@@ -2,19 +2,35 @@
 
 **Long-term memory for software projects: what was decided, why, and where it lives in the code.**
 
-## The problem
+## The problem — and it has two sides
 
-Projects that run for a long time under agent-driven development forget
-things. A decision gets made, the conversation that made it scrolls out of
-context, and three weeks later someone (human or agent) re-litigates the same
-question from scratch — sometimes landing on the same answer, sometimes
-reinventing the thing that was already tried and rejected, sometimes
-reintroducing the bug an incident already taught everyone about. Code alone
-doesn't answer "why is this written this way?" or "didn't we already try the
-obvious alternative?" — and chat history isn't searchable, isn't structured,
-and isn't there once the session ends.
+Projects that run for a long time under agent-driven development degrade in
+two different ways.
 
-## How it solves it
+**Forgotten decisions.** A decision gets made, the conversation that made it
+scrolls out of context, and three weeks later someone (human or agent)
+re-litigates the same question from scratch — sometimes landing on the same
+answer, sometimes reinventing the thing that was already tried and rejected,
+sometimes reintroducing the bug an incident already taught everyone about.
+Code alone doesn't answer "why is this written this way?" — and chat history
+isn't searchable, isn't structured, and isn't there once the session ends.
+This side is well known, and several tools attack it.
+
+**Code fragmentation.** The quieter rot: an agent working file-locally in a
+large codebase can't know that the helper it needs already exists two
+directories away — so it writes a new one. Solved problems get re-solved,
+slightly differently each time. The same job ends up implemented in five
+places with five behaviours; the design stops being one design. No decision
+log fixes this, because nothing was ever *decided* — knowledge about what the
+code already contains simply wasn't in front of the agent at the moment it
+started typing. This side is the one most memory tools ignore.
+
+MemContinuum's two layers map onto the two sides: **Rationale** holds the
+decisions so they stop being forgotten; **Anatomy** holds what the code
+already has — its concepts, owners, and boundaries — so it stops being
+reinvented.
+
+## How it works
 
 MemContinuum keeps decisions as **append-only chains**: every ruling on one
 question, newest first, dated, and tagged with *who actually said it* — the
@@ -37,6 +53,20 @@ record, and anything cited as the project owner's own words passes through
 an explicit step where the owner sees the exact text before it counts as a
 constraint. A store that silently guesses at what someone meant is worse than
 no store, because it gets trusted the same as one that didn't guess.
+
+Against fragmentation, **Anatomy** gives the codebase's shape a queryable
+form: a small set of *concept* records — "this is one system; here are the
+files and symbols that implement it, the tests that guard it, the decisions
+that govern it, and where its boundary runs." Ask `why <symbol>` and you get
+the concept a strange piece of code belongs to, its decision history, and the
+obvious alternative that was rejected — before a well-meaning cleanup deletes
+it. Ask `for-path` (the pre-edit hook does, automatically) and an edit to a
+governed file starts with its concept and rulings in view. And `drift` turns
+active decisions with a checkable shape ("all deletes go through the one
+gate") into failing checks when the code quietly grows a bypass. Roadmap,
+not yet shipped: semantic search over the code itself ("a helper that writes
+a debug image"), for the case where the agent doesn't know the name of the
+thing it's about to reinvent.
 
 ## Who this is for
 
@@ -83,6 +113,9 @@ reminds the session that this might be worth writing down as a new link in
 the chain. Separately, at any time, you can search by meaning rather than by
 file — "why don't we count hidden files in the total?" — and get back the
 chain that answers it, ranked by a hybrid of full-text and semantic search.
+And when a piece of code looks strange, or you're about to write something
+that feels like it must already exist, `why` walks from the code to its
+concept to the rulings that shaped it — the anti-reinvention direction.
 
 Everything below this point is the technical reference: requirements,
 installation, the storage model, the CLI, and the schema.
