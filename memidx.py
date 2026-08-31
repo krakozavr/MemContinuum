@@ -907,6 +907,58 @@ def concept_matches_for_path(conn, project: str, file_path: str) -> list:
     return [by_id[cid] for cid in matched_ids if cid in by_id]
 
 
+def concept_matches_for_chunk(
+    conn, project: str, file_path: str, symbol: str, qualified_name: str
+) -> list:
+    """Finding 4: code-search's per-hit concept attachment must prefer a
+    SYMBOL-level implemented_by/tested_by match over a file-level one --
+    concept_matches_for_path (used by `for-path`/`unmapped`, which are
+    file-level by design and stay exactly as they are) ignores any
+    "#symbol" fragment entirely, so two concepts each claiming a
+    different symbol in the same file would both match every chunk in it.
+
+    A concept_paths row whose path carries a "#symbol" fragment only
+    matches a chunk whose own symbol or qualified_name equals that
+    fragment, or whose qualified_name ends with ".<fragment>" (so a
+    fragment written as the bare member name, e.g. "outerFunc", still
+    matches "Outer.outerFunc"). A row with no fragment (file-level) still
+    matches every chunk in the file, same as concept_matches_for_path.
+    Symbol-level matches are returned before file-level ones, so a caller
+    that only wants the single best match (matches[0]) prefers the more
+    specific one."""
+    path_rows = conn.execute(
+        "SELECT * FROM concept_paths WHERE project=?", (project,)
+    ).fetchall()
+    symbol_ids: list[str] = []
+    file_ids: list[str] = []
+    seen_symbol: set = set()
+    seen_file: set = set()
+    for pr in path_rows:
+        ref_path, _, frag = pr["path"].partition("#")
+        if not code_ref_matches(file_path, ref_path):
+            continue
+        cid = pr["concept_id"]
+        if frag:
+            if frag == symbol or frag == qualified_name or qualified_name.endswith("." + frag):
+                if cid not in seen_symbol:
+                    seen_symbol.add(cid)
+                    symbol_ids.append(cid)
+        else:
+            if cid not in seen_file:
+                seen_file.add(cid)
+                file_ids.append(cid)
+    matched_ids = symbol_ids + [cid for cid in file_ids if cid not in seen_symbol]
+    if not matched_ids:
+        return []
+    placeholders = ",".join("?" * len(matched_ids))
+    rows = conn.execute(
+        f"SELECT * FROM concepts WHERE project=? AND id IN ({placeholders})",
+        (project, *matched_ids),
+    ).fetchall()
+    by_id = {r["id"]: r for r in rows}
+    return [by_id[cid] for cid in matched_ids if cid in by_id]
+
+
 def governed_topic_rows(conn, project: str, concept_row) -> list:
     ids = json.loads(concept_row["governed_by"] or "[]")
     rows = []
@@ -1644,8 +1696,9 @@ def _scan_region(text: str, start: int):
 
 _RESYNC_RE = re.compile(
     r"^[ \t]{0,8}(?:(?:public|private|internal|fileprivate|open|final|static|class|"
-    r"override|required|convenience|indirect|mutating|nonisolated|@\w+(?:\([^)]*\))?)\s+)*"
-    r"(?:func|init|class|struct|enum|protocol|extension)\b"
+    r"override|required|convenience|indirect|mutating|nonisolated|package|consuming|"
+    r"borrowing|@\w+(?:\([^)]*\))?)\s+)*"
+    r"(?:func|init|class|struct|enum|protocol|extension|actor|var|subscript)\b"
 )
 
 
@@ -1676,13 +1729,16 @@ def _find_resync_point(text: str, from_idx: int):
     return None
 
 
-def chunk_source(text: str):
-    """Chunk one Swift file's source text. Returns (chunks, gaps) where
-    chunks is a list of dicts (kind, symbol, qualified_name, signature,
-    doc, start_line, end_line -- all 1-based) in source order, and gaps is
-    a list of (start_line, end_line) 1-based ranges skipped due to a brace
-    desync (counted + reported by the caller; never a whole-file
-    fallback -- indexing always resumes after the gap)."""
+def _build_mask_and_match_dict(text: str):
+    """The lexer-aware brace-walk shared by chunk_source and
+    declared_symbol_names (finding 5, memlint's #symbol vocabulary):
+    returns (mask, match_dict, gaps) -- mask is `text` with every
+    comment/string's contents blanked to spaces (newlines kept, so line
+    numbers still line up) and match_dict maps each '{' index to its
+    matching '}' index for fully-closed top-level constructs. gaps is a
+    list of (start_line, end_line) 1-based ranges skipped due to a brace
+    desync (never a whole-file fallback -- indexing always resumes after
+    the gap)."""
     n = len(text)
     mask_full = [("\n" if ch == "\n" else " ") for ch in text]
     match_dict: dict = {}
@@ -1717,17 +1773,60 @@ def chunk_source(text: str):
         gaps.append((gap_start_line, gap_end_line))
         pos = resync_idx
     mask = "".join(mask_full)
+    return mask, match_dict, gaps
+
+
+def chunk_source(text: str):
+    """Chunk one Swift file's source text. Returns (chunks, gaps) where
+    chunks is a list of dicts (kind, symbol, qualified_name, signature,
+    doc, start_line, end_line -- all 1-based) in source order, and gaps is
+    a list of (start_line, end_line) 1-based ranges skipped due to a brace
+    desync (counted + reported by the caller; never a whole-file
+    fallback -- indexing always resumes after the gap)."""
+    mask, match_dict, gaps = _build_mask_and_match_dict(text)
     chunks = _extract_decls(text, mask, match_dict)
     return chunks, gaps
 
 
 _IDENT_RE = re.compile(r"[ \t\n]*([A-Za-z_][A-Za-z0-9_]*)")
+_DOTTED_IDENT_RE = re.compile(r"[ \t\n]*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)")
 _OPERATOR_CHARS = set("+-*/%=<>!&|^~?.")
-_KEYWORD_RE = re.compile(r"\b(class|struct|enum|protocol|extension|func|init|subscript|var)\b")
+_KEYWORD_RE = re.compile(
+    r"\b(class|struct|enum|protocol|extension|actor|func|init|subscript|var)\b"
+)
+
+
+def _read_backtick_identifier(mask: str, i: int):
+    """A backtick-quoted name (finding 6, e.g. `` `default` ``, used to
+    escape a reserved word as an identifier) -- returns the name WITHOUT
+    its backticks, or None if `i` (after skipping whitespace) isn't a
+    backtick-opened name."""
+    j = i
+    n = len(mask)
+    while j < n and mask[j] in (" ", "\n", "\t"):
+        j += 1
+    if j >= n or mask[j] != "`":
+        return None
+    k = j + 1
+    while k < n and mask[k] != "`":
+        k += 1
+    return mask[j + 1 : k] if k < n else None
 
 
 def _read_identifier(mask: str, i: int):
     m = _IDENT_RE.match(mask, i)
+    if m:
+        return m.group(1)
+    return _read_backtick_identifier(mask, i)
+
+
+def _read_dotted_identifier(mask: str, i: int):
+    """Like _read_identifier, but for `extension Outer.Inner` (finding
+    6) -- keeps the full dot-joined qualifier as one chain element so the
+    nested type's members qualify as Outer.Inner.member, not Outer.member.
+    Backtick-quoted segments aren't supported here (an extension naming a
+    backtick-escaped type is not a case this fixture set covers)."""
+    m = _DOTTED_IDENT_RE.match(mask, i)
     return m.group(1) if m else None
 
 
@@ -1736,6 +1835,8 @@ def _read_identifier_or_operator(mask: str, i: int):
     n = len(mask)
     while j < n and mask[j] in (" ", "\n", "\t"):
         j += 1
+    if j < n and mask[j] == "`":
+        return _read_backtick_identifier(mask, i)
     if j < n and (mask[j].isalpha() or mask[j] == "_"):
         return _read_identifier(mask, i)
     k = j
@@ -1795,7 +1896,15 @@ def _classify_var(mask: str, i: int, limit: int):
     already blank in mask) for the next real character -- only '{' (brace
     on the next line) or '=' (a multi-line initializer) means the same
     declaration continues; anything else (typically the next
-    declaration's own keyword) means this one had no body."""
+    declaration's own keyword) means this one had no body.
+
+    willSet/didSet observers (finding 6) are syntactically identical to a
+    computed property's getter block up to this point -- a type
+    annotation directly followed by '{', no initializer -- so a stored
+    property with observers and no initializer (`var x: Int { willSet
+    {...} didSet {...} }`) would otherwise be misclassified as computed.
+    Only the block's own first token distinguishes them: if it's
+    `willSet`/`didSet`, this is NOT a computed-var chunk."""
     paren_depth = 0
     bracket_depth = 0
     j = i
@@ -1821,6 +1930,9 @@ def _classify_var(mask: str, i: int, limit: int):
             if c == "=":
                 return False, None
             if c == "{":
+                first = _read_identifier(mask, j + 1)
+                if first in ("willSet", "didSet"):
+                    return False, None
                 return True, j
             if c == "}":
                 return False, None
@@ -1858,10 +1970,23 @@ def _extract_decls(text: str, mask: str, match_dict: dict):
         kstart = m.start()
         after = kstart + len(kw)
 
-        if kw in ("class", "struct", "enum", "protocol", "extension"):
-            name = _read_identifier(mask, after)
+        if kw in ("class", "struct", "enum", "protocol", "extension", "actor"):
+            # `extension Outer.Inner` (finding 6) keeps its dotted
+            # qualifier as one chain element; every other container kind
+            # never has a dotted name in Swift.
+            if kw == "extension":
+                name = _read_dotted_identifier(mask, after)
+            else:
+                name = _read_identifier(mask, after)
             if kw == "class" and name in ("func", "var"):
                 continue  # `class func` / `class var` modifier, not a type decl
+            if not name:
+                # e.g. `actor`/`class`/etc. used as a plain identifier
+                # (`let actor = ...`), not a type decl -- never a
+                # container (finding 6: guards the same phantom-container
+                # class of bug the `class func`/`class var` check above
+                # already exists for).
+                continue
             body_open = _find_body_open(mask, match_dict, after, n)
             if body_open is None:
                 continue
@@ -1928,6 +2053,40 @@ def _extract_decls(text: str, mask: str, match_dict: dict):
         )
     out.sort(key=lambda c: c["start_line"])
     return out
+
+
+def declared_symbol_names(text: str) -> set:
+    """All symbol names memlint's #symbol vocabulary check (finding 5,
+    memlint.py's lint_concept) should recognize as declared in `text` --
+    everything chunk_source would chunk (init, subscript, computed var
+    names, static/class func, operators, backtick names) PLUS each
+    container type's own name (class/struct/enum/protocol/extension/
+    actor -- a #symbol fragment may name the type itself, not just a
+    member; `extension Outer.Inner` contributes both "Outer" and "Inner"
+    separately, matching either half). Reuses chunk_source's own
+    lexer-aware mask (_build_mask_and_match_dict) rather than a
+    from-scratch regex scan, so a name that only appears inside a comment
+    or string literal is never counted (mirrors the same guarantee
+    chunk_source already gives code-search/code-reindex)."""
+    mask, match_dict, _gaps = _build_mask_and_match_dict(text)
+    names = {c["symbol"] for c in _extract_decls(text, mask, match_dict)}
+    for m in _KEYWORD_RE.finditer(mask):
+        kw = m.group(1)
+        if kw not in ("class", "struct", "enum", "protocol", "extension", "actor"):
+            continue
+        after = m.start() + len(kw)
+        if kw == "extension":
+            name = _read_dotted_identifier(mask, after)
+        else:
+            name = _read_identifier(mask, after)
+        if kw == "class" and name in ("func", "var"):
+            continue  # `class func` / `class var` modifier, not a type decl
+        if not name:
+            continue
+        for part in name.split("."):
+            if part:
+                names.add(part)
+    return names
 
 
 # ---------------------------------------------------------------------------
@@ -2001,6 +2160,18 @@ def cmd_code_reindex(args) -> int:
         prev_sha = existing.get(rel)
         if prev_sha == sha and not args.full:
             unchanged_files += 1
+            # Finding 2 (staleness): the file's content (and thus its
+            # chunks) didn't change, but its mtime/size on disk may have
+            # (e.g. a bare `touch`) -- refresh the stored file_sha row's
+            # mtime/size so _code_index_is_stale's on-disk comparison
+            # matches again. sha256/gap_count are untouched (nothing about
+            # the indexed content changed), so this is a plain UPDATE, not
+            # the INSERT OR REPLACE the changed/added branch below uses.
+            stat = f.stat()
+            conn.execute(
+                "UPDATE file_sha SET mtime=?, size=? WHERE project=? AND path=?",
+                (stat.st_mtime, stat.st_size, args.project, rel),
+            )
             continue
         is_new = rel not in existing
 
@@ -2163,7 +2334,20 @@ def cmd_code_search(args) -> int:
 
     results = results[: args.limit]
 
-    md_db_path = resolve_db_path(args)
+    # Finding 3: concept attachment must always read the DECISION
+    # (markdown) db, never the CODE db that --db selects for this command.
+    # resolve_db_path(args) would incorrectly honor a --db that here means
+    # "the code db" (schema clash: SCHEMA_SQL run onto the code db, and
+    # concepts read from a db that has none -- attach silently empty). A
+    # dedicated --decision-db flag lets a caller override the decision db
+    # explicitly; absent that, the normal per-project decision db path
+    # applies regardless of --db.
+    decision_db_arg = getattr(args, "decision_db", None)
+    if decision_db_arg:
+        md_db_path = Path(decision_db_arg).expanduser().resolve()
+    else:
+        md_base = Path(os.environ.get("MEMCONTINUUM_HOME", str(Path.home() / ".memcontinuum")))
+        md_db_path = md_base / f"{args.project}.sqlite"
     md_conn = None
     if md_db_path.exists():
         try:
@@ -2185,7 +2369,11 @@ def cmd_code_search(args) -> int:
             "score": score,
         }
         if md_conn is not None:
-            concept_matches = concept_matches_for_path(md_conn, args.project, row["path"])
+            # Finding 4: prefer a symbol-level implemented_by/tested_by
+            # match over a file-level one for this specific chunk.
+            concept_matches = concept_matches_for_chunk(
+                md_conn, args.project, row["path"], row["symbol"], row["qualified_name"]
+            )
             if concept_matches:
                 hit["concept_id"] = concept_matches[0]["id"]
                 hit["concept_title"] = concept_matches[0]["title"]
@@ -2291,6 +2479,12 @@ def main(argv=None) -> int:
     p_code_search.add_argument("--mode", choices=["fts", "vector", "hybrid"], default="hybrid")
     p_code_search.add_argument("--limit", type=int, default=10)
     p_code_search.add_argument("--json", action="store_true")
+    p_code_search.add_argument(
+        "--decision-db", default=None,
+        help="override the DECISION (markdown) index db path used for concept "
+             "attachment -- independent of --db, which always selects the CODE "
+             "db for this command. Defaults to the normal per-project decision db.",
+    )
     p_code_search.set_defaults(func=cmd_code_search)
 
     args = parser.parse_args(argv)

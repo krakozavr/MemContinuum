@@ -8,11 +8,13 @@ additions, this file, and fixtures/code/. Does not touch hooks/, install.sh,
 tests/test_hooks.py, tests/test_write_hooks.py, or tests/test_install.py.
 
 Every python invocation for this project is
-`PYTHONPATH= /home/user/dev/mem-venv/bin/python` (a Windows numpy
-install leaks onto PYTHONPATH by default in this shell and breaks fastembed
-under Linux Python -- see the module import failing with
-`AttributeError: module 'os' has no attribute 'add_dll_directory'` if that
-env var isn't cleared).
+`PYTHONPATH= $MEMCONTINUUM_PYTHON` (a Windows numpy install leaks onto
+PYTHONPATH by default in this shell and breaks fastembed under Linux Python
+-- see the module import failing with `AttributeError: module 'os' has no
+attribute 'add_dll_directory'` if that env var isn't cleared). This
+machine's venv python is never hardcoded in tracked test code -- set
+$MEMCONTINUUM_PYTHON in your own (untracked) shell environment before
+running this file; see README.md "Requirements" / "Running the tests".
 """
 from __future__ import annotations
 
@@ -219,6 +221,81 @@ class TestChunkerSyntheticAppKitFixture(unittest.TestCase):
         self.assertGreaterEqual(len(self.chunks), 15, self.chunks)
 
 
+class TestChunkerActorObserversExtensionBacktick(unittest.TestCase):
+    """Finding 6: actor as a container (qualifies like class/struct/enum/
+    protocol/extension, never a chunk itself), willSet/didSet observers on
+    a stored property are NOT computed-var chunks, `extension Outer.Inner`
+    keeps its dotted qualifier, and backtick-quoted names are captured."""
+
+    def setUp(self):
+        self.text = (FIXTURES / "ChunkerCases.swift").read_text()
+        self.chunks, self.gaps = memidx.chunk_source(self.text)
+
+    def test_no_gaps(self):
+        self.assertEqual(self.gaps, [])
+
+    def test_actor_qualifies_its_members_and_is_never_a_chunk_itself(self):
+        names = {c["qualified_name"] for c in self.chunks}
+        self.assertIn("Counter.increment", names)
+        kinds = {c["kind"] for c in self.chunks}
+        self.assertNotIn("actor", kinds)
+        symbols = {c["symbol"] for c in self.chunks}
+        self.assertNotIn("Counter", symbols)
+
+    def test_willset_didset_observers_are_not_a_computed_var_chunk(self):
+        names = {c["qualified_name"] for c in self.chunks}
+        self.assertNotIn("Observed.value", names)
+
+    def test_extension_of_a_nested_type_keeps_the_dotted_qualifier(self):
+        names = {c["qualified_name"] for c in self.chunks}
+        self.assertIn("Outer.Inner.nested", names)
+
+    def test_backtick_quoted_func_and_var_names_are_captured(self):
+        by_name = {c["qualified_name"]: c for c in self.chunks}
+        self.assertIn("Escaped.default", by_name)
+        self.assertEqual(by_name["Escaped.default"]["kind"], "func")
+        self.assertIn("Escaped.type", by_name)
+        self.assertEqual(by_name["Escaped.type"]["kind"], "var")
+
+
+class TestChunkerGapResyncModifiers(unittest.TestCase):
+    """Finding 6: gap-resync must also recognise `package`/`consuming`/
+    `borrowing` func modifiers and bare `var`/`subscript` declarations as
+    valid resync anchors -- previously the heuristic only knew func/init/
+    class/struct/enum/protocol/extension (with a narrower modifier set),
+    so a member using this vocabulary right after a desync used to be
+    swallowed into the same gap instead of being recovered."""
+
+    def setUp(self):
+        self.text = (FIXTURES / "GapResyncModifiers.swift").read_text()
+        self.chunks, self.gaps = memidx.chunk_source(self.text)
+
+    def test_exactly_five_gaps_reported(self):
+        self.assertEqual(len(self.gaps), 5, self.gaps)
+
+    def test_package_modifier_recovered_after_gap(self):
+        names = {c["qualified_name"] for c in self.chunks}
+        self.assertIn("afterPackageGap", names)
+
+    def test_consuming_modifier_recovered_after_gap(self):
+        names = {c["qualified_name"] for c in self.chunks}
+        self.assertIn("afterConsumingGap", names)
+
+    def test_borrowing_modifier_recovered_after_gap(self):
+        names = {c["qualified_name"] for c in self.chunks}
+        self.assertIn("afterBorrowingGap", names)
+
+    def test_bare_var_recovered_after_gap(self):
+        by_name = {c["qualified_name"]: c for c in self.chunks}
+        self.assertIn("afterVarGap", by_name)
+        self.assertEqual(by_name["afterVarGap"]["kind"], "var")
+
+    def test_bare_subscript_recovered_after_gap(self):
+        by_name = {c["qualified_name"]: c for c in self.chunks}
+        self.assertIn("subscript", by_name)
+        self.assertEqual(by_name["subscript"]["kind"], "subscript")
+
+
 # ---------------------------------------------------------------------------
 # 2. code-reindex / code-search (DB-backed)
 # ---------------------------------------------------------------------------
@@ -226,29 +303,42 @@ class TestChunkerSyntheticAppKitFixture(unittest.TestCase):
 
 class TestIncremental(unittest.TestCase):
     def test_unchanged_file_gives_zero_reembeds(self):
+        """Finding 8: despite its name, this test used to run with
+        embeddings OFF both times (no_embed=True) and only checked that
+        the chunk COUNT was unchanged -- it never actually asserted a
+        re-embed count, so it couldn't tell "0 reembeds because nothing
+        changed" apart from "0 reembeds because embedding never ran at
+        all". Turn embeddings ON (no_embed=False) for this small (3-func)
+        fixture and assert the real re-embed count from code-reindex's own
+        summary line: > 0 on the first run, exactly 0 on the second
+        (sha-skip, file byte-for-byte unchanged)."""
+        import contextlib
+        import io
+        import re
+
+        reembed_re = re.compile(r"(\d+) chunk\(s\) \(re-\)embedded")
+
+        def reembed_count(root, db):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = code_reindex(root, db, no_embed=False)
+            self.assertEqual(rc, 0)
+            out = buf.getvalue()
+            m = reembed_re.search(out)
+            self.assertIsNotNone(m, out)
+            return int(m.group(1))
+
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "code"
             root.mkdir()
             shutil.copy(FIXTURES / "NestedTypes.swift", root / "NestedTypes.swift")
             db = Path(td) / "idx-code.sqlite"
 
-            rc = code_reindex(root, db, no_embed=True)
-            self.assertEqual(rc, 0)
+            first = reembed_count(root, db)
+            self.assertGreater(first, 0, "first-ever index of a new file must embed its chunks")
 
-            conn = memidx.open_code_db(db)
-            before = conn.execute("SELECT COUNT(*) AS n FROM chunks").fetchone()["n"]
-            conn.close()
-            self.assertGreater(before, 0)
-
-            # second reindex, file byte-for-byte unchanged -> 0 new chunks
-            # touched, sha comparison alone decides (no embedding is
-            # requested either way here, so this isolates the sha-skip).
-            rc2 = code_reindex(root, db, no_embed=True)
-            self.assertEqual(rc2, 0)
-            conn = memidx.open_code_db(db)
-            after = conn.execute("SELECT COUNT(*) AS n FROM chunks").fetchone()["n"]
-            conn.close()
-            self.assertEqual(before, after)
+            second = reembed_count(root, db)
+            self.assertEqual(second, 0, "file byte-for-byte unchanged -- sha-skip must re-embed nothing")
 
     def test_changed_file_is_rechunked(self):
         with tempfile.TemporaryDirectory() as td:
@@ -385,6 +475,13 @@ class TestVectorAndHybridJSONIsSerializable(unittest.TestCase):
     not a second control case."""
 
     def _search_json(self, db, mode):
+        # Finding 8: the old version only asserted "OK" appeared in
+        # stdout and that every score (already round-tripped through
+        # json.loads, which never yields numpy types either way -- the
+        # real risk is json.dumps() raising before that point) was a
+        # plain float -- neither check could fail even if `out` were
+        # empty, silently losing all coverage of the actual float32 path.
+        # Assert a nonzero hit count explicitly instead.
         script = (
             "import sys, io, contextlib, json; sys.path.insert(0, %r); import memidx; "
             "buf = io.StringIO()\n"
@@ -393,6 +490,7 @@ class TestVectorAndHybridJSONIsSerializable(unittest.TestCase):
             "'--mode', %r, '--limit', '3', '--json'])\n"
             "assert rc == 0, rc\n"
             "out = json.loads(buf.getvalue())\n"
+            "assert len(out) > 0, 'zero hits -- the float32 path was never exercised'\n"
             "for h in out:\n"
             "    assert isinstance(h['score'], float), (h['score'], type(h['score']))\n"
             "print('OK', len(out))\n"
@@ -402,6 +500,9 @@ class TestVectorAndHybridJSONIsSerializable(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("OK", result.stdout)
+        hit_count = int(result.stdout.strip().rsplit(" ", 1)[-1])
+        self.assertGreater(hit_count, 0, result.stdout)
+        return hit_count
 
     def test_vector_mode_json_output_is_valid_and_scores_are_plain_floats(self):
         with tempfile.TemporaryDirectory() as td:
@@ -426,6 +527,24 @@ class TestVectorAndHybridJSONIsSerializable(unittest.TestCase):
             db = Path(td) / "idx-code.sqlite"
             code_reindex(root, db, no_embed=False)
             self._search_json(db, "hybrid")
+
+            # Finding 8: hybrid's own per-hit score is an RRF rank sum
+            # (always a plain float already, per the class docstring), so
+            # a passing hybrid JSON test alone doesn't prove the merge
+            # actually drew on real vector-side (float32-cast) results
+            # rather than FTS alone. Confirm code_hits_vector -- the exact
+            # function that used to leak a numpy.float32 score -- genuinely
+            # returns nonempty, plain-float results for this same query.
+            conn = memidx.open_code_db(db)
+            try:
+                vec_hits = memidx.code_hits_vector(
+                    conn, "[redacted probe query]", memidx.DEFAULT_PROJECT
+                )
+            finally:
+                conn.close()
+            self.assertGreater(len(vec_hits), 0, "hybrid's vector side never ran")
+            for _cid, score in vec_hits:
+                self.assertIsInstance(score, float)
 
 
 class TestConceptAttachment(unittest.TestCase):
@@ -472,6 +591,145 @@ class TestConceptAttachment(unittest.TestCase):
             finally:
                 del os.environ["MEMCONTINUUM_HOME"]
 
+    def test_explicit_code_db_still_attaches_concepts_from_decision_db_and_stays_clean(self):
+        """Finding 3: `code-search --db <codedb>` used to run the markdown
+        SCHEMA_SQL onto the CODE db (schema clash, concepts read from the
+        wrong db, attach silently empty). `--db` for code-search must
+        select the CODE db only; concept attachment must always read the
+        DECISION db (default project path here -- no --decision-db
+        override needed for this case)."""
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"
+            home.mkdir()
+            os.environ["MEMCONTINUUM_HOME"] = str(home)
+            try:
+                md_root = Path(td) / "md"
+                md_root.mkdir()
+                (md_root / "concept.md").write_text(
+                    "---\n"
+                    "type: concept\n"
+                    "id: CON-EXPLICITDB\n"
+                    "title: Explicit DB Test\n"
+                    "owner_boundary: fixture\n"
+                    "implemented_by:\n"
+                    "  - NestedTypes.swift#outerFunc\n"
+                    "tested_by: []\n"
+                    "governed_by: []\n"
+                    "involved_in: []\n"
+                    "---\n\n"
+                    "Fixture. NOT this concept: nothing else.\n"
+                )
+                memidx.cmd_reindex(ns(root=str(md_root), no_embed=True, full=False))
+
+                code_root = Path(td) / "code"
+                code_root.mkdir()
+                shutil.copy(FIXTURES / "NestedTypes.swift", code_root / "NestedTypes.swift")
+                code_db = Path(td) / "explicit-code.sqlite"
+                memidx.cmd_code_reindex(
+                    ns(code_root=str(code_root), db=str(code_db), no_embed=True, full=False, lang=None)
+                )
+
+                import io
+                import contextlib
+                import json as _json
+
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = memidx.cmd_code_search(
+                        ns(query="outer func", mode="fts", limit=5, json=True, db=str(code_db))
+                    )
+                self.assertEqual(rc, 0)
+                results = _json.loads(buf.getvalue())
+                self.assertTrue(
+                    any(r.get("concept_id") == "CON-EXPLICITDB" for r in results), results
+                )
+
+                import sqlite3
+
+                code_conn = sqlite3.connect(str(code_db))
+                tables = {
+                    r[0]
+                    for r in code_conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+                code_conn.close()
+                markdown_only_tables = {"records", "links", "edges", "assumptions", "concepts", "concept_paths"}
+                self.assertFalse(
+                    tables & markdown_only_tables,
+                    f"code db must never carry markdown tables: {tables & markdown_only_tables}",
+                )
+            finally:
+                del os.environ["MEMCONTINUUM_HOME"]
+
+    def test_two_concepts_on_one_file_different_symbols_each_get_their_own_chunk(self):
+        """Finding 4: concept_id attachment must prefer a symbol-level
+        match -- an implemented_by entry carrying #symbol must only stamp
+        the chunk(s) whose qualified name actually matches that symbol,
+        not every chunk in the file."""
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"
+            home.mkdir()
+            os.environ["MEMCONTINUUM_HOME"] = str(home)
+            try:
+                md_root = Path(td) / "md"
+                md_root.mkdir()
+                (md_root / "concept_outer.md").write_text(
+                    "---\n"
+                    "type: concept\n"
+                    "id: CON-OUTER\n"
+                    "title: Outer func concept\n"
+                    "owner_boundary: fixture\n"
+                    "implemented_by:\n"
+                    "  - NestedTypes.swift#outerFunc\n"
+                    "tested_by: []\n"
+                    "governed_by: []\n"
+                    "involved_in: []\n"
+                    "---\n\n"
+                    "Fixture. NOT this concept: nothing else.\n"
+                )
+                (md_root / "concept_ext.md").write_text(
+                    "---\n"
+                    "type: concept\n"
+                    "id: CON-EXT\n"
+                    "title: Ext func concept\n"
+                    "owner_boundary: fixture\n"
+                    "implemented_by:\n"
+                    "  - NestedTypes.swift#extFunc\n"
+                    "tested_by: []\n"
+                    "governed_by: []\n"
+                    "involved_in: []\n"
+                    "---\n\n"
+                    "Fixture. NOT this concept: nothing else.\n"
+                )
+                memidx.cmd_reindex(ns(root=str(md_root), no_embed=True, full=False))
+
+                code_root = Path(td) / "code"
+                code_root.mkdir()
+                shutil.copy(FIXTURES / "NestedTypes.swift", code_root / "NestedTypes.swift")
+                memidx.cmd_code_reindex(ns(code_root=str(code_root), no_embed=True, full=False, lang=None))
+
+                import io
+                import contextlib
+                import json as _json
+
+                def top_hit(query):
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        rc = memidx.cmd_code_search(ns(query=query, mode="fts", limit=5, json=True))
+                    self.assertEqual(rc, 0)
+                    return _json.loads(buf.getvalue())[0]
+
+                outer_hit = top_hit("outer func")
+                self.assertEqual(outer_hit["qualified_name"], "Outer.outerFunc")
+                self.assertEqual(outer_hit.get("concept_id"), "CON-OUTER", outer_hit)
+
+                ext_hit = top_hit("ext func")
+                self.assertEqual(ext_hit["qualified_name"], "Outer.extFunc")
+                self.assertEqual(ext_hit.get("concept_id"), "CON-EXT", ext_hit)
+            finally:
+                del os.environ["MEMCONTINUUM_HOME"]
+
 
 class TestStaleWarning(unittest.TestCase):
     def test_touching_a_source_file_triggers_stderr_warning_on_search(self):
@@ -492,6 +750,33 @@ class TestStaleWarning(unittest.TestCase):
                 [sys.executable, "-c", script], capture_output=True, text=True, timeout=30
             )
             self.assertIn("stale", result.stderr.lower(), result.stderr)
+
+    def test_touch_then_reindex_with_unchanged_sha_clears_stale_warning(self):
+        """Finding 2: a SHA-skipped unchanged file must still refresh its
+        stored file_sha mtime/size row -- otherwise the on-disk mtime keeps
+        drifting away from the stale-comparison snapshot forever after a
+        mere touch, even though a reindex genuinely ran and found nothing
+        to do. touch -> reindex (sha unchanged, 0 chunks touched) -> search
+        must NOT warn stale."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            target = root / "NestedTypes.swift"
+            shutil.copy(FIXTURES / "NestedTypes.swift", target)
+            db = Path(td) / "idx-code.sqlite"
+            code_reindex(root, db, no_embed=True)
+
+            os.utime(target, (time.time() + 3600, time.time() + 3600))
+            code_reindex(root, db, no_embed=True)
+
+            script = (
+                "import sys; sys.path.insert(0, %r); import memidx; "
+                "memidx.main(['code-search', '--db', %r, 'outer func', '--mode', 'fts'])"
+            ) % (str(TOOLS_DIR), str(db))
+            result = subprocess.run(
+                [sys.executable, "-c", script], capture_output=True, text=True, timeout=30
+            )
+            self.assertNotIn("stale", result.stderr.lower(), result.stderr)
 
     def test_search_never_warns_when_nothing_changed(self):
         with tempfile.TemporaryDirectory() as td:
@@ -653,6 +938,39 @@ class TestMemlintSymbolFragment(unittest.TestCase):
             shutil.copy(CONCEPTS / "bad_symbol.md", root / "bad_symbol.md")
             errors, _warnings = memlint.lint_root(root)
             self.assertFalse(any("doesNotExist" in e for e in errors), errors)
+
+
+class TestMemlintSymbolVocabulary(unittest.TestCase):
+    """Finding 5: memlint's #symbol check must recognize everything the
+    chunker emits (init, subscript, computed var names, static/class func,
+    operators, backtick names) and stop matching inside comments/strings."""
+
+    def test_init_computed_var_static_func_and_backtick_name_all_pass(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            shutil.copy(CONCEPTS / "vocab_good.md", root / "vocab_good.md")
+            errors, _warnings = memlint.lint_root(root, code_root=CODE_ROOT)
+            self.assertFalse(any("CON-VOCAB-GOOD" in e for e in errors), errors)
+
+    def test_symbol_only_in_a_comment_is_an_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            shutil.copy(CONCEPTS / "vocab_bad_comment.md", root / "vocab_bad_comment.md")
+            errors, _warnings = memlint.lint_root(root, code_root=CODE_ROOT)
+            self.assertTrue(
+                any("CON-VOCAB-BADCOMMENT" in e and "commentedOutSymbol" in e for e in errors),
+                errors,
+            )
+
+    def test_symbol_only_in_a_string_literal_is_an_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            shutil.copy(CONCEPTS / "vocab_bad_string.md", root / "vocab_bad_string.md")
+            errors, _warnings = memlint.lint_root(root, code_root=CODE_ROOT)
+            self.assertTrue(
+                any("CON-VOCAB-BADSTRING" in e and "stringOnlySymbol" in e for e in errors),
+                errors,
+            )
 
 
 class TestMemlintUnqualifiedLargeFile(unittest.TestCase):

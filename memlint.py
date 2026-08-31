@@ -28,6 +28,7 @@ from memidx import (
     EDGE_RELS,
     KINDS,
     STATUSES,
+    declared_symbol_names,
     newest_active_link,
     parse_frontmatter,
     walk_markdown,
@@ -38,21 +39,19 @@ from memidx import (
 # code-search sibling additions to the concept-record rules below)
 # ---------------------------------------------------------------------------
 
-_DECLARED_FUNC_RE = re.compile(r"\b(?:static\s+)?func\s+([A-Za-z_][A-Za-z0-9_]*|[+\-*/%=<>!&|^~]+)")
-_DECLARED_TYPE_RE = re.compile(r"\b(?:class|struct|enum)\s+([A-Za-z_][A-Za-z0-9_]*)")
 _NOT_THIS_RE = re.compile(r"\bNOT\b|not this concept|Does NOT")
 
 
 def _declared_symbols(text: str) -> set[str]:
-    """Best-effort regex scan (not the full lexer-aware chunker in
-    memidx.py -- memlint just needs existence, not chunk boundaries) for
-    names declared via func/struct/enum/class/subscript, including
-    `static func NAME`."""
-    names = {m.group(1) for m in _DECLARED_FUNC_RE.finditer(text)}
-    names.update(m.group(1) for m in _DECLARED_TYPE_RE.finditer(text))
-    if re.search(r"\bsubscript\b", text):
-        names.add("subscript")
-    return names
+    """Finding 5: every #symbol fragment memlint accepts must be something
+    code-search/code-reindex would actually recognize -- so this reuses
+    the chunker's own lexer-aware scan (memidx.declared_symbol_names)
+    rather than a from-scratch regex, which used to miss init, subscript,
+    computed var names, and backtick-quoted names, AND could false-positive
+    on a name that only ever appeared inside a comment or string literal
+    (a regex has no notion of "inside a comment" at all -- the chunker's
+    mask already blanks those out)."""
+    return declared_symbol_names(text)
 
 
 def lint_topic(path: Path, fm: dict) -> tuple[list[str], list[str]]:

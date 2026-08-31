@@ -79,7 +79,7 @@ always exits 0 (see its own comments) and logs failures to
 
 ## 3. Write-side reminder hooks — five more Claude Code hooks in the target project
 
-Live in this repo too (`hooks/{memlib.sh,ledger-post-edit.sh,
+Live in this repo too (`hooks/{memlib.sh,mc-watchdog.sh,ledger-post-edit.sh,
 precompact-persist.sh,sessionstart-remind.sh,userprompt-remind.sh,sessionend-stamp.sh}`),
 wired into a project's Claude Code settings exactly like `pre-edit-chain.sh`
 above. They gather evidence (an edit ledger, git HEAD movement) and, at most

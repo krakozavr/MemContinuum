@@ -28,7 +28,16 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MEMIDX="$REPO_ROOT/memidx.py"
-PY="/home/user/dev/mem-venv/bin/python"
+# Python resolution order (README.md "Requirements" / hooks/memlib.sh): env
+# override -> <engine>/.venv/bin/python -> error naming the fix. No machine
+# path is ever hardcoded in tracked content (privacy requirement,
+# tests/test_install.py TestNoMachineIdentifyingContent).
+PY="${MEMCONTINUUM_PYTHON:-$REPO_ROOT/.venv/bin/python}"
+if [ ! -x "$PY" ]; then
+  echo "ERROR: no python resolved -- set \$MEMCONTINUUM_PYTHON to a venv python" \
+    "with fastembed/PyYAML installed (see README.md Requirements)" >&2
+  exit 1
+fi
 SOURCES_ROOT="${1:-$HOME/dev/private-corpus/Sources}"
 
 CACHE_DIR="$HOME/.cache/codanna-bench"

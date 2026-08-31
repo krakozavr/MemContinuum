@@ -16,6 +16,7 @@ import io
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -2172,6 +2173,41 @@ class TestSessionEndStamp(HookTestBase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertLess(elapsed, 1.5)
 
+    def test_watchdog_budget_reduced_to_1_2s(self):
+        """Finding 1: SessionEnd's own harness budget is 1.5s (this
+        hook's own header), tighter than the shared 2s default every
+        other hook's guard uses (hooks/mc-watchdog.sh) -- its own
+        watchdog budget must leave real headroom under that ceiling, not
+        consume it. A python wrapper that hangs on every real work call
+        (same pattern as e.g. TestPrecompactPersist.test_fail_open_on_timeout)
+        proves the bound empirically: the OLD shared 2s default would
+        leave ~2.0-2.3s elapsed here (launcher startup + post-kill reap
+        add a little past the bare 2.0s); the reduced 1.2s budget must
+        land well under that, with real margin to spare before the 1.5s
+        harness ceiling."""
+        session_id = "s-end-budget"
+        self.seed_ledger(session_id, [])
+        hang_py = Path(self.td) / "hang-python-sessionend"
+        hang_py.write_text(
+            "#!/usr/bin/env bash\n"
+            "for a in \"$@\"; do\n"
+            "  case \"$a\" in\n"
+            "    *MC_WATCHDOG_LAUNCHER*) exec \"" + VENV_PYTHON + "\" \"$@\" ;;\n"
+            "  esac\n"
+            "done\n"
+            "sleep 6\n"
+            f'exec "{VENV_PYTHON}" "$@"\n'
+        )
+        hang_py.chmod(0o755)
+        env = self.base_env(MEMCONTINUUM_PYTHON=str(hang_py))
+        proc, elapsed = run_script(
+            SESSIONEND_HOOK, self.session_end_payload(session_id), env, timeout=10.0
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertLess(
+            elapsed, 1.8, f"SessionEnd's watchdog budget must be ~1.2s (not the shared 2s), took {elapsed:.3f}s"
+        )
+
 
 # ---------------------------------------------------------------------------
 # 7. memlib.sh exists / is sourceable
@@ -2367,6 +2403,88 @@ class TestMacOSPortMechanics(unittest.TestCase):
             5.0,
             f"an orphaned grandchild holding stdout open must not block completion, took {elapsed:.3f}s",
         )
+
+    # ---- finding 1: launcher self-guards against being killed ---------
+
+    def test_watchdog_launcher_sigterm_kills_the_inner_process_group(self):
+        """Finding 1: the launcher spawns its guarded child with
+        start_new_session=True but (before this fix) installed no
+        SIGTERM/SIGINT handler and no atexit killpg -- if the harness
+        kills the LAUNCHER itself (not just its guarded child), the
+        child's whole process group survived unbounded, orphaned. Drives
+        hooks/mc-watchdog.sh's MC_WATCHDOG_LAUNCHER_PY directly (the exact
+        source every one of the five hooks' guard preambles runs) rather
+        than through a full hook invocation, since the property under
+        test -- the launcher's OWN signal handling -- is identical for
+        all five and independent of which hook spawned it.
+
+        This is deliberately RED on the pre-fix source: reverting just
+        the `signal.signal(...)`/`atexit.register(_kill_group)` lines
+        back out of mc-watchdog.sh (equivalent to the launcher blob every
+        hook used to carry before this dedup) leaves the heartbeat child
+        running well past the 1s bound this test asserts, because nothing
+        catches the SIGTERM in time to kill its process group before the
+        default handler just terminates the launcher outright."""
+        launcher_py = subprocess.run(
+            [MC_BASH, "-c", 'source "$1"; printf %s "$MC_WATCHDOG_LAUNCHER_PY"', "_",
+             str(HOOKS_DIR / "mc-watchdog.sh")],
+            capture_output=True, text=True, check=True,
+        ).stdout
+        self.assertIn("MC_WATCHDOG_LAUNCHER", launcher_py)
+
+        pidfile = Path(self.td) / "heartbeat-child.pid"
+        child_script = Path(self.td) / "heartbeat-child.sh"
+        child_script.write_text(
+            "#!/usr/bin/env bash\n"
+            f'echo $$ > "{pidfile}"\n'
+            "while true; do sleep 0.05; done\n"
+        )
+        child_script.chmod(0o755)
+
+        launcher_proc = subprocess.Popen(
+            [VENV_PYTHON, "-c", launcher_py, MC_BASH, str(child_script)],
+            start_new_session=True,
+        )
+        try:
+            deadline = time.monotonic() + 5.0
+            while not pidfile.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(pidfile.exists(), "heartbeat child never started")
+            child_pid = int(pidfile.read_text().strip())
+
+            def child_alive():
+                try:
+                    os.kill(child_pid, 0)
+                except OSError:
+                    return False
+                return True
+
+            self.assertTrue(child_alive(), "heartbeat child died before the SIGTERM was even sent")
+
+            os.kill(launcher_proc.pid, signal.SIGTERM)
+            start = time.monotonic()
+            while child_alive() and time.monotonic() - start < 1.0:
+                time.sleep(0.02)
+            died_after = time.monotonic() - start
+            self.assertFalse(
+                child_alive(),
+                f"inner process group outlived the launcher's SIGTERM by >{died_after:.3f}s",
+            )
+            self.assertLess(died_after, 1.0, f"took {died_after:.3f}s -- expected ~0.5s")
+        finally:
+            try:
+                os.killpg(launcher_proc.pid, signal.SIGKILL)
+            except Exception:
+                pass
+            try:
+                launcher_proc.wait(timeout=2)
+            except Exception:
+                pass
+            try:
+                if pidfile.exists():
+                    os.kill(int(pidfile.read_text().strip()), signal.SIGKILL)
+            except Exception:
+                pass
 
     # ---- item 2: stdout passthrough under the watchdog -----------------
 
