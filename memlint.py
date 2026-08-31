@@ -28,7 +28,7 @@ from memidx import (
     EDGE_RELS,
     KINDS,
     STATUSES,
-    declared_symbol_names,
+    fragment_declared_in_text,
     newest_active_link,
     parse_frontmatter,
     walk_markdown,
@@ -42,16 +42,16 @@ from memidx import (
 _NOT_THIS_RE = re.compile(r"\bNOT\b|not this concept|Does NOT")
 
 
-def _declared_symbols(text: str) -> set[str]:
-    """Finding 5: every #symbol fragment memlint accepts must be something
-    code-search/code-reindex would actually recognize -- so this reuses
-    the chunker's own lexer-aware scan (memidx.declared_symbol_names)
-    rather than a from-scratch regex, which used to miss init, subscript,
-    computed var names, and backtick-quoted names, AND could false-positive
-    on a name that only ever appeared inside a comment or string literal
-    (a regex has no notion of "inside a comment" at all -- the chunker's
-    mask already blanks those out)."""
-    return declared_symbol_names(text)
+def _symbol_declared(frag: str, text: str) -> bool:
+    """Finding 5 (init/subscript/computed var/backtick names) AND finding 4
+    (a QUALIFIED fragment, e.g. "Outer.outerFunc", must validate exactly
+    like code-search's runtime concept attachment accepts it): this reuses
+    memidx.fragment_declared_in_text -- the SAME single-source-of-truth
+    predicate concept_matches_for_chunk uses at attach time -- rather than
+    a from-scratch regex or a flattened bare-name set. Also never
+    false-positives on a name that only appears inside a comment or string
+    literal (the chunker's mask already blanks those out)."""
+    return fragment_declared_in_text(frag, text)
 
 
 def lint_topic(path: Path, fm: dict) -> tuple[list[str], list[str]]:
@@ -148,11 +148,34 @@ def lint_concept(
     cid = fm.get("id") or path.stem
 
     if code_root is not None:
+        resolved_root = code_root.resolve()
         for field in ("implemented_by", "tested_by"):
             for ref in fm.get(field) or []:
                 ref_str = str(ref)
                 ref_path, _, frag = ref_str.partition("#")
-                full = code_root / ref_path
+
+                # Finding 4 (containment): an absolute ref_path silently
+                # discarded code_root entirely (Path's `/` operator drops
+                # the left side for an absolute right-hand side), and a
+                # relative "../.." path could walk outside code_root with
+                # no check at all -- either used to be judged only by
+                # whatever full.exists() happened to say about wherever it
+                # landed. Both are now a hard, named error instead.
+                if Path(ref_path).is_absolute():
+                    errors.append(
+                        f"{path}: {cid} {field} path {ref_path!r} is absolute -- "
+                        f"must be relative to code_root {resolved_root}"
+                    )
+                    continue
+                full = (resolved_root / ref_path).resolve()
+                try:
+                    full.relative_to(resolved_root)
+                except ValueError:
+                    errors.append(
+                        f"{path}: {cid} {field} path {ref_path!r} escapes code_root {resolved_root}"
+                    )
+                    continue
+
                 if not full.exists():
                     errors.append(
                         f"{path}: {cid} {field} path {ref_path!r} does not exist under {code_root}"
@@ -160,10 +183,10 @@ def lint_concept(
                     continue
                 if frag:
                     try:
-                        declared = _declared_symbols(full.read_text(encoding="utf-8", errors="ignore"))
+                        text = full.read_text(encoding="utf-8", errors="ignore")
                     except OSError:
-                        declared = set()
-                    if frag not in declared:
+                        text = ""
+                    if not _symbol_declared(frag, text):
                         errors.append(
                             f"{path}: {cid} {field} fragment {frag!r} is not a func/struct/enum/"
                             f"class/subscript declared in {ref_path!r}"

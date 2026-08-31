@@ -109,7 +109,23 @@ class TestD1RebuildStable(unittest.TestCase):
 
 
 class TestD2ProjectIsolation(unittest.TestCase):
-    def test_project_a_query_never_returns_project_b(self):
+    """Finding 2 (reviewer, 2026-08-31): several tables here (records/
+    embeddings/concepts/links) key rows by `path` alone, not
+    (project, path). This class's ORIGINAL test reindexed two DIFFERENT
+    projects into the SAME physical db file and asserted per-project query
+    filtering worked -- but root_a/root_b are different absolute
+    directories, so their stored `path` values never actually collided on
+    that path-only PK either way; the "isolation" it proved was
+    incidental, never the collision the reviewer was worried about.
+    Superseded by the simpler, equally-safe fix the finding itself
+    sanctions ("or clean refusal"): opening the SAME db file under a
+    DIFFERENT --project than the one that first claimed it is now a hard,
+    named error (enforce_project_isolation) instead of a silent
+    cross-project eviction/overwrite risk -- composite-key migration
+    across every table/query here was rejected as disproportionate to a
+    collision only reachable via an explicit --db override."""
+
+    def test_reopening_the_same_db_file_under_a_different_project_is_refused(self):
         with tempfile.TemporaryDirectory() as td:
             root_a = Path(td) / "a"
             root_b = Path(td) / "b"
@@ -118,16 +134,51 @@ class TestD2ProjectIsolation(unittest.TestCase):
             db = Path(td) / "shared.sqlite"  # same db file, different --project
 
             reindex(root_a, db, project="proj-a", no_embed=True)
-            reindex(root_b, db, project="proj-b", no_embed=True)
+            with self.assertRaises(memidx.DbProjectMismatchError) as ctx:
+                reindex(root_b, db, project="proj-b", no_embed=True)
+            self.assertIn("proj-a", str(ctx.exception))
+            self.assertIn("proj-b", str(ctx.exception))
+
+    def test_reopening_the_same_db_file_under_the_same_project_is_unaffected(self):
+        with tempfile.TemporaryDirectory() as td:
+            root_a = Path(td) / "a"
+            build_real_corpus(root_a)
+            db = Path(td) / "shared.sqlite"
+
+            reindex(root_a, db, project="proj-a", no_embed=True)
+            reindex(root_a, db, project="proj-a", no_embed=True)  # must not raise
 
             results = _run_search(ns(
                 db=str(db), project="proj-a", query="hidden files count", mode="fts",
                 status=[], type=[], area=None, topic=None, authority=None, limit=50, json=True,
             ))
             self.assertTrue(results)
-            for r in results:
-                self.assertTrue(r["path"].startswith(str(root_a)), r["path"])
-                self.assertFalse(r["path"].startswith(str(root_b)), r["path"])
+
+
+class TestOpenDbProjectIsolationDirect(unittest.TestCase):
+    """Finding 2, direct-API coverage of open_db/enforce_project_isolation
+    (not routed through a full reindex)."""
+
+    def test_open_db_without_project_never_enforces(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "shared.sqlite"
+            memidx.open_db(db, project="proj-a").close()
+            # no `project` kwarg given here -- must never raise, even
+            # though the file is already owned by proj-a (existing direct
+            # open_db(path) callers, e.g. tests inspecting a db file, must
+            # be unaffected).
+            memidx.open_db(db).close()
+
+    def test_open_code_db_has_no_project_isolation_check(self):
+        # Finding 2: the CODE db is already project-scoped by its own
+        # schema (file_sha PK is (path, project), chunk deletes are
+        # project-scoped, code_meta is keyed by project) -- opening it
+        # must never be refused, regardless of how many different
+        # projects' code-reindex runs land in the same physical file.
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "shared-code.sqlite"
+            memidx.open_code_db(db).close()
+            memidx.open_code_db(db).close()
 
 
 class TestD3AndFilters(unittest.TestCase):

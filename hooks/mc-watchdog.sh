@@ -38,8 +38,22 @@
 # default) would be orphaned with no bound at all. A signal handler for
 # SIGTERM/SIGINT plus an atexit hook now killpg the child group on every
 # exit path, not just the normal timeout/success ones.
-MC_WATCHDOG_LAUNCHER_PY="$(cat <<'MC_WATCHDOG_PY_EOF'
-import atexit, os, signal, subprocess, sys
+# Finding 5 (MEDIUM): this used to be `X="$(cat <<'EOF' ... EOF)"` -- a
+# command substitution that forks+execs the external `cat` binary BEFORE
+# this file's own "no filesystem/subprocess work of its own" guarantee
+# even starts to hold, i.e. before the watchdog's own deadline clock below
+# starts ticking at all (that only starts once the guarded script's Popen
+# call runs, strictly after this assignment completes). A slow/hung `cat`
+# on PATH at that point would blow the whole invocation's wall time with
+# no bound whatsoever. `read -r -d ''` is a bash BUILTIN (bash 3.2 safe --
+# the -d flag has existed since bash 2.04): it reads the heredoc directly
+# off its own stdin with no external process and no subshell at all. It
+# returns 1 because the heredoc never contains a NUL delimiter (read hits
+# real EOF instead of finding one) -- expected and harmless, `|| true`
+# only exists so `set -e` callers (none today, but never assume) aren't
+# tripped by that nonzero-but-successful read.
+IFS= read -r -d '' MC_WATCHDOG_LAUNCHER_PY <<'MC_WATCHDOG_PY_EOF' || true
+import atexit, os, signal, subprocess, sys, time
 # MC_WATCHDOG_LAUNCHER: runs the real hook script as a child in its own
 # process group and enforces a wall-clock budget (MC_WATCHDOG_BUDGET env,
 # seconds, default 2 -- SessionEnd sets 1.2, its harness budget is 1.5s)
@@ -52,6 +66,18 @@ except ValueError:
     budget = 2.0
 
 proc = None
+# Finding 6 (LOW, startup signal race): a SIGTERM/SIGINT can land while
+# `proc` is still None -- strictly between signal.signal() registering
+# below and the `proc = subprocess.Popen(...)` assignment a few lines
+# down actually completing (CPython checks for a pending signal at GIL
+# reacquisition points inside a C call like Popen's own fork/exec, not
+# only between Python bytecodes -- so the real child process can already
+# exist even though this module's own `proc` name isn't bound to it yet).
+# In that window the handler has no pid to kill at all, so it must NOT
+# exit immediately (that would leak the about-to-exist child forever,
+# unbounded) -- it only records the request; the code right after Popen
+# returns checks it and kills immediately once `proc` is real.
+pending_kill = False
 
 
 def _kill_group():
@@ -63,9 +89,38 @@ def _kill_group():
         pass
 
 
+def _log_watchdog_kill():
+    # Every watchdog kill must leave one log line: on budget expiry the
+    # guarded child is killed before it ever gets a chance to write its
+    # own outcome line (it may be mid-call, or long before its own
+    # finish()), so the invocation would otherwise leave NO trace at all
+    # in hook.log. sys.argv here is [ "-c", "$BASH", "$BASH_SOURCE[0]",
+    # ...rest ] (see this file's own "Used as:" header comment) --
+    # argv[2] is the guarded hook script's own path. Best-effort only,
+    # like every other log write in this repo: never lets a logging
+    # failure change the launcher's own exit behavior.
+    try:
+        home = os.environ.get("MEMCONTINUUM_HOME") or os.path.join(
+            os.path.expanduser("~"), ".memcontinuum"
+        )
+        hook_name = os.path.basename(sys.argv[2]) if len(sys.argv) > 2 else "unknown"
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+        os.makedirs(home, exist_ok=True)
+        with open(os.path.join(home, "hook.log"), "a") as f:
+            f.write(f"{ts} outcome=watchdog-killed hook={hook_name}\n")
+    except Exception:
+        pass
+
+
 def _on_signal(signum, frame):
-    _kill_group()
-    sys.exit(0)
+    global pending_kill
+    pending_kill = True
+    if proc is not None:
+        _kill_group()
+        sys.exit(0)
+    # else: proc not assigned yet -- return normally (do NOT sys.exit
+    # here) so the in-flight subprocess.Popen() call/assignment below can
+    # finish; the pending_kill check right after it takes over from here.
 
 
 signal.signal(signal.SIGTERM, _on_signal)
@@ -76,10 +131,13 @@ try:
     proc = subprocess.Popen(sys.argv[1:], start_new_session=True)
 except Exception:
     sys.exit(0)
+if pending_kill:
+    _kill_group()
+    sys.exit(0)
 try:
     proc.wait(timeout=budget)
 except subprocess.TimeoutExpired:
-    pass
+    _log_watchdog_kill()
 # Unconditional group sweep (not just on a timeout): a hung call several
 # layers deep can background a detached descendant that inherits the
 # real stdout/stderr fds, which would otherwise keep those pipes open
@@ -94,4 +152,3 @@ except Exception:
     pass
 sys.exit(0)
 MC_WATCHDOG_PY_EOF
-)"

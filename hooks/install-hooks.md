@@ -53,7 +53,46 @@ Notes:
 - The command line, not a JSON `env` block, carries the env vars — Claude Code hook `command`
   entries run through a shell, so `VAR=value ... command` works directly.
 
-## 2. `post-commit-reindex.sh` — git hook in the STORE repo
+## 2. `newfile-nudge.sh` — Claude Code `PreToolUse` hook (Write only)
+
+Lives in this repo (`hooks/newfile-nudge.sh`), wired into the same project settings as
+`pre-edit-chain.sh` above but as a SEPARATE `PreToolUse` matcher group (`"Write"`, never
+`"Edit|Write"` — this hook only ever fires on a path that does not exist yet; an edit to an
+existing file is `pre-edit-chain.sh`'s job, not this one's). Deliberately minimal: no
+`MEMCONTINUUM_ROOT`/`PROJECT`/`STRIP_PREFIX`, since this hook never calls `memidx.py` or reads the
+index at all — it only checks that the write target is new, under a configured code root, and has
+an indexed source extension, then injects one reminder line.
+
+Rendered from `templates/newfile-nudge-hook.json.tmpl` + one
+`templates/newfile-nudge-filter-pair.json.tmpl` pair per `--code-root`, merged into the SAME
+target `hooks.PreToolUse` array as `pre-edit-chain.sh` (a second group, not a second array):
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Write(<code-root>/**)",
+            "command": "MEMCONTINUUM_CODE_ROOT=<code-root> MEMCONTINUUM_PYTHON=<python> <this-repo>/hooks/newfile-nudge.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Notes:
+- `MEMCONTINUUM_HOME` is deliberately omitted here, same reason as `pre-edit-chain.sh` above.
+- Runs under the shared `hooks/mc-watchdog.sh` wall-clock watchdog like the five write-side hooks
+  below, even though its own logic never calls python for real work — one shared mechanism, not a
+  second bespoke timeout story for the one hook that happens to be fast.
+
+## 3. `post-commit-reindex.sh` — git hook in the STORE repo
 
 Lives in this repo too, but runs as a `post-commit` hook inside the **store**
 repo — not this tool repo, and not the code repo it describes.
@@ -77,7 +116,7 @@ re-installing. A failed reindex must never block the commit — the script
 always exits 0 (see its own comments) and logs failures to
 `$MEMCONTINUUM_HOME/hook.log` instead.
 
-## 3. Write-side reminder hooks — five more Claude Code hooks in the target project
+## 4. Write-side reminder hooks — five more Claude Code hooks in the target project
 
 Live in this repo too (`hooks/{memlib.sh,mc-watchdog.sh,ledger-post-edit.sh,
 precompact-persist.sh,sessionstart-remind.sh,userprompt-remind.sh,sessionend-stamp.sh}`),

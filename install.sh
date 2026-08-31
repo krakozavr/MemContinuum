@@ -27,7 +27,7 @@ MEMIDX="$SCRIPT_DIR/memidx.py"
 MEMLINT="$SCRIPT_DIR/memlint.py"
 SKILL_SRC="$SCRIPT_DIR/skills/memory-search/SKILL.md"
 
-OUR_HOOK_SCRIPTS="pre-edit-chain.sh ledger-post-edit.sh precompact-persist.sh sessionstart-remind.sh userprompt-remind.sh sessionend-stamp.sh"
+OUR_HOOK_SCRIPTS="pre-edit-chain.sh newfile-nudge.sh ledger-post-edit.sh precompact-persist.sh sessionstart-remind.sh userprompt-remind.sh sessionend-stamp.sh"
 
 PROJECT=""
 STORE=""
@@ -364,6 +364,7 @@ dry_run = os.environ.get("MC_INSTALL_DRY_RUN", "0") == "1"
 
 OUR_SCRIPTS = [
     "pre-edit-chain.sh",
+    "newfile-nudge.sh",
     "ledger-post-edit.sh",
     "precompact-persist.sh",
     "sessionstart-remind.sh",
@@ -445,6 +446,34 @@ if code_roots:
         print(pre_rendered, file=sys.stderr)
         sys.exit(1)
     for event, groups in pre_block["hooks"].items():
+        blocks.setdefault(event, []).extend(groups)
+
+    # --- newfile-nudge block (finding 8): a SECOND, separate PreToolUse
+    # matcher group (matcher "Write" only, never "Edit|Write" -- this hook
+    # never fires on an edit to an existing file) appended alongside the
+    # pre-edit-chain.sh group above, one `if` entry per --code-root. Never
+    # carries MEMCONTINUUM_ROOT/PROJECT/STRIP_PREFIX -- this hook never
+    # calls memidx.py at all (see its own header comment).
+    nudge_pair_tmpl = read_tmpl("newfile-nudge-filter-pair.json.tmpl")
+    nudge_pairs = []
+    for cr in code_roots:
+        nudge_pairs.append(render(nudge_pair_tmpl, {
+            "CODE_ROOT": esc_json(cr.rstrip("/")),
+            "CODE_ROOT_CMD": esc_cmd(cr.rstrip("/")),
+            "PYTHON": esc_cmd(python_bin),
+            "HOOKS_DIR": esc_cmd(hooks_dir),
+        }))
+    nudge_filters_text = ",\n".join(nudge_pairs)
+
+    nudge_tmpl = read_tmpl("newfile-nudge-hook.json.tmpl")
+    nudge_rendered = nudge_tmpl.replace("{{CODE_ROOT_FILTERS}}", nudge_filters_text)
+    try:
+        nudge_block = json.loads(nudge_rendered)
+    except json.JSONDecodeError as e:
+        print("ERROR: rendered newfile-nudge-hook template is not valid JSON: %s" % e, file=sys.stderr)
+        print(nudge_rendered, file=sys.stderr)
+        sys.exit(1)
+    for event, groups in nudge_block["hooks"].items():
         blocks.setdefault(event, []).extend(groups)
 
 
@@ -634,7 +663,7 @@ else
    id, title, area, code_refs, links: [...]), then reindex:
      PYTHONPATH= $PYTHON_BIN $MEMIDX reindex --root $STORE --project $PROJECT
    (the store's post-commit hook does this automatically after a commit).
-3. Uninstall: remove the six hook entries below from
+3. Uninstall: remove the seven hook entries below from
      $CLAUDE_DIR/settings.local.json
    (identified by these script basenames in their "command" fields --
    safe to hand-delete, or restore $CLAUDE_DIR/settings.local.json.bak-memcontinuum):

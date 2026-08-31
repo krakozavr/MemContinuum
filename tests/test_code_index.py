@@ -18,6 +18,7 @@ running this file; see README.md "Requirements" / "Running the tests".
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -296,6 +297,48 @@ class TestChunkerGapResyncModifiers(unittest.TestCase):
         self.assertEqual(by_name["subscript"]["kind"], "subscript")
 
 
+class TestChunkerClassMemberAndBacktickContainer(unittest.TestCase):
+    """Finding 3: `class subscript` (and other `class <modifier> func/var/
+    subscript` member forms) is a class-level MEMBER, not a phantom type
+    container -- only `class func`/`class var` used to be excluded. A
+    backtick-quoted extension target must still be kept as a real
+    container, including when it is itself a dotted, backtick-quoted
+    nested type."""
+
+    def setUp(self):
+        self.text = (FIXTURES / "ClassMemberAndBacktickContainer.swift").read_text()
+        self.chunks, self.gaps = memidx.chunk_source(self.text)
+
+    def test_no_gaps(self):
+        self.assertEqual(self.gaps, [])
+
+    def test_class_subscript_qualifies_under_box_not_under_a_phantom_subscript_container(self):
+        names = {c["qualified_name"] for c in self.chunks}
+        self.assertIn("Box.subscript", names)
+        self.assertNotIn("Box.subscript.subscript", names)
+
+    def test_class_subscript_is_not_a_type_container(self):
+        symbols = {c["symbol"] for c in self.chunks}
+        # a phantom "subscript" container would make "make" qualify as
+        # Box.subscript.make instead of Box.make.
+        self.assertIn("Box.make", {c["qualified_name"] for c in self.chunks})
+
+    def test_class_final_func_member_form_is_not_a_phantom_container(self):
+        names = {c["qualified_name"] for c in self.chunks}
+        self.assertIn("Box.make", names)
+        self.assertNotIn("Box.final.make", names)
+        symbols = {c["symbol"] for c in self.chunks}
+        self.assertNotIn("final", symbols)
+
+    def test_backtick_extension_target_keeps_its_container(self):
+        names = {c["qualified_name"] for c in self.chunks}
+        self.assertIn("Type.plain", names)
+
+    def test_backtick_dotted_nested_extension_target_keeps_its_container(self):
+        names = {c["qualified_name"] for c in self.chunks}
+        self.assertIn("Type.Inner.nested", names)
+
+
 # ---------------------------------------------------------------------------
 # 2. code-reindex / code-search (DB-backed)
 # ---------------------------------------------------------------------------
@@ -489,7 +532,9 @@ class TestVectorAndHybridJSONIsSerializable(unittest.TestCase):
             "    rc = memidx.main(['code-search', '--db', %r, '[redacted probe query]', "
             "'--mode', %r, '--limit', '3', '--json'])\n"
             "assert rc == 0, rc\n"
-            "out = json.loads(buf.getvalue())\n"
+            "env = json.loads(buf.getvalue())\n"
+            "assert env['state'] == 'current', env['state']\n"
+            "out = env['results']\n"
             "assert len(out) > 0, 'zero hits -- the float32 path was never exercised'\n"
             "for h in out:\n"
             "    assert isinstance(h['score'], float), (h['score'], type(h['score']))\n"
@@ -586,7 +631,7 @@ class TestConceptAttachment(unittest.TestCase):
                 self.assertEqual(rc, 0)
                 import json as _json
 
-                results = _json.loads(buf.getvalue())
+                results = _json.loads(buf.getvalue())["results"]
                 self.assertTrue(any(r.get("concept_id") == "CON-ATTACH" for r in results), results)
             finally:
                 del os.environ["MEMCONTINUUM_HOME"]
@@ -639,7 +684,7 @@ class TestConceptAttachment(unittest.TestCase):
                         ns(query="outer func", mode="fts", limit=5, json=True, db=str(code_db))
                     )
                 self.assertEqual(rc, 0)
-                results = _json.loads(buf.getvalue())
+                results = _json.loads(buf.getvalue())["results"]
                 self.assertTrue(
                     any(r.get("concept_id") == "CON-EXPLICITDB" for r in results), results
                 )
@@ -718,7 +763,7 @@ class TestConceptAttachment(unittest.TestCase):
                     with contextlib.redirect_stdout(buf):
                         rc = memidx.cmd_code_search(ns(query=query, mode="fts", limit=5, json=True))
                     self.assertEqual(rc, 0)
-                    return _json.loads(buf.getvalue())[0]
+                    return _json.loads(buf.getvalue())["results"][0]
 
                 outer_hit = top_hit("outer func")
                 self.assertEqual(outer_hit["qualified_name"], "Outer.outerFunc")
@@ -794,6 +839,100 @@ class TestStaleWarning(unittest.TestCase):
                 [sys.executable, "-c", script], capture_output=True, text=True, timeout=30
             )
             self.assertNotIn("stale", result.stderr.lower(), result.stderr)
+
+
+class TestIndexProvenance(unittest.TestCase):
+    """Finding 1 (HIGH): code-search must distinguish three code-index
+    states and SAY so -- uninitialized (never reindexed for this project:
+    refuse, not a healthy-empty result), stale (existing warning, now also
+    surfaced in --json), current (indexed_at/code_root/head_sha surfaced
+    in --json)."""
+
+    def _run(self, argv):
+        script = (
+            "import sys; sys.path.insert(0, %r); import memidx; "
+            "sys.exit(memidx.main(%r))"
+        ) % (str(TOOLS_DIR), argv)
+        return subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, text=True, timeout=30
+        )
+
+    def test_uninitialized_index_refuses_not_a_bare_empty_list(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "never-reindexed-code.sqlite"
+            result = self._run(["code-search", "--db", str(db), "anything", "--mode", "fts"])
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("code-reindex", (result.stdout + result.stderr).lower(), result.stderr)
+            self.assertNotEqual(result.stdout.strip(), "[]")
+
+    def test_uninitialized_index_json_carries_structured_state_not_bare_list(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "never-reindexed-code.sqlite"
+            result = self._run(["code-search", "--db", str(db), "anything", "--mode", "fts", "--json"])
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            data = json.loads(result.stdout)
+            self.assertEqual(data["state"], "uninitialized")
+            self.assertEqual(data["results"], [])
+
+    def test_current_index_json_carries_indexed_at_and_root(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            shutil.copy(FIXTURES / "NestedTypes.swift", root / "NestedTypes.swift")
+            db = Path(td) / "idx-code.sqlite"
+            code_reindex(root, db, no_embed=True)
+
+            result = self._run(["code-search", "--db", str(db), "outer func", "--mode", "fts", "--json"])
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            data = json.loads(result.stdout)
+            self.assertEqual(data["state"], "current")
+            self.assertEqual(data["code_root"], str(root))
+            self.assertIsInstance(data["indexed_at"], (int, float))
+            self.assertGreater(len(data["results"]), 0)
+
+    def test_stale_index_json_carries_state_stale(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            target = root / "NestedTypes.swift"
+            shutil.copy(FIXTURES / "NestedTypes.swift", target)
+            db = Path(td) / "idx-code.sqlite"
+            code_reindex(root, db, no_embed=True)
+            os.utime(target, (time.time() + 3600, time.time() + 3600))
+
+            result = self._run(["code-search", "--db", str(db), "outer func", "--mode", "fts", "--json"])
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            data = json.loads(result.stdout)
+            self.assertEqual(data["state"], "stale")
+
+    def test_code_meta_stores_head_sha_when_code_root_is_a_git_repo(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            shutil.copy(FIXTURES / "NestedTypes.swift", root / "NestedTypes.swift")
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run(
+                ["git", "-C", str(root), "-c", "user.email=t@t.t", "-c", "user.name=t",
+                 "add", "-A"], check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "-c", "user.email=t@t.t", "-c", "user.name=t",
+                 "commit", "-q", "-m", "init"], check=True,
+            )
+            expected_sha = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "HEAD"],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
+
+            db = Path(td) / "idx-code.sqlite"
+            code_reindex(root, db, no_embed=True)
+
+            conn = memidx.open_code_db(db)
+            row = conn.execute(
+                "SELECT head_sha FROM code_meta WHERE project=?", (memidx.DEFAULT_PROJECT,)
+            ).fetchone()
+            conn.close()
+            self.assertEqual(row["head_sha"], expected_sha)
 
 
 # ---------------------------------------------------------------------------
@@ -969,6 +1108,94 @@ class TestMemlintSymbolVocabulary(unittest.TestCase):
             errors, _warnings = memlint.lint_root(root, code_root=CODE_ROOT)
             self.assertTrue(
                 any("CON-VOCAB-BADSTRING" in e and "stringOnlySymbol" in e for e in errors),
+                errors,
+            )
+
+
+class TestMemlintFragmentAttachAgreement(unittest.TestCase):
+    """Finding 4: memlint's #symbol vocabulary check must accept a QUALIFIED
+    fragment (e.g. "Outer.outerFunc") exactly as code-search's runtime
+    concept attachment (concept_matches_for_chunk) does -- one shared
+    matcher (memidx.fragment_matches_symbol / fragment_declared_in_text),
+    not two independently-encoded rules that can disagree."""
+
+    def test_qualified_fragment_matching_runtime_attachment_is_not_an_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            shutil.copy(CONCEPTS / "qualified_symbol_good.md", root / "qualified_symbol_good.md")
+            errors, _warnings = memlint.lint_root(root, code_root=CODE_ROOT)
+            self.assertFalse(any("CON-CODE-QUALGOOD" in e for e in errors), errors)
+
+    def test_lint_and_runtime_attach_agree_on_the_same_qualified_fragment(self):
+        # The same predicate, exercised both ways on the same fixture data:
+        # lint_concept accepts "Outer.outerFunc" against NestedTypes.swift
+        # (above) AND concept_matches_for_chunk would match a chunk whose
+        # symbol="outerFunc"/qualified_name="Outer.outerFunc" against a
+        # concept_paths row fragment of "Outer.outerFunc" -- verified
+        # directly via the shared predicate so a future regression that
+        # breaks only one side is caught here.
+        self.assertTrue(memidx.fragment_matches_symbol("Outer.outerFunc", "outerFunc", "Outer.outerFunc"))
+        text = (FIXTURES / "NestedTypes.swift").read_text()
+        self.assertTrue(memidx.fragment_declared_in_text("Outer.outerFunc", text))
+
+
+class TestMemlintPathContainment(unittest.TestCase):
+    """Finding 4: implemented_by/tested_by path resolution against code_root
+    must be containment-checked -- an absolute ref_path used to silently
+    discard code_root entirely (Path's `/` operator drops the left side for
+    an absolute right-hand side), and a relative "../" path could walk
+    outside code_root with no check at all."""
+
+    def _lint_one_ref(self, ref_path: str, td: Path, code_root: Path):
+        (td / "escape_concept.md").write_text(
+            "---\n"
+            "type: concept\n"
+            "id: CON-CODE-ESCAPE\n"
+            "title: Fixture -- path containment\n"
+            "owner_boundary: fixture\n"
+            "implemented_by:\n"
+            f"  - {ref_path}\n"
+            "tested_by: []\n"
+            "governed_by: []\n"
+            "involved_in: []\n"
+            "---\n\n"
+            "Fixture. NOT this concept: nothing else.\n"
+        )
+        return memlint.lint_root(td, code_root=code_root)
+
+    def test_absolute_ref_path_escaping_code_root_is_an_error(self):
+        with tempfile.TemporaryDirectory() as td_str:
+            td = Path(td_str)
+            code_root = td / "code"
+            code_root.mkdir()
+            outside = td / "secret.swift"
+            outside.write_text("func real() {}\n")
+            errors, _warnings = self._lint_one_ref(str(outside), td, code_root)
+            self.assertTrue(
+                any("CON-CODE-ESCAPE" in e and "absolute" in e for e in errors), errors
+            )
+
+    def test_relative_dotdot_escaping_code_root_is_an_error(self):
+        with tempfile.TemporaryDirectory() as td_str:
+            td = Path(td_str)
+            code_root = td / "code"
+            code_root.mkdir()
+            outside = td / "secret.swift"
+            outside.write_text("func real() {}\n")
+            errors, _warnings = self._lint_one_ref("../secret.swift", td, code_root)
+            self.assertTrue(
+                any("CON-CODE-ESCAPE" in e and "escapes code_root" in e for e in errors), errors
+            )
+
+    def test_relative_path_inside_code_root_is_not_a_containment_error(self):
+        with tempfile.TemporaryDirectory() as td_str:
+            td = Path(td_str)
+            code_root = td / "code"
+            code_root.mkdir()
+            (code_root / "Inside.swift").write_text("func real() {}\n")
+            errors, _warnings = self._lint_one_ref("Inside.swift", td, code_root)
+            self.assertFalse(
+                any("CON-CODE-ESCAPE" in e and ("absolute" in e or "escapes" in e) for e in errors),
                 errors,
             )
 

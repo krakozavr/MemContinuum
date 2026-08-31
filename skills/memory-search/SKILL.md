@@ -70,7 +70,10 @@ a file's contents"), not as a symbol name — the index is built to match on tha
 `concept_id` is set means a decision record governs that code; check it (`memidx.py why <path>`)
 before working around or duplicating it.
 
-**Name the hits in your report, or state that none were found** — the same rule as the markdown
-search above, and for the same reason: silently skipping this check is exactly how a second,
-slightly different `embedInScrollBox` gets written next to the first one. Run `code-reindex` first
-if the index doesn't exist yet or a stale-index warning appears on stderr.
+The `--json` output carries a `state` field: `uninitialized` (exit non-zero — `code-reindex`
+was never run for this project; a bare `[]` here is a refusal, not a real "nothing found"),
+`stale` (source changed since the last `code-reindex` — a warning, not a block), or `current`.
+**Confirm the code index is initialized/current (or stale with eyes open) before trusting a
+"nothing found" — then run `code-search`; name relevant hits in your report, or say none** —
+the same rule as the markdown search above: silently skipping this check is exactly how a
+second, slightly different `embedInScrollBox` gets written next to the first one.

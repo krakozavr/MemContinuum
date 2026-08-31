@@ -25,6 +25,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -216,6 +217,15 @@ def embed_text_for(record: dict) -> str:
 # ---------------------------------------------------------------------------
 
 SCHEMA_SQL = """
+-- Finding 2: records the single project this physical db file is allowed
+-- to be opened for (see enforce_project_isolation) -- a plain key/value
+-- table, not project-scoped itself (there is exactly one owning project
+-- per db file, by construction).
+CREATE TABLE IF NOT EXISTS db_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT
+);
+
 CREATE TABLE IF NOT EXISTS records (
   path TEXT PRIMARY KEY,
   sha256 TEXT NOT NULL,
@@ -340,12 +350,49 @@ def ensure_links_invariant_column(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE links ADD COLUMN invariant TEXT")
 
 
-def open_db(db_path: Path) -> sqlite3.Connection:
+class DbProjectMismatchError(RuntimeError):
+    """Finding 2: raised by open_db when the physical db file being opened
+    already claims a DIFFERENT owning project than the one it's being
+    opened for now."""
+
+
+def enforce_project_isolation(conn: sqlite3.Connection, db_path: Path, project: str) -> None:
+    """Finding 2 (MEDIUM, same-file --db project isolation): several
+    tables here (records/embeddings/concepts/links) key rows by `path`
+    alone, not (project, path) -- migrating every one of them to a
+    composite key would touch nearly every table/query in this file for a
+    collision only reachable via an explicit --db override in the first
+    place (the default per-project "<project>.sqlite" filename already
+    keeps two projects on separate files). The simpler, equally-safe fix:
+    record the db's OWNING project the first time it's ever opened (in
+    db_meta), and hard-refuse any later open under a DIFFERENT project --
+    a same-file, different-project open is a named error, never a silent
+    cross-project eviction/overwrite. Only enforced when `project` is
+    given (open_db's default `project=None` skips this entirely, e.g. for
+    tests/tools that just want to inspect a db file directly)."""
+    row = conn.execute("SELECT value FROM db_meta WHERE key='project'").fetchone()
+    if row is None:
+        conn.execute("INSERT INTO db_meta (key, value) VALUES ('project', ?)", (project,))
+        conn.commit()
+        return
+    owner = row["value"]
+    if owner != project:
+        raise DbProjectMismatchError(
+            f"{db_path} is owned by project {owner!r}, refusing to open it for project "
+            f"{project!r} -- this db keys rows by path alone, so opening the SAME physical "
+            f"file for a different --project would silently evict/overwrite that project's "
+            f"rows. Pass a different --db, or use --project {owner!r}."
+        )
+
+
+def open_db(db_path: Path, project: str | None = None) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA_SQL)
     ensure_links_invariant_column(conn)
+    if project is not None:
+        enforce_project_isolation(conn, db_path, project)
     return conn
 
 
@@ -479,7 +526,7 @@ def walk_markdown(root: Path):
 def cmd_reindex(args) -> int:
     root = Path(args.root).resolve()
     db_path = resolve_db_path(args)
-    conn = open_db(db_path)
+    conn = open_db(db_path, project=args.project)
     t0 = time.time()
 
     existing = {
@@ -646,7 +693,7 @@ def vector_ranked(conn, query: str, project: str) -> list[tuple[str, float]]:
 
 def cmd_search(args) -> int:
     db_path = resolve_db_path(args)
-    conn = open_db(db_path)
+    conn = open_db(db_path, project=args.project)
     allowed = filtered_paths(conn, args)
 
     results: list[tuple[str, float]] = []
@@ -834,7 +881,7 @@ def chain_json(topic_row, link_rows, edges_by_from, assumptions_by_link) -> dict
 
 def cmd_chain(args) -> int:
     db_path = resolve_db_path(args)
-    conn = open_db(db_path)
+    conn = open_db(db_path, project=args.project)
     topic_row = find_topic_row(conn, args.project, args.topic)
     if topic_row is None:
         print(f"no topic matching {args.topic!r}", file=sys.stderr)
@@ -907,6 +954,50 @@ def concept_matches_for_path(conn, project: str, file_path: str) -> list:
     return [by_id[cid] for cid in matched_ids if cid in by_id]
 
 
+def fragment_matches_symbol(frag: str, symbol: str, qualified_name: str) -> bool:
+    """The single acceptance rule for a "#symbol" fragment against one
+    chunk (finding 4): exact bare-symbol match, exact full-qualified-name
+    match, or a qualified suffix match (frag written as a bare member name
+    or a partial dotted suffix, e.g. "outerFunc" or "Middle.outerFunc"
+    matching qualified_name "Outer.Middle.outerFunc"). This is the ONE
+    place this rule is expressed -- code-search's per-hit concept
+    attachment (concept_matches_for_chunk, below) and memlint's #symbol
+    vocabulary check (fragment_declared_in_text, and memlint.py's
+    lint_concept through it) both call this instead of each encoding their
+    own copy, so a fragment written qualified (e.g. "Outer.outerFunc")
+    validates identically on both surfaces (reviewer finding: they used to
+    disagree -- attachment accepted it, lint rejected it)."""
+    return frag == symbol or frag == qualified_name or qualified_name.endswith("." + frag)
+
+
+def fragment_declared_in_text(frag: str, text: str) -> bool:
+    """memlint's #symbol vocabulary check (memlint.py's lint_concept),
+    reusing chunk_source's own lexer-aware chunks (not the flattened
+    bare-name set declared_symbol_names returns) so a QUALIFIED fragment
+    (e.g. "Outer.outerFunc") is accepted exactly when code-search's
+    concept_matches_for_chunk would accept it as a match for that chunk --
+    same fragment_matches_symbol predicate, applied here per-chunk instead
+    of per-DB-row. A fragment naming just a container type (no member,
+    e.g. "Outer") is still accepted too, matching declared_symbol_names'
+    existing container-name behavior."""
+    chunks, _gaps = chunk_source(text)
+    for c in chunks:
+        if fragment_matches_symbol(frag, c["symbol"], c["qualified_name"]):
+            return True
+    mask, _match_dict, _gaps2 = _build_mask_and_match_dict(text)
+    for m in _KEYWORD_RE.finditer(mask):
+        kw = m.group(1)
+        if kw not in ("class", "struct", "enum", "protocol", "extension", "actor"):
+            continue
+        after = m.start() + len(kw)
+        name = _container_type_name(kw, mask, after)
+        if not name:
+            continue
+        if frag == name or frag in name.split("."):
+            return True
+    return False
+
+
 def concept_matches_for_chunk(
     conn, project: str, file_path: str, symbol: str, qualified_name: str
 ) -> list:
@@ -939,7 +1030,7 @@ def concept_matches_for_chunk(
             continue
         cid = pr["concept_id"]
         if frag:
-            if frag == symbol or frag == qualified_name or qualified_name.endswith("." + frag):
+            if fragment_matches_symbol(frag, symbol, qualified_name):
                 if cid not in seen_symbol:
                     seen_symbol.add(cid)
                     symbol_ids.append(cid)
@@ -1010,7 +1101,7 @@ def concept_json(conn, project: str, concept_row) -> dict:
 
 def cmd_for_path(args) -> int:
     db_path = resolve_db_path(args)
-    conn = open_db(db_path)
+    conn = open_db(db_path, project=args.project)
     matches = topic_matches_for_path(conn, args.project, args.file_path)
     concept_matches = concept_matches_for_path(conn, args.project, args.file_path)
 
@@ -1036,7 +1127,6 @@ def cmd_for_path(args) -> int:
 # ---------------------------------------------------------------------------
 
 SKIP_DIR_NAMES = {".git", ".build"}
-SYMBOL_DEF_RE = r"\b(?:func|class|struct|enum|let|var)\s+{sym}\b"
 
 
 def is_binary_file(path: Path) -> bool:
@@ -1058,16 +1148,83 @@ def iter_code_files(code_root: Path):
             yield fpath
 
 
-def resolve_symbol_to_path(code_root: Path, symbol: str) -> str | None:
-    """grep code_root for a `func|class|struct|enum|let|var <symbol>` definition;
-    return the first matching file's path relative to code_root, or None."""
-    pattern = re.compile(SYMBOL_DEF_RE.format(sym=re.escape(symbol)))
+def _resolve_symbol_via_code_index(code_root: Path, symbol: str, project: str) -> str | None:
+    """Finding 7 fast path for resolve_symbol_to_path, below: consult the
+    code index's `chunks` table (member symbols only -- container names
+    like class/struct/enum/protocol/extension/actor are never chunks
+    themselves, see chunk_source's own docstring -- so a miss here is
+    never conclusive; the caller always falls back to the full lexer
+    scan, which does see container names too). Deliberately never
+    consults `--db`: on `why`, that flag means the DECISION db override
+    (exactly the confusion --decision-db exists to prevent for
+    code-search's own concept attachment) -- only the default
+    "<project>-code.sqlite" path is ever read here. Only trusted when the
+    index was built against this SAME code_root -- code_meta.code_root
+    mismatch (a stale index built against a different tree, or one that
+    predates this code_root entirely) is treated exactly like no index at
+    all, since its stored relative chunk paths would otherwise resolve
+    against the wrong root."""
+    code_db_path = (
+        Path(os.environ.get("MEMCONTINUUM_HOME", str(Path.home() / ".memcontinuum")))
+        / f"{project}-code.sqlite"
+    )
+    if not code_db_path.exists():
+        return None
+    try:
+        conn = open_code_db(code_db_path)
+    except sqlite3.DatabaseError:
+        return None
+    try:
+        meta = conn.execute(
+            "SELECT code_root FROM code_meta WHERE project=?", (project,)
+        ).fetchone()
+        if not meta or not meta["code_root"]:
+            return None
+        try:
+            if Path(meta["code_root"]).resolve() != code_root.resolve():
+                return None
+        except OSError:
+            return None
+        rows = conn.execute(
+            "SELECT path, symbol, qualified_name FROM chunks WHERE project=? ORDER BY path",
+            (project,),
+        ).fetchall()
+        for r in rows:
+            if fragment_matches_symbol(symbol, r["symbol"], r["qualified_name"]):
+                return r["path"]
+        return None
+    finally:
+        conn.close()
+
+
+def resolve_symbol_to_path(code_root: Path, symbol: str, project: str | None = None) -> str | None:
+    """Finding 7: resolve a bare --code-root symbol to its defining file
+    for `why`, consuming the SAME lexer-aware chunker chunk_source/
+    declared_symbol_names/memlint/code-search attachment already agree on
+    (via fragment_declared_in_text, so a QUALIFIED symbol like
+    "Outer.outerFunc" also resolves) -- not the old from-scratch regex
+    (`func|class|struct|enum|let|var` only, missing init, subscript,
+    operators, backtick-quoted names, and the actor/protocol/extension
+    container keywords entirely).
+
+    Tries the code index first (_resolve_symbol_via_code_index) when
+    `project` is given, for speed; always falls back to scanning
+    code_root directly (same SKIP_DIR_NAMES as before -- deliberately NOT
+    the broader CODE_SKIP_DIR_NAMES the code index itself uses, since
+    `why` must stay able to resolve a symbol declared under Tests/, a
+    behavior change nobody asked for) so a missing/stale/member-only-index
+    miss never regresses a resolution the old regex-based version could
+    already make."""
+    if project:
+        resolved = _resolve_symbol_via_code_index(code_root, symbol, project)
+        if resolved is not None:
+            return resolved
     for fpath in sorted(iter_code_files(code_root)):
         try:
             text = fpath.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
-        if pattern.search(text):
+        if fragment_declared_in_text(symbol, text):
             try:
                 return str(fpath.relative_to(code_root))
             except ValueError:
@@ -1094,14 +1251,14 @@ def cmd_why(args) -> int:
                 file=sys.stderr,
             )
             return 2
-        resolved = resolve_symbol_to_path(Path(args.code_root).resolve(), target)
+        resolved = resolve_symbol_to_path(Path(args.code_root).resolve(), target, project=args.project)
         if resolved is None:
             print(f"why: no definition of {target!r} found under {args.code_root}", file=sys.stderr)
             return 1
         file_path = resolved
 
     db_path = resolve_db_path(args)
-    conn = open_db(db_path)
+    conn = open_db(db_path, project=args.project)
     concept_matches = concept_matches_for_path(conn, args.project, file_path)
 
     if args.json:
@@ -1188,7 +1345,7 @@ def check_invariant(code_root: Path, invariant: dict) -> list[str]:
 
 def cmd_drift(args) -> int:
     db_path = resolve_db_path(args)
-    conn = open_db(db_path)
+    conn = open_db(db_path, project=args.project)
     code_root = Path(args.code_root).resolve()
     entries = links_with_active_invariant(conn, args.project)
     conn.close()
@@ -1309,7 +1466,7 @@ def cmd_unmapped(args) -> int:
     coverage_status = "ok"
     conn: sqlite3.Connection | None = None
     try:
-        conn = open_db(db_path)
+        conn = open_db(db_path, project=args.project)
         if _index_has_drift(conn, root, args.project):
             reindex_ns = argparse.Namespace(
                 root=str(root), project=args.project, db=str(db_path), full=False, no_embed=True
@@ -1318,7 +1475,7 @@ def cmd_unmapped(args) -> int:
             with contextlib.redirect_stdout(buf):
                 cmd_reindex(reindex_ns)
             conn.close()
-            conn = open_db(db_path)
+            conn = open_db(db_path, project=args.project)
             if _index_has_drift(conn, root, args.project):
                 coverage_status = "unknown"
     except Exception:
@@ -1380,7 +1537,7 @@ def cmd_unmapped(args) -> int:
 def cmd_check(args) -> int:
     root = Path(args.root).resolve()
     db_path = resolve_db_path(args)
-    conn = open_db(db_path)
+    conn = open_db(db_path, project=args.project)
     existing = {
         row["path"]: (row["mtime"], row["size"])
         for row in conn.execute("SELECT path, mtime, size FROM records WHERE project=?", (args.project,))
@@ -1483,7 +1640,8 @@ CREATE TABLE IF NOT EXISTS code_meta (
   project TEXT PRIMARY KEY,
   code_root TEXT,
   langs TEXT,
-  last_indexed_at REAL
+  last_indexed_at REAL,
+  head_sha TEXT
 );
 """
 
@@ -1498,11 +1656,22 @@ def resolve_code_db_path(args) -> Path:
     return base / f"{args.project}-code.sqlite"
 
 
+def ensure_code_meta_head_sha_column(conn: sqlite3.Connection) -> None:
+    """Migration guard (finding 1, index provenance): a code_meta table
+    created by pre-provenance memidx.py has no head_sha column --
+    CREATE TABLE IF NOT EXISTS never adds columns to an existing table
+    (mirrors ensure_links_invariant_column's same fix for `links`)."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(code_meta)").fetchall()}
+    if "head_sha" not in cols:
+        conn.execute("ALTER TABLE code_meta ADD COLUMN head_sha TEXT")
+
+
 def open_code_db(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.executescript(CODE_SCHEMA_SQL)
+    ensure_code_meta_head_sha_column(conn)
     return conn
 
 
@@ -1694,10 +1863,17 @@ def _scan_region(text: str, start: int):
     return None, local_writes, local_match, n
 
 
+# Shared modifier vocabulary (finding 3): used both by _RESYNC_RE's gap-resync
+# heuristic below AND by _class_token_is_member_modifier's `class <modifier>*
+# func/var/subscript/init` member-form detection -- one list, not two.
+_DECL_MODIFIER_WORDS = (
+    "public", "private", "internal", "fileprivate", "open", "final", "static",
+    "class", "override", "required", "convenience", "indirect", "mutating",
+    "nonisolated", "package", "consuming", "borrowing",
+)
+
 _RESYNC_RE = re.compile(
-    r"^[ \t]{0,8}(?:(?:public|private|internal|fileprivate|open|final|static|class|"
-    r"override|required|convenience|indirect|mutating|nonisolated|package|consuming|"
-    r"borrowing|@\w+(?:\([^)]*\))?)\s+)*"
+    r"^[ \t]{0,8}(?:(?:" + "|".join(_DECL_MODIFIER_WORDS) + r"|@\w+(?:\([^)]*\))?)\s+)*"
     r"(?:func|init|class|struct|enum|protocol|extension|actor|var|subscript)\b"
 )
 
@@ -1789,7 +1965,6 @@ def chunk_source(text: str):
 
 
 _IDENT_RE = re.compile(r"[ \t\n]*([A-Za-z_][A-Za-z0-9_]*)")
-_DOTTED_IDENT_RE = re.compile(r"[ \t\n]*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)")
 _OPERATOR_CHARS = set("+-*/%=<>!&|^~?.")
 _KEYWORD_RE = re.compile(
     r"\b(class|struct|enum|protocol|extension|actor|func|init|subscript|var)\b"
@@ -1820,14 +1995,98 @@ def _read_identifier(mask: str, i: int):
     return _read_backtick_identifier(mask, i)
 
 
+def _read_dotted_segment(mask: str, i: int):
+    """One segment of a dotted qualifier (finding 3): a plain identifier or
+    a backtick-quoted name, either one, whitespace-led. Returns (name
+    WITHOUT its backticks, end_idx) or (None, i)."""
+    n = len(mask)
+    j = i
+    while j < n and mask[j] in (" ", "\n", "\t"):
+        j += 1
+    if j < n and mask[j] == "`":
+        k = j + 1
+        while k < n and mask[k] != "`":
+            k += 1
+        if k >= n:
+            return None, i
+        return mask[j + 1 : k], k + 1
+    m = _IDENT_RE.match(mask, i)
+    if m:
+        return m.group(1), m.end()
+    return None, i
+
+
 def _read_dotted_identifier(mask: str, i: int):
     """Like _read_identifier, but for `extension Outer.Inner` (finding
     6) -- keeps the full dot-joined qualifier as one chain element so the
     nested type's members qualify as Outer.Inner.member, not Outer.member.
-    Backtick-quoted segments aren't supported here (an extension naming a
-    backtick-escaped type is not a case this fixture set covers)."""
-    m = _DOTTED_IDENT_RE.match(mask, i)
-    return m.group(1) if m else None
+    Each segment may be plain OR backtick-quoted (finding 3: an extension
+    naming a backtick-escaped type, e.g. `` extension `Type` `` or
+    `` extension `Type`.Inner ``, must still keep its container -- it used
+    to be silently dropped since the segment regex never matched a
+    backtick)."""
+    name, end = _read_dotted_segment(mask, i)
+    if name is None:
+        return None
+    parts = [name]
+    n = len(mask)
+    pos = end
+    while pos < n and mask[pos] == ".":
+        seg, seg_end = _read_dotted_segment(mask, pos + 1)
+        if seg is None:
+            break
+        parts.append(seg)
+        pos = seg_end
+    return ".".join(parts)
+
+
+def _class_token_is_member_modifier(mask: str, after: int) -> bool:
+    """Finding 3: `class` is both a type-decl keyword (`class Foo {}`) and
+    a member modifier (`class func`/`class var`/`class subscript`, and
+    `class` stacked with further modifiers, e.g. `class final func`) --
+    only `class func`/`class var` used to be excluded from the
+    phantom-container check, so e.g. `class subscript` was misparsed as a
+    type named "subscript" containing the actual subscript's body. This
+    skips over any further _DECL_MODIFIER_WORDS right after `class` and
+    checks what member keyword actually follows; func/init/subscript/var/
+    let means this `class` token is a modifier, never a type declaration
+    (the member itself gets its own separate _KEYWORD_RE match, so nothing
+    is lost by skipping container creation here). A genuine type
+    declaration never has a modifier between `class` and its name (Swift
+    modifiers precede `class`, never follow it), so anything else here
+    falls through to being treated as the type's own name, unchanged from
+    prior behavior."""
+    j = after
+    n = len(mask)
+    while True:
+        while j < n and mask[j] in (" ", "\t", "\n"):
+            j += 1
+        m = _IDENT_RE.match(mask, j)
+        if not m:
+            return False
+        word = m.group(1)
+        if word in ("func", "var", "subscript", "init", "let"):
+            return True
+        if word in _DECL_MODIFIER_WORDS:
+            j = m.end()
+            continue
+        return False
+
+
+def _container_type_name(kw: str, mask: str, after: int):
+    """Shared by _extract_decls and declared_symbol_names (findings 3/7):
+    for a class/struct/enum/protocol/extension/actor _KEYWORD_RE match,
+    returns the container's own name, or None when this isn't really a
+    type declaration at all (a `class <modifier>* func/var/subscript/init`
+    member form, or a keyword used as a plain identifier like
+    `let actor = ...`)."""
+    if kw == "class" and _class_token_is_member_modifier(mask, after):
+        return None
+    if kw == "extension":
+        name = _read_dotted_identifier(mask, after)
+    else:
+        name = _read_identifier(mask, after)
+    return name or None
 
 
 def _read_identifier_or_operator(mask: str, i: int):
@@ -1971,21 +2230,16 @@ def _extract_decls(text: str, mask: str, match_dict: dict):
         after = kstart + len(kw)
 
         if kw in ("class", "struct", "enum", "protocol", "extension", "actor"):
-            # `extension Outer.Inner` (finding 6) keeps its dotted
-            # qualifier as one chain element; every other container kind
-            # never has a dotted name in Swift.
-            if kw == "extension":
-                name = _read_dotted_identifier(mask, after)
-            else:
-                name = _read_identifier(mask, after)
-            if kw == "class" and name in ("func", "var"):
-                continue  # `class func` / `class var` modifier, not a type decl
+            # `extension Outer.Inner` (finding 6), a backtick-quoted
+            # target (finding 3), and `class <modifier>* func/var/
+            # subscript/init` member forms (finding 3, not just `class
+            # func`/`class var`) are all resolved by the one shared
+            # helper -- see _container_type_name.
+            name = _container_type_name(kw, mask, after)
             if not name:
-                # e.g. `actor`/`class`/etc. used as a plain identifier
-                # (`let actor = ...`), not a type decl -- never a
-                # container (finding 6: guards the same phantom-container
-                # class of bug the `class func`/`class var` check above
-                # already exists for).
+                # a `class` member-modifier form, or a keyword used as a
+                # plain identifier (`let actor = ...`) -- never a
+                # container.
                 continue
             body_open = _find_body_open(mask, match_dict, after, n)
             if body_open is None:
@@ -2075,12 +2329,7 @@ def declared_symbol_names(text: str) -> set:
         if kw not in ("class", "struct", "enum", "protocol", "extension", "actor"):
             continue
         after = m.start() + len(kw)
-        if kw == "extension":
-            name = _read_dotted_identifier(mask, after)
-        else:
-            name = _read_identifier(mask, after)
-        if kw == "class" and name in ("func", "var"):
-            continue  # `class func` / `class var` modifier, not a type decl
+        name = _container_type_name(kw, mask, after)
         if not name:
             continue
         for part in name.split("."):
@@ -2128,6 +2377,25 @@ def delete_code_chunks_for_path(conn: sqlite3.Connection, project: str, path: st
         conn.execute("DELETE FROM fts WHERE rowid=?", (r["id"],))
         conn.execute("DELETE FROM embeddings WHERE chunk_id=?", (r["id"],))
     conn.execute("DELETE FROM chunks WHERE project=? AND path=?", (project, path))
+
+
+def _git_head_sha(root: Path) -> str | None:
+    """Finding 1 (index provenance): the code repo's HEAD sha at
+    code-reindex time, stored in code_meta alongside code_root/
+    last_indexed_at, when `root` is (inside) a git repo and git is on
+    PATH. Best-effort only -- None (not an exception) on any failure, so a
+    non-git code_root or a missing git binary never breaks code-reindex."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    sha = result.stdout.strip()
+    return sha or None
 
 
 def cmd_code_reindex(args) -> int:
@@ -2241,8 +2509,9 @@ def cmd_code_reindex(args) -> int:
         conn.execute("DELETE FROM file_sha WHERE project=? AND path=?", (args.project, rel))
 
     conn.execute(
-        "INSERT OR REPLACE INTO code_meta (project, code_root, langs, last_indexed_at) VALUES (?,?,?,?)",
-        (args.project, str(root), ",".join(langs) if langs else "swift", time.time()),
+        "INSERT OR REPLACE INTO code_meta (project, code_root, langs, last_indexed_at, head_sha) "
+        "VALUES (?,?,?,?,?)",
+        (args.project, str(root), ",".join(langs) if langs else "swift", time.time(), _git_head_sha(root)),
     )
     conn.commit()
     conn.close()
@@ -2303,11 +2572,47 @@ def _code_index_is_stale(conn: sqlite3.Connection, project: str) -> bool:
     return bool(set(existing.keys()) - seen)
 
 
+def _code_index_state(conn: sqlite3.Connection, project: str):
+    """Finding 1 (HIGH, index provenance): the three states code-search
+    must distinguish and SAY, not collapse into a bare empty result --
+    "uninitialized" (`code-reindex` was never run for this project: no
+    code_meta row, or one with no code_root ever recorded -- the
+    never-indexed-reads-as-healthy-empty bug), "stale" (existing
+    _code_index_is_stale mtime/size-drift or missing-code_root-dir check),
+    "current" (neither). Returns (state, meta_row_or_None)."""
+    meta = conn.execute(
+        "SELECT code_root, langs, last_indexed_at, head_sha FROM code_meta WHERE project=?",
+        (project,),
+    ).fetchone()
+    if meta is None or not meta["code_root"]:
+        return "uninitialized", None
+    if _code_index_is_stale(conn, project):
+        return "stale", meta
+    return "current", meta
+
+
 def cmd_code_search(args) -> int:
     db_path = resolve_code_db_path(args)
     conn = open_code_db(db_path)
 
-    if _code_index_is_stale(conn, args.project):
+    state, meta = _code_index_state(conn, args.project)
+
+    if state == "uninitialized":
+        print(
+            f"code-search: the code index is uninitialized for project {args.project!r} "
+            f"(no code_meta / no chunks for this root) -- run `code-reindex` first",
+            file=sys.stderr,
+        )
+        conn.close()
+        if args.json:
+            print(json.dumps(
+                {"state": "uninitialized", "code_root": None, "indexed_at": None,
+                 "head_sha": None, "results": []},
+                indent=2,
+            ))
+        return 1
+
+    if state == "stale":
         print(
             "code-search: WARNING code index appears stale "
             "(source changed since last code-reindex)",
@@ -2351,8 +2656,17 @@ def cmd_code_search(args) -> int:
     md_conn = None
     if md_db_path.exists():
         try:
-            md_conn = open_db(md_db_path)
+            md_conn = open_db(md_db_path, project=args.project)
         except sqlite3.DatabaseError:
+            md_conn = None
+        except DbProjectMismatchError as e:
+            # Finding 2: a same-file, different-project decision db is a
+            # real misconfiguration, but concept attachment is an
+            # enrichment, not the point of this command -- degrade to
+            # "no attach" + a named warning, never kill the whole search
+            # over it (unlike a direct `open_db` call elsewhere, which
+            # should hard-refuse).
+            print(f"code-search: WARNING decision db not attached: {e}", file=sys.stderr)
             md_conn = None
 
     out = []
@@ -2384,7 +2698,21 @@ def cmd_code_search(args) -> int:
     conn.close()
 
     if args.json:
-        print(json.dumps(out, indent=2))
+        # Finding 1: state + index provenance (code_root/indexed_at/
+        # head_sha, stored at reindex time) surface here alongside
+        # `results` -- an envelope, not a bare list, so a caller can tell
+        # "current" apart from "stale" apart from an empty-but-healthy
+        # result without a separate call.
+        print(json.dumps(
+            {
+                "state": state,
+                "code_root": meta["code_root"],
+                "indexed_at": meta["last_indexed_at"],
+                "head_sha": meta["head_sha"],
+                "results": out,
+            },
+            indent=2,
+        ))
     else:
         for h in out:
             extra = f"  [{h['concept_id']}]" if "concept_id" in h else ""

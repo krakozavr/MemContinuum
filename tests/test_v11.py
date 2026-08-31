@@ -8,6 +8,7 @@ skills/, or tests/test_hooks.py.
 import contextlib
 import io
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -32,6 +33,24 @@ def ns(**kw):
     base = dict(project=memidx.DEFAULT_PROJECT, db=None)
     base.update(kw)
     return SimpleNamespace(**base)
+
+
+@contextlib.contextmanager
+def mc_home(path):
+    """Pins MEMCONTINUUM_HOME to `path` for the duration of the block --
+    finding 7's code-index fast path (resolve_symbol_to_path, when a
+    project is given) reads this env var directly, and must never be
+    exercised against a real ~/.memcontinuum on the machine running the
+    test."""
+    old = os.environ.get("MEMCONTINUUM_HOME")
+    os.environ["MEMCONTINUUM_HOME"] = str(path)
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop("MEMCONTINUUM_HOME", None)
+        else:
+            os.environ["MEMCONTINUUM_HOME"] = old
 
 
 def reindex(root, db, project=memidx.DEFAULT_PROJECT, full=False, no_embed=True):
@@ -278,15 +297,22 @@ class TestWhy(unittest.TestCase):
             self.assertIn("counting hidden files in the main total was rejected", out)
 
     def test_why_by_bare_symbol_resolves_via_code_root_grep(self):
+        # Finding 7: cmd_why now passes project=args.project into
+        # resolve_symbol_to_path, which (when a project is given) tries
+        # the CODE INDEX fast path first, reading MEMCONTINUUM_HOME --
+        # pin it to a fresh temp dir so this test never touches a real
+        # ~/.memcontinuum/default-code.sqlite on the machine it runs on
+        # (it has none here anyway, but must not depend on that).
         with tempfile.TemporaryDirectory() as td:
             root = build_root(td)
             db = Path(td) / "idx.sqlite"
             reindex(root, db)
-            args = ns(
-                db=str(db), project=memidx.DEFAULT_PROJECT,
-                symbol_or_path="DeleteGate", code_root=str(FIXTURES / "code"), json=False,
-            )
-            rc, out = run_capturing(memidx.cmd_why, args)
+            with mc_home(Path(td) / "home"):
+                args = ns(
+                    db=str(db), project=memidx.DEFAULT_PROJECT,
+                    symbol_or_path="DeleteGate", code_root=str(FIXTURES / "code"), json=False,
+                )
+                rc, out = run_capturing(memidx.cmd_why, args)
             self.assertEqual(rc, 0)
             self.assertIn("CON-007", out)
             self.assertIn("TOP-0100", out)
@@ -302,6 +328,102 @@ class TestWhy(unittest.TestCase):
             )
             rc = memidx.cmd_why(args)
             self.assertEqual(rc, 2)
+
+    def test_bare_symbol_resolution_finds_a_backtick_name_the_old_regex_missed(self):
+        """Finding 7: `why`'s bare-symbol resolver must consume the SAME
+        chunker lexer chunk_source/declared_symbol_names/memlint/
+        code-search attachment all agree on, not its own from-scratch
+        regex (which only knew func/class/struct/enum/let/var -- no init,
+        subscript, operators, or backtick-quoted names, e.g. `` `default` ``)."""
+        with tempfile.TemporaryDirectory() as td:
+            code_root = Path(td) / "code"
+            code_root.mkdir()
+            (code_root / "Escaped.swift").write_text(
+                "class Escaped {\n"
+                "    func `default`() -> Int {\n"
+                "        return 1\n"
+                "    }\n"
+                "}\n"
+            )
+            resolved = memidx.resolve_symbol_to_path(code_root, "default")
+            self.assertEqual(resolved, "Escaped.swift")
+
+    def test_bare_symbol_resolution_finds_an_actor_container_name_the_old_regex_missed(self):
+        """The old regex's keyword list (func/class/struct/enum/let/var)
+        never included `actor` (or `protocol`/`extension`/`init`/
+        `subscript`) at all -- a bare symbol naming an actor's own type
+        could never resolve."""
+        with tempfile.TemporaryDirectory() as td:
+            code_root = Path(td) / "code"
+            code_root.mkdir()
+            (code_root / "Counter.swift").write_text(
+                "actor Counter {\n"
+                "    func increment() -> Int { return 1 }\n"
+                "}\n"
+            )
+            resolved = memidx.resolve_symbol_to_path(code_root, "Counter")
+            self.assertEqual(resolved, "Counter.swift")
+
+    def test_code_index_fast_path_resolves_symbol_when_index_matches_code_root(self):
+        """Finding 7: 'the code index when present' -- resolve_symbol_to_path
+        must actually consult it (_resolve_symbol_via_code_index), not just
+        fall back to scanning code_root every time. Isolated by DELETING the
+        source file after indexing: only the fast path's chunks-table
+        lookup -- never the fallback file scan -- can possibly still
+        resolve this symbol."""
+        with tempfile.TemporaryDirectory() as td:
+            code_root = Path(td) / "code"
+            code_root.mkdir()
+            (code_root / "Escaped.swift").write_text(
+                "class Escaped {\n"
+                "    func `default`() -> Int {\n"
+                "        return 1\n"
+                "    }\n"
+                "}\n"
+            )
+            project = "fastpath-proj"
+            with mc_home(Path(td) / "home"):
+                code_args = ns(
+                    project=project, code_root=str(code_root), db=None,
+                    no_embed=True, full=False, lang=None,
+                )
+                self.assertEqual(memidx.cmd_code_reindex(code_args), 0)
+
+                (code_root / "Escaped.swift").unlink()  # kill the fallback scan's only path
+
+                resolved = memidx.resolve_symbol_to_path(code_root, "default", project=project)
+            self.assertEqual(resolved, "Escaped.swift")
+
+    def test_code_index_mismatched_root_falls_back_to_scan_not_a_stale_hit(self):
+        """Finding 7: a code index built against a DIFFERENT code_root than
+        the one being queried must never be trusted (its relative chunk
+        paths would resolve against the wrong tree) -- resolve_symbol_to_path
+        must fall back to scanning the REAL code_root instead, both for a
+        symbol only the real tree has (still resolves) and one only the
+        stale index has (must NOT be reported as a match)."""
+        with tempfile.TemporaryDirectory() as td:
+            indexed_root = Path(td) / "indexed-code"
+            indexed_root.mkdir()
+            (indexed_root / "Old.swift").write_text(
+                "class Old {\n    func stale() -> Int { return 1 }\n}\n"
+            )
+            real_root = Path(td) / "real-code"
+            real_root.mkdir()
+            (real_root / "New.swift").write_text(
+                "class New {\n    func fresh() -> Int { return 2 }\n}\n"
+            )
+            project = "mismatch-proj"
+            with mc_home(Path(td) / "home"):
+                code_args = ns(
+                    project=project, code_root=str(indexed_root), db=None,
+                    no_embed=True, full=False, lang=None,
+                )
+                self.assertEqual(memidx.cmd_code_reindex(code_args), 0)
+
+                resolved_real = memidx.resolve_symbol_to_path(real_root, "fresh", project=project)
+                resolved_stale = memidx.resolve_symbol_to_path(real_root, "stale", project=project)
+            self.assertEqual(resolved_real, "New.swift")
+            self.assertIsNone(resolved_stale)
 
     def test_why_json_shape(self):
         with tempfile.TemporaryDirectory() as td:

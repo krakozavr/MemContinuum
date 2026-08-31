@@ -28,6 +28,7 @@ _SKIP_NO_VENV = (
 
 OUR_SCRIPTS = [
     "pre-edit-chain.sh",
+    "newfile-nudge.sh",
     "ledger-post-edit.sh",
     "precompact-persist.sh",
     "sessionstart-remind.sh",
@@ -220,6 +221,7 @@ class TestFreshInstall(unittest.TestCase):
             (h.get("if", ""), h.get("command", ""))
             for group in pre
             for h in group.get("hooks", [])
+            if "pre-edit-chain.sh" in h.get("command", "")
         ]
         edit = [c for i, c in commands if i.startswith("Edit(")]
         write = [c for i, c in commands if i.startswith("Write(")]
@@ -232,6 +234,31 @@ class TestFreshInstall(unittest.TestCase):
             self.assertIn(f"MEMCONTINUUM_STRIP_PREFIX={self.code_root}/", cmd)
         ifs = [i for i, _ in commands]
         self.assertTrue(any(self.code_root in i for i in ifs), ifs)
+
+    def test_settings_contains_newfile_nudge_hook_write_only_with_right_paths(self):
+        """Finding 8: newfile-nudge.sh gets its OWN "Write" (never
+        "Edit|Write") matcher group, a separate group from pre-edit-chain's,
+        one `if` per --code-root, and never carries MEMCONTINUUM_ROOT/
+        PROJECT/STRIP_PREFIX (it never calls memidx.py)."""
+        data = json.loads(self.settings_path.read_text())
+        pre = data["hooks"]["PreToolUse"]
+        nudge_groups = [g for g in pre if g.get("matcher") == "Write"]
+        self.assertEqual(len(nudge_groups), 1, pre)
+        nudge_items = [
+            h for h in nudge_groups[0].get("hooks", [])
+            if "newfile-nudge.sh" in h.get("command", "")
+        ]
+        self.assertEqual(len(nudge_items), 1, nudge_items)
+        item = nudge_items[0]
+        self.assertEqual(item["if"], f"Write({self.code_root}/**)")
+        self.assertIn(f"MEMCONTINUUM_CODE_ROOT={self.code_root}", item["command"])
+        self.assertIn("MEMCONTINUUM_PYTHON=", item["command"])
+        self.assertNotIn("MEMCONTINUUM_ROOT=", item["command"])
+        self.assertNotIn("MEMCONTINUUM_PROJECT=", item["command"])
+        self.assertNotIn("MEMCONTINUUM_STRIP_PREFIX=", item["command"])
+        # pre-edit-chain's own group must be untouched by this addition.
+        edit_write_groups = [g for g in pre if g.get("matcher") == "Edit|Write"]
+        self.assertEqual(len(edit_write_groups), 1, pre)
 
     def test_reindex_and_lint_clean_on_empty_store(self):
         out = self.proc.stdout
@@ -296,7 +323,8 @@ class TestReinstallIdempotent(unittest.TestCase):
         pre_items = [
             h for group in data["hooks"]["PreToolUse"] for h in group.get("hooks", [])
         ]
-        self.assertEqual(len(pre_items), 2, pre_items)  # one Edit, one Write
+        # pre-edit-chain: one Edit, one Write; newfile-nudge: one Write.
+        self.assertEqual(len(pre_items), 3, pre_items)
 
     def test_settings_stable_across_reruns(self):
         self.assertEqual(
@@ -407,7 +435,7 @@ class TestIdempotentDropToZeroCodeRoots(unittest.TestCase):
 
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
 class TestMultipleCodeRoots(unittest.TestCase):
-    def test_two_code_roots_render_four_pretooluse_items(self):
+    def test_two_code_roots_render_pretooluse_items_for_both_hooks(self):
         home = sandbox_home()
         try:
             store = str(Path(home) / "store")
@@ -423,17 +451,31 @@ class TestMultipleCodeRoots(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             data = json.loads((Path(home) / ".claude" / "settings.local.json").read_text())
             items = [h for group in data["hooks"]["PreToolUse"] for h in group.get("hooks", [])]
-            self.assertEqual(len(items), 4, items)  # Edit+Write for each of 2 roots
-            ifs = sorted(h["if"] for h in items)
+            # pre-edit-chain: Edit+Write for each of 2 roots (4); newfile-nudge:
+            # Write-only for each of 2 roots (2) -- 6 total.
+            self.assertEqual(len(items), 6, items)
+            pre_edit_items = [h for h in items if "pre-edit-chain.sh" in h["command"]]
+            nudge_items = [h for h in items if "newfile-nudge.sh" in h["command"]]
+            self.assertEqual(len(pre_edit_items), 4, pre_edit_items)
+            self.assertEqual(len(nudge_items), 2, nudge_items)
+
+            ifs = sorted(h["if"] for h in pre_edit_items)
             self.assertEqual(ifs, sorted([
                 f"Edit({root_a}/**)", f"Write({root_a}/**)",
                 f"Edit({root_b}/**)", f"Write({root_b}/**)",
             ]))
-            for h in items:
+            for h in pre_edit_items:
                 if root_a in h["if"]:
                     self.assertIn(f"MEMCONTINUUM_STRIP_PREFIX={root_a}/", h["command"])
                 else:
                     self.assertIn(f"MEMCONTINUUM_STRIP_PREFIX={root_b}/", h["command"])
+
+            nudge_ifs = sorted(h["if"] for h in nudge_items)
+            self.assertEqual(nudge_ifs, sorted([f"Write({root_a}/**)", f"Write({root_b}/**)"]))
+            for h in nudge_items:
+                root = root_a if root_a in h["if"] else root_b
+                self.assertIn(f"MEMCONTINUUM_CODE_ROOT={root}", h["command"])
+
             # write hooks only support one MEMCONTINUUM_CODE_ROOT -- must be the first root given
             post_cmd = data["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
             self.assertIn(f"MEMCONTINUUM_CODE_ROOT={root_a}", post_cmd)

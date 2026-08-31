@@ -1632,6 +1632,40 @@ class TestUserPromptRemind(HookTestBase):
             f"a slow memlib.sh source must still be bounded by the outer 2s deadline, took {elapsed:.3f}s",
         )
 
+    def test_cat_on_path_does_not_delay_the_watchdog_deadline(self):
+        """Finding 5 (MEDIUM): hooks/mc-watchdog.sh used to build its
+        launcher source via `$(cat <<'EOF' ... EOF)` -- an external `cat`
+        process run via command substitution, BEFORE the watchdog's own
+        deadline clock starts ticking (that assignment happens at `source
+        mc-watchdog.sh` time, strictly before the guard's Popen call). A
+        slow/hung `cat` on PATH at that point would blow the whole
+        invocation's wall time with no bound at all, exactly the same
+        class of bug test_outer_deadline_covers_memlib_sourcing guards for
+        memlib.sh. Proven via a real seam (a `cat` shim placed first on
+        PATH that sleeps 5s before exec-ing the real `cat`) rather than
+        pure code inspection: the outer ~2s budget must still bound the
+        whole run."""
+        session_id = "s-prompt-slow-cat-on-path"
+        self.seed_ledger(session_id, [])
+        real_cat = shutil.which("cat") or "/bin/cat"
+        shim_dir = Path(self.td) / "slow-cat-bin"
+        shim_dir.mkdir()
+        (shim_dir / "cat").write_text(
+            "#!/usr/bin/env bash\nsleep 5\nexec " + real_cat + ' "$@"\n'
+        )
+        (shim_dir / "cat").chmod(0o755)
+        env = self.base_env(PATH=f"{shim_dir}:{os.environ.get('PATH', '')}")
+        proc, elapsed = run_script(
+            USERPROMPT_HOOK, self.user_prompt_payload(session_id), env, timeout=10.0
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertLess(
+            elapsed,
+            2.5,
+            f"a slow `cat` on PATH must still be bounded by the outer watchdog deadline, "
+            f"took {elapsed:.3f}s",
+        )
+
     def test_payload_keys_logged_once_per_session(self):
         session_id = "s-prompt-payloadkeys"
         self.seed_ledger(session_id, [])
@@ -2486,6 +2520,147 @@ class TestMacOSPortMechanics(unittest.TestCase):
             except Exception:
                 pass
 
+    # ---- finding 6: launcher startup signal race -----------------------
+
+    def test_launcher_startup_signal_race_pending_flag_kills_promptly(self):
+        """Finding 6 (LOW): a SIGTERM/SIGINT landing strictly between the
+        launcher's `signal.signal(...)` registration and its own `proc =
+        Popen(...)` assignment COMPLETING is exactly the window the pre-fix
+        `_on_signal` handler could do nothing about: `proc` was still its
+        initial `None`, so `_kill_group`'s `if proc is None: return` made
+        the handler a silent no-op even though the real child process
+        already existed. The fix installs a pending-kill flag the handler
+        can set even before `proc` exists, checked right after Popen
+        returns.
+
+        Deterministic reproduction (real end-to-end signal timing across
+        process boundaries is exactly the "hard to time" case the finding
+        itself calls out): a driver script monkeypatches
+        `subprocess.Popen` so the self-SIGTERM fires and is given time to
+        be delivered (a short `time.sleep`, which DOES check for pending
+        signals) INSIDE the wrapped Popen call -- after the real child
+        process already exists (its pid is captured), but strictly before
+        control returns to the launcher's own `proc = ...` assignment.
+        This lands in the exact race window under test on every run, not
+        as a matter of luck."""
+        launcher_py = subprocess.run(
+            [MC_BASH, "-c", 'source "$1"; printf %s "$MC_WATCHDOG_LAUNCHER_PY"', "_",
+             str(HOOKS_DIR / "mc-watchdog.sh")],
+            capture_output=True, text=True, check=True,
+        ).stdout
+        self.assertIn("MC_WATCHDOG_LAUNCHER", launcher_py)
+
+        pidfile = Path(self.td) / "race-heartbeat-child.pid"
+        child_script = Path(self.td) / "race-heartbeat-child.sh"
+        child_script.write_text(
+            "#!/usr/bin/env bash\n"
+            f'echo $$ > "{pidfile}"\n'
+            "while true; do sleep 0.05; done\n"
+        )
+        child_script.chmod(0o755)
+
+        pidholder_file = Path(self.td) / "child-pid-from-driver.txt"
+        driver = Path(self.td) / "race_driver.py"
+        driver.write_text(
+            "import subprocess, sys, signal, os, time\n"
+            "_real_popen = subprocess.Popen\n"
+            f"_pidholder_path = {str(pidholder_file)!r}\n"
+            "def _patched_popen(*a, **kw):\n"
+            "    p = _real_popen(*a, **kw)\n"
+            "    with open(_pidholder_path, 'w') as f:\n"
+            "        f.write(str(p.pid))\n"
+            "    os.kill(os.getpid(), signal.SIGTERM)\n"
+            "    time.sleep(0.1)  # give the pending signal a chance to be delivered HERE\n"
+            "    return p\n"
+            "subprocess.Popen = _patched_popen\n"
+            + launcher_py
+        )
+
+        # Deliberately NOT capture_output=True / PIPE here: the guarded
+        # child inherits the driver's stdout/stderr (start_new_session=
+        # True, no explicit redirection -- matches real passthrough
+        # usage), so on the pre-fix bug the child survives orphaned,
+        # holding those fds open, and a piped .communicate() would hang
+        # on THAT instead of failing on the actual assertion below. A
+        # devnull'd Popen + wait() isolates "does the launcher process
+        # itself exit promptly" from "is the descendant still alive"
+        # (checked separately, directly, right after).
+        driver_proc = subprocess.Popen(
+            [VENV_PYTHON, str(driver), MC_BASH, str(child_script)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            returncode = driver_proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            driver_proc.kill()
+            driver_proc.wait(timeout=5)
+            self.fail("the launcher driver process itself did not exit within 10s")
+        # the injected SIGTERM's handler calls sys.exit(0) -- the driver
+        # (== the launcher, with one monkeypatch) must exit cleanly, not
+        # hang or crash.
+        self.assertEqual(returncode, 0)
+
+        self.assertTrue(pidholder_file.exists(), "the patched Popen was never reached")
+        child_pid = int(pidholder_file.read_text().strip())
+
+        def child_alive():
+            try:
+                os.kill(child_pid, 0)
+            except OSError:
+                return False
+            return True
+
+        deadline = time.monotonic() + 2.0
+        while child_alive() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        try:
+            self.assertFalse(
+                child_alive(),
+                "a SIGTERM landing between signal.signal() and Popen() returning must "
+                "still kill the guarded child's process group promptly (pending-kill flag)",
+            )
+        finally:
+            try:
+                os.killpg(child_pid, signal.SIGKILL)
+            except Exception:
+                pass
+
+    # ---- watchdog-kill log line (README claim made true) ---------------
+
+    def test_watchdog_expiry_leaves_one_log_line(self):
+        """Every watchdog kill must leave one log line (the README claims
+        this; this makes it true): on budget expiry (subprocess.
+        TimeoutExpired), the launcher itself -- not the killed child, which
+        never gets the chance -- writes `outcome=watchdog-killed
+        hook=<name>` to $MEMCONTINUUM_HOME/hook.log, where <name> is the
+        guarded hook script's own basename (sys.argv[2] in the launcher's
+        own invocation convention)."""
+        launcher_py = subprocess.run(
+            [MC_BASH, "-c", 'source "$1"; printf %s "$MC_WATCHDOG_LAUNCHER_PY"', "_",
+             str(HOOKS_DIR / "mc-watchdog.sh")],
+            capture_output=True, text=True, check=True,
+        ).stdout
+        self.assertIn("MC_WATCHDOG_LAUNCHER", launcher_py)
+
+        home = Path(self.td) / "expiry-home"
+        home.mkdir()
+        fake_hook = Path(self.td) / "fake-hook-name.sh"
+        fake_hook.write_text("#!/usr/bin/env bash\nwhile true; do sleep 0.05; done\n")
+        fake_hook.chmod(0o755)
+
+        env = clean_env(MEMCONTINUUM_HOME=str(home), MC_WATCHDOG_BUDGET="0.3")
+        proc = subprocess.run(
+            [VENV_PYTHON, "-c", launcher_py, MC_BASH, str(fake_hook)],
+            capture_output=True, text=True, env=env, timeout=10,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+        log_path = home / "hook.log"
+        self.assertTrue(log_path.exists(), "watchdog expiry must write hook.log")
+        log_text = log_path.read_text()
+        self.assertIn("outcome=watchdog-killed", log_text, log_text)
+        self.assertIn("hook=fake-hook-name.sh", log_text, log_text)
+
     # ---- item 2: stdout passthrough under the watchdog -----------------
 
     def test_stdout_passes_through_the_watchdog_byte_identical_to_unguarded(self):
@@ -2590,6 +2765,144 @@ class TestMacOSPortMechanics(unittest.TestCase):
         )
         json.loads(proc_g.stdout)  # must also parse cleanly on its own
         self.assertIn("passthrough-file-000.py", proc_g.stdout)
+
+
+NEWFILE_NUDGE_HOOK = HOOKS_DIR / "newfile-nudge.sh"
+
+
+class TestNewFileNudgeHook(unittest.TestCase):
+    """Finding 8 (NEW HOOK): hooks/newfile-nudge.sh -- a PreToolUse
+    Write-only hook, deliberately separate from pre-edit-chain.sh, that
+    fires ONLY when tool_input.file_path does not exist yet (and isn't a
+    symlink), sits under a configured code root, and has an indexed
+    source extension. Runs under the shared watchdog; never blocks; never
+    calls memidx.py."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp(prefix="memcontinuum-newfile-nudge-")
+        self.addCleanup(shutil.rmtree, self.td, ignore_errors=True)
+        self.code_root = Path(self.td) / "code"
+        self.code_root.mkdir()
+        self.home = Path(self.td) / "home"
+        self.home.mkdir()
+
+    def base_env(self, **overrides):
+        env = clean_env(
+            MEMCONTINUUM_HOME=str(self.home),
+            MEMCONTINUUM_CODE_ROOT=str(self.code_root),
+            MEMCONTINUUM_PYTHON=VENV_PYTHON,
+        )
+        env.update(overrides)
+        return env
+
+    def payload_for(self, file_path: str):
+        return json.dumps({
+            "session_id": "s-newfile-nudge",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Write",
+            "cwd": str(self.code_root),
+            "tool_input": {"file_path": file_path},
+        })
+
+    def test_bash_syntax_valid(self):
+        result = subprocess.run(
+            [MC_BASH, "-n", str(NEWFILE_NUDGE_HOOK)], capture_output=True, text=True
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_fires_on_new_swift_file_under_code_root(self):
+        target = self.code_root / "Sources" / "NewThing.swift"
+        proc, elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(target.exists(), "the hook must never create the file itself")
+        data = json.loads(proc.stdout)
+        ctx = data["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(str(self.code_root), ctx)
+        self.assertIn("confirm the code index is initialized/current", ctx)
+        self.assertIn("code-search", ctx)
+        self.assertIn("New source file under", ctx)
+        # exactly one line of additionalContext.
+        self.assertEqual(len(ctx.splitlines()), 1, ctx)
+
+    def test_silent_for_an_existing_file(self):
+        target = self.code_root / "Existing.swift"
+        target.write_text("// already here\n")
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "", proc.stdout)
+
+    def test_silent_for_a_non_indexed_extension(self):
+        target = self.code_root / "Notes.md"
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "", proc.stdout)
+
+    def test_silent_for_a_path_outside_the_code_root(self):
+        outside = Path(self.td) / "outside" / "NewThing.swift"
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(outside)), self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "", proc.stdout)
+
+    def test_silent_for_a_broken_symlink(self):
+        # `-e` is false for a broken symlink -- `-L` must be checked too,
+        # or a broken symlink would be misread as "a brand-new file".
+        target = self.code_root / "Linked.swift"
+        target.symlink_to(self.code_root / "does-not-exist-target.swift")
+        self.assertFalse(target.exists())  # confirms it's genuinely broken
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "", proc.stdout)
+
+    def test_silent_with_no_code_root_configured(self):
+        target = self.code_root / "NewThing.swift"
+        env = self.base_env()
+        del env["MEMCONTINUUM_CODE_ROOT"]
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "", proc.stdout)
+
+    def test_logs_exactly_one_line_per_invocation(self):
+        target = self.code_root / "Logged.swift"
+        run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), self.base_env())
+        log_text = (self.home / "hook.log").read_text()
+        lines = [l for l in log_text.splitlines() if l.strip()]
+        self.assertEqual(len(lines), 1, log_text)
+        self.assertIn("newfile-nudge", lines[0])
+        self.assertIn("outcome=nudged", lines[0])
+
+    def test_never_writes_under_code_root_or_store(self):
+        target = self.code_root / "SideEffectFree.swift"
+        before = set(self.code_root.rglob("*"))
+        run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), self.base_env())
+        after = set(self.code_root.rglob("*"))
+        self.assertEqual(before, after, "newfile-nudge.sh must never write under the code root")
+
+    def test_completes_under_poisoned_pythonpath(self):
+        target = self.code_root / "Poisoned.swift"
+        env = poisoned_env(self.td, **self.base_env())
+        proc, elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertLess(elapsed, 3.0, f"took {elapsed:.3f}s")
+
+    def test_p95_latency_over_20_runs(self):
+        """Finding 8: report the number, don't assert a tight (e.g. 10ms)
+        bound -- bash+jq (or the python JSON fallback) plus the shared
+        watchdog launcher's own python startup make sub-100ms unrealistic
+        to guarantee cross-machine. Asserts only a generous outer bound so
+        a real regression (e.g. the watchdog no longer short-circuiting)
+        still fails the suite."""
+        samples = []
+        for i in range(20):
+            target = self.code_root / f"Latency{i}.swift"
+            _proc, elapsed = run_script(
+                NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), self.base_env()
+            )
+            samples.append(elapsed)
+        samples.sort()
+        p95 = samples[int(len(samples) * 0.95) - 1]
+        print(f"\nnewfile-nudge.sh p95 latency over 20 runs: {p95 * 1000:.1f}ms "
+              f"(min {samples[0]*1000:.1f}ms, max {samples[-1]*1000:.1f}ms)")
+        self.assertLess(p95, 1.5, f"p95 {p95:.3f}s far exceeds a generous 1.5s outer bound")
 
 
 if __name__ == "__main__":
