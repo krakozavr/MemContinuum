@@ -37,19 +37,24 @@ LOG="$MEMCONTINUUM_HOME/hook.log"
 mkdir -p "$MEMCONTINUUM_HOME" 2>/dev/null
 
 if [ -z "${MEMCONTINUUM_ROOT:-}" ]; then
-    printf '%s post-commit-reindex: MEMCONTINUUM_ROOT not set, skipping\n' "$(date -Iseconds)" >>"$LOG" 2>/dev/null || true
+    printf '%s post-commit-reindex: MEMCONTINUUM_ROOT not set, skipping\n' "$(date -Iseconds 2>/dev/null || date)" >>"$LOG" 2>/dev/null || true
     exit 0
 fi
 
 PROJECT="${MEMCONTINUUM_PROJECT:-$(basename "$MEMCONTINUUM_ROOT")}"
 
-START_TS=$EPOCHREALTIME
+# $EPOCHREALTIME is a bash 5-ism (unbound under `set -u` on macOS's stock
+# bash 3.2); `date +%s` (whole seconds -- nothing downstream parses the
+# elapsed value, so the lost sub-second precision costs nothing) is the
+# portable substitute, matching BSD date (no `%N`) same as GNU date.
+START_TS=$(date +%s 2>/dev/null || echo 0)
 OUT="$(PYTHONPATH= "$PY" "$MEMIDX" reindex --root "$MEMCONTINUUM_ROOT" --project "$PROJECT" ${MEMCONTINUUM_HOME:+--db "$MEMCONTINUUM_HOME/$PROJECT.sqlite"} 2>&1)"
 RC=$?
-ELAPSED=$(awk -v a="$START_TS" -v b="$EPOCHREALTIME" 'BEGIN{printf "%.3f", b-a}')
+NOW_TS=$(date +%s 2>/dev/null || echo "$START_TS")
+ELAPSED=$(( NOW_TS - START_TS ))
 
 printf '%s post-commit-reindex: rc=%s elapsed=%ss project=%s root=%s :: %s\n' \
-    "$(date -Iseconds)" "$RC" "$ELAPSED" "$PROJECT" "$MEMCONTINUUM_ROOT" "$OUT" >>"$LOG" 2>/dev/null || true
+    "$(date -Iseconds 2>/dev/null || date)" "$RC" "$ELAPSED" "$PROJECT" "$MEMCONTINUUM_ROOT" "$OUT" >>"$LOG" 2>/dev/null || true
 
 # A commit should never be blocked by a reindex failure.
 exit 0

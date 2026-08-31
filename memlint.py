@@ -19,6 +19,7 @@ Exit 1 if any error was found anywhere under ROOT (warnings alone -> exit 0).
 """
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -31,6 +32,27 @@ from memidx import (
     parse_frontmatter,
     walk_markdown,
 )
+
+# ---------------------------------------------------------------------------
+# concept-rule helpers (Anatomy's intent index -- memidx.py's code-reindex/
+# code-search sibling additions to the concept-record rules below)
+# ---------------------------------------------------------------------------
+
+_DECLARED_FUNC_RE = re.compile(r"\b(?:static\s+)?func\s+([A-Za-z_][A-Za-z0-9_]*|[+\-*/%=<>!&|^~]+)")
+_DECLARED_TYPE_RE = re.compile(r"\b(?:class|struct|enum)\s+([A-Za-z_][A-Za-z0-9_]*)")
+_NOT_THIS_RE = re.compile(r"\bNOT\b|not this concept|Does NOT")
+
+
+def _declared_symbols(text: str) -> set[str]:
+    """Best-effort regex scan (not the full lexer-aware chunker in
+    memidx.py -- memlint just needs existence, not chunk boundaries) for
+    names declared via func/struct/enum/class/subscript, including
+    `static func NAME`."""
+    names = {m.group(1) for m in _DECLARED_FUNC_RE.finditer(text)}
+    names.update(m.group(1) for m in _DECLARED_TYPE_RE.finditer(text))
+    if re.search(r"\bsubscript\b", text):
+        names.add("subscript")
+    return names
 
 
 def lint_topic(path: Path, fm: dict) -> tuple[list[str], list[str]]:
@@ -95,13 +117,32 @@ def lint_topic(path: Path, fm: dict) -> tuple[list[str], list[str]]:
     return errors, warnings
 
 
-def lint_concept(path: Path, fm: dict, code_root: Path | None) -> tuple[list[str], list[str]]:
+def lint_concept(
+    path: Path,
+    fm: dict,
+    code_root: Path | None,
+    body: str = "",
+    known_topic_ids: set[str] | None = None,
+) -> tuple[list[str], list[str]]:
     """docs/SCHEMA.md.1 addendum SS4: type: concept records.
 
     - implemented_by/tested_by path that doesn't exist on disk (relative to
       code_root, "#symbol" fragment stripped) -> error. Skipped entirely
       when code_root is not given (existence isn't checkable without one).
+    - a "#symbol" fragment that doesn't actually match a func/struct/enum/
+      class/subscript/static-func declared in that file -> error (the
+      fragment used to be stripped and never checked).
+    - implemented_by WITHOUT a "#symbol" fragment on a file over 400
+      lines -> error (an unqualified claim on a large file is too vague to
+      be useful -- narrow it to a symbol).
+    - governed_by referencing a topic id not found anywhere in the linted
+      corpus -> error. Only enforced when known_topic_ids is given AND
+      non-empty (a corpus with zero topic records has no registry to
+      validate against -- same "skip when unverifiable" pattern as the
+      code_root-less path-existence check).
     - no tested_by entries -> warning (promotion needs at least one).
+    - concept body with no "not this concept" sentence (what this concept
+      is explicitly NOT) -> warning.
     """
     errors: list[str] = []
     warnings: list[str] = []
@@ -110,14 +151,49 @@ def lint_concept(path: Path, fm: dict, code_root: Path | None) -> tuple[list[str
     if code_root is not None:
         for field in ("implemented_by", "tested_by"):
             for ref in fm.get(field) or []:
-                ref_path = str(ref).split("#", 1)[0]
-                if not (code_root / ref_path).exists():
+                ref_str = str(ref)
+                ref_path, _, frag = ref_str.partition("#")
+                full = code_root / ref_path
+                if not full.exists():
                     errors.append(
                         f"{path}: {cid} {field} path {ref_path!r} does not exist under {code_root}"
                     )
+                    continue
+                if frag:
+                    try:
+                        declared = _declared_symbols(full.read_text(encoding="utf-8", errors="ignore"))
+                    except OSError:
+                        declared = set()
+                    if frag not in declared:
+                        errors.append(
+                            f"{path}: {cid} {field} fragment {frag!r} is not a func/struct/enum/"
+                            f"class/subscript declared in {ref_path!r}"
+                        )
+                elif field == "implemented_by":
+                    try:
+                        with full.open(encoding="utf-8", errors="ignore") as fh:
+                            line_count = sum(1 for _ in fh)
+                    except OSError:
+                        line_count = 0
+                    if line_count > 400:
+                        errors.append(
+                            f"{path}: {cid} implemented_by {ref_path!r} has no #symbol fragment and "
+                            f"is {line_count} lines (>400) -- narrow the claim to a specific symbol"
+                        )
+
+    if known_topic_ids:
+        for gid in fm.get("governed_by") or []:
+            if gid not in known_topic_ids:
+                errors.append(f"{path}: {cid} governed_by references unknown topic id {gid!r}")
 
     if not fm.get("tested_by"):
         warnings.append(f"{path}: concept {cid} has no tested_by (required before promotion)")
+
+    if not _NOT_THIS_RE.search(body):
+        warnings.append(
+            f"{path}: concept {cid} body has no \"not this concept\" sentence "
+            f"(state what this concept explicitly is NOT)"
+        )
 
     return errors, warnings
 
@@ -134,23 +210,70 @@ def lint_record(path: Path, fm: dict) -> tuple[list[str], list[str]]:
     return errors, []
 
 
-def lint_file(path: Path, code_root: Path | None = None) -> tuple[list[str], list[str]]:
-    fm, _body = parse_frontmatter(path)
+def lint_file(
+    path: Path,
+    code_root: Path | None = None,
+    known_topic_ids: set[str] | None = None,
+) -> tuple[list[str], list[str]]:
+    fm, body = parse_frontmatter(path)
     if fm.get("type") == "concept":
-        return lint_concept(path, fm, code_root)
+        return lint_concept(path, fm, code_root, body=body, known_topic_ids=known_topic_ids)
     is_topic = bool(fm.get("links")) or fm.get("type") == "topic"
     if is_topic:
         return lint_topic(path, fm)
     return lint_record(path, fm)
 
 
+def _duplicate_claim_errors(root: Path) -> list[str]:
+    """docs/SCHEMA.md.1 addendum SS4 extension: two concepts must never
+    both claim the same implemented_by "path#symbol" -- that's not two
+    concepts sharing ownership, it's an unresolved ambiguity about which
+    one actually implements it. tested_by is deliberately excluded (many
+    concepts legitimately share a test file). Message avoids concatenating
+    "path#symbol" as one literal substring so it can't be mistaken for
+    (or collide with an assertion aimed at) the path-existence checks
+    above, which do use that exact concatenation."""
+    claims: dict[str, list[tuple[str, Path]]] = {}
+    for f in sorted(walk_markdown(root)):
+        fm, _body = parse_frontmatter(f)
+        if fm.get("type") != "concept":
+            continue
+        cid = fm.get("id") or f.stem
+        for ref in fm.get("implemented_by") or []:
+            ref_str = str(ref)
+            if "#" not in ref_str:
+                continue
+            ref_path, _, frag = ref_str.partition("#")
+            claims.setdefault(f"{ref_path}\x00{frag}", []).append((cid, f))
+
+    errors = []
+    for key, owners in claims.items():
+        if len(owners) < 2:
+            continue
+        ref_path, frag = key.split("\x00", 1)
+        owner_desc = ", ".join(f"{cid} ({fp})" for cid, fp in owners)
+        errors.append(
+            f"duplicate implemented_by claim on {ref_path!r} symbol {frag!r}: {owner_desc}"
+        )
+    return errors
+
+
 def lint_root(root: Path, code_root: Path | None = None) -> tuple[list[str], list[str]]:
+    known_topic_ids: set[str] = set()
+    for f in sorted(walk_markdown(root)):
+        fm, _body = parse_frontmatter(f)
+        is_topic = bool(fm.get("links")) or fm.get("type") == "topic"
+        if is_topic:
+            tid = fm.get("id") or f.stem
+            known_topic_ids.add(str(tid))
+
     all_errors: list[str] = []
     all_warnings: list[str] = []
     for f in sorted(walk_markdown(root)):
-        errors, warnings = lint_file(f, code_root)
+        errors, warnings = lint_file(f, code_root, known_topic_ids=known_topic_ids)
         all_errors.extend(errors)
         all_warnings.extend(warnings)
+    all_errors.extend(_duplicate_claim_errors(root))
     return all_errors, all_warnings
 
 

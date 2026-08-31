@@ -563,6 +563,14 @@ def compute_query_embedding(text: str):
 
 
 def cosine(a: list[float], b: list[float]) -> float:
+    """Returns a plain Python float, always -- fastembed's query_embed
+    yields a numpy array (numpy.float32 elements), so an un-cast result
+    here silently produces a numpy.float32 that `json.dumps` cannot
+    serialize (TypeError: Object of type float32 is not JSON serializable)
+    the moment a caller's score reaches --json output. Pre-existing on the
+    markdown `search --mode vector --json` path too (same helper); fixed
+    here since code-search inherits the identical bug via the same
+    cosine()/compute_query_embedding() pair."""
     import math
 
     dot = sum(x * y for x, y in zip(a, b))
@@ -570,7 +578,7 @@ def cosine(a: list[float], b: list[float]) -> float:
     nb = math.sqrt(sum(y * y for y in b))
     if na == 0 or nb == 0:
         return 0.0
-    return dot / (na * nb)
+    return float(dot / (na * nb))
 
 
 # ---------------------------------------------------------------------------
@@ -1360,6 +1368,843 @@ def cmd_check(args) -> int:
 
 
 # ---------------------------------------------------------------------------
+# code index -- `code-reindex` / `code-search` (Anatomy's intent index)
+#
+# A completely separate SQLite DB ($MEMCONTINUUM_HOME/<project>-code.sqlite,
+# see resolve_code_db_path/CODE_SCHEMA_SQL) from the markdown decision index
+# above. Chunks a Swift source tree into func/init/subscript/computed-var
+# units via a lexer-aware brace walker (comments, strings incl. raw/
+# multiline, string-interpolation closures, and #if branches all handled --
+# see chunk_source below) and serves fts/vector/hybrid search over them,
+# reusing the same fts_escape/pack_vector/unpack_vector/cosine/
+# compute_embeddings/compute_query_embedding helpers as the markdown path so
+# `--mode fts` never imports fastembed here either.
+#
+# class/struct/enum/protocol/extension are NEVER chunks themselves -- they
+# only qualify names (an enclosing-type stack, `types` below) so e.g. a
+# method inside `extension RuleEngine { func f() {} }` is indexed as
+# `RuleEngine.f`.
+# ---------------------------------------------------------------------------
+
+LANG_EXTENSIONS = {"swift": (".swift",)}
+CODE_SKIP_DIR_NAMES = {".git", ".build", "vendor", "node_modules", "Tests", "Resources"}
+
+CODE_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS chunks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  path TEXT NOT NULL,
+  project TEXT NOT NULL,
+  lang TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  qualified_name TEXT NOT NULL,
+  signature TEXT,
+  doc TEXT,
+  start_line INTEGER NOT NULL,
+  end_line INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_code_chunks_path ON chunks(project, path);
+CREATE INDEX IF NOT EXISTS idx_code_chunks_qname ON chunks(project, qualified_name);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(
+  qualified_name, split_tokens, signature, doc, body
+);
+
+CREATE TABLE IF NOT EXISTS embeddings (
+  chunk_id INTEGER PRIMARY KEY,
+  project TEXT NOT NULL,
+  dim INTEGER NOT NULL,
+  vector BLOB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS file_sha (
+  path TEXT NOT NULL,
+  project TEXT NOT NULL,
+  sha256 TEXT NOT NULL,
+  mtime REAL,
+  size INTEGER,
+  gap_count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (path, project)
+);
+
+CREATE TABLE IF NOT EXISTS code_meta (
+  project TEXT PRIMARY KEY,
+  code_root TEXT,
+  langs TEXT,
+  last_indexed_at REAL
+);
+"""
+
+
+def resolve_code_db_path(args) -> Path:
+    """Same override rule as resolve_db_path, but the filename is always
+    "<project>-code.sqlite" -- a completely separate file from
+    "<project>.sqlite" (checked by TestCodeIndexIsolation)."""
+    if getattr(args, "db", None):
+        return Path(args.db).expanduser().resolve()
+    base = Path(os.environ.get("MEMCONTINUUM_HOME", str(Path.home() / ".memcontinuum")))
+    return base / f"{args.project}-code.sqlite"
+
+
+def open_code_db(db_path: Path) -> sqlite3.Connection:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.executescript(CODE_SCHEMA_SQL)
+    return conn
+
+
+def _lang_for_ext(suffix: str) -> str:
+    for lang, exts in LANG_EXTENSIONS.items():
+        if suffix in exts:
+            return lang
+    return suffix.lstrip(".") or "unknown"
+
+
+def iter_code_source_files(root: Path, langs: list[str] | None):
+    exts = set()
+    for lang in (langs or ["swift"]):
+        exts.update(LANG_EXTENSIONS.get(lang, ()))
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in CODE_SKIP_DIR_NAMES]
+        for fname in sorted(filenames):
+            if any(fname.endswith(e) for e in exts):
+                yield Path(dirpath) / fname
+
+
+# ---------------------------------------------------------------------------
+# chunker: lexer-aware brace walker
+# ---------------------------------------------------------------------------
+
+
+def _find_prefix_hashes(text: str, i: int) -> int:
+    n = 0
+    while i + n < len(text) and text[i + n] == "#":
+        n += 1
+    return n
+
+
+def _scan_region(text: str, start: int):
+    """Scan text[start:] as Swift source in a FRESH top-level brace context
+    (depth 0). Writes accumulate into local_writes/local_match, but are
+    only TRUSTWORTHY up through `checkpoint_idx` -- the position just past
+    the most recent point brace depth returned to 0 (a fully-closed
+    top-level construct can never be retroactively corrupted by whatever
+    comes after it, so each such point is a safe commit boundary). The
+    caller (chunk_source) discards anything at/after checkpoint_idx when a
+    desync is reported, keeping everything before it -- this is what lets
+    "func good() {...}" ahead of a later-in-the-same-file fault still get
+    indexed, rather than gapping the whole region back to its start.
+
+    An "extra open" imbalance (e.g. one #if branch missing a closing
+    brace) doesn't fail until EOF (or may, pathologically, never fail at
+    all if a later stray '}' happens to numerically rebalance it --
+    brace-counting alone cannot distinguish that from genuinely correct
+    code; a known limitation, not fixable without semantic analysis). An
+    "extra close" (a stray '}') fails immediately, so checkpoint_idx will
+    usually sit right at the fault in that case.
+
+    Handles // and /* nested */ comments, "simple" strings, triple-quoted
+    strings, #"raw"# strings (interpolation not supported inside raw
+    strings -- inert content, matching the advisor's "gap+warn is
+    acceptable there" guidance), and \\(...\\) string interpolation
+    (including one containing a closure literal) via a small mode stack so
+    nested `(`/`{` inside an interpolation still balance correctly.
+
+    Returns (desync_idx_or_None, local_writes, local_match, checkpoint_idx).
+    """
+    n = len(text)
+    brace_stack: list[int] = []
+    mode_stack: list[list] = [["CODE"]]
+    local_writes: dict = {}
+    local_match: dict = {}
+    checkpoint_idx = start
+    i = start
+    while i < n:
+        frame = mode_stack[-1]
+        mode = frame[0]
+        c = text[i]
+
+        if mode in ("CODE", "ICODE"):
+            if c == "/" and i + 1 < n and text[i + 1] == "/":
+                j = i
+                while j < n and text[j] != "\n":
+                    j += 1
+                i = j
+                continue
+            if c == "/" and i + 1 < n and text[i + 1] == "*":
+                depth_c = 1
+                j = i + 2
+                while j < n and depth_c > 0:
+                    if text[j : j + 2] == "/*":
+                        depth_c += 1
+                        j += 2
+                        continue
+                    if text[j : j + 2] == "*/":
+                        depth_c -= 1
+                        j += 2
+                        continue
+                    j += 1
+                i = j
+                continue
+            if text[i : i + 3] == '"""':
+                mode_stack.append(["STR_TRIPLE"])
+                i += 3
+                continue
+            if c == "#":
+                h = _find_prefix_hashes(text, i)
+                if i + h < n and text[i + h] == '"':
+                    mode_stack.append(["STR_RAW", h])
+                    i += h + 1
+                    continue
+                local_writes[i] = c
+                i += 1
+                continue
+            if c == '"':
+                mode_stack.append(["STR_SIMPLE"])
+                i += 1
+                continue
+            if c == "{":
+                brace_stack.append(i)
+                local_writes[i] = c
+                i += 1
+                continue
+            if c == "}":
+                if not brace_stack:
+                    return i, local_writes, local_match, checkpoint_idx
+                open_idx = brace_stack.pop()
+                local_match[open_idx] = i
+                local_writes[i] = c
+                i += 1
+                if not brace_stack:
+                    checkpoint_idx = i
+                continue
+            if mode == "ICODE" and c == "(":
+                frame[1] += 1
+                local_writes[i] = c
+                i += 1
+                continue
+            if mode == "ICODE" and c == ")":
+                frame[1] -= 1
+                local_writes[i] = c
+                i += 1
+                if frame[1] == 0:
+                    mode_stack.pop()
+                continue
+            if c != "\n":
+                local_writes[i] = c
+            i += 1
+            continue
+
+        if mode == "STR_SIMPLE":
+            if c == "\\" and i + 1 < n and text[i + 1] == "(":
+                mode_stack.append(["ICODE", 1])
+                i += 2
+                continue
+            if c == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if c == '"':
+                mode_stack.pop()
+                i += 1
+                continue
+            i += 1
+            continue
+
+        if mode == "STR_TRIPLE":
+            if c == "\\" and i + 1 < n and text[i + 1] == "(":
+                mode_stack.append(["ICODE", 1])
+                i += 2
+                continue
+            if c == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if text[i : i + 3] == '"""':
+                mode_stack.pop()
+                i += 3
+                continue
+            i += 1
+            continue
+
+        if mode == "STR_RAW":
+            h = frame[1]
+            if c == '"' and text[i + 1 : i + 1 + h] == "#" * h:
+                mode_stack.pop()
+                i += h + 1
+                continue
+            i += 1
+            continue
+
+        i += 1
+
+    if brace_stack:
+        return brace_stack[0], local_writes, local_match, checkpoint_idx
+    return None, local_writes, local_match, n
+
+
+_RESYNC_RE = re.compile(
+    r"^[ \t]{0,8}(?:(?:public|private|internal|fileprivate|open|final|static|class|"
+    r"override|required|convenience|indirect|mutating|nonisolated|@\w+(?:\([^)]*\))?)\s+)*"
+    r"(?:func|init|class|struct|enum|protocol|extension)\b"
+)
+
+
+def _iter_lines(text: str, start: int):
+    i = start
+    n = len(text)
+    while i <= n:
+        j = text.find("\n", i)
+        if j == -1:
+            yield i, n
+            return
+        yield i, j
+        i = j + 1
+
+
+def _find_resync_point(text: str, from_idx: int):
+    """The gap-fallback resync heuristic: from the line AFTER the desync
+    point, the next line that (after up to 8 columns of indent and any
+    modifiers) starts a func/init/class/struct/enum/protocol/extension
+    declaration -- i.e. "looks top-level or type-member level". None if no
+    such line exists before EOF (desync ran to end of file)."""
+    nl = text.find("\n", from_idx)
+    if nl == -1:
+        return None
+    for line_start, line_end in _iter_lines(text, nl + 1):
+        if _RESYNC_RE.match(text[line_start:line_end]):
+            return line_start
+    return None
+
+
+def chunk_source(text: str):
+    """Chunk one Swift file's source text. Returns (chunks, gaps) where
+    chunks is a list of dicts (kind, symbol, qualified_name, signature,
+    doc, start_line, end_line -- all 1-based) in source order, and gaps is
+    a list of (start_line, end_line) 1-based ranges skipped due to a brace
+    desync (counted + reported by the caller; never a whole-file
+    fallback -- indexing always resumes after the gap)."""
+    n = len(text)
+    mask_full = [("\n" if ch == "\n" else " ") for ch in text]
+    match_dict: dict = {}
+    gaps: list = []
+    pos = 0
+    while pos < n:
+        desync_idx, local_writes, local_match, checkpoint_idx = _scan_region(text, pos)
+        if desync_idx is None:
+            # clean run to EOF: commit this region's writes/pairs.
+            for idx, ch in local_writes.items():
+                mask_full[idx] = ch
+            match_dict.update(local_match)
+            break
+        # desync: only what was safely checkpointed (fully-closed
+        # top-level constructs up to checkpoint_idx) is committed -- the
+        # rest of this region's writes/pairs are discarded (see
+        # _scan_region's docstring). The gap covers checkpoint_idx (the
+        # last known-good point) through the resync point.
+        for idx, ch in local_writes.items():
+            if idx < checkpoint_idx:
+                mask_full[idx] = ch
+        for open_idx, close_idx in local_match.items():
+            if open_idx < checkpoint_idx:
+                match_dict[open_idx] = close_idx
+        resync_idx = _find_resync_point(text, desync_idx)
+        gap_start_line = text.count("\n", 0, checkpoint_idx) + 1
+        if resync_idx is None:
+            gap_end_line = text.count("\n", 0, n) + 1
+            gaps.append((gap_start_line, gap_end_line))
+            break
+        gap_end_line = text.count("\n", 0, resync_idx) + 1
+        gaps.append((gap_start_line, gap_end_line))
+        pos = resync_idx
+    mask = "".join(mask_full)
+    chunks = _extract_decls(text, mask, match_dict)
+    return chunks, gaps
+
+
+_IDENT_RE = re.compile(r"[ \t\n]*([A-Za-z_][A-Za-z0-9_]*)")
+_OPERATOR_CHARS = set("+-*/%=<>!&|^~?.")
+_KEYWORD_RE = re.compile(r"\b(class|struct|enum|protocol|extension|func|init|subscript|var)\b")
+
+
+def _read_identifier(mask: str, i: int):
+    m = _IDENT_RE.match(mask, i)
+    return m.group(1) if m else None
+
+
+def _read_identifier_or_operator(mask: str, i: int):
+    j = i
+    n = len(mask)
+    while j < n and mask[j] in (" ", "\n", "\t"):
+        j += 1
+    if j < n and (mask[j].isalpha() or mask[j] == "_"):
+        return _read_identifier(mask, i)
+    k = j
+    while k < n and mask[k] in _OPERATOR_CHARS:
+        k += 1
+    return mask[j:k] if k > j else None
+
+
+def _read_init_suffix(mask: str, i: int) -> str:
+    j = i
+    n = len(mask)
+    while j < n and mask[j] in (" ", "\n", "\t"):
+        j += 1
+    if j < n and mask[j] in ("?", "!"):
+        return mask[j]
+    return ""
+
+
+def _find_body_open(mask: str, match_dict: dict, i: int, limit: int):
+    """From just after a decl's keyword+name(+header), find its own
+    body-open '{' -- the first '{' at paren_depth 0, jumping wholesale
+    (via match_dict) over any nested brace region first (a default
+    parameter's closure literal, a where-clause, etc). Returns None if the
+    enclosing scope's own '}' is hit first (a body-less protocol
+    requirement -- not a chunk) or the region ends unmatched."""
+    paren_depth = 0
+    j = i
+    while j < limit:
+        c = mask[j]
+        if c == "(":
+            paren_depth += 1
+        elif c == ")":
+            paren_depth -= 1
+        elif c == "{":
+            if paren_depth <= 0:
+                return j
+            nxt = match_dict.get(j)
+            if nxt is None:
+                return None
+            j = nxt
+        elif c == "}":
+            return None
+        j += 1
+    return None
+
+
+def _classify_var(mask: str, i: int, limit: int):
+    """From just after `var NAME`, decide whether it's a computed property
+    (chunk) or a stored one (never a chunk -- includes `lazy var x = { ...
+    }()`, excluded because '=' is found before '{'). Returns (is_computed,
+    body_open_idx_or_None).
+
+    A stored property with no initializer (`var x: Int` alone, e.g. a
+    protocol requirement or a plain field) is statement-terminated by its
+    newline: at each '\\n' outside any paren/bracket nesting, peek past
+    following whitespace (blank lines, and comment lines, which are
+    already blank in mask) for the next real character -- only '{' (brace
+    on the next line) or '=' (a multi-line initializer) means the same
+    declaration continues; anything else (typically the next
+    declaration's own keyword) means this one had no body."""
+    paren_depth = 0
+    bracket_depth = 0
+    j = i
+    while j < limit:
+        c = mask[j]
+        if c == "\n" and paren_depth <= 0 and bracket_depth <= 0:
+            k = j
+            while k < limit and mask[k] in (" ", "\t", "\n"):
+                k += 1
+            if k >= limit or mask[k] not in ("{", "="):
+                return False, None
+            j = k
+            continue
+        if c == "(":
+            paren_depth += 1
+        elif c == ")":
+            paren_depth -= 1
+        elif c == "[":
+            bracket_depth += 1
+        elif c == "]":
+            bracket_depth -= 1
+        elif paren_depth <= 0 and bracket_depth <= 0:
+            if c == "=":
+                return False, None
+            if c == "{":
+                return True, j
+            if c == "}":
+                return False, None
+        j += 1
+    return False, None
+
+
+def _signature_text(text: str, kstart: int, body_open: int) -> str:
+    raw = text[kstart:body_open]
+    return re.sub(r"\s+", " ", raw).strip()
+
+
+def _doc_comment_before(text: str, kstart: int) -> str:
+    line_start = text.rfind("\n", 0, kstart) + 1
+    lines_before = text[:line_start].splitlines()
+    doc_lines: list = []
+    idx = len(lines_before) - 1
+    while idx >= 0:
+        stripped = lines_before[idx].strip()
+        if stripped.startswith("///"):
+            doc_lines.insert(0, stripped[3:].strip())
+            idx -= 1
+            continue
+        break
+    return "\n".join(doc_lines)
+
+
+def _extract_decls(text: str, mask: str, match_dict: dict):
+    n = len(text)
+    raw_types: list = []
+    raw_chunks: list = []
+
+    for m in _KEYWORD_RE.finditer(mask):
+        kw = m.group(1)
+        kstart = m.start()
+        after = kstart + len(kw)
+
+        if kw in ("class", "struct", "enum", "protocol", "extension"):
+            name = _read_identifier(mask, after)
+            if kw == "class" and name in ("func", "var"):
+                continue  # `class func` / `class var` modifier, not a type decl
+            body_open = _find_body_open(mask, match_dict, after, n)
+            if body_open is None:
+                continue
+            body_close = match_dict.get(body_open)
+            if body_close is None:
+                continue
+            raw_types.append((name, kstart, body_open, body_close))
+            continue
+
+        if kw in ("func", "init", "subscript"):
+            if kw == "func":
+                name = _read_identifier_or_operator(mask, after)
+                if not name:
+                    continue
+            elif kw == "init":
+                name = "init" + _read_init_suffix(mask, after)
+            else:
+                name = "subscript"
+            body_open = _find_body_open(mask, match_dict, after, n)
+            if body_open is None:
+                continue
+            body_close = match_dict.get(body_open)
+            if body_close is None:
+                continue
+            raw_chunks.append((kw, name, kstart, body_open, body_close))
+            continue
+
+        if kw == "var":
+            name = _read_identifier(mask, after)
+            if not name:
+                continue
+            is_computed, body_open = _classify_var(mask, after, n)
+            if not is_computed:
+                continue
+            body_close = match_dict.get(body_open)
+            if body_close is None:
+                continue
+            raw_chunks.append(("var", name, kstart, body_open, body_close))
+            continue
+
+    def enclosing_chain(pos: int) -> list:
+        containing = [t for t in raw_types if t[1] < pos < t[3]]
+        containing.sort(key=lambda t: (t[3] - t[1]), reverse=True)  # outermost first
+        return [t[0] for t in containing if t[0]]
+
+    out = []
+    for kw, name, kstart, body_open, body_close in raw_chunks:
+        chain = enclosing_chain(kstart)
+        qualified = ".".join(chain + [name]) if chain else name
+        sig = _signature_text(text, kstart, body_open)
+        doc = _doc_comment_before(text, kstart)
+        start_line = text.count("\n", 0, kstart) + 1
+        end_line = text.count("\n", 0, body_close) + 1
+        out.append(
+            {
+                "kind": kw,
+                "symbol": name,
+                "qualified_name": qualified,
+                "signature": sig,
+                "doc": doc,
+                "start_line": start_line,
+                "end_line": end_line,
+            }
+        )
+    out.sort(key=lambda c: c["start_line"])
+    return out
+
+
+# ---------------------------------------------------------------------------
+# embed/FTS text + reindex/search commands
+# ---------------------------------------------------------------------------
+
+
+def split_ident(name: str) -> str:
+    """camelCase/snake_case splitter used for both the FTS split_tokens
+    column and the embed text -- "writePNG" -> "write PNG",
+    "PNGWriter" -> "PNG Writer"."""
+    s = name.replace("_", " ")
+    s = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", s)
+    s = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def split_qualified(qualified_name: str) -> str:
+    return " ".join(split_ident(part) for part in qualified_name.split(".") if part)
+
+
+def code_embed_text_for(rel_path: str, chunk: dict, body_lines: list) -> str:
+    """file path, qualified name PLUS split tokens, signature, doc comment,
+    first ~25 body lines -- in that order (per the spec)."""
+    split_tokens = split_qualified(chunk["qualified_name"])
+    parts = [
+        rel_path,
+        f"{chunk['qualified_name']} {split_tokens}".strip(),
+        chunk["signature"] or "",
+        chunk["doc"] or "",
+        "\n".join(body_lines[:25]),
+    ]
+    return "\n\n".join(p for p in parts if p)
+
+
+def delete_code_chunks_for_path(conn: sqlite3.Connection, project: str, path: str) -> None:
+    rows = conn.execute("SELECT id FROM chunks WHERE project=? AND path=?", (project, path)).fetchall()
+    for r in rows:
+        conn.execute("DELETE FROM fts WHERE rowid=?", (r["id"],))
+        conn.execute("DELETE FROM embeddings WHERE chunk_id=?", (r["id"],))
+    conn.execute("DELETE FROM chunks WHERE project=? AND path=?", (project, path))
+
+
+def cmd_code_reindex(args) -> int:
+    root = Path(args.code_root).resolve()
+    db_path = resolve_code_db_path(args)
+    conn = open_code_db(db_path)
+    t0 = time.time()
+    langs = [l.strip() for l in args.lang.split(",")] if getattr(args, "lang", None) else None
+
+    existing = {
+        row["path"]: row["sha256"]
+        for row in conn.execute("SELECT path, sha256 FROM file_sha WHERE project=?", (args.project,))
+    }
+
+    files = list(iter_code_source_files(root, langs))
+    seen = set()
+    added_files = changed_files = unchanged_files = 0
+    total_gaps = 0
+    pending_texts: list = []
+    pending_ids: list = []
+
+    for f in files:
+        try:
+            rel = str(f.relative_to(root))
+        except ValueError:
+            rel = str(f)
+        seen.add(rel)
+        data = f.read_bytes()
+        sha = hashlib.sha256(data).hexdigest()
+        prev_sha = existing.get(rel)
+        if prev_sha == sha and not args.full:
+            unchanged_files += 1
+            continue
+        is_new = rel not in existing
+
+        text = data.decode("utf-8", errors="replace")
+        lang = _lang_for_ext(f.suffix)
+        chunks, gaps = chunk_source(text)
+        total_gaps += len(gaps)
+        for g in gaps:
+            print(
+                f"code-reindex: WARNING gap in {rel} lines {g[0]}-{g[1]} "
+                f"(brace desync, skipped)",
+                file=sys.stderr,
+            )
+
+        delete_code_chunks_for_path(conn, args.project, rel)
+        text_lines = text.splitlines()
+        for chunk in chunks:
+            body_lines = text_lines[chunk["start_line"] : chunk["end_line"] - 1]
+            cur = conn.execute(
+                """INSERT INTO chunks (path, project, lang, kind, symbol, qualified_name,
+                       signature, doc, start_line, end_line)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    rel, args.project, lang, chunk["kind"], chunk["symbol"],
+                    chunk["qualified_name"], chunk["signature"], chunk["doc"],
+                    chunk["start_line"], chunk["end_line"],
+                ),
+            )
+            chunk_id = cur.lastrowid
+            split_tokens = split_qualified(chunk["qualified_name"])
+            body_text = "\n".join(body_lines[:25])
+            conn.execute(
+                "INSERT INTO fts (rowid, qualified_name, split_tokens, signature, doc, body) "
+                "VALUES (?,?,?,?,?,?)",
+                (chunk_id, chunk["qualified_name"], split_tokens, chunk["signature"] or "",
+                 chunk["doc"] or "", body_text),
+            )
+            if not args.no_embed:
+                pending_texts.append(code_embed_text_for(rel, chunk, body_lines))
+                pending_ids.append(chunk_id)
+
+        stat = f.stat()
+        conn.execute(
+            "INSERT OR REPLACE INTO file_sha (path, project, sha256, mtime, size, gap_count) "
+            "VALUES (?,?,?,?,?,?)",
+            (rel, args.project, sha, stat.st_mtime, stat.st_size, len(gaps)),
+        )
+        if is_new:
+            added_files += 1
+        else:
+            changed_files += 1
+
+    reembeds = 0
+    if pending_texts:
+        vecs = compute_embeddings(pending_texts)
+        for cid, v in zip(pending_ids, vecs):
+            packed = pack_vector(v)
+            conn.execute(
+                "INSERT OR REPLACE INTO embeddings (chunk_id, project, dim, vector) VALUES (?,?,?,?)",
+                (cid, args.project, len(unpack_vector(packed)), packed),
+            )
+        reembeds = len(pending_texts)
+
+    removed = set(existing.keys()) - seen
+    for rel in removed:
+        delete_code_chunks_for_path(conn, args.project, rel)
+        conn.execute("DELETE FROM file_sha WHERE project=? AND path=?", (args.project, rel))
+
+    conn.execute(
+        "INSERT OR REPLACE INTO code_meta (project, code_root, langs, last_indexed_at) VALUES (?,?,?,?)",
+        (args.project, str(root), ",".join(langs) if langs else "swift", time.time()),
+    )
+    conn.commit()
+    conn.close()
+    elapsed = time.time() - t0
+    print(
+        f"code-reindex: {len(files)} files scanned, {added_files} added, {changed_files} changed, "
+        f"{unchanged_files} unchanged, {len(removed)} removed, {reembeds} chunk(s) (re-)embedded, "
+        f"{total_gaps} gap(s) warned, {elapsed:.3f}s"
+    )
+    return 0
+
+
+def code_hits_fts(conn: sqlite3.Connection, query: str, project: str, limit: int = 200):
+    q = fts_escape(query)
+    rows = conn.execute(
+        """SELECT fts.rowid AS rowid FROM fts
+           JOIN chunks ON chunks.id = fts.rowid
+           WHERE fts MATCH ? AND chunks.project=?
+           ORDER BY bm25(fts) LIMIT ?""",
+        (q, project, limit),
+    ).fetchall()
+    return [r["rowid"] for r in rows]
+
+
+def code_hits_vector(conn: sqlite3.Connection, query: str, project: str):
+    qvec = compute_query_embedding(query)
+    rows = conn.execute(
+        "SELECT chunk_id, vector FROM embeddings WHERE project=?", (project,)
+    ).fetchall()
+    scored = [(r["chunk_id"], cosine(qvec, unpack_vector(r["vector"]))) for r in rows]
+    scored.sort(key=lambda t: t[1], reverse=True)
+    return scored
+
+
+def _code_index_is_stale(conn: sqlite3.Connection, project: str) -> bool:
+    meta = conn.execute("SELECT code_root, langs FROM code_meta WHERE project=?", (project,)).fetchone()
+    if meta is None or not meta["code_root"]:
+        return False
+    root = Path(meta["code_root"])
+    if not root.exists():
+        return True
+    langs = meta["langs"].split(",") if meta["langs"] else None
+    existing = {
+        row["path"]: (row["mtime"], row["size"])
+        for row in conn.execute("SELECT path, mtime, size FROM file_sha WHERE project=?", (project,))
+    }
+    seen = set()
+    for f in iter_code_source_files(root, langs):
+        try:
+            rel = str(f.relative_to(root))
+        except ValueError:
+            continue
+        seen.add(rel)
+        stat = f.stat()
+        prev = existing.get(rel)
+        if prev is None or prev[0] != stat.st_mtime or prev[1] != stat.st_size:
+            return True
+    return bool(set(existing.keys()) - seen)
+
+
+def cmd_code_search(args) -> int:
+    db_path = resolve_code_db_path(args)
+    conn = open_code_db(db_path)
+
+    if _code_index_is_stale(conn, args.project):
+        print(
+            "code-search: WARNING code index appears stale "
+            "(source changed since last code-reindex)",
+            file=sys.stderr,
+        )
+
+    if args.mode == "fts":
+        ids = code_hits_fts(conn, args.query, args.project)
+        results = [(cid, float(len(ids) - i)) for i, cid in enumerate(ids)]
+    elif args.mode == "vector":
+        results = code_hits_vector(conn, args.query, args.project)
+    elif args.mode == "hybrid":
+        fts_ids = code_hits_fts(conn, args.query, args.project)
+        vec_ids = [cid for cid, _ in code_hits_vector(conn, args.query, args.project)]
+        k = 60
+        scores: dict = {}
+        for i, cid in enumerate(fts_ids):
+            scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + i + 1)
+        for i, cid in enumerate(vec_ids):
+            scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + i + 1)
+        results = sorted(scores.items(), key=lambda t: t[1], reverse=True)
+    else:
+        raise ValueError(f"unknown mode {args.mode}")
+
+    results = results[: args.limit]
+
+    md_db_path = resolve_db_path(args)
+    md_conn = None
+    if md_db_path.exists():
+        try:
+            md_conn = open_db(md_db_path)
+        except sqlite3.DatabaseError:
+            md_conn = None
+
+    out = []
+    for chunk_id, score in results:
+        row = conn.execute("SELECT * FROM chunks WHERE id=?", (chunk_id,)).fetchone()
+        if row is None:
+            continue
+        hit = {
+            "path": row["path"],
+            "line": row["start_line"],
+            "qualified_name": row["qualified_name"],
+            "kind": row["kind"],
+            "signature": row["signature"],
+            "score": score,
+        }
+        if md_conn is not None:
+            concept_matches = concept_matches_for_path(md_conn, args.project, row["path"])
+            if concept_matches:
+                hit["concept_id"] = concept_matches[0]["id"]
+                hit["concept_title"] = concept_matches[0]["title"]
+        out.append(hit)
+
+    if md_conn is not None:
+        md_conn.close()
+    conn.close()
+
+    if args.json:
+        print(json.dumps(out, indent=2))
+    else:
+        for h in out:
+            extra = f"  [{h['concept_id']}]" if "concept_id" in h else ""
+            print(f"{h['score']:.4f}  {h['path']}:{h['line']}  {h['qualified_name']}  {h['signature']}{extra}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1431,6 +2276,22 @@ def main(argv=None) -> int:
     p_unmapped.add_argument("--code-root", dest="code_root", default=None)
     p_unmapped.add_argument("--json", action="store_true")
     p_unmapped.set_defaults(func=cmd_unmapped)
+
+    p_code_reindex = sub.add_parser("code-reindex")
+    add_common_args(p_code_reindex)
+    p_code_reindex.add_argument("--code-root", dest="code_root", required=True)
+    p_code_reindex.add_argument("--lang", default=None, help="comma-separated language filter, e.g. swift,ts")
+    p_code_reindex.add_argument("--no-embed", action="store_true")
+    p_code_reindex.add_argument("--full", action="store_true")
+    p_code_reindex.set_defaults(func=cmd_code_reindex)
+
+    p_code_search = sub.add_parser("code-search")
+    add_common_args(p_code_search)
+    p_code_search.add_argument("query")
+    p_code_search.add_argument("--mode", choices=["fts", "vector", "hybrid"], default="hybrid")
+    p_code_search.add_argument("--limit", type=int, default=10)
+    p_code_search.add_argument("--json", action="store_true")
+    p_code_search.set_defaults(func=cmd_code_search)
 
     args = parser.parse_args(argv)
     return args.func(args)

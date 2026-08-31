@@ -69,7 +69,11 @@ if [ ! -x "$PY" ]; then
         "$(date -Iseconds 2>/dev/null || date)" "$SCRIPT_DIR/../.venv/bin/python" >>"$LOG" 2>/dev/null || true
 fi
 
-START_TS=$EPOCHREALTIME
+# $EPOCHREALTIME is a bash 5-ism (unbound under `set -u` on macOS's stock
+# bash 3.2); `date +%s` (whole seconds -- nothing downstream parses the
+# elapsed value, so the lost sub-second precision costs nothing) is the
+# portable substitute, matching BSD date (no `%N`) same as GNU date.
+START_TS=$(date +%s 2>/dev/null || echo 0)
 
 log() {
     # never let logging itself fail the hook
@@ -79,9 +83,10 @@ log() {
 finish() {
     # $1 = one-word outcome for the log line; everything after stays 0.
     local outcome="$1"
-    local elapsed
-    elapsed=$(awk -v a="$START_TS" -v b="$EPOCHREALTIME" 'BEGIN{printf "%.3f", b-a}')
-    log "$(date -Iseconds) outcome=$outcome elapsed=${elapsed}s project=${PROJECT:-} file=${FILE_PATH:-}"
+    local now elapsed
+    now=$(date +%s 2>/dev/null || echo "$START_TS")
+    elapsed=$(( now - START_TS ))
+    log "$(date -Iseconds 2>/dev/null || date) outcome=$outcome elapsed=${elapsed}s project=${PROJECT:-} file=${FILE_PATH:-}"
     exit 0
 }
 

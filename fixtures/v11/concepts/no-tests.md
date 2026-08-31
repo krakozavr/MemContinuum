@@ -4,7 +4,7 @@ id: CON-901
 title: Bad fixture — concept with no tested_by
 owner_boundary: "somewhere"
 implemented_by:
-  - Sources/Delete/DeleteGate.swift#delete
+  - Sources/Scan/QuickCleanup.swift#purgeTemp
 tested_by: []
 governed_by: []
 involved_in: []

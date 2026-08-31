@@ -33,6 +33,10 @@ import memidx  # noqa: E402
 # $MEMCONTINUUM_PYTHON in your own (untracked) shell environment before
 # running this file; see README.md "Requirements" / "Running the tests".
 VENV_PYTHON = os.environ.get("MEMCONTINUUM_PYTHON", "")
+# macOS-port bash-3.2 verification harness (tests/run_bash32.sh): overrides
+# which bash interpreter every hook subprocess call below runs under.
+# Defaults to the system "bash" (unchanged behavior for every normal run).
+MC_BASH = os.environ.get("MC_BASH", "bash")
 _SKIP_NO_VENV = (
     "set $MEMCONTINUUM_PYTHON to a venv python with fastembed/PyYAML "
     "installed to run these tests (see README.md)"
@@ -161,7 +165,7 @@ def clean_env(**overrides):
 def run_script(script: Path, payload_text: str, env: dict, timeout: float = 6.0):
     start = time.monotonic()
     proc = subprocess.run(
-        ["bash", str(script)],
+        [MC_BASH, str(script)],
         input=payload_text,
         capture_output=True,
         text=True,
@@ -513,7 +517,7 @@ class HookTestBase(unittest.TestCase):
 
 class TestLedgerPostEdit(HookTestBase):
     def test_bash_syntax_valid(self):
-        result = subprocess.run(["bash", "-n", str(LEDGER_HOOK)], capture_output=True, text=True)
+        result = subprocess.run([MC_BASH, "-n", str(LEDGER_HOOK)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_silent_always(self):
@@ -718,7 +722,7 @@ class TestLedgerPostEdit(HookTestBase):
 
 class TestPrecompactPersist(HookTestBase):
     def test_bash_syntax_valid(self):
-        result = subprocess.run(["bash", "-n", str(PRECOMPACT_HOOK)], capture_output=True, text=True)
+        result = subprocess.run([MC_BASH, "-n", str(PRECOMPACT_HOOK)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_exits_zero_with_absolutely_empty_stdout(self):
@@ -793,10 +797,29 @@ class TestPrecompactPersist(HookTestBase):
         self.assertEqual(proc.stdout, "")
 
     def test_fail_open_on_timeout(self):
+        """macOS port mechanics note: MEMCONTINUUM_PYTHON also resolves the
+        outer watchdog launcher's own interpreter (see hooks/*.sh's guard
+        block), so a wrapper that sleeps unconditionally on every
+        invocation would delay the launcher's own startup, not just the
+        work call it means to simulate. The wrapper only sleeps for calls
+        that are NOT the launcher itself (detected by the MC_WATCHDOG_LAUNCHER
+        marker every guard's -c source carries) -- this keeps the test's
+        original intent (a slow python for real work) while adjusting for
+        the new mechanism, per the port's "adjust mechanics, keep bounds"
+        instruction."""
         session_id = "s-precompact-timeout"
         self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
         slow_py = Path(self.td) / "slow-python"
-        slow_py.write_text(f"#!/usr/bin/env bash\nsleep 6\nexec {VENV_PYTHON} \"$@\"\n")
+        slow_py.write_text(
+            "#!/usr/bin/env bash\n"
+            "for a in \"$@\"; do\n"
+            "  case \"$a\" in\n"
+            "    *MC_WATCHDOG_LAUNCHER*) exec \"" + VENV_PYTHON + "\" \"$@\" ;;\n"
+            "  esac\n"
+            "done\n"
+            "sleep 6\n"
+            f'exec "{VENV_PYTHON}" "$@"\n'
+        )
         slow_py.chmod(0o755)
         env = self.base_env(MEMCONTINUUM_PYTHON=str(slow_py))
         start = time.monotonic()
@@ -837,7 +860,7 @@ class TestPrecompactPersist(HookTestBase):
 
 class TestSessionStartRemind(HookTestBase):
     def test_bash_syntax_valid(self):
-        result = subprocess.run(["bash", "-n", str(SESSIONSTART_HOOK)], capture_output=True, text=True)
+        result = subprocess.run([MC_BASH, "-n", str(SESSIONSTART_HOOK)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_startup_inits_state_with_start_shas_silently(self):
@@ -1168,7 +1191,7 @@ class TestSessionStartCompactLookback(HookTestBase):
 
 class TestUserPromptRemind(HookTestBase):
     def test_bash_syntax_valid(self):
-        result = subprocess.run(["bash", "-n", str(USERPROMPT_HOOK)], capture_output=True, text=True)
+        result = subprocess.run([MC_BASH, "-n", str(USERPROMPT_HOOK)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_silent_on_empty_evidence(self):
@@ -1545,17 +1568,34 @@ class TestUserPromptRemind(HookTestBase):
 
     def test_overall_two_second_budget_bounds_sequential_subprocess_calls(self):
         """Dual-gate finding 3 (HIGH): this hook makes many SEQUENTIAL
-        python calls, each individually bounded by its own 2s inner
-        timeout. A wrapper that merely hangs forever gets killed by that
-        first inner timeout and the hook fails open immediately -- it does
-        NOT exercise the "many successful-but-slow calls sum past budget"
+        python calls that (macOS port, 2026-08-30) now carry no individual
+        timeout of their own -- one outer watchdog bounds the whole run
+        instead (see hooks/userprompt-remind.sh's guard block). A wrapper
+        that merely hangs forever would get killed by that single watchdog
+        and the hook would fail open almost immediately -- it does NOT
+        exercise the "many successful-but-slow calls sum past budget"
         failure mode. Use a wrapper that adds real (but sub-2s) latency to
-        every call instead, so each individual call still succeeds; only
-        their sum should have blown the (pre-fix) budget."""
+        every WORK call instead, so each individual call still succeeds;
+        only their sum should blow the budget. It must NOT delay the
+        watchdog launcher's own startup (MEMCONTINUUM_PYTHON also resolves
+        that launcher's interpreter) -- detected via the MC_WATCHDOG_LAUNCHER
+        marker every guard's -c source carries -- or the launcher's own
+        2s deadline clock would not even start ticking until after the
+        delay, breaking the bound this test means to prove (port's "adjust
+        mechanics, keep bounds" instruction)."""
         session_id = "s-prompt-budget"
         self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
         slow_py = Path(self.td) / "slow-python-budget"
-        slow_py.write_text(f"#!/usr/bin/env bash\nsleep 1\nexec {VENV_PYTHON} \"$@\"\n")
+        slow_py.write_text(
+            "#!/usr/bin/env bash\n"
+            "for a in \"$@\"; do\n"
+            "  case \"$a\" in\n"
+            "    *MC_WATCHDOG_LAUNCHER*) exec \"" + VENV_PYTHON + "\" \"$@\" ;;\n"
+            "  esac\n"
+            "done\n"
+            "sleep 1\n"
+            f'exec "{VENV_PYTHON}" "$@"\n'
+        )
         slow_py.chmod(0o755)
         env = self.base_env(MEMCONTINUUM_PYTHON=str(slow_py))
         proc, elapsed = run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), env, timeout=20.0)
@@ -2090,7 +2130,7 @@ class TestUserPromptLookback(HookTestBase):
 
 class TestSessionEndStamp(HookTestBase):
     def test_bash_syntax_valid(self):
-        result = subprocess.run(["bash", "-n", str(SESSIONEND_HOOK)], capture_output=True, text=True)
+        result = subprocess.run([MC_BASH, "-n", str(SESSIONEND_HOOK)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_stamps_ended_at_only_silent(self):
@@ -2141,13 +2181,297 @@ class TestSessionEndStamp(HookTestBase):
 class TestMemlib(unittest.TestCase):
     def test_memlib_exists_and_is_valid_bash(self):
         self.assertTrue(MEMLIB.exists())
-        result = subprocess.run(["bash", "-n", str(MEMLIB)], capture_output=True, text=True)
+        result = subprocess.run([MC_BASH, "-n", str(MEMLIB)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_memlib_never_writes_under_a_store_root(self):
         text = MEMLIB.read_text()
         self.assertNotIn("MEMCONTINUUM_ROOT\" >", text)
         self.assertNotIn(">\"$MEMCONTINUUM_ROOT", text)
+
+
+# ---------------------------------------------------------------------------
+# macOS port (docs/DESIGN.md SS8 port note, 2026-08-30): flock -> python
+# fcntl, timeout -> python watchdog. TDD per the port instructions for the
+# three mechanics the pre-port test suite did not already pin.
+# ---------------------------------------------------------------------------
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestMacOSPortMechanics(unittest.TestCase):
+    def setUp(self):
+        self.td = tempfile.mkdtemp(prefix="memcontinuum-port-")
+        self.addCleanup(shutil.rmtree, self.td, ignore_errors=True)
+
+    # ---- item 1: flock -> python fcntl -------------------------------
+
+    def _run_lock_contention_scenario(self, memlib_path: Path, wait_seconds: float):
+        """Holds a real exclusive flock on STATE_FILE.lock from a separate
+        process, then calls mc_update_state_json through a tiny caller
+        script that sources memlib_path directly -- not through any hook's
+        own outer watchdog, which (exactly like userprompt-remind.sh's
+        pre-port outer `timeout 2` already did for that one hook) can
+        otherwise legitimately preempt a lock wait that is itself
+        approaching its own deadline. That whole-run-vs-per-lock race is a
+        real, accepted trade-off of giving every hook a single whole-run
+        budget (item 2) -- this test is about the LOCK mechanism itself
+        (item 1), so it drives memlib.sh directly."""
+        home = Path(self.td) / f"home-{wait_seconds}"
+        home.mkdir()
+        state_file = home / "sessions" / "proj" / "s1.json"
+        state_file.parent.mkdir(parents=True)
+        lockfile = Path(str(state_file) + ".lock")
+
+        holder = subprocess.Popen([
+            VENV_PYTHON,
+            "-c",
+            "import fcntl, time, sys\n"
+            "fd = open(sys.argv[1], 'a+')\n"
+            "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+            "time.sleep(float(sys.argv[2]))\n",
+            str(lockfile),
+            str(wait_seconds),
+        ])
+        self.addCleanup(lambda: holder.wait(timeout=10))
+        time.sleep(0.3)  # let the holder actually acquire the lock first
+
+        caller = Path(self.td) / f"caller-{wait_seconds}.sh"
+        caller.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -u\n"
+            f'source "{memlib_path}"\n'
+            f'mc_update_state_json "{state_file}" \'\n'
+            "state[\"should_not_appear\"] = True\n"
+            "print(json.dumps(state))\n"
+            "'\n"
+            'echo "RC=$?"\n'
+        )
+        caller.chmod(0o755)
+        env = clean_env(MEMCONTINUUM_HOME=str(home), MEMCONTINUUM_PYTHON=VENV_PYTHON)
+        start = time.monotonic()
+        proc = subprocess.run(
+            [MC_BASH, str(caller)], capture_output=True, text=True, env=env, timeout=10.0
+        )
+        elapsed = time.monotonic() - start
+        return proc, elapsed, home, state_file
+
+    def test_lock_timeout_fails_open_with_log_line_and_state_untouched(self):
+        """Item 1's port TDD requirement: the new fcntl-based lock must
+        still fail open with a log line, bounded to ~2s, and must never
+        touch the state file -- exactly what the old `flock -w 2` did."""
+        proc, elapsed, home, state_file = self._run_lock_contention_scenario(MEMLIB, 5.0)
+        self.assertIn("RC=1", proc.stdout, proc.stderr)
+        self.assertLess(elapsed, 4.0, "the lock wait must be bounded to ~2s, not block indefinitely")
+        self.assertGreaterEqual(
+            elapsed, 1.5, "must actually have waited out the ~2s deadline, not skipped it"
+        )
+        log_text = (home / "hook.log").read_text()
+        self.assertIn("outcome=lock-timeout", log_text)
+        self.assertFalse(state_file.exists(), "a lock-timeout write must never touch the state file")
+
+    def test_control_broken_lock_deadline_would_blow_the_bound(self):
+        """Control experiment (project rule: a fix's test must fail on the
+        pre-fix code, or it's decoration). Patches the real memlib.sh's 2s
+        lock deadline out (into a temp copy -- the real file is never
+        touched) so the lock-wait loop cannot give up, and proves the
+        assertion above (`elapsed < 4.0`) actually goes red without a
+        working deadline -- not vacuously true regardless of the
+        mechanism."""
+        original = MEMLIB.read_text()
+        self.assertIn("_deadline = time.time() + 2.0", original)
+        broken = original.replace(
+            "_deadline = time.time() + 2.0", "_deadline = time.time() + 30.0", 1
+        )
+        self.assertNotEqual(broken, original)
+        broken_memlib = Path(self.td) / "memlib-broken-control.sh"
+        broken_memlib.write_text(broken)
+
+        proc, elapsed, home, state_file = self._run_lock_contention_scenario(broken_memlib, 5.0)
+        self.assertGreaterEqual(
+            elapsed,
+            4.0,
+            "with the deadline broken, the call must block past the bound the real test "
+            "asserts under -- proving that assertion is load-bearing, not decoration",
+        )
+
+    # ---- item 2: timeout -> python watchdog ---------------------------
+
+    def test_watchdog_kills_a_hung_grandchild_holding_stdout(self):
+        """TDD requirement: 'watchdog kills a hung grandchild'. A python
+        wrapper standing in for MEMCONTINUUM_PYTHON backgrounds a `sleep
+        30` (inheriting stdout/stderr) before every real call it makes,
+        then execs the real work. Empirically this hook's own internal
+        `eval "$(mc_extract_fields ...)"` command substitution ends up
+        waiting on that same orphaned descendant too, so the whole child
+        script itself stalls past the 2s budget and the launcher's
+        proc.wait(timeout=2) DOES raise -- this is the timeout path, not a
+        success-path orphan. What this test actually pins: subprocess.run(
+        ..., capture_output=True) on the test side will not see EOF on its
+        stdout pipe until every process holding it exits, so if the
+        watchdog's process-group kill did not really reach every
+        descendant (e.g. a regression back to killing only proc.pid, not
+        its whole pgid -- the original "orphaned-grandchild lesson" this
+        guard exists to fix), the orphaned `sleep 30` would keep the pipe
+        open and this call would block for the full 30s (or error out at
+        this test's own 15s subprocess timeout) instead of completing in
+        a few seconds."""
+        home = Path(self.td) / "home-grandchild"
+        home.mkdir()
+        code_root = Path(self.td) / "code-grandchild"
+        code_root.mkdir()
+        git_init(code_root)
+        fpath = code_root / "src" / "f.py"
+        _write(fpath, "# f\n")
+
+        wrapper = Path(self.td) / "grandchild-python"
+        wrapper.write_text(
+            "#!/usr/bin/env bash\n"
+            "for a in \"$@\"; do\n"
+            "  case \"$a\" in\n"
+            "    *MC_WATCHDOG_LAUNCHER*) exec \"" + VENV_PYTHON + "\" \"$@\" ;;\n"
+            "  esac\n"
+            "done\n"
+            "(sleep 30 &)\n"  # detached, inherits our stdout/stderr, survives us
+            f'exec "{VENV_PYTHON}" "$@"\n'
+        )
+        wrapper.chmod(0o755)
+
+        env = clean_env(
+            MEMCONTINUUM_HOME=str(home),
+            MEMCONTINUUM_PROJECT="proj",
+            MEMCONTINUUM_CODE_ROOT=str(code_root),
+            MEMCONTINUUM_PYTHON=str(wrapper),
+        )
+        payload = json.dumps(
+            {
+                "session_id": "s-grandchild",
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Edit",
+                "cwd": str(code_root),
+                "tool_input": {"file_path": str(fpath)},
+            }
+        )
+        start = time.monotonic()
+        proc = subprocess.run(
+            [MC_BASH, str(LEDGER_HOOK)],
+            input=payload,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=15.0,
+        )
+        elapsed = time.monotonic() - start
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertLess(
+            elapsed,
+            5.0,
+            f"an orphaned grandchild holding stdout open must not block completion, took {elapsed:.3f}s",
+        )
+
+    # ---- item 2: stdout passthrough under the watchdog -----------------
+
+    def test_stdout_passes_through_the_watchdog_byte_identical_to_unguarded(self):
+        """TDD requirement: 'stdout passthrough under the watchdog'. These
+        hooks' own outputs are deliberately small and capped by design (the
+        coverage signal shows at most 8 paths + a count), so there is no
+        real scenario that forces a pipe-buffer-sized payload through
+        them -- chasing an artificial 64KB blob would test a shape these
+        scripts never actually produce. The guarantee that actually matters
+        is that the extra python launcher process the guard interposes
+        never buffers, reorders, or truncates anything relative to running
+        the exact same logic with no launcher in the way at all. Proven
+        differentially: two sessions seeded with IDENTICAL ledgers (so
+        classification renders byte-identical text) are run through the
+        SAME script once normally (guarded, the real production path) and
+        once with MC_UNDER_TIMEOUT pre-set (a real, exercised seam -- see
+        every guard's own `if [ -z "${MC_UNDER_TIMEOUT:-}" ]` check --
+        that skips straight to the child logic, no launcher at all); their
+        stdout must be byte-identical."""
+        code_root = Path(self.td) / "code-passthrough"
+        code_root.mkdir()
+        git_init(code_root)
+        store_root = Path(self.td) / "store-passthrough"
+        build_store_root(store_root)
+        git_init(store_root)
+
+        def make_session(home_name, session_id):
+            home = Path(self.td) / home_name
+            home.mkdir()
+            db = home / "proj.sqlite"
+            reindex(store_root, db, project="proj")
+            state_file = home / "sessions" / "proj" / f"{session_id}.json"
+            state_file.parent.mkdir(parents=True)
+            ledger = []
+            for i in range(20):
+                p = code_root / "src" / f"passthrough-file-{i:03d}.py"
+                if not p.exists():
+                    _write(p, f"# {i}\n")
+                ledger.append(
+                    {
+                        "path": str(p),
+                        "kind": "code",
+                        "content_sha256": hashlib.sha256(str(p).encode()).hexdigest(),
+                        "seen_at": 1000.0,
+                    }
+                )
+            state = {
+                "session_id": session_id,
+                "project": "proj",
+                "ledger": ledger,
+                "user_turn_count": 0,
+                "last_inject_turn": -999,
+                "last_inject_time": 0,
+                "last_inject_ts": 0,
+                "last_injected_pairs": [],
+                "last_growth_turn": 0,
+                "lookback_count": 0,
+            }
+            state_file.write_text(json.dumps(state))
+            return home
+
+        home_guarded = make_session("home-passthrough-guarded", "s-passthrough-guarded")
+        home_unguarded = make_session("home-passthrough-unguarded", "s-passthrough-unguarded")
+
+        def payload_for(session_id, prompt_id):
+            return json.dumps(
+                {
+                    "session_id": session_id,
+                    "hook_event_name": "UserPromptSubmit",
+                    "source": "user",
+                    "cwd": str(code_root),
+                    "prompt_id": prompt_id,
+                    "user_input": "hello",
+                }
+            )
+
+        env_guarded = clean_env(
+            MEMCONTINUUM_HOME=str(home_guarded),
+            MEMCONTINUUM_PROJECT="proj",
+            MEMCONTINUUM_ROOT=str(store_root),
+            MEMCONTINUUM_CODE_ROOT=str(code_root),
+            MEMCONTINUUM_PYTHON=VENV_PYTHON,
+        )
+        env_unguarded = dict(env_guarded)
+        env_unguarded["MC_UNDER_TIMEOUT"] = "1"
+        env_unguarded["MEMCONTINUUM_HOME"] = str(home_unguarded)
+
+        proc_g, _ = run_script(
+            USERPROMPT_HOOK, payload_for("s-passthrough-guarded", "pass-1"), env_guarded, timeout=10.0
+        )
+        proc_u, _ = run_script(
+            USERPROMPT_HOOK, payload_for("s-passthrough-unguarded", "pass-1"), env_unguarded, timeout=10.0
+        )
+        self.assertEqual(proc_g.returncode, 0, proc_g.stderr)
+        self.assertEqual(proc_u.returncode, 0, proc_u.stderr)
+        self.assertTrue(proc_g.stdout.strip(), "guarded run should have injected")
+        self.assertTrue(proc_u.stdout.strip(), "unguarded run should have injected")
+        self.assertEqual(
+            proc_g.stdout,
+            proc_u.stdout,
+            "the watchdog launcher must pass stdout through byte-identical to the unguarded path",
+        )
+        json.loads(proc_g.stdout)  # must also parse cleanly on its own
+        self.assertIn("passthrough-file-000.py", proc_g.stdout)
 
 
 if __name__ == "__main__":

@@ -38,6 +38,63 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+
+# Watchdog guard (macOS port, docs/DESIGN.md SS8 port note, 2026-08-30): must
+# be the literal first thing after resolving SCRIPT_DIR, strictly BEFORE
+# sourcing memlib.sh (which does its own mkdir -p work) -- see
+# hooks/userprompt-remind.sh's test_outer_deadline_covers_memlib_sourcing for
+# why this ordering matters. Replaces the old per-call `timeout 2 ...` wraps
+# (macOS bash 3.2 ships neither `timeout` nor `flock`): a tiny python
+# launcher starts this same script as a child in its own process group and
+# kills the WHOLE group on a 2s wall-clock budget, so an orphaned grandchild
+# (e.g. a hung python call several layers deep) cannot outlive the deadline.
+# Every python call this script and memlib.sh's helpers make therefore needs
+# no timeout of its own -- this one watchdog bounds the entire run. Always
+# exits 0; stdin/stdout/stderr are the real, inherited file descriptors
+# (never piped through python), so passthrough is unbuffered. If
+# MEMCONTINUUM_PYTHON (or the venv fallback) does not resolve to an
+# executable, this falls through UNGUARDED instead of exec-ing a dead path --
+# memlib.sh's own "no python resolved" detection then fires exactly as it
+# would with no guard at all.
+if [ -z "${MC_UNDER_TIMEOUT:-}" ]; then
+    export MC_UNDER_TIMEOUT=1
+    MC_GUARD_PY="${MEMCONTINUUM_PYTHON:-$SCRIPT_DIR/../.venv/bin/python}"
+    if [ -x "$MC_GUARD_PY" ]; then
+        "$MC_GUARD_PY" -c '
+import os, signal, subprocess, sys
+# MC_WATCHDOG_LAUNCHER: runs the real hook script as a child in its own
+# process group and enforces a 2s wall-clock budget for the whole run. On
+# expiry, kills the entire group so an orphaned grandchild cannot outlive
+# the deadline, then always exits 0.
+try:
+    proc = subprocess.Popen(sys.argv[1:], start_new_session=True)
+except Exception:
+    sys.exit(0)
+try:
+    proc.wait(timeout=2)
+except subprocess.TimeoutExpired:
+    pass
+# Unconditional group sweep (not just on a timeout): a hung call several
+# layers deep can background a detached descendant that inherits the
+# real stdout/stderr fds, which would otherwise keep those pipes open
+# past the point the main script logically finished, even though it
+# exited on time. Reaping the whole group here, always, is the actual
+# orphaned-grandchild fix -- killing the group only on the timeout branch
+# still leaves this exact gap on the success path.
+try:
+    os.killpg(proc.pid, signal.SIGKILL)
+except Exception:
+    pass
+try:
+    proc.wait(timeout=1)
+except Exception:
+    pass
+sys.exit(0)
+' "${BASH:-bash}" "${BASH_SOURCE[0]}" "$@"
+        exit 0
+    fi
+fi
+
 # shellcheck source=memlib.sh
 source "$SCRIPT_DIR/memlib.sh"
 
@@ -102,7 +159,7 @@ print(json.dumps(state))
     compact)
         [ -f "$STATE_FILE" ] || finish "compact-no-state"
 
-        OUTPUT_JSON="$(timeout 2 env PYTHONPATH= "$MC_PY" -c '
+        OUTPUT_JSON="$(env PYTHONPATH= "$MC_PY" -c '
 import json, sys
 
 try:
@@ -174,7 +231,7 @@ print(json.dumps({
         LB_TURN=""
         if [ $RC -ne 0 ]; then
             LB_META_TMP="$(mktemp 2>/dev/null)"
-            LB_JSON="$(timeout 2 env PYTHONPATH= "$MC_PY" -c '
+            LB_JSON="$(env PYTHONPATH= "$MC_PY" -c '
 import json, sys
 
 try:
@@ -254,7 +311,7 @@ print(json.dumps(state))
             # never logged -- read it back (cheap, one extra call; this
             # hook has no overall-budget constraint) so the outcome line
             # below can include it.
-            LB_COUNT="$(timeout 2 env PYTHONPATH= "$MC_PY" -c '
+            LB_COUNT="$(env PYTHONPATH= "$MC_PY" -c '
 import json, sys
 with open(sys.argv[1]) as f:
     state = json.load(f)

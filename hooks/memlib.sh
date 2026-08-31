@@ -10,6 +10,19 @@
 # still individually responsible for its own final `exit 0` -- memlib.sh never
 # exits or traps on the caller's behalf.
 #
+# macOS port (docs/DESIGN.md SS8 port note, 2026-08-30): stock macOS bash is
+# 3.2 and ships neither `flock` nor `timeout`. This file used to shell out to
+# both; it no longer uses either anywhere. Locking now lives inside the one
+# python process mc_update_state_json already spawns (real fcntl.flock, a 2s
+# non-blocking-retry deadline, atomic tmp+rename write, see below). The
+# overall per-call deadline that `timeout 2` used to provide is now the job
+# of each CALLING hook script's own watchdog guard (a tiny python launcher
+# that runs the whole script in its own process group and kills the group on
+# a 2s budget -- see the top of each hooks/*.sh file) -- so no helper in this
+# file wraps its own subprocess calls in any per-call timeout any more; the
+# caller's watchdog bounds the entire run, including every helper call made
+# along the way.
+#
 # Env (project-agnostic; concrete values belong only in project wiring, e.g.
 # .claude/settings.json or a *.json.example next to it -- never in this repo):
 #   MEMCONTINUUM_HOME        base dir for the index db, hook.log, and session
@@ -63,22 +76,6 @@ fi
 
 MC_DB_PATH="$MEMCONTINUUM_HOME/$MC_PROJECT.sqlite"
 
-# MC_TIMEOUT_FG -- when a caller has already wrapped its own whole
-# invocation in an outer `timeout` (MC_UNDER_TIMEOUT=1 -- currently only
-# userprompt-remind.sh does this, dual-gate review finding 3), every
-# *nested* `timeout` call below must run with --foreground so it does not
-# escape into its own process group. Without this, the outer timeout's
-# kill-the-group cannot reach (and reap) a nested timeout's own
-# descendants: an orphaned grandchild can keep running -- and keep the
-# caller's captured stdout/stderr pipes open -- long past the outer
-# deadline (verified empirically: a nested `timeout 2` without
-# --foreground let a killed call's own child run to its full natural
-# duration instead of ~2s). Empty (default, group-creating) `timeout`
-# behavior is unchanged for every other caller, which is exactly what
-# lets a LONE `timeout` call still correctly kill its own descendants.
-MC_TIMEOUT_FG=""
-[ -n "${MC_UNDER_TIMEOUT:-}" ] && MC_TIMEOUT_FG="--foreground"
-
 # mc_log MESSAGE -- append one timestamped line to hook.log. Never fails the
 # calling hook (logging failure is swallowed, not propagated).
 mc_log() {
@@ -110,11 +107,12 @@ mc_state_file_for() {
 # beyond an explicitly requested scalar field on purpose -- callers must
 # not ask for them (docs/DESIGN.md ruling B). The payload is
 # piped to this one python's stdin only -- never placed in an env var or
-# another process's argv (dual-gate review finding 1).
+# another process's argv (dual-gate review finding 1). No per-call timeout
+# here (see the file header): the calling hook's own watchdog bounds this.
 mc_extract_fields() {
     local payload="$1"
     shift
-    printf '%s' "$payload" | timeout $MC_TIMEOUT_FG 2 env PYTHONPATH= "$MC_PY" -c '
+    printf '%s' "$payload" | env PYTHONPATH= "$MC_PY" -c '
 import hashlib, json, sys, shlex
 fields = sys.argv[1:]
 try:
@@ -144,33 +142,48 @@ for f in fields:
 }
 
 # mc_git_head DIR -- read-only; empty string if DIR is missing or not a repo.
-# Never mutates DIR.
+# Never mutates DIR. No per-call timeout (see the file header).
 mc_git_head() {
     local dir="$1"
     [ -n "$dir" ] && [ -d "$dir" ] || { printf ''; return; }
-    timeout $MC_TIMEOUT_FG 2 git -C "$dir" rev-parse HEAD 2>>"$MC_LOG" || printf ''
+    git -C "$dir" rev-parse HEAD 2>>"$MC_LOG" || printf ''
 }
 
 # mc_update_state_json STATE_FILE PY_TRANSFORM
 #
-# The one shared "lock + atomic-rename JSON update" primitive. Acquires an
-# flock on STATE_FILE.lock (2s timeout), loads the existing STATE_FILE (or
-# {} if missing/corrupt/unreadable) and pipes it to the transform python's
-# STDIN -- never an exported env var, and never argv -- so a legacy or
-# otherwise-sensitive key already sitting in a caller's persisted state
-# (e.g. a pre-fingerprint-scheme raw prompt_id) is never inherited by any
-# subprocess that python spawns (re-gate finding, HIGH; the same class of
-# bug as dual-gate review finding 1 above, but for the EXISTING state
-# rather than the incoming payload). Runs
-# PY_TRANSFORM against it (which may read any MC_*-prefixed env var the
-# caller exported beforehand, and must end by printing the new, complete
-# state object via `print(json.dumps(state))` -- or print nothing / exit
-# non-zero to make this a no-op write), and atomically renames a temp file
-# onto STATE_FILE. Returns the transform's exit code; a caller that also
-# needs a *value* out of the transform (not just the persisted state) should
-# have the transform write that value to a side-channel file of its own
-# choosing (e.g. one named by an MC_*_OUT env var) and read it back itself
-# afterward -- this function's own stdout/return value carries no such value.
+# The one shared "lock + atomic-rename JSON update" primitive. Everything --
+# acquiring the lock, loading the existing state, running the transform, and
+# the atomic write -- happens inside ONE python process (macOS port: no
+# `flock`/`timeout` binary involved anywhere). That process:
+#   1. opens STATE_FILE.lock and takes a real fcntl.flock(LOCK_EX), retried
+#      non-blocking every ~20ms up to a 2s deadline -- exits 97 (mapped to
+#      outcome=lock-timeout below) if the deadline passes without the lock.
+#   2. loads STATE_FILE (or {} if missing/corrupt/unreadable) into `state`.
+#   3. runs PY_TRANSFORM (spliced in verbatim at column 0, exactly as
+#      before) against it -- it may read any MC_*-prefixed env var the
+#      caller exported beforehand, and must end by printing the new,
+#      complete state object via `print(json.dumps(state))` (or print
+#      nothing / exit non-zero to make this a no-op write).
+#   4. via an atexit hook registered before the transform runs (so it fires
+#      whether the transform falls through normally, calls sys.exit(N), or
+#      raises), writes whatever was printed to a tmp file and os.replace()s
+#      it onto STATE_FILE -- but only if something was actually printed --
+#      then releases the lock.
+# The transform never sees the existing state through an exported env var or
+# argv (only via the `state` dict already loaded into that same process) --
+# so a legacy or otherwise-sensitive key already sitting in a caller's
+# persisted state (e.g. a pre-fingerprint-scheme raw prompt_id) is never
+# inherited by any subprocess that python spawns (re-gate finding, HIGH; the
+# same class of bug as dual-gate review finding 1, but for the EXISTING
+# state rather than the incoming payload).
+#
+# Returns the transform's exit code (0 on a normal, evaluated write; a lock
+# failure returns 1 after logging outcome=lock-timeout / outcome=lock-open-
+# failed). A caller that also needs a *value* out of the transform (not just
+# the persisted state) should have the transform write that value to a
+# side-channel file of its own choosing (e.g. one named by an MC_*_OUT env
+# var) and read it back itself afterward -- this function's own stdout/
+# return value carries no such value.
 mc_update_state_json() {
     local state_file="$1"
     local py_transform="$2"
@@ -178,42 +191,81 @@ mc_update_state_json() {
     state_dir="$(dirname "$state_file")"
     mkdir -p "$state_dir" 2>/dev/null || { mc_log "outcome=state-dir-failed dir=$state_dir"; return 1; }
 
-    local lockfile="$state_file.lock"
-    exec 9>"$lockfile" 2>/dev/null || { mc_log "outcome=lock-open-failed file=$lockfile"; return 1; }
-    if ! flock -w 2 9; then
-        mc_log "outcome=lock-timeout file=$lockfile"
-        exec 9>&- 2>/dev/null || true
-        return 1
-    fi
+    local rc
+    env PYTHONPATH= "$MC_PY" -c "
+import atexit, fcntl, io, json, os, sys, time
 
-    local existing="{}"
-    if [ -f "$state_file" ]; then
-        existing="$(cat "$state_file" 2>/dev/null)"
-        [ -z "$existing" ] && existing="{}"
-    fi
+state_file = sys.argv[1]
+lockfile = state_file + '.lock'
 
-    local new_json rc
-    new_json="$(printf '%s' "$existing" | timeout $MC_TIMEOUT_FG 2 env PYTHONPATH= "$MC_PY" -c "
-import json, os, sys
 try:
-    state = json.loads(sys.stdin.read() or '{}')
+    lock_fd = os.open(lockfile, os.O_CREAT | os.O_RDWR, 0o644)
+except OSError:
+    sys.exit(98)
+
+_deadline = time.time() + 2.0
+_locked = False
+while True:
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _locked = True
+        break
+    except OSError:
+        if time.time() >= _deadline:
+            break
+        time.sleep(0.02)
+if not _locked:
+    os.close(lock_fd)
+    sys.exit(97)
+
+_buf = io.StringIO()
+_real_stdout = sys.stdout
+
+
+def _finalize():
+    sys.stdout = _real_stdout
+    new_json = _buf.getvalue()
+    if new_json.strip():
+        tmp = state_file + '.tmp.' + str(os.getpid())
+        try:
+            with open(tmp, 'w') as f:
+                f.write(new_json)
+            os.replace(tmp, state_file)
+        except OSError:
+            pass
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    os.close(lock_fd)
+
+
+atexit.register(_finalize)
+
+existing = '{}'
+if os.path.isfile(state_file):
+    try:
+        with open(state_file) as f:
+            existing = f.read() or '{}'
+    except OSError:
+        existing = '{}'
+try:
+    state = json.loads(existing)
     if not isinstance(state, dict):
         state = {}
 except Exception:
     state = {}
+
+sys.stdout = _buf
 $py_transform
-" 2>>"$MC_LOG")"
+" "$state_file" 2>>"$MC_LOG"
     rc=$?
 
-    if [ $rc -eq 0 ] && [ -n "$new_json" ]; then
-        local tmp="$state_file.tmp.$$"
-        if printf '%s' "$new_json" >"$tmp" 2>/dev/null; then
-            mv -f "$tmp" "$state_file" 2>/dev/null || rm -f "$tmp" 2>/dev/null
-        fi
-    fi
-
-    exec 9>&- 2>/dev/null || true
-    return $rc
+    case $rc in
+        97) mc_log "outcome=lock-timeout file=$state_file.lock"; return 1 ;;
+        98) mc_log "outcome=lock-open-failed file=$state_file.lock"; return 1 ;;
+        *) return $rc ;;
+    esac
 }
 
 # mc_prune_old_state PROJECT MINUTES -- deletes *.json state files older than

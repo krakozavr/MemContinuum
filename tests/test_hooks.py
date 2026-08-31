@@ -24,6 +24,10 @@ import memidx  # noqa: E402
 # $MEMCONTINUUM_PYTHON in your own (untracked) shell environment before
 # running this file; see README.md "Requirements" / "Running the tests".
 VENV_PYTHON = os.environ.get("MEMCONTINUUM_PYTHON", "")
+# macOS-port bash-3.2 verification harness (tests/run_bash32.sh): overrides
+# which bash interpreter every hook subprocess call below runs under.
+# Defaults to the system "bash" (unchanged behavior for every normal run).
+MC_BASH = os.environ.get("MC_BASH", "bash")
 _SKIP_NO_VENV = (
     "set $MEMCONTINUUM_PYTHON to a venv python with fastembed/PyYAML "
     "installed to run these tests (see README.md)"
@@ -59,7 +63,7 @@ def clean_env(**overrides):
 def run_hook(payload_text: str, env: dict, timeout: float = 5.0):
     start = time.monotonic()
     proc = subprocess.run(
-        ["bash", str(HOOK_SCRIPT)],
+        [MC_BASH, str(HOOK_SCRIPT)],
         input=payload_text,
         capture_output=True,
         text=True,
@@ -99,7 +103,7 @@ class TestPreEditChainHook(unittest.TestCase):
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def test_bash_syntax_is_valid(self):
-        result = subprocess.run(["bash", "-n", str(HOOK_SCRIPT)], capture_output=True, text=True)
+        result = subprocess.run([MC_BASH, "-n", str(HOOK_SCRIPT)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_a_matching_path_emits_chain_with_citation_reminder(self):
@@ -263,7 +267,7 @@ class TestPreEditChainHook(unittest.TestCase):
 
         env = self._poisoned_env()
         proc = subprocess.run(
-            ["bash", str(broken_script)],
+            [MC_BASH, str(broken_script)],
             input=self._matching_payload(),
             capture_output=True,
             text=True,

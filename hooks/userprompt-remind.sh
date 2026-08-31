@@ -56,7 +56,7 @@
 # prompt) is read ONCE, on stdin, by the single field-extraction call
 # (mc_extract_fields, memlib.sh) -- it is NEVER placed in an exported
 # environment variable, so no subprocess this hook spawns (dirname/mkdir/
-# flock/cat/timeout/env/python) ever inherits it (dual-gate review
+# cat/env/python) ever inherits it (dual-gate review
 # finding 1, BLOCKER). Only the extracted scalar fields (session_id,
 # source, agent_id presence, a prompt_id fingerprint) and the sorted
 # top-level payload KEY NAMES (never values -- the payload-shape capture
@@ -73,14 +73,14 @@
 # code-root paths, so the (comparatively expensive) classification only runs
 # on turns that were already going to inject something.
 #
-# Always exits 0 and prints nothing on any failure (fail-open); 2s internal
-# timeout on every memidx.py call. On top of those per-call timeouts, this
-# whole hook re-execs itself under an OUTER `timeout 2` on entry (dual-gate
-# review finding 3): several per-call 2s timeouts run SEQUENTIALLY here, so
-# without an overall deadline a chain of slow-but-not-hung calls could sum
-# to several times 2s. The outer timeout's kill must actually reach every
-# nested subprocess -- see memlib.sh's MC_TIMEOUT_FG for why every nested
-# `timeout` call below runs with --foreground once MC_UNDER_TIMEOUT is set.
+# Always exits 0 and prints nothing on any failure (fail-open). This hook
+# makes many SEQUENTIAL python calls with no timeout of their own any more
+# (macOS port, 2026-08-30): the whole hook re-execs itself under an OUTER
+# python watchdog on entry instead (see the guard just below) -- a single 2s
+# wall-clock budget for the ENTIRE run, enforced by killing the guarded
+# child's whole process group on expiry, so a chain of slow-but-not-hung
+# calls summing past budget is bounded exactly the same way a single hung
+# call is.
 #
 # Env: see hooks/memlib.sh.
 
@@ -88,19 +88,73 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 
-# Re-gate finding (MED, Codex): this guard must be the LITERAL first thing
-# this script does after `set -u` and resolving its own location -- in
-# particular, strictly BEFORE sourcing memlib.sh (which does its own
-# mkdir -p work). Sourcing used to happen above this check, so it ran once
-# on the outer, un-timed invocation before the deadline below even started
-# -- a slow/hung memlib.sh could blow the whole invocation's wall time with
-# no bound at all. Moving the guard up means memlib.sh is only ever
-# sourced inside the re-exec'd child, i.e. already under the outer
-# `timeout 2`.
+# Watchdog guard (macOS port, docs/DESIGN.md SS8 port note, 2026-08-30): this
+# guard must be the LITERAL first thing this script does after `set -u` and
+# resolving its own location -- in particular, strictly BEFORE sourcing
+# memlib.sh (which does its own mkdir -p work). Sourcing used to happen
+# above this check, so it ran once on the outer, un-timed invocation before
+# the deadline below even started -- a slow/hung memlib.sh could blow the
+# whole invocation's wall time with no bound at all. Moving the guard up
+# means memlib.sh is only ever sourced inside the guarded child, i.e.
+# already under the watchdog below (see test_outer_deadline_covers_memlib_sourcing).
+#
+# Re-gate finding (MED, Codex), still true under the port: same reasoning,
+# new mechanism. macOS bash 3.2 ships neither `timeout` nor `flock`, so the
+# old `timeout 2 bash "$0"` re-exec is replaced with a tiny python launcher:
+# it starts this same script as a child in its own process group and kills
+# the WHOLE group on a 2s wall-clock budget, so an orphaned grandchild (a
+# hung python call several layers deep -- the exact failure the old
+# MC_TIMEOUT_FG/--foreground dance in memlib.sh existed to prevent) cannot
+# outlive the deadline either. Every python call this script and memlib.sh's
+# helpers make therefore needs no timeout of its own any more -- this one
+# watchdog bounds the entire run (memlib.sh's MC_TIMEOUT_FG plumbing is gone
+# along with every per-call `timeout`). Always exits 0; stdin/stdout/stderr
+# are the real, inherited file descriptors (never piped through python), so
+# passthrough is unbuffered. The re-exec'd child is started via `$BASH` (the
+# invoking shell's own resolved path), never a bare literal `bash`, so a
+# harness that overrides which bash interpreter runs this script (e.g. the
+# bash-3.2 verification harness, tests/run_bash32.sh) is honored all the way
+# down, not just for this outer 20 lines. If MEMCONTINUUM_PYTHON (or the
+# venv fallback) does not resolve to an executable, this falls through
+# UNGUARDED instead of exec-ing a dead path -- memlib.sh's own "no python
+# resolved" detection then fires exactly as it would with no guard at all.
 if [ -z "${MC_UNDER_TIMEOUT:-}" ]; then
     export MC_UNDER_TIMEOUT=1
-    timeout 2 bash "${BASH_SOURCE[0]}" "$@"
-    exit 0
+    MC_GUARD_PY="${MEMCONTINUUM_PYTHON:-$SCRIPT_DIR/../.venv/bin/python}"
+    if [ -x "$MC_GUARD_PY" ]; then
+        "$MC_GUARD_PY" -c '
+import os, signal, subprocess, sys
+# MC_WATCHDOG_LAUNCHER: runs the real hook script as a child in its own
+# process group and enforces a 2s wall-clock budget for the whole run. On
+# expiry, kills the entire group so an orphaned grandchild cannot outlive
+# the deadline, then always exits 0.
+try:
+    proc = subprocess.Popen(sys.argv[1:], start_new_session=True)
+except Exception:
+    sys.exit(0)
+try:
+    proc.wait(timeout=2)
+except subprocess.TimeoutExpired:
+    pass
+# Unconditional group sweep (not just on a timeout): a hung call several
+# layers deep can background a detached descendant that inherits the
+# real stdout/stderr fds, which would otherwise keep those pipes open
+# past the point the main script logically finished, even though it
+# exited on time. Reaping the whole group here, always, is the actual
+# orphaned-grandchild fix -- killing the group only on the timeout branch
+# still leaves this exact gap on the success path.
+try:
+    os.killpg(proc.pid, signal.SIGKILL)
+except Exception:
+    pass
+try:
+    proc.wait(timeout=1)
+except Exception:
+    pass
+sys.exit(0)
+' "${BASH:-bash}" "${BASH_SOURCE[0]}" "$@"
+        exit 0
+    fi
 fi
 
 # shellcheck source=memlib.sh
@@ -314,7 +368,7 @@ fi
 # delivery_open) --
 # kept to a single call so the happy path doesn't add spawns on top of the
 # 2s outer budget above.
-eval "$(timeout $MC_TIMEOUT_FG 2 env PYTHONPATH= "$MC_PY" -c '
+eval "$(env PYTHONPATH= "$MC_PY" -c '
 import json, sys, shlex
 with open(sys.argv[1]) as f:
     d = json.load(f)
@@ -335,7 +389,13 @@ if [ "${DUPLICATE:-0}" = "1" ]; then
 fi
 
 if [ "${CANDIDATE:-0}" = "1" ]; then
-    mapfile -t CODE_PATHS < <(timeout $MC_TIMEOUT_FG 2 env PYTHONPATH= "$MC_PY" -c '
+    # bash 3.2 has no `mapfile`/`readarray` -- process substitution (never a
+    # pipe, which would run the loop in a subshell and drop the assignments)
+    # feeding a plain while-read loop is the portable equivalent.
+    CODE_PATHS=()
+    while IFS= read -r p; do
+        CODE_PATHS+=("$p")
+    done < <(env PYTHONPATH= "$MC_PY" -c '
 import json, sys
 with open(sys.argv[1]) as f:
     d = json.load(f)
@@ -350,7 +410,7 @@ for p in d.get("code_paths", []):
         ARGS+=("${CODE_PATHS[@]}")
         ARGS+=(--root "$MEMCONTINUUM_ROOT" --project "$MC_PROJECT" --db "$MC_DB_PATH" --json)
         [ -n "${MEMCONTINUUM_CODE_ROOT:-}" ] && ARGS+=(--code-root "$MEMCONTINUUM_CODE_ROOT")
-        RAW="$(timeout $MC_TIMEOUT_FG 2 env PYTHONPATH= "$MC_PY" "$MC_MEMIDX" "${ARGS[@]}" 2>>"$MC_LOG")"
+        RAW="$(env PYTHONPATH= "$MC_PY" "$MC_MEMIDX" "${ARGS[@]}" 2>>"$MC_LOG")"
         RC=$?
         if [ $RC -eq 0 ] && [ -n "$RAW" ]; then
             UNMAPPED_JSON="$RAW"
@@ -359,7 +419,7 @@ for p in d.get("code_paths", []):
 
     CUR_CODE_SHA="$(mc_git_head "${MEMCONTINUUM_CODE_ROOT:-}")"
     CUR_STORE_SHA="$(mc_git_head "${MEMCONTINUUM_ROOT:-}")"
-    START_CODE_SHA="$(timeout $MC_TIMEOUT_FG 2 env PYTHONPATH= "$MC_PY" -c '
+    START_CODE_SHA="$(env PYTHONPATH= "$MC_PY" -c '
 import json, sys
 try:
     with open(sys.argv[1]) as f:
@@ -368,7 +428,7 @@ except Exception:
     state = {}
 print(state.get("start_code_sha") or "")
 ' "$STATE_FILE" 2>>"$MC_LOG")"
-    START_STORE_SHA="$(timeout $MC_TIMEOUT_FG 2 env PYTHONPATH= "$MC_PY" -c '
+    START_STORE_SHA="$(env PYTHONPATH= "$MC_PY" -c '
 import json, sys
 try:
     with open(sys.argv[1]) as f:
@@ -390,7 +450,7 @@ print(state.get("start_store_sha") or "")
     fi
 
     OUTPUT_JSON="$(UNMAPPED_JSON="$UNMAPPED_JSON" CODE_CHANGED="$CODE_CHANGED" STORE_CHANGED="$STORE_CHANGED" \
-        timeout $MC_TIMEOUT_FG 2 env PYTHONPATH= "$MC_PY" -c '
+        env PYTHONPATH= "$MC_PY" -c '
 import json, os
 
 try:
@@ -452,7 +512,7 @@ print(json.dumps({
         # Phase 3 (locked): commit the injection bookkeeping now that we know
         # it actually happened. last_inject_ts mirrors last_inject_time (the
         # look-back's shared "since last inject of any kind" clock).
-        PAIRS_JSON="$(timeout $MC_TIMEOUT_FG 2 env PYTHONPATH= "$MC_PY" -c '
+        PAIRS_JSON="$(env PYTHONPATH= "$MC_PY" -c '
 import json, sys
 with open(sys.argv[1]) as f:
     d = json.load(f)
@@ -503,7 +563,7 @@ if [ "${LB_ELIGIBLE:-0}" != "1" ]; then
     finish "no-evidence"
 fi
 
-LB_OUTPUT_JSON="$(SINCE_TURN="${SINCE_TURN:-0}" timeout $MC_TIMEOUT_FG 2 env PYTHONPATH= "$MC_PY" -c '
+LB_OUTPUT_JSON="$(SINCE_TURN="${SINCE_TURN:-0}" env PYTHONPATH= "$MC_PY" -c '
 import json, os
 
 since = os.environ.get("SINCE_TURN", "0")

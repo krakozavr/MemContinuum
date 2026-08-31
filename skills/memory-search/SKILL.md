@@ -55,3 +55,22 @@ a chain into your own reasoning without citing it, and don't silently skip the s
 task "feels" novel — that's exactly when a prior HOLD or declined approach is most likely to be
 missed. If `search`/`chain`/`for-path` return nothing, say so explicitly ("no existing decision
 found on X") rather than proceeding as if the question had never been asked.
+
+## Before writing a new helper or file
+
+Before adding a new function, type, or file to a codebase this project indexes, search the
+**code** index too — a near-duplicate of what you're about to write may already exist:
+
+```
+memidx.py code-search "INTENT PHRASE" --project PROJECT --mode hybrid --json
+```
+
+Phrase the query as the intent ("write a debug PNG", "[redacted probe query]", "hash
+a file's contents"), not as a symbol name — the index is built to match on that. A hit whose
+`concept_id` is set means a decision record governs that code; check it (`memidx.py why <path>`)
+before working around or duplicating it.
+
+**Name the hits in your report, or state that none were found** — the same rule as the markdown
+search above, and for the same reason: silently skipping this check is exactly how a second,
+slightly different `embedInScrollBox` gets written next to the first one. Run `code-reindex` first
+if the index doesn't exist yet or a stale-index warning appears on stderr.

@@ -86,6 +86,34 @@ same store. The automatic-reminder hooks, though, are written against Claude
 Code's own hook events today, and would need porting to fire the same way
 under a different harness.
 
+## How this relates to Claude Code's own memory
+
+Claude Code already ships two memory mechanisms of its own: CLAUDE.md (a
+person's standing instructions, loaded every session) and auto-memory (notes
+the agent writes for itself — a small index loaded every session, with topic
+files read on demand). MemContinuum doesn't replace either one; it adds the
+layer both are bad at — a durable record of *why*, with a clear answer to
+who actually said it.
+
+Four layers, in order of authority. **Code and tests** decide what the
+software does today; nothing outranks them. **MemContinuum** records why it
+got that way — only a person's own confirmed words can block work; an
+agent's guess can inform a decision, never veto one. **CLAUDE.md** holds
+standing rules for how to work, not knowledge or history. **Auto-memory**
+holds the agent's own working notes — where things stood, preferences,
+machine quirks — handy, never authoritative.
+
+They divide the work cleanly. What's true for this session only stays in
+auto-memory, loaded for free at session start; MemContinuum is deliberately
+never auto-loaded. Once a fact graduates into a real ruling, it moves into
+the store, and auto-memory keeps a one-line pointer to it — never a copy,
+because copies drift and a drifted copy gets quoted as if it were still
+true. The pre-edit hook is the bridge running the other way: it pulls a
+store record into the session exactly when a file it governs gets touched.
+
+If the same fact lives in two of these places at once, one of them is
+already wrong — pick its one home.
+
 ## The parts
 
 - **Rationale** — the decision graph: topics, each an append-only chain of
@@ -124,10 +152,15 @@ installation, the storage model, the CLI, and the schema.
 
 ## Requirements
 
-- Linux or WSL, `bash`, `git`.
+- macOS or Linux/WSL, `bash` 3.2+, `git`. The hooks need no `flock` or
+  `timeout` binary (macOS ships neither by default) — locking and
+  per-run deadlines are handled inside the python calls the hooks already
+  make, not by shelling out to coreutils, so there is nothing extra to
+  install on either platform. Real-Mac smoke status: pending (the
+  orchestrator runs it separately over ssh).
 - Python 3.10+.
-- `flock` and a `sqlite3` new enough for FTS5 (≥3.40, via Python's own
-  `sqlite3` module — nothing to install separately).
+- A `sqlite3` new enough for FTS5 (≥3.40, via Python's own `sqlite3`
+  module — nothing to install separately).
 - ~100 MB of disk for the embedding model, downloaded once by `fastembed` the
   first time a vector search actually runs. No network is needed after that;
   `--no-embed` / `--mode fts` never trigger the download at all.
@@ -464,6 +497,14 @@ on their own — they read `$MEMCONTINUUM_PYTHON` and, for the tests that need a
 real venv to drive the hooks/installer through, skip with a clear message if
 it isn't set (a handful of others need extra machine-local test data of their
 own — see below — and skip the same way without it).
+
+`tests/run_bash32.sh` re-runs `test_hooks.py`/`test_write_hooks.py` under a
+real bash 3.2.57 (building one into `~/.cache/bash32` on first use, or point
+`MC_BASH32` at an existing bash binary to skip that) — the actual interpreter
+stock macOS ships, not `bash --posix` under a newer bash, which doesn't
+reject bash-4/5-only syntax the way an old interpreter does. Every hook
+subprocess call in both test files goes through `$MC_BASH` (defaults to
+`bash`), so this is the same test suite, just under a different shell.
 
 All tests create their own temp directories and pass an explicit `--db`
 (or set `MEMCONTINUUM_HOME`), so nothing here ever touches a real
