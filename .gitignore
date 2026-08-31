@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.sqlite
+.venv/
+fixtures/records/
+memory/
+.venv/

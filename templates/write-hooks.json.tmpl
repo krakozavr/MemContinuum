@@ -1,0 +1,55 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "MEMCONTINUUM_ROOT={{STORE}} {{CODE_ROOT_ENV}}MEMCONTINUUM_PROJECT={{PROJECT}} MEMCONTINUUM_PYTHON={{PYTHON}} {{HOOKS_DIR}}/ledger-post-edit.sh"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "MEMCONTINUUM_ROOT={{STORE}} {{CODE_ROOT_ENV}}MEMCONTINUUM_PROJECT={{PROJECT}} MEMCONTINUUM_PYTHON={{PYTHON}} {{HOOKS_DIR}}/precompact-persist.sh"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "MEMCONTINUUM_ROOT={{STORE}} {{CODE_ROOT_ENV}}MEMCONTINUUM_PROJECT={{PROJECT}} MEMCONTINUUM_PYTHON={{PYTHON}} {{HOOKS_DIR}}/sessionstart-remind.sh"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "MEMCONTINUUM_ROOT={{STORE}} {{CODE_ROOT_ENV}}MEMCONTINUUM_PROJECT={{PROJECT}} MEMCONTINUUM_PYTHON={{PYTHON}} {{HOOKS_DIR}}/userprompt-remind.sh"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "MEMCONTINUUM_ROOT={{STORE}} {{CODE_ROOT_ENV}}MEMCONTINUUM_PROJECT={{PROJECT}} MEMCONTINUUM_PYTHON={{PYTHON}} {{HOOKS_DIR}}/sessionend-stamp.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

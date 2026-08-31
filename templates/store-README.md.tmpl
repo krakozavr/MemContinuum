@@ -1,0 +1,46 @@
+# {{PROJECT}} Rationale store
+
+This is MemContinuum's **Rationale** graph for {{PROJECT}}: the decision history behind the
+codebase, not the codebase itself. `topics/<area>/<slug>.md` holds append-only chains of
+rulings on one question each (newest link first); `incidents/<slug>.md` holds closed,
+single-claim incident records; `investigations/` and `concepts/` are seeded but start empty.
+This store is its own git repository -- never a subdirectory of a code repo it describes.
+
+Schema: {{ENGINE_DIR}}/docs/SCHEMA.md. Engine: {{ENGINE_DIR}} (`memidx.py`, `memlint.py`).
+
+## The citation rule, in six lines
+
+1. Every ruling is a **link**, not a fact -- authority lives on the field, not the file.
+2. `owner-verbatim` / `owner-ratified` = the owner's exact words, quoted, with a `source`
+   pointer. This is the only tier that may block, refuse, or reverse work (a CONSTRAINT).
+3. `agent-inference` / `reviewer-finding` / `code-derived` inform but never override a fix that
+   code and tests already accept.
+4. Never invent a quote. Never upgrade an authority because you believe it. Never merge two
+   separately-dated statements into one "quote."
+5. A changed mind is a **new link** (`reverses:` + `reason_for_change:`), never an edit to the
+   old one. History is never rewritten, only superseded.
+6. When in doubt about what a symbol/file is even allowed to do, ask `memidx.py why <symbol>` --
+   it shows declined alternatives too, on purpose, before you "clean up" code that implements one.
+
+## Running the engine
+
+```bash
+# One-time / after any edit to this store:
+PYTHONPATH= {{PYTHON}} {{ENGINE_DIR}}/memlint.py {{STORE}} --code-root {{CODE_ROOT}}
+
+PYTHONPATH= {{PYTHON}} {{ENGINE_DIR}}/memidx.py reindex --root {{STORE}} --project {{PROJECT}}
+# (index lands at ~/.memcontinuum/{{PROJECT}}.sqlite by default -- keep it on a local, POSIX
+# filesystem, never a synced/cloud drive)
+
+# Look things up:
+{{ENGINE_DIR}}/memidx.py chain <topic-id-or-slug> --project {{PROJECT}}
+{{ENGINE_DIR}}/memidx.py search "<question>" --mode hybrid --project {{PROJECT}}
+{{ENGINE_DIR}}/memidx.py for-path <file> --project {{PROJECT}}
+{{ENGINE_DIR}}/memidx.py why <symbol-or-path> --project {{PROJECT}} --code-root {{CODE_ROOT}}
+{{ENGINE_DIR}}/memidx.py drift --code-root {{CODE_ROOT}} --project {{PROJECT}}
+```
+
+## Provenance of this seed
+
+Created by `install.sh` in the MemContinuum engine checkout. Nothing in this repo predates its
+own first commit.

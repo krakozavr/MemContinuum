@@ -1,0 +1,9 @@
+{
+  "session_id": "synthetic-session-0002",
+  "transcript_path": "/home/user/.claude/projects/example-project/synthetic-session-0002.jsonl",
+  "cwd": "/home/user/dev/example-project",
+  "hook_event_name": "UserPromptSubmit",
+  "source": "user",
+  "prompt_id": "synthetic-prompt-id-0002",
+  "user_input": "Write a function to calculate the factorial of a number"
+}

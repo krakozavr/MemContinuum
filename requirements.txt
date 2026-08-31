@@ -1,0 +1,9 @@
+# MemContinuum runtime dependencies.
+#
+# numpy is not listed explicitly -- it arrives transitively via fastembed
+# (fastembed's ONNX runtime and its own array handling both depend on it).
+# Pins are minimums (>=), not exact versions: this repo has no reason to
+# forbid a newer compatible release.
+
+fastembed>=0.8.0
+PyYAML>=6.0.3

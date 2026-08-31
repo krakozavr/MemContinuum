@@ -1,0 +1,16 @@
+[project]
+name = "memcontinuum"
+version = "0.1.0"
+description = "A small, project-agnostic decision-chain memory engine: SQLite FTS5 + whole-record embeddings over hand-authored markdown."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "fastembed>=0.8.0",
+    "PyYAML>=6.0.3",
+]
+
+# No packaging magic: memidx.py and memlint.py are run directly (or via
+# install.sh's rendered hook commands), never imported as an installed
+# package. This file exists for dependency/metadata declaration only --
+# there is no [build-system] / wheel build here to keep in sync.

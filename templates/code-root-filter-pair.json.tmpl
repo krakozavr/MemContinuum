@@ -1,0 +1,10 @@
+          {
+            "type": "command",
+            "if": "Edit({{CODE_ROOT}}/**)",
+            "command": "MEMCONTINUUM_ROOT={{STORE}} MEMCONTINUUM_PROJECT={{PROJECT}} MEMCONTINUUM_STRIP_PREFIX={{STRIP_PREFIX}} MEMCONTINUUM_PYTHON={{PYTHON}} {{HOOKS_DIR}}/pre-edit-chain.sh"
+          },
+          {
+            "type": "command",
+            "if": "Write({{CODE_ROOT}}/**)",
+            "command": "MEMCONTINUUM_ROOT={{STORE}} MEMCONTINUUM_PROJECT={{PROJECT}} MEMCONTINUUM_STRIP_PREFIX={{STRIP_PREFIX}} MEMCONTINUUM_PYTHON={{PYTHON}} {{HOOKS_DIR}}/pre-edit-chain.sh"
+          }
