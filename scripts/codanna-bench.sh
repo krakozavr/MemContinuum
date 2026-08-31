@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # codanna-bench.sh -- compares Anatomy's code-reindex/code-search (memidx.py)
-# against Codanna (https://github.com/bartolli/codanna) on the same 12-probe
-# protocol over the real ~/dev/private-corpus/Sources corpus.
+# against Codanna (https://github.com/bartolli/codanna) on the same probe
+# protocol over a real code corpus of your choosing.
 #
 # Standalone: memidx.py never imports or references this script (or
 # Codanna) -- this script calls memidx.py's CLI as a subprocess, the same
@@ -17,7 +17,12 @@
 # output at all.
 #
 # Usage: scripts/codanna-bench.sh [SOURCES_ROOT]
-#   SOURCES_ROOT defaults to ~/dev/private-corpus/Sources.
+#   SOURCES_ROOT, or $MEMCONTINUUM_BENCH_CORPUS, or the `#corpus:` line of
+#   the probe file. The probe set itself is read from
+#   $MEMCONTINUUM_BENCH_PROBES (default docs/internal/gold-probes.tsv) --
+#   untracked, because probe queries and expected qualified names describe
+#   a real private codebase (privacy requirement, see
+#   tests/test_repo_init.py TestNoMachineIdentifyingContent).
 #
 # Every python invocation clears PYTHONPATH -- a Windows numpy install
 # leaks onto it by default in this shell and breaks fastembed under Linux
@@ -31,14 +36,28 @@ MEMIDX="$REPO_ROOT/memidx.py"
 # Python resolution order (README.md "Requirements" / hooks/memlib.sh): env
 # override -> <engine>/.venv/bin/python -> error naming the fix. No machine
 # path is ever hardcoded in tracked content (privacy requirement,
-# tests/test_install.py TestNoMachineIdentifyingContent).
+# tests/test_repo_init.py TestNoMachineIdentifyingContent).
 PY="${MEMCONTINUUM_PYTHON:-$REPO_ROOT/.venv/bin/python}"
 if [ ! -x "$PY" ]; then
   echo "ERROR: no python resolved -- set \$MEMCONTINUUM_PYTHON to a venv python" \
     "with fastembed/PyYAML installed (see README.md Requirements)" >&2
   exit 1
 fi
-SOURCES_ROOT="${1:-$HOME/dev/private-corpus/Sources}"
+PROBES_FILE="${MEMCONTINUUM_BENCH_PROBES:-$REPO_ROOT/docs/internal/gold-probes.tsv}"
+if [ ! -f "$PROBES_FILE" ]; then
+  echo "ERROR: no probe set at $PROBES_FILE -- set \$MEMCONTINUUM_BENCH_PROBES to a" \
+    "TSV of 'query<TAB>qualified_name<TAB>negative_substr' rows with a '#corpus:' header" >&2
+  exit 1
+fi
+# corpus root: argv -> env -> the probe file's own #corpus: line
+PROBES_CORPUS="$(sed -n 's/^#corpus:[[:space:]]*//p' "$PROBES_FILE" | head -1)"
+PROBES_CORPUS="${PROBES_CORPUS/#\~/$HOME}"
+SOURCES_ROOT="${1:-${MEMCONTINUUM_BENCH_CORPUS:-$PROBES_CORPUS}}"
+if [ -z "$SOURCES_ROOT" ]; then
+  echo "ERROR: no corpus root -- pass one as argv[1], set \$MEMCONTINUUM_BENCH_CORPUS," \
+    "or give $PROBES_FILE a '#corpus:' line" >&2
+  exit 1
+fi
 
 CACHE_DIR="$HOME/.cache/codanna-bench"
 BIN_DIR="$CACHE_DIR/bin"
@@ -160,34 +179,20 @@ T1=$(date +%s.%N)
 echo "codanna-bench: our code-reindex done in $(PYTHONPATH= "$PY" -c "print(f'{$T1-$T0:.2f}s')")"
 
 # ---------------------------------------------------------------------------
-# 3. the 12-probe protocol
+# 3. the probe protocol
 #
-# 8 gold probes (verified present in the real corpus before this script was
-# written -- see the task report) + 4 poorly-documented PrivateCore helpers
-# (missing or single-vague-line /// comments, confirmed by direct file
-# inspection). TSV: query \t gold_qualified_name \t negative_substr (may be
-# empty -- the "negatives rule": if a hit whose qualified_name contains
-# negative_substr outranks the gold within the top 3, that probe FAILS even
-# if the gold is technically present, because a bypass/exception site
-# beating the sanctioned implementation is the wrong answer to give a
-# caller asking "how do I do X".
+# Probes come from $PROBES_FILE (untracked -- see the header). TSV:
+# query \t gold_qualified_name \t negative_substr ("-" = none; never empty,
+# see the read loop below) -- the
+# "negatives rule": if a hit whose qualified_name contains negative_substr
+# outranks the gold within the top 3, that probe FAILS even if the gold is
+# technically present, because a bypass/exception site beating the sanctioned
+# implementation is the wrong answer to give a caller asking "how do I do X".
 # ---------------------------------------------------------------------------
 
 PROBES_TSV="$WORK_DIR/probes.tsv"
-cat > "$PROBES_TSV" <<'PROBES'
-write debug png	Redacted.rA
-[redacted probe query]	Redacted.rB
-compare two files by content hash	Redacted.rC
-path length budget	Redacted.rD
-[redacted probe query]	Redacted.rE
-[redacted probe query]	Redacted.rF
-[redacted probe query]	Redacted.rG
-[redacted probe query]	Redacted.rH
-[redacted probe query]	Redacted.rI
-[redacted probe query]	Redacted.rJ
-[redacted probe query]	Redacted.rK
-[redacted probe query]	Redacted.rL
-PROBES
+grep -v '^#' "$PROBES_FILE" | grep -v '^[[:space:]]*$' > "$PROBES_TSV"
+echo "codanna-bench: $(wc -l < "$PROBES_TSV") probes from $PROBES_FILE"
 
 # ---------------------------------------------------------------------------
 # 4. run every probe through fts/vector/hybrid (ours) and Codanna's lexical
@@ -214,8 +219,12 @@ codanna_semantic_probe() {
 RESULTS_JSON="$WORK_DIR/results.jsonl"
 : > "$RESULTS_JSON"
 
-while IFS=$'\t' read -r query gold negative; do
+while IFS=$'\t' read -r query gold negative gold_flag; do
   [ -z "$query" ] && continue
+  # Columns are never empty in the probe file ("-" means none) precisely
+  # because TAB is IFS whitespace: `read` collapses consecutive tabs, so an
+  # empty column would shift every later one into the wrong variable.
+  [ "$negative" = "-" ] && negative=""
   our_fts="$(our_probe "$query" fts)"
   our_vector="$(our_probe "$query" vector)"
   our_hybrid="$(our_probe "$query" hybrid)"

@@ -1,4 +1,4 @@
-"""Tests for install.sh -- the new-project installer.
+"""Tests for scripts/repo-init.sh -- the new-project installer.
 
 These exercise the real script via subprocess (matching the convention in
 tests/test_hooks.py), with HOME sandboxed to a fresh temp dir per test so
@@ -16,7 +16,7 @@ import unittest
 from pathlib import Path
 
 TOOLS_DIR = Path(__file__).resolve().parent.parent
-INSTALL_SH = TOOLS_DIR / "install.sh"
+INSTALL_SH = TOOLS_DIR / "scripts" / "repo-init.sh"
 # This machine's venv python is never hardcoded in tracked test code -- set
 # $MEMCONTINUUM_PYTHON in your own (untracked) shell environment before
 # running this file; see README.md "Requirements" / "Running the tests".
@@ -41,11 +41,11 @@ def sandbox_home():
     return tempfile.mkdtemp(prefix="memcontinuum-install-test-home-")
 
 
-def run_install(args, home, timeout=60, python=VENV_PYTHON, extra_env=None):
-    """Runs the real install.sh via subprocess with a sandboxed HOME.
+def run_install(args, home, timeout=60, python=VENV_PYTHON, extra_env=None, cwd=None):
+    """Runs the real scripts/repo-init.sh via subprocess with a sandboxed HOME.
 
     `python` sets MEMCONTINUUM_PYTHON to this machine's venv by default, so
-    every test in this file exercises install.sh's own logic rather than its
+    every test in this file exercises scripts/repo-init.sh's own logic rather than its
     python-resolution fallback chain (that resolution order has its own
     dedicated tests below -- TestPythonResolutionOrder). Pass python=None to
     leave MEMCONTINUUM_PYTHON unset (and rely on --python / .venv / the
@@ -66,12 +66,18 @@ def run_install(args, home, timeout=60, python=VENV_PYTHON, extra_env=None):
         text=True,
         env=env,
         timeout=timeout,
+        # Never the test process's own cwd: that is the REAL engine checkout,
+        # a git repo -- any cwd-derived default in the script under test
+        # would resolve against it and write into the real .claude (this
+        # actually happened; the engine's own wiring had to be restored from
+        # a session transcript). The sandbox HOME is the neutral floor.
+        cwd=cwd or home,
     )
     return proc
 
 
 def run_install_at(install_sh, args, home, path_prepend=None, timeout=60, python=None, extra_env=None):
-    """Like run_install, but against an arbitrary install.sh path (a copied
+    """Like run_install, but against an arbitrary scripts/repo-init.sh path (a copied
     engine checkout -- see copy_engine below) and with PATH control, for the
     --bootstrap-venv / python-resolution-order tests that need to run a copy
     without $MEMCONTINUUM_PYTHON and without the real repo's absence of a
@@ -93,29 +99,32 @@ def run_install_at(install_sh, args, home, path_prepend=None, timeout=60, python
         text=True,
         env=env,
         timeout=timeout,
+        # Same pin as run_install: never the real engine checkout (INC-0102).
+        cwd=home,
     )
     return proc
 
 
 def copy_engine(dst):
-    """Copies just the engine files install.sh needs (not memory/, .claude/,
+    """Copies just the engine files scripts/repo-init.sh needs (not memory/, .claude/,
     fixtures/, tests/) into dst, so a test can plant its own .venv/ next to
     the copy, or run with PATH manipulated, without ever touching the real
     checkout this test suite itself lives in."""
     dst = Path(dst)
     dst.mkdir(parents=True, exist_ok=True)
-    shutil.copy(INSTALL_SH, dst / "install.sh")
-    (dst / "install.sh").chmod(0o755)
+    (dst / "scripts").mkdir(exist_ok=True)
+    shutil.copy(INSTALL_SH, dst / "scripts" / "repo-init.sh")
+    (dst / "scripts" / "repo-init.sh").chmod(0o755)
     for name in ("memidx.py", "memlint.py", "requirements.txt"):
         shutil.copy(TOOLS_DIR / name, dst / name)
     for name in ("hooks", "templates", "skills"):
         shutil.copytree(TOOLS_DIR / name, dst / name)
-    return dst / "install.sh"
+    return dst / "scripts" / "repo-init.sh"
 
 
 def write_python_shim(path, target=VENV_PYTHON):
     """Writes an executable at `path` that just execs `target` -- a stand-in
-    venv python good enough for install.sh's own `-c 'pass'` sanity check
+    venv python good enough for scripts/repo-init.sh's own `-c 'pass'` sanity check
     and its real reindex/lint calls."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -632,7 +641,7 @@ class TestPreExistingStoreRepo(unittest.TestCase):
                 ["git", "-C", store, "log", "--oneline"], capture_output=True, text=True
             )
             commits = [l for l in log.stdout.strip().splitlines() if l]
-            self.assertEqual(len(commits), 1, "install.sh must not create a second commit")
+            self.assertEqual(len(commits), 1, "scripts/repo-init.sh must not create a second commit")
             self.assertIn("pre-existing commit", log.stdout)
         finally:
             shutil.rmtree(home, ignore_errors=True)
@@ -662,10 +671,98 @@ class TestPreExistingStoreRepo(unittest.TestCase):
             shutil.rmtree(home, ignore_errors=True)
 
 
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestDefaultStoreName(unittest.TestCase):
+    """Omitting --store applies the marked naming convention (owner ruling
+    2026-08-31): never a generic "memory/", never a bare "MemContinuum" --
+    "<repo>-MemContinuum-Store" beside a git repo, "MemContinuum-Store" inside
+    a plain working folder."""
+
+    def test_default_beside_a_git_repo_is_a_marked_sibling(self):
+        home = sandbox_home()
+        try:
+            repo = Path(home) / "proj"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "."], cwd=repo, check=True)
+            proc = run_install(["--project", "p", "--dry-run"], home, cwd=str(repo))
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn(f"defaulting to {home}/proj-MemContinuum-Store", proc.stdout)
+            # the hooks stay with the REPO, not the parent dir the sibling
+            # store happens to land in
+            self.assertIn(f"{repo}/.claude", proc.stdout)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_default_in_a_plain_folder_is_inside_it(self):
+        home = sandbox_home()
+        try:
+            work = Path(home) / "docs"
+            work.mkdir()
+            proc = run_install(["--project", "p", "--dry-run"], home, cwd=str(work))
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn(f"defaulting to {work}/MemContinuum-Store", proc.stdout)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestTwoProjectsOneClaudeDir(unittest.TestCase):
+    """Two projects wired into the SAME claude-dir must coexist: the merge
+    identifies its own entries by basename AND project, so initializing the
+    second project must not unwire the first (regate finding 1 -- basename-
+    only identification silently dropped the earlier project's entries; the
+    engine's own wiring was destroyed exactly this way by a test run)."""
+
+    def test_second_project_does_not_unwire_the_first(self):
+        home = sandbox_home()
+        try:
+            claude = str(Path(home) / ".claude")
+            for name in ("alpha", "beta"):
+                store = str(Path(home) / f"{name}-store")
+                proc = run_install(
+                    ["--project", name, "--store", store, "--claude-dir", claude],
+                    home,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            text = (Path(claude) / "settings.local.json").read_text(encoding="utf-8")
+            data = json.loads(text)
+            cmds = [
+                i["command"]
+                for groups in data.get("hooks", {}).values()
+                for g in groups
+                for i in g.get("hooks", [])
+            ]
+            alpha = [c for c in cmds if "MEMCONTINUUM_PROJECT=alpha" in c]
+            beta = [c for c in cmds if "MEMCONTINUUM_PROJECT=beta" in c]
+            self.assertGreaterEqual(len(alpha), 5, "first project's wiring was lost")
+            self.assertGreaterEqual(len(beta), 5)
+            # and a re-run of alpha replaces alpha's entries, not beta's
+            proc = run_install(
+                ["--project", "alpha", "--store", str(Path(home) / "alpha-store"),
+                 "--claude-dir", claude], home,
+            )
+            self.assertEqual(proc.returncode, 0)
+            data = json.loads((Path(claude) / "settings.local.json").read_text(encoding="utf-8"))
+            cmds = [
+                i["command"]
+                for groups in data.get("hooks", {}).values()
+                for g in groups
+                for i in g.get("hooks", [])
+            ]
+            self.assertGreaterEqual(
+                len([c for c in cmds if "MEMCONTINUUM_PROJECT=beta" in c]), 5)
+            self.assertEqual(
+                len([c for c in cmds if "MEMCONTINUUM_PROJECT=alpha" in c]), len(alpha),
+                "alpha re-run duplicated or dropped its own entries")
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+
 class TestNoMachineIdentifyingContent(unittest.TestCase):
     """Privacy requirement, broader than just "no hardcoded default": no
     tracked file anywhere in this repo -- including tests/ -- may name this
-    development machine's username or its absolute checkout path. The one
+    development machine's username, its absolute checkout path, or the private
+    codebase this engine is developed and benchmarked against. The one
     deliberate exception is LICENSE's copyright line.
 
     The needles below are built from string fragments rather than written as
@@ -681,6 +778,14 @@ class TestNoMachineIdentifyingContent(unittest.TestCase):
         )
         username_needle = "kra" + "kozavr"
         path_needle = "/mnt/d/!_WORK_" + "!"
+        # The private codebase this engine is developed against must not be
+        # named either -- not its checkout, not its module prefixes, not its
+        # product name. Its symbols and probe queries describe that project's
+        # internal architecture, so they live in an untracked probe file
+        # (tests/test_code_index.py load_probe_set) rather than in tracked
+        # content. Same split-literal trick as the two needles above.
+        project_needles = ["mmd" + "-swift", "MMD" + "App", "MMD" + "Core", "Shot" + "Porter"]
+        needles = [username_needle, path_needle] + project_needles
         offenders = {}
         for rel in result.stdout.splitlines():
             if not rel:
@@ -692,7 +797,7 @@ class TestNoMachineIdentifyingContent(unittest.TestCase):
                 text = p.read_text(errors="ignore")
             except Exception:
                 continue
-            hits = [n for n in (username_needle, path_needle) if n in text]
+            hits = [n for n in needles if n in text]
             if hits:
                 offenders[rel] = hits
         # LICENSE's copyright line is the one deliberate exception (and only
@@ -709,7 +814,7 @@ class TestPythonResolutionOrder(unittest.TestCase):
     """$MEMCONTINUUM_PYTHON env -> <engine>/.venv/bin/python -> error naming
     --bootstrap-venv. Runs against a COPIED engine checkout (copy_engine) so
     no test ever creates, or depends on the absence of, a real .venv/ next
-    to this repo's own install.sh."""
+    to this repo's own scripts/repo-init.sh."""
 
     def test_error_when_nothing_resolves(self):
         home = sandbox_home()
@@ -787,7 +892,7 @@ class TestBootstrapVenv(unittest.TestCase):
     test, a fake `python3`) on PATH intercepts the actual venv-creation and
     pip-install calls so nothing here ever touches the network, while still
     producing a working python (by delegating non-pip/non-venv calls to this
-    machine's real venv python) so install.sh's own later reindex/lint steps
+    machine's real venv python) so scripts/repo-init.sh's own later reindex/lint steps
     still succeed end to end."""
 
     def test_bootstrap_uses_uv_when_on_path_and_installs_requirements(self):

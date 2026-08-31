@@ -564,10 +564,37 @@ def unpack_vector(blob: bytes):
 # ---------------------------------------------------------------------------
 
 
+# Store-side walk pruning, the counterpart to CODE_SKIP_DIR_NAMES below.
+# Shared by reindex, check, unmapped's drift self-heal -- and by memlint.py,
+# which imports this function: a session buffer must not be linted as a topic
+# either.
+# Records never live in a dot-directory, but plenty of noise does: `.git`
+# itself, a project's `.claude/` settings, and -- the case that forced this --
+# a `.remember/now.md` session buffer sitting in a store root, which reindex
+# was indexing as a record and then serving in `search` results alongside real
+# rulings. Pruning by directory name keeps the walk cheap and needs no
+# per-file check. `os.walk` never prunes the root it is given, so a store that
+# legitimately lives at e.g. `~/.memory/` still indexes in full.
+#
+# Known and accepted gap (reviewer finding, 2026-08-31): with followlinks=True
+# a NON-hidden directory that symlinks AT a hidden one is still walked, since
+# the prune tests the local name. Closing it would cost a realpath() per
+# directory on every walk to defend against a store deliberately aliasing its
+# own noise, which nothing observed does. A hidden directory reached by its own
+# name is pruned whether or not it is a symlink.
+STORE_SKIP_DIR_NAMES = {"node_modules"}
+
+
 def walk_markdown(root: Path):
-    for dirpath, _dirnames, filenames in os.walk(root, followlinks=True):
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
+        dirnames[:] = [
+            d for d in dirnames
+            if not d.startswith(".") and d not in STORE_SKIP_DIR_NAMES
+        ]
         for fname in filenames:
-            if fname.endswith(".md"):
+            # Hidden files get the same treatment as hidden directories, and
+            # for the same reason: a dotfile is tooling's, not a record.
+            if fname.endswith(".md") and not fname.startswith("."):
                 yield Path(dirpath) / fname
 
 

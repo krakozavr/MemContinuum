@@ -281,13 +281,30 @@ def _duplicate_claim_errors(root: Path) -> list[str]:
 
 
 def lint_root(root: Path, code_root: Path | None = None) -> tuple[list[str], list[str]]:
+    """One pre-pass walk collects everything id-shaped (known ids for concept
+    validation, explicit-id owners for the duplicate check, stem fallbacks for
+    the collision warning) so the duplicate-id check costs no walk of its own
+    (round-3 reviewer finding 8)."""
     known_topic_ids: set[str] = set()
+    id_owners: dict[str, list[Path]] = {}
+    stem_owners: dict[str, list[Path]] = {}
     for f in sorted(walk_markdown(root)):
         fm, _body = parse_frontmatter(f)
         is_topic = bool(fm.get("links")) or fm.get("type") == "topic"
         if is_topic:
             tid = fm.get("id") or f.stem
             known_topic_ids.add(str(tid))
+        rid = fm.get("id")
+        if rid:
+            id_owners.setdefault(str(rid), []).append(f)
+        elif is_topic or fm.get("type"):
+            # Any STRUCTURED record (an explicit type:, or links) without an
+            # id falls back to its stem as a lookup id, so every such kind --
+            # investigations and sources included -- gets the collision
+            # warning (regate finding 5). Untyped plain markdown (a README,
+            # an inbox drop) is exempt: nobody chains those by stem, and
+            # inbox/*/README.md colliding is the normal state of the tree.
+            stem_owners.setdefault(f.stem, []).append(f)
 
     all_errors: list[str] = []
     all_warnings: list[str] = []
@@ -296,6 +313,24 @@ def lint_root(root: Path, code_root: Path | None = None) -> tuple[list[str], lis
         all_errors.extend(errors)
         all_warnings.extend(warnings)
     all_errors.extend(_duplicate_claim_errors(root))
+    for rid, files in id_owners.items():
+        if len(files) > 1:
+            listing = ", ".join(str(f) for f in files)
+            all_errors.append(
+                f"duplicate id {rid!r} claimed by {len(files)} records: {listing} "
+                "-- chain/edge/citation lookups by this id are ambiguous; renumber all but one"
+            )
+    # Records with NO explicit id fall back to the file stem as their lookup
+    # id, so two same-named files in different areas are just as ambiguous to
+    # `chain <stem>` -- but only a WARNING: renaming a topic's area must not
+    # become an error, and the durable fix is giving each an explicit id.
+    for stem, files in stem_owners.items():
+        if len(files) > 1:
+            listing = ", ".join(str(f) for f in files)
+            all_warnings.append(
+                f"stem {stem!r} shared by {len(files)} records without explicit ids: {listing} "
+                "-- `chain {0}` is ambiguous; give each an explicit id".format(stem)
+            )
     return all_errors, all_warnings
 
 

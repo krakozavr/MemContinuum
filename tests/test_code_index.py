@@ -4,8 +4,8 @@ index) and memlint.py's concept-record rule additions.
 
 Owned by this session (per the concurrent-work split, see the repo-root
 brief): memidx.py's code-index additions, memlint.py's concept-rule
-additions, this file, and fixtures/code/. Does not touch hooks/, install.sh,
-tests/test_hooks.py, tests/test_write_hooks.py, or tests/test_install.py.
+additions, this file, and fixtures/code/. Does not touch hooks/, scripts/repo-init.sh,
+tests/test_hooks.py, tests/test_write_hooks.py, or tests/test_repo_init.py.
 
 Every python invocation for this project is
 `PYTHONPATH= $MEMCONTINUUM_PYTHON` (a Windows numpy install leaks onto
@@ -36,7 +36,74 @@ import memidx  # noqa: E402
 import memlint  # noqa: E402
 
 FIXTURES = TOOLS_DIR / "fixtures" / "code"
-REAL_CORPUS_ROOT = Path.home() / "dev" / "private-corpus" / "Sources"
+
+# The real-corpus gold-probe test below runs against a PRIVATE code tree. Its
+# corpus path, its probe queries and the qualified names it expects all
+# describe that tree, so none of them may live in tracked content (privacy
+# requirement, tests/test_repo_init.py TestNoMachineIdentifyingContent). They are
+# read at run time from an untracked TSV instead; without it the test skips.
+PROBE_FILE = Path(
+    os.environ.get("MEMCONTINUUM_TEST_PROBES", TOOLS_DIR / "docs" / "internal" / "gold-probes.tsv")
+)
+
+
+def load_probe_set(path=PROBE_FILE):
+    """-> (corpus_root, [(query, expected_qualified_name)], min_top1), or None
+    when the untracked probe file is absent or unusable.
+
+    Format. Header directives `#corpus:` and `#min_top1:` are BOTH required --
+    defaulting either one is how a threshold quietly becomes vacuous (a missing
+    min_top1 defaulting to 1) or a reindex quietly targets the working
+    directory (an empty corpus resolving to Path(".")). First directive wins on
+    a repeat, matching scripts/codanna-bench.sh's `sed | head -1`.
+
+    Data rows are TAB-separated: query, qualified_name, negative_substr
+    (bench only) and gold_flag. Every column is always present and "-" means
+    none: an EMPTY column is unusable, because TAB is an IFS whitespace
+    character and bash `read` collapses consecutive tabs, silently shifting a
+    later column into an earlier variable. Only gold rows reach the assertion --
+    the bench runs a wider probe list, and folding the extras in would let a
+    hit on a bench-only probe mask a miss on a gold one against an absolute
+    threshold.
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    corpus, min_top1, probes = None, None, []
+    corpus_seen = min_top1_seen = False
+    for line in text.splitlines():
+        if line.startswith("#corpus:"):
+            # First directive wins EVEN when its value is empty -- otherwise
+            # an empty first line lets a later one through here while the
+            # bench's `sed | head -1` keeps the empty first, and the two
+            # consumers disagree about the same file (round-3 finding 11).
+            if not corpus_seen:
+                corpus_seen = True
+                value = line.split(":", 1)[1].strip()
+                if value:
+                    corpus = Path(value).expanduser()
+        elif line.startswith("#min_top1:"):
+            if not min_top1_seen:
+                min_top1_seen = True
+                try:
+                    min_top1 = int(line.split(":", 1)[1].strip())
+                except ValueError:
+                    return None
+                if min_top1 < 1:
+                    # 0 would make the assertion vacuous.
+                    return None
+        elif line.startswith("#") or not line.strip():
+            continue
+        else:
+            cols = line.split("\t")
+            if len(cols) >= 2 and cols[0].strip() and cols[1].strip():
+                is_gold = len(cols) >= 4 and cols[3].strip().lower() == "gold"
+                if is_gold:
+                    probes.append((cols[0].strip(), cols[1].strip()))
+    if corpus is None or min_top1 is None or not probes:
+        return None
+    return corpus, probes, min_top1
 
 
 def ns(**kw):
@@ -529,7 +596,7 @@ class TestVectorAndHybridJSONIsSerializable(unittest.TestCase):
             "import sys, io, contextlib, json; sys.path.insert(0, %r); import memidx; "
             "buf = io.StringIO()\n"
             "with contextlib.redirect_stdout(buf):\n"
-            "    rc = memidx.main(['code-search', '--db', %r, '[redacted probe query]', "
+            "    rc = memidx.main(['code-search', '--db', %r, 'embed a view in a scroll box', "
             "'--mode', %r, '--limit', '3', '--json'])\n"
             "assert rc == 0, rc\n"
             "env = json.loads(buf.getvalue())\n"
@@ -583,7 +650,7 @@ class TestVectorAndHybridJSONIsSerializable(unittest.TestCase):
             conn = memidx.open_code_db(db)
             try:
                 vec_hits = memidx.code_hits_vector(
-                    conn, "[redacted probe query]", memidx.DEFAULT_PROJECT
+                    conn, "embed a view in a scroll box", memidx.DEFAULT_PROJECT
                 )
             finally:
                 conn.close()
@@ -985,37 +1052,119 @@ class TestBudgets(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-GOLD_PROBES = [
-    ("write debug png", "Redacted.rA"),
-    ("[redacted probe query]", "Redacted.rB"),
-    ("compare two files by content hash", "Redacted.rC"),
-    ("path length budget", "Redacted.rD"),
-    ("[redacted probe query]", "Redacted.rE"),
-    ("[redacted probe query]", "Redacted.rF"),
-    ("[redacted probe query]", "Redacted.rG"),
-    ("[redacted probe query]", "Redacted.rH"),
-]
+
+
+class TestLoadProbeSet(unittest.TestCase):
+    """Runs in the DEFAULT suite. The real-corpus test that consumes this
+    parser is double-gated and normally skips, so without these the parser
+    would never execute in CI at all (reviewer finding 6, 2026-08-31)."""
+
+    def write(self, body):
+        d = tempfile.mkdtemp()
+        f = Path(d) / "probes.tsv"
+        f.write_text(body, encoding="utf-8")
+        return f
+
+    GOOD = (
+        "#corpus: /tmp\n"
+        "#min_top1: 2\n"
+        "a query\tPkg.alpha\t-\tgold\n"
+        "b query\tPkg.beta\tbypass\tgold\n"
+        "bench only\tPkg.gamma\t-\t-\n"
+    )
+
+    def test_parses_directives_and_gold_rows_only(self):
+        corpus, probes, min_top1 = load_probe_set(self.write(self.GOOD))
+        self.assertEqual(corpus, Path("/tmp"))
+        self.assertEqual(min_top1, 2)
+        self.assertEqual(probes, [("a query", "Pkg.alpha"), ("b query", "Pkg.beta")])
+
+    def test_missing_file_is_none_not_an_error(self):
+        self.assertIsNone(load_probe_set(Path("/nonexistent/probes.tsv")))
+
+    def test_non_utf8_file_is_none_not_an_error(self):
+        d = tempfile.mkdtemp()
+        f = Path(d) / "probes.tsv"
+        f.write_bytes(b"#corpus: /tmp\n\xff\xfe binary\n")
+        self.assertIsNone(load_probe_set(f))
+
+    def test_empty_corpus_directive_is_refused(self):
+        """An empty value would resolve to Path(".") and point the real-corpus
+        reindex at the working directory."""
+        self.assertIsNone(load_probe_set(self.write(
+            "#corpus:\n#min_top1: 1\nq\tP.a\t-\tgold\n")))
+
+    def test_missing_min_top1_is_refused_rather_than_defaulted(self):
+        """Defaulting it to 1 would make the assertion nearly vacuous."""
+        self.assertIsNone(load_probe_set(self.write("#corpus: /tmp\nq\tP.a\t-\tgold\n")))
+
+    def test_non_integer_min_top1_is_refused(self):
+        self.assertIsNone(load_probe_set(self.write(
+            "#corpus: /tmp\n#min_top1: five\nq\tP.a\t-\tgold\n")))
+
+    def test_no_gold_rows_is_refused(self):
+        self.assertIsNone(load_probe_set(self.write(
+            "#corpus: /tmp\n#min_top1: 1\nq\tP.a\t-\t-\n")))
+
+    def test_empty_first_corpus_directive_is_not_overridden_by_a_later_one(self):
+        """First-wins must hold even for an empty value, or this parser and
+        the bench's `sed | head -1` disagree about the same file."""
+        self.assertIsNone(load_probe_set(self.write(
+            "#corpus:\n#corpus: /tmp\n#min_top1: 1\nq\tP.a\t-\tgold\n")))
+
+    def test_zero_min_top1_is_refused_as_vacuous(self):
+        self.assertIsNone(load_probe_set(self.write(
+            "#corpus: /tmp\n#min_top1: 0\nq\tP.a\t-\tgold\n")))
+
+    def test_first_directive_wins_matching_the_bench_script(self):
+        """scripts/codanna-bench.sh reads `sed ... | head -1`; last-wins here
+        would make the two consumers disagree about the same file."""
+        corpus, _, min_top1 = load_probe_set(self.write(
+            "#corpus: /tmp\n#corpus: /var\n#min_top1: 3\n#min_top1: 9\n"
+            "q\tP.a\t-\tgold\n"))
+        self.assertEqual(corpus, Path("/tmp"))
+        self.assertEqual(min_top1, 3)
+
+    def test_comment_with_a_space_is_a_comment_not_a_directive(self):
+        corpus, _, _ = load_probe_set(self.write(
+            "# corpus: /decoy\n#corpus: /tmp\n#min_top1: 1\nq\tP.a\t-\tgold\n"))
+        self.assertEqual(corpus, Path("/tmp"))
 
 
 class TestGoldProbesRealCorpus(unittest.TestCase):
+    """Hybrid top-1 accuracy against a real code corpus, not the fixtures.
+
+    Double-gated: $MEMCONTINUUM_TEST_REAL_CORPUS must be set AND the untracked
+    probe file must exist (see load_probe_set). Everything project-specific --
+    corpus root, queries, expected qualified names, the pass threshold -- comes
+    from that file, so this test names nothing private. The threshold is below
+    100% on purpose: the misses are plausible near-misses (a sibling symbol or
+    a semantically adjacent one taking top-1), not index bugs; the analysis of
+    which probes miss and why is in the internal notes beside the probe file.
+    """
+
     @unittest.skipUnless(
         os.environ.get("MEMCONTINUUM_TEST_REAL_CORPUS"),
-        "set $MEMCONTINUUM_TEST_REAL_CORPUS=1 to run the real ~/dev/private-corpus/Sources gold-probe test",
+        "set $MEMCONTINUUM_TEST_REAL_CORPUS=1 to run the real-corpus gold-probe test",
     )
     def test_hybrid_top1_on_real_corpus(self):
-        self.assertTrue(REAL_CORPUS_ROOT.is_dir(), REAL_CORPUS_ROOT)
+        loaded = load_probe_set()
+        if loaded is None:
+            self.skipTest(f"no probe set at {PROBE_FILE} (see $MEMCONTINUUM_TEST_PROBES)")
+        corpus_root, probes, min_top1 = loaded
+        self.assertTrue(corpus_root.is_dir(), corpus_root)
         # Cached (incrementally reused, like scripts/codanna-bench.sh's own
-        # index) rather than a fresh tempdir -- a full embed of the real
-        # corpus takes ~20+ minutes on this host, and re-embeds nothing
-        # once the corpus hasn't changed since the last run.
+        # index) rather than a fresh tempdir -- a full embed of a real corpus
+        # takes ~20+ minutes on this host, and re-embeds nothing once the
+        # corpus hasn't changed since the last run.
         cache_dir = Path.home() / ".cache" / "codanna-bench"
         cache_dir.mkdir(parents=True, exist_ok=True)
         db = cache_dir / "bench-code.sqlite"
-        code_reindex(REAL_CORPUS_ROOT, db, project="codanna-bench", no_embed=False, full=False)
+        code_reindex(corpus_root, db, project="codanna-bench", no_embed=False, full=False)
 
         hits = 0
         details = []
-        for query, expect in GOLD_PROBES:
+        for query, expect in probes:
             conn = memidx.open_code_db(db)
             fts_ids = memidx.code_hits_fts(conn, query, "codanna-bench")
             vec_ids = [cid for cid, _ in memidx.code_hits_vector(conn, query, "codanna-bench")]
@@ -1036,13 +1185,9 @@ class TestGoldProbesRealCorpus(unittest.TestCase):
             details.append((query, expect, top1, ok))
             if ok:
                 hits += 1
-        # Measured against the real corpus (see the task report): hybrid
-        # top-1 hits 5/8 -- Redacted.rC loses top-1 to
-        # Redacted.rM, Redacted.rD loses
-        # to Redacted.rN, and
-        # Redacted.rG loses to the sibling symbol
-        # Redacted.rO -- all plausible near-misses, not index bugs.
-        self.assertGreaterEqual(hits, 5, f"{hits}/8 -- {details}")
+        self.assertGreaterEqual(
+            hits, min_top1, f"{hits}/{len(probes)} top-1 (threshold {min_top1}) -- {details}"
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -261,9 +261,13 @@ class TestPreEditChainHook(unittest.TestCase):
         # $SCRIPT_DIR/../memidx.py, so a temp-dir copy would fail on that
         # path lookup instead of on the (poisoned) import it's meant to test.
         broken_script = HOOK_SCRIPT.parent / "pre-edit-chain-broken-control.sh"
+        # Cleanup registered BEFORE the write: this file lands in the REAL
+        # checkout (it must sit next to memidx.py, see above), so an
+        # interruption between write and a later-registered cleanup would
+        # leave a broken hook script in the working tree (regate finding 2).
+        self.addCleanup(lambda: broken_script.unlink(missing_ok=True))
         broken_script.write_text(broken)
         broken_script.chmod(0o755)
-        self.addCleanup(broken_script.unlink)
 
         env = self._poisoned_env()
         proc = subprocess.run(

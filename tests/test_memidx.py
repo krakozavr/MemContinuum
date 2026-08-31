@@ -422,6 +422,89 @@ class TestD8TimingAndForPath(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
+class TestStoreWalkPruning(unittest.TestCase):
+    """walk_markdown must not index markdown that merely happens to sit under
+    the store root. The live case: a `.remember/now.md` session buffer in a
+    store root was reindexed as a record and returned by `search` next to real
+    rulings. `.gitignore` cannot prevent this -- the walk is a filesystem walk,
+    not a git one -- so the pruning has to live here."""
+
+    def test_dot_directories_and_node_modules_are_pruned(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "store"
+            (root / "topics" / "area").mkdir(parents=True)
+            (root / "topics" / "area" / "real.md").write_text("# real\n")
+            (root / "README.md").write_text("# store\n")
+            for noise in (".remember", ".claude", ".git", "node_modules"):
+                d = root / noise
+                d.mkdir()
+                (d / "now.md").write_text("# noise\n")
+            # nested one level down too -- pruning must apply at every depth
+            (root / "topics" / ".remember").mkdir()
+            (root / "topics" / ".remember" / "buf.md").write_text("# noise\n")
+
+            # hidden FILES in a kept directory are pruned too
+            (root / "topics" / "area" / ".draft.md").write_text("# noise\n")
+
+            found = sorted(p.name for p in memidx.walk_markdown(root))
+            self.assertEqual(found, ["README.md", "real.md"])
+
+    def test_a_store_root_that_is_itself_a_dot_directory_still_walks(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".memory"
+            (root / "topics").mkdir(parents=True)
+            (root / "topics" / "real.md").write_text("# real\n")
+            self.assertEqual([p.name for p in memidx.walk_markdown(root)], ["real.md"])
+
+
+class TestPrunedPathsLeaveTheIndex(unittest.TestCase):
+    """Pruning the walker is only half the fix: an ALREADY-polluted index has
+    to lose those rows too. reindex drops anything the walk no longer yields,
+    so the first reindex after this change cleans itself. Asserting on
+    walk_markdown alone would not catch a future reindex that kept walking
+    correctly but stopped deleting unseen rows -- which is exactly the path
+    that repairs a live database (reviewer finding 4, 2026-08-31)."""
+
+    def test_reindex_removes_rows_for_newly_pruned_paths(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "store"
+            (root / "topics" / "area").mkdir(parents=True)
+            (root / "topics" / "area" / "real.md").write_text(
+                "---\ntype: topic\nid: TOP-0001\ntitle: Real\n---\n# Real\n")
+            noise_dir = root / ".remember"
+            noise_dir.mkdir()
+            noise = noise_dir / "now.md"
+            noise.write_text("# session buffer\n")
+
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+
+            # Simulate the polluted state a pre-fix index was left in.
+            conn = memidx.open_db(db, project=memidx.DEFAULT_PROJECT)
+            conn.execute(
+                "INSERT INTO records (path, project, type, id, title, body, sha256, mtime, size) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (str(noise), memidx.DEFAULT_PROJECT, "topic", "TOP-9999",
+                 "buffer", "noise", "0" * 64, 0.0, 1),
+            )
+            conn.commit()
+            self.assertEqual(self._paths(conn), {str(root / "topics" / "area" / "real.md"), str(noise)})
+            conn.close()
+
+            reindex(root, db, no_embed=True)
+
+            conn = memidx.open_db(db, project=memidx.DEFAULT_PROJECT)
+            self.assertEqual(self._paths(conn), {str(root / "topics" / "area" / "real.md")})
+            conn.close()
+            # The file on disk is never touched -- only the derived index.
+            self.assertTrue(noise.is_file())
+
+    @staticmethod
+    def _paths(conn):
+        return {r[0] for r in conn.execute(
+            "SELECT path FROM records WHERE project=?", (memidx.DEFAULT_PROJECT,))}
+
+
 class TestCheckDrift(unittest.TestCase):
     def test_check_detects_touched_file(self):
         with tempfile.TemporaryDirectory() as td:

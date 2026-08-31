@@ -34,7 +34,7 @@
 #   MEMCONTINUUM_ROOT        store markdown root (the decision-chain repo).
 #   MEMCONTINUUM_CODE_ROOT   code root these hooks watch edits under.
 #   MEMCONTINUUM_PYTHON      absolute path to the venv python. Falls back to
-#                        <engine>/.venv/bin/python (see install.sh
+#                        <engine>/.venv/bin/python (see scripts/repo-init.sh
 #                        --bootstrap-venv) when unset.
 #
 # WRITE-LOCK (ruling E): these scripts' only writable surface is
@@ -47,22 +47,36 @@ export PYTHONPATH=
 
 MC_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 MC_MEMIDX="$MC_LIB_DIR/../memidx.py"
-# Python resolution order (README.md "Requirements" / install.sh --bootstrap-venv):
-#   $MEMCONTINUUM_PYTHON -> <engine>/.venv/bin/python -> (left unresolved; every
-#   caller here fails open, so a missing python surfaces as a logged outcome,
-#   never a blocked hook -- see mc_log below and each script's own finish()).
+# Python resolution order (README.md "Requirements" / memcontinuum-setup.sh):
+#   $MEMCONTINUUM_PYTHON -> $MEMCONTINUUM_HOME/config.sh -> <engine>/.venv/bin/python
+#   -> (left unresolved; every caller here fails open, so a missing python
+#   surfaces as a logged outcome, never a blocked hook -- see mc_log below and
+#   each script's own finish()).
+#
+# The config.sh step exists because a venv does not have to live at
+# <engine>/.venv: point --venv anywhere, or hand memcontinuum-setup.sh an existing
+# --python, and the last fallback is wrong. Without this step every hook line
+# in every project has to carry MEMCONTINUUM_PYTHON by hand, and the one that
+# forgets fails silently -- observed in the field, hooks dead for two days
+# behind a "no python resolved" line nobody was reading. config.sh is shell
+# rather than JSON precisely so this costs a `.` and no interpreter.
+MEMCONTINUUM_HOME="${MEMCONTINUUM_HOME:-$HOME/.memcontinuum}"
+if [ -z "${MEMCONTINUUM_PYTHON:-}" ] && [ -f "$MEMCONTINUUM_HOME/config.sh" ]; then
+    # shellcheck source=/dev/null
+    . "$MEMCONTINUUM_HOME/config.sh" 2>/dev/null || true
+fi
 if [ -n "${MEMCONTINUUM_PYTHON:-}" ]; then
     MC_PY="$MEMCONTINUUM_PYTHON"
 else
     MC_PY="$MC_LIB_DIR/../.venv/bin/python"
 fi
-MEMCONTINUUM_HOME="${MEMCONTINUUM_HOME:-$HOME/.memcontinuum}"
 MC_LOG="$MEMCONTINUUM_HOME/hook.log"
 mkdir -p "$MEMCONTINUUM_HOME" 2>/dev/null || true
 
 if [ ! -x "$MC_PY" ]; then
-    printf '%s memlib: no python resolved (checked MEMCONTINUUM_PYTHON, %s) -- run install.sh --bootstrap-venv\n' \
-        "$(date -Iseconds 2>/dev/null || date)" "$MC_LIB_DIR/../.venv/bin/python" >>"$MC_LOG" 2>/dev/null || true
+    printf '%s memlib: no python resolved (checked MEMCONTINUUM_PYTHON, %s, %s) -- run memcontinuum-setup.sh\n' \
+        "$(date -Iseconds 2>/dev/null || date)" "$MEMCONTINUUM_HOME/config.sh" \
+        "$MC_LIB_DIR/../.venv/bin/python" >>"$MC_LOG" 2>/dev/null || true
 fi
 
 MC_PROJECT="${MEMCONTINUUM_PROJECT:-}"

@@ -1,6 +1,6 @@
 # Wiring the hooks
 
-`install.sh` renders and merges all of this automatically (see the README's
+`scripts/repo-init.sh` renders and merges all of this automatically (see the README's
 "Installing into a new project") — this document explains what it wires and
 why, for anyone reading the generated `settings.local.json`, adapting it for
 a harness other than Claude Code, or wiring by hand instead of using the
@@ -27,12 +27,12 @@ into the target `hooks.PreToolUse` array:
           {
             "type": "command",
             "if": "Edit(<code-root>/**)",
-            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_STRIP_PREFIX=<code-root>/ MEMCONTINUUM_PYTHON=<python> <this-repo>/hooks/pre-edit-chain.sh"
+            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_STRIP_PREFIX=<code-root>/ MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/pre-edit-chain.sh"
           },
           {
             "type": "command",
             "if": "Write(<code-root>/**)",
-            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_STRIP_PREFIX=<code-root>/ MEMCONTINUUM_PYTHON=<python> <this-repo>/hooks/pre-edit-chain.sh"
+            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_STRIP_PREFIX=<code-root>/ MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/pre-edit-chain.sh"
           }
         ]
       }
@@ -77,7 +77,7 @@ target `hooks.PreToolUse` array as `pre-edit-chain.sh` (a second group, not a se
           {
             "type": "command",
             "if": "Write(<code-root>/**)",
-            "command": "MEMCONTINUUM_CODE_ROOT=<code-root> MEMCONTINUUM_PYTHON=<python> <this-repo>/hooks/newfile-nudge.sh"
+            "command": "MEMCONTINUUM_CODE_ROOT=<code-root> MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/newfile-nudge.sh"
           }
         ]
       }
@@ -97,7 +97,7 @@ Notes:
 Lives in this repo too, but runs as a `post-commit` hook inside the **store**
 repo — not this tool repo, and not the code repo it describes.
 
-`install.sh` writes this wrapper as `<store>/.git/hooks/post-commit`
+`scripts/repo-init.sh` writes this wrapper as `<store>/.git/hooks/post-commit`
 (not a bare symlink — a symlinked git hook carries no environment of its
 own, and `post-commit-reindex.sh` silently no-ops without `MEMCONTINUUM_ROOT`
 set):
@@ -107,7 +107,7 @@ set):
 export MEMCONTINUUM_ROOT="<store>"
 export MEMCONTINUUM_PROJECT="<project>"
 export MEMCONTINUUM_PYTHON="<python>"
-exec "<this-repo>/hooks/post-commit-reindex.sh"
+exec bash "<this-repo>/hooks/post-commit-reindex.sh"
 ```
 
 Since it `exec`s the canonical script by absolute path rather than copying it,
@@ -138,7 +138,7 @@ merged into `.claude/settings.json` or `.claude/settings.local.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_CODE_ROOT=<code-root> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_PYTHON=<python> <this-repo>/hooks/ledger-post-edit.sh"
+            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_CODE_ROOT=<code-root> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/ledger-post-edit.sh"
           }
         ]
       }
@@ -148,7 +148,7 @@ merged into `.claude/settings.json` or `.claude/settings.local.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_CODE_ROOT=<code-root> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_PYTHON=<python> <this-repo>/hooks/precompact-persist.sh"
+            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_CODE_ROOT=<code-root> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/precompact-persist.sh"
           }
         ]
       }
@@ -158,7 +158,7 @@ merged into `.claude/settings.json` or `.claude/settings.local.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_CODE_ROOT=<code-root> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_PYTHON=<python> <this-repo>/hooks/sessionstart-remind.sh"
+            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_CODE_ROOT=<code-root> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/sessionstart-remind.sh"
           }
         ]
       }
@@ -168,7 +168,7 @@ merged into `.claude/settings.json` or `.claude/settings.local.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_CODE_ROOT=<code-root> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_PYTHON=<python> <this-repo>/hooks/userprompt-remind.sh"
+            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_CODE_ROOT=<code-root> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/userprompt-remind.sh"
           }
         ]
       }
@@ -178,7 +178,7 @@ merged into `.claude/settings.json` or `.claude/settings.local.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_CODE_ROOT=<code-root> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_PYTHON=<python> <this-repo>/hooks/sessionend-stamp.sh"
+            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_CODE_ROOT=<code-root> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/sessionend-stamp.sh"
           }
         ]
       }
@@ -201,10 +201,16 @@ Notes:
 - `MEMCONTINUUM_CODE_ROOT` is new here (not used by `pre-edit-chain.sh`/`post-commit-reindex.sh`):
   it is the code root `ledger-post-edit.sh` scopes edits to. The five write-side hooks only
   support **one** `MEMCONTINUUM_CODE_ROOT` each — with multiple `--code-root`s given to
-  `install.sh`, the first one given is what they get.
+  `scripts/repo-init.sh`, the first one given is what they get.
 - `MEMCONTINUUM_HOME` is deliberately omitted here for the same reason as section 1: falls back
   to `~/.memcontinuum` unless overridden, and must never point at a synced/cloud drive.
 - These five scripts' only writable surface is `$MEMCONTINUUM_HOME/sessions/**/*.json[.lock]` and
   `$MEMCONTINUUM_HOME/hook.log` — never the store, never the code tree. `git diff`/`git status`
   in either root staying empty across every hook invocation is a permanent regression test
   (`tests/test_write_hooks.py`).
+
+
+> Invocation note (2026-08-31): every example above runs a hook as `bash <path>`
+> rather than by the path alone, matching what the templates now render -- the
+> executable bit is not required anywhere (a zip download or a
+> core.filemode=false clone drops it silently).

@@ -30,7 +30,7 @@
 #                    Also where this script's own hook.log lives. Defaults to
 #                    ~/.memcontinuum, matching memidx.py's own default.
 #   MEMCONTINUUM_PYTHON   absolute path to the venv python. Falls back to
-#                    <engine>/.venv/bin/python (install.sh --bootstrap-venv)
+#                    <engine>/.venv/bin/python (scripts/repo-init.sh --bootstrap-venv)
 #                    when unset.
 #   MEMCONTINUUM_STRIP_PREFIX
 #                    optional colon-separated list of absolute path prefixes
@@ -56,7 +56,7 @@ export PYTHONPATH=
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 MEMIDX="$SCRIPT_DIR/../memidx.py"
 # Python resolution order: $MEMCONTINUUM_PYTHON -> <engine>/.venv/bin/python
-# (install.sh --bootstrap-venv). Never a hard error here -- this hook fails
+# (scripts/repo-init.sh --bootstrap-venv). Never a hard error here -- this hook fails
 # open on every path (see the header comment above); a python that doesn't
 # resolve just surfaces as a logged outcome below.
 PY="${MEMCONTINUUM_PYTHON:-$SCRIPT_DIR/../.venv/bin/python}"
@@ -65,7 +65,7 @@ LOG="$MEMCONTINUUM_HOME/hook.log"
 
 mkdir -p "$MEMCONTINUUM_HOME" 2>/dev/null
 if [ ! -x "$PY" ]; then
-    printf '%s pre-edit-chain: no python resolved (checked MEMCONTINUUM_PYTHON, %s) -- run install.sh --bootstrap-venv\n' \
+    printf '%s pre-edit-chain: no python resolved (checked MEMCONTINUUM_PYTHON, %s) -- run scripts/repo-init.sh --bootstrap-venv\n' \
         "$(date -Iseconds 2>/dev/null || date)" "$SCRIPT_DIR/../.venv/bin/python" >>"$LOG" 2>/dev/null || true
 fi
 

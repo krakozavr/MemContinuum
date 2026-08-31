@@ -5,3 +5,4 @@ __pycache__/
 fixtures/records/
 memory/
 .venv/
+docs/internal/

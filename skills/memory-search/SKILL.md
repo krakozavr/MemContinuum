@@ -65,7 +65,7 @@ Before adding a new function, type, or file to a codebase this project indexes, 
 memidx.py code-search "INTENT PHRASE" --project PROJECT --mode hybrid --json
 ```
 
-Phrase the query as the intent ("write a debug PNG", "[redacted probe query]", "hash
+Phrase the query as the intent ("write a debug PNG", "embed a view in a scroll box", "hash
 a file's contents"), not as a symbol name — the index is built to match on that. A hit whose
 `concept_id` is set means a decision record governs that code; check it (`memidx.py why <path>`)
 before working around or duplicating it.

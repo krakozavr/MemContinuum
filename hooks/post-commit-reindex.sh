@@ -18,7 +18,7 @@
 #                     script's own log line goes ($MEMCONTINUUM_HOME/hook.log).
 #                     Defaults to ~/.memcontinuum, matching memidx.py's default.
 #   MEMCONTINUUM_PYTHON   absolute path to the venv python. Falls back to
-#                     <engine>/.venv/bin/python (install.sh --bootstrap-venv)
+#                     <engine>/.venv/bin/python (scripts/repo-init.sh --bootstrap-venv)
 #                     when unset.
 
 set -u
@@ -27,7 +27,7 @@ export PYTHONPATH=
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 MEMIDX="$SCRIPT_DIR/../memidx.py"
 # Python resolution order: $MEMCONTINUUM_PYTHON -> <engine>/.venv/bin/python
-# (install.sh --bootstrap-venv). A commit must never be blocked by this, so
+# (scripts/repo-init.sh --bootstrap-venv). A commit must never be blocked by this, so
 # an unresolved python just surfaces as a logged rc below, same as any other
 # reindex failure.
 PY="${MEMCONTINUUM_PYTHON:-$SCRIPT_DIR/../.venv/bin/python}"

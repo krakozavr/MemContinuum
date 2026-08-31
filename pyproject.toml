@@ -11,6 +11,6 @@ dependencies = [
 ]
 
 # No packaging magic: memidx.py and memlint.py are run directly (or via
-# install.sh's rendered hook commands), never imported as an installed
+# repo-init.sh's rendered hook commands), never imported as an installed
 # package. This file exists for dependency/metadata declaration only --
 # there is no [build-system] / wheel build here to keep in sync.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh -- MemContinuum new-project installer.
+# repo-init.sh -- MemContinuum per-repository initializer (formerly install.sh).
 #
 # Creates a Rationale-store markdown tree at --store, wires the PreToolUse
 # retrieval hook and the five write-side reminder hooks into a project's
@@ -7,7 +7,7 @@
 # store's git post-commit reindex hook, and runs an initial reindex + lint.
 #
 # Usage:
-#   install.sh --project NAME --store DIR [--code-root DIR ...]
+#   repo-init.sh --project NAME --store DIR [--code-root DIR ...]
 #              [--claude-dir DIR] [--python PATH] [--bootstrap-venv [DIR]]
 #              [--dry-run] [--force]
 #
@@ -21,11 +21,15 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
-HOOKS_DIR="$SCRIPT_DIR/hooks"
-TEMPLATES_DIR="$SCRIPT_DIR/templates"
-MEMIDX="$SCRIPT_DIR/memidx.py"
-MEMLINT="$SCRIPT_DIR/memlint.py"
-SKILL_SRC="$SCRIPT_DIR/skills/memory-search/SKILL.md"
+# This script lives in scripts/ (it is the SKILL's tool, not the user's entry
+# point -- that is memcontinuum-setup.sh at the repo root); everything it
+# consumes lives one level up.
+ENGINE_ROOT="$(cd "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd)"
+HOOKS_DIR="$ENGINE_ROOT/hooks"
+TEMPLATES_DIR="$ENGINE_ROOT/templates"
+MEMIDX="$ENGINE_ROOT/memidx.py"
+MEMLINT="$ENGINE_ROOT/memlint.py"
+SKILL_SRC="$ENGINE_ROOT/skills/memory-search/SKILL.md"
 
 OUR_HOOK_SCRIPTS="pre-edit-chain.sh newfile-nudge.sh ledger-post-edit.sh precompact-persist.sh sessionstart-remind.sh userprompt-remind.sh sessionend-stamp.sh"
 
@@ -42,13 +46,19 @@ declare -a CODE_ROOTS=()
 
 usage() {
     cat <<'USAGE'
-Usage: install.sh --project NAME --store DIR [--code-root DIR ...]
+Usage: repo-init.sh --project NAME [--store DIR] [--code-root DIR ...]
                    [--claude-dir DIR] [--python PATH]
                    [--bootstrap-venv [DIR]] [--dry-run] [--force]
 
   --project NAME     project namespace (used for --project everywhere, and
                       as the index db filename <NAME>.sqlite). Required.
-  --store DIR        the markdown store root to create/wire. Required.
+  --store DIR        the markdown store root to create/wire. Optional: the
+                      default is the conventional marked name --
+                      "<repo>-MemContinuum-Store" beside the git repo the
+                      cwd is in, else "$PWD/MemContinuum-Store". Never a
+                      generic "memory/" (collides with other memory
+                      systems) and never bare "MemContinuum" (reads as the
+                      tool itself).
   --code-root DIR     a code checkout the PreToolUse hook should watch for
                       Edit/Write and the write-side hooks should scope
                       ledger entries to. Repeatable. Optional -- omit for a
@@ -116,8 +126,8 @@ resolve_python() {
         printf '%s' "$MEMCONTINUUM_PYTHON"
         return 0
     fi
-    if [ -x "$SCRIPT_DIR/.venv/bin/python" ]; then
-        printf '%s' "$SCRIPT_DIR/.venv/bin/python"
+    if [ -x "$ENGINE_ROOT/.venv/bin/python" ]; then
+        printf '%s' "$ENGINE_ROOT/.venv/bin/python"
         return 0
     fi
     return 1
@@ -130,9 +140,9 @@ resolve_python() {
 # touches PYTHON_BIN itself (the caller decides whether to adopt the result).
 bootstrap_venv() {
     local dir="$1"
-    local req="$SCRIPT_DIR/requirements.txt"
+    local req="$ENGINE_ROOT/requirements.txt"
     if [ ! -f "$req" ]; then
-        echo "ERROR: requirements.txt not found next to install.sh: $req" >&2
+        echo "ERROR: requirements.txt not found next to scripts/repo-init.sh: $req" >&2
         return 1
     fi
     mkdir -p "$(dirname "$dir")" 2>/dev/null || true
@@ -153,13 +163,17 @@ bootstrap_venv() {
 
 # --- arg parsing -----------------------------------------------------------
 
+# A two-argument option with no value must ERROR, not loop: a failed
+# `shift 2` leaves the argument in place and spins forever (reviewer
+# finding, reproduced against all three entry points).
+mc_need_value() { [ $# -ge 2 ] || { echo "missing value for $1" >&2; exit 2; }; }
 while [ $# -gt 0 ]; do
     case "$1" in
-        --project) PROJECT="${2:-}"; shift 2 ;;
-        --store) STORE="${2:-}"; shift 2 ;;
-        --code-root) CODE_ROOTS+=("${2:-}"); shift 2 ;;
-        --claude-dir) CLAUDE_DIR="${2:-}"; shift 2 ;;
-        --python) PYTHON_BIN="${2:-}"; PYTHON_BIN_EXPLICIT=1; shift 2 ;;
+        --project) mc_need_value "$@"; PROJECT="$2"; shift 2 ;;
+        --store) mc_need_value "$@"; STORE="$2"; shift 2 ;;
+        --code-root) mc_need_value "$@"; CODE_ROOTS+=("$2"); shift 2 ;;
+        --claude-dir) mc_need_value "$@"; CLAUDE_DIR="$2"; shift 2 ;;
+        --python) mc_need_value "$@"; PYTHON_BIN="$2"; PYTHON_BIN_EXPLICIT=1; shift 2 ;;
         --bootstrap-venv)
             BOOTSTRAP_VENV=1
             shift
@@ -178,7 +192,39 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$PROJECT" ] || { usage >&2; fail "--project is required" 2; }
-[ -n "$STORE" ] || { usage >&2; fail "--store is required" 2; }
+# Default store location (owner convention, 2026-08-31): the folder is named
+# MemContinuum-Store -- marked as this tool's, never a generic "memory" that
+# another memory system could collide with or a bare "MemContinuum" that reads
+# as the tool itself. Where it lands depends on what the cwd is:
+#   cwd inside a git repo   -> a SIBLING of that repo, "<name>-MemContinuum-Store"
+#                              (never inside -- a store must not be absorbed
+#                              into a code repo's history; same rule the
+#                              inside-a-repo refusal below enforces)
+#   cwd not in any git repo -> "$PWD/MemContinuum-Store" (a working FOLDER,
+#                              like a docs dir, hosts its store directly)
+# An explicit --store always wins; the default is printed so nothing lands
+# anywhere silently.
+if [ -z "$STORE" ]; then
+    CWD_TOPLEVEL="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+    if [ -n "$CWD_TOPLEVEL" ]; then
+        STORE="$(dirname "$CWD_TOPLEVEL")/$(basename "$CWD_TOPLEVEL")-MemContinuum-Store"
+        # A defaulted SIBLING store must not drag --claude-dir's own default
+        # (<dirname of store>/.claude) up to the parent directory -- the hooks
+        # belong to the repo being initialized, so they default into that
+        # repo's .claude. Deliberately scoped to the defaulted-store flow
+        # only: with an EXPLICIT --store, the cwd is no signal at all (the
+        # command may be run from anywhere -- a test harness, a script, an
+        # unrelated checkout -- to set up paths elsewhere; round-3's fix
+        # attempt keyed on cwd unconditionally and wired a test run's hooks
+        # into the engine repo's own .claude). The skill's documented flow is
+        # cd-into-the-repo with NO --store, which lands here.
+        [ -n "$CLAUDE_DIR" ] || CLAUDE_DIR="$CWD_TOPLEVEL/.claude"
+    else
+        STORE="$PWD/MemContinuum-Store"
+    fi
+    echo "note: no --store given -- defaulting to $STORE"
+    [ -n "$CLAUDE_DIR" ] && echo "note: hooks will merge into $CLAUDE_DIR"
+fi
 
 case "$PROJECT" in
     */*|"") fail "--project must not contain '/' (got: $PROJECT)" 2 ;;
@@ -193,7 +239,7 @@ esac
 # this feature existed).
 
 if [ "$BOOTSTRAP_VENV" -eq 1 ]; then
-    VENV_DIR="${BOOTSTRAP_VENV_DIR:-$SCRIPT_DIR/.venv}"
+    VENV_DIR="${BOOTSTRAP_VENV_DIR:-$ENGINE_ROOT/.venv}"
     bootstrap_venv "$VENV_DIR" || fail "bootstrap-venv failed (see output above)" 3
     if [ "$PYTHON_BIN_EXPLICIT" -eq 0 ]; then
         PYTHON_BIN="$VENV_DIR/bin/python"
@@ -212,8 +258,8 @@ fi
 
 [ -x "$PYTHON_BIN" ] || fail "python venv not found or not executable: $PYTHON_BIN (missing python venv)" 3
 "$PYTHON_BIN" -c 'pass' >/dev/null 2>&1 || fail "python venv at $PYTHON_BIN does not run (missing python venv)" 3
-[ -f "$MEMIDX" ] || fail "memidx.py not found next to install.sh: $MEMIDX" 3
-[ -f "$MEMLINT" ] || fail "memlint.py not found next to install.sh: $MEMLINT" 3
+[ -f "$MEMIDX" ] || fail "memidx.py not found next to scripts/repo-init.sh: $MEMIDX" 3
+[ -f "$MEMLINT" ] || fail "memlint.py not found next to scripts/repo-init.sh: $MEMLINT" 3
 
 STORE="$(abspath "$STORE")"
 if [ -z "$CLAUDE_DIR" ]; then
@@ -259,7 +305,7 @@ else
 fi
 echo "  claude-dir  : $CLAUDE_DIR"
 echo "  python      : $PYTHON_BIN"
-echo "  engine dir  : $SCRIPT_DIR"
+echo "  engine dir  : $ENGINE_ROOT"
 [ "$DRY_RUN" -eq 1 ] && echo "  mode        : DRY RUN -- nothing below is actually written"
 echo
 
@@ -296,7 +342,7 @@ else
         README_TMPL="${README_TMPL//\{\{PROJECT\}\}/$PROJECT}"
         README_TMPL="${README_TMPL//\{\{STORE\}\}/$STORE}"
         README_TMPL="${README_TMPL//\{\{PYTHON\}\}/$PYTHON_BIN}"
-        README_TMPL="${README_TMPL//\{\{ENGINE_DIR\}\}/$SCRIPT_DIR}"
+        README_TMPL="${README_TMPL//\{\{ENGINE_DIR\}\}/$ENGINE_ROOT}"
         README_TMPL="${README_TMPL//\{\{CODE_ROOT\}\}/$FIRST_CODE_ROOT}"
         printf '%s' "$README_TMPL" > "$STORE/README.md" || fail "could not write $STORE/README.md"
     fi
@@ -478,8 +524,23 @@ if code_roots:
 
 
 def is_ours(hook_item):
+    """Identity-aware (regate finding 1): an entry is THIS install's only when
+    it names one of our scripts AND belongs to this --project. Basename alone
+    silently unwired a coexisting project sharing the same claude-dir -- an
+    accepted topology, since two sibling explicit stores derive the same
+    parent .claude, and exactly how the engine's own wiring was destroyed by
+    a test run. An entry naming our scripts with NO project marker at all is
+    treated as ours (pre-identity legacy wiring, safe to refresh)."""
     cmd = hook_item.get("command", "")
-    return any(name in cmd for name in OUR_SCRIPTS)
+    if not any(name in cmd for name in OUR_SCRIPTS):
+        return False
+    if "MEMCONTINUUM_PROJECT=" not in cmd:
+        return True
+    return (
+        f"MEMCONTINUUM_PROJECT={project} " in cmd
+        or cmd.rstrip().endswith(f"MEMCONTINUUM_PROJECT={project}")
+        or f"MEMCONTINUUM_PROJECT='{project}'" in cmd
+    )
 
 
 settings_path = os.path.join(claude_dir, "settings.local.json")
@@ -587,7 +648,7 @@ if [ -d "$STORE/.git" ]; then
             printf 'export MEMCONTINUUM_ROOT=%s\n' "$(printf '%q' "$STORE")"
             printf 'export MEMCONTINUUM_PROJECT=%s\n' "$(printf '%q' "$PROJECT")"
             printf 'export MEMCONTINUUM_PYTHON=%s\n' "$(printf '%q' "$PYTHON_BIN")"
-            printf 'exec %s\n' "$(printf '%q' "$HOOKS_DIR/post-commit-reindex.sh")"
+            printf 'exec bash %s\n' "$(printf '%q' "$HOOKS_DIR/post-commit-reindex.sh")"
         } > "$POST_COMMIT" || fail "could not write $POST_COMMIT"
         chmod +x "$POST_COMMIT" || fail "could not chmod $POST_COMMIT"
     fi
@@ -602,7 +663,7 @@ fi
 # not otherwise need. The store repo's post-commit hook (step 6) will run a
 # full (embedding) reindex automatically on the first real commit of
 # content, and `README.md`'s own "Running the engine" section documents
-# `--no-embed` as install.sh's choice, so it does not read as an accident.
+# `--no-embed` as scripts/repo-init.sh's choice, so it does not read as an accident.
 
 REINDEX_CMD=("$PYTHON_BIN" "$MEMIDX" reindex --root "$STORE" --project "$PROJECT" --no-embed)
 LINT_CMD=("$PYTHON_BIN" "$MEMLINT" "$STORE")
@@ -659,7 +720,7 @@ else
    $CLAUDE_DIR/settings.local.json take effect.
 2. Write your first topic: create
      $STORE/topics/<area>/<slug>.md
-   following the frontmatter shape in $SCRIPT_DIR/docs/SCHEMA.md (type: topic,
+   following the frontmatter shape in $ENGINE_ROOT/docs/SCHEMA.md (type: topic,
    id, title, area, code_refs, links: [...]), then reindex:
      PYTHONPATH= $PYTHON_BIN $MEMIDX reindex --root $STORE --project $PROJECT
    (the store's post-commit hook does this automatically after a commit).

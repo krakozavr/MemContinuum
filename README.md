@@ -104,7 +104,7 @@ reviewers (for example, Codex or Grok CLIs) as gates and advisors. By
 convention, the orchestrator is the memory's canonical writer — this is a
 governance pattern, not an access control the engine enforces: nothing in
 the code stops any other role from editing a topic file directly.
-`install.sh` creates `inbox/{codex,grok,audit}` directories under the store
+`scripts/repo-init.sh` creates `inbox/{codex,grok,audit}` directories under the store
 precisely so a reviewer proposing a record and the orchestrator writing it
 up stay two different, deliberate steps by habit. Subagents get the
 relevant decision history handed to them automatically before they touch a
@@ -229,21 +229,108 @@ If your shell exports a `PYTHONPATH` that shadows the venv's own site-packages
 `PYTHONPATH=` — every hook already does this defensively on its own, so it
 only matters when you're running `memidx.py`/`memlint.py` directly.
 
+## Installing on a machine
+
+Two layers, and mixing them up is the usual source of confusion:
+
+| | what it sets up | how often | who runs it |
+|---|---|---|---|
+| `memcontinuum-setup.sh` | the venv, `~/.memcontinuum/config.sh`, and the **user-level** SessionStart detector + `memcontinuum` skill in `~/.claude` | once per machine | a person, deliberately |
+| `scripts/repo-init.sh` | one store, and the seven **project-level** hooks in that repo's `.claude/settings.local.json` | once per repository | the `memcontinuum` skill, after a human says yes |
+
+```bash
+bash memcontinuum-setup.sh [--venv DIR] [--python PATH] [--claude-dir DIR]
+                  [--no-model-warm] [--dry-run] [--uninstall]
+```
+
+- `--venv DIR` — where to create the venv. Default `<checkout>/.venv`, which is
+  also the path every hook falls back to on its own. Uses `uv venv`/`uv pip`
+  when `uv` is on `PATH`, else `python3 -m venv`/`pip`.
+- `--python PATH` — use an existing python instead, with `requirements.txt`
+  already installed. Version-gated at 3.10+ against the python that will
+  actually run the engine, not against whatever `python3` happens to be first
+  on `PATH`.
+- `--claude-dir DIR` — user-level Claude Code directory. Default `~/.claude`.
+- `--no-model-warm` — skip the one-time ~100 MB embedding-model download.
+  It is on by default because, left lazy, that download lands inside someone's
+  first `reindex` — or inside a hook — where it looks like a hang.
+- `--dry-run` — print the plan, write nothing.
+- `--uninstall` — remove the user-level hook, the skill, and `config.sh`.
+  Never touches a venv, a store, any per-repo wiring, or `decisions.tsv`.
+
+`config.sh` is sourceable shell rather than JSON on purpose: `hooks/memlib.sh`
+reads it on every hook invocation to resolve python, and must not need an
+interpreter to do so. Resolution order is `$MEMCONTINUUM_PYTHON` →
+`$MEMCONTINUUM_HOME/config.sh` → `<engine>/.venv/bin/python`. The middle step
+exists because a venv need not live at `<engine>/.venv`; without it, every hook
+line in every project must carry `MEMCONTINUUM_PYTHON` by hand, and the one
+that forgets fails silently behind a log line nobody reads.
+
+### Being asked, rather than having to remember
+
+`hooks/memcontinuum-detect.sh` is the only hook that runs in repositories which
+have never been initialized — that is the whole point of installing it at user
+level. On `SessionStart` it classifies the repo and, in exactly one of five
+states, emits a single `additionalContext` line asking the assistant to put the
+question to a human:
+
+| state | behaviour |
+|---|---|
+| `not-a-repo` | silent — nothing to wire |
+| `opted-out` | silent — `$MEMCONTINUUM_HOME/no-ask` exists (machine-wide "never ask") |
+| `wired` | silent — the repo's `.claude` settings already reference the installed hooks |
+| `decided` | silent — the repo's key is in `decisions.tsv`; never ask twice |
+| `undecided` | **asks, once** |
+
+It is deliberately unlike every other hook here: no python, no `memlib.sh`, no
+watchdog, no logging unless `$MEMCONTINUUM_DETECT_LOG` is set — it fires on
+every session start on the machine, including in repos that have nothing to do
+with this tool, so it must cost near-nothing and depend on nothing. Pure bash
+and `git`, ~12 ms, and it fails open on any error.
+
+**A hook reports a state; only the skill records a decision.** The detector
+never installs anything and never writes to `decisions.tsv` — a hook must not
+write down a consent it did not collect. The human answers in conversation, and
+the `memcontinuum` skill acts:
+
+```bash
+scripts/memcontinuum-state.sh [REPO]            # read-only: prints state=...
+scripts/memcontinuum-decide.sh declined         # they said no; never asked again
+scripts/memcontinuum-decide.sh wired --store DIR --project NAME
+scripts/memcontinuum-decide.sh forget           # back to undecided
+scripts/memcontinuum-decide.sh never-ask        # machine-wide; undo: ask-again
+```
+
+`decisions.tsv` is keyed by the `origin` remote URL when there is one and the
+working tree's absolute path otherwise. Remote-keyed on purpose: a path key
+evaporates the moment a repo is moved on disk, and a settled decision then
+looks unmade. On a path-key miss after a move the repo reads as `undecided` and
+is asked once more — re-ask, never assume.
+
+A decline stops the *asking*, not an existing installation: if a repo was wired
+and is later declined, its hooks stay until they are removed (see "Uninstall"
+below). Nothing here ever deletes a store — a store is its own git history, not
+an installer artifact.
+
 ## Installing into a new project
 
 ```bash
-bash install.sh --project NAME --store DIR [--code-root DIR ...] \
+bash scripts/repo-init.sh --project NAME --store DIR [--code-root DIR ...] \
                  [--claude-dir DIR] [--python PATH] [--bootstrap-venv [DIR]] \
                  [--dry-run] [--force]
 ```
 
 One command, run from this checkout, sets up a project's Rationale store and wires it into
-Claude Code. `--project` and `--store` are the only required flags.
+Claude Code. `--project` is the only required flag.
 
 - `--project NAME` — the project namespace passed to every `memidx.py --project`; also the
   index db's filename (`<NAME>.sqlite`). Must not contain `/`.
 - `--store DIR` — the markdown store root to create (or adopt, if `DIR` already exists as its
-  own git repo).
+  own git repo). Optional: the default applies the store-naming convention —
+  `<repo>-MemContinuum-Store` as a sibling of the git repo the cwd is in, else
+  `MemContinuum-Store` inside the cwd. The name is deliberately marked: a generic
+  `memory/` collides with other memory systems' directories, and a bare
+  `MemContinuum` reads as the tool itself rather than one project's store.
 - `--code-root DIR` — a code checkout the two PreToolUse hooks (`pre-edit-chain.sh`,
   `newfile-nudge.sh`) should watch, and the write-side hooks should scope the edit ledger to.
   Repeatable. Omit entirely for a rationale-only install with no associated code tree (neither
@@ -276,15 +363,16 @@ Claude Code. `--project` and `--store` are the only required flags.
 
 **Python resolution**, when neither `--python` nor `--bootstrap-venv` is given:
 `$MEMCONTINUUM_PYTHON` (env) → `<this checkout>/.venv/bin/python` → a clear error naming
-`--bootstrap-venv`. The five write-side hooks and the two PreToolUse hooks resolve their own
-python the same way at runtime (`$MEMCONTINUUM_PYTHON` → `<engine>/.venv/bin/python`), except
+`--bootstrap-venv`. The hooks resolve their own python at runtime with one extra middle step —
+`$MEMCONTINUUM_PYTHON` → `$MEMCONTINUUM_HOME/config.sh` (written by `memcontinuum-setup.sh`) →
+`<engine>/.venv/bin/python` — except
 they never hard-error — every hook fails open (logs the problem, changes nothing, never blocks
 an edit or a commit) rather than blocking on a missing python.
 
 **What it creates**, under `--store`: `topics/ incidents/ investigations/ concepts/ sources/
 inbox/{codex,grok,audit}` (each with a `.gitkeep`), a store `README.md` (the six-line citation
 rule + engine commands, rendered from `templates/store-README.md.tmpl`), and a `.gitignore`
-(`*.sqlite`). If `--store` isn't already a git repo, `install.sh` runs `git init` and one
+(`*.sqlite`). If `--store` isn't already a git repo, `scripts/repo-init.sh` runs `git init` and one
 initial commit (author from git config, falling back to `memcontinuum-install
 <install@memcontinuum.invalid>` when none is set) — then writes `.git/hooks/post-commit` as a
 small wrapper that exports `MEMCONTINUUM_ROOT`/`MEMCONTINUUM_PROJECT`/`MEMCONTINUUM_PYTHON` and
@@ -314,7 +402,7 @@ above from `settings.local.json` (or restore `settings.local.json.bak-memcontinu
 `<claude-dir>/skills/memory-search/`, delete `<store>/.git/hooks/post-commit`, and delete
 `~/.memcontinuum/<project>.sqlite` and, if `code-reindex` was ever run against
 this project, `~/.memcontinuum/<project>-code.sqlite` too (or wherever
-`MEMCONTINUUM_HOME` points) — `install.sh`'s own printed next-steps currently
+`MEMCONTINUUM_HOME` points) — `scripts/repo-init.sh`'s own printed next-steps currently
 name only the first of those two db files, not the code-index cache. Leave
 `<store>` itself alone — it is the store's own git history, not an installer
 artifact.
@@ -341,7 +429,14 @@ See `hooks/install-hooks.md` for what each generated hook line actually does at 
 ## Storage model
 
 Markdown is canonical; SQLite is a disposable cache, rebuildable at any time
-with `memidx.py reindex`. Search runs SQLite FTS5 (keyword) fused with cosine
+with `memidx.py reindex`. `reindex`/`check`/`unmapped` — and `memlint.py`, which imports the same
+walker, so a session buffer is never linted as a topic either — walk every
+`.md` under `--root`, but prune dot-directories and dotfiles (`.git`, `.claude`, a `.remember/` session
+buffer, …) and `node_modules` at every depth — markdown that merely happens to
+sit under a store root is not a record, and a `.gitignore` cannot express that,
+since this is a filesystem walk rather than a git one. The root itself is never
+pruned, so a store that legitimately lives at e.g. `~/.memory/` still indexes in
+full. Search runs SQLite FTS5 (keyword) fused with cosine
 similarity over whole-record embeddings (`BAAI/bge-small-en-v1.5` via
 `fastembed`) using Reciprocal Rank Fusion — never score blending, since bm25
 scores and cosine similarities live on incomparable scales. See
@@ -617,7 +712,10 @@ the point where a canonical store's commits are made, not inside the linter.
 ## Hooks
 
 Seven hook scripts under `hooks/`, wired into a project's `.claude/settings.local.json`
-by `install.sh`. All of them fail open (never block an edit, never block a commit
+by `scripts/repo-init.sh` — plus `memcontinuum-detect.sh`, which is wired one level up, into
+`~/.claude/settings.json` by `memcontinuum-setup.sh`, and is the only one that runs in
+repositories this tool has never been installed into (see "Being asked, rather
+than having to remember" above). All of them fail open (never block an edit, never block a commit
 on a missing python or a lookup failure) and log one OUTCOME line per run
 to `$MEMCONTINUUM_HOME/hook.log` (diagnostic lines may precede it, e.g.
 `pre-edit-chain.sh`'s missing-python note before its own `outcome=...`
@@ -641,6 +739,7 @@ below. `hooks/install-hooks.md` documents the exact wiring each one gets.
 | `userprompt-remind.sh` | `UserPromptSubmit` | never reads the prompt text itself — fires a *coverage* nudge when edited files carry no decision topic and the ledger has grown since the last nudge (past a cooldown), or a *look-back* nudge when several user turns or tens of minutes have passed with no ledger growth |
 | `sessionend-stamp.sh` | `SessionEnd` | stamps session end into state |
 | `post-commit-reindex.sh` | store's own git `post-commit` (not a Claude Code hook) | reindexes the store after every commit to it |
+| `memcontinuum-detect.sh` | `SessionStart`, **user level** | in an un-initialized repo with no recorded answer, asks the assistant to put the question to a human — once. No python, no watchdog, no logging by default; silent in every other state |
 
 Session state lives at `$MEMCONTINUUM_HOME/sessions/<project>/<id>.json`,
 updated by atomic rename (`os.replace`) and guarded by a real file lock — a
@@ -654,8 +753,8 @@ markdown store has changed since the last reindex, writing to the
 decision index's own SQLite cache (`$MEMCONTINUUM_HOME/<project>.sqlite`)
 when that happens.
 
-Every hook here except `pre-edit-chain.sh` and `post-commit-reindex.sh`
-runs under its own wall-clock watchdog — the five write-side hooks above
+Every hook here except `pre-edit-chain.sh`, `post-commit-reindex.sh` and
+`memcontinuum-detect.sh` runs under its own wall-clock watchdog — the five write-side hooks above
 plus `newfile-nudge.sh` (which has no write-side state of its own but
 shares the same guard, per its own header comment, rather than a second
 bespoke timeout story for the one hook that happens to be fast): each
@@ -694,7 +793,7 @@ export MEMCONTINUUM_PYTHON="$PWD/.venv/bin/python"   # or wherever --bootstrap-v
 $MEMCONTINUUM_PYTHON -m unittest discover -s tests -v
 ```
 
-Unlike `install.sh`, the tests don't fall back to `<checkout>/.venv/bin/python`
+Unlike `scripts/repo-init.sh`, the tests don't fall back to `<checkout>/.venv/bin/python`
 on their own — they read `$MEMCONTINUUM_PYTHON` and, for the tests that need a
 real venv to drive the hooks/installer through, skip with a clear message if
 it isn't set (a handful of others need extra machine-local test data of their
@@ -732,13 +831,23 @@ split — D1/D2 fail, D5 skips — is a pre-existing property of those tests,
 not something this pass changed. D8's timing test also skips cleanly: it
 needs its own `$MEMCONTINUUM_TEST_SANDBOX_SYNTH` directory of synthetic
 markdown for a fixed file-count assertion, and skips without that
-variable set. `test_code_index.py`'s `TestGoldProbesRealCorpus` is gated
-the same way, behind `$MEMCONTINUUM_TEST_REAL_CORPUS` (skips cleanly when
-unset) — but unlike D5/D8, when it *does* run it deliberately does not use
-a temp dir: it reindexes a real Swift corpus into a cache at
+variable set. `test_code_index.py`'s `TestGoldProbesRealCorpus` is double-gated:
+`$MEMCONTINUUM_TEST_REAL_CORPUS` must be set **and** an untracked probe file
+must exist (`$MEMCONTINUUM_TEST_PROBES`, default `docs/internal/gold-probes.tsv`),
+or it skips. Everything project-specific — the corpus root, the probe queries,
+the qualified names they expect, the pass threshold — is read from that file
+rather than written into tracked content, because probe queries and expected
+symbol names describe a real private codebase (the same privacy requirement
+`tests/test_repo_init.py`'s `TestNoMachineIdentifyingContent` enforces, which
+also refuses that codebase's name and module prefixes anywhere in tracked
+files). `scripts/codanna-bench.sh` reads the same file via
+`$MEMCONTINUUM_BENCH_PROBES` and takes its corpus root from argv, then
+`$MEMCONTINUUM_BENCH_CORPUS`, then the file's own `#corpus:` line. Unlike
+D5/D8, when the test *does* run it deliberately does not use a temp dir: it
+reindexes the real corpus into a cache at
 `~/.cache/codanna-bench/bench-code.sqlite`, reused (incrementally) across
 runs rather than rebuilt from scratch each time, because a full embed of
-that corpus takes on the order of 20+ minutes on a typical dev machine.
+a real corpus takes on the order of 20+ minutes on a typical dev machine.
 See `fixtures/payloads/README.md` for the same guarantee about the hook
 payload fixtures specifically. `scripts/codanna-bench.sh` is a further,
 separate exception to "everything test-related stays inside a temp dir"
