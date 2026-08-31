@@ -40,45 +40,78 @@ changed mind is a new entry in the chain, never an edit to the old one, so
 the history of "we tried X, it didn't work because Y, so we do Z instead"
 stays intact and citable.
 
-Retrieval is **forced at the moment it matters**, not left to an agent's
-memory or discipline. Before an edit touches a file, a hook looks up whatever
-decision governs that file and hands it over automatically — the agent
-doesn't have to remember to ask. The same idea runs in the other direction:
-at natural checkpoints (a session starting, a compaction, a prompt that reads
-like a ruling), a hook nudges the session that something worth recording just
-happened.
+Retrieval is **forced when the index is healthy** — not left to an agent's
+memory or discipline, and not something a person has to remember to
+trigger. Before an edit touches a file, a hook looks up whatever decision
+governs that file and hands it over automatically. It's fail-open by
+design, though: a stale index, a missing python, or any lookup failure just
+means the hook stays silent that turn, never that the edit gets blocked —
+nothing here can stop you from working.
+
+The same idea runs in the other direction, on two triggers, and neither one
+reads what you typed. A *coverage* signal fires mid-session when files have
+been edited under no decision topic at all, the set of edited files has
+grown since the last nudge, and a short cooldown has passed. A *look-back*
+signal fires when the conversation has moved on — several user turns or
+tens of minutes — while the edit ledger hasn't grown at all, on the theory
+that a long quiet stretch right after real edits is exactly when a ruling
+that happened only in conversation is most likely to go unrecorded. Either
+one nudges the session that this might be worth writing down as a new link
+in a chain; if either fired right before a compaction, the nudge survives
+into the fresh session on the other side.
 
 Nothing is captured automatically. An agent has to deliberately write a
-record, and anything cited as the project owner's own words passes through
-an explicit step where the owner sees the exact text before it counts as a
-constraint. A store that silently guesses at what someone meant is worse than
-no store, because it gets trusted the same as one that didn't guess.
+record, and a ruling cited as the project owner's own words is only
+supposed to be written down after the owner has seen and confirmed the
+exact text — that's a documented authoring step (`docs/SCHEMA.md` §5), not
+a UI or a runtime gate the code enforces. What the engine *does* enforce is
+narrower: `memlint` rejects any `owner-verbatim`/`owner-ratified` link
+that's missing `ruling.text` or `ruling.source`, which catches an
+incomplete record but can't verify the confirmation actually happened. A
+store that silently guesses at what someone meant is worse than no store,
+because it gets trusted the same as one that didn't guess.
 
-Against fragmentation, **Anatomy** gives the codebase's shape a queryable
-form: a small set of *concept* records — "this is one system; here are the
+Against fragmentation, **Anatomy** works in two layers. The authored layer
+is a small set of *concept* records — "this is one system; here are the
 files and symbols that implement it, the tests that guard it, the decisions
 that govern it, and where its boundary runs." Ask `why <symbol>` and you get
-the concept a strange piece of code belongs to, its decision history, and the
-obvious alternative that was rejected — before a well-meaning cleanup deletes
-it. Ask `for-path` (the pre-edit hook does, automatically) and an edit to a
-governed file starts with its concept and rulings in view. And `drift` turns
-active decisions with a checkable shape ("all deletes go through the one
-gate") into failing checks when the code quietly grows a bypass. Roadmap,
-not yet shipped: semantic search over the code itself ("a helper that writes
-a debug image"), for the case where the agent doesn't know the name of the
-thing it's about to reinvent.
+the concept a strange piece of code belongs to and its full decision chain
+— including whatever alternative was tried and declined — before a
+well-meaning cleanup deletes it. Ask `for-path` (the pre-edit hook does,
+automatically) and an edit to a governed file starts with its concept and
+rulings in view. `drift` turns active decisions with a checkable shape
+("all deletes go through the one gate") into failing checks when the code
+quietly grows a bypass.
+
+The second layer doesn't need anyone to have written a concept record at
+all: `code-reindex` chunks a source tree into functions, inits, and
+computed properties, and `code-search` finds them by what they do — "a
+helper that writes a debug image" — instead of by a name you'd have to
+already know to grep for. A hit that falls inside an authored concept's
+boundary carries that concept's id, so the trail from "code that does
+roughly this" to "the decision that governs it" still closes when one
+exists. This is what lets the `memory-search` skill tell agents to run
+`code-search` before writing a new helper or file — the case a concept
+record alone can't cover, because nobody has to have described this part
+of the codebase yet for the code itself to be searchable.
 
 ## Who this is for
 
 MemContinuum is built for Claude Code workflows where one lead model acts as
 the orchestrator and system engineer: it plans the work, deploys its own
 subagents to write code, and — optionally — consults independent external
-reviewers (for example, Codex or Grok CLIs) as gates and advisors. The
-orchestrator is the memory's only canonical writer. Subagents get the
+reviewers (for example, Codex or Grok CLIs) as gates and advisors. By
+convention, the orchestrator is the memory's canonical writer — this is a
+governance pattern, not an access control the engine enforces: nothing in
+the code stops any other role from editing a topic file directly.
+`install.sh` creates `inbox/{codex,grok,audit}` directories under the store
+precisely so a reviewer proposing a record and the orchestrator writing it
+up stay two different, deliberate steps by habit. Subagents get the
 relevant decision history handed to them automatically before they touch a
-file — they don't have to go looking for it. Reviewers read whatever a brief
-hands them and may propose new records into an inbox for the orchestrator to
-write up; they never write into the store directly.
+file — they don't have to go looking for it. Reviewers read whatever a
+brief hands them and are meant to propose new records into their inbox
+directory for the orchestrator to write up, rather than writing into the
+store directly.
 
 The engine and the store are plain CLI tools and markdown files, so nothing
 here is locked to Claude Code specifically — other agent stacks can adopt the
@@ -135,15 +168,19 @@ already wrong — pick its one home.
 A short walk-through. You (or an agent) are about to edit a file that a past
 decision governs. A hook fires first, looks up that file, and injects the
 relevant chain as context — so the edit happens with the history already in
-view, not after the fact. Later, a natural checkpoint arrives — a compaction,
-a session start, a prompt that sounds like a ruling — and another hook
-reminds the session that this might be worth writing down as a new link in
-the chain. Separately, at any time, you can search by meaning rather than by
-file — "why don't we count hidden files in the total?" — and get back the
-chain that answers it, ranked by a hybrid of full-text and semantic search.
-And when a piece of code looks strange, or you're about to write something
-that feels like it must already exist, `why` walks from the code to its
-concept to the rulings that shaped it — the anti-reinvention direction.
+view, not after the fact. Later, a natural checkpoint arrives — edits
+piling up under no decision topic, or a stretch of turns with no edit at
+all, or a compaction relaying either signal into the session on the other
+side — and another hook reminds the session that this might be worth
+writing down as a new link in the chain. Separately, at any time, you can
+search by meaning rather than by file — "why don't we count hidden files in
+the total?" — and get back the chain that answers it, ranked by a hybrid of
+full-text and semantic search. Before writing something that feels like it
+must already exist, `code-search` finds it by what it does rather than a
+name you'd have to already know — a separate index built by chunking the
+code itself, not the decision chains. And when a piece of code looks
+strange, `why` walks from the code to its concept (where one has been
+authored) to the rulings that shaped it — the anti-reinvention direction.
 
 Everything below this point is the technical reference: requirements,
 installation, the storage model, the CLI, and the schema.
@@ -153,17 +190,27 @@ installation, the storage model, the CLI, and the schema.
 ## Requirements
 
 - macOS or Linux/WSL, `bash` 3.2+, `git`. The hooks need no `flock` or
-  `timeout` binary (macOS ships neither by default) — locking and
-  per-run deadlines are handled inside the python calls the hooks already
-  make, not by shelling out to coreutils, so there is nothing extra to
-  install on either platform. Real-Mac smoke status: pending (the
-  orchestrator runs it separately over ssh).
-- Python 3.10+.
-- A `sqlite3` new enough for FTS5 (≥3.40, via Python's own `sqlite3`
-  module — nothing to install separately).
-- ~100 MB of disk for the embedding model, downloaded once by `fastembed` the
-  first time a vector search actually runs. No network is needed after that;
-  `--no-embed` / `--mode fts` never trigger the download at all.
+  `timeout` binary (macOS ships neither by default): each write-side hook
+  re-execs itself as a child under a small Python watchdog launcher
+  (`hooks/mc-watchdog.sh`) that enforces its own wall-clock deadline (2s;
+  1.2s for `SessionEnd`), and the shared session-state lock is a real
+  Python `fcntl.flock(LOCK_EX)` call inside the same state-update helper —
+  never a shelled-out `flock` binary. Nothing here shells out to
+  coreutils, so there's nothing extra to install on either platform.
+  Real-Mac smoke: **done** — verified on macOS (arm64): 124/124 hook tests
+  pass under stock bash 3.2.57 and Python 3.9.
+- Python 3.10+ for the engine itself (`memidx.py`/`memlint.py`, and any
+  hook subprocess that actually invokes embedding code) — `fastembed`
+  requires it. The hook scripts' own Python snippets stick to the
+  standard library plus `PyYAML`, which is why they were verified above
+  under the older Python macOS ships without needing 3.10 there too.
+- A `sqlite3` build with FTS5, via Python's own `sqlite3` module —
+  nothing to install separately.
+- ~100 MB of disk for the embedding model, downloaded once by `fastembed`
+  the first time anything actually needs to embed something — a `reindex`
+  or `code-reindex` that has new/changed content to embed, or the first
+  `search`/`code-search --mode vector`/`hybrid`. `--no-embed` / `--mode
+  fts` never trigger the download.
 
 If your shell exports a `PYTHONPATH` that shadows the venv's own site-packages
 (e.g. from something a `.bashrc` sets globally), prefix any command below with
@@ -245,8 +292,12 @@ already a git repo.
 **Uninstall.** Remove the hook items whose `command` mentions one of the six script basenames
 above from `settings.local.json` (or restore `settings.local.json.bak-memcontinuum`), delete
 `<claude-dir>/skills/memory-search/`, delete `<store>/.git/hooks/post-commit`, and delete
-`~/.memcontinuum/<project>.sqlite` (or wherever `MEMCONTINUUM_HOME` points). Leave `<store>`
-itself alone — it is the store's own git history, not an installer artifact.
+`~/.memcontinuum/<project>.sqlite` and, if `code-reindex` was ever run against
+this project, `~/.memcontinuum/<project>-code.sqlite` too (or wherever
+`MEMCONTINUUM_HOME` points) — `install.sh`'s own printed next-steps currently
+name only the first of those two db files, not the code-index cache. Leave
+`<store>` itself alone — it is the store's own git history, not an installer
+artifact.
 
 **Deliberate deviations from a literal reading of the brief** (flagged here per the build
 task's "report ambiguities explicitly"):
@@ -276,6 +327,12 @@ similarity over whole-record embeddings (`BAAI/bge-small-en-v1.5` via
 scores and cosine similarities live on incomparable scales. See
 `docs/DESIGN.md` for the reasoning behind this and the engine's other central
 choices (chains over notes, forced retrieval, no auto-capture).
+
+A second, entirely separate SQLite cache — `<project>-code.sqlite`, next to
+`<project>.sqlite` — holds Anatomy's code intent index (`code-reindex`/
+`code-search`, described under `memidx.py` below): its own schema, its own
+`file_sha`-by-content incremental rebuild, its own embeddings, never mixed
+into the decision database.
 
 ## Record shapes
 
@@ -342,13 +399,21 @@ memidx.py for-path FILE_PATH [--project NAME] [--db PATH] [--json]
 memidx.py check --root DIR [--project NAME] [--db PATH] [--json]
 memidx.py why SYMBOL_OR_PATH [--project NAME] [--db PATH] [--code-root DIR] [--json]
 memidx.py drift --code-root DIR [--project NAME] [--db PATH] [--json]
+memidx.py unmapped PATH... --root DIR [--project NAME] [--db PATH] [--code-root DIR] [--json]
+memidx.py code-reindex --code-root DIR [--project NAME] [--db PATH] [--lang LANGS] [--no-embed] [--full]
+memidx.py code-search QUERY [--project NAME] [--db PATH] [--mode fts|vector|hybrid]
+                      [--limit N] [--json] [--decision-db PATH]
 ```
 
 `why` and `drift` are extensions (schema §8) — resolve a symbol/path to the
-concept(s) it belongs to, then that concept's `governed_by` topic chains
-(`why`), or check every active link's checkable `invariant:` against a code
-tree and report drift (`drift`). The rest of this section describes the base
-commands.
+concept(s) it belongs to, then print those concepts' `governed_by` topic
+chains in full — newest first, every link, including any `kind: declined`
+one (`why`; there's no separate "rejected alternative" field, a declined
+link in the chain *is* that record) — or check every active link's
+checkable `invariant:` against a code tree and report drift (`drift`).
+`unmapped` and `code-reindex`/`code-search` are Anatomy's other two
+extensions, described in their own subsection below. The rest of this
+section describes the base commands.
 
 - `--project` defaults to `default`.
 - `--db` overrides the index database path. Without it, the database lives at
@@ -360,9 +425,16 @@ commands.
   removed from the index. `--no-embed` skips embedding entirely (fast, FTS-only
   — used for timing tests and for corpora too big to embed on every run).
 - `search --mode fts` and `--mode vector` never both run; `--mode hybrid`
-  (the default) runs both and fuses ranks with Reciprocal Rank Fusion (`k=60`).
-  Filters (`--status`, `--type`, `--area`, `--topic`, `--authority`) are always
-  ANDed together and applied before ranking.
+  (the default) runs both and fuses ranks with Reciprocal Rank Fusion
+  (`k=60`). Filters (`--status`, `--type`, `--area`, `--topic`,
+  `--authority`) are always ANDed together, but *where* they're applied
+  differs by mode: for plain `fts`/`vector`, the full ranked list is
+  computed first and then filtered down to the allowed set (this can't
+  change which of the allowed records place, since nothing outside that
+  set was ever a real candidate); for `hybrid`, each side's ranked list is
+  filtered to the allowed set *before* Reciprocal Rank Fusion runs, so a
+  filtered-out record can never occupy a rank position that shifts the
+  fused score of one that survives.
 - `chain` prints the compressed chain view: one line per link, newest first,
   each showing its `kind`, its `reverses`/`reason_for_change` when it has one,
   its ruling (quoted when the authority is owner-verbatim/owner-ratified) and
@@ -383,6 +455,46 @@ commands.
   whether content actually changed and needs re-embedding; `check` uses the
   cheaper mtime/size pair so a `touch` alone — no content change — is still
   correctly reported as drift.)
+- `unmapped PATH...` classifies each given path against the current index
+  without walking the code tree: `mapped_topic` (some topic's `code_refs`
+  claims it), `mapped_concept_only` (no topic does, but a concept's
+  `implemented_by`/`tested_by` does), or `unmapped` (neither). Self-healing:
+  if the markdown under `--root` has drifted since the last `reindex`, it
+  reindexes once (`--no-embed`) and rechecks; if drift still can't be
+  resolved, `coverage_status` comes back `"unknown"` and nothing is ever
+  reported as `unmapped` against an index of unknown freshness — a missing
+  match is only trusted once the index is known-current. This is what
+  `userprompt-remind.sh`'s coverage signal calls.
+
+### Anatomy's code index: `code-reindex` / `code-search`
+
+A completely separate SQLite database (`<project>-code.sqlite`, see
+"Storage model" above) holds a chunked intent index over the code itself,
+independent of any authored concept record.
+
+- `code-reindex --code-root DIR` walks the tree (skipping `.git`, `.build`,
+  `vendor`, `node_modules`, `Tests`, `Resources`) and chunks each source
+  file into function/`init`/subscript/computed-property units with a
+  lexer-aware brace walker (handles comments, strings including raw and
+  multiline, string-interpolation closures, and `#if` branches).
+  **Swift is the only language actually chunked today** — `--lang` takes a
+  comma-separated filter (e.g. `swift,ts`), but only `swift` has a chunker
+  behind it; naming any other language there just matches zero files,
+  silently, not an error. Incremental by sha256, same as `reindex`, and it
+  downloads the embedding model on the same terms `reindex` does (see
+  Requirements) unless `--no-embed` is given.
+- `code-search QUERY` runs fts/vector/hybrid search over those chunks —
+  the same RRF fusion as `search`. Each hit optionally carries a
+  `concept_id` when some concept's `implemented_by`/`tested_by` claims
+  that exact symbol (preferred) or its containing file. Concept attachment
+  always reads the *decision* database, never whatever `--db` means for
+  this command (which selects the *code* database) — `--decision-db PATH`
+  overrides which decision database gets consulted for attachment,
+  independent of `--db`. Warns on stderr when the code index looks stale
+  (source under `--code-root` changed since the last `code-reindex`).
+
+The `memory-search` skill has agents run `code-search` before writing a new
+helper — see "How they work together" above.
 
 ### Tolerant parsing
 
@@ -408,13 +520,13 @@ a subprocess-isolated test (`test_for_path_does_not_import_fastembed`).
 memlint.py ROOT [--code-root DIR]
 ```
 
-`--code-root` is a schema §8.4 addition (optional; omit it and `memlint.py
-ROOT` behaves exactly as before) — it enables the concept-path existence
-checks described there.
+`--code-root` is a schema §8.4 addition (optional; omit it and the checks
+that need it are simply skipped) — it enables the concept-path existence
+and symbol-vocabulary checks described below.
 
 Walks `ROOT` for `.md` files, validates every topic-chain file against the
 rules in `docs/SCHEMA.md` §7, and prints one `ERROR:`/`WARNING:` line per
-finding:
+finding. Topic-chain rules:
 
 | rule | severity |
 |---|---|
@@ -425,13 +537,24 @@ finding:
 | a topic in area `processing/*` or `deletion/*` has no `code_refs` | warning |
 | any `status` / `authority` / `kind` value is outside the five/five/five enumerated in the schema | error |
 | an edge's `rel` is not one of the seven enumerated relations (schema §8.1) | error |
-| (with `--code-root`) a concept's `implemented_by`/`tested_by` path doesn't exist under it | error |
-| (with `--code-root`) a concept has no `tested_by` at all | warning |
+
+Concept-record rules (schema §8.4; these apply to `type: concept` files, not topic chains):
+
+| rule | severity |
+|---|---|
+| (with `--code-root`) an `implemented_by`/`tested_by` path doesn't exist under it | error |
+| (with `--code-root`) a `#symbol` fragment doesn't match anything the chunker itself would recognize in that file — reuses `code-reindex`'s own lexer-aware scan directly (funcs, `init`, subscripts, computed vars, backtick-quoted names included), not a separate regex | error |
+| (with `--code-root`) `implemented_by` with no `#symbol` fragment on a file over 400 lines | error (an unqualified claim on a large file is too vague — narrow it to a symbol) |
+| `governed_by` references a topic id not found anywhere in the linted corpus | error (only checked when the corpus has at least one topic record to validate against) |
+| two concepts both claim the same `implemented_by` "path#symbol" | error (corpus-wide; `tested_by` is excluded — sharing a test file across concepts is fine) |
+| a concept has no `tested_by` at all | warning — **unconditional**, fires with or without `--code-root` |
+| a concept's body has no "not this concept" sentence (what it's explicitly *not*) | warning |
 
 Exit code is 1 if any error was found anywhere under `ROOT`; warnings alone
-exit 0. Standalone (non-topic) records are only checked for enum validity on
-whatever `status`/`authority` fields they happen to carry — the other rules
-are about link chains and don't apply to them.
+exit 0. Standalone (non-topic, non-concept) records are only checked for
+enum validity on whatever `status`/`authority` fields they happen to
+carry — the other rules are about link chains or concepts and don't apply
+to them.
 
 **Deliberately not implemented:** "a link edited after being recorded (hash
 mismatch vs git) → reject" — see `docs/SCHEMA.md` §7 for why this belongs at
@@ -443,23 +566,34 @@ Six hook scripts under `hooks/`, wired into a project's `.claude/settings.local.
 by `install.sh`. All of them fail open (never block an edit, never block a commit
 on a missing python or a lookup failure) and log one line per run to
 `$MEMCONTINUUM_HOME/hook.log`. `hooks/memlib.sh` is the shared implementation
-the five write-side hooks source; `hooks/install-hooks.md` documents the exact
-wiring each one gets.
+the five write-side hooks source; `hooks/mc-watchdog.sh` is a second shared
+file, sourced by those same five hooks *before* `memlib.sh`, providing the
+wall-clock watchdog described below. `hooks/install-hooks.md` documents the
+exact wiring each one gets.
 
 | script | event | does |
 |---|---|---|
 | `pre-edit-chain.sh` | `PreToolUse` (Edit/Write, filtered to `--code-root`) | looks up the file being edited via `for-path`, injects the matching chain(s) as `additionalContext` |
-| `ledger-post-edit.sh` | `PostToolUse` | appends the edit to a per-session ledger, scoped to `--code-root` |
+| `ledger-post-edit.sh` | `PostToolUse` | appends the edit to a per-session ledger, scoped to `--code-root` and the store root |
 | `precompact-persist.sh` | `PreCompact` | persists session state before context is compacted away |
-| `sessionstart-remind.sh` | `SessionStart` | reminds a fresh session that a store exists and how to query it |
-| `userprompt-remind.sh` | `UserPromptSubmit` | on a prompt that looks like a ruling, reminds the session to record it |
+| `sessionstart-remind.sh` | `SessionStart` | on `startup`/`resume`, only initializes session state (captures the code/store roots' current git HEAD, prunes state older than 24h) — no output; only on `source: compact` does it inject whatever `precompact-persist.sh` left pending |
+| `userprompt-remind.sh` | `UserPromptSubmit` | never reads the prompt text itself — fires a *coverage* nudge when edited files carry no decision topic and the ledger has grown since the last nudge (past a cooldown), or a *look-back* nudge when several user turns or tens of minutes have passed with no ledger growth |
 | `sessionend-stamp.sh` | `SessionEnd` | stamps session end into state |
 | `post-commit-reindex.sh` | store's own git `post-commit` (not a Claude Code hook) | reindexes the store after every commit to it |
 
 Session state lives at `$MEMCONTINUUM_HOME/sessions/<project>/<id>.json`,
-lock-guarded (`flock`, 2s timeout) and updated by atomic rename; the write-side
-hooks' only writable surface is that directory plus `hook.log` — never the
-store or the code root.
+updated by atomic rename (`os.replace`) and guarded by a real file lock — a
+Python `fcntl.flock(LOCK_EX)` call (retried up to 2s) inside the same
+state-update helper in `memlib.sh`, never a shelled-out `flock` binary; the
+write-side hooks' only writable surface is that directory plus `hook.log`
+— never the store or the code root.
+
+Every write-side hook (the five above other than `pre-edit-chain.sh`) runs
+under its own wall-clock watchdog: it re-execs itself as a child under a
+small Python launcher (`hooks/mc-watchdog.sh`) that kills the whole child
+process group once a budget expires — 2 seconds by default, 1.2 seconds
+for `sessionend-stamp.sh`. `pre-edit-chain.sh` and `post-commit-reindex.sh`
+have no watchdog of their own.
 
 ## Design choices worth knowing
 
@@ -513,20 +647,30 @@ All tests create their own temp directories and pass an explicit `--db`
 spawn a real subprocess per hook invocation; the vector/hybrid tests add one
 warm load of the `bge-small-en-v1.5` embedding model on top of that).
 
-`fixtures/records/incidents/` (gitignored, not part of this repo) is where a
-project's own real incident notes can be dropped in locally to re-run the
-paraphrase-retrieval regression test against real data; every fixture
+`fixtures/records/incidents/` and `fixtures/records/queries.json` (both
+gitignored, not part of this repo) are where a project's own real incident
+notes and paraphrase-query expectations can be dropped in locally to
+re-run the retrieval-quality tests against real data; every fixture
 actually **tracked** in this repo is synthetic — invented dates, invented
-rulings, a fictional example app — never a real project's decision history.
-The tests that read that directory (`test_memidx.py`'s D1/D2/D5) don't skip
-gracefully on a fresh clone with nothing dropped in; they fail (weak or empty
-results) on the missing data instead. This is a pre-existing property of
-those tests, not something this pass changed. D8's timing test is the
-exception: it additionally needs its own `$MEMCONTINUUM_TEST_SANDBOX_SYNTH`
-directory of synthetic markdown for a fixed file-count assertion, and does
-skip cleanly without that variable set.
+rulings, a fictional example app — never a real project's decision
+history. `test_memidx.py`'s D1 and D2 build their corpus from
+`incidents/` and don't skip gracefully on a fresh clone with nothing
+dropped in: with the directory empty, their assertions that a query
+returns *something* fail rather than skip. D5 is the exception, not the
+rule: it reads `queries.json` specifically and calls `self.skipTest(...)`
+when that file is absent, so it skips cleanly rather than failing. This
+split — D1/D2 fail, D5 skips — is a pre-existing property of those tests,
+not something this pass changed. D8's timing test also skips cleanly: it
+needs its own `$MEMCONTINUUM_TEST_SANDBOX_SYNTH` directory of synthetic
+markdown for a fixed file-count assertion, and skips without that
+variable set.
 See `fixtures/payloads/README.md` for the same guarantee about the hook
-payload fixtures specifically.
+payload fixtures specifically. `scripts/codanna-bench.sh` is a further
+exception to "everything test-related stays inside a temp dir" worth
+knowing about, even though it's a manual benchmark script (comparing
+`code-search` against the Codanna tool), not part of the test suite: it
+caches a downloaded/built Codanna binary under `~/.cache/codanna-bench`
+across runs, rather than a temp directory.
 
 ## Acknowledgements & prior art
 
