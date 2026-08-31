@@ -2843,6 +2843,33 @@ class TestNewFileNudgeHook(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), "", proc.stdout)
 
+    def test_silent_for_a_dot_dot_traversal_path(self):
+        # MEDIUM (2026-08-31 review): the under-root check used to be a
+        # plain lexical `case "$FILE_PATH" in "$CODE_ROOT"/*` prefix match
+        # -- `<code_root>/../outside/x.swift` starts with the code-root
+        # string textually while actually resolving to a sibling
+        # directory OUTSIDE it. Must stay silent.
+        outside_sibling = Path(self.td) / "outside"
+        outside_sibling.mkdir()
+        traversal = f"{self.code_root}/../outside/NewThing.swift"
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(traversal), self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "", proc.stdout)
+
+    def test_silent_for_a_symlinked_parent_escaping_the_code_root(self):
+        # A path that is lexically under the code root at every segment,
+        # but whose nearest EXISTING ancestor directory is actually a
+        # symlink pointing outside it -- must resolve the real path before
+        # judging containment, not trust the string.
+        real_outside = Path(self.td) / "real-outside"
+        real_outside.mkdir()
+        escape_link = self.code_root / "escape-link"
+        escape_link.symlink_to(real_outside, target_is_directory=True)
+        target = escape_link / "NewThing.swift"
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "", proc.stdout)
+
     def test_silent_for_a_broken_symlink(self):
         # `-e` is false for a broken symlink -- `-L` must be checked too,
         # or a broken symlink would be misread as "a brand-new file".

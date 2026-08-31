@@ -356,6 +356,33 @@ class DbProjectMismatchError(RuntimeError):
     opened for now."""
 
 
+#: tables carrying a `project` column, inspected by _distinct_legacy_projects
+#: below when a db has rows but no db_meta stamp yet (a real pre-Finding-2
+#: db, or one whose db_meta row was lost) -- records is the primary/always-
+#: populated one; the rest are unioned in for belt-and-suspenders coverage
+#: since a partial/hand-edited legacy db could in principle have rows in one
+#: without the other.
+_PROJECT_SCOPED_TABLES = (
+    "records", "links", "embeddings", "edges", "assumptions",
+    "concepts", "concept_paths",
+)
+
+
+def _distinct_legacy_projects(conn: sqlite3.Connection) -> set[str]:
+    """DISTINCT non-null `project` values found across every project-scoped
+    table -- used only to figure out who ALREADY owns a db that has no
+    db_meta stamp yet. A table missing entirely (schema drift on some very
+    old db) is treated as contributing nothing, not as an error."""
+    found: set[str] = set()
+    for table in _PROJECT_SCOPED_TABLES:
+        try:
+            rows = conn.execute(f"SELECT DISTINCT project FROM {table}").fetchall()
+        except sqlite3.OperationalError:
+            continue
+        found.update(row[0] for row in rows if row[0] is not None)
+    return found
+
+
 def enforce_project_isolation(conn: sqlite3.Connection, db_path: Path, project: str) -> None:
     """Finding 2 (MEDIUM, same-file --db project isolation): several
     tables here (records/embeddings/concepts/links) key rows by `path`
@@ -369,9 +396,30 @@ def enforce_project_isolation(conn: sqlite3.Connection, db_path: Path, project: 
     a same-file, different-project open is a named error, never a silent
     cross-project eviction/overwrite. Only enforced when `project` is
     given (open_db's default `project=None` skips this entirely, e.g. for
-    tests/tools that just want to inspect a db file directly)."""
+    tests/tools that just want to inspect a db file directly).
+
+    HIGH (2026-08-31 review): a db can have rows but no db_meta stamp for a
+    reason other than "brand new, zero data" -- it can be a real db built
+    by a memidx.py version that predates db_meta ever being stamped (or one
+    whose db_meta row was lost some other way). Blindly INSERTing the
+    *requested* project as owner in that case would silently rewrite
+    ownership to whatever the caller happened to pass, on exactly the kind
+    of db this guard exists to protect. So an unstamped db is only ever
+    stamped automatically when the existing data agrees it's safe: no rows
+    at all (genuinely new), or rows for exactly one project and it's the
+    one being requested. Any other case -- rows for one DIFFERENT project,
+    or rows spanning several -- refuses instead of guessing."""
     row = conn.execute("SELECT value FROM db_meta WHERE key='project'").fetchone()
     if row is None:
+        found = _distinct_legacy_projects(conn)
+        if found and found != {project}:
+            found_desc = ", ".join(repr(p) for p in sorted(found))
+            raise DbProjectMismatchError(
+                f"{db_path} has no db_meta project stamp yet, but already has rows for "
+                f"{found_desc} -- refusing to guess ownership by stamping it for {project!r}. "
+                f"Re-open it with --project matching the project found above (whichever one "
+                f"actually owns this data), or start a fresh --db file for {project!r}."
+            )
         conn.execute("INSERT INTO db_meta (key, value) VALUES ('project', ?)", (project,))
         conn.commit()
         return

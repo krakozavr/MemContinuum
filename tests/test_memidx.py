@@ -155,6 +155,90 @@ class TestD2ProjectIsolation(unittest.TestCase):
             self.assertTrue(results)
 
 
+class TestD2LegacyDbMigrationSafety(unittest.TestCase):
+    """HIGH (2026-08-31 review): enforce_project_isolation's `row is None`
+    branch (no db_meta row yet) used to blindly INSERT the *requested*
+    project as owner -- fine for a genuinely empty new db, but wrong for a
+    real pre-Finding-2 db that already has rows: it would silently rewrite
+    ownership to whatever --project the caller happened to pass, defeating
+    the whole point of the isolation guard on exactly the db that needs it
+    most (an old db that predates db_meta ever being stamped).
+
+    Fix: when db_meta has no project row, inspect DISTINCT project values
+    already present in the data tables (records, at minimum). Zero rows ->
+    genuinely empty, stamp the requested project. Exactly one distinct
+    project and it matches the request -> stamp it (this IS that project's
+    db, just never stamped). Otherwise (one DIFFERENT project, or several)
+    -> refuse with a named error, do not guess."""
+
+    def _legacy_db_with_rows(self, db_path, *projects):
+        # Simulate a pre-db_meta db file: open once with project=None so
+        # the schema (including the db_meta table itself) exists but is
+        # never stamped, then insert rows directly as an older memidx.py
+        # (pre-Finding-2) would have -- one row per project given.
+        conn = memidx.open_db(db_path, project=None)
+        for i, proj in enumerate(projects):
+            conn.execute(
+                "INSERT INTO records (path, sha256, mtime, size, project, type, id, "
+                "title, area, topic, status, authority, tags, code_refs, body, "
+                "ruling_text) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (f"fake/path-{i}.md", "deadbeef", 0.0, 0, proj, "incident",
+                 f"id-{i}", "title", None, None, None, None, "", "", "", ""),
+            )
+        conn.commit()
+        conn.close()
+        self.assertIsNone(
+            memidx.sqlite3.connect(str(db_path)).execute(
+                "SELECT value FROM db_meta WHERE key='project'"
+            ).fetchone(),
+            "test setup bug: db_meta must genuinely have no project row yet",
+        )
+
+    def test_legacy_db_with_rows_of_project_a_opened_as_b_is_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "legacy.sqlite"
+            self._legacy_db_with_rows(db, "project-a")
+            with self.assertRaises(memidx.DbProjectMismatchError) as ctx:
+                memidx.open_db(db, project="project-b")
+            self.assertIn("project-a", str(ctx.exception))
+            self.assertIn("project-b", str(ctx.exception))
+            # and it must NOT have stamped db_meta on the way to refusing
+            conn = memidx.sqlite3.connect(str(db))
+            conn.row_factory = memidx.sqlite3.Row
+            row = conn.execute("SELECT value FROM db_meta WHERE key='project'").fetchone()
+            conn.close()
+            self.assertIsNone(row, "a refused open must not stamp db_meta")
+
+    def test_legacy_db_with_rows_of_project_a_opened_as_a_is_stamped_and_works(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "legacy.sqlite"
+            self._legacy_db_with_rows(db, "project-a")
+            conn = memidx.open_db(db, project="project-a")  # must not raise
+            row = conn.execute("SELECT value FROM db_meta WHERE key='project'").fetchone()
+            self.assertEqual(row["value"], "project-a")
+            conn.close()
+            memidx.open_db(db, project="project-a").close()  # reopen still fine
+
+    def test_empty_legacy_db_is_stamped_with_requested_project(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "legacy.sqlite"
+            memidx.open_db(db, project=None).close()  # schema only, zero rows
+            conn = memidx.open_db(db, project="project-c")  # must not raise
+            row = conn.execute("SELECT value FROM db_meta WHERE key='project'").fetchone()
+            self.assertEqual(row["value"], "project-c")
+            conn.close()
+
+    def test_legacy_db_with_rows_of_several_projects_is_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "legacy.sqlite"
+            self._legacy_db_with_rows(db, "project-a", "project-x")
+            with self.assertRaises(memidx.DbProjectMismatchError) as ctx:
+                memidx.open_db(db, project="project-a")
+            msg = str(ctx.exception)
+            self.assertIn("project-a", msg)
+            self.assertIn("project-x", msg)
+
+
 class TestOpenDbProjectIsolationDirect(unittest.TestCase):
     """Finding 2, direct-API coverage of open_db/enforce_project_isolation
     (not routed through a full reindex)."""

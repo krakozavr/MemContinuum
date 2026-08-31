@@ -126,8 +126,49 @@ if [ -z "$CODE_ROOT" ]; then
     finish "no-code-root-configured"
 fi
 
+# A plain lexical `case "$FILE_PATH" in "$CODE_ROOT"/*` prefix match (the
+# original check here) is not enough to prove containment: it is fooled
+# both by a literal `/../` traversal segment (which is textually "under"
+# the root string while resolving to a sibling of it) and by a symlinked
+# ancestor directory (every path segment textually under the root, but
+# the real directory it names lives elsewhere). MEDIUM (2026-08-31
+# review), fixed bash-3.2-safe with no external binaries beyond what this
+# hook already uses:
+#   1. reject any literal `/../` traversal segment (or a leading `../`)
+#      outright, purely as a string -- a syntactic red flag regardless of
+#      what it would resolve to.
+#   2. canonicalize CODE_ROOT and the nearest EXISTING ancestor directory
+#      of FILE_PATH (walking up via dirname -- FILE_PATH itself was
+#      already confirmed not to exist above) via `cd ... && pwd -P`,
+#      which resolves symlinks, and require that ancestor to sit under
+#      the canonicalized root. Both `cd`+`pwd -P` and `dirname` are
+#      already-used builtins/coreutils elsewhere in this hook family, so
+#      this adds nothing new to the p95 budget beyond a handful of cheap
+#      filesystem stats.
 case "$FILE_PATH" in
-    "${CODE_ROOT%/}"/*) ;;
+    */../*|*/..|../*|..) finish "path-traversal" ;;
+esac
+
+CODE_ROOT_REAL="$(cd "$CODE_ROOT" 2>/dev/null && pwd -P)"
+if [ -z "$CODE_ROOT_REAL" ]; then
+    finish "code-root-unresolvable"
+fi
+
+ANCESTOR="$FILE_PATH"
+while [ ! -d "$ANCESTOR" ]; do
+    NEXT="$(dirname "$ANCESTOR")"
+    if [ "$NEXT" = "$ANCESTOR" ]; then
+        finish "no-existing-ancestor"
+    fi
+    ANCESTOR="$NEXT"
+done
+ANCESTOR_REAL="$(cd "$ANCESTOR" 2>/dev/null && pwd -P)"
+if [ -z "$ANCESTOR_REAL" ]; then
+    finish "ancestor-unresolvable"
+fi
+
+case "$ANCESTOR_REAL" in
+    "$CODE_ROOT_REAL"|"$CODE_ROOT_REAL"/*) ;;
     *) finish "outside-code-root" ;;
 esac
 

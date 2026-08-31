@@ -618,12 +618,14 @@ the point where a canonical store's commits are made, not inside the linter.
 
 Seven hook scripts under `hooks/`, wired into a project's `.claude/settings.local.json`
 by `install.sh`. All of them fail open (never block an edit, never block a commit
-on a missing python or a lookup failure) and log one line per run to
-`$MEMCONTINUUM_HOME/hook.log` — including on a watchdog kill at budget
-expiry: the guarded hook can't write its own outcome line then (it may be
-mid-call, or never got that far), so `mc-watchdog.sh` itself writes
+on a missing python or a lookup failure) and log one OUTCOME line per run
+to `$MEMCONTINUUM_HOME/hook.log` (diagnostic lines may precede it, e.g.
+`pre-edit-chain.sh`'s missing-python note before its own `outcome=...`
+line) — including on a watchdog kill at budget expiry: the guarded hook
+can't write its own outcome line then (it may be mid-call, or never got
+that far), so `mc-watchdog.sh` itself writes
 `outcome=watchdog-killed hook=<name>` before exiting, and a budget-expiry
-kill still leaves its one line. `hooks/memlib.sh` is the shared implementation the five
+kill still leaves its one outcome line. `hooks/memlib.sh` is the shared implementation the five
 write-side hooks source; `hooks/mc-watchdog.sh` is a second shared file,
 sourced by those same five hooks plus `newfile-nudge.sh` *before*
 `memlib.sh`/its own logic, providing the wall-clock watchdog described
