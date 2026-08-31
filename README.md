@@ -178,9 +178,14 @@ the total?" — and get back the chain that answers it, ranked by a hybrid of
 full-text and semantic search. Before writing something that feels like it
 must already exist, `code-search` finds it by what it does rather than a
 name you'd have to already know — a separate index built by chunking the
-code itself, not the decision chains. And when a piece of code looks
-strange, `why` walks from the code to its concept (where one has been
-authored) to the rulings that shaped it — the anti-reinvention direction.
+code itself, not the decision chains. Creating a brand-new source file gets
+the same nudge automatically: a hook fires the moment you write to a path
+that doesn't exist yet, reminding you to check the code index first — the
+anti-reinvention trigger, aimed at the one moment a duplicate helper is
+most likely to get written instead of found. And when a piece of code
+looks strange, `why` walks from the code to its concept (where one has
+been authored) to the rulings that shaped it — the anti-reinvention
+direction.
 
 Everything below this point is the technical reference: requirements,
 installation, the storage model, the CLI, and the schema.
@@ -195,10 +200,17 @@ installation, the storage model, the CLI, and the schema.
   (`hooks/mc-watchdog.sh`) that enforces its own wall-clock deadline (2s;
   1.2s for `SessionEnd`), and the shared session-state lock is a real
   Python `fcntl.flock(LOCK_EX)` call inside the same state-update helper —
-  never a shelled-out `flock` binary. Nothing here shells out to
-  coreutils, so there's nothing extra to install on either platform.
-  Real-Mac smoke: **done** — verified on macOS (arm64): 124/124 hook tests
-  pass under stock bash 3.2.57 and Python 3.9.
+  never a shelled-out `flock` binary. What's avoided is specifically those
+  two GNU-only binaries macOS doesn't ship by default — ordinary coreutils
+  (`cat`, `dirname`, `date`, `mkdir`, and the like) are used throughout the
+  hooks and installer and are fine on both platforms, so there's nothing
+  extra to install either way.
+  Real-Mac smoke: **done** at the port commit — verified on macOS (arm64):
+  124/124 hook tests passed under stock bash 3.2.57 and Python 3.9 at that
+  point. The hook suites have grown since (140 tests as of this commit,
+  `test_hooks.py` + `test_write_hooks.py` combined) and stay green under
+  the same bash-3.2 harness (`tests/run_bash32.sh`), verified on this
+  machine; they haven't been re-run on a real Mac since the port commit.
 - Python 3.10+ for the engine itself (`memidx.py`/`memlint.py`, and any
   hook subprocess that actually invokes embedding code) — `fastembed`
   requires it. The hook scripts' own Python snippets stick to the
@@ -232,13 +244,16 @@ Claude Code. `--project` and `--store` are the only required flags.
   index db's filename (`<NAME>.sqlite`). Must not contain `/`.
 - `--store DIR` — the markdown store root to create (or adopt, if `DIR` already exists as its
   own git repo).
-- `--code-root DIR` — a code checkout the PreToolUse retrieval hook should watch for Edit/Write,
-  and the write-side hooks should scope the edit ledger to. Repeatable. Omit entirely for a
-  rationale-only install with no associated code tree (no PreToolUse hook is wired in that
-  case). The five write-side hooks only support **one** `MEMCONTINUUM_CODE_ROOT` each (that is
-  a limitation of `hooks/memlib.sh`, not of this installer) — with multiple `--code-root`s the
-  first one given is what they get; every `--code-root` still gets its own PreToolUse
-  `if`-filtered pair (`Edit(DIR/**)` / `Write(DIR/**)`).
+- `--code-root DIR` — a code checkout the two PreToolUse hooks (`pre-edit-chain.sh`,
+  `newfile-nudge.sh`) should watch, and the write-side hooks should scope the edit ledger to.
+  Repeatable. Omit entirely for a rationale-only install with no associated code tree (neither
+  PreToolUse hook is wired in that case — both are gated on there being at least one
+  `--code-root`). The five write-side hooks only support **one** `MEMCONTINUUM_CODE_ROOT` each
+  (that is a limitation of `hooks/memlib.sh`, not of this installer) — with multiple
+  `--code-root`s the first one given is what they get. The two PreToolUse hooks don't share that
+  limitation: every `--code-root` gets its own correctly-scoped `if`-filtered entry in each —
+  `pre-edit-chain.sh` an `Edit(DIR/**)` / `Write(DIR/**)` pair, `newfile-nudge.sh` a
+  `Write(DIR/**)` entry with its own `MEMCONTINUUM_CODE_ROOT` set to that specific `DIR`.
 - `--claude-dir DIR` — where to merge hook wiring and install the skill. Defaults to
   `<dirname of --store>/.claude`.
 - `--python PATH` — absolute path to the python to run the engine with. Overrides every other
@@ -251,12 +266,17 @@ Claude Code. `--project` and `--store` are the only required flags.
 - `--dry-run` — print the full plan (every path, every hook command line, the exact reindex/lint
   commands) and write nothing at all: no directories, no git init, no settings file, no backup,
   no skill copy, no index db (`--bootstrap-venv`'s venv is the one exception — see above).
-- `--force` — allow `--store` to sit inside another git repo's already-tracked working tree
-  (normally refused, so a store never gets silently absorbed into an unrelated repo's history).
+- `--force` — allow `--store` to be created at any location that falls inside another git
+  repo's working tree (normally refused, so a store never gets silently absorbed into an
+  unrelated repo's history). The check is by location, not by tracked content: it walks up from
+  `--store` to the nearest already-existing ancestor directory and refuses if *that* is inside
+  any git working tree at all — whether or not anything at the `--store` path itself is tracked,
+  committed, or even exists yet. It's skipped entirely when `--store` is already its own git
+  repo (the normal re-run/adopt case) — `--force` only ever matters the first time.
 
 **Python resolution**, when neither `--python` nor `--bootstrap-venv` is given:
 `$MEMCONTINUUM_PYTHON` (env) → `<this checkout>/.venv/bin/python` → a clear error naming
-`--bootstrap-venv`. The five write-side hooks and the PreToolUse retrieval hook resolve their own
+`--bootstrap-venv`. The five write-side hooks and the two PreToolUse hooks resolve their own
 python the same way at runtime (`$MEMCONTINUUM_PYTHON` → `<engine>/.venv/bin/python`), except
 they never hard-error — every hook fails open (logs the problem, changes nothing, never blocks
 an edit or a commit) rather than blocking on a missing python.
@@ -278,10 +298,10 @@ DIR --project NAME --no-embed` (see "Design choices" below) and `memlint.py DIR`
 verification summary plus next steps.
 
 **Idempotency.** Re-running with the same `--project`/`--store`/`--claude-dir` is safe: the
-merge step identifies "its own" hook entries by the six script basenames
-(`pre-edit-chain.sh`, `ledger-post-edit.sh`, `precompact-persist.sh`, `sessionstart-remind.sh`,
-`userprompt-remind.sh`, `sessionend-stamp.sh`) appearing in a hook item's `command`, drops only
-those items (per item, not per group — a foreign hook sharing a matcher group with one of ours
+merge step identifies "its own" hook entries by the seven script basenames
+(`pre-edit-chain.sh`, `newfile-nudge.sh`, `ledger-post-edit.sh`, `precompact-persist.sh`,
+`sessionstart-remind.sh`, `userprompt-remind.sh`, `sessionend-stamp.sh`) appearing in a hook
+item's `command`, drops only those items (per item, not per group — a foreign hook sharing a matcher group with one of ours
 survives), removes any group left empty, and appends freshly rendered groups. Every other
 top-level key in `settings.local.json` (`permissions`, unrelated hooks, …) is left untouched.
 `settings.local.json` is backed up to `settings.local.json.bak-memcontinuum` before every write
@@ -289,7 +309,7 @@ that touches an existing file. Store tree creation, the README/`.gitignore` rend
 skill copy are all overwrite-safe; `git init`/the initial commit are skipped once `--store` is
 already a git repo.
 
-**Uninstall.** Remove the hook items whose `command` mentions one of the six script basenames
+**Uninstall.** Remove the hook items whose `command` mentions one of the seven script basenames
 above from `settings.local.json` (or restore `settings.local.json.bak-memcontinuum`), delete
 `<claude-dir>/skills/memory-search/`, delete `<store>/.git/hooks/post-commit`, and delete
 `~/.memcontinuum/<project>.sqlite` and, if `code-reindex` was ever run against
@@ -311,7 +331,7 @@ task's "report ambiguities explicitly"):
   creates" above for why a bare symlink can't work here.
 - `--force` is documented above but wasn't in an earlier one-line usage signature this project
   worked from; it's the necessary escape hatch for the "store dir inside another git repo's
-  tracked tree" refusal.
+  working tree" refusal.
 
 See `hooks/install-hooks.md` for what each generated hook line actually does at runtime, and
 `templates/` for the generalised JSON/Markdown templates this command renders
@@ -331,8 +351,20 @@ choices (chains over notes, forced retrieval, no auto-capture).
 A second, entirely separate SQLite cache — `<project>-code.sqlite`, next to
 `<project>.sqlite` — holds Anatomy's code intent index (`code-reindex`/
 `code-search`, described under `memidx.py` below): its own schema, its own
-`file_sha`-by-content incremental rebuild, its own embeddings, never mixed
-into the decision database.
+`file_sha`-by-content incremental rebuild, its own embeddings, kept in a
+separate physical file *by default*. Nothing enforces that split as a hard
+rule, though: `--db` (code) and `--decision-db` (decision, on `code-search`)
+are independent flags and could be pointed at the same file on purpose.
+What actually is guarded is narrower and lives on the decision-db side only
+(`open_db`'s `db_meta` table): the first
+time a physical db file is opened for a given `--project`, that project is
+recorded as its owner in `db_meta`; opening the *same file* later under a
+**different** `--project` is refused outright (`DbProjectMismatchError`)
+rather than silently mixing that other project's rows in. A same-project
+open of the same file is still allowed, and `code-search`'s own db
+(`open_code_db`) carries no equivalent `db_meta` check at all — so pointing
+`--db` and `--decision-db` at one file for the same project is possible and
+would leave the two schemas coexisting in it.
 
 ## Record shapes
 
@@ -410,7 +442,17 @@ concept(s) it belongs to, then print those concepts' `governed_by` topic
 chains in full — newest first, every link, including any `kind: declined`
 one (`why`; there's no separate "rejected alternative" field, a declined
 link in the chain *is* that record) — or check every active link's
-checkable `invariant:` against a code tree and report drift (`drift`).
+checkable `invariant:` against a code tree and report drift (`drift`). A
+bare symbol passed to `why` (as opposed to a `path`, detected by the
+presence of `/`) resolves to its defining file via the same lexer-aware
+scan `code-search`'s chunker and `memlint`'s symbol-vocabulary check
+already agree on — functions, `init`, subscripts, computed properties,
+operators, and backtick-quoted names, including container keywords like
+`actor`/`protocol`/`extension`, not the older from-scratch regex that
+missed most of those. It tries the code index first (fast, when `--project`
+resolves one) and always falls back to scanning `--code-root` directly if
+that misses, so a missing or stale code index never regresses a resolution
+the direct scan can still make.
 `unmapped` and `code-reindex`/`code-search` are Anatomy's other two
 extensions, described in their own subsection below. The rest of this
 section describes the base commands.
@@ -490,8 +532,20 @@ independent of any authored concept record.
   always reads the *decision* database, never whatever `--db` means for
   this command (which selects the *code* database) — `--decision-db PATH`
   overrides which decision database gets consulted for attachment,
-  independent of `--db`. Warns on stderr when the code index looks stale
-  (source under `--code-root` changed since the last `code-reindex`).
+  independent of `--db`. Every call resolves one of three index-provenance
+  states first and says which, rather than ever collapsing "no code index
+  yet" into a bare empty result: **uninitialized** (`code-reindex` was
+  never run for this project — refuses outright, exit 1, an error on
+  stderr, and `results` comes back `[]` in `--json` too, since an empty
+  list here would otherwise read as a real "nothing found"), **stale**
+  (source under `--code-root` changed since the last `code-reindex` — a
+  warning on stderr, search still runs), or **current**. `--json` wraps
+  the hits in an envelope rather than a bare list so a caller can tell
+  these apart without a separate call: `{"state", "code_root",
+  "indexed_at", "head_sha", "results"}`. A "nothing found" is only real
+  evidence when `state` is `current` (or `stale` with eyes open) — the
+  `memory-search` skill tells agents to confirm that before reporting
+  "none".
 
 The `memory-search` skill has agents run `code-search` before writing a new
 helper — see "How they work together" above.
@@ -562,18 +616,23 @@ the point where a canonical store's commits are made, not inside the linter.
 
 ## Hooks
 
-Six hook scripts under `hooks/`, wired into a project's `.claude/settings.local.json`
+Seven hook scripts under `hooks/`, wired into a project's `.claude/settings.local.json`
 by `install.sh`. All of them fail open (never block an edit, never block a commit
 on a missing python or a lookup failure) and log one line per run to
-`$MEMCONTINUUM_HOME/hook.log`. `hooks/memlib.sh` is the shared implementation
-the five write-side hooks source; `hooks/mc-watchdog.sh` is a second shared
-file, sourced by those same five hooks *before* `memlib.sh`, providing the
-wall-clock watchdog described below. `hooks/install-hooks.md` documents the
-exact wiring each one gets.
+`$MEMCONTINUUM_HOME/hook.log` — including on a watchdog kill at budget
+expiry: the guarded hook can't write its own outcome line then (it may be
+mid-call, or never got that far), so `mc-watchdog.sh` itself writes
+`outcome=watchdog-killed hook=<name>` before exiting, and a budget-expiry
+kill still leaves its one line. `hooks/memlib.sh` is the shared implementation the five
+write-side hooks source; `hooks/mc-watchdog.sh` is a second shared file,
+sourced by those same five hooks plus `newfile-nudge.sh` *before*
+`memlib.sh`/its own logic, providing the wall-clock watchdog described
+below. `hooks/install-hooks.md` documents the exact wiring each one gets.
 
 | script | event | does |
 |---|---|---|
 | `pre-edit-chain.sh` | `PreToolUse` (Edit/Write, filtered to `--code-root`) | looks up the file being edited via `for-path`, injects the matching chain(s) as `additionalContext` |
+| `newfile-nudge.sh` | `PreToolUse` (Write only, filtered to `--code-root`) | fires only when the write target does not exist yet (never on an edit to an existing file) and has an indexed source extension (`.swift` today); injects one reminder to check the code index before writing; never blocks; ~56ms p95 latency; runs under the shared watchdog |
 | `ledger-post-edit.sh` | `PostToolUse` | appends the edit to a per-session ledger, scoped to `--code-root` and the store root |
 | `precompact-persist.sh` | `PreCompact` | persists session state before context is compacted away |
 | `sessionstart-remind.sh` | `SessionStart` | on `startup`/`resume`, only initializes session state (captures the code/store roots' current git HEAD, prunes state older than 24h) — no output; only on `source: compact` does it inject whatever `precompact-persist.sh` left pending |
@@ -585,15 +644,22 @@ Session state lives at `$MEMCONTINUUM_HOME/sessions/<project>/<id>.json`,
 updated by atomic rename (`os.replace`) and guarded by a real file lock — a
 Python `fcntl.flock(LOCK_EX)` call (retried up to 2s) inside the same
 state-update helper in `memlib.sh`, never a shelled-out `flock` binary; the
-write-side hooks' only writable surface is that directory plus `hook.log`
-— never the store or the code root.
+write-side hooks' writable surface is that directory plus `hook.log` —
+never the store or the code root — with one exception: `userprompt-remind.sh`'s
+coverage check calls `memidx.py unmapped`, which self-heals a drifted
+decision index by running `reindex --no-embed` when it detects the
+markdown store has changed since the last reindex, writing to the
+decision index's own SQLite cache (`$MEMCONTINUUM_HOME/<project>.sqlite`)
+when that happens.
 
-Every write-side hook (the five above other than `pre-edit-chain.sh`) runs
-under its own wall-clock watchdog: it re-execs itself as a child under a
-small Python launcher (`hooks/mc-watchdog.sh`) that kills the whole child
-process group once a budget expires — 2 seconds by default, 1.2 seconds
-for `sessionend-stamp.sh`. `pre-edit-chain.sh` and `post-commit-reindex.sh`
-have no watchdog of their own.
+Every hook here except `pre-edit-chain.sh` and `post-commit-reindex.sh`
+runs under its own wall-clock watchdog — the five write-side hooks above
+plus `newfile-nudge.sh` (which has no write-side state of its own but
+shares the same guard, per its own header comment, rather than a second
+bespoke timeout story for the one hook that happens to be fast): each
+re-execs itself as a child under a small Python launcher
+(`hooks/mc-watchdog.sh`) that kills the whole child process group once a
+budget expires — 2 seconds by default, 1.2 seconds for `sessionend-stamp.sh`.
 
 ## Design choices worth knowing
 
@@ -640,9 +706,10 @@ reject bash-4/5-only syntax the way an old interpreter does. Every hook
 subprocess call in both test files goes through `$MC_BASH` (defaults to
 `bash`), so this is the same test suite, just under a different shell.
 
-All tests create their own temp directories and pass an explicit `--db`
-(or set `MEMCONTINUUM_HOME`), so nothing here ever touches a real
-`~/.memcontinuum/` index. The full suite takes about a minute once
+Nearly all tests create their own temp directories and pass an explicit
+`--db` (or set `MEMCONTINUUM_HOME`), so nothing here ever touches a real
+`~/.memcontinuum/` index — the one exception is the gated real-corpus test
+described below, off by default. The full suite takes about a minute once
 `$MEMCONTINUUM_PYTHON` is set (most of that in the write-hooks tests, which
 spawn a real subprocess per hook invocation; the vector/hybrid tests add one
 warm load of the `bge-small-en-v1.5` embedding model on top of that).
@@ -663,14 +730,20 @@ split — D1/D2 fail, D5 skips — is a pre-existing property of those tests,
 not something this pass changed. D8's timing test also skips cleanly: it
 needs its own `$MEMCONTINUUM_TEST_SANDBOX_SYNTH` directory of synthetic
 markdown for a fixed file-count assertion, and skips without that
-variable set.
+variable set. `test_code_index.py`'s `TestGoldProbesRealCorpus` is gated
+the same way, behind `$MEMCONTINUUM_TEST_REAL_CORPUS` (skips cleanly when
+unset) — but unlike D5/D8, when it *does* run it deliberately does not use
+a temp dir: it reindexes a real Swift corpus into a cache at
+`~/.cache/codanna-bench/bench-code.sqlite`, reused (incrementally) across
+runs rather than rebuilt from scratch each time, because a full embed of
+that corpus takes on the order of 20+ minutes on a typical dev machine.
 See `fixtures/payloads/README.md` for the same guarantee about the hook
-payload fixtures specifically. `scripts/codanna-bench.sh` is a further
-exception to "everything test-related stays inside a temp dir" worth
-knowing about, even though it's a manual benchmark script (comparing
+payload fixtures specifically. `scripts/codanna-bench.sh` is a further,
+separate exception to "everything test-related stays inside a temp dir"
+worth knowing about, even though it's a manual benchmark script (comparing
 `code-search` against the Codanna tool), not part of the test suite: it
-caches a downloaded/built Codanna binary under `~/.cache/codanna-bench`
-across runs, rather than a temp directory.
+caches a downloaded/built Codanna binary under the same `~/.cache/codanna-bench`
+directory across runs, rather than a temp directory.
 
 ## Acknowledgements & prior art
 
