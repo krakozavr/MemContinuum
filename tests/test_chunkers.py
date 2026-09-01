@@ -1,4 +1,3 @@
-import importlib.util
 import json
 import shutil
 import sys
@@ -7,6 +6,7 @@ import unittest
 from pathlib import Path
 
 import chunkers
+import chunkers.python_ast as python_ast
 import memidx
 
 TESTS_DIR = Path(__file__).resolve().parent
@@ -18,13 +18,7 @@ from test_code_index import FIXTURES, code_reindex  # noqa: E402 -- reuse the Sw
 # the corpus text here.
 
 GOLDEN_PATH = TESTS_DIR / "goldens" / "swift_chunks_pre_extraction.json"
-
-
-def _backends_available():
-    return bool(
-        importlib.util.find_spec("chunkers.swift")
-        and importlib.util.find_spec("chunkers.python_ast")
-    )
+PY_FIXTURES = TESTS_DIR / "fixtures" / "python_corpus"
 
 
 class TestRegistry(unittest.TestCase):
@@ -38,8 +32,6 @@ class TestRegistry(unittest.TestCase):
         self.assertIsNone(chunkers.lang_for_path("x.rs"))       # not in M1 table
         self.assertIsNone(chunkers.lang_for_path("x.blade.php"))  # compound ext never a plain match
 
-    @unittest.skipUnless(_backends_available(),
-        "chunkers.swift / chunkers.python_ast land in Tasks 2/4")
     def test_get_chunker_has_chunk_file(self):
         for lang in ("swift", "python"):
             self.assertTrue(callable(chunkers.get_chunker(lang).chunk_file))
@@ -87,3 +79,109 @@ class TestSwiftExtractionGolden(unittest.TestCase):
         with open(GOLDEN_PATH) as f:
             expected = json.load(f)
         self.assertEqual(got, expected)
+
+
+def _recall_tuples(chunks):
+    """(kind, qualified_name, start_line, end_line) per chunk, in the order
+    chunk_file returned them -- the exact-tuple recall contract the brief
+    requires; catches kind-mapping, qualification, and line-number drift
+    together (query/AST drift trips the suite per the brief's capture-count
+    golden requirement)."""
+    return [(c["kind"], c["qualified_name"], c["start_line"], c["end_line"]) for c in chunks]
+
+
+class TestPythonAstChunker(unittest.TestCase):
+    """Gold fixtures under tests/fixtures/python_corpus/ (Task 4 of the
+    Anatomy M1 milestone): exact (kind, qualified_name, start_line, end_line)
+    recall per fixture file, a capture-count golden per file, and one exact
+    ChunkResult assertion for the syntactically broken file (fail-open, no
+    exception escapes)."""
+
+    def test_basic_functions_recall(self):
+        text = (PY_FIXTURES / "basic_functions.py").read_text()
+        result = python_ast.chunk_file(text, "basic_functions.py")
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.gaps, [])
+        self.assertEqual(len(result.chunks), 5)  # capture-count golden
+        self.assertEqual(
+            _recall_tuples(result.chunks),
+            [
+                ("function", "plain_function", 4, 9),
+                ("function", "fetch_data", 12, 14),
+                ("function", "decorated_standalone", 17, 20),  # first decorator's line
+                ("function", "outer_with_nested", 23, 29),
+                ("function", "outer_with_nested.inner", 26, 27),  # nested, parent-qualified
+            ],
+        )
+        for chunk in result.chunks:
+            self.assertEqual(chunk["lang"], "python")
+            self.assertIn(chunk["kind"], chunkers.KINDS)
+
+    def test_basic_functions_doc_and_signature(self):
+        text = (PY_FIXTURES / "basic_functions.py").read_text()
+        result = python_ast.chunk_file(text, "basic_functions.py")
+        by_qname = {c["qualified_name"]: c for c in result.chunks}
+        # doc = ast.get_docstring's first line only -- the second docstring
+        # paragraph ("More detail...") must NOT leak into `doc`.
+        self.assertEqual(by_qname["plain_function"]["doc"], "First line of the docstring.")
+        self.assertEqual(by_qname["plain_function"]["signature"], "def plain_function(a, b=1)")
+        self.assertEqual(
+            by_qname["fetch_data"]["signature"], "async def fetch_data(url: str) -> str"
+        )
+        self.assertEqual(by_qname["decorated_standalone"]["symbol"], "decorated_standalone")
+
+    def test_classes_recall(self):
+        text = (PY_FIXTURES / "classes.py").read_text()
+        result = python_ast.chunk_file(text, "classes.py")
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(len(result.chunks), 6)  # capture-count golden
+        self.assertEqual(
+            _recall_tuples(result.chunks),
+            [
+                ("constructor", "Widget.__init__", 7, 9),
+                ("method", "Widget.render", 11, 13),
+                ("constructor", "Gadget.__init__", 19, 20),
+                ("accessor", "Gadget.value", 22, 25),   # @property getter
+                ("accessor", "Gadget.value", 27, 29),   # @value.setter
+                ("method", "Outer.Inner.greet", 38, 39),  # nested class, never itself a chunk
+            ],
+        )
+        # ClassDef is NEVER a chunk -- no symbol/qualified_name in the result
+        # names a bare class ("Widget", "Gadget", "Outer", "Inner").
+        qnames = {c["qualified_name"] for c in result.chunks}
+        self.assertNotIn("Widget", qnames)
+        self.assertNotIn("Outer", qnames)
+        self.assertNotIn("Outer.Inner", qnames)
+
+    def test_broken_file_fails_open(self):
+        text = (PY_FIXTURES / "broken.py").read_text()
+        result = python_ast.chunk_file(text, "broken.py")
+        self.assertEqual(result.chunks, [])
+        self.assertEqual(result.gaps, [(1, text.count("\n") + 1, "syntax-error")])
+        self.assertEqual(result.status, "failed")
+
+    def test_declared_symbols_functions(self):
+        text = (PY_FIXTURES / "basic_functions.py").read_text()
+        got = python_ast.declared_symbols(text)
+        self.assertEqual(
+            got,
+            [
+                ("plain_function", "plain_function"),
+                ("fetch_data", "fetch_data"),
+                ("decorated_standalone", "decorated_standalone"),
+                ("outer_with_nested", "outer_with_nested"),
+                ("inner", "outer_with_nested.inner"),
+            ],
+        )
+
+    def test_declared_symbols_includes_class_container_names(self):
+        # Mirrors chunkers.swift's declared_symbol_names container-name
+        # inclusion (memidx.py): a #symbol fragment may name the class
+        # itself, not just a member.
+        text = (PY_FIXTURES / "classes.py").read_text()
+        got = python_ast.declared_symbols(text)
+        self.assertIn(("Widget", "Widget"), got)
+        self.assertIn(("Outer", "Outer"), got)
+        self.assertIn(("Inner", "Outer.Inner"), got)
+        self.assertIn(("greet", "Outer.Inner.greet"), got)
+        self.assertIn(("__init__", "Widget.__init__"), got)
