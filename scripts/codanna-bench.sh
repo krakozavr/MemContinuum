@@ -173,7 +173,12 @@ fi
 
 echo "codanna-bench: running memidx.py code-reindex on $SOURCES_ROOT ..."
 T0=$(date +%s.%N)
+# --lang is required on a project's first code-reindex (memidx.py Task 7 --
+# no more hardcoded "swift" default); $OUR_DB is a cache-dir file reused
+# across runs, so passed explicitly every time rather than relying on
+# reused-stored-langs behavior (this script has only ever benched Swift).
 PYTHONPATH= "$PY" "$MEMIDX" code-reindex --code-root "$SOURCES_ROOT" --project "$OUR_PROJECT" \
+  --lang "${MEMCONTINUUM_BENCH_LANG:-swift}" \
   --db "$OUR_DB" || { echo "codanna-bench: our code-reindex failed" >&2; exit 1; }
 T1=$(date +%s.%N)
 echo "codanna-bench: our code-reindex done in $(PYTHONPATH= "$PY" -c "print(f'{$T1-$T0:.2f}s')")"

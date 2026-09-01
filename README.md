@@ -694,15 +694,21 @@ A completely separate SQLite database (`<project>-code.sqlite`, see
 "Storage model" above) holds a chunked intent index over the code itself,
 independent of any authored concept record.
 
-- `code-reindex --code-root DIR` walks the tree (skipping `.git`, `.build`,
-  `vendor`, `node_modules`, `Tests`, `Resources`) and chunks each source
-  file into function/`init`/subscript/computed-property units with a
-  lexer-aware brace walker (handles comments, strings including raw and
-  multiline, string-interpolation closures, and `#if` branches).
-  **Swift is the only language actually chunked today** — `--lang` takes a
-  comma-separated filter (e.g. `swift,ts`), but only `swift` has a chunker
-  behind it; naming any other language there just matches zero files,
-  silently, not an error. Incremental by sha256, same as `reindex`, and it
+- `code-reindex --code-root DIR --lang LANGS` walks the tree and chunks each
+  wired language's source files into function/`init`/subscript/computed-
+  property (Swift) or function/method/closure (Python) units. Directory
+  pruning is the union of a global set (`.git`, `vendor`, `node_modules`)
+  and each WIRED language's own noise dirs (Swift: `Tests`, `Resources`,
+  `.build`; Python: `venv`, `.venv`, `__pycache__`, `build`, `dist`,
+  `.tox`, `.eggs`) — pruning is a single per-directory decision made once
+  for the whole walk, so a directory named in any wired language's set is
+  pruned for every wired language, even one whose own set wouldn't have
+  pruned it standalone (e.g. wiring `swift,python` together prunes
+  `Tests/` from the walk entirely, so a `Tests/*.py` file is invisible to
+  the Python chunker too — wire `python` alone to index it). `--lang` is
+  **required on a project's first `code-reindex`** (exits 1 with an error
+  naming this); omit it on later runs to reuse the language set stored
+  from the first run. Incremental by sha256, same as `reindex`, and it
   downloads the embedding model on the same terms `reindex` does (see
   Requirements) unless `--no-embed` is given.
 - `code-search QUERY` runs fts/vector/hybrid search over those chunks —

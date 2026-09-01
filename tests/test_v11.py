@@ -385,7 +385,7 @@ class TestWhy(unittest.TestCase):
             with mc_home(Path(td) / "home"):
                 code_args = ns(
                     project=project, code_root=str(code_root), db=None,
-                    no_embed=True, full=False, lang=None,
+                    no_embed=True, full=False, lang="swift",
                 )
                 self.assertEqual(memidx.cmd_code_reindex(code_args), 0)
 
@@ -416,7 +416,7 @@ class TestWhy(unittest.TestCase):
             with mc_home(Path(td) / "home"):
                 code_args = ns(
                     project=project, code_root=str(indexed_root), db=None,
-                    no_embed=True, full=False, lang=None,
+                    no_embed=True, full=False, lang="swift",
                 )
                 self.assertEqual(memidx.cmd_code_reindex(code_args), 0)
 

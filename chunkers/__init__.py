@@ -20,10 +20,13 @@ COMPOUND_EXCLUDES = {".blade.php", ".d.ts", ".min.js"}
 
 LANGUAGE_TABLE = {
     "swift": {"backend": "native", "module": "chunkers.swift",
-              "extensions": (".swift",), "shebangs": (), "impl_version": "1"},
+              "extensions": (".swift",), "shebangs": (), "impl_version": "1",
+              "skip_dirs": frozenset({"Tests", "Resources", ".build"})},
     "python": {"backend": "native", "module": "chunkers.python_ast",
                "extensions": (".py",), "shebangs": ("python", "python3"),
-               "impl_version": "1"},
+               "impl_version": "1",
+               "skip_dirs": frozenset({"venv", ".venv", "__pycache__", "build",
+                                        "dist", ".tox", ".eggs"})},
 }
 
 
@@ -91,3 +94,31 @@ def wired_extensions(langs):
     for lang in langs:
         exts.update(LANGUAGE_TABLE[lang]["extensions"])
     return exts
+
+
+def wired_skip_dirs(langs):
+    """Directory names to prune from a walk, UNIONED across a chosen
+    language subset (Task 7, Anatomy M1 milestone).
+
+    Deliberately-resolved design note (brief Step 1(b)): pruning is a
+    single decision made once per directory for the WHOLE walk, using the
+    union of every wired lang's skip_dirs -- not a per-language decision
+    re-made for each wired lang. So a directory named in ANY wired lang's
+    skip_dirs is pruned for ALL of them, even a lang whose own skip_dirs
+    entry would never have pruned it standalone. Concretely: swift's
+    skip_dirs includes "Tests"; wiring swift alongside python prunes
+    "Tests/" from the walk entirely, so a `Tests/*.py` file is invisible
+    to python's chunker too -- accepted trade-off (simpler than a
+    per-lang-aware walk), not a bug. Only after this union prune does
+    per-file classification (chunkers.lang_for_path) filter by extension.
+
+    Fails open on a `lang` with no LANGUAGE_TABLE row (a stray/typo'd
+    --lang value, or a language the engine doesn't chunk yet): contributes
+    no skip_dirs rather than raising, matching cmd_code_reindex's existing
+    per-file tolerance for the same case (chunker_version falls back to
+    "unversioned") and the documented behavior that naming an unwired
+    language just matches zero files, silently -- never a crash."""
+    dirs = set()
+    for lang in langs:
+        dirs.update(LANGUAGE_TABLE.get(lang, {}).get("skip_dirs", ()))
+    return dirs

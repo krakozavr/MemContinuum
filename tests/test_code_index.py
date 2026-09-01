@@ -118,7 +118,14 @@ def ns(**kw):
     return SimpleNamespace(**base)
 
 
-def code_reindex(code_root, db, project=memidx.DEFAULT_PROJECT, no_embed=True, full=False, lang=None):
+def code_reindex(code_root, db, project=memidx.DEFAULT_PROJECT, no_embed=True, full=False, lang="swift"):
+    """Task 7: `lang` now defaults to "swift" here in the test helper (not
+    in memidx.py -- that hardcoded default is gone, see TestLangDefaultFix)
+    purely to centralize the fix for the many pre-existing call sites in
+    this file that relied on the old production default and always index
+    Swift-only fixtures. Pass lang=None explicitly to exercise the real
+    omitted-flag behavior (fails on a fresh project, reuses stored langs
+    otherwise)."""
     args = ns(code_root=str(code_root), db=str(db), project=project, no_embed=no_embed, full=full, lang=lang)
     return memidx.cmd_code_reindex(args)
 
@@ -585,6 +592,203 @@ class TestRegistryDispatchMixedCorpus(unittest.TestCase):
             self.assertIn("plain_function", by_lang["python"])
 
 
+class TestPerLanguageSkipDirs(unittest.TestCase):
+    """Task 7: CODE_SKIP_DIR_NAMES is now the GLOBAL set (.git, vendor,
+    node_modules) only -- language-specific noise dirs (python's venv/
+    .venv/__pycache__/build/dist/.tox/.eggs) live on the LANGUAGE_TABLE row
+    instead, so a Swift-only project never has its own `build/` or `dist/`
+    output pruned by a rule meant for Python virtualenvs."""
+
+    def test_python_venv_dir_is_pruned_and_not_indexed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            shutil.copy(PY_FIXTURES / "basic_functions.py", root / "basic_functions.py")
+            venv_pkg = root / "venv" / "lib"
+            venv_pkg.mkdir(parents=True)
+            (venv_pkg / "vendored.py").write_text("def vendored_function():\n    return 1\n")
+            db = Path(td) / "idx-code.sqlite"
+
+            rc = code_reindex(root, db, no_embed=True, lang="python")
+            self.assertEqual(rc, 0)
+
+            conn = memidx.open_code_db(db)
+            paths = {r["path"] for r in conn.execute("SELECT DISTINCT path FROM chunks")}
+            conn.close()
+            self.assertIn("basic_functions.py", paths)
+            self.assertFalse(
+                any("venv" in Path(p).parts for p in paths),
+                f"venv/ must be pruned for a python-wired walk, got paths: {paths}",
+            )
+
+    def test_dunder_pycache_dir_is_pruned_and_not_indexed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            shutil.copy(PY_FIXTURES / "basic_functions.py", root / "basic_functions.py")
+            cache_dir = root / "__pycache__"
+            cache_dir.mkdir()
+            (cache_dir / "stray.py").write_text("def stray():\n    return 1\n")
+            db = Path(td) / "idx-code.sqlite"
+
+            rc = code_reindex(root, db, no_embed=True, lang="python")
+            self.assertEqual(rc, 0)
+
+            conn = memidx.open_code_db(db)
+            paths = {r["path"] for r in conn.execute("SELECT DISTINCT path FROM chunks")}
+            conn.close()
+            self.assertFalse(any("__pycache__" in Path(p).parts for p in paths))
+
+    def test_stray_lang_with_no_language_table_row_does_not_crash(self):
+        """A --lang value naming a language outside LANGUAGE_TABLE (e.g. a
+        typo, or a language the engine doesn't chunk yet) must not crash
+        the directory-pruning union either -- same "fail open, match zero
+        files, silently" tolerance cmd_code_reindex's per-file dispatch
+        already documents (Task 3 comment) and the pre-Task-7 README used
+        to promise. Mirrors TestUnsupportedExtensionCensus's .rs shape."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            shutil.copy(FIXTURES / "NestedTypes.swift", root / "NestedTypes.swift")
+            db = Path(td) / "idx-code.sqlite"
+
+            rc = code_reindex(root, db, no_embed=True, lang="swift,ts")
+            self.assertEqual(rc, 0)
+
+            conn = memidx.open_code_db(db)
+            paths = {r["path"] for r in conn.execute("SELECT DISTINCT path FROM chunks")}
+            conn.close()
+            self.assertIn("NestedTypes.swift", paths)
+
+
+class TestSkipDirUnionRule(unittest.TestCase):
+    """Task 7 brief Step 1(b), deliberately-resolved design note: directory
+    pruning for a walk consults the UNION of the wired langs' skip_dirs,
+    applied ONCE for the whole walk -- a pruned dir is pruned for ALL
+    wired langs, even one whose own skip_dirs wouldn't have pruned it
+    standalone (accepted trade-off, documented here per the brief). Only
+    AFTER that union prune does per-file classification (extension via
+    lang_for_path) decide what gets chunked. Concretely: swift's skip_dirs
+    include "Tests"; when swift is wired alongside python, "Tests/" is
+    pruned from the walk entirely, so a `Tests/*.py` file is invisible to
+    python's own chunker too, even though python's skip_dirs alone would
+    never have pruned "Tests". Wiring python WITHOUT swift removes
+    "Tests" from the union, and the same file is indexed."""
+
+    @staticmethod
+    def _make_corpus(root):
+        shutil.copy(FIXTURES / "NestedTypes.swift", root / "NestedTypes.swift")
+        tests_dir = root / "Tests"
+        tests_dir.mkdir()
+        shutil.copy(PY_FIXTURES / "basic_functions.py", tests_dir / "basic_functions.py")
+
+    def test_tests_dir_python_file_pruned_when_swift_wired_alongside(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            self._make_corpus(root)
+            db = Path(td) / "idx-code.sqlite"
+
+            rc = code_reindex(root, db, no_embed=True, lang="swift,python")
+            self.assertEqual(rc, 0)
+
+            conn = memidx.open_code_db(db)
+            paths = {r["path"] for r in conn.execute("SELECT DISTINCT path FROM chunks")}
+            conn.close()
+            tests_py = str(Path("Tests") / "basic_functions.py")
+            self.assertNotIn(
+                tests_py, paths,
+                "swift's Tests/ skip_dir prunes the whole directory for the union "
+                "walk -- python's own chunker never even sees this file (Step 1(b) "
+                "trade-off, not a bug)",
+            )
+
+    def test_tests_dir_python_file_indexed_when_python_wired_alone(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            self._make_corpus(root)
+            db = Path(td) / "idx-code.sqlite"
+
+            rc = code_reindex(root, db, no_embed=True, lang="python")
+            self.assertEqual(rc, 0)
+
+            conn = memidx.open_code_db(db)
+            paths = {r["path"] for r in conn.execute("SELECT DISTINCT path FROM chunks")}
+            conn.close()
+            tests_py = str(Path("Tests") / "basic_functions.py")
+            self.assertIn(
+                tests_py, paths,
+                "python's own skip_dirs never include Tests/ -- without swift "
+                "wired, the union no longer prunes it",
+            )
+
+
+class TestLangDefaultFix(unittest.TestCase):
+    """Task 7: the old hardcoded `"swift"` --lang default is gone.
+    Omitted --lang: reuse code_meta.langs for the project if a prior
+    reindex stored one, else fail loudly (first reindex for a project
+    MUST name its languages explicitly) rather than silently default to
+    Swift-only, which used to index nothing at all for a python-only
+    project set up without --lang and never say why."""
+
+    def test_first_reindex_without_lang_on_fresh_project_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            shutil.copy(FIXTURES / "NestedTypes.swift", root / "NestedTypes.swift")
+            db = Path(td) / "idx-code.sqlite"
+
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = code_reindex(root, db, no_embed=True, lang=None, project="freshproj")
+            self.assertNotEqual(rc, 0)
+            self.assertIn("--lang required on first code-reindex", err.getvalue())
+
+            conn = memidx.open_code_db(db)
+            row = conn.execute(
+                "SELECT * FROM code_meta WHERE project=?", ("freshproj",)
+            ).fetchone()
+            conn.close()
+            self.assertIsNone(row, "a refused first reindex must not stamp code_meta")
+
+    def test_second_reindex_without_lang_reuses_stored_langs_not_swift_default(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            shutil.copy(PY_FIXTURES / "basic_functions.py", root / "basic_functions.py")
+            db = Path(td) / "idx-code.sqlite"
+
+            rc = code_reindex(root, db, no_embed=True, lang="python", project="reuseproj")
+            self.assertEqual(rc, 0)
+
+            # A swift file lands in the corpus AFTER the python-only first
+            # reindex -- if the omitted --lang on the next run silently fell
+            # back to the old hardcoded "swift" default (or wired both),
+            # this would wire it in. It must not: the STORED set ("python")
+            # is what gets reused.
+            shutil.copy(FIXTURES / "NestedTypes.swift", root / "NestedTypes.swift")
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = code_reindex(root, db, no_embed=True, lang=None, project="reuseproj")
+            self.assertEqual(rc, 0, buf.getvalue())
+
+            conn = memidx.open_code_db(db)
+            langs_row = conn.execute(
+                "SELECT langs FROM code_meta WHERE project=?", ("reuseproj",)
+            ).fetchone()
+            paths = {r["path"] for r in conn.execute("SELECT DISTINCT path FROM chunks")}
+            conn.close()
+            self.assertEqual(langs_row["langs"], "python")
+            self.assertIn("basic_functions.py", paths)
+            self.assertNotIn("NestedTypes.swift", paths)
+            self.assertIn(
+                "code-reindex: 1 files with unsupported/unwired extensions not indexed: .swift=1",
+                buf.getvalue(),
+            )
+
+
 class TestUnsupportedExtensionCensus(unittest.TestCase):
     """Task 5 spec S4: a file whose extension is not in the wired lang set
     must not be silently dropped -- code-reindex prints exactly one summary
@@ -749,7 +953,7 @@ class TestIsolationFromMarkdownIndex(unittest.TestCase):
             root.mkdir()
             shutil.copy(FIXTURES / "NestedTypes.swift", root / "NestedTypes.swift")
 
-            args = ns(code_root=str(root), project="isoproj", no_embed=True, full=False, lang=None)
+            args = ns(code_root=str(root), project="isoproj", no_embed=True, full=False, lang="swift")
             os.environ["MEMCONTINUUM_HOME"] = str(home)
             try:
                 rc = memidx.cmd_code_reindex(args)
@@ -959,7 +1163,7 @@ class TestConceptAttachment(unittest.TestCase):
                 code_root = Path(td) / "code"
                 code_root.mkdir()
                 shutil.copy(FIXTURES / "NestedTypes.swift", code_root / "NestedTypes.swift")
-                memidx.cmd_code_reindex(ns(code_root=str(code_root), no_embed=True, full=False, lang=None))
+                memidx.cmd_code_reindex(ns(code_root=str(code_root), no_embed=True, full=False, lang="swift"))
 
                 import io
                 import contextlib
@@ -1010,7 +1214,7 @@ class TestConceptAttachment(unittest.TestCase):
                 shutil.copy(FIXTURES / "NestedTypes.swift", code_root / "NestedTypes.swift")
                 code_db = Path(td) / "explicit-code.sqlite"
                 memidx.cmd_code_reindex(
-                    ns(code_root=str(code_root), db=str(code_db), no_embed=True, full=False, lang=None)
+                    ns(code_root=str(code_root), db=str(code_db), no_embed=True, full=False, lang="swift")
                 )
 
                 import io
@@ -1091,7 +1295,7 @@ class TestConceptAttachment(unittest.TestCase):
                 code_root = Path(td) / "code"
                 code_root.mkdir()
                 shutil.copy(FIXTURES / "NestedTypes.swift", code_root / "NestedTypes.swift")
-                memidx.cmd_code_reindex(ns(code_root=str(code_root), no_embed=True, full=False, lang=None))
+                memidx.cmd_code_reindex(ns(code_root=str(code_root), no_embed=True, full=False, lang="swift"))
 
                 import io
                 import contextlib

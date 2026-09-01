@@ -1697,7 +1697,16 @@ def cmd_check(args) -> int:
 # still reading LANG_EXTENSIONS directly; dispatch itself goes through
 # chunkers.lang_for_path (see _lang_for_ext / iter_code_source_files below).
 LANG_EXTENSIONS = {lang: row["extensions"] for lang, row in chunkers.LANGUAGE_TABLE.items()}
-CODE_SKIP_DIR_NAMES = {".git", ".build", "vendor", "node_modules", "Tests", "Resources"}
+
+# Task 7: this is now the GLOBAL skip set ONLY -- directory names that are
+# always noise regardless of which languages are wired. Language-specific
+# noise (swift's Tests/Resources/.build, python's venv/.venv/__pycache__/
+# build/dist/.tox/.eggs) lives on each LANGUAGE_TABLE row's "skip_dirs" key
+# instead (chunkers.wired_skip_dirs), so a Swift-only project's own build/
+# or dist/ output is never pruned by a rule meant for Python virtualenvs,
+# and vice versa. iter_code_source_files below unions this with the wired
+# langs' per-lang sets to get the actual prune set for a walk.
+CODE_SKIP_DIR_NAMES = {".git", "vendor", "node_modules"}
 
 CODE_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS chunks (
@@ -1815,9 +1824,29 @@ def _lang_for_ext(suffix: str) -> str:
 
 def iter_code_source_files(root: Path, langs: list[str] | None, skipped: Counter | None = None):
     """Walk `root`, yielding source files whose chunkers.lang_for_path is in
-    the wired set (`langs`, defaulting to swift-only -- unchanged pre-Task-7
-    default). Dispatch is registry-driven (compound-extension-aware) rather
-    than the old locally duplicated extension map.
+    the wired set (`langs`). Dispatch is registry-driven (compound-extension-
+    aware) rather than the old locally duplicated extension map.
+
+    `langs` defaults to swift-only when falsy -- a legacy-row safety net for
+    _code_index_is_stale below, whose only caller reads it out of an
+    existing code_meta.langs column that has been non-empty on every row
+    ever written since langs became mandatory (Task 7); it does not mean
+    code-reindex itself still has a default (it doesn't -- see
+    cmd_code_reindex's --lang resolution, which fails outright rather than
+    reaching this fallback).
+
+    Directory pruning (Task 7): the skip set for the WHOLE walk is
+    CODE_SKIP_DIR_NAMES (global noise: .git, vendor, node_modules) UNIONED
+    with chunkers.wired_skip_dirs(wired) (the per-lang sets of every WIRED
+    lang, e.g. swift's Tests/Resources/.build, python's venv/.venv/
+    __pycache__/build/dist/.tox/.eggs). This is a single decision per
+    directory, not a per-lang one: a directory pruned because ONE wired
+    lang's skip_dirs names it is pruned for every wired lang, even one
+    whose own skip_dirs wouldn't have pruned it standalone (deliberately
+    accepted trade-off, brief Step 1(b); see chunkers.wired_skip_dirs's
+    docstring and TestSkipDirUnionRule). Per-file classification below
+    (lang_for_path against the wired set) only ever runs on files under
+    directories that survived that union prune.
 
     `skipped`, when passed a Counter, is mutated in place: every walked file
     that is NOT yielded -- lang_for_path is None (truly unsupported) or
@@ -1828,13 +1857,15 @@ def iter_code_source_files(root: Path, langs: list[str] | None, skipped: Counter
     Mutated-in-place rather than a second yield channel so existing callers
     (_code_index_is_stale) that iterate this generator for plain paths need
     no change."""
-    wired = set(langs or ["swift"])
+    wired = list(langs or ["swift"])
+    wired_set = set(wired)
+    skip_dirs = CODE_SKIP_DIR_NAMES | chunkers.wired_skip_dirs(wired)
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in CODE_SKIP_DIR_NAMES]
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs]
         for fname in sorted(filenames):
             path = Path(dirpath) / fname
             lang = chunkers.lang_for_path(path)
-            if lang is not None and lang in wired:
+            if lang is not None and lang in wired_set:
                 yield path
                 continue
             if skipped is not None:
@@ -1956,7 +1987,30 @@ def cmd_code_reindex(args) -> int:
     db_path = resolve_code_db_path(args)
     conn = open_code_db(db_path)
     t0 = time.time()
-    langs = [l.strip() for l in args.lang.split(",")] if getattr(args, "lang", None) else None
+
+    # Task 7: the old hardcoded "swift" --lang default is gone. Omitted
+    # --lang reuses code_meta.langs from a PRIOR reindex of this project,
+    # when one is stored; a project with no stored langs yet (its first
+    # reindex) must name its languages explicitly -- silently defaulting to
+    # swift-only used to index nothing at all for a python-only project set
+    # up without --lang, and never say why.
+    if getattr(args, "lang", None):
+        langs = [l.strip() for l in args.lang.split(",")]
+    else:
+        meta_row = conn.execute(
+            "SELECT langs FROM code_meta WHERE project=?", (args.project,)
+        ).fetchone()
+        stored = meta_row["langs"] if meta_row else None
+        if stored:
+            langs = [l.strip() for l in stored.split(",")]
+        else:
+            print(
+                f"code-reindex: --lang required on first code-reindex for a project "
+                f"(no stored langs yet for {args.project!r})",
+                file=sys.stderr,
+            )
+            conn.close()
+            return 1
 
     existing = {
         row["path"]: (row["sha256"], row["chunker_version"])
@@ -2104,10 +2158,15 @@ def cmd_code_reindex(args) -> int:
         delete_code_chunks_for_path(conn, args.project, rel)
         conn.execute("DELETE FROM file_sha WHERE project=? AND path=?", (args.project, rel))
 
+    # Task 7: the "swift" fallback here is gone -- `langs` is always a
+    # non-empty, resolved list by this point (explicit --lang, or reused
+    # code_meta.langs; the no-langs-yet case already returned 1 above), so
+    # a fallback here would just be dead code hiding a real bug if one of
+    # those guarantees ever broke.
     conn.execute(
         "INSERT OR REPLACE INTO code_meta (project, code_root, langs, last_indexed_at, head_sha) "
         "VALUES (?,?,?,?,?)",
-        (args.project, str(root), ",".join(langs) if langs else "swift", time.time(), _git_head_sha(root)),
+        (args.project, str(root), ",".join(langs), time.time(), _git_head_sha(root)),
     )
     conn.commit()
     conn.close()
@@ -2406,7 +2465,12 @@ def main(argv=None) -> int:
     p_code_reindex = sub.add_parser("code-reindex")
     add_common_args(p_code_reindex)
     p_code_reindex.add_argument("--code-root", dest="code_root", required=True)
-    p_code_reindex.add_argument("--lang", default=None, help="comma-separated language filter, e.g. swift,ts")
+    p_code_reindex.add_argument(
+        "--lang", default=None,
+        help="comma-separated language filter, e.g. swift,python. Required on a "
+             "project's first code-reindex; omit it on later runs to reuse the "
+             "langs stored from the first run.",
+    )
     p_code_reindex.add_argument("--no-embed", action="store_true")
     p_code_reindex.add_argument("--full", action="store_true")
     p_code_reindex.set_defaults(func=cmd_code_reindex)
