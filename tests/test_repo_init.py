@@ -124,6 +124,12 @@ def copy_engine(dst):
         shutil.copy(TOOLS_DIR / name, dst / name)
     for name in ("hooks", "templates", "skills"):
         shutil.copytree(TOOLS_DIR / name, dst / name)
+    # Anatomy M1 Task 2: memidx.py now imports chunkers.swift at module load
+    # (not lazily), so a copied checkout without the chunkers/ package next
+    # to it fails with ModuleNotFoundError, not a graceful skip -- same
+    # reasoning as the mc_settings_merge.py copy above.
+    shutil.copytree(TOOLS_DIR / "chunkers", dst / "chunkers",
+                     ignore=shutil.ignore_patterns("__pycache__"))
     return dst / "scripts" / "repo-init.sh"
 
 
