@@ -789,6 +789,121 @@ class TestLangDefaultFix(unittest.TestCase):
             )
 
 
+class TestCodeCensus(unittest.TestCase):
+    """Task 8: memidx.py `code-census` -- discovery-only extension+shebang
+    census, three-way classification (spec §3, DESIGN-anatomy-chunkers.md:
+    extension-supported / extension-unsupported / shebang-sniffed
+    extensionless). No DB, no --project, no consent recorded; exit 0
+    always -- census never fails a scan it can walk."""
+
+    @staticmethod
+    def _make_corpus(root):
+        shutil.copy(PY_FIXTURES / "basic_functions.py", root / "basic_functions.py")
+        shutil.copy(FIXTURES / "NestedTypes.swift", root / "NestedTypes.swift")
+        (root / "Program.cs").write_text("class Program {}\n")
+        script = root / "run-migrations"
+        script.write_text("#!/usr/bin/env python3\nprint('hi')\n")
+        script.chmod(0o755)
+        return script
+
+    def test_json_shape_classifies_extension_and_shebang_together(self):
+        """Brief Step 1 corpus: .py, .swift, .cs, plus an extensionless
+        `#!/usr/bin/env python3` script -- python's count includes BOTH the
+        real .py file and the shebang script (corpus-count(+1 shebang)),
+        .cs is unsupported."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            self._make_corpus(root)
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = memidx.main(["code-census", "--root", str(root), "--json"])
+            self.assertEqual(rc, 0)
+            data = json.loads(buf.getvalue())
+
+            self.assertEqual(data["python"], {"files": 2, "status": "supported"})
+            self.assertEqual(data["swift"], {"files": 1, "status": "supported"})
+            self.assertEqual(data[".cs"], {"files": 1, "status": "unsupported"})
+
+    def test_extensionless_shebang_script_counted_under_its_language(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            (root / "deploy").write_text("#!/usr/bin/env python3\nprint('x')\n")
+
+            counts = memidx.code_census(root)
+            self.assertEqual(counts["python"], {"files": 1, "status": "supported"})
+
+    def test_extensionless_without_recognized_shebang_falls_to_no_extension_bucket(self):
+        """Controller-scope addition #1 (Task 5 reviewer, "second silent
+        gap"): an extensionless file with NO recognized shebang -- whether
+        no shebang at all, or a real shebang for a language not in the
+        table -- is counted under NO_EXTENSION_BUCKET as unsupported, never
+        silently dropped from the census entirely."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            (root / "README").write_text("just some notes, no shebang here\n")
+            (root / "run-it").write_text("#!/bin/bash\necho hi\n")
+
+            counts = memidx.code_census(root)
+            self.assertEqual(
+                counts[memidx.NO_EXTENSION_BUCKET],
+                {"files": 2, "status": "unsupported"},
+            )
+            self.assertNotIn("python", counts)
+            self.assertNotIn("swift", counts)
+
+    def test_language_table_skip_dirs_pruned_even_though_no_lang_is_wired(self):
+        """Controller-scope addition #2: census walks with the GLOBAL skip
+        set UNIONED with EVERY LANGUAGE_TABLE row's skip_dirs -- not just a
+        wired subset (there is none yet at census time, unlike
+        iter_code_source_files' walk). A project's untouched .venv/
+        (python's own skip_dir) and Tests/ (swift's own skip_dir) must
+        never be counted, even though census names no langs at all -- a
+        census that counted thousands of files under .venv/ would be pure
+        noise."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            venv_dir = root / ".venv" / "lib"
+            venv_dir.mkdir(parents=True)
+            shutil.copy(PY_FIXTURES / "basic_functions.py", venv_dir / "vendored.py")
+            tests_dir = root / "Tests"
+            tests_dir.mkdir()
+            shutil.copy(FIXTURES / "NestedTypes.swift", tests_dir / "NestedTypes.swift")
+            shutil.copy(PY_FIXTURES / "basic_functions.py", root / "basic_functions.py")
+
+            counts = memidx.code_census(root)
+            self.assertEqual(counts["python"], {"files": 1, "status": "supported"})
+            self.assertNotIn("swift", counts)
+
+    def test_exit_code_is_always_zero_even_on_a_nonexistent_root(self):
+        with tempfile.TemporaryDirectory() as td:
+            missing = Path(td) / "does-not-exist"
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = memidx.main(["code-census", "--root", str(missing), "--json"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(buf.getvalue()), {})
+
+    def test_human_readable_table_groups_supported_before_unsupported(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            self._make_corpus(root)
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = memidx.main(["code-census", "--root", str(root)])
+            self.assertEqual(rc, 0)
+            out = buf.getvalue()
+            self.assertLess(out.index("supported:"), out.index("unsupported:"))
+            self.assertIn("python: 2", out)
+            self.assertIn(".cs: 1", out)
+
+
 class TestUnsupportedExtensionCensus(unittest.TestCase):
     """Task 5 spec S4: a file whose extension is not in the wired lang set
     must not be silently dropped -- code-reindex prints exactly one summary

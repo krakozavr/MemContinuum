@@ -96,6 +96,45 @@ def wired_extensions(langs):
     return exts
 
 
+def lang_for_shebang(first_line):
+    """Shebang first line (e.g. "#!/usr/bin/env python3") -> lang name via
+    LANGUAGE_TABLE's per-row "shebangs" stems, else None.
+
+    Task 8 (Anatomy M1): memidx.py's code-census uses this to classify an
+    EXTENSIONLESS executable script -- lang_for_path (extension-only) can
+    never resolve one, so an unwired-but-recognizable interpreter would
+    otherwise silently vanish from the census (the "second silent gap" a
+    Task 5 reviewer flagged: a repo can have real Python entry-point
+    scripts with no `.py` suffix at all).
+
+    Matching: split the line after "#!" on whitespace; if the first token's
+    basename is "env" (the common `#!/usr/bin/env python3` indirection),
+    the interpreter name is the NEXT token's basename instead, else it's
+    the first token's own basename. A row's "shebangs" stem matches when
+    the interpreter name equals it OR STARTS WITH it -- so "python3",
+    "python3.11", "python3.12" etc. all match the "python"/"python3" stems
+    without the table enumerating every patch version (the brief's
+    "first line #!...python* -> counted as python" wildcard). Iterates
+    LANGUAGE_TABLE once; no stem across the current rows overlaps another
+    row's, so match order never matters.
+    """
+    if not first_line.startswith("#!"):
+        return None
+    parts = first_line[2:].split()
+    if not parts:
+        return None
+    interpreter = os.path.basename(parts[0])
+    if interpreter == "env" and len(parts) > 1:
+        interpreter = os.path.basename(parts[1])
+    if not interpreter:
+        return None
+    for lang, row in LANGUAGE_TABLE.items():
+        for stem in row.get("shebangs", ()):
+            if interpreter == stem or interpreter.startswith(stem):
+                return lang
+    return None
+
+
 def wired_skip_dirs(langs):
     """Directory names to prune from a walk, UNIONED across a chosen
     language subset (Task 7, Anatomy M1 milestone).

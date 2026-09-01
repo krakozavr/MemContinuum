@@ -2193,6 +2193,160 @@ def cmd_code_reindex(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# code-census (Task 8, Anatomy M1): discovery-only, no DB, no consent
+# recorded -- census PROPOSES a language set (spec §3,
+# docs/internal/DESIGN-anatomy-chunkers.md); repo-init's dialogue (Task 10)
+# is what may eventually wire/install/record one. Exit 0 always: a census
+# never fails a scan it can walk.
+# ---------------------------------------------------------------------------
+
+NO_EXTENSION_BUCKET = "(no extension)"
+
+
+def _census_skip_dirs() -> set:
+    """Directory names pruned from a code-census walk.
+
+    Deliberately WIDER than iter_code_source_files' wired-langs union
+    (Task 7): census runs BEFORE any language is wired for a project --
+    it is the discovery step repo-init's consent dialogue reads, so there
+    is no "wired" subset yet to union against. Using ONLY
+    CODE_SKIP_DIR_NAMES (the global set: .git/vendor/node_modules) would
+    let a census walk descend into every OTHER LANGUAGE_TABLE row's own
+    noise dirs it doesn't yet know to exclude -- an untouched Python
+    project's census would count thousands of files under .venv/ as pure
+    noise (Task 5 reviewer finding, assigned to this task). So census
+    unions CODE_SKIP_DIR_NAMES with EVERY LANGUAGE_TABLE row's skip_dirs,
+    not just a wired subset: the walk needs to already look clean before
+    the user has chosen anything. (Contrast iter_code_source_files, which
+    correctly unions only the WIRED subset once a project has committed to
+    a language set -- that is a different question from this one.)
+    """
+    dirs = set(CODE_SKIP_DIR_NAMES)
+    for row in chunkers.LANGUAGE_TABLE.values():
+        dirs.update(row.get("skip_dirs", ()))
+    return dirs
+
+
+def _first_line_or_none(path: Path) -> str | None:
+    """Read just the first line of `path`, fail-open. Any error (permission
+    denied, undecodable bytes, empty file) yields None rather than raising
+    -- census never fails a scan it can walk (brief's exit-0-always
+    contract). `errors="replace"` means an undecodable byte never raises
+    either; it just can never match a shebang afterward, same as None.
+    `readline(512)` caps the read on an extensionless file with no
+    newline near the start (e.g. a large binary) -- a shebang interpreter
+    name is always well within the first few dozen bytes, so a truncated
+    line still matches correctly; this only bounds how much of a
+    non-matching file gets pulled into memory."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.readline(512).rstrip("\n") or None
+    except OSError:
+        return None
+
+
+def code_census(root: Path) -> dict:
+    """Walk `root` and classify every file two ways: SUPPORTED (resolves to
+    a LANGUAGE_TABLE lang, whether by extension via chunkers.lang_for_path
+    or -- for an extensionless executable -- by chunkers.lang_for_shebang
+    matching a shebang stem) or UNSUPPORTED (an extension with no
+    LANGUAGE_TABLE row, or an extensionless file whose first line is not a
+    recognized shebang, bucketed under NO_EXTENSION_BUCKET). This is the
+    "three ways" the brief names: extension-supported, extension-
+    unsupported, and shebang-sniffed extensionless (itself supported or
+    unsupported depending on whether the shebang matched) -- the shebang
+    path folds into the SAME lang key an extension match would use, not a
+    separate status, so a `#!/usr/bin/env python3` script and a `foo.py`
+    file both count under the "python" key.
+
+    Returns {key: {"files": n, "status": "supported"|"unsupported"}} (the
+    brief's JSON shape) -- `key` is a lang name for a supported row, else
+    the raw extension string (or NO_EXTENSION_BUCKET) for an unsupported
+    one. Directory pruning: _census_skip_dirs() (global set UNION every
+    LANGUAGE_TABLE row's skip_dirs -- see its docstring for why this is
+    wider than a wired-langs walk). Fails open per file and never raises on
+    a walk it can complete: os.walk over a missing/unreadable root just
+    yields nothing, so an empty or nonexistent root produces an empty dict,
+    not an error."""
+    skip_dirs = _census_skip_dirs()
+    counts: dict = {}
+
+    def bump(key: str, status: str) -> None:
+        row = counts.setdefault(key, {"files": 0, "status": status})
+        row["files"] += 1
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+        for fname in sorted(filenames):
+            path = Path(dirpath) / fname
+            _, ext = os.path.splitext(fname)
+            if ext:
+                lang = chunkers.lang_for_path(path)
+                if lang is not None:
+                    bump(lang, "supported")
+                else:
+                    bump(ext, "unsupported")
+                continue
+            # Extensionless: only a recognized shebang saves it from the
+            # catch-all bucket (controller-scope addition, Task 5 reviewer
+            # finding -- the "second silent gap": extensionless scripts
+            # used to vanish from the census entirely).
+            first_line = _first_line_or_none(path)
+            lang = chunkers.lang_for_shebang(first_line) if first_line else None
+            if lang is not None:
+                bump(lang, "supported")
+            else:
+                bump(NO_EXTENSION_BUCKET, "unsupported")
+
+    return counts
+
+
+def _print_code_census_table(counts: dict) -> None:
+    """Human-readable form: supported rows FIRST (named by lang), then
+    unsupported rows (named by extension / NO_EXTENSION_BUCKET), each
+    group sorted by file count descending, ties broken alphabetically for
+    determinism (same tie rule as code-reindex's skipped-extension
+    provenance line)."""
+    def sort_key(item):
+        key, row = item
+        return (-row["files"], key)
+
+    supported = sorted(
+        (item for item in counts.items() if item[1]["status"] == "supported"),
+        key=sort_key,
+    )
+    unsupported = sorted(
+        (item for item in counts.items() if item[1]["status"] == "unsupported"),
+        key=sort_key,
+    )
+    total = sum(row["files"] for row in counts.values())
+    print(f"code-census: {total} file(s) scanned")
+    if supported:
+        print("supported:")
+        for key, row in supported:
+            print(f"  {key}: {row['files']}")
+    if unsupported:
+        print("unsupported:")
+        for key, row in unsupported:
+            print(f"  {key}: {row['files']}")
+    if not counts:
+        print("(no files found)")
+
+
+def cmd_code_census(args) -> int:
+    """`code-census --root DIR [--json]`. No DB, no --project, no consent
+    recorded -- pure discovery (see the module comment above). Exit 0
+    always."""
+    root = Path(args.root)
+    counts = code_census(root)
+    if getattr(args, "json", False):
+        print(json.dumps(counts))
+    else:
+        _print_code_census_table(counts)
+    return 0
+
+
 def code_hits_fts(conn: sqlite3.Connection, query: str, project: str, limit: int = 200):
     q = fts_escape(query)
     rows = conn.execute(
@@ -2488,6 +2642,11 @@ def main(argv=None) -> int:
              "db for this command. Defaults to the normal per-project decision db.",
     )
     p_code_search.set_defaults(func=cmd_code_search)
+
+    p_code_census = sub.add_parser("code-census")
+    p_code_census.add_argument("--root", required=True)
+    p_code_census.add_argument("--json", action="store_true")
+    p_code_census.set_defaults(func=cmd_code_census)
 
     args = parser.parse_args(argv)
     return args.func(args)
