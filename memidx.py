@@ -1048,7 +1048,7 @@ def fragment_matches_symbol(frag: str, symbol: str, qualified_name: str) -> bool
     return frag == symbol or frag == qualified_name or qualified_name.endswith("." + frag)
 
 
-def fragment_declared_in_text(frag: str, text: str) -> bool:
+def fragment_declared_in_text(frag: str, text: str, rel_path: str = "x.swift") -> bool:
     """memlint's #symbol vocabulary check (memlint.py's lint_concept),
     reusing chunk_source's own lexer-aware chunks (not the flattened
     bare-name set declared_symbol_names returns) so a QUALIFIED fragment
@@ -1057,7 +1057,25 @@ def fragment_declared_in_text(frag: str, text: str) -> bool:
     same fragment_matches_symbol predicate, applied here per-chunk instead
     of per-DB-row. A fragment naming just a container type (no member,
     e.g. "Outer") is still accepted too, matching declared_symbol_names'
-    existing container-name behavior."""
+    existing container-name behavior.
+
+    Task 6: `rel_path` (optional, defaulting to "x.swift" so every existing
+    call site is unaffected) routes the check per-language through the
+    chunker registry (chunkers.lang_for_path) instead of always running the
+    Swift lexer over the text. A ".py" rel_path dispatches to
+    chunkers.python_ast.declared_symbols, which already includes each
+    class's own name alongside its members (controller ruling: no separate
+    container-name pass is added here for Python -- declared_symbols is the
+    single source for that, same as it is for chunkers/test_chunkers.py's
+    own container-name tests), evaluated with the SAME fragment_matches_symbol
+    predicate used everywhere else. Every other rel_path (no registered
+    lang, or "swift") falls through to the Swift path below, byte-identical
+    to before this task."""
+    if chunkers.lang_for_path(rel_path) == "python":
+        return any(
+            fragment_matches_symbol(frag, symbol, qualified_name)
+            for symbol, qualified_name in chunkers.python_ast.declared_symbols(text)
+        )
     chunks, _gaps = chunk_source(text)
     for c in chunks:
         if fragment_matches_symbol(frag, c["symbol"], c["qualified_name"]):
@@ -1841,6 +1859,7 @@ from chunkers.swift import (
     _container_type_name,
     _extract_decls,
 )
+import chunkers.python_ast
 
 
 def declared_symbol_names(text: str) -> set:

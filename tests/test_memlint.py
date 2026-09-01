@@ -153,5 +153,67 @@ class TestDuplicateIdErrors(unittest.TestCase):
         self.assertEqual(len([e for e in errors if "duplicate id 'TOP-0042'" in e]), 1, errors)
 
 
+class TestMemlintPythonSymbolVocabulary(unittest.TestCase):
+    """Task 6: memlint's #symbol vocabulary check (lint_concept, via
+    _symbol_declared) forwards the record's own ref_path to
+    memidx.fragment_declared_in_text, so a Python implemented_by/tested_by
+    path is checked against chunkers.python_ast.declared_symbols instead of
+    always assuming Swift (the pre-Task-6 default, which would reject every
+    real Python `def` -- the Swift lexer has no notion of it)."""
+
+    CONCEPT = (
+        "---\n"
+        "type: concept\n"
+        "id: {cid}\n"
+        "title: Fixture -- Python #symbol vocabulary\n"
+        "owner_boundary: fixture\n"
+        "implemented_by:\n"
+        "  - {ref}\n"
+        "tested_by: []\n"
+        "governed_by: []\n"
+        "involved_in: []\n"
+        "---\n\n"
+        "Fixture. NOT this concept: nothing else.\n"
+    )
+
+    def _lint(self, ref: str, cid: str, py_source: str):
+        with tempfile.TemporaryDirectory() as td_str:
+            td = Path(td_str)
+            code_root = td / "code"
+            code_root.mkdir()
+            (code_root / "thing.py").write_text(py_source)
+            (td / "concept.md").write_text(self.CONCEPT.format(cid=cid, ref=ref))
+            return memlint.lint_root(td, code_root=code_root)
+
+    def test_python_symbol_declared_is_not_an_error(self):
+        # If the call site ever regresses to not forwarding ref_path (i.e.
+        # falls back to the default "x.swift"), this becomes an error --
+        # the Swift lexer scan of `def declared_func(): pass` finds nothing.
+        errors, _warnings = self._lint(
+            "thing.py#declared_func",
+            "CON-PYVOCAB-GOOD",
+            "def declared_func():\n    pass\n",
+        )
+        self.assertFalse(any("CON-PYVOCAB-GOOD" in e for e in errors), errors)
+
+    def test_python_symbol_not_declared_is_an_error(self):
+        errors, _warnings = self._lint(
+            "thing.py#missingFunc",
+            "CON-PYVOCAB-BAD",
+            "def declared_func():\n    pass\n",
+        )
+        self.assertTrue(
+            any("CON-PYVOCAB-BAD" in e and "missingFunc" in e for e in errors), errors
+        )
+
+    def test_python_class_container_symbol_declared_is_not_an_error(self):
+        errors, _warnings = self._lint(
+            "thing.py#Widget",
+            "CON-PYVOCAB-CLASS",
+            "class Widget:\n    def __init__(self):\n        pass\n",
+        )
+        self.assertFalse(any("CON-PYVOCAB-CLASS" in e for e in errors), errors)
+
+
 if __name__ == "__main__":
     unittest.main()
