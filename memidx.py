@@ -1710,6 +1710,12 @@ CREATE TABLE IF NOT EXISTS file_sha (
   gap_count INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (path, project)
 );
+-- chunker_version (TASK 3, joins the skip decision alongside sha256) is
+-- NOT listed above -- same reasoning as code_meta.head_sha below:
+-- CREATE TABLE IF NOT EXISTS never adds a column to a table that already
+-- exists on disk, so a brand-new DB relies on the unconditional migration
+-- guard just like an upgraded one does (ensure_file_sha_chunker_version_column,
+-- called from open_code_db right after this script runs).
 
 CREATE TABLE IF NOT EXISTS code_meta (
   project TEXT PRIMARY KEY,
@@ -1741,12 +1747,27 @@ def ensure_code_meta_head_sha_column(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE code_meta ADD COLUMN head_sha TEXT")
 
 
+def ensure_file_sha_chunker_version_column(conn: sqlite3.Connection) -> None:
+    """Migration guard (Task 3, Anatomy M1): a file_sha table created
+    before chunker_version joined the skip decision has no such column --
+    CREATE TABLE IF NOT EXISTS never adds columns to an existing table
+    (same fix as ensure_code_meta_head_sha_column above). NULL on an
+    upgraded row (and on any row this migration adds the column for) is
+    the documented pre-stamp value: the skip check below never treats
+    NULL as equal to a real chunker_version string, so every pre-existing
+    row re-chunks exactly once and gets stamped."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(file_sha)").fetchall()}
+    if "chunker_version" not in cols:
+        conn.execute("ALTER TABLE file_sha ADD COLUMN chunker_version TEXT")
+
+
 def open_code_db(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.executescript(CODE_SCHEMA_SQL)
     ensure_code_meta_head_sha_column(conn)
+    ensure_file_sha_chunker_version_column(conn)
     return conn
 
 
@@ -1776,6 +1797,7 @@ def iter_code_source_files(root: Path, langs: list[str] | None):
 # tests import chunk_source via memidx.chunk_source.
 # ---------------------------------------------------------------------------
 
+import chunkers
 from chunkers.swift import (
     chunk_source,
     _build_mask_and_match_dict,
@@ -1882,8 +1904,10 @@ def cmd_code_reindex(args) -> int:
     langs = [l.strip() for l in args.lang.split(",")] if getattr(args, "lang", None) else None
 
     existing = {
-        row["path"]: row["sha256"]
-        for row in conn.execute("SELECT path, sha256 FROM file_sha WHERE project=?", (args.project,))
+        row["path"]: (row["sha256"], row["chunker_version"])
+        for row in conn.execute(
+            "SELECT path, sha256, chunker_version FROM file_sha WHERE project=?", (args.project,)
+        )
     }
 
     files = list(iter_code_source_files(root, langs))
@@ -1901,16 +1925,27 @@ def cmd_code_reindex(args) -> int:
         seen.add(rel)
         data = f.read_bytes()
         sha = hashlib.sha256(data).hexdigest()
-        prev_sha = existing.get(rel)
-        if prev_sha == sha and not args.full:
+        lang = _lang_for_ext(f.suffix)
+        try:
+            cv = chunkers.chunker_version(lang)
+        except KeyError:
+            # Task 3 edge case: a lang with no LANGUAGE_TABLE row (e.g. an
+            # extension outside the table reached via a stray --lang
+            # value) must not crash code-reindex -- fail open with a
+            # literal stamp instead of raising.
+            cv = "unversioned"
+        prev_sha, prev_cv = existing.get(rel, (None, None))
+        if prev_sha == sha and prev_cv == cv and not args.full:
             unchanged_files += 1
             # Finding 2 (staleness): the file's content (and thus its
             # chunks) didn't change, but its mtime/size on disk may have
             # (e.g. a bare `touch`) -- refresh the stored file_sha row's
             # mtime/size so _code_index_is_stale's on-disk comparison
-            # matches again. sha256/gap_count are untouched (nothing about
-            # the indexed content changed), so this is a plain UPDATE, not
-            # the INSERT OR REPLACE the changed/added branch below uses.
+            # matches again. sha256/gap_count/chunker_version are
+            # untouched (nothing about the indexed content or the
+            # chunker that produced it changed), so this is a plain
+            # UPDATE, not the INSERT OR REPLACE the changed/added branch
+            # below uses.
             stat = f.stat()
             conn.execute(
                 "UPDATE file_sha SET mtime=?, size=? WHERE project=? AND path=?",
@@ -1920,7 +1955,6 @@ def cmd_code_reindex(args) -> int:
         is_new = rel not in existing
 
         text = data.decode("utf-8", errors="replace")
-        lang = _lang_for_ext(f.suffix)
         chunks, gaps = chunk_source(text)
         total_gaps += len(gaps)
         for g in gaps:
@@ -1959,9 +1993,9 @@ def cmd_code_reindex(args) -> int:
 
         stat = f.stat()
         conn.execute(
-            "INSERT OR REPLACE INTO file_sha (path, project, sha256, mtime, size, gap_count) "
-            "VALUES (?,?,?,?,?,?)",
-            (rel, args.project, sha, stat.st_mtime, stat.st_size, len(gaps)),
+            "INSERT OR REPLACE INTO file_sha (path, project, sha256, mtime, size, gap_count, chunker_version) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (rel, args.project, sha, stat.st_mtime, stat.st_size, len(gaps), cv),
         )
         if is_new:
             added_files += 1

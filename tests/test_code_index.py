@@ -18,8 +18,11 @@ running this file; see README.md "Requirements" / "Running the tests".
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -32,6 +35,7 @@ from types import SimpleNamespace
 TOOLS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(TOOLS_DIR))
 
+import chunkers  # noqa: E402
 import memidx  # noqa: E402
 import memlint  # noqa: E402
 
@@ -466,6 +470,88 @@ class TestIncremental(unittest.TestCase):
             rows = conn.execute("SELECT qualified_name FROM chunks").fetchall()
             conn.close()
             self.assertIn("addedLater", {r["qualified_name"] for r in rows})
+
+
+class TestChunkerVersionSkipDecision(unittest.TestCase):
+    """Task 3: chunker_version joins the sha-only skip decision, so a
+    backend behavior change (impl_version bump) forces a re-chunk on the
+    next code-reindex even though no source byte moved -- the stale-chunk
+    one-way-door the brief closes."""
+
+    @staticmethod
+    def _summary_counts(output: str):
+        m = re.search(
+            r"(\d+) files scanned, (\d+) added, (\d+) changed, (\d+) unchanged",
+            output,
+        )
+        assert m is not None, output
+        return {
+            "scanned": int(m.group(1)),
+            "added": int(m.group(2)),
+            "changed": int(m.group(3)),
+            "unchanged": int(m.group(4)),
+        }
+
+    def _reindex_summary(self, root, db):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = code_reindex(root, db, no_embed=True)
+        self.assertEqual(rc, 0)
+        return self._summary_counts(buf.getvalue())
+
+    def test_chunker_version_bump_forces_rechunk(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            shutil.copy(FIXTURES / "NestedTypes.swift", root / "NestedTypes.swift")
+            db = Path(td) / "idx-code.sqlite"
+
+            first = self._reindex_summary(root, db)
+            self.assertEqual(first["added"], 1)
+
+            second = self._reindex_summary(root, db)
+            self.assertEqual(second["changed"], 0)
+            self.assertEqual(second["unchanged"], 1)
+
+            original_version = chunkers.LANGUAGE_TABLE["swift"]["impl_version"]
+            chunkers.LANGUAGE_TABLE["swift"]["impl_version"] = original_version + "-bumped"
+            try:
+                third = self._reindex_summary(root, db)
+            finally:
+                chunkers.LANGUAGE_TABLE["swift"]["impl_version"] = original_version
+
+            self.assertGreater(third["changed"], 0, "impl_version bump must force a re-chunk")
+            self.assertEqual(third["unchanged"], 0, "no file may be reported unchanged after a version bump")
+
+    def test_pre_stamp_rows_rechunk_once(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            shutil.copy(FIXTURES / "NestedTypes.swift", root / "NestedTypes.swift")
+            db = Path(td) / "idx-code.sqlite"
+
+            code_reindex(root, db, no_embed=True)
+
+            conn = memidx.open_code_db(db)
+            conn.execute("UPDATE file_sha SET chunker_version = NULL")
+            conn.commit()
+            conn.close()
+
+            summary = self._reindex_summary(root, db)
+            self.assertGreater(summary["changed"], 0, "a NULL (pre-stamp) chunker_version must force one re-chunk")
+            self.assertEqual(summary["unchanged"], 0)
+
+            conn = memidx.open_code_db(db)
+            row = conn.execute(
+                "SELECT chunker_version FROM file_sha WHERE path=?", ("NestedTypes.swift",)
+            ).fetchone()
+            conn.close()
+            self.assertEqual(row["chunker_version"], chunkers.chunker_version("swift"))
+
+            # Re-running now must be a clean skip: the row is stamped.
+            summary2 = self._reindex_summary(root, db)
+            self.assertEqual(summary2["changed"], 0)
+            self.assertEqual(summary2["unchanged"], 1)
 
 
 class TestIsolationFromMarkdownIndex(unittest.TestCase):
