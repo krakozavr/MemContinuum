@@ -7,6 +7,7 @@ never touch the real machine's state.
 """
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -115,6 +116,10 @@ def copy_engine(dst):
     (dst / "scripts").mkdir(exist_ok=True)
     shutil.copy(INSTALL_SH, dst / "scripts" / "repo-init.sh")
     (dst / "scripts" / "repo-init.sh").chmod(0o755)
+    # fix-round-4 F8: repo-init.sh's heredoc imports this sibling module by
+    # SCRIPT_DIR at runtime -- a copied checkout without it fails with
+    # ModuleNotFoundError, not a graceful skip.
+    shutil.copy(TOOLS_DIR / "scripts" / "mc_settings_merge.py", dst / "scripts" / "mc_settings_merge.py")
     for name in ("memidx.py", "memlint.py", "requirements.txt"):
         shutil.copy(TOOLS_DIR / name, dst / name)
     for name in ("hooks", "templates", "skills"):
@@ -146,11 +151,12 @@ class TestFreshInstall(unittest.TestCase):
         cls.store = str(Path(cls.home) / "store")
         cls.code_root = str(Path(cls.home) / "code")
         os.makedirs(cls.code_root, exist_ok=True)
+        cls.claude_dir = Path(cls.home) / ".claude"
         cls.proc = run_install(
-            ["--project", "widgetco", "--store", cls.store, "--code-root", cls.code_root],
+            ["--project", "widgetco", "--store", cls.store, "--code-root", cls.code_root,
+             "--claude-dir", str(cls.claude_dir)],
             cls.home,
         )
-        cls.claude_dir = Path(cls.home) / ".claude"
         cls.settings_path = cls.claude_dir / "settings.local.json"
 
     @classmethod
@@ -243,6 +249,15 @@ class TestFreshInstall(unittest.TestCase):
             self.assertIn(f"MEMCONTINUUM_STRIP_PREFIX={self.code_root}/", cmd)
         ifs = [i for i, _ in commands]
         self.assertTrue(any(self.code_root in i for i in ifs), ifs)
+        # `if` filter paths use Claude Code's permission-rule syntax, where a
+        # single leading slash anchors at the settings source, not the
+        # filesystem root -- a rendered `Edit(/abs/root/**)` (one leading
+        # slash) matches nothing at all. `self.code_root` is already
+        # absolute, so the correct rendering needs a SECOND leading slash:
+        # `Edit(//abs/root/**)`. Fix-round 2026-08-31: this was the actual
+        # bug (confirmed empirically: a live Edit to a governed file produced
+        # a PostToolUse ledger line and NO PreToolUse line).
+        self.assertEqual(ifs, [f"Edit(/{self.code_root}/**)", f"Write(/{self.code_root}/**)"])
 
     def test_settings_contains_newfile_nudge_hook_write_only_with_right_paths(self):
         """Finding 8: newfile-nudge.sh gets its OWN "Write" (never
@@ -259,15 +274,50 @@ class TestFreshInstall(unittest.TestCase):
         ]
         self.assertEqual(len(nudge_items), 1, nudge_items)
         item = nudge_items[0]
-        self.assertEqual(item["if"], f"Write({self.code_root}/**)")
+        # Same double-leading-slash requirement as the pre-edit filter pair
+        # (fix-round 2026-08-31, see test_settings_contains_pre_edit_hook_with_right_paths).
+        self.assertEqual(item["if"], f"Write(/{self.code_root}/**)")
         self.assertIn(f"MEMCONTINUUM_CODE_ROOT={self.code_root}", item["command"])
         self.assertIn("MEMCONTINUUM_PYTHON=", item["command"])
         self.assertNotIn("MEMCONTINUUM_ROOT=", item["command"])
-        self.assertNotIn("MEMCONTINUUM_PROJECT=", item["command"])
+        # F1 fix: DOES carry the project identity marker now (the hook itself
+        # never reads it -- this is so a re-run can tell this project's nudge
+        # entry apart from a different project's sharing the same claude-dir;
+        # see TestTwoProjectsOneClaudeDir below for the regression it closes).
+        self.assertIn("MEMCONTINUUM_PROJECT=widgetco", item["command"])
         self.assertNotIn("MEMCONTINUUM_STRIP_PREFIX=", item["command"])
         # pre-edit-chain's own group must be untouched by this addition.
         edit_write_groups = [g for g in pre if g.get("matcher") == "Edit|Write"]
         self.assertEqual(len(edit_write_groups), 1, pre)
+
+    def test_every_rendered_if_filter_has_double_leading_slash(self):
+        """Fix-round 2026-08-31, the dead-PreToolUse-hook bug: Claude Code
+        hook `if` filters use permission-rule path syntax, where a single
+        leading slash anchors at the settings SOURCE, not the filesystem
+        root (docs: code.claude.com/docs/en/permissions.md -- "Use
+        //Users/alice/file for absolute paths"). `--code-root` is always
+        rendered absolute (already starting with `/`), so every `if` value
+        this installer writes must carry exactly two leading slashes -- one
+        short, and the pattern matches nothing, ever (empirically confirmed:
+        a live Edit to a governed file produced a PostToolUse ledger line
+        and NO PreToolUse line, same settings file). Sweeps every `if` in
+        the merged settings, not just the pre-edit/newfile-nudge pairs this
+        file already pins individually above, so a future filter-pair
+        template gains this coverage for free."""
+        data = json.loads(self.settings_path.read_text())
+        ifs = [
+            h["if"]
+            for event_groups in data["hooks"].values()
+            for group in event_groups
+            for h in group.get("hooks", [])
+            if "if" in h
+        ]
+        self.assertTrue(ifs, "expected at least one `if`-filtered hook entry")
+        pattern = re.compile(r"^(Edit|Write)\(//.+/\*\*\)$")
+        for i in ifs:
+            self.assertRegex(i, pattern, i)
+            self.assertTrue(i.startswith(("Edit(//", "Write(//")), i)
+            self.assertTrue(i.endswith("/**)"), i)
 
     def test_reindex_and_lint_clean_on_empty_store(self):
         out = self.proc.stdout
@@ -303,12 +353,14 @@ class TestReinstallIdempotent(unittest.TestCase):
         }))
 
         cls.proc1 = run_install(
-            ["--project", "widgetco", "--store", cls.store, "--code-root", cls.code_root],
+            ["--project", "widgetco", "--store", cls.store, "--code-root", cls.code_root,
+             "--claude-dir", str(Path(cls.home) / ".claude")],
             cls.home,
         )
         cls.settings_after_1 = cls.settings_path.read_text()
         cls.proc2 = run_install(
-            ["--project", "widgetco", "--store", cls.store, "--code-root", cls.code_root],
+            ["--project", "widgetco", "--store", cls.store, "--code-root", cls.code_root,
+             "--claude-dir", str(Path(cls.home) / ".claude")],
             cls.home,
         )
         cls.settings_after_2 = cls.settings_path.read_text()
@@ -367,7 +419,8 @@ class TestDryRun(unittest.TestCase):
             code_root = str(Path(home) / "code")
             os.makedirs(code_root, exist_ok=True)
             proc = run_install(
-                ["--project", "ghost", "--store", store, "--code-root", code_root, "--dry-run"],
+                ["--project", "ghost", "--store", store, "--code-root", code_root,
+                 "--claude-dir", str(Path(home) / ".claude"), "--dry-run"],
                 home,
             )
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -384,8 +437,9 @@ class TestDryRun(unittest.TestCase):
         home = sandbox_home()
         try:
             store = str(Path(home) / "store")
-            run_install(["--project", "p", "--store", store, "--dry-run"], home)
-            proc = run_install(["--project", "p", "--store", store], home)
+            claude_dir = str(Path(home) / ".claude")
+            run_install(["--project", "p", "--store", store, "--claude-dir", claude_dir, "--dry-run"], home)
+            proc = run_install(["--project", "p", "--store", store, "--claude-dir", claude_dir], home)
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertTrue(Path(store).is_dir())
         finally:
@@ -398,7 +452,11 @@ class TestNoCodeRoot(unittest.TestCase):
         home = sandbox_home()
         try:
             store = str(Path(home) / "store")
-            proc = run_install(["--project", "rationale-only", "--store", store], home)
+            proc = run_install(
+                ["--project", "rationale-only", "--store", store,
+                 "--claude-dir", str(Path(home) / ".claude")],
+                home,
+            )
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             data = json.loads((Path(home) / ".claude" / "settings.local.json").read_text())
             self.assertNotIn("PreToolUse", data.get("hooks", {}))
@@ -420,15 +478,17 @@ class TestIdempotentDropToZeroCodeRoots(unittest.TestCase):
             store = str(Path(home) / "store")
             code_root = str(Path(home) / "code")
             os.makedirs(code_root, exist_ok=True)
+            claude_dir = str(Path(home) / ".claude")
             proc1 = run_install(
-                ["--project", "p", "--store", store, "--code-root", code_root], home
+                ["--project", "p", "--store", store, "--code-root", code_root,
+                 "--claude-dir", claude_dir], home
             )
             self.assertEqual(proc1.returncode, 0, proc1.stdout + proc1.stderr)
             settings_path = Path(home) / ".claude" / "settings.local.json"
             data1 = json.loads(settings_path.read_text())
             self.assertIn("PreToolUse", data1["hooks"])
 
-            proc2 = run_install(["--project", "p", "--store", store], home)
+            proc2 = run_install(["--project", "p", "--store", store, "--claude-dir", claude_dir], home)
             self.assertEqual(proc2.returncode, 0, proc2.stdout + proc2.stderr)
             data2 = json.loads(settings_path.read_text())
             self.assertNotIn(
@@ -454,7 +514,8 @@ class TestMultipleCodeRoots(unittest.TestCase):
             os.makedirs(root_b, exist_ok=True)
             proc = run_install(
                 ["--project", "multi", "--store", store,
-                 "--code-root", root_a, "--code-root", root_b],
+                 "--code-root", root_a, "--code-root", root_b,
+                 "--claude-dir", str(Path(home) / ".claude")],
                 home,
             )
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -468,10 +529,15 @@ class TestMultipleCodeRoots(unittest.TestCase):
             self.assertEqual(len(pre_edit_items), 4, pre_edit_items)
             self.assertEqual(len(nudge_items), 2, nudge_items)
 
+            # Fix-round 2026-08-31: `if` filter paths use Claude Code's
+            # permission-rule syntax, where a single leading slash anchors at
+            # the settings source, not the filesystem root -- an absolute
+            # code root (root_a/root_b already start with `/`) needs a
+            # SECOND leading slash to match anything.
             ifs = sorted(h["if"] for h in pre_edit_items)
             self.assertEqual(ifs, sorted([
-                f"Edit({root_a}/**)", f"Write({root_a}/**)",
-                f"Edit({root_b}/**)", f"Write({root_b}/**)",
+                f"Edit(/{root_a}/**)", f"Write(/{root_a}/**)",
+                f"Edit(/{root_b}/**)", f"Write(/{root_b}/**)",
             ]))
             for h in pre_edit_items:
                 if root_a in h["if"]:
@@ -480,7 +546,7 @@ class TestMultipleCodeRoots(unittest.TestCase):
                     self.assertIn(f"MEMCONTINUUM_STRIP_PREFIX={root_b}/", h["command"])
 
             nudge_ifs = sorted(h["if"] for h in nudge_items)
-            self.assertEqual(nudge_ifs, sorted([f"Write({root_a}/**)", f"Write({root_b}/**)"]))
+            self.assertEqual(nudge_ifs, sorted([f"Write(/{root_a}/**)", f"Write(/{root_b}/**)"]))
             for h in nudge_items:
                 root = root_a if root_a in h["if"] else root_b
                 self.assertIn(f"MEMCONTINUUM_CODE_ROOT={root}", h["command"])
@@ -499,7 +565,8 @@ class TestMultipleCodeRoots(unittest.TestCase):
             root_b = str(Path(home) / "code-b")
             proc = run_install(
                 ["--project", "multi", "--store", store,
-                 "--code-root", root_a, "--code-root", root_b, "--dry-run"],
+                 "--code-root", root_a, "--code-root", root_b,
+                 "--claude-dir", str(Path(home) / ".claude"), "--dry-run"],
                 home,
             )
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -519,8 +586,11 @@ class TestSingleHomeTwoProjectIsolation(unittest.TestCase):
         try:
             store_a = str(Path(home) / "store-a")
             store_b = str(Path(home) / "store-b")
-            proc_a = run_install(["--project", "shared-home-a", "--store", store_a], home)
-            proc_b = run_install(["--project", "shared-home-b", "--store", store_b], home)
+            claude_dir = str(Path(home) / ".claude")
+            proc_a = run_install(
+                ["--project", "shared-home-a", "--store", store_a, "--claude-dir", claude_dir], home)
+            proc_b = run_install(
+                ["--project", "shared-home-b", "--store", store_b, "--claude-dir", claude_dir], home)
             self.assertEqual(proc_a.returncode, 0, proc_a.stdout + proc_a.stderr)
             self.assertEqual(proc_b.returncode, 0, proc_b.stdout + proc_b.stderr)
 
@@ -546,8 +616,12 @@ class TestTwoProjectIsolation(unittest.TestCase):
         try:
             store_a = str(Path(home_a) / "store")
             store_b = str(Path(home_b) / "store")
-            proc_a = run_install(["--project", "proj-a", "--store", store_a], home_a)
-            proc_b = run_install(["--project", "proj-b", "--store", store_b], home_b)
+            proc_a = run_install(
+                ["--project", "proj-a", "--store", store_a,
+                 "--claude-dir", str(Path(home_a) / ".claude")], home_a)
+            proc_b = run_install(
+                ["--project", "proj-b", "--store", store_b,
+                 "--claude-dir", str(Path(home_b) / ".claude")], home_b)
             self.assertEqual(proc_a.returncode, 0, proc_a.stdout + proc_a.stderr)
             self.assertEqual(proc_b.returncode, 0, proc_b.stdout + proc_b.stderr)
 
@@ -570,8 +644,13 @@ class TestFailureModes(unittest.TestCase):
         home = sandbox_home()
         try:
             store = str(Path(home) / "store")
+            # --claude-dir given explicitly (R5, round 4: the --claude-dir
+            # refusal now fires before python resolution -- this test is
+            # about the python failure specifically, so it must clear that
+            # earlier pure-argument check first to actually reach it).
             proc = run_install(
-                ["--project", "p", "--store", store, "--python", "/no/such/python"],
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude"),
+                 "--python", "/no/such/python"],
                 home,
             )
             self.assertNotEqual(proc.returncode, 0)
@@ -587,12 +666,14 @@ class TestFailureModes(unittest.TestCase):
             outer.mkdir()
             subprocess.run(["git", "init", "-q", str(outer)], check=True)
             store = str(outer / "nested-store")
-            proc = run_install(["--project", "p", "--store", store], home)
+            claude_dir = str(Path(home) / ".claude")
+            proc = run_install(["--project", "p", "--store", store, "--claude-dir", claude_dir], home)
             self.assertNotEqual(proc.returncode, 0)
             self.assertFalse(Path(store).exists())
 
             # --force overrides
-            proc2 = run_install(["--project", "p", "--store", store, "--force"], home)
+            proc2 = run_install(
+                ["--project", "p", "--store", store, "--claude-dir", claude_dir, "--force"], home)
             self.assertEqual(proc2.returncode, 0, proc2.stdout + proc2.stderr)
             self.assertTrue(Path(store).is_dir())
         finally:
@@ -627,6 +708,11 @@ class TestPreExistingStoreRepo(unittest.TestCase):
             os.makedirs(store)
             subprocess.run(["git", "init", "-q", store], check=True)
             (Path(store) / "seed.txt").write_text("pre-existing content\n")
+            # F10 store-shape marker: a bare git repo with unrelated content
+            # is now refused (see TestAdoptClassification below) -- a
+            # genuine adopt case carries at least one of this tool's markers.
+            os.makedirs(str(Path(store) / "topics"))
+            (Path(store) / "topics" / ".gitkeep").write_text("")
             subprocess.run(
                 ["git", "-C", store, "-c", "user.name=t", "-c", "user.email=t@t.invalid",
                  "add", "-A"], check=True,
@@ -635,7 +721,10 @@ class TestPreExistingStoreRepo(unittest.TestCase):
                 ["git", "-C", store, "-c", "user.name=t", "-c", "user.email=t@t.invalid",
                  "commit", "-q", "-m", "pre-existing commit"], check=True,
             )
-            proc = run_install(["--project", "p", "--store", store], home)
+            proc = run_install(
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude")],
+                home,
+            )
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             log = subprocess.run(
                 ["git", "-C", store, "log", "--oneline"], capture_output=True, text=True
@@ -652,7 +741,15 @@ class TestPreExistingStoreRepo(unittest.TestCase):
             store = str(Path(home) / "store")
             os.makedirs(store)
             subprocess.run(["git", "init", "-q", store], check=True)
-            hand_authored = "# My Hand-Authored Store\n\nDo not overwrite this provenance note.\n"
+            # F10 store-shape marker: a README mentioning MemContinuum is one
+            # of the accepted markers (the other is a topics/incidents/
+            # concepts dir) -- realistic for a hand-authored provenance note
+            # on a MemContinuum store, and required for this to still count
+            # as "adopt" rather than "refuse: no markers".
+            hand_authored = (
+                "# My Hand-Authored MemContinuum Store\n\n"
+                "Do not overwrite this provenance note.\n"
+            )
             (Path(store) / "README.md").write_text(hand_authored)
             (Path(store) / ".gitignore").write_text("*.sqlite\ncustom-ignore-line\n")
             subprocess.run(
@@ -663,7 +760,10 @@ class TestPreExistingStoreRepo(unittest.TestCase):
                 ["git", "-C", store, "-c", "user.name=t", "-c", "user.email=t@t.invalid",
                  "commit", "-q", "-m", "pre-existing commit"], check=True,
             )
-            proc = run_install(["--project", "p", "--store", store], home)
+            proc = run_install(
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude")],
+                home,
+            )
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertEqual((Path(store) / "README.md").read_text(), hand_authored)
             self.assertIn("custom-ignore-line", (Path(store) / ".gitignore").read_text())
@@ -714,16 +814,37 @@ class TestTwoProjectsOneClaudeDir(unittest.TestCase):
     engine's own wiring was destroyed exactly this way by a test run)."""
 
     def test_second_project_does_not_unwire_the_first(self):
+        """F1 regression: each project also gets a --code-root, so each gets
+        a newfile-nudge.sh entry too (the one hook whose template used to
+        render with NO project marker at all -- markerless entries read as
+        "ours" to any project's sweep, so alpha's nudge entry used to vanish
+        the moment beta re-ran against this shared claude-dir)."""
         home = sandbox_home()
         try:
             claude = str(Path(home) / ".claude")
+            code_roots = {}
             for name in ("alpha", "beta"):
                 store = str(Path(home) / f"{name}-store")
+                code_root = str(Path(home) / f"{name}-code")
+                os.makedirs(code_root, exist_ok=True)
+                code_roots[name] = code_root
                 proc = run_install(
-                    ["--project", name, "--store", store, "--claude-dir", claude],
+                    ["--project", name, "--store", store, "--claude-dir", claude,
+                     "--code-root", code_root],
                     home,
                 )
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+            def nudge_items(data):
+                return [
+                    h
+                    for groups in data.get("hooks", {}).values()
+                    for g in groups
+                    if g.get("matcher") == "Write"
+                    for h in g.get("hooks", [])
+                    if "newfile-nudge.sh" in h.get("command", "")
+                ]
+
             text = (Path(claude) / "settings.local.json").read_text(encoding="utf-8")
             data = json.loads(text)
             cmds = [
@@ -734,12 +855,20 @@ class TestTwoProjectsOneClaudeDir(unittest.TestCase):
             ]
             alpha = [c for c in cmds if "MEMCONTINUUM_PROJECT=alpha" in c]
             beta = [c for c in cmds if "MEMCONTINUUM_PROJECT=beta" in c]
-            self.assertGreaterEqual(len(alpha), 5, "first project's wiring was lost")
-            self.assertGreaterEqual(len(beta), 5)
+            # 5 write hooks + pre-edit-chain (Edit+Write) + newfile-nudge = 8
+            # marked entries per project.
+            self.assertGreaterEqual(len(alpha), 8, "first project's wiring was lost")
+            self.assertGreaterEqual(len(beta), 8)
+
+            alpha_nudge = [h for h in nudge_items(data) if "MEMCONTINUUM_PROJECT=alpha" in h["command"]]
+            beta_nudge = [h for h in nudge_items(data) if "MEMCONTINUUM_PROJECT=beta" in h["command"]]
+            self.assertEqual(len(alpha_nudge), 1, nudge_items(data))
+            self.assertEqual(len(beta_nudge), 1, nudge_items(data))
+
             # and a re-run of alpha replaces alpha's entries, not beta's
             proc = run_install(
                 ["--project", "alpha", "--store", str(Path(home) / "alpha-store"),
-                 "--claude-dir", claude], home,
+                 "--claude-dir", claude, "--code-root", code_roots["alpha"]], home,
             )
             self.assertEqual(proc.returncode, 0)
             data = json.loads((Path(claude) / "settings.local.json").read_text(encoding="utf-8"))
@@ -750,10 +879,14 @@ class TestTwoProjectsOneClaudeDir(unittest.TestCase):
                 for i in g.get("hooks", [])
             ]
             self.assertGreaterEqual(
-                len([c for c in cmds if "MEMCONTINUUM_PROJECT=beta" in c]), 5)
+                len([c for c in cmds if "MEMCONTINUUM_PROJECT=beta" in c]), 8)
             self.assertEqual(
                 len([c for c in cmds if "MEMCONTINUUM_PROJECT=alpha" in c]), len(alpha),
                 "alpha re-run duplicated or dropped its own entries")
+            # F1's actual regression target: beta's nudge entry specifically
+            # must still be there after alpha's re-run.
+            beta_nudge_after = [h for h in nudge_items(data) if "MEMCONTINUUM_PROJECT=beta" in h["command"]]
+            self.assertEqual(len(beta_nudge_after), 1, nudge_items(data))
         finally:
             shutil.rmtree(home, ignore_errors=True)
 
@@ -822,7 +955,16 @@ class TestPythonResolutionOrder(unittest.TestCase):
         try:
             install_sh = copy_engine(engine_dir)
             store = str(Path(home) / "store")
-            proc = run_install_at(install_sh, ["--project", "p", "--store", store], home)
+            # --claude-dir given explicitly (R5, round 4: the --claude-dir
+            # refusal now fires before python resolution -- this test is
+            # about the python-resolution failure specifically, so it must
+            # clear that earlier pure-argument check first to actually
+            # reach it).
+            proc = run_install_at(
+                install_sh,
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude")],
+                home,
+            )
             self.assertNotEqual(proc.returncode, 0)
             self.assertIn("--bootstrap-venv", proc.stdout + proc.stderr)
             self.assertFalse(Path(store).exists())
@@ -839,7 +981,9 @@ class TestPythonResolutionOrder(unittest.TestCase):
             write_python_shim(fake_py)
             store = str(Path(home) / "store")
             proc = run_install_at(
-                install_sh, ["--project", "p", "--store", store], home,
+                install_sh,
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude")],
+                home,
                 python=str(fake_py),
             )
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -856,7 +1000,11 @@ class TestPythonResolutionOrder(unittest.TestCase):
             venv_py = Path(engine_dir) / ".venv" / "bin" / "python"
             write_python_shim(venv_py)
             store = str(Path(home) / "store")
-            proc = run_install_at(install_sh, ["--project", "p", "--store", store], home)
+            proc = run_install_at(
+                install_sh,
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude")],
+                home,
+            )
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertIn(f"python      : {venv_py}", proc.stdout)
         finally:
@@ -875,7 +1023,8 @@ class TestPythonResolutionOrder(unittest.TestCase):
             store = str(Path(home) / "store")
             proc = run_install_at(
                 install_sh,
-                ["--project", "p", "--store", store, "--python", str(explicit_py)],
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude"),
+                 "--python", str(explicit_py)],
                 home,
                 python="/no/such/env/python",  # would fail if this ever won
             )
@@ -921,7 +1070,8 @@ class TestBootstrapVenv(unittest.TestCase):
             venv_dir = str(Path(home) / "bootstrapped-venv")
             proc = run_install_at(
                 install_sh,
-                ["--project", "p", "--store", store, "--bootstrap-venv", venv_dir],
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude"),
+                 "--bootstrap-venv", venv_dir],
                 home,
                 path_prepend=[fakebin],
             )
@@ -988,7 +1138,8 @@ chmod +x "$dir/bin/python"
             venv_dir = str(Path(home) / "bootstrapped-venv")
             proc = run_install_at(
                 install_sh,
-                ["--project", "p", "--store", store, "--bootstrap-venv", venv_dir],
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude"),
+                 "--bootstrap-venv", venv_dir],
                 home,
                 extra_env={"PATH": minimal_path},
             )
@@ -1002,6 +1153,284 @@ chmod +x "$dir/bin/python"
             shutil.rmtree(home, ignore_errors=True)
             shutil.rmtree(engine_dir, ignore_errors=True)
             shutil.rmtree(fakebin, ignore_errors=True)
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestClaudeDirRequiredWithExplicitStore(unittest.TestCase):
+    """Fix-round-4 F3 (final ruling): an explicit --store with no explicit
+    --claude-dir is a hard error, not a cwd-based guess -- even a git cwd can
+    be the wrong repo (an explicit --store may be run from anywhere)."""
+
+    def test_explicit_store_without_claude_dir_errors(self):
+        home = sandbox_home()
+        try:
+            # cwd (home) IS a git repo here on purpose -- the ruling is
+            # "no cwd-guessing" full stop, not "only when cwd isn't a repo".
+            subprocess.run(["git", "init", "-q", home], check=True)
+            store = str(Path(home) / "store")
+            proc = run_install(["--project", "p", "--store", store], home)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("--claude-dir", proc.stdout + proc.stderr)
+            self.assertFalse(Path(store).exists())
+            self.assertFalse((Path(home) / ".claude").exists())
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_claude_dir_error_precedes_python_resolution(self):
+        """R5 regression, round 4 gate: the --claude-dir refusal used to run
+        AFTER --bootstrap-venv and python resolution -- an invalid
+        invocation (explicit --store, no --claude-dir, and no python
+        resolvable at all) used to die naming the WRONG problem ("no python
+        found") instead of the actual one. Pure-argument validation must be
+        checked first. python=None here (this checkout ships no .venv/ and
+        the sandbox HOME strips MEMCONTINUUM_PYTHON) means python resolution
+        would ALSO fail if it ever ran -- proving the error we get back is
+        actually the --claude-dir one, not a lucky coincidence."""
+        self.assertFalse(
+            (TOOLS_DIR / ".venv" / "bin" / "python").exists(),
+            "this test relies on no engine .venv existing in this checkout",
+        )
+        home = sandbox_home()
+        try:
+            store = str(Path(home) / "store")
+            proc = run_install(["--project", "p", "--store", store], home, python=None)
+            self.assertNotEqual(proc.returncode, 0)
+            out = proc.stdout + proc.stderr
+            self.assertIn("--claude-dir", out)
+            self.assertNotIn("no python found", out)
+            self.assertFalse(Path(store).exists())
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_explicit_store_with_claude_dir_wires_there(self):
+        home = sandbox_home()
+        try:
+            store = str(Path(home) / "store")
+            claude_dir = str(Path(home) / "somewhere-else" / ".claude")
+            proc = run_install(
+                ["--project", "p", "--store", store, "--claude-dir", claude_dir], home,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertTrue((Path(claude_dir) / "settings.local.json").is_file())
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestAdoptClassification(unittest.TestCase):
+    """Fix-round-4 F10: classification happens BEFORE any mutation. --store
+    at an existing git repo counts as "adopt" only if it already carries one
+    of this tool's markers; otherwise it is refused outright, never silently
+    adopted. An adopted store's memlint findings are report-only (exit 0); a
+    freshly seeded store still hard-fails on any lint error."""
+
+    @staticmethod
+    def _duplicate_id_pair(store, name_a="a", name_b="b"):
+        topics = Path(store) / "topics"
+        topics.mkdir(parents=True, exist_ok=True)
+        for name in (name_a, name_b):
+            (topics / f"{name}.md").write_text(
+                "---\ntype: topic\nid: DUP-1\ntitle: %s\narea: test\n---\nBody\n" % name
+            )
+
+    @staticmethod
+    def _git_commit(store, message):
+        subprocess.run(
+            ["git", "-C", store, "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+             "add", "-A"], check=True,
+        )
+        subprocess.run(
+            ["git", "-C", store, "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+             "commit", "-q", "-m", message], check=True,
+        )
+
+    def test_adopt_with_duplicate_ids_succeeds_with_findings_in_summary(self):
+        home = sandbox_home()
+        try:
+            store = str(Path(home) / "store")
+            os.makedirs(store)
+            subprocess.run(["git", "init", "-q", store], check=True)
+            self._duplicate_id_pair(store)
+            self._git_commit(store, "legacy store with duplicate ids")
+
+            proc = run_install(
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude")],
+                home,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("duplicate id", proc.stdout)
+            self.assertIn("NOTE: adopted store has memlint findings", proc.stdout)
+            self.assertIn("Store install  : adopted", proc.stdout)
+            # hooks were actually wired despite the findings -- report-only
+            # must not mean "install aborted before the useful part."
+            settings = json.loads((Path(home) / ".claude" / "settings.local.json").read_text())
+            self.assertIn("hooks", settings)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_store_as_linked_worktree_adopts_cleanly(self):
+        """R8 regression, round 4 gate (Codex): a store checked out via
+        `git worktree add` has a .git FILE (a gitdir pointer), not a
+        directory -- every `[ -d "$STORE/.git" ]` check used to misread
+        that as "not a git repo at all", so a worktree store was refused
+        outright (the containment check saw it as living inside its own
+        main repo) or, under --force, seeded fresh content on top of the
+        existing worktree. Must adopt cleanly, with no re-seeding, and its
+        post-commit hook must land in the worktree's REAL hooks dir (under
+        the main repo's .git/worktrees/<name>/hooks, not a nonexistent
+        "$STORE/.git/hooks")."""
+        home = sandbox_home()
+        try:
+            main_repo = str(Path(home) / "main-store")
+            os.makedirs(main_repo)
+            subprocess.run(["git", "init", "-q", main_repo], check=True)
+            self._duplicate_id_pair(main_repo, "keepme", "keepme2")
+            # give it real (non-duplicate) shape too, and a distinguishing
+            # marker file so re-seeding would be detectable.
+            topics = Path(main_repo) / "topics"
+            (topics / "keepme.md").unlink()
+            (topics / "keepme2.md").unlink()
+            (topics / "T-0001.md").write_text(
+                "---\ntype: topic\nid: T-0001\ntitle: real\narea: test\n---\nBody\n"
+            )
+            sentinel = Path(main_repo) / "topics" / "SENTINEL.md"
+            sentinel.write_text("---\ntype: topic\nid: SENTINEL-1\ntitle: s\narea: test\n---\nkeep\n")
+            self._git_commit(main_repo, "seed main store")
+
+            worktree = str(Path(home) / "worktree-store")
+            subprocess.run(
+                ["git", "-C", main_repo, "worktree", "add", worktree, "-b", "wt-branch"],
+                check=True, capture_output=True, text=True,
+            )
+            self.assertTrue(Path(worktree, ".git").is_file(), "a linked worktree's .git must be a FILE")
+
+            proc = run_install(
+                ["--project", "p", "--store", worktree, "--claude-dir", str(Path(home) / ".claude")],
+                home,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("adopted", proc.stdout)
+            # No re-seeding: the sentinel content survives untouched.
+            self.assertTrue((Path(worktree) / "topics" / "SENTINEL.md").is_file())
+
+            # Where git actually RUNS hooks for commits in the worktree:
+            # `rev-parse --git-path hooks` (the shared repo's .git/hooks) --
+            # NOT --git-dir (.git/worktrees/<name>), whose hooks/ git never
+            # consults (regate round-2 probe, git 2.43).
+            hooks_dir = subprocess.run(
+                ["git", "-C", worktree, "rev-parse", "--git-path", "hooks"],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
+            if not os.path.isabs(hooks_dir):
+                hooks_dir = str(Path(worktree) / hooks_dir)
+            post_commit = Path(hooks_dir) / "post-commit"
+            self.assertTrue(post_commit.is_file(), f"post-commit hook missing at {post_commit}")
+            self.assertFalse(
+                (Path(worktree) / ".git" / "hooks").exists(),
+                "must never treat the worktree's .git (a FILE) as a hooks-holding directory",
+            )
+
+            # And the wrapper actually FIRES on a real worktree commit: the
+            # install-time reindex left <home>/.memcontinuum/p.sqlite --
+            # delete it, commit in the worktree, and the post-commit
+            # reindex must recreate it.
+            index_db = Path(home) / ".memcontinuum" / "p.sqlite"
+            self.assertTrue(index_db.is_file(), "install-time reindex should have built the index")
+            index_db.unlink()
+            commit_env = dict(os.environ)
+            for k in list(commit_env):
+                if k.startswith("MEMCONTINUUM_"):
+                    del commit_env[k]
+            commit_env["HOME"] = home
+            (Path(worktree) / "topics" / "T-0002.md").write_text(
+                "---\ntype: topic\nid: T-0002\ntitle: wt\narea: test\n---\nBody\n"
+            )
+            subprocess.run(
+                ["git", "-C", worktree, "add", "-A"],
+                check=True, capture_output=True, text=True, env=commit_env,
+            )
+            subprocess.run(
+                ["git", "-C", worktree, "-c", "user.email=t@t", "-c", "user.name=t",
+                 "commit", "-q", "-m", "worktree commit"],
+                check=True, capture_output=True, text=True, env=commit_env,
+            )
+            self.assertTrue(
+                index_db.is_file(),
+                "a commit made in the linked worktree must run the post-commit reindex wrapper",
+            )
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_unrelated_git_repo_store_refused(self):
+        home = sandbox_home()
+        try:
+            store = str(Path(home) / "store")
+            os.makedirs(store)
+            (Path(store) / "unrelated.txt").write_text("just some other repo's content\n")
+            subprocess.run(["git", "init", "-q", store], check=True)
+            self._git_commit(store, "unrelated repo")
+
+            proc = run_install(
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude")],
+                home,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(proc.returncode, 9, proc.stdout + proc.stderr)
+            self.assertIn("none of this tool's markers", proc.stdout + proc.stderr)
+            # nothing was seeded into the unrelated repo, and no --force
+            # carve-out exists for this refusal.
+            self.assertFalse((Path(store) / "topics").exists())
+            self.assertFalse((Path(home) / ".claude").exists())
+
+            proc2 = run_install(
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude"),
+                 "--force"],
+                home,
+            )
+            self.assertNotEqual(proc2.returncode, 0, "no --force carve-out for the shape refusal")
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_fresh_seed_with_planted_duplicate_ids_still_hard_fails(self):
+        """A location that is NOT YET a git repo is always a fresh seed,
+        whatever content it happens to hold -- repo-init.sh will git-init it
+        itself. A lint error there still hard-fails (exit 8): this installer
+        (via reindex/lint of whatever the seed step + any pre-planted
+        content produced) is the only thing that could have put it there."""
+        home = sandbox_home()
+        try:
+            store = str(Path(home) / "store")
+            self._duplicate_id_pair(store)  # store dir exists, NOT a git repo yet
+
+            proc = run_install(
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude")],
+                home,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(proc.returncode, 8, proc.stdout + proc.stderr)
+            self.assertIn("duplicate id", proc.stdout + proc.stderr)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestProjectNameCanonicalization(unittest.TestCase):
+    """Fix-round-4 F8 addendum: --project is restricted to [A-Za-z0-9._-]+,
+    not just "no /" -- it is embedded, unquoted, as a MEMCONTINUUM_PROJECT=
+    identity marker in every hook command line."""
+
+    def test_quote_in_project_name_refused(self):
+        home = sandbox_home()
+        try:
+            store = str(Path(home) / "store")
+            proc = run_install(
+                ["--project", "a'b", "--store", store, "--claude-dir", str(Path(home) / ".claude")],
+                home,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertFalse(Path(store).exists())
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
 
 
 if __name__ == "__main__":

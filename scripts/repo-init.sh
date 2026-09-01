@@ -7,9 +7,13 @@
 # store's git post-commit reindex hook, and runs an initial reindex + lint.
 #
 # Usage:
-#   repo-init.sh --project NAME --store DIR [--code-root DIR ...]
+#   repo-init.sh --project NAME [--store DIR] [--code-root DIR ...]
 #              [--claude-dir DIR] [--python PATH] [--bootstrap-venv [DIR]]
 #              [--dry-run] [--force]
+#
+# An explicit --store REQUIRES an explicit --claude-dir alongside it (fix-
+# round-4 F3) -- omitting --store lets --claude-dir default from the repo the
+# cwd is in instead.
 #
 # See README.md "## Installing into a new project" for the full contract.
 #
@@ -35,6 +39,7 @@ OUR_HOOK_SCRIPTS="pre-edit-chain.sh newfile-nudge.sh ledger-post-edit.sh precomp
 
 PROJECT=""
 STORE=""
+STORE_GIVEN=0
 CLAUDE_DIR=""
 PYTHON_BIN=""
 PYTHON_BIN_EXPLICIT=0
@@ -51,21 +56,33 @@ Usage: repo-init.sh --project NAME [--store DIR] [--code-root DIR ...]
                    [--bootstrap-venv [DIR]] [--dry-run] [--force]
 
   --project NAME     project namespace (used for --project everywhere, and
-                      as the index db filename <NAME>.sqlite). Required.
+                      as the index db filename <NAME>.sqlite). Must match
+                      [A-Za-z0-9._-]+ (it is embedded as an identity marker
+                      in every hook command line). Required.
   --store DIR        the markdown store root to create/wire. Optional: the
                       default is the conventional marked name --
                       "<repo>-MemContinuum-Store" beside the git repo the
                       cwd is in, else "$PWD/MemContinuum-Store". Never a
                       generic "memory/" (collides with other memory
                       systems) and never bare "MemContinuum" (reads as the
-                      tool itself).
+                      tool itself). An existing git repo at DIR with none of
+                      this tool's markers (no topics/incidents/concepts dir,
+                      no README mentioning MemContinuum) is refused, not
+                      silently adopted -- protects against a mistyped
+                      --store landing store dirs in an unrelated repo.
   --code-root DIR     a code checkout the PreToolUse hook should watch for
                       Edit/Write and the write-side hooks should scope
                       ledger entries to. Repeatable. Optional -- omit for a
                       store with no associated code checkout (retrieval-only
                       / rationale-only install).
   --claude-dir DIR    where to merge hook wiring and install the skill.
-                      Defaults to <dirname of --store>/.claude.
+                      Defaults to <dirname of --store>/.claude ONLY when
+                      --store was also omitted (the store then defaults
+                      beside the repo the cwd is in, a reliable signal). An
+                      EXPLICIT --store with no --claude-dir is a hard error
+                      -- an explicit --store may be run from any cwd, so the
+                      cwd is not a reliable signal for where hooks belong;
+                      pass --claude-dir DIR alongside it.
   --python PATH       absolute path to the venv python to use. Overrides
                       every other resolution below. Optional.
   --bootstrap-venv [DIR]
@@ -115,6 +132,38 @@ nearest_existing_ancestor() {
         d="$parent"
     done
     printf '%s' "$d"
+}
+
+# is_git_repo DIR -- true iff DIR is a git working tree, root OR linked
+# worktree (fix-round-4 R8). A linked worktree (`git worktree add`) has a
+# .git FILE (a "gitdir: <path>" pointer), not a directory -- every prior
+# `[ -d "$STORE/.git" ]` check in this script misread that as "not a git
+# repo at all", refusing a worktree store outright (or, under --force,
+# seeding fresh content on top of one). `[ -e ]` accepts either shape;
+# `rev-parse --is-inside-work-tree` confirms it is actually a working tree
+# (not, say, some unrelated directory that merely happens to contain a
+# file or dir named .git) before this counts as a real answer.
+is_git_repo() {
+    [ -e "$1/.git" ] || return 1
+    git -C "$1" rev-parse --is-inside-work-tree >/dev/null 2>&1
+}
+
+# git_hooks_dir_for DIR -- prints the hooks directory git actually consults
+# for commits made in DIR (absolute). `rev-parse --git-path hooks` is the
+# only correct resolver: a root repo's own .git/hooks, but for a linked
+# worktree the SHARED repo's .git/hooks -- git never runs hooks from
+# .git/worktrees/<name>/hooks (verified by live probe, git 2.43, regate
+# round 2) -- and it honors core.hooksPath when someone has set one.
+# Never assume "$DIR/.git/hooks" -- for a worktree .git is a file, not a
+# directory. Returns 1 with nothing printed if DIR is not a git working
+# tree.
+git_hooks_dir_for() {
+    local d
+    d="$(git -C "$1" rev-parse --git-path hooks 2>/dev/null)" || return 1
+    case "$d" in
+        /*) printf '%s' "$d" ;;
+        *)  printf '%s' "$1/$d" ;;
+    esac
 }
 
 # resolve_python -- prints an absolute python path on stdout and returns 0,
@@ -170,7 +219,7 @@ mc_need_value() { [ $# -ge 2 ] || { echo "missing value for $1" >&2; exit 2; }; 
 while [ $# -gt 0 ]; do
     case "$1" in
         --project) mc_need_value "$@"; PROJECT="$2"; shift 2 ;;
-        --store) mc_need_value "$@"; STORE="$2"; shift 2 ;;
+        --store) mc_need_value "$@"; STORE="$2"; STORE_GIVEN=1; shift 2 ;;
         --code-root) mc_need_value "$@"; CODE_ROOTS+=("$2"); shift 2 ;;
         --claude-dir) mc_need_value "$@"; CLAUDE_DIR="$2"; shift 2 ;;
         --python) mc_need_value "$@"; PYTHON_BIN="$2"; PYTHON_BIN_EXPLICIT=1; shift 2 ;;
@@ -226,9 +275,26 @@ if [ -z "$STORE" ]; then
     [ -n "$CLAUDE_DIR" ] && echo "note: hooks will merge into $CLAUDE_DIR"
 fi
 
+# fix-round-4 F8 addendum: canonical identity, not just "no /" -- PROJECT is
+# embedded, unquoted, as a MEMCONTINUUM_PROJECT=<name> identity marker in
+# every hook command line (is_ours()'s project-aware match above depends on
+# it appearing as one bare shell word), so anything a shell would split or
+# glob-expand there is refused outright rather than silently mismatching.
 case "$PROJECT" in
-    */*|"") fail "--project must not contain '/' (got: $PROJECT)" 2 ;;
+    ""|*[!A-Za-z0-9._-]*) fail "--project must match [A-Za-z0-9._-]+ (got: $PROJECT)" 2 ;;
 esac
+
+# fix-round-4 R5: this refusal needs no python and must be checked before
+# any python/venv work below (--bootstrap-venv, resolve_python) -- it used
+# to run only after python resolution, so an invalid invocation (explicit
+# --store, no --claude-dir, no python available) would bootstrap a venv or
+# die naming the WRONG problem ("no python found") before ever reaching
+# the actual one. See where CLAUDE_DIR is actually ASSIGNED below (after
+# python resolves -- that step needs abspath(), which needs $PYTHON_BIN)
+# for the full rationale.
+if [ "$STORE_GIVEN" -eq 1 ] && [ -z "$CLAUDE_DIR" ]; then
+    fail "--store was given explicitly with no --claude-dir -- refusing to guess which .claude the hooks belong in (an explicit --store may be run from any cwd, so the cwd is not a reliable signal). Pass --claude-dir DIR." 2
+fi
 
 # --- python resolution --------------------------------------------------
 #
@@ -263,6 +329,19 @@ fi
 
 STORE="$(abspath "$STORE")"
 if [ -z "$CLAUDE_DIR" ]; then
+    # fix-round-4 F3 (final ruling): an EXPLICIT --store with no --claude-dir
+    # is refused, not guessed -- already checked (and failed, if applicable)
+    # before any python/venv work above (R5). dirname(store)/.claude is
+    # right only when the store sits beside the repo being initialized --
+    # true for the defaulted sibling-store case above, which is the only
+    # way to reach this branch with CLAUDE_DIR still unset (an explicit
+    # --store with no --claude-dir already exited above). A cwd-based
+    # fallback for an explicit --store would reproduce the exact bug this
+    # fixes with a log line: even a git cwd can be the wrong repo (the
+    # command may be run from a test harness, a script, or any unrelated
+    # checkout). The no-store branch above is untouched -- it already
+    # derives CLAUDE_DIR from the repo the cwd is actually in, which IS a
+    # reliable signal there.
     CLAUDE_DIR="$(dirname "$STORE")/.claude"
 else
     CLAUDE_DIR="$(abspath "$CLAUDE_DIR")"
@@ -275,13 +354,42 @@ for cr in "${CODE_ROOTS[@]:-}"; do
 done
 
 # store dir must not already live inside a DIFFERENT git repo's working
-# tree, unless it is already its own repo (the normal re-run case) or
-# --force was given.
-if [ ! -d "$STORE/.git" ] && [ "$FORCE" -eq 0 ]; then
+# tree, unless it is already its own repo (the normal re-run case, a
+# linked worktree included -- R8) or --force was given.
+if ! is_git_repo "$STORE" && [ "$FORCE" -eq 0 ]; then
     ANCESTOR="$(nearest_existing_ancestor "$STORE")"
     if OUTER_TOPLEVEL="$(git -C "$ANCESTOR" rev-parse --show-toplevel 2>/dev/null)"; then
         fail "--store $STORE is inside an existing git repo's tracked tree ($OUTER_TOPLEVEL) -- pass --force to install anyway, or pick a --store outside it" 4
     fi
+fi
+
+# --- classify: fresh seed vs adopt vs refuse (fix-round-4 F10) -------------
+#
+# Must run here, BEFORE any mutation below (step 1 is the first one that
+# writes anything): memlint's duplicate-id promotion used to fire (exit 8)
+# AFTER wiring was already written, when adopting a pre-existing store that
+# happened to carry legacy duplicate ids -- a "successful" install reporting
+# failure (see the lint-handling note near the summary below). Classifying
+# up front also protects against a mistyped --store landing this tool's
+# store directories and a replacement post-commit hook in an unrelated git
+# repo: an existing git repo at --store with none of this tool's markers is
+# refused outright here, never silently adopted -- no --force carve-out,
+# since --force's job is "allow nesting", not "allow adopting the wrong repo".
+STORE_IS_ADOPTED=0
+if is_git_repo "$STORE"; then
+    STORE_HAS_SHAPE=0
+    for d in topics incidents concepts; do
+        [ -d "$STORE/$d" ] && STORE_HAS_SHAPE=1
+    done
+    if [ "$STORE_HAS_SHAPE" -eq 0 ] && [ -f "$STORE/README.md" ]; then
+        case "$(cat "$STORE/README.md" 2>/dev/null)" in
+            *MemContinuum*) STORE_HAS_SHAPE=1 ;;
+        esac
+    fi
+    if [ "$STORE_HAS_SHAPE" -eq 0 ]; then
+        fail "--store $STORE is an existing git repo with none of this tool's markers (no topics/incidents/concepts directory, no README mentioning MemContinuum) -- refusing to seed store directories and a replacement post-commit hook into what looks like an unrelated repo. Point --store at a location that does not exist yet, or at an existing MemContinuum store." 9
+    fi
+    STORE_IS_ADOPTED=1
 fi
 
 # claude-dir (and store's parent) must be writable.
@@ -359,7 +467,7 @@ fi
 
 # --- 3. git init + initial commit ------------------------------------------
 
-if [ -d "$STORE/.git" ]; then
+if is_git_repo "$STORE"; then
     step "store is already a git repo -- skipping git init"
 else
     step "git init $STORE + initial commit"
@@ -393,6 +501,7 @@ MC_INSTALL_HOOKS_DIR="$HOOKS_DIR" \
 MC_INSTALL_TEMPLATES_DIR="$TEMPLATES_DIR" \
 MC_INSTALL_CODE_ROOTS="$CODE_ROOTS_NL" \
 MC_INSTALL_DRY_RUN="$DRY_RUN" \
+MC_INSTALL_SCRIPTS_DIR="$SCRIPT_DIR" \
 "$PYTHON_BIN" - <<'PYEOF'
 import json
 import os
@@ -407,6 +516,11 @@ hooks_dir = os.environ["MC_INSTALL_HOOKS_DIR"]
 templates_dir = os.environ["MC_INSTALL_TEMPLATES_DIR"]
 code_roots = [l for l in os.environ.get("MC_INSTALL_CODE_ROOTS", "").split("\n") if l]
 dry_run = os.environ.get("MC_INSTALL_DRY_RUN", "0") == "1"
+
+# Fix-round-4 F8: the ONE settings merge implementation, shared with
+# memcontinuum-setup.sh -- see scripts/mc_settings_merge.py's own docstring.
+sys.path.insert(0, os.environ["MC_INSTALL_SCRIPTS_DIR"])
+from mc_settings_merge import merge_settings, MergeRefused, basenames_identity
 
 OUR_SCRIPTS = [
     "pre-edit-chain.sh",
@@ -498,14 +612,20 @@ if code_roots:
     # matcher group (matcher "Write" only, never "Edit|Write" -- this hook
     # never fires on an edit to an existing file) appended alongside the
     # pre-edit-chain.sh group above, one `if` entry per --code-root. Never
-    # carries MEMCONTINUUM_ROOT/PROJECT/STRIP_PREFIX -- this hook never
-    # calls memidx.py at all (see its own header comment).
+    # carries MEMCONTINUUM_ROOT/STRIP_PREFIX -- this hook never calls
+    # memidx.py at all (see its own header comment). It DOES carry
+    # MEMCONTINUUM_PROJECT (fix-round-4 F1) -- identity only, the hook itself
+    # never reads it -- so is_ours() below can scope a sweep to this project
+    # and never unwire a coexisting project's nudge entries sharing the same
+    # claude-dir (the bug: a markerless nudge command read as ours/sweepable
+    # regardless of which project's re-run swept it).
     nudge_pair_tmpl = read_tmpl("newfile-nudge-filter-pair.json.tmpl")
     nudge_pairs = []
     for cr in code_roots:
         nudge_pairs.append(render(nudge_pair_tmpl, {
             "CODE_ROOT": esc_json(cr.rstrip("/")),
             "CODE_ROOT_CMD": esc_cmd(cr.rstrip("/")),
+            "PROJECT": esc_cmd(project),
             "PYTHON": esc_cmd(python_bin),
             "HOOKS_DIR": esc_cmd(hooks_dir),
         }))
@@ -523,98 +643,43 @@ if code_roots:
         blocks.setdefault(event, []).extend(groups)
 
 
-def is_ours(hook_item):
-    """Identity-aware (regate finding 1): an entry is THIS install's only when
-    it names one of our scripts AND belongs to this --project. Basename alone
-    silently unwired a coexisting project sharing the same claude-dir -- an
-    accepted topology, since two sibling explicit stores derive the same
-    parent .claude, and exactly how the engine's own wiring was destroyed by
-    a test run. An entry naming our scripts with NO project marker at all is
-    treated as ours (pre-identity legacy wiring, safe to refresh)."""
-    cmd = hook_item.get("command", "")
-    if not any(name in cmd for name in OUR_SCRIPTS):
-        return False
-    if "MEMCONTINUUM_PROJECT=" not in cmd:
-        return True
-    return (
-        f"MEMCONTINUUM_PROJECT={project} " in cmd
-        or cmd.rstrip().endswith(f"MEMCONTINUUM_PROJECT={project}")
-        or f"MEMCONTINUUM_PROJECT='{project}'" in cmd
-    )
-
+# Identity-aware (regate finding 1, F1 nudge fix): an entry is THIS
+# install's only when it names one of our scripts AND belongs to this
+# --project. Basename alone silently unwired a coexisting project sharing
+# the same claude-dir -- an accepted topology, since two sibling explicit
+# stores derive the same parent .claude, and exactly how the engine's own
+# wiring was destroyed by a test run. An entry naming our scripts with NO
+# project marker at all is treated as ours (pre-identity legacy wiring,
+# safe to refresh) -- see README.md/hooks/install-hooks.md for the
+# migration note this implies for pre-F1 nudge entries specifically.
+is_ours = basenames_identity(OUR_SCRIPTS, project)
 
 settings_path = os.path.join(claude_dir, "settings.local.json")
-settings = {}
-if os.path.isfile(settings_path):
-    try:
-        with open(settings_path, "r", encoding="utf-8") as f:
-            raw = f.read()
-        settings = json.loads(raw) if raw.strip() else {}
-    except json.JSONDecodeError as e:
-        print("ERROR: existing %s is not valid JSON: %s" % (settings_path, e), file=sys.stderr)
-        sys.exit(1)
-    if not isinstance(settings, dict):
-        print("ERROR: existing %s does not contain a JSON object at the top level" % settings_path, file=sys.stderr)
-        sys.exit(1)
-
-hooks_section = dict(settings.get("hooks", {}))
 
 # Sweep our script-keyed items out of every event this installer ever
 # writes to -- not just the events the CURRENT run happens to render.
 # Otherwise re-running with fewer --code-roots than a previous run (e.g.
 # down to zero) leaves stale PreToolUse entries behind: idempotency means
 # "this run's config replaces the LAST run's", not "only touch what this
-# run has something new to add."
-ALL_EVENTS = {
+# run has something new to add." merge_settings (fix-round-4 F8) is the
+# ONE settings-merge implementation, shared with memcontinuum-setup.sh --
+# see scripts/mc_settings_merge.py.
+ALL_EVENTS = sorted({
     "PreToolUse", "PostToolUse", "PreCompact",
     "SessionStart", "UserPromptSubmit", "SessionEnd",
-}
+})
 
-for event in ALL_EVENTS:
-    existing_groups = list(hooks_section.get(event, []))
-    kept_groups = []
-    for group in existing_groups:
-        group_hooks = group.get("hooks", [])
-        filtered = [h for h in group_hooks if not is_ours(h)]
-        if filtered:
-            new_group = dict(group)
-            new_group["hooks"] = filtered
-            kept_groups.append(new_group)
-        # else: group became empty (it was entirely ours) -- drop it.
-    new_groups = blocks.get(event, [])
-    merged = kept_groups + new_groups
-    if merged:
-        hooks_section[event] = merged
-    elif event in hooks_section:
-        del hooks_section[event]
+if not dry_run:
+    os.makedirs(claude_dir, exist_ok=True)
 
-settings["hooks"] = hooks_section
-
-if dry_run:
-    print("  (dry-run) would merge these hook entries into %s:" % settings_path)
-    for event in blocks:
-        print("    %s: +%d group(s), scripts: %s" % (
-            event, len(blocks[event]),
-            ", ".join(sorted({s for s in OUR_SCRIPTS if any(
-                s in h.get("command", "") for g in blocks[event] for h in g.get("hooks", [])
-            )})),
-        ))
-    sys.exit(0)
-
-os.makedirs(claude_dir, exist_ok=True)
-
-if os.path.isfile(settings_path):
-    backup_path = settings_path + ".bak-memcontinuum"
-    with open(settings_path, "r", encoding="utf-8") as src, open(backup_path, "w", encoding="utf-8") as dst:
-        dst.write(src.read())
-
-with open(settings_path, "w", encoding="utf-8") as f:
-    json.dump(settings, f, indent=2)
-    f.write("\n")
-
-print("  wrote %s" % settings_path)
-for event in blocks:
-    print("    merged %d group(s) into hooks.%s" % (len(blocks[event]), event))
+try:
+    merge_settings(settings_path, ALL_EVENTS, is_ours, add=blocks, dry_run=dry_run, log=print)
+except MergeRefused as e:
+    print(str(e), file=sys.stderr)
+    sys.exit(1)
+except ValueError as e:
+    print("ERROR: %s" % e, file=sys.stderr)
+    sys.exit(1)
 PYEOF
 MERGE_RC=$?
 [ $MERGE_RC -eq 0 ] || fail "hook wiring failed (see above)" 6
@@ -639,10 +704,16 @@ fi
 # post-commit-reindex.sh are picked up automatically without reinstalling
 # (because the wrapper execs the canonical file, it never copies it).
 
-if [ -d "$STORE/.git" ]; then
-    step "git post-commit reindex wrapper: $STORE/.git/hooks/post-commit -> $HOOKS_DIR/post-commit-reindex.sh"
+if is_git_repo "$STORE"; then
+    # R8 fix, round 4 (corrected in regate round 2): install where git
+    # actually RUNS post-commit for commits in $STORE -- `rev-parse
+    # --git-path hooks` -- which for a linked worktree is the shared
+    # repo's .git/hooks, never .git/worktrees/<name>/hooks.
+    STORE_HOOKS_DIR="$(git_hooks_dir_for "$STORE")" || fail "could not resolve git hooks dir for $STORE"
+    step "git post-commit reindex wrapper: $STORE_HOOKS_DIR/post-commit -> $HOOKS_DIR/post-commit-reindex.sh"
     if [ "$DRY_RUN" -eq 0 ]; then
-        POST_COMMIT="$STORE/.git/hooks/post-commit"
+        mkdir -p "$STORE_HOOKS_DIR" || fail "could not create $STORE_HOOKS_DIR"
+        POST_COMMIT="$STORE_HOOKS_DIR/post-commit"
         {
             printf '#!/usr/bin/env bash\n'
             printf 'export MEMCONTINUUM_ROOT=%s\n' "$(printf '%q' "$STORE")"
@@ -689,23 +760,38 @@ echo "=== Verification summary ==="
 if [ "$DRY_RUN" -eq 1 ]; then
     echo "Dry run only -- nothing was written."
 else
+    if [ "$STORE_IS_ADOPTED" -eq 1 ]; then
+        echo "Store install  : adopted (--store was already a git repo carrying this tool's markers)"
+    else
+        echo "Store install  : fresh seed"
+    fi
     echo "Store tree     : $STORE (${STORE_DIRS[*]})"
     echo "Store README   : $STORE/README.md"
     echo "Store git repo : $STORE/.git"
     echo "Settings file  : $CLAUDE_DIR/settings.local.json"
     echo "Skill installed: $CLAUDE_DIR/skills/memory-search/SKILL.md"
-    if [ -f "$STORE/.git/hooks/post-commit" ]; then
-        echo "Post-commit    : $STORE/.git/hooks/post-commit (wraps $HOOKS_DIR/post-commit-reindex.sh)"
+    if [ -n "${STORE_HOOKS_DIR:-}" ] && [ -f "$STORE_HOOKS_DIR/post-commit" ]; then
+        echo "Post-commit    : $STORE_HOOKS_DIR/post-commit (wraps $HOOKS_DIR/post-commit-reindex.sh)"
     fi
     echo "Reindex        : rc=$REINDEX_RC"
     [ -n "$REINDEX_OUT" ] && echo "$REINDEX_OUT" | sed 's/^/  /'
     echo "Lint           : rc=$LINT_RC"
     [ -n "$LINT_OUT" ] && echo "$LINT_OUT" | sed 's/^/  /'
+    # fix-round-4 F10: for an ADOPTED store, memlint findings are reported
+    # here (above) but do not fail the install -- they reflect PRE-EXISTING
+    # content the adopt, not this installer, introduced (the motivating case:
+    # legacy duplicate ids memlint's duplicate-id check now promotes to an
+    # error). A freshly SEEDED store still hard-fails on any lint error --
+    # nothing but this installer's own templates could have put one there.
+    if [ "$LINT_RC" -ne 0 ] && [ "$STORE_IS_ADOPTED" -eq 1 ]; then
+        echo
+        echo "NOTE: adopted store has memlint findings above (rc=$LINT_RC) -- not fatal for an adopted store (pre-existing content, not this install); fix at your convenience with: PYTHONPATH= $PYTHON_BIN $MEMLINT $STORE"
+    fi
 
     if [ "$REINDEX_RC" -ne 0 ]; then
         fail "reindex failed (rc=$REINDEX_RC) -- see output above" 7
     fi
-    if [ "$LINT_RC" -ne 0 ]; then
+    if [ "$LINT_RC" -ne 0 ] && [ "$STORE_IS_ADOPTED" -eq 0 ]; then
         fail "memlint reported errors (rc=$LINT_RC) -- see output above" 8
     fi
 fi
@@ -731,7 +817,7 @@ else
      $OUR_HOOK_SCRIPTS
    then delete:
      $CLAUDE_DIR/skills/memory-search/
-     $STORE/.git/hooks/post-commit
+     ${STORE_HOOKS_DIR:-$STORE/.git/hooks}/post-commit
      ~/.memcontinuum/$PROJECT.sqlite
    (leave $STORE itself alone -- it is the store's own git history).
 EOF

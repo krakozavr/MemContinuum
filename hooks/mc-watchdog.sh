@@ -2,20 +2,37 @@
 # mc-watchdog.sh -- shared watchdog-launcher Python source (finding 1
 # dedup), sourced by every write-side hook script's guard preamble
 # (ledger-post-edit.sh, precompact-persist.sh, sessionstart-remind.sh,
-# userprompt-remind.sh, sessionend-stamp.sh) BEFORE `source memlib.sh`.
+# userprompt-remind.sh, sessionend-stamp.sh, newfile-nudge.sh) BEFORE
+# `source memlib.sh`.
 #
-# This file does exactly one thing: a single-quoted heredoc assignment to
-# MC_WATCHDOG_LAUNCHER_PY (via `$(cat <<'EOF' ... EOF)`, bash-3.2 safe --
-# no arrays, no [[ ]], no process substitution). No filesystem/mkdir/
-# subprocess work of its own, so sourcing it adds no measurable time ahead
-# of the watchdog's own deadline -- the same invariant
-# test_outer_deadline_covers_memlib_sourcing enforces for memlib.sh itself
-# (nothing slow may run before the guard starts). It is deliberately NOT
-# folded into memlib.sh: that test proves the guard bounds even a
-# slow/hung memlib.sh source by running the guard strictly BEFORE
-# memlib.sh is sourced at all -- a guard living inside memlib.sh would run
-# AFTER any injected slowness in that same file, defeating the exact
-# property under test.
+# This file does two things: a single-quoted heredoc assignment to
+# MC_WATCHDOG_LAUNCHER_PY (via `read -r -d ''`, bash-3.2 safe -- no arrays,
+# no [[ ]], no process substitution, no external `cat`), and resolving
+# MC_GUARD_PY -- the python that launches that watchdog -- via the SAME
+# three-step order memlib.sh uses for MC_PY ($MEMCONTINUUM_PYTHON ->
+# $MEMCONTINUUM_HOME/config.sh -> <engine>/.venv/bin/python; F6 fix, round
+# 4). Before this, the guard preamble in all six hooks resolved python with
+# only two steps (env or engine venv, skipping config.sh), so a non-default
+# venv (--venv elsewhere, or an existing --python handed to
+# memcontinuum-setup.sh) left the watchdog guard itself silently unguarded
+# in every hand/legacy install that relies on config.sh rather than an
+# explicit MEMCONTINUUM_PYTHON in the hook line (installer-rendered hook
+# lines bake MEMCONTINUUM_PYTHON directly and never depended on this step).
+# The config.sh source is swallowed by `|| true`, so a missing/corrupt
+# config.sh can only cost sourcing time, never block a hook -- same
+# fail-open guarantee as memlib.sh's own step. This relies on SCRIPT_DIR
+# already being set by the sourcing hook (every caller sets it before
+# sourcing this file). No filesystem/mkdir/subprocess work beyond that one
+# `[ -f ]` stat and (at most) sourcing a few config.sh assignment lines --
+# nothing that shells out (no `cat`, no `sed`) -- so sourcing this file
+# still adds no more than sourcing cost ahead of the watchdog's own
+# deadline -- the same invariant test_outer_deadline_covers_memlib_sourcing
+# enforces for memlib.sh itself (nothing SLOW, i.e. no external process,
+# may run before the guard starts). It is deliberately NOT folded into
+# memlib.sh: that test proves the guard bounds even a slow/hung memlib.sh
+# source by running the guard strictly BEFORE memlib.sh is sourced at all
+# -- a guard living inside memlib.sh would run AFTER any injected slowness
+# in that same file, defeating the exact property under test.
 #
 # Used as: "$MC_GUARD_PY" -c "$MC_WATCHDOG_LAUNCHER_PY" "${BASH:-bash}"
 # "${BASH_SOURCE[0]}" "$@" -- passing the source text itself (not a file
@@ -152,3 +169,44 @@ except Exception:
     pass
 sys.exit(0)
 MC_WATCHDOG_PY_EOF
+
+# MC_GUARD_PY resolution (F6 fix, round 4) -- see the file header comment
+# above. Mirrors hooks/memlib.sh's own MC_PY resolution exactly; kept
+# separate from memlib.sh because this file is sourced BEFORE memlib.sh
+# (see the header's "deliberately NOT folded into memlib.sh" note). Relies
+# on the sourcing hook having already set SCRIPT_DIR and (optionally)
+# MEMCONTINUUM_HOME.
+# R2/R3 fix, round 4: the file just sourced below may be a POINTER (a
+# custom-HOME install also writes a minimal config.sh at the fixed default
+# path recording only the real MEMCONTINUUM_HOME -- memcontinuum-setup.sh
+# "3. config"). If sourcing it just redefined MEMCONTINUUM_HOME to a
+# DIFFERENT directory than the file we sourced, follow through and source
+# the REAL config.sh too, so MEMCONTINUUM_PYTHON actually resolves there.
+# Unconditional on MEMCONTINUUM_PYTHON already being set (R3): config.sh's
+# own `if [ -z "${MEMCONTINUUM_PYTHON:-}" ]` guard keeps env/baked
+# precedence for PYTHON either way -- the guard itself, and every hook's
+# session state/hook.log under it, must resolve to the real HOME even when
+# PYTHON was already baked into the installer-rendered hook line.
+MEMCONTINUUM_HOME="${MEMCONTINUUM_HOME:-$HOME/.memcontinuum}"
+MC_HOME_CONFIG_1="$MEMCONTINUUM_HOME/config.sh"
+if [ -f "$MC_HOME_CONFIG_1" ]; then
+    # shellcheck source=/dev/null
+    . "$MC_HOME_CONFIG_1" 2>/dev/null || true
+fi
+# A damaged-but-sourceable config may have `unset MEMCONTINUUM_HOME` --
+# re-default after every source so `set -u` can never trip on it (regate
+# round 2).
+MEMCONTINUUM_HOME="${MEMCONTINUUM_HOME:-$HOME/.memcontinuum}"
+if [ "$MEMCONTINUUM_HOME/config.sh" != "$MC_HOME_CONFIG_1" ] && [ -f "$MEMCONTINUUM_HOME/config.sh" ]; then
+    # shellcheck source=/dev/null
+    . "$MEMCONTINUUM_HOME/config.sh" 2>/dev/null || true
+    MEMCONTINUUM_HOME="${MEMCONTINUUM_HOME:-$HOME/.memcontinuum}"
+fi
+unset MC_HOME_CONFIG_1
+# The guarded hook re-execs ITSELF as a child under the launcher -- the
+# child must see the HOME just resolved (possibly via the pointer), or it
+# re-defaults and writes session state/hook.log under ~/.memcontinuum
+# again (regate round 2). Export is safe: same value this chain would
+# resolve, just made visible across the re-exec boundary.
+export MEMCONTINUUM_HOME
+MC_GUARD_PY="${MEMCONTINUUM_PYTHON:-$SCRIPT_DIR/../.venv/bin/python}"

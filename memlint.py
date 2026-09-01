@@ -329,7 +329,7 @@ def lint_root(root: Path, code_root: Path | None = None) -> tuple[list[str], lis
             listing = ", ".join(str(f) for f in files)
             all_warnings.append(
                 f"stem {stem!r} shared by {len(files)} records without explicit ids: {listing} "
-                "-- `chain {0}` is ambiguous; give each an explicit id".format(stem)
+                f"-- `chain {stem}` is ambiguous; give each an explicit id"
             )
     return all_errors, all_warnings
 

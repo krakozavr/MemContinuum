@@ -1,24 +1,34 @@
 #!/usr/bin/env bash
-# memcontinuum-decide.sh <wired|declined|never-ask|ask-again|forget> [--store DIR]
-#                        [--project NAME] [--repo PATH] [--claude-dir DIR]
+# memcontinuum-decide.sh <wired|declined|never-ask|ask-again|forget> --repo PATH
+#                        [--store DIR] [--project NAME] [--claude-dir DIR]
 #
 # Record a human's answer about one repository, so the SessionStart detector
 # never asks again. Called by the `memcontinuum` skill AFTER a human has
 # answered -- never by a hook, and never to guess.
 #
-#   wired      they said yes AND the hooks are actually wired -- refused when no
-#              settings under the repo's .claude (or --claude-dir) references the
-#              seven hook scripts, because a wired row silences the detector
-#              forever whether or not the install ever succeeded
+#   wired      they said yes AND the hooks are actually wired -- refused when
+#              settings under the repo's .claude (or --claude-dir) don't
+#              reference all five always-wired write-side hooks, because a
+#              wired row silences the detector forever whether or not the
+#              install ever succeeded
 #   declined   they said no
 #   forget     drop this repo's row, returning it to "undecided"
 #   never-ask  machine-wide: stop asking in every repo
 #   ask-again  undo never-ask
 #
+# --repo is REQUIRED for wired/declined/forget (fix-round-4 F2): these three
+# actions used to default to $PWD, and every documented invocation in
+# skills/memcontinuum/SKILL.md passed no repo at all -- a shell sitting in
+# the engine checkout recorded "wired" against the ENGINE's key, and the
+# repo the human actually meant stayed undecided forever. There is no safe
+# default for a write that silences a repo permanently; name it explicitly.
+# never-ask/ask-again are machine-wide and take no repo at all.
+#
 # The registry is a TSV at $MEMCONTINUUM_HOME/decisions.tsv:
 #   key <TAB> decision <TAB> iso-date <TAB> note
 # Key = origin remote URL when there is one, else the working tree path --
 # remote-keyed so a repo that moves on disk keeps its decision.
+# --MC-USAGE-END--
 #
 # Known path-key staleness (accepted, reviewer finding 2026-08-31): a NEW repo
 # created at a path whose previous occupant left a path-keyed row inherits
@@ -29,19 +39,25 @@
 
 set -u
 
-MEMCONTINUUM_HOME="${MEMCONTINUUM_HOME:-$HOME/.memcontinuum}"
-DECISIONS="$MEMCONTINUUM_HOME/decisions.tsv"
-TAB="$(printf '\t')"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+# shellcheck source=./mc-registry-lib.sh
+. "$SCRIPT_DIR/mc-registry-lib.sh" || { echo "missing $SCRIPT_DIR/mc-registry-lib.sh -- incomplete checkout" >&2; exit 1; }
 
+mc_resolve_home
+DECISIONS="$MEMCONTINUUM_HOME/decisions.tsv"
+
+# scan to the explicit end marker above rather than a hardcoded line count --
+# a hardcoded `sed -n '2,Np'` silently truncates or overruns usage() every
+# time this header is edited (fix-round-4 finding).
 usage() {
-    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,/^# --MC-USAGE-END--$/p' "$0" | grep -v '^# --MC-USAGE-END--$' | sed 's/^# \{0,1\}//'
     exit "${1:-1}"
 }
 
 [ $# -ge 1 ] || usage 1
 ACTION="$1"; shift
 
-STORE=""; PROJECT=""; REPO_ARG="$PWD"; CLAUDE_DIR_ARG=""
+STORE=""; PROJECT=""; REPO_ARG=""; CLAUDE_DIR_ARG=""
 # A two-argument option with no value must ERROR, not loop: `shift 2` on a
 # one-element argv fails and leaves the argument in place, which spins this
 # loop forever (round-3 reviewer finding, reproduced).
@@ -73,43 +89,37 @@ case "$ACTION" in
     *) echo "unknown action: $ACTION" >&2; usage 1 ;;
 esac
 
-REPO="$(git -C "$REPO_ARG" rev-parse --show-toplevel 2>/dev/null)"
-[ -n "$REPO" ] || { echo "not a git repository: $REPO_ARG" >&2; exit 1; }
+# F2: no $PWD fallback for a write that silences a repo permanently -- see
+# the header note above.
+[ -n "$REPO_ARG" ] || {
+    echo "the '$ACTION' action requires an explicit repo: pass --repo PATH" >&2
+    exit 2
+}
+
+if ! mc_repo_key "$REPO_ARG"; then
+    echo "not a git repository: $REPO_ARG" >&2
+    exit 1
+fi
+REPO="$MC_REPO"
+KEY="$MC_REPO_KEY"
 
 # Recording `wired` is the one write that can lie: a wired row silences the
-# detector forever, whether or not scripts/repo-init.sh ever succeeded. So verify the
-# claim against the repo's own settings before recording it (same seven-
-# basename rule the detector and installer use). --claude-dir points the
+# detector forever, whether or not scripts/repo-init.sh ever succeeded. So
+# verify the claim against the repo's own settings before recording it (same
+# five-basename rule the detector and installer use). --claude-dir points the
 # check elsewhere for projects whose wiring deliberately lives outside the
 # repo (a working-dir .claude beside a bare code checkout, for instance).
 if [ "$ACTION" = "wired" ]; then
     CHECK_DIR="${CLAUDE_DIR_ARG:-$REPO/.claude}"
-    # ALL five always-wired write-side hooks must appear on "command" lines
-    # (any one basename anywhere in the file let a comment or one stale
-    # fragment authorize the permanent record -- round-3 reviewer finding).
-    # The two PreToolUse hooks are excluded: rationale-only installs omit
-    # them legitimately.
-    FOUND=1
-    for base in ledger-post-edit.sh precompact-persist.sh sessionstart-remind.sh userprompt-remind.sh sessionend-stamp.sh; do
-        base_ok=0
-        for settings in "$CHECK_DIR/settings.local.json" "$CHECK_DIR/settings.json"; do
-            [ -f "$settings" ] || continue
-            if grep '"command"' "$settings" 2>/dev/null | grep -qF "$base"; then base_ok=1; break; fi
-        done
-        [ "$base_ok" -eq 1 ] || { FOUND=0; break; }
-    done
-    if [ "$FOUND" -eq 0 ]; then
-        echo "REFUSED: no MemContinuum hook wiring found under $CHECK_DIR -- run the" >&2
-        echo "installer first (the memcontinuum skill does this), or pass --claude-dir" >&2
-        echo "if this repo's wiring deliberately lives elsewhere." >&2
+    mc_wiring_scan "$CHECK_DIR/settings.local.json" "$CHECK_DIR/settings.json"
+    if [ "$MC_WIRING" != "full" ]; then
+        echo "REFUSED: wiring under $CHECK_DIR is '$MC_WIRING', not full -- missing:" >&2
+        echo "  $MC_WIRING_MISSING" >&2
+        echo "Run the installer first (the memcontinuum skill does this), or pass" >&2
+        echo "--claude-dir if this repo's wiring deliberately lives elsewhere." >&2
         exit 1
     fi
 fi
-REMOTE="$(git -C "$REPO" config --get remote.origin.url 2>/dev/null)"
-if [ -n "$REMOTE" ]; then KEY="$REMOTE"; else KEY="$REPO"; fi
-# Same tab/newline sanitization as the detector -- all three key readers and
-# this one writer must agree, or a sanitized key never matches its row.
-KEY="$(printf '%s' "$KEY" | tr '\t\n' '__')"
 
 NOTE=""
 if [ -n "$STORE" ] || [ -n "$PROJECT" ]; then
@@ -123,7 +133,7 @@ TMP="$DECISIONS.tmp.$$"
 {
     if [ -f "$DECISIONS" ]; then
         while IFS= read -r line || [ -n "$line" ]; do
-            k="${line%%$TAB*}"
+            k="${line%%"$MC_TAB"*}"
             [ "$k" = "$KEY" ] && continue
             printf '%s\n' "$line"
         done < "$DECISIONS"

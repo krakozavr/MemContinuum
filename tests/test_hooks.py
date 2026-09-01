@@ -286,6 +286,148 @@ class TestPreEditChainHook(unittest.TestCase):
         log_text = (Path(self.memtool_home) / "hook.log").read_text()
         self.assertIn("poisoned PYTHONPATH not cleared", log_text)
 
+    def test_f_resolves_python_via_config_sh_when_env_unset(self):
+        """F6 regression, round 4: this hook's own python resolution used
+        to be two-step only ($MEMCONTINUUM_PYTHON, else the engine's
+        <engine>/.venv/bin/python) -- skipping the config.sh middle step
+        hooks/memlib.sh already consults. A non-default venv (e.g. --venv
+        pointed elsewhere, or an existing --python handed to
+        memcontinuum-setup.sh) left this hook's own python dead. With
+        MEMCONTINUUM_PYTHON unset from the env and no engine .venv in this
+        checkout, a config.sh at $MEMCONTINUUM_HOME/config.sh is the ONLY
+        way this hook can resolve a python at all -- proven end to end (the
+        hook actually injects the real chain), not just by inspecting the
+        resolved path."""
+        self.assertFalse(
+            (TOOLS_DIR / ".venv" / "bin" / "python").exists(),
+            "this test relies on no engine .venv existing in this checkout",
+        )
+        config_sh = Path(self.memtool_home) / "config.sh"
+        config_sh.write_text(f'MEMCONTINUUM_PYTHON="{VENV_PYTHON}"\n')
+        self.addCleanup(lambda: config_sh.unlink(missing_ok=True))
+
+        payload = self._matching_payload()
+        env = clean_env(
+            MEMCONTINUUM_HOME=self.memtool_home,
+            MEMCONTINUUM_PROJECT=self.project,
+            MEMCONTINUUM_STRIP_PREFIX="/fake/repo/",
+        )
+        env.pop("MEMCONTINUUM_PYTHON", None)
+        proc, elapsed = run_hook(payload, env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertLess(elapsed, 1.0, f"hook took {elapsed:.3f}s")
+        self.assertTrue(proc.stdout.strip(), "expected additionalContext output, got nothing")
+        out = json.loads(proc.stdout)
+        self.assertIn("TOP-0042", out["hookSpecificOutput"]["additionalContext"])
+
+    def test_r2_resolves_python_via_pointer_config_at_custom_home(self):
+        """R2 regression, round 4 gate: a custom-HOME install also writes a
+        minimal POINTER config.sh at the fixed default $HOME/.memcontinuum
+        (memcontinuum-setup.sh "3. config") recording only the real
+        MEMCONTINUUM_HOME -- it carries no MEMCONTINUUM_PYTHON. With NO
+        MEMCONTINUUM_HOME in this hook's own environment (every installed
+        hook line, by construction), the old single-source step read only
+        that pointer and stopped there, leaving MEMCONTINUUM_PYTHON
+        unresolved. Must follow through to the REAL config.sh at the
+        pointed-at home to find it -- proven end to end, not by inspecting
+        a resolved path."""
+        self.assertFalse(
+            (TOOLS_DIR / ".venv" / "bin" / "python").exists(),
+            "this test relies on no engine .venv existing in this checkout",
+        )
+        fake_home = Path(self.tmp) / "r2-fake-home"
+        default_mc_home = fake_home / ".memcontinuum"
+        default_mc_home.mkdir(parents=True)
+        custom_home = Path(self.tmp) / "r2-custom-mc-home"
+        custom_home.mkdir()
+        (default_mc_home / "config.sh").write_text(
+            f"MEMCONTINUUM_HOME='{custom_home}'\n"
+        )
+        (custom_home / "config.sh").write_text(
+            f"MEMCONTINUUM_PYTHON='{VENV_PYTHON}'\nMEMCONTINUUM_HOME='{custom_home}'\n"
+        )
+        # The prebuilt index lives at cls.memtool_home -- copy it under the
+        # CUSTOM home too, since DB_PATH is derived from MEMCONTINUUM_HOME.
+        shutil.copyfile(
+            Path(self.memtool_home) / f"{self.project}.sqlite",
+            custom_home / f"{self.project}.sqlite",
+        )
+
+        payload = self._matching_payload()
+        env = clean_env(
+            HOME=str(fake_home),
+            MEMCONTINUUM_PROJECT=self.project,
+            MEMCONTINUUM_STRIP_PREFIX="/fake/repo/",
+        )
+        env.pop("MEMCONTINUUM_HOME", None)
+        env.pop("MEMCONTINUUM_PYTHON", None)
+        proc, elapsed = run_hook(payload, env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertLess(elapsed, 1.0, f"hook took {elapsed:.3f}s")
+        self.assertTrue(proc.stdout.strip(), "expected additionalContext output, got nothing")
+        out = json.loads(proc.stdout)
+        self.assertIn("TOP-0042", out["hookSpecificOutput"]["additionalContext"])
+        # R3: the hook's own log must land under the REAL (custom) home,
+        # never the default one the pointer lives at.
+        self.assertTrue((custom_home / "hook.log").exists())
+        self.assertFalse((default_mc_home / "hook.log").exists())
+
+
+POST_COMMIT_HOOK = TOOLS_DIR / "hooks" / "post-commit-reindex.sh"
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestPostCommitReindexHook(unittest.TestCase):
+    def test_bash_syntax_is_valid(self):
+        result = subprocess.run([MC_BASH, "-n", str(POST_COMMIT_HOOK)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_r2_resolves_python_via_pointer_config_at_custom_home(self):
+        """R2 regression, round 4 gate: see TestPreEditChainHook's twin --
+        same pointer-then-follow-through chain, this time for the store's
+        git post-commit hook. With no MEMCONTINUUM_PYTHON/HOME in the
+        environment and no engine .venv, only the REAL config.sh at the
+        pointed-at custom home can resolve a working python; the old
+        single-source step stopped at the pointer and never found it, so
+        the reindex silently failed (logged, never blocking the commit --
+        but the index then never actually updates)."""
+        self.assertFalse(
+            (TOOLS_DIR / ".venv" / "bin" / "python").exists(),
+            "this test relies on no engine .venv existing in this checkout",
+        )
+        tmp = tempfile.mkdtemp(prefix="memcontinuum-postcommit-test-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        fake_home = Path(tmp) / "fake-home"
+        default_mc_home = fake_home / ".memcontinuum"
+        default_mc_home.mkdir(parents=True)
+        custom_home = Path(tmp) / "custom-mc-home"
+        custom_home.mkdir()
+        (default_mc_home / "config.sh").write_text(f"MEMCONTINUUM_HOME='{custom_home}'\n")
+        (custom_home / "config.sh").write_text(
+            f"MEMCONTINUUM_PYTHON='{VENV_PYTHON}'\nMEMCONTINUUM_HOME='{custom_home}'\n"
+        )
+
+        store_root = Path(tmp) / "store"
+        (store_root / "topics").mkdir(parents=True)
+        (store_root / "topics" / "T-0001.md").write_text(
+            "---\nid: T-0001\ntitle: Test\nstatus: active\n---\nbody\n"
+        )
+
+        env = clean_env(HOME=str(fake_home), MEMCONTINUUM_ROOT=str(store_root), MEMCONTINUUM_PROJECT="pc-test")
+        env.pop("MEMCONTINUUM_HOME", None)
+        env.pop("MEMCONTINUUM_PYTHON", None)
+        proc = subprocess.run(
+            [MC_BASH, str(POST_COMMIT_HOOK)], capture_output=True, text=True, env=env, timeout=15,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(
+            (custom_home / "pc-test.sqlite").exists(),
+            "the reindex must have actually run against a python resolved via the pointer chain",
+        )
+        log_text = (custom_home / "hook.log").read_text()
+        self.assertIn("rc=0", log_text, log_text)
+        self.assertFalse((default_mc_home / "pc-test.sqlite").exists())
+
 
 class TestMemorySearchSkill(unittest.TestCase):
     def test_e_skill_frontmatter_has_name_and_description(self):

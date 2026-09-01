@@ -28,19 +28,40 @@
 #   --claude-dir DIR  user-level Claude Code directory. Default ~/.claude.
 #   --no-model-warm   skip the one-time embedding-model download.
 #   --dry-run         print the plan, write nothing.
-#   --uninstall       remove the user-level hook + skill and the config file.
-#                     Never touches a venv, a store, or any per-repo wiring.
+#   --uninstall       remove the user-level hook + skill and BOTH config
+#                     artifacts (see MEMCONTINUUM_HOME below). Never touches
+#                     a venv, a store, or any per-repo wiring.
 #
 # Why the model warm is on by default: fastembed downloads ~100 MB the first
 # time anything needs to embed. Left lazy, that download happens inside
 # somebody's first reindex -- or worse, inside a hook -- looking like a hang.
 # Better to pay it here, visibly, once.
+#
+# MEMCONTINUUM_HOME (fix-round-4 F7): when this env var is set to something
+# other than the fixed default $HOME/.memcontinuum, config.sh is written
+# there AS USUAL, but a second, minimal "pointer" config.sh is ALSO written
+# at the fixed default path recording the real MEMCONTINUUM_HOME. The
+# detector hook's installed command line does not bake MEMCONTINUUM_HOME in
+# any more (a baked value and this registry used to disagree -- two
+# registries, a decline that never silenced the ask); every consumer
+# (detector, decide.sh, state.sh) now resolves it the same way: env ->
+# pointer at the fixed default -> the fixed default itself. See
+# scripts/mc-registry-lib.sh mc_resolve_home.
+# --MC-USAGE-END--
 
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
-MEMCONTINUUM_HOME="${MEMCONTINUUM_HOME:-$HOME/.memcontinuum}"
+DEFAULT_MEMCONTINUUM_HOME="$HOME/.memcontinuum"
+# R4 fix, round 4: captured BEFORE the env-or-default fallback below so
+# --uninstall can tell "no env var at all" (must still follow the pointer
+# chain to find a custom-HOME install) apart from "env var equals the
+# default" (nothing to follow).
+MEMCONTINUUM_HOME_ENV_SET=0
+[ -n "${MEMCONTINUUM_HOME:-}" ] && MEMCONTINUUM_HOME_ENV_SET=1
+MEMCONTINUUM_HOME="${MEMCONTINUUM_HOME:-$DEFAULT_MEMCONTINUUM_HOME}"
 CONFIG="$MEMCONTINUUM_HOME/config.sh"
+POINTER_CONFIG="$DEFAULT_MEMCONTINUUM_HOME/config.sh"
 DETECT_HOOK="$SCRIPT_DIR/hooks/memcontinuum-detect.sh"
 SKILL_SRC="$SCRIPT_DIR/skills/memcontinuum/SKILL.md"
 
@@ -51,7 +72,13 @@ MODEL_WARM=1
 DRY_RUN=0
 UNINSTALL=0
 
-usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
+# scan to the explicit end marker above rather than a hardcoded line count --
+# a hardcoded `sed -n '2,Np'` silently truncates or overruns usage() every
+# time this header is edited (fix-round-4 finding, same as decide.sh).
+usage() {
+    sed -n '2,/^# --MC-USAGE-END--$/p' "$0" | grep -v '^# --MC-USAGE-END--$' | sed 's/^# \{0,1\}//'
+    exit "${1:-1}"
+}
 
 # A two-argument option with no value must ERROR, not loop: a failed
 # `shift 2` leaves the argument in place and spins forever (reviewer
@@ -80,98 +107,29 @@ BOOT_PY="$(command -v python3 2>/dev/null)"
 [ -n "$BOOT_PY" ] || die "no python3 on PATH -- MemContinuum needs Python 3.10+ (see README.md Requirements)"
 
 # ---------------------------------------------------------------------------
-# settings.json merge. Ours is identified by the detector script's basename
-# appearing in a hook item's command -- the same rule scripts/repo-init.sh uses for the
-# seven per-project hooks, and for the same reason: it survives the user
-# editing paths or reordering groups, and it drops only our own items, never a
-# foreign hook that happens to share a group.
+# settings.json merge, via the ONE shared implementation (fix-round-4 F8):
+# scripts/mc_settings_merge.py, also used by scripts/repo-init.sh for the
+# seven per-project hooks. Ours is identified by the detector script's
+# basename appearing in a hook item's command (bare-needle -- this is the
+# one machine-wide detector entry, no per-project concept) -- the same
+# reasoning scripts/repo-init.sh's project-aware rule follows: it survives
+# the user editing paths or reordering groups, and it drops only our own
+# items, never a foreign hook that happens to share a group. The command
+# line is passed as a plain argv value (never assembled into JSON in bash)
+# so a checkout path with a quote or a space needs no shell-side escaping.
 # ---------------------------------------------------------------------------
+MC_SETTINGS_MERGE="$SCRIPT_DIR/scripts/mc_settings_merge.py"
 merge_settings() {
     local settings="$1" mode="$2" command_line="${3:-}"
-    env PYTHONPATH= "$BOOT_PY" - "$settings" "$mode" "$command_line" <<'PY'
-import json, os, shutil, sys
-
-path, mode, command_line = sys.argv[1], sys.argv[2], sys.argv[3]
-NEEDLE = "memcontinuum-detect.sh"
-
-data = {}
-orig_mode = None
-if os.path.exists(path):
-    orig_mode = os.stat(path).st_mode & 0o7777
-    try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception as e:
-        print(f"REFUSED: {path} is not valid JSON ({e}) -- fix or move it first", file=sys.stderr)
-        sys.exit(2)
-    if not isinstance(data, dict):
-        print(f"REFUSED: {path} is not a JSON object", file=sys.stderr)
-        sys.exit(2)
-    # copy2 keeps the original mode on the backup; the rewrite below restores
-    # it on the new file -- a 0600 settings file must not come back 0644
-    # under a default umask (reviewer finding).
-    shutil.copy2(path, path + ".bak-memcontinuum")
-
-hooks = data.get("hooks")
-if hooks is None:
-    hooks = {}
-elif not isinstance(hooks, dict):
-    print(f"REFUSED: {path} has a non-object \"hooks\" value -- fix or move it first", file=sys.stderr)
-    sys.exit(2)
-groups = hooks.get("SessionStart")
-if groups is None:
-    groups = []
-elif not isinstance(groups, list):
-    print(f"REFUSED: {path} has a non-list hooks.SessionStart -- fix or move it first", file=sys.stderr)
-    sys.exit(2)
-
-# Drop only our own items, per item rather than per group, then drop any group
-# left with nothing in it. Everything else in the file is untouched.
-cleaned = []
-for group in groups:
-    if not isinstance(group, dict):
-        cleaned.append(group)
-        continue
-    items = group.get("hooks")
-    if not isinstance(items, list):
-        cleaned.append(group)
-        continue
-    kept = [
-        it for it in items
-        if not (isinstance(it, dict) and NEEDLE in str(it.get("command", "")))
-    ]
-    if kept:
-        g = dict(group)
-        g["hooks"] = kept
-        cleaned.append(g)
-
-if mode == "install":
-    cleaned.append({"hooks": [{"type": "command", "command": command_line}]})
-
-if cleaned:
-    hooks["SessionStart"] = cleaned
-else:
-    hooks.pop("SessionStart", None)
-
-if hooks:
-    data["hooks"] = hooks
-else:
-    data.pop("hooks", None)
-
-# Atomic replace: this is the user's GLOBAL Claude settings -- a truncate-
-# in-place write interrupted mid-dump would take down every session on the
-# machine. Temp file in the same directory, then os.replace, same as
-# scripts/memcontinuum-decide.sh does for its registry.
-os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-tmp = path + ".tmp-memcontinuum"
-with open(tmp, "w", encoding="utf-8") as f:
-    json.dump(data, f, indent=2)
-    f.write("\n")
-if orig_mode is not None:
-    os.chmod(tmp, orig_mode)
-os.replace(tmp, path)
-print("ok")
-PY
+    local add_json="{}"
+    if [ "$mode" = "install" ]; then
+        add_json="$(env PYTHONPATH= "$BOOT_PY" -c '
+import json, sys
+print(json.dumps({"SessionStart": [{"hooks": [{"type": "command", "command": sys.argv[1]}]}]}))
+' "$command_line")" || return 1
+    fi
+    env PYTHONPATH= "$BOOT_PY" "$MC_SETTINGS_MERGE" "$settings" \
+        --events SessionStart --needle memcontinuum-detect.sh --add "$add_json"
 }
 
 SETTINGS="$CLAUDE_DIR/settings.json"
@@ -184,7 +142,11 @@ SKILL_DST_DIR="$CLAUDE_DIR/skills/memcontinuum"
 # which a zip download or a core.filemode=false clone can drop -- is
 # irrelevant to whether the machine layer works at all.
 sh_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
-HOOK_CMD="MEMCONTINUUM_HOME=$(sh_quote "$MEMCONTINUUM_HOME") bash $(sh_quote "$DETECT_HOOK")"
+# No MEMCONTINUUM_HOME= prefix any more (F7): a baked setup-time value here
+# used to disagree with whatever decide.sh/state.sh resolved on their own --
+# two registries, silently. The detector now resolves it itself, the same
+# way, via scripts/mc-registry-lib.sh mc_resolve_home.
+HOOK_CMD="bash $(sh_quote "$DETECT_HOOK")"
 
 # ---------------------------------------------------------------------------
 # Uninstall: user-level pieces only. A venv is shared with anything else that
@@ -192,6 +154,20 @@ HOOK_CMD="MEMCONTINUUM_HOME=$(sh_quote "$MEMCONTINUUM_HOME") bash $(sh_quote "$D
 # ---------------------------------------------------------------------------
 if [ "$UNINSTALL" -eq 1 ]; then
     say "=== MemContinuum bootstrap --uninstall ==="
+    # R4 fix, round 4: with NO MEMCONTINUUM_HOME in the environment,
+    # MEMCONTINUUM_HOME above resolved to the fixed default -- but a
+    # custom-HOME install left the REAL config.sh elsewhere and only a
+    # pointer at that default path. Follow the same chain every consumer
+    # uses (env -> pointer at the fixed default -> the fixed default
+    # itself) before deciding what to remove, or this only ever deletes
+    # the pointer and leaves the real config (and its artifacts) behind.
+    if [ "$MEMCONTINUUM_HOME_ENV_SET" -eq 0 ] && [ -f "$POINTER_CONFIG" ]; then
+        POINTED_HOME="$(. "$POINTER_CONFIG" 2>/dev/null; printf '%s' "${MEMCONTINUUM_HOME:-}")"
+        if [ -n "$POINTED_HOME" ] && [ "$POINTED_HOME" != "$DEFAULT_MEMCONTINUUM_HOME" ]; then
+            MEMCONTINUUM_HOME="$POINTED_HOME"
+            CONFIG="$MEMCONTINUUM_HOME/config.sh"
+        fi
+    fi
     if [ -f "$SETTINGS" ]; then
         if [ "$DRY_RUN" -eq 1 ]; then
             plan "remove the detector hook from $SETTINGS (backup: $SETTINGS.bak-memcontinuum)"
@@ -204,6 +180,16 @@ if [ "$UNINSTALL" -eq 1 ]; then
     [ "$DRY_RUN" -eq 0 ] && rm -rf "$SKILL_DST_DIR"
     plan "remove $CONFIG"
     [ "$DRY_RUN" -eq 0 ] && rm -f "$CONFIG"
+    # F7: remove the pointer config too, but ONLY if it points at THIS
+    # MEMCONTINUUM_HOME -- an unrelated install's pointer at the same fixed
+    # default path is not ours to delete.
+    if [ "$MEMCONTINUUM_HOME" != "$DEFAULT_MEMCONTINUUM_HOME" ] && [ -f "$POINTER_CONFIG" ]; then
+        POINTED_HOME="$(. "$POINTER_CONFIG" 2>/dev/null; printf '%s' "${MEMCONTINUUM_HOME:-}")"
+        if [ "$POINTED_HOME" = "$MEMCONTINUUM_HOME" ]; then
+            plan "remove pointer $POINTER_CONFIG"
+            [ "$DRY_RUN" -eq 0 ] && rm -f "$POINTER_CONFIG"
+        fi
+    fi
     say ""
     say "Left alone on purpose: the venv, every store, every per-repo wiring,"
     say "and $MEMCONTINUUM_HOME/decisions.tsv (your answers, not an artifact)."
@@ -218,6 +204,7 @@ say ""
 
 [ -f "$DETECT_HOOK" ] || die "missing $DETECT_HOOK -- is this a complete checkout?"
 [ -f "$SKILL_SRC" ] || die "missing $SKILL_SRC -- is this a complete checkout?"
+[ -f "$MC_SETTINGS_MERGE" ] || die "missing $MC_SETTINGS_MERGE -- is this a complete checkout?"
 
 # ---------------------------------------------------------------------------
 # 1. python
@@ -290,32 +277,64 @@ fi
 #
 # One sourceable file, deliberately shell rather than JSON: hooks/memlib.sh
 # reads it on every hook invocation and must not need python to do so.
+#
+# F7: MEMCONTINUUM_HOME is now recorded here too (it used to live only in the
+# detector's baked-in hook line, which decide.sh/state.sh never read -- two
+# registries, and a decline never silenced the ask). When MEMCONTINUUM_HOME
+# is the fixed default, that's the whole story. When it's custom, a second,
+# minimal pointer config.sh is ALSO written at the fixed default path, so a
+# shell with no MEMCONTINUUM_HOME in its environment (every hook invocation,
+# by construction) can still find the real one -- see mc_resolve_home in
+# scripts/mc-registry-lib.sh.
 # ---------------------------------------------------------------------------
 say ""
 say "3. config"
 plan "write $CONFIG"
+IS_CUSTOM_HOME=0
+[ "$MEMCONTINUUM_HOME" = "$DEFAULT_MEMCONTINUUM_HOME" ] || IS_CUSTOM_HOME=1
+[ "$IS_CUSTOM_HOME" -eq 1 ] && plan "write pointer $POINTER_CONFIG (MEMCONTINUUM_HOME is custom)"
 if [ "$DRY_RUN" -eq 0 ]; then
     mkdir -p "$MEMCONTINUUM_HOME" || die "cannot create $MEMCONTINUUM_HOME"
     # config.sh is SOURCED by every hook, so its values are serialized with
     # sh_quote (single-quoted, embedded quotes escaped) -- a raw
     # double-quoted interpolation would let a backtick or $() in a path
-    # execute on every hook invocation (reviewer finding). A newline in
-    # either path cannot be quoted safely into a sourceable line at all, so
+    # execute on every hook invocation (reviewer finding). A newline in any
+    # of the three cannot be quoted safely into a sourceable line at all, so
     # it is refused outright.
     # NB: $(printf '\n') would strip its own trailing newline and match
     # everything -- the ANSI-C quoted literal does not (bash 2.0+).
     MC_NL=$'\n'
-    case "$SCRIPT_DIR$PYTHON_BIN" in *"$MC_NL"*) die "engine or python path contains a newline -- unsupported" ;; esac
+    case "$SCRIPT_DIR$PYTHON_BIN$MEMCONTINUUM_HOME" in
+        *"$MC_NL"*) die "engine, python, or MEMCONTINUUM_HOME path contains a newline -- unsupported" ;;
+    esac
     Q_ENGINE="$(sh_quote "$SCRIPT_DIR")"
     Q_PYTHON="$(sh_quote "$PYTHON_BIN")"
+    Q_HOME="$(sh_quote "$MEMCONTINUUM_HOME")"
+    # Machine backup rule: never overwrite a config a previous setup wrote
+    # without keeping a copy.
+    [ -f "$CONFIG" ] && cp "$CONFIG" "$CONFIG.bak-memcontinuum"
     cat > "$CONFIG" <<CONF
 # MemContinuum machine config -- written by memcontinuum-setup.sh $(date +%Y-%m-%d).
-# Sourced by hooks/memlib.sh and scripts/memcontinuum-state.sh. Shell, not
+# Sourced by hooks/memlib.sh, scripts/memcontinuum-state.sh, -decide.sh, and
+# hooks/memcontinuum-detect.sh (via scripts/mc-registry-lib.sh). Shell, not
 # JSON, so a hook can read it without starting python. Values are
 # single-quoted by sh_quote; do not hand-edit into double quotes.
 MEMCONTINUUM_ENGINE=$Q_ENGINE
 if [ -z "\${MEMCONTINUUM_PYTHON:-}" ]; then MEMCONTINUUM_PYTHON=$Q_PYTHON; fi
+MEMCONTINUUM_HOME=$Q_HOME
 CONF
+    if [ "$IS_CUSTOM_HOME" -eq 1 ]; then
+        mkdir -p "$DEFAULT_MEMCONTINUUM_HOME" || die "cannot create $DEFAULT_MEMCONTINUUM_HOME"
+        [ -f "$POINTER_CONFIG" ] && cp "$POINTER_CONFIG" "$POINTER_CONFIG.bak-memcontinuum"
+        cat > "$POINTER_CONFIG" <<CONF
+# MemContinuum pointer config -- written by memcontinuum-setup.sh $(date +%Y-%m-%d)
+# because MEMCONTINUUM_HOME was set to a non-default location at setup time.
+# The real config lives at \$MEMCONTINUUM_HOME/config.sh; this file exists
+# only so a shell with no MEMCONTINUUM_HOME in its environment can still find
+# it. See mc_resolve_home in scripts/mc-registry-lib.sh.
+MEMCONTINUUM_HOME=$Q_HOME
+CONF
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -326,6 +345,8 @@ say "4. user-level install"
 plan "copy skill -> $SKILL_DST_DIR/SKILL.md"
 if [ "$DRY_RUN" -eq 0 ]; then
     mkdir -p "$SKILL_DST_DIR" || die "cannot create $SKILL_DST_DIR"
+    # Machine backup rule: keep the previous installed copy before overwrite.
+    [ -f "$SKILL_DST_DIR/SKILL.md" ] && cp "$SKILL_DST_DIR/SKILL.md" "$SKILL_DST_DIR/SKILL.md.bak-memcontinuum"
     cp "$SKILL_SRC" "$SKILL_DST_DIR/SKILL.md" || die "skill copy failed"
 fi
 plan "merge SessionStart detector into $SETTINGS"

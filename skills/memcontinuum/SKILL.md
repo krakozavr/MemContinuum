@@ -19,16 +19,38 @@ and the human has not actually answered yet, stop and ask them first.
 # config.sh is sourceable shell (values are single-quoted by sh_quote) --
 # SOURCE it, never parse it with sed/tr: quote-stripping broke the moment
 # the quoting style changed (regate finding, 2026-08-31).
-. "${MEMCONTINUUM_HOME:-$HOME/.memcontinuum}/config.sh"
+#
+# Two-step, round-4 R2 fix: the fixed default path may hold only a POINTER
+# (a custom-HOME install also writes a minimal config.sh at
+# $HOME/.memcontinuum recording just the real MEMCONTINUUM_HOME -- see
+# memcontinuum-setup.sh "3. config"). Source the default/env path first;
+# if that just redefined MEMCONTINUUM_HOME to a different directory, it
+# was a pointer -- follow through and source the REAL config.sh there too,
+# or MEMCONTINUUM_ENGINE stays empty under a custom HOME.
+MC_HOME_CONFIG_1="${MEMCONTINUUM_HOME:-$HOME/.memcontinuum}/config.sh"
+[ -f "$MC_HOME_CONFIG_1" ] && . "$MC_HOME_CONFIG_1"
+if [ -n "${MEMCONTINUUM_HOME:-}" ] && [ "$MEMCONTINUUM_HOME/config.sh" != "$MC_HOME_CONFIG_1" ]; then
+    . "$MEMCONTINUUM_HOME/config.sh"
+fi
 ENGINE="$MEMCONTINUUM_ENGINE"
-bash "$ENGINE/scripts/memcontinuum-state.sh"          # add a path to inspect another repo
+bash "$ENGINE/scripts/memcontinuum-state.sh" REPO     # the repo you're deciding for, not $PWD
 ```
 
-It prints one `state=` line: `wired`, `declined`, `undecided`, `not-a-repo`, or
-`no-config`, plus the repo key, store path and project name where they apply.
-Report that state plainly; never guess it from the presence of a directory.
+It prints `decision=` (`wired`, `declined`, or `none` -- the human's recorded
+answer, when there is one) and `wiring=` (`full`, `partial`, or `none` --
+what the repo's `.claude` settings actually contain right now, plus
+`missing=<basenames>` when partial) as two SEPARATE facts: a hand-edited
+settings file or an interrupted install can leave them disagreeing. It also
+prints a backward-compatible `state=` line -- `wired`, `declined`,
+`partial-wired` (no recorded decision, and only SOME of the five hooks are
+present -- SessionStart's detector DOES ask here, same as `undecided`: a
+half-wired repo with no recorded decision is still an open question, not a
+grandfathered install), `undecided`, `not-a-repo`, or `no-config` -- plus
+the repo key, store path and project name where they apply. Report
+`decision`/`wiring` plainly when they disagree; never guess either one from
+the presence of a directory.
 
-## 2. Ask, if the state is `undecided`
+## 2. Ask, if the state is `undecided` or `partial-wired`
 
 One question, no advocacy. What the human is deciding: whether this repo should
 keep an append-only record of *why* its decisions were made — rulings,
@@ -45,18 +67,35 @@ and let them decide.
 
 **Yes → initialize.** Two facts are needed and both are the human's call:
 
-- `--project NAME` — the index namespace, also `<NAME>.sqlite`. No `/`.
+- `--project NAME` — the index namespace, also `<NAME>.sqlite`. Must match
+  `[A-Za-z0-9._-]+` (repo-init.sh refuses anything else — it is embedded as
+  an identity marker, fix-round-4 R7/F8).
 - `--store DIR` — where the store lives. It must be **its own git repo**, and
   by default `scripts/repo-init.sh` refuses a location inside another repo's working
-  tree (`--force` overrides). **Naming convention (owner ruling 2026-08-31):
+  tree (`--force` overrides); it also refuses an existing git repo at `DIR` that carries
+  none of this tool's markers (fix-round-4 F10 — protects against a mistyped `--store`
+  landing store directories in an unrelated repo; adopt an existing store by pointing at
+  one that already has `topics/`/`incidents/`/`concepts/` or a README mentioning
+  MemContinuum). **Naming convention (owner ruling 2026-08-31):
   the folder is called `MemContinuum-Store`** — marked as this tool's, never a
   generic `memory/` (collides with other memory systems) and never bare
   `MemContinuum` (reads as the tool itself). Omit `--store` and repo-init
   applies the convention on its own: `<repo>-MemContinuum-Store` beside the
   git repo the cwd is in, else `MemContinuum-Store` inside the cwd. Only pass
-  `--store` when the human wants a different place.
+  `--store` when the human wants a different place — and when you do, pass
+  `--claude-dir` alongside it (fix-round-4 F3: `repo-init.sh` refuses an
+  explicit `--store` with no explicit `--claude-dir` rather than guess which
+  `.claude` its hooks belong in).
 - `--code-root DIR` — repeatable; the code checkout(s) whose edits should
   trigger retrieval. Omit for a rationale-only store.
+
+**If the state was `partial-wired`** (some but not all five write-side hooks
+already present, no recorded decision), a human "yes" is a repair, not a
+fresh install: re-run `scripts/repo-init.sh` with the same `--store`/
+`--project` the repo already has (from step 1's `store=`/`project=` lines) so
+it completes the missing wiring — `memcontinuum-decide.sh wired` refuses
+anything short of `wiring=full` and names the missing hooks. Only after
+`repo-init.sh` reports full wiring does `decide.sh wired` succeed.
 
 Always dry-run first, show the plan, then run it:
 
@@ -68,16 +107,19 @@ cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME --code-root DIR --
 cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME --code-root DIR
 ```
 
-Then record it:
+Then record it. `--repo REPO` is REQUIRED here (fix-round-4 F2): `wired`,
+`declined`, and `forget` all silence or unsilence a specific repo
+permanently, and there is no safe default for that -- name the repo, don't
+rely on whatever directory the shell happens to be sitting in:
 
 ```bash
-bash "$ENGINE/scripts/memcontinuum-decide.sh" wired --store DIR --project NAME
+bash "$ENGINE/scripts/memcontinuum-decide.sh" wired --repo REPO --store DIR --project NAME
 ```
 
 **No → record the decline.** One command, and this repo is never asked again:
 
 ```bash
-bash "$ENGINE/scripts/memcontinuum-decide.sh" declined
+bash "$ENGINE/scripts/memcontinuum-decide.sh" declined --repo REPO
 ```
 
 **"Not now" → record nothing.** Say so and move on; the detector stays quiet
@@ -89,9 +131,9 @@ correct here — do not invent a decision to silence a prompt.
 Either direction, at any point in a repo's life:
 
 - declined → wanted: run the `scripts/repo-init.sh` steps above, then
-  `memcontinuum-decide.sh wired ...`.
-- wired → unwanted: `memcontinuum-decide.sh declined` records it, but that
-  only stops the *asking*. The hooks stay wired until they are removed — see
+  `memcontinuum-decide.sh wired --repo REPO ...`.
+- wired → unwanted: `memcontinuum-decide.sh declined --repo REPO` records it,
+  but that only stops the *asking*. The hooks stay wired until they are removed — see
   README.md "Uninstall". Tell the human which of the two they want; do not
   delete a store, ever. A store is its own git history, not an installer
   artifact.

@@ -36,8 +36,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 # Watchdog guard (macOS port, docs/DESIGN.md SS8 port note, 2026-08-30;
 # deduped into hooks/mc-watchdog.sh, finding 1, 2026-08-31): must be the
 # literal first thing after resolving SCRIPT_DIR and sourcing
-# mc-watchdog.sh (a fast, filesystem/subprocess-free variable assignment
-# only -- see its own header), strictly BEFORE sourcing memlib.sh (which
+# mc-watchdog.sh (see its own header for what
+# running it costs), strictly BEFORE sourcing memlib.sh (which
 # does its own mkdir -p work) -- see
 # hooks/userprompt-remind.sh's test_outer_deadline_covers_memlib_sourcing
 # for why this ordering matters. A tiny python launcher
@@ -60,8 +60,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 source "${MC_WATCHDOG_LIB_PATH:-$SCRIPT_DIR/mc-watchdog.sh}" 2>/dev/null
 if [ -z "${MC_UNDER_TIMEOUT:-}" ]; then
     export MC_UNDER_TIMEOUT=1
-    MC_GUARD_PY="${MEMCONTINUUM_PYTHON:-$SCRIPT_DIR/../.venv/bin/python}"
-    if [ -x "$MC_GUARD_PY" ] && [ -n "${MC_WATCHDOG_LAUNCHER_PY:-}" ]; then
+    # MC_GUARD_PY is set by mc-watchdog.sh above (F6 fix, round 4: env ->
+    # config.sh -> engine venv, same order memlib.sh uses for MC_PY).
+    if [ -x "${MC_GUARD_PY:-}" ] && [ -n "${MC_WATCHDOG_LAUNCHER_PY:-}" ]; then
         "$MC_GUARD_PY" -c "$MC_WATCHDOG_LAUNCHER_PY" "${BASH:-bash}" "${BASH_SOURCE[0]}" "$@"
         exit 0
     fi

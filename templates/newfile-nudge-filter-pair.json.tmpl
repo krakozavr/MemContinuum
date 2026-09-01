@@ -1,5 +1,5 @@
           {
             "type": "command",
-            "if": "Write({{CODE_ROOT}}/**)",
-            "command": "MEMCONTINUUM_CODE_ROOT={{CODE_ROOT_CMD}} MEMCONTINUUM_PYTHON={{PYTHON}} bash {{HOOKS_DIR}}/newfile-nudge.sh"
+            "if": "Write(/{{CODE_ROOT}}/**)",
+            "command": "MEMCONTINUUM_CODE_ROOT={{CODE_ROOT_CMD}} MEMCONTINUUM_PROJECT={{PROJECT}} MEMCONTINUUM_PYTHON={{PYTHON}} bash {{HOOKS_DIR}}/newfile-nudge.sh"
           }

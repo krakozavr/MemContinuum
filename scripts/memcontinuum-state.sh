@@ -3,28 +3,52 @@
 # state on stdout, for the `memcontinuum` skill to read before it says
 # anything. Read-only: writes nothing, decides nothing.
 #
-# Prints `state=<value>` plus whatever context that state has:
+# Decision (the human's recorded answer) and wiring (what the repo's .claude
+# settings actually contain right now) are SEPARATE facts (fix-round-4 F5) --
+# a hand-edited settings file or an interrupted install can leave them
+# disagreeing, and collapsing them into one line hid exactly that. Both are
+# printed:
 #
-#   state=no-config    MemContinuum was never bootstrapped on this machine
-#   state=not-a-repo   the path is not inside a git working tree
-#   state=wired        this repo's .claude settings reference the hooks
-#   state=declined     a human recorded "no" for this repo's key
-#   state=undecided    none of the above
+#   decision=wired      a human recorded "yes" for this repo's key
+#   decision=declined    a human recorded "no" for this repo's key
+#   decision=none        no row for this repo's key
 #
-# Same key rule as hooks/memcontinuum-detect.sh: origin remote URL when there
-# is one, else the working tree's absolute path.
+#   wiring=full           the repo's .claude settings reference ALL FIVE
+#                        always-wired write-side hooks
+#   wiring=partial        SOME but not all five -- a broken or half-finished
+#                        install; `missing=<basenames>` names what's absent
+#   wiring=none          none of the five present
+#
+# Plus a backward-compatible `state=` line, since decision and wiring can
+# disagree (declined-but-still-wired, wired-row-but-broken-wiring):
+#
+#   state=no-config      MemContinuum was never bootstrapped on this machine
+#   state=not-a-repo     the path is not inside a git working tree
+#   state=wired          decision=wired, OR (decision=none AND wiring=full)
+#                        -- grandfathered installs that predate the registry
+#   state=declined       decision=declined (regardless of current wiring --
+#                        the recorded answer is authoritative)
+#   state=partial-wired  decision=none AND wiring=partial -- the repair path
+#   state=undecided       decision=none AND wiring=none
+#
+# Same key rule as hooks/memcontinuum-detect.sh and memcontinuum-decide.sh:
+# origin remote URL when there is one, else the working tree's absolute path
+# -- scripts/mc-registry-lib.sh is the one place that mapping is written.
 
 set -u
 
-MEMCONTINUUM_HOME="${MEMCONTINUUM_HOME:-$HOME/.memcontinuum}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+# shellcheck source=./mc-registry-lib.sh
+if ! . "$SCRIPT_DIR/mc-registry-lib.sh"; then
+    echo "state=no-config"
+    echo "hint=missing $SCRIPT_DIR/mc-registry-lib.sh -- incomplete checkout"
+    exit 0
+fi
+
+mc_resolve_home
 CONFIG="$MEMCONTINUUM_HOME/config.sh"
 DECISIONS="$MEMCONTINUUM_HOME/decisions.tsv"
 TARGET="${1:-$PWD}"
-
-# The five always-wired write-side hooks, matched on "command" lines only --
-# same rule as the detector and decide.sh (rationale-only installs omit the
-# two PreToolUse hooks, so those never count toward "wired").
-HOOK_BASENAMES="ledger-post-edit.sh precompact-persist.sh sessionstart-remind.sh userprompt-remind.sh sessionend-stamp.sh"
 
 if [ ! -f "$CONFIG" ]; then
     echo "state=no-config"
@@ -42,50 +66,88 @@ else
     echo "global_ask=on"
 fi
 
-REPO="$(git -C "$TARGET" rev-parse --show-toplevel 2>/dev/null)"
-if [ -z "$REPO" ]; then
+if ! mc_repo_key "$TARGET"; then
     echo "state=not-a-repo"
     echo "path=$TARGET"
     exit 0
 fi
+REPO="$MC_REPO"
+KEY="$MC_REPO_KEY"
 echo "repo=$REPO"
-
-REMOTE="$(git -C "$REPO" config --get remote.origin.url 2>/dev/null)"
-if [ -n "$REMOTE" ]; then KEY="$REMOTE"; else KEY="$REPO"; fi
-KEY="$(printf '%s' "$KEY" | tr '\t\n' '__')"
 echo "key=$KEY"
 
-for settings in "$REPO/.claude/settings.local.json" "$REPO/.claude/settings.json"; do
-    [ -f "$settings" ] || continue
-    for base in $HOOK_BASENAMES; do
-        if grep '"command"' "$settings" 2>/dev/null | grep -qF "$base"; then
-            echo "state=wired"
-            echo "settings=$settings"
-            # Surface the store/project the wiring actually names, so the
-            # skill reports what is true rather than what it assumes.
-            # scripts/repo-init.sh emits shlex-quoted values (MEMCONTINUUM_ROOT='/a b/c'),
-            # hand-written wiring often doesn't -- try the quoted form first,
-            # else fall back to the bare word.
-            store="$(sed -n "s/.*MEMCONTINUUM_ROOT='\([^']*\)'.*/\1/p" "$settings" | head -1)"
-            [ -n "$store" ] || store="$(sed -n 's/.*MEMCONTINUUM_ROOT=\([^ "'"'"']*\).*/\1/p' "$settings" | head -1)"
-            project="$(sed -n "s/.*MEMCONTINUUM_PROJECT='\([^']*\)'.*/\1/p" "$settings" | head -1)"
-            [ -n "$project" ] || project="$(sed -n 's/.*MEMCONTINUUM_PROJECT=\([^ "'"'"']*\).*/\1/p' "$settings" | head -1)"
-            [ -n "$store" ] && echo "store=$store"
-            [ -n "$project" ] && echo "project=$project"
-            exit 0
-        fi
-    done
-done
+mc_wiring_scan "$REPO/.claude/settings.local.json" "$REPO/.claude/settings.json"
+echo "wiring=$MC_WIRING"
+[ "$MC_WIRING" = "partial" ] && echo "missing=$MC_WIRING_MISSING"
 
-if [ -f "$DECISIONS" ]; then
-    while IFS="$(printf '\t')" read -r k decision when rest; do
-        case "$k" in \#*|"") continue ;; esac
-        if [ "$k" = "$KEY" ]; then
-            echo "state=$decision"
-            echo "decided_at=$when"
-            exit 0
-        fi
-    done < "$DECISIONS"
+# Decision lookup happens BEFORE store/project extraction (R6 fix, round 4):
+# a registry row recorded by `decide.sh wired --store DIR --project NAME`
+# carries store=/project= in its note column, and that -- not "whichever
+# hook entry happens to appear first in the settings file" -- is the
+# authoritative source when a repo's .claude wires MORE THAN ONE project
+# (two-projects-one-claude-dir topology). Without this, state.sh for repo
+# B (decided, project=beta) could report project A's store/project just
+# because A's hook entry sorts first in the file.
+DECISION="none"
+DECISION_PROJECT=""
+if mc_registry_lookup "$DECISIONS" "$KEY"; then
+    DECISION="$MC_LOOKUP_DECISION"
+    echo "decision=$DECISION"
+    echo "decided_at=$MC_LOOKUP_WHEN"
+    DECISION_PROJECT="$(printf '%s\n' "$MC_LOOKUP_NOTE" | sed -n 's/.*[ ]project=\([^ ]*\).*/\1/p')"
+else
+    echo "decision=none"
 fi
 
-echo "state=undecided"
+# Store/project, pulled from ONE coherent hook entry rather than two
+# independent whole-file sed passes -- the latter can pair one project's
+# store with a DIFFERENT project's name when a repo's .claude carries more
+# than one project's wiring (two-projects-one-claude-dir topology; the old
+# `head -1` on each field independently had no such guarantee). When the
+# registry row names a project (DECISION_PROJECT), prefer the hook entry
+# that actually carries THAT project's marker over "the first match" --
+# falling back to first-found only when there is no row, or the row's
+# project has no matching hook entry (R6 fix, round 4).
+if [ "$MC_WIRING" != "none" ]; then
+    FOUND=0
+    PROJECT_SOURCE=""
+    if [ -n "$DECISION_PROJECT" ] && mc_wired_command_for_project "$DECISION_PROJECT" \
+            "$REPO/.claude/settings.local.json" "$REPO/.claude/settings.json"; then
+        FOUND=1
+        PROJECT_SOURCE="registry"
+    elif mc_first_wired_command \
+            "$REPO/.claude/settings.local.json" "$REPO/.claude/settings.json"; then
+        FOUND=1
+        PROJECT_SOURCE="wiring"
+    fi
+    if [ "$FOUND" -eq 1 ]; then
+        echo "settings=$MC_WIRED_SETTINGS_FILE"
+        # scripts/repo-init.sh emits shlex-quoted values (MEMCONTINUUM_ROOT='/a b/c'),
+        # hand-written wiring often doesn't -- try the quoted form first, else
+        # fall back to the bare word.
+        store="$(printf '%s\n' "$MC_WIRED_COMMAND" | sed -n "s/.*MEMCONTINUUM_ROOT='\([^']*\)'.*/\1/p")"
+        [ -n "$store" ] || store="$(printf '%s\n' "$MC_WIRED_COMMAND" | sed -n 's/.*MEMCONTINUUM_ROOT=\([^ "'"'"']*\).*/\1/p')"
+        project="$(printf '%s\n' "$MC_WIRED_COMMAND" | sed -n "s/.*MEMCONTINUUM_PROJECT='\([^']*\)'.*/\1/p")"
+        [ -n "$project" ] || project="$(printf '%s\n' "$MC_WIRED_COMMAND" | sed -n 's/.*MEMCONTINUUM_PROJECT=\([^ "'"'"']*\).*/\1/p')"
+        [ -n "$store" ] && echo "store=$store"
+        [ -n "$project" ] && echo "project=$project"
+        # Output keys stay stable (store=/project= unchanged); this extra
+        # key just says which source picked the entry above -- "registry"
+        # when the decision row's own project pinned it, "wiring" when it
+        # was the first match (no row, or the row named no project).
+        [ -n "$project" ] && echo "project_source=$PROJECT_SOURCE"
+    fi
+fi
+
+case "$DECISION" in
+    wired)    STATE="wired" ;;
+    declined) STATE="declined" ;;
+    *)
+        case "$MC_WIRING" in
+            full)    STATE="wired" ;;
+            partial) STATE="partial-wired" ;;
+            *)       STATE="undecided" ;;
+        esac
+        ;;
+esac
+echo "state=$STATE"

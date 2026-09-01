@@ -124,6 +124,24 @@ class TestDuplicateIdErrors(unittest.TestCase):
         stem_warns = [w for w in warnings if "same-slug" in w and "ambiguous" in w]
         self.assertEqual(len(stem_warns), 1, warnings)
 
+    def test_stem_collision_with_brace_in_stem_does_not_crash(self):
+        """F4 regression: the stem-collision warning used to build the message
+        as an f-string concatenated with a literal `.format(stem)` applied to
+        the WHOLE result, so any `{...}` / bare `}` or `{` already inside the
+        stem (or a listed path) was re-interpreted as a format placeholder and
+        raised KeyError/ValueError, aborting the entire lint run. Two id-less
+        structured records sharing a stem containing `{x}` must still just
+        produce the warning."""
+        body = "---\ntype: topic\ntitle: T\nlinks: []\n---\n# T\n"
+        stem = "weird{x}stem"
+        errors, warnings = self.lint_tree({
+            f"topics/a/{stem}.md": body,
+            f"topics/b/{stem}.md": body,
+        })
+        self.assertEqual([e for e in errors if "duplicate id" in e], [])
+        stem_warns = [w for w in warnings if stem in w and "ambiguous" in w]
+        self.assertEqual(len(stem_warns), 1, warnings)
+
     def test_concepts_and_topics_share_one_id_namespace(self):
         """`chain`/`for-path` resolve ids across record types; a concept and a
         topic sharing an id is exactly as ambiguous as two topics."""

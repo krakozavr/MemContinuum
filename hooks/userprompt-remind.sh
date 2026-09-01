@@ -3,8 +3,16 @@
 # "Coverage signal" fact block via hookSpecificOutput.additionalContext when
 # ALL of these hold (docs/DESIGN.md rulings A/C):
 #
-#   - source == "user"        (never a slash command / skill invocation)
-#   - agent_id is NOT set      (never inside a subagent)
+#   - agent_id/agent_type are NOT set (never inside a subagent, and never a
+#     session run under `--agent`) -- fix-round 2026-08-31: this hook used to
+#     also require source=="user", but a real UserPromptSubmit payload NEVER
+#     carries a `source` field at all (that field belongs to SessionStart's
+#     startup/resume/clear/compact/fork; the two events were confused --
+#     docs: code.claude.com/docs/en/hooks). Empirically confirmed: 30/30 real
+#     invocations in one session died as outcome=non-user-source. The gate
+#     is gone; agent_id/agent_type (documented as present only under
+#     `--agent` or inside a subagent) is the real "never in a subagent, never
+#     the main thread run as a persona" signal.
 #   - the ledger's evidence fingerprint GREW since the last injection --
 #     defined as: the set of (path, content_sha256) pairs currently in the
 #     ledger contains at least one pair that was not in the pair-set
@@ -37,7 +45,7 @@
 # This hook NEVER reads transcript_path, user_input, prompt, or
 # last_assistant_message from the payload (ruling B; the addendum extends
 # the not-read invariant to `prompt`, the alternate payload key Claude Code
-# may use for the same field) -- only session_id, source, agent_id, and
+# may use for the same field) -- only session_id, agent_id, agent_type, and
 # prompt_id. prompt_id itself is never extracted, stored, or logged: only
 # sha256(prompt_id)[:16] ever exists past the one extraction call (dual-gate
 # review finding 2), stored as `last_prompt_hash`, for dedupe only. A
@@ -58,14 +66,23 @@
 # environment variable, so no subprocess this hook spawns (dirname/mkdir/
 # cat/env/python) ever inherits it (dual-gate review
 # finding 1, BLOCKER). Only the extracted scalar fields (session_id,
-# source, agent_id presence, a prompt_id fingerprint) and the sorted
+# agent_id/agent_type presence, a prompt_id fingerprint) and the sorted
 # top-level payload KEY NAMES (never values -- the payload-shape capture
 # addendum below) ever exist past that call.
 #
-# Payload-shape capture (Codex fixture request): on this hook's first
-# eligible (source=user, no agent_id) turn in a session, logs the sorted
-# list of top-level payload KEY NAMES ONLY (never values) as
-# `payload_keys=...`, once per session.
+# Payload-shape capture (Codex fixture request): on this hook's first turn
+# with a resolvable session_id and an already-started session (state file
+# exists), logs the sorted list of top-level payload KEY NAMES ONLY (never
+# values) as `payload_keys=...`, once per session -- BEFORE the
+# agent_id/agent_type gate below (fix-round 2026-08-31: the previous
+# placement was inside phase 1's locked transform, reached only once every
+# earlier gate had already let the turn through; the source=="user" gate
+# rejected every real payload before that point, so `payload_keys=` never
+# once appeared in hook.log for a real session -- the exact evidence that
+# would have shown the contract mismatch was itself gated behind the bug).
+# The common-case (already logged this session) path is a plain grep
+# against the state file, no subprocess -- only the genuinely-first turn
+# pays for the one locked write.
 #
 # Evidence is computed LIVE here (not read from state.pending, which is only
 # populated around a compaction) -- but only once cooldown+growth already
@@ -93,9 +110,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 # must be the LITERAL first thing this script does after `set -u` and
 # resolving its own location -- in particular, strictly BEFORE sourcing
 # memlib.sh (which does its own mkdir -p work). Sourcing mc-watchdog.sh
-# itself is safe here: it does nothing but a single-quoted variable
-# assignment (no filesystem/subprocess work of its own -- see its own
-# header), unlike memlib.sh, whose own body used to run unbounded on the
+# itself is safe here: it costs at most one `[ -f ]` stat and sourcing a
+# few config.sh assignment lines while resolving MC_GUARD_PY (F6 fix,
+# round 4) -- no external process, no shelling out (see its own header),
+# unlike memlib.sh, whose own body used to run unbounded on the
 # outer, un-timed invocation before this fix -- a slow/hung memlib.sh
 # could blow the whole invocation's wall time with no bound at all.
 # Sourcing memlib.sh stays strictly AFTER this guard, i.e. only ever
@@ -129,8 +147,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 source "${MC_WATCHDOG_LIB_PATH:-$SCRIPT_DIR/mc-watchdog.sh}" 2>/dev/null
 if [ -z "${MC_UNDER_TIMEOUT:-}" ]; then
     export MC_UNDER_TIMEOUT=1
-    MC_GUARD_PY="${MEMCONTINUUM_PYTHON:-$SCRIPT_DIR/../.venv/bin/python}"
-    if [ -x "$MC_GUARD_PY" ] && [ -n "${MC_WATCHDOG_LAUNCHER_PY:-}" ]; then
+    # MC_GUARD_PY is set by mc-watchdog.sh above (F6 fix, round 4: env ->
+    # config.sh -> engine venv, same order memlib.sh uses for MC_PY).
+    if [ -x "${MC_GUARD_PY:-}" ] && [ -n "${MC_WATCHDOG_LAUNCHER_PY:-}" ]; then
         "$MC_GUARD_PY" -c "$MC_WATCHDOG_LAUNCHER_PY" "${BASH:-bash}" "${BASH_SOURCE[0]}" "$@"
         exit 0
     fi
@@ -176,26 +195,49 @@ print(json.dumps(state))
 PAYLOAD="$(cat)"
 [ -z "$PAYLOAD" ] && finish "empty-payload"
 
-eval "$(mc_extract_fields "$PAYLOAD" session_id source agent_id _prompt_hash _top_keys_csv)" 2>/dev/null
+eval "$(mc_extract_fields "$PAYLOAD" session_id agent_id agent_type _prompt_hash _top_keys_csv)" 2>/dev/null
 unset PAYLOAD
 
-if [ -n "${AGENT_ID:-}" ]; then
-    finish "agent-context"
-fi
-if [ "${SOURCE:-}" != "user" ]; then
-    finish "non-user-source"
-fi
 [ -z "${SESSION_ID:-}" ] && finish "no-session-id"
 
 STATE_FILE="$(mc_state_file_for "$MC_PROJECT" "$SESSION_ID")"
 [ -f "$STATE_FILE" ] || finish "no-state"
 
+# Payload-shape capture (Codex fixture request, WRITE-HOOKS-CONSENSUS.md
+# addendum point 4) -- deliberately BEFORE the agent_id/agent_type gate
+# below (fix-round 2026-08-31, see header comment): a future contract
+# mismatch must show up in hook.log even on a turn a later gate goes on to
+# skip. Sorted top-level KEY NAMES only, never values, logged once per
+# session. Fast path: a plain grep against the state file on disk (no
+# subprocess) short-circuits every turn after the first; only a session's
+# genuinely-first turn pays for the one locked write.
+if ! grep -q '"payload_keys_logged"[[:space:]]*:[[:space:]]*true' "$STATE_FILE" 2>/dev/null; then
+    export MC_LOG_PATH="$MC_LOG"
+    export MC_TOP_KEYS_CSV="${TOP_KEYS_CSV:-}"
+    mc_update_state_json "$STATE_FILE" '
+import os
+
+if not state.get("payload_keys_logged"):
+    keys_csv = os.environ.get("MC_TOP_KEYS_CSV") or ""
+    try:
+        with open(os.environ["MC_LOG_PATH"], "a") as lf:
+            lf.write("payload_keys=" + keys_csv + "\n")
+    except OSError:
+        pass
+    state["payload_keys_logged"] = True
+
+print(json.dumps(state))
+' >>"$MC_LOG" 2>&1
+fi
+
+if [ -n "${AGENT_ID:-}" ] || [ -n "${AGENT_TYPE:-}" ]; then
+    finish "agent-source"
+fi
+
 DECIDE_TMP="$(mktemp 2>/dev/null)" || finish "mktemp-failed"
 
 export MC_DECIDE_OUT="$DECIDE_TMP"
 export MC_NOW="$(date +%s 2>/dev/null || echo 0)"
-export MC_LOG_PATH="$MC_LOG"
-export MC_TOP_KEYS_CSV="${TOP_KEYS_CSV:-}"
 export MC_PROMPT_HASH="${PROMPT_HASH:-}"
 
 # Phase 1 (locked): bump the turn counter (prompt_hash-deduped), decide,
@@ -208,20 +250,6 @@ mc_update_state_json "$STATE_FILE" '
 import hashlib, json, os, time
 
 now = float(os.environ.get("MC_NOW") or time.time())
-
-# One-time payload-shape capture (Codex fixture request, WRITE-HOOKS-
-# CONSENSUS.md addendum point 4): sorted top-level KEY NAMES only, never
-# values, logged once per session on its first eligible turn. The names
-# arrive pre-extracted (MC_TOP_KEYS_CSV) -- this transform, like the rest
-# of this hook, never sees the raw payload at all.
-if not state.get("payload_keys_logged"):
-    keys_csv = os.environ.get("MC_TOP_KEYS_CSV") or ""
-    try:
-        with open(os.environ["MC_LOG_PATH"], "a") as lf:
-            lf.write("payload_keys=" + keys_csv + "\n")
-    except OSError:
-        pass
-    state["payload_keys_logged"] = True
 
 # Legacy-key purge (re-gate finding, HIGH, Codex): a pre-existing state
 # file may still carry a raw last_prompt_id from before the sha256-

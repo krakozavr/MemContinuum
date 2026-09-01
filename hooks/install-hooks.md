@@ -26,12 +26,12 @@ into the target `hooks.PreToolUse` array:
         "hooks": [
           {
             "type": "command",
-            "if": "Edit(<code-root>/**)",
+            "if": "Edit(/<code-root>/**)",
             "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_STRIP_PREFIX=<code-root>/ MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/pre-edit-chain.sh"
           },
           {
             "type": "command",
-            "if": "Write(<code-root>/**)",
+            "if": "Write(/<code-root>/**)",
             "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_STRIP_PREFIX=<code-root>/ MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/pre-edit-chain.sh"
           }
         ]
@@ -52,6 +52,14 @@ Notes:
   drive").
 - The command line, not a JSON `env` block, carries the env vars — Claude Code hook `command`
   entries run through a shell, so `VAR=value ... command` works directly.
+- `if` filter paths use Claude Code's permission-rule syntax, where a single leading slash
+  anchors at the settings source, not the filesystem root (docs: `Edit(//Users/alice/file)` =
+  absolute `/Users/alice/file`). `<code-root>` above is always an absolute path (already starting
+  with `/`), so the rendered pattern needs a SECOND leading slash — `Edit(//home/…/**)` — to match
+  anything at all. Fix-round (2026-08-31): the templates previously rendered only one leading
+  slash and the pre-edit hook never fired in real sessions as a result; `code-root-filter-pair.json.tmpl`
+  and `newfile-nudge-filter-pair.json.tmpl` now compose `if` as `Edit(/{{CODE_ROOT}}/**)` /
+  `Write(/{{CODE_ROOT}}/**)` so the rendered value always has exactly two leading slashes.
 
 ## 2. `newfile-nudge.sh` — Claude Code `PreToolUse` hook (Write only)
 
@@ -59,9 +67,14 @@ Lives in this repo (`hooks/newfile-nudge.sh`), wired into the same project setti
 `pre-edit-chain.sh` above but as a SEPARATE `PreToolUse` matcher group (`"Write"`, never
 `"Edit|Write"` — this hook only ever fires on a path that does not exist yet; an edit to an
 existing file is `pre-edit-chain.sh`'s job, not this one's). Deliberately minimal: no
-`MEMCONTINUUM_ROOT`/`PROJECT`/`STRIP_PREFIX`, since this hook never calls `memidx.py` or reads the
-index at all — it only checks that the write target is new, under a configured code root, and has
-an indexed source extension, then injects one reminder line.
+`MEMCONTINUUM_ROOT`/`STRIP_PREFIX`, since this hook never calls `memidx.py` or reads the index at
+all — it only checks that the write target is new, under a configured code root, and has an
+indexed source extension, then injects one reminder line. It DOES carry `MEMCONTINUUM_PROJECT`
+(fix-round-4 F1) — identity only, so `scripts/repo-init.sh`'s merge step can tell this project's
+nudge entry apart from a different project's sharing the same `--claude-dir`; the hook itself never
+reads it. A nudge entry installed before this fix carries no `MEMCONTINUUM_PROJECT` at all and
+stays sweepable by ANY project's re-run until that project re-runs `repo-init.sh` — see README.md's
+"Idempotency" note.
 
 Rendered from `templates/newfile-nudge-hook.json.tmpl` + one
 `templates/newfile-nudge-filter-pair.json.tmpl` pair per `--code-root`, merged into the SAME
@@ -76,8 +89,8 @@ target `hooks.PreToolUse` array as `pre-edit-chain.sh` (a second group, not a se
         "hooks": [
           {
             "type": "command",
-            "if": "Write(<code-root>/**)",
-            "command": "MEMCONTINUUM_CODE_ROOT=<code-root> MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/newfile-nudge.sh"
+            "if": "Write(/<code-root>/**)",
+            "command": "MEMCONTINUUM_CODE_ROOT=<code-root> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/newfile-nudge.sh"
           }
         ]
       }
@@ -193,11 +206,20 @@ Notes:
   is no settings-level `if` for `PreCompact`, `SessionStart`, `UserPromptSubmit`, or `SessionEnd`.
   If you want `ledger-post-edit.sh` scoped the same way `pre-edit-chain.sh` is (e.g. only a
   specific subtree), add `"if": "Edit(...)"` / `"if": "Write(...)"` entries the same way as
-  section 1 above; the other four scripts gate on payload fields (`source`, `trigger`, `agent_id`)
-  in-script instead, since they have no `if` to lean on.
+  section 1 above; the other four scripts gate on payload fields (`trigger`, `agent_id`/
+  `agent_type`) in-script instead, since they have no `if` to lean on. `source` is a
+  `SessionStart`-only field (see the next note) — `precompact-persist.sh` gates on `trigger`
+  (PreCompact's own field, `manual`/`auto`), and `userprompt-remind.sh` gates on `agent_id`/
+  `agent_type` (UserPromptSubmit carries neither `source` nor `trigger` at all; fix-round
+  2026-08-31 removed a `source == "user"` gate that had never once matched a real payload — see
+  that script's own header comment).
 - `SessionStart` fires with several `source` values (`startup`, `resume`, `clear`, `compact`,
   `fork`); `sessionstart-remind.sh` branches on all of them itself — wire it unconditionally
   (no settings-level source filter needed, though one is supported if you want to narrow it).
+  `hooks/memcontinuum-detect.sh` (a separate, user-level `~/.claude/settings.json` `SessionStart`
+  hook — not rendered by this installer, see its own header comment) also gates on `source` for
+  the same reason — both are the correct, documented use of that field; `UserPromptSubmit` is the
+  one event that never carries it.
 - `MEMCONTINUUM_CODE_ROOT` is new here (not used by `pre-edit-chain.sh`/`post-commit-reindex.sh`):
   it is the code root `ledger-post-edit.sh` scopes edits to. The five write-side hooks only
   support **one** `MEMCONTINUUM_CODE_ROOT` each — with multiple `--code-root`s given to
@@ -214,3 +236,12 @@ Notes:
 > rather than by the path alone, matching what the templates now render -- the
 > executable bit is not required anywhere (a zip download or a
 > core.filemode=false clone drops it silently).
+
+> Migration note (fix-round-4 F1, 2026-08-31): `scripts/repo-init.sh`'s merge step identifies its
+> own hook entries by script basename, further scoped by the `MEMCONTINUUM_PROJECT=` marker every
+> one of the seven commands now carries -- including `newfile-nudge.sh` (section 2 above), which
+> did not carry it before this fix. Two projects sharing one `--claude-dir`: a project's re-run
+> can only sweep entries marked for ITS OWN `--project`, or entries with no marker at all (legacy,
+> pre-identity wiring). A `newfile-nudge.sh` entry installed before this fix carries no marker and
+> stays sweepable by ANY project's re-run until the project that owns it re-runs
+> `scripts/repo-init.sh` -- there is no separate migration step; a normal re-run closes the hole.

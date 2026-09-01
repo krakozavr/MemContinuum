@@ -30,8 +30,9 @@
 #                    Also where this script's own hook.log lives. Defaults to
 #                    ~/.memcontinuum, matching memidx.py's own default.
 #   MEMCONTINUUM_PYTHON   absolute path to the venv python. Falls back to
-#                    <engine>/.venv/bin/python (scripts/repo-init.sh --bootstrap-venv)
-#                    when unset.
+#                    $MEMCONTINUUM_HOME/config.sh (if it sets MEMCONTINUUM_PYTHON),
+#                    then <engine>/.venv/bin/python (scripts/repo-init.sh
+#                    --bootstrap-venv) when unset.
 #   MEMCONTINUUM_STRIP_PREFIX
 #                    optional colon-separated list of absolute path prefixes
 #                    to strip from tool_input.file_path when trying to match
@@ -55,12 +56,41 @@ export PYTHONPATH=
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 MEMIDX="$SCRIPT_DIR/../memidx.py"
-# Python resolution order: $MEMCONTINUUM_PYTHON -> <engine>/.venv/bin/python
+MEMCONTINUUM_HOME="${MEMCONTINUUM_HOME:-$HOME/.memcontinuum}"
+# Python resolution order (matches hooks/memlib.sh; F6 fix, round 4):
+#   $MEMCONTINUUM_PYTHON -> $MEMCONTINUUM_HOME/config.sh -> <engine>/.venv/bin/python
 # (scripts/repo-init.sh --bootstrap-venv). Never a hard error here -- this hook fails
 # open on every path (see the header comment above); a python that doesn't
-# resolve just surfaces as a logged outcome below.
-PY="${MEMCONTINUUM_PYTHON:-$SCRIPT_DIR/../.venv/bin/python}"
+# resolve just surfaces as a logged outcome below. The config.sh step is
+# sourced (never sed/grep'd -- it is sourceable shell); a missing/corrupt
+# config.sh is swallowed by `|| true` so it can only cost sourcing time, never
+# block the hook.
+# R2/R3 fix, round 4: the file just sourced above may be a POINTER (a
+# custom-HOME install also writes a minimal config.sh at the fixed default
+# path recording only the real MEMCONTINUUM_HOME -- memcontinuum-setup.sh
+# "3. config"). If sourcing it just redefined MEMCONTINUUM_HOME to a
+# DIFFERENT directory than the file we sourced, follow through and source
+# the REAL config.sh too, so MEMCONTINUUM_PYTHON actually resolves there.
+# Unconditional on MEMCONTINUUM_PYTHON already being set (R3): config.sh's
+# own `if [ -z "${MEMCONTINUUM_PYTHON:-}" ]` guard keeps env/baked
+# precedence for PYTHON either way; LOG below must still land under the
+# real HOME even when PYTHON was already baked into the hook line.
+MC_HOME_CONFIG_1="$MEMCONTINUUM_HOME/config.sh"
+if [ -f "$MC_HOME_CONFIG_1" ]; then
+    # shellcheck source=/dev/null
+    . "$MC_HOME_CONFIG_1" 2>/dev/null || true
+fi
+# Re-default after every source: a damaged-but-sourceable config may have
+# `unset MEMCONTINUUM_HOME`, and under `set -u` a bare expansion would
+# kill the hook (regate round 2).
 MEMCONTINUUM_HOME="${MEMCONTINUUM_HOME:-$HOME/.memcontinuum}"
+if [ "$MEMCONTINUUM_HOME/config.sh" != "$MC_HOME_CONFIG_1" ] && [ -f "$MEMCONTINUUM_HOME/config.sh" ]; then
+    # shellcheck source=/dev/null
+    . "$MEMCONTINUUM_HOME/config.sh" 2>/dev/null || true
+    MEMCONTINUUM_HOME="${MEMCONTINUUM_HOME:-$HOME/.memcontinuum}"
+fi
+unset MC_HOME_CONFIG_1
+PY="${MEMCONTINUUM_PYTHON:-$SCRIPT_DIR/../.venv/bin/python}"
 LOG="$MEMCONTINUUM_HOME/hook.log"
 
 mkdir -p "$MEMCONTINUUM_HOME" 2>/dev/null

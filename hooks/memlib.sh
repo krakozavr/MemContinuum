@@ -60,11 +60,35 @@ MC_MEMIDX="$MC_LIB_DIR/../memidx.py"
 # forgets fails silently -- observed in the field, hooks dead for two days
 # behind a "no python resolved" line nobody was reading. config.sh is shell
 # rather than JSON precisely so this costs a `.` and no interpreter.
+# R2/R3 fix, round 4: a custom-HOME install also writes a minimal POINTER
+# config.sh at the fixed default path (memcontinuum-setup.sh "3. config")
+# that records only the real MEMCONTINUUM_HOME. Source the default/env
+# path first; if that just redefined MEMCONTINUUM_HOME to a DIFFERENT
+# directory than the file we sourced, it was a pointer -- follow through
+# and source the REAL config.sh too, so MEMCONTINUUM_PYTHON actually
+# resolves there instead of silently falling back to the engine venv (and
+# so this script's own MC_LOG/MC_DB_PATH below land under the real HOME,
+# not the default one -- R3). Unconditional on MEMCONTINUUM_PYTHON already
+# being set: config.sh's own `if [ -z "${MEMCONTINUUM_PYTHON:-}" ]` guard
+# keeps env/baked precedence for PYTHON either way. Both sources are
+# fail-open (`|| true`): a missing/corrupt config.sh only costs sourcing
+# time, never blocks the hook.
 MEMCONTINUUM_HOME="${MEMCONTINUUM_HOME:-$HOME/.memcontinuum}"
-if [ -z "${MEMCONTINUUM_PYTHON:-}" ] && [ -f "$MEMCONTINUUM_HOME/config.sh" ]; then
+MC_HOME_CONFIG_1="$MEMCONTINUUM_HOME/config.sh"
+if [ -f "$MC_HOME_CONFIG_1" ]; then
+    # shellcheck source=/dev/null
+    . "$MC_HOME_CONFIG_1" 2>/dev/null || true
+fi
+# Re-default after every source: a damaged-but-sourceable config may have
+# `unset MEMCONTINUUM_HOME`, and under `set -u` a bare expansion would
+# kill the hook (regate round 2).
+MEMCONTINUUM_HOME="${MEMCONTINUUM_HOME:-$HOME/.memcontinuum}"
+if [ "$MEMCONTINUUM_HOME/config.sh" != "$MC_HOME_CONFIG_1" ] && [ -f "$MEMCONTINUUM_HOME/config.sh" ]; then
     # shellcheck source=/dev/null
     . "$MEMCONTINUUM_HOME/config.sh" 2>/dev/null || true
+    MEMCONTINUUM_HOME="${MEMCONTINUUM_HOME:-$HOME/.memcontinuum}"
 fi
+unset MC_HOME_CONFIG_1
 if [ -n "${MEMCONTINUUM_PYTHON:-}" ]; then
     MC_PY="$MEMCONTINUUM_PYTHON"
 else

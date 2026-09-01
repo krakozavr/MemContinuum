@@ -255,16 +255,42 @@ bash memcontinuum-setup.sh [--venv DIR] [--python PATH] [--claude-dir DIR]
   It is on by default because, left lazy, that download lands inside someone's
   first `reindex` — or inside a hook — where it looks like a hang.
 - `--dry-run` — print the plan, write nothing.
-- `--uninstall` — remove the user-level hook, the skill, and `config.sh`.
-  Never touches a venv, a store, any per-repo wiring, or `decisions.tsv`.
+- `--uninstall` — remove the user-level hook, the skill, and **both**
+  `config.sh` artifacts (fix-round-4 R4): the real one at `$MEMCONTINUUM_HOME`
+  and, for a custom-HOME install, the pointer at the fixed default
+  `~/.memcontinuum/config.sh` too — resolved the same env → pointer →
+  default chain every other consumer uses, so an uninstall run with no
+  `MEMCONTINUUM_HOME` in its own environment (the normal case) still finds
+  and removes the real one, not just the pointer. Never touches a venv, a
+  store, any per-repo wiring, or `decisions.tsv`.
 
-`config.sh` is sourceable shell rather than JSON on purpose: `hooks/memlib.sh`
-reads it on every hook invocation to resolve python, and must not need an
+`config.sh` is sourceable shell rather than JSON on purpose: every hook
+(`hooks/memlib.sh`, `pre-edit-chain.sh`, `post-commit-reindex.sh`, and — as of
+round 4's F6 fix — the watchdog guard every write-side hook runs before it
+sources `memlib.sh`) reads it to resolve python, and must not need an
 interpreter to do so. Resolution order is `$MEMCONTINUUM_PYTHON` →
 `$MEMCONTINUUM_HOME/config.sh` → `<engine>/.venv/bin/python`. The middle step
 exists because a venv need not live at `<engine>/.venv`; without it, every hook
 line in every project must carry `MEMCONTINUUM_PYTHON` by hand, and the one
-that forgets fails silently behind a log line nobody reads.
+that forgets fails silently behind a log line nobody reads. In practice this
+step mainly matters for hand-wired or legacy hook lines (see
+`hooks/install-hooks.md`): `scripts/repo-init.sh` and `memcontinuum-setup.sh`
+bake `MEMCONTINUUM_PYTHON` directly into every hook line they render, so a
+freshly installer-wired repo never needs it — it exists for installs that
+predate the venv it now points at, or were wired by hand without it.
+
+**Custom `MEMCONTINUUM_HOME` (fix-round-4 R2/R3):** the `config.sh` at the
+fixed default path (`~/.memcontinuum/config.sh`) may itself be a POINTER —
+`memcontinuum-setup.sh` writes one there, recording only the real
+`MEMCONTINUUM_HOME`, whenever setup runs with a non-default `MEMCONTINUUM_HOME`.
+All four sites above follow through on it identically: source the
+default/env path first, and if that just redefined `MEMCONTINUUM_HOME` to a
+different directory, source the REAL `config.sh` there too. This runs
+unconditionally — even when `MEMCONTINUUM_PYTHON` is already baked into the
+hook line — because `MEMCONTINUUM_HOME` still has to resolve correctly for
+session state and `hook.log` to land under the real home rather than the
+default one; `config.sh`'s own `if [ -z "$MEMCONTINUUM_PYTHON" ]` guard keeps
+env/baked precedence for python either way.
 
 ### Being asked, rather than having to remember
 
@@ -272,15 +298,24 @@ that forgets fails silently behind a log line nobody reads.
 have never been initialized — that is the whole point of installing it at user
 level. On `SessionStart` it classifies the repo and, in exactly one of five
 states, emits a single `additionalContext` line asking the assistant to put the
-question to a human:
+question to a human. Decision (a human's recorded answer) and wiring (what the
+repo's `.claude` settings actually reference right now) are separate facts —
+see `state.sh`'s `decision=`/`wiring=` output below:
 
-| state | behaviour |
-|---|---|
-| `not-a-repo` | silent — nothing to wire |
-| `opted-out` | silent — `$MEMCONTINUUM_HOME/no-ask` exists (machine-wide "never ask") |
-| `wired` | silent — the repo's `.claude` settings already reference the installed hooks |
-| `decided` | silent — the repo's key is in `decisions.tsv`; never ask twice |
-| `undecided` | **asks, once** |
+| state | decision row? | wiring | behaviour |
+|---|---|---|---|
+| `not-a-repo` | — | — | silent — nothing to wire |
+| `opted-out` | — | — | silent — `$MEMCONTINUUM_HOME/no-ask` exists (machine-wide "never ask") |
+| `decided` | yes (`wired` or `declined`) | any | silent — the recorded answer is authoritative regardless of current wiring; never ask twice |
+| `wired-full-no-row` | none | `full` | silent — grandfathered: an install that predates the decisions registry reads as already-wired, never re-asked |
+| `undecided` | none | `partial` or `none` | **asks, once** — a half-wired repo (`partial`) is the repair path, not a grandfathered install: silence there would leave it with no route back to health |
+
+`memcontinuum-state.sh` reports these same two facts as `decision=`/`wiring=`
+(plus a backward-compatible `state=` line — `wired`, `declined`,
+`partial-wired`, `undecided`, `not-a-repo`, `no-config`) so a human "yes" on a
+`partial-wired` repo is recognized as a repair (re-run `repo-init.sh` to
+complete the wiring, THEN `decide.sh wired`), not confused with a fresh
+install.
 
 It is deliberately unlike every other hook here: no python, no `memlib.sh`, no
 watchdog, no logging unless `$MEMCONTINUUM_DETECT_LOG` is set — it fires on
@@ -294,12 +329,19 @@ write down a consent it did not collect. The human answers in conversation, and
 the `memcontinuum` skill acts:
 
 ```bash
-scripts/memcontinuum-state.sh [REPO]            # read-only: prints state=...
-scripts/memcontinuum-decide.sh declined         # they said no; never asked again
-scripts/memcontinuum-decide.sh wired --store DIR --project NAME
-scripts/memcontinuum-decide.sh forget           # back to undecided
-scripts/memcontinuum-decide.sh never-ask        # machine-wide; undo: ask-again
+scripts/memcontinuum-state.sh [REPO]                     # read-only: prints decision=/wiring=/state=...
+scripts/memcontinuum-decide.sh declined --repo REPO      # they said no; never asked again
+scripts/memcontinuum-decide.sh wired --repo REPO --store DIR --project NAME
+scripts/memcontinuum-decide.sh forget --repo REPO        # back to undecided
+scripts/memcontinuum-decide.sh never-ask                 # machine-wide; undo: ask-again
 ```
+
+`--repo` is REQUIRED for `wired`/`declined`/`forget` (fix-round-4 F2): each
+silences or unsilences a specific repo permanently, and there is no safe
+`$PWD` default for that — a shell sitting in the engine checkout used to
+record `wired` against the *engine's* key while the repo actually meant
+stayed undecided forever. `memcontinuum-state.sh` (read-only) keeps its
+`$PWD` default.
 
 `decisions.tsv` is keyed by the `origin` remote URL when there is one and the
 working tree's absolute path otherwise. Remote-keyed on purpose: a path key
@@ -315,7 +357,7 @@ an installer artifact.
 ## Installing into a new project
 
 ```bash
-bash scripts/repo-init.sh --project NAME --store DIR [--code-root DIR ...] \
+bash scripts/repo-init.sh --project NAME [--store DIR] [--code-root DIR ...] \
                  [--claude-dir DIR] [--python PATH] [--bootstrap-venv [DIR]] \
                  [--dry-run] [--force]
 ```
@@ -324,13 +366,20 @@ One command, run from this checkout, sets up a project's Rationale store and wir
 Claude Code. `--project` is the only required flag.
 
 - `--project NAME` — the project namespace passed to every `memidx.py --project`; also the
-  index db's filename (`<NAME>.sqlite`). Must not contain `/`.
+  index db's filename (`<NAME>.sqlite`). Must match `[A-Za-z0-9._-]+` (fix-round-4 F8: not just
+  "no `/`" — `NAME` is embedded, unquoted, as a `MEMCONTINUUM_PROJECT=` identity marker in every
+  hook command line the merge step's identity check depends on).
 - `--store DIR` — the markdown store root to create (or adopt, if `DIR` already exists as its
-  own git repo). Optional: the default applies the store-naming convention —
-  `<repo>-MemContinuum-Store` as a sibling of the git repo the cwd is in, else
-  `MemContinuum-Store` inside the cwd. The name is deliberately marked: a generic
-  `memory/` collides with other memory systems' directories, and a bare
-  `MemContinuum` reads as the tool itself rather than one project's store.
+  own git repo *and* already carries one of this tool's markers — any of a `topics/`,
+  `incidents/`, or `concepts/` directory, or a `README.md` mentioning MemContinuum). Optional: the
+  default applies the store-naming convention — `<repo>-MemContinuum-Store` as a sibling of the
+  git repo the cwd is in, else `MemContinuum-Store` inside the cwd. The name is deliberately
+  marked: a generic `memory/` collides with other memory systems' directories, and a bare
+  `MemContinuum` reads as the tool itself rather than one project's store. **An existing git repo
+  at `DIR` with none of those markers is refused outright** (fix-round-4 F10, exit 9) — a mistyped
+  `--store` must never seed store directories and a replacement post-commit hook into someone
+  else's repo; there is no `--force` carve-out for this one (`--force` only ever overrides the
+  *nesting* check below).
 - `--code-root DIR` — a code checkout the two PreToolUse hooks (`pre-edit-chain.sh`,
   `newfile-nudge.sh`) should watch, and the write-side hooks should scope the edit ledger to.
   Repeatable. Omit entirely for a rationale-only install with no associated code tree (neither
@@ -340,9 +389,19 @@ Claude Code. `--project` is the only required flag.
   `--code-root`s the first one given is what they get. The two PreToolUse hooks don't share that
   limitation: every `--code-root` gets its own correctly-scoped `if`-filtered entry in each —
   `pre-edit-chain.sh` an `Edit(DIR/**)` / `Write(DIR/**)` pair, `newfile-nudge.sh` a
-  `Write(DIR/**)` entry with its own `MEMCONTINUUM_CODE_ROOT` set to that specific `DIR`.
+  `Write(DIR/**)` entry with its own `MEMCONTINUUM_CODE_ROOT` set to that specific `DIR`. (`DIR`
+  here is always absolute, and the actually-rendered `if` value carries a second leading slash on
+  top of it — `Edit(//abs/path/**)` — per Claude Code's permission-rule path syntax, where one
+  leading slash anchors at the settings source rather than the filesystem root; see
+  `hooks/install-hooks.md` for the fix-round note.)
 - `--claude-dir DIR` — where to merge hook wiring and install the skill. Defaults to
-  `<dirname of --store>/.claude`.
+  `<dirname of --store>/.claude` **only when `--store` was also omitted** — the store then
+  defaults beside the repo the cwd is in, a reliable signal for where its hooks belong. **An
+  explicit `--store` with no `--claude-dir` is a hard error** (fix-round-4 F3, final ruling): an
+  explicit `--store` may be run from any cwd (a test harness, a script, an unrelated checkout) to
+  wire a project's hooks from elsewhere, so the cwd is never a safe guess for `--claude-dir` —
+  even a git cwd can be the wrong repo. Pass `--claude-dir DIR` explicitly whenever `--store` is
+  explicit.
 - `--python PATH` — absolute path to the python to run the engine with. Overrides every other
   resolution below.
 - `--bootstrap-venv [DIR]` — create a venv (prefer `uv venv` + `uv pip` when `uv` is on `PATH`,
@@ -383,19 +442,39 @@ picks up future edits to the canonical script automatically, since it `exec`s th
 than copying it). Under `--claude-dir`: `skills/memory-search/SKILL.md` (copied verbatim) and
 the hook wiring, merged into `settings.local.json`. Finally it runs `memidx.py reindex --root
 DIR --project NAME --no-embed` (see "Design choices" below) and `memlint.py DIR`, and prints a
-verification summary plus next steps.
+verification summary plus next steps. **Adopted vs. fresh-seeded stores are classified before any
+of this runs** (fix-round-4 F10): a store install is "adopted" iff `--store` was already a git
+repo carrying one of this tool's markers (see `--store` above); everything else is a fresh seed.
+On an adopted store, `memlint` findings are printed in the verification summary but do **not**
+fail the install (exit 0) — they reflect pre-existing content the adopt, not this installer,
+introduced (the motivating case: legacy duplicate ids memlint's duplicate-id check promotes to an
+error). A freshly seeded store still hard-fails on any lint error (exit 8) — nothing but this
+installer's own templates could have put one there, so a lint error there is an installer bug.
 
 **Idempotency.** Re-running with the same `--project`/`--store`/`--claude-dir` is safe: the
-merge step identifies "its own" hook entries by the seven script basenames
-(`pre-edit-chain.sh`, `newfile-nudge.sh`, `ledger-post-edit.sh`, `precompact-persist.sh`,
-`sessionstart-remind.sh`, `userprompt-remind.sh`, `sessionend-stamp.sh`) appearing in a hook
-item's `command`, drops only those items (per item, not per group — a foreign hook sharing a matcher group with one of ours
-survives), removes any group left empty, and appends freshly rendered groups. Every other
-top-level key in `settings.local.json` (`permissions`, unrelated hooks, …) is left untouched.
-`settings.local.json` is backed up to `settings.local.json.bak-memcontinuum` before every write
-that touches an existing file. Store tree creation, the README/`.gitignore` render, and the
-skill copy are all overwrite-safe; `git init`/the initial commit are skipped once `--store` is
-already a git repo.
+merge step (`scripts/mc_settings_merge.py`, fix-round-4 F8 — the one settings-merge
+implementation, shared with `memcontinuum-setup.sh`'s own detector-hook merge) identifies "its
+own" hook entries by the seven script basenames (`pre-edit-chain.sh`, `newfile-nudge.sh`,
+`ledger-post-edit.sh`, `precompact-persist.sh`, `sessionstart-remind.sh`, `userprompt-remind.sh`,
+`sessionend-stamp.sh`) appearing in a hook item's `command`, **further scoped by a
+`MEMCONTINUUM_PROJECT=` identity marker** carried in every one of the seven commands (fix-round-4
+F1): an entry naming our scripts but marked for a *different* project survives a re-run — this is
+what lets two projects share one `--claude-dir` without one's re-run unwiring the other's entries.
+Drops only its own items (per item, not per group — a foreign hook sharing a matcher group with
+one of ours survives), removes any group left empty, and appends freshly rendered groups. Every
+other top-level key in `settings.local.json` (`permissions`, unrelated hooks, …) is left
+untouched. `settings.local.json` is backed up to `settings.local.json.bak-memcontinuum` before
+every write that touches an existing file (atomically: a same-directory tmp file plus
+`os.replace`, original file mode preserved — never a truncate-in-place). Store tree creation, the
+README/`.gitignore` render, and the skill copy are all overwrite-safe; `git init`/the initial
+commit are skipped once `--store` is already a git repo.
+
+**Migration note (fix-round-4 F1):** an entry naming one of the seven scripts with NO
+`MEMCONTINUUM_PROJECT=` marker at all — every `newfile-nudge.sh` entry installed before this fix,
+since the template that renders it never carried the marker — is treated as legacy/pre-identity
+wiring and stays sweepable by *any* project's re-run of a shared `--claude-dir`, exactly as
+before. Re-running `scripts/repo-init.sh` for a given project rewrites that project's entries with
+the marker and closes the hole for it; a project that never re-runs stays exposed until it does.
 
 **Uninstall.** Remove the hook items whose `command` mentions one of the seven script basenames
 above from `settings.local.json` (or restore `settings.local.json.bak-memcontinuum`), delete

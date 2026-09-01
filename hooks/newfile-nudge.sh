@@ -52,22 +52,35 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 # Watchdog guard (same pattern as every other hook here -- see
 # userprompt-remind.sh's own guard-block comment for the full rationale):
 # must be the literal first thing this script does after resolving
-# SCRIPT_DIR and sourcing mc-watchdog.sh (a fast, filesystem/subprocess-
-# free variable assignment only -- see its own header).
+# SCRIPT_DIR and sourcing mc-watchdog.sh (see its own header for what
+# running it costs).
 # shellcheck source=mc-watchdog.sh
 source "${MC_WATCHDOG_LIB_PATH:-$SCRIPT_DIR/mc-watchdog.sh}" 2>/dev/null
 if [ -z "${MC_UNDER_TIMEOUT:-}" ]; then
     export MC_UNDER_TIMEOUT=1
-    MC_GUARD_PY="${MEMCONTINUUM_PYTHON:-$SCRIPT_DIR/../.venv/bin/python}"
-    if [ -x "$MC_GUARD_PY" ] && [ -n "${MC_WATCHDOG_LAUNCHER_PY:-}" ]; then
+    # MC_GUARD_PY is set by mc-watchdog.sh above (F6 fix, round 4: env ->
+    # config.sh -> engine venv, same order memlib.sh uses for MC_PY).
+    if [ -x "${MC_GUARD_PY:-}" ] && [ -n "${MC_WATCHDOG_LAUNCHER_PY:-}" ]; then
         "$MC_GUARD_PY" -c "$MC_WATCHDOG_LAUNCHER_PY" "${BASH:-bash}" "${BASH_SOURCE[0]}" "$@"
         exit 0
     fi
 fi
 
 export PYTHONPATH=
-PY="${MEMCONTINUUM_PYTHON:-$SCRIPT_DIR/../.venv/bin/python}"
 MEMCONTINUUM_HOME="${MEMCONTINUUM_HOME:-$HOME/.memcontinuum}"
+# Python resolution order (matches hooks/memlib.sh; F6 fix, round 4):
+#   $MEMCONTINUUM_PYTHON -> $MEMCONTINUUM_HOME/config.sh -> <engine>/.venv/bin/python
+# Only used for JSON handling when jq isn't on PATH (see the header comment
+# above) -- never to run memidx.py. The config.sh step is sourced (never
+# sed/grep'd), swallowed by `|| true` so a missing/corrupt config.sh can
+# only cost sourcing time, never block this hook. mc-watchdog.sh above
+# already resolved MEMCONTINUUM_PYTHON via this same order for MC_GUARD_PY,
+# so this second lookup is a no-op whenever that one already found one.
+if [ -z "${MEMCONTINUUM_PYTHON:-}" ] && [ -f "$MEMCONTINUUM_HOME/config.sh" ]; then
+    # shellcheck source=/dev/null
+    . "$MEMCONTINUUM_HOME/config.sh" 2>/dev/null || true
+fi
+PY="${MEMCONTINUUM_PYTHON:-$SCRIPT_DIR/../.venv/bin/python}"
 LOG="$MEMCONTINUUM_HOME/hook.log"
 mkdir -p "$MEMCONTINUUM_HOME" 2>/dev/null || true
 

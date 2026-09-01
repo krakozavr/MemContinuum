@@ -11,14 +11,16 @@
 #
 #   * No python, no memlib.sh, no watchdog. This fires on EVERY session start
 #     on the machine, including repos that have nothing to do with this tool,
-#     so it must cost near-nothing and depend on nothing. Pure bash + git,
-#     bash 3.2 compatible (no `timeout`, no `flock`, no bash-4 syntax).
+#     so it must cost near-nothing and depend on nothing but git and the pure-
+#     bash scripts/mc-registry-lib.sh sibling. Bash 3.2 compatible (no
+#     `timeout`, no `flock`, no bash-4 syntax).
 #   * No logging by default. A silent no-op in an unrelated repo should leave
 #     no trace; set $MEMCONTINUUM_DETECT_LOG=1 to trace decisions into
 #     hook.log while debugging.
 #
 # Fails open, always exit 0: any error, any missing tool, any unparseable
-# payload means "say nothing", never "block the session".
+# payload -- including a missing/broken mc-registry-lib.sh -- means "say
+# nothing", never "block the session".
 #
 # States, in the order they are checked (first match wins, all but the last
 # are silent):
@@ -26,11 +28,18 @@
 #   not-a-repo   cwd is not inside a git working tree -- nothing to wire.
 #   opted-out    $MEMCONTINUUM_HOME/no-ask exists -- the machine-wide "never
 #                ask me in any repo" switch.
-#   wired        the repo's own .claude settings already reference one of the
-#                installed hook scripts -- MemContinuum serves this repo.
 #   decided      the repo's key appears in $MEMCONTINUUM_HOME/decisions.tsv --
-#                a human already answered, either way. Never ask twice.
-#   undecided    none of the above -> emit ONE additionalContext line.
+#                a human already answered, either way. Never ask twice,
+#                regardless of what the repo's current wiring looks like: the
+#                recorded answer is the source of truth, the wiring scan
+#                below is diagnostic only (fix-round-4 F5).
+#   wired-full   no recorded row, but the repo's own .claude settings already
+#                reference ALL FIVE always-wired write-side hooks --
+#                grandfathered installs that predate this registry.
+#   undecided    none of the above (including a PARTIAL wiring match: some
+#                but not all five hooks present is the repair path, and
+#                silence there would leave a half-wired repo with no route
+#                back to health) -> emit ONE additionalContext line.
 #
 # Repo key: the `origin` remote URL when there is one, else the working
 # tree's absolute path. Remote-keyed on purpose -- a path key silently
@@ -43,30 +52,42 @@ set -u
 
 exec 2>/dev/null
 
-MEMCONTINUUM_HOME="${MEMCONTINUUM_HOME:-$HOME/.memcontinuum}"
-DECISIONS="$MEMCONTINUUM_HOME/decisions.tsv"
-NO_ASK="$MEMCONTINUUM_HOME/no-ask"
-
-# "Wired" means the five ALWAYS-wired write-side hooks appear on "command"
-# lines of the repo's .claude settings -- same rule as memcontinuum-decide.sh
-# and -state.sh. The two PreToolUse hooks (pre-edit-chain, newfile-nudge) are
-# deliberately absent: a rationale-only install omits them, and a stale
-# PreToolUse-only fragment must not silence the detector (regate finding 4 --
-# an earlier version of this edit no-opped because its match text had been
-# rewritten by an unrelated rename sweep; hence the assert-style comment).
-HOOK_BASENAMES="ledger-post-edit.sh precompact-persist.sh sessionstart-remind.sh userprompt-remind.sh sessionend-stamp.sh"
-
+# detect_log falls back to the fixed default inline, in a LOCAL, rather than
+# defaulting the real $MEMCONTINUUM_HOME up front: mc_resolve_home below (F7)
+# distinguishes "unset" (check the pointer config) from "already resolved"
+# purely by whether $MEMCONTINUUM_HOME is non-empty, so pre-seeding it here
+# would make every custom-HOME machine look already-resolved to the fixed
+# default and silently skip the pointer.
 detect_log() {
     [ -n "${MEMCONTINUUM_DETECT_LOG:-}" ] || return 0
-    mkdir -p "$MEMCONTINUUM_HOME" 2>/dev/null
+    local home="${MEMCONTINUUM_HOME:-$HOME/.memcontinuum}"
+    mkdir -p "$home" 2>/dev/null
     printf '%s detect: %s\n' "$(date -Iseconds 2>/dev/null || date)" "$1" \
-        >>"$MEMCONTINUUM_HOME/hook.log" 2>/dev/null
+        >>"$home/hook.log" 2>/dev/null
 }
 
 quiet_exit() {
     detect_log "$1"
     exit 0
 }
+
+# The engine dir is wherever THIS script lives, one level up from hooks/ --
+# same layout the installed hook line always ships (hooks/ and scripts/ are
+# checkout siblings). If the checkout has moved or lost the lib, fail open:
+# that is the existing posture for every other error in this file.
+MC_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" >/dev/null 2>&1 && pwd)"
+[ -n "$MC_SELF_DIR" ] || quiet_exit "no-self-dir"
+# shellcheck source=./mc-registry-lib.sh
+. "$MC_SELF_DIR/../scripts/mc-registry-lib.sh" 2>/dev/null || quiet_exit "lib-missing"
+
+# F7: resolve MEMCONTINUUM_HOME the same way state.sh/decide.sh do (env ->
+# pointer at the fixed default path -> fixed default) now that the installed
+# hook line no longer bakes it in literally. Cheap (one optional file read),
+# and must happen before the no-ask/git work below since NO_ASK and DECISIONS
+# depend on the final value.
+mc_resolve_home
+DECISIONS="$MEMCONTINUUM_HOME/decisions.tsv"
+NO_ASK="$MEMCONTINUUM_HOME/no-ask"
 
 # Interactive/no-stdin invocation must never hang -- and neither may a pipe
 # whose writer stalls or never closes: this hook has no watchdog, so it
@@ -127,47 +148,30 @@ esac
 
 [ -d "$CWD" ] || quiet_exit "cwd-missing"
 
-command -v git >/dev/null 2>&1 || quiet_exit "no-git"
-REPO="$(git -C "$CWD" rev-parse --show-toplevel 2>/dev/null)"
-[ -n "$REPO" ] || quiet_exit "not-a-repo"
-
+# Cheapest possible check first, before any git invocation: a stat, not a
+# fork+exec. Most sessions on this machine are NOT in a repo mid-decision, so
+# this ordering matters for the common case, not just the opted-out one.
 [ -f "$NO_ASK" ] && quiet_exit "opted-out-globally"
 
-for settings in "$REPO/.claude/settings.local.json" "$REPO/.claude/settings.json"; do
-    [ -f "$settings" ] || continue
-    for base in $HOOK_BASENAMES; do
-        if grep '"command"' "$settings" 2>/dev/null | grep -qF "$base"; then
-            quiet_exit "wired repo=$REPO"
-        fi
-    done
-done
-
-REMOTE="$(git -C "$REPO" config --get remote.origin.url 2>/dev/null)"
-if [ -n "$REMOTE" ]; then
-    KEY="$REMOTE"
-else
-    KEY="$REPO"
+if ! mc_repo_key "$CWD"; then
+    quiet_exit "not-a-repo"
 fi
-# The registry is line-oriented TSV; a key containing a tab or newline (legal
-# in both paths and git config values) must not be able to fake columns or
-# extra rows. Same mapping in memcontinuum-decide.sh/-state.sh -- all three
-# must agree or a sanitized key never matches its row.
-KEY="$(printf '%s' "$KEY" | tr '\t\n' '__')"
+REPO="$MC_REPO"
+KEY="$MC_REPO_KEY"
 
-if [ -f "$DECISIONS" ]; then
-    # Exact match on the first TAB-separated field only -- a substring match
-    # would let one repo's key mask another's.
-    while IFS="$(printf '\t')" read -r k rest; do
-        case "$k" in
-            \#*|"") continue ;;
-        esac
-        if [ "$k" = "$KEY" ]; then
-            quiet_exit "decided key=$KEY"
-        fi
-    done < "$DECISIONS"
+# A recorded row is authoritative regardless of current wiring (F5): never
+# re-ask a repo a human already answered, even if its wiring later broke.
+if mc_registry_lookup "$DECISIONS" "$KEY"; then
+    quiet_exit "decided key=$KEY decision=$MC_LOOKUP_DECISION"
 fi
 
-detect_log "undecided key=$KEY"
+# No row. Grandfather a fully-wired repo (installs that predate this
+# registry) but ask about a partial one -- partial is the repair path, and
+# silence there would leave a half-wired repo with no route back to health.
+mc_wiring_scan "$REPO/.claude/settings.local.json" "$REPO/.claude/settings.json"
+[ "$MC_WIRING" = "full" ] && quiet_exit "wired-full-no-row repo=$REPO"
+
+detect_log "undecided key=$KEY wiring=$MC_WIRING"
 
 # One fact line and one question, matching the wording rule the other hooks
 # follow: state what is true, ask once, never issue an imperative and never

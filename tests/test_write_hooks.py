@@ -446,17 +446,25 @@ class HookTestBase(unittest.TestCase):
         )
 
     def user_prompt_payload(
-        self, session_id, source="user", agent_id=None, prompt_id=None, prompt_key="user_input"
+        self, session_id, source=None, agent_id=None, agent_type=None, prompt_id=None,
+        prompt_key="user_input",
     ):
+        """Real-shaped by default (fix-round 2026-08-31): a live
+        UserPromptSubmit payload carries no `source` field at all -- that
+        field belongs to SessionStart -- so `source` is omitted unless a
+        test explicitly passes one (to prove its presence, if it ever
+        shows up again, is a no-op the hook ignores)."""
         d = {
             "session_id": session_id,
             "hook_event_name": "UserPromptSubmit",
-            "source": source,
             "cwd": str(self.code_root),
             prompt_key: "this text must never be read by the hook",
         }
+        if source is not None:
+            d["source"] = source
         if agent_id:
             d["agent_id"] = agent_id
+            d["agent_type"] = agent_type or "Explore"
         if prompt_id:
             d["prompt_id"] = prompt_id
         return json.dumps(d)
@@ -715,6 +723,246 @@ class TestLedgerPostEdit(HookTestBase):
         state = self.load_state(session_id)
         self.assertEqual(state.get("last_growth_turn"), 7)
 
+    def test_watchdog_guard_resolves_python_via_config_sh(self):
+        """F6 regression, round 4: the watchdog guard's own MC_GUARD_PY
+        resolution (hooks/mc-watchdog.sh) used to be two-step only (env
+        $MEMCONTINUUM_PYTHON, else the engine's <engine>/.venv/bin/python)
+        -- skipping the config.sh middle step hooks/memlib.sh already
+        consults for MC_PY. A non-default venv left the guard itself dead:
+        it would fall through UNGUARDED (per its own header comment)
+        straight to `source memlib.sh`, which DOES still find the right
+        python via its own config.sh step -- so the hook would still work,
+        just with no watchdog wrapped around it at all.
+
+        Proven by boundedness, not by inspecting a resolved path: with
+        MEMCONTINUUM_PYTHON unset and no engine .venv in this checkout, a
+        config.sh at $MEMCONTINUUM_HOME/config.sh is the ONLY way
+        MC_GUARD_PY can resolve to an executable. Point it at a python
+        wrapper that execs the real venv python immediately for the
+        launcher's own `-c $MC_WATCHDOG_LAUNCHER_PY` call (so the launcher
+        itself always starts fine) but sleeps 6s for every OTHER call --
+        i.e. every real hook-work call memlib.sh's helpers make. If the
+        guard actually engaged (MC_GUARD_PY resolved via config.sh), the
+        whole run is bounded to the watchdog's own ~2s budget; if the guard
+        fell through unguarded, nothing bounds the 6s sleep and the run
+        takes ~6s instead."""
+        self.assertFalse(
+            (HOOKS_DIR / ".." / ".venv" / "bin" / "python").resolve().exists(),
+            "this test relies on no engine .venv existing in this checkout",
+        )
+        hang_py = Path(self.td) / "hang-python-config-guard"
+        hang_py.write_text(
+            "#!/usr/bin/env bash\n"
+            "for a in \"$@\"; do\n"
+            "  case \"$a\" in\n"
+            "    *MC_WATCHDOG_LAUNCHER*) exec \"" + VENV_PYTHON + "\" \"$@\" ;;\n"
+            "  esac\n"
+            "done\n"
+            "sleep 6\n"
+            f'exec "{VENV_PYTHON}" "$@"\n'
+        )
+        hang_py.chmod(0o755)
+        (self.home / "config.sh").write_text(f'MEMCONTINUUM_PYTHON="{hang_py}"\n')
+
+        env = self.base_env()
+        del env["MEMCONTINUUM_PYTHON"]
+        session_id = "s-ledger-config-guard"
+        fpath = str(self.code_root / "src" / "mapped.py")
+        payload = self.post_tool_use_payload(session_id, fpath)
+        proc, elapsed = run_script(LEDGER_HOOK, payload, env, timeout=10.0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertLess(
+            elapsed,
+            2.5,
+            f"the watchdog guard must have resolved MC_GUARD_PY via config.sh and bounded "
+            f"the run to its own ~2s budget, took {elapsed:.3f}s",
+        )
+
+    def test_control_watchdog_guard_without_config_sh_step_is_unbounded(self):
+        """Control experiment (project rule: a fix's test must fail on the
+        pre-fix code, or it's decoration): a copy of mc-watchdog.sh with
+        the config.sh resolution step stripped back out (MC_WATCHDOG_LIB_PATH
+        seam, same one every hook's guard preamble already reads) leaves
+        MC_GUARD_PY unresolvable (env unset, no engine .venv) -- the guard
+        then falls through UNGUARDED and the hang wrapper's 6s sleep is NOT
+        bounded by any watchdog, proving the boundedness assertion above is
+        load-bearing, not decoration."""
+        original = (HOOKS_DIR / "mc-watchdog.sh").read_text()
+        needle = (
+            'MEMCONTINUUM_HOME="${MEMCONTINUUM_HOME:-$HOME/.memcontinuum}"\n'
+            'MC_HOME_CONFIG_1="$MEMCONTINUUM_HOME/config.sh"\n'
+            'if [ -f "$MC_HOME_CONFIG_1" ]; then\n'
+            '    # shellcheck source=/dev/null\n'
+            '    . "$MC_HOME_CONFIG_1" 2>/dev/null || true\n'
+            'fi\n'
+            '# A damaged-but-sourceable config may have `unset MEMCONTINUUM_HOME` --\n'
+            '# re-default after every source so `set -u` can never trip on it (regate\n'
+            '# round 2).\n'
+            'MEMCONTINUUM_HOME="${MEMCONTINUUM_HOME:-$HOME/.memcontinuum}"\n'
+            'if [ "$MEMCONTINUUM_HOME/config.sh" != "$MC_HOME_CONFIG_1" ] && [ -f "$MEMCONTINUUM_HOME/config.sh" ]; then\n'
+            '    # shellcheck source=/dev/null\n'
+            '    . "$MEMCONTINUUM_HOME/config.sh" 2>/dev/null || true\n'
+            '    MEMCONTINUUM_HOME="${MEMCONTINUUM_HOME:-$HOME/.memcontinuum}"\n'
+            'fi\n'
+            'unset MC_HOME_CONFIG_1\n'
+        )
+        self.assertIn(needle, original)
+        broken = original.replace(needle, "", 1)
+        self.assertNotEqual(broken, original)
+        broken_watchdog = Path(self.td) / "mc-watchdog-broken-control.sh"
+        broken_watchdog.write_text(broken)
+
+        hang_py = Path(self.td) / "hang-python-control"
+        hang_py.write_text(
+            "#!/usr/bin/env bash\n"
+            "for a in \"$@\"; do\n"
+            "  case \"$a\" in\n"
+            "    *MC_WATCHDOG_LAUNCHER*) exec \"" + VENV_PYTHON + "\" \"$@\" ;;\n"
+            "  esac\n"
+            "done\n"
+            "sleep 6\n"
+            f'exec "{VENV_PYTHON}" "$@"\n'
+        )
+        hang_py.chmod(0o755)
+        (self.home / "config.sh").write_text(f'MEMCONTINUUM_PYTHON="{hang_py}"\n')
+
+        env = self.base_env(MC_WATCHDOG_LIB_PATH=str(broken_watchdog))
+        del env["MEMCONTINUUM_PYTHON"]
+        session_id = "s-ledger-config-guard-control"
+        fpath = str(self.code_root / "src" / "mapped.py")
+        payload = self.post_tool_use_payload(session_id, fpath)
+        proc, elapsed = run_script(LEDGER_HOOK, payload, env, timeout=20.0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertGreaterEqual(
+            elapsed,
+            4.0,
+            "with the config.sh step stripped from the guard, the run must NOT be "
+            f"bounded by any watchdog -- proving the real test's assertion is "
+            f"load-bearing, took only {elapsed:.3f}s",
+        )
+
+    def test_fail_open_when_watchdog_lib_missing(self):
+        """R1 regression, round 4 gate: mc-watchdog.sh missing/unsourceable
+        (e.g. the engine moved) used to leave MC_GUARD_PY completely unset
+        -- under `set -u`, the guard preamble's `[ -x "$MC_GUARD_PY" ]` then
+        aborted the hook with 'unbound variable' instead of falling through
+        unguarded, turning a PostToolUse hook into a real failure instead
+        of failing open. Must still exit 0 and do the real ledger work."""
+        session_id = "s-ledger-watchdog-lib-missing"
+        fpath = str(self.code_root / "src" / "mapped.py")
+        payload = self.post_tool_use_payload(session_id, fpath)
+        env = self.base_env(MC_WATCHDOG_LIB_PATH="/nonexistent/mc-watchdog.sh")
+        proc, _elapsed = run_script(LEDGER_HOOK, payload, env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("unbound variable", proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        state = self.load_state(session_id)
+        self.assertIn(fpath, [e["path"] for e in state.get("ledger", [])])
+
+    def test_regate2_damaged_config_unsetting_home_still_fails_open(self):
+        """Regate round 2 (Codex): a damaged-but-sourceable config.sh that
+        does `unset MEMCONTINUUM_HOME` used to leave the next bare
+        $MEMCONTINUUM_HOME expansion to abort the hook under `set -u`.
+        Every post-source use must re-default instead: exit 0, no 'unbound
+        variable', real work still done (under the $HOME fallback)."""
+        session_id = "s-ledger-damaged-config"
+        fake_home = Path(self.td) / "regate2-fake-home"
+        fake_home.mkdir()
+        (self.home / "config.sh").write_text("unset MEMCONTINUUM_HOME\n")
+        fpath = str(self.code_root / "src" / "mapped.py")
+        payload = self.post_tool_use_payload(session_id, fpath)
+        env = self.base_env(HOME=str(fake_home))
+        proc, _elapsed = run_script(LEDGER_HOOK, payload, env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("unbound variable", proc.stderr)
+        # MEMCONTINUUM_HOME env is still set here (base_env), so the unset
+        # only bites INSIDE the sourcing chain; the state must land under
+        # the re-defaulted home, not vanish.
+        state_file = fake_home / ".memcontinuum" / "sessions" / self.project / f"{session_id}.json"
+        state = json.loads(state_file.read_text()) if state_file.exists() else self.load_state(session_id)
+        self.assertIn(fpath, [e["path"] for e in state.get("ledger", [])])
+
+    def test_regate2_watchdog_exports_resolved_home_for_reexec_child(self):
+        """Regate round 2 (Codex): the guard resolved MEMCONTINUUM_HOME
+        (possibly via the pointer) but never exported it, so the re-exec'd
+        child re-defaulted HOME and -- with PYTHON baked -- wrote hook.log
+        and session state under ~/.memcontinuum again. After sourcing
+        mc-watchdog.sh, MEMCONTINUUM_HOME must be exported (visible in
+        `env`), carrying the pointer-resolved value."""
+        real_home = Path(self.td) / "regate2-real-home"
+        default_home = Path(self.td) / "regate2-default-home" / ".memcontinuum"
+        real_home.mkdir()
+        default_home.mkdir(parents=True)
+        (default_home / "config.sh").write_text(
+            f"MEMCONTINUUM_HOME='{real_home}'\n"
+        )
+        probe = (
+            "set -u; "
+            f"SCRIPT_DIR='{HOOKS_DIR}'; "
+            f"HOME='{default_home.parent}'; "
+            "unset MEMCONTINUUM_HOME 2>/dev/null; "
+            f"source '{HOOKS_DIR}/mc-watchdog.sh'; "
+            "env | grep '^MEMCONTINUUM_HOME='"
+        )
+        env = clean_env(MEMCONTINUUM_PYTHON=VENV_PYTHON)
+        env.pop("MEMCONTINUUM_HOME", None)
+        proc = subprocess.run(
+            [MC_BASH, "-c", probe], capture_output=True, text=True, env=env, timeout=10
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), f"MEMCONTINUUM_HOME={real_home}")
+
+    def test_r3_session_state_lands_under_custom_home_with_baked_python(self):
+        """R3 regression, round 4 gate: installer-rendered hook lines bake
+        MEMCONTINUUM_PYTHON directly, so the old single-source-if-PYTHON-
+        unset guard in the watchdog guard AND memlib.sh never even looked
+        at config.sh on a freshly installer-wired repo -- MEMCONTINUUM_HOME
+        stayed at the fixed default even though the registry (and the
+        pointer at that default path) say the real home is elsewhere.
+        Session state, hook.log, and the sqlite index all landed under the
+        WRONG (default) home. HOME resolution must run unconditionally,
+        independent of whether PYTHON already resolved."""
+        fake_home = Path(self.td) / "r3-fake-home"
+        default_mc_home = fake_home / ".memcontinuum"
+        default_mc_home.mkdir(parents=True)
+        custom_home = Path(self.td) / "r3-custom-mc-home"
+        custom_home.mkdir()
+        (default_mc_home / "config.sh").write_text(
+            f"MEMCONTINUUM_HOME='{custom_home}'\n"
+        )
+        # The real config.sh at the custom home -- deliberately carries NO
+        # MEMCONTINUUM_PYTHON of its own; this test's env bakes PYTHON
+        # directly (matching an installer-rendered hook line), so PYTHON
+        # resolution must NOT be what triggers HOME to follow the pointer.
+        (custom_home / "config.sh").write_text(f"MEMCONTINUUM_HOME='{custom_home}'\n")
+
+        session_id = "s-ledger-r3-custom-home"
+        fpath = str(self.code_root / "src" / "mapped.py")
+        payload = self.post_tool_use_payload(session_id, fpath)
+        env = clean_env(
+            HOME=str(fake_home),
+            MEMCONTINUUM_PROJECT=self.project,
+            MEMCONTINUUM_ROOT=str(self.store_root),
+            MEMCONTINUUM_CODE_ROOT=str(self.code_root),
+            MEMCONTINUUM_PYTHON=VENV_PYTHON,  # baked, like a real hook line
+        )
+        env.pop("MEMCONTINUUM_HOME", None)
+        proc, _elapsed = run_script(LEDGER_HOOK, payload, env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        state_file = custom_home / "sessions" / self.project / f"{session_id}.json"
+        self.assertTrue(
+            state_file.exists(),
+            f"session state must land under the REAL custom home ({custom_home}), "
+            f"not the default one the pointer lives at",
+        )
+        default_state_file = (
+            default_mc_home / "sessions" / self.project / f"{session_id}.json"
+        )
+        self.assertFalse(default_state_file.exists())
+        self.assertTrue((custom_home / "hook.log").exists())
+        self.assertFalse((default_mc_home / "hook.log").exists())
+
 
 # ---------------------------------------------------------------------------
 # 3. precompact-persist.sh
@@ -852,6 +1100,16 @@ class TestPrecompactPersist(HookTestBase):
         pending = self.load_state(session_id).get("pending") or {}
         self.assertEqual(pending.get("user_turn_count"), 7)
         self.assertEqual(pending.get("last_growth_turn"), 3)
+
+    def test_fail_open_when_watchdog_lib_missing(self):
+        """R1 regression, round 4 gate: see TestLedgerPostEdit's twin."""
+        session_id = "s-precompact-watchdog-lib-missing"
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+        env = self.base_env(MC_WATCHDOG_LIB_PATH="/nonexistent/mc-watchdog.sh")
+        proc, _ = run_script(PRECOMPACT_HOOK, self.pre_compact_payload(session_id), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("unbound variable", proc.stderr)
+        self.assertEqual(proc.stdout, "")
 
 
 # ---------------------------------------------------------------------------
@@ -1015,6 +1273,19 @@ class TestSessionStartRemind(HookTestBase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertLess(elapsed, 1.0)
+
+    def test_fail_open_when_watchdog_lib_missing(self):
+        """R1 regression, round 4 gate: see TestLedgerPostEdit's twin."""
+        session_id = "s-start-watchdog-lib-missing"
+        env = self.base_env(MC_WATCHDOG_LIB_PATH="/nonexistent/mc-watchdog.sh")
+        proc, _ = run_script(
+            SESSIONSTART_HOOK, self.session_start_payload(session_id, "startup"), env
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("unbound variable", proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        state = self.load_state(session_id)
+        self.assertEqual(state.get("start_code_sha"), git_head(self.code_root))
 
 
 # ---------------------------------------------------------------------------
@@ -1202,25 +1473,86 @@ class TestUserPromptRemind(HookTestBase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), "")
 
-    def test_source_not_user_is_silent(self):
-        session_id = "s-prompt-slash"
+    def test_real_shaped_payload_no_source_no_agent_proceeds(self):
+        """The contract fix's central claim: a real UserPromptSubmit payload
+        (no `source` field at all, no agent_id) must fire the hook's normal
+        coverage logic, not be silently rejected. `user_prompt_payload()`'s
+        default is already real-shaped (no `source`), so this is the same
+        payload shape every other test in this class uses -- named
+        explicitly here as the regression pin for the dead-hook bug."""
+        session_id = "s-prompt-realshape"
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+        payload = json.loads(self.user_prompt_payload(session_id))
+        self.assertNotIn("source", payload)
+        self.assertNotIn("agent_id", payload)
+        proc, _ = run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("Coverage signal", proc.stdout)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=injected", log_text)
+
+    def test_arbitrary_source_field_does_not_block(self):
+        """fix-round 2026-08-31: the source=="user" gate is gone -- a
+        payload that happens to carry a `source` value (stale forwarding,
+        or any value other than "user") must still fire normally, proving
+        the gate was actually removed rather than merely never triggered by
+        the default fixture shape."""
+        session_id = "s-prompt-arbitrary-source"
         self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
         proc, _ = run_script(
             USERPROMPT_HOOK, self.user_prompt_payload(session_id, source="my-slash-cmd"), self.base_env()
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.strip(), "")
+        self.assertIn("Coverage signal", proc.stdout)
 
     def test_agent_id_present_is_silent(self):
         session_id = "s-prompt-agent"
         self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
         proc, _ = run_script(
             USERPROMPT_HOOK,
-            self.user_prompt_payload(session_id, source="user", agent_id="agent-123"),
+            self.user_prompt_payload(session_id, agent_id="agent-123"),
             self.base_env(),
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), "")
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=agent-source", log_text)
+
+    def test_agent_type_alone_is_silent(self):
+        """agent_type can be present without agent_id (a session run under
+        `--agent`, not necessarily inside a subagent) -- the gate must catch
+        that shape too, per the fix spec (agent_id OR agent_type)."""
+        session_id = "s-prompt-agent-type-only"
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+        payload = json.loads(self.user_prompt_payload(session_id))
+        payload["agent_type"] = "Explore"
+        proc, _ = run_script(USERPROMPT_HOOK, json.dumps(payload), self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=agent-source", log_text)
+
+    def test_payload_keys_diagnostic_logged_even_when_agent_gate_skips(self):
+        """fix-round 2026-08-31: the payload_keys= diagnostic was moved
+        BEFORE the agent_id/agent_type gate specifically so a future
+        contract mismatch stays visible even on a turn that gate goes on to
+        skip -- this is what the old placement got wrong (it sat inside
+        phase 1, reached only once the now-removed source=="user" gate had
+        already let the turn through, so it never fired on a session where
+        every real turn was being rejected)."""
+        session_id = "s-prompt-agent-keys"
+        self.seed_ledger(session_id, [])
+        proc, _ = run_script(
+            USERPROMPT_HOOK,
+            self.user_prompt_payload(session_id, agent_id="agent-999"),
+            self.base_env(),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (self.home / "hook.log").read_text()
+        keys_lines = [l for l in log_text.splitlines() if "payload_keys=" in l]
+        self.assertEqual(len(keys_lines), 1)
+        self.assertIn("agent_id", keys_lines[0])
+        self.assertIn("outcome=agent-source", log_text)
 
     def test_never_reads_user_input(self):
         """Two checks, both load-bearing (neither passes on a missing/no-op
@@ -1673,8 +2005,12 @@ class TestUserPromptRemind(HookTestBase):
         log_text = (self.home / "hook.log").read_text()
         keys_lines = [l for l in log_text.splitlines() if "payload_keys=" in l]
         self.assertEqual(len(keys_lines), 1)
-        self.assertIn("source", keys_lines[0])
+        # real-shaped default payload (fix-round 2026-08-31): no `source`
+        # key at all -- the captured key list must reflect that, not the
+        # pre-fix fixture shape.
+        self.assertNotIn("source", keys_lines[0])
         self.assertIn("session_id", keys_lines[0])
+        self.assertIn("cwd", keys_lines[0])
 
         # a second turn must not log payload_keys again
         run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.base_env())
@@ -1812,6 +2148,15 @@ class TestUserPromptRemind(HookTestBase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertLess(elapsed, 1.0, f"userprompt hook took {elapsed:.3f}s with a 20-path ledger")
+
+    def test_fail_open_when_watchdog_lib_missing(self):
+        """R1 regression, round 4 gate: see TestLedgerPostEdit's twin."""
+        session_id = "s-prompt-watchdog-lib-missing"
+        env = self.base_env(MC_WATCHDOG_LIB_PATH="/nonexistent/mc-watchdog.sh")
+        proc, _ = run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("unbound variable", proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
 
 
 # ---------------------------------------------------------------------------
@@ -2048,14 +2393,18 @@ class TestUserPromptLookback(HookTestBase):
         fired = proc7.stdout.strip() or proc8.stdout.strip()
         self.assertIn("Coverage signal", fired, "coverage must fire once its shared cooldown re-opens")
 
-    def test_source_not_user_silent_even_when_thin(self):
+    def test_arbitrary_source_field_still_fires_when_thin(self):
+        """fix-round 2026-08-31: the source=="user" gate is gone -- an
+        arbitrary `source` value must no longer silence the look-back
+        reminder either (it used to; this is the look-back twin of
+        TestUserPromptRemind.test_arbitrary_source_field_does_not_block)."""
         session_id = "s-lb-nonuser"
         self._start(session_id)
         self.patch_state(session_id, user_turn_count=20, last_growth_turn=0)
         proc, _ = run_script(
             USERPROMPT_HOOK, self.user_prompt_payload(session_id, source="my-slash-cmd"), self.base_env()
         )
-        self.assertEqual(proc.stdout.strip(), "")
+        self.assertIn("Look-back signal", proc.stdout)
 
     def test_agent_id_silent_even_when_thin(self):
         session_id = "s-lb-agent"
@@ -2063,10 +2412,12 @@ class TestUserPromptLookback(HookTestBase):
         self.patch_state(session_id, user_turn_count=20, last_growth_turn=0)
         proc, _ = run_script(
             USERPROMPT_HOOK,
-            self.user_prompt_payload(session_id, source="user", agent_id="agent-1"),
+            self.user_prompt_payload(session_id, agent_id="agent-1"),
             self.base_env(),
         )
         self.assertEqual(proc.stdout.strip(), "")
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=agent-source", log_text)
 
     def test_store_byte_identical_on_lookback_fire(self):
         session_id = "s-lb-bytesafe"
@@ -2241,6 +2592,18 @@ class TestSessionEndStamp(HookTestBase):
         self.assertLess(
             elapsed, 1.8, f"SessionEnd's watchdog budget must be ~1.2s (not the shared 2s), took {elapsed:.3f}s"
         )
+
+    def test_fail_open_when_watchdog_lib_missing(self):
+        """R1 regression, round 4 gate: see TestLedgerPostEdit's twin."""
+        session_id = "s-end-watchdog-lib-missing"
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+        env = self.base_env(MC_WATCHDOG_LIB_PATH="/nonexistent/mc-watchdog.sh")
+        proc, _ = run_script(SESSIONEND_HOOK, self.session_end_payload(session_id), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("unbound variable", proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+        after = self.load_state(session_id)
+        self.assertIn("ended_at", after)
 
 
 # ---------------------------------------------------------------------------
@@ -2930,6 +3293,22 @@ class TestNewFileNudgeHook(unittest.TestCase):
         print(f"\nnewfile-nudge.sh p95 latency over 20 runs: {p95 * 1000:.1f}ms "
               f"(min {samples[0]*1000:.1f}ms, max {samples[-1]*1000:.1f}ms)")
         self.assertLess(p95, 1.5, f"p95 {p95:.3f}s far exceeds a generous 1.5s outer bound")
+
+    def test_fail_open_when_watchdog_lib_missing(self):
+        """R1 regression, round 4 gate: mc-watchdog.sh missing/unsourceable
+        used to leave MC_GUARD_PY unset, and `[ -x "$MC_GUARD_PY" ]` under
+        `set -u` aborted the hook with 'unbound variable' instead of
+        falling through unguarded -- a PreToolUse hook FAILING instead of
+        failing open. Must still exit 0, never block, and still do the
+        real nudge work (proving the fallthrough, not just non-crashing)."""
+        target = self.code_root / "WatchdogLibMissing.swift"
+        env = self.base_env(MC_WATCHDOG_LIB_PATH="/nonexistent/mc-watchdog.sh")
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("unbound variable", proc.stderr)
+        data = json.loads(proc.stdout)
+        ctx = data["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("New source file under", ctx)
 
 
 if __name__ == "__main__":
