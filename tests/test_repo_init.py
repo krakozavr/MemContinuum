@@ -944,10 +944,11 @@ class TestNoMachineIdentifyingContent(unittest.TestCase):
 
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
 class TestPythonResolutionOrder(unittest.TestCase):
-    """$MEMCONTINUUM_PYTHON env -> <engine>/.venv/bin/python -> error naming
-    --bootstrap-venv. Runs against a COPIED engine checkout (copy_engine) so
-    no test ever creates, or depends on the absence of, a real .venv/ next
-    to this repo's own scripts/repo-init.sh."""
+    """$MEMCONTINUUM_PYTHON env -> $MEMCONTINUUM_HOME/config.sh ->
+    <engine>/.venv/bin/python -> error naming --bootstrap-venv. Runs against
+    a COPIED engine checkout (copy_engine) so no test ever creates, or
+    depends on the absence of, a real .venv/ next to this repo's own
+    scripts/repo-init.sh."""
 
     def test_error_when_nothing_resolves(self):
         home = sandbox_home()
@@ -967,6 +968,7 @@ class TestPythonResolutionOrder(unittest.TestCase):
             )
             self.assertNotEqual(proc.returncode, 0)
             self.assertIn("--bootstrap-venv", proc.stdout + proc.stderr)
+            self.assertIn("config.sh", proc.stdout + proc.stderr)
             self.assertFalse(Path(store).exists())
         finally:
             shutil.rmtree(home, ignore_errors=True)
@@ -1033,6 +1035,195 @@ class TestPythonResolutionOrder(unittest.TestCase):
         finally:
             shutil.rmtree(home, ignore_errors=True)
             shutil.rmtree(engine_dir, ignore_errors=True)
+
+    def test_config_sh_python_used_when_no_env_no_flag_no_venv(self):
+        home = sandbox_home()
+        engine_dir = tempfile.mkdtemp(prefix="memcontinuum-engine-copy-")
+        try:
+            install_sh = copy_engine(engine_dir)
+            cfg_py = Path(home) / "external-python" / "python"
+            write_python_shim(cfg_py)
+            mc_home = Path(home) / ".memcontinuum"
+            mc_home.mkdir(parents=True, exist_ok=True)
+            (mc_home / "config.sh").write_text(
+                "if [ -z \"${MEMCONTINUUM_PYTHON:-}\" ]; then MEMCONTINUUM_PYTHON='%s'; fi\n"
+                % cfg_py
+            )
+            store = str(Path(home) / "store")
+            proc = run_install_at(
+                install_sh,
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude")],
+                home,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn(f"python      : {cfg_py}", proc.stdout)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+            shutil.rmtree(engine_dir, ignore_errors=True)
+
+    def test_env_wins_over_config_sh(self):
+        home = sandbox_home()
+        engine_dir = tempfile.mkdtemp(prefix="memcontinuum-engine-copy-")
+        try:
+            install_sh = copy_engine(engine_dir)
+            env_py = Path(home) / "env-python" / "python"
+            write_python_shim(env_py)
+            mc_home = Path(home) / ".memcontinuum"
+            mc_home.mkdir(parents=True, exist_ok=True)
+            (mc_home / "config.sh").write_text(
+                "if [ -z \"${MEMCONTINUUM_PYTHON:-}\" ]; then "
+                "MEMCONTINUUM_PYTHON='/no/such/config/python'; fi\n"
+            )
+            store = str(Path(home) / "store")
+            proc = run_install_at(
+                install_sh,
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude")],
+                home,
+                python=str(env_py),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn(f"python      : {env_py}", proc.stdout)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+            shutil.rmtree(engine_dir, ignore_errors=True)
+
+    def test_pointer_config_sh_is_followed(self):
+        home = sandbox_home()
+        engine_dir = tempfile.mkdtemp(prefix="memcontinuum-engine-copy-")
+        other_dir = tempfile.mkdtemp(prefix="memcontinuum-other-home-")
+        try:
+            install_sh = copy_engine(engine_dir)
+            real_py = Path(other_dir) / "real-python" / "python"
+            write_python_shim(real_py)
+            mc_home = Path(home) / ".memcontinuum"
+            mc_home.mkdir(parents=True, exist_ok=True)
+            (mc_home / "config.sh").write_text("MEMCONTINUUM_HOME='%s'\n" % other_dir)
+            Path(other_dir, "config.sh").write_text(
+                "if [ -z \"${MEMCONTINUUM_PYTHON:-}\" ]; then MEMCONTINUUM_PYTHON='%s'; fi\n"
+                % real_py
+            )
+            store = str(Path(home) / "store")
+            proc = run_install_at(
+                install_sh,
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude")],
+                home,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn(f"python      : {real_py}", proc.stdout)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+            shutil.rmtree(engine_dir, ignore_errors=True)
+            shutil.rmtree(other_dir, ignore_errors=True)
+
+    def test_engine_venv_used_when_config_sh_sets_no_python(self):
+        home = sandbox_home()
+        engine_dir = tempfile.mkdtemp(prefix="memcontinuum-engine-copy-")
+        try:
+            install_sh = copy_engine(engine_dir)
+            venv_py = Path(engine_dir) / ".venv" / "bin" / "python"
+            write_python_shim(venv_py)
+            mc_home = Path(home) / ".memcontinuum"
+            mc_home.mkdir(parents=True, exist_ok=True)
+            (mc_home / "config.sh").write_text("MEMCONTINUUM_ENGINE='%s'\n" % engine_dir)
+            store = str(Path(home) / "store")
+            proc = run_install_at(
+                install_sh,
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude")],
+                home,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn(f"python      : {venv_py}", proc.stdout)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+            shutil.rmtree(engine_dir, ignore_errors=True)
+
+    def test_noisy_config_sh_stdout_does_not_corrupt_resolution(self):
+        # Codex, 2026-09-01: resolve_python's config.sh sources now silence
+        # stdout too (". \"$cfg\" >/dev/null 2>&1"), not just stderr -- a
+        # config.sh that prints chatter used to have that chatter captured
+        # into cfg_python by the command substitution, corrupting it into
+        # "chatter/path" and wrongly blocking a valid engine-venv fallback.
+        # Red against the pre-fix code, green now.
+        home = sandbox_home()
+        engine_dir = tempfile.mkdtemp(prefix="memcontinuum-engine-copy-")
+        try:
+            install_sh = copy_engine(engine_dir)
+            venv_py = Path(engine_dir) / ".venv" / "bin" / "python"
+            write_python_shim(venv_py)
+            mc_home = Path(home) / ".memcontinuum"
+            mc_home.mkdir(parents=True, exist_ok=True)
+            (mc_home / "config.sh").write_text(
+                'echo "setup chatter"\n'
+                'echo "more setup chatter" >&2\n'
+            )
+            store = str(Path(home) / "store")
+            proc = run_install_at(
+                install_sh,
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude")],
+                home,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn(f"python      : {venv_py}", proc.stdout)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+            shutil.rmtree(engine_dir, ignore_errors=True)
+
+    def test_malformed_config_sh_fails_open_to_engine_venv(self):
+        home = sandbox_home()
+        engine_dir = tempfile.mkdtemp(prefix="memcontinuum-engine-copy-")
+        try:
+            install_sh = copy_engine(engine_dir)
+            venv_py = Path(engine_dir) / ".venv" / "bin" / "python"
+            write_python_shim(venv_py)
+            mc_home = Path(home) / ".memcontinuum"
+            mc_home.mkdir(parents=True, exist_ok=True)
+            (mc_home / "config.sh").write_text("syntax error (((\n")
+            store = str(Path(home) / "store")
+            proc = run_install_at(
+                install_sh,
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude")],
+                home,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn(f"python      : {venv_py}", proc.stdout)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+            shutil.rmtree(engine_dir, ignore_errors=True)
+
+    def test_python_flag_wins_over_config_sh(self):
+        home = sandbox_home()
+        engine_dir = tempfile.mkdtemp(prefix="memcontinuum-engine-copy-")
+        try:
+            install_sh = copy_engine(engine_dir)
+            explicit_py = Path(engine_dir) / "explicit" / "python"
+            write_python_shim(explicit_py)
+            mc_home = Path(home) / ".memcontinuum"
+            mc_home.mkdir(parents=True, exist_ok=True)
+            (mc_home / "config.sh").write_text(
+                "if [ -z \"${MEMCONTINUUM_PYTHON:-}\" ]; then "
+                "MEMCONTINUUM_PYTHON='/no/such/config/python'; fi\n"
+            )
+            store = str(Path(home) / "store")
+            proc = run_install_at(
+                install_sh,
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude"),
+                 "--python", str(explicit_py)],
+                home,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn(f"python      : {explicit_py}", proc.stdout)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+            shutil.rmtree(engine_dir, ignore_errors=True)
+
+    # --bootstrap-venv vs. a competing config.sh is deliberately not tested
+    # here: reading scripts/repo-init.sh's main flow shows --bootstrap-venv
+    # sets PYTHON_BIN directly and skips resolve_python() entirely whenever
+    # --python wasn't also given (see the `if [ "$BOOTSTRAP_VENV" -eq 1 ]`
+    # block) -- so a competing config.sh can never be consulted, let alone
+    # win, and a test asserting that would only re-prove TestBootstrapVenv's
+    # existing coverage while duplicating its whole fake-uv/fake-python3
+    # harness for no new signal.
 
 
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)

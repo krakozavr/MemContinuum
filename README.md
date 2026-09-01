@@ -283,7 +283,11 @@ predate the venv it now points at, or were wired by hand without it.
 fixed default path (`~/.memcontinuum/config.sh`) may itself be a POINTER —
 `memcontinuum-setup.sh` writes one there, recording only the real
 `MEMCONTINUUM_HOME`, whenever setup runs with a non-default `MEMCONTINUUM_HOME`.
-All four sites above follow through on it identically: source the
+(`scripts/repo-init.sh`'s own python resolution also follows the pointer,
+but only when it reaches the config.sh fallback — an explicit
+`$MEMCONTINUUM_PYTHON` returns before any sourcing, since repo-init needs
+only the python, not the resolved home.) All four sites above follow
+through on it identically: source the
 default/env path first, and if that just redefined `MEMCONTINUUM_HOME` to a
 different directory, source the REAL `config.sh` there too. This runs
 unconditionally — even when `MEMCONTINUUM_PYTHON` is already baked into the
@@ -421,10 +425,12 @@ Claude Code. `--project` is the only required flag.
   repo (the normal re-run/adopt case) — `--force` only ever matters the first time.
 
 **Python resolution**, when neither `--python` nor `--bootstrap-venv` is given:
-`$MEMCONTINUUM_PYTHON` (env) → `<this checkout>/.venv/bin/python` → a clear error naming
-`--bootstrap-venv`. The hooks resolve their own python at runtime with one extra middle step —
-`$MEMCONTINUUM_PYTHON` → `$MEMCONTINUUM_HOME/config.sh` (written by `memcontinuum-setup.sh`) →
-`<engine>/.venv/bin/python` — except
+`$MEMCONTINUUM_PYTHON` (env) → `$MEMCONTINUUM_HOME/config.sh` (written by
+`memcontinuum-setup.sh`) → `<this checkout>/.venv/bin/python` → a clear error naming
+`--bootstrap-venv`. A machine already set up with `memcontinuum-setup.sh` needs neither
+`$MEMCONTINUUM_PYTHON` nor `--bootstrap-venv` for this step — its `config.sh` already resolves
+it. The hooks resolve their own python at runtime the same way — `$MEMCONTINUUM_PYTHON` →
+`$MEMCONTINUUM_HOME/config.sh` → `<engine>/.venv/bin/python` — except
 they never hard-error — every hook fails open (logs the problem, changes nothing, never blocks
 an edit or a commit) rather than blocking on a missing python.
 

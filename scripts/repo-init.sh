@@ -100,7 +100,9 @@ Usage: repo-init.sh --project NAME [--store DIR] [--code-root DIR ...]
   -h, --help          this text.
 
 Without --python or --bootstrap-venv, the python to run memidx.py/memlint.py
-with is resolved in this order: $MEMCONTINUUM_PYTHON (env) -> <this
+with is resolved in this order: $MEMCONTINUUM_PYTHON (env) -> the
+MEMCONTINUUM_PYTHON recorded in $MEMCONTINUUM_HOME/config.sh (written by
+memcontinuum-setup.sh; one pointer config.sh followed) -> <this
 checkout>/.venv/bin/python -> a clear error naming --bootstrap-venv.
 USAGE
 }
@@ -167,12 +169,46 @@ git_hooks_dir_for() {
 }
 
 # resolve_python -- prints an absolute python path on stdout and returns 0,
-# or returns 1 with nothing printed. Order: $MEMCONTINUUM_PYTHON env, then
-# <this checkout>/.venv/bin/python. Never consults --python (the caller
-# checks that first, since it's an explicit override, not a fallback).
+# or returns 1 with nothing printed. Order (README.md "Requirements",
+# hooks/memlib.sh): $MEMCONTINUUM_PYTHON env, then the MEMCONTINUUM_PYTHON
+# recorded in $MEMCONTINUUM_HOME/config.sh (following one pointer config.sh
+# to a custom HOME, exactly like memlib.sh), then <this checkout>/
+# .venv/bin/python. Never consults --python (the caller checks that first,
+# since it's an explicit override, not a fallback).
+#
+# The config.sh step was MISSING here until 2026-09-01 even though the
+# README documented it and memcontinuum-setup.sh writes config.sh precisely
+# so no invocation needs MEMCONTINUUM_PYTHON by hand -- a machine set up by
+# memcontinuum-setup.sh with a venv elsewhere (no <engine>/.venv) died with
+# "no python found" on every repo-init run. Sourced in a subshell so a
+# config.sh's other assignments (MEMCONTINUUM_HOME, MEMCONTINUUM_ENGINE)
+# never leak into this script's environment.
 resolve_python() {
     if [ -n "${MEMCONTINUUM_PYTHON:-}" ]; then
         printf '%s' "$MEMCONTINUUM_PYTHON"
+        return 0
+    fi
+    local cfg_python
+    cfg_python="$(
+        home="${MEMCONTINUUM_HOME:-$HOME/.memcontinuum}"
+        cfg1="$home/config.sh"
+        # stdout silenced too, not just stderr (Codex, 2026-09-01): the
+        # command substitution captures ALL stdout, so a config.sh that
+        # prints anything would corrupt cfg_python into "chatter/path" and
+        # block a valid engine-venv fallback.
+        if [ -f "$cfg1" ]; then
+            # shellcheck source=/dev/null
+            . "$cfg1" >/dev/null 2>&1 || true
+        fi
+        home="${MEMCONTINUUM_HOME:-$HOME/.memcontinuum}"
+        if [ "$home/config.sh" != "$cfg1" ] && [ -f "$home/config.sh" ]; then
+            # shellcheck source=/dev/null
+            . "$home/config.sh" >/dev/null 2>&1 || true
+        fi
+        printf '%s' "${MEMCONTINUUM_PYTHON:-}"
+    )"
+    if [ -n "$cfg_python" ]; then
+        printf '%s' "$cfg_python"
         return 0
     fi
     if [ -x "$ENGINE_ROOT/.venv/bin/python" ]; then
@@ -316,7 +352,7 @@ if [ -z "$PYTHON_BIN" ]; then
     if RESOLVED_PYTHON="$(resolve_python)"; then
         PYTHON_BIN="$RESOLVED_PYTHON"
     else
-        fail "no python found: set \$MEMCONTINUUM_PYTHON, pass --python PATH, or run '$0 --bootstrap-venv [DIR]' to create one (see README.md's Requirements section)" 3
+        fail "no python found (checked \$MEMCONTINUUM_PYTHON, \$MEMCONTINUUM_HOME/config.sh, $ENGINE_ROOT/.venv/bin/python): set \$MEMCONTINUUM_PYTHON, pass --python PATH, run memcontinuum-setup.sh, or run '$0 --bootstrap-venv [DIR]' to create a venv (see README.md's Requirements section)" 3
     fi
 fi
 
