@@ -19,6 +19,7 @@ running this file; see README.md "Requirements" / "Running the tests".
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -40,6 +41,7 @@ import memidx  # noqa: E402
 import memlint  # noqa: E402
 
 FIXTURES = TOOLS_DIR / "fixtures" / "code"
+PY_FIXTURES = TOOLS_DIR / "tests" / "fixtures" / "python_corpus"
 
 # The real-corpus gold-probe test below runs against a PRIVATE code tree. Its
 # corpus path, its probe queries and the qualified names it expects all
@@ -552,6 +554,190 @@ class TestChunkerVersionSkipDecision(unittest.TestCase):
             summary2 = self._reindex_summary(root, db)
             self.assertEqual(summary2["changed"], 0)
             self.assertEqual(summary2["unchanged"], 1)
+
+
+class TestRegistryDispatchMixedCorpus(unittest.TestCase):
+    """Task 5: code-reindex dispatches per-file through
+    chunkers.get_chunker(lang).chunk_file instead of hardcoding the Swift
+    walker -- a --lang swift,python run over a corpus containing both must
+    index both, each chunk row carrying its own backend's `lang`."""
+
+    def test_mixed_swift_and_python_corpus_indexes_both_langs(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            shutil.copy(FIXTURES / "NestedTypes.swift", root / "NestedTypes.swift")
+            shutil.copy(PY_FIXTURES / "basic_functions.py", root / "basic_functions.py")
+            db = Path(td) / "idx-code.sqlite"
+
+            rc = code_reindex(root, db, no_embed=True, lang="swift,python")
+            self.assertEqual(rc, 0)
+
+            conn = memidx.open_code_db(db)
+            rows = conn.execute("SELECT lang, qualified_name FROM chunks").fetchall()
+            conn.close()
+
+            by_lang: dict = {}
+            for r in rows:
+                by_lang.setdefault(r["lang"], set()).add(r["qualified_name"])
+            self.assertEqual(set(by_lang.keys()), {"swift", "python"})
+            self.assertGreater(len(by_lang["swift"]), 0)
+            self.assertIn("plain_function", by_lang["python"])
+
+
+class TestUnsupportedExtensionCensus(unittest.TestCase):
+    """Task 5 spec S4: a file whose extension is not in the wired lang set
+    must not be silently dropped -- code-reindex prints exactly one summary
+    line, sorted by count desc, and never crashes on it (INC-0103/0104: no
+    growing blind spot may be silent)."""
+
+    def test_rust_file_produces_census_line_and_does_not_crash(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            shutil.copy(FIXTURES / "NestedTypes.swift", root / "NestedTypes.swift")
+            (root / "lib.rs").write_text("fn main() {}\n")
+            db = Path(td) / "idx-code.sqlite"
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = code_reindex(root, db, no_embed=True)
+            self.assertEqual(rc, 0)
+            out = buf.getvalue()
+            self.assertIn(
+                "code-reindex: 1 files with unsupported/unwired extensions not indexed: .rs=1",
+                out,
+                out,
+            )
+
+    def test_no_census_line_when_nothing_is_skipped(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            shutil.copy(FIXTURES / "NestedTypes.swift", root / "NestedTypes.swift")
+            db = Path(td) / "idx-code.sqlite"
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = code_reindex(root, db, no_embed=True)
+            self.assertEqual(rc, 0)
+            self.assertNotIn("unsupported/unwired", buf.getvalue())
+
+
+class TestChunkerFailOpenPerFile(unittest.TestCase):
+    """Task 5 spec S4: ANY exception escaping a chunker backend, or a
+    ChunkResult with status "failed", must not crash the reindex -- warn
+    (naming the file), write NO file_sha row for it (so its sha never
+    matches on the next run and repair retriggers), and keep going."""
+
+    def test_raising_chunker_is_skipped_not_crashed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            shutil.copy(FIXTURES / "NestedTypes.swift", root / "NestedTypes.swift")
+            db = Path(td) / "idx-code.sqlite"
+
+            original = chunkers.swift.chunk_file
+
+            def boom(text, rel):
+                raise RuntimeError("simulated backend crash")
+
+            chunkers.swift.chunk_file = boom
+            try:
+                out_buf, err_buf = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+                    rc = code_reindex(root, db, no_embed=True)
+            finally:
+                chunkers.swift.chunk_file = original
+
+            self.assertEqual(rc, 0)
+            self.assertIn("NestedTypes.swift", err_buf.getvalue())
+
+            conn = memidx.open_code_db(db)
+            row = conn.execute(
+                "SELECT * FROM file_sha WHERE path=?", ("NestedTypes.swift",)
+            ).fetchone()
+            chunk_count = conn.execute(
+                "SELECT COUNT(*) AS c FROM chunks WHERE path=?", ("NestedTypes.swift",)
+            ).fetchone()["c"]
+            conn.close()
+            self.assertIsNone(row)
+            self.assertEqual(chunk_count, 0)
+
+    def test_failed_status_result_is_skipped_not_crashed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            shutil.copy(PY_FIXTURES / "broken.py", root / "broken.py")
+            db = Path(td) / "idx-code.sqlite"
+
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf):
+                rc = code_reindex(root, db, no_embed=True, lang="python")
+            self.assertEqual(rc, 0)
+            self.assertIn("broken.py", err_buf.getvalue())
+
+            conn = memidx.open_code_db(db)
+            row = conn.execute(
+                "SELECT * FROM file_sha WHERE path=?", ("broken.py",)
+            ).fetchone()
+            conn.close()
+            self.assertIsNone(row)
+
+
+class TestPreRewireStampSkewForcesRechunk(unittest.TestCase):
+    """Task 3 carry-forward (ruling 2): a .py file whose file_sha row was
+    stamped BEFORE this dispatch rewire (chunker_version = swift's, or the
+    literal "unversioned" a stray/unwired extension used to get) must
+    re-chunk on the very next reindex -- its stored chunker_version can
+    never match python's real one, so the dispatch rewire itself cannot
+    silently go on serving chunks some other backend produced."""
+
+    def _assert_forces_one_rechunk(self, cv_before):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            target = root / "basic_functions.py"
+            shutil.copy(PY_FIXTURES / "basic_functions.py", target)
+            db = Path(td) / "idx-code.sqlite"
+
+            conn = memidx.open_code_db(db)
+            data = target.read_bytes()
+            sha = hashlib.sha256(data).hexdigest()
+            stat = target.stat()
+            conn.execute(
+                "INSERT INTO file_sha (path, project, sha256, mtime, size, gap_count, chunker_version) "
+                "VALUES (?,?,?,?,?,?,?)",
+                ("basic_functions.py", memidx.DEFAULT_PROJECT, sha, stat.st_mtime, stat.st_size, 0, cv_before),
+            )
+            conn.commit()
+            conn.close()
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = code_reindex(root, db, no_embed=True, lang="python")
+            self.assertEqual(rc, 0, buf.getvalue())
+            m = re.search(r"(\d+) added, (\d+) changed, (\d+) unchanged", buf.getvalue())
+            self.assertIsNotNone(m, buf.getvalue())
+            self.assertEqual(int(m.group(3)), 0, "a stamp-skewed row must NOT be reported unchanged")
+            self.assertEqual(int(m.group(2)), 1, "a stamp-skewed row must force exactly one re-chunk")
+
+            conn = memidx.open_code_db(db)
+            row = conn.execute(
+                "SELECT chunker_version FROM file_sha WHERE path=?", ("basic_functions.py",)
+            ).fetchone()
+            chunk_count = conn.execute(
+                "SELECT COUNT(*) AS c FROM chunks WHERE path=?", ("basic_functions.py",)
+            ).fetchone()["c"]
+            conn.close()
+            self.assertEqual(row["chunker_version"], chunkers.chunker_version("python"))
+            self.assertGreater(chunk_count, 0)
+
+    def test_swift_stamped_row_rechunks_as_python(self):
+        self._assert_forces_one_rechunk(chunkers.chunker_version("swift"))
+
+    def test_unversioned_stamped_row_rechunks_as_python(self):
+        self._assert_forces_one_rechunk("unversioned")
 
 
 class TestIsolationFromMarkdownIndex(unittest.TestCase):

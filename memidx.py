@@ -28,9 +28,12 @@ import sqlite3
 import subprocess
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 import yaml
+
+import chunkers
 
 AUTHORITIES = {
     "owner-verbatim",
@@ -1670,7 +1673,12 @@ def cmd_check(args) -> int:
 # `RuleEngine.f`.
 # ---------------------------------------------------------------------------
 
-LANG_EXTENSIONS = {"swift": (".swift",)}
+# Task 5 rewire: a thin view over chunkers.LANGUAGE_TABLE, not a second
+# hand-maintained extension map (Task 3 reviewer finding -- the registry is
+# now the single source of truth). Kept only for back-compat with anything
+# still reading LANG_EXTENSIONS directly; dispatch itself goes through
+# chunkers.lang_for_path (see _lang_for_ext / iter_code_source_files below).
+LANG_EXTENSIONS = {lang: row["extensions"] for lang, row in chunkers.LANGUAGE_TABLE.items()}
 CODE_SKIP_DIR_NAMES = {".git", ".build", "vendor", "node_modules", "Tests", "Resources"}
 
 CODE_SCHEMA_SQL = """
@@ -1772,32 +1780,60 @@ def open_code_db(db_path: Path) -> sqlite3.Connection:
 
 
 def _lang_for_ext(suffix: str) -> str:
-    for lang, exts in LANG_EXTENSIONS.items():
-        if suffix in exts:
-            return lang
-    return suffix.lstrip(".") or "unknown"
+    """Task 5 rewire: delegates to chunkers.lang_for_path -- the registry,
+    not a locally duplicated extension map, is the single source of truth
+    now (Task 3 reviewer finding). Keep the function name: external
+    references (tests) use it. Suffix-only means lang_for_path's
+    compound-extension guard (COMPOUND_EXCLUDES) is inert here, which is
+    harmless: by the time code-reindex's per-file loop calls this,
+    iter_code_source_files has already applied that same guard against the
+    FULL path -- only files it already accepted reach this call. Falls
+    back to the bare suffix name (matching pre-rewire behavior) when no
+    LANGUAGE_TABLE row matches, so chunker_version's "unversioned" fail-open
+    guard still has a readable, non-None label to work with."""
+    lang = chunkers.lang_for_path("x" + suffix)
+    return lang if lang is not None else (suffix.lstrip(".") or "unknown")
 
 
-def iter_code_source_files(root: Path, langs: list[str] | None):
-    exts = set()
-    for lang in (langs or ["swift"]):
-        exts.update(LANG_EXTENSIONS.get(lang, ()))
+def iter_code_source_files(root: Path, langs: list[str] | None, skipped: Counter | None = None):
+    """Walk `root`, yielding source files whose chunkers.lang_for_path is in
+    the wired set (`langs`, defaulting to swift-only -- unchanged pre-Task-7
+    default). Dispatch is registry-driven (compound-extension-aware) rather
+    than the old locally duplicated extension map.
+
+    `skipped`, when passed a Counter, is mutated in place: every walked file
+    that is NOT yielded -- lang_for_path is None (truly unsupported) or
+    resolves to a lang outside the wired set (engine-supported but not
+    selected for this project) -- has its extension tallied there. That
+    Counter is the data source for code-reindex's end-of-run provenance
+    line (spec S4, INC-0103/0104: no growing blind spot may be silent).
+    Mutated-in-place rather than a second yield channel so existing callers
+    (_code_index_is_stale) that iterate this generator for plain paths need
+    no change."""
+    wired = set(langs or ["swift"])
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in CODE_SKIP_DIR_NAMES]
         for fname in sorted(filenames):
-            if any(fname.endswith(e) for e in exts):
-                yield Path(dirpath) / fname
+            path = Path(dirpath) / fname
+            lang = chunkers.lang_for_path(path)
+            if lang is not None and lang in wired:
+                yield path
+                continue
+            if skipped is not None:
+                _, ext = os.path.splitext(fname)
+                if ext:
+                    skipped[ext] += 1
 
 
 # ---------------------------------------------------------------------------
 # chunker: lexer-aware brace walker -- moved to chunkers/swift.py (Task 2,
-# Anatomy M1 milestone). Re-exported here for back-compat: memidx.py's own
-# code-reindex path below and declared_symbol_names (which still needs
-# _extract_decls) call these by their memidx.<name> names, and existing
-# tests import chunk_source via memidx.chunk_source.
+# Anatomy M1 milestone). Re-exported here for back-compat: declared_symbol_names
+# (which still needs _extract_decls) calls these by their memidx.<name> names,
+# and existing tests import chunk_source via memidx.chunk_source. (`chunkers`
+# itself is imported at module top now -- Task 5 needs it earlier, for
+# LANG_EXTENSIONS below.)
 # ---------------------------------------------------------------------------
 
-import chunkers
 from chunkers.swift import (
     chunk_source,
     _build_mask_and_match_dict,
@@ -1910,7 +1946,8 @@ def cmd_code_reindex(args) -> int:
         )
     }
 
-    files = list(iter_code_source_files(root, langs))
+    skipped_unknown: Counter = Counter()
+    files = list(iter_code_source_files(root, langs, skipped_unknown))
     seen = set()
     added_files = changed_files = unchanged_files = 0
     total_gaps = 0
@@ -1955,14 +1992,44 @@ def cmd_code_reindex(args) -> int:
         is_new = rel not in existing
 
         text = data.decode("utf-8", errors="replace")
-        chunks, gaps = chunk_source(text)
-        total_gaps += len(gaps)
-        for g in gaps:
+        # Task 5 rewire: dispatch through the chunker registry instead of
+        # calling the Swift walker (chunk_source) directly -- get_chunker(lang)
+        # resolves the right backend, chunk_file(text, rel) is the uniform
+        # per-backend contract (ChunkResult: chunks/gaps/status). Per-file
+        # fail-open (spec S4): ANY exception escaping the chunker, or a
+        # ChunkResult with status "failed", must not crash the reindex --
+        # warn, write NO file_sha row (so the file's sha never matches on the
+        # next run and repair retriggers), and move on to the next file. A
+        # "partial" status still indexes its chunks and writes file_sha with
+        # gap_count = len(gaps) -- the existing gap behavior, unchanged.
+        try:
+            result = chunkers.get_chunker(lang).chunk_file(text, rel)
+        except Exception as exc:
             print(
-                f"code-reindex: WARNING gap in {rel} lines {g[0]}-{g[1]} "
-                f"(brace desync, skipped)",
+                f"code-reindex: WARNING chunker raised on {rel}: "
+                f"{type(exc).__name__}: {exc} -- not indexed (repair will retry)",
                 file=sys.stderr,
             )
+            continue
+
+        for g in result.gaps:
+            total_gaps += 1
+            print(
+                f"code-reindex: WARNING gap in {rel} lines {g[0]}-{g[1]} "
+                f"({g[2]}, skipped)",
+                file=sys.stderr,
+            )
+
+        if result.status == "failed":
+            print(
+                f"code-reindex: WARNING {rel}: chunker reported status=failed -- "
+                "not indexed (repair will retry)",
+                file=sys.stderr,
+            )
+            continue
+
+        chunks = result.chunks
+        gaps = result.gaps
 
         delete_code_chunks_for_path(conn, args.project, rel)
         text_lines = text.splitlines()
@@ -1973,7 +2040,7 @@ def cmd_code_reindex(args) -> int:
                        signature, doc, start_line, end_line)
                    VALUES (?,?,?,?,?,?,?,?,?,?)""",
                 (
-                    rel, args.project, lang, chunk["kind"], chunk["symbol"],
+                    rel, args.project, chunk["lang"], chunk["kind"], chunk["symbol"],
                     chunk["qualified_name"], chunk["signature"], chunk["doc"],
                     chunk["start_line"], chunk["end_line"],
                 ),
@@ -2031,6 +2098,20 @@ def cmd_code_reindex(args) -> int:
         f"{unchanged_files} unchanged, {len(removed)} removed, {reembeds} chunk(s) (re-)embedded, "
         f"{total_gaps} gap(s) warned, {elapsed:.3f}s"
     )
+    if skipped_unknown:
+        # Task 5 census (spec S4, INC-0103/0104 lesson): a walked file whose
+        # extension isn't in the wired lang set is NOT indexed -- say so,
+        # every run, so the gap never grows silently. One line, extensions
+        # sorted by count desc (ties broken alphabetically for determinism).
+        total_skipped = sum(skipped_unknown.values())
+        breakdown = " ".join(
+            f"{ext}={count}"
+            for ext, count in sorted(skipped_unknown.items(), key=lambda kv: (-kv[1], kv[0]))
+        )
+        print(
+            f"code-reindex: {total_skipped} files with unsupported/unwired extensions "
+            f"not indexed: {breakdown}"
+        )
     return 0
 
 
