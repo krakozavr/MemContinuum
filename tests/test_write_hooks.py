@@ -3310,6 +3310,78 @@ class TestNewFileNudgeHook(unittest.TestCase):
         ctx = data["hookSpecificOutput"]["additionalContext"]
         self.assertIn("New source file under", ctx)
 
+    # -- Task 9: env-driven extension gate -----------------------------
+
+    def test_wired_env_lets_a_new_py_file_through(self):
+        """MEMCONTINUUM_LANG_EXTS="*.swift *.py" -- a new .py file must
+        pass the gate exactly like .swift does today (fires, nudged)."""
+        target = self.code_root / "new_thing.py"
+        env = self.base_env(MEMCONTINUUM_LANG_EXTS="*.swift *.py")
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = json.loads(proc.stdout)
+        ctx = data["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("New source file under", ctx)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=nudged", log_text)
+
+    def test_known_but_not_wired_extension_logs_language_available_not_wired(self):
+        """Only *.swift is wired; KNOWN includes *.py -- a new .py file
+        must stay silent on stdout (never nudged for an unwired language)
+        but log outcome=language-available-not-wired, not the plain
+        not-indexed-extension."""
+        target = self.code_root / "new_thing.py"
+        env = self.base_env(
+            MEMCONTINUUM_LANG_EXTS="*.swift",
+            MEMCONTINUUM_KNOWN_EXTS="*.swift *.py",
+        )
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "", proc.stdout)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=language-available-not-wired", log_text)
+        self.assertNotIn("outcome=not-indexed-extension", log_text)
+
+    def test_unknown_extension_logs_not_indexed_extension(self):
+        """A .rs file matches neither WIRED nor KNOWN -- plain
+        not-indexed-extension, same as any other non-indexed extension."""
+        target = self.code_root / "new_thing.rs"
+        env = self.base_env(
+            MEMCONTINUUM_LANG_EXTS="*.swift",
+            MEMCONTINUUM_KNOWN_EXTS="*.swift *.py",
+        )
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "", proc.stdout)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=not-indexed-extension", log_text)
+
+    def test_unset_lang_exts_env_is_byte_identical_legacy_swift_only(self):
+        """No MEMCONTINUUM_LANG_EXTS/MEMCONTINUUM_KNOWN_EXTS at all (the
+        un-re-rendered legacy wiring) must reproduce the original
+        hardcoded `*.swift`-only gate byte-identically: .swift still
+        fires, and an unwired extension with no KNOWN list falls straight
+        to not-indexed-extension (no language-available-not-wired, since
+        KNOWN falls back to WIRED when unset)."""
+        env = self.base_env()
+        self.assertNotIn("MEMCONTINUUM_LANG_EXTS", env)
+        self.assertNotIn("MEMCONTINUUM_KNOWN_EXTS", env)
+
+        swift_target = self.code_root / "Legacy.swift"
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(swift_target)), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = json.loads(proc.stdout)
+        ctx = data["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("New source file under", ctx)
+
+        py_target = self.code_root / "legacy_thing.py"
+        proc2, _elapsed2 = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(py_target)), env)
+        self.assertEqual(proc2.returncode, 0, proc2.stderr)
+        self.assertEqual(proc2.stdout.strip(), "", proc2.stdout)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=not-indexed-extension", log_text)
+        self.assertNotIn("outcome=language-available-not-wired", log_text)
+
 
 if __name__ == "__main__":
     unittest.main()

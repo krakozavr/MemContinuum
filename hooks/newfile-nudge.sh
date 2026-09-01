@@ -44,6 +44,18 @@
 #                            for the shared watchdog launcher and (when jq
 #                            isn't on PATH) JSON handling -- never to run
 #                            memidx.py.
+#   MEMCONTINUUM_LANG_EXTS   space-separated glob list of engine-wired
+#                            source extensions (e.g. "*.swift *.py"),
+#                            rendered at hook-line render time (Task 10).
+#                            Empty/unset -> legacy `*.swift`-only fallback,
+#                            for wiring not yet re-rendered.
+#   MEMCONTINUUM_KNOWN_EXTS  space-separated glob list of ALL engine-
+#                            supported extensions, wired or not. A file
+#                            matching KNOWN but not WIRED logs
+#                            outcome=language-available-not-wired instead
+#                            of the plain not-indexed-extension. Unset ->
+#                            falls back to MEMCONTINUUM_LANG_EXTS (no
+#                            language-available-not-wired distinction).
 
 set -u
 
@@ -125,14 +137,36 @@ if [ -e "$FILE_PATH" ] || [ -L "$FILE_PATH" ]; then
     finish "existing-or-symlink"
 fi
 
-# Same "indexed source extension" notion as memidx.py's LANG_EXTENSIONS --
-# hardcoded here (this hook never imports/runs memidx.py) since today
-# there is exactly one language; extend this list in lockstep with
-# LANG_EXTENSIONS if that ever grows.
-case "$FILE_PATH" in
-    *.swift) ;;
-    *) finish "not-indexed-extension" ;;
-esac
+# Extension gate is render-time env, not a hardcoded list: Task 10 renders
+# MEMCONTINUUM_LANG_EXTS (space-separated glob list of engine-wired
+# extensions, e.g. "*.swift *.py") and MEMCONTINUUM_KNOWN_EXTS (all
+# engine-supported globs, wired or not) into this hook's environment.
+# Empty/unset MEMCONTINUUM_LANG_EXTS means legacy un-re-rendered wiring --
+# fall back to the original hardcoded `*.swift` so behavior stays
+# byte-identical until Task 10 re-renders this hook line.
+#
+# _ext_matches loops over $2 deliberately UNQUOTED to split the
+# space-separated glob list on IFS (bash-3.2 has no arrays-of-globs
+# alternative) -- `set -f` (noglob) brackets the loop so that unquoted
+# expansion never lets the shell glob-expand a pattern like *.swift
+# against files in cwd; `case "$1" in $_pat)` itself is safe unquoted
+# too (case patterns match, they never expand against the filesystem).
+_ext_matches() {  # $1=path  $2=space-separated glob list
+    set -f
+    for _pat in $2; do
+        case "$1" in $_pat) set +f; return 0 ;; esac
+    done
+    set +f
+    return 1
+}
+WIRED_EXTS="${MEMCONTINUUM_LANG_EXTS:-*.swift}"
+KNOWN_EXTS="${MEMCONTINUUM_KNOWN_EXTS:-$WIRED_EXTS}"
+if ! _ext_matches "$FILE_PATH" "$WIRED_EXTS"; then
+    if _ext_matches "$FILE_PATH" "$KNOWN_EXTS"; then
+        finish "language-available-not-wired"   # logged outcome; future: user-visible nudge text
+    fi
+    finish "not-indexed-extension"
+fi
 
 CODE_ROOT="${MEMCONTINUUM_CODE_ROOT:-}"
 if [ -z "$CODE_ROOT" ]; then
