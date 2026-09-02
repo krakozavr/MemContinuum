@@ -556,12 +556,13 @@ class TestDecisionRegistry(BootstrapCase):
 
         line = self.stats_line_of(repo)
         self.assertIsNotNone(line)
-        # python/engine/store paths are single-quoted (F: copy-pasteable
-        # even when a path has a space) -- match on the substring, not a
-        # bare unquoted equality.
+        # python/engine/store/project are all single-quoted (round-2
+        # review finding: copy-pasteable even when a path has a space, or
+        # the project value is the literal "(unknown)") -- match on the
+        # substring, not a bare unquoted equality.
         self.assertIn(VENV_PYTHON, line)
         self.assertIn("memidx.py' stats", line)
-        self.assertIn("--project proj-a", line)
+        self.assertIn("--project 'proj-a'", line)
         self.assertIn("--days 7", line)
         self.assertIn("--store '/store/proj-a'", line)
 
@@ -577,6 +578,36 @@ class TestDecisionRegistry(BootstrapCase):
         self.assertIn("memidx.py' stats", line)
         self.assertIn("--project", line)
         self.assertNotIn("--store", line)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_stats_hint_prefers_registry_project_when_wiring_is_unusable(self):
+        """Round-2 Codex gate item 13 (finding, MAJOR): a DECIDED but
+        currently-UNWIRED repo (hooks missing/broken after the decision
+        was recorded -- the state where a liveness check matters most) is
+        exactly the case live wiring resolution cannot help with. The
+        registry's own recorded project (from `decide.sh wired --project
+        NAME`) must win the hint over a basename fallback."""
+        self.assertEqual(self.bootstrap().returncode, 0)
+        repo = git_repo(str(Path(self.tmp) / "repo"))
+        self._wire(repo)  # full wiring, required for `decide wired` to accept
+        proc = run(
+            DECIDE_SH, ["wired", "--repo", repo, "--store", "/store/registered", "--project", "registered-proj"],
+            self.home, self.mc_home,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+        # Now break the wiring -- decision=wired persists (the recorded
+        # answer is authoritative), but live wiring can no longer resolve
+        # ANY project on its own.
+        (Path(repo) / ".claude" / "settings.local.json").unlink()
+
+        fields = self.fields_of(repo)
+        self.assertEqual(fields.get("decision"), "wired")
+        self.assertEqual(fields.get("wiring"), "none")
+        self.assertNotIn("project", fields, "live wiring must have nothing to report here")
+
+        line = self.stats_line_of(repo)
+        self.assertIn("--project 'registered-proj'", line)
 
     @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
     def test_decision_and_wiring_are_reported_as_separate_facts(self):

@@ -1,7 +1,8 @@
 """Tests for `memidx.py stats` -- the liveness metric (backlog SS2,
 INC-0103/INC-0105): reads hook.log and reports, per project, whether the
-read side (pre-edit lookups) and the write side (nudges -> real store
-commits) are alive within a trailing window.
+read side (real pre-edit lookups) and the write side (nudges vs. this
+project's own store-kind ledger appends) are alive within a trailing
+window.
 
 Exercised in-process via memidx.cmd_stats (argparse.Namespace, like
 TestUnmappedCommand in tests/test_write_hooks.py) -- no subprocess needed,
@@ -66,15 +67,26 @@ class StatsTestBase(unittest.TestCase):
 
     def git_store(self, name="store", commit_dates=()):
         """A real git repo with one commit per date in `commit_dates`
-        (datetime, backdated via GIT_AUTHOR_DATE/GIT_COMMITTER_DATE so `git
-        log --since` sees a real historical date, not "now")."""
+        (datetime, backdated/forward-dated via GIT_AUTHOR_DATE/
+        GIT_COMMITTER_DATE so `git log --since/--until` sees a real
+        historical or future date, not "now")."""
         store = Path(self.td) / name
         store.mkdir()
         subprocess.run(["git", "init", "-q"], cwd=store, check=True)
         subprocess.run(["git", "config", "user.email", "t@t.local"], cwd=store, check=True)
         subprocess.run(["git", "config", "user.name", "t"], cwd=store, check=True)
         for i, d in enumerate(commit_dates):
-            iso = d.strftime("%Y-%m-%dT%H:%M:%S")
+            # Explicit UTC offset (isoformat(), not a naive strftime with
+            # no zone) -- git interprets a zone-less GIT_AUTHOR_DATE as
+            # LOCAL system time, not UTC. On a host whose local zone isn't
+            # UTC (e.g. America/New_York, -04:00) a naive "wall clock"
+            # string silently shifted every backdated/forward-dated commit
+            # by the local offset -- invisible in round 1's wide (30-day)
+            # windows, but a real bug once round 2 added a tight
+            # `--until=now` bound (round-2 fix-round self-catch, surfaced
+            # by test_healthy_case_no_flags going from a passing to a
+            # failing store_commits assertion after that bound landed).
+            iso = d.isoformat()
             env = dict(os.environ)
             env["GIT_AUTHOR_DATE"] = iso
             env["GIT_COMMITTER_DATE"] = iso
@@ -145,21 +157,26 @@ class TestStatsHealthyCase(StatsTestBase):
         self.assertEqual(out["flags"], [])
         self.assertEqual(out["sessions_seen"], 1)
         self.assertEqual(out["user_prompts"], 2)
+        self.assertEqual(out["non_user_prompt_lines"], 0)
         self.assertEqual(out["nudges"]["coverage_injected"], 1)
         self.assertEqual(out["nudges"]["lookback_injected"], 1)
         self.assertEqual(out["nudges"]["total"], 2)
         self.assertEqual(out["pre_edit"]["matched"], 1)
+        self.assertEqual(out["pre_edit"]["lookups"], 1)
         self.assertEqual(out["ledger_appends"]["code"], 1)
         self.assertEqual(out["ledger_appends"]["store"], 1)
         self.assertEqual(out["store_commits"], 1)
 
     def test_pre_edit_no_match_and_other_classified_separately(self):
-        """The named fields (matched/no_match/other/total) are VIEWS over
-        the dynamic per-outcome `outcomes` dict (fix round 1) -- assert
-        both: the named subset the rest of this file relies on, and that
-        the two distinct "other" outcomes (index-missing, no-file-path)
-        are still individually visible in `outcomes`, not folded into one
-        opaque "other" count with the literal strings lost."""
+        """The named fields (matched/no_match/other/total/lookups) are
+        VIEWS over the dynamic per-outcome `outcomes` dict (fix round 1) --
+        assert both: the named subset the rest of this file relies on, and
+        that the two distinct "other" outcomes (index-missing,
+        no-file-path) are still individually visible in `outcomes`, not
+        folded into one opaque "other" count with the literal strings
+        lost. `lookups` (round 2, Codex item 7) counts only matched+
+        no-match -- the two "other" outcomes contribute to `other`/`total`
+        but NOT to `lookups`."""
         lines = [
             f"{ts(1)} outcome=matched elapsed=0s project=demo file=/a.py",
             f"{ts(1)} outcome=no-match elapsed=0s project=demo file=/b.py",
@@ -171,7 +188,7 @@ class TestStatsHealthyCase(StatsTestBase):
         pe = out["pre_edit"]
         self.assertEqual(
             {k: v for k, v in pe.items() if k != "outcomes"},
-            {"matched": 1, "no_match": 1, "other": 2, "total": 4},
+            {"matched": 1, "no_match": 1, "other": 2, "total": 4, "lookups": 2},
         )
         self.assertEqual(
             pe["outcomes"],
@@ -195,6 +212,7 @@ class TestStatsHealthyCase(StatsTestBase):
         self.write_log(lines)
         rc, out = run_stats_json(home=str(self.home))
         self.assertEqual(out["pre_edit"]["total"], 0)
+        self.assertEqual(out["pre_edit"]["lookups"], 0)
         self.assertEqual(out["user_prompts"], 10)
         self.assertIn("FLAG: read side silent (INC-0103 class)", out["flags"])
 
@@ -236,75 +254,184 @@ class TestStatsHealthyCase(StatsTestBase):
         self.assertEqual(rc, 0)
         self.assertEqual(out["nudges"]["coverage_injected"], 1)
 
-    def test_unparseable_lines_counted_as_self_liveness_signal(self):
-        """A reviewer finding: lines whose leading token isn't an
-        ISO-with-offset timestamp are silently SKIPPED from every other
-        count by design (payload_keys=..., watchdog-killed, tracebacks) --
-        but that same silence would also hide a genuinely broken host (e.g.
-        `date -Iseconds` unsupported, every real hook.log write falling
-        back to a bare `date` format) as an indistinguishable all-zero
-        report. unparseable_lines must count them (never silently) so an
-        operator can tell "nothing happened" apart from "this metric can't
-        read this log". The three non-ISO lines from the malformed-lines
-        fixture above are exactly this."""
+    def test_unparseable_vs_untimestamped_lines_counted_separately(self):
+        """Round 2 refinement (reviewer finding): `payload_keys=...` is a
+        KNOWN, by-design timestamp-less shape (userprompt-remind.sh's
+        payload-shape capture) -- it must NOT tick the `unparseable_lines`
+        self-liveness signal (that would make it fire on every single
+        healthy run, burying the one number that is supposed to mean
+        "something NEW is wrong"). It is counted separately as
+        `untimestamped_lines`. A naive/non-ISO timestamp-shaped line and a
+        genuinely garbled line both still count as `unparseable_lines`."""
         lines = [
             "payload_keys=session_id,agent_id project=demo",
+            "payload_keys=cwd,hook_event_name project=demo",
             f"{NOW.strftime('%Y-%m-%dT%H:%M:%S')} outcome=watchdog-killed hook=userprompt-remind.sh",
             "not a log line at all !!! {{{",
             f"{ts(1)} userprompt outcome=injected session=s1 project=demo",
         ]
         self.write_log(lines)
         rc, out = run_stats_json(home=str(self.home))
-        self.assertEqual(out["unparseable_lines"], 3)
+        self.assertEqual(out["untimestamped_lines"], 2)
+        self.assertEqual(out["unparseable_lines"], 2)
         rc, text = run_stats(home=str(self.home))
         self.assertIn("unparseable lines skipped", text)
-        self.assertIn("3", text.split("unparseable lines skipped")[1].splitlines()[0])
+        self.assertIn("untimestamped lines skipped", text)
 
     def test_no_unparseable_lines_omits_the_line_in_text_output(self):
         self.write_log([f"{ts(1)} userprompt outcome=injected session=s1 project=demo"])
         rc, text = run_stats(home=str(self.home))
         self.assertNotIn("unparseable lines skipped", text)
+        self.assertNotIn("untimestamped lines skipped", text)
         rc, out = run_stats_json(home=str(self.home))
         self.assertEqual(out["unparseable_lines"], 0)
+        self.assertEqual(out["untimestamped_lines"], 0)
 
-    def test_store_missing_repo_is_unmeasured_not_a_crash(self):
+    def test_bsd_date_fallback_format_parsed_as_local_naive(self):
+        """Round 2 review finding: macOS/BSD `date` (no `-Iseconds`
+        support -- this repo's documented bash-3.2 port target) prints
+        `Tue Sep  2 02:10:00 EDT 2026`, not an ISO offset. Without parsing
+        this shape, every real hook.log line on such a host would be
+        unparseable -- an INC-0103-class silence of the metric itself on
+        exactly the platform this repo was ported to support."""
+        local_ts = (NOW - timedelta(hours=1)).astimezone().strftime("%a %b %e %H:%M:%S %Z %Y")
+        lines = [f"{local_ts} userprompt outcome=injected session=s1 project=demo"]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home))
+        self.assertEqual(out["nudges"]["coverage_injected"], 1)
+        self.assertEqual(out["unparseable_lines"], 0)
+
+    def test_file_field_containing_project_equals_does_not_hijack_attribution_pre_edit_shape(self):
+        """Round 2 Codex gate finding: `file=` is genuinely the LAST field
+        on a pre-edit-chain.sh/newfile-nudge.sh line (their own
+        independent loggers, never through mc_log) -- `... project=P
+        file=F`, project= BEFORE file=. Its value is an arbitrary
+        filesystem path that can itself contain `project=`-shaped text.
+        Reproduced exactly: a path containing the literal substring
+        `project=other`, textually AFTER the real project= -- the OLD
+        generic last-match-wins scan would have let it win. The line's
+        REAL project= (parsed only from the prefix before the first
+        ` file=`) must win instead."""
+        lines = [
+            f"{ts(1)} outcome=matched elapsed=0s project=demo file=/tmp/a project=other/x.py",
+        ]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home), project="demo")
+        self.assertEqual(out["pre_edit"]["matched"], 1, "the real project=demo must win")
+        rc, other = run_stats_json(home=str(self.home), project="other")
+        self.assertEqual(other["pre_edit"]["matched"], 0, "the embedded file-path text must not become a project")
+
+    def test_file_field_containing_project_equals_does_not_hijack_attribution_ledger_shape(self):
+        """The mirror-image shape: ledger-post-edit.sh's line (via
+        mc_log) places `project=` AFTER `file=` -- mc_log's own
+        unconditional suffix. Cutting the scan at the first ` file=` (the
+        pre-edit-chain rule) would silently swallow that real trailing
+        project= as part of the file value instead -- this is the
+        regression the kind-aware fix exists to prevent (caught by
+        test_healthy_case_no_flags while fixing the OTHER shape). A file
+        value containing an embedded, EARLIER fake `project=other` token
+        must still lose to mc_log's real trailing one."""
+        lines = [
+            f"{ts(1)} ledger outcome=appended kind=code elapsed=0s session=s1 "
+            f"file=/tmp/a project=other/x.py project=demo",
+        ]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home), project="demo")
+        self.assertEqual(out["ledger_appends"]["code"], 1, "the real trailing project=demo must win")
+        rc, other = run_stats_json(home=str(self.home), project="other")
+        self.assertEqual(other["ledger_appends"]["code"], 0, "the embedded file-path text must not become a project")
+
+    def test_store_missing_repo_is_unmeasured_but_ledger_flag_still_evaluated(self):
+        """The write-side FLAG no longer needs --store at all (round 2,
+        ruling 1) -- it is driven entirely by this project's own
+        store-kind ledger appends. A missing/bad --store path leaves
+        store_commits unmeasured (None) but must NOT suppress the FLAG:
+        3 nudges and 0 ledger store appends here, with no ledger lines at
+        all, must still fire."""
         lines = [f"{ts(1)} userprompt outcome=injected session=s1 project=demo" for _ in range(3)]
         self.write_log(lines)
         rc, out = run_stats_json(home=str(self.home), store=str(Path(self.td) / "no-such-store"))
         self.assertEqual(rc, 0)
         self.assertIsNone(out["store_commits"])
-        self.assertEqual(out["flags"], [], "no --store measurement means no FLAG, never a guessed zero")
+        self.assertIn(
+            "FLAG: write side silent — 3 nudges, 0 store-kind ledger appends in 7d (INC-0105 class)",
+            out["flags"],
+        )
 
 
 class TestStatsFlags(StatsTestBase):
-    def test_write_side_silent_flag(self):
+    def test_write_side_silent_flag_driven_by_ledger_not_store_commits(self):
+        """Round 2, ruling 1 (Grok gate): the write-side FLAG is keyed on
+        `ledger_appends.store`, never on git `store_commits` -- even with
+        --store passed and a real (irrelevant, outside-window) store
+        history, an empty ledger for THIS project still fires."""
         lines = [f"{ts(1)} userprompt outcome=injected session=s1 project=demo" for _ in range(4)]
         self.write_log(lines)
         store = self.git_store(commit_dates=[NOW - timedelta(days=400)])  # outside window
         rc, out = run_stats_json(home=str(self.home), store=str(store))
         self.assertEqual(out["store_commits"], 0)
+        self.assertEqual(out["ledger_appends"]["store"], 0)
         self.assertEqual(out["nudges"]["total"], 4)
-        self.assertIn("FLAG: write side silent — 4 nudges, 0 store writes in 7d (INC-0105 class)", out["flags"])
+        self.assertIn(
+            "FLAG: write side silent — 4 nudges, 0 store-kind ledger appends in 7d (INC-0105 class)",
+            out["flags"],
+        )
 
-    def test_write_side_flag_needs_at_least_three_nudges(self):
-        lines = [f"{ts(1)} userprompt outcome=injected session=s1 project=demo" for _ in range(2)]
+    def test_inc_0105_exact_shape_unrelated_store_commit_never_vetoes(self):
+        """The literal INC-0105 shape (12 nudges, 0 store-kind ledger
+        appends that day) PLUS an unrelated store commit elsewhere in the
+        window (the real incident: a store relocation commit the day
+        before) -- ruling 1's whole point. The old git-gated formula would
+        have read `store_commits >= 1` and suppressed the FLAG; the
+        ledger-gated formula must fire regardless, with the commit still
+        reported as (irrelevant) corroboration."""
+        lines = [f"{ts(2)} userprompt outcome=injected session=s1 project=demo" for _ in range(12)]
         self.write_log(lines)
-        store = self.git_store(commit_dates=[NOW - timedelta(days=400)])
+        store = self.git_store(commit_dates=[NOW - timedelta(days=1)])  # unrelated, inside window
         rc, out = run_stats_json(home=str(self.home), store=str(store))
-        self.assertEqual(out["flags"], [])
+        self.assertEqual(out["store_commits"], 1, "the unrelated commit is still reported, as corroboration")
+        self.assertEqual(out["ledger_appends"]["store"], 0)
+        self.assertEqual(out["nudges"]["total"], 12)
+        self.assertIn(
+            "FLAG: write side silent — 12 nudges, 0 store-kind ledger appends in 7d (INC-0105 class)",
+            out["flags"],
+        )
 
-    def test_write_side_flag_absent_without_store(self):
-        lines = [f"{ts(1)} userprompt outcome=injected session=s1 project=demo" for _ in range(5)]
+    def test_future_dated_store_commit_excluded_by_until_bound(self):
+        """Round 2 Codex gate item 11: `--until=<now>` bounds the git
+        measurement on BOTH ends -- a future-dated commit (clock skew, a
+        rebase, deliberate backdating) must not count as "in the window"
+        with no upper bound."""
+        lines = [f"{ts(1)} userprompt outcome=injected session=s1 project=demo" for _ in range(3)]
+        self.write_log(lines)
+        store = self.git_store(commit_dates=[NOW + timedelta(days=2)])  # future
+        rc, out = run_stats_json(home=str(self.home), store=str(store))
+        self.assertEqual(out["store_commits"], 0, "a future-dated commit must not be counted")
+
+    def test_write_side_flag_boundary_three_fires(self):
+        lines = [f"{ts(1)} userprompt outcome=injected session=s1 project=demo" for _ in range(3)]
         self.write_log(lines)
         rc, out = run_stats_json(home=str(self.home))
-        self.assertIsNone(out["store_commits"])
-        self.assertEqual(out["flags"], [])
+        self.assertTrue(any("INC-0105" in f for f in out["flags"]))
+
+    def test_write_side_flag_boundary_two_does_not_fire(self):
+        lines = [f"{ts(1)} userprompt outcome=injected session=s1 project=demo" for _ in range(2)]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home))
+        self.assertFalse(any("INC-0105" in f for f in out["flags"]))
+
+    def test_write_side_flag_silent_when_ledger_store_appends_present(self):
+        lines = [f"{ts(1)} userprompt outcome=injected session=s1 project=demo" for _ in range(5)]
+        lines.append(f"{ts(1)} ledger outcome=appended kind=store session=s1 file=/y.md project=demo")
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home))
+        self.assertFalse(any("INC-0105" in f for f in out["flags"]))
 
     def test_read_side_silent_flag(self):
         lines = [f"{ts(1)} userprompt outcome=no-evidence session=s1 project=demo" for _ in range(10)]
         self.write_log(lines)
         rc, out = run_stats_json(home=str(self.home))
-        self.assertEqual(out["pre_edit"]["total"], 0)
+        self.assertEqual(out["pre_edit"]["lookups"], 0)
         self.assertIn("FLAG: read side silent (INC-0103 class)", out["flags"])
 
     def test_read_side_flag_needs_at_least_ten_prompts(self):
@@ -319,6 +446,56 @@ class TestStatsFlags(StatsTestBase):
         self.write_log(lines)
         rc, out = run_stats_json(home=str(self.home))
         self.assertEqual(out["flags"], [])
+
+    def test_read_side_flag_fires_when_only_failed_lookups_exist(self):
+        """Round 2 Codex gate item 7 (BLOCKING finding): ten prompts plus
+        five FAILED pre-edit attempts (index-missing -- the db was never
+        built) and zero real (matched/no-match) lookups must still FLAG.
+        The old formula used `pre_edit_total` (which includes `other`) and
+        would have read this as "read side has activity" -- the exact
+        false negative that would have hidden a dead read side behind a
+        pile of failed attempts."""
+        lines = [f"{ts(1)} userprompt outcome=injected session=s1 project=demo" for _ in range(10)]
+        lines += [f"{ts(1)} outcome=index-missing elapsed=0s project=demo db=/x.sqlite" for _ in range(5)]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home))
+        self.assertEqual(out["pre_edit"]["total"], 5)
+        self.assertEqual(out["pre_edit"]["lookups"], 0)
+        self.assertIn("FLAG: read side silent (INC-0103 class)", out["flags"])
+
+    def test_read_side_flag_absent_with_ten_duplicate_delivery_lines(self):
+        """Round 2 Codex gate item 8: ten `duplicate-delivery` lines are
+        ten hook INVOCATIONS but zero live user turns -- they must not
+        satisfy the ">=10 prompts" busy signal on their own. (No pre-edit
+        lookups exist either, so under the OLD user_prompts semantics
+        this would have wrongly FLAGged a project that never had ten real
+        prompts at all.)"""
+        lines = [f"{ts(1)} userprompt outcome=duplicate-delivery session=s1 project=demo" for _ in range(10)]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home))
+        self.assertEqual(out["user_prompts"], 0)
+        self.assertEqual(out["non_user_prompt_lines"], 10)
+        self.assertEqual(out["flags"], [])
+
+    def test_read_side_flag_absent_with_ten_agent_source_lines(self):
+        lines = [f"{ts(1)} userprompt outcome=agent-source session=s1 project=demo" for _ in range(10)]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home))
+        self.assertEqual(out["user_prompts"], 0)
+        self.assertEqual(out["flags"], [])
+
+    def test_non_user_prompt_lines_excluded_but_real_prompts_still_flag(self):
+        """A mix: 10 real (injected) prompts plus 5 duplicate-delivery --
+        user_prompts must count only the 10 real ones (duplicates are
+        NOT added on top), and with zero pre-edit lookups the read-side
+        FLAG must still fire on the real count alone."""
+        lines = [f"{ts(1)} userprompt outcome=injected session=s1 project=demo" for _ in range(10)]
+        lines += [f"{ts(1)} userprompt outcome=duplicate-delivery session=s1 project=demo" for _ in range(5)]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home))
+        self.assertEqual(out["user_prompts"], 10)
+        self.assertEqual(out["non_user_prompt_lines"], 5)
+        self.assertIn("FLAG: read side silent (INC-0103 class)", out["flags"])
 
     def test_both_flags_can_fire_together(self):
         lines = [f"{ts(1)} userprompt outcome=injected session=s1 project=demo" for _ in range(10)]
@@ -384,17 +561,68 @@ class TestStatsUnknownProject(StatsTestBase):
         self.assertEqual(out["nudges"]["coverage_injected"], 0)
         self.assertIn("shotporter", out["projects_seen"])
 
+    def test_unknown_project_never_flags_even_when_thresholds_met(self):
+        """Round 2, ruling 2 (Grok gate BLOCKING finding): >=10 userprompt
+        lines with no project= (a real, common shape -- every pre-fix
+        write-side hook invocation before this branch) plus >=3 nudges and
+        zero everything-else must NOT raise either FLAG on the
+        "(unknown)" bucket -- that bucket's attribution is incomplete by
+        construction (every un-projected logger, forever), so both
+        conditions would ALWAYS read as silent there, on every
+        deployment's cold-start window. That is not a real signal."""
+        lines = [f"{ts(1)} userprompt outcome=injected session=s1" for _ in range(12)]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home), project="(unknown)")
+        self.assertEqual(out["user_prompts"], 12)
+        self.assertEqual(out["pre_edit"]["lookups"], 0)
+        self.assertEqual(out["nudges"]["total"], 12)
+        self.assertEqual(out["ledger_appends"]["store"], 0)
+        self.assertEqual(out["flags"], [], "neither FLAG may ever fire for the (unknown) bucket")
+
+    def test_live_mix_named_project_honest_vs_unknown_bucket(self):
+        """Round 2, ruling 2's required test: the exact live-log shape
+        (pre-edit-chain.sh already stamped project= before this branch;
+        userprompt-remind.sh/ledger-post-edit.sh did not yet) -- pre-edit
+        lookups WITH project=X, userprompt lines WITHOUT any project= at
+        all. X must show its true, honest numbers (0 prompts -- none of
+        the userprompt traffic is attributable to it, this is not
+        silently invented) and must NOT flag (0 prompts < 10, trivially).
+        "(unknown)" must show the real prompt volume AND must not
+        INC-0103-FLAG despite 0 pre-edit lookups landing there."""
+        lines = [f"{ts(1)} outcome=matched elapsed=0s project=X file=/a.py"]
+        lines += [f"{ts(1)} userprompt outcome=no-evidence session=s{i}" for i in range(15)]
+        self.write_log(lines)
+
+        rc, x = run_stats_json(home=str(self.home), project="X")
+        self.assertEqual(x["user_prompts"], 0, "X's own prompt count is honestly zero, not borrowed from (unknown)")
+        self.assertEqual(x["pre_edit"]["lookups"], 1)
+        self.assertEqual(x["flags"], [])
+
+        rc, unknown = run_stats_json(home=str(self.home), project="(unknown)")
+        self.assertEqual(unknown["user_prompts"], 15)
+        self.assertEqual(unknown["pre_edit"]["lookups"], 0)
+        self.assertEqual(unknown["flags"], [], "the (unknown) bucket must never INC-0103-FLAG")
+
 
 class TestStatsTextOutput(StatsTestBase):
     def test_plain_text_contains_key_lines(self):
         lines = [f"{ts(1)} userprompt outcome=injected session=s1 project=demo" for _ in range(3)]
+        lines.append(f"{ts(1)} userprompt outcome=injected session=s2")  # legacy, no project=
         self.write_log(lines)
         rc, out = run_stats(home=str(self.home))
         self.assertEqual(rc, 0)
         self.assertIn("MemContinuum liveness stats", out)
         self.assertIn("project=demo", out)
-        self.assertIn("nudges → store writes: 3 → ?", out)
-        self.assertIn("(unknown) lines skipped", out)
+        self.assertIn(
+            "nudges → store-kind ledger appends (this project, drives the FLAG below): 3 → 0", out
+        )
+        self.assertIn('note: 1 legacy lines without project= are bucketed under "(unknown)"', out)
+
+    def test_no_note_line_when_no_unknown_lines(self):
+        lines = [f"{ts(1)} userprompt outcome=injected session=s1 project=demo" for _ in range(3)]
+        self.write_log(lines)
+        rc, out = run_stats(home=str(self.home))
+        self.assertNotIn("note:", out)
 
     def test_exit_code_always_zero_even_on_flags(self):
         lines = [f"{ts(1)} userprompt outcome=no-evidence session=s1 project=demo" for _ in range(10)]

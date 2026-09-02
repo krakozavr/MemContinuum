@@ -2704,26 +2704,71 @@ def cmd_code_search(args) -> int:
 #   <ts> newfile-nudge outcome=X project=P file=...
 #   <ts> outcome=matched elapsed=Ns project=P file=...      (pre-edit-chain.sh --
 #        no hook-type keyword; own independent logger, distinguished below)
-#   payload_keys=... project=P                               (no timestamp)
-#   <ts> outcome=watchdog-killed hook=<name>                  (mc-watchdog.sh's
-#        own expiry line; no offset, no project= -- launched before MC_PROJECT
-#        is ever computed. Left alone: see the liveness-stats report.)
+#   payload_keys=... project=P                               (no timestamp --
+#        a KNOWN timestamp-less shape, counted separately, see
+#        untimestamped_lines below)
+#   <ts> outcome=watchdog-killed hook=<name> project=P        (mc-watchdog.sh's
+#        own expiry line; round-2 review fix -- now carries an offset-bearing
+#        timestamp and project= (or the literal "(pre-resolution)" when the
+#        env didn't have MEMCONTINUUM_PROJECT set yet at kill time))
 #   <ts> memlib: no python resolved (...) project=P
-#   arbitrary python tracebacks landing via `2>>"$MC_LOG"`
+#   <ts> pre-edit-chain: no python resolved (...) project=P
+#   <ts> post-commit-reindex: MEMCONTINUUM_ROOT not set, skipping project=P
+#   arbitrary python tracebacks / stray stderr landing via `2>>"$MC_LOG"`
+#   Tue Sep  2 02:10:00 EDT 2026 ...                          (BSD/macOS
+#        `date` fallback shape when `date -Iseconds` isn't supported --
+#        this repo's documented bash-3.2/macOS port target. Parsed as a
+#        LOCAL NAIVE timestamp, localized to whatever machine runs `stats`
+#        itself -- see _parse_bsd_date_prefix. Without this, every real
+#        line on such a host was unparseable, which is itself an
+#        INC-0103-class silence of the metric.)
 #
-# Rule (never raise on any of the above): the first whitespace-delimited
-# token must parse as an ISO timestamp WITH a UTC offset via
-# datetime.fromisoformat, else the whole line is silently skipped -- this
-# is what makes the payload_keys=/watchdog-killed/traceback shapes above
-# harmless instead of crashes. A line without `project=` is bucketed under
-# the literal project name "(unknown)" rather than dropped, so pre-fix
-# history (or any other logger that never learns project=) still shows up
-# somewhere instead of silently vanishing from every count.
+# Rule (never raise on any of the above): the line must start with either
+# an ISO-with-offset timestamp (as the first whitespace token) or the BSD
+# `date` fallback's multi-token prefix, else the whole line is silently
+# skipped from every count -- this is what makes the payload_keys=/
+# watchdog-killed/traceback shapes above harmless instead of crashes. A
+# line without `project=` is bucketed under the literal project name
+# "(unknown)" rather than dropped, so pre-fix history (or any other logger
+# that never learns project=) still shows up somewhere instead of silently
+# vanishing from every count -- but neither FLAG is ever evaluated for
+# that bucket (round-2 review ruling: attribution there is incomplete by
+# design, so "read side silent" there would be a guaranteed false alarm on
+# every deployment's cold-start window, not a real signal).
 _HOOK_LOG_KEYWORDS = (
     "userprompt", "ledger", "sessionstart", "sessionend", "precompact",
     "newfile-nudge",
 )
 UNKNOWN_STATS_PROJECT = "(unknown)"
+
+# Round 2 (Codex gate, item 8): these userprompt outcomes mean "this
+# invocation was not itself a live, unique user turn" -- a redelivered
+# prompt_id (duplicate-delivery), a subagent/persona run (agent-source),
+# or the pre-INC-0103-fix gate's own now-dead outcome name
+# (non-user-source, kept here only because OLD hook.log lines can still
+# carry it). Excluded from `user_prompts` so ten of THESE alone can never
+# satisfy the read-side FLAG's ">=10 prompts" busy-signal on their own --
+# they prove the hook ran, not that a human was actively prompting.
+_NON_USER_PROMPT_OUTCOMES = frozenset({
+    "duplicate-delivery", "agent-source", "non-user-source",
+})
+
+_MONTH_ABBR = {
+    name: i for i, name in enumerate(
+        ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+         "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"],
+        start=1,
+    )
+}
+# `%a %b %e %H:%M:%S %Z %Y` -- BSD/macOS `date`'s default output (what
+# every `date -Iseconds 2>/dev/null || date` fallback line becomes on a
+# host without GNU date's -I flag). %e is space-padded (` 2`, not `02`),
+# hence ` +` rather than a fixed width; the zone abbreviation (%Z, e.g.
+# EDT/PST/UTC) is matched but deliberately NOT captured -- see
+# _parse_bsd_date_prefix for why.
+_BSD_DATE_RE = re.compile(
+    r"^[A-Za-z]{3} ([A-Za-z]{3}) +(\d{1,2}) (\d{2}):(\d{2}):(\d{2}) [A-Za-z]{2,5} (\d{4})"
+)
 
 
 def _parse_hook_log_ts(token: str):
@@ -2738,6 +2783,57 @@ def _parse_hook_log_ts(token: str):
     if ts.tzinfo is None:
         return None
     return ts
+
+
+def _parse_bsd_date_prefix(line: str):
+    """Round-2 review finding: the BSD/macOS `date` fallback (no
+    `-Iseconds` support) prints `Tue Sep  2 02:10:00 EDT 2026`, not an
+    ISO offset -- every real hook.log line on such a host was previously
+    100% unparseable, which is itself the exact class of silent failure
+    this metric exists to catch. Returns (naive_datetime, matched_length)
+    or (None, 0). The zone abbreviation is matched but discarded: Python's
+    stdlib cannot reliably resolve an arbitrary three-to-five-letter zone
+    abbreviation (EDT, PST, ...) to a UTC offset (there is no
+    installation-independent abbreviation->offset table), so the returned
+    datetime is NAIVE -- the caller localizes it to whatever machine is
+    running `stats` via `.astimezone()`, on the accepted assumption that a
+    single-operator liveness tool reads logs on the same machine (or at
+    least the same timezone) that wrote them."""
+    m = _BSD_DATE_RE.match(line)
+    if not m:
+        return None, 0
+    mon_abbr, day, hh, mm, ss, year = m.groups()
+    month = _MONTH_ABBR.get(mon_abbr)
+    if month is None:
+        return None, 0
+    try:
+        dt = datetime(int(year), month, int(day), int(hh), int(mm), int(ss))
+    except ValueError:
+        return None, 0
+    return dt, m.end()
+
+
+def _parse_hook_log_line_ts(line: str):
+    """Returns (ts_aware_or_None, rest_of_line). Two timestamp shapes are
+    recognized -- ISO-with-offset as the whole first whitespace token, or
+    the BSD `date` fallback's multi-token prefix (see
+    _parse_bsd_date_prefix, localized to this process's own timezone via
+    `.astimezone()`, which -- called with no argument on a NAIVE datetime
+    -- attaches the system's local UTC offset without altering the
+    wall-clock fields, i.e. exactly "this naive value IS local time").
+    Neither shape recognized: ts is None and rest is the line unchanged
+    (nothing meaningful to split off)."""
+    first, _, remainder = line.partition(" ")
+    ts = _parse_hook_log_ts(first)
+    if ts is not None:
+        return ts, remainder
+    naive, end = _parse_bsd_date_prefix(line)
+    if naive is not None:
+        try:
+            return naive.astimezone(), line[end:].lstrip(" ")
+        except Exception:
+            return None, line
+    return None, line
 
 
 def _hook_log_line_kind(rest: str) -> str:
@@ -2774,8 +2870,13 @@ _STATS_KINDS = (
 def _new_stats_bucket():
     return {
         "sessions": set(),
-        "user_prompts": 0,
         "lines": 0,
+        # user_prompts is NOT tracked as a separate counter (round 2,
+        # Codex gate item 8): it is a VIEW over outcomes["userprompt"] at
+        # report time, excluding _NON_USER_PROMPT_OUTCOMES -- see
+        # _stats_report. A separate increment here would double the
+        # bookkeeping this dict already exists to replace.
+        #
         # Fix round 1 (review finding, MINOR): outcome counts are tallied
         # DYNAMICALLY per kind -- {kind: Counter(outcome -> count)} -- so no
         # outcome value is ever silently folded into a total or dropped,
@@ -2793,37 +2894,96 @@ def _new_stats_bucket():
 _FIELD_RE = re.compile(r"(?:^|\s)(\w+)=(\S*)")
 
 
-def _hook_log_fields(rest: str) -> dict:
+def _hook_log_fields(rest: str, kind: str = "other") -> dict:
     """Every producer writes space-separated `key=value` tokens (a few
     values may be empty, e.g. `session=` on a payload missing session_id).
     A generic key=value scan is more robust than one regex per field name,
-    and costs nothing extra -- every line here is short."""
-    return {k: v for k, v in _FIELD_RE.findall(rest)}
+    and costs nothing extra -- every line here is short.
+
+    Round-2 Codex gate finding: `file=`'s value is an arbitrary filesystem
+    path, which can itself contain a substring shaped like `key=value`
+    (reproduced: a path literally containing `project=other`, e.g.
+    `/tmp/a project=other/x.py`). Without care, the generic scan's
+    last-match-wins semantics can let that embedded text overwrite the
+    line's REAL project=. The fix has to be KIND-AWARE, not one universal
+    rule, because the two real shapes disagree about where `file=` sits:
+
+      - pre-edit-chain.sh / newfile-nudge.sh (their own independent
+        loggers, never through mc_log): `... project=P file=F`, with
+        `file=` genuinely LAST -- nothing follows it. Here the scan must
+        stop AT the first ` file=` marker: fields come only from the
+        prefix before it, and everything after is the file value
+        verbatim, never re-scanned.
+      - ledger-post-edit.sh (via mc_log, hooks/memlib.sh): mc_log appends
+        `project=$MC_PROJECT` as the line's UNCONDITIONAL LAST token,
+        always AFTER the hook's own `... file=F` -- so here `project=`
+        sits PAST `file=`, the opposite arrangement. Cutting at the first
+        ` file=` (the pre-edit-chain rule) would silently drop this
+        trailing project= as part of the file value instead -- reproduced
+        as a real regression while fixing the OTHER shape, caught by
+        test_healthy_case_no_flags. The fix for THIS shape: parse fields
+        from the prefix as before, but then scan the tail (everything
+        after ` file=`) for `project=` tokens and take the LAST one --
+        matching mc_log's own guarantee that its append is always the
+        line's final such token, so an embedded fake one earlier in the
+        path still loses to the real one after it. The file value is the
+        tail with that trailing project token removed.
+      - every other kind (userprompt/sessionstart/sessionend/precompact/
+        other): never carries a real `file=` field in practice; default
+        to the pre-edit-chain-style stop-at-`file=` rule (the safer
+        default -- never let a stray value re-open scanning across the
+        whole line)."""
+    marker = " file="
+    idx = rest.find(marker)
+    if idx == -1:
+        return {k: v for k, v in _FIELD_RE.findall(rest)}
+    prefix = rest[:idx]
+    fields = {k: v for k, v in _FIELD_RE.findall(prefix)}
+    tail = rest[idx + len(marker):]
+
+    if kind == "ledger":
+        matches = list(re.finditer(r"(?:^|\s)project=(\S*)", tail))
+        if matches:
+            last = matches[-1]
+            fields["project"] = last.group(1)
+            tail = tail[: last.start()].rstrip(" ")
+
+    fields["file"] = tail
+    return fields
 
 
 def _scan_hook_log(log_path: Path, cutoff: datetime, now: datetime):
     """Returns (buckets: {project: bucket}, unknown_lines: int,
-    projects_seen: set[str], unparseable_lines: int). Never raises: an
-    unreadable file, a non-UTF-8 byte, or any single malformed line is
-    tolerated -- this function's caller (cmd_stats) still wraps the whole
-    thing in case a genuinely unexpected failure shows up, per this repo's
-    fail-open rule for every hook.log consumer.
+    projects_seen: set[str], unparseable_lines: int, untimestamped_lines:
+    int). Never raises: an unreadable file, a non-UTF-8 byte, or any
+    single malformed line is tolerated -- this function's caller
+    (cmd_stats) still wraps the whole thing in case a genuinely unexpected
+    failure shows up, per this repo's fail-open rule for every hook.log
+    consumer.
 
     `unparseable_lines` is this metric's OWN self-liveness signal (a
-    reviewer finding, not in the original spec): every line whose leading
-    token does not parse as an ISO-with-offset timestamp is silently
-    skipped by design (payload_keys=..., a python traceback, mc-watchdog's
-    offset-less watchdog-killed line -- see the module comment above). That
-    silence is exactly right for THOSE known shapes, but it would also hide
-    a genuinely broken host -- e.g. `date -Iseconds` unsupported, falling
-    back to `date`'s bare `Tue Sep  2 ...` on every real hook.log write --
-    which would otherwise report a healthy-looking all-zero stats output,
+    reviewer finding, not in the original spec): a line whose leading
+    token(s) do not parse as either an ISO-with-offset timestamp or the
+    BSD `date` fallback shape (see _parse_hook_log_line_ts) is silently
+    skipped from every count. That silence would hide a genuinely broken
+    host -- e.g. hook.log filling up with stray stderr or python
+    tracebacks -- as a healthy-looking all-zero stats output,
     indistinguishable from a dead system. Counting it separately (never
     silently) means an operator staring at zero counts can tell "nothing
-    happened" apart from "the metric itself can't read this log"."""
+    happened" apart from "the metric itself can't read this log".
+
+    `untimestamped_lines` is the round-2 refinement of that signal
+    (reviewer finding): `payload_keys=...` lines are a KNOWN,
+    by-design-timestamp-less shape (userprompt-remind.sh's payload-shape
+    capture writes them directly, not through mc_log) -- counting them
+    under `unparseable_lines` would make that number tick on every single
+    healthy run, burying the ratio's only real discriminator ("this is
+    new/unexpected breakage") under permanent, harmless noise. They are
+    counted here instead, separately."""
     buckets: dict[str, dict] = {}
     unknown_lines = 0
     unparseable_lines = 0
+    untimestamped_lines = 0
     projects_seen: set[str] = set()
 
     try:
@@ -2839,20 +2999,22 @@ def _scan_hook_log(log_path: Path, cutoff: datetime, now: datetime):
         # error (...)" instead of a real message -- the exact kind of
         # silent-failure-about-silent-failure this metric exists to catch.
         # Reproduced: chmod 000 an existing hook.log.
-        return buckets, unknown_lines, projects_seen, unparseable_lines
+        return buckets, unknown_lines, projects_seen, unparseable_lines, untimestamped_lines
 
     for line in raw_lines:
         if not line.strip():
             continue
-        parts = line.split(" ", 1)
-        ts = _parse_hook_log_ts(parts[0])
+        ts, rest = _parse_hook_log_line_ts(line)
         if ts is None:
-            unparseable_lines += 1
+            if line.lstrip().startswith("payload_keys="):
+                untimestamped_lines += 1
+            else:
+                unparseable_lines += 1
             continue
         if ts < cutoff or ts > now:
             continue
-        rest = parts[1] if len(parts) > 1 else ""
-        fields = _hook_log_fields(rest)
+        kind = _hook_log_line_kind(rest)
+        fields = _hook_log_fields(rest, kind)
         project = fields.get("project") or UNKNOWN_STATS_PROJECT
         projects_seen.add(project)
         if project == UNKNOWN_STATS_PROJECT:
@@ -2861,15 +3023,12 @@ def _scan_hook_log(log_path: Path, cutoff: datetime, now: datetime):
         bucket = buckets.setdefault(project, _new_stats_bucket())
         bucket["lines"] += 1
 
-        kind = _hook_log_line_kind(rest)
         outcome = fields.get("outcome", "")
 
         if kind == "sessionstart":
             session = fields.get("session")
             if session:
                 bucket["sessions"].add(session)
-        elif kind == "userprompt":
-            bucket["user_prompts"] += 1
         elif kind == "ledger":
             # Fix round 1: the code/store split is a SEPARATE field
             # (`kind=`), not the outcome itself -- folded into the outcome
@@ -2884,21 +3043,39 @@ def _scan_hook_log(log_path: Path, cutoff: datetime, now: datetime):
             bucket["outcomes"]["ledger"][outcome_key] += 1
             continue
         bucket["outcomes"][kind][outcome] += 1
-        # sessionend/precompact/other: counted in `lines` and their own
-        # `outcomes[kind]` bucket; no dedicated named metric asked for by
-        # the spec, but nothing here is silently dropped either.
+        # userprompt: `user_prompts` is derived at report time from this
+        # same outcomes["userprompt"] Counter (round 2, item 8) -- no
+        # separate increment here. sessionend/precompact/other: counted in
+        # `lines` and their own `outcomes[kind]` bucket; no dedicated named
+        # metric asked for by the spec, but nothing here is silently
+        # dropped either.
 
-    return buckets, unknown_lines, projects_seen, unparseable_lines
+    return buckets, unknown_lines, projects_seen, unparseable_lines, untimestamped_lines
 
 
-def _count_store_commits(store_dir: str, cutoff: datetime):
-    """`git -C STORE log --since=<cutoff> --oneline` line count. None (not
-    0) on any failure -- STORE not a repo, git missing, timeout -- so the
-    caller can tell "unmeasured" apart from "measured zero" (the INC-0105
-    FLAG needs a real zero, never a guess)."""
+def _count_store_commits(store_dir: str, cutoff: datetime, now: datetime):
+    """`git -C STORE log --since=<cutoff> --until=<now> --oneline` line
+    count. None (not 0) on any failure -- STORE not a repo, git missing,
+    timeout -- so the caller can tell "unmeasured" apart from "measured
+    zero".
+
+    Round 2 (Grok gate, ruling 1 + Codex gate, item 11): this NO LONGER
+    gates the write-side FLAG (see _stats_report) -- INC-0105's own
+    numbers proved why: a single unrelated commit anywhere in the window
+    (a README fix, an unrelated project's ruling, the store's own
+    relocation) made `store_commits >= 1` and hid a genuinely silent day.
+    It is reported as CORROBORATION ONLY now, alongside the FLAG-driving
+    ledger store-kind append count. Two fixes to the measurement itself:
+    `--until=<now>` bounds the window on BOTH ends (a future-dated commit
+    -- clock skew, a rebase, a deliberately backdated one -- used to still
+    count as "in the window" with no upper bound at all); and the count is
+    explicitly STORE-WIDE, not scoped to any one project (a store repo can
+    be shared by more than one project's wiring), which is exactly why it
+    can only ever corroborate, never veto."""
     try:
         result = subprocess.run(
-            ["git", "-C", str(store_dir), "log", f"--since={cutoff.isoformat()}", "--oneline"],
+            ["git", "-C", str(store_dir), "log",
+             f"--since={cutoff.isoformat()}", f"--until={now.isoformat()}", "--oneline"],
             capture_output=True, text=True, timeout=10,
         )
     except Exception:
@@ -2908,7 +3085,10 @@ def _count_store_commits(store_dir: str, cutoff: datetime):
     return len([l for l in result.stdout.splitlines() if l.strip()])
 
 
-def _stats_report(args, buckets, unknown_lines, projects_seen, now, cutoff, store_commits, unparseable_lines):
+def _stats_report(
+    args, buckets, unknown_lines, projects_seen, now, cutoff, store_commits,
+    unparseable_lines, untimestamped_lines,
+):
     """Every named field below (pre_edit.matched, newfile_nudge.nudged,
     nudges.coverage_injected, ...) is a VIEW computed here, at report time,
     over the bucket's dynamic `outcomes[kind]` Counter -- never a separate
@@ -2920,7 +3100,31 @@ def _stats_report(args, buckets, unknown_lines, projects_seen, now, cutoff, stor
     invisible. Each named metric's raw Counter is also exposed under an
     "outcomes" key in the result, so no outcome is ever silently folded
     away: a brand-new outcome value some future hook edit introduces shows
-    up there on the very next run with no code change here."""
+    up there on the very next run with no code change here.
+
+    Round 2 (Grok + Codex gates) FLAG redesign:
+      - write-side FLAG is keyed on `ledger_appends.store` (this project's
+        own per-day-accurate append ledger), NEVER on `store_commits` (a
+        store-wide git count reported only as corroboration) -- ruling 1.
+        INC-0105 itself is the proof: 12 nudges, 0 store-kind ledger
+        appends that day, but an unrelated store commit elsewhere in the
+        window would have hidden it under the old git-gated formula.
+      - read-side FLAG's "lookups" means real for-path EXECUTIONS only --
+        `pre_edit.matched + pre_edit.no_match` -- never `pre_edit.other`
+        (index-missing, no-file-path, output-build-failed, ...), which
+        counts FAILED-OR-NEVER-ATTEMPTED lookups and must not read as
+        evidence the read side is alive (Codex gate item 7).
+      - `user_prompts` excludes _NON_USER_PROMPT_OUTCOMES (duplicate
+        redeliveries, subagent/persona runs, the dead pre-fix gate outcome)
+        so those alone can never fake the ">=10 prompts" busy signal
+        (Codex gate item 8).
+      - NEITHER flag is ever evaluated for the "(unknown)" project: lines
+        with no project= are bucketed there so they are never silently
+        dropped, but attribution IS incomplete there by construction (a
+        mix of every un-projected logger, forever, not one coherent
+        project's history) -- "read side silent" on that bucket would be a
+        guaranteed false alarm on every deployment's cold-start window,
+        not a real signal (Grok gate ruling 2)."""
     b = buckets.get(args.project, _new_stats_bucket())
     outcomes = b["outcomes"]
 
@@ -2929,6 +3133,7 @@ def _stats_report(args, buckets, unknown_lines, projects_seen, now, cutoff, stor
     pre_edit_matched = pe.get("matched", 0)
     pre_edit_no_match = pe.get("no-match", 0)
     pre_edit_other = pre_edit_total - pre_edit_matched - pre_edit_no_match
+    pre_edit_lookups = pre_edit_matched + pre_edit_no_match
 
     led = outcomes["ledger"]
     ledger_code = led.get("appended:code", 0)
@@ -2940,6 +3145,8 @@ def _stats_report(args, buckets, unknown_lines, projects_seen, now, cutoff, stor
     no_evidence = up.get("no-evidence", 0)
     duplicate_delivery = up.get("duplicate-delivery", 0)
     nudges_total = coverage_injected + lookback_injected
+    non_user_prompt_lines = sum(up.get(k, 0) for k in _NON_USER_PROMPT_OUTCOMES)
+    user_prompts = sum(up.values()) - non_user_prompt_lines
 
     nf = outcomes["newfile-nudge"]
     nf_nudged = nf.get("nudged", 0)
@@ -2948,13 +3155,14 @@ def _stats_report(args, buckets, unknown_lines, projects_seen, now, cutoff, stor
     nf_never = nf.get("never-extension", 0)
 
     flags = []
-    if store_commits is not None and nudges_total >= 3 and store_commits == 0:
-        flags.append(
-            f"FLAG: write side silent — {nudges_total} nudges, 0 store writes "
-            f"in {args.days}d (INC-0105 class)"
-        )
-    if b["user_prompts"] >= 10 and pre_edit_total == 0:
-        flags.append("FLAG: read side silent (INC-0103 class)")
+    if args.project != UNKNOWN_STATS_PROJECT:
+        if nudges_total >= 3 and ledger_store == 0:
+            flags.append(
+                f"FLAG: write side silent — {nudges_total} nudges, 0 store-kind "
+                f"ledger appends in {args.days}d (INC-0105 class)"
+            )
+        if user_prompts >= 10 and pre_edit_lookups == 0:
+            flags.append("FLAG: read side silent (INC-0103 class)")
 
     result = {
         "project": args.project,
@@ -2962,12 +3170,14 @@ def _stats_report(args, buckets, unknown_lines, projects_seen, now, cutoff, stor
         "window_start": cutoff.isoformat(),
         "window_end": now.isoformat(),
         "sessions_seen": len(b["sessions"]),
-        "user_prompts": b["user_prompts"],
+        "user_prompts": user_prompts,
+        "non_user_prompt_lines": non_user_prompt_lines,
         "pre_edit": {
             "matched": pre_edit_matched,
             "no_match": pre_edit_no_match,
             "other": pre_edit_other,
             "total": pre_edit_total,
+            "lookups": pre_edit_lookups,
             "outcomes": dict(pe),
         },
         "ledger_appends": {
@@ -2993,6 +3203,7 @@ def _stats_report(args, buckets, unknown_lines, projects_seen, now, cutoff, stor
         "store_commits": store_commits,
         "unknown_lines": unknown_lines,
         "unparseable_lines": unparseable_lines,
+        "untimestamped_lines": untimestamped_lines,
         "projects_seen": sorted(projects_seen),
         "flags": flags,
     }
@@ -3002,17 +3213,19 @@ def _stats_report(args, buckets, unknown_lines, projects_seen, now, cutoff, stor
 def cmd_stats(args) -> int:
     """`memidx.py stats --project P [--days N] [--home DIR] [--store DIR]
     [--json]` -- the liveness metric (backlog SS2, INC-0103/INC-0105): reads
-    hook.log and reports, per project, whether the read side (pre-edit
-    lookups) and the write side (nudges -> real store commits) are alive.
-    Never touches hook.log or anything else -- read-only, exit 0 always
-    (missing hook.log, unreadable file, a bad --store, anything: this
-    prints one line and returns 0, on the same fail-open principle every
-    hook in this repo already follows -- a broken liveness check must never
-    itself become a second silent failure mode).
+    hook.log and reports, per project, whether the read side (real pre-edit
+    lookups) and the write side (nudges -> this project's own store-kind
+    ledger appends) are alive. Never touches hook.log or anything else --
+    read-only, exit 0 always (missing hook.log, unreadable file, a bad
+    --store, anything: this prints one line and returns 0, on the same
+    fail-open principle every hook in this repo already follows -- a
+    broken liveness check must never itself become a second silent
+    failure mode).
 
-    --store is optional: without it, store commits are UNMEASURED (None,
-    printed as "?"/"not measured"), and the INC-0105 write-side-silent FLAG
-    is never raised -- that FLAG asserts a real zero, never a guess.
+    --store is optional and, since round 2, never gates either FLAG: it
+    adds a store-wide git-commit count reported purely as corroboration
+    (`store_commits`) alongside the FLAG-driving ledger numbers. Neither
+    FLAG is ever raised for `--project '(unknown)'` -- see _stats_report.
     """
     # Everything -- including the final print block -- lives inside this one
     # try/except: a printing failure (e.g. a non-UTF-8 stdout choking on the
@@ -3051,14 +3264,17 @@ def cmd_stats(args) -> int:
             print(f"hook.log exists but is unreadable at {log_path} ({e})")
             return 0
 
-        buckets, unknown_lines, projects_seen, unparseable_lines = _scan_hook_log(log_path, cutoff, now)
+        buckets, unknown_lines, projects_seen, unparseable_lines, untimestamped_lines = _scan_hook_log(
+            log_path, cutoff, now
+        )
 
         store_commits = None
         if args.store:
-            store_commits = _count_store_commits(args.store, cutoff)
+            store_commits = _count_store_commits(args.store, cutoff, now)
 
         result = _stats_report(
-            args, buckets, unknown_lines, projects_seen, now, cutoff, store_commits, unparseable_lines
+            args, buckets, unknown_lines, projects_seen, now, cutoff, store_commits,
+            unparseable_lines, untimestamped_lines,
         )
 
         if args.json:
@@ -3069,11 +3285,18 @@ def cmd_stats(args) -> int:
         print(f"window: {result['window_start']} .. {result['window_end']}")
         print()
         print(f"sessions seen: {result['sessions_seen']}")
-        print(f"user prompts: {result['user_prompts']}")
+        print(
+            f"user prompts: {result['user_prompts']}"
+            + (
+                f"  ({result['non_user_prompt_lines']} duplicate/agent/non-user lines excluded)"
+                if result["non_user_prompt_lines"] else ""
+            )
+        )
         print()
         pe = result["pre_edit"]
         print(f"pre-edit lookups: matched={pe['matched']} no-match={pe['no_match']} "
-              f"other={pe['other']} (total {pe['total']})")
+              f"(real lookups {pe['lookups']}); other={pe['other']} "
+              f"(failed/never-attempted, not counted as a lookup) -- total lines {pe['total']}")
         la = result["ledger_appends"]
         print(f"ledger appends: code={la['code']} store={la['store']}")
         print()
@@ -3088,23 +3311,26 @@ def cmd_stats(args) -> int:
               f"never-extension={nf['never_extension']}")
         print()
         if result["store_commits"] is None:
-            print("store commits in window: not measured (pass --store to measure)")
+            print("store commits (all projects, corroboration only) in window: not measured (pass --store to measure)")
         else:
-            print(f"store commits in window: {result['store_commits']}")
-        print(f"store-kind ledger appends: {la['store']}")
-        print()
-        store_rhs = "?" if result["store_commits"] is None else str(result["store_commits"])
-        suffix = "  (pass --store to measure)" if result["store_commits"] is None else ""
-        print(f"nudges → store writes: {nu['total']} → {store_rhs}{suffix}")
+            print(f"store commits (all projects, corroboration only) in window: {result['store_commits']}")
+        print(f"nudges → store-kind ledger appends (this project, drives the FLAG below): "
+              f"{nu['total']} → {la['store']}")
         for flag in result["flags"]:
             print(flag)
         print()
-        print(f"(unknown) lines skipped (no project= in this window): {result['unknown_lines']}")
+        if result["unknown_lines"]:
+            print(
+                f'note: {result["unknown_lines"]} legacy lines without project= are bucketed '
+                f'under "(unknown)" — counts there are incomplete by design'
+            )
         if result["unparseable_lines"]:
             print(
-                f"unparseable lines skipped (no ISO-with-offset timestamp -- self-liveness "
-                f"signal, see --help): {result['unparseable_lines']}"
+                f"unparseable lines skipped (no ISO-with-offset or BSD-date timestamp -- "
+                f"self-liveness signal, see --help): {result['unparseable_lines']}"
             )
+        if result["untimestamped_lines"]:
+            print(f"untimestamped lines skipped (known shape, e.g. payload_keys=...): {result['untimestamped_lines']}")
         if result["projects_seen"]:
             print(f"projects seen in window: {', '.join(result['projects_seen'])}")
         return 0
@@ -3221,34 +3447,47 @@ def main(argv=None) -> int:
 
     p_stats = sub.add_parser(
         "stats",
-        help="liveness metric from hook.log: per-project read-side (pre-edit "
-             "lookup) and write-side (nudge-to-store-commit) activity in a "
-             "trailing window, with FLAG lines when either side goes silent "
-             "-- the INC-0103/INC-0105 lesson: a dead or misrouted write side "
-             "must be visible within a day, not a week.",
+        help="liveness metric from hook.log: per-project read-side (real "
+             "pre-edit lookups) and write-side (nudges vs. this project's own "
+             "store-kind ledger appends) activity in a trailing window, with "
+             "FLAG lines when either side goes silent -- the INC-0103/INC-0105 "
+             "lesson: a dead or misrouted write side must be visible within a "
+             "day, not a week.",
         description=(
             "Reads $MEMCONTINUUM_HOME/hook.log (never writes anything) and reports, "
-            "for one project, whether the read side (pre-edit lookups) and the write "
-            "side (write-side nudges -> real store commits) are actually alive in a "
-            "trailing window -- the liveness signal INC-0103 (forced retrieval dead "
-            "on arrival for a week) and INC-0105 (a day of rulings misrouted into the "
-            "wrong folder) both lacked: every hook fails open by design, so a dead "
-            "hook and a healthy hook that found nothing look identical from inside a "
-            "session.\n\n"
-            "Reports: sessions seen, user prompts, pre-edit lookups (matched/"
-            "no-match/other), ledger appends (code/store), write-side nudges "
-            "(coverage-injected/lookback-injected/no-evidence/duplicate-delivery), "
-            "new-file nudge outcomes, store commits in the window (only with --store), "
-            "the 'nudges -> store writes' ratio, and two FLAG lines: "
-            "'write side silent' (INC-0105 class: >=3 nudges but 0 store commits -- "
-            "requires --store, since this asserts a real measured zero, never a "
-            "guess) and 'read side silent' (INC-0103 class: >=10 user prompts but 0 "
-            "pre-edit lookups of any outcome).\n\n"
+            "for one project, whether the read side (real pre-edit lookups) and the "
+            "write side (write-side nudges vs. this project's own store-kind ledger "
+            "appends) are actually alive in a trailing window -- the liveness signal "
+            "INC-0103 (forced retrieval dead on arrival for a week) and INC-0105 (a "
+            "day of rulings misrouted into the wrong folder) both lacked: every hook "
+            "fails open by design, so a dead hook and a healthy hook that found "
+            "nothing look identical from inside a session.\n\n"
+            "Reports: sessions seen, user prompts (duplicate/subagent/non-user "
+            "lines excluded), pre-edit lookups (matched/no-match count as real "
+            "lookups; every other pre-edit outcome -- index-missing, no-file-path, "
+            "output-build-failed, ... -- is a FAILED or NEVER-ATTEMPTED lookup, "
+            "reported under 'other' but never counted as read-side evidence), "
+            "ledger appends (code/store), write-side nudges (coverage-injected/"
+            "lookback-injected/no-evidence/duplicate-delivery), new-file nudge "
+            "outcomes, and a store-wide git commit count (only with --store, "
+            "corroboration only -- see below) and two FLAG lines: "
+            "'write side silent' (INC-0105 class: >=3 nudges but 0 store-kind "
+            "LEDGER appends this project made -- --store's git count is reported "
+            "alongside but never gates this: one unrelated commit anywhere in a "
+            "shared store must not hide a genuinely silent day, which is exactly "
+            "what INC-0105 itself looked like) and 'read side silent' (INC-0103 "
+            "class: >=10 real user prompts but 0 real pre-edit lookups (matched or "
+            "no-match) -- a run of failed/never-attempted lookups does not count as "
+            "evidence the read side is alive).\n\n"
             "Lines with no project= token (pre-fix history, or any other logger that "
             "never learns it) are grouped under the literal project name "
             "'(unknown)' rather than dropped -- pass --project '(unknown)' to see "
-            "them. Fail-open throughout: a missing hook.log, an unreadable file, a "
-            "bad --store path, or any unexpected error prints one line and exits 0."
+            "them, but NEITHER flag is ever raised for that bucket: its attribution "
+            "is incomplete by design (a mix of every un-projected logger, forever), "
+            "so 'read side silent' there would be a guaranteed false alarm on every "
+            "deployment's cold-start window, not a real signal. Fail-open "
+            "throughout: a missing hook.log, an unreadable file, a bad --store "
+            "path, or any unexpected error prints one line and exits 0."
         ),
     )
     p_stats.add_argument("--project", default=DEFAULT_PROJECT, help="project namespace to report on (default: %(default)s)")
@@ -3259,9 +3498,12 @@ def main(argv=None) -> int:
     )
     p_stats.add_argument(
         "--store", default=None,
-        help="store markdown root's git repo -- counts real commits in the window "
-             "(git log --since); without it, store writes are unmeasured and the "
-             "write-side-silent FLAG (INC-0105 class) is never raised",
+        help="store markdown root's git repo -- counts real, store-WIDE commits in "
+             "the window (git log --since/--until, bounded on both ends) as "
+             "CORROBORATION ONLY; never gates either FLAG (a store can be shared by "
+             "more than one project, and one unrelated commit must not hide a "
+             "genuinely silent project) -- the write-side FLAG is driven entirely by "
+             "this project's own store-kind ledger appends, with or without --store",
     )
     p_stats.add_argument("--json", action="store_true", help="machine-readable output instead of plain text")
     p_stats.add_argument("--now", default=None, help=argparse.SUPPRESS)

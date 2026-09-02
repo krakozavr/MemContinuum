@@ -66,7 +66,14 @@ LOG="$MEMCONTINUUM_HOME/hook.log"
 mkdir -p "$MEMCONTINUUM_HOME" 2>/dev/null
 
 if [ -z "${MEMCONTINUUM_ROOT:-}" ]; then
-    printf '%s post-commit-reindex: MEMCONTINUUM_ROOT not set, skipping\n' "$(date -Iseconds 2>/dev/null || date)" >>"$LOG" 2>/dev/null || true
+    # Can't derive PROJECT the normal way (basename of a ROOT we don't
+    # have) -- fall back to MEMCONTINUUM_PROJECT/"default", same as every
+    # other hook's fallback chain, so this line still carries project=
+    # (round-2 review finding: "every hook.log line carries project=" was
+    # still false for this one).
+    _SKIP_PROJECT="${MEMCONTINUUM_PROJECT:-default}"
+    printf '%s post-commit-reindex: MEMCONTINUUM_ROOT not set, skipping project=%s\n' \
+        "$(date -Iseconds 2>/dev/null || date)" "$_SKIP_PROJECT" >>"$LOG" 2>/dev/null || true
     exit 0
 fi
 

@@ -22,6 +22,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -2731,7 +2732,19 @@ class TestMemlib(unittest.TestCase):
     def test_mc_log_appends_project(self):
         """Liveness metric fix: mc_log (the shared logging path every
         memlib.sh-sourcing hook uses) must append project=<MC_PROJECT> to
-        every line it writes."""
+        every line it writes.
+
+        Round-2 Codex gate finding: the old version of this test asserted
+        neither the subprocess's return code nor the SPECIFIC "probe
+        outcome=ok" line -- it only checked that "project=mclog-proj"
+        appeared SOMEWHERE in hook.log. If MEMCONTINUUM_PYTHON doesn't
+        resolve in the caller's environment, memlib.sh's own "no python
+        resolved" diagnostic (sourced before mc_log is even called) ALSO
+        carries project=mclog-proj -- so that line alone could satisfy the
+        old assertion even if `mc_log` itself were broken or had stopped
+        adding the field entirely. Explicit MEMCONTINUUM_PYTHON (so the
+        "no python resolved" line never fires) plus an exact-line
+        assertion closes that gap."""
         td = tempfile.mkdtemp(prefix="memcontinuum-memlib-mclog-")
         self.addCleanup(shutil.rmtree, td, ignore_errors=True)
         home = Path(td) / "home"
@@ -2740,10 +2753,17 @@ class TestMemlib(unittest.TestCase):
         caller.write_text(
             f'#!/usr/bin/env bash\nset -u\nsource "{MEMLIB}"\nmc_log "probe outcome=ok"\n'
         )
-        env = clean_env(MEMCONTINUUM_HOME=str(home), MEMCONTINUUM_PROJECT="mclog-proj")
-        subprocess.run([MC_BASH, str(caller)], capture_output=True, text=True, env=env, timeout=10)
+        env = clean_env(
+            MEMCONTINUUM_HOME=str(home), MEMCONTINUUM_PROJECT="mclog-proj",
+            MEMCONTINUUM_PYTHON=VENV_PYTHON,
+        )
+        proc = subprocess.run([MC_BASH, str(caller)], capture_output=True, text=True, env=env, timeout=10)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
         log_text = (home / "hook.log").read_text()
-        self.assertIn("project=mclog-proj", log_text)
+        self.assertNotIn("no python resolved", log_text, "MEMCONTINUUM_PYTHON was set -- this must never fire")
+        matching = [l for l in log_text.splitlines() if "probe outcome=ok" in l]
+        self.assertEqual(len(matching), 1, log_text)
+        self.assertIn("project=mclog-proj", matching[0])
 
     def test_no_python_resolved_line_carries_project(self):
         """The fail-open 'no python resolved' diagnostic (memlib.sh, printed
@@ -3167,6 +3187,72 @@ class TestMacOSPortMechanics(unittest.TestCase):
         log_text = log_path.read_text()
         self.assertIn("outcome=watchdog-killed", log_text, log_text)
         self.assertIn("hook=fake-hook-name.sh", log_text, log_text)
+
+    def test_watchdog_expiry_line_carries_offset_timestamp_and_pre_resolution_project(self):
+        """Round-2 review finding: this line used to have a NAIVE
+        timestamp (no UTC offset -- memidx.py stats' parser requires one,
+        so it was ALWAYS unparseable) and no project= at all. Without
+        MEMCONTINUUM_PROJECT in the launcher's own environment (the
+        common case: this launcher runs BEFORE memlib.sh's own MC_PROJECT
+        resolution, by design), it must say so explicitly via the literal
+        "(pre-resolution)" rather than ever emitting a bare line."""
+        launcher_py = subprocess.run(
+            [MC_BASH, "-c", 'source "$1"; printf %s "$MC_WATCHDOG_LAUNCHER_PY"', "_",
+             str(HOOKS_DIR / "mc-watchdog.sh")],
+            capture_output=True, text=True, check=True,
+        ).stdout
+
+        home = Path(self.td) / "expiry-ts-home"
+        home.mkdir()
+        fake_hook = Path(self.td) / "fake-hook-ts.sh"
+        fake_hook.write_text("#!/usr/bin/env bash\nwhile true; do sleep 0.05; done\n")
+        fake_hook.chmod(0o755)
+
+        env = clean_env(MEMCONTINUUM_HOME=str(home), MC_WATCHDOG_BUDGET="0.3")
+        env.pop("MEMCONTINUUM_PROJECT", None)
+        proc = subprocess.run(
+            [VENV_PYTHON, "-c", launcher_py, MC_BASH, str(fake_hook)],
+            capture_output=True, text=True, env=env, timeout=10,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+        log_text = (home / "hook.log").read_text()
+        matching = [l for l in log_text.splitlines() if "watchdog-killed" in l]
+        self.assertEqual(len(matching), 1, log_text)
+        line = matching[0]
+        self.assertIn("project=(pre-resolution)", line, line)
+        # ISO-with-offset timestamp: the same shape memidx.py's
+        # _parse_hook_log_ts requires (datetime.fromisoformat, tz-aware).
+        ts_token = line.split(" ", 1)[0]
+        parsed = datetime.fromisoformat(ts_token)
+        self.assertIsNotNone(parsed.tzinfo, f"timestamp {ts_token!r} must carry a UTC offset")
+
+    def test_watchdog_expiry_line_uses_project_from_env_when_set(self):
+        """The common installer-rendered shape: MEMCONTINUUM_PROJECT IS
+        already baked into the hook line's own env before the launcher
+        ever starts -- use it instead of the "(pre-resolution)" fallback."""
+        launcher_py = subprocess.run(
+            [MC_BASH, "-c", 'source "$1"; printf %s "$MC_WATCHDOG_LAUNCHER_PY"', "_",
+             str(HOOKS_DIR / "mc-watchdog.sh")],
+            capture_output=True, text=True, check=True,
+        ).stdout
+
+        home = Path(self.td) / "expiry-projenv-home"
+        home.mkdir()
+        fake_hook = Path(self.td) / "fake-hook-projenv.sh"
+        fake_hook.write_text("#!/usr/bin/env bash\nwhile true; do sleep 0.05; done\n")
+        fake_hook.chmod(0o755)
+
+        env = clean_env(
+            MEMCONTINUUM_HOME=str(home), MC_WATCHDOG_BUDGET="0.3", MEMCONTINUUM_PROJECT="wd-proj",
+        )
+        proc = subprocess.run(
+            [VENV_PYTHON, "-c", launcher_py, MC_BASH, str(fake_hook)],
+            capture_output=True, text=True, env=env, timeout=10,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        log_text = (home / "hook.log").read_text()
+        self.assertIn("project=wd-proj", log_text, log_text)
 
     # ---- item 2: stdout passthrough under the watchdog -----------------
 

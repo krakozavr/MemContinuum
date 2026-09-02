@@ -162,17 +162,29 @@ echo "state=$STATE"
 # broken "/memidx.py" with no engine root at all. `--store "$store"` is
 # appended when this repo's wiring named a store (project= implies store=
 # above): without it, `stats` can still report the read side and the
-# write-side nudge count, but never the INC-0105 write-side-silent FLAG,
-# which needs a REAL store-commit count, not a guess -- so the hint only
-# omits --store when this repo genuinely has no known store to point at.
+# write-side nudge count (the write-side FLAG no longer needs --store at
+# all, round 2 -- it is driven by this project's own store-kind ledger
+# appends; --store only adds a corroborating store-wide git commit count).
+#
+# Project precedence (round-2 Codex gate, item 13): the REGISTRY's own
+# recorded project (DECISION_PROJECT, from a `decide.sh wired --project
+# NAME` row) wins over whatever live wiring happens to resolve, and falls
+# back to it only when there is no row. A decided-but-currently-unwired
+# repo (hooks missing/broken -- exactly the state where a liveness check
+# matters most) used to fall straight to the repo's own basename here,
+# pointing the hint at a project name that was never the one actually
+# recorded -- silently steering an operator to query the wrong bucket.
 STATS_PYTHON="${MEMCONTINUUM_PYTHON:-python3}"
 STATS_ENGINE="${MEMCONTINUUM_ENGINE:-$SCRIPT_DIR/..}"
-STATS_PROJECT="${project:-}"
+STATS_PROJECT="${DECISION_PROJECT:-}"
+[ -z "$STATS_PROJECT" ] && STATS_PROJECT="${project:-}"
 [ -z "$STATS_PROJECT" ] && STATS_PROJECT="$(basename "$REPO" 2>/dev/null)"
 [ -z "$STATS_PROJECT" ] && STATS_PROJECT="default"
-# Single-quoted (a real install's python/engine/store path can contain a
-# space, e.g. under a Windows-mounted drive) so the printed line is a
-# directly copy-pasteable command, not just a human-readable summary.
-STATS_CMD="'$STATS_PYTHON' '$STATS_ENGINE/memidx.py' stats --project $STATS_PROJECT --days 7"
+# Single-quoted throughout (a real install's python/engine/store/project
+# value can contain a space or, for the literal "(unknown)" bucket name,
+# parentheses that a shell would otherwise treat specially) so the printed
+# line is a directly copy-pasteable command, not just a human-readable
+# summary.
+STATS_CMD="'$STATS_PYTHON' '$STATS_ENGINE/memidx.py' stats --project '$STATS_PROJECT' --days 7"
 [ -n "${store:-}" ] && STATS_CMD="$STATS_CMD --store '$store'"
 echo "stats: $STATS_CMD"
