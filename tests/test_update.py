@@ -22,6 +22,11 @@ UPDATE_SH = TOOLS_DIR / "scripts" / "memcontinuum-update.sh"
 INSTALL_SH = TOOLS_DIR / "scripts" / "repo-init.sh"
 SETUP_SH = TOOLS_DIR / "memcontinuum-setup.sh"
 
+# Same seam tests/test_write_hooks.py uses: tests/run_bash32.sh sets MC_BASH to
+# a real bash 3.2.57 binary so these scripts are exercised under the actual
+# interpreter the macOS port targets. The scripts these invoke shell out to
+# each other through "$BASH", so the nested calls follow automatically.
+MC_BASH = os.environ.get("MC_BASH", "bash")
 VENV_PYTHON = os.environ.get("MEMCONTINUUM_PYTHON", "")
 _SKIP_NO_VENV = (
     "set $MEMCONTINUUM_PYTHON to a venv python with fastembed/PyYAML "
@@ -45,7 +50,7 @@ def clean_env(home, extra=None):
 
 def run(script, args, home, timeout=120, stdin=None, cwd=None):
     return subprocess.run(
-        ["bash", str(script)] + args,
+        [MC_BASH, str(script)] + args,
         input=stdin, capture_output=True, text=True,
         env=clean_env(home), timeout=timeout, cwd=cwd or home,
     )
@@ -59,16 +64,16 @@ def git_repo(path):
     return path
 
 
-def engine_sha(root=None):
+def engine_sha(root=None, scope="repo"):
     """The stamp this checkout renders with -- asked of the one function that
     computes it (mc_render_fingerprint), never recomputed here. A test that
     re-derives a value it is checking only proves the two copies agree."""
     root = str(root or TOOLS_DIR)
     return subprocess.run(
-        ["bash", "-c",
-         '. "$1"/scripts/mc-registry-lib.sh; mc_render_fingerprint "$1"; '
+        [MC_BASH, "-c",
+         '. "$1"/scripts/mc-registry-lib.sh; mc_render_fingerprint "$2" "$1"; '
          'printf "%s" "$MC_RENDER_FINGERPRINT"',
-         "_", root],
+         "_", root, scope],
         capture_output=True, text=True, check=True,
     ).stdout.strip()
 
@@ -641,6 +646,38 @@ class TestNeverExtsSurviveARerender(unittest.TestCase):
         proc = self._migrate()
         self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("migrate-needs-never-exts", proc.stdout + proc.stderr)
+        self.assertIn("--set-never-ext", proc.stdout + proc.stderr)
+        self.assertEqual(decisions_tsv(self.home).read_text(), before)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_set_never_ext_completes_that_migration(self):
+        self._install(["--never-ext", ".cs"])
+        path = Path(self.claude_dir, "settings.local.json")
+        path.write_text(path.read_text().replace(
+            "MEMCONTINUUM_NEVER_EXTS='*.cs'",
+            "MEMCONTINUUM_NEVER_EXTS='/etc/passwd'"))
+        write_row(self.home, self.repo, "wired",
+                  note=f"store={self.store} project=nev")
+        proc = run(UPDATE_SH, ["--apply", "--repo", self.repo,
+                               "--claude-dir", self.claude_dir,
+                               "--set-never-ext", ".cs,.h"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        note = decisions_tsv(self.home).read_text().splitlines()[-1]
+        self.assertIn("never=.cs;.h", note, note)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_never_ext_keeps_its_one_additive_meaning(self):
+        """--never-ext adds to a row. It never doubled as "here is the whole
+        list for the migration" -- that is --set-never-ext. Combining it with
+        --apply is refused rather than quietly picking one of the two."""
+        self._install([])
+        write_row(self.home, self.repo, "wired",
+                  note=f"store={self.store} project=nev")
+        before = decisions_tsv(self.home).read_text()
+        proc = run(UPDATE_SH, ["--never-ext", ".h", "--apply", "--repo", self.repo],
+                   self.home)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("--set-never-ext", proc.stdout + proc.stderr)
         self.assertEqual(decisions_tsv(self.home).read_text(), before)
 
 
@@ -1165,31 +1202,79 @@ class TestRenderFingerprint(unittest.TestCase):
                         ignore=shutil.ignore_patterns(
                             ".git", "fixtures", "tests", "__pycache__", ".venv"))
 
-    def fingerprint(self, root=None):
+    def fingerprint(self, scope="repo", root=None):
         root = str(root or self.engine)
         proc = subprocess.run(
-            ["bash", "-c",
-             '. "$1"/scripts/mc-registry-lib.sh; mc_render_fingerprint "$1"; '
+            [MC_BASH, "-c",
+             '. "$1"/scripts/mc-registry-lib.sh; mc_render_fingerprint "$2" "$1"; '
              'printf "%s" "$MC_RENDER_FINGERPRINT"',
-             "_", root],
+             "_", root, scope],
             capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         return proc.stdout.strip()
 
     def test_it_is_twelve_hex_characters_and_stable(self):
-        fp = self.fingerprint()
-        self.assertRegex(fp, r"^[0-9a-f]{12}$", fp)
-        self.assertEqual(fp, self.fingerprint(), "must be deterministic")
+        for scope in ("repo", "machine"):
+            with self.subTest(scope=scope):
+                fp = self.fingerprint(scope)
+                self.assertRegex(fp, r"^[0-9a-f]{12}$", fp)
+                self.assertEqual(fp, self.fingerprint(scope), "must be deterministic")
+
+    def test_the_two_scopes_are_different_fingerprints(self):
+        self.assertNotEqual(self.fingerprint("repo"), self.fingerprint("machine"))
+
+    def test_an_unknown_scope_is_refused_rather_than_silently_hashing_something(self):
+        proc = subprocess.run(
+            [MC_BASH, "-c",
+             '. "$1"/scripts/mc-registry-lib.sh; mc_render_fingerprint bogus "$1"; '
+             'printf "%s" "$MC_RENDER_FINGERPRINT"',
+             "_", str(self.engine)],
+            capture_output=True, text=True)
+        self.assertEqual(proc.stdout.strip(), "unknown", proc.stdout + proc.stderr)
+
+    def test_a_machine_layer_input_does_not_move_the_repo_fingerprint(self):
+        """The whole point of the split. memcontinuum-setup.sh and the
+        machine-level skill copy render only into ~/.claude -- editing either
+        used to mark every PER-REPO row stale, whereupon --apply re-rendered
+        those repos to no effect and left the actual drift untouched."""
+        before = self.fingerprint("repo")
+        setup = self.engine / "memcontinuum-setup.sh"
+        setup.write_text(setup.read_text() + "\n# touched\n")
+        skill = self.engine / "skills" / "memcontinuum" / "SKILL.md"
+        skill.write_text(skill.read_text() + "\nextra line\n")
+        self.assertEqual(self.fingerprint("repo"), before)
+
+    def test_a_machine_layer_input_does_move_the_machine_fingerprint(self):
+        before = self.fingerprint("machine")
+        setup = self.engine / "memcontinuum-setup.sh"
+        setup.write_text(setup.read_text() + "\n# touched\n")
+        self.assertNotEqual(self.fingerprint("machine"), before)
+
+    def test_the_machine_level_skill_is_a_machine_input(self):
+        before = self.fingerprint("machine")
+        skill = self.engine / "skills" / "memcontinuum" / "SKILL.md"
+        skill.write_text(skill.read_text() + "\nextra line\n")
+        self.assertNotEqual(self.fingerprint("machine"), before)
+
+    def test_a_template_does_not_move_the_machine_fingerprint(self):
+        before = self.fingerprint("machine")
+        tmpl = self.engine / "templates" / "write-hooks.json.tmpl"
+        tmpl.write_text(tmpl.read_text() + "\n")
+        self.assertEqual(self.fingerprint("machine"), before)
 
     def test_a_hook_script_is_not_a_render_input(self):
         """Hook scripts execute by absolute path, so a pull updates them live
         in every wired repo. Nothing needs re-rendering, and nothing may be
         marked stale."""
-        before = self.fingerprint()
-        memlib = self.engine / "hooks" / "memlib.sh"
-        memlib.write_text(memlib.read_text() + "\n# touched\n")
-        self.assertEqual(self.fingerprint(), before,
+        before_repo = self.fingerprint("repo")
+        before_machine = self.fingerprint("machine")
+        for rel in ("hooks/memlib.sh", "hooks/memcontinuum-detect.sh"):
+            f = self.engine / rel
+            f.write_text(f.read_text() + "\n# touched\n")
+        self.assertEqual(self.fingerprint("repo"), before_repo,
                          "editing a hook script must not change the fingerprint")
+        self.assertEqual(self.fingerprint("machine"), before_machine,
+                         "the detector script executes by path too -- pulling it is live")
 
     def test_a_template_is_a_render_input(self):
         before = self.fingerprint()
@@ -1198,15 +1283,16 @@ class TestRenderFingerprint(unittest.TestCase):
         self.assertNotEqual(self.fingerprint(), before)
 
     def test_the_installer_and_the_merge_module_are_render_inputs(self):
-        for rel in ("scripts/repo-init.sh", "scripts/mc_settings_merge.py",
-                    "memcontinuum-setup.sh"):
+        # mc_settings_merge.py is in BOTH scopes: it is what actually lands
+        # the rendered blocks, per repo and into ~/.claude alike.
+        for rel in ("scripts/repo-init.sh", "scripts/mc_settings_merge.py"):
             with self.subTest(rel=rel):
                 engine2 = Path(self.tmp) / ("e-" + rel.replace("/", "_"))
                 shutil.copytree(self.engine, engine2, symlinks=True)
-                before = self.fingerprint(engine2)
+                before = self.fingerprint("repo", engine2)
                 f = engine2 / rel
                 f.write_text(f.read_text() + "\n# touched\n")
-                self.assertNotEqual(self.fingerprint(engine2), before, rel)
+                self.assertNotEqual(self.fingerprint("repo", engine2), before, rel)
 
     def test_a_copied_skill_is_a_render_input(self):
         before = self.fingerprint()
@@ -1249,15 +1335,102 @@ class TestRenderFingerprint(unittest.TestCase):
         self.assertEqual(act, "stale", "a template change must flip the repo stale\n" + out)
 
 
+class TestMachineLayerIsComparedSeparately(unittest.TestCase):
+    """`--machine` compares the MACHINE fingerprint against what the machine
+    layer was rendered with, so a setup.sh change shows up where it actually
+    applies -- and nowhere else."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-machine-test-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.engine = Path(self.tmp) / "engine"
+        shutil.copytree(TOOLS_DIR, self.engine, symlinks=True,
+                        ignore=shutil.ignore_patterns(
+                            ".git", "fixtures", "tests", "__pycache__", ".venv"))
+        self.home = str(Path(self.tmp) / "home")
+        os.makedirs(self.home, exist_ok=True)
+
+    def _setup(self):
+        proc = run(self.engine / "memcontinuum-setup.sh",
+                   ["--python", VENV_PYTHON, "--no-model-warm"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def _machine_line(self):
+        proc = run(self.engine / "scripts" / "memcontinuum-update.sh",
+                   ["--machine"], self.home)
+        for line in proc.stdout.splitlines():
+            if line.startswith("machine:"):
+                return line
+        return None
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_the_machine_hook_line_carries_the_machine_fingerprint(self):
+        self._setup()
+        settings = json.loads(Path(self.home, ".claude", "settings.json").read_text())
+        cmds = [h["command"] for g in settings["hooks"]["SessionStart"] for h in g["hooks"]]
+        detect = [c for c in cmds if "memcontinuum-detect.sh" in c]
+        self.assertTrue(detect, cmds)
+        self.assertIn("MEMCONTINUUM_RENDERED=%s " % engine_sha(self.engine, "machine"),
+                      detect[0], detect[0])
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_machine_reads_ok_then_stale_after_a_setup_edit(self):
+        self._setup()
+        line = self._machine_line()
+        self.assertIsNotNone(line)
+        self.assertIn("ok", line, line)
+
+        setup = self.engine / "memcontinuum-setup.sh"
+        setup.write_text(setup.read_text() + "\n# a machine-layer change\n")
+        line = self._machine_line()
+        self.assertIsNotNone(line)
+        self.assertIn("stale", line, line)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_a_template_edit_flips_the_repos_not_the_machine(self):
+        self._setup()
+        repo = git_repo(str(Path(self.tmp) / "repo"))
+        store = str(Path(self.tmp) / "store")
+        claude_dir = str(Path(repo) / ".claude")
+        proc = run(self.engine / "scripts" / "repo-init.sh",
+                   ["--project", "m", "--store", store, "--claude-dir", claude_dir,
+                    "--non-interactive"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        proc = run(self.engine / "scripts" / "memcontinuum-decide.sh",
+                   ["wired", "--repo", repo, "--store", store, "--project", "m",
+                    "--claude-dir", claude_dir], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+        def row_action():
+            p = run(self.engine / "scripts" / "memcontinuum-update.sh", [], self.home)
+            lines = [l for l in p.stdout.splitlines() if l.strip() and "\t" in l]
+            rows = [dict(zip(lines[0].split("\t"), l.split("\t"))) for l in lines[1:]]
+            return rows[0]["action"], p.stdout
+
+        self.assertEqual(row_action()[0], "ok")
+
+        setup = self.engine / "memcontinuum-setup.sh"
+        setup.write_text(setup.read_text() + "\n# a machine-layer change\n")
+        act, out = row_action()
+        self.assertEqual(act, "ok",
+                         "a machine-layer change must not mark per-repo rows stale\n" + out)
+        self.assertIn("stale", self._machine_line())
+
+        tmpl = self.engine / "templates" / "memcontinuum-rules.md"
+        tmpl.write_text(tmpl.read_text() + "\nA new paragraph.\n")
+        act, out = row_action()
+        self.assertEqual(act, "stale", out)
+
+
 class TestHelp(unittest.TestCase):
     def test_help_exits_zero_and_documents_the_flags(self):
-        proc = subprocess.run(["bash", str(UPDATE_SH), "--help"], capture_output=True, text=True)
+        proc = subprocess.run([MC_BASH, str(UPDATE_SH), "--help"], capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         for token in ("--dry-run", "--apply", "--machine", "--add-lang", "--never-ext", "--repo"):
             self.assertIn(token, proc.stdout, token)
 
     def test_bash_n(self):
-        proc = subprocess.run(["bash", "-n", str(UPDATE_SH)], capture_output=True, text=True)
+        proc = subprocess.run([MC_BASH, "-n", str(UPDATE_SH)], capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
 

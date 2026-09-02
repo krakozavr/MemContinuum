@@ -23,6 +23,10 @@ PY_CORPUS = TOOLS_DIR / "tests" / "fixtures" / "python_corpus"
 # This machine's venv python is never hardcoded in tracked test code -- set
 # $MEMCONTINUUM_PYTHON in your own (untracked) shell environment before
 # running this file; see README.md "Requirements" / "Running the tests".
+# Same seam tests/test_write_hooks.py uses: tests/run_bash32.sh points MC_BASH
+# at a real bash 3.2.57 binary. repo-init.sh shells out to
+# memcontinuum-decide.sh through "$BASH", so that nested call follows.
+MC_BASH = os.environ.get("MC_BASH", "bash")
 VENV_PYTHON = os.environ.get("MEMCONTINUUM_PYTHON", "")
 _SKIP_NO_VENV = (
     "set $MEMCONTINUUM_PYTHON to a venv python with fastembed/PyYAML "
@@ -64,7 +68,7 @@ def run_install(args, home, timeout=60, python=VENV_PYTHON, extra_env=None, cwd=
     if extra_env:
         env.update(extra_env)
     proc = subprocess.run(
-        ["bash", str(INSTALL_SH)] + args,
+        [MC_BASH, str(INSTALL_SH)] + args,
         capture_output=True,
         text=True,
         env=env,
@@ -104,7 +108,7 @@ def run_install_at(install_sh, args, home, path_prepend=None, timeout=60, python
     if extra_env:
         env.update(extra_env)
     proc = subprocess.run(
-        ["bash", str(install_sh)] + args,
+        [MC_BASH, str(install_sh)] + args,
         capture_output=True,
         text=True,
         env=env,
@@ -172,7 +176,7 @@ def write_python_shim(path, target=VENV_PYTHON):
 
 class TestBashSyntax(unittest.TestCase):
     def test_bash_n(self):
-        proc = subprocess.run(["bash", "-n", str(INSTALL_SH)], capture_output=True, text=True)
+        proc = subprocess.run([MC_BASH, "-n", str(INSTALL_SH)], capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
 
@@ -387,8 +391,8 @@ class TestFreshInstall(unittest.TestCase):
         that computes it (mc_render_fingerprint) -- a test that re-derives it
         would only prove the two copies agree."""
         return subprocess.run(
-            ["bash", "-c",
-             '. "$1"/scripts/mc-registry-lib.sh; mc_render_fingerprint "$1"; '
+            [MC_BASH, "-c",
+             '. "$1"/scripts/mc-registry-lib.sh; mc_render_fingerprint repo "$1"; '
              'printf "%s" "$MC_RENDER_FINGERPRINT"',
              "_", str(TOOLS_DIR)],
             capture_output=True, text=True, check=True,

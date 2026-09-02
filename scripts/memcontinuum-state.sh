@@ -204,7 +204,7 @@ if [ "$FOUND" -eq 1 ]; then
         mc_command_env_value "$MC_WIRED_COMMAND" "MEMCONTINUUM_RENDERED"
         rendered="${MC_ENV_VALUE:-unknown}"
         engine_dir="${MEMCONTINUUM_ENGINE:-$SCRIPT_DIR/..}"
-        mc_render_fingerprint "$engine_dir" || :
+        mc_render_fingerprint repo "$engine_dir" || :
         engine_sha="$MC_RENDER_FINGERPRINT"
         if [ "$rendered" != "$engine_sha" ]; then
             echo "update: wiring rendered by $rendered, engine at $engine_sha -- run scripts/memcontinuum-update.sh"

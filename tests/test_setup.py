@@ -133,7 +133,11 @@ class TestBootstrapInstall(BootstrapCase):
         about whether the installed line actually runs)."""
         self.assertEqual(self.bootstrap().returncode, 0)
         (cmd,) = self.our_commands()
-        self.assertEqual(cmd, f"bash '{DETECT_SH}'")
+        # One env token in front: the MACHINE render fingerprint, so
+        # memcontinuum-update.sh --machine can tell whether what is installed
+        # in ~/.claude is still current. Everything after it is unchanged.
+        self.assertRegex(cmd, r"^MEMCONTINUUM_RENDERED=[0-9a-f]{12} bash '")
+        self.assertTrue(cmd.endswith(f"bash '{DETECT_SH}'"), cmd)
         self.assertNotIn("MEMCONTINUUM_HOME=", cmd)
 
     def test_silent_when_the_shared_lib_is_missing(self):
@@ -837,8 +841,8 @@ class TestDecisionRegistry(BootstrapCase):
         that computes it (mc_render_fingerprint) -- a test that re-derives it
         would only prove the two copies agree."""
         return subprocess.run(
-            ["bash", "-c",
-             '. "$1"/scripts/mc-registry-lib.sh; mc_render_fingerprint "$1"; '
+            [MC_BASH, "-c",
+             '. "$1"/scripts/mc-registry-lib.sh; mc_render_fingerprint repo "$1"; '
              'printf "%s" "$MC_RENDER_FINGERPRINT"',
              "_", str(TOOLS_DIR)],
             capture_output=True, text=True, check=True,

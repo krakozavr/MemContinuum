@@ -331,6 +331,11 @@ installer, the skill copies — so pulling a change to a hook script leaves
 every repository reading as current, and changing a template flips exactly the
 repositories that need re-rendering.
 
+The machine-wide pieces (the detector, the skill in your own `~/.claude`) are
+tracked the same way but separately, under `--machine`: a change there is
+reported where the one command that fixes it applies, rather than as drift in
+every repository you have ever wired.
+
 Run `memcontinuum-update.sh` with no flags and it only prints a table: one line
 per repository and claude-dir, saying what is current, what has drifted, and
 what it will not touch. `--apply` does the work. It can re-render wiring; it

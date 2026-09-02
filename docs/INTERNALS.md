@@ -314,24 +314,40 @@ distinction this command exists to draw, drawn wrong. Hashing the inputs draws
 it: a scripts-only commit leaves every repo `ok`; a template or installer
 change flips them `stale`.
 
-`mc_render_fingerprint ENGINE_ROOT` (`mc-registry-lib.sh`) is the one function
-that computes it — used by `repo-init.sh` when it renders, by
-`memcontinuum-update.sh` when it compares, and by `memcontinuum-state.sh` for
-its hint. It is 12 hex characters of a `sha256sum` (falling back to
-`shasum -a 256`) over these inputs, in this fixed order, each preceded by its
-path relative to the checkout so that adding, removing or renaming one counts
-as a change:
+**There are two fingerprints, one per layer.** The per-repo wiring and the
+machine layer are re-rendered by different commands, and a repository has no
+way to act on the other one's drift. With a single combined fingerprint, an
+edit to `memcontinuum-setup.sh` marked every *per-repo* row `stale`, and
+`--apply` then re-rendered all of them to no effect while leaving the drift
+that actually existed — in `~/.claude` — untouched.
 
-| input | why |
-|---|---|
-| `scripts/repo-init.sh` | does the rendering |
-| `scripts/mc_settings_merge.py` | decides how rendered blocks land |
-| `memcontinuum-setup.sh` | renders the machine layer's own pieces |
-| `templates/*` | everything rendered from a template |
-| `skills/*/SKILL.md` | the skill copies installed into a repo |
+`mc_render_fingerprint SCOPE ENGINE_ROOT` (`mc-registry-lib.sh`) is the one
+function that computes both. `SCOPE` is `repo` or `machine`; anything else
+returns `unknown` rather than quietly hashing something. It is 12 hex
+characters of a `sha256sum` (falling back to `shasum -a 256`) over the scope's
+inputs in a fixed order, each preceded by its path relative to the checkout so
+that adding, removing or renaming one counts as a change.
 
-`hooks/*.sh` are deliberately **not** inputs: they are executed by path, so
-pulling updates them live. `LC_ALL=C` is set around the globs so the file
+| scope | input | why |
+|---|---|---|
+| `repo` | `scripts/repo-init.sh` | does the per-repo rendering |
+| `repo` | `templates/*` | everything rendered from a template |
+| `repo` | `skills/memory-search/SKILL.md` | the skill copied into a project |
+| `machine` | `memcontinuum-setup.sh` | renders the detector hook line and `config.sh`, both templated inside it |
+| `machine` | `skills/memcontinuum/SKILL.md` | the skill copied to the user level |
+| both | `scripts/mc_settings_merge.py` | lands the rendered blocks, per repo and machine-wide alike |
+
+Who uses which: `repo-init.sh` stamps with `repo`; `memcontinuum-update.sh`
+compares each registry row against `repo` and, under `--machine`, the
+`~/.claude` detector entry against `machine`; `memcontinuum-state.sh`'s
+per-repo hint uses `repo`. `memcontinuum-setup.sh` renders
+`MEMCONTINUUM_RENDERED=<machine fingerprint>` onto the one hook line it
+installs — that is what `--machine` reads back.
+
+`hooks/*.sh` are deliberately **not** inputs in either scope: they are
+executed by path, so pulling updates them live. That includes
+`hooks/memcontinuum-detect.sh` — the machine layer renders a hook *line*
+naming it, never a copy of it. `LC_ALL=C` is set around the globs so the file
 order is byte-ordered and a checkout fingerprints identically on every
 machine. The literal `unknown` when no sha256 tool is available or the
 checkout is incomplete — read downstream as "cannot tell, re-render to find
@@ -440,7 +456,15 @@ re-render replays, so a value invented here would be permanent:
   project that had it on. Pass `--langs LIST`. (An explicitly empty
   `MEMCONTINUUM_LANG_EXTS=''` is a recorded answer and migrates without one.)
 - **`migrate-needs-never-exts`** — the rendered never-mention list is not a
-  plain extension list (hand-edited). Pass `--never-ext LIST`.
+  plain extension list (hand-edited). Pass `--set-never-ext LIST`.
+
+`--set-never-ext` is the migration's own spelling, deliberately not
+`--never-ext`. `--never-ext` ADDS one extension to a row that already has its
+parameters recorded, and it has no second meaning: an earlier round let
+`--apply` silently change what the same flag *meant*, which is the kind of
+quiet reinterpretation a command that writes a registry must not do.
+Combining `--add-lang`/`--never-ext` with `--apply` is refused, with both
+spellings named in the error.
 
 Each named `--claude-dir` must already carry this project's wiring: the
 migration *records* what is installed and never wires a directory from
@@ -463,9 +487,13 @@ anything is touched at all — `repo-init.sh` validates `--langs` too, but only
 when the install has a `--code-root` to wire it into, so a code-root-less row
 would otherwise sail past that check.
 
-`--machine` (with `--apply`) also re-runs `memcontinuum-setup.sh` once, to
-refresh the machine-level detector hook and the user-level skill copy — off
-by default, since most drift is per-repo.
+`--machine` reports the machine layer as one extra line
+(`machine: rendered by X, engine at Y -- ok|stale`), comparing the `machine`
+fingerprint against the stamp on the `~/.claude` detector entry. With
+`--apply` it re-runs `memcontinuum-setup.sh`, but only when that comparison
+says `stale`. Off by default, since most drift is per-repo — and a missing
+registry no longer skips it, because a machine can perfectly well have its
+own layer installed before any repository is wired.
 
 `memcontinuum-state.sh` stays python-free and prints one extra line,
 `update: wiring rendered by X, engine at Y -- run scripts/memcontinuum-update.sh`,

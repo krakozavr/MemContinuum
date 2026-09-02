@@ -45,6 +45,12 @@ SKILL_SRC="$ENGINE_ROOT/skills/memory-search/SKILL.md"
 # shellcheck source=./mc-registry-lib.sh
 . "$SCRIPT_DIR/mc-registry-lib.sh" || { echo "ERROR: missing $SCRIPT_DIR/mc-registry-lib.sh -- incomplete checkout" >&2; exit 1; }
 
+# The bash running THIS script, for the one script it shells out to (see
+# scripts/memcontinuum-update.sh for the same note): `bash` off PATH would
+# hop interpreters mid-install, which is what kept the bash 3.2 harness from
+# reaching any of these scripts.
+MC_BASH_BIN="${BASH:-bash}"
+
 OUR_HOOK_SCRIPTS="pre-edit-chain.sh newfile-nudge.sh ledger-post-edit.sh precompact-persist.sh sessionstart-remind.sh userprompt-remind.sh sessionend-stamp.sh"
 
 # The stamp that goes onto every hook line, the rules file, and the installed
@@ -62,7 +68,7 @@ OUR_HOOK_SCRIPTS="pre-edit-chain.sh newfile-nudge.sh ledger-post-edit.sh precomp
 # be computed at all (no sha256 tool, an incomplete checkout); an
 # absent/unknown stamp reads as "re-render to find out" downstream, never as
 # an error here.
-mc_render_fingerprint "$ENGINE_ROOT" || :
+mc_render_fingerprint repo "$ENGINE_ROOT" || :
 RENDERED_SHA="$MC_RENDER_FINGERPRINT"
 
 PROJECT=""
@@ -1482,7 +1488,7 @@ if [ "$DRY_RUN" -eq 0 ] && [ "$RECORD_DECISION" -eq 1 ]; then
                     "$(printf '%s' "$RD_LANGS" | tr ';' ',')" \
                     "$(printf '%s' "$RD_NEVER" | tr ';' ',')"
                 RD_ARGS+=(${MC_BUILT_ARGS[@]+"${MC_BUILT_ARGS[@]}"})
-                if bash "$SCRIPT_DIR/memcontinuum-decide.sh" "${RD_ARGS[@]}"; then
+                if "$MC_BASH_BIN" "$SCRIPT_DIR/memcontinuum-decide.sh" "${RD_ARGS[@]}"; then
                     echo "decision recorded: $RD_KEY wired"
                 else
                     echo "note: --record-decision given but recording failed (see above) -- the install itself still succeeded" >&2

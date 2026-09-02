@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # usage: memcontinuum-update.sh [--dry-run | --apply] [--machine] [--repo PATH]
 #        memcontinuum-update.sh --apply --repo PATH --claude-dir DIR [--claude-dir DIR ...]
-#                               [--langs LIST] [--never-ext LIST]
+#                               [--langs LIST] [--set-never-ext LIST]
 #        memcontinuum-update.sh --add-lang LANG [--never-ext .ext] --repo PATH
 #        memcontinuum-update.sh --never-ext .ext [--add-lang LANG] --repo PATH
 #
@@ -20,7 +20,8 @@
 #     claude-dir   one claude-dir this row lists (or recovers -- see below)
 #     stamped      the MEMCONTINUUM_RENDERED value on this claude-dir's
 #                  rendered hook lines ("none" = pre-stamp render)
-#     engine       this engine checkout's current short sha
+#     engine       what this checkout would render right now: the REPO render
+#                  fingerprint (see --machine for the other one)
 #     store-match  yes/no/unknown -- the row's own store= vs the rendered
 #                  MEMCONTINUUM_ROOT on those hook lines (a stamp match alone
 #                  cannot catch a store renamed under the same engine
@@ -28,7 +29,8 @@
 #     rules        ok/stale/missing/foreign -- <claude-dir>/rules/
 #                  memcontinuum.md's own identity marker and stamp
 #     action       ok | stale | store-mismatch | rules-stale | rules-missing
-#                  | rules-foreign | migrate | migrate-needs-never-exts |
+#                  | rules-foreign | migrate | migrate-needs-claude-dirs |
+#                  migrate-needs-langs | migrate-needs-never-exts |
 #                  store-missing | no-wiring | unrecoverable
 #
 #                  store-missing outranks every other answer, including a
@@ -51,9 +53,15 @@
 # --repo PATH
 #            narrows the walk to that one repository's row. Required
 #            alongside the migration options below (they describe ONE row).
-# --machine  also re-runs memcontinuum-setup.sh once, to refresh the
-#            machine-level detector hook and skill copy. Off by default --
-#            most updates are per-repo; the machine layer rarely drifts.
+# --machine  also report the MACHINE layer -- the detector hook and skill
+#            copy in ~/.claude, which memcontinuum-setup.sh renders and no
+#            per-repo install touches. It is compared against its own
+#            fingerprint, over its own inputs (memcontinuum-setup.sh, the
+#            machine-level skill, the settings merge), so an edit to any of
+#            those shows up HERE and not as drift in every repository -- and a
+#            template change shows up in the rows and not here. With --apply,
+#            re-runs memcontinuum-setup.sh, but only when it is actually
+#            stale. Off by default -- most drift is per-repo.
 #
 # MIGRATING A ROW WRITTEN BEFORE THE REGISTRY RECORDED WIRING PARAMETERS
 #
@@ -71,7 +79,7 @@
 #       written onto the hook line, so it cannot be read back -- unknown,
 #       not "none". Add --langs LANG[,LANG].
 #   migrate-needs-never-exts    the never-mention list on the hook line is
-#       not a plain extension list. Add --never-ext .ext[,.ext].
+#       not a plain extension list. Add --set-never-ext .ext[,.ext].
 #   migrate                     everything needed is on record or recovered;
 #       --apply re-renders, and only then rewrites the row (via
 #       memcontinuum-decide.sh wired) to carry the parameters from now on.
@@ -97,10 +105,10 @@
 #            The row is rewritten only AFTER every claude-dir has
 #            re-rendered successfully, and an unknown language is refused
 #            before anything is touched at all.
-#            (--apply is what tells the two modes apart: the same
-#            --never-ext spelling means "add this to the row" on its own,
-#            and "here is the whole list for the row you are migrating"
-#            under --apply.)
+#            --never-ext ADDS; it has no second meaning. Supplying the whole
+#            list for a migration is --set-never-ext, above. Combining
+#            --add-lang or --never-ext with --apply is refused rather than
+#            guessed at.
 #
 # This command never wires an undecided or declined repo (it only ever
 # touches rows already marked `wired`), and never creates a store: every
@@ -133,6 +141,13 @@ REPO_INIT="$SCRIPT_DIR/repo-init.sh"
 DECIDE="$SCRIPT_DIR/memcontinuum-decide.sh"
 SETUP="$ENGINE_ROOT/memcontinuum-setup.sh"
 
+# The bash that is running THIS script, for the scripts it shells out to.
+# `bash` off PATH would silently hop interpreters mid-command -- which is
+# exactly what made the bash-3.2 harness unable to reach any of this: it
+# launches the entry point under a real 3.2.57 binary, and every nested call
+# went straight back to the system's bash 5.
+MC_BASH_BIN="${BASH:-bash}"
+
 # shellcheck source=./mc-registry-lib.sh
 . "$SCRIPT_DIR/mc-registry-lib.sh" || { echo "missing $SCRIPT_DIR/mc-registry-lib.sh -- incomplete checkout" >&2; exit 1; }
 
@@ -152,7 +167,7 @@ DECISIONS="$MEMCONTINUUM_HOME/decisions.tsv"
 # rather than against the engine's HEAD commit, is what makes "a scripts-only
 # fix needs nothing, a rendered-artifact fix needs a re-render" a distinction
 # this table can actually draw.
-mc_render_fingerprint "$ENGINE_ROOT" || :
+mc_render_fingerprint repo "$ENGINE_ROOT" || :
 ENGINE_SHA="$MC_RENDER_FINGERPRINT"
 
 # From the template that defines it, not a copy (mc_rules_identity_marker):
@@ -176,6 +191,8 @@ MACHINE=0
 ADD_LANG=""
 NEVER_EXT=""
 LANGS_FLAG=""
+SET_NEVER_EXT=""
+SET_NEVER_GIVEN=0
 TARGET_REPO=""
 declare -a OVERRIDE_CLAUDE_DIRS=()
 need_value() { [ $# -ge 2 ] || { echo "missing value for $1" >&2; exit 2; }; }
@@ -187,6 +204,7 @@ while [ $# -gt 0 ]; do
         --add-lang) need_value "$@"; ADD_LANG="$2"; shift 2 ;;
         --never-ext) need_value "$@"; NEVER_EXT="$2"; shift 2 ;;
         --langs) need_value "$@"; LANGS_FLAG="$2"; shift 2 ;;
+        --set-never-ext) need_value "$@"; SET_NEVER_EXT="$2"; SET_NEVER_GIVEN=1; shift 2 ;;
         --claude-dir) need_value "$@"; OVERRIDE_CLAUDE_DIRS+=("$2"); shift 2 ;;
         --repo) need_value "$@"; TARGET_REPO="$2"; shift 2 ;;
         -h|--help) usage 0 ;;
@@ -203,26 +221,36 @@ done
 # you are migrating, because it could not be read back". Splitting them on
 # --apply keeps each spelling doing one thing.
 TARGETED=0
-if [ -n "$ADD_LANG" ]; then
-    if [ "$APPLY" -eq 1 ]; then
-        echo "--add-lang is not a walk-mode option: it adds one language to ONE row (which is why it takes --repo), and --apply re-renders every row. Drop --apply -- typing --add-lang is itself the consent to write." >&2
-        exit 2
-    fi
+if [ -n "$ADD_LANG" ] || [ -n "$NEVER_EXT" ]; then
     TARGETED=1
-elif [ -n "$NEVER_EXT" ] && [ "$APPLY" -eq 0 ]; then
-    TARGETED=1
+fi
+
+# --add-lang/--never-ext ADD to one row; the walk re-renders every row. They
+# are not two readings of one command, and this refuses rather than picking
+# one: an earlier version let --apply silently change what --never-ext MEANT
+# (additive on its own, "the whole list" under --apply), which is exactly the
+# kind of quiet reinterpretation a command that writes a registry must not do.
+# The migration's own spellings are --langs and --set-never-ext.
+if [ "$TARGETED" -eq 1 ] && [ "$APPLY" -eq 1 ]; then
+    echo "--add-lang/--never-ext add to ONE row (which is why they take --repo); --apply re-renders every row. They cannot be combined." >&2
+    echo "  to ADD a language or extension:  memcontinuum-update.sh --add-lang LANG --repo PATH   (typing it is the consent; no --apply needed)" >&2
+    echo "  to supply the whole never-list while migrating a legacy row: --apply --repo PATH --claude-dir DIR --set-never-ext LIST" >&2
+    exit 2
 fi
 
 if [ "$TARGETED" -eq 0 ]; then
     # Migration overrides are per-row by nature -- a claude-dir set or a
     # language list belongs to ONE project. With several legacy rows on the
     # machine and no --repo, there would be no saying which row they meant.
-    if [ "${#OVERRIDE_CLAUDE_DIRS[@]}" -gt 0 ] || [ -n "$LANGS_FLAG" ] || [ -n "$NEVER_EXT" ]; then
+    if [ "${#OVERRIDE_CLAUDE_DIRS[@]}" -gt 0 ] || [ -n "$LANGS_FLAG" ] || [ "$SET_NEVER_GIVEN" -eq 1 ]; then
         [ -n "$TARGET_REPO" ] || {
-            echo "--claude-dir/--langs/--never-ext describe ONE registry row, so they need --repo PATH to say which. (Without --repo this command walks every wired row and writes nothing it had to guess.)" >&2
+            echo "--claude-dir/--langs/--set-never-ext describe ONE registry row, so they need --repo PATH to say which. (Without --repo this command walks every wired row and writes nothing it had to guess.)" >&2
             exit 2
         }
     fi
+elif [ "$SET_NEVER_GIVEN" -eq 1 ]; then
+    echo "--set-never-ext supplies the whole never-list for a legacy row's MIGRATION (--apply --repo PATH --claude-dir DIR --set-never-ext LIST). To add one extension to a row that already has its parameters recorded, use --never-ext." >&2
+    exit 2
 fi
 
 # --- python resolution (only needed for legacy-row lang recovery below) ---
@@ -628,7 +656,7 @@ apply_claude_dir() {
     args+=(${MC_BUILT_ARGS[@]+"${MC_BUILT_ARGS[@]}"})
 
     echo "  applying: bash $REPO_INIT ${args[*]}"
-    if bash "$REPO_INIT" "${args[@]}" >"$SBOX_APPLY_LOG" 2>&1; then
+    if "$MC_BASH_BIN" "$REPO_INIT" "${args[@]}" >"$SBOX_APPLY_LOG" 2>&1; then
         echo "  OK $claude_dir"
     else
         local rc=$?
@@ -773,7 +801,7 @@ PYEOF
     for d in ${TARGET_CLAUDE_DIRS[@]+"${TARGET_CLAUDE_DIRS[@]}"}; do
         REINIT_ARGS=(--project "$PROJECT" --store "$STORE" --claude-dir "$d" --non-interactive --adopt-only)
         REINIT_ARGS+=(${WIRING_ARGS[@]+"${WIRING_ARGS[@]}"})
-        if ! bash "$REPO_INIT" "${REINIT_ARGS[@]}"; then
+        if ! "$MC_BASH_BIN" "$REPO_INIT" "${REINIT_ARGS[@]}"; then
             echo "ERROR: re-render failed for $d -- see above" >&2
             RC=1
         fi
@@ -783,7 +811,7 @@ PYEOF
         exit 1
     fi
 
-    if ! bash "$DECIDE" "${DECIDE_ARGS[@]}"; then
+    if ! "$MC_BASH_BIN" "$DECIDE" "${DECIDE_ARGS[@]}"; then
         echo "ERROR: the re-render succeeded but the registry row could not be rewritten -- see above. Re-run this command to try the row again." >&2
         exit 1
     fi
@@ -792,9 +820,13 @@ fi
 
 # --- default mode: walk every wired row -------------------------------
 
+# No registry is not an error, and it is not a reason to skip --machine
+# either: the machine layer can perfectly well be installed on a machine where
+# no repository has been wired yet -- that is what a fresh setup looks like.
+DECISIONS_SRC="$DECISIONS"
 [ -f "$DECISIONS" ] || {
     echo "no registry at $DECISIONS -- nothing wired yet (run memcontinuum-setup.sh, then the memcontinuum skill)"
-    exit 0
+    DECISIONS_SRC=/dev/null
 }
 
 MIGRATE_HINTS=""
@@ -893,7 +925,7 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
         # Command-line overrides win over anything recovered -- they are the
         # human's answer to exactly the question the recovery could not.
         [ -n "$LANGS_FLAG" ] && LANGS_COMMA="$LANGS_FLAG"
-        [ -n "$NEVER_EXT" ] && NEVER_COMMA="$NEVER_EXT"
+        [ "$SET_NEVER_GIVEN" -eq 1 ] && NEVER_COMMA="$SET_NEVER_EXT"
 
         # Anything the rendered extension list carries that the recovered
         # language set does not account for is said out loud, under the row it
@@ -917,10 +949,10 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
             LEGACY_ACTION="migrate-needs-langs"
             MIGRATE_BLOCKED_HINT="the wiring at $FIRST_CLAUDE_DIR was rendered before the language set was written onto the hook line, so which languages this project indexes cannot be read back. That is UNKNOWN, not none -- recording it as none would turn code indexing off for a project that had it on. Name the set and re-run:
     $0 --apply --repo $KEY --claude-dir $FIRST_CLAUDE_DIR --langs LANG[,LANG]"
-        elif [ "$MC_RECOVERED_NEVER_OK" -eq 0 ] && [ -z "$NEVER_EXT" ]; then
+        elif [ "$MC_RECOVERED_NEVER_OK" -eq 0 ] && [ "$SET_NEVER_GIVEN" -eq 0 ]; then
             LEGACY_ACTION="migrate-needs-never-exts"
             MIGRATE_BLOCKED_HINT="the never-mention list rendered at $FIRST_CLAUDE_DIR is not a plain extension list, so it cannot be read back. Name it and re-run:
-    $0 --apply --repo $KEY --claude-dir $FIRST_CLAUDE_DIR --never-ext .ext[,.ext]"
+    $0 --apply --repo $KEY --claude-dir $FIRST_CLAUDE_DIR --set-never-ext .ext[,.ext]"
         fi
 
         # A named claude-dir must ALREADY carry this project's wiring. This
@@ -954,7 +986,7 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
         # KEY is a path here (the only LEGACY branch that reaches this point
         # -- the remote-keyed one `continue`d above), so `--repo "$KEY"` is
         # safe: decide.sh re-derives the very same key from it.
-        if bash "$DECIDE" "${MIGRATE_ARGS[@]}" >/dev/null 2>&1; then
+        if "$MC_BASH_BIN" "$DECIDE" "${MIGRATE_ARGS[@]}" >/dev/null 2>&1; then
             echo "  migrated: $KEY registry row now records claude-dirs/code-roots/langs/never" >&2
         else
             not_applied "  MIGRATE FAILED: $KEY -- registry row left as-is, re-render still applied above if it succeeded"
@@ -971,7 +1003,7 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
   $KEY: run with --apply to migrate this row to the new registry format"
         fi
     fi
-done < "$DECISIONS"
+done < "$DECISIONS_SRC"
 
 if [ -n "$MIGRATE_HINTS" ]; then
     echo >&2
@@ -979,16 +1011,45 @@ if [ -n "$MIGRATE_HINTS" ]; then
     printf '%s\n' "$MIGRATE_HINTS" >&2
 fi
 
-if [ "$APPLY" -eq 1 ] && [ "$MACHINE" -eq 1 ]; then
-    echo
-    echo "refreshing machine layer: bash $SETUP"
-    PY="$(mc_update_resolve_python)" || PY=""
-    SETUP_ARGS=(--no-model-warm)
-    [ -n "$PY" ] && SETUP_ARGS=(--python "$PY" --no-model-warm)
-    if bash "$SETUP" "${SETUP_ARGS[@]}"; then
-        echo "OK: machine layer refreshed"
+# --- the machine layer, compared against its OWN fingerprint ---------------
+#
+# Separate from every row above, because it is a separate layer: the detector
+# hook and the user-level skill live in ~/.claude and are re-rendered by
+# memcontinuum-setup.sh, not by any per-repo install. Comparing it against the
+# repo fingerprint would report a template change as machine drift and an edit
+# to memcontinuum-setup.sh as drift in every repository -- neither of which
+# the reported command would fix.
+if [ "$MACHINE" -eq 1 ]; then
+    mc_render_fingerprint machine "$ENGINE_ROOT" || :
+    MACHINE_ENGINE="$MC_RENDER_FINGERPRINT"
+    MACHINE_STAMP="none"
+    if mc_first_command_matching "memcontinuum-detect.sh" \
+            "$HOME/.claude/settings.json" "$HOME/.claude/settings.local.json"; then
+        mc_command_env_value "$MC_WIRED_COMMAND" "MEMCONTINUUM_RENDERED"
+        [ -n "$MC_ENV_VALUE" ] && MACHINE_STAMP="$MC_ENV_VALUE"
+    fi
+    if [ "$MACHINE_STAMP" = "$MACHINE_ENGINE" ]; then
+        MACHINE_ACTION="ok"
     else
-        not_applied "FAILED: machine layer refresh -- see above"
+        MACHINE_ACTION="stale"
+    fi
+    echo
+    echo "machine: rendered by $MACHINE_STAMP, engine at $MACHINE_ENGINE -- $MACHINE_ACTION"
+
+    if [ "$APPLY" -eq 1 ]; then
+        if [ "$MACHINE_ACTION" = "ok" ]; then
+            echo "machine layer already current -- nothing to refresh"
+        else
+            echo "refreshing machine layer: $MC_BASH_BIN $SETUP"
+            PY="$(mc_update_resolve_python)" || PY=""
+            SETUP_ARGS=(--no-model-warm)
+            [ -n "$PY" ] && SETUP_ARGS=(--python "$PY" --no-model-warm)
+            if "$MC_BASH_BIN" "$SETUP" "${SETUP_ARGS[@]}"; then
+                echo "OK: machine layer refreshed"
+            else
+                not_applied "FAILED: machine layer refresh -- see above"
+            fi
+        fi
     fi
 fi
 

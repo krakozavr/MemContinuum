@@ -59,6 +59,13 @@ CONFIG="$MEMCONTINUUM_HOME/config.sh"
 POINTER_CONFIG="$DEFAULT_MEMCONTINUUM_HOME/config.sh"
 DETECT_HOOK="$SCRIPT_DIR/hooks/memcontinuum-detect.sh"
 SKILL_SRC="$SCRIPT_DIR/skills/memcontinuum/SKILL.md"
+# Sourced for mc_render_fingerprint only (the library defines functions and
+# nothing else when sourced). The completeness of this checkout is checked
+# properly further down, alongside the other required files; a missing library
+# here just means the machine layer renders with an "unknown" stamp, which
+# reads downstream as "cannot tell, re-render to find out".
+# shellcheck source=scripts/mc-registry-lib.sh
+. "$SCRIPT_DIR/scripts/mc-registry-lib.sh" 2>/dev/null || MC_RENDER_FINGERPRINT="unknown"
 
 VENV_DIR=""
 PYTHON_BIN=""
@@ -141,7 +148,19 @@ sh_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 # used to disagree with whatever decide.sh/state.sh resolved on their own --
 # two registries, silently. The detector now resolves it itself, the same
 # way, via scripts/mc-registry-lib.sh mc_resolve_home.
-HOOK_CMD="bash $(sh_quote "$DETECT_HOOK")"
+# The MACHINE render fingerprint, on the one hook line this layer renders --
+# the same idea scripts/repo-init.sh stamps its per-repo lines with, and the
+# only way scripts/memcontinuum-update.sh --machine can tell whether what is
+# installed in ~/.claude is still current. It is the MACHINE scope
+# deliberately: this layer is re-rendered by a different command than a
+# repository's wiring, and a template change (which no per-machine re-run
+# would fix) must not show up here, any more than an edit to this file should
+# mark every wired repository stale. `unknown` when it cannot be computed --
+# read as "re-render to find out", never as an error.
+if command -v mc_render_fingerprint >/dev/null 2>&1; then
+    mc_render_fingerprint machine "$SCRIPT_DIR" || :
+fi
+HOOK_CMD="MEMCONTINUUM_RENDERED=${MC_RENDER_FINGERPRINT:-unknown} bash $(sh_quote "$DETECT_HOOK")"
 
 # ---------------------------------------------------------------------------
 # Uninstall: user-level pieces only. A venv is shared with anything else that

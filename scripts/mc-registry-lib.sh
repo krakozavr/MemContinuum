@@ -158,6 +158,35 @@ mc_first_wired_command() {
     return 1
 }
 
+# mc_first_command_matching NEEDLE SETTINGS_FILE...
+#
+# The first "command" line across the given settings files that contains
+# NEEDLE. Deliberately not scoped to MC_HOOK_BASENAMES or to a project: the
+# machine layer has exactly ONE entry, identified by the detector script's
+# basename appearing in its command (the same bare-needle identity
+# memcontinuum-setup.sh's own merge uses), and it belongs to no project.
+# Sets MC_WIRED_COMMAND / MC_WIRED_SETTINGS_FILE and returns 0 on a match;
+# clears both and returns 1 otherwise.
+mc_first_command_matching() {
+    local needle="$1" settings line
+    shift
+    MC_WIRED_COMMAND=""
+    MC_WIRED_SETTINGS_FILE=""
+    for settings in "$@"; do
+        [ -f "$settings" ] || continue
+        while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+                *"$needle"*)
+                    MC_WIRED_COMMAND="$line"
+                    MC_WIRED_SETTINGS_FILE="$settings"
+                    return 0
+                    ;;
+            esac
+        done < <(grep '"command"' "$settings" 2>/dev/null)
+    done
+    return 1
+}
+
 # mc_wired_command_for_project PROJECT SETTINGS_FILE...
 #
 # Like mc_first_wired_command, but scoped to entries carrying an
@@ -478,7 +507,7 @@ mc_rules_identity_marker() {
     [ -n "$MC_RULES_MARKER" ]
 }
 
-# mc_render_fingerprint ENGINE_ROOT
+# mc_render_fingerprint SCOPE ENGINE_ROOT   (SCOPE: repo | machine)
 #
 # The stamp every rendered artifact carries: 12 hex characters of a sha256
 # over this checkout's RENDER INPUTS. Sets MC_RENDER_FINGERPRINT and returns
@@ -504,20 +533,42 @@ mc_rules_identity_marker() {
 # flips them `stale`.
 #
 # Hook SCRIPTS are deliberately NOT inputs -- they are executed by path, and
-# pulling updates them live.
+# pulling updates them live. That includes hooks/memcontinuum-detect.sh: the
+# machine layer renders a hook LINE naming it, not a copy of it.
 #
-# Inputs, in a fixed order, each preceded by its path relative to the
-# checkout (so adding, removing or renaming one changes the fingerprint even
-# when the bytes elsewhere are identical):
-#   scripts/repo-init.sh          -- does the rendering
-#   scripts/mc_settings_merge.py  -- decides how rendered blocks land
-#   memcontinuum-setup.sh         -- renders the machine layer's own pieces
-#   templates/*                   -- everything rendered from a template
-#   skills/*/SKILL.md             -- the skill copies installed into a repo
+# TWO SCOPES, because the two layers are re-rendered by different commands and
+# a repository has no way to act on the other one's drift. A change to
+# memcontinuum-setup.sh or the machine-level skill affects only what lives in
+# ~/.claude; with one combined fingerprint it marked every PER-REPO row
+# `stale`, and `--apply` then re-rendered all of them to no effect while
+# leaving the drift that actually existed untouched.
+#
+#   repo     what scripts/repo-init.sh renders into a project's claude-dir
+#     scripts/repo-init.sh           -- does the rendering
+#     scripts/mc_settings_merge.py   -- decides how rendered blocks land
+#     templates/*                    -- everything rendered from a template
+#     skills/memory-search/SKILL.md  -- the skill copied into a project
+#
+#   machine  what memcontinuum-setup.sh renders into ~/.claude
+#     memcontinuum-setup.sh          -- renders the detector hook line and
+#                                       config.sh (both templated inside it)
+#     scripts/mc_settings_merge.py   -- lands the detector entry too
+#     skills/memcontinuum/SKILL.md   -- the skill copied to the user level
+#
+# mc_settings_merge.py is in both on purpose: it is what actually writes the
+# rendered blocks, per repo and machine-wide alike.
+#
+# Each input is preceded by its path relative to the checkout, so adding,
+# removing or renaming one changes the fingerprint even when the bytes
+# elsewhere are identical.
 mc_render_fingerprint() {
-    local root="$1" f hasher out
+    local scope="$1" root="$2" f hasher out
     local -a files=()
     MC_RENDER_FINGERPRINT="unknown"
+    case "$scope" in
+        repo|machine) ;;
+        *) return 1 ;;
+    esac
     if command -v sha256sum >/dev/null 2>&1; then
         hasher="sha256sum"
     elif command -v shasum >/dev/null 2>&1; then
@@ -525,21 +576,26 @@ mc_render_fingerprint() {
     else
         return 1
     fi
-    for f in "$root/scripts/repo-init.sh" "$root/scripts/mc_settings_merge.py" \
-             "$root/memcontinuum-setup.sh"; do
-        [ -f "$f" ] && files[${#files[@]}]="$f"
-    done
     # LC_ALL=C so glob expansion is byte-ordered, and therefore the same on
     # every machine -- a locale-dependent order would give the same checkout
     # two different fingerprints.
     local saved_lc="${LC_ALL:-__mc_unset__}"
     LC_ALL=C
-    for f in "$root"/templates/*; do
-        [ -f "$f" ] && files[${#files[@]}]="$f"
-    done
-    for f in "$root"/skills/*/SKILL.md; do
-        [ -f "$f" ] && files[${#files[@]}]="$f"
-    done
+    if [ "$scope" = "repo" ]; then
+        for f in "$root/scripts/repo-init.sh" "$root/scripts/mc_settings_merge.py"; do
+            [ -f "$f" ] && files[${#files[@]}]="$f"
+        done
+        for f in "$root"/templates/*; do
+            [ -f "$f" ] && files[${#files[@]}]="$f"
+        done
+        [ -f "$root/skills/memory-search/SKILL.md" ] && \
+            files[${#files[@]}]="$root/skills/memory-search/SKILL.md"
+    else
+        for f in "$root/memcontinuum-setup.sh" "$root/scripts/mc_settings_merge.py" \
+                 "$root/skills/memcontinuum/SKILL.md"; do
+            [ -f "$f" ] && files[${#files[@]}]="$f"
+        done
+    fi
     if [ "$saved_lc" = "__mc_unset__" ]; then unset LC_ALL; else LC_ALL="$saved_lc"; fi
     # An incomplete checkout cannot be fingerprinted honestly.
     [ "${#files[@]}" -ge 3 ] || return 1
