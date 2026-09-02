@@ -1714,9 +1714,17 @@ class TestMultiDirLegacyMigrationRecoversPerDir(unittest.TestCase):
                                 "--langs", "python", "--never-ext", ".cs",
                                 "--non-interactive"], self.home)
         assert proc.returncode == 0, proc.stdout + proc.stderr
+        # Anatomy M2a: one project has one stored language set, shared by
+        # every root -- code-reindex accepts a SUPERSET of what a prior
+        # root already stored ("python") but refuses a set that drops a
+        # language, so this second root's install adds swift on top of
+        # (not instead of) python. Dir B's own recovered langs
+        # ("python,swift") still disagrees with dir A's ("python" only) --
+        # the scenario this class exists to test -- it just no longer
+        # drops a stored language while doing it.
         proc = run(INSTALL_SH, ["--project", "multi", "--store", self.store,
                                 "--claude-dir", self.claude_b, "--code-root", self.code_b,
-                                "--langs", "swift", "--never-ext", ".h",
+                                "--langs", "python,swift", "--never-ext", ".h",
                                 "--non-interactive"], self.home)
         assert proc.returncode == 0, proc.stdout + proc.stderr
         write_row(self.home, self.repo, "wired",

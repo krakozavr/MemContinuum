@@ -25,6 +25,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -118,7 +119,8 @@ def ns(**kw):
     return SimpleNamespace(**base)
 
 
-def code_reindex(code_root, db, project=memidx.DEFAULT_PROJECT, no_embed=True, full=False, lang="swift"):
+def code_reindex(code_root, db, project=memidx.DEFAULT_PROJECT, no_embed=True, full=False, lang="swift",
+                  drop_root=None):
     """Task 7: `lang` now defaults to "swift" here in the test helper (not
     in memidx.py -- that hardcoded default is gone, see TestLangDefaultFix)
     purely to centralize the fix for the many pre-existing call sites in
@@ -126,8 +128,212 @@ def code_reindex(code_root, db, project=memidx.DEFAULT_PROJECT, no_embed=True, f
     Swift-only fixtures. Pass lang=None explicitly to exercise the real
     omitted-flag behavior (fails on a fresh project, reuses stored langs
     otherwise)."""
-    args = ns(code_root=str(code_root), db=str(db), project=project, no_embed=no_embed, full=full, lang=lang)
+    args = ns(code_root=str(code_root), db=str(db), project=project, no_embed=no_embed, full=full, lang=lang,
+              drop_root=drop_root)
     return memidx.cmd_code_reindex(args)
+
+
+class TestCodeSchemaV2(unittest.TestCase):
+    V1_DDL = """
+      CREATE TABLE chunks (id INTEGER PRIMARY KEY, path TEXT, project TEXT, lang TEXT, kind TEXT,
+        symbol TEXT, qualified_name TEXT, signature TEXT, doc TEXT, start_line INTEGER, end_line INTEGER);
+      CREATE VIRTUAL TABLE fts USING fts5(qualified_name, split_tokens, signature, doc, body);
+      CREATE TABLE embeddings (chunk_id INTEGER PRIMARY KEY, project TEXT, dim INTEGER, vector BLOB);
+      CREATE TABLE file_sha (path TEXT, project TEXT, sha256 TEXT NOT NULL, mtime REAL, size INTEGER,
+        gap_count INTEGER DEFAULT 0, chunker_version TEXT, PRIMARY KEY (path, project));
+      CREATE TABLE code_meta (project TEXT PRIMARY KEY, code_root TEXT, langs TEXT, last_indexed_at REAL, head_sha TEXT);
+      INSERT INTO chunks VALUES (1,'a.swift','p','swift','function','f','f','func f()','',1,2);
+      INSERT INTO file_sha VALUES ('a.swift','p','x',0,0,0,'cv');
+      INSERT INTO code_meta VALUES ('p','/old/root','swift,python',0,'abc');
+    """
+
+    def _cols(self, conn, table):
+        return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+    def _v1(self, td):
+        db = Path(td) / "c.sqlite"
+        conn = sqlite3.connect(str(db)); conn.executescript(self.V1_DDL); conn.commit(); conn.close()
+        return db
+
+    def test_fresh_db_has_v2_shape(self):
+        with tempfile.TemporaryDirectory() as td:
+            conn = memidx.open_code_db(Path(td) / "c.sqlite")
+            self.assertEqual(memidx.code_schema_version(conn), 2)
+            self.assertIn("code_root", self._cols(conn, "chunks"))
+            self.assertTrue({"code_root", "status", "reason", "chunker_version"} <= self._cols(conn, "file_sha"))
+            self.assertNotIn("langs", self._cols(conn, "code_meta"))
+            self.assertEqual(self._cols(conn, "code_project"), {"project", "langs", "embedding_mode"})
+            self.assertIn("attempt_key", self._cols(conn, "file_sha"))
+            pk = sorted(r[1] for r in conn.execute("PRAGMA table_info(code_meta)") if r[5])
+            self.assertEqual(pk, ["code_root", "project"])
+            self.assertIn("tokenchars", conn.execute("SELECT sql FROM sqlite_master WHERE name='fts'").fetchone()[0])
+
+    def test_older_db_keeps_roots_and_langs_but_drops_derived_rows(self):
+        with tempfile.TemporaryDirectory() as td:
+            conn = memidx.open_code_db(self._v1(td))
+            self.assertEqual(memidx.code_schema_version(conn), 2)
+            self.assertEqual(conn.execute("SELECT count(*) FROM chunks").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT count(*) FROM file_sha").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT project, code_root FROM code_meta").fetchall()[0][:], ("p", "/old/root"))
+            self.assertEqual(conn.execute("SELECT langs, embedding_mode FROM code_project").fetchone()[:], ("swift,python", "none"))
+
+    def test_failed_rebuild_leaves_older_db_intact(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = self._v1(td)
+            real = memidx.CODE_SCHEMA_SQL
+            memidx.CODE_SCHEMA_SQL = real + "\nCREATE TABLE code_schema (dup INTEGER);"   # forces an error mid-rebuild
+            try:
+                with self.assertRaises(sqlite3.Error):
+                    memidx.open_code_db(db)
+            finally:
+                memidx.CODE_SCHEMA_SQL = real
+            conn = sqlite3.connect(str(db))
+            self.assertEqual(conn.execute("SELECT count(*) FROM chunks").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT langs FROM code_meta").fetchone()[0], "swift,python")
+
+    def test_reopen_keeps_v2_rows(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "c.sqlite"
+            conn = memidx.open_code_db(db)
+            conn.execute("INSERT INTO code_meta VALUES ('p','/r',0,NULL)"); conn.commit(); conn.close()
+            conn = memidx.open_code_db(db)
+            self.assertEqual(conn.execute("SELECT count(*) FROM code_meta").fetchone()[0], 1)
+
+
+class TestMultiRootReindex(unittest.TestCase):
+    def _mk(self, td):
+        a = Path(td) / "a"; b = Path(td) / "b"; a.mkdir(); b.mkdir()
+        (a / "main.py").write_text("def alpha():\n    return 1\n")
+        (b / "main.py").write_text("def beta():\n    return 2\n")
+        return a, b, Path(td) / "idx-code.sqlite"
+
+    def test_two_roots_with_same_relative_path_coexist(self):
+        with tempfile.TemporaryDirectory() as td:
+            a, b, db = self._mk(td)
+            self.assertEqual(code_reindex(a, db, lang="python"), 0)
+            self.assertEqual(code_reindex(b, db, lang=None), 0)      # langs reused from code_project
+            conn = memidx.open_code_db(db)
+            rows = conn.execute("SELECT code_root, qualified_name FROM chunks ORDER BY code_root").fetchall()
+            self.assertEqual([tuple(r) for r in rows], [(str(a.resolve()), "alpha"), (str(b.resolve()), "beta")])
+            self.assertEqual(conn.execute("SELECT count(*) FROM code_meta").fetchone()[0], 2)
+            self.assertEqual(conn.execute("SELECT langs FROM code_project").fetchone()[0], "python")
+
+    def test_reindexing_one_root_never_removes_the_other(self):
+        with tempfile.TemporaryDirectory() as td:
+            a, b, db = self._mk(td)
+            code_reindex(a, db, lang="python"); code_reindex(b, db, lang="python")
+            (a / "main.py").unlink()
+            code_reindex(a, db, lang="python")
+            conn = memidx.open_code_db(db)
+            self.assertEqual([r[0] for r in conn.execute("SELECT qualified_name FROM chunks")], ["beta"])
+
+    def test_missing_root_is_refused_and_nothing_is_deleted(self):
+        with tempfile.TemporaryDirectory() as td:
+            a, b, db = self._mk(td)
+            code_reindex(a, db, lang="python")
+            shutil.rmtree(a)
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                rc = code_reindex(a, db, lang="python")
+            self.assertEqual(rc, 2)
+            self.assertIn("not a readable directory", buf.getvalue())
+            self.assertIn("--drop-root", buf.getvalue())
+            conn = memidx.open_code_db(db)
+            self.assertEqual(conn.execute("SELECT count(*) FROM chunks").fetchone()[0], 1)
+
+    def test_invalid_root_is_refused_before_any_db_is_touched(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "never-created.sqlite"
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(code_reindex(Path(td) / "missing", db, lang="python"), 2)
+            self.assertFalse(db.exists(), "a refused root must not create the db")
+            regular = Path(td) / "file.txt"; regular.write_text("x")
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(code_reindex(regular, db, lang="python"), 2)
+            self.assertFalse(db.exists())
+            # an older-schema db must not be rebuilt by a refused run
+            v1 = Path(td) / "v1.sqlite"
+            conn = sqlite3.connect(str(v1)); conn.executescript(TestCodeSchemaV2.V1_DDL); conn.commit(); conn.close()
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(code_reindex(Path(td) / "missing", v1, lang="python"), 2)
+            conn = sqlite3.connect(str(v1))
+            self.assertEqual(conn.execute("SELECT count(*) FROM chunks").fetchone()[0], 1)
+            self.assertFalse(conn.execute("SELECT 1 FROM sqlite_master WHERE name='code_schema'").fetchone())
+            if os.geteuid() != 0:
+                unreadable = Path(td) / "noperm"; unreadable.mkdir(); unreadable.chmod(0)
+                try:
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        self.assertEqual(code_reindex(unreadable, db, lang="python"), 2)
+                finally:
+                    unreadable.chmod(0o755)
+                self.assertFalse(db.exists())
+
+    def test_drop_root_removes_only_that_root(self):
+        with tempfile.TemporaryDirectory() as td:
+            a, b, db = self._mk(td)
+            code_reindex(a, db, lang="python"); code_reindex(b, db, lang="python")
+            rc = memidx.cmd_code_reindex(ns(code_root=None, drop_root=str(a), db=str(db),
+                                           project=memidx.DEFAULT_PROJECT, no_embed=True, full=False, lang=None))
+            self.assertEqual(rc, 0)
+            conn = memidx.open_code_db(db)
+            self.assertEqual([r[0] for r in conn.execute("SELECT qualified_name FROM chunks")], ["beta"])
+            self.assertEqual(conn.execute("SELECT count(*) FROM code_meta").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT count(*) FROM file_sha").fetchone()[0], 1)
+
+    def test_lang_superset_is_additive_but_removal_needs_full(self):
+        with tempfile.TemporaryDirectory() as td:
+            a, b, db = self._mk(td)
+            code_reindex(a, db, lang="python")
+            self.assertEqual(code_reindex(b, db, lang="python,swift"), 0)        # superset: --add-lang's shape
+            conn = memidx.open_code_db(db)
+            self.assertEqual(conn.execute("SELECT langs FROM code_project").fetchone()[0], "python,swift"); conn.close()
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                self.assertEqual(code_reindex(b, db, lang="swift"), 1)              # drops python
+            self.assertIn("drops python", buf.getvalue())
+            self.assertEqual(code_reindex(b, db, lang="swift", full=True), 0)
+            conn = memidx.open_code_db(db)
+            self.assertEqual(conn.execute("SELECT langs FROM code_project").fetchone()[0], "swift")
+
+    def _coverage(self, db):
+        conn = memidx.open_code_db(db)
+        mode = conn.execute("SELECT embedding_mode FROM code_project").fetchone()[0]
+        chunks = conn.execute("SELECT count(*) FROM chunks").fetchone()[0]
+        embedded = conn.execute("SELECT count(*) FROM chunks c JOIN embeddings e ON e.chunk_id=c.id").fetchone()[0]
+        conn.close()
+        return mode, chunks, embedded
+
+    def test_embedding_mode_tracks_real_coverage(self):
+        with tempfile.TemporaryDirectory() as td:
+            a, b, db = self._mk(td)
+            code_reindex(a, db, lang="python", no_embed=True)
+            self.assertEqual(self._coverage(db)[0], "none")
+            code_reindex(a, db, lang="python", no_embed=False)
+            mode, chunks, embedded = self._coverage(db)
+            self.assertEqual((mode, chunks, embedded), ("full", 1, 1))
+            code_reindex(a, db, lang="python", no_embed=True)               # nothing changed -> stays full
+            self.assertEqual(self._coverage(db), ("full", 1, 1))
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code_reindex(b, db, lang="python", no_embed=True)           # adds chunks without vectors
+            mode, chunks, embedded = self._coverage(db)
+            self.assertEqual(mode, "none"); self.assertEqual(chunks, 2); self.assertEqual(embedded, 1)
+            self.assertIn("embedding mode set to none", buf.getvalue())
+            code_reindex(b, db, lang="python", no_embed=False)              # restores coverage
+            self.assertEqual(self._coverage(db), ("full", 2, 2))
+
+    def test_full_mode_means_every_chunk_has_a_vector(self):
+        """The invariant behind the mode: whenever code_project says full,
+        chunks and embeddings agree 1:1 (change a file with --no-embed on a
+        full project -> mode none; with embeddings -> still full)."""
+        with tempfile.TemporaryDirectory() as td:
+            a, b, db = self._mk(td)
+            code_reindex(a, db, lang="python", no_embed=False)
+            (a / "main.py").write_text("def alpha2():\n    return 1\n")
+            with contextlib.redirect_stdout(io.StringIO()):
+                code_reindex(a, db, lang="python", no_embed=True)
+            mode, chunks, embedded = self._coverage(db)
+            self.assertEqual(mode, "none"); self.assertEqual(embedded, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -906,7 +1112,7 @@ class TestLangDefaultFix(unittest.TestCase):
 
             conn = memidx.open_code_db(db)
             langs_row = conn.execute(
-                "SELECT langs FROM code_meta WHERE project=?", ("reuseproj",)
+                "SELECT langs FROM code_project WHERE project=?", ("reuseproj",)
             ).fetchone()
             paths = {r["path"] for r in conn.execute("SELECT DISTINCT path FROM chunks")}
             conn.close()
@@ -1584,9 +1790,10 @@ class TestPreRewireStampSkewForcesRechunk(unittest.TestCase):
             sha = hashlib.sha256(data).hexdigest()
             stat = target.stat()
             conn.execute(
-                "INSERT INTO file_sha (path, project, sha256, mtime, size, gap_count, chunker_version) "
-                "VALUES (?,?,?,?,?,?,?)",
-                ("basic_functions.py", memidx.DEFAULT_PROJECT, sha, stat.st_mtime, stat.st_size, 0, cv_before),
+                "INSERT INTO file_sha (path, project, code_root, sha256, mtime, size, gap_count, chunker_version) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                ("basic_functions.py", memidx.DEFAULT_PROJECT, str(root.resolve()), sha, stat.st_mtime,
+                 stat.st_size, 0, cv_before),
             )
             conn.commit()
             conn.close()

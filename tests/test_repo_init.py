@@ -1907,9 +1907,9 @@ class TestCodeCensusAndConsentDialogue(unittest.TestCase):
             code_db = Path(home) / ".memcontinuum" / "widgetco-code.sqlite"
             self.assertTrue(code_db.is_file(), "code db not created -- initial code-reindex did not run")
             conn = sqlite3.connect(str(code_db))
-            row = conn.execute("SELECT langs FROM code_meta WHERE project=?", ("widgetco",)).fetchone()
+            row = conn.execute("SELECT langs FROM code_project WHERE project=?", ("widgetco",)).fetchone()
             conn.close()
-            self.assertIsNotNone(row, "no code_meta row for project widgetco")
+            self.assertIsNotNone(row, "no code_project row for project widgetco")
             self.assertEqual(row[0], "python")
         finally:
             shutil.rmtree(home, ignore_errors=True)
@@ -2209,7 +2209,7 @@ class TestNeverExtension(unittest.TestCase):
             conn = sqlite3.connect(str(code_db))
             try:
                 row = conn.execute(
-                    "SELECT langs FROM code_meta WHERE project=?", ("neverco",)
+                    "SELECT langs FROM code_project WHERE project=?", ("neverco",)
                 ).fetchone()
             finally:
                 conn.close()
