@@ -612,6 +612,7 @@ memidx.py check --root DIR [--project NAME] [--db PATH] [--json]
 memidx.py why SYMBOL_OR_PATH [--project NAME] [--db PATH] [--code-root DIR] [--json]
 memidx.py drift --code-root DIR [--project NAME] [--db PATH] [--json]
 memidx.py unmapped PATH... --root DIR [--project NAME] [--db PATH] [--code-root DIR] [--json]
+memidx.py code-census --root DIR [--json]
 memidx.py code-reindex --code-root DIR [--project NAME] [--db PATH] [--lang LANGS] [--no-embed] [--full]
 memidx.py code-search QUERY [--project NAME] [--db PATH] [--mode fts|vector|hybrid]
                       [--limit N] [--json] [--decision-db PATH]
@@ -633,8 +634,8 @@ missed most of those. It tries the code index first (fast, when `--project`
 resolves one) and always falls back to scanning `--code-root` directly if
 that misses, so a missing or stale code index never regresses a resolution
 the direct scan can still make.
-`unmapped` and `code-reindex`/`code-search` are Anatomy's other two
-extensions, described in their own subsection below. The rest of this
+`unmapped`, `code-census`, and `code-reindex`/`code-search` are Anatomy's
+other extensions, described in their own subsection below. The rest of this
 section describes the base commands.
 
 - `--project` defaults to `default`.
@@ -694,6 +695,21 @@ A completely separate SQLite database (`<project>-code.sqlite`, see
 "Storage model" above) holds a chunked intent index over the code itself,
 independent of any authored concept record.
 
+| language | chunker |
+|---|---|
+| Swift | native walker |
+| Python | stdlib `ast` |
+| more languages | arriving via tree-sitter in the next milestone |
+
+A project chooses its languages once, not by flag guesswork: `scripts/repo-init.sh`
+runs a census of your `--code-root`(s) — counts source files by extension —
+and asks what to do with what it found: skip (language-less wiring), enable
+all detected, select from the detected set, or never for one extension
+(stop asking about that one). Nothing is enabled without your answer.
+`--langs LIST` and `--non-interactive` skip that dialogue for scripted/CI
+runs. Run `code-census --root DIR` yourself at any time to see the same
+breakdown without wiring anything.
+
 - `code-reindex --code-root DIR --lang LANGS` walks the tree and chunks each
   wired language's source files into function/`init`/subscript/computed-
   property (Swift) or function/method/closure (Python) units. Directory
@@ -710,7 +726,10 @@ independent of any authored concept record.
   naming this); omit it on later runs to reuse the language set stored
   from the first run. Incremental by sha256, same as `reindex`, and it
   downloads the embedding model on the same terms `reindex` does (see
-  Requirements) unless `--no-embed` is given.
+  Requirements) unless `--no-embed` is given. A new file whose extension
+  isn't in the wired set — unsupported entirely, or supported by the engine
+  but not enabled for this project — is never indexed silently: every run
+  prints one line naming each such extension and how many files it skipped.
 - `code-search QUERY` runs fts/vector/hybrid search over those chunks —
   the same RRF fusion as `search`. Each hit optionally carries a
   `concept_id` when some concept's `implemented_by`/`tested_by` claims
@@ -823,7 +842,7 @@ below. `hooks/install-hooks.md` documents the exact wiring each one gets.
 | script | event | does |
 |---|---|---|
 | `pre-edit-chain.sh` | `PreToolUse` (Edit/Write, filtered to `--code-root`) | looks up the file being edited via `for-path`, injects the matching chain(s) as `additionalContext` |
-| `newfile-nudge.sh` | `PreToolUse` (Write only, filtered to `--code-root`) | fires only when the write target does not exist yet (never on an edit to an existing file) and has an indexed source extension (`.swift` today); injects one reminder to check the code index before writing; never blocks; ~56ms p95 latency; runs under the shared watchdog |
+| `newfile-nudge.sh` | `PreToolUse` (Write only, filtered to `--code-root`) | fires only when the write target does not exist yet (never on an edit to an existing file) and has an extension wired for this project (the language(s) chosen at `repo-init`; a project wired before language choice existed keeps watching `.swift` only until `repo-init` is run again); injects one reminder to check the code index before writing; never blocks; ~56ms p95 latency; runs under the shared watchdog |
 | `ledger-post-edit.sh` | `PostToolUse` | appends the edit to a per-session ledger, scoped to `--code-root` and the store root |
 | `precompact-persist.sh` | `PreCompact` | persists session state before context is compacted away |
 | `sessionstart-remind.sh` | `SessionStart` | on `startup`/`resume`, only initializes session state (captures the code/store roots' current git HEAD, prunes state older than 24h) — no output; only on `source: compact` does it inject whatever `precompact-persist.sh` left pending |
