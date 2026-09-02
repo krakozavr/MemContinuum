@@ -108,6 +108,27 @@ class TestStatsHealthyCase(StatsTestBase):
         self.assertEqual(rc, 0)
         self.assertIn(str(env_home / "hook.log"), out)
 
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores permission bits")
+    def test_exists_but_unreadable_prints_tolerant_message_not_internal_error(self):
+        """Fix round 1 (review finding, IMPORTANT): _scan_hook_log's OSError
+        branch used to return a 5-tuple (a duplicated unparseable_lines)
+        while the normal path returns 4 and cmd_stats always unpacks 4 --
+        an existing-but-unreadable hook.log (chmod 000; permissions, a
+        mid-rotation window, anything read_text can raise OSError for)
+        crashed with "too many values to unpack" INSIDE the try/except
+        meant to make this fail open, surfacing as "stats: internal error
+        (...)" instead of a real message. Reproduced exactly as the
+        reviewer described: chmod 000 an existing hook.log."""
+        log_path = self.home / "hook.log"
+        log_path.write_text(f"{ts(1)} userprompt outcome=injected session=s1 project=demo\n")
+        log_path.chmod(0o000)
+        self.addCleanup(log_path.chmod, 0o644)
+        rc, out = run_stats(home=str(self.home))
+        self.assertEqual(rc, 0)
+        self.assertNotIn("internal error", out)
+        self.assertIn("hook.log exists but is unreadable at", out)
+        self.assertIn(str(log_path), out)
+
     def test_healthy_case_no_flags(self):
         lines = [
             f"{ts(1)} sessionstart outcome=init session=s1 source=startup project=demo",
@@ -128,10 +149,17 @@ class TestStatsHealthyCase(StatsTestBase):
         self.assertEqual(out["nudges"]["lookback_injected"], 1)
         self.assertEqual(out["nudges"]["total"], 2)
         self.assertEqual(out["pre_edit"]["matched"], 1)
-        self.assertEqual(out["ledger_appends"], {"code": 1, "store": 1})
+        self.assertEqual(out["ledger_appends"]["code"], 1)
+        self.assertEqual(out["ledger_appends"]["store"], 1)
         self.assertEqual(out["store_commits"], 1)
 
     def test_pre_edit_no_match_and_other_classified_separately(self):
+        """The named fields (matched/no_match/other/total) are VIEWS over
+        the dynamic per-outcome `outcomes` dict (fix round 1) -- assert
+        both: the named subset the rest of this file relies on, and that
+        the two distinct "other" outcomes (index-missing, no-file-path)
+        are still individually visible in `outcomes`, not folded into one
+        opaque "other" count with the literal strings lost."""
         lines = [
             f"{ts(1)} outcome=matched elapsed=0s project=demo file=/a.py",
             f"{ts(1)} outcome=no-match elapsed=0s project=demo file=/b.py",
@@ -140,7 +168,15 @@ class TestStatsHealthyCase(StatsTestBase):
         ]
         self.write_log(lines)
         rc, out = run_stats_json(home=str(self.home))
-        self.assertEqual(out["pre_edit"], {"matched": 1, "no_match": 1, "other": 2, "total": 4})
+        pe = out["pre_edit"]
+        self.assertEqual(
+            {k: v for k, v in pe.items() if k != "outcomes"},
+            {"matched": 1, "no_match": 1, "other": 2, "total": 4},
+        )
+        self.assertEqual(
+            pe["outcomes"],
+            {"matched": 1, "no-match": 1, "index-missing": 1, "no-file-path": 1},
+        )
 
     def test_memlib_raw_outcome_lines_not_misclassified_as_pre_edit(self):
         """The false-positive advisor caught: memlib.sh's own raw
@@ -163,6 +199,10 @@ class TestStatsHealthyCase(StatsTestBase):
         self.assertIn("FLAG: read side silent (INC-0103 class)", out["flags"])
 
     def test_new_file_nudge_outcomes(self):
+        """The four named fields are a view over `outcomes` (fix round 1);
+        a fifth outcome (existing-or-symlink) -- one of newfile-nudge.sh's
+        other nine possible outcomes, none of which had a named field --
+        must still be visible in `outcomes`, never silently dropped."""
         lines = [
             f"{ts(1)} newfile-nudge outcome=nudged project=demo file=/a.swift",
             f"{ts(1)} newfile-nudge outcome=not-indexed-extension project=demo file=/b.md",
@@ -172,10 +212,16 @@ class TestStatsHealthyCase(StatsTestBase):
         ]
         self.write_log(lines)
         rc, out = run_stats_json(home=str(self.home))
-        self.assertEqual(out["newfile_nudge"], {
-            "nudged": 1, "not_indexed_extension": 1,
-            "language_available_not_wired": 1, "never_extension": 1,
-        })
+        nf = out["newfile_nudge"]
+        self.assertEqual(
+            {k: v for k, v in nf.items() if k != "outcomes"},
+            {
+                "nudged": 1, "not_indexed_extension": 1,
+                "language_available_not_wired": 1, "never_extension": 1,
+            },
+        )
+        self.assertEqual(nf["outcomes"].get("existing-or-symlink"), 1)
+        self.assertEqual(sum(nf["outcomes"].values()), 5)
 
     def test_never_raises_on_malformed_or_unrelated_lines(self):
         lines = [

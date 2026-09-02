@@ -2762,15 +2762,31 @@ def _hook_log_line_kind(rest: str) -> str:
     return "other"
 
 
+# Every hook-log "kind" _hook_log_line_kind can return, pre-seeded so a
+# report always has a Counter to read from even for a kind this window
+# never saw (never a KeyError, never a silent `.get(..., {})` fallback).
+_STATS_KINDS = (
+    "userprompt", "ledger", "pre-edit", "newfile-nudge",
+    "sessionstart", "sessionend", "precompact", "other",
+)
+
+
 def _new_stats_bucket():
     return {
         "sessions": set(),
         "user_prompts": 0,
-        "pre_edit": Counter(),
-        "ledger": Counter(),
-        "nudges": Counter(),
-        "newfile": Counter(),
         "lines": 0,
+        # Fix round 1 (review finding, MINOR): outcome counts are tallied
+        # DYNAMICALLY per kind -- {kind: Counter(outcome -> count)} -- so no
+        # outcome value is ever silently folded into a total or dropped,
+        # whether or not this file's own named metrics (pre_edit.other,
+        # newfile_nudge's four named outcomes, etc.) happen to enumerate it.
+        # Every named field the report prints is a VIEW computed from this
+        # dict at report time (see _stats_report), never a separate
+        # incremented-in-the-loop counter -- so a brand-new outcome string
+        # some future hook edit introduces shows up in `outcomes` on the
+        # very next run with no code change here.
+        "outcomes": {k: Counter() for k in _STATS_KINDS},
     }
 
 
@@ -2813,7 +2829,17 @@ def _scan_hook_log(log_path: Path, cutoff: datetime, now: datetime):
     try:
         raw_lines = log_path.read_text(errors="replace").splitlines()
     except OSError:
-        return buckets, unknown_lines, projects_seen, unparseable_lines, unparseable_lines
+        # Fix round 1 (review finding, IMPORTANT): this used to return a
+        # 5-tuple (a duplicated unparseable_lines) here while the normal
+        # path below returns 4 -- cmd_stats always unpacks 4, so an
+        # exists-but-unreadable hook.log (permissions, a mid-rotation
+        # window, anything read_text can raise OSError for) blew up with
+        # "too many values to unpack" INSIDE the try/except that is
+        # supposed to make this tool fail open, printing "stats: internal
+        # error (...)" instead of a real message -- the exact kind of
+        # silent-failure-about-silent-failure this metric exists to catch.
+        # Reproduced: chmod 000 an existing hook.log.
+        return buckets, unknown_lines, projects_seen, unparseable_lines
 
     for line in raw_lines:
         if not line.strip():
@@ -2844,34 +2870,23 @@ def _scan_hook_log(log_path: Path, cutoff: datetime, now: datetime):
                 bucket["sessions"].add(session)
         elif kind == "userprompt":
             bucket["user_prompts"] += 1
-            if outcome == "injected":
-                bucket["nudges"]["coverage_injected"] += 1
-            elif outcome == "lookback-injected":
-                bucket["nudges"]["lookback_injected"] += 1
-            elif outcome == "no-evidence":
-                bucket["nudges"]["no_evidence"] += 1
-            elif outcome == "duplicate-delivery":
-                bucket["nudges"]["duplicate_delivery"] += 1
         elif kind == "ledger":
+            # Fix round 1: the code/store split is a SEPARATE field
+            # (`kind=`), not the outcome itself -- folded into the outcome
+            # key here (rather than a second fixed-list branch) so the
+            # dynamic outcomes dict still carries the full, undivided
+            # picture: any ledger outcome OTHER than "appended" (e.g.
+            # out-of-scope, no-session-id, update-failed) is tallied under
+            # its own literal string, never silently dropped.
+            outcome_key = outcome
             if outcome == "appended":
-                line_kind = fields.get("kind", "")
-                if line_kind == "code":
-                    bucket["ledger"]["code"] += 1
-                elif line_kind == "store":
-                    bucket["ledger"]["store"] += 1
-        elif kind == "pre-edit":
-            if outcome == "matched":
-                bucket["pre_edit"]["matched"] += 1
-            elif outcome == "no-match":
-                bucket["pre_edit"]["no_match"] += 1
-            else:
-                bucket["pre_edit"]["other"] += 1
-        elif kind == "newfile-nudge":
-            key = outcome.replace("-", "_")
-            if key in ("nudged", "not_indexed_extension", "language_available_not_wired", "never_extension"):
-                bucket["newfile"][key] += 1
-        # sessionend/precompact/other: counted in `lines`, no dedicated
-        # metric asked for by the spec.
+                outcome_key = f"appended:{fields.get('kind') or 'unknown'}"
+            bucket["outcomes"]["ledger"][outcome_key] += 1
+            continue
+        bucket["outcomes"][kind][outcome] += 1
+        # sessionend/precompact/other: counted in `lines` and their own
+        # `outcomes[kind]` bucket; no dedicated named metric asked for by
+        # the spec, but nothing here is silently dropped either.
 
     return buckets, unknown_lines, projects_seen, unparseable_lines
 
@@ -2894,14 +2909,43 @@ def _count_store_commits(store_dir: str, cutoff: datetime):
 
 
 def _stats_report(args, buckets, unknown_lines, projects_seen, now, cutoff, store_commits, unparseable_lines):
+    """Every named field below (pre_edit.matched, newfile_nudge.nudged,
+    nudges.coverage_injected, ...) is a VIEW computed here, at report time,
+    over the bucket's dynamic `outcomes[kind]` Counter -- never a separate
+    counter incremented in the scan loop. Fix round 1 (review finding,
+    MINOR): the old code kept a hand-picked fixed list of outcome names per
+    kind (four newfile-nudge outcomes out of the thirteen that hook can
+    actually log, "other" as a single bucket losing which pre-edit outcome
+    it actually was) -- any outcome string not on that list was silently
+    invisible. Each named metric's raw Counter is also exposed under an
+    "outcomes" key in the result, so no outcome is ever silently folded
+    away: a brand-new outcome value some future hook edit introduces shows
+    up there on the very next run with no code change here."""
     b = buckets.get(args.project, _new_stats_bucket())
+    outcomes = b["outcomes"]
 
-    pre_edit = b["pre_edit"]
-    pre_edit_total = sum(pre_edit.values())
-    ledger = b["ledger"]
-    nudges = b["nudges"]
-    nudges_total = nudges["coverage_injected"] + nudges["lookback_injected"]
-    newfile = b["newfile"]
+    pe = outcomes["pre-edit"]
+    pre_edit_total = sum(pe.values())
+    pre_edit_matched = pe.get("matched", 0)
+    pre_edit_no_match = pe.get("no-match", 0)
+    pre_edit_other = pre_edit_total - pre_edit_matched - pre_edit_no_match
+
+    led = outcomes["ledger"]
+    ledger_code = led.get("appended:code", 0)
+    ledger_store = led.get("appended:store", 0)
+
+    up = outcomes["userprompt"]
+    coverage_injected = up.get("injected", 0)
+    lookback_injected = up.get("lookback-injected", 0)
+    no_evidence = up.get("no-evidence", 0)
+    duplicate_delivery = up.get("duplicate-delivery", 0)
+    nudges_total = coverage_injected + lookback_injected
+
+    nf = outcomes["newfile-nudge"]
+    nf_nudged = nf.get("nudged", 0)
+    nf_not_indexed = nf.get("not-indexed-extension", 0)
+    nf_lang_not_wired = nf.get("language-available-not-wired", 0)
+    nf_never = nf.get("never-extension", 0)
 
     flags = []
     if store_commits is not None and nudges_total >= 3 and store_commits == 0:
@@ -2920,27 +2964,31 @@ def _stats_report(args, buckets, unknown_lines, projects_seen, now, cutoff, stor
         "sessions_seen": len(b["sessions"]),
         "user_prompts": b["user_prompts"],
         "pre_edit": {
-            "matched": pre_edit["matched"],
-            "no_match": pre_edit["no_match"],
-            "other": pre_edit["other"],
+            "matched": pre_edit_matched,
+            "no_match": pre_edit_no_match,
+            "other": pre_edit_other,
             "total": pre_edit_total,
+            "outcomes": dict(pe),
         },
         "ledger_appends": {
-            "code": ledger["code"],
-            "store": ledger["store"],
+            "code": ledger_code,
+            "store": ledger_store,
+            "outcomes": dict(led),
         },
         "nudges": {
-            "coverage_injected": nudges["coverage_injected"],
-            "lookback_injected": nudges["lookback_injected"],
-            "no_evidence": nudges["no_evidence"],
-            "duplicate_delivery": nudges["duplicate_delivery"],
+            "coverage_injected": coverage_injected,
+            "lookback_injected": lookback_injected,
+            "no_evidence": no_evidence,
+            "duplicate_delivery": duplicate_delivery,
             "total": nudges_total,
+            "outcomes": dict(up),
         },
         "newfile_nudge": {
-            "nudged": newfile["nudged"],
-            "not_indexed_extension": newfile["not_indexed_extension"],
-            "language_available_not_wired": newfile["language_available_not_wired"],
-            "never_extension": newfile["never_extension"],
+            "nudged": nf_nudged,
+            "not_indexed_extension": nf_not_indexed,
+            "language_available_not_wired": nf_lang_not_wired,
+            "never_extension": nf_never,
+            "outcomes": dict(nf),
         },
         "store_commits": store_commits,
         "unknown_lines": unknown_lines,
@@ -2985,6 +3033,22 @@ def cmd_stats(args) -> int:
 
         if not log_path.exists():
             print(f"no hook.log at {log_path}")
+            return 0
+
+        # Fix round 1 (review finding): an EXISTING-but-unreadable
+        # hook.log (permissions, a mid-rotation window) is a distinct,
+        # tolerant case from "no hook.log at all" -- it gets its own
+        # message rather than silently falling through to an all-zero
+        # report indistinguishable from "nothing happened", and rather
+        # than the internal-error path this cheap open+close probe
+        # exists specifically to avoid. _scan_hook_log's own OSError
+        # branch (see its comment) is a defensive fallback for the TOCTOU
+        # gap between this check and the real read, not the primary path.
+        try:
+            with open(log_path, "r"):
+                pass
+        except OSError as e:
+            print(f"hook.log exists but is unreadable at {log_path} ({e})")
             return 0
 
         buckets, unknown_lines, projects_seen, unparseable_lines = _scan_hook_log(log_path, cutoff, now)
