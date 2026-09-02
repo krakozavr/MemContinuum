@@ -138,8 +138,8 @@ print(json.dumps(state))
     compact)
         [ -f "$STATE_FILE" ] || finish "compact-no-state"
 
-        OUTPUT_JSON="$(env PYTHONPATH= "$MC_PY" -c '
-import json, sys
+        OUTPUT_JSON="$(MEMCONTINUUM_ROOT="${MEMCONTINUUM_ROOT:-}" env PYTHONPATH= "$MC_PY" -c '
+import json, os, sys
 
 try:
     with open(sys.argv[1]) as f:
@@ -187,9 +187,13 @@ else:
 if not has_evidence:
     sys.exit(3)
 
+store_root = os.environ.get("MEMCONTINUUM_ROOT") or "<store root not configured>"
 question = (
     "Any ruling, incident, or rejected alternative from this session that "
-    "memory/ should hold? If none, say so once."
+    "the MemContinuum store should hold? Store: " + store_root + " — a ruling "
+    "is a new link in topics/<area>/<topic>.md, an incident is a file in "
+    "incidents/ (see docs/SCHEMA.md); NOT Claude Code auto-memory. If none, "
+    "say so once."
 )
 ctx = fact_line + "\n\n" + question
 print(json.dumps({
@@ -210,8 +214,8 @@ print(json.dumps({
         LB_TURN=""
         if [ $RC -ne 0 ]; then
             LB_META_TMP="$(mktemp 2>/dev/null)"
-            LB_JSON="$(env PYTHONPATH= "$MC_PY" -c '
-import json, sys
+            LB_JSON="$(MEMCONTINUUM_ROOT="${MEMCONTINUUM_ROOT:-}" env PYTHONPATH= "$MC_PY" -c '
+import json, os, sys
 
 try:
     with open(sys.argv[1]) as f:
@@ -232,6 +236,7 @@ if since < 3:
     sys.exit(3)
 
 Q = chr(39)
+store_root = os.environ.get("MEMCONTINUUM_ROOT") or "<store root not configured>"
 fact = (
     f"Look-back signal — {since} user turns with no edited-file evidence; "
     "context was just compacted."
@@ -239,7 +244,10 @@ fact = (
 question = (
     "Did the conversation since then establish any ruling, incident, "
     "rejected alternative, priority, wording choice, money decision, or "
-    f"{Q}not now{Q} that memory/ should hold? If none, say so once."
+    f"{Q}not now{Q} that the MemContinuum store should hold? Store: "
+    + store_root + " — a ruling is a new link in topics/<area>/<topic>.md, "
+    "an incident is a file in incidents/ (see docs/SCHEMA.md); NOT Claude "
+    "Code auto-memory. If none, say so once."
 )
 ctx = fact + "\n\n" + question
 print(json.dumps({

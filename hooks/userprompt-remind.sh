@@ -457,6 +457,7 @@ print(state.get("start_store_sha") or "")
     fi
 
     OUTPUT_JSON="$(UNMAPPED_JSON="$UNMAPPED_JSON" CODE_CHANGED="$CODE_CHANGED" STORE_CHANGED="$STORE_CHANGED" \
+        MEMCONTINUUM_ROOT="${MEMCONTINUUM_ROOT:-}" \
         env PYTHONPATH= "$MC_PY" -c '
 import json, os
 
@@ -499,9 +500,13 @@ else:
 if not has_evidence:
     raise SystemExit(3)
 
+store_root = os.environ.get("MEMCONTINUUM_ROOT") or "<store root not configured>"
 question = (
     "Any ruling, incident, or rejected alternative from this session that "
-    "memory/ should hold? If none, say so once."
+    "the MemContinuum store should hold? Store: " + store_root + " — a ruling "
+    "is a new link in topics/<area>/<topic>.md, an incident is a file in "
+    "incidents/ (see docs/SCHEMA.md); NOT Claude Code auto-memory. If none, "
+    "say so once."
 )
 ctx = fact_line + "\n\n" + question
 print(json.dumps({
@@ -570,16 +575,21 @@ if [ "${LB_ELIGIBLE:-0}" != "1" ]; then
     finish "no-evidence"
 fi
 
-LB_OUTPUT_JSON="$(SINCE_TURN="${SINCE_TURN:-0}" env PYTHONPATH= "$MC_PY" -c '
+LB_OUTPUT_JSON="$(SINCE_TURN="${SINCE_TURN:-0}" MEMCONTINUUM_ROOT="${MEMCONTINUUM_ROOT:-}" \
+    env PYTHONPATH= "$MC_PY" -c '
 import json, os
 
 since = os.environ.get("SINCE_TURN", "0")
 Q = chr(39)
+store_root = os.environ.get("MEMCONTINUUM_ROOT") or "<store root not configured>"
 fact = f"Look-back signal — {since} user turns with no edited-file evidence."
 question = (
     "Did the conversation since then establish any ruling, incident, "
     "rejected alternative, priority, wording choice, money decision, or "
-    f"{Q}not now{Q} that memory/ should hold? If none, say so once."
+    f"{Q}not now{Q} that the MemContinuum store should hold? Store: "
+    + store_root + " — a ruling is a new link in topics/<area>/<topic>.md, "
+    "an incident is a file in incidents/ (see docs/SCHEMA.md); NOT Claude "
+    "Code auto-memory. If none, say so once."
 )
 ctx = fact + "\n\n" + question
 print(json.dumps({

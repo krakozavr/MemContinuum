@@ -1191,9 +1191,15 @@ class TestSessionStartRemind(HookTestBase):
         self.assertIn("store HEAD changed: no", ctx)
         self.assertIn(
             "Any ruling, incident, or rejected alternative from this session that "
-            "memory/ should hold? If none, say so once.",
+            "the MemContinuum store should hold? Store: " + str(self.store_root) + " — "
+            "a ruling is a new link in topics/<area>/<topic>.md, an incident is a "
+            "file in incidents/ (see docs/SCHEMA.md); NOT Claude Code auto-memory. "
+            "If none, say so once.",
             ctx,
         )
+        self.assertIn(str(self.store_root), ctx)
+        self.assertIn("NOT Claude Code auto-memory", ctx)
+        self.assertNotIn("that memory/ should hold", ctx)
         self.assertNotIn("unrecorded", ctx.lower())
         self.assertEqual(scan_forbidden_lines(ctx), [])
 
@@ -1327,9 +1333,15 @@ class TestSessionStartCompactLookback(HookTestBase):
         self.assertIn(
             "Did the conversation since then establish any ruling, incident, "
             "rejected alternative, priority, wording choice, money decision, or "
-            "'not now' that memory/ should hold? If none, say so once.",
+            "'not now' that the MemContinuum store should hold? Store: "
+            + str(self.store_root) + " — a ruling is a new link in "
+            "topics/<area>/<topic>.md, an incident is a file in incidents/ "
+            "(see docs/SCHEMA.md); NOT Claude Code auto-memory. If none, say so once.",
             ctx,
         )
+        self.assertIn(str(self.store_root), ctx)
+        self.assertIn("NOT Claude Code auto-memory", ctx)
+        self.assertNotIn("that memory/ should hold", ctx)
         self.assertEqual(scan_forbidden_lines(ctx), [])
 
     def test_thin_lt3_is_silent(self):
@@ -2035,10 +2047,29 @@ class TestUserPromptRemind(HookTestBase):
         self.assertIn("src/unmapped.py", ctx)
         self.assertIn(
             "Any ruling, incident, or rejected alternative from this session that "
-            "memory/ should hold? If none, say so once.",
+            "the MemContinuum store should hold? Store: " + str(self.store_root) + " — "
+            "a ruling is a new link in topics/<area>/<topic>.md, an incident is a "
+            "file in incidents/ (see docs/SCHEMA.md); NOT Claude Code auto-memory. "
+            "If none, say so once.",
             ctx,
         )
+        self.assertIn(str(self.store_root), ctx)
+        self.assertIn("NOT Claude Code auto-memory", ctx)
+        self.assertNotIn("that memory/ should hold", ctx)
         self.assertEqual(scan_forbidden_lines(ctx), [])
+
+    def test_nudge_falls_back_when_root_unconfigured(self):
+        """INC-0105: if MEMCONTINUUM_ROOT is unavailable, the nudge must
+        render a placeholder rather than a bare folder name that could be
+        misread as Claude Code auto-memory again."""
+        session_id = "s-prompt-noroot"
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+        env = self.base_env(MEMCONTINUUM_ROOT="")
+        proc, _ = run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), env)
+        self.assertTrue(proc.stdout.strip())
+        ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("<store root not configured>", ctx)
+        self.assertNotIn("that memory/ should hold", ctx)
 
     def test_more_than_8_paths_truncated_with_plus_n(self):
         session_id = "s-prompt-many"
@@ -2168,11 +2199,15 @@ class TestUserPromptRemind(HookTestBase):
 #     (docs/DESIGN.md 2026-08-30)
 # ---------------------------------------------------------------------------
 
-LOOKBACK_QUESTION = (
-    "Did the conversation since then establish any ruling, incident, "
-    "rejected alternative, priority, wording choice, money decision, or "
-    "'not now' that memory/ should hold? If none, say so once."
-)
+def lookback_question(store_root):
+    return (
+        "Did the conversation since then establish any ruling, incident, "
+        "rejected alternative, priority, wording choice, money decision, or "
+        "'not now' that the MemContinuum store should hold? Store: "
+        + str(store_root) + " — a ruling is a new link in "
+        "topics/<area>/<topic>.md, an incident is a file in incidents/ "
+        "(see docs/SCHEMA.md); NOT Claude Code auto-memory. If none, say so once."
+    )
 
 
 class TestUserPromptLookback(HookTestBase):
@@ -2212,7 +2247,10 @@ class TestUserPromptLookback(HookTestBase):
         self.assertIn("Look-back signal", ctx)
         self.assertIn("5 user turns with no edited-file evidence.", ctx)
         self.assertNotIn("Coverage signal", ctx)
-        self.assertIn(LOOKBACK_QUESTION, ctx)
+        self.assertIn(lookback_question(self.store_root), ctx)
+        self.assertIn(str(self.store_root), ctx)
+        self.assertIn("NOT Claude Code auto-memory", ctx)
+        self.assertNotIn("that memory/ should hold", ctx)
         self.assertEqual(scan_forbidden_lines(ctx), [])
         # exactly one block -- one hookSpecificOutput, one question
         self.assertEqual(ctx.count("Did the conversation"), 1)
