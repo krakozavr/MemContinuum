@@ -6,3 +6,4 @@ fixtures/records/
 memory/
 .venv/
 docs/internal/
+.claude/skills/

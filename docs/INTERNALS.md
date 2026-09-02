@@ -308,6 +308,11 @@ seven hook command lines, and `<!-- memcontinuum-rendered: <fingerprint> -->`
 as an HTML comment — the rules file's second line (after its identity-marker
 first line); the skill copy's, right after the frontmatter's closing `---`
 (never at byte 0 — the skill loader needs the opening `---` to stay line 1).
+The engine repo is itself a wired MemContinuum project, so its own
+`.claude/` install artifacts (the installed skill copy included) are
+gitignored render targets like any other checkout's — never tracked — with
+the templates under `skills/` and `templates/` staying the sole tracked
+source.
 
 **The stamp is a fingerprint of the render inputs, not the engine's HEAD
 commit.** Two kinds of change reach a wired repository in completely
