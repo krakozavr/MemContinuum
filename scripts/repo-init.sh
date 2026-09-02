@@ -38,6 +38,19 @@ SKILL_SRC="$ENGINE_ROOT/skills/memory-search/SKILL.md"
 
 OUR_HOOK_SCRIPTS="pre-edit-chain.sh newfile-nudge.sh ledger-post-edit.sh precompact-persist.sh sessionstart-remind.sh userprompt-remind.sh sessionend-stamp.sh"
 
+# D1 (updater workstream): the engine commit that is about to render every
+# hook line, the rules file, and the installed skill copy -- a stamp so a
+# later `memcontinuum-update.sh` can tell a rendered artifact apart from
+# "whatever commit last rendered it". Short sha, derived from THIS checkout
+# (not the cwd -- ENGINE_ROOT is always where this script itself lives, so a
+# `--code-root`-only invocation from an unrelated repo still stamps
+# correctly). "unknown" when the engine checkout is not a git repo at all
+# (a tarball drop, for instance) -- absent/unknown stamps read as
+# "pre-stamp render, re-render to find out" by the updater, never as an
+# error here.
+RENDERED_SHA="$(git -C "$ENGINE_ROOT" rev-parse --short HEAD 2>/dev/null)"
+[ -n "$RENDERED_SHA" ] || RENDERED_SHA="unknown"
+
 PROJECT=""
 STORE=""
 STORE_GIVEN=0
@@ -476,6 +489,22 @@ STORE_PARENT_ANCESTOR="$(nearest_existing_ancestor "$(dirname "$STORE")")"
 CLAUDE_DIR_ANCESTOR="$(nearest_existing_ancestor "$CLAUDE_DIR")"
 [ -w "$CLAUDE_DIR_ANCESTOR" ] || fail "cannot write --claude-dir $CLAUDE_DIR (nearest existing ancestor $CLAUDE_DIR_ANCESTOR is not writable)" 5
 
+# D4 (updater workstream): refuse a foreign rules file BEFORE any mutation
+# below (fix-round-4 F10's own principle -- a refusal after hooks are
+# already wired would report failure from a half-finished install).
+# templates/memcontinuum-rules.md's first line is the identity marker; an
+# existing $CLAUDE_DIR/rules/memcontinuum.md is only ever overwritten when
+# its own first line matches -- a hand-authored or foreign file at that path
+# is left alone, loudly.
+RULES_IDENTITY_MARKER="<!-- memcontinuum-rules v1 — rendered by MemContinuum repo-init; do not hand-edit -->"
+RULES_DEST="$CLAUDE_DIR/rules/memcontinuum.md"
+if [ -f "$RULES_DEST" ]; then
+    RULES_DEST_FIRST_LINE="$(head -n 1 "$RULES_DEST" 2>/dev/null)"
+    if [ "$RULES_DEST_FIRST_LINE" != "$RULES_IDENTITY_MARKER" ]; then
+        fail "$RULES_DEST already exists and was not rendered by this installer (first line does not match the identity marker) -- refusing to overwrite a hand-authored or foreign rules file. Move it aside first if you want repo-init to render one here." 14
+    fi
+fi
+
 # --- code census + consent dialogue (Task 10, Anatomy M1) -----------------
 #
 # Runs BEFORE the plan summary (so its outcome -- the chosen language set,
@@ -844,6 +873,7 @@ MC_INSTALL_SCRIPTS_DIR="$SCRIPT_DIR" \
 MC_INSTALL_ENGINE_ROOT="$ENGINE_ROOT" \
 MC_INSTALL_LANGS="$CHOSEN_LANGS" \
 MC_INSTALL_NEVER_EXTS="$NEVER_EXTS_RAW" \
+MC_INSTALL_RENDERED="$RENDERED_SHA" \
 "$PYTHON_BIN" - <<'PYEOF'
 import json
 import os
@@ -858,6 +888,7 @@ hooks_dir = os.environ["MC_INSTALL_HOOKS_DIR"]
 templates_dir = os.environ["MC_INSTALL_TEMPLATES_DIR"]
 code_roots = [l for l in os.environ.get("MC_INSTALL_CODE_ROOTS", "").split("\n") if l]
 dry_run = os.environ.get("MC_INSTALL_DRY_RUN", "0") == "1"
+rendered_sha = os.environ["MC_INSTALL_RENDERED"]
 
 # Fix-round-4 F8: the ONE settings merge implementation, shared with
 # memcontinuum-setup.sh -- see scripts/mc_settings_merge.py's own docstring.
@@ -969,6 +1000,7 @@ write_rendered = render(write_tmpl, {
     "PYTHON": esc_cmd(python_bin),
     "HOOKS_DIR": esc_cmd(hooks_dir),
     "CODE_ROOT_ENV": code_root_env,
+    "RENDERED": esc_cmd(rendered_sha),
 })
 try:
     write_block = json.loads(write_rendered)
@@ -993,6 +1025,7 @@ if code_roots:
             "STRIP_PREFIX": esc_cmd(strip_prefix),
             "PYTHON": esc_cmd(python_bin),
             "HOOKS_DIR": esc_cmd(hooks_dir),
+            "RENDERED": esc_cmd(rendered_sha),
         }))
     filters_text = ",\n".join(pairs)
 
@@ -1030,6 +1063,7 @@ if code_roots:
             "LANG_EXTS_ENV": lang_exts_env,
             "NEVER_EXTS_ENV": never_exts_env,
             "KNOWN_EXTS_CMD": known_exts_cmd,
+            "RENDERED": esc_cmd(rendered_sha),
         }))
     nudge_filters_text = ",\n".join(nudge_pairs)
 
@@ -1086,12 +1120,49 @@ PYEOF
 MERGE_RC=$?
 [ $MERGE_RC -eq 0 ] || fail "hook wiring failed (see above)" 6
 
+# --- 4b. render the project routing rule (D4, TOP-0117/INC-0105) ----------
+#
+# Rendered on EVERY install (fresh or re-run), not write-if-absent like the
+# store README above -- this file's whole point is to always name the
+# CURRENT store, and repo-init is its only writer (the identity-marker
+# refusal above already ruled out clobbering anything foreign). {{STORE}}
+# is the template's one placeholder; the stamp line goes right after the
+# identity-marker first line so a `head -1` identity check (above, and any
+# future one) keeps matching a stamped file.
+
+step "rules file: $RULES_DEST (rendered from templates/memcontinuum-rules.md)"
+if [ "$DRY_RUN" -eq 0 ]; then
+    mkdir -p "$CLAUDE_DIR/rules" || fail "could not create $CLAUDE_DIR/rules"
+    RULES_TMPL="$(cat "$TEMPLATES_DIR/memcontinuum-rules.md")"
+    RULES_TMPL="${RULES_TMPL//\{\{STORE\}\}/$STORE}"
+    RULES_FIRST_LINE="${RULES_TMPL%%$'\n'*}"
+    RULES_REST="${RULES_TMPL#*$'\n'}"
+    {
+        printf '%s\n' "$RULES_FIRST_LINE"
+        printf '<!-- memcontinuum-rendered: %s -->\n' "$RENDERED_SHA"
+        printf '%s\n' "$RULES_REST"
+    } > "$RULES_DEST" || fail "could not write $RULES_DEST"
+fi
+
 # --- 5. install the memory-search skill -------------------------------
 
 step "install skill: $CLAUDE_DIR/skills/memory-search/SKILL.md"
 if [ "$DRY_RUN" -eq 0 ]; then
     mkdir -p "$CLAUDE_DIR/skills/memory-search" || fail "could not create $CLAUDE_DIR/skills/memory-search"
     cp -f "$SKILL_SRC" "$CLAUDE_DIR/skills/memory-search/SKILL.md" || fail "could not copy SKILL.md"
+    # D1: stamp the INSTALLED COPY only, right after the frontmatter's
+    # closing "---" (never at byte 0 -- the skill loader needs the OPENING
+    # "---" to stay the very first line of the file).
+    SKILL_DEST="$CLAUDE_DIR/skills/memory-search/SKILL.md"
+    FM_END_LINE="$(grep -n '^---$' "$SKILL_DEST" | sed -n '2p' | cut -d: -f1)"
+    if [ -n "$FM_END_LINE" ]; then
+        SKILL_TMP="$SKILL_DEST.tmp-memcontinuum-stamp"
+        {
+            head -n "$FM_END_LINE" "$SKILL_DEST"
+            printf '<!-- memcontinuum-rendered: %s -->\n' "$RENDERED_SHA"
+            tail -n "+$((FM_END_LINE + 1))" "$SKILL_DEST"
+        } > "$SKILL_TMP" && mv "$SKILL_TMP" "$SKILL_DEST" || fail "could not stamp $SKILL_DEST"
+    fi
 fi
 
 # --- 6. git post-commit reindex wrapper -------------------------------
@@ -1230,6 +1301,7 @@ else
     echo "Store README   : $STORE/README.md"
     echo "Store git repo : $STORE/.git"
     echo "Settings file  : $CLAUDE_DIR/settings.local.json"
+    echo "Rules file     : $RULES_DEST (rendered by $RENDERED_SHA)"
     echo "Skill installed: $CLAUDE_DIR/skills/memory-search/SKILL.md"
     if [ -n "${STORE_HOOKS_DIR:-}" ] && [ -f "$STORE_HOOKS_DIR/post-commit" ]; then
         echo "Post-commit    : $STORE_HOOKS_DIR/post-commit (wraps $HOOKS_DIR/post-commit-reindex.sh)"
@@ -1285,6 +1357,7 @@ else
      $OUR_HOOK_SCRIPTS
    then delete:
      $CLAUDE_DIR/skills/memory-search/
+     $RULES_DEST
      ${STORE_HOOKS_DIR:-$STORE/.git/hooks}/post-commit
      ~/.memcontinuum/$PROJECT.sqlite
    (leave $STORE itself alone -- it is the store's own git history).

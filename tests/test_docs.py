@@ -139,6 +139,14 @@ class TestInstalledSkillsMatchTheirTemplates(unittest.TestCase):
         )
 
     def test_each_installed_skill_is_byte_identical_to_its_template(self):
+        # D1 (updater workstream): repo-init.sh stamps the copy it installs
+        # with one extra line -- "<!-- memcontinuum-rendered: SHA -->",
+        # right after the frontmatter's closing "---" -- that the template
+        # never carries and that changes on every commit. Stripped before
+        # comparing, "identical" still means "identical" (the invariant
+        # this test guards: a template fix reaching the installed copy),
+        # just tolerant of the one line whose whole job is to differ.
+        stamp_re = re.compile(rb"^<!-- memcontinuum-rendered: [^\n]* -->\n", re.M)
         drifted = []
         for installed in INSTALLED_SKILLS:
             template = TOOLS_DIR / "skills" / installed.parent.name / "SKILL.md"
@@ -147,7 +155,8 @@ class TestInstalledSkillsMatchTheirTemplates(unittest.TestCase):
                 f"{installed.relative_to(TOOLS_DIR)} has no template at "
                 f"{template.relative_to(TOOLS_DIR)}",
             )
-            if installed.read_bytes() != template.read_bytes():
+            installed_bytes = stamp_re.sub(b"", installed.read_bytes())
+            if installed_bytes != template.read_bytes():
                 drifted.append(str(installed.relative_to(TOOLS_DIR)))
         self.assertEqual(
             drifted, [],

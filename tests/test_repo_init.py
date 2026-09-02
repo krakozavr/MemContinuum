@@ -225,10 +225,29 @@ class TestFreshInstall(unittest.TestCase):
         self.assertIn("MEMCONTINUUM_PROJECT", text)
 
     def test_skill_copied(self):
+        # D1 (updater workstream): the installed copy carries one extra
+        # line -- a "<!-- memcontinuum-rendered: SHA -->" stamp right after
+        # the frontmatter's closing "---" -- that the template never has.
+        # Stripped before comparing, the two are still identical.
         dst = self.claude_dir / "skills" / "memory-search" / "SKILL.md"
         src = TOOLS_DIR / "skills" / "memory-search" / "SKILL.md"
         self.assertTrue(dst.is_file())
-        self.assertEqual(dst.read_text(), src.read_text())
+        stamp_re = re.compile(r"^<!-- memcontinuum-rendered: [^\n]* -->\n", re.M)
+        self.assertEqual(stamp_re.sub("", dst.read_text()), src.read_text())
+
+    def test_skill_copy_stamp_present(self):
+        dst = self.claude_dir / "skills" / "memory-search" / "SKILL.md"
+        text = dst.read_text()
+        lines = text.splitlines()
+        # Right after the frontmatter's closing "---" (the second "---"
+        # line), never at byte 0 -- the opening "---" must stay line 1 for
+        # the skill loader.
+        self.assertEqual(lines[0], "---")
+        fm_end = lines[1:].index("---") + 1
+        self.assertTrue(
+            lines[fm_end + 1].startswith("<!-- memcontinuum-rendered: "),
+            f"expected a stamp line right after the frontmatter, got: {lines[fm_end + 1]!r}",
+        )
 
     def test_settings_is_valid_json(self):
         data = json.loads(self.settings_path.read_text())
@@ -355,6 +374,49 @@ class TestFreshInstall(unittest.TestCase):
     def test_db_created_under_home_memcontinuum(self):
         db = Path(self.home) / ".memcontinuum" / "widgetco.sqlite"
         self.assertTrue(db.is_file())
+
+    # --- D1 (updater workstream): version stamp ---------------------------
+
+    def _engine_sha(self):
+        out = subprocess.run(
+            ["git", "-C", str(TOOLS_DIR), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        return out or "unknown"
+
+    def test_every_rendered_hook_line_carries_the_stamp(self):
+        """D1: MEMCONTINUUM_RENDERED=<engine short sha> on every hook line
+        this installer renders -- all seven scripts (the five always-wired
+        write-side hooks, plus pre-edit-chain.sh rendered twice for
+        Edit/Write, plus newfile-nudge.sh -- eight command lines total for
+        an install with one --code-root, this fixture's shape)."""
+        data = json.loads(self.settings_path.read_text())
+        commands = [
+            h.get("command", "")
+            for event_groups in data["hooks"].values()
+            for group in event_groups
+            for h in group.get("hooks", [])
+            if "command" in h
+        ]
+        self.assertEqual(len(commands), 8, commands)
+        token = f"MEMCONTINUUM_RENDERED={self._engine_sha()}"
+        for cmd in commands:
+            self.assertIn(token, cmd, cmd)
+
+    # --- D4 (updater workstream): rendered rules file ----------------------
+
+    def test_rules_file_rendered_with_store_filled(self):
+        rules = self.claude_dir / "rules" / "memcontinuum.md"
+        self.assertTrue(rules.is_file())
+        text = rules.read_text()
+        lines = text.splitlines()
+        self.assertEqual(
+            lines[0],
+            "<!-- memcontinuum-rules v1 — rendered by MemContinuum repo-init; do not hand-edit -->",
+        )
+        self.assertEqual(lines[1], f"<!-- memcontinuum-rendered: {self._engine_sha()} -->")
+        self.assertIn(f"MemContinuum store ({self.store})", text)
+        self.assertNotIn("{{STORE}}", text)
 
 
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
@@ -704,6 +766,50 @@ class TestFailureModes(unittest.TestCase):
                 ["--project", "p", "--store", store, "--claude-dir", claude_dir, "--force"], home)
             self.assertEqual(proc2.returncode, 0, proc2.stdout + proc2.stderr)
             self.assertTrue(Path(store).is_dir())
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_foreign_rules_file_refused_before_any_mutation(self):
+        """D4: an existing $CLAUDE_DIR/rules/memcontinuum.md whose first
+        line does not match the identity marker is a hand-authored or
+        foreign file -- refused, not overwritten, and refused BEFORE any
+        other mutation (the store tree, settings.local.json) so a refusal
+        never leaves a half-finished install behind."""
+        home = sandbox_home()
+        try:
+            store = str(Path(home) / "store")
+            claude_dir = Path(home) / ".claude"
+            rules_dir = claude_dir / "rules"
+            rules_dir.mkdir(parents=True)
+            (rules_dir / "memcontinuum.md").write_text("# hand-written notes\nnot ours\n")
+            proc = run_install(
+                ["--project", "p", "--store", store, "--claude-dir", str(claude_dir)],
+                home,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("memcontinuum.md", proc.stdout + proc.stderr)
+            self.assertEqual(
+                (rules_dir / "memcontinuum.md").read_text(),
+                "# hand-written notes\nnot ours\n",
+                "foreign rules file must be left untouched",
+            )
+            self.assertFalse(Path(store).exists(), "no mutation at all on refusal")
+            self.assertFalse((claude_dir / "settings.local.json").exists())
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_own_rendered_rules_file_is_overwritten_on_reinstall(self):
+        home = sandbox_home()
+        try:
+            store = str(Path(home) / "store")
+            claude_dir = Path(home) / ".claude"
+            proc1 = run_install(["--project", "p", "--store", store, "--claude-dir", str(claude_dir)], home)
+            self.assertEqual(proc1.returncode, 0, proc1.stdout + proc1.stderr)
+            rules_path = claude_dir / "rules" / "memcontinuum.md"
+            self.assertTrue(rules_path.is_file())
+            proc2 = run_install(["--project", "p", "--store", store, "--claude-dir", str(claude_dir)], home)
+            self.assertEqual(proc2.returncode, 0, proc2.stdout + proc2.stderr)
+            self.assertIn(f"MemContinuum store ({store})", rules_path.read_text())
         finally:
             shutil.rmtree(home, ignore_errors=True)
 
