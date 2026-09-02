@@ -2096,6 +2096,231 @@ class TestThePartialRenderNoteIsOnlyPrintedWhenTrue(unittest.TestCase):
         self.assertIn("*.zz", combined, combined)
 
 
+class TestFlagsTheModeDoesNotConsumeAreRefused(unittest.TestCase):
+    """This command has four modes and they read the same option names
+    differently. A flag the selected mode does not consume must be REFUSED,
+    naming the mode and the flag -- never accepted and quietly dropped. A
+    dropped flag is the worst outcome available here: the human typed what
+    they wanted, the command reported success, and it did something else."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-matrix-test-")
+        self.home = str(Path(self.tmp) / "home")
+        os.makedirs(self.home, exist_ok=True)
+        self.repo = git_repo(str(Path(self.tmp) / "repo"))
+        self.store = str(Path(self.tmp) / "store")
+        self.code_root = str(Path(self.tmp) / "code")
+        os.makedirs(self.code_root, exist_ok=True)
+        (Path(self.code_root) / "x.py").write_text("print(1)\n")
+        self.claude_a = str(Path(self.repo) / ".claude")
+        self.claude_b = str(Path(self.tmp) / "session-home" / ".claude")
+
+    def _install(self, claude_dir):
+        proc = run(INSTALL_SH, ["--project", "m", "--store", self.store,
+                                "--claude-dir", claude_dir, "--code-root", self.code_root,
+                                "--langs", "python", "--never-ext", ".cs",
+                                "--non-interactive"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def _current_format_row(self, dirs):
+        for d in dirs:
+            self._install(d)
+        args = ["wired", "--repo", self.repo, "--store", self.store, "--project", "m"]
+        for d in dirs:
+            args += ["--claude-dir", d]
+        args += ["--code-root", self.code_root, "--langs", "python", "--never-ext", ".cs"]
+        proc = run(DECIDE_SH, args, self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def _refused(self, args, mode_word, flag):
+        proc = run(UPDATE_SH, args, self.home)
+        combined = proc.stdout + proc.stderr
+        self.assertNotEqual(proc.returncode, 0, combined)
+        self.assertIn(flag, combined, combined)
+        self.assertIn(mode_word, combined.lower(), combined)
+        return combined
+
+    # --- walk mode: no --repo, so nothing that describes one row ------------
+
+    def test_walk_mode_refuses_every_per_row_flag(self):
+        for flag, value in (("--claude-dir", self.claude_a),
+                            ("--code-root", self.code_root),
+                            ("--langs", "python"),
+                            ("--set-never-ext", ".cs")):
+            with self.subTest(flag=flag):
+                self._refused(["--apply", flag, value], "walk", flag)
+
+    # --- targeted mode: --add-lang/--never-ext, which change one row's -----
+    # --- language and never lists and nothing else ------------------------
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_targeted_mode_refuses_the_migration_and_dir_flags(self):
+        self._current_format_row([self.claude_a])
+        before = decisions_tsv(self.home).read_text()
+        before_settings = Path(self.claude_a, "settings.local.json").read_text()
+        for flag, value in (("--claude-dir", self.claude_a),
+                            ("--code-root", self.code_root),
+                            ("--langs", "python"),
+                            ("--set-never-ext", ".cs")):
+            with self.subTest(flag=flag):
+                self._refused(["--add-lang", "swift", "--repo", self.repo, flag, value],
+                              "targeted", flag)
+        with self.subTest(flag="--machine"):
+            self._refused(["--add-lang", "swift", "--repo", self.repo, "--machine"],
+                          "targeted", "--machine")
+        self.assertEqual(decisions_tsv(self.home).read_text(), before)
+        self.assertEqual(Path(self.claude_a, "settings.local.json").read_text(),
+                         before_settings)
+
+    # --- a CURRENT-format row: its parameters are on record, so the ---------
+    # --- migration overrides have nothing to supply ------------------------
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_a_recorded_row_refuses_the_migration_overrides(self):
+        self._current_format_row([self.claude_a])
+        before = decisions_tsv(self.home).read_text()
+        for flag, value in (("--code-root", self.code_root),
+                            ("--langs", "python"),
+                            ("--set-never-ext", ".cs")):
+            with self.subTest(flag=flag):
+                combined = self._refused(
+                    ["--apply", "--repo", self.repo, flag, value], "record", flag)
+                self.assertNotIn("applying:", combined, combined)
+        self.assertEqual(decisions_tsv(self.home).read_text(), before)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_a_claude_dir_the_row_does_not_record_is_refused(self):
+        self._current_format_row([self.claude_a])
+        stranger = str(Path(self.tmp) / "stranger" / ".claude")
+        os.makedirs(stranger, exist_ok=True)
+        proc = run(UPDATE_SH, ["--apply", "--repo", self.repo,
+                               "--claude-dir", stranger], self.home)
+        combined = proc.stdout + proc.stderr
+        self.assertNotEqual(proc.returncode, 0, combined)
+        self.assertIn("dir-not-recorded", combined, combined)
+        self.assertFalse(Path(stranger, "settings.local.json").exists())
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_claude_dir_narrows_a_recorded_row_to_those_dirs_only(self):
+        """The subset walk: on a row that records its dirs, --claude-dir means
+        "act on these and leave the rest alone"."""
+        self._current_format_row([self.claude_a, self.claude_b])
+        for cd in (self.claude_a, self.claude_b):
+            path = Path(cd, "settings.local.json")
+            path.write_text(path.read_text().replace(
+                "MEMCONTINUUM_RENDERED=%s " % engine_sha(),
+                "MEMCONTINUUM_RENDERED=deadbee "))
+        before_b = Path(self.claude_b, "settings.local.json").read_text()
+
+        proc = run(UPDATE_SH, ["--apply", "--repo", self.repo,
+                               "--claude-dir", self.claude_a], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        # Tab-separated lines only: --apply also prints its own "applying:"
+        # and "OK" progress lines onto stdout, between the table rows.
+        lines = [l for l in proc.stdout.splitlines() if "\t" in l]
+        header = lines[0].split("\t")
+        self.assertEqual(header[1], "claude-dir", proc.stdout)
+        rows = [dict(zip(header, l.split("\t"))) for l in lines[1:]]
+        self.assertEqual([r["claude-dir"] for r in rows], [self.claude_a], proc.stdout)
+        self.assertIn("MEMCONTINUUM_RENDERED=%s " % engine_sha(),
+                      Path(self.claude_a, "settings.local.json").read_text())
+        self.assertEqual(Path(self.claude_b, "settings.local.json").read_text(), before_b,
+                         "a dir the command was not asked to touch was re-rendered")
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_a_legacy_row_still_takes_all_four(self):
+        """The green half of the matrix: on a legacy row these flags are the
+        migration's whole point, and must keep working."""
+        self._install(self.claude_a)
+        write_row(self.home, self.repo, "wired",
+                  note=f"store={self.store} project=m")
+        proc = run(UPDATE_SH, ["--apply", "--repo", self.repo,
+                               "--claude-dir", self.claude_a,
+                               "--code-root", self.code_root,
+                               "--langs", "python", "--set-never-ext", ".cs"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        note = decisions_tsv(self.home).read_text().splitlines()[-1]
+        self.assertIn("langs=python", note, note)
+        self.assertIn("never=.cs", note, note)
+
+
+class TestDisagreementComparesTheRawRenderedValues(unittest.TestCase):
+    """What a re-render replays is the rendered VALUE, not the tidy name it
+    normalizes to. Two dirs whose extension globs differ but map to the same
+    language list are still rendering different things, and picking one to
+    replay onto the other silently changes what the other indexes."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-rawset-test-")
+        self.home = str(Path(self.tmp) / "home")
+        os.makedirs(self.home, exist_ok=True)
+        self.repo = git_repo(str(Path(self.tmp) / "repo"))
+        self.store = str(Path(self.tmp) / "store")
+        self.code_root = str(Path(self.tmp) / "code")
+        os.makedirs(self.code_root, exist_ok=True)
+        (Path(self.code_root) / "x.py").write_text("print(1)\n")
+        self.claude_a = str(Path(self.repo) / ".claude")
+        self.claude_b = str(Path(self.tmp) / "session-home" / ".claude")
+        for cd in (self.claude_a, self.claude_b):
+            proc = run(INSTALL_SH, ["--project", "raw", "--store", self.store,
+                                    "--claude-dir", cd, "--code-root", self.code_root,
+                                    "--langs", "python", "--non-interactive"], self.home)
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+        # B carries an extra glob this engine knows no language for. Both dirs
+        # still NORMALIZE to exactly "python".
+        path = Path(self.claude_b, "settings.local.json")
+        path.write_text(path.read_text().replace(
+            "MEMCONTINUUM_LANG_EXTS='*.py'", "MEMCONTINUUM_LANG_EXTS='*.py *.zz'"))
+        write_row(self.home, self.repo, "wired",
+                  note=f"store={self.store} project=raw")
+
+    def _apply(self, extra=()):
+        return run(UPDATE_SH, ["--apply", "--repo", self.repo,
+                               "--claude-dir", self.claude_a,
+                               "--claude-dir", self.claude_b] + list(extra), self.home)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_globs_that_normalize_to_the_same_languages_still_disagree(self):
+        before = decisions_tsv(self.home).read_text()
+        before_a = Path(self.claude_a, "settings.local.json").read_text()
+        before_b = Path(self.claude_b, "settings.local.json").read_text()
+        proc = self._apply()
+        combined = proc.stdout + proc.stderr
+        self.assertNotEqual(proc.returncode, 0, combined)
+        self.assertIn("migrate-dirs-disagree", combined, combined)
+        self.assertIn("*.py *.zz", combined,
+                      "the raw recovered value must be shown, not the "
+                      "language name it normalizes to:\n" + combined)
+        self.assertEqual(decisions_tsv(self.home).read_text(), before)
+        self.assertEqual(Path(self.claude_a, "settings.local.json").read_text(), before_a)
+        self.assertEqual(Path(self.claude_b, "settings.local.json").read_text(), before_b)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_the_partial_note_is_attributed_to_the_dir_it_came_from(self):
+        """Not the first dir's note printed for the row: A is fully rendered
+        and B is not, so a first-dir-only note says nothing at all here."""
+        proc = self._apply()
+        combined = proc.stdout + proc.stderr
+        zz_lines = [l for l in combined.splitlines() if "*.zz" in l and "partially" in l]
+        self.assertTrue(zz_lines, "no partial-render note for the dir that has one:\n"
+                        + combined)
+        for line in zz_lines:
+            self.assertIn(self.claude_b, line, line)
+            self.assertNotIn(self.claude_a, line,
+                             "the note was attributed to the wrong dir: " + line)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_explicit_langs_resolves_it_and_both_dirs_render_identically(self):
+        proc = self._apply(["--langs", "python"])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        note = decisions_tsv(self.home).read_text().splitlines()[-1]
+        self.assertIn("langs=python", note, note)
+        for cd in (self.claude_a, self.claude_b):
+            settings = Path(cd, "settings.local.json").read_text()
+            self.assertIn("MEMCONTINUUM_LANG_EXTS='*.py'", settings, cd)
+            self.assertNotIn("*.zz", settings, cd)
+
+
 class TestHelp(unittest.TestCase):
     def test_help_exits_zero_and_documents_the_flags(self):
         proc = subprocess.run([MC_BASH, str(UPDATE_SH), "--help"], capture_output=True, text=True)

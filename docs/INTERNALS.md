@@ -386,6 +386,31 @@ rules | action`, action being one of `ok`, `stale`, `store-mismatch`,
 recorded parameters, always passing `--adopt-only` (below), so this command
 cannot create, rename, or delete a store on any path through it.
 
+**The flag/mode matrix.** The same option names mean different things in
+different modes, so each mode consumes a fixed set and refuses anything else,
+naming the mode and the flag. Accepted-and-ignored is the one outcome ruled
+out: the human typed what they wanted, the command reported success, and it
+did something else.
+
+| mode | selected by | consumes |
+| --- | --- | --- |
+| `walk` | no `--repo` | `--dry-run` `--apply` `--machine` |
+| `targeted` | `--add-lang`/`--never-ext` (needs `--repo`) | `--dry-run` `--repo` `--add-lang` `--never-ext` |
+| `repo` | `--repo`, no `--add-lang`/`--never-ext` | `--dry-run` `--apply` `--machine` `--repo` `--claude-dir` |
+
+Everything decidable from the command line alone is enforced before the
+registry is opened. The rest is a property of the *row*, so `repo` mode splits
+when the row is read:
+
+- a **legacy** row (no `claude-dirs=`) also consumes `--code-root`, `--langs`
+  and `--set-never-ext`: they supply the parameters the row never recorded.
+- a **current-format** row refuses those three — it already records them, and
+  this mode does not rewrite what a row records (`--add-lang`/`--never-ext`
+  do, additively, or a `decide.sh wired` line). `--claude-dir` changes meaning
+  rather than being refused: it **narrows** the walk to the dirs it names, and
+  each must be one the row already records. One that is not is refused as
+  `dir-not-recorded` — never walked, never installed into.
+
 **Action precedence.** The answers this command will never act on come first:
 `store-missing`, then `no-wiring`, then `rules-foreign`, then the
 `migrate-needs-*`/`migrate-dirs-disagree` questions, and only then the drift
@@ -492,8 +517,19 @@ re-render replays, so a value invented here would be permanent:
   plain extension list (hand-edited). Pass `--set-never-ext LIST`.
 - **`migrate-dirs-disagree`** — the named claude-dirs were recovered
   separately and do not hold the same code-roots, languages or never-list.
-  Both recoveries are printed under the row; resolve it with explicit
+  Every dir's recovery is printed under the row; resolve it with explicit
   `--code-root DIR` (repeatable), `--langs LIST`, `--set-never-ext LIST`.
+
+  The comparison is on the **raw rendered values** — the
+  `MEMCONTINUUM_LANG_EXTS`/`MEMCONTINUUM_NEVER_EXTS` glob strings and the
+  code-root list exactly as they sit on the hook lines — not on the language
+  names they normalize to. Normalizing is lossy in the one direction that
+  matters here: `*.py` and `*.py *.zz` both come back as the language list
+  `python`, and treating them as equal lets one dir's wiring be replayed over
+  the other's, changing what it indexes. Partial-render notes are collected
+  per dir and all of them printed, attributed to the dir they came from; the
+  first dir's note standing for the row meant a fully rendered first dir hid a
+  partially rendered second one entirely.
 
 **One row is one project, and one project has one wiring set.** A registry
 row records a single `code-roots=`/`langs=`/`never=` triple, and every

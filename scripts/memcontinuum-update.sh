@@ -66,6 +66,35 @@
 #            re-runs memcontinuum-setup.sh, but only when it is actually
 #            stale. Off by default -- most drift is per-repo.
 #
+# MODES, AND WHICH FLAGS EACH ONE TAKES
+#
+# The same option names mean different things depending on what is being
+# asked for, so each mode consumes a fixed set and REFUSES anything else,
+# naming the mode and the flag. A flag accepted and quietly dropped is the
+# worst answer this command could give: you typed what you wanted, it
+# reported success, and it did something else.
+#
+#   walk        no --repo. Every wired row.
+#               --dry-run --apply --machine
+#   targeted    --add-lang / --never-ext (with --repo). One row's language
+#               and never-extension lists, additively, and nothing else.
+#               --dry-run --repo --add-lang --never-ext
+#   repo        --repo, without --add-lang/--never-ext. One row.
+#               --dry-run --apply --machine --repo --claude-dir
+#
+# In `repo` mode the remaining flags depend on the ROW, not on the command
+# line, so they are settled when the row is read:
+#
+#   a LEGACY row (records no claude-dirs) also takes --code-root, --langs and
+#   --set-never-ext -- they supply what the row never wrote down. See below.
+#
+#   a CURRENT-FORMAT row already records all of that, so those three are
+#   refused; there is nothing for them to supply, and this mode does not
+#   rewrite what a row records. --claude-dir instead NARROWS the walk: it
+#   means "re-render these dirs of this row and leave its others alone", and
+#   every dir named must be one the row already records (a dir it does not is
+#   refused as `dir-not-recorded`, never walked and never installed into).
+#
 # MIGRATING A ROW WRITTEN BEFORE THE REGISTRY RECORDED WIRING PARAMETERS
 #
 # Such a row has no claude-dirs on record. This command can see the one
@@ -267,23 +296,58 @@ if [ "$TARGETED" -eq 1 ] && [ "$APPLY" -eq 1 ]; then
     exit 2
 fi
 
+# --- the flag/mode matrix, in one place ------------------------------------
+#
+# Every flag belongs to a mode, and a mode REFUSES any flag it does not
+# consume, naming both. Accepting one and quietly dropping it is the worst
+# answer available here: the human typed what they wanted, this command
+# reported success, and it did something else instead.
+#
+#   MODE      selected by                           consumes
+#   walk      no --repo                             --dry-run --apply --machine
+#   targeted  --add-lang / --never-ext (+ --repo)   --dry-run --repo
+#                                                   --add-lang --never-ext
+#   repo      --repo, no --add-lang/--never-ext     --dry-run --apply --machine
+#                                                   --repo --claude-dir
+#
+# `repo` mode splits once the ROW is read, because what the remaining flags
+# mean is a property of the row and not of the command line -- so that half of
+# the matrix is enforced in the walk, at the point the row is known:
+#
+#   legacy row (records no claude-dirs)  ALSO consumes --code-root --langs
+#       --set-never-ext: they supply the parameters the row never wrote down.
+#   current-format row                   --claude-dir NARROWS the walk to the
+#       dirs it names (each must be one the row records, else dir-not-recorded);
+#       --code-root/--langs/--set-never-ext are refused -- the row already
+#       records those, and this mode does not rewrite them.
+#
+# refuse_flag MODE FLAG WHY
+refuse_flag() {
+    echo "$2 is not accepted in $1 mode: $3" >&2
+    echo "Nothing was read and nothing was written. \`$0 --help\` lists what each mode takes." >&2
+    exit 2
+}
+
+WALK_WHY="--claude-dir/--code-root/--langs/--set-never-ext describe ONE registry row, so they need --repo PATH to say which. Without --repo this command walks every wired row and writes nothing it had to guess."
+TARGETED_WHY="--add-lang/--never-ext re-render exactly the claude-dirs the row records, with the code-roots the row records -- they change its language and never-extension lists and nothing else. To change which dirs or code-roots a row records, say so where rows are written: $DECIDE wired --repo PATH ..."
+
 if [ "$TARGETED" -eq 0 ]; then
-    # Migration overrides are per-row by nature -- a claude-dir set or a
-    # language list belongs to ONE project. With several legacy rows on the
-    # machine and no --repo, there would be no saying which row they meant.
-    if [ "${#OVERRIDE_CLAUDE_DIRS[@]}" -gt 0 ] || [ "${#OVERRIDE_CODE_ROOTS[@]}" -gt 0 ] \
-           || [ -n "$LANGS_FLAG" ] || [ "$SET_NEVER_GIVEN" -eq 1 ]; then
-        [ -n "$TARGET_REPO" ] || {
-            echo "--claude-dir/--code-root/--langs/--set-never-ext describe ONE registry row, so they need --repo PATH to say which. (Without --repo this command walks every wired row and writes nothing it had to guess.)" >&2
-            exit 2
-        }
+    if [ -z "$TARGET_REPO" ]; then
+        [ "${#OVERRIDE_CLAUDE_DIRS[@]}" -eq 0 ] || refuse_flag walk --claude-dir "$WALK_WHY"
+        [ "${#OVERRIDE_CODE_ROOTS[@]}" -eq 0 ] || refuse_flag walk --code-root "$WALK_WHY"
+        [ -z "$LANGS_FLAG" ] || refuse_flag walk --langs "$WALK_WHY"
+        [ "$SET_NEVER_GIVEN" -eq 0 ] || refuse_flag walk --set-never-ext "$WALK_WHY"
     fi
-elif [ "$SET_NEVER_GIVEN" -eq 1 ]; then
-    echo "--set-never-ext supplies the whole never-list for a legacy row's MIGRATION (--apply --repo PATH --claude-dir DIR --set-never-ext LIST). To add one extension to a row that already has its parameters recorded, use --never-ext." >&2
-    exit 2
-elif [ "${#OVERRIDE_CODE_ROOTS[@]}" -gt 0 ]; then
-    echo "--code-root supplies a legacy row's code-root set during its MIGRATION (--apply --repo PATH --claude-dir DIR --code-root DIR). --add-lang/--never-ext re-render the code-roots the row already records; they never change them." >&2
-    exit 2
+    # `repo` mode: --claude-dir is always legal here (it names the migration's
+    # set on a legacy row, and narrows the walk on a current-format one); the
+    # other three are decided against the row, below.
+else
+    [ -n "$TARGET_REPO" ] || { echo "--add-lang/--never-ext requires an explicit repo: pass --repo PATH" >&2; exit 2; }
+    [ "${#OVERRIDE_CLAUDE_DIRS[@]}" -eq 0 ] || refuse_flag targeted --claude-dir "$TARGETED_WHY"
+    [ "${#OVERRIDE_CODE_ROOTS[@]}" -eq 0 ] || refuse_flag targeted --code-root "$TARGETED_WHY"
+    [ -z "$LANGS_FLAG" ] || refuse_flag targeted --langs "$TARGETED_WHY (--add-lang is how this mode names a language.)"
+    [ "$SET_NEVER_GIVEN" -eq 0 ] || refuse_flag targeted --set-never-ext "--set-never-ext supplies the WHOLE never-list for a legacy row's migration (--apply --repo PATH --claude-dir DIR --set-never-ext LIST). To add one extension to a row that already records its parameters, use --never-ext."
+    [ "$MACHINE" -eq 0 ] || refuse_flag targeted --machine "this mode acts on one repository's row. The machine layer is a separate layer with its own command: $0 --apply --machine."
 fi
 
 # --- python resolution (only needed for legacy-row lang recovery below) ---
@@ -398,6 +462,13 @@ mc_update_recover_from_settings() {
     MC_RECOVERED_CODE_ROOTS=""
     MC_RECOVERED_LANGS=""
     MC_RECOVERED_NEVER=""
+    # The RAW rendered values, exactly as they sit on the hook line, beside
+    # the normalized ones. Normalizing is lossy in the direction that matters
+    # for comparing two dirs: `*.py` and `*.py *.zz` both come back as the
+    # language list "python", but they are not the same wiring, and a
+    # migration that treats them as equal replays one over the other.
+    MC_RECOVERED_LANG_GLOBS=""
+    MC_RECOVERED_NEVER_GLOBS=""
     MC_RECOVERED_NEVER_OK=1
     # No nudge line at all means a rationale-only install: there is no code
     # indexing here and therefore no language set to lose, so "" IS the
@@ -456,6 +527,8 @@ mc_update_recover_from_settings() {
                      "$claude_dir/settings.local.json" "$claude_dir/settings.json")
     fi
     MC_RECOVERED_CODE_ROOTS="$(join_semi "${roots[@]:-}")"
+    MC_RECOVERED_LANG_GLOBS="$lang_glob_str"
+    MC_RECOVERED_NEVER_GLOBS="$never_glob_str"
 
     if [ -n "$lang_glob_str" ]; then
         local py glob ext known_exts known_lang lang_list=""
@@ -761,7 +834,8 @@ trap 'rm -f "$SBOX_APPLY_LOG"' EXIT
 # --- targeted mode: --add-lang / --never-ext -------------------------------
 
 if [ "$TARGETED" -eq 1 ]; then
-    [ -n "$TARGET_REPO" ] || { echo "--add-lang/--never-ext requires an explicit repo: pass --repo PATH" >&2; exit 2; }
+    # --repo, and every flag this mode does not consume, were settled by the
+    # matrix above -- before the registry was read.
     if ! mc_repo_key "$TARGET_REPO"; then
         echo "not a git repository: $TARGET_REPO" >&2
         exit 1
@@ -1074,6 +1148,47 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
         fi
     fi
 
+    # The half of the flag/mode matrix that only the ROW can settle. A
+    # current-format row already records its code-roots, languages and
+    # never-list; the migration overrides exist to supply what a legacy row
+    # never wrote down, so here they have nothing to supply and are refused
+    # rather than accepted and dropped. (Changing what a recorded row says is
+    # --add-lang/--never-ext, additively, or a decide.sh line.)
+    #
+    # --claude-dir is the exception, and it changes meaning rather than being
+    # refused: on a recorded row it NARROWS the walk to the dirs it names --
+    # "re-render these and leave the rest alone" -- and each must be one the
+    # row already records. A dir that is not on the row is refused
+    # (dir-not-recorded) rather than walked: this command re-renders what a
+    # row describes, and a dir the row has never heard of is not that.
+    if [ "$LEGACY" -eq 0 ]; then
+        [ "${#OVERRIDE_CODE_ROOTS[@]}" -eq 0 ] || refuse_flag "recorded-row" --code-root \
+            "$KEY already records code-roots=${CODE_ROOTS_SEMI:-(none)}. --code-root/--langs/--set-never-ext supply a LEGACY row's parameters during migration; this row is already migrated."
+        [ -z "$LANGS_FLAG" ] || refuse_flag "recorded-row" --langs \
+            "$KEY already records langs=${LANGS_SEMI:-(none)}. To add one: $0 --add-lang LANG --repo $TARGET_REPO. To set the whole list: $DECIDE wired --repo $TARGET_REPO ... --langs LIST."
+        [ "$SET_NEVER_GIVEN" -eq 0 ] || refuse_flag "recorded-row" --set-never-ext \
+            "$KEY already records never=${NEVER_SEMI:-(none)}. To add one: $0 --never-ext .ext --repo $TARGET_REPO. To set the whole list: $DECIDE wired --repo $TARGET_REPO ... --never-ext LIST."
+        if [ "${#OVERRIDE_CLAUDE_DIRS[@]}" -gt 0 ]; then
+            SUBSET_SEMI=""
+            for OD in "${OVERRIDE_CLAUDE_DIRS[@]}"; do
+                [ -n "$OD" ] || continue
+                OD_FOUND=0
+                mc_split_semi "$CLAUDE_DIRS_SEMI"
+                for RD in ${MC_SPLIT[@]+"${MC_SPLIT[@]}"}; do
+                    [ "$RD" = "$OD" ] && OD_FOUND=1
+                done
+                if [ "$OD_FOUND" -eq 0 ]; then
+                    echo "dir-not-recorded: --claude-dir $OD is not one of the claude-dirs $KEY records ($CLAUDE_DIRS_SEMI). On a row that records its dirs, --claude-dir narrows the walk to some of THEM; it does not add one." >&2
+                    echo "To record another claude-dir for this row: $DECIDE wired --repo $TARGET_REPO --store $STORE --project $PROJECT --claude-dir $OD [--claude-dir DIR ...]" >&2
+                    echo "Nothing was read further and nothing was written." >&2
+                    exit 2
+                fi
+                SUBSET_SEMI="${SUBSET_SEMI:+$SUBSET_SEMI;}$OD"
+            done
+            CLAUDE_DIRS_SEMI="$SUBSET_SEMI"
+        fi
+    fi
+
     # A legacy row's code-roots/langs/never are recovered from EVERY one of
     # its claude-dirs, not from whichever happens to be first.
     #
@@ -1124,11 +1239,20 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
         REC_CODE_ROOTS=""
         REC_LANGS=""
         REC_NEVER=""
+        # The RAW rendered values of the first dir, which every later dir is
+        # compared against. Comparison is on these, NOT on the normalized
+        # language names: what a re-render replays is the value, and `*.py`
+        # against `*.py *.zz` normalizes to the same "python" while being two
+        # different things on disk. Recording either as the answer for both
+        # would silently change what one of them indexes.
+        REC_LANG_GLOBS=""
+        REC_NEVER_GLOBS=""
         REC_LANGS_OK=1
         REC_NEVER_OK=1
-        REC_LANG_NOTE=""
+        REC_NOTES=""
         REC_FIRST=1
         REC_REPORT=""
+        REC_NL=$'\n'
         DISAGREE_CODE_ROOTS=0
         DISAGREE_LANGS=0
         DISAGREE_NEVER=0
@@ -1136,21 +1260,29 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
         for RD in ${MC_SPLIT[@]+"${MC_SPLIT[@]}"}; do
             mc_update_recover_from_settings "$PROJECT" "$RD"
             REC_REPORT="$REC_REPORT
-      $RD: code-roots=${MC_RECOVERED_CODE_ROOTS:-(none)} langs=${MC_RECOVERED_LANGS:-(none)} never=${MC_RECOVERED_NEVER:-(none)}"
+      $RD: code-roots=${MC_RECOVERED_CODE_ROOTS:-(none)} lang-exts='$MC_RECOVERED_LANG_GLOBS' never-exts='$MC_RECOVERED_NEVER_GLOBS' (languages: ${MC_RECOVERED_LANGS:-none})"
             # "cannot be read back" from ANY dir blocks the whole row: the row
             # describes all of them at once.
             [ "$MC_RECOVERED_LANGS_OK" -eq 0 ] && REC_LANGS_OK=0
             [ "$MC_RECOVERED_NEVER_OK" -eq 0 ] && REC_NEVER_OK=0
+            # Notes are collected PER DIR and every one is printed. Keeping
+            # only the first dir's meant the row's report described whichever
+            # dir happened to sort first -- so a fully rendered first dir hid
+            # a partially rendered second one completely.
+            if [ -n "$MC_RECOVERED_LANG_NOTE" ]; then
+                REC_NOTES="${REC_NOTES:+$REC_NOTES$REC_NL}  $KEY [$RD]: partially rendered -- $MC_RECOVERED_LANG_NOTE"
+            fi
             if [ "$REC_FIRST" -eq 1 ]; then
                 REC_CODE_ROOTS="$MC_RECOVERED_CODE_ROOTS"
                 REC_LANGS="$MC_RECOVERED_LANGS"
                 REC_NEVER="$MC_RECOVERED_NEVER"
-                REC_LANG_NOTE="$MC_RECOVERED_LANG_NOTE"
+                REC_LANG_GLOBS="$MC_RECOVERED_LANG_GLOBS"
+                REC_NEVER_GLOBS="$MC_RECOVERED_NEVER_GLOBS"
                 REC_FIRST=0
             else
                 [ "$MC_RECOVERED_CODE_ROOTS" = "$REC_CODE_ROOTS" ] || DISAGREE_CODE_ROOTS=1
-                [ "$MC_RECOVERED_LANGS" = "$REC_LANGS" ] || DISAGREE_LANGS=1
-                [ "$MC_RECOVERED_NEVER" = "$REC_NEVER" ] || DISAGREE_NEVER=1
+                [ "$MC_RECOVERED_LANG_GLOBS" = "$REC_LANG_GLOBS" ] || DISAGREE_LANGS=1
+                [ "$MC_RECOVERED_NEVER_GLOBS" = "$REC_NEVER_GLOBS" ] || DISAGREE_NEVER=1
             fi
         done
 
@@ -1183,8 +1315,9 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
         # language set does not account for is said out loud, under the row it
         # belongs to. The table has no note column, and a difference nobody is
         # told about is how a migration records less than what is wired.
-        if [ -n "$REC_LANG_NOTE" ] && [ -z "$LANGS_FLAG" ]; then
-            echo "  $KEY: partially rendered -- $REC_LANG_NOTE. Recorded languages: ${LANGS_COMMA:-(none)}. Pass --langs LIST to record something else." >&2
+        if [ -n "$REC_NOTES" ] && [ -z "$LANGS_FLAG" ]; then
+            printf '%s\n' "$REC_NOTES" >&2
+            echo "  $KEY: recorded languages would be ${LANGS_COMMA:-(none)}. Pass --langs LIST to record something else." >&2
         fi
 
         # The migration PROPOSES and refuses; it never writes a value it had
