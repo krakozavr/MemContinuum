@@ -18,15 +18,30 @@ KINDS = frozenset({"function", "method", "constructor", "accessor", "closure"})
 # of these (e.g. ".php" would otherwise false-match "x.blade.php").
 COMPOUND_EXCLUDES = {".blade.php", ".d.ts", ".min.js"}
 
+# Task 6: the ONE universal noise set -- directory names that are never
+# user source regardless of which language(s) are wired, or of whether any
+# language is wired at all (memidx.CODE_SKIP_DIR_NAMES is an alias of this,
+# and iter_code_files -- the walker `why`'s fallback and `drift`'s
+# invariants share -- prunes exactly this set, nothing narrower). ".build"
+# lives here, not on the swift row alone: it is SwiftPM's dependency
+# checkout, thousands of third-party .swift files that are never user
+# source in ANY project, Swift-wired or not -- a bare `why`/`drift` walk
+# with no language wired at all must still skip it. Each LANGUAGE_TABLE
+# row's own "skip_dirs" holds only the noise names that are NOT already
+# covered here (fix wave C1's per-language intersection rule, unaffected).
+UNIVERSAL_SKIP_DIRS = frozenset({
+    ".git", ".build", "node_modules", "vendor", "venv", ".venv",
+    "__pycache__", ".tox", ".eggs",
+})
+
 LANGUAGE_TABLE = {
     "swift": {"backend": "native", "module": "chunkers.swift",
               "extensions": (".swift",), "shebangs": (), "impl_version": "3",
-              "skip_dirs": frozenset({"Tests", "Resources", ".build"})},
+              "skip_dirs": frozenset({"Tests", "Resources"})},
     "python": {"backend": "native", "module": "chunkers.python_ast",
                "extensions": (".py",), "shebangs": ("python", "python3"),
                "impl_version": "1",
-               "skip_dirs": frozenset({"venv", ".venv", "__pycache__", "build",
-                                        "dist", ".tox", ".eggs"})},
+               "skip_dirs": frozenset({"build", "dist"})},
 }
 
 

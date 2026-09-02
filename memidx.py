@@ -1050,7 +1050,7 @@ def fragment_matches_symbol(frag: str, symbol: str, qualified_name: str) -> bool
     return frag == symbol or frag == qualified_name or qualified_name.endswith("." + frag)
 
 
-def fragment_declared_in_text(frag: str, text: str, rel_path: str = "x.swift") -> bool:
+def fragment_declared_in_text(frag: str, text: str, rel_path: str) -> bool:
     """memlint's #symbol vocabulary check (memlint.py's lint_concept): is
     `frag` a symbol actually DECLARED in `text`?
 
@@ -1058,12 +1058,20 @@ def fragment_declared_in_text(frag: str, text: str, rel_path: str = "x.swift") -
     language comes from chunkers.lang_for_path(rel_path), and the answer
     comes from that backend's own `declared_symbols(text)` -- a uniform
     part of the registry contract, alongside `chunk_file`. There is no
-    per-language branch here and no Swift lexer call: adding a third
-    language means adding a LANGUAGE_TABLE row with a backend that exposes
-    declared_symbols, and this check follows for free. A rel_path with no
-    registered language falls back to the swift backend, which is what the
-    default "x.swift" preserves for every pre-existing call site
-    (resolve_symbol_to_path's bare-symbol fallback among them).
+    per-language branch here: adding a third language means adding a
+    LANGUAGE_TABLE row with a backend that exposes declared_symbols, and
+    this check follows for free.
+
+    `rel_path` is REQUIRED (Task 6 drops the old "x.swift" default, which
+    silently ran every unrecognized/extensionless path through the Swift
+    lexer -- the bug that made `why`'s fallback resolve a Swift symbol but
+    never a Python one). Resolution, same order lang_for_source_file uses
+    elsewhere: extension first (chunkers.lang_for_path); only when that is
+    None AND rel_path has no extension at all is text's first line sniffed
+    for a shebang (chunkers.lang_for_shebang) -- an extension that simply
+    doesn't match any LANGUAGE_TABLE row (e.g. ".txt") never falls through
+    to the shebang guess. Still unresolved -> return False: no language
+    means no vocabulary to check against, not a crash.
 
     Each backend returns `(symbol, qualified_name)` pairs -- including its
     container type names (Swift's class/struct/enum/protocol/extension/
@@ -1072,7 +1080,11 @@ def fragment_declared_in_text(frag: str, text: str, rel_path: str = "x.swift") -
     fragment_matches_symbol predicate code-search's per-hit concept
     attachment uses, so a fragment written qualified (e.g.
     "Outer.outerFunc") validates identically on both surfaces."""
-    lang = chunkers.lang_for_path(rel_path) or "swift"
+    lang = chunkers.lang_for_path(rel_path)
+    if lang is None and not chunkers.extension_of(rel_path):
+        lang = chunkers.lang_for_shebang(text.split("\n", 1)[0])
+    if lang is None:
+        return False
     try:
         backend = chunkers.get_chunker(lang)
         pairs = backend.declared_symbols(text)
@@ -1214,9 +1226,6 @@ def cmd_for_path(args) -> int:
 # code-tree helpers shared by `why` (symbol resolution) and `drift` (invariant checks)
 # ---------------------------------------------------------------------------
 
-SKIP_DIR_NAMES = {".git", ".build"}
-
-
 def is_binary_file(path: Path) -> bool:
     try:
         with open(path, "rb") as f:
@@ -1227,8 +1236,15 @@ def is_binary_file(path: Path) -> bool:
 
 
 def iter_code_files(code_root: Path):
+    """Every non-binary file under `code_root`, noise dirs pruned (Task 6:
+    chunkers.UNIVERSAL_SKIP_DIRS -- the same set CODE_SKIP_DIR_NAMES
+    aliases below -- not a narrower/older SKIP_DIR_NAMES). Deliberately
+    yields EVERY language, not just wired ones: `drift`'s
+    pattern-absent/no-bypass/single-definition invariants (check_invariant,
+    below) scan non-language files too (binding point 7) -- the language
+    filter lives in resolve_symbol_to_path's own loop, not here."""
     for dirpath, dirnames, filenames in os.walk(code_root):
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIR_NAMES]
+        dirnames[:] = [d for d in dirnames if d not in chunkers.UNIVERSAL_SKIP_DIRS]
         for fname in filenames:
             fpath = Path(dirpath) / fname
             if is_binary_file(fpath):
@@ -1251,9 +1267,14 @@ def _resolve_symbol_via_code_index(code_root: Path, symbol: str, project: str) -
     Anatomy M2a Task 5: multi-root aware (Task 4's code_index_report, not a
     single code_meta row) and NEVER heals -- unlike code-search, `why` only
     ever gets one shot at an answer, so a stale index must not be silently
-    trusted for it, but repairing it here would also make a `why` call
-    mutate the index as a side effect, which nothing about `why` implies
-    should happen. Untrusted (returns None, sending the caller to the disk
+    trusted for it, and repairing it here would make a `why` call mutate
+    the index as a side effect, which nothing about `why` implies should
+    happen. Precisely: this function itself never heals and never writes a
+    chunk, status, or meta row; but code_index_report (called below, the
+    same preflight code-search's own heal decision reads) may still commit
+    a stored file's mtime/size cache refresh when a drifted-looking row's
+    content turns out unchanged (cache bookkeeping, not a repair -- see
+    _root_report's own docstring). Untrusted (returns None, sending the caller to the disk
     scan) whenever: the report's overall state is `stale` (some root's
     content has drifted -- a state-wide caution, since a chunk this SAME
     root reports as current could still be a false hit once ANY root in
@@ -1312,28 +1333,42 @@ def resolve_symbol_to_path(code_root: Path, symbol: str, project: str | None = N
     container keywords entirely).
 
     Tries the code index first (_resolve_symbol_via_code_index) when
-    `project` is given, for speed; always falls back to scanning
-    code_root directly (same SKIP_DIR_NAMES as before -- deliberately NOT
-    the broader CODE_SKIP_DIR_NAMES the code index itself uses, since
-    `why` must stay able to resolve a symbol declared under Tests/, a
-    behavior change nobody asked for) so a missing/stale/member-only-index
-    miss never regresses a resolution the old regex-based version could
-    already make."""
+    `project` is given, for speed; always falls back to scanning code_root
+    directly -- iter_code_files prunes only chunkers.UNIVERSAL_SKIP_DIRS
+    (global noise: .git, .build, node_modules, vendor, venv, .venv,
+    __pycache__, .tox, .eggs), never a language's own skip_dirs, so `why`
+    stays able to resolve a symbol declared under Tests/, a behavior
+    change nobody asked for -- so a missing/stale/member-only-index miss
+    never regresses a resolution the old regex-based version could already
+    make.
+
+    Task 6: dispatch is language-aware, not Swift-only. Each candidate
+    file's language is resolved with lang_for_source_file (extension
+    first, then a shebang sniff for an extensionless file) BEFORE it is
+    even read -- a file with no resolvable language (an unwired
+    extension, a non-language file drift's iter_code_files also walks) is
+    skipped outright, never sent through the Swift lexer as the old
+    default rel_path="x.swift" silently did (the bug: a `.py` file's `def`
+    syntax never matched Swift's grammar, so a bare Python symbol could
+    never resolve here at all)."""
     if project:
         resolved = _resolve_symbol_via_code_index(code_root, symbol, project)
         if resolved is not None:
             _root_s, path = resolved
             return path
     for fpath in sorted(iter_code_files(code_root)):
+        if lang_for_source_file(fpath) is None:
+            continue
+        try:
+            rel = str(fpath.relative_to(code_root))
+        except ValueError:
+            rel = str(fpath)
         try:
             text = fpath.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
-        if fragment_declared_in_text(symbol, text):
-            try:
-                return str(fpath.relative_to(code_root))
-            except ValueError:
-                return str(fpath)
+        if fragment_declared_in_text(symbol, text, rel):
+            return rel
     return None
 
 
@@ -1708,16 +1743,22 @@ def cmd_check(args) -> int:
 # below).
 LANG_EXTENSIONS = {lang: row["extensions"] for lang, row in chunkers.LANGUAGE_TABLE.items()}
 
-# Task 7: this is now the GLOBAL skip set ONLY -- directory names that are
-# always noise regardless of which languages are wired. Language-specific
-# noise (swift's Tests/Resources/.build, python's venv/.venv/__pycache__/
-# build/dist/.tox/.eggs) lives on each LANGUAGE_TABLE row's "skip_dirs" key
-# instead, so a Swift-only project's own build/ or dist/ output is never
-# pruned by a rule meant for Python virtualenvs, and vice versa. This
-# global set is what iter_code_source_files prunes for every walk;
-# per-language sets are applied per FILE, to that language's own files
-# only (fix wave C1 -- see chunkers.common_skip_dirs).
-CODE_SKIP_DIR_NAMES = {".git", "vendor", "node_modules"}
+# Task 7 (superseded by Task 6): this is the GLOBAL skip set ONLY --
+# directory names that are always noise regardless of which languages are
+# wired, or of whether any language is wired at all. Language-specific
+# noise (swift's Tests/Resources, python's build/dist) lives on each
+# LANGUAGE_TABLE row's "skip_dirs" key instead, so a Swift-only project's
+# own build/ or dist/ output is never pruned by a rule meant for Python
+# virtualenvs, and vice versa. This global set is what
+# iter_code_source_files prunes for every walk; per-language sets are
+# applied per FILE, to that language's own files only (fix wave C1 -- see
+# chunkers.common_skip_dirs).
+#
+# Task 6: an ALIAS of chunkers.UNIVERSAL_SKIP_DIRS, not a second
+# hand-maintained set -- iter_code_files (the `why`-fallback/`drift` walker,
+# which has no notion of "wired languages" at all) prunes the very same
+# set. One definition, two names kept for their own call sites' history.
+CODE_SKIP_DIR_NAMES = chunkers.UNIVERSAL_SKIP_DIRS
 
 CODE_SCHEMA_VERSION = 2
 CODE_TABLES = ("chunks", "fts", "embeddings", "file_sha", "code_meta", "code_schema")
@@ -1934,7 +1975,8 @@ def iter_code_source_files(root: Path, langs: list[str] | None, skipped: Counter
 
     Directory pruning (fix wave C1, superseding Task 7's union rule): a
     language's skip_dirs prune only THAT language's own files. The walk
-    prunes CODE_SKIP_DIR_NAMES (global noise: .git, vendor, node_modules)
+    prunes CODE_SKIP_DIR_NAMES (== chunkers.UNIVERSAL_SKIP_DIRS: .git,
+    .build, node_modules, vendor, venv, .venv, __pycache__, .tox, .eggs)
     plus chunkers.common_skip_dirs(wired) -- the INTERSECTION of the wired
     languages' skip sets, a pure optimization since every file under such
     a directory would be dropped by its own language's rule anyway. Every
@@ -2636,15 +2678,18 @@ NO_EXTENSION_BUCKET = "(no extension)"
 
 def _census_skip_dirs() -> set:
     """Directory names pruned from a code-census walk: CODE_SKIP_DIR_NAMES
-    (the global set: .git/vendor/node_modules) unioned with EVERY
+    (== chunkers.UNIVERSAL_SKIP_DIRS: .git, .build, node_modules, vendor,
+    venv, .venv, __pycache__, .tox, .eggs) unioned with EVERY
     LANGUAGE_TABLE row's skip_dirs.
 
     Census runs BEFORE any language is wired -- it is the discovery step
     repo-init's consent dialogue reads -- so there is no wired subset to
     reason about, and the walk has to already look clean before the user
-    has chosen anything. On the global set alone, an untouched Python
-    project's census would count thousands of files under .venv/ as
-    signal.
+    has chosen anything. On the global set alone, a Python project's own
+    `build/` or `dist/` packaging output (python's LANGUAGE_TABLE row, not
+    the global set) would count as signal -- those stay language-specific
+    on purpose, since the very same names are real user source in a
+    project that has no python wired at all.
 
     Contrast iter_code_source_files, which answers a different question
     once a language set exists: it prunes the global set plus the
@@ -3162,15 +3207,25 @@ def cmd_code_search(args) -> int:
         row = conn.execute("SELECT * FROM chunks WHERE id=?", (chunk_id,)).fetchone()
         if row is None:
             continue
+        hit_root = row["code_root"]
         hit = {
             "path": row["path"],
+            "code_root": hit_root,
             "line": row["start_line"],
             "qualified_name": row["qualified_name"],
             "kind": row["kind"],
             "signature": row["signature"],
             "score": score,
         }
-        if md_conn is not None:
+        # Task 6: concept attachment is root-checked -- a stale hit whose
+        # relative path no longer exists under the root it was indexed
+        # from (the real adversary: the SAME relative path indexed under
+        # TWO roots, one deleted, heal off) must never attach a concept
+        # keyed on that path alone. With a current index this is always
+        # true (nothing stale to guard against); the guard only ever
+        # changes behavior once a hit's own root/path has drifted, which
+        # a single-root project sharing no path with itself never can.
+        if md_conn is not None and (Path(hit_root) / row["path"]).exists():
             # Finding 4: prefer a symbol-level implemented_by/tested_by
             # match over a file-level one for this specific chunk.
             concept_matches = concept_matches_for_chunk(
@@ -3210,9 +3265,16 @@ def cmd_code_search(args) -> int:
             indent=2,
         ))
     else:
+        # Task 6: a path alone is ambiguous once a project has more than
+        # one code root (the SAME relative path can be indexed under
+        # each) -- qualify it with the root only when that ambiguity can
+        # actually arise, so the common single-root case keeps its
+        # existing, unqualified line.
+        multi_root = len(report["roots"]) > 1
         for h in out:
             extra = f"  [{h['concept_id']}]" if "concept_id" in h else ""
-            print(f"{h['score']:.4f}  {h['path']}:{h['line']}  {h['qualified_name']}  {h['signature']}{extra}")
+            loc = f"{h['code_root']}/{h['path']}:{h['line']}" if multi_root else f"{h['path']}:{h['line']}"
+            print(f"{h['score']:.4f}  {loc}  {h['qualified_name']}  {h['signature']}{extra}")
     return 0
 
 

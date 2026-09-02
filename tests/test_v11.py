@@ -439,10 +439,11 @@ class TestWhy(unittest.TestCase):
         chunks row touched) -- the fast path's job here is only to say
         "don't trust this", never to fix it.
 
-        Swift, not Python: the disk-scan fallback (fragment_declared_in_text)
-        is still Swift-only as of this task -- Task 6 wires the other
-        languages into it -- so a Python root would fail this test for a
-        reason unrelated to Task 5's staleness check."""
+        Swift, arbitrarily: the disk-scan fallback (fragment_declared_in_text)
+        is language-aware per file since Task 6, so a Python root would
+        exercise the identical staleness check -- Swift is used here only
+        because it is the fixture language every other test in this class
+        already uses, not because Python is unsupported."""
         with tempfile.TemporaryDirectory() as td:
             code_root = Path(td) / "code"
             code_root.mkdir()
@@ -492,6 +493,31 @@ class TestWhy(unittest.TestCase):
             self.assertEqual(rc, 0)
             data = json.loads(out)
             self.assertTrue(any(c["id"] == "CON-007" for c in data))
+
+    def test_why_fallback_resolves_python_symbol(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); (root / "svc.py").write_text("def load_settings():\n    return 1\n")
+            self.assertEqual(memidx.resolve_symbol_to_path(root, "load_settings"), "svc.py")
+
+    def test_why_fallback_resolves_shebang_only_script(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); (root / "tool").write_text("#!/usr/bin/env python3\ndef run_tool():\n    pass\n")
+            self.assertEqual(memidx.resolve_symbol_to_path(root, "run_tool"), "tool")
+
+    def test_why_fallback_skips_noise_dirs_but_sees_tests_dir(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); (root / "node_modules").mkdir(); (root / ".build").mkdir(); (root / "Tests").mkdir()
+            (root / "node_modules" / "x.py").write_text("def hidden():\n    pass\n")
+            (root / ".build" / "dep.swift").write_text("func fromDependency() {}\n")
+            (root / "Tests" / "t.swift").write_text("func visible() {}\n")
+            self.assertIsNone(memidx.resolve_symbol_to_path(root, "hidden"))
+            self.assertIsNone(memidx.resolve_symbol_to_path(root, "fromDependency"))
+            self.assertEqual(memidx.resolve_symbol_to_path(root, "visible"), "Tests/t.swift")
+
+    def test_drift_walk_still_sees_non_language_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); (root / "Info.plist").write_text("<plist/>\n")
+            self.assertIn(root / "Info.plist", list(memidx.iter_code_files(root)))
 
 
 # ---------------------------------------------------------------------------

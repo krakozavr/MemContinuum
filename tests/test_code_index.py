@@ -336,6 +336,28 @@ class TestMultiRootReindex(unittest.TestCase):
             mode, chunks, embedded = self._coverage(db)
             self.assertEqual(mode, "none"); self.assertEqual(embedded, 0)
 
+    def test_search_output_is_root_qualified_with_two_roots(self):
+        with tempfile.TemporaryDirectory() as td:
+            a, b, db = self._mk(td)
+            code_reindex(a, db, lang="python"); code_reindex(b, db, lang="python")
+            script = ("import sys; sys.path.insert(0, %r); import memidx; "
+                      "memidx.main(['code-search', '--db', %r, 'beta', '--mode', 'fts', '--no-heal'])"
+                      ) % (str(TOOLS_DIR), str(db))
+            r = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=30)
+            self.assertIn(f"{b.resolve()}/main.py:1", r.stdout)
+
+    def test_json_hit_carries_code_root(self):
+        with tempfile.TemporaryDirectory() as td:
+            a, b, db = self._mk(td)
+            code_reindex(a, db, lang="python"); code_reindex(b, db, lang="python")
+            script = ("import sys; sys.path.insert(0, %r); import memidx; "
+                      "memidx.main(['code-search', '--db', %r, 'beta', '--mode', 'fts', '--no-heal', '--json'])"
+                      ) % (str(TOOLS_DIR), str(db))
+            r = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=30)
+            env = json.loads(r.stdout)
+            self.assertTrue(env["results"], env)
+            self.assertEqual(env["results"][0]["code_root"], str(b.resolve()))
+
 
 # ---------------------------------------------------------------------------
 # 1. Chunker fixtures (memidx.chunk_source directly -- no DB involved)
@@ -2297,6 +2319,62 @@ class TestVectorAndHybridJSONIsSerializable(unittest.TestCase):
                 self.assertIsInstance(score, float)
 
 
+def _build_decision_db_with_concepts(parent, concepts, db=None, project=memidx.DEFAULT_PROJECT):
+    """The one concept-record fixture every concept-attachment test builds
+    on (factored out of what used to be an inline frontmatter block
+    duplicated per test): writes one concept.md per entry in `concepts`
+    (each a dict with keys concept_id, implemented_by (list of ref
+    strings), and optional title/owner_boundary; tested_by/governed_by/
+    involved_in are always empty) into ONE scratch markdown root under
+    `parent`, indexes them with a SINGLE cmd_reindex call, and returns
+    that root.
+
+    ONE call, not one call per concept: cmd_reindex deletes any existing
+    record path this run's own walk did not `seen` (removed_paths =
+    existing - seen) -- writing concept N into a fresh md_root and
+    reindexing again would walk only that new root, see none of the
+    earlier concepts' paths, and delete them from the shared db on the
+    spot. A caller that wants two concepts in one db (e.g.
+    test_two_concepts_on_one_file_different_symbols_each_get_their_own_chunk)
+    must pass both specs here together.
+
+    `parent` is always the caller's own tempfile.TemporaryDirectory path
+    (never a fresh mkdtemp of this function's own) so the md_root this
+    creates is cleaned up with everything else the test already owns.
+
+    `db` explicit routes cmd_reindex straight to that sqlite file
+    (TestConceptAttachIsRootChecked, which passes its own decision db path
+    and reads it back via code-search's --decision-db); left None, it falls
+    through to cmd_reindex's own MEMCONTINUUM_HOME-derived default -- every
+    pre-existing caller here, which pins MEMCONTINUUM_HOME (mc_home /
+    inline os.environ) to the SAME default code-search itself reads."""
+    md_root = Path(parent) / "md"
+    md_root.mkdir(parents=True, exist_ok=True)
+    for i, c in enumerate(concepts):
+        concept_id = c["concept_id"]
+        lines = "\n".join(f"  - {p}" for p in c["implemented_by"])
+        (md_root / f"concept_{i}.md").write_text(
+            "---\n"
+            "type: concept\n"
+            f"id: {concept_id}\n"
+            f"title: {c.get('title') or concept_id}\n"
+            f"owner_boundary: {c.get('owner_boundary', 'fixture')}\n"
+            "implemented_by:\n"
+            f"{lines}\n"
+            "tested_by: []\n"
+            "governed_by: []\n"
+            "involved_in: []\n"
+            "---\n\n"
+            "Fixture. NOT this concept: nothing else.\n"
+        )
+    args = ns(root=str(md_root), no_embed=True, full=False, project=project)
+    if db is not None:
+        args.db = str(db)
+    rc = memidx.cmd_reindex(args)
+    assert rc == 0
+    return md_root
+
+
 class TestConceptAttachment(unittest.TestCase):
     def test_hit_gets_concept_id_when_decision_db_has_a_matching_implemented_by(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2304,23 +2382,11 @@ class TestConceptAttachment(unittest.TestCase):
             home.mkdir()
             os.environ["MEMCONTINUUM_HOME"] = str(home)
             try:
-                md_root = Path(td) / "md"
-                md_root.mkdir()
-                (md_root / "concept.md").write_text(
-                    "---\n"
-                    "type: concept\n"
-                    "id: CON-ATTACH\n"
-                    "title: Attach Test\n"
-                    "owner_boundary: fixture\n"
-                    "implemented_by:\n"
-                    "  - NestedTypes.swift#outerFunc\n"
-                    "tested_by: []\n"
-                    "governed_by: []\n"
-                    "involved_in: []\n"
-                    "---\n\n"
-                    "Fixture. NOT this concept: nothing else.\n"
-                )
-                memidx.cmd_reindex(ns(root=str(md_root), no_embed=True, full=False))
+                _build_decision_db_with_concepts(td, [{
+                    "concept_id": "CON-ATTACH",
+                    "implemented_by": ["NestedTypes.swift#outerFunc"],
+                    "title": "Attach Test",
+                }])
 
                 code_root = Path(td) / "code"
                 code_root.mkdir()
@@ -2353,23 +2419,11 @@ class TestConceptAttachment(unittest.TestCase):
             home.mkdir()
             os.environ["MEMCONTINUUM_HOME"] = str(home)
             try:
-                md_root = Path(td) / "md"
-                md_root.mkdir()
-                (md_root / "concept.md").write_text(
-                    "---\n"
-                    "type: concept\n"
-                    "id: CON-EXPLICITDB\n"
-                    "title: Explicit DB Test\n"
-                    "owner_boundary: fixture\n"
-                    "implemented_by:\n"
-                    "  - NestedTypes.swift#outerFunc\n"
-                    "tested_by: []\n"
-                    "governed_by: []\n"
-                    "involved_in: []\n"
-                    "---\n\n"
-                    "Fixture. NOT this concept: nothing else.\n"
-                )
-                memidx.cmd_reindex(ns(root=str(md_root), no_embed=True, full=False))
+                _build_decision_db_with_concepts(td, [{
+                    "concept_id": "CON-EXPLICITDB",
+                    "implemented_by": ["NestedTypes.swift#outerFunc"],
+                    "title": "Explicit DB Test",
+                }])
 
                 code_root = Path(td) / "code"
                 code_root.mkdir()
@@ -2422,37 +2476,12 @@ class TestConceptAttachment(unittest.TestCase):
             home.mkdir()
             os.environ["MEMCONTINUUM_HOME"] = str(home)
             try:
-                md_root = Path(td) / "md"
-                md_root.mkdir()
-                (md_root / "concept_outer.md").write_text(
-                    "---\n"
-                    "type: concept\n"
-                    "id: CON-OUTER\n"
-                    "title: Outer func concept\n"
-                    "owner_boundary: fixture\n"
-                    "implemented_by:\n"
-                    "  - NestedTypes.swift#outerFunc\n"
-                    "tested_by: []\n"
-                    "governed_by: []\n"
-                    "involved_in: []\n"
-                    "---\n\n"
-                    "Fixture. NOT this concept: nothing else.\n"
-                )
-                (md_root / "concept_ext.md").write_text(
-                    "---\n"
-                    "type: concept\n"
-                    "id: CON-EXT\n"
-                    "title: Ext func concept\n"
-                    "owner_boundary: fixture\n"
-                    "implemented_by:\n"
-                    "  - NestedTypes.swift#extFunc\n"
-                    "tested_by: []\n"
-                    "governed_by: []\n"
-                    "involved_in: []\n"
-                    "---\n\n"
-                    "Fixture. NOT this concept: nothing else.\n"
-                )
-                memidx.cmd_reindex(ns(root=str(md_root), no_embed=True, full=False))
+                _build_decision_db_with_concepts(td, [
+                    {"concept_id": "CON-OUTER", "implemented_by": ["NestedTypes.swift#outerFunc"],
+                     "title": "Outer func concept"},
+                    {"concept_id": "CON-EXT", "implemented_by": ["NestedTypes.swift#extFunc"],
+                     "title": "Ext func concept"},
+                ])
 
                 code_root = Path(td) / "code"
                 code_root.mkdir()
@@ -2479,6 +2508,33 @@ class TestConceptAttachment(unittest.TestCase):
                 self.assertEqual(ext_hit.get("concept_id"), "CON-EXT", ext_hit)
             finally:
                 del os.environ["MEMCONTINUUM_HOME"]
+
+
+class TestConceptAttachIsRootChecked(unittest.TestCase):
+    def test_concept_attaches_only_where_the_file_exists_under_the_hit_root(self):
+        """The real adversary: the SAME relative path indexed under two roots,
+        one concept whose implemented_by is that path, then B's file deleted
+        while B's stale hit stays in the index (heal off). A attaches; B does
+        not -- without the guard both would, because the matcher keys on the
+        relative path alone."""
+        with tempfile.TemporaryDirectory() as td:
+            a = Path(td) / "a"; b = Path(td) / "b"; a.mkdir(); b.mkdir()
+            (a / "main.py").write_text("def shared_name():\n    return 1\n")
+            (b / "main.py").write_text("def shared_name():\n    return 2\n")
+            db = Path(td) / "idx-code.sqlite"
+            code_reindex(a, db, lang="python"); code_reindex(b, db, lang="python")
+            md_db = Path(td) / "decisions.sqlite"
+            _build_decision_db_with_concepts(
+                td, [{"concept_id": "CON-1", "implemented_by": ["main.py#shared_name"]}], db=md_db
+            )
+            (b / "main.py").unlink()
+            script = ("import sys; sys.path.insert(0, %r); import memidx; "
+                      "memidx.main(['code-search', '--db', %r, 'shared_name', '--mode', 'fts', '--json', '--no-heal', '--decision-db', %r])"
+                      ) % (str(TOOLS_DIR), str(db), str(md_db))
+            env = json.loads(subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=30).stdout)
+            by_root = {h["code_root"]: h for h in env["results"]}
+            self.assertIn("concept_id", by_root[str(a.resolve())])
+            self.assertNotIn("concept_id", by_root[str(b.resolve())])
 
 
 class TestCodeIndexReport(unittest.TestCase):
@@ -2603,6 +2659,20 @@ class TestHealOnSearch(unittest.TestCase):
             self.assertNotIn("stale", r.stderr.lower())
             r2 = self._run(db, "new_name")
             self.assertNotIn("healed", r2.stderr)
+
+    def test_stale_index_heals_with_json_and_envelope_reflects_post_heal_report(self):
+        """Carried in from Task 5's review: --json's envelope (state,
+        results, changed) must come from the POST-heal report, not the one
+        computed before heal_code_index ran."""
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._stale_tree(td)
+            r = self._run(db, "new_name", "--json")
+            env = json.loads(r.stdout)
+            self.assertEqual(env["state"], "current")
+            self.assertEqual(env["changed"], 0)
+            self.assertTrue(
+                any(h["qualified_name"] == "new_name" for h in env["results"]), env["results"]
+            )
 
     def test_no_heal_keeps_the_stale_warning(self):
         with tempfile.TemporaryDirectory() as td:
@@ -3160,7 +3230,7 @@ class TestMemlintFragmentAttachAgreement(unittest.TestCase):
         # breaks only one side is caught here.
         self.assertTrue(memidx.fragment_matches_symbol("Outer.outerFunc", "outerFunc", "Outer.outerFunc"))
         text = (FIXTURES / "NestedTypes.swift").read_text()
-        self.assertTrue(memidx.fragment_declared_in_text("Outer.outerFunc", text))
+        self.assertTrue(memidx.fragment_declared_in_text("Outer.outerFunc", text, rel_path="NestedTypes.swift"))
 
 
 class TestMemlintPathContainment(unittest.TestCase):

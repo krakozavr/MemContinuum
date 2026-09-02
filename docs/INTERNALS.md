@@ -1091,11 +1091,11 @@ down:
   now-edited file is trusted exactly like a fresh one). A miss there (member
   symbols only — container names like class/struct/enum are never chunks
   themselves, so a miss is never conclusive) falls back to scanning
-  `--code-root` directly; that direct scan is Swift-only regardless of the
-  file's real language (it calls `fragment_declared_in_text` with no
-  `rel_path`, so `chunkers.lang_for_path` never sees the file's actual
-  extension and always resolves to the swift backend) — rel_path-aware
-  dispatch on this fallback path is a later item.
+  `--code-root` directly; that direct scan is language-aware per file (each
+  candidate's language is resolved the same way the indexer resolves it —
+  extension first, then a shebang sniff for an extensionless file — and a
+  file with no resolvable language is skipped outright), so a bare Python
+  (or any other wired-language) symbol resolves exactly like a Swift one.
 - **`drift`** — checks every active link's checkable `invariant:` against a code
   tree.
 - **`code-search`** — same RRF fusion as `search`. Each hit optionally carries a

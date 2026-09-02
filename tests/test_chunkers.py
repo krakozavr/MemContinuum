@@ -487,14 +487,16 @@ class TestPythonAstChunker(unittest.TestCase):
 
 
 class TestFragmentDeclaredInTextDispatch(unittest.TestCase):
-    """Task 6: memidx.fragment_declared_in_text(frag, text, rel_path=...)
-    dispatches per chunkers.lang_for_path(rel_path) -- a .py rel_path routes
-    through chunkers.python_ast.declared_symbols (already includes
-    class-container names per its own docstring/tests above, so no separate
-    container pass is added here) evaluated with the SAME fragment_matches_symbol
-    predicate the Swift path and code-search's runtime attachment both use.
-    Every other rel_path (including the default "x.swift") keeps the
-    Swift-lexer path byte-identical to before this task."""
+    """Task 6: memidx.fragment_declared_in_text(frag, text, rel_path) --
+    rel_path is REQUIRED (Task 6 drops the old "x.swift" default) --
+    dispatches per chunkers.lang_for_path(rel_path), falling back to a
+    shebang sniff of text's first line for an extensionless rel_path, and
+    returning False when neither resolves a language (no vocabulary). A
+    .py rel_path routes through chunkers.python_ast.declared_symbols
+    (already includes class-container names per its own docstring/tests
+    above, so no separate container pass is added here) evaluated with the
+    SAME fragment_matches_symbol predicate the Swift path and
+    code-search's runtime attachment both use."""
 
     def test_python_function_fragment_recognized_with_py_rel_path(self):
         # Step 1's red test (brief): fails today -- fragment_declared_in_text
@@ -505,12 +507,12 @@ class TestFragmentDeclaredInTextDispatch(unittest.TestCase):
             memidx.fragment_declared_in_text("parse_frontmatter", text, rel_path="memidx.py")
         )
 
-    def test_python_function_fragment_not_recognized_without_py_rel_path(self):
-        # Same text, default rel_path ("x.swift") -- the Swift lexer path,
+    def test_python_function_fragment_not_recognized_with_swift_rel_path(self):
+        # Same text, an explicit .swift rel_path -- the Swift lexer path,
         # which has no notion of `def`. Documents that dispatch is driven by
         # rel_path, not a guess from the text's own contents.
         text = "def parse_frontmatter():\n    pass\n"
-        self.assertFalse(memidx.fragment_declared_in_text("parse_frontmatter", text))
+        self.assertFalse(memidx.fragment_declared_in_text("parse_frontmatter", text, rel_path="x.swift"))
 
     def test_python_class_container_name_recognized_via_declared_symbols(self):
         text = (PY_FIXTURES / "classes.py").read_text()
@@ -521,13 +523,25 @@ class TestFragmentDeclaredInTextDispatch(unittest.TestCase):
 
     def test_swift_path_regression_unchanged(self):
         # Existing behavior preserved exactly: a Swift fragment case that
-        # passes today (default rel_path, and an explicit .swift rel_path)
-        # still passes after the dispatch is added.
+        # passed before this task still passes after the dispatch is added.
         text = (FIXTURES / "NestedTypes.swift").read_text()
-        self.assertTrue(memidx.fragment_declared_in_text("Outer.outerFunc", text))
         self.assertTrue(
             memidx.fragment_declared_in_text("Outer.outerFunc", text, rel_path="NestedTypes.swift")
         )
+
+    def test_no_extension_no_shebang_returns_false(self):
+        # rel_path has no extension and text carries no recognizable
+        # shebang -- neither resolution path finds a language, so the
+        # answer is False (no vocabulary), not an exception.
+        text = "def parse_frontmatter():\n    pass\n"
+        self.assertFalse(memidx.fragment_declared_in_text("parse_frontmatter", text, rel_path="tool"))
+
+    def test_unknown_extension_returns_false_without_shebang_fallback(self):
+        # An extension IS present but matches no LANGUAGE_TABLE row -- the
+        # shebang fallback only applies to an EXTENSIONLESS rel_path, so
+        # this must not fall through to sniffing the text either.
+        text = "#!/usr/bin/env python3\ndef parse_frontmatter():\n    pass\n"
+        self.assertFalse(memidx.fragment_declared_in_text("parse_frontmatter", text, rel_path="tool.txt"))
 
 
 class TestSwiftDeclaredSymbolsBackend(unittest.TestCase):

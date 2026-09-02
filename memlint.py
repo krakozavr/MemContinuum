@@ -42,7 +42,7 @@ from memidx import (
 _NOT_THIS_RE = re.compile(r"\bNOT\b|not this concept|Does NOT")
 
 
-def _symbol_declared(frag: str, text: str, rel_path: str = "x.swift") -> bool:
+def _symbol_declared(frag: str, text: str, rel_path: str) -> bool:
     """Finding 5 (init/subscript/computed var/backtick names) AND finding 4
     (a QUALIFIED fragment, e.g. "Outer.outerFunc", must validate exactly
     like code-search's runtime concept attachment accepts it): this reuses
