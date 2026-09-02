@@ -1154,8 +1154,9 @@ fi
 # Separate call from the decision-store reindex above -- code-reindex is
 # Anatomy's own intent index, keyed by --code-root, not --root/STORE (Task
 # 7's `--lang` contract: required on a project's FIRST code-reindex, no
-# hardcoded-swift default). Runs once per --code-root (code-reindex takes
-# exactly one). Skipped entirely for language-less wiring (CHOSEN_LANGS
+# hardcoded-swift default). Runs ONCE, for the first --code-root only --
+# code-reindex is single-root by construction (see B3 below). Skipped
+# entirely for language-less wiring (CHOSEN_LANGS
 # empty) -- per Task 7's carry, an empty --lang set means "nothing to
 # index yet", not "index nothing and call it done." Same --no-embed
 # rationale as step 7's decision-store reindex above: a fresh corpus is

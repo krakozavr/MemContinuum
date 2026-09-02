@@ -15,8 +15,8 @@ Claude Code auto-memory (~/.claude/projects/…/memory/):
 
 Never both; never copy content across layers.
 
-How to write a store record: docs/SCHEMA.md in the engine; run memlint after;
-commit the store (its post-commit hook reindexes).
+How to write a store record: docs/SCHEMA.md in the engine; lint it, then commit
+the store (committing reindexes it).
 
 A coverage or look-back nudge is an ACTION ITEM, not a notice: answer it with
 records or an explicit "none".
