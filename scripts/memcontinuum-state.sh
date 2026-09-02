@@ -62,6 +62,13 @@ Decision and wiring are printed separately because they can disagree -- a
 hand-edited settings file or an interrupted install leaves them out of step,
 and collapsing them into one line hides exactly that.
 
+  update: wiring rendered by X, engine at Y -- run scripts/memcontinuum-update.sh
+                                 printed only when the rendered wiring's stamp
+                                 does not match the engine checkout's current
+                                 commit -- a rendered-artifact fix landed in
+                                 the engine since this repo was last installed
+                                 or updated.
+
 Recording an answer is a different command: memcontinuum-decide.sh.
 USAGE
         exit 0
@@ -125,7 +132,8 @@ if mc_registry_lookup "$DECISIONS" "$KEY"; then
     DECISION="$MC_LOOKUP_DECISION"
     echo "decision=$DECISION"
     echo "decided_at=$MC_LOOKUP_WHEN"
-    DECISION_PROJECT="$(printf '%s\n' "$MC_LOOKUP_NOTE" | sed -n 's/.*[ ]project=\([^ ]*\).*/\1/p')"
+    mc_note_field "$MC_LOOKUP_NOTE" "project"
+    DECISION_PROJECT="$MC_NOTE_FIELD"
 else
     echo "decision=none"
 fi
@@ -153,13 +161,14 @@ if [ "$MC_WIRING" != "none" ]; then
     fi
     if [ "$FOUND" -eq 1 ]; then
         echo "settings=$MC_WIRED_SETTINGS_FILE"
-        # scripts/repo-init.sh emits shlex-quoted values (MEMCONTINUUM_ROOT='/a b/c'),
-        # hand-written wiring often doesn't -- try the quoted form first, else
-        # fall back to the bare word.
-        store="$(printf '%s\n' "$MC_WIRED_COMMAND" | sed -n "s/.*MEMCONTINUUM_ROOT='\([^']*\)'.*/\1/p")"
-        [ -n "$store" ] || store="$(printf '%s\n' "$MC_WIRED_COMMAND" | sed -n 's/.*MEMCONTINUUM_ROOT=\([^ "'"'"']*\).*/\1/p')"
-        project="$(printf '%s\n' "$MC_WIRED_COMMAND" | sed -n "s/.*MEMCONTINUUM_PROJECT='\([^']*\)'.*/\1/p")"
-        [ -n "$project" ] || project="$(printf '%s\n' "$MC_WIRED_COMMAND" | sed -n 's/.*MEMCONTINUUM_PROJECT=\([^ "'"'"']*\).*/\1/p')"
+        # mc_command_env_value (mc-registry-lib.sh): scripts/repo-init.sh
+        # emits shlex-quoted values (MEMCONTINUUM_ROOT='/a b/c'), hand-written
+        # wiring often doesn't -- it tries the quoted form first, else falls
+        # back to the bare word.
+        mc_command_env_value "$MC_WIRED_COMMAND" "MEMCONTINUUM_ROOT"
+        store="$MC_ENV_VALUE"
+        mc_command_env_value "$MC_WIRED_COMMAND" "MEMCONTINUUM_PROJECT"
+        project="$MC_ENV_VALUE"
         [ -n "$store" ] && echo "store=$store"
         [ -n "$project" ] && echo "project=$project"
         # Output keys stay stable (store=/project= unchanged); this extra
@@ -167,6 +176,21 @@ if [ "$MC_WIRING" != "none" ]; then
         # when the decision row's own project pinned it, "wiring" when it
         # was the first match (no row, or the row named no project).
         [ -n "$project" ] && echo "project_source=$PROJECT_SOURCE"
+        # D5 (updater workstream): compare this hook line's own render stamp
+        # to the ENGINE checkout's current commit. A no-python, near-zero-cost
+        # check -- MC_WIRED_COMMAND is already resolved above, and this is
+        # just one more mc_command_env_value call plus one `git rev-parse` on
+        # the engine checkout this very script lives in (never on $REPO).
+        # Absent stamp (pre-D1 render) reads as "unknown", same as
+        # repo-init.sh's own fallback -- never a hard failure, always a hint.
+        mc_command_env_value "$MC_WIRED_COMMAND" "MEMCONTINUUM_RENDERED"
+        rendered="${MC_ENV_VALUE:-unknown}"
+        engine_dir="${MEMCONTINUUM_ENGINE:-$SCRIPT_DIR/..}"
+        engine_sha="$(git -C "$engine_dir" rev-parse --short HEAD 2>/dev/null)"
+        [ -n "$engine_sha" ] || engine_sha="unknown"
+        if [ "$rendered" != "$engine_sha" ]; then
+            echo "update: wiring rendered by $rendered, engine at $engine_sha -- run scripts/memcontinuum-update.sh"
+        fi
     fi
 fi
 

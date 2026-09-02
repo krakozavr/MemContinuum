@@ -529,6 +529,36 @@ class TestDecisionRegistry(BootstrapCase):
                 return line
         return None
 
+    def update_line_of(self, repo):
+        out = run(STATE_SH, [str(repo)], self.home, self.mc_home).stdout
+        for line in out.splitlines():
+            if line.startswith("update:"):
+                return line
+        return None
+
+    @staticmethod
+    def _wire_stamped(repo, project, rendered):
+        """Like _wire, but with a MEMCONTINUUM_PROJECT identity marker and a
+        MEMCONTINUUM_RENDERED stamp on every command line -- the shape D1
+        (updater workstream) actually renders, needed to exercise D5's
+        stamp-vs-engine comparison (the bare `_wire` fixture above predates
+        the stamp entirely, which is itself one of the cases below)."""
+        claude = Path(repo, ".claude")
+        claude.mkdir(exist_ok=True)
+        basenames = (
+            "ledger-post-edit.sh", "precompact-persist.sh",
+            "sessionstart-remind.sh", "userprompt-remind.sh",
+            "sessionend-stamp.sh",
+        )
+        items = [
+            {"type": "command",
+             "command": f"MEMCONTINUUM_RENDERED={rendered} MEMCONTINUUM_PROJECT={project} bash x/{b}"}
+            for b in basenames
+        ]
+        (claude / "settings.local.json").write_text(
+            json.dumps({"hooks": {"PostToolUse": [{"hooks": items}]}}),
+            encoding="utf-8")
+
     @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
     def test_stats_hint_line_names_the_liveness_command(self):
         """Deliverable 3 (liveness metric): state.sh's own contract stays
@@ -799,6 +829,49 @@ class TestDecisionRegistry(BootstrapCase):
         plain.mkdir()
         proc = run(DECIDE_SH, ["declined", "--repo", str(plain)], self.home, self.mc_home)
         self.assertNotEqual(proc.returncode, 0)
+
+    # --- D5 (updater workstream): state.sh's stamp-vs-engine hint --------
+
+    @staticmethod
+    def _engine_sha():
+        out = subprocess.run(
+            ["git", "-C", str(TOOLS_DIR), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        return out or "unknown"
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_no_update_hint_when_stamp_matches_engine(self):
+        self.assertEqual(self.bootstrap().returncode, 0)
+        repo = git_repo(str(Path(self.tmp) / "repo"))
+        self._wire_stamped(repo, "proj", self._engine_sha())
+        run(DECIDE_SH, ["wired", "--repo", repo, "--project", "proj"], self.home, self.mc_home)
+        self.assertIsNone(self.update_line_of(repo))
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_update_hint_when_stamp_is_stale(self):
+        self.assertEqual(self.bootstrap().returncode, 0)
+        repo = git_repo(str(Path(self.tmp) / "repo"))
+        self._wire_stamped(repo, "proj", "deadbee")
+        run(DECIDE_SH, ["wired", "--repo", repo, "--project", "proj"], self.home, self.mc_home)
+        line = self.update_line_of(repo)
+        self.assertIsNotNone(line)
+        self.assertIn("rendered by deadbee", line)
+        self.assertIn(f"engine at {self._engine_sha()}", line)
+        self.assertIn("scripts/memcontinuum-update.sh", line)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_update_hint_when_stamp_is_absent_pre_d1_render(self):
+        """A pre-D1 render has no MEMCONTINUUM_RENDERED token at all --
+        reads as "unknown", same as scripts/repo-init.sh's own fallback for
+        a non-git engine checkout, never a crash."""
+        self.assertEqual(self.bootstrap().returncode, 0)
+        repo = git_repo(str(Path(self.tmp) / "repo"))
+        self._wire(repo)  # the bare, pre-stamp fixture (no MEMCONTINUUM_RENDERED)
+        run(DECIDE_SH, ["wired", "--repo", repo], self.home, self.mc_home)
+        line = self.update_line_of(repo)
+        self.assertIsNotNone(line)
+        self.assertIn("rendered by unknown", line)
 
 
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)

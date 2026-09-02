@@ -246,6 +246,117 @@ more — re-ask, never assume.
 A decline stops the asking, not an existing installation. Nothing in this system
 ever deletes a store: a store is its own git history, not an installer artifact.
 
+### Registry row parameters (`decide.sh wired`)
+
+The `note` column carries `store=`/`project=` unconditionally (blank when not
+given, back-compatible with every pre-existing row) and, when given,
+`claude-dirs=`/`code-roots=`/`langs=`/`never=` — each of the last four is a
+`;`-joined list, omitted entirely (not written blank) when never passed.
+`--claude-dir` is repeatable: one project can list more than one claude-dir
+(a working-dir `.claude` beside a bare code checkout, or two session homes
+pointed at the same store), and `wired` refuses unless **every** one given is
+fully wired — recording the row after checking only the first would recreate
+"nothing tracks the set of claude-dirs a project's wiring lives in."
+`mc-registry-lib.sh` carries the shared parsing: `mc_note_field NOTE KEY`
+pulls one `key=value` field out of the note (space-separated between fields,
+so `store=` — first, no leading space — and every later field parse the same
+way), and `mc_command_env_value CMD VAR` pulls one `VAR=value` token out of a
+rendered hook command line (quoted form tried first, then the bare word) —
+`memcontinuum-state.sh` and `memcontinuum-update.sh` both use it instead of
+each hand-rolling the same sed.
+
+## Version stamp and the updater
+
+Every rendered hook line, every rendered `<claude-dir>/rules/memcontinuum.md`,
+and the installed `memory-search` skill copy carry the engine commit that
+rendered them: `MEMCONTINUUM_RENDERED=<short sha>` as one more env token on
+each of the seven hook command lines (`repo-init.sh` computes it once,
+`git -C "$ENGINE_ROOT" rev-parse --short HEAD`, falling back to the literal
+`unknown` when the engine checkout is not a git repo at all), and
+`<!-- memcontinuum-rendered: <sha> -->` as an HTML comment — the rules file's
+second line (after its identity-marker first line); the skill copy's, right
+after the frontmatter's closing `---` (never at byte 0 — the skill loader
+needs the opening `---` to stay line 1). Engine/hook *logic* updates for free
+(every rendered line runs a script from the checkout by absolute path, so a
+`git pull` is live instantly); this stamp is what lets something detect when
+*rendered* artifacts — the settings hook lines themselves, the rules file, the
+skill copy — have fallen behind.
+
+`<claude-dir>/rules/memcontinuum.md` is rendered from
+`templates/memcontinuum-rules.md` on every install, fresh or re-run — the one
+rendered file that is never write-if-absent, because its whole job is to
+always name the *current* store. It is refused (exit 14), before any other
+mutation, when it already exists and its first line does not match the
+template's identity marker verbatim: a hand-authored or foreign file at that
+path is left alone, loudly, rather than overwritten.
+
+`scripts/memcontinuum-update.sh` walks every `wired` row and, for each
+claude-dir the row lists, compares three things against the engine right now:
+the stamp on that claude-dir's rendered hook lines, the row's own `store=`
+against the rendered `MEMCONTINUUM_ROOT` on those same lines (a stamp match
+alone cannot catch a store renamed under the same engine version), and the
+rules file's identity marker + stamp. It prints one table row per
+(row, claude-dir): `repo | claude-dir | stamped | engine | store-match |
+rules | action`, action being one of `ok`, `stale`, `store-mismatch`,
+`rules-missing`, `rules-stale`, `rules-foreign`, `migrate`, `store-missing`,
+`no-wiring`, or `unrecoverable`. `--dry-run` (the default with no `--apply`)
+only prints; `--apply` re-runs `repo-init.sh` per non-`ok` claude-dir with the
+row's own recorded parameters (adopting the existing store — this command
+never creates, renames, or deletes one).
+
+Two actions are deliberately never auto-applied:
+
+- **`store-missing`** — the row's `store=` path is no longer a git
+  repository (renamed or deleted out from under the row). Re-running
+  `repo-init.sh` against a missing `--store` would *seed a fresh one* there,
+  which is exactly the "stores never touched" line this command does not
+  cross. Reported with a one-line fix hint; skipped.
+- **`rules-foreign`** — `repo-init.sh` itself refuses to overwrite a foreign
+  rules file (see above), so calling it would just fail loudly for a reason
+  already named in the table. Reported; skipped.
+- **`no-wiring`** — a claude-dir this row lists has none of this project's
+  hook lines at all (settings deleted or badly broken). That is the `memcontinuum`
+  skill's repair path (an undecided/broken install), not this command's — a
+  `wired` row is never a license to *wire* anything; it only ever re-renders
+  wiring that is already there.
+
+A row written before this registry format existed (no `claude-dirs=` in its
+note) is a **legacy row**: its single claude-dir is recovered as `<repo>/.claude`
+when the row's key is a path (starts with `/`); a remote-keyed legacy row's
+repo path is not recoverable from the registry at all and is reported as
+`unrecoverable` with a fix command, never guessed (guessing could touch the
+wrong repo's `.claude`). A recoverable legacy row also has its `code-roots=`/
+`langs=`/`never=` recovered from what is actually rendered on its
+`newfile-nudge.sh` line today (`MEMCONTINUUM_CODE_ROOT`/`_LANG_EXTS`/
+`_NEVER_EXTS`, the extension globs mapped back to language names via
+`chunkers.LANGUAGE_TABLE`'s own extension sets) rather than from
+`mc_wired_commands_for_project`, which is scoped to the five always-wired
+write-side basenames and never matches `newfile-nudge.sh`/`pre-edit-chain.sh`
+by design (see "The five basenames" above) — `memcontinuum-update.sh` has its
+own basename-parametrized scan for this one case. `--apply` on a legacy row
+re-renders it and rewrites the registry row (`migrate` in the table),
+reported once; every subsequent walk sees it as current-format.
+
+`--add-lang LANG [--never-ext .ext] --repo PATH` and
+`--never-ext .ext [--add-lang LANG] --repo PATH` are additive-only (a human
+typing the command is the consent, so this mode applies unless `--dry-run` is
+given explicitly — not gated on `--apply`, which the walk mode's dry-run
+default would otherwise make it silently no-op): they union the given
+language/extension into the row's existing `langs=`/`never=` lists, never
+drop what was already there, rewrite the row via `decide.sh wired` with every
+field, then re-render every claude-dir the row lists.
+
+`--machine` (with `--apply`) also re-runs `memcontinuum-setup.sh` once, to
+refresh the machine-level detector hook and the user-level skill copy — off
+by default, since most drift is per-repo.
+
+`memcontinuum-state.sh` stays python-free and prints one extra line,
+`update: wiring rendered by X, engine at Y -- run scripts/memcontinuum-update.sh`,
+only when the two differ — pulled from the same registry-pinned hook command
+line its `store=`/`project=` extraction already resolves, plus one
+`git rev-parse --short HEAD` on the engine checkout `SCRIPT_DIR` lives in
+(never on the repo being reported on).
+
 ## Path syntax in hook filters
 
 Rendered `if` filters carry a **second leading slash** on top of the absolute

@@ -316,6 +316,15 @@ so `reindex` by hand is only for edits you have not committed yet; and
 an empty list that reads like "nothing found". Run any command with `--help` for
 its full flag list.
 
+**Keeping a wired repo up to date.** A fix that only touches a script (a hook,
+`memidx.py`, `memlint.py`) reaches every wired repo the moment you pull —
+nothing to run. A fix that changes what gets *rendered* into a repo (the hook
+lines in its settings, its rules file, its copy of the search skill) needs
+`scripts/memcontinuum-update.sh` re-run there. `scripts/memcontinuum-state.sh`
+tells you which case you're in — it prints an `update:` line naming the repair
+command only when this repo's wiring is out of date; nothing to do when it
+says nothing.
+
 ## Languages
 
 The code index handles **Swift and Python**, both natively — Swift with a tuned

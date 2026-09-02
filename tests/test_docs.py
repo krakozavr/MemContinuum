@@ -52,6 +52,8 @@ HELP_COMMANDS = [
      ["bash", str(TOOLS_DIR / "scripts" / "memcontinuum-state.sh"), "--help"]),
     ("memcontinuum-decide.sh --help",
      ["bash", str(TOOLS_DIR / "scripts" / "memcontinuum-decide.sh"), "--help"]),
+    ("memcontinuum-update.sh --help",
+     ["bash", str(TOOLS_DIR / "scripts" / "memcontinuum-update.sh"), "--help"]),
     ("memlint.py --help", [PYTHON, str(TOOLS_DIR / "memlint.py"), "--help"]),
 ]
 
