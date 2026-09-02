@@ -52,10 +52,12 @@ def _symbol_declared(frag: str, text: str, rel_path: str = "x.swift") -> bool:
     false-positives on a name that only appears inside a comment or string
     literal (the chunker's mask already blanks those out).
 
-    Task 6: `rel_path` (the record's own ref_path when the caller has one)
-    is forwarded to fragment_declared_in_text so a "#symbol" fragment on a
-    Python implemented_by/tested_by path is checked against
-    chunkers.python_ast.declared_symbols instead of always assuming Swift."""
+    `rel_path` (the record's own ref_path when the caller has one) is
+    forwarded to fragment_declared_in_text, which resolves the file's
+    language from it and asks THAT backend's own `declared_symbols` --
+    so a "#symbol" fragment on a Python implemented_by/tested_by path is
+    checked against Python's vocabulary, not Swift's, with no
+    language-specific branch anywhere on this path."""
     return fragment_declared_in_text(frag, text, rel_path=rel_path)
 
 

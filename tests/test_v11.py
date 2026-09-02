@@ -331,7 +331,7 @@ class TestWhy(unittest.TestCase):
 
     def test_bare_symbol_resolution_finds_a_backtick_name_the_old_regex_missed(self):
         """Finding 7: `why`'s bare-symbol resolver must consume the SAME
-        chunker lexer chunk_source/declared_symbol_names/memlint/
+        chunker lexer chunk_source/declared_symbols/memlint/
         code-search attachment all agree on, not its own from-scratch
         regex (which only knew func/class/struct/enum/let/var -- no init,
         subscript, operators, or backtick-quoted names, e.g. `` `default` ``)."""

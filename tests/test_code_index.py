@@ -2777,6 +2777,31 @@ class TestSelfIndexAcceptanceGate(unittest.TestCase):
         resolved = memidx.resolve_symbol_to_path(TOOLS_DIR, symbol, project=self.PROJECT)
         self.assertEqual(resolved, "memidx.py")
 
+    def test_why_on_a_bare_symbol_names_the_file_that_defines_it(self):
+        """C6 (Anatomy M1 fix wave, Codex): the milestone's acceptance
+        sentence is about the real COMMAND, not the helper underneath it.
+        `why <bare symbol>` must go through cmd_why -- bare-symbol
+        detection, --code-root resolution, the code-index fast path, the
+        decision-store lookup -- and print a line naming memidx.py.
+
+        There are no concepts in this throwaway store, so the printed line
+        is `no concept claims 'memidx.py'` -- which is exactly the point:
+        the command resolved the symbol to its defining file and said so.
+        A regression in any step above prints a different path, or exits
+        non-zero, instead."""
+        args = ns(
+            symbol_or_path="parse_frontmatter",
+            code_root=str(TOOLS_DIR),
+            project=self.PROJECT,
+            db=str(Path(self._tmpdir.name) / "decisions.sqlite"),
+            json=False,
+        )
+        buf, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+            rc = memidx.cmd_why(args)
+        self.assertEqual(rc, 0, buf.getvalue() + err.getvalue())
+        self.assertIn("memidx.py", buf.getvalue(), buf.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

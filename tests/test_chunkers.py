@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import io
 import json
 import re
@@ -21,7 +22,10 @@ from test_code_index import FIXTURES, code_reindex  # noqa: E402 -- reuse the Sw
 # the corpus text here.
 
 GOLDEN_PATH = TESTS_DIR / "goldens" / "swift_chunks_kind_v2.json"
+PRE_EXTRACTION_GOLDEN_PATH = TESTS_DIR / "goldens" / "swift_chunks_pre_extraction.json"
+FINGERPRINT_GOLDEN_PATH = TESTS_DIR / "goldens" / "chunker_source_fingerprints.json"
 PY_FIXTURES = TESTS_DIR / "fixtures" / "python_corpus"
+REPO_ROOT = TESTS_DIR.parent
 
 
 class TestRegistry(unittest.TestCase):
@@ -147,14 +151,13 @@ class TestSwiftExtractionGolden(unittest.TestCase):
     Anatomy M1 milestone) from the NEW code once Swift's raw kinds
     (func/init/subscript/var) were mapped at emission onto the frozen
     chunkers.KINDS vocabulary (function/method/constructor/accessor). This
-    golden replaces swift_chunks_pre_extraction.json (captured BEFORE the
+    golden supersedes swift_chunks_pre_extraction.json (captured BEFORE the
     Swift lexer/walker moved to chunkers/swift.py, Task 2); the two goldens
-    are IDENTICAL except for the "kind" column -- verified once, at
-    generation time, by a one-off diff-with-kind-stripped script (see the
-    Task 12 report) rather than re-checked here on every run, since the old
-    golden no longer exists to diff against. Any further diff against
-    THIS golden means the move/mapping wasn't mechanical: fix the code,
-    never the golden."""
+    are IDENTICAL except for the "kind" column -- a claim that used to rest
+    on a one-off script and a report, and is now re-checked on every run by
+    TestSwiftGoldenByteIdentityProof below, the old golden having been
+    restored (fix wave C4). Any further diff against THIS golden means the
+    move/mapping wasn't mechanical: fix the code, never the golden."""
 
     def test_index_matches_kind_v2_golden(self):
         with tempfile.TemporaryDirectory() as td:
@@ -171,6 +174,95 @@ class TestSwiftExtractionGolden(unittest.TestCase):
         with open(GOLDEN_PATH) as f:
             expected = json.load(f)
         self.assertEqual(got, expected)
+
+
+class TestSwiftGoldenByteIdentityProof(unittest.TestCase):
+    """C4 (Anatomy M1 fix wave, Codex): the proof that moving the Swift
+    walker out of memidx.py into chunkers/swift.py changed NOTHING but the
+    `kind` column was, until now, a one-off script run at Task 12 time and
+    a sentence in a report. Anyone auditing this branch had to take that
+    on trust, or go digging in git history for a golden that had been
+    deleted.
+
+    tests/goldens/swift_chunks_pre_extraction.json is restored (recovered
+    verbatim from commit 6c98c7a) and the proof now runs on every suite
+    invocation: strip "kind" from both goldens, assert the rest is equal.
+    The two files together are the permanent, checkable record that the
+    extraction was mechanical and the taxonomy change touched exactly one
+    column."""
+
+    def _load(self, path):
+        with open(path) as f:
+            return json.load(f)
+
+    def test_goldens_are_identical_apart_from_the_kind_column(self):
+        pre = self._load(PRE_EXTRACTION_GOLDEN_PATH)
+        v2 = self._load(GOLDEN_PATH)
+
+        def strip_kind(rows):
+            return [{k: v for k, v in row.items() if k != "kind"} for row in rows]
+
+        self.assertEqual(len(pre), len(v2))
+        self.assertEqual(strip_kind(pre), strip_kind(v2))
+
+    def test_the_kind_column_is_exactly_what_changed(self):
+        """Guards the other direction: the two goldens must genuinely
+        DIFFER in `kind` (raw Swift keywords before, the frozen vocabulary
+        after), so the equality above can never be satisfied by two copies
+        of the same file."""
+        pre = self._load(PRE_EXTRACTION_GOLDEN_PATH)
+        v2 = self._load(GOLDEN_PATH)
+        self.assertEqual({row["kind"] for row in pre}, {"func", "init", "subscript", "var"})
+        self.assertTrue({row["kind"] for row in v2} <= chunkers.KINDS)
+        self.assertNotEqual(pre, v2)
+
+
+class TestChunkerSourceFingerprints(unittest.TestCase):
+    """I4 (Anatomy M1 fix wave): impl_version stays a MANUAL field --
+    deriving it from the module's bytes would force a full reindex of every
+    project on a whitespace edit or a comment fix, which is exactly the
+    cost the version stamp exists to avoid. The risk that leaves is the
+    discipline one: someone changes a chunker's OUTPUT and forgets to bump
+    impl_version, so every already-indexed project silently keeps serving
+    chunks the current code would no longer produce.
+
+    This test is the tripwire for that. It fingerprints each backend's
+    source and compares against a recorded golden; any edit to those files
+    fails here with instructions. Editing a comment will trip it too --
+    that is deliberate. A noisy prompt to think about the version stamp
+    costs one golden regeneration; a missed bump costs every project's
+    index silently."""
+
+    BACKENDS = ("chunkers/swift.py", "chunkers/python_ast.py")
+
+    @staticmethod
+    def _fingerprint(rel):
+        return hashlib.sha256((REPO_ROOT / rel).read_bytes()).hexdigest()
+
+    def test_backend_sources_match_the_recorded_fingerprints(self):
+        with open(FINGERPRINT_GOLDEN_PATH) as f:
+            golden = json.load(f)
+        got = {rel: self._fingerprint(rel) for rel in self.BACKENDS}
+        self.assertEqual(
+            got, golden,
+            "chunker source changed: bump impl_version AND regenerate the "
+            "fingerprint golden (tests/goldens/chunker_source_fingerprints.json) "
+            "-- if the change cannot alter any chunk this backend emits (a "
+            "comment, a docstring), regenerate the golden alone and say so in "
+            "the commit message.",
+        )
+
+    def test_the_golden_covers_every_native_backend_in_the_table(self):
+        """A new LANGUAGE_TABLE row must not slip past the tripwire just by
+        not being listed here."""
+        with open(FINGERPRINT_GOLDEN_PATH) as f:
+            golden = json.load(f)
+        expected = {
+            row["module"].replace(".", "/") + ".py"
+            for row in chunkers.LANGUAGE_TABLE.values()
+            if row["backend"] == "native"
+        }
+        self.assertEqual(set(golden), expected)
 
 
 class TestImplVersionBumpForcesSwiftRechunk(unittest.TestCase):
@@ -327,6 +419,39 @@ class TestPythonAstChunker(unittest.TestCase):
         self.assertNotIn("Outer", qnames)
         self.assertNotIn("Outer.Inner", qnames)
 
+    def test_nested_def_in_method_recall(self):
+        """T2 (Anatomy M1 fix wave): the one qualification shape the other
+        fixtures miss -- a def nested inside a METHOD. Pinned as the
+        chunker ACTUALLY emits it: the immediate parent is a function, not
+        a class, so `inner` is kind "function" (never "method"), and its
+        qualified_name carries the whole mixed stack, "Outer.method.inner".
+        """
+        text = (PY_FIXTURES / "nested_in_method.py").read_text()
+        result = python_ast.chunk_file(text, "nested_in_method.py")
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.gaps, [])
+        self.assertEqual(len(result.chunks), 3)  # capture-count golden
+        self.assertEqual(
+            _recall_tuples(result.chunks),
+            [
+                ("method", "Outer.method", 16, 23),
+                ("function", "Outer.method.inner", 19, 21),
+                ("method", "Outer.plain", 25, 26),
+            ],
+        )
+
+    def test_nested_def_in_method_declared_symbols(self):
+        text = (PY_FIXTURES / "nested_in_method.py").read_text()
+        self.assertEqual(
+            python_ast.declared_symbols(text),
+            [
+                ("Outer", "Outer"),
+                ("method", "Outer.method"),
+                ("inner", "Outer.method.inner"),
+                ("plain", "Outer.plain"),
+            ],
+        )
+
     def test_broken_file_fails_open(self):
         text = (PY_FIXTURES / "broken.py").read_text()
         result = python_ast.chunk_file(text, "broken.py")
@@ -349,7 +474,7 @@ class TestPythonAstChunker(unittest.TestCase):
         )
 
     def test_declared_symbols_includes_class_container_names(self):
-        # Mirrors chunkers.swift's declared_symbol_names container-name
+        # Mirrors chunkers.swift.declared_symbols' container-name
         # inclusion (memidx.py): a #symbol fragment may name the class
         # itself, not just a member.
         text = (PY_FIXTURES / "classes.py").read_text()
@@ -403,3 +528,58 @@ class TestFragmentDeclaredInTextDispatch(unittest.TestCase):
         self.assertTrue(
             memidx.fragment_declared_in_text("Outer.outerFunc", text, rel_path="NestedTypes.swift")
         )
+
+
+class TestSwiftDeclaredSymbolsBackend(unittest.TestCase):
+    """I3 (Anatomy M1 fix wave): `declared_symbols` is now part of the
+    registry contract, exposed by every backend, so
+    memidx.fragment_declared_in_text can route generically instead of
+    carrying an `if lang == "python"` branch and an inline Swift
+    container-name pass. Swift's implementation returns the same
+    (symbol, qualified_name) pair shape Python's does, and memidx no
+    longer imports any Swift lexer internals."""
+
+    def test_swift_declared_symbols_returns_pairs_covering_members(self):
+        text = (FIXTURES / "NestedTypes.swift").read_text()
+        pairs = chunkers.swift.declared_symbols(text)
+        for pair in pairs:
+            self.assertIsInstance(pair, tuple)
+            self.assertEqual(len(pair), 2)
+        self.assertIn(("outerFunc", "Outer.outerFunc"), pairs)
+        self.assertIn(("innerFunc", "Outer.Inner.innerFunc"), pairs)
+
+    def test_swift_declared_symbols_includes_container_type_names(self):
+        text = (FIXTURES / "NestedTypes.swift").read_text()
+        names = {symbol for symbol, _q in chunkers.swift.declared_symbols(text)}
+        self.assertIn("Outer", names)
+        self.assertIn("Inner", names)
+
+    def test_every_language_table_backend_exposes_declared_symbols(self):
+        for lang in chunkers.LANGUAGE_TABLE:
+            backend = chunkers.get_chunker(lang)
+            self.assertTrue(
+                callable(getattr(backend, "declared_symbols", None)),
+                f"{lang} backend must expose declared_symbols (registry contract)",
+            )
+            self.assertTrue(callable(getattr(backend, "chunk_file", None)))
+
+    def test_memidx_no_longer_imports_swift_lexer_internals(self):
+        for name in ("_build_mask_and_match_dict", "_KEYWORD_RE",
+                     "_container_type_name", "_extract_decls",
+                     "declared_symbol_names"):
+            self.assertFalse(
+                hasattr(memidx, name),
+                f"memidx.{name} should be gone -- the vocabulary check routes "
+                "through the backend's own declared_symbols now (I3)",
+            )
+        # chunk_source stays: existing tests import it as memidx.chunk_source.
+        self.assertTrue(callable(memidx.chunk_source))
+
+    def test_dispatch_has_no_per_language_branch_in_the_source(self):
+        """The point of I3 is structural, so assert the structure: the
+        function body must not name a language."""
+        import inspect
+        src = inspect.getsource(memidx.fragment_declared_in_text)
+        body = src.split('"""')[-1]
+        self.assertNotIn('== "python"', body, body)
+        self.assertIn("get_chunker", body, body)

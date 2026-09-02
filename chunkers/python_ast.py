@@ -250,10 +250,15 @@ def chunk_source(text: str):
     try:
         tree = ast.parse(text)
     except (SyntaxError, ValueError):
-        # ValueError alongside SyntaxError: ast.parse raises ValueError (not
-        # SyntaxError) for source containing NUL bytes -- "fail-open, no
-        # exception escapes" per the brief covers that case too, not just
-        # the SyntaxError one it names explicitly.
+        # B6 (Anatomy M1 fix wave): the comment that used to sit here said
+        # ast.parse raises ValueError for source containing NUL bytes.
+        # Verified false on this project's interpreter (CPython 3.12.3):
+        # `ast.parse("a = 1\x00b = 2")` raises SyntaxError ("source code
+        # string cannot contain null bytes"). ValueError is kept in the
+        # tuple anyway -- it is what older CPython raised for exactly this
+        # input, and the brief's "fail-open, no exception escapes" contract
+        # is worth more than a tight except clause -- but the comment must
+        # not claim behavior the runtime does not have.
         line_count = text.count("\n") + 1
         return [], [(1, line_count, "syntax-error")], "failed"
 
@@ -288,12 +293,14 @@ def chunk_file(text: str, rel_path: str) -> ChunkResult:
 
 
 def declared_symbols(text: str) -> list:
-    """All symbol names memlint's #symbol vocabulary check (Task 6) should
-    recognize as declared in `text` -- every chunkable def's bare name PLUS
-    each class's own name (mirroring chunkers.swift/memidx.py's
-    `declared_symbol_names`, which includes container type names alongside
-    member names: a #symbol fragment may name the class itself, not just a
-    member). Returns `(symbol, qualified_name)` pairs in source order,
+    """All symbol names memlint's #symbol vocabulary check should recognize
+    as declared in `text` -- every chunkable def's bare name PLUS each
+    class's own name (mirroring chunkers.swift.declared_symbols, which
+    includes container type names alongside member names: a #symbol
+    fragment may name the class itself, not just a member). Part of the
+    registry contract alongside `chunk_file`: memidx.fragment_declared_in_text
+    calls it generically, by language, with no per-language branch.
+    Returns `(symbol, qualified_name)` pairs in source order,
     de-duplicated (a `@property`/`@x.setter` pair share one qualified_name,
     e.g. `Gadget.value` from two separate defs -- listing it once is enough
     for a vocabulary check). On a syntax error, returns `[]` -- fail-open,

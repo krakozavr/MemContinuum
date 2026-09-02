@@ -1049,49 +1049,39 @@ def fragment_matches_symbol(frag: str, symbol: str, qualified_name: str) -> bool
 
 
 def fragment_declared_in_text(frag: str, text: str, rel_path: str = "x.swift") -> bool:
-    """memlint's #symbol vocabulary check (memlint.py's lint_concept),
-    reusing chunk_source's own lexer-aware chunks (not the flattened
-    bare-name set declared_symbol_names returns) so a QUALIFIED fragment
-    (e.g. "Outer.outerFunc") is accepted exactly when code-search's
-    concept_matches_for_chunk would accept it as a match for that chunk --
-    same fragment_matches_symbol predicate, applied here per-chunk instead
-    of per-DB-row. A fragment naming just a container type (no member,
-    e.g. "Outer") is still accepted too, matching declared_symbol_names'
-    existing container-name behavior.
+    """memlint's #symbol vocabulary check (memlint.py's lint_concept): is
+    `frag` a symbol actually DECLARED in `text`?
 
-    Task 6: `rel_path` (optional, defaulting to "x.swift" so every existing
-    call site is unaffected) routes the check per-language through the
-    chunker registry (chunkers.lang_for_path) instead of always running the
-    Swift lexer over the text. A ".py" rel_path dispatches to
-    chunkers.python_ast.declared_symbols, which already includes each
-    class's own name alongside its members (controller ruling: no separate
-    container-name pass is added here for Python -- declared_symbols is the
-    single source for that, same as it is for chunkers/test_chunkers.py's
-    own container-name tests), evaluated with the SAME fragment_matches_symbol
-    predicate used everywhere else. Every other rel_path (no registered
-    lang, or "swift") falls through to the Swift path below, byte-identical
-    to before this task."""
-    if chunkers.lang_for_path(rel_path) == "python":
-        return any(
-            fragment_matches_symbol(frag, symbol, qualified_name)
-            for symbol, qualified_name in chunkers.python_ast.declared_symbols(text)
-        )
-    chunks, _gaps = chunk_source(text)
-    for c in chunks:
-        if fragment_matches_symbol(frag, c["symbol"], c["qualified_name"]):
-            return True
-    mask, _match_dict, _gaps2 = _build_mask_and_match_dict(text)
-    for m in _KEYWORD_RE.finditer(mask):
-        kw = m.group(1)
-        if kw not in ("class", "struct", "enum", "protocol", "extension", "actor"):
-            continue
-        after = m.start() + len(kw)
-        name = _container_type_name(kw, mask, after)
-        if not name:
-            continue
-        if frag == name or frag in name.split("."):
-            return True
-    return False
+    Dispatch is fully generic (Anatomy M1 fix wave, I3): the file's
+    language comes from chunkers.lang_for_path(rel_path), and the answer
+    comes from that backend's own `declared_symbols(text)` -- a uniform
+    part of the registry contract, alongside `chunk_file`. There is no
+    per-language branch here and no Swift lexer call: adding a third
+    language means adding a LANGUAGE_TABLE row with a backend that exposes
+    declared_symbols, and this check follows for free. A rel_path with no
+    registered language falls back to the swift backend, which is what the
+    default "x.swift" preserves for every pre-existing call site
+    (resolve_symbol_to_path's bare-symbol fallback among them).
+
+    Each backend returns `(symbol, qualified_name)` pairs -- including its
+    container type names (Swift's class/struct/enum/protocol/extension/
+    actor, Python's classes), since a #symbol fragment may name the type
+    itself rather than a member. The pairs are evaluated with the SAME
+    fragment_matches_symbol predicate code-search's per-hit concept
+    attachment uses, so a fragment written qualified (e.g.
+    "Outer.outerFunc") validates identically on both surfaces."""
+    lang = chunkers.lang_for_path(rel_path) or "swift"
+    try:
+        backend = chunkers.get_chunker(lang)
+        pairs = backend.declared_symbols(text)
+    except Exception:
+        # Fail open, like every other chunker call site: a backend that
+        # cannot answer must not turn a lint into a crash.
+        return False
+    return any(
+        fragment_matches_symbol(frag, symbol, qualified_name)
+        for symbol, qualified_name in pairs
+    )
 
 
 def concept_matches_for_chunk(
@@ -1295,8 +1285,9 @@ def _resolve_symbol_via_code_index(code_root: Path, symbol: str, project: str) -
 
 def resolve_symbol_to_path(code_root: Path, symbol: str, project: str | None = None) -> str | None:
     """Finding 7: resolve a bare --code-root symbol to its defining file
-    for `why`, consuming the SAME lexer-aware chunker chunk_source/
-    declared_symbol_names/memlint/code-search attachment already agree on
+    for `why`, consuming the SAME per-language symbol vocabulary memlint
+    and code-search attachment already agree on -- each backend's own
+    declared_symbols
     (via fragment_declared_in_text, so a QUALIFIED symbol like
     "Outer.outerFunc" also resolves) -- not the old from-scratch regex
     (`func|class|struct|enum|let|var` only, missing init, subscript,
@@ -1913,50 +1904,17 @@ def iter_code_source_files(root: Path, langs: list[str] | None, skipped: Counter
 
 # ---------------------------------------------------------------------------
 # chunker: lexer-aware brace walker -- moved to chunkers/swift.py (Task 2,
-# Anatomy M1 milestone). Re-exported here for back-compat: declared_symbol_names
-# (which still needs _extract_decls) calls these by their memidx.<name> names,
-# and existing tests import chunk_source via memidx.chunk_source. (`chunkers`
-# itself is imported at module top now -- Task 5 needs it earlier, for
-# LANG_EXTENSIONS below.)
+# Anatomy M1 milestone). Only `chunk_source` is re-exported here now, for
+# the existing tests that import it as memidx.chunk_source. The lexer
+# internals (_build_mask_and_match_dict, _KEYWORD_RE, _container_type_name,
+# _extract_decls) used to be re-exported too, for declared_symbol_names and
+# fragment_declared_in_text's inline Swift container-name pass; both are
+# gone (fix wave I3 -- the vocabulary question is now one generic call to
+# the backend's own declared_symbols), and with them every reason for this
+# module to reach into a backend's internals at all.
 # ---------------------------------------------------------------------------
 
-from chunkers.swift import (
-    chunk_source,
-    _build_mask_and_match_dict,
-    _KEYWORD_RE,
-    _container_type_name,
-    _extract_decls,
-)
-import chunkers.python_ast
-
-
-def declared_symbol_names(text: str) -> set:
-    """All symbol names memlint's #symbol vocabulary check (finding 5,
-    memlint.py's lint_concept) should recognize as declared in `text` --
-    everything chunk_source would chunk (init, subscript, computed var
-    names, static/class func, operators, backtick names) PLUS each
-    container type's own name (class/struct/enum/protocol/extension/
-    actor -- a #symbol fragment may name the type itself, not just a
-    member; `extension Outer.Inner` contributes both "Outer" and "Inner"
-    separately, matching either half). Reuses chunk_source's own
-    lexer-aware mask (_build_mask_and_match_dict) rather than a
-    from-scratch regex scan, so a name that only appears inside a comment
-    or string literal is never counted (mirrors the same guarantee
-    chunk_source already gives code-search/code-reindex)."""
-    mask, match_dict, _gaps = _build_mask_and_match_dict(text)
-    names = {c["symbol"] for c in _extract_decls(text, mask, match_dict)}
-    for m in _KEYWORD_RE.finditer(mask):
-        kw = m.group(1)
-        if kw not in ("class", "struct", "enum", "protocol", "extension", "actor"):
-            continue
-        after = m.start() + len(kw)
-        name = _container_type_name(kw, mask, after)
-        if not name:
-            continue
-        for part in name.split("."):
-            if part:
-                names.add(part)
-    return names
+from chunkers.swift import chunk_source
 
 
 # ---------------------------------------------------------------------------

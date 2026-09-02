@@ -6,9 +6,13 @@ chunks-table dump captured from the pre-move code (that golden,
 tests/goldens/swift_chunks_pre_extraction.json, was retired in Task 12
 once _map_kind below changed the "kind" column it captured -- see
 tests/goldens/swift_chunks_kind_v2.json, identical to it except for that
-one column). memidx.py re-exports the names its own code and memlint.py
-still need (`chunk_source`, `_build_mask_and_match_dict`, `_KEYWORD_RE`,
-`_container_type_name`, `_extract_decls`) for back-compat.
+one column -- a claim TestSwiftGoldenByteIdentityProof re-checks on every
+run now that the pre-extraction golden is restored). memidx.py re-exports
+`chunk_source` for the tests that import it as memidx.chunk_source; the
+lexer internals stay private to this module.
+
+Registry contract (chunkers.__init__): this backend exposes `chunk_file`
+for indexing and `declared_symbols` for the #symbol vocabulary check.
 """
 from __future__ import annotations
 
@@ -230,7 +234,7 @@ def _find_resync_point(text: str, from_idx: int):
 
 def _build_mask_and_match_dict(text: str):
     """The lexer-aware brace-walk shared by chunk_source and
-    declared_symbol_names (finding 5, memlint's #symbol vocabulary):
+    declared_symbols (finding 5, memlint's #symbol vocabulary):
     returns (mask, match_dict, gaps) -- mask is `text` with every
     comment/string's contents blanked to spaces (newlines kept, so line
     numbers still line up) and match_dict maps each '{' index to its
@@ -397,7 +401,7 @@ def _class_token_is_member_modifier(mask: str, after: int) -> bool:
 
 
 def _container_type_name(kw: str, mask: str, after: int):
-    """Shared by _extract_decls and declared_symbol_names (findings 3/7):
+    """Shared by _extract_decls and declared_symbols (findings 3/7):
     for a class/struct/enum/protocol/extension/actor _KEYWORD_RE match,
     returns the container's own name, or None when this isn't really a
     type declaration at all (a `class <modifier>* func/var/subscript/init`
@@ -709,3 +713,60 @@ def chunk_file(text: str, rel_path: str) -> ChunkResult:
     gaps3 = [(start, end, "brace-desync") for start, end in gaps]
     status = "ok" if not gaps3 else "partial"
     return ChunkResult(chunks, gaps3, status)
+
+
+def declared_symbols(text: str) -> list:
+    """Every name memlint's `#symbol` vocabulary check should recognize as
+    declared in `text`, as `(symbol, qualified_name)` pairs -- the same
+    shape chunkers.python_ast.declared_symbols returns, so
+    memidx.fragment_declared_in_text can dispatch to whichever backend the
+    file's language names without knowing anything about either one
+    (Anatomy M1 fix wave, I3; this replaces memidx.declared_symbol_names
+    and the Swift-specific container-name pass memidx used to run inline).
+
+    Two sources, in order:
+
+    1. Everything `chunk_source` would chunk -- init, subscript, computed
+       var names, static/class func, operators, backtick names -- each as
+       its own (symbol, qualified_name) pair.
+    2. Each CONTAINER type's own name (class/struct/enum/protocol/
+       extension/actor). A #symbol fragment may name the type itself, not
+       just one of its members, and `extension Outer.Inner` contributes
+       the dotted name AND each half separately, so a fragment written as
+       either "Outer" or "Inner" matches.
+
+    Both passes read chunk_source's own lexer-aware mask
+    (_build_mask_and_match_dict) rather than scanning raw text, so a name
+    that appears only inside a comment or a string literal is never
+    counted -- the same guarantee chunk_source already gives code-search
+    and code-reindex."""
+    mask, match_dict, _gaps = _build_mask_and_match_dict(text)
+    out: list = []
+    seen: set = set()
+
+    def add(symbol, qualified_name):
+        pair = (symbol, qualified_name)
+        if pair not in seen:
+            seen.add(pair)
+            out.append(pair)
+
+    for chunk in _extract_decls(text, mask, match_dict):
+        add(chunk["symbol"], chunk["qualified_name"])
+
+    for m in _KEYWORD_RE.finditer(mask):
+        kw = m.group(1)
+        if kw not in ("class", "struct", "enum", "protocol", "extension", "actor"):
+            continue
+        name = _container_type_name(kw, mask, m.start() + len(kw))
+        if not name:
+            continue
+        # The dotted name itself, plus each half -- memidx's
+        # fragment_matches_symbol then accepts a fragment written either
+        # way, exactly as the old `frag == name or frag in name.split(".")`
+        # container check did.
+        add(name, name)
+        for part in name.split("."):
+            if part:
+                add(part, part)
+
+    return out
