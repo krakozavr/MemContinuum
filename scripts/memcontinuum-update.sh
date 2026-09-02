@@ -55,8 +55,10 @@
 #            narrows the walk to that one repository's row. Required
 #            alongside the migration options below (they describe ONE row).
 # --machine  also report the MACHINE layer -- the detector hook and skill
-#            copy in ~/.claude, which memcontinuum-setup.sh renders and no
-#            per-repo install touches. It is compared against its own
+#            copy in the user-level claude-dir memcontinuum-setup.sh
+#            installed into (it records which one; ~/.claude is only the
+#            fallback), which no per-repo install touches. The reported line
+#            names that directory. It is compared against its own
 #            fingerprint, over its own inputs (memcontinuum-setup.sh, the
 #            machine-level skill, the settings merge), so an edit to any of
 #            those shows up HERE and not as drift in every repository -- and a
@@ -105,14 +107,30 @@
 #            want to check the plan first). Adds LANG to the row's recorded
 #            language set and/or .ext to its recorded never-mention list
 #            (both are ADDITIVE -- neither drops what the row already had),
-#            rewrites the row (memcontinuum-decide.sh wired, every field),
-#            then re-renders every claude-dir that row lists with the new
-#            set. --repo PATH is required -- same reasoning as
+#            re-renders every claude-dir that row lists with the new set,
+#            and only THEN rewrites the row (memcontinuum-decide.sh wired,
+#            every field). Render first, record second: a row written first
+#            would describe a language set that exists nowhere the moment a
+#            render failed, and every later re-render replays that claim.
+#            --repo PATH is required -- same reasoning as
 #            memcontinuum-decide.sh's own --repo requirement: no silent
 #            $PWD default for a write that changes what gets indexed.
-#            The row is rewritten only AFTER every claude-dir has
-#            re-rendered successfully, and an unknown language is refused
-#            before anything is touched at all.
+#
+#            The re-render is all-or-nothing: every claude-dir is run with
+#            --dry-run first, and only an all-clear turns into real writes.
+#            The dirs on one row share one language set, so converting the
+#            first and failing on the second would leave the project
+#            describing itself two different ways.
+#
+#            Refused before anything is written anywhere: a row that records
+#            no claude-dirs (migrate it first -- <repo>/.claude is never
+#            substituted for a set the row does not name); a row that
+#            records no code-roots (no-code-root -- the installer ignores
+#            --langs without a --code-root, so nothing would render while
+#            the row claimed it); a store that is gone; an unknown language;
+#            and a recorded claude-dir carrying no wiring for this project
+#            (dir-not-wired -- this command re-renders what is installed, it
+#            never installs).
 #            --never-ext ADDS; it has no second meaning. Supplying the whole
 #            list for a migration is --set-never-ext, above. Combining
 #            --add-lang or --never-ext with --apply is refused rather than
@@ -129,9 +147,10 @@
 #   ANSWER there, not an error.
 #   --apply exits 0 only when every claude-dir it walked ended up correct:
 #   already ok, or re-rendered successfully. Anything left undone -- a failed
-#   installer run, or a dir deliberately skipped (store-missing, a foreign
-#   rules file, a migration this command must not guess at) -- exits non-zero,
-#   with the table still printed and the reason on stderr.
+#   installer run, a dir deliberately skipped (store-missing, a foreign
+#   rules file, a migration this command must not guess at), or a row that
+#   could not be resolved to a claude-dir at all (unrecoverable) -- exits
+#   non-zero, with the table still printed and the reason on stderr.
 #   The one exception is `no-wiring`: a claude-dir with none of this
 #   project's hook lines at all is a broken or never-finished INSTALL, which
 #   is the memcontinuum skill's repair path (a human is asked), not this

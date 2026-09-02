@@ -281,6 +281,138 @@ class TestDocumentedHelpFlagsWork(unittest.TestCase):
         self.assertNotIn("path=--help", proc.stdout)
 
 
+# Commands with a real option parser: an argument loop with an
+# `*) unknown argument` arm. memlint.py and memcontinuum-state.sh are
+# deliberately absent -- neither has one (state.sh takes a bare REPO_PATH,
+# memlint.py a bare ROOT), so an unrecognised flag is swallowed as the
+# positional rather than refused, and probing them could not tell "the parser
+# accepts this" from "the parser mistook it for a path".
+PARSED_COMMANDS = [
+    ("memcontinuum-setup.sh", ["bash", str(TOOLS_DIR / "memcontinuum-setup.sh")], []),
+    ("repo-init.sh", ["bash", str(TOOLS_DIR / "scripts" / "repo-init.sh")], []),
+    # decide.sh dispatches on an ACTION in $1 before its option loop, so the
+    # probe needs one. `wired` never runs here: the loop refuses the probe
+    # flag first, and the action dispatch is below the loop.
+    ("memcontinuum-decide.sh",
+     ["bash", str(TOOLS_DIR / "scripts" / "memcontinuum-decide.sh")], ["wired"]),
+    ("memcontinuum-update.sh",
+     ["bash", str(TOOLS_DIR / "scripts" / "memcontinuum-update.sh")], []),
+]
+
+PROBE_FLAG = "--mc-help-consistency-probe"
+PROBE_VALUE = "MC_HELP_CONSISTENCY_PROBE_VALUE"
+
+_LONG_FLAG = re.compile(r"(?<![\w-])--[a-z][a-z0-9-]*")
+# An OPTION ENTRY, not prose that happens to begin with a flag: the flag is
+# followed by end-of-line, the description column (two or more spaces), an
+# `=`, or a single space and a token that is not a plain lowercase word
+# (a placeholder like DIR/LIST/.ext, or a bracketed alternative).
+_OPTION_ENTRY = re.compile(r"^(--[a-z][a-z0-9-]*)(?:$|\s{2,}|=| (?![a-z]+(?:\s|$)))")
+# `--foo)` / `--foo|--bar)` case arms in a bash argument loop.
+_CASE_LABEL = re.compile(r"^\s*((?:--[a-z0-9-]+\|)*--[a-z0-9-]+)\)", re.M)
+
+
+def documented_flags(own_basename, help_text):
+    """Every long option a help text presents as one of THIS command's own.
+
+    Only three line shapes count: the usage synopsis (a line naming the
+    command itself), a bracketed synopsis continuation, and an option entry.
+    Free prose is skipped on purpose -- these help texts discuss sibling
+    commands' flags ("every installer run it makes is passed --adopt-only")
+    and wrap mid-sentence onto lines that begin with one.
+    """
+    flags = []
+    for line in help_text.splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("usage:"):
+            stripped = stripped.split(":", 1)[1].strip()
+        if not (stripped.startswith(own_basename)
+                or stripped.startswith("[--")
+                or _OPTION_ENTRY.match(stripped)):
+            continue
+        for flag in _LONG_FLAG.findall(stripped):
+            if flag != "--help" and flag not in flags:
+                flags.append(flag)
+    return flags
+
+
+def parser_flags(script_path):
+    flags = []
+    for group in _CASE_LABEL.findall(Path(script_path).read_text()):
+        for flag in group.split("|"):
+            if flag.startswith("--") and flag != "--help" and flag not in flags:
+                flags.append(flag)
+    return flags
+
+
+class TestHelpTextsAgreeWithTheParsers(unittest.TestCase):
+    """A --help that names a flag the parser rejects sends whoever reads it to
+    an error; a parser that accepts a flag the help never mentions is a
+    feature only its author can find. Both halves are checked, and the
+    documented half is checked by actually FEEDING each flag to the command --
+    a help text and a parser can agree on a spelling that no longer parses.
+
+    Nothing here mutates anything: every probe run appends an argument the
+    parser cannot know, so each command exits inside its argument loop, before
+    it does any work. HOME is sandboxed anyway.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-helpflags-test-")
+        self.env = dict(os.environ)
+        self.env["PYTHONPATH"] = ""
+        self.env["HOME"] = self.tmp
+        for key in list(self.env):
+            if key.startswith("MEMCONTINUUM_"):
+                del self.env[key]
+
+    def _run(self, argv):
+        return subprocess.run(argv, cwd=str(TOOLS_DIR), env=self.env,
+                              capture_output=True, text=True, timeout=120)
+
+    def _help_text(self, argv):
+        proc = self._run(argv + ["--help"])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return proc.stdout
+
+    def test_the_probe_is_actually_refused(self):
+        """The negative control. Every assertion below is "this flag was NOT
+        called unknown", which a command that never prints that phrase would
+        pass without parsing anything. So first: an argument no parser can
+        know must be named, by every one of them."""
+        for label, argv, prefix in PARSED_COMMANDS:
+            with self.subTest(command=label):
+                proc = self._run(argv + prefix + [PROBE_FLAG])
+                self.assertIn("unknown argument: " + PROBE_FLAG,
+                              proc.stdout + proc.stderr,
+                              proc.stdout + proc.stderr)
+                self.assertNotEqual(proc.returncode, 0)
+
+    def test_every_documented_flag_is_accepted_by_the_parser(self):
+        for label, argv, prefix in PARSED_COMMANDS:
+            flags = documented_flags(label, self._help_text(argv))
+            with self.subTest(command=label):
+                # A floor, so a broken extractor cannot pass by finding none.
+                self.assertGreaterEqual(len(flags), 5, flags)
+            for flag in flags:
+                with self.subTest(command=label, flag=flag):
+                    proc = self._run(argv + prefix + [flag, PROBE_VALUE, PROBE_FLAG])
+                    combined = proc.stdout + proc.stderr
+                    self.assertNotIn(
+                        "unknown argument: " + flag, combined,
+                        f"{label} --help documents {flag}, and its parser refuses it")
+
+    def test_every_flag_the_parser_accepts_is_documented(self):
+        for label, argv, _prefix in PARSED_COMMANDS:
+            script = argv[-1]
+            documented = documented_flags(label, self._help_text(argv))
+            for flag in parser_flags(script):
+                with self.subTest(command=label, flag=flag):
+                    self.assertIn(
+                        flag, documented,
+                        f"{label} accepts {flag} and its --help never says so")
+
+
 class TestDocumentedSkipBehaviour(unittest.TestCase):
     """The README promises that the tests needing machine-local data skip with
     a clear message rather than failing. Verified by running the one suite that

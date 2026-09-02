@@ -63,11 +63,23 @@ hand-edited settings file or an interrupted install leaves them out of step,
 and collapsing them into one line hides exactly that.
 
   update: wiring rendered by X, engine at Y -- run scripts/memcontinuum-update.sh
-                                 printed only when the rendered wiring's stamp
-                                 does not match the engine checkout's current
-                                 commit -- a rendered-artifact fix landed in
-                                 the engine since this repo was last installed
-                                 or updated.
+                                 printed only when the stamp on this repo's
+                                 wired hook line does not match the engine
+                                 checkout's RENDER FINGERPRINT -- a hash of
+                                 the things wiring is rendered from (the
+                                 templates, the installer, the copied skill),
+                                 not the engine's current commit. A fix to a
+                                 script alone changes the commit and not the
+                                 fingerprint, and needs no re-render; a fix to
+                                 a template changes the fingerprint and does.
+                                 An `unknown` on either side prints the line
+                                 too: it means the fingerprint could not be
+                                 computed, which is not the same as agreeing.
+
+Silence on that line means one thing only: that hook line's stamp is current.
+It is not a health check -- it does not look at the rules file, at whether the
+store still exists, or at whether the row's store= still matches what is
+wired. `scripts/memcontinuum-update.sh --dry-run` is the check that does.
 
 Recording an answer is a different command: memcontinuum-decide.sh.
 USAGE

@@ -321,9 +321,17 @@ its full flag list.
 nothing to run. A fix that changes what gets *rendered* into a repo (the hook
 lines in its settings, its rules file, its copy of the search skill) needs
 `scripts/memcontinuum-update.sh` re-run there. `scripts/memcontinuum-state.sh`
-tells you which case you're in — it prints an `update:` line naming the repair
-command only when this repo's wiring is out of date; nothing to do when it
-says nothing.
+prints an `update:` line naming the repair command when this repo's wiring is
+out of date.
+
+Read its silence narrowly, though. What that line compares is the *stamp on
+this repo's wired hook line* against the engine's fingerprint — so silence
+means the hook lines were rendered by this checkout, and nothing more. It does
+not notice a rules file that has gone missing, a `store=` that no longer
+matches what is wired, or a store that has been renamed or deleted out from
+under the wiring. The check that looks at all of those is
+`scripts/memcontinuum-update.sh --dry-run`, which writes nothing and prints a
+row per repository and claude-dir.
 
 That distinction is real, not a rule of thumb. Each rendered artifact carries
 a fingerprint of the things it was rendered *from* — the templates, the
@@ -331,10 +339,12 @@ installer, the skill copies — so pulling a change to a hook script leaves
 every repository reading as current, and changing a template flips exactly the
 repositories that need re-rendering.
 
-The machine-wide pieces (the detector, the skill in your own `~/.claude`) are
-tracked the same way but separately, under `--machine`: a change there is
-reported where the one command that fixes it applies, rather than as drift in
-every repository you have ever wired.
+The machine-wide pieces (the detector, the skill in your own user-level Claude
+directory) are tracked the same way but separately, under `--machine`: a
+change there is reported where the one command that fixes it applies, rather
+than as drift in every repository you have ever wired. Setup records which
+directory it installed those into, so if you gave it `--claude-dir`, that is
+the one reported and refreshed — never a second copy at the default path.
 
 Run `memcontinuum-update.sh` with no flags and it only prints a table: one line
 per repository and claude-dir, saying what is current, what has drifted, and
@@ -354,6 +364,13 @@ claude-dir only ever joins a repository's record by being named on such a
 command line. Likewise, wiring old enough not to record which languages it
 indexes is reported as needing `--langs`, not quietly recorded as indexing
 none — that would switch off code indexing for a project that had it on.
+
+**A repository has one set of languages, and it applies to all of its
+claude-dirs.** So when such a repository is being brought onto the new record
+format, each of its claude-dirs is read separately, and if they turn out to
+disagree — different code roots, different languages — the table says so and
+stops rather than picking one and re-rendering the others to match. You settle
+it with `--code-root`, `--langs` and `--set-never-ext` on the command line.
 
 ## Languages
 
