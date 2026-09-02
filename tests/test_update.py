@@ -1957,6 +1957,145 @@ class TestMachineClaudeDirIsRecordedAndReused(unittest.TestCase):
         self.assertTrue(line.endswith("-- ok"), line)
 
 
+class TestTheRowIsRewrittenOnlyWhenEveryDirRendered(unittest.TestCase):
+    """"Record what is on disk" has to mean every dir, not every dir that
+    happened to reach the installer. A skip is not a success: a dir refused
+    for a foreign rules file or a dead store was never re-rendered, so a row
+    rewritten after it describes parameters that dir does not carry -- and
+    every future re-render replays that description."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-migrate-skip-test-")
+        self.home = str(Path(self.tmp) / "home")
+        os.makedirs(self.home, exist_ok=True)
+        self.repo = git_repo(str(Path(self.tmp) / "repo"))
+        self.store = str(Path(self.tmp) / "store")
+        self.code_root = str(Path(self.tmp) / "code")
+        os.makedirs(self.code_root, exist_ok=True)
+        (Path(self.code_root) / "x.py").write_text("print(1)\n")
+        self.claude_a = str(Path(self.repo) / ".claude")
+        self.claude_b = str(Path(self.tmp) / "session-home" / ".claude")
+
+    def _install(self, claude_dir):
+        proc = run(INSTALL_SH, ["--project", "skip", "--store", self.store,
+                                "--claude-dir", claude_dir, "--code-root", self.code_root,
+                                "--langs", "python", "--non-interactive"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_a_dead_store_skips_the_dir_and_leaves_the_row_alone(self):
+        self._install(self.claude_a)
+        write_row(self.home, self.repo, "wired",
+                  note=f"store={self.store} project=skip")
+        os.rename(self.store, self.store + "-renamed-away")
+        before = decisions_tsv(self.home).read_text()
+
+        proc = run(UPDATE_SH, ["--apply", "--repo", self.repo,
+                               "--claude-dir", self.claude_a,
+                               "--langs", "python"], self.home)
+        combined = proc.stdout + proc.stderr
+        self.assertNotEqual(proc.returncode, 0, combined)
+        self.assertIn("store-missing", combined, combined)
+        self.assertNotIn("migrated:", combined, combined)
+        self.assertEqual(decisions_tsv(self.home).read_text(), before,
+                         "the row was rewritten over a dir that was never re-rendered")
+        self.assertFalse(Path(self.store).exists())
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_one_skipped_dir_among_two_leaves_the_row_alone(self):
+        self._install(self.claude_a)
+        self._install(self.claude_b)
+        write_row(self.home, self.repo, "wired",
+                  note=f"store={self.store} project=skip")
+        Path(self.claude_b, "rules", "memcontinuum.md").write_text("# not ours\n")
+        before = decisions_tsv(self.home).read_text()
+
+        proc = run(UPDATE_SH, ["--apply", "--repo", self.repo,
+                               "--claude-dir", self.claude_a,
+                               "--claude-dir", self.claude_b], self.home)
+        combined = proc.stdout + proc.stderr
+        self.assertNotEqual(proc.returncode, 0, combined)
+        # A really was re-rendered -- an installer run cannot be rolled back,
+        # and re-rendering it is idempotent. What must NOT happen is the row
+        # being rewritten as though B had been converted too.
+        self.assertIn("OK %s" % self.claude_a, combined, combined)
+        self.assertIn("SKIPPED %s" % self.claude_b, combined, combined)
+        self.assertIn("rules-foreign", combined, combined)
+        self.assertNotIn("migrated:", combined, combined)
+        self.assertEqual(decisions_tsv(self.home).read_text(), before,
+                         "one dir skipped, and the row was rewritten anyway")
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_the_all_clear_case_still_migrates(self):
+        self._install(self.claude_a)
+        self._install(self.claude_b)
+        write_row(self.home, self.repo, "wired",
+                  note=f"store={self.store} project=skip")
+        proc = run(UPDATE_SH, ["--apply", "--repo", self.repo,
+                               "--claude-dir", self.claude_a,
+                               "--claude-dir", self.claude_b], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("migrated:", proc.stdout + proc.stderr)
+        note = decisions_tsv(self.home).read_text().splitlines()[-1]
+        self.assertIn(f"claude-dirs={self.claude_a};{self.claude_b}", note, note)
+
+
+class TestThePartialRenderNoteIsOnlyPrintedWhenTrue(unittest.TestCase):
+    """The note exists to stop a migration recording a smaller language set
+    than what is wired without saying so. Printed when nothing is partial, it
+    does the opposite job: it tells a human their fully-wired project is half
+    installed, and names the language that is actually fine as the culprit."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-partial-note-test-")
+        self.home = str(Path(self.tmp) / "home")
+        os.makedirs(self.home, exist_ok=True)
+        self.repo = git_repo(str(Path(self.tmp) / "repo"))
+        self.code_root = str(Path(self.tmp) / "code")
+        os.makedirs(self.code_root, exist_ok=True)
+        (Path(self.code_root) / "x.py").write_text("print(1)\n")
+        self.store = str(Path(self.tmp) / "store")
+        self.claude_dir = str(Path(self.repo) / ".claude")
+
+    def _legacy_walk(self):
+        proc = run(INSTALL_SH, [
+            "--project", "note", "--store", self.store, "--claude-dir", self.claude_dir,
+            "--code-root", self.code_root, "--langs", "python", "--non-interactive",
+        ], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return proc
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_a_fully_rendered_language_produces_no_note(self):
+        self._legacy_walk()
+        write_row(self.home, self.repo, "wired",
+                  note=f"store={self.store} project=note")
+        proc = run(UPDATE_SH, [], self.home)
+        combined = proc.stdout + proc.stderr
+        self.assertNotIn("partially rendered", combined, combined)
+        # And the recovery itself is still right.
+        proc = run(UPDATE_SH, ["--apply", "--repo", self.repo,
+                               "--claude-dir", self.claude_dir], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        note = decisions_tsv(self.home).read_text().splitlines()[-1]
+        self.assertIn("langs=python", note, note)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_a_genuinely_partial_render_still_produces_one(self):
+        """The other half: silencing the note by always printing nothing
+        would pass the test above and lose what it is for."""
+        self._legacy_walk()
+        path = Path(self.claude_dir, "settings.local.json")
+        path.write_text(path.read_text().replace(
+            "MEMCONTINUUM_LANG_EXTS='*.py'", "MEMCONTINUUM_LANG_EXTS='*.py *.zz'"))
+        write_row(self.home, self.repo, "wired",
+                  note=f"store={self.store} project=note")
+        proc = run(UPDATE_SH, [], self.home)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("partially rendered", combined, combined)
+        self.assertIn("*.zz", combined, combined)
+
+
 class TestHelp(unittest.TestCase):
     def test_help_exits_zero_and_documents_the_flags(self):
         proc = subprocess.run([MC_BASH, str(UPDATE_SH), "--help"], capture_output=True, text=True)

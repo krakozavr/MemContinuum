@@ -475,7 +475,18 @@ mc_update_recover_from_settings() {
             # migration ends up recording a smaller language set than what is
             # actually installed and saying nothing about the difference.
             # Globs matching no language at all are named for the same reason.
-            lang_list="$(
+            #
+            # Both answers come back on ONE stdout, each behind a key, and
+            # neither is read positionally. They used to be two bare lines
+            # split on the newline between them -- but command substitution
+            # strips TRAILING newlines, so when the notes line was empty (the
+            # normal case: nothing is partial) there was no newline left to
+            # split on, `${x#*\n}` matched nothing and handed back the whole
+            # string, and the LANGUAGE LIST became the note. Every fully
+            # rendered project was told it was "partially rendered -- python",
+            # naming the one language that was perfectly fine.
+            local lang_out=""
+            lang_out="$(
                 MC_UPDATE_EXTS="$lang_glob_str" MC_UPDATE_ENGINE_ROOT="$ENGINE_ROOT" \
                 PYTHONPATH= "$py" - <<'PYEOF' 2>/dev/null
 import os, sys
@@ -500,12 +511,27 @@ leftover = sorted(have - claimed)
 if leftover:
     notes.append("extensions matching no language this engine knows: %s"
                  % " ".join(leftover))
-print(",".join(full))
-print(" | ".join(notes))
+print("MC_LANGS=" + ",".join(full))
+print("MC_NOTE=" + " | ".join(notes))
 PYEOF
             )"
-            MC_RECOVERED_LANG_NOTE="${lang_list#*$'\n'}"
-            lang_list="${lang_list%%$'\n'*}"
+            local lang_line lang_seen=0
+            while IFS= read -r lang_line || [ -n "$lang_line" ]; do
+                case "$lang_line" in
+                    MC_LANGS=*) lang_list="${lang_line#MC_LANGS=}"; lang_seen=1 ;;
+                    MC_NOTE=*)  MC_RECOVERED_LANG_NOTE="${lang_line#MC_NOTE=}" ;;
+                esac
+            done <<<"$lang_out"
+            # No keyed answer at all means the helper did not run (a broken
+            # checkout, an import failure -- its stderr is discarded because a
+            # traceback is not this table's business). That is UNKNOWN, not
+            # "no languages": recording the latter would turn code indexing
+            # off for a project that had it on.
+            if [ "$lang_seen" -eq 0 ]; then
+                MC_RECOVERED_LANGS_OK=0
+                lang_list=""
+                MC_RECOVERED_LANG_NOTE=""
+            fi
         fi
         MC_RECOVERED_LANGS="$lang_list"
     fi
@@ -651,8 +677,13 @@ process_claude_dir() {
     # never-finished INSTALL, which is the memcontinuum skill's repair path
     # (a human is asked), not this command's. A `wired` row is never a licence
     # to wire anything.
-    if [ "$APPLY" -eq 1 ] && [ "$action" != "ok" ] && [ "$action" != "no-wiring" ]; then
-        apply_claude_dir "$claude_dir" "$action"
+    if [ "$APPLY" -eq 1 ]; then
+        # Counted for a legacy row whatever happens next: the migration gate
+        # compares this against the number that actually re-rendered.
+        [ "$LEGACY" -eq 1 ] && MIGRATE_DIRS_WALKED=$((MIGRATE_DIRS_WALKED + 1))
+        if [ "$action" != "ok" ] && [ "$action" != "no-wiring" ]; then
+            apply_claude_dir "$claude_dir" "$action"
+        fi
     fi
     return 0
 }
@@ -712,11 +743,15 @@ apply_claude_dir() {
     echo "  applying: bash $REPO_INIT ${args[*]}"
     if "$MC_BASH_BIN" "$REPO_INIT" "${args[@]}" >"$SBOX_APPLY_LOG" 2>&1; then
         echo "  OK $claude_dir"
+        # The ONE place a dir counts as re-rendered. Everything above this
+        # line -- every skip, every refusal -- leaves the count alone, which
+        # is what makes the migration gate below say "all of them" rather
+        # than "none of them failed loudly enough".
+        MIGRATE_DIRS_RENDERED=$((MIGRATE_DIRS_RENDERED + 1))
     else
         local rc=$?
         not_applied "  FAILED $claude_dir (rc=$rc) -- see below"
         sed 's/^/    /' "$SBOX_APPLY_LOG" >&2
-        MIGRATE_RENDER_FAILED=1
     fi
 }
 
@@ -1056,10 +1091,14 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
     # that answer can come from.
     LEGACY_ACTION="migrate"
     MIGRATE_BLOCKED_HINT=""
-    # Reset per row: the registry row is rewritten only when every one of this
-    # row's claude-dirs actually re-rendered. A row rewritten after a failed
-    # render would record parameters that are not on disk anywhere.
-    MIGRATE_RENDER_FAILED=0
+    # Reset per row. The registry row is rewritten only when EVERY one of this
+    # row's claude-dirs actually re-rendered in this run -- counted, rather
+    # than inferred from "no failure was recorded". A skip is not a success:
+    # a dir refused for a dead store or a foreign rules file was never
+    # re-rendered, and a row rewritten after it describes parameters that dir
+    # does not carry -- which every future re-render then replays.
+    MIGRATE_DIRS_WALKED=0
+    MIGRATE_DIRS_RENDERED=0
     if [ "$LEGACY" -eq 1 ]; then
         FIRST_CLAUDE_DIR="${CLAUDE_DIRS_SEMI%%;*}"
 
@@ -1180,7 +1219,8 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
     done
 
     if [ "$LEGACY" -eq 1 ] && [ "$APPLY" -eq 1 ] && [ "$LEGACY_ACTION" = "migrate" ] \
-           && [ "$MIGRATE_RENDER_FAILED" -eq 0 ]; then
+           && [ "$MIGRATE_DIRS_WALKED" -gt 0 ] \
+           && [ "$MIGRATE_DIRS_RENDERED" -eq "$MIGRATE_DIRS_WALKED" ]; then
         MIGRATE_ARGS=(wired --repo "$KEY" --store "$STORE" --project "$PROJECT")
         mc_split_semi "$CLAUDE_DIRS_SEMI"
         for d in ${MC_SPLIT[@]+"${MC_SPLIT[@]}"}; do MIGRATE_ARGS+=(--claude-dir "$d"); done
@@ -1195,8 +1235,11 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
             not_applied "  MIGRATE FAILED: $KEY -- registry row left as-is, re-render still applied above if it succeeded"
         fi
     elif [ "$LEGACY" -eq 1 ] && [ "$APPLY" -eq 1 ]; then
-        : # refused above (migrate-needs-*) or the re-render failed -- the row
-          # is left exactly as it was, and not_applied has already recorded it.
+        : # Refused up front (migrate-needs-*/migrate-dirs-disagree), or at
+          # least one claude-dir did not end up re-rendered -- it failed, or
+          # it was skipped for a dead store or a foreign rules file. Either
+          # way the row is left exactly as it was, `migrated:` is not printed,
+          # and not_applied has already made the walk exit non-zero.
     elif [ "$LEGACY" -eq 1 ]; then
         if [ -n "$MIGRATE_BLOCKED_HINT" ]; then
             MIGRATE_HINTS="$MIGRATE_HINTS
