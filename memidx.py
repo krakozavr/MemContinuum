@@ -2307,22 +2307,21 @@ NO_EXTENSION_BUCKET = "(no extension)"
 
 
 def _census_skip_dirs() -> set:
-    """Directory names pruned from a code-census walk.
+    """Directory names pruned from a code-census walk: CODE_SKIP_DIR_NAMES
+    (the global set: .git/vendor/node_modules) unioned with EVERY
+    LANGUAGE_TABLE row's skip_dirs.
 
-    Deliberately WIDER than iter_code_source_files' wired-langs union
-    (Task 7): census runs BEFORE any language is wired for a project --
-    it is the discovery step repo-init's consent dialogue reads, so there
-    is no "wired" subset yet to union against. Using ONLY
-    CODE_SKIP_DIR_NAMES (the global set: .git/vendor/node_modules) would
-    let a census walk descend into every OTHER LANGUAGE_TABLE row's own
-    noise dirs it doesn't yet know to exclude -- an untouched Python
-    project's census would count thousands of files under .venv/ as pure
-    noise (Task 5 reviewer finding, assigned to this task). So census
-    unions CODE_SKIP_DIR_NAMES with EVERY LANGUAGE_TABLE row's skip_dirs,
-    not just a wired subset: the walk needs to already look clean before
-    the user has chosen anything. (Contrast iter_code_source_files, which
-    correctly unions only the WIRED subset once a project has committed to
-    a language set -- that is a different question from this one.)
+    Census runs BEFORE any language is wired -- it is the discovery step
+    repo-init's consent dialogue reads -- so there is no wired subset to
+    reason about, and the walk has to already look clean before the user
+    has chosen anything. On the global set alone, an untouched Python
+    project's census would count thousands of files under .venv/ as
+    signal.
+
+    Contrast iter_code_source_files, which answers a different question
+    once a language set exists: it prunes the global set plus the
+    INTERSECTION of the wired languages' skip sets, and drops a file only
+    when an ancestor directory is in ITS OWN language's set.
     """
     dirs = set(CODE_SKIP_DIR_NAMES)
     for row in chunkers.LANGUAGE_TABLE.values():
@@ -2369,8 +2368,9 @@ def code_census(root: Path) -> dict:
     LANGUAGE_TABLE row's skip_dirs -- see its docstring for why this is
     wider than a wired-langs walk). Fails open per file and never raises on
     a walk it can complete: os.walk over a missing/unreadable root just
-    yields nothing, so an empty or nonexistent root produces an empty dict,
-    not an error."""
+    yields nothing, so an empty or nonexistent root returns the zero-seeded
+    rows below -- every LANGUAGE_TABLE language at 0, no unsupported rows at
+    all -- rather than an error (or an empty dict)."""
     skip_dirs = _census_skip_dirs()
     # C5 (Anatomy M1 fix wave, Codex): EVERY LANGUAGE_TABLE language gets a
     # row, seeded at zero, whether or not the tree holds one of its files.

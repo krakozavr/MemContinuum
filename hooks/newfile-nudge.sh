@@ -195,7 +195,7 @@ KNOWN_EXTS="${MEMCONTINUUM_KNOWN_EXTS:-$WIRED_EXTS}"
 # _ext_matches' `for` loop iterate zero times), so wiring that never asked
 # the question behaves exactly as before. This is render-time persistence:
 # the value lives on the hook's own command line, refreshed by every
-# install, not in a registry (that arrives with the updater).
+# install; there is no registry behind it, so it holds for this wiring only.
 NEVER_EXTS="${MEMCONTINUUM_NEVER_EXTS:-}"
 if [ -n "$NEVER_EXTS" ] && _ext_matches "$FILE_PATH" "$NEVER_EXTS"; then
     finish "never-extension"

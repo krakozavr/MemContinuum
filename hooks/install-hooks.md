@@ -1,7 +1,7 @@
 # Wiring the hooks
 
 `scripts/repo-init.sh` renders and merges all of this automatically (see the README's
-"Installing into a new project") — this document explains what it wires and
+"Install → Once per repository") — this document explains what it wires and
 why, for anyone reading the generated `settings.local.json`, adapting it for
 a harness other than Claude Code, or wiring by hand instead of using the
 installer.
@@ -48,18 +48,17 @@ Notes:
   "engine request" comment at the top of `pre-edit-chain.sh` for why this is needed at all.
 - `MEMCONTINUUM_HOME` is deliberately omitted here so the hook falls back to memidx.py's own default
   (`~/.memcontinuum`) — set it explicitly only if the derived index should live somewhere else. It
-  must never point at a synced/cloud-backed filesystem (README: "never index on a synced/cloud
-  drive").
+  must never point at a synced/cloud-backed filesystem — SQLite locking is not reliable there.
 - The command line, not a JSON `env` block, carries the env vars — Claude Code hook `command`
   entries run through a shell, so `VAR=value ... command` works directly.
 - `if` filter paths use Claude Code's permission-rule syntax, where a single leading slash
   anchors at the settings source, not the filesystem root (docs: `Edit(//Users/alice/file)` =
   absolute `/Users/alice/file`). `<code-root>` above is always an absolute path (already starting
   with `/`), so the rendered pattern needs a SECOND leading slash — `Edit(//home/…/**)` — to match
-  anything at all. Fix-round (2026-08-31): the templates previously rendered only one leading
-  slash and the pre-edit hook never fired in real sessions as a result; `code-root-filter-pair.json.tmpl`
-  and `newfile-nudge-filter-pair.json.tmpl` now compose `if` as `Edit(/{{CODE_ROOT}}/**)` /
-  `Write(/{{CODE_ROOT}}/**)` so the rendered value always has exactly two leading slashes.
+  anything at all. With only one leading slash the hook never fires in a real session, so
+  `code-root-filter-pair.json.tmpl` and `newfile-nudge-filter-pair.json.tmpl` compose `if` as
+  `Edit(/{{CODE_ROOT}}/**)` / `Write(/{{CODE_ROOT}}/**)` — the rendered value always has exactly
+  two leading slashes.
 
 ## 2. `newfile-nudge.sh` — Claude Code `PreToolUse` hook (Write only)
 
@@ -70,11 +69,10 @@ existing file is `pre-edit-chain.sh`'s job, not this one's). Deliberately minima
 `MEMCONTINUUM_ROOT`/`STRIP_PREFIX`, since this hook never calls `memidx.py` or reads the index at
 all — it only checks that the write target is new, under a configured code root, and has an
 indexed source extension, then injects one reminder line. It DOES carry `MEMCONTINUUM_PROJECT`
-(fix-round-4 F1) — identity only, so `scripts/repo-init.sh`'s merge step can tell this project's
-nudge entry apart from a different project's sharing the same `--claude-dir`; the hook itself never
-reads it. A nudge entry installed before this fix carries no `MEMCONTINUUM_PROJECT` at all and
-stays sweepable by ANY project's re-run until that project re-runs `repo-init.sh` — see README.md's
-"Idempotency" note.
+— identity only, so `scripts/repo-init.sh`'s merge step can tell this project's nudge entry apart
+from a different project's sharing the same `--claude-dir`; the hook itself never reads it. A
+legacy nudge entry carrying no `MEMCONTINUUM_PROJECT` at all stays sweepable by ANY project's
+re-run until that project re-runs `repo-init.sh` — see the migration note at the end of this file.
 
 Rendered from `templates/newfile-nudge-hook.json.tmpl` + one
 `templates/newfile-nudge-filter-pair.json.tmpl` pair per `--code-root`, merged into the SAME
@@ -136,8 +134,8 @@ precompact-persist.sh,sessionstart-remind.sh,userprompt-remind.sh,sessionend-sta
 wired into a project's Claude Code settings exactly like `pre-edit-chain.sh`
 above. They gather evidence (an edit ledger, git HEAD movement) and, at most
 a few times per session, ask ONE question — they never write a record, never
-draft one, never classify anything as a ruling. See the README's "Hooks"
-table for what each one does.
+draft one, never classify anything as a ruling. See `docs/INTERNALS.md`'s
+"Hooks and the fail-open contract" table for what each one does.
 
 Rendered from `templates/write-hooks.json.tmpl`, the project-agnostic shape
 merged into `.claude/settings.json` or `.claude/settings.local.json`:
@@ -210,9 +208,9 @@ Notes:
   `agent_type`) in-script instead, since they have no `if` to lean on. `source` is a
   `SessionStart`-only field (see the next note) — `precompact-persist.sh` gates on `trigger`
   (PreCompact's own field, `manual`/`auto`), and `userprompt-remind.sh` gates on `agent_id`/
-  `agent_type` (UserPromptSubmit carries neither `source` nor `trigger` at all; fix-round
-  2026-08-31 removed a `source == "user"` gate that had never once matched a real payload — see
-  that script's own header comment).
+  `agent_type` (UserPromptSubmit carries neither `source` nor `trigger` at all — a
+  `source == "user"` gate on this event matches no real payload; see that script's own header
+  comment).
 - `SessionStart` fires with several `source` values (`startup`, `resume`, `clear`, `compact`,
   `fork`); `sessionstart-remind.sh` branches on all of them itself — wire it unconditionally
   (no settings-level source filter needed, though one is supported if you want to narrow it).
@@ -226,22 +224,23 @@ Notes:
   `scripts/repo-init.sh`, the first one given is what they get.
 - `MEMCONTINUUM_HOME` is deliberately omitted here for the same reason as section 1: falls back
   to `~/.memcontinuum` unless overridden, and must never point at a synced/cloud drive.
-- These five scripts' only writable surface is `$MEMCONTINUUM_HOME/sessions/**/*.json[.lock]` and
-  `$MEMCONTINUUM_HOME/hook.log` — never the store, never the code tree. `git diff`/`git status`
-  in either root staying empty across every hook invocation is a permanent regression test
-  (`tests/test_write_hooks.py`).
+- These five scripts write `$MEMCONTINUUM_HOME/sessions/**/*.json[.lock]` and
+  `$MEMCONTINUUM_HOME/hook.log` — never the store, never the code tree. One carve-out:
+  `userprompt-remind.sh`'s coverage check and `precompact-persist.sh` call `memidx.py unmapped`,
+  which self-heals a drifted decision index with a `reindex --no-embed`, so the decision index's
+  own SQLite cache is written too. `git diff`/`git status` in either root staying empty across
+  every hook invocation is a permanent regression test (`tests/test_write_hooks.py`).
 
 
-> Invocation note (2026-08-31): every example above runs a hook as `bash <path>`
-> rather than by the path alone, matching what the templates now render -- the
-> executable bit is not required anywhere (a zip download or a
-> core.filemode=false clone drops it silently).
+> Invocation note: every example above runs a hook as `bash <path>` rather than
+> by the path alone, matching what the templates render -- the executable bit is
+> not required anywhere (a zip download or a core.filemode=false clone drops it
+> silently).
 
-> Migration note (fix-round-4 F1, 2026-08-31): `scripts/repo-init.sh`'s merge step identifies its
-> own hook entries by script basename, further scoped by the `MEMCONTINUUM_PROJECT=` marker every
-> one of the seven commands now carries -- including `newfile-nudge.sh` (section 2 above), which
-> did not carry it before this fix. Two projects sharing one `--claude-dir`: a project's re-run
-> can only sweep entries marked for ITS OWN `--project`, or entries with no marker at all (legacy,
-> pre-identity wiring). A `newfile-nudge.sh` entry installed before this fix carries no marker and
+> Migration note: `scripts/repo-init.sh`'s merge step identifies its own hook entries by script
+> basename, further scoped by the `MEMCONTINUUM_PROJECT=` marker every one of the seven commands
+> carries -- `newfile-nudge.sh` (section 2 above) included. Two projects sharing one
+> `--claude-dir`: a project's re-run can only sweep entries marked for ITS OWN `--project`, or
+> entries with no marker at all (legacy, pre-identity wiring). A legacy entry carrying no marker
 > stays sweepable by ANY project's re-run until the project that owns it re-runs
 > `scripts/repo-init.sh` -- there is no separate migration step; a normal re-run closes the hole.

@@ -933,10 +933,54 @@ class TestNoMachineIdentifyingContent(unittest.TestCase):
     its own definition.
     """
 
-    def test_only_license_names_the_dev_machine(self):
+    @staticmethod
+    def _tracked_entries():
+        """[(mode, path)] from `git ls-files -s` -- mode included, because a
+        symlink's own blob is its TARGET PATH and a content scan that follows
+        the link never reads it."""
         result = subprocess.run(
-            ["git", "ls-files"], cwd=str(TOOLS_DIR), capture_output=True, text=True, check=True,
+            ["git", "ls-files", "-s"], cwd=str(TOOLS_DIR),
+            capture_output=True, text=True, check=True,
         )
+        entries = []
+        for line in result.stdout.splitlines():
+            if not line:
+                continue
+            meta, _, rel = line.partition("\t")
+            entries.append((meta.split()[0], rel))
+        return entries
+
+    def test_no_tracked_symlinks(self):
+        """A tracked symlink is refused outright in this repo. Its blob content
+        is the link target, so a link created for local convenience -- e.g. a
+        worktree pointing `fixtures/records` at the main checkout -- commits an
+        absolute path naming this machine's home directory. The content scan
+        below cannot catch that: `Path.is_file()` follows the link to a
+        directory, returns False, and skips the entry unread."""
+        symlinks = [rel for mode, rel in self._tracked_entries() if mode == "120000"]
+        self.assertEqual(
+            symlinks, [],
+            "tracked symlinks found -- their blobs are path strings, which leak "
+            f"local layout: {symlinks}. Untrack them (git rm --cached).",
+        )
+
+    def test_worktree_fixture_link_is_untracked(self):
+        """The private-corpus link a worktree creates must never be committed.
+        Asserted separately from the blanket symlink rule so the failure names
+        the actual convention when it is the one that broke."""
+        link = TOOLS_DIR / "fixtures" / "records"
+        if not link.exists() and not link.is_symlink():
+            self.skipTest("no fixtures/records in this working tree")
+        tracked = {rel for _, rel in self._tracked_entries()}
+        leaked = sorted(r for r in tracked if r == "fixtures/records"
+                        or r.startswith("fixtures/records/"))
+        self.assertEqual(
+            leaked, [],
+            "fixtures/records is tracked -- it holds (or links to) a project's "
+            f"real incident notes and must stay untracked: {leaked}",
+        )
+
+    def test_only_license_names_the_dev_machine(self):
         username_needle = "kra" + "kozavr"
         path_needle = "/mnt/d/!_WORK_" + "!"
         # The private codebase this engine is developed against must not be
@@ -948,10 +992,19 @@ class TestNoMachineIdentifyingContent(unittest.TestCase):
         project_needles = ["mmd" + "-swift", "MMD" + "App", "MMD" + "Core", "Shot" + "Porter"]
         needles = [username_needle, path_needle] + project_needles
         offenders = {}
-        for rel in result.stdout.splitlines():
-            if not rel:
-                continue
+        for mode, rel in self._tracked_entries():
             p = TOOLS_DIR / rel
+            if mode == "120000":
+                # Read the LINK, not what it points at (test_no_tracked_symlinks
+                # already refuses these outright; this keeps the content scan
+                # honest if that rule is ever relaxed).
+                try:
+                    hits = [n for n in needles if n in os.readlink(p)]
+                except OSError:
+                    hits = []
+                if hits:
+                    offenders[rel] = hits
+                continue
             if not p.is_file():
                 continue
             try:
@@ -1862,7 +1915,10 @@ class TestMultiRootCodeIndexTruncation(unittest.TestCase):
 
             # The note must NAME the un-indexed root, not just hint at one.
             self.assertIn(str(second), out, out)
-            self.assertIn("later milestone", out.lower(), out)
+            self.assertIn("only the first code root is indexed", out.lower(), out)
+            # ... and it must say so in present tense: no roadmap vocabulary in
+            # anything a person reads during an install.
+            self.assertNotIn("milestone", out.lower(), out)
 
             code_db = Path(home) / ".memcontinuum" / "multi-code.sqlite"
             self.assertTrue(code_db.is_file(), out)

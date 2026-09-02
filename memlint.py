@@ -1,9 +1,9 @@
 #!/usr/bin/env python
-"""memlint.py -- docs/SCHEMA.md section 7 linter for Store D markdown.
+"""memlint.py -- docs/SCHEMA.md section 7 linter for MemContinuum store markdown.
 
-Rules implemented (exactly the set enumerated in the Store D build brief,
-a subset of docs/SCHEMA.md section 7 -- the append-only git-hash-mismatch rule is
-out of scope here; see README for why):
+Rules implemented, a subset of docs/SCHEMA.md section 7 -- the append-only
+git-hash-mismatch rule is deliberately out of scope (see that section: the
+check belongs where a canonical store's commits are made, not in the linter):
 
   * a link whose ruling.authority is owner-verbatim/owner-ratified with no
     ruling.text and/or ruling.source            -> error
@@ -357,14 +357,35 @@ def parse_argv(argv: list[str]) -> tuple[str | None, str | None]:
     return root, code_root
 
 
+USAGE = """usage: memlint.py ROOT [--code-root PATH]
+
+Validate every MemContinuum record under ROOT against the schema and print one
+ERROR:/WARNING: line per finding. Exit 1 if any error was found, 0 otherwise
+(warnings alone do not fail).
+
+  ROOT               the markdown store root to walk
+  --code-root PATH   a code checkout, enabling the concept-record checks that
+                     need one: implemented_by/tested_by paths must exist under
+                     it, and a #symbol fragment must name something the chunker
+                     recognizes in that file. Omit it and those checks are
+                     skipped; every other rule still runs.
+  -h, --help         print this and exit
+
+Rule reference: docs/SCHEMA.md sections 7 and 8.4; the complete table of what
+this linter checks is in docs/INTERNALS.md (memlint section)."""
+
+
 def main(argv=None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
     if not argv:
-        print("usage: memlint.py ROOT [--code-root PATH]", file=sys.stderr)
+        print(USAGE, file=sys.stderr)
         return 2
+    if "-h" in argv or "--help" in argv:
+        print(USAGE)
+        return 0
     root_str, code_root_str = parse_argv(argv)
     if not root_str:
-        print("usage: memlint.py ROOT [--code-root PATH]", file=sys.stderr)
+        print(USAGE, file=sys.stderr)
         return 2
     root = Path(root_str).resolve()
     code_root = Path(code_root_str).resolve() if code_root_str else None

@@ -28,25 +28,20 @@
 #   --claude-dir DIR  user-level Claude Code directory. Default ~/.claude.
 #   --no-model-warm   skip the one-time embedding-model download.
 #   --dry-run         print the plan, write nothing.
-#   --uninstall       remove the user-level hook + skill and BOTH config
-#                     artifacts (see MEMCONTINUUM_HOME below). Never touches
-#                     a venv, a store, or any per-repo wiring.
+#   --uninstall       remove the user-level hook, the skill, and this
+#                     machine's config. Never touches a venv, a store, any
+#                     per-repo wiring, or your recorded per-repo answers.
 #
 # Why the model warm is on by default: fastembed downloads ~100 MB the first
 # time anything needs to embed. Left lazy, that download happens inside
 # somebody's first reindex -- or worse, inside a hook -- looking like a hang.
 # Better to pay it here, visibly, once.
 #
-# MEMCONTINUUM_HOME (fix-round-4 F7): when this env var is set to something
-# other than the fixed default $HOME/.memcontinuum, config.sh is written
-# there AS USUAL, but a second, minimal "pointer" config.sh is ALSO written
-# at the fixed default path recording the real MEMCONTINUUM_HOME. The
-# detector hook's installed command line does not bake MEMCONTINUUM_HOME in
-# any more (a baked value and this registry used to disagree -- two
-# registries, a decline that never silenced the ask); every consumer
-# (detector, decide.sh, state.sh) now resolves it the same way: env ->
-# pointer at the fixed default -> the fixed default itself. See
-# scripts/mc-registry-lib.sh mc_resolve_home.
+# MEMCONTINUUM_HOME: where this machine's config, index databases, session
+# state and hook log live. Defaults to $HOME/.memcontinuum. Set it in the
+# environment before running this script to put them somewhere else; every
+# command finds them from there afterwards, with no per-repo configuration.
+# Keep it on a local, POSIX filesystem -- never a synced or cloud drive.
 # --MC-USAGE-END--
 
 set -u

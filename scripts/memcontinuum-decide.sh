@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# memcontinuum-decide.sh <wired|declined|never-ask|ask-again|forget> --repo PATH
-#                        [--store DIR] [--project NAME] [--claude-dir DIR]
+# usage: memcontinuum-decide.sh <wired|declined|never-ask|ask-again|forget>
+#                               --repo PATH [--store DIR] [--project NAME]
+#                               [--claude-dir DIR]
 #
 # Record a human's answer about one repository, so the SessionStart detector
 # never asks again. Called by the `memcontinuum` skill AFTER a human has
@@ -16,12 +17,11 @@
 #   never-ask  machine-wide: stop asking in every repo
 #   ask-again  undo never-ask
 #
-# --repo is REQUIRED for wired/declined/forget (fix-round-4 F2): these three
-# actions used to default to $PWD, and every documented invocation in
-# skills/memcontinuum/SKILL.md passed no repo at all -- a shell sitting in
-# the engine checkout recorded "wired" against the ENGINE's key, and the
-# repo the human actually meant stayed undecided forever. There is no safe
-# default for a write that silences a repo permanently; name it explicitly.
+# --repo is REQUIRED for wired/declined/forget: each of these three silences
+# or unsilences one specific repo permanently, and there is no safe $PWD
+# default for a write like that -- a shell sitting in the engine checkout
+# would record the answer against the ENGINE's key while the repo actually
+# meant stayed undecided forever. Name the repo explicitly.
 # never-ask/ask-again are machine-wide and take no repo at all.
 #
 # The registry is a TSV at $MEMCONTINUUM_HOME/decisions.tsv:
@@ -55,6 +55,8 @@ usage() {
 }
 
 [ $# -ge 1 ] || usage 1
+# --help before the action dispatch: asking for help is not an unknown action.
+case "$1" in -h|--help) usage 0 ;; esac
 ACTION="$1"; shift
 
 STORE=""; PROJECT=""; REPO_ARG=""; CLAUDE_DIR_ARG=""

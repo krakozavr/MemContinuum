@@ -79,8 +79,9 @@ Usage: repo-init.sh --project NAME [--store DIR] [--code-root DIR ...]
   --code-root DIR     a code checkout the PreToolUse hook should watch for
                       Edit/Write and the write-side hooks should scope
                       ledger entries to. Repeatable. Optional -- omit for a
-                      store with no associated code checkout (retrieval-only
-                      / rationale-only install).
+                      store with no associated code checkout (a
+                      rationale-only install: neither PreToolUse hook is
+                      wired, so nothing is retrieved at edit time).
   --claude-dir DIR    where to merge hook wiring and install the skill.
                       Defaults to <dirname of --store>/.claude ONLY when
                       --store was also omitted (the store then defaults
@@ -117,14 +118,16 @@ Usage: repo-init.sh --project NAME [--store DIR] [--code-root DIR ...]
                       code-reindex, which is skipped; the newfile-nudge hook
                       line still gets MEMCONTINUUM_KNOWN_EXTS, and an
                       EXPLICITLY EMPTY MEMCONTINUUM_LANG_EXTS='' -- rendered,
-                      never omitted, per Ruling 6: a set-but-empty value
-                      matches nothing, distinct from an un-re-rendered
-                      legacy line where the var is unset). For scripted/CI
-                      runs.
+                      never omitted: a set-but-empty value matches nothing,
+                      which is distinct from a legacy line where the variable
+                      is unset). For scripted/CI runs.
   --dry-run           print everything this script would do; write nothing
                       (except --bootstrap-venv's venv, see above).
-  --force             allow --store to sit inside another git repo's
-                      tracked working tree (normally refused).
+  --force             allow --store to sit inside another git repo's working
+                      tree (normally refused). The check is by LOCATION, not
+                      by tracked content: nothing at --store need exist yet.
+                      It never overrides the separate refusal of an existing
+                      git repo that is not a MemContinuum store.
   -h, --help          this text.
 
 Without --python or --bootstrap-venv, the python to run memidx.py/memlint.py
@@ -433,7 +436,7 @@ fi
 if ! is_git_repo "$STORE" && [ "$FORCE" -eq 0 ]; then
     ANCESTOR="$(nearest_existing_ancestor "$STORE")"
     if OUTER_TOPLEVEL="$(git -C "$ANCESTOR" rev-parse --show-toplevel 2>/dev/null)"; then
-        fail "--store $STORE is inside an existing git repo's tracked tree ($OUTER_TOPLEVEL) -- pass --force to install anyway, or pick a --store outside it" 4
+        fail "--store $STORE is inside an existing git repo's working tree ($OUTER_TOPLEVEL) -- pass --force to install anyway, or pick a --store outside it" 4
     fi
 fi
 
@@ -506,15 +509,17 @@ declare -a NEVER_NOTES=()
 if [ "${#CODE_ROOTS_ABS[@]}" -gt 0 ]; then
     # Carry (Task 8 reviewer): repo-init does its own existence check on
     # each code root BEFORE invoking census -- a missing dir is repo-init's
-    # own error, never inferred from code-census's empty-dict fail-open
-    # (code-census exits 0 with {} on a nonexistent root by design, so
-    # silence there would otherwise read as "found nothing", not "you
-    # pointed --code-root at nothing"). Gated on real (non-dry) runs only:
+    # own error, never inferred from code-census's fail-open (code-census
+    # exits 0 on a nonexistent root by design, walking nothing and returning
+    # every language at zero, so silence there would otherwise read as
+    # "found nothing", not "you pointed --code-root at nothing"). Gated on
+    # real (non-dry) runs only:
     # --dry-run is a preview and a --code-root need not exist yet for one
     # (pre-existing contract -- TestMultipleCodeRoots' two-code-roots
     # dry-run test passes roots that are never created). Under --dry-run
-    # with a missing root, code-census's own fail-open (nonexistent root ->
-    # {}) takes over below and the run proceeds as "nothing proposed".
+    # with a missing root, code-census's own fail-open (nothing walked, every
+    # language at zero) takes over below and the run proceeds as "nothing
+    # proposed".
     if [ "$DRY_RUN" -eq 0 ]; then
         for cr in "${CODE_ROOTS_ABS[@]}"; do
             [ -d "$cr" ] || fail "--code-root $cr does not exist -- pass an existing directory (repo-init checks this itself before running any census)" 10
@@ -558,7 +563,8 @@ for root in roots:
         capture_output=True, text=True,
     )
     # code-census is documented exit-0-always (even a nonexistent root just
-    # yields {}) -- a non-zero rc here means something actually crashed
+    # walks nothing and returns its zero-count rows) -- a non-zero rc here
+    # means something actually crashed
     # (e.g. an import failure), and treating that as "nothing proposed"
     # would silently reach language-less wiring through the exact side
     # door the carry note (Task 8 reviewer) exists to close. Surface it as
@@ -711,15 +717,15 @@ PYEOF
         esac
     fi
     if [ -n "$NEVER_EXTS_RAW" ]; then
-        # Deliberately narrow wording (B4): what actually happens today is
-        # that this wiring's nudge hook line carries the extension, so the
-        # reminder stops mentioning it. Nothing is recorded in a registry
-        # yet, so a later install elsewhere would ask again -- say that,
-        # rather than claiming a durable "never ask about that one".
+        # Deliberately narrow wording: what actually happens is that this
+        # wiring's nudge hook line carries the extension, so the reminder
+        # stops mentioning it. Nothing is recorded in any registry, so a
+        # later install elsewhere asks again -- say that, rather than
+        # claiming a durable "never ask about that one".
         for _never in $(printf '%s' "$NEVER_EXTS_RAW" | tr ',' ' '); do
             NEVER_NOTES+=("$_never")
         done
-        echo "noted for this wiring: never=$(printf '%s' "$NEVER_EXTS_RAW" | tr ',' ' ') (persistent never-ask arrives with the updater)"
+        echo "noted for this wiring only: never=$(printf '%s' "$NEVER_EXTS_RAW" | tr ',' ' ') (not recorded machine-wide)"
     fi
     echo
 fi
@@ -1154,8 +1160,9 @@ fi
 # Separate call from the decision-store reindex above -- code-reindex is
 # Anatomy's own intent index, keyed by --code-root, not --root/STORE (Task
 # 7's `--lang` contract: required on a project's FIRST code-reindex, no
-# hardcoded-swift default). Runs once per --code-root (code-reindex takes
-# exactly one). Skipped entirely for language-less wiring (CHOSEN_LANGS
+# hardcoded-swift default). Runs ONCE, for the first --code-root only --
+# code-reindex is single-root by construction (see B3 below). Skipped
+# entirely for language-less wiring (CHOSEN_LANGS
 # empty) -- per Task 7's carry, an empty --lang set means "nothing to
 # index yet", not "index nothing and call it done." Same --no-embed
 # rationale as step 7's decision-store reindex above: a fresh corpus is
@@ -1172,9 +1179,8 @@ fi
 # under the root it was given, and overwrites code_meta.code_root. Looping
 # it over several roots therefore left only the LAST root indexed, having
 # quietly deleted the earlier ones' rows on the way -- an install that
-# reported success while throwing most of its own work away. Multi-root
-# code indexing is a later milestone; until then the honest thing is to
-# index one root and SAY which roots were not indexed.
+# reported success while throwing most of its own work away. The honest
+# thing with several roots is to index one and SAY which were not indexed.
 CODE_REINDEX_RAN=0
 CODE_REINDEX_RC=0
 CODE_REINDEX_OUT=""
@@ -1194,10 +1200,10 @@ if [ "${#CODE_ROOTS_ABS[@]}" -gt 0 ] && [ -n "$CHOSEN_LANGS" ]; then
             fi
             i=$((i + 1))
         done
-        echo "    The code index holds one root per project; multi-root code"
-        echo "    indexing is a later milestone. Code under the roots above is"
-        echo "    NOT searchable via code-search, and new files there still get"
-        echo "    the write-time reminder."
+        echo "    The code index holds one root per project: only the first code"
+        echo "    root is indexed, the others are not. Code under the roots above"
+        echo "    is NOT searchable via code-search, though a new file written"
+        echo "    there still gets the new-file reminder."
         echo
     fi
     if [ "$DRY_RUN" -eq 0 ]; then
