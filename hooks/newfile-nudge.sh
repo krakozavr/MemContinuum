@@ -47,8 +47,13 @@
 #   MEMCONTINUUM_LANG_EXTS   space-separated glob list of engine-wired
 #                            source extensions (e.g. "*.swift *.py"),
 #                            rendered at hook-line render time (Task 10).
-#                            Empty/unset -> legacy `*.swift`-only fallback,
-#                            for wiring not yet re-rendered.
+#                            UNSET -> legacy `*.swift`-only fallback, for
+#                            wiring not yet re-rendered. Explicitly EMPTY
+#                            (MEMCONTINUUM_LANG_EXTS='', rendered on
+#                            purpose for language-less wiring -- Ruling 6)
+#                            -> matches NOTHING, no fallback -- `${VAR-x}`
+#                            (no colon) is used below specifically so
+#                            "unset" and "set but empty" stay distinct.
 #   MEMCONTINUUM_KNOWN_EXTS  space-separated glob list of ALL engine-
 #                            supported extensions, wired or not. A file
 #                            matching KNOWN but not WIRED logs
@@ -141,16 +146,28 @@ fi
 # MEMCONTINUUM_LANG_EXTS (space-separated glob list of engine-wired
 # extensions, e.g. "*.swift *.py") and MEMCONTINUUM_KNOWN_EXTS (all
 # engine-supported globs, wired or not) into this hook's environment.
-# Empty/unset MEMCONTINUUM_LANG_EXTS means legacy un-re-rendered wiring --
-# fall back to the original hardcoded `*.swift` so behavior stays
-# byte-identical until Task 10 re-renders this hook line.
+# UNSET MEMCONTINUUM_LANG_EXTS means legacy un-re-rendered wiring -- fall
+# back to the original hardcoded `*.swift` so behavior stays byte-identical
+# for a hook line Task 10 has not re-rendered yet. An explicitly EMPTY
+# MEMCONTINUUM_LANG_EXTS (Ruling 6, Task 10 fix round: `MEMCONTINUUM_LANG_EXTS=''`
+# rendered on the line, not omitted) is a DIFFERENT, deliberate state --
+# language-less wiring, matching nothing -- and must NOT fall back to
+# `*.swift`: `${VAR-default}` (dash, no colon) substitutes the default only
+# when VAR is UNSET, leaving a set-but-empty VAR empty. This is why the
+# expansion below is `${MEMCONTINUUM_LANG_EXTS-*.swift}`, not
+# `${MEMCONTINUUM_LANG_EXTS:-*.swift}` (colon = "unset OR empty", which
+# could never distinguish the two states Task 10 needs distinguished).
 #
 # _ext_matches loops over $2 deliberately UNQUOTED to split the
 # space-separated glob list on IFS (bash-3.2 has no arrays-of-globs
 # alternative) -- `set -f` (noglob) brackets the loop so that unquoted
 # expansion never lets the shell glob-expand a pattern like *.swift
 # against files in cwd; `case "$1" in $_pat)` itself is safe unquoted
-# too (case patterns match, they never expand against the filesystem).
+# too (case patterns match, they never expand against the filesystem). An
+# empty $2 makes the `for` loop iterate zero times (word-splitting an
+# empty string yields no words), so `_ext_matches path ""` correctly
+# returns 1 (no match) -- matches nothing, exactly what language-less
+# wiring's explicit empty MEMCONTINUUM_LANG_EXTS needs.
 _ext_matches() {  # $1=path  $2=space-separated glob list
     set -f
     for _pat in $2; do
@@ -159,7 +176,7 @@ _ext_matches() {  # $1=path  $2=space-separated glob list
     set +f
     return 1
 }
-WIRED_EXTS="${MEMCONTINUUM_LANG_EXTS:-*.swift}"
+WIRED_EXTS="${MEMCONTINUUM_LANG_EXTS-*.swift}"
 KNOWN_EXTS="${MEMCONTINUUM_KNOWN_EXTS:-$WIRED_EXTS}"
 if ! _ext_matches "$FILE_PATH" "$WIRED_EXTS"; then
     if _ext_matches "$FILE_PATH" "$KNOWN_EXTS"; then

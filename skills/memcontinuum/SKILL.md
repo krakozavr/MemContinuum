@@ -97,14 +97,44 @@ it completes the missing wiring — `memcontinuum-decide.sh wired` refuses
 anything short of `wiring=full` and names the missing hooks. Only after
 `repo-init.sh` reports full wiring does `decide.sh wired` succeed.
 
-Always dry-run first, show the plan, then run it:
+Always dry-run first, show the plan, then run it. **With a `--code-root`,
+never invoke `repo-init.sh` bare and interactive** — you (Claude Code's Bash
+tool) have no tty, so a bare run against a repo with any supported-language
+files hits `repo-init.sh`'s own `[ -t 0 ]` guard and fails with a clear
+message (exit 12) rather than hanging; the message itself names the driven
+path below. Run the driven flow instead:
 
-Run from the repo being initialized, WITHOUT --store, so the conventional
-default applies (and --claude-dir defaults to that repo's own .claude):
+1. Census the code root yourself, with the resolved python and `PYTHONPATH=`
+   cleared (same resolution `repo-init.sh` uses — `$MEMCONTINUUM_PYTHON`,
+   else `$ENGINE/.venv/bin/python`):
+   ```bash
+   PY="${MEMCONTINUUM_PYTHON:-$ENGINE/.venv/bin/python}"
+   PYTHONPATH= "$PY" "$ENGINE/memidx.py" code-census --root DIR --json
+   ```
+2. Present the three categories to the human in conversation — proposed
+   (supported, found), supported-but-not-found, and unsupported (with
+   counts) — and the options **skip**, **enable all detected**, or
+   **select** a subset. (A fourth option, marking one extension "never" so
+   the nudge hook stops mentioning it, exists in `repo-init.sh`'s own
+   interactive dialogue but is currently interactive-only — there is no
+   flag for it, so a driven install cannot offer it; tell the human to
+   re-run `repo-init.sh` directly at a real terminal if they want it.)
+3. Run `repo-init.sh` with the human's answer turned into a flag — never
+   bare:
+   ```bash
+   cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME --code-root DIR --dry-run
+   cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME --code-root DIR \
+       --langs "chosen,langs"    # human chose specific languages, or "enable all detected"
+   # -- or, for "skip":
+   cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME --code-root DIR --non-interactive
+   ```
+
+For a rationale-only install (no `--code-root` at all), there is nothing to
+census or ask about — the bare two-line dry-run-then-run form is fine:
 
 ```bash
-cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME --code-root DIR --dry-run
-cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME --code-root DIR
+cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME --dry-run
+cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME
 ```
 
 Then record it. `--repo REPO` is REQUIRED here (fix-round-4 F2): `wired`,

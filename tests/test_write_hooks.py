@@ -3382,6 +3382,47 @@ class TestNewFileNudgeHook(unittest.TestCase):
         self.assertIn("outcome=not-indexed-extension", log_text)
         self.assertNotIn("outcome=language-available-not-wired", log_text)
 
+    def test_explicit_empty_lang_exts_matches_nothing_not_the_swift_fallback(self):
+        """Ruling 6 (Task 10 fix round): an EXPLICITLY empty
+        MEMCONTINUUM_LANG_EXTS (rendered as `MEMCONTINUUM_LANG_EXTS=''` for
+        language-less wiring, never omitted) must NOT fall back to the
+        legacy `*.swift` default the way UNSET does --
+        `${MEMCONTINUUM_LANG_EXTS-*.swift}` (no colon) only substitutes on
+        unset, so a set-but-empty value matches nothing and a new .swift
+        file stays silent with outcome=not-indexed-extension. Distinct
+        from test_unset_lang_exts_env_is_byte_identical_legacy_swift_only,
+        which covers the UNSET case and is unchanged by this fix."""
+        env = self.base_env(MEMCONTINUUM_LANG_EXTS="")
+        self.assertIn("MEMCONTINUUM_LANG_EXTS", env)
+        self.assertEqual(env["MEMCONTINUUM_LANG_EXTS"], "")
+
+        target = self.code_root / "NewThing.swift"
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "", proc.stdout)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=not-indexed-extension", log_text)
+        self.assertNotIn("outcome=nudged", log_text)
+
+    def test_explicit_empty_lang_exts_with_known_exts_logs_language_available_not_wired(self):
+        """The actual production shape Task 10 renders for language-less
+        wiring with a real code root: MEMCONTINUUM_LANG_EXTS='' alongside
+        a non-empty MEMCONTINUUM_KNOWN_EXTS (always rendered, per Task
+        10). A new .py file (KNOWN but not WIRED, since WIRED is
+        deliberately empty) must log language-available-not-wired, not
+        the plain not-indexed-extension, and never nudge."""
+        env = self.base_env(
+            MEMCONTINUUM_LANG_EXTS="",
+            MEMCONTINUUM_KNOWN_EXTS="*.py *.swift",
+        )
+        target = self.code_root / "new_thing.py"
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "", proc.stdout)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=language-available-not-wired", log_text)
+        self.assertNotIn("outcome=not-indexed-extension", log_text)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -610,7 +610,16 @@ PYEOF
         # behavior for an empty/untouched code root.
         CHOSEN_LANGS=""
     else
-        [ -t 0 ] || fail "code census proposes a language set ($MC_CENSUS_PROPOSED) but this is not an interactive terminal (stdin is not a tty) -- pass --langs LIST or --non-interactive to continue without the consent dialogue" 12
+        # Ruling 7 (Task 10 fix round, owner): names both bypass flags AND
+        # points a non-tty caller (e.g. a Claude-Code-driven install, whose
+        # Bash tool has no tty) at the census command it should run itself
+        # first -- the driven flow is: run `memidx.py code-census --root
+        # <code-root> --json` (with the resolved python, PYTHONPATH=
+        # cleared), present the three categories and skip/enable-all/select
+        # to the human in conversation, then re-run this script with
+        # --langs <chosen> or --non-interactive (skill wiring, see
+        # skills/memcontinuum/SKILL.md's driven-install section).
+        [ -t 0 ] || fail "code census proposes a language set ($MC_CENSUS_PROPOSED) but this is not an interactive terminal (stdin is not a tty) -- pass --langs LIST or --non-interactive to continue without the consent dialogue. Driven from an agent (no tty): run 'PYTHONPATH= $PYTHON_BIN $MEMIDX code-census --root <code-root> --json' yourself, present the result to the human, then re-run this script with --langs <chosen> or --non-interactive." 12
         echo
         echo "Enable code indexing for a detected language?"
         echo "  1) skip -- language-less wiring"
@@ -837,24 +846,24 @@ if code_roots:
 # rendered onto the nudge line whenever it exists at all -- independent of
 # which languages were actually chosen. LANG_EXTS_ENV is the WHOLE
 # "MEMCONTINUUM_LANG_EXTS='...' " token (trailing space and all, matching
-# the {{CODE_ROOT_ENV}} pattern write-hooks.json.tmpl above already uses)
-# and is OMITTED entirely -- not rendered as an empty value -- when no
-# language was chosen: newfile-nudge.sh's
-# `${MEMCONTINUUM_LANG_EXTS:-*.swift}` fallback cannot tell "unset" from
-# "set but empty" (bash's `:-` triggers on both), so an explicit empty
-# value would silently mean the same as never re-rendering this line at
-# all, not "no language wired." Omitting the token invokes that same
-# documented legacy fallback deliberately, for lack of any other way to
-# express "zero languages" through the existing Task 9 contract -- see this
-# task's report for why that is a real (if narrow) gap, not a design choice.
+# the {{CODE_ROOT_ENV}} pattern write-hooks.json.tmpl above already uses).
+#
+# Ruling 6 (Task 10 fix round, owner): rendered EXPLICITLY EMPTY --
+# `MEMCONTINUUM_LANG_EXTS=''` -- never omitted, when no language was
+# chosen. This relies on a matching Ruling-6 fix in
+# hooks/newfile-nudge.sh: its fallback there changed from
+# `${MEMCONTINUUM_LANG_EXTS:-*.swift}` to `${MEMCONTINUUM_LANG_EXTS-*.swift}`
+# (dash, no colon) specifically so "unset" (legacy un-re-rendered wiring,
+# still falls back to `*.swift`) and "set but empty" (deliberate
+# language-less wiring, matches nothing) are distinct states -- bash's
+# `:-` could never tell them apart, which is why the token used to be
+# omitted entirely instead (Task 10's original round; see that round's
+# report for the gap this closes).
 chosen_langs = [l.strip() for l in os.environ.get("MC_INSTALL_LANGS", "").split(",") if l.strip()]
 known_exts_str = " ".join("*" + e for e in sorted(chunkers.known_extensions()))
 known_exts_cmd = esc_cmd(known_exts_str)
-if chosen_langs:
-    wired_exts_str = " ".join("*" + e for e in sorted(chunkers.wired_extensions(chosen_langs)))
-    lang_exts_env = "MEMCONTINUUM_LANG_EXTS=%s " % esc_cmd(wired_exts_str)
-else:
-    lang_exts_env = ""
+wired_exts_str = " ".join("*" + e for e in sorted(chunkers.wired_extensions(chosen_langs))) if chosen_langs else ""
+lang_exts_env = "MEMCONTINUUM_LANG_EXTS=%s " % esc_cmd(wired_exts_str)
 
 write_tmpl = read_tmpl("write-hooks.json.tmpl")
 write_rendered = render(write_tmpl, {

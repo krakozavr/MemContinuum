@@ -1749,7 +1749,13 @@ class TestCodeCensusAndConsentDialogue(unittest.TestCase):
             settings = json.loads((claude_dir / "settings.local.json").read_text())
             nudge_groups = [g for g in settings["hooks"]["PreToolUse"] if g.get("matcher") == "Write"]
             item = nudge_groups[0]["hooks"][0]
-            self.assertNotIn("MEMCONTINUUM_LANG_EXTS", item["command"])
+            # Ruling 6 (fix round): language-less wiring renders the token
+            # EXPLICITLY EMPTY, never omitted -- hooks/newfile-nudge.sh's
+            # `${MEMCONTINUUM_LANG_EXTS-*.swift}` (no colon) only falls back
+            # to the legacy *.swift default when the var is UNSET, so an
+            # omitted token would (wrongly) still nudge on new .swift files
+            # after an explicit skip. An empty value matches nothing.
+            self.assertIn("MEMCONTINUUM_LANG_EXTS='' ", item["command"])
             self.assertIn("MEMCONTINUUM_KNOWN_EXTS=", item["command"])
         finally:
             shutil.rmtree(home, ignore_errors=True)
