@@ -1438,7 +1438,19 @@ if [ "$DRY_RUN" -eq 0 ] && [ "$RECORD_DECISION" -eq 1 ]; then
             # Union with whatever a pre-existing row already recorded --
             # never dropped (INC-0104's own lesson: a project's SECOND
             # claude-dir/code-root/language must not erase its first).
+            RD_DECLINED=0
             if mc_registry_lookup "$RD_DECISIONS" "$RD_KEY"; then
+                # A `declined` row is a human's "no". Only an UNDECIDED repo
+                # may be recorded as wired by an installer -- reversing a
+                # decline is `memcontinuum-decide.sh forget`, typed by the
+                # person who declined. The install itself still succeeds and
+                # still exits 0: the wiring is real, it is only the REGISTRY
+                # that keeps the answer already on record. (Nothing is
+                # silently half-done here -- the detector reads the row, so
+                # the repo stays exactly as quiet as it was asked to be.)
+                if [ "$MC_LOOKUP_DECISION" = "declined" ]; then
+                    RD_DECLINED=1
+                fi
                 mc_note_field "$MC_LOOKUP_NOTE" "claude-dirs"
                 RD_CLAUDE_DIRS="$(mc_union_semi "$MC_NOTE_FIELD" "$RD_CLAUDE_DIRS")"
                 mc_note_field "$MC_LOOKUP_NOTE" "code-roots"
@@ -1448,20 +1460,24 @@ if [ "$DRY_RUN" -eq 0 ] && [ "$RECORD_DECISION" -eq 1 ]; then
                 mc_note_field "$MC_LOOKUP_NOTE" "never"
                 RD_NEVER="$(mc_union_semi "$MC_NOTE_FIELD" "$RD_NEVER")"
             fi
-            declare -a RD_ARGS=(wired --repo "$RD_REPO" --store "$STORE" --project "$PROJECT")
-            mc_split_semi "$RD_CLAUDE_DIRS"
-            for d in ${MC_SPLIT[@]+"${MC_SPLIT[@]}"}; do RD_ARGS+=(--claude-dir "$d"); done
-            # mc_build_wiring_args (scripts/mc-registry-lib.sh): the one
-            # builder for the --code-root/--langs/--never-ext tail, shared with
-            # scripts/memcontinuum-update.sh.
-            mc_build_wiring_args "$RD_CODE_ROOTS" \
-                "$(printf '%s' "$RD_LANGS" | tr ';' ',')" \
-                "$(printf '%s' "$RD_NEVER" | tr ';' ',')"
-            RD_ARGS+=(${MC_BUILT_ARGS[@]+"${MC_BUILT_ARGS[@]}"})
-            if bash "$SCRIPT_DIR/memcontinuum-decide.sh" "${RD_ARGS[@]}"; then
-                echo "decision recorded: $RD_KEY wired"
+            if [ "$RD_DECLINED" -eq 1 ]; then
+                echo "note: --record-decision given, but $RD_KEY is recorded as declined -- leaving that answer alone. Only an undecided repo may be recorded as wired by the installer; if the decision has changed, run: $SCRIPT_DIR/memcontinuum-decide.sh forget --repo $RD_REPO   (then record it again)" >&2
             else
-                echo "note: --record-decision given but recording failed (see above) -- the install itself still succeeded" >&2
+                declare -a RD_ARGS=(wired --repo "$RD_REPO" --store "$STORE" --project "$PROJECT")
+                mc_split_semi "$RD_CLAUDE_DIRS"
+                for d in ${MC_SPLIT[@]+"${MC_SPLIT[@]}"}; do RD_ARGS+=(--claude-dir "$d"); done
+                # mc_build_wiring_args (scripts/mc-registry-lib.sh): the one
+                # builder for the --code-root/--langs/--never-ext tail, shared
+                # with scripts/memcontinuum-update.sh.
+                mc_build_wiring_args "$RD_CODE_ROOTS" \
+                    "$(printf '%s' "$RD_LANGS" | tr ';' ',')" \
+                    "$(printf '%s' "$RD_NEVER" | tr ';' ',')"
+                RD_ARGS+=(${MC_BUILT_ARGS[@]+"${MC_BUILT_ARGS[@]}"})
+                if bash "$SCRIPT_DIR/memcontinuum-decide.sh" "${RD_ARGS[@]}"; then
+                    echo "decision recorded: $RD_KEY wired"
+                else
+                    echo "note: --record-decision given but recording failed (see above) -- the install itself still succeeded" >&2
+                fi
             fi
         else
             echo "note: --record-decision given but $CLAUDE_DIR is not inside a git working tree -- skipping" >&2

@@ -325,6 +325,25 @@ tells you which case you're in — it prints an `update:` line naming the repair
 command only when this repo's wiring is out of date; nothing to do when it
 says nothing.
 
+Run `memcontinuum-update.sh` with no flags and it only prints a table: one line
+per repository and claude-dir, saying what is current, what has drifted, and
+what it will not touch. `--apply` does the work. It can re-render wiring; it
+can never create a store — if the store a row names has been renamed or
+deleted, the row is reported `store-missing` and skipped, because re-running
+the installer against a missing store would seed a new, empty one in its
+place.
+
+Two things it will not decide for you. **A project's set of claude-dirs is
+named by a person, never discovered.** A project can have more than one (a
+session-home `.claude` beside a bare checkout, say), and nothing on disk says
+how many — so for a repository wired before the registry recorded them, the
+table *proposes* the one it can find and waits: you name the full set with
+`--apply --repo PATH --claude-dir DIR [--claude-dir DIR ...]`, and a second
+claude-dir only ever joins a repository's record by being named on such a
+command line. Likewise, wiring old enough not to record which languages it
+indexes is reported as needing `--langs`, not quietly recorded as indexing
+none — that would switch off code indexing for a project that had it on.
+
 ## Languages
 
 The code index handles **Swift and Python**, both natively — Swift with a tuned

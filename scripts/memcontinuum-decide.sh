@@ -114,14 +114,30 @@ while [ $# -gt 0 ]; do
 done
 
 # join_semi ARR... -- prints array elements joined by ';', "" for a
-# zero-element array. Bash-3.2-safe (no `${arr[*]/%/;}` tricks, no external
-# tr/paste dependency): plain iteration.
+# zero-element array, each element percent-encoded for the note column
+# (mc_note_encode, scripts/mc-registry-lib.sh). Bash-3.2-safe (no
+# `${arr[*]/%/;}` tricks, no external tr/paste dependency): plain iteration.
 join_semi() {
     local out="" first=1 a
     for a in "$@"; do
+        a="$(mc_note_encode "$a")"
         if [ "$first" -eq 1 ]; then out="$a"; first=0; else out="$out;$a"; fi
     done
     printf '%s' "$out"
+}
+
+# check_storable LABEL VALUE -- refuses the three characters the note column
+# cannot represent. A space is fine (it is encoded); `;` separates the
+# elements of a list field, and a tab or newline would fake a TSV column or a
+# whole extra row. Storing any of them by guessing at a split is worse than
+# saying so.
+check_storable() {
+    case "$2" in
+        *";"*)  echo "REFUSED: $1 contains ';', which separates the elements of a registry list field: $2" >&2; exit 2 ;;
+        *"$MC_TAB"*) echo "REFUSED: $1 contains a tab, which separates registry columns: $2" >&2; exit 2 ;;
+        *"
+"*) echo "REFUSED: $1 contains a newline, which separates registry rows: $2" >&2; exit 2 ;;
+    esac
 }
 
 mkdir -p "$MEMCONTINUUM_HOME" || { echo "cannot create $MEMCONTINUUM_HOME" >&2; exit 1; }
@@ -163,6 +179,20 @@ KEY="$MC_REPO_KEY"
 # given more than once (INC-0104: one project, several claude-dirs), EVERY
 # one given must be fully wired -- a row claiming "wired" must be true at
 # every claude-dir it lists, not just the first.
+# Argument validation before any work: a value the note column cannot hold is
+# a bad argument, and saying so is more useful than a wiring report about a
+# path that was never going to be storable anyway.
+check_storable "--store" "$STORE"
+check_storable "--project" "$PROJECT"
+check_storable "--langs" "$LANGS"
+check_storable "--never-ext" "$NEVER_EXT"
+for CHECK_DIR in "${CLAUDE_DIRS[@]:-}"; do
+    [ -n "$CHECK_DIR" ] && check_storable "--claude-dir" "$CHECK_DIR"
+done
+for CHECK_DIR in "${CODE_ROOTS[@]:-}"; do
+    [ -n "$CHECK_DIR" ] && check_storable "--code-root" "$CHECK_DIR"
+done
+
 if [ "$ACTION" = "wired" ]; then
     if [ "${#CLAUDE_DIRS[@]}" -eq 0 ]; then
         CLAUDE_DIRS=("$REPO/.claude")
@@ -181,7 +211,7 @@ fi
 
 NOTE=""
 if [ -n "$STORE" ] || [ -n "$PROJECT" ]; then
-    NOTE="store=$STORE project=$PROJECT"
+    NOTE="store=$(mc_note_encode "$STORE") project=$(mc_note_encode "$PROJECT")"
 fi
 if [ "${#CLAUDE_DIRS[@]}" -gt 0 ]; then
     NOTE="$NOTE claude-dirs=$(join_semi "${CLAUDE_DIRS[@]}")"
@@ -190,10 +220,10 @@ if [ "${#CODE_ROOTS[@]}" -gt 0 ]; then
     NOTE="$NOTE code-roots=$(join_semi "${CODE_ROOTS[@]}")"
 fi
 if [ -n "$LANGS" ]; then
-    NOTE="$NOTE langs=$(printf '%s' "$LANGS" | tr ',' ';')"
+    NOTE="$NOTE langs=$(mc_note_encode "$(printf '%s' "$LANGS" | tr ',' ';')")"
 fi
 if [ -n "$NEVER_EXT" ]; then
-    NOTE="$NOTE never=$(printf '%s' "$NEVER_EXT" | tr ',' ';')"
+    NOTE="$NOTE never=$(mc_note_encode "$(printf '%s' "$NEVER_EXT" | tr ',' ';')")"
 fi
 # The unconditional store=/project= branch above may have left NOTE empty
 # (forget/declined pass neither) while a later branch (wired, with only

@@ -261,9 +261,35 @@ fully wired — recording the row after checking only the first would recreate
 pulls one `key=value` field out of the note (space-separated between fields,
 so `store=` — first, no leading space — and every later field parse the same
 way), and `mc_command_env_value CMD VAR` pulls one `VAR=value` token out of a
-rendered hook command line (quoted form tried first, then the bare word) —
-`memcontinuum-state.sh` and `memcontinuum-update.sh` both use it instead of
-each hand-rolling the same sed.
+rendered hook command line — `memcontinuum-state.sh` and
+`memcontinuum-update.sh` both use it instead of each hand-rolling the same
+extraction. It is pure parameter expansion, anchored on an assignment
+boundary (so a variable that is a suffix of a longer name is never read out
+of it), and it sets `MC_ENV_PRESENT` alongside `MC_ENV_VALUE`: an explicitly
+empty `MEMCONTINUUM_LANG_EXTS=''` is a *recorded answer* (language-less
+wiring, chosen on purpose), while the variable being absent means the wiring
+predates the set being written down at all — unknown, not "none". Reading the
+second as the first would silently turn a project's code indexing off, so the
+two are kept apart everywhere.
+
+**Values with spaces.** The note column is space-separated `key=value` fields
+with `;` between list elements, so a raw space inside a value would end its
+own field early and turn the remainder into garbage fields — and real stores
+do live under paths with spaces. Every value is therefore percent-encoded on
+the way in (`mc_note_encode`: `%` → `%25` first, then ` ` → `%20`) and
+decoded on the way out (`mc_note_decode`, in the opposite order, which is
+what lets a value literally containing the text `%20` survive). `;`, tab and
+newline are *not* encoded — `decide.sh` refuses a value containing one, since
+a decoded `;` would arrive after the field had already been split on `;`.
+Accepted edge: a row written before this encoding, holding a path with a
+literal `%` followed by `20` or `25`, decodes wrongly; the fix is to rewrite
+the row.
+
+Splitting a stored list back into arguments goes through `mc_split_semi`, and
+the `--code-root`/`--langs`/`--never-ext` tail every re-run command shares is
+built once by `mc_build_wiring_args`. Both exist because the hand-rolled
+versions they replace used `tr ';' ' '` with an unquoted expansion, which
+word-splits every path containing a space and glob-expands the rest.
 
 ## Version stamp and the updater
 
@@ -298,19 +324,43 @@ alone cannot catch a store renamed under the same engine version), and the
 rules file's identity marker + stamp. It prints one table row per
 (row, claude-dir): `repo | claude-dir | stamped | engine | store-match |
 rules | action`, action being one of `ok`, `stale`, `store-mismatch`,
-`rules-missing`, `rules-stale`, `rules-foreign`, `migrate`, `store-missing`,
-`no-wiring`, or `unrecoverable`. `--dry-run` (the default with no `--apply`)
-only prints; `--apply` re-runs `repo-init.sh` per non-`ok` claude-dir with the
-row's own recorded parameters (adopting the existing store — this command
-never creates, renames, or deletes one).
+`rules-missing`, `rules-stale`, `rules-foreign`, `migrate`,
+`migrate-needs-claude-dirs`, `migrate-needs-langs`,
+`migrate-needs-never-exts`, `store-missing`, `no-wiring`, or
+`unrecoverable`. `--dry-run` (the default with no `--apply`) only prints;
+`--apply` re-runs `repo-init.sh` per non-`ok` claude-dir with the row's own
+recorded parameters, always passing `--adopt-only` (below), so this command
+cannot create, rename, or delete a store on any path through it.
 
-Two actions are deliberately never auto-applied:
+**Action precedence.** The answers this command will never act on come first:
+`store-missing`, then `rules-foreign`, then the `migrate-needs-*` questions,
+and only then the drift it can actually re-render (`stale`,
+`store-mismatch`, `rules-missing`, `rules-stale`, `ok`). Ordering them the
+other way would name some lesser drift in the action column and then have
+`--apply` call the installer just to watch it refuse for a reason already
+known.
 
-- **`store-missing`** — the row's `store=` path is no longer a git
-  repository (renamed or deleted out from under the row). Re-running
-  `repo-init.sh` against a missing `--store` would *seed a fresh one* there,
-  which is exactly the "stores never touched" line this command does not
-  cross. Reported with a one-line fix hint; skipped.
+**Exit codes.** The reporting walk always exits 0 — there, a stale row is the
+answer, not an error. `--apply` exits 0 only when every claude-dir it walked
+ended up correct: already `ok`, or re-rendered successfully. Anything left
+undone — a failed installer run, or a dir deliberately skipped — exits
+non-zero, with the table still printed in full and the reason on stderr.
+
+**`--adopt-only`.** `repo-init.sh` grows a flag that refuses, before writing
+anything at all, unless `--store` is already a git working tree carrying this
+tool's markers (`mc_is_marked_store`, the same predicate the installer's own
+classify step uses). No `--force` carve-out, and `--dry-run` refuses too. The
+re-render command passes it on every installer run it makes.
+
+Actions that are deliberately never auto-applied:
+
+- **`store-missing`** — the row's `store=` path is no longer an existing
+  MemContinuum store (renamed, deleted, or replaced by an unrelated git
+  repo). Re-running `repo-init.sh` against a missing `--store` would *seed a
+  fresh one* there, which is exactly the "stores never touched" line this
+  command does not cross. It outranks every other answer, including a stamp
+  and a `store=` that both still look right: those compare strings, and a
+  string agrees just as happily with a store that is gone.
 - **`rules-foreign`** — `repo-init.sh` itself refuses to overwrite a foreign
   rules file (see above), so calling it would just fail loudly for a reason
   already named in the table. Reported; skipped.
@@ -333,9 +383,42 @@ wrong repo's `.claude`). A recoverable legacy row also has its `code-roots=`/
 `mc_wired_commands_for_project`, which is scoped to the five always-wired
 write-side basenames and never matches `newfile-nudge.sh`/`pre-edit-chain.sh`
 by design (see "The five basenames" above) — `memcontinuum-update.sh` has its
-own basename-parametrized scan for this one case. `--apply` on a legacy row
-re-renders it and rewrites the registry row (`migrate` in the table),
-reported once; every subsequent walk sees it as current-format.
+own basename-parametrized scan for this one case.
+
+**The migration proposes; a human decides.** The recovered `<repo>/.claude`
+is shown in the table as a *proposal*, never written from. Migrating a legacy
+row requires the human to name the full claude-dir set on the command line:
+
+```
+scripts/memcontinuum-update.sh --apply --repo PATH \
+    --claude-dir DIR [--claude-dir DIR ...] [--langs LIST] [--never-ext LIST]
+```
+
+Without it the action is `migrate-needs-claude-dirs` and nothing is written.
+The reason is structural: one project can have several claude-dirs, and
+nothing on disk says how many — the command can see the one it found and no
+more. **A second claude-dir joins a project's row only by being named on a
+`memcontinuum-decide.sh wired` command line** (directly, or through the
+`--claude-dir` above, which builds that command). Nothing discovers one; that
+topology is manual by design.
+
+Two more refusals follow the same rule — the row is what every future
+re-render replays, so a value invented here would be permanent:
+
+- **`migrate-needs-langs`** — the wiring carries no `MEMCONTINUUM_LANG_EXTS`
+  at all, so it predates the language set being written onto the hook line.
+  Unknown, not "none": recording "none" would turn code indexing off for a
+  project that had it on. Pass `--langs LIST`. (An explicitly empty
+  `MEMCONTINUUM_LANG_EXTS=''` is a recorded answer and migrates without one.)
+- **`migrate-needs-never-exts`** — the rendered never-mention list is not a
+  plain extension list (hand-edited). Pass `--never-ext LIST`.
+
+Each named `--claude-dir` must already carry this project's wiring: the
+migration *records* what is installed and never wires a directory from
+scratch. `--apply` re-renders every named claude-dir first and rewrites the
+registry row only if all of them succeeded (`migrate` in the table); a row
+rewritten after a failed render would describe wiring that exists nowhere.
+Every subsequent walk sees the row as current-format.
 
 `--add-lang LANG [--never-ext .ext] --repo PATH` and
 `--never-ext .ext [--add-lang LANG] --repo PATH` are additive-only (a human

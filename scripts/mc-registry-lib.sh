@@ -260,9 +260,18 @@ mc_wired_commands_for_project() {
 # preceding character that cannot be part of an identifier -- a space, or the
 # JSON string's opening quote for the first token on the line) so a VAR that
 # is a suffix of a longer variable name can never be read out of it.
+# MC_ENV_PRESENT is set alongside MC_ENV_VALUE: 1 when the line actually
+# carries the assignment, 0 when it does not. The two are NOT the same
+# question, and the difference decides a migration. An explicitly empty
+# `MEMCONTINUUM_LANG_EXTS=''` is a RECORDED ANSWER -- language-less wiring,
+# chosen on purpose. The variable being absent means the wiring predates the
+# language set ever being written down: unknown, not "none". Migrating the
+# second case as though it were the first would silently turn a project's
+# code indexing off.
 mc_command_env_value() {
     local cmd="$1" var="$2" head tail
     MC_ENV_VALUE=""
+    MC_ENV_PRESENT=0
     tail="$cmd"
     while :; do
         case "$tail" in
@@ -284,6 +293,7 @@ mc_command_env_value() {
                 MC_ENV_VALUE="${tail%%[ \"]*}"
                 ;;
         esac
+        MC_ENV_PRESENT=1
         return 0
     done
 }
@@ -322,23 +332,65 @@ mc_is_marked_store() {
     return 1
 }
 
+# mc_note_encode VALUE / mc_note_decode VALUE
+#
+# The registry row's NOTE column is space-separated `key=value` fields with
+# `;` between the elements of a list field. A value containing a space would
+# therefore end its own field early and turn the rest of itself into garbage
+# fields -- and real stores do live under paths with spaces in them. So every
+# value is percent-encoded on the way in and decoded on the way out: `%`
+# becomes `%25` first, then ` ` becomes `%20`.
+#
+# Decoding undoes that in the opposite order (`%20` before `%25`), which is
+# what makes a value that literally contains the text "%20" survive: it is
+# stored as `%2520`, where no `%20` occurs, and only the `%25` step turns it
+# back into a percent sign.
+#
+# `;`, tab and newline are NOT encoded -- they are refused at the point of
+# writing instead (memcontinuum-decide.sh). A `;` that came back decoded
+# would arrive AFTER the field had already been split on `;`, so encoding it
+# would only move the corruption somewhere harder to see.
+#
+# Accepted edge: a row written before this encoding existed, holding a path
+# with a literal `%` in it, decodes wrongly if that `%` happens to be
+# followed by `20` or `25`. Such a path could never have been stored
+# correctly anyway (it would have had no space to break on, but nothing
+# guaranteed round-tripping either); the fix is to rewrite the row.
+mc_note_encode() {
+    local v="$1"
+    v="${v//%/%25}"
+    v="${v// /%20}"
+    printf '%s' "$v"
+}
+
+mc_note_decode() {
+    local v="$1"
+    v="${v//%20/ }"
+    v="${v//%25/%}"
+    printf '%s' "$v"
+}
+
 # mc_note_field NOTE KEY
 #
-# Pulls one space-separated "key=value" field out of a registry row's NOTE
-# column (the shape decide.sh writes: "store=... project=... claude-dirs=a;b
-# code-roots=c;d langs=python;swift never=.cs;.h" -- semicolon-joined for the
-# list-valued fields, space-separated between fields, same as decide.sh's
-# own note format). Values never contain a space (the same assumption
-# store=/project= have relied on since fix-round-4). Sets MC_NOTE_FIELD to
-# the value, or "" when KEY is absent -- absence is normal (every
-# pre-updater-workstream row lacks claude-dirs/code-roots/langs/never), not
-# an error -- and always returns 0.
+# Pulls one "key=value" field out of a registry row's NOTE column (the shape
+# decide.sh writes: "store=... project=... claude-dirs=a;b code-roots=c;d
+# langs=python;swift never=.cs;.h" -- semicolon-joined for the list-valued
+# fields, space-separated between fields). The value is percent-DECODED
+# before it is handed back, so a caller always sees the real path. Sets
+# MC_NOTE_FIELD to the value, or "" when KEY is absent -- absence is normal
+# (every row written before those four fields existed lacks them), not an
+# error -- and always returns 0.
 mc_note_field() {
     local note="$1" key="$2" tok
+    local -a toks=()
     MC_NOTE_FIELD=""
-    for tok in $note; do
+    # `read -ra`, not `for tok in $note`: an unquoted expansion also runs
+    # pathname expansion, so a field value that happens to look like a glob
+    # would be replaced by whatever files sit in the caller's directory.
+    read -ra toks <<<"$note"
+    for tok in "${toks[@]:-}"; do
         case "$tok" in
-            "$key="*) MC_NOTE_FIELD="${tok#"$key"=}"; return 0 ;;
+            "$key="*) MC_NOTE_FIELD="$(mc_note_decode "${tok#"$key"=}")"; return 0 ;;
         esac
     done
     return 0

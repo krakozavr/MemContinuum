@@ -396,7 +396,10 @@ class TestLegacyRowMigration(unittest.TestCase):
         self.assertIn("migrate", rows_out)
         self.assertIn("legacy rows found", proc.stdout + proc.stderr)
 
-        proc2 = run(UPDATE_SH, ["--apply"], self.home)
+        # The claude-dir set is named by the human -- the table only proposes
+        # the one dir this command can see.
+        proc2 = run(UPDATE_SH, ["--apply", "--repo", self.repo,
+                                "--claude-dir", self.claude_dir], self.home)
         self.assertEqual(proc2.returncode, 0, proc2.stdout + proc2.stderr)
         self.assertIn("migrated", proc2.stdout + proc2.stderr)
 
@@ -566,7 +569,8 @@ class TestNeverExtsSurviveARerender(unittest.TestCase):
         assert proc.returncode == 0, proc.stdout + proc.stderr
 
     def _migrate(self, cwd=None):
-        return run(UPDATE_SH, ["--apply"], self.home, cwd=cwd)
+        return run(UPDATE_SH, ["--apply", "--repo", self.repo,
+                               "--claude-dir", self.claude_dir], self.home, cwd=cwd)
 
     def _nudge_command(self):
         settings = json.loads(Path(self.claude_dir, "settings.local.json").read_text())
@@ -654,6 +658,326 @@ class TestAddLangValidatesBeforeWriting(UpdateTestBase):
         proc = run(UPDATE_SH, ["--add-lang", "swift", "--repo", self.repo], self.home)
         self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(decisions_tsv(self.home).read_text(), before)
+
+
+class TestMigrationNeverGuessesTheClaudeDirSet(unittest.TestCase):
+    """A legacy row records no claude-dirs. One project can have SEVERAL --
+    a session-home .claude beside a bare checkout, two homes pointed at one
+    store -- and the updater has no way to know how many. It PROPOSES the one
+    it can see and refuses to write until a human names the whole set."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-update-cd-test-")
+        self.home = str(Path(self.tmp) / "home")
+        os.makedirs(self.home, exist_ok=True)
+        self.repo = git_repo(str(Path(self.tmp) / "repo"))
+        self.store = str(Path(self.tmp) / "store")
+        self.claude_a = str(Path(self.repo) / ".claude")
+        self.claude_b = str(Path(self.tmp) / "session-home" / ".claude")
+        for cd in (self.claude_a, self.claude_b):
+            proc = run(INSTALL_SH, ["--project", "two", "--store", self.store,
+                                    "--claude-dir", cd, "--non-interactive"], self.home)
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+        write_row(self.home, self.repo, "wired",
+                  note=f"store={self.store} project=two")
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_plain_apply_refuses_and_writes_nothing(self):
+        before = decisions_tsv(self.home).read_text()
+        proc = run(UPDATE_SH, ["--apply"], self.home)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("migrate-needs-claude-dirs", proc.stdout)
+        self.assertEqual(decisions_tsv(self.home).read_text(), before)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_the_table_proposes_the_recovered_dir_and_names_the_command(self):
+        proc = run(UPDATE_SH, [], self.home)
+        rows = self.assertTableProposes(proc)
+        self.assertEqual(rows[0]["action"], "migrate-needs-claude-dirs")
+        self.assertEqual(rows[0]["claude-dir"], self.claude_a)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("memcontinuum-decide.sh wired", combined)
+        self.assertIn("--claude-dir", combined)
+
+    def assertTableProposes(self, proc):
+        lines = [l for l in proc.stdout.splitlines() if l.strip()]
+        header = lines[0].split("\t")
+        return [dict(zip(header, l.split("\t"))) for l in lines[1:]]
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_named_claude_dirs_migrate_and_are_all_walked_afterwards(self):
+        proc = run(UPDATE_SH, ["--apply", "--repo", self.repo,
+                               "--claude-dir", self.claude_a,
+                               "--claude-dir", self.claude_b], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        note = decisions_tsv(self.home).read_text().splitlines()[-1]
+        self.assertIn(f"claude-dirs={self.claude_a};{self.claude_b}", note, note)
+
+        again = run(UPDATE_SH, [], self.home)
+        rows = self.assertTableProposes(again)
+        self.assertEqual([r["claude-dir"] for r in rows],
+                         [self.claude_a, self.claude_b], again.stdout)
+        self.assertEqual([r["action"] for r in rows], ["ok", "ok"], again.stdout)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_a_named_claude_dir_that_carries_no_wiring_is_refused(self):
+        """The migration RECORDS what is already installed. It never wires a
+        directory from scratch -- that is the skill's job, with a human."""
+        empty = str(Path(self.tmp) / "not-installed")
+        os.makedirs(empty, exist_ok=True)
+        before = decisions_tsv(self.home).read_text()
+        proc = run(UPDATE_SH, ["--apply", "--repo", self.repo,
+                               "--claude-dir", self.claude_a,
+                               "--claude-dir", empty], self.home)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(decisions_tsv(self.home).read_text(), before)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_claude_dir_without_repo_is_refused(self):
+        proc = run(UPDATE_SH, ["--apply", "--claude-dir", self.claude_a], self.home)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("--repo", proc.stdout + proc.stderr)
+
+
+class TestMigrationNeverInventsALanguageSet(unittest.TestCase):
+    """Wiring rendered before the language set was recorded on the hook line
+    has no MEMCONTINUUM_LANG_EXTS at all. That is "unknown", not "none": a
+    migration that silently wrote a language-less row would turn off code
+    indexing for a project that had it on."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-update-langs-test-")
+        self.home = str(Path(self.tmp) / "home")
+        os.makedirs(self.home, exist_ok=True)
+        self.repo = git_repo(str(Path(self.tmp) / "repo"))
+        self.code_root = str(Path(self.tmp) / "code")
+        os.makedirs(self.code_root, exist_ok=True)
+        (Path(self.code_root) / "x.py").write_text("print(1)\n")
+        self.store = str(Path(self.tmp) / "store")
+        self.claude_dir = str(Path(self.repo) / ".claude")
+        proc = run(INSTALL_SH, [
+            "--project", "old", "--store", self.store, "--claude-dir", self.claude_dir,
+            "--code-root", self.code_root, "--langs", "python", "--non-interactive",
+        ], self.home)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        # Roll the nudge line back to the pre-record shape: the variable is
+        # not set at all (distinct from set-and-empty, which IS a recorded
+        # answer -- deliberate language-less wiring).
+        path = Path(self.claude_dir, "settings.local.json")
+        path.write_text(path.read_text().replace("MEMCONTINUUM_LANG_EXTS='*.py' ", ""))
+        write_row(self.home, self.repo, "wired",
+                  note=f"store={self.store} project=old")
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_absent_lang_exts_is_migrate_needs_langs_and_writes_nothing(self):
+        before = decisions_tsv(self.home).read_text()
+        proc = run(UPDATE_SH, ["--apply", "--repo", self.repo,
+                               "--claude-dir", self.claude_dir], self.home)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("migrate-needs-langs", proc.stdout)
+        self.assertEqual(decisions_tsv(self.home).read_text(), before)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_explicit_langs_completes_the_migration(self):
+        proc = run(UPDATE_SH, ["--apply", "--repo", self.repo,
+                               "--claude-dir", self.claude_dir,
+                               "--langs", "python"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        note = decisions_tsv(self.home).read_text().splitlines()[-1]
+        self.assertIn("langs=python", note, note)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_an_explicitly_empty_lang_exts_is_a_recorded_answer_not_a_gap(self):
+        """`MEMCONTINUUM_LANG_EXTS=''` means "language-less wiring, on
+        purpose" -- it migrates without an explicit --langs."""
+        path = Path(self.claude_dir, "settings.local.json")
+        path.write_text(path.read_text().replace(
+            "MEMCONTINUUM_NEVER_EXTS=", "MEMCONTINUUM_LANG_EXTS='' MEMCONTINUUM_NEVER_EXTS="))
+        proc = run(UPDATE_SH, ["--apply", "--repo", self.repo,
+                               "--claude-dir", self.claude_dir], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        note = decisions_tsv(self.home).read_text().splitlines()[-1]
+        self.assertNotIn("langs=", note, note)
+
+
+class TestWalkExitCodesAndPrecedence(UpdateTestBase):
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_rules_foreign_outranks_stale(self):
+        """A foreign rules file is never applied -- so it must be what the
+        action column SAYS, or --apply would call repo-init just to watch it
+        refuse for a reason already known."""
+        drifted = self.settings_text().replace(
+            f"MEMCONTINUUM_RENDERED={engine_sha()}", "MEMCONTINUUM_RENDERED=deadbee")
+        Path(self.claude_dir, "settings.local.json").write_text(drifted)
+        Path(self.claude_dir, "rules", "memcontinuum.md").write_text("# not ours\n")
+        proc = run(UPDATE_SH, [], self.home)
+        rows = self.table_rows(proc.stdout)
+        self.assertEqual(rows[0]["action"], "rules-foreign", proc.stdout)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_apply_that_skips_never_calls_repo_init_for_that_dir(self):
+        Path(self.claude_dir, "rules", "memcontinuum.md").write_text("# not ours\n")
+        proc = run(UPDATE_SH, ["--apply"], self.home)
+        self.assertNotIn("applying:", proc.stdout, proc.stdout)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_the_reporting_walk_still_exits_zero(self):
+        Path(self.claude_dir, "rules", "memcontinuum.md").write_text("# not ours\n")
+        proc = run(UPDATE_SH, [], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("rules-foreign", proc.stdout)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_one_bad_dir_among_several_still_fails_the_walk(self):
+        """Partial failure is failure: the table is still printed in full,
+        and the exit code reports that not everything got done."""
+        other = str(Path(self.tmp) / "second-claude")
+        proc = run(INSTALL_SH, ["--project", "proj", "--store", self.store,
+                                "--claude-dir", other, "--code-root", self.code_root,
+                                "--langs", "python", "--non-interactive"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        proc = run(DECIDE_SH, ["wired", "--repo", self.repo, "--store", self.store,
+                               "--project", "proj", "--claude-dir", self.claude_dir,
+                               "--claude-dir", other, "--code-root", self.code_root,
+                               "--langs", "python", "--never-ext", ".cs"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        Path(other, "rules", "memcontinuum.md").write_text("# not ours\n")
+        proc = run(UPDATE_SH, ["--apply"], self.home)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        rows = self.table_rows(proc.stdout)
+        self.assertEqual(len(rows), 2, proc.stdout)
+
+
+class TestRecordDecisionNeverFlipsADeclinedRow(unittest.TestCase):
+    """`declined` is a human's "no". An installer -- even one run with
+    --record-decision by a driven flow -- may only record an UNDECIDED repo as
+    wired. Reversing a decline is `memcontinuum-decide.sh forget`, typed by
+    the person who declined."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-record-declined-test-")
+        self.home = str(Path(self.tmp) / "home")
+        os.makedirs(self.home, exist_ok=True)
+        self.repo = git_repo(str(Path(self.tmp) / "repo"))
+        self.store = str(Path(self.tmp) / "store")
+        self.claude_dir = str(Path(self.repo) / ".claude")
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_declined_row_survives_and_the_install_still_succeeds(self):
+        proc = run(DECIDE_SH, ["declined", "--repo", self.repo], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        proc = run(INSTALL_SH, ["--project", "dec", "--store", self.store,
+                                "--claude-dir", self.claude_dir, "--non-interactive",
+                                "--record-decision"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        text = decisions_tsv(self.home).read_text()
+        self.assertIn("declined", text, text)
+        self.assertNotIn("wired", text, text)
+        self.assertIn("declined", proc.stdout + proc.stderr)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_an_undecided_repo_is_still_recorded(self):
+        proc = run(INSTALL_SH, ["--project", "und", "--store", self.store,
+                                "--claude-dir", self.claude_dir, "--non-interactive",
+                                "--record-decision"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("wired", decisions_tsv(self.home).read_text())
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_an_already_wired_row_is_still_updated(self):
+        """Re-installing a repo that is already recorded as wired must keep
+        working -- the rule is about `declined`, not about idempotence."""
+        for _ in range(2):
+            proc = run(INSTALL_SH, ["--project", "und", "--store", self.store,
+                                    "--claude-dir", self.claude_dir, "--non-interactive",
+                                    "--record-decision"], self.home)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("wired", decisions_tsv(self.home).read_text())
+
+
+class TestPathsWithSpaces(unittest.TestCase):
+    """A real store on this machine lives under a path with a space in it.
+    The registry note is space-separated `key=value` fields, so a raw space in
+    a value would end the field early and the rest would parse as garbage --
+    values are percent-encoded on the way in and decoded on the way out."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-spaces-test-")
+        self.home = str(Path(self.tmp) / "home")
+        os.makedirs(self.home, exist_ok=True)
+        self.repo = git_repo(str(Path(self.tmp) / "my repo"))
+        self.store = str(Path(self.tmp) / "my store")
+        self.code_root = str(Path(self.tmp) / "my code")
+        os.makedirs(self.code_root, exist_ok=True)
+        (Path(self.code_root) / "x.py").write_text("print(1)\n")
+        self.claude_dir = str(Path(self.repo) / ".claude")
+
+    def _install_and_record(self):
+        proc = run(INSTALL_SH, [
+            "--project", "spaced", "--store", self.store, "--claude-dir", self.claude_dir,
+            "--code-root", self.code_root, "--langs", "python", "--never-ext", ".cs",
+            "--non-interactive",
+        ], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        proc = run(DECIDE_SH, [
+            "wired", "--repo", self.repo, "--store", self.store, "--project", "spaced",
+            "--claude-dir", self.claude_dir, "--code-root", self.code_root,
+            "--langs", "python", "--never-ext", ".cs",
+        ], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_a_spaced_store_and_claude_dir_round_trip_through_the_registry(self):
+        self._install_and_record()
+        note = decisions_tsv(self.home).read_text().splitlines()[-1]
+        # One field per space-separated token: the encoding is what makes
+        # that true for a value that itself contains a space.
+        fields = dict(t.split("=", 1) for t in note.split("\t")[-1].split() if "=" in t)
+        self.assertEqual(set(fields), {"store", "project", "claude-dirs",
+                                       "code-roots", "langs", "never"}, note)
+
+        proc = run(UPDATE_SH, [], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        lines = [l for l in proc.stdout.splitlines() if l.strip()]
+        rows = [dict(zip(lines[0].split("\t"), l.split("\t"))) for l in lines[1:]]
+        self.assertEqual(len(rows), 1, proc.stdout)
+        self.assertEqual(rows[0]["claude-dir"], self.claude_dir, proc.stdout)
+        self.assertEqual(rows[0]["store-match"], "yes", proc.stdout)
+        self.assertEqual(rows[0]["action"], "ok", proc.stdout)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_add_lang_rerenders_a_spaced_path_as_one_argument(self):
+        self._install_and_record()
+        proc = run(UPDATE_SH, ["--add-lang", "swift", "--repo", self.repo], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        settings = Path(self.claude_dir, "settings.local.json").read_text()
+        self.assertIn("'*.py *.swift'", settings)
+        self.assertIn(self.store, settings)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_a_value_containing_a_literal_percent_survives_the_round_trip(self):
+        weird = str(Path(self.tmp) / "pct %20 dir")
+        os.makedirs(weird, exist_ok=True)
+        proc = run(INSTALL_SH, ["--project", "pct", "--store", self.store,
+                                "--claude-dir", self.claude_dir, "--code-root", weird,
+                                "--non-interactive"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        proc = run(DECIDE_SH, ["wired", "--repo", self.repo, "--store", self.store,
+                               "--project", "pct", "--claude-dir", self.claude_dir,
+                               "--code-root", weird], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        proc = run(UPDATE_SH, [], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("ok", proc.stdout)
+
+    def test_a_semicolon_in_a_value_is_refused_not_silently_split(self):
+        """`;` separates the elements of a list field -- a value carrying one
+        cannot be stored, and a guess would silently split it into two."""
+        proc = run(DECIDE_SH, ["wired", "--repo", self.repo,
+                               "--store", "/a;b", "--project", "p",
+                               "--claude-dir", self.claude_dir], self.home)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(";", proc.stdout + proc.stderr)
 
 
 class TestHelp(unittest.TestCase):

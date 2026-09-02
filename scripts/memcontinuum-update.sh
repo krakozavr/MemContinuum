@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# usage: memcontinuum-update.sh [--dry-run | --apply] [--machine]
+# usage: memcontinuum-update.sh [--dry-run | --apply] [--machine] [--repo PATH]
+#        memcontinuum-update.sh --apply --repo PATH --claude-dir DIR [--claude-dir DIR ...]
+#                               [--langs LIST] [--never-ext LIST]
 #        memcontinuum-update.sh --add-lang LANG [--never-ext .ext] --repo PATH
 #        memcontinuum-update.sh --never-ext .ext [--add-lang LANG] --repo PATH
 #
@@ -39,21 +41,46 @@
 #            recorded (adopting the row's existing --store -- this command
 #            never creates or renames a store, only re-renders wiring that
 #            points at one that already exists), for every claude-dir whose
-#            action is not "ok". A row with no --claude-dir on record
-#            (written before this registry format existed) is migrated: its
-#            claude-dir/code-roots/langs/never-exts are recovered from what
-#            is actually rendered there today, applied, and the row is
-#            rewritten (via memcontinuum-decide.sh wired) to carry them from
-#            now on -- reported as `migrate`, a one-time thing per row.
-#            "store-missing" (the row's store no longer exists as a git
-#            repository -- a renamed or deleted store) is never applied
-#            automatically: re-running repo-init against a
-#            missing --store would SEED A FRESH ONE there, which is exactly
-#            the "stores never touched" line this command does not cross.
+#            action is not "ok".
+#            "store-missing" (the row's store is no longer an existing
+#            MemContinuum store -- renamed or deleted) is never applied
+#            automatically: re-running the installer against a missing
+#            --store would SEED A FRESH ONE there, which is exactly the
+#            "stores never touched" line this command does not cross.
 #            Fix the row's store (or restore the old one) and re-run.
+# --repo PATH
+#            narrows the walk to that one repository's row. Required
+#            alongside the migration options below (they describe ONE row).
 # --machine  also re-runs memcontinuum-setup.sh once, to refresh the
 #            machine-level detector hook and skill copy. Off by default --
 #            most updates are per-repo; the machine layer rarely drifts.
+#
+# MIGRATING A ROW WRITTEN BEFORE THE REGISTRY RECORDED WIRING PARAMETERS
+#
+# Such a row has no claude-dirs on record. This command can see the one
+# claude-dir it can find, and it PROPOSES it in the table -- but a project
+# may well have more than one (a session-home .claude beside a bare
+# checkout, or two homes pointed at the same store), and there is no way to
+# discover the rest. So the table proposes and a human decides; nothing is
+# written from a guess. Actions:
+#
+#   migrate-needs-claude-dirs   name the full set:
+#       memcontinuum-update.sh --apply --repo PATH \
+#           --claude-dir DIR [--claude-dir DIR ...]
+#   migrate-needs-langs         the wiring predates the language set being
+#       written onto the hook line, so it cannot be read back -- unknown,
+#       not "none". Add --langs LANG[,LANG].
+#   migrate-needs-never-exts    the never-mention list on the hook line is
+#       not a plain extension list. Add --never-ext .ext[,.ext].
+#   migrate                     everything needed is on record or recovered;
+#       --apply re-renders, and only then rewrites the row (via
+#       memcontinuum-decide.sh wired) to carry the parameters from now on.
+#
+# Each named --claude-dir must ALREADY carry this project's wiring: this
+# command records what is installed, it never wires a directory from scratch.
+# A second claude-dir joins a project's row only by being named on a
+# `memcontinuum-decide.sh wired` command line -- here, or typed directly.
+# Nothing discovers one.
 #
 # --add-lang LANG [--never-ext .ext] --repo PATH
 # --never-ext .ext [--add-lang LANG] --repo PATH
@@ -67,6 +94,13 @@
 #            set. --repo PATH is required -- same reasoning as
 #            memcontinuum-decide.sh's own --repo requirement: no silent
 #            $PWD default for a write that changes what gets indexed.
+#            The row is rewritten only AFTER every claude-dir has
+#            re-rendered successfully, and an unknown language is refused
+#            before anything is touched at all.
+#            (--apply is what tells the two modes apart: the same
+#            --never-ext spelling means "add this to the row" on its own,
+#            and "here is the whole list for the row you are migrating"
+#            under --apply.)
 #
 # This command never wires an undecided or declined repo (it only ever
 # touches rows already marked `wired`), and never creates a store: every
@@ -123,7 +157,9 @@ DRY_RUN_EXPLICIT=0
 MACHINE=0
 ADD_LANG=""
 NEVER_EXT=""
+LANGS_FLAG=""
 TARGET_REPO=""
+declare -a OVERRIDE_CLAUDE_DIRS=()
 need_value() { [ $# -ge 2 ] || { echo "missing value for $1" >&2; exit 2; }; }
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -132,11 +168,44 @@ while [ $# -gt 0 ]; do
         --machine) MACHINE=1; shift ;;
         --add-lang) need_value "$@"; ADD_LANG="$2"; shift 2 ;;
         --never-ext) need_value "$@"; NEVER_EXT="$2"; shift 2 ;;
+        --langs) need_value "$@"; LANGS_FLAG="$2"; shift 2 ;;
+        --claude-dir) need_value "$@"; OVERRIDE_CLAUDE_DIRS+=("$2"); shift 2 ;;
         --repo) need_value "$@"; TARGET_REPO="$2"; shift 2 ;;
         -h|--help) usage 0 ;;
         *) echo "unknown argument: $1" >&2; usage 1 ;;
     esac
 done
+
+# --- which mode is this? ---------------------------------------------------
+#
+# --apply is the discriminator, and it is the only one, because the two modes
+# want opposite things from the same three option names. `--never-ext .h`
+# means "add .h to what this row already records" when a human types it on
+# its own; under --apply it means "here is the whole never-list for the row
+# you are migrating, because it could not be read back". Splitting them on
+# --apply keeps each spelling doing one thing.
+TARGETED=0
+if [ -n "$ADD_LANG" ]; then
+    if [ "$APPLY" -eq 1 ]; then
+        echo "--add-lang is not a walk-mode option: it adds one language to ONE row (which is why it takes --repo), and --apply re-renders every row. Drop --apply -- typing --add-lang is itself the consent to write." >&2
+        exit 2
+    fi
+    TARGETED=1
+elif [ -n "$NEVER_EXT" ] && [ "$APPLY" -eq 0 ]; then
+    TARGETED=1
+fi
+
+if [ "$TARGETED" -eq 0 ]; then
+    # Migration overrides are per-row by nature -- a claude-dir set or a
+    # language list belongs to ONE project. With several legacy rows on the
+    # machine and no --repo, there would be no saying which row they meant.
+    if [ "${#OVERRIDE_CLAUDE_DIRS[@]}" -gt 0 ] || [ -n "$LANGS_FLAG" ] || [ -n "$NEVER_EXT" ]; then
+        [ -n "$TARGET_REPO" ] || {
+            echo "--claude-dir/--langs/--never-ext describe ONE registry row, so they need --repo PATH to say which. (Without --repo this command walks every wired row and writes nothing it had to guess.)" >&2
+            exit 2
+        }
+    fi
+fi
 
 # --- python resolution (only needed for legacy-row lang recovery below) ---
 #
@@ -240,12 +309,21 @@ mc_update_recover_from_settings() {
     MC_RECOVERED_LANGS=""
     MC_RECOVERED_NEVER=""
     MC_RECOVERED_NEVER_OK=1
+    # No nudge line at all means a rationale-only install: there is no code
+    # indexing here and therefore no language set to lose, so "" IS the
+    # recovered answer. A nudge line that carries no MEMCONTINUUM_LANG_EXTS
+    # is the opposite -- wiring rendered before the set was written down, so
+    # the answer is genuinely unknown (see MC_ENV_PRESENT in
+    # scripts/mc-registry-lib.sh).
+    MC_RECOVERED_LANGS_OK=1
+    local nudge_seen=0 lang_present=0
     lang_glob_str=""
     never_glob_str=""
     while IFS= read -r line || [ -n "$line" ]; do
         [ -n "$line" ] || continue
         case "$line" in
             *newfile-nudge.sh*)
+                nudge_seen=1
                 mc_command_env_value "$line" "MEMCONTINUUM_CODE_ROOT"
                 if [ -n "$MC_ENV_VALUE" ]; then
                     case ";$root_seen;" in
@@ -253,9 +331,12 @@ mc_update_recover_from_settings() {
                         *) roots+=("$MC_ENV_VALUE"); root_seen="$root_seen;$MC_ENV_VALUE" ;;
                     esac
                 fi
-                if [ -z "$lang_glob_str" ]; then
+                if [ "$lang_present" -eq 0 ]; then
                     mc_command_env_value "$line" "MEMCONTINUUM_LANG_EXTS"
-                    lang_glob_str="$MC_ENV_VALUE"
+                    if [ "$MC_ENV_PRESENT" -eq 1 ]; then
+                        lang_present=1
+                        lang_glob_str="$MC_ENV_VALUE"
+                    fi
                 fi
                 if [ -z "$never_glob_str" ]; then
                     mc_command_env_value "$line" "MEMCONTINUUM_NEVER_EXTS"
@@ -265,6 +346,9 @@ mc_update_recover_from_settings() {
         esac
     done < <(mc_update_project_lines_for_basename "$project" "newfile-nudge.sh" \
                  "$claude_dir/settings.local.json" "$claude_dir/settings.json")
+    if [ "$nudge_seen" -eq 1 ] && [ "$lang_present" -eq 0 ]; then
+        MC_RECOVERED_LANGS_OK=0
+    fi
     # Rationale-only wiring (no PreToolUse hooks at all) has no nudge line to
     # recover a code-root from -- fall back to the always-present write-side
     # line's own MEMCONTINUUM_CODE_ROOT (first root only; write-hooks.json.tmpl
@@ -285,6 +369,12 @@ mc_update_recover_from_settings() {
     if [ -n "$lang_glob_str" ]; then
         local py glob ext known_exts known_lang lang_list=""
         py="$(mc_update_resolve_python)" || py=""
+        if [ -z "$py" ]; then
+            # The extension globs are on the line, but turning them back into
+            # language NAMES needs this engine's own language table, which
+            # needs python. Without it the answer is unknown, not empty.
+            MC_RECOVERED_LANGS_OK=0
+        fi
         if [ -n "$py" ]; then
             lang_list="$(
                 MC_UPDATE_EXTS="$lang_glob_str" MC_UPDATE_ENGINE_ROOT="$ENGINE_ROOT" \
@@ -408,16 +498,24 @@ process_claude_dir() {
     # deleted, or replaced by an unrelated git repo), that is agreement on a
     # corpse: every hook wired here points at a store that is gone, and this
     # walk's job is to say so rather than print `ok`.
+    #
+    # Precedence, and the reason for it: the answers this command will never
+    # act on come FIRST, so the action column names why nothing will happen
+    # rather than naming some lesser drift that --apply would then try to fix
+    # and fail. store-missing and rules-foreign are both refusals the
+    # installer would only repeat more loudly; the migrate-needs-* answers are
+    # questions only a human can settle. Everything below them is drift this
+    # command can and will re-render.
     if ! mc_is_marked_store "$STORE"; then
         action="store-missing"
+    elif [ "$MC_RULES_STATE" = "foreign" ]; then
+        action="rules-foreign"
     elif [ "$LEGACY" -eq 1 ]; then
         action="$LEGACY_ACTION"
     elif [ "$stamp" != "$ENGINE_SHA" ]; then
         action="stale"
     elif [ "$store_match" = "no" ]; then
         action="store-mismatch"
-    elif [ "$MC_RULES_STATE" = "foreign" ]; then
-        action="rules-foreign"
     elif [ "$MC_RULES_STATE" = "missing" ]; then
         action="rules-missing"
     elif [ "$MC_RULES_STATE" = "stale" ]; then
@@ -502,7 +600,7 @@ trap 'rm -f "$SBOX_APPLY_LOG"' EXIT
 
 # --- targeted mode: --add-lang / --never-ext -------------------------------
 
-if [ -n "$ADD_LANG" ] || [ -n "$NEVER_EXT" ]; then
+if [ "$TARGETED" -eq 1 ]; then
     [ -n "$TARGET_REPO" ] || { echo "--add-lang/--never-ext requires an explicit repo: pass --repo PATH" >&2; exit 2; }
     if ! mc_repo_key "$TARGET_REPO"; then
         echo "not a git repository: $TARGET_REPO" >&2
@@ -658,12 +756,27 @@ fi
 
 MIGRATE_HINTS=""
 
+# --repo narrows the walk to that one repository's row -- which is also what
+# makes the per-row migration overrides (--claude-dir/--langs/--never-ext)
+# unambiguous. Without it, every wired row is walked.
+ONLY_KEY=""
+if [ -n "$TARGET_REPO" ]; then
+    if ! mc_repo_key "$TARGET_REPO"; then
+        echo "not a git repository: $TARGET_REPO" >&2
+        exit 1
+    fi
+    ONLY_KEY="$MC_REPO_KEY"
+fi
+
 while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
     case "$RAW_LINE" in \#*|"") continue ;; esac
     KEY="${RAW_LINE%%"$MC_TAB"*}"
     REST="${RAW_LINE#*"$MC_TAB"}"
     IFS="$MC_TAB" read -r ROW_DECISION ROW_WHEN NOTE <<<"$REST"
     [ "$ROW_DECISION" = "wired" ] || continue
+    if [ -n "$ONLY_KEY" ] && [ "$KEY" != "$ONLY_KEY" ]; then
+        continue
+    fi
 
     mc_note_field "$NOTE" "store"; STORE="$MC_NOTE_FIELD"
     mc_note_field "$NOTE" "project"; PROJECT="$MC_NOTE_FIELD"
@@ -681,22 +794,38 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
     fi
 
     LEGACY=0
+    CLAUDE_DIRS_EXPLICIT=0
     if [ -z "$CLAUDE_DIRS_SEMI" ]; then
         LEGACY=1
-        # KEY is a path key (starts with "/") iff it IS the repo's working
-        # tree path -- decide.sh writes the origin remote URL as KEY when
-        # one exists, else the path itself (mc_repo_key). A remote-keyed
-        # legacy row's repo path is simply not in the registry anywhere;
-        # this command does not guess it (a wrong guess would touch the
-        # wrong repo's .claude).
-        case "$KEY" in
-            /*) CLAUDE_DIRS_SEMI="$KEY/.claude" ;;
-            *)
-                print_row "$KEY" "(unknown)" "none" "unknown" "unknown" "unrecoverable"
-                echo "  legacy row, no claude-dirs recorded, and the key is a remote URL (not a path) -- this row's claude-dir cannot be recovered automatically. Fix: memcontinuum-decide.sh wired --repo PATH --store $STORE --project $PROJECT --claude-dir DIR [--code-root DIR ...] [--langs LIST]" >&2
-                continue
-                ;;
-        esac
+        if [ "${#OVERRIDE_CLAUDE_DIRS[@]}" -gt 0 ]; then
+            # The human named the set on the command line. That is the ONLY
+            # way a claude-dir set gets written for a legacy row: this
+            # command can see one .claude, and a project may well have two
+            # (a session home beside a bare checkout), so what it recovers is
+            # a PROPOSAL, never an answer.
+            CLAUDE_DIRS_SEMI=""
+            for OD in "${OVERRIDE_CLAUDE_DIRS[@]}"; do
+                [ -n "$OD" ] || continue
+                CLAUDE_DIRS_SEMI="${CLAUDE_DIRS_SEMI:+$CLAUDE_DIRS_SEMI;}$OD"
+            done
+            CLAUDE_DIRS_EXPLICIT=1
+        else
+            # KEY is a path key (starts with "/") iff it IS the repo's working
+            # tree path -- decide.sh writes the origin remote URL as KEY when
+            # one exists, else the path itself (mc_repo_key). A remote-keyed
+            # legacy row's repo path is simply not in the registry anywhere;
+            # this command does not guess it (a wrong guess would touch the
+            # wrong repo's .claude).
+            case "$KEY" in
+                /*) CLAUDE_DIRS_SEMI="$KEY/.claude" ;;
+                *)
+                    print_row "$KEY" "(unknown)" "none" "unknown" "unknown" "unrecoverable"
+                    echo "  legacy row, no claude-dirs recorded, and the key is a remote URL (not a path) -- this row's claude-dir cannot be recovered automatically. Fix: memcontinuum-decide.sh wired --repo PATH --store $STORE --project $PROJECT --claude-dir DIR [--code-root DIR ...] [--langs LIST]" >&2
+                    [ "$APPLY" -eq 1 ] && WALK_RC=1
+                    continue
+                    ;;
+            esac
+        fi
     fi
 
     # A legacy row's code-roots/langs/never are recovered ONCE, from the
@@ -718,13 +847,44 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
         [ -n "$CODE_ROOTS_SEMI" ] || CODE_ROOTS_SEMI="$MC_RECOVERED_CODE_ROOTS"
         [ -n "$LANGS_COMMA" ] || LANGS_COMMA="$MC_RECOVERED_LANGS"
         [ -n "$NEVER_COMMA" ] || NEVER_COMMA="$MC_RECOVERED_NEVER"
-        # A never-list that could not be read back as plain extensions is not
-        # migrated by guessing. The registry row is the thing every future
-        # re-render replays; writing a value this command had to invent would
-        # bake the invention in permanently.
-        if [ "$MC_RECOVERED_NEVER_OK" -eq 0 ]; then
+        # Command-line overrides win over anything recovered -- they are the
+        # human's answer to exactly the question the recovery could not.
+        [ -n "$LANGS_FLAG" ] && LANGS_COMMA="$LANGS_FLAG"
+        [ -n "$NEVER_EXT" ] && NEVER_COMMA="$NEVER_EXT"
+
+        # The migration PROPOSES and refuses; it never writes a value it had
+        # to invent. Whatever goes into the row is replayed by every future
+        # re-render, so an invention here is permanent.
+        MIGRATE_FIX_CMD="$DECIDE wired --repo $KEY --store $STORE --project $PROJECT --claude-dir $FIRST_CLAUDE_DIR [--claude-dir DIR ...]${CODE_ROOTS_SEMI:+ --code-root ...}"
+        if [ "$CLAUDE_DIRS_EXPLICIT" -eq 0 ]; then
+            LEGACY_ACTION="migrate-needs-claude-dirs"
+            MIGRATE_BLOCKED_HINT="this row records no claude-dirs. $FIRST_CLAUDE_DIR is a PROPOSAL -- the one this command can see -- and a project may have more than one (a session-home .claude beside a bare checkout, say). Name the full set and re-run:
+    $0 --apply --repo $KEY --claude-dir $FIRST_CLAUDE_DIR [--claude-dir DIR ...]
+  or record it directly with:
+    $MIGRATE_FIX_CMD"
+        elif [ "$MC_RECOVERED_LANGS_OK" -eq 0 ] && [ -z "$LANGS_FLAG" ]; then
+            LEGACY_ACTION="migrate-needs-langs"
+            MIGRATE_BLOCKED_HINT="the wiring at $FIRST_CLAUDE_DIR was rendered before the language set was written onto the hook line, so which languages this project indexes cannot be read back. That is UNKNOWN, not none -- recording it as none would turn code indexing off for a project that had it on. Name the set and re-run:
+    $0 --apply --repo $KEY --claude-dir $FIRST_CLAUDE_DIR --langs LANG[,LANG]"
+        elif [ "$MC_RECOVERED_NEVER_OK" -eq 0 ] && [ -z "$NEVER_EXT" ]; then
             LEGACY_ACTION="migrate-needs-never-exts"
-            MIGRATE_BLOCKED_HINT="the never-mention list rendered at $FIRST_CLAUDE_DIR is not a plain extension list, so it cannot be read back. Nothing was written. Name the list yourself: memcontinuum-decide.sh wired --repo $KEY --store $STORE --project $PROJECT --claude-dir $FIRST_CLAUDE_DIR --never-ext .ext[,.ext]"
+            MIGRATE_BLOCKED_HINT="the never-mention list rendered at $FIRST_CLAUDE_DIR is not a plain extension list, so it cannot be read back. Name it and re-run:
+    $0 --apply --repo $KEY --claude-dir $FIRST_CLAUDE_DIR --never-ext .ext[,.ext]"
+        fi
+
+        # A named claude-dir must ALREADY carry this project's wiring. This
+        # command records what is installed; it never wires a directory from
+        # scratch -- that is the skill's job, with a human answering.
+        if [ "$CLAUDE_DIRS_EXPLICIT" -eq 1 ]; then
+            mc_split_semi "$CLAUDE_DIRS_SEMI"
+            for OD in ${MC_SPLIT[@]+"${MC_SPLIT[@]}"}; do
+                if ! mc_wired_commands_for_project "$PROJECT" \
+                        "$OD/settings.local.json" "$OD/settings.json" >/dev/null; then
+                    echo "REFUSED: --claude-dir $OD carries no wiring for project $PROJECT. This command records claude-dirs that are already installed; it never wires one from scratch. Install it first (the memcontinuum skill does this), then re-run. Nothing was written." >&2
+                    WALK_RC=1
+                    continue 2
+                fi
+            done
         fi
     fi
 
@@ -752,8 +912,13 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
         : # refused above (migrate-needs-*) or the re-render failed -- the row
           # is left exactly as it was, and not_applied has already recorded it.
     elif [ "$LEGACY" -eq 1 ]; then
-        MIGRATE_HINTS="$MIGRATE_HINTS
+        if [ -n "$MIGRATE_BLOCKED_HINT" ]; then
+            MIGRATE_HINTS="$MIGRATE_HINTS
+  $KEY ($LEGACY_ACTION): $MIGRATE_BLOCKED_HINT"
+        else
+            MIGRATE_HINTS="$MIGRATE_HINTS
   $KEY: run with --apply to migrate this row to the new registry format"
+        fi
     fi
 done < "$DECISIONS"
 
