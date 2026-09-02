@@ -133,7 +133,11 @@ class TestBootstrapInstall(BootstrapCase):
         about whether the installed line actually runs)."""
         self.assertEqual(self.bootstrap().returncode, 0)
         (cmd,) = self.our_commands()
-        self.assertEqual(cmd, f"bash '{DETECT_SH}'")
+        # One env token in front: the MACHINE render fingerprint, so
+        # memcontinuum-update.sh --machine can tell whether what is installed
+        # in ~/.claude is still current. Everything after it is unchanged.
+        self.assertRegex(cmd, r"^MEMCONTINUUM_RENDERED=[0-9a-f]{12} bash '")
+        self.assertTrue(cmd.endswith(f"bash '{DETECT_SH}'"), cmd)
         self.assertNotIn("MEMCONTINUUM_HOME=", cmd)
 
     def test_silent_when_the_shared_lib_is_missing(self):
@@ -529,6 +533,36 @@ class TestDecisionRegistry(BootstrapCase):
                 return line
         return None
 
+    def update_line_of(self, repo):
+        out = run(STATE_SH, [str(repo)], self.home, self.mc_home).stdout
+        for line in out.splitlines():
+            if line.startswith("update:"):
+                return line
+        return None
+
+    @staticmethod
+    def _wire_stamped(repo, project, rendered):
+        """Like _wire, but with a MEMCONTINUUM_PROJECT identity marker and a
+        MEMCONTINUUM_RENDERED stamp on every command line -- the shape D1
+        (updater workstream) actually renders, needed to exercise D5's
+        stamp-vs-engine comparison (the bare `_wire` fixture above predates
+        the stamp entirely, which is itself one of the cases below)."""
+        claude = Path(repo, ".claude")
+        claude.mkdir(exist_ok=True)
+        basenames = (
+            "ledger-post-edit.sh", "precompact-persist.sh",
+            "sessionstart-remind.sh", "userprompt-remind.sh",
+            "sessionend-stamp.sh",
+        )
+        items = [
+            {"type": "command",
+             "command": f"MEMCONTINUUM_RENDERED={rendered} MEMCONTINUUM_PROJECT={project} bash x/{b}"}
+            for b in basenames
+        ]
+        (claude / "settings.local.json").write_text(
+            json.dumps({"hooks": {"PostToolUse": [{"hooks": items}]}}),
+            encoding="utf-8")
+
     @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
     def test_stats_hint_line_names_the_liveness_command(self):
         """Deliverable 3 (liveness metric): state.sh's own contract stays
@@ -799,6 +833,102 @@ class TestDecisionRegistry(BootstrapCase):
         plain.mkdir()
         proc = run(DECIDE_SH, ["declined", "--repo", str(plain)], self.home, self.mc_home)
         self.assertNotEqual(proc.returncode, 0)
+
+    # --- D5 (updater workstream): state.sh's stamp-vs-engine hint --------
+
+    def _engine_sha(self):
+        """The stamp this checkout renders with, asked of the one function
+        that computes it (mc_render_fingerprint) -- a test that re-derives it
+        would only prove the two copies agree."""
+        return subprocess.run(
+            [MC_BASH, "-c",
+             '. "$1"/scripts/mc-registry-lib.sh; mc_render_fingerprint repo "$1"; '
+             'printf "%s" "$MC_RENDER_FINGERPRINT"',
+             "_", str(TOOLS_DIR)],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_no_update_hint_when_stamp_matches_engine(self):
+        self.assertEqual(self.bootstrap().returncode, 0)
+        repo = git_repo(str(Path(self.tmp) / "repo"))
+        self._wire_stamped(repo, "proj", self._engine_sha())
+        run(DECIDE_SH, ["wired", "--repo", repo, "--project", "proj"], self.home, self.mc_home)
+        self.assertIsNone(self.update_line_of(repo))
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_update_hint_when_stamp_is_stale(self):
+        self.assertEqual(self.bootstrap().returncode, 0)
+        repo = git_repo(str(Path(self.tmp) / "repo"))
+        self._wire_stamped(repo, "proj", "deadbee")
+        run(DECIDE_SH, ["wired", "--repo", repo, "--project", "proj"], self.home, self.mc_home)
+        line = self.update_line_of(repo)
+        self.assertIsNotNone(line)
+        self.assertIn("rendered by deadbee", line)
+        self.assertIn(f"engine at {self._engine_sha()}", line)
+        self.assertIn("scripts/memcontinuum-update.sh", line)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_update_hint_when_stamp_is_absent_pre_d1_render(self):
+        """A pre-D1 render has no MEMCONTINUUM_RENDERED token at all --
+        reads as "unknown", same as scripts/repo-init.sh's own fallback for
+        a non-git engine checkout, never a crash."""
+        self.assertEqual(self.bootstrap().returncode, 0)
+        repo = git_repo(str(Path(self.tmp) / "repo"))
+        self._wire(repo)  # the bare, pre-stamp fixture (no MEMCONTINUUM_RENDERED)
+        run(DECIDE_SH, ["wired", "--repo", repo], self.home, self.mc_home)
+        line = self.update_line_of(repo)
+        self.assertIsNotNone(line)
+        self.assertIn("rendered by unknown", line)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_update_hint_reads_the_claude_dirs_the_row_records(self):
+        """A project's wiring does not have to live in <repo>/.claude -- a
+        session-home .claude beside a bare checkout is a supported shape, and
+        the registry row names where it actually is. Looking only in
+        <repo>/.claude meant the drift hint went permanently silent for
+        exactly the repositories most likely to drift."""
+        self.assertEqual(self.bootstrap().returncode, 0)
+        repo = git_repo(str(Path(self.tmp) / "repo"))
+        elsewhere = Path(self.tmp) / "session-home" / ".claude"
+        elsewhere.mkdir(parents=True)
+        self._wire_stamped(elsewhere.parent, "proj", "deadbee")
+        run(DECIDE_SH, ["wired", "--repo", repo, "--project", "proj",
+                        "--claude-dir", str(elsewhere)], self.home, self.mc_home)
+        line = self.update_line_of(repo)
+        self.assertIsNotNone(line, run(STATE_SH, [str(repo)], self.home, self.mc_home).stdout)
+        self.assertIn("rendered by deadbee", line)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_update_hint_stays_silent_when_the_recorded_claude_dir_is_current(self):
+        self.assertEqual(self.bootstrap().returncode, 0)
+        repo = git_repo(str(Path(self.tmp) / "repo"))
+        elsewhere = Path(self.tmp) / "session-home" / ".claude"
+        elsewhere.mkdir(parents=True)
+        self._wire_stamped(elsewhere.parent, "proj", self._engine_sha())
+        run(DECIDE_SH, ["wired", "--repo", repo, "--project", "proj",
+                        "--claude-dir", str(elsewhere)], self.home, self.mc_home)
+        self.assertIsNone(self.update_line_of(repo))
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_state_sh_runs_no_python(self):
+        """state.sh's own contract: it names the commands, it never runs
+        python itself. Guarded with a PATH holding no python at all and a
+        MEMCONTINUUM_PYTHON pointed at a binary that fails loudly if run."""
+        self.assertEqual(self.bootstrap().returncode, 0)
+        repo = git_repo(str(Path(self.tmp) / "repo"))
+        self._wire_stamped(repo, "proj", "deadbee")
+        run(DECIDE_SH, ["wired", "--repo", repo, "--project", "proj"], self.home, self.mc_home)
+        trap = Path(self.tmp) / "python-trap"
+        trap.write_text("#!/bin/sh\necho PYTHON-WAS-RUN >&2\nexit 3\n")
+        trap.chmod(0o755)
+        env = clean_env(self.home, self.mc_home)
+        env["MEMCONTINUUM_PYTHON"] = str(trap)
+        proc = subprocess.run(["bash", str(STATE_SH), str(repo)],
+                              capture_output=True, text=True, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("PYTHON-WAS-RUN", proc.stdout + proc.stderr)
+        self.assertIn("rendered by deadbee", proc.stdout)
 
 
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)

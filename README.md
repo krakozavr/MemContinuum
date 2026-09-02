@@ -316,6 +316,62 @@ so `reindex` by hand is only for edits you have not committed yet; and
 an empty list that reads like "nothing found". Run any command with `--help` for
 its full flag list.
 
+**Keeping a wired repo up to date.** A fix that only touches a script (a hook,
+`memidx.py`, `memlint.py`) reaches every wired repo the moment you pull —
+nothing to run. A fix that changes what gets *rendered* into a repo (the hook
+lines in its settings, its rules file, its copy of the search skill) needs
+`scripts/memcontinuum-update.sh` re-run there. `scripts/memcontinuum-state.sh`
+prints an `update:` line naming the repair command when this repo's wiring is
+out of date.
+
+Read its silence narrowly, though. What that line compares is the *stamp on
+this repo's wired hook line* against the engine's fingerprint — so silence
+means the hook lines were rendered by this checkout, and nothing more. It does
+not notice a rules file that has gone missing, a `store=` that no longer
+matches what is wired, or a store that has been renamed or deleted out from
+under the wiring. The check that looks at all of those is
+`scripts/memcontinuum-update.sh --dry-run`, which writes nothing and prints a
+row per repository and claude-dir.
+
+That distinction is real, not a rule of thumb. Each rendered artifact carries
+a fingerprint of the things it was rendered *from* — the templates, the
+installer, the skill copies — so pulling a change to a hook script leaves
+every repository reading as current, and changing a template flips exactly the
+repositories that need re-rendering.
+
+The machine-wide pieces (the detector, the skill in your own user-level Claude
+directory) are tracked the same way but separately, under `--machine`: a
+change there is reported where the one command that fixes it applies, rather
+than as drift in every repository you have ever wired. Setup records which
+directory it installed those into, so if you gave it `--claude-dir`, that is
+the one reported and refreshed — never a second copy at the default path.
+
+Run `memcontinuum-update.sh` with no flags and it only prints a table: one line
+per repository and claude-dir, saying what is current, what has drifted, and
+what it will not touch. `--apply` does the work. It can re-render wiring; it
+can never create a store — if the store a row names has been renamed or
+deleted, the row is reported `store-missing` and skipped, because re-running
+the installer against a missing store would seed a new, empty one in its
+place.
+
+Two things it will not decide for you. **A project's set of claude-dirs is
+named by a person, never discovered.** A project can have more than one (a
+session-home `.claude` beside a bare checkout, say), and nothing on disk says
+how many — so for a repository wired before the registry recorded them, the
+table *proposes* the one it can find and waits: you name the full set with
+`--apply --repo PATH --claude-dir DIR [--claude-dir DIR ...]`, and a second
+claude-dir only ever joins a repository's record by being named on such a
+command line. Likewise, wiring old enough not to record which languages it
+indexes is reported as needing `--langs`, not quietly recorded as indexing
+none — that would switch off code indexing for a project that had it on.
+
+**A repository has one set of languages, and it applies to all of its
+claude-dirs.** So when such a repository is being brought onto the new record
+format, each of its claude-dirs is read separately, and if they turn out to
+disagree — different code roots, different languages — the table says so and
+stops rather than picking one and re-rendering the others to match. You settle
+it with `--code-root`, `--langs` and `--set-never-ext` on the command line.
+
 ## Languages
 
 The code index handles **Swift and Python**, both natively — Swift with a tuned

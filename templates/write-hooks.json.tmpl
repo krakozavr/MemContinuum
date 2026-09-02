@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "MEMCONTINUUM_ROOT={{STORE}} {{CODE_ROOT_ENV}}MEMCONTINUUM_PROJECT={{PROJECT}} MEMCONTINUUM_PYTHON={{PYTHON}} bash {{HOOKS_DIR}}/ledger-post-edit.sh"
+            "command": "MEMCONTINUUM_RENDERED={{RENDERED}} MEMCONTINUUM_ROOT={{STORE}} {{CODE_ROOT_ENV}}MEMCONTINUUM_PROJECT={{PROJECT}} MEMCONTINUUM_PYTHON={{PYTHON}} bash {{HOOKS_DIR}}/ledger-post-edit.sh"
           }
         ]
       }
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "MEMCONTINUUM_ROOT={{STORE}} {{CODE_ROOT_ENV}}MEMCONTINUUM_PROJECT={{PROJECT}} MEMCONTINUUM_PYTHON={{PYTHON}} bash {{HOOKS_DIR}}/precompact-persist.sh"
+            "command": "MEMCONTINUUM_RENDERED={{RENDERED}} MEMCONTINUUM_ROOT={{STORE}} {{CODE_ROOT_ENV}}MEMCONTINUUM_PROJECT={{PROJECT}} MEMCONTINUUM_PYTHON={{PYTHON}} bash {{HOOKS_DIR}}/precompact-persist.sh"
           }
         ]
       }
@@ -26,7 +26,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "MEMCONTINUUM_ROOT={{STORE}} {{CODE_ROOT_ENV}}MEMCONTINUUM_PROJECT={{PROJECT}} MEMCONTINUUM_PYTHON={{PYTHON}} bash {{HOOKS_DIR}}/sessionstart-remind.sh"
+            "command": "MEMCONTINUUM_RENDERED={{RENDERED}} MEMCONTINUUM_ROOT={{STORE}} {{CODE_ROOT_ENV}}MEMCONTINUUM_PROJECT={{PROJECT}} MEMCONTINUUM_PYTHON={{PYTHON}} bash {{HOOKS_DIR}}/sessionstart-remind.sh"
           }
         ]
       }
@@ -36,7 +36,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "MEMCONTINUUM_ROOT={{STORE}} {{CODE_ROOT_ENV}}MEMCONTINUUM_PROJECT={{PROJECT}} MEMCONTINUUM_PYTHON={{PYTHON}} bash {{HOOKS_DIR}}/userprompt-remind.sh"
+            "command": "MEMCONTINUUM_RENDERED={{RENDERED}} MEMCONTINUUM_ROOT={{STORE}} {{CODE_ROOT_ENV}}MEMCONTINUUM_PROJECT={{PROJECT}} MEMCONTINUUM_PYTHON={{PYTHON}} bash {{HOOKS_DIR}}/userprompt-remind.sh"
           }
         ]
       }
@@ -46,7 +46,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "MEMCONTINUUM_ROOT={{STORE}} {{CODE_ROOT_ENV}}MEMCONTINUUM_PROJECT={{PROJECT}} MEMCONTINUUM_PYTHON={{PYTHON}} bash {{HOOKS_DIR}}/sessionend-stamp.sh"
+            "command": "MEMCONTINUUM_RENDERED={{RENDERED}} MEMCONTINUUM_ROOT={{STORE}} {{CODE_ROOT_ENV}}MEMCONTINUUM_PROJECT={{PROJECT}} MEMCONTINUUM_PYTHON={{PYTHON}} bash {{HOOKS_DIR}}/sessionend-stamp.sh"
           }
         ]
       }

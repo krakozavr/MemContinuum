@@ -4,15 +4,22 @@ into <repo>/.claude/rules/memcontinuum.md. This file only checks the
 template artifact itself; repo-init.sh's render step is out of scope here
 (it is mid-change on another branch).
 """
+import re
 import unittest
 from pathlib import Path
 
 TOOLS_DIR = Path(__file__).resolve().parent.parent
 TEMPLATE = TOOLS_DIR / "templates" / "memcontinuum-rules.md"
 
-IDENTITY_MARKER = (
-    "<!-- memcontinuum-rules v1 — rendered by MemContinuum repo-init; "
-    "do not hand-edit -->"
+# This file's first line IS the identity marker -- it is where that string is
+# defined, and everything else (the installer, the re-render walk, the other
+# tests) reads it from here. So this test checks its SHAPE rather than
+# comparing it to a second copy of itself, which would only prove the two
+# copies match. The shape is what has to hold: an HTML comment (invisible when
+# the rules file is read as markdown), version-tagged so a future format can
+# be told apart, naming the tool and saying not to hand-edit.
+IDENTITY_MARKER_SHAPE = re.compile(
+    r"^<!--\s*memcontinuum-rules v\d+\b.*\bdo not hand-edit\s*-->$"
 )
 
 
@@ -21,11 +28,9 @@ class TestRoutingRuleTemplate(unittest.TestCase):
         self.assertTrue(TEMPLATE.is_file(), f"missing {TEMPLATE}")
 
     def test_starts_with_identity_marker(self):
-        text = TEMPLATE.read_text()
-        self.assertTrue(
-            text.startswith(IDENTITY_MARKER),
-            f"first line must be the identity marker, got: {text.splitlines()[:1]!r}",
-        )
+        first = TEMPLATE.read_text().splitlines()[0]
+        self.assertRegex(first, IDENTITY_MARKER_SHAPE)
+        self.assertIn("MemContinuum", first)
 
     def test_store_placeholder_present_exactly_once(self):
         text = TEMPLATE.read_text()

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tests/run_bash32.sh -- macOS-port verification harness (docs/DESIGN.md SS8
-# port note, 2026-08-30). Re-runs the hook test suites (test_hooks.py,
-# test_write_hooks.py) with every hook subprocess invoked under a REAL
+# port note, 2026-08-30). Re-runs the shell-driving test suites with every
+# subprocess invoked under a REAL
 # bash 3.2 binary instead of whatever "bash" resolves to on this machine --
 # stock macOS still ships bash 3.2.57 today, and it is the actual bar the
 # hooks/*.sh port targets, not `bash --posix` under a modern bash (which
@@ -12,7 +12,7 @@
 # Usage:
 #   tests/run_bash32.sh                 # builds bash 3.2.57 into
 #                                        # ~/.cache/bash32 if not already
-#                                        # there, then runs both suites
+#                                        # there, then runs the suites
 #                                        # under it.
 #   tests/run_bash32.sh --build-only    # only (re)build bash 3.2.57.
 #   MC_BASH32=/path/to/bash tests/run_bash32.sh
@@ -137,8 +137,22 @@ if [ -z "${MEMCONTINUUM_PYTHON:-}" ]; then
     exit 1
 fi
 
+# The enrolled suites. The two hook suites were the original pair; the four
+# installer/registry suites joined them once repo-init.sh, memcontinuum-
+# setup.sh, memcontinuum-decide.sh, memcontinuum-state.sh and
+# memcontinuum-update.sh grew enough shell to be worth the same bar the
+# hooks are held to -- they are the scripts a macOS user runs by hand, and
+# `bash -n` alone never catches a bash-4-ism on a path that is not taken.
+#
+# MC_BASH is what each suite invokes the entry-point script with. The nested
+# calls (memcontinuum-update.sh -> repo-init.sh -> memcontinuum-decide.sh)
+# follow on their own: those scripts shell out through "$BASH", the path of
+# the interpreter already running them, rather than a bare `bash` off PATH
+# that would hop back to the system's bash 5 halfway through.
+BASH32_SUITES="tests.test_hooks tests.test_write_hooks tests.test_update tests.test_setup tests.test_repo_init tests.test_routing_rule_template"
+
 cd "$REPO_ROOT"
-MC_BASH="$BASH32_BIN" PYTHONPATH= "$MEMCONTINUUM_PYTHON" -m unittest tests.test_hooks tests.test_write_hooks
+MC_BASH="$BASH32_BIN" PYTHONPATH= "$MEMCONTINUUM_PYTHON" -m unittest $BASH32_SUITES
 RC=$?
 
 log ""

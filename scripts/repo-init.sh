@@ -36,7 +36,40 @@ MEMIDX="$ENGINE_ROOT/memidx.py"
 MEMLINT="$ENGINE_ROOT/memlint.py"
 SKILL_SRC="$ENGINE_ROOT/skills/memory-search/SKILL.md"
 
+# Sourced up here rather than inside the record-the-decision block at the end:
+# this script needs its store predicates (mc_is_git_repo/mc_is_marked_store)
+# from the very first validation onwards, and having ONE definition of "this
+# path still holds a store" shared with scripts/memcontinuum-update.sh is the
+# point -- the re-render walk and the installer must agree, by construction,
+# on what a store is. The library only defines functions when sourced.
+# shellcheck source=./mc-registry-lib.sh
+. "$SCRIPT_DIR/mc-registry-lib.sh" || { echo "ERROR: missing $SCRIPT_DIR/mc-registry-lib.sh -- incomplete checkout" >&2; exit 1; }
+
+# The bash running THIS script, for the one script it shells out to (see
+# scripts/memcontinuum-update.sh for the same note): `bash` off PATH would
+# hop interpreters mid-install, which is what kept the bash 3.2 harness from
+# reaching any of these scripts.
+MC_BASH_BIN="${BASH:-bash}"
+
 OUR_HOOK_SCRIPTS="pre-edit-chain.sh newfile-nudge.sh ledger-post-edit.sh precompact-persist.sh sessionstart-remind.sh userprompt-remind.sh sessionend-stamp.sh"
+
+# The stamp that goes onto every hook line, the rules file, and the installed
+# skill copy, so a later `memcontinuum-update.sh` can tell a current rendered
+# artifact from a stale one. It is a fingerprint of this checkout's RENDER
+# INPUTS -- templates, this installer, the settings merge, the copied skills,
+# the machine-layer installer -- not the checkout's HEAD commit: pulling a fix
+# to a hook SCRIPT changes nothing that was rendered here (hook lines run
+# those scripts by absolute path), so it must not make every wired repo look
+# stale. See mc_render_fingerprint in scripts/mc-registry-lib.sh.
+#
+# Derived from THIS checkout, never the cwd -- ENGINE_ROOT is always where
+# this script itself lives, so a `--code-root`-only invocation from an
+# unrelated repo still stamps correctly. The literal "unknown" when it cannot
+# be computed at all (no sha256 tool, an incomplete checkout); an
+# absent/unknown stamp reads as "re-render to find out" downstream, never as
+# an error here.
+mc_render_fingerprint repo "$ENGINE_ROOT" || :
+RENDERED_SHA="$MC_RENDER_FINGERPRINT"
 
 PROJECT=""
 STORE=""
@@ -51,6 +84,8 @@ BOOTSTRAP_VENV_DIR=""
 LANGS_FLAG=""
 NEVER_EXT_FLAG=""
 NON_INTERACTIVE=0
+RECORD_DECISION=0
+ADOPT_ONLY=0
 declare -a CODE_ROOTS=()
 
 usage() {
@@ -58,7 +93,7 @@ usage() {
 Usage: repo-init.sh --project NAME [--store DIR] [--code-root DIR ...]
                    [--claude-dir DIR] [--python PATH]
                    [--bootstrap-venv [DIR]] [--langs LIST] [--never-ext LIST]
-                   [--non-interactive]
+                   [--non-interactive] [--adopt-only]
                    [--dry-run] [--force]
 
   --project NAME     project namespace (used for --project everywhere, and
@@ -121,6 +156,36 @@ Usage: repo-init.sh --project NAME [--store DIR] [--code-root DIR ...]
                       never omitted: a set-but-empty value matches nothing,
                       which is distinct from a legacy line where the variable
                       is unset). For scripted/CI runs.
+  --record-decision   after a successful (non-dry-run) install, record
+                      "wired" in the decision registry (same as running
+                      memcontinuum-decide.sh wired by hand), so the
+                      SessionStart detector never asks about this repo
+                      again. OFF by default: recording a human's consent is
+                      the memcontinuum skill's job, not this installer's --
+                      pass this only from a driven flow where a human has
+                      already said yes. Refuses to record (a warning, never
+                      a failure of the install itself) when --claude-dir is
+                      not inside a git working tree, same as
+                      memcontinuum-decide.sh's own requirement. When a row
+                      already exists for this repo, its recorded
+                      claude-dirs/code-roots are UNIONED with this install's
+                      (never dropped) -- installing a second claude-dir for
+                      the same project must not erase the first from the
+                      registry.
+  --adopt-only        wire an EXISTING store; never create one. Unless
+                      --store is a directory that is already a git working
+                      tree carrying this tool's markers (a topics/incidents/
+                      concepts directory, or a README naming MemContinuum),
+                      this run is refused with "store-missing" before it
+                      writes anything at all -- no store tree, no git init,
+                      no hook wiring. --dry-run is refused the same way: a
+                      preview of an install that must never happen would only
+                      mislead. Pass this whenever the store is supposed to
+                      exist already and a fresh one would be wrong -- the
+                      re-render command (scripts/memcontinuum-update.sh)
+                      always does, so a registry row naming a store that was
+                      renamed or deleted can never quietly get a new, empty
+                      store seeded at the old path.
   --dry-run           print everything this script would do; write nothing
                       (except --bootstrap-venv's venv, see above).
   --force             allow --store to sit inside another git repo's working
@@ -167,19 +232,10 @@ nearest_existing_ancestor() {
     printf '%s' "$d"
 }
 
-# is_git_repo DIR -- true iff DIR is a git working tree, root OR linked
-# worktree (fix-round-4 R8). A linked worktree (`git worktree add`) has a
-# .git FILE (a "gitdir: <path>" pointer), not a directory -- every prior
-# `[ -d "$STORE/.git" ]` check in this script misread that as "not a git
-# repo at all", refusing a worktree store outright (or, under --force,
-# seeding fresh content on top of one). `[ -e ]` accepts either shape;
-# `rev-parse --is-inside-work-tree` confirms it is actually a working tree
-# (not, say, some unrelated directory that merely happens to contain a
-# file or dir named .git) before this counts as a real answer.
-is_git_repo() {
-    [ -e "$1/.git" ] || return 1
-    git -C "$1" rev-parse --is-inside-work-tree >/dev/null 2>&1
-}
+# is_git_repo DIR -- see mc_is_git_repo in scripts/mc-registry-lib.sh (the one
+# definition, shared with the re-render walk). Kept as a local name because
+# this script reads better with it, not as a second implementation.
+is_git_repo() { mc_is_git_repo "$@"; }
 
 # git_hooks_dir_for DIR -- prints the hooks directory git actually consults
 # for commits made in DIR (absolute). `rev-parse --git-path hooks` is the
@@ -277,6 +333,34 @@ bootstrap_venv() {
     return 0
 }
 
+# mc_union_semi A B -- prints A's ';'-joined list with every item from B's
+# not already in A appended, deduplicated, order preserved (A's own order
+# first). Declared/assigned on separate statements deliberately -- a single
+# `local a="$1" out="$a"` reads "$a" as still-unset under `set -u` in this
+# bash (reproduced; see scripts/memcontinuum-update.sh's add_semi for the
+# same fix with the same reasoning). Used only by --record-decision below,
+# to union THIS install's claude-dir/code-roots/langs/never-exts into
+# whatever a pre-existing registry row already recorded, rather than
+# replacing it (a second claude-dir installed for the same project must not
+# erase the first from the registry).
+mc_union_semi() {
+    local a b out tok union_ifs
+    a="$1"; b="$2"; out="$a"
+    union_ifs="$IFS"
+    IFS=';'
+    for tok in $b; do
+        IFS="$union_ifs"
+        [ -n "$tok" ] || continue
+        case ";$out;" in
+            *";$tok;"*) ;;
+            *) out="${out:+$out;}$tok" ;;
+        esac
+        IFS=';'
+    done
+    IFS="$union_ifs"
+    printf '%s' "$out"
+}
+
 # --- arg parsing -----------------------------------------------------------
 
 # A two-argument option with no value must ERROR, not loop: a failed
@@ -303,6 +387,8 @@ while [ $# -gt 0 ]; do
         --langs) mc_need_value "$@"; LANGS_FLAG="$2"; shift 2 ;;
         --never-ext) mc_need_value "$@"; NEVER_EXT_FLAG="$2"; shift 2 ;;
         --non-interactive) NON_INTERACTIVE=1; shift ;;
+        --record-decision) RECORD_DECISION=1; shift ;;
+        --adopt-only) ADOPT_ONLY=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         --force) FORCE=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -430,6 +516,24 @@ if [ -n "$NEVER_EXT_FLAG" ] && [ "${#CODE_ROOTS_ABS[@]}" -eq 0 ]; then
     echo "note: --never-ext $NEVER_EXT_FLAG given with no --code-root -- there is no new-file reminder to silence, ignoring"
 fi
 
+# --adopt-only: this run may WIRE an existing store, never CREATE one.
+# Checked first, before every other store check below, for two reasons: it is
+# the strictest of them (an --adopt-only run that gets past here has a real
+# store, so none of the seeding paths can fire at all), and it must report
+# ITS OWN reason. Ordered after the nesting check, a vanished store whose
+# nearest existing ancestor happens to sit inside some other git repo would
+# die with "your --store is inside another repo, pass --force" -- advice that
+# is both wrong and dangerous here, since --force would then seed a store
+# where one must never be created.
+#
+# The whole point is the re-render walk (scripts/memcontinuum-update.sh),
+# which always passes this: a registry row naming a store that has since been
+# renamed or deleted must NOT cause a fresh, empty store to appear at the old
+# path and be wired up as if nothing had happened. --dry-run refuses too.
+if [ "$ADOPT_ONLY" -eq 1 ] && ! mc_is_marked_store "$STORE"; then
+    fail "store-missing: --adopt-only was given, but $STORE is not an existing MemContinuum store (it must be a git working tree carrying this tool's markers -- a topics/incidents/concepts directory, or a README naming MemContinuum). Nothing was written. If the store was renamed or moved, point --store at where it lives now; if it was deleted, restore it from its own git history. This mode never creates a store." 15
+fi
+
 # store dir must not already live inside a DIFFERENT git repo's working
 # tree, unless it is already its own repo (the normal re-run case, a
 # linked worktree included -- R8) or --force was given.
@@ -454,16 +558,9 @@ fi
 # since --force's job is "allow nesting", not "allow adopting the wrong repo".
 STORE_IS_ADOPTED=0
 if is_git_repo "$STORE"; then
-    STORE_HAS_SHAPE=0
-    for d in topics incidents concepts; do
-        [ -d "$STORE/$d" ] && STORE_HAS_SHAPE=1
-    done
-    if [ "$STORE_HAS_SHAPE" -eq 0 ] && [ -f "$STORE/README.md" ]; then
-        case "$(cat "$STORE/README.md" 2>/dev/null)" in
-            *MemContinuum*) STORE_HAS_SHAPE=1 ;;
-        esac
-    fi
-    if [ "$STORE_HAS_SHAPE" -eq 0 ]; then
+    # mc_is_marked_store (scripts/mc-registry-lib.sh) is the one definition of
+    # "this path holds a store", shared with the re-render walk.
+    if ! mc_is_marked_store "$STORE"; then
         fail "--store $STORE is an existing git repo with none of this tool's markers (no topics/incidents/concepts directory, no README mentioning MemContinuum) -- refusing to seed store directories and a replacement post-commit hook into what looks like an unrelated repo. Point --store at a location that does not exist yet, or at an existing MemContinuum store." 9
     fi
     STORE_IS_ADOPTED=1
@@ -475,6 +572,26 @@ STORE_PARENT_ANCESTOR="$(nearest_existing_ancestor "$(dirname "$STORE")")"
 
 CLAUDE_DIR_ANCESTOR="$(nearest_existing_ancestor "$CLAUDE_DIR")"
 [ -w "$CLAUDE_DIR_ANCESTOR" ] || fail "cannot write --claude-dir $CLAUDE_DIR (nearest existing ancestor $CLAUDE_DIR_ANCESTOR is not writable)" 5
+
+# D4 (updater workstream): refuse a foreign rules file BEFORE any mutation
+# below (fix-round-4 F10's own principle -- a refusal after hooks are
+# already wired would report failure from a half-finished install).
+# templates/memcontinuum-rules.md's first line is the identity marker; an
+# existing $CLAUDE_DIR/rules/memcontinuum.md is only ever overwritten when
+# its own first line matches -- a hand-authored or foreign file at that path
+# is left alone, loudly.
+# Read from the template that defines it (mc_rules_identity_marker), never
+# copied into this file: one place says what a rendered rules file looks like.
+mc_rules_identity_marker "$ENGINE_ROOT" \
+    || fail "cannot read $TEMPLATES_DIR/memcontinuum-rules.md (or it is empty) -- incomplete checkout" 3
+RULES_IDENTITY_MARKER="$MC_RULES_MARKER"
+RULES_DEST="$CLAUDE_DIR/rules/memcontinuum.md"
+if [ -f "$RULES_DEST" ]; then
+    RULES_DEST_FIRST_LINE="$(head -n 1 "$RULES_DEST" 2>/dev/null)"
+    if [ "$RULES_DEST_FIRST_LINE" != "$RULES_IDENTITY_MARKER" ]; then
+        fail "$RULES_DEST already exists and was not rendered by this installer (first line does not match the identity marker) -- refusing to overwrite a hand-authored or foreign rules file. Move it aside first if you want repo-init to render one here." 14
+    fi
+fi
 
 # --- code census + consent dialogue (Task 10, Anatomy M1) -----------------
 #
@@ -844,6 +961,7 @@ MC_INSTALL_SCRIPTS_DIR="$SCRIPT_DIR" \
 MC_INSTALL_ENGINE_ROOT="$ENGINE_ROOT" \
 MC_INSTALL_LANGS="$CHOSEN_LANGS" \
 MC_INSTALL_NEVER_EXTS="$NEVER_EXTS_RAW" \
+MC_INSTALL_RENDERED="$RENDERED_SHA" \
 "$PYTHON_BIN" - <<'PYEOF'
 import json
 import os
@@ -858,6 +976,7 @@ hooks_dir = os.environ["MC_INSTALL_HOOKS_DIR"]
 templates_dir = os.environ["MC_INSTALL_TEMPLATES_DIR"]
 code_roots = [l for l in os.environ.get("MC_INSTALL_CODE_ROOTS", "").split("\n") if l]
 dry_run = os.environ.get("MC_INSTALL_DRY_RUN", "0") == "1"
+rendered_sha = os.environ["MC_INSTALL_RENDERED"]
 
 # Fix-round-4 F8: the ONE settings merge implementation, shared with
 # memcontinuum-setup.sh -- see scripts/mc_settings_merge.py's own docstring.
@@ -969,6 +1088,7 @@ write_rendered = render(write_tmpl, {
     "PYTHON": esc_cmd(python_bin),
     "HOOKS_DIR": esc_cmd(hooks_dir),
     "CODE_ROOT_ENV": code_root_env,
+    "RENDERED": esc_cmd(rendered_sha),
 })
 try:
     write_block = json.loads(write_rendered)
@@ -993,6 +1113,7 @@ if code_roots:
             "STRIP_PREFIX": esc_cmd(strip_prefix),
             "PYTHON": esc_cmd(python_bin),
             "HOOKS_DIR": esc_cmd(hooks_dir),
+            "RENDERED": esc_cmd(rendered_sha),
         }))
     filters_text = ",\n".join(pairs)
 
@@ -1030,6 +1151,7 @@ if code_roots:
             "LANG_EXTS_ENV": lang_exts_env,
             "NEVER_EXTS_ENV": never_exts_env,
             "KNOWN_EXTS_CMD": known_exts_cmd,
+            "RENDERED": esc_cmd(rendered_sha),
         }))
     nudge_filters_text = ",\n".join(nudge_pairs)
 
@@ -1086,12 +1208,49 @@ PYEOF
 MERGE_RC=$?
 [ $MERGE_RC -eq 0 ] || fail "hook wiring failed (see above)" 6
 
+# --- 4b. render the project routing rule (D4, TOP-0117/INC-0105) ----------
+#
+# Rendered on EVERY install (fresh or re-run), not write-if-absent like the
+# store README above -- this file's whole point is to always name the
+# CURRENT store, and repo-init is its only writer (the identity-marker
+# refusal above already ruled out clobbering anything foreign). {{STORE}}
+# is the template's one placeholder; the stamp line goes right after the
+# identity-marker first line so a `head -1` identity check (above, and any
+# future one) keeps matching a stamped file.
+
+step "rules file: $RULES_DEST (rendered from templates/memcontinuum-rules.md)"
+if [ "$DRY_RUN" -eq 0 ]; then
+    mkdir -p "$CLAUDE_DIR/rules" || fail "could not create $CLAUDE_DIR/rules"
+    RULES_TMPL="$(cat "$TEMPLATES_DIR/memcontinuum-rules.md")"
+    RULES_TMPL="${RULES_TMPL//\{\{STORE\}\}/$STORE}"
+    RULES_FIRST_LINE="${RULES_TMPL%%$'\n'*}"
+    RULES_REST="${RULES_TMPL#*$'\n'}"
+    {
+        printf '%s\n' "$RULES_FIRST_LINE"
+        printf '<!-- memcontinuum-rendered: %s -->\n' "$RENDERED_SHA"
+        printf '%s\n' "$RULES_REST"
+    } > "$RULES_DEST" || fail "could not write $RULES_DEST"
+fi
+
 # --- 5. install the memory-search skill -------------------------------
 
 step "install skill: $CLAUDE_DIR/skills/memory-search/SKILL.md"
 if [ "$DRY_RUN" -eq 0 ]; then
     mkdir -p "$CLAUDE_DIR/skills/memory-search" || fail "could not create $CLAUDE_DIR/skills/memory-search"
     cp -f "$SKILL_SRC" "$CLAUDE_DIR/skills/memory-search/SKILL.md" || fail "could not copy SKILL.md"
+    # D1: stamp the INSTALLED COPY only, right after the frontmatter's
+    # closing "---" (never at byte 0 -- the skill loader needs the OPENING
+    # "---" to stay the very first line of the file).
+    SKILL_DEST="$CLAUDE_DIR/skills/memory-search/SKILL.md"
+    FM_END_LINE="$(grep -n '^---$' "$SKILL_DEST" | sed -n '2p' | cut -d: -f1)"
+    if [ -n "$FM_END_LINE" ]; then
+        SKILL_TMP="$SKILL_DEST.tmp-memcontinuum-stamp"
+        {
+            head -n "$FM_END_LINE" "$SKILL_DEST"
+            printf '<!-- memcontinuum-rendered: %s -->\n' "$RENDERED_SHA"
+            tail -n "+$((FM_END_LINE + 1))" "$SKILL_DEST"
+        } > "$SKILL_TMP" && mv "$SKILL_TMP" "$SKILL_DEST" || fail "could not stamp $SKILL_DEST"
+    fi
 fi
 
 # --- 6. git post-commit reindex wrapper -------------------------------
@@ -1230,6 +1389,7 @@ else
     echo "Store README   : $STORE/README.md"
     echo "Store git repo : $STORE/.git"
     echo "Settings file  : $CLAUDE_DIR/settings.local.json"
+    echo "Rules file     : $RULES_DEST (rendered by $RENDERED_SHA)"
     echo "Skill installed: $CLAUDE_DIR/skills/memory-search/SKILL.md"
     if [ -n "${STORE_HOOKS_DIR:-}" ] && [ -f "$STORE_HOOKS_DIR/post-commit" ]; then
         echo "Post-commit    : $STORE_HOOKS_DIR/post-commit (wraps $HOOKS_DIR/post-commit-reindex.sh)"
@@ -1264,6 +1424,81 @@ else
     fi
 fi
 
+# --- 8. record the decision (D2, updater workstream) -----------------------
+#
+# Reaching here means the install above succeeded (every failure path
+# through step 7/7b already called fail(), which exits immediately) --
+# --record-decision, when given, records "wired" the same way a human
+# running memcontinuum-decide.sh by hand would. Off by default: recording a
+# consent nobody gave is the one thing this system must never do -- see
+# README.md's "A hook reports a state; only the skill records a decision"
+# doctrine. This is not a hook; it is this installer's OWN successful
+# completion, gated on a flag a driven flow only ever passes after a human
+# has already said yes.
+if [ "$DRY_RUN" -eq 0 ] && [ "$RECORD_DECISION" -eq 1 ]; then
+    # mc-registry-lib.sh is sourced at the top of this script (it is a hard
+    # requirement now, not an optional extra for this one block).
+        if mc_repo_key "$(dirname "$CLAUDE_DIR")"; then
+            RD_REPO="$MC_REPO"
+            RD_KEY="$MC_REPO_KEY"
+            mc_resolve_home
+            RD_DECISIONS="$MEMCONTINUUM_HOME/decisions.tsv"
+            RD_CLAUDE_DIRS="$CLAUDE_DIR"
+            RD_CODE_ROOTS=""
+            for cr in "${CODE_ROOTS_ABS[@]:-}"; do
+                [ -n "$cr" ] && RD_CODE_ROOTS="${RD_CODE_ROOTS:+$RD_CODE_ROOTS;}$cr"
+            done
+            RD_LANGS="$(printf '%s' "$CHOSEN_LANGS" | tr ',' ';')"
+            RD_NEVER="$(printf '%s' "$NEVER_EXTS_RAW" | tr ',' ';')"
+            # Union with whatever a pre-existing row already recorded --
+            # never dropped (INC-0104's own lesson: a project's SECOND
+            # claude-dir/code-root/language must not erase its first).
+            RD_DECLINED=0
+            if mc_registry_lookup "$RD_DECISIONS" "$RD_KEY"; then
+                # A `declined` row is a human's "no". Only an UNDECIDED repo
+                # may be recorded as wired by an installer -- reversing a
+                # decline is `memcontinuum-decide.sh forget`, typed by the
+                # person who declined. The install itself still succeeds and
+                # still exits 0: the wiring is real, it is only the REGISTRY
+                # that keeps the answer already on record. (Nothing is
+                # silently half-done here -- the detector reads the row, so
+                # the repo stays exactly as quiet as it was asked to be.)
+                if [ "$MC_LOOKUP_DECISION" = "declined" ]; then
+                    RD_DECLINED=1
+                fi
+                mc_note_field "$MC_LOOKUP_NOTE" "claude-dirs"
+                RD_CLAUDE_DIRS="$(mc_union_semi "$MC_NOTE_FIELD" "$RD_CLAUDE_DIRS")"
+                mc_note_field "$MC_LOOKUP_NOTE" "code-roots"
+                RD_CODE_ROOTS="$(mc_union_semi "$MC_NOTE_FIELD" "$RD_CODE_ROOTS")"
+                mc_note_field "$MC_LOOKUP_NOTE" "langs"
+                RD_LANGS="$(mc_union_semi "$MC_NOTE_FIELD" "$RD_LANGS")"
+                mc_note_field "$MC_LOOKUP_NOTE" "never"
+                RD_NEVER="$(mc_union_semi "$MC_NOTE_FIELD" "$RD_NEVER")"
+            fi
+            if [ "$RD_DECLINED" -eq 1 ]; then
+                echo "note: --record-decision given, but $RD_KEY is recorded as declined -- leaving that answer alone. Only an undecided repo may be recorded as wired by the installer; if the decision has changed, run: $SCRIPT_DIR/memcontinuum-decide.sh forget --repo $RD_REPO   (then record it again)" >&2
+            else
+                declare -a RD_ARGS=(wired --repo "$RD_REPO" --store "$STORE" --project "$PROJECT")
+                mc_split_semi "$RD_CLAUDE_DIRS"
+                for d in ${MC_SPLIT[@]+"${MC_SPLIT[@]}"}; do RD_ARGS+=(--claude-dir "$d"); done
+                # mc_build_wiring_args (scripts/mc-registry-lib.sh): the one
+                # builder for the --code-root/--langs/--never-ext tail, shared
+                # with scripts/memcontinuum-update.sh.
+                mc_build_wiring_args "$RD_CODE_ROOTS" \
+                    "$(printf '%s' "$RD_LANGS" | tr ';' ',')" \
+                    "$(printf '%s' "$RD_NEVER" | tr ';' ',')"
+                RD_ARGS+=(${MC_BUILT_ARGS[@]+"${MC_BUILT_ARGS[@]}"})
+                if "$MC_BASH_BIN" "$SCRIPT_DIR/memcontinuum-decide.sh" "${RD_ARGS[@]}"; then
+                    echo "decision recorded: $RD_KEY wired"
+                else
+                    echo "note: --record-decision given but recording failed (see above) -- the install itself still succeeded" >&2
+                fi
+            fi
+        else
+            echo "note: --record-decision given but $CLAUDE_DIR is not inside a git working tree -- skipping" >&2
+        fi
+fi
+
 echo
 echo "=== Next steps ==="
 if [ "$DRY_RUN" -eq 1 ]; then
@@ -1285,6 +1520,7 @@ else
      $OUR_HOOK_SCRIPTS
    then delete:
      $CLAUDE_DIR/skills/memory-search/
+     $RULES_DEST
      ${STORE_HOOKS_DIR:-$STORE/.git/hooks}/post-commit
      ~/.memcontinuum/$PROJECT.sqlite
    (leave $STORE itself alone -- it is the store's own git history).

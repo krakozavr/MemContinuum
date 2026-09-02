@@ -62,6 +62,25 @@ Decision and wiring are printed separately because they can disagree -- a
 hand-edited settings file or an interrupted install leaves them out of step,
 and collapsing them into one line hides exactly that.
 
+  update: wiring rendered by X, engine at Y -- run scripts/memcontinuum-update.sh
+                                 printed only when the stamp on this repo's
+                                 wired hook line does not match the engine
+                                 checkout's RENDER FINGERPRINT -- a hash of
+                                 the things wiring is rendered from (the
+                                 templates, the installer, the copied skill),
+                                 not the engine's current commit. A fix to a
+                                 script alone changes the commit and not the
+                                 fingerprint, and needs no re-render; a fix to
+                                 a template changes the fingerprint and does.
+                                 An `unknown` on either side prints the line
+                                 too: it means the fingerprint could not be
+                                 computed, which is not the same as agreeing.
+
+Silence on that line means one thing only: that hook line's stamp is current.
+It is not a health check -- it does not look at the rules file, at whether the
+store still exists, or at whether the row's store= still matches what is
+wired. `scripts/memcontinuum-update.sh --dry-run` is the check that does.
+
 Recording an answer is a different command: memcontinuum-decide.sh.
 USAGE
         exit 0
@@ -121,13 +140,30 @@ echo "wiring=$MC_WIRING"
 # because A's hook entry sorts first in the file.
 DECISION="none"
 DECISION_PROJECT=""
+# Where this project's wiring actually lives. A project's wiring does not have
+# to be in <repo>/.claude -- a session-home .claude beside a bare checkout is
+# a supported shape, and the registry row is the only thing that knows. Look
+# there when the row says, and fall back to <repo>/.claude when it does not
+# (every row written before the registry recorded claude-dirs, and every
+# ordinary single-directory install). Pure string work: this script runs no
+# python, and this adds no fork.
+declare -a WIRING_SETTINGS=()
 if mc_registry_lookup "$DECISIONS" "$KEY"; then
     DECISION="$MC_LOOKUP_DECISION"
     echo "decision=$DECISION"
     echo "decided_at=$MC_LOOKUP_WHEN"
-    DECISION_PROJECT="$(printf '%s\n' "$MC_LOOKUP_NOTE" | sed -n 's/.*[ ]project=\([^ ]*\).*/\1/p')"
+    mc_note_field "$MC_LOOKUP_NOTE" "project"
+    DECISION_PROJECT="$MC_NOTE_FIELD"
+    mc_note_field "$MC_LOOKUP_NOTE" "claude-dirs"
+    mc_split_semi "$MC_NOTE_FIELD"
+    for ROW_CLAUDE_DIR in ${MC_SPLIT[@]+"${MC_SPLIT[@]}"}; do
+        WIRING_SETTINGS+=("$ROW_CLAUDE_DIR/settings.local.json" "$ROW_CLAUDE_DIR/settings.json")
+    done
 else
     echo "decision=none"
+fi
+if [ "${#WIRING_SETTINGS[@]}" -eq 0 ]; then
+    WIRING_SETTINGS=("$REPO/.claude/settings.local.json" "$REPO/.claude/settings.json")
 fi
 
 # Store/project, pulled from ONE coherent hook entry rather than two
@@ -139,27 +175,30 @@ fi
 # that actually carries THAT project's marker over "the first match" --
 # falling back to first-found only when there is no row, or the row's
 # project has no matching hook entry (R6 fix, round 4).
-if [ "$MC_WIRING" != "none" ]; then
-    FOUND=0
-    PROJECT_SOURCE=""
-    if [ -n "$DECISION_PROJECT" ] && mc_wired_command_for_project "$DECISION_PROJECT" \
-            "$REPO/.claude/settings.local.json" "$REPO/.claude/settings.json"; then
-        FOUND=1
-        PROJECT_SOURCE="registry"
-    elif mc_first_wired_command \
-            "$REPO/.claude/settings.local.json" "$REPO/.claude/settings.json"; then
-        FOUND=1
-        PROJECT_SOURCE="wiring"
-    fi
-    if [ "$FOUND" -eq 1 ]; then
+# Not gated on the wiring= scan above: that scan deliberately looks only at
+# <repo>/.claude (it answers "is THIS repo's own .claude wired", which is what
+# the state= line means), while the store/project/stamp below come from
+# wherever the row says this project's wiring lives.
+FOUND=0
+PROJECT_SOURCE=""
+if [ -n "$DECISION_PROJECT" ] && mc_wired_command_for_project "$DECISION_PROJECT" \
+        "${WIRING_SETTINGS[@]}"; then
+    FOUND=1
+    PROJECT_SOURCE="registry"
+elif mc_first_wired_command "${WIRING_SETTINGS[@]}"; then
+    FOUND=1
+    PROJECT_SOURCE="wiring"
+fi
+if [ "$FOUND" -eq 1 ]; then
         echo "settings=$MC_WIRED_SETTINGS_FILE"
-        # scripts/repo-init.sh emits shlex-quoted values (MEMCONTINUUM_ROOT='/a b/c'),
-        # hand-written wiring often doesn't -- try the quoted form first, else
-        # fall back to the bare word.
-        store="$(printf '%s\n' "$MC_WIRED_COMMAND" | sed -n "s/.*MEMCONTINUUM_ROOT='\([^']*\)'.*/\1/p")"
-        [ -n "$store" ] || store="$(printf '%s\n' "$MC_WIRED_COMMAND" | sed -n 's/.*MEMCONTINUUM_ROOT=\([^ "'"'"']*\).*/\1/p')"
-        project="$(printf '%s\n' "$MC_WIRED_COMMAND" | sed -n "s/.*MEMCONTINUUM_PROJECT='\([^']*\)'.*/\1/p")"
-        [ -n "$project" ] || project="$(printf '%s\n' "$MC_WIRED_COMMAND" | sed -n 's/.*MEMCONTINUUM_PROJECT=\([^ "'"'"']*\).*/\1/p')"
+        # mc_command_env_value (mc-registry-lib.sh): scripts/repo-init.sh
+        # emits shlex-quoted values (MEMCONTINUUM_ROOT='/a b/c'), hand-written
+        # wiring often doesn't -- it tries the quoted form first, else falls
+        # back to the bare word.
+        mc_command_env_value "$MC_WIRED_COMMAND" "MEMCONTINUUM_ROOT"
+        store="$MC_ENV_VALUE"
+        mc_command_env_value "$MC_WIRED_COMMAND" "MEMCONTINUUM_PROJECT"
+        project="$MC_ENV_VALUE"
         [ -n "$store" ] && echo "store=$store"
         [ -n "$project" ] && echo "project=$project"
         # Output keys stay stable (store=/project= unchanged); this extra
@@ -167,7 +206,24 @@ if [ "$MC_WIRING" != "none" ]; then
         # when the decision row's own project pinned it, "wiring" when it
         # was the first match (no row, or the row named no project).
         [ -n "$project" ] && echo "project_source=$PROJECT_SOURCE"
-    fi
+        # Compare this hook line's own render stamp to what the engine
+        # checkout would render right now. Still python-free: one more
+        # mc_command_env_value call on a command line already resolved above,
+        # plus one sha256 pass over the engine's render inputs
+        # (mc_render_fingerprint, scripts/mc-registry-lib.sh) -- never
+        # anything on $REPO. A stamp from a render that predates stamping
+        # reads as "unknown", never a hard failure, always a hint.
+        mc_command_env_value "$MC_WIRED_COMMAND" "MEMCONTINUUM_RENDERED"
+        rendered="${MC_ENV_VALUE:-unknown}"
+        engine_dir="${MEMCONTINUUM_ENGINE:-$SCRIPT_DIR/..}"
+        mc_render_fingerprint repo "$engine_dir" || :
+        engine_sha="$MC_RENDER_FINGERPRINT"
+        # mc_fingerprint_match, not `!=`: an `unknown` on either side is the
+        # absence of a fingerprint, and two absences comparing equal would
+        # silence this hint for exactly the repos nobody could verify.
+        if ! mc_fingerprint_match "$rendered" "$engine_sha"; then
+            echo "update: wiring rendered by $rendered, engine at $engine_sha -- run scripts/memcontinuum-update.sh"
+        fi
 fi
 
 case "$DECISION" in

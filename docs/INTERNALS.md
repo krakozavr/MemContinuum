@@ -126,6 +126,14 @@ every consumer that needs it (`hooks/memlib.sh`, `pre-edit-chain.sh`,
 an interpreter to do so. Values are single-quoted by `sh_quote` — source the
 file, never parse it with `sed`/`tr`.
 
+It carries four values: `MEMCONTINUUM_ENGINE` (this checkout),
+`MEMCONTINUUM_PYTHON` (set only when the environment has none),
+`MEMCONTINUUM_HOME`, and `MEMCONTINUUM_MACHINE_CLAUDE_DIR` — the user-level
+Claude directory `memcontinuum-setup.sh` installed the detector hook and the
+`memcontinuum` skill into. That last one exists because setup takes
+`--claude-dir` and nothing else on the machine knows what it was given;
+`memcontinuum-update.sh --machine` reads it rather than assuming `~/.claude`.
+
 Resolution order, for hooks and for `scripts/repo-init.sh` alike:
 
     $MEMCONTINUUM_PYTHON → $MEMCONTINUUM_HOME/config.sh → <engine>/.venv/bin/python
@@ -245,6 +253,406 @@ more — re-ask, never assume.
 
 A decline stops the asking, not an existing installation. Nothing in this system
 ever deletes a store: a store is its own git history, not an installer artifact.
+
+### Registry row parameters (`decide.sh wired`)
+
+The `note` column carries `store=`/`project=` unconditionally (blank when not
+given, back-compatible with every pre-existing row) and, when given,
+`claude-dirs=`/`code-roots=`/`langs=`/`never=` — each of the last four is a
+`;`-joined list, omitted entirely (not written blank) when never passed.
+`--claude-dir` is repeatable: one project can list more than one claude-dir
+(a working-dir `.claude` beside a bare code checkout, or two session homes
+pointed at the same store), and `wired` refuses unless **every** one given is
+fully wired — recording the row after checking only the first would recreate
+"nothing tracks the set of claude-dirs a project's wiring lives in."
+`mc-registry-lib.sh` carries the shared parsing: `mc_note_field NOTE KEY`
+pulls one `key=value` field out of the note (space-separated between fields,
+so `store=` — first, no leading space — and every later field parse the same
+way), and `mc_command_env_value CMD VAR` pulls one `VAR=value` token out of a
+rendered hook command line — `memcontinuum-state.sh` and
+`memcontinuum-update.sh` both use it instead of each hand-rolling the same
+extraction. It is pure parameter expansion, anchored on an assignment
+boundary (so a variable that is a suffix of a longer name is never read out
+of it), and it sets `MC_ENV_PRESENT` alongside `MC_ENV_VALUE`: an explicitly
+empty `MEMCONTINUUM_LANG_EXTS=''` is a *recorded answer* (language-less
+wiring, chosen on purpose), while the variable being absent means the wiring
+predates the set being written down at all — unknown, not "none". Reading the
+second as the first would silently turn a project's code indexing off, so the
+two are kept apart everywhere.
+
+**Values with spaces.** The note column is space-separated `key=value` fields
+with `;` between list elements, so a raw space inside a value would end its
+own field early and turn the remainder into garbage fields — and real stores
+do live under paths with spaces. Every value is therefore percent-encoded on
+the way in (`mc_note_encode`: `%` → `%25` first, then ` ` → `%20`) and
+decoded on the way out (`mc_note_decode`, in the opposite order, which is
+what lets a value literally containing the text `%20` survive). `;`, tab and
+newline are *not* encoded — `decide.sh` refuses a value containing one, since
+a decoded `;` would arrive after the field had already been split on `;`.
+Accepted edge: a row written before this encoding, holding a path with a
+literal `%` followed by `20` or `25`, decodes wrongly; the fix is to rewrite
+the row.
+
+Splitting a stored list back into arguments goes through `mc_split_semi`, and
+the `--code-root`/`--langs`/`--never-ext` tail every re-run command shares is
+built once by `mc_build_wiring_args`. Both exist because the hand-rolled
+versions they replace used `tr ';' ' '` with an unquoted expansion, which
+word-splits every path containing a space and glob-expands the rest.
+
+## Render fingerprint and the updater
+
+Every rendered hook line, every rendered `<claude-dir>/rules/memcontinuum.md`,
+and the installed `memory-search` skill copy carry a stamp:
+`MEMCONTINUUM_RENDERED=<fingerprint>` as one more env token on each of the
+seven hook command lines, and `<!-- memcontinuum-rendered: <fingerprint> -->`
+as an HTML comment — the rules file's second line (after its identity-marker
+first line); the skill copy's, right after the frontmatter's closing `---`
+(never at byte 0 — the skill loader needs the opening `---` to stay line 1).
+
+**The stamp is a fingerprint of the render inputs, not the engine's HEAD
+commit.** Two kinds of change reach a wired repository in completely
+different ways. A fix to a *script* — a hook, `memidx.py`, the walker —
+arrives the moment the checkout is pulled, because every rendered hook line
+runs that script from the checkout by absolute path; nothing needs
+re-rendering. A change to what gets *rendered* — a template, this installer's
+own rendering, the settings merge, a skill copied into a repo — reaches nobody
+until the installer is re-run there. A HEAD sha moves on both, so it marked
+every wired repo on the machine stale after any commit to anything: the exact
+distinction this command exists to draw, drawn wrong. Hashing the inputs draws
+it: a scripts-only commit leaves every repo `ok`; a template or installer
+change flips them `stale`.
+
+**There are two fingerprints, one per layer.** The per-repo wiring and the
+machine layer are re-rendered by different commands, and a repository has no
+way to act on the other one's drift. With a single combined fingerprint, an
+edit to `memcontinuum-setup.sh` marked every *per-repo* row `stale`, and
+`--apply` then re-rendered all of them to no effect while leaving the drift
+that actually existed — in `~/.claude` — untouched.
+
+`mc_render_fingerprint SCOPE ENGINE_ROOT` (`mc-registry-lib.sh`) is the one
+function that computes both. `SCOPE` is `repo` or `machine`; anything else
+returns `unknown` rather than quietly hashing something. It is 12 hex
+characters of a `sha256sum` (falling back to `shasum -a 256`) over the scope's
+inputs in a fixed order, each preceded by its path relative to the checkout so
+that adding, removing or renaming one counts as a change.
+
+| scope | input | why |
+|---|---|---|
+| `repo` | `scripts/repo-init.sh` | does the per-repo rendering |
+| `repo` | `templates/*` | everything rendered from a template |
+| `repo` | `skills/memory-search/SKILL.md` | the skill copied into a project |
+| `machine` | `memcontinuum-setup.sh` | renders the detector hook line and `config.sh`, both templated inside it |
+| `machine` | `skills/memcontinuum/SKILL.md` | the skill copied to the user level |
+| both | `scripts/mc_settings_merge.py` | lands the rendered blocks, per repo and machine-wide alike |
+
+Who uses which: `repo-init.sh` stamps with `repo`; `memcontinuum-update.sh`
+compares each registry row against `repo` and, under `--machine`, the
+`~/.claude` detector entry against `machine`; `memcontinuum-state.sh`'s
+per-repo hint uses `repo`. `memcontinuum-setup.sh` renders
+`MEMCONTINUUM_RENDERED=<machine fingerprint>` onto the one hook line it
+installs — that is what `--machine` reads back.
+
+`hooks/*.sh` are deliberately **not** inputs in either scope: they are
+executed by path, so pulling updates them live. That includes
+`hooks/memcontinuum-detect.sh` — the machine layer renders a hook *line*
+naming it, never a copy of it. `LC_ALL=C` is set around the globs so the file
+order is byte-ordered and a checkout fingerprints identically on every
+machine. The literal `unknown` when no sha256 tool is available or the
+checkout is incomplete — read downstream as "cannot tell, re-render to find
+out", never as an error.
+
+`<claude-dir>/rules/memcontinuum.md` is rendered from
+`templates/memcontinuum-rules.md` on every install, fresh or re-run — the one
+rendered file that is never write-if-absent, because its whole job is to
+always name the *current* store. It is refused (exit 14), before any other
+mutation, when it already exists and its first line does not match the
+template's identity marker verbatim: a hand-authored or foreign file at that
+path is left alone, loudly, rather than overwritten.
+
+`scripts/memcontinuum-update.sh` walks every `wired` row and, for each
+claude-dir the row lists, compares three things against the engine right now:
+the stamp on that claude-dir's rendered hook lines, the row's own `store=`
+against the rendered `MEMCONTINUUM_ROOT` on those same lines (a stamp match
+alone cannot catch a store renamed under the same engine version), and the
+rules file's identity marker + stamp. It prints one table row per
+(row, claude-dir): `repo | claude-dir | stamped | engine | store-match |
+rules | action`, action being one of `ok`, `stale`, `store-mismatch`,
+`rules-missing`, `rules-stale`, `rules-foreign`, `migrate`,
+`migrate-needs-claude-dirs`, `migrate-needs-langs`,
+`migrate-needs-never-exts`, `migrate-dirs-disagree`, `store-missing`,
+`no-wiring`, or
+`unrecoverable`. `--dry-run` (the default with no `--apply`) only prints;
+`--apply` re-runs `repo-init.sh` per non-`ok` claude-dir with the row's own
+recorded parameters, always passing `--adopt-only` (below), so this command
+cannot create, rename, or delete a store on any path through it.
+
+**The flag/mode matrix.** The same option names mean different things in
+different modes, so each mode consumes a fixed set and refuses anything else,
+naming the mode and the flag. Accepted-and-ignored is the one outcome ruled
+out: the human typed what they wanted, the command reported success, and it
+did something else.
+
+| mode | selected by | consumes |
+| --- | --- | --- |
+| `walk` | no `--repo` | `--dry-run` `--apply` `--machine` |
+| `targeted` | `--add-lang`/`--never-ext` (needs `--repo`) | `--dry-run` `--repo` `--add-lang` `--never-ext` |
+| `repo` | `--repo`, no `--add-lang`/`--never-ext` | `--dry-run` `--apply` `--machine` `--repo` `--claude-dir` |
+
+Two refusals precede the modes entirely, at the argument loop. An **empty or
+whitespace-only value** for any flag that takes one is refused
+(`<flag> needs a non-empty value`, rc 2): each of these reads its own empty
+value as "not given", so an empty one never failed — it changed what the
+command *was*. `--repo ''` walked every wired row; `--langs ''` migrated with
+whatever it recovered; `--claude-dir ''` narrowed a recorded row's walk to the
+empty set and exited 0 with no table, which is the shape of a clean bill of
+health for a repository it had just been told to re-render. And **`--apply`
+with `--dry-run`** is refused in either order — they are opposites, and
+last-one-wins would make the same pair of flags write or preview depending
+only on typing order, discarding the other in silence.
+
+Everything else decidable from the command line alone is enforced before the
+registry is opened. The rest is a property of the *row*, so `repo` mode splits
+when the row is read:
+
+- a **legacy** row (no `claude-dirs=`) also consumes `--code-root`, `--langs`
+  and `--set-never-ext`: they supply the parameters the row never recorded.
+- a **current-format** row refuses those three — it already records them, and
+  this mode does not rewrite what a row records (`--add-lang`/`--never-ext`
+  do, additively, or a `decide.sh wired` line). `--claude-dir` changes meaning
+  rather than being refused: it **narrows** the walk to the dirs it names, and
+  each must be one the row already records. One that is not is refused as
+  `dir-not-recorded` — never walked, never installed into.
+
+`--repo` naming a repository with no `wired` row — undecided, or a recorded
+`declined` — is refused before the walk begins:
+`no-wired-row: <key> (decision=none|declined|…)`, non-zero. It used to match
+nothing and print an empty table at exit 0, which reads as "checked, all
+current" for a repository this command never had anything to say about. It is
+also the case that left the row half of the matrix unreachable: with no row to
+judge them against, the row-dependent flags were neither consumed nor refused.
+One helper (`require_wired_row`) serves both the walk and targeted mode, so
+the answer is the same whichever asked, and it names the decision that *is*
+recorded rather than reporting a bare miss.
+
+**Action precedence.** The answers this command will never act on come first:
+`store-missing`, then `no-wiring`, then `rules-foreign`, then the
+`migrate-needs-*`/`migrate-dirs-disagree` questions, and only then the drift
+it can actually re-render (`stale`, `store-mismatch`, `rules-missing`,
+`rules-stale`, `ok`). Ordering them the other way would name some lesser
+drift in the action column and then have `--apply` call the installer just to
+watch it refuse for a reason already known.
+
+`store-missing` outranking `no-wiring` matters on its own. A claude-dir with
+no hook lines is normally "finish the install" — but when the row's store is
+gone as well, sending someone to re-install is sending them to seed a fresh
+store over a dead one and call the result repaired. The dead store is the
+fact that has to be said first, so the store is checked before the wiring is
+looked at at all.
+
+**Exit codes.** The reporting walk always exits 0 — there, a stale row is the
+answer, not an error. `--apply` exits 0 only when every claude-dir it walked
+ended up correct: already `ok`, or re-rendered successfully. Anything left
+undone — a failed installer run, a dir deliberately skipped, or a row that
+could not be resolved to a claude-dir at all (`unrecoverable`: no `project=`
+recorded, or a remote-keyed legacy row) — exits non-zero, with the table
+still printed in full and the reason on stderr. `no-wiring` is the single
+exception, for the reason below.
+
+**An `unknown` fingerprint never compares equal.** `mc_render_fingerprint`
+returns the literal `unknown` when it cannot compute one: no `sha256sum`/
+`shasum` on the machine, or a checkout missing its render inputs. That is the
+absence of an answer, not an answer, and `[ "$a" = "$b" ]` on two absences
+reports the artifact as current — precisely the claim nobody was able to
+check. One helper, `mc_fingerprint_match`, is the only comparison: `unknown`
+or empty on either side is a mismatch, and a mismatch is `stale`. It is used
+by the table's stamp column, the rules file's own stamp line (the stamp is
+parsed out of the rendered comment rather than the whole line being compared
+as text), the machine layer, and `memcontinuum-state.sh`'s drift hint.
+Re-rendering something already current is a no-op; calling something current
+that nobody verified is not.
+
+**`--adopt-only`.** `repo-init.sh` grows a flag that refuses, before writing
+anything at all, unless `--store` is already a git working tree carrying this
+tool's markers (`mc_is_marked_store`, the same predicate the installer's own
+classify step uses). No `--force` carve-out, and `--dry-run` refuses too. The
+re-render command passes it on every installer run it makes.
+
+Actions that are deliberately never auto-applied:
+
+- **`store-missing`** — the row's `store=` path is no longer an existing
+  MemContinuum store (renamed, deleted, or replaced by an unrelated git
+  repo). Re-running `repo-init.sh` against a missing `--store` would *seed a
+  fresh one* there, which is exactly the "stores never touched" line this
+  command does not cross. It outranks every other answer, including a stamp
+  and a `store=` that both still look right: those compare strings, and a
+  string agrees just as happily with a store that is gone.
+- **`rules-foreign`** — `repo-init.sh` itself refuses to overwrite a foreign
+  rules file (see above), so calling it would just fail loudly for a reason
+  already named in the table. Reported; skipped.
+- **`no-wiring`** — a claude-dir this row lists has none of this project's
+  hook lines at all (settings deleted or badly broken). That is the `memcontinuum`
+  skill's repair path (an undecided/broken install), not this command's — a
+  `wired` row is never a license to *wire* anything; it only ever re-renders
+  wiring that is already there.
+
+A row written before this registry format existed (no `claude-dirs=` in its
+note) is a **legacy row**: its single claude-dir is recovered as `<repo>/.claude`
+when the row's key is a path (starts with `/`); a remote-keyed legacy row's
+repo path is not recoverable from the registry at all and is reported as
+`unrecoverable` with a fix command, never guessed (guessing could touch the
+wrong repo's `.claude`). A recoverable legacy row also has its `code-roots=`/
+`langs=`/`never=` recovered from what is actually rendered on its
+`newfile-nudge.sh` line today (`MEMCONTINUUM_CODE_ROOT`/`_LANG_EXTS`/
+`_NEVER_EXTS`, the extension globs mapped back to language names via
+`chunkers.LANGUAGE_TABLE`'s own extension sets) rather than from
+`mc_wired_commands_for_project`, which is scoped to the five always-wired
+write-side basenames and never matches `newfile-nudge.sh`/`pre-edit-chain.sh`
+by design (see "The five basenames" above) — `memcontinuum-update.sh` has its
+own basename-parametrized scan for this one case.
+
+**The migration proposes; a human decides.** The recovered `<repo>/.claude`
+is shown in the table as a *proposal*, never written from. Migrating a legacy
+row requires the human to name the full claude-dir set on the command line:
+
+```
+scripts/memcontinuum-update.sh --apply --repo PATH \
+    --claude-dir DIR [--claude-dir DIR ...] \
+    [--code-root DIR ...] [--langs LIST] [--set-never-ext LIST]
+```
+
+Without it the action is `migrate-needs-claude-dirs` and nothing is written.
+The reason is structural: one project can have several claude-dirs, and
+nothing on disk says how many — the command can see the one it found and no
+more. **A second claude-dir joins a project's row only by being named on a
+`memcontinuum-decide.sh wired` command line** (directly, or through the
+`--claude-dir` above, which builds that command). Nothing discovers one; that
+topology is manual by design.
+
+Two more refusals follow the same rule — the row is what every future
+re-render replays, so a value invented here would be permanent:
+
+- **`migrate-needs-langs`** — the wiring carries no `MEMCONTINUUM_LANG_EXTS`
+  at all, so it predates the language set being written onto the hook line.
+  Unknown, not "none": recording "none" would turn code indexing off for a
+  project that had it on. Pass `--langs LIST`. (An explicitly empty
+  `MEMCONTINUUM_LANG_EXTS=''` is a recorded answer and migrates without one.)
+- **`migrate-needs-never-exts`** — the rendered never-mention list is not a
+  plain extension list (hand-edited). Pass `--set-never-ext LIST`.
+- **`migrate-dirs-disagree`** — the named claude-dirs were recovered
+  separately and do not hold the same code-roots, languages or never-list.
+  Every dir's recovery is printed under the row; resolve it with explicit
+  `--code-root DIR` (repeatable), `--langs LIST`, `--set-never-ext LIST`.
+
+  The comparison is on the **raw rendered values** — the
+  `MEMCONTINUUM_LANG_EXTS`/`MEMCONTINUUM_NEVER_EXTS` glob strings and the
+  code-root list exactly as they sit on the hook lines — not on the language
+  names they normalize to. Normalizing is lossy in the one direction that
+  matters here: `*.py` and `*.py *.zz` both come back as the language list
+  `python`, and treating them as equal lets one dir's wiring be replayed over
+  the other's, changing what it indexes. Partial-render notes are collected
+  per dir and all of them printed, attributed to the dir they came from; the
+  first dir's note standing for the row meant a fully rendered first dir hid a
+  partially rendered second one entirely.
+
+**One row is one project, and one project has one wiring set.** A registry
+row records a single `code-roots=`/`langs=`/`never=` triple, and every
+claude-dir the row lists is rendered from it. That is what makes a re-render
+deterministic, and it is why a legacy row's parameters are recovered from
+*every* named claude-dir rather than from whichever comes first. The whole
+reason a legacy row is being migrated is that nothing ever wrote its
+parameters down — so nothing enforced that invariant either, and two dirs
+installed months apart can genuinely differ. Reading the first and replaying
+it onto the rest would silently re-render the others with languages they
+never indexed and record the result as though a human had chosen it. So the
+recovery refuses instead, and the human names the set.
+
+`--set-never-ext` is the migration's own spelling, deliberately not
+`--never-ext`. `--never-ext` ADDS one extension to a row that already has its
+parameters recorded, and it has no second meaning: an earlier round let
+`--apply` silently change what the same flag *meant*, which is the kind of
+quiet reinterpretation a command that writes a registry must not do.
+Combining `--add-lang`/`--never-ext` with `--apply` is refused, with both
+spellings named in the error.
+
+Each named `--claude-dir` must already carry this project's wiring: the
+migration *records* what is installed and never wires a directory from
+scratch. `--apply` re-renders every named claude-dir first and rewrites the
+registry row only if all of them succeeded (`migrate` in the table); a row
+rewritten after a failed render would describe wiring that exists nowhere.
+Every subsequent walk sees the row as current-format.
+
+`--add-lang LANG [--never-ext .ext] --repo PATH` and
+`--never-ext .ext [--add-lang LANG] --repo PATH` are additive-only (a human
+typing the command is the consent, so this mode applies unless `--dry-run` is
+given explicitly — not gated on `--apply`, which the walk mode's dry-run
+default would otherwise make it silently no-op): they union the given
+language/extension into the row's existing `langs=`/`never=` lists and never
+drop what was already there.
+
+**Render first, record second**, always: every claude-dir the row lists is
+re-rendered, and only if all of them succeeded is the row rewritten via
+`decide.sh wired` with every field. A row written first would describe a
+language set that exists nowhere the moment a render failed — and every later
+re-render replays that claim.
+
+The re-render itself is **all-or-nothing**, as far as two installer runs can
+be made to be: each claude-dir is run with `--dry-run` first, and only an
+all-clear turns into real writes. `repo-init.sh`'s refusals (a foreign rules
+file, an unwritable claude-dir, an `--adopt-only` store that is not there)
+all fire during `--dry-run`, before it writes anything, which is what makes
+the preflight worth running. The dirs on one row share one language set by
+construction, so converting the first and failing on the second would leave a
+project describing itself two different ways. If a real run still fails after
+its own dry run passed, the drift is reported explicitly — which dirs
+converted, which did not, and that the row is unchanged — rather than exiting
+on a bare failure.
+
+Four refusals come before any of that, in this order:
+
+- **legacy row** — the row records no `claude-dirs=`. This mode re-renders
+  the dirs a row *names*; `<repo>/.claude` is not substituted for them, ever
+  (a project's wiring can live outside the repo, and in more than one place).
+  Migrate the row first, with the command above.
+- **`no-code-root`** — the row records no `code-roots=`. `repo-init.sh`
+  ignores `--langs`/`--never-ext` without a `--code-root` to wire them into,
+  so the language set would render nowhere while the row claimed it.
+- **store-missing** — the same `mc_is_marked_store` check the walk uses. No
+  row is ever rewritten to describe wiring for a store that is gone.
+- **unknown language** — validated against `chunkers.LANGUAGE_TABLE` before
+  anything is touched. `repo-init.sh` validates `--langs` too, but only when
+  the install has a `--code-root` to wire it into.
+- **`dir-not-wired`** — a recorded claude-dir that carries no wiring *for
+  this project* (`mc_wired_commands_for_project`, so another project's hook
+  lines in the same claude-dir do not count). A row is a record, not a
+  warrant: it can name a directory that was wiped, and pointing the installer
+  at one would wire it from scratch — the one thing this command never does.
+  Checked for every dir before any of them is touched.
+
+`--machine` reports the machine layer as one extra line
+(`machine: DIR rendered by X, engine at Y -- ok|stale`), comparing the
+`machine` fingerprint against the stamp on that dir's detector entry. *Which*
+claude-dir is a fact only `memcontinuum-setup.sh` knows — it takes
+`--claude-dir` and defaults to `~/.claude` — so it records the answer in
+`config.sh` as `MEMCONTINUUM_MACHINE_CLAUDE_DIR`, and this reads it back
+(falling back to `~/.claude` only for a `config.sh` written before that
+existed). Assuming `~/.claude` reported a real install elsewhere as absent,
+and `--apply` would then have rendered a *second* machine layer at the
+default path while the stale one stayed stale. With `--apply` it re-runs
+`memcontinuum-setup.sh --claude-dir DIR`, but only when the comparison says
+`stale`. Off by default, since most drift is per-repo — and a missing
+registry no longer skips it, because a machine can perfectly well have its
+own layer installed before any repository is wired.
+
+`memcontinuum-state.sh` stays python-free and prints one extra line,
+`update: wiring rendered by X, engine at Y -- run scripts/memcontinuum-update.sh`,
+only when the two differ — pulled from the same registry-pinned hook command
+line its `store=`/`project=` extraction already resolves, plus one
+`mc_render_fingerprint` pass over the engine checkout's render inputs (never
+anything on the repo being reported on). It looks for that command line in the
+claude-dir(s) the registry row records, falling back to `<repo>/.claude` when
+the row names none: a project whose wiring lives in a session home beside a
+bare checkout would otherwise have had the hint go permanently silent —
+exactly the repositories most likely to drift.
 
 ## Path syntax in hook filters
 

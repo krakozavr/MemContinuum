@@ -23,6 +23,10 @@ PY_CORPUS = TOOLS_DIR / "tests" / "fixtures" / "python_corpus"
 # This machine's venv python is never hardcoded in tracked test code -- set
 # $MEMCONTINUUM_PYTHON in your own (untracked) shell environment before
 # running this file; see README.md "Requirements" / "Running the tests".
+# Same seam tests/test_write_hooks.py uses: tests/run_bash32.sh points MC_BASH
+# at a real bash 3.2.57 binary. repo-init.sh shells out to
+# memcontinuum-decide.sh through "$BASH", so that nested call follows.
+MC_BASH = os.environ.get("MC_BASH", "bash")
 VENV_PYTHON = os.environ.get("MEMCONTINUUM_PYTHON", "")
 _SKIP_NO_VENV = (
     "set $MEMCONTINUUM_PYTHON to a venv python with fastembed/PyYAML "
@@ -64,7 +68,7 @@ def run_install(args, home, timeout=60, python=VENV_PYTHON, extra_env=None, cwd=
     if extra_env:
         env.update(extra_env)
     proc = subprocess.run(
-        ["bash", str(INSTALL_SH)] + args,
+        [MC_BASH, str(INSTALL_SH)] + args,
         capture_output=True,
         text=True,
         env=env,
@@ -104,7 +108,7 @@ def run_install_at(install_sh, args, home, path_prepend=None, timeout=60, python
     if extra_env:
         env.update(extra_env)
     proc = subprocess.run(
-        ["bash", str(install_sh)] + args,
+        [MC_BASH, str(install_sh)] + args,
         capture_output=True,
         text=True,
         env=env,
@@ -142,6 +146,11 @@ def copy_engine(dst):
     # SCRIPT_DIR at runtime -- a copied checkout without it fails with
     # ModuleNotFoundError, not a graceful skip.
     shutil.copy(TOOLS_DIR / "scripts" / "mc_settings_merge.py", dst / "scripts" / "mc_settings_merge.py")
+    # repo-init.sh sources this sibling for its store predicates and its
+    # registry-row helpers, from its first validation onwards -- a copied
+    # checkout without it exits "incomplete checkout" before doing anything.
+    shutil.copy(TOOLS_DIR / "scripts" / "mc-registry-lib.sh", dst / "scripts" / "mc-registry-lib.sh")
+    shutil.copy(TOOLS_DIR / "scripts" / "memcontinuum-decide.sh", dst / "scripts" / "memcontinuum-decide.sh")
     for name in ("memidx.py", "memlint.py", "requirements.txt"):
         shutil.copy(TOOLS_DIR / name, dst / name)
     for name in ("hooks", "templates", "skills"):
@@ -167,7 +176,7 @@ def write_python_shim(path, target=VENV_PYTHON):
 
 class TestBashSyntax(unittest.TestCase):
     def test_bash_n(self):
-        proc = subprocess.run(["bash", "-n", str(INSTALL_SH)], capture_output=True, text=True)
+        proc = subprocess.run([MC_BASH, "-n", str(INSTALL_SH)], capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
 
@@ -225,10 +234,29 @@ class TestFreshInstall(unittest.TestCase):
         self.assertIn("MEMCONTINUUM_PROJECT", text)
 
     def test_skill_copied(self):
+        # D1 (updater workstream): the installed copy carries one extra
+        # line -- a "<!-- memcontinuum-rendered: SHA -->" stamp right after
+        # the frontmatter's closing "---" -- that the template never has.
+        # Stripped before comparing, the two are still identical.
         dst = self.claude_dir / "skills" / "memory-search" / "SKILL.md"
         src = TOOLS_DIR / "skills" / "memory-search" / "SKILL.md"
         self.assertTrue(dst.is_file())
-        self.assertEqual(dst.read_text(), src.read_text())
+        stamp_re = re.compile(r"^<!-- memcontinuum-rendered: [^\n]* -->\n", re.M)
+        self.assertEqual(stamp_re.sub("", dst.read_text()), src.read_text())
+
+    def test_skill_copy_stamp_present(self):
+        dst = self.claude_dir / "skills" / "memory-search" / "SKILL.md"
+        text = dst.read_text()
+        lines = text.splitlines()
+        # Right after the frontmatter's closing "---" (the second "---"
+        # line), never at byte 0 -- the opening "---" must stay line 1 for
+        # the skill loader.
+        self.assertEqual(lines[0], "---")
+        fm_end = lines[1:].index("---") + 1
+        self.assertTrue(
+            lines[fm_end + 1].startswith("<!-- memcontinuum-rendered: "),
+            f"expected a stamp line right after the frontmatter, got: {lines[fm_end + 1]!r}",
+        )
 
     def test_settings_is_valid_json(self):
         data = json.loads(self.settings_path.read_text())
@@ -355,6 +383,56 @@ class TestFreshInstall(unittest.TestCase):
     def test_db_created_under_home_memcontinuum(self):
         db = Path(self.home) / ".memcontinuum" / "widgetco.sqlite"
         self.assertTrue(db.is_file())
+
+    # --- D1 (updater workstream): version stamp ---------------------------
+
+    def _engine_sha(self):
+        """The stamp this checkout renders with, asked of the one function
+        that computes it (mc_render_fingerprint) -- a test that re-derives it
+        would only prove the two copies agree."""
+        return subprocess.run(
+            [MC_BASH, "-c",
+             '. "$1"/scripts/mc-registry-lib.sh; mc_render_fingerprint repo "$1"; '
+             'printf "%s" "$MC_RENDER_FINGERPRINT"',
+             "_", str(TOOLS_DIR)],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+
+    def test_every_rendered_hook_line_carries_the_stamp(self):
+        """D1: MEMCONTINUUM_RENDERED=<engine short sha> on every hook line
+        this installer renders -- all seven scripts (the five always-wired
+        write-side hooks, plus pre-edit-chain.sh rendered twice for
+        Edit/Write, plus newfile-nudge.sh -- eight command lines total for
+        an install with one --code-root, this fixture's shape)."""
+        data = json.loads(self.settings_path.read_text())
+        commands = [
+            h.get("command", "")
+            for event_groups in data["hooks"].values()
+            for group in event_groups
+            for h in group.get("hooks", [])
+            if "command" in h
+        ]
+        self.assertEqual(len(commands), 8, commands)
+        token = f"MEMCONTINUUM_RENDERED={self._engine_sha()}"
+        for cmd in commands:
+            self.assertIn(token, cmd, cmd)
+
+    # --- D4 (updater workstream): rendered rules file ----------------------
+
+    def test_rules_file_rendered_with_store_filled(self):
+        rules = self.claude_dir / "rules" / "memcontinuum.md"
+        self.assertTrue(rules.is_file())
+        text = rules.read_text()
+        lines = text.splitlines()
+        # From the template that defines it, never a copy: a second copy here
+        # would have to be edited in lockstep with the template, and a test
+        # comparing two copies of a string proves only that they match.
+        template_marker = (TOOLS_DIR / "templates" / "memcontinuum-rules.md"
+                           ).read_text().splitlines()[0]
+        self.assertEqual(lines[0], template_marker)
+        self.assertEqual(lines[1], f"<!-- memcontinuum-rendered: {self._engine_sha()} -->")
+        self.assertIn(f"MemContinuum store ({self.store})", text)
+        self.assertNotIn("{{STORE}}", text)
 
 
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
@@ -704,6 +782,50 @@ class TestFailureModes(unittest.TestCase):
                 ["--project", "p", "--store", store, "--claude-dir", claude_dir, "--force"], home)
             self.assertEqual(proc2.returncode, 0, proc2.stdout + proc2.stderr)
             self.assertTrue(Path(store).is_dir())
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_foreign_rules_file_refused_before_any_mutation(self):
+        """D4: an existing $CLAUDE_DIR/rules/memcontinuum.md whose first
+        line does not match the identity marker is a hand-authored or
+        foreign file -- refused, not overwritten, and refused BEFORE any
+        other mutation (the store tree, settings.local.json) so a refusal
+        never leaves a half-finished install behind."""
+        home = sandbox_home()
+        try:
+            store = str(Path(home) / "store")
+            claude_dir = Path(home) / ".claude"
+            rules_dir = claude_dir / "rules"
+            rules_dir.mkdir(parents=True)
+            (rules_dir / "memcontinuum.md").write_text("# hand-written notes\nnot ours\n")
+            proc = run_install(
+                ["--project", "p", "--store", store, "--claude-dir", str(claude_dir)],
+                home,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("memcontinuum.md", proc.stdout + proc.stderr)
+            self.assertEqual(
+                (rules_dir / "memcontinuum.md").read_text(),
+                "# hand-written notes\nnot ours\n",
+                "foreign rules file must be left untouched",
+            )
+            self.assertFalse(Path(store).exists(), "no mutation at all on refusal")
+            self.assertFalse((claude_dir / "settings.local.json").exists())
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_own_rendered_rules_file_is_overwritten_on_reinstall(self):
+        home = sandbox_home()
+        try:
+            store = str(Path(home) / "store")
+            claude_dir = Path(home) / ".claude"
+            proc1 = run_install(["--project", "p", "--store", store, "--claude-dir", str(claude_dir)], home)
+            self.assertEqual(proc1.returncode, 0, proc1.stdout + proc1.stderr)
+            rules_path = claude_dir / "rules" / "memcontinuum.md"
+            self.assertTrue(rules_path.is_file())
+            proc2 = run_install(["--project", "p", "--store", store, "--claude-dir", str(claude_dir)], home)
+            self.assertEqual(proc2.returncode, 0, proc2.stdout + proc2.stderr)
+            self.assertIn(f"MemContinuum store ({store})", rules_path.read_text())
         finally:
             shutil.rmtree(home, ignore_errors=True)
 
@@ -2085,6 +2207,83 @@ class TestNeverExtension(unittest.TestCase):
             self.assertIn("this wiring", out.lower(), out)
         finally:
             shutil.rmtree(home, ignore_errors=True)
+
+
+class TestAdoptOnly(unittest.TestCase):
+    """`--adopt-only`: this install may WIRE an existing store, never CREATE
+    one. The re-render path (scripts/memcontinuum-update.sh) always passes it,
+    so a registry row naming a store that has been renamed or deleted can
+    never make a re-render seed a fresh store at the old path.
+
+    The refusal is pre-mutation and unconditional: no --force carve-out, and
+    --dry-run refuses too (a preview of an install that must never happen is
+    not useful, it is misleading)."""
+
+    def setUp(self):
+        self.home = sandbox_home()
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        self.store = str(Path(self.home) / "store")
+        self.claude_dir = str(Path(self.home) / "wt" / ".claude")
+
+    def _install(self, args, **kw):
+        return run_install(
+            ["--project", "adoptonly", "--store", self.store,
+             "--claude-dir", self.claude_dir, "--non-interactive"] + args,
+            self.home, timeout=120, **kw)
+
+    def _assert_nothing_created(self):
+        self.assertFalse(Path(self.store).exists(),
+                         "--adopt-only must not create the store directory")
+        self.assertFalse(Path(self.store, ".git").exists(),
+                         "--adopt-only must not git init a store")
+        self.assertFalse(Path(self.claude_dir, "settings.local.json").exists(),
+                         "--adopt-only refused: no wiring may be written either")
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_refuses_when_the_store_path_does_not_exist(self):
+        proc = self._install(["--adopt-only"])
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("store-missing", proc.stdout + proc.stderr)
+        self._assert_nothing_created()
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_refuses_under_dry_run_too(self):
+        proc = self._install(["--adopt-only", "--dry-run"])
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("store-missing", proc.stdout + proc.stderr)
+        self._assert_nothing_created()
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_refuses_a_plain_directory_that_is_not_a_git_repo(self):
+        os.makedirs(self.store)
+        proc = self._install(["--adopt-only"])
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("store-missing", proc.stdout + proc.stderr)
+        self.assertFalse(Path(self.store, ".git").exists())
+        self.assertFalse(Path(self.claude_dir, "settings.local.json").exists())
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_refuses_a_git_repo_without_this_tools_markers(self):
+        os.makedirs(self.store)
+        subprocess.run(["git", "init", "-q", "."], cwd=self.store, check=True)
+        proc = self._install(["--adopt-only"])
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("store-missing", proc.stdout + proc.stderr)
+        self.assertFalse(Path(self.claude_dir, "settings.local.json").exists())
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_accepts_an_existing_marked_store(self):
+        first = self._install([])
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        again = self._install(["--adopt-only"])
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertIn("adopted", again.stdout)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_help_documents_it(self):
+        proc = run_install(["--help"], self.home, python=None)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("--adopt-only", proc.stdout)
 
 
 if __name__ == "__main__":
