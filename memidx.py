@@ -1909,7 +1909,7 @@ def iter_code_source_files(root: Path, langs: list[str] | None, skipped: Counter
     rather than the old locally duplicated extension map.
 
     `langs` defaults to swift-only when falsy -- a legacy-row safety net for
-    _code_index_is_stale below, whose only caller reads it out of an
+    code_index_report's per-root walk, whose only caller reads it out of an
     existing code_project.langs row that has been non-empty on every row
     ever written since langs became mandatory (Task 7); it does not mean
     code-reindex itself still has a default (it doesn't -- see
@@ -1944,8 +1944,8 @@ def iter_code_source_files(root: Path, langs: list[str] | None, skipped: Counter
     chunk. That Counter is the data source for code-reindex's end-of-run
     provenance line (spec S4, INC-0103/0104: no growing blind spot may be
     silent). Mutated-in-place rather than a second yield channel so
-    existing callers (_code_index_is_stale) that iterate this generator
-    for plain paths need no change."""
+    existing callers (_root_report, code_index_report's per-root walk)
+    that iterate this generator for plain paths need no change."""
     wired = list(langs or ["swift"])
     wired_set = set(wired)
     skip_dirs = CODE_SKIP_DIR_NAMES | chunkers.common_skip_dirs(wired)
@@ -2145,6 +2145,21 @@ def write_file_status(
     )
 
 
+def _refresh_file_sha_stat(conn: sqlite3.Connection, project: str, code_root: str, rel: str, stat) -> None:
+    """Single writer for the mtime/size-only refresh (Task 4 carried-in fix
+    2, Ruling 57 -- dedupe): content, sha256, gap_count, chunker_version,
+    status and reason are all left exactly as stored. Cache bookkeeping
+    only -- a bare `touch` (or a not-indexed row left alone, or a report's
+    own sha-confirmed match) must not by itself read as a change on the
+    next comparison. Used by cmd_code_reindex's unchanged-file and
+    left-alone-not-indexed branches and by code_index_report's sha-match
+    refresh, so the identical UPDATE lives in exactly one place."""
+    conn.execute(
+        "UPDATE file_sha SET mtime=?, size=? WHERE project=? AND code_root=? AND path=?",
+        (stat.st_mtime, stat.st_size, project, code_root, rel),
+    )
+
+
 def _record_index_failure(conn, project, code_root, rel, f, *, sha, cv, status, reason, attempt_key=None):
     """Shared tail of both failure paths (B1: fail open, purge stale
     state). `f` is best-effort stat'd for mtime/size -- a file that
@@ -2301,7 +2316,7 @@ def cmd_code_reindex(args) -> int:
     #     with nothing on any surface saying so. Now: delete the chunks
     #     (with their fts/embedding shadows) AND the file_sha row, warn
     #     naming the file, continue. Deleting the file_sha row is also what
-    #     keeps _code_index_state honest: the file is on disk, absent from
+    #     keeps code_index_report honest: the file is on disk, absent from
     #     file_sha, so the index reports "stale", not "current".
     #
     # A "partial" status still indexes its chunks and writes file_sha with
@@ -2318,8 +2333,14 @@ def cmd_code_reindex(args) -> int:
         seen.add(rel)
         sha = cv = None
         try:
-            data = f.read_bytes()
-            sha = hashlib.sha256(data).hexdigest()
+            # Task 4 carried-in fix 1 (Task 3 review, Ruling 57): lang, cv
+            # and the not-indexed retry decision need only the path and the
+            # table -- never the file's bytes -- so they run BEFORE
+            # f.read_bytes(). Previously read_bytes() ran first, so an
+            # unreadable (or vanished-mid-run) file never reached the
+            # leave-it-alone skip below and was re-attempted -- and
+            # re-counted as not-indexed -- on every run, inflating the
+            # heal's re-indexed sum.
             lang = lang_for_source_file(f)
             try:
                 cv = chunkers.chunker_version(lang)
@@ -2348,31 +2369,29 @@ def cmd_code_reindex(args) -> int:
                 )
                 if not retry:
                     unchanged_files += 1
-                    stat = f.stat()
-                    conn.execute(
-                        "UPDATE file_sha SET mtime=?, size=? WHERE project=? AND code_root=? AND path=?",
-                        (stat.st_mtime, stat.st_size, args.project, root_s, rel),
-                    )
+                    try:
+                        _refresh_file_sha_stat(conn, args.project, root_s, rel, f.stat())
+                    except OSError:
+                        pass  # best-effort only -- the row itself stays exactly as stamped
                     continue
                 prev_sha = prev_cv = None  # a not-indexed row never carries a real sha to compare
             else:
                 prev_sha, prev_cv = (prev[0], prev[1]) if prev is not None else (None, None)
+
+            data = f.read_bytes()
+            sha = hashlib.sha256(data).hexdigest()
             if prev_sha == sha and prev_cv == cv and not args.full:
                 unchanged_files += 1
                 # Finding 2 (staleness): the file's content (and thus its
                 # chunks) didn't change, but its mtime/size on disk may
                 # have (e.g. a bare `touch`) -- refresh the stored
-                # file_sha row's mtime/size so _code_index_is_stale's
+                # file_sha row's mtime/size so code_index_report's
                 # on-disk comparison matches again. sha256/gap_count/
                 # chunker_version are untouched (nothing about the indexed
                 # content or the chunker that produced it changed), so
                 # this is a plain UPDATE, not the INSERT OR REPLACE the
                 # changed/added branch below uses.
-                stat = f.stat()
-                conn.execute(
-                    "UPDATE file_sha SET mtime=?, size=? WHERE project=? AND code_root=? AND path=?",
-                    (stat.st_mtime, stat.st_size, args.project, root_s, rel),
-                )
+                _refresh_file_sha_stat(conn, args.project, root_s, rel, f.stat())
                 if not args.no_embed:
                     # embedding_mode's invariant is REAL coverage (every
                     # chunk of a `full` project has a vector), not merely
@@ -2800,94 +2819,150 @@ def code_hits_vector(conn: sqlite3.Connection, query: str, project: str):
     return scored
 
 
-def _code_index_is_stale(conn: sqlite3.Connection, project: str) -> bool:
-    """Stale when the tree and the stored rows disagree in ANY of four
-    ways: a file's mtime/size drifted, a file is on disk with no stored
-    row at all, a stored row was produced by a DIFFERENT chunker version
-    than the one this engine would use today (B2, Anatomy M1 fix wave), or
-    a stored row is `failed`/`not-indexed` (Task 3, Anatomy M2a) -- such a
-    row's chunks were purged, so the index can never be "current" for that
-    file no matter how closely its mtime/size/chunker_version happen to
-    match the row cmd_code_reindex stamped alongside the failure. Plus the
-    missing-code_root case.
+def _root_report(conn: sqlite3.Connection, project: str, root_s: str, langs: list[str] | None, avail: str) -> dict:
+    """One code_root's slice of `code_index_report`: preflight only, never
+    a mutation of index content -- the tree and the stored `file_sha` rows
+    for THIS root are compared, and a drifted-but-sha-confirmed row's
+    mtime/size is refreshed (cache bookkeeping, committed by the caller).
+    No chunk, status, reason, or meta row is ever written here.
 
-    The chunker-version comparison is the one this check used to be
-    missing. `code-reindex` has always re-chunked a file whose stored
-    chunker_version no longer matches, but `code-search`'s staleness
-    report only compared mtime/size -- so bumping a chunker's
-    impl_version left every stored row reading "current" until something
-    on disk happened to change, which is precisely when a reader most
-    needs to be told the index predates the current chunker. A row for a
-    language with no LANGUAGE_TABLE row compares against "unversioned",
-    the same literal cmd_code_reindex's own fail-open stamps.
+    `avail` is the backend availability fingerprint for this WHOLE report
+    call (chunkers.backend_availability() itself warns against recomputing
+    it per call within one run) -- every root in one code_index_report
+    call is judged against the same fingerprint.
 
-    Anatomy M2a: code_meta no longer carries `langs` (that moved to the
-    project-level code_project table, see resolve_project_langs) and may
-    hold one row per code_root -- this check still reasons about a single
-    root per project (multi-root staleness/heal is a later task's
-    concern); `fetchone()` picks whichever root a prior run wrote first."""
-    meta = conn.execute("SELECT code_root FROM code_meta WHERE project=?", (project,)).fetchone()
-    if meta is None or not meta["code_root"]:
-        return False
-    root = Path(meta["code_root"])
-    if not root.exists():
-        return True
-    langs = resolve_project_langs(conn, project)
-    existing = {
-        row["path"]: (row["mtime"], row["size"], row["chunker_version"], row["status"])
-        for row in conn.execute(
-            "SELECT path, mtime, size, chunker_version, status FROM file_sha WHERE project=?", (project,)
+    `changed` counts: a row missing entirely, OR a drifted row (mtime/size
+    disagree) whose recomputed sha256 differs from the stored one (binding
+    point 4: a drifted row with sha NULL -- a not-indexed file -- carries
+    no source evidence and is NEVER counted here; it is governed by
+    cmd_code_reindex's retry rule alone), OR a stored `chunker_version`
+    that no longer matches what this engine would produce today (every
+    status, not-indexed included -- the table stamps its version even when
+    the chunker itself could not run), plus every path on disk with no
+    surviving row (`removed`)."""
+    root = Path(root_s)
+    rep = {
+        "code_root": root_s, "exists": _root_is_readable_dir(root), "changed": 0, "removed": 0,
+        "failed": 0, "not_indexed": 0,
+    }
+    rows = {
+        r["path"]: r
+        for r in conn.execute(
+            "SELECT path, sha256, mtime, size, chunker_version, status, attempt_key FROM file_sha "
+            "WHERE project=? AND code_root=?",
+            (project, root_s),
         )
     }
+    rep["failed"] = sum(1 for r in rows.values() if r["status"] == "failed")
+    rep["not_indexed"] = sum(1 for r in rows.values() if r["status"] == "not-indexed")
+    rep["availability_changed"] = any(
+        r["status"] == "not-indexed" and r["attempt_key"] != avail for r in rows.values()
+    )
+    if not rep["exists"]:
+        # A missing root contributes exists: False and does not itself
+        # count as changed -- code_index_report folds this into `degraded`
+        # (never `current`) via missing_root, binding point 5.
+        return rep
     seen = set()
+    touched = False
     for f in iter_code_source_files(root, langs):
         try:
             rel = str(f.relative_to(root))
         except ValueError:
             continue
         seen.add(rel)
-        stat = f.stat()
-        prev = existing.get(rel)
-        if (
-            prev is None
-            or prev[0] != stat.st_mtime
-            or prev[1] != stat.st_size
-            or prev[3] not in ("ok", "partial")
-        ):
-            return True
+        prev = rows.get(rel)
+        if prev is None:
+            rep["changed"] += 1
+            continue
         try:
             cv = chunkers.chunker_version(lang_for_source_file(f))
         except KeyError:
             cv = "unversioned"
-        if prev[2] != cv:
-            return True
-    return bool(set(existing.keys()) - seen)
+        if prev["chunker_version"] != cv:
+            rep["changed"] += 1
+            continue
+        if prev["sha256"] is None:
+            continue  # not-indexed: no source evidence -- the retry rule owns it
+        try:
+            st = f.stat()
+        except OSError:
+            rep["changed"] += 1
+            continue
+        if prev["mtime"] != st.st_mtime or prev["size"] != st.st_size:
+            try:
+                if hashlib.sha256(f.read_bytes()).hexdigest() != prev["sha256"]:
+                    rep["changed"] += 1
+                else:
+                    _refresh_file_sha_stat(conn, project, root_s, rel, st)
+                    touched = True
+            except OSError:
+                rep["changed"] += 1
+    rep["removed"] = len(set(rows) - seen)
+    rep["changed"] += rep["removed"]
+    if touched:
+        conn.commit()
+    return rep
 
 
-def _code_index_state(conn: sqlite3.Connection, project: str):
-    """Finding 1 (HIGH, index provenance): the three states code-search
-    must distinguish and SAY, not collapse into a bare empty result --
-    "uninitialized" (`code-reindex` was never run for this project: no
-    code_meta row, or one with no code_root ever recorded -- the
-    never-indexed-reads-as-healthy-empty bug), "stale" (existing
-    _code_index_is_stale mtime/size-drift or missing-code_root-dir check),
-    "current" (neither). Returns (state, meta_row_or_None)."""
-    meta = conn.execute(
-        "SELECT code_root, last_indexed_at, head_sha FROM code_meta WHERE project=?",
-        (project,),
+def code_index_report(conn: sqlite3.Connection, project: str) -> dict:
+    """Finding 1 (HIGH, index provenance) + Anatomy M2a Task 4: the
+    preflight code-search consults before every search and code-reindex's
+    heal (Task 5) consumes to decide what to repair -- per code_root,
+    status-aware, and sha-confirmed (a drifted-but-unchanged file is never
+    reported as a change). Read-only except for the mtime/size cache
+    refresh `_root_report` may commit; never writes a chunk, status, or
+    meta row.
+
+    State, in order: no roots at all -> "uninitialized" (code-reindex was
+    never run for this project); any root's `changed > 0` -> "stale";
+    else `not_indexed > 0`, or `availability_changed`, or any root missing
+    on disk -> "degraded" (binding point 5: a missing recorded root can
+    never read "current"); else "current"."""
+    proj = conn.execute(
+        "SELECT langs, embedding_mode FROM code_project WHERE project=?", (project,)
     ).fetchone()
-    if meta is None or not meta["code_root"]:
-        return "uninitialized", None
-    if _code_index_is_stale(conn, project):
-        return "stale", meta
-    return "current", meta
+    metas = conn.execute(
+        "SELECT code_root, last_indexed_at, head_sha FROM code_meta WHERE project=? ORDER BY code_root",
+        (project,),
+    ).fetchall()
+    if not metas:
+        return {
+            "state": "uninitialized", "langs": None, "embedding_mode": "none",
+            "availability_changed": False, "roots": [], "changed": 0, "failed": 0, "not_indexed": 0,
+        }
+    langs = resolve_project_langs(conn, project)
+    avail = chunkers.backend_availability()  # one fingerprint for every root in this call
+    roots = []
+    for m in metas:
+        r = _root_report(conn, project, m["code_root"], langs, avail)
+        r["last_indexed_at"] = m["last_indexed_at"]
+        r["head_sha"] = m["head_sha"]
+        roots.append(r)
+    changed = sum(r["changed"] for r in roots)
+    failed = sum(r["failed"] for r in roots)
+    not_indexed = sum(r["not_indexed"] for r in roots)
+    availability_changed = any(r["availability_changed"] for r in roots)
+    missing_root = any(not r["exists"] for r in roots)
+    if changed:
+        state = "stale"
+    elif not_indexed or availability_changed or missing_root:
+        state = "degraded"
+    else:
+        state = "current"
+    return {
+        "state": state, "langs": langs, "embedding_mode": (proj["embedding_mode"] if proj else "none"),
+        "availability_changed": availability_changed, "roots": roots, "changed": changed,
+        "failed": failed, "not_indexed": not_indexed,
+    }
 
 
 def cmd_code_search(args) -> int:
     db_path = resolve_code_db_path(args)
     conn = open_code_db(db_path)
 
-    state, meta = _code_index_state(conn, args.project)
+    report = code_index_report(conn, args.project)
+    state = report["state"]
 
     if state == "uninitialized":
         print(
@@ -2904,12 +2979,35 @@ def cmd_code_search(args) -> int:
             ))
         return 1
 
+    # Anatomy M2a Task 4: the preflight now distinguishes stale / degraded /
+    # failed / a missing root and says each one that applies, instead of a
+    # single "appears stale" catch-all. A missing root is named regardless
+    # of overall state (binding point 5 keeps it out of "current", but the
+    # line itself is the actionable one -- `code-reindex --drop-root` if
+    # it is gone for good).
     if state == "stale":
         print(
-            "code-search: WARNING code index appears stale "
-            "(source changed since last code-reindex)",
+            f"code-search: WARNING code index is stale ({report['changed']} file(s) differ "
+            "from the last code-reindex)",
             file=sys.stderr,
         )
+    elif state == "degraded":
+        print(
+            f"code-search: code index is incomplete ({report['not_indexed']} file(s) not indexed)",
+            file=sys.stderr,
+        )
+    if report["failed"] > 0:
+        print(
+            f"code-search: {report['failed']} file(s) failed to index -- see code-reindex output",
+            file=sys.stderr,
+        )
+    for r in report["roots"]:
+        if not r["exists"]:
+            print(
+                f"code-search: WARNING recorded code root {r['code_root']} does not exist -- "
+                f"code-reindex --drop-root {shlex.quote(r['code_root'])} if it is gone for good",
+                file=sys.stderr,
+            )
 
     if args.mode == "fts":
         ids = code_hits_fts(conn, args.query, args.project)
@@ -2990,17 +3088,25 @@ def cmd_code_search(args) -> int:
     conn.close()
 
     if args.json:
-        # Finding 1: state + index provenance (code_root/indexed_at/
-        # head_sha, stored at reindex time) surface here alongside
-        # `results` -- an envelope, not a bare list, so a caller can tell
-        # "current" apart from "stale" apart from an empty-but-healthy
-        # result without a separate call.
+        # Finding 1 + Anatomy M2a Task 4: state + full per-root provenance
+        # surface here alongside `results` -- an envelope, not a bare
+        # list, so a caller can tell "current" apart from "stale" apart
+        # from an empty-but-healthy result without a separate call.
+        # code_root/indexed_at/head_sha name the FIRST root (code_meta's
+        # own alphabetical order), kept for existing readers; code_roots
+        # carries the report's full per-root list.
+        first_root = report["roots"][0]
         print(json.dumps(
             {
                 "state": state,
-                "code_root": meta["code_root"],
-                "indexed_at": meta["last_indexed_at"],
-                "head_sha": meta["head_sha"],
+                "code_root": first_root["code_root"],
+                "code_roots": report["roots"],
+                "indexed_at": first_root["last_indexed_at"],
+                "head_sha": first_root["head_sha"],
+                "changed": report["changed"],
+                "failed": report["failed"],
+                "not_indexed": report["not_indexed"],
+                "embedding_mode": report["embedding_mode"],
                 "results": out,
             },
             indent=2,
@@ -3846,6 +3952,14 @@ def main(argv=None) -> int:
         help="override the DECISION (markdown) index db path used for concept "
              "attachment -- independent of --db, which always selects the CODE "
              "db for this command. Defaults to the normal per-project decision db.",
+    )
+    p_code_search.add_argument(
+        "--no-heal", dest="no_heal", action="store_true",
+        help="skip the automatic repair of a stale or degraded index before searching",
+    )
+    p_code_search.add_argument(
+        "--heal-limit", dest="heal_limit", type=int, default=500,
+        help="cap on files an automatic repair re-indexes in one search",
     )
     p_code_search.set_defaults(func=cmd_code_search)
 

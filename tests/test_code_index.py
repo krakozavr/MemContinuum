@@ -1505,7 +1505,7 @@ class TestFailOpenDeletesStaleIndexState(unittest.TestCase):
 
     def test_version_bump_then_failure_leaves_the_index_not_current(self):
         """Task 3: same not-indexed contract as above; the row's presence
-        no longer by itself makes `_code_index_state` honest, so the state
+        no longer by itself makes `code_index_report` honest, so the state
         check consults `status` too (a not-indexed/failed row can never
         read "current", whatever its stored mtime/size/chunker_version)."""
         try:
@@ -1521,7 +1521,7 @@ class TestFailOpenDeletesStaleIndexState(unittest.TestCase):
                 sha_row = conn.execute(
                     "SELECT * FROM file_sha WHERE path=?", ("NestedTypes.swift",)
                 ).fetchone()
-                state, _meta = memidx._code_index_state(conn, memidx.DEFAULT_PROJECT)
+                state = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)["state"]
                 conn.close()
                 self.assertEqual(chunk_count, 0)
                 self.assertIsNotNone(sha_row, "the file_sha row stays -- with a not-indexed status")
@@ -1681,6 +1681,43 @@ class TestFileStatusRows(unittest.TestCase):
                 p.chmod(0o644)
             self.assertEqual(self._row(db, "x.py")["status"], "not-indexed")
 
+    @unittest.skipIf(os.name != "posix" or os.geteuid() == 0,
+                     "mode-000 is only unreadable for a non-root posix user")
+    def test_retry_gate_runs_before_read_bytes_for_unreadable_file(self):
+        """Carried-in fix (Task 3 review, Ruling 57): the retry-gate lookup
+        (lang/cv/prev, then the not-indexed leave-it-alone decision) must
+        run BEFORE f.read_bytes() -- otherwise an unreadable (or vanished)
+        file never reaches the skip and is re-attempted, and re-counted as
+        not indexed, on every run. A second, heal-style run
+        (retry_not_indexed=False) over an unchanged-availability not-
+        indexed row must report 0 not indexed / 1 unchanged, not another
+        attempt."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            p = root / "locked.py"
+            p.write_text("def f():\n    pass\n")
+            p.chmod(0)
+            db = Path(td) / "idx-code.sqlite"
+            try:
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    code_reindex(root, db, lang="python")
+                self.assertIn("1 not indexed", out.getvalue())
+                self.assertEqual(self._row(db, "locked.py")["status"], "not-indexed")
+
+                out2 = io.StringIO()
+                with contextlib.redirect_stdout(out2):
+                    memidx.cmd_code_reindex(ns(
+                        code_root=str(root), drop_root=None, db=str(db), project=memidx.DEFAULT_PROJECT,
+                        no_embed=True, full=False, lang="python", retry_not_indexed=False,
+                    ))
+                self.assertIn("0 not indexed", out2.getvalue())
+                self.assertIn("1 unchanged", out2.getvalue())
+                self.assertEqual(self._row(db, "locked.py")["status"], "not-indexed")
+            finally:
+                p.chmod(0o644)
+
     def test_partial_status_is_recorded(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "code"
@@ -1763,7 +1800,6 @@ class TestFileStatusRows(unittest.TestCase):
             finally:
                 chunkers.LANGUAGE_TABLE["python"]["impl_version"] = old
 
-    @unittest.skip("code_index_report lands in Task 4")
     def test_repairing_root_a_does_not_strand_root_b(self):
         with tempfile.TemporaryDirectory() as td:
             a = Path(td) / "a"
@@ -1914,11 +1950,11 @@ class TestRegistryContractEnforcement(unittest.TestCase):
 
 
 class TestStaleCheckConsultsChunkerVersion(unittest.TestCase):
-    """B2 (final fix wave): _code_index_is_stale compared only mtime/size,
-    so bumping a chunker's impl_version left every stored row reading
-    "current" until something on disk happened to change. It must compare
-    each stored stamp against the chunker version that lang would produce
-    today."""
+    """B2 (final fix wave): the old _code_index_is_stale compared only
+    mtime/size, so bumping a chunker's impl_version left every stored row
+    reading "current" until something on disk happened to change.
+    code_index_report must compare each stored stamp against the chunker
+    version that lang would produce today."""
 
     def test_impl_version_bump_makes_the_index_stale(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1931,7 +1967,7 @@ class TestStaleCheckConsultsChunkerVersion(unittest.TestCase):
 
             conn = memidx.open_code_db(db)
             try:
-                state_before, _ = memidx._code_index_state(conn, memidx.DEFAULT_PROJECT)
+                state_before = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)["state"]
                 self.assertEqual(state_before, "current")
 
                 prev = chunkers.LANGUAGE_TABLE["swift"]
@@ -1939,7 +1975,7 @@ class TestStaleCheckConsultsChunkerVersion(unittest.TestCase):
                 bumped["impl_version"] = str(int(prev["impl_version"]) + 100)
                 chunkers.LANGUAGE_TABLE["swift"] = bumped
                 try:
-                    state_after, _ = memidx._code_index_state(conn, memidx.DEFAULT_PROJECT)
+                    state_after = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)["state"]
                 finally:
                     chunkers.LANGUAGE_TABLE["swift"] = prev
             finally:
@@ -2445,8 +2481,105 @@ class TestConceptAttachment(unittest.TestCase):
                 del os.environ["MEMCONTINUUM_HOME"]
 
 
+class TestCodeIndexReport(unittest.TestCase):
+    def _search(self, db, q="fine", *extra):
+        script = ("import sys; sys.path.insert(0, %r); import memidx; "
+                  "memidx.main(['code-search', '--db', %r, %r, '--mode', 'fts', '--no-heal'] + %r)"
+                  ) % (str(TOOLS_DIR), str(db), q, list(extra))
+        return subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=30)
+
+    def test_failed_file_keeps_index_current_with_a_counted_line(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"; root.mkdir()
+            (root / "bad.py").write_text("def (:\n"); (root / "ok.py").write_text("def fine():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"; code_reindex(root, db, lang="python")
+            r = self._search(db)
+            self.assertNotIn("stale", r.stderr.lower(), r.stderr)
+            self.assertIn("1 file(s) failed to index", r.stderr)
+
+    def test_touch_is_not_a_change_but_an_edit_is(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"; root.mkdir(); p = root / "a.py"; p.write_text("def fine():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"; code_reindex(root, db, lang="python")
+            os.utime(p, (time.time() + 3600, time.time() + 3600))
+            conn = memidx.open_code_db(db)
+            self.assertEqual(memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)["state"], "current"); conn.close()
+            p.write_text("def other():\n    pass\n"); os.utime(p, (time.time() + 7200, time.time() + 7200))
+            conn = memidx.open_code_db(db)
+            rep = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)
+            self.assertEqual((rep["state"], rep["changed"]), ("stale", 1))
+
+    def test_not_indexed_makes_state_degraded_not_current(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"; root.mkdir(); (root / "x.py").write_text("def f():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"
+            real = chunkers.get_chunker
+            chunkers.get_chunker = lambda lang: (_ for _ in ()).throw(chunkers.BackendUnavailable("missing"))
+            try:
+                code_reindex(root, db, lang="python")
+                conn = memidx.open_code_db(db)
+                rep = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)
+            finally:
+                chunkers.get_chunker = real
+            self.assertEqual(rep["state"], "degraded"); self.assertEqual(rep["not_indexed"], 1)
+            r = self._search(db, "f")
+            self.assertIn("incomplete (1 file(s) not indexed)", r.stderr)
+
+    def test_chunker_version_drift_stales_failed_rows_too(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"; root.mkdir(); (root / "bad.py").write_text("def (:\n")
+            db = Path(td) / "idx-code.sqlite"; code_reindex(root, db, lang="python")
+            old = chunkers.LANGUAGE_TABLE["python"]["impl_version"]
+            chunkers.LANGUAGE_TABLE["python"]["impl_version"] = old + "-bump"
+            try:
+                conn = memidx.open_code_db(db)
+                self.assertEqual(memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)["state"], "stale")
+            finally:
+                chunkers.LANGUAGE_TABLE["python"]["impl_version"] = old
+
+    def test_report_is_per_root_and_missing_root_is_named(self):
+        with tempfile.TemporaryDirectory() as td:
+            a = Path(td) / "a"; b = Path(td) / "b"; a.mkdir(); b.mkdir()
+            (a / "x.py").write_text("def fx():\n    pass\n"); (b / "y.py").write_text("def fy():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"; code_reindex(a, db, lang="python"); code_reindex(b, db, lang="python")
+            (b / "y.py").write_text("def fy2():\n    pass\n"); os.utime(b / "y.py", (time.time() + 3600,) * 2)
+            conn = memidx.open_code_db(db)
+            rep = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)
+            self.assertEqual([(r["code_root"], r["changed"]) for r in rep["roots"]], [(str(a.resolve()), 0), (str(b.resolve()), 1)])
+            conn.close(); code_reindex(b, db, lang="python"); shutil.rmtree(b)
+            conn = memidx.open_code_db(db)
+            self.assertEqual(memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)["state"], "degraded"); conn.close()
+            r = self._search(db, "fx")
+            self.assertIn(f"recorded code root {b.resolve()} does not exist", r.stderr); self.assertIn("--drop-root", r.stderr)
+
+    def test_touching_a_not_indexed_file_is_not_a_change(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"; root.mkdir(); p = root / "x.py"; p.write_text("def f():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"
+            with mock.patch.multiple(chunkers, get_chunker=lambda lang: (_ for _ in ()).throw(chunkers.BackendUnavailable("m")),
+                                     backend_availability=lambda: "python=missing;swift=ok"):
+                code_reindex(root, db, lang="python")
+                os.utime(p, (time.time() + 3600,) * 2)
+                conn = memidx.open_code_db(db)
+                rep = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)
+            self.assertEqual((rep["state"], rep["changed"], rep["not_indexed"]), ("degraded", 0, 1))
+
+    def test_json_envelope(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"; root.mkdir()
+            (root / "bad.py").write_text("def (:\n"); (root / "ok.py").write_text("def fine():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"; code_reindex(root, db, lang="python")
+            env = json.loads(self._search(db, "fine", "--json").stdout)
+            self.assertEqual(env["state"], "current"); self.assertEqual(env["failed"], 1); self.assertEqual(env["not_indexed"], 0)
+            self.assertEqual(env["code_roots"][0]["code_root"], str(root.resolve())); self.assertEqual(env["embedding_mode"], "none")
+
+
 class TestStaleWarning(unittest.TestCase):
-    def test_touching_a_source_file_triggers_stderr_warning_on_search(self):
+    def test_editing_a_source_file_triggers_stderr_warning_on_search(self):
+        """Anatomy M2a Task 4: code_index_report is sha-confirmed -- a bare
+        `touch` alone is no longer enough to warn stale (see
+        TestCodeIndexReport.test_touch_is_not_a_change_but_an_edit_is); an
+        actual content edit is."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "code"
             root.mkdir()
@@ -2457,7 +2590,8 @@ class TestStaleWarning(unittest.TestCase):
 
             script = (
                 "import sys, time, os; sys.path.insert(0, %r); import memidx; "
-                "os.utime(%r, (time.time() + 3600, time.time() + 3600)); "
+                "p = %r; open(p, 'a').write('\\nfunc addedLater() {}\\n'); "
+                "os.utime(p, (time.time() + 3600, time.time() + 3600)); "
                 "memidx.main(['code-search', '--db', %r, 'outer func', '--mode', 'fts'])"
             ) % (str(TOOLS_DIR), str(target), str(db))
             result = subprocess.run(
@@ -2560,6 +2694,8 @@ class TestIndexProvenance(unittest.TestCase):
             self.assertGreater(len(data["results"]), 0)
 
     def test_stale_index_json_carries_state_stale(self):
+        """Anatomy M2a Task 4: code_index_report is sha-confirmed -- a real
+        content edit (not a bare `touch`) is what the state must react to."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "code"
             root.mkdir()
@@ -2567,6 +2703,7 @@ class TestIndexProvenance(unittest.TestCase):
             shutil.copy(FIXTURES / "NestedTypes.swift", target)
             db = Path(td) / "idx-code.sqlite"
             code_reindex(root, db, no_embed=True)
+            target.write_text(target.read_text() + "\nfunc addedLater() {}\n")
             os.utime(target, (time.time() + 3600, time.time() + 3600))
 
             result = self._run(["code-search", "--db", str(db), "outer func", "--mode", "fts", "--json"])
