@@ -36,6 +36,15 @@ MEMIDX="$ENGINE_ROOT/memidx.py"
 MEMLINT="$ENGINE_ROOT/memlint.py"
 SKILL_SRC="$ENGINE_ROOT/skills/memory-search/SKILL.md"
 
+# Sourced up here rather than inside the record-the-decision block at the end:
+# this script needs its store predicates (mc_is_git_repo/mc_is_marked_store)
+# from the very first validation onwards, and having ONE definition of "this
+# path still holds a store" shared with scripts/memcontinuum-update.sh is the
+# point -- the re-render walk and the installer must agree, by construction,
+# on what a store is. The library only defines functions when sourced.
+# shellcheck source=./mc-registry-lib.sh
+. "$SCRIPT_DIR/mc-registry-lib.sh" || { echo "ERROR: missing $SCRIPT_DIR/mc-registry-lib.sh -- incomplete checkout" >&2; exit 1; }
+
 OUR_HOOK_SCRIPTS="pre-edit-chain.sh newfile-nudge.sh ledger-post-edit.sh precompact-persist.sh sessionstart-remind.sh userprompt-remind.sh sessionend-stamp.sh"
 
 # D1 (updater workstream): the engine commit that is about to render every
@@ -65,6 +74,7 @@ LANGS_FLAG=""
 NEVER_EXT_FLAG=""
 NON_INTERACTIVE=0
 RECORD_DECISION=0
+ADOPT_ONLY=0
 declare -a CODE_ROOTS=()
 
 usage() {
@@ -72,7 +82,7 @@ usage() {
 Usage: repo-init.sh --project NAME [--store DIR] [--code-root DIR ...]
                    [--claude-dir DIR] [--python PATH]
                    [--bootstrap-venv [DIR]] [--langs LIST] [--never-ext LIST]
-                   [--non-interactive]
+                   [--non-interactive] [--adopt-only]
                    [--dry-run] [--force]
 
   --project NAME     project namespace (used for --project everywhere, and
@@ -151,6 +161,20 @@ Usage: repo-init.sh --project NAME [--store DIR] [--code-root DIR ...]
                       (never dropped) -- installing a second claude-dir for
                       the same project must not erase the first from the
                       registry.
+  --adopt-only        wire an EXISTING store; never create one. Unless
+                      --store is a directory that is already a git working
+                      tree carrying this tool's markers (a topics/incidents/
+                      concepts directory, or a README naming MemContinuum),
+                      this run is refused with "store-missing" before it
+                      writes anything at all -- no store tree, no git init,
+                      no hook wiring. --dry-run is refused the same way: a
+                      preview of an install that must never happen would only
+                      mislead. Pass this whenever the store is supposed to
+                      exist already and a fresh one would be wrong -- the
+                      re-render command (scripts/memcontinuum-update.sh)
+                      always does, so a registry row naming a store that was
+                      renamed or deleted can never quietly get a new, empty
+                      store seeded at the old path.
   --dry-run           print everything this script would do; write nothing
                       (except --bootstrap-venv's venv, see above).
   --force             allow --store to sit inside another git repo's working
@@ -197,19 +221,10 @@ nearest_existing_ancestor() {
     printf '%s' "$d"
 }
 
-# is_git_repo DIR -- true iff DIR is a git working tree, root OR linked
-# worktree (fix-round-4 R8). A linked worktree (`git worktree add`) has a
-# .git FILE (a "gitdir: <path>" pointer), not a directory -- every prior
-# `[ -d "$STORE/.git" ]` check in this script misread that as "not a git
-# repo at all", refusing a worktree store outright (or, under --force,
-# seeding fresh content on top of one). `[ -e ]` accepts either shape;
-# `rev-parse --is-inside-work-tree` confirms it is actually a working tree
-# (not, say, some unrelated directory that merely happens to contain a
-# file or dir named .git) before this counts as a real answer.
-is_git_repo() {
-    [ -e "$1/.git" ] || return 1
-    git -C "$1" rev-parse --is-inside-work-tree >/dev/null 2>&1
-}
+# is_git_repo DIR -- see mc_is_git_repo in scripts/mc-registry-lib.sh (the one
+# definition, shared with the re-render walk). Kept as a local name because
+# this script reads better with it, not as a second implementation.
+is_git_repo() { mc_is_git_repo "$@"; }
 
 # git_hooks_dir_for DIR -- prints the hooks directory git actually consults
 # for commits made in DIR (absolute). `rev-parse --git-path hooks` is the
@@ -362,6 +377,7 @@ while [ $# -gt 0 ]; do
         --never-ext) mc_need_value "$@"; NEVER_EXT_FLAG="$2"; shift 2 ;;
         --non-interactive) NON_INTERACTIVE=1; shift ;;
         --record-decision) RECORD_DECISION=1; shift ;;
+        --adopt-only) ADOPT_ONLY=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         --force) FORCE=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -489,6 +505,24 @@ if [ -n "$NEVER_EXT_FLAG" ] && [ "${#CODE_ROOTS_ABS[@]}" -eq 0 ]; then
     echo "note: --never-ext $NEVER_EXT_FLAG given with no --code-root -- there is no new-file reminder to silence, ignoring"
 fi
 
+# --adopt-only: this run may WIRE an existing store, never CREATE one.
+# Checked first, before every other store check below, for two reasons: it is
+# the strictest of them (an --adopt-only run that gets past here has a real
+# store, so none of the seeding paths can fire at all), and it must report
+# ITS OWN reason. Ordered after the nesting check, a vanished store whose
+# nearest existing ancestor happens to sit inside some other git repo would
+# die with "your --store is inside another repo, pass --force" -- advice that
+# is both wrong and dangerous here, since --force would then seed a store
+# where one must never be created.
+#
+# The whole point is the re-render walk (scripts/memcontinuum-update.sh),
+# which always passes this: a registry row naming a store that has since been
+# renamed or deleted must NOT cause a fresh, empty store to appear at the old
+# path and be wired up as if nothing had happened. --dry-run refuses too.
+if [ "$ADOPT_ONLY" -eq 1 ] && ! mc_is_marked_store "$STORE"; then
+    fail "store-missing: --adopt-only was given, but $STORE is not an existing MemContinuum store (it must be a git working tree carrying this tool's markers -- a topics/incidents/concepts directory, or a README naming MemContinuum). Nothing was written. If the store was renamed or moved, point --store at where it lives now; if it was deleted, restore it from its own git history. This mode never creates a store." 15
+fi
+
 # store dir must not already live inside a DIFFERENT git repo's working
 # tree, unless it is already its own repo (the normal re-run case, a
 # linked worktree included -- R8) or --force was given.
@@ -513,16 +547,9 @@ fi
 # since --force's job is "allow nesting", not "allow adopting the wrong repo".
 STORE_IS_ADOPTED=0
 if is_git_repo "$STORE"; then
-    STORE_HAS_SHAPE=0
-    for d in topics incidents concepts; do
-        [ -d "$STORE/$d" ] && STORE_HAS_SHAPE=1
-    done
-    if [ "$STORE_HAS_SHAPE" -eq 0 ] && [ -f "$STORE/README.md" ]; then
-        case "$(cat "$STORE/README.md" 2>/dev/null)" in
-            *MemContinuum*) STORE_HAS_SHAPE=1 ;;
-        esac
-    fi
-    if [ "$STORE_HAS_SHAPE" -eq 0 ]; then
+    # mc_is_marked_store (scripts/mc-registry-lib.sh) is the one definition of
+    # "this path holds a store", shared with the re-render walk.
+    if ! mc_is_marked_store "$STORE"; then
         fail "--store $STORE is an existing git repo with none of this tool's markers (no topics/incidents/concepts directory, no README mentioning MemContinuum) -- refusing to seed store directories and a replacement post-commit hook into what looks like an unrelated repo. Point --store at a location that does not exist yet, or at an existing MemContinuum store." 9
     fi
     STORE_IS_ADOPTED=1
@@ -1394,12 +1421,8 @@ fi
 # completion, gated on a flag a driven flow only ever passes after a human
 # has already said yes.
 if [ "$DRY_RUN" -eq 0 ] && [ "$RECORD_DECISION" -eq 1 ]; then
-    RECORD_LIB="$SCRIPT_DIR/mc-registry-lib.sh"
-    if [ ! -f "$RECORD_LIB" ]; then
-        echo "note: --record-decision given but $RECORD_LIB is missing -- skipping (incomplete checkout)" >&2
-    else
-        # shellcheck source=./mc-registry-lib.sh
-        . "$RECORD_LIB"
+    # mc-registry-lib.sh is sourced at the top of this script (it is a hard
+    # requirement now, not an optional extra for this one block).
         if mc_repo_key "$(dirname "$CLAUDE_DIR")"; then
             RD_REPO="$MC_REPO"
             RD_KEY="$MC_REPO_KEY"
@@ -1426,13 +1449,15 @@ if [ "$DRY_RUN" -eq 0 ] && [ "$RECORD_DECISION" -eq 1 ]; then
                 RD_NEVER="$(mc_union_semi "$MC_NOTE_FIELD" "$RD_NEVER")"
             fi
             declare -a RD_ARGS=(wired --repo "$RD_REPO" --store "$STORE" --project "$PROJECT")
-            RD_OLD_IFS="$IFS"
-            IFS=';'
-            for d in $RD_CLAUDE_DIRS; do [ -n "$d" ] && RD_ARGS+=(--claude-dir "$d"); done
-            for cr in $RD_CODE_ROOTS; do [ -n "$cr" ] && RD_ARGS+=(--code-root "$cr"); done
-            IFS="$RD_OLD_IFS"
-            [ -n "$RD_LANGS" ] && RD_ARGS+=(--langs "$(printf '%s' "$RD_LANGS" | tr ';' ',')")
-            [ -n "$RD_NEVER" ] && RD_ARGS+=(--never-ext "$(printf '%s' "$RD_NEVER" | tr ';' ',')")
+            mc_split_semi "$RD_CLAUDE_DIRS"
+            for d in ${MC_SPLIT[@]+"${MC_SPLIT[@]}"}; do RD_ARGS+=(--claude-dir "$d"); done
+            # mc_build_wiring_args (scripts/mc-registry-lib.sh): the one
+            # builder for the --code-root/--langs/--never-ext tail, shared with
+            # scripts/memcontinuum-update.sh.
+            mc_build_wiring_args "$RD_CODE_ROOTS" \
+                "$(printf '%s' "$RD_LANGS" | tr ';' ',')" \
+                "$(printf '%s' "$RD_NEVER" | tr ';' ',')"
+            RD_ARGS+=(${MC_BUILT_ARGS[@]+"${MC_BUILT_ARGS[@]}"})
             if bash "$SCRIPT_DIR/memcontinuum-decide.sh" "${RD_ARGS[@]}"; then
                 echo "decision recorded: $RD_KEY wired"
             else
@@ -1441,7 +1466,6 @@ if [ "$DRY_RUN" -eq 0 ] && [ "$RECORD_DECISION" -eq 1 ]; then
         else
             echo "note: --record-decision given but $CLAUDE_DIR is not inside a git working tree -- skipping" >&2
         fi
-    fi
 fi
 
 echo

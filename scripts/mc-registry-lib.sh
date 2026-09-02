@@ -242,17 +242,84 @@ mc_wired_commands_for_project() {
 # reimplement it a third time. repo-init.sh emits shlex-quoted values
 # (VAR='a b/c') when the value could contain a shell-special character;
 # hand-wired or charset-restricted values (PROJECT, a plain sha) often
-# aren't quoted -- the quoted form is tried first, then the bare word (up to
-# the next space). Sets MC_ENV_VALUE (empty string if VAR is absent from
-# CMD) and always returns 0 -- an absent var is not an error, just "this
-# line doesn't carry it" (pre-stamp lines lack MEMCONTINUUM_RENDERED, for
-# instance).
+# aren't quoted -- the quoted form is used when the assignment is followed by
+# a quote, else the bare word (up to the next space or the closing JSON
+# quote). Sets MC_ENV_VALUE (empty string if VAR is absent from CMD) and
+# always returns 0 -- an absent var is not an error, just "this line doesn't
+# carry it" (pre-stamp lines lack MEMCONTINUUM_RENDERED, for instance).
+#
+# Pure parameter expansion, no sed fork, and -- the reason it was rewritten --
+# an EXPLICITLY EMPTY value is read as empty. The old two-sed version tried
+# the quoted form first and treated its empty result as "not found", falling
+# through to the bare-word pattern, which then captured the two literal quote
+# characters: `MEMCONTINUUM_NEVER_EXTS=''` came back as `''`, and that
+# two-character string went on to be recorded in a registry row and rendered
+# back onto a hook line as the nonsense glob `*.''`.
+#
+# The match is anchored on an assignment boundary (start of string, or a
+# preceding character that cannot be part of an identifier -- a space, or the
+# JSON string's opening quote for the first token on the line) so a VAR that
+# is a suffix of a longer variable name can never be read out of it.
 mc_command_env_value() {
-    local cmd="$1" var="$2" value
-    value="$(printf '%s\n' "$cmd" | sed -n "s/.*${var}='\([^']*\)'.*/\1/p")"
-    [ -n "$value" ] || value="$(printf '%s\n' "$cmd" | sed -n "s/.*${var}=\([^ ]*\).*/\1/p")"
-    MC_ENV_VALUE="$value"
-    return 0
+    local cmd="$1" var="$2" head tail
+    MC_ENV_VALUE=""
+    tail="$cmd"
+    while :; do
+        case "$tail" in
+            *"$var="*) ;;
+            *) return 0 ;;
+        esac
+        head="${tail%%"$var="*}"
+        tail="${tail#*"$var="}"
+        case "$head" in
+            ""|*[!A-Za-z0-9_]) ;;
+            *) continue ;;
+        esac
+        case "$tail" in
+            "'"*)
+                tail="${tail#\'}"
+                MC_ENV_VALUE="${tail%%\'*}"
+                ;;
+            *)
+                MC_ENV_VALUE="${tail%%[ \"]*}"
+                ;;
+        esac
+        return 0
+    done
+}
+
+# mc_is_git_repo DIR -- true iff DIR is a git working tree, root OR linked
+# worktree. A linked worktree (`git worktree add`) has a .git FILE (a
+# "gitdir: <path>" pointer), not a directory, so `[ -d "$DIR/.git" ]` misreads
+# one as "not a git repo at all". `[ -e ]` accepts either shape;
+# `rev-parse --is-inside-work-tree` confirms it is actually a working tree
+# (not some unrelated directory that merely happens to contain a file or dir
+# named .git) before this counts as a real answer.
+mc_is_git_repo() {
+    [ -e "$1/.git" ] || return 1
+    git -C "$1" rev-parse --is-inside-work-tree >/dev/null 2>&1
+}
+
+# mc_is_marked_store DIR -- true iff DIR is an existing decision store: a git
+# working tree carrying this tool's markers (a topics/incidents/concepts
+# directory, or a README naming the tool). The ONE definition of "this path
+# still holds a store", shared by the installer (which refuses to seed store
+# directories and a replacement post-commit hook into an unrelated repo) and
+# by the re-render walk (whose row may name a store that has since been
+# renamed or deleted -- re-running the installer against a missing --store
+# would seed a fresh one there, which is the line neither command crosses).
+mc_is_marked_store() {
+    local dir="$1" d
+    mc_is_git_repo "$dir" || return 1
+    for d in topics incidents concepts; do
+        [ -d "$dir/$d" ] && return 0
+    done
+    if [ -f "$dir/README.md" ]; then
+        case "$(cat "$dir/README.md" 2>/dev/null)" in
+            *MemContinuum*) return 0 ;;
+        esac
+    fi
+    return 1
 }
 
 # mc_note_field NOTE KEY
@@ -274,6 +341,68 @@ mc_note_field() {
             "$key="*) MC_NOTE_FIELD="${tok#"$key"=}"; return 0 ;;
         esac
     done
+    return 0
+}
+
+# mc_split_semi LIST
+#
+# Splits a ';'-joined registry list field into the MC_SPLIT array, dropping
+# empty elements. The ONE way this codebase turns a stored list back into
+# arguments: the hand-rolled alternatives it replaces were
+# `for x in $(printf '%s' "$list" | tr ';' ' ')`, which both word-splits on
+# spaces (so a store or claude-dir under a path containing one arrives as two
+# arguments) and glob-expands against the current directory. `read -ra` does
+# neither. Bash-3.2 safe.
+mc_split_semi() {
+    MC_SPLIT=()
+    [ -n "${1:-}" ] || return 0
+    local part
+    local -a raw=()
+    IFS=';' read -ra raw <<<"$1"
+    for part in "${raw[@]:-}"; do
+        [ -n "$part" ] && MC_SPLIT[${#MC_SPLIT[@]}]="$part"
+    done
+    return 0
+}
+
+# mc_build_wiring_args CODE_ROOTS_SEMI LANGS_COMMA NEVER_COMMA
+#
+# Builds the tail every "re-run the wiring with this row's parameters" command
+# line shares -- `--code-root DIR` per recorded code root, then `--langs` and
+# `--never-ext` when non-empty -- into the MC_BUILT_ARGS array. Both
+# memcontinuum-decide.sh and scripts/repo-init.sh take exactly these three
+# options with exactly these spellings, which is why one builder can serve
+# both.
+#
+# It replaces four near-identical hand-rolled blocks (the installer's
+# record-the-decision arguments, and the re-render command's targeted-mode,
+# migration, and per-claude-dir blocks) that had already drifted: some split
+# the semicolon lists with an IFS assignment, others with `tr ';' ' '` and an
+# unquoted expansion that word-split every path containing a space and
+# glob-expanded the rest.
+#
+# Claude-dirs are deliberately NOT built here: `decide.sh wired` takes the
+# whole set at once while an installer run takes exactly one, so the caller
+# decides. Results come back through an array global because bash 3.2 has no
+# namerefs, and because an array is the only way to pass a path with a space
+# through without re-quoting it.
+mc_build_wiring_args() {
+    local code_roots_semi="$1" langs_comma="$2" never_comma="$3" root
+    MC_BUILT_ARGS=()
+    mc_split_semi "$code_roots_semi"
+    for root in "${MC_SPLIT[@]:-}"; do
+        [ -n "$root" ] || continue
+        MC_BUILT_ARGS[${#MC_BUILT_ARGS[@]}]="--code-root"
+        MC_BUILT_ARGS[${#MC_BUILT_ARGS[@]}]="$root"
+    done
+    if [ -n "$langs_comma" ]; then
+        MC_BUILT_ARGS[${#MC_BUILT_ARGS[@]}]="--langs"
+        MC_BUILT_ARGS[${#MC_BUILT_ARGS[@]}]="$langs_comma"
+    fi
+    if [ -n "$never_comma" ]; then
+        MC_BUILT_ARGS[${#MC_BUILT_ARGS[@]}]="--never-ext"
+        MC_BUILT_ARGS[${#MC_BUILT_ARGS[@]}]="$never_comma"
+    fi
     return 0
 }
 

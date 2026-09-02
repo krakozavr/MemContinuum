@@ -26,8 +26,14 @@
 #     rules        ok/stale/missing/foreign -- <claude-dir>/rules/
 #                  memcontinuum.md's own identity marker and stamp
 #     action       ok | stale | store-mismatch | rules-stale | rules-missing
-#                  | rules-foreign | migrate | store-missing | no-wiring |
-#                  unrecoverable
+#                  | rules-foreign | migrate | migrate-needs-never-exts |
+#                  store-missing | no-wiring | unrecoverable
+#
+#                  store-missing outranks every other answer, including a
+#                  stamp and a store= that both look right: those compare
+#                  strings, and a string can agree with a store that has been
+#                  renamed or deleted. Nothing is re-rendered against a store
+#                  that is not there.
 #
 # --apply    re-runs scripts/repo-init.sh, with the parameters this row
 #            recorded (adopting the row's existing --store -- this command
@@ -63,11 +69,21 @@
 #            $PWD default for a write that changes what gets indexed.
 #
 # This command never wires an undecided or declined repo (it only ever
-# touches rows already marked `wired`), and never creates, deletes, or
-# rewrites a store's own git history -- re-rendering settings/rules/skill is
-# all it does. Always exits 0 in the default walk (a stale row is reported,
-# not an error); --add-lang/--never-ext exit non-zero on bad usage, same as
-# memcontinuum-decide.sh.
+# touches rows already marked `wired`), and never creates a store: every
+# installer run it makes is passed --adopt-only, which refuses outright
+# unless the store is already there. It never deletes or rewrites a store's
+# own git history either -- re-rendering settings/rules/skill is all it does.
+#
+# Exit codes:
+#   the reporting walk (no --apply) always exits 0 -- a stale row is the
+#   ANSWER there, not an error.
+#   --apply exits 0 only when every claude-dir it walked ended up correct:
+#   already ok, or re-rendered successfully. Anything left undone -- a failed
+#   installer run, or a dir deliberately skipped (store-missing, a foreign
+#   rules file, a migration this command must not guess at) -- exits non-zero,
+#   with the table still printed and the reason on stderr.
+#   --add-lang/--never-ext exit non-zero on bad usage, same as
+#   memcontinuum-decide.sh.
 # --MC-USAGE-END--
 
 set -u
@@ -148,18 +164,6 @@ mc_update_resolve_python() {
     return 1
 }
 
-# mc_update_is_store DIR -- true iff DIR is a git working tree (root or
-# linked worktree -- a linked worktree's .git is a FILE, not a directory,
-# same shape scripts/repo-init.sh's own is_git_repo() checks for). A store
-# that fails this check no longer exists as a real git repository --
-# INC-0104's exact shape (a rename/delete under the row's nose) -- and
-# --apply must never re-seed one: that is repo-init's fresh-install path,
-# not this command's.
-mc_update_is_store() {
-    [ -e "$1/.git" ] || return 1
-    git -C "$1" rev-parse --is-inside-work-tree >/dev/null 2>&1
-}
-
 # mc_update_rules_state CLAUDE_DIR -- sets MC_RULES_STATE to one of
 # ok/stale/missing/foreign for CLAUDE_DIR/rules/memcontinuum.md.
 mc_update_rules_state() {
@@ -235,6 +239,7 @@ mc_update_recover_from_settings() {
     MC_RECOVERED_CODE_ROOTS=""
     MC_RECOVERED_LANGS=""
     MC_RECOVERED_NEVER=""
+    MC_RECOVERED_NEVER_OK=1
     lang_glob_str=""
     never_glob_str=""
     while IFS= read -r line || [ -n "$line" ]; do
@@ -301,9 +306,29 @@ PYEOF
     fi
 
     if [ -n "$never_glob_str" ]; then
-        local -a nevers=() g
-        for g in $never_glob_str; do
-            nevers+=("$(mc_update_glob_to_ext "$g")")
+        # `read -ra`, never `for g in $never_glob_str`: the value being
+        # recovered is a list of EXTENSION PATTERNS (`*.md *.txt`), and an
+        # unquoted expansion hands them straight to pathname expansion --
+        # run from a directory holding README.md and requirements.txt, the
+        # loop silently recovered THOSE FILENAMES and wrote them into the
+        # registry row as the never-list. `read -ra` splits on IFS and never
+        # globs.
+        local -a nevers=() never_toks=()
+        local g ext
+        read -ra never_toks <<<"$never_glob_str"
+        for g in "${never_toks[@]:-}"; do
+            [ -n "$g" ] || continue
+            ext="$(mc_update_glob_to_ext "$g")"
+            # Only a plain extension survives. Anything else -- a path, a
+            # bare word, a leftover quote character -- means this line was
+            # hand-edited into a shape this command cannot read, and a guess
+            # would be written into a registry row and rendered back onto
+            # every hook line. Refused instead: the human names the list.
+            case "$ext" in
+                .*[!A-Za-z0-9_+-]*|.|"") MC_RECOVERED_NEVER_OK=0 ;;
+                .*) nevers+=("$ext") ;;
+                *) MC_RECOVERED_NEVER_OK=0 ;;
+            esac
         done
         MC_RECOVERED_NEVER="$(IFS=,; printf '%s' "${nevers[*]:-}")"
     fi
@@ -376,8 +401,17 @@ process_claude_dir() {
 
     mc_update_rules_state "$claude_dir"
 
-    if [ "$LEGACY" -eq 1 ]; then
-        action="migrate"
+    # store-missing outranks everything, INCLUDING a clean stamp and a
+    # store= that still matches what is rendered. A rendered
+    # MEMCONTINUUM_ROOT agreeing with the row's store= only proves the two
+    # STRINGS agree -- if nothing exists at that path any more (renamed,
+    # deleted, or replaced by an unrelated git repo), that is agreement on a
+    # corpse: every hook wired here points at a store that is gone, and this
+    # walk's job is to say so rather than print `ok`.
+    if ! mc_is_marked_store "$STORE"; then
+        action="store-missing"
+    elif [ "$LEGACY" -eq 1 ]; then
+        action="$LEGACY_ACTION"
     elif [ "$stamp" != "$ENGINE_SHA" ]; then
         action="stale"
     elif [ "$store_match" = "no" ]; then
@@ -400,6 +434,21 @@ process_claude_dir() {
     return 0
 }
 
+# not_applied REASON_LINE -- one place that records "--apply was asked for and
+# this claude-dir did NOT end up re-rendered", whether that was a refusal
+# (store-missing, a foreign rules file, a migration this command must not
+# guess at) or an outright failure of repo-init. `--apply` exits non-zero
+# unless every dir it walked is either already `ok` or was successfully
+# re-rendered: a command that reports success while silently leaving work
+# undone is the one behavior a re-render tool cannot afford. The plain
+# reporting walk (no --apply) still always exits 0 -- there, a stale row is
+# the ANSWER, not a failure.
+WALK_RC=0
+not_applied() {
+    echo "$1" >&2
+    WALK_RC=1
+}
+
 # apply_claude_dir CLAUDE_DIR ACTION -- re-runs repo-init.sh for one
 # claude-dir with this row's recorded parameters. Never invoked for
 # action=ok. action=rules-foreign is reported but never applied here
@@ -412,33 +461,39 @@ apply_claude_dir() {
     local cr
 
     if [ "$action" = "rules-foreign" ]; then
-        echo "  SKIPPED $claude_dir: rules-foreign -- move $claude_dir/rules/memcontinuum.md aside first (it was not rendered by this installer)" >&2
+        not_applied "  SKIPPED $claude_dir: rules-foreign -- move $claude_dir/rules/memcontinuum.md aside first (it was not rendered by this installer)"
         return 0
     fi
 
-    if ! mc_update_is_store "$STORE"; then
-        echo "  SKIPPED $claude_dir: store-missing -- $STORE is not a git repository (renamed or deleted?) -- fix the row (memcontinuum-decide.sh wired --repo ... --store NEWPATH ...) or restore the store before re-rendering" >&2
+    case "$action" in
+        migrate-needs-*)
+            not_applied "  SKIPPED $claude_dir: $action -- $MIGRATE_BLOCKED_HINT"
+            return 0
+            ;;
+    esac
+
+    if ! mc_is_marked_store "$STORE"; then
+        not_applied "  SKIPPED $claude_dir: store-missing -- $STORE is not an existing MemContinuum store (renamed or deleted?) -- fix the row (memcontinuum-decide.sh wired --repo ... --store NEWPATH ...) or restore the store before re-rendering"
         return 0
     fi
 
-    args=(--project "$PROJECT" --store "$STORE" --claude-dir "$claude_dir" --non-interactive)
-    if [ -n "$CODE_ROOTS_SEMI" ]; then
-        local IFS_OLD="$IFS"
-        IFS=';'
-        for cr in $CODE_ROOTS_SEMI; do
-            [ -n "$cr" ] && args+=(--code-root "$cr")
-        done
-        IFS="$IFS_OLD"
-    fi
-    [ -n "$LANGS_COMMA" ] && args+=(--langs "$LANGS_COMMA")
-    [ -n "$NEVER_COMMA" ] && args+=(--never-ext "$NEVER_COMMA")
+    # --adopt-only, always: a re-render wires a store that already exists and
+    # never creates one. This is belt AND braces with the store check just
+    # above -- the check is what produces the readable message, the flag is
+    # what makes it impossible for any path through this command to seed a
+    # store even if a future edit forgets the check.
+    args=(--project "$PROJECT" --store "$STORE" --claude-dir "$claude_dir" --non-interactive --adopt-only)
+    mc_build_wiring_args "$CODE_ROOTS_SEMI" "$LANGS_COMMA" "$NEVER_COMMA"
+    args+=(${MC_BUILT_ARGS[@]+"${MC_BUILT_ARGS[@]}"})
 
     echo "  applying: bash $REPO_INIT ${args[*]}"
     if bash "$REPO_INIT" "${args[@]}" >"$SBOX_APPLY_LOG" 2>&1; then
         echo "  OK $claude_dir"
     else
-        echo "  FAILED $claude_dir (rc=$?) -- see below" >&2
+        local rc=$?
+        not_applied "  FAILED $claude_dir (rc=$rc) -- see below"
         sed 's/^/    /' "$SBOX_APPLY_LOG" >&2
+        MIGRATE_RENDER_FAILED=1
     fi
 }
 
@@ -499,17 +554,63 @@ if [ -n "$ADD_LANG" ] || [ -n "$NEVER_EXT" ]; then
     LANGS_COMMA="$(printf '%s' "$NEW_LANGS_SEMI" | tr ';' ',')"
     NEVER_COMMA="$(printf '%s' "$NEW_NEVER_SEMI" | tr ';' ',')"
 
+    # The store has to still be there. Checked here, before anything else, so
+    # a renamed or deleted store gets this command's own plain answer rather
+    # than a re-render's -- and so no registry row is ever rewritten to
+    # describe wiring for a store that does not exist.
+    if ! mc_is_marked_store "$STORE"; then
+        echo "store-missing: $STORE is not an existing MemContinuum store (renamed or deleted?) -- nothing was written. Fix the row (memcontinuum-decide.sh wired --repo $MC_REPO --store NEWPATH --project $PROJECT ...) or restore the store, then re-run." >&2
+        exit 1
+    fi
+
+    # An unknown language never reaches the registry. repo-init validates
+    # --langs too, but only when the install has a --code-root to wire it
+    # into: a row with no code-roots would sail straight past that check and
+    # record a language this engine has no chunker for.
+    if [ -n "$ADD_LANG" ]; then
+        MC_UPDATE_PY="$(mc_update_resolve_python)" || MC_UPDATE_PY=""
+        if [ -z "$MC_UPDATE_PY" ]; then
+            echo "cannot validate --add-lang $ADD_LANG: no python found (set \$MEMCONTINUUM_PYTHON or run memcontinuum-setup.sh). Refusing to record a language this command could not check." >&2
+            exit 1
+        fi
+        MC_UPDATE_LANG_ERR="$(
+            MC_UPDATE_WANT="$ADD_LANG" MC_UPDATE_ENGINE_ROOT="$ENGINE_ROOT" \
+            PYTHONPATH= "$MC_UPDATE_PY" - <<'PYEOF'
+import os, sys
+sys.path.insert(0, os.environ["MC_UPDATE_ENGINE_ROOT"])
+import chunkers
+known = set(chunkers.LANGUAGE_TABLE)
+bad = [w for w in (t.strip() for t in os.environ["MC_UPDATE_WANT"].split(",")) if w and w not in known]
+if bad:
+    print("unknown language: %s (this engine version knows: %s)"
+          % (", ".join(bad), " ".join(sorted(known))))
+PYEOF
+        )" || {
+            echo "could not read this engine's language table to validate --add-lang $ADD_LANG -- nothing was written" >&2
+            exit 1
+        }
+        if [ -n "$MC_UPDATE_LANG_ERR" ]; then
+            echo "$MC_UPDATE_LANG_ERR" >&2
+            echo "nothing was written -- the registry row is unchanged." >&2
+            exit 1
+        fi
+    fi
+
+    mc_split_semi "$CLAUDE_DIRS_SEMI"
+    TARGET_CLAUDE_DIRS=(${MC_SPLIT[@]+"${MC_SPLIT[@]}"})
+    mc_build_wiring_args "$CODE_ROOTS_SEMI" "$LANGS_COMMA" "$NEVER_COMMA"
+    WIRING_ARGS=(${MC_BUILT_ARGS[@]+"${MC_BUILT_ARGS[@]}"})
+
     DECIDE_ARGS=(wired --repo "$MC_REPO" --store "$STORE" --project "$PROJECT")
-    OLD_IFS="$IFS"; IFS=';'
-    for d in $CLAUDE_DIRS_SEMI; do [ -n "$d" ] && DECIDE_ARGS+=(--claude-dir "$d"); done
-    for cr in $CODE_ROOTS_SEMI; do [ -n "$cr" ] && DECIDE_ARGS+=(--code-root "$cr"); done
-    IFS="$OLD_IFS"
-    [ -n "$LANGS_COMMA" ] && DECIDE_ARGS+=(--langs "$LANGS_COMMA")
-    [ -n "$NEVER_COMMA" ] && DECIDE_ARGS+=(--never-ext "$NEVER_COMMA")
+    for d in ${TARGET_CLAUDE_DIRS[@]+"${TARGET_CLAUDE_DIRS[@]}"}; do
+        DECIDE_ARGS+=(--claude-dir "$d")
+    done
+    DECIDE_ARGS+=(${WIRING_ARGS[@]+"${WIRING_ARGS[@]}"})
 
     echo "plan: $DECIDE wired --repo $MC_REPO --store $STORE --project $PROJECT (langs=$LANGS_COMMA never=$NEVER_COMMA claude-dirs=$CLAUDE_DIRS_SEMI code-roots=$CODE_ROOTS_SEMI)"
-    for d in $(printf '%s' "$CLAUDE_DIRS_SEMI" | tr ';' ' '); do
-        echo "plan: bash $REPO_INIT --project $PROJECT --store $STORE --claude-dir $d --non-interactive --langs $LANGS_COMMA --never-ext $NEVER_COMMA $(for cr in $(printf '%s' "$CODE_ROOTS_SEMI" | tr ';' ' '); do printf -- '--code-root %s ' "$cr"; done)"
+    for d in ${TARGET_CLAUDE_DIRS[@]+"${TARGET_CLAUDE_DIRS[@]}"}; do
+        [ -n "$d" ] || continue
+        echo "plan: bash $REPO_INIT --project $PROJECT --store $STORE --claude-dir $d --non-interactive --adopt-only --langs $LANGS_COMMA --never-ext $NEVER_COMMA (code-roots: ${CODE_ROOTS_SEMI:-none})"
     done
 
     # Consent is the command itself (see this mode's own usage text above):
@@ -520,25 +621,32 @@ if [ -n "$ADD_LANG" ] || [ -n "$NEVER_EXT" ]; then
         exit 0
     fi
 
-    if ! bash "$DECIDE" "${DECIDE_ARGS[@]}"; then
-        echo "ERROR: could not rewrite the registry row -- see above" >&2
-        exit 1
-    fi
+    # RE-RENDER FIRST, RECORD SECOND. The registry row is the description of
+    # what is rendered on disk; writing it before the render means a failed
+    # render (a foreign rules file, an unwritable claude-dir, a store that
+    # went missing between the check above and now) leaves the registry
+    # claiming a language set that exists nowhere -- and every later
+    # re-render replays that claim. If any claude-dir fails, the row is left
+    # exactly as it was.
     RC=0
-    for d in $(printf '%s' "$CLAUDE_DIRS_SEMI" | tr ';' ' '); do
-        [ -n "$d" ] || continue
-        REINIT_ARGS=(--project "$PROJECT" --store "$STORE" --claude-dir "$d" --non-interactive)
-        for cr in $(printf '%s' "$CODE_ROOTS_SEMI" | tr ';' ' '); do
-            [ -n "$cr" ] && REINIT_ARGS+=(--code-root "$cr")
-        done
-        [ -n "$LANGS_COMMA" ] && REINIT_ARGS+=(--langs "$LANGS_COMMA")
-        [ -n "$NEVER_COMMA" ] && REINIT_ARGS+=(--never-ext "$NEVER_COMMA")
+    for d in ${TARGET_CLAUDE_DIRS[@]+"${TARGET_CLAUDE_DIRS[@]}"}; do
+        REINIT_ARGS=(--project "$PROJECT" --store "$STORE" --claude-dir "$d" --non-interactive --adopt-only)
+        REINIT_ARGS+=(${WIRING_ARGS[@]+"${WIRING_ARGS[@]}"})
         if ! bash "$REPO_INIT" "${REINIT_ARGS[@]}"; then
             echo "ERROR: re-render failed for $d -- see above" >&2
             RC=1
         fi
     done
-    exit "$RC"
+    if [ "$RC" -ne 0 ]; then
+        echo "ERROR: at least one claude-dir did not re-render -- the registry row was NOT changed (it still describes the wiring that is actually on disk)." >&2
+        exit 1
+    fi
+
+    if ! bash "$DECIDE" "${DECIDE_ARGS[@]}"; then
+        echo "ERROR: the re-render succeeded but the registry row could not be rewritten -- see above. Re-run this command to try the row again." >&2
+        exit 1
+    fi
+    exit 0
 fi
 
 # --- default mode: walk every wired row -------------------------------
@@ -598,40 +706,51 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
     # per-claude-dir walk, so every claude-dir's `migrate` apply (below)
     # uses the same recovered values, and the end-of-row registry rewrite
     # only has to happen once.
+    LEGACY_ACTION="migrate"
+    MIGRATE_BLOCKED_HINT=""
+    # Reset per row: the registry row is rewritten only when every one of this
+    # row's claude-dirs actually re-rendered. A row rewritten after a failed
+    # render would record parameters that are not on disk anywhere.
+    MIGRATE_RENDER_FAILED=0
     if [ "$LEGACY" -eq 1 ]; then
         FIRST_CLAUDE_DIR="${CLAUDE_DIRS_SEMI%%;*}"
         mc_update_recover_from_settings "$PROJECT" "$FIRST_CLAUDE_DIR"
         [ -n "$CODE_ROOTS_SEMI" ] || CODE_ROOTS_SEMI="$MC_RECOVERED_CODE_ROOTS"
         [ -n "$LANGS_COMMA" ] || LANGS_COMMA="$MC_RECOVERED_LANGS"
         [ -n "$NEVER_COMMA" ] || NEVER_COMMA="$MC_RECOVERED_NEVER"
+        # A never-list that could not be read back as plain extensions is not
+        # migrated by guessing. The registry row is the thing every future
+        # re-render replays; writing a value this command had to invent would
+        # bake the invention in permanently.
+        if [ "$MC_RECOVERED_NEVER_OK" -eq 0 ]; then
+            LEGACY_ACTION="migrate-needs-never-exts"
+            MIGRATE_BLOCKED_HINT="the never-mention list rendered at $FIRST_CLAUDE_DIR is not a plain extension list, so it cannot be read back. Nothing was written. Name the list yourself: memcontinuum-decide.sh wired --repo $KEY --store $STORE --project $PROJECT --claude-dir $FIRST_CLAUDE_DIR --never-ext .ext[,.ext]"
+        fi
     fi
 
-    OLD_IFS="$IFS"
-    IFS=';'
-    for CLAUDE_DIR in $CLAUDE_DIRS_SEMI; do
-        IFS="$OLD_IFS"
-        [ -n "$CLAUDE_DIR" ] || continue
+    mc_split_semi "$CLAUDE_DIRS_SEMI"
+    for CLAUDE_DIR in ${MC_SPLIT[@]+"${MC_SPLIT[@]}"}; do
         process_claude_dir "$CLAUDE_DIR"
-        IFS=';'
     done
-    IFS="$OLD_IFS"
 
-    if [ "$LEGACY" -eq 1 ] && [ "$APPLY" -eq 1 ]; then
+    if [ "$LEGACY" -eq 1 ] && [ "$APPLY" -eq 1 ] && [ "$LEGACY_ACTION" = "migrate" ] \
+           && [ "$MIGRATE_RENDER_FAILED" -eq 0 ]; then
         MIGRATE_ARGS=(wired --repo "$KEY" --store "$STORE" --project "$PROJECT")
-        OLD_IFS="$IFS"; IFS=';'
-        for d in $CLAUDE_DIRS_SEMI; do [ -n "$d" ] && MIGRATE_ARGS+=(--claude-dir "$d"); done
-        for cr in $CODE_ROOTS_SEMI; do [ -n "$cr" ] && MIGRATE_ARGS+=(--code-root "$cr"); done
-        IFS="$OLD_IFS"
-        [ -n "$LANGS_COMMA" ] && MIGRATE_ARGS+=(--langs "$LANGS_COMMA")
-        [ -n "$NEVER_COMMA" ] && MIGRATE_ARGS+=(--never-ext "$NEVER_COMMA")
+        mc_split_semi "$CLAUDE_DIRS_SEMI"
+        for d in ${MC_SPLIT[@]+"${MC_SPLIT[@]}"}; do MIGRATE_ARGS+=(--claude-dir "$d"); done
+        mc_build_wiring_args "$CODE_ROOTS_SEMI" "$LANGS_COMMA" "$NEVER_COMMA"
+        MIGRATE_ARGS+=(${MC_BUILT_ARGS[@]+"${MC_BUILT_ARGS[@]}"})
         # KEY is a path here (the only LEGACY branch that reaches this point
         # -- the remote-keyed one `continue`d above), so `--repo "$KEY"` is
         # safe: decide.sh re-derives the very same key from it.
         if bash "$DECIDE" "${MIGRATE_ARGS[@]}" >/dev/null 2>&1; then
             echo "  migrated: $KEY registry row now records claude-dirs/code-roots/langs/never" >&2
         else
-            echo "  MIGRATE FAILED: $KEY -- registry row left as-is, re-render still applied above if it succeeded" >&2
+            not_applied "  MIGRATE FAILED: $KEY -- registry row left as-is, re-render still applied above if it succeeded"
         fi
+    elif [ "$LEGACY" -eq 1 ] && [ "$APPLY" -eq 1 ]; then
+        : # refused above (migrate-needs-*) or the re-render failed -- the row
+          # is left exactly as it was, and not_applied has already recorded it.
     elif [ "$LEGACY" -eq 1 ]; then
         MIGRATE_HINTS="$MIGRATE_HINTS
   $KEY: run with --apply to migrate this row to the new registry format"
@@ -653,8 +772,8 @@ if [ "$APPLY" -eq 1 ] && [ "$MACHINE" -eq 1 ]; then
     if bash "$SETUP" "${SETUP_ARGS[@]}"; then
         echo "OK: machine layer refreshed"
     else
-        echo "FAILED: machine layer refresh -- see above" >&2
+        not_applied "FAILED: machine layer refresh -- see above"
     fi
 fi
 
-exit 0
+exit "$WALK_RC"

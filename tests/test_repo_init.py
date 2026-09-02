@@ -142,6 +142,11 @@ def copy_engine(dst):
     # SCRIPT_DIR at runtime -- a copied checkout without it fails with
     # ModuleNotFoundError, not a graceful skip.
     shutil.copy(TOOLS_DIR / "scripts" / "mc_settings_merge.py", dst / "scripts" / "mc_settings_merge.py")
+    # repo-init.sh sources this sibling for its store predicates and its
+    # registry-row helpers, from its first validation onwards -- a copied
+    # checkout without it exits "incomplete checkout" before doing anything.
+    shutil.copy(TOOLS_DIR / "scripts" / "mc-registry-lib.sh", dst / "scripts" / "mc-registry-lib.sh")
+    shutil.copy(TOOLS_DIR / "scripts" / "memcontinuum-decide.sh", dst / "scripts" / "memcontinuum-decide.sh")
     for name in ("memidx.py", "memlint.py", "requirements.txt"):
         shutil.copy(TOOLS_DIR / name, dst / name)
     for name in ("hooks", "templates", "skills"):
@@ -2191,6 +2196,78 @@ class TestNeverExtension(unittest.TestCase):
             self.assertIn("this wiring", out.lower(), out)
         finally:
             shutil.rmtree(home, ignore_errors=True)
+
+
+class TestAdoptOnly(unittest.TestCase):
+    """`--adopt-only`: this install may WIRE an existing store, never CREATE
+    one. The re-render path (scripts/memcontinuum-update.sh) always passes it,
+    so a registry row naming a store that has been renamed or deleted can
+    never make a re-render seed a fresh store at the old path.
+
+    The refusal is pre-mutation and unconditional: no --force carve-out, and
+    --dry-run refuses too (a preview of an install that must never happen is
+    not useful, it is misleading)."""
+
+    def setUp(self):
+        self.home = sandbox_home()
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        self.store = str(Path(self.home) / "store")
+        self.claude_dir = str(Path(self.home) / "wt" / ".claude")
+
+    def _install(self, args, **kw):
+        return run_install(
+            ["--project", "adoptonly", "--store", self.store,
+             "--claude-dir", self.claude_dir, "--non-interactive"] + args,
+            self.home, timeout=120, **kw)
+
+    def _assert_nothing_created(self):
+        self.assertFalse(Path(self.store).exists(),
+                         "--adopt-only must not create the store directory")
+        self.assertFalse(Path(self.store, ".git").exists(),
+                         "--adopt-only must not git init a store")
+        self.assertFalse(Path(self.claude_dir, "settings.local.json").exists(),
+                         "--adopt-only refused: no wiring may be written either")
+
+    def test_refuses_when_the_store_path_does_not_exist(self):
+        proc = self._install(["--adopt-only"])
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("store-missing", proc.stdout + proc.stderr)
+        self._assert_nothing_created()
+
+    def test_refuses_under_dry_run_too(self):
+        proc = self._install(["--adopt-only", "--dry-run"])
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("store-missing", proc.stdout + proc.stderr)
+        self._assert_nothing_created()
+
+    def test_refuses_a_plain_directory_that_is_not_a_git_repo(self):
+        os.makedirs(self.store)
+        proc = self._install(["--adopt-only"])
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("store-missing", proc.stdout + proc.stderr)
+        self.assertFalse(Path(self.store, ".git").exists())
+        self.assertFalse(Path(self.claude_dir, "settings.local.json").exists())
+
+    def test_refuses_a_git_repo_without_this_tools_markers(self):
+        os.makedirs(self.store)
+        subprocess.run(["git", "init", "-q", "."], cwd=self.store, check=True)
+        proc = self._install(["--adopt-only"])
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("store-missing", proc.stdout + proc.stderr)
+        self.assertFalse(Path(self.claude_dir, "settings.local.json").exists())
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_accepts_an_existing_marked_store(self):
+        first = self._install([])
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        again = self._install(["--adopt-only"])
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertIn("adopted", again.stdout)
+
+    def test_help_documents_it(self):
+        proc = run_install(["--help"], self.home, python=None)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("--adopt-only", proc.stdout)
 
 
 if __name__ == "__main__":

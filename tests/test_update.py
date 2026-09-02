@@ -42,11 +42,11 @@ def clean_env(home, extra=None):
     return env
 
 
-def run(script, args, home, timeout=120, stdin=None):
+def run(script, args, home, timeout=120, stdin=None, cwd=None):
     return subprocess.run(
         ["bash", str(script)] + args,
         input=stdin, capture_output=True, text=True,
-        env=clean_env(home), timeout=timeout, cwd=home,
+        env=clean_env(home), timeout=timeout, cwd=cwd or home,
     )
 
 
@@ -342,7 +342,9 @@ class TestUpdateWalkStaleAndOk(UpdateTestBase):
         self.assertEqual(rows[0]["action"], "rules-foreign")
 
         proc2 = run(UPDATE_SH, ["--apply"], self.home)
-        self.assertEqual(proc2.returncode, 0, proc2.stdout + proc2.stderr)
+        # --apply asked for this dir to be re-rendered and it was not: a skip
+        # is still work left undone, and the exit code has to say so.
+        self.assertNotEqual(proc2.returncode, 0, proc2.stdout + proc2.stderr)
         self.assertIn("SKIPPED", proc2.stdout + proc2.stderr)
         self.assertEqual(rules_path.read_text(), "# hand-written, not ours\n")
 
@@ -436,7 +438,7 @@ class TestStoreMissingGuard(UpdateTestBase):
         os.rename(self.store, self.store + "-renamed-away")
 
         proc = run(UPDATE_SH, ["--apply"], self.home)
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("SKIPPED", proc.stdout + proc.stderr)
         self.assertIn("store-missing", proc.stdout + proc.stderr)
         self.assertFalse(Path(self.store).exists(), "must not have re-seeded a store at the old path")
@@ -488,6 +490,170 @@ class TestMachineFlag(UpdateTestBase):
         self.assertEqual(proc2.returncode, 0, proc2.stdout + proc2.stderr)
         self.assertIn("refreshing machine layer", proc2.stdout)
         self.assertTrue(Path(self.home, ".memcontinuum", "config.sh").is_file())
+
+
+class TestStoreMissingIsAFirstClassAction(UpdateTestBase):
+    """A row whose store path is no longer an existing, marked store is
+    `store-missing` in the ACTION column -- even when everything else agrees.
+    "Agreement on a corpse": a current stamp and a matching MEMCONTINUUM_ROOT
+    string say nothing about whether the store is still there."""
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_renamed_store_reads_store_missing_even_when_the_stamp_agrees(self):
+        os.rename(self.store, self.store + "-renamed-away")
+        proc = run(UPDATE_SH, [], self.home)
+        rows = self.table_rows(proc.stdout)
+        self.assertEqual([r["action"] for r in rows], ["store-missing"], proc.stdout)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_a_git_repo_without_this_tools_markers_is_store_missing(self):
+        """A path that is a git repo but carries none of this tool's markers
+        is not this row's store any more either -- re-rendering against it
+        would point wiring at an unrelated repository."""
+        os.rename(self.store, self.store + "-renamed-away")
+        os.makedirs(self.store)
+        subprocess.run(["git", "init", "-q", "."], cwd=self.store, check=True)
+        proc = run(UPDATE_SH, [], self.home)
+        rows = self.table_rows(proc.stdout)
+        self.assertEqual([r["action"] for r in rows], ["store-missing"], proc.stdout)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_apply_creates_nothing_at_the_vanished_store_path(self):
+        os.rename(self.store, self.store + "-renamed-away")
+        before = decisions_tsv(self.home).read_text()
+        proc = run(UPDATE_SH, ["--apply"], self.home)
+        self.assertIn("store-missing", proc.stdout + proc.stderr)
+        self.assertFalse(Path(self.store).exists(),
+                         "--apply must never seed a store at a vanished path")
+        self.assertEqual(decisions_tsv(self.home).read_text(), before)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_add_lang_refuses_a_vanished_store_and_writes_nothing(self):
+        os.rename(self.store, self.store + "-renamed-away")
+        before = decisions_tsv(self.home).read_text()
+        settings_before = self.settings_text()
+        proc = run(UPDATE_SH, ["--add-lang", "swift", "--repo", self.repo], self.home)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("store-missing", proc.stdout + proc.stderr)
+        self.assertFalse(Path(self.store).exists())
+        self.assertEqual(decisions_tsv(self.home).read_text(), before)
+        self.assertEqual(self.settings_text(), settings_before)
+
+
+class TestNeverExtsSurviveARerender(unittest.TestCase):
+    """The never-extension list must survive a legacy-row migration intact:
+    an EMPTY list re-renders as exactly `MEMCONTINUUM_NEVER_EXTS=''` (what a
+    fresh install writes), and a real list is read back as extensions -- never
+    as whatever files happen to sit in the directory the command was run
+    from."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-update-never-test-")
+        self.home = str(Path(self.tmp) / "home")
+        os.makedirs(self.home, exist_ok=True)
+        self.repo = git_repo(str(Path(self.tmp) / "repo"))
+        self.code_root = str(Path(self.tmp) / "code")
+        os.makedirs(self.code_root, exist_ok=True)
+        (Path(self.code_root) / "x.py").write_text("print(1)\n")
+        self.store = str(Path(self.tmp) / "store")
+        self.claude_dir = str(Path(self.repo) / ".claude")
+
+    def _install(self, extra):
+        proc = run(INSTALL_SH, [
+            "--project", "nev", "--store", self.store, "--claude-dir", self.claude_dir,
+            "--code-root", self.code_root, "--langs", "python", "--non-interactive",
+        ] + extra, self.home)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    def _migrate(self, cwd=None):
+        return run(UPDATE_SH, ["--apply"], self.home, cwd=cwd)
+
+    def _nudge_command(self):
+        settings = json.loads(Path(self.claude_dir, "settings.local.json").read_text())
+        nudge = [g for g in settings["hooks"]["PreToolUse"] if g.get("matcher") == "Write"]
+        return nudge[0]["hooks"][0]["command"]
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_empty_never_list_migrates_to_an_empty_value_not_quote_garbage(self):
+        self._install([])
+        write_row(self.home, self.repo, "wired",
+                  note=f"store={self.store} project=nev")
+        proc = self._migrate()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        note = decisions_tsv(self.home).read_text().splitlines()[-1]
+        self.assertNotIn("never=''", note, note)
+        self.assertNotIn('never="', note, note)
+        # An empty never-list is recorded as empty -- the field is either
+        # absent or blank, never a literal pair of quote characters.
+        for tok in note.split():
+            if tok.startswith("never="):
+                self.assertEqual(tok, "never=", note)
+        self.assertIn("MEMCONTINUUM_NEVER_EXTS='' ", self._nudge_command(),
+                      self._nudge_command())
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_recovery_does_not_glob_expand_against_the_working_directory(self):
+        """`*.md`/`*.txt` on the rendered hook line are EXTENSION PATTERNS, not
+        a shell glob to expand: run from a directory holding README.md and
+        requirements.txt, the migration must still record `.md`/`.txt`."""
+        self._install(["--never-ext", ".md,.txt"])
+        write_row(self.home, self.repo, "wired",
+                  note=f"store={self.store} project=nev")
+        cwd = str(Path(self.tmp) / "cwd")
+        os.makedirs(cwd, exist_ok=True)
+        Path(cwd, "README.md").write_text("x\n")
+        Path(cwd, "requirements.txt").write_text("x\n")
+        proc = self._migrate(cwd=cwd)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        note = decisions_tsv(self.home).read_text().splitlines()[-1]
+        self.assertIn("never=.md;.txt", note, note)
+        self.assertNotIn("README.md", note, note)
+        self.assertNotIn("requirements.txt", note, note)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_an_unrecoverable_never_value_is_refused_never_written(self):
+        """A hand-edited nudge line whose never-list is not a plain extension
+        list cannot be migrated by guessing: the human names it with
+        --never-ext, or nothing is written."""
+        self._install(["--never-ext", ".cs"])
+        path = Path(self.claude_dir, "settings.local.json")
+        path.write_text(path.read_text().replace(
+            "MEMCONTINUUM_NEVER_EXTS='*.cs'",
+            "MEMCONTINUUM_NEVER_EXTS='/etc/passwd'"))
+        write_row(self.home, self.repo, "wired",
+                  note=f"store={self.store} project=nev")
+        before = decisions_tsv(self.home).read_text()
+        proc = self._migrate()
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("migrate-needs-never-exts", proc.stdout + proc.stderr)
+        self.assertEqual(decisions_tsv(self.home).read_text(), before)
+
+
+class TestAddLangValidatesBeforeWriting(UpdateTestBase):
+    """O2: the registry row is written only after a successful re-render, and
+    an unknown language never reaches the registry at all."""
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_unknown_language_is_refused_with_the_row_untouched(self):
+        before = decisions_tsv(self.home).read_text()
+        settings_before = self.settings_text()
+        proc = run(UPDATE_SH, ["--add-lang", "bogus", "--repo", self.repo], self.home)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("bogus", proc.stdout + proc.stderr)
+        self.assertEqual(decisions_tsv(self.home).read_text(), before)
+        self.assertEqual(self.settings_text(), settings_before)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_a_failed_rerender_leaves_the_row_untouched(self):
+        """A foreign rules file makes repo-init refuse before it writes
+        anything. The registry must not record a language set that was never
+        rendered anywhere."""
+        rules = Path(self.claude_dir, "rules", "memcontinuum.md")
+        rules.write_text("# hand-authored, not ours\n")
+        before = decisions_tsv(self.home).read_text()
+        proc = run(UPDATE_SH, ["--add-lang", "swift", "--repo", self.repo], self.home)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(decisions_tsv(self.home).read_text(), before)
 
 
 class TestHelp(unittest.TestCase):
