@@ -2950,24 +2950,52 @@ def _hook_log_fields(rest: str) -> dict:
     ` file=`) own LAST whitespace-delimited token, unconditionally, for
     every kind.
 
-    One deliberate refinement on top of the literal review wording: the
-    last token must look like a REAL project value, not merely `\\S+`.
-    MemContinuum project names are already restricted elsewhere in this
-    codebase to `[A-Za-z0-9._-]+` (repo-init.sh refuses anything else,
-    e.g. the skill's `--project NAME` doc). A bare `\\S+` would also match
-    the pre-edit-chain.sh/newfile-nudge.sh adversarial shape's file value
-    (`file=/tmp/a project=other/x.py` -- file= genuinely last there,
-    nothing really follows it, but "other/x.py" still LOOKS like a
-    project=-shaped last token) and wrongly hijack it -- reproduced by
-    this file's own existing pre-edit-hijack regression test, which this
-    exact refinement is what keeps passing. Restricting the value to the
-    real project-name charset (no `/`) rejects "other/x.py" (contains
-    `/`) while still accepting every genuine mc_log project append
-    (always a valid project name). The residual, accepted edge case: a
-    real file literally named ...`/project=validname` with NO further
-    path segment after it, on a NON-mc_log line -- indistinguishable from
-    a real trailing project= by any purely structural rule; considered
-    rare enough to accept."""
+    One deliberate refinement on top of the literal round-3 review
+    wording: the last token must look like a REAL project value, not
+    merely `\\S+`. MemContinuum project names are already restricted
+    elsewhere in this codebase to `[A-Za-z0-9._-]+` (repo-init.sh refuses
+    anything else, e.g. the skill's `--project NAME` doc). Restricting the
+    value to that charset (no `/`) rejects a file path fragment like
+    "other/x.py" while still accepting every genuine mc_log project
+    append (always a valid project name).
+
+    Round 4 (review fix -- round 3's universal tail-rescan was itself a
+    NEW hijack): applying the tail rescan UNCONDITIONALLY, even when the
+    prefix already found a real project=, let a pre-edit-chain.sh/
+    newfile-nudge.sh line (their genuine shape: `... project=REAL
+    file=F`, project= BEFORE file=, nothing structurally follows file=)
+    get overwritten by an EDITED FILE whose path happens to end in
+    ` project=validname` -- reproduced: `... project=realproj
+    file=/nowhere/near/anything project=validname` re-attributed the
+    whole line to "validname", not "realproj". The charset restriction
+    above stops an adversarial "/other/x.py" shape but does nothing
+    against an adversarial shape using ONLY valid project-name
+    characters.
+
+    Fixed with a strict precedence rule, not another charset tweak: the
+    tail is rescanned ONLY when the PREFIX (everything before the first
+    ` file=`) found NO project= of its own. If the prefix already has
+    one, it is final -- full stop, the tail is never even looked at. This
+    makes both real shapes provably safe simultaneously:
+      - pre-edit-chain.sh / newfile-nudge.sh (`project=P file=F`,
+        project= always in the prefix): the prefix always has project=,
+        so the tail rescan never runs for these lines AT ALL -- no file
+        value, however constructed, can ever change their project=.
+      - every mc_log-sourced line (ledger-post-edit.sh, memlib.sh's own
+        raw diagnostics, userprompt/sessionstart/sessionend/precompact):
+        their own hook-specific message text never mentions "project="
+        itself, so the prefix never has one, and the tail rescan always
+        runs -- exactly where it needs to, since mc_log's real project=
+        append is genuinely the tail's last token there.
+    The one remaining, accepted ambiguity is therefore narrower than
+    round 3's version: a LEGACY, pre-project=-fix mc_log-sourced line (no
+    prefix project=, by definition -- old mc_log never appended one)
+    whose FILE VALUE itself happens to end in a valid-charset
+    ` project=X` with nothing genuine following it. Lexically
+    indistinguishable from a real current line logging a boring file
+    named X with a real trailing project=X append; resolved in favor of
+    attribution (treated as the latter) since it is the far more common
+    case and the coincidence required for the former is rare."""
     marker = " file="
     idx = rest.find(marker)
     if idx == -1:
@@ -2976,12 +3004,13 @@ def _hook_log_fields(rest: str) -> dict:
     fields = {k: v for k, v in _FIELD_RE.findall(prefix)}
     tail = rest[idx + len(marker):]
 
-    last_sep = tail.rfind(" ")
-    last_token = tail[last_sep + 1:]
-    m = _TRAILING_PROJECT_TOKEN_RE.match(last_token)
-    if m:
-        fields["project"] = m.group(1)
-        tail = tail[:last_sep] if last_sep != -1 else ""
+    if "project" not in fields:
+        last_sep = tail.rfind(" ")
+        last_token = tail[last_sep + 1:]
+        m = _TRAILING_PROJECT_TOKEN_RE.match(last_token)
+        if m:
+            fields["project"] = m.group(1)
+            tail = tail[:last_sep] if last_sep != -1 else ""
 
     fields["file"] = tail
     return fields
@@ -3527,14 +3556,21 @@ def main(argv=None) -> int:
             "deployment's cold-start window, not a real signal. Fail-open "
             "throughout: a missing hook.log, an unreadable file, a bad --store "
             "path, or any unexpected error prints one line and exits 0.\n\n"
-            "Legacy-log note: project= attribution rescues a trailing project= "
-            "token after file= for every kind of hook.log line (mc_log, "
-            "hooks/memlib.sh, always appends it last) -- but this can only be "
-            "PRE-FIX history: a real, ambiguous case exists only for a ledger "
-            "line logged before this project= fix landed, whose FILE PATH "
-            "itself happens to end in a project-name-shaped ' project=X' "
-            "segment with nothing after it. Considered rare enough to accept; "
-            "every line from a fixed install is unambiguous."
+            "Legacy-log note: a trailing project= token after file= (mc_log, "
+            "hooks/memlib.sh, always appends one last, for every kind of line "
+            "it logs) is rescued ONLY when the text BEFORE file= carries no "
+            "project= of its own -- a prefix project= (pre-edit-chain.sh's/ "
+            "newfile-nudge.sh's own shape) is always final and the file value "
+            "is never rescanned, so an edited file whose path ends in "
+            "' project=X' can never re-attribute one of those lines. The one "
+            "remaining, accepted ambiguity is narrower: a LEGACY line logged "
+            "before this project= fix existed (no prefix project=, by "
+            "definition -- old mc_log never appended one) whose FILE PATH "
+            "itself happens to end in a valid-charset ' project=X' segment "
+            "with nothing after it, indistinguishable from a real current "
+            "line naming that same file with a genuine trailing project=X. "
+            "Considered rare enough to accept; every line logged by a fixed "
+            "install is unambiguous."
         ),
     )
     p_stats.add_argument("--project", default=DEFAULT_PROJECT, help="project namespace to report on (default: %(default)s)")

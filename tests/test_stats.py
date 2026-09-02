@@ -372,6 +372,70 @@ class TestStatsHealthyCase(StatsTestBase):
         rc, other = run_stats_json(home=str(self.home), project="other")
         self.assertEqual(other["ledger_appends"]["code"], 0, "the embedded file-path text must not become a project")
 
+    def test_prefix_project_is_final_pre_edit_shape_never_hijacked_by_valid_charset_suffix(self):
+        """Round 4 (review fix -- round 3's universal tail-rescan was
+        itself a NEW hijack): the round-3 charset restriction only
+        stopped an adversarial file value shaped like "other/x.py"
+        (contains '/'). It did nothing against a file value ending in
+        ONLY valid project-name characters, e.g. an edited path literally
+        named ".../project=validname" -- reproduced exactly: `...
+        project=realproj file=/nowhere/near/anything project=validname`
+        used to re-attribute the WHOLE line to "validname". Fixed with a
+        strict precedence rule: the tail is rescanned ONLY when the
+        PREFIX (before the first ` file=`) has no project= of its own. A
+        pre-edit-chain.sh/newfile-nudge.sh line's project= is ALWAYS in
+        the prefix, so its tail is never even looked at, regardless of
+        what the file value contains. Ruling test (a)."""
+        lines = [
+            f"{ts(1)} outcome=matched elapsed=0s project=realproj "
+            f"file=/nowhere/near/anything project=validname",
+        ]
+        self.write_log(lines)
+        rc, real = run_stats_json(home=str(self.home), project="realproj")
+        self.assertEqual(real["pre_edit"]["matched"], 1, "the prefix project=realproj must win")
+        rc, fake = run_stats_json(home=str(self.home), project="validname")
+        self.assertEqual(fake["pre_edit"]["matched"], 0, "a valid-charset filename suffix must not re-attribute the line")
+
+    def test_prefix_project_absent_mc_log_shape_still_gets_tail_rescue(self):
+        """Ruling test (b): memlib.sh's own raw diagnostic line (mc_log,
+        kind 'other', no project= in the prefix at all) must still get
+        the trailing project= rescue -- the round-4 precedence gate only
+        withholds the rescan when the PREFIX already has one; it must not
+        regress the round-3 fix for lines where it doesn't."""
+        lines = [f"{ts(1)} outcome=lock-timeout file=/x.json.lock project=demo"]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home), project="demo")
+        self.assertIn("demo", out["projects_seen"])
+        self.assertNotIn("(unknown)", out["projects_seen"])
+
+    def test_prefix_project_absent_ledger_shape_with_embedded_fake_still_resolves_real(self):
+        """Ruling test (c): the ledger shape (no prefix project=, mc_log
+        appends the real one after file=) with an embedded, non-last fake
+        `project=other/x.py` token must still resolve to the real
+        trailing project=demo -- the round-4 gate must not disturb this
+        already-passing round-3 case."""
+        lines = [
+            f"{ts(1)} ledger outcome=appended kind=code file=/tmp/a "
+            f"project=other/x.py project=demo",
+        ]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home), project="demo")
+        self.assertEqual(out["ledger_appends"]["code"], 1)
+
+    def test_legacy_no_prefix_project_ambiguous_file_suffix_resolves_to_attribution(self):
+        """Ruling test (d): the one remaining, accepted ambiguity -- a
+        line with NO prefix project= (so the tail rescan runs) whose file
+        value's own last token happens to be a valid-charset ` project=X`
+        with nothing genuine following it (`... file=/tmp/a
+        project=demo`, no further suffix). Lexically indistinguishable
+        from a real current line naming file "/tmp/a" with a genuine
+        trailing project=demo append -- resolved in favor of attribution,
+        exactly as documented in `stats --help`'s legacy-log note."""
+        lines = [f"{ts(1)} ledger outcome=appended kind=code file=/tmp/a project=demo"]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home), project="demo")
+        self.assertEqual(out["ledger_appends"]["code"], 1)
+
     def test_store_missing_repo_is_unmeasured_but_ledger_flag_still_evaluated(self):
         """The write-side FLAG no longer needs --store at all (round 2,
         ruling 1) -- it is driven entirely by this project's own
