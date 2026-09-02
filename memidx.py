@@ -3226,11 +3226,14 @@ def _stats_report(
     if args.project != UNKNOWN_STATS_PROJECT:
         if nudges_total >= 3 and ledger_store == 0:
             flags.append(
-                f"FLAG: write side silent — {nudges_total} nudges, 0 store-kind "
-                f"ledger appends in {args.days}d (INC-0105 class)"
+                f"FLAG: write side silent — {nudges_total} reminders fired, "
+                f"nothing appended to the store in {args.days}d"
             )
         if user_prompts >= 10 and pre_edit_lookups == 0:
-            flags.append("FLAG: read side silent (INC-0103 class)")
+            flags.append(
+                f"FLAG: read side silent — {user_prompts} prompts, no "
+                f"retrieval matched or missed in {args.days}d"
+            )
 
     result = {
         "project": args.project,

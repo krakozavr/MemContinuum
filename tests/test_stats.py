@@ -13,6 +13,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -225,7 +226,11 @@ class TestStatsHealthyCase(StatsTestBase):
         self.assertEqual(out["pre_edit"]["total"], 0)
         self.assertEqual(out["pre_edit"]["lookups"], 0)
         self.assertEqual(out["user_prompts"], 10)
-        self.assertIn("FLAG: read side silent (INC-0103 class)", out["flags"])
+        self.assertIn(
+            "FLAG: read side silent — 10 prompts, no retrieval matched or "
+            "missed in 7d",
+            out["flags"],
+        )
         self.assertNotIn("(unknown)", out["projects_seen"])
         self.assertIn("demo", out["projects_seen"])
 
@@ -449,7 +454,8 @@ class TestStatsHealthyCase(StatsTestBase):
         self.assertEqual(rc, 0)
         self.assertIsNone(out["store_commits"])
         self.assertIn(
-            "FLAG: write side silent — 3 nudges, 0 store-kind ledger appends in 7d (INC-0105 class)",
+            "FLAG: write side silent — 3 reminders fired, nothing appended "
+            "to the store in 7d",
             out["flags"],
         )
 
@@ -468,7 +474,8 @@ class TestStatsFlags(StatsTestBase):
         self.assertEqual(out["ledger_appends"]["store"], 0)
         self.assertEqual(out["nudges"]["total"], 4)
         self.assertIn(
-            "FLAG: write side silent — 4 nudges, 0 store-kind ledger appends in 7d (INC-0105 class)",
+            "FLAG: write side silent — 4 reminders fired, nothing appended "
+            "to the store in 7d",
             out["flags"],
         )
 
@@ -488,7 +495,8 @@ class TestStatsFlags(StatsTestBase):
         self.assertEqual(out["ledger_appends"]["store"], 0)
         self.assertEqual(out["nudges"]["total"], 12)
         self.assertIn(
-            "FLAG: write side silent — 12 nudges, 0 store-kind ledger appends in 7d (INC-0105 class)",
+            "FLAG: write side silent — 12 reminders fired, nothing appended "
+            "to the store in 7d",
             out["flags"],
         )
 
@@ -507,27 +515,31 @@ class TestStatsFlags(StatsTestBase):
         lines = [f"{ts(1)} userprompt outcome=injected session=s1 project=demo" for _ in range(3)]
         self.write_log(lines)
         rc, out = run_stats_json(home=str(self.home))
-        self.assertTrue(any("INC-0105" in f for f in out["flags"]))
+        self.assertTrue(any("write side silent" in f for f in out["flags"]))
 
     def test_write_side_flag_boundary_two_does_not_fire(self):
         lines = [f"{ts(1)} userprompt outcome=injected session=s1 project=demo" for _ in range(2)]
         self.write_log(lines)
         rc, out = run_stats_json(home=str(self.home))
-        self.assertFalse(any("INC-0105" in f for f in out["flags"]))
+        self.assertFalse(any("write side silent" in f for f in out["flags"]))
 
     def test_write_side_flag_silent_when_ledger_store_appends_present(self):
         lines = [f"{ts(1)} userprompt outcome=injected session=s1 project=demo" for _ in range(5)]
         lines.append(f"{ts(1)} ledger outcome=appended kind=store session=s1 file=/y.md project=demo")
         self.write_log(lines)
         rc, out = run_stats_json(home=str(self.home))
-        self.assertFalse(any("INC-0105" in f for f in out["flags"]))
+        self.assertFalse(any("write side silent" in f for f in out["flags"]))
 
     def test_read_side_silent_flag(self):
         lines = [f"{ts(1)} userprompt outcome=no-evidence session=s1 project=demo" for _ in range(10)]
         self.write_log(lines)
         rc, out = run_stats_json(home=str(self.home))
         self.assertEqual(out["pre_edit"]["lookups"], 0)
-        self.assertIn("FLAG: read side silent (INC-0103 class)", out["flags"])
+        self.assertIn(
+            "FLAG: read side silent — 10 prompts, no retrieval matched or "
+            "missed in 7d",
+            out["flags"],
+        )
 
     def test_read_side_flag_needs_at_least_ten_prompts(self):
         lines = [f"{ts(1)} userprompt outcome=no-evidence session=s1 project=demo" for _ in range(9)]
@@ -556,7 +568,11 @@ class TestStatsFlags(StatsTestBase):
         rc, out = run_stats_json(home=str(self.home))
         self.assertEqual(out["pre_edit"]["total"], 5)
         self.assertEqual(out["pre_edit"]["lookups"], 0)
-        self.assertIn("FLAG: read side silent (INC-0103 class)", out["flags"])
+        self.assertIn(
+            "FLAG: read side silent — 10 prompts, no retrieval matched or "
+            "missed in 7d",
+            out["flags"],
+        )
 
     def test_read_side_flag_fires_with_query_failed_outcome(self):
         """Round-3 addendum: `query-failed` (pre-edit-chain.sh's new
@@ -571,7 +587,11 @@ class TestStatsFlags(StatsTestBase):
         self.assertEqual(out["pre_edit"]["total"], 5)
         self.assertEqual(out["pre_edit"]["lookups"], 0)
         self.assertIn("query-failed", out["pre_edit"]["outcomes"])
-        self.assertIn("FLAG: read side silent (INC-0103 class)", out["flags"])
+        self.assertIn(
+            "FLAG: read side silent — 10 prompts, no retrieval matched or "
+            "missed in 7d",
+            out["flags"],
+        )
 
     def test_read_side_flag_absent_with_ten_empty_payload_lines(self):
         """Round-3 addendum (ruling C): `empty-payload` means the hook
@@ -616,7 +636,11 @@ class TestStatsFlags(StatsTestBase):
         rc, out = run_stats_json(home=str(self.home))
         self.assertEqual(out["user_prompts"], 10)
         self.assertEqual(out["non_user_prompt_lines"], 0)
-        self.assertIn("FLAG: read side silent (INC-0103 class)", out["flags"])
+        self.assertIn(
+            "FLAG: read side silent — 10 prompts, no retrieval matched or "
+            "missed in 7d",
+            out["flags"],
+        )
 
     def test_read_side_flag_absent_with_ten_duplicate_delivery_lines(self):
         """Round 2 Codex gate item 8: ten `duplicate-delivery` lines are
@@ -650,7 +674,11 @@ class TestStatsFlags(StatsTestBase):
         rc, out = run_stats_json(home=str(self.home))
         self.assertEqual(out["user_prompts"], 10)
         self.assertEqual(out["non_user_prompt_lines"], 5)
-        self.assertIn("FLAG: read side silent (INC-0103 class)", out["flags"])
+        self.assertIn(
+            "FLAG: read side silent — 10 prompts, no retrieval matched or "
+            "missed in 7d",
+            out["flags"],
+        )
 
     def test_both_flags_can_fire_together(self):
         lines = [f"{ts(1)} userprompt outcome=injected session=s1 project=demo" for _ in range(10)]
@@ -658,8 +686,31 @@ class TestStatsFlags(StatsTestBase):
         store = self.git_store(commit_dates=[NOW - timedelta(days=400)])
         rc, out = run_stats_json(home=str(self.home), store=str(store))
         self.assertEqual(len(out["flags"]), 2)
-        self.assertTrue(any("INC-0105" in f for f in out["flags"]))
-        self.assertTrue(any("INC-0103" in f for f in out["flags"]))
+        self.assertTrue(any("write side silent" in f for f in out["flags"]))
+        self.assertTrue(any("read side silent" in f for f in out["flags"]))
+
+    def test_flag_wording_carries_no_incident_or_store_record_ids(self):
+        """TOP-0116 L2: documentation doctrine reaches runtime output too --
+        a FLAG line is read by whoever runs `stats`, not by someone digging
+        through git archaeology, so it must never cite an INC-#### or
+        TOP-#### id. Both flags raised at once, checked in both the plain
+        text report and the JSON `flags` list."""
+        lines = [f"{ts(1)} userprompt outcome=injected session=s1 project=demo" for _ in range(10)]
+        self.write_log(lines)
+        store = self.git_store(commit_dates=[NOW - timedelta(days=400)])
+
+        id_pattern = re.compile(r"INC-\d{4}|TOP-\d{4}")
+
+        rc, out = run_stats_json(home=str(self.home), store=str(store))
+        self.assertEqual(len(out["flags"]), 2)
+        for flag in out["flags"]:
+            self.assertNotRegex(flag, id_pattern)
+
+        rc, text = run_stats(home=str(self.home), store=str(store))
+        self.assertEqual(rc, 0)
+        self.assertIn("FLAG: write side silent", text)
+        self.assertIn("FLAG: read side silent", text)
+        self.assertNotRegex(text, id_pattern)
 
 
 class TestStatsWindowEdges(StatsTestBase):
