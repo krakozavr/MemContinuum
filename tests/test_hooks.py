@@ -164,6 +164,113 @@ class TestPreEditChainHook(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), "")
 
+    def test_log_line_carries_project(self):
+        """Liveness metric fix (INC-0103/INC-0105): memidx.py stats groups
+        hook.log by project=. pre-edit-chain.sh already stamps it in its own
+        finish() -- this is a regression pin, not a new fix, so the shared
+        memidx.py stats tool can rely on it for every outcome, matched or
+        not."""
+        payload = json.dumps(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Edit",
+                "cwd": "/nowhere",
+                "tool_input": {"file_path": "/nowhere/near/anything.py"},
+            }
+        )
+        env = clean_env(
+            MEMCONTINUUM_HOME=self.memtool_home,
+            MEMCONTINUUM_PROJECT=self.project,
+            MEMCONTINUUM_PYTHON=VENV_PYTHON,
+        )
+        run_hook(payload, env)
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        self.assertIn(f"project={self.project}", log_text)
+
+    def test_no_file_path_outcome_carries_project(self):
+        """Round-2 Codex gate item 10 (finding: `no-file-path` calls
+        finish() BEFORE PROJECT used to be initialized -- an empty
+        project=). PROJECT resolution was moved above the no-python check
+        (item 3), which is itself above the payload read / no-file-path
+        gate -- so this outcome must carry a real project= too, not just
+        the matched/no-match paths test_log_line_carries_project already
+        covers."""
+        payload = json.dumps({"hook_event_name": "PreToolUse", "tool_name": "Edit", "cwd": "/nowhere"})
+        env = clean_env(
+            MEMCONTINUUM_HOME=self.memtool_home,
+            MEMCONTINUUM_PROJECT=self.project,
+            MEMCONTINUUM_PYTHON=VENV_PYTHON,
+        )
+        proc, _elapsed = run_hook(payload, env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        matching = [l for l in log_text.splitlines() if "no-file-path" in l]
+        self.assertTrue(matching, log_text)
+        self.assertIn(f"project={self.project}", matching[-1])
+
+    def test_for_path_all_candidates_failing_logs_query_failed_not_no_match(self):
+        """Round-3 addendum (review finding): a candidate whose `for-path`
+        call itself FAILS (non-zero exit -- a broken python, a corrupt db
+        mid-write, any exec failure) used to `continue` silently and, if
+        EVERY candidate failed the same way, fall through to the exact
+        same `outcome=no-match` a genuine "queried fine, found nothing"
+        result produces -- indistinguishable in the log from real
+        negative evidence. Must log a distinct `query-failed` outcome
+        instead. The stub python fails ONLY the `for-path` calls (not the
+        jq-fallback JSON payload parsing, so this test doesn't depend on
+        whether jq happens to be on PATH) -- proxying every other call to
+        the real venv python."""
+        fail_py = Path(self.tmp) / "fail-for-path-python"
+        fail_py.write_text(
+            "#!/usr/bin/env bash\n"
+            "for a in \"$@\"; do\n"
+            "  case \"$a\" in\n"
+            "    for-path) exit 1 ;;\n"
+            "  esac\n"
+            "done\n"
+            f'exec "{VENV_PYTHON}" "$@"\n'
+        )
+        fail_py.chmod(0o755)
+
+        payload = json.dumps(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Edit",
+                "cwd": "/nowhere",
+                "tool_input": {"file_path": "/nowhere/near/anything.py"},
+            }
+        )
+        env = clean_env(
+            MEMCONTINUUM_HOME=self.memtool_home,
+            MEMCONTINUUM_PROJECT=self.project,
+            MEMCONTINUUM_PYTHON=str(fail_py),
+        )
+        proc, _elapsed = run_hook(payload, env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        matching = [l for l in log_text.splitlines() if "outcome=" in l]
+        self.assertIn("outcome=query-failed", matching[-1], matching[-1])
+        self.assertNotIn("outcome=no-match", matching[-1])
+
+    def test_no_python_resolved_line_carries_project(self):
+        """Round-2 review finding: this fail-open diagnostic (the FIRST,
+        sometimes ONLY, trace a session with a broken python resolution
+        ever leaves) used to have no project= -- memlib.sh's own twin was
+        fixed in round 1 (project resolution moved above it); this is the
+        same move for pre-edit-chain.sh's independent copy."""
+        env = clean_env(
+            MEMCONTINUUM_HOME=self.memtool_home,
+            MEMCONTINUUM_PROJECT="nopy-proj",
+            MEMCONTINUUM_PYTHON="/no/such/python",
+        )
+        proc, _elapsed = run_hook("{}", env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        matching = [l for l in log_text.splitlines() if "no python resolved" in l]
+        self.assertTrue(matching, log_text)
+        self.assertIn("project=nopy-proj", matching[-1])
+
     def test_c_malformed_payload_emits_nothing_and_logs(self):
         log_path = Path(self.memtool_home) / "hook.log"
         before = log_path.read_text() if log_path.exists() else ""
@@ -381,6 +488,39 @@ class TestPostCommitReindexHook(unittest.TestCase):
     def test_bash_syntax_is_valid(self):
         result = subprocess.run([MC_BASH, "-n", str(POST_COMMIT_HOOK)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_root_not_set_skip_line_carries_project(self):
+        """Round-2 review finding: this fail-open skip line (no
+        MEMCONTINUUM_ROOT -- the hook can't derive PROJECT the normal way,
+        since basename(MEMCONTINUUM_ROOT) needs a ROOT it doesn't have)
+        used to log with no project= at all -- "every hook.log line
+        carries project=" was still false for it. Falls back to
+        MEMCONTINUUM_PROJECT/"default", same as every other hook's
+        fallback chain."""
+        tmp = tempfile.mkdtemp(prefix="memcontinuum-postcommit-project-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        home = Path(tmp) / "home"
+        home.mkdir()
+        env = clean_env(HOME=str(tmp), MEMCONTINUUM_HOME=str(home), MEMCONTINUUM_PROJECT="pc-proj")
+        env.pop("MEMCONTINUUM_ROOT", None)
+        proc = subprocess.run([MC_BASH, str(POST_COMMIT_HOOK)], capture_output=True, text=True, env=env, timeout=10)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (home / "hook.log").read_text()
+        self.assertIn("MEMCONTINUUM_ROOT not set, skipping", log_text)
+        self.assertIn("project=pc-proj", log_text)
+
+    def test_root_not_set_skip_line_defaults_project_when_unset(self):
+        tmp = tempfile.mkdtemp(prefix="memcontinuum-postcommit-project-default-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        home = Path(tmp) / "home"
+        home.mkdir()
+        env = clean_env(HOME=str(tmp), MEMCONTINUUM_HOME=str(home))
+        env.pop("MEMCONTINUUM_ROOT", None)
+        env.pop("MEMCONTINUUM_PROJECT", None)
+        proc = subprocess.run([MC_BASH, str(POST_COMMIT_HOOK)], capture_output=True, text=True, env=env, timeout=10)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (home / "hook.log").read_text()
+        self.assertIn("project=default", log_text)
 
     def test_r2_resolves_python_via_pointer_config_at_custom_home(self):
         """R2 regression, round 4 gate: see TestPreEditChainHook's twin --

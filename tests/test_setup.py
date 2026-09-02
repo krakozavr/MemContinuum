@@ -522,6 +522,93 @@ class TestDecisionRegistry(BootstrapCase):
         out = run(STATE_SH, [str(repo)], self.home, self.mc_home).stdout
         return dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
 
+    def stats_line_of(self, repo):
+        out = run(STATE_SH, [str(repo)], self.home, self.mc_home).stdout
+        for line in out.splitlines():
+            if line.startswith("stats:"):
+                return line
+        return None
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_stats_hint_line_names_the_liveness_command(self):
+        """Deliverable 3 (liveness metric): state.sh's own contract stays
+        python-free (it never runs python itself) but must still print the
+        exact command a human/agent would run to check this repo's
+        read/write liveness -- `<python> <engine>/memidx.py stats
+        --project <name> --days 7 [--store <store>]`."""
+        self.assertEqual(self.bootstrap().returncode, 0)
+        repo = git_repo(str(Path(self.tmp) / "repo"))
+        claude = Path(repo, ".claude")
+        claude.mkdir()
+        basenames = (
+            "ledger-post-edit.sh", "precompact-persist.sh",
+            "sessionstart-remind.sh", "userprompt-remind.sh",
+            "sessionend-stamp.sh",
+        )
+        items = [
+            {"type": "command", "command":
+                f"MEMCONTINUUM_ROOT=/store/proj-a MEMCONTINUUM_PROJECT=proj-a bash x/{b}"}
+            for b in basenames
+        ]
+        (claude / "settings.local.json").write_text(
+            json.dumps({"hooks": {"PostToolUse": [{"hooks": items}]}}, indent=2),
+            encoding="utf-8")
+
+        line = self.stats_line_of(repo)
+        self.assertIsNotNone(line)
+        # python/engine/store/project are all single-quoted (round-2
+        # review finding: copy-pasteable even when a path has a space, or
+        # the project value is the literal "(unknown)") -- match on the
+        # substring, not a bare unquoted equality.
+        self.assertIn(VENV_PYTHON, line)
+        self.assertIn("memidx.py' stats", line)
+        self.assertIn("--project 'proj-a'", line)
+        self.assertIn("--days 7", line)
+        self.assertIn("--store '/store/proj-a'", line)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_stats_hint_line_present_even_when_undecided_and_unwired(self):
+        """No wiring at all yet -- must still print SOME usable hint
+        (python-free engine fallback via $SCRIPT_DIR/.., project falls back
+        to the repo's own basename), never crash or omit the line."""
+        self.assertEqual(self.bootstrap().returncode, 0)
+        repo = git_repo(str(Path(self.tmp) / "repo"))
+        line = self.stats_line_of(repo)
+        self.assertIsNotNone(line)
+        self.assertIn("memidx.py' stats", line)
+        self.assertIn("--project", line)
+        self.assertNotIn("--store", line)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_stats_hint_prefers_registry_project_when_wiring_is_unusable(self):
+        """Round-2 Codex gate item 13 (finding, MAJOR): a DECIDED but
+        currently-UNWIRED repo (hooks missing/broken after the decision
+        was recorded -- the state where a liveness check matters most) is
+        exactly the case live wiring resolution cannot help with. The
+        registry's own recorded project (from `decide.sh wired --project
+        NAME`) must win the hint over a basename fallback."""
+        self.assertEqual(self.bootstrap().returncode, 0)
+        repo = git_repo(str(Path(self.tmp) / "repo"))
+        self._wire(repo)  # full wiring, required for `decide wired` to accept
+        proc = run(
+            DECIDE_SH, ["wired", "--repo", repo, "--store", "/store/registered", "--project", "registered-proj"],
+            self.home, self.mc_home,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+        # Now break the wiring -- decision=wired persists (the recorded
+        # answer is authoritative), but live wiring can no longer resolve
+        # ANY project on its own.
+        (Path(repo) / ".claude" / "settings.local.json").unlink()
+
+        fields = self.fields_of(repo)
+        self.assertEqual(fields.get("decision"), "wired")
+        self.assertEqual(fields.get("wiring"), "none")
+        self.assertNotIn("project", fields, "live wiring must have nothing to report here")
+
+        line = self.stats_line_of(repo)
+        self.assertIn("--project 'registered-proj'", line)
+
     @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
     def test_decision_and_wiring_are_reported_as_separate_facts(self):
         """F5: state.sh used to collapse both into one `state=` line. A

@@ -94,9 +94,25 @@ PY="${MEMCONTINUUM_PYTHON:-$SCRIPT_DIR/../.venv/bin/python}"
 LOG="$MEMCONTINUUM_HOME/hook.log"
 
 mkdir -p "$MEMCONTINUUM_HOME" 2>/dev/null
+
+# Project resolution moved ABOVE the no-python check (round-2 review
+# finding, same move memlib.sh already made for its own twin diagnostic):
+# depends only on env (MEMCONTINUUM_PROJECT / basename(MEMCONTINUUM_ROOT) /
+# "default"), never on the payload, so it costs nothing to compute this
+# early -- and memidx.py stats groups hook.log by project=, so this line
+# needs one exactly like every other line does.
+PROJECT="${MEMCONTINUUM_PROJECT:-}"
+if [ -z "$PROJECT" ]; then
+    if [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
+        PROJECT="$(basename "$MEMCONTINUUM_ROOT")"
+    else
+        PROJECT="default"
+    fi
+fi
+
 if [ ! -x "$PY" ]; then
-    printf '%s pre-edit-chain: no python resolved (checked MEMCONTINUUM_PYTHON, %s) -- run scripts/repo-init.sh --bootstrap-venv\n' \
-        "$(date -Iseconds 2>/dev/null || date)" "$SCRIPT_DIR/../.venv/bin/python" >>"$LOG" 2>/dev/null || true
+    printf '%s pre-edit-chain: no python resolved (checked MEMCONTINUUM_PYTHON, %s) -- run scripts/repo-init.sh --bootstrap-venv project=%s\n' \
+        "$(date -Iseconds 2>/dev/null || date)" "$SCRIPT_DIR/../.venv/bin/python" "$PROJECT" >>"$LOG" 2>/dev/null || true
 fi
 
 # $EPOCHREALTIME is a bash 5-ism (unbound under `set -u` on macOS's stock
@@ -153,15 +169,7 @@ if [ -z "$FILE_PATH" ]; then
     finish "no-file-path"
 fi
 
-# --- project resolution ---------------------------------------------------
-PROJECT="${MEMCONTINUUM_PROJECT:-}"
-if [ -z "$PROJECT" ]; then
-    if [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
-        PROJECT="$(basename "$MEMCONTINUUM_ROOT")"
-    else
-        PROJECT="default"
-    fi
-fi
+# PROJECT is already resolved above (moved ahead of the no-python check).
 
 # --- build candidate paths to try against for-path -------------------------
 declare -a CANDIDATES=()
@@ -202,14 +210,24 @@ if [ ! -f "$DB_PATH" ]; then
 fi
 
 # --- query memidx.py for-path for each candidate until one matches ---------
+# Round-3 addendum (review finding): a candidate whose `for-path` call
+# itself FAILED (RC != 0 -- a broken python, a corrupt db mid-write, any
+# exec failure) was silently `continue`d past and, if every candidate
+# failed the same way, fell straight through to the same `finish
+# "no-match"` a genuine "queried fine, found nothing" result uses --
+# indistinguishable in the log from real negative evidence. Track whether
+# ANY candidate's query actually ran to completion; if none did, this
+# was never really evaluated at all, so it gets its own distinct outcome.
 MATCHED_CANDIDATE=""
 RESULT_JSON=""
+ANY_QUERY_SUCCEEDED=0
 for candidate in "${CANDIDATES[@]}"; do
     RESULT_JSON="$(PYTHONPATH= "$PY" "$MEMIDX" for-path "$candidate" --project "$PROJECT" --db "$DB_PATH" --json 2>>"$LOG")"
     RC=$?
     if [ $RC -ne 0 ]; then
         continue
     fi
+    ANY_QUERY_SUCCEEDED=1
     TRIMMED="$(printf '%s' "$RESULT_JSON" | tr -d '[:space:]')"
     if [ -n "$TRIMMED" ] && [ "$TRIMMED" != "[]" ]; then
         MATCHED_CANDIDATE="$candidate"
@@ -218,6 +236,9 @@ for candidate in "${CANDIDATES[@]}"; do
 done
 
 if [ -z "$MATCHED_CANDIDATE" ]; then
+    if [ "$ANY_QUERY_SUCCEEDED" -eq 0 ]; then
+        finish "query-failed"
+    fi
     finish "no-match"
 fi
 

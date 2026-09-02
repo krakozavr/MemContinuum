@@ -108,6 +108,21 @@ PY="${MEMCONTINUUM_PYTHON:-$SCRIPT_DIR/../.venv/bin/python}"
 LOG="$MEMCONTINUUM_HOME/hook.log"
 mkdir -p "$MEMCONTINUUM_HOME" 2>/dev/null || true
 
+# Project resolution (liveness metric fix: memidx.py stats groups hook.log
+# by project; matches memlib.sh's MC_PROJECT / pre-edit-chain.sh's own PROJECT
+# resolution -- MEMCONTINUUM_PROJECT, else basename(MEMCONTINUUM_ROOT), else
+# "default"). This hook never sources memlib.sh (see the header comment), so
+# it resolves its own copy rather than duplicating a whole shared library for
+# one variable.
+PROJECT="${MEMCONTINUUM_PROJECT:-}"
+if [ -z "$PROJECT" ]; then
+    if [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
+        PROJECT="$(basename "$MEMCONTINUUM_ROOT")"
+    else
+        PROJECT="default"
+    fi
+fi
+
 FILE_PATH=""
 
 log() {
@@ -117,7 +132,7 @@ log() {
 
 finish() {
     # $1 = one-word outcome for the log line; everything after stays 0.
-    log "$(date -Iseconds 2>/dev/null || date) newfile-nudge outcome=$1 file=${FILE_PATH:-}"
+    log "$(date -Iseconds 2>/dev/null || date) newfile-nudge outcome=$1 project=${PROJECT:-} file=${FILE_PATH:-}"
     exit 0
 }
 

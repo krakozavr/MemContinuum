@@ -71,6 +71,7 @@
 # tripped by that nonzero-but-successful read.
 IFS= read -r -d '' MC_WATCHDOG_LAUNCHER_PY <<'MC_WATCHDOG_PY_EOF' || true
 import atexit, os, signal, subprocess, sys, time
+from datetime import datetime
 # MC_WATCHDOG_LAUNCHER: runs the real hook script as a child in its own
 # process group and enforces a wall-clock budget (MC_WATCHDOG_BUDGET env,
 # seconds, default 2 -- SessionEnd sets 1.2, its harness budget is 1.5s)
@@ -121,10 +122,31 @@ def _log_watchdog_kill():
             os.path.expanduser("~"), ".memcontinuum"
         )
         hook_name = os.path.basename(sys.argv[2]) if len(sys.argv) > 2 else "unknown"
-        ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+        # Round-2 review finding: this used to be a NAIVE `%Y-%m-%dT%H:%M:%S`
+        # (no UTC offset) -- memidx.py stats' parser requires an
+        # offset-bearing timestamp (the same `date -Iseconds 2>/dev/null ||
+        # date` idiom every other hook.log line uses), so this line was
+        # ALWAYS unparseable, never counted in any window. astimezone()
+        # attaches the local UTC offset with no subprocess call (this is a
+        # best-effort log write on an already-past-the-kill path -- adding
+        # a `date` shell-out here would be a new failure mode for exactly
+        # the moment this function exists to survive).
+        try:
+            ts = datetime.now().astimezone().isoformat()
+        except Exception:
+            ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+        # project=: this launcher runs BEFORE memlib.sh's own MC_PROJECT
+        # resolution (basename(MEMCONTINUUM_ROOT) / "default" fallback) --
+        # by design, so a slow/hung memlib.sh source can't blow the
+        # watchdog's own deadline (see this file's header). Use
+        # MEMCONTINUUM_PROJECT from the environment when the caller already
+        # set/baked it (the common installer-rendered case); otherwise this
+        # line genuinely cannot know the real project, and must say so
+        # rather than ever emitting a bare line with none at all.
+        project = os.environ.get("MEMCONTINUUM_PROJECT") or "(pre-resolution)"
         os.makedirs(home, exist_ok=True)
         with open(os.path.join(home, "hook.log"), "a") as f:
-            f.write(f"{ts} outcome=watchdog-killed hook={hook_name}\n")
+            f.write(f"{ts} outcome=watchdog-killed hook={hook_name} project={project}\n")
     except Exception:
         pass
 

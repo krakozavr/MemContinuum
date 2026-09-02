@@ -214,14 +214,16 @@ STATE_FILE="$(mc_state_file_for "$MC_PROJECT" "$SESSION_ID")"
 if ! grep -q '"payload_keys_logged"[[:space:]]*:[[:space:]]*true' "$STATE_FILE" 2>/dev/null; then
     export MC_LOG_PATH="$MC_LOG"
     export MC_TOP_KEYS_CSV="${TOP_KEYS_CSV:-}"
+    export MC_PROJECT_ENV="$MC_PROJECT"
     mc_update_state_json "$STATE_FILE" '
 import os
 
 if not state.get("payload_keys_logged"):
     keys_csv = os.environ.get("MC_TOP_KEYS_CSV") or ""
+    project = os.environ.get("MC_PROJECT_ENV") or ""
     try:
         with open(os.environ["MC_LOG_PATH"], "a") as lf:
-            lf.write("payload_keys=" + keys_csv + "\n")
+            lf.write("payload_keys=" + keys_csv + " project=" + project + "\n")
     except OSError:
         pass
     state["payload_keys_logged"] = True
