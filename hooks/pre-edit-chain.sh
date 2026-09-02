@@ -210,14 +210,24 @@ if [ ! -f "$DB_PATH" ]; then
 fi
 
 # --- query memidx.py for-path for each candidate until one matches ---------
+# Round-3 addendum (review finding): a candidate whose `for-path` call
+# itself FAILED (RC != 0 -- a broken python, a corrupt db mid-write, any
+# exec failure) was silently `continue`d past and, if every candidate
+# failed the same way, fell straight through to the same `finish
+# "no-match"` a genuine "queried fine, found nothing" result uses --
+# indistinguishable in the log from real negative evidence. Track whether
+# ANY candidate's query actually ran to completion; if none did, this
+# was never really evaluated at all, so it gets its own distinct outcome.
 MATCHED_CANDIDATE=""
 RESULT_JSON=""
+ANY_QUERY_SUCCEEDED=0
 for candidate in "${CANDIDATES[@]}"; do
     RESULT_JSON="$(PYTHONPATH= "$PY" "$MEMIDX" for-path "$candidate" --project "$PROJECT" --db "$DB_PATH" --json 2>>"$LOG")"
     RC=$?
     if [ $RC -ne 0 ]; then
         continue
     fi
+    ANY_QUERY_SUCCEEDED=1
     TRIMMED="$(printf '%s' "$RESULT_JSON" | tr -d '[:space:]')"
     if [ -n "$TRIMMED" ] && [ "$TRIMMED" != "[]" ]; then
         MATCHED_CANDIDATE="$candidate"
@@ -226,6 +236,9 @@ for candidate in "${CANDIDATES[@]}"; do
 done
 
 if [ -z "$MATCHED_CANDIDATE" ]; then
+    if [ "$ANY_QUERY_SUCCEEDED" -eq 0 ]; then
+        finish "query-failed"
+    fi
     finish "no-match"
 fi
 

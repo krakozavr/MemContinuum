@@ -208,6 +208,51 @@ class TestPreEditChainHook(unittest.TestCase):
         self.assertTrue(matching, log_text)
         self.assertIn(f"project={self.project}", matching[-1])
 
+    def test_for_path_all_candidates_failing_logs_query_failed_not_no_match(self):
+        """Round-3 addendum (review finding): a candidate whose `for-path`
+        call itself FAILS (non-zero exit -- a broken python, a corrupt db
+        mid-write, any exec failure) used to `continue` silently and, if
+        EVERY candidate failed the same way, fall through to the exact
+        same `outcome=no-match` a genuine "queried fine, found nothing"
+        result produces -- indistinguishable in the log from real
+        negative evidence. Must log a distinct `query-failed` outcome
+        instead. The stub python fails ONLY the `for-path` calls (not the
+        jq-fallback JSON payload parsing, so this test doesn't depend on
+        whether jq happens to be on PATH) -- proxying every other call to
+        the real venv python."""
+        fail_py = Path(self.tmp) / "fail-for-path-python"
+        fail_py.write_text(
+            "#!/usr/bin/env bash\n"
+            "for a in \"$@\"; do\n"
+            "  case \"$a\" in\n"
+            "    for-path) exit 1 ;;\n"
+            "  esac\n"
+            "done\n"
+            f'exec "{VENV_PYTHON}" "$@"\n'
+        )
+        fail_py.chmod(0o755)
+
+        payload = json.dumps(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Edit",
+                "cwd": "/nowhere",
+                "tool_input": {"file_path": "/nowhere/near/anything.py"},
+            }
+        )
+        env = clean_env(
+            MEMCONTINUUM_HOME=self.memtool_home,
+            MEMCONTINUUM_PROJECT=self.project,
+            MEMCONTINUUM_PYTHON=str(fail_py),
+        )
+        proc, _elapsed = run_hook(payload, env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        matching = [l for l in log_text.splitlines() if "outcome=" in l]
+        self.assertIn("outcome=query-failed", matching[-1], matching[-1])
+        self.assertNotIn("outcome=no-match", matching[-1])
+
     def test_no_python_resolved_line_carries_project(self):
         """Round-2 review finding: this fail-open diagnostic (the FIRST,
         sometimes ONLY, trace a session with a broken python resolution

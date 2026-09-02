@@ -122,10 +122,13 @@ class TestStatsHealthyCase(StatsTestBase):
 
     @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores permission bits")
     def test_exists_but_unreadable_prints_tolerant_message_not_internal_error(self):
-        """Fix round 1 (review finding, IMPORTANT): _scan_hook_log's OSError
-        branch used to return a 5-tuple (a duplicated unparseable_lines)
-        while the normal path returns 4 and cmd_stats always unpacks 4 --
-        an existing-but-unreadable hook.log (chmod 000; permissions, a
+        """Fix round 1 (review finding, IMPORTANT; historical -- at the
+        time, _scan_hook_log returned a 4-tuple): the OSError branch used
+        to return a 5-tuple (a duplicated unparseable_lines) while the
+        normal path returned 4 and cmd_stats always unpacked 4 -- round 2
+        later added a genuine 5th value (untimestamped_lines) to both
+        branches, kept in sync on purpose. At the time of THIS bug, an
+        existing-but-unreadable hook.log (chmod 000; permissions, a
         mid-rotation window, anything read_text can raise OSError for)
         crashed with "too many values to unpack" INSIDE the try/except
         meant to make this fail open, surfacing as "stats: internal error
@@ -203,7 +206,15 @@ class TestStatsHealthyCase(StatsTestBase):
         classifier only checked for a bare `outcome=` prefix, these would
         count as pre-edit lookups (`other`) and could suppress the
         INC-0103 FLAG -- the exact false negative this metric exists to
-        prevent."""
+        prevent.
+
+        Round-3 addition: these lines (`file=/x.json.lock project=demo`)
+        also pin the round-3 fix -- they classify as kind "other" (no
+        hook-type keyword, no `elapsed=`), which the round-2 kind=='ledger'
+        -only rescue did NOT cover, so their trailing project=demo (mc_log's
+        own unconditional append, AFTER file=) used to be silently
+        swallowed into the file value and the lines landed in
+        "(unknown)" instead of "demo"."""
         lines = [
             f"{ts(1)} outcome=lock-timeout file=/x.json.lock project=demo",
             f"{ts(1)} outcome=lock-open-failed file=/x.json.lock project=demo",
@@ -215,6 +226,26 @@ class TestStatsHealthyCase(StatsTestBase):
         self.assertEqual(out["pre_edit"]["lookups"], 0)
         self.assertEqual(out["user_prompts"], 10)
         self.assertIn("FLAG: read side silent (INC-0103 class)", out["flags"])
+        self.assertNotIn("(unknown)", out["projects_seen"])
+        self.assertIn("demo", out["projects_seen"])
+
+    def test_trailing_project_rescued_for_every_kind_not_just_ledger(self):
+        """Round 3 (review ruling): the rule is STRUCTURAL, not per-kind --
+        mc_log always appends project= as the line's last token, whatever
+        kind of line it's logging for. A synthetic kind='other' line whose
+        file value itself embeds a FAKE ' project=other' token in the
+        middle, but whose line genuinely ENDS with a real ' project=demo'
+        token, must attribute to demo -- the fake, non-last occurrence
+        must never win."""
+        lines = [
+            f"{ts(1)} outcome=some-other-outcome file=/tmp/x project=other/mid.txt project=demo",
+        ]
+        self.write_log(lines)
+        rc, demo = run_stats_json(home=str(self.home), project="demo")
+        self.assertIn("demo", demo["projects_seen"])
+        self.assertNotIn("(unknown)", demo["projects_seen"])
+        rc, unknown = run_stats_json(home=str(self.home), project="(unknown)")
+        self.assertEqual(unknown["unknown_lines"], 0, "the line must be attributed to demo, not (unknown)")
 
     def test_new_file_nudge_outcomes(self):
         """The four named fields are a view over `outcomes` (fix round 1);
@@ -461,6 +492,66 @@ class TestStatsFlags(StatsTestBase):
         rc, out = run_stats_json(home=str(self.home))
         self.assertEqual(out["pre_edit"]["total"], 5)
         self.assertEqual(out["pre_edit"]["lookups"], 0)
+        self.assertIn("FLAG: read side silent (INC-0103 class)", out["flags"])
+
+    def test_read_side_flag_fires_with_query_failed_outcome(self):
+        """Round-3 addendum: `query-failed` (pre-edit-chain.sh's new
+        outcome for "every for-path candidate itself errored, nothing was
+        genuinely queried") is exactly the same class as index-missing --
+        FAILED, not a real lookup. Ten prompts plus five query-failed and
+        zero real lookups must still FLAG."""
+        lines = [f"{ts(1)} userprompt outcome=injected session=s1 project=demo" for _ in range(10)]
+        lines += [f"{ts(1)} outcome=query-failed elapsed=0s project=demo file=/x.py" for _ in range(5)]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home))
+        self.assertEqual(out["pre_edit"]["total"], 5)
+        self.assertEqual(out["pre_edit"]["lookups"], 0)
+        self.assertIn("query-failed", out["pre_edit"]["outcomes"])
+        self.assertIn("FLAG: read side silent (INC-0103 class)", out["flags"])
+
+    def test_read_side_flag_absent_with_ten_empty_payload_lines(self):
+        """Round-3 addendum (ruling C): `empty-payload` means the hook
+        received no payload at all -- nothing was processed, so it must
+        not satisfy the ">=10 prompts" busy signal any more than
+        duplicate-delivery/agent-source do."""
+        lines = [f"{ts(1)} userprompt outcome=empty-payload session= project=demo" for _ in range(10)]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home))
+        self.assertEqual(out["user_prompts"], 0)
+        self.assertEqual(out["non_user_prompt_lines"], 10)
+        self.assertEqual(out["flags"], [])
+
+    def test_read_side_flag_absent_with_no_session_id_and_no_state_lines(self):
+        """Round-3 addendum: `no-session-id` (payload present, no
+        session_id -- can't even say WHICH session) and `no-state` (a
+        session_id with no prior SessionStart -- no turn tracking, no
+        evidence considered) are the same "nothing was actually
+        processed" class as empty-payload."""
+        lines = [f"{ts(1)} userprompt outcome=no-session-id project=demo" for _ in range(5)]
+        lines += [f"{ts(1)} userprompt outcome=no-state session=s1 project=demo" for _ in range(5)]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home))
+        self.assertEqual(out["user_prompts"], 0)
+        self.assertEqual(out["non_user_prompt_lines"], 10)
+        self.assertEqual(out["flags"], [])
+
+    def test_read_side_flag_still_fires_with_mktemp_and_decision_failed_lines(self):
+        """Round-3 addendum design decision (documented, not literally
+        asked for by the ruling, but the natural boundary line): unlike
+        the malformed-delivery outcomes above, `mktemp-failed` and
+        `decision-failed` are only reachable AFTER the hook has already
+        confirmed a real session_id, existing state, and a non-agent
+        turn -- a downstream infra failure on top of a CONFIRMED real
+        prompt, not evidence the prompt wasn't real. These must still
+        count toward user_prompts (excluding them would under-count
+        genuine engagement and could itself hide a real INC-0103-class
+        silence)."""
+        lines = [f"{ts(1)} userprompt outcome=mktemp-failed session=s1 project=demo" for _ in range(5)]
+        lines += [f"{ts(1)} userprompt outcome=decision-failed session=s1 project=demo" for _ in range(5)]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home))
+        self.assertEqual(out["user_prompts"], 10)
+        self.assertEqual(out["non_user_prompt_lines"], 0)
         self.assertIn("FLAG: read side silent (INC-0103 class)", out["flags"])
 
     def test_read_side_flag_absent_with_ten_duplicate_delivery_lines(self):

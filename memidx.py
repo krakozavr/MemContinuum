@@ -2741,16 +2741,40 @@ _HOOK_LOG_KEYWORDS = (
 )
 UNKNOWN_STATS_PROJECT = "(unknown)"
 
-# Round 2 (Codex gate, item 8): these userprompt outcomes mean "this
-# invocation was not itself a live, unique user turn" -- a redelivered
-# prompt_id (duplicate-delivery), a subagent/persona run (agent-source),
-# or the pre-INC-0103-fix gate's own now-dead outcome name
-# (non-user-source, kept here only because OLD hook.log lines can still
-# carry it). Excluded from `user_prompts` so ten of THESE alone can never
-# satisfy the read-side FLAG's ">=10 prompts" busy-signal on their own --
-# they prove the hook ran, not that a human was actively prompting.
+# Round 2 (Codex gate, item 8) + round-3 addendum (review finding): every
+# outcome userprompt-remind.sh's finish() can ever log, and whether it
+# means a confirmed, distinct, live user turn actually happened:
+#
+#   EXCLUDED (does not confirm a real user turn -- a malformed/ineligible
+#   delivery, evaluated BEFORE the hook can even establish which session
+#   this is or that it's a real main-thread turn):
+#     empty-payload   -- no payload at all; nothing to process
+#     no-session-id   -- payload present but no session_id; can't even
+#                        say WHICH session this belongs to
+#     no-state        -- session_id present but no state file for it (no
+#                        prior SessionStart) -- no turn tracking, no
+#                        evidence considered, functionally unprocessed
+#     agent-source    -- a subagent/persona run, not the main user thread
+#     duplicate-delivery -- a redelivered prompt_id, not a NEW turn
+#     non-user-source -- the pre-INC-0103-fix gate's own dead outcome
+#                        name (kept only because OLD hook.log lines can
+#                        still carry it)
+#   COUNTED (everything past those gates: this outcome is only reachable
+#   once the hook has already confirmed a real session_id, existing
+#   state, and a non-agent turn -- a downstream failure past that point
+#   is the HOOK's own infra choking on a confirmed real prompt, not
+#   evidence the prompt wasn't real; excluding these would UNDER-count
+#   genuine engagement and could itself hide a real INC-0103-class
+#   silence, e.g. every real turn failing at mktemp):
+#     mktemp-failed, decision-failed, injected, no-evidence,
+#     lookback-injected
+#
+# Excluded from `user_prompts` so ten of THESE alone can never satisfy
+# the read-side FLAG's ">=10 prompts" busy-signal on their own -- they
+# prove the hook ran, not that a human was actively prompting.
 _NON_USER_PROMPT_OUTCOMES = frozenset({
     "duplicate-delivery", "agent-source", "non-user-source",
+    "empty-payload", "no-session-id", "no-state",
 })
 
 _MONTH_ABBR = {
@@ -2894,7 +2918,10 @@ def _new_stats_bucket():
 _FIELD_RE = re.compile(r"(?:^|\s)(\w+)=(\S*)")
 
 
-def _hook_log_fields(rest: str, kind: str = "other") -> dict:
+_TRAILING_PROJECT_TOKEN_RE = re.compile(r"^project=([A-Za-z0-9._-]+)$")
+
+
+def _hook_log_fields(rest: str) -> dict:
     """Every producer writes space-separated `key=value` tokens (a few
     values may be empty, e.g. `session=` on a payload missing session_id).
     A generic key=value scan is more robust than one regex per field name,
@@ -2905,34 +2932,42 @@ def _hook_log_fields(rest: str, kind: str = "other") -> dict:
     (reproduced: a path literally containing `project=other`, e.g.
     `/tmp/a project=other/x.py`). Without care, the generic scan's
     last-match-wins semantics can let that embedded text overwrite the
-    line's REAL project=. The fix has to be KIND-AWARE, not one universal
-    rule, because the two real shapes disagree about where `file=` sits:
+    line's REAL project=.
 
-      - pre-edit-chain.sh / newfile-nudge.sh (their own independent
-        loggers, never through mc_log): `... project=P file=F`, with
-        `file=` genuinely LAST -- nothing follows it. Here the scan must
-        stop AT the first ` file=` marker: fields come only from the
-        prefix before it, and everything after is the file value
-        verbatim, never re-scanned.
-      - ledger-post-edit.sh (via mc_log, hooks/memlib.sh): mc_log appends
-        `project=$MC_PROJECT` as the line's UNCONDITIONAL LAST token,
-        always AFTER the hook's own `... file=F` -- so here `project=`
-        sits PAST `file=`, the opposite arrangement. Cutting at the first
-        ` file=` (the pre-edit-chain rule) would silently drop this
-        trailing project= as part of the file value instead -- reproduced
-        as a real regression while fixing the OTHER shape, caught by
-        test_healthy_case_no_flags. The fix for THIS shape: parse fields
-        from the prefix as before, but then scan the tail (everything
-        after ` file=`) for `project=` tokens and take the LAST one --
-        matching mc_log's own guarantee that its append is always the
-        line's final such token, so an embedded fake one earlier in the
-        path still loses to the real one after it. The file value is the
-        tail with that trailing project token removed.
-      - every other kind (userprompt/sessionstart/sessionend/precompact/
-        other): never carries a real `file=` field in practice; default
-        to the pre-edit-chain-style stop-at-`file=` rule (the safer
-        default -- never let a stray value re-open scanning across the
-        whole line)."""
+    Round 3 (review fix): round 2 shipped a KIND-AWARE fix (special-cased
+    `kind == "ledger"`) that was itself incomplete -- memlib.sh's own raw
+    diagnostic lines (mc_log's `outcome=lock-timeout file=$lockfile` /
+    `lock-open-failed` / `state-dir-failed`) ALSO go through mc_log, which
+    ALWAYS appends `project=$MC_PROJECT` as the line's unconditional last
+    token, but those lines classify as kind "other" (no hook-type
+    keyword, and no `elapsed=` either -- see _hook_log_line_kind), so the
+    round-2 fix missed them entirely: their trailing project= was
+    silently swallowed into the file value and the line landed in
+    "(unknown)". The rule is STRUCTURAL, not per-kind: mc_log's guarantee
+    ("project= is always this line's last token") holds regardless of
+    WHICH kind of line it's logging for, so there is no need to enumerate
+    kinds at all -- check the tail's (everything after the first
+    ` file=`) own LAST whitespace-delimited token, unconditionally, for
+    every kind.
+
+    One deliberate refinement on top of the literal review wording: the
+    last token must look like a REAL project value, not merely `\\S+`.
+    MemContinuum project names are already restricted elsewhere in this
+    codebase to `[A-Za-z0-9._-]+` (repo-init.sh refuses anything else,
+    e.g. the skill's `--project NAME` doc). A bare `\\S+` would also match
+    the pre-edit-chain.sh/newfile-nudge.sh adversarial shape's file value
+    (`file=/tmp/a project=other/x.py` -- file= genuinely last there,
+    nothing really follows it, but "other/x.py" still LOOKS like a
+    project=-shaped last token) and wrongly hijack it -- reproduced by
+    this file's own existing pre-edit-hijack regression test, which this
+    exact refinement is what keeps passing. Restricting the value to the
+    real project-name charset (no `/`) rejects "other/x.py" (contains
+    `/`) while still accepting every genuine mc_log project append
+    (always a valid project name). The residual, accepted edge case: a
+    real file literally named ...`/project=validname` with NO further
+    path segment after it, on a NON-mc_log line -- indistinguishable from
+    a real trailing project= by any purely structural rule; considered
+    rare enough to accept."""
     marker = " file="
     idx = rest.find(marker)
     if idx == -1:
@@ -2941,12 +2976,12 @@ def _hook_log_fields(rest: str, kind: str = "other") -> dict:
     fields = {k: v for k, v in _FIELD_RE.findall(prefix)}
     tail = rest[idx + len(marker):]
 
-    if kind == "ledger":
-        matches = list(re.finditer(r"(?:^|\s)project=(\S*)", tail))
-        if matches:
-            last = matches[-1]
-            fields["project"] = last.group(1)
-            tail = tail[: last.start()].rstrip(" ")
+    last_sep = tail.rfind(" ")
+    last_token = tail[last_sep + 1:]
+    m = _TRAILING_PROJECT_TOKEN_RE.match(last_token)
+    if m:
+        fields["project"] = m.group(1)
+        tail = tail[:last_sep] if last_sep != -1 else ""
 
     fields["file"] = tail
     return fields
@@ -2989,16 +3024,20 @@ def _scan_hook_log(log_path: Path, cutoff: datetime, now: datetime):
     try:
         raw_lines = log_path.read_text(errors="replace").splitlines()
     except OSError:
-        # Fix round 1 (review finding, IMPORTANT): this used to return a
-        # 5-tuple (a duplicated unparseable_lines) here while the normal
-        # path below returns 4 -- cmd_stats always unpacks 4, so an
-        # exists-but-unreadable hook.log (permissions, a mid-rotation
+        # Fix round 1 (review finding, IMPORTANT; historical -- at the
+        # time, this function returned a 4-tuple): this branch used to
+        # return a 5-tuple (a duplicated unparseable_lines) while the
+        # normal path below returned 4, and cmd_stats always unpacked 4 --
+        # an exists-but-unreadable hook.log (permissions, a mid-rotation
         # window, anything read_text can raise OSError for) blew up with
         # "too many values to unpack" INSIDE the try/except that is
         # supposed to make this tool fail open, printing "stats: internal
         # error (...)" instead of a real message -- the exact kind of
         # silent-failure-about-silent-failure this metric exists to catch.
-        # Reproduced: chmod 000 an existing hook.log.
+        # Reproduced: chmod 000 an existing hook.log. Round 2 later added
+        # a genuine 5th return value (untimestamped_lines) to BOTH
+        # branches -- kept in sync here on purpose; this comment is a
+        # trip-wire for the next person editing either branch alone.
         return buckets, unknown_lines, projects_seen, unparseable_lines, untimestamped_lines
 
     for line in raw_lines:
@@ -3014,7 +3053,7 @@ def _scan_hook_log(log_path: Path, cutoff: datetime, now: datetime):
         if ts < cutoff or ts > now:
             continue
         kind = _hook_log_line_kind(rest)
-        fields = _hook_log_fields(rest, kind)
+        fields = _hook_log_fields(rest)
         project = fields.get("project") or UNKNOWN_STATS_PROJECT
         projects_seen.add(project)
         if project == UNKNOWN_STATS_PROJECT:
@@ -3487,7 +3526,15 @@ def main(argv=None) -> int:
             "so 'read side silent' there would be a guaranteed false alarm on every "
             "deployment's cold-start window, not a real signal. Fail-open "
             "throughout: a missing hook.log, an unreadable file, a bad --store "
-            "path, or any unexpected error prints one line and exits 0."
+            "path, or any unexpected error prints one line and exits 0.\n\n"
+            "Legacy-log note: project= attribution rescues a trailing project= "
+            "token after file= for every kind of hook.log line (mc_log, "
+            "hooks/memlib.sh, always appends it last) -- but this can only be "
+            "PRE-FIX history: a real, ambiguous case exists only for a ledger "
+            "line logged before this project= fix landed, whose FILE PATH "
+            "itself happens to end in a project-name-shaped ' project=X' "
+            "segment with nothing after it. Considered rare enough to accept; "
+            "every line from a fixed install is unambiguous."
         ),
     )
     p_stats.add_argument("--project", default=DEFAULT_PROJECT, help="project namespace to report on (default: %(default)s)")
