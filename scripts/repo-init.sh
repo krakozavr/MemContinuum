@@ -569,7 +569,11 @@ CLAUDE_DIR_ANCESTOR="$(nearest_existing_ancestor "$CLAUDE_DIR")"
 # existing $CLAUDE_DIR/rules/memcontinuum.md is only ever overwritten when
 # its own first line matches -- a hand-authored or foreign file at that path
 # is left alone, loudly.
-RULES_IDENTITY_MARKER="<!-- memcontinuum-rules v1 — rendered by MemContinuum repo-init; do not hand-edit -->"
+# Read from the template that defines it (mc_rules_identity_marker), never
+# copied into this file: one place says what a rendered rules file looks like.
+mc_rules_identity_marker "$ENGINE_ROOT" \
+    || fail "cannot read $TEMPLATES_DIR/memcontinuum-rules.md (or it is empty) -- incomplete checkout" 3
+RULES_IDENTITY_MARKER="$MC_RULES_MARKER"
 RULES_DEST="$CLAUDE_DIR/rules/memcontinuum.md"
 if [ -f "$RULES_DEST" ]; then
     RULES_DEST_FIRST_LINE="$(head -n 1 "$RULES_DEST" 2>/dev/null)"

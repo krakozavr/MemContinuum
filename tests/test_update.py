@@ -10,6 +10,7 @@ test, nothing here ever touches the real machine's ~/.claude or
 """
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -978,6 +979,138 @@ class TestPathsWithSpaces(unittest.TestCase):
                                "--claude-dir", self.claude_dir], self.home)
         self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn(";", proc.stdout + proc.stderr)
+
+
+class TestRulesMarkerComesFromTheTemplate(unittest.TestCase):
+    """The rules file's identity marker is the template's own first line.
+    Copying it into the two scripts (and the tests) meant four places had to
+    be edited in lockstep, and a template whose first line moved on would
+    silently make every rendered file read as foreign."""
+
+    TEMPLATE = TOOLS_DIR / "templates" / "memcontinuum-rules.md"
+
+    def marker(self):
+        return self.TEMPLATE.read_text().splitlines()[0]
+
+    def test_no_script_hardcodes_the_marker_text(self):
+        marker = self.marker()
+        for script in ("scripts/repo-init.sh", "scripts/memcontinuum-update.sh"):
+            text = (TOOLS_DIR / script).read_text()
+            self.assertNotIn(
+                marker, text,
+                f"{script} still carries a copy of the rules identity marker -- "
+                "read line 1 of templates/memcontinuum-rules.md at runtime instead")
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_a_changed_template_marker_still_round_trips(self):
+        """Change the template's first line in a copied engine and the whole
+        chain -- render, identity check, the updater's rules state -- follows
+        it, with no source edit anywhere."""
+        tmp = tempfile.mkdtemp(prefix="memcontinuum-marker-test-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        engine = Path(tmp) / "engine"
+        subprocess.run(["git", "-C", str(TOOLS_DIR), "worktree", "list"],
+                       capture_output=True)
+        shutil.copytree(TOOLS_DIR, engine, symlinks=True, ignore=shutil.ignore_patterns(
+            ".git", "fixtures", "tests", "__pycache__", ".venv"))
+        tmpl = engine / "templates" / "memcontinuum-rules.md"
+        lines = tmpl.read_text().splitlines(keepends=True)
+        lines[0] = "<!-- memcontinuum-rules v2 - a different marker -->\n"
+        tmpl.write_text("".join(lines))
+
+        home = str(Path(tmp) / "home")
+        os.makedirs(home, exist_ok=True)
+        repo = git_repo(str(Path(tmp) / "repo"))
+        store = str(Path(tmp) / "store")
+        claude_dir = str(Path(repo) / ".claude")
+        proc = run(engine / "scripts" / "repo-init.sh",
+                   ["--project", "mk", "--store", store, "--claude-dir", claude_dir,
+                    "--non-interactive"], home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        rules = Path(claude_dir, "rules", "memcontinuum.md").read_text()
+        self.assertTrue(rules.startswith("<!-- memcontinuum-rules v2 - a different marker -->"),
+                        rules[:200])
+
+        proc = run(engine / "scripts" / "memcontinuum-decide.sh",
+                   ["wired", "--repo", repo, "--store", store, "--project", "mk",
+                    "--claude-dir", claude_dir], home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        proc = run(engine / "scripts" / "memcontinuum-update.sh", [], home)
+        lines = [l for l in proc.stdout.splitlines() if l.strip()]
+        rows = [dict(zip(lines[0].split("\t"), l.split("\t"))) for l in lines[1:]]
+        self.assertEqual(rows[0]["rules"], "ok", proc.stdout)
+        self.assertNotEqual(rows[0]["rules"], "foreign", proc.stdout)
+
+
+class TestPartiallyRenderedLanguagesAreReported(unittest.TestCase):
+    """Recovering languages from extension globs: a language counts as
+    rendered only when ALL of its extensions are on the line. One that is
+    half-present used to be dropped in silence -- the migration would then
+    record a language set smaller than what is actually wired, and say
+    nothing about it."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-partial-test-")
+        self.home = str(Path(self.tmp) / "home")
+        os.makedirs(self.home, exist_ok=True)
+        self.repo = git_repo(str(Path(self.tmp) / "repo"))
+        self.code_root = str(Path(self.tmp) / "code")
+        os.makedirs(self.code_root, exist_ok=True)
+        (Path(self.code_root) / "x.py").write_text("print(1)\n")
+        self.store = str(Path(self.tmp) / "store")
+        self.claude_dir = str(Path(self.repo) / ".claude")
+
+    def _lang_exts(self, lang):
+        out = subprocess.run(
+            [VENV_PYTHON, "-c",
+             "import sys,chunkers;"
+             "print(' '.join('*'+e for e in sorted(chunkers.LANGUAGE_TABLE[sys.argv[1]]['extensions'])))",
+             lang],
+            cwd=str(TOOLS_DIR), capture_output=True, text=True,
+            env={**os.environ, "PYTHONPATH": ""})
+        return out.stdout.strip().split()
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_a_half_rendered_language_is_named_not_silently_dropped(self):
+        multi = None
+        for lang in ("swift", "python"):
+            if len(self._lang_exts(lang)) > 1:
+                multi = lang
+                break
+        if multi is None:
+            self.skipTest("no language in this engine's table has more than one extension")
+        exts = self._lang_exts(multi)
+        proc = run(INSTALL_SH, [
+            "--project", "part", "--store", self.store, "--claude-dir", self.claude_dir,
+            "--code-root", self.code_root, "--langs", multi, "--non-interactive",
+        ], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        path = Path(self.claude_dir, "settings.local.json")
+        path.write_text(path.read_text().replace(
+            "MEMCONTINUUM_LANG_EXTS='%s'" % " ".join(exts),
+            "MEMCONTINUUM_LANG_EXTS='%s'" % exts[0]))
+        write_row(self.home, self.repo, "wired",
+                  note=f"store={self.store} project=part")
+        proc = run(UPDATE_SH, [], self.home)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("partially", combined.lower(), combined)
+        self.assertIn(multi, combined, combined)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_an_extension_matching_no_language_is_named_too(self):
+        proc = run(INSTALL_SH, [
+            "--project", "part", "--store", self.store, "--claude-dir", self.claude_dir,
+            "--code-root", self.code_root, "--langs", "python", "--non-interactive",
+        ], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        path = Path(self.claude_dir, "settings.local.json")
+        path.write_text(path.read_text().replace(
+            "MEMCONTINUUM_LANG_EXTS='*.py'", "MEMCONTINUUM_LANG_EXTS='*.py *.zz'"))
+        write_row(self.home, self.repo, "wired",
+                  note=f"store={self.store} project=part")
+        proc = run(UPDATE_SH, [], self.home)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("*.zz", combined, combined)
 
 
 class TestHelp(unittest.TestCase):

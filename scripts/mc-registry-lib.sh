@@ -458,6 +458,26 @@ mc_build_wiring_args() {
     return 0
 }
 
+# mc_rules_identity_marker ENGINE_ROOT
+#
+# Reads the identity marker for a rendered <claude-dir>/rules/memcontinuum.md
+# out of the template that defines it: line 1 of
+# templates/memcontinuum-rules.md. Sets MC_RULES_MARKER and returns 0; sets it
+# empty and returns 1 when the template is not readable.
+#
+# There is exactly one place this string is written down, and it is the
+# template. It used to be copied into the installer, the re-render walk, and
+# the tests: five copies that had to be edited in lockstep, and any template
+# whose first line moved on would have made every file the installer renders
+# read as "foreign" -- refusing to overwrite its own output.
+mc_rules_identity_marker() {
+    local tmpl="$1/templates/memcontinuum-rules.md"
+    MC_RULES_MARKER=""
+    [ -f "$tmpl" ] || return 1
+    IFS= read -r MC_RULES_MARKER < "$tmpl" || :
+    [ -n "$MC_RULES_MARKER" ]
+}
+
 # mc_resolve_home
 #
 # F7: two registries used to exist under a non-default MEMCONTINUUM_HOME --

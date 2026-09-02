@@ -128,14 +128,30 @@ echo "wiring=$MC_WIRING"
 # because A's hook entry sorts first in the file.
 DECISION="none"
 DECISION_PROJECT=""
+# Where this project's wiring actually lives. A project's wiring does not have
+# to be in <repo>/.claude -- a session-home .claude beside a bare checkout is
+# a supported shape, and the registry row is the only thing that knows. Look
+# there when the row says, and fall back to <repo>/.claude when it does not
+# (every row written before the registry recorded claude-dirs, and every
+# ordinary single-directory install). Pure string work: this script runs no
+# python, and this adds no fork.
+declare -a WIRING_SETTINGS=()
 if mc_registry_lookup "$DECISIONS" "$KEY"; then
     DECISION="$MC_LOOKUP_DECISION"
     echo "decision=$DECISION"
     echo "decided_at=$MC_LOOKUP_WHEN"
     mc_note_field "$MC_LOOKUP_NOTE" "project"
     DECISION_PROJECT="$MC_NOTE_FIELD"
+    mc_note_field "$MC_LOOKUP_NOTE" "claude-dirs"
+    mc_split_semi "$MC_NOTE_FIELD"
+    for ROW_CLAUDE_DIR in ${MC_SPLIT[@]+"${MC_SPLIT[@]}"}; do
+        WIRING_SETTINGS+=("$ROW_CLAUDE_DIR/settings.local.json" "$ROW_CLAUDE_DIR/settings.json")
+    done
 else
     echo "decision=none"
+fi
+if [ "${#WIRING_SETTINGS[@]}" -eq 0 ]; then
+    WIRING_SETTINGS=("$REPO/.claude/settings.local.json" "$REPO/.claude/settings.json")
 fi
 
 # Store/project, pulled from ONE coherent hook entry rather than two
@@ -147,19 +163,21 @@ fi
 # that actually carries THAT project's marker over "the first match" --
 # falling back to first-found only when there is no row, or the row's
 # project has no matching hook entry (R6 fix, round 4).
-if [ "$MC_WIRING" != "none" ]; then
-    FOUND=0
-    PROJECT_SOURCE=""
-    if [ -n "$DECISION_PROJECT" ] && mc_wired_command_for_project "$DECISION_PROJECT" \
-            "$REPO/.claude/settings.local.json" "$REPO/.claude/settings.json"; then
-        FOUND=1
-        PROJECT_SOURCE="registry"
-    elif mc_first_wired_command \
-            "$REPO/.claude/settings.local.json" "$REPO/.claude/settings.json"; then
-        FOUND=1
-        PROJECT_SOURCE="wiring"
-    fi
-    if [ "$FOUND" -eq 1 ]; then
+# Not gated on the wiring= scan above: that scan deliberately looks only at
+# <repo>/.claude (it answers "is THIS repo's own .claude wired", which is what
+# the state= line means), while the store/project/stamp below come from
+# wherever the row says this project's wiring lives.
+FOUND=0
+PROJECT_SOURCE=""
+if [ -n "$DECISION_PROJECT" ] && mc_wired_command_for_project "$DECISION_PROJECT" \
+        "${WIRING_SETTINGS[@]}"; then
+    FOUND=1
+    PROJECT_SOURCE="registry"
+elif mc_first_wired_command "${WIRING_SETTINGS[@]}"; then
+    FOUND=1
+    PROJECT_SOURCE="wiring"
+fi
+if [ "$FOUND" -eq 1 ]; then
         echo "settings=$MC_WIRED_SETTINGS_FILE"
         # mc_command_env_value (mc-registry-lib.sh): scripts/repo-init.sh
         # emits shlex-quoted values (MEMCONTINUUM_ROOT='/a b/c'), hand-written
@@ -191,7 +209,6 @@ if [ "$MC_WIRING" != "none" ]; then
         if [ "$rendered" != "$engine_sha" ]; then
             echo "update: wiring rendered by $rendered, engine at $engine_sha -- run scripts/memcontinuum-update.sh"
         fi
-    fi
 fi
 
 case "$DECISION" in

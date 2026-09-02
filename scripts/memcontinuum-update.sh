@@ -144,7 +144,14 @@ DECISIONS="$MEMCONTINUUM_HOME/decisions.tsv"
 ENGINE_SHA="$(git -C "$ENGINE_ROOT" rev-parse --short HEAD 2>/dev/null)"
 [ -n "$ENGINE_SHA" ] || ENGINE_SHA="unknown"
 
-RULES_IDENTITY_MARKER="<!-- memcontinuum-rules v1 — rendered by MemContinuum repo-init; do not hand-edit -->"
+# From the template that defines it, not a copy (mc_rules_identity_marker):
+# this command and the installer must agree on what a rendered rules file
+# looks like, or one of them calls the other's output foreign.
+mc_rules_identity_marker "$ENGINE_ROOT" || {
+    echo "cannot read $ENGINE_ROOT/templates/memcontinuum-rules.md (or it is empty) -- incomplete checkout" >&2
+    exit 1
+}
+RULES_IDENTITY_MARKER="$MC_RULES_MARKER"
 
 APPLY=0
 # Set only when --dry-run is literally typed -- distinct from APPLY's
@@ -316,6 +323,7 @@ mc_update_recover_from_settings() {
     # the answer is genuinely unknown (see MC_ENV_PRESENT in
     # scripts/mc-registry-lib.sh).
     MC_RECOVERED_LANGS_OK=1
+    MC_RECOVERED_LANG_NOTE=""
     local nudge_seen=0 lang_present=0
     lang_glob_str=""
     never_glob_str=""
@@ -376,6 +384,14 @@ mc_update_recover_from_settings() {
             MC_RECOVERED_LANGS_OK=0
         fi
         if [ -n "$py" ]; then
+            # Two lines out: the recovered language list, then anything the
+            # line carries that the list does not account for. A language is
+            # "rendered" only when ALL of its extensions are present; one that
+            # is half-present is NOT recorded (recording it would claim more
+            # than is wired) but it is NAMED -- silently dropping it is how a
+            # migration ends up recording a smaller language set than what is
+            # actually installed and saying nothing about the difference.
+            # Globs matching no language at all are named for the same reason.
             lang_list="$(
                 MC_UPDATE_EXTS="$lang_glob_str" MC_UPDATE_ENGINE_ROOT="$ENGINE_ROOT" \
                 PYTHONPATH= "$py" - <<'PYEOF' 2>/dev/null
@@ -383,14 +399,30 @@ import os, sys
 sys.path.insert(0, os.environ["MC_UPDATE_ENGINE_ROOT"])
 import chunkers
 have = set(os.environ.get("MC_UPDATE_EXTS", "").split())
-out = []
+full, partial, claimed = [], [], set()
 for lang, row in sorted(chunkers.LANGUAGE_TABLE.items()):
     globs = set("*" + e for e in row["extensions"])
-    if globs and globs <= have:
-        out.append(lang)
-print(",".join(out))
+    if not globs:
+        continue
+    hit = globs & have
+    if hit == globs:
+        full.append(lang)
+        claimed |= globs
+    elif hit:
+        partial.append("%s (has %s, missing %s)"
+                       % (lang, " ".join(sorted(hit)), " ".join(sorted(globs - hit))))
+        claimed |= hit
+notes = list(partial)
+leftover = sorted(have - claimed)
+if leftover:
+    notes.append("extensions matching no language this engine knows: %s"
+                 % " ".join(leftover))
+print(",".join(full))
+print(" | ".join(notes))
 PYEOF
             )"
+            MC_RECOVERED_LANG_NOTE="${lang_list#*$'\n'}"
+            lang_list="${lang_list%%$'\n'*}"
         fi
         MC_RECOVERED_LANGS="$lang_list"
     fi
@@ -851,6 +883,14 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
         # human's answer to exactly the question the recovery could not.
         [ -n "$LANGS_FLAG" ] && LANGS_COMMA="$LANGS_FLAG"
         [ -n "$NEVER_EXT" ] && NEVER_COMMA="$NEVER_EXT"
+
+        # Anything the rendered extension list carries that the recovered
+        # language set does not account for is said out loud, under the row it
+        # belongs to. The table has no note column, and a difference nobody is
+        # told about is how a migration records less than what is wired.
+        if [ -n "$MC_RECOVERED_LANG_NOTE" ] && [ -z "$LANGS_FLAG" ]; then
+            echo "  $KEY: partially rendered -- $MC_RECOVERED_LANG_NOTE. Recorded languages: ${LANGS_COMMA:-(none)}. Pass --langs LIST to record something else." >&2
+        fi
 
         # The migration PROPOSES and refuses; it never writes a value it had
         # to invent. Whatever goes into the row is replayed by every future

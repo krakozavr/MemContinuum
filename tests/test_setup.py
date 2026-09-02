@@ -873,6 +873,55 @@ class TestDecisionRegistry(BootstrapCase):
         self.assertIsNotNone(line)
         self.assertIn("rendered by unknown", line)
 
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_update_hint_reads_the_claude_dirs_the_row_records(self):
+        """A project's wiring does not have to live in <repo>/.claude -- a
+        session-home .claude beside a bare checkout is a supported shape, and
+        the registry row names where it actually is. Looking only in
+        <repo>/.claude meant the drift hint went permanently silent for
+        exactly the repositories most likely to drift."""
+        self.assertEqual(self.bootstrap().returncode, 0)
+        repo = git_repo(str(Path(self.tmp) / "repo"))
+        elsewhere = Path(self.tmp) / "session-home" / ".claude"
+        elsewhere.mkdir(parents=True)
+        self._wire_stamped(elsewhere.parent, "proj", "deadbee")
+        run(DECIDE_SH, ["wired", "--repo", repo, "--project", "proj",
+                        "--claude-dir", str(elsewhere)], self.home, self.mc_home)
+        line = self.update_line_of(repo)
+        self.assertIsNotNone(line, run(STATE_SH, [str(repo)], self.home, self.mc_home).stdout)
+        self.assertIn("rendered by deadbee", line)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_update_hint_stays_silent_when_the_recorded_claude_dir_is_current(self):
+        self.assertEqual(self.bootstrap().returncode, 0)
+        repo = git_repo(str(Path(self.tmp) / "repo"))
+        elsewhere = Path(self.tmp) / "session-home" / ".claude"
+        elsewhere.mkdir(parents=True)
+        self._wire_stamped(elsewhere.parent, "proj", self._engine_sha())
+        run(DECIDE_SH, ["wired", "--repo", repo, "--project", "proj",
+                        "--claude-dir", str(elsewhere)], self.home, self.mc_home)
+        self.assertIsNone(self.update_line_of(repo))
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_state_sh_runs_no_python(self):
+        """state.sh's own contract: it names the commands, it never runs
+        python itself. Guarded with a PATH holding no python at all and a
+        MEMCONTINUUM_PYTHON pointed at a binary that fails loudly if run."""
+        self.assertEqual(self.bootstrap().returncode, 0)
+        repo = git_repo(str(Path(self.tmp) / "repo"))
+        self._wire_stamped(repo, "proj", "deadbee")
+        run(DECIDE_SH, ["wired", "--repo", repo, "--project", "proj"], self.home, self.mc_home)
+        trap = Path(self.tmp) / "python-trap"
+        trap.write_text("#!/bin/sh\necho PYTHON-WAS-RUN >&2\nexit 3\n")
+        trap.chmod(0o755)
+        env = clean_env(self.home, self.mc_home)
+        env["MEMCONTINUUM_PYTHON"] = str(trap)
+        proc = subprocess.run(["bash", str(STATE_SH), str(repo)],
+                              capture_output=True, text=True, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("PYTHON-WAS-RUN", proc.stdout + proc.stderr)
+        self.assertIn("rendered by deadbee", proc.stdout)
+
 
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
 class TestMemlibReadsConfig(BootstrapCase):
