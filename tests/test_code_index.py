@@ -33,6 +33,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 TOOLS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(TOOLS_DIR))
@@ -1361,8 +1362,13 @@ class TestUnsupportedExtensionCensus(unittest.TestCase):
 class TestChunkerFailOpenPerFile(unittest.TestCase):
     """Task 5 spec S4: ANY exception escaping a chunker backend, or a
     ChunkResult with status "failed", must not crash the reindex -- warn
-    (naming the file), write NO file_sha row for it (so its sha never
-    matches on the next run and repair retriggers), and keep going."""
+    (naming the file) and keep going. Task 3 (Anatomy M2a) refines WHAT
+    gets written for the skipped file: a non-deterministic exception (a
+    RuntimeError, here) lands `not-indexed` (sha NULL, retried on the next
+    run or when the backend/chunker changes); a deterministic ChunkResult
+    status="failed" lands `failed` (sha stored, retried only on a source
+    edit or --full) -- either way the row stays so repair provenance is
+    visible, it is just never "ok"."""
 
     def test_raising_chunker_is_skipped_not_crashed(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1395,7 +1401,9 @@ class TestChunkerFailOpenPerFile(unittest.TestCase):
                 "SELECT COUNT(*) AS c FROM chunks WHERE path=?", ("NestedTypes.swift",)
             ).fetchone()["c"]
             conn.close()
-            self.assertIsNone(row)
+            self.assertIsNotNone(row)
+            self.assertEqual(row["status"], "not-indexed")
+            self.assertIsNone(row["sha256"])
             self.assertEqual(chunk_count, 0)
 
     def test_failed_status_result_is_skipped_not_crashed(self):
@@ -1416,7 +1424,9 @@ class TestChunkerFailOpenPerFile(unittest.TestCase):
                 "SELECT * FROM file_sha WHERE path=?", ("broken.py",)
             ).fetchone()
             conn.close()
-            self.assertIsNone(row)
+            self.assertIsNotNone(row)
+            self.assertEqual(row["status"], "failed")
+            self.assertIsNotNone(row["sha256"])
 
 
 class TestFailOpenDeletesStaleIndexState(unittest.TestCase):
@@ -1468,6 +1478,11 @@ class TestFailOpenDeletesStaleIndexState(unittest.TestCase):
         return root, db, rc, err_buf.getvalue()
 
     def test_content_change_then_failure_purges_chunks_and_file_sha(self):
+        """Task 3: a RuntimeError escaping the backend is not a
+        deterministic (source-code) failure -- it lands `not-indexed`, not
+        `failed`. The chunks/fts purge is unchanged; what changed is that
+        the file_sha row now STAYS (status="not-indexed", sha NULL) instead
+        of being deleted, so provenance survives the failure."""
         with tempfile.TemporaryDirectory() as td:
             _root, db, rc, err = self._index_then_break(td)
             self.assertEqual(rc, 0)
@@ -1483,10 +1498,16 @@ class TestFailOpenDeletesStaleIndexState(unittest.TestCase):
             fts_count = conn.execute("SELECT COUNT(*) AS c FROM fts").fetchone()["c"]
             conn.close()
             self.assertEqual(chunk_count, 0, "stale chunks from the last good run must be deleted")
-            self.assertIsNone(sha_row, "the file_sha row must go too, so repair retriggers")
+            self.assertIsNotNone(sha_row, "the file_sha row stays -- with a not-indexed status")
+            self.assertEqual(sha_row["status"], "not-indexed")
+            self.assertIsNone(sha_row["sha256"])
             self.assertEqual(fts_count, 0, "the fts shadow rows must go with the chunks")
 
     def test_version_bump_then_failure_leaves_the_index_not_current(self):
+        """Task 3: same not-indexed contract as above; the row's presence
+        no longer by itself makes `_code_index_state` honest, so the state
+        check consults `status` too (a not-indexed/failed row can never
+        read "current", whatever its stored mtime/size/chunker_version)."""
         try:
             with tempfile.TemporaryDirectory() as td:
                 _root, db, rc, err = self._index_then_break(td, bump_version=True)
@@ -1503,7 +1524,8 @@ class TestFailOpenDeletesStaleIndexState(unittest.TestCase):
                 state, _meta = memidx._code_index_state(conn, memidx.DEFAULT_PROJECT)
                 conn.close()
                 self.assertEqual(chunk_count, 0)
-                self.assertIsNone(sha_row)
+                self.assertIsNotNone(sha_row, "the file_sha row stays -- with a not-indexed status")
+                self.assertEqual(sha_row["status"], "not-indexed")
                 self.assertNotEqual(
                     state, "current",
                     "a file the chunker could not process is missing from the index "
@@ -1568,13 +1590,210 @@ class TestFailOpenDeletesStaleIndexState(unittest.TestCase):
             self.assertNotIn("AAALocked.swift", paths)
 
 
+class TestFileStatusRows(unittest.TestCase):
+    """Task 3 (Anatomy M2a): deterministic chunker/contract failures land as
+    `failed` (sha + chunker_version stored, retried only on source change or
+    --full); everything else (a missing backend, a permission error, any
+    other exception) lands as `not-indexed` (sha NULL, chunker_version
+    stored, attempt_key = the backend availability fingerprint) and is
+    retried whenever the run is explicit, --full, or the fingerprint/
+    chunker_version no longer match the stamped row -- binding point 1."""
+
+    def _row(self, db, rel):
+        conn = memidx.open_code_db(db)
+        return conn.execute(
+            "SELECT status, reason, sha256, chunker_version FROM file_sha WHERE path=?", (rel,)
+        ).fetchone()
+
+    def test_syntax_error_is_failed_with_sha(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            (root / "bad.py").write_text("def (:\n")
+            (root / "ok.py").write_text("def fine():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"
+            code_reindex(root, db, lang="python")
+            row = self._row(db, "bad.py")
+            self.assertEqual(row["status"], "failed")
+            self.assertIsNotNone(row["sha256"])
+            self.assertIsNotNone(row["chunker_version"])
+            self.assertEqual(self._row(db, "ok.py")["status"], "ok")
+
+    def test_failed_is_skipped_incrementally_and_retried_on_full_or_source_change(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            (root / "bad.py").write_text("def (:\n")
+            db = Path(td) / "idx-code.sqlite"
+            code_reindex(root, db, lang="python")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code_reindex(root, db, lang="python")
+            self.assertIn("1 unchanged", out.getvalue())
+            self.assertIn("0 failed", out.getvalue())
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code_reindex(root, db, lang="python", full=True)
+            self.assertIn("1 failed", out.getvalue())
+            (root / "bad.py").write_text("def fixed():\n    pass\n")
+            code_reindex(root, db, lang="python")
+            self.assertEqual(self._row(db, "bad.py")["status"], "ok")
+
+    def test_backend_unavailable_is_not_indexed_without_sha_and_retried(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            (root / "x.py").write_text("def f():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"
+            real = chunkers.get_chunker
+
+            def broken(lang):
+                raise chunkers.BackendUnavailable("tree-sitter wheel missing")
+
+            chunkers.get_chunker = broken
+            try:
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    code_reindex(root, db, lang="python")
+            finally:
+                chunkers.get_chunker = real
+            row = self._row(db, "x.py")
+            self.assertEqual(row["status"], "not-indexed")
+            self.assertIn("wheel missing", row["reason"])
+            self.assertIsNone(row["sha256"])
+            self.assertIn("1 not indexed", out.getvalue())
+            code_reindex(root, db, lang="python")  # explicit run always retries
+            self.assertEqual(self._row(db, "x.py")["status"], "ok")
+
+    def test_unreadable_file_is_not_indexed_not_failed(self):
+        if os.geteuid() == 0:
+            self.skipTest("root ignores file modes")
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            p = root / "x.py"
+            p.write_text("def f():\n    pass\n")
+            p.chmod(0)
+            db = Path(td) / "idx-code.sqlite"
+            try:
+                code_reindex(root, db, lang="python")
+            finally:
+                p.chmod(0o644)
+            self.assertEqual(self._row(db, "x.py")["status"], "not-indexed")
+
+    def test_partial_status_is_recorded(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            shutil.copy(FIXTURES / "GapDesync.swift", root / "GapDesync.swift")
+            db = Path(td) / "idx-code.sqlite"
+            code_reindex(root, db)
+            self.assertEqual(self._row(db, "GapDesync.swift")["status"], "partial")
+
+    def _broken_backend(self):
+        """Context manager: get_chunker raises BackendUnavailable and the
+        availability fingerprint reports python=missing (both patched, so
+        the attempt_key stamped on the row matches what a later un-patched
+        run compares against)."""
+        return mock.patch.multiple(
+            chunkers,
+            get_chunker=lambda lang: (_ for _ in ()).throw(chunkers.BackendUnavailable("missing")),
+            backend_availability=lambda: "python=missing;swift=ok",
+        )
+
+    def test_not_indexed_row_carries_attempt_key_and_chunker_version(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            (root / "x.py").write_text("def f():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"
+            with self._broken_backend():
+                code_reindex(root, db, lang="python")
+            conn = memidx.open_code_db(db)
+            row = conn.execute("SELECT attempt_key, chunker_version, sha256 FROM file_sha").fetchone()
+            self.assertEqual(row["attempt_key"], "python=missing;swift=ok")
+            self.assertEqual(row["chunker_version"], chunkers.chunker_version("python"))
+            self.assertIsNone(row["sha256"])
+
+    def test_not_indexed_retry_rules(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            (root / "x.py").write_text("def f():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"
+            with self._broken_backend():
+                code_reindex(root, db, lang="python")
+                # same fingerprint, heal-style run (no explicit retry): still not-indexed, no attempt made
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                    memidx.cmd_code_reindex(ns(
+                        code_root=str(root), drop_root=None, db=str(db), project=memidx.DEFAULT_PROJECT,
+                        no_embed=True, full=False, lang="python", retry_not_indexed=False,
+                    ))
+                self.assertIn("0 not indexed", out.getvalue())
+            # backend back (fingerprint differs) -> a heal-style run retries and succeeds
+            with contextlib.redirect_stdout(io.StringIO()):
+                memidx.cmd_code_reindex(ns(
+                    code_root=str(root), drop_root=None, db=str(db), project=memidx.DEFAULT_PROJECT,
+                    no_embed=True, full=False, lang="python", retry_not_indexed=False,
+                ))
+            conn = memidx.open_code_db(db)
+            self.assertEqual(conn.execute("SELECT status FROM file_sha").fetchone()[0], "ok")
+
+    def test_chunker_version_bump_retries_not_indexed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            (root / "x.py").write_text("def f():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"
+            with self._broken_backend():
+                code_reindex(root, db, lang="python")
+            old = chunkers.LANGUAGE_TABLE["python"]["impl_version"]
+            chunkers.LANGUAGE_TABLE["python"]["impl_version"] = old + "-bump"
+            try:
+                with mock.patch.object(chunkers, "backend_availability", lambda: "python=missing;swift=ok"):
+                    # same availability, different chunker version, heal-style run -> retried (and succeeds: real get_chunker)
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        memidx.cmd_code_reindex(ns(
+                            code_root=str(root), drop_root=None, db=str(db), project=memidx.DEFAULT_PROJECT,
+                            no_embed=True, full=False, lang="python", retry_not_indexed=False,
+                        ))
+                conn = memidx.open_code_db(db)
+                self.assertEqual(conn.execute("SELECT status FROM file_sha").fetchone()[0], "ok")
+            finally:
+                chunkers.LANGUAGE_TABLE["python"]["impl_version"] = old
+
+    @unittest.skip("code_index_report lands in Task 4")
+    def test_repairing_root_a_does_not_strand_root_b(self):
+        with tempfile.TemporaryDirectory() as td:
+            a = Path(td) / "a"
+            b = Path(td) / "b"
+            a.mkdir()
+            b.mkdir()
+            (a / "x.py").write_text("def fa():\n    pass\n")
+            (b / "y.py").write_text("def fb():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"
+            with self._broken_backend():
+                code_reindex(a, db, lang="python")
+                code_reindex(b, db, lang="python")
+            code_reindex(a, db, lang="python")  # explicit repair of A only
+            conn = memidx.open_code_db(db)
+            rep = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)  # Task 4 -- B's stale attempt_key still differs
+            self.assertTrue(rep["availability_changed"])
+            self.assertEqual(rep["not_indexed"], 1)
+
+
 class TestRegistryContractEnforcement(unittest.TestCase):
     """C3 (final fix wave, Codex): the reindex loop is the boundary between
     a chunker backend and the database. It validates what a backend hands
     back -- required keys, a `kind` from the frozen KINDS vocabulary,
     integer line numbers, a real ChunkResult -- and a violation is that
     file's failure (B1's path: warn, purge, continue), never a row in the
-    chunks table."""
+    chunks table. Task 3 (Anatomy M2a): a validate_chunk_result violation
+    is a bare ValueError, a deterministic failure -- the file_sha row
+    stays with status="failed" and its sha256/chunker_version stored, so
+    it is skipped incrementally and retried only on a source edit or
+    --full, never every run."""
 
     def _reindex_with_backend(self, td, fake_chunk_file):
         root = Path(td) / "code"
@@ -1592,6 +1811,9 @@ class TestRegistryContractEnforcement(unittest.TestCase):
         return db, rc, err_buf.getvalue()
 
     def _assert_nothing_stored(self, db, rc, err):
+        """Name kept from before Task 3 -- no CHUNK ever reaches the table
+        for a rejected result. The file_sha row itself now stays (status
+        "failed", sha256/chunker_version stored) instead of being absent."""
         self.assertEqual(rc, 0)
         self.assertIn("NestedTypes.swift", err)
         conn = memidx.open_code_db(db)
@@ -1603,7 +1825,9 @@ class TestRegistryContractEnforcement(unittest.TestCase):
         ).fetchone()
         conn.close()
         self.assertEqual(chunk_count, 0)
-        self.assertIsNone(sha_row)
+        self.assertIsNotNone(sha_row)
+        self.assertEqual(sha_row["status"], "failed")
+        self.assertIsNotNone(sha_row["sha256"])
 
     def test_kind_outside_the_frozen_vocabulary_is_rejected(self):
         def bad_kind(text, rel):

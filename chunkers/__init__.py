@@ -40,14 +40,44 @@ class ChunkResult:
         self.status = status        # "ok" | "partial" | "failed"
 
 
+class BackendUnavailable(Exception):
+    """A LANGUAGE_TABLE backend that cannot run here (missing wheel,
+    provider init failure). The indexer records the file as not-indexed
+    and retries on the next explicit run, or when availability changes."""
+
+
 def get_chunker(lang):
     """Return the backend module for `lang` (must expose `chunk_file`).
 
     Imports lazily via importlib so this registry module imports cleanly
-    before every backend exists.
+    before every backend exists. An ImportError (the backend's wheel/
+    module isn't installed here) is wrapped as BackendUnavailable so
+    cmd_code_reindex's per-file guard can tell "this file is broken"
+    (a deterministic failure) apart from "this engine can't run this
+    backend on this machine" (not-indexed, retried when that changes).
     """
     module_name = LANGUAGE_TABLE[lang]["module"]
-    return importlib.import_module(module_name)
+    try:
+        return importlib.import_module(module_name)
+    except ImportError as exc:
+        raise BackendUnavailable(f"{lang}: {exc}") from exc
+
+
+def backend_availability():
+    """'lang=ok;lang=missing;...' over every table row, sorted -- the
+    fingerprint a not-indexed file_sha row stamps as its attempt_key, and
+    that code-reindex/heal compare against on a later run to decide
+    whether a not-indexed row is worth another try (Anatomy M2a binding
+    point 1). Recomputed on every call (no internal caching) -- callers
+    that need it more than once per run cache the single value locally."""
+    parts = []
+    for lang in sorted(LANGUAGE_TABLE):
+        try:
+            get_chunker(lang)
+            parts.append(f"{lang}=ok")
+        except BackendUnavailable:
+            parts.append(f"{lang}=missing")
+    return ";".join(parts)
 
 
 def extension_of(path):

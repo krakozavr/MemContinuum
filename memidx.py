@@ -2121,6 +2121,53 @@ def validate_chunk_result(result, rel: str) -> None:
                 )
 
 
+# Task 3 (Anatomy M2a): a chunker/contract violation that will keep
+# recurring on the same bytes -- fixing it needs a source-code change, not
+# a retry -- lands as `failed`. validate_chunk_result raises a bare
+# ValueError (no dedicated exception type exists for its contract), and
+# the python_ast backend's own SyntaxError-to-status="failed" path is
+# turned into the same ValueError by the `result.status == "failed"`
+# check below, so both land here uniformly.
+DETERMINISTIC_FAILURES = (SyntaxError, ValueError)
+
+
+def write_file_status(
+    conn: sqlite3.Connection, project: str, code_root: str, rel: str, *,
+    sha, mtime, size, gap_count, chunker_version, status, reason=None, attempt_key=None,
+) -> None:
+    """Single writer for every file_sha row cmd_code_reindex produces --
+    success (ok/partial) and failure (failed/not-indexed) alike -- so the
+    column list lives in exactly one place."""
+    conn.execute(
+        "INSERT OR REPLACE INTO file_sha (path, project, code_root, sha256, mtime, size, "
+        "gap_count, chunker_version, status, reason, attempt_key) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (rel, project, code_root, sha, mtime, size, gap_count, chunker_version, status, reason, attempt_key),
+    )
+
+
+def _record_index_failure(conn, project, code_root, rel, f, *, sha, cv, status, reason, attempt_key=None):
+    """Shared tail of both failure paths (B1: fail open, purge stale
+    state). `f` is best-effort stat'd for mtime/size -- a file that
+    vanished mid-run still gets a row, with NULL mtime/size, so the index
+    keeps reporting it rather than going silent. (A permission-denied file
+    still `stat()`s fine on POSIX -- only the read fails -- so mtime/size
+    are usually real for those; NULL is specifically the vanished-file
+    case.)"""
+    try:
+        delete_code_chunks_for_path(conn, project, code_root, rel)
+        try:
+            st = f.stat()
+            mtime, size = st.st_mtime, st.st_size
+        except OSError:
+            mtime = size = None
+        write_file_status(
+            conn, project, code_root, rel, sha=sha, mtime=mtime, size=size, gap_count=0,
+            chunker_version=cv, status=status, reason=reason, attempt_key=attempt_key,
+        )
+    except Exception:
+        pass
+
+
 def cmd_code_reindex(args) -> int:
     db_path = resolve_code_db_path(args)
 
@@ -2215,17 +2262,25 @@ def cmd_code_reindex(args) -> int:
     )
 
     existing = {
-        row["path"]: (row["sha256"], row["chunker_version"])
+        row["path"]: (row["sha256"], row["chunker_version"], row["status"], row["attempt_key"])
         for row in conn.execute(
-            "SELECT path, sha256, chunker_version FROM file_sha WHERE project=? AND code_root=?",
+            "SELECT path, sha256, chunker_version, status, attempt_key FROM file_sha "
+            "WHERE project=? AND code_root=?",
             (args.project, root_s),
         )
     }
 
+    # Anatomy M2a binding point 1: the backend availability fingerprint at
+    # THIS run -- computed once (not per file) so a not-indexed row's
+    # retry check and the fingerprint it stamps on a fresh not-indexed row
+    # agree with each other within one run.
+    availability = chunkers.backend_availability()
+    retry_not_indexed = getattr(args, "retry_not_indexed", True)
+
     skipped_unknown: Counter = Counter()
     files = list(iter_code_source_files(root, langs, skipped_unknown))
     seen = set()
-    added_files = changed_files = unchanged_files = failed_files = 0
+    added_files = changed_files = unchanged_files = failed_files = not_indexed_files = 0
     total_gaps = 0
     pending_texts: list = []
     pending_ids: list = []
@@ -2261,6 +2316,7 @@ def cmd_code_reindex(args) -> int:
         # also be swept up by the removed-paths pass below and counted as
         # a deletion.
         seen.add(rel)
+        sha = cv = None
         try:
             data = f.read_bytes()
             sha = hashlib.sha256(data).hexdigest()
@@ -2273,7 +2329,34 @@ def cmd_code_reindex(args) -> int:
                 # instead of raising. (Unreachable via --lang since C2
                 # validates the resolved language set; kept as a guard.)
                 cv = "unversioned"
-            prev_sha, prev_cv = existing.get(rel, (None, None))
+            prev = existing.get(rel)
+            if prev is not None and prev[2] == "not-indexed":
+                # Task 3 / binding point 1: a not-indexed row is retried
+                # only when this run is explicit (retry_not_indexed,
+                # default True; the heal passes False), --full, or the
+                # backend/chunker moved on since the row was stamped --
+                # otherwise it is left exactly as-is (still not-indexed)
+                # and counted as unchanged, so an unrelated edit elsewhere
+                # in the tree never retries a known-broken backend on
+                # every heal.
+                prev_sha, prev_cv, _prev_status, prev_attempt_key = prev
+                retry = (
+                    retry_not_indexed
+                    or args.full
+                    or prev_attempt_key != availability
+                    or prev_cv != cv
+                )
+                if not retry:
+                    unchanged_files += 1
+                    stat = f.stat()
+                    conn.execute(
+                        "UPDATE file_sha SET mtime=?, size=? WHERE project=? AND code_root=? AND path=?",
+                        (stat.st_mtime, stat.st_size, args.project, root_s, rel),
+                    )
+                    continue
+                prev_sha = prev_cv = None  # a not-indexed row never carries a real sha to compare
+            else:
+                prev_sha, prev_cv = (prev[0], prev[1]) if prev is not None else (None, None)
             if prev_sha == sha and prev_cv == cv and not args.full:
                 unchanged_files += 1
                 # Finding 2 (staleness): the file's content (and thus its
@@ -2375,10 +2458,9 @@ def cmd_code_reindex(args) -> int:
                     file_ids.append(chunk_id)
 
             stat = f.stat()
-            conn.execute(
-                "INSERT OR REPLACE INTO file_sha (path, project, code_root, sha256, mtime, size, "
-                "gap_count, chunker_version) VALUES (?,?,?,?,?,?,?,?)",
-                (rel, args.project, root_s, sha, stat.st_mtime, stat.st_size, len(gaps), cv),
+            write_file_status(
+                conn, args.project, root_s, rel, sha=sha, mtime=stat.st_mtime, size=stat.st_size,
+                gap_count=len(gaps), chunker_version=cv, status="partial" if gaps else "ok",
             )
             pending_texts.extend(file_texts)
             pending_ids.extend(file_ids)
@@ -2386,23 +2468,42 @@ def cmd_code_reindex(args) -> int:
                 added_files += 1
             else:
                 changed_files += 1
-        except Exception as exc:
-            # B1: purge whatever this path still has in the index, so no
-            # stale row outlives the source that produced it, and the
-            # missing file_sha row keeps the index reading "stale".
-            try:
-                delete_code_chunks_for_path(conn, args.project, root_s, rel)
-                conn.execute(
-                    "DELETE FROM file_sha WHERE project=? AND code_root=? AND path=?",
-                    (args.project, root_s, rel),
-                )
-            except Exception:
-                pass
+        except DETERMINISTIC_FAILURES as exc:
+            # Task 3: a chunker/contract violation that will keep
+            # recurring on the same bytes -- fixing it needs a source
+            # change, not a retry. B1's purge-then-warn shape, but the
+            # file_sha row STAYS (status=failed, sha+chunker_version
+            # stored) so it is skipped incrementally while the source and
+            # chunker are unchanged, and retried on a source edit or
+            # --full -- never silently, and never every run.
+            _record_index_failure(
+                conn, args.project, root_s, rel, f, sha=sha, cv=cv, status="failed",
+                reason=f"{type(exc).__name__}: {exc}",
+            )
             failed_files += 1
             print(
-                f"code-reindex: WARNING {rel} not indexed: "
-                f"{type(exc).__name__}: {exc} -- any previously indexed chunks for "
-                "this file were removed (repair will retry)",
+                f"code-reindex: WARNING {rel} failed to index: {type(exc).__name__}: {exc} -- "
+                "previous chunks removed; retried when the file or the chunker changes, or with --full",
+                file=sys.stderr,
+            )
+            continue
+        except Exception as exc:
+            # B1: purge whatever this path still has in the index, so no
+            # stale row outlives the source that produced it. Task 3: the
+            # row itself STAYS (status=not-indexed, sha NULL, chunker_version
+            # from the table, attempt_key = this run's backend availability
+            # fingerprint) rather than being deleted -- this is the
+            # retryable bucket (a missing backend, a permission error, any
+            # other exception this engine did not itself validate), and the
+            # index still reads "stale" while it holds a not-indexed row.
+            _record_index_failure(
+                conn, args.project, root_s, rel, f, sha=None, cv=cv, status="not-indexed",
+                reason=f"{type(exc).__name__}: {exc}", attempt_key=availability,
+            )
+            not_indexed_files += 1
+            print(
+                f"code-reindex: {rel} not indexed: {type(exc).__name__}: {exc} "
+                "(retried on the next run)",
                 file=sys.stderr,
             )
             continue
@@ -2462,7 +2563,8 @@ def cmd_code_reindex(args) -> int:
     print(
         f"code-reindex: {len(files)} files scanned, {added_files} added, {changed_files} changed, "
         f"{unchanged_files} unchanged, {len(removed)} removed, {failed_files} failed, "
-        f"{reembeds} chunk(s) (re-)embedded, {total_gaps} gap(s) warned, {elapsed:.3f}s"
+        f"{not_indexed_files} not indexed, {reembeds} chunk(s) (re-)embedded, {total_gaps} gap(s) warned, "
+        f"{elapsed:.3f}s"
     )
     if downgraded:
         print(
@@ -2699,11 +2801,15 @@ def code_hits_vector(conn: sqlite3.Connection, query: str, project: str):
 
 
 def _code_index_is_stale(conn: sqlite3.Connection, project: str) -> bool:
-    """Stale when the tree and the stored rows disagree in ANY of three
+    """Stale when the tree and the stored rows disagree in ANY of four
     ways: a file's mtime/size drifted, a file is on disk with no stored
-    row at all, or a stored row was produced by a DIFFERENT chunker
-    version than the one this engine would use today (B2, Anatomy M1 fix
-    wave). Plus the missing-code_root case.
+    row at all, a stored row was produced by a DIFFERENT chunker version
+    than the one this engine would use today (B2, Anatomy M1 fix wave), or
+    a stored row is `failed`/`not-indexed` (Task 3, Anatomy M2a) -- such a
+    row's chunks were purged, so the index can never be "current" for that
+    file no matter how closely its mtime/size/chunker_version happen to
+    match the row cmd_code_reindex stamped alongside the failure. Plus the
+    missing-code_root case.
 
     The chunker-version comparison is the one this check used to be
     missing. `code-reindex` has always re-chunked a file whose stored
@@ -2728,9 +2834,9 @@ def _code_index_is_stale(conn: sqlite3.Connection, project: str) -> bool:
         return True
     langs = resolve_project_langs(conn, project)
     existing = {
-        row["path"]: (row["mtime"], row["size"], row["chunker_version"])
+        row["path"]: (row["mtime"], row["size"], row["chunker_version"], row["status"])
         for row in conn.execute(
-            "SELECT path, mtime, size, chunker_version FROM file_sha WHERE project=?", (project,)
+            "SELECT path, mtime, size, chunker_version, status FROM file_sha WHERE project=?", (project,)
         )
     }
     seen = set()
@@ -2742,7 +2848,12 @@ def _code_index_is_stale(conn: sqlite3.Connection, project: str) -> bool:
         seen.add(rel)
         stat = f.stat()
         prev = existing.get(rel)
-        if prev is None or prev[0] != stat.st_mtime or prev[1] != stat.st_size:
+        if (
+            prev is None
+            or prev[0] != stat.st_mtime
+            or prev[1] != stat.st_size
+            or prev[3] not in ("ok", "partial")
+        ):
             return True
         try:
             cv = chunkers.chunker_version(lang_for_source_file(f))
@@ -3717,6 +3828,11 @@ def main(argv=None) -> int:
     )
     p_code_reindex.add_argument("--no-embed", action="store_true")
     p_code_reindex.add_argument("--full", action="store_true")
+    p_code_reindex.add_argument(
+        "--no-retry-not-indexed", dest="retry_not_indexed", action="store_false", default=True,
+        help="leave not-indexed files alone unless the backend set or the chunker changed "
+             "(the heal uses this)",
+    )
     p_code_reindex.set_defaults(func=cmd_code_reindex)
 
     p_code_search = sub.add_parser("code-search")
