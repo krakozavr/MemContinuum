@@ -564,6 +564,20 @@ class TestAddLangAndNeverExt(UpdateTestBase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("no wired row", proc.stdout + proc.stderr)
 
+    def test_add_lang_refuses_via_repo_init_when_the_skill_copy_is_foreign(self):
+        """Ruling 52: --add-lang/--never-ext call repo-init.sh directly,
+        never through process_claude_dir/apply_claude_dir's own
+        skill-foreign gate -- this path's only protection against a foreign
+        skill copy is repo-init.sh's own refusal (exit 16)."""
+        skill_path = Path(self.claude_dir, "skills", "memory-search", "SKILL.md")
+        foreign = "---\nname: not-memory-search\ndescription: hand-authored\n---\n\n# not ours\n"
+        skill_path.write_text(foreign)
+        before = decisions_tsv(self.home).read_text()
+        proc = run(UPDATE_SH, ["--add-lang", "swift", "--repo", self.repo], self.home)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(skill_path.read_text(), foreign)
+        self.assertEqual(decisions_tsv(self.home).read_text(), before)
+
 
 class TestMachineFlag(UpdateTestBase):
     def test_machine_flag_refreshes_the_machine_layer_and_off_by_default(self):
@@ -951,10 +965,9 @@ class TestWalkExitCodesAndPrecedence(UpdateTestBase):
 
     @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
     def test_skill_foreign_outranks_stale(self):
-        """A foreign skill copy is never applied either -- repo-init.sh has
-        no refusal of its own for it (unlike the rules file), so this
-        command's own action gating is the only thing standing between a
-        hand-authored skill copy and `cp -f`."""
+        """A foreign skill copy is never applied either -- belt and braces
+        with repo-init.sh's own refusal (test_repo_init.py), same as
+        rules-foreign."""
         drifted = self.settings_text().replace(
             f"MEMCONTINUUM_RENDERED={engine_sha()}", "MEMCONTINUUM_RENDERED=deadbee")
         Path(self.claude_dir, "settings.local.json").write_text(drifted)

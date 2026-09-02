@@ -507,6 +507,34 @@ mc_rules_identity_marker() {
     [ -n "$MC_RULES_MARKER" ]
 }
 
+# mc_skill_copy_is_ours DEST
+#
+# True iff DEST (a path to an installed memory-search SKILL.md copy) is one
+# this tool rendered -- the same test repo-init.sh and memcontinuum-update.sh
+# both need, and used to each hardcode their own copy of. Unlike the rules
+# file, the skill copy's identity cannot be a fixed first line: the opening
+# `---` has to stay byte 0 for the skill loader (repo-init stamps right
+# after the frontmatter's CLOSING `---` instead), so identity here is "the
+# frontmatter carries a `name: memory-search` line" -- scanned only up to
+# that closing `---`, never the whole file, so a hand-authored file whose
+# BODY happens to mention `name: memory-search` after its own frontmatter
+# does not read as ours.
+#
+# Sets MC_SKILL_FM_END to the 1-based line number of the closing `---` when
+# found (empty otherwise) -- the stamp comment sits on the line right after
+# it, and callers that need the stamp read it from there instead of
+# re-finding the boundary themselves. Returns 0 when DEST is ours, 1
+# otherwise (a missing file, a file with no two-`---`-line frontmatter, or
+# one whose frontmatter names something else).
+mc_skill_copy_is_ours() {
+    local dest="$1"
+    MC_SKILL_FM_END=""
+    [ -f "$dest" ] || return 1
+    MC_SKILL_FM_END="$(grep -n '^---$' "$dest" | sed -n '2p' | cut -d: -f1)"
+    [ -n "$MC_SKILL_FM_END" ] || return 1
+    sed -n "1,${MC_SKILL_FM_END}p" "$dest" | grep -qx 'name: memory-search'
+}
+
 # mc_render_fingerprint SCOPE ENGINE_ROOT   (SCOPE: repo | machine)
 #
 # The stamp every rendered artifact carries: 12 hex characters of a sha256

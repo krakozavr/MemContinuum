@@ -374,6 +374,18 @@ mutation, when it already exists and its first line does not match the
 template's identity marker verbatim: a hand-authored or foreign file at that
 path is left alone, loudly, rather than overwritten.
 
+The installed `memory-search` skill copy is refused the same way (exit 16) —
+before any mutation, when `<claude-dir>/skills/memory-search/SKILL.md`
+already exists and is not this tool's own. Identity here cannot be
+a fixed first line the way the rules file's is (the opening `---` has to stay
+byte 0 for the skill loader), so it is instead "the frontmatter carries a
+`name: memory-search` line", checked by `mc_skill_copy_is_ours`
+(`mc-registry-lib.sh`) — the one predicate `repo-init.sh`'s refusal and
+`memcontinuum-update.sh`'s `skill` column (below) both call, rather than each
+hardcoding its own copy of the check. A copy that already carries that
+identity is overwritten on every re-run regardless of its stamp, same as the
+rules file.
+
 `scripts/memcontinuum-update.sh` walks every `wired` row and, for each
 claude-dir the row lists, compares four things against the engine right now:
 the stamp on that claude-dir's rendered hook lines, the row's own `store=`
@@ -396,21 +408,23 @@ The `rules` and `skill` columns share one determination helper
 (`mc_update_artifact_state`) for the missing/stale/ok part — parsing the
 `<!-- memcontinuum-rendered: ... -->` stamp comment and comparing it through
 `mc_fingerprint_match` — because that part is identical for both artifacts.
-What is NOT shared is identity detection: the rules file's identity marker is
-a literal, fixed first line (`mc_rules_identity_marker`, from the template
-that defines it); the skill copy's opening line has to stay a bare `---` for
-the skill loader, so its identity is instead "the frontmatter contains a
-`name: memory-search` line", and its stamp sits right after the frontmatter's
-*closing* `---` rather than at a fixed line number. A missing or stale skill
-copy reports as the same generic `stale` action the hook-stamp check already
-uses (not a `skill-missing`/`skill-stale` action of its own, unlike the rules
-file) — it is the same kind of drift, not a new question. A *foreign* skill
-copy reports `skill-foreign` and is refused like `rules-foreign` (below) —
-but for the skill copy that refusal is the ONLY protection: unlike the rules
-file, `repo-init.sh` has no identity check of its own before writing
-`<claude-dir>/skills/memory-search/SKILL.md` (`cp -f`, unconditionally), so
-this command's own action-precedence gate is what stands between a
-hand-authored copy and being silently overwritten by `--apply`.
+Identity detection differs in shape: the rules file's identity marker is a
+literal, fixed first line (`mc_rules_identity_marker`, from the template that
+defines it); the skill copy's opening line has to stay a bare `---` for the
+skill loader, so its identity is instead "the frontmatter contains a
+`name: memory-search` line" — one shared predicate, `mc_skill_copy_is_ours`
+(`mc-registry-lib.sh`), used here AND by `repo-init.sh`'s own refusal (above)
+rather than each hardcoding its own copy of the check — and its stamp sits
+right after the frontmatter's *closing* `---` rather than at a fixed line
+number. A missing or stale skill copy reports as the same generic `stale`
+action the hook-stamp check already uses (not a `skill-missing`/`skill-stale`
+action of its own, unlike the rules file) — it is the same kind of drift, not
+a new question. A *foreign* skill copy reports `skill-foreign` and is refused
+like `rules-foreign` (below) — belt and braces with `repo-init.sh`'s own
+refusal, the same relationship the rules file's own belt-and-braces has: the
+identity check is what makes the refusal correct either way; the ranking
+above it is what keeps `--apply` from calling `repo-init.sh` just to watch it
+refuse for a reason already named in the table.
 
 **The flag/mode matrix** — which mode each flag combination selects, and what
 each mode consumes versus refuses — is documented once, in
@@ -518,12 +532,11 @@ Actions that are deliberately never auto-applied:
   rules file (see above), so calling it would just fail loudly for a reason
   already named in the table. Reported; skipped.
 - **`skill-foreign`** — the installed `memory-search` skill copy's frontmatter
-  has no `name: memory-search` line, so it was not rendered by this
-  installer. Unlike `rules-foreign`, `repo-init.sh` has no refusal of its own
-  here — the skill copy install step is a plain `cp -f`. Reported; skipped:
-  this action, and the precedence that puts it ahead of `stale`, is the only
-  thing preventing `--apply` from clobbering a hand-authored file at that
-  path.
+  has no `name: memory-search` line (`mc_skill_copy_is_ours`), so it was not
+  rendered by this installer. Same relationship to `repo-init.sh` as
+  `rules-foreign`: `repo-init.sh` itself refuses to overwrite it (exit 16,
+  same identity check), so calling it would just fail loudly for a reason
+  already named in the table. Reported; skipped.
 - **`no-wiring`** — a claude-dir this row lists has none of this project's
   hook lines at all (settings deleted or badly broken). That is the `memcontinuum`
   skill's repair path (an undecided/broken install), not this command's — a

@@ -814,6 +814,56 @@ class TestFailureModes(unittest.TestCase):
         finally:
             shutil.rmtree(home, ignore_errors=True)
 
+    def test_foreign_skill_copy_refused_before_any_mutation(self):
+        """Ruling 52: same principle as the rules file, for the installed
+        memory-search skill copy -- an existing $CLAUDE_DIR/skills/
+        memory-search/SKILL.md with no `name: memory-search` frontmatter is
+        hand-authored or foreign, refused before any other mutation (the
+        store tree, settings.local.json) so a refusal never leaves a
+        half-finished install behind. Closes the bypass
+        `--add-lang`/`--never-ext` used to have: they call repo-init.sh
+        directly, never through memcontinuum-update.sh's own skill-foreign
+        gate."""
+        home = sandbox_home()
+        try:
+            store = str(Path(home) / "store")
+            claude_dir = Path(home) / ".claude"
+            skill_dir = claude_dir / "skills" / "memory-search"
+            skill_dir.mkdir(parents=True)
+            foreign = "---\nname: not-memory-search\ndescription: hand-authored\n---\n\n# not ours\n"
+            (skill_dir / "SKILL.md").write_text(foreign)
+            proc = run_install(
+                ["--project", "p", "--store", store, "--claude-dir", str(claude_dir)],
+                home,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("SKILL.md", proc.stdout + proc.stderr)
+            self.assertEqual(
+                (skill_dir / "SKILL.md").read_text(), foreign,
+                "foreign skill copy must be left untouched",
+            )
+            self.assertFalse(Path(store).exists(), "no mutation at all on refusal")
+            self.assertFalse((claude_dir / "settings.local.json").exists())
+            self.assertFalse((claude_dir / "rules" / "memcontinuum.md").exists())
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_own_installed_skill_copy_is_overwritten_on_reinstall(self):
+        home = sandbox_home()
+        try:
+            store = str(Path(home) / "store")
+            claude_dir = Path(home) / ".claude"
+            proc1 = run_install(["--project", "p", "--store", store, "--claude-dir", str(claude_dir)], home)
+            self.assertEqual(proc1.returncode, 0, proc1.stdout + proc1.stderr)
+            skill_path = claude_dir / "skills" / "memory-search" / "SKILL.md"
+            self.assertTrue(skill_path.is_file())
+            self.assertIn("name: memory-search", skill_path.read_text())
+            proc2 = run_install(["--project", "p", "--store", store, "--claude-dir", str(claude_dir)], home)
+            self.assertEqual(proc2.returncode, 0, proc2.stdout + proc2.stderr)
+            self.assertIn("name: memory-search", skill_path.read_text())
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
     def test_own_rendered_rules_file_is_overwritten_on_reinstall(self):
         home = sandbox_home()
         try:

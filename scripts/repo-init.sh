@@ -593,6 +593,25 @@ if [ -f "$RULES_DEST" ]; then
     fi
 fi
 
+# Ruling 52: same principle, same place, for the installed memory-search
+# skill copy -- refused BEFORE any mutation, not after the skill install
+# step's own `cp -f` below has already clobbered it. Unlike the rules file
+# this one used to have NO refusal of its own at all (memcontinuum-update.sh
+# could report a foreign copy as `skill-foreign` in its table, but repo-init
+# itself would still overwrite one if invoked directly -- exactly the path
+# `--add-lang`/`--never-ext` take, since they call this script directly
+# rather than through the updater's own skill-foreign gate). Identity is
+# `mc_skill_copy_is_ours` (mc-registry-lib.sh) -- the ONE predicate this
+# refusal and memcontinuum-update.sh's `skill` column both call, so the
+# installer and the re-render walk agree, by construction, on what "ours"
+# means here. Our own copy -- identity matches, whatever its stamp -- is
+# still overwritten below as always; only a file that is not ours at all is
+# refused.
+SKILL_DEST="$CLAUDE_DIR/skills/memory-search/SKILL.md"
+if [ -f "$SKILL_DEST" ] && ! mc_skill_copy_is_ours "$SKILL_DEST"; then
+    fail "$SKILL_DEST already exists and was not rendered by this installer (no \`name: memory-search\` frontmatter) -- refusing to overwrite a hand-authored or foreign skill copy. Move it aside first if you want repo-init to install one here." 16
+fi
+
 # --- code census + consent dialogue (Task 10, Anatomy M1) -----------------
 #
 # Runs BEFORE the plan summary (so its outcome -- the chosen language set,
@@ -1240,8 +1259,8 @@ if [ "$DRY_RUN" -eq 0 ]; then
     cp -f "$SKILL_SRC" "$CLAUDE_DIR/skills/memory-search/SKILL.md" || fail "could not copy SKILL.md"
     # D1: stamp the INSTALLED COPY only, right after the frontmatter's
     # closing "---" (never at byte 0 -- the skill loader needs the OPENING
-    # "---" to stay the very first line of the file).
-    SKILL_DEST="$CLAUDE_DIR/skills/memory-search/SKILL.md"
+    # "---" to stay the very first line of the file). SKILL_DEST is the same
+    # path the foreign-copy refusal above already checked.
     FM_END_LINE="$(grep -n '^---$' "$SKILL_DEST" | sed -n '2p' | cut -d: -f1)"
     if [ -n "$FM_END_LINE" ]; then
         SKILL_TMP="$SKILL_DEST.tmp-memcontinuum-stamp"

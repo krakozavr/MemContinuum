@@ -521,26 +521,27 @@ mc_update_rules_state() {
 }
 
 # mc_update_skill_state CLAUDE_DIR -- sets MC_SKILL_STATE to one of
-# ok/stale/missing/foreign for CLAUDE_DIR/skills/memory-search/SKILL.md
-# (Ruling 51). Unlike the rules file, the identity marker cannot be a fixed
-# first line -- the opening "---" has to stay byte 0 for the skill loader,
-# so repo-init stamps right after the frontmatter's CLOSING "---" instead
-# (scripts/repo-init.sh, "install the memory-search skill"). Identity here is
-# "the frontmatter contains a `name: memory-search` line" -- the same test a
-# human would use to tell this skill's copy from a foreign one at that path.
+# ok/stale/missing/foreign for CLAUDE_DIR/skills/memory-search/SKILL.md.
+# Identity is mc_skill_copy_is_ours (mc-registry-lib.sh) -- the same
+# predicate scripts/repo-init.sh's own foreign-copy refusal calls, rather
+# than each hardcoding its own copy of "is this ours". Unlike the rules
+# file, that identity cannot be a fixed first line -- the opening "---" has
+# to stay byte 0 for the skill loader, so repo-init stamps right after the
+# frontmatter's CLOSING "---" instead, and the predicate hands that boundary
+# back as MC_SKILL_FM_END so this function does not re-find it.
 #
-# repo-init.sh, unlike the rules file, has no refusal of its own before
-# overwriting this path (`cp -f`, unconditionally) -- this command's own
-# action gating (skill-foreign, below) is the ONLY thing standing between a
-# hand-authored file here and being silently clobbered by --apply.
+# repo-init.sh refuses to overwrite a foreign copy at this path, the same as
+# it does for the rules file -- so `skill-foreign` below is belt and braces
+# with that refusal, not the only thing standing between a hand-authored
+# file here and being overwritten (that WAS true before repo-init.sh grew
+# its own check; it stayed true a moment longer for --add-lang/--never-ext,
+# which call repo-init.sh directly and bypass this command's own action
+# gating -- also closed now that repo-init.sh checks for itself).
 mc_update_skill_state() {
-    local dest="$1/skills/memory-search/SKILL.md" fm_end="" is_foreign=1 stamp_line=""
-    if [ -f "$dest" ]; then
-        fm_end="$(grep -n '^---$' "$dest" | sed -n '2p' | cut -d: -f1)"
-        if [ -n "$fm_end" ] && sed -n "1,${fm_end}p" "$dest" | grep -qx 'name: memory-search'; then
-            is_foreign=0
-            stamp_line="$(sed -n "$((fm_end + 1))p" "$dest")"
-        fi
+    local dest="$1/skills/memory-search/SKILL.md" is_foreign=1 stamp_line=""
+    if mc_skill_copy_is_ours "$dest"; then
+        is_foreign=0
+        stamp_line="$(sed -n "$((MC_SKILL_FM_END + 1))p" "$dest")"
     fi
     mc_update_artifact_state "$dest" "$is_foreign" "$stamp_line"
     MC_SKILL_STATE="$MC_ARTIFACT_STATE"
@@ -851,12 +852,12 @@ process_claude_dir() {
     # act on come FIRST, so the action column names why nothing will happen
     # rather than naming some lesser drift that --apply would then try to fix
     # and fail. store-missing, rules-foreign and skill-foreign are all
-    # refusals the installer would only repeat more loudly (rules-foreign
-    # because repo-init.sh itself refuses to overwrite a foreign rules file;
-    # skill-foreign because repo-init.sh has NO refusal of its own for the
-    # skill copy -- `cp -f`, unconditionally -- so this ranking is the only
-    # thing standing between a foreign copy and being clobbered); the
-    # migrate-needs-* answers are questions only a human can settle.
+    # refusals the installer would only repeat more loudly -- repo-init.sh
+    # itself refuses to overwrite a foreign rules file OR a foreign skill
+    # copy, both before any mutation, both through the one identity
+    # predicate this ranking's own MC_RULES_STATE/MC_SKILL_STATE checks use
+    # (mc_rules_identity_marker, mc_skill_copy_is_ours -- mc-registry-lib.sh);
+    # the migrate-needs-* answers are questions only a human can settle.
     # Everything below them is drift this command can and will re-render --
     # a missing or stale skill copy (Ruling 51) folds into the same generic
     # `stale` the hook-stamp check already reports, rather than getting its
@@ -933,11 +934,9 @@ not_applied() {
 # (repo-init.sh itself refuses a foreign rules file before writing
 # anything -- calling it would just fail loudly for a reason already named
 # in the table; the fix is a human moving the foreign file aside).
-# action=skill-foreign is skipped for the same reason, but repo-init.sh
-# carries NO refusal of its own for the skill copy -- it `cp -f`s
-# unconditionally -- so this skip is the only thing standing between a
-# foreign copy and being clobbered, not a belt-and-braces second line of
-# defense the way the rules-foreign skip is.
+# action=skill-foreign is skipped for the same reason (repo-init.sh refuses
+# a foreign skill copy before writing anything too, through the same
+# mc_skill_copy_is_ours predicate this table's own skill column uses).
 apply_claude_dir() {
     local claude_dir="$1" action="$2"
     local -a args=()
