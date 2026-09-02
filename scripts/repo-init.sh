@@ -64,6 +64,7 @@ BOOTSTRAP_VENV_DIR=""
 LANGS_FLAG=""
 NEVER_EXT_FLAG=""
 NON_INTERACTIVE=0
+RECORD_DECISION=0
 declare -a CODE_ROOTS=()
 
 usage() {
@@ -134,6 +135,22 @@ Usage: repo-init.sh --project NAME [--store DIR] [--code-root DIR ...]
                       never omitted: a set-but-empty value matches nothing,
                       which is distinct from a legacy line where the variable
                       is unset). For scripted/CI runs.
+  --record-decision   after a successful (non-dry-run) install, record
+                      "wired" in the decision registry (same as running
+                      memcontinuum-decide.sh wired by hand), so the
+                      SessionStart detector never asks about this repo
+                      again. OFF by default: recording a human's consent is
+                      the memcontinuum skill's job, not this installer's --
+                      pass this only from a driven flow where a human has
+                      already said yes. Refuses to record (a warning, never
+                      a failure of the install itself) when --claude-dir is
+                      not inside a git working tree, same as
+                      memcontinuum-decide.sh's own requirement. When a row
+                      already exists for this repo, its recorded
+                      claude-dirs/code-roots are UNIONED with this install's
+                      (never dropped) -- installing a second claude-dir for
+                      the same project must not erase the first from the
+                      registry.
   --dry-run           print everything this script would do; write nothing
                       (except --bootstrap-venv's venv, see above).
   --force             allow --store to sit inside another git repo's working
@@ -290,6 +307,34 @@ bootstrap_venv() {
     return 0
 }
 
+# mc_union_semi A B -- prints A's ';'-joined list with every item from B's
+# not already in A appended, deduplicated, order preserved (A's own order
+# first). Declared/assigned on separate statements deliberately -- a single
+# `local a="$1" out="$a"` reads "$a" as still-unset under `set -u` in this
+# bash (reproduced; see scripts/memcontinuum-update.sh's add_semi for the
+# same fix with the same reasoning). Used only by --record-decision below,
+# to union THIS install's claude-dir/code-roots/langs/never-exts into
+# whatever a pre-existing registry row already recorded, rather than
+# replacing it (a second claude-dir installed for the same project must not
+# erase the first from the registry).
+mc_union_semi() {
+    local a b out tok union_ifs
+    a="$1"; b="$2"; out="$a"
+    union_ifs="$IFS"
+    IFS=';'
+    for tok in $b; do
+        IFS="$union_ifs"
+        [ -n "$tok" ] || continue
+        case ";$out;" in
+            *";$tok;"*) ;;
+            *) out="${out:+$out;}$tok" ;;
+        esac
+        IFS=';'
+    done
+    IFS="$union_ifs"
+    printf '%s' "$out"
+}
+
 # --- arg parsing -----------------------------------------------------------
 
 # A two-argument option with no value must ERROR, not loop: a failed
@@ -316,6 +361,7 @@ while [ $# -gt 0 ]; do
         --langs) mc_need_value "$@"; LANGS_FLAG="$2"; shift 2 ;;
         --never-ext) mc_need_value "$@"; NEVER_EXT_FLAG="$2"; shift 2 ;;
         --non-interactive) NON_INTERACTIVE=1; shift ;;
+        --record-decision) RECORD_DECISION=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         --force) FORCE=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -1333,6 +1379,68 @@ else
     fi
     if [ "$CODE_REINDEX_RC" -ne 0 ]; then
         fail "code-reindex failed (rc=$CODE_REINDEX_RC) -- see output above" 13
+    fi
+fi
+
+# --- 8. record the decision (D2, updater workstream) -----------------------
+#
+# Reaching here means the install above succeeded (every failure path
+# through step 7/7b already called fail(), which exits immediately) --
+# --record-decision, when given, records "wired" the same way a human
+# running memcontinuum-decide.sh by hand would. Off by default: recording a
+# consent nobody gave is the one thing this system must never do -- see
+# README.md's "A hook reports a state; only the skill records a decision"
+# doctrine. This is not a hook; it is this installer's OWN successful
+# completion, gated on a flag a driven flow only ever passes after a human
+# has already said yes.
+if [ "$DRY_RUN" -eq 0 ] && [ "$RECORD_DECISION" -eq 1 ]; then
+    RECORD_LIB="$SCRIPT_DIR/mc-registry-lib.sh"
+    if [ ! -f "$RECORD_LIB" ]; then
+        echo "note: --record-decision given but $RECORD_LIB is missing -- skipping (incomplete checkout)" >&2
+    else
+        # shellcheck source=./mc-registry-lib.sh
+        . "$RECORD_LIB"
+        if mc_repo_key "$(dirname "$CLAUDE_DIR")"; then
+            RD_REPO="$MC_REPO"
+            RD_KEY="$MC_REPO_KEY"
+            mc_resolve_home
+            RD_DECISIONS="$MEMCONTINUUM_HOME/decisions.tsv"
+            RD_CLAUDE_DIRS="$CLAUDE_DIR"
+            RD_CODE_ROOTS=""
+            for cr in "${CODE_ROOTS_ABS[@]:-}"; do
+                [ -n "$cr" ] && RD_CODE_ROOTS="${RD_CODE_ROOTS:+$RD_CODE_ROOTS;}$cr"
+            done
+            RD_LANGS="$(printf '%s' "$CHOSEN_LANGS" | tr ',' ';')"
+            RD_NEVER="$(printf '%s' "$NEVER_EXTS_RAW" | tr ',' ';')"
+            # Union with whatever a pre-existing row already recorded --
+            # never dropped (INC-0104's own lesson: a project's SECOND
+            # claude-dir/code-root/language must not erase its first).
+            if mc_registry_lookup "$RD_DECISIONS" "$RD_KEY"; then
+                mc_note_field "$MC_LOOKUP_NOTE" "claude-dirs"
+                RD_CLAUDE_DIRS="$(mc_union_semi "$MC_NOTE_FIELD" "$RD_CLAUDE_DIRS")"
+                mc_note_field "$MC_LOOKUP_NOTE" "code-roots"
+                RD_CODE_ROOTS="$(mc_union_semi "$MC_NOTE_FIELD" "$RD_CODE_ROOTS")"
+                mc_note_field "$MC_LOOKUP_NOTE" "langs"
+                RD_LANGS="$(mc_union_semi "$MC_NOTE_FIELD" "$RD_LANGS")"
+                mc_note_field "$MC_LOOKUP_NOTE" "never"
+                RD_NEVER="$(mc_union_semi "$MC_NOTE_FIELD" "$RD_NEVER")"
+            fi
+            declare -a RD_ARGS=(wired --repo "$RD_REPO" --store "$STORE" --project "$PROJECT")
+            RD_OLD_IFS="$IFS"
+            IFS=';'
+            for d in $RD_CLAUDE_DIRS; do [ -n "$d" ] && RD_ARGS+=(--claude-dir "$d"); done
+            for cr in $RD_CODE_ROOTS; do [ -n "$cr" ] && RD_ARGS+=(--code-root "$cr"); done
+            IFS="$RD_OLD_IFS"
+            [ -n "$RD_LANGS" ] && RD_ARGS+=(--langs "$(printf '%s' "$RD_LANGS" | tr ';' ',')")
+            [ -n "$RD_NEVER" ] && RD_ARGS+=(--never-ext "$(printf '%s' "$RD_NEVER" | tr ';' ',')")
+            if bash "$SCRIPT_DIR/memcontinuum-decide.sh" "${RD_ARGS[@]}"; then
+                echo "decision recorded: $RD_KEY wired"
+            else
+                echo "note: --record-decision given but recording failed (see above) -- the install itself still succeeded" >&2
+            fi
+        else
+            echo "note: --record-decision given but $CLAUDE_DIR is not inside a git working tree -- skipping" >&2
+        fi
     fi
 fi
 
