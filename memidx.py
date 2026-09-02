@@ -28,9 +28,12 @@ import sqlite3
 import subprocess
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 import yaml
+
+import chunkers
 
 AUTHORITIES = {
     "owner-verbatim",
@@ -1045,32 +1048,40 @@ def fragment_matches_symbol(frag: str, symbol: str, qualified_name: str) -> bool
     return frag == symbol or frag == qualified_name or qualified_name.endswith("." + frag)
 
 
-def fragment_declared_in_text(frag: str, text: str) -> bool:
-    """memlint's #symbol vocabulary check (memlint.py's lint_concept),
-    reusing chunk_source's own lexer-aware chunks (not the flattened
-    bare-name set declared_symbol_names returns) so a QUALIFIED fragment
-    (e.g. "Outer.outerFunc") is accepted exactly when code-search's
-    concept_matches_for_chunk would accept it as a match for that chunk --
-    same fragment_matches_symbol predicate, applied here per-chunk instead
-    of per-DB-row. A fragment naming just a container type (no member,
-    e.g. "Outer") is still accepted too, matching declared_symbol_names'
-    existing container-name behavior."""
-    chunks, _gaps = chunk_source(text)
-    for c in chunks:
-        if fragment_matches_symbol(frag, c["symbol"], c["qualified_name"]):
-            return True
-    mask, _match_dict, _gaps2 = _build_mask_and_match_dict(text)
-    for m in _KEYWORD_RE.finditer(mask):
-        kw = m.group(1)
-        if kw not in ("class", "struct", "enum", "protocol", "extension", "actor"):
-            continue
-        after = m.start() + len(kw)
-        name = _container_type_name(kw, mask, after)
-        if not name:
-            continue
-        if frag == name or frag in name.split("."):
-            return True
-    return False
+def fragment_declared_in_text(frag: str, text: str, rel_path: str = "x.swift") -> bool:
+    """memlint's #symbol vocabulary check (memlint.py's lint_concept): is
+    `frag` a symbol actually DECLARED in `text`?
+
+    Dispatch is fully generic (Anatomy M1 fix wave, I3): the file's
+    language comes from chunkers.lang_for_path(rel_path), and the answer
+    comes from that backend's own `declared_symbols(text)` -- a uniform
+    part of the registry contract, alongside `chunk_file`. There is no
+    per-language branch here and no Swift lexer call: adding a third
+    language means adding a LANGUAGE_TABLE row with a backend that exposes
+    declared_symbols, and this check follows for free. A rel_path with no
+    registered language falls back to the swift backend, which is what the
+    default "x.swift" preserves for every pre-existing call site
+    (resolve_symbol_to_path's bare-symbol fallback among them).
+
+    Each backend returns `(symbol, qualified_name)` pairs -- including its
+    container type names (Swift's class/struct/enum/protocol/extension/
+    actor, Python's classes), since a #symbol fragment may name the type
+    itself rather than a member. The pairs are evaluated with the SAME
+    fragment_matches_symbol predicate code-search's per-hit concept
+    attachment uses, so a fragment written qualified (e.g.
+    "Outer.outerFunc") validates identically on both surfaces."""
+    lang = chunkers.lang_for_path(rel_path) or "swift"
+    try:
+        backend = chunkers.get_chunker(lang)
+        pairs = backend.declared_symbols(text)
+    except Exception:
+        # Fail open, like every other chunker call site: a backend that
+        # cannot answer must not turn a lint into a crash.
+        return False
+    return any(
+        fragment_matches_symbol(frag, symbol, qualified_name)
+        for symbol, qualified_name in pairs
+    )
 
 
 def concept_matches_for_chunk(
@@ -1274,8 +1285,9 @@ def _resolve_symbol_via_code_index(code_root: Path, symbol: str, project: str) -
 
 def resolve_symbol_to_path(code_root: Path, symbol: str, project: str | None = None) -> str | None:
     """Finding 7: resolve a bare --code-root symbol to its defining file
-    for `why`, consuming the SAME lexer-aware chunker chunk_source/
-    declared_symbol_names/memlint/code-search attachment already agree on
+    for `why`, consuming the SAME per-language symbol vocabulary memlint
+    and code-search attachment already agree on -- each backend's own
+    declared_symbols
     (via fragment_declared_in_text, so a QUALIFIED symbol like
     "Outer.outerFunc" also resolves) -- not the old from-scratch regex
     (`func|class|struct|enum|let|var` only, missing init, subscript,
@@ -1670,8 +1682,24 @@ def cmd_check(args) -> int:
 # `RuleEngine.f`.
 # ---------------------------------------------------------------------------
 
-LANG_EXTENSIONS = {"swift": (".swift",)}
-CODE_SKIP_DIR_NAMES = {".git", ".build", "vendor", "node_modules", "Tests", "Resources"}
+# Task 5 rewire: a thin view over chunkers.LANGUAGE_TABLE, not a second
+# hand-maintained extension map (Task 3 reviewer finding -- the registry is
+# now the single source of truth). Kept only for back-compat with anything
+# still reading LANG_EXTENSIONS directly; dispatch itself goes through
+# chunkers.lang_for_path (see lang_for_source_file / iter_code_source_files
+# below).
+LANG_EXTENSIONS = {lang: row["extensions"] for lang, row in chunkers.LANGUAGE_TABLE.items()}
+
+# Task 7: this is now the GLOBAL skip set ONLY -- directory names that are
+# always noise regardless of which languages are wired. Language-specific
+# noise (swift's Tests/Resources/.build, python's venv/.venv/__pycache__/
+# build/dist/.tox/.eggs) lives on each LANGUAGE_TABLE row's "skip_dirs" key
+# instead, so a Swift-only project's own build/ or dist/ output is never
+# pruned by a rule meant for Python virtualenvs, and vice versa. This
+# global set is what iter_code_source_files prunes for every walk;
+# per-language sets are applied per FILE, to that language's own files
+# only (fix wave C1 -- see chunkers.common_skip_dirs).
+CODE_SKIP_DIR_NAMES = {".git", "vendor", "node_modules"}
 
 CODE_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS chunks (
@@ -1710,6 +1738,12 @@ CREATE TABLE IF NOT EXISTS file_sha (
   gap_count INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (path, project)
 );
+-- chunker_version (TASK 3, joins the skip decision alongside sha256) is
+-- NOT listed above -- same reasoning as code_meta.head_sha below:
+-- CREATE TABLE IF NOT EXISTS never adds a column to a table that already
+-- exists on disk, so a brand-new DB relies on the unconditional migration
+-- guard just like an upgraded one does (ensure_file_sha_chunker_version_column,
+-- called from open_code_db right after this script runs).
 
 CREATE TABLE IF NOT EXISTS code_meta (
   project TEXT PRIMARY KEY,
@@ -1741,676 +1775,146 @@ def ensure_code_meta_head_sha_column(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE code_meta ADD COLUMN head_sha TEXT")
 
 
+def ensure_file_sha_chunker_version_column(conn: sqlite3.Connection) -> None:
+    """Migration guard (Task 3, Anatomy M1): a file_sha table created
+    before chunker_version joined the skip decision has no such column --
+    CREATE TABLE IF NOT EXISTS never adds columns to an existing table
+    (same fix as ensure_code_meta_head_sha_column above). NULL on an
+    upgraded row (and on any row this migration adds the column for) is
+    the documented pre-stamp value: the skip check below never treats
+    NULL as equal to a real chunker_version string, so every pre-existing
+    row re-chunks exactly once and gets stamped."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(file_sha)").fetchall()}
+    if "chunker_version" not in cols:
+        conn.execute("ALTER TABLE file_sha ADD COLUMN chunker_version TEXT")
+
+
 def open_code_db(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.executescript(CODE_SCHEMA_SQL)
     ensure_code_meta_head_sha_column(conn)
+    ensure_file_sha_chunker_version_column(conn)
     return conn
 
 
-def _lang_for_ext(suffix: str) -> str:
-    for lang, exts in LANG_EXTENSIONS.items():
-        if suffix in exts:
-            return lang
-    return suffix.lstrip(".") or "unknown"
+def lang_for_source_file(path: Path) -> str | None:
+    """The language of ONE file on disk, or None -- the single resolution
+    rule the whole code-index side shares (Anatomy M1 fix wave).
 
+    Extension first (chunkers.lang_for_path, compound-extension aware).
+    Only when a file has NO extension at all is its first line sniffed for
+    a shebang (chunkers.lang_for_shebang) -- B5: `code-census` already
+    counts a `#!/usr/bin/env python3` script named `bin/tool` under the
+    python row, so the indexer has to be able to actually index the file
+    the census proposed a language on the strength of. Anything else is a
+    census that promises what the index silently ignores.
 
-def iter_code_source_files(root: Path, langs: list[str] | None):
-    exts = set()
-    for lang in (langs or ["swift"]):
-        exts.update(LANG_EXTENSIONS.get(lang, ()))
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in CODE_SKIP_DIR_NAMES]
-        for fname in sorted(filenames):
-            if any(fname.endswith(e) for e in exts):
-                yield Path(dirpath) / fname
+    Guarded to REGULAR files before reading: an extensionless FIFO in the
+    tree would otherwise block the read forever, and a directory entry is
+    never a source file. Any read failure yields None (fail open) -- an
+    unreadable file simply has no resolvable language here; the reindex
+    loop's own per-file guard reports it.
 
-
-# ---------------------------------------------------------------------------
-# chunker: lexer-aware brace walker
-# ---------------------------------------------------------------------------
-
-
-def _find_prefix_hashes(text: str, i: int) -> int:
-    n = 0
-    while i + n < len(text) and text[i + n] == "#":
-        n += 1
-    return n
-
-
-def _scan_region(text: str, start: int):
-    """Scan text[start:] as Swift source in a FRESH top-level brace context
-    (depth 0). Writes accumulate into local_writes/local_match, but are
-    only TRUSTWORTHY up through `checkpoint_idx` -- the position just past
-    the most recent point brace depth returned to 0 (a fully-closed
-    top-level construct can never be retroactively corrupted by whatever
-    comes after it, so each such point is a safe commit boundary). The
-    caller (chunk_source) discards anything at/after checkpoint_idx when a
-    desync is reported, keeping everything before it -- this is what lets
-    "func good() {...}" ahead of a later-in-the-same-file fault still get
-    indexed, rather than gapping the whole region back to its start.
-
-    An "extra open" imbalance (e.g. one #if branch missing a closing
-    brace) doesn't fail until EOF (or may, pathologically, never fail at
-    all if a later stray '}' happens to numerically rebalance it --
-    brace-counting alone cannot distinguish that from genuinely correct
-    code; a known limitation, not fixable without semantic analysis). An
-    "extra close" (a stray '}') fails immediately, so checkpoint_idx will
-    usually sit right at the fault in that case.
-
-    Handles // and /* nested */ comments, "simple" strings, triple-quoted
-    strings, #"raw"# strings (interpolation not supported inside raw
-    strings -- inert content, matching the advisor's "gap+warn is
-    acceptable there" guidance), and \\(...\\) string interpolation
-    (including one containing a closure literal) via a small mode stack so
-    nested `(`/`{` inside an interpolation still balance correctly.
-
-    Returns (desync_idx_or_None, local_writes, local_match, checkpoint_idx).
-    """
-    n = len(text)
-    brace_stack: list[int] = []
-    mode_stack: list[list] = [["CODE"]]
-    local_writes: dict = {}
-    local_match: dict = {}
-    checkpoint_idx = start
-    i = start
-    while i < n:
-        frame = mode_stack[-1]
-        mode = frame[0]
-        c = text[i]
-
-        if mode in ("CODE", "ICODE"):
-            if c == "/" and i + 1 < n and text[i + 1] == "/":
-                j = i
-                while j < n and text[j] != "\n":
-                    j += 1
-                i = j
-                continue
-            if c == "/" and i + 1 < n and text[i + 1] == "*":
-                depth_c = 1
-                j = i + 2
-                while j < n and depth_c > 0:
-                    if text[j : j + 2] == "/*":
-                        depth_c += 1
-                        j += 2
-                        continue
-                    if text[j : j + 2] == "*/":
-                        depth_c -= 1
-                        j += 2
-                        continue
-                    j += 1
-                i = j
-                continue
-            if text[i : i + 3] == '"""':
-                mode_stack.append(["STR_TRIPLE"])
-                i += 3
-                continue
-            if c == "#":
-                h = _find_prefix_hashes(text, i)
-                if i + h < n and text[i + h] == '"':
-                    mode_stack.append(["STR_RAW", h])
-                    i += h + 1
-                    continue
-                local_writes[i] = c
-                i += 1
-                continue
-            if c == '"':
-                mode_stack.append(["STR_SIMPLE"])
-                i += 1
-                continue
-            if c == "{":
-                brace_stack.append(i)
-                local_writes[i] = c
-                i += 1
-                continue
-            if c == "}":
-                if not brace_stack:
-                    return i, local_writes, local_match, checkpoint_idx
-                open_idx = brace_stack.pop()
-                local_match[open_idx] = i
-                local_writes[i] = c
-                i += 1
-                if not brace_stack:
-                    checkpoint_idx = i
-                continue
-            if mode == "ICODE" and c == "(":
-                frame[1] += 1
-                local_writes[i] = c
-                i += 1
-                continue
-            if mode == "ICODE" and c == ")":
-                frame[1] -= 1
-                local_writes[i] = c
-                i += 1
-                if frame[1] == 0:
-                    mode_stack.pop()
-                continue
-            if c != "\n":
-                local_writes[i] = c
-            i += 1
-            continue
-
-        if mode == "STR_SIMPLE":
-            if c == "\\" and i + 1 < n and text[i + 1] == "(":
-                mode_stack.append(["ICODE", 1])
-                i += 2
-                continue
-            if c == "\\" and i + 1 < n:
-                i += 2
-                continue
-            if c == '"':
-                mode_stack.pop()
-                i += 1
-                continue
-            i += 1
-            continue
-
-        if mode == "STR_TRIPLE":
-            if c == "\\" and i + 1 < n and text[i + 1] == "(":
-                mode_stack.append(["ICODE", 1])
-                i += 2
-                continue
-            if c == "\\" and i + 1 < n:
-                i += 2
-                continue
-            if text[i : i + 3] == '"""':
-                mode_stack.pop()
-                i += 3
-                continue
-            i += 1
-            continue
-
-        if mode == "STR_RAW":
-            h = frame[1]
-            if c == '"' and text[i + 1 : i + 1 + h] == "#" * h:
-                mode_stack.pop()
-                i += h + 1
-                continue
-            i += 1
-            continue
-
-        i += 1
-
-    if brace_stack:
-        return brace_stack[0], local_writes, local_match, checkpoint_idx
-    return None, local_writes, local_match, n
-
-
-# Shared modifier vocabulary (finding 3): used both by _RESYNC_RE's gap-resync
-# heuristic below AND by _class_token_is_member_modifier's `class <modifier>*
-# func/var/subscript/init` member-form detection -- one list, not two.
-_DECL_MODIFIER_WORDS = (
-    "public", "private", "internal", "fileprivate", "open", "final", "static",
-    "class", "override", "required", "convenience", "indirect", "mutating",
-    "nonisolated", "package", "consuming", "borrowing",
-)
-
-_RESYNC_RE = re.compile(
-    r"^[ \t]{0,8}(?:(?:" + "|".join(_DECL_MODIFIER_WORDS) + r"|@\w+(?:\([^)]*\))?)\s+)*"
-    r"(?:func|init|class|struct|enum|protocol|extension|actor|var|subscript)\b"
-)
-
-
-def _iter_lines(text: str, start: int):
-    i = start
-    n = len(text)
-    while i <= n:
-        j = text.find("\n", i)
-        if j == -1:
-            yield i, n
-            return
-        yield i, j
-        i = j + 1
-
-
-def _find_resync_point(text: str, from_idx: int):
-    """The gap-fallback resync heuristic: from the line AFTER the desync
-    point, the next line that (after up to 8 columns of indent and any
-    modifiers) starts a func/init/class/struct/enum/protocol/extension
-    declaration -- i.e. "looks top-level or type-member level". None if no
-    such line exists before EOF (desync ran to end of file)."""
-    nl = text.find("\n", from_idx)
-    if nl == -1:
+    Used by all three places that used to answer this question separately:
+    the walk's classification, cmd_code_reindex's per-file dispatch (which
+    used to call the extension-only `_lang_for_ext`) and the staleness
+    check's per-file chunker-version comparison."""
+    lang = chunkers.lang_for_path(path)
+    if lang is not None:
+        return lang
+    if chunkers.extension_of(path):
         return None
-    for line_start, line_end in _iter_lines(text, nl + 1):
-        if _RESYNC_RE.match(text[line_start:line_end]):
-            return line_start
-    return None
-
-
-def _build_mask_and_match_dict(text: str):
-    """The lexer-aware brace-walk shared by chunk_source and
-    declared_symbol_names (finding 5, memlint's #symbol vocabulary):
-    returns (mask, match_dict, gaps) -- mask is `text` with every
-    comment/string's contents blanked to spaces (newlines kept, so line
-    numbers still line up) and match_dict maps each '{' index to its
-    matching '}' index for fully-closed top-level constructs. gaps is a
-    list of (start_line, end_line) 1-based ranges skipped due to a brace
-    desync (never a whole-file fallback -- indexing always resumes after
-    the gap)."""
-    n = len(text)
-    mask_full = [("\n" if ch == "\n" else " ") for ch in text]
-    match_dict: dict = {}
-    gaps: list = []
-    pos = 0
-    while pos < n:
-        desync_idx, local_writes, local_match, checkpoint_idx = _scan_region(text, pos)
-        if desync_idx is None:
-            # clean run to EOF: commit this region's writes/pairs.
-            for idx, ch in local_writes.items():
-                mask_full[idx] = ch
-            match_dict.update(local_match)
-            break
-        # desync: only what was safely checkpointed (fully-closed
-        # top-level constructs up to checkpoint_idx) is committed -- the
-        # rest of this region's writes/pairs are discarded (see
-        # _scan_region's docstring). The gap covers checkpoint_idx (the
-        # last known-good point) through the resync point.
-        for idx, ch in local_writes.items():
-            if idx < checkpoint_idx:
-                mask_full[idx] = ch
-        for open_idx, close_idx in local_match.items():
-            if open_idx < checkpoint_idx:
-                match_dict[open_idx] = close_idx
-        resync_idx = _find_resync_point(text, desync_idx)
-        gap_start_line = text.count("\n", 0, checkpoint_idx) + 1
-        if resync_idx is None:
-            gap_end_line = text.count("\n", 0, n) + 1
-            gaps.append((gap_start_line, gap_end_line))
-            break
-        gap_end_line = text.count("\n", 0, resync_idx) + 1
-        gaps.append((gap_start_line, gap_end_line))
-        pos = resync_idx
-    mask = "".join(mask_full)
-    return mask, match_dict, gaps
-
-
-def chunk_source(text: str):
-    """Chunk one Swift file's source text. Returns (chunks, gaps) where
-    chunks is a list of dicts (kind, symbol, qualified_name, signature,
-    doc, start_line, end_line -- all 1-based) in source order, and gaps is
-    a list of (start_line, end_line) 1-based ranges skipped due to a brace
-    desync (counted + reported by the caller; never a whole-file
-    fallback -- indexing always resumes after the gap)."""
-    mask, match_dict, gaps = _build_mask_and_match_dict(text)
-    chunks = _extract_decls(text, mask, match_dict)
-    return chunks, gaps
-
-
-_IDENT_RE = re.compile(r"[ \t\n]*([A-Za-z_][A-Za-z0-9_]*)")
-_OPERATOR_CHARS = set("+-*/%=<>!&|^~?.")
-_KEYWORD_RE = re.compile(
-    r"\b(class|struct|enum|protocol|extension|actor|func|init|subscript|var)\b"
-)
-
-
-def _read_backtick_identifier(mask: str, i: int):
-    """A backtick-quoted name (finding 6, e.g. `` `default` ``, used to
-    escape a reserved word as an identifier) -- returns the name WITHOUT
-    its backticks, or None if `i` (after skipping whitespace) isn't a
-    backtick-opened name."""
-    j = i
-    n = len(mask)
-    while j < n and mask[j] in (" ", "\n", "\t"):
-        j += 1
-    if j >= n or mask[j] != "`":
-        return None
-    k = j + 1
-    while k < n and mask[k] != "`":
-        k += 1
-    return mask[j + 1 : k] if k < n else None
-
-
-def _read_identifier(mask: str, i: int):
-    m = _IDENT_RE.match(mask, i)
-    if m:
-        return m.group(1)
-    return _read_backtick_identifier(mask, i)
-
-
-def _read_dotted_segment(mask: str, i: int):
-    """One segment of a dotted qualifier (finding 3): a plain identifier or
-    a backtick-quoted name, either one, whitespace-led. Returns (name
-    WITHOUT its backticks, end_idx) or (None, i)."""
-    n = len(mask)
-    j = i
-    while j < n and mask[j] in (" ", "\n", "\t"):
-        j += 1
-    if j < n and mask[j] == "`":
-        k = j + 1
-        while k < n and mask[k] != "`":
-            k += 1
-        if k >= n:
-            return None, i
-        return mask[j + 1 : k], k + 1
-    m = _IDENT_RE.match(mask, i)
-    if m:
-        return m.group(1), m.end()
-    return None, i
-
-
-def _read_dotted_identifier(mask: str, i: int):
-    """Like _read_identifier, but for `extension Outer.Inner` (finding
-    6) -- keeps the full dot-joined qualifier as one chain element so the
-    nested type's members qualify as Outer.Inner.member, not Outer.member.
-    Each segment may be plain OR backtick-quoted (finding 3: an extension
-    naming a backtick-escaped type, e.g. `` extension `Type` `` or
-    `` extension `Type`.Inner ``, must still keep its container -- it used
-    to be silently dropped since the segment regex never matched a
-    backtick)."""
-    name, end = _read_dotted_segment(mask, i)
-    if name is None:
-        return None
-    parts = [name]
-    n = len(mask)
-    pos = end
-    while pos < n and mask[pos] == ".":
-        seg, seg_end = _read_dotted_segment(mask, pos + 1)
-        if seg is None:
-            break
-        parts.append(seg)
-        pos = seg_end
-    return ".".join(parts)
-
-
-def _class_token_is_member_modifier(mask: str, after: int) -> bool:
-    """Finding 3: `class` is both a type-decl keyword (`class Foo {}`) and
-    a member modifier (`class func`/`class var`/`class subscript`, and
-    `class` stacked with further modifiers, e.g. `class final func`) --
-    only `class func`/`class var` used to be excluded from the
-    phantom-container check, so e.g. `class subscript` was misparsed as a
-    type named "subscript" containing the actual subscript's body. This
-    skips over any further _DECL_MODIFIER_WORDS right after `class` and
-    checks what member keyword actually follows; func/init/subscript/var/
-    let means this `class` token is a modifier, never a type declaration
-    (the member itself gets its own separate _KEYWORD_RE match, so nothing
-    is lost by skipping container creation here). A genuine type
-    declaration never has a modifier between `class` and its name (Swift
-    modifiers precede `class`, never follow it), so anything else here
-    falls through to being treated as the type's own name, unchanged from
-    prior behavior."""
-    j = after
-    n = len(mask)
-    while True:
-        while j < n and mask[j] in (" ", "\t", "\n"):
-            j += 1
-        m = _IDENT_RE.match(mask, j)
-        if not m:
-            return False
-        word = m.group(1)
-        if word in ("func", "var", "subscript", "init", "let"):
-            return True
-        if word in _DECL_MODIFIER_WORDS:
-            j = m.end()
-            continue
-        return False
-
-
-def _container_type_name(kw: str, mask: str, after: int):
-    """Shared by _extract_decls and declared_symbol_names (findings 3/7):
-    for a class/struct/enum/protocol/extension/actor _KEYWORD_RE match,
-    returns the container's own name, or None when this isn't really a
-    type declaration at all (a `class <modifier>* func/var/subscript/init`
-    member form, or a keyword used as a plain identifier like
-    `let actor = ...`)."""
-    if kw == "class" and _class_token_is_member_modifier(mask, after):
-        return None
-    if kw == "extension":
-        name = _read_dotted_identifier(mask, after)
-    else:
-        name = _read_identifier(mask, after)
-    return name or None
-
-
-def _read_identifier_or_operator(mask: str, i: int):
-    j = i
-    n = len(mask)
-    while j < n and mask[j] in (" ", "\n", "\t"):
-        j += 1
-    if j < n and mask[j] == "`":
-        return _read_backtick_identifier(mask, i)
-    if j < n and (mask[j].isalpha() or mask[j] == "_"):
-        return _read_identifier(mask, i)
-    k = j
-    while k < n and mask[k] in _OPERATOR_CHARS:
-        k += 1
-    return mask[j:k] if k > j else None
-
-
-def _read_init_suffix(mask: str, i: int) -> str:
-    j = i
-    n = len(mask)
-    while j < n and mask[j] in (" ", "\n", "\t"):
-        j += 1
-    if j < n and mask[j] in ("?", "!"):
-        return mask[j]
-    return ""
-
-
-def _find_body_open(mask: str, match_dict: dict, i: int, limit: int):
-    """From just after a decl's keyword+name(+header), find its own
-    body-open '{' -- the first '{' at paren_depth 0, jumping wholesale
-    (via match_dict) over any nested brace region first (a default
-    parameter's closure literal, a where-clause, etc). Returns None if the
-    enclosing scope's own '}' is hit first (a body-less protocol
-    requirement -- not a chunk) or the region ends unmatched."""
-    paren_depth = 0
-    j = i
-    while j < limit:
-        c = mask[j]
-        if c == "(":
-            paren_depth += 1
-        elif c == ")":
-            paren_depth -= 1
-        elif c == "{":
-            if paren_depth <= 0:
-                return j
-            nxt = match_dict.get(j)
-            if nxt is None:
-                return None
-            j = nxt
-        elif c == "}":
+    try:
+        if not path.is_file() or path.is_symlink():
             return None
-        j += 1
-    return None
+        first_line = _first_line_or_none(path)
+    except OSError:
+        return None
+    if not first_line:
+        return None
+    return chunkers.lang_for_shebang(first_line)
 
 
-def _classify_var(mask: str, i: int, limit: int):
-    """From just after `var NAME`, decide whether it's a computed property
-    (chunk) or a stored one (never a chunk -- includes `lazy var x = { ...
-    }()`, excluded because '=' is found before '{'). Returns (is_computed,
-    body_open_idx_or_None).
+def iter_code_source_files(root: Path, langs: list[str] | None, skipped: Counter | None = None):
+    """Walk `root`, yielding source files whose language (see
+    `lang_for_source_file` -- extension, or a shebang on an extensionless
+    file) is in the wired set (`langs`). Dispatch is registry-driven
+    rather than the old locally duplicated extension map.
 
-    A stored property with no initializer (`var x: Int` alone, e.g. a
-    protocol requirement or a plain field) is statement-terminated by its
-    newline: at each '\\n' outside any paren/bracket nesting, peek past
-    following whitespace (blank lines, and comment lines, which are
-    already blank in mask) for the next real character -- only '{' (brace
-    on the next line) or '=' (a multi-line initializer) means the same
-    declaration continues; anything else (typically the next
-    declaration's own keyword) means this one had no body.
+    `langs` defaults to swift-only when falsy -- a legacy-row safety net for
+    _code_index_is_stale below, whose only caller reads it out of an
+    existing code_meta.langs column that has been non-empty on every row
+    ever written since langs became mandatory (Task 7); it does not mean
+    code-reindex itself still has a default (it doesn't -- see
+    cmd_code_reindex's --lang resolution, which fails outright rather than
+    reaching this fallback).
 
-    willSet/didSet observers (finding 6) are syntactically identical to a
-    computed property's getter block up to this point -- a type
-    annotation directly followed by '{', no initializer -- so a stored
-    property with observers and no initializer (`var x: Int { willSet
-    {...} didSet {...} }`) would otherwise be misclassified as computed.
-    Only the block's own first token distinguishes them: if it's
-    `willSet`/`didSet`, this is NOT a computed-var chunk."""
-    paren_depth = 0
-    bracket_depth = 0
-    j = i
-    while j < limit:
-        c = mask[j]
-        if c == "\n" and paren_depth <= 0 and bracket_depth <= 0:
-            k = j
-            while k < limit and mask[k] in (" ", "\t", "\n"):
-                k += 1
-            if k >= limit or mask[k] not in ("{", "="):
-                return False, None
-            j = k
-            continue
-        if c == "(":
-            paren_depth += 1
-        elif c == ")":
-            paren_depth -= 1
-        elif c == "[":
-            bracket_depth += 1
-        elif c == "]":
-            bracket_depth -= 1
-        elif paren_depth <= 0 and bracket_depth <= 0:
-            if c == "=":
-                return False, None
-            if c == "{":
-                first = _read_identifier(mask, j + 1)
-                if first in ("willSet", "didSet"):
-                    return False, None
-                return True, j
-            if c == "}":
-                return False, None
-        j += 1
-    return False, None
+    Directory pruning (fix wave C1, superseding Task 7's union rule): a
+    language's skip_dirs prune only THAT language's own files. The walk
+    prunes CODE_SKIP_DIR_NAMES (global noise: .git, vendor, node_modules)
+    plus chunkers.common_skip_dirs(wired) -- the INTERSECTION of the wired
+    languages' skip sets, a pure optimization since every file under such
+    a directory would be dropped by its own language's rule anyway. Every
+    other directory is walked, and a file is dropped iff one of its
+    root-relative ancestor directory names is in ITS OWN language's skip
+    set (chunkers.path_is_skipped_for_lang). Consequence: with swift and
+    python both wired, `Tests/foo.py` IS indexed (python's skip set has no
+    "Tests") while `Tests/Foo.swift` is not. The union rule dropped both,
+    silently losing python source the census had just proposed python on
+    the strength of -- see chunkers.common_skip_dirs and
+    TestSkipDirOwnLanguageRule.
 
-
-def _signature_text(text: str, kstart: int, body_open: int) -> str:
-    raw = text[kstart:body_open]
-    return re.sub(r"\s+", " ", raw).strip()
-
-
-def _doc_comment_before(text: str, kstart: int) -> str:
-    line_start = text.rfind("\n", 0, kstart) + 1
-    lines_before = text[:line_start].splitlines()
-    doc_lines: list = []
-    idx = len(lines_before) - 1
-    while idx >= 0:
-        stripped = lines_before[idx].strip()
-        if stripped.startswith("///"):
-            doc_lines.insert(0, stripped[3:].strip())
-            idx -= 1
-            continue
-        break
-    return "\n".join(doc_lines)
-
-
-def _extract_decls(text: str, mask: str, match_dict: dict):
-    n = len(text)
-    raw_types: list = []
-    raw_chunks: list = []
-
-    for m in _KEYWORD_RE.finditer(mask):
-        kw = m.group(1)
-        kstart = m.start()
-        after = kstart + len(kw)
-
-        if kw in ("class", "struct", "enum", "protocol", "extension", "actor"):
-            # `extension Outer.Inner` (finding 6), a backtick-quoted
-            # target (finding 3), and `class <modifier>* func/var/
-            # subscript/init` member forms (finding 3, not just `class
-            # func`/`class var`) are all resolved by the one shared
-            # helper -- see _container_type_name.
-            name = _container_type_name(kw, mask, after)
-            if not name:
-                # a `class` member-modifier form, or a keyword used as a
-                # plain identifier (`let actor = ...`) -- never a
-                # container.
-                continue
-            body_open = _find_body_open(mask, match_dict, after, n)
-            if body_open is None:
-                continue
-            body_close = match_dict.get(body_open)
-            if body_close is None:
-                continue
-            raw_types.append((name, kstart, body_open, body_close))
-            continue
-
-        if kw in ("func", "init", "subscript"):
-            if kw == "func":
-                name = _read_identifier_or_operator(mask, after)
-                if not name:
+    `skipped`, when passed a Counter, is mutated in place: every walked file
+    that is NOT yielded because its extension is unsupported (no language
+    at all) or resolves to a lang outside the wired set (engine-supported
+    but not selected for this project) has its extension tallied there --
+    keyed compound-extension-aware (chunkers.extension_of, fix wave I2:
+    `foo.blade.php` counts as ".blade.php", never ".php") and under
+    NO_EXTENSION_BUCKET for an extensionless file with no recognized
+    shebang (B5: the same "second silent gap" the census already closed).
+    A file dropped by its OWN language's skip set is NOT tallied -- that
+    is deliberately-pruned noise, not a blind spot in what this engine can
+    chunk. That Counter is the data source for code-reindex's end-of-run
+    provenance line (spec S4, INC-0103/0104: no growing blind spot may be
+    silent). Mutated-in-place rather than a second yield channel so
+    existing callers (_code_index_is_stale) that iterate this generator
+    for plain paths need no change."""
+    wired = list(langs or ["swift"])
+    wired_set = set(wired)
+    skip_dirs = CODE_SKIP_DIR_NAMES | chunkers.common_skip_dirs(wired)
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+        for fname in sorted(filenames):
+            path = Path(dirpath) / fname
+            lang = lang_for_source_file(path)
+            if lang is not None and lang in wired_set:
+                try:
+                    rel_parts = path.relative_to(root).parts
+                except ValueError:
+                    rel_parts = (fname,)
+                if chunkers.path_is_skipped_for_lang(rel_parts, lang):
                     continue
-            elif kw == "init":
-                name = "init" + _read_init_suffix(mask, after)
-            else:
-                name = "subscript"
-            body_open = _find_body_open(mask, match_dict, after, n)
-            if body_open is None:
+                yield path
                 continue
-            body_close = match_dict.get(body_open)
-            if body_close is None:
-                continue
-            raw_chunks.append((kw, name, kstart, body_open, body_close))
-            continue
-
-        if kw == "var":
-            name = _read_identifier(mask, after)
-            if not name:
-                continue
-            is_computed, body_open = _classify_var(mask, after, n)
-            if not is_computed:
-                continue
-            body_close = match_dict.get(body_open)
-            if body_close is None:
-                continue
-            raw_chunks.append(("var", name, kstart, body_open, body_close))
-            continue
-
-    def enclosing_chain(pos: int) -> list:
-        containing = [t for t in raw_types if t[1] < pos < t[3]]
-        containing.sort(key=lambda t: (t[3] - t[1]), reverse=True)  # outermost first
-        return [t[0] for t in containing if t[0]]
-
-    out = []
-    for kw, name, kstart, body_open, body_close in raw_chunks:
-        chain = enclosing_chain(kstart)
-        qualified = ".".join(chain + [name]) if chain else name
-        sig = _signature_text(text, kstart, body_open)
-        doc = _doc_comment_before(text, kstart)
-        start_line = text.count("\n", 0, kstart) + 1
-        end_line = text.count("\n", 0, body_close) + 1
-        out.append(
-            {
-                "kind": kw,
-                "symbol": name,
-                "qualified_name": qualified,
-                "signature": sig,
-                "doc": doc,
-                "start_line": start_line,
-                "end_line": end_line,
-            }
-        )
-    out.sort(key=lambda c: c["start_line"])
-    return out
+            if skipped is not None:
+                skipped[chunkers.extension_of(fname) or NO_EXTENSION_BUCKET] += 1
 
 
-def declared_symbol_names(text: str) -> set:
-    """All symbol names memlint's #symbol vocabulary check (finding 5,
-    memlint.py's lint_concept) should recognize as declared in `text` --
-    everything chunk_source would chunk (init, subscript, computed var
-    names, static/class func, operators, backtick names) PLUS each
-    container type's own name (class/struct/enum/protocol/extension/
-    actor -- a #symbol fragment may name the type itself, not just a
-    member; `extension Outer.Inner` contributes both "Outer" and "Inner"
-    separately, matching either half). Reuses chunk_source's own
-    lexer-aware mask (_build_mask_and_match_dict) rather than a
-    from-scratch regex scan, so a name that only appears inside a comment
-    or string literal is never counted (mirrors the same guarantee
-    chunk_source already gives code-search/code-reindex)."""
-    mask, match_dict, _gaps = _build_mask_and_match_dict(text)
-    names = {c["symbol"] for c in _extract_decls(text, mask, match_dict)}
-    for m in _KEYWORD_RE.finditer(mask):
-        kw = m.group(1)
-        if kw not in ("class", "struct", "enum", "protocol", "extension", "actor"):
-            continue
-        after = m.start() + len(kw)
-        name = _container_type_name(kw, mask, after)
-        if not name:
-            continue
-        for part in name.split("."):
-            if part:
-                names.add(part)
-    return names
+# ---------------------------------------------------------------------------
+# chunker: lexer-aware brace walker -- moved to chunkers/swift.py (Task 2,
+# Anatomy M1 milestone). Only `chunk_source` is re-exported here now, for
+# the existing tests that import it as memidx.chunk_source. The lexer
+# internals (_build_mask_and_match_dict, _KEYWORD_RE, _container_type_name,
+# _extract_decls) used to be re-exported too, for declared_symbol_names and
+# fragment_declared_in_text's inline Swift container-name pass; both are
+# gone (fix wave I3 -- the vocabulary question is now one generic call to
+# the backend's own declared_symbols), and with them every reason for this
+# module to reach into a backend's internals at all.
+# ---------------------------------------------------------------------------
+
+from chunkers.swift import chunk_source
 
 
 # ---------------------------------------------------------------------------
@@ -2473,99 +1977,272 @@ def _git_head_sha(root: Path) -> str | None:
     return sha or None
 
 
+CHUNK_REQUIRED_KEYS = (
+    "kind", "symbol", "qualified_name", "signature", "doc",
+    "start_line", "end_line", "lang",
+)
+
+
+def validate_chunk_result(result, rel: str) -> None:
+    """C3 (Anatomy M1 fix wave, Codex): the reindex loop is the boundary
+    between a chunker backend and the database, so it -- not each backend
+    -- is where the registry contract is ENFORCED. Raises ValueError
+    naming what is wrong; cmd_code_reindex's per-file guard turns that
+    into B1's failure path (warn, purge whatever the last good run stored
+    for this file, continue), so a violating chunk is never written.
+
+    Checked: a real ChunkResult back (not None, not a bare list); `chunks`
+    and `gaps` are lists; every chunk is a dict carrying every key the
+    INSERT below reads; `kind` is drawn from the frozen chunkers.KINDS
+    vocabulary (spec S2 -- the whole point of freezing it is that nothing
+    outside it reaches the column); `start_line`/`end_line` are real ints
+    (a string "1" would sort and slice wrongly and poison every downstream
+    line-range read). `path` is deliberately NOT required: it is supplied
+    by this caller (rel_path), never by the provider."""
+    if not isinstance(result, chunkers.ChunkResult):
+        raise ValueError(
+            f"chunker returned {type(result).__name__}, not a ChunkResult"
+        )
+    if not isinstance(result.chunks, list) or not isinstance(result.gaps, list):
+        raise ValueError("ChunkResult.chunks and .gaps must both be lists")
+    if result.status not in ("ok", "partial", "failed"):
+        raise ValueError(f"ChunkResult.status {result.status!r} is not ok/partial/failed")
+    for gap in result.gaps:
+        if not isinstance(gap, (tuple, list)) or len(gap) != 3:
+            raise ValueError(f"malformed gap {gap!r} (expected a 3-tuple)")
+    for i, chunk in enumerate(result.chunks):
+        if not isinstance(chunk, dict):
+            raise ValueError(f"chunk {i} is {type(chunk).__name__}, not a dict")
+        missing = [k for k in CHUNK_REQUIRED_KEYS if k not in chunk]
+        if missing:
+            raise ValueError(f"chunk {i} is missing required key(s): {', '.join(missing)}")
+        if chunk["kind"] not in chunkers.KINDS:
+            raise ValueError(
+                f"chunk {i} has kind {chunk['kind']!r}, which is outside the frozen "
+                f"kind vocabulary ({', '.join(sorted(chunkers.KINDS))})"
+            )
+        for key in ("start_line", "end_line"):
+            if not isinstance(chunk[key], int) or isinstance(chunk[key], bool):
+                raise ValueError(
+                    f"chunk {i} has non-integer {key}: {chunk[key]!r}"
+                )
+
+
 def cmd_code_reindex(args) -> int:
     root = Path(args.code_root).resolve()
     db_path = resolve_code_db_path(args)
     conn = open_code_db(db_path)
     t0 = time.time()
-    langs = [l.strip() for l in args.lang.split(",")] if getattr(args, "lang", None) else None
+
+    # Task 7: the old hardcoded "swift" --lang default is gone. Omitted
+    # --lang reuses code_meta.langs from a PRIOR reindex of this project,
+    # when one is stored; a project with no stored langs yet (its first
+    # reindex) must name its languages explicitly -- silently defaulting to
+    # swift-only used to index nothing at all for a python-only project set
+    # up without --lang, and never say why.
+    if getattr(args, "lang", None):
+        langs = [l.strip() for l in args.lang.split(",")]
+    else:
+        meta_row = conn.execute(
+            "SELECT langs FROM code_meta WHERE project=?", (args.project,)
+        ).fetchone()
+        stored = meta_row["langs"] if meta_row else None
+        if stored:
+            langs = [l.strip() for l in stored.split(",")]
+        else:
+            print(
+                f"code-reindex: --lang required on first code-reindex for a project "
+                f"(no stored langs yet for {args.project!r})",
+                file=sys.stderr,
+            )
+            conn.close()
+            return 1
+
+    # C2 (Anatomy M1 fix wave, Codex): every RESOLVED language name --
+    # whether it came from --lang or from a code_meta row a previous run
+    # stored -- must name a real LANGUAGE_TABLE row. A typo used to be
+    # tolerated silently: the walk matched zero files for it, the run said
+    # nothing, and the bad name was then PERSISTED to code_meta.langs, so
+    # every later run reused it. That is exactly the silent blind spot
+    # this milestone exists to close, so it is now a loud failure naming
+    # the languages this engine actually knows, before anything is walked
+    # or written.
+    unknown = [l for l in langs if l not in chunkers.LANGUAGE_TABLE]
+    if unknown:
+        print(
+            f"code-reindex: unknown language(s): {', '.join(unknown)} -- "
+            f"this engine version knows: {', '.join(sorted(chunkers.LANGUAGE_TABLE))}",
+            file=sys.stderr,
+        )
+        conn.close()
+        return 1
 
     existing = {
-        row["path"]: row["sha256"]
-        for row in conn.execute("SELECT path, sha256 FROM file_sha WHERE project=?", (args.project,))
+        row["path"]: (row["sha256"], row["chunker_version"])
+        for row in conn.execute(
+            "SELECT path, sha256, chunker_version FROM file_sha WHERE project=?", (args.project,)
+        )
     }
 
-    files = list(iter_code_source_files(root, langs))
+    skipped_unknown: Counter = Counter()
+    files = list(iter_code_source_files(root, langs, skipped_unknown))
     seen = set()
-    added_files = changed_files = unchanged_files = 0
+    added_files = changed_files = unchanged_files = failed_files = 0
     total_gaps = 0
     pending_texts: list = []
     pending_ids: list = []
 
+    # B1/C3 (Anatomy M1 fix wave). Two changes to the per-file loop:
+    #
+    # (a) the try covers the WHOLE per-file body -- read_bytes/stat/decode
+    #     and the chunk INSERT loop, not just the chunk_file call. Grok
+    #     HIGH 2: one mode-000 (or vanished, or malformed-result) file used
+    #     to abort the entire walk with a traceback, so a single
+    #     unreadable file could leave most of a repo unindexed.
+    #
+    # (b) a failure PURGES this file's stale index state instead of merely
+    #     declining to write new state (Grok HIGH 1). Writing no file_sha
+    #     row was enough to make repair retrigger, but the chunks the LAST
+    #     good run stored stayed in the table -- so code-search kept
+    #     answering from rows the current source text no longer produces,
+    #     with nothing on any surface saying so. Now: delete the chunks
+    #     (with their fts/embedding shadows) AND the file_sha row, warn
+    #     naming the file, continue. Deleting the file_sha row is also what
+    #     keeps _code_index_state honest: the file is on disk, absent from
+    #     file_sha, so the index reports "stale", not "current".
+    #
+    # A "partial" status still indexes its chunks and writes file_sha with
+    # gap_count = len(gaps) -- the existing gap behavior, unchanged.
     for f in files:
         try:
             rel = str(f.relative_to(root))
         except ValueError:
             rel = str(f)
+        # `seen` is populated BEFORE the guarded body: a file that failed
+        # to chunk is still a file that EXISTS on disk, so it must not
+        # also be swept up by the removed-paths pass below and counted as
+        # a deletion.
         seen.add(rel)
-        data = f.read_bytes()
-        sha = hashlib.sha256(data).hexdigest()
-        prev_sha = existing.get(rel)
-        if prev_sha == sha and not args.full:
-            unchanged_files += 1
-            # Finding 2 (staleness): the file's content (and thus its
-            # chunks) didn't change, but its mtime/size on disk may have
-            # (e.g. a bare `touch`) -- refresh the stored file_sha row's
-            # mtime/size so _code_index_is_stale's on-disk comparison
-            # matches again. sha256/gap_count are untouched (nothing about
-            # the indexed content changed), so this is a plain UPDATE, not
-            # the INSERT OR REPLACE the changed/added branch below uses.
+        try:
+            data = f.read_bytes()
+            sha = hashlib.sha256(data).hexdigest()
+            lang = lang_for_source_file(f)
+            try:
+                cv = chunkers.chunker_version(lang)
+            except KeyError:
+                # Task 3 edge case: a lang with no LANGUAGE_TABLE row must
+                # not crash code-reindex -- fail open with a literal stamp
+                # instead of raising. (Unreachable via --lang since C2
+                # validates the resolved language set; kept as a guard.)
+                cv = "unversioned"
+            prev_sha, prev_cv = existing.get(rel, (None, None))
+            if prev_sha == sha and prev_cv == cv and not args.full:
+                unchanged_files += 1
+                # Finding 2 (staleness): the file's content (and thus its
+                # chunks) didn't change, but its mtime/size on disk may
+                # have (e.g. a bare `touch`) -- refresh the stored
+                # file_sha row's mtime/size so _code_index_is_stale's
+                # on-disk comparison matches again. sha256/gap_count/
+                # chunker_version are untouched (nothing about the indexed
+                # content or the chunker that produced it changed), so
+                # this is a plain UPDATE, not the INSERT OR REPLACE the
+                # changed/added branch below uses.
+                stat = f.stat()
+                conn.execute(
+                    "UPDATE file_sha SET mtime=?, size=? WHERE project=? AND path=?",
+                    (stat.st_mtime, stat.st_size, args.project, rel),
+                )
+                continue
+            is_new = rel not in existing
+
+            text = data.decode("utf-8", errors="replace")
+            # Task 5 rewire: dispatch through the chunker registry instead
+            # of calling the Swift walker (chunk_source) directly --
+            # get_chunker(lang) resolves the right backend, chunk_file(text,
+            # rel) is the uniform per-backend contract (ChunkResult:
+            # chunks/gaps/status), and validate_chunk_result enforces that
+            # contract here at the DB boundary (C3).
+            result = chunkers.get_chunker(lang).chunk_file(text, rel)
+            validate_chunk_result(result, rel)
+
+            if result.status == "failed":
+                raise ValueError("chunker reported status=failed")
+
+            for g in result.gaps:
+                total_gaps += 1
+                print(
+                    f"code-reindex: WARNING gap in {rel} lines {g[0]}-{g[1]} "
+                    f"({g[2]}, skipped)",
+                    file=sys.stderr,
+                )
+
+            chunks = result.chunks
+            gaps = result.gaps
+
+            delete_code_chunks_for_path(conn, args.project, rel)
+            text_lines = text.splitlines()
+            # Embeddings are queued per-file and only merged into the
+            # shared pending lists once the whole file is stored: a chunk
+            # id whose row is deleted again by the failure path below must
+            # never reach the embeddings table.
+            file_texts: list = []
+            file_ids: list = []
+            for chunk in chunks:
+                body_lines = text_lines[chunk["start_line"] : chunk["end_line"] - 1]
+                cur = conn.execute(
+                    """INSERT INTO chunks (path, project, lang, kind, symbol, qualified_name,
+                           signature, doc, start_line, end_line)
+                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        rel, args.project, chunk["lang"], chunk["kind"], chunk["symbol"],
+                        chunk["qualified_name"], chunk["signature"], chunk["doc"],
+                        chunk["start_line"], chunk["end_line"],
+                    ),
+                )
+                chunk_id = cur.lastrowid
+                split_tokens = split_qualified(chunk["qualified_name"])
+                body_text = "\n".join(body_lines[:25])
+                conn.execute(
+                    "INSERT INTO fts (rowid, qualified_name, split_tokens, signature, doc, body) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (chunk_id, chunk["qualified_name"], split_tokens, chunk["signature"] or "",
+                     chunk["doc"] or "", body_text),
+                )
+                if not args.no_embed:
+                    file_texts.append(code_embed_text_for(rel, chunk, body_lines))
+                    file_ids.append(chunk_id)
+
             stat = f.stat()
             conn.execute(
-                "UPDATE file_sha SET mtime=?, size=? WHERE project=? AND path=?",
-                (stat.st_mtime, stat.st_size, args.project, rel),
+                "INSERT OR REPLACE INTO file_sha (path, project, sha256, mtime, size, gap_count, chunker_version) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (rel, args.project, sha, stat.st_mtime, stat.st_size, len(gaps), cv),
             )
-            continue
-        is_new = rel not in existing
-
-        text = data.decode("utf-8", errors="replace")
-        lang = _lang_for_ext(f.suffix)
-        chunks, gaps = chunk_source(text)
-        total_gaps += len(gaps)
-        for g in gaps:
+            pending_texts.extend(file_texts)
+            pending_ids.extend(file_ids)
+            if is_new:
+                added_files += 1
+            else:
+                changed_files += 1
+        except Exception as exc:
+            # B1: purge whatever this path still has in the index, so no
+            # stale row outlives the source that produced it, and the
+            # missing file_sha row keeps the index reading "stale".
+            try:
+                delete_code_chunks_for_path(conn, args.project, rel)
+                conn.execute(
+                    "DELETE FROM file_sha WHERE project=? AND path=?", (args.project, rel)
+                )
+            except Exception:
+                pass
+            failed_files += 1
             print(
-                f"code-reindex: WARNING gap in {rel} lines {g[0]}-{g[1]} "
-                f"(brace desync, skipped)",
+                f"code-reindex: WARNING {rel} not indexed: "
+                f"{type(exc).__name__}: {exc} -- any previously indexed chunks for "
+                "this file were removed (repair will retry)",
                 file=sys.stderr,
             )
-
-        delete_code_chunks_for_path(conn, args.project, rel)
-        text_lines = text.splitlines()
-        for chunk in chunks:
-            body_lines = text_lines[chunk["start_line"] : chunk["end_line"] - 1]
-            cur = conn.execute(
-                """INSERT INTO chunks (path, project, lang, kind, symbol, qualified_name,
-                       signature, doc, start_line, end_line)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    rel, args.project, lang, chunk["kind"], chunk["symbol"],
-                    chunk["qualified_name"], chunk["signature"], chunk["doc"],
-                    chunk["start_line"], chunk["end_line"],
-                ),
-            )
-            chunk_id = cur.lastrowid
-            split_tokens = split_qualified(chunk["qualified_name"])
-            body_text = "\n".join(body_lines[:25])
-            conn.execute(
-                "INSERT INTO fts (rowid, qualified_name, split_tokens, signature, doc, body) "
-                "VALUES (?,?,?,?,?,?)",
-                (chunk_id, chunk["qualified_name"], split_tokens, chunk["signature"] or "",
-                 chunk["doc"] or "", body_text),
-            )
-            if not args.no_embed:
-                pending_texts.append(code_embed_text_for(rel, chunk, body_lines))
-                pending_ids.append(chunk_id)
-
-        stat = f.stat()
-        conn.execute(
-            "INSERT OR REPLACE INTO file_sha (path, project, sha256, mtime, size, gap_count) "
-            "VALUES (?,?,?,?,?,?)",
-            (rel, args.project, sha, stat.st_mtime, stat.st_size, len(gaps)),
-        )
-        if is_new:
-            added_files += 1
-        else:
-            changed_files += 1
+            continue
 
     reembeds = 0
     if pending_texts:
@@ -2583,19 +2260,206 @@ def cmd_code_reindex(args) -> int:
         delete_code_chunks_for_path(conn, args.project, rel)
         conn.execute("DELETE FROM file_sha WHERE project=? AND path=?", (args.project, rel))
 
+    # Task 7: the "swift" fallback here is gone -- `langs` is always a
+    # non-empty, resolved list by this point (explicit --lang, or reused
+    # code_meta.langs; the no-langs-yet case already returned 1 above), so
+    # a fallback here would just be dead code hiding a real bug if one of
+    # those guarantees ever broke.
     conn.execute(
         "INSERT OR REPLACE INTO code_meta (project, code_root, langs, last_indexed_at, head_sha) "
         "VALUES (?,?,?,?,?)",
-        (args.project, str(root), ",".join(langs) if langs else "swift", time.time(), _git_head_sha(root)),
+        (args.project, str(root), ",".join(langs), time.time(), _git_head_sha(root)),
     )
     conn.commit()
     conn.close()
     elapsed = time.time() - t0
     print(
         f"code-reindex: {len(files)} files scanned, {added_files} added, {changed_files} changed, "
-        f"{unchanged_files} unchanged, {len(removed)} removed, {reembeds} chunk(s) (re-)embedded, "
-        f"{total_gaps} gap(s) warned, {elapsed:.3f}s"
+        f"{unchanged_files} unchanged, {len(removed)} removed, {failed_files} failed, "
+        f"{reembeds} chunk(s) (re-)embedded, {total_gaps} gap(s) warned, {elapsed:.3f}s"
     )
+    if skipped_unknown:
+        # Task 5 census (spec S4, INC-0103/0104 lesson): a walked file whose
+        # extension isn't in the wired lang set is NOT indexed -- say so,
+        # every run, so the gap never grows silently. One line, extensions
+        # sorted by count desc (ties broken alphabetically for determinism).
+        total_skipped = sum(skipped_unknown.values())
+        breakdown = " ".join(
+            f"{ext}={count}"
+            for ext, count in sorted(skipped_unknown.items(), key=lambda kv: (-kv[1], kv[0]))
+        )
+        print(
+            f"code-reindex: {total_skipped} files with unsupported/unwired extensions "
+            f"not indexed: {breakdown}"
+        )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# code-census (Task 8, Anatomy M1): discovery-only, no DB, no consent
+# recorded -- census PROPOSES a language set (spec §3,
+# docs/internal/DESIGN-anatomy-chunkers.md); repo-init's dialogue (Task 10)
+# is what may eventually wire/install/record one. Exit 0 always: a census
+# never fails a scan it can walk.
+# ---------------------------------------------------------------------------
+
+NO_EXTENSION_BUCKET = "(no extension)"
+
+
+def _census_skip_dirs() -> set:
+    """Directory names pruned from a code-census walk.
+
+    Deliberately WIDER than iter_code_source_files' wired-langs union
+    (Task 7): census runs BEFORE any language is wired for a project --
+    it is the discovery step repo-init's consent dialogue reads, so there
+    is no "wired" subset yet to union against. Using ONLY
+    CODE_SKIP_DIR_NAMES (the global set: .git/vendor/node_modules) would
+    let a census walk descend into every OTHER LANGUAGE_TABLE row's own
+    noise dirs it doesn't yet know to exclude -- an untouched Python
+    project's census would count thousands of files under .venv/ as pure
+    noise (Task 5 reviewer finding, assigned to this task). So census
+    unions CODE_SKIP_DIR_NAMES with EVERY LANGUAGE_TABLE row's skip_dirs,
+    not just a wired subset: the walk needs to already look clean before
+    the user has chosen anything. (Contrast iter_code_source_files, which
+    correctly unions only the WIRED subset once a project has committed to
+    a language set -- that is a different question from this one.)
+    """
+    dirs = set(CODE_SKIP_DIR_NAMES)
+    for row in chunkers.LANGUAGE_TABLE.values():
+        dirs.update(row.get("skip_dirs", ()))
+    return dirs
+
+
+def _first_line_or_none(path: Path) -> str | None:
+    """Read just the first line of `path`, fail-open. Any error (permission
+    denied, undecodable bytes, empty file) yields None rather than raising
+    -- census never fails a scan it can walk (brief's exit-0-always
+    contract). `errors="replace"` means an undecodable byte never raises
+    either; it just can never match a shebang afterward, same as None.
+    `readline(512)` caps the read on an extensionless file with no
+    newline near the start (e.g. a large binary) -- a shebang interpreter
+    name is always well within the first few dozen bytes, so a truncated
+    line still matches correctly; this only bounds how much of a
+    non-matching file gets pulled into memory."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.readline(512).rstrip("\n") or None
+    except OSError:
+        return None
+
+
+def code_census(root: Path) -> dict:
+    """Walk `root` and classify every file two ways: SUPPORTED (resolves to
+    a LANGUAGE_TABLE lang, whether by extension via chunkers.lang_for_path
+    or -- for an extensionless executable -- by chunkers.lang_for_shebang
+    matching a shebang stem) or UNSUPPORTED (an extension with no
+    LANGUAGE_TABLE row, or an extensionless file whose first line is not a
+    recognized shebang, bucketed under NO_EXTENSION_BUCKET). This is the
+    "three ways" the brief names: extension-supported, extension-
+    unsupported, and shebang-sniffed extensionless (itself supported or
+    unsupported depending on whether the shebang matched) -- the shebang
+    path folds into the SAME lang key an extension match would use, not a
+    separate status, so a `#!/usr/bin/env python3` script and a `foo.py`
+    file both count under the "python" key.
+
+    Returns {key: {"files": n, "status": "supported"|"unsupported"}} (the
+    brief's JSON shape) -- `key` is a lang name for a supported row, else
+    the raw extension string (or NO_EXTENSION_BUCKET) for an unsupported
+    one. Directory pruning: _census_skip_dirs() (global set UNION every
+    LANGUAGE_TABLE row's skip_dirs -- see its docstring for why this is
+    wider than a wired-langs walk). Fails open per file and never raises on
+    a walk it can complete: os.walk over a missing/unreadable root just
+    yields nothing, so an empty or nonexistent root produces an empty dict,
+    not an error."""
+    skip_dirs = _census_skip_dirs()
+    # C5 (Anatomy M1 fix wave, Codex): EVERY LANGUAGE_TABLE language gets a
+    # row, seeded at zero, whether or not the tree holds one of its files.
+    # The driven install flow (skills/memcontinuum/SKILL.md step 2) has to
+    # present "supported but not found" alongside "proposed", and a
+    # language simply missing from the JSON forces every consumer to
+    # re-derive the known-language list for itself to spot the difference.
+    counts: dict = {
+        lang: {"files": 0, "status": "supported"} for lang in chunkers.LANGUAGE_TABLE
+    }
+
+    def bump(key: str, status: str) -> None:
+        row = counts.setdefault(key, {"files": 0, "status": status})
+        row["files"] += 1
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+        for fname in sorted(filenames):
+            path = Path(dirpath) / fname
+            # I2: compound-extension aware, so `foo.blade.php` is keyed
+            # ".blade.php" and never folded into the ".php" bucket
+            # lang_for_path already refuses to treat it as.
+            ext = chunkers.extension_of(fname)
+            if ext:
+                lang = chunkers.lang_for_path(path)
+                if lang is not None:
+                    bump(lang, "supported")
+                else:
+                    bump(ext, "unsupported")
+                continue
+            # Extensionless: only a recognized shebang saves it from the
+            # catch-all bucket (controller-scope addition, Task 5 reviewer
+            # finding -- the "second silent gap": extensionless scripts
+            # used to vanish from the census entirely).
+            first_line = _first_line_or_none(path)
+            lang = chunkers.lang_for_shebang(first_line) if first_line else None
+            if lang is not None:
+                bump(lang, "supported")
+            else:
+                bump(NO_EXTENSION_BUCKET, "unsupported")
+
+    return counts
+
+
+def _print_code_census_table(counts: dict) -> None:
+    """Human-readable form: supported rows FIRST (named by lang), then
+    unsupported rows (named by extension / NO_EXTENSION_BUCKET), each
+    group sorted by file count descending, ties broken alphabetically for
+    determinism (same tie rule as code-reindex's skipped-extension
+    provenance line)."""
+    def sort_key(item):
+        key, row = item
+        return (-row["files"], key)
+
+    supported = sorted(
+        (item for item in counts.items() if item[1]["status"] == "supported"),
+        key=sort_key,
+    )
+    unsupported = sorted(
+        (item for item in counts.items() if item[1]["status"] == "unsupported"),
+        key=sort_key,
+    )
+    total = sum(row["files"] for row in counts.values())
+    print(f"code-census: {total} file(s) scanned")
+    if supported:
+        # C5: a language the tree does not hold is listed here at 0
+        # ("supported but not found"), not omitted -- same data the --json
+        # form now carries, in the human's form.
+        print("supported:")
+        for key, row in supported:
+            print(f"  {key}: {row['files']}")
+    if unsupported:
+        print("unsupported:")
+        for key, row in unsupported:
+            print(f"  {key}: {row['files']}")
+    if total == 0:
+        print("(no files found)")
+
+
+def cmd_code_census(args) -> int:
+    """`code-census --root DIR [--json]`. No DB, no --project, no consent
+    recorded -- pure discovery (see the module comment above). Exit 0
+    always."""
+    root = Path(args.root)
+    counts = code_census(root)
+    if getattr(args, "json", False):
+        print(json.dumps(counts))
+    else:
+        _print_code_census_table(counts)
     return 0
 
 
@@ -2622,6 +2486,21 @@ def code_hits_vector(conn: sqlite3.Connection, query: str, project: str):
 
 
 def _code_index_is_stale(conn: sqlite3.Connection, project: str) -> bool:
+    """Stale when the tree and the stored rows disagree in ANY of three
+    ways: a file's mtime/size drifted, a file is on disk with no stored
+    row at all, or a stored row was produced by a DIFFERENT chunker
+    version than the one this engine would use today (B2, Anatomy M1 fix
+    wave). Plus the missing-code_root case.
+
+    The chunker-version comparison is the one this check used to be
+    missing. `code-reindex` has always re-chunked a file whose stored
+    chunker_version no longer matches, but `code-search`'s staleness
+    report only compared mtime/size -- so bumping a chunker's
+    impl_version left every stored row reading "current" until something
+    on disk happened to change, which is precisely when a reader most
+    needs to be told the index predates the current chunker. A row for a
+    language with no LANGUAGE_TABLE row compares against "unversioned",
+    the same literal cmd_code_reindex's own fail-open stamps."""
     meta = conn.execute("SELECT code_root, langs FROM code_meta WHERE project=?", (project,)).fetchone()
     if meta is None or not meta["code_root"]:
         return False
@@ -2630,8 +2509,10 @@ def _code_index_is_stale(conn: sqlite3.Connection, project: str) -> bool:
         return True
     langs = meta["langs"].split(",") if meta["langs"] else None
     existing = {
-        row["path"]: (row["mtime"], row["size"])
-        for row in conn.execute("SELECT path, mtime, size FROM file_sha WHERE project=?", (project,))
+        row["path"]: (row["mtime"], row["size"], row["chunker_version"])
+        for row in conn.execute(
+            "SELECT path, mtime, size, chunker_version FROM file_sha WHERE project=?", (project,)
+        )
     }
     seen = set()
     for f in iter_code_source_files(root, langs):
@@ -2643,6 +2524,12 @@ def _code_index_is_stale(conn: sqlite3.Connection, project: str) -> bool:
         stat = f.stat()
         prev = existing.get(rel)
         if prev is None or prev[0] != stat.st_mtime or prev[1] != stat.st_size:
+            return True
+        try:
+            cv = chunkers.chunker_version(lang_for_source_file(f))
+        except KeyError:
+            cv = "unversioned"
+        if prev[2] != cv:
             return True
     return bool(set(existing.keys()) - seen)
 
@@ -2871,7 +2758,12 @@ def main(argv=None) -> int:
     p_code_reindex = sub.add_parser("code-reindex")
     add_common_args(p_code_reindex)
     p_code_reindex.add_argument("--code-root", dest="code_root", required=True)
-    p_code_reindex.add_argument("--lang", default=None, help="comma-separated language filter, e.g. swift,ts")
+    p_code_reindex.add_argument(
+        "--lang", default=None,
+        help="comma-separated language filter, e.g. swift,python. Required on a "
+             "project's first code-reindex; omit it on later runs to reuse the "
+             "langs stored from the first run.",
+    )
     p_code_reindex.add_argument("--no-embed", action="store_true")
     p_code_reindex.add_argument("--full", action="store_true")
     p_code_reindex.set_defaults(func=cmd_code_reindex)
@@ -2889,6 +2781,11 @@ def main(argv=None) -> int:
              "db for this command. Defaults to the normal per-project decision db.",
     )
     p_code_search.set_defaults(func=cmd_code_search)
+
+    p_code_census = sub.add_parser("code-census")
+    p_code_census.add_argument("--root", required=True)
+    p_code_census.add_argument("--json", action="store_true")
+    p_code_census.set_defaults(func=cmd_code_census)
 
     args = parser.parse_args(argv)
     return args.func(args)

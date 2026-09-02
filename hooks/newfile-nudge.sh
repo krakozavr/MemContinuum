@@ -44,6 +44,30 @@
 #                            for the shared watchdog launcher and (when jq
 #                            isn't on PATH) JSON handling -- never to run
 #                            memidx.py.
+#   MEMCONTINUUM_LANG_EXTS   space-separated glob list of engine-wired
+#                            source extensions (e.g. "*.swift *.py"),
+#                            rendered at hook-line render time (Task 10).
+#                            UNSET -> legacy `*.swift`-only fallback, for
+#                            wiring not yet re-rendered. Explicitly EMPTY
+#                            (MEMCONTINUUM_LANG_EXTS='', rendered on
+#                            purpose for language-less wiring -- Ruling 6)
+#                            -> matches NOTHING, no fallback -- `${VAR-x}`
+#                            (no colon) is used below specifically so
+#                            "unset" and "set but empty" stay distinct.
+#   MEMCONTINUUM_KNOWN_EXTS  space-separated glob list of ALL engine-
+#                            supported extensions, wired or not. A file
+#                            matching KNOWN but not WIRED logs
+#                            outcome=language-available-not-wired instead
+#                            of the plain not-indexed-extension. Unset ->
+#                            falls back to MEMCONTINUUM_LANG_EXTS (no
+#                            language-available-not-wired distinction).
+#   MEMCONTINUUM_NEVER_EXTS  space-separated glob list of extensions the
+#                            human answered "never" to at install time.
+#                            Checked BEFORE the wired gate: a match
+#                            finishes silently with
+#                            outcome=never-extension, even for an
+#                            otherwise-wired extension. Unset/empty ->
+#                            matches nothing (no behavior change).
 
 set -u
 
@@ -125,14 +149,64 @@ if [ -e "$FILE_PATH" ] || [ -L "$FILE_PATH" ]; then
     finish "existing-or-symlink"
 fi
 
-# Same "indexed source extension" notion as memidx.py's LANG_EXTENSIONS --
-# hardcoded here (this hook never imports/runs memidx.py) since today
-# there is exactly one language; extend this list in lockstep with
-# LANG_EXTENSIONS if that ever grows.
-case "$FILE_PATH" in
-    *.swift) ;;
-    *) finish "not-indexed-extension" ;;
-esac
+# Extension gate is render-time env, not a hardcoded list: Task 10 renders
+# MEMCONTINUUM_LANG_EXTS (space-separated glob list of engine-wired
+# extensions, e.g. "*.swift *.py") and MEMCONTINUUM_KNOWN_EXTS (all
+# engine-supported globs, wired or not) into this hook's environment.
+# UNSET MEMCONTINUUM_LANG_EXTS means legacy un-re-rendered wiring -- fall
+# back to the original hardcoded `*.swift` so behavior stays byte-identical
+# for a hook line Task 10 has not re-rendered yet. An explicitly EMPTY
+# MEMCONTINUUM_LANG_EXTS (Ruling 6, Task 10 fix round: `MEMCONTINUUM_LANG_EXTS=''`
+# rendered on the line, not omitted) is a DIFFERENT, deliberate state --
+# language-less wiring, matching nothing -- and must NOT fall back to
+# `*.swift`: `${VAR-default}` (dash, no colon) substitutes the default only
+# when VAR is UNSET, leaving a set-but-empty VAR empty. This is why the
+# expansion below is `${MEMCONTINUUM_LANG_EXTS-*.swift}`, not
+# `${MEMCONTINUUM_LANG_EXTS:-*.swift}` (colon = "unset OR empty", which
+# could never distinguish the two states Task 10 needs distinguished).
+#
+# _ext_matches loops over $2 deliberately UNQUOTED to split the
+# space-separated glob list on IFS (bash-3.2 has no arrays-of-globs
+# alternative) -- `set -f` (noglob) brackets the loop so that unquoted
+# expansion never lets the shell glob-expand a pattern like *.swift
+# against files in cwd; `case "$1" in $_pat)` itself is safe unquoted
+# too (case patterns match, they never expand against the filesystem). An
+# empty $2 makes the `for` loop iterate zero times (word-splitting an
+# empty string yields no words), so `_ext_matches path ""` correctly
+# returns 1 (no match) -- matches nothing, exactly what language-less
+# wiring's explicit empty MEMCONTINUUM_LANG_EXTS needs.
+_ext_matches() {  # $1=path  $2=space-separated glob list
+    set -f
+    for _pat in $2; do
+        case "$1" in $_pat) set +f; return 0 ;; esac
+    done
+    set +f
+    return 1
+}
+WIRED_EXTS="${MEMCONTINUUM_LANG_EXTS-*.swift}"
+KNOWN_EXTS="${MEMCONTINUUM_KNOWN_EXTS:-$WIRED_EXTS}"
+
+# MEMCONTINUUM_NEVER_EXTS is checked FIRST, before the wired gate (B4,
+# Anatomy M1 fix wave): the install dialogue's "never for one extension"
+# answer means "stop mentioning this one", and it has to win even over an
+# extension that is otherwise wired -- otherwise the answer would only
+# work for extensions the hook was already silent about, which is no
+# answer at all. Empty or unset matches nothing (an empty $2 makes
+# _ext_matches' `for` loop iterate zero times), so wiring that never asked
+# the question behaves exactly as before. This is render-time persistence:
+# the value lives on the hook's own command line, refreshed by every
+# install, not in a registry (that arrives with the updater).
+NEVER_EXTS="${MEMCONTINUUM_NEVER_EXTS:-}"
+if [ -n "$NEVER_EXTS" ] && _ext_matches "$FILE_PATH" "$NEVER_EXTS"; then
+    finish "never-extension"
+fi
+
+if ! _ext_matches "$FILE_PATH" "$WIRED_EXTS"; then
+    if _ext_matches "$FILE_PATH" "$KNOWN_EXTS"; then
+        finish "language-available-not-wired"   # logged outcome; future: user-visible nudge text
+    fi
+    finish "not-indexed-extension"
+fi
 
 CODE_ROOT="${MEMCONTINUUM_CODE_ROOT:-}"
 if [ -z "$CODE_ROOT" ]; then

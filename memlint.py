@@ -42,7 +42,7 @@ from memidx import (
 _NOT_THIS_RE = re.compile(r"\bNOT\b|not this concept|Does NOT")
 
 
-def _symbol_declared(frag: str, text: str) -> bool:
+def _symbol_declared(frag: str, text: str, rel_path: str = "x.swift") -> bool:
     """Finding 5 (init/subscript/computed var/backtick names) AND finding 4
     (a QUALIFIED fragment, e.g. "Outer.outerFunc", must validate exactly
     like code-search's runtime concept attachment accepts it): this reuses
@@ -50,8 +50,15 @@ def _symbol_declared(frag: str, text: str) -> bool:
     predicate concept_matches_for_chunk uses at attach time -- rather than
     a from-scratch regex or a flattened bare-name set. Also never
     false-positives on a name that only appears inside a comment or string
-    literal (the chunker's mask already blanks those out)."""
-    return fragment_declared_in_text(frag, text)
+    literal (the chunker's mask already blanks those out).
+
+    `rel_path` (the record's own ref_path when the caller has one) is
+    forwarded to fragment_declared_in_text, which resolves the file's
+    language from it and asks THAT backend's own `declared_symbols` --
+    so a "#symbol" fragment on a Python implemented_by/tested_by path is
+    checked against Python's vocabulary, not Swift's, with no
+    language-specific branch anywhere on this path."""
+    return fragment_declared_in_text(frag, text, rel_path=rel_path)
 
 
 def lint_topic(path: Path, fm: dict) -> tuple[list[str], list[str]]:
@@ -186,7 +193,7 @@ def lint_concept(
                         text = full.read_text(encoding="utf-8", errors="ignore")
                     except OSError:
                         text = ""
-                    if not _symbol_declared(frag, text):
+                    if not _symbol_declared(frag, text, rel_path=ref_path):
                         errors.append(
                             f"{path}: {cid} {field} fragment {frag!r} is not a func/struct/enum/"
                             f"class/subscript declared in {ref_path!r}"

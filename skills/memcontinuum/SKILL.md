@@ -97,14 +97,56 @@ it completes the missing wiring — `memcontinuum-decide.sh wired` refuses
 anything short of `wiring=full` and names the missing hooks. Only after
 `repo-init.sh` reports full wiring does `decide.sh wired` succeed.
 
-Always dry-run first, show the plan, then run it:
+Always dry-run first, show the plan, then run it. **With a `--code-root`,
+never invoke `repo-init.sh` bare and interactive** — you (Claude Code's Bash
+tool) have no tty, so a bare run against a repo with any supported-language
+files hits `repo-init.sh`'s own `[ -t 0 ]` guard and fails with a clear
+message (exit 12) rather than hanging; the message itself names the driven
+path below. Run the driven flow instead:
 
-Run from the repo being initialized, WITHOUT --store, so the conventional
-default applies (and --claude-dir defaults to that repo's own .claude):
+1. Census the code root yourself, with the resolved python and `PYTHONPATH=`
+   cleared (same resolution `repo-init.sh` uses — `$MEMCONTINUUM_PYTHON`,
+   else `$ENGINE/.venv/bin/python`):
+   ```bash
+   PY="${MEMCONTINUUM_PYTHON:-$ENGINE/.venv/bin/python}"
+   PYTHONPATH= "$PY" "$ENGINE/memidx.py" code-census --root DIR --json
+   ```
+2. Present the three categories to the human in conversation, reading all
+   three straight out of that JSON — no separate list of known languages is
+   needed. Each key maps to `{"files": N, "status": "supported"|"unsupported"}`:
+   - **proposed** — `status: "supported"` with `files > 0` (the key is the
+     language name),
+   - **supported but not found** — `status: "supported"` with `files == 0`
+     (every language this engine version knows always appears, at zero when
+     the tree holds none of its files),
+   - **unsupported** — `status: "unsupported"` (the key is the extension, or
+     `"(no extension)"`).
+
+   Offer **skip**, **enable all detected**, or **select** a subset. A fourth
+   option: the human can name an extension the new-file reminder should
+   never mention again — pass `--never-ext .cs` (comma-separated for
+   several) alongside whichever language choice they made. It does not
+   change which languages are enabled.
+3. Run `repo-init.sh` with the human's answer turned into a flag — never
+   bare, and the flag goes on the `--dry-run` preview line too (the census
+   block, unlike the existence check, runs under `--dry-run` as well — a
+   preview command with no tty and no bypass flag hits the same `[ -t 0 ]`
+   guard and exit 12 that this whole driven flow exists to avoid):
+   ```bash
+   # human chose specific languages, or "enable all detected":
+   cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME --code-root DIR --langs "chosen,langs" --dry-run
+   cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME --code-root DIR --langs "chosen,langs"
+   # -- or, for "skip":
+   cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME --code-root DIR --non-interactive --dry-run
+   cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME --code-root DIR --non-interactive
+   ```
+
+For a rationale-only install (no `--code-root` at all), there is nothing to
+census or ask about — the bare two-line dry-run-then-run form is fine:
 
 ```bash
-cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME --code-root DIR --dry-run
-cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME --code-root DIR
+cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME --dry-run
+cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME
 ```
 
 Then record it. `--repo REPO` is REQUIRED here (fix-round-4 F2): `wired`,

@@ -163,7 +163,10 @@ def clean_env(**overrides):
     return env
 
 
-def run_script(script: Path, payload_text: str, env: dict, timeout: float = 6.0):
+def run_script(script: Path, payload_text: str, env: dict, timeout: float = 6.0, cwd=None):
+    """`cwd` defaults to the test process's own (subprocess.run's default) --
+    pass one explicitly for a test that needs the hook to run with specific
+    files sitting in the working directory (the noglob-guard test, T1)."""
     start = time.monotonic()
     proc = subprocess.run(
         [MC_BASH, str(script)],
@@ -172,6 +175,7 @@ def run_script(script: Path, payload_text: str, env: dict, timeout: float = 6.0)
         text=True,
         env=env,
         timeout=timeout,
+        cwd=None if cwd is None else str(cwd),
     )
     elapsed = time.monotonic() - start
     return proc, elapsed
@@ -3309,6 +3313,210 @@ class TestNewFileNudgeHook(unittest.TestCase):
         data = json.loads(proc.stdout)
         ctx = data["hookSpecificOutput"]["additionalContext"]
         self.assertIn("New source file under", ctx)
+
+    # -- Task 9: env-driven extension gate -----------------------------
+
+    def test_wired_env_lets_a_new_py_file_through(self):
+        """MEMCONTINUUM_LANG_EXTS="*.swift *.py" -- a new .py file must
+        pass the gate exactly like .swift does today (fires, nudged)."""
+        target = self.code_root / "new_thing.py"
+        env = self.base_env(MEMCONTINUUM_LANG_EXTS="*.swift *.py")
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = json.loads(proc.stdout)
+        ctx = data["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("New source file under", ctx)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=nudged", log_text)
+
+    def test_known_but_not_wired_extension_logs_language_available_not_wired(self):
+        """Only *.swift is wired; KNOWN includes *.py -- a new .py file
+        must stay silent on stdout (never nudged for an unwired language)
+        but log outcome=language-available-not-wired, not the plain
+        not-indexed-extension."""
+        target = self.code_root / "new_thing.py"
+        env = self.base_env(
+            MEMCONTINUUM_LANG_EXTS="*.swift",
+            MEMCONTINUUM_KNOWN_EXTS="*.swift *.py",
+        )
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "", proc.stdout)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=language-available-not-wired", log_text)
+        self.assertNotIn("outcome=not-indexed-extension", log_text)
+
+    def test_unknown_extension_logs_not_indexed_extension(self):
+        """A .rs file matches neither WIRED nor KNOWN -- plain
+        not-indexed-extension, same as any other non-indexed extension."""
+        target = self.code_root / "new_thing.rs"
+        env = self.base_env(
+            MEMCONTINUUM_LANG_EXTS="*.swift",
+            MEMCONTINUUM_KNOWN_EXTS="*.swift *.py",
+        )
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "", proc.stdout)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=not-indexed-extension", log_text)
+
+    def test_unset_lang_exts_env_is_byte_identical_legacy_swift_only(self):
+        """No MEMCONTINUUM_LANG_EXTS/MEMCONTINUUM_KNOWN_EXTS at all (the
+        un-re-rendered legacy wiring) must reproduce the original
+        hardcoded `*.swift`-only gate byte-identically: .swift still
+        fires, and an unwired extension with no KNOWN list falls straight
+        to not-indexed-extension (no language-available-not-wired, since
+        KNOWN falls back to WIRED when unset)."""
+        env = self.base_env()
+        self.assertNotIn("MEMCONTINUUM_LANG_EXTS", env)
+        self.assertNotIn("MEMCONTINUUM_KNOWN_EXTS", env)
+
+        swift_target = self.code_root / "Legacy.swift"
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(swift_target)), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = json.loads(proc.stdout)
+        ctx = data["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("New source file under", ctx)
+
+        py_target = self.code_root / "legacy_thing.py"
+        proc2, _elapsed2 = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(py_target)), env)
+        self.assertEqual(proc2.returncode, 0, proc2.stderr)
+        self.assertEqual(proc2.stdout.strip(), "", proc2.stdout)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=not-indexed-extension", log_text)
+        self.assertNotIn("outcome=language-available-not-wired", log_text)
+
+    def test_explicit_empty_lang_exts_matches_nothing_not_the_swift_fallback(self):
+        """Ruling 6 (Task 10 fix round): an EXPLICITLY empty
+        MEMCONTINUUM_LANG_EXTS (rendered as `MEMCONTINUUM_LANG_EXTS=''` for
+        language-less wiring, never omitted) must NOT fall back to the
+        legacy `*.swift` default the way UNSET does --
+        `${MEMCONTINUUM_LANG_EXTS-*.swift}` (no colon) only substitutes on
+        unset, so a set-but-empty value matches nothing and a new .swift
+        file stays silent with outcome=not-indexed-extension. Distinct
+        from test_unset_lang_exts_env_is_byte_identical_legacy_swift_only,
+        which covers the UNSET case and is unchanged by this fix."""
+        env = self.base_env(MEMCONTINUUM_LANG_EXTS="")
+        self.assertIn("MEMCONTINUUM_LANG_EXTS", env)
+        self.assertEqual(env["MEMCONTINUUM_LANG_EXTS"], "")
+
+        target = self.code_root / "NewThing.swift"
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "", proc.stdout)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=not-indexed-extension", log_text)
+        self.assertNotIn("outcome=nudged", log_text)
+
+    def test_explicit_empty_lang_exts_with_known_exts_logs_language_available_not_wired(self):
+        """The actual production shape Task 10 renders for language-less
+        wiring with a real code root: MEMCONTINUUM_LANG_EXTS='' alongside
+        a non-empty MEMCONTINUUM_KNOWN_EXTS (always rendered, per Task
+        10). A new .py file (KNOWN but not WIRED, since WIRED is
+        deliberately empty) must log language-available-not-wired, not
+        the plain not-indexed-extension, and never nudge."""
+        env = self.base_env(
+            MEMCONTINUUM_LANG_EXTS="",
+            MEMCONTINUUM_KNOWN_EXTS="*.py *.swift",
+        )
+        target = self.code_root / "new_thing.py"
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "", proc.stdout)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=language-available-not-wired", log_text)
+        self.assertNotIn("outcome=not-indexed-extension", log_text)
+
+    # --- T1: the noglob guard, asserted for what it is actually for -------
+
+    def _cwd_with_matching_files(self):
+        """A working directory holding files that MATCH the glob list
+        (a.py, b.swift). _ext_matches expands `$2` unquoted to split the
+        space-separated pattern list on IFS, so without `set -f` bracketing
+        the loop the shell would glob-expand `*.py`/`*.swift` against
+        exactly these files and compare the path against filenames instead
+        of patterns."""
+        cwd = Path(self.td) / "globbable"
+        cwd.mkdir(exist_ok=True)
+        (cwd / "a.py").write_text("x = 1\n")
+        (cwd / "b.swift").write_text("// x\n")
+        return cwd
+
+    def test_noglob_guard_still_matches_with_matching_files_in_cwd(self):
+        env = self.base_env(MEMCONTINUUM_LANG_EXTS="*.py *.swift")
+        target = self.code_root / "Sources" / "NewThing.swift"
+        proc, _elapsed = run_script(
+            NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env,
+            cwd=self._cwd_with_matching_files(),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = json.loads(proc.stdout or "{}")
+        self.assertIn(
+            "New source file under",
+            data.get("hookSpecificOutput", {}).get("additionalContext", ""),
+            proc.stdout,
+        )
+        self.assertIn("outcome=nudged", (self.home / "hook.log").read_text())
+
+    def test_noglob_guard_still_rejects_with_matching_files_in_cwd(self):
+        """The other half of the same guard: a non-matching path must stay
+        non-matching even when the cwd holds files the patterns would
+        expand to. Without `set -f`, `*.py` expands to the literal `a.py`
+        sitting here, and `case "$FILE_PATH" in a.py)` no longer means what
+        the pattern list said."""
+        env = self.base_env(MEMCONTINUUM_LANG_EXTS="*.py *.swift")
+        target = self.code_root / "Notes.md"
+        proc, _elapsed = run_script(
+            NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env,
+            cwd=self._cwd_with_matching_files(),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "", proc.stdout)
+        self.assertIn("outcome=not-indexed-extension", (self.home / "hook.log").read_text())
+
+    # --- B4: MEMCONTINUUM_NEVER_EXTS -------------------------------------
+
+    def test_never_extension_finishes_silently_before_the_wired_gate(self):
+        """B4: an extension the human said "never" to is checked FIRST and
+        finishes with its own outcome -- even if it would otherwise be a
+        wired, nudge-worthy extension."""
+        env = self.base_env(
+            MEMCONTINUUM_LANG_EXTS="*.py *.swift *.cs",
+            MEMCONTINUUM_KNOWN_EXTS="*.py *.swift",
+            MEMCONTINUUM_NEVER_EXTS="*.cs",
+        )
+        target = self.code_root / "Program.cs"
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "", proc.stdout)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=never-extension", log_text)
+        self.assertNotIn("outcome=nudged", log_text)
+
+    def test_never_extension_does_not_silence_other_extensions(self):
+        env = self.base_env(
+            MEMCONTINUUM_LANG_EXTS="*.py *.swift",
+            MEMCONTINUUM_NEVER_EXTS="*.cs",
+        )
+        target = self.code_root / "NewThing.swift"
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("New source file under", proc.stdout, proc.stdout)
+
+    def test_unset_never_exts_changes_nothing(self):
+        env = self.base_env(MEMCONTINUUM_LANG_EXTS="*.swift")
+        self.assertNotIn("MEMCONTINUUM_NEVER_EXTS", env)
+        target = self.code_root / "NewThing.swift"
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("New source file under", proc.stdout, proc.stdout)
+
+    def test_empty_never_exts_matches_nothing(self):
+        env = self.base_env(MEMCONTINUUM_LANG_EXTS="*.swift", MEMCONTINUUM_NEVER_EXTS="")
+        target = self.code_root / "NewThing.swift"
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("New source file under", proc.stdout, proc.stdout)
 
 
 if __name__ == "__main__":
