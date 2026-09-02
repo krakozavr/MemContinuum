@@ -29,6 +29,7 @@ import subprocess
 import sys
 import time
 from collections import Counter
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import yaml
@@ -2683,6 +2684,373 @@ def cmd_code_search(args) -> int:
 
 
 # ---------------------------------------------------------------------------
+# stats -- the liveness metric (backlog SS2 / INC-0103 / INC-0105)
+# ---------------------------------------------------------------------------
+#
+# INC-0103 (forced retrieval dead on arrival) and INC-0105 (the write-side
+# nudge misrouted a whole day of rulings into the wrong folder) share one
+# root cause: every hook fails open by design, and there was no liveness
+# signal -- a dead hook and a healthy hook that found nothing look
+# identical from inside a session. `stats` reads hook.log (never writes
+# anything) and reports, per project, whether the read side (pre-edit
+# lookups) and the write side (nudges -> actual store commits) are alive.
+#
+# hook.log line shapes this parser has to handle, none of them optional:
+#   <ts> userprompt outcome=X ... session=S project=P
+#   <ts> ledger outcome=appended kind=code|store ... session=S project=P
+#   <ts> sessionstart outcome=X ... session=S source=... project=P
+#   <ts> sessionend outcome=X session=S project=P
+#   <ts> precompact outcome=X session=S project=P
+#   <ts> newfile-nudge outcome=X project=P file=...
+#   <ts> outcome=matched elapsed=Ns project=P file=...      (pre-edit-chain.sh --
+#        no hook-type keyword; own independent logger, distinguished below)
+#   payload_keys=... project=P                               (no timestamp)
+#   <ts> outcome=watchdog-killed hook=<name>                  (mc-watchdog.sh's
+#        own expiry line; no offset, no project= -- launched before MC_PROJECT
+#        is ever computed. Left alone: see the liveness-stats report.)
+#   <ts> memlib: no python resolved (...) project=P
+#   arbitrary python tracebacks landing via `2>>"$MC_LOG"`
+#
+# Rule (never raise on any of the above): the first whitespace-delimited
+# token must parse as an ISO timestamp WITH a UTC offset via
+# datetime.fromisoformat, else the whole line is silently skipped -- this
+# is what makes the payload_keys=/watchdog-killed/traceback shapes above
+# harmless instead of crashes. A line without `project=` is bucketed under
+# the literal project name "(unknown)" rather than dropped, so pre-fix
+# history (or any other logger that never learns project=) still shows up
+# somewhere instead of silently vanishing from every count.
+_HOOK_LOG_KEYWORDS = (
+    "userprompt", "ledger", "sessionstart", "sessionend", "precompact",
+    "newfile-nudge",
+)
+UNKNOWN_STATS_PROJECT = "(unknown)"
+
+
+def _parse_hook_log_ts(token: str):
+    """ISO-with-offset only (`date -Iseconds`'s own format, e.g.
+    2026-09-01T12:04:12-04:00). Returns None for anything else: a naive
+    timestamp (no offset -- can't be compared to `now` safely), a bare word
+    like `payload_keys=...` or a python traceback's first token, etc."""
+    try:
+        ts = datetime.fromisoformat(token)
+    except (ValueError, TypeError):
+        return None
+    if ts.tzinfo is None:
+        return None
+    return ts
+
+
+def _hook_log_line_kind(rest: str) -> str:
+    """Classify a hook.log line's PRODUCER by shape, never by content.
+    `rest` is everything after the leading timestamp token.
+
+    pre-edit-chain.sh's finish() is the only producer whose line starts
+    with a bare `outcome=` (no hook-type keyword) AND carries `elapsed=`
+    right after it -- `outcome=$outcome elapsed=${elapsed}s project=...
+    file=...`. memlib.sh's OWN raw outcome lines (mc_update_state_json's
+    lock-timeout/lock-open-failed/state-dir-failed, logged via mc_log with
+    no hook-type prefix either) never carry `elapsed=` -- without that
+    second check those would misclassify as pre-edit lookups and silently
+    suppress the INC-0103 FLAG (a real false negative, not a cosmetic
+    miscount)."""
+    stripped = rest.strip()
+    if stripped.startswith("outcome=") and " elapsed=" in stripped:
+        return "pre-edit"
+    for kw in _HOOK_LOG_KEYWORDS:
+        if stripped.startswith(kw + " ") or stripped == kw:
+            return kw
+    return "other"
+
+
+def _new_stats_bucket():
+    return {
+        "sessions": set(),
+        "user_prompts": 0,
+        "pre_edit": Counter(),
+        "ledger": Counter(),
+        "nudges": Counter(),
+        "newfile": Counter(),
+        "lines": 0,
+    }
+
+
+_FIELD_RE = re.compile(r"(?:^|\s)(\w+)=(\S*)")
+
+
+def _hook_log_fields(rest: str) -> dict:
+    """Every producer writes space-separated `key=value` tokens (a few
+    values may be empty, e.g. `session=` on a payload missing session_id).
+    A generic key=value scan is more robust than one regex per field name,
+    and costs nothing extra -- every line here is short."""
+    return {k: v for k, v in _FIELD_RE.findall(rest)}
+
+
+def _scan_hook_log(log_path: Path, cutoff: datetime, now: datetime):
+    """Returns (buckets: {project: bucket}, unknown_lines: int,
+    projects_seen: set[str], unparseable_lines: int). Never raises: an
+    unreadable file, a non-UTF-8 byte, or any single malformed line is
+    tolerated -- this function's caller (cmd_stats) still wraps the whole
+    thing in case a genuinely unexpected failure shows up, per this repo's
+    fail-open rule for every hook.log consumer.
+
+    `unparseable_lines` is this metric's OWN self-liveness signal (a
+    reviewer finding, not in the original spec): every line whose leading
+    token does not parse as an ISO-with-offset timestamp is silently
+    skipped by design (payload_keys=..., a python traceback, mc-watchdog's
+    offset-less watchdog-killed line -- see the module comment above). That
+    silence is exactly right for THOSE known shapes, but it would also hide
+    a genuinely broken host -- e.g. `date -Iseconds` unsupported, falling
+    back to `date`'s bare `Tue Sep  2 ...` on every real hook.log write --
+    which would otherwise report a healthy-looking all-zero stats output,
+    indistinguishable from a dead system. Counting it separately (never
+    silently) means an operator staring at zero counts can tell "nothing
+    happened" apart from "the metric itself can't read this log"."""
+    buckets: dict[str, dict] = {}
+    unknown_lines = 0
+    unparseable_lines = 0
+    projects_seen: set[str] = set()
+
+    try:
+        raw_lines = log_path.read_text(errors="replace").splitlines()
+    except OSError:
+        return buckets, unknown_lines, projects_seen, unparseable_lines, unparseable_lines
+
+    for line in raw_lines:
+        if not line.strip():
+            continue
+        parts = line.split(" ", 1)
+        ts = _parse_hook_log_ts(parts[0])
+        if ts is None:
+            unparseable_lines += 1
+            continue
+        if ts < cutoff or ts > now:
+            continue
+        rest = parts[1] if len(parts) > 1 else ""
+        fields = _hook_log_fields(rest)
+        project = fields.get("project") or UNKNOWN_STATS_PROJECT
+        projects_seen.add(project)
+        if project == UNKNOWN_STATS_PROJECT:
+            unknown_lines += 1
+
+        bucket = buckets.setdefault(project, _new_stats_bucket())
+        bucket["lines"] += 1
+
+        kind = _hook_log_line_kind(rest)
+        outcome = fields.get("outcome", "")
+
+        if kind == "sessionstart":
+            session = fields.get("session")
+            if session:
+                bucket["sessions"].add(session)
+        elif kind == "userprompt":
+            bucket["user_prompts"] += 1
+            if outcome == "injected":
+                bucket["nudges"]["coverage_injected"] += 1
+            elif outcome == "lookback-injected":
+                bucket["nudges"]["lookback_injected"] += 1
+            elif outcome == "no-evidence":
+                bucket["nudges"]["no_evidence"] += 1
+            elif outcome == "duplicate-delivery":
+                bucket["nudges"]["duplicate_delivery"] += 1
+        elif kind == "ledger":
+            if outcome == "appended":
+                line_kind = fields.get("kind", "")
+                if line_kind == "code":
+                    bucket["ledger"]["code"] += 1
+                elif line_kind == "store":
+                    bucket["ledger"]["store"] += 1
+        elif kind == "pre-edit":
+            if outcome == "matched":
+                bucket["pre_edit"]["matched"] += 1
+            elif outcome == "no-match":
+                bucket["pre_edit"]["no_match"] += 1
+            else:
+                bucket["pre_edit"]["other"] += 1
+        elif kind == "newfile-nudge":
+            key = outcome.replace("-", "_")
+            if key in ("nudged", "not_indexed_extension", "language_available_not_wired", "never_extension"):
+                bucket["newfile"][key] += 1
+        # sessionend/precompact/other: counted in `lines`, no dedicated
+        # metric asked for by the spec.
+
+    return buckets, unknown_lines, projects_seen, unparseable_lines
+
+
+def _count_store_commits(store_dir: str, cutoff: datetime):
+    """`git -C STORE log --since=<cutoff> --oneline` line count. None (not
+    0) on any failure -- STORE not a repo, git missing, timeout -- so the
+    caller can tell "unmeasured" apart from "measured zero" (the INC-0105
+    FLAG needs a real zero, never a guess)."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(store_dir), "log", f"--since={cutoff.isoformat()}", "--oneline"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return len([l for l in result.stdout.splitlines() if l.strip()])
+
+
+def _stats_report(args, buckets, unknown_lines, projects_seen, now, cutoff, store_commits, unparseable_lines):
+    b = buckets.get(args.project, _new_stats_bucket())
+
+    pre_edit = b["pre_edit"]
+    pre_edit_total = sum(pre_edit.values())
+    ledger = b["ledger"]
+    nudges = b["nudges"]
+    nudges_total = nudges["coverage_injected"] + nudges["lookback_injected"]
+    newfile = b["newfile"]
+
+    flags = []
+    if store_commits is not None and nudges_total >= 3 and store_commits == 0:
+        flags.append(
+            f"FLAG: write side silent — {nudges_total} nudges, 0 store writes "
+            f"in {args.days}d (INC-0105 class)"
+        )
+    if b["user_prompts"] >= 10 and pre_edit_total == 0:
+        flags.append("FLAG: read side silent (INC-0103 class)")
+
+    result = {
+        "project": args.project,
+        "days": args.days,
+        "window_start": cutoff.isoformat(),
+        "window_end": now.isoformat(),
+        "sessions_seen": len(b["sessions"]),
+        "user_prompts": b["user_prompts"],
+        "pre_edit": {
+            "matched": pre_edit["matched"],
+            "no_match": pre_edit["no_match"],
+            "other": pre_edit["other"],
+            "total": pre_edit_total,
+        },
+        "ledger_appends": {
+            "code": ledger["code"],
+            "store": ledger["store"],
+        },
+        "nudges": {
+            "coverage_injected": nudges["coverage_injected"],
+            "lookback_injected": nudges["lookback_injected"],
+            "no_evidence": nudges["no_evidence"],
+            "duplicate_delivery": nudges["duplicate_delivery"],
+            "total": nudges_total,
+        },
+        "newfile_nudge": {
+            "nudged": newfile["nudged"],
+            "not_indexed_extension": newfile["not_indexed_extension"],
+            "language_available_not_wired": newfile["language_available_not_wired"],
+            "never_extension": newfile["never_extension"],
+        },
+        "store_commits": store_commits,
+        "unknown_lines": unknown_lines,
+        "unparseable_lines": unparseable_lines,
+        "projects_seen": sorted(projects_seen),
+        "flags": flags,
+    }
+    return result
+
+
+def cmd_stats(args) -> int:
+    """`memidx.py stats --project P [--days N] [--home DIR] [--store DIR]
+    [--json]` -- the liveness metric (backlog SS2, INC-0103/INC-0105): reads
+    hook.log and reports, per project, whether the read side (pre-edit
+    lookups) and the write side (nudges -> real store commits) are alive.
+    Never touches hook.log or anything else -- read-only, exit 0 always
+    (missing hook.log, unreadable file, a bad --store, anything: this
+    prints one line and returns 0, on the same fail-open principle every
+    hook in this repo already follows -- a broken liveness check must never
+    itself become a second silent failure mode).
+
+    --store is optional: without it, store commits are UNMEASURED (None,
+    printed as "?"/"not measured"), and the INC-0105 write-side-silent FLAG
+    is never raised -- that FLAG asserts a real zero, never a guess.
+    """
+    # Everything -- including the final print block -- lives inside this one
+    # try/except: a printing failure (e.g. a non-UTF-8 stdout choking on the
+    # —/→ glyphs below) must fail open exactly like a parsing failure would,
+    # never a traceback/exit 1 from what is supposed to be the tool that
+    # catches silent failures.
+    try:
+        home = Path(args.home).expanduser() if args.home else Path(
+            os.environ.get("MEMCONTINUUM_HOME", str(Path.home() / ".memcontinuum"))
+        )
+        log_path = home / "hook.log"
+
+        if args.now:
+            now = _parse_hook_log_ts(args.now) or datetime.now(timezone.utc)
+        else:
+            now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(days=args.days)
+
+        if not log_path.exists():
+            print(f"no hook.log at {log_path}")
+            return 0
+
+        buckets, unknown_lines, projects_seen, unparseable_lines = _scan_hook_log(log_path, cutoff, now)
+
+        store_commits = None
+        if args.store:
+            store_commits = _count_store_commits(args.store, cutoff)
+
+        result = _stats_report(
+            args, buckets, unknown_lines, projects_seen, now, cutoff, store_commits, unparseable_lines
+        )
+
+        if args.json:
+            print(json.dumps(result, indent=2))
+            return 0
+
+        print(f"MemContinuum liveness stats — project={result['project']} days={result['days']}")
+        print(f"window: {result['window_start']} .. {result['window_end']}")
+        print()
+        print(f"sessions seen: {result['sessions_seen']}")
+        print(f"user prompts: {result['user_prompts']}")
+        print()
+        pe = result["pre_edit"]
+        print(f"pre-edit lookups: matched={pe['matched']} no-match={pe['no_match']} "
+              f"other={pe['other']} (total {pe['total']})")
+        la = result["ledger_appends"]
+        print(f"ledger appends: code={la['code']} store={la['store']}")
+        print()
+        nu = result["nudges"]
+        print(f"write-side nudges: coverage-injected={nu['coverage_injected']} "
+              f"lookback-injected={nu['lookback_injected']} no-evidence={nu['no_evidence']} "
+              f"duplicate-delivery={nu['duplicate_delivery']}")
+        nf = result["newfile_nudge"]
+        print(f"new-file nudges: nudged={nf['nudged']} "
+              f"not-indexed-extension={nf['not_indexed_extension']} "
+              f"language-available-not-wired={nf['language_available_not_wired']} "
+              f"never-extension={nf['never_extension']}")
+        print()
+        if result["store_commits"] is None:
+            print("store commits in window: not measured (pass --store to measure)")
+        else:
+            print(f"store commits in window: {result['store_commits']}")
+        print(f"store-kind ledger appends: {la['store']}")
+        print()
+        store_rhs = "?" if result["store_commits"] is None else str(result["store_commits"])
+        suffix = "  (pass --store to measure)" if result["store_commits"] is None else ""
+        print(f"nudges → store writes: {nu['total']} → {store_rhs}{suffix}")
+        for flag in result["flags"]:
+            print(flag)
+        print()
+        print(f"(unknown) lines skipped (no project= in this window): {result['unknown_lines']}")
+        if result["unparseable_lines"]:
+            print(
+                f"unparseable lines skipped (no ISO-with-offset timestamp -- self-liveness "
+                f"signal, see --help): {result['unparseable_lines']}"
+            )
+        if result["projects_seen"]:
+            print(f"projects seen in window: {', '.join(result['projects_seen'])}")
+        return 0
+    except Exception as e:  # fail-open: a broken liveness check is not
+        # allowed to become a second silent failure mode.
+        print(f"stats: internal error ({e}) -- exit 0 (fail-open)")
+        return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -2786,6 +3154,54 @@ def main(argv=None) -> int:
     p_code_census.add_argument("--root", required=True)
     p_code_census.add_argument("--json", action="store_true")
     p_code_census.set_defaults(func=cmd_code_census)
+
+    p_stats = sub.add_parser(
+        "stats",
+        help="liveness metric from hook.log: per-project read-side (pre-edit "
+             "lookup) and write-side (nudge-to-store-commit) activity in a "
+             "trailing window, with FLAG lines when either side goes silent "
+             "-- the INC-0103/INC-0105 lesson: a dead or misrouted write side "
+             "must be visible within a day, not a week.",
+        description=(
+            "Reads $MEMCONTINUUM_HOME/hook.log (never writes anything) and reports, "
+            "for one project, whether the read side (pre-edit lookups) and the write "
+            "side (write-side nudges -> real store commits) are actually alive in a "
+            "trailing window -- the liveness signal INC-0103 (forced retrieval dead "
+            "on arrival for a week) and INC-0105 (a day of rulings misrouted into the "
+            "wrong folder) both lacked: every hook fails open by design, so a dead "
+            "hook and a healthy hook that found nothing look identical from inside a "
+            "session.\n\n"
+            "Reports: sessions seen, user prompts, pre-edit lookups (matched/"
+            "no-match/other), ledger appends (code/store), write-side nudges "
+            "(coverage-injected/lookback-injected/no-evidence/duplicate-delivery), "
+            "new-file nudge outcomes, store commits in the window (only with --store), "
+            "the 'nudges -> store writes' ratio, and two FLAG lines: "
+            "'write side silent' (INC-0105 class: >=3 nudges but 0 store commits -- "
+            "requires --store, since this asserts a real measured zero, never a "
+            "guess) and 'read side silent' (INC-0103 class: >=10 user prompts but 0 "
+            "pre-edit lookups of any outcome).\n\n"
+            "Lines with no project= token (pre-fix history, or any other logger that "
+            "never learns it) are grouped under the literal project name "
+            "'(unknown)' rather than dropped -- pass --project '(unknown)' to see "
+            "them. Fail-open throughout: a missing hook.log, an unreadable file, a "
+            "bad --store path, or any unexpected error prints one line and exits 0."
+        ),
+    )
+    p_stats.add_argument("--project", default=DEFAULT_PROJECT, help="project namespace to report on (default: %(default)s)")
+    p_stats.add_argument("--days", type=int, default=7, help="trailing window size in days (default: %(default)s)")
+    p_stats.add_argument(
+        "--home", default=None,
+        help="base dir holding hook.log (default: $MEMCONTINUUM_HOME or ~/.memcontinuum)",
+    )
+    p_stats.add_argument(
+        "--store", default=None,
+        help="store markdown root's git repo -- counts real commits in the window "
+             "(git log --since); without it, store writes are unmeasured and the "
+             "write-side-silent FLAG (INC-0105 class) is never raised",
+    )
+    p_stats.add_argument("--json", action="store_true", help="machine-readable output instead of plain text")
+    p_stats.add_argument("--now", default=None, help=argparse.SUPPRESS)
+    p_stats.set_defaults(func=cmd_stats)
 
     args = parser.parse_args(argv)
     return args.func(args)

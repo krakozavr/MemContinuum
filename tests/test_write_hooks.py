@@ -553,6 +553,19 @@ class TestLedgerPostEdit(HookTestBase):
         self.assertEqual(entry["kind"], "code")
         self.assertTrue(entry.get("content_sha256"))
 
+    def test_log_line_carries_project(self):
+        """Liveness metric fix: every ledger-post-edit.sh outcome line must
+        carry project=<MC_PROJECT> (via mc_log in memlib.sh)."""
+        session_id = "s-ledger-project"
+        fpath = str(self.code_root / "src" / "mapped.py")
+        payload = self.post_tool_use_payload(session_id, fpath)
+        run_script(LEDGER_HOOK, payload, self.base_env())
+        log_text = (self.home / "hook.log").read_text()
+        matching = [l for l in log_text.splitlines() if "ledger" in l]
+        self.assertTrue(matching)
+        for line in matching:
+            self.assertIn(f"project={self.project}", line, line)
+
     def test_appends_path_under_store_root(self):
         session_id = "s-ledger-store"
         fpath = str(self.store_root / "topics" / "testing" / "mapped-topic.md")
@@ -991,6 +1004,19 @@ class TestPrecompactPersist(HookTestBase):
         self.assertNotIn("hookSpecificOutput", proc.stdout)
         self.assertNotIn("decision", proc.stdout)
 
+    def test_log_line_carries_project(self):
+        """Liveness metric fix: every precompact-persist.sh outcome line
+        must carry project=<MC_PROJECT> (via mc_log in memlib.sh)."""
+        session_id = "s-precompact-project"
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+        payload = self.pre_compact_payload(session_id)
+        run_script(PRECOMPACT_HOOK, payload, self.base_env())
+        log_text = (self.home / "hook.log").read_text()
+        matching = [l for l in log_text.splitlines() if "precompact" in l]
+        self.assertTrue(matching)
+        for line in matching:
+            self.assertIn(f"project={self.project}", line, line)
+
     def test_computes_pending_evidence(self):
         session_id = "s-precompact-pending"
         self.seed_ledger(
@@ -1135,6 +1161,17 @@ class TestSessionStartRemind(HookTestBase):
         state = self.load_state(session_id)
         self.assertEqual(state.get("start_code_sha"), git_head(self.code_root))
         self.assertEqual(state.get("start_store_sha"), git_head(self.store_root))
+
+    def test_log_line_carries_project(self):
+        """Liveness metric fix: every sessionstart-remind.sh outcome line
+        must carry project=<MC_PROJECT> (via mc_log in memlib.sh)."""
+        session_id = "s-start-project"
+        run_script(SESSIONSTART_HOOK, self.session_start_payload(session_id, "startup"), self.base_env())
+        log_text = (self.home / "hook.log").read_text()
+        matching = [l for l in log_text.splitlines() if "sessionstart" in l]
+        self.assertTrue(matching)
+        for line in matching:
+            self.assertIn(f"project={self.project}", line, line)
 
     def test_resume_does_not_reset_existing_start_shas(self):
         session_id = "s-start-resume"
@@ -1506,6 +1543,22 @@ class TestUserPromptRemind(HookTestBase):
         self.assertIn("Coverage signal", proc.stdout)
         log_text = (self.home / "hook.log").read_text()
         self.assertIn("outcome=injected", log_text)
+
+    def test_log_line_carries_project(self):
+        """Liveness metric fix (INC-0103/INC-0105): every hook.log line must
+        carry `project=<MC_PROJECT>` so memidx.py stats can group by
+        project. userprompt-remind.sh sources memlib.sh, so this is really
+        pinning mc_log's own project= append -- every outcome line from this
+        hook (including agent-source and duplicate-delivery, not just
+        injected) must carry it."""
+        session_id = "s-prompt-project"
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+        run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.base_env())
+        log_text = (self.home / "hook.log").read_text()
+        matching = [l for l in log_text.splitlines() if "userprompt" in l]
+        self.assertTrue(matching)
+        for line in matching:
+            self.assertIn(f"project={self.project}", line, line)
 
     def test_arbitrary_source_field_does_not_block(self):
         """fix-round 2026-08-31: the source=="user" gate is gone -- a
@@ -2576,6 +2629,17 @@ class TestSessionEndStamp(HookTestBase):
         self.assertIn("ended_at", after)
         self.assertEqual(after["ledger"], before["ledger"])
 
+    def test_log_line_carries_project(self):
+        """Liveness metric fix: every sessionend-stamp.sh outcome line must
+        carry project=<MC_PROJECT> (via mc_log in memlib.sh)."""
+        session_id = "s-end-project"
+        run_script(SESSIONEND_HOOK, self.session_end_payload(session_id), self.base_env())
+        log_text = (self.home / "hook.log").read_text()
+        matching = [l for l in log_text.splitlines() if "sessionend" in l]
+        self.assertTrue(matching)
+        for line in matching:
+            self.assertIn(f"project={self.project}", line, line)
+
     def test_store_byte_identical(self):
         session_id = "s-end-bytesafe"
         self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
@@ -2663,6 +2727,44 @@ class TestMemlib(unittest.TestCase):
         text = MEMLIB.read_text()
         self.assertNotIn("MEMCONTINUUM_ROOT\" >", text)
         self.assertNotIn(">\"$MEMCONTINUUM_ROOT", text)
+
+    def test_mc_log_appends_project(self):
+        """Liveness metric fix: mc_log (the shared logging path every
+        memlib.sh-sourcing hook uses) must append project=<MC_PROJECT> to
+        every line it writes."""
+        td = tempfile.mkdtemp(prefix="memcontinuum-memlib-mclog-")
+        self.addCleanup(shutil.rmtree, td, ignore_errors=True)
+        home = Path(td) / "home"
+        home.mkdir()
+        caller = Path(td) / "caller.sh"
+        caller.write_text(
+            f'#!/usr/bin/env bash\nset -u\nsource "{MEMLIB}"\nmc_log "probe outcome=ok"\n'
+        )
+        env = clean_env(MEMCONTINUUM_HOME=str(home), MEMCONTINUUM_PROJECT="mclog-proj")
+        subprocess.run([MC_BASH, str(caller)], capture_output=True, text=True, env=env, timeout=10)
+        log_text = (home / "hook.log").read_text()
+        self.assertIn("project=mclog-proj", log_text)
+
+    def test_no_python_resolved_line_carries_project(self):
+        """The fail-open 'no python resolved' diagnostic (memlib.sh, printed
+        BEFORE mc_log even exists) must also carry project= -- it is a real
+        hook.log line and would otherwise silently escape the liveness
+        metric's 'EVERY line carries project=' guarantee."""
+        td = tempfile.mkdtemp(prefix="memcontinuum-memlib-nopy-")
+        self.addCleanup(shutil.rmtree, td, ignore_errors=True)
+        home = Path(td) / "home"
+        home.mkdir()
+        caller = Path(td) / "caller.sh"
+        caller.write_text(f'#!/usr/bin/env bash\nset -u\nsource "{MEMLIB}"\n')
+        env = clean_env(
+            MEMCONTINUUM_HOME=str(home),
+            MEMCONTINUUM_PROJECT="nopy-proj",
+            MEMCONTINUUM_PYTHON="/no/such/python",
+        )
+        subprocess.run([MC_BASH, str(caller)], capture_output=True, text=True, env=env, timeout=10)
+        log_text = (home / "hook.log").read_text()
+        self.assertIn("no python resolved", log_text)
+        self.assertIn("project=nopy-proj", log_text)
 
 
 # ---------------------------------------------------------------------------
@@ -3301,6 +3403,25 @@ class TestNewFileNudgeHook(unittest.TestCase):
         self.assertEqual(len(lines), 1, log_text)
         self.assertIn("newfile-nudge", lines[0])
         self.assertIn("outcome=nudged", lines[0])
+
+    def test_log_line_carries_project(self):
+        """Liveness metric fix: newfile-nudge.sh doesn't source memlib.sh
+        (its own independent logger, like pre-edit-chain.sh), so it needs
+        its own project= resolution -- MEMCONTINUUM_PROJECT when set."""
+        target = self.code_root / "WithProject.swift"
+        env = self.base_env(MEMCONTINUUM_PROJECT="explicit-proj")
+        run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("project=explicit-proj", log_text)
+
+    def test_log_line_project_defaults_when_unset(self):
+        """No MEMCONTINUUM_PROJECT and no MEMCONTINUUM_ROOT configured (this
+        class's base_env sets neither) -- must still log project=default,
+        never an empty/missing project= token."""
+        target = self.code_root / "DefaultProject.swift"
+        run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), self.base_env())
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("project=default", log_text)
 
     def test_never_writes_under_code_root_or_store(self):
         target = self.code_root / "SideEffectFree.swift"

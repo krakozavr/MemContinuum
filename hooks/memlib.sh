@@ -97,12 +97,10 @@ fi
 MC_LOG="$MEMCONTINUUM_HOME/hook.log"
 mkdir -p "$MEMCONTINUUM_HOME" 2>/dev/null || true
 
-if [ ! -x "$MC_PY" ]; then
-    printf '%s memlib: no python resolved (checked MEMCONTINUUM_PYTHON, %s, %s) -- run memcontinuum-setup.sh\n' \
-        "$(date -Iseconds 2>/dev/null || date)" "$MEMCONTINUUM_HOME/config.sh" \
-        "$MC_LIB_DIR/../.venv/bin/python" >>"$MC_LOG" 2>/dev/null || true
-fi
-
+# Project resolution moved ABOVE the "no python resolved" check (liveness
+# metric fix: memidx.py stats needs `project=` on every hook.log line,
+# including this fail-open one -- MC_PROJECT costs nothing to compute this
+# early, it is env/basename-only, no python involved).
 MC_PROJECT="${MEMCONTINUUM_PROJECT:-}"
 if [ -z "$MC_PROJECT" ]; then
     if [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
@@ -112,12 +110,22 @@ if [ -z "$MC_PROJECT" ]; then
     fi
 fi
 
+if [ ! -x "$MC_PY" ]; then
+    printf '%s memlib: no python resolved (checked MEMCONTINUUM_PYTHON, %s, %s) -- run memcontinuum-setup.sh project=%s\n' \
+        "$(date -Iseconds 2>/dev/null || date)" "$MEMCONTINUUM_HOME/config.sh" \
+        "$MC_LIB_DIR/../.venv/bin/python" "$MC_PROJECT" >>"$MC_LOG" 2>/dev/null || true
+fi
+
 MC_DB_PATH="$MEMCONTINUUM_HOME/$MC_PROJECT.sqlite"
 
-# mc_log MESSAGE -- append one timestamped line to hook.log. Never fails the
-# calling hook (logging failure is swallowed, not propagated).
+# mc_log MESSAGE -- append one timestamped line to hook.log, with
+# `project=$MC_PROJECT` always appended at the end (liveness metric:
+# memidx.py stats groups hook.log by project; every line from this shared
+# path must carry one, matching pre-edit-chain.sh's own independent logger,
+# which already stamps project= -- see that file's finish()). Never fails
+# the calling hook (logging failure is swallowed, not propagated).
 mc_log() {
-    printf '%s %s\n' "$(date -Iseconds 2>/dev/null || date)" "$1" >>"$MC_LOG" 2>/dev/null || true
+    printf '%s %s project=%s\n' "$(date -Iseconds 2>/dev/null || date)" "$1" "$MC_PROJECT" >>"$MC_LOG" 2>/dev/null || true
 }
 
 # mc_state_dir_for PROJECT

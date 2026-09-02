@@ -151,3 +151,28 @@ case "$DECISION" in
         ;;
 esac
 echo "state=$STATE"
+
+# Liveness metric hint (backlog SS2, INC-0103/INC-0105): one line naming the
+# exact command that reports whether this repo's read/write sides are still
+# alive. No python runs here -- this script stays python-free, per its own
+# contract -- it just names the interpreter/engine/project the rest of this
+# script already resolved. `python`/`engine` fall back to a python-free
+# guess (the engine checkout this very script lives in, via $SCRIPT_DIR)
+# when config.sh left MEMCONTINUUM_ENGINE empty, so the hint is never a
+# broken "/memidx.py" with no engine root at all. `--store "$store"` is
+# appended when this repo's wiring named a store (project= implies store=
+# above): without it, `stats` can still report the read side and the
+# write-side nudge count, but never the INC-0105 write-side-silent FLAG,
+# which needs a REAL store-commit count, not a guess -- so the hint only
+# omits --store when this repo genuinely has no known store to point at.
+STATS_PYTHON="${MEMCONTINUUM_PYTHON:-python3}"
+STATS_ENGINE="${MEMCONTINUUM_ENGINE:-$SCRIPT_DIR/..}"
+STATS_PROJECT="${project:-}"
+[ -z "$STATS_PROJECT" ] && STATS_PROJECT="$(basename "$REPO" 2>/dev/null)"
+[ -z "$STATS_PROJECT" ] && STATS_PROJECT="default"
+# Single-quoted (a real install's python/engine/store path can contain a
+# space, e.g. under a Windows-mounted drive) so the printed line is a
+# directly copy-pasteable command, not just a human-readable summary.
+STATS_CMD="'$STATS_PYTHON' '$STATS_ENGINE/memidx.py' stats --project $STATS_PROJECT --days 7"
+[ -n "${store:-}" ] && STATS_CMD="$STATS_CMD --store '$store'"
+echo "stats: $STATS_CMD"

@@ -164,6 +164,29 @@ class TestPreEditChainHook(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), "")
 
+    def test_log_line_carries_project(self):
+        """Liveness metric fix (INC-0103/INC-0105): memidx.py stats groups
+        hook.log by project=. pre-edit-chain.sh already stamps it in its own
+        finish() -- this is a regression pin, not a new fix, so the shared
+        memidx.py stats tool can rely on it for every outcome, matched or
+        not."""
+        payload = json.dumps(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Edit",
+                "cwd": "/nowhere",
+                "tool_input": {"file_path": "/nowhere/near/anything.py"},
+            }
+        )
+        env = clean_env(
+            MEMCONTINUUM_HOME=self.memtool_home,
+            MEMCONTINUUM_PROJECT=self.project,
+            MEMCONTINUUM_PYTHON=VENV_PYTHON,
+        )
+        run_hook(payload, env)
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        self.assertIn(f"project={self.project}", log_text)
+
     def test_c_malformed_payload_emits_nothing_and_logs(self):
         log_path = Path(self.memtool_home) / "hook.log"
         before = log_path.read_text() if log_path.exists() else ""
