@@ -140,7 +140,7 @@ class UpdateTestBase(unittest.TestCase):
         lines = [l for l in out.splitlines() if l.strip()]
         self.assertTrue(lines, out)
         header = lines[0].split("\t")
-        self.assertEqual(header, ["repo", "claude-dir", "stamped", "engine", "store-match", "rules", "action"])
+        self.assertEqual(header, ["repo", "claude-dir", "stamped", "engine", "store-match", "rules", "skill", "action"])
         return [dict(zip(header, l.split("\t"))) for l in lines[1:]]
 
 
@@ -289,6 +289,7 @@ class TestUpdateWalkStaleAndOk(UpdateTestBase):
         self.assertEqual(rows[0]["stamped"], engine_sha())
         self.assertEqual(rows[0]["store-match"], "yes")
         self.assertEqual(rows[0]["rules"], "ok")
+        self.assertEqual(rows[0]["skill"], "ok")
 
     def test_dry_run_is_the_default_and_writes_nothing(self):
         settings_before = self.settings_text()
@@ -369,6 +370,61 @@ class TestUpdateWalkStaleAndOk(UpdateTestBase):
         self.assertNotEqual(proc2.returncode, 0, proc2.stdout + proc2.stderr)
         self.assertIn("SKIPPED", proc2.stdout + proc2.stderr)
         self.assertEqual(rules_path.read_text(), "# hand-written, not ours\n")
+
+    def test_skill_missing_detected_and_fixed_by_apply(self):
+        """Ruling 51: the installed memory-search skill copy is checked the
+        same way the rules file is -- a deleted copy used to read as `ok`
+        and survive --apply untouched."""
+        skill_path = Path(self.claude_dir, "skills", "memory-search", "SKILL.md")
+        skill_path.unlink()
+        proc = run(UPDATE_SH, [], self.home)
+        rows = self.table_rows(proc.stdout)
+        self.assertEqual(rows[0]["skill"], "missing")
+        self.assertEqual(rows[0]["action"], "stale")
+
+        proc2 = run(UPDATE_SH, ["--apply"], self.home)
+        self.assertEqual(proc2.returncode, 0, proc2.stdout + proc2.stderr)
+        self.assertTrue(skill_path.is_file())
+        self.assertIn(f"<!-- memcontinuum-rendered: {engine_sha()} -->", skill_path.read_text())
+        # Re-walk: clean now.
+        proc3 = run(UPDATE_SH, [], self.home)
+        rows3 = self.table_rows(proc3.stdout)
+        self.assertEqual(rows3[0]["skill"], "ok")
+        self.assertEqual(rows3[0]["action"], "ok")
+
+    def test_skill_stale_detected_and_fixed_by_apply(self):
+        skill_path = Path(self.claude_dir, "skills", "memory-search", "SKILL.md")
+        text = skill_path.read_text().replace(
+            f"<!-- memcontinuum-rendered: {engine_sha()} -->",
+            "<!-- memcontinuum-rendered: deadbee -->",
+        )
+        self.assertNotEqual(text, skill_path.read_text(), "fixture did not find the stamp line")
+        skill_path.write_text(text)
+        proc = run(UPDATE_SH, [], self.home)
+        rows = self.table_rows(proc.stdout)
+        self.assertEqual(rows[0]["skill"], "stale")
+        self.assertEqual(rows[0]["action"], "stale")
+
+        proc2 = run(UPDATE_SH, ["--apply"], self.home)
+        self.assertEqual(proc2.returncode, 0, proc2.stdout + proc2.stderr)
+        self.assertIn(f"<!-- memcontinuum-rendered: {engine_sha()} -->", skill_path.read_text())
+
+    def test_skill_foreign_is_reported_and_apply_skips_it_without_crashing(self):
+        skill_path = Path(self.claude_dir, "skills", "memory-search", "SKILL.md")
+        foreign = "---\nname: not-memory-search\ndescription: hand-authored\n---\n\n# not ours\n"
+        skill_path.write_text(foreign)
+        proc = run(UPDATE_SH, [], self.home)
+        rows = self.table_rows(proc.stdout)
+        self.assertEqual(rows[0]["skill"], "foreign")
+        self.assertEqual(rows[0]["action"], "skill-foreign")
+
+        proc2 = run(UPDATE_SH, ["--apply"], self.home)
+        # --apply asked for this dir to be re-rendered and it was not: a skip
+        # is still work left undone, and the exit code has to say so.
+        self.assertNotEqual(proc2.returncode, 0, proc2.stdout + proc2.stderr)
+        self.assertIn("SKIPPED", proc2.stdout + proc2.stderr)
+        self.assertNotIn("applying:", proc2.stdout, proc2.stdout)
+        self.assertEqual(skill_path.read_text(), foreign)
 
     def test_missing_wiring_is_reported_as_no_wiring_and_never_auto_applied(self):
         Path(self.claude_dir, "settings.local.json").unlink()
@@ -892,6 +948,21 @@ class TestWalkExitCodesAndPrecedence(UpdateTestBase):
         proc = run(UPDATE_SH, [], self.home)
         rows = self.table_rows(proc.stdout)
         self.assertEqual(rows[0]["action"], "rules-foreign", proc.stdout)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_skill_foreign_outranks_stale(self):
+        """A foreign skill copy is never applied either -- repo-init.sh has
+        no refusal of its own for it (unlike the rules file), so this
+        command's own action gating is the only thing standing between a
+        hand-authored skill copy and `cp -f`."""
+        drifted = self.settings_text().replace(
+            f"MEMCONTINUUM_RENDERED={engine_sha()}", "MEMCONTINUUM_RENDERED=deadbee")
+        Path(self.claude_dir, "settings.local.json").write_text(drifted)
+        Path(self.claude_dir, "skills", "memory-search", "SKILL.md").write_text(
+            "---\nname: not-memory-search\ndescription: hand-authored\n---\n\n# not ours\n")
+        proc = run(UPDATE_SH, [], self.home)
+        rows = self.table_rows(proc.stdout)
+        self.assertEqual(rows[0]["action"], "skill-foreign", proc.stdout)
 
     @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
     def test_apply_that_skips_never_calls_repo_init_for_that_dir(self):

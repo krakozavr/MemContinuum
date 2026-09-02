@@ -15,7 +15,7 @@
 # compares what was rendered there against the engine checkout right now.
 #
 # No flags (or --dry-run, the default): prints a table and writes nothing.
-#   repo | claude-dir | stamped | engine | store-match | rules | action
+#   repo | claude-dir | stamped | engine | store-match | rules | skill | action
 #     repo         the registry row's key (an origin remote URL, or a path)
 #     claude-dir   one claude-dir this row lists (or recovers -- see below)
 #     stamped      the MEMCONTINUUM_RENDERED value on this claude-dir's
@@ -28,17 +28,24 @@
 #                  version)
 #     rules        ok/stale/missing/foreign -- <claude-dir>/rules/
 #                  memcontinuum.md's own identity marker and stamp
+#     skill        ok/stale/missing/foreign -- <claude-dir>/skills/
+#                  memory-search/SKILL.md's own identity (a `name:
+#                  memory-search` frontmatter line) and stamp
 #     action       ok | stale | store-mismatch | rules-stale | rules-missing
-#                  | rules-foreign | migrate | migrate-needs-claude-dirs |
-#                  migrate-needs-langs | migrate-needs-never-exts |
-#                  migrate-dirs-disagree | store-missing | no-wiring |
-#                  unrecoverable
+#                  | rules-foreign | skill-foreign | migrate |
+#                  migrate-needs-claude-dirs | migrate-needs-langs |
+#                  migrate-needs-never-exts | migrate-dirs-disagree |
+#                  store-missing | no-wiring | unrecoverable
 #
 #                  store-missing outranks every other answer, including a
 #                  stamp and a store= that both look right: those compare
 #                  strings, and a string can agree with a store that has been
 #                  renamed or deleted. Nothing is re-rendered against a store
-#                  that is not there.
+#                  that is not there. A missing or stale skill copy reports
+#                  as plain `stale` (the same drift the hook-stamp check
+#                  reports) rather than getting rules-missing/rules-stale's
+#                  own names; a FOREIGN skill copy reports as `skill-foreign`
+#                  and, like `rules-foreign`, is refused rather than applied.
 #
 # --apply    re-runs scripts/repo-init.sh, with the parameters this row
 #            recorded (adopting the row's existing --store -- this command
@@ -202,7 +209,7 @@
 #   --apply exits 0 only when every claude-dir it walked ended up correct:
 #   already ok, or re-rendered successfully. Anything left undone -- a failed
 #   installer run, a dir deliberately skipped (store-missing, a foreign
-#   rules file, a migration this command must not guess at), or a row that
+#   rules file or skill copy, a migration this command must not guess at), or a row that
 #   could not be resolved to a claude-dir at all (unrecoverable) -- exits
 #   non-zero, with the table still printed and the reason on stderr.
 #   The one exception is `no-wiring`: a claude-dir with none of this
@@ -460,36 +467,83 @@ mc_update_resolve_python() {
     return 1
 }
 
-# mc_update_rules_state CLAUDE_DIR -- sets MC_RULES_STATE to one of
-# ok/stale/missing/foreign for CLAUDE_DIR/rules/memcontinuum.md.
-mc_update_rules_state() {
-    local dest="$1/rules/memcontinuum.md" first second
+# mc_update_artifact_state DEST IS_FOREIGN STAMP_LINE -- shared
+# missing/foreign/stale/ok determination for a rendered artifact whose
+# identity check the caller has already done (a rules file's fixed first
+# line; the skill copy's frontmatter `name:` line -- the two shapes differ
+# enough that identity detection stays per-artifact) and whose render-stamp
+# line the caller has already located and handed over as STAMP_LINE (empty
+# when none applies). Sets MC_ARTIFACT_STATE; always returns 0.
+#
+# The stamp is pulled out of the rendered `<!-- memcontinuum-rendered: ... -->`
+# comment and compared through mc_fingerprint_match rather than matching the
+# whole line as text: a file stamped `unknown` against an engine that also
+# cannot fingerprint itself would otherwise compare EQUAL as text and read
+# `ok`, which is exactly the claim nobody was able to check.
+mc_update_artifact_state() {
+    local dest="$1" is_foreign="$2" stamp_line="$3" stamp=""
     if [ ! -f "$dest" ]; then
-        MC_RULES_STATE="missing"
+        MC_ARTIFACT_STATE="missing"
         return 0
     fi
-    first="$(sed -n '1p' "$dest")"
-    if [ "$first" != "$RULES_IDENTITY_MARKER" ]; then
-        MC_RULES_STATE="foreign"
+    if [ "$is_foreign" -ne 0 ]; then
+        MC_ARTIFACT_STATE="foreign"
         return 0
     fi
-    # Line 2 is the stamp comment repo-init renders. Pull the fingerprint out
-    # of it and compare through mc_fingerprint_match rather than matching the
-    # whole line: a file stamped `unknown` against an engine that also cannot
-    # fingerprint itself would otherwise compare EQUAL as text and read `ok`.
-    second="$(sed -n '2p' "$dest")"
-    local rules_stamp=""
-    case "$second" in
+    case "$stamp_line" in
         "<!-- memcontinuum-rendered: "*" -->")
-            rules_stamp="${second#<!-- memcontinuum-rendered: }"
-            rules_stamp="${rules_stamp% -->}"
+            stamp="${stamp_line#<!-- memcontinuum-rendered: }"
+            stamp="${stamp% -->}"
             ;;
     esac
-    if mc_fingerprint_match "$rules_stamp" "$ENGINE_SHA"; then
-        MC_RULES_STATE="ok"
+    if mc_fingerprint_match "$stamp" "$ENGINE_SHA"; then
+        MC_ARTIFACT_STATE="ok"
     else
-        MC_RULES_STATE="stale"
+        MC_ARTIFACT_STATE="stale"
     fi
+    return 0
+}
+
+# mc_update_rules_state CLAUDE_DIR -- sets MC_RULES_STATE to one of
+# ok/stale/missing/foreign for CLAUDE_DIR/rules/memcontinuum.md. The identity
+# marker is the file's first line (mc_rules_identity_marker, from the
+# template that defines it); the stamp comment repo-init renders sits on
+# line 2, right after it.
+mc_update_rules_state() {
+    local dest="$1/rules/memcontinuum.md" is_foreign=0 stamp_line=""
+    if [ -f "$dest" ]; then
+        [ "$(sed -n '1p' "$dest")" = "$RULES_IDENTITY_MARKER" ] || is_foreign=1
+        stamp_line="$(sed -n '2p' "$dest")"
+    fi
+    mc_update_artifact_state "$dest" "$is_foreign" "$stamp_line"
+    MC_RULES_STATE="$MC_ARTIFACT_STATE"
+    return 0
+}
+
+# mc_update_skill_state CLAUDE_DIR -- sets MC_SKILL_STATE to one of
+# ok/stale/missing/foreign for CLAUDE_DIR/skills/memory-search/SKILL.md
+# (Ruling 51). Unlike the rules file, the identity marker cannot be a fixed
+# first line -- the opening "---" has to stay byte 0 for the skill loader,
+# so repo-init stamps right after the frontmatter's CLOSING "---" instead
+# (scripts/repo-init.sh, "install the memory-search skill"). Identity here is
+# "the frontmatter contains a `name: memory-search` line" -- the same test a
+# human would use to tell this skill's copy from a foreign one at that path.
+#
+# repo-init.sh, unlike the rules file, has no refusal of its own before
+# overwriting this path (`cp -f`, unconditionally) -- this command's own
+# action gating (skill-foreign, below) is the ONLY thing standing between a
+# hand-authored file here and being silently clobbered by --apply.
+mc_update_skill_state() {
+    local dest="$1/skills/memory-search/SKILL.md" fm_end="" is_foreign=1 stamp_line=""
+    if [ -f "$dest" ]; then
+        fm_end="$(grep -n '^---$' "$dest" | sed -n '2p' | cut -d: -f1)"
+        if [ -n "$fm_end" ] && sed -n "1,${fm_end}p" "$dest" | grep -qx 'name: memory-search'; then
+            is_foreign=0
+            stamp_line="$(sed -n "$((fm_end + 1))p" "$dest")"
+        fi
+    fi
+    mc_update_artifact_state "$dest" "$is_foreign" "$stamp_line"
+    MC_SKILL_STATE="$MC_ARTIFACT_STATE"
     return 0
 }
 
@@ -738,12 +792,12 @@ join_semi() {
 
 TABLE_HEADER_PRINTED=0
 print_row() {
-    # print_row REPO CLAUDE_DIR STAMPED STORE_MATCH RULES ACTION
+    # print_row REPO CLAUDE_DIR STAMPED STORE_MATCH RULES SKILL ACTION
     if [ "$TABLE_HEADER_PRINTED" -eq 0 ]; then
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "repo" "claude-dir" "stamped" "engine" "store-match" "rules" "action"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "repo" "claude-dir" "stamped" "engine" "store-match" "rules" "skill" "action"
         TABLE_HEADER_PRINTED=1
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$ENGINE_SHA" "$4" "$5" "$6"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$ENGINE_SHA" "$4" "$5" "$6" "$7"
 }
 
 # --- process_claude_dir: the per-(row, claude-dir) walk + optional apply ---
@@ -783,6 +837,7 @@ process_claude_dir() {
     [ -n "$stamp" ] || stamp="none"
 
     mc_update_rules_state "$claude_dir"
+    mc_update_skill_state "$claude_dir"
 
     # store-missing outranks everything, INCLUDING a clean stamp and a
     # store= that still matches what is rendered. A rendered
@@ -795,24 +850,34 @@ process_claude_dir() {
     # Precedence, and the reason for it: the answers this command will never
     # act on come FIRST, so the action column names why nothing will happen
     # rather than naming some lesser drift that --apply would then try to fix
-    # and fail. store-missing and rules-foreign are both refusals the
-    # installer would only repeat more loudly; the migrate-needs-* answers are
-    # questions only a human can settle. Everything below them is drift this
-    # command can and will re-render.
+    # and fail. store-missing, rules-foreign and skill-foreign are all
+    # refusals the installer would only repeat more loudly (rules-foreign
+    # because repo-init.sh itself refuses to overwrite a foreign rules file;
+    # skill-foreign because repo-init.sh has NO refusal of its own for the
+    # skill copy -- `cp -f`, unconditionally -- so this ranking is the only
+    # thing standing between a foreign copy and being clobbered); the
+    # migrate-needs-* answers are questions only a human can settle.
+    # Everything below them is drift this command can and will re-render --
+    # a missing or stale skill copy (Ruling 51) folds into the same generic
+    # `stale` the hook-stamp check already reports, rather than getting its
+    # own name the way rules-missing/rules-stale do: it is drift of the same
+    # kind (a rendered artifact behind the engine), not a new question.
     #
-    # It outranks `no-wiring` too, and that is the whole point of checking it
-    # before the wiring is even looked at. A claude-dir with none of this
-    # project's hook lines is normally the skill's repair path -- "finish the
-    # install". But when the store is gone as well, sending a human to
-    # re-install is sending them to seed a fresh store over a dead one and
-    # call the result repaired. The dead store is the fact that has to be
-    # said first.
+    # store-missing outranks `no-wiring` too, and that is the whole point of
+    # checking it before the wiring is even looked at. A claude-dir with none
+    # of this project's hook lines is normally the skill's repair path --
+    # "finish the install". But when the store is gone as well, sending a
+    # human to re-install is sending them to seed a fresh store over a dead
+    # one and call the result repaired. The dead store is the fact that has
+    # to be said first.
     if ! mc_is_marked_store "$STORE"; then
         action="store-missing"
     elif [ "${#lines[@]}" -eq 0 ]; then
         action="no-wiring"
     elif [ "$MC_RULES_STATE" = "foreign" ]; then
         action="rules-foreign"
+    elif [ "$MC_SKILL_STATE" = "foreign" ]; then
+        action="skill-foreign"
     elif [ "$LEGACY" -eq 1 ]; then
         action="$LEGACY_ACTION"
     elif ! mc_fingerprint_match "$stamp" "$ENGINE_SHA"; then
@@ -823,11 +888,13 @@ process_claude_dir() {
         action="rules-missing"
     elif [ "$MC_RULES_STATE" = "stale" ]; then
         action="rules-stale"
+    elif [ "$MC_SKILL_STATE" = "missing" ] || [ "$MC_SKILL_STATE" = "stale" ]; then
+        action="stale"
     else
         action="ok"
     fi
 
-    print_row "$KEY" "$claude_dir" "$stamp" "$store_match" "$MC_RULES_STATE" "$action"
+    print_row "$KEY" "$claude_dir" "$stamp" "$store_match" "$MC_RULES_STATE" "$MC_SKILL_STATE" "$action"
 
     # `no-wiring` is the one action --apply neither fixes nor fails on: a
     # claude-dir with none of this project's hook lines is a broken or
@@ -866,15 +933,26 @@ not_applied() {
 # (repo-init.sh itself refuses a foreign rules file before writing
 # anything -- calling it would just fail loudly for a reason already named
 # in the table; the fix is a human moving the foreign file aside).
+# action=skill-foreign is skipped for the same reason, but repo-init.sh
+# carries NO refusal of its own for the skill copy -- it `cp -f`s
+# unconditionally -- so this skip is the only thing standing between a
+# foreign copy and being clobbered, not a belt-and-braces second line of
+# defense the way the rules-foreign skip is.
 apply_claude_dir() {
     local claude_dir="$1" action="$2"
     local -a args=()
     local cr
 
-    if [ "$action" = "rules-foreign" ]; then
-        not_applied "  SKIPPED $claude_dir: rules-foreign -- move $claude_dir/rules/memcontinuum.md aside first (it was not rendered by this installer)"
-        return 0
-    fi
+    case "$action" in
+        rules-foreign)
+            not_applied "  SKIPPED $claude_dir: rules-foreign -- move $claude_dir/rules/memcontinuum.md aside first (it was not rendered by this installer)"
+            return 0
+            ;;
+        skill-foreign)
+            not_applied "  SKIPPED $claude_dir: skill-foreign -- move $claude_dir/skills/memory-search/SKILL.md aside first (it was not rendered by this installer)"
+            return 0
+            ;;
+    esac
 
     case "$action" in
         migrate-needs-*|migrate-dirs-disagree)
@@ -1189,7 +1267,7 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
     NEVER_COMMA="$(printf '%s' "$NEVER_SEMI" | tr ';' ',')"
 
     if [ -z "$PROJECT" ]; then
-        print_row "$KEY" "(unknown)" "none" "unknown" "unknown" "unrecoverable"
+        print_row "$KEY" "(unknown)" "none" "unknown" "unknown" "unknown" "unrecoverable"
         echo "  no project= recorded for $KEY -- re-run memcontinuum-decide.sh wired --repo ... --store ... --project ... to fix" >&2
         # Work left undone is work left undone: --apply promised to end with
         # every walked row correct, and this one was never even resolved to a
@@ -1225,7 +1303,7 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
             case "$KEY" in
                 /*) CLAUDE_DIRS_SEMI="$KEY/.claude" ;;
                 *)
-                    print_row "$KEY" "(unknown)" "none" "unknown" "unknown" "unrecoverable"
+                    print_row "$KEY" "(unknown)" "none" "unknown" "unknown" "unknown" "unrecoverable"
                     echo "  legacy row, no claude-dirs recorded, and the key is a remote URL (not a path) -- this row's claude-dir cannot be recovered automatically. Fix: memcontinuum-decide.sh wired --repo PATH --store $STORE --project $PROJECT --claude-dir DIR [--code-root DIR ...] [--langs LIST]" >&2
                     [ "$APPLY" -eq 1 ] && WALK_RC=1
                     continue
