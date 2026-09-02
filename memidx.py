@@ -2655,6 +2655,26 @@ def cmd_code_census(args) -> int:
 
 
 def code_hits_fts(conn: sqlite3.Connection, query: str, project: str, limit: int = 200):
+    """Task 7 (Anatomy M2a): a bare identifier-shaped query (e.g. a symbol
+    or qualified name typed verbatim, not a phrase) puts every chunk whose
+    OWN `symbol` or `qualified_name` equals it first, ordered by path --
+    ahead of the raw bm25 ranking, which weighs a short chunk repeating
+    the name in its body/doc as favorably as the chunk the name actually
+    names (Codex's `parse_frontmatter`-vs-a-test-fixture probe). A
+    multi-word or punctuation-bearing query is unaffected -- bm25 ordering
+    only, exactly as before."""
+    exact: list = []
+    q_stripped = query.strip()
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", q_stripped):
+        exact = [
+            r["id"]
+            for r in conn.execute(
+                "SELECT id FROM chunks WHERE project=? AND (symbol=? OR qualified_name=?) "
+                "ORDER BY path, start_line",
+                (project, q_stripped, q_stripped),
+            )
+        ]
+
     q = fts_escape(query)
     rows = conn.execute(
         """SELECT fts.rowid AS rowid FROM fts
@@ -2663,7 +2683,9 @@ def code_hits_fts(conn: sqlite3.Connection, query: str, project: str, limit: int
            ORDER BY bm25(fts) LIMIT ?""",
         (q, project, limit),
     ).fetchall()
-    return [r["rowid"] for r in rows]
+    ids = [r["rowid"] for r in rows]
+    exact_set = set(exact)
+    return exact + [i for i in ids if i not in exact_set]
 
 
 def code_hits_vector(conn: sqlite3.Connection, query: str, project: str):

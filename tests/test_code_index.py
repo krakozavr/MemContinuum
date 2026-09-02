@@ -1926,6 +1926,27 @@ class TestFTSSplitFindsCamelCase(unittest.TestCase):
             self.assertIn("writePNGSnapshot", top["qualified_name"])
 
 
+class TestExactSymbolRanksFirst(unittest.TestCase):
+    def test_body_mentions_do_not_outrank_the_exact_name(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"; root.mkdir()
+            (root / "a.py").write_text(
+                "def load_settings():\n    return 1\n\n"
+                "def caller():\n    '''load_settings load_settings load_settings'''\n"
+                "    load_settings(); load_settings(); return load_settings()\n")
+            db = Path(td) / "idx-code.sqlite"; code_reindex(root, db, lang="python")
+            conn = memidx.open_code_db(db)
+            ids = memidx.code_hits_fts(conn, "load_settings", memidx.DEFAULT_PROJECT)
+            self.assertEqual(conn.execute("SELECT qualified_name FROM chunks WHERE id=?", (ids[0],)).fetchone()[0], "load_settings")
+
+    def test_partial_word_still_matches(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"; root.mkdir(); (root / "a.py").write_text("def load_settings():\n    return 1\n")
+            db = Path(td) / "idx-code.sqlite"; code_reindex(root, db, lang="python")
+            conn = memidx.open_code_db(db)
+            self.assertTrue(memidx.code_hits_fts(conn, "settings", memidx.DEFAULT_PROJECT))
+
+
 class TestVectorAndHybridJSONIsSerializable(unittest.TestCase):
     """Regression test: cosine() used to return a numpy.float32 score
     (fastembed's query_embed yields numpy arrays), which json.dumps cannot
