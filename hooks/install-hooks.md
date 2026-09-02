@@ -134,8 +134,8 @@ precompact-persist.sh,sessionstart-remind.sh,userprompt-remind.sh,sessionend-sta
 wired into a project's Claude Code settings exactly like `pre-edit-chain.sh`
 above. They gather evidence (an edit ledger, git HEAD movement) and, at most
 a few times per session, ask ONE question — they never write a record, never
-draft one, never classify anything as a ruling. See the README's "Hooks"
-table for what each one does.
+draft one, never classify anything as a ruling. See `docs/INTERNALS.md`'s
+"Hooks and the fail-open contract" table for what each one does.
 
 Rendered from `templates/write-hooks.json.tmpl`, the project-agnostic shape
 merged into `.claude/settings.json` or `.claude/settings.local.json`:

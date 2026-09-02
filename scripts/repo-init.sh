@@ -715,15 +715,15 @@ PYEOF
         esac
     fi
     if [ -n "$NEVER_EXTS_RAW" ]; then
-        # Deliberately narrow wording (B4): what actually happens today is
-        # that this wiring's nudge hook line carries the extension, so the
-        # reminder stops mentioning it. Nothing is recorded in a registry
-        # yet, so a later install elsewhere would ask again -- say that,
-        # rather than claiming a durable "never ask about that one".
+        # Deliberately narrow wording: what actually happens is that this
+        # wiring's nudge hook line carries the extension, so the reminder
+        # stops mentioning it. Nothing is recorded in any registry, so a
+        # later install elsewhere asks again -- say that, rather than
+        # claiming a durable "never ask about that one".
         for _never in $(printf '%s' "$NEVER_EXTS_RAW" | tr ',' ' '); do
             NEVER_NOTES+=("$_never")
         done
-        echo "noted for this wiring: never=$(printf '%s' "$NEVER_EXTS_RAW" | tr ',' ' ') (persistent never-ask arrives with the updater)"
+        echo "noted for this wiring only: never=$(printf '%s' "$NEVER_EXTS_RAW" | tr ',' ' ') (not recorded machine-wide)"
     fi
     echo
 fi

@@ -156,6 +156,72 @@ class TestInstalledSkillsMatchTheirTemplates(unittest.TestCase):
         )
 
 
+class TestReadmeCrossReferencesResolve(unittest.TestCase):
+    """Docs that point a reader at a README section by name must name a
+    section that exists. The README was restructured; every cross-reference
+    written against the old headings became a dead end, silently -- prose
+    cannot be checked by a link checker, so it is checked here.
+
+    A reference is any quoted name attached to a README mention:
+    `README.md "Uninstall"`, `the README's "Install -> Once per repository"`.
+    An arrow separates a heading from its subheading; both halves must exist.
+    """
+
+    REF_RE = re.compile(r"README(?:\.md)?(?:'s)?\s+\"([^\"]+)\"")
+    # Files that point readers at the README. Kept explicit rather than
+    # globbed: a new doc joining this list should be a deliberate act.
+    REFERRING_DOCS = (
+        [INSTALL_HOOKS, DESIGN, INTERNALS, TOOLS_DIR / "docs" / "SCHEMA.md",
+         SKILL, SEARCH_SKILL]
+        + INSTALLED_SKILLS
+        + sorted((TOOLS_DIR / "templates").glob("*.md"))
+    )
+
+    def _readme_headings(self):
+        return {
+            line.lstrip("#").strip().lower()
+            for line in README.read_text().splitlines()
+            if line.startswith("#")
+        }
+
+    def _refs(self):
+        """(doc, lineno, reference) for every quoted README section reference.
+
+        Scanned over the whole file, not line by line: these references wrap
+        across lines in prose, and a per-line scan silently sees none of them.
+        """
+        for doc in self.REFERRING_DOCS:
+            if not doc.is_file():
+                continue
+            text = doc.read_text()
+            for m in self.REF_RE.finditer(text):
+                yield doc, text.count("\n", 0, m.start()) + 1, m.group(1)
+
+    def test_the_scan_actually_finds_the_known_references(self):
+        # Guards the guard: a regex that matches nothing passes vacuously.
+        found = {ref for _, _, ref in self._refs()}
+        self.assertGreaterEqual(
+            len(found), 2,
+            f"expected several README section references across the docs, found {found}",
+        )
+
+    def test_every_quoted_readme_section_exists(self):
+        headings = self._readme_headings()
+        self.assertIn("uninstall", headings, "README heading scan found nothing usable")
+        broken = []
+        for doc, lineno, ref in self._refs():
+            rel = str(doc.relative_to(TOOLS_DIR))
+            for part in re.split(r"[→>]+", ref.replace("->", "→")):
+                part = part.strip().lower()
+                if part and part not in headings:
+                    broken.append(f"{rel}:{lineno}: README has no section {part!r}")
+        self.assertEqual(
+            broken, [],
+            "stale README cross-references (the README's real headings are "
+            f"{sorted(headings)}): {broken}",
+        )
+
+
 class TestDocumentedHelpFlagsWork(unittest.TestCase):
     """The README tells a person to run any command with --help. That has to
     be true of every command it names, not just the ones argparse happens to
