@@ -98,7 +98,7 @@ line in exactly one of five states:
 `partial` wiring asks rather than staying silent: a half-wired repo is the
 repair path, and silence there would leave it with no route back to health.
 `memcontinuum-state.sh` reports decision and wiring as two separate facts
-(`decision=` / `wiring=`, plus a backward-compatible `state=` line) because a
+(`decision=` / `wiring=`, plus a combined `state=` line) because a
 hand-edited settings file or an interrupted install can leave them disagreeing.
 
 `wiring=full` means the **five always-wired write-side hooks** are all present
@@ -144,9 +144,9 @@ end it by failing open.
 The middle step exists because a venv need not live at `<engine>/.venv`. Without
 it, every hook line in every project has to carry `MEMCONTINUUM_PYTHON` by hand,
 and the one that forgets fails silently behind a log line nobody reads. In
-practice it matters mainly for hand-wired or legacy hook lines: `repo-init.sh`
-and `memcontinuum-setup.sh` bake `MEMCONTINUUM_PYTHON` into every hook line they
-render.
+practice it matters mainly for hand-wired hook lines, or ones rendered before
+this baking existed: `repo-init.sh` and `memcontinuum-setup.sh` bake
+`MEMCONTINUUM_PYTHON` into every hook line they render now.
 
 **The pointer case.** When setup runs with a `MEMCONTINUUM_HOME` other than the
 fixed default, it writes the real `config.sh` under that home *and* a minimal
@@ -186,9 +186,9 @@ embedded unquoted as that identity marker in every hook command line the merge
 step's identity check depends on. The constraint is not merely "no `/`".
 
 An entry naming one of the seven scripts with **no** `MEMCONTINUUM_PROJECT=`
-marker at all is treated as legacy pre-identity wiring and stays sweepable by
-any project's re-run of a shared `--claude-dir`. Re-running `repo-init.sh` for a
-project rewrites that project's entries with the marker.
+marker at all is treated as wiring from before that marker existed, and stays
+sweepable by any project's re-run of a shared `--claude-dir`. Re-running
+`repo-init.sh` for a project rewrites that project's entries with the marker.
 
 Merge behaviour: drops only its own items, per item and not per group (a foreign
 hook sharing a matcher group with one of ours survives), removes any group left
@@ -386,17 +386,13 @@ rules | action`, action being one of `ok`, `stale`, `store-mismatch`,
 recorded parameters, always passing `--adopt-only` (below), so this command
 cannot create, rename, or delete a store on any path through it.
 
-**The flag/mode matrix.** The same option names mean different things in
-different modes, so each mode consumes a fixed set and refuses anything else,
-naming the mode and the flag. Accepted-and-ignored is the one outcome ruled
-out: the human typed what they wanted, the command reported success, and it
-did something else.
-
-| mode | selected by | consumes |
-| --- | --- | --- |
-| `walk` | no `--repo` | `--dry-run` `--apply` `--machine` |
-| `targeted` | `--add-lang`/`--never-ext` (needs `--repo`) | `--dry-run` `--repo` `--add-lang` `--never-ext` |
-| `repo` | `--repo`, no `--add-lang`/`--never-ext` | `--dry-run` `--apply` `--machine` `--repo` `--claude-dir` |
+**The flag/mode matrix** — which mode each flag combination selects, and what
+each mode consumes versus refuses — is documented once, in
+`memcontinuum-update.sh --help` ("MODES, AND WHICH FLAGS EACH ONE TAKES").
+That text is the prose source; the script's own comments point back at it
+rather than restating it. What follows here is the maintainer-level detail
+--help does not carry: why the refusals exist, and how the row-dependent half
+is implemented.
 
 Two refusals precede the modes entirely, at the argument loop. An **empty or
 whitespace-only value** for any flag that takes one is refused
@@ -414,13 +410,14 @@ Everything else decidable from the command line alone is enforced before the
 registry is opened. The rest is a property of the *row*, so `repo` mode splits
 when the row is read:
 
-- a **legacy** row (no `claude-dirs=`) also consumes `--code-root`, `--langs`
-  and `--set-never-ext`: they supply the parameters the row never recorded.
-- a **current-format** row refuses those three — it already records them, and
-  this mode does not rewrite what a row records (`--add-lang`/`--never-ext`
-  do, additively, or a `decide.sh wired` line). `--claude-dir` changes meaning
-  rather than being refused: it **narrows** the walk to the dirs it names, and
-  each must be one the row already records. One that is not is refused as
+- a row that **records no `claude-dirs=`** also consumes `--code-root`,
+  `--langs` and `--set-never-ext`: they supply the parameters the row never
+  recorded.
+- a row that **already records them** refuses those three — this mode does
+  not rewrite what a row records (`--add-lang`/`--never-ext` do, additively,
+  or a `decide.sh wired` line). `--claude-dir` changes meaning rather than
+  being refused: it **narrows** the walk to the dirs it names, and each must
+  be one the row already records. One that is not is refused as
   `dir-not-recorded` — never walked, never installed into.
 
 `--repo` naming a repository with no `wired` row — undecided, or a recorded
@@ -449,14 +446,18 @@ store over a dead one and call the result repaired. The dead store is the
 fact that has to be said first, so the store is checked before the wiring is
 looked at at all.
 
-**Exit codes.** The reporting walk always exits 0 — there, a stale row is the
-answer, not an error. `--apply` exits 0 only when every claude-dir it walked
-ended up correct: already `ok`, or re-rendered successfully. Anything left
-undone — a failed installer run, a dir deliberately skipped, or a row that
-could not be resolved to a claude-dir at all (`unrecoverable`: no `project=`
-recorded, or a remote-keyed legacy row) — exits non-zero, with the table
-still printed in full and the reason on stderr. `no-wiring` is the single
-exception, for the reason below.
+**Exit codes.** Three refusals happen before any row is walked and are not
+the walk's own answer: an empty/whitespace-only flag value, `--apply`
+together with `--dry-run`, and `--repo` naming a row that is not `wired` —
+each exits non-zero with nothing read and nothing written. Past that point,
+the reporting walk always exits 0 — there, a stale row is the answer, not an
+error. `--apply` exits 0 only when every claude-dir it walked ended up
+correct: already `ok`, or re-rendered successfully. Anything left undone — a
+failed installer run, a dir deliberately skipped, or a row that could not be
+resolved to a claude-dir at all (`unrecoverable`: no `project=` recorded, or
+a remote-keyed row with no `claude-dirs=` on record) — exits non-zero, with
+the table still printed in full and the reason on stderr. `no-wiring` is the
+single exception, for the reason below.
 
 **An `unknown` fingerprint never compares equal.** `mc_render_fingerprint`
 returns the literal `unknown` when it cannot compute one: no `sha256sum`/
@@ -496,11 +497,11 @@ Actions that are deliberately never auto-applied:
   wiring that is already there.
 
 A row written before this registry format existed (no `claude-dirs=` in its
-note) is a **legacy row**: its single claude-dir is recovered as `<repo>/.claude`
-when the row's key is a path (starts with `/`); a remote-keyed legacy row's
+note) is an **old-format row**: its single claude-dir is recovered as `<repo>/.claude`
+when the row's key is a path (starts with `/`); a remote-keyed old-format row's
 repo path is not recoverable from the registry at all and is reported as
 `unrecoverable` with a fix command, never guessed (guessing could touch the
-wrong repo's `.claude`). A recoverable legacy row also has its `code-roots=`/
+wrong repo's `.claude`). A recoverable old-format row also has its `code-roots=`/
 `langs=`/`never=` recovered from what is actually rendered on its
 `newfile-nudge.sh` line today (`MEMCONTINUUM_CODE_ROOT`/`_LANG_EXTS`/
 `_NEVER_EXTS`, the extension globs mapped back to language names via
@@ -511,8 +512,9 @@ by design (see "The five basenames" above) — `memcontinuum-update.sh` has its
 own basename-parametrized scan for this one case.
 
 **The migration proposes; a human decides.** The recovered `<repo>/.claude`
-is shown in the table as a *proposal*, never written from. Migrating a legacy
-row requires the human to name the full claude-dir set on the command line:
+is shown in the table as a *proposal*, never written from. Migrating an
+old-format row requires the human to name the full claude-dir set on the
+command line:
 
 ```
 scripts/memcontinuum-update.sh --apply --repo PATH \
@@ -557,9 +559,9 @@ re-render replays, so a value invented here would be permanent:
 **One row is one project, and one project has one wiring set.** A registry
 row records a single `code-roots=`/`langs=`/`never=` triple, and every
 claude-dir the row lists is rendered from it. That is what makes a re-render
-deterministic, and it is why a legacy row's parameters are recovered from
+deterministic, and it is why an old-format row's parameters are recovered from
 *every* named claude-dir rather than from whichever comes first. The whole
-reason a legacy row is being migrated is that nothing ever wrote its
+reason an old-format row is being migrated is that nothing ever wrote its
 parameters down — so nothing enforced that invariant either, and two dirs
 installed months apart can genuinely differ. Reading the first and replaying
 it onto the rest would silently re-render the others with languages they
@@ -609,10 +611,10 @@ on a bare failure.
 
 Four refusals come before any of that, in this order:
 
-- **legacy row** — the row records no `claude-dirs=`. This mode re-renders
-  the dirs a row *names*; `<repo>/.claude` is not substituted for them, ever
-  (a project's wiring can live outside the repo, and in more than one place).
-  Migrate the row first, with the command above.
+- **row records no `claude-dirs=`** — this mode re-renders the dirs a row
+  *names*; `<repo>/.claude` is not substituted for them, ever (a project's
+  wiring can live outside the repo, and in more than one place). Migrate the
+  row first, with the command above.
 - **`no-code-root`** — the row records no `code-roots=`. `repo-init.sh`
   ignores `--langs`/`--never-ext` without a `--code-root` to wire them into,
   so the language set would render nowhere while the row claimed it.
@@ -739,9 +741,9 @@ source-sha-only skip would serve chunks from a superseded chunker forever after
 a backend change — a one-way door. Bumping a row's `impl_version` is therefore
 the supported way to force re-chunking of one language's files.
 
-`ensure_file_sha_chunker_version_column` adds the column to a legacy db and
-leaves it NULL; NULL never compares equal to a real version, so every
-pre-existing row re-chunks once.
+`ensure_file_sha_chunker_version_column` adds the column to a db built before
+this column existed and leaves it NULL; NULL never compares equal to a real
+version, so every pre-existing row re-chunks once.
 
 ### Skip predicate
 
@@ -878,8 +880,15 @@ Corpus-wide identity rules, applied to every record regardless of type:
 | several records with no explicit `id:` share a file stem — `chain <stem>` is then ambiguous | warning (the durable fix is an explicit id on each) |
 
 Exit 1 on any error anywhere under `ROOT`; warnings alone exit 0. Standalone
-records are checked only for enum validity on whatever `status`/`authority`
-fields they carry.
+(non-topic, non-concept) records get `lint_record`'s own check — enum
+validity on whatever `status`/`authority` fields they carry — plus, like every
+other record type, the two corpus-wide identity rules above: any record with
+an explicit `id:` is checked against every other record's `id:` for a
+duplicate, and a standalone record with a `type:` but no explicit `id:` is
+checked for a stem collision. The one exemption from the stem check is
+untyped plain markdown with no `id:`, no `type:`, and no `links:` (a README,
+an inbox drop) — nobody chains those by stem, and two files sharing one is
+the normal state of the tree.
 
 **Deliberately not implemented:** "a link edited after being recorded (hash
 mismatch vs git) → reject". See `docs/SCHEMA.md` §7 — that check belongs where a
@@ -890,11 +899,19 @@ canonical store's commits are made, not inside the linter.
 Markdown is canonical; SQLite is a disposable cache, rebuildable with `reindex`.
 
 **Walker pruning.** `reindex`/`check`/`unmapped` — and memlint, which imports the
-same walker — walk every `.md` under `--root` but prune dot-directories,
-dotfiles and `node_modules` at every depth. Markdown that merely sits under a
-store root is not a record, and a `.gitignore` cannot express that, because this
-is a filesystem walk rather than a git one. The root itself is never pruned, so a
-store that legitimately lives at `~/.memory/` still indexes in full.
+same walker — walk every non-hidden `.md` file under `--root` but prune
+dot-directories, dotfiles and `node_modules` at every depth. The root itself is
+never pruned, so a store that legitimately lives at `~/.memory/` still indexes
+in full. A `.gitignore` cannot express this pruning, because this is a
+filesystem walk rather than a git one.
+
+Every `.md` file the walk does not prune IS indexed as a record — including
+one with no frontmatter at all (`parse_frontmatter` is tolerant of that, see
+below, and `infer_type` falls back to the containing directory name), so
+"put arbitrary markdown under the store root" is not a safe way to keep it out
+of `search`/`chain`/`for-path` results. The directory-name pruning above (a
+`.remember/now.md` session buffer, a project's `.claude/`) is the only thing
+that keeps non-record markdown out of the walk.
 
 **Two databases.** `<project>.sqlite` (decisions) and `<project>-code.sqlite`
 (Anatomy's code index) are separate physical files by default, each with its own
@@ -969,11 +986,18 @@ down:
 - **`search`** — `--mode fts` and `--mode vector` never both run; `hybrid` (the
   default) runs both and fuses ranks with RRF. Filters (`--status`, `--type`,
   `--area`, `--topic`, `--authority`) are always ANDed, but *where* they apply
-  differs by mode: for plain `fts`/`vector` the full ranked list is computed and
+  differs by mode: for plain `fts`/`vector` the ranked list is computed and
   then filtered (which cannot change which allowed records place, since nothing
   outside the set was ever a candidate); for `hybrid` each side is filtered
   **before** fusion, so a filtered-out record can never occupy a rank position
-  that shifts the fused score of a survivor.
+  that shifts the fused score of a survivor. The FTS side of that ranked list
+  is not the full one: `fts_ranked` runs `ORDER BY bm25(fts) ... LIMIT 200`
+  scoped to `--project` alone, before `--status`/`--type`/`--area`/`--topic`/
+  `--authority` are known at all — a record that would pass every filter but
+  ranks below 200th on raw bm25 for this project is never returned by that
+  query, so it is never a candidate for FTS or (in `hybrid`) RRF fusion,
+  regardless of what the filters would have allowed. Vector ranking carries no
+  such cap: `vector_ranked` scores every embedded row for the project.
 - **`chain`** — one line per link, newest first: `kind`,
   `reverses`/`reason_for_change` when present, ruling (quoted for
   owner-verbatim/owner-ratified) and rationale, plus one indented edge line per
@@ -1000,10 +1024,18 @@ down:
   concepts' `governed_by` chains in full, including any `kind: declined` link
   (there is no separate "rejected alternative" field; a declined link *is* that
   record). A bare symbol (no `/`) resolves to its defining file through the same
-  registry-served declared-symbol scan the chunker and memlint use. It tries the
-  code index first and always falls back to scanning `--code-root` directly, so
-  a missing or stale code index never regresses a resolution the direct scan can
-  still make.
+  registry-served declared-symbol scan the chunker and memlint use, in two
+  steps: it first checks the code index's `chunks` table for this project, and
+  a hit whose `code_meta.code_root` matches the `--code-root` given here
+  returns IMMEDIATELY — with no freshness check at all (an index built from a
+  now-edited file is trusted exactly like a fresh one). A miss there (member
+  symbols only — container names like class/struct/enum are never chunks
+  themselves, so a miss is never conclusive) falls back to scanning
+  `--code-root` directly; that direct scan is Swift-only regardless of the
+  file's real language (it calls `fragment_declared_in_text` with no
+  `rel_path`, so `chunkers.lang_for_path` never sees the file's actual
+  extension and always resolves to the swift backend) — rel_path-aware
+  dispatch on this fallback path is a later item.
 - **`drift`** — checks every active link's checkable `invariant:` against a code
   tree.
 - **`code-search`** — same RRF fusion as `search`. Each hit optionally carries a
