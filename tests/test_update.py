@@ -78,6 +78,16 @@ def engine_sha(root=None, scope="repo"):
     ).stdout.strip()
 
 
+def marked_store(path):
+    """The cheapest thing mc_is_marked_store accepts: a git working tree with
+    a topics/ directory. Used where a test needs a store that EXISTS but does
+    not need a full install to have produced it."""
+    Path(path).mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q", "."], cwd=path, check=True)
+    Path(path, "topics").mkdir(exist_ok=True)
+    return path
+
+
 def decisions_tsv(home):
     return Path(home, ".memcontinuum", "decisions.tsv")
 
@@ -1420,6 +1430,284 @@ class TestMachineLayerIsComparedSeparately(unittest.TestCase):
         tmpl.write_text(tmpl.read_text() + "\nA new paragraph.\n")
         act, out = row_action()
         self.assertEqual(act, "stale", out)
+
+
+class TestTargetedModeRequiresRecordedWiring(unittest.TestCase):
+    """`--add-lang`/`--never-ext` re-render the claude-dirs a row RECORDS.
+
+    A legacy row records none, and `<repo>/.claude` is a guess -- one this
+    command must not make: a project can have several claude-dirs and none of
+    them has to be the one under the repo. And a dir that IS on record still
+    has to carry this project's wiring before the installer is pointed at it;
+    this command re-renders what is installed, it never installs.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-update-targeted-test-")
+        self.home = str(Path(self.tmp) / "home")
+        os.makedirs(self.home, exist_ok=True)
+        self.repo = git_repo(str(Path(self.tmp) / "repo"))
+        self.store = marked_store(str(Path(self.tmp) / "store"))
+
+    def test_a_legacy_row_is_refused_and_no_claude_dir_is_substituted(self):
+        write_row(self.home, self.repo, "wired",
+                  note=f"store={self.store} project=p code-roots=/x langs=python")
+        before = decisions_tsv(self.home).read_text()
+        proc = run(UPDATE_SH, ["--add-lang", "swift", "--repo", self.repo], self.home)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("claude-dirs", combined, combined)
+        # The refusal must hand over the migration command, not just complain.
+        self.assertIn("--apply", combined, combined)
+        self.assertIn("--claude-dir", combined, combined)
+        self.assertFalse(Path(self.repo, ".claude").exists(),
+                         "<repo>/.claude was substituted for a row that records none")
+        self.assertEqual(decisions_tsv(self.home).read_text(), before)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_the_same_refusal_covers_never_ext(self):
+        """Same refusal, and it has to be THIS refusal: the code-root here is
+        real, so nothing else would stop the substituted dir being wired."""
+        code_root = str(Path(self.tmp) / "code")
+        os.makedirs(code_root, exist_ok=True)
+        (Path(code_root) / "x.py").write_text("print(1)\n")
+        write_row(self.home, self.repo, "wired",
+                  note=f"store={self.store} project=p code-roots={code_root} langs=python")
+        proc = run(UPDATE_SH, ["--never-ext", ".h", "--repo", self.repo], self.home)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("claude-dirs", proc.stdout + proc.stderr)
+        self.assertFalse(Path(self.repo, ".claude").exists())
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_a_recorded_but_unwired_dir_is_refused_and_never_installed_into(self):
+        code_root = str(Path(self.tmp) / "code")
+        os.makedirs(code_root, exist_ok=True)
+        (Path(code_root) / "x.py").write_text("print(1)\n")
+        store = str(Path(self.tmp) / "real-store")
+        claude_a = str(Path(self.repo) / ".claude")
+        claude_b = str(Path(self.tmp) / "never-installed" / ".claude")
+        os.makedirs(claude_b, exist_ok=True)
+        proc = run(INSTALL_SH, ["--project", "p", "--store", store,
+                                "--claude-dir", claude_a, "--code-root", code_root,
+                                "--langs", "python", "--non-interactive"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        # Hand-written: decide.sh would refuse to record claude_b at all, which
+        # is exactly why the updater must re-check rather than trust the row.
+        write_row(self.home, self.repo, "wired",
+                  note=(f"store={store} project=p claude-dirs={claude_a};{claude_b} "
+                        f"code-roots={code_root} langs=python"))
+        before_row = decisions_tsv(self.home).read_text()
+        before_a = Path(claude_a, "settings.local.json").read_text()
+
+        proc = run(UPDATE_SH, ["--add-lang", "swift", "--repo", self.repo], self.home)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("dir-not-wired", proc.stdout + proc.stderr)
+        self.assertFalse(Path(claude_b, "settings.local.json").exists(),
+                         "an unwired recorded dir must never be installed into")
+        self.assertFalse(Path(claude_b, "rules").exists())
+        self.assertEqual(Path(claude_a, "settings.local.json").read_text(), before_a,
+                         "the refusal must land before any dir is re-rendered")
+        self.assertEqual(decisions_tsv(self.home).read_text(), before_row)
+
+
+class TestTargetedModeRefusesARowWithNoCodeRoot(unittest.TestCase):
+    """repo-init ignores --langs/--never-ext when there is no --code-root to
+    wire them into, so recording them for a code-root-less row would write a
+    language set that renders nowhere. Refused before anything is written."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-update-nocr-test-")
+        self.home = str(Path(self.tmp) / "home")
+        os.makedirs(self.home, exist_ok=True)
+        self.repo = git_repo(str(Path(self.tmp) / "repo"))
+        self.store = str(Path(self.tmp) / "store")
+        self.claude_dir = str(Path(self.repo) / ".claude")
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_add_lang_is_refused_with_the_row_and_the_wiring_untouched(self):
+        proc = run(INSTALL_SH, ["--project", "p", "--store", self.store,
+                                "--claude-dir", self.claude_dir,
+                                "--non-interactive"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        proc = run(DECIDE_SH, ["wired", "--repo", self.repo, "--store", self.store,
+                               "--project", "p", "--claude-dir", self.claude_dir],
+                   self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        before_row = decisions_tsv(self.home).read_text()
+        before_settings = Path(self.claude_dir, "settings.local.json").read_text()
+
+        proc = run(UPDATE_SH, ["--add-lang", "python", "--repo", self.repo], self.home)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("no-code-root", proc.stdout + proc.stderr)
+        self.assertEqual(decisions_tsv(self.home).read_text(), before_row)
+        self.assertEqual(Path(self.claude_dir, "settings.local.json").read_text(),
+                         before_settings)
+
+
+class TestMultiDirLegacyMigrationRecoversPerDir(unittest.TestCase):
+    """One row is one project, and a project has ONE code-root/language set
+    applied to all of its claude-dirs. So a legacy row's parameters are
+    recovered from EVERY named dir, not from whichever was named first: two
+    dirs that disagree mean the recovery has no single answer, and replaying
+    the first dir's parameters onto the second would silently re-render it
+    with a set it never had."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-update-multidir-test-")
+        self.home = str(Path(self.tmp) / "home")
+        os.makedirs(self.home, exist_ok=True)
+        self.repo = git_repo(str(Path(self.tmp) / "repo"))
+        self.store = str(Path(self.tmp) / "store")
+        self.code_a = str(Path(self.tmp) / "code-a")
+        self.code_b = str(Path(self.tmp) / "code-b")
+        for d, name in ((self.code_a, "x.py"), (self.code_b, "y.swift")):
+            os.makedirs(d, exist_ok=True)
+            Path(d, name).write_text("// x\n")
+        self.claude_a = str(Path(self.repo) / ".claude")
+        self.claude_b = str(Path(self.tmp) / "session-home" / ".claude")
+        proc = run(INSTALL_SH, ["--project", "multi", "--store", self.store,
+                                "--claude-dir", self.claude_a, "--code-root", self.code_a,
+                                "--langs", "python", "--never-ext", ".cs",
+                                "--non-interactive"], self.home)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        proc = run(INSTALL_SH, ["--project", "multi", "--store", self.store,
+                                "--claude-dir", self.claude_b, "--code-root", self.code_b,
+                                "--langs", "swift", "--never-ext", ".h",
+                                "--non-interactive"], self.home)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        write_row(self.home, self.repo, "wired",
+                  note=f"store={self.store} project=multi")
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_disagreeing_dirs_are_refused_with_both_recoveries_printed(self):
+        before = decisions_tsv(self.home).read_text()
+        before_a = Path(self.claude_a, "settings.local.json").read_text()
+        before_b = Path(self.claude_b, "settings.local.json").read_text()
+        proc = run(UPDATE_SH, ["--apply", "--repo", self.repo,
+                               "--claude-dir", self.claude_a,
+                               "--claude-dir", self.claude_b], self.home)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("migrate-dirs-disagree", combined, combined)
+        # Both recoveries, so the human can see WHAT disagrees.
+        self.assertIn(self.code_a, combined, combined)
+        self.assertIn(self.code_b, combined, combined)
+        self.assertIn("python", combined, combined)
+        self.assertIn("swift", combined, combined)
+        self.assertEqual(decisions_tsv(self.home).read_text(), before)
+        self.assertEqual(Path(self.claude_a, "settings.local.json").read_text(), before_a)
+        self.assertEqual(Path(self.claude_b, "settings.local.json").read_text(), before_b)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_explicit_overrides_render_both_dirs_identically_and_record_them(self):
+        proc = run(UPDATE_SH, ["--apply", "--repo", self.repo,
+                               "--claude-dir", self.claude_a,
+                               "--claude-dir", self.claude_b,
+                               "--code-root", self.code_a, "--code-root", self.code_b,
+                               "--langs", "python,swift",
+                               "--set-never-ext", ".cs,.h"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        note = decisions_tsv(self.home).read_text().splitlines()[-1]
+        self.assertIn(f"claude-dirs={self.claude_a};{self.claude_b}", note, note)
+        self.assertIn(f"code-roots={self.code_a};{self.code_b}", note, note)
+        self.assertIn("langs=python;swift", note, note)
+        self.assertIn("never=.cs;.h", note, note)
+        for cd in (self.claude_a, self.claude_b):
+            settings = Path(cd, "settings.local.json").read_text()
+            self.assertIn("'*.py *.swift'", settings, cd)
+            self.assertIn("'*.cs *.h'", settings, cd)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_code_root_override_needs_repo_like_its_siblings(self):
+        """Accepted as a migration override -- and refused without --repo for
+        the same reason its siblings are, not because it is an unknown flag."""
+        proc = run(UPDATE_SH, ["--apply", "--code-root", self.code_a], self.home)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        combined = proc.stdout + proc.stderr
+        self.assertNotIn("unknown argument", combined, combined)
+        self.assertIn("ONE registry row", combined, combined)
+
+
+class TestStoreMissingOutranksNoWiring(UpdateTestBase):
+    """A dir with no wiring AND a store that is gone is not a wiring problem
+    to hand to the repair path -- it is a dead store, and saying `no-wiring`
+    there sends a human to re-install against a store that is not there."""
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_a_gone_store_wins_over_absent_wiring_in_the_table(self):
+        os.remove(Path(self.claude_dir, "settings.local.json"))
+        os.rename(self.store, self.store + "-renamed-away")
+        proc = run(UPDATE_SH, [], self.home)
+        rows = self.table_rows(proc.stdout)
+        self.assertEqual([r["action"] for r in rows], ["store-missing"], proc.stdout)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_apply_exits_nonzero_and_seeds_nothing(self):
+        os.remove(Path(self.claude_dir, "settings.local.json"))
+        os.rename(self.store, self.store + "-renamed-away")
+        proc = run(UPDATE_SH, ["--apply"], self.home)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("store-missing", proc.stdout + proc.stderr)
+        self.assertFalse(Path(self.store).exists())
+
+
+class TestTargetedMultiDirIsAllOrNothing(unittest.TestCase):
+    """As transactional as two installer runs can be made: every claude-dir is
+    dry-run FIRST, and only an all-clear turns into real writes. Otherwise a
+    row with two dirs re-renders the first with a new language set, fails on
+    the second, and leaves the project half-converted with a registry row that
+    describes neither half."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-update-txn-test-")
+        self.home = str(Path(self.tmp) / "home")
+        os.makedirs(self.home, exist_ok=True)
+        self.repo = git_repo(str(Path(self.tmp) / "repo"))
+        self.store = str(Path(self.tmp) / "store")
+        self.code_root = str(Path(self.tmp) / "code")
+        os.makedirs(self.code_root, exist_ok=True)
+        (Path(self.code_root) / "x.py").write_text("print(1)\n")
+        self.claude_a = str(Path(self.repo) / ".claude")
+        self.claude_b = str(Path(self.tmp) / "session-home" / ".claude")
+        for cd in (self.claude_a, self.claude_b):
+            proc = run(INSTALL_SH, ["--project", "p", "--store", self.store,
+                                    "--claude-dir", cd, "--code-root", self.code_root,
+                                    "--langs", "python", "--never-ext", ".cs",
+                                    "--non-interactive"], self.home)
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+        proc = run(DECIDE_SH, ["wired", "--repo", self.repo, "--store", self.store,
+                               "--project", "p", "--claude-dir", self.claude_a,
+                               "--claude-dir", self.claude_b,
+                               "--code-root", self.code_root, "--langs", "python",
+                               "--never-ext", ".cs"], self.home)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_a_second_dir_that_cannot_render_stops_the_first_from_rendering(self):
+        Path(self.claude_b, "rules", "memcontinuum.md").write_text("# not ours\n")
+        before_a = Path(self.claude_a, "settings.local.json").read_text()
+        before_row = decisions_tsv(self.home).read_text()
+
+        proc = run(UPDATE_SH, ["--add-lang", "swift", "--repo", self.repo], self.home)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(Path(self.claude_a, "settings.local.json").read_text(), before_a,
+                         "dir A was re-rendered even though dir B could not be")
+        # Byte-equality above is the real assertion; this names what would
+        # have changed. (MEMCONTINUUM_KNOWN_EXTS lists every extension this
+        # engine knows and mentions swift either way -- the language set that
+        # would have moved is MEMCONTINUUM_LANG_EXTS.)
+        self.assertIn("MEMCONTINUUM_LANG_EXTS='*.py'",
+                      Path(self.claude_a, "settings.local.json").read_text())
+        self.assertEqual(decisions_tsv(self.home).read_text(), before_row)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_the_all_clear_case_still_renders_every_dir_and_records_the_row(self):
+        proc = run(UPDATE_SH, ["--add-lang", "swift", "--repo", self.repo], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        for cd in (self.claude_a, self.claude_b):
+            self.assertIn("'*.py *.swift'", Path(cd, "settings.local.json").read_text(), cd)
+        note = decisions_tsv(self.home).read_text().splitlines()[-1]
+        self.assertIn("langs=python;swift", note, note)
 
 
 class TestHelp(unittest.TestCase):

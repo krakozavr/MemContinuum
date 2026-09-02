@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # usage: memcontinuum-update.sh [--dry-run | --apply] [--machine] [--repo PATH]
 #        memcontinuum-update.sh --apply --repo PATH --claude-dir DIR [--claude-dir DIR ...]
-#                               [--langs LIST] [--set-never-ext LIST]
+#                               [--code-root DIR ...] [--langs LIST] [--set-never-ext LIST]
 #        memcontinuum-update.sh --add-lang LANG [--never-ext .ext] --repo PATH
 #        memcontinuum-update.sh --never-ext .ext [--add-lang LANG] --repo PATH
 #
@@ -31,7 +31,8 @@
 #     action       ok | stale | store-mismatch | rules-stale | rules-missing
 #                  | rules-foreign | migrate | migrate-needs-claude-dirs |
 #                  migrate-needs-langs | migrate-needs-never-exts |
-#                  store-missing | no-wiring | unrecoverable
+#                  migrate-dirs-disagree | store-missing | no-wiring |
+#                  unrecoverable
 #
 #                  store-missing outranks every other answer, including a
 #                  stamp and a store= that both look right: those compare
@@ -80,6 +81,13 @@
 #       not "none". Add --langs LANG[,LANG].
 #   migrate-needs-never-exts    the never-mention list on the hook line is
 #       not a plain extension list. Add --set-never-ext .ext[,.ext].
+#   migrate-dirs-disagree       the named claude-dirs were recovered
+#       separately -- as they must be, since nothing ever wrote this row's
+#       parameters down -- and they do not hold the same code-roots,
+#       languages or never-list. One row is one project, and one project has
+#       one such set for all of its claude-dirs, so there is nothing here to
+#       record. Both recoveries are printed; say which set is right with
+#       --code-root DIR (repeatable), --langs LIST, --set-never-ext LIST.
 #   migrate                     everything needed is on record or recovered;
 #       --apply re-renders, and only then rewrites the row (via
 #       memcontinuum-decide.sh wired) to carry the parameters from now on.
@@ -195,6 +203,7 @@ SET_NEVER_EXT=""
 SET_NEVER_GIVEN=0
 TARGET_REPO=""
 declare -a OVERRIDE_CLAUDE_DIRS=()
+declare -a OVERRIDE_CODE_ROOTS=()
 need_value() { [ $# -ge 2 ] || { echo "missing value for $1" >&2; exit 2; }; }
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -205,6 +214,7 @@ while [ $# -gt 0 ]; do
         --never-ext) need_value "$@"; NEVER_EXT="$2"; shift 2 ;;
         --langs) need_value "$@"; LANGS_FLAG="$2"; shift 2 ;;
         --set-never-ext) need_value "$@"; SET_NEVER_EXT="$2"; SET_NEVER_GIVEN=1; shift 2 ;;
+        --code-root) need_value "$@"; OVERRIDE_CODE_ROOTS+=("$2"); shift 2 ;;
         --claude-dir) need_value "$@"; OVERRIDE_CLAUDE_DIRS+=("$2"); shift 2 ;;
         --repo) need_value "$@"; TARGET_REPO="$2"; shift 2 ;;
         -h|--help) usage 0 ;;
@@ -242,14 +252,18 @@ if [ "$TARGETED" -eq 0 ]; then
     # Migration overrides are per-row by nature -- a claude-dir set or a
     # language list belongs to ONE project. With several legacy rows on the
     # machine and no --repo, there would be no saying which row they meant.
-    if [ "${#OVERRIDE_CLAUDE_DIRS[@]}" -gt 0 ] || [ -n "$LANGS_FLAG" ] || [ "$SET_NEVER_GIVEN" -eq 1 ]; then
+    if [ "${#OVERRIDE_CLAUDE_DIRS[@]}" -gt 0 ] || [ "${#OVERRIDE_CODE_ROOTS[@]}" -gt 0 ] \
+           || [ -n "$LANGS_FLAG" ] || [ "$SET_NEVER_GIVEN" -eq 1 ]; then
         [ -n "$TARGET_REPO" ] || {
-            echo "--claude-dir/--langs/--set-never-ext describe ONE registry row, so they need --repo PATH to say which. (Without --repo this command walks every wired row and writes nothing it had to guess.)" >&2
+            echo "--claude-dir/--code-root/--langs/--set-never-ext describe ONE registry row, so they need --repo PATH to say which. (Without --repo this command walks every wired row and writes nothing it had to guess.)" >&2
             exit 2
         }
     fi
 elif [ "$SET_NEVER_GIVEN" -eq 1 ]; then
     echo "--set-never-ext supplies the whole never-list for a legacy row's MIGRATION (--apply --repo PATH --claude-dir DIR --set-never-ext LIST). To add one extension to a row that already has its parameters recorded, use --never-ext." >&2
+    exit 2
+elif [ "${#OVERRIDE_CODE_ROOTS[@]}" -gt 0 ]; then
+    echo "--code-root supplies a legacy row's code-root set during its MIGRATION (--apply --repo PATH --claude-dir DIR --code-root DIR). --add-lang/--never-ext re-render the code-roots the row already records; they never change them." >&2
     exit 2
 fi
 
@@ -536,13 +550,7 @@ process_claude_dir() {
     done < <(mc_wired_commands_for_project "$PROJECT" \
                  "$claude_dir/settings.local.json" "$claude_dir/settings.json")
 
-    if [ "${#lines[@]}" -eq 0 ]; then
-        mc_update_rules_state "$claude_dir"
-        print_row "$KEY" "$claude_dir" "none" "unknown" "$MC_RULES_STATE" "no-wiring"
-        return 0
-    fi
-
-    for line in "${lines[@]}"; do
+    for line in ${lines[@]+"${lines[@]}"}; do
         mc_command_env_value "$line" "MEMCONTINUUM_RENDERED"
         [ -n "$MC_ENV_VALUE" ] || MC_ENV_VALUE="none"
         if [ -z "$stamp" ]; then
@@ -559,6 +567,7 @@ process_claude_dir() {
             fi
         fi
     done
+    [ -n "$stamp" ] || stamp="none"
 
     mc_update_rules_state "$claude_dir"
 
@@ -577,8 +586,18 @@ process_claude_dir() {
     # installer would only repeat more loudly; the migrate-needs-* answers are
     # questions only a human can settle. Everything below them is drift this
     # command can and will re-render.
+    #
+    # It outranks `no-wiring` too, and that is the whole point of checking it
+    # before the wiring is even looked at. A claude-dir with none of this
+    # project's hook lines is normally the skill's repair path -- "finish the
+    # install". But when the store is gone as well, sending a human to
+    # re-install is sending them to seed a fresh store over a dead one and
+    # call the result repaired. The dead store is the fact that has to be
+    # said first.
     if ! mc_is_marked_store "$STORE"; then
         action="store-missing"
+    elif [ "${#lines[@]}" -eq 0 ]; then
+        action="no-wiring"
     elif [ "$MC_RULES_STATE" = "foreign" ]; then
         action="rules-foreign"
     elif [ "$LEGACY" -eq 1 ]; then
@@ -597,7 +616,12 @@ process_claude_dir() {
 
     print_row "$KEY" "$claude_dir" "$stamp" "$store_match" "$MC_RULES_STATE" "$action"
 
-    if [ "$APPLY" -eq 1 ] && [ "$action" != "ok" ]; then
+    # `no-wiring` is the one action --apply neither fixes nor fails on: a
+    # claude-dir with none of this project's hook lines is a broken or
+    # never-finished INSTALL, which is the memcontinuum skill's repair path
+    # (a human is asked), not this command's. A `wired` row is never a licence
+    # to wire anything.
+    if [ "$APPLY" -eq 1 ] && [ "$action" != "ok" ] && [ "$action" != "no-wiring" ]; then
         apply_claude_dir "$claude_dir" "$action"
     fi
     return 0
@@ -635,7 +659,7 @@ apply_claude_dir() {
     fi
 
     case "$action" in
-        migrate-needs-*)
+        migrate-needs-*|migrate-dirs-disagree)
             not_applied "  SKIPPED $claude_dir: $action -- $MIGRATE_BLOCKED_HINT"
             return 0
             ;;
@@ -690,11 +714,37 @@ if [ "$TARGETED" -eq 1 ]; then
     mc_note_field "$NOTE" "langs"; EXISTING_LANGS_SEMI="$MC_NOTE_FIELD"
     mc_note_field "$NOTE" "never"; EXISTING_NEVER_SEMI="$MC_NOTE_FIELD"
 
-    [ -n "$CLAUDE_DIRS_SEMI" ] || CLAUDE_DIRS_SEMI="$MC_REPO/.claude"
+    # A LEGACY row (no claude-dirs on record) is refused here, and no
+    # <repo>/.claude is put in its place. This mode re-renders the dirs the
+    # row NAMES; substituting the one directory this command can imagine is a
+    # guess with two ways to be wrong -- a project's wiring may live in a
+    # claude-dir outside the repo entirely (a session home), and it may live
+    # in more than one. Either way the substituted dir gets installed into or
+    # skipped, and the row is rewritten to describe a set nobody chose.
+    if [ -z "$CLAUDE_DIRS_SEMI" ]; then
+        echo "this row records no claude-dirs (it predates the registry recording them), and --add-lang/--never-ext re-render the dirs a row NAMES. $MC_REPO/.claude is not substituted for them: a project's wiring can live outside the repo, and in more than one place." >&2
+        echo "Migrate the row first -- name the full claude-dir set:" >&2
+        echo "  $0 --apply --repo $MC_REPO --claude-dir DIR [--claude-dir DIR ...]" >&2
+        echo "then re-run this command. Nothing was written." >&2
+        exit 1
+    fi
     [ -n "$STORE" ] && [ -n "$PROJECT" ] || {
         echo "row for $TARGET_REPO has no recorded store/project -- re-run repo-init and memcontinuum-decide.sh wired with --store/--project first" >&2
         exit 1
     }
+
+    # No code-roots means no code indexing is wired for this project at all,
+    # and repo-init IGNORES --langs/--never-ext without a --code-root to wire
+    # them into. Recording a language set here would put a value in the
+    # registry that renders nowhere and that every later re-render replays --
+    # a row describing wiring that does not exist.
+    if [ -z "$CODE_ROOTS_SEMI" ]; then
+        echo "no-code-root: this row records no code-roots, so there is no code indexing here for a language or never-extension to apply to -- repo-init ignores --langs/--never-ext without a --code-root, so nothing would render and the row would claim something that is wired nowhere." >&2
+        echo "Add a code-root first:" >&2
+        echo "  $DECIDE wired --repo $MC_REPO --store $STORE --project $PROJECT --claude-dir DIR [--claude-dir DIR ...] --code-root DIR" >&2
+        echo "and re-run repo-init there. Nothing was written." >&2
+        exit 1
+    fi
 
     # Additive union, never a drop: LANG/EXT already on the row stay.
     add_semi() {
@@ -767,6 +817,29 @@ PYEOF
 
     mc_split_semi "$CLAUDE_DIRS_SEMI"
     TARGET_CLAUDE_DIRS=(${MC_SPLIT[@]+"${MC_SPLIT[@]}"})
+
+    # Every recorded dir must ALREADY carry this project's wiring before the
+    # installer is pointed at it. A row is a record, not a warrant: it can name
+    # a directory that was never installed (hand-edited, or installed and then
+    # wiped), and running repo-init there would WIRE IT FROM SCRATCH -- this
+    # command's one prohibition. Checked for every dir before any of them is
+    # touched, so the refusal costs nothing half-done.
+    #
+    # Scoped to THIS project (mc_wired_commands_for_project), not to any
+    # MemContinuum wiring: one claude-dir can carry two projects' hook lines,
+    # and the other project's presence says nothing about this one's.
+    for TD in ${TARGET_CLAUDE_DIRS[@]+"${TARGET_CLAUDE_DIRS[@]}"}; do
+        [ -n "$TD" ] || continue
+        if ! mc_wired_commands_for_project "$PROJECT" \
+                "$TD/settings.local.json" "$TD/settings.json" >/dev/null; then
+            echo "dir-not-wired: the row records $TD, but it carries no wiring for project $PROJECT. This command re-renders what is installed; it never wires a directory from scratch (the memcontinuum skill does that, with a human answering)." >&2
+            echo "Either install it there first, or drop it from the row:" >&2
+            echo "  $DECIDE wired --repo $MC_REPO --store $STORE --project $PROJECT --claude-dir DIR [--claude-dir DIR ...]" >&2
+            echo "Nothing was written -- no dir was re-rendered and the registry row is unchanged." >&2
+            exit 1
+        fi
+    done
+
     mc_build_wiring_args "$CODE_ROOTS_SEMI" "$LANGS_COMMA" "$NEVER_COMMA"
     WIRING_ARGS=(${MC_BUILT_ARGS[@]+"${MC_BUILT_ARGS[@]}"})
 
@@ -797,19 +870,47 @@ PYEOF
     # claiming a language set that exists nowhere -- and every later
     # re-render replays that claim. If any claude-dir fails, the row is left
     # exactly as it was.
+    # ALL-OR-NOTHING, as far as two installer runs can be made to be. Every
+    # claude-dir is DRY-RUN first, and only an all-clear turns into real
+    # writes. The dirs on one row share one language/never set by
+    # construction, so re-rendering the first with a new set and then failing
+    # on the second leaves a project half-converted -- two claude-dirs
+    # disagreeing about what it indexes, and a registry row describing
+    # neither. repo-init's refusals (a foreign rules file, an unwritable
+    # claude-dir, a store that went missing) all fire in --dry-run, before it
+    # writes anything, which is what makes the preflight worth running.
     RC=0
     for d in ${TARGET_CLAUDE_DIRS[@]+"${TARGET_CLAUDE_DIRS[@]}"}; do
-        REINIT_ARGS=(--project "$PROJECT" --store "$STORE" --claude-dir "$d" --non-interactive --adopt-only)
+        REINIT_ARGS=(--project "$PROJECT" --store "$STORE" --claude-dir "$d" --non-interactive --adopt-only --dry-run)
         REINIT_ARGS+=(${WIRING_ARGS[@]+"${WIRING_ARGS[@]}"})
-        if ! "$MC_BASH_BIN" "$REPO_INIT" "${REINIT_ARGS[@]}"; then
-            echo "ERROR: re-render failed for $d -- see above" >&2
+        if ! "$MC_BASH_BIN" "$REPO_INIT" "${REINIT_ARGS[@]}" >"$SBOX_APPLY_LOG" 2>&1; then
+            echo "ERROR: $d would not re-render:" >&2
+            sed 's/^/    /' "$SBOX_APPLY_LOG" >&2
             RC=1
         fi
     done
     if [ "$RC" -ne 0 ]; then
-        echo "ERROR: at least one claude-dir did not re-render -- the registry row was NOT changed (it still describes the wiring that is actually on disk)." >&2
+        echo "ERROR: at least one claude-dir could not be re-rendered, so NONE of them was. The dirs on this row share one language and never-extension set; converting some of them would leave the project describing itself two different ways. Nothing was written anywhere and the registry row is unchanged -- fix what is named above and re-run." >&2
         exit 1
     fi
+
+    APPLIED_DIRS=""
+    for d in ${TARGET_CLAUDE_DIRS[@]+"${TARGET_CLAUDE_DIRS[@]}"}; do
+        REINIT_ARGS=(--project "$PROJECT" --store "$STORE" --claude-dir "$d" --non-interactive --adopt-only)
+        REINIT_ARGS+=(${WIRING_ARGS[@]+"${WIRING_ARGS[@]}"})
+        if ! "$MC_BASH_BIN" "$REPO_INIT" "${REINIT_ARGS[@]}"; then
+            # Its dry run passed and the real run did not, so something
+            # changed underneath us (a permission, a disk, a concurrent edit).
+            # The preflight cannot rule this out, and an installer run cannot
+            # be rolled back -- so the one thing left is to say exactly what
+            # is now inconsistent, rather than exiting with a bare failure
+            # over a project that is genuinely half-converted.
+            echo "ERROR: re-render failed for $d -- see above. Its dry run had passed, so this failed part way." >&2
+            echo "DRIFT: ${APPLIED_DIRS:-(no dir)} re-rendered with the new parameters; $d did not. The registry row was NOT changed, so it still describes the old set -- which now matches neither half. Fix what failed above and re-run this same command to converge (re-rendering an already-current dir is a no-op)." >&2
+            exit 1
+        fi
+        APPLIED_DIRS="${APPLIED_DIRS:+$APPLIED_DIRS, }$d"
+    done
 
     if ! "$MC_BASH_BIN" "$DECIDE" "${DECIDE_ARGS[@]}"; then
         echo "ERROR: the re-render succeeded but the registry row could not be rewritten -- see above. Re-run this command to try the row again." >&2
@@ -903,13 +1004,21 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
         fi
     fi
 
-    # A legacy row's code-roots/langs/never are recovered ONCE, from the
-    # first claude-dir's own rendered settings (repo-init installs one
-    # coherent set per project; several claude-dirs for the same project
-    # render the same set -- see INC-0104). Recovered here, before the
-    # per-claude-dir walk, so every claude-dir's `migrate` apply (below)
-    # uses the same recovered values, and the end-of-row registry rewrite
-    # only has to happen once.
+    # A legacy row's code-roots/langs/never are recovered from EVERY one of
+    # its claude-dirs, not from whichever happens to be first.
+    #
+    # The doctrine the recovery has to hold up: one row is one project, and a
+    # project has ONE code-root/language/never set, applied to all of its
+    # claude-dirs. Reading the first dir and replaying its parameters onto the
+    # rest ASSUMES that -- and the whole reason a legacy row is being migrated
+    # is that nothing ever wrote the parameters down, so nothing enforced it
+    # either. Two dirs installed months apart can genuinely differ. Replaying
+    # the first one's set would silently re-render the second with languages
+    # it never indexed and a never-list it never had, and record the result as
+    # if a human had chosen it. So: recover per dir, and when the dirs
+    # disagree, refuse and show both recoveries. The human resolves it with
+    # explicit --code-root/--langs/--set-never-ext, which is the only place
+    # that answer can come from.
     LEGACY_ACTION="migrate"
     MIGRATE_BLOCKED_HINT=""
     # Reset per row: the registry row is rewritten only when every one of this
@@ -918,21 +1027,90 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
     MIGRATE_RENDER_FAILED=0
     if [ "$LEGACY" -eq 1 ]; then
         FIRST_CLAUDE_DIR="${CLAUDE_DIRS_SEMI%%;*}"
-        mc_update_recover_from_settings "$PROJECT" "$FIRST_CLAUDE_DIR"
-        [ -n "$CODE_ROOTS_SEMI" ] || CODE_ROOTS_SEMI="$MC_RECOVERED_CODE_ROOTS"
-        [ -n "$LANGS_COMMA" ] || LANGS_COMMA="$MC_RECOVERED_LANGS"
-        [ -n "$NEVER_COMMA" ] || NEVER_COMMA="$MC_RECOVERED_NEVER"
+
+        # A named claude-dir must ALREADY carry this project's wiring. Checked
+        # BEFORE the recovery below, not after: recovering from a dir with no
+        # wiring yields three empty answers, which would then read as a
+        # disagreement with the dirs that do have wiring -- the right refusal
+        # for the wrong reason. This command records what is installed; it
+        # never wires a directory from scratch -- that is the skill's job,
+        # with a human answering.
+        if [ "$CLAUDE_DIRS_EXPLICIT" -eq 1 ]; then
+            mc_split_semi "$CLAUDE_DIRS_SEMI"
+            for OD in ${MC_SPLIT[@]+"${MC_SPLIT[@]}"}; do
+                if ! mc_wired_commands_for_project "$PROJECT" \
+                        "$OD/settings.local.json" "$OD/settings.json" >/dev/null; then
+                    echo "REFUSED: --claude-dir $OD carries no wiring for project $PROJECT. This command records claude-dirs that are already installed; it never wires one from scratch. Install it first (the memcontinuum skill does this), then re-run. Nothing was written." >&2
+                    WALK_RC=1
+                    continue 2
+                fi
+            done
+        fi
+
+        REC_CODE_ROOTS=""
+        REC_LANGS=""
+        REC_NEVER=""
+        REC_LANGS_OK=1
+        REC_NEVER_OK=1
+        REC_LANG_NOTE=""
+        REC_FIRST=1
+        REC_REPORT=""
+        DISAGREE_CODE_ROOTS=0
+        DISAGREE_LANGS=0
+        DISAGREE_NEVER=0
+        mc_split_semi "$CLAUDE_DIRS_SEMI"
+        for RD in ${MC_SPLIT[@]+"${MC_SPLIT[@]}"}; do
+            mc_update_recover_from_settings "$PROJECT" "$RD"
+            REC_REPORT="$REC_REPORT
+      $RD: code-roots=${MC_RECOVERED_CODE_ROOTS:-(none)} langs=${MC_RECOVERED_LANGS:-(none)} never=${MC_RECOVERED_NEVER:-(none)}"
+            # "cannot be read back" from ANY dir blocks the whole row: the row
+            # describes all of them at once.
+            [ "$MC_RECOVERED_LANGS_OK" -eq 0 ] && REC_LANGS_OK=0
+            [ "$MC_RECOVERED_NEVER_OK" -eq 0 ] && REC_NEVER_OK=0
+            if [ "$REC_FIRST" -eq 1 ]; then
+                REC_CODE_ROOTS="$MC_RECOVERED_CODE_ROOTS"
+                REC_LANGS="$MC_RECOVERED_LANGS"
+                REC_NEVER="$MC_RECOVERED_NEVER"
+                REC_LANG_NOTE="$MC_RECOVERED_LANG_NOTE"
+                REC_FIRST=0
+            else
+                [ "$MC_RECOVERED_CODE_ROOTS" = "$REC_CODE_ROOTS" ] || DISAGREE_CODE_ROOTS=1
+                [ "$MC_RECOVERED_LANGS" = "$REC_LANGS" ] || DISAGREE_LANGS=1
+                [ "$MC_RECOVERED_NEVER" = "$REC_NEVER" ] || DISAGREE_NEVER=1
+            fi
+        done
+
+        [ -n "$CODE_ROOTS_SEMI" ] || CODE_ROOTS_SEMI="$REC_CODE_ROOTS"
+        [ -n "$LANGS_COMMA" ] || LANGS_COMMA="$REC_LANGS"
+        [ -n "$NEVER_COMMA" ] || NEVER_COMMA="$REC_NEVER"
         # Command-line overrides win over anything recovered -- they are the
-        # human's answer to exactly the question the recovery could not.
-        [ -n "$LANGS_FLAG" ] && LANGS_COMMA="$LANGS_FLAG"
-        [ "$SET_NEVER_GIVEN" -eq 1 ] && NEVER_COMMA="$SET_NEVER_EXT"
+        # human's answer to exactly the question the recovery could not settle.
+        # An overridden field is also no longer a disagreement: the answer has
+        # been given, so what the dirs happen to hold no longer decides it.
+        if [ "${#OVERRIDE_CODE_ROOTS[@]}" -gt 0 ]; then
+            CODE_ROOTS_SEMI="$(join_semi ${OVERRIDE_CODE_ROOTS[@]+"${OVERRIDE_CODE_ROOTS[@]}"})"
+            DISAGREE_CODE_ROOTS=0
+        fi
+        if [ -n "$LANGS_FLAG" ]; then
+            LANGS_COMMA="$LANGS_FLAG"
+            DISAGREE_LANGS=0
+        fi
+        if [ "$SET_NEVER_GIVEN" -eq 1 ]; then
+            NEVER_COMMA="$SET_NEVER_EXT"
+            DISAGREE_NEVER=0
+        fi
+
+        DISAGREE_FIELDS=""
+        [ "$DISAGREE_CODE_ROOTS" -eq 1 ] && DISAGREE_FIELDS="${DISAGREE_FIELDS:+$DISAGREE_FIELDS, }code-roots"
+        [ "$DISAGREE_LANGS" -eq 1 ] && DISAGREE_FIELDS="${DISAGREE_FIELDS:+$DISAGREE_FIELDS, }langs"
+        [ "$DISAGREE_NEVER" -eq 1 ] && DISAGREE_FIELDS="${DISAGREE_FIELDS:+$DISAGREE_FIELDS, }never"
 
         # Anything the rendered extension list carries that the recovered
         # language set does not account for is said out loud, under the row it
         # belongs to. The table has no note column, and a difference nobody is
         # told about is how a migration records less than what is wired.
-        if [ -n "$MC_RECOVERED_LANG_NOTE" ] && [ -z "$LANGS_FLAG" ]; then
-            echo "  $KEY: partially rendered -- $MC_RECOVERED_LANG_NOTE. Recorded languages: ${LANGS_COMMA:-(none)}. Pass --langs LIST to record something else." >&2
+        if [ -n "$REC_LANG_NOTE" ] && [ -z "$LANGS_FLAG" ]; then
+            echo "  $KEY: partially rendered -- $REC_LANG_NOTE. Recorded languages: ${LANGS_COMMA:-(none)}. Pass --langs LIST to record something else." >&2
         fi
 
         # The migration PROPOSES and refuses; it never writes a value it had
@@ -945,29 +1123,19 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
     $0 --apply --repo $KEY --claude-dir $FIRST_CLAUDE_DIR [--claude-dir DIR ...]
   or record it directly with:
     $MIGRATE_FIX_CMD"
-        elif [ "$MC_RECOVERED_LANGS_OK" -eq 0 ] && [ -z "$LANGS_FLAG" ]; then
+        elif [ -n "$DISAGREE_FIELDS" ]; then
+            LEGACY_ACTION="migrate-dirs-disagree"
+            MIGRATE_BLOCKED_HINT="the claude-dirs named for this row do not agree on: $DISAGREE_FIELDS. One row is one project, and one project has ONE code-root, language and never-extension set, applied to every claude-dir it wires -- so there is no single answer to record here, and picking one dir's would silently re-render the others with parameters they never had. What each dir carries right now:$REC_REPORT
+  Say which set this project has, and re-run with the same --claude-dir flags plus the fields that disagree:
+    $0 --apply --repo $KEY --claude-dir DIR [--claude-dir DIR ...] [--code-root DIR ...] [--langs LANG[,LANG]] [--set-never-ext .ext[,.ext]]"
+        elif [ "$REC_LANGS_OK" -eq 0 ] && [ -z "$LANGS_FLAG" ]; then
             LEGACY_ACTION="migrate-needs-langs"
             MIGRATE_BLOCKED_HINT="the wiring at $FIRST_CLAUDE_DIR was rendered before the language set was written onto the hook line, so which languages this project indexes cannot be read back. That is UNKNOWN, not none -- recording it as none would turn code indexing off for a project that had it on. Name the set and re-run:
     $0 --apply --repo $KEY --claude-dir $FIRST_CLAUDE_DIR --langs LANG[,LANG]"
-        elif [ "$MC_RECOVERED_NEVER_OK" -eq 0 ] && [ "$SET_NEVER_GIVEN" -eq 0 ]; then
+        elif [ "$REC_NEVER_OK" -eq 0 ] && [ "$SET_NEVER_GIVEN" -eq 0 ]; then
             LEGACY_ACTION="migrate-needs-never-exts"
             MIGRATE_BLOCKED_HINT="the never-mention list rendered at $FIRST_CLAUDE_DIR is not a plain extension list, so it cannot be read back. Name it and re-run:
     $0 --apply --repo $KEY --claude-dir $FIRST_CLAUDE_DIR --set-never-ext .ext[,.ext]"
-        fi
-
-        # A named claude-dir must ALREADY carry this project's wiring. This
-        # command records what is installed; it never wires a directory from
-        # scratch -- that is the skill's job, with a human answering.
-        if [ "$CLAUDE_DIRS_EXPLICIT" -eq 1 ]; then
-            mc_split_semi "$CLAUDE_DIRS_SEMI"
-            for OD in ${MC_SPLIT[@]+"${MC_SPLIT[@]}"}; do
-                if ! mc_wired_commands_for_project "$PROJECT" \
-                        "$OD/settings.local.json" "$OD/settings.json" >/dev/null; then
-                    echo "REFUSED: --claude-dir $OD carries no wiring for project $PROJECT. This command records claude-dirs that are already installed; it never wires one from scratch. Install it first (the memcontinuum skill does this), then re-run. Nothing was written." >&2
-                    WALK_RC=1
-                    continue 2
-                fi
-            done
         fi
     fi
 
