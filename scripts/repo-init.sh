@@ -9,6 +9,7 @@
 # Usage:
 #   repo-init.sh --project NAME [--store DIR] [--code-root DIR ...]
 #              [--claude-dir DIR] [--python PATH] [--bootstrap-venv [DIR]]
+#              [--langs LIST] [--never-ext LIST] [--non-interactive]
 #              [--dry-run] [--force]
 #
 # An explicit --store REQUIRES an explicit --claude-dir alongside it (fix-
