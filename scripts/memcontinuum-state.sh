@@ -37,12 +37,12 @@
 
 set -u
 
-# --help must never be mistaken for a REPO path: reporting `path=--help
-# state=not-a-repo` looks like a real answer. Handled before anything else so
-# it works with no config, no registry lib, and no git.
-case "${1:-}" in
-    -h|--help)
-        cat <<'USAGE'
+# --help (and any other unrecognised flag) must never be mistaken for a REPO
+# path: reporting `path=--help state=not-a-repo` looks like a real answer.
+# Handled before anything else so it works with no config, no registry lib,
+# and no git.
+usage() {
+    cat <<'USAGE'
 usage: memcontinuum-state.sh [REPO_PATH]
 
 Report one repository's MemContinuum state on stdout, for the `memcontinuum`
@@ -83,8 +83,12 @@ wired. `scripts/memcontinuum-update.sh --dry-run` is the check that does.
 
 Recording an answer is a different command: memcontinuum-decide.sh.
 USAGE
-        exit 0
-        ;;
+    exit "${1:-1}"
+}
+
+case "${1:-}" in
+    -h|--help) usage 0 ;;
+    --*) echo "unknown argument: $1" >&2; usage 1 ;;
 esac
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"

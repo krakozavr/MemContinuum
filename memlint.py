@@ -341,20 +341,31 @@ def lint_root(root: Path, code_root: Path | None = None) -> tuple[list[str], lis
     return all_errors, all_warnings
 
 
-def parse_argv(argv: list[str]) -> tuple[str | None, str | None]:
-    """ROOT positional + optional --code-root PATH, in either order."""
+def parse_argv(argv: list[str]) -> tuple[str | None, str | None, str | None]:
+    """ROOT positional + optional --code-root PATH, in either order.
+
+    H6: any other `--flag` used to fall through the `elif root is None`
+    branch below and get accepted AS the ROOT positional -- `memlint.py
+    --anything` linted a nonexistent path named "--anything", found nothing
+    under it, and printed "memlint: clean" at exit 0. The third return value
+    names the first such flag seen, so the caller can refuse it instead of
+    treating it as a path.
+    """
     root = None
     code_root = None
+    unknown = None
     i = 0
     while i < len(argv):
         a = argv[i]
         if a == "--code-root":
             i += 1
             code_root = argv[i] if i < len(argv) else None
+        elif a.startswith("--") and unknown is None:
+            unknown = a
         elif root is None:
             root = a
         i += 1
-    return root, code_root
+    return root, code_root, unknown
 
 
 USAGE = """usage: memlint.py ROOT [--code-root PATH]
@@ -383,7 +394,11 @@ def main(argv=None) -> int:
     if "-h" in argv or "--help" in argv:
         print(USAGE)
         return 0
-    root_str, code_root_str = parse_argv(argv)
+    root_str, code_root_str, unknown = parse_argv(argv)
+    if unknown is not None:
+        print(f"unknown argument: {unknown}", file=sys.stderr)
+        print(USAGE, file=sys.stderr)
+        return 2
     if not root_str:
         print(USAGE, file=sys.stderr)
         return 2

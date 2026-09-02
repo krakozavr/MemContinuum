@@ -55,6 +55,13 @@ HELP_COMMANDS = [
     ("memcontinuum-update.sh --help",
      ["bash", str(TOOLS_DIR / "scripts" / "memcontinuum-update.sh"), "--help"]),
     ("memlint.py --help", [PYTHON, str(TOOLS_DIR / "memlint.py"), "--help"]),
+    ("memidx.py --help", [PYTHON, str(TOOLS_DIR / "memidx.py"), "--help"]),
+] + [
+    (f"memidx.py {sub} --help", [PYTHON, str(TOOLS_DIR / "memidx.py"), sub, "--help"])
+    for sub in [
+        "reindex", "search", "chain", "for-path", "check", "why", "drift",
+        "unmapped", "code-reindex", "code-search", "code-census", "stats",
+    ]
 ]
 
 # Each entry: (human name, compiled pattern). Patterns are deliberately narrow
@@ -74,6 +81,11 @@ FORBIDDEN = [
     ("roadmap vocabulary", re.compile(r"\bmilestone", re.I)),
     ("build-brief store name", re.compile(r"\bStore [A-Z]\b")),
     ("phantom schema section", re.compile(r"§G\d")),
+    ("pre-fix archaeology", re.compile(r"pre-fix", re.I)),
+    ("legacy wording", re.compile(r"\blegacy", re.I)),
+    ("grandfathered wording", re.compile(r"grandfathered", re.I)),
+    ("backward-compatible wording", re.compile(r"backward-compatible", re.I)),
+    ("Migration note heading", re.compile(r"Migration note", re.I)),
 ]
 
 PUBLIC_DOCS = [
@@ -282,11 +294,15 @@ class TestDocumentedHelpFlagsWork(unittest.TestCase):
 
 
 # Commands with a real option parser: an argument loop with an
-# `*) unknown argument` arm. memlint.py and memcontinuum-state.sh are
-# deliberately absent -- neither has one (state.sh takes a bare REPO_PATH,
-# memlint.py a bare ROOT), so an unrecognised flag is swallowed as the
-# positional rather than refused, and probing them could not tell "the parser
-# accepts this" from "the parser mistook it for a path".
+# `*) unknown argument` arm, cataloguing several named flags a --help text
+# and the parser must agree on. memlint.py and memcontinuum-state.sh are
+# deliberately absent from THIS list -- each takes only a bare positional
+# (ROOT, REPO_PATH) plus, for memlint.py, one named `--code-root`, so neither
+# has the >=5-flag matrix this list's tests probe, and memlint.py's parser
+# lives in Python, not one of these scripts' `--foo)` case arms. Both DO now
+# refuse an unrecognised `--flag` (H6) -- covered separately below,
+# TestUnparsedCommandsStillRefuseUnknownFlags, with the same negative-control
+# shape as test_the_probe_is_actually_refused.
 PARSED_COMMANDS = [
     ("memcontinuum-setup.sh", ["bash", str(TOOLS_DIR / "memcontinuum-setup.sh")], []),
     ("repo-init.sh", ["bash", str(TOOLS_DIR / "scripts" / "repo-init.sh")], []),
@@ -413,6 +429,33 @@ class TestHelpTextsAgreeWithTheParsers(unittest.TestCase):
                         f"{label} accepts {flag} and its --help never says so")
 
 
+class TestUnparsedCommandsStillRefuseUnknownFlags(unittest.TestCase):
+    """H6: memlint.py and memcontinuum-state.sh sit outside PARSED_COMMANDS
+    (neither has the named-flag matrix that list's tests probe -- see the
+    comment above it), but both must still refuse an unrecognised `--flag`
+    rather than swallow it as their one positional argument. Same negative
+    control as TestHelpTextsAgreeWithTheParsers.test_the_probe_is_actually_
+    refused, scoped to these two."""
+
+    def _run(self, argv):
+        env = dict(os.environ)
+        env["PYTHONPATH"] = ""
+        return subprocess.run(
+            argv, cwd=str(TOOLS_DIR), env=env, capture_output=True, text=True,
+        )
+
+    def test_memlint_refuses_the_probe_flag(self):
+        proc = self._run([PYTHON, str(TOOLS_DIR / "memlint.py"), PROBE_FLAG])
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("unknown argument: " + PROBE_FLAG, proc.stdout + proc.stderr)
+
+    def test_state_sh_refuses_the_probe_flag(self):
+        proc = self._run(
+            ["bash", str(TOOLS_DIR / "scripts" / "memcontinuum-state.sh"), PROBE_FLAG])
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("unknown argument: " + PROBE_FLAG, proc.stdout + proc.stderr)
+
+
 class TestDocumentedSkipBehaviour(unittest.TestCase):
     """The README promises that the tests needing machine-local data skip with
     a clear message rather than failing. Verified by running the one suite that
@@ -446,6 +489,63 @@ class TestInternalsIsLinked(unittest.TestCase):
         self.assertIn(
             "docs/INTERNALS.md", text,
             "README must point maintainers at docs/INTERNALS.md",
+        )
+
+
+class TestReadmeListsEveryDocumentedMemidxSubcommand(unittest.TestCase):
+    """A memidx.py subcommand only shows up in `memidx.py --help`'s own
+    subcommand listing when its subparser was given a `help=` description
+    (argparse renders those as indented sub-bullets under "positional
+    arguments:"; a subcommand with none renders bare, undiscoverable from
+    --help alone). The README's "commands a person actually types" block is
+    supposed to name every one of those -- checked by parsing --help rather
+    than trusting a maintainer to also remember the README when a new
+    subcommand gets a description."""
+
+    def _documented_subcommands(self):
+        env = dict(os.environ)
+        env["PYTHONPATH"] = ""
+        proc = subprocess.run(
+            [PYTHON, str(TOOLS_DIR / "memidx.py"), "--help"],
+            cwd=str(TOOLS_DIR), env=env, capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        names = []
+        in_positional = False
+        for line in proc.stdout.splitlines():
+            if line.strip() == "positional arguments:":
+                in_positional = True
+                continue
+            if not in_positional:
+                continue
+            if not line.startswith(" ") or line.strip() == "options:":
+                break
+            m = re.match(r"^ {4}(\S+)\s{2,}\S", line)
+            if m:
+                names.append(m.group(1))
+        return names
+
+    def _commands_block(self):
+        text = README.read_text()
+        marker = "The commands a person actually types."
+        idx = text.index(marker)
+        fence_start = text.index("```", idx)
+        fence_end = text.index("```", fence_start + 3)
+        return text[fence_start:fence_end]
+
+    def test_the_scan_finds_at_least_one_documented_subcommand(self):
+        # Guards the guard: a broken --help parse would pass vacuously below.
+        self.assertGreaterEqual(len(self._documented_subcommands()), 1)
+
+    def test_readme_names_every_documented_subcommand(self):
+        names = self._documented_subcommands()
+        block = self._commands_block()
+        missing = [n for n in names if f"memidx.py {n} " not in block]
+        self.assertEqual(
+            missing, [],
+            f"memidx.py --help documents {names} with a help= description, "
+            f"and the README's \"commands a person actually types\" block "
+            f"never mentions {missing}",
         )
 
 
