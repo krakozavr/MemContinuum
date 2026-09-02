@@ -420,10 +420,12 @@ class TestFreshInstall(unittest.TestCase):
         self.assertTrue(rules.is_file())
         text = rules.read_text()
         lines = text.splitlines()
-        self.assertEqual(
-            lines[0],
-            "<!-- memcontinuum-rules v1 — rendered by MemContinuum repo-init; do not hand-edit -->",
-        )
+        # From the template that defines it, never a copy: a second copy here
+        # would have to be edited in lockstep with the template, and a test
+        # comparing two copies of a string proves only that they match.
+        template_marker = (TOOLS_DIR / "templates" / "memcontinuum-rules.md"
+                           ).read_text().splitlines()[0]
+        self.assertEqual(lines[0], template_marker)
         self.assertEqual(lines[1], f"<!-- memcontinuum-rendered: {self._engine_sha()} -->")
         self.assertIn(f"MemContinuum store ({self.store})", text)
         self.assertNotIn("{{STORE}}", text)
@@ -2233,18 +2235,21 @@ class TestAdoptOnly(unittest.TestCase):
         self.assertFalse(Path(self.claude_dir, "settings.local.json").exists(),
                          "--adopt-only refused: no wiring may be written either")
 
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
     def test_refuses_when_the_store_path_does_not_exist(self):
         proc = self._install(["--adopt-only"])
         self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("store-missing", proc.stdout + proc.stderr)
         self._assert_nothing_created()
 
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
     def test_refuses_under_dry_run_too(self):
         proc = self._install(["--adopt-only", "--dry-run"])
         self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("store-missing", proc.stdout + proc.stderr)
         self._assert_nothing_created()
 
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
     def test_refuses_a_plain_directory_that_is_not_a_git_repo(self):
         os.makedirs(self.store)
         proc = self._install(["--adopt-only"])
@@ -2253,6 +2258,7 @@ class TestAdoptOnly(unittest.TestCase):
         self.assertFalse(Path(self.store, ".git").exists())
         self.assertFalse(Path(self.claude_dir, "settings.local.json").exists())
 
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
     def test_refuses_a_git_repo_without_this_tools_markers(self):
         os.makedirs(self.store)
         subprocess.run(["git", "init", "-q", "."], cwd=self.store, check=True)
@@ -2269,6 +2275,7 @@ class TestAdoptOnly(unittest.TestCase):
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
         self.assertIn("adopted", again.stdout)
 
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
     def test_help_documents_it(self):
         proc = run_install(["--help"], self.home, python=None)
         self.assertEqual(proc.returncode, 0, proc.stderr)

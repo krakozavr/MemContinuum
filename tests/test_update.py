@@ -358,6 +358,10 @@ class TestUpdateWalkStaleAndOk(UpdateTestBase):
     def test_missing_wiring_is_reported_as_no_wiring_and_never_auto_applied(self):
         Path(self.claude_dir, "settings.local.json").unlink()
         proc = run(UPDATE_SH, ["--apply"], self.home)
+        # The documented exception to "--apply fails on anything left undone":
+        # a claude-dir with no wiring at all is a broken install, which the
+        # skill repairs by asking a human. Not this command's work to leave
+        # undone, so not this command's failure.
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         rows = self.table_rows(proc.stdout)
         self.assertEqual(rows[0]["action"], "no-wiring")
@@ -785,6 +789,27 @@ class TestMigrationNeverInventsALanguageSet(unittest.TestCase):
         self.assertEqual(decisions_tsv(self.home).read_text(), before)
 
     @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_a_failed_rerender_leaves_the_legacy_row_untouched(self):
+        """The other half of "rewrite only after a successful re-render": not
+        a refusal this command made up front, but the installer actually
+        failing part way. The row must be exactly as it was, and the walk must
+        exit non-zero."""
+        path = Path(self.claude_dir, "settings.local.json")
+        # Unparseable JSON, hook command lines intact: the walk still sees
+        # wiring here (it greps), so this is a real re-render attempt that
+        # fails inside the installer, not a `no-wiring` skip.
+        path.write_text(path.read_text() + "\nNOT JSON AT ALL\n")
+        before = decisions_tsv(self.home).read_text()
+        proc = run(UPDATE_SH, ["--apply", "--repo", self.repo,
+                               "--claude-dir", self.claude_dir,
+                               "--langs", "python"], self.home)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("FAILED", proc.stdout + proc.stderr)
+        self.assertEqual(decisions_tsv(self.home).read_text(), before,
+                         "a row rewritten after a failed render would describe "
+                         "wiring that exists nowhere")
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
     def test_explicit_langs_completes_the_migration(self):
         proc = run(UPDATE_SH, ["--apply", "--repo", self.repo,
                                "--claude-dir", self.claude_dir,
@@ -998,14 +1023,19 @@ class TestRulesMarkerComesFromTheTemplate(unittest.TestCase):
     def marker(self):
         return self.TEMPLATE.read_text().splitlines()[0]
 
-    def test_no_script_hardcodes_the_marker_text(self):
+    def test_nothing_outside_the_template_hardcodes_the_marker_text(self):
+        """Scripts AND tests: a copy in a test is the same lockstep-edit
+        problem, and a test comparing two copies of a string proves only that
+        the two copies match."""
         marker = self.marker()
-        for script in ("scripts/repo-init.sh", "scripts/memcontinuum-update.sh"):
-            text = (TOOLS_DIR / script).read_text()
-            self.assertNotIn(
-                marker, text,
-                f"{script} still carries a copy of the rules identity marker -- "
-                "read line 1 of templates/memcontinuum-rules.md at runtime instead")
+        offenders = []
+        for path in sorted(TOOLS_DIR.glob("scripts/*.sh")) + sorted(TOOLS_DIR.glob("tests/*.py")):
+            if marker in path.read_text():
+                offenders.append(str(path.relative_to(TOOLS_DIR)))
+        self.assertEqual(
+            offenders, [],
+            "these carry a copy of the rules identity marker -- read line 1 of "
+            f"templates/memcontinuum-rules.md instead: {offenders}")
 
     @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
     def test_a_changed_template_marker_still_round_trips(self):
