@@ -31,10 +31,12 @@ SEARCH_SKILL = TOOLS_DIR / "skills" / "memory-search" / "SKILL.md"
 INSTALL_HOOKS = TOOLS_DIR / "hooks" / "install-hooks.md"
 
 # This repo dogfoods its own installer: .claude/skills/<name>/SKILL.md is the
-# INSTALLED copy that Claude Code actually loads in this checkout, and it is
-# tracked. repo-init.sh installs a skill by copying the template over it, so
-# the two must stay byte-identical -- a template fix that never reaches the
-# installed copy is a fix nobody in this repo gets.
+# INSTALLED copy that Claude Code actually loads in this checkout. It is a
+# gitignored RENDER TARGET, not tracked source -- repo-init.sh installs a
+# skill by copying the template over it and stamping the copy, so tracking it
+# would mean every `--apply` dirties the working tree with the stamp line
+# alone. The two must still stay byte-identical (stamp aside): a template fix
+# that never reaches the installed copy is a fix nobody in this repo gets.
 INSTALLED_SKILLS = sorted(
     (TOOLS_DIR / ".claude" / "skills").glob("*/SKILL.md")
 )
@@ -139,20 +141,32 @@ class TestPublicDocsCarryNoProvenance(unittest.TestCase):
 
 class TestInstalledSkillsMatchTheirTemplates(unittest.TestCase):
     """The defect this catches: a skill is edited under skills/ and the copy
-    this checkout actually loads, .claude/skills/<name>/SKILL.md, keeps the old
-    text -- tracked, shipped to every clone, and invisible to a scan that only
-    looks at the template. repo-init.sh installs by copying the template over
-    the destination, so identity is the real invariant, not similarity."""
+    this checkout actually loads, .claude/skills/<name>/SKILL.md, keeps the
+    old text -- invisible to a scan that only looks at the template.
+    repo-init.sh installs a skill by copying the template over the
+    destination, so identity is the real invariant, not similarity.
 
-    def test_at_least_one_installed_skill_is_checked(self):
-        # Guards the guard: an empty glob would make the identity test vacuous.
-        self.assertTrue(
-            INSTALLED_SKILLS,
-            "no .claude/skills/*/SKILL.md found -- if the installed copies moved, "
-            "point INSTALLED_SKILLS at their new home rather than dropping the check",
-        )
+    .claude/skills/ is a gitignored RENDER TARGET (the engine repo is itself
+    a wired MemContinuum project), not tracked source -- a fresh clone, or
+    any checkout where repo-init.sh has never been --apply'd, carries no
+    installed copy at all. These tests skip rather than fail when
+    INSTALLED_SKILLS is empty; the doctrine scan in
+    TestPublicDocsCarryNoProvenance still covers the installed copy whenever
+    one is present."""
 
     def test_each_installed_skill_is_byte_identical_to_its_template(self):
+        # An empty glob is the ordinary state of a checkout that never ran
+        # repo-init.sh --apply (a fresh clone included) -- that's a skip,
+        # not a failure. If the install location moves, point
+        # INSTALLED_SKILLS at its new home rather than letting this go
+        # vacuous silently.
+        if not INSTALLED_SKILLS:
+            self.skipTest(
+                "no .claude/skills/*/SKILL.md in this checkout -- it's a "
+                "gitignored render target, not tracked source; run "
+                "scripts/repo-init.sh --apply to produce one, or point "
+                "INSTALLED_SKILLS at its new home if the install path moved"
+            )
         # D1 (updater workstream): repo-init.sh stamps the copy it installs
         # with one extra line -- "<!-- memcontinuum-rendered: SHA -->",
         # right after the frontmatter's closing "---" -- that the template
@@ -176,6 +190,38 @@ class TestInstalledSkillsMatchTheirTemplates(unittest.TestCase):
             drifted, [],
             "installed skill copies have drifted from their templates -- copy the "
             f"template over each (that is what repo-init.sh does): {drifted}",
+        )
+
+
+class TestInstalledSkillCopyIsUntracked(unittest.TestCase):
+    """.claude/skills/ is a RENDER TARGET: repo-init.sh (via
+    memcontinuum-update.sh --apply) copies the template there and inserts a
+    render-stamp comment line -- right after the frontmatter's closing
+    `---`, never at byte 0 -- on every run. Tracking it in git means every
+    `--apply` dirties the working tree with nothing but that stamp -- the
+    defect this guards against."""
+
+    def test_claude_skills_is_gitignored(self):
+        proc = subprocess.run(
+            ["git", "check-ignore", "-q", ".claude/skills/"],
+            cwd=str(TOOLS_DIR),
+        )
+        self.assertEqual(
+            proc.returncode, 0,
+            ".claude/skills/ is not gitignored -- add it to .gitignore so "
+            "the installed skill copy stops being a candidate for tracking",
+        )
+
+    def test_no_path_under_claude_skills_is_tracked(self):
+        proc = subprocess.run(
+            ["git", "ls-files", "--", ".claude/skills/"],
+            cwd=str(TOOLS_DIR), capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            proc.stdout, "",
+            "tracked paths under .claude/skills/ -- it's a render target, "
+            f"untrack with `git rm --cached`: {proc.stdout.splitlines()}",
         )
 
 
