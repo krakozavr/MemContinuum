@@ -306,8 +306,19 @@ mc_update_rules_state() {
         MC_RULES_STATE="foreign"
         return 0
     fi
+    # Line 2 is the stamp comment repo-init renders. Pull the fingerprint out
+    # of it and compare through mc_fingerprint_match rather than matching the
+    # whole line: a file stamped `unknown` against an engine that also cannot
+    # fingerprint itself would otherwise compare EQUAL as text and read `ok`.
     second="$(sed -n '2p' "$dest")"
-    if [ "$second" = "<!-- memcontinuum-rendered: $ENGINE_SHA -->" ]; then
+    local rules_stamp=""
+    case "$second" in
+        "<!-- memcontinuum-rendered: "*" -->")
+            rules_stamp="${second#<!-- memcontinuum-rendered: }"
+            rules_stamp="${rules_stamp% -->}"
+            ;;
+    esac
+    if mc_fingerprint_match "$rules_stamp" "$ENGINE_SHA"; then
         MC_RULES_STATE="ok"
     else
         MC_RULES_STATE="stale"
@@ -602,7 +613,7 @@ process_claude_dir() {
         action="rules-foreign"
     elif [ "$LEGACY" -eq 1 ]; then
         action="$LEGACY_ACTION"
-    elif [ "$stamp" != "$ENGINE_SHA" ]; then
+    elif ! mc_fingerprint_match "$stamp" "$ENGINE_SHA"; then
         action="stale"
     elif [ "$store_match" = "no" ]; then
         action="store-mismatch"
@@ -966,6 +977,11 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
     if [ -z "$PROJECT" ]; then
         print_row "$KEY" "(unknown)" "none" "unknown" "unknown" "unrecoverable"
         echo "  no project= recorded for $KEY -- re-run memcontinuum-decide.sh wired --repo ... --store ... --project ... to fix" >&2
+        # Work left undone is work left undone: --apply promised to end with
+        # every walked row correct, and this one was never even resolved to a
+        # claude-dir. `no-wiring` is the sole exception to that rule; a row
+        # this command cannot read is not one.
+        [ "$APPLY" -eq 1 ] && WALK_RC=1
         continue
     fi
 
@@ -1190,28 +1206,48 @@ fi
 if [ "$MACHINE" -eq 1 ]; then
     mc_render_fingerprint machine "$ENGINE_ROOT" || :
     MACHINE_ENGINE="$MC_RENDER_FINGERPRINT"
+
+    # WHICH claude-dir the machine layer lives in is a fact only
+    # memcontinuum-setup.sh knows -- it takes --claude-dir and defaults to
+    # ~/.claude -- so it records it in config.sh and this reads it back.
+    # Assuming ~/.claude reported a real install at a custom dir as absent
+    # ("rendered by none"), and --apply then rendered a SECOND machine layer
+    # at the default path: two detector hooks, two skill copies, and the one
+    # that was actually stale still stale.
+    MACHINE_CLAUDE_DIR=""
+    if [ -f "$MEMCONTINUUM_HOME/config.sh" ]; then
+        MACHINE_CLAUDE_DIR="$(
+            . "$MEMCONTINUUM_HOME/config.sh" >/dev/null 2>&1
+            printf '%s' "${MEMCONTINUUM_MACHINE_CLAUDE_DIR:-}"
+        )"
+    fi
+    # Fallback only when nothing is on record (a config.sh written before
+    # setup recorded it) -- setup's own default, so the answer is the same one
+    # that install would have used.
+    [ -n "$MACHINE_CLAUDE_DIR" ] || MACHINE_CLAUDE_DIR="$HOME/.claude"
+
     MACHINE_STAMP="none"
     if mc_first_command_matching "memcontinuum-detect.sh" \
-            "$HOME/.claude/settings.json" "$HOME/.claude/settings.local.json"; then
+            "$MACHINE_CLAUDE_DIR/settings.json" "$MACHINE_CLAUDE_DIR/settings.local.json"; then
         mc_command_env_value "$MC_WIRED_COMMAND" "MEMCONTINUUM_RENDERED"
         [ -n "$MC_ENV_VALUE" ] && MACHINE_STAMP="$MC_ENV_VALUE"
     fi
-    if [ "$MACHINE_STAMP" = "$MACHINE_ENGINE" ]; then
+    if mc_fingerprint_match "$MACHINE_STAMP" "$MACHINE_ENGINE"; then
         MACHINE_ACTION="ok"
     else
         MACHINE_ACTION="stale"
     fi
     echo
-    echo "machine: rendered by $MACHINE_STAMP, engine at $MACHINE_ENGINE -- $MACHINE_ACTION"
+    echo "machine: $MACHINE_CLAUDE_DIR rendered by $MACHINE_STAMP, engine at $MACHINE_ENGINE -- $MACHINE_ACTION"
 
     if [ "$APPLY" -eq 1 ]; then
         if [ "$MACHINE_ACTION" = "ok" ]; then
             echo "machine layer already current -- nothing to refresh"
         else
-            echo "refreshing machine layer: $MC_BASH_BIN $SETUP"
+            echo "refreshing machine layer: $MC_BASH_BIN $SETUP --claude-dir $MACHINE_CLAUDE_DIR"
             PY="$(mc_update_resolve_python)" || PY=""
-            SETUP_ARGS=(--no-model-warm)
-            [ -n "$PY" ] && SETUP_ARGS=(--python "$PY" --no-model-warm)
+            SETUP_ARGS=(--claude-dir "$MACHINE_CLAUDE_DIR" --no-model-warm)
+            [ -n "$PY" ] && SETUP_ARGS=(--claude-dir "$MACHINE_CLAUDE_DIR" --python "$PY" --no-model-warm)
             if "$MC_BASH_BIN" "$SETUP" "${SETUP_ARGS[@]}"; then
                 echo "OK: machine layer refreshed"
             else

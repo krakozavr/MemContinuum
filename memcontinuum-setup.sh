@@ -318,12 +318,13 @@ if [ "$DRY_RUN" -eq 0 ]; then
     # NB: $(printf '\n') would strip its own trailing newline and match
     # everything -- the ANSI-C quoted literal does not (bash 2.0+).
     MC_NL=$'\n'
-    case "$SCRIPT_DIR$PYTHON_BIN$MEMCONTINUUM_HOME" in
-        *"$MC_NL"*) die "engine, python, or MEMCONTINUUM_HOME path contains a newline -- unsupported" ;;
+    case "$SCRIPT_DIR$PYTHON_BIN$MEMCONTINUUM_HOME$CLAUDE_DIR" in
+        *"$MC_NL"*) die "engine, python, MEMCONTINUUM_HOME, or claude-dir path contains a newline -- unsupported" ;;
     esac
     Q_ENGINE="$(sh_quote "$SCRIPT_DIR")"
     Q_PYTHON="$(sh_quote "$PYTHON_BIN")"
     Q_HOME="$(sh_quote "$MEMCONTINUUM_HOME")"
+    Q_CLAUDE_DIR="$(sh_quote "$CLAUDE_DIR")"
     # Machine backup rule: never overwrite a config a previous setup wrote
     # without keeping a copy.
     [ -f "$CONFIG" ] && cp "$CONFIG" "$CONFIG.bak-memcontinuum"
@@ -336,6 +337,12 @@ if [ "$DRY_RUN" -eq 0 ]; then
 MEMCONTINUUM_ENGINE=$Q_ENGINE
 if [ -z "\${MEMCONTINUUM_PYTHON:-}" ]; then MEMCONTINUUM_PYTHON=$Q_PYTHON; fi
 MEMCONTINUUM_HOME=$Q_HOME
+# Which user-level Claude Code directory this setup installed the detector
+# hook and the memcontinuum skill into. Read by scripts/memcontinuum-update.sh
+# --machine, which would otherwise assume ~/.claude -- and, on a machine set
+# up with --claude-dir, report the real install as absent and render a second
+# one at the default path.
+MEMCONTINUUM_MACHINE_CLAUDE_DIR=$Q_CLAUDE_DIR
 CONF
     if [ "$IS_CUSTOM_HOME" -eq 1 ]; then
         mkdir -p "$DEFAULT_MEMCONTINUUM_HOME" || die "cannot create $DEFAULT_MEMCONTINUUM_HOME"

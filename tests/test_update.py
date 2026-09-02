@@ -1710,6 +1710,252 @@ class TestTargetedMultiDirIsAllOrNothing(unittest.TestCase):
         self.assertIn("langs=python;swift", note, note)
 
 
+class TestAnUnknownFingerprintNeverComparesEqual(unittest.TestCase):
+    """`unknown` is not a fingerprint -- it is the absence of one (no sha256
+    tool on the machine, an incomplete checkout, a render that predates
+    stamping). Comparing two absences and calling them equal reports the repo
+    as current and re-renders nothing, which is the one answer that cannot be
+    checked. Unknown on either side means `stale`: re-render and find out."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-unknown-fp-test-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.home = str(Path(self.tmp) / "home")
+        os.makedirs(self.home, exist_ok=True)
+
+    def match(self, a, b):
+        proc = subprocess.run(
+            [MC_BASH, "-c",
+             '. "$1"/scripts/mc-registry-lib.sh; '
+             'if mc_fingerprint_match "$2" "$3"; then printf yes; else printf no; fi',
+             "_", str(TOOLS_DIR), a, b],
+            capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return proc.stdout.strip()
+
+    def test_the_one_comparison_treats_unknown_as_a_mismatch(self):
+        self.assertEqual(self.match("abc123abc123", "abc123abc123"), "yes")
+        self.assertEqual(self.match("unknown", "unknown"), "no",
+                         "two absences are not an agreement")
+        self.assertEqual(self.match("unknown", "abc123abc123"), "no")
+        self.assertEqual(self.match("abc123abc123", "unknown"), "no")
+        self.assertEqual(self.match("", ""), "no")
+        self.assertEqual(self.match("abc123abc123", "def456def456"), "no")
+
+    def _crippled_engine(self, keep_repo_inputs=1):
+        """A checkout mc_render_fingerprint cannot honestly fingerprint (fewer
+        than three render inputs), but that update.sh can still run: the rules
+        template it reads the identity marker from stays."""
+        engine = Path(self.tmp) / "engine"
+        shutil.copytree(TOOLS_DIR, engine, symlinks=True,
+                        ignore=shutil.ignore_patterns(
+                            ".git", "fixtures", "tests", "__pycache__", ".venv"))
+        for tmpl in (engine / "templates").iterdir():
+            if tmpl.name != "memcontinuum-rules.md":
+                tmpl.unlink()
+        (engine / "scripts" / "mc_settings_merge.py").unlink()
+        shutil.rmtree(engine / "skills" / "memory-search")
+        shutil.rmtree(engine / "skills" / "memcontinuum")
+        return engine
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_a_repo_row_reads_stale_when_both_sides_are_unknown(self):
+        repo = git_repo(str(Path(self.tmp) / "repo"))
+        store = str(Path(self.tmp) / "store")
+        claude_dir = str(Path(repo) / ".claude")
+        proc = run(INSTALL_SH, ["--project", "u", "--store", store,
+                                "--claude-dir", claude_dir, "--non-interactive"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        proc = run(DECIDE_SH, ["wired", "--repo", repo, "--store", store,
+                               "--project", "u", "--claude-dir", claude_dir], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+        # Both sides unknown: the rendered artifacts say so, and the engine
+        # cannot compute one either.
+        settings = Path(claude_dir, "settings.local.json")
+        settings.write_text(settings.read_text().replace(
+            "MEMCONTINUUM_RENDERED=%s " % engine_sha(), "MEMCONTINUUM_RENDERED=unknown "))
+        rules = Path(claude_dir, "rules", "memcontinuum.md")
+        lines = rules.read_text().splitlines(True)
+        lines[1] = "<!-- memcontinuum-rendered: unknown -->\n"
+        rules.write_text("".join(lines))
+
+        engine = self._crippled_engine()
+        proc = run(engine / "scripts" / "memcontinuum-update.sh", [], self.home)
+        lines_out = [l for l in proc.stdout.splitlines() if l.strip()]
+        header = lines_out[0].split("\t")
+        row = dict(zip(header, lines_out[1].split("\t")))
+        self.assertEqual(row["engine"], "unknown", proc.stdout)
+        self.assertEqual(row["stamped"], "unknown", proc.stdout)
+        self.assertEqual(row["rules"], "stale", proc.stdout)
+        self.assertEqual(row["action"], "stale", proc.stdout)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_the_machine_layer_reads_stale_when_both_sides_are_unknown(self):
+        engine = Path(self.tmp) / "engine"
+        shutil.copytree(TOOLS_DIR, engine, symlinks=True,
+                        ignore=shutil.ignore_patterns(
+                            ".git", "fixtures", "tests", "__pycache__", ".venv"))
+        proc = run(engine / "memcontinuum-setup.sh",
+                   ["--python", VENV_PYTHON, "--no-model-warm"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        settings = Path(self.home, ".claude", "settings.json")
+        settings.write_text(settings.read_text().replace(
+            "MEMCONTINUUM_RENDERED=%s " % engine_sha(engine, "machine"),
+            "MEMCONTINUUM_RENDERED=unknown "))
+        # Now cripple the MACHINE inputs so the engine side is unknown too.
+        (engine / "scripts" / "mc_settings_merge.py").unlink()
+        shutil.rmtree(engine / "skills" / "memcontinuum")
+
+        proc = run(engine / "scripts" / "memcontinuum-update.sh", ["--machine"], self.home)
+        line = [l for l in proc.stdout.splitlines() if l.startswith("machine:")]
+        self.assertTrue(line, proc.stdout)
+        self.assertIn("unknown", line[0], line[0])
+        self.assertIn("stale", line[0], line[0])
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_state_sh_still_names_the_drift_when_both_sides_are_unknown(self):
+        """The same comparison, in the hint a session actually sees. The
+        engine is bootstrapped whole (state.sh needs a config.sh at all) and
+        crippled afterwards, so config.sh's MEMCONTINUUM_ENGINE points at the
+        checkout that can no longer fingerprint itself."""
+        engine = Path(self.tmp) / "engine"
+        shutil.copytree(TOOLS_DIR, engine, symlinks=True,
+                        ignore=shutil.ignore_patterns(
+                            ".git", "fixtures", "tests", "__pycache__", ".venv"))
+        proc = run(engine / "memcontinuum-setup.sh",
+                   ["--python", VENV_PYTHON, "--no-model-warm"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        repo = git_repo(str(Path(self.tmp) / "repo"))
+        store = str(Path(self.tmp) / "store")
+        claude_dir = str(Path(repo) / ".claude")
+        proc = run(engine / "scripts" / "repo-init.sh",
+                   ["--project", "u", "--store", store,
+                    "--claude-dir", claude_dir, "--non-interactive"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        settings = Path(claude_dir, "settings.local.json")
+        settings.write_text(settings.read_text().replace(
+            "MEMCONTINUUM_RENDERED=%s " % engine_sha(engine),
+            "MEMCONTINUUM_RENDERED=unknown "))
+
+        for tmpl in (engine / "templates").iterdir():
+            if tmpl.name != "memcontinuum-rules.md":
+                tmpl.unlink()
+        (engine / "scripts" / "mc_settings_merge.py").unlink()
+        shutil.rmtree(engine / "skills" / "memory-search")
+        self.assertEqual(engine_sha(engine), "unknown")
+
+        proc = run(engine / "scripts" / "memcontinuum-state.sh", [repo], self.home,
+                   cwd=repo)
+        self.assertIn("update:", proc.stdout,
+                      "an unverifiable stamp must be reported, not read as agreement:\n"
+                      + proc.stdout + proc.stderr)
+
+
+class TestEveryUnfinishedApplyRowFailsTheWalk(unittest.TestCase):
+    """`--apply` exits 0 only when every claude-dir it walked ended up
+    correct. A row it could not even resolve to a claude-dir is work left
+    undone like any other -- reporting success over it is how a re-render tool
+    tells you it fixed something it never looked at. `no-wiring` stays the one
+    exception: that is the skill's repair path, not this command's."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-exit-test-")
+        self.home = str(Path(self.tmp) / "home")
+        os.makedirs(self.home, exist_ok=True)
+        self.repo = git_repo(str(Path(self.tmp) / "repo"))
+        self.store = marked_store(str(Path(self.tmp) / "store"))
+        # A row with no project= at all: unrecoverable, no claude-dir to walk.
+        write_row(self.home, self.repo, "wired", note=f"store={self.store}")
+
+    def test_apply_exits_nonzero_on_an_unrecoverable_row(self):
+        proc = run(UPDATE_SH, ["--apply"], self.home)
+        self.assertIn("unrecoverable", proc.stdout, proc.stdout)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_the_reporting_walk_still_exits_zero(self):
+        proc = run(UPDATE_SH, [], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("unrecoverable", proc.stdout)
+
+
+class TestMachineClaudeDirIsRecordedAndReused(unittest.TestCase):
+    """The machine layer lives in whichever claude-dir setup installed it
+    into, which need not be ~/.claude. Nothing recorded that, so `--machine`
+    read ~/.claude, reported the real install as missing, and `--apply` would
+    have rendered a SECOND machine layer at the default path."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-machine-cd-test-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.engine = Path(self.tmp) / "engine"
+        shutil.copytree(TOOLS_DIR, self.engine, symlinks=True,
+                        ignore=shutil.ignore_patterns(
+                            ".git", "fixtures", "tests", "__pycache__", ".venv"))
+        self.home = str(Path(self.tmp) / "home")
+        os.makedirs(self.home, exist_ok=True)
+        self.custom = str(Path(self.tmp) / "elsewhere" / "claude")
+
+    def _setup(self):
+        proc = run(self.engine / "memcontinuum-setup.sh",
+                   ["--python", VENV_PYTHON, "--no-model-warm",
+                    "--claude-dir", self.custom], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def _machine_line(self, args=()):
+        proc = run(self.engine / "scripts" / "memcontinuum-update.sh",
+                   ["--machine"] + list(args), self.home)
+        for line in proc.stdout.splitlines():
+            if line.startswith("machine:"):
+                return line, proc
+        return None, proc
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_setup_records_the_claude_dir_it_installed_into(self):
+        self._setup()
+        config = Path(self.home, ".memcontinuum", "config.sh").read_text()
+        self.assertIn("MEMCONTINUUM_MACHINE_CLAUDE_DIR='%s'" % self.custom, config, config)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_machine_reports_the_recorded_dir_and_reads_ok(self):
+        self._setup()
+        line, proc = self._machine_line()
+        self.assertIsNotNone(line, proc.stdout)
+        self.assertIn(self.custom, line, line)
+        self.assertIn("ok", line, line)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_apply_refreshes_that_dir_in_place_and_renders_no_second_layer(self):
+        self._setup()
+        setup = self.engine / "memcontinuum-setup.sh"
+        setup.write_text(setup.read_text() + "\n# a machine-layer change\n")
+        line, _ = self._machine_line()
+        self.assertIn("stale", line, line)
+
+        proc = run(self.engine / "scripts" / "memcontinuum-update.sh",
+                   ["--apply", "--machine"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertFalse(Path(self.home, ".claude", "settings.json").exists(),
+                         "a second machine layer was rendered at the default path")
+        self.assertIn("MEMCONTINUUM_RENDERED=%s " % engine_sha(self.engine, "machine"),
+                      Path(self.custom, "settings.json").read_text())
+        line, _ = self._machine_line()
+        self.assertIn("ok", line, line)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_the_default_dir_is_still_the_fallback_when_nothing_is_recorded(self):
+        proc = run(self.engine / "memcontinuum-setup.sh",
+                   ["--python", VENV_PYTHON, "--no-model-warm"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        config = Path(self.home, ".memcontinuum", "config.sh")
+        config.write_text("\n".join(
+            l for l in config.read_text().splitlines()
+            if "MEMCONTINUUM_MACHINE_CLAUDE_DIR" not in l) + "\n")
+        line, proc = self._machine_line()
+        self.assertIsNotNone(line, proc.stdout)
+        self.assertIn("ok", line, line)
+
+
 class TestHelp(unittest.TestCase):
     def test_help_exits_zero_and_documents_the_flags(self):
         proc = subprocess.run([MC_BASH, str(UPDATE_SH), "--help"], capture_output=True, text=True)

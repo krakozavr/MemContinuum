@@ -614,6 +614,29 @@ mc_render_fingerprint() {
     return 0
 }
 
+# mc_fingerprint_match RENDERED ENGINE
+#
+# True iff the two render fingerprints are the same KNOWN value. The ONE
+# comparison every caller uses -- the table's stamp column, the rules file's
+# own stamp line, the machine layer, and state.sh's drift hint.
+#
+# `unknown` is what mc_render_fingerprint returns when it could not compute a
+# fingerprint at all: no sha256 tool on the machine, or a checkout missing its
+# render inputs. It is the ABSENCE of an answer, not an answer, and two
+# absences are not an agreement -- `[ "$a" = "$b" ]` on them reports the
+# artifact as current, which is precisely the claim nobody was able to check.
+# The empty string is the same thing arriving by a different route (a hook
+# line with no MEMCONTINUUM_RENDERED on it at all).
+#
+# So: unknown or empty on either side means no match, and a no-match means
+# `stale` -- re-render and find out. Re-rendering something already current is
+# a no-op; calling something current that nobody verified is not.
+mc_fingerprint_match() {
+    case "${1:-}" in ""|unknown) return 1 ;; esac
+    case "${2:-}" in ""|unknown) return 1 ;; esac
+    [ "$1" = "$2" ]
+}
+
 # mc_resolve_home
 #
 # F7: two registries used to exist under a non-default MEMCONTINUUM_HOME --
