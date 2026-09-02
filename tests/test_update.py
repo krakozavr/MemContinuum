@@ -2392,6 +2392,90 @@ class TestRepoWithoutAWiredRowIsRefused(unittest.TestCase):
         self.assertIn("no wired row", combined, combined)
 
 
+class TestEmptyFlagValuesAndContradictoryModesAreRefused(unittest.TestCase):
+    """The remaining accepted-and-ignored shapes, both at the parse loop.
+
+    An empty value is not an answer. Worse, each of these flags reads its own
+    empty value as "not given", so the command silently switched to a
+    different mode or dropped the instruction: `--repo ''` walked EVERY row,
+    `--langs ''` migrated with a recovered set instead of the given one, and
+    `--claude-dir ''` on a row that records its dirs narrowed the walk to
+    nothing and exited 0 with no table -- a successful no-op that reads as
+    "checked, all current".
+
+    And `--apply` with `--dry-run` is a contradiction that was resolved by
+    whichever came last, so the same pair of flags meant opposite things
+    depending on the order they were typed in, and one of them was always
+    discarded in silence.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-emptyval-test-")
+        self.home = str(Path(self.tmp) / "home")
+        os.makedirs(self.home, exist_ok=True)
+        self.repo = git_repo(str(Path(self.tmp) / "repo"))
+
+    VALUE_FLAGS = ("--repo", "--add-lang", "--never-ext", "--set-never-ext",
+                   "--langs", "--code-root", "--claude-dir")
+
+    def test_every_value_taking_flag_refuses_an_empty_value(self):
+        for flag in self.VALUE_FLAGS:
+            with self.subTest(flag=flag):
+                proc = run(UPDATE_SH, [flag, ""], self.home)
+                combined = proc.stdout + proc.stderr
+                self.assertEqual(proc.returncode, 2, combined)
+                self.assertIn("%s needs a non-empty value" % flag, combined, combined)
+
+    def test_every_value_taking_flag_refuses_a_whitespace_only_value(self):
+        """Whitespace is not a value either -- and `--claude-dir ' '` would
+        otherwise reach the filesystem as a directory name made of spaces."""
+        for flag in self.VALUE_FLAGS:
+            with self.subTest(flag=flag):
+                proc = run(UPDATE_SH, [flag, "   "], self.home)
+                combined = proc.stdout + proc.stderr
+                self.assertEqual(proc.returncode, 2, combined)
+                self.assertIn("%s needs a non-empty value" % flag, combined, combined)
+
+    def test_apply_and_dry_run_together_are_refused_in_either_order(self):
+        for args in (["--apply", "--dry-run"], ["--dry-run", "--apply"]):
+            with self.subTest(args=" ".join(args)):
+                proc = run(UPDATE_SH, args, self.home)
+                combined = proc.stdout + proc.stderr
+                self.assertEqual(proc.returncode, 2, combined)
+                self.assertIn("--apply", combined, combined)
+                self.assertIn("--dry-run", combined, combined)
+                self.assertNotIn("claude-dir\tstamped", combined,
+                                 "the walk ran anyway:\n" + combined)
+
+
+class TestAnEmptyClaudeDirIsNotASilentNoOp(UpdateTestBase):
+    """The subset branch's own version of it: on a row that records its dirs,
+    `--claude-dir ''` narrowed the walk to the empty set. No table, no work,
+    exit 0 -- the shape of a clean bill of health for a repository the command
+    had just been asked to re-render."""
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_it_is_refused_rather_than_succeeding_with_no_output(self):
+        drifted = self.settings_text().replace(
+            f"MEMCONTINUUM_RENDERED={engine_sha()}", "MEMCONTINUUM_RENDERED=deadbee")
+        Path(self.claude_dir, "settings.local.json").write_text(drifted)
+        before = self.settings_text()
+
+        proc = run(UPDATE_SH, ["--apply", "--repo", self.repo, "--claude-dir", ""],
+                   self.home)
+        combined = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 2, combined)
+        self.assertIn("--claude-dir needs a non-empty value", combined, combined)
+        self.assertEqual(self.settings_text(), before)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_a_real_claude_dir_still_works(self):
+        """The green half: the refusal must not catch the ordinary case."""
+        proc = run(UPDATE_SH, ["--apply", "--repo", self.repo,
+                               "--claude-dir", self.claude_dir], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+
 class TestHelp(unittest.TestCase):
     def test_help_exits_zero_and_documents_the_flags(self):
         proc = subprocess.run([MC_BASH, str(UPDATE_SH), "--help"], capture_output=True, text=True)

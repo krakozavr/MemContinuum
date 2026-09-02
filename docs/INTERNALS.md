@@ -398,7 +398,19 @@ did something else.
 | `targeted` | `--add-lang`/`--never-ext` (needs `--repo`) | `--dry-run` `--repo` `--add-lang` `--never-ext` |
 | `repo` | `--repo`, no `--add-lang`/`--never-ext` | `--dry-run` `--apply` `--machine` `--repo` `--claude-dir` |
 
-Everything decidable from the command line alone is enforced before the
+Two refusals precede the modes entirely, at the argument loop. An **empty or
+whitespace-only value** for any flag that takes one is refused
+(`<flag> needs a non-empty value`, rc 2): each of these reads its own empty
+value as "not given", so an empty one never failed — it changed what the
+command *was*. `--repo ''` walked every wired row; `--langs ''` migrated with
+whatever it recovered; `--claude-dir ''` narrowed a recorded row's walk to the
+empty set and exited 0 with no table, which is the shape of a clean bill of
+health for a repository it had just been told to re-render. And **`--apply`
+with `--dry-run`** is refused in either order — they are opposites, and
+last-one-wins would make the same pair of flags write or preview depending
+only on typing order, discarding the other in silence.
+
+Everything else decidable from the command line alone is enforced before the
 registry is opened. The rest is a property of the *row*, so `repo` mode splits
 when the row is read:
 

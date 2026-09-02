@@ -95,6 +95,18 @@
 #   every dir named must be one the row already records (a dir it does not is
 #   refused as `dir-not-recorded`, never walked and never installed into).
 #
+# Two refusals apply to every mode, at the point the arguments are read:
+#
+#   an EMPTY or whitespace-only value for any flag that takes one
+#   (--repo, --add-lang, --never-ext, --set-never-ext, --langs, --code-root,
+#   --claude-dir) is refused. Each of these reads its own empty value as "not
+#   given", so an empty one did not fail -- it changed what the command was.
+#
+#   --apply together with --dry-run is refused whichever order they are typed
+#   in. They are opposites; "whichever came last" would mean the same pair of
+#   flags writes or previews depending only on typing order, with the other
+#   discarded in silence.
+#
 # --repo naming a repository with NO wired row -- undecided, or a recorded
 # `declined` -- is refused (`no-wired-row: <key> (decision=...)`), never
 # answered with an empty table at exit 0. An empty table reads as "checked,
@@ -252,6 +264,7 @@ APPLY=0
 # above): it applies unless --dry-run was explicitly given, so it must not
 # key off APPLY's default the walk mode uses.
 DRY_RUN_EXPLICIT=0
+APPLY_EXPLICIT=0
 MACHINE=0
 ADD_LANG=""
 NEVER_EXT=""
@@ -262,22 +275,55 @@ TARGET_REPO=""
 declare -a OVERRIDE_CLAUDE_DIRS=()
 declare -a OVERRIDE_CODE_ROOTS=()
 need_value() { [ $# -ge 2 ] || { echo "missing value for $1" >&2; exit 2; }; }
+
+# need_value catches `--repo` with nothing after it. This catches `--repo ''`
+# and `--repo '   '`, which are a different failure and a quieter one: EVERY
+# one of these flags reads its own empty value as "not given", so an empty
+# value did not fail -- it changed what the command was. `--repo ''` walked
+# every wired row; `--langs ''` migrated with whatever it recovered instead of
+# what was asked for; `--claude-dir ''` narrowed a recorded row's walk to
+# nothing and exited 0 with no table, which is the shape of a clean bill of
+# health for a repository it had just been told to re-render.
+#
+# `*[![:space:]]*` is "contains at least one non-whitespace character" -- false
+# for both "" and "   ", and a plain POSIX glob, so bash 3.2 reads it too.
+need_nonempty() {
+    case "$2" in
+        *[![:space:]]*) return 0 ;;
+    esac
+    echo "$1 needs a non-empty value" >&2
+    echo "An empty value is not an answer, and this command will not read it as one -- every one of these flags would otherwise take it for the flag not being given at all, and quietly do something else." >&2
+    exit 2
+}
+take_value() { need_value "$@"; need_nonempty "$1" "${2:-}"; }
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run) APPLY=0; DRY_RUN_EXPLICIT=1; shift ;;
-        --apply) APPLY=1; shift ;;
+        --apply) APPLY=1; APPLY_EXPLICIT=1; shift ;;
         --machine) MACHINE=1; shift ;;
-        --add-lang) need_value "$@"; ADD_LANG="$2"; shift 2 ;;
-        --never-ext) need_value "$@"; NEVER_EXT="$2"; shift 2 ;;
-        --langs) need_value "$@"; LANGS_FLAG="$2"; shift 2 ;;
-        --set-never-ext) need_value "$@"; SET_NEVER_EXT="$2"; SET_NEVER_GIVEN=1; shift 2 ;;
-        --code-root) need_value "$@"; OVERRIDE_CODE_ROOTS+=("$2"); shift 2 ;;
-        --claude-dir) need_value "$@"; OVERRIDE_CLAUDE_DIRS+=("$2"); shift 2 ;;
-        --repo) need_value "$@"; TARGET_REPO="$2"; shift 2 ;;
+        --add-lang) take_value "$@"; ADD_LANG="$2"; shift 2 ;;
+        --never-ext) take_value "$@"; NEVER_EXT="$2"; shift 2 ;;
+        --langs) take_value "$@"; LANGS_FLAG="$2"; shift 2 ;;
+        --set-never-ext) take_value "$@"; SET_NEVER_EXT="$2"; SET_NEVER_GIVEN=1; shift 2 ;;
+        --code-root) take_value "$@"; OVERRIDE_CODE_ROOTS+=("$2"); shift 2 ;;
+        --claude-dir) take_value "$@"; OVERRIDE_CLAUDE_DIRS+=("$2"); shift 2 ;;
+        --repo) take_value "$@"; TARGET_REPO="$2"; shift 2 ;;
         -h|--help) usage 0 ;;
         *) echo "unknown argument: $1" >&2; usage 1 ;;
     esac
 done
+
+# --apply and --dry-run are opposites, and "whichever came last" is not a
+# reading of them -- it is one of the two being discarded in silence, with the
+# same pair of flags meaning WRITE or PREVIEW depending only on typing order.
+# The one place this command must not guess is the one that decides whether it
+# writes.
+if [ "$APPLY_EXPLICIT" -eq 1 ] && [ "$DRY_RUN_EXPLICIT" -eq 1 ]; then
+    echo "--apply and --dry-run are contradictory: one writes, the other only reports. Give exactly one (--dry-run is the default when neither is given)." >&2
+    echo "Nothing was read and nothing was written." >&2
+    exit 2
+fi
 
 # --- which mode is this? ---------------------------------------------------
 #
