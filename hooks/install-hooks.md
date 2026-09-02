@@ -224,10 +224,12 @@ Notes:
   `scripts/repo-init.sh`, the first one given is what they get.
 - `MEMCONTINUUM_HOME` is deliberately omitted here for the same reason as section 1: falls back
   to `~/.memcontinuum` unless overridden, and must never point at a synced/cloud drive.
-- These five scripts' only writable surface is `$MEMCONTINUUM_HOME/sessions/**/*.json[.lock]` and
-  `$MEMCONTINUUM_HOME/hook.log` — never the store, never the code tree. `git diff`/`git status`
-  in either root staying empty across every hook invocation is a permanent regression test
-  (`tests/test_write_hooks.py`).
+- These five scripts write `$MEMCONTINUUM_HOME/sessions/**/*.json[.lock]` and
+  `$MEMCONTINUUM_HOME/hook.log` — never the store, never the code tree. One carve-out:
+  `userprompt-remind.sh`'s coverage check and `precompact-persist.sh` call `memidx.py unmapped`,
+  which self-heals a drifted decision index with a `reindex --no-embed`, so the decision index's
+  own SQLite cache is written too. `git diff`/`git status` in either root staying empty across
+  every hook invocation is a permanent regression test (`tests/test_write_hooks.py`).
 
 
 > Invocation note: every example above runs a hook as `bash <path>` rather than

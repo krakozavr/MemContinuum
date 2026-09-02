@@ -79,8 +79,9 @@ Usage: repo-init.sh --project NAME [--store DIR] [--code-root DIR ...]
   --code-root DIR     a code checkout the PreToolUse hook should watch for
                       Edit/Write and the write-side hooks should scope
                       ledger entries to. Repeatable. Optional -- omit for a
-                      store with no associated code checkout (retrieval-only
-                      / rationale-only install).
+                      store with no associated code checkout (a
+                      rationale-only install: neither PreToolUse hook is
+                      wired, so nothing is retrieved at edit time).
   --claude-dir DIR    where to merge hook wiring and install the skill.
                       Defaults to <dirname of --store>/.claude ONLY when
                       --store was also omitted (the store then defaults
@@ -562,7 +563,8 @@ for root in roots:
         capture_output=True, text=True,
     )
     # code-census is documented exit-0-always (even a nonexistent root just
-    # yields {}) -- a non-zero rc here means something actually crashed
+    # walks nothing and returns its zero-count rows) -- a non-zero rc here
+    # means something actually crashed
     # (e.g. an import failure), and treating that as "nothing proposed"
     # would silently reach language-less wiring through the exact side
     # door the carry note (Task 8 reviewer) exists to close. Surface it as

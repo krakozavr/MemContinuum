@@ -1,9 +1,9 @@
 #!/usr/bin/env python
-"""memlint.py -- docs/SCHEMA.md section 7 linter for Store D markdown.
+"""memlint.py -- docs/SCHEMA.md section 7 linter for MemContinuum store markdown.
 
-Rules implemented (exactly the set enumerated in the Store D build brief,
-a subset of docs/SCHEMA.md section 7 -- the append-only git-hash-mismatch rule is
-out of scope here; see README for why):
+Rules implemented, a subset of docs/SCHEMA.md section 7 -- the append-only
+git-hash-mismatch rule is deliberately out of scope (see that section: the
+check belongs where a canonical store's commits are made, not in the linter):
 
   * a link whose ruling.authority is owner-verbatim/owner-ratified with no
     ruling.text and/or ruling.source            -> error
@@ -371,7 +371,8 @@ ERROR:/WARNING: line per finding. Exit 1 if any error was found, 0 otherwise
                      skipped; every other rule still runs.
   -h, --help         print this and exit
 
-Record schema and the full rule list: docs/SCHEMA.md."""
+Rule reference: docs/SCHEMA.md sections 7 and 8.4; the complete table of what
+this linter checks is in docs/INTERNALS.md (memlint section)."""
 
 
 def main(argv=None) -> int:
