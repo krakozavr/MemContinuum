@@ -383,11 +383,16 @@ class TestFreshInstall(unittest.TestCase):
     # --- D1 (updater workstream): version stamp ---------------------------
 
     def _engine_sha(self):
-        out = subprocess.run(
-            ["git", "-C", str(TOOLS_DIR), "rev-parse", "--short", "HEAD"],
+        """The stamp this checkout renders with, asked of the one function
+        that computes it (mc_render_fingerprint) -- a test that re-derives it
+        would only prove the two copies agree."""
+        return subprocess.run(
+            ["bash", "-c",
+             '. "$1"/scripts/mc-registry-lib.sh; mc_render_fingerprint "$1"; '
+             'printf "%s" "$MC_RENDER_FINGERPRINT"',
+             "_", str(TOOLS_DIR)],
             capture_output=True, text=True, check=True,
         ).stdout.strip()
-        return out or "unknown"
 
     def test_every_rendered_hook_line_carries_the_stamp(self):
         """D1: MEMCONTINUUM_RENDERED=<engine short sha> on every hook line

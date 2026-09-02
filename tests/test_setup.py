@@ -832,13 +832,17 @@ class TestDecisionRegistry(BootstrapCase):
 
     # --- D5 (updater workstream): state.sh's stamp-vs-engine hint --------
 
-    @staticmethod
-    def _engine_sha():
-        out = subprocess.run(
-            ["git", "-C", str(TOOLS_DIR), "rev-parse", "--short", "HEAD"],
+    def _engine_sha(self):
+        """The stamp this checkout renders with, asked of the one function
+        that computes it (mc_render_fingerprint) -- a test that re-derives it
+        would only prove the two copies agree."""
+        return subprocess.run(
+            ["bash", "-c",
+             '. "$1"/scripts/mc-registry-lib.sh; mc_render_fingerprint "$1"; '
+             'printf "%s" "$MC_RENDER_FINGERPRINT"',
+             "_", str(TOOLS_DIR)],
             capture_output=True, text=True, check=True,
         ).stdout.strip()
-        return out or "unknown"
 
     @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
     def test_no_update_hint_when_stamp_matches_engine(self):

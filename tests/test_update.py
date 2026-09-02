@@ -59,12 +59,18 @@ def git_repo(path):
     return path
 
 
-def engine_sha():
-    out = subprocess.run(
-        ["git", "-C", str(TOOLS_DIR), "rev-parse", "--short", "HEAD"],
+def engine_sha(root=None):
+    """The stamp this checkout renders with -- asked of the one function that
+    computes it (mc_render_fingerprint), never recomputed here. A test that
+    re-derives a value it is checking only proves the two copies agree."""
+    root = str(root or TOOLS_DIR)
+    return subprocess.run(
+        ["bash", "-c",
+         '. "$1"/scripts/mc-registry-lib.sh; mc_render_fingerprint "$1"; '
+         'printf "%s" "$MC_RENDER_FINGERPRINT"',
+         "_", root],
         capture_output=True, text=True, check=True,
     ).stdout.strip()
-    return out or "unknown"
 
 
 def decisions_tsv(home):
@@ -1111,6 +1117,106 @@ class TestPartiallyRenderedLanguagesAreReported(unittest.TestCase):
         proc = run(UPDATE_SH, [], self.home)
         combined = proc.stdout + proc.stderr
         self.assertIn("*.zz", combined, combined)
+
+
+class TestRenderFingerprint(unittest.TestCase):
+    """The stamp is a fingerprint of the RENDER INPUTS, not the engine's HEAD
+    commit. That is the whole distinction the update command promises: a fix
+    that only touches a script reaches every wired repo the moment you pull,
+    so it must leave every repo `ok`; a fix that changes what gets rendered
+    must flip them `stale`. A HEAD sha changes on both, which made the promise
+    false -- every commit to anything marked every repo on the machine stale."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-fp-test-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.engine = Path(self.tmp) / "engine"
+        shutil.copytree(TOOLS_DIR, self.engine, symlinks=True,
+                        ignore=shutil.ignore_patterns(
+                            ".git", "fixtures", "tests", "__pycache__", ".venv"))
+
+    def fingerprint(self, root=None):
+        root = str(root or self.engine)
+        proc = subprocess.run(
+            ["bash", "-c",
+             '. "$1"/scripts/mc-registry-lib.sh; mc_render_fingerprint "$1"; '
+             'printf "%s" "$MC_RENDER_FINGERPRINT"',
+             "_", root],
+            capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return proc.stdout.strip()
+
+    def test_it_is_twelve_hex_characters_and_stable(self):
+        fp = self.fingerprint()
+        self.assertRegex(fp, r"^[0-9a-f]{12}$", fp)
+        self.assertEqual(fp, self.fingerprint(), "must be deterministic")
+
+    def test_a_hook_script_is_not_a_render_input(self):
+        """Hook scripts execute by absolute path, so a pull updates them live
+        in every wired repo. Nothing needs re-rendering, and nothing may be
+        marked stale."""
+        before = self.fingerprint()
+        memlib = self.engine / "hooks" / "memlib.sh"
+        memlib.write_text(memlib.read_text() + "\n# touched\n")
+        self.assertEqual(self.fingerprint(), before,
+                         "editing a hook script must not change the fingerprint")
+
+    def test_a_template_is_a_render_input(self):
+        before = self.fingerprint()
+        tmpl = self.engine / "templates" / "write-hooks.json.tmpl"
+        tmpl.write_text(tmpl.read_text().replace("MEMCONTINUUM_RENDERED", "MEMCONTINUUM_RENDERED2"))
+        self.assertNotEqual(self.fingerprint(), before)
+
+    def test_the_installer_and_the_merge_module_are_render_inputs(self):
+        for rel in ("scripts/repo-init.sh", "scripts/mc_settings_merge.py",
+                    "memcontinuum-setup.sh"):
+            with self.subTest(rel=rel):
+                engine2 = Path(self.tmp) / ("e-" + rel.replace("/", "_"))
+                shutil.copytree(self.engine, engine2, symlinks=True)
+                before = self.fingerprint(engine2)
+                f = engine2 / rel
+                f.write_text(f.read_text() + "\n# touched\n")
+                self.assertNotEqual(self.fingerprint(engine2), before, rel)
+
+    def test_a_copied_skill_is_a_render_input(self):
+        before = self.fingerprint()
+        skill = self.engine / "skills" / "memory-search" / "SKILL.md"
+        skill.write_text(skill.read_text() + "\nextra line\n")
+        self.assertNotEqual(self.fingerprint(), before)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_the_walk_calls_a_scripts_only_change_ok_and_a_template_change_stale(self):
+        home = str(Path(self.tmp) / "home")
+        os.makedirs(home, exist_ok=True)
+        repo = git_repo(str(Path(self.tmp) / "repo"))
+        store = str(Path(self.tmp) / "store")
+        claude_dir = str(Path(repo) / ".claude")
+        proc = run(self.engine / "scripts" / "repo-init.sh",
+                   ["--project", "fp", "--store", store, "--claude-dir", claude_dir,
+                    "--non-interactive"], home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        proc = run(self.engine / "scripts" / "memcontinuum-decide.sh",
+                   ["wired", "--repo", repo, "--store", store, "--project", "fp",
+                    "--claude-dir", claude_dir], home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+        def action():
+            p = run(self.engine / "scripts" / "memcontinuum-update.sh", [], home)
+            lines = [l for l in p.stdout.splitlines() if l.strip()]
+            rows = [dict(zip(lines[0].split("\t"), l.split("\t"))) for l in lines[1:]]
+            return rows[0]["action"], p.stdout
+
+        self.assertEqual(action()[0], "ok")
+
+        memlib = self.engine / "hooks" / "memlib.sh"
+        memlib.write_text(memlib.read_text() + "\n# a scripts-only fix\n")
+        act, out = action()
+        self.assertEqual(act, "ok", "a scripts-only fix must leave every repo ok\n" + out)
+
+        tmpl = self.engine / "templates" / "memcontinuum-rules.md"
+        tmpl.write_text(tmpl.read_text() + "\nA new paragraph.\n")
+        act, out = action()
+        self.assertEqual(act, "stale", "a template change must flip the repo stale\n" + out)
 
 
 class TestHelp(unittest.TestCase):

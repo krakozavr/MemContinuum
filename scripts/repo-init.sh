@@ -47,18 +47,23 @@ SKILL_SRC="$ENGINE_ROOT/skills/memory-search/SKILL.md"
 
 OUR_HOOK_SCRIPTS="pre-edit-chain.sh newfile-nudge.sh ledger-post-edit.sh precompact-persist.sh sessionstart-remind.sh userprompt-remind.sh sessionend-stamp.sh"
 
-# D1 (updater workstream): the engine commit that is about to render every
-# hook line, the rules file, and the installed skill copy -- a stamp so a
-# later `memcontinuum-update.sh` can tell a rendered artifact apart from
-# "whatever commit last rendered it". Short sha, derived from THIS checkout
-# (not the cwd -- ENGINE_ROOT is always where this script itself lives, so a
-# `--code-root`-only invocation from an unrelated repo still stamps
-# correctly). "unknown" when the engine checkout is not a git repo at all
-# (a tarball drop, for instance) -- absent/unknown stamps read as
-# "pre-stamp render, re-render to find out" by the updater, never as an
-# error here.
-RENDERED_SHA="$(git -C "$ENGINE_ROOT" rev-parse --short HEAD 2>/dev/null)"
-[ -n "$RENDERED_SHA" ] || RENDERED_SHA="unknown"
+# The stamp that goes onto every hook line, the rules file, and the installed
+# skill copy, so a later `memcontinuum-update.sh` can tell a current rendered
+# artifact from a stale one. It is a fingerprint of this checkout's RENDER
+# INPUTS -- templates, this installer, the settings merge, the copied skills,
+# the machine-layer installer -- not the checkout's HEAD commit: pulling a fix
+# to a hook SCRIPT changes nothing that was rendered here (hook lines run
+# those scripts by absolute path), so it must not make every wired repo look
+# stale. See mc_render_fingerprint in scripts/mc-registry-lib.sh.
+#
+# Derived from THIS checkout, never the cwd -- ENGINE_ROOT is always where
+# this script itself lives, so a `--code-root`-only invocation from an
+# unrelated repo still stamps correctly. The literal "unknown" when it cannot
+# be computed at all (no sha256 tool, an incomplete checkout); an
+# absent/unknown stamp reads as "re-render to find out" downstream, never as
+# an error here.
+mc_render_fingerprint "$ENGINE_ROOT" || :
+RENDERED_SHA="$MC_RENDER_FINGERPRINT"
 
 PROJECT=""
 STORE=""

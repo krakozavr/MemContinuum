@@ -194,18 +194,18 @@ if [ "$FOUND" -eq 1 ]; then
         # when the decision row's own project pinned it, "wiring" when it
         # was the first match (no row, or the row named no project).
         [ -n "$project" ] && echo "project_source=$PROJECT_SOURCE"
-        # D5 (updater workstream): compare this hook line's own render stamp
-        # to the ENGINE checkout's current commit. A no-python, near-zero-cost
-        # check -- MC_WIRED_COMMAND is already resolved above, and this is
-        # just one more mc_command_env_value call plus one `git rev-parse` on
-        # the engine checkout this very script lives in (never on $REPO).
-        # Absent stamp (pre-D1 render) reads as "unknown", same as
-        # repo-init.sh's own fallback -- never a hard failure, always a hint.
+        # Compare this hook line's own render stamp to what the engine
+        # checkout would render right now. Still python-free: one more
+        # mc_command_env_value call on a command line already resolved above,
+        # plus one sha256 pass over the engine's render inputs
+        # (mc_render_fingerprint, scripts/mc-registry-lib.sh) -- never
+        # anything on $REPO. A stamp from a render that predates stamping
+        # reads as "unknown", never a hard failure, always a hint.
         mc_command_env_value "$MC_WIRED_COMMAND" "MEMCONTINUUM_RENDERED"
         rendered="${MC_ENV_VALUE:-unknown}"
         engine_dir="${MEMCONTINUUM_ENGINE:-$SCRIPT_DIR/..}"
-        engine_sha="$(git -C "$engine_dir" rev-parse --short HEAD 2>/dev/null)"
-        [ -n "$engine_sha" ] || engine_sha="unknown"
+        mc_render_fingerprint "$engine_dir" || :
+        engine_sha="$MC_RENDER_FINGERPRINT"
         if [ "$rendered" != "$engine_sha" ]; then
             echo "update: wiring rendered by $rendered, engine at $engine_sha -- run scripts/memcontinuum-update.sh"
         fi

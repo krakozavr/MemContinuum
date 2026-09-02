@@ -325,6 +325,12 @@ tells you which case you're in — it prints an `update:` line naming the repair
 command only when this repo's wiring is out of date; nothing to do when it
 says nothing.
 
+That distinction is real, not a rule of thumb. Each rendered artifact carries
+a fingerprint of the things it was rendered *from* — the templates, the
+installer, the skill copies — so pulling a change to a hook script leaves
+every repository reading as current, and changing a template flips exactly the
+repositories that need re-rendering.
+
 Run `memcontinuum-update.sh` with no flags and it only prints a table: one line
 per repository and claude-dir, saying what is current, what has drifted, and
 what it will not touch. `--apply` does the work. It can re-render wiring; it

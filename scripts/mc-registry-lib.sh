@@ -478,6 +478,86 @@ mc_rules_identity_marker() {
     [ -n "$MC_RULES_MARKER" ]
 }
 
+# mc_render_fingerprint ENGINE_ROOT
+#
+# The stamp every rendered artifact carries: 12 hex characters of a sha256
+# over this checkout's RENDER INPUTS. Sets MC_RENDER_FINGERPRINT and returns
+# 0; sets it to the literal "unknown" and returns 1 when no sha256 tool is
+# available or the checkout is missing the inputs (which the callers treat as
+# "cannot tell -- re-render to find out", never as an error).
+#
+# Why not the engine's HEAD commit, which is what this used to be. Two kinds
+# of change reach a wired repository in completely different ways:
+#
+#   a fix to a SCRIPT (a hook, memidx.py, the walker) reaches every wired repo
+#   the moment the checkout is pulled -- every rendered hook line runs that
+#   script from this checkout by absolute path. Nothing needs re-rendering.
+#
+#   a change to what gets RENDERED (a template, the installer's own rendering,
+#   the settings merge, a skill that gets copied into a repo) reaches nobody
+#   until the installer is re-run there.
+#
+# A HEAD sha moves on both, so it marked every wired repo on the machine
+# stale after any commit to anything -- the distinction the update command
+# exists to draw, drawn wrong. Hashing the inputs draws it exactly: a
+# scripts-only commit leaves every repo `ok`; a template or installer change
+# flips them `stale`.
+#
+# Hook SCRIPTS are deliberately NOT inputs -- they are executed by path, and
+# pulling updates them live.
+#
+# Inputs, in a fixed order, each preceded by its path relative to the
+# checkout (so adding, removing or renaming one changes the fingerprint even
+# when the bytes elsewhere are identical):
+#   scripts/repo-init.sh          -- does the rendering
+#   scripts/mc_settings_merge.py  -- decides how rendered blocks land
+#   memcontinuum-setup.sh         -- renders the machine layer's own pieces
+#   templates/*                   -- everything rendered from a template
+#   skills/*/SKILL.md             -- the skill copies installed into a repo
+mc_render_fingerprint() {
+    local root="$1" f hasher out
+    local -a files=()
+    MC_RENDER_FINGERPRINT="unknown"
+    if command -v sha256sum >/dev/null 2>&1; then
+        hasher="sha256sum"
+    elif command -v shasum >/dev/null 2>&1; then
+        hasher="shasum -a 256"
+    else
+        return 1
+    fi
+    for f in "$root/scripts/repo-init.sh" "$root/scripts/mc_settings_merge.py" \
+             "$root/memcontinuum-setup.sh"; do
+        [ -f "$f" ] && files[${#files[@]}]="$f"
+    done
+    # LC_ALL=C so glob expansion is byte-ordered, and therefore the same on
+    # every machine -- a locale-dependent order would give the same checkout
+    # two different fingerprints.
+    local saved_lc="${LC_ALL:-__mc_unset__}"
+    LC_ALL=C
+    for f in "$root"/templates/*; do
+        [ -f "$f" ] && files[${#files[@]}]="$f"
+    done
+    for f in "$root"/skills/*/SKILL.md; do
+        [ -f "$f" ] && files[${#files[@]}]="$f"
+    done
+    if [ "$saved_lc" = "__mc_unset__" ]; then unset LC_ALL; else LC_ALL="$saved_lc"; fi
+    # An incomplete checkout cannot be fingerprinted honestly.
+    [ "${#files[@]}" -ge 3 ] || return 1
+    out="$(
+        for f in "${files[@]}"; do
+            printf '%s\n' "${f#"$root"/}"
+            cat "$f"
+        done | $hasher
+    )" || return 1
+    out="${out%% *}"
+    case "$out" in
+        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
+        *) return 1 ;;
+    esac
+    MC_RENDER_FINGERPRINT="${out:0:12}"
+    return 0
+}
+
 # mc_resolve_home
 #
 # F7: two registries used to exist under a non-default MEMCONTINUUM_HOME --

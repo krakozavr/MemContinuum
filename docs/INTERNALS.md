@@ -291,22 +291,51 @@ built once by `mc_build_wiring_args`. Both exist because the hand-rolled
 versions they replace used `tr ';' ' '` with an unquoted expansion, which
 word-splits every path containing a space and glob-expands the rest.
 
-## Version stamp and the updater
+## Render fingerprint and the updater
 
 Every rendered hook line, every rendered `<claude-dir>/rules/memcontinuum.md`,
-and the installed `memory-search` skill copy carry the engine commit that
-rendered them: `MEMCONTINUUM_RENDERED=<short sha>` as one more env token on
-each of the seven hook command lines (`repo-init.sh` computes it once,
-`git -C "$ENGINE_ROOT" rev-parse --short HEAD`, falling back to the literal
-`unknown` when the engine checkout is not a git repo at all), and
-`<!-- memcontinuum-rendered: <sha> -->` as an HTML comment — the rules file's
-second line (after its identity-marker first line); the skill copy's, right
-after the frontmatter's closing `---` (never at byte 0 — the skill loader
-needs the opening `---` to stay line 1). Engine/hook *logic* updates for free
-(every rendered line runs a script from the checkout by absolute path, so a
-`git pull` is live instantly); this stamp is what lets something detect when
-*rendered* artifacts — the settings hook lines themselves, the rules file, the
-skill copy — have fallen behind.
+and the installed `memory-search` skill copy carry a stamp:
+`MEMCONTINUUM_RENDERED=<fingerprint>` as one more env token on each of the
+seven hook command lines, and `<!-- memcontinuum-rendered: <fingerprint> -->`
+as an HTML comment — the rules file's second line (after its identity-marker
+first line); the skill copy's, right after the frontmatter's closing `---`
+(never at byte 0 — the skill loader needs the opening `---` to stay line 1).
+
+**The stamp is a fingerprint of the render inputs, not the engine's HEAD
+commit.** Two kinds of change reach a wired repository in completely
+different ways. A fix to a *script* — a hook, `memidx.py`, the walker —
+arrives the moment the checkout is pulled, because every rendered hook line
+runs that script from the checkout by absolute path; nothing needs
+re-rendering. A change to what gets *rendered* — a template, this installer's
+own rendering, the settings merge, a skill copied into a repo — reaches nobody
+until the installer is re-run there. A HEAD sha moves on both, so it marked
+every wired repo on the machine stale after any commit to anything: the exact
+distinction this command exists to draw, drawn wrong. Hashing the inputs draws
+it: a scripts-only commit leaves every repo `ok`; a template or installer
+change flips them `stale`.
+
+`mc_render_fingerprint ENGINE_ROOT` (`mc-registry-lib.sh`) is the one function
+that computes it — used by `repo-init.sh` when it renders, by
+`memcontinuum-update.sh` when it compares, and by `memcontinuum-state.sh` for
+its hint. It is 12 hex characters of a `sha256sum` (falling back to
+`shasum -a 256`) over these inputs, in this fixed order, each preceded by its
+path relative to the checkout so that adding, removing or renaming one counts
+as a change:
+
+| input | why |
+|---|---|
+| `scripts/repo-init.sh` | does the rendering |
+| `scripts/mc_settings_merge.py` | decides how rendered blocks land |
+| `memcontinuum-setup.sh` | renders the machine layer's own pieces |
+| `templates/*` | everything rendered from a template |
+| `skills/*/SKILL.md` | the skill copies installed into a repo |
+
+`hooks/*.sh` are deliberately **not** inputs: they are executed by path, so
+pulling updates them live. `LC_ALL=C` is set around the globs so the file
+order is byte-ordered and a checkout fingerprints identically on every
+machine. The literal `unknown` when no sha256 tool is available or the
+checkout is incomplete — read downstream as "cannot tell, re-render to find
+out", never as an error.
 
 `<claude-dir>/rules/memcontinuum.md` is rendered from
 `templates/memcontinuum-rules.md` on every install, fresh or re-run — the one
@@ -427,7 +456,12 @@ given explicitly — not gated on `--apply`, which the walk mode's dry-run
 default would otherwise make it silently no-op): they union the given
 language/extension into the row's existing `langs=`/`never=` lists, never
 drop what was already there, rewrite the row via `decide.sh wired` with every
-field, then re-render every claude-dir the row lists.
+field, then re-render every claude-dir the row lists. The re-render happens
+**first**: the row is rewritten only after every claude-dir succeeded, and an
+unknown language is refused (against `chunkers.LANGUAGE_TABLE`) before
+anything is touched at all — `repo-init.sh` validates `--langs` too, but only
+when the install has a `--code-root` to wire it into, so a code-root-less row
+would otherwise sail past that check.
 
 `--machine` (with `--apply`) also re-runs `memcontinuum-setup.sh` once, to
 refresh the machine-level detector hook and the user-level skill copy — off
@@ -437,8 +471,12 @@ by default, since most drift is per-repo.
 `update: wiring rendered by X, engine at Y -- run scripts/memcontinuum-update.sh`,
 only when the two differ — pulled from the same registry-pinned hook command
 line its `store=`/`project=` extraction already resolves, plus one
-`git rev-parse --short HEAD` on the engine checkout `SCRIPT_DIR` lives in
-(never on the repo being reported on).
+`mc_render_fingerprint` pass over the engine checkout's render inputs (never
+anything on the repo being reported on). It looks for that command line in the
+claude-dir(s) the registry row records, falling back to `<repo>/.claude` when
+the row names none: a project whose wiring lives in a session home beside a
+bare checkout would otherwise have had the hint go permanently silent —
+exactly the repositories most likely to drift.
 
 ## Path syntax in hook filters
 

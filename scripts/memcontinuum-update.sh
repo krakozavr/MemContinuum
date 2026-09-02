@@ -141,8 +141,14 @@ usage() {
 mc_resolve_home
 DECISIONS="$MEMCONTINUUM_HOME/decisions.tsv"
 
-ENGINE_SHA="$(git -C "$ENGINE_ROOT" rev-parse --short HEAD 2>/dev/null)"
-[ -n "$ENGINE_SHA" ] || ENGINE_SHA="unknown"
+# What this checkout would render right now -- a fingerprint of the render
+# inputs, the same one repo-init.sh stamps with (mc_render_fingerprint,
+# scripts/mc-registry-lib.sh). Comparing rendered artifacts against THIS,
+# rather than against the engine's HEAD commit, is what makes "a scripts-only
+# fix needs nothing, a rendered-artifact fix needs a re-render" a distinction
+# this table can actually draw.
+mc_render_fingerprint "$ENGINE_ROOT" || :
+ENGINE_SHA="$MC_RENDER_FINGERPRINT"
 
 # From the template that defines it, not a copy (mc_rules_identity_marker):
 # this command and the installer must agree on what a rendered rules file
