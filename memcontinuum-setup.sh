@@ -37,16 +37,15 @@
 # somebody's first reindex -- or worse, inside a hook -- looking like a hang.
 # Better to pay it here, visibly, once.
 #
-# MEMCONTINUUM_HOME (fix-round-4 F7): when this env var is set to something
-# other than the fixed default $HOME/.memcontinuum, config.sh is written
-# there AS USUAL, but a second, minimal "pointer" config.sh is ALSO written
-# at the fixed default path recording the real MEMCONTINUUM_HOME. The
-# detector hook's installed command line does not bake MEMCONTINUUM_HOME in
-# any more (a baked value and this registry used to disagree -- two
-# registries, a decline that never silenced the ask); every consumer
-# (detector, decide.sh, state.sh) now resolves it the same way: env ->
-# pointer at the fixed default -> the fixed default itself. See
-# scripts/mc-registry-lib.sh mc_resolve_home.
+# MEMCONTINUUM_HOME: when this env var is set to something other than the
+# fixed default $HOME/.memcontinuum, config.sh is written there AS USUAL, but
+# a second, minimal "pointer" config.sh is ALSO written at the fixed default
+# path recording the real MEMCONTINUUM_HOME. The detector hook's installed
+# command line bakes no MEMCONTINUUM_HOME of its own -- a baked value can
+# disagree with the registry, which means two registries and a decline that
+# never silences the ask. Every consumer (detector, decide.sh, state.sh)
+# resolves it the same way instead: env -> pointer at the fixed default ->
+# the fixed default itself. See scripts/mc-registry-lib.sh mc_resolve_home.
 # --MC-USAGE-END--
 
 set -u

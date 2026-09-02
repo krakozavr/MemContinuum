@@ -17,10 +17,10 @@ and the human has not actually answered yet, stop and ask them first.
 
 ```bash
 # config.sh is sourceable shell (values are single-quoted by sh_quote) --
-# SOURCE it, never parse it with sed/tr: quote-stripping broke the moment
-# the quoting style changed (regate finding, 2026-08-31).
+# SOURCE it, never parse it with sed/tr: any quote-stripping of your own
+# breaks the moment the quoting style changes.
 #
-# Two-step, round-4 R2 fix: the fixed default path may hold only a POINTER
+# Two steps, because the fixed default path may hold only a POINTER
 # (a custom-HOME install also writes a minimal config.sh at
 # $HOME/.memcontinuum recording just the real MEMCONTINUUM_HOME -- see
 # memcontinuum-setup.sh "3. config"). Source the default/env path first;
@@ -69,11 +69,11 @@ and let them decide.
 
 - `--project NAME` — the index namespace, also `<NAME>.sqlite`. Must match
   `[A-Za-z0-9._-]+` (repo-init.sh refuses anything else — it is embedded as
-  an identity marker, fix-round-4 R7/F8).
+  an identity marker in every hook command line).
 - `--store DIR` — where the store lives. It must be **its own git repo**, and
   by default `scripts/repo-init.sh` refuses a location inside another repo's working
   tree (`--force` overrides); it also refuses an existing git repo at `DIR` that carries
-  none of this tool's markers (fix-round-4 F10 — protects against a mistyped `--store`
+  none of this tool's markers (this protects against a mistyped `--store`
   landing store directories in an unrelated repo; adopt an existing store by pointing at
   one that already has `topics/`/`incidents/`/`concepts/` or a README mentioning
   MemContinuum). **Naming convention (owner ruling 2026-08-31):
@@ -83,9 +83,9 @@ and let them decide.
   applies the convention on its own: `<repo>-MemContinuum-Store` beside the
   git repo the cwd is in, else `MemContinuum-Store` inside the cwd. Only pass
   `--store` when the human wants a different place — and when you do, pass
-  `--claude-dir` alongside it (fix-round-4 F3: `repo-init.sh` refuses an
-  explicit `--store` with no explicit `--claude-dir` rather than guess which
-  `.claude` its hooks belong in).
+  `--claude-dir` alongside it (`repo-init.sh` refuses an explicit `--store`
+  with no explicit `--claude-dir` rather than guess which `.claude` its hooks
+  belong in).
 - `--code-root DIR` — repeatable; the code checkout(s) whose edits should
   trigger retrieval. Omit for a rationale-only store.
 
@@ -149,10 +149,10 @@ cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME --dry-run
 cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME
 ```
 
-Then record it. `--repo REPO` is REQUIRED here (fix-round-4 F2): `wired`,
-`declined`, and `forget` all silence or unsilence a specific repo
-permanently, and there is no safe default for that -- name the repo, don't
-rely on whatever directory the shell happens to be sitting in:
+Then record it. `--repo REPO` is REQUIRED here: `wired`, `declined`, and
+`forget` all silence or unsilence a specific repo permanently, and there is
+no safe default for that -- name the repo, don't rely on whatever directory
+the shell happens to be sitting in:
 
 ```bash
 bash "$ENGINE/scripts/memcontinuum-decide.sh" wired --repo REPO --store DIR --project NAME

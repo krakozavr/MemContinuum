@@ -56,10 +56,10 @@ Notes:
   anchors at the settings source, not the filesystem root (docs: `Edit(//Users/alice/file)` =
   absolute `/Users/alice/file`). `<code-root>` above is always an absolute path (already starting
   with `/`), so the rendered pattern needs a SECOND leading slash — `Edit(//home/…/**)` — to match
-  anything at all. Fix-round (2026-08-31): the templates previously rendered only one leading
-  slash and the pre-edit hook never fired in real sessions as a result; `code-root-filter-pair.json.tmpl`
-  and `newfile-nudge-filter-pair.json.tmpl` now compose `if` as `Edit(/{{CODE_ROOT}}/**)` /
-  `Write(/{{CODE_ROOT}}/**)` so the rendered value always has exactly two leading slashes.
+  anything at all. With only one leading slash the hook never fires in a real session, so
+  `code-root-filter-pair.json.tmpl` and `newfile-nudge-filter-pair.json.tmpl` compose `if` as
+  `Edit(/{{CODE_ROOT}}/**)` / `Write(/{{CODE_ROOT}}/**)` — the rendered value always has exactly
+  two leading slashes.
 
 ## 2. `newfile-nudge.sh` — Claude Code `PreToolUse` hook (Write only)
 
@@ -70,11 +70,10 @@ existing file is `pre-edit-chain.sh`'s job, not this one's). Deliberately minima
 `MEMCONTINUUM_ROOT`/`STRIP_PREFIX`, since this hook never calls `memidx.py` or reads the index at
 all — it only checks that the write target is new, under a configured code root, and has an
 indexed source extension, then injects one reminder line. It DOES carry `MEMCONTINUUM_PROJECT`
-(fix-round-4 F1) — identity only, so `scripts/repo-init.sh`'s merge step can tell this project's
-nudge entry apart from a different project's sharing the same `--claude-dir`; the hook itself never
-reads it. A nudge entry installed before this fix carries no `MEMCONTINUUM_PROJECT` at all and
-stays sweepable by ANY project's re-run until that project re-runs `repo-init.sh` — see README.md's
-"Idempotency" note.
+— identity only, so `scripts/repo-init.sh`'s merge step can tell this project's nudge entry apart
+from a different project's sharing the same `--claude-dir`; the hook itself never reads it. A
+legacy nudge entry carrying no `MEMCONTINUUM_PROJECT` at all stays sweepable by ANY project's
+re-run until that project re-runs `repo-init.sh` — see the migration note at the end of this file.
 
 Rendered from `templates/newfile-nudge-hook.json.tmpl` + one
 `templates/newfile-nudge-filter-pair.json.tmpl` pair per `--code-root`, merged into the SAME
@@ -210,9 +209,9 @@ Notes:
   `agent_type`) in-script instead, since they have no `if` to lean on. `source` is a
   `SessionStart`-only field (see the next note) — `precompact-persist.sh` gates on `trigger`
   (PreCompact's own field, `manual`/`auto`), and `userprompt-remind.sh` gates on `agent_id`/
-  `agent_type` (UserPromptSubmit carries neither `source` nor `trigger` at all; fix-round
-  2026-08-31 removed a `source == "user"` gate that had never once matched a real payload — see
-  that script's own header comment).
+  `agent_type` (UserPromptSubmit carries neither `source` nor `trigger` at all — a
+  `source == "user"` gate on this event matches no real payload; see that script's own header
+  comment).
 - `SessionStart` fires with several `source` values (`startup`, `resume`, `clear`, `compact`,
   `fork`); `sessionstart-remind.sh` branches on all of them itself — wire it unconditionally
   (no settings-level source filter needed, though one is supported if you want to narrow it).
@@ -237,11 +236,10 @@ Notes:
 > executable bit is not required anywhere (a zip download or a
 > core.filemode=false clone drops it silently).
 
-> Migration note (fix-round-4 F1, 2026-08-31): `scripts/repo-init.sh`'s merge step identifies its
-> own hook entries by script basename, further scoped by the `MEMCONTINUUM_PROJECT=` marker every
-> one of the seven commands now carries -- including `newfile-nudge.sh` (section 2 above), which
-> did not carry it before this fix. Two projects sharing one `--claude-dir`: a project's re-run
-> can only sweep entries marked for ITS OWN `--project`, or entries with no marker at all (legacy,
-> pre-identity wiring). A `newfile-nudge.sh` entry installed before this fix carries no marker and
+> Migration note: `scripts/repo-init.sh`'s merge step identifies its own hook entries by script
+> basename, further scoped by the `MEMCONTINUUM_PROJECT=` marker every one of the seven commands
+> carries -- `newfile-nudge.sh` (section 2 above) included. Two projects sharing one
+> `--claude-dir`: a project's re-run can only sweep entries marked for ITS OWN `--project`, or
+> entries with no marker at all (legacy, pre-identity wiring). A legacy entry carrying no marker
 > stays sweepable by ANY project's re-run until the project that owns it re-runs
 > `scripts/repo-init.sh` -- there is no separate migration step; a normal re-run closes the hole.

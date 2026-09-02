@@ -369,8 +369,8 @@ re-deriving the known-language list: `status: "supported"` with `files > 0`
 (proposed), `status: "supported"` with `files == 0` (supported but not found),
 and `status: "unsupported"` (the key is the extension, or `"(no extension)"`).
 
-`repo-init.sh` runs the census across every `--code-root` given, aggregates, and
-offers four answers on a tty: skip (language-less wiring), enable all detected,
+`repo-init.sh` runs the census across every `--code-root` given, merges the
+counts, and offers four answers on a tty: skip (language-less wiring), enable all detected,
 select from detected, or never-mention-this-extension. The fourth records
 extensions onto the nudge hook line (`MEMCONTINUUM_NEVER_EXTS`) and does not
 change which languages are enabled.
