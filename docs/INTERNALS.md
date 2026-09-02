@@ -411,6 +411,17 @@ when the row is read:
   each must be one the row already records. One that is not is refused as
   `dir-not-recorded` — never walked, never installed into.
 
+`--repo` naming a repository with no `wired` row — undecided, or a recorded
+`declined` — is refused before the walk begins:
+`no-wired-row: <key> (decision=none|declined|…)`, non-zero. It used to match
+nothing and print an empty table at exit 0, which reads as "checked, all
+current" for a repository this command never had anything to say about. It is
+also the case that left the row half of the matrix unreachable: with no row to
+judge them against, the row-dependent flags were neither consumed nor refused.
+One helper (`require_wired_row`) serves both the walk and targeted mode, so
+the answer is the same whichever asked, and it names the decision that *is*
+recorded rather than reporting a bare miss.
+
 **Action precedence.** The answers this command will never act on come first:
 `store-missing`, then `no-wiring`, then `rules-foreign`, then the
 `migrate-needs-*`/`migrate-dirs-disagree` questions, and only then the drift

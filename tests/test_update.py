@@ -2321,6 +2321,77 @@ class TestDisagreementComparesTheRawRenderedValues(unittest.TestCase):
             self.assertNotIn("*.zz", settings, cd)
 
 
+class TestRepoWithoutAWiredRowIsRefused(unittest.TestCase):
+    """`--repo` names the row to act on. When there is no wired row for it,
+    the walk matched nothing and printed an empty table at exit 0 -- which
+    reads as "checked, all current" for a repository this command never had
+    anything to say about. It also left the per-row flags in limbo: the half
+    of the flag matrix that only a row can settle never ran, so
+    `--repo UNDECIDED --langs python` was neither consumed nor refused."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-norow-test-")
+        self.home = str(Path(self.tmp) / "home")
+        os.makedirs(self.home, exist_ok=True)
+        self.repo = git_repo(str(Path(self.tmp) / "repo"))
+
+    def _wire_an_unrelated_row(self):
+        """So the registry FILE exists and holds rows -- the miss has to come
+        from this key, not from an empty machine."""
+        other = git_repo(str(Path(self.tmp) / "other"))
+        write_row(self.home, other, "wired", note="store=/nowhere project=other")
+
+    def _refused(self, args, decision):
+        before = (decisions_tsv(self.home).read_text()
+                  if decisions_tsv(self.home).exists() else None)
+        proc = run(UPDATE_SH, args, self.home)
+        combined = proc.stdout + proc.stderr
+        self.assertNotEqual(proc.returncode, 0, combined)
+        self.assertIn("no-wired-row", combined, combined)
+        self.assertIn("decision=%s" % decision, combined, combined)
+        # No table: an empty one is exactly the "nothing to report" answer
+        # this refusal replaces.
+        self.assertNotIn("claude-dir\tstamped", combined, combined)
+        after = (decisions_tsv(self.home).read_text()
+                 if decisions_tsv(self.home).exists() else None)
+        self.assertEqual(after, before, "the registry was touched")
+        self.assertFalse(Path(self.repo, ".claude").exists(),
+                         "nothing may be wired for a repo with no wired row")
+        return combined
+
+    def test_an_undecided_repo_is_refused(self):
+        self._wire_an_unrelated_row()
+        self._refused(["--dry-run", "--repo", self.repo], "none")
+
+    def test_a_declined_repo_is_refused_and_names_the_recorded_answer(self):
+        self._wire_an_unrelated_row()
+        write_row(self.home, self.repo, "declined")
+        combined = self._refused(["--apply", "--repo", self.repo], "declined")
+        self.assertIn(self.repo, combined, combined)
+
+    def test_a_machine_with_no_registry_at_all_is_refused_too(self):
+        self._refused(["--dry-run", "--repo", self.repo], "none")
+
+    def test_per_row_flags_alongside_it_are_refused_rather_than_ignored(self):
+        """The point of the ruling: with no row, the row half of the flag
+        matrix never runs, so these used to be silently dropped."""
+        self._wire_an_unrelated_row()
+        for flag, value in (("--langs", "python"),
+                            ("--code-root", self.tmp),
+                            ("--set-never-ext", ".cs"),
+                            ("--claude-dir", str(Path(self.repo) / ".claude"))):
+            with self.subTest(flag=flag):
+                self._refused(["--apply", "--repo", self.repo, flag, value], "none")
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_targeted_mode_refuses_with_the_same_answer(self):
+        self._wire_an_unrelated_row()
+        write_row(self.home, self.repo, "declined")
+        combined = self._refused(["--add-lang", "swift", "--repo", self.repo], "declined")
+        # The old wording stays reachable -- it is what the message means.
+        self.assertIn("no wired row", combined, combined)
+
+
 class TestHelp(unittest.TestCase):
     def test_help_exits_zero_and_documents_the_flags(self):
         proc = subprocess.run([MC_BASH, str(UPDATE_SH), "--help"], capture_output=True, text=True)

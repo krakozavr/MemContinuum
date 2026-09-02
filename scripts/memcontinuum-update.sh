@@ -95,6 +95,15 @@
 #   every dir named must be one the row already records (a dir it does not is
 #   refused as `dir-not-recorded`, never walked and never installed into).
 #
+# --repo naming a repository with NO wired row -- undecided, or a recorded
+# `declined` -- is refused (`no-wired-row: <key> (decision=...)`), never
+# answered with an empty table at exit 0. An empty table reads as "checked,
+# all current" for a repository this command had nothing to say about, and it
+# is also where the row-dependent flags above would go unjudged: with no row
+# to judge them against, they were neither consumed nor refused. Wiring a repo
+# is the memcontinuum skill's job, with a human answering; this command only
+# ever re-renders rows already marked `wired`.
+#
 # MIGRATING A ROW WRITTEN BEFORE THE REGISTRY RECORDED WIRING PARAMETERS
 #
 # Such a row has no claude-dirs on record. This command can see the one
@@ -326,6 +335,48 @@ refuse_flag() {
     echo "$2 is not accepted in $1 mode: $3" >&2
     echo "Nothing was read and nothing was written. \`$0 --help\` lists what each mode takes." >&2
     exit 2
+}
+
+# require_wired_row KEY REPO -- refuses unless KEY has a `wired` row, naming
+# the decision that IS recorded.
+#
+# The completing half of the matrix above. Every mode that takes --repo acts on
+# one row, and the row-dependent flags (--claude-dir/--code-root/--langs/
+# --set-never-ext) can only be judged against that row -- so with no row there
+# was nothing to judge them against, and they were neither consumed nor
+# refused: the walk matched nothing, printed an empty table, and exited 0.
+# That reads as "checked, all current" for a repository this command never had
+# anything to say about, and it silently swallowed whatever else was typed.
+#
+# `wired` is the only decision this command acts on -- it re-renders wiring
+# that is already there and never wires anything -- so `declined` and "no row
+# at all" are both refusals, and each names what it found so the answer is
+# actionable rather than a bare miss.
+#
+# Leaves MC_LOOKUP_DECISION/WHEN/NOTE set on success (mc_registry_lookup's own
+# out-parameter contract), so the caller reads the row it just validated
+# instead of looking it up twice.
+require_wired_row() {
+    local key="$1" repo="$2" decision="none"
+    if mc_registry_lookup "$DECISIONS" "$key"; then
+        [ "$MC_LOOKUP_DECISION" = "wired" ] && return 0
+        [ -z "$MC_LOOKUP_DECISION" ] || decision="$MC_LOOKUP_DECISION"
+    fi
+    echo "no-wired-row: $key (decision=$decision)" >&2
+    case "$decision" in
+        none)
+            echo "  There is no wired row for $repo -- this repo is undecided: nobody has answered the MemContinuum question for it yet. Nothing was read further and nothing was written." >&2
+            echo "  This command only ever re-renders rows already marked \`wired\`; wiring one is the memcontinuum skill's job, with a human answering." >&2
+            ;;
+        declined)
+            echo "  There is no wired row for $repo -- the recorded answer is \`declined\`. Nothing was read further and nothing was written." >&2
+            echo "  A declined repo is a recorded NO. If that has changed, record the new answer where answers are recorded: $DECIDE wired --repo $repo --store DIR --project NAME --claude-dir DIR" >&2
+            ;;
+        *)
+            echo "  There is no wired row for $repo -- its row records decision=$decision, which this command does not act on. Nothing was read further and nothing was written." >&2
+            ;;
+    esac
+    exit 1
 }
 
 WALK_WHY="--claude-dir/--code-root/--langs/--set-never-ext describe ONE registry row, so they need --repo PATH to say which. Without --repo this command walks every wired row and writes nothing it had to guess."
@@ -840,10 +891,9 @@ if [ "$TARGETED" -eq 1 ]; then
         echo "not a git repository: $TARGET_REPO" >&2
         exit 1
     fi
-    if ! mc_registry_lookup "$DECISIONS" "$MC_REPO_KEY" || [ "$MC_LOOKUP_DECISION" != "wired" ]; then
-        echo "no wired row for $TARGET_REPO ($MC_REPO_KEY) -- nothing to update. Wire it first (the memcontinuum skill does this)." >&2
-        exit 1
-    fi
+    # Same refusal as the walk's, from the same place: a repo with no wired
+    # row gets one answer, whichever mode asked.
+    require_wired_row "$MC_REPO_KEY" "$MC_REPO"
     KEY="$MC_REPO_KEY"
     NOTE="$MC_LOOKUP_NOTE"
     mc_note_field "$NOTE" "store"; STORE="$MC_NOTE_FIELD"
@@ -1080,6 +1130,9 @@ if [ -n "$TARGET_REPO" ]; then
         echo "not a git repository: $TARGET_REPO" >&2
         exit 1
     fi
+    # Before the walk, not during it: a --repo that matches no wired row must
+    # be an answer, not an empty table.
+    require_wired_row "$MC_REPO_KEY" "$MC_REPO"
     ONLY_KEY="$MC_REPO_KEY"
 fi
 
