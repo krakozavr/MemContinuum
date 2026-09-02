@@ -48,8 +48,8 @@ reason is asymmetric cost: a missed reminder costs one un-recorded ruling; a
 hook that blocks an edit costs the user their tool, and the first thing anyone
 does with a tool that blocks edits is remove it.
 
-**Logging, per hook.** The seven Claude Code hooks and `pre-edit-chain.sh` each
-write exactly one `outcome=` line per run to `$MEMCONTINUUM_HOME/hook.log`.
+**Logging, per hook.** The seven project-level hooks each write exactly one
+`outcome=` line per run to `$MEMCONTINUUM_HOME/hook.log`.
 Diagnostic lines may precede it (`pre-edit-chain.sh` logs a missing-python note
 before its own `outcome=`). A watchdog kill is included in "every run": the
 guarded hook cannot write its own outcome line then — it may be mid-call, or may

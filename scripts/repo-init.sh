@@ -122,8 +122,11 @@ Usage: repo-init.sh --project NAME [--store DIR] [--code-root DIR ...]
                       is unset). For scripted/CI runs.
   --dry-run           print everything this script would do; write nothing
                       (except --bootstrap-venv's venv, see above).
-  --force             allow --store to sit inside another git repo's
-                      tracked working tree (normally refused).
+  --force             allow --store to sit inside another git repo's working
+                      tree (normally refused). The check is by LOCATION, not
+                      by tracked content: nothing at --store need exist yet.
+                      It never overrides the separate refusal of an existing
+                      git repo that is not a MemContinuum store.
   -h, --help          this text.
 
 Without --python or --bootstrap-venv, the python to run memidx.py/memlint.py
@@ -432,7 +435,7 @@ fi
 if ! is_git_repo "$STORE" && [ "$FORCE" -eq 0 ]; then
     ANCESTOR="$(nearest_existing_ancestor "$STORE")"
     if OUTER_TOPLEVEL="$(git -C "$ANCESTOR" rev-parse --show-toplevel 2>/dev/null)"; then
-        fail "--store $STORE is inside an existing git repo's tracked tree ($OUTER_TOPLEVEL) -- pass --force to install anyway, or pick a --store outside it" 4
+        fail "--store $STORE is inside an existing git repo's working tree ($OUTER_TOPLEVEL) -- pass --force to install anyway, or pick a --store outside it" 4
     fi
 fi
 

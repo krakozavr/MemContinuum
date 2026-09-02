@@ -28,9 +28,9 @@
 #   --claude-dir DIR  user-level Claude Code directory. Default ~/.claude.
 #   --no-model-warm   skip the one-time embedding-model download.
 #   --dry-run         print the plan, write nothing.
-#   --uninstall       remove the user-level hook + skill and BOTH config
-#                     artifacts (see MEMCONTINUUM_HOME below). Never touches
-#                     a venv, a store, or any per-repo wiring.
+#   --uninstall       remove the user-level hook, the skill, and this
+#                     machine's config. Never touches a venv, a store, any
+#                     per-repo wiring, or your recorded per-repo answers.
 #
 # Why the model warm is on by default: fastembed downloads ~100 MB the first
 # time anything needs to embed. Left lazy, that download happens inside

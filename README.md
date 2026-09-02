@@ -222,7 +222,7 @@ rather than wiring the wrong repo.
 **The census, and being asked before anything is indexed.** With a
 `--code-root`, the installer first counts source files by extension — and by
 reading the first line of extensionless files, so a `#!/usr/bin/env python3`
-script with no `.py` suffix counts as Python too — skipping each language's
+script with no `.py` suffix counts as Python too — skipping every language's
 usual noise directories, and then asks what to do with what it found:
 
 1. **skip** — wire the hooks, index no code
