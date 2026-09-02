@@ -40,9 +40,11 @@ because Y, so we do Z instead" stays intact and citable.
 
 Retrieval is **automatic**, not left to anyone's discipline. Before an edit
 touches a file, a hook looks up whatever decision governs that file and hands it
-over. Every hook here fails open: a stale index, a missing python, or any lookup
-failure means the hook stays silent that turn — never that your edit is blocked.
-Nothing in this tool can stop you from working.
+over. Every hook here fails open: a missing index, a missing python, or a failed
+lookup means the hook stays silent that turn — never that your edit is blocked.
+A stale-but-present index is not one of those cases: it still answers from
+whatever it has, which is why keeping it current (`reindex`, or just committing
+the store) is worth doing. Nothing in this tool can stop you from working.
 
 The same idea runs in the other direction. When files have been edited under no
 decision topic at all, or when the conversation has moved on for a while right
@@ -217,7 +219,12 @@ writes nothing, with one exception: `--bootstrap-venv` really does create the
 venv, because the rest of the plan cannot be resolved without a python. If you
 pass `--store`, pass `--claude-dir` too: an explicit store can be wired from any
 directory, so the installer refuses to guess which `.claude` the hooks belong in
-rather than wiring the wrong repo.
+rather than wiring the wrong repo. One gap `--dry-run` does not close: a
+mistyped `--code-root` is not checked for existence there, so it just looks
+like an empty tree in the census — every language at zero, reading as
+"nothing proposed" rather than "you pointed this at nothing" — while a real
+(non-dry-run) install does check, and refuses a `--code-root` that does not
+exist.
 
 **The census, and being asked before anything is indexed.** With a
 `--code-root`, the installer first counts source files by extension — and by
@@ -228,9 +235,10 @@ usual noise directories, and then asks what to do with what it found:
 1. **skip** — wire the hooks, index no code
 2. **enable all detected**
 3. **select** from the detected set
-4. **never mention this extension again** for this project (this keeps the
+4. **never mention this extension again** for this wiring (this keeps the
    languages the census proposed and only silences the new-file reminder for
-   that one extension)
+   that one extension) — re-running the installer without `--never-ext`
+   resets it
 
 Nothing is enabled without your answer, and the dialogue always shows all three
 categories: what it proposes, what this engine supports but did not find, and
@@ -293,22 +301,31 @@ most of these with your paths already filled in — all but the two code-index
 commands:
 
 ```bash
-memidx.py why <symbol-or-path> --project NAME --code-root DIR   # why is this here?
-memidx.py search "<question>" --project NAME                    # search the decisions
-memidx.py code-search "<what it does>" --project NAME           # find existing code
-memidx.py for-path <file> --project NAME                        # what governs this file?
-memidx.py chain <topic-id> --project NAME                       # one question's full history
-memidx.py drift --code-root DIR --project NAME                  # has the code grown a bypass?
-memidx.py reindex --root STORE --project NAME                   # after editing the store by hand
-memidx.py code-reindex --code-root DIR --project NAME           # after the code moved on
-memlint.py STORE --code-root DIR                                # validate records
+memidx.py why <symbol-or-path> --project NAME --code-root DIR                    # why is this here?
+memidx.py search "<question>" --project NAME --status active                     # search the decisions
+memidx.py code-search "<what it does>" --project NAME                            # find existing code
+memidx.py for-path <file> --project NAME                                         # what governs this file?
+memidx.py chain <topic-id> --project NAME                                        # one question's full history
+memidx.py drift --code-root DIR --project NAME                                   # has the code grown a bypass?
+memidx.py reindex --root STORE --project NAME                                    # after editing the store by hand
+memidx.py code-reindex --code-root DIR --project NAME                            # after the code moved on
+memidx.py stats --project NAME [--days 7] [--store DIR]                          # is retrieval actually firing?
+memlint.py STORE --code-root DIR                                                 # validate records
 ```
 
 `--project NAME` is not optional in practice: leave it out and everything goes
 to a shared `default` namespace and its `default.sqlite`, mixing projects into
-one index. `drift` is the one that reads rulings written with a checkable shape
-("all deletes go through the one gate") and turns them into failing checks when
-the code quietly grows a way around them.
+one index. `search` without `--status active` also returns superseded,
+declined and historical rulings — plain (non-`--json`) output does not show
+each hit's status, so a stray one there reads as current. `drift` is the one
+that reads rulings written with a checkable shape ("all deletes go through the
+one gate") and turns them into failing checks when the code quietly grows a
+way around them. `stats` is the health check: it reads `hook.log` and reports,
+per project, whether the read side (pre-edit lookups) and the write side
+(nudges vs. this project's own ledger appends) actually fired in a trailing
+window — every hook here fails open, so a dead hook and a healthy one that
+found nothing look identical from inside a session; `stats` is what tells them
+apart, and flags the silent side when it finds one.
 
 Two more things worth knowing: committing the store reindexes it automatically,
 so `reindex` by hand is only for edits you have not committed yet; and
@@ -442,15 +459,9 @@ synthetic.
   search.
 - [Claude Code hooks](https://code.claude.com/docs/en/hooks) — the mechanism the
   retrieval and reminder hooks are built on.
-- [Basic Memory](https://github.com/basicmachines-co/basic-memory) — evaluated
-  as a substrate before building a dedicated engine, and set aside for this
-  specific use case: per-invocation latency matters in a pre-edit hook that must
-  return well under a second, its defaults lean toward auto-capture where this
-  project wanted every record deliberately authored, and this project needed
-  chain-shaped retrieval — a ranked sequence of rulings on one question, not
-  just similar notes. Its local-markdown-first philosophy, files as the real
-  store and a database as a derived index, directly influenced the storage model
-  here.
+- [Basic Memory](https://github.com/basicmachines-co/basic-memory) — its
+  local-markdown-first philosophy, files as the real store and a database as a
+  derived index, directly influenced the storage model here.
 
 ## License
 
