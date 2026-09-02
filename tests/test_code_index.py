@@ -2050,5 +2050,174 @@ class TestMemlintExistingRulesStillGreen(unittest.TestCase):
         self.assertFalse(any("CON-007" in e for e in errors), errors)
 
 
+# ---------------------------------------------------------------------------
+# Task 11: self-index acceptance gate (design doc S6) -- the engine indexes
+# itself. Every reviewer round across this milestone named "point it at its
+# own repo" as the closer; this is that check, made real. THIS repo
+# (TOOLS_DIR = Path(__file__).resolve().parent.parent) is the tree under
+# test, run through the real registry dispatch (chunkers.get_chunker), the
+# real python AST chunker, the real skip-dir census and the real FTS index
+# end to end -- no synthetic fixture stands in for it.
+# ---------------------------------------------------------------------------
+
+
+class TestSelfIndexAcceptanceGate(unittest.TestCase):
+    """`code-reindex --lang python --no-embed` over TOOLS_DIR itself, indexed
+    once for the whole class (setUpClass) -- this repo's ~19 .py files
+    reindex in well under a second with --no-embed, and every assertion
+    below reads the same resulting index, so there is no reason to pay for
+    it four times over.
+
+    MEMCONTINUUM_HOME is pointed at a throwaway tmpdir and --db is left
+    unset (matches ns()'s default), so resolve_code_db_path lands the index
+    at $MEMCONTINUUM_HOME/<PROJECT>-code.sqlite -- the SAME path
+    _resolve_symbol_via_code_index hardcodes (it never consults --db; see
+    that function's docstring), which is what lets the fast-path test below
+    exercise the real fast path instead of a --db location it can't see.
+
+    A note on the two FTS assertions below: this class is itself indexed as
+    part of "the engine indexes itself" (it lives under TOOLS_DIR, in
+    tests/), and each probe method necessarily embeds its own query string
+    as a literal argument. Method names, docstrings and comments here
+    therefore deliberately do NOT restate those query words -- the FIRST
+    version of this gate named its test methods after the queries, and
+    each self-indexed method promptly out-scored the real target (its own
+    short chunk repeating the query in its name AND its call site beat the
+    target file's single genuine mention) with a self-referential false
+    positive, not a chunker defect. One literal mention per probe (the
+    `query = "..."` line the test needs to actually call code_hits_fts)
+    is unavoidable and left as-is.
+    """
+
+    PROJECT = "anatomy-self-index"
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmpdir = tempfile.TemporaryDirectory()
+        home = Path(cls._tmpdir.name) / "home"
+        home.mkdir()
+        cls._prev_home = os.environ.get("MEMCONTINUUM_HOME")
+        os.environ["MEMCONTINUUM_HOME"] = str(home)
+
+        args = ns(
+            code_root=str(TOOLS_DIR),
+            project=cls.PROJECT,
+            db=None,
+            no_embed=True,
+            full=False,
+            lang="python",
+        )
+        out_buf, err_buf = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+            rc = memidx.cmd_code_reindex(args)
+        # Not asserted on: reindexing this repo's real tree always prints a
+        # "files with unsupported/unwired extensions not indexed" census
+        # line (.md/.sh/.swift/... alongside the wired .py files) and a
+        # WARNING for tests/fixtures/python_corpus/broken.py (Task 4's
+        # deliberately-invalid fixture, a syntax-error probe, not a defect
+        # here) -- both expected, neither a failure. Captured only so a
+        # green run stays quiet; kept on the class for a failing test's
+        # message to include if something above rc unexpectedly breaks.
+        cls.reindex_stdout = out_buf.getvalue()
+        cls.reindex_stderr = err_buf.getvalue()
+        if rc != 0:
+            raise AssertionError(
+                f"code-reindex failed (rc={rc})\nstdout:\n{cls.reindex_stdout}\nstderr:\n{cls.reindex_stderr}"
+            )
+
+        cls.db_path = home / f"{cls.PROJECT}-code.sqlite"
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls._prev_home is None:
+            os.environ.pop("MEMCONTINUUM_HOME", None)
+        else:
+            os.environ["MEMCONTINUUM_HOME"] = cls._prev_home
+        cls._tmpdir.cleanup()
+
+    def _conn(self):
+        return memidx.open_code_db(self.db_path)
+
+    def test_memidx_py_yields_over_50_chunks(self):
+        conn = self._conn()
+        try:
+            count = conn.execute(
+                "SELECT COUNT(*) AS c FROM chunks WHERE project=? AND path=?",
+                (self.PROJECT, "memidx.py"),
+            ).fetchone()["c"]
+        finally:
+            conn.close()
+        self.assertGreater(count, 50, f"memidx.py chunk count was {count}")
+
+    def test_fts_search_for_a_known_memidx_symbol_hits_that_file(self):
+        query = "parse_frontmatter"
+        conn = self._conn()
+        try:
+            ids = memidx.code_hits_fts(conn, query, self.PROJECT, limit=10)
+            self.assertTrue(ids, f"no FTS hits for {query!r}")
+            top = conn.execute("SELECT path FROM chunks WHERE id=?", (ids[0],)).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(top["path"], "memidx.py")
+
+    def test_fts_search_for_a_multiword_phrase_hits_its_home_file(self):
+        # fts_escape ORs the words of a multi-word query; the target
+        # chunk matches every one of them via its own qualified name
+        # (split into its two identifier halves) plus its own doc line --
+        # genuinely the top bm25 hit, not a tuned assertion. See the class
+        # docstring for why this method avoids restating the query itself
+        # anywhere but the one line below that actually needs it.
+        query = "merge settings hook entries"
+        conn = self._conn()
+        try:
+            ids = memidx.code_hits_fts(conn, query, self.PROJECT, limit=10)
+            self.assertTrue(ids, f"no FTS hits for {query!r}")
+            top = conn.execute("SELECT path FROM chunks WHERE id=?", (ids[0],)).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(top["path"], "scripts/mc_settings_merge.py")
+
+    def test_no_venv_or_pycache_paths_indexed(self):
+        # This tree has no .venv/venv directory at all right now (only the
+        # tracked __pycache__ dirs the test run itself recreates under
+        # scripts/, chunkers/, tests/ and the repo root) -- so only the
+        # __pycache__ half of this check is live today. The .venv/venv
+        # checks stay in as a guard against a regression the moment a venv
+        # ever gets created inside this repo (the skip_dirs entry already
+        # covers it; this just asserts the walker actually honors it).
+        conn = self._conn()
+        try:
+            rows = conn.execute(
+                "SELECT DISTINCT path FROM file_sha WHERE project=?", (self.PROJECT,)
+            ).fetchall()
+        finally:
+            conn.close()
+        offenders = [
+            r["path"]
+            for r in rows
+            if r["path"].startswith(".venv/")
+            or r["path"].startswith("venv/")
+            or r["path"].startswith("__pycache__/")
+            or "/.venv/" in r["path"]
+            or "/venv/" in r["path"]
+            or "/__pycache__/" in r["path"]
+        ]
+        self.assertEqual(offenders, [])
+
+    def test_resolve_symbol_to_path_uses_the_code_index_fast_path(self):
+        """Ruling 5 (controller): the spec's controller-resolves-a-symbol
+        requirement is satisfied in M1 via the CODE-INDEX FAST PATH, not
+        the bare --code-root lexer fallback (still swift-only -- an M2
+        item). resolve_symbol_to_path with project= set tries
+        _resolve_symbol_via_code_index FIRST; that function reads ONLY
+        $MEMCONTINUUM_HOME/<project>-code.sqlite (never --db -- see its own
+        docstring), which is exactly the db setUpClass built above, so a
+        hit here is the fast path actually firing, not the fallback scan
+        silently doing the same work."""
+        symbol = "parse_frontmatter"
+        resolved = memidx.resolve_symbol_to_path(TOOLS_DIR, symbol, project=self.PROJECT)
+        self.assertEqual(resolved, "memidx.py")
+
+
 if __name__ == "__main__":
     unittest.main()
