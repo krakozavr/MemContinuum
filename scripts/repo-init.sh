@@ -47,13 +47,16 @@ DRY_RUN=0
 FORCE=0
 BOOTSTRAP_VENV=0
 BOOTSTRAP_VENV_DIR=""
+LANGS_FLAG=""
+NON_INTERACTIVE=0
 declare -a CODE_ROOTS=()
 
 usage() {
     cat <<'USAGE'
 Usage: repo-init.sh --project NAME [--store DIR] [--code-root DIR ...]
                    [--claude-dir DIR] [--python PATH]
-                   [--bootstrap-venv [DIR]] [--dry-run] [--force]
+                   [--bootstrap-venv [DIR]] [--langs LIST] [--non-interactive]
+                   [--dry-run] [--force]
 
   --project NAME     project namespace (used for --project everywhere, and
                       as the index db filename <NAME>.sqlite). Must match
@@ -93,6 +96,17 @@ Usage: repo-init.sh --project NAME [--store DIR] [--code-root DIR ...]
                       given). DIR defaults to <this checkout>/.venv. Runs
                       immediately -- even under --dry-run -- since later
                       steps need a real python to resolve paths with.
+  --langs LIST        comma-separated language set to enable for --code-root
+                      indexing (e.g. "python,swift"), bypassing the census
+                      consent dialogue. Wins over --non-interactive. Each
+                      name must be a language this engine version's table
+                      knows (see `memidx.py code-census`). Ignored (with no
+                      effect) when no --code-root is given.
+  --non-interactive   with no --langs, skip the consent dialogue entirely --
+                      language-less wiring (no --lang on the initial
+                      code-reindex, which is skipped; the newfile-nudge hook
+                      line still gets MEMCONTINUUM_KNOWN_EXTS, but no
+                      MEMCONTINUUM_LANG_EXTS). For scripted/CI runs.
   --dry-run           print everything this script would do; write nothing
                       (except --bootstrap-venv's venv, see above).
   --force             allow --store to sit inside another git repo's
@@ -269,6 +283,8 @@ while [ $# -gt 0 ]; do
                 esac
             fi
             ;;
+        --langs) mc_need_value "$@"; LANGS_FLAG="$2"; shift 2 ;;
+        --non-interactive) NON_INTERACTIVE=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         --force) FORCE=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -389,6 +405,10 @@ for cr in "${CODE_ROOTS[@]:-}"; do
     CODE_ROOTS_ABS+=("$(abspath "$cr")")
 done
 
+if [ -n "$LANGS_FLAG" ] && [ "${#CODE_ROOTS_ABS[@]}" -eq 0 ]; then
+    echo "note: --langs $LANGS_FLAG given with no --code-root -- nothing to wire it into, ignoring"
+fi
+
 # store dir must not already live inside a DIFFERENT git repo's working
 # tree, unless it is already its own repo (the normal re-run case, a
 # linked worktree included -- R8) or --force was given.
@@ -435,6 +455,206 @@ STORE_PARENT_ANCESTOR="$(nearest_existing_ancestor "$(dirname "$STORE")")"
 CLAUDE_DIR_ANCESTOR="$(nearest_existing_ancestor "$CLAUDE_DIR")"
 [ -w "$CLAUDE_DIR_ANCESTOR" ] || fail "cannot write --claude-dir $CLAUDE_DIR (nearest existing ancestor $CLAUDE_DIR_ANCESTOR is not writable)" 5
 
+# --- code census + consent dialogue (Task 10, Anatomy M1) -----------------
+#
+# Runs BEFORE the plan summary (so its outcome -- the chosen language set,
+# any "never" notes -- can be printed there) and BEFORE any mutation below
+# (nothing has written anything to disk yet at this point). Runs under
+# --dry-run too: it is read-only discovery, not an install step; only the
+# initial code-reindex later (step 7) is gated on $DRY_RUN.
+#
+# Precedence: --langs (if given) always wins, no dialogue, no tty needed.
+# Else --non-interactive with no --langs is language-less wiring (a note,
+# no dialogue). Else, if census proposes nothing at all (empty project),
+# language-less wiring with no dialogue either -- there is nothing to ask
+# about (spec S3: "Empty project => language-less wiring"). Only when
+# something WAS proposed and neither bypass flag was given does this
+# actually try to read a live consent dialogue from /dev/tty -- guarded by
+# `[ -t 0 ]` so a non-interactive run with no bypass flag fails with a
+# clear message instead of hanging on a read that will never complete.
+CHOSEN_LANGS=""
+declare -a NEVER_NOTES=()
+
+if [ "${#CODE_ROOTS_ABS[@]}" -gt 0 ]; then
+    # Carry (Task 8 reviewer): repo-init does its own existence check on
+    # each code root BEFORE invoking census -- a missing dir is repo-init's
+    # own error, never inferred from code-census's empty-dict fail-open
+    # (code-census exits 0 with {} on a nonexistent root by design, so
+    # silence there would otherwise read as "found nothing", not "you
+    # pointed --code-root at nothing"). Gated on real (non-dry) runs only:
+    # --dry-run is a preview and a --code-root need not exist yet for one
+    # (pre-existing contract -- TestMultipleCodeRoots' two-code-roots
+    # dry-run test passes roots that are never created). Under --dry-run
+    # with a missing root, code-census's own fail-open (nonexistent root ->
+    # {}) takes over below and the run proceeds as "nothing proposed".
+    if [ "$DRY_RUN" -eq 0 ]; then
+        for cr in "${CODE_ROOTS_ABS[@]}"; do
+            [ -d "$cr" ] || fail "--code-root $cr does not exist -- pass an existing directory (repo-init checks this itself before running any census)" 10
+        done
+    fi
+
+    CENSUS_VARS="$(mktemp 2>/dev/null)" || fail "could not create a temp file for census results" 10
+    trap 'rm -f "$CENSUS_VARS"' EXIT
+
+    CODE_ROOTS_NL_FOR_CENSUS=""
+    for cr in "${CODE_ROOTS_ABS[@]}"; do
+        CODE_ROOTS_NL_FOR_CENSUS+="$cr"$'\n'
+    done
+
+    echo "Code census:"
+    MC_CENSUS_CODE_ROOTS="$CODE_ROOTS_NL_FOR_CENSUS" \
+    MC_CENSUS_PYTHON="$PYTHON_BIN" \
+    MC_CENSUS_MEMIDX="$MEMIDX" \
+    MC_CENSUS_ENGINE_ROOT="$ENGINE_ROOT" \
+    MC_CENSUS_VARS_OUT="$CENSUS_VARS" \
+    PYTHONPATH= "$PYTHON_BIN" - <<'PYEOF'
+import json
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.environ["MC_CENSUS_ENGINE_ROOT"])
+import chunkers  # noqa: E402
+
+roots = [l for l in os.environ["MC_CENSUS_CODE_ROOTS"].split("\n") if l]
+python_bin = os.environ["MC_CENSUS_PYTHON"]
+memidx_path = os.environ["MC_CENSUS_MEMIDX"]
+
+# Aggregated across every --code-root given to this run -- one census
+# table for the whole install, not one per root (repo-init installs ONE
+# language set for the project, not a per-root set).
+merged = {}
+for root in roots:
+    proc = subprocess.run(
+        [python_bin, memidx_path, "code-census", "--root", root, "--json"],
+        capture_output=True, text=True,
+    )
+    # code-census is documented exit-0-always (even a nonexistent root just
+    # yields {}) -- a non-zero rc here means something actually crashed
+    # (e.g. an import failure), and treating that as "nothing proposed"
+    # would silently reach language-less wiring through the exact side
+    # door the carry note (Task 8 reviewer) exists to close. Surface it as
+    # this heredoc's own failure so the caller's `fail ... 10` fires.
+    if proc.returncode != 0:
+        print("ERROR: code-census --root %s failed (rc=%s):" % (root, proc.returncode), file=sys.stderr)
+        print(proc.stderr, file=sys.stderr)
+        sys.exit(1)
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError:
+        data = {}
+    for key, row in data.items():
+        m = merged.setdefault(key, {"files": 0, "status": row.get("status", "unsupported")})
+        m["files"] += row.get("files", 0)
+
+known_langs = sorted(chunkers.LANGUAGE_TABLE.keys())
+proposed = sorted(
+    (k for k, v in merged.items() if v["status"] == "supported" and v["files"] > 0),
+    key=lambda k: (-merged[k]["files"], k),
+)
+unfound = [l for l in known_langs if l not in proposed]
+unsupported = sorted(
+    ((k, v["files"]) for k, v in merged.items() if v["status"] == "unsupported"),
+    key=lambda kv: (-kv[1], kv[0]),
+)
+
+print("  proposed (supported, found):")
+if proposed:
+    for lang in proposed:
+        print("    %s: %d" % (lang, merged[lang]["files"]))
+else:
+    print("    (none)")
+print("  supported but not found (skip):")
+if unfound:
+    for lang in unfound:
+        print("    %s" % lang)
+else:
+    print("    (none)")
+print("  unsupported (no chunker in this engine version):")
+if unsupported:
+    for ext, n in unsupported:
+        print("    %s: %d" % (ext, n))
+else:
+    print("    (none)")
+
+with open(os.environ["MC_CENSUS_VARS_OUT"], "w") as f:
+    f.write("MC_CENSUS_PROPOSED=%s\n" % repr(" ".join(proposed)))
+    f.write("MC_CENSUS_KNOWN_LANGS=%s\n" % repr(" ".join(known_langs)))
+PYEOF
+    CENSUS_RC=$?
+    [ "$CENSUS_RC" -eq 0 ] || fail "code-census failed (see output above)" 10
+
+    # shellcheck source=/dev/null
+    . "$CENSUS_VARS"
+    rm -f "$CENSUS_VARS"
+    trap - EXIT
+    MC_CENSUS_PROPOSED="${MC_CENSUS_PROPOSED:-}"
+    MC_CENSUS_KNOWN_LANGS="${MC_CENSUS_KNOWN_LANGS:-}"
+
+    if [ -n "$LANGS_FLAG" ]; then
+        for want in $(printf '%s' "$LANGS_FLAG" | tr ',' ' '); do
+            case " $MC_CENSUS_KNOWN_LANGS " in
+                *" $want "*) ;;
+                *) fail "--langs names an unknown language: $want (this engine version knows: $MC_CENSUS_KNOWN_LANGS)" 11 ;;
+            esac
+        done
+        CHOSEN_LANGS="$LANGS_FLAG"
+        echo "note: languages chosen via --langs: $CHOSEN_LANGS"
+    elif [ "$NON_INTERACTIVE" -eq 1 ]; then
+        CHOSEN_LANGS=""
+        echo "note: --non-interactive with no --langs -- language-less wiring (no language enabled; initial code-reindex skipped)"
+    elif [ -z "$MC_CENSUS_PROPOSED" ]; then
+        # Empty project => language-less wiring (spec S3): nothing was
+        # detected across any --code-root, so there is nothing to ask
+        # about -- no dialogue, no note, matches the pre-Task-10 no-op
+        # behavior for an empty/untouched code root.
+        CHOSEN_LANGS=""
+    else
+        [ -t 0 ] || fail "code census proposes a language set ($MC_CENSUS_PROPOSED) but this is not an interactive terminal (stdin is not a tty) -- pass --langs LIST or --non-interactive to continue without the consent dialogue" 12
+        echo
+        echo "Enable code indexing for a detected language?"
+        echo "  1) skip -- language-less wiring"
+        echo "  2) enable all detected: $MC_CENSUS_PROPOSED"
+        echo "  3) select from detected"
+        echo "  4) never for one extension (stop nagging about it)"
+        printf '> '
+        DIALOGUE_CHOICE=""
+        read -r DIALOGUE_CHOICE < /dev/tty
+        case "$DIALOGUE_CHOICE" in
+            2)
+                CHOSEN_LANGS="$(printf '%s' "$MC_CENSUS_PROPOSED" | tr ' ' ',')"
+                ;;
+            3)
+                echo "Enter the languages to enable, space-separated (from: $MC_CENSUS_PROPOSED):"
+                printf '> '
+                SELECTED=""
+                read -r SELECTED < /dev/tty
+                SEL_OK=""
+                for want in $SELECTED; do
+                    case " $MC_CENSUS_PROPOSED " in
+                        *" $want "*) SEL_OK="$SEL_OK,$want" ;;
+                        *) echo "note: ignoring unrecognized/undetected language: $want" ;;
+                    esac
+                done
+                CHOSEN_LANGS="${SEL_OK#,}"
+                ;;
+            4)
+                echo "Enter the extension to never enable (e.g. .cs):"
+                printf '> '
+                NEVER_EXT=""
+                read -r NEVER_EXT < /dev/tty
+                [ -n "$NEVER_EXT" ] && NEVER_NOTES+=("$NEVER_EXT")
+                CHOSEN_LANGS=""
+                echo "note: recorded never=$NEVER_EXT -- skipping language wiring this run"
+                ;;
+            *)
+                CHOSEN_LANGS=""
+                ;;
+        esac
+    fi
+    echo
+fi
+
 # --- plan summary ------------------------------------------------------
 
 echo "MemContinuum install plan"
@@ -445,6 +665,14 @@ if [ "${#CODE_ROOTS_ABS[@]}" -eq 0 ]; then
 else
     for cr in "${CODE_ROOTS_ABS[@]}"; do
         echo "  code root   : $cr"
+    done
+    if [ -n "$CHOSEN_LANGS" ]; then
+        echo "  languages   : $CHOSEN_LANGS"
+    else
+        echo "  languages   : (none -- language-less wiring)"
+    fi
+    for note in "${NEVER_NOTES[@]:-}"; do
+        [ -n "$note" ] && echo "  # memcontinuum-never: $note"
     done
 fi
 echo "  claude-dir  : $CLAUDE_DIR"
@@ -538,6 +766,8 @@ MC_INSTALL_TEMPLATES_DIR="$TEMPLATES_DIR" \
 MC_INSTALL_CODE_ROOTS="$CODE_ROOTS_NL" \
 MC_INSTALL_DRY_RUN="$DRY_RUN" \
 MC_INSTALL_SCRIPTS_DIR="$SCRIPT_DIR" \
+MC_INSTALL_ENGINE_ROOT="$ENGINE_ROOT" \
+MC_INSTALL_LANGS="$CHOSEN_LANGS" \
 "$PYTHON_BIN" - <<'PYEOF'
 import json
 import os
@@ -557,6 +787,9 @@ dry_run = os.environ.get("MC_INSTALL_DRY_RUN", "0") == "1"
 # memcontinuum-setup.sh -- see scripts/mc_settings_merge.py's own docstring.
 sys.path.insert(0, os.environ["MC_INSTALL_SCRIPTS_DIR"])
 from mc_settings_merge import merge_settings, MergeRefused, basenames_identity
+
+sys.path.insert(0, os.environ["MC_INSTALL_ENGINE_ROOT"])
+import chunkers  # noqa: E402
 
 OUR_SCRIPTS = [
     "pre-edit-chain.sh",
@@ -598,6 +831,30 @@ blocks = {}  # event_name -> list of new group dicts
 code_root_env = ""
 if code_roots:
     code_root_env = "MEMCONTINUUM_CODE_ROOT=%s " % esc_cmd(code_roots[0])
+
+# Task 10: newfile-nudge's env-driven extension gate (Task 9). KNOWN_EXTS is
+# a constant of this engine version (every LANGUAGE_TABLE row's extensions),
+# rendered onto the nudge line whenever it exists at all -- independent of
+# which languages were actually chosen. LANG_EXTS_ENV is the WHOLE
+# "MEMCONTINUUM_LANG_EXTS='...' " token (trailing space and all, matching
+# the {{CODE_ROOT_ENV}} pattern write-hooks.json.tmpl above already uses)
+# and is OMITTED entirely -- not rendered as an empty value -- when no
+# language was chosen: newfile-nudge.sh's
+# `${MEMCONTINUUM_LANG_EXTS:-*.swift}` fallback cannot tell "unset" from
+# "set but empty" (bash's `:-` triggers on both), so an explicit empty
+# value would silently mean the same as never re-rendering this line at
+# all, not "no language wired." Omitting the token invokes that same
+# documented legacy fallback deliberately, for lack of any other way to
+# express "zero languages" through the existing Task 9 contract -- see this
+# task's report for why that is a real (if narrow) gap, not a design choice.
+chosen_langs = [l.strip() for l in os.environ.get("MC_INSTALL_LANGS", "").split(",") if l.strip()]
+known_exts_str = " ".join("*" + e for e in sorted(chunkers.known_extensions()))
+known_exts_cmd = esc_cmd(known_exts_str)
+if chosen_langs:
+    wired_exts_str = " ".join("*" + e for e in sorted(chunkers.wired_extensions(chosen_langs)))
+    lang_exts_env = "MEMCONTINUUM_LANG_EXTS=%s " % esc_cmd(wired_exts_str)
+else:
+    lang_exts_env = ""
 
 write_tmpl = read_tmpl("write-hooks.json.tmpl")
 write_rendered = render(write_tmpl, {
@@ -664,6 +921,8 @@ if code_roots:
             "PROJECT": esc_cmd(project),
             "PYTHON": esc_cmd(python_bin),
             "HOOKS_DIR": esc_cmd(hooks_dir),
+            "LANG_EXTS_ENV": lang_exts_env,
+            "KNOWN_EXTS_CMD": known_exts_cmd,
         }))
     nudge_filters_text = ",\n".join(nudge_pairs)
 
@@ -789,6 +1048,41 @@ if [ "$DRY_RUN" -eq 0 ]; then
     LINT_RC=$?
 fi
 
+# --- 7b. initial code-reindex (Task 10, Anatomy M1) -----------------------
+#
+# Separate call from the decision-store reindex above -- code-reindex is
+# Anatomy's own intent index, keyed by --code-root, not --root/STORE (Task
+# 7's `--lang` contract: required on a project's FIRST code-reindex, no
+# hardcoded-swift default). Runs once per --code-root (code-reindex takes
+# exactly one). Skipped entirely for language-less wiring (CHOSEN_LANGS
+# empty) -- per Task 7's carry, an empty --lang set means "nothing to
+# index yet", not "index nothing and call it done." Same --no-embed
+# rationale as step 7's decision-store reindex above: a fresh corpus is
+# not worth a network-dependent embed at install time. Unlike the
+# decision-store reindex, a failure here HARD-FAILS the install (exit 13,
+# its own code, distinct from the decision-store reindex's exit 7) --
+# code-reindex's own per-file handling already fails open for a single bad
+# file, so a non-zero exit here is structural (bad db, bad --code-root,
+# bad --lang), the same class of problem exit 7 already treats as fatal.
+CODE_REINDEX_RAN=0
+CODE_REINDEX_RC=0
+CODE_REINDEX_OUT=""
+if [ "${#CODE_ROOTS_ABS[@]}" -gt 0 ] && [ -n "$CHOSEN_LANGS" ]; then
+    CODE_REINDEX_RAN=1
+    for cr in "${CODE_ROOTS_ABS[@]}"; do
+        CODE_REINDEX_CMD=("$PYTHON_BIN" "$MEMIDX" code-reindex --code-root "$cr" --project "$PROJECT" --lang "$CHOSEN_LANGS" --no-embed)
+        step "code-reindex ($cr): PYTHONPATH= ${CODE_REINDEX_CMD[*]}"
+        if [ "$DRY_RUN" -eq 0 ]; then
+            CR_OUT="$(PYTHONPATH= "${CODE_REINDEX_CMD[@]}" 2>&1)"
+            CR_RC=$?
+            CODE_REINDEX_OUT="$CODE_REINDEX_OUT$CR_OUT"$'\n'
+            [ "$CR_RC" -ne 0 ] && CODE_REINDEX_RC=$CR_RC
+        fi
+    done
+elif [ "${#CODE_ROOTS_ABS[@]}" -gt 0 ]; then
+    step "code-reindex: skipped (language-less wiring, no languages chosen)"
+fi
+
 # --- summary -------------------------------------------------------------
 
 echo
@@ -813,6 +1107,10 @@ else
     [ -n "$REINDEX_OUT" ] && echo "$REINDEX_OUT" | sed 's/^/  /'
     echo "Lint           : rc=$LINT_RC"
     [ -n "$LINT_OUT" ] && echo "$LINT_OUT" | sed 's/^/  /'
+    if [ "$CODE_REINDEX_RAN" -eq 1 ]; then
+        echo "Code reindex   : rc=$CODE_REINDEX_RC (languages: $CHOSEN_LANGS)"
+        [ -n "$CODE_REINDEX_OUT" ] && echo "$CODE_REINDEX_OUT" | sed 's/^/  /'
+    fi
     # fix-round-4 F10: for an ADOPTED store, memlint findings are reported
     # here (above) but do not fail the install -- they reflect PRE-EXISTING
     # content the adopt, not this installer, introduced (the motivating case:
@@ -829,6 +1127,9 @@ else
     fi
     if [ "$LINT_RC" -ne 0 ] && [ "$STORE_IS_ADOPTED" -eq 0 ]; then
         fail "memlint reported errors (rc=$LINT_RC) -- see output above" 8
+    fi
+    if [ "$CODE_REINDEX_RC" -ne 0 ]; then
+        fail "code-reindex failed (rc=$CODE_REINDEX_RC) -- see output above" 13
     fi
 fi
 
