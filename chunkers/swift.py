@@ -1,12 +1,14 @@
 """chunkers/swift.py -- lexer-aware brace-walker Swift chunker backend.
 
 Moved from memidx.py (Task 2 of the Anatomy M1 milestone) byte-for-byte:
-same regexes, same logic, proven behavior-identical against
-tests/goldens/swift_chunks_pre_extraction.json (a chunks-table dump
-captured from the pre-move code). memidx.py re-exports the names its own
-code and memlint.py still need (`chunk_source`,
-`_build_mask_and_match_dict`, `_KEYWORD_RE`, `_container_type_name`,
-`_extract_decls`) for back-compat.
+same regexes, same logic, proven behavior-identical against a
+chunks-table dump captured from the pre-move code (that golden,
+tests/goldens/swift_chunks_pre_extraction.json, was retired in Task 12
+once _map_kind below changed the "kind" column it captured -- see
+tests/goldens/swift_chunks_kind_v2.json, identical to it except for that
+one column). memidx.py re-exports the names its own code and memlint.py
+still need (`chunk_source`, `_build_mask_and_match_dict`, `_KEYWORD_RE`,
+`_container_type_name`, `_extract_decls`) for back-compat.
 """
 from __future__ import annotations
 
@@ -540,6 +542,25 @@ def _doc_comment_before(text: str, kstart: int) -> str:
     return "\n".join(doc_lines)
 
 
+# Raw-keyword -> frozen chunkers.KINDS vocabulary (Task 12, Anatomy M1
+# milestone): `func` is "method" when `chain` (its enclosing-type stack,
+# already computed by _extract_decls's enclosing_chain for qualification)
+# is non-empty, else top-level "function" -- the ONLY kind that depends on
+# nesting. `init` is always "constructor" (Swift has no free-standing
+# init), `subscript` and computed `var` are always "accessor" regardless of
+# nesting level -- e.g. GapResyncModifiers.swift's top-level `afterVarGap`
+# (var) and top-level `subscript` both map to "accessor" with an EMPTY
+# chain, same as any type-member var/subscript would; nesting only ever
+# changes func's function/method split.
+_RAW_KIND_MAP = {"init": "constructor", "subscript": "accessor", "var": "accessor"}
+
+
+def _map_kind(kw: str, chain: list) -> str:
+    if kw == "func":
+        return "method" if chain else "function"
+    return _RAW_KIND_MAP[kw]
+
+
 def _extract_decls(text: str, mask: str, match_dict: dict):
     n = len(text)
     raw_types: list = []
@@ -617,7 +638,7 @@ def _extract_decls(text: str, mask: str, match_dict: dict):
         end_line = text.count("\n", 0, body_close) + 1
         out.append(
             {
-                "kind": kw,
+                "kind": _map_kind(kw, chain),
                 "symbol": name,
                 "qualified_name": qualified,
                 "signature": sig,

@@ -1,4 +1,7 @@
+import contextlib
+import io
 import json
+import re
 import shutil
 import sys
 import tempfile
@@ -17,7 +20,7 @@ from test_code_index import FIXTURES, code_reindex  # noqa: E402 -- reuse the Sw
 # corpus and code-reindex helper test_code_index.py already builds, rather than duplicating
 # the corpus text here.
 
-GOLDEN_PATH = TESTS_DIR / "goldens" / "swift_chunks_pre_extraction.json"
+GOLDEN_PATH = TESTS_DIR / "goldens" / "swift_chunks_kind_v2.json"
 PY_FIXTURES = TESTS_DIR / "fixtures" / "python_corpus"
 
 
@@ -46,6 +49,33 @@ class TestRegistry(unittest.TestCase):
         finally:
             chunkers.LANGUAGE_TABLE["swift"]["impl_version"] = old
 
+    def test_kind_values_are_in_KINDS(self):
+        """Task 12 (Anatomy M1 milestone): every chunk BOTH chunkers emit,
+        over their whole fixture corpora, uses only the frozen
+        chunkers.KINDS vocabulary -- never a raw source-language keyword
+        (Swift's "func"/"init"/"subscript"/"var" no longer leak through;
+        see chunkers/swift.py's _map_kind)."""
+        swift_kinds = set()
+        swift = chunkers.get_chunker("swift")
+        for f in sorted(FIXTURES.glob("*.swift")):
+            result = swift.chunk_file(f.read_text(), f.name)
+            for chunk in result.chunks:
+                self.assertIn(chunk["kind"], chunkers.KINDS, (f.name, chunk))
+                swift_kinds.add(chunk["kind"])
+        python_kinds = set()
+        for f in sorted(PY_FIXTURES.glob("*.py")):
+            result = python_ast.chunk_file(f.read_text(), f.name)
+            for chunk in result.chunks:
+                self.assertIn(chunk["kind"], chunkers.KINDS, (f.name, chunk))
+                python_kinds.add(chunk["kind"])
+        # Not a vacuous pass on EITHER side: each corpus, independently,
+        # actually exercises more than one kind value (a regression that
+        # collapsed one chunker onto a single kind, e.g. Python losing its
+        # function/method/constructor/accessor split, would still pass a
+        # combined-set check if the other chunker alone covered >= 2).
+        self.assertGreaterEqual(len(swift_kinds), 2, swift_kinds)
+        self.assertGreaterEqual(len(python_kinds), 2, python_kinds)
+
 
 def _dump_chunks(conn):
     rows = conn.execute(
@@ -59,12 +89,20 @@ class TestSwiftExtractionGolden(unittest.TestCase):
     """Index the whole fixtures/code/*.swift corpus (the same fixture files
     test_code_index.py's TestChunker* classes read individually) through the
     real code-reindex path and compare the resulting chunks-table rows
-    against tests/goldens/swift_chunks_pre_extraction.json -- captured from
-    memidx.py BEFORE the Swift lexer/walker moved to chunkers/swift.py
-    (Task 2 of the Anatomy M1 milestone). Any diff here means the move
-    wasn't mechanical: fix the move, never the golden."""
+    against tests/goldens/swift_chunks_kind_v2.json -- regenerated (Task 12,
+    Anatomy M1 milestone) from the NEW code once Swift's raw kinds
+    (func/init/subscript/var) were mapped at emission onto the frozen
+    chunkers.KINDS vocabulary (function/method/constructor/accessor). This
+    golden replaces swift_chunks_pre_extraction.json (captured BEFORE the
+    Swift lexer/walker moved to chunkers/swift.py, Task 2); the two goldens
+    are IDENTICAL except for the "kind" column -- verified once, at
+    generation time, by a one-off diff-with-kind-stripped script (see the
+    Task 12 report) rather than re-checked here on every run, since the old
+    golden no longer exists to diff against. Any further diff against
+    THIS golden means the move/mapping wasn't mechanical: fix the code,
+    never the golden."""
 
-    def test_index_matches_pre_extraction_golden(self):
+    def test_index_matches_kind_v2_golden(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "code"
             root.mkdir()
@@ -79,6 +117,82 @@ class TestSwiftExtractionGolden(unittest.TestCase):
         with open(GOLDEN_PATH) as f:
             expected = json.load(f)
         self.assertEqual(got, expected)
+
+
+class TestImplVersionBumpForcesSwiftRechunk(unittest.TestCase):
+    """Task 12 (Anatomy M1 milestone): the whole point of this task being
+    LAST -- the impl_version bump ("1" -> "2") alone must force every Swift
+    file to re-chunk on the next reindex with NO source change, proving the
+    Task 3 chunker_version-skip mechanism live end-to-end on a real
+    taxonomy migration (not just a synthetic impl_version mutation, as
+    TestChunkerVersionSkipDecision in test_code_index.py already covers).
+
+    Simplest honest form (brief): pre-stamp file_sha.chunker_version with
+    the OLD ("1"-era) chunker_version string computed the same way
+    chunkers.chunker_version does, reindex unchanged Swift source, and
+    assert changed > 0 -- then assert the re-chunked rows carry the NEW
+    kind vocabulary, not the old raw Swift keywords."""
+
+    def test_old_stamp_forces_rechunk_with_new_kind_vocabulary(self):
+        # The "1"-era chunker_version string -- what a real pre-Task-12
+        # database has stamped on every row -- computed via
+        # chunkers.chunker_version itself (same pattern as
+        # TestRegistry.test_chunker_version_changes_with_impl_version above)
+        # rather than reimplementing its hash formula inline, so this test
+        # can't silently drift from that formula.
+        old_impl_version = chunkers.LANGUAGE_TABLE["swift"]["impl_version"]
+        try:
+            chunkers.LANGUAGE_TABLE["swift"]["impl_version"] = "1"
+            old_chunker_version = chunkers.chunker_version("swift")
+        finally:
+            chunkers.LANGUAGE_TABLE["swift"]["impl_version"] = old_impl_version
+        new_chunker_version = chunkers.chunker_version("swift")
+        self.assertNotEqual(old_chunker_version, new_chunker_version)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            target = root / "NestedTypes.swift"
+            shutil.copy(FIXTURES / "NestedTypes.swift", target)
+            db = Path(td) / "idx-code.sqlite"
+
+            rc = code_reindex(root, db, no_embed=True)
+            self.assertEqual(rc, 0)
+
+            conn = memidx.open_code_db(db)
+            conn.execute("UPDATE file_sha SET chunker_version=?", (old_chunker_version,))
+            conn.commit()
+            conn.close()
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = code_reindex(root, db, no_embed=True)
+            self.assertEqual(rc, 0)
+            m = re.search(
+                r"(\d+) files scanned, (\d+) added, (\d+) changed, (\d+) unchanged",
+                buf.getvalue(),
+            )
+            self.assertIsNotNone(m, buf.getvalue())
+            self.assertGreater(int(m.group(3)), 0,
+                "an old-era chunker_version stamp must force a re-chunk even "
+                "though the source file itself never changed")
+            self.assertEqual(int(m.group(4)), 0)
+
+            conn = memidx.open_code_db(db)
+            stamp = conn.execute(
+                "SELECT chunker_version FROM file_sha WHERE path=?", ("NestedTypes.swift",)
+            ).fetchone()
+            kinds_rows = conn.execute(
+                "SELECT kind FROM chunks WHERE path=?", ("NestedTypes.swift",)
+            ).fetchall()
+            conn.close()
+            self.assertEqual(stamp["chunker_version"], new_chunker_version)
+            self.assertGreater(len(kinds_rows), 0)
+            for row in kinds_rows:
+                # The whole point: no raw Swift keyword ("func"/"init"/
+                # "subscript"/"var") survives the re-chunk -- only the
+                # frozen chunkers.KINDS vocabulary.
+                self.assertIn(row["kind"], chunkers.KINDS)
 
 
 def _recall_tuples(chunks):

@@ -2,7 +2,7 @@
   {
     "path": "ChunkerCases.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "increment",
     "qualified_name": "Counter.increment",
     "signature": "func increment() -> Int",
@@ -13,7 +13,7 @@
   {
     "path": "ChunkerCases.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "nested",
     "qualified_name": "Outer.Inner.nested",
     "signature": "func nested() -> Int",
@@ -24,7 +24,7 @@
   {
     "path": "ChunkerCases.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "default",
     "qualified_name": "Escaped.default",
     "signature": "func `default`() -> Int",
@@ -35,7 +35,7 @@
   {
     "path": "ChunkerCases.swift",
     "lang": "swift",
-    "kind": "var",
+    "kind": "accessor",
     "symbol": "type",
     "qualified_name": "Escaped.type",
     "signature": "var `type`: Int",
@@ -46,7 +46,7 @@
   {
     "path": "ClassMemberAndBacktickContainer.swift",
     "lang": "swift",
-    "kind": "subscript",
+    "kind": "accessor",
     "symbol": "subscript",
     "qualified_name": "Box.subscript",
     "signature": "subscript(i: Int) -> Int",
@@ -57,7 +57,7 @@
   {
     "path": "ClassMemberAndBacktickContainer.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "make",
     "qualified_name": "Box.make",
     "signature": "func make() -> Box",
@@ -68,7 +68,7 @@
   {
     "path": "ClassMemberAndBacktickContainer.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "plain",
     "qualified_name": "Type.plain",
     "signature": "func plain() -> Int",
@@ -79,7 +79,7 @@
   {
     "path": "ClassMemberAndBacktickContainer.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "nested",
     "qualified_name": "Type.Inner.nested",
     "signature": "func nested() -> Int",
@@ -90,7 +90,7 @@
   {
     "path": "GapDesync.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "before",
     "qualified_name": "WellFormed.before",
     "signature": "func before() -> Int",
@@ -101,7 +101,7 @@
   {
     "path": "GapDesync.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "broken",
     "qualified_name": "Broken.broken",
     "signature": "func broken()",
@@ -112,7 +112,7 @@
   {
     "path": "GapDesync.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "function",
     "symbol": "after",
     "qualified_name": "after",
     "signature": "func after() -> Int",
@@ -123,7 +123,7 @@
   {
     "path": "GapDesync.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "trailing",
     "qualified_name": "AlsoWellFormed.trailing",
     "signature": "func trailing() -> Int",
@@ -134,7 +134,7 @@
   {
     "path": "GapResyncModifiers.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "broken",
     "qualified_name": "BrokenPackage.broken",
     "signature": "func broken()",
@@ -145,7 +145,7 @@
   {
     "path": "GapResyncModifiers.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "function",
     "symbol": "afterPackageGap",
     "qualified_name": "afterPackageGap",
     "signature": "func afterPackageGap() -> Int",
@@ -156,7 +156,7 @@
   {
     "path": "GapResyncModifiers.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "broken",
     "qualified_name": "BrokenConsuming.broken",
     "signature": "func broken()",
@@ -167,7 +167,7 @@
   {
     "path": "GapResyncModifiers.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "function",
     "symbol": "afterConsumingGap",
     "qualified_name": "afterConsumingGap",
     "signature": "func afterConsumingGap() -> Int",
@@ -178,7 +178,7 @@
   {
     "path": "GapResyncModifiers.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "broken",
     "qualified_name": "BrokenBorrowing.broken",
     "signature": "func broken()",
@@ -189,7 +189,7 @@
   {
     "path": "GapResyncModifiers.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "function",
     "symbol": "afterBorrowingGap",
     "qualified_name": "afterBorrowingGap",
     "signature": "func afterBorrowingGap() -> Int",
@@ -200,7 +200,7 @@
   {
     "path": "GapResyncModifiers.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "broken",
     "qualified_name": "BrokenVar.broken",
     "signature": "func broken()",
@@ -211,7 +211,7 @@
   {
     "path": "GapResyncModifiers.swift",
     "lang": "swift",
-    "kind": "var",
+    "kind": "accessor",
     "symbol": "afterVarGap",
     "qualified_name": "afterVarGap",
     "signature": "var afterVarGap: Int",
@@ -222,7 +222,7 @@
   {
     "path": "GapResyncModifiers.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "broken",
     "qualified_name": "BrokenSubscript.broken",
     "signature": "func broken()",
@@ -233,7 +233,7 @@
   {
     "path": "GapResyncModifiers.swift",
     "lang": "swift",
-    "kind": "subscript",
+    "kind": "accessor",
     "symbol": "subscript",
     "qualified_name": "subscript",
     "signature": "subscript(i: Int) -> Int",
@@ -244,7 +244,7 @@
   {
     "path": "IfBranches.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "mode",
     "qualified_name": "Debugger.mode",
     "signature": "func mode() -> String",
@@ -255,7 +255,7 @@
   {
     "path": "IfBranches.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "mode",
     "qualified_name": "Debugger.mode",
     "signature": "func mode() -> String",
@@ -266,7 +266,7 @@
   {
     "path": "IfBranches.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "label",
     "qualified_name": "Debugger.label",
     "signature": "func label() -> String",
@@ -277,7 +277,7 @@
   {
     "path": "InitSubscriptOperator.swift",
     "lang": "swift",
-    "kind": "init",
+    "kind": "constructor",
     "symbol": "init",
     "qualified_name": "Vec.init",
     "signature": "init(x: Int)",
@@ -288,7 +288,7 @@
   {
     "path": "InitSubscriptOperator.swift",
     "lang": "swift",
-    "kind": "subscript",
+    "kind": "accessor",
     "symbol": "subscript",
     "qualified_name": "Vec.subscript",
     "signature": "subscript(i: Int) -> Int",
@@ -299,7 +299,7 @@
   {
     "path": "InitSubscriptOperator.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "==",
     "qualified_name": "Vec.==",
     "signature": "func == (lhs: Vec, rhs: Vec) -> Bool",
@@ -310,7 +310,7 @@
   {
     "path": "LazyAndComputedVar.swift",
     "lang": "swift",
-    "kind": "var",
+    "kind": "accessor",
     "symbol": "computed",
     "qualified_name": "Cache.computed",
     "signature": "var computed: Int",
@@ -321,7 +321,7 @@
   {
     "path": "MemlintVocabulary.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "realSymbol",
     "qualified_name": "Real.realSymbol",
     "signature": "func realSymbol() -> Int",
@@ -332,7 +332,7 @@
   {
     "path": "MemlintVocabulary.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "staticHelper",
     "qualified_name": "Real.staticHelper",
     "signature": "func staticHelper() -> Int",
@@ -343,7 +343,7 @@
   {
     "path": "MemlintVocabulary.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "escaped",
     "qualified_name": "Real.escaped",
     "signature": "func `escaped`() -> Int",
@@ -354,7 +354,7 @@
   {
     "path": "NestedTypes.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "innerFunc",
     "qualified_name": "Outer.Inner.innerFunc",
     "signature": "func innerFunc() -> Int",
@@ -365,7 +365,7 @@
   {
     "path": "NestedTypes.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "outerFunc",
     "qualified_name": "Outer.outerFunc",
     "signature": "func outerFunc()",
@@ -376,7 +376,7 @@
   {
     "path": "NestedTypes.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "extFunc",
     "qualified_name": "Outer.extFunc",
     "signature": "func extFunc()",
@@ -387,7 +387,7 @@
   {
     "path": "StringsAndInterpolation.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "greet",
     "qualified_name": "Formatter.greet",
     "signature": "func greet(items: [String]) -> String",
@@ -398,7 +398,7 @@
   {
     "path": "StringsAndInterpolation.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "rawPath",
     "qualified_name": "Formatter.rawPath",
     "signature": "func rawPath() -> String",
@@ -409,7 +409,7 @@
   {
     "path": "StringsAndInterpolation.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "multiline",
     "qualified_name": "Formatter.multiline",
     "signature": "func multiline() -> String",
@@ -420,7 +420,7 @@
   {
     "path": "SyntheticSettingsController.swift",
     "lang": "swift",
-    "kind": "var",
+    "kind": "accessor",
     "symbol": "rowCount",
     "qualified_name": "SyntheticSettingsController.rowCount",
     "signature": "var rowCount: Int",
@@ -431,7 +431,7 @@
   {
     "path": "SyntheticSettingsController.swift",
     "lang": "swift",
-    "kind": "var",
+    "kind": "accessor",
     "symbol": "selectedLabel",
     "qualified_name": "SyntheticSettingsController.selectedLabel",
     "signature": "var selectedLabel: String",
@@ -442,7 +442,7 @@
   {
     "path": "SyntheticSettingsController.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "viewDidLoad",
     "qualified_name": "SyntheticSettingsController.viewDidLoad",
     "signature": "func viewDidLoad()",
@@ -453,7 +453,7 @@
   {
     "path": "SyntheticSettingsController.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "viewWillAppear",
     "qualified_name": "SyntheticSettingsController.viewWillAppear",
     "signature": "func viewWillAppear()",
@@ -464,7 +464,7 @@
   {
     "path": "SyntheticSettingsController.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "buildRows",
     "qualified_name": "SyntheticSettingsController.buildRows",
     "signature": "func buildRows()",
@@ -475,7 +475,7 @@
   {
     "path": "SyntheticSettingsController.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "makeRow",
     "qualified_name": "SyntheticSettingsController.makeRow",
     "signature": "func makeRow(label: String, key: String) -> NSView",
@@ -486,7 +486,7 @@
   {
     "path": "SyntheticSettingsController.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "embedInScrollBox",
     "qualified_name": "SyntheticSettingsController.embedInScrollBox",
     "signature": "func embedInScrollBox(_ content: NSView, inset: CGFloat = 8) -> NSScrollView",
@@ -497,7 +497,7 @@
   {
     "path": "SyntheticSettingsController.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "installTableView",
     "qualified_name": "SyntheticSettingsController.installTableView",
     "signature": "func installTableView()",
@@ -508,7 +508,7 @@
   {
     "path": "SyntheticSettingsController.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "reloadRowLabels",
     "qualified_name": "SyntheticSettingsController.reloadRowLabels",
     "signature": "func reloadRowLabels()",
@@ -519,7 +519,7 @@
   {
     "path": "SyntheticSettingsController.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "selectRow",
     "qualified_name": "SyntheticSettingsController.selectRow",
     "signature": "func selectRow(at index: Int)",
@@ -530,7 +530,7 @@
   {
     "path": "SyntheticSettingsController.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "clearSelection",
     "qualified_name": "SyntheticSettingsController.clearSelection",
     "signature": "func clearSelection()",
@@ -541,7 +541,7 @@
   {
     "path": "SyntheticSettingsController.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "exceedsBudget",
     "qualified_name": "SyntheticSettingsController.exceedsBudget",
     "signature": "func exceedsBudget(_ path: String, limit: Int = 255) -> Bool",
@@ -552,7 +552,7 @@
   {
     "path": "SyntheticSettingsController.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "writePNGSnapshot",
     "qualified_name": "SyntheticSettingsController.writePNGSnapshot",
     "signature": "func writePNGSnapshot(to path: String, tag: String) -> Bool",
@@ -563,7 +563,7 @@
   {
     "path": "SyntheticSettingsController.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "cleanup",
     "qualified_name": "SyntheticSettingsController.cleanup",
     "signature": "func cleanup(removeObservers: Bool) -> Bool",
@@ -574,7 +574,7 @@
   {
     "path": "SyntheticSettingsController.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "numberOfRows",
     "qualified_name": "SyntheticSettingsController.numberOfRows",
     "signature": "func numberOfRows(in tableView: NSTableView) -> Int",
@@ -585,7 +585,7 @@
   {
     "path": "SyntheticSettingsController.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "tableView",
     "qualified_name": "SyntheticSettingsController.tableView",
     "signature": "func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView?",
@@ -596,7 +596,7 @@
   {
     "path": "SyntheticSettingsController.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "tableViewSelectionDidChange",
     "qualified_name": "SyntheticSettingsController.tableViewSelectionDidChange",
     "signature": "func tableViewSelectionDidChange(_ notification: Notification)",
@@ -607,7 +607,7 @@
   {
     "path": "SyntheticSettingsController.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "captionKey",
     "qualified_name": "RowLabelFormat.captionKey",
     "signature": "func captionKey(for token: String) -> String",
@@ -618,7 +618,7 @@
   {
     "path": "SyntheticSettingsController.swift",
     "lang": "swift",
-    "kind": "func",
+    "kind": "method",
     "symbol": "placeholderKey",
     "qualified_name": "RowLabelFormat.placeholderKey",
     "signature": "func placeholderKey(for token: String) -> String",
@@ -629,7 +629,7 @@
   {
     "path": "SyntheticSettingsController.swift",
     "lang": "swift",
-    "kind": "var",
+    "kind": "accessor",
     "symbol": "supportedTokenCount",
     "qualified_name": "RowLabelFormat.supportedTokenCount",
     "signature": "var supportedTokenCount: Int",

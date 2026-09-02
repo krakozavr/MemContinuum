@@ -178,7 +178,7 @@ class TestChunkerLazyAndComputedVar(unittest.TestCase):
     def test_computed_var_with_body_included(self):
         names = {c["qualified_name"]: c for c in self.chunks}
         self.assertIn("Cache.computed", names)
-        self.assertEqual(names["Cache.computed"]["kind"], "var")
+        self.assertEqual(names["Cache.computed"]["kind"], "accessor")
 
 
 class TestChunkerStringsAndInterpolation(unittest.TestCase):
@@ -222,12 +222,12 @@ class TestChunkerInitSubscriptOperator(unittest.TestCase):
     def test_init_chunked_and_qualified(self):
         by_name = {c["qualified_name"]: c for c in self.chunks}
         self.assertIn("Vec.init", by_name)
-        self.assertEqual(by_name["Vec.init"]["kind"], "init")
+        self.assertEqual(by_name["Vec.init"]["kind"], "constructor")
 
     def test_subscript_has_no_own_name_but_chunks(self):
         by_name = {c["qualified_name"]: c for c in self.chunks}
         self.assertIn("Vec.subscript", by_name)
-        self.assertEqual(by_name["Vec.subscript"]["kind"], "subscript")
+        self.assertEqual(by_name["Vec.subscript"]["kind"], "accessor")
 
     def test_static_operator_func_chunks(self):
         by_name = {c["qualified_name"]: c for c in self.chunks}
@@ -334,9 +334,9 @@ class TestChunkerActorObserversExtensionBacktick(unittest.TestCase):
     def test_backtick_quoted_func_and_var_names_are_captured(self):
         by_name = {c["qualified_name"]: c for c in self.chunks}
         self.assertIn("Escaped.default", by_name)
-        self.assertEqual(by_name["Escaped.default"]["kind"], "func")
+        self.assertEqual(by_name["Escaped.default"]["kind"], "method")
         self.assertIn("Escaped.type", by_name)
-        self.assertEqual(by_name["Escaped.type"]["kind"], "var")
+        self.assertEqual(by_name["Escaped.type"]["kind"], "accessor")
 
 
 class TestChunkerGapResyncModifiers(unittest.TestCase):
@@ -369,12 +369,12 @@ class TestChunkerGapResyncModifiers(unittest.TestCase):
     def test_bare_var_recovered_after_gap(self):
         by_name = {c["qualified_name"]: c for c in self.chunks}
         self.assertIn("afterVarGap", by_name)
-        self.assertEqual(by_name["afterVarGap"]["kind"], "var")
+        self.assertEqual(by_name["afterVarGap"]["kind"], "accessor")
 
     def test_bare_subscript_recovered_after_gap(self):
         by_name = {c["qualified_name"]: c for c in self.chunks}
         self.assertIn("subscript", by_name)
-        self.assertEqual(by_name["subscript"]["kind"], "subscript")
+        self.assertEqual(by_name["subscript"]["kind"], "accessor")
 
 
 class TestChunkerClassMemberAndBacktickContainer(unittest.TestCase):
