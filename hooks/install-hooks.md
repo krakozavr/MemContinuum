@@ -46,9 +46,12 @@ Notes:
   checkout that the edited file's absolute path doesn't share a `cwd` with (a real `PreToolUse`
   payload's `file_path` is always absolute, while `code_refs` are written repo-relative) — see the
   "engine request" comment at the top of `pre-edit-chain.sh` for why this is needed at all.
-- `MEMCONTINUUM_HOME` is deliberately omitted here so the hook falls back to memidx.py's own default
-  (`~/.memcontinuum`) — set it explicitly only if the derived index should live somewhere else. It
-  must never point at a synced/cloud-backed filesystem — SQLite locking is not reliable there.
+- `MEMCONTINUUM_HOME` is deliberately omitted here so the hook resolves it the same way
+  `config.sh` does: default to `~/.memcontinuum`, then follow the pointer written there into the
+  real home if `memcontinuum-setup.sh` was run with a custom one (see `docs/INTERNALS.md`
+  "Python resolution and `config.sh`" — the pointer case) — set it explicitly only if the derived
+  index should live somewhere else. It must never point at a synced/cloud-backed filesystem —
+  SQLite locking is not reliable there.
 - The command line, not a JSON `env` block, carries the env vars — Claude Code hook `command`
   entries run through a shell, so `VAR=value ... command` works directly.
 - `if` filter paths use Claude Code's permission-rule syntax, where a single leading slash
@@ -71,8 +74,9 @@ all — it only checks that the write target is new, under a configured code roo
 indexed source extension, then injects one reminder line. It DOES carry `MEMCONTINUUM_PROJECT`
 — identity only, so `scripts/repo-init.sh`'s merge step can tell this project's nudge entry apart
 from a different project's sharing the same `--claude-dir`; the hook itself never reads it. A
-legacy nudge entry carrying no `MEMCONTINUUM_PROJECT` at all stays sweepable by ANY project's
-re-run until that project re-runs `repo-init.sh` — see the migration note at the end of this file.
+nudge entry carrying no `MEMCONTINUUM_PROJECT` at all (wired before this marker existed) stays
+sweepable by ANY project's re-run until the project that owns it re-runs `repo-init.sh` — see the
+note at the end of this file.
 
 Rendered from `templates/newfile-nudge-hook.json.tmpl` + one
 `templates/newfile-nudge-filter-pair.json.tmpl` pair per `--code-root`, merged into the SAME
@@ -222,8 +226,9 @@ Notes:
   it is the code root `ledger-post-edit.sh` scopes edits to. The five write-side hooks only
   support **one** `MEMCONTINUUM_CODE_ROOT` each — with multiple `--code-root`s given to
   `scripts/repo-init.sh`, the first one given is what they get.
-- `MEMCONTINUUM_HOME` is deliberately omitted here for the same reason as section 1: falls back
-  to `~/.memcontinuum` unless overridden, and must never point at a synced/cloud drive.
+- `MEMCONTINUUM_HOME` is deliberately omitted here, same reason and same resolution as section 1
+  above (default, then the pointer, then a custom value only if given) — and it must never point
+  at a synced/cloud drive.
 - These five scripts write `$MEMCONTINUUM_HOME/sessions/**/*.json[.lock]` and
   `$MEMCONTINUUM_HOME/hook.log` — never the store, never the code tree. One carve-out:
   `userprompt-remind.sh`'s coverage check and `precompact-persist.sh` call `memidx.py unmapped`,
@@ -237,10 +242,10 @@ Notes:
 > not required anywhere (a zip download or a core.filemode=false clone drops it
 > silently).
 
-> Migration note: `scripts/repo-init.sh`'s merge step identifies its own hook entries by script
-> basename, further scoped by the `MEMCONTINUUM_PROJECT=` marker every one of the seven commands
-> carries -- `newfile-nudge.sh` (section 2 above) included. Two projects sharing one
-> `--claude-dir`: a project's re-run can only sweep entries marked for ITS OWN `--project`, or
-> entries with no marker at all (legacy, pre-identity wiring). A legacy entry carrying no marker
-> stays sweepable by ANY project's re-run until the project that owns it re-runs
-> `scripts/repo-init.sh` -- there is no separate migration step; a normal re-run closes the hole.
+> Two projects sharing one claude-dir: `scripts/repo-init.sh`'s merge step identifies its own
+> hook entries by script basename, further scoped by the `MEMCONTINUUM_PROJECT=` marker every one
+> of the seven commands carries -- `newfile-nudge.sh` (section 2 above) included. A project's
+> re-run can only sweep entries marked for ITS OWN `--project`, or entries with no marker at all
+> (wired before this marker existed). An entry carrying no marker stays sweepable by ANY
+> project's re-run until the project that owns it re-runs `scripts/repo-init.sh` -- there is no
+> separate step for this; a normal re-run closes the hole.

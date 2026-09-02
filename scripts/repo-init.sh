@@ -154,8 +154,8 @@ Usage: repo-init.sh --project NAME [--store DIR] [--code-root DIR ...]
                       line still gets MEMCONTINUUM_KNOWN_EXTS, and an
                       EXPLICITLY EMPTY MEMCONTINUUM_LANG_EXTS='' -- rendered,
                       never omitted: a set-but-empty value matches nothing,
-                      which is distinct from a legacy line where the variable
-                      is unset). For scripted/CI runs.
+                      which is distinct from a hook line rendered without the
+                      variable at all). For scripted/CI runs.
   --record-decision   after a successful (non-dry-run) install, record
                       "wired" in the decision registry (same as running
                       memcontinuum-decide.sh wired by hand), so the

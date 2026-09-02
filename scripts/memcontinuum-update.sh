@@ -85,7 +85,7 @@
 # In `repo` mode the remaining flags depend on the ROW, not on the command
 # line, so they are settled when the row is read:
 #
-#   a LEGACY row (records no claude-dirs) also takes --code-root, --langs and
+#   a row that RECORDS NO claude-dirs also takes --code-root, --langs and
 #   --set-never-ext -- they supply what the row never wrote down. See below.
 #
 #   a CURRENT-FORMAT row already records all of that, so those three are
@@ -193,8 +193,12 @@
 # own git history either -- re-rendering settings/rules/skill is all it does.
 #
 # Exit codes:
-#   the reporting walk (no --apply) always exits 0 -- a stale row is the
-#   ANSWER there, not an error.
+#   three refusals happen BEFORE any row is walked, and none of them is the
+#   walk's own answer: an empty/whitespace-only flag value, --apply together
+#   with --dry-run, and --repo naming a repository with no wired row -- each
+#   exits non-zero (2, 2, 1) with nothing read and nothing written.
+#   Past that point, the reporting walk (no --apply) always exits 0 -- a
+#   stale row IS the answer there, not an error.
 #   --apply exits 0 only when every claude-dir it walked ended up correct:
 #   already ok, or re-rendered successfully. Anything left undone -- a failed
 #   installer run, a dir deliberately skipped (store-missing, a foreign
@@ -351,30 +355,13 @@ if [ "$TARGETED" -eq 1 ] && [ "$APPLY" -eq 1 ]; then
     exit 2
 fi
 
-# --- the flag/mode matrix, in one place ------------------------------------
+# --- the flag/mode matrix is enforced here ----------------------------------
 #
-# Every flag belongs to a mode, and a mode REFUSES any flag it does not
-# consume, naming both. Accepting one and quietly dropping it is the worst
-# answer available here: the human typed what they wanted, this command
-# reported success, and it did something else instead.
-#
-#   MODE      selected by                           consumes
-#   walk      no --repo                             --dry-run --apply --machine
-#   targeted  --add-lang / --never-ext (+ --repo)   --dry-run --repo
-#                                                   --add-lang --never-ext
-#   repo      --repo, no --add-lang/--never-ext     --dry-run --apply --machine
-#                                                   --repo --claude-dir
-#
-# `repo` mode splits once the ROW is read, because what the remaining flags
-# mean is a property of the row and not of the command line -- so that half of
-# the matrix is enforced in the walk, at the point the row is known:
-#
-#   legacy row (records no claude-dirs)  ALSO consumes --code-root --langs
-#       --set-never-ext: they supply the parameters the row never wrote down.
-#   current-format row                   --claude-dir NARROWS the walk to the
-#       dirs it names (each must be one the row records, else dir-not-recorded);
-#       --code-root/--langs/--set-never-ext are refused -- the row already
-#       records those, and this mode does not rewrite them.
+# What each mode consumes (and refuses) is documented once, in the --help
+# text above ("MODES, AND WHICH FLAGS EACH ONE TAKES") -- this block and the
+# ROW-dependent half further down (search this file for "only the ROW can
+# settle") are what actually enforces it. Keep the prose there in sync with
+# the checks here, not the other way around.
 #
 # refuse_flag MODE FLAG WHY
 refuse_flag() {
@@ -1261,11 +1248,11 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
     # (dir-not-recorded) rather than walked: this command re-renders what a
     # row describes, and a dir the row has never heard of is not that.
     if [ "$LEGACY" -eq 0 ]; then
-        [ "${#OVERRIDE_CODE_ROOTS[@]}" -eq 0 ] || refuse_flag "recorded-row" --code-root \
+        [ "${#OVERRIDE_CODE_ROOTS[@]}" -eq 0 ] || refuse_flag repo --code-root \
             "$KEY already records code-roots=${CODE_ROOTS_SEMI:-(none)}. --code-root/--langs/--set-never-ext supply a LEGACY row's parameters during migration; this row is already migrated."
-        [ -z "$LANGS_FLAG" ] || refuse_flag "recorded-row" --langs \
+        [ -z "$LANGS_FLAG" ] || refuse_flag repo --langs \
             "$KEY already records langs=${LANGS_SEMI:-(none)}. To add one: $0 --add-lang LANG --repo $TARGET_REPO. To set the whole list: $DECIDE wired --repo $TARGET_REPO ... --langs LIST."
-        [ "$SET_NEVER_GIVEN" -eq 0 ] || refuse_flag "recorded-row" --set-never-ext \
+        [ "$SET_NEVER_GIVEN" -eq 0 ] || refuse_flag repo --set-never-ext \
             "$KEY already records never=${NEVER_SEMI:-(none)}. To add one: $0 --never-ext .ext --repo $TARGET_REPO. To set the whole list: $DECIDE wired --repo $TARGET_REPO ... --never-ext LIST."
         if [ "${#OVERRIDE_CLAUDE_DIRS[@]}" -gt 0 ]; then
             SUBSET_SEMI=""
