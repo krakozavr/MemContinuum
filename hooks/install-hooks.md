@@ -1,7 +1,7 @@
 # Wiring the hooks
 
 `scripts/repo-init.sh` renders and merges all of this automatically (see the README's
-"Installing into a new project") — this document explains what it wires and
+"Install → Once per repository") — this document explains what it wires and
 why, for anyone reading the generated `settings.local.json`, adapting it for
 a harness other than Claude Code, or wiring by hand instead of using the
 installer.
@@ -48,8 +48,7 @@ Notes:
   "engine request" comment at the top of `pre-edit-chain.sh` for why this is needed at all.
 - `MEMCONTINUUM_HOME` is deliberately omitted here so the hook falls back to memidx.py's own default
   (`~/.memcontinuum`) — set it explicitly only if the derived index should live somewhere else. It
-  must never point at a synced/cloud-backed filesystem (README: "never index on a synced/cloud
-  drive").
+  must never point at a synced/cloud-backed filesystem — SQLite locking is not reliable there.
 - The command line, not a JSON `env` block, carries the env vars — Claude Code hook `command`
   entries run through a shell, so `VAR=value ... command` works directly.
 - `if` filter paths use Claude Code's permission-rule syntax, where a single leading slash
@@ -231,10 +230,10 @@ Notes:
   (`tests/test_write_hooks.py`).
 
 
-> Invocation note (2026-08-31): every example above runs a hook as `bash <path>`
-> rather than by the path alone, matching what the templates now render -- the
-> executable bit is not required anywhere (a zip download or a
-> core.filemode=false clone drops it silently).
+> Invocation note: every example above runs a hook as `bash <path>` rather than
+> by the path alone, matching what the templates render -- the executable bit is
+> not required anywhere (a zip download or a core.filemode=false clone drops it
+> silently).
 
 > Migration note: `scripts/repo-init.sh`'s merge step identifies its own hook entries by script
 > basename, further scoped by the `MEMCONTINUUM_PROJECT=` marker every one of the seven commands

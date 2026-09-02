@@ -76,8 +76,8 @@ and let them decide.
   none of this tool's markers (this protects against a mistyped `--store`
   landing store directories in an unrelated repo; adopt an existing store by pointing at
   one that already has `topics/`/`incidents/`/`concepts/` or a README mentioning
-  MemContinuum). **Naming convention (owner ruling 2026-08-31):
-  the folder is called `MemContinuum-Store`** — marked as this tool's, never a
+  MemContinuum). **Naming convention: the folder is called
+  `MemContinuum-Store`** — marked as this tool's, never a
   generic `memory/` (collides with other memory systems) and never bare
   `MemContinuum` (reads as the tool itself). Omit `--store` and repo-init
   applies the convention on its own: `<repo>-MemContinuum-Store` beside the

@@ -117,10 +117,9 @@ Usage: repo-init.sh --project NAME [--store DIR] [--code-root DIR ...]
                       code-reindex, which is skipped; the newfile-nudge hook
                       line still gets MEMCONTINUUM_KNOWN_EXTS, and an
                       EXPLICITLY EMPTY MEMCONTINUUM_LANG_EXTS='' -- rendered,
-                      never omitted, per Ruling 6: a set-but-empty value
-                      matches nothing, distinct from an un-re-rendered
-                      legacy line where the var is unset). For scripted/CI
-                      runs.
+                      never omitted: a set-but-empty value matches nothing,
+                      which is distinct from a legacy line where the variable
+                      is unset). For scripted/CI runs.
   --dry-run           print everything this script would do; write nothing
                       (except --bootstrap-venv's venv, see above).
   --force             allow --store to sit inside another git repo's
@@ -506,15 +505,17 @@ declare -a NEVER_NOTES=()
 if [ "${#CODE_ROOTS_ABS[@]}" -gt 0 ]; then
     # Carry (Task 8 reviewer): repo-init does its own existence check on
     # each code root BEFORE invoking census -- a missing dir is repo-init's
-    # own error, never inferred from code-census's empty-dict fail-open
-    # (code-census exits 0 with {} on a nonexistent root by design, so
-    # silence there would otherwise read as "found nothing", not "you
-    # pointed --code-root at nothing"). Gated on real (non-dry) runs only:
+    # own error, never inferred from code-census's fail-open (code-census
+    # exits 0 on a nonexistent root by design, walking nothing and returning
+    # every language at zero, so silence there would otherwise read as
+    # "found nothing", not "you pointed --code-root at nothing"). Gated on
+    # real (non-dry) runs only:
     # --dry-run is a preview and a --code-root need not exist yet for one
     # (pre-existing contract -- TestMultipleCodeRoots' two-code-roots
     # dry-run test passes roots that are never created). Under --dry-run
-    # with a missing root, code-census's own fail-open (nonexistent root ->
-    # {}) takes over below and the run proceeds as "nothing proposed".
+    # with a missing root, code-census's own fail-open (nothing walked, every
+    # language at zero) takes over below and the run proceeds as "nothing
+    # proposed".
     if [ "$DRY_RUN" -eq 0 ]; then
         for cr in "${CODE_ROOTS_ABS[@]}"; do
             [ -d "$cr" ] || fail "--code-root $cr does not exist -- pass an existing directory (repo-init checks this itself before running any census)" 10

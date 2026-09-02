@@ -5,8 +5,8 @@ description: Check whether a decision, incident, or investigation already exists
 
 # memory-search
 
-Store D (`memory/topics/`, `memory/incidents/`, `memory/investigations/`) is queried through
-`memidx.py`, never by reading the markdown tree directly. Run these from the project's memcontinuum
+The project's store (`topics/`, `incidents/`, `investigations/` at the store root) is queried
+through `memidx.py`, never by reading the markdown tree directly. Run these from the MemContinuum
 checkout (or wherever `MEMCONTINUUM_HOME`/`--project` are configured for this project).
 
 ## Commands
@@ -15,8 +15,9 @@ checkout (or wherever `MEMCONTINUUM_HOME`/`--project` are configured for this pr
 ```
 memidx.py search "QUERY" --mode vector --project PROJECT --status active [--area AREA] [--type topic] --json
 ```
-Drop `--status active` only when you deliberately want superseded/historical/declined records
-too (§G5 of docs/SCHEMA.md: default retrieval excludes them). Add `--authority owner-verbatim` or
+`--status active` is this skill's convention, not the engine's: `search` with no `--status`
+filter returns superseded, historical and declined records too. Pass it by default, and drop it
+only when you deliberately want those. Add `--authority owner-verbatim` or
 `--authority owner-ratified` to find only rulings that can be cited as CONSTRAINT.
 
 **A specific topic's full chain**, once you have its id or slug:
@@ -76,4 +77,4 @@ was never run for this project; a bare `[]` here is a refusal, not a real "nothi
 **Confirm the code index is initialized/current (or stale with eyes open) before trusting a
 "nothing found" — then run `code-search`; name relevant hits in your report, or say none** —
 the same rule as the markdown search above: silently skipping this check is exactly how a
-second, slightly different `embedInScrollBox` gets written next to the first one.
+second, slightly different `writeDebugImage` gets written next to the first one.

@@ -45,10 +45,13 @@ looks up whatever the file being edited is governed by and injects it as
 context *at the moment of the edit*, before any code gets written. Retrieval
 that depends on being remembered eventually isn't retrieval; it's one more
 thing to forget. The same logic runs the other direction: write-side hooks
-remind a session, at natural checkpoints (a compaction, a session start, a
-prompt that looks like a ruling), that a decision it just made might be worth
-recording — again, a nudge at the moment it matters, not a hope that someone
-remembers to write the note later.
+remind a session that a decision it just made might be worth recording —
+again, a nudge at the moment it matters, not a hope that someone remembers to
+write the note later. The triggers are deliberately blind to what was typed:
+one fires when edited files are covered by no decision topic and the edit
+ledger has grown since the last nudge, the other when the conversation has
+moved on — several turns or tens of minutes — with no new edits at all. A
+nudge pending at a compaction is relayed into the session on the other side.
 
 ## No auto-capture
 

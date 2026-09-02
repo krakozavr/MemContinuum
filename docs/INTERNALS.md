@@ -48,19 +48,27 @@ reason is asymmetric cost: a missed reminder costs one un-recorded ruling; a
 hook that blocks an edit costs the user their tool, and the first thing anyone
 does with a tool that blocks edits is remove it.
 
-**One OUTCOME line per run** to `$MEMCONTINUUM_HOME/hook.log`. Diagnostic lines
-may precede it (`pre-edit-chain.sh` logs a missing-python note before its own
-`outcome=` line). A watchdog kill is included in "every run": the guarded hook
-cannot write its own outcome line then — it may be mid-call, or may never have
-reached that code — so `mc-watchdog.sh` writes `outcome=watchdog-killed
-hook=<name>` itself before exiting.
+**Logging, per hook.** The seven Claude Code hooks and `pre-edit-chain.sh` each
+write exactly one `outcome=` line per run to `$MEMCONTINUUM_HOME/hook.log`.
+Diagnostic lines may precede it (`pre-edit-chain.sh` logs a missing-python note
+before its own `outcome=`). A watchdog kill is included in "every run": the
+guarded hook cannot write its own outcome line then — it may be mid-call, or may
+never have reached that code — so `mc-watchdog.sh` writes
+`outcome=watchdog-killed hook=<name>` itself before exiting. The two hooks
+outside that rule are deliberate: `post-commit-reindex.sh` writes its own
+`post-commit-reindex: rc=… elapsed=… project=… root=…` line instead, and
+`memcontinuum-detect.sh` writes nothing at all unless
+`$MEMCONTINUUM_DETECT_LOG` is set — it runs in every repo on the machine, so its
+default is silence.
 
 **Writable surface.** The write-side hooks may write
 `$MEMCONTINUUM_HOME/sessions/<project>/` and `hook.log`, and nothing else —
-never the store, never the code root. The one exception is
-`userprompt-remind.sh`'s coverage check, which calls `memidx.py unmapped`; that
-command self-heals a drifted decision index by running `reindex --no-embed`,
-writing to the decision index's own SQLite cache.
+never the store, never the code root. Two of them reach the decision index's own
+SQLite cache as well, and only that: `userprompt-remind.sh`'s coverage check
+calls `memidx.py unmapped`, which self-heals a drifted index with a
+`reindex --no-embed`, and `precompact-persist.sh` runs the same self-healing
+`unmapped` call for ledger entries under the code root — or a plain
+`reindex --no-embed` when the session only touched the store.
 
 **Session state** lives at `$MEMCONTINUUM_HOME/sessions/<project>/<id>.json`,
 written by atomic rename (`os.replace`) and guarded by a real
@@ -92,6 +100,12 @@ repair path, and silence there would leave it with no route back to health.
 `memcontinuum-state.sh` reports decision and wiring as two separate facts
 (`decision=` / `wiring=`, plus a backward-compatible `state=` line) because a
 hand-edited settings file or an interrupted install can leave them disagreeing.
+
+`wiring=full` means the **five always-wired write-side hooks** are all present
+(`ledger-post-edit.sh`, `precompact-persist.sh`, `sessionstart-remind.sh`,
+`userprompt-remind.sh`, `sessionend-stamp.sh`). The two PreToolUse hooks are
+deliberately excluded from the count: a rationale-only install omits them on
+purpose, and their absence must never make a healthy repo read as unwired.
 
 `memcontinuum-decide.sh wired` refuses anything short of `wiring=full` and names
 the missing hooks: a `wired` row silences the detector forever, whether or not
@@ -361,7 +375,8 @@ rule it enforces: no growing blind spot may be silent.
 `code-census --root DIR [--json]` counts source files by extension, applies
 compound-extension rules, and reads the first line of extensionless files for a
 recognized shebang stem. It is documented exit-0-always: a missing or unreadable
-root yields `{}`, not an error.
+root is not an error, it just walks nothing — the result is every table language
+at zero and no unsupported-extension rows at all.
 
 The JSON always seeds **every** table language at zero, whether or not the tree
 holds one of its files, so a consumer can present three categories without
@@ -375,15 +390,22 @@ select from detected, or never-mention-this-extension. The fourth records
 extensions onto the nudge hook line (`MEMCONTINUUM_NEVER_EXTS`) and does not
 change which languages are enabled.
 
-`repo-init.sh` verifies each `--code-root` exists itself before running any
-census, rather than inferring a missing directory from the census's own
-fail-open empty dict; a census that fails, prints non-JSON, or prints JSON that
-is not an object is a hard error rather than a silent `{}`.
+On a real (non-dry) run, `repo-init.sh` verifies each `--code-root` exists
+itself before running any census, rather than inferring a missing directory from
+a census that walked nothing and proposed nothing. Under `--dry-run` that check
+is skipped — a preview may name roots that do not exist yet — and the run
+proceeds as "nothing proposed". Either way, a census that fails, prints
+non-JSON, or prints JSON that is not an object is a hard error, never a silent
+empty result.
 
 Non-interactive use: `--langs LIST` (wins over `--non-interactive`; an unknown
 name fails with the list of known languages), `--never-ext LIST`,
-`--non-interactive` (language-less wiring, initial `code-reindex` skipped). With
-no tty and neither flag, `repo-init.sh` exits 12 with a message naming the driven
+`--non-interactive` (language-less wiring, initial `code-reindex` skipped).
+
+The dialogue is only reached when the census proposes at least one supported
+language: an empty tree, or one holding nothing this engine can chunk, wires
+language-less with no prompt and no error. When there *is* something to propose
+and stdin is not a tty, `repo-init.sh` exits 12 with a message naming the driven
 flow rather than hanging on `/dev/tty` — an agent has no tty, so the skill runs
 the census itself, presents it, and re-runs with `--langs`.
 
@@ -399,8 +421,13 @@ fails open, so a non-zero exit there is structural.
 did not see under the root it was given, and overwrites `code_meta.code_root`.
 Looping it over several roots therefore leaves only the last root indexed, having
 quietly deleted the earlier ones' rows on the way. `repo-init.sh` indexes the
-first `--code-root` only and prints which roots it skipped. Multi-root code
-indexing is a later milestone.
+first `--code-root` only and prints which roots it skipped.
+
+The write-side hooks follow the same first-root rule for a different reason:
+`memlib.sh` carries a single `MEMCONTINUUM_CODE_ROOT`, so the edit ledger — and
+therefore the coverage and look-back nudges that read it — only ever sees the
+first root. `newfile-nudge.sh` is the one per-root hook: it gets its own wired
+entry, with its own `MEMCONTINUUM_CODE_ROOT`, for every `--code-root` given.
 
 ## memlint
 
@@ -435,6 +462,13 @@ Concept-record rules (`type: concept` files):
 | a concept has no `tested_by` | warning, unconditional |
 | a concept body has no "not this concept" sentence | warning |
 
+Corpus-wide identity rules, applied to every record regardless of type:
+
+| rule | severity |
+|---|---|
+| the same explicit `id:` is claimed by more than one record | error |
+| several records with no explicit `id:` share a file stem — `chain <stem>` is then ambiguous | warning (the durable fix is an explicit id on each) |
+
 Exit 1 on any error anywhere under `ROOT`; warnings alone exit 0. Standalone
 records are checked only for enum validity on whatever `status`/`authority`
 fields they carry.
@@ -458,18 +492,33 @@ store that legitimately lives at `~/.memory/` still indexes in full.
 (Anatomy's code index) are separate physical files by default, each with its own
 schema, its own content-hash incremental rebuild, and its own embeddings.
 Nothing enforces the split as a hard rule: `--db` (code) and `--decision-db`
-(decision, on `code-search`) are independent flags. What is guarded is narrower
-and lives on the decision side only: `open_db` records the owning `--project` in
-a `db_meta` table the first time a physical file is opened, and refuses a later
-open of the same file under a different project (`DbProjectMismatchError`)
-rather than mixing rows. `open_code_db` carries no equivalent check.
+(decision, on `code-search`) are independent flags. `open_code_db` carries no
+ownership check at all.
 
 Never place either db under a synced or cloud drive — keep the index on a local
 POSIX filesystem.
 
-**Isolation is enforced twice.** Each `--project` gets its own file by default,
-which isolates trivially; every query additionally filters on a `project`
-column, so isolation holds even when two projects are pointed at one `--db`.
+**Project isolation, on the decision db.** The default per-project filename does
+the work in the normal case. Beyond that, the guarantee is a *refusal*, not a
+partition: `records`, `embeddings`, `concepts` and `links` key rows by `path`
+alone, so two projects sharing one physical file could evict each other's rows
+on a colliding path — reachable only through an explicit `--db`. Rather than
+migrate every table and query to a composite key, `open_db` stamps the owning
+`--project` into a `db_meta` table the first time a file is opened and raises
+`DbProjectMismatchError` on any later open under a different project. Two
+`--project`s therefore cannot share one decision db at all.
+
+An unstamped file (built before the stamp existed, or one that lost its row) is
+only stamped automatically when the data agrees it is safe: no rows at all, or
+rows for exactly one project and that is the project asking. Rows for a
+different project, or rows spanning several, refuse instead of guessing.
+`open_db` skips the whole check when no project is given, so a tool can still
+inspect a db file directly.
+
+Queries that select by project do filter on the `project` column, which keeps a
+same-project reopen honest; that filter is a second layer, not the thing that
+makes sharing a file safe — path-keyed lookups such as `record_row_by_path` do
+not carry it.
 
 **Embedding text is `title + "\n\n" + body[:1500]`** — no frontmatter YAML, no
 ruling text. That formula was measured at 10/10 top-1 paraphrase retrieval on
@@ -492,8 +541,10 @@ and positions in agreement.
 **Tolerant parsing.** `parse_frontmatter()` never raises on malformed YAML: it
 logs a warning to stderr and falls back to pulling simple top-level `key: value`
 lines out of the frontmatter block by regex, so `title`/`name`/`type` survive and
-the file stays indexed. Hand-authored records never take that path; it exists for
-pre-existing markdown a project wants indexed as-is.
+the file stays indexed. The branch is taken on a YAML parse error and nothing
+else, so it is invisible to any record that parses — which is every well-formed
+hand-authored one. It exists for pre-existing markdown a project wants indexed
+as-is.
 
 **Lazy imports.** `fastembed` (and, transitively, numpy) is imported only inside
 `compute_embeddings`, `compute_query_embedding`, and the branches of
@@ -583,10 +634,14 @@ bash tests/run_bash32.sh
   prefixes — anywhere in tracked content, `tests/` included. `LICENSE`'s
   copyright line is the one exception. Anything project-specific (corpus roots,
   probe queries, expected symbol names) therefore lives in untracked files.
-- **Gated tests.** `test_memidx.py`'s D1/D2 build their corpus from
-  `fixtures/records/incidents/` (untracked) and fail rather than skip when it is
-  empty; D5 reads `fixtures/records/queries.json` and skips cleanly when absent;
-  D8's timing test skips without `$MEMCONTINUUM_TEST_SANDBOX_SYNTH`.
+- **Gated tests.** Anything that asserts real hits in the untracked incident
+  corpus (`fixtures/records/incidents/`) is gated on it and skips with a message
+  naming the directory — `test_memidx.py`'s D1, whose two other queries only
+  resolve there; `$MEMCONTINUUM_TEST_INCIDENTS` points the gate elsewhere. D2
+  also builds from that corpus but asserts only against the tracked schema
+  fixture, so it passes on a fresh clone. D5 reads
+  `fixtures/records/queries.json` and skips cleanly when absent; D8's timing test
+  skips without `$MEMCONTINUUM_TEST_SANDBOX_SYNTH`.
   `test_code_index.py`'s `TestGoldProbesRealCorpus` is double-gated on
   `$MEMCONTINUUM_TEST_REAL_CORPUS` **and** an untracked probe file
   (`$MEMCONTINUUM_TEST_PROBES`, default `docs/internal/gold-probes.tsv`).
