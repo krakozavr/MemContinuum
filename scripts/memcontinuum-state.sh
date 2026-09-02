@@ -37,6 +37,37 @@
 
 set -u
 
+# --help must never be mistaken for a REPO path: reporting `path=--help
+# state=not-a-repo` looks like a real answer. Handled before anything else so
+# it works with no config, no registry lib, and no git.
+case "${1:-}" in
+    -h|--help)
+        cat <<'USAGE'
+usage: memcontinuum-state.sh [REPO_PATH]
+
+Report one repository's MemContinuum state on stdout, for the `memcontinuum`
+skill to read before it says anything. Read-only: writes nothing, decides
+nothing. REPO_PATH defaults to the current directory.
+
+Prints, as separate facts:
+
+  decision=wired|declined|none   the human's recorded answer for this repo
+  wiring=full|partial|none       what the repo's .claude settings reference
+                                 right now (`missing=` names what is absent
+                                 when partial)
+  state=...                      a combined view: no-config, not-a-repo,
+                                 wired, declined, partial-wired, undecided
+
+Decision and wiring are printed separately because they can disagree -- a
+hand-edited settings file or an interrupted install leaves them out of step,
+and collapsing them into one line hides exactly that.
+
+Recording an answer is a different command: memcontinuum-decide.sh.
+USAGE
+        exit 0
+        ;;
+esac
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 # shellcheck source=./mc-registry-lib.sh
 if ! . "$SCRIPT_DIR/mc-registry-lib.sh"; then

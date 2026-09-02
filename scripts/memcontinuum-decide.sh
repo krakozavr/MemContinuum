@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# memcontinuum-decide.sh <wired|declined|never-ask|ask-again|forget> --repo PATH
-#                        [--store DIR] [--project NAME] [--claude-dir DIR]
+# usage: memcontinuum-decide.sh <wired|declined|never-ask|ask-again|forget>
+#                               --repo PATH [--store DIR] [--project NAME]
+#                               [--claude-dir DIR]
 #
 # Record a human's answer about one repository, so the SessionStart detector
 # never asks again. Called by the `memcontinuum` skill AFTER a human has
@@ -54,6 +55,8 @@ usage() {
 }
 
 [ $# -ge 1 ] || usage 1
+# --help before the action dispatch: asking for help is not an unknown action.
+case "$1" in -h|--help) usage 0 ;; esac
 ACTION="$1"; shift
 
 STORE=""; PROJECT=""; REPO_ARG=""; CLAUDE_DIR_ARG=""

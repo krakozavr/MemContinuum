@@ -17,7 +17,17 @@ FIXTURES = TOOLS_DIR / "fixtures"
 # The 14 incident records are local copies (fixtures/records/incidents/) of the
 # real-world notes originally sourced from an external sandbox directory --
 # copied in once, verbatim, never edited, so the test tree is self-contained.
-LOCAL_INCIDENTS = FIXTURES / "records" / "incidents"
+_INCIDENTS_ENV = os.environ.get("MEMCONTINUUM_TEST_INCIDENTS", "")
+LOCAL_INCIDENTS = (
+    Path(_INCIDENTS_ENV) if _INCIDENTS_ENV else FIXTURES / "records" / "incidents"
+)
+# The corpus is untracked machine-local data, so tests that assert real hits in
+# it must SKIP without it, not fail: a fresh clone has an empty directory here.
+PRIVATE_CORPUS_PRESENT = LOCAL_INCIDENTS.is_dir() and any(LOCAL_INCIDENTS.glob("*.md"))
+_SKIP_NO_PRIVATE_CORPUS = (
+    "no records in fixtures/records/incidents/ -- drop a project's own incident "
+    "notes there (or point $MEMCONTINUUM_TEST_INCIDENTS at them) to run this test"
+)
 # Extra synthetic-markdown corpus for the D8 timing test's fixed file count,
 # outside this repo (gitignored territory). Never hardcoded in tracked test
 # code -- point $MEMCONTINUUM_TEST_SANDBOX_SYNTH at a local directory of
@@ -82,7 +92,12 @@ def _run_search(args):
     return out
 
 
+@unittest.skipUnless(PRIVATE_CORPUS_PRESENT, _SKIP_NO_PRIVATE_CORPUS)
 class TestD1RebuildStable(unittest.TestCase):
+    """Two of the three queries here ("parallel test flake", "byte limits")
+    only resolve against the untracked incident corpus, so this whole class is
+    gated on it being present."""
+
     def test_delete_and_reindex_gives_identical_results(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "root"
