@@ -1824,5 +1824,212 @@ class TestCodeCensusAndConsentDialogue(unittest.TestCase):
             shutil.rmtree(home, ignore_errors=True)
 
 
+class TestMultiRootCodeIndexTruncation(unittest.TestCase):
+    """B3 (final fix wave): `code-reindex` is single-root by construction --
+    it removes every stored path it did not see under the root it was
+    given, and overwrites code_meta.code_root. Running it once per
+    --code-root therefore left only the LAST root indexed, having quietly
+    deleted the previous ones' rows. The installer now indexes exactly the
+    first code root (the same one the hooks wire as
+    MEMCONTINUUM_CODE_ROOT) and says loudly which roots it did not."""
+
+    @staticmethod
+    def _two_roots(home):
+        first = Path(home) / "code-a"
+        first.mkdir(parents=True)
+        shutil.copy(PY_CORPUS / "basic_functions.py", first / "alpha_module.py")
+        second = Path(home) / "code-b"
+        second.mkdir(parents=True)
+        shutil.copy(PY_CORPUS / "basic_functions.py", second / "beta_module.py")
+        return first, second
+
+    def test_only_the_first_root_is_indexed_and_the_rest_are_named(self):
+        home = sandbox_home()
+        try:
+            store = str(Path(home) / "store")
+            first, second = self._two_roots(home)
+            claude_dir = Path(home) / ".claude"
+            proc = run_install_at(
+                INSTALL_SH,
+                ["--project", "multi", "--store", store,
+                 "--code-root", str(first), "--code-root", str(second),
+                 "--claude-dir", str(claude_dir), "--langs", "python",
+                 "--non-interactive"],
+                home, python=VENV_PYTHON, timeout=120,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            out = proc.stdout + proc.stderr
+
+            # The note must NAME the un-indexed root, not just hint at one.
+            self.assertIn(str(second), out, out)
+            self.assertIn("later milestone", out.lower(), out)
+
+            code_db = Path(home) / ".memcontinuum" / "multi-code.sqlite"
+            self.assertTrue(code_db.is_file(), out)
+            conn = sqlite3.connect(str(code_db))
+            try:
+                meta = conn.execute(
+                    "SELECT code_root FROM code_meta WHERE project=?", ("multi",)
+                ).fetchone()
+                paths = {r[0] for r in conn.execute("SELECT DISTINCT path FROM chunks")}
+            finally:
+                conn.close()
+            self.assertEqual(meta[0], str(first))
+            self.assertEqual(paths, {"alpha_module.py"}, paths)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_no_removed_churn_from_a_second_root(self):
+        """The symptom the single-root rule exists to prevent: a second
+        code-reindex pass reporting the first root's files as "removed"."""
+        home = sandbox_home()
+        try:
+            store = str(Path(home) / "store")
+            first, second = self._two_roots(home)
+            claude_dir = Path(home) / ".claude"
+            proc = run_install_at(
+                INSTALL_SH,
+                ["--project", "multi", "--store", store,
+                 "--code-root", str(first), "--code-root", str(second),
+                 "--claude-dir", str(claude_dir), "--langs", "python",
+                 "--non-interactive"],
+                home, python=VENV_PYTHON, timeout=120,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertNotIn("1 removed", proc.stdout, proc.stdout)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+
+class TestCensusInvalidJSONFails(unittest.TestCase):
+    """I1 (final fix wave, Grok MEDIUM): the census heredoc used to swallow
+    a JSONDecodeError and carry on with an empty dict, so a broken census
+    reached language-less wiring through the same side door the non-zero-rc
+    check exists to close -- "nothing proposed", said in the voice of a
+    successful scan. Unparseable stdout is now a failure, like rc != 0."""
+
+    def test_garbage_census_stdout_fails_the_install(self):
+        home = sandbox_home()
+        try:
+            store = str(Path(home) / "store")
+            code_root = make_python_and_cs_corpus(Path(home) / "code")
+            claude_dir = Path(home) / ".claude"
+            # A python shim that corrupts ONLY the `code-census` call (the
+            # heredoc itself runs under this same interpreter and must keep
+            # working, so everything else execs the real venv python).
+            shim = Path(home) / "bin" / "python"
+            shim.parent.mkdir(parents=True, exist_ok=True)
+            shim.write_text(
+                "#!/usr/bin/env bash\n"
+                "for a in \"$@\"; do\n"
+                "  if [ \"$a\" = \"code-census\" ]; then\n"
+                "    echo 'this is not json {{{'\n"
+                "    exit 0\n"
+                "  fi\n"
+                "done\n"
+                'exec "' + VENV_PYTHON + '" "$@"\n'
+            )
+            shim.chmod(0o755)
+
+            proc = run_install_at(
+                INSTALL_SH,
+                ["--project", "p", "--store", store, "--code-root", str(code_root),
+                 "--claude-dir", str(claude_dir), "--non-interactive"],
+                home, python=str(shim), timeout=60,
+            )
+            self.assertEqual(proc.returncode, 10, proc.stdout + proc.stderr)
+            combined = (proc.stdout + proc.stderr).lower()
+            self.assertIn("json", combined, proc.stdout + proc.stderr)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+
+class TestNeverExtension(unittest.TestCase):
+    """B4 (final fix wave): the dialogue's "never for one extension" answer
+    used to throw away the whole proposed language set -- answering "stop
+    nagging me about .cs" silently disabled python indexing too. It now
+    keeps the proposed languages and excludes only the named extension,
+    persisted for this wiring by rendering MEMCONTINUUM_NEVER_EXTS onto the
+    nudge hook line. `--never-ext` is the non-interactive seam for the same
+    variable the interactive option 4 sets."""
+
+    def _install(self, home, extra):
+        store = str(Path(home) / "store")
+        code_root = make_python_and_cs_corpus(Path(home) / "code")
+        claude_dir = Path(home) / ".claude"
+        proc = run_install_at(
+            INSTALL_SH,
+            ["--project", "neverco", "--store", store, "--code-root", str(code_root),
+             "--claude-dir", str(claude_dir), "--langs", "python",
+             "--non-interactive"] + extra,
+            home, python=VENV_PYTHON, timeout=120,
+        )
+        return proc, claude_dir
+
+    def test_never_ext_keeps_the_chosen_languages_and_renders_the_env(self):
+        home = sandbox_home()
+        try:
+            proc, claude_dir = self._install(home, ["--never-ext", ".cs"])
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+            code_db = Path(home) / ".memcontinuum" / "neverco-code.sqlite"
+            self.assertTrue(
+                code_db.is_file(),
+                "python must still be indexed -- 'never .cs' is about one extension, "
+                "not about abandoning the language set\n" + proc.stdout + proc.stderr,
+            )
+            conn = sqlite3.connect(str(code_db))
+            try:
+                row = conn.execute(
+                    "SELECT langs FROM code_meta WHERE project=?", ("neverco",)
+                ).fetchone()
+            finally:
+                conn.close()
+            self.assertEqual(row[0], "python")
+
+            settings = json.loads((claude_dir / "settings.local.json").read_text())
+            nudge = [g for g in settings["hooks"]["PreToolUse"] if g.get("matcher") == "Write"]
+            command = nudge[0]["hooks"][0]["command"]
+            self.assertIn("MEMCONTINUUM_NEVER_EXTS='*.cs'", command, command)
+            self.assertIn("MEMCONTINUUM_LANG_EXTS='*.py'", command, command)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_never_ext_is_normalized_and_accepts_a_comma_list(self):
+        home = sandbox_home()
+        try:
+            proc, claude_dir = self._install(home, ["--never-ext", "cs,.vb"])
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            settings = json.loads((claude_dir / "settings.local.json").read_text())
+            nudge = [g for g in settings["hooks"]["PreToolUse"] if g.get("matcher") == "Write"]
+            command = nudge[0]["hooks"][0]["command"]
+            self.assertIn("MEMCONTINUUM_NEVER_EXTS='*.cs *.vb'", command, command)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_no_never_ext_renders_the_token_empty(self):
+        home = sandbox_home()
+        try:
+            proc, claude_dir = self._install(home, [])
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            settings = json.loads((claude_dir / "settings.local.json").read_text())
+            nudge = [g for g in settings["hooks"]["PreToolUse"] if g.get("matcher") == "Write"]
+            command = nudge[0]["hooks"][0]["command"]
+            self.assertIn("MEMCONTINUUM_NEVER_EXTS='' ", command, command)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_the_note_names_the_extension_and_does_not_overpromise(self):
+        home = sandbox_home()
+        try:
+            proc, _claude_dir = self._install(home, ["--never-ext", ".cs"])
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            out = proc.stdout
+            self.assertIn("never=.cs", out, out)
+            self.assertIn("this wiring", out.lower(), out)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()

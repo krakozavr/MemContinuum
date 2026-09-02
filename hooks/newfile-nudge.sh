@@ -61,6 +61,13 @@
 #                            of the plain not-indexed-extension. Unset ->
 #                            falls back to MEMCONTINUUM_LANG_EXTS (no
 #                            language-available-not-wired distinction).
+#   MEMCONTINUUM_NEVER_EXTS  space-separated glob list of extensions the
+#                            human answered "never" to at install time.
+#                            Checked BEFORE the wired gate: a match
+#                            finishes silently with
+#                            outcome=never-extension, even for an
+#                            otherwise-wired extension. Unset/empty ->
+#                            matches nothing (no behavior change).
 
 set -u
 
@@ -178,6 +185,22 @@ _ext_matches() {  # $1=path  $2=space-separated glob list
 }
 WIRED_EXTS="${MEMCONTINUUM_LANG_EXTS-*.swift}"
 KNOWN_EXTS="${MEMCONTINUUM_KNOWN_EXTS:-$WIRED_EXTS}"
+
+# MEMCONTINUUM_NEVER_EXTS is checked FIRST, before the wired gate (B4,
+# Anatomy M1 fix wave): the install dialogue's "never for one extension"
+# answer means "stop mentioning this one", and it has to win even over an
+# extension that is otherwise wired -- otherwise the answer would only
+# work for extensions the hook was already silent about, which is no
+# answer at all. Empty or unset matches nothing (an empty $2 makes
+# _ext_matches' `for` loop iterate zero times), so wiring that never asked
+# the question behaves exactly as before. This is render-time persistence:
+# the value lives on the hook's own command line, refreshed by every
+# install, not in a registry (that arrives with the updater).
+NEVER_EXTS="${MEMCONTINUUM_NEVER_EXTS:-}"
+if [ -n "$NEVER_EXTS" ] && _ext_matches "$FILE_PATH" "$NEVER_EXTS"; then
+    finish "never-extension"
+fi
+
 if ! _ext_matches "$FILE_PATH" "$WIRED_EXTS"; then
     if _ext_matches "$FILE_PATH" "$KNOWN_EXTS"; then
         finish "language-available-not-wired"   # logged outcome; future: user-visible nudge text
