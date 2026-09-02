@@ -197,6 +197,86 @@ mc_wired_command_for_project() {
     return 1
 }
 
+# mc_wired_commands_for_project PROJECT SETTINGS_FILE...
+#
+# Like mc_wired_command_for_project, but returns EVERY matching command line
+# (one per stdout line), not just the first -- the updater workstream needs
+# every one of a project's rendered hook lines (to check each carries the
+# current stamp, not just whichever sorts first), where the detector/state.sh
+# only ever needed one representative line. Kept as a separate function
+# rather than changing mc_wired_command_for_project's contract: that
+# function's single-match/out-parameter shape is relied on by
+# memcontinuum-state.sh today. Prints nothing and returns 1 when no line
+# matches; prints N lines and returns 0 otherwise. Command lines never
+# contain a literal newline (they are single JSON string values), so one
+# line of stdout per match is safe to split on.
+mc_wired_commands_for_project() {
+    local project="$1" settings base line padded found=1
+    shift
+    for settings in "$@"; do
+        [ -f "$settings" ] || continue
+        while IFS= read -r line || [ -n "$line" ]; do
+            padded=" $line "
+            for base in $MC_HOOK_BASENAMES; do
+                case "$line" in
+                    *"$base"*)
+                        case "$padded" in
+                            *" MEMCONTINUUM_PROJECT=$project "*|*" MEMCONTINUUM_PROJECT='$project' "*)
+                                printf '%s\n' "$line"
+                                found=0
+                                ;;
+                        esac
+                        ;;
+                esac
+            done
+        done < <(grep '"command"' "$settings" 2>/dev/null)
+    done
+    return "$found"
+}
+
+# mc_command_env_value CMD VAR
+#
+# Pulls one VAR=value token out of a rendered hook COMMAND line. Generalizes
+# the VAR-specific extraction memcontinuum-state.sh used to inline twice
+# (MEMCONTINUUM_ROOT, MEMCONTINUUM_PROJECT) so the updater does not
+# reimplement it a third time. repo-init.sh emits shlex-quoted values
+# (VAR='a b/c') when the value could contain a shell-special character;
+# hand-wired or charset-restricted values (PROJECT, a plain sha) often
+# aren't quoted -- the quoted form is tried first, then the bare word (up to
+# the next space). Sets MC_ENV_VALUE (empty string if VAR is absent from
+# CMD) and always returns 0 -- an absent var is not an error, just "this
+# line doesn't carry it" (pre-stamp lines lack MEMCONTINUUM_RENDERED, for
+# instance).
+mc_command_env_value() {
+    local cmd="$1" var="$2" value
+    value="$(printf '%s\n' "$cmd" | sed -n "s/.*${var}='\([^']*\)'.*/\1/p")"
+    [ -n "$value" ] || value="$(printf '%s\n' "$cmd" | sed -n "s/.*${var}=\([^ ]*\).*/\1/p")"
+    MC_ENV_VALUE="$value"
+    return 0
+}
+
+# mc_note_field NOTE KEY
+#
+# Pulls one space-separated "key=value" field out of a registry row's NOTE
+# column (the shape decide.sh writes: "store=... project=... claude-dirs=a;b
+# code-roots=c;d langs=python;swift never=.cs;.h" -- semicolon-joined for the
+# list-valued fields, space-separated between fields, same as decide.sh's
+# own note format). Values never contain a space (the same assumption
+# store=/project= have relied on since fix-round-4). Sets MC_NOTE_FIELD to
+# the value, or "" when KEY is absent -- absence is normal (every
+# pre-updater-workstream row lacks claude-dirs/code-roots/langs/never), not
+# an error -- and always returns 0.
+mc_note_field() {
+    local note="$1" key="$2" tok
+    MC_NOTE_FIELD=""
+    for tok in $note; do
+        case "$tok" in
+            "$key="*) MC_NOTE_FIELD="${tok#"$key"=}"; return 0 ;;
+        esac
+    done
+    return 0
+}
+
 # mc_resolve_home
 #
 # F7: two registries used to exist under a non-default MEMCONTINUUM_HOME --
