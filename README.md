@@ -363,6 +363,7 @@ an installer artifact.
 ```bash
 bash scripts/repo-init.sh --project NAME [--store DIR] [--code-root DIR ...] \
                  [--claude-dir DIR] [--python PATH] [--bootstrap-venv [DIR]] \
+                 [--langs LIST] [--never-ext LIST] [--non-interactive] \
                  [--dry-run] [--force]
 ```
 
@@ -397,7 +398,19 @@ Claude Code. `--project` is the only required flag.
   here is always absolute, and the actually-rendered `if` value carries a second leading slash on
   top of it — `Edit(//abs/path/**)` — per Claude Code's permission-rule path syntax, where one
   leading slash anchors at the settings source rather than the filesystem root; see
-  `hooks/install-hooks.md` for the fix-round note.)
+  `hooks/install-hooks.md` for the fix-round note.) The **code index** covers the first
+  `--code-root` only; see "Anatomy's code index" below.
+- `--langs LIST` — comma-separated languages to enable for code indexing (e.g.
+  `python,swift`), instead of answering the census dialogue. Each name must be one this engine
+  version knows; an unknown one fails with the list of known languages. Ignored with no
+  `--code-root`.
+- `--never-ext LIST` — comma-separated extensions (`.cs` or `cs`) the new-file reminder should
+  never mention again for this project. It does not change which languages are enabled. This is
+  the non-interactive form of the census dialogue's fourth answer; it holds for this wiring, and
+  a future install elsewhere will ask again.
+- `--non-interactive` — with no `--langs`, skip the census dialogue and wire no language at all
+  (nothing is indexed; the new-file reminder stays silent about every extension). For
+  scripted/CI runs.
 - `--claude-dir DIR` — where to merge hook wiring and install the skill. Defaults to
   `<dirname of --store>/.claude` **only when `--store` was also omitted** — the store then
   defaults beside the repo the cwd is in, a reliable signal for where its hooks belong. **An
@@ -702,34 +715,44 @@ independent of any authored concept record.
 | more languages | arriving via tree-sitter in the next milestone |
 
 A project chooses its languages once, not by flag guesswork: `scripts/repo-init.sh`
-runs a census of your `--code-root`(s) — counts source files by extension —
-and asks what to do with what it found: skip (language-less wiring), enable
-all detected, select from the detected set, or never for one extension
-(stop asking about that one). Nothing is enabled without your answer.
-`--langs LIST` and `--non-interactive` skip that dialogue for scripted/CI
+runs a census of your `--code-root`(s) — counts source files by extension,
+and reads the first line of extensionless files so a `#!/usr/bin/env python3`
+script with no `.py` suffix is counted as Python too — and asks what to do
+with what it found: skip (language-less wiring), enable all detected, select
+from the detected set, or name one extension the new-file reminder should
+stop mentioning for this project (that last one keeps the languages you
+chose — it only silences the reminder, and only for this wiring). Nothing is
+enabled without your answer. `--langs LIST`, `--never-ext LIST` and
+`--non-interactive` do the same things without the dialogue, for scripted/CI
 runs. Run `code-census --root DIR` yourself at any time to see the same
 breakdown without wiring anything.
 
+If you pass several `--code-root` directories, the code index covers the
+**first** one. The other roots still get the write-time reminder, but their
+code is not searchable; indexing more than one root per project is a later
+milestone, and the installer prints which roots it skipped.
+
 - `code-reindex --code-root DIR --lang LANGS` walks the tree and chunks each
   wired language's source files into function/`init`/subscript/computed-
-  property (Swift) or function/method/closure (Python) units. Directory
-  pruning is the union of a global set (`.git`, `vendor`, `node_modules`)
-  and each WIRED language's own noise dirs (Swift: `Tests`, `Resources`,
-  `.build`; Python: `venv`, `.venv`, `__pycache__`, `build`, `dist`,
-  `.tox`, `.eggs`) — pruning is a single per-directory decision made once
-  for the whole walk, so a directory named in any wired language's set is
-  pruned for every wired language, even one whose own set wouldn't have
-  pruned it standalone (e.g. wiring `swift,python` together prunes
-  `Tests/` from the walk entirely, so a `Tests/*.py` file is invisible to
-  the Python chunker too — wire `python` alone to index it). `--lang` is
-  **required on a project's first `code-reindex`** (exits 1 with an error
-  naming this); omit it on later runs to reuse the language set stored
-  from the first run. Incremental by sha256, same as `reindex`, and it
-  downloads the embedding model on the same terms `reindex` does (see
-  Requirements) unless `--no-embed` is given. A new file whose extension
-  isn't in the wired set — unsupported entirely, or supported by the engine
-  but not enabled for this project — is never indexed silently: every run
-  prints one line naming each such extension and how many files it skipped.
+  property (Swift) or function/method/constructor/accessor (Python) units.
+  Each language's own noise directories are skipped for that language's
+  files (Swift: `Tests`, `Resources`, `.build`; Python: `venv`, `.venv`,
+  `__pycache__`, `build`, `dist`, `.tox`, `.eggs`); `.git`, `vendor` and
+  `node_modules` are always skipped. `--lang` is **required on a project's
+  first `code-reindex`** (exits 1 with an error naming this); omit it on
+  later runs to reuse the language set stored from the first run. Naming a
+  language this engine version does not know fails with an error listing
+  the ones it does. Re-indexing only re-reads what changed — a file is
+  re-chunked when its content hash changes, or when the chunker for its
+  language has been updated since it was last indexed — and it downloads
+  the embedding model on the same terms `reindex` does (see Requirements)
+  unless `--no-embed` is given. A file that is not indexed — an extension
+  no chunker here handles, or one supported by the engine but not enabled
+  for this project — is never dropped silently: every run prints one line
+  naming each such extension and how many files it skipped. A file whose
+  chunker fails outright is reported by name, and anything previously
+  indexed for it is removed rather than left behind as an answer nothing
+  on disk still backs.
 - `code-search QUERY` runs fts/vector/hybrid search over those chunks —
   the same RRF fusion as `search`. Each hit optionally carries a
   `concept_id` when some concept's `implemented_by`/`tested_by` claims
@@ -743,8 +766,9 @@ breakdown without wiring anything.
   never run for this project — refuses outright, exit 1, an error on
   stderr, and `results` comes back `[]` in `--json` too, since an empty
   list here would otherwise read as a real "nothing found"), **stale**
-  (source under `--code-root` changed since the last `code-reindex` — a
-  warning on stderr, search still runs), or **current**. `--json` wraps
+  (source under `--code-root` changed since the last `code-reindex`, or the
+  chunker for one of its languages has been updated since — a warning on
+  stderr, search still runs), or **current**. `--json` wraps
   the hits in an envelope rather than a bare list so a caller can tell
   these apart without a separate call: `{"state", "code_root",
   "indexed_at", "head_sha", "results"}`. A "nothing found" is only real

@@ -111,14 +111,22 @@ path below. Run the driven flow instead:
    PY="${MEMCONTINUUM_PYTHON:-$ENGINE/.venv/bin/python}"
    PYTHONPATH= "$PY" "$ENGINE/memidx.py" code-census --root DIR --json
    ```
-2. Present the three categories to the human in conversation — proposed
-   (supported, found), supported-but-not-found, and unsupported (with
-   counts) — and the options **skip**, **enable all detected**, or
-   **select** a subset. (A fourth option, marking one extension "never" so
-   the nudge hook stops mentioning it, exists in `repo-init.sh`'s own
-   interactive dialogue but is currently interactive-only — there is no
-   flag for it, so a driven install cannot offer it; tell the human to
-   re-run `repo-init.sh` directly at a real terminal if they want it.)
+2. Present the three categories to the human in conversation, reading all
+   three straight out of that JSON — no separate list of known languages is
+   needed. Each key maps to `{"files": N, "status": "supported"|"unsupported"}`:
+   - **proposed** — `status: "supported"` with `files > 0` (the key is the
+     language name),
+   - **supported but not found** — `status: "supported"` with `files == 0`
+     (every language this engine version knows always appears, at zero when
+     the tree holds none of its files),
+   - **unsupported** — `status: "unsupported"` (the key is the extension, or
+     `"(no extension)"`).
+
+   Offer **skip**, **enable all detected**, or **select** a subset. A fourth
+   option: the human can name an extension the new-file reminder should
+   never mention again — pass `--never-ext .cs` (comma-separated for
+   several) alongside whichever language choice they made. It does not
+   change which languages are enabled.
 3. Run `repo-init.sh` with the human's answer turned into a flag — never
    bare, and the flag goes on the `--dry-run` preview line too (the census
    block, unlike the existence check, runs under `--dry-run` as well — a
