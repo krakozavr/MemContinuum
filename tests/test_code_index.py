@@ -2574,12 +2574,148 @@ class TestCodeIndexReport(unittest.TestCase):
             self.assertEqual(env["code_roots"][0]["code_root"], str(root.resolve())); self.assertEqual(env["embedding_mode"], "none")
 
 
+class TestHealOnSearch(unittest.TestCase):
+    """Anatomy M2a Task 5: `code-search` preflights the index (Task 4's
+    code_index_report) and, when it is eligible (stale or degraded, within
+    --heal-limit), reindexes each recorded root ONCE in-process before
+    answering -- one attempt, never a retry loop -- so a routine edit never
+    leaves a search silently answering from stale content. --no-heal and
+    --heal-limit (already-parsed no-ops since Task 4) get their meaning
+    here."""
+
+    def _run(self, db, q, *extra):
+        script = ("import sys; sys.path.insert(0, %r); import memidx; "
+                  "memidx.main(['code-search', '--db', %r, %r, '--mode', 'fts'] + %r)") % (str(TOOLS_DIR), str(db), q, list(extra))
+        return subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=60)
+
+    def _stale_tree(self, td):
+        root = Path(td) / "code"; root.mkdir(); p = root / "x.py"
+        p.write_text("def old_name():\n    pass\n")
+        db = Path(td) / "idx-code.sqlite"; code_reindex(root, db, lang="python")
+        p.write_text("def new_name():\n    pass\n"); os.utime(p, (time.time() + 3600,) * 2)
+        return root, db
+
+    def test_stale_index_heals_once_and_finds_the_new_symbol(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._stale_tree(td)
+            r = self._run(db, "new_name")
+            self.assertIn("new_name", r.stdout); self.assertIn("index healed (1 file(s) re-indexed)", r.stderr)
+            self.assertNotIn("stale", r.stderr.lower())
+            r2 = self._run(db, "new_name")
+            self.assertNotIn("healed", r2.stderr)
+
+    def test_no_heal_keeps_the_stale_warning(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._stale_tree(td)
+            r = self._run(db, "new_name", "--no-heal")
+            self.assertNotIn("new_name", r.stdout); self.assertIn("stale", r.stderr.lower())
+
+    def test_heal_limit_refuses_large_drift(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._stale_tree(td); (root / "y.py").write_text("def y():\n    pass\n")
+            r = self._run(db, "new_name", "--heal-limit", "1")
+            self.assertIn("above --heal-limit 1", r.stderr); self.assertIn("stale", r.stderr.lower())
+
+    def test_missing_root_is_never_healed_or_deleted(self):
+        with tempfile.TemporaryDirectory() as td:
+            a = Path(td) / "a"; b = Path(td) / "b"; a.mkdir(); b.mkdir()
+            (a / "x.py").write_text("def fx():\n    pass\n"); (b / "y.py").write_text("def fy():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"; code_reindex(a, db, lang="python"); code_reindex(b, db, lang="python")
+            shutil.rmtree(b)
+            (a / "x.py").write_text("def fx2():\n    pass\n"); os.utime(a / "x.py", (time.time() + 3600,) * 2)
+            r = self._run(db, "fx2")
+            self.assertIn("fx2", r.stdout)                       # a healed
+            self.assertIn("does not exist", r.stderr)            # b named, not touched
+            conn = memidx.open_code_db(db)
+            self.assertEqual(conn.execute("SELECT count(*) FROM chunks WHERE code_root=?", (str(b.resolve()),)).fetchone()[0], 1)
+            self.assertEqual(memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)["state"], "degraded")   # never current while b is missing
+
+    def test_heal_follows_embedding_mode(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._stale_tree(td)                       # mode none
+            self._run(db, "new_name")
+            conn = memidx.open_code_db(db)
+            self.assertEqual(conn.execute("SELECT count(*) FROM embeddings").fetchone()[0], 0)
+
+    def test_failed_file_does_not_trigger_heal(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"; root.mkdir()
+            (root / "bad.py").write_text("def (:\n"); (root / "ok.py").write_text("def fine():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"; code_reindex(root, db, lang="python")
+            r = self._run(db, "fine")
+            self.assertNotIn("healed", r.stderr); self.assertNotIn("stale", r.stderr.lower())
+
+    def test_not_indexed_is_retried_only_when_availability_changes(self):
+        """Task 5 conflict resolved (see task-5-report.md): the brief's
+        fixture made BOTH files not-indexed (get_chunker mocked to throw for
+        every lang), so there was nothing genuinely indexed left for step
+        (a)'s edit to change -- the sha-based `changed` count binding point
+        4 relies on never fires for a not-indexed (sha-NULL) row, so the
+        edit could never be observed and "g2" could never be found. Fixed
+        by indexing other.py for REAL first (no mock active), THEN adding
+        x.py under the mocked-unavailable backend -- only x.py is
+        not-indexed; other.py's later edit is a genuine sha-confirmed
+        change the preflight (and the heal) can see."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"; root.mkdir()
+            (root / "other.py").write_text("def g():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"
+            code_reindex(root, db, lang="python")                # other.py indexed ok (real backend)
+            (root / "x.py").write_text("def f():\n    pass\n")
+            with mock.patch.multiple(chunkers, get_chunker=lambda lang: (_ for _ in ()).throw(chunkers.BackendUnavailable("m")),
+                                     backend_availability=lambda: "python=missing;swift=ok"):
+                code_reindex(root, db, lang="python")            # x.py not-indexed, attempt_key python=missing; other.py untouched (sha match, chunker never called)
+            # (a) same fingerprint + an unrelated edit: heal re-indexes the edit only, x.py stays not-indexed
+            (root / "other.py").write_text("def g2():\n    pass\n"); os.utime(root / "other.py", (time.time() + 3600,) * 2)
+            script = ("import sys; sys.path.insert(0, %r); import chunkers, memidx; "
+                      "chunkers.backend_availability = lambda: 'python=missing;swift=ok'; "
+                      "memidx.main(['code-search', '--db', %r, 'g2', '--mode', 'fts'])") % (str(TOOLS_DIR), str(db))
+            r = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=60)
+            self.assertIn("g2", r.stdout)
+            conn = memidx.open_code_db(db)
+            self.assertEqual(conn.execute("SELECT status FROM file_sha WHERE path='x.py'").fetchone()[0], "not-indexed"); conn.close()
+            # (b) fingerprint differs (backend really available now) -> heal retries x.py
+            r = self._run(db, "f")
+            self.assertIn("f", r.stdout); self.assertIn("healed", r.stderr)
+            r2 = self._run(db, "f")
+            self.assertNotIn("healed", r2.stderr)
+
+    def test_healed_count_reports_files_actually_reindexed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"; root.mkdir(); (root / "x.py").write_text("def f():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"
+            with mock.patch.multiple(chunkers, get_chunker=lambda lang: (_ for _ in ()).throw(chunkers.BackendUnavailable("m")),
+                                     backend_availability=lambda: "python=missing;swift=ok"):
+                code_reindex(root, db, lang="python")
+            r = self._run(db, "f")                      # availability-only heal: preflight changed == 0
+            self.assertIn("index healed (1 file(s) re-indexed)", r.stderr)
+
+    def test_heal_failure_is_fail_open(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._stale_tree(td)
+            real = memidx.cmd_code_reindex
+            memidx.cmd_code_reindex = lambda a: (_ for _ in ()).throw(RuntimeError("boom"))
+            # in-process call needed for the monkeypatch: call cmd_code_search directly
+            try:
+                buf = io.StringIO()
+                with contextlib.redirect_stderr(buf), contextlib.redirect_stdout(io.StringIO()):
+                    rc = memidx.cmd_code_search(ns(db=str(db), project=memidx.DEFAULT_PROJECT, query="old_name", mode="fts",
+                                                   limit=10, json=False, decision_db=None, no_heal=False, heal_limit=500))
+            finally:
+                memidx.cmd_code_reindex = real
+            self.assertEqual(rc, 0); self.assertIn("heal failed", buf.getvalue()); self.assertIn("stale", buf.getvalue().lower())
+
+
 class TestStaleWarning(unittest.TestCase):
     def test_editing_a_source_file_triggers_stderr_warning_on_search(self):
         """Anatomy M2a Task 4: code_index_report is sha-confirmed -- a bare
         `touch` alone is no longer enough to warn stale (see
         TestCodeIndexReport.test_touch_is_not_a_change_but_an_edit_is); an
-        actual content edit is."""
+        actual content edit is.
+
+        Anatomy M2a Task 5: a stale index heals itself by default now, so
+        this must pass --no-heal to still exercise the bare warning path;
+        TestHealOnSearch covers the with-heal behavior."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "code"
             root.mkdir()
@@ -2592,7 +2728,7 @@ class TestStaleWarning(unittest.TestCase):
                 "import sys, time, os; sys.path.insert(0, %r); import memidx; "
                 "p = %r; open(p, 'a').write('\\nfunc addedLater() {}\\n'); "
                 "os.utime(p, (time.time() + 3600, time.time() + 3600)); "
-                "memidx.main(['code-search', '--db', %r, 'outer func', '--mode', 'fts'])"
+                "memidx.main(['code-search', '--db', %r, 'outer func', '--mode', 'fts', '--no-heal'])"
             ) % (str(TOOLS_DIR), str(target), str(db))
             result = subprocess.run(
                 [sys.executable, "-c", script], capture_output=True, text=True, timeout=30
@@ -2695,7 +2831,11 @@ class TestIndexProvenance(unittest.TestCase):
 
     def test_stale_index_json_carries_state_stale(self):
         """Anatomy M2a Task 4: code_index_report is sha-confirmed -- a real
-        content edit (not a bare `touch`) is what the state must react to."""
+        content edit (not a bare `touch`) is what the state must react to.
+
+        Anatomy M2a Task 5: --no-heal, so this exercises the raw preflight
+        state rather than the now-default heal-to-current behavior
+        (TestHealOnSearch covers that)."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "code"
             root.mkdir()
@@ -2706,7 +2846,7 @@ class TestIndexProvenance(unittest.TestCase):
             target.write_text(target.read_text() + "\nfunc addedLater() {}\n")
             os.utime(target, (time.time() + 3600, time.time() + 3600))
 
-            result = self._run(["code-search", "--db", str(db), "outer func", "--mode", "fts", "--json"])
+            result = self._run(["code-search", "--db", str(db), "outer func", "--mode", "fts", "--json", "--no-heal"])
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             data = json.loads(result.stdout)
             self.assertEqual(data["state"], "stale")

@@ -1236,7 +1236,7 @@ def iter_code_files(code_root: Path):
             yield fpath
 
 
-def _resolve_symbol_via_code_index(code_root: Path, symbol: str, project: str) -> str | None:
+def _resolve_symbol_via_code_index(code_root: Path, symbol: str, project: str) -> tuple[str, str] | None:
     """Finding 7 fast path for resolve_symbol_to_path, below: consult the
     code index's `chunks` table (member symbols only -- container names
     like class/struct/enum/protocol/extension/actor are never chunks
@@ -1246,12 +1246,28 @@ def _resolve_symbol_via_code_index(code_root: Path, symbol: str, project: str) -
     consults `--db`: on `why`, that flag means the DECISION db override
     (exactly the confusion --decision-db exists to prevent for
     code-search's own concept attachment) -- only the default
-    "<project>-code.sqlite" path is ever read here. Only trusted when the
-    index was built against this SAME code_root -- code_meta.code_root
-    mismatch (a stale index built against a different tree, or one that
-    predates this code_root entirely) is treated exactly like no index at
-    all, since its stored relative chunk paths would otherwise resolve
-    against the wrong root."""
+    "<project>-code.sqlite" path is ever read here.
+
+    Anatomy M2a Task 5: multi-root aware (Task 4's code_index_report, not a
+    single code_meta row) and NEVER heals -- unlike code-search, `why` only
+    ever gets one shot at an answer, so a stale index must not be silently
+    trusted for it, but repairing it here would also make a `why` call
+    mutate the index as a side effect, which nothing about `why` implies
+    should happen. Untrusted (returns None, sending the caller to the disk
+    scan) whenever: the report's overall state is `stale` (some root's
+    content has drifted -- a state-wide caution, since a chunk this SAME
+    root reports as current could still be a false hit once ANY root in
+    the project has unindexed drift and the caller cannot tell which chunk
+    came from which), or `code_root` (resolved) is not one of the report's
+    own recorded roots at all (an index that never saw this tree, or one
+    that predates it). A `degraded` report (not-indexed / missing-root
+    rows elsewhere, no drifted content) is still trusted for a chunk that
+    IS present, same as before this task.
+
+    Returns (code_root, path) -- the resolved root alongside the chunk's
+    stored relative path, so a multi-root caller (Task 6) can tell which
+    tree the match came from; resolve_symbol_to_path (immediately below)
+    unpacks the tuple and returns just the path for now."""
     code_db_path = (
         Path(os.environ.get("MEMCONTINUUM_HOME", str(Path.home() / ".memcontinuum")))
         / f"{project}-code.sqlite"
@@ -1263,23 +1279,22 @@ def _resolve_symbol_via_code_index(code_root: Path, symbol: str, project: str) -
     except sqlite3.DatabaseError:
         return None
     try:
-        meta = conn.execute(
-            "SELECT code_root FROM code_meta WHERE project=?", (project,)
-        ).fetchone()
-        if not meta or not meta["code_root"]:
+        report = code_index_report(conn, project)
+        if report["state"] == "stale":
             return None
         try:
-            if Path(meta["code_root"]).resolve() != code_root.resolve():
-                return None
+            root_s = str(code_root.resolve())
         except OSError:
             return None
+        if root_s not in {r["code_root"] for r in report["roots"]}:
+            return None
         rows = conn.execute(
-            "SELECT path, symbol, qualified_name FROM chunks WHERE project=? ORDER BY path",
-            (project,),
+            "SELECT path, symbol, qualified_name FROM chunks WHERE project=? AND code_root=? ORDER BY path",
+            (project, root_s),
         ).fetchall()
         for r in rows:
             if fragment_matches_symbol(symbol, r["symbol"], r["qualified_name"]):
-                return r["path"]
+                return (root_s, r["path"])
         return None
     finally:
         conn.close()
@@ -1307,7 +1322,8 @@ def resolve_symbol_to_path(code_root: Path, symbol: str, project: str | None = N
     if project:
         resolved = _resolve_symbol_via_code_index(code_root, symbol, project)
         if resolved is not None:
-            return resolved
+            _root_s, path = resolved
+            return path
     for fpath in sorted(iter_code_files(code_root)):
         try:
             text = fpath.read_text(encoding="utf-8", errors="ignore")
@@ -2957,14 +2973,85 @@ def code_index_report(conn: sqlite3.Connection, project: str) -> dict:
     }
 
 
+def heal_code_index(conn: sqlite3.Connection, db_path: Path, project: str, report: dict, *, limit: int):
+    """Anatomy M2a Task 5: `code-search`'s one-attempt preflighted heal --
+    consulted right after code_index_report, before a search ever answers.
+    Eligible when the report is `stale` or `degraded` AND has something to
+    actually fix (`changed > 0` or `availability_changed` -- a `failed`-only
+    report is left alone; `code-reindex` is what a real parse failure
+    needs, not an automatic retry loop). Within --heal-limit, every
+    recorded root that still exists on disk is reindexed ONCE, in-process,
+    with `retry_not_indexed=False` (binding point 1: an unrelated edit must
+    never retry a known-broken backend) and `--full` never set (a heal
+    repairs drift, it does not rewrite the project's language set).
+    `no_embed` follows the project's OWN embedding_mode (binding point 2):
+    `full` embeds, anything else passes --no-embed, so a heal can never be
+    the thing that silently adds unembedded chunks to a `full` project.
+
+    Returns (report, conn) -- conn is always a LIVE, valid connection on
+    return, never the one this function may have closed along the way;
+    cmd_code_search's caller reads report/conn from this call's own return
+    value, never the ones it passed in.
+
+    Any exception during the heal is fail-open: the db is reopened, the
+    ORIGINAL (pre-heal) report is returned unchanged, and code-search still
+    answers from whatever was already indexed -- a heal that cannot finish
+    must never crash a search or leave the connection closed."""
+    eligible = report["state"] in ("stale", "degraded") and (report["changed"] > 0 or report["availability_changed"])
+    if not eligible:
+        return report, conn
+    if report["changed"] > limit:
+        print(
+            f"code-search: index is stale ({report['changed']} file(s) changed since the last "
+            f"code-reindex, above --heal-limit {limit}); run code-reindex",
+            file=sys.stderr,
+        )
+        return report, conn
+    langs = ",".join(report["langs"] or [])
+    no_embed = report["embedding_mode"] != "full"
+    # Task 5 decision: matches the actual per-run summary line printed at
+    # the end of cmd_code_reindex (see the `code-reindex: {N} files
+    # scanned, ... added, ... changed, ... unchanged, ... removed, ...
+    # failed, ... not indexed, ...` line) -- the "healed" count sums every
+    # file this heal actually TOUCHED (added + changed + failed + not
+    # indexed), never the preflight's own `changed` count (binding point 4).
+    summary_re = re.compile(r"(\d+) added, (\d+) changed, .*? (\d+) failed, (\d+) not indexed")
+    try:
+        conn.close()
+        reindexed = 0
+        for r in report["roots"]:
+            if not r["exists"]:
+                continue
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                cmd_code_reindex(argparse.Namespace(
+                    code_root=r["code_root"], drop_root=None, db=str(db_path), project=project,
+                    lang=langs or None, no_embed=no_embed, full=False, retry_not_indexed=False,
+                ))
+            m = summary_re.search(out.getvalue())
+            if m:
+                reindexed += sum(int(g) for g in m.groups())
+        conn = open_code_db(db_path)
+        after = code_index_report(conn, project)
+        if after["state"] == "current":
+            print(f"code-search: index healed ({reindexed} file(s) re-indexed)", file=sys.stderr)
+        return after, conn
+    except Exception as exc:
+        conn = open_code_db(db_path)
+        print(
+            f"code-search: heal failed ({type(exc).__name__}: {exc}); answering from the current index",
+            file=sys.stderr,
+        )
+        return report, conn
+
+
 def cmd_code_search(args) -> int:
     db_path = resolve_code_db_path(args)
     conn = open_code_db(db_path)
 
     report = code_index_report(conn, args.project)
-    state = report["state"]
 
-    if state == "uninitialized":
+    if report["state"] == "uninitialized":
         print(
             f"code-search: the code index is uninitialized for project {args.project!r} "
             f"(no code_meta / no chunks for this root) -- run `code-reindex` first",
@@ -2978,6 +3065,17 @@ def cmd_code_search(args) -> int:
                 indent=2,
             ))
         return 1
+
+    # Anatomy M2a Task 5: one preflighted heal attempt before anything else
+    # reads `report` -- every message below (and the --json envelope) is
+    # computed from whatever heal_code_index returns, which may still be
+    # stale/degraded (heal_limit refused, nothing eligible, or a heal that
+    # itself failed open) or may now read current.
+    if not getattr(args, "no_heal", False):
+        report, conn = heal_code_index(
+            conn, db_path, args.project, report, limit=getattr(args, "heal_limit", 500)
+        )
+    state = report["state"]
 
     # Anatomy M2a Task 4: the preflight now distinguishes stale / degraded /
     # failed / a missing root and says each one that applies, instead of a
