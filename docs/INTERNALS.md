@@ -995,9 +995,12 @@ down:
   scoped to `--project` alone, before `--status`/`--type`/`--area`/`--topic`/
   `--authority` are known at all — a record that would pass every filter but
   ranks below 200th on raw bm25 for this project is never returned by that
-  query, so it is never a candidate for FTS or (in `hybrid`) RRF fusion,
-  regardless of what the filters would have allowed. Vector ranking carries no
-  such cap: `vector_ranked` scores every embedded row for the project.
+  query, so FTS itself never considers it as a candidate, regardless of what
+  the filters would have allowed. The vector side carries no such cap —
+  `vector_ranked` scores every embedded row for the project — and `hybrid` is
+  the default mode, so a record the FTS window missed can still surface
+  through RRF fusion on the strength of its vector rank alone; only `--mode
+  fts` on its own loses it outright.
 - **`chain`** — one line per link, newest first: `kind`,
   `reverses`/`reason_for_change` when present, ruling (quoted for
   owner-verbatim/owner-ratified) and rationale, plus one indented edge line per
