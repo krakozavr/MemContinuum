@@ -931,6 +931,24 @@ class TestDecisionRegistry(BootstrapCase):
         self.assertIn("rendered by deadbee", proc.stdout)
 
 
+class TestStateShRejectsUnknownFlags(unittest.TestCase):
+    """H6: memcontinuum-state.sh took a single REPO_PATH positional with no
+    flag parsing at all -- an unrecognised `--flag` fell straight through to
+    `TARGET="${1:-$PWD}"` and got reported as though it were a repository
+    path (`path=--anything state=not-a-repo`). Handled at the very top,
+    before config/registry/git are touched -- no HOME/MEMCONTINUUM_HOME
+    sandbox needed for this one."""
+
+    def test_unknown_flag_is_rejected(self):
+        proc = subprocess.run(
+            [MC_BASH, str(STATE_SH), "--anything"],
+            capture_output=True, text=True,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("unknown argument: --anything", proc.stdout + proc.stderr)
+        self.assertNotIn("path=--anything", proc.stdout)
+
+
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
 class TestMemlibReadsConfig(BootstrapCase):
     """config.sh exists so a hook resolves python without every hook line

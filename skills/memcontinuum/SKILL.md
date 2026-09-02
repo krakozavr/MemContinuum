@@ -41,22 +41,26 @@ answer, when there is one) and `wiring=` (`full`, `partial`, or `none` --
 what the repo's `.claude` settings actually contain right now, plus
 `missing=<basenames>` when partial) as two SEPARATE facts: a hand-edited
 settings file or an interrupted install can leave them disagreeing. It also
-prints a backward-compatible `state=` line -- `wired`, `declined`,
-`partial-wired` (no recorded decision, and only SOME of the five hooks are
-present -- SessionStart's detector DOES ask here, same as `undecided`: a
-half-wired repo with no recorded decision is still an open question, not a
-grandfathered install), `undecided`, `not-a-repo`, or `no-config` -- plus
-the repo key, store path and project name where they apply. Report
-`decision`/`wiring` plainly when they disagree; never guess either one from
-the presence of a directory.
+prints a combined `state=` line -- `wired`, `declined`, `partial-wired` (no
+recorded decision, and only SOME of the five hooks are present --
+SessionStart's detector DOES ask here, same as `undecided`: a half-wired
+repo with no recorded decision is still an open question, not a settled
+one), `undecided`, `not-a-repo`, or `no-config` -- plus the repo key, store
+path and project name where they apply. `wired` also covers an install
+wired before the decision registry existed: `decision=none` with
+`wiring=full` reads as already wired, since the wiring itself is the
+evidence. Report `decision`/`wiring` plainly when they disagree; never guess
+either one from the presence of a directory.
 
 ## 2. Ask, if the state is `undecided` or `partial-wired`
 
 One question, no advocacy. What the human is deciding: whether this repo should
 keep an append-only record of *why* its decisions were made — rulings,
 incidents, rejected alternatives — indexed and surfaced to agents when they
-touch related code. It costs a git repo for the store, seven hooks in the
-project's `.claude/settings.local.json`, and the habit of writing records.
+touch related code. It costs a git repo for the store, five hooks in the
+project's `.claude/settings.local.json` (plus two more, for retrieval and the
+new-file reminder, when a `--code-root` is given), and the habit of writing
+records.
 
 It earns its keep on a codebase with contested history that outlives one
 person's memory. It is overhead on a scratch repo, a fork you don't own, or

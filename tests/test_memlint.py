@@ -74,6 +74,34 @@ class TestMemlintClean(unittest.TestCase):
             self.assertEqual(rc, 1)
 
 
+class TestMemlintRejectsUnknownFlags(unittest.TestCase):
+    """H6: an unrecognised `--flag` used to fall through parse_argv's
+    `elif root is None: root = a` arm and get linted as a PATH --
+    `memlint.py --anything` walked a nonexistent directory named
+    "--anything", found nothing to complain about, and printed
+    "memlint: clean" at exit 0. An unknown flag must be refused, not
+    silently treated as the ROOT positional."""
+
+    def test_unknown_flag_is_rejected_not_treated_as_root(self):
+        rc = memlint.main(["--anything"])
+        self.assertNotEqual(rc, 0, "an unknown flag must not exit 0")
+
+    def test_unknown_flag_message_names_it(self):
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            rc = memlint.main(["--anything"])
+        self.assertNotEqual(rc, 0)
+        self.assertIn("unknown argument: --anything", buf.getvalue())
+
+    def test_known_root_with_code_root_still_works(self):
+        # The fix must not regress the one real flag memlint.py has.
+        rc = memlint.main([str(FIXTURES / "memlint_clean"), "--code-root", str(FIXTURES)])
+        self.assertEqual(rc, 0)
+
+
 class TestDuplicateIdErrors(unittest.TestCase):
     """A record id is a citation target; two records sharing one makes every
     chain/edge/citation lookup by that id silently ambiguous. Observed live

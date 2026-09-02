@@ -31,7 +31,7 @@ automatically — use it by hand when working outside an edit, e.g. while planni
 memidx.py for-path path/to/file.ext --project PROJECT --json
 ```
 
-Drop `--json` for any of the three to get the human-readable compressed chain view instead.
+Drop `--json` for a human-readable form: `chain`/`for-path` print the compressed chain view; `search` prints one line per hit -- score, path, type, and title.
 
 ## Reading the output — three tiers (docs/SCHEMA.md §4)
 
