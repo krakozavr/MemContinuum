@@ -200,6 +200,38 @@ with is resolved in this order: $MEMCONTINUUM_PYTHON (env) -> the
 MEMCONTINUUM_PYTHON recorded in $MEMCONTINUUM_HOME/config.sh (written by
 memcontinuum-setup.sh; one pointer config.sh followed) -> <this
 checkout>/.venv/bin/python -> a clear error naming --bootstrap-venv.
+
+Exit codes (0 on success, including a --dry-run preview that hit no refusal):
+   1  missing scripts/mc-registry-lib.sh -- incomplete checkout.
+   2  bad usage: an unknown or missing argument, --project missing or not
+      matching [A-Za-z0-9._-]+, or an explicit --store with no --claude-dir.
+   3  python/venv resolution failed (no python found, --bootstrap-venv
+      failed, memidx.py/memlint.py missing), or a required render source
+      (templates/memcontinuum-rules.md, skills/memory-search/SKILL.md) is
+      missing, empty, or carries no identity marker -- incomplete checkout.
+   4  --store sits inside another git repo's working tree; pass --force.
+   5  the nearest existing ancestor of --store or --claude-dir is not
+      writable.
+   6  hook wiring (the settings.local.json merge) failed.
+   7  the install-time reindex failed.
+   8  memlint reported errors on a freshly seeded store (never fatal on an
+      adopted one -- see docs/INTERNALS.md).
+   9  --store is an existing git repo carrying none of this tool's markers
+      (no topics/incidents/concepts directory, no README naming
+      MemContinuum) -- refusing to seed store files into an unrelated repo.
+  10  --code-root does not exist, or the code census failed.
+  11  --langs names a language this engine version's table does not know.
+  12  the code census proposes a language set but stdin is not a tty and
+      neither --langs nor --non-interactive was given.
+  13  the install-time code-reindex failed.
+  14  <claude-dir>/rules/memcontinuum.md already exists and was not
+      rendered by this installer (foreign or hand-authored) -- refused
+      before any mutation, never overwritten.
+  15  --adopt-only was given but --store is not an existing MemContinuum
+      store (this mode never creates one).
+  16  <claude-dir>/skills/memory-search/SKILL.md already exists and was
+      not rendered by this installer (foreign or hand-authored) -- refused
+      before any mutation, never overwritten, same as 14.
 USAGE
 }
 
@@ -591,6 +623,33 @@ if [ -f "$RULES_DEST" ]; then
     if [ "$RULES_DEST_FIRST_LINE" != "$RULES_IDENTITY_MARKER" ]; then
         fail "$RULES_DEST already exists and was not rendered by this installer (first line does not match the identity marker) -- refusing to overwrite a hand-authored or foreign rules file. Move it aside first if you want repo-init to render one here." 14
     fi
+fi
+
+# Ruling 52: same principle, same place, for the installed memory-search
+# skill copy -- refused BEFORE any mutation, not after the skill install
+# step's own `cp -f` below has already clobbered it. Unlike the rules file
+# this one used to have NO refusal of its own at all (memcontinuum-update.sh
+# could report a foreign copy as `skill-foreign` in its table, but repo-init
+# itself would still overwrite one if invoked directly -- exactly the path
+# `--add-lang`/`--never-ext` take, since they call this script directly
+# rather than through the updater's own skill-foreign gate). Identity is
+# `mc_skill_copy_is_ours` (mc-registry-lib.sh) -- the ONE predicate this
+# refusal and memcontinuum-update.sh's `skill` column both call, so the
+# installer and the re-render walk agree, by construction, on what "ours"
+# means here. The marker itself is read from SKILL_SRC's own frontmatter at
+# runtime (mc_skill_identity_marker), the same way RULES_IDENTITY_MARKER
+# above is read from the rules template -- never a literal hardcoded in
+# this file or the library: a renamed skill moves the marker everywhere
+# that reads it, rather than making every previously-installed copy read as
+# foreign the moment the template changes. Our own copy -- identity
+# matches, whatever its stamp -- is still overwritten below as always; only
+# a file that is not ours at all is refused.
+mc_skill_identity_marker "$ENGINE_ROOT" \
+    || fail "cannot read $SKILL_SRC (or its frontmatter carries no name: line) -- incomplete checkout" 3
+SKILL_IDENTITY_MARKER="$MC_SKILL_MARKER"
+SKILL_DEST="$CLAUDE_DIR/skills/memory-search/SKILL.md"
+if [ -f "$SKILL_DEST" ] && ! mc_skill_copy_is_ours "$SKILL_DEST" "$SKILL_IDENTITY_MARKER"; then
+    fail "$SKILL_DEST already exists and was not rendered by this installer (frontmatter does not carry \`$SKILL_IDENTITY_MARKER\`) -- refusing to overwrite a hand-authored or foreign skill copy. Move it aside first if you want repo-init to install one here." 16
 fi
 
 # --- code census + consent dialogue (Task 10, Anatomy M1) -----------------
@@ -1240,8 +1299,8 @@ if [ "$DRY_RUN" -eq 0 ]; then
     cp -f "$SKILL_SRC" "$CLAUDE_DIR/skills/memory-search/SKILL.md" || fail "could not copy SKILL.md"
     # D1: stamp the INSTALLED COPY only, right after the frontmatter's
     # closing "---" (never at byte 0 -- the skill loader needs the OPENING
-    # "---" to stay the very first line of the file).
-    SKILL_DEST="$CLAUDE_DIR/skills/memory-search/SKILL.md"
+    # "---" to stay the very first line of the file). SKILL_DEST is the same
+    # path the foreign-copy refusal above already checked.
     FM_END_LINE="$(grep -n '^---$' "$SKILL_DEST" | sed -n '2p' | cut -d: -f1)"
     if [ -n "$FM_END_LINE" ]; then
         SKILL_TMP="$SKILL_DEST.tmp-memcontinuum-stamp"

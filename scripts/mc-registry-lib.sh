@@ -507,6 +507,64 @@ mc_rules_identity_marker() {
     [ -n "$MC_RULES_MARKER" ]
 }
 
+# mc_skill_identity_marker ENGINE_ROOT
+#
+# Reads the identity marker for an installed memory-search SKILL.md copy out
+# of the template that defines it: the `name: ...` line inside
+# skills/memory-search/SKILL.md's OWN frontmatter (bounded by its own
+# closing `---` -- the same boundary rule mc_skill_copy_is_ours uses on the
+# installed copy, so a `name:` line appearing in the template's BODY is
+# never picked up). Sets MC_SKILL_MARKER (e.g. `name: memory-search`) and
+# returns 0; sets it empty and returns 1 when the template is not readable
+# or its frontmatter carries no `name:` line.
+#
+# Symmetric with mc_rules_identity_marker, and for the same reason: there is
+# exactly one place this string is written down, and it is the template --
+# never a literal hardcoded here or in a caller. A skill rename then moves
+# the marker everywhere that reads it, rather than making every
+# previously-installed copy read as foreign the moment the template changes
+# out from under a hardcoded copy of its old name.
+mc_skill_identity_marker() {
+    local tmpl="$1/skills/memory-search/SKILL.md" fm_end
+    MC_SKILL_MARKER=""
+    [ -f "$tmpl" ] || return 1
+    fm_end="$(grep -n '^---$' "$tmpl" | sed -n '2p' | cut -d: -f1)"
+    [ -n "$fm_end" ] || return 1
+    MC_SKILL_MARKER="$(sed -n "1,${fm_end}p" "$tmpl" | grep '^name:' | head -n 1)"
+    [ -n "$MC_SKILL_MARKER" ]
+}
+
+# mc_skill_copy_is_ours DEST MARKER
+#
+# True iff DEST (a path to an installed memory-search SKILL.md copy) carries
+# MARKER (the `name: ...` line mc_skill_identity_marker read from the
+# template, at runtime -- never a literal hardcoded here) inside its own
+# frontmatter. The same test repo-init.sh and memcontinuum-update.sh both
+# need, and used to each hardcode their own copy of. Unlike the rules file,
+# the skill copy's identity cannot be a fixed first line: the opening `---`
+# has to stay byte 0 for the skill loader (repo-init stamps right after the
+# frontmatter's CLOSING `---` instead), so identity here is "the frontmatter
+# carries MARKER" -- scanned only up to that closing `---`, never the whole
+# file, so a hand-authored file whose BODY happens to mention MARKER after
+# its own frontmatter does not read as ours.
+#
+# Sets MC_SKILL_FM_END to the 1-based line number of the closing `---` when
+# found (empty otherwise) -- the stamp comment sits on the line right after
+# it, and callers that need the stamp read it from there instead of
+# re-finding the boundary themselves. Returns 0 when DEST is ours, 1
+# otherwise (a missing file, no MARKER given, a file with no
+# two-`---`-line frontmatter, or one whose frontmatter names something
+# else).
+mc_skill_copy_is_ours() {
+    local dest="$1" marker="$2"
+    MC_SKILL_FM_END=""
+    [ -f "$dest" ] || return 1
+    [ -n "$marker" ] || return 1
+    MC_SKILL_FM_END="$(grep -n '^---$' "$dest" | sed -n '2p' | cut -d: -f1)"
+    [ -n "$MC_SKILL_FM_END" ] || return 1
+    sed -n "1,${MC_SKILL_FM_END}p" "$dest" | grep -Fqx -- "$marker"
+}
+
 # mc_render_fingerprint SCOPE ENGINE_ROOT   (SCOPE: repo | machine)
 #
 # The stamp every rendered artifact carries: 12 hex characters of a sha256

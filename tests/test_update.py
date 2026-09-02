@@ -140,7 +140,7 @@ class UpdateTestBase(unittest.TestCase):
         lines = [l for l in out.splitlines() if l.strip()]
         self.assertTrue(lines, out)
         header = lines[0].split("\t")
-        self.assertEqual(header, ["repo", "claude-dir", "stamped", "engine", "store-match", "rules", "action"])
+        self.assertEqual(header, ["repo", "claude-dir", "stamped", "engine", "store-match", "rules", "skill", "action"])
         return [dict(zip(header, l.split("\t"))) for l in lines[1:]]
 
 
@@ -289,6 +289,7 @@ class TestUpdateWalkStaleAndOk(UpdateTestBase):
         self.assertEqual(rows[0]["stamped"], engine_sha())
         self.assertEqual(rows[0]["store-match"], "yes")
         self.assertEqual(rows[0]["rules"], "ok")
+        self.assertEqual(rows[0]["skill"], "ok")
 
     def test_dry_run_is_the_default_and_writes_nothing(self):
         settings_before = self.settings_text()
@@ -369,6 +370,61 @@ class TestUpdateWalkStaleAndOk(UpdateTestBase):
         self.assertNotEqual(proc2.returncode, 0, proc2.stdout + proc2.stderr)
         self.assertIn("SKIPPED", proc2.stdout + proc2.stderr)
         self.assertEqual(rules_path.read_text(), "# hand-written, not ours\n")
+
+    def test_skill_missing_detected_and_fixed_by_apply(self):
+        """Ruling 51: the installed memory-search skill copy is checked the
+        same way the rules file is -- a deleted copy used to read as `ok`
+        and survive --apply untouched."""
+        skill_path = Path(self.claude_dir, "skills", "memory-search", "SKILL.md")
+        skill_path.unlink()
+        proc = run(UPDATE_SH, [], self.home)
+        rows = self.table_rows(proc.stdout)
+        self.assertEqual(rows[0]["skill"], "missing")
+        self.assertEqual(rows[0]["action"], "stale")
+
+        proc2 = run(UPDATE_SH, ["--apply"], self.home)
+        self.assertEqual(proc2.returncode, 0, proc2.stdout + proc2.stderr)
+        self.assertTrue(skill_path.is_file())
+        self.assertIn(f"<!-- memcontinuum-rendered: {engine_sha()} -->", skill_path.read_text())
+        # Re-walk: clean now.
+        proc3 = run(UPDATE_SH, [], self.home)
+        rows3 = self.table_rows(proc3.stdout)
+        self.assertEqual(rows3[0]["skill"], "ok")
+        self.assertEqual(rows3[0]["action"], "ok")
+
+    def test_skill_stale_detected_and_fixed_by_apply(self):
+        skill_path = Path(self.claude_dir, "skills", "memory-search", "SKILL.md")
+        text = skill_path.read_text().replace(
+            f"<!-- memcontinuum-rendered: {engine_sha()} -->",
+            "<!-- memcontinuum-rendered: deadbee -->",
+        )
+        self.assertNotEqual(text, skill_path.read_text(), "fixture did not find the stamp line")
+        skill_path.write_text(text)
+        proc = run(UPDATE_SH, [], self.home)
+        rows = self.table_rows(proc.stdout)
+        self.assertEqual(rows[0]["skill"], "stale")
+        self.assertEqual(rows[0]["action"], "stale")
+
+        proc2 = run(UPDATE_SH, ["--apply"], self.home)
+        self.assertEqual(proc2.returncode, 0, proc2.stdout + proc2.stderr)
+        self.assertIn(f"<!-- memcontinuum-rendered: {engine_sha()} -->", skill_path.read_text())
+
+    def test_skill_foreign_is_reported_and_apply_skips_it_without_crashing(self):
+        skill_path = Path(self.claude_dir, "skills", "memory-search", "SKILL.md")
+        foreign = "---\nname: not-memory-search\ndescription: hand-authored\n---\n\n# not ours\n"
+        skill_path.write_text(foreign)
+        proc = run(UPDATE_SH, [], self.home)
+        rows = self.table_rows(proc.stdout)
+        self.assertEqual(rows[0]["skill"], "foreign")
+        self.assertEqual(rows[0]["action"], "skill-foreign")
+
+        proc2 = run(UPDATE_SH, ["--apply"], self.home)
+        # --apply asked for this dir to be re-rendered and it was not: a skip
+        # is still work left undone, and the exit code has to say so.
+        self.assertNotEqual(proc2.returncode, 0, proc2.stdout + proc2.stderr)
+        self.assertIn("SKIPPED", proc2.stdout + proc2.stderr)
+        self.assertNotIn("applying:", proc2.stdout, proc2.stdout)
+        self.assertEqual(skill_path.read_text(), foreign)
 
     def test_missing_wiring_is_reported_as_no_wiring_and_never_auto_applied(self):
         Path(self.claude_dir, "settings.local.json").unlink()
@@ -507,6 +563,20 @@ class TestAddLangAndNeverExt(UpdateTestBase):
         proc = run(UPDATE_SH, ["--add-lang", "swift", "--repo", other], self.home)
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("no wired row", proc.stdout + proc.stderr)
+
+    def test_add_lang_refuses_via_repo_init_when_the_skill_copy_is_foreign(self):
+        """Ruling 52: --add-lang/--never-ext call repo-init.sh directly,
+        never through process_claude_dir/apply_claude_dir's own
+        skill-foreign gate -- this path's only protection against a foreign
+        skill copy is repo-init.sh's own refusal (exit 16)."""
+        skill_path = Path(self.claude_dir, "skills", "memory-search", "SKILL.md")
+        foreign = "---\nname: not-memory-search\ndescription: hand-authored\n---\n\n# not ours\n"
+        skill_path.write_text(foreign)
+        before = decisions_tsv(self.home).read_text()
+        proc = run(UPDATE_SH, ["--add-lang", "swift", "--repo", self.repo], self.home)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(skill_path.read_text(), foreign)
+        self.assertEqual(decisions_tsv(self.home).read_text(), before)
 
 
 class TestMachineFlag(UpdateTestBase):
@@ -894,6 +964,20 @@ class TestWalkExitCodesAndPrecedence(UpdateTestBase):
         self.assertEqual(rows[0]["action"], "rules-foreign", proc.stdout)
 
     @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_skill_foreign_outranks_stale(self):
+        """A foreign skill copy is never applied either -- belt and braces
+        with repo-init.sh's own refusal (test_repo_init.py), same as
+        rules-foreign."""
+        drifted = self.settings_text().replace(
+            f"MEMCONTINUUM_RENDERED={engine_sha()}", "MEMCONTINUUM_RENDERED=deadbee")
+        Path(self.claude_dir, "settings.local.json").write_text(drifted)
+        Path(self.claude_dir, "skills", "memory-search", "SKILL.md").write_text(
+            "---\nname: not-memory-search\ndescription: hand-authored\n---\n\n# not ours\n")
+        proc = run(UPDATE_SH, [], self.home)
+        rows = self.table_rows(proc.stdout)
+        self.assertEqual(rows[0]["action"], "skill-foreign", proc.stdout)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
     def test_apply_that_skips_never_calls_repo_init_for_that_dir(self):
         Path(self.claude_dir, "rules", "memcontinuum.md").write_text("# not ours\n")
         proc = run(UPDATE_SH, ["--apply"], self.home)
@@ -1123,6 +1207,65 @@ class TestRulesMarkerComesFromTheTemplate(unittest.TestCase):
         rows = [dict(zip(lines[0].split("\t"), l.split("\t"))) for l in lines[1:]]
         self.assertEqual(rows[0]["rules"], "ok", proc.stdout)
         self.assertNotEqual(rows[0]["rules"], "foreign", proc.stdout)
+
+
+class TestSkillMarkerComesFromTheTemplate(unittest.TestCase):
+    """Ruling 52 round 3: the installed skill copy's identity marker is read
+    from skills/memory-search/SKILL.md's own frontmatter at runtime
+    (mc_skill_identity_marker) -- never a literal hardcoded in the library
+    or a caller, the same principle test_a_changed_template_marker_still_
+    round_trips proves for the rules file. A hardcoded `name: memory-search`
+    would make repo-init's OWN freshly-rendered copy read as foreign the
+    moment the template's name changes -- exactly the failure this predicate
+    exists to avoid repeating for the skill copy."""
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_a_changed_template_marker_still_round_trips(self):
+        """Change the template's `name:` line in a copied engine and the
+        whole chain -- install, the updater's skill state -- follows it,
+        with no source edit anywhere."""
+        tmp = tempfile.mkdtemp(prefix="memcontinuum-skill-marker-test-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        engine = Path(tmp) / "engine"
+        shutil.copytree(TOOLS_DIR, engine, symlinks=True, ignore=shutil.ignore_patterns(
+            ".git", "fixtures", "tests", "__pycache__", ".venv"))
+        tmpl = engine / "skills" / "memory-search" / "SKILL.md"
+        text = tmpl.read_text()
+        new_text = text.replace("name: memory-search", "name: memory-search-v2", 1)
+        self.assertNotEqual(text, new_text, "fixture did not find the name: line to change")
+        tmpl.write_text(new_text)
+
+        home = str(Path(tmp) / "home")
+        os.makedirs(home, exist_ok=True)
+        repo = git_repo(str(Path(tmp) / "repo"))
+        store = str(Path(tmp) / "store")
+        claude_dir = str(Path(repo) / ".claude")
+        proc = run(engine / "scripts" / "repo-init.sh",
+                   ["--project", "mk", "--store", store, "--claude-dir", claude_dir,
+                    "--non-interactive"], home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        skill = Path(claude_dir, "skills", "memory-search", "SKILL.md").read_text()
+        self.assertIn("name: memory-search-v2", skill, skill[:200])
+
+        # Re-run repo-init.sh against its own output -- proves the REFUSAL
+        # gate (not just the updater's report) follows the changed template:
+        # a hardcoded old marker would refuse to overwrite its own fresh
+        # copy here (exit 16), since the file no longer carries the literal
+        # it was checking for.
+        proc = run(engine / "scripts" / "repo-init.sh",
+                   ["--project", "mk", "--store", store, "--claude-dir", claude_dir,
+                    "--non-interactive"], home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+        proc = run(engine / "scripts" / "memcontinuum-decide.sh",
+                   ["wired", "--repo", repo, "--store", store, "--project", "mk",
+                    "--claude-dir", claude_dir], home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        proc = run(engine / "scripts" / "memcontinuum-update.sh", [], home)
+        lines = [l for l in proc.stdout.splitlines() if l.strip()]
+        rows = [dict(zip(lines[0].split("\t"), l.split("\t"))) for l in lines[1:]]
+        self.assertEqual(rows[0]["skill"], "ok", proc.stdout)
+        self.assertNotEqual(rows[0]["skill"], "foreign", proc.stdout)
 
 
 class TestPartiallyRenderedLanguagesAreReported(unittest.TestCase):
@@ -1745,8 +1888,15 @@ class TestAnUnknownFingerprintNeverComparesEqual(unittest.TestCase):
 
     def _crippled_engine(self, keep_repo_inputs=1):
         """A checkout mc_render_fingerprint cannot honestly fingerprint (fewer
-        than three render inputs), but that update.sh can still run: the rules
-        template it reads the identity marker from stays."""
+        than three repo-scope render inputs), but that update.sh can still
+        run: the rules template AND the memory-search skill template it reads
+        its two identity markers from (mc_rules_identity_marker,
+        mc_skill_identity_marker -- both required at startup, machine mode
+        included) both stay. scripts/repo-init.sh is removed instead --
+        unneeded for a plain, non---apply walk, and one of the four repo-scope
+        inputs mc_render_fingerprint counts -- so the surviving count (the one
+        template plus the skill template) stays at two, still under the
+        three-input floor."""
         engine = Path(self.tmp) / "engine"
         shutil.copytree(TOOLS_DIR, engine, symlinks=True,
                         ignore=shutil.ignore_patterns(
@@ -1755,7 +1905,7 @@ class TestAnUnknownFingerprintNeverComparesEqual(unittest.TestCase):
             if tmpl.name != "memcontinuum-rules.md":
                 tmpl.unlink()
         (engine / "scripts" / "mc_settings_merge.py").unlink()
-        shutil.rmtree(engine / "skills" / "memory-search")
+        (engine / "scripts" / "repo-init.sh").unlink()
         shutil.rmtree(engine / "skills" / "memcontinuum")
         return engine
 
