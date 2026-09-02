@@ -120,12 +120,16 @@ path below. Run the driven flow instead:
    flag for it, so a driven install cannot offer it; tell the human to
    re-run `repo-init.sh` directly at a real terminal if they want it.)
 3. Run `repo-init.sh` with the human's answer turned into a flag — never
-   bare:
+   bare, and the flag goes on the `--dry-run` preview line too (the census
+   block, unlike the existence check, runs under `--dry-run` as well — a
+   preview command with no tty and no bypass flag hits the same `[ -t 0 ]`
+   guard and exit 12 that this whole driven flow exists to avoid):
    ```bash
-   cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME --code-root DIR --dry-run
-   cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME --code-root DIR \
-       --langs "chosen,langs"    # human chose specific languages, or "enable all detected"
+   # human chose specific languages, or "enable all detected":
+   cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME --code-root DIR --langs "chosen,langs" --dry-run
+   cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME --code-root DIR --langs "chosen,langs"
    # -- or, for "skip":
+   cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME --code-root DIR --non-interactive --dry-run
    cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME --code-root DIR --non-interactive
    ```
 

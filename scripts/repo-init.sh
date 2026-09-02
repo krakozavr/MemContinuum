@@ -105,8 +105,12 @@ Usage: repo-init.sh --project NAME [--store DIR] [--code-root DIR ...]
   --non-interactive   with no --langs, skip the consent dialogue entirely --
                       language-less wiring (no --lang on the initial
                       code-reindex, which is skipped; the newfile-nudge hook
-                      line still gets MEMCONTINUUM_KNOWN_EXTS, but no
-                      MEMCONTINUUM_LANG_EXTS). For scripted/CI runs.
+                      line still gets MEMCONTINUUM_KNOWN_EXTS, and an
+                      EXPLICITLY EMPTY MEMCONTINUUM_LANG_EXTS='' -- rendered,
+                      never omitted, per Ruling 6: a set-but-empty value
+                      matches nothing, distinct from an un-re-rendered
+                      legacy line where the var is unset). For scripted/CI
+                      runs.
   --dry-run           print everything this script would do; write nothing
                       (except --bootstrap-venv's venv, see above).
   --force             allow --store to sit inside another git repo's
