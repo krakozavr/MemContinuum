@@ -1388,13 +1388,13 @@ class TestMachineLayerIsComparedSeparately(unittest.TestCase):
         self._setup()
         line = self._machine_line()
         self.assertIsNotNone(line)
-        self.assertIn("ok", line, line)
+        self.assertTrue(line.endswith("-- ok"), line)
 
         setup = self.engine / "memcontinuum-setup.sh"
         setup.write_text(setup.read_text() + "\n# a machine-layer change\n")
         line = self._machine_line()
         self.assertIsNotNone(line)
-        self.assertIn("stale", line, line)
+        self.assertTrue(line.endswith("-- stale"), line)
 
     @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
     def test_a_template_edit_flips_the_repos_not_the_machine(self):
@@ -1424,7 +1424,8 @@ class TestMachineLayerIsComparedSeparately(unittest.TestCase):
         act, out = row_action()
         self.assertEqual(act, "ok",
                          "a machine-layer change must not mark per-repo rows stale\n" + out)
-        self.assertIn("stale", self._machine_line())
+        self.assertTrue(self._machine_line().endswith("-- stale"),
+                        self._machine_line())
 
         tmpl = self.engine / "templates" / "memcontinuum-rules.md"
         tmpl.write_text(tmpl.read_text() + "\nA new paragraph.\n")
@@ -1811,7 +1812,7 @@ class TestAnUnknownFingerprintNeverComparesEqual(unittest.TestCase):
         line = [l for l in proc.stdout.splitlines() if l.startswith("machine:")]
         self.assertTrue(line, proc.stdout)
         self.assertIn("unknown", line[0], line[0])
-        self.assertIn("stale", line[0], line[0])
+        self.assertTrue(line[0].endswith("-- stale"), line[0])
 
     @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
     def test_state_sh_still_names_the_drift_when_both_sides_are_unknown(self):
@@ -1922,7 +1923,7 @@ class TestMachineClaudeDirIsRecordedAndReused(unittest.TestCase):
         line, proc = self._machine_line()
         self.assertIsNotNone(line, proc.stdout)
         self.assertIn(self.custom, line, line)
-        self.assertIn("ok", line, line)
+        self.assertTrue(line.endswith("-- ok"), line)
 
     @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
     def test_apply_refreshes_that_dir_in_place_and_renders_no_second_layer(self):
@@ -1930,7 +1931,7 @@ class TestMachineClaudeDirIsRecordedAndReused(unittest.TestCase):
         setup = self.engine / "memcontinuum-setup.sh"
         setup.write_text(setup.read_text() + "\n# a machine-layer change\n")
         line, _ = self._machine_line()
-        self.assertIn("stale", line, line)
+        self.assertTrue(line.endswith("-- stale"), line)
 
         proc = run(self.engine / "scripts" / "memcontinuum-update.sh",
                    ["--apply", "--machine"], self.home)
@@ -1940,7 +1941,7 @@ class TestMachineClaudeDirIsRecordedAndReused(unittest.TestCase):
         self.assertIn("MEMCONTINUUM_RENDERED=%s " % engine_sha(self.engine, "machine"),
                       Path(self.custom, "settings.json").read_text())
         line, _ = self._machine_line()
-        self.assertIn("ok", line, line)
+        self.assertTrue(line.endswith("-- ok"), line)
 
     @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
     def test_the_default_dir_is_still_the_fallback_when_nothing_is_recorded(self):
@@ -1953,7 +1954,7 @@ class TestMachineClaudeDirIsRecordedAndReused(unittest.TestCase):
             if "MEMCONTINUUM_MACHINE_CLAUDE_DIR" not in l) + "\n")
         line, proc = self._machine_line()
         self.assertIsNotNone(line, proc.stdout)
-        self.assertIn("ok", line, line)
+        self.assertTrue(line.endswith("-- ok"), line)
 
 
 class TestHelp(unittest.TestCase):
