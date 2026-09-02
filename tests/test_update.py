@@ -1209,6 +1209,65 @@ class TestRulesMarkerComesFromTheTemplate(unittest.TestCase):
         self.assertNotEqual(rows[0]["rules"], "foreign", proc.stdout)
 
 
+class TestSkillMarkerComesFromTheTemplate(unittest.TestCase):
+    """Ruling 52 round 3: the installed skill copy's identity marker is read
+    from skills/memory-search/SKILL.md's own frontmatter at runtime
+    (mc_skill_identity_marker) -- never a literal hardcoded in the library
+    or a caller, the same principle test_a_changed_template_marker_still_
+    round_trips proves for the rules file. A hardcoded `name: memory-search`
+    would make repo-init's OWN freshly-rendered copy read as foreign the
+    moment the template's name changes -- exactly the failure this predicate
+    exists to avoid repeating for the skill copy."""
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_a_changed_template_marker_still_round_trips(self):
+        """Change the template's `name:` line in a copied engine and the
+        whole chain -- install, the updater's skill state -- follows it,
+        with no source edit anywhere."""
+        tmp = tempfile.mkdtemp(prefix="memcontinuum-skill-marker-test-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        engine = Path(tmp) / "engine"
+        shutil.copytree(TOOLS_DIR, engine, symlinks=True, ignore=shutil.ignore_patterns(
+            ".git", "fixtures", "tests", "__pycache__", ".venv"))
+        tmpl = engine / "skills" / "memory-search" / "SKILL.md"
+        text = tmpl.read_text()
+        new_text = text.replace("name: memory-search", "name: memory-search-v2", 1)
+        self.assertNotEqual(text, new_text, "fixture did not find the name: line to change")
+        tmpl.write_text(new_text)
+
+        home = str(Path(tmp) / "home")
+        os.makedirs(home, exist_ok=True)
+        repo = git_repo(str(Path(tmp) / "repo"))
+        store = str(Path(tmp) / "store")
+        claude_dir = str(Path(repo) / ".claude")
+        proc = run(engine / "scripts" / "repo-init.sh",
+                   ["--project", "mk", "--store", store, "--claude-dir", claude_dir,
+                    "--non-interactive"], home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        skill = Path(claude_dir, "skills", "memory-search", "SKILL.md").read_text()
+        self.assertIn("name: memory-search-v2", skill, skill[:200])
+
+        # Re-run repo-init.sh against its own output -- proves the REFUSAL
+        # gate (not just the updater's report) follows the changed template:
+        # a hardcoded old marker would refuse to overwrite its own fresh
+        # copy here (exit 16), since the file no longer carries the literal
+        # it was checking for.
+        proc = run(engine / "scripts" / "repo-init.sh",
+                   ["--project", "mk", "--store", store, "--claude-dir", claude_dir,
+                    "--non-interactive"], home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+        proc = run(engine / "scripts" / "memcontinuum-decide.sh",
+                   ["wired", "--repo", repo, "--store", store, "--project", "mk",
+                    "--claude-dir", claude_dir], home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        proc = run(engine / "scripts" / "memcontinuum-update.sh", [], home)
+        lines = [l for l in proc.stdout.splitlines() if l.strip()]
+        rows = [dict(zip(lines[0].split("\t"), l.split("\t"))) for l in lines[1:]]
+        self.assertEqual(rows[0]["skill"], "ok", proc.stdout)
+        self.assertNotEqual(rows[0]["skill"], "foreign", proc.stdout)
+
+
 class TestPartiallyRenderedLanguagesAreReported(unittest.TestCase):
     """Recovering languages from extension globs: a language counts as
     rendered only when ALL of its extensions are on the line. One that is
@@ -1829,8 +1888,15 @@ class TestAnUnknownFingerprintNeverComparesEqual(unittest.TestCase):
 
     def _crippled_engine(self, keep_repo_inputs=1):
         """A checkout mc_render_fingerprint cannot honestly fingerprint (fewer
-        than three render inputs), but that update.sh can still run: the rules
-        template it reads the identity marker from stays."""
+        than three repo-scope render inputs), but that update.sh can still
+        run: the rules template AND the memory-search skill template it reads
+        its two identity markers from (mc_rules_identity_marker,
+        mc_skill_identity_marker -- both required at startup, machine mode
+        included) both stay. scripts/repo-init.sh is removed instead --
+        unneeded for a plain, non---apply walk, and one of the four repo-scope
+        inputs mc_render_fingerprint counts -- so the surviving count (the one
+        template plus the skill template) stays at two, still under the
+        three-input floor."""
         engine = Path(self.tmp) / "engine"
         shutil.copytree(TOOLS_DIR, engine, symlinks=True,
                         ignore=shutil.ignore_patterns(
@@ -1839,7 +1905,7 @@ class TestAnUnknownFingerprintNeverComparesEqual(unittest.TestCase):
             if tmpl.name != "memcontinuum-rules.md":
                 tmpl.unlink()
         (engine / "scripts" / "mc_settings_merge.py").unlink()
-        shutil.rmtree(engine / "skills" / "memory-search")
+        (engine / "scripts" / "repo-init.sh").unlink()
         shutil.rmtree(engine / "skills" / "memcontinuum")
         return engine
 

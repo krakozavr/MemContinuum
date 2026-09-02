@@ -267,6 +267,15 @@ mc_rules_identity_marker "$ENGINE_ROOT" || {
 }
 RULES_IDENTITY_MARKER="$MC_RULES_MARKER"
 
+# Same idea, for the installed memory-search skill copy (mc_skill_identity_marker):
+# repo-init.sh's own foreign-copy refusal reads this identity from the same
+# place, at runtime, rather than either side hardcoding a copy of it.
+mc_skill_identity_marker "$ENGINE_ROOT" || {
+    echo "cannot read $ENGINE_ROOT/skills/memory-search/SKILL.md (or its frontmatter carries no name: line) -- incomplete checkout" >&2
+    exit 1
+}
+SKILL_IDENTITY_MARKER="$MC_SKILL_MARKER"
+
 APPLY=0
 # Set only when --dry-run is literally typed -- distinct from APPLY's
 # default-0, which the WALK mode reads as "no --apply given yet, preview".
@@ -522,11 +531,13 @@ mc_update_rules_state() {
 
 # mc_update_skill_state CLAUDE_DIR -- sets MC_SKILL_STATE to one of
 # ok/stale/missing/foreign for CLAUDE_DIR/skills/memory-search/SKILL.md.
-# Identity is mc_skill_copy_is_ours (mc-registry-lib.sh) -- the same
-# predicate scripts/repo-init.sh's own foreign-copy refusal calls, rather
-# than each hardcoding its own copy of "is this ours". Unlike the rules
-# file, that identity cannot be a fixed first line -- the opening "---" has
-# to stay byte 0 for the skill loader, so repo-init stamps right after the
+# Identity is mc_skill_copy_is_ours against SKILL_IDENTITY_MARKER
+# (mc-registry-lib.sh; the marker read at runtime by mc_skill_identity_marker
+# above, never a literal) -- the same predicate and the same marker
+# scripts/repo-init.sh's own foreign-copy refusal uses, rather than either
+# side hardcoding its own copy of "is this ours". Unlike the rules file,
+# that identity cannot be a fixed first line -- the opening "---" has to
+# stay byte 0 for the skill loader, so repo-init stamps right after the
 # frontmatter's CLOSING "---" instead, and the predicate hands that boundary
 # back as MC_SKILL_FM_END so this function does not re-find it.
 #
@@ -539,7 +550,7 @@ mc_update_rules_state() {
 # gating -- also closed now that repo-init.sh checks for itself).
 mc_update_skill_state() {
     local dest="$1/skills/memory-search/SKILL.md" is_foreign=1 stamp_line=""
-    if mc_skill_copy_is_ours "$dest"; then
+    if mc_skill_copy_is_ours "$dest" "$SKILL_IDENTITY_MARKER"; then
         is_foreign=0
         stamp_line="$(sed -n "$((MC_SKILL_FM_END + 1))p" "$dest")"
     fi

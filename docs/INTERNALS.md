@@ -201,7 +201,11 @@ existing file, and the write itself is a same-directory tmp file plus
 ## repo-init guards
 
 Each of these refuses rather than guesses, with its own exit code, because the
-cost of guessing wrong is writing into somebody else's repository.
+cost of guessing wrong is writing into somebody else's repository. The
+complete exit-code list (all sixteen, including the rules-file and skill-copy
+foreign-file refusals below) is `repo-init.sh --help`'s — the canonical,
+user-facing one; what follows here is the subset whose reasoning needs more
+room than a help line.
 
 - **Explicit `--store` with no `--claude-dir` is a hard error** (exit 2). An
   explicit store may legitimately be wired from any cwd — a test harness, a
@@ -379,12 +383,15 @@ before any mutation, when `<claude-dir>/skills/memory-search/SKILL.md`
 already exists and is not this tool's own. Identity here cannot be
 a fixed first line the way the rules file's is (the opening `---` has to stay
 byte 0 for the skill loader), so it is instead "the frontmatter carries a
-`name: memory-search` line", checked by `mc_skill_copy_is_ours`
-(`mc-registry-lib.sh`) — the one predicate `repo-init.sh`'s refusal and
-`memcontinuum-update.sh`'s `skill` column (below) both call, rather than each
-hardcoding its own copy of the check. A copy that already carries that
-identity is overwritten on every re-run regardless of its stamp, same as the
-rules file.
+`name: ...` line" — read from `skills/memory-search/SKILL.md`'s own
+frontmatter at runtime (`mc_skill_identity_marker`), the same way
+`mc_rules_identity_marker` reads the rules file's marker from its template,
+never a literal hardcoded in the installer or the library — and checked by
+`mc_skill_copy_is_ours` (`mc-registry-lib.sh`), the one predicate
+`repo-init.sh`'s refusal and `memcontinuum-update.sh`'s `skill` column
+(below) both call against that marker, rather than each hardcoding its own
+copy of the check. A copy that already carries that identity is overwritten
+on every re-run regardless of its stamp, same as the rules file.
 
 `scripts/memcontinuum-update.sh` walks every `wired` row and, for each
 claude-dir the row lists, compares four things against the engine right now:
@@ -411,12 +418,14 @@ The `rules` and `skill` columns share one determination helper
 Identity detection differs in shape: the rules file's identity marker is a
 literal, fixed first line (`mc_rules_identity_marker`, from the template that
 defines it); the skill copy's opening line has to stay a bare `---` for the
-skill loader, so its identity is instead "the frontmatter contains a
-`name: memory-search` line" — one shared predicate, `mc_skill_copy_is_ours`
-(`mc-registry-lib.sh`), used here AND by `repo-init.sh`'s own refusal (above)
-rather than each hardcoding its own copy of the check — and its stamp sits
-right after the frontmatter's *closing* `---` rather than at a fixed line
-number. A missing or stale skill copy reports as the same generic `stale`
+skill loader, so its identity is instead "the frontmatter contains the
+`name: ...` line `mc_skill_identity_marker` reads from
+`skills/memory-search/SKILL.md`'s own frontmatter" — one shared predicate,
+`mc_skill_copy_is_ours` (`mc-registry-lib.sh`), used here AND by
+`repo-init.sh`'s own refusal (above) against that same runtime-read marker,
+rather than each hardcoding its own copy of the check or the marker text —
+and its stamp sits right after the frontmatter's *closing* `---` rather than
+at a fixed line number. A missing or stale skill copy reports as the same generic `stale`
 action the hook-stamp check already uses (not a `skill-missing`/`skill-stale`
 action of its own, unlike the rules file) — it is the same kind of drift, not
 a new question. A *foreign* skill copy reports `skill-foreign` and is refused
@@ -532,8 +541,9 @@ Actions that are deliberately never auto-applied:
   rules file (see above), so calling it would just fail loudly for a reason
   already named in the table. Reported; skipped.
 - **`skill-foreign`** — the installed `memory-search` skill copy's frontmatter
-  has no `name: memory-search` line (`mc_skill_copy_is_ours`), so it was not
-  rendered by this installer. Same relationship to `repo-init.sh` as
+  does not carry the identity marker (`mc_skill_copy_is_ours`, checked
+  against `mc_skill_identity_marker`'s runtime read of the template), so it
+  was not rendered by this installer. Same relationship to `repo-init.sh` as
   `rules-foreign`: `repo-init.sh` itself refuses to overwrite it (exit 16,
   same identity check), so calling it would just fail loudly for a reason
   already named in the table. Reported; skipped.
