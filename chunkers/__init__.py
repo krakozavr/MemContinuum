@@ -20,7 +20,7 @@ COMPOUND_EXCLUDES = {".blade.php", ".d.ts", ".min.js"}
 
 LANGUAGE_TABLE = {
     "swift": {"backend": "native", "module": "chunkers.swift",
-              "extensions": (".swift",), "shebangs": (), "impl_version": "2",
+              "extensions": (".swift",), "shebangs": (), "impl_version": "3",
               "skip_dirs": frozenset({"Tests", "Resources", ".build"})},
     "python": {"backend": "native", "module": "chunkers.python_ast",
                "extensions": (".py",), "shebangs": ("python", "python3"),

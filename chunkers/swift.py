@@ -543,22 +543,63 @@ def _doc_comment_before(text: str, kstart: int) -> str:
 
 
 # Raw-keyword -> frozen chunkers.KINDS vocabulary (Task 12, Anatomy M1
-# milestone): `func` is "method" when `chain` (its enclosing-type stack,
-# already computed by _extract_decls's enclosing_chain for qualification)
-# is non-empty, else top-level "function" -- the ONLY kind that depends on
-# nesting. `init` is always "constructor" (Swift has no free-standing
-# init), `subscript` and computed `var` are always "accessor" regardless of
-# nesting level -- e.g. GapResyncModifiers.swift's top-level `afterVarGap`
-# (var) and top-level `subscript` both map to "accessor" with an EMPTY
-# chain, same as any type-member var/subscript would; nesting only ever
-# changes func's function/method split.
+# milestone; refined by Ruling 8's fix round 1). `func` is "method" when
+# its IMMEDIATE lexical parent is a type (chain non-empty AND nothing
+# func-like sits closer), else "function" -- covering both the top-level
+# case (no chain at all) and a func declared directly inside another
+# func/init/subscript/var body (a local function, e.g. `class Foo { func
+# outer(){ func inner(){} } }`'s `inner`): a local function is never
+# callable on the type, so "method" would be a false claim there even
+# though a type still encloses it further out -- see
+# _nearest_enclosing_kind, which walks the SAME raw_types/raw_chunks
+# proximity data `chain` is built from, just also considering raw_chunks
+# entries as possible (tighter) enclosers. `init` is always "constructor"
+# (Swift has no free-standing init), `subscript` and computed `var` are
+# always "accessor" regardless of nesting level -- e.g.
+# GapResyncModifiers.swift's top-level `afterVarGap` (var) and top-level
+# `subscript` both map to "accessor" with an EMPTY chain, same as any
+# type-member var/subscript would; nesting only ever changes func's
+# function/method split, and only ever via its IMMEDIATE parent, not the
+# full chain.
 _RAW_KIND_MAP = {"init": "constructor", "subscript": "accessor", "var": "accessor"}
 
 
-def _map_kind(kw: str, chain: list) -> str:
+def _map_kind(kw: str, chain: list, immediate_parent_is_type: bool) -> str:
     if kw == "func":
-        return "method" if chain else "function"
+        return "method" if (chain and immediate_parent_is_type) else "function"
     return _RAW_KIND_MAP[kw]
+
+
+def _nearest_enclosing_is_type(pos: int, raw_types: list, raw_chunks: list, self_idx: int) -> bool:
+    """Whether the TIGHTEST span in raw_types/raw_chunks containing `pos`
+    is a type (raw_types entry) rather than a func-like declaration (any
+    raw_chunks entry other than the chunk at `self_idx` itself) -- i.e.
+    whether `pos`'s immediate lexical parent is a type. `raw_types` tuples
+    are (name, kstart, body_open, body_close); `raw_chunks` tuples are
+    (kw, name, kstart, body_open, body_close) -- same containment test
+    (kstart < pos < body_close) as `enclosing_chain` above, just extended
+    to also weigh raw_chunks spans so a func nested inside another func's
+    body (never itself a type) is recognized even though a type may still
+    enclose both further out. Ties can't happen: two declarations can
+    never share the exact same (kstart, body_close) span. True (type, or
+    nothing encloses `pos` at all -- vacuously "not inside a function")
+    is the safe default so non-func kinds (which never call this with a
+    real answer they'd act on) and truly top-level funcs are unaffected."""
+    best_span = None
+    best_is_type = True
+    for _name, kstart, _body_open, body_close in raw_types:
+        if kstart < pos < body_close:
+            span = body_close - kstart
+            if best_span is None or span < best_span:
+                best_span, best_is_type = span, True
+    for idx, (_kw2, _name2, kstart2, _body_open2, body_close2) in enumerate(raw_chunks):
+        if idx == self_idx:
+            continue
+        if kstart2 < pos < body_close2:
+            span = body_close2 - kstart2
+            if best_span is None or span < best_span:
+                best_span, best_is_type = span, False
+    return best_is_type
 
 
 def _extract_decls(text: str, mask: str, match_dict: dict):
@@ -629,8 +670,9 @@ def _extract_decls(text: str, mask: str, match_dict: dict):
         return [t[0] for t in containing if t[0]]
 
     out = []
-    for kw, name, kstart, body_open, body_close in raw_chunks:
+    for self_idx, (kw, name, kstart, body_open, body_close) in enumerate(raw_chunks):
         chain = enclosing_chain(kstart)
+        immediate_parent_is_type = _nearest_enclosing_is_type(kstart, raw_types, raw_chunks, self_idx)
         qualified = ".".join(chain + [name]) if chain else name
         sig = _signature_text(text, kstart, body_open)
         doc = _doc_comment_before(text, kstart)
@@ -638,7 +680,7 @@ def _extract_decls(text: str, mask: str, match_dict: dict):
         end_line = text.count("\n", 0, body_close) + 1
         out.append(
             {
-                "kind": _map_kind(kw, chain),
+                "kind": _map_kind(kw, chain, immediate_parent_is_type),
                 "symbol": name,
                 "qualified_name": qualified,
                 "signature": sig,

@@ -77,6 +77,60 @@ class TestRegistry(unittest.TestCase):
         self.assertGreaterEqual(len(python_kinds), 2, python_kinds)
 
 
+class TestNestedFunctionImmediateParentKind(unittest.TestCase):
+    """Ruling 8 (fix round 1 on Task 12, Anatomy M1 milestone): kind
+    semantics are uniform across chunkers -- a function whose IMMEDIATE
+    lexical parent is a function/method is kind "function" in every
+    language, matching Python's rule (chunkers/python_ast.py's `_kind_for`
+    looks at `parent_is_class`, the immediate parent only, not the full
+    enclosing chain). Swift's original Task 12 mapping used the full
+    enclosing-TYPE chain instead, so a func nested directly inside a
+    method's body (never itself callable on the type -- a local function)
+    was wrongly reported as "method" whenever some type enclosed the pair
+    further out. Inline source, not a fixtures/code/*.swift file: adding
+    a fixture there would pull this case into
+    TestSwiftExtractionGolden's whole-corpus golden, which Ruling 8
+    requires to stay byte-identical (no existing fixture has a func
+    nested in a func body)."""
+
+    NESTED_IN_METHOD = """
+    class Foo {
+        func outer() -> Int {
+            func inner() -> Int { return 1 }
+            return inner()
+        }
+    }
+    """
+
+    NESTED_IN_TOP_LEVEL_FUNC = """
+    func topOuter() -> Int {
+        func topInner() -> Int { return 2 }
+        return topInner()
+    }
+    """
+
+    @staticmethod
+    def _by_qualified_name(text):
+        swift = chunkers.get_chunker("swift")
+        result = swift.chunk_file(text, "inline.swift")
+        return {c["qualified_name"]: c["kind"] for c in result.chunks}
+
+    def test_func_nested_in_a_method_body_is_function_not_method(self):
+        by_name = self._by_qualified_name(self.NESTED_IN_METHOD)
+        # The outer method itself: immediate parent IS the type -> method.
+        self.assertEqual(by_name["Foo.outer"], "method")
+        # The nested func: immediate parent is outer()'s OWN body, not
+        # Foo directly -- never callable on Foo, so "function", even
+        # though Foo still encloses it further out and its qualified_name
+        # (unaffected by this ruling) keeps the "Foo.inner" form.
+        self.assertEqual(by_name["Foo.inner"], "function")
+
+    def test_func_nested_in_a_top_level_func_body_is_function(self):
+        by_name = self._by_qualified_name(self.NESTED_IN_TOP_LEVEL_FUNC)
+        self.assertEqual(by_name["topOuter"], "function")
+        self.assertEqual(by_name["topInner"], "function")
+
+
 def _dump_chunks(conn):
     rows = conn.execute(
         "SELECT path, lang, kind, symbol, qualified_name, signature, doc, start_line, end_line "
@@ -182,17 +236,23 @@ class TestImplVersionBumpForcesSwiftRechunk(unittest.TestCase):
             stamp = conn.execute(
                 "SELECT chunker_version FROM file_sha WHERE path=?", ("NestedTypes.swift",)
             ).fetchone()
-            kinds_rows = conn.execute(
-                "SELECT kind FROM chunks WHERE path=?", ("NestedTypes.swift",)
+            kind_rows = conn.execute(
+                "SELECT qualified_name, kind FROM chunks WHERE path=?", ("NestedTypes.swift",)
             ).fetchall()
             conn.close()
             self.assertEqual(stamp["chunker_version"], new_chunker_version)
-            self.assertGreater(len(kinds_rows), 0)
-            for row in kinds_rows:
-                # The whole point: no raw Swift keyword ("func"/"init"/
-                # "subscript"/"var") survives the re-chunk -- only the
-                # frozen chunkers.KINDS vocabulary.
-                self.assertIn(row["kind"], chunkers.KINDS)
+            # The whole point: no raw Swift keyword ("func") survives the
+            # re-chunk. An exact-dict comparison (not just "each kind is
+            # SOME chunkers.KINDS member", which even a stray leftover raw
+            # value could accidentally satisfy if KINDS itself were ever
+            # misdefined) pins every one of NestedTypes.swift's three
+            # methods to its precise new-taxonomy kind.
+            by_qname = {r["qualified_name"]: r["kind"] for r in kind_rows}
+            self.assertEqual(by_qname, {
+                "Outer.Inner.innerFunc": "method",
+                "Outer.outerFunc": "method",
+                "Outer.extFunc": "method",
+            })
 
 
 def _recall_tuples(chunks):
