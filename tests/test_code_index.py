@@ -639,41 +639,43 @@ class TestPerLanguageSkipDirs(unittest.TestCase):
             conn.close()
             self.assertFalse(any("__pycache__" in Path(p).parts for p in paths))
 
-    def test_stray_lang_with_no_language_table_row_does_not_crash(self):
-        """A --lang value naming a language outside LANGUAGE_TABLE (e.g. a
-        typo, or a language the engine doesn't chunk yet) must not crash
-        the directory-pruning union either -- same "fail open, match zero
-        files, silently" tolerance cmd_code_reindex's per-file dispatch
-        already documents (Task 3 comment) and the pre-Task-7 README used
-        to promise. Mirrors TestUnsupportedExtensionCensus's .rs shape."""
+    def test_stray_lang_with_no_language_table_row_is_rejected_not_ignored(self):
+        """SUPERSEDED CONTRACT (C1/C2, final fix wave). This test used to
+        assert that a --lang value outside LANGUAGE_TABLE was tolerated
+        silently (rc 0, zero files matched). The Codex gate ruled that
+        wrong: a typo'd language is a typo, and "matched nothing, said
+        nothing" is exactly the silent blind spot this milestone exists to
+        close. code-reindex now validates every resolved language name and
+        fails loudly instead -- see TestCodeReindexLangValidation for the
+        full contract; this case is kept here because the directory-pruning
+        code is what used to have to tolerate it."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "code"
             root.mkdir()
             shutil.copy(FIXTURES / "NestedTypes.swift", root / "NestedTypes.swift")
             db = Path(td) / "idx-code.sqlite"
 
-            rc = code_reindex(root, db, no_embed=True, lang="swift,ts")
-            self.assertEqual(rc, 0)
-
-            conn = memidx.open_code_db(db)
-            paths = {r["path"] for r in conn.execute("SELECT DISTINCT path FROM chunks")}
-            conn.close()
-            self.assertIn("NestedTypes.swift", paths)
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf):
+                rc = code_reindex(root, db, no_embed=True, lang="swift,ts")
+            self.assertNotEqual(rc, 0)
+            self.assertIn("ts", err_buf.getvalue())
 
 
-class TestSkipDirUnionRule(unittest.TestCase):
-    """Task 7 brief Step 1(b), deliberately-resolved design note: directory
-    pruning for a walk consults the UNION of the wired langs' skip_dirs,
-    applied ONCE for the whole walk -- a pruned dir is pruned for ALL
-    wired langs, even one whose own skip_dirs wouldn't have pruned it
-    standalone (accepted trade-off, documented here per the brief). Only
-    AFTER that union prune does per-file classification (extension via
-    lang_for_path) decide what gets chunked. Concretely: swift's skip_dirs
-    include "Tests"; when swift is wired alongside python, "Tests/" is
-    pruned from the walk entirely, so a `Tests/*.py` file is invisible to
-    python's own chunker too, even though python's skip_dirs alone would
-    never have pruned "Tests". Wiring python WITHOUT swift removes
-    "Tests" from the union, and the same file is indexed."""
+class TestSkipDirOwnLanguageRule(unittest.TestCase):
+    """C1 (final fix wave, supersedes Task 7's Step 1(b) union rule, which
+    the Codex gate flagged as silent data loss): a language's skip_dirs
+    prune ONLY that language's OWN files. The walk still prunes the global
+    noise dirs plus the INTERSECTION of every wired language's skip sets
+    (pure optimization -- a dir every wired lang would drop anyway can be
+    skipped wholesale); every other directory is walked, and an individual
+    file is dropped iff one of its ancestor directory names (relative to
+    the code root) is in ITS OWN language's skip set.
+
+    Concretely, with swift and python both wired: swift's skip_dirs name
+    "Tests", python's do not, so `Tests/basic_functions.py` IS indexed
+    while `Tests/NestedTypes.swift` is NOT. python's own "venv" still
+    drops `venv/*.py` either way."""
 
     @staticmethod
     def _make_corpus(root):
@@ -681,8 +683,9 @@ class TestSkipDirUnionRule(unittest.TestCase):
         tests_dir = root / "Tests"
         tests_dir.mkdir()
         shutil.copy(PY_FIXTURES / "basic_functions.py", tests_dir / "basic_functions.py")
+        shutil.copy(FIXTURES / "NestedTypes.swift", tests_dir / "NestedTypes.swift")
 
-    def test_tests_dir_python_file_pruned_when_swift_wired_alongside(self):
+    def test_tests_dir_python_file_indexed_when_swift_wired_alongside(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "code"
             root.mkdir()
@@ -696,12 +699,67 @@ class TestSkipDirUnionRule(unittest.TestCase):
             paths = {r["path"] for r in conn.execute("SELECT DISTINCT path FROM chunks")}
             conn.close()
             tests_py = str(Path("Tests") / "basic_functions.py")
-            self.assertNotIn(
+            self.assertIn(
                 tests_py, paths,
-                "swift's Tests/ skip_dir prunes the whole directory for the union "
-                "walk -- python's own chunker never even sees this file (Step 1(b) "
-                "trade-off, not a bug)",
+                "C1: 'Tests' is in swift's skip set, not python's -- it may only "
+                f"drop swift files there, never python ones. Got: {paths}",
             )
+
+    def test_tests_dir_swift_file_still_dropped_when_swift_wired_alongside(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            self._make_corpus(root)
+            db = Path(td) / "idx-code.sqlite"
+
+            rc = code_reindex(root, db, no_embed=True, lang="swift,python")
+            self.assertEqual(rc, 0)
+
+            conn = memidx.open_code_db(db)
+            paths = {r["path"] for r in conn.execute("SELECT DISTINCT path FROM chunks")}
+            conn.close()
+            tests_swift = str(Path("Tests") / "NestedTypes.swift")
+            self.assertNotIn(
+                tests_swift, paths,
+                "C1: 'Tests' IS in swift's own skip set -- a .swift file under it "
+                f"stays dropped. Got: {paths}",
+            )
+            self.assertIn("NestedTypes.swift", paths)
+
+    def test_code_root_named_Tests_does_not_drop_everything(self):
+        """The ancestor check is relative to the code root: a project whose
+        root directory is itself called `Tests` must still index its files
+        (the root's own name is not an ancestor name inside the walk)."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "Tests"
+            root.mkdir()
+            shutil.copy(FIXTURES / "NestedTypes.swift", root / "NestedTypes.swift")
+            db = Path(td) / "idx-code.sqlite"
+
+            rc = code_reindex(root, db, no_embed=True, lang="swift")
+            self.assertEqual(rc, 0)
+
+            conn = memidx.open_code_db(db)
+            paths = {r["path"] for r in conn.execute("SELECT DISTINCT path FROM chunks")}
+            conn.close()
+            self.assertIn("NestedTypes.swift", paths)
+
+    def test_own_language_skipped_file_is_not_tallied_as_unsupported(self):
+        """A file dropped by its OWN language's skip set is noise the walk
+        deliberately prunes -- it must not show up on the end-of-run
+        "unsupported/unwired extensions" census line, which is about
+        extensions this install cannot chunk at all."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            self._make_corpus(root)
+            db = Path(td) / "idx-code.sqlite"
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = code_reindex(root, db, no_embed=True, lang="swift,python")
+            self.assertEqual(rc, 0)
+            self.assertNotIn("unsupported/unwired", buf.getvalue())
 
     def test_tests_dir_python_file_indexed_when_python_wired_alone(self):
         with tempfile.TemporaryDirectory() as td:
@@ -719,9 +777,81 @@ class TestSkipDirUnionRule(unittest.TestCase):
             tests_py = str(Path("Tests") / "basic_functions.py")
             self.assertIn(
                 tests_py, paths,
-                "python's own skip_dirs never include Tests/ -- without swift "
-                "wired, the union no longer prunes it",
+                "python's own skip_dirs never include Tests/ -- it is indexed "
+                "whether or not swift happens to be wired alongside (C1)",
             )
+
+
+class TestExtensionlessShebangIndexing(unittest.TestCase):
+    """B5 (final fix wave): the census PROMISES an extensionless
+    `#!/usr/bin/env python3` script under the python row, so the reindex
+    walk must actually index it when python is wired -- otherwise the
+    census proposes a language on the strength of files the indexer then
+    silently ignores. Extensionless files with no recognized shebang are
+    tallied on the skipped census line under NO_EXTENSION_BUCKET rather
+    than vanishing (the same gap, on the other surface)."""
+
+    def test_shebang_only_extensionless_file_is_indexed_under_python(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            script = root / "run-migrations"
+            script.write_text(
+                "#!/usr/bin/env python3\n"
+                "def migrate_everything():\n"
+                "    return 1\n"
+            )
+            script.chmod(0o755)
+            db = Path(td) / "idx-code.sqlite"
+
+            rc = code_reindex(root, db, no_embed=True, lang="python")
+            self.assertEqual(rc, 0)
+
+            conn = memidx.open_code_db(db)
+            paths = {r["path"] for r in conn.execute("SELECT DISTINCT path FROM chunks")}
+            symbols = {r["symbol"] for r in conn.execute("SELECT symbol FROM chunks")}
+            sha_row = conn.execute(
+                "SELECT chunker_version FROM file_sha WHERE path=?", ("run-migrations",)
+            ).fetchone()
+            conn.close()
+            self.assertEqual(paths, {"run-migrations"})
+            self.assertIn("migrate_everything", symbols)
+            self.assertEqual(
+                sha_row["chunker_version"], chunkers.chunker_version("python"),
+                "a shebang-resolved file must be stamped with its real chunker "
+                "version, not the 'unversioned' fail-open label",
+            )
+
+    def test_shebang_file_not_indexed_when_its_language_is_not_wired(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            shutil.copy(FIXTURES / "NestedTypes.swift", root / "NestedTypes.swift")
+            (root / "deploy").write_text("#!/usr/bin/env python3\ndef go():\n    return 1\n")
+            db = Path(td) / "idx-code.sqlite"
+
+            rc = code_reindex(root, db, no_embed=True, lang="swift")
+            self.assertEqual(rc, 0)
+
+            conn = memidx.open_code_db(db)
+            paths = {r["path"] for r in conn.execute("SELECT DISTINCT path FROM chunks")}
+            conn.close()
+            self.assertEqual(paths, {"NestedTypes.swift"})
+
+    def test_extensionless_without_shebang_appears_on_the_skipped_census_line(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            shutil.copy(FIXTURES / "NestedTypes.swift", root / "NestedTypes.swift")
+            (root / "NOTES").write_text("no shebang, just prose\n")
+            db = Path(td) / "idx-code.sqlite"
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = code_reindex(root, db, no_embed=True, lang="swift")
+            self.assertEqual(rc, 0)
+            out = buf.getvalue()
+            self.assertIn(memidx.NO_EXTENSION_BUCKET + "=1", out, out)
 
 
 class TestLangDefaultFix(unittest.TestCase):
@@ -826,6 +956,58 @@ class TestCodeCensus(unittest.TestCase):
             self.assertEqual(data["swift"], {"files": 1, "status": "supported"})
             self.assertEqual(data[".cs"], {"files": 1, "status": "unsupported"})
 
+    def test_compound_extension_keys_by_its_full_suffix(self):
+        """I2 (final fix wave): code_census must key `.blade.php`/`.d.ts`/
+        `.min.js` files by the COMPOUND suffix, not by the parent single
+        suffix -- `foo.blade.php` counted as `.php` misrepresents what the
+        tree actually holds, and lang_for_path already refuses to treat the
+        two as the same thing."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            (root / "foo.blade.php").write_text("<div></div>\n")
+            (root / "bar.php").write_text("<?php ?>\n")
+            (root / "types.d.ts").write_text("declare const x: number;\n")
+
+            counts = memidx.code_census(root)
+            self.assertEqual(counts[".blade.php"], {"files": 1, "status": "unsupported"})
+            self.assertEqual(counts[".php"], {"files": 1, "status": "unsupported"})
+            self.assertEqual(counts[".d.ts"], {"files": 1, "status": "unsupported"})
+
+    def test_json_lists_zero_count_rows_for_every_known_language(self):
+        """C5 (final fix wave): the driven install flow reads
+        "supported but not found" straight out of the --json census, so
+        every LANGUAGE_TABLE language absent from the tree must still get a
+        zero-count supported row rather than simply being missing."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            shutil.copy(PY_FIXTURES / "basic_functions.py", root / "basic_functions.py")
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = memidx.main(["code-census", "--root", str(root), "--json"])
+            self.assertEqual(rc, 0)
+            data = json.loads(buf.getvalue())
+            self.assertEqual(data["swift"], {"files": 0, "status": "supported"})
+            self.assertEqual(data["python"], {"files": 1, "status": "supported"})
+            for lang in chunkers.LANGUAGE_TABLE:
+                self.assertIn(lang, data)
+
+    def test_human_table_lists_a_not_found_language_under_supported_with_zero(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            shutil.copy(PY_FIXTURES / "basic_functions.py", root / "basic_functions.py")
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = memidx.main(["code-census", "--root", str(root)])
+            self.assertEqual(rc, 0)
+            out = buf.getvalue()
+            self.assertIn("swift: 0", out, out)
+            self.assertIn("python: 1", out, out)
+
     def test_extensionless_shebang_script_counted_under_its_language(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "code"
@@ -852,8 +1034,9 @@ class TestCodeCensus(unittest.TestCase):
                 counts[memidx.NO_EXTENSION_BUCKET],
                 {"files": 2, "status": "unsupported"},
             )
-            self.assertNotIn("python", counts)
-            self.assertNotIn("swift", counts)
+            # C5: every known language still gets a row, at zero.
+            self.assertEqual(counts["python"], {"files": 0, "status": "supported"})
+            self.assertEqual(counts["swift"], {"files": 0, "status": "supported"})
 
     def test_language_table_skip_dirs_pruned_even_though_no_lang_is_wired(self):
         """Controller-scope addition #2: census walks with the GLOBAL skip
@@ -877,7 +1060,7 @@ class TestCodeCensus(unittest.TestCase):
 
             counts = memidx.code_census(root)
             self.assertEqual(counts["python"], {"files": 1, "status": "supported"})
-            self.assertNotIn("swift", counts)
+            self.assertEqual(counts["swift"], {"files": 0, "status": "supported"})
 
     def test_exit_code_is_always_zero_even_on_a_nonexistent_root(self):
         with tempfile.TemporaryDirectory() as td:
@@ -886,7 +1069,13 @@ class TestCodeCensus(unittest.TestCase):
             with contextlib.redirect_stdout(buf):
                 rc = memidx.main(["code-census", "--root", str(missing), "--json"])
             self.assertEqual(rc, 0)
-            self.assertEqual(json.loads(buf.getvalue()), {})
+            # C5: a walk that found nothing still names every known
+            # language at zero -- "supported but not found", not silence.
+            self.assertEqual(
+                json.loads(buf.getvalue()),
+                {lang: {"files": 0, "status": "supported"}
+                 for lang in chunkers.LANGUAGE_TABLE},
+            )
 
     def test_human_readable_table_groups_supported_before_unsupported(self):
         with tempfile.TemporaryDirectory() as td:
@@ -928,6 +1117,26 @@ class TestUnsupportedExtensionCensus(unittest.TestCase):
                 out,
                 out,
             )
+
+    def test_compound_extension_is_tallied_under_its_full_suffix(self):
+        """I2 (final fix wave): a `.blade.php` file must not be tallied as a
+        plain `.php` one -- lang_for_path already treats the compound as its
+        own thing (COMPOUND_EXCLUDES), so the census line must agree."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            shutil.copy(FIXTURES / "NestedTypes.swift", root / "NestedTypes.swift")
+            (root / "foo.blade.php").write_text("<div></div>\n")
+            (root / "bar.php").write_text("<?php ?>\n")
+            db = Path(td) / "idx-code.sqlite"
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = code_reindex(root, db, no_embed=True)
+            self.assertEqual(rc, 0)
+            out = buf.getvalue()
+            self.assertIn(".blade.php=1", out, out)
+            self.assertIn(".php=1", out, out)
 
     def test_no_census_line_when_nothing_is_skipped(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1002,6 +1211,356 @@ class TestChunkerFailOpenPerFile(unittest.TestCase):
             ).fetchone()
             conn.close()
             self.assertIsNone(row)
+
+
+class TestFailOpenDeletesStaleIndexState(unittest.TestCase):
+    """B1 (final fix wave, Grok HIGH 1): "fail open" must not mean "keep
+    serving what the last good run stored". When a file that WAS indexed
+    later fails to chunk, its old chunks and its file_sha row both have to
+    go -- otherwise code-search keeps answering from rows whose source
+    text no longer produces them, and the index reports itself "current"
+    while carrying content nothing on disk backs."""
+
+    @staticmethod
+    def _raise_on_swift():
+        def boom(text, rel):
+            raise RuntimeError("simulated backend crash")
+        return boom
+
+    def _index_then_break(self, td, *, bump_version=False):
+        root = Path(td) / "code"
+        root.mkdir()
+        target = root / "NestedTypes.swift"
+        shutil.copy(FIXTURES / "NestedTypes.swift", target)
+        db = Path(td) / "idx-code.sqlite"
+
+        rc = code_reindex(root, db, no_embed=True)
+        self.assertEqual(rc, 0)
+        conn = memidx.open_code_db(db)
+        first_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM chunks WHERE path=?", ("NestedTypes.swift",)
+        ).fetchone()["c"]
+        conn.close()
+        self.assertGreater(first_count, 0, "setup: the first pass must index something")
+
+        if bump_version:
+            row = dict(chunkers.LANGUAGE_TABLE["swift"])
+            row["impl_version"] = str(int(row["impl_version"]) + 100)
+            self._prev_row = chunkers.LANGUAGE_TABLE["swift"]
+            chunkers.LANGUAGE_TABLE["swift"] = row
+        else:
+            target.write_text(target.read_text() + "\nfunc addedLater() {}\n")
+
+        original = chunkers.swift.chunk_file
+        chunkers.swift.chunk_file = self._raise_on_swift()
+        try:
+            out_buf, err_buf = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+                rc = code_reindex(root, db, no_embed=True)
+        finally:
+            chunkers.swift.chunk_file = original
+        return root, db, rc, err_buf.getvalue()
+
+    def test_content_change_then_failure_purges_chunks_and_file_sha(self):
+        with tempfile.TemporaryDirectory() as td:
+            _root, db, rc, err = self._index_then_break(td)
+            self.assertEqual(rc, 0)
+            self.assertIn("NestedTypes.swift", err)
+
+            conn = memidx.open_code_db(db)
+            chunk_count = conn.execute(
+                "SELECT COUNT(*) AS c FROM chunks WHERE path=?", ("NestedTypes.swift",)
+            ).fetchone()["c"]
+            sha_row = conn.execute(
+                "SELECT * FROM file_sha WHERE path=?", ("NestedTypes.swift",)
+            ).fetchone()
+            fts_count = conn.execute("SELECT COUNT(*) AS c FROM fts").fetchone()["c"]
+            conn.close()
+            self.assertEqual(chunk_count, 0, "stale chunks from the last good run must be deleted")
+            self.assertIsNone(sha_row, "the file_sha row must go too, so repair retriggers")
+            self.assertEqual(fts_count, 0, "the fts shadow rows must go with the chunks")
+
+    def test_version_bump_then_failure_leaves_the_index_not_current(self):
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                _root, db, rc, err = self._index_then_break(td, bump_version=True)
+                self.assertEqual(rc, 0)
+                self.assertIn("NestedTypes.swift", err)
+
+                conn = memidx.open_code_db(db)
+                chunk_count = conn.execute(
+                    "SELECT COUNT(*) AS c FROM chunks WHERE path=?", ("NestedTypes.swift",)
+                ).fetchone()["c"]
+                sha_row = conn.execute(
+                    "SELECT * FROM file_sha WHERE path=?", ("NestedTypes.swift",)
+                ).fetchone()
+                state, _meta = memidx._code_index_state(conn, memidx.DEFAULT_PROJECT)
+                conn.close()
+                self.assertEqual(chunk_count, 0)
+                self.assertIsNone(sha_row)
+                self.assertNotEqual(
+                    state, "current",
+                    "a file the chunker could not process is missing from the index "
+                    "-- the index must not report itself current",
+                )
+        finally:
+            if getattr(self, "_prev_row", None) is not None:
+                chunkers.LANGUAGE_TABLE["swift"] = self._prev_row
+                self._prev_row = None
+
+    def test_repair_retriggers_on_the_next_reindex(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, db, rc, _err = self._index_then_break(td)
+            self.assertEqual(rc, 0)
+
+            # chunk_file is restored by _index_then_break's finally -- this
+            # second pass is the repaired chunker actually running again.
+            rc2 = code_reindex(root, db, no_embed=True)
+            self.assertEqual(rc2, 0)
+
+            conn = memidx.open_code_db(db)
+            chunk_count = conn.execute(
+                "SELECT COUNT(*) AS c FROM chunks WHERE path=?", ("NestedTypes.swift",)
+            ).fetchone()["c"]
+            sha_row = conn.execute(
+                "SELECT * FROM file_sha WHERE path=?", ("NestedTypes.swift",)
+            ).fetchone()
+            conn.close()
+            self.assertGreater(chunk_count, 0, "repair must re-index the file")
+            self.assertIsNotNone(sha_row)
+
+    @unittest.skipIf(os.name != "posix" or os.geteuid() == 0,
+                     "mode-000 is only unreadable for a non-root posix user")
+    def test_unreadable_file_is_skipped_and_the_walk_continues(self):
+        """Grok HIGH 2: the per-file try must cover the read/stat/decode
+        too, not only the chunker call -- one mode-000 file must not abort
+        the whole walk."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            shutil.copy(FIXTURES / "NestedTypes.swift", root / "NestedTypes.swift")
+            locked = root / "AAALocked.swift"
+            locked.write_text("func locked() {}\n")
+            locked.chmod(0o000)
+            db = Path(td) / "idx-code.sqlite"
+            try:
+                out_buf, err_buf = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+                    rc = code_reindex(root, db, no_embed=True)
+            finally:
+                locked.chmod(0o644)
+
+            self.assertEqual(rc, 0)
+            self.assertIn("AAALocked.swift", err_buf.getvalue())
+            conn = memidx.open_code_db(db)
+            paths = {r["path"] for r in conn.execute("SELECT DISTINCT path FROM chunks")}
+            conn.close()
+            self.assertIn(
+                "NestedTypes.swift", paths,
+                "the rest of the tree must still index after one unreadable file",
+            )
+            self.assertNotIn("AAALocked.swift", paths)
+
+
+class TestRegistryContractEnforcement(unittest.TestCase):
+    """C3 (final fix wave, Codex): the reindex loop is the boundary between
+    a chunker backend and the database. It validates what a backend hands
+    back -- required keys, a `kind` from the frozen KINDS vocabulary,
+    integer line numbers, a real ChunkResult -- and a violation is that
+    file's failure (B1's path: warn, purge, continue), never a row in the
+    chunks table."""
+
+    def _reindex_with_backend(self, td, fake_chunk_file):
+        root = Path(td) / "code"
+        root.mkdir()
+        shutil.copy(FIXTURES / "NestedTypes.swift", root / "NestedTypes.swift")
+        db = Path(td) / "idx-code.sqlite"
+        original = chunkers.swift.chunk_file
+        chunkers.swift.chunk_file = fake_chunk_file
+        try:
+            out_buf, err_buf = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+                rc = code_reindex(root, db, no_embed=True)
+        finally:
+            chunkers.swift.chunk_file = original
+        return db, rc, err_buf.getvalue()
+
+    def _assert_nothing_stored(self, db, rc, err):
+        self.assertEqual(rc, 0)
+        self.assertIn("NestedTypes.swift", err)
+        conn = memidx.open_code_db(db)
+        chunk_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM chunks WHERE path=?", ("NestedTypes.swift",)
+        ).fetchone()["c"]
+        sha_row = conn.execute(
+            "SELECT * FROM file_sha WHERE path=?", ("NestedTypes.swift",)
+        ).fetchone()
+        conn.close()
+        self.assertEqual(chunk_count, 0)
+        self.assertIsNone(sha_row)
+
+    def test_kind_outside_the_frozen_vocabulary_is_rejected(self):
+        def bad_kind(text, rel):
+            return chunkers.ChunkResult(
+                [{"kind": "method_definition", "symbol": "x", "qualified_name": "x",
+                  "signature": "func x()", "doc": "", "start_line": 1, "end_line": 2,
+                  "lang": "swift"}],
+                [], "ok",
+            )
+        with tempfile.TemporaryDirectory() as td:
+            db, rc, err = self._reindex_with_backend(td, bad_kind)
+            self._assert_nothing_stored(db, rc, err)
+            self.assertIn("kind", err)
+
+    def test_missing_required_key_is_rejected(self):
+        def missing_key(text, rel):
+            return chunkers.ChunkResult(
+                [{"kind": "function", "symbol": "x", "signature": "func x()",
+                  "doc": "", "start_line": 1, "end_line": 2, "lang": "swift"}],
+                [], "ok",
+            )
+        with tempfile.TemporaryDirectory() as td:
+            db, rc, err = self._reindex_with_backend(td, missing_key)
+            self._assert_nothing_stored(db, rc, err)
+
+    def test_non_integer_line_numbers_are_rejected(self):
+        def bad_lines(text, rel):
+            return chunkers.ChunkResult(
+                [{"kind": "function", "symbol": "x", "qualified_name": "x",
+                  "signature": "func x()", "doc": "", "start_line": "1",
+                  "end_line": 2, "lang": "swift"}],
+                [], "ok",
+            )
+        with tempfile.TemporaryDirectory() as td:
+            db, rc, err = self._reindex_with_backend(td, bad_lines)
+            self._assert_nothing_stored(db, rc, err)
+
+    def test_a_backend_returning_none_is_rejected(self):
+        def returns_none(text, rel):
+            return None
+        with tempfile.TemporaryDirectory() as td:
+            db, rc, err = self._reindex_with_backend(td, returns_none)
+            self._assert_nothing_stored(db, rc, err)
+
+    def test_malformed_gaps_are_rejected(self):
+        def bad_gaps(text, rel):
+            return chunkers.ChunkResult([], ["not-a-tuple"], "partial")
+        with tempfile.TemporaryDirectory() as td:
+            db, rc, err = self._reindex_with_backend(td, bad_gaps)
+            self._assert_nothing_stored(db, rc, err)
+
+    def test_a_rejected_file_leaves_no_orphan_embedding_rows(self):
+        """The chunk INSERT loop runs after the old rows are deleted, so a
+        mid-file rejection must not leave a half-written file behind --
+        nor queue embeddings for chunk ids that no longer exist."""
+        def half_bad(text, rel):
+            good = {"kind": "function", "symbol": "ok", "qualified_name": "ok",
+                    "signature": "func ok()", "doc": "", "start_line": 1,
+                    "end_line": 2, "lang": "swift"}
+            bad = dict(good, kind="method_definition", symbol="bad")
+            return chunkers.ChunkResult([good, bad], [], "ok")
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            shutil.copy(FIXTURES / "NestedTypes.swift", root / "NestedTypes.swift")
+            db = Path(td) / "idx-code.sqlite"
+            original = chunkers.swift.chunk_file
+            chunkers.swift.chunk_file = half_bad
+            try:
+                out_buf, err_buf = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+                    rc = code_reindex(root, db, no_embed=False)
+            finally:
+                chunkers.swift.chunk_file = original
+            self.assertEqual(rc, 0)
+            conn = memidx.open_code_db(db)
+            chunk_count = conn.execute("SELECT COUNT(*) AS c FROM chunks").fetchone()["c"]
+            emb_count = conn.execute("SELECT COUNT(*) AS c FROM embeddings").fetchone()["c"]
+            fts_count = conn.execute("SELECT COUNT(*) AS c FROM fts").fetchone()["c"]
+            conn.close()
+            self.assertEqual(chunk_count, 0)
+            self.assertEqual(emb_count, 0)
+            self.assertEqual(fts_count, 0)
+
+
+class TestStaleCheckConsultsChunkerVersion(unittest.TestCase):
+    """B2 (final fix wave): _code_index_is_stale compared only mtime/size,
+    so bumping a chunker's impl_version left every stored row reading
+    "current" until something on disk happened to change. It must compare
+    each stored stamp against the chunker version that lang would produce
+    today."""
+
+    def test_impl_version_bump_makes_the_index_stale(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            shutil.copy(FIXTURES / "NestedTypes.swift", root / "NestedTypes.swift")
+            db = Path(td) / "idx-code.sqlite"
+            rc = code_reindex(root, db, no_embed=True)
+            self.assertEqual(rc, 0)
+
+            conn = memidx.open_code_db(db)
+            try:
+                state_before, _ = memidx._code_index_state(conn, memidx.DEFAULT_PROJECT)
+                self.assertEqual(state_before, "current")
+
+                prev = chunkers.LANGUAGE_TABLE["swift"]
+                bumped = dict(prev)
+                bumped["impl_version"] = str(int(prev["impl_version"]) + 100)
+                chunkers.LANGUAGE_TABLE["swift"] = bumped
+                try:
+                    state_after, _ = memidx._code_index_state(conn, memidx.DEFAULT_PROJECT)
+                finally:
+                    chunkers.LANGUAGE_TABLE["swift"] = prev
+            finally:
+                conn.close()
+            self.assertEqual(
+                state_after, "stale",
+                "a chunker-version bump must read as stale before any reindex runs",
+            )
+
+
+class TestCodeReindexLangValidation(unittest.TestCase):
+    """C2 (final fix wave, Codex): an unknown --lang is a typo, not a
+    silent no-op. code-reindex fails, names the languages it knows, and
+    persists nothing to code_meta."""
+
+    def test_unknown_lang_fails_and_writes_no_code_meta(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            shutil.copy(FIXTURES / "NestedTypes.swift", root / "NestedTypes.swift")
+            db = Path(td) / "idx-code.sqlite"
+
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf):
+                rc = code_reindex(root, db, no_embed=True, lang="ts")
+            self.assertNotEqual(rc, 0)
+            err = err_buf.getvalue()
+            self.assertIn("ts", err)
+            self.assertIn("swift", err, "the message must list the known languages")
+            self.assertIn("python", err)
+
+            conn = memidx.open_code_db(db)
+            rows = conn.execute("SELECT * FROM code_meta").fetchall()
+            conn.close()
+            self.assertEqual(rows, [], "no code_meta row may be written for an unknown lang")
+
+    def test_one_unknown_lang_among_known_ones_still_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            shutil.copy(FIXTURES / "NestedTypes.swift", root / "NestedTypes.swift")
+            db = Path(td) / "idx-code.sqlite"
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf):
+                rc = code_reindex(root, db, no_embed=True, lang="swift,ts")
+            self.assertNotEqual(rc, 0)
+
+            conn = memidx.open_code_db(db)
+            chunk_count = conn.execute("SELECT COUNT(*) AS c FROM chunks").fetchone()["c"]
+            conn.close()
+            self.assertEqual(chunk_count, 0)
 
 
 class TestPreRewireStampSkewForcesRechunk(unittest.TestCase):

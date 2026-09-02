@@ -1695,17 +1695,19 @@ def cmd_check(args) -> int:
 # hand-maintained extension map (Task 3 reviewer finding -- the registry is
 # now the single source of truth). Kept only for back-compat with anything
 # still reading LANG_EXTENSIONS directly; dispatch itself goes through
-# chunkers.lang_for_path (see _lang_for_ext / iter_code_source_files below).
+# chunkers.lang_for_path (see lang_for_source_file / iter_code_source_files
+# below).
 LANG_EXTENSIONS = {lang: row["extensions"] for lang, row in chunkers.LANGUAGE_TABLE.items()}
 
 # Task 7: this is now the GLOBAL skip set ONLY -- directory names that are
 # always noise regardless of which languages are wired. Language-specific
 # noise (swift's Tests/Resources/.build, python's venv/.venv/__pycache__/
 # build/dist/.tox/.eggs) lives on each LANGUAGE_TABLE row's "skip_dirs" key
-# instead (chunkers.wired_skip_dirs), so a Swift-only project's own build/
-# or dist/ output is never pruned by a rule meant for Python virtualenvs,
-# and vice versa. iter_code_source_files below unions this with the wired
-# langs' per-lang sets to get the actual prune set for a walk.
+# instead, so a Swift-only project's own build/ or dist/ output is never
+# pruned by a rule meant for Python virtualenvs, and vice versa. This
+# global set is what iter_code_source_files prunes for every walk;
+# per-language sets are applied per FILE, to that language's own files
+# only (fix wave C1 -- see chunkers.common_skip_dirs).
 CODE_SKIP_DIR_NAMES = {".git", "vendor", "node_modules"}
 
 CODE_SCHEMA_SQL = """
@@ -1806,26 +1808,49 @@ def open_code_db(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
-def _lang_for_ext(suffix: str) -> str:
-    """Task 5 rewire: delegates to chunkers.lang_for_path -- the registry,
-    not a locally duplicated extension map, is the single source of truth
-    now (Task 3 reviewer finding). Keep the function name: external
-    references (tests) use it. Suffix-only means lang_for_path's
-    compound-extension guard (COMPOUND_EXCLUDES) is inert here, which is
-    harmless: by the time code-reindex's per-file loop calls this,
-    iter_code_source_files has already applied that same guard against the
-    FULL path -- only files it already accepted reach this call. Falls
-    back to the bare suffix name (matching pre-rewire behavior) when no
-    LANGUAGE_TABLE row matches, so chunker_version's "unversioned" fail-open
-    guard still has a readable, non-None label to work with."""
-    lang = chunkers.lang_for_path("x" + suffix)
-    return lang if lang is not None else (suffix.lstrip(".") or "unknown")
+def lang_for_source_file(path: Path) -> str | None:
+    """The language of ONE file on disk, or None -- the single resolution
+    rule the whole code-index side shares (Anatomy M1 fix wave).
+
+    Extension first (chunkers.lang_for_path, compound-extension aware).
+    Only when a file has NO extension at all is its first line sniffed for
+    a shebang (chunkers.lang_for_shebang) -- B5: `code-census` already
+    counts a `#!/usr/bin/env python3` script named `bin/tool` under the
+    python row, so the indexer has to be able to actually index the file
+    the census proposed a language on the strength of. Anything else is a
+    census that promises what the index silently ignores.
+
+    Guarded to REGULAR files before reading: an extensionless FIFO in the
+    tree would otherwise block the read forever, and a directory entry is
+    never a source file. Any read failure yields None (fail open) -- an
+    unreadable file simply has no resolvable language here; the reindex
+    loop's own per-file guard reports it.
+
+    Used by all three places that used to answer this question separately:
+    the walk's classification, cmd_code_reindex's per-file dispatch (which
+    used to call the extension-only `_lang_for_ext`) and the staleness
+    check's per-file chunker-version comparison."""
+    lang = chunkers.lang_for_path(path)
+    if lang is not None:
+        return lang
+    if chunkers.extension_of(path):
+        return None
+    try:
+        if not path.is_file() or path.is_symlink():
+            return None
+        first_line = _first_line_or_none(path)
+    except OSError:
+        return None
+    if not first_line:
+        return None
+    return chunkers.lang_for_shebang(first_line)
 
 
 def iter_code_source_files(root: Path, langs: list[str] | None, skipped: Counter | None = None):
-    """Walk `root`, yielding source files whose chunkers.lang_for_path is in
-    the wired set (`langs`). Dispatch is registry-driven (compound-extension-
-    aware) rather than the old locally duplicated extension map.
+    """Walk `root`, yielding source files whose language (see
+    `lang_for_source_file` -- extension, or a shebang on an extensionless
+    file) is in the wired set (`langs`). Dispatch is registry-driven
+    rather than the old locally duplicated extension map.
 
     `langs` defaults to swift-only when falsy -- a legacy-row safety net for
     _code_index_is_stale below, whose only caller reads it out of an
@@ -1835,43 +1860,55 @@ def iter_code_source_files(root: Path, langs: list[str] | None, skipped: Counter
     cmd_code_reindex's --lang resolution, which fails outright rather than
     reaching this fallback).
 
-    Directory pruning (Task 7): the skip set for the WHOLE walk is
-    CODE_SKIP_DIR_NAMES (global noise: .git, vendor, node_modules) UNIONED
-    with chunkers.wired_skip_dirs(wired) (the per-lang sets of every WIRED
-    lang, e.g. swift's Tests/Resources/.build, python's venv/.venv/
-    __pycache__/build/dist/.tox/.eggs). This is a single decision per
-    directory, not a per-lang one: a directory pruned because ONE wired
-    lang's skip_dirs names it is pruned for every wired lang, even one
-    whose own skip_dirs wouldn't have pruned it standalone (deliberately
-    accepted trade-off, brief Step 1(b); see chunkers.wired_skip_dirs's
-    docstring and TestSkipDirUnionRule). Per-file classification below
-    (lang_for_path against the wired set) only ever runs on files under
-    directories that survived that union prune.
+    Directory pruning (fix wave C1, superseding Task 7's union rule): a
+    language's skip_dirs prune only THAT language's own files. The walk
+    prunes CODE_SKIP_DIR_NAMES (global noise: .git, vendor, node_modules)
+    plus chunkers.common_skip_dirs(wired) -- the INTERSECTION of the wired
+    languages' skip sets, a pure optimization since every file under such
+    a directory would be dropped by its own language's rule anyway. Every
+    other directory is walked, and a file is dropped iff one of its
+    root-relative ancestor directory names is in ITS OWN language's skip
+    set (chunkers.path_is_skipped_for_lang). Consequence: with swift and
+    python both wired, `Tests/foo.py` IS indexed (python's skip set has no
+    "Tests") while `Tests/Foo.swift` is not. The union rule dropped both,
+    silently losing python source the census had just proposed python on
+    the strength of -- see chunkers.common_skip_dirs and
+    TestSkipDirOwnLanguageRule.
 
     `skipped`, when passed a Counter, is mutated in place: every walked file
-    that is NOT yielded -- lang_for_path is None (truly unsupported) or
-    resolves to a lang outside the wired set (engine-supported but not
-    selected for this project) -- has its extension tallied there. That
-    Counter is the data source for code-reindex's end-of-run provenance
-    line (spec S4, INC-0103/0104: no growing blind spot may be silent).
-    Mutated-in-place rather than a second yield channel so existing callers
-    (_code_index_is_stale) that iterate this generator for plain paths need
-    no change."""
+    that is NOT yielded because its extension is unsupported (no language
+    at all) or resolves to a lang outside the wired set (engine-supported
+    but not selected for this project) has its extension tallied there --
+    keyed compound-extension-aware (chunkers.extension_of, fix wave I2:
+    `foo.blade.php` counts as ".blade.php", never ".php") and under
+    NO_EXTENSION_BUCKET for an extensionless file with no recognized
+    shebang (B5: the same "second silent gap" the census already closed).
+    A file dropped by its OWN language's skip set is NOT tallied -- that
+    is deliberately-pruned noise, not a blind spot in what this engine can
+    chunk. That Counter is the data source for code-reindex's end-of-run
+    provenance line (spec S4, INC-0103/0104: no growing blind spot may be
+    silent). Mutated-in-place rather than a second yield channel so
+    existing callers (_code_index_is_stale) that iterate this generator
+    for plain paths need no change."""
     wired = list(langs or ["swift"])
     wired_set = set(wired)
-    skip_dirs = CODE_SKIP_DIR_NAMES | chunkers.wired_skip_dirs(wired)
+    skip_dirs = CODE_SKIP_DIR_NAMES | chunkers.common_skip_dirs(wired)
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in skip_dirs]
         for fname in sorted(filenames):
             path = Path(dirpath) / fname
-            lang = chunkers.lang_for_path(path)
+            lang = lang_for_source_file(path)
             if lang is not None and lang in wired_set:
+                try:
+                    rel_parts = path.relative_to(root).parts
+                except ValueError:
+                    rel_parts = (fname,)
+                if chunkers.path_is_skipped_for_lang(rel_parts, lang):
+                    continue
                 yield path
                 continue
             if skipped is not None:
-                _, ext = os.path.splitext(fname)
-                if ext:
-                    skipped[ext] += 1
+                skipped[chunkers.extension_of(fname) or NO_EXTENSION_BUCKET] += 1
 
 
 # ---------------------------------------------------------------------------
@@ -1982,6 +2019,57 @@ def _git_head_sha(root: Path) -> str | None:
     return sha or None
 
 
+CHUNK_REQUIRED_KEYS = (
+    "kind", "symbol", "qualified_name", "signature", "doc",
+    "start_line", "end_line", "lang",
+)
+
+
+def validate_chunk_result(result, rel: str) -> None:
+    """C3 (Anatomy M1 fix wave, Codex): the reindex loop is the boundary
+    between a chunker backend and the database, so it -- not each backend
+    -- is where the registry contract is ENFORCED. Raises ValueError
+    naming what is wrong; cmd_code_reindex's per-file guard turns that
+    into B1's failure path (warn, purge whatever the last good run stored
+    for this file, continue), so a violating chunk is never written.
+
+    Checked: a real ChunkResult back (not None, not a bare list); `chunks`
+    and `gaps` are lists; every chunk is a dict carrying every key the
+    INSERT below reads; `kind` is drawn from the frozen chunkers.KINDS
+    vocabulary (spec S2 -- the whole point of freezing it is that nothing
+    outside it reaches the column); `start_line`/`end_line` are real ints
+    (a string "1" would sort and slice wrongly and poison every downstream
+    line-range read). `path` is deliberately NOT required: it is supplied
+    by this caller (rel_path), never by the provider."""
+    if not isinstance(result, chunkers.ChunkResult):
+        raise ValueError(
+            f"chunker returned {type(result).__name__}, not a ChunkResult"
+        )
+    if not isinstance(result.chunks, list) or not isinstance(result.gaps, list):
+        raise ValueError("ChunkResult.chunks and .gaps must both be lists")
+    if result.status not in ("ok", "partial", "failed"):
+        raise ValueError(f"ChunkResult.status {result.status!r} is not ok/partial/failed")
+    for gap in result.gaps:
+        if not isinstance(gap, (tuple, list)) or len(gap) != 3:
+            raise ValueError(f"malformed gap {gap!r} (expected a 3-tuple)")
+    for i, chunk in enumerate(result.chunks):
+        if not isinstance(chunk, dict):
+            raise ValueError(f"chunk {i} is {type(chunk).__name__}, not a dict")
+        missing = [k for k in CHUNK_REQUIRED_KEYS if k not in chunk]
+        if missing:
+            raise ValueError(f"chunk {i} is missing required key(s): {', '.join(missing)}")
+        if chunk["kind"] not in chunkers.KINDS:
+            raise ValueError(
+                f"chunk {i} has kind {chunk['kind']!r}, which is outside the frozen "
+                f"kind vocabulary ({', '.join(sorted(chunkers.KINDS))})"
+            )
+        for key in ("start_line", "end_line"):
+            if not isinstance(chunk[key], int) or isinstance(chunk[key], bool):
+                raise ValueError(
+                    f"chunk {i} has non-integer {key}: {chunk[key]!r}"
+                )
+
+
 def cmd_code_reindex(args) -> int:
     root = Path(args.code_root).resolve()
     db_path = resolve_code_db_path(args)
@@ -2012,6 +2100,25 @@ def cmd_code_reindex(args) -> int:
             conn.close()
             return 1
 
+    # C2 (Anatomy M1 fix wave, Codex): every RESOLVED language name --
+    # whether it came from --lang or from a code_meta row a previous run
+    # stored -- must name a real LANGUAGE_TABLE row. A typo used to be
+    # tolerated silently: the walk matched zero files for it, the run said
+    # nothing, and the bad name was then PERSISTED to code_meta.langs, so
+    # every later run reused it. That is exactly the silent blind spot
+    # this milestone exists to close, so it is now a loud failure naming
+    # the languages this engine actually knows, before anything is walked
+    # or written.
+    unknown = [l for l in langs if l not in chunkers.LANGUAGE_TABLE]
+    if unknown:
+        print(
+            f"code-reindex: unknown language(s): {', '.join(unknown)} -- "
+            f"this engine version knows: {', '.join(sorted(chunkers.LANGUAGE_TABLE))}",
+            file=sys.stderr,
+        )
+        conn.close()
+        return 1
+
     existing = {
         row["path"]: (row["sha256"], row["chunker_version"])
         for row in conn.execute(
@@ -2022,125 +2129,162 @@ def cmd_code_reindex(args) -> int:
     skipped_unknown: Counter = Counter()
     files = list(iter_code_source_files(root, langs, skipped_unknown))
     seen = set()
-    added_files = changed_files = unchanged_files = 0
+    added_files = changed_files = unchanged_files = failed_files = 0
     total_gaps = 0
     pending_texts: list = []
     pending_ids: list = []
 
+    # B1/C3 (Anatomy M1 fix wave). Two changes to the per-file loop:
+    #
+    # (a) the try covers the WHOLE per-file body -- read_bytes/stat/decode
+    #     and the chunk INSERT loop, not just the chunk_file call. Grok
+    #     HIGH 2: one mode-000 (or vanished, or malformed-result) file used
+    #     to abort the entire walk with a traceback, so a single
+    #     unreadable file could leave most of a repo unindexed.
+    #
+    # (b) a failure PURGES this file's stale index state instead of merely
+    #     declining to write new state (Grok HIGH 1). Writing no file_sha
+    #     row was enough to make repair retrigger, but the chunks the LAST
+    #     good run stored stayed in the table -- so code-search kept
+    #     answering from rows the current source text no longer produces,
+    #     with nothing on any surface saying so. Now: delete the chunks
+    #     (with their fts/embedding shadows) AND the file_sha row, warn
+    #     naming the file, continue. Deleting the file_sha row is also what
+    #     keeps _code_index_state honest: the file is on disk, absent from
+    #     file_sha, so the index reports "stale", not "current".
+    #
+    # A "partial" status still indexes its chunks and writes file_sha with
+    # gap_count = len(gaps) -- the existing gap behavior, unchanged.
     for f in files:
         try:
             rel = str(f.relative_to(root))
         except ValueError:
             rel = str(f)
+        # `seen` is populated BEFORE the guarded body: a file that failed
+        # to chunk is still a file that EXISTS on disk, so it must not
+        # also be swept up by the removed-paths pass below and counted as
+        # a deletion.
         seen.add(rel)
-        data = f.read_bytes()
-        sha = hashlib.sha256(data).hexdigest()
-        lang = _lang_for_ext(f.suffix)
         try:
-            cv = chunkers.chunker_version(lang)
-        except KeyError:
-            # Task 3 edge case: a lang with no LANGUAGE_TABLE row (e.g. an
-            # extension outside the table reached via a stray --lang
-            # value) must not crash code-reindex -- fail open with a
-            # literal stamp instead of raising.
-            cv = "unversioned"
-        prev_sha, prev_cv = existing.get(rel, (None, None))
-        if prev_sha == sha and prev_cv == cv and not args.full:
-            unchanged_files += 1
-            # Finding 2 (staleness): the file's content (and thus its
-            # chunks) didn't change, but its mtime/size on disk may have
-            # (e.g. a bare `touch`) -- refresh the stored file_sha row's
-            # mtime/size so _code_index_is_stale's on-disk comparison
-            # matches again. sha256/gap_count/chunker_version are
-            # untouched (nothing about the indexed content or the
-            # chunker that produced it changed), so this is a plain
-            # UPDATE, not the INSERT OR REPLACE the changed/added branch
-            # below uses.
+            data = f.read_bytes()
+            sha = hashlib.sha256(data).hexdigest()
+            lang = lang_for_source_file(f)
+            try:
+                cv = chunkers.chunker_version(lang)
+            except KeyError:
+                # Task 3 edge case: a lang with no LANGUAGE_TABLE row must
+                # not crash code-reindex -- fail open with a literal stamp
+                # instead of raising. (Unreachable via --lang since C2
+                # validates the resolved language set; kept as a guard.)
+                cv = "unversioned"
+            prev_sha, prev_cv = existing.get(rel, (None, None))
+            if prev_sha == sha and prev_cv == cv and not args.full:
+                unchanged_files += 1
+                # Finding 2 (staleness): the file's content (and thus its
+                # chunks) didn't change, but its mtime/size on disk may
+                # have (e.g. a bare `touch`) -- refresh the stored
+                # file_sha row's mtime/size so _code_index_is_stale's
+                # on-disk comparison matches again. sha256/gap_count/
+                # chunker_version are untouched (nothing about the indexed
+                # content or the chunker that produced it changed), so
+                # this is a plain UPDATE, not the INSERT OR REPLACE the
+                # changed/added branch below uses.
+                stat = f.stat()
+                conn.execute(
+                    "UPDATE file_sha SET mtime=?, size=? WHERE project=? AND path=?",
+                    (stat.st_mtime, stat.st_size, args.project, rel),
+                )
+                continue
+            is_new = rel not in existing
+
+            text = data.decode("utf-8", errors="replace")
+            # Task 5 rewire: dispatch through the chunker registry instead
+            # of calling the Swift walker (chunk_source) directly --
+            # get_chunker(lang) resolves the right backend, chunk_file(text,
+            # rel) is the uniform per-backend contract (ChunkResult:
+            # chunks/gaps/status), and validate_chunk_result enforces that
+            # contract here at the DB boundary (C3).
+            result = chunkers.get_chunker(lang).chunk_file(text, rel)
+            validate_chunk_result(result, rel)
+
+            if result.status == "failed":
+                raise ValueError("chunker reported status=failed")
+
+            for g in result.gaps:
+                total_gaps += 1
+                print(
+                    f"code-reindex: WARNING gap in {rel} lines {g[0]}-{g[1]} "
+                    f"({g[2]}, skipped)",
+                    file=sys.stderr,
+                )
+
+            chunks = result.chunks
+            gaps = result.gaps
+
+            delete_code_chunks_for_path(conn, args.project, rel)
+            text_lines = text.splitlines()
+            # Embeddings are queued per-file and only merged into the
+            # shared pending lists once the whole file is stored: a chunk
+            # id whose row is deleted again by the failure path below must
+            # never reach the embeddings table.
+            file_texts: list = []
+            file_ids: list = []
+            for chunk in chunks:
+                body_lines = text_lines[chunk["start_line"] : chunk["end_line"] - 1]
+                cur = conn.execute(
+                    """INSERT INTO chunks (path, project, lang, kind, symbol, qualified_name,
+                           signature, doc, start_line, end_line)
+                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        rel, args.project, chunk["lang"], chunk["kind"], chunk["symbol"],
+                        chunk["qualified_name"], chunk["signature"], chunk["doc"],
+                        chunk["start_line"], chunk["end_line"],
+                    ),
+                )
+                chunk_id = cur.lastrowid
+                split_tokens = split_qualified(chunk["qualified_name"])
+                body_text = "\n".join(body_lines[:25])
+                conn.execute(
+                    "INSERT INTO fts (rowid, qualified_name, split_tokens, signature, doc, body) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (chunk_id, chunk["qualified_name"], split_tokens, chunk["signature"] or "",
+                     chunk["doc"] or "", body_text),
+                )
+                if not args.no_embed:
+                    file_texts.append(code_embed_text_for(rel, chunk, body_lines))
+                    file_ids.append(chunk_id)
+
             stat = f.stat()
             conn.execute(
-                "UPDATE file_sha SET mtime=?, size=? WHERE project=? AND path=?",
-                (stat.st_mtime, stat.st_size, args.project, rel),
+                "INSERT OR REPLACE INTO file_sha (path, project, sha256, mtime, size, gap_count, chunker_version) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (rel, args.project, sha, stat.st_mtime, stat.st_size, len(gaps), cv),
             )
-            continue
-        is_new = rel not in existing
-
-        text = data.decode("utf-8", errors="replace")
-        # Task 5 rewire: dispatch through the chunker registry instead of
-        # calling the Swift walker (chunk_source) directly -- get_chunker(lang)
-        # resolves the right backend, chunk_file(text, rel) is the uniform
-        # per-backend contract (ChunkResult: chunks/gaps/status). Per-file
-        # fail-open (spec S4): ANY exception escaping the chunker, or a
-        # ChunkResult with status "failed", must not crash the reindex --
-        # warn, write NO file_sha row (so the file's sha never matches on the
-        # next run and repair retriggers), and move on to the next file. A
-        # "partial" status still indexes its chunks and writes file_sha with
-        # gap_count = len(gaps) -- the existing gap behavior, unchanged.
-        try:
-            result = chunkers.get_chunker(lang).chunk_file(text, rel)
+            pending_texts.extend(file_texts)
+            pending_ids.extend(file_ids)
+            if is_new:
+                added_files += 1
+            else:
+                changed_files += 1
         except Exception as exc:
+            # B1: purge whatever this path still has in the index, so no
+            # stale row outlives the source that produced it, and the
+            # missing file_sha row keeps the index reading "stale".
+            try:
+                delete_code_chunks_for_path(conn, args.project, rel)
+                conn.execute(
+                    "DELETE FROM file_sha WHERE project=? AND path=?", (args.project, rel)
+                )
+            except Exception:
+                pass
+            failed_files += 1
             print(
-                f"code-reindex: WARNING chunker raised on {rel}: "
-                f"{type(exc).__name__}: {exc} -- not indexed (repair will retry)",
+                f"code-reindex: WARNING {rel} not indexed: "
+                f"{type(exc).__name__}: {exc} -- any previously indexed chunks for "
+                "this file were removed (repair will retry)",
                 file=sys.stderr,
             )
             continue
-
-        for g in result.gaps:
-            total_gaps += 1
-            print(
-                f"code-reindex: WARNING gap in {rel} lines {g[0]}-{g[1]} "
-                f"({g[2]}, skipped)",
-                file=sys.stderr,
-            )
-
-        if result.status == "failed":
-            print(
-                f"code-reindex: WARNING {rel}: chunker reported status=failed -- "
-                "not indexed (repair will retry)",
-                file=sys.stderr,
-            )
-            continue
-
-        chunks = result.chunks
-        gaps = result.gaps
-
-        delete_code_chunks_for_path(conn, args.project, rel)
-        text_lines = text.splitlines()
-        for chunk in chunks:
-            body_lines = text_lines[chunk["start_line"] : chunk["end_line"] - 1]
-            cur = conn.execute(
-                """INSERT INTO chunks (path, project, lang, kind, symbol, qualified_name,
-                       signature, doc, start_line, end_line)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    rel, args.project, chunk["lang"], chunk["kind"], chunk["symbol"],
-                    chunk["qualified_name"], chunk["signature"], chunk["doc"],
-                    chunk["start_line"], chunk["end_line"],
-                ),
-            )
-            chunk_id = cur.lastrowid
-            split_tokens = split_qualified(chunk["qualified_name"])
-            body_text = "\n".join(body_lines[:25])
-            conn.execute(
-                "INSERT INTO fts (rowid, qualified_name, split_tokens, signature, doc, body) "
-                "VALUES (?,?,?,?,?,?)",
-                (chunk_id, chunk["qualified_name"], split_tokens, chunk["signature"] or "",
-                 chunk["doc"] or "", body_text),
-            )
-            if not args.no_embed:
-                pending_texts.append(code_embed_text_for(rel, chunk, body_lines))
-                pending_ids.append(chunk_id)
-
-        stat = f.stat()
-        conn.execute(
-            "INSERT OR REPLACE INTO file_sha (path, project, sha256, mtime, size, gap_count, chunker_version) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (rel, args.project, sha, stat.st_mtime, stat.st_size, len(gaps), cv),
-        )
-        if is_new:
-            added_files += 1
-        else:
-            changed_files += 1
 
     reembeds = 0
     if pending_texts:
@@ -2173,8 +2317,8 @@ def cmd_code_reindex(args) -> int:
     elapsed = time.time() - t0
     print(
         f"code-reindex: {len(files)} files scanned, {added_files} added, {changed_files} changed, "
-        f"{unchanged_files} unchanged, {len(removed)} removed, {reembeds} chunk(s) (re-)embedded, "
-        f"{total_gaps} gap(s) warned, {elapsed:.3f}s"
+        f"{unchanged_files} unchanged, {len(removed)} removed, {failed_files} failed, "
+        f"{reembeds} chunk(s) (re-)embedded, {total_gaps} gap(s) warned, {elapsed:.3f}s"
     )
     if skipped_unknown:
         # Task 5 census (spec S4, INC-0103/0104 lesson): a walked file whose
@@ -2270,7 +2414,15 @@ def code_census(root: Path) -> dict:
     yields nothing, so an empty or nonexistent root produces an empty dict,
     not an error."""
     skip_dirs = _census_skip_dirs()
-    counts: dict = {}
+    # C5 (Anatomy M1 fix wave, Codex): EVERY LANGUAGE_TABLE language gets a
+    # row, seeded at zero, whether or not the tree holds one of its files.
+    # The driven install flow (skills/memcontinuum/SKILL.md step 2) has to
+    # present "supported but not found" alongside "proposed", and a
+    # language simply missing from the JSON forces every consumer to
+    # re-derive the known-language list for itself to spot the difference.
+    counts: dict = {
+        lang: {"files": 0, "status": "supported"} for lang in chunkers.LANGUAGE_TABLE
+    }
 
     def bump(key: str, status: str) -> None:
         row = counts.setdefault(key, {"files": 0, "status": status})
@@ -2280,7 +2432,10 @@ def code_census(root: Path) -> dict:
         dirnames[:] = [d for d in dirnames if d not in skip_dirs]
         for fname in sorted(filenames):
             path = Path(dirpath) / fname
-            _, ext = os.path.splitext(fname)
+            # I2: compound-extension aware, so `foo.blade.php` is keyed
+            # ".blade.php" and never folded into the ".php" bucket
+            # lang_for_path already refuses to treat it as.
+            ext = chunkers.extension_of(fname)
             if ext:
                 lang = chunkers.lang_for_path(path)
                 if lang is not None:
@@ -2323,6 +2478,9 @@ def _print_code_census_table(counts: dict) -> None:
     total = sum(row["files"] for row in counts.values())
     print(f"code-census: {total} file(s) scanned")
     if supported:
+        # C5: a language the tree does not hold is listed here at 0
+        # ("supported but not found"), not omitted -- same data the --json
+        # form now carries, in the human's form.
         print("supported:")
         for key, row in supported:
             print(f"  {key}: {row['files']}")
@@ -2330,7 +2488,7 @@ def _print_code_census_table(counts: dict) -> None:
         print("unsupported:")
         for key, row in unsupported:
             print(f"  {key}: {row['files']}")
-    if not counts:
+    if total == 0:
         print("(no files found)")
 
 
@@ -2370,6 +2528,21 @@ def code_hits_vector(conn: sqlite3.Connection, query: str, project: str):
 
 
 def _code_index_is_stale(conn: sqlite3.Connection, project: str) -> bool:
+    """Stale when the tree and the stored rows disagree in ANY of three
+    ways: a file's mtime/size drifted, a file is on disk with no stored
+    row at all, or a stored row was produced by a DIFFERENT chunker
+    version than the one this engine would use today (B2, Anatomy M1 fix
+    wave). Plus the missing-code_root case.
+
+    The chunker-version comparison is the one this check used to be
+    missing. `code-reindex` has always re-chunked a file whose stored
+    chunker_version no longer matches, but `code-search`'s staleness
+    report only compared mtime/size -- so bumping a chunker's
+    impl_version left every stored row reading "current" until something
+    on disk happened to change, which is precisely when a reader most
+    needs to be told the index predates the current chunker. A row for a
+    language with no LANGUAGE_TABLE row compares against "unversioned",
+    the same literal cmd_code_reindex's own fail-open stamps."""
     meta = conn.execute("SELECT code_root, langs FROM code_meta WHERE project=?", (project,)).fetchone()
     if meta is None or not meta["code_root"]:
         return False
@@ -2378,8 +2551,10 @@ def _code_index_is_stale(conn: sqlite3.Connection, project: str) -> bool:
         return True
     langs = meta["langs"].split(",") if meta["langs"] else None
     existing = {
-        row["path"]: (row["mtime"], row["size"])
-        for row in conn.execute("SELECT path, mtime, size FROM file_sha WHERE project=?", (project,))
+        row["path"]: (row["mtime"], row["size"], row["chunker_version"])
+        for row in conn.execute(
+            "SELECT path, mtime, size, chunker_version FROM file_sha WHERE project=?", (project,)
+        )
     }
     seen = set()
     for f in iter_code_source_files(root, langs):
@@ -2391,6 +2566,12 @@ def _code_index_is_stale(conn: sqlite3.Connection, project: str) -> bool:
         stat = f.stat()
         prev = existing.get(rel)
         if prev is None or prev[0] != stat.st_mtime or prev[1] != stat.st_size:
+            return True
+        try:
+            cv = chunkers.chunker_version(lang_for_source_file(f))
+        except KeyError:
+            cv = "unversioned"
+        if prev[2] != cv:
             return True
     return bool(set(existing.keys()) - seen)
 

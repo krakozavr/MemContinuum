@@ -50,6 +50,28 @@ def get_chunker(lang):
     return importlib.import_module(module_name)
 
 
+def extension_of(path):
+    """The extension a census/provenance tally should key `path` under.
+
+    Compound-extension aware (Anatomy M1 fix wave, I2): a file named
+    `foo.blade.php` is keyed ".blade.php", NOT the ".php" a plain
+    `os.path.splitext` would return -- lang_for_path already refuses to
+    treat the two as the same thing (COMPOUND_EXCLUDES), so a tally that
+    folded them together would describe a tree neither surface agrees
+    exists. Returns "" for an extensionless file, exactly like splitext.
+
+    Single source for both tallies that need it (memidx.code_census and
+    code-reindex's skipped-extension provenance line) rather than a
+    splitext call duplicated at each site.
+    """
+    basename = os.path.basename(os.fspath(path))
+    for excluded in COMPOUND_EXCLUDES:
+        if basename.endswith(excluded) and basename != excluded:
+            return excluded
+    _, ext = os.path.splitext(basename)
+    return ext
+
+
 def lang_for_path(path):
     """Extension (compound-ext aware) -> lang name, else None.
 
@@ -135,29 +157,53 @@ def lang_for_shebang(first_line):
     return None
 
 
-def wired_skip_dirs(langs):
-    """Directory names to prune from a walk, UNIONED across a chosen
-    language subset (Task 7, Anatomy M1 milestone).
+def skip_dirs_for_lang(lang):
+    """The noise directory names `lang` itself wants pruned -- empty for a
+    language with no LANGUAGE_TABLE row (fail open, never raise)."""
+    return frozenset(LANGUAGE_TABLE.get(lang, {}).get("skip_dirs", ()))
 
-    Deliberately-resolved design note (brief Step 1(b)): pruning is a
-    single decision made once per directory for the WHOLE walk, using the
-    union of every wired lang's skip_dirs -- not a per-language decision
-    re-made for each wired lang. So a directory named in ANY wired lang's
-    skip_dirs is pruned for ALL of them, even a lang whose own skip_dirs
-    entry would never have pruned it standalone. Concretely: swift's
-    skip_dirs includes "Tests"; wiring swift alongside python prunes
-    "Tests/" from the walk entirely, so a `Tests/*.py` file is invisible
-    to python's chunker too -- accepted trade-off (simpler than a
-    per-lang-aware walk), not a bug. Only after this union prune does
-    per-file classification (chunkers.lang_for_path) filter by extension.
 
-    Fails open on a `lang` with no LANGUAGE_TABLE row (a stray/typo'd
-    --lang value, or a language the engine doesn't chunk yet): contributes
-    no skip_dirs rather than raising, matching cmd_code_reindex's existing
-    per-file tolerance for the same case (chunker_version falls back to
-    "unversioned") and the documented behavior that naming an unwired
-    language just matches zero files, silently -- never a crash."""
-    dirs = set()
-    for lang in langs:
-        dirs.update(LANGUAGE_TABLE.get(lang, {}).get("skip_dirs", ()))
-    return dirs
+def common_skip_dirs(langs):
+    """Directory names EVERY wired language would drop anyway -- the
+    INTERSECTION of the wired languages' skip sets (Anatomy M1 fix wave,
+    C1; supersedes the old union rule).
+
+    Why an intersection and not a union: a skip set belongs to ONE
+    language and describes ITS noise. Swift's names "Tests"; python's does
+    not. Pruning the union made a directory named by ANY wired language
+    invisible to EVERY wired language, so wiring swift alongside python
+    silently dropped every `Tests/*.py` file in the project -- real source
+    the census had just proposed python on the strength of. The Codex gate
+    ruled that data loss, not an accepted trade-off.
+
+    So the walk prunes only what is safe to prune for everyone: the global
+    noise dirs plus this intersection (a pure optimization -- every file
+    under such a directory would be dropped by its own language's rule
+    anyway). Every other directory is walked, and the per-file decision
+    (see `dir_is_skipped_for_lang`) drops a file iff one of its ancestor
+    directory names sits in ITS OWN language's skip set.
+
+    Languages with no LANGUAGE_TABLE row contribute nothing and are
+    ignored here rather than emptying the intersection -- an unknown name
+    would otherwise silently switch the optimization off. (code-reindex
+    itself now rejects an unknown --lang outright; this only keeps the
+    helper honest for any other caller.)"""
+    sets = [skip_dirs_for_lang(l) for l in langs if l in LANGUAGE_TABLE]
+    if not sets:
+        return set()
+    common = set(sets[0])
+    for s in sets[1:]:
+        common &= s
+    return common
+
+
+def path_is_skipped_for_lang(rel_parts, lang):
+    """True when any ancestor DIRECTORY name in `rel_parts` (a file path's
+    parts RELATIVE to the code root, its own basename included or not --
+    only the directory components are consulted) is in `lang`'s own
+    skip set. The parts must be root-relative: a code root that is itself
+    named `Tests` must not have its whole contents dropped."""
+    skip = skip_dirs_for_lang(lang)
+    if not skip:
+        return False
+    return any(part in skip for part in rel_parts[:-1])
