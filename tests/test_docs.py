@@ -30,6 +30,15 @@ SKILL = TOOLS_DIR / "skills" / "memcontinuum" / "SKILL.md"
 SEARCH_SKILL = TOOLS_DIR / "skills" / "memory-search" / "SKILL.md"
 INSTALL_HOOKS = TOOLS_DIR / "hooks" / "install-hooks.md"
 
+# This repo dogfoods its own installer: .claude/skills/<name>/SKILL.md is the
+# INSTALLED copy that Claude Code actually loads in this checkout, and it is
+# tracked. repo-init.sh installs a skill by copying the template over it, so
+# the two must stay byte-identical -- a template fix that never reaches the
+# installed copy is a fix nobody in this repo gets.
+INSTALLED_SKILLS = sorted(
+    (TOOLS_DIR / ".claude" / "skills").glob("*/SKILL.md")
+)
+
 PYTHON = os.environ.get("MEMCONTINUUM_PYTHON") or sys.executable
 
 # Every command the README tells a person they can run with --help. Each must
@@ -65,7 +74,9 @@ FORBIDDEN = [
     ("phantom schema section", re.compile(r"§G\d")),
 ]
 
-PUBLIC_DOCS = [README, INTERNALS, DESIGN, SKILL, SEARCH_SKILL, INSTALL_HOOKS]
+PUBLIC_DOCS = [
+    README, INTERNALS, DESIGN, SKILL, SEARCH_SKILL, INSTALL_HOOKS,
+] + INSTALLED_SKILLS
 
 
 def _scan(label, text, offenders):
@@ -82,7 +93,8 @@ class TestPublicDocsCarryNoProvenance(unittest.TestCase):
         offenders = {}
         for doc in PUBLIC_DOCS:
             self.assertTrue(doc.is_file(), f"missing {doc}")
-            _scan(doc.name, doc.read_text(), offenders)
+            # Path-relative label: several of these are named SKILL.md.
+            _scan(str(doc.relative_to(TOOLS_DIR)), doc.read_text(), offenders)
         self.assertEqual(
             offenders, {},
             "development-history provenance found in a public-facing doc "
@@ -108,6 +120,39 @@ class TestPublicDocsCarryNoProvenance(unittest.TestCase):
         self.assertEqual(
             offenders, {},
             f"development-history provenance found in --help output: {offenders}",
+        )
+
+
+class TestInstalledSkillsMatchTheirTemplates(unittest.TestCase):
+    """The defect this catches: a skill is edited under skills/ and the copy
+    this checkout actually loads, .claude/skills/<name>/SKILL.md, keeps the old
+    text -- tracked, shipped to every clone, and invisible to a scan that only
+    looks at the template. repo-init.sh installs by copying the template over
+    the destination, so identity is the real invariant, not similarity."""
+
+    def test_at_least_one_installed_skill_is_checked(self):
+        # Guards the guard: an empty glob would make the identity test vacuous.
+        self.assertTrue(
+            INSTALLED_SKILLS,
+            "no .claude/skills/*/SKILL.md found -- if the installed copies moved, "
+            "point INSTALLED_SKILLS at their new home rather than dropping the check",
+        )
+
+    def test_each_installed_skill_is_byte_identical_to_its_template(self):
+        drifted = []
+        for installed in INSTALLED_SKILLS:
+            template = TOOLS_DIR / "skills" / installed.parent.name / "SKILL.md"
+            self.assertTrue(
+                template.is_file(),
+                f"{installed.relative_to(TOOLS_DIR)} has no template at "
+                f"{template.relative_to(TOOLS_DIR)}",
+            )
+            if installed.read_bytes() != template.read_bytes():
+                drifted.append(str(installed.relative_to(TOOLS_DIR)))
+        self.assertEqual(
+            drifted, [],
+            "installed skill copies have drifted from their templates -- copy the "
+            f"template over each (that is what repo-init.sh does): {drifted}",
         )
 
 

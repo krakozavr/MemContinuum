@@ -2368,8 +2368,9 @@ def code_census(root: Path) -> dict:
     LANGUAGE_TABLE row's skip_dirs -- see its docstring for why this is
     wider than a wired-langs walk). Fails open per file and never raises on
     a walk it can complete: os.walk over a missing/unreadable root just
-    yields nothing, so an empty or nonexistent root produces an empty dict,
-    not an error."""
+    yields nothing, so an empty or nonexistent root returns the zero-seeded
+    rows below -- every LANGUAGE_TABLE language at 0, no unsupported rows at
+    all -- rather than an error (or an empty dict)."""
     skip_dirs = _census_skip_dirs()
     # C5 (Anatomy M1 fix wave, Codex): EVERY LANGUAGE_TABLE language gets a
     # row, seeded at zero, whether or not the tree holds one of its files.

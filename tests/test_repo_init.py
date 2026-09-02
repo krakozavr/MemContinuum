@@ -1862,7 +1862,10 @@ class TestMultiRootCodeIndexTruncation(unittest.TestCase):
 
             # The note must NAME the un-indexed root, not just hint at one.
             self.assertIn(str(second), out, out)
-            self.assertIn("later milestone", out.lower(), out)
+            self.assertIn("only the first code root is indexed", out.lower(), out)
+            # ... and it must say so in present tense: no roadmap vocabulary in
+            # anything a person reads during an install.
+            self.assertNotIn("milestone", out.lower(), out)
 
             code_db = Path(home) / ".memcontinuum" / "multi-code.sqlite"
             self.assertTrue(code_db.is_file(), out)

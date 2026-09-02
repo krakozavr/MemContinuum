@@ -1177,9 +1177,8 @@ fi
 # under the root it was given, and overwrites code_meta.code_root. Looping
 # it over several roots therefore left only the LAST root indexed, having
 # quietly deleted the earlier ones' rows on the way -- an install that
-# reported success while throwing most of its own work away. Multi-root
-# code indexing is a later milestone; until then the honest thing is to
-# index one root and SAY which roots were not indexed.
+# reported success while throwing most of its own work away. The honest
+# thing with several roots is to index one and SAY which were not indexed.
 CODE_REINDEX_RAN=0
 CODE_REINDEX_RC=0
 CODE_REINDEX_OUT=""
@@ -1199,10 +1198,10 @@ if [ "${#CODE_ROOTS_ABS[@]}" -gt 0 ] && [ -n "$CHOSEN_LANGS" ]; then
             fi
             i=$((i + 1))
         done
-        echo "    The code index holds one root per project; multi-root code"
-        echo "    indexing is a later milestone. Code under the roots above is"
-        echo "    NOT searchable via code-search, and new files there still get"
-        echo "    the write-time reminder."
+        echo "    The code index holds one root per project: only the first code"
+        echo "    root is indexed, the others are not. Code under the roots above"
+        echo "    is NOT searchable via code-search, though a new file written"
+        echo "    there still gets the new-file reminder."
         echo
     fi
     if [ "$DRY_RUN" -eq 0 ]; then
