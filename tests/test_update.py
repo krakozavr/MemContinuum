@@ -61,7 +61,18 @@ def git_repo(path):
     subprocess.run(["git", "init", "-q", "."], cwd=path, check=True)
     subprocess.run(["git", "-c", "user.email=a@b.c", "-c", "user.name=a",
                      "commit", "-q", "--allow-empty", "-m", "init"], cwd=path, check=True)
-    return path
+    # Resolved, not raw: mc_repo_key (scripts/mc-registry-lib.sh) keys every
+    # registry row on `git rev-parse --show-toplevel`, which is always the
+    # physical (symlink-free) path -- git resolves via getcwd() internally,
+    # not the shell's logical $PWD. Handing back the raw tempfile.mkdtemp()
+    # form here (macOS's /var/folders/... is itself a symlink to
+    # /private/var/folders/...) would make write_row's direct decisions.tsv
+    # writes below key against a string mc_repo_key never produces, and
+    # would make every no-wired-row/refusal message (which echoes the
+    # resolved MC_REPO/MC_REPO_KEY back) disagree with a raw comparison --
+    # both correct only on Linux, where /tmp is not usually symlinked and
+    # raw happens to equal resolved.
+    return os.path.realpath(path)
 
 
 def engine_sha(root=None, scope="repo"):

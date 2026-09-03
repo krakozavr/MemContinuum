@@ -64,7 +64,16 @@ def run(script, args, home, mc_home, stdin=None, timeout=120):
 def git_repo(path):
     Path(path).mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init", "-q", "."], cwd=path, check=True)
-    return path
+    # Resolved, not raw: mc_repo_key (scripts/mc-registry-lib.sh) keys every
+    # registry row on `git rev-parse --show-toplevel`, which is always the
+    # physical (symlink-free) path -- git resolves via getcwd() internally,
+    # not the shell's logical $PWD. Handing back the raw tempfile.mkdtemp()
+    # form here (macOS's /var/folders/... is itself a symlink to
+    # /private/var/folders/...) would make any DIRECT decisions.tsv write in
+    # these tests (write_row equivalents below, plus manual writes) key
+    # against a string mc_repo_key never produces -- correct only on Linux,
+    # where /tmp is not usually symlinked and raw happens to equal resolved.
+    return os.path.realpath(path)
 
 
 class BootstrapCase(unittest.TestCase):
