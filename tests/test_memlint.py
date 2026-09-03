@@ -330,5 +330,89 @@ class TestMemlintCLIRepeatableCodeRoot(unittest.TestCase):
         self.assertIsNone(unknown)
 
 
+class TestF3MemlintChecks(unittest.TestCase):
+    def _lint(self, frontmatter_yaml, body="Body.\n"):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "topics" / "reference"; root.mkdir(parents=True)
+            (root / "t.md").write_text(f"---\n{frontmatter_yaml}\n---\n{body}")
+            return memlint.lint_root(Path(td))
+
+    def test_rationale_authority_unknown_is_error(self):
+        errors, _ = self._lint(
+            "type: topic\nid: TOP-1\ntitle: T\nlinks:\n  - link: L1\n    status: active\n"
+            "    ruling: {text: r, authority: owner-verbatim, source: s}\n"
+            "    rationale: {text: w, authority: bogus}\n"
+        )
+        self.assertTrue(any("rationale.authority" in e for e in errors), errors)
+
+    def test_alternatives_authority_unknown_is_error(self):
+        errors, _ = self._lint(
+            "type: topic\nid: TOP-1\ntitle: T\nlinks:\n  - link: L1\n    status: active\n"
+            "    ruling: {text: r, authority: owner-verbatim, source: s}\n"
+            "    alternatives:\n      - {option: o, rejected_because: b, authority: bogus}\n"
+        )
+        self.assertTrue(any("alternatives" in e for e in errors), errors)
+
+    def test_duplicate_link_id_within_topic_is_error(self):
+        errors, _ = self._lint(
+            "type: topic\nid: TOP-1\ntitle: T\nlinks:\n"
+            "  - link: L1\n    status: active\n    ruling: {text: a, authority: owner-verbatim, source: s}\n"
+            "  - link: L1\n    status: active\n    ruling: {text: b, authority: owner-verbatim, source: s}\n"
+        )
+        self.assertTrue(any("used 2 times" in e for e in errors), errors)
+
+    def test_dangling_reverses_is_error(self):
+        errors, _ = self._lint(
+            "type: topic\nid: TOP-1\ntitle: T\nlinks:\n"
+            "  - link: L1\n    status: active\n    reverses: L99\n    reason_for_change: new-evidence\n"
+            "    ruling: {text: a, authority: owner-verbatim, source: s}\n"
+        )
+        self.assertTrue(any("does not match any link id" in e for e in errors), errors)
+
+    def test_agent_inference_with_invariant_is_always_an_error_evidence_or_not(self):
+        # Ruling 70: agent-inference can never be promoted -- unlike
+        # Revision 2/3's rule (evidence alone silenced the error), this now
+        # errors even WITH a non-empty evidence list, since no amount of
+        # evidence fixes an agent-inference invariant.
+        errors, _ = self._lint(
+            "type: topic\nid: TOP-1\ntitle: T\nlinks:\n  - link: L1\n    status: active\n"
+            "    ruling: {text: r, authority: agent-inference, source: s}\n"
+            "    evidence: [\"a real-looking citation\"]\n"
+            "    invariant: {kind: no-bypass, pattern: x}\n"
+        )
+        self.assertTrue(any("agent-inference" in e for e in errors), errors)
+
+    def test_reviewer_finding_with_only_blank_evidence_is_error(self):
+        errors, _ = self._lint(
+            "type: topic\nid: TOP-1\ntitle: T\nlinks:\n  - link: L1\n    status: active\n"
+            "    ruling: {text: r, authority: reviewer-finding, source: s}\n"
+            "    evidence: [\"\", \"   \"]\n"
+            "    invariant: {kind: no-bypass, pattern: x}\n"
+        )
+        self.assertTrue(any("evidence" in e for e in errors), errors)
+
+    def test_reviewer_finding_with_scalar_evidence_is_error(self):
+        # Ruling 70: evidence must be a parsed LIST of non-blank strings. A
+        # bare YAML scalar ("evidence: commit abc123" instead of a list) is
+        # not that shape -- and must not be silently accepted by iterating
+        # its characters as if it were a list of one-letter "citations".
+        errors, _ = self._lint(
+            "type: topic\nid: TOP-1\ntitle: T\nlinks:\n  - link: L1\n    status: active\n"
+            "    ruling: {text: r, authority: reviewer-finding, source: s}\n"
+            "    evidence: \"commit abc123\"\n"
+            "    invariant: {kind: no-bypass, pattern: x}\n"
+        )
+        self.assertTrue(any("evidence" in e for e in errors), errors)
+
+    def test_reviewer_finding_with_real_evidence_is_clean(self):
+        errors, _ = self._lint(
+            "type: topic\nid: TOP-1\ntitle: T\nlinks:\n  - link: L1\n    status: active\n"
+            "    ruling: {text: r, authority: reviewer-finding, source: s}\n"
+            "    evidence: [\"commit abc123 -- verified\"]\n"
+            "    invariant: {kind: no-bypass, pattern: x}\n"
+        )
+        self.assertFalse(any("evidence" in e or "agent-inference" in e for e in errors), errors)
+
+
 if __name__ == "__main__":
     unittest.main()

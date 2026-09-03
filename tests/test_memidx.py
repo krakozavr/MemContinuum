@@ -16,6 +16,7 @@ TOOLS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(TOOLS_DIR))
 
 import memidx  # noqa: E402
+import memlint  # noqa: E402
 
 FIXTURES = TOOLS_DIR / "fixtures"
 # The 14 incident records are local copies (fixtures/records/incidents/) of the
@@ -954,6 +955,165 @@ class TestF2EmbeddingMode(unittest.TestCase):
             self.assertIn("1 embedding(s) backfilled", buf.getvalue())
             path = str(root / "topics" / "t.md")
             self.assertIsNotNone(self._emb(db, path))
+
+
+class TestF3TrustModel(unittest.TestCase):
+    SYNTHETIC_TOPIC = """---
+type: topic
+id: TOP-9100
+title: Synthetic violations
+links:
+  - link: L1
+    status: active
+    ruling: {text: "r", authority: owner-verbatim, source: s}
+    rationale: {text: "why", authority: not-a-real-authority}
+    alternatives:
+      - {option: "o", rejected_because: "b", authority: also-not-real}
+    invariant: {kind: not-a-real-kind, pattern: "("}
+  - link: L1
+    status: active
+    ruling: {text: "dup", authority: owner-verbatim, source: s}
+    reverses: L99
+    reason_for_change: new-evidence
+    superseded_by: L98
+---
+Body.
+"""
+
+    def test_synthetic_topic_produces_at_least_five_errors(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "topics" / "reference"; root.mkdir(parents=True)
+            (root / "synthetic.md").write_text(self.SYNTHETIC_TOPIC)
+            errors, warnings = memlint.lint_root(Path(td))
+            self.assertGreaterEqual(len(errors), 5, errors)
+
+    def test_single_definition_zero_matches_is_a_violation(self):
+        with tempfile.TemporaryDirectory() as td:
+            code_root = Path(td) / "code"; code_root.mkdir()
+            (code_root / "a.py").write_text("x = 1\n")
+            hits = memidx.check_invariant(code_root, {"kind": "single-definition", "pattern": "def gate\\("})
+            self.assertEqual(hits, ["<no definition found>"])
+
+    def test_unknown_kind_is_skipped_not_a_traceback(self):
+        with self.assertRaises(memidx.InvariantSkipped):
+            memidx.check_invariant(Path("."), {"kind": "bogus-kind", "pattern": "x"})
+
+    def test_invalid_regex_is_skipped_not_a_traceback(self):
+        with self.assertRaises(memidx.InvariantSkipped):
+            memidx.check_invariant(Path("."), {"kind": "no-bypass", "pattern": "("})
+
+    def test_must_call_without_scope_is_skipped(self):
+        with self.assertRaises(memidx.InvariantSkipped):
+            memidx.check_invariant(Path("."), {"kind": "must-call", "pattern": "x"})
+
+    def test_drift_never_raises_and_names_each_skip_reason(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = Path(td) / "store"; (store / "topics" / "reference").mkdir(parents=True)
+            topic = """---
+type: topic
+id: TOP-9200
+title: Four skip cases
+links:
+  - {link: L1, status: active, ruling: {text: r, authority: owner-verbatim, source: s}, invariant: {kind: bogus, pattern: "x"}}
+  - {link: L2, status: active, ruling: {text: r, authority: owner-verbatim, source: s}, invariant: {kind: no-bypass, pattern: "("}}
+  - {link: L3, status: active, ruling: {text: r, authority: owner-verbatim, source: s}, invariant: {kind: must-call, pattern: "x"}}
+  - {link: L4, status: active, ruling: {text: r, authority: agent-inference, source: s}, invariant: {kind: no-bypass, pattern: "unlink\\\\("}}
+---
+Body.
+"""
+            (store / "topics" / "reference" / "t.md").write_text(topic)
+            db = Path(td) / "idx.sqlite"
+            reindex(store, db, no_embed=True)
+            code_root = Path(td) / "code"; code_root.mkdir(); (code_root / "a.py").write_text("x=1\n")
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                memidx.cmd_drift(ns(project=memidx.DEFAULT_PROJECT, db=str(db),
+                                     code_root=str(code_root), json=True))
+            out = json.loads(buf_out.getvalue())
+            self.assertEqual(len(out["skipped"]), 4, out)
+            reasons = {s["reason"] for s in out["skipped"]}
+            self.assertTrue(any("unknown kind" in r for r in reasons), reasons)
+            self.assertTrue(any("invalid regex" in r for r in reasons), reasons)
+            self.assertTrue(any("missing scope" in r for r in reasons), reasons)
+            self.assertIn("authority", reasons)
+
+    def test_constraint_authority_is_always_enforced(self):
+        row = {"status": "active", "ruling_authority": "owner-verbatim", "evidence": None}
+        self.assertEqual(memidx.invariant_enforcement_class(row), "constraint")
+
+    def test_evidence_bearing_reviewer_finding_is_a_hold(self):
+        row = {"status": "active", "ruling_authority": "reviewer-finding",
+               "evidence": json.dumps(["commit abc123"])}
+        self.assertEqual(memidx.invariant_enforcement_class(row), "hold")
+
+    def test_reviewer_finding_without_evidence_is_context_not_hold(self):
+        row = {"status": "active", "ruling_authority": "reviewer-finding", "evidence": None}
+        self.assertEqual(memidx.invariant_enforcement_class(row), "context")
+
+    def test_blank_string_evidence_counts_as_empty(self):
+        # Ruling 70: evidence must be VALIDATED content, not merely tested
+        # for truthiness -- a list of blank strings is [] in every way
+        # that matters.
+        row = {"status": "active", "ruling_authority": "code-derived",
+               "evidence": json.dumps(["", "   "])}
+        self.assertEqual(memidx.invariant_enforcement_class(row), "context")
+
+    def test_scalar_evidence_is_not_a_validated_list(self):
+        # Same agreement point as memlint's own scalar-evidence test: a bare
+        # JSON-encoded string ("evidence" stored as a scalar, not a list) is
+        # not the "parsed list of non-blank strings" ruling 70 requires.
+        row = {"status": "active", "ruling_authority": "reviewer-finding",
+               "evidence": json.dumps("commit abc123")}
+        self.assertEqual(memidx.invariant_enforcement_class(row), "context")
+
+    def test_agent_inference_is_never_promoted_by_evidence(self):
+        # The specific point Codex rejected in Grok's flat OR: a bare
+        # non-empty list must not promote an unverified guess to
+        # enforcement, however "real" the list looks.
+        row = {"status": "active", "ruling_authority": "agent-inference",
+               "evidence": json.dumps(["looks real but agent-inference can never be promoted"])}
+        self.assertEqual(memidx.invariant_enforcement_class(row), "context")
+
+    def test_non_active_status_is_always_context(self):
+        row = {"status": "superseded", "ruling_authority": "owner-verbatim", "evidence": None}
+        self.assertEqual(memidx.invariant_enforcement_class(row), "context")
+
+    def test_drift_strict_holds_fails_only_under_the_flag(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = Path(td) / "store"; (store / "topics" / "reference").mkdir(parents=True)
+            topic = """---
+type: topic
+id: TOP-9300
+title: Hold case
+links:
+  - link: L1
+    status: active
+    ruling: {text: r, authority: reviewer-finding, source: s}
+    evidence: ["commit abc123 -- verified the bypass exists"]
+    invariant: {kind: no-bypass, pattern: "unsafe_call\\\\("}
+---
+Body.
+"""
+            (store / "topics" / "reference" / "t.md").write_text(topic)
+            db = Path(td) / "idx.sqlite"
+            reindex(store, db, no_embed=True)
+            code_root = Path(td) / "code"; code_root.mkdir()
+            (code_root / "a.py").write_text("unsafe_call(1)\n")   # trips the invariant
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = memidx.cmd_drift(ns(project=memidx.DEFAULT_PROJECT, db=str(db),
+                                          code_root=str(code_root), json=True, strict_holds=False))
+            out = json.loads(buf.getvalue())
+            self.assertEqual(len(out["hold_violations"]), 1, out)
+            self.assertEqual(out["violations"], [])
+            self.assertEqual(rc, 0, "a hold-violation must not fail the exit without --strict-holds")
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = memidx.cmd_drift(ns(project=memidx.DEFAULT_PROJECT, db=str(db),
+                                          code_root=str(code_root), json=True, strict_holds=True))
+            self.assertEqual(rc, 1, "the same hold-violation must fail the exit under --strict-holds")
 
 
 if __name__ == "__main__":

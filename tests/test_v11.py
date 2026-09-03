@@ -542,11 +542,12 @@ class TestDrift(unittest.TestCase):
             rc, out = run_capturing(memidx.cmd_drift, args)
             self.assertEqual(rc, 1)
             data = json.loads(out)
-            self.assertEqual(len(data), 1)
-            self.assertEqual(data[0]["topic"], "TOP-0100")
-            self.assertEqual(data[0]["link"], "L2")
-            self.assertEqual(len(data[0]["hits"]), 1)
-            self.assertIn("QuickCleanup.swift", data[0]["hits"][0])
+            self.assertEqual(len(data["violations"]), 1, data)
+            self.assertEqual(data["hold_violations"], [])
+            self.assertEqual(data["violations"][0]["topic"], "TOP-0100")
+            self.assertEqual(data["violations"][0]["link"], "L2")
+            self.assertEqual(len(data["violations"][0]["hits"]), 1)
+            self.assertIn("QuickCleanup.swift", data["violations"][0]["hits"][0])
 
     def test_drift_green_when_bypass_routed_through_gate(self):
         with tempfile.TemporaryDirectory() as td:
@@ -567,7 +568,9 @@ class TestDrift(unittest.TestCase):
             )
             rc, out = run_capturing(memidx.cmd_drift, args)
             self.assertEqual(rc, 0)
-            self.assertEqual(json.loads(out), [])
+            data = json.loads(out)
+            self.assertEqual(data["violations"], [])
+            self.assertEqual(data["hold_violations"], [])
 
     def test_drift_text_report_format(self):
         with tempfile.TemporaryDirectory() as td:
@@ -601,7 +604,7 @@ class TestDrift(unittest.TestCase):
             rc, out = run_capturing(memidx.cmd_drift, args)
             self.assertEqual(rc, 1)
             data = json.loads(out)
-            self.assertEqual(len(data[0]["hits"]), 1)
+            self.assertEqual(len(data["violations"][0]["hits"]), 1)
 
 
 # ---------------------------------------------------------------------------

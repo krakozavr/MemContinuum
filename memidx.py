@@ -74,7 +74,16 @@ EMBED_BODY_CHARS = 1500
 # covers this round's own stamp/generation scheme plus later tasks' evidence/
 # link-row columns. A db stamped below this reads "upgrade-required" from
 # decision_index_state (see below) until its next reindex.
-CURRENT_INDEX_GENERATION = 2
+# Bumped to 3 (F3, ruling 70): an unchanged-sha row would otherwise keep
+# links.evidence NULL forever -- the migration guard only adds the COLUMN,
+# it cannot retroactively parse markdown that never gets re-read. A db
+# stamped below generation 3 now reads "upgrade-required" (decision_index_state,
+# below) until its next reindex -- readers warn instead of trusting it as
+# fully current. The reindex-side half of this (forcing a full content pass
+# on a generation mismatch, so an unchanged-sha topic's evidence actually
+# gets backfilled without a real edit) is cmd_reindex's own "migration
+# probe" and is not wired by this change alone; see this task's report.
+CURRENT_INDEX_GENERATION = 3
 
 # ---------------------------------------------------------------------------
 # frontmatter parsing (shared by memidx and memlint)
@@ -457,6 +466,15 @@ def ensure_embeddings_embed_sha_column(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE embeddings ADD COLUMN embed_sha TEXT")
 
 
+def ensure_links_evidence_column(conn: sqlite3.Connection) -> None:
+    """Migration guard shaped like ensure_links_invariant_column: a `links`
+    row must carry its own `evidence` (F3, ruling 70), or invariant_enforcement_class
+    has nothing to check a HOLD-eligible authority's validated evidence against."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(links)").fetchall()}
+    if "evidence" not in cols:
+        conn.execute("ALTER TABLE links ADD COLUMN evidence TEXT")
+
+
 def _run_decision_migration_guards(conn: sqlite3.Connection, db_path: Path, project: str | None) -> None:
     """Every additive-ALTER migration guard for the decision index, run
     unconditionally on every successful open (create via open_db, or
@@ -469,6 +487,7 @@ def _run_decision_migration_guards(conn: sqlite3.Connection, db_path: Path, proj
     enforcement, matching open_db's previous behavior exactly."""
     ensure_links_invariant_column(conn)
     ensure_embeddings_embed_sha_column(conn)
+    ensure_links_evidence_column(conn)
     if project is not None:
         enforce_project_isolation(conn, db_path, project)
 
@@ -593,8 +612,8 @@ def insert_record_rows(conn: sqlite3.Connection, project: str, rec: dict, sha: s
                    (topic_path, topic_id, project, link, seq, date, status, kind, reverses,
                     reason_for_change, ruling_text, ruling_authority, ruling_source,
                     rationale_text, rationale_authority, superseded_by, revisit_if,
-                    recorded_by, recorded_at, invariant)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    recorded_by, recorded_at, invariant, evidence)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     rec["path"], rec["id"], project, link.get("link"), seq,
                     str(link.get("date") or ""), link.get("status"), link.get("kind"),
@@ -604,6 +623,7 @@ def insert_record_rows(conn: sqlite3.Connection, project: str, rec: dict, sha: s
                     link.get("superseded_by"), json.dumps(link.get("revisit_if") or []),
                     link.get("recorded_by"), str(link.get("recorded_at") or ""),
                     json.dumps(invariant) if invariant else None,
+                    json.dumps(link.get("evidence") or []) if link.get("evidence") else None,
                 ),
             )
 
@@ -1680,6 +1700,57 @@ def cmd_why(args) -> int:
 # ---------------------------------------------------------------------------
 
 
+# F3 (external-fix round, coordinator ruling 70): the trust model's three
+# enforcement classes. docs/SCHEMA.md §4's CONSTRAINT tier is exactly
+# owner-verbatim/owner-ratified; HOLD is only reviewer-finding/code-derived,
+# and only WITH validated evidence -- an agent-inference invariant is never
+# promoted by evidence, however real-looking (Codex's specific correction
+# over a flatter authority-OR-evidence rule).
+CONSTRAINT_AUTHORITIES = {"owner-verbatim", "owner-ratified"}
+HOLD_ELIGIBLE_AUTHORITIES = {"reviewer-finding", "code-derived"}
+
+
+def _validated_evidence(link_row) -> list[str]:
+    """Parses `evidence` as a JSON list and keeps only non-blank string
+    entries -- [] and an all-blank list both count as empty (ruling 70:
+    evidence must be validated content, never merely tested for
+    truthiness)."""
+    try:
+        raw = json.loads(link_row["evidence"] or "[]")
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(raw, list):
+        return []
+    return [e.strip() for e in raw if isinstance(e, str) and e.strip()]
+
+
+def invariant_enforcement_class(link_row) -> str:
+    """"constraint" | "hold" | "context" -- ruling 70's four-class rule
+    (three outcomes; the fourth, "no invariant at all", never reaches this
+    function). "constraint": active owner-verbatim/owner-ratified -- always
+    enforced, a violation always fails the run. "hold": active
+    reviewer-finding/code-derived WITH validated evidence -- reported, only
+    fails the exit under --strict-holds. "context": everything else -- a
+    non-active status, agent-inference at ANY evidence state (an arbitrary
+    non-empty list must never promote it), or a HOLD-eligible authority
+    with no validated evidence."""
+    if link_row["status"] != "active":
+        return "context"
+    authority = link_row["ruling_authority"]
+    if authority in CONSTRAINT_AUTHORITIES:
+        return "constraint"
+    if authority in HOLD_ELIGIBLE_AUTHORITIES and _validated_evidence(link_row):
+        return "hold"
+    return "context"
+
+
+class InvariantSkipped(Exception):
+    """check_invariant refuses this invariant outright (bad kind/regex/
+    scope) rather than silently reporting no drift; cmd_drift catches this
+    per-entry and prints one distinct "skipped" line instead of a
+    traceback or a false "clean" result."""
+
+
 def links_with_active_invariant(conn, project: str):
     """(link row, invariant dict) for every active link that carries one."""
     rows = conn.execute(
@@ -1699,9 +1770,19 @@ def links_with_active_invariant(conn, project: str):
 
 def check_invariant(code_root: Path, invariant: dict) -> list[str]:
     """Run one docs/SCHEMA.md.1 SS3 invariant against code_root. Returns the
-    drift evidence lines -- empty means the invariant holds."""
+    drift evidence lines -- empty means the invariant holds. F3 (ruling 70):
+    every way this can be unevaluable is a named InvariantSkipped instead of
+    a silent `return []` or an uncaught traceback -- an unknown `kind`, an
+    invalid regex, or a `must-call` with no `scope`. A `single-definition`
+    with zero matches is still a real violation ("defined nowhere"), not a
+    skip."""
     kind = invariant.get("kind")
-    pattern = re.compile(invariant.get("pattern") or "")
+    if kind not in INVARIANT_KINDS:
+        raise InvariantSkipped(f"unknown kind {kind!r}")
+    try:
+        pattern = re.compile(invariant.get("pattern") or "")
+    except re.error as exc:
+        raise InvariantSkipped(f"invalid regex: {exc}") from exc
     allowed = invariant.get("allowed") or []
 
     if kind in ("pattern-absent", "no-bypass"):
@@ -1724,26 +1805,50 @@ def check_invariant(code_root: Path, invariant: dict) -> list[str]:
             for i, line in enumerate(text.splitlines(), start=1):
                 if pattern.search(line):
                     all_hits.append(f"{rel}:{i}")
+        if not all_hits:
+            return ["<no definition found>"]
         return [] if len(all_hits) == 1 else all_hits
 
-    if kind == "must-call":
-        scope = invariant.get("scope")
-        if not scope:
-            return []
-        missing = []
-        for fpath in sorted(code_root.glob(scope)):
-            if not fpath.is_file() or is_binary_file(fpath):
-                continue
-            rel = str(fpath.relative_to(code_root))
-            text = fpath.read_text(encoding="utf-8", errors="ignore")
-            if not pattern.search(text):
-                missing.append(rel)
-        return missing
+    # kind == "must-call" (the only remaining member of INVARIANT_KINDS)
+    scope = invariant.get("scope")
+    if not scope:
+        raise InvariantSkipped("missing scope")
+    missing = []
+    for fpath in sorted(code_root.glob(scope)):
+        if not fpath.is_file() or is_binary_file(fpath):
+            continue
+        rel = str(fpath.relative_to(code_root))
+        text = fpath.read_text(encoding="utf-8", errors="ignore")
+        if not pattern.search(text):
+            missing.append(rel)
+    return missing
 
-    return []
+
+def _format_drift_line(prefix: str, r: dict) -> str:
+    label = f"{r['topic']}/{r['link']}"
+    joined = ", ".join(r["hits"])
+    if r["kind"] in ("pattern-absent", "no-bypass"):
+        return f"{prefix}: {label} — {len(r['hits'])} hits outside allowed: {joined}"
+    if r["kind"] == "single-definition":
+        if r["hits"] == ["<no definition found>"]:
+            return f"{prefix}: {label} — expected exactly 1 definition, found 0"
+        return f"{prefix}: {label} — expected exactly 1 definition, found {len(r['hits'])}: {joined}"
+    if r["kind"] == "must-call":
+        return f"{prefix}: {label} — {len(r['hits'])} file(s) missing required call: {joined}"
+    return f"{prefix}: {label} — {len(r['hits'])} hits: {joined}"
 
 
 def cmd_drift(args) -> int:
+    """F3 (ruling 70): three buckets, not one flat list -- an active
+    owner-verbatim/owner-ratified invariant is a CONSTRAINT violation
+    (always fails the run); an active reviewer-finding/code-derived
+    invariant with validated evidence is a HOLD violation (reported, only
+    fails the exit under --strict-holds); everything else (non-active
+    status, agent-inference at any evidence state, or a HOLD-eligible
+    authority with no validated evidence) is CONTEXT -- named `skipped`,
+    never silently enforced. check_invariant's own InvariantSkipped (bad
+    kind/regex/scope) is caught per-entry and named too, never a
+    traceback."""
     db_path = resolve_db_path(args)
     # --code-root points at CODE, not the decision store's own markdown
     # tree, so this reader cannot compute "stale" either -- root stays None,
@@ -1760,36 +1865,39 @@ def cmd_drift(args) -> int:
     entries = links_with_active_invariant(conn, args.project)
     conn.close()
 
-    results = []
+    violations, hold_violations, skipped = [], [], []
     for link_row, invariant in entries:
-        hits = check_invariant(code_root, invariant)
-        if hits:
-            results.append(
-                {
-                    "topic": link_row["topic_id"],
-                    "link": link_row["link"],
-                    "kind": invariant.get("kind"),
-                    "hits": hits,
-                }
-            )
+        label = f"{link_row['topic_id']}/{link_row['link']}"
+        eclass = invariant_enforcement_class(link_row)
+        if eclass == "context":
+            reason = "authority" if link_row["status"] == "active" else f"status={link_row['status']}"
+            skipped.append({"link": label, "reason": reason})
+            continue
+        try:
+            hits = check_invariant(code_root, invariant)
+        except InvariantSkipped as exc:
+            skipped.append({"link": label, "reason": str(exc)})
+            continue
+        if not hits:
+            continue
+        entry = {"topic": link_row["topic_id"], "link": link_row["link"],
+                 "kind": invariant.get("kind"), "hits": hits}
+        (violations if eclass == "constraint" else hold_violations).append(entry)
 
+    strict = getattr(args, "strict_holds", False)
     if args.json:
-        print(json.dumps(results, indent=2))
+        print(json.dumps({"violations": violations, "hold_violations": hold_violations,
+                           "skipped": skipped}, indent=2))
     else:
-        if not results:
+        if not violations and not hold_violations:
             print("drift: no invariants violated")
-        for r in results:
-            label = f"{r['topic']}/{r['link']}"
-            joined = ", ".join(r["hits"])
-            if r["kind"] in ("pattern-absent", "no-bypass"):
-                print(f"DRIFT: {label} — {len(r['hits'])} hits outside allowed: {joined}")
-            elif r["kind"] == "single-definition":
-                print(f"DRIFT: {label} — expected exactly 1 definition, found {len(r['hits'])}: {joined}")
-            elif r["kind"] == "must-call":
-                print(f"DRIFT: {label} — {len(r['hits'])} file(s) missing required call: {joined}")
-            else:
-                print(f"DRIFT: {label} — {len(r['hits'])} hits: {joined}")
-    return 1 if results else 0
+        for r in violations:
+            print(_format_drift_line("DRIFT", r))
+        for r in hold_violations:
+            print(_format_drift_line("HOLD", r))
+        for s in skipped:
+            print(f"drift: skipped {s['link']} ({s['reason']})")
+    return 1 if (violations or (strict and hold_violations)) else 0
 
 
 # ---------------------------------------------------------------------------
@@ -4497,6 +4605,13 @@ def main(argv=None) -> int:
     add_common_args(p_drift)
     p_drift.add_argument("--code-root", dest="code_root", required=True)
     p_drift.add_argument("--json", action="store_true")
+    p_drift.add_argument(
+        "--strict-holds", action="store_true",
+        help="also fail the exit code on a HOLD violation (an active reviewer-finding/"
+             "code-derived invariant with validated evidence) -- without this flag, a HOLD "
+             "violation is reported but never blocks (SCHEMA.md §4: a HOLD 'may block', at "
+             "the caller's discretion)",
+    )
     p_drift.set_defaults(func=cmd_drift)
 
     p_unmapped = sub.add_parser("unmapped")
