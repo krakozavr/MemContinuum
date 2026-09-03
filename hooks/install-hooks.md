@@ -27,12 +27,14 @@ into the target `hooks.PreToolUse` array:
           {
             "type": "command",
             "if": "Edit(/<code-root>/**)",
-            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_STRIP_PREFIX=<code-root>/ MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/pre-edit-chain.sh"
+            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_STRIP_PREFIX=<code-root>/ MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/pre-edit-chain.sh",
+            "timeout": 5
           },
           {
             "type": "command",
             "if": "Write(/<code-root>/**)",
-            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_STRIP_PREFIX=<code-root>/ MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/pre-edit-chain.sh"
+            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_STRIP_PREFIX=<code-root>/ MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/pre-edit-chain.sh",
+            "timeout": 5
           }
         ]
       }
@@ -54,6 +56,10 @@ Notes:
   SQLite locking is not reliable there.
 - The command line, not a JSON `env` block, carries the env vars — Claude Code hook `command`
   entries run through a shell, so `VAR=value ... command` works directly.
+- `"timeout": 5` is Claude Code's own per-hook backstop (default 600s when unset); the mechanism
+  meant to fire is the INNER watchdog `hooks/mc-watchdog.sh` wraps this hook in (see
+  `docs/INTERNALS.md` "The watchdog"), which times out well before this outer value and, unlike
+  the outer one, still returns a real `additionalContext` explaining that retrieval timed out.
 - `if` filter paths use Claude Code's permission-rule syntax, where a single leading slash
   anchors at the settings source, not the filesystem root (docs: `Edit(//Users/alice/file)` =
   absolute `/Users/alice/file`). `<code-root>` above is always an absolute path (already starting

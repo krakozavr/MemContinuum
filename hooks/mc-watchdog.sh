@@ -3,7 +3,10 @@
 # dedup), sourced by every write-side hook script's guard preamble
 # (ledger-post-edit.sh, precompact-persist.sh, sessionstart-remind.sh,
 # userprompt-remind.sh, sessionend-stamp.sh, newfile-nudge.sh) BEFORE
-# `source memlib.sh`.
+# `source memlib.sh`. F6 (external-review fix round): pre-edit-chain.sh
+# sources this file too, in the same guard-preamble position -- the one
+# exception to "BEFORE memlib.sh" above, since pre-edit-chain.sh never
+# sources memlib.sh at all (it has no write-side state of its own).
 #
 # This file does two things: a single-quoted heredoc assignment to
 # MC_WATCHDOG_LAUNCHER_PY (via `read -r -d ''`, bash-3.2 safe -- no arrays,
