@@ -106,7 +106,7 @@ die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 # A python that can run the JSON merge below. During --uninstall, and before
 # the venv exists, this is whatever system python3 is on PATH.
 BOOT_PY="$(command -v python3 2>/dev/null)"
-[ -n "$BOOT_PY" ] || die "no python3 on PATH -- MemContinuum needs Python 3.10+ (see README.md Requirements)"
+[ -n "$BOOT_PY" ] || die "no python3 on PATH -- MemContinuum needs Python 3.12+ (see README.md Requirements)"
 
 # ---------------------------------------------------------------------------
 # settings.json merge, via the ONE shared implementation (fix-round-4 F8):
@@ -260,8 +260,8 @@ fi
 # engine -- a 3.9 system python is fine for the hooks' own snippets but not for
 # fastembed. Skipped under --dry-run when the venv doesn't exist yet.
 if [ "$DRY_RUN" -eq 0 ] || [ -x "$PYTHON_BIN" ]; then
-    env PYTHONPATH= "$PYTHON_BIN" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' \
-        || die "$PYTHON_BIN is older than Python 3.10 (fastembed requires it) -- see README.md Requirements"
+    env PYTHONPATH= "$PYTHON_BIN" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)' \
+        || die "$PYTHON_BIN is older than Python 3.12 (fastembed requires it) -- see README.md Requirements"
     plan "python is $(env PYTHONPATH= "$PYTHON_BIN" -c 'import sys; print(".".join(map(str, sys.version_info[:3])))')"
 fi
 

@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.2.0rc2] — unreleased
+
+### Release
+- The declared minimum Python is now 3.12 everywhere a floor is named --
+  `pyproject.toml`'s `requires-python`, the README requirement line, and
+  the machine-setup version gate -- matching what the dependency lockfile
+  has required all along: its pinned numpy release only ships wheels for
+  3.12 and newer, so every environment this project actually supports
+  already runs 3.12+.
+- CI now runs the unit test suite across a Python version matrix (3.12
+  and 3.13) on Ubuntu, alongside the existing bash 3.2 verification job,
+  and adds a real macOS runner: it installs the same lockfile, runs the
+  full suite, and re-runs the shell-driving suites under the actual bash
+  3.2.57 macOS ships, rather than only a bash-3.2-on-Ubuntu simulation.
+
 ## [0.2.0rc1] — unreleased
 
 ### Code index
