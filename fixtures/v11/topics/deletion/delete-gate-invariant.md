@@ -16,7 +16,8 @@ links:
     reason_for_change: new-evidence
     ruling:
       text: "all file removal must go through DeleteGate; no direct FileManager calls elsewhere"
-      authority: agent-inference
+      authority: owner-verbatim
+      source: "session 2026-08-29"
     rationale:
       text: "a direct removeItem call bypassed the gate's safety checks in QuickCleanup"
       authority: agent-inference

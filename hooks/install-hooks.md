@@ -27,12 +27,14 @@ into the target `hooks.PreToolUse` array:
           {
             "type": "command",
             "if": "Edit(/<code-root>/**)",
-            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_STRIP_PREFIX=<code-root>/ MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/pre-edit-chain.sh"
+            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_STRIP_PREFIX=<code-root>/ MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/pre-edit-chain.sh",
+            "timeout": 5
           },
           {
             "type": "command",
             "if": "Write(/<code-root>/**)",
-            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_STRIP_PREFIX=<code-root>/ MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/pre-edit-chain.sh"
+            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_STRIP_PREFIX=<code-root>/ MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/pre-edit-chain.sh",
+            "timeout": 5
           }
         ]
       }
@@ -54,6 +56,10 @@ Notes:
   SQLite locking is not reliable there.
 - The command line, not a JSON `env` block, carries the env vars — Claude Code hook `command`
   entries run through a shell, so `VAR=value ... command` works directly.
+- `"timeout": 5` is Claude Code's own per-hook backstop (default 600s when unset); the mechanism
+  meant to fire is the INNER watchdog `hooks/mc-watchdog.sh` wraps this hook in (see
+  `docs/INTERNALS.md` "The watchdog"), which times out well before this outer value and, unlike
+  the outer one, still returns a real `additionalContext` explaining that retrieval timed out.
 - `if` filter paths use Claude Code's permission-rule syntax, where a single leading slash
   anchors at the settings source, not the filesystem root (docs: `Edit(//Users/alice/file)` =
   absolute `/Users/alice/file`). `<code-root>` above is always an absolute path (already starting
@@ -232,8 +238,9 @@ Notes:
 - These five scripts write `$MEMCONTINUUM_HOME/sessions/**/*.json[.lock]` and
   `$MEMCONTINUUM_HOME/hook.log` — never the store, never the code tree. One carve-out:
   `userprompt-remind.sh`'s coverage check and `precompact-persist.sh` call `memidx.py unmapped`,
-  which self-heals a drifted decision index with a `reindex --no-embed`, so the decision index's
-  own SQLite cache is written too. `git diff`/`git status` in either root staying empty across
+  which self-heals a drifted decision index with a `reindex --no-embed --auto` (mode-preserving —
+  it never embeds, and never claims a fuller embedding mode than the index already had, inside a
+  hook's own time budget), so the decision index's own SQLite cache is written too. `git diff`/`git status` in either root staying empty across
   every hook invocation is a permanent regression test (`tests/test_write_hooks.py`).
 
 

@@ -3,7 +3,10 @@
 # dedup), sourced by every write-side hook script's guard preamble
 # (ledger-post-edit.sh, precompact-persist.sh, sessionstart-remind.sh,
 # userprompt-remind.sh, sessionend-stamp.sh, newfile-nudge.sh) BEFORE
-# `source memlib.sh`.
+# `source memlib.sh`. F6 (external-review fix round): pre-edit-chain.sh
+# sources this file too, in the same guard-preamble position -- the one
+# exception to "BEFORE memlib.sh" above, since pre-edit-chain.sh never
+# sources memlib.sh at all (it has no write-side state of its own).
 #
 # This file does two things: a single-quoted heredoc assignment to
 # MC_WATCHDOG_LAUNCHER_PY (via `read -r -d ''`, bash-3.2 safe -- no arrays,
@@ -176,14 +179,50 @@ if pending_kill:
 try:
     proc.wait(timeout=budget)
 except subprocess.TimeoutExpired:
+    # Coordinator review fix: kill (and reap) the whole child group FIRST,
+    # strictly before this process writes anything of its own to the
+    # shared stdout fd. The child inherits this launcher's real stdout
+    # directly (no pipe in between, see the header's "Used as" note) --
+    # while it is still alive and unreaped, it can still write to that
+    # SAME fd, so writing the fallback before killing it left a real
+    # window (this branch's own _log_watchdog_kill() file I/O alone is
+    # enough) for the child's own output to land after -- or wrapped
+    # around -- the fallback text, corrupting what Claude Code reads.
+    # Once the group is confirmed dead (killed, then reaped with a bounded
+    # wait -- not merely signaled), nothing it does can reach stdout ever
+    # again, so the fallback write below is guaranteed to be the last
+    # thing this whole process tree puts on that fd.
+    _kill_group()
+    try:
+        proc.wait(timeout=1)
+    except Exception:
+        pass
     _log_watchdog_kill()
+    # F6 (external-review fix round): opt-in timeout fallback -- for the
+    # six guarded hooks that never set this, `fallback` is None/empty and
+    # this is a no-op, preserving today's silent-on-timeout behavior
+    # unchanged. pre-edit-chain.sh sets MC_WATCHDOG_TIMEOUT_FALLBACK to a
+    # minimal, valid additionalContext JSON payload stating retrieval timed
+    # out and that absence of a decision was NOT established, so Claude
+    # Code reads a real uncertainty signal instead of an empty
+    # additionalContext indistinguishable from "retrieval ran and found
+    # nothing".
+    fallback = os.environ.get("MC_WATCHDOG_TIMEOUT_FALLBACK")
+    if fallback:
+        try:
+            sys.stdout.write(fallback)
+            sys.stdout.flush()
+        except Exception:
+            pass
+    sys.exit(0)
 # Unconditional group sweep (not just on a timeout): a hung call several
 # layers deep can background a detached descendant that inherits the
 # real stdout/stderr fds, which would otherwise keep those pipes open
 # past the point the main script logically finished, even though it
 # exited on time. Reaping the whole group here, always, is the actual
-# orphaned-grandchild fix -- killing the group only on the timeout branch
-# still leaves this exact gap on the success path.
+# orphaned-grandchild fix -- the timeout branch above already does its
+# own kill+reap (and returns before reaching here); this is the
+# success-path twin of that same guarantee.
 _kill_group()
 try:
     proc.wait(timeout=1)

@@ -3701,12 +3701,26 @@ class TestSelfIndexAcceptanceGate(unittest.TestCase):
         is `no concept claims 'memidx.py'` -- which is exactly the point:
         the command resolved the symbol to its defining file and said so.
         A regression in any step above prints a different path, or exits
-        non-zero, instead."""
+        non-zero, instead.
+
+        F1 (ruling 68): `why` now refuses on a wholly missing decision db
+        (never silently creates one), so this test's own throwaway decision
+        store needs one real (empty-root) reindex first -- unrelated to the
+        bare-symbol/code-index fast path under test, which never touches
+        this db until the decision-store lookup step."""
+        decisions_db = Path(self._tmpdir.name) / "decisions.sqlite"
+        empty_root = Path(self._tmpdir.name) / "empty-decisions-root"
+        empty_root.mkdir(exist_ok=True)
+        reindex_args = ns(root=str(empty_root), project=self.PROJECT, db=str(decisions_db),
+                           full=False, no_embed=True)
+        rc = memidx.cmd_reindex(reindex_args)
+        self.assertEqual(rc, 0)
+
         args = ns(
             symbol_or_path="parse_frontmatter",
             code_root=str(TOOLS_DIR),
             project=self.PROJECT,
-            db=str(Path(self._tmpdir.name) / "decisions.sqlite"),
+            db=str(decisions_db),
             json=False,
         )
         buf, err = io.StringIO(), io.StringIO()

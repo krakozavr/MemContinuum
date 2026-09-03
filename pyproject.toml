@@ -1,7 +1,7 @@
 [project]
 name = "memcontinuum"
-version = "0.1.0"
-description = "A small, project-agnostic decision-chain memory engine: SQLite FTS5 + whole-record embeddings over hand-authored markdown."
+version = "0.2.0rc1"
+description = "A small, project-agnostic decision-chain memory engine over hand-authored markdown: SQLite FTS5, title + body-excerpt embeddings, and ruling text made retrievable via its own link rows."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"

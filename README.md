@@ -36,15 +36,20 @@ newest first, dated, and tagged with *who actually said it* — the project
 owner's own words, a summary they confirmed, an agent's inference, a reviewer's
 finding, or something derived from code and tests. A changed mind is a new entry
 in the chain, never an edit to the old one, so "we tried X, it did not work
-because Y, so we do Z instead" stays intact and citable.
+because Y, so we do Z instead" stays intact and citable. The linter does not enforce
+this invariant; git history is the record's own audit trail.
 
 Retrieval is **automatic**, not left to anyone's discipline. Before an edit
 touches a file, a hook looks up whatever decision governs that file and hands it
-over. Every hook here fails open: a missing index, a missing python, or a failed
-lookup means the hook stays silent that turn — never that your edit is blocked.
-A stale-but-present index is not one of those cases: it still answers from
-whatever it has, which is why keeping it current (`reindex`, or just committing
-the store) is worth doing. Nothing in this tool can stop you from working.
+over. Every hook here fails open: a missing index, a missing python, a failed
+lookup, or the hook running too long means the hook stays silent (or, on a
+timeout specifically, says outright that retrieval timed out rather than
+staying silent) — never that your edit is blocked. That lookup runs under a
+2-second watchdog deadline — a real lookup measures in the low tenths of a
+second, comfortably under it; a stale-but-present index is not one of the
+fail-open cases: it still answers from whatever it has, which is why keeping
+it current (`reindex`, or just committing the store) is worth doing. Nothing
+in this tool can stop you from working.
 
 The same idea runs in the other direction. When files have been edited under no
 decision topic at all, or when the conversation has moved on for a while right
@@ -118,7 +123,9 @@ Four layers, in order of authority:
 1. **Code and tests** decide what the software does today. Nothing outranks
    them.
 2. **MemContinuum** records why it got that way. Only a person's own confirmed
-   words can block work; an agent's guess can inform a decision, never veto one.
+   words can block work; an incident or finding with real, checkable evidence
+   can force a pause for revalidation (a HOLD) even without the owner's own
+   words; an agent's unevidenced guess can inform a decision, never veto one.
 3. **CLAUDE.md** holds standing rules for how to work — not knowledge, not
    history.
 4. **Auto-memory** holds the agent's working notes: where things stood,

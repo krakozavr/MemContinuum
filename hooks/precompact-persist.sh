@@ -15,10 +15,12 @@
 #   - for ledger entries under the code root: runs `memidx.py unmapped`
 #     (self-healing: check -> reindex --no-embed on drift) to classify them
 #   - for ledger entries under the store root with no code entries present:
-#     runs a plain `memidx.py reindex --no-embed` directly, so store-only
-#     edits still get reconciled into the index even with nothing to check
-#     coverage for (ruling E: "store edits trigger RECONCILIATION, not
-#     reminders")
+#     runs a plain `memidx.py reindex --no-embed --auto` directly, so
+#     store-only edits still get reconciled into the index even with
+#     nothing to check coverage for (ruling E: "store edits trigger
+#     RECONCILIATION, not reminders") -- --auto (ruling 69) keeps
+#     embedding_mode untouched, since this hook-triggered heal never
+#     re-embeds
 #   - compares the code/store roots' current git HEAD against the session's
 #     start_code_sha/start_store_sha (captured by sessionstart-remind.sh)
 #   - writes the result to state.pending, replacing whatever was there
@@ -150,7 +152,7 @@ if [ "${#CODE_PATHS[@]}" -eq 0 ]; then
     if [ "$STORE_TOUCHED" = "true" ] && [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
         env PYTHONPATH= "$MC_PY" "$MC_MEMIDX" reindex \
             --root "$MEMCONTINUUM_ROOT" --project "$MC_PROJECT" --db "$MC_DB_PATH" \
-            --no-embed >>"$MC_LOG" 2>&1
+            --no-embed --auto >>"$MC_LOG" 2>&1
     fi
 fi
 
@@ -163,8 +165,24 @@ if [ "${#CODE_PATHS[@]}" -gt 0 ] && [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
     [ -n "${MEMCONTINUUM_CODE_ROOT:-}" ] && ARGS+=(--code-root "$MEMCONTINUUM_CODE_ROOT")
     RAW="$(env PYTHONPATH= "$MC_PY" "$MC_MEMIDX" "${ARGS[@]}" 2>>"$MC_LOG")"
     RC=$?
-    if [ $RC -eq 0 ] && [ -n "$RAW" ]; then
+    # F1 (ruling 68): see userprompt-remind.sh's identical block -- accept
+    # RC 0 or 1, log a distinct outcome per coverage_status via mc_log
+    # directly (never finish(), which would exit 0 and skip the rest of
+    # this script's normal reconciliation work).
+    if { [ $RC -eq 0 ] || [ $RC -eq 1 ]; } && [ -n "$RAW" ]; then
         UNMAPPED_JSON="$RAW"
+        COVERAGE_STATUS="$(printf '%s' "$RAW" | env PYTHONPATH= "$MC_PY" -c '
+import json, sys
+try:
+    print((json.load(sys.stdin) or {}).get("coverage_status", "unknown"))
+except Exception:
+    print("unknown")
+' 2>/dev/null)"
+        case "$COVERAGE_STATUS" in
+            uninitialized)      mc_log "precompact outcome=index-uninitialized session=${SESSION_ID:-}" ;;
+            upgrade-required)   mc_log "precompact outcome=index-upgrade-required session=${SESSION_ID:-}" ;;
+            index-error)        mc_log "precompact outcome=index-error session=${SESSION_ID:-}" ;;
+        esac
     fi
 fi
 

@@ -1,10 +1,12 @@
           {
             "type": "command",
             "if": "Edit(/{{CODE_ROOT}}/**)",
-            "command": "MEMCONTINUUM_RENDERED={{RENDERED}} MEMCONTINUUM_ROOT={{STORE}} MEMCONTINUUM_PROJECT={{PROJECT}} MEMCONTINUUM_STRIP_PREFIX={{STRIP_PREFIX}} MEMCONTINUUM_PYTHON={{PYTHON}} bash {{HOOKS_DIR}}/pre-edit-chain.sh"
+            "command": "MEMCONTINUUM_RENDERED={{RENDERED}} MEMCONTINUUM_ROOT={{STORE}} MEMCONTINUUM_PROJECT={{PROJECT}} MEMCONTINUUM_STRIP_PREFIX={{STRIP_PREFIX}} MEMCONTINUUM_PYTHON={{PYTHON}} bash {{HOOKS_DIR}}/pre-edit-chain.sh",
+            "timeout": 5
           },
           {
             "type": "command",
             "if": "Write(/{{CODE_ROOT}}/**)",
-            "command": "MEMCONTINUUM_RENDERED={{RENDERED}} MEMCONTINUUM_ROOT={{STORE}} MEMCONTINUUM_PROJECT={{PROJECT}} MEMCONTINUUM_STRIP_PREFIX={{STRIP_PREFIX}} MEMCONTINUUM_PYTHON={{PYTHON}} bash {{HOOKS_DIR}}/pre-edit-chain.sh"
+            "command": "MEMCONTINUUM_RENDERED={{RENDERED}} MEMCONTINUUM_ROOT={{STORE}} MEMCONTINUUM_PROJECT={{PROJECT}} MEMCONTINUUM_STRIP_PREFIX={{STRIP_PREFIX}} MEMCONTINUUM_PYTHON={{PYTHON}} bash {{HOOKS_DIR}}/pre-edit-chain.sh",
+            "timeout": 5
           }

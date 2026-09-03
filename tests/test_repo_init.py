@@ -316,6 +316,26 @@ class TestFreshInstall(unittest.TestCase):
         # a PostToolUse ledger line and NO PreToolUse line).
         self.assertEqual(ifs, [f"Edit(/{self.code_root}/**)", f"Write(/{self.code_root}/**)"])
 
+    def test_pre_edit_chain_commands_render_outer_timeout_of_5(self):
+        """F6 (external-review fix round): the OUTER Claude Code backstop.
+        templates/code-root-filter-pair.json.tmpl renders `"timeout": 5` into
+        both the Edit and Write pre-edit-chain.sh command lines; this proves
+        the value survives the real repo-init.sh render/parse/write pipeline
+        end to end, not just the template text on its own (see
+        tests/test_hooks.py and tests/test_mc_settings_merge.py for the two
+        narrower checks this one sits on top of)."""
+        data = json.loads(self.settings_path.read_text())
+        pre = data["hooks"]["PreToolUse"]
+        pre_edit_commands = [
+            h
+            for group in pre
+            for h in group.get("hooks", [])
+            if "pre-edit-chain.sh" in h.get("command", "")
+        ]
+        self.assertEqual(len(pre_edit_commands), 2, pre_edit_commands)
+        for h in pre_edit_commands:
+            self.assertEqual(h.get("timeout"), 5, h)
+
     def test_settings_contains_newfile_nudge_hook_write_only_with_right_paths(self):
         """Finding 8: newfile-nudge.sh gets its OWN "Write" (never
         "Edit|Write") matcher group, a separate group from pre-edit-chain's,
@@ -1582,6 +1602,52 @@ class TestBootstrapVenv(unittest.TestCase):
             shutil.rmtree(engine_dir, ignore_errors=True)
             shutil.rmtree(fakebin, ignore_errors=True)
 
+    def test_bootstrap_prefers_requirements_lock_when_present(self):
+        # task-9: bootstrap_venv must install from the exact-pinned
+        # requirements.lock when one sits next to requirements.txt (CI and
+        # a real repo checkout both ship one), not the loose >= file.
+        home = sandbox_home()
+        engine_dir = tempfile.mkdtemp(prefix="memcontinuum-engine-copy-")
+        fakebin = tempfile.mkdtemp(prefix="memcontinuum-fakebin-")
+        try:
+            install_sh = copy_engine(engine_dir)
+            (Path(engine_dir) / "requirements.lock").write_text("fastembed==0.8.0\nPyYAML==6.0.3\n")
+
+            record = Path(fakebin) / "uv-invocations.log"
+            fake_uv = Path(fakebin) / "uv"
+            fake_uv.write_text(
+                "#!/usr/bin/env bash\n"
+                f'printf \'%s\\n\' "$*" >> "{record}"\n'
+                'if [ "$1" = "venv" ]; then\n'
+                '    dir="$2"\n'
+                '    mkdir -p "$dir/bin"\n'
+                f'    printf \'#!/usr/bin/env bash\\nexec "{VENV_PYTHON}" "$@"\\n\' > "$dir/bin/python"\n'
+                '    chmod +x "$dir/bin/python"\n'
+                '    exit 0\n'
+                'fi\n'
+                'exit 0\n'
+            )
+            fake_uv.chmod(0o755)
+
+            store = str(Path(home) / "store")
+            venv_dir = str(Path(home) / "bootstrapped-venv")
+            proc = run_install_at(
+                install_sh,
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude"),
+                 "--bootstrap-venv", venv_dir],
+                home,
+                path_prepend=[fakebin],
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+            invocations = record.read_text()
+            self.assertIn("requirements.lock", invocations)
+            self.assertNotIn("requirements.txt", invocations)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+            shutil.rmtree(engine_dir, ignore_errors=True)
+            shutil.rmtree(fakebin, ignore_errors=True)
+
     def test_bootstrap_falls_back_to_python3_venv_and_pip_when_no_uv(self):
         # A real venv-python shim, written by a small static helper script
         # (not inlined into fake_python3 below) so there is only one level
@@ -1644,6 +1710,75 @@ chmod +x "$dir/bin/python"
             self.assertTrue(pip_record.is_file(), proc.stdout + proc.stderr)
             pip_invocations = pip_record.read_text()
             self.assertIn("requirements.txt", pip_invocations)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+            shutil.rmtree(engine_dir, ignore_errors=True)
+            shutil.rmtree(fakebin, ignore_errors=True)
+
+    def test_bootstrap_falls_back_prefers_requirements_lock_when_present(self):
+        # Plain-pip-branch counterpart of
+        # test_bootstrap_prefers_requirements_lock_when_present: no uv on
+        # PATH forces the `python3 -m venv` + pip fallback, and that branch
+        # must prefer requirements.lock over requirements.txt exactly the
+        # same way the uv branch does.
+        MAKE_SHIM_SCRIPT = """#!/usr/bin/env bash
+# make_python_shim.sh DIR PIP_RECORD REAL_PYTHON
+dir="$1"
+pip_record="$2"
+real_python="$3"
+mkdir -p "$dir/bin"
+cat > "$dir/bin/python" <<SHIMEOF
+#!/usr/bin/env bash
+if [ "\\$1" = "-m" ] && [ "\\$2" = "pip" ]; then
+    printf '%s\\n' "\\$*" >> "$pip_record"
+    exit 0
+fi
+exec "$real_python" "\\$@"
+SHIMEOF
+chmod +x "$dir/bin/python"
+"""
+        home = sandbox_home()
+        engine_dir = tempfile.mkdtemp(prefix="memcontinuum-engine-copy-")
+        fakebin = tempfile.mkdtemp(prefix="memcontinuum-fakebin-")
+        try:
+            install_sh = copy_engine(engine_dir)
+            (Path(engine_dir) / "requirements.lock").write_text("fastembed==0.8.0\nPyYAML==6.0.3\n")
+            pip_record = Path(fakebin) / "pip-invocations.log"
+
+            make_shim = Path(fakebin) / "make_python_shim.sh"
+            make_shim.write_text(MAKE_SHIM_SCRIPT)
+            make_shim.chmod(0o755)
+
+            fake_python3 = Path(fakebin) / "python3"
+            fake_python3.write_text(
+                "#!/usr/bin/env bash\n"
+                'if [ "$1" = "-m" ] && [ "$2" = "venv" ]; then\n'
+                f'    exec "{make_shim}" "$3" "{pip_record}" "{VENV_PYTHON}"\n'
+                "fi\n"
+                "exit 0\n"
+            )
+            fake_python3.chmod(0o755)
+
+            # PATH with NO uv at all -- see the sibling fallback test above
+            # for why this must be a minimal, uv-free PATH.
+            minimal_path = os.pathsep.join([fakebin, "/usr/bin", "/bin"])
+
+            store = str(Path(home) / "store")
+            venv_dir = str(Path(home) / "bootstrapped-venv")
+            proc = run_install_at(
+                install_sh,
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude"),
+                 "--bootstrap-venv", venv_dir],
+                home,
+                extra_env={"PATH": minimal_path},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertTrue((Path(venv_dir) / "bin" / "python").is_file())
+
+            self.assertTrue(pip_record.is_file(), proc.stdout + proc.stderr)
+            pip_invocations = pip_record.read_text()
+            self.assertIn("requirements.lock", pip_invocations)
+            self.assertNotIn("requirements.txt", pip_invocations)
         finally:
             shutil.rmtree(home, ignore_errors=True)
             shutil.rmtree(engine_dir, ignore_errors=True)

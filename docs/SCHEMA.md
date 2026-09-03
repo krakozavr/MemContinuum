@@ -20,11 +20,11 @@ field that can drift out of sync with the chain.
 
 ```yaml
 type: topic
-id: TOP-0042
+id: TOP-42
 title: Hidden files in the processed count
 area: processing/status
 project: notecatcher
-current: L4                 # newest active link id — DERIVED by the linter, never hand-edited
+current: L4                 # newest active link id — hand-set; memlint errors if it does not match the newest active link
 code_refs:                  # the decision→code link
   - src/core/scan/scan_plan.py#hidden_count
   - src/app/summary/summary_card.py#appendix
@@ -63,7 +63,7 @@ tags: []
 |---|---|---|
 | `owner-verbatim` | the project owner's own words, quoted; `source` points at where | **CONSTRAINT** (with status active) |
 | `owner-ratified` | agent-drafted text the owner was shown and affirmed; `text` = what they saw; `source` = the sitting | **CONSTRAINT**; produced only by the promotion procedure (§5) |
-| `agent-inference` | an agent's reading of the situation | CONTEXT |
+| `agent-inference` | an agent's reading of the situation | CONTEXT; with an invariant and validated evidence it is a HOLD (reported; enforced only under `--strict-holds`) |
 | `reviewer-finding` | an independent reviewer's finding, with its evidence | HOLD if evidence-bearing, else CONTEXT |
 | `code-derived` | true because code/tests say so; WHY is unknown | HOLD if it is an incident with a repro, else CONTEXT |
 
@@ -94,10 +94,17 @@ is handled by **splitting the link into scoped claims before promotion**
 > no record here.
 >
 > **HOLD** — must pause: an incident/constraint with reproducible evidence
-> (repro, commit, failing test), at any authority. A HOLD forces **live
+> (repro, commit, failing test), at `reviewer-finding`, `code-derived`, or
+> `agent-inference` authority — never `owner-verbatim`/`owner-ratified`,
+> which are already CONSTRAINT, and never a HOLD-eligible authority with no
+> validated evidence, which stays CONTEXT. A HOLD forces **live
 > revalidation against current source** — a confirmed current-source safety
 > violation may block on its own authority; green tests are not dispositive
-> unless they actually discriminate against the failure.
+> unless they actually discriminate against the failure. `memidx.py drift`
+> makes this executable against a checkable `invariant:` (§8.3): a
+> CONSTRAINT-tier violation always fails the run; a HOLD violation is
+> reported but only fails the run under `--strict-holds`; a `provisional`
+> link's invariant is never enforced, only reported for revalidation.
 >
 > **CONTEXT** — informs only. `agent-inference` may never by itself override
 > a fix that code and tests already accept.
@@ -120,7 +127,7 @@ is handled by **splitting the link into scoped claims before promotion**
 
 One line per link, newest first:
 ```
-TOP-0042 Hidden files in the processed count — current: L4 (active, agent-inference)
+TOP-42 Hidden files in the processed count — current: L4 (active, agent-inference)
   L4 2024-04-15 restored  ← reverses L3 (new-evidence: the earlier deletion was blind to the rationale)
   L3 2024-04-01 amended   half of the pair was deleted (reviewer-finding)
   L2 2024-03-20 adopted   "…the ruling text…" (owner-verbatim) because [rationale, inference]
@@ -158,11 +165,11 @@ described: plain topics/records work exactly as before.
 
 ```yaml
   edges:                      # optional, any link; targets are topic ids, link ids, incident/investigation ids
-    - {rel: supersedes,    to: TOP-0042/L2}
-    - {rel: preserves,     to: TOP-0042/L2#constraint-a}   # partial supersession: what survives
+    - {rel: supersedes,    to: TOP-42/L2}
+    - {rel: preserves,     to: TOP-42/L2#constraint-a}   # partial supersession: what survives
     - {rel: abandons,      to: assumption:A1}              # what stops being assumed
-    - {rel: challenged_by, to: INC-0900}
-    - {rel: led_to,        to: TOP-0091/L1}
+    - {rel: challenged_by, to: INC-900}
+    - {rel: led_to,        to: TOP-91/L1}
     - {rel: applies_to,    to: subsystem:import}           # scope of a partial replacement
 ```
 A claim superseded in one scope only is SPLIT into scoped claims; `applies_to`
@@ -204,8 +211,8 @@ title: Tag Suggestion
 owner_boundary: "src/core/tags — everything that decides which tags to suggest for a note"
 implemented_by: [src/core/tags/suggest.py#rank_candidates]
 tested_by: [tests/test_tag_suggestion.py]
-governed_by: [TOP-0031, TOP-0042]
-involved_in: [INC-0004]
+governed_by: [TOP-31, TOP-42]
+involved_in: [INC-4]
 ```
 Answers "which existing entity already owns X, and where are its
 boundaries?" — a question symbol search alone cannot answer. `for-path`
@@ -221,3 +228,47 @@ concept has no `tested_by` at all (promotion needs at least one).
 `--code-root`) to its concept(s), then prints each concept's `governed_by`
 topic chains, newest first — **including `declined` links**, so a reviewer
 sees the rejected alternative before "cleaning up" code that implements it.
+
+## 9. Incidents and investigations — field shape
+
+`incidents/<slug>.md` and `investigations/<slug>.md` are standalone records —
+`is_topic` is false (no `links:`, `type` is not `topic`) — so they skip the
+per-field authority machinery of §3 entirely: one flat frontmatter block, one
+claim, closed once written. This section names the fields real records
+actually carry, not a new required shape:
+
+```yaml
+type: incident                    # or: investigation
+id: INC-9                         # referenced from a link's edges{} (§8.1) and a concept's involved_in (§8.4)
+title: Appendix count double-counted hidden files after a rename
+area: processing
+date: '2024-05-02'                # or omitted/null when genuinely unknown
+status: active                    # active | provisional | superseded | historical | declined
+authority: agent-inference        # owner-verbatim | owner-ratified | agent-inference | reviewer-finding | code-derived
+source: session 2024-05-02 debugging log
+evidence:
+  - "test_hidden_count.py failure before the fix, commit a1b2c3d"
+code_refs:
+  - src/core/scan/scan_plan.py
+```
+
+- `status` and `authority` are the only two fields `memlint.py`'s standalone-
+  record check enum-validates (the same five/five values §3 defines for a
+  link) — an unrecognized value on either is an error. `type`, `id`, `title`,
+  `area`, `date`, `source` are free-form: nothing in the linter enum-checks
+  them. `id`, when present, still participates in the project-wide duplicate-
+  id collision warning every structured record gets (§7), and is what an
+  `edges{}`/`involved_in` reference (§8.1, §8.4) actually points at.
+- `evidence` here is prose only. A topic *link's* `evidence` (§3) is parsed
+  into the `links` table and read by `memidx.py drift`'s HOLD classification
+  (§4); a standalone record's own top-level `evidence` is never parsed into
+  that table and never consulted by `drift` — it supports the claim for a
+  human reader, nothing more.
+- `code_refs` is stored the same way a topic's is, but only a *topic's*
+  `code_refs` are ever matched against a file path: `for-path`/`unmapped`
+  query `records WHERE type='topic'` alone, so an incident's `code_refs` is
+  descriptive context, not something `for-path` will ever surface for an
+  edited file. Unlike a topic's `code_refs` (§2, §7), memlint does not reject
+  an empty or fragment-only entry here — that check runs only for topics.
+- `date: null` is real (seen in the wild when an incident's timing was never
+  pinned down) — treat it as optional, not required-but-sometimes-empty.

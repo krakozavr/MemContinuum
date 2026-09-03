@@ -8,6 +8,7 @@ behavior) as much as its output shape.
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -207,6 +208,45 @@ class TestPreEditChainHook(unittest.TestCase):
         matching = [l for l in log_text.splitlines() if "no-file-path" in l]
         self.assertTrue(matching, log_text)
         self.assertIn(f"project={self.project}", matching[-1])
+
+    def test_index_error_fails_open_and_logs_a_distinct_outcome(self):
+        """F1 (ruling 65's belt-and-suspenders catch): for-path's exit 4
+        (index-error). Renaming records.path breaks the query AFTER
+        decision_index_state has already reported a usable state ("current"
+        here, since the state check itself never references `path`) -- the
+        matched candidate's chain-building (topic_row["path"]) is what
+        actually raises. Restores the column afterward (addCleanup) so
+        correctness of the rest of this class's shared class-level db
+        doesn't depend on unittest's alphabetical run order."""
+        db = Path(self.memtool_home) / f"{self.project}.sqlite"
+        conn = sqlite3.connect(str(db))
+        conn.execute("ALTER TABLE records RENAME COLUMN path TO path_broken")
+        conn.commit(); conn.close()
+
+        def _restore():
+            c = sqlite3.connect(str(db))
+            c.execute("ALTER TABLE records RENAME COLUMN path_broken TO path")
+            c.commit(); c.close()
+
+        self.addCleanup(_restore)
+
+        payload = json.dumps(
+            {
+                "session_id": "s-preedit-index-error", "hook_event_name": "PreToolUse",
+                "tool_name": "Edit", "cwd": "/some/other/unrelated/dir",
+                "tool_input": {"file_path": "/fake/repo/src/core/scan/scan_plan.py"},
+            }
+        )
+        env = clean_env(
+            MEMCONTINUUM_HOME=self.memtool_home,
+            MEMCONTINUUM_PROJECT=self.project,
+            MEMCONTINUUM_PYTHON=VENV_PYTHON,
+            MEMCONTINUUM_STRIP_PREFIX="/fake/repo/",
+        )
+        proc, elapsed = run_hook(payload, env, timeout=10.0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        self.assertIn("outcome=index-error", log_text, log_text)
 
     def test_for_path_all_candidates_failing_logs_query_failed_not_no_match(self):
         """Round-3 addendum (review finding): a candidate whose `for-path`
@@ -478,6 +518,236 @@ class TestPreEditChainHook(unittest.TestCase):
         # never the default one the pointer lives at.
         self.assertTrue((custom_home / "hook.log").exists())
         self.assertFalse((default_mc_home / "hook.log").exists())
+
+    def test_watchdog_lib_missing_still_uses_explicit_memcontinuum_python(self):
+        """Coordinator review fix (F6 follow-up): mc-watchdog.sh sourcing
+        failure (MC_WATCHDOG_LIB_PATH pointing nowhere) leaves MC_GUARD_PY
+        unset -- the PY resolution line used to be
+        `PY="${MC_GUARD_PY:-$SCRIPT_DIR/../.venv/bin/python}"`, which falls
+        straight to the hardcoded engine-venv default in that case,
+        silently dropping an explicitly baked MEMCONTINUUM_PYTHON (mirrors
+        TestLedgerPostEdit.test_fail_open_when_watchdog_lib_missing in
+        tests/test_write_hooks.py, but that test only proves fail-open, not
+        that the EXPLICIT python actually ran -- a marker-writing fake
+        python, plus a real successful match that only the real venv
+        python (proxied through the fake one) can produce, proves it did)."""
+        marker = Path(self.tmp) / "watchdog-lib-missing-marker"
+        fake_py = Path(self.tmp) / "fake-python-explicit-marker"
+        fake_py.write_text(
+            "#!/usr/bin/env bash\n"
+            f"echo ran >> '{marker}'\n"
+            f'exec "{VENV_PYTHON}" "$@"\n'
+        )
+        fake_py.chmod(0o755)
+        payload = self._matching_payload()
+        env = clean_env(
+            MEMCONTINUUM_HOME=self.memtool_home,
+            MEMCONTINUUM_PROJECT=self.project,
+            MEMCONTINUUM_PYTHON=str(fake_py),
+            MEMCONTINUUM_STRIP_PREFIX="/fake/repo/",
+            MC_WATCHDOG_LIB_PATH="/nonexistent/mc-watchdog.sh",
+        )
+        proc, elapsed = run_hook(payload, env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("unbound variable", proc.stderr)
+        self.assertTrue(
+            marker.exists(),
+            "the explicit MEMCONTINUUM_PYTHON must still run when the watchdog "
+            "lib fails to source, not silently fall back to the engine venv",
+        )
+        self.assertTrue(proc.stdout.strip(), "expected additionalContext output, got nothing")
+        out = json.loads(proc.stdout)
+        self.assertIn("TOP-0042", out["hookSpecificOutput"]["additionalContext"])
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestPreEditChainRootAndStaleWarning(unittest.TestCase):
+    """Final-fix-wave item 2: pre-edit-chain.sh now passes --root to
+    for-path (whenever MEMCONTINUUM_ROOT is set) so a store edited since
+    the last reindex is served as a positive match (ruling 68 -- never
+    withheld) under its own named hook.log outcome, `index-stale-served`,
+    instead of the generic `matched` -- the stale warning itself reaches
+    hook.log only via for-path's own stderr (captured by the existing
+    `2>>"$LOG"` redirect), never the injected additionalContext payload."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-hook-stale-test-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.root = Path(self.tmp) / "store"
+        shutil.copytree(SCHEMA_FIXTURE_ROOT, self.root)
+        self.memtool_home = str(Path(self.tmp) / "memcontinuum-home")
+        os.makedirs(self.memtool_home, exist_ok=True)
+        self.project = "hookstaletest"
+        args = type(
+            "Args",
+            (),
+            dict(
+                root=str(self.root),
+                project=self.project,
+                db=str(Path(self.memtool_home) / f"{self.project}.sqlite"),
+                full=True,
+                no_embed=True,
+            ),
+        )()
+        memidx.cmd_reindex(args)
+
+    def _matching_payload(self):
+        return json.dumps(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Edit",
+                "cwd": "/some/other/unrelated/dir",
+                "tool_input": {"file_path": "/fake/repo/src/core/scan/scan_plan.py"},
+            }
+        )
+
+    def _run(self):
+        env = clean_env(
+            MEMCONTINUUM_HOME=self.memtool_home,
+            MEMCONTINUUM_PROJECT=self.project,
+            MEMCONTINUUM_PYTHON=VENV_PYTHON,
+            MEMCONTINUUM_STRIP_PREFIX="/fake/repo/",
+            MEMCONTINUUM_ROOT=str(self.root),
+        )
+        return run_hook(self._matching_payload(), env)
+
+    def test_stale_store_logs_index_stale_served_not_matched(self):
+        (self.root / "topics" / "new-topic.md").write_text(
+            "---\ntype: topic\nid: TOP-NEW\ntitle: New\nlinks: []\n---\nBody.\n"
+        )
+        proc, elapsed = self._run()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(proc.stdout.strip(), "expected additionalContext output, got nothing")
+        out = json.loads(proc.stdout)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("TOP-0042", ctx)          # the real match is still injected
+        self.assertNotIn("stale", ctx.lower())  # but the staleness caveat never is
+
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        self.assertIn("outcome=index-stale-served", log_text)
+        self.assertNotIn("outcome=matched", log_text)
+
+    def test_current_store_still_logs_plain_matched(self):
+        proc, elapsed = self._run()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        self.assertIn("outcome=matched", log_text)
+        self.assertNotIn("outcome=index-stale-served", log_text)
+
+    def test_rootless_call_unchanged_still_logs_plain_matched(self):
+        # MEMCONTINUUM_ROOT unset entirely: for-path is still called (just
+        # without --root, exactly its pre-existing behavior) -- proves the
+        # new --root plumbing doesn't fire when the env var isn't there.
+        (self.root / "topics" / "new-topic.md").write_text(
+            "---\ntype: topic\nid: TOP-NEW\ntitle: New\nlinks: []\n---\nBody.\n"
+        )
+        env = clean_env(
+            MEMCONTINUUM_HOME=self.memtool_home,
+            MEMCONTINUUM_PROJECT=self.project,
+            MEMCONTINUUM_PYTHON=VENV_PYTHON,
+            MEMCONTINUUM_STRIP_PREFIX="/fake/repo/",
+        )
+        proc, elapsed = run_hook(self._matching_payload(), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        self.assertIn("outcome=matched", log_text)
+        self.assertNotIn("outcome=index-stale-served", log_text)
+
+
+class TestF6RenderedTimeout(unittest.TestCase):
+    """The OUTER Claude Code backstop: `code-root-filter-pair.json.tmpl`
+    renders `"timeout": 5` on both the Edit and Write PreToolUse command
+    entries pre-edit-chain.sh receives -- unaffected by whatever the inner
+    watchdog measurement below produces (F6, external-review fix round)."""
+
+    def test_template_carries_timeout_5(self):
+        text = (TOOLS_DIR / "templates" / "code-root-filter-pair.json.tmpl").read_text()
+        self.assertEqual(text.count('"timeout": 5'), 2)
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestPreEditChainWatchdog(unittest.TestCase):
+    """F6 (external-review fix round, coordinator ruling 67 + "Also binding
+    from Codex"): pre-edit-chain.sh now runs under hooks/mc-watchdog.sh's
+    own guard. WATCHDOG_BUDGET_S mirrors the unmodified default budget
+    (MC_WATCHDOG_BUDGET is not overridden in hooks/pre-edit-chain.sh -- see
+    its own header comment) -- confirmed, not assumed, against a real
+    measurement of this hook's actual wired command line on three live
+    stores: the engine's own, plus two other real, live projects, one of
+    them hosted entirely on a slow drvfs (/mnt/c) mount, code root and
+    store both. 34 timed samples, overall p95=0.198s / p99=0.206s /
+    max=0.206s -- roughly 10x headroom under the 2s default, so it is kept
+    rather than tightened or loosened. See this task's own report for the
+    full per-store table."""
+
+    WATCHDOG_BUDGET_S = 2.0
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp(prefix="memcontinuum-preedit-watchdog-")
+        self.addCleanup(shutil.rmtree, self.td, ignore_errors=True)
+
+    def _hang_python(self, name):
+        hang_py = Path(self.td) / name
+        hang_py.write_text(
+            "#!/usr/bin/env bash\n"
+            "for a in \"$@\"; do\n"
+            "  case \"$a\" in\n"
+            "    *MC_WATCHDOG_LAUNCHER*) exec \"" + VENV_PYTHON + "\" \"$@\" ;;\n"
+            "  esac\n"
+            "done\n"
+            "sleep 6\n"
+        )
+        hang_py.chmod(0o755)
+        return hang_py
+
+    def test_a_hung_python_is_killed_within_budget_and_hook_exits_0(self):
+        home = Path(self.td) / "home"; home.mkdir()
+        # The `[ ! -f "$DB_PATH" ]` index-missing gate runs BEFORE any
+        # for-path call -- an empty home would exit that gate in
+        # milliseconds without ever reaching hang_py, which would falsely
+        # look like this test passes for the wrong reason. A real (if
+        # empty) db file lets the hang actually happen where for-path is
+        # called, under the watchdog's own guard.
+        (home / "wdtest.sqlite").touch()
+        hang_py = self._hang_python("hang-python")
+        env = clean_env(MEMCONTINUUM_HOME=str(home), MEMCONTINUUM_PYTHON=str(hang_py),
+                         MEMCONTINUUM_PROJECT="wdtest", MEMCONTINUUM_ROOT=str(SCHEMA_FIXTURE_ROOT))
+        payload = json.dumps({
+            "session_id": "s-preedit-wd", "hook_event_name": "PreToolUse", "tool_name": "Edit",
+            "cwd": str(SCHEMA_FIXTURE_ROOT),
+            "tool_input": {"file_path": str(SCHEMA_FIXTURE_ROOT / "x.py")},
+        })
+        proc, elapsed = run_hook(payload, env, timeout=10.0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        deadline = self.WATCHDOG_BUDGET_S + 1.0  # generous slack for process-start overhead
+        self.assertLess(elapsed, deadline,
+                         f"took {elapsed:.3f}s -- the {self.WATCHDOG_BUDGET_S}s watchdog budget must bound this")
+        log_text = (home / "hook.log").read_text()
+        self.assertIn("outcome=watchdog-killed", log_text)
+        self.assertIn("hook=pre-edit-chain.sh", log_text)
+
+    def test_timeout_emits_a_minimal_valid_additional_context_not_silence(self):
+        # Codex's addition: today the launcher exits 0 with EMPTY stdout on
+        # timeout -- Claude Code then reads that as "retrieval ran and
+        # found nothing," indistinguishable from a genuine no-match. A
+        # timeout must produce a real, valid, honest uncertainty signal.
+        home = Path(self.td) / "home2"; home.mkdir()
+        (home / "wdtest.sqlite").touch()
+        hang_py = self._hang_python("hang-python2")
+        env = clean_env(MEMCONTINUUM_HOME=str(home), MEMCONTINUUM_PYTHON=str(hang_py),
+                         MEMCONTINUUM_PROJECT="wdtest", MEMCONTINUUM_ROOT=str(SCHEMA_FIXTURE_ROOT))
+        payload = json.dumps({
+            "session_id": "s-preedit-wd2", "hook_event_name": "PreToolUse", "tool_name": "Edit",
+            "cwd": str(SCHEMA_FIXTURE_ROOT),
+            "tool_input": {"file_path": str(SCHEMA_FIXTURE_ROOT / "x.py")},
+        })
+        proc, elapsed = run_hook(payload, env, timeout=10.0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(proc.stdout.strip(), "a timeout must not leave stdout empty")
+        payload_out = json.loads(proc.stdout)
+        ctx = payload_out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("timed out", ctx.lower())
+        self.assertIn("not established", ctx.lower())
 
 
 POST_COMMIT_HOOK = TOOLS_DIR / "hooks" / "post-commit-reindex.sh"

@@ -26,11 +26,14 @@ from pathlib import Path
 from memidx import (
     AUTHORITIES,
     EDGE_RELS,
+    INVARIANT_KINDS,
     KINDS,
     STATUSES,
+    code_ref_is_named,
     fragment_declared_in_text,
     newest_active_link,
     parse_frontmatter,
+    validated_evidence_list,
     walk_markdown,
 )
 
@@ -106,6 +109,65 @@ def lint_topic(path: Path, fm: dict) -> tuple[list[str], list[str]]:
                     f"{prefix}: unknown edge rel {rel!r} (must be one of {sorted(EDGE_RELS)})"
                 )
 
+        # F3 (external-fix round, coordinator ruling 70): rationale/
+        # alternatives carry their own authority field, unchecked until now.
+        rationale = link.get("rationale") or {}
+        rauth = rationale.get("authority")
+        if rauth is not None and rauth not in AUTHORITIES:
+            errors.append(f"{prefix}: unknown rationale.authority {rauth!r} (must be one of {sorted(AUTHORITIES)})")
+
+        for alt in link.get("alternatives") or []:
+            aauth = alt.get("authority")
+            if aauth is not None and aauth not in AUTHORITIES:
+                errors.append(f"{prefix}: unknown alternatives[].authority {aauth!r} (must be one of {sorted(AUTHORITIES)})")
+
+        # F3: an invariant's own kind/pattern must be checkable, and its
+        # enforceability under the trust model is validated here too --
+        # drift's runtime classifier (invariant_enforcement_class) applies
+        # the same rule, but a bad invariant should never reach a real
+        # `drift` run silently in the first place.
+        invariant = link.get("invariant")
+        if invariant:
+            ikind = invariant.get("kind")
+            if ikind not in INVARIANT_KINDS:
+                errors.append(f"{prefix}: unknown invariant.kind {ikind!r} (must be one of {sorted(INVARIANT_KINDS)})")
+            ipattern = invariant.get("pattern")
+            if ipattern:
+                try:
+                    re.compile(ipattern)
+                except re.error as exc:
+                    errors.append(f"{prefix}: invariant.pattern {ipattern!r} does not compile: {exc}")
+            # Ruling 76 (overrides this task's original agent-inference
+            # exclusion): agent-inference is HOLD-eligible exactly like
+            # reviewer-finding/code-derived -- validated evidence makes it
+            # a HOLD, not an error; empty evidence gets the same ERROR
+            # every other non-CONSTRAINT authority gets below. No more
+            # special-cased always-error branch.
+            if auth not in ("owner-verbatim", "owner-ratified"):
+                validated = validated_evidence_list(link.get("evidence"))
+                if not validated:
+                    errors.append(
+                        f"{prefix}: invariant present but authority {auth!r} is not CONSTRAINT and "
+                        "evidence has no validated (non-blank) content -- a non-CONSTRAINT invariant "
+                        "only enforces as a HOLD with real evidence, and even then only under --strict-holds"
+                    )
+
+    topic_link_ids = {str(l.get("link")) for l in links if l.get("link")}
+    seen_link_ids: dict[str, int] = {}
+    for link in links:
+        lid = str(link.get("link") or "")
+        if lid:
+            seen_link_ids[lid] = seen_link_ids.get(lid, 0) + 1
+        rev = link.get("reverses")
+        if rev and str(rev) not in topic_link_ids:
+            errors.append(f"{path}:{link.get('link','?')}: reverses {rev!r} does not match any link id in this topic")
+        sb = link.get("superseded_by")
+        if sb and str(sb) not in topic_link_ids:
+            errors.append(f"{path}:{link.get('link','?')}: superseded_by {sb!r} does not match any link id in this topic")
+    for lid, count in seen_link_ids.items():
+        if count > 1:
+            errors.append(f"{path}: link id {lid!r} used {count} times within this topic -- link ids must be unique per topic")
+
     current_field = fm.get("current")
     if current_field is not None:
         expected_link = newest_active_link(links)
@@ -119,6 +181,20 @@ def lint_topic(path: Path, fm: dict) -> tuple[list[str], list[str]]:
     area = str(fm.get("area") or "")
     if (area.startswith("processing/") or area.startswith("deletion/")) and not fm.get("code_refs"):
         warnings.append(f"{path}: topic in area {area!r} has no code_refs")
+
+    # Critical (external-fix round, coordinator review of F4): a code_refs
+    # entry that is empty ("") or fragment-only ("#Foo") names no path --
+    # code_ref_matches now refuses to match one, but an unvalidated entry
+    # like this reaching a live topic was the reachability path for the
+    # bug in the first place, so it is rejected here too, at the source.
+    topic_id = fm.get("id") or path.stem
+    for ref in fm.get("code_refs") or []:
+        ref_str = str(ref)
+        if not code_ref_is_named(ref_str):
+            errors.append(
+                f"{path}: topic {topic_id!r} code_refs entry {ref_str!r} is empty or "
+                "fragment-only -- a code_ref must name a path"
+            )
 
     return errors, warnings
 

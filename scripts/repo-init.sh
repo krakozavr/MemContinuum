@@ -338,13 +338,18 @@ resolve_python() {
 }
 
 # bootstrap_venv DIR -- creates a venv at DIR and installs requirements.txt
-# into it. Prefers `uv venv` + `uv pip install` when `uv` is on PATH (fast,
-# no separate pip bootstrap needed); falls back to `python3 -m venv` +
-# `DIR/bin/python -m pip install`. Returns non-zero on any failure; never
-# touches PYTHON_BIN itself (the caller decides whether to adopt the result).
+# (or, when present, the exact-pinned requirements.lock -- see requirements.lock's
+# own header) into it. Prefers `uv venv` + `uv pip install` when `uv` is on
+# PATH (fast, no separate pip bootstrap needed); falls back to
+# `python3 -m venv` + `DIR/bin/python -m pip install`. Returns non-zero on
+# any failure; never touches PYTHON_BIN itself (the caller decides whether
+# to adopt the result).
 bootstrap_venv() {
     local dir="$1"
-    local req="$ENGINE_ROOT/requirements.txt"
+    local req="$ENGINE_ROOT/requirements.lock"
+    if [ ! -f "$req" ]; then
+        req="$ENGINE_ROOT/requirements.txt"
+    fi
     if [ ! -f "$req" ]; then
         echo "ERROR: requirements.txt not found next to scripts/repo-init.sh: $req" >&2
         return 1

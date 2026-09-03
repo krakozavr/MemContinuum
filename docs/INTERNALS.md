@@ -15,7 +15,9 @@ Contents: [hooks](#hooks-and-the-fail-open-contract) ·
 [watchdog](#the-watchdog) ·
 [bash 3.2](#bash-32-discipline) ·
 [code index](#code-index) · [memlint](#memlint) ·
-[storage and index](#storage-and-index) · [CLI semantics](#cli-semantics) ·
+[storage and index](#storage-and-index) ·
+[decision index provenance](#decision-index-provenance-and-embedding-lifecycle) ·
+[CLI semantics](#cli-semantics) ·
 [tests](#test-conventions)
 
 ---
@@ -66,9 +68,12 @@ default is silence.
 never the store, never the code root. Two of them reach the decision index's own
 SQLite cache as well, and only that: `userprompt-remind.sh`'s coverage check
 calls `memidx.py unmapped`, which self-heals a drifted index with a
-`reindex --no-embed`, and `precompact-persist.sh` runs the same self-healing
-`unmapped` call for ledger entries under the code root — or a plain
-`reindex --no-embed` when the session only touched the store.
+`reindex --no-embed --auto`, and `precompact-persist.sh` runs the same
+self-healing `unmapped` call for ledger entries under the code root — or a
+plain `reindex --no-embed --auto` when the session only touched the store.
+`--auto` keeps the self-heal mode-preserving: it never embeds inside a hook's
+time budget, and never lets a no-op heal pass claim a fuller `embedding_mode`
+than the index already had (see [Decision index provenance](#decision-index-provenance-and-embedding-lifecycle)).
 
 **Session state** lives at `$MEMCONTINUUM_HOME/sessions/<project>/<id>.json`,
 written by atomic rename (`os.replace`) and guarded by a real
@@ -739,9 +744,40 @@ Python launcher that kills the whole child process group once a budget expires �
 
 Guarded: the five write-side hooks, plus `newfile-nudge.sh` (which has no
 write-side state of its own but shares the same guard rather than growing a
-second bespoke timeout story for the one hook that happens to be fast).
-Unguarded: `pre-edit-chain.sh`, `post-commit-reindex.sh`,
+second bespoke timeout story for the one hook that happens to be fast) and
+`pre-edit-chain.sh`. Unguarded: `post-commit-reindex.sh`,
 `memcontinuum-detect.sh`.
+
+`pre-edit-chain.sh`'s own inner budget is confirmed against a real
+measurement of its wired command line across the engine's own store and two
+other real, live projects' stores, one of them hosted entirely on a slow
+drvfs (`/mnt/c`) mount, code root and store both:
+34 timed samples give an overall p95 of 0.198s and p99 of 0.206s, comfortably
+under the unmodified 2-second default (roughly 10x headroom). Claude Code's
+own per-hook `timeout` field defaults to 600 seconds when unset
+(code.claude.com/docs/en/hooks.md, "Common fields"); `pre-edit-chain.sh`'s
+rendered `"timeout": 5` is a backstop against a hung watchdog itself, not the
+mechanism meant to fire — the inner 2-second budget above is.
+
+Unlike the five write-side hooks, whose timeout costs at most a lost
+reminder, `pre-edit-chain.sh`'s timeout carries an asymmetric cost: it costs
+the one citation this tool exists to put in front of the model before the
+edit lands. Fail-open still applies — the edit proceeds either way — but
+losing that citation is not the same size of loss as a dropped write-side
+nudge.
+
+A timeout on the inner watchdog path emits a minimal `additionalContext`
+stating that retrieval timed out and that the absence of a decision was not
+established, so the model reads an honest uncertainty signal instead of an
+empty context indistinguishable from a genuine no-match. The outer Claude
+Code timeout is a last-resort backstop only and cannot provide this
+fallback, since it discards the hook's output entirely — it guarantees the
+run ends, not that anything useful comes back. Every `pre-edit-chain.sh`
+timeout the inner watchdog wins (the expected case, since it starts before
+and is bounded well under the outer budget) is named in `memidx.py stats`
+output under its own `watchdog-killed` outcome inside the `pre_edit` bucket,
+not folded into a generic one, and a repeated pattern (three or more within
+a window) raises its own FLAG there.
 
 Ordinary coreutils (`cat`, `dirname`, `date`, `mkdir`, …) are used freely — what
 is avoided is specifically the two GNU-only binaries macOS lacks.
@@ -1017,6 +1053,7 @@ Topic-chain rules:
 | `reverses:` set with no `reason_for_change` | error |
 | frontmatter `current:` does not equal the newest link with `status: active` | error (names the correct value) |
 | a topic in area `processing/*` or `deletion/*` has no `code_refs` | warning |
+| a topic's `code_refs` entry is empty (`""`) or fragment-only (`"#Foo"`) — names no path | error |
 | a `status`/`authority`/`kind` value outside the schema enums | error |
 | an edge `rel` outside the seven enumerated relations | error |
 
@@ -1087,6 +1124,107 @@ ownership check at all.
 Never place either db under a synced or cloud drive — keep the index on a local
 POSIX filesystem.
 
+### Decision index provenance and embedding lifecycle
+
+The decision index (`<project>.sqlite`) carries the same provenance discipline
+`code_index_report` already gave the code index (see
+[Root-scoped indexing](#root-scoped-indexing)), computed by
+`decision_index_state(db_path, project, root=None|Path)`:
+
+| state | means | a reader does |
+|---|---|---|
+| `missing` | no db file at that path | refuse (no query attempted) |
+| `uninitialized` | file exists, has a `db_meta` row for this project, but no `last_reindexed_at` stamp and no `records` rows | refuse (no query attempted) |
+| `upgrade-required` | no `last_reindexed_at` stamp but `records` rows already exist (an older engine's db), or the stamped `index_generation` is behind the engine's current one | proceed, warn on stderr |
+| `stale` | current generation, stamped, but `check`'s own on-disk drift comparison (mtime/size against what `reindex` last recorded) finds added/changed/removed files — only computed when a `root` is given | proceed, warn on stderr |
+| `current` | stamped, current generation, no drift | proceed silently |
+
+Every reader opens the file with `open_db_noncreating` — a genuinely
+non-creating SQLite URI (`mode=rw`) — never `open_db`'s create-on-connect path,
+which closes a TOCTOU window a plain `exists()` check followed by `connect()`
+still had (the file could be created by a race between the two calls). `root`
+is REQUIRED on `reindex`, `check`, and `unmapped` (they walk the store's own
+markdown tree by design); `unmapped` branches on `stale` to self-heal (below).
+`search`, `chain`, `for-path`, `why`, and `drift` take `root` as an OPTIONAL
+`--root DIR`: omitted (the default, and unchanged from before),
+`decision_index_state` can still report `upgrade-required` for them but
+never `stale` — they have nothing to walk without it. Given, the same five readers CAN see
+`stale`: a positive match off it is still returned (see the next paragraph),
+with one stderr line naming the cause (`"<cmd>: index is stale (store
+changed since the last reindex); results may be outdated"`). `for-path`'s
+own stale positive match, reached through `hooks/pre-edit-chain.sh` (which
+passes `--root "$MEMCONTINUUM_ROOT"` on both its `for-path` calls whenever
+that env var is set), is logged under its own hook.log outcome name,
+`index-stale-served`, distinct from a plain `matched` — the staleness
+caveat itself reaches `hook.log` only via `for-path`'s own stderr (the
+hook's existing redirect), never the injected `additionalContext` payload.
+
+**A positive match off a non-`current` index stays usable; a negative claim
+does not.** `upgrade-required` and `stale` both warn and proceed — a hit found
+there is real evidence, not withheld just because the index is not perfectly
+fresh. What must never be trusted off anything but `current` is the *absence*
+of a match: `unmapped`'s `coverage_status` collapses `missing`/`uninitialized`
+to `"uninitialized"` and `upgrade-required` to its own `"upgrade-required"`
+state, and in both cases returns `unmapped: []` rather than asserting "nothing
+governs this file" from an index that cannot back that claim. Only
+`coverage_status == "ok"` (state was `current`, or `stale` and the self-heal
+below cleared it) actually populates `unmapped`.
+
+**Exit codes.** `for-path` is the one reader with its own distinct codes (used
+directly by `pre-edit-chain.sh`): `0` success, `2` is argparse's own reserved
+usage-error code (untouched), `3` is `missing`/`uninitialized` — collapsed,
+since neither has a positive match worth attempting, and it also covers the
+TOCTOU race where the file vanishes between the state check and the open —
+and `4` is `index-error`, a belt-and-suspenders catch for a
+`sqlite3.OperationalError`/`IndexError` that a migration guard should already
+have prevented but didn't (a raw query naming a column that no longer exists,
+or a `sqlite3.Row` access on a renamed column). `upgrade-required`/`stale`/
+`current` all proceed to exit `0` normally. Every other reader (`search`,
+`chain`, `drift`, `check`) shares one `_decision_reply` refusal on
+`missing`/`uninitialized` (exit `1`, `--json` still emits a real `{"state":
+..., "results": []}` envelope on stdout so a caller piping stdout still learns
+why) and one `_decision_warn` (stderr only) on `upgrade-required`/`stale`.
+`unmapped` itself exits `1` whenever `coverage_status != "ok"` (a state alone
+is enough — no candidate path even needs to be unmapped); the hooks that call
+it (`userprompt-remind.sh`'s coverage check, `precompact-persist.sh`) treat
+either exit `0` or `1` as a normal, fail-open answer — only an actual
+exception invoking it would make them fail open on the hook's own contract —
+and log the `coverage_status` they got as their own `index-uninitialized`/
+`index-upgrade-required`/`index-error` outcome line; see
+[Hooks and the fail-open contract](#hooks-and-the-fail-open-contract) above.
+
+**Embeddings are never silently stale.** `embeddings.embed_sha` records the
+exact record `sha256` a vector was actually computed from (a pre-existing row
+predating the column reads `embed_sha IS NULL`, backfilled on the project's
+first embedding-capable reindex after upgrade). Every vector-search query — in
+`vector_ranked`, and the same `records r JOIN embeddings e ON e.path=r.path AND
+e.embed_sha=r.sha256` shape in `check`'s own vector-coverage count — joins on
+`embed_sha == sha256`, so a vector kept physically stale (a `--no-embed`/
+`--auto` edit changes a record's content but deliberately skips recomputing
+its vector) is invisible to ranking entirely, not merely scored lower, until a
+real reindex refreshes it. The row is never deleted on a stale edit — deleting
+it would lose the "this needs a backfill" signal the sha mismatch itself
+carries — only replaced on the next embedding-capable pass.
+
+**`embedding_mode`** (`db_meta['embedding_mode']`, one of `none` / `partial` /
+`full`) mirrors the code index's own field and is recomputed from *actual
+fresh coverage* — `fresh == 0` → `none`, `fresh == total` → `full`, otherwise
+`partial` — on every reindex except a no-op `--auto` pass (nothing added,
+changed, or removed): an internal heal must never announce, or force, a mode
+change for a change that did not happen. A run that does change rows under
+`--auto` (self-heal `--no-embed --auto` still forces `no_embed=True`, so
+backfills never happen there) still recomputes the mode from real coverage, so
+`full` can never keep standing over vectors that very pass just made stale.
+
+**`--auto`** is the internal/hook-facing reindex mode: content is rewritten
+(so a schema migration or a genuine markdown edit is still picked up) but
+nothing is embedded, and — per the paragraph above — the run never claims a
+fuller `embedding_mode` than the coverage it actually produced. It is what
+`unmapped`'s self-heal (`reindex --no-embed --auto`, on state `stale` only —
+never on `upgrade-required`, which is the rollout's job, not an ad-hoc
+hook-triggered one) and `precompact-persist.sh` use to keep a hook-triggered
+repair honest about what it did and did not refresh.
+
 **Project isolation, on the decision db.** The default per-project filename does
 the work in the normal case. Beyond that, the guarantee is a *refusal*, not a
 partition: `records`, `embeddings`, `concepts` and `links` key rows by `path`
@@ -1109,12 +1247,22 @@ same-project reopen honest; that filter is a second layer, not the thing that
 makes sharing a file safe — path-keyed lookups such as `record_row_by_path` do
 not carry it.
 
-**Embedding text is `title + "\n\n" + body[:1500]`** — no frontmatter YAML, no
-ruling text. That formula was measured at 10/10 top-1 paraphrase retrieval on
-real records, and `test_paraphrase_top1_at_least_9_of_10` reruns the measurement
-as a permanent regression check. Ruling and rationale text stays searchable: it
-goes into the FTS `ruling_text` column and into BM25 ranking; it is just not
-embedded.
+**A topic's own embedding text is `title + "\n\n" + body[:1500]`** — no
+frontmatter YAML, no ruling text. That formula was measured at
+10/10 top-1 paraphrase retrieval on real records, and
+`test_paraphrase_top1_at_least_9_of_10` reruns the measurement as a permanent
+regression check. (The corpus and probe set behind this measurement are
+private, untracked files — the tests that use them skip automatically when
+absent; see [Test conventions](#test-conventions) for the full disclosure.)
+That formula is unchanged, but it is no longer the whole story: **every link
+with ruling or rationale text also gets its own,
+separate embedded row** — `title + "\n\n" + ruling.text + "\n" + rationale.text`,
+keyed by a hashed `link:<sha256>` surrogate (`link_record_key`, never a real
+walked path) rather than the topic's own path. A ruling's actual text is
+therefore retrievable through vector search too, not only through the FTS
+`ruling_text` column/BM25 ranking it has always gone into — in every search
+mode, since a link row is an ordinary candidate on both the FTS and vector
+sides.
 
 **RRF, not score blending**, for hybrid search (`k=60`): bm25 scores and cosine
 similarities live on incomparable scales, so any weighted sum of the two is
@@ -1149,44 +1297,98 @@ down:
 
 - **`search`** — `--mode fts` and `--mode vector` never both run; `hybrid` (the
   default) runs both and fuses ranks with RRF. Filters (`--status`, `--type`,
-  `--area`, `--topic`, `--authority`) are always ANDed, but *where* they apply
-  differs by mode: for plain `fts`/`vector` the ranked list is computed and
-  then filtered (which cannot change which allowed records place, since nothing
-  outside the set was ever a candidate); for `hybrid` each side is filtered
-  **before** fusion, so a filtered-out record can never occupy a rank position
-  that shifts the fused score of a survivor. The FTS side of that ranked list
-  is not the full one: `fts_ranked` runs `ORDER BY bm25(fts) ... LIMIT 200`
-  scoped to `--project` alone, before `--status`/`--type`/`--area`/`--topic`/
-  `--authority` are known at all — a record that would pass every filter but
-  ranks below 200th on raw bm25 for this project is never returned by that
-  query, so FTS itself never considers it as a candidate, regardless of what
-  the filters would have allowed. The vector side carries no such cap —
-  `vector_ranked` scores every embedded row for the project — and `hybrid` is
-  the default mode, so a record the FTS window missed can still surface
-  through RRF fusion on the strength of its vector rank alone; only `--mode
-  fts` on its own loses it outright.
+  `--area`, `--topic`, `--authority`) are always ANDed, and are applied
+  **inside** `fts_ranked`/`vector_ranked`'s own query, before either channel's
+  cap and before RRF fusion — a status a caller filtered out can never occupy
+  a rank position that starves out a real match, in any mode. `fts_ranked`
+  runs its filtered `ORDER BY bm25(fts)` query with NO raw row limit,
+  walking the ranked cursor in batches of 200 (`fetchmany`), resolving each
+  batch's family in one query and collapsing same-topic-family duplicates
+  (see link rows below) as it goes — stopping the instant 200 DISTINCT
+  families have been collected, never a raw row cap before collapse can see
+  them (a single family that alone contributes over 1000 matching rows used
+  to be able to push a second family's own lone matching row past a raw
+  `LIMIT 1000` cap, starving it out even though both matched and the true
+  family count was nowhere near 200). The tradeoff: a match set with fewer
+  than 200 distinct families is read to its end — every matching row, not a
+  fixed raw ceiling — before the query returns. `vector_ranked` carries no
+  cap at all — it scores every fresh embedded
+  row for the project matching the filter — and joins `embeddings` to
+  `records` on `embed_sha == sha256` (see
+  [Decision index provenance](#decision-index-provenance-and-embedding-lifecycle)),
+  so a vector kept stale across a `--no-embed`/`--auto` edit is never a
+  candidate at all. Each `--json` hit reports the topic's real path (never a
+  link row's own synthetic surrogate path); a hit whose fused winner was a
+  link row also carries `matched_link_id`/`link_status`/`link_authority` (that
+  link's own `status`, checked independently of its parent topic's — `--status`
+  filters each row's own status, with no OR against the topic), and
+  `contributing_link_ids` names, per channel, which specific link (if any) that
+  channel's own ranked list picked for this topic family, whenever hybrid
+  mode's two channels disagreed. `check --json` reports `source_topic_count`
+  (real topic files), `searchable_row_count` (topics *and* their link rows —
+  every row `search` can return), and `searchable_vector_count` (rows with a
+  fresh embedding) separately, so a store's growth from link rows is visible,
+  not folded into one number that reads like topic growth alone.
+
+  **No ANN index; a linear scan over every searchable vector.**
+  `vector_ranked` scores every fresh row for the project one at a time —
+  practical while that count stays small, a real cost once it does not. Run
+  `memidx.py check --project <name> --json` on a real store for the actual,
+  current numbers rather than guessing; this engine's own store measured
+  42 topics, 72 total searchable rows (topics plus link rows), 72 fresh
+  vectors. A real approximate-nearest-neighbor index is worth revisiting once
+  a project's searchable vector count runs into the low thousands — comfortably
+  above what any store here has reached yet.
 - **`chain`** — one line per link, newest first: `kind`,
   `reverses`/`reason_for_change` when present, ruling (quoted for
   owner-verbatim/owner-ratified) and rationale, plus one indented edge line per
   typed cross-reference and a trailing `broken assumptions:` block. It is a
   deterministic adaptation of `docs/SCHEMA.md`'s illustrative chain view, not a
   byte-for-byte reproduction.
+
+  **`edges_for_topic` is presentation, not reasoning.** It exists to feed
+  `chain`'s own indented edge lines: its only three callers — `cmd_chain`
+  (which passes the result into `chain_lines`/`chain_json`), `topic_chain_json`,
+  and `print_topic_chain` — all exist to display a chain, never to decide
+  anything from it. Nothing in `search`, `drift`'s HOLD/CONSTRAINT
+  classification, or hybrid ranking ever reads the `edges` table — a typed
+  cross-reference is shown to a reader, never consulted by the engine to decide
+  anything. A dedicated traversal view over the edge graph itself (following
+  `supersedes`/`led_to`/`challenged_by` chains across topics, rather than one
+  topic's own edge lines) is backlogged, not built — a shape like `search
+  --expand-edges` is the natural place for it if it is ever built.
 - **`for-path`** — plain SQLite lookup, no embedding imports, safe on a hot
-  path. Matches the queried path against every topic's `code_refs` (the part
-  before `#`) by exact match, prefix match in either direction, or `fnmatch`
-  glob; concept records add the same matching against
-  `implemented_by`/`tested_by`.
+  path. Matches the queried path against every *topic's* `code_refs` (the part
+  before `#`) — never a standalone incident/investigation record's, see
+  `docs/SCHEMA.md` §9 — by exact match, segment-aware prefix match in either
+  direction (a `/`-boundary check, so `src/foo.py.bak` never matches
+  `src/foo.py`), or `fnmatch` glob; concept records add the same matching
+  against `implemented_by`/`tested_by`. An empty or fragment-only `code_ref`
+  (`""`, `"#Foo"`) names no path and matches nothing — `code_ref_matches` is
+  the one path-matching helper every governance lookup here shares (`for-path`,
+  concept attachment, `drift`'s `allowed` exemption), so this guard, and the
+  segment-awareness above, apply uniformly everywhere a `code_ref` is
+  consulted. See [Decision index provenance](#decision-index-provenance-and-embedding-lifecycle)
+  above for its `2`/`3`/`4` exit codes.
 - **`check`** — compares current mtime/size against what was stored at the last
   `reindex`, without re-hashing or loading the embedding model. Exits 1 on any
   drift. (`reindex` uses sha256 to decide whether content changed and needs
   re-embedding; `check` uses the cheaper pair so a bare `touch` is still
-  reported as drift.)
+  reported as drift.) Its `--json` report also carries `source_topic_count`/
+  `searchable_row_count`/`searchable_vector_count` — see the `search` bullet
+  above.
 - **`unmapped PATH...`** — classifies each path as `mapped_topic`,
   `mapped_concept_only`, or `unmapped` without walking the code tree.
-  Self-healing: if the markdown has drifted it reindexes once (`--no-embed`) and
-  rechecks; if drift persists, `coverage_status` is `"unknown"` and nothing is
-  reported as `unmapped` against an index of unknown freshness. This is what
-  `userprompt-remind.sh`'s coverage signal calls.
+  `coverage_status` mirrors the decision index's five states, collapsed for a
+  *negative* claim's purposes: `"ok"` (state was `current`, queried normally —
+  the only state that actually populates `unmapped`), `"uninitialized"`
+  (`missing`/`uninitialized`, no query attempted), `"upgrade-required"` (no
+  self-heal — that is the rollout's job, not an ad-hoc hook-triggered one),
+  `"index-error"` (a `sqlite3.OperationalError` while reading), or `"unknown"`
+  (state was `stale`, self-heal ran, and drift still persisted afterward —
+  unchanged from before). Self-healing only fires on `stale`: one
+  `reindex --no-embed --auto` pass, then a recheck. This is what
+  `userprompt-remind.sh`'s coverage signal and `precompact-persist.sh` call.
 - **`why`** — resolves a symbol or path to its concept(s), then prints those
   concepts' `governed_by` chains in full, including any `kind: declined` link
   (there is no separate "rejected alternative" field; a declined link *is* that
@@ -1209,8 +1411,22 @@ down:
   and a file with no resolvable language is skipped outright, so a bare
   Python (or any other registered language's) symbol resolves exactly like a
   Swift one.
-- **`drift`** — checks every active link's checkable `invariant:` against a code
-  tree.
+- **`drift`** — checks every active or provisional link's checkable
+  `invariant:` against a code tree, and classifies each into one of four
+  buckets (`docs/SCHEMA.md` §4): an active `owner-verbatim`/`owner-ratified`
+  invariant that fails is a CONSTRAINT `violation` — always fails the run; an
+  active `reviewer-finding`/`code-derived`/`agent-inference` invariant that
+  fails, *with validated evidence* (a real, non-blank list — a HOLD-eligible
+  authority with no validated evidence is CONTEXT, not a HOLD), is a
+  `hold_violation` — reported always, but only fails the run under
+  `--strict-holds`; everything else that carries no failure, or is CONTEXT, is
+  named in `skipped` with its reason (`"authority"`, a `status=…` other than
+  active, or `check_invariant`'s own refusal for a bad `kind`/regex/scope —
+  never a silent pass or a traceback). A `provisional` link's invariant is a
+  fourth, orthogonal bucket: never classified, never checked, always reported
+  in `revalidate` (plain output: `revalidate (provisional): <topic>/<link>
+  <kind>`) for a human to re-confirm against live source — never a failure,
+  even under `--strict-holds`.
 - **`code-search`** — same RRF fusion as `search`. Each hit optionally carries a
   `concept_id` when a concept's `implemented_by`/`tested_by` claims that exact
   symbol (preferred) or its containing file; attachment always reads the
