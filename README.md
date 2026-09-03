@@ -328,10 +328,12 @@ found nothing look identical from inside a session; `stats` is what tells them
 apart, and flags the silent side when it finds one.
 
 Two more things worth knowing: committing the store reindexes it automatically,
-so `reindex` by hand is only for edits you have not committed yet; and
-`code-search` tells you when its index is missing or stale rather than returning
-an empty list that reads like "nothing found". Run any command with `--help` for
-its full flag list.
+so `reindex` by hand is only for edits you have not committed yet; and a
+project can have several code roots — `code-search` tells you when their index
+is missing or stale rather than returning an empty list that reads like
+"nothing found", and heals a stale or incomplete index itself before
+searching, in one attempt, when the drift is small enough. Run any command
+with `--help` for its full flag list.
 
 **Keeping a wired repo up to date.** A fix that only touches a script (a hook,
 `memidx.py`, `memlint.py`) reaches every wired repo the moment you pull —
@@ -408,11 +410,13 @@ for it is removed rather than left behind as an answer nothing on disk still
 backs. A growing blind spot that nobody can see is the failure mode these rules
 exist to prevent.
 
-With several `--code-root` directories, only the **first** is indexed and
-searchable, and the installer prints which roots it skipped. The write-side
-hooks — the edit ledger and the nudges that read it — also follow that first
-root only, so edits under a later root do not reach them. The new-file reminder
-is the exception: it is wired per root and fires under all of them.
+With several `--code-root` directories, every one of them is indexed and
+searchable — `code-reindex`/`code-search` are scoped per root, so repairing
+one root never touches another's rows. The write-side hooks are the one
+exception: the edit ledger and the nudges that read it follow the **first**
+root only, so edits under a later root do not reach them. The new-file
+reminder is the one per-root hook: it is wired for, and fires under, every
+`--code-root` given.
 
 ## Uninstall
 

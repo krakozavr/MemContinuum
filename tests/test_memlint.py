@@ -12,6 +12,27 @@ import memlint  # noqa: E402
 FIXTURES = TOOLS_DIR / "fixtures"
 
 
+def concept_md(cid: str, ref: str, title: str = "Fixture") -> str:
+    """Shared concept-record fixture text: one implemented_by ref, minimal
+    frontmatter, a body carrying the required "not this concept" sentence.
+    Used by every test class below that needs a concept record with a
+    single implemented_by/tested_by-shaped path to lint."""
+    return (
+        "---\n"
+        "type: concept\n"
+        f"id: {cid}\n"
+        f"title: {title}\n"
+        "owner_boundary: fixture\n"
+        "implemented_by:\n"
+        f"  - {ref}\n"
+        "tested_by: []\n"
+        "governed_by: []\n"
+        "involved_in: []\n"
+        "---\n\n"
+        "Fixture. NOT this concept: nothing else.\n"
+    )
+
+
 def lint_single_file(fixture_name: str):
     """Copy one violation fixture into an isolated temp root and lint it."""
     src = FIXTURES / "memlint_violations" / fixture_name
@@ -189,29 +210,16 @@ class TestMemlintPythonSymbolVocabulary(unittest.TestCase):
     always assuming Swift (the pre-Task-6 default, which would reject every
     real Python `def` -- the Swift lexer has no notion of it)."""
 
-    CONCEPT = (
-        "---\n"
-        "type: concept\n"
-        "id: {cid}\n"
-        "title: Fixture -- Python #symbol vocabulary\n"
-        "owner_boundary: fixture\n"
-        "implemented_by:\n"
-        "  - {ref}\n"
-        "tested_by: []\n"
-        "governed_by: []\n"
-        "involved_in: []\n"
-        "---\n\n"
-        "Fixture. NOT this concept: nothing else.\n"
-    )
-
     def _lint(self, ref: str, cid: str, py_source: str):
         with tempfile.TemporaryDirectory() as td_str:
             td = Path(td_str)
             code_root = td / "code"
             code_root.mkdir()
             (code_root / "thing.py").write_text(py_source)
-            (td / "concept.md").write_text(self.CONCEPT.format(cid=cid, ref=ref))
-            return memlint.lint_root(td, code_root=code_root)
+            (td / "concept.md").write_text(
+                concept_md(cid, ref, title="Fixture -- Python #symbol vocabulary")
+            )
+            return memlint.lint_root(td, code_roots=[code_root])
 
     def test_python_symbol_declared_is_not_an_error(self):
         # If the call site ever regresses to not forwarding ref_path (i.e.
@@ -241,6 +249,85 @@ class TestMemlintPythonSymbolVocabulary(unittest.TestCase):
             "class Widget:\n    def __init__(self):\n        pass\n",
         )
         self.assertFalse(any("CON-PYVOCAB-CLASS" in e for e in errors), errors)
+
+
+class TestMemlintMultipleCodeRoots(unittest.TestCase):
+    """Task 8: --code-root is repeatable and the code index is root-scoped,
+    so a concept's implemented_by/tested_by path is checked against every
+    configured root, not just one:
+
+    - found under exactly one root -> fine, no matter which root.
+    - found under NONE of the roots -> error naming every root tried.
+    - found under MORE THAN ONE root -> ERROR (not a warning): one
+      reference must name one file, so a path that resolves inside two
+      code roots is an unresolved ambiguity about which file the concept
+      actually claims, exactly like the existing duplicate-implemented_by-
+      claim check treats two concepts claiming the same symbol.
+    """
+
+    def _two_roots(self, td: Path):
+        root_a = td / "root_a"
+        root_b = td / "root_b"
+        root_a.mkdir()
+        root_b.mkdir()
+        return root_a, root_b
+
+    def test_ref_found_under_second_root(self):
+        with tempfile.TemporaryDirectory() as td_str:
+            td = Path(td_str)
+            root_a, root_b = self._two_roots(td)
+            (root_b / "thing.py").write_text("def f():\n    pass\n")
+            (td / "concept.md").write_text(concept_md("CON-MULTIROOT-OK", "thing.py#f"))
+            errors, _warnings = memlint.lint_root(td, code_roots=[root_a, root_b])
+            self.assertFalse(any("CON-MULTIROOT-OK" in e for e in errors), errors)
+
+    def test_ref_under_two_roots_is_an_error(self):
+        with tempfile.TemporaryDirectory() as td_str:
+            td = Path(td_str)
+            root_a, root_b = self._two_roots(td)
+            (root_a / "thing.py").write_text("def f():\n    pass\n")
+            (root_b / "thing.py").write_text("def f():\n    pass\n")
+            (td / "concept.md").write_text(concept_md("CON-MULTIROOT-AMBIG", "thing.py#f"))
+            errors, _warnings = memlint.lint_root(td, code_roots=[root_a, root_b])
+            hit = [e for e in errors if "CON-MULTIROOT-AMBIG" in e]
+            self.assertTrue(hit, errors)
+            self.assertIn("exists under several code roots", hit[0])
+            self.assertIn("one reference must name one file", hit[0])
+            self.assertIn(str(root_a.resolve()), hit[0])
+            self.assertIn(str(root_b.resolve()), hit[0])
+
+    def test_ref_found_under_no_root_names_every_root_tried(self):
+        with tempfile.TemporaryDirectory() as td_str:
+            td = Path(td_str)
+            root_a, root_b = self._two_roots(td)
+            (td / "concept.md").write_text(concept_md("CON-MULTIROOT-MISSING", "thing.py"))
+            errors, _warnings = memlint.lint_root(td, code_roots=[root_a, root_b])
+            hit = [e for e in errors if "CON-MULTIROOT-MISSING" in e]
+            self.assertTrue(hit, errors)
+            self.assertIn(str(root_a.resolve()), hit[0])
+            self.assertIn(str(root_b.resolve()), hit[0])
+
+
+class TestMemlintCLIRepeatableCodeRoot(unittest.TestCase):
+    def test_cli_accepts_repeated_code_root(self):
+        root, code_roots, unknown = memlint.parse_argv(
+            ["S", "--code-root", "A", "--code-root", "B"]
+        )
+        self.assertEqual(root, "S")
+        self.assertEqual(code_roots, ["A", "B"])
+        self.assertIsNone(unknown)
+
+    def test_single_code_root_still_returns_a_one_item_list(self):
+        root, code_roots, unknown = memlint.parse_argv(["S", "--code-root", "A"])
+        self.assertEqual(root, "S")
+        self.assertEqual(code_roots, ["A"])
+        self.assertIsNone(unknown)
+
+    def test_no_code_root_returns_empty_list(self):
+        root, code_roots, unknown = memlint.parse_argv(["S"])
+        self.assertEqual(root, "S")
+        self.assertEqual(code_roots, [])
+        self.assertIsNone(unknown)
 
 
 if __name__ == "__main__":

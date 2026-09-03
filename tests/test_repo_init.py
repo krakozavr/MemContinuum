@@ -8,6 +8,7 @@ never touch the real machine's state.
 import json
 import os
 import re
+import shlex
 import shutil
 import sqlite3
 import stat
@@ -676,6 +677,56 @@ class TestMultipleCodeRoots(unittest.TestCase):
                 home,
             )
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_two_code_roots_readme_recipe_has_both_code_root_flags(self):
+        """Task 8: memlint's --code-root is repeatable, so the store README's
+        recipe line ({{CODE_ROOT_ARGS}}, templates/store-README.md.tmpl:29)
+        must render one --code-root per recorded root -- a lint following
+        the recipe as printed must see every root, not just the first."""
+        home = sandbox_home()
+        try:
+            store = str(Path(home) / "store")
+            root_a = str(Path(home) / "code-a")
+            root_b = str(Path(home) / "code-b")
+            os.makedirs(root_a, exist_ok=True)
+            os.makedirs(root_b, exist_ok=True)
+            proc = run_install(
+                ["--project", "multi", "--store", store,
+                 "--code-root", root_a, "--code-root", root_b,
+                 "--claude-dir", str(Path(home) / ".claude")],
+                home,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            readme = (Path(store) / "README.md").read_text()
+            recipe = next(l for l in readme.splitlines() if "memlint.py" in l and "PYTHONPATH" in l)
+            self.assertIn(f"--code-root {root_a}", recipe, recipe)
+            self.assertIn(f"--code-root {root_b}", recipe, recipe)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_code_root_with_a_space_is_quoted_in_the_readme_recipe(self):
+        home = sandbox_home()
+        try:
+            store = str(Path(home) / "store")
+            root_with_space = str(Path(home) / "code root")
+            os.makedirs(root_with_space, exist_ok=True)
+            proc = run_install(
+                ["--project", "spacey", "--store", store,
+                 "--code-root", root_with_space,
+                 "--claude-dir", str(Path(home) / ".claude")],
+                home,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            readme = (Path(store) / "README.md").read_text()
+            recipe = next(l for l in readme.splitlines() if "memlint.py" in l and "PYTHONPATH" in l)
+            self.assertIn("--code-root", recipe, recipe)
+            # Quoted well enough that a shell splitting the recipe line sees
+            # the space-containing path as ONE word, not two -- robust to
+            # either `printf %q` backslash-escaping or a quoted string.
+            tokens = shlex.split(recipe)
+            self.assertIn(root_with_space, tokens, recipe)
         finally:
             shutil.rmtree(home, ignore_errors=True)
 
@@ -1907,9 +1958,9 @@ class TestCodeCensusAndConsentDialogue(unittest.TestCase):
             code_db = Path(home) / ".memcontinuum" / "widgetco-code.sqlite"
             self.assertTrue(code_db.is_file(), "code db not created -- initial code-reindex did not run")
             conn = sqlite3.connect(str(code_db))
-            row = conn.execute("SELECT langs FROM code_meta WHERE project=?", ("widgetco",)).fetchone()
+            row = conn.execute("SELECT langs FROM code_project WHERE project=?", ("widgetco",)).fetchone()
             conn.close()
-            self.assertIsNotNone(row, "no code_meta row for project widgetco")
+            self.assertIsNotNone(row, "no code_project row for project widgetco")
             self.assertEqual(row[0], "python")
         finally:
             shutil.rmtree(home, ignore_errors=True)
@@ -2049,14 +2100,11 @@ class TestCodeCensusAndConsentDialogue(unittest.TestCase):
             shutil.rmtree(home, ignore_errors=True)
 
 
-class TestMultiRootCodeIndexTruncation(unittest.TestCase):
-    """B3 (final fix wave): `code-reindex` is single-root by construction --
-    it removes every stored path it did not see under the root it was
-    given, and overwrites code_meta.code_root. Running it once per
-    --code-root therefore left only the LAST root indexed, having quietly
-    deleted the previous ones' rows. The installer now indexes exactly the
-    first code root (the same one the hooks wire as
-    MEMCONTINUUM_CODE_ROOT) and says loudly which roots it did not."""
+class TestMultiRootCodeIndex(unittest.TestCase):
+    """`code-reindex` is root-scoped: indexing one root touches only that
+    root's own stored rows (code_meta is keyed by (project, code_root)), so
+    repo-init runs one code-reindex call per --code-root and indexes all
+    of them, instead of only the first."""
 
     @staticmethod
     def _two_roots(home):
@@ -2068,7 +2116,7 @@ class TestMultiRootCodeIndexTruncation(unittest.TestCase):
         shutil.copy(PY_CORPUS / "basic_functions.py", second / "beta_module.py")
         return first, second
 
-    def test_only_the_first_root_is_indexed_and_the_rest_are_named(self):
+    def test_every_code_root_is_indexed(self):
         home = sandbox_home()
         try:
             store = str(Path(home) / "store")
@@ -2085,31 +2133,35 @@ class TestMultiRootCodeIndexTruncation(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             out = proc.stdout + proc.stderr
 
-            # The note must NAME the un-indexed root, not just hint at one.
-            self.assertIn(str(second), out, out)
-            self.assertIn("only the first code root is indexed", out.lower(), out)
-            # ... and it must say so in present tense: no roadmap vocabulary in
-            # anything a person reads during an install.
+            # One code-reindex step line per root, naming that root.
+            self.assertIn(f"code-reindex ({first})", out, out)
+            self.assertIn(f"code-reindex ({second})", out, out)
+            self.assertNotIn("NOTE: only the first", out, out)
+            # Present tense throughout: no roadmap vocabulary in anything a
+            # person reads during an install.
             self.assertNotIn("milestone", out.lower(), out)
 
             code_db = Path(home) / ".memcontinuum" / "multi-code.sqlite"
             self.assertTrue(code_db.is_file(), out)
             conn = sqlite3.connect(str(code_db))
             try:
-                meta = conn.execute(
-                    "SELECT code_root FROM code_meta WHERE project=?", ("multi",)
-                ).fetchone()
+                roots = {
+                    r[0] for r in conn.execute(
+                        "SELECT code_root FROM code_meta WHERE project=?", ("multi",)
+                    ).fetchall()
+                }
                 paths = {r[0] for r in conn.execute("SELECT DISTINCT path FROM chunks")}
             finally:
                 conn.close()
-            self.assertEqual(meta[0], str(first))
-            self.assertEqual(paths, {"alpha_module.py"}, paths)
+            self.assertEqual(roots, {str(first), str(second)}, roots)
+            self.assertEqual(paths, {"alpha_module.py", "beta_module.py"}, paths)
         finally:
             shutil.rmtree(home, ignore_errors=True)
 
     def test_no_removed_churn_from_a_second_root(self):
-        """The symptom the single-root rule exists to prevent: a second
-        code-reindex pass reporting the first root's files as "removed"."""
+        """Each root's code-reindex call is scoped to that root alone: a
+        second root's own first index must never report the first root's
+        files as "removed"."""
         home = sandbox_home()
         try:
             store = str(Path(home) / "store")
@@ -2209,7 +2261,7 @@ class TestNeverExtension(unittest.TestCase):
             conn = sqlite3.connect(str(code_db))
             try:
                 row = conn.execute(
-                    "SELECT langs FROM code_meta WHERE project=?", ("neverco",)
+                    "SELECT langs FROM code_project WHERE project=?", ("neverco",)
                 ).fetchone()
             finally:
                 conn.close()

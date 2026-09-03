@@ -538,6 +538,18 @@ class TestInternalsIsLinked(unittest.TestCase):
         )
 
 
+class TestInternalsDocumentsRootScopedCodeIndex(unittest.TestCase):
+    """The code-index section has to describe --drop-root, the heal's
+    --heal-limit cap, and the report's degraded state -- all three landed
+    in the code-index foundation work and none of them showed up in
+    INTERNALS.md by name until this doc pass."""
+
+    def test_internals_mentions_drop_root_heal_limit_degraded(self):
+        text = INTERNALS.read_text()
+        for token in ("--drop-root", "--heal-limit", "degraded"):
+            self.assertIn(token, text, f"docs/INTERNALS.md never mentions {token!r}")
+
+
 class TestReadmeListsEveryDocumentedMemidxSubcommand(unittest.TestCase):
     """A memidx.py subcommand only shows up in `memidx.py --help`'s own
     subcommand listing when its subparser was given a `help=` description

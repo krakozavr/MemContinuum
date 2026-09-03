@@ -42,7 +42,7 @@ from memidx import (
 _NOT_THIS_RE = re.compile(r"\bNOT\b|not this concept|Does NOT")
 
 
-def _symbol_declared(frag: str, text: str, rel_path: str = "x.swift") -> bool:
+def _symbol_declared(frag: str, text: str, rel_path: str) -> bool:
     """Finding 5 (init/subscript/computed var/backtick names) AND finding 4
     (a QUALIFIED fragment, e.g. "Outer.outerFunc", must validate exactly
     like code-search's runtime concept attachment accepts it): this reuses
@@ -126,15 +126,20 @@ def lint_topic(path: Path, fm: dict) -> tuple[list[str], list[str]]:
 def lint_concept(
     path: Path,
     fm: dict,
-    code_root: Path | None,
+    code_roots: list[Path],
     body: str = "",
     known_topic_ids: set[str] | None = None,
 ) -> tuple[list[str], list[str]]:
     """docs/SCHEMA.md.1 addendum SS4: type: concept records.
 
-    - implemented_by/tested_by path that doesn't exist on disk (relative to
-      code_root, "#symbol" fragment stripped) -> error. Skipped entirely
-      when code_root is not given (existence isn't checkable without one).
+    - implemented_by/tested_by path that doesn't exist on disk under any of
+      code_roots ("#symbol" fragment stripped) -> error naming every root
+      tried. Skipped entirely when code_roots is empty (existence isn't
+      checkable without at least one root).
+    - a path that resolves and exists under MORE than one of code_roots ->
+      ERROR (not a warning): one reference must name one file, so a ref
+      that is ambiguous across roots is exactly as unresolved as two
+      concepts claiming the same symbol (see _duplicate_claim_errors).
     - a "#symbol" fragment that doesn't actually match a func/struct/enum/
       class/subscript/static-func declared in that file -> error (the
       fragment used to be stripped and never checked).
@@ -145,7 +150,7 @@ def lint_concept(
       corpus -> error. Only enforced when known_topic_ids is given AND
       non-empty (a corpus with zero topic records has no registry to
       validate against -- same "skip when unverifiable" pattern as the
-      code_root-less path-existence check).
+      code_roots-less path-existence check).
     - no tested_by entries -> warning (promotion needs at least one).
     - concept body with no "not this concept" sentence (what this concept
       is explicitly NOT) -> warning.
@@ -154,8 +159,9 @@ def lint_concept(
     warnings: list[str] = []
     cid = fm.get("id") or path.stem
 
-    if code_root is not None:
-        resolved_root = code_root.resolve()
+    resolved_roots = [r.resolve() for r in (code_roots or [])]
+    if resolved_roots:
+        roots_desc = ", ".join(str(r) for r in resolved_roots)
         for field in ("implemented_by", "tested_by"):
             for ref in fm.get(field) or []:
                 ref_str = str(ref)
@@ -167,27 +173,54 @@ def lint_concept(
                 # relative "../.." path could walk outside code_root with
                 # no check at all -- either used to be judged only by
                 # whatever full.exists() happened to say about wherever it
-                # landed. Both are now a hard, named error instead.
+                # landed. Both are now a hard, named error instead. This
+                # is root-independent (an absolute path can't be relative
+                # to ANY root), so it's checked once, not per root.
                 if Path(ref_path).is_absolute():
                     errors.append(
                         f"{path}: {cid} {field} path {ref_path!r} is absolute -- "
-                        f"must be relative to code_root {resolved_root}"
-                    )
-                    continue
-                full = (resolved_root / ref_path).resolve()
-                try:
-                    full.relative_to(resolved_root)
-                except ValueError:
-                    errors.append(
-                        f"{path}: {cid} {field} path {ref_path!r} escapes code_root {resolved_root}"
+                        f"must be relative to a code root ({roots_desc})"
                     )
                     continue
 
-                if not full.exists():
+                # The `..`-escape check runs against each root: the same
+                # relative ref_path can escape one root while staying
+                # contained in another (a shallower root has less room to
+                # walk up out of). A root it escapes contributes no hit.
+                hits: list[Path] = []
+                escaped_from: list[Path] = []
+                for root in resolved_roots:
+                    full = (root / ref_path).resolve()
+                    try:
+                        full.relative_to(root)
+                    except ValueError:
+                        escaped_from.append(root)
+                        continue
+                    if full.exists():
+                        hits.append(root)
+
+                if len(hits) > 1:
+                    hits_desc = ", ".join(str(r) for r in hits)
                     errors.append(
-                        f"{path}: {cid} {field} path {ref_path!r} does not exist under {code_root}"
+                        f"{path}: {cid} {field} path {ref_path!r} exists under several code "
+                        f"roots ({hits_desc}) -- one reference must name one file"
                     )
                     continue
+                if not hits:
+                    if len(escaped_from) == len(resolved_roots):
+                        errors.append(
+                            f"{path}: {cid} {field} path {ref_path!r} escapes code_root "
+                            f"({roots_desc})"
+                        )
+                    else:
+                        errors.append(
+                            f"{path}: {cid} {field} path {ref_path!r} does not exist under any "
+                            f"code root tried ({roots_desc})"
+                        )
+                    continue
+
+                root = hits[0]
+                full = (root / ref_path).resolve()
                 if frag:
                     try:
                         text = full.read_text(encoding="utf-8", errors="ignore")
@@ -241,12 +274,12 @@ def lint_record(path: Path, fm: dict) -> tuple[list[str], list[str]]:
 
 def lint_file(
     path: Path,
-    code_root: Path | None = None,
+    code_roots: list[Path] | None = None,
     known_topic_ids: set[str] | None = None,
 ) -> tuple[list[str], list[str]]:
     fm, body = parse_frontmatter(path)
     if fm.get("type") == "concept":
-        return lint_concept(path, fm, code_root, body=body, known_topic_ids=known_topic_ids)
+        return lint_concept(path, fm, code_roots or [], body=body, known_topic_ids=known_topic_ids)
     is_topic = bool(fm.get("links")) or fm.get("type") == "topic"
     if is_topic:
         return lint_topic(path, fm)
@@ -287,7 +320,7 @@ def _duplicate_claim_errors(root: Path) -> list[str]:
     return errors
 
 
-def lint_root(root: Path, code_root: Path | None = None) -> tuple[list[str], list[str]]:
+def lint_root(root: Path, code_roots: list[Path] | None = None) -> tuple[list[str], list[str]]:
     """One pre-pass walk collects everything id-shaped (known ids for concept
     validation, explicit-id owners for the duplicate check, stem fallbacks for
     the collision warning) so the duplicate-id check costs no walk of its own
@@ -316,7 +349,7 @@ def lint_root(root: Path, code_root: Path | None = None) -> tuple[list[str], lis
     all_errors: list[str] = []
     all_warnings: list[str] = []
     for f in sorted(walk_markdown(root)):
-        errors, warnings = lint_file(f, code_root, known_topic_ids=known_topic_ids)
+        errors, warnings = lint_file(f, code_roots, known_topic_ids=known_topic_ids)
         all_errors.extend(errors)
         all_warnings.extend(warnings)
     all_errors.extend(_duplicate_claim_errors(root))
@@ -341,8 +374,13 @@ def lint_root(root: Path, code_root: Path | None = None) -> tuple[list[str], lis
     return all_errors, all_warnings
 
 
-def parse_argv(argv: list[str]) -> tuple[str | None, str | None, str | None]:
-    """ROOT positional + optional --code-root PATH, in either order.
+def parse_argv(argv: list[str]) -> tuple[str | None, list[str], str | None]:
+    """ROOT positional + repeatable --code-root PATH, in either order.
+
+    --code-root accumulates: `--code-root A --code-root B` yields
+    ["A", "B"], not "B" silently winning over "A" -- the code index is
+    root-scoped, so a concept ref can legitimately live under any one of
+    several roots, and every root given must be checked.
 
     H6: any other `--flag` used to fall through the `elif root is None`
     branch below and get accepted AS the ROOT positional -- `memlint.py
@@ -352,23 +390,24 @@ def parse_argv(argv: list[str]) -> tuple[str | None, str | None, str | None]:
     treating it as a path.
     """
     root = None
-    code_root = None
+    code_roots: list[str] = []
     unknown = None
     i = 0
     while i < len(argv):
         a = argv[i]
         if a == "--code-root":
             i += 1
-            code_root = argv[i] if i < len(argv) else None
+            if i < len(argv):
+                code_roots.append(argv[i])
         elif a.startswith("--") and unknown is None:
             unknown = a
         elif root is None:
             root = a
         i += 1
-    return root, code_root, unknown
+    return root, code_roots, unknown
 
 
-USAGE = """usage: memlint.py ROOT [--code-root PATH]
+USAGE = """usage: memlint.py ROOT [--code-root PATH ...]
 
 Validate every MemContinuum record under ROOT against the schema and print one
 ERROR:/WARNING: line per finding. Exit 1 if any error was found, 0 otherwise
@@ -377,9 +416,14 @@ ERROR:/WARNING: line per finding. Exit 1 if any error was found, 0 otherwise
   ROOT               the markdown store root to walk
   --code-root PATH   a code checkout, enabling the concept-record checks that
                      need one: implemented_by/tested_by paths must exist under
-                     it, and a #symbol fragment must name something the chunker
-                     recognizes in that file. Omit it and those checks are
-                     skipped; every other rule still runs.
+                     one of them, and a #symbol fragment must name something
+                     the chunker recognizes in that file. Repeatable, for a
+                     project with several code roots -- a path found under
+                     exactly one root is fine; found under none is an error
+                     naming every root tried; found under more than one is an
+                     error (one reference must name one file). Omit it
+                     entirely and those checks are skipped; every other rule
+                     still runs.
   -h, --help         print this and exit
 
 Rule reference: docs/SCHEMA.md sections 7 and 8.4; the complete table of what
@@ -394,7 +438,7 @@ def main(argv=None) -> int:
     if "-h" in argv or "--help" in argv:
         print(USAGE)
         return 0
-    root_str, code_root_str, unknown = parse_argv(argv)
+    root_str, code_root_strs, unknown = parse_argv(argv)
     if unknown is not None:
         print(f"unknown argument: {unknown}", file=sys.stderr)
         print(USAGE, file=sys.stderr)
@@ -403,8 +447,17 @@ def main(argv=None) -> int:
         print(USAGE, file=sys.stderr)
         return 2
     root = Path(root_str).resolve()
-    code_root = Path(code_root_str).resolve() if code_root_str else None
-    errors, warnings = lint_root(root, code_root)
+    # Dedupe by resolved path, preserving first-seen order: `--code-root A
+    # --code-root A` (or two spellings of the same directory) must not turn
+    # every ref found under it into a false "exists under several roots".
+    code_roots: list[Path] = []
+    seen: set[Path] = set()
+    for s in code_root_strs:
+        resolved = Path(s).resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            code_roots.append(resolved)
+    errors, warnings = lint_root(root, code_roots)
     for w in warnings:
         print(f"WARNING: {w}")
     for e in errors:

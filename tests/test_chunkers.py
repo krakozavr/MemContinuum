@@ -2,12 +2,14 @@ import contextlib
 import hashlib
 import io
 import json
+import os
 import re
 import shutil
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import chunkers
 import chunkers.python_ast as python_ast
@@ -17,7 +19,7 @@ TESTS_DIR = Path(__file__).resolve().parent
 if str(TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(TESTS_DIR))
 
-from test_code_index import FIXTURES, code_reindex  # noqa: E402 -- reuse the Swift fixture
+from test_code_index import FIXTURES, code_reindex, ns  # noqa: E402 -- reuse the Swift fixture
 # corpus and code-reindex helper test_code_index.py already builds, rather than duplicating
 # the corpus text here.
 
@@ -487,14 +489,16 @@ class TestPythonAstChunker(unittest.TestCase):
 
 
 class TestFragmentDeclaredInTextDispatch(unittest.TestCase):
-    """Task 6: memidx.fragment_declared_in_text(frag, text, rel_path=...)
-    dispatches per chunkers.lang_for_path(rel_path) -- a .py rel_path routes
-    through chunkers.python_ast.declared_symbols (already includes
-    class-container names per its own docstring/tests above, so no separate
-    container pass is added here) evaluated with the SAME fragment_matches_symbol
-    predicate the Swift path and code-search's runtime attachment both use.
-    Every other rel_path (including the default "x.swift") keeps the
-    Swift-lexer path byte-identical to before this task."""
+    """Task 6: memidx.fragment_declared_in_text(frag, text, rel_path) --
+    rel_path is REQUIRED (Task 6 drops the old "x.swift" default) --
+    dispatches per chunkers.lang_for_path(rel_path), falling back to a
+    shebang sniff of text's first line for an extensionless rel_path, and
+    returning False when neither resolves a language (no vocabulary). A
+    .py rel_path routes through chunkers.python_ast.declared_symbols
+    (already includes class-container names per its own docstring/tests
+    above, so no separate container pass is added here) evaluated with the
+    SAME fragment_matches_symbol predicate the Swift path and
+    code-search's runtime attachment both use."""
 
     def test_python_function_fragment_recognized_with_py_rel_path(self):
         # Step 1's red test (brief): fails today -- fragment_declared_in_text
@@ -505,12 +509,12 @@ class TestFragmentDeclaredInTextDispatch(unittest.TestCase):
             memidx.fragment_declared_in_text("parse_frontmatter", text, rel_path="memidx.py")
         )
 
-    def test_python_function_fragment_not_recognized_without_py_rel_path(self):
-        # Same text, default rel_path ("x.swift") -- the Swift lexer path,
+    def test_python_function_fragment_not_recognized_with_swift_rel_path(self):
+        # Same text, an explicit .swift rel_path -- the Swift lexer path,
         # which has no notion of `def`. Documents that dispatch is driven by
         # rel_path, not a guess from the text's own contents.
         text = "def parse_frontmatter():\n    pass\n"
-        self.assertFalse(memidx.fragment_declared_in_text("parse_frontmatter", text))
+        self.assertFalse(memidx.fragment_declared_in_text("parse_frontmatter", text, rel_path="x.swift"))
 
     def test_python_class_container_name_recognized_via_declared_symbols(self):
         text = (PY_FIXTURES / "classes.py").read_text()
@@ -521,13 +525,25 @@ class TestFragmentDeclaredInTextDispatch(unittest.TestCase):
 
     def test_swift_path_regression_unchanged(self):
         # Existing behavior preserved exactly: a Swift fragment case that
-        # passes today (default rel_path, and an explicit .swift rel_path)
-        # still passes after the dispatch is added.
+        # passed before this task still passes after the dispatch is added.
         text = (FIXTURES / "NestedTypes.swift").read_text()
-        self.assertTrue(memidx.fragment_declared_in_text("Outer.outerFunc", text))
         self.assertTrue(
             memidx.fragment_declared_in_text("Outer.outerFunc", text, rel_path="NestedTypes.swift")
         )
+
+    def test_no_extension_no_shebang_returns_false(self):
+        # rel_path has no extension and text carries no recognizable
+        # shebang -- neither resolution path finds a language, so the
+        # answer is False (no vocabulary), not an exception.
+        text = "def parse_frontmatter():\n    pass\n"
+        self.assertFalse(memidx.fragment_declared_in_text("parse_frontmatter", text, rel_path="tool"))
+
+    def test_unknown_extension_returns_false_without_shebang_fallback(self):
+        # An extension IS present but matches no LANGUAGE_TABLE row -- the
+        # shebang fallback only applies to an EXTENSIONLESS rel_path, so
+        # this must not fall through to sniffing the text either.
+        text = "#!/usr/bin/env python3\ndef parse_frontmatter():\n    pass\n"
+        self.assertFalse(memidx.fragment_declared_in_text("parse_frontmatter", text, rel_path="tool.txt"))
 
 
 class TestSwiftDeclaredSymbolsBackend(unittest.TestCase):
@@ -583,3 +599,93 @@ class TestSwiftDeclaredSymbolsBackend(unittest.TestCase):
         body = src.split('"""')[-1]
         self.assertNotIn('== "python"', body, body)
         self.assertIn("get_chunker", body, body)
+
+
+class TestGetChunkerFailsOpenOnAnyBackendException(unittest.TestCase):
+    """Fix-wave item 2: get_chunker wrapped only ImportError before this
+    fix -- any OTHER exception a backend module raises at import time (a
+    provider's own init code raising RuntimeError, OSError, a custom
+    exception type, ...) propagated straight through importlib.import_module
+    and out of get_chunker uncaught, crashing backend_availability() and
+    everything built on it (code_index_report, cmd_code_search, `why`'s
+    code-index fast path) instead of degrading gracefully."""
+
+    def _broken_python_import(self):
+        """Patches chunkers.importlib.import_module so importing
+        chunkers.python_ast specifically raises a RuntimeError (a stand-in
+        for "this backend's own init code failed", not a missing module --
+        the real chunkers.python_ast module exists and imports fine
+        outside this patch); every other import_module call (swift, or
+        python_ast's own internal imports once it's already loaded)
+        passes through to the real importlib unchanged."""
+        real_import_module = chunkers.importlib.import_module
+
+        def fake(name, *a, **kw):
+            if name == "chunkers.python_ast":
+                raise RuntimeError("provider init failed")
+            return real_import_module(name, *a, **kw)
+
+        return mock.patch.object(chunkers.importlib, "import_module", side_effect=fake)
+
+    def test_get_chunker_wraps_any_exception_not_just_import_error(self):
+        with self._broken_python_import():
+            with self.assertRaises(chunkers.BackendUnavailable) as ctx:
+                chunkers.get_chunker("python")
+            self.assertIn("RuntimeError", str(ctx.exception))
+            self.assertIn("provider init failed", str(ctx.exception))
+            avail = chunkers.backend_availability()  # must not raise either
+        self.assertIn("python=missing", avail)
+        self.assertIn("swift=ok", avail)
+
+    def test_code_search_and_why_fail_open_when_a_backend_raises_on_import(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"
+            home.mkdir()
+            root = Path(td) / "code"
+            root.mkdir()
+            (root / "x.py").write_text("def f():\n    pass\n")
+            project = "fail-open-backend-import"
+            db_path = home / f"{project}-code.sqlite"
+            prev_home = os.environ.get("MEMCONTINUUM_HOME")
+            os.environ["MEMCONTINUUM_HOME"] = str(home)
+            try:
+                with self._broken_python_import():
+                    out, err = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                        rc = code_reindex(root, db_path, project=project, no_embed=True, lang="python")
+                    self.assertEqual(rc, 0, out.getvalue() + err.getvalue())
+                    self.assertIn("1 not indexed", out.getvalue())
+
+                    conn = memidx.open_code_db(db_path)
+                    report = memidx.code_index_report(conn, project)
+                    conn.close()
+                    self.assertEqual(report["state"], "degraded", report)
+
+                    buf, errbuf = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(errbuf):
+                        rc = memidx.cmd_code_search(
+                            ns(db=str(db_path), project=project, query="f", mode="fts", limit=5, json=False)
+                        )
+                    self.assertEqual(rc, 0, buf.getvalue() + errbuf.getvalue())
+                    self.assertIn("not indexed", errbuf.getvalue())
+
+                    # `why`'s code-index fast path consults MEMCONTINUUM_HOME's
+                    # own <project>-code.sqlite (never --db) -- db_path above
+                    # IS that path, so this exercises the real fast path, not
+                    # a disk-scan fallback called in isolation. The point
+                    # here is fail-OPEN, not a successful resolution: with
+                    # the python backend genuinely broken, the disk-scan
+                    # fallback's own declared-symbol check
+                    # (fragment_declared_in_text) can't chunk python either,
+                    # so the honest answer is still None -- what matters,
+                    # and what the pre-fix get_chunker broke, is that this
+                    # call returns None instead of letting the RuntimeError
+                    # propagate all the way up through backend_availability()
+                    # -> code_index_report() -> _resolve_symbol_via_code_index.
+                    resolved = memidx.resolve_symbol_to_path(root, "f", project=project)
+                    self.assertIsNone(resolved)
+            finally:
+                if prev_home is None:
+                    os.environ.pop("MEMCONTINUUM_HOME", None)
+                else:
+                    os.environ["MEMCONTINUUM_HOME"] = prev_home

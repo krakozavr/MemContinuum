@@ -664,7 +664,8 @@ mc_update_recover_from_settings() {
     # Rationale-only wiring (no PreToolUse hooks at all) has no nudge line to
     # recover a code-root from -- fall back to the always-present write-side
     # line's own MEMCONTINUUM_CODE_ROOT (first root only; write-hooks.json.tmpl
-    # only ever carries the first -- see repo-init.sh's own single-root note).
+    # only ever carries the first root's env var into that hook's command,
+    # regardless of how many --code-root values repo-init indexed).
     if [ "${#roots[@]}" -eq 0 ]; then
         while IFS= read -r line || [ -n "$line" ]; do
             [ -n "$line" ] || continue

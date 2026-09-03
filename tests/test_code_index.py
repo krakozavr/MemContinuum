@@ -25,6 +25,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -32,6 +33,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 TOOLS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(TOOLS_DIR))
@@ -118,7 +120,8 @@ def ns(**kw):
     return SimpleNamespace(**base)
 
 
-def code_reindex(code_root, db, project=memidx.DEFAULT_PROJECT, no_embed=True, full=False, lang="swift"):
+def code_reindex(code_root, db, project=memidx.DEFAULT_PROJECT, no_embed=True, full=False, lang="swift",
+                  drop_root=None):
     """Task 7: `lang` now defaults to "swift" here in the test helper (not
     in memidx.py -- that hardcoded default is gone, see TestLangDefaultFix)
     purely to centralize the fix for the many pre-existing call sites in
@@ -126,8 +129,308 @@ def code_reindex(code_root, db, project=memidx.DEFAULT_PROJECT, no_embed=True, f
     Swift-only fixtures. Pass lang=None explicitly to exercise the real
     omitted-flag behavior (fails on a fresh project, reuses stored langs
     otherwise)."""
-    args = ns(code_root=str(code_root), db=str(db), project=project, no_embed=no_embed, full=full, lang=lang)
+    args = ns(code_root=str(code_root), db=str(db), project=project, no_embed=no_embed, full=full, lang=lang,
+              drop_root=drop_root)
     return memidx.cmd_code_reindex(args)
+
+
+class TestCodeSchemaV2(unittest.TestCase):
+    V1_DDL = """
+      CREATE TABLE chunks (id INTEGER PRIMARY KEY, path TEXT, project TEXT, lang TEXT, kind TEXT,
+        symbol TEXT, qualified_name TEXT, signature TEXT, doc TEXT, start_line INTEGER, end_line INTEGER);
+      CREATE VIRTUAL TABLE fts USING fts5(qualified_name, split_tokens, signature, doc, body);
+      CREATE TABLE embeddings (chunk_id INTEGER PRIMARY KEY, project TEXT, dim INTEGER, vector BLOB);
+      CREATE TABLE file_sha (path TEXT, project TEXT, sha256 TEXT NOT NULL, mtime REAL, size INTEGER,
+        gap_count INTEGER DEFAULT 0, chunker_version TEXT, PRIMARY KEY (path, project));
+      CREATE TABLE code_meta (project TEXT PRIMARY KEY, code_root TEXT, langs TEXT, last_indexed_at REAL, head_sha TEXT);
+      INSERT INTO chunks VALUES (1,'a.swift','p','swift','function','f','f','func f()','',1,2);
+      INSERT INTO file_sha VALUES ('a.swift','p','x',0,0,0,'cv');
+      INSERT INTO code_meta VALUES ('p','/old/root','swift,python',0,'abc');
+    """
+
+    def _cols(self, conn, table):
+        return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+    def _v1(self, td):
+        db = Path(td) / "c.sqlite"
+        conn = sqlite3.connect(str(db)); conn.executescript(self.V1_DDL); conn.commit(); conn.close()
+        return db
+
+    def test_fresh_db_has_v2_shape(self):
+        with tempfile.TemporaryDirectory() as td:
+            conn = memidx.open_code_db(Path(td) / "c.sqlite")
+            self.assertEqual(memidx.code_schema_version(conn), 2)
+            self.assertIn("code_root", self._cols(conn, "chunks"))
+            self.assertTrue({"code_root", "status", "reason", "chunker_version"} <= self._cols(conn, "file_sha"))
+            self.assertNotIn("langs", self._cols(conn, "code_meta"))
+            self.assertEqual(self._cols(conn, "code_project"), {"project", "langs", "embedding_mode"})
+            self.assertIn("attempt_key", self._cols(conn, "file_sha"))
+            pk = sorted(r[1] for r in conn.execute("PRAGMA table_info(code_meta)") if r[5])
+            self.assertEqual(pk, ["code_root", "project"])
+            self.assertIn("tokenchars", conn.execute("SELECT sql FROM sqlite_master WHERE name='fts'").fetchone()[0])
+
+    def test_older_db_keeps_roots_and_langs_but_drops_derived_rows(self):
+        with tempfile.TemporaryDirectory() as td:
+            conn = memidx.open_code_db(self._v1(td))
+            self.assertEqual(memidx.code_schema_version(conn), 2)
+            self.assertEqual(conn.execute("SELECT count(*) FROM chunks").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT count(*) FROM file_sha").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT project, code_root FROM code_meta").fetchall()[0][:], ("p", "/old/root"))
+            self.assertEqual(conn.execute("SELECT langs, embedding_mode FROM code_project").fetchone()[:], ("swift,python", "none"))
+
+    def test_failed_rebuild_leaves_older_db_intact(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = self._v1(td)
+            real = memidx.CODE_SCHEMA_SQL
+            memidx.CODE_SCHEMA_SQL = real + "\nCREATE TABLE code_schema (dup INTEGER);"   # forces an error mid-rebuild
+            try:
+                with self.assertRaises(sqlite3.Error):
+                    memidx.open_code_db(db)
+            finally:
+                memidx.CODE_SCHEMA_SQL = real
+            conn = sqlite3.connect(str(db))
+            self.assertEqual(conn.execute("SELECT count(*) FROM chunks").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT langs FROM code_meta").fetchone()[0], "swift,python")
+
+    def test_reopen_keeps_v2_rows(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "c.sqlite"
+            conn = memidx.open_code_db(db)
+            conn.execute("INSERT INTO code_meta VALUES ('p','/r',0,NULL)"); conn.commit(); conn.close()
+            conn = memidx.open_code_db(db)
+            self.assertEqual(conn.execute("SELECT count(*) FROM code_meta").fetchone()[0], 1)
+
+    def test_rebuild_of_a_v2_db_preserves_langs_from_code_project(self):
+        """Fix-wave item 8 follow-up: langs lives on `code_project` from
+        schema v2 on -- code_meta has NO langs column here at all. A
+        rebuild that (as CODE_TABLES now requires) drops code_project too
+        must still carry ITS langs forward, not just code_meta's (which
+        would read NULL and silently wipe the one non-derived fact this
+        whole preservation path exists for)."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"; root.mkdir(); (root / "x.py").write_text("def f():\n    pass\n")
+            db = Path(td) / "c.sqlite"
+            code_reindex(root, db, lang="python")   # a real v2 db, code_project.langs='python'
+            conn = sqlite3.connect(str(db))
+            conn.execute("UPDATE code_schema SET version=1")  # force the rebuild path
+            conn.commit(); conn.close()
+            conn = memidx.open_code_db(db)
+            self.assertEqual(memidx.code_schema_version(conn), memidx.CODE_SCHEMA_VERSION)
+            self.assertEqual(
+                conn.execute("SELECT langs FROM code_project WHERE project=?", (memidx.DEFAULT_PROJECT,)).fetchone()[0],
+                "python",
+            )
+
+
+class TestMultiRootReindex(unittest.TestCase):
+    def _mk(self, td):
+        a = Path(td) / "a"; b = Path(td) / "b"; a.mkdir(); b.mkdir()
+        (a / "main.py").write_text("def alpha():\n    return 1\n")
+        (b / "main.py").write_text("def beta():\n    return 2\n")
+        return a, b, Path(td) / "idx-code.sqlite"
+
+    def test_two_roots_with_same_relative_path_coexist(self):
+        with tempfile.TemporaryDirectory() as td:
+            a, b, db = self._mk(td)
+            self.assertEqual(code_reindex(a, db, lang="python"), 0)
+            self.assertEqual(code_reindex(b, db, lang=None), 0)      # langs reused from code_project
+            conn = memidx.open_code_db(db)
+            rows = conn.execute("SELECT code_root, qualified_name FROM chunks ORDER BY code_root").fetchall()
+            self.assertEqual([tuple(r) for r in rows], [(str(a.resolve()), "alpha"), (str(b.resolve()), "beta")])
+            self.assertEqual(conn.execute("SELECT count(*) FROM code_meta").fetchone()[0], 2)
+            self.assertEqual(conn.execute("SELECT langs FROM code_project").fetchone()[0], "python")
+
+    def test_reindexing_one_root_never_removes_the_other(self):
+        with tempfile.TemporaryDirectory() as td:
+            a, b, db = self._mk(td)
+            code_reindex(a, db, lang="python"); code_reindex(b, db, lang="python")
+            (a / "main.py").unlink()
+            code_reindex(a, db, lang="python")
+            conn = memidx.open_code_db(db)
+            self.assertEqual([r[0] for r in conn.execute("SELECT qualified_name FROM chunks")], ["beta"])
+
+    def test_missing_root_is_refused_and_nothing_is_deleted(self):
+        with tempfile.TemporaryDirectory() as td:
+            a, b, db = self._mk(td)
+            code_reindex(a, db, lang="python")
+            shutil.rmtree(a)
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                rc = code_reindex(a, db, lang="python")
+            self.assertEqual(rc, 2)
+            self.assertIn("not a readable directory", buf.getvalue())
+            self.assertIn("--drop-root", buf.getvalue())
+            conn = memidx.open_code_db(db)
+            self.assertEqual(conn.execute("SELECT count(*) FROM chunks").fetchone()[0], 1)
+
+    def test_invalid_root_is_refused_before_any_db_is_touched(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "never-created.sqlite"
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(code_reindex(Path(td) / "missing", db, lang="python"), 2)
+            self.assertFalse(db.exists(), "a refused root must not create the db")
+            regular = Path(td) / "file.txt"; regular.write_text("x")
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(code_reindex(regular, db, lang="python"), 2)
+            self.assertFalse(db.exists())
+            # an older-schema db must not be rebuilt by a refused run
+            v1 = Path(td) / "v1.sqlite"
+            conn = sqlite3.connect(str(v1)); conn.executescript(TestCodeSchemaV2.V1_DDL); conn.commit(); conn.close()
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(code_reindex(Path(td) / "missing", v1, lang="python"), 2)
+            conn = sqlite3.connect(str(v1))
+            self.assertEqual(conn.execute("SELECT count(*) FROM chunks").fetchone()[0], 1)
+            self.assertFalse(conn.execute("SELECT 1 FROM sqlite_master WHERE name='code_schema'").fetchone())
+            if os.geteuid() != 0:
+                unreadable = Path(td) / "noperm"; unreadable.mkdir(); unreadable.chmod(0)
+                try:
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        self.assertEqual(code_reindex(unreadable, db, lang="python"), 2)
+                finally:
+                    unreadable.chmod(0o755)
+                self.assertFalse(db.exists())
+
+    def test_drop_root_removes_only_that_root(self):
+        with tempfile.TemporaryDirectory() as td:
+            a, b, db = self._mk(td)
+            code_reindex(a, db, lang="python"); code_reindex(b, db, lang="python")
+            rc = memidx.cmd_code_reindex(ns(code_root=None, drop_root=str(a), db=str(db),
+                                           project=memidx.DEFAULT_PROJECT, no_embed=True, full=False, lang=None))
+            self.assertEqual(rc, 0)
+            conn = memidx.open_code_db(db)
+            self.assertEqual([r[0] for r in conn.execute("SELECT qualified_name FROM chunks")], ["beta"])
+            self.assertEqual(conn.execute("SELECT count(*) FROM code_meta").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT count(*) FROM file_sha").fetchone()[0], 1)
+
+    def test_lang_superset_is_additive_but_removal_needs_full(self):
+        with tempfile.TemporaryDirectory() as td:
+            a, b, db = self._mk(td)
+            code_reindex(a, db, lang="python")
+            self.assertEqual(code_reindex(b, db, lang="python,swift"), 0)        # superset: --add-lang's shape
+            conn = memidx.open_code_db(db)
+            self.assertEqual(conn.execute("SELECT langs FROM code_project").fetchone()[0], "python,swift"); conn.close()
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                self.assertEqual(code_reindex(b, db, lang="swift"), 1)              # drops python
+            self.assertIn("drops python", buf.getvalue())
+            self.assertEqual(code_reindex(b, db, lang="swift", full=True), 0)
+            conn = memidx.open_code_db(db)
+            self.assertEqual(conn.execute("SELECT langs FROM code_project").fetchone()[0], "swift")
+
+    def _coverage(self, db):
+        conn = memidx.open_code_db(db)
+        mode = conn.execute("SELECT embedding_mode FROM code_project").fetchone()[0]
+        chunks = conn.execute("SELECT count(*) FROM chunks").fetchone()[0]
+        embedded = conn.execute("SELECT count(*) FROM chunks c JOIN embeddings e ON e.chunk_id=c.id").fetchone()[0]
+        conn.close()
+        return mode, chunks, embedded
+
+    def test_embedding_mode_tracks_real_coverage(self):
+        with tempfile.TemporaryDirectory() as td:
+            a, b, db = self._mk(td)
+            code_reindex(a, db, lang="python", no_embed=True)
+            self.assertEqual(self._coverage(db)[0], "none")
+            code_reindex(a, db, lang="python", no_embed=False)
+            mode, chunks, embedded = self._coverage(db)
+            self.assertEqual((mode, chunks, embedded), ("full", 1, 1))
+            code_reindex(a, db, lang="python", no_embed=True)               # nothing changed -> stays full
+            self.assertEqual(self._coverage(db), ("full", 1, 1))
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code_reindex(b, db, lang="python", no_embed=True)           # adds chunks without vectors
+            mode, chunks, embedded = self._coverage(db)
+            self.assertEqual(mode, "none"); self.assertEqual(chunks, 2); self.assertEqual(embedded, 1)
+            self.assertIn("embedding mode set to none", buf.getvalue())
+            code_reindex(b, db, lang="python", no_embed=False)              # restores coverage
+            self.assertEqual(self._coverage(db), ("full", 2, 2))
+
+    def test_full_mode_means_every_chunk_has_a_vector(self):
+        """The invariant behind the mode: whenever code_project says full,
+        chunks and embeddings agree 1:1 (change a file with --no-embed on a
+        full project -> mode none; with embeddings -> still full)."""
+        with tempfile.TemporaryDirectory() as td:
+            a, b, db = self._mk(td)
+            code_reindex(a, db, lang="python", no_embed=False)
+            (a / "main.py").write_text("def alpha2():\n    return 1\n")
+            with contextlib.redirect_stdout(io.StringIO()):
+                code_reindex(a, db, lang="python", no_embed=True)
+            mode, chunks, embedded = self._coverage(db)
+            self.assertEqual(mode, "none"); self.assertEqual(embedded, 0)
+
+    def test_embedded_run_on_one_root_never_claims_full_while_another_lacks_vectors(self):
+        """Fix-wave item 1 (CRITICAL): an embedded run over root A must
+        derive `full` from PROJECT-wide coverage, not just "this run wasn't
+        --no-embed". Grok's sequence: A embedded (full) -> B --no-embed
+        (none, since B's new chunks have no vectors) -> A embedded AGAIN
+        with no edits at all (mutated == False for this run) must STILL
+        read none -- A's own chunk already has a vector, so the buggy
+        unconditional "not --no-embed -> full" line used to relapse to
+        full here even though B's chunk still has none."""
+        with tempfile.TemporaryDirectory() as td:
+            a, b, db = self._mk(td)
+            code_reindex(a, db, lang="python", no_embed=False)          # A: full (1 chunk, 1 vector)
+            self.assertEqual(self._coverage(db), ("full", 1, 1))
+
+            buf1 = io.StringIO()
+            with contextlib.redirect_stdout(buf1):
+                code_reindex(b, db, lang="python", no_embed=True)       # B: no-embed -> downgrades to none
+            self.assertEqual(self._coverage(db), ("none", 2, 1))
+            self.assertIn("embedding mode set to none", buf1.getvalue())
+
+            buf2 = io.StringIO()
+            with contextlib.redirect_stdout(buf2):
+                code_reindex(a, db, lang="python", no_embed=False)      # A again, embedded, NO edits
+            mode, chunks, embedded = self._coverage(db)
+            self.assertEqual((mode, chunks, embedded), ("none", 2, 1))  # still none: B's chunk is still bare
+            self.assertIn(
+                "chunk(s) in other roots have no embedding; embedding mode stays none",
+                buf2.getvalue(),
+            )
+
+            buf3 = io.StringIO()
+            with contextlib.redirect_stdout(buf3):
+                code_reindex(b, db, lang="python", no_embed=False)      # B embedded too -> now genuinely full
+            self.assertEqual(self._coverage(db), ("full", 2, 2))
+            self.assertNotIn("chunk(s) in other roots", buf3.getvalue())
+
+    def test_no_embed_root_then_embedded_root_then_no_embed_original_stays_full(self):
+        """The other order from finding 1: root A --no-embed, root B
+        embedded -> project-wide coverage is still incomplete (A's chunk
+        has no vector) so mode reads none + the cross-root line; embedding
+        A afterwards makes coverage complete -> full."""
+        with tempfile.TemporaryDirectory() as td:
+            a, b, db = self._mk(td)
+            code_reindex(a, db, lang="python", no_embed=True)
+            self.assertEqual(self._coverage(db)[0], "none")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code_reindex(b, db, lang="python", no_embed=False)      # B embedded, A still bare
+            self.assertEqual(self._coverage(db), ("none", 2, 1))
+            self.assertIn("chunk(s) in other roots have no embedding", buf.getvalue())
+            code_reindex(a, db, lang="python", no_embed=False)          # A embedded -> now full
+            self.assertEqual(self._coverage(db), ("full", 2, 2))
+
+    def test_search_output_is_root_qualified_with_two_roots(self):
+        with tempfile.TemporaryDirectory() as td:
+            a, b, db = self._mk(td)
+            code_reindex(a, db, lang="python"); code_reindex(b, db, lang="python")
+            script = ("import sys; sys.path.insert(0, %r); import memidx; "
+                      "memidx.main(['code-search', '--db', %r, 'beta', '--mode', 'fts', '--no-heal'])"
+                      ) % (str(TOOLS_DIR), str(db))
+            r = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=30)
+            self.assertIn(f"{b.resolve()}/main.py:1", r.stdout)
+
+    def test_json_hit_carries_code_root(self):
+        with tempfile.TemporaryDirectory() as td:
+            a, b, db = self._mk(td)
+            code_reindex(a, db, lang="python"); code_reindex(b, db, lang="python")
+            script = ("import sys; sys.path.insert(0, %r); import memidx; "
+                      "memidx.main(['code-search', '--db', %r, 'beta', '--mode', 'fts', '--no-heal', '--json'])"
+                      ) % (str(TOOLS_DIR), str(db))
+            r = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=30)
+            env = json.loads(r.stdout)
+            self.assertTrue(env["results"], env)
+            self.assertEqual(env["results"][0]["code_root"], str(b.resolve()))
 
 
 # ---------------------------------------------------------------------------
@@ -906,7 +1209,7 @@ class TestLangDefaultFix(unittest.TestCase):
 
             conn = memidx.open_code_db(db)
             langs_row = conn.execute(
-                "SELECT langs FROM code_meta WHERE project=?", ("reuseproj",)
+                "SELECT langs FROM code_project WHERE project=?", ("reuseproj",)
             ).fetchone()
             paths = {r["path"] for r in conn.execute("SELECT DISTINCT path FROM chunks")}
             conn.close()
@@ -1038,15 +1341,16 @@ class TestCodeCensus(unittest.TestCase):
             self.assertEqual(counts["python"], {"files": 0, "status": "supported"})
             self.assertEqual(counts["swift"], {"files": 0, "status": "supported"})
 
-    def test_language_table_skip_dirs_pruned_even_though_no_lang_is_wired(self):
-        """Controller-scope addition #2: census walks with the GLOBAL skip
-        set UNIONED with EVERY LANGUAGE_TABLE row's skip_dirs -- not just a
-        wired subset (there is none yet at census time, unlike
-        iter_code_source_files' walk). A project's untouched .venv/
-        (python's own skip_dir) and Tests/ (swift's own skip_dir) must
-        never be counted, even though census names no langs at all -- a
-        census that counted thousands of files under .venv/ would be pure
-        noise."""
+    def test_universal_skip_dirs_pruned_and_language_skip_dirs_scoped_to_own_language(self):
+        """Controller-scope addition #2, moved to the D7-as-reconciled
+        contract (Ruling 17): census walks with ONLY the universal noise
+        set pruned (CODE_SKIP_DIR_NAMES == chunkers.UNIVERSAL_SKIP_DIRS) --
+        not a union of every LANGUAGE_TABLE row's skip_dirs. `.venv/`
+        (universal noise) is never counted for any language. `Tests/`
+        (swift's own skip_dir, not python's) drops the swift file it holds
+        but NOT a python file in the very same directory -- the union rule
+        this superseded would have dropped both, silently losing real
+        python source to swift's noise rule."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "code"
             root.mkdir()
@@ -1056,10 +1360,16 @@ class TestCodeCensus(unittest.TestCase):
             tests_dir = root / "Tests"
             tests_dir.mkdir()
             shutil.copy(FIXTURES / "NestedTypes.swift", tests_dir / "NestedTypes.swift")
+            shutil.copy(PY_FIXTURES / "basic_functions.py", tests_dir / "also_python.py")
             shutil.copy(PY_FIXTURES / "basic_functions.py", root / "basic_functions.py")
 
             counts = memidx.code_census(root)
-            self.assertEqual(counts["python"], {"files": 1, "status": "supported"})
+            # basic_functions.py at root + also_python.py under Tests/ --
+            # python has no "Tests" skip_dir, so both count.
+            self.assertEqual(counts["python"], {"files": 2, "status": "supported"})
+            # NestedTypes.swift under Tests/ -- swift's own skip_dir drops
+            # it; vendored.py under .venv/ never reaches a language check
+            # at all (universal noise, pruned before the walk descends).
             self.assertEqual(counts["swift"], {"files": 0, "status": "supported"})
 
     def test_exit_code_is_always_zero_even_on_a_nonexistent_root(self):
@@ -1091,6 +1401,39 @@ class TestCodeCensus(unittest.TestCase):
             self.assertLess(out.index("supported:"), out.index("unsupported:"))
             self.assertIn("python: 2", out)
             self.assertIn(".cs: 1", out)
+
+
+class TestCensusSkipRule(unittest.TestCase):
+    """D7 as reconciled (Ruling 17, "your call"): the census prunes
+    chunkers.UNIVERSAL_SKIP_DIRS only -- the same universal noise set
+    iter_code_source_files prunes. A SUPPORTED file is then dropped iff an
+    ancestor directory on its root-relative path sits in ITS OWN
+    language's skip_dirs (chunkers.path_is_skipped_for_lang, the same
+    per-file test the indexer's walk already uses) -- a union rule would
+    have hidden a real `Tests/x.cs` file behind swift's "Tests" skip_dir
+    even though `.cs` has no language of its own to skip anything for. An
+    UNSUPPORTED extension is always counted, in any directory that is not
+    universal noise -- it has no language, so it has no skip_dirs to be
+    dropped by."""
+
+    def test_per_file_language_skip_and_unsupported_counted(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "Tests").mkdir()
+            (root / "node_modules").mkdir()
+            # python has no "Tests" skip_dir -> counted
+            (root / "Tests" / "t.py").write_text("def t():\n    pass\n")
+            # swift's own skip_dir names "Tests" -> not counted
+            (root / "Tests" / "T.swift").write_text("func t() {}\n")
+            # unsupported extension, no language to skip it -> always counted
+            (root / "Tests" / "x.cs").write_text("class X {}\n")
+            # node_modules is universal noise -> pruned regardless of language
+            (root / "node_modules" / "m.py").write_text("")
+
+            counts = memidx.code_census(root)
+            self.assertEqual(counts["python"], {"files": 1, "status": "supported"})
+            self.assertEqual(counts["swift"], {"files": 0, "status": "supported"})
+            self.assertEqual(counts[".cs"], {"files": 1, "status": "unsupported"})
 
 
 class TestUnsupportedExtensionCensus(unittest.TestCase):
@@ -1155,8 +1498,13 @@ class TestUnsupportedExtensionCensus(unittest.TestCase):
 class TestChunkerFailOpenPerFile(unittest.TestCase):
     """Task 5 spec S4: ANY exception escaping a chunker backend, or a
     ChunkResult with status "failed", must not crash the reindex -- warn
-    (naming the file), write NO file_sha row for it (so its sha never
-    matches on the next run and repair retriggers), and keep going."""
+    (naming the file) and keep going. Task 3 (Anatomy M2a) refines WHAT
+    gets written for the skipped file: a non-deterministic exception (a
+    RuntimeError, here) lands `not-indexed` (sha NULL, retried on the next
+    run or when the backend/chunker changes); a deterministic ChunkResult
+    status="failed" lands `failed` (sha stored, retried only on a source
+    edit or --full) -- either way the row stays so repair provenance is
+    visible, it is just never "ok"."""
 
     def test_raising_chunker_is_skipped_not_crashed(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1189,7 +1537,9 @@ class TestChunkerFailOpenPerFile(unittest.TestCase):
                 "SELECT COUNT(*) AS c FROM chunks WHERE path=?", ("NestedTypes.swift",)
             ).fetchone()["c"]
             conn.close()
-            self.assertIsNone(row)
+            self.assertIsNotNone(row)
+            self.assertEqual(row["status"], "not-indexed")
+            self.assertIsNone(row["sha256"])
             self.assertEqual(chunk_count, 0)
 
     def test_failed_status_result_is_skipped_not_crashed(self):
@@ -1210,7 +1560,9 @@ class TestChunkerFailOpenPerFile(unittest.TestCase):
                 "SELECT * FROM file_sha WHERE path=?", ("broken.py",)
             ).fetchone()
             conn.close()
-            self.assertIsNone(row)
+            self.assertIsNotNone(row)
+            self.assertEqual(row["status"], "failed")
+            self.assertIsNotNone(row["sha256"])
 
 
 class TestFailOpenDeletesStaleIndexState(unittest.TestCase):
@@ -1262,6 +1614,11 @@ class TestFailOpenDeletesStaleIndexState(unittest.TestCase):
         return root, db, rc, err_buf.getvalue()
 
     def test_content_change_then_failure_purges_chunks_and_file_sha(self):
+        """Task 3: a RuntimeError escaping the backend is not a
+        deterministic (source-code) failure -- it lands `not-indexed`, not
+        `failed`. The chunks/fts purge is unchanged; what changed is that
+        the file_sha row now STAYS (status="not-indexed", sha NULL) instead
+        of being deleted, so provenance survives the failure."""
         with tempfile.TemporaryDirectory() as td:
             _root, db, rc, err = self._index_then_break(td)
             self.assertEqual(rc, 0)
@@ -1277,10 +1634,16 @@ class TestFailOpenDeletesStaleIndexState(unittest.TestCase):
             fts_count = conn.execute("SELECT COUNT(*) AS c FROM fts").fetchone()["c"]
             conn.close()
             self.assertEqual(chunk_count, 0, "stale chunks from the last good run must be deleted")
-            self.assertIsNone(sha_row, "the file_sha row must go too, so repair retriggers")
+            self.assertIsNotNone(sha_row, "the file_sha row stays -- with a not-indexed status")
+            self.assertEqual(sha_row["status"], "not-indexed")
+            self.assertIsNone(sha_row["sha256"])
             self.assertEqual(fts_count, 0, "the fts shadow rows must go with the chunks")
 
     def test_version_bump_then_failure_leaves_the_index_not_current(self):
+        """Task 3: same not-indexed contract as above; the row's presence
+        no longer by itself makes `code_index_report` honest, so the state
+        check consults `status` too (a not-indexed/failed row can never
+        read "current", whatever its stored mtime/size/chunker_version)."""
         try:
             with tempfile.TemporaryDirectory() as td:
                 _root, db, rc, err = self._index_then_break(td, bump_version=True)
@@ -1294,10 +1657,11 @@ class TestFailOpenDeletesStaleIndexState(unittest.TestCase):
                 sha_row = conn.execute(
                     "SELECT * FROM file_sha WHERE path=?", ("NestedTypes.swift",)
                 ).fetchone()
-                state, _meta = memidx._code_index_state(conn, memidx.DEFAULT_PROJECT)
+                state = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)["state"]
                 conn.close()
                 self.assertEqual(chunk_count, 0)
-                self.assertIsNone(sha_row)
+                self.assertIsNotNone(sha_row, "the file_sha row stays -- with a not-indexed status")
+                self.assertEqual(sha_row["status"], "not-indexed")
                 self.assertNotEqual(
                     state, "current",
                     "a file the chunker could not process is missing from the index "
@@ -1362,13 +1726,246 @@ class TestFailOpenDeletesStaleIndexState(unittest.TestCase):
             self.assertNotIn("AAALocked.swift", paths)
 
 
+class TestFileStatusRows(unittest.TestCase):
+    """Task 3 (Anatomy M2a): deterministic chunker/contract failures land as
+    `failed` (sha + chunker_version stored, retried only on source change or
+    --full); everything else (a missing backend, a permission error, any
+    other exception) lands as `not-indexed` (sha NULL, chunker_version
+    stored, attempt_key = the backend availability fingerprint) and is
+    retried whenever the run is explicit, --full, or the fingerprint/
+    chunker_version no longer match the stamped row -- binding point 1."""
+
+    def _row(self, db, rel):
+        conn = memidx.open_code_db(db)
+        return conn.execute(
+            "SELECT status, reason, sha256, chunker_version FROM file_sha WHERE path=?", (rel,)
+        ).fetchone()
+
+    def test_syntax_error_is_failed_with_sha(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            (root / "bad.py").write_text("def (:\n")
+            (root / "ok.py").write_text("def fine():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"
+            code_reindex(root, db, lang="python")
+            row = self._row(db, "bad.py")
+            self.assertEqual(row["status"], "failed")
+            self.assertIsNotNone(row["sha256"])
+            self.assertIsNotNone(row["chunker_version"])
+            self.assertEqual(self._row(db, "ok.py")["status"], "ok")
+
+    def test_failed_is_skipped_incrementally_and_retried_on_full_or_source_change(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            (root / "bad.py").write_text("def (:\n")
+            db = Path(td) / "idx-code.sqlite"
+            code_reindex(root, db, lang="python")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code_reindex(root, db, lang="python")
+            self.assertIn("1 unchanged", out.getvalue())
+            self.assertIn("0 failed", out.getvalue())
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code_reindex(root, db, lang="python", full=True)
+            self.assertIn("1 failed", out.getvalue())
+            (root / "bad.py").write_text("def fixed():\n    pass\n")
+            code_reindex(root, db, lang="python")
+            self.assertEqual(self._row(db, "bad.py")["status"], "ok")
+
+    def test_backend_unavailable_is_not_indexed_without_sha_and_retried(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            (root / "x.py").write_text("def f():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"
+            real = chunkers.get_chunker
+
+            def broken(lang):
+                raise chunkers.BackendUnavailable("tree-sitter wheel missing")
+
+            chunkers.get_chunker = broken
+            try:
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    code_reindex(root, db, lang="python")
+            finally:
+                chunkers.get_chunker = real
+            row = self._row(db, "x.py")
+            self.assertEqual(row["status"], "not-indexed")
+            self.assertIn("wheel missing", row["reason"])
+            self.assertIsNone(row["sha256"])
+            self.assertIn("1 not indexed", out.getvalue())
+            code_reindex(root, db, lang="python")  # explicit run always retries
+            self.assertEqual(self._row(db, "x.py")["status"], "ok")
+
+    def test_unreadable_file_is_not_indexed_not_failed(self):
+        if os.geteuid() == 0:
+            self.skipTest("root ignores file modes")
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            p = root / "x.py"
+            p.write_text("def f():\n    pass\n")
+            p.chmod(0)
+            db = Path(td) / "idx-code.sqlite"
+            try:
+                code_reindex(root, db, lang="python")
+            finally:
+                p.chmod(0o644)
+            self.assertEqual(self._row(db, "x.py")["status"], "not-indexed")
+
+    @unittest.skipIf(os.name != "posix" or os.geteuid() == 0,
+                     "mode-000 is only unreadable for a non-root posix user")
+    def test_retry_gate_runs_before_read_bytes_for_unreadable_file(self):
+        """Carried-in fix (Task 3 review, Ruling 57): the retry-gate lookup
+        (lang/cv/prev, then the not-indexed leave-it-alone decision) must
+        run BEFORE f.read_bytes() -- otherwise an unreadable (or vanished)
+        file never reaches the skip and is re-attempted, and re-counted as
+        not indexed, on every run. A second, heal-style run
+        (retry_not_indexed=False) over an unchanged-availability not-
+        indexed row must report 0 not indexed / 1 unchanged, not another
+        attempt."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            p = root / "locked.py"
+            p.write_text("def f():\n    pass\n")
+            p.chmod(0)
+            db = Path(td) / "idx-code.sqlite"
+            try:
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    code_reindex(root, db, lang="python")
+                self.assertIn("1 not indexed", out.getvalue())
+                self.assertEqual(self._row(db, "locked.py")["status"], "not-indexed")
+
+                out2 = io.StringIO()
+                with contextlib.redirect_stdout(out2):
+                    memidx.cmd_code_reindex(ns(
+                        code_root=str(root), drop_root=None, db=str(db), project=memidx.DEFAULT_PROJECT,
+                        no_embed=True, full=False, lang="python", retry_not_indexed=False,
+                    ))
+                self.assertRegex(out2.getvalue(), r"\b0 not indexed\b")  # not "10 not indexed" etc.
+                self.assertIn("1 unchanged", out2.getvalue())
+                self.assertEqual(self._row(db, "locked.py")["status"], "not-indexed")
+            finally:
+                p.chmod(0o644)
+
+    def test_partial_status_is_recorded(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            shutil.copy(FIXTURES / "GapDesync.swift", root / "GapDesync.swift")
+            db = Path(td) / "idx-code.sqlite"
+            code_reindex(root, db)
+            self.assertEqual(self._row(db, "GapDesync.swift")["status"], "partial")
+
+    def _broken_backend(self):
+        """Context manager: get_chunker raises BackendUnavailable and the
+        availability fingerprint reports python=missing (both patched, so
+        the attempt_key stamped on the row matches what a later un-patched
+        run compares against)."""
+        return mock.patch.multiple(
+            chunkers,
+            get_chunker=lambda lang: (_ for _ in ()).throw(chunkers.BackendUnavailable("missing")),
+            backend_availability=lambda: "python=missing;swift=ok",
+        )
+
+    def test_not_indexed_row_carries_attempt_key_and_chunker_version(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            (root / "x.py").write_text("def f():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"
+            with self._broken_backend():
+                code_reindex(root, db, lang="python")
+            conn = memidx.open_code_db(db)
+            row = conn.execute("SELECT attempt_key, chunker_version, sha256 FROM file_sha").fetchone()
+            self.assertEqual(row["attempt_key"], "python=missing;swift=ok")
+            self.assertEqual(row["chunker_version"], chunkers.chunker_version("python"))
+            self.assertIsNone(row["sha256"])
+
+    def test_not_indexed_retry_rules(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            (root / "x.py").write_text("def f():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"
+            with self._broken_backend():
+                code_reindex(root, db, lang="python")
+                # same fingerprint, heal-style run (no explicit retry): still not-indexed, no attempt made
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                    memidx.cmd_code_reindex(ns(
+                        code_root=str(root), drop_root=None, db=str(db), project=memidx.DEFAULT_PROJECT,
+                        no_embed=True, full=False, lang="python", retry_not_indexed=False,
+                    ))
+                self.assertRegex(out.getvalue(), r"\b0 not indexed\b")  # not "10 not indexed" etc.
+            # backend back (fingerprint differs) -> a heal-style run retries and succeeds
+            with contextlib.redirect_stdout(io.StringIO()):
+                memidx.cmd_code_reindex(ns(
+                    code_root=str(root), drop_root=None, db=str(db), project=memidx.DEFAULT_PROJECT,
+                    no_embed=True, full=False, lang="python", retry_not_indexed=False,
+                ))
+            conn = memidx.open_code_db(db)
+            self.assertEqual(conn.execute("SELECT status FROM file_sha").fetchone()[0], "ok")
+
+    def test_chunker_version_bump_retries_not_indexed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            (root / "x.py").write_text("def f():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"
+            with self._broken_backend():
+                code_reindex(root, db, lang="python")
+            old = chunkers.LANGUAGE_TABLE["python"]["impl_version"]
+            chunkers.LANGUAGE_TABLE["python"]["impl_version"] = old + "-bump"
+            try:
+                with mock.patch.object(chunkers, "backend_availability", lambda: "python=missing;swift=ok"):
+                    # same availability, different chunker version, heal-style run -> retried (and succeeds: real get_chunker)
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        memidx.cmd_code_reindex(ns(
+                            code_root=str(root), drop_root=None, db=str(db), project=memidx.DEFAULT_PROJECT,
+                            no_embed=True, full=False, lang="python", retry_not_indexed=False,
+                        ))
+                conn = memidx.open_code_db(db)
+                self.assertEqual(conn.execute("SELECT status FROM file_sha").fetchone()[0], "ok")
+            finally:
+                chunkers.LANGUAGE_TABLE["python"]["impl_version"] = old
+
+    def test_repairing_root_a_does_not_strand_root_b(self):
+        with tempfile.TemporaryDirectory() as td:
+            a = Path(td) / "a"
+            b = Path(td) / "b"
+            a.mkdir()
+            b.mkdir()
+            (a / "x.py").write_text("def fa():\n    pass\n")
+            (b / "y.py").write_text("def fb():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"
+            with self._broken_backend():
+                code_reindex(a, db, lang="python")
+                code_reindex(b, db, lang="python")
+            code_reindex(a, db, lang="python")  # explicit repair of A only
+            conn = memidx.open_code_db(db)
+            rep = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)  # Task 4 -- B's stale attempt_key still differs
+            self.assertTrue(rep["availability_changed"])
+            self.assertEqual(rep["not_indexed"], 1)
+
+
 class TestRegistryContractEnforcement(unittest.TestCase):
     """C3 (final fix wave, Codex): the reindex loop is the boundary between
     a chunker backend and the database. It validates what a backend hands
     back -- required keys, a `kind` from the frozen KINDS vocabulary,
     integer line numbers, a real ChunkResult -- and a violation is that
     file's failure (B1's path: warn, purge, continue), never a row in the
-    chunks table."""
+    chunks table. Task 3 (Anatomy M2a): a validate_chunk_result violation
+    is a bare ValueError, a deterministic failure -- the file_sha row
+    stays with status="failed" and its sha256/chunker_version stored, so
+    it is skipped incrementally and retried only on a source edit or
+    --full, never every run."""
 
     def _reindex_with_backend(self, td, fake_chunk_file):
         root = Path(td) / "code"
@@ -1386,6 +1983,9 @@ class TestRegistryContractEnforcement(unittest.TestCase):
         return db, rc, err_buf.getvalue()
 
     def _assert_nothing_stored(self, db, rc, err):
+        """Name kept from before Task 3 -- no CHUNK ever reaches the table
+        for a rejected result. The file_sha row itself now stays (status
+        "failed", sha256/chunker_version stored) instead of being absent."""
         self.assertEqual(rc, 0)
         self.assertIn("NestedTypes.swift", err)
         conn = memidx.open_code_db(db)
@@ -1397,7 +1997,9 @@ class TestRegistryContractEnforcement(unittest.TestCase):
         ).fetchone()
         conn.close()
         self.assertEqual(chunk_count, 0)
-        self.assertIsNone(sha_row)
+        self.assertIsNotNone(sha_row)
+        self.assertEqual(sha_row["status"], "failed")
+        self.assertIsNotNone(sha_row["sha256"])
 
     def test_kind_outside_the_frozen_vocabulary_is_rejected(self):
         def bad_kind(text, rel):
@@ -1484,11 +2086,11 @@ class TestRegistryContractEnforcement(unittest.TestCase):
 
 
 class TestStaleCheckConsultsChunkerVersion(unittest.TestCase):
-    """B2 (final fix wave): _code_index_is_stale compared only mtime/size,
-    so bumping a chunker's impl_version left every stored row reading
-    "current" until something on disk happened to change. It must compare
-    each stored stamp against the chunker version that lang would produce
-    today."""
+    """B2 (final fix wave): the old _code_index_is_stale compared only
+    mtime/size, so bumping a chunker's impl_version left every stored row
+    reading "current" until something on disk happened to change.
+    code_index_report must compare each stored stamp against the chunker
+    version that lang would produce today."""
 
     def test_impl_version_bump_makes_the_index_stale(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1501,7 +2103,7 @@ class TestStaleCheckConsultsChunkerVersion(unittest.TestCase):
 
             conn = memidx.open_code_db(db)
             try:
-                state_before, _ = memidx._code_index_state(conn, memidx.DEFAULT_PROJECT)
+                state_before = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)["state"]
                 self.assertEqual(state_before, "current")
 
                 prev = chunkers.LANGUAGE_TABLE["swift"]
@@ -1509,7 +2111,7 @@ class TestStaleCheckConsultsChunkerVersion(unittest.TestCase):
                 bumped["impl_version"] = str(int(prev["impl_version"]) + 100)
                 chunkers.LANGUAGE_TABLE["swift"] = bumped
                 try:
-                    state_after, _ = memidx._code_index_state(conn, memidx.DEFAULT_PROJECT)
+                    state_after = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)["state"]
                 finally:
                     chunkers.LANGUAGE_TABLE["swift"] = prev
             finally:
@@ -1584,9 +2186,10 @@ class TestPreRewireStampSkewForcesRechunk(unittest.TestCase):
             sha = hashlib.sha256(data).hexdigest()
             stat = target.stat()
             conn.execute(
-                "INSERT INTO file_sha (path, project, sha256, mtime, size, gap_count, chunker_version) "
-                "VALUES (?,?,?,?,?,?,?)",
-                ("basic_functions.py", memidx.DEFAULT_PROJECT, sha, stat.st_mtime, stat.st_size, 0, cv_before),
+                "INSERT INTO file_sha (path, project, code_root, sha256, mtime, size, gap_count, chunker_version) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                ("basic_functions.py", memidx.DEFAULT_PROJECT, str(root.resolve()), sha, stat.st_mtime,
+                 stat.st_size, 0, cv_before),
             )
             conn.commit()
             conn.close()
@@ -1719,6 +2322,27 @@ class TestFTSSplitFindsCamelCase(unittest.TestCase):
             self.assertIn("writePNGSnapshot", top["qualified_name"])
 
 
+class TestExactSymbolRanksFirst(unittest.TestCase):
+    def test_body_mentions_do_not_outrank_the_exact_name(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"; root.mkdir()
+            (root / "a.py").write_text(
+                "def load_settings():\n    return 1\n\n"
+                "def caller():\n    '''load_settings load_settings load_settings'''\n"
+                "    load_settings(); load_settings(); return load_settings()\n")
+            db = Path(td) / "idx-code.sqlite"; code_reindex(root, db, lang="python")
+            conn = memidx.open_code_db(db)
+            ids = memidx.code_hits_fts(conn, "load_settings", memidx.DEFAULT_PROJECT)
+            self.assertEqual(conn.execute("SELECT qualified_name FROM chunks WHERE id=?", (ids[0],)).fetchone()[0], "load_settings")
+
+    def test_partial_word_still_matches(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"; root.mkdir(); (root / "a.py").write_text("def load_settings():\n    return 1\n")
+            db = Path(td) / "idx-code.sqlite"; code_reindex(root, db, lang="python")
+            conn = memidx.open_code_db(db)
+            self.assertTrue(memidx.code_hits_fts(conn, "settings", memidx.DEFAULT_PROJECT))
+
+
 class TestVectorAndHybridJSONIsSerializable(unittest.TestCase):
     """Regression test: cosine() used to return a numpy.float32 score
     (fastembed's query_embed yields numpy arrays), which json.dumps cannot
@@ -1809,6 +2433,62 @@ class TestVectorAndHybridJSONIsSerializable(unittest.TestCase):
                 self.assertIsInstance(score, float)
 
 
+def _build_decision_db_with_concepts(parent, concepts, db=None, project=memidx.DEFAULT_PROJECT):
+    """The one concept-record fixture every concept-attachment test builds
+    on (factored out of what used to be an inline frontmatter block
+    duplicated per test): writes one concept.md per entry in `concepts`
+    (each a dict with keys concept_id, implemented_by (list of ref
+    strings), and optional title/owner_boundary; tested_by/governed_by/
+    involved_in are always empty) into ONE scratch markdown root under
+    `parent`, indexes them with a SINGLE cmd_reindex call, and returns
+    that root.
+
+    ONE call, not one call per concept: cmd_reindex deletes any existing
+    record path this run's own walk did not `seen` (removed_paths =
+    existing - seen) -- writing concept N into a fresh md_root and
+    reindexing again would walk only that new root, see none of the
+    earlier concepts' paths, and delete them from the shared db on the
+    spot. A caller that wants two concepts in one db (e.g.
+    test_two_concepts_on_one_file_different_symbols_each_get_their_own_chunk)
+    must pass both specs here together.
+
+    `parent` is always the caller's own tempfile.TemporaryDirectory path
+    (never a fresh mkdtemp of this function's own) so the md_root this
+    creates is cleaned up with everything else the test already owns.
+
+    `db` explicit routes cmd_reindex straight to that sqlite file
+    (TestConceptAttachIsRootChecked, which passes its own decision db path
+    and reads it back via code-search's --decision-db); left None, it falls
+    through to cmd_reindex's own MEMCONTINUUM_HOME-derived default -- every
+    pre-existing caller here, which pins MEMCONTINUUM_HOME (mc_home /
+    inline os.environ) to the SAME default code-search itself reads."""
+    md_root = Path(parent) / "md"
+    md_root.mkdir(parents=True, exist_ok=True)
+    for i, c in enumerate(concepts):
+        concept_id = c["concept_id"]
+        lines = "\n".join(f"  - {p}" for p in c["implemented_by"])
+        (md_root / f"concept_{i}.md").write_text(
+            "---\n"
+            "type: concept\n"
+            f"id: {concept_id}\n"
+            f"title: {c.get('title') or concept_id}\n"
+            f"owner_boundary: {c.get('owner_boundary', 'fixture')}\n"
+            "implemented_by:\n"
+            f"{lines}\n"
+            "tested_by: []\n"
+            "governed_by: []\n"
+            "involved_in: []\n"
+            "---\n\n"
+            "Fixture. NOT this concept: nothing else.\n"
+        )
+    args = ns(root=str(md_root), no_embed=True, full=False, project=project)
+    if db is not None:
+        args.db = str(db)
+    rc = memidx.cmd_reindex(args)
+    assert rc == 0
+    return md_root
+
+
 class TestConceptAttachment(unittest.TestCase):
     def test_hit_gets_concept_id_when_decision_db_has_a_matching_implemented_by(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1816,23 +2496,11 @@ class TestConceptAttachment(unittest.TestCase):
             home.mkdir()
             os.environ["MEMCONTINUUM_HOME"] = str(home)
             try:
-                md_root = Path(td) / "md"
-                md_root.mkdir()
-                (md_root / "concept.md").write_text(
-                    "---\n"
-                    "type: concept\n"
-                    "id: CON-ATTACH\n"
-                    "title: Attach Test\n"
-                    "owner_boundary: fixture\n"
-                    "implemented_by:\n"
-                    "  - NestedTypes.swift#outerFunc\n"
-                    "tested_by: []\n"
-                    "governed_by: []\n"
-                    "involved_in: []\n"
-                    "---\n\n"
-                    "Fixture. NOT this concept: nothing else.\n"
-                )
-                memidx.cmd_reindex(ns(root=str(md_root), no_embed=True, full=False))
+                _build_decision_db_with_concepts(td, [{
+                    "concept_id": "CON-ATTACH",
+                    "implemented_by": ["NestedTypes.swift#outerFunc"],
+                    "title": "Attach Test",
+                }])
 
                 code_root = Path(td) / "code"
                 code_root.mkdir()
@@ -1865,23 +2533,11 @@ class TestConceptAttachment(unittest.TestCase):
             home.mkdir()
             os.environ["MEMCONTINUUM_HOME"] = str(home)
             try:
-                md_root = Path(td) / "md"
-                md_root.mkdir()
-                (md_root / "concept.md").write_text(
-                    "---\n"
-                    "type: concept\n"
-                    "id: CON-EXPLICITDB\n"
-                    "title: Explicit DB Test\n"
-                    "owner_boundary: fixture\n"
-                    "implemented_by:\n"
-                    "  - NestedTypes.swift#outerFunc\n"
-                    "tested_by: []\n"
-                    "governed_by: []\n"
-                    "involved_in: []\n"
-                    "---\n\n"
-                    "Fixture. NOT this concept: nothing else.\n"
-                )
-                memidx.cmd_reindex(ns(root=str(md_root), no_embed=True, full=False))
+                _build_decision_db_with_concepts(td, [{
+                    "concept_id": "CON-EXPLICITDB",
+                    "implemented_by": ["NestedTypes.swift#outerFunc"],
+                    "title": "Explicit DB Test",
+                }])
 
                 code_root = Path(td) / "code"
                 code_root.mkdir()
@@ -1934,37 +2590,12 @@ class TestConceptAttachment(unittest.TestCase):
             home.mkdir()
             os.environ["MEMCONTINUUM_HOME"] = str(home)
             try:
-                md_root = Path(td) / "md"
-                md_root.mkdir()
-                (md_root / "concept_outer.md").write_text(
-                    "---\n"
-                    "type: concept\n"
-                    "id: CON-OUTER\n"
-                    "title: Outer func concept\n"
-                    "owner_boundary: fixture\n"
-                    "implemented_by:\n"
-                    "  - NestedTypes.swift#outerFunc\n"
-                    "tested_by: []\n"
-                    "governed_by: []\n"
-                    "involved_in: []\n"
-                    "---\n\n"
-                    "Fixture. NOT this concept: nothing else.\n"
-                )
-                (md_root / "concept_ext.md").write_text(
-                    "---\n"
-                    "type: concept\n"
-                    "id: CON-EXT\n"
-                    "title: Ext func concept\n"
-                    "owner_boundary: fixture\n"
-                    "implemented_by:\n"
-                    "  - NestedTypes.swift#extFunc\n"
-                    "tested_by: []\n"
-                    "governed_by: []\n"
-                    "involved_in: []\n"
-                    "---\n\n"
-                    "Fixture. NOT this concept: nothing else.\n"
-                )
-                memidx.cmd_reindex(ns(root=str(md_root), no_embed=True, full=False))
+                _build_decision_db_with_concepts(td, [
+                    {"concept_id": "CON-OUTER", "implemented_by": ["NestedTypes.swift#outerFunc"],
+                     "title": "Outer func concept"},
+                    {"concept_id": "CON-EXT", "implemented_by": ["NestedTypes.swift#extFunc"],
+                     "title": "Ext func concept"},
+                ])
 
                 code_root = Path(td) / "code"
                 code_root.mkdir()
@@ -1993,8 +2624,282 @@ class TestConceptAttachment(unittest.TestCase):
                 del os.environ["MEMCONTINUUM_HOME"]
 
 
+class TestConceptAttachIsRootChecked(unittest.TestCase):
+    def test_concept_attaches_only_where_the_file_exists_under_the_hit_root(self):
+        """The real adversary: the SAME relative path indexed under two roots,
+        one concept whose implemented_by is that path, then B's file deleted
+        while B's stale hit stays in the index (heal off). A attaches; B does
+        not -- without the guard both would, because the matcher keys on the
+        relative path alone."""
+        with tempfile.TemporaryDirectory() as td:
+            a = Path(td) / "a"; b = Path(td) / "b"; a.mkdir(); b.mkdir()
+            (a / "main.py").write_text("def shared_name():\n    return 1\n")
+            (b / "main.py").write_text("def shared_name():\n    return 2\n")
+            db = Path(td) / "idx-code.sqlite"
+            code_reindex(a, db, lang="python"); code_reindex(b, db, lang="python")
+            md_db = Path(td) / "decisions.sqlite"
+            _build_decision_db_with_concepts(
+                td, [{"concept_id": "CON-1", "implemented_by": ["main.py#shared_name"]}], db=md_db
+            )
+            (b / "main.py").unlink()
+            script = ("import sys; sys.path.insert(0, %r); import memidx; "
+                      "memidx.main(['code-search', '--db', %r, 'shared_name', '--mode', 'fts', '--json', '--no-heal', '--decision-db', %r])"
+                      ) % (str(TOOLS_DIR), str(db), str(md_db))
+            env = json.loads(subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=30).stdout)
+            by_root = {h["code_root"]: h for h in env["results"]}
+            self.assertIn("concept_id", by_root[str(a.resolve())])
+            self.assertNotIn("concept_id", by_root[str(b.resolve())])
+
+
+class TestCodeIndexReport(unittest.TestCase):
+    def _search(self, db, q="fine", *extra):
+        script = ("import sys; sys.path.insert(0, %r); import memidx; "
+                  "memidx.main(['code-search', '--db', %r, %r, '--mode', 'fts', '--no-heal'] + %r)"
+                  ) % (str(TOOLS_DIR), str(db), q, list(extra))
+        return subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=30)
+
+    def test_failed_file_keeps_index_current_with_a_counted_line(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"; root.mkdir()
+            (root / "bad.py").write_text("def (:\n"); (root / "ok.py").write_text("def fine():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"; code_reindex(root, db, lang="python")
+            r = self._search(db)
+            self.assertNotIn("stale", r.stderr.lower(), r.stderr)
+            self.assertIn("1 file(s) failed to index", r.stderr)
+
+    def test_touch_is_not_a_change_but_an_edit_is(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"; root.mkdir(); p = root / "a.py"; p.write_text("def fine():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"; code_reindex(root, db, lang="python")
+            os.utime(p, (time.time() + 3600, time.time() + 3600))
+            conn = memidx.open_code_db(db)
+            self.assertEqual(memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)["state"], "current"); conn.close()
+            p.write_text("def other():\n    pass\n"); os.utime(p, (time.time() + 7200, time.time() + 7200))
+            conn = memidx.open_code_db(db)
+            rep = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)
+            self.assertEqual((rep["state"], rep["changed"]), ("stale", 1))
+
+    def test_not_indexed_makes_state_degraded_not_current(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"; root.mkdir(); (root / "x.py").write_text("def f():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"
+            real = chunkers.get_chunker
+            chunkers.get_chunker = lambda lang: (_ for _ in ()).throw(chunkers.BackendUnavailable("missing"))
+            try:
+                code_reindex(root, db, lang="python")
+                conn = memidx.open_code_db(db)
+                rep = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)
+            finally:
+                chunkers.get_chunker = real
+            self.assertEqual(rep["state"], "degraded"); self.assertEqual(rep["not_indexed"], 1)
+            r = self._search(db, "f")
+            self.assertIn("incomplete (1 file(s) not indexed)", r.stderr)
+
+    def test_chunker_version_drift_stales_failed_rows_too(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"; root.mkdir(); (root / "bad.py").write_text("def (:\n")
+            db = Path(td) / "idx-code.sqlite"; code_reindex(root, db, lang="python")
+            old = chunkers.LANGUAGE_TABLE["python"]["impl_version"]
+            chunkers.LANGUAGE_TABLE["python"]["impl_version"] = old + "-bump"
+            try:
+                conn = memidx.open_code_db(db)
+                self.assertEqual(memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)["state"], "stale")
+            finally:
+                chunkers.LANGUAGE_TABLE["python"]["impl_version"] = old
+
+    def test_report_is_per_root_and_missing_root_is_named(self):
+        with tempfile.TemporaryDirectory() as td:
+            a = Path(td) / "a"; b = Path(td) / "b"; a.mkdir(); b.mkdir()
+            (a / "x.py").write_text("def fx():\n    pass\n"); (b / "y.py").write_text("def fy():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"; code_reindex(a, db, lang="python"); code_reindex(b, db, lang="python")
+            (b / "y.py").write_text("def fy2():\n    pass\n"); os.utime(b / "y.py", (time.time() + 3600,) * 2)
+            conn = memidx.open_code_db(db)
+            rep = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)
+            self.assertEqual([(r["code_root"], r["changed"]) for r in rep["roots"]], [(str(a.resolve()), 0), (str(b.resolve()), 1)])
+            conn.close(); code_reindex(b, db, lang="python"); shutil.rmtree(b)
+            conn = memidx.open_code_db(db)
+            self.assertEqual(memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)["state"], "degraded"); conn.close()
+            r = self._search(db, "fx")
+            self.assertIn(f"recorded code root {b.resolve()} does not exist", r.stderr); self.assertIn("--drop-root", r.stderr)
+
+    def test_touching_a_not_indexed_file_is_not_a_change(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"; root.mkdir(); p = root / "x.py"; p.write_text("def f():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"
+            with mock.patch.multiple(chunkers, get_chunker=lambda lang: (_ for _ in ()).throw(chunkers.BackendUnavailable("m")),
+                                     backend_availability=lambda: "python=missing;swift=ok"):
+                code_reindex(root, db, lang="python")
+                os.utime(p, (time.time() + 3600,) * 2)
+                conn = memidx.open_code_db(db)
+                rep = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)
+            self.assertEqual((rep["state"], rep["changed"], rep["not_indexed"]), ("degraded", 0, 1))
+
+    def test_json_envelope(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"; root.mkdir()
+            (root / "bad.py").write_text("def (:\n"); (root / "ok.py").write_text("def fine():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"; code_reindex(root, db, lang="python")
+            env = json.loads(self._search(db, "fine", "--json").stdout)
+            self.assertEqual(env["state"], "current"); self.assertEqual(env["failed"], 1); self.assertEqual(env["not_indexed"], 0)
+            self.assertEqual(env["code_roots"][0]["code_root"], str(root.resolve())); self.assertEqual(env["embedding_mode"], "none")
+
+
+class TestHealOnSearch(unittest.TestCase):
+    """Anatomy M2a Task 5: `code-search` preflights the index (Task 4's
+    code_index_report) and, when it is eligible (stale or degraded, within
+    --heal-limit), reindexes each recorded root ONCE in-process before
+    answering -- one attempt, never a retry loop -- so a routine edit never
+    leaves a search silently answering from stale content. --no-heal and
+    --heal-limit (already-parsed no-ops since Task 4) get their meaning
+    here."""
+
+    def _run(self, db, q, *extra):
+        script = ("import sys; sys.path.insert(0, %r); import memidx; "
+                  "memidx.main(['code-search', '--db', %r, %r, '--mode', 'fts'] + %r)") % (str(TOOLS_DIR), str(db), q, list(extra))
+        return subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=60)
+
+    def _stale_tree(self, td):
+        root = Path(td) / "code"; root.mkdir(); p = root / "x.py"
+        p.write_text("def old_name():\n    pass\n")
+        db = Path(td) / "idx-code.sqlite"; code_reindex(root, db, lang="python")
+        p.write_text("def new_name():\n    pass\n"); os.utime(p, (time.time() + 3600,) * 2)
+        return root, db
+
+    def test_stale_index_heals_once_and_finds_the_new_symbol(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._stale_tree(td)
+            r = self._run(db, "new_name")
+            self.assertIn("new_name", r.stdout); self.assertIn("index healed (1 file(s) re-indexed)", r.stderr)
+            self.assertNotIn("stale", r.stderr.lower())
+            r2 = self._run(db, "new_name")
+            self.assertNotIn("healed", r2.stderr)
+
+    def test_stale_index_heals_with_json_and_envelope_reflects_post_heal_report(self):
+        """Carried in from Task 5's review: --json's envelope (state,
+        results, changed) must come from the POST-heal report, not the one
+        computed before heal_code_index ran."""
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._stale_tree(td)
+            r = self._run(db, "new_name", "--json")
+            env = json.loads(r.stdout)
+            self.assertEqual(env["state"], "current")
+            self.assertEqual(env["changed"], 0)
+            self.assertTrue(
+                any(h["qualified_name"] == "new_name" for h in env["results"]), env["results"]
+            )
+
+    def test_no_heal_keeps_the_stale_warning(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._stale_tree(td)
+            r = self._run(db, "new_name", "--no-heal")
+            self.assertNotIn("new_name", r.stdout); self.assertIn("stale", r.stderr.lower())
+
+    def test_heal_limit_refuses_large_drift(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._stale_tree(td); (root / "y.py").write_text("def y():\n    pass\n")
+            r = self._run(db, "new_name", "--heal-limit", "1")
+            self.assertIn("above --heal-limit 1", r.stderr); self.assertIn("stale", r.stderr.lower())
+
+    def test_missing_root_is_never_healed_or_deleted(self):
+        with tempfile.TemporaryDirectory() as td:
+            a = Path(td) / "a"; b = Path(td) / "b"; a.mkdir(); b.mkdir()
+            (a / "x.py").write_text("def fx():\n    pass\n"); (b / "y.py").write_text("def fy():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"; code_reindex(a, db, lang="python"); code_reindex(b, db, lang="python")
+            shutil.rmtree(b)
+            (a / "x.py").write_text("def fx2():\n    pass\n"); os.utime(a / "x.py", (time.time() + 3600,) * 2)
+            r = self._run(db, "fx2")
+            self.assertIn("fx2", r.stdout)                       # a healed
+            self.assertIn("does not exist", r.stderr)            # b named, not touched
+            conn = memidx.open_code_db(db)
+            self.assertEqual(conn.execute("SELECT count(*) FROM chunks WHERE code_root=?", (str(b.resolve()),)).fetchone()[0], 1)
+            self.assertEqual(memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)["state"], "degraded")   # never current while b is missing
+
+    def test_heal_follows_embedding_mode(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._stale_tree(td)                       # mode none
+            self._run(db, "new_name")
+            conn = memidx.open_code_db(db)
+            self.assertEqual(conn.execute("SELECT count(*) FROM embeddings").fetchone()[0], 0)
+
+    def test_failed_file_does_not_trigger_heal(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"; root.mkdir()
+            (root / "bad.py").write_text("def (:\n"); (root / "ok.py").write_text("def fine():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"; code_reindex(root, db, lang="python")
+            r = self._run(db, "fine")
+            self.assertNotIn("healed", r.stderr); self.assertNotIn("stale", r.stderr.lower())
+
+    def test_not_indexed_is_retried_only_when_availability_changes(self):
+        """Task 5 conflict resolved (see task-5-report.md): the brief's
+        fixture made BOTH files not-indexed (get_chunker mocked to throw for
+        every lang), so there was nothing genuinely indexed left for step
+        (a)'s edit to change -- the sha-based `changed` count binding point
+        4 relies on never fires for a not-indexed (sha-NULL) row, so the
+        edit could never be observed and "g2" could never be found. Fixed
+        by indexing other.py for REAL first (no mock active), THEN adding
+        x.py under the mocked-unavailable backend -- only x.py is
+        not-indexed; other.py's later edit is a genuine sha-confirmed
+        change the preflight (and the heal) can see."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"; root.mkdir()
+            (root / "other.py").write_text("def g():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"
+            code_reindex(root, db, lang="python")                # other.py indexed ok (real backend)
+            (root / "x.py").write_text("def f():\n    pass\n")
+            with mock.patch.multiple(chunkers, get_chunker=lambda lang: (_ for _ in ()).throw(chunkers.BackendUnavailable("m")),
+                                     backend_availability=lambda: "python=missing;swift=ok"):
+                code_reindex(root, db, lang="python")            # x.py not-indexed, attempt_key python=missing; other.py untouched (sha match, chunker never called)
+            # (a) same fingerprint + an unrelated edit: heal re-indexes the edit only, x.py stays not-indexed
+            (root / "other.py").write_text("def g2():\n    pass\n"); os.utime(root / "other.py", (time.time() + 3600,) * 2)
+            script = ("import sys; sys.path.insert(0, %r); import chunkers, memidx; "
+                      "chunkers.backend_availability = lambda: 'python=missing;swift=ok'; "
+                      "memidx.main(['code-search', '--db', %r, 'g2', '--mode', 'fts'])") % (str(TOOLS_DIR), str(db))
+            r = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=60)
+            self.assertIn("g2", r.stdout)
+            conn = memidx.open_code_db(db)
+            self.assertEqual(conn.execute("SELECT status FROM file_sha WHERE path='x.py'").fetchone()[0], "not-indexed"); conn.close()
+            # (b) fingerprint differs (backend really available now) -> heal retries x.py
+            r = self._run(db, "f")
+            self.assertIn("f", r.stdout); self.assertIn("healed", r.stderr)
+            r2 = self._run(db, "f")
+            self.assertNotIn("healed", r2.stderr)
+
+    def test_healed_count_reports_files_actually_reindexed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"; root.mkdir(); (root / "x.py").write_text("def f():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"
+            with mock.patch.multiple(chunkers, get_chunker=lambda lang: (_ for _ in ()).throw(chunkers.BackendUnavailable("m")),
+                                     backend_availability=lambda: "python=missing;swift=ok"):
+                code_reindex(root, db, lang="python")
+            r = self._run(db, "f")                      # availability-only heal: preflight changed == 0
+            self.assertIn("index healed (1 file(s) re-indexed)", r.stderr)
+
+    def test_heal_failure_is_fail_open(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._stale_tree(td)
+            real = memidx.cmd_code_reindex
+            memidx.cmd_code_reindex = lambda a: (_ for _ in ()).throw(RuntimeError("boom"))
+            # in-process call needed for the monkeypatch: call cmd_code_search directly
+            try:
+                buf = io.StringIO()
+                with contextlib.redirect_stderr(buf), contextlib.redirect_stdout(io.StringIO()):
+                    rc = memidx.cmd_code_search(ns(db=str(db), project=memidx.DEFAULT_PROJECT, query="old_name", mode="fts",
+                                                   limit=10, json=False, decision_db=None, no_heal=False, heal_limit=500))
+            finally:
+                memidx.cmd_code_reindex = real
+            self.assertEqual(rc, 0); self.assertIn("heal failed", buf.getvalue()); self.assertIn("stale", buf.getvalue().lower())
+
+
 class TestStaleWarning(unittest.TestCase):
-    def test_touching_a_source_file_triggers_stderr_warning_on_search(self):
+    def test_editing_a_source_file_triggers_stderr_warning_on_search(self):
+        """Anatomy M2a Task 4: code_index_report is sha-confirmed -- a bare
+        `touch` alone is no longer enough to warn stale (see
+        TestCodeIndexReport.test_touch_is_not_a_change_but_an_edit_is); an
+        actual content edit is.
+
+        Anatomy M2a Task 5: a stale index heals itself by default now, so
+        this must pass --no-heal to still exercise the bare warning path;
+        TestHealOnSearch covers the with-heal behavior."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "code"
             root.mkdir()
@@ -2005,8 +2910,9 @@ class TestStaleWarning(unittest.TestCase):
 
             script = (
                 "import sys, time, os; sys.path.insert(0, %r); import memidx; "
-                "os.utime(%r, (time.time() + 3600, time.time() + 3600)); "
-                "memidx.main(['code-search', '--db', %r, 'outer func', '--mode', 'fts'])"
+                "p = %r; open(p, 'a').write('\\nfunc addedLater() {}\\n'); "
+                "os.utime(p, (time.time() + 3600, time.time() + 3600)); "
+                "memidx.main(['code-search', '--db', %r, 'outer func', '--mode', 'fts', '--no-heal'])"
             ) % (str(TOOLS_DIR), str(target), str(db))
             result = subprocess.run(
                 [sys.executable, "-c", script], capture_output=True, text=True, timeout=30
@@ -2108,6 +3014,12 @@ class TestIndexProvenance(unittest.TestCase):
             self.assertGreater(len(data["results"]), 0)
 
     def test_stale_index_json_carries_state_stale(self):
+        """Anatomy M2a Task 4: code_index_report is sha-confirmed -- a real
+        content edit (not a bare `touch`) is what the state must react to.
+
+        Anatomy M2a Task 5: --no-heal, so this exercises the raw preflight
+        state rather than the now-default heal-to-current behavior
+        (TestHealOnSearch covers that)."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "code"
             root.mkdir()
@@ -2115,9 +3027,10 @@ class TestIndexProvenance(unittest.TestCase):
             shutil.copy(FIXTURES / "NestedTypes.swift", target)
             db = Path(td) / "idx-code.sqlite"
             code_reindex(root, db, no_embed=True)
+            target.write_text(target.read_text() + "\nfunc addedLater() {}\n")
             os.utime(target, (time.time() + 3600, time.time() + 3600))
 
-            result = self._run(["code-search", "--db", str(db), "outer func", "--mode", "fts", "--json"])
+            result = self._run(["code-search", "--db", str(db), "outer func", "--mode", "fts", "--json", "--no-heal"])
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             data = json.loads(result.stdout)
             self.assertEqual(data["state"], "stale")
@@ -2353,7 +3266,7 @@ class TestMemlintSymbolFragment(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             shutil.copy(CONCEPTS / "bad_symbol.md", root / "bad_symbol.md")
-            errors, _warnings = memlint.lint_root(root, code_root=CODE_ROOT)
+            errors, _warnings = memlint.lint_root(root, code_roots=[CODE_ROOT])
             self.assertTrue(
                 any("CON-CODE-BADSYM" in e and "doesNotExist" in e for e in errors), errors
             )
@@ -2363,7 +3276,7 @@ class TestMemlintSymbolFragment(unittest.TestCase):
             root = Path(td)
             shutil.copy(CONCEPTS / "good.md", root / "good.md")
             shutil.copy(CONCEPTS / "topics" / "top-code-1.md", root / "top-code-1.md")
-            errors, _warnings = memlint.lint_root(root, code_root=CODE_ROOT)
+            errors, _warnings = memlint.lint_root(root, code_roots=[CODE_ROOT])
             self.assertFalse(any("CON-CODE-GOOD" in e for e in errors), errors)
 
     def test_symbol_check_skipped_without_code_root(self):
@@ -2383,14 +3296,14 @@ class TestMemlintSymbolVocabulary(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             shutil.copy(CONCEPTS / "vocab_good.md", root / "vocab_good.md")
-            errors, _warnings = memlint.lint_root(root, code_root=CODE_ROOT)
+            errors, _warnings = memlint.lint_root(root, code_roots=[CODE_ROOT])
             self.assertFalse(any("CON-VOCAB-GOOD" in e for e in errors), errors)
 
     def test_symbol_only_in_a_comment_is_an_error(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             shutil.copy(CONCEPTS / "vocab_bad_comment.md", root / "vocab_bad_comment.md")
-            errors, _warnings = memlint.lint_root(root, code_root=CODE_ROOT)
+            errors, _warnings = memlint.lint_root(root, code_roots=[CODE_ROOT])
             self.assertTrue(
                 any("CON-VOCAB-BADCOMMENT" in e and "commentedOutSymbol" in e for e in errors),
                 errors,
@@ -2400,7 +3313,7 @@ class TestMemlintSymbolVocabulary(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             shutil.copy(CONCEPTS / "vocab_bad_string.md", root / "vocab_bad_string.md")
-            errors, _warnings = memlint.lint_root(root, code_root=CODE_ROOT)
+            errors, _warnings = memlint.lint_root(root, code_roots=[CODE_ROOT])
             self.assertTrue(
                 any("CON-VOCAB-BADSTRING" in e and "stringOnlySymbol" in e for e in errors),
                 errors,
@@ -2418,7 +3331,7 @@ class TestMemlintFragmentAttachAgreement(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             shutil.copy(CONCEPTS / "qualified_symbol_good.md", root / "qualified_symbol_good.md")
-            errors, _warnings = memlint.lint_root(root, code_root=CODE_ROOT)
+            errors, _warnings = memlint.lint_root(root, code_roots=[CODE_ROOT])
             self.assertFalse(any("CON-CODE-QUALGOOD" in e for e in errors), errors)
 
     def test_lint_and_runtime_attach_agree_on_the_same_qualified_fragment(self):
@@ -2431,7 +3344,7 @@ class TestMemlintFragmentAttachAgreement(unittest.TestCase):
         # breaks only one side is caught here.
         self.assertTrue(memidx.fragment_matches_symbol("Outer.outerFunc", "outerFunc", "Outer.outerFunc"))
         text = (FIXTURES / "NestedTypes.swift").read_text()
-        self.assertTrue(memidx.fragment_declared_in_text("Outer.outerFunc", text))
+        self.assertTrue(memidx.fragment_declared_in_text("Outer.outerFunc", text, rel_path="NestedTypes.swift"))
 
 
 class TestMemlintPathContainment(unittest.TestCase):
@@ -2456,7 +3369,7 @@ class TestMemlintPathContainment(unittest.TestCase):
             "---\n\n"
             "Fixture. NOT this concept: nothing else.\n"
         )
-        return memlint.lint_root(td, code_root=code_root)
+        return memlint.lint_root(td, code_roots=[code_root])
 
     def test_absolute_ref_path_escaping_code_root_is_an_error(self):
         with tempfile.TemporaryDirectory() as td_str:
@@ -2500,7 +3413,7 @@ class TestMemlintUnqualifiedLargeFile(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             shutil.copy(CONCEPTS / "no_symbol_small.md", root / "no_symbol_small.md")
-            errors, _warnings = memlint.lint_root(root, code_root=CODE_ROOT)
+            errors, _warnings = memlint.lint_root(root, code_roots=[CODE_ROOT])
             self.assertFalse(any("CON-CODE-NOSYM-SMALL" in e for e in errors), errors)
 
     def test_no_symbol_on_a_file_over_400_lines_is_an_error(self):
@@ -2524,7 +3437,7 @@ class TestMemlintUnqualifiedLargeFile(unittest.TestCase):
                 "---\n\n"
                 "Fixture. NOT this concept: nothing else.\n"
             )
-            errors, _warnings = memlint.lint_root(root, code_root=code_root)
+            errors, _warnings = memlint.lint_root(root, code_roots=[code_root])
             self.assertTrue(
                 any("CON-CODE-BIG" in e and "400" in e for e in errors), errors
             )
@@ -2536,7 +3449,7 @@ class TestMemlintGovernedByRegistry(unittest.TestCase):
             root = Path(td)
             shutil.copy(CONCEPTS / "bad_governed.md", root / "bad_governed.md")
             shutil.copy(CONCEPTS / "topics" / "top-code-1.md", root / "top-code-1.md")
-            errors, _warnings = memlint.lint_root(root, code_root=CODE_ROOT)
+            errors, _warnings = memlint.lint_root(root, code_roots=[CODE_ROOT])
             self.assertTrue(
                 any("CON-CODE-BADGOV" in e and "TOP-DOES-NOT-EXIST" in e for e in errors), errors
             )
@@ -2546,7 +3459,7 @@ class TestMemlintGovernedByRegistry(unittest.TestCase):
             root = Path(td)
             shutil.copy(CONCEPTS / "good.md", root / "good.md")
             shutil.copy(CONCEPTS / "topics" / "top-code-1.md", root / "top-code-1.md")
-            errors, _warnings = memlint.lint_root(root, code_root=CODE_ROOT)
+            errors, _warnings = memlint.lint_root(root, code_roots=[CODE_ROOT])
             self.assertFalse(any("governed_by" in e and "CON-CODE-GOOD" in e for e in errors), errors)
 
     def test_governed_by_check_skipped_when_no_topic_registry_present(self):
@@ -2555,7 +3468,7 @@ class TestMemlintGovernedByRegistry(unittest.TestCase):
             shutil.copy(CONCEPTS / "bad_governed.md", root / "bad_governed.md")
             # deliberately NOT copying top-code-1.md -- zero topics in this
             # corpus, so there's no registry to validate against.
-            errors, _warnings = memlint.lint_root(root, code_root=CODE_ROOT)
+            errors, _warnings = memlint.lint_root(root, code_roots=[CODE_ROOT])
             self.assertFalse(any("governed_by" in e for e in errors), errors)
 
 
@@ -2565,7 +3478,7 @@ class TestMemlintDuplicateClaim(unittest.TestCase):
             root = Path(td)
             shutil.copy(CONCEPTS / "dup_a.md", root / "dup_a.md")
             shutil.copy(CONCEPTS / "dup_b.md", root / "dup_b.md")
-            errors, _warnings = memlint.lint_root(root, code_root=CODE_ROOT)
+            errors, _warnings = memlint.lint_root(root, code_roots=[CODE_ROOT])
             self.assertTrue(
                 any("CON-CODE-DUP-A" in e and "CON-CODE-DUP-B" in e for e in errors), errors
             )
@@ -2574,7 +3487,7 @@ class TestMemlintDuplicateClaim(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             shutil.copy(CONCEPTS / "dup_a.md", root / "dup_a.md")
-            errors, _warnings = memlint.lint_root(root, code_root=CODE_ROOT)
+            errors, _warnings = memlint.lint_root(root, code_roots=[CODE_ROOT])
             self.assertFalse(any("duplicate" in e.lower() for e in errors), errors)
 
 
@@ -2583,7 +3496,7 @@ class TestMemlintNotThisConcept(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             shutil.copy(CONCEPTS / "no_not_this.md", root / "no_not_this.md")
-            _errors, warnings = memlint.lint_root(root, code_root=CODE_ROOT)
+            _errors, warnings = memlint.lint_root(root, code_roots=[CODE_ROOT])
             self.assertTrue(
                 any("CON-CODE-NO-NOT-THIS" in w and "not this" in w.lower() for w in warnings), warnings
             )
@@ -2593,7 +3506,7 @@ class TestMemlintNotThisConcept(unittest.TestCase):
             root = Path(td)
             shutil.copy(CONCEPTS / "good.md", root / "good.md")
             shutil.copy(CONCEPTS / "topics" / "top-code-1.md", root / "top-code-1.md")
-            _errors, warnings = memlint.lint_root(root, code_root=CODE_ROOT)
+            _errors, warnings = memlint.lint_root(root, code_roots=[CODE_ROOT])
             self.assertFalse(
                 any("CON-CODE-GOOD" in w and "not this" in w.lower() for w in warnings), warnings
             )
@@ -2603,7 +3516,7 @@ class TestMemlintExistingRulesStillGreen(unittest.TestCase):
     def test_v11_concept_fixtures_still_lint_clean_of_the_original_checks(self):
         v11_concepts = TOOLS_DIR / "fixtures" / "v11" / "concepts"
         v11_code = TOOLS_DIR / "fixtures" / "v11" / "code"
-        errors, _warnings = memlint.lint_root(v11_concepts, code_root=v11_code)
+        errors, _warnings = memlint.lint_root(v11_concepts, code_roots=[v11_code])
         # CON-900's missing path is still expected; nothing NEW should
         # appear for CON-007 (media-identity) or CON-901 (no-tests).
         self.assertFalse(any("CON-007" in e for e in errors), errors)
@@ -2801,6 +3714,324 @@ class TestSelfIndexAcceptanceGate(unittest.TestCase):
             rc = memidx.cmd_why(args)
         self.assertEqual(rc, 0, buf.getvalue() + err.getvalue())
         self.assertIn("memidx.py", buf.getvalue(), buf.getvalue())
+
+
+class TestWhyNeverRebuildsAnOlderIndex(unittest.TestCase):
+    """Fix-wave item 3: _resolve_symbol_via_code_index must never call
+    open_code_db on a db whose schema is older than CODE_SCHEMA_VERSION --
+    that call performs the v1->v2 rebuild as a SIDE EFFECT of opening, and
+    `why` gets exactly one shot per call (it never heals, see that
+    function's own docstring). If the fast path were the thing that
+    triggered the rebuild, the first bare-symbol `why` right after an
+    engine upgrade would silently empty the whole index and leave it
+    stale until the next code-search happened to run -- worse than simply
+    missing the fast path once. The fix reads the schema version first
+    with a throwaway, read-only connection and returns None (sending the
+    caller to the disk-scan fallback) without ever opening the db for
+    real when the version is behind."""
+
+    def test_v1_db_is_left_untouched_and_lookup_returns_none(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"
+            home.mkdir()
+            project = "why-v1-guard"
+            db_path = home / f"{project}-code.sqlite"
+            conn = sqlite3.connect(str(db_path))
+            conn.executescript(TestCodeSchemaV2.V1_DDL)
+            conn.commit()
+            conn.close()
+
+            prev_home = os.environ.get("MEMCONTINUUM_HOME")
+            os.environ["MEMCONTINUUM_HOME"] = str(home)
+            try:
+                result = memidx._resolve_symbol_via_code_index(Path("/old/root"), "f", project)
+            finally:
+                if prev_home is None:
+                    os.environ.pop("MEMCONTINUUM_HOME", None)
+                else:
+                    os.environ["MEMCONTINUUM_HOME"] = prev_home
+
+            self.assertIsNone(result)
+            conn = sqlite3.connect(str(db_path))
+            still_v1 = not conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='code_schema'"
+            ).fetchone()
+            chunk_count = conn.execute("SELECT count(*) FROM chunks").fetchone()[0]
+            conn.close()
+            self.assertTrue(still_v1, "why must not trigger the v1->v2 rebuild")
+            self.assertEqual(chunk_count, 1)  # the V1_DDL fixture row, untouched
+
+    def test_corrupt_db_never_crashes_the_lookup(self):
+        """Regression guard on the version pre-check itself: sqlite3.connect
+        is lazy and never raises on a non-database file -- the DatabaseError
+        only surfaces on the first real read (code_schema_version's own
+        query). That read must stay inside the same try/except as the
+        connect, or a corrupt db crashes `why` exactly like the bug this
+        whole function exists to prevent, instead of sending the caller to
+        the disk-scan fallback like every other unreadable-db case here."""
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"
+            home.mkdir()
+            project = "why-corrupt-db-guard"
+            db_path = home / f"{project}-code.sqlite"
+            db_path.write_bytes(b"not a sqlite database at all")
+
+            prev_home = os.environ.get("MEMCONTINUUM_HOME")
+            os.environ["MEMCONTINUUM_HOME"] = str(home)
+            try:
+                result = memidx._resolve_symbol_via_code_index(Path("/old/root"), "f", project)
+            finally:
+                if prev_home is None:
+                    os.environ.pop("MEMCONTINUUM_HOME", None)
+                else:
+                    os.environ["MEMCONTINUUM_HOME"] = prev_home
+            self.assertIsNone(result)
+
+
+class TestHealIgnoresMissingRootAvailability(unittest.TestCase):
+    """Fix-wave item 4 (Grok G2): a MISSING root's availability_changed
+    flag must not make the project eligible for heal forever -- heal
+    skips exists=False roots outright, so nothing there ever actually
+    gets fixed; counting a missing root's stale not-indexed rows into the
+    project-wide aggregate just re-triggers "eligible" (and a no-op
+    reindex pass) on every single search."""
+
+    def _run(self, db, q, *extra):
+        script = ("import sys; sys.path.insert(0, %r); import memidx; "
+                  "memidx.main(['code-search', '--db', %r, %r, '--mode', 'fts'] + %r)"
+                  ) % (str(TOOLS_DIR), str(db), q, list(extra))
+        return subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=60)
+
+    def test_missing_root_with_stale_not_indexed_row_never_heals_and_stays_degraded(self):
+        with tempfile.TemporaryDirectory() as td:
+            a = Path(td) / "a"; b = Path(td) / "b"; a.mkdir(); b.mkdir()
+            (a / "x.py").write_text("def fx():\n    pass\n")
+            (b / "y.py").write_text("def fy():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"
+            code_reindex(a, db, lang="python")
+            with mock.patch.multiple(
+                chunkers,
+                get_chunker=lambda lang: (_ for _ in ()).throw(chunkers.BackendUnavailable("m")),
+                backend_availability=lambda: "python=missing;swift=ok",
+            ):
+                code_reindex(b, db, lang="python")   # b/y.py: not-indexed, stale attempt_key
+            shutil.rmtree(b)                          # root b now missing entirely
+
+            def _root_a_last_indexed_at():
+                conn = memidx.open_code_db(db)
+                row = conn.execute(
+                    "SELECT last_indexed_at FROM code_meta WHERE code_root=?", (str(a.resolve()),)
+                ).fetchone()
+                conn.close()
+                return row[0]
+
+            # A missing root's stale not-indexed row must not make root A
+            # (present, unchanged, nothing to fix) eligible for a heal --
+            # the buggy version reindexed A on every single search anyway
+            # (last_indexed_at kept moving forward), even though nothing
+            # about A ever changed and heal_code_index's own loop SKIPS
+            # exists=False roots (so B, the actual not-indexed row, is
+            # never touched either way).
+            before = _root_a_last_indexed_at()
+            r1 = self._run(db, "fx")
+            self.assertNotIn("index healed", r1.stderr, r1.stderr)
+            after1 = _root_a_last_indexed_at()
+            self.assertEqual(before, after1, "root A must not be spuriously re-reindexed by heal")
+
+            r2 = self._run(db, "fx")
+            self.assertNotIn("index healed", r2.stderr, r2.stderr)
+            after2 = _root_a_last_indexed_at()
+            self.assertEqual(before, after2)
+
+            conn = memidx.open_code_db(db)
+            self.assertEqual(memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)["state"], "degraded")
+            conn.close()
+
+
+class TestHealLimitAndFailurePathCleanup(unittest.TestCase):
+    """Fix-wave items 6 and 7: the heal-limit refusal names the report's
+    actual state (not a hardcoded "stale"), and a heal failure after the
+    post-reindex reopen closes that connection before opening a third one
+    (no leaked sqlite3.Connection)."""
+
+    def test_heal_limit_refusal_names_degraded_not_stale(self):
+        """A `degraded` report (not_indexed-driven, changed == 0) never
+        actually hits the >limit branch -- degraded implies changed == 0 --
+        so this proves the WORDING fix directly against the report dict
+        heal_code_index reads, independent of whether --heal-limit can be
+        tuned low enough to reach it in practice."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"; root.mkdir()
+            (root / "x.py").write_text("def f():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"
+            with mock.patch.multiple(
+                chunkers,
+                get_chunker=lambda lang: (_ for _ in ()).throw(chunkers.BackendUnavailable("m")),
+                backend_availability=lambda: "python=missing;swift=ok",
+            ):
+                code_reindex(root, db, lang="python")
+            conn = memidx.open_code_db(db)
+            report = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)
+            self.assertEqual(report["state"], "degraded")
+            report = dict(report, changed=1)  # force the >limit branch open regardless of shape
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                memidx.heal_code_index(conn, db, memidx.DEFAULT_PROJECT, report, limit=0)
+            self.assertIn("index is degraded", buf.getvalue())
+            self.assertNotIn("index is stale", buf.getvalue())
+
+    def test_heal_failure_after_reopen_does_not_leak_the_reopened_connection(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"; root.mkdir()
+            p = root / "x.py"; p.write_text("def old_name():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"
+            code_reindex(root, db, lang="python")
+            p.write_text("def new_name():\n    pass\n")
+            os.utime(p, (time.time() + 3600,) * 2)
+            conn = memidx.open_code_db(db)
+            report = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)
+            self.assertEqual(report["state"], "stale")
+
+            real_report = memidx.code_index_report
+            seen_conns = []
+
+            def spying_report(c, project):
+                seen_conns.append(c)
+                if len(seen_conns) == 1:
+                    raise RuntimeError("boom after reopen")
+                return real_report(c, project)
+
+            memidx.code_index_report = spying_report
+            try:
+                buf = io.StringIO()
+                with contextlib.redirect_stderr(buf):
+                    result_report, result_conn = memidx.heal_code_index(
+                        conn, db, memidx.DEFAULT_PROJECT, report, limit=500
+                    )
+            finally:
+                memidx.code_index_report = real_report
+
+            self.assertIn("heal failed", buf.getvalue())
+            self.assertEqual(len(seen_conns), 1)  # the reopened conn that raised
+            reopened = seen_conns[0]
+            with self.assertRaises(sqlite3.ProgrammingError):
+                reopened.execute("SELECT 1")       # closed by the except handler, not leaked
+            result_conn.execute("SELECT 1")         # the returned connection is still live
+            result_conn.close()
+
+
+class TestCodeIndexTooNew(unittest.TestCase):
+    """Fix-wave item 9: a db whose code_schema.version is GREATER than
+    this engine's CODE_SCHEMA_VERSION was written by a newer engine -- it
+    must never be silently used (an older engine guessing at a newer
+    schema's meaning corrupts data quietly) and never silently rebuilt
+    (that would destroy the newer engine's index). open_code_db refuses it
+    outright; code-search and why fail open around that refusal."""
+
+    def _mk_too_new_db(self, td):
+        db = Path(td) / "idx-code.sqlite"
+        conn = memidx.open_code_db(db)   # normal v2 db
+        conn.execute("UPDATE code_schema SET version=?", (memidx.CODE_SCHEMA_VERSION + 1,))
+        conn.commit()
+        conn.close()
+        return db
+
+    def test_open_code_db_refuses_a_newer_schema(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = self._mk_too_new_db(td)
+            with self.assertRaises(memidx.CodeIndexTooNew) as ctx:
+                memidx.open_code_db(db)
+            msg = str(ctx.exception)
+            self.assertIn(str(memidx.CODE_SCHEMA_VERSION + 1), msg)
+            self.assertIn(str(memidx.CODE_SCHEMA_VERSION), msg)
+            self.assertIsInstance(ctx.exception, sqlite3.DatabaseError)
+
+    def test_code_search_fails_open_on_a_newer_schema_db(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = self._mk_too_new_db(td)
+            buf, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+                rc = memidx.cmd_code_search(
+                    ns(db=str(db), query="anything", mode="fts", limit=5, json=False)
+                )
+            self.assertEqual(rc, 0, buf.getvalue() + err.getvalue())
+            self.assertIn("newer engine", err.getvalue())
+
+    def test_why_falls_back_to_disk_scan_on_a_newer_schema_db(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"; home.mkdir()
+            project = "too-new-guard"
+            root = Path(td) / "code"; root.mkdir()
+            (root / "x.py").write_text("def f():\n    pass\n")
+            db_path = home / f"{project}-code.sqlite"
+            conn = memidx.open_code_db(db_path)
+            conn.execute("UPDATE code_schema SET version=?", (memidx.CODE_SCHEMA_VERSION + 1,))
+            conn.commit()
+            conn.close()
+
+            prev_home = os.environ.get("MEMCONTINUUM_HOME")
+            os.environ["MEMCONTINUUM_HOME"] = str(home)
+            try:
+                resolved = memidx.resolve_symbol_to_path(root, "f", project=project)
+            finally:
+                if prev_home is None:
+                    os.environ.pop("MEMCONTINUUM_HOME", None)
+                else:
+                    os.environ["MEMCONTINUUM_HOME"] = prev_home
+            self.assertEqual(resolved, "x.py")  # disk-scan fallback, never a crash
+
+    def _version_and_table_names(self, db):
+        conn = sqlite3.connect(str(db))
+        version = conn.execute("SELECT version FROM code_schema").fetchone()[0]
+        tables = {
+            r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        conn.close()
+        return version, tables
+
+    def test_code_reindex_refuses_a_newer_schema_db_without_a_traceback(self):
+        """Coordinator ruling (fix-wave follow-up): cmd_code_reindex's own
+        open_code_db call must catch CodeIndexTooNew too -- code-search/why
+        degrade with rc=0, but code-reindex has real work it could
+        otherwise start, so it fails CLOSED (rc=1, same message, db
+        untouched) rather than letting the exception traceback all the way
+        out (repo-init turns rc 1 into its own exit 13, with the captured
+        stderr -- a raw traceback there is not that)."""
+        with tempfile.TemporaryDirectory() as td:
+            db = self._mk_too_new_db(td)
+            before_version, before_tables = self._version_and_table_names(db)
+            root = Path(td) / "code"; root.mkdir(); (root / "x.py").write_text("def f():\n    pass\n")
+
+            buf, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+                rc = memidx.cmd_code_reindex(ns(
+                    code_root=str(root), drop_root=None, db=str(db), project=memidx.DEFAULT_PROJECT,
+                    no_embed=True, full=False, lang="python",
+                ))
+            self.assertEqual(rc, 1, buf.getvalue() + err.getvalue())
+            self.assertIn("newer engine", err.getvalue())
+
+            after_version, after_tables = self._version_and_table_names(db)
+            self.assertEqual(before_version, after_version)   # not silently rebuilt down
+            self.assertEqual(before_tables, after_tables)     # nothing dropped, nothing added
+
+    def test_code_reindex_drop_root_refuses_a_newer_schema_db_without_a_traceback(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = self._mk_too_new_db(td)
+            before_version, before_tables = self._version_and_table_names(db)
+
+            buf, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+                rc = memidx.cmd_code_reindex(ns(
+                    code_root=None, drop_root=str(Path(td) / "some-root"), db=str(db),
+                    project=memidx.DEFAULT_PROJECT, no_embed=True, full=False, lang=None,
+                ))
+            self.assertEqual(rc, 1, buf.getvalue() + err.getvalue())
+            self.assertIn("newer engine", err.getvalue())
+
+            after_version, after_tables = self._version_and_table_names(db)
+            self.assertEqual(before_version, after_version)
+            self.assertEqual(before_tables, after_tables)
 
 
 if __name__ == "__main__":

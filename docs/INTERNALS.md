@@ -798,15 +798,35 @@ source-sha-only skip would serve chunks from a superseded chunker forever after
 a backend change — a one-way door. Bumping a row's `impl_version` is therefore
 the supported way to force re-chunking of one language's files.
 
-`ensure_file_sha_chunker_version_column` adds the column to a db built before
-this column existed and leaves it NULL; NULL never compares equal to a real
-version, so every pre-existing row re-chunks once.
+`open_code_db` compares the stored schema version against the current
+one. When the stored version is OLDER, the index is rebuilt on first use,
+keeping its roots and languages: every derived table (`chunks`, `fts`,
+`embeddings`, `file_sha`, `code_meta`, `code_schema`, `code_project`) is
+dropped and recreated inside one transaction, carrying `(project,
+code_root, langs)` forward into the fresh tables first — `langs` comes
+from the old `code_project` when that table exists (schema v2 and later,
+where langs actually lives), falling back to `code_meta`'s own `langs`
+column only for a v1 db (which has no `code_project` at all and stored
+langs directly on `code_meta`). `embedding_mode` does **not** survive: the
+fresh `code_project` row this rebuild inserts always starts at `none`,
+since an older schema tracked no such concept to carry forward — so the
+first `code-search` after a rebuild reads the project as `stale` (never
+`uninitialized`, since its roots and languages did survive) and, if it
+heals, heals without embeddings until a `code-reindex` without
+`--no-embed` runs. When the stored version is NEWER than this engine's
+own, `open_code_db` refuses the db outright (`CodeIndexTooNew`, a
+`sqlite3.DatabaseError`) rather than silently using or rebuilding it —
+`code-search`/`why` fail open around that refusal (a message, no crash,
+no results) instead of destroying an index a newer engine wrote.
 
 ### Skip predicate
 
 A language's `skip_dirs` prune only that language's own files. The walk in
-`iter_code_source_files` prunes `CODE_SKIP_DIR_NAMES` (global noise: `.git`,
-`vendor`, `node_modules`) plus `chunkers.common_skip_dirs(wired)` — the
+`iter_code_source_files` prunes `CODE_SKIP_DIR_NAMES` — an alias of
+`chunkers.UNIVERSAL_SKIP_DIRS` (`.git`, `.build`, `node_modules`, `vendor`,
+`venv`, `.venv`, `__pycache__`, `.tox`, `.eggs`; the one universal noise set
+every code-index walker prunes regardless of which languages are wired, or
+of whether any are) — plus `chunkers.common_skip_dirs(wired)`, the
 **intersection** of the wired languages' skip sets, a pure optimization, since
 any file under such a directory would be dropped by its own language's rule
 anyway. Every other directory is walked, and a file is dropped iff one of its
@@ -818,10 +838,13 @@ Consequence, and the point of the design: with Swift and Python both wired,
 `Tests/Foo.swift` is not. A union rule dropped both, silently losing Python
 source the census had just proposed Python on the strength of.
 
-`_census_skip_dirs` is deliberately wider — the global set unioned with *every*
-table row's `skip_dirs` — because a census runs before any language is wired, so
-there is no wired subset to reason about; without it, an untouched Python
-project's census would count thousands of files under `.venv/` as signal.
+The census walk applies the same skip predicate. It prunes `CODE_SKIP_DIR_NAMES`
+only — there is no wired language set at census time to intersect against, so
+it prunes nothing narrower and nothing wider — and then drops a supported file
+by the same per-file rule above: an ancestor directory in *that file's own*
+language's `skip_dirs`. An unsupported extension has no language and so no
+`skip_dirs` of its own; it is always counted outside the global noise dirs,
+never hidden behind another language's skip set.
 
 ### Unindexed-file tally
 
@@ -877,29 +900,109 @@ flow rather than hanging on `/dev/tty` — an agent has no tty, so the skill run
 the census itself, presents it, and re-runs with `--langs`.
 
 `--lang` is required on a project's first `code-reindex` (exit 1) and reused
-from `code_meta` afterwards; there is no hardcoded default. The initial
-code-reindex in `repo-init.sh` hard-fails the install on a non-zero exit (exit
-13, distinct from the decision-store reindex's exit 7): per-file handling already
-fails open, so a non-zero exit there is structural.
+from `code_project.langs` afterwards; there is no hardcoded default. The
+initial code-reindex in `repo-init.sh` hard-fails the install on a non-zero
+exit (exit 13, distinct from the decision-store reindex's exit 7): per-file
+handling already fails open, so a non-zero exit there is structural.
 
-### Single-root indexing
+### Root-scoped indexing
 
-`code-reindex` is single-root by construction — it deletes every stored path it
-did not see under the root it was given, and overwrites `code_meta.code_root`.
-Looping it over several roots therefore leaves only the last root indexed, having
-quietly deleted the earlier ones' rows on the way. `repo-init.sh` indexes the
-first `--code-root` only and prints which roots it skipped.
+A project has one language set (`code_project.langs`, `code_project.embedding_mode`)
+shared by every code root it indexes, and one row per root
+(`code_meta(project, code_root)`, holding that root's `last_indexed_at` and
+`head_sha`). `chunks` and `file_sha` carry `code_root` in their key, so a
+project can index several trees at once without one root's rows colliding
+with another's.
 
-The write-side hooks follow the same first-root rule for a different reason:
-`memlib.sh` carries a single `MEMCONTINUUM_CODE_ROOT`, so the edit ledger — and
-therefore the coverage and look-back nudges that read it — only ever sees the
-first root. `newfile-nudge.sh` is the one per-root hook: it gets its own wired
-entry, with its own `MEMCONTINUUM_CODE_ROOT`, for every `--code-root` given.
+`code-reindex --code-root DIR` touches only that root: it queries, writes and
+deletes `file_sha`/`chunks` rows scoped to `(project, code_root)` alone, and
+never sees another root's rows at all — running it once per root, as
+`repo-init.sh` does, indexes every root given, and repairing one root cannot
+strand another. Root validation runs *before* `open_code_db`, so a missing or
+unreadable `--code-root` neither creates a db file nor triggers the schema
+rebuild above; it prints the fix (`code-reindex --drop-root DIR` if the root
+is gone for good) and exits 2. `code-reindex --drop-root DIR` removes one
+root's `code_meta`/`file_sha`/`chunks` rows outright — nothing is walked, so
+it works even when `DIR` no longer exists on disk.
+
+**File status.** Every indexed file's `file_sha` row carries a `status`:
+`ok` (chunked cleanly), `partial` (chunked with at least one warned gap,
+`gap_count` > 0), `failed` (the chunker raised or reported `status=failed` —
+`sha256` and `chunker_version` are stored, so the row is skipped until the
+source or the chunker version changes, or `--full`; this is the
+**deterministic** bucket — retrying it without a code or chunker change would
+just fail again), or `not-indexed` (`sha256` is NULL — a backend unavailable
+on this machine, a permission error, or any other exception this engine did
+not itself validate; this is the **retryable** bucket, and each such row
+stamps `attempt_key` with the backend-availability fingerprint
+(`chunkers.backend_availability()`) at the moment it was written). A
+`not-indexed` row is retried when the run is an explicit `code-reindex`
+(the default), `--full`, or its stored `attempt_key`/`chunker_version` no
+longer matches the current one — never on an unrelated edit elsewhere in the
+tree with nothing about the backend or the chunker having changed, which is
+exactly the situation `code-search`'s heal (below) runs in.
+
+**`code_index_report(project)`** is the preflight both `code-search` and the
+heal consult, one entry per recorded root. States, in order: **uninitialized**
+(no `code-reindex` has ever run for this project — no `code_meta` rows at
+all); **stale** (some root has files that changed, were removed, or moved to
+a new chunker version since the last `code-reindex` — a removed file counts
+as changed too); **degraded** (nothing changed, but some root has a
+`not-indexed` file, a backend-availability change since a `not-indexed` row
+was stamped, or a recorded root missing on disk — a missing root can never
+read `current`); otherwise **current**. `failed` files are never part of this
+state calculation at all — an index with only `failed` files reads `current`,
+and `code-search` reports the failed count as its own separate line.
+The preflight is otherwise read-only: the one write it may commit is
+refreshing a drifted-looking file's stored `mtime`/`size` once its content
+turns out unchanged (sha256 still matches) — cache bookkeeping so the same
+file isn't re-hashed on the next call, never a chunk, status, or meta row.
+
+**Heal.** Before answering, `code-search` consults the report and, unless
+`--no-heal` is given, may repair it once: eligible only when the state is
+`stale` or `degraded` **and** there is something to actually fix (some root's
+`changed` count is above zero, or availability changed since a `not-indexed`
+row was stamped) — a report that is `degraded` only because a root is
+missing, or only because a `not-indexed` file's backend is still unavailable,
+is left alone, since nothing about running `code-reindex` again would change
+either. `--heal-limit N` (default 500) caps the total `changed` count the
+heal will attempt; above it, `code-search` prints the count and tells the
+caller to run `code-reindex` instead. Within the cap, every recorded root
+that still exists on disk is reindexed once, in-process, with the
+retry-not-indexed rule above turned off (so an unrelated edit never retries a
+known-broken backend) and `--full` never set (a heal repairs drift, it does not rewrite
+the project's language set); it reindexes with embeddings only when the
+project's own `embedding_mode` is already `full`, otherwise with
+`--no-embed` — a heal can never be what silently leaves a `full` project's
+new chunks unembedded, but it also never upgrades a `none` project to `full`
+on its own. `code-search` prints `index healed` only when the state after
+healing reads `current`; any exception during the heal is fail-open — the
+original report stands and the search still answers from whatever was
+already indexed.
+
+**Multi-root output.** `code-search --json` wraps hits in an envelope:
+`state`; `code_root`/`indexed_at`/`head_sha`, naming the first recorded root
+alphabetically (`indexed_at` here is that root's `last_indexed_at`, renamed
+at this top level only); `code_roots`, the full per-root report list (each
+entry carries its own `last_indexed_at`/`head_sha`, not renamed); `changed`,
+`failed`, `not_indexed`, `embedding_mode`; and `results`. In plain output,
+a hit's location is qualified with its root
+(`root/path:line`) only once a project has more than one recorded root — the
+common single-root case keeps its plain `path:line` line, since only a
+multi-root project can have the same relative path indexed under two roots
+at once.
+
+The write-side hooks stay single-root, for a different reason: `memlib.sh`
+carries one `MEMCONTINUUM_CODE_ROOT`, so the edit ledger — and therefore the
+coverage and look-back nudges that read it — only ever sees the first
+`--code-root` given. `newfile-nudge.sh` is the one per-root hook: it gets its
+own wired entry, with its own `MEMCONTINUUM_CODE_ROOT`, for every
+`--code-root` given.
 
 ## memlint
 
-`memlint.py ROOT [--code-root DIR]` imports memidx's own walker, so a session
-buffer is never linted as a topic, and reuses
+`memlint.py ROOT [--code-root DIR ...]` imports memidx's own walker, so a
+session buffer is never linted as a topic, and reuses
 `memidx.fragment_declared_in_text` — the same predicate `code-search` uses for
 concept attachment at runtime — rather than a from-scratch regex, so a
 `#symbol` fragment validates exactly the way attachment accepts it, comments and
@@ -917,11 +1020,15 @@ Topic-chain rules:
 | a `status`/`authority`/`kind` value outside the schema enums | error |
 | an edge `rel` outside the seven enumerated relations | error |
 
-Concept-record rules (`type: concept` files):
+Concept-record rules (`type: concept` files). `--code-root` is repeatable —
+one project can have several code roots, and every root given is checked:
 
 | rule | severity |
 |---|---|
-| (`--code-root`) an `implemented_by`/`tested_by` path does not exist under it | error |
+| (`--code-root`) an `implemented_by`/`tested_by` path is absolute | error |
+| (`--code-root`) a relative path escapes every code root given (a `../` that walks outside all of them) | error |
+| (`--code-root`) a path does not exist under any code root given | error (names every root tried) |
+| (`--code-root`, several roots) a path exists under more than one code root | error (one reference must name one file) |
 | (`--code-root`) a `#symbol` fragment matches nothing the chunker recognizes in that file | error |
 | (`--code-root`) `implemented_by` with no `#symbol` fragment on a file over 400 lines | error |
 | `governed_by` names a topic id not in the linted corpus | error (only when the corpus has at least one topic) |
@@ -1085,31 +1192,50 @@ down:
   (there is no separate "rejected alternative" field; a declined link *is* that
   record). A bare symbol (no `/`) resolves to its defining file through the same
   registry-served declared-symbol scan the chunker and memlint use, in two
-  steps: it first checks the code index's `chunks` table for this project, and
-  a hit whose `code_meta.code_root` matches the `--code-root` given here
-  returns IMMEDIATELY — with no freshness check at all (an index built from a
-  now-edited file is trusted exactly like a fresh one). A miss there (member
-  symbols only — container names like class/struct/enum are never chunks
-  themselves, so a miss is never conclusive) falls back to scanning
-  `--code-root` directly; that direct scan is Swift-only regardless of the
-  file's real language (it calls `fragment_declared_in_text` with no
-  `rel_path`, so `chunkers.lang_for_path` never sees the file's actual
-  extension and always resolves to the swift backend) — rel_path-aware
-  dispatch on this fallback path is a later item.
+  steps: it first checks the code index's `chunks` table for this project — a
+  stale index skips this fast path entirely (some root has unindexed drift, so
+  a chunk any root reports as current could still be a false hit); a
+  `--code-root` that is not one of the report's own recorded roots is skipped
+  too; otherwise a matching chunk in a `degraded` or `current` index returns
+  immediately, with no per-file freshness check (an index built from a
+  now-edited file is trusted exactly like a fresh one), and `why` itself never
+  heals — one call, one answer, never a side-effecting repair. A miss there
+  (member symbols only — container names like class/struct/enum are never
+  chunks themselves, so a miss is never conclusive) falls back to scanning
+  `--code-root` directly; the disk scan dispatches by file language (each
+  candidate's language is resolved the same way the indexer resolves it —
+  extension first, then a shebang sniff for an extensionless file — against
+  the full chunker registry, not just this project's stored language set),
+  and a file with no resolvable language is skipped outright, so a bare
+  Python (or any other registered language's) symbol resolves exactly like a
+  Swift one.
 - **`drift`** — checks every active link's checkable `invariant:` against a code
   tree.
 - **`code-search`** — same RRF fusion as `search`. Each hit optionally carries a
   `concept_id` when a concept's `implemented_by`/`tested_by` claims that exact
   symbol (preferred) or its containing file; attachment always reads the
-  *decision* db, overridable with `--decision-db`. Every call resolves an
-  index-provenance state first: **uninitialized** (no `code-reindex` for this
-  project — refuses, exit 1, error on stderr, and `results` is `[]` in `--json`
-  too, since an empty list would otherwise read as a real "nothing found"),
-  **stale** (source changed, or a chunker was updated, since the last
-  `code-reindex` — warning on stderr, search still runs), or **current**.
-  `--json` wraps hits in `{"state", "code_root", "indexed_at", "head_sha",
-  "results"}` so a caller can tell these apart without a second call. A "nothing
-  found" is only evidence when `state` is `current`.
+  *decision* db, overridable with `--decision-db`, and only for a hit whose
+  file still exists under the root it was indexed from — a hit whose file is
+  gone from its root (moved, deleted, or one relative path indexed under two
+  roots with only one still holding the file) never attaches a concept keyed
+  on that path alone, single- or multi-root alike; two roots sharing a
+  relative path is only the case that makes the guard visible, since a
+  single-root project can drift the same way. Every call resolves an
+  index-provenance state first (see [Root-scoped indexing](#root-scoped-indexing)
+  for the full state table) and, unless `--no-heal`, attempts the one-shot heal
+  described there before answering. **uninitialized** refuses outright (exit
+  1, error on stderr, `results` is `[]` in `--json` too, since an empty list
+  would otherwise read as a real "nothing found"); **stale** and **degraded**
+  both warn on stderr and still search, naming the failed-file count and any
+  missing root separately when they apply. `--json` wraps hits in
+  `{"state", "code_root", "code_roots", "indexed_at", "head_sha", "changed",
+  "failed", "not_indexed", "embedding_mode", "results"}`. A "nothing found" is
+  only evidence when `state` is `current`. A db written by a newer engine
+  (see `CodeIndexTooNew` above) never reaches `code_index_report` at all —
+  `code-search` exits 0 with the refusal on stderr and, in `--json`, a
+  minimal `{"state": "unavailable", "code_root": null, "indexed_at": null,
+  "head_sha": null, "results": []}` (no `code_roots`/`changed`/`failed`/
+  `not_indexed`/`embedding_mode`, since none of those were ever computed).
 
 ## Test conventions
 

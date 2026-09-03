@@ -18,15 +18,30 @@ KINDS = frozenset({"function", "method", "constructor", "accessor", "closure"})
 # of these (e.g. ".php" would otherwise false-match "x.blade.php").
 COMPOUND_EXCLUDES = {".blade.php", ".d.ts", ".min.js"}
 
+# Task 6: the ONE universal noise set -- directory names that are never
+# user source regardless of which language(s) are wired, or of whether any
+# language is wired at all (memidx.CODE_SKIP_DIR_NAMES is an alias of this,
+# and iter_code_files -- the walker `why`'s fallback and `drift`'s
+# invariants share -- prunes exactly this set, nothing narrower). ".build"
+# lives here, not on the swift row alone: it is SwiftPM's dependency
+# checkout, thousands of third-party .swift files that are never user
+# source in ANY project, Swift-wired or not -- a bare `why`/`drift` walk
+# with no language wired at all must still skip it. Each LANGUAGE_TABLE
+# row's own "skip_dirs" holds only the noise names that are NOT already
+# covered here (fix wave C1's per-language intersection rule, unaffected).
+UNIVERSAL_SKIP_DIRS = frozenset({
+    ".git", ".build", "node_modules", "vendor", "venv", ".venv",
+    "__pycache__", ".tox", ".eggs",
+})
+
 LANGUAGE_TABLE = {
     "swift": {"backend": "native", "module": "chunkers.swift",
               "extensions": (".swift",), "shebangs": (), "impl_version": "3",
-              "skip_dirs": frozenset({"Tests", "Resources", ".build"})},
+              "skip_dirs": frozenset({"Tests", "Resources"})},
     "python": {"backend": "native", "module": "chunkers.python_ast",
                "extensions": (".py",), "shebangs": ("python", "python3"),
                "impl_version": "1",
-               "skip_dirs": frozenset({"venv", ".venv", "__pycache__", "build",
-                                        "dist", ".tox", ".eggs"})},
+               "skip_dirs": frozenset({"build", "dist"})},
 }
 
 
@@ -40,14 +55,49 @@ class ChunkResult:
         self.status = status        # "ok" | "partial" | "failed"
 
 
+class BackendUnavailable(Exception):
+    """A LANGUAGE_TABLE backend that cannot run here (missing wheel,
+    provider init failure). The indexer records the file as not-indexed
+    and retries on the next explicit run, or when availability changes."""
+
+
 def get_chunker(lang):
     """Return the backend module for `lang` (must expose `chunk_file`).
 
     Imports lazily via importlib so this registry module imports cleanly
-    before every backend exists.
+    before every backend exists. importlib.import_module does nothing but
+    import here -- ANY exception it raises (not just ImportError: a
+    provider's module-level init can raise RuntimeError, OSError, its own
+    exception type, ...) means this engine cannot run this backend on this
+    machine, so it is wrapped as BackendUnavailable so cmd_code_reindex's
+    per-file guard can tell "this file is broken" (a deterministic
+    failure) apart from "this engine can't run this backend here"
+    (not-indexed, retried when that changes) -- fail-open all the way up
+    through backend_availability()/code_index_report() into code-search
+    and why, none of which may crash on a backend's own import bug.
     """
     module_name = LANGUAGE_TABLE[lang]["module"]
-    return importlib.import_module(module_name)
+    try:
+        return importlib.import_module(module_name)
+    except Exception as exc:
+        raise BackendUnavailable(f"{lang}: {type(exc).__name__}: {exc}") from exc
+
+
+def backend_availability():
+    """'lang=ok;lang=missing;...' over every table row, sorted -- the
+    fingerprint a not-indexed file_sha row stamps as its attempt_key, and
+    that code-reindex/heal compare against on a later run to decide
+    whether a not-indexed row is worth another try (Anatomy M2a binding
+    point 1). Recomputed on every call (no internal caching) -- callers
+    that need it more than once per run cache the single value locally."""
+    parts = []
+    for lang in sorted(LANGUAGE_TABLE):
+        try:
+            get_chunker(lang)
+            parts.append(f"{lang}=ok")
+        except BackendUnavailable:
+            parts.append(f"{lang}=missing")
+    return ";".join(parts)
 
 
 def extension_of(path):

@@ -12,9 +12,11 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 TOOLS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(TOOLS_DIR))
@@ -235,7 +237,7 @@ class TestForPathConcepts(unittest.TestCase):
 
 class TestConceptMemlint(unittest.TestCase):
     def test_missing_path_is_error_when_code_root_given(self):
-        errors, _warnings = memlint.lint_root(FIXTURES / "concepts", code_root=FIXTURES / "code")
+        errors, _warnings = memlint.lint_root(FIXTURES / "concepts", code_roots=[FIXTURES / "code"])
         self.assertTrue(
             any("CON-900" in e and "DoesNotExist.swift" in e for e in errors), errors
         )
@@ -245,7 +247,7 @@ class TestConceptMemlint(unittest.TestCase):
         self.assertFalse(any("DoesNotExist.swift" in e for e in errors), errors)
 
     def test_no_tested_by_is_warning_not_error(self):
-        errors, warnings = memlint.lint_root(FIXTURES / "concepts", code_root=FIXTURES / "code")
+        errors, warnings = memlint.lint_root(FIXTURES / "concepts", code_roots=[FIXTURES / "code"])
         self.assertFalse(any("CON-901" in e for e in errors), errors)
         self.assertTrue(any("CON-901" in w and "tested_by" in w for w in warnings), warnings)
 
@@ -253,12 +255,12 @@ class TestConceptMemlint(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             shutil.copy(FIXTURES / "concepts" / "media-identity.md", root / "media-identity.md")
-            errors, _warnings = memlint.lint_root(root, code_root=FIXTURES / "code")
+            errors, _warnings = memlint.lint_root(root, code_roots=[FIXTURES / "code"])
             self.assertEqual(errors, [], errors)
 
     def test_hash_fragment_stripped_before_existence_check(self):
         # implemented_by entries carry "#symbol" -- must check only the file.
-        errors, _warnings = memlint.lint_root(FIXTURES / "concepts", code_root=FIXTURES / "code")
+        errors, _warnings = memlint.lint_root(FIXTURES / "concepts", code_roots=[FIXTURES / "code"])
         self.assertFalse(any("DeleteGate.swift#delete" in e for e in errors), errors)
 
 
@@ -367,10 +369,15 @@ class TestWhy(unittest.TestCase):
     def test_code_index_fast_path_resolves_symbol_when_index_matches_code_root(self):
         """Finding 7: 'the code index when present' -- resolve_symbol_to_path
         must actually consult it (_resolve_symbol_via_code_index), not just
-        fall back to scanning code_root every time. Isolated by DELETING the
-        source file after indexing: only the fast path's chunks-table
-        lookup -- never the fallback file scan -- can possibly still
-        resolve this symbol."""
+        fall back to scanning code_root every time. Isolated by disabling
+        the fallback's own matcher (fragment_declared_in_text) rather than
+        deleting the source file: Anatomy M2a Task 5 makes the fast path
+        distrust a report state of anything but current/degraded-without-
+        drift, and a removed file counts as a change (state -> stale), so
+        deletion would (correctly) route this query to the disabled
+        fallback and fail instead of proving the fast path was used. The
+        file stays on disk, unedited, so the report reads "current" and the
+        fast path is what must answer."""
         with tempfile.TemporaryDirectory() as td:
             code_root = Path(td) / "code"
             code_root.mkdir()
@@ -389,9 +396,8 @@ class TestWhy(unittest.TestCase):
                 )
                 self.assertEqual(memidx.cmd_code_reindex(code_args), 0)
 
-                (code_root / "Escaped.swift").unlink()  # kill the fallback scan's only path
-
-                resolved = memidx.resolve_symbol_to_path(code_root, "default", project=project)
+                with mock.patch.object(memidx, "fragment_declared_in_text", return_value=False):
+                    resolved = memidx.resolve_symbol_to_path(code_root, "default", project=project)
             self.assertEqual(resolved, "Escaped.swift")
 
     def test_code_index_mismatched_root_falls_back_to_scan_not_a_stale_hit(self):
@@ -425,6 +431,55 @@ class TestWhy(unittest.TestCase):
             self.assertEqual(resolved_real, "New.swift")
             self.assertIsNone(resolved_stale)
 
+    def test_why_skips_stale_index_fast_path(self):
+        """Anatomy M2a Task 5: `why`'s fast path (_resolve_symbol_via_code_index)
+        never heals -- unlike code-search, which repairs a stale/degraded
+        index before answering. A stale index must instead fall through to
+        the disk scan, and the index itself is left exactly as it was (no
+        chunks row touched) -- the fast path's job here is only to say
+        "don't trust this", never to fix it.
+
+        Swift, arbitrarily: the disk-scan fallback (fragment_declared_in_text)
+        is language-aware per file since Task 6, so a Python root would
+        exercise the identical staleness check -- Swift is used here only
+        because it is the fixture language every other test in this class
+        already uses, not because Python is unsupported."""
+        with tempfile.TemporaryDirectory() as td:
+            code_root = Path(td) / "code"
+            code_root.mkdir()
+            target = code_root / "x.swift"
+            target.write_text("class C {\n    func old() -> Int { return 1 }\n}\n")
+            project = "stale-fastpath-proj"
+            with mc_home(Path(td) / "home"):
+                code_args = ns(
+                    project=project, code_root=str(code_root), db=None,
+                    no_embed=True, full=False, lang="swift",
+                )
+                self.assertEqual(memidx.cmd_code_reindex(code_args), 0)
+
+                code_db_path = Path(td) / "home" / f"{project}-code.sqlite"
+                conn = memidx.open_code_db(code_db_path)
+                before = [dict(r) for r in conn.execute("SELECT * FROM chunks ORDER BY id")]
+                conn.close()
+
+                target.write_text("class C {\n    func newer() -> Int { return 1 }\n}\n")
+                os.utime(target, (time.time() + 3600,) * 2)
+
+                resolved = memidx.resolve_symbol_to_path(code_root, "newer", project=project)
+                # The actual stale-gate check: "old" is still a chunks-table
+                # row (the index was never healed), but the source no
+                # longer declares it -- a fast path that trusted a stale
+                # report would return the now-wrong "x.swift" for it. Only
+                # the (correctly empty) disk scan may answer here.
+                resolved_stale_name = memidx.resolve_symbol_to_path(code_root, "old", project=project)
+
+                conn = memidx.open_code_db(code_db_path)
+                after = [dict(r) for r in conn.execute("SELECT * FROM chunks ORDER BY id")]
+                conn.close()
+            self.assertEqual(resolved, "x.swift")
+            self.assertIsNone(resolved_stale_name)
+            self.assertEqual(before, after)
+
     def test_why_json_shape(self):
         with tempfile.TemporaryDirectory() as td:
             root = build_root(td)
@@ -438,6 +493,31 @@ class TestWhy(unittest.TestCase):
             self.assertEqual(rc, 0)
             data = json.loads(out)
             self.assertTrue(any(c["id"] == "CON-007" for c in data))
+
+    def test_why_fallback_resolves_python_symbol(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); (root / "svc.py").write_text("def load_settings():\n    return 1\n")
+            self.assertEqual(memidx.resolve_symbol_to_path(root, "load_settings"), "svc.py")
+
+    def test_why_fallback_resolves_shebang_only_script(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); (root / "tool").write_text("#!/usr/bin/env python3\ndef run_tool():\n    pass\n")
+            self.assertEqual(memidx.resolve_symbol_to_path(root, "run_tool"), "tool")
+
+    def test_why_fallback_skips_noise_dirs_but_sees_tests_dir(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); (root / "node_modules").mkdir(); (root / ".build").mkdir(); (root / "Tests").mkdir()
+            (root / "node_modules" / "x.py").write_text("def hidden():\n    pass\n")
+            (root / ".build" / "dep.swift").write_text("func fromDependency() {}\n")
+            (root / "Tests" / "t.swift").write_text("func visible() {}\n")
+            self.assertIsNone(memidx.resolve_symbol_to_path(root, "hidden"))
+            self.assertIsNone(memidx.resolve_symbol_to_path(root, "fromDependency"))
+            self.assertEqual(memidx.resolve_symbol_to_path(root, "visible"), "Tests/t.swift")
+
+    def test_drift_walk_still_sees_non_language_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); (root / "Info.plist").write_text("<plist/>\n")
+            self.assertIn(root / "Info.plist", list(memidx.iter_code_files(root)))
 
 
 # ---------------------------------------------------------------------------
