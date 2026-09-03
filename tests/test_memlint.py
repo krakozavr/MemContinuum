@@ -425,5 +425,33 @@ class TestF3MemlintChecks(unittest.TestCase):
         self.assertFalse(any("evidence" in e or "agent-inference" in e for e in errors), errors)
 
 
+class TestF4EmptyCodeRefIsRejected(unittest.TestCase):
+    def _lint(self, frontmatter_yaml, body="Body.\n"):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "topics" / "reference"; root.mkdir(parents=True)
+            (root / "t.md").write_text(f"---\n{frontmatter_yaml}\n---\n{body}")
+            return memlint.lint_root(Path(td))
+
+    def test_empty_code_ref_entry_is_error(self):
+        errors, _warnings = self._lint(
+            "type: topic\nid: TOP-1\ntitle: T\ncode_refs: [\"\"]\nlinks: []\n"
+        )
+        self.assertTrue(any("t.md" in e and "code_refs" in e for e in errors), errors)
+        self.assertTrue(any("TOP-1" in e for e in errors), errors)
+
+    def test_fragment_only_code_ref_entry_is_error(self):
+        errors, _warnings = self._lint(
+            "type: topic\nid: TOP-1\ntitle: T\ncode_refs: [\"#Foo\"]\nlinks: []\n"
+        )
+        self.assertTrue(any("code_refs" in e and "#Foo" in e for e in errors), errors)
+        self.assertTrue(any("TOP-1" in e for e in errors), errors)
+
+    def test_real_code_ref_entry_stays_clean(self):
+        errors, _warnings = self._lint(
+            "type: topic\nid: TOP-1\ntitle: T\ncode_refs: [\"src/foo.py\"]\nlinks: []\n"
+        )
+        self.assertFalse(any("code_refs" in e for e in errors), errors)
+
+
 if __name__ == "__main__":
     unittest.main()

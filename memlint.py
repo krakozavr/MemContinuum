@@ -29,6 +29,7 @@ from memidx import (
     INVARIANT_KINDS,
     KINDS,
     STATUSES,
+    code_ref_is_named,
     fragment_declared_in_text,
     newest_active_link,
     parse_frontmatter,
@@ -180,6 +181,20 @@ def lint_topic(path: Path, fm: dict) -> tuple[list[str], list[str]]:
     area = str(fm.get("area") or "")
     if (area.startswith("processing/") or area.startswith("deletion/")) and not fm.get("code_refs"):
         warnings.append(f"{path}: topic in area {area!r} has no code_refs")
+
+    # Critical (external-fix round, coordinator review of F4): a code_refs
+    # entry that is empty ("") or fragment-only ("#Foo") names no path --
+    # code_ref_matches now refuses to match one, but an unvalidated entry
+    # like this reaching a live topic was the reachability path for the
+    # bug in the first place, so it is rejected here too, at the source.
+    topic_id = fm.get("id") or path.stem
+    for ref in fm.get("code_refs") or []:
+        ref_str = str(ref)
+        if not code_ref_is_named(ref_str):
+            errors.append(
+                f"{path}: topic {topic_id!r} code_refs entry {ref_str!r} is empty or "
+                "fragment-only -- a code_ref must name a path"
+            )
 
     return errors, warnings
 

@@ -1202,6 +1202,15 @@ def cmd_chain(args) -> int:
 # ---------------------------------------------------------------------------
 
 
+def code_ref_is_named(code_ref: str) -> bool:
+    """True iff `code_ref` names an actual path once its `#symbol`
+    fragment is stripped -- an empty entry (`""`) or a fragment-only entry
+    (`"#Foo"`) names nothing. Shared by code_ref_matches's degenerate-empty
+    guard below and memlint's code_refs validation, so "what counts as a
+    real code_ref" is expressed in exactly one place."""
+    return bool(code_ref.split("#", 1)[0].rstrip("/"))
+
+
 def code_ref_matches(file_path: str, code_ref: str) -> bool:
     """The one path-matching helper every governance lookup (code_refs,
     concept implemented_by/tested_by, drift's `allowed` exemption) shares
@@ -1211,7 +1220,12 @@ def code_ref_matches(file_path: str, code_ref: str) -> bool:
     `src/core2/x.py` is not under `src/core`. Both sides are
     `rstrip("/")`d first, so a `code_ref` authored with a trailing slash
     still matches. `#symbol` fragments are stripped before comparison,
-    unaffected by this fix."""
+    unaffected by this fix. An empty or fragment-only `code_ref` names no
+    path and matches nothing -- without this guard the directory check
+    degenerates to `fp.startswith("/")`, matching every ABSOLUTE path
+    (for-path receives absolute hook-payload paths)."""
+    if not code_ref_is_named(code_ref):
+        return False
     ref_path = code_ref.split("#", 1)[0].rstrip("/")
     fp = file_path.rstrip("/")
     if fp == ref_path:

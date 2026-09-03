@@ -1423,6 +1423,16 @@ class TestF4CodeRefMatches(unittest.TestCase):
             )
             self.assertEqual(hits, ["src/foo.py.bak:1"])
 
+    def test_empty_code_ref_matches_no_path(self):
+        # Critical fix: an empty code_refs entry ("") used to degenerate the
+        # directory check to fp.startswith(ref_path + "/") == fp.startswith("/"),
+        # matching every ABSOLUTE path -- reachable because for-path receives
+        # absolute hook-payload paths and memlint did not reject this shape.
+        self.assertFalse(memidx.code_ref_matches("/home/x/src/foo.py", ""))
+
+    def test_fragment_only_code_ref_matches_no_path(self):
+        self.assertFalse(memidx.code_ref_matches("/home/x/src/foo.py", "#Foo"))
+
 
 if __name__ == "__main__":
     unittest.main()
