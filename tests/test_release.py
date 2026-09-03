@@ -128,6 +128,48 @@ class TestReleaseHygiene(unittest.TestCase):
         self.assertIn("command -v python", text)
 
 
+TREE_SITTER_PINS = {
+    "tree-sitter": "0.26.0",
+    "tree-sitter-javascript": "0.25.0",
+    "tree-sitter-typescript": "0.23.2",
+    "tree-sitter-java": "0.23.5",
+    "tree-sitter-php": "0.24.1",
+    "tree-sitter-rust": "0.24.2",
+    "tree-sitter-lua": "0.5.0",
+}
+
+
+class TestTreeSitterPins(unittest.TestCase):
+    def test_requirements_txt_has_an_exact_pin_block_naming_the_policy_exception(self):
+        text = REQUIREMENTS.read_text()
+        self.assertIn("exact", text.lower())
+        self.assertIn("pin", text.lower())
+        for name, version in TREE_SITTER_PINS.items():
+            self.assertIn(
+                f"{name}=={version}", text,
+                f"requirements.txt is missing the exact pin {name}=={version}",
+            )
+
+    def test_lockfile_pins_match_requirements_txt_exactly(self):
+        lock_text = LOCKFILE.read_text()
+        for name, version in TREE_SITTER_PINS.items():
+            pattern = re.compile(r"^%s==%s\b" % (re.escape(name), re.escape(version)), re.M | re.I)
+            self.assertRegex(
+                lock_text, pattern,
+                f"requirements.lock does not pin {name} to {version} (must match requirements.txt exactly)",
+            )
+
+    def test_lockfile_still_carries_no_machine_identifying_path(self):
+        # Regenerating for the seven new pins must not reintroduce what
+        # test_lockfile_carries_no_machine_identifying_path already guards --
+        # a belt-and-suspenders re-check right after this task's regen step,
+        # not a replacement for that test.
+        text = LOCKFILE.read_text()
+        username_needle = "kra" + "kozavr"
+        for needle in ("/home/", "/mnt/", "/Users/", username_needle):
+            self.assertNotIn(needle, text)
+
+
 class TestChangelogAddedToDoctrineScan(unittest.TestCase):
     def test_changelog_is_scanned_by_the_doctrine_machinery(self):
         from test_docs import PUBLIC_DOCS  # noqa: E402

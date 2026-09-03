@@ -375,7 +375,20 @@ bootstrap_venv() {
     else
         command -v python3 >/dev/null 2>&1 || { echo "ERROR: neither uv nor python3 found on PATH" >&2; return 1; }
         step "python3 -m venv $dir"
-        python3 -m venv "$dir" || return 1
+        venv_err="$(python3 -m venv "$dir" 2>&1)"
+        venv_rc=$?
+        if [ "$venv_rc" -ne 0 ]; then
+            printf '%s\n' "$venv_err" >&2
+            case "$venv_err" in
+                *ensurepip*)
+                    echo "ERROR: python3 -m venv failed because ensurepip is unavailable on this system's python3 -- install uv instead (https://docs.astral.sh/uv/getting-started/installation/) and re-run, or pass --bootstrap-venv again once uv is on PATH; uv creates a venv without depending on ensurepip" >&2
+                    ;;
+                *)
+                    echo "ERROR: python3 -m venv $dir failed" >&2
+                    ;;
+            esac
+            return 1
+        fi
         step "$dir/bin/python -m pip install -r $req"
         "$dir/bin/python" -m pip install -r "$req" || return 1
     fi

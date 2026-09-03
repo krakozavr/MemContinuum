@@ -1923,6 +1923,46 @@ chmod +x "$dir/bin/python"
             shutil.rmtree(engine_dir, ignore_errors=True)
             shutil.rmtree(fakebin, ignore_errors=True)
 
+    def test_bootstrap_fallback_without_ensurepip_names_uv(self):
+        # WSL's python3 -m venv fails here with no ensurepip and no sudo
+        # (DESIGN-anatomy-m2-deltas.md "Verified facts") -- B4 requires the
+        # fallback to fail with a clear, actionable message naming uv, not
+        # a bare "venv creation failed".
+        home = sandbox_home()
+        engine_dir = tempfile.mkdtemp(prefix="memcontinuum-engine-copy-")
+        fakebin = tempfile.mkdtemp(prefix="memcontinuum-fakebin-")
+        try:
+            install_sh = copy_engine(engine_dir)
+            fake_python3 = Path(fakebin) / "python3"
+            fake_python3.write_text(
+                "#!/usr/bin/env bash\n"
+                'if [ "$1" = "-m" ] && [ "$2" = "venv" ]; then\n'
+                '    echo "Error: Command '"'"'/tmp/x/bin/python3 -Im ensurepip '"'"'" >&2\n'
+                '    echo "ensurepip is not available" >&2\n'
+                '    exit 1\n'
+                "fi\n"
+                "exit 0\n"
+            )
+            fake_python3.chmod(0o755)
+            minimal_path = os.pathsep.join([fakebin, "/usr/bin", "/bin"])
+
+            store = str(Path(home) / "store")
+            venv_dir = str(Path(home) / "bootstrapped-venv")
+            proc = run_install_at(
+                install_sh,
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude"),
+                 "--bootstrap-venv", venv_dir],
+                home,
+                extra_env={"PATH": minimal_path},
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("uv", proc.stdout + proc.stderr)
+            self.assertIn("ensurepip", (proc.stdout + proc.stderr).lower())
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+            shutil.rmtree(engine_dir, ignore_errors=True)
+            shutil.rmtree(fakebin, ignore_errors=True)
+
 
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
 class TestClaudeDirRequiredWithExplicitStore(unittest.TestCase):
