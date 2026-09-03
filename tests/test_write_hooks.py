@@ -593,6 +593,64 @@ class TestLedgerPostEdit(HookTestBase):
         paths = [e["path"] for e in state.get("ledger", [])]
         self.assertNotIn(fpath, paths)
 
+    def test_appends_path_under_a_symlinked_parent_into_the_store(self):
+        # mc_path_under_root (hooks/memlib.sh): a path that reaches the
+        # store only through a symlinked ancestor -- every segment lexically
+        # OUTSIDE MEMCONTINUUM_ROOT's own string, but resolving physically
+        # into it -- must still count as under-store. The old lexical
+        # `case "$FILE_PATH" in "$MEMCONTINUUM_ROOT"/*` prefix match could
+        # never see this (it only ever matched a literal prefix), the
+        # mirror-image gap of newfile-nudge.sh's own symlink fix.
+        store_link = Path(self.td) / "store-link"
+        store_link.symlink_to(self.store_root, target_is_directory=True)
+        session_id = "s-ledger-symlinked-store"
+        fpath = str(store_link / "topics" / "testing" / "mapped-topic.md")
+        payload = self.post_tool_use_payload(session_id, fpath, tool_name="Write")
+        proc, _ = run_script(LEDGER_HOOK, payload, self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        state = self.load_state(session_id)
+        entry = [e for e in state["ledger"] if e["path"] == fpath][0]
+        self.assertEqual(entry["kind"], "store")
+
+    def test_silent_for_a_symlinked_parent_escaping_the_code_root(self):
+        # Mirror-image of newfile-nudge.sh's own
+        # test_silent_for_a_symlinked_parent_escaping_the_code_root: a path
+        # that is lexically under the code root at every segment, but whose
+        # nearest EXISTING ancestor directory is actually a symlink pointing
+        # OUTSIDE it, must stay out-of-scope -- never appended to the
+        # ledger, never advancing the growth signal.
+        real_outside = Path(self.td) / "real-outside"
+        real_outside.mkdir()
+        escape_link = self.code_root / "escape-link"
+        escape_link.symlink_to(real_outside, target_is_directory=True)
+        session_id = "s-ledger-escape-link"
+        fpath = str(escape_link / "Escaped.py")
+        payload = self.post_tool_use_payload(session_id, fpath)
+        proc, _ = run_script(LEDGER_HOOK, payload, self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        state = self.load_state(session_id)
+        paths = [e["path"] for e in state.get("ledger", [])]
+        self.assertNotIn(fpath, paths)
+
+    def test_silent_for_a_dot_dot_traversal_path(self):
+        # Mirror-image of newfile-nudge.sh's own
+        # test_silent_for_a_dot_dot_traversal_path: `<code_root>/../outside/x.py`
+        # starts with the code-root string textually while actually
+        # resolving to a sibling directory OUTSIDE it. Must stay
+        # out-of-scope.
+        outside_sibling = Path(self.td) / "outside"
+        outside_sibling.mkdir()
+        session_id = "s-ledger-traversal"
+        fpath = f"{self.code_root}/../outside/Escaped.py"
+        payload = self.post_tool_use_payload(session_id, fpath)
+        proc, _ = run_script(LEDGER_HOOK, payload, self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        state = self.load_state(session_id)
+        paths = [e["path"] for e in state.get("ledger", [])]
+        self.assertNotIn(fpath, paths)
+
     def test_dedupes_same_path(self):
         session_id = "s-ledger-dedupe"
         fpath = str(self.code_root / "src" / "mapped.py")

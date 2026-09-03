@@ -75,6 +75,20 @@ def git_repo(path):
     return os.path.realpath(path)
 
 
+def tmpdir(prefix):
+    # Resolved, not raw (Ruling 89, symlink-paths fix): repo-init.sh's
+    # abspath() now resolves symlinks (os.path.realpath, not
+    # os.path.abspath), so every --store/--code-root this file builds
+    # from a setUp's self.tmp and later compares directly against
+    # rendered/registry output must be resolved too -- the identical
+    # reasoning git_repo() above already carries, one layer out: macOS's
+    # TMPDIR (/var/folders/... -> /private/var/folders/...) diverges from
+    # a raw tempfile.mkdtemp() the same way a symlinked git toplevel does.
+    # One helper, not a `realpath` sprinkled onto each of this file's
+    # ~25 `self.tmp = tempfile.mkdtemp(...)` setUp lines.
+    return os.path.realpath(tempfile.mkdtemp(prefix=prefix))
+
+
 def engine_sha(root=None, scope="repo"):
     """The stamp this checkout renders with -- asked of the one function that
     computes it (mc_render_fingerprint), never recomputed here. A test that
@@ -122,7 +136,7 @@ class UpdateTestBase(unittest.TestCase):
     registry row: claude-dirs=/code-roots=/langs=/never= all present)."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-update-test-")
+        self.tmp = tmpdir("memcontinuum-update-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -157,7 +171,7 @@ class UpdateTestBase(unittest.TestCase):
 
 class TestDecideNewFlags(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-decide-test-")
+        self.tmp = tmpdir("memcontinuum-decide-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
 
@@ -229,7 +243,7 @@ class TestRecordDecisionFlag(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-record-decision-test-")
+        self.tmp = tmpdir("memcontinuum-record-decision-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -462,7 +476,7 @@ class TestUpdateWalkStaleAndOk(UpdateTestBase):
 
 class TestLegacyRowMigration(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-update-legacy-test-")
+        self.tmp = tmpdir("memcontinuum-update-legacy-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -658,7 +672,7 @@ class TestNeverExtsSurviveARerender(unittest.TestCase):
     from."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-update-never-test-")
+        self.tmp = tmpdir("memcontinuum-update-never-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -806,7 +820,7 @@ class TestMigrationNeverGuessesTheClaudeDirSet(unittest.TestCase):
     it can see and refuses to write until a human names the whole set."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-update-cd-test-")
+        self.tmp = tmpdir("memcontinuum-update-cd-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -877,6 +891,34 @@ class TestMigrationNeverGuessesTheClaudeDirSet(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("--repo", proc.stdout + proc.stderr)
 
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_symlinked_claude_dir_override_records_the_physical_path(self):
+        """Symlink-paths fix (mc_physical, scripts/memcontinuum-update.sh):
+        a legacy row's first-ever claude-dirs record (this command's own
+        --claude-dir, the ONLY way that set is ever written) must resolve
+        PHYSICALLY before it lands in the registry row -- repo-init.sh
+        (re-run below with this same --claude-dir) resolves its own copy
+        physically too (abspath()), so the two must agree."""
+        real_parent = Path(self.tmp) / "real-session-home-parent"
+        real_parent.mkdir()
+        session_link = Path(self.tmp) / "session-home-link"
+        session_link.symlink_to(real_parent, target_is_directory=True)
+        claude_c = session_link / ".claude"
+        proc_install = run(INSTALL_SH, ["--project", "two", "--store", self.store,
+                                        "--claude-dir", str(claude_c), "--non-interactive"], self.home)
+        self.assertEqual(proc_install.returncode, 0, proc_install.stdout + proc_install.stderr)
+        claude_c_real = os.path.realpath(str(claude_c))
+        self.assertNotEqual(str(claude_c), claude_c_real, "test setup must actually be symlinked")
+
+        proc = run(UPDATE_SH, ["--apply", "--repo", self.repo,
+                               "--claude-dir", self.claude_a,
+                               "--claude-dir", str(claude_c)], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        note = decisions_tsv(self.home).read_text().splitlines()[-1]
+        self.assertIn(f"claude-dirs={self.claude_a};{claude_c_real}", note, note)
+        self.assertNotIn(str(claude_c) + ";", note, note)
+        self.assertNotIn(";" + str(claude_c), note, note)
+
 
 class TestMigrationNeverInventsALanguageSet(unittest.TestCase):
     """Wiring rendered before the language set was recorded on the hook line
@@ -885,7 +927,7 @@ class TestMigrationNeverInventsALanguageSet(unittest.TestCase):
     indexing for a project that had it on."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-update-langs-test-")
+        self.tmp = tmpdir("memcontinuum-update-langs-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -1029,7 +1071,7 @@ class TestRecordDecisionNeverFlipsADeclinedRow(unittest.TestCase):
     the person who declined."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-record-declined-test-")
+        self.tmp = tmpdir("memcontinuum-record-declined-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -1076,7 +1118,7 @@ class TestPathsWithSpaces(unittest.TestCase):
     values are percent-encoded on the way in and decoded on the way out."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-spaces-test-")
+        self.tmp = tmpdir("memcontinuum-spaces-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "my repo"))
@@ -1287,7 +1329,7 @@ class TestPartiallyRenderedLanguagesAreReported(unittest.TestCase):
     nothing about it."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-partial-test-")
+        self.tmp = tmpdir("memcontinuum-partial-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -1359,7 +1401,7 @@ class TestRenderFingerprint(unittest.TestCase):
     false -- every commit to anything marked every repo on the machine stale."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-fp-test-")
+        self.tmp = tmpdir("memcontinuum-fp-test-")
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.engine = Path(self.tmp) / "engine"
         shutil.copytree(TOOLS_DIR, self.engine, symlinks=True,
@@ -1505,7 +1547,7 @@ class TestMachineLayerIsComparedSeparately(unittest.TestCase):
     applies -- and nowhere else."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-machine-test-")
+        self.tmp = tmpdir("memcontinuum-machine-test-")
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.engine = Path(self.tmp) / "engine"
         shutil.copytree(TOOLS_DIR, self.engine, symlinks=True,
@@ -1598,7 +1640,7 @@ class TestTargetedModeRequiresRecordedWiring(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-update-targeted-test-")
+        self.tmp = tmpdir("memcontinuum-update-targeted-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -1671,7 +1713,7 @@ class TestTargetedModeRefusesARowWithNoCodeRoot(unittest.TestCase):
     language set that renders nowhere. Refused before anything is written."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-update-nocr-test-")
+        self.tmp = tmpdir("memcontinuum-update-nocr-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -1708,7 +1750,7 @@ class TestMultiDirLegacyMigrationRecoversPerDir(unittest.TestCase):
     with a set it never had."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-update-multidir-test-")
+        self.tmp = tmpdir("memcontinuum-update-multidir-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -1790,6 +1832,38 @@ class TestMultiDirLegacyMigrationRecoversPerDir(unittest.TestCase):
         self.assertNotIn("unknown argument", combined, combined)
         self.assertIn("ONE registry row", combined, combined)
 
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_symlinked_code_root_override_records_and_renders_the_physical_path(self):
+        """Symlink-paths fix (mc_physical, scripts/memcontinuum-update.sh):
+        an OVERRIDE_CODE_ROOTS value given directly on this command's own
+        --code-root during migration must resolve PHYSICALLY before it
+        lands in the registry row -- otherwise it would disagree with what
+        repo-init.sh (re-run below with this same value) bakes into the
+        rendered hook line for the very same install (Ruling 89's
+        registry-vs-rendered divergence, one layer up)."""
+        real_parent = Path(self.tmp) / "real-code-c-parent"
+        real_parent.mkdir()
+        code_c_link = Path(self.tmp) / "code-c-link"
+        code_c_link.symlink_to(real_parent, target_is_directory=True)
+        code_c = code_c_link / "code-c"
+        code_c.mkdir()
+        (code_c / "z.py").write_text("print(3)\n")
+        code_c_real = os.path.realpath(str(code_c))
+        self.assertNotEqual(str(code_c), code_c_real, "test setup must actually be symlinked")
+
+        proc = run(UPDATE_SH, ["--apply", "--repo", self.repo,
+                               "--claude-dir", self.claude_a,
+                               "--code-root", str(code_c),
+                               "--langs", "python,swift",
+                               "--set-never-ext", ".cs"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        note = decisions_tsv(self.home).read_text().splitlines()[-1]
+        self.assertIn(f"code-roots={code_c_real}", note, note)
+        self.assertNotIn(str(code_c), note, note)
+        settings = Path(self.claude_a, "settings.local.json").read_text()
+        self.assertIn(f"MEMCONTINUUM_CODE_ROOT={code_c_real}", settings)
+        self.assertNotIn(f"MEMCONTINUUM_CODE_ROOT={code_c}", settings)
+
 
 class TestStoreMissingOutranksNoWiring(UpdateTestBase):
     """A dir with no wiring AND a store that is gone is not a wiring problem
@@ -1822,7 +1896,7 @@ class TestTargetedMultiDirIsAllOrNothing(unittest.TestCase):
     describes neither half."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-update-txn-test-")
+        self.tmp = tmpdir("memcontinuum-update-txn-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -1881,7 +1955,7 @@ class TestAnUnknownFingerprintNeverComparesEqual(unittest.TestCase):
     checked. Unknown on either side means `stale`: re-render and find out."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-unknown-fp-test-")
+        self.tmp = tmpdir("memcontinuum-unknown-fp-test-")
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
@@ -2030,7 +2104,7 @@ class TestEveryUnfinishedApplyRowFailsTheWalk(unittest.TestCase):
     exception: that is the skill's repair path, not this command's."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-exit-test-")
+        self.tmp = tmpdir("memcontinuum-exit-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -2056,7 +2130,7 @@ class TestMachineClaudeDirIsRecordedAndReused(unittest.TestCase):
     have rendered a SECOND machine layer at the default path."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-machine-cd-test-")
+        self.tmp = tmpdir("memcontinuum-machine-cd-test-")
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.engine = Path(self.tmp) / "engine"
         shutil.copytree(TOOLS_DIR, self.engine, symlinks=True,
@@ -2134,7 +2208,7 @@ class TestTheRowIsRewrittenOnlyWhenEveryDirRendered(unittest.TestCase):
     every future re-render replays that description."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-migrate-skip-test-")
+        self.tmp = tmpdir("memcontinuum-migrate-skip-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -2216,7 +2290,7 @@ class TestThePartialRenderNoteIsOnlyPrintedWhenTrue(unittest.TestCase):
     installed, and names the language that is actually fine as the culprit."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-partial-note-test-")
+        self.tmp = tmpdir("memcontinuum-partial-note-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -2273,7 +2347,7 @@ class TestFlagsTheModeDoesNotConsumeAreRefused(unittest.TestCase):
     they wanted, the command reported success, and it did something else."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-matrix-test-")
+        self.tmp = tmpdir("memcontinuum-matrix-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -2420,7 +2494,7 @@ class TestDisagreementComparesTheRawRenderedValues(unittest.TestCase):
     replay onto the other silently changes what the other indexes."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-rawset-test-")
+        self.tmp = tmpdir("memcontinuum-rawset-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -2499,7 +2573,7 @@ class TestRepoWithoutAWiredRowIsRefused(unittest.TestCase):
     `--repo UNDECIDED --langs python` was neither consumed nor refused."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-norow-test-")
+        self.tmp = tmpdir("memcontinuum-norow-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -2579,7 +2653,7 @@ class TestEmptyFlagValuesAndContradictoryModesAreRefused(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-emptyval-test-")
+        self.tmp = tmpdir("memcontinuum-emptyval-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))

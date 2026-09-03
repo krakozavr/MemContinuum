@@ -803,6 +803,30 @@ join_semi() {
     printf '%s' "$out"
 }
 
+# mc_physical PATH -- resolves PATH to its physical (symlink-free) form via
+# `cd -P && pwd -P`, matching repo-init.sh's abspath()/no-git-default fix
+# (Ruling 89: os.path.realpath / `pwd -P`, not os.path.abspath / raw $PWD).
+# A --code-root/--claude-dir OVERRIDE the human types here on the command
+# line (migrate mode / a legacy row's first claude-dir) flows straight into
+# the registry row this command writes via decide.sh -- unresolved, it
+# would disagree with what repo-init.sh itself bakes into the rendered hook
+# line for the very same re-render this command drives, the same
+# registry-vs-rendered divergence class Ruling 89 fixed for repo-init.sh's
+# own --store/--code-root. Falls back to the raw PATH when it does not
+# resolve (does not exist, etc.) -- repo-init.sh's own --code-root
+# existence check refuses a nonexistent root before a value from here could
+# ever reach the registry, so the fallback only ever surfaces in an error
+# message, never a written row.
+mc_physical() {
+    local p
+    p="$(cd "$1" 2>/dev/null && pwd -P)"
+    if [ -n "$p" ]; then
+        printf '%s' "$p"
+    else
+        printf '%s' "$1"
+    fi
+}
+
 TABLE_HEADER_PRINTED=0
 print_row() {
     # print_row REPO CLAUDE_DIR STAMPED STORE_MATCH RULES SKILL ACTION
@@ -1301,7 +1325,11 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
             CLAUDE_DIRS_SEMI=""
             for OD in "${OVERRIDE_CLAUDE_DIRS[@]}"; do
                 [ -n "$OD" ] || continue
-                CLAUDE_DIRS_SEMI="${CLAUDE_DIRS_SEMI:+$CLAUDE_DIRS_SEMI;}$OD"
+                # mc_physical: this becomes the row's claude-dirs=, and
+                # repo-init.sh (re-run below with this same --claude-dir)
+                # resolves its own copy physically -- see mc_physical's
+                # own comment.
+                CLAUDE_DIRS_SEMI="${CLAUDE_DIRS_SEMI:+$CLAUDE_DIRS_SEMI;}$(mc_physical "$OD")"
             done
             CLAUDE_DIRS_EXPLICIT=1
         else
@@ -1469,7 +1497,15 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
         # An overridden field is also no longer a disagreement: the answer has
         # been given, so what the dirs happen to hold no longer decides it.
         if [ "${#OVERRIDE_CODE_ROOTS[@]}" -gt 0 ]; then
-            CODE_ROOTS_SEMI="$(join_semi ${OVERRIDE_CODE_ROOTS[@]+"${OVERRIDE_CODE_ROOTS[@]}"})"
+            # mc_physical: this becomes the row's code-roots=, and
+            # repo-init.sh (re-run below with these same --code-root
+            # values) resolves its own copy physically -- see
+            # mc_physical's own comment.
+            declare -a OVERRIDE_CODE_ROOTS_PHYSICAL=()
+            for cr in "${OVERRIDE_CODE_ROOTS[@]}"; do
+                OVERRIDE_CODE_ROOTS_PHYSICAL+=("$(mc_physical "$cr")")
+            done
+            CODE_ROOTS_SEMI="$(join_semi "${OVERRIDE_CODE_ROOTS_PHYSICAL[@]}")"
             DISAGREE_CODE_ROOTS=0
         fi
         if [ -n "$LANGS_FLAG" ]; then
