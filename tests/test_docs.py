@@ -23,12 +23,20 @@ import unittest
 from pathlib import Path
 
 TOOLS_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(TOOLS_DIR))
+
+import memidx  # noqa: E402
+
 README = TOOLS_DIR / "README.md"
 INTERNALS = TOOLS_DIR / "docs" / "INTERNALS.md"
 DESIGN = TOOLS_DIR / "docs" / "DESIGN.md"
 SKILL = TOOLS_DIR / "skills" / "memcontinuum" / "SKILL.md"
 SEARCH_SKILL = TOOLS_DIR / "skills" / "memory-search" / "SKILL.md"
 INSTALL_HOOKS = TOOLS_DIR / "hooks" / "install-hooks.md"
+STORE_README_TMPL = TOOLS_DIR / "templates" / "store-README.md.tmpl"
+RULES_TEMPLATE = TOOLS_DIR / "templates" / "memcontinuum-rules.md"
+SCHEMA = TOOLS_DIR / "docs" / "SCHEMA.md"
+PYPROJECT = TOOLS_DIR / "pyproject.toml"
 
 # This repo dogfoods its own installer: .claude/skills/<name>/SKILL.md is the
 # INSTALLED copy that Claude Code actually loads in this checkout. It is a
@@ -88,10 +96,13 @@ FORBIDDEN = [
     ("grandfathered wording", re.compile(r"grandfathered", re.I)),
     ("backward-compatible wording", re.compile(r"backward-compatible", re.I)),
     ("Migration note heading", re.compile(r"Migration note", re.I)),
+    ("store record id", re.compile(r"\bTOP-\d{4}")),
+    ("internal finding-code label", re.compile(r"\bF\d+:")),
 ]
 
 PUBLIC_DOCS = [
     README, INTERNALS, DESIGN, SKILL, SEARCH_SKILL, INSTALL_HOOKS,
+    STORE_README_TMPL, RULES_TEMPLATE, SCHEMA, PYPROJECT,
 ] + INSTALLED_SKILLS
 
 
@@ -640,6 +651,116 @@ class TestReadmeListsEveryDocumentedMemidxSubcommand(unittest.TestCase):
             f"and the README's \"commands a person actually types\" block "
             f"never mentions {missing}",
         )
+
+
+class TestF8F9Documented(unittest.TestCase):
+    def test_internals_states_the_f8_ceiling_in_searchable_vectors_not_topic_count(self):
+        text = INTERNALS.read_text()
+        self.assertNotIn("≤120 topics", text)
+        self.assertIn("searchable vector", text.lower())
+
+    def test_internals_names_edges_for_topic_as_presentation_not_reasoning(self):
+        text = INTERNALS.read_text()
+        self.assertIn("presentation, not reasoning", text)
+
+
+class TestDocsRound7(unittest.TestCase):
+    def test_skill_search_recipe_is_hybrid_not_vector(self):
+        text = SEARCH_SKILL.read_text()
+        self.assertNotIn("--mode vector", text.split("## Reading the output")[0])
+        self.assertIn("--mode hybrid", text)
+
+    def test_store_readme_search_recipe_carries_status_active(self):
+        text = STORE_README_TMPL.read_text()
+        recipe_line = next(l for l in text.splitlines() if "memidx.py search" in l)
+        self.assertIn("--status", recipe_line)
+
+    def test_pyproject_description_no_longer_claims_whole_record_embeddings(self):
+        text = PYPROJECT.read_text()
+        self.assertNotIn("whole-record embeddings", text)
+
+    def test_store_readme_distinguishes_owner_verbatim_from_owner_ratified(self):
+        text = STORE_README_TMPL.read_text()
+        self.assertIn("agent-drafted", text)
+
+    def test_rules_template_names_the_authority_label_not_just_exact_words(self):
+        text = RULES_TEMPLATE.read_text()
+        self.assertIn("authority", text.lower())
+
+    def test_readme_blocking_paragraph_names_hold(self):
+        text = README.read_text()
+        self.assertIn("HOLD", text)
+
+    def test_readme_append_only_notes_the_linter_does_not_enforce_it(self):
+        # W8 was vacuous as first drafted: README.md already contains the
+        # substring "git history" today, in an unrelated sentence, so
+        # assertIn("git history", ...) alone passes on the UNEDITED file
+        # and never goes red. Assert the actual new clause instead.
+        text = README.read_text()
+        self.assertIn("linter does not enforce", text.lower())
+
+    def test_schema_current_field_comment_says_hand_set(self):
+        text = SCHEMA.read_text()
+        self.assertNotIn("DERIVED by the linter", text)
+
+    def test_schema_incidents_section_names_every_field_actually_used(self):
+        # G2 was vacuous as first drafted: docs/SCHEMA.md already contains
+        # "incident" and "investigation" as substrings today, in unrelated
+        # locations, so assertIn on those words alone passes on the
+        # UNEDITED file. Enumerate the REAL frontmatter keys from the
+        # actual incident records at runtime and require the new section
+        # to name every one of them -- this is red until the section both
+        # exists and actually reflects the real corpus.
+        #
+        # `memory/` is this engine repo's OWN store (its real incident
+        # corpus), present in the main checkout but gitignored -- a
+        # worktree carries no copy of it at all, same shape as fixtures/
+        # records/ (see TestDocumentedSkipBehaviour above). Skip cleanly
+        # rather than fail when it is absent, matching the README's own
+        # promise that machine-local-data tests skip with a clear message.
+        incidents_dir = TOOLS_DIR / "memory" / "incidents"
+        keys = set()
+        for f in sorted(incidents_dir.glob("*.md")):
+            fm, _ = memidx.parse_frontmatter(f)
+            keys.update(fm.keys())
+        if not keys:
+            self.skipTest(
+                f"no incident files under {incidents_dir} -- this engine "
+                "repo's own store is machine-local, gitignored data; point "
+                "MEMCONTINUUM_TEST_INCIDENTS-style local setup at it (or "
+                "symlink memory/ to the real store) to run this test"
+            )
+        text = SCHEMA.read_text()
+        self.assertIn("Incidents and investigations", text)
+        section = text.split("Incidents and investigations", 1)[1]
+        for key in sorted(keys):
+            self.assertIn(key, section,
+                           f"SCHEMA.md's incidents section must name field {key!r} (seen in real incident frontmatter)")
+
+    def test_internals_probe_disclosure_pointer_sits_next_to_the_10_of_10_claim(self):
+        text = INTERNALS.read_text()
+        idx_claim = text.find("10/10 top-1 paraphrase")
+        idx_pointer = text.find("private, untracked files")
+        self.assertNotEqual(idx_claim, -1, "the 10/10 claim itself must still exist")
+        self.assertNotEqual(idx_pointer, -1, "the new disclosure pointer sentence must exist")
+        self.assertLess(abs(idx_pointer - idx_claim), 400,
+                         "the disclosure pointer must sit right next to the 10/10 claim, not stay only in the far-below disclosure")
+
+
+class TestDoctrineMachineryCoversDocsRound7Files(unittest.TestCase):
+    def test_public_docs_includes_the_files_task_8_writes_into(self):
+        names = {str(p) for p in PUBLIC_DOCS}
+        for rel in ("templates/store-README.md.tmpl", "templates/memcontinuum-rules.md",
+                    "docs/SCHEMA.md", "pyproject.toml"):
+            self.assertTrue(any(rel in n for n in names), f"{rel} missing from PUBLIC_DOCS")
+
+    def test_forbidden_catches_a_store_record_id_and_a_finding_code_label(self):
+        sample_id = "See TOP-0116 for the ruling."
+        sample_label = "F1: decision-index provenance state"
+        self.assertTrue(any(p.search(sample_id) for _, p in FORBIDDEN),
+                         "FORBIDDEN has no pattern for a bare TOP-#### store record id")
+        self.assertTrue(any(p.search(sample_label) for _, p in FORBIDDEN),
+                         "FORBIDDEN has no pattern for an F#: finding-code label")
 
 
 if __name__ == "__main__":

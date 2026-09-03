@@ -238,8 +238,9 @@ Notes:
 - These five scripts write `$MEMCONTINUUM_HOME/sessions/**/*.json[.lock]` and
   `$MEMCONTINUUM_HOME/hook.log` — never the store, never the code tree. One carve-out:
   `userprompt-remind.sh`'s coverage check and `precompact-persist.sh` call `memidx.py unmapped`,
-  which self-heals a drifted decision index with a `reindex --no-embed`, so the decision index's
-  own SQLite cache is written too. `git diff`/`git status` in either root staying empty across
+  which self-heals a drifted decision index with a `reindex --no-embed --auto` (mode-preserving —
+  it never embeds, and never claims a fuller embedding mode than the index already had, inside a
+  hook's own time budget), so the decision index's own SQLite cache is written too. `git diff`/`git status` in either root staying empty across
   every hook invocation is a permanent regression test (`tests/test_write_hooks.py`).
 
 

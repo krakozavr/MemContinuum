@@ -13,16 +13,13 @@ checkout (or wherever `MEMCONTINUUM_HOME`/`--project` are configured for this pr
 
 **Semantic search with filters** — the default entry point:
 ```
-memidx.py search "QUERY" --mode vector --project PROJECT --status active [--area AREA] [--type topic] --json
+memidx.py search "QUERY" --mode hybrid --project PROJECT --status active [--area AREA] [--type topic] --json
 ```
-`--status active` is this skill's convention, not the engine's: `search` with no `--status`
-filter returns superseded, historical and declined records too. Pass it by default, and drop it
-only when you deliberately want those. Add `--authority owner-verbatim` or
-`--authority owner-ratified` to find only rulings that can be cited as CONSTRAINT.
+`hybrid` (the engine's default) is what this skill recommends too — a ruling's own text is retrievable through either channel, so no single-channel mode is needed. `--status active` is this skill's convention, not the engine's: `search` with no `--status` filter also returns superseded/historical/declined records; drop it only when you want those. `--authority owner-verbatim`/`owner-ratified` narrows to CONSTRAINT-citable rulings only.
 
 **A specific topic's full chain**, once you have its id or slug:
 ```
-memidx.py chain TOP-0042 --project PROJECT --json
+memidx.py chain <topic-id-or-slug> --project PROJECT --json
 ```
 
 **What a file is governed by**, before editing it (this is also what the PreToolUse hook runs

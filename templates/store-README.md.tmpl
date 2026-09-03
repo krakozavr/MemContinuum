@@ -11,8 +11,11 @@ Schema: {{ENGINE_DIR}}/docs/SCHEMA.md. Engine: {{ENGINE_DIR}} (`memidx.py`, `mem
 ## The citation rule, in six lines
 
 1. Every ruling is a **link**, not a fact -- authority lives on the field, not the file.
-2. `owner-verbatim` / `owner-ratified` = the owner's exact words, quoted, with a `source`
-   pointer. This is the only tier that may block, refuse, or reverse work (a CONSTRAINT).
+2. `owner-verbatim` = the owner's exact words, quoted, with a `source` pointer.
+   `owner-ratified` = agent-drafted text the owner was shown and affirmed -- `text` is what
+   they saw, `source` is the sitting. Both are CONSTRAINT (the only tier that may block,
+   refuse, or reverse work); neither is ever confused with the other, since one is the
+   owner's own words and the other is a draft they only confirmed.
 3. `agent-inference` / `reviewer-finding` / `code-derived` inform but never override a fix that
    code and tests already accept.
 4. Never invent a quote. Never upgrade an authority because you believe it. Never merge two
@@ -34,7 +37,7 @@ PYTHONPATH= {{PYTHON}} {{ENGINE_DIR}}/memidx.py reindex --root {{STORE}} --proje
 
 # Look things up:
 {{ENGINE_DIR}}/memidx.py chain <topic-id-or-slug> --project {{PROJECT}}
-{{ENGINE_DIR}}/memidx.py search "<question>" --mode hybrid --project {{PROJECT}}
+{{ENGINE_DIR}}/memidx.py search "<question>" --mode hybrid --status active --project {{PROJECT}}
 {{ENGINE_DIR}}/memidx.py for-path <file> --project {{PROJECT}}
 {{ENGINE_DIR}}/memidx.py why <symbol-or-path> --project {{PROJECT}} --code-root {{CODE_ROOT}}
 {{ENGINE_DIR}}/memidx.py drift --code-root {{CODE_ROOT}} --project {{PROJECT}}
