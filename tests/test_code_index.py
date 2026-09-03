@@ -1274,7 +1274,7 @@ class TestCodeCensus(unittest.TestCase):
 
             counts = memidx.code_census(root)
             self.assertEqual(counts[".blade.php"], {"files": 1, "status": "unsupported"})
-            self.assertEqual(counts[".php"], {"files": 1, "status": "unsupported"})
+            self.assertEqual(counts["php"], {"files": 1, "status": "supported"})
             self.assertEqual(counts[".d.ts"], {"files": 1, "status": "unsupported"})
 
     def test_json_lists_zero_count_rows_for_every_known_language(self):

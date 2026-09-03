@@ -1,10 +1,12 @@
 import contextlib
 import hashlib
+import importlib
 import io
 import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -13,6 +15,7 @@ from unittest import mock
 
 import chunkers
 import chunkers.python_ast as python_ast
+import chunkers.treesitter
 import memidx
 
 TESTS_DIR = Path(__file__).resolve().parent
@@ -29,6 +32,10 @@ FINGERPRINT_GOLDEN_PATH = TESTS_DIR / "goldens" / "chunker_source_fingerprints.j
 PY_FIXTURES = TESTS_DIR / "fixtures" / "python_corpus"
 REPO_ROOT = TESTS_DIR.parent
 
+VENV_PYTHON = os.environ.get("MEMCONTINUUM_PYTHON", "")
+_SKIP_NO_VENV = ("MEMCONTINUUM_PYTHON not set -- tree-sitter tests need the fixed venv "
+                 "with the seven pins installed (Task 1's coordinator step)")
+
 
 class TestRegistry(unittest.TestCase):
     def test_kinds_frozen(self):
@@ -38,7 +45,7 @@ class TestRegistry(unittest.TestCase):
     def test_lang_for_path(self):
         self.assertEqual(chunkers.lang_for_path("a/b.swift"), "swift")
         self.assertEqual(chunkers.lang_for_path("x.py"), "python")
-        self.assertIsNone(chunkers.lang_for_path("x.rs"))       # not in M1 table
+        self.assertIsNone(chunkers.lang_for_path("x.go"))       # not in the table
         self.assertIsNone(chunkers.lang_for_path("x.blade.php"))  # compound ext never a plain match
 
     def test_get_chunker_has_chunk_file(self):
@@ -689,3 +696,253 @@ class TestGetChunkerFailsOpenOnAnyBackendException(unittest.TestCase):
                     os.environ.pop("MEMCONTINUUM_HOME", None)
                 else:
                     os.environ["MEMCONTINUUM_HOME"] = prev_home
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestTreeSitterRegistry(unittest.TestCase):
+    TS_LANGS = ("javascript", "typescript", "tsx", "java", "php", "rust", "lua")
+
+    def test_every_tree_sitter_row_present_with_required_keys(self):
+        required = {"backend", "module", "grammar_module", "grammar_pin", "runtime_pin",
+                    "query_file", "extensions", "impl_version", "containers"}
+        for lang in self.TS_LANGS:
+            row = chunkers.LANGUAGE_TABLE[lang]
+            self.assertEqual(row["backend"], "tree-sitter")
+            self.assertEqual(row["module"], "chunkers.treesitter")
+            self.assertIsInstance(row["language_fn"], str)   # ruling 83: never a dict, ts/tsx are separate rows
+            missing = required - set(row)
+            self.assertFalse(missing, f"{lang} row missing {missing}")
+
+    def test_typescript_and_tsx_are_distinct_rows_sharing_the_query_file(self):
+        ts_row = chunkers.LANGUAGE_TABLE["typescript"]
+        tsx_row = chunkers.LANGUAGE_TABLE["tsx"]
+        self.assertEqual(ts_row["language_fn"], "language_typescript")
+        self.assertEqual(tsx_row["language_fn"], "language_tsx")
+        self.assertEqual(ts_row["query_file"], tsx_row["query_file"])
+        self.assertEqual(ts_row["extensions"], (".ts",))
+        self.assertEqual(tsx_row["extensions"], (".tsx",))
+
+    def test_chunkers_treesitter_imports_with_no_grammar_wheel_present(self):
+        # Binding point 1: importing the registry module itself must never
+        # require tree_sitter -- BackendUnavailable is raised lazily, at
+        # for_language() time, not at import time.
+        with mock.patch.dict(sys.modules, {"tree_sitter": None, "tree_sitter_lua": None}):
+            importlib.reload(chunkers.treesitter)
+        importlib.reload(chunkers.treesitter)   # restore normal state for later tests
+
+    def test_get_chunker_wraps_missing_wheel_as_backend_unavailable(self):
+        chunkers.treesitter.reset_cache()
+        with mock.patch.dict(sys.modules, {"tree_sitter_lua": None}):
+            with self.assertRaises(chunkers.BackendUnavailable):
+                chunkers.get_chunker("lua")
+        chunkers.treesitter.reset_cache()
+
+    def test_backend_availability_reports_all_seven_rows_including_both_ts_dialects(self):
+        chunkers.treesitter.reset_cache()
+        with mock.patch.dict(sys.modules, {"tree_sitter_lua": None}):
+            avail = chunkers.backend_availability()
+        chunkers.treesitter.reset_cache()
+        self.assertIn("lua=missing", avail)
+        # every wheel IS present (Task 1's coordinator step) except the one
+        # mocked out above -- proving this isn't a blanket
+        # "everything unavailable" false negative, and specifically proving
+        # ruling 83's fix: typescript AND tsx both report ok independently.
+        for lang in ("javascript", "typescript", "tsx", "java", "php", "rust"):
+            self.assertIn(f"{lang}=ok", avail, avail)
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestTreeSitterFingerprint(unittest.TestCase):
+    def test_chunker_version_never_imports_tree_sitter(self):
+        with mock.patch.dict(sys.modules, {"tree_sitter": None, "tree_sitter_javascript": None}):
+            v = chunkers.chunker_version("javascript")
+        self.assertEqual(len(v), 12)
+
+    def test_chunker_version_changes_when_query_file_changes(self):
+        qpath = Path(chunkers.treesitter.QUERY_DIR) / chunkers.LANGUAGE_TABLE["javascript"]["query_file"]
+        original = qpath.read_bytes()
+        before = chunkers.chunker_version("javascript")
+        try:
+            qpath.write_bytes(original + b"\n; probe\n")
+            after = chunkers.chunker_version("javascript")
+            self.assertNotEqual(before, after)
+        finally:
+            qpath.write_bytes(original)
+
+    def test_typescript_and_tsx_are_independent_cached_instances(self):
+        chunkers.treesitter.reset_cache()
+        ts_chunker = chunkers.treesitter.for_language("typescript")
+        tsx_chunker = chunkers.treesitter.for_language("tsx")
+        self.assertIsNot(ts_chunker, tsx_chunker)
+        self.assertIs(chunkers.treesitter.for_language("typescript"), ts_chunker)   # cached
+        chunkers.treesitter.reset_cache()
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestTreeSitterFileSizeCap(unittest.TestCase):
+    """Revision 4, binding ruling 87: signal.alarm is GONE (measured: it
+    does not bound wall-clock parse time -- see the module docstring and
+    binding ruling 87's own probe). The replacement is a per-file byte
+    cap checked BEFORE `parser.parse()` is ever called."""
+
+    def test_default_cap_is_one_mebibyte(self):
+        self.assertEqual(chunkers.treesitter.DEFAULT_MAX_PARSE_BYTES, 1024 * 1024)
+
+    def test_file_under_cap_parses_normally(self):
+        chunkers.treesitter.reset_cache()
+        c = chunkers.treesitter.for_language("javascript")
+        result = c.chunk_file("function f(){}\n", "f.js")
+        self.assertEqual(result.status, "ok")
+        chunkers.treesitter.reset_cache()
+
+    def test_file_over_cap_raises_too_large_before_parsing_ever_runs(self):
+        chunkers.treesitter.reset_cache()
+        c = chunkers.treesitter.for_language("javascript")
+        big = "function f(){}\n" + ("// pad\n" * 200000)   # > 1 MiB
+        self.assertGreater(len(big.encode("utf-8")), chunkers.treesitter.DEFAULT_MAX_PARSE_BYTES)
+        with mock.patch("tree_sitter.Parser.parse") as spy:
+            with self.assertRaises(chunkers.treesitter.TreeSitterFileTooLarge) as ctx:
+                c.chunk_file(big, "big.js")
+            spy.assert_not_called()   # the cap check runs BEFORE the parser is ever touched
+        self.assertIn("too large", str(ctx.exception))
+        self.assertIn(str(chunkers.treesitter.DEFAULT_MAX_PARSE_BYTES), str(ctx.exception))
+        chunkers.treesitter.reset_cache()
+
+    def test_env_override_lowers_the_cap(self):
+        chunkers.treesitter.reset_cache()
+        c = chunkers.treesitter.for_language("javascript")
+        text = "function f(){}\n" * 100   # well under 1 MiB, well over 10 bytes
+        with mock.patch.dict(os.environ, {"MEMCONTINUUM_MAX_PARSE_BYTES": "10"}):
+            with self.assertRaises(chunkers.treesitter.TreeSitterFileTooLarge):
+                c.chunk_file(text, "f.js")
+        # env override does not leak into a later call once unset
+        result = c.chunk_file("function f(){}\n", "f.js")
+        self.assertEqual(result.status, "ok")
+        chunkers.treesitter.reset_cache()
+
+    def test_per_language_row_override_wins_over_env_and_default(self):
+        row = dict(chunkers.LANGUAGE_TABLE["javascript"])
+        row["max_bytes"] = 5
+        with mock.patch.dict(os.environ, {"MEMCONTINUUM_MAX_PARSE_BYTES": "999999999"}):
+            self.assertEqual(chunkers.treesitter.max_parse_bytes(row), 5)   # row wins over env
+        no_override_row = dict(chunkers.LANGUAGE_TABLE["javascript"])
+        no_override_row.pop("max_bytes", None)
+        with mock.patch.dict(os.environ, {"MEMCONTINUUM_MAX_PARSE_BYTES": "42"}):
+            self.assertEqual(chunkers.treesitter.max_parse_bytes(no_override_row), 42)   # env wins over default
+
+
+class TestTreeSitterHookIsolation(unittest.TestCase):
+    """Revision 3, binding addition c (fixed in revision 4, binding ruling
+    87): no hook may ever import chunkers.treesitter (directly, or
+    transitively through `import memidx`/`import chunkers`)."""
+
+    def test_hook_reachable_subcommands_never_load_chunkers_treesitter(self):
+        # Revision 4: REPLACES revision 3's substring grep of hooks/*.sh,
+        # which false-positived against hooks/newfile-nudge.sh's own
+        # human-facing message text (it tells a PERSON to run `code-search`
+        # themselves -- the hook never invokes it) and would have failed on
+        # day one, before Task 2 changes a single line of hook code. This
+        # version runs the actual memidx.py subcommands hooks/*.sh invoke
+        # (grep-confirmed against hooks/*.sh at plan-write time: `for-path`,
+        # `reindex` -- with `--auto`, the internal/hook-use flag -- and
+        # `unmapped`; never `code-reindex`/`code-search`/`backend-preflight`)
+        # in one subprocess, then checks sys.modules directly -- the exact
+        # invariant, not a proxy for it. Command exit codes are irrelevant
+        # here; only whether the import happened matters.
+        with tempfile.TemporaryDirectory() as td:
+            store = Path(td) / "store"
+            store.mkdir()
+            note = store / "note.md"
+            note.write_text("---\nid: T-0001\nkind: decision\n---\n\n# A note\n\nBody text.\n")
+            db = str(Path(td) / "idx.sqlite")
+            script = (
+                "import sys; sys.path.insert(0, %r); import memidx; "
+                "memidx.main(['reindex', '--root', %r, '--project', 'p', '--db', %r, '--auto']); "
+                "memidx.main(['for-path', %r, '--root', %r, '--project', 'p', '--db', %r]); "
+                "memidx.main(['unmapped', '--root', %r, '--project', 'p', '--db', %r, %r]); "
+                "print('RESULT:' + str('chunkers.treesitter' in sys.modules))"
+            ) % (
+                str(REPO_ROOT),
+                str(store), db,
+                str(note), str(store), db,
+                str(store), db, str(note),
+            )
+            r = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=30)
+            self.assertIn("RESULT:False", r.stdout, r.stdout + r.stderr)
+
+    def test_fresh_import_of_memidx_never_loads_chunkers_treesitter(self):
+        # A subprocess, not an in-process reload, so this reflects what a
+        # hook's own cold-start `import memidx` actually pulls in.
+        script = (
+            "import sys; sys.path.insert(0, %r); import memidx; "
+            "print('chunkers.treesitter' in sys.modules)"
+        ) % (str(REPO_ROOT),)
+        r = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "False", r.stdout + r.stderr)
+
+
+class TestTreeSitterDedupPriority(unittest.TestCase):
+    def test_same_span_two_kinds_keeps_the_more_specific_one(self):
+        entries = [
+            {"key": (10, 40), "kind": "method", "symbol": "value", "start_line": 2, "end_line": 2},
+            {"key": (10, 40), "kind": "accessor", "symbol": "value", "start_line": 2, "end_line": 2},
+        ]
+        deduped = chunkers.treesitter.dedup_by_priority(entries)
+        self.assertEqual(len(deduped), 1)
+        self.assertEqual(deduped[0]["kind"], "accessor")
+
+    def test_containing_span_with_the_same_symbol_is_dropped(self):
+        # Ruling 84: an outer wrapper match (e.g. export_statement) and an
+        # inner definition match (e.g. function_declaration) can both name
+        # symbol "Named" with DIFFERENT spans, the outer containing the
+        # inner -- keep only the innermost.
+        entries = [
+            {"key": (0, 50), "kind": "function", "symbol": "Named", "start_line": 1, "end_line": 3},
+            {"key": (7, 45), "kind": "function", "symbol": "Named", "start_line": 1, "end_line": 3},
+        ]
+        deduped = chunkers.treesitter.dedup_nested(entries)
+        self.assertEqual(len(deduped), 1)
+        self.assertEqual(deduped[0]["key"], (7, 45))
+
+    def test_containing_span_with_a_different_symbol_is_kept(self):
+        # A method inside a class is CONTAINED by the class's own span, but
+        # they name different symbols -- containment alone must never merge
+        # unrelated captures (this is not the same hazard as #2 above).
+        entries = [
+            {"key": (0, 100), "kind": "function", "symbol": "Outer", "start_line": 1, "end_line": 10},
+            {"key": (10, 40), "kind": "method", "symbol": "Outer.inner", "start_line": 2, "end_line": 4},
+        ]
+        deduped = chunkers.treesitter.dedup_nested(entries)
+        self.assertEqual(len(deduped), 2)
+
+    def test_containing_span_with_the_same_symbol_but_a_different_kind_is_kept(self):
+        # Revision 3, binding addition b: the drop trigger is symbol AND
+        # kind, not symbol alone. Two entries sharing a symbol but
+        # disagreeing on kind (a shape no shipped query actually produces,
+        # but the engine rule must not assume that) must both survive --
+        # this is the discriminating test proving `and k["kind"] ==
+        # e["kind"]` actually gates the drop, not just documents it.
+        entries = [
+            {"key": (0, 60), "kind": "function", "symbol": "value", "start_line": 1, "end_line": 5},
+            {"key": (10, 40), "kind": "method", "symbol": "value", "start_line": 2, "end_line": 4},
+        ]
+        deduped = chunkers.treesitter.dedup_nested(entries)
+        self.assertEqual(len(deduped), 2)
+
+    def test_legitimately_nested_callable_is_never_merged(self):
+        # Revision 3, binding addition b: `function outer(){ function
+        # inner(){} }` -- a nested function inside another function, the
+        # same shape as tests/fixtures/python_corpus/nested_in_method.py's
+        # def-inside-a-method case -- must produce TWO chunks, never one.
+        # Different symbols (outer vs inner) already guarantees this via
+        # the symbol check alone; this test documents the shape each
+        # per-language task's own nested-callable fixture (Tasks 3-8)
+        # exercises end to end through the real grammar, not just here in
+        # the abstract.
+        entries = [
+            {"key": (0, 80), "kind": "function", "symbol": "outer", "start_line": 1, "end_line": 6},
+            {"key": (20, 50), "kind": "function", "symbol": "inner", "start_line": 2, "end_line": 4},
+        ]
+        deduped = chunkers.treesitter.dedup_nested(entries)
+        self.assertEqual(len(deduped), 2)

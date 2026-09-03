@@ -2387,7 +2387,10 @@ class TestCodeCensusAndConsentDialogue(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             settings = json.loads((claude_dir / "settings.local.json").read_text())
             item = [g for g in settings["hooks"]["PreToolUse"] if g.get("matcher") == "Write"][0]["hooks"][0]
-            self.assertIn("MEMCONTINUUM_KNOWN_EXTS='*.py *.swift'", item["command"])
+            self.assertIn(
+                "MEMCONTINUUM_KNOWN_EXTS='*.cjs *.java *.js *.jsx *.lua *.mjs *.php *.py *.rs *.swift *.ts *.tsx'",
+                item["command"],
+            )
         finally:
             shutil.rmtree(home, ignore_errors=True)
 

@@ -375,6 +375,7 @@ bootstrap_venv() {
     else
         command -v python3 >/dev/null 2>&1 || { echo "ERROR: neither uv nor python3 found on PATH" >&2; return 1; }
         step "python3 -m venv $dir"
+        local venv_err venv_rc
         venv_err="$(python3 -m venv "$dir" 2>&1)"
         venv_rc=$?
         if [ "$venv_rc" -ne 0 ]; then

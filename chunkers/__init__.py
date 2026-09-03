@@ -42,6 +42,64 @@ LANGUAGE_TABLE = {
                "extensions": (".py",), "shebangs": ("python", "python3"),
                "impl_version": "1",
                "skip_dirs": frozenset({"build", "dist"})},
+    "javascript": {"backend": "tree-sitter", "module": "chunkers.treesitter",
+                    "grammar_module": "tree_sitter_javascript", "language_fn": "language",
+                    "runtime_pin": "0.26.0", "grammar_pin": "0.25.0",
+                    "query_file": "javascript.scm", "impl_version": "1",
+                    "extensions": (".js", ".jsx", ".mjs", ".cjs"), "shebangs": ("node",),
+                    "skip_dirs": frozenset({"build", "dist"}),
+                    "containers": {"class_declaration": "name"},
+                    "method_if_ancestor_in": frozenset(), "max_bytes": None},
+    "typescript": {"backend": "tree-sitter", "module": "chunkers.treesitter",
+                    "grammar_module": "tree_sitter_typescript", "language_fn": "language_typescript",
+                    "runtime_pin": "0.26.0", "grammar_pin": "0.23.2",
+                    "query_file": "typescript.scm", "impl_version": "1",
+                    "extensions": (".ts",), "shebangs": (),
+                    "skip_dirs": frozenset({"build", "dist"}),
+                    "containers": {"class_declaration": "name", "internal_module": "name"},
+                    "method_if_ancestor_in": frozenset(), "max_bytes": None},
+    "tsx": {"backend": "tree-sitter", "module": "chunkers.treesitter",
+            "grammar_module": "tree_sitter_typescript", "language_fn": "language_tsx",
+            "runtime_pin": "0.26.0", "grammar_pin": "0.23.2",
+            "query_file": "typescript.scm", "impl_version": "1",
+            "extensions": (".tsx",), "shebangs": (),
+            "skip_dirs": frozenset({"build", "dist"}),
+            "containers": {"class_declaration": "name", "internal_module": "name"},
+            "method_if_ancestor_in": frozenset(), "max_bytes": None},
+    "java": {"backend": "tree-sitter", "module": "chunkers.treesitter",
+             "grammar_module": "tree_sitter_java", "language_fn": "language",
+             "runtime_pin": "0.26.0", "grammar_pin": "0.23.5",
+             "query_file": "java.scm", "impl_version": "1",
+             "extensions": (".java",), "shebangs": (),
+             "skip_dirs": frozenset({"target", "build", "dist"}),
+             "containers": {"class_declaration": "name", "interface_declaration": "name",
+                             "enum_declaration": "name", "record_declaration": "name"},
+             "method_if_ancestor_in": frozenset(), "max_bytes": None},
+    "php": {"backend": "tree-sitter", "module": "chunkers.treesitter",
+            "grammar_module": "tree_sitter_php", "language_fn": "language_php",
+            "runtime_pin": "0.26.0", "grammar_pin": "0.24.1",
+            "query_file": "php.scm", "impl_version": "1",
+            "extensions": (".php",), "shebangs": (),
+            "skip_dirs": frozenset(),
+            "containers": {"class_declaration": "name", "trait_declaration": "name",
+                            "enum_declaration": "name"},
+            "method_if_ancestor_in": frozenset(), "max_bytes": None},
+    "rust": {"backend": "tree-sitter", "module": "chunkers.treesitter",
+             "grammar_module": "tree_sitter_rust", "language_fn": "language",
+             "runtime_pin": "0.26.0", "grammar_pin": "0.24.2",
+             "query_file": "rust.scm", "impl_version": "1",
+             "extensions": (".rs",), "shebangs": (),
+             "skip_dirs": frozenset({"target"}),
+             "containers": {"impl_item": "SELF_TYPE", "trait_item": "name", "mod_item": "name"},
+             "method_if_ancestor_in": frozenset({"impl_item", "trait_item"}), "max_bytes": None},
+    "lua": {"backend": "tree-sitter", "module": "chunkers.treesitter",
+            "grammar_module": "tree_sitter_lua", "language_fn": "language",
+            "runtime_pin": "0.26.0", "grammar_pin": "0.5.0",
+            "query_file": "lua.scm", "impl_version": "1",
+            "extensions": (".lua",), "shebangs": ("lua",),
+            "skip_dirs": frozenset(),
+            "containers": {},
+            "method_if_ancestor_in": frozenset(), "max_bytes": None},
 }
 
 
@@ -76,11 +134,16 @@ def get_chunker(lang):
     through backend_availability()/code_index_report() into code-search
     and why, none of which may crash on a backend's own import bug.
     """
-    module_name = LANGUAGE_TABLE[lang]["module"]
-    try:
-        return importlib.import_module(module_name)
-    except Exception as exc:
-        raise BackendUnavailable(f"{lang}: {type(exc).__name__}: {exc}") from exc
+    row = LANGUAGE_TABLE[lang]
+    if row["backend"] == "native":
+        try:
+            return importlib.import_module(row["module"])
+        except Exception as exc:
+            raise BackendUnavailable(f"{lang}: {type(exc).__name__}: {exc}") from exc
+    if row["backend"] == "tree-sitter":
+        from . import treesitter
+        return treesitter.for_language(lang)
+    raise BackendUnavailable(f"{lang}: unknown backend {row['backend']!r}")
 
 
 def backend_availability():
@@ -148,7 +211,15 @@ def chunker_version(lang):
     impl_version is reflected immediately.
     """
     row = LANGUAGE_TABLE[lang]
-    payload = f"{row['backend']}:{row['module']}:{row['impl_version']}"
+    if row["backend"] == "native":
+        payload = f"{row['backend']}:{row['module']}:{row['impl_version']}"
+    elif row["backend"] == "tree-sitter":
+        from . import treesitter
+        payload = (f"{row['backend']}:{row['module']}:{row['runtime_pin']}:"
+                   f"{row['grammar_module']}:{row['grammar_pin']}:"
+                   f"{treesitter.query_fingerprint(row)}:{row['impl_version']}")
+    else:
+        payload = f"{row['backend']}:{row.get('module','?')}:{row.get('impl_version','?')}"
     return hashlib.sha256(payload.encode()).hexdigest()[:12]
 
 

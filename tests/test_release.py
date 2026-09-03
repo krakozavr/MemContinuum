@@ -159,16 +159,6 @@ class TestTreeSitterPins(unittest.TestCase):
                 f"requirements.lock does not pin {name} to {version} (must match requirements.txt exactly)",
             )
 
-    def test_lockfile_still_carries_no_machine_identifying_path(self):
-        # Regenerating for the seven new pins must not reintroduce what
-        # test_lockfile_carries_no_machine_identifying_path already guards --
-        # a belt-and-suspenders re-check right after this task's regen step,
-        # not a replacement for that test.
-        text = LOCKFILE.read_text()
-        username_needle = "kra" + "kozavr"
-        for needle in ("/home/", "/mnt/", "/Users/", username_needle):
-            self.assertNotIn(needle, text)
-
 
 class TestChangelogAddedToDoctrineScan(unittest.TestCase):
     def test_changelog_is_scanned_by_the_doctrine_machinery(self):
