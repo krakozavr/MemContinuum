@@ -316,6 +316,26 @@ class TestFreshInstall(unittest.TestCase):
         # a PostToolUse ledger line and NO PreToolUse line).
         self.assertEqual(ifs, [f"Edit(/{self.code_root}/**)", f"Write(/{self.code_root}/**)"])
 
+    def test_pre_edit_chain_commands_render_outer_timeout_of_5(self):
+        """F6 (external-review fix round): the OUTER Claude Code backstop.
+        templates/code-root-filter-pair.json.tmpl renders `"timeout": 5` into
+        both the Edit and Write pre-edit-chain.sh command lines; this proves
+        the value survives the real repo-init.sh render/parse/write pipeline
+        end to end, not just the template text on its own (see
+        tests/test_hooks.py and tests/test_mc_settings_merge.py for the two
+        narrower checks this one sits on top of)."""
+        data = json.loads(self.settings_path.read_text())
+        pre = data["hooks"]["PreToolUse"]
+        pre_edit_commands = [
+            h
+            for group in pre
+            for h in group.get("hooks", [])
+            if "pre-edit-chain.sh" in h.get("command", "")
+        ]
+        self.assertEqual(len(pre_edit_commands), 2, pre_edit_commands)
+        for h in pre_edit_commands:
+            self.assertEqual(h.get("timeout"), 5, h)
+
     def test_settings_contains_newfile_nudge_hook_write_only_with_right_paths(self):
         """Finding 8: newfile-nudge.sh gets its OWN "Write" (never
         "Edit|Write") matcher group, a separate group from pre-edit-chain's,

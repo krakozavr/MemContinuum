@@ -9,8 +9,12 @@
 #   - match                   -> one JSON object on stdout:
 #         {"hookSpecificOutput":{"hookEventName":"PreToolUse",
 #                                  "additionalContext":"..."}}
-#   - must complete in well under 1s; every run appends one timing line to
-#     $MEMCONTINUUM_HOME/hook.log
+#   - runs under hooks/mc-watchdog.sh's own budget (see "Watchdog guard"
+#     below): a bounded run finishes in well under a second on measurement;
+#     a run past the inner budget still exits 0, still logs a named
+#     outcome, and still emits a minimal additionalContext stating the
+#     retrieval timed out rather than staying silent. Every run appends one
+#     timing (or watchdog-kill) line to $MEMCONTINUUM_HOME/hook.log.
 #   - hard-clears PYTHONPATH itself (the hook environment trap, DECISION SS8):
 #     PreToolUse hooks spawn shells that re-source .bashrc, which re-exports a
 #     Windows-site-packages PYTHONPATH that breaks the venv's own packages.
@@ -56,41 +60,46 @@ export PYTHONPATH=
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 MEMIDX="$SCRIPT_DIR/../memidx.py"
-MEMCONTINUUM_HOME="${MEMCONTINUUM_HOME:-$HOME/.memcontinuum}"
-# Python resolution order (matches hooks/memlib.sh; F6 fix, round 4):
-#   $MEMCONTINUUM_PYTHON -> $MEMCONTINUUM_HOME/config.sh -> <engine>/.venv/bin/python
-# (scripts/repo-init.sh --bootstrap-venv). Never a hard error here -- this hook fails
-# open on every path (see the header comment above); a python that doesn't
-# resolve just surfaces as a logged outcome below. The config.sh step is
-# sourced (never sed/grep'd -- it is sourceable shell); a missing/corrupt
-# config.sh is swallowed by `|| true` so it can only cost sourcing time, never
-# block the hook.
-# R2/R3 fix, round 4: the file just sourced above may be a POINTER (a
-# custom-HOME install also writes a minimal config.sh at the fixed default
-# path recording only the real MEMCONTINUUM_HOME -- memcontinuum-setup.sh
-# "3. config"). If sourcing it just redefined MEMCONTINUUM_HOME to a
-# DIFFERENT directory than the file we sourced, follow through and source
-# the REAL config.sh too, so MEMCONTINUUM_PYTHON actually resolves there.
-# Unconditional on MEMCONTINUUM_PYTHON already being set (R3): config.sh's
-# own `if [ -z "${MEMCONTINUUM_PYTHON:-}" ]` guard keeps env/baked
-# precedence for PYTHON either way; LOG below must still land under the
-# real HOME even when PYTHON was already baked into the hook line.
-MC_HOME_CONFIG_1="$MEMCONTINUUM_HOME/config.sh"
-if [ -f "$MC_HOME_CONFIG_1" ]; then
-    # shellcheck source=/dev/null
-    . "$MC_HOME_CONFIG_1" 2>/dev/null || true
+
+# Watchdog guard (F6, external-review fix round) -- same pattern every
+# other guarded hook uses (hooks/ledger-post-edit.sh's own header explains
+# what running it costs). Budget: measured against this hook's real wired
+# command line on three live stores -- the engine's own, plus two other
+# real, live projects, one of them hosted entirely on a slow drvfs
+# (/mnt/c) mount, code root and store both -- BEFORE this value was
+# chosen. Measured p95/p99 across 34 timed runs of the exact rendered
+# command line: 0.198s / 0.206s overall, max 0.206s -- see this task's
+# own report for the full per-store table.
+# That leaves roughly 10x headroom under the unmodified default budget
+# (MC_WATCHDOG_BUDGET unset here -- the five-write-side-hooks 2s default,
+# not sessionend-stamp.sh's tighter 1.2s: two sequential for-path calls on
+# a miss need the fuller budget), so 2s is confirmed by measurement, not
+# assumed. Sourcing this also resolves MEMCONTINUUM_HOME and MC_GUARD_PY
+# (env -> config.sh -> engine venv), so the duplicate resolution this file
+# used to carry inline is gone -- PY below reads MC_GUARD_PY directly
+# instead of re-deriving it.
+#
+# MC_WATCHDOG_TIMEOUT_FALLBACK is exported BEFORE the re-exec block below:
+# on a watchdog timeout the child (this same script, re-exec'd under the
+# launcher) is killed before it can write anything to stdout, so a plain
+# "silent exit 0" would leave Claude Code reading an EMPTY additionalContext
+# -- indistinguishable from "retrieval ran and found nothing". This value
+# is what the launcher (hooks/mc-watchdog.sh's embedded python) writes to
+# stdout instead on that path -- see this repo's docs/INTERNALS.md "The
+# watchdog" section for the full contract.
+export MC_WATCHDOG_TIMEOUT_FALLBACK='{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"Decision-chain retrieval timed out; absence of a matching decision was not established -- treat this edit as unverified against recorded decisions, not as confirmed clear."}}'
+# shellcheck source=mc-watchdog.sh
+source "${MC_WATCHDOG_LIB_PATH:-$SCRIPT_DIR/mc-watchdog.sh}" 2>/dev/null
+if [ -z "${MC_UNDER_TIMEOUT:-}" ]; then
+    export MC_UNDER_TIMEOUT=1
+    if [ -x "${MC_GUARD_PY:-}" ] && [ -n "${MC_WATCHDOG_LAUNCHER_PY:-}" ]; then
+        "$MC_GUARD_PY" -c "$MC_WATCHDOG_LAUNCHER_PY" "${BASH:-bash}" "${BASH_SOURCE[0]}" "$@"
+        exit 0
+    fi
 fi
-# Re-default after every source: a damaged-but-sourceable config may have
-# `unset MEMCONTINUUM_HOME`, and under `set -u` a bare expansion would
-# kill the hook (regate round 2).
+
 MEMCONTINUUM_HOME="${MEMCONTINUUM_HOME:-$HOME/.memcontinuum}"
-if [ "$MEMCONTINUUM_HOME/config.sh" != "$MC_HOME_CONFIG_1" ] && [ -f "$MEMCONTINUUM_HOME/config.sh" ]; then
-    # shellcheck source=/dev/null
-    . "$MEMCONTINUUM_HOME/config.sh" 2>/dev/null || true
-    MEMCONTINUUM_HOME="${MEMCONTINUUM_HOME:-$HOME/.memcontinuum}"
-fi
-unset MC_HOME_CONFIG_1
-PY="${MEMCONTINUUM_PYTHON:-$SCRIPT_DIR/../.venv/bin/python}"
+PY="${MC_GUARD_PY:-$SCRIPT_DIR/../.venv/bin/python}"
 LOG="$MEMCONTINUUM_HOME/hook.log"
 
 mkdir -p "$MEMCONTINUUM_HOME" 2>/dev/null

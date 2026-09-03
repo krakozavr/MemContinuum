@@ -244,5 +244,35 @@ class TestNeedleIdentity(unittest.TestCase):
         self.assertFalse(is_ours("bash '/some/path/other.sh'"))
 
 
+class TestF6SettingsTimeoutSurvivesReRender(unittest.TestCase):
+    """F6 (external-review fix round): the new `"timeout": 5` key rendered
+    into pre-edit-chain.sh's PreToolUse entries (templates/
+    code-root-filter-pair.json.tmpl) must survive a re-render through the
+    shared merge implementation -- a stale, timeout-less entry from an
+    older install gets swept and replaced, not merged/kept alongside the
+    new one."""
+
+    def test_a_rerun_replaces_old_entries_with_the_timeout_carrying_ones(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = str(Path(td) / "settings.json")
+            old_group = {"matcher": "Edit|Write", "hooks": [{
+                "type": "command", "if": "Edit(/repo/**)",
+                "command": "MEMCONTINUUM_PROJECT=p bash hooks/pre-edit-chain.sh",
+            }]}
+            Path(path).write_text(json.dumps({"hooks": {"PreToolUse": [old_group]}}))
+            new_group = {"matcher": "Edit|Write", "hooks": [{
+                "type": "command", "if": "Edit(/repo/**)",
+                "command": "MEMCONTINUUM_PROJECT=p bash hooks/pre-edit-chain.sh", "timeout": 5,
+            }]}
+            merge_settings(
+                path, ["PreToolUse"], needle_identity("MEMCONTINUUM_PROJECT="),
+                add={"PreToolUse": [new_group]},
+            )
+            data = json.loads(Path(path).read_text())
+            entries = data["hooks"]["PreToolUse"][0]["hooks"]
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0]["timeout"], 5)
+
+
 if __name__ == "__main__":
     unittest.main()

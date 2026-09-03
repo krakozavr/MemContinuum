@@ -192,7 +192,8 @@ class TestStatsHealthyCase(StatsTestBase):
         pe = out["pre_edit"]
         self.assertEqual(
             {k: v for k, v in pe.items() if k != "outcomes"},
-            {"matched": 1, "no_match": 1, "other": 2, "total": 4, "lookups": 2},
+            {"matched": 1, "no_match": 1, "other": 2, "total": 4, "lookups": 2,
+             "watchdog_killed": 0},
         )
         self.assertEqual(
             pe["outcomes"],
@@ -836,6 +837,77 @@ class TestStatsTextOutput(StatsTestBase):
         rc, out = run_stats(home=str(self.home))
         self.assertEqual(rc, 0)
         self.assertIn("FLAG: read side silent", out)
+
+
+class TestF6StatsExposesPreEditWatchdogKills(StatsTestBase):
+    """F6 (external-review fix round): mc-watchdog.sh's own kill line for
+    pre-edit-chain.sh (`outcome=watchdog-killed hook=pre-edit-chain.sh
+    project=...`, no `elapsed=` field -- the child was killed before it
+    could log its own timing) must land in the `pre_edit` bucket's own
+    `outcomes` Counter, not a shared generic bucket that loses which hook
+    timed out (coordinator ruling 67 + "Also binding from Codex").
+
+    Deviation from the task brief's scaffolding (explicitly invited by its
+    own caveat): the brief's draft test targeted tests/test_memidx.py with
+    `ns(project=None, ...)` and an `out["projects"]["p"]["pre_edit"]`
+    path -- `cmd_stats`'s real signature has no `project=None` default (it
+    reports on exactly ONE `--project`, defaulting to DEFAULT_PROJECT) and
+    its real JSON shape has no top-level "projects" key at all (see
+    `_stats_report`'s `result` dict). This file (tests/test_stats.py) is
+    the established home for `cmd_stats` tests, with `run_stats_json`/`ts`
+    helpers already built for exactly this shape -- used here instead of
+    re-deriving parallel scaffolding."""
+
+    def test_pre_edit_watchdog_kill_is_named_not_folded_into_other(self):
+        line = f"{ts(1)} outcome=watchdog-killed hook=pre-edit-chain.sh project=p\n"
+        (self.home / "hook.log").write_text(line)
+        rc, out = run_stats_json(home=str(self.home), project="p")
+        self.assertEqual(rc, 0)
+        pre_edit_outcomes = out["pre_edit"]["outcomes"]
+        self.assertIn(
+            "watchdog-killed", pre_edit_outcomes,
+            f"a pre-edit-chain watchdog kill must be named in the pre_edit "
+            f"bucket's own outcomes, not folded away: {pre_edit_outcomes}",
+        )
+        self.assertEqual(out["pre_edit"]["watchdog_killed"], 1)
+
+    def test_other_hooks_watchdog_kills_are_unaffected(self):
+        """The routing fix is targeted at hook=pre-edit-chain.sh only -- a
+        different guarded hook's kill line keeps landing in the generic
+        bucket exactly as before this fix (no blanket reclassification)."""
+        line = f"{ts(1)} outcome=watchdog-killed hook=ledger-post-edit.sh project=p\n"
+        (self.home / "hook.log").write_text(line)
+        rc, out = run_stats_json(home=str(self.home), project="p")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["pre_edit"]["watchdog_killed"], 0)
+        self.assertNotIn("watchdog-killed", out["pre_edit"]["outcomes"])
+
+    def test_repeated_pre_edit_watchdog_kills_raise_their_own_flag(self):
+        """Named telemetry, not merely routing: a REPEATED pre-edit-chain
+        timeout is a distinct, visible problem from "read side silent"
+        (which a watchdog-killed run, exiting 0 with a fallback context,
+        never trips) -- threshold mirrors the write-side FLAG's own >=3."""
+        lines = [
+            f"{ts(1)} outcome=watchdog-killed hook=pre-edit-chain.sh project=p\n"
+            for _ in range(3)
+        ]
+        (self.home / "hook.log").write_text("".join(lines))
+        rc, out = run_stats_json(home=str(self.home), project="p")
+        self.assertEqual(rc, 0)
+        self.assertTrue(
+            any("pre-edit-chain" in f and "timing out" in f for f in out["flags"]),
+            out["flags"],
+        )
+
+    def test_two_pre_edit_watchdog_kills_do_not_yet_flag(self):
+        lines = [
+            f"{ts(1)} outcome=watchdog-killed hook=pre-edit-chain.sh project=p\n"
+            for _ in range(2)
+        ]
+        (self.home / "hook.log").write_text("".join(lines))
+        rc, out = run_stats_json(home=str(self.home), project="p")
+        self.assertEqual(rc, 0)
+        self.assertFalse(any("timing out" in f for f in out["flags"]), out["flags"])
 
 
 if __name__ == "__main__":

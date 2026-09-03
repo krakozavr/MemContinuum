@@ -550,6 +550,41 @@ class TestInternalsDocumentsRootScopedCodeIndex(unittest.TestCase):
             self.assertIn(token, text, f"docs/INTERNALS.md never mentions {token!r}")
 
 
+class TestInternalsDocumentsPreEditChainWatchdog(unittest.TestCase):
+    """F6 (external-review fix round): pre-edit-chain.sh moved from the
+    "Unguarded" list to "Guarded", and the watchdog section documents the
+    measured budget, the verified Claude Code outer-timeout default, the
+    asymmetric fail-open cost, and the timeout fallback/named stats
+    outcome -- not just the moved list entry on its own."""
+
+    def test_pre_edit_chain_moved_to_guarded_not_unguarded(self):
+        text = INTERNALS.read_text()
+        idx = text.index("## The watchdog")
+        section = text[idx:idx + 3000]
+        guarded_idx = section.index("Guarded:")
+        unguarded_idx = section.index("Unguarded:")
+        pre_edit_idx = section.index("`pre-edit-chain.sh`")
+        self.assertTrue(
+            guarded_idx < pre_edit_idx < unguarded_idx,
+            "pre-edit-chain.sh must be named in the Guarded list, before Unguarded:",
+        )
+
+    def test_documents_verified_outer_default_and_measured_budget(self):
+        text = INTERNALS.read_text()
+        self.assertIn("600 seconds", text)
+        self.assertIn("p95", text)
+        self.assertIn("p99", text)
+
+    def test_documents_asymmetric_fail_open_cost(self):
+        text = INTERNALS.read_text()
+        self.assertIn("asymmetric", text)
+
+    def test_documents_timeout_fallback_and_named_stats_outcome(self):
+        text = INTERNALS.read_text()
+        self.assertRegex(text, r"not\s+established")
+        self.assertIn("watchdog-killed", text)
+
+
 class TestReadmeListsEveryDocumentedMemidxSubcommand(unittest.TestCase):
     """A memidx.py subcommand only shows up in `memidx.py --help`'s own
     subcommand listing when its subparser was given a `help=` description

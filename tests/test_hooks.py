@@ -520,6 +520,102 @@ class TestPreEditChainHook(unittest.TestCase):
         self.assertFalse((default_mc_home / "hook.log").exists())
 
 
+class TestF6RenderedTimeout(unittest.TestCase):
+    """The OUTER Claude Code backstop: `code-root-filter-pair.json.tmpl`
+    renders `"timeout": 5` on both the Edit and Write PreToolUse command
+    entries pre-edit-chain.sh receives -- unaffected by whatever the inner
+    watchdog measurement below produces (F6, external-review fix round)."""
+
+    def test_template_carries_timeout_5(self):
+        text = (TOOLS_DIR / "templates" / "code-root-filter-pair.json.tmpl").read_text()
+        self.assertEqual(text.count('"timeout": 5'), 2)
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestPreEditChainWatchdog(unittest.TestCase):
+    """F6 (external-review fix round, coordinator ruling 67 + "Also binding
+    from Codex"): pre-edit-chain.sh now runs under hooks/mc-watchdog.sh's
+    own guard. WATCHDOG_BUDGET_S mirrors the unmodified default budget
+    (MC_WATCHDOG_BUDGET is not overridden in hooks/pre-edit-chain.sh -- see
+    its own header comment) -- confirmed, not assumed, against a real
+    measurement of this hook's actual wired command line on three live
+    stores: the engine's own, plus two other real, live projects, one of
+    them hosted entirely on a slow drvfs (/mnt/c) mount, code root and
+    store both. 34 timed samples, overall p95=0.198s / p99=0.206s /
+    max=0.206s -- roughly 10x headroom under the 2s default, so it is kept
+    rather than tightened or loosened. See this task's own report for the
+    full per-store table."""
+
+    WATCHDOG_BUDGET_S = 2.0
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp(prefix="memcontinuum-preedit-watchdog-")
+        self.addCleanup(shutil.rmtree, self.td, ignore_errors=True)
+
+    def _hang_python(self, name):
+        hang_py = Path(self.td) / name
+        hang_py.write_text(
+            "#!/usr/bin/env bash\n"
+            "for a in \"$@\"; do\n"
+            "  case \"$a\" in\n"
+            "    *MC_WATCHDOG_LAUNCHER*) exec \"" + VENV_PYTHON + "\" \"$@\" ;;\n"
+            "  esac\n"
+            "done\n"
+            "sleep 6\n"
+        )
+        hang_py.chmod(0o755)
+        return hang_py
+
+    def test_a_hung_python_is_killed_within_budget_and_hook_exits_0(self):
+        home = Path(self.td) / "home"; home.mkdir()
+        # The `[ ! -f "$DB_PATH" ]` index-missing gate runs BEFORE any
+        # for-path call -- an empty home would exit that gate in
+        # milliseconds without ever reaching hang_py, which would falsely
+        # look like this test passes for the wrong reason. A real (if
+        # empty) db file lets the hang actually happen where for-path is
+        # called, under the watchdog's own guard.
+        (home / "wdtest.sqlite").touch()
+        hang_py = self._hang_python("hang-python")
+        env = clean_env(MEMCONTINUUM_HOME=str(home), MEMCONTINUUM_PYTHON=str(hang_py),
+                         MEMCONTINUUM_PROJECT="wdtest", MEMCONTINUUM_ROOT=str(SCHEMA_FIXTURE_ROOT))
+        payload = json.dumps({
+            "session_id": "s-preedit-wd", "hook_event_name": "PreToolUse", "tool_name": "Edit",
+            "cwd": str(SCHEMA_FIXTURE_ROOT),
+            "tool_input": {"file_path": str(SCHEMA_FIXTURE_ROOT / "x.py")},
+        })
+        proc, elapsed = run_hook(payload, env, timeout=10.0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        deadline = self.WATCHDOG_BUDGET_S + 1.0  # generous slack for process-start overhead
+        self.assertLess(elapsed, deadline,
+                         f"took {elapsed:.3f}s -- the {self.WATCHDOG_BUDGET_S}s watchdog budget must bound this")
+        log_text = (home / "hook.log").read_text()
+        self.assertIn("outcome=watchdog-killed", log_text)
+        self.assertIn("hook=pre-edit-chain.sh", log_text)
+
+    def test_timeout_emits_a_minimal_valid_additional_context_not_silence(self):
+        # Codex's addition: today the launcher exits 0 with EMPTY stdout on
+        # timeout -- Claude Code then reads that as "retrieval ran and
+        # found nothing," indistinguishable from a genuine no-match. A
+        # timeout must produce a real, valid, honest uncertainty signal.
+        home = Path(self.td) / "home2"; home.mkdir()
+        (home / "wdtest.sqlite").touch()
+        hang_py = self._hang_python("hang-python2")
+        env = clean_env(MEMCONTINUUM_HOME=str(home), MEMCONTINUUM_PYTHON=str(hang_py),
+                         MEMCONTINUUM_PROJECT="wdtest", MEMCONTINUUM_ROOT=str(SCHEMA_FIXTURE_ROOT))
+        payload = json.dumps({
+            "session_id": "s-preedit-wd2", "hook_event_name": "PreToolUse", "tool_name": "Edit",
+            "cwd": str(SCHEMA_FIXTURE_ROOT),
+            "tool_input": {"file_path": str(SCHEMA_FIXTURE_ROOT / "x.py")},
+        })
+        proc, elapsed = run_hook(payload, env, timeout=10.0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(proc.stdout.strip(), "a timeout must not leave stdout empty")
+        payload_out = json.loads(proc.stdout)
+        ctx = payload_out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("timed out", ctx.lower())
+        self.assertIn("not established", ctx.lower())
+
+
 POST_COMMIT_HOOK = TOOLS_DIR / "hooks" / "post-commit-reindex.sh"
 
 

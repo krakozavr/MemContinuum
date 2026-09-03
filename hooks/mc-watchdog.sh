@@ -177,6 +177,23 @@ try:
     proc.wait(timeout=budget)
 except subprocess.TimeoutExpired:
     _log_watchdog_kill()
+    # F6 (external-review fix round): opt-in timeout fallback. The child is
+    # killed here before it can write anything of its own to stdout -- for
+    # the six guarded hooks that never set this, `fallback` is None/empty
+    # and this is a no-op, preserving today's silent-on-timeout behavior
+    # unchanged. pre-edit-chain.sh sets MC_WATCHDOG_TIMEOUT_FALLBACK to a
+    # minimal, valid additionalContext JSON payload stating retrieval timed
+    # out and that absence of a decision was NOT established, so Claude
+    # Code reads a real uncertainty signal instead of an empty
+    # additionalContext indistinguishable from "retrieval ran and found
+    # nothing".
+    fallback = os.environ.get("MC_WATCHDOG_TIMEOUT_FALLBACK")
+    if fallback:
+        try:
+            sys.stdout.write(fallback)
+            sys.stdout.flush()
+        except Exception:
+            pass
 # Unconditional group sweep (not just on a timeout): a hung call several
 # layers deep can background a detached descendant that inherits the
 # real stdout/stderr fds, which would otherwise keep those pipes open

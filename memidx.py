@@ -4491,9 +4491,23 @@ def _hook_log_line_kind(rest: str) -> str:
     no hook-type prefix either) never carry `elapsed=` -- without that
     second check those would misclassify as pre-edit lookups and silently
     suppress the INC-0103 FLAG (a real false negative, not a cosmetic
-    miscount)."""
+    miscount).
+
+    F6 (external-review fix round): mc-watchdog.sh's own kill line
+    (`outcome=watchdog-killed hook=<name> project=<p>`) carries no
+    `elapsed=` at all -- the child was killed before it could log its own
+    timing -- so without a dedicated check every guarded hook's watchdog
+    kill falls into the generic "other" bucket below, losing which hook
+    actually timed out. `pre-edit-chain.sh` gets its own targeted match
+    here (same as any other pre-edit-chain outcome line already lands in
+    "pre-edit") so a repeated pre-edit-chain timeout is visible in its own
+    bucket's `outcomes` Counter, not folded away. The other six guarded
+    hooks' watchdog-kill lines are unaffected by this check -- they keep
+    landing in "other", same as before."""
     stripped = rest.strip()
     if stripped.startswith("outcome=") and " elapsed=" in stripped:
+        return "pre-edit"
+    if stripped.startswith("outcome=watchdog-killed") and "hook=pre-edit-chain.sh" in stripped:
         return "pre-edit"
     for kw in _HOOK_LOG_KEYWORDS:
         if stripped.startswith(kw + " ") or stripped == kw:
@@ -4821,6 +4835,11 @@ def _stats_report(
     pre_edit_no_match = pe.get("no-match", 0)
     pre_edit_other = pre_edit_total - pre_edit_matched - pre_edit_no_match
     pre_edit_lookups = pre_edit_matched + pre_edit_no_match
+    # F6: a pre-edit-chain watchdog kill (see _hook_log_line_kind) lands in
+    # this same Counter under its own outcome name -- named here so a
+    # REPEATED timeout pattern can raise its own FLAG below, not just sit
+    # inside the generic `other` count.
+    pre_edit_watchdog_killed = pe.get("watchdog-killed", 0)
 
     led = outcomes["ledger"]
     ledger_code = led.get("appended:code", 0)
@@ -4853,6 +4872,18 @@ def _stats_report(
                 f"FLAG: read side silent — {user_prompts} prompts, no "
                 f"retrieval matched or missed in {args.days}d"
             )
+        # F6: a pre-edit-chain watchdog kill still exits 0 (fail-open) and
+        # still emits a fallback context, so it never trips "read side
+        # silent" above -- but a repeated timeout on THIS specific hook is
+        # its own distinct problem (retrieval is running late enough to be
+        # bounded out, not merely absent) and needs its own visibility.
+        # Threshold mirrors the write-side FLAG's own >=3.
+        if pre_edit_watchdog_killed >= 3:
+            flags.append(
+                f"FLAG: pre-edit-chain timing out — {pre_edit_watchdog_killed} "
+                f"watchdog kills in {args.days}d (retrieval is not completing "
+                f"within its budget)"
+            )
 
     result = {
         "project": args.project,
@@ -4868,6 +4899,7 @@ def _stats_report(
             "other": pre_edit_other,
             "total": pre_edit_total,
             "lookups": pre_edit_lookups,
+            "watchdog_killed": pre_edit_watchdog_killed,
             "outcomes": dict(pe),
         },
         "ledger_appends": {
@@ -4986,7 +5018,8 @@ def cmd_stats(args) -> int:
         pe = result["pre_edit"]
         print(f"pre-edit lookups: matched={pe['matched']} no-match={pe['no_match']} "
               f"(real lookups {pe['lookups']}); other={pe['other']} "
-              f"(failed/never-attempted, not counted as a lookup) -- total lines {pe['total']}")
+              f"(failed/never-attempted, not counted as a lookup) -- total lines {pe['total']}; "
+              f"watchdog-killed={pe['watchdog_killed']}")
         la = result["ledger_appends"]
         print(f"ledger appends: code={la['code']} store={la['store']}")
         print()

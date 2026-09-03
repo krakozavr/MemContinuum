@@ -739,9 +739,40 @@ Python launcher that kills the whole child process group once a budget expires �
 
 Guarded: the five write-side hooks, plus `newfile-nudge.sh` (which has no
 write-side state of its own but shares the same guard rather than growing a
-second bespoke timeout story for the one hook that happens to be fast).
-Unguarded: `pre-edit-chain.sh`, `post-commit-reindex.sh`,
+second bespoke timeout story for the one hook that happens to be fast) and
+`pre-edit-chain.sh`. Unguarded: `post-commit-reindex.sh`,
 `memcontinuum-detect.sh`.
+
+`pre-edit-chain.sh`'s own inner budget is confirmed against a real
+measurement of its wired command line across the engine's own store and two
+other real, live projects' stores, one of them hosted entirely on a slow
+drvfs (`/mnt/c`) mount, code root and store both:
+34 timed samples give an overall p95 of 0.198s and p99 of 0.206s, comfortably
+under the unmodified 2-second default (roughly 10x headroom). Claude Code's
+own per-hook `timeout` field defaults to 600 seconds when unset
+(code.claude.com/docs/en/hooks.md, "Common fields"); `pre-edit-chain.sh`'s
+rendered `"timeout": 5` is a backstop against a hung watchdog itself, not the
+mechanism meant to fire — the inner 2-second budget above is.
+
+Unlike the five write-side hooks, whose timeout costs at most a lost
+reminder, `pre-edit-chain.sh`'s timeout carries an asymmetric cost: it costs
+the one citation this tool exists to put in front of the model before the
+edit lands. Fail-open still applies — the edit proceeds either way — but
+losing that citation is not the same size of loss as a dropped write-side
+nudge.
+
+A timeout on the inner watchdog path emits a minimal `additionalContext`
+stating that retrieval timed out and that the absence of a decision was not
+established, so the model reads an honest uncertainty signal instead of an
+empty context indistinguishable from a genuine no-match. The outer Claude
+Code timeout is a last-resort backstop only and cannot provide this
+fallback, since it discards the hook's output entirely — it guarantees the
+run ends, not that anything useful comes back. Every `pre-edit-chain.sh`
+timeout the inner watchdog wins (the expected case, since it starts before
+and is bounded well under the outer budget) is named in `memidx.py stats`
+output under its own `watchdog-killed` outcome inside the `pre_edit` bucket,
+not folded into a generic one, and a repeated pattern (three or more within
+a window) raises its own FLAG there.
 
 Ordinary coreutils (`cat`, `dirname`, `date`, `mkdir`, …) are used freely — what
 is avoided is specifically the two GNU-only binaries macOS lacks.
