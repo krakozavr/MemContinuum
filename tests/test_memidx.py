@@ -1552,6 +1552,19 @@ class TestF5LinkRows(unittest.TestCase):
             families = {memidx._record_family(conn, memidx.DEFAULT_PROJECT, p) for p in ranked}
             self.assertTrue(any("target.md" in fam for fam in families), (ranked, families))
 
+            # Fix-round item 5 (coordinator review): the families assertion
+            # above proves the FAMILY survives the cap, but not that the
+            # real cmd_search caller-facing path actually resolves that
+            # survivor back to a topic hit ending in "target.md" -- prove
+            # that end to end too.
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                memidx.cmd_search(ns(project=memidx.DEFAULT_PROJECT, db=str(db), query="needle term",
+                                      mode="fts", status=["active"], type=[], area=None, topic=None,
+                                      authority=None, limit=10, json=True))
+            out = json.loads(buf.getvalue())
+            self.assertTrue(any(h["path"].endswith("target.md") for h in out), out)
+
     def test_unfiltered_search_returns_both_topic_and_link_hits_with_no_type_given(self):
         with tempfile.TemporaryDirectory() as td:
             root = self._topic_with_two_links(td)
@@ -1576,15 +1589,32 @@ class TestF5LinkRows(unittest.TestCase):
             self.assertEqual(len(only_link), 2)
 
     def test_status_active_drops_a_declined_only_match(self):
+        # Fix-round item 3 (coordinator review): exercise the IN-QUERY
+        # filter itself (the actual F7 mechanism -- filter_clause applied
+        # inside fts_ranked's own WHERE), not a Python-side post-filter
+        # reimplemented in the test that would stay green even if the
+        # in-query filter regressed to a no-op.
         with tempfile.TemporaryDirectory() as td:
             root = self._topic_with_two_links(td)
             db = Path(td) / "idx.sqlite"
             reindex(root, db, no_embed=True)
             conn = memidx.open_db(db, project=memidx.DEFAULT_PROJECT)
-            ranked = [p for p in memidx.fts_ranked(conn, "sweeper", memidx.DEFAULT_PROJECT)
-                      if p in memidx.filtered_paths(conn, ns(project=memidx.DEFAULT_PROJECT, status=["active"],
-                                                              type=[], area=None, topic=None, authority=None))]
-            self.assertEqual(ranked, [], "a declined-only match must be dropped under --status active, never surfaced")
+            where, params = memidx.build_filter_clause(
+                ns(project=memidx.DEFAULT_PROJECT, status=["active"], type=[], area=None, topic=None, authority=None),
+                include_project=False,
+            )
+            ranked = memidx.fts_ranked(conn, "sweeper", memidx.DEFAULT_PROJECT, where, params)
+            self.assertEqual(ranked, [], "a declined-only match must be dropped by the in-query "
+                                          "status filter, never surfaced")
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                memidx.cmd_search(ns(project=memidx.DEFAULT_PROJECT, db=str(db), query="sweeper",
+                                      mode="fts", status=["active"], type=[], area=None, topic=None,
+                                      authority=None, limit=10, json=True))
+            out = json.loads(buf.getvalue())
+            self.assertEqual(out, [], "cmd_search --status active must return no hits for a "
+                                       "declined-only match")
 
     def test_reindex_check_unmapped_run_twice_report_zero_second_time(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1641,6 +1671,64 @@ class TestF5LinkRows(unittest.TestCase):
                 out = json.loads(buf.getvalue())
             hit = next(h for h in out if h["path"].endswith("t.md"))
             self.assertEqual(hit.get("contributing_link_ids"), {"fts": "L1", "vector": "L2"})
+
+    def test_contributing_link_ids_emitted_when_fts_picks_a_link_and_vector_picks_the_topic(self):
+        # Fix-round item 4 (coordinator review): contributing_link_ids used
+        # to require BOTH channels to have a link representative that
+        # DIFFER -- so the mixed case (one channel's representative is the
+        # plain topic row, the other's is a link row) carried neither
+        # contributing_link_ids nor matched_link_id, silently dropping real
+        # per-channel link information. Fixed: emit whenever AT LEAST ONE
+        # channel's representative is a link row.
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic_with_two_links(td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+            conn = memidx.open_db(db, project=memidx.DEFAULT_PROJECT)
+            topic_path = str(root / "topics" / "t.md")
+            l1_path = conn.execute("SELECT path FROM records WHERE type='link' AND link_id='L1'").fetchone()["path"]
+            conn.close()
+            # fts's representative for the family is the LINK row; vector's
+            # is the plain TOPIC row. fts is processed first, so it also
+            # wins the RRF fusion -- the fused winner IS the link, so
+            # matched_link_id is set too (from the winner's own row).
+            with mock.patch.object(memidx, "fts_ranked", return_value=[l1_path]), \
+                 mock.patch.object(memidx, "vector_ranked", return_value=[(topic_path, 0.9)]):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    memidx.cmd_search(ns(project=memidx.DEFAULT_PROJECT, db=str(db), query="x",
+                                          mode="hybrid", status=[], type=[], area=None, topic=None,
+                                          authority=None, limit=10, json=True))
+                out = json.loads(buf.getvalue())
+            hit = next(h for h in out if h["path"].endswith("t.md"))
+            self.assertEqual(hit.get("contributing_link_ids"), {"fts": "L1"})
+            self.assertEqual(hit.get("matched_link_id"), "L1")
+
+    def test_contributing_link_ids_emitted_when_vector_picks_a_link_and_fts_picks_the_topic(self):
+        # The mirror image of the test above -- fts's representative is the
+        # plain topic row (and wins the fusion, being processed first), so
+        # the fused winner has no link id of its own (matched_link_id is
+        # absent), but contributing_link_ids must still surface the
+        # vector channel's real link-level match.
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic_with_two_links(td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+            conn = memidx.open_db(db, project=memidx.DEFAULT_PROJECT)
+            topic_path = str(root / "topics" / "t.md")
+            l1_path = conn.execute("SELECT path FROM records WHERE type='link' AND link_id='L1'").fetchone()["path"]
+            conn.close()
+            with mock.patch.object(memidx, "fts_ranked", return_value=[topic_path]), \
+                 mock.patch.object(memidx, "vector_ranked", return_value=[(l1_path, 0.9)]):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    memidx.cmd_search(ns(project=memidx.DEFAULT_PROJECT, db=str(db), query="x",
+                                          mode="hybrid", status=[], type=[], area=None, topic=None,
+                                          authority=None, limit=10, json=True))
+                out = json.loads(buf.getvalue())
+            hit = next(h for h in out if h["path"].endswith("t.md"))
+            self.assertEqual(hit.get("contributing_link_ids"), {"vector": "L1"})
+            self.assertIsNone(hit.get("matched_link_id"))
 
     def test_link_row_hit_reports_real_topic_path_and_link_fields(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1839,6 +1927,139 @@ class TestF5LinkRows(unittest.TestCase):
             self.assertEqual(unmapped_out["coverage_status"], "ok",
                               "unmapped must not fall into its stale-index self-heal path when the "
                               "only 'drift' would have been link rows being miscounted as missing files")
+
+    def test_link_topic_path_index_created_on_a_legacy_shaped_db(self):
+        # Fix-round item 1 (coordinator review, IMPORTANT): the index
+        # cannot live in SCHEMA_SQL -- executescript(SCHEMA_SQL) runs
+        # BEFORE ensure_records_link_columns adds the column it would
+        # index, so CREATE INDEX there would fail (or, with IF NOT EXISTS
+        # racing the ALTER, silently never happen) on a legacy-shaped db
+        # that predates link_topic_path. Build a db with the OLD schema
+        # only (no source_path/link_topic_path/link_id at all), then open
+        # it through the real migration path.
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "idx.sqlite"
+            conn = sqlite3.connect(str(db))
+            conn.executescript(memidx.SCHEMA_SQL)
+            conn.commit(); conn.close()
+            conn = memidx.open_db(db, project=memidx.DEFAULT_PROJECT)
+            idx_names = {r[1] for r in conn.execute("PRAGMA index_list(records)").fetchall()}
+            self.assertIn("idx_records_link_topic_path", idx_names, idx_names)
+            conn.close()
+
+    def test_batched_collapse_matches_a_naive_per_row_reference(self):
+        # Fix-round item 2 (coordinator review, IMPORTANT): the batched
+        # family lookup inside fts_ranked/vector_ranked must produce
+        # EXACTLY the same collapsed output as a naive per-row reference
+        # (built here directly against the db, independent of memidx's own
+        # internal helpers) -- proving the batching is a pure performance
+        # change, not a behavior change.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "store"; (root / "topics").mkdir(parents=True)
+            for i in range(30):
+                (root / "topics" / f"t{i:02}.md").write_text(
+                    f"---\ntype: topic\nid: TOP-{i}\ntitle: Topic {i}\nlinks:\n"
+                    f"  - {{link: L1, status: active, ruling: {{text: shared needle term {i}, "
+                    f"authority: owner-verbatim, source: s}}}}\n"
+                    f"  - {{link: L2, status: active, ruling: {{text: shared needle term {i} again, "
+                    f"authority: owner-verbatim, source: s}}}}\n"
+                    "---\nBody.\n"
+                )
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+            conn = memidx.open_db(db, project=memidx.DEFAULT_PROJECT)
+
+            raw = conn.execute(
+                "SELECT fts.path AS path FROM fts JOIN records ON records.path=fts.path "
+                "WHERE fts MATCH ? AND records.project=? ORDER BY bm25(fts) LIMIT 1000",
+                (memidx.fts_escape("shared needle term"), memidx.DEFAULT_PROJECT),
+            ).fetchall()
+            seen = set(); naive = []
+            for r in raw:
+                p = r["path"]
+                row = conn.execute("SELECT link_topic_path FROM records WHERE path=?", (p,)).fetchone()
+                fam = row["link_topic_path"] or p
+                if fam in seen:
+                    continue
+                seen.add(fam); naive.append(p)
+            naive = naive[:200]
+
+            actual = memidx.fts_ranked(conn, "shared needle term", memidx.DEFAULT_PROJECT)
+            self.assertEqual(actual, naive)
+
+    def test_fts_and_vector_ranked_issue_at_most_three_sql_statements_per_channel(self):
+        # Fix-round item 2 (coordinator review, IMPORTANT): _collapse_link_
+        # duplicates/_record_family used to issue one SELECT per ranked
+        # row (up to 1000 in fts_ranked, the whole fresh corpus in
+        # vector_ranked) -- must now be O(1) queries (batched), not O(rows).
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "store"; (root / "topics").mkdir(parents=True)
+            for i in range(30):
+                (root / "topics" / f"t{i:02}.md").write_text(
+                    f"---\ntype: topic\nid: TOP-{i}\ntitle: Topic {i}\nlinks:\n"
+                    f"  - {{link: L1, status: active, ruling: {{text: shared needle term {i}, "
+                    f"authority: owner-verbatim, source: s}}}}\n"
+                    f"  - {{link: L2, status: active, ruling: {{text: shared needle term {i} again, "
+                    f"authority: owner-verbatim, source: s}}}}\n"
+                    "---\nBody.\n"
+                )
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=False)
+            conn = memidx.open_db(db, project=memidx.DEFAULT_PROJECT)
+            # Two kinds of statement traffic this count must NOT charge to
+            # fts_ranked/vector_ranked themselves: (1) FTS5's own virtual-
+            # table implementation issues internal shadow-table statements
+            # per MATCH query (segment b-tree traversal etc.), always
+            # prefixed "--" in the trace -- filtered out below; (2) SQLite/
+            # FTS5 issue a one-time PRAGMA + fts_config bootstrap the FIRST
+            # time the fts5 module is touched on a connection -- a warm-up
+            # call (untraced) absorbs that before the real, traced call, so
+            # the count reflects each function's own PER-CALL marginal SQL,
+            # which is what "batched, not one-query-per-row" actually means.
+            memidx.fts_ranked(conn, "shared needle term", memidx.DEFAULT_PROJECT)
+            memidx.vector_ranked(conn, "shared needle term", memidx.DEFAULT_PROJECT)
+            stmts: list[str] = []
+            conn.set_trace_callback(lambda sql: stmts.append(sql))
+            try:
+                stmts.clear()
+                memidx.fts_ranked(conn, "shared needle term", memidx.DEFAULT_PROJECT)
+                top = [s for s in stmts if not s.strip().startswith("--")]
+                self.assertLessEqual(len(top), 3, f"fts_ranked issued {top}")
+                stmts.clear()
+                memidx.vector_ranked(conn, "shared needle term", memidx.DEFAULT_PROJECT)
+                top = [s for s in stmts if not s.strip().startswith("--")]
+                self.assertLessEqual(len(top), 3, f"vector_ranked issued {top}")
+            finally:
+                conn.set_trace_callback(None)
+
+    def test_migration_probe_treats_a_corrupted_generation_stamp_as_older(self):
+        # Fix-round item 6 (coordinator review): int(gen_row[0]) on a
+        # corrupted stamp used to raise ValueError, escaping the probe's
+        # own `except sqlite3.OperationalError` and crashing the whole
+        # reindex. A non-integer stamp must be treated as older than
+        # current (force the content rewrite) with a warning, not crash.
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic_with_two_links(td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+            conn = sqlite3.connect(str(db))
+            conn.execute("UPDATE db_meta SET value='garbage' WHERE key='index_generation'")
+            conn.commit(); conn.close()
+
+            err_buf = io.StringIO()
+            out_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf), contextlib.redirect_stdout(out_buf):
+                rc = memidx.cmd_reindex(ns(root=str(root), db=str(db), project=memidx.DEFAULT_PROJECT,
+                                            full=False, no_embed=True, auto=False))
+            self.assertEqual(rc, 0, err_buf.getvalue())
+            self.assertIn("garbage", err_buf.getvalue())
+
+            conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
+            gen = conn.execute("SELECT value FROM db_meta WHERE key='index_generation'").fetchone()
+            self.assertEqual(gen["value"], str(memidx.CURRENT_INDEX_GENERATION))
+            link_row = conn.execute("SELECT 1 FROM records WHERE type='link' AND link_id='L1'").fetchone()
+            self.assertIsNotNone(link_row, "the corrupted-stamp pass must still be treated as a "
+                                            "migration -- link rows must still be present")
 
 
 if __name__ == "__main__":

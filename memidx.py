@@ -505,6 +505,19 @@ def ensure_records_link_columns(conn: sqlite3.Connection) -> bool:
     if "link_id" not in cols:
         conn.execute("ALTER TABLE records ADD COLUMN link_id TEXT")
         added = True
+    # Fix-round item 1 (coordinator review, IMPORTANT): this index cannot
+    # live in SCHEMA_SQL -- open_db's executescript(SCHEMA_SQL) runs BEFORE
+    # this guard adds link_topic_path, so a CREATE INDEX there would fail
+    # outright on a legacy-shaped db (the column doesn't exist yet at that
+    # point). CREATE INDEX IF NOT EXISTS here is always safe/idempotent,
+    # run unconditionally (not gated on `added`) so a db that already had
+    # the columns from an earlier partial migration but never got the
+    # index still gets it now. _record_family/_collapse_link_duplicates's
+    # batched WHERE path IN (...) lookups still scan by PRIMARY KEY (path);
+    # this index is what makes _search_hits' hybrid-mode reverse lookups
+    # (family membership by link_topic_path) and any future "every link
+    # under this topic" query cheap.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_records_link_topic_path ON records(link_topic_path)")
     return added
 
 
@@ -539,11 +552,50 @@ def _link_embed_items(rec: dict) -> list[tuple[str, str, str]]:
 def _record_family(conn, project: str, path: str) -> str:
     """A link row's own parent topic path, else the path itself -- the key
     that _collapse_link_duplicates/RRF group by so a topic and its own
-    link rows are never scored as unrelated hits."""
+    link rows are never scored as unrelated hits. A single-path lookup --
+    used only where the caller already has a small, bounded set (cmd_
+    search's own per-result-row loop, capped at args.limit); anything
+    iterating a whole ranked candidate list uses _batch_record_meta below
+    instead (fix-round item 2: one query per row here does not scale to
+    up to 1000 candidates)."""
     row = conn.execute(
         "SELECT link_topic_path FROM records WHERE project=? AND path=?", (project, path)
     ).fetchone()
     return row["link_topic_path"] if row and row["link_topic_path"] else path
+
+
+def _batch_record_meta(conn, project: str, paths: list[str]) -> dict[str, dict]:
+    """path -> {"family": ..., "type": ..., "link_id": ...} for every path
+    in `paths`, fetched in as few queries as the SQLite host-parameter
+    limit allows -- ONE query per chunk of paths (chunk size comfortably
+    under SQLite's default ~999 host-parameter limit), not one query per
+    path. Fix-round item 2 (coordinator review, IMPORTANT):
+    _collapse_link_duplicates/_record_family used to issue a SELECT per
+    ranked candidate (up to 1000 in fts_ranked, the whole fresh corpus in
+    vector_ranked), and _search_hits' hybrid branch added a second SELECT
+    per item per channel (record_row_by_path) on top of that. `type`/
+    `link_id` are fetched alongside `family` so _search_hits' hybrid
+    fusion (which needs to know whether a path is a link row, and which
+    link, for contributing_link_ids) is served by this SAME batched query
+    instead of a second N-query pass."""
+    out: dict[str, dict] = {}
+    uniq = list(dict.fromkeys(paths))   # de-dup, preserve first-seen order
+    CHUNK = 500
+    for i in range(0, len(uniq), CHUNK):
+        chunk = uniq[i:i + CHUNK]
+        placeholders = ",".join("?" * len(chunk))
+        rows = conn.execute(
+            f"SELECT path, link_topic_path, type, link_id FROM records "
+            f"WHERE project=? AND path IN ({placeholders})",
+            [project, *chunk],
+        ).fetchall()
+        for r in rows:
+            out[r["path"]] = {
+                "family": r["link_topic_path"] if r["link_topic_path"] else r["path"],
+                "type": r["type"],
+                "link_id": r["link_id"],
+            }
+    return out
 
 
 def _collapse_link_duplicates(conn, project: str, ranked_paths: list[str]) -> list[str]:
@@ -552,11 +604,13 @@ def _collapse_link_duplicates(conn, project: str, ranked_paths: list[str]) -> li
     SEPARATELY, INSIDE fts_ranked/vector_ranked -- BEFORE their own cap and
     before RRF fusion (ruling 71): collapsing only a fused list lets the
     two per-mode lists pick different family winners and split credit
-    right back apart."""
+    right back apart. Batched (fix-round item 2): one query for the whole
+    candidate list via _batch_record_meta, not one query per row."""
+    meta = _batch_record_meta(conn, project, ranked_paths)
     seen: set[str] = set()
     out = []
     for p in ranked_paths:
-        fam = _record_family(conn, project, p)
+        fam = meta[p]["family"] if p in meta else p
         if fam in seen:
             continue
         seen.add(fam)
@@ -890,8 +944,31 @@ def cmd_reindex(args) -> int:
                 gen_row = probe.execute(
                     "SELECT value FROM db_meta WHERE key='index_generation'"
                 ).fetchone()
-                if gen_row is not None and int(gen_row[0]) < CURRENT_INDEX_GENERATION:
-                    migrated = True
+                if gen_row is not None:
+                    # Fix-round item 6 (coordinator review): a corrupted
+                    # stamp must not crash the whole reindex -- int() on
+                    # garbage raises ValueError, which is NOT a
+                    # sqlite3.OperationalError and would otherwise escape
+                    # the except below uncaught. Treat "not a valid
+                    # integer" the same as "older than current": force the
+                    # full content pass (the safe direction -- a corrupted
+                    # stamp is evidence this db's own bookkeeping cannot be
+                    # trusted, so re-parsing everything is strictly safer
+                    # than trusting a row count / sha match that might
+                    # itself be from a half-written state).
+                    try:
+                        generation = int(gen_row[0])
+                    except (TypeError, ValueError):
+                        print(
+                            f"reindex: index_generation stamp {gen_row[0]!r} is not a valid "
+                            f"integer -- treating the index as older than current and forcing "
+                            f"a full content pass",
+                            file=sys.stderr,
+                        )
+                        migrated = True
+                    else:
+                        if generation < CURRENT_INDEX_GENERATION:
+                            migrated = True
         except sqlite3.OperationalError:
             pass
         finally:
@@ -1262,17 +1339,23 @@ def _search_hits(conn, args, extra_where: str, extra_params: list) -> tuple[list
     elif args.mode == "hybrid":
         fts_list = fts_ranked(conn, args.query, args.project, extra_where, extra_params)
         vec_list = [p for p, _ in vector_ranked(conn, args.query, args.project, extra_where, extra_params)]
+        # Fix-round item 2 (coordinator review): ONE batched query for
+        # both channels' combined candidate set, replacing what used to be
+        # a _record_family call PLUS a record_row_by_path call per item
+        # per channel (two N-query passes on top of fts_ranked/
+        # vector_ranked's own now-batched internal collapse).
+        meta = _batch_record_meta(conn, args.project, fts_list + vec_list)
         k = 60
         scores: dict[str, float] = {}
         family_winner: dict[str, str] = {}
         for channel_name, lst in (("fts", fts_list), ("vector", vec_list)):
             for i, p in enumerate(lst):
-                fam = _record_family(conn, args.project, p)
+                m = meta.get(p) or {"family": p, "type": None, "link_id": None}
+                fam = m["family"]
                 scores[fam] = scores.get(fam, 0.0) + 1.0 / (k + i + 1)
                 family_winner.setdefault(fam, p)
-                row = record_row_by_path(conn, p)
-                if row is not None and row["type"] == "link":
-                    contributing.setdefault(fam, {})[channel_name] = row["link_id"]
+                if m["type"] == "link":
+                    contributing.setdefault(fam, {})[channel_name] = m["link_id"]
         results = sorted(((family_winner[fam], s) for fam, s in scores.items()), key=lambda t: t[1], reverse=True)
     else:
         raise ValueError(f"unknown mode {args.mode}")
@@ -1318,12 +1401,21 @@ def cmd_search(args) -> int:
             entry["link_authority"] = row["authority"]
         fam = _record_family(conn, args.project, path)
         links_by_channel = contributing.get(fam)
-        if links_by_channel and len(set(links_by_channel.values())) > 1:
-            # Codex's addition: a single matched_link_id is ambiguous
-            # exactly when the FTS channel's best-ranked family member and
-            # the vector channel's are DIFFERENT links -- single-mode
-            # fts/vector search never hits this (only one channel, no
-            # disagreement possible).
+        if links_by_channel:
+            # Fix-round item 4 (coordinator review): emit whenever AT
+            # LEAST ONE channel's own representative for this family is a
+            # link row -- not only when both channels picked a link AND
+            # those links differ. The old `len(...) > 1` gate silently
+            # dropped real per-channel link information the moment one
+            # channel's representative was the plain topic row (mixed
+            # case: one channel matched a specific link, the other only
+            # matched the topic's own aggregate text) -- that hit carried
+            # neither contributing_link_ids nor (when the fused winner was
+            # the topic) matched_link_id, even though a genuine per-link
+            # match existed on one channel. Single-mode fts/vector search
+            # still never reaches here (contributing stays {} -- only
+            # hybrid mode populates it), so a plain link-row hit's own
+            # matched_link_id (set above) is not duplicated by this field.
             entry["contributing_link_ids"] = links_by_channel
         out.append(entry)
 
