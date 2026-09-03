@@ -1143,10 +1143,12 @@ Every reader opens the file with `open_db_noncreating` — a genuinely
 non-creating SQLite URI (`mode=rw`) — never `open_db`'s create-on-connect path,
 which closes a TOCTOU window a plain `exists()` check followed by `connect()`
 still had (the file could be created by a race between the two calls). `root`
-is only ever passed by `check` — the one reader that walks the store's own
-markdown tree — so every other reader (`search`, `chain`, `for-path`, `drift`,
-`unmapped`) can report `upgrade-required` but never `stale`; they have nothing
-to walk in the first place.
+is passed by the two readers that walk the store's own markdown tree —
+`check` always, and `unmapped` (which takes its own `--root`) — so only these
+two can ever see `stale`; `unmapped` branches on it to self-heal (below).
+`search`, `chain`, `for-path` and `drift` never pass a `root` at all — they
+have nothing to walk — so `decision_index_state` can report `upgrade-required`
+for them but never `stale`.
 
 **A positive match off a non-`current` index stays usable; a negative claim
 does not.** `upgrade-required` and `stale` both warn and proceed — a hit found
@@ -1173,10 +1175,13 @@ or a `sqlite3.Row` access on a renamed column). `upgrade-required`/`stale`/
 `missing`/`uninitialized` (exit `1`, `--json` still emits a real `{"state":
 ..., "results": []}` envelope on stdout so a caller piping stdout still learns
 why) and one `_decision_warn` (stderr only) on `upgrade-required`/`stale`.
-`unmapped` and the hooks that call it never exit non-zero for a state alone —
-they report `coverage_status` instead and always exit fail-open — see
-`hooks/userprompt-remind.sh`/`precompact-persist.sh`'s `index-uninitialized`/
-`index-upgrade-required`/`index-error` outcome lines in
+`unmapped` itself exits `1` whenever `coverage_status != "ok"` (a state alone
+is enough — no candidate path even needs to be unmapped); the hooks that call
+it (`userprompt-remind.sh`'s coverage check, `precompact-persist.sh`) treat
+either exit `0` or `1` as a normal, fail-open answer — only an actual
+exception invoking it would make them fail open on the hook's own contract —
+and log the `coverage_status` they got as their own `index-uninitialized`/
+`index-upgrade-required`/`index-error` outcome line; see
 [Hooks and the fail-open contract](#hooks-and-the-fail-open-contract) above.
 
 **Embeddings are never silently stale.** `embeddings.embed_sha` records the
@@ -1325,8 +1330,10 @@ down:
   byte-for-byte reproduction.
 
   **F9 — `edges_for_topic` is presentation, not reasoning.** It exists to feed
-  `chain`'s own indented edge lines (`edges_for_topic` → `chain_lines` /
-  `topic_chain_json`); nothing in `search`, `drift`'s HOLD/CONSTRAINT
+  `chain`'s own indented edge lines: its only three callers — `cmd_chain`
+  (which passes the result into `chain_lines`/`chain_json`), `topic_chain_json`,
+  and `print_topic_chain` — all exist to display a chain, never to decide
+  anything from it. Nothing in `search`, `drift`'s HOLD/CONSTRAINT
   classification, or hybrid ranking ever reads the `edges` table — a typed
   cross-reference is shown to a reader, never consulted by the engine to decide
   anything. A dedicated traversal view over the edge graph itself (following

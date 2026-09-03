@@ -45,8 +45,8 @@ over. Every hook here fails open: a missing index, a missing python, a failed
 lookup, or the hook running too long means the hook stays silent (or, on a
 timeout specifically, says outright that retrieval timed out rather than
 staying silent) — never that your edit is blocked. That lookup runs under a
-tight watchdog deadline measured in the low tenths of a second, comfortably
-above what a real lookup takes; a stale-but-present index is not one of the
+2-second watchdog deadline — a real lookup measures in the low tenths of a
+second, comfortably under it; a stale-but-present index is not one of the
 fail-open cases: it still answers from whatever it has, which is why keeping
 it current (`reindex`, or just committing the store) is worth doing. Nothing
 in this tool can stop you from working.
