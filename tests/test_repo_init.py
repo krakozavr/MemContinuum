@@ -1602,6 +1602,52 @@ class TestBootstrapVenv(unittest.TestCase):
             shutil.rmtree(engine_dir, ignore_errors=True)
             shutil.rmtree(fakebin, ignore_errors=True)
 
+    def test_bootstrap_prefers_requirements_lock_when_present(self):
+        # task-9: bootstrap_venv must install from the exact-pinned
+        # requirements.lock when one sits next to requirements.txt (CI and
+        # a real repo checkout both ship one), not the loose >= file.
+        home = sandbox_home()
+        engine_dir = tempfile.mkdtemp(prefix="memcontinuum-engine-copy-")
+        fakebin = tempfile.mkdtemp(prefix="memcontinuum-fakebin-")
+        try:
+            install_sh = copy_engine(engine_dir)
+            (Path(engine_dir) / "requirements.lock").write_text("fastembed==0.8.0\nPyYAML==6.0.3\n")
+
+            record = Path(fakebin) / "uv-invocations.log"
+            fake_uv = Path(fakebin) / "uv"
+            fake_uv.write_text(
+                "#!/usr/bin/env bash\n"
+                f'printf \'%s\\n\' "$*" >> "{record}"\n'
+                'if [ "$1" = "venv" ]; then\n'
+                '    dir="$2"\n'
+                '    mkdir -p "$dir/bin"\n'
+                f'    printf \'#!/usr/bin/env bash\\nexec "{VENV_PYTHON}" "$@"\\n\' > "$dir/bin/python"\n'
+                '    chmod +x "$dir/bin/python"\n'
+                '    exit 0\n'
+                'fi\n'
+                'exit 0\n'
+            )
+            fake_uv.chmod(0o755)
+
+            store = str(Path(home) / "store")
+            venv_dir = str(Path(home) / "bootstrapped-venv")
+            proc = run_install_at(
+                install_sh,
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude"),
+                 "--bootstrap-venv", venv_dir],
+                home,
+                path_prepend=[fakebin],
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+            invocations = record.read_text()
+            self.assertIn("requirements.lock", invocations)
+            self.assertNotIn("requirements.txt", invocations)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+            shutil.rmtree(engine_dir, ignore_errors=True)
+            shutil.rmtree(fakebin, ignore_errors=True)
+
     def test_bootstrap_falls_back_to_python3_venv_and_pip_when_no_uv(self):
         # A real venv-python shim, written by a small static helper script
         # (not inlined into fake_python3 below) so there is only one level

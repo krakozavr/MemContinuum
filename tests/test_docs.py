@@ -37,6 +37,7 @@ STORE_README_TMPL = TOOLS_DIR / "templates" / "store-README.md.tmpl"
 RULES_TEMPLATE = TOOLS_DIR / "templates" / "memcontinuum-rules.md"
 SCHEMA = TOOLS_DIR / "docs" / "SCHEMA.md"
 PYPROJECT = TOOLS_DIR / "pyproject.toml"
+CHANGELOG = TOOLS_DIR / "CHANGELOG.md"
 
 # This repo dogfoods its own installer: .claude/skills/<name>/SKILL.md is the
 # INSTALLED copy that Claude Code actually loads in this checkout. It is a
@@ -102,7 +103,7 @@ FORBIDDEN = [
 
 PUBLIC_DOCS = [
     README, INTERNALS, DESIGN, SKILL, SEARCH_SKILL, INSTALL_HOOKS,
-    STORE_README_TMPL, RULES_TEMPLATE, SCHEMA, PYPROJECT,
+    STORE_README_TMPL, RULES_TEMPLATE, SCHEMA, PYPROJECT, CHANGELOG,
 ] + INSTALLED_SKILLS
 
 
@@ -751,7 +752,7 @@ class TestDoctrineMachineryCoversDocsRound7Files(unittest.TestCase):
     def test_public_docs_includes_the_files_task_8_writes_into(self):
         names = {str(p) for p in PUBLIC_DOCS}
         for rel in ("templates/store-README.md.tmpl", "templates/memcontinuum-rules.md",
-                    "docs/SCHEMA.md", "pyproject.toml"):
+                    "docs/SCHEMA.md", "pyproject.toml", "CHANGELOG.md"):
             self.assertTrue(any(rel in n for n in names), f"{rel} missing from PUBLIC_DOCS")
 
     def test_forbidden_catches_a_store_record_id_and_a_finding_code_label(self):

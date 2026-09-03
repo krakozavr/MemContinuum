@@ -1,0 +1,64 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        # requirements.lock (uv pip compile, exact pins + hashes) is what
+        # actually ships -- requirements.txt itself uses >= minimums and is
+        # not what CI (or scripts/repo-init.sh's bootstrap_venv, which
+        # prefers the lock the same way) installs from.
+        run: pip install -r requirements.lock
+      - name: Cache fastembed model
+        uses: actions/cache@v4
+        with:
+          # fastembed 0.8.0's own default (fastembed.common.utils.
+          # define_cache_dir): tempfile.gettempdir()/fastembed_cache, i.e.
+          # /tmp/fastembed_cache on a standard Linux runner -- NOT
+          # ~/.cache/fastembed, which this package never uses unless
+          # FASTEMBED_CACHE_PATH is set (this repo doesn't set it).
+          path: /tmp/fastembed_cache
+          key: fastembed-model-v1
+      - name: Run unittest suite
+        # Same shell step resolves `python` for BOTH the interpreter that
+        # just received `pip install -r requirements.lock` and the one
+        # tests/test_hooks.py's subprocess-hook tests actually run under
+        # (they gate on MEMCONTINUUM_PYTHON being non-empty, then RUN --
+        # a hardcoded path here would diverge from whatever
+        # actions/setup-python put on PATH and break that gate silently).
+        run: |
+          MEMCONTINUUM_PYTHON="$(command -v python)" PYTHONPATH= python -m unittest discover -s tests
+
+  bash32:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.lock
+      - name: Cache bash 3.2 build
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/bash32
+          key: bash32-3.2.57-v1
+      - name: Run bash 3.2 verification harness
+        # tests/run_bash32.sh builds bash 3.2.57 from source into
+        # ~/.cache/bash32 (gcc/make/bison, cached above) and re-runs the
+        # shell-driving suites under it. This has been simulated locally in
+        # a clean-cache build on this same ubuntu toolchain shape before
+        # this workflow was committed (see the task-9 report), so it is NOT
+        # marked continue-on-error.
+        run: |
+          MEMCONTINUUM_PYTHON="$(command -v python)" bash tests/run_bash32.sh

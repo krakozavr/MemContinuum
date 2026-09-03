@@ -52,6 +52,14 @@ build_bash32() {
     log "== building bash $BASH32_VERSION into $INSTALL_ROOT (one-time) =="
     mkdir -p "$BUILD_ROOT/src" "$BUILD_ROOT/debs" "$BUILD_ROOT/extracted" "$INSTALL_ROOT/bin"
 
+    # A bare CI runner's apt package lists may be empty or stale -- without
+    # this refresh, the fetch below fails silently (its own `|| true`
+    # swallows the error) and the toolchain never lands, so the build fails
+    # later with a much less obvious "make: command not found". Best-effort:
+    # a runner with a pre-populated apt cache, or no `apt-get` at all on a
+    # non-Debian host, must not fail the build over this.
+    apt-get update >/dev/null 2>&1 || true
+
     # Fetch a minimal, self-contained build toolchain (make/bison/m4) via
     # `apt-get download` + `dpkg-deb --extract` -- neither needs root, so
     # this works even on a machine with no system compiler toolchain
@@ -78,6 +86,18 @@ exec "$ext/usr/bin/bison" -y "\$@"
 YACC
             chmod +x "$ext/usr/bin/yacc"
         fi
+    fi
+    if [ -x "$ext/usr/bin/bison" ]; then
+        # configure's AC_PROG_YACC finds this extracted `bison` directly on
+        # PATH (it now ranks ahead of the plain-"yacc" case above) and wires
+        # YACC="bison -y" literally into the Makefile -- calling the binary
+        # straight, never through the wrapper script above that sets this
+        # same variable. Without it exported here too, the extracted bison
+        # looks for its skeleton/m4sugar files under its compiled-in default
+        # (the SYSTEM /usr/share/bison, which does not exist on a bare
+        # runner with no system bison installed) and fails every grammar
+        # file with "cannot open ... m4sugar.m4" (reproduced).
+        export BISON_PKGDATADIR="$ext/usr/share/bison"
     fi
     if [ -x "$ext/usr/bin/m4" ]; then
         export M4="$ext/usr/bin/m4"
