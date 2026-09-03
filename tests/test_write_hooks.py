@@ -12,6 +12,7 @@ logic in Python.
 """
 import contextlib
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -3843,6 +3844,27 @@ class TestNewFileNudgeHook(unittest.TestCase):
         proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("New source file under", proc.stdout, proc.stdout)
+
+
+class TestF2AutoCallers(unittest.TestCase):
+    """F2 (coordinator ruling 69): the exactly-two --auto callers --
+    unmapped's in-process self-heal and precompact-persist.sh's direct
+    reindex call -- and repo-init.sh's install-time reindex staying an
+    explicit --no-embed initializer without --auto."""
+
+    def test_unmapped_self_heal_passes_auto(self):
+        src = inspect.getsource(memidx.cmd_unmapped)
+        self.assertIn("auto=True", src)
+
+    def test_precompact_persist_reindex_call_passes_auto(self):
+        text = (TOOLS_DIR / "hooks" / "precompact-persist.sh").read_text()
+        self.assertIn("--auto", text)
+
+    def test_repo_init_install_time_reindex_does_not_pass_auto(self):
+        text = (TOOLS_DIR / "scripts" / "repo-init.sh").read_text()
+        line = next(l for l in text.splitlines() if "REINDEX_CMD=" in l and "code-reindex" not in l)
+        self.assertIn("--no-embed", line)
+        self.assertNotIn("--auto", line)
 
 
 if __name__ == "__main__":

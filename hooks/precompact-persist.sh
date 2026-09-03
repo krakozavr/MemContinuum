@@ -15,10 +15,12 @@
 #   - for ledger entries under the code root: runs `memidx.py unmapped`
 #     (self-healing: check -> reindex --no-embed on drift) to classify them
 #   - for ledger entries under the store root with no code entries present:
-#     runs a plain `memidx.py reindex --no-embed` directly, so store-only
-#     edits still get reconciled into the index even with nothing to check
-#     coverage for (ruling E: "store edits trigger RECONCILIATION, not
-#     reminders")
+#     runs a plain `memidx.py reindex --no-embed --auto` directly, so
+#     store-only edits still get reconciled into the index even with
+#     nothing to check coverage for (ruling E: "store edits trigger
+#     RECONCILIATION, not reminders") -- --auto (ruling 69) keeps
+#     embedding_mode untouched, since this hook-triggered heal never
+#     re-embeds
 #   - compares the code/store roots' current git HEAD against the session's
 #     start_code_sha/start_store_sha (captured by sessionstart-remind.sh)
 #   - writes the result to state.pending, replacing whatever was there
@@ -150,7 +152,7 @@ if [ "${#CODE_PATHS[@]}" -eq 0 ]; then
     if [ "$STORE_TOUCHED" = "true" ] && [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
         env PYTHONPATH= "$MC_PY" "$MC_MEMIDX" reindex \
             --root "$MEMCONTINUUM_ROOT" --project "$MC_PROJECT" --db "$MC_DB_PATH" \
-            --no-embed >>"$MC_LOG" 2>&1
+            --no-embed --auto >>"$MC_LOG" 2>&1
     fi
 fi
 

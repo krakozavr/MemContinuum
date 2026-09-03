@@ -809,5 +809,152 @@ class TestF1DecisionIndexState(unittest.TestCase):
             self.assertEqual(json.loads(buf.getvalue())["coverage_status"], "index-error")
 
 
+class TestF2EmbeddingMode(unittest.TestCase):
+    """F2 (coordinator ruling 69): embed_sha provenance, the freshness join
+    excluding a stale vector from ranking, --auto never writing
+    embedding_mode, and the none/partial/full mode derived from real
+    coverage on every non-auto reindex."""
+
+    def _topic(self, td, text="alpha decision"):
+        # NOTE (deviation from the brief's literal fixture, verified
+        # empirically): embed_text_for(rec) is title+body only (pre-round,
+        # unchanged by this task) -- it never reads ruling_text. The
+        # brief's own fixture put the varying `text` param into the
+        # ruling field and left the body constant ("body text\n"), so a
+        # test asserting the RE-embedded vector differs after a content
+        # edit would never see any change to the actual embedded input.
+        # `text` goes into the body here instead; the ruling field is a
+        # fixed placeholder. The existing `.replace("alpha decision", ...)`
+        # callers below still work unchanged -- they match the whole file
+        # text, not a specific frontmatter field.
+        root = Path(td) / "root"; (root / "topics").mkdir(parents=True)
+        p = root / "topics" / "t.md"
+        p.write_text(
+            "---\ntype: topic\nid: TOP-1\ntitle: T\nlinks:\n"
+            "  - link: L1\n    status: active\n    ruling: {text: \"r\", authority: owner-verbatim, source: s}\n"
+            f"---\n{text}\n"
+        )
+        return root
+
+    def _emb(self, db, path):
+        conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT embed_sha, vector FROM embeddings WHERE path=?", (path,)).fetchone()
+        conn.close(); return row
+
+    def _rec_sha(self, db, path):
+        conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
+        r = conn.execute("SELECT sha256 FROM records WHERE path=?", (path,)).fetchone()
+        conn.close(); return r["sha256"]
+
+    def _mode(self, db):
+        conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
+        r = conn.execute("SELECT value FROM db_meta WHERE key='embedding_mode'").fetchone()
+        conn.close(); return r["value"] if r else "none"
+
+    def test_stale_vector_is_kept_physically_but_excluded_from_ranking(self):
+        # Ruling 69's central point, tested through the REAL search path
+        # (not just the embeddings table) -- a stale vector must never
+        # rank at all, not merely rank lower.
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic(td, text="the widget cache invalidates on write"); db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=False)
+            path = str(root / "topics" / "t.md")
+            row1 = self._emb(db, path)
+            self.assertIsNotNone(row1)
+            conn = memidx.open_db(db, project=memidx.DEFAULT_PROJECT)
+            fresh_ranked = memidx.vector_ranked(conn, "widget cache invalidates on write", memidx.DEFAULT_PROJECT)
+            conn.close()
+            self.assertTrue(any(p == path for p, _ in fresh_ranked),
+                             "a fresh vector must actually rank -- positive control for the JOIN below")
+            (root / "topics" / "t.md").write_text(
+                (root / "topics" / "t.md").read_text().replace(
+                    "the widget cache invalidates on write", "an unrelated sentence about nothing"
+                )
+            )
+            reindex(root, db, no_embed=True)
+            row2 = self._emb(db, path)
+            self.assertIsNotNone(row2, "a changed record's embedding must be kept physically, not deleted, under --no-embed")
+            self.assertEqual(row2["vector"], row1["vector"])
+            self.assertNotEqual(row2["embed_sha"], self._rec_sha(db, path), "the kept vector is now stale")
+            conn = memidx.open_db(db, project=memidx.DEFAULT_PROJECT)
+            ranked = memidx.vector_ranked(conn, "widget cache invalidates on write", memidx.DEFAULT_PROJECT)
+            self.assertFalse(any(p == path for p, _ in ranked),
+                              "a stale vector must be invisible to ranking, not merely scored lower")
+            reindex(root, db, no_embed=False)
+            row3 = self._emb(db, path)
+            self.assertEqual(row3["embed_sha"], self._rec_sha(db, path))
+            self.assertNotEqual(row3["vector"], row1["vector"])
+            conn = memidx.open_db(db, project=memidx.DEFAULT_PROJECT)
+            reranked = memidx.vector_ranked(conn, "unrelated sentence about nothing", memidx.DEFAULT_PROJECT)
+            conn.close()
+            self.assertTrue(any(p == path for p, _ in reranked),
+                             "the re-embedded row must be fresh again and rank -- positive control")
+
+    def test_mode_tracks_none_partial_full(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic(td); db = Path(td) / "idx.sqlite"
+            second = root / "topics" / "second.md"
+            second.write_text(
+                "---\ntype: topic\nid: TOP-2\ntitle: T2\nlinks:\n"
+                "  - link: L1\n    status: active\n    ruling: {text: \"second\", authority: owner-verbatim, source: s}\n"
+                "---\nbody\n"
+            )
+            reindex(root, db, no_embed=False)
+            self.assertEqual(self._mode(db), "full")
+            second.write_text(second.read_text().replace("second", "second-edited"))
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                reindex(root, db, no_embed=True)   # one of two records now stale
+            self.assertEqual(self._mode(db), "partial")
+            self.assertIn("embedding mode set to partial", buf.getvalue())
+            reindex(root, db, no_embed=False)
+            self.assertEqual(self._mode(db), "full")
+
+    def test_mode_reaches_none_when_no_record_has_a_fresh_vector(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic(td); db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=False)
+            (root / "topics" / "t.md").write_text(
+                (root / "topics" / "t.md").read_text().replace("alpha decision", "gamma decision")
+            )
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                reindex(root, db, no_embed=True)
+            self.assertEqual(self._mode(db), "none")
+            self.assertIn("embedding mode set to none", buf.getvalue())
+
+    def test_auto_never_writes_mode_but_leaves_a_real_gap_until_the_next_full_reindex(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic(td); db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=False)
+            self.assertEqual(self._mode(db), "full")
+            (root / "topics" / "t.md").write_text(
+                (root / "topics" / "t.md").read_text().replace("alpha decision", "delta decision")
+            )
+            args = ns(root=str(root), db=str(db), project=memidx.DEFAULT_PROJECT,
+                       full=False, no_embed=True, auto=True)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                memidx.cmd_reindex(args)
+            self.assertEqual(self._mode(db), "full", "an --auto heal must never write embedding_mode at all")
+            self.assertNotIn("embedding mode set to", buf.getvalue())
+            path = str(root / "topics" / "t.md")
+            self.assertNotEqual(self._emb(db, path)["embed_sha"], self._rec_sha(db, path))
+            reindex(root, db, no_embed=False)
+            self.assertEqual(self._emb(db, path)["embed_sha"], self._rec_sha(db, path))
+
+    def test_unchanged_sha_skip_still_requires_a_matching_embed_sha(self):
+        # the skip predicate is sha AND embed_sha match -- not sha alone.
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic(td); db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)   # record exists, no embedding at all
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                reindex(root, db, no_embed=False)
+            self.assertIn("1 embedding(s) backfilled", buf.getvalue())
+            path = str(root / "topics" / "t.md")
+            self.assertIsNotNone(self._emb(db, path))
+
+
 if __name__ == "__main__":
     unittest.main()

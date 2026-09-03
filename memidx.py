@@ -447,6 +447,16 @@ def enforce_project_isolation(conn: sqlite3.Connection, db_path: Path, project: 
         )
 
 
+def ensure_embeddings_embed_sha_column(conn: sqlite3.Connection) -> None:
+    """Migration guard shaped like ensure_links_invariant_column: an
+    embeddings row must remember the record sha it was computed FROM
+    (Ruling 69's `embed_sha`), or the freshness join below has nothing to
+    compare against and a stale vector can never be excluded from ranking."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(embeddings)").fetchall()}
+    if "embed_sha" not in cols:
+        conn.execute("ALTER TABLE embeddings ADD COLUMN embed_sha TEXT")
+
+
 def _run_decision_migration_guards(conn: sqlite3.Connection, db_path: Path, project: str | None) -> None:
     """Every additive-ALTER migration guard for the decision index, run
     unconditionally on every successful open (create via open_db, or
@@ -458,6 +468,7 @@ def _run_decision_migration_guards(conn: sqlite3.Connection, db_path: Path, proj
     that just want to inspect a db file directly) skips project-isolation
     enforcement, matching open_db's previous behavior exactly."""
     ensure_links_invariant_column(conn)
+    ensure_embeddings_embed_sha_column(conn)
     if project is not None:
         enforce_project_isolation(conn, db_path, project)
 
@@ -544,11 +555,12 @@ def _decision_warn(cmd_name: str, args, state: str) -> None:
     )
 
 
-def delete_record_rows(conn: sqlite3.Connection, path: str) -> None:
+def delete_record_rows(conn: sqlite3.Connection, path: str, *, keep_embedding: bool = False) -> None:
     conn.execute("DELETE FROM records WHERE path=?", (path,))
     conn.execute("DELETE FROM links WHERE topic_path=?", (path,))
     conn.execute("DELETE FROM fts WHERE path=?", (path,))
-    conn.execute("DELETE FROM embeddings WHERE path=?", (path,))
+    if not keep_embedding:
+        conn.execute("DELETE FROM embeddings WHERE path=?", (path,))
     conn.execute("DELETE FROM edges WHERE topic_path=?", (path,))
     conn.execute("DELETE FROM assumptions WHERE topic_path=?", (path,))
     conn.execute("DELETE FROM concepts WHERE path=?", (path,))
@@ -692,6 +704,9 @@ def walk_markdown(root: Path):
 
 
 def cmd_reindex(args) -> int:
+    """F2 (Ruling 69), self-contained: no link rows, no link_topic_path
+    column, no _link_embed_items call -- Task 5 replaces this function
+    wholesale, not by patching it (see Task 5's own Step 3)."""
     root = Path(args.root).resolve()
     if not root.is_dir() or not os.access(root, os.R_OK | os.X_OK):
         print(f"reindex: {root} is not a readable directory -- nothing was changed", file=sys.stderr)
@@ -699,10 +714,15 @@ def cmd_reindex(args) -> int:
     db_path = resolve_db_path(args)
     conn = open_db(db_path, project=args.project)
     t0 = time.time()
+    no_embed = args.no_embed or getattr(args, "auto", False)
 
     existing = {
         row["path"]: (row["sha256"], row["mtime"])
         for row in conn.execute("SELECT path, sha256, mtime FROM records WHERE project=?", (args.project,))
+    }
+    embedded_shas = {
+        row["path"]: row["embed_sha"]
+        for row in conn.execute("SELECT path, embed_sha FROM embeddings WHERE project=?", (args.project,))
     }
 
     files = sorted(walk_markdown(root))
@@ -710,6 +730,7 @@ def cmd_reindex(args) -> int:
     to_embed_paths: list[str] = []
     to_embed_texts: list[str] = []
     pending: list[tuple[dict, str, float, int]] = []
+    backfill_only: list[tuple[str, dict]] = []
     unchanged = 0
 
     for f in files:
@@ -719,16 +740,21 @@ def cmd_reindex(args) -> int:
         data = f.read_bytes()
         sha = hashlib.sha256(data).hexdigest()
         prev = existing.get(path_str)
-        if prev and not args.full and prev[0] == sha:
+        sha_unchanged = prev is not None and not args.full and prev[0] == sha
+        needs_backfill = (not no_embed) and sha_unchanged and embedded_shas.get(path_str) != sha
+        if sha_unchanged and not needs_backfill:
             unchanged += 1
             continue
         fm, body = parse_frontmatter(f)
         rec = build_record(root, f, fm, body)
         rec["project"] = args.project
+        if sha_unchanged and needs_backfill:
+            backfill_only.append((path_str, rec))
+            to_embed_paths.append(path_str); to_embed_texts.append(embed_text_for(rec))
+            continue
         pending.append((rec, sha, stat.st_mtime, stat.st_size))
-        if not args.no_embed:
-            to_embed_paths.append(path_str)
-            to_embed_texts.append(embed_text_for(rec))
+        if not no_embed:
+            to_embed_paths.append(path_str); to_embed_texts.append(embed_text_for(rec))
 
     vectors_by_path: dict[str, bytes] = {}
     if to_embed_texts:
@@ -736,17 +762,30 @@ def cmd_reindex(args) -> int:
         for p, v in zip(to_embed_paths, vecs):
             vectors_by_path[p] = pack_vector(v)
 
+    def _upsert_embedding(path: str, sha_for: str) -> bool:
+        if path not in vectors_by_path:
+            return False
+        vec = vectors_by_path[path]
+        conn.execute(
+            "INSERT OR REPLACE INTO embeddings (path, project, dim, embed_sha, vector) VALUES (?,?,?,?,?)",
+            (path, args.project, len(unpack_vector(vec)), sha_for, vec),
+        )
+        return True
+
+    backfilled = 0
+    for path_str, rec in backfill_only:
+        sha = existing[path_str][0]
+        if _upsert_embedding(path_str, sha):
+            backfilled += 1
+
     added = 0
     changed = 0
     for rec, sha, mtime, size in pending:
         is_new = rec["path"] not in existing
-        delete_record_rows(conn, rec["path"])
+        keep_embedding = no_embed and not is_new
+        delete_record_rows(conn, rec["path"], keep_embedding=keep_embedding)
         insert_record_rows(conn, args.project, rec, sha, mtime, size)
-        if rec["path"] in vectors_by_path:
-            conn.execute(
-                "INSERT OR REPLACE INTO embeddings (path, project, dim, vector) VALUES (?,?,?,?)",
-                (rec["path"], args.project, len(unpack_vector(vectors_by_path[rec["path"]])), vectors_by_path[rec["path"]]),
-            )
+        _upsert_embedding(rec["path"], sha)
         if is_new:
             added += 1
         else:
@@ -754,7 +793,39 @@ def cmd_reindex(args) -> int:
 
     removed_paths = set(existing.keys()) - seen
     for p in removed_paths:
-        delete_record_rows(conn, p)
+        delete_record_rows(conn, p)   # keep_embedding=False always -- a removed record's
+                                       # vector is dropped, never kept stale.
+
+    # Ruling 69: embedding_mode is recomputed from ACTUAL fresh coverage on
+    # every run except --auto -- one uniform rule replaces Revision 3's
+    # special-cased "only downgrade under --no-embed when mutated" branch,
+    # and naturally handles "a backfill restores full" for free (no
+    # separate case needed: fresh coverage is just recomputed and happens
+    # to be 100%).
+    if not getattr(args, "auto", False):
+        mode_row = conn.execute("SELECT value FROM db_meta WHERE key='embedding_mode'").fetchone()
+        mode_now = mode_row["value"] if mode_row else "none"
+        total = conn.execute(
+            "SELECT COUNT(*) AS n FROM records WHERE project=?", (args.project,)
+        ).fetchone()["n"]
+        fresh = conn.execute(
+            "SELECT COUNT(*) AS n FROM records r JOIN embeddings e "
+            "ON e.path=r.path AND e.embed_sha=r.sha256 WHERE r.project=?",
+            (args.project,),
+        ).fetchone()["n"]
+        if total == 0 or fresh == 0:
+            mode = "none"
+        elif fresh == total:
+            mode = "full"
+        else:
+            mode = "partial"
+        if mode != mode_now:
+            conn.execute("INSERT OR REPLACE INTO db_meta (key, value) VALUES ('embedding_mode', ?)", (mode,))
+            if mode_now == "full" and mode != "full":
+                print(f"reindex: embeddings are now incomplete for {args.project}; embedding mode set "
+                      f"to {mode} (run without --no-embed to restore)")
+    # --auto never writes embedding_mode at all -- the project's own mode
+    # is left exactly as it was; content reindexes normally either way.
 
     # F1 (Codex-pending item 1): the successful-reindex stamp and the
     # logical index generation land in the SAME transaction as every other
@@ -772,10 +843,9 @@ def cmd_reindex(args) -> int:
     conn.commit()
     conn.close()
     elapsed = time.time() - t0
-    print(
-        f"reindex: {len(files)} files scanned, {added} added, {changed} changed, "
-        f"{unchanged} unchanged, {len(removed_paths)} removed, {elapsed:.3f}s"
-    )
+    print(f"reindex: {len(files)} files scanned, {added} added, {changed} changed, "
+          f"{unchanged} unchanged, {len(removed_paths)} removed, {backfilled} embedding(s) backfilled, "
+          f"{elapsed:.3f}s")
     return 0
 
 
@@ -868,8 +938,16 @@ def fts_escape(query: str) -> str:
 
 
 def vector_ranked(conn, query: str, project: str) -> list[tuple[str, float]]:
+    """Ruling 69: joins embeddings to records on embed_sha == sha256 -- a
+    stale vector (kept physically across a --no-embed/--auto edit) never
+    reaches the scoring loop at all, not merely scores lower."""
     qvec = compute_query_embedding(query)
-    rows = conn.execute("SELECT path, vector FROM embeddings WHERE project=?", (project,)).fetchall()
+    rows = conn.execute(
+        "SELECT e.path AS path, e.vector AS vector FROM embeddings e "
+        "JOIN records r ON r.path = e.path AND r.sha256 = e.embed_sha "
+        "WHERE e.project=?",
+        (project,),
+    ).fetchall()
     scored = [(r["path"], cosine(qvec, unpack_vector(r["vector"]))) for r in rows]
     scored.sort(key=lambda t: t[1], reverse=True)
     return scored
@@ -1822,7 +1900,8 @@ def cmd_unmapped(args) -> int:
             else:
                 if state == "stale":
                     reindex_ns = argparse.Namespace(
-                        root=str(root), project=args.project, db=str(db_path), full=False, no_embed=True
+                        root=str(root), project=args.project, db=str(db_path), full=False,
+                        no_embed=True, auto=True,
                     )
                     buf = io.StringIO()
                     with contextlib.redirect_stdout(buf):
@@ -4369,6 +4448,11 @@ def main(argv=None) -> int:
     add_common_args(p_reindex, need_root=True)
     p_reindex.add_argument("--full", action="store_true")
     p_reindex.add_argument("--no-embed", action="store_true")
+    p_reindex.add_argument(
+        "--auto", action="store_true",
+        help="internal/hook use: reindex content without embedding and leave embedding_mode "
+             "untouched (unlike --no-embed alone, which can downgrade a full project)",
+    )
     p_reindex.set_defaults(func=cmd_reindex)
 
     p_search = sub.add_parser("search")
