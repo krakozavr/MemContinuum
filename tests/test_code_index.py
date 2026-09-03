@@ -3152,7 +3152,7 @@ class TestMemlintSymbolFragment(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             shutil.copy(CONCEPTS / "bad_symbol.md", root / "bad_symbol.md")
-            errors, _warnings = memlint.lint_root(root, code_root=CODE_ROOT)
+            errors, _warnings = memlint.lint_root(root, code_roots=[CODE_ROOT])
             self.assertTrue(
                 any("CON-CODE-BADSYM" in e and "doesNotExist" in e for e in errors), errors
             )
@@ -3162,7 +3162,7 @@ class TestMemlintSymbolFragment(unittest.TestCase):
             root = Path(td)
             shutil.copy(CONCEPTS / "good.md", root / "good.md")
             shutil.copy(CONCEPTS / "topics" / "top-code-1.md", root / "top-code-1.md")
-            errors, _warnings = memlint.lint_root(root, code_root=CODE_ROOT)
+            errors, _warnings = memlint.lint_root(root, code_roots=[CODE_ROOT])
             self.assertFalse(any("CON-CODE-GOOD" in e for e in errors), errors)
 
     def test_symbol_check_skipped_without_code_root(self):
@@ -3182,14 +3182,14 @@ class TestMemlintSymbolVocabulary(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             shutil.copy(CONCEPTS / "vocab_good.md", root / "vocab_good.md")
-            errors, _warnings = memlint.lint_root(root, code_root=CODE_ROOT)
+            errors, _warnings = memlint.lint_root(root, code_roots=[CODE_ROOT])
             self.assertFalse(any("CON-VOCAB-GOOD" in e for e in errors), errors)
 
     def test_symbol_only_in_a_comment_is_an_error(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             shutil.copy(CONCEPTS / "vocab_bad_comment.md", root / "vocab_bad_comment.md")
-            errors, _warnings = memlint.lint_root(root, code_root=CODE_ROOT)
+            errors, _warnings = memlint.lint_root(root, code_roots=[CODE_ROOT])
             self.assertTrue(
                 any("CON-VOCAB-BADCOMMENT" in e and "commentedOutSymbol" in e for e in errors),
                 errors,
@@ -3199,7 +3199,7 @@ class TestMemlintSymbolVocabulary(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             shutil.copy(CONCEPTS / "vocab_bad_string.md", root / "vocab_bad_string.md")
-            errors, _warnings = memlint.lint_root(root, code_root=CODE_ROOT)
+            errors, _warnings = memlint.lint_root(root, code_roots=[CODE_ROOT])
             self.assertTrue(
                 any("CON-VOCAB-BADSTRING" in e and "stringOnlySymbol" in e for e in errors),
                 errors,
@@ -3217,7 +3217,7 @@ class TestMemlintFragmentAttachAgreement(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             shutil.copy(CONCEPTS / "qualified_symbol_good.md", root / "qualified_symbol_good.md")
-            errors, _warnings = memlint.lint_root(root, code_root=CODE_ROOT)
+            errors, _warnings = memlint.lint_root(root, code_roots=[CODE_ROOT])
             self.assertFalse(any("CON-CODE-QUALGOOD" in e for e in errors), errors)
 
     def test_lint_and_runtime_attach_agree_on_the_same_qualified_fragment(self):
@@ -3255,7 +3255,7 @@ class TestMemlintPathContainment(unittest.TestCase):
             "---\n\n"
             "Fixture. NOT this concept: nothing else.\n"
         )
-        return memlint.lint_root(td, code_root=code_root)
+        return memlint.lint_root(td, code_roots=[code_root])
 
     def test_absolute_ref_path_escaping_code_root_is_an_error(self):
         with tempfile.TemporaryDirectory() as td_str:
@@ -3299,7 +3299,7 @@ class TestMemlintUnqualifiedLargeFile(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             shutil.copy(CONCEPTS / "no_symbol_small.md", root / "no_symbol_small.md")
-            errors, _warnings = memlint.lint_root(root, code_root=CODE_ROOT)
+            errors, _warnings = memlint.lint_root(root, code_roots=[CODE_ROOT])
             self.assertFalse(any("CON-CODE-NOSYM-SMALL" in e for e in errors), errors)
 
     def test_no_symbol_on_a_file_over_400_lines_is_an_error(self):
@@ -3323,7 +3323,7 @@ class TestMemlintUnqualifiedLargeFile(unittest.TestCase):
                 "---\n\n"
                 "Fixture. NOT this concept: nothing else.\n"
             )
-            errors, _warnings = memlint.lint_root(root, code_root=code_root)
+            errors, _warnings = memlint.lint_root(root, code_roots=[code_root])
             self.assertTrue(
                 any("CON-CODE-BIG" in e and "400" in e for e in errors), errors
             )
@@ -3335,7 +3335,7 @@ class TestMemlintGovernedByRegistry(unittest.TestCase):
             root = Path(td)
             shutil.copy(CONCEPTS / "bad_governed.md", root / "bad_governed.md")
             shutil.copy(CONCEPTS / "topics" / "top-code-1.md", root / "top-code-1.md")
-            errors, _warnings = memlint.lint_root(root, code_root=CODE_ROOT)
+            errors, _warnings = memlint.lint_root(root, code_roots=[CODE_ROOT])
             self.assertTrue(
                 any("CON-CODE-BADGOV" in e and "TOP-DOES-NOT-EXIST" in e for e in errors), errors
             )
@@ -3345,7 +3345,7 @@ class TestMemlintGovernedByRegistry(unittest.TestCase):
             root = Path(td)
             shutil.copy(CONCEPTS / "good.md", root / "good.md")
             shutil.copy(CONCEPTS / "topics" / "top-code-1.md", root / "top-code-1.md")
-            errors, _warnings = memlint.lint_root(root, code_root=CODE_ROOT)
+            errors, _warnings = memlint.lint_root(root, code_roots=[CODE_ROOT])
             self.assertFalse(any("governed_by" in e and "CON-CODE-GOOD" in e for e in errors), errors)
 
     def test_governed_by_check_skipped_when_no_topic_registry_present(self):
@@ -3354,7 +3354,7 @@ class TestMemlintGovernedByRegistry(unittest.TestCase):
             shutil.copy(CONCEPTS / "bad_governed.md", root / "bad_governed.md")
             # deliberately NOT copying top-code-1.md -- zero topics in this
             # corpus, so there's no registry to validate against.
-            errors, _warnings = memlint.lint_root(root, code_root=CODE_ROOT)
+            errors, _warnings = memlint.lint_root(root, code_roots=[CODE_ROOT])
             self.assertFalse(any("governed_by" in e for e in errors), errors)
 
 
@@ -3364,7 +3364,7 @@ class TestMemlintDuplicateClaim(unittest.TestCase):
             root = Path(td)
             shutil.copy(CONCEPTS / "dup_a.md", root / "dup_a.md")
             shutil.copy(CONCEPTS / "dup_b.md", root / "dup_b.md")
-            errors, _warnings = memlint.lint_root(root, code_root=CODE_ROOT)
+            errors, _warnings = memlint.lint_root(root, code_roots=[CODE_ROOT])
             self.assertTrue(
                 any("CON-CODE-DUP-A" in e and "CON-CODE-DUP-B" in e for e in errors), errors
             )
@@ -3373,7 +3373,7 @@ class TestMemlintDuplicateClaim(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             shutil.copy(CONCEPTS / "dup_a.md", root / "dup_a.md")
-            errors, _warnings = memlint.lint_root(root, code_root=CODE_ROOT)
+            errors, _warnings = memlint.lint_root(root, code_roots=[CODE_ROOT])
             self.assertFalse(any("duplicate" in e.lower() for e in errors), errors)
 
 
@@ -3382,7 +3382,7 @@ class TestMemlintNotThisConcept(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             shutil.copy(CONCEPTS / "no_not_this.md", root / "no_not_this.md")
-            _errors, warnings = memlint.lint_root(root, code_root=CODE_ROOT)
+            _errors, warnings = memlint.lint_root(root, code_roots=[CODE_ROOT])
             self.assertTrue(
                 any("CON-CODE-NO-NOT-THIS" in w and "not this" in w.lower() for w in warnings), warnings
             )
@@ -3392,7 +3392,7 @@ class TestMemlintNotThisConcept(unittest.TestCase):
             root = Path(td)
             shutil.copy(CONCEPTS / "good.md", root / "good.md")
             shutil.copy(CONCEPTS / "topics" / "top-code-1.md", root / "top-code-1.md")
-            _errors, warnings = memlint.lint_root(root, code_root=CODE_ROOT)
+            _errors, warnings = memlint.lint_root(root, code_roots=[CODE_ROOT])
             self.assertFalse(
                 any("CON-CODE-GOOD" in w and "not this" in w.lower() for w in warnings), warnings
             )
@@ -3402,7 +3402,7 @@ class TestMemlintExistingRulesStillGreen(unittest.TestCase):
     def test_v11_concept_fixtures_still_lint_clean_of_the_original_checks(self):
         v11_concepts = TOOLS_DIR / "fixtures" / "v11" / "concepts"
         v11_code = TOOLS_DIR / "fixtures" / "v11" / "code"
-        errors, _warnings = memlint.lint_root(v11_concepts, code_root=v11_code)
+        errors, _warnings = memlint.lint_root(v11_concepts, code_roots=[v11_code])
         # CON-900's missing path is still expected; nothing NEW should
         # appear for CON-007 (media-identity) or CON-901 (no-tests).
         self.assertFalse(any("CON-007" in e for e in errors), errors)

@@ -8,6 +8,7 @@ never touch the real machine's state.
 import json
 import os
 import re
+import shlex
 import shutil
 import sqlite3
 import stat
@@ -676,6 +677,56 @@ class TestMultipleCodeRoots(unittest.TestCase):
                 home,
             )
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_two_code_roots_readme_recipe_has_both_code_root_flags(self):
+        """Task 8: memlint's --code-root is repeatable, so the store README's
+        recipe line ({{CODE_ROOT_ARGS}}, templates/store-README.md.tmpl:29)
+        must render one --code-root per recorded root -- a lint following
+        the recipe as printed must see every root, not just the first."""
+        home = sandbox_home()
+        try:
+            store = str(Path(home) / "store")
+            root_a = str(Path(home) / "code-a")
+            root_b = str(Path(home) / "code-b")
+            os.makedirs(root_a, exist_ok=True)
+            os.makedirs(root_b, exist_ok=True)
+            proc = run_install(
+                ["--project", "multi", "--store", store,
+                 "--code-root", root_a, "--code-root", root_b,
+                 "--claude-dir", str(Path(home) / ".claude")],
+                home,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            readme = (Path(store) / "README.md").read_text()
+            recipe = next(l for l in readme.splitlines() if "memlint.py" in l and "PYTHONPATH" in l)
+            self.assertIn(f"--code-root {root_a}", recipe, recipe)
+            self.assertIn(f"--code-root {root_b}", recipe, recipe)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_code_root_with_a_space_is_quoted_in_the_readme_recipe(self):
+        home = sandbox_home()
+        try:
+            store = str(Path(home) / "store")
+            root_with_space = str(Path(home) / "code root")
+            os.makedirs(root_with_space, exist_ok=True)
+            proc = run_install(
+                ["--project", "spacey", "--store", store,
+                 "--code-root", root_with_space,
+                 "--claude-dir", str(Path(home) / ".claude")],
+                home,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            readme = (Path(store) / "README.md").read_text()
+            recipe = next(l for l in readme.splitlines() if "memlint.py" in l and "PYTHONPATH" in l)
+            self.assertIn("--code-root", recipe, recipe)
+            # Quoted well enough that a shell splitting the recipe line sees
+            # the space-containing path as ONE word, not two -- robust to
+            # either `printf %q` backslash-escaping or a quoted string.
+            tokens = shlex.split(recipe)
+            self.assertIn(root_with_space, tokens, recipe)
         finally:
             shutil.rmtree(home, ignore_errors=True)
 

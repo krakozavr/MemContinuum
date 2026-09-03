@@ -26,7 +26,7 @@ Schema: {{ENGINE_DIR}}/docs/SCHEMA.md. Engine: {{ENGINE_DIR}} (`memidx.py`, `mem
 
 ```bash
 # One-time / after any edit to this store:
-PYTHONPATH= {{PYTHON}} {{ENGINE_DIR}}/memlint.py {{STORE}} --code-root {{CODE_ROOT}}
+PYTHONPATH= {{PYTHON}} {{ENGINE_DIR}}/memlint.py {{STORE}} {{CODE_ROOT_ARGS}}
 
 PYTHONPATH= {{PYTHON}} {{ENGINE_DIR}}/memidx.py reindex --root {{STORE}} --project {{PROJECT}}
 # (index lands at ~/.memcontinuum/{{PROJECT}}.sqlite by default -- keep it on a local, POSIX

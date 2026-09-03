@@ -961,11 +961,25 @@ else
         FIRST_CODE_ROOT="<no code-root configured>"
         [ "${#CODE_ROOTS_ABS[@]}" -gt 0 ] && FIRST_CODE_ROOT="${CODE_ROOTS_ABS[0]}"
 
+        # One --code-root per recorded root, each shell-quoted (printf '%q',
+        # the same quoting the post-commit-reindex trampoline uses below) so
+        # a root containing a space still round-trips as one word when the
+        # recipe line is pasted into a shell -- empty when there are no
+        # roots, so the memlint line in the recipe simply carries no
+        # --code-root at all.
+        CODE_ROOT_ARGS=""
+        for cr in "${CODE_ROOTS_ABS[@]:-}"; do
+            if [ -n "$cr" ]; then
+                CODE_ROOT_ARGS="${CODE_ROOT_ARGS:+$CODE_ROOT_ARGS }--code-root $(printf '%q' "$cr")"
+            fi
+        done
+
         README_TMPL="$(cat "$TEMPLATES_DIR/store-README.md.tmpl")"
         README_TMPL="${README_TMPL//\{\{PROJECT\}\}/$PROJECT}"
         README_TMPL="${README_TMPL//\{\{STORE\}\}/$STORE}"
         README_TMPL="${README_TMPL//\{\{PYTHON\}\}/$PYTHON_BIN}"
         README_TMPL="${README_TMPL//\{\{ENGINE_DIR\}\}/$ENGINE_ROOT}"
+        README_TMPL="${README_TMPL//\{\{CODE_ROOT_ARGS\}\}/$CODE_ROOT_ARGS}"
         README_TMPL="${README_TMPL//\{\{CODE_ROOT\}\}/$FIRST_CODE_ROOT}"
         printf '%s' "$README_TMPL" > "$STORE/README.md" || fail "could not write $STORE/README.md"
     fi

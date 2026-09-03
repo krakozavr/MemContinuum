@@ -237,7 +237,7 @@ class TestForPathConcepts(unittest.TestCase):
 
 class TestConceptMemlint(unittest.TestCase):
     def test_missing_path_is_error_when_code_root_given(self):
-        errors, _warnings = memlint.lint_root(FIXTURES / "concepts", code_root=FIXTURES / "code")
+        errors, _warnings = memlint.lint_root(FIXTURES / "concepts", code_roots=[FIXTURES / "code"])
         self.assertTrue(
             any("CON-900" in e and "DoesNotExist.swift" in e for e in errors), errors
         )
@@ -247,7 +247,7 @@ class TestConceptMemlint(unittest.TestCase):
         self.assertFalse(any("DoesNotExist.swift" in e for e in errors), errors)
 
     def test_no_tested_by_is_warning_not_error(self):
-        errors, warnings = memlint.lint_root(FIXTURES / "concepts", code_root=FIXTURES / "code")
+        errors, warnings = memlint.lint_root(FIXTURES / "concepts", code_roots=[FIXTURES / "code"])
         self.assertFalse(any("CON-901" in e for e in errors), errors)
         self.assertTrue(any("CON-901" in w and "tested_by" in w for w in warnings), warnings)
 
@@ -255,12 +255,12 @@ class TestConceptMemlint(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             shutil.copy(FIXTURES / "concepts" / "media-identity.md", root / "media-identity.md")
-            errors, _warnings = memlint.lint_root(root, code_root=FIXTURES / "code")
+            errors, _warnings = memlint.lint_root(root, code_roots=[FIXTURES / "code"])
             self.assertEqual(errors, [], errors)
 
     def test_hash_fragment_stripped_before_existence_check(self):
         # implemented_by entries carry "#symbol" -- must check only the file.
-        errors, _warnings = memlint.lint_root(FIXTURES / "concepts", code_root=FIXTURES / "code")
+        errors, _warnings = memlint.lint_root(FIXTURES / "concepts", code_roots=[FIXTURES / "code"])
         self.assertFalse(any("DeleteGate.swift#delete" in e for e in errors), errors)
 
 
