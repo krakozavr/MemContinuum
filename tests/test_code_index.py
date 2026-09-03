@@ -200,6 +200,27 @@ class TestCodeSchemaV2(unittest.TestCase):
             conn = memidx.open_code_db(db)
             self.assertEqual(conn.execute("SELECT count(*) FROM code_meta").fetchone()[0], 1)
 
+    def test_rebuild_of_a_v2_db_preserves_langs_from_code_project(self):
+        """Fix-wave item 8 follow-up: langs lives on `code_project` from
+        schema v2 on -- code_meta has NO langs column here at all. A
+        rebuild that (as CODE_TABLES now requires) drops code_project too
+        must still carry ITS langs forward, not just code_meta's (which
+        would read NULL and silently wipe the one non-derived fact this
+        whole preservation path exists for)."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"; root.mkdir(); (root / "x.py").write_text("def f():\n    pass\n")
+            db = Path(td) / "c.sqlite"
+            code_reindex(root, db, lang="python")   # a real v2 db, code_project.langs='python'
+            conn = sqlite3.connect(str(db))
+            conn.execute("UPDATE code_schema SET version=1")  # force the rebuild path
+            conn.commit(); conn.close()
+            conn = memidx.open_code_db(db)
+            self.assertEqual(memidx.code_schema_version(conn), memidx.CODE_SCHEMA_VERSION)
+            self.assertEqual(
+                conn.execute("SELECT langs FROM code_project WHERE project=?", (memidx.DEFAULT_PROJECT,)).fetchone()[0],
+                "python",
+            )
+
 
 class TestMultiRootReindex(unittest.TestCase):
     def _mk(self, td):
@@ -335,6 +356,59 @@ class TestMultiRootReindex(unittest.TestCase):
                 code_reindex(a, db, lang="python", no_embed=True)
             mode, chunks, embedded = self._coverage(db)
             self.assertEqual(mode, "none"); self.assertEqual(embedded, 0)
+
+    def test_embedded_run_on_one_root_never_claims_full_while_another_lacks_vectors(self):
+        """Fix-wave item 1 (CRITICAL): an embedded run over root A must
+        derive `full` from PROJECT-wide coverage, not just "this run wasn't
+        --no-embed". Grok's sequence: A embedded (full) -> B --no-embed
+        (none, since B's new chunks have no vectors) -> A embedded AGAIN
+        with no edits at all (mutated == False for this run) must STILL
+        read none -- A's own chunk already has a vector, so the buggy
+        unconditional "not --no-embed -> full" line used to relapse to
+        full here even though B's chunk still has none."""
+        with tempfile.TemporaryDirectory() as td:
+            a, b, db = self._mk(td)
+            code_reindex(a, db, lang="python", no_embed=False)          # A: full (1 chunk, 1 vector)
+            self.assertEqual(self._coverage(db), ("full", 1, 1))
+
+            buf1 = io.StringIO()
+            with contextlib.redirect_stdout(buf1):
+                code_reindex(b, db, lang="python", no_embed=True)       # B: no-embed -> downgrades to none
+            self.assertEqual(self._coverage(db), ("none", 2, 1))
+            self.assertIn("embedding mode set to none", buf1.getvalue())
+
+            buf2 = io.StringIO()
+            with contextlib.redirect_stdout(buf2):
+                code_reindex(a, db, lang="python", no_embed=False)      # A again, embedded, NO edits
+            mode, chunks, embedded = self._coverage(db)
+            self.assertEqual((mode, chunks, embedded), ("none", 2, 1))  # still none: B's chunk is still bare
+            self.assertIn(
+                "chunk(s) in other roots have no embedding; embedding mode stays none",
+                buf2.getvalue(),
+            )
+
+            buf3 = io.StringIO()
+            with contextlib.redirect_stdout(buf3):
+                code_reindex(b, db, lang="python", no_embed=False)      # B embedded too -> now genuinely full
+            self.assertEqual(self._coverage(db), ("full", 2, 2))
+            self.assertNotIn("chunk(s) in other roots", buf3.getvalue())
+
+    def test_no_embed_root_then_embedded_root_then_no_embed_original_stays_full(self):
+        """The other order from finding 1: root A --no-embed, root B
+        embedded -> project-wide coverage is still incomplete (A's chunk
+        has no vector) so mode reads none + the cross-root line; embedding
+        A afterwards makes coverage complete -> full."""
+        with tempfile.TemporaryDirectory() as td:
+            a, b, db = self._mk(td)
+            code_reindex(a, db, lang="python", no_embed=True)
+            self.assertEqual(self._coverage(db)[0], "none")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code_reindex(b, db, lang="python", no_embed=False)      # B embedded, A still bare
+            self.assertEqual(self._coverage(db), ("none", 2, 1))
+            self.assertIn("chunk(s) in other roots have no embedding", buf.getvalue())
+            code_reindex(a, db, lang="python", no_embed=False)          # A embedded -> now full
+            self.assertEqual(self._coverage(db), ("full", 2, 2))
 
     def test_search_output_is_root_qualified_with_two_roots(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1774,7 +1848,7 @@ class TestFileStatusRows(unittest.TestCase):
                         code_root=str(root), drop_root=None, db=str(db), project=memidx.DEFAULT_PROJECT,
                         no_embed=True, full=False, lang="python", retry_not_indexed=False,
                     ))
-                self.assertIn("0 not indexed", out2.getvalue())
+                self.assertRegex(out2.getvalue(), r"\b0 not indexed\b")  # not "10 not indexed" etc.
                 self.assertIn("1 unchanged", out2.getvalue())
                 self.assertEqual(self._row(db, "locked.py")["status"], "not-indexed")
             finally:
@@ -1829,7 +1903,7 @@ class TestFileStatusRows(unittest.TestCase):
                         code_root=str(root), drop_root=None, db=str(db), project=memidx.DEFAULT_PROJECT,
                         no_embed=True, full=False, lang="python", retry_not_indexed=False,
                     ))
-                self.assertIn("0 not indexed", out.getvalue())
+                self.assertRegex(out.getvalue(), r"\b0 not indexed\b")  # not "10 not indexed" etc.
             # backend back (fingerprint differs) -> a heal-style run retries and succeeds
             with contextlib.redirect_stdout(io.StringIO()):
                 memidx.cmd_code_reindex(ns(
@@ -3640,6 +3714,271 @@ class TestSelfIndexAcceptanceGate(unittest.TestCase):
             rc = memidx.cmd_why(args)
         self.assertEqual(rc, 0, buf.getvalue() + err.getvalue())
         self.assertIn("memidx.py", buf.getvalue(), buf.getvalue())
+
+
+class TestWhyNeverRebuildsAnOlderIndex(unittest.TestCase):
+    """Fix-wave item 3: _resolve_symbol_via_code_index must never call
+    open_code_db on a db whose schema is older than CODE_SCHEMA_VERSION --
+    that call performs the v1->v2 rebuild as a SIDE EFFECT of opening, and
+    `why` gets exactly one shot per call (it never heals, see that
+    function's own docstring). If the fast path were the thing that
+    triggered the rebuild, the first bare-symbol `why` right after an
+    engine upgrade would silently empty the whole index and leave it
+    stale until the next code-search happened to run -- worse than simply
+    missing the fast path once. The fix reads the schema version first
+    with a throwaway, read-only connection and returns None (sending the
+    caller to the disk-scan fallback) without ever opening the db for
+    real when the version is behind."""
+
+    def test_v1_db_is_left_untouched_and_lookup_returns_none(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"
+            home.mkdir()
+            project = "why-v1-guard"
+            db_path = home / f"{project}-code.sqlite"
+            conn = sqlite3.connect(str(db_path))
+            conn.executescript(TestCodeSchemaV2.V1_DDL)
+            conn.commit()
+            conn.close()
+
+            prev_home = os.environ.get("MEMCONTINUUM_HOME")
+            os.environ["MEMCONTINUUM_HOME"] = str(home)
+            try:
+                result = memidx._resolve_symbol_via_code_index(Path("/old/root"), "f", project)
+            finally:
+                if prev_home is None:
+                    os.environ.pop("MEMCONTINUUM_HOME", None)
+                else:
+                    os.environ["MEMCONTINUUM_HOME"] = prev_home
+
+            self.assertIsNone(result)
+            conn = sqlite3.connect(str(db_path))
+            still_v1 = not conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='code_schema'"
+            ).fetchone()
+            chunk_count = conn.execute("SELECT count(*) FROM chunks").fetchone()[0]
+            conn.close()
+            self.assertTrue(still_v1, "why must not trigger the v1->v2 rebuild")
+            self.assertEqual(chunk_count, 1)  # the V1_DDL fixture row, untouched
+
+    def test_corrupt_db_never_crashes_the_lookup(self):
+        """Regression guard on the version pre-check itself: sqlite3.connect
+        is lazy and never raises on a non-database file -- the DatabaseError
+        only surfaces on the first real read (code_schema_version's own
+        query). That read must stay inside the same try/except as the
+        connect, or a corrupt db crashes `why` exactly like the bug this
+        whole function exists to prevent, instead of sending the caller to
+        the disk-scan fallback like every other unreadable-db case here."""
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"
+            home.mkdir()
+            project = "why-corrupt-db-guard"
+            db_path = home / f"{project}-code.sqlite"
+            db_path.write_bytes(b"not a sqlite database at all")
+
+            prev_home = os.environ.get("MEMCONTINUUM_HOME")
+            os.environ["MEMCONTINUUM_HOME"] = str(home)
+            try:
+                result = memidx._resolve_symbol_via_code_index(Path("/old/root"), "f", project)
+            finally:
+                if prev_home is None:
+                    os.environ.pop("MEMCONTINUUM_HOME", None)
+                else:
+                    os.environ["MEMCONTINUUM_HOME"] = prev_home
+            self.assertIsNone(result)
+
+
+class TestHealIgnoresMissingRootAvailability(unittest.TestCase):
+    """Fix-wave item 4 (Grok G2): a MISSING root's availability_changed
+    flag must not make the project eligible for heal forever -- heal
+    skips exists=False roots outright, so nothing there ever actually
+    gets fixed; counting a missing root's stale not-indexed rows into the
+    project-wide aggregate just re-triggers "eligible" (and a no-op
+    reindex pass) on every single search."""
+
+    def _run(self, db, q, *extra):
+        script = ("import sys; sys.path.insert(0, %r); import memidx; "
+                  "memidx.main(['code-search', '--db', %r, %r, '--mode', 'fts'] + %r)"
+                  ) % (str(TOOLS_DIR), str(db), q, list(extra))
+        return subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=60)
+
+    def test_missing_root_with_stale_not_indexed_row_never_heals_and_stays_degraded(self):
+        with tempfile.TemporaryDirectory() as td:
+            a = Path(td) / "a"; b = Path(td) / "b"; a.mkdir(); b.mkdir()
+            (a / "x.py").write_text("def fx():\n    pass\n")
+            (b / "y.py").write_text("def fy():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"
+            code_reindex(a, db, lang="python")
+            with mock.patch.multiple(
+                chunkers,
+                get_chunker=lambda lang: (_ for _ in ()).throw(chunkers.BackendUnavailable("m")),
+                backend_availability=lambda: "python=missing;swift=ok",
+            ):
+                code_reindex(b, db, lang="python")   # b/y.py: not-indexed, stale attempt_key
+            shutil.rmtree(b)                          # root b now missing entirely
+
+            def _root_a_last_indexed_at():
+                conn = memidx.open_code_db(db)
+                row = conn.execute(
+                    "SELECT last_indexed_at FROM code_meta WHERE code_root=?", (str(a.resolve()),)
+                ).fetchone()
+                conn.close()
+                return row[0]
+
+            # A missing root's stale not-indexed row must not make root A
+            # (present, unchanged, nothing to fix) eligible for a heal --
+            # the buggy version reindexed A on every single search anyway
+            # (last_indexed_at kept moving forward), even though nothing
+            # about A ever changed and heal_code_index's own loop SKIPS
+            # exists=False roots (so B, the actual not-indexed row, is
+            # never touched either way).
+            before = _root_a_last_indexed_at()
+            r1 = self._run(db, "fx")
+            self.assertNotIn("index healed", r1.stderr, r1.stderr)
+            after1 = _root_a_last_indexed_at()
+            self.assertEqual(before, after1, "root A must not be spuriously re-reindexed by heal")
+
+            r2 = self._run(db, "fx")
+            self.assertNotIn("index healed", r2.stderr, r2.stderr)
+            after2 = _root_a_last_indexed_at()
+            self.assertEqual(before, after2)
+
+            conn = memidx.open_code_db(db)
+            self.assertEqual(memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)["state"], "degraded")
+            conn.close()
+
+
+class TestHealLimitAndFailurePathCleanup(unittest.TestCase):
+    """Fix-wave items 6 and 7: the heal-limit refusal names the report's
+    actual state (not a hardcoded "stale"), and a heal failure after the
+    post-reindex reopen closes that connection before opening a third one
+    (no leaked sqlite3.Connection)."""
+
+    def test_heal_limit_refusal_names_degraded_not_stale(self):
+        """A `degraded` report (not_indexed-driven, changed == 0) never
+        actually hits the >limit branch -- degraded implies changed == 0 --
+        so this proves the WORDING fix directly against the report dict
+        heal_code_index reads, independent of whether --heal-limit can be
+        tuned low enough to reach it in practice."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"; root.mkdir()
+            (root / "x.py").write_text("def f():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"
+            with mock.patch.multiple(
+                chunkers,
+                get_chunker=lambda lang: (_ for _ in ()).throw(chunkers.BackendUnavailable("m")),
+                backend_availability=lambda: "python=missing;swift=ok",
+            ):
+                code_reindex(root, db, lang="python")
+            conn = memidx.open_code_db(db)
+            report = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)
+            self.assertEqual(report["state"], "degraded")
+            report = dict(report, changed=1)  # force the >limit branch open regardless of shape
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                memidx.heal_code_index(conn, db, memidx.DEFAULT_PROJECT, report, limit=0)
+            self.assertIn("index is degraded", buf.getvalue())
+            self.assertNotIn("index is stale", buf.getvalue())
+
+    def test_heal_failure_after_reopen_does_not_leak_the_reopened_connection(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"; root.mkdir()
+            p = root / "x.py"; p.write_text("def old_name():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"
+            code_reindex(root, db, lang="python")
+            p.write_text("def new_name():\n    pass\n")
+            os.utime(p, (time.time() + 3600,) * 2)
+            conn = memidx.open_code_db(db)
+            report = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)
+            self.assertEqual(report["state"], "stale")
+
+            real_report = memidx.code_index_report
+            seen_conns = []
+
+            def spying_report(c, project):
+                seen_conns.append(c)
+                if len(seen_conns) == 1:
+                    raise RuntimeError("boom after reopen")
+                return real_report(c, project)
+
+            memidx.code_index_report = spying_report
+            try:
+                buf = io.StringIO()
+                with contextlib.redirect_stderr(buf):
+                    result_report, result_conn = memidx.heal_code_index(
+                        conn, db, memidx.DEFAULT_PROJECT, report, limit=500
+                    )
+            finally:
+                memidx.code_index_report = real_report
+
+            self.assertIn("heal failed", buf.getvalue())
+            self.assertEqual(len(seen_conns), 1)  # the reopened conn that raised
+            reopened = seen_conns[0]
+            with self.assertRaises(sqlite3.ProgrammingError):
+                reopened.execute("SELECT 1")       # closed by the except handler, not leaked
+            result_conn.execute("SELECT 1")         # the returned connection is still live
+            result_conn.close()
+
+
+class TestCodeIndexTooNew(unittest.TestCase):
+    """Fix-wave item 9: a db whose code_schema.version is GREATER than
+    this engine's CODE_SCHEMA_VERSION was written by a newer engine -- it
+    must never be silently used (an older engine guessing at a newer
+    schema's meaning corrupts data quietly) and never silently rebuilt
+    (that would destroy the newer engine's index). open_code_db refuses it
+    outright; code-search and why fail open around that refusal."""
+
+    def _mk_too_new_db(self, td):
+        db = Path(td) / "idx-code.sqlite"
+        conn = memidx.open_code_db(db)   # normal v2 db
+        conn.execute("UPDATE code_schema SET version=?", (memidx.CODE_SCHEMA_VERSION + 1,))
+        conn.commit()
+        conn.close()
+        return db
+
+    def test_open_code_db_refuses_a_newer_schema(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = self._mk_too_new_db(td)
+            with self.assertRaises(memidx.CodeIndexTooNew) as ctx:
+                memidx.open_code_db(db)
+            msg = str(ctx.exception)
+            self.assertIn(str(memidx.CODE_SCHEMA_VERSION + 1), msg)
+            self.assertIn(str(memidx.CODE_SCHEMA_VERSION), msg)
+            self.assertIsInstance(ctx.exception, sqlite3.DatabaseError)
+
+    def test_code_search_fails_open_on_a_newer_schema_db(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = self._mk_too_new_db(td)
+            buf, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+                rc = memidx.cmd_code_search(
+                    ns(db=str(db), query="anything", mode="fts", limit=5, json=False)
+                )
+            self.assertEqual(rc, 0, buf.getvalue() + err.getvalue())
+            self.assertIn("newer engine", err.getvalue())
+
+    def test_why_falls_back_to_disk_scan_on_a_newer_schema_db(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"; home.mkdir()
+            project = "too-new-guard"
+            root = Path(td) / "code"; root.mkdir()
+            (root / "x.py").write_text("def f():\n    pass\n")
+            db_path = home / f"{project}-code.sqlite"
+            conn = memidx.open_code_db(db_path)
+            conn.execute("UPDATE code_schema SET version=?", (memidx.CODE_SCHEMA_VERSION + 1,))
+            conn.commit()
+            conn.close()
+
+            prev_home = os.environ.get("MEMCONTINUUM_HOME")
+            os.environ["MEMCONTINUUM_HOME"] = str(home)
+            try:
+                resolved = memidx.resolve_symbol_to_path(root, "f", project=project)
+            finally:
+                if prev_home is None:
+                    os.environ.pop("MEMCONTINUUM_HOME", None)
+                else:
+                    os.environ["MEMCONTINUUM_HOME"] = prev_home
+            self.assertEqual(resolved, "x.py")  # disk-scan fallback, never a crash
 
 
 if __name__ == "__main__":

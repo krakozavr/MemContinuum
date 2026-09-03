@@ -65,17 +65,22 @@ def get_chunker(lang):
     """Return the backend module for `lang` (must expose `chunk_file`).
 
     Imports lazily via importlib so this registry module imports cleanly
-    before every backend exists. An ImportError (the backend's wheel/
-    module isn't installed here) is wrapped as BackendUnavailable so
-    cmd_code_reindex's per-file guard can tell "this file is broken"
-    (a deterministic failure) apart from "this engine can't run this
-    backend on this machine" (not-indexed, retried when that changes).
+    before every backend exists. importlib.import_module does nothing but
+    import here -- ANY exception it raises (not just ImportError: a
+    provider's module-level init can raise RuntimeError, OSError, its own
+    exception type, ...) means this engine cannot run this backend on this
+    machine, so it is wrapped as BackendUnavailable so cmd_code_reindex's
+    per-file guard can tell "this file is broken" (a deterministic
+    failure) apart from "this engine can't run this backend here"
+    (not-indexed, retried when that changes) -- fail-open all the way up
+    through backend_availability()/code_index_report() into code-search
+    and why, none of which may crash on a backend's own import bug.
     """
     module_name = LANGUAGE_TABLE[lang]["module"]
     try:
         return importlib.import_module(module_name)
-    except ImportError as exc:
-        raise BackendUnavailable(f"{lang}: {exc}") from exc
+    except Exception as exc:
+        raise BackendUnavailable(f"{lang}: {type(exc).__name__}: {exc}") from exc
 
 
 def backend_availability():

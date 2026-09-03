@@ -1288,12 +1288,41 @@ def _resolve_symbol_via_code_index(code_root: Path, symbol: str, project: str) -
     Returns (code_root, path) -- the resolved root alongside the chunk's
     stored relative path, so a multi-root caller (Task 6) can tell which
     tree the match came from; resolve_symbol_to_path (immediately below)
-    unpacks the tuple and returns just the path for now."""
+    unpacks the tuple and returns just the path for now.
+
+    Fix-wave item 3: never calls open_code_db directly on an
+    older-than-current-schema db. open_code_db's schema check doubles as a
+    REBUILD trigger (it drops and recreates the derived tables as a side
+    effect of opening); `why` only gets one shot per call and never heals
+    (see above), so if this were the thing that triggered that rebuild, a
+    bare-symbol `why` right after an engine upgrade would silently empty
+    the whole index and leave it stale until the next code-search -- worse
+    than just missing the fast path once. So the schema version is read
+    first with a plain, read-only connection; anything below current (or
+    the table missing entirely) sends the caller to the disk scan WITHOUT
+    opening (and thus without rebuilding) the db at all. The next
+    code-search still finds it stale and heals it normally."""
     code_db_path = (
         Path(os.environ.get("MEMCONTINUUM_HOME", str(Path.home() / ".memcontinuum")))
         / f"{project}-code.sqlite"
     )
     if not code_db_path.exists():
+        return None
+    # sqlite3.connect() is lazy -- a corrupt/non-database file never raises
+    # here, only on the first real read below, so BOTH the connect and the
+    # version read live inside this one try/except (a bare try/finally
+    # around just the read would let that DatabaseError escape uncaught,
+    # crashing `why` on a corrupt db exactly like the bug this function
+    # exists to prevent).
+    try:
+        raw = sqlite3.connect(str(code_db_path))
+        try:
+            version = code_schema_version(raw)
+        finally:
+            raw.close()
+    except sqlite3.DatabaseError:
+        return None
+    if version < CODE_SCHEMA_VERSION:
         return None
     try:
         conn = open_code_db(code_db_path)
@@ -1762,7 +1791,15 @@ LANG_EXTENSIONS = {lang: row["extensions"] for lang, row in chunkers.LANGUAGE_TA
 CODE_SKIP_DIR_NAMES = chunkers.UNIVERSAL_SKIP_DIRS
 
 CODE_SCHEMA_VERSION = 2
-CODE_TABLES = ("chunks", "fts", "embeddings", "file_sha", "code_meta", "code_schema")
+# Fix-wave item 8: code_project belongs here too -- the v1->v2 preserving
+# path (_preserved_code_config, below) reads the OLD code_meta before this
+# drop runs and reinserts code_project rows from it, but a rebuild that
+# left an old code_project table standing would carry forward whatever
+# stale langs/embedding_mode rows an older engine wrote instead of the
+# reseeded ones. Dropping it here and letting it get recreated by
+# CODE_SCHEMA_SQL, then reseeded from `keep`, is the same "rebuilt empty,
+# non-derived facts carried over" contract the other derived tables get.
+CODE_TABLES = ("chunks", "fts", "embeddings", "file_sha", "code_meta", "code_schema", "code_project")
 
 CODE_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS code_project (
@@ -1870,20 +1907,45 @@ def _split_sql(script: str) -> list[str]:
 
 def _preserved_code_config(conn: sqlite3.Connection):
     """(project, code_root, langs) rows an older code_meta holds -- the one
-    thing a rebuild must carry over, or nothing can reindex automatically."""
+    thing a rebuild must carry over, or nothing can reindex automatically.
+
+    `langs` is read from `code_project` when that table exists -- schema
+    v2 moved langs OFF code_meta and onto code_project, so a v2 (or later)
+    db being rebuilt has no "langs" column on code_meta at all; reading
+    only code_meta (as this used to) would silently carry every project
+    forward with langs=NULL, wiping the one fact this whole function
+    exists to preserve. code_meta's own "langs" column is read only as the
+    v1 fallback, for a db old enough to have never had code_project."""
     if not conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='code_meta'"
     ).fetchone():
         return []
+    project_langs = {}
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='code_project'"
+    ).fetchone():
+        project_langs = dict(conn.execute("SELECT project, langs FROM code_project"))
     cols = {r[1] for r in conn.execute("PRAGMA table_info(code_meta)")}
-    langs_expr = "langs" if "langs" in cols else "NULL"
-    return [
-        tuple(r)
-        for r in conn.execute(
-            f"SELECT project, code_root, {langs_expr} FROM code_meta "
-            "WHERE code_root IS NOT NULL AND code_root<>''"
-        )
-    ]
+    meta_langs_expr = "langs" if "langs" in cols else "NULL"
+    rows = []
+    for project, code_root, meta_langs in conn.execute(
+        f"SELECT project, code_root, {meta_langs_expr} FROM code_meta "
+        "WHERE code_root IS NOT NULL AND code_root<>''"
+    ):
+        rows.append((project, code_root, project_langs.get(project, meta_langs)))
+    return rows
+
+
+class CodeIndexTooNew(sqlite3.DatabaseError):
+    """Fix-wave item 9: the db's code_schema.version is GREATER than this
+    engine's CODE_SCHEMA_VERSION -- written by a newer engine than the one
+    running now. Never silently used (an older engine guessing at a newer
+    schema's meaning is how data gets corrupted quietly); never silently
+    rebuilt either (that would DESTROY a newer engine's index). Derives
+    from sqlite3.DatabaseError so every existing `except sqlite3.
+    DatabaseError` fail-open path (cmd_code_search, why's code-index fast
+    path) already degrades gracefully without new except clauses, but
+    callers that want the specific message can catch this type by name."""
 
 
 def open_code_db(db_path: Path) -> sqlite3.Connection:
@@ -1891,11 +1953,20 @@ def open_code_db(db_path: Path) -> sqlite3.Connection:
     languages a project indexes. A db written by an older engine is
     rebuilt empty in one transaction, keeping exactly that fact, so the
     next code-search finds the index stale (not uninitialized) and heals
-    it."""
+    it. A db written by a NEWER engine (code_schema.version above this
+    engine's CODE_SCHEMA_VERSION) is refused outright -- see
+    CodeIndexTooNew."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
-    if code_schema_version(conn) < CODE_SCHEMA_VERSION:
+    version = code_schema_version(conn)
+    if version > CODE_SCHEMA_VERSION:
+        conn.close()
+        raise CodeIndexTooNew(
+            f"code index written by a newer engine (schema {version} > {CODE_SCHEMA_VERSION}); "
+            "upgrade the engine or delete the db"
+        )
+    if version < CODE_SCHEMA_VERSION:
         keep = _preserved_code_config(conn)
         try:
             conn.execute("BEGIN")
@@ -2633,13 +2704,22 @@ def cmd_code_reindex(args) -> int:
     # run that adds or changes chunks on a `full` project downgrades the
     # project to `none` in the SAME transaction (the invariant tested is
     # actual coverage: every chunk of a `full` project has an embedding
-    # row); a run without --no-embed always sets `full`; a --no-embed run
-    # that changes nothing leaves whatever mode was stored intact.
+    # row); a --no-embed run that changes nothing leaves whatever mode was
+    # stored intact.
+    #
+    # Fix-wave item 1: a run WITHOUT --no-embed must not set `full` just
+    # because it embedded everything it walked -- it only ever sees the
+    # root(s) it was given, and another root's chunks may still lack
+    # vectors (from an earlier --no-embed run there, or one never run at
+    # all). So after the embedding writes above, derive the mode from
+    # actual PROJECT-wide coverage: `full` iff no chunk of the project (any
+    # root) lacks an embeddings row.
     mutated = (added_files + changed_files) > 0
     mode_now = conn.execute(
         "SELECT embedding_mode FROM code_project WHERE project=?", (args.project,)
     ).fetchone()["embedding_mode"]
     downgraded = False
+    stranded_elsewhere = 0
     if args.no_embed:
         if mutated and mode_now == "full":
             conn.execute(
@@ -2647,7 +2727,15 @@ def cmd_code_reindex(args) -> int:
             )
             downgraded = True
     else:
-        conn.execute("UPDATE code_project SET embedding_mode='full' WHERE project=?", (args.project,))
+        stranded_elsewhere = conn.execute(
+            "SELECT COUNT(*) AS n FROM chunks c LEFT JOIN embeddings e ON e.chunk_id = c.id "
+            "WHERE c.project=? AND e.chunk_id IS NULL",
+            (args.project,),
+        ).fetchone()["n"]
+        conn.execute(
+            "UPDATE code_project SET embedding_mode=? WHERE project=?",
+            ("none" if stranded_elsewhere else "full", args.project),
+        )
 
     conn.commit()
     conn.close()
@@ -2662,6 +2750,11 @@ def cmd_code_reindex(args) -> int:
         print(
             f"code-reindex: embeddings are now incomplete for {args.project}; embedding mode set "
             "to none (run without --no-embed to restore)"
+        )
+    if stranded_elsewhere:
+        print(
+            f"code-reindex: {stranded_elsewhere} chunk(s) in other roots have no embedding; "
+            "embedding mode stays none (run code-reindex without --no-embed on every root)"
         )
     if skipped_unknown:
         # Task 5 census (spec S4, INC-0103/0104 lesson): a walked file whose
@@ -3003,7 +3096,17 @@ def code_index_report(conn: sqlite3.Connection, project: str) -> dict:
     changed = sum(r["changed"] for r in roots)
     failed = sum(r["failed"] for r in roots)
     not_indexed = sum(r["not_indexed"] for r in roots)
-    availability_changed = any(r["availability_changed"] for r in roots)
+    # Fix-wave item 4 (Grok G2): a MISSING root's own availability_changed
+    # flag must never make the project eligible for heal -- heal_code_index
+    # skips exists=False roots outright (there is nothing there to
+    # re-index), so a missing root's stale not-indexed rows can never
+    # actually get resolved by a heal attempt; counting them into the
+    # aggregate just re-triggers "eligible" on every single search forever,
+    # for a heal that touches nothing. The per-root flag itself still
+    # reflects reality (_root_report computes it before checking `exists`);
+    # only the project-wide aggregate ignores a root that isn't there. A
+    # missing root still forces `degraded` via missing_root below.
+    availability_changed = any(r["availability_changed"] for r in roots if r["exists"])
     missing_root = any(not r["exists"] for r in roots)
     if changed:
         state = "stale"
@@ -3046,9 +3149,13 @@ def heal_code_index(conn: sqlite3.Connection, db_path: Path, project: str, repor
     if not eligible:
         return report, conn
     if report["changed"] > limit:
+        # Fix-wave item 7: name the report's actual state, not a hardcoded
+        # "stale" -- this refusal fires for a `degraded` report too (heal
+        # is eligible on `stale` OR `degraded`), and "index is stale" is
+        # simply wrong when the report says degraded.
         print(
-            f"code-search: index is stale ({report['changed']} file(s) changed since the last "
-            f"code-reindex, above --heal-limit {limit}); run code-reindex",
+            f"code-search: index is {report['state']} ({report['changed']} file(s) changed since "
+            f"the last code-reindex, above --heal-limit {limit}); run code-reindex",
             file=sys.stderr,
         )
         return report, conn
@@ -3082,6 +3189,18 @@ def heal_code_index(conn: sqlite3.Connection, db_path: Path, project: str, repor
             print(f"code-search: index healed ({reindexed} file(s) re-indexed)", file=sys.stderr)
         return after, conn
     except Exception as exc:
+        # Fix-wave item 6: `conn` may already be the REOPENED connection
+        # (code_index_report itself raised, after the line above swapped
+        # `conn` back to a live handle) -- close it before reassigning, or
+        # that connection leaks. try/except because `conn` may equally
+        # still be the one this function already closed a few lines up
+        # (the reindex loop itself raised, before the reopen ran); closing
+        # an already-closed sqlite3.Connection is harmless, but nothing
+        # here should depend on that.
+        try:
+            conn.close()
+        except Exception:
+            pass
         conn = open_code_db(db_path)
         print(
             f"code-search: heal failed ({type(exc).__name__}: {exc}); answering from the current index",
@@ -3092,7 +3211,20 @@ def heal_code_index(conn: sqlite3.Connection, db_path: Path, project: str, repor
 
 def cmd_code_search(args) -> int:
     db_path = resolve_code_db_path(args)
-    conn = open_code_db(db_path)
+    # Fix-wave item 9: a db written by a newer engine must never crash
+    # code-search -- fail open with the refusal's own message and no
+    # results, same shape as the uninitialized-project case below.
+    try:
+        conn = open_code_db(db_path)
+    except CodeIndexTooNew as exc:
+        print(f"code-search: {exc}", file=sys.stderr)
+        if args.json:
+            print(json.dumps(
+                {"state": "unavailable", "code_root": None, "indexed_at": None,
+                 "head_sha": None, "results": []},
+                indent=2,
+            ))
+        return 0
 
     report = code_index_report(conn, args.project)
 

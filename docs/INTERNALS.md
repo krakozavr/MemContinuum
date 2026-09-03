@@ -798,20 +798,26 @@ source-sha-only skip would serve chunks from a superseded chunker forever after
 a backend change — a one-way door. Bumping a row's `impl_version` is therefore
 the supported way to force re-chunking of one language's files.
 
-An index written by an older engine is rebuilt on first use, keeping its
-roots and languages: `open_code_db` compares the stored schema version
-against the current one and, on a mismatch, drops and recreates every
-derived table (`chunks`, `fts`, `embeddings`, `file_sha`, `code_meta`) inside
-one transaction, carrying the old `code_meta`'s `(project, code_root, langs)`
-rows forward into the fresh tables first — an older schema keeps its roots
-and languages in `code_meta` itself, since `code_project` (where `langs`
-lives from schema v2 on) does not exist there yet. `embedding_mode` does
-**not** survive: the fresh `code_project` row this rebuild inserts always
-starts at `none`, since an older schema tracked no such concept to carry
-forward — so the first `code-search` after a rebuild reads the project as
-`stale` (never `uninitialized`, since its roots and languages did survive)
-and, if it heals, heals without embeddings until a `code-reindex` without
-`--no-embed` runs.
+`open_code_db` compares the stored schema version against the current
+one. When the stored version is OLDER, the index is rebuilt on first use,
+keeping its roots and languages: every derived table (`chunks`, `fts`,
+`embeddings`, `file_sha`, `code_meta`, `code_schema`, `code_project`) is
+dropped and recreated inside one transaction, carrying `(project,
+code_root, langs)` forward into the fresh tables first — `langs` comes
+from the old `code_project` when that table exists (schema v2 and later,
+where langs actually lives), falling back to `code_meta`'s own `langs`
+column only for a v1 db (which has no `code_project` at all and stored
+langs directly on `code_meta`). `embedding_mode` does **not** survive: the
+fresh `code_project` row this rebuild inserts always starts at `none`,
+since an older schema tracked no such concept to carry forward — so the
+first `code-search` after a rebuild reads the project as `stale` (never
+`uninitialized`, since its roots and languages did survive) and, if it
+heals, heals without embeddings until a `code-reindex` without
+`--no-embed` runs. When the stored version is NEWER than this engine's
+own, `open_code_db` refuses the db outright (`CodeIndexTooNew`, a
+`sqlite3.DatabaseError`) rather than silently using or rebuilding it —
+`code-search`/`why` fail open around that refusal (a message, no crash,
+no results) instead of destroying an index a newer engine wrote.
 
 ### Skip predicate
 
@@ -1224,7 +1230,12 @@ down:
   missing root separately when they apply. `--json` wraps hits in
   `{"state", "code_root", "code_roots", "indexed_at", "head_sha", "changed",
   "failed", "not_indexed", "embedding_mode", "results"}`. A "nothing found" is
-  only evidence when `state` is `current`.
+  only evidence when `state` is `current`. A db written by a newer engine
+  (see `CodeIndexTooNew` above) never reaches `code_index_report` at all —
+  `code-search` exits 0 with the refusal on stderr and, in `--json`, a
+  minimal `{"state": "unavailable", "code_root": null, "indexed_at": null,
+  "head_sha": null, "results": []}` (no `code_roots`/`changed`/`failed`/
+  `not_indexed`/`embedding_mode`, since none of those were ever computed).
 
 ## Test conventions
 
