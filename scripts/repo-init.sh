@@ -1392,56 +1392,39 @@ fi
 # Separate call from the decision-store reindex above -- code-reindex is
 # Anatomy's own intent index, keyed by --code-root, not --root/STORE (Task
 # 7's `--lang` contract: required on a project's FIRST code-reindex, no
-# hardcoded-swift default). Runs ONCE, for the first --code-root only --
-# code-reindex is single-root by construction (see B3 below). Skipped
-# entirely for language-less wiring (CHOSEN_LANGS
-# empty) -- per Task 7's carry, an empty --lang set means "nothing to
-# index yet", not "index nothing and call it done." Same --no-embed
-# rationale as step 7's decision-store reindex above: a fresh corpus is
-# not worth a network-dependent embed at install time. Unlike the
+# hardcoded-swift default). Skipped entirely for language-less wiring
+# (CHOSEN_LANGS empty) -- per Task 7's carry, an empty --lang set means
+# "nothing to index yet", not "index nothing and call it done." Same
+# --no-embed rationale as step 7's decision-store reindex above: a fresh
+# corpus is not worth a network-dependent embed at install time. Unlike the
 # decision-store reindex, a failure here HARD-FAILS the install (exit 13,
 # its own code, distinct from the decision-store reindex's exit 7) --
 # code-reindex's own per-file handling already fails open for a single bad
 # file, so a non-zero exit here is structural (bad db, bad --code-root,
 # bad --lang), the same class of problem exit 7 already treats as fatal.
 #
-# B3 (Anatomy M1 fix wave): exactly ONE root is indexed -- the first, the
-# same one the hooks wire as MEMCONTINUUM_CODE_ROOT. `code-reindex` is
-# single-root by construction: it deletes every stored path it did not see
-# under the root it was given, and overwrites code_meta.code_root. Looping
-# it over several roots therefore left only the LAST root indexed, having
-# quietly deleted the earlier ones' rows on the way -- an install that
-# reported success while throwing most of its own work away. The honest
-# thing with several roots is to index one and SAY which were not indexed.
+# `code-reindex` is root-scoped: it stores rows keyed by (project,
+# code_root) and only ever touches the root it was given, so one
+# code-reindex call per --code-root indexes every root, without any of
+# them deleting another's rows. A --lang equal to (or a superset of) the
+# project's stored set is accepted on every root, so the same $CHOSEN_LANGS
+# passes on each call in the loop below.
 CODE_REINDEX_RAN=0
 CODE_REINDEX_RC=0
 CODE_REINDEX_OUT=""
 if [ "${#CODE_ROOTS_ABS[@]}" -gt 0 ] && [ -n "$CHOSEN_LANGS" ]; then
     CODE_REINDEX_RAN=1
-    CODE_REINDEX_ROOT="${CODE_ROOTS_ABS[0]}"
-    CODE_REINDEX_CMD=("$PYTHON_BIN" "$MEMIDX" code-reindex --code-root "$CODE_REINDEX_ROOT" --project "$PROJECT" --lang "$CHOSEN_LANGS" --no-embed)
-    step "code-reindex ($CODE_REINDEX_ROOT): PYTHONPATH= ${CODE_REINDEX_CMD[*]}"
-    if [ "${#CODE_ROOTS_ABS[@]}" -gt 1 ]; then
-        echo
-        echo "*** NOTE: only the first code root is indexed ***"
-        echo "    indexed     : $CODE_REINDEX_ROOT"
-        i=0
-        for cr in "${CODE_ROOTS_ABS[@]}"; do
-            if [ "$i" -gt 0 ]; then
-                echo "    NOT indexed : $cr"
-            fi
-            i=$((i + 1))
-        done
-        echo "    The code index holds one root per project: only the first code"
-        echo "    root is indexed, the others are not. Code under the roots above"
-        echo "    is NOT searchable via code-search, though a new file written"
-        echo "    there still gets the new-file reminder."
-        echo
-    fi
-    if [ "$DRY_RUN" -eq 0 ]; then
-        CODE_REINDEX_OUT="$(PYTHONPATH= "${CODE_REINDEX_CMD[@]}" 2>&1)"
-        CODE_REINDEX_RC=$?
-    fi
+    for CODE_REINDEX_ROOT in "${CODE_ROOTS_ABS[@]}"; do
+        CODE_REINDEX_CMD=("$PYTHON_BIN" "$MEMIDX" code-reindex --code-root "$CODE_REINDEX_ROOT" --project "$PROJECT" --lang "$CHOSEN_LANGS" --no-embed)
+        step "code-reindex ($CODE_REINDEX_ROOT): PYTHONPATH= ${CODE_REINDEX_CMD[*]}"
+        if [ "$DRY_RUN" -eq 0 ]; then
+            out="$(PYTHONPATH= "${CODE_REINDEX_CMD[@]}" 2>&1)"
+            rc=$?
+            CODE_REINDEX_OUT="${CODE_REINDEX_OUT}${out}
+"
+            [ "$rc" -ne 0 ] && CODE_REINDEX_RC=$rc
+        fi
+    done
 elif [ "${#CODE_ROOTS_ABS[@]}" -gt 0 ]; then
     step "code-reindex: skipped (language-less wiring, no languages chosen)"
 fi

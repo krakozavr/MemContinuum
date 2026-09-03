@@ -2100,14 +2100,11 @@ class TestCodeCensusAndConsentDialogue(unittest.TestCase):
             shutil.rmtree(home, ignore_errors=True)
 
 
-class TestMultiRootCodeIndexTruncation(unittest.TestCase):
-    """B3 (final fix wave): `code-reindex` is single-root by construction --
-    it removes every stored path it did not see under the root it was
-    given, and overwrites code_meta.code_root. Running it once per
-    --code-root therefore left only the LAST root indexed, having quietly
-    deleted the previous ones' rows. The installer now indexes exactly the
-    first code root (the same one the hooks wire as
-    MEMCONTINUUM_CODE_ROOT) and says loudly which roots it did not."""
+class TestMultiRootCodeIndex(unittest.TestCase):
+    """`code-reindex` is root-scoped: indexing one root touches only that
+    root's own stored rows (code_meta is keyed by (project, code_root)), so
+    repo-init runs one code-reindex call per --code-root and indexes all
+    of them, instead of only the first."""
 
     @staticmethod
     def _two_roots(home):
@@ -2119,7 +2116,7 @@ class TestMultiRootCodeIndexTruncation(unittest.TestCase):
         shutil.copy(PY_CORPUS / "basic_functions.py", second / "beta_module.py")
         return first, second
 
-    def test_only_the_first_root_is_indexed_and_the_rest_are_named(self):
+    def test_every_code_root_is_indexed(self):
         home = sandbox_home()
         try:
             store = str(Path(home) / "store")
@@ -2136,31 +2133,35 @@ class TestMultiRootCodeIndexTruncation(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             out = proc.stdout + proc.stderr
 
-            # The note must NAME the un-indexed root, not just hint at one.
-            self.assertIn(str(second), out, out)
-            self.assertIn("only the first code root is indexed", out.lower(), out)
-            # ... and it must say so in present tense: no roadmap vocabulary in
-            # anything a person reads during an install.
+            # One code-reindex step line per root, naming that root.
+            self.assertIn(f"code-reindex ({first})", out, out)
+            self.assertIn(f"code-reindex ({second})", out, out)
+            self.assertNotIn("NOTE: only the first", out, out)
+            # Present tense throughout: no roadmap vocabulary in anything a
+            # person reads during an install.
             self.assertNotIn("milestone", out.lower(), out)
 
             code_db = Path(home) / ".memcontinuum" / "multi-code.sqlite"
             self.assertTrue(code_db.is_file(), out)
             conn = sqlite3.connect(str(code_db))
             try:
-                meta = conn.execute(
-                    "SELECT code_root FROM code_meta WHERE project=?", ("multi",)
-                ).fetchone()
+                roots = {
+                    r[0] for r in conn.execute(
+                        "SELECT code_root FROM code_meta WHERE project=?", ("multi",)
+                    ).fetchall()
+                }
                 paths = {r[0] for r in conn.execute("SELECT DISTINCT path FROM chunks")}
             finally:
                 conn.close()
-            self.assertEqual(meta[0], str(first))
-            self.assertEqual(paths, {"alpha_module.py"}, paths)
+            self.assertEqual(roots, {str(first), str(second)}, roots)
+            self.assertEqual(paths, {"alpha_module.py", "beta_module.py"}, paths)
         finally:
             shutil.rmtree(home, ignore_errors=True)
 
     def test_no_removed_churn_from_a_second_root(self):
-        """The symptom the single-root rule exists to prevent: a second
-        code-reindex pass reporting the first root's files as "removed"."""
+        """Each root's code-reindex call is scoped to that root alone: a
+        second root's own first index must never report the first root's
+        files as "removed"."""
         home = sandbox_home()
         try:
             store = str(Path(home) / "store")
