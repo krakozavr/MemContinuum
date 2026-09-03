@@ -1267,15 +1267,16 @@ class TestCodeCensus(unittest.TestCase):
             self.assertEqual(counts["python"], {"files": 0, "status": "supported"})
             self.assertEqual(counts["swift"], {"files": 0, "status": "supported"})
 
-    def test_language_table_skip_dirs_pruned_even_though_no_lang_is_wired(self):
-        """Controller-scope addition #2: census walks with the GLOBAL skip
-        set UNIONED with EVERY LANGUAGE_TABLE row's skip_dirs -- not just a
-        wired subset (there is none yet at census time, unlike
-        iter_code_source_files' walk). A project's untouched .venv/
-        (python's own skip_dir) and Tests/ (swift's own skip_dir) must
-        never be counted, even though census names no langs at all -- a
-        census that counted thousands of files under .venv/ would be pure
-        noise."""
+    def test_universal_skip_dirs_pruned_and_language_skip_dirs_scoped_to_own_language(self):
+        """Controller-scope addition #2, moved to the D7-as-reconciled
+        contract (Ruling 17): census walks with ONLY the universal noise
+        set pruned (CODE_SKIP_DIR_NAMES == chunkers.UNIVERSAL_SKIP_DIRS) --
+        not a union of every LANGUAGE_TABLE row's skip_dirs. `.venv/`
+        (universal noise) is never counted for any language. `Tests/`
+        (swift's own skip_dir, not python's) drops the swift file it holds
+        but NOT a python file in the very same directory -- the union rule
+        this superseded would have dropped both, silently losing real
+        python source to swift's noise rule."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "code"
             root.mkdir()
@@ -1285,10 +1286,16 @@ class TestCodeCensus(unittest.TestCase):
             tests_dir = root / "Tests"
             tests_dir.mkdir()
             shutil.copy(FIXTURES / "NestedTypes.swift", tests_dir / "NestedTypes.swift")
+            shutil.copy(PY_FIXTURES / "basic_functions.py", tests_dir / "also_python.py")
             shutil.copy(PY_FIXTURES / "basic_functions.py", root / "basic_functions.py")
 
             counts = memidx.code_census(root)
-            self.assertEqual(counts["python"], {"files": 1, "status": "supported"})
+            # basic_functions.py at root + also_python.py under Tests/ --
+            # python has no "Tests" skip_dir, so both count.
+            self.assertEqual(counts["python"], {"files": 2, "status": "supported"})
+            # NestedTypes.swift under Tests/ -- swift's own skip_dir drops
+            # it; vendored.py under .venv/ never reaches a language check
+            # at all (universal noise, pruned before the walk descends).
             self.assertEqual(counts["swift"], {"files": 0, "status": "supported"})
 
     def test_exit_code_is_always_zero_even_on_a_nonexistent_root(self):
@@ -1320,6 +1327,39 @@ class TestCodeCensus(unittest.TestCase):
             self.assertLess(out.index("supported:"), out.index("unsupported:"))
             self.assertIn("python: 2", out)
             self.assertIn(".cs: 1", out)
+
+
+class TestCensusSkipRule(unittest.TestCase):
+    """D7 as reconciled (Ruling 17, "your call"): the census prunes
+    chunkers.UNIVERSAL_SKIP_DIRS only -- the same universal noise set
+    iter_code_source_files prunes. A SUPPORTED file is then dropped iff an
+    ancestor directory on its root-relative path sits in ITS OWN
+    language's skip_dirs (chunkers.path_is_skipped_for_lang, the same
+    per-file test the indexer's walk already uses) -- a union rule would
+    have hidden a real `Tests/x.cs` file behind swift's "Tests" skip_dir
+    even though `.cs` has no language of its own to skip anything for. An
+    UNSUPPORTED extension is always counted, in any directory that is not
+    universal noise -- it has no language, so it has no skip_dirs to be
+    dropped by."""
+
+    def test_per_file_language_skip_and_unsupported_counted(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "Tests").mkdir()
+            (root / "node_modules").mkdir()
+            # python has no "Tests" skip_dir -> counted
+            (root / "Tests" / "t.py").write_text("def t():\n    pass\n")
+            # swift's own skip_dir names "Tests" -> not counted
+            (root / "Tests" / "T.swift").write_text("func t() {}\n")
+            # unsupported extension, no language to skip it -> always counted
+            (root / "Tests" / "x.cs").write_text("class X {}\n")
+            # node_modules is universal noise -> pruned regardless of language
+            (root / "node_modules" / "m.py").write_text("")
+
+            counts = memidx.code_census(root)
+            self.assertEqual(counts["python"], {"files": 1, "status": "supported"})
+            self.assertEqual(counts["swift"], {"files": 0, "status": "supported"})
+            self.assertEqual(counts[".cs"], {"files": 1, "status": "unsupported"})
 
 
 class TestUnsupportedExtensionCensus(unittest.TestCase):

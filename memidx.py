@@ -1959,6 +1959,19 @@ def lang_for_source_file(path: Path) -> str | None:
     return chunkers.lang_for_shebang(first_line)
 
 
+def _root_relative_parts(path: Path, root: Path) -> tuple[str, ...]:
+    """`path`'s parts relative to `root`, for the per-file skip test
+    (`chunkers.path_is_skipped_for_lang`) both `iter_code_source_files` and
+    `code_census` share. Falls back to just the file's own basename if
+    `path` doesn't sit under `root` -- defensive only; every path handed in
+    here comes from an os.walk rooted at `root`, so this should never
+    actually trigger."""
+    try:
+        return path.relative_to(root).parts
+    except ValueError:
+        return (path.name,)
+
+
 def iter_code_source_files(root: Path, langs: list[str] | None, skipped: Counter | None = None):
     """Walk `root`, yielding source files whose language (see
     `lang_for_source_file` -- extension, or a shebang on an extensionless
@@ -2013,10 +2026,7 @@ def iter_code_source_files(root: Path, langs: list[str] | None, skipped: Counter
             path = Path(dirpath) / fname
             lang = lang_for_source_file(path)
             if lang is not None and lang in wired_set:
-                try:
-                    rel_parts = path.relative_to(root).parts
-                except ValueError:
-                    rel_parts = (fname,)
+                rel_parts = _root_relative_parts(path, root)
                 if chunkers.path_is_skipped_for_lang(rel_parts, lang):
                     continue
                 yield path
@@ -2676,32 +2686,6 @@ def cmd_code_reindex(args) -> int:
 NO_EXTENSION_BUCKET = "(no extension)"
 
 
-def _census_skip_dirs() -> set:
-    """Directory names pruned from a code-census walk: CODE_SKIP_DIR_NAMES
-    (== chunkers.UNIVERSAL_SKIP_DIRS: .git, .build, node_modules, vendor,
-    venv, .venv, __pycache__, .tox, .eggs) unioned with EVERY
-    LANGUAGE_TABLE row's skip_dirs.
-
-    Census runs BEFORE any language is wired -- it is the discovery step
-    repo-init's consent dialogue reads -- so there is no wired subset to
-    reason about, and the walk has to already look clean before the user
-    has chosen anything. On the global set alone, a Python project's own
-    `build/` or `dist/` packaging output (python's LANGUAGE_TABLE row, not
-    the global set) would count as signal -- those stay language-specific
-    on purpose, since the very same names are real user source in a
-    project that has no python wired at all.
-
-    Contrast iter_code_source_files, which answers a different question
-    once a language set exists: it prunes the global set plus the
-    INTERSECTION of the wired languages' skip sets, and drops a file only
-    when an ancestor directory is in ITS OWN language's set.
-    """
-    dirs = set(CODE_SKIP_DIR_NAMES)
-    for row in chunkers.LANGUAGE_TABLE.values():
-        dirs.update(row.get("skip_dirs", ()))
-    return dirs
-
-
 def _first_line_or_none(path: Path) -> str | None:
     """Read just the first line of `path`, fail-open. Any error (permission
     denied, undecodable bytes, empty file) yields None rather than raising
@@ -2722,29 +2706,45 @@ def _first_line_or_none(path: Path) -> str | None:
 
 def code_census(root: Path) -> dict:
     """Walk `root` and classify every file two ways: SUPPORTED (resolves to
-    a LANGUAGE_TABLE lang, whether by extension via chunkers.lang_for_path
-    or -- for an extensionless executable -- by chunkers.lang_for_shebang
-    matching a shebang stem) or UNSUPPORTED (an extension with no
-    LANGUAGE_TABLE row, or an extensionless file whose first line is not a
-    recognized shebang, bucketed under NO_EXTENSION_BUCKET). This is the
-    "three ways" the brief names: extension-supported, extension-
-    unsupported, and shebang-sniffed extensionless (itself supported or
-    unsupported depending on whether the shebang matched) -- the shebang
-    path folds into the SAME lang key an extension match would use, not a
-    separate status, so a `#!/usr/bin/env python3` script and a `foo.py`
-    file both count under the "python" key.
+    a LANGUAGE_TABLE lang via `lang_for_source_file` -- extension first,
+    else a shebang sniff for a REGULAR, non-symlinked extensionless file,
+    the one resolution rule the whole code-index side shares) or
+    UNSUPPORTED (an extension with no LANGUAGE_TABLE row, or an
+    extensionless file -- or a symlink, or any other non-regular entry --
+    whose language does not resolve, bucketed under NO_EXTENSION_BUCKET
+    when it also has no extension). This is the "three ways" the brief
+    names: extension-supported, extension-unsupported, and shebang-sniffed
+    extensionless (itself supported or unsupported depending on whether the
+    shebang matched) -- the shebang path folds into the SAME lang key an
+    extension match would use, not a separate status, so a
+    `#!/usr/bin/env python3` script and a `foo.py` file both count under
+    the "python" key. An extensionless symlink is never followed for a
+    shebang sniff (`lang_for_source_file`'s own guard) -- it always lands
+    in NO_EXTENSION_BUCKET as unsupported, the same as any other
+    non-regular file, so the census never promises a language for a file
+    the indexer's own walk would not read either.
 
     Returns {key: {"files": n, "status": "supported"|"unsupported"}} (the
     brief's JSON shape) -- `key` is a lang name for a supported row, else
     the raw extension string (or NO_EXTENSION_BUCKET) for an unsupported
-    one. Directory pruning: _census_skip_dirs() (global set UNION every
-    LANGUAGE_TABLE row's skip_dirs -- see its docstring for why this is
-    wider than a wired-langs walk). Fails open per file and never raises on
-    a walk it can complete: os.walk over a missing/unreadable root just
-    yields nothing, so an empty or nonexistent root returns the zero-seeded
-    rows below -- every LANGUAGE_TABLE language at 0, no unsupported rows at
-    all -- rather than an error (or an empty dict)."""
-    skip_dirs = _census_skip_dirs()
+    one.
+
+    Directory pruning: the walk prunes CODE_SKIP_DIR_NAMES (==
+    chunkers.UNIVERSAL_SKIP_DIRS: .git, .build, node_modules, vendor,
+    venv, .venv, __pycache__, .tox, .eggs) -- the same universal noise set
+    iter_code_source_files prunes, and nothing wider. A SUPPORTED file is
+    then dropped only when an ancestor directory on its root-relative path
+    sits in ITS OWN language's skip_dirs (chunkers.path_is_skipped_for_lang
+    against `_root_relative_parts`, the same per-file test and path helper
+    iter_code_source_files already applies once a language is wired). An
+    UNSUPPORTED extension has no language and so no skip_dirs of its own
+    -- it is always counted outside the universal noise dirs, never hidden
+    behind another language's skip set. Fails open per file and never
+    raises on a walk it can complete: os.walk over a missing/unreadable
+    root just yields nothing, so an empty or nonexistent root returns the
+    zero-seeded rows below -- every LANGUAGE_TABLE language at 0, no
+    unsupported rows at all -- rather than an error (or an empty dict)."""
+    skip_dirs = CODE_SKIP_DIR_NAMES
     # C5 (Anatomy M1 fix wave, Codex): EVERY LANGUAGE_TABLE language gets a
     # row, seeded at zero, whether or not the tree holds one of its files.
     # The driven install flow (skills/memcontinuum/SKILL.md step 2) has to
@@ -2763,27 +2763,22 @@ def code_census(root: Path) -> dict:
         dirnames[:] = [d for d in dirnames if d not in skip_dirs]
         for fname in sorted(filenames):
             path = Path(dirpath) / fname
-            # I2: compound-extension aware, so `foo.blade.php` is keyed
-            # ".blade.php" and never folded into the ".php" bucket
-            # lang_for_path already refuses to treat it as.
-            ext = chunkers.extension_of(fname)
-            if ext:
-                lang = chunkers.lang_for_path(path)
-                if lang is not None:
-                    bump(lang, "supported")
-                else:
-                    bump(ext, "unsupported")
+            # lang_for_source_file is the one resolution rule the whole
+            # code-index side shares: extension first (I2 compound-aware,
+            # so `foo.blade.php` is never folded into `.php`), else a
+            # shebang sniff for an extensionless file (controller-scope
+            # addition, Task 5 reviewer finding -- the "second silent
+            # gap": extensionless scripts used to vanish from the census
+            # entirely).
+            lang = lang_for_source_file(path)
+            if lang is None:
+                ext = chunkers.extension_of(fname)
+                bump(ext or NO_EXTENSION_BUCKET, "unsupported")
                 continue
-            # Extensionless: only a recognized shebang saves it from the
-            # catch-all bucket (controller-scope addition, Task 5 reviewer
-            # finding -- the "second silent gap": extensionless scripts
-            # used to vanish from the census entirely).
-            first_line = _first_line_or_none(path)
-            lang = chunkers.lang_for_shebang(first_line) if first_line else None
-            if lang is not None:
-                bump(lang, "supported")
-            else:
-                bump(NO_EXTENSION_BUCKET, "unsupported")
+            rel_parts = _root_relative_parts(path, root)
+            if chunkers.path_is_skipped_for_lang(rel_parts, lang):
+                continue
+            bump(lang, "supported")
 
     return counts
 

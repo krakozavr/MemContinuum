@@ -818,10 +818,13 @@ Consequence, and the point of the design: with Swift and Python both wired,
 `Tests/Foo.swift` is not. A union rule dropped both, silently losing Python
 source the census had just proposed Python on the strength of.
 
-`_census_skip_dirs` is deliberately wider — the global set unioned with *every*
-table row's `skip_dirs` — because a census runs before any language is wired, so
-there is no wired subset to reason about; without it, an untouched Python
-project's census would count thousands of files under `.venv/` as signal.
+The census walk applies the same skip predicate. It prunes `CODE_SKIP_DIR_NAMES`
+only — there is no wired language set at census time to intersect against, so
+it prunes nothing narrower and nothing wider — and then drops a supported file
+by the same per-file rule above: an ancestor directory in *that file's own*
+language's `skip_dirs`. An unsupported extension has no language and so no
+`skip_dirs` of its own; it is always counted outside the global noise dirs,
+never hidden behind another language's skip set.
 
 ### Unindexed-file tally
 
