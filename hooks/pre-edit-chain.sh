@@ -99,7 +99,15 @@ if [ -z "${MC_UNDER_TIMEOUT:-}" ]; then
 fi
 
 MEMCONTINUUM_HOME="${MEMCONTINUUM_HOME:-$HOME/.memcontinuum}"
-PY="${MC_GUARD_PY:-$SCRIPT_DIR/../.venv/bin/python}"
+# Coordinator review fix: MC_GUARD_PY is unset whenever mc-watchdog.sh
+# fails to source (e.g. MC_WATCHDOG_LIB_PATH pointing nowhere) -- falling
+# straight to the hardcoded engine-venv default in that case silently
+# dropped an explicitly baked MEMCONTINUUM_PYTHON (verified: a fake
+# python that only mc-watchdog.sh's own resolution step would ever
+# invoke was skipped entirely). MEMCONTINUUM_PYTHON is now the second
+# fallback, ahead of the hardcoded venv path -- same env->config.sh->venv
+# precedence every other hook uses, restored for this one path.
+PY="${MC_GUARD_PY:-${MEMCONTINUUM_PYTHON:-$SCRIPT_DIR/../.venv/bin/python}}"
 LOG="$MEMCONTINUUM_HOME/hook.log"
 
 mkdir -p "$MEMCONTINUUM_HOME" 2>/dev/null

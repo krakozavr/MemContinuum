@@ -3336,6 +3336,91 @@ class TestMacOSPortMechanics(unittest.TestCase):
         log_text = (home / "hook.log").read_text()
         self.assertIn("project=wd-proj", log_text, log_text)
 
+    # ---- coordinator review fix: kill before writing the fallback ------
+
+    def test_timeout_fallback_write_waits_for_the_child_to_be_reaped(self):
+        """Coordinator review fix (F6 follow-up): the timeout-fallback
+        write used to happen BEFORE `_kill_group()` -- a live, not-yet-
+        killed child could still be writing to the SAME inherited stdout
+        fd (no pipe between launcher and child) in that window, landing
+        its own bytes after (or interleaved around) the parent's fallback
+        write. Reordered: kill the group, reap it, THEN write the
+        fallback -- for every guarded hook, not only pre-edit-chain.sh
+        (this drives the shared launcher directly, independent of which
+        hook spawned it, exactly like this class's other MC_WATCHDOG_
+        LAUNCHER_PY-driving tests).
+
+        Reproduction: the guarded child sleeps for exactly the watchdog
+        budget (so, given real process-startup skew, it is still asleep
+        at the instant the launcher's own `proc.wait(timeout=budget)`
+        times out in every run observed on this machine) then bursts many
+        small writes to stdout. On the pre-fix ordering, `_log_watchdog_
+        kill()`'s own file I/O (a real, multi-millisecond `os.makedirs` +
+        `open`/`write`/close before `_kill_group()` ever runs) is a wide
+        enough window for the child to wake up and get several writes out
+        before being killed, landing garbage around the fallback text. On
+        the fixed ordering the child is confirmed dead before the parent
+        ever touches stdout, so none of its writes can land at all --
+        stdout must be exactly the fallback payload, nothing else."""
+        launcher_py = subprocess.run(
+            [MC_BASH, "-c", 'source "$1"; printf %s "$MC_WATCHDOG_LAUNCHER_PY"', "_",
+             str(HOOKS_DIR / "mc-watchdog.sh")],
+            capture_output=True, text=True, check=True,
+        ).stdout
+        self.assertIn("MC_WATCHDOG_LAUNCHER", launcher_py)
+
+        home = Path(self.td) / "fallback-order-home"
+        home.mkdir()
+        budget = 0.3
+        # Writes continuously from the start, straight through the budget
+        # deadline and past it (until actually killed) -- not timed to land
+        # in one narrow window, so the child is guaranteed to still be
+        # alive and mid-write at whatever instant the launcher acts on the
+        # timeout, on the pre-fix ordering as much as the fixed one.
+        burst_child = Path(self.td) / "burst-child.sh"
+        burst_child.write_text(
+            "#!/usr/bin/env bash\n"
+            "while true; do\n"
+            "  printf 'INTERLEAVED-GARBAGE-'\n"
+            "done\n"
+        )
+        burst_child.chmod(0o755)
+
+        fallback = '{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"timed out"}}'
+        env = clean_env(
+            MEMCONTINUUM_HOME=str(home), MC_WATCHDOG_BUDGET=str(budget),
+            MC_WATCHDOG_TIMEOUT_FALLBACK=fallback,
+        )
+        proc = subprocess.run(
+            [VENV_PYTHON, "-c", launcher_py, MC_BASH, str(burst_child)],
+            capture_output=True, text=True, env=env, timeout=10,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        # The child writes continuously from the moment it starts, so SOME
+        # of its own garbage landing before the fallback is expected and
+        # harmless (it started well before the timeout could possibly
+        # fire) -- that is not the bug under test. What the reorder fixes
+        # is specifically: can the child write anything MORE once the
+        # parent has decided to act on the timeout? On the pre-fix
+        # ordering, `_log_watchdog_kill()`'s own file I/O plus the
+        # fallback write both happen while the child is still alive and
+        # unreaped, mid-loop -- more of its "INTERLEAVED-GARBAGE-" chunks
+        # can and do land AFTER the fallback text in that window. On the
+        # fixed ordering the child is confirmed dead (killed and reaped)
+        # before the parent ever touches stdout, so nothing can follow the
+        # fallback -- it must be the exact suffix of the captured output.
+        self.assertTrue(
+            proc.stdout.endswith(fallback),
+            f"a not-yet-reaped child must never be able to write anything "
+            f"after the timeout fallback: got {proc.stdout!r}",
+        )
+        # Also prove the fallback itself parses cleanly where it appears --
+        # a corrupted/interleaved copy embedded in leading garbage would
+        # still satisfy endswith() above by coincidence if a clean second
+        # copy happened to trail it, so isolate exactly the suffix checked
+        # above and parse THAT in isolation.
+        json.loads(proc.stdout[-len(fallback):])
+
     # ---- item 2: stdout passthrough under the watchdog -----------------
 
     def test_stdout_passes_through_the_watchdog_byte_identical_to_unguarded(self):

@@ -519,6 +519,46 @@ class TestPreEditChainHook(unittest.TestCase):
         self.assertTrue((custom_home / "hook.log").exists())
         self.assertFalse((default_mc_home / "hook.log").exists())
 
+    def test_watchdog_lib_missing_still_uses_explicit_memcontinuum_python(self):
+        """Coordinator review fix (F6 follow-up): mc-watchdog.sh sourcing
+        failure (MC_WATCHDOG_LIB_PATH pointing nowhere) leaves MC_GUARD_PY
+        unset -- the PY resolution line used to be
+        `PY="${MC_GUARD_PY:-$SCRIPT_DIR/../.venv/bin/python}"`, which falls
+        straight to the hardcoded engine-venv default in that case,
+        silently dropping an explicitly baked MEMCONTINUUM_PYTHON (mirrors
+        TestLedgerPostEdit.test_fail_open_when_watchdog_lib_missing in
+        tests/test_write_hooks.py, but that test only proves fail-open, not
+        that the EXPLICIT python actually ran -- a marker-writing fake
+        python, plus a real successful match that only the real venv
+        python (proxied through the fake one) can produce, proves it did)."""
+        marker = Path(self.tmp) / "watchdog-lib-missing-marker"
+        fake_py = Path(self.tmp) / "fake-python-explicit-marker"
+        fake_py.write_text(
+            "#!/usr/bin/env bash\n"
+            f"echo ran >> '{marker}'\n"
+            f'exec "{VENV_PYTHON}" "$@"\n'
+        )
+        fake_py.chmod(0o755)
+        payload = self._matching_payload()
+        env = clean_env(
+            MEMCONTINUUM_HOME=self.memtool_home,
+            MEMCONTINUUM_PROJECT=self.project,
+            MEMCONTINUUM_PYTHON=str(fake_py),
+            MEMCONTINUUM_STRIP_PREFIX="/fake/repo/",
+            MC_WATCHDOG_LIB_PATH="/nonexistent/mc-watchdog.sh",
+        )
+        proc, elapsed = run_hook(payload, env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("unbound variable", proc.stderr)
+        self.assertTrue(
+            marker.exists(),
+            "the explicit MEMCONTINUUM_PYTHON must still run when the watchdog "
+            "lib fails to source, not silently fall back to the engine venv",
+        )
+        self.assertTrue(proc.stdout.strip(), "expected additionalContext output, got nothing")
+        out = json.loads(proc.stdout)
+        self.assertIn("TOP-0042", out["hookSpecificOutput"]["additionalContext"])
+
 
 class TestF6RenderedTimeout(unittest.TestCase):
     """The OUTER Claude Code backstop: `code-root-filter-pair.json.tmpl`
