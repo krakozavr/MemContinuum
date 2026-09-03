@@ -7,17 +7,25 @@ on:
 
 jobs:
   unittest:
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
       - name: Install dependencies
         # requirements.lock (uv pip compile, exact pins + hashes) is what
         # actually ships -- requirements.txt itself uses >= minimums and is
         # not what CI (or scripts/repo-init.sh's bootstrap_venv, which
-        # prefers the lock the same way) installs from.
+        # prefers the lock the same way) installs from. Every pin in it
+        # carries a binary wheel for both matrix versions on
+        # manylinux_2_28 x86_64 (verified by download simulation before
+        # this matrix was added), so the same lock serves both legs
+        # unchanged.
         run: pip install -r requirements.lock
       - name: Cache fastembed model
         uses: actions/cache@v4
@@ -26,9 +34,11 @@ jobs:
           # define_cache_dir): tempfile.gettempdir()/fastembed_cache, i.e.
           # /tmp/fastembed_cache on a standard Linux runner -- NOT
           # ~/.cache/fastembed, which this package never uses unless
-          # FASTEMBED_CACHE_PATH is set (this repo doesn't set it).
+          # FASTEMBED_CACHE_PATH is set (this repo doesn't set it). Keyed
+          # per Python version so the two matrix legs don't race to write
+          # the same cache key.
           path: /tmp/fastembed_cache
-          key: fastembed-model-v1
+          key: fastembed-model-v1-${{ matrix.python-version }}
       - name: Run unittest suite
         # Same shell step resolves `python` for BOTH the interpreter that
         # just received `pip install -r requirements.lock` and the one
@@ -58,7 +68,35 @@ jobs:
         # ~/.cache/bash32 (gcc/make/bison, cached above) and re-runs the
         # shell-driving suites under it. This has been simulated locally in
         # a clean-cache build on this same ubuntu toolchain shape before
-        # this workflow was committed (see the task-9 report), so it is NOT
-        # marked continue-on-error.
+        # this workflow was committed, so it is NOT marked continue-on-error.
         run: |
           MEMCONTINUUM_PYTHON="$(command -v python)" bash tests/run_bash32.sh
+
+  macos:
+    # A real macOS runner, not a Bash-3.2-on-Ubuntu simulation: it exercises
+    # the actual BSD toolchain, filesystem, and the bash 3.2.57 Apple still
+    # ships at /bin/bash -- none of which the bash32 job above can reach.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        # Every lock pin carries a macOS arm64 wheel for this Python
+        # version (verified by download simulation before this job was
+        # added) -- no build toolchain required.
+        run: pip install -r requirements.lock
+      - name: Run unittest suite
+        # No fastembed-model cache here: GitHub's macOS runner image
+        # randomizes TMPDIR (and so fastembed's default cache dir) per VM
+        # boot, so a path-keyed cache would never hit -- the model
+        # downloads fresh each run instead, same as a cold cache-miss run
+        # on the Ubuntu leg.
+        run: |
+          MEMCONTINUUM_PYTHON="$(command -v python)" PYTHONPATH= python -m unittest discover -s tests
+      - name: Run bash 3.2 verification harness
+        # Real macOS /bin/bash is 3.2.57 already -- MC_BASH32 points
+        # run_bash32.sh at it directly instead of building one from source.
+        run: |
+          MEMCONTINUUM_PYTHON="$(command -v python)" MC_BASH32=/bin/bash bash tests/run_bash32.sh

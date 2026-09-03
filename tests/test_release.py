@@ -19,16 +19,31 @@ WORKFLOW = TOOLS_DIR / ".github" / "workflows" / "tests.yml"
 LOCKFILE = TOOLS_DIR / "requirements.lock"
 REQUIREMENTS = TOOLS_DIR / "requirements.txt"
 RUN_BASH32 = TOOLS_DIR / "tests" / "run_bash32.sh"
+README = TOOLS_DIR / "README.md"
 
 
 class TestReleaseHygiene(unittest.TestCase):
-    def test_pyproject_version_is_0_2_0rc1(self):
+    def test_pyproject_version_is_0_2_0rc2(self):
         text = PYPROJECT.read_text()
-        self.assertIn('version = "0.2.0rc1"', text)
+        self.assertIn('version = "0.2.0rc2"', text)
 
     def test_changelog_exists_and_mentions_the_version(self):
         self.assertTrue(CHANGELOG.exists())
-        self.assertIn("0.2.0rc1", CHANGELOG.read_text())
+        self.assertIn("0.2.0rc2", CHANGELOG.read_text())
+
+    def test_pyproject_python_floor_is_3_12(self):
+        text = PYPROJECT.read_text()
+        self.assertIn('requires-python = ">=3.12"', text)
+
+    def test_readme_requirement_line_agrees_with_pyproject_floor(self):
+        match = re.search(r'requires-python = ">=(\d+\.\d+)"', PYPROJECT.read_text())
+        self.assertIsNotNone(match, "pyproject.toml has no requires-python floor to compare against")
+        floor = match.group(1)
+        readme_text = README.read_text()
+        self.assertIn(
+            f"Python {floor}+", readme_text,
+            f"README Requirements section does not state the same Python {floor}+ floor as pyproject.toml",
+        )
 
     def test_ci_workflow_exists_and_runs_the_suite_with_pythonpath_cleared(self):
         self.assertTrue(WORKFLOW.exists())
@@ -39,6 +54,20 @@ class TestReleaseHygiene(unittest.TestCase):
     def test_ci_workflow_runs_bash32_harness(self):
         text = WORKFLOW.read_text()
         self.assertIn("run_bash32.sh", text)
+
+    def test_ci_workflow_runs_a_python_version_matrix(self):
+        text = WORKFLOW.read_text()
+        self.assertIn('"3.12"', text)
+        self.assertIn('"3.13"', text)
+        self.assertIn("matrix:", text)
+
+    def test_ci_workflow_has_a_macos_job(self):
+        text = WORKFLOW.read_text()
+        self.assertIn("macos-latest", text)
+        # The macOS job re-runs the shell-driving suites under a real
+        # bash 3.2.57 (MC_BASH32 points run_bash32.sh at it directly),
+        # not a from-source build like the Ubuntu bash32 job.
+        self.assertIn("MC_BASH32=/bin/bash", text)
 
     def test_lockfile_exists(self):
         self.assertTrue(LOCKFILE.exists())

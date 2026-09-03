@@ -146,7 +146,8 @@ wrong. Pick its one home.
 
 - macOS or Linux/WSL, `bash` 3.2+, `git`. The hooks and the installer run on
   stock macOS with nothing extra to install — no Homebrew, no GNU coreutils.
-- Python 3.10+ for the engine itself (`fastembed` requires it); the hooks' own
+- Python 3.12+ for the engine itself (the pinned dependency set — numpy
+  2.5.2's own wheels — ships for 3.12+); the hooks' own
   Python snippets stay on the standard library plus `PyYAML`, so they are
   content with the older Python macOS ships. A `sqlite3` with FTS5, which
   Python's own `sqlite3` module provides — nothing to install separately.
