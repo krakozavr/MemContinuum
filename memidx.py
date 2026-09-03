@@ -1203,12 +1203,22 @@ def cmd_chain(args) -> int:
 
 
 def code_ref_matches(file_path: str, code_ref: str) -> bool:
-    ref_path = code_ref.split("#", 1)[0]
-    if file_path == ref_path:
+    """The one path-matching helper every governance lookup (code_refs,
+    concept implemented_by/tested_by, drift's `allowed` exemption) shares
+    (F4). Segment-aware: a directory `code_ref` only contains a file
+    directly under it (a `/`-boundary check), never merely sharing a
+    string prefix -- `src/foo.py.bak` is not `src/foo.py`, and
+    `src/core2/x.py` is not under `src/core`. Both sides are
+    `rstrip("/")`d first, so a `code_ref` authored with a trailing slash
+    still matches. `#symbol` fragments are stripped before comparison,
+    unaffected by this fix."""
+    ref_path = code_ref.split("#", 1)[0].rstrip("/")
+    fp = file_path.rstrip("/")
+    if fp == ref_path:
         return True
-    if file_path.startswith(ref_path) or ref_path.startswith(file_path):
+    if fp.startswith(ref_path + "/") or ref_path.startswith(fp + "/"):
         return True
-    if fnmatch.fnmatch(file_path, ref_path):
+    if fnmatch.fnmatch(fp, ref_path):
         return True
     return False
 

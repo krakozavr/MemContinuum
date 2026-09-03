@@ -1351,5 +1351,78 @@ class TestSharedEvidenceValidator(unittest.TestCase):
                 self.assertEqual(memlint_clean, drift_is_hold, (name, errors, row))
 
 
+class TestF4CodeRefMatches(unittest.TestCase):
+    def test_suffix_collision_is_not_a_match(self):
+        self.assertFalse(memidx.code_ref_matches("src/foo.py.bak", "src/foo.py"))
+
+    def test_sibling_prefix_directory_is_not_a_match(self):
+        self.assertFalse(memidx.code_ref_matches("src/core2/x.py", "src/core"))
+
+    def test_exact_directory_containment_still_matches(self):
+        self.assertTrue(memidx.code_ref_matches("src/core/x.py", "src/core"))
+
+    def test_trailing_slash_ref_still_matches(self):
+        self.assertTrue(memidx.code_ref_matches("src/core/x.py", "src/core/"))
+
+    def test_exact_file_match_unchanged(self):
+        self.assertTrue(memidx.code_ref_matches("src/x.py", "src/x.py"))
+
+    def test_symbol_fragment_unaffected(self):
+        self.assertTrue(memidx.code_ref_matches("src/x.py", "src/x.py#Foo.bar"))
+
+    def test_topic_matches_for_path_no_longer_false_positives_on_suffix(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "topics"; root.mkdir()
+            (root / "t.md").write_text(
+                "---\ntype: topic\nid: TOP-1\ntitle: T\ncode_refs: [src/foo.py]\nlinks: []\n---\nBody.\n"
+            )
+            db = Path(td) / "idx.sqlite"
+            reindex(Path(td), db, no_embed=True)
+            conn = memidx.open_db(db, project=memidx.DEFAULT_PROJECT)
+            self.assertEqual(memidx.topic_matches_for_path(conn, memidx.DEFAULT_PROJECT, "src/foo.py.bak"), [])
+
+    def test_concept_matches_for_path_no_longer_false_positives_on_suffix(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "concepts"; root.mkdir()
+            (root / "c.md").write_text(
+                "---\ntype: concept\nid: CON-1\ntitle: C\n"
+                "implemented_by: [src/foo.py]\ntested_by: []\ngoverned_by: []\ninvolved_in: []\n"
+                "---\nBody.\n"
+            )
+            db = Path(td) / "idx.sqlite"
+            reindex(Path(td), db, no_embed=True)
+            conn = memidx.open_db(db, project=memidx.DEFAULT_PROJECT)
+            self.assertEqual(memidx.concept_matches_for_path(conn, memidx.DEFAULT_PROJECT, "src/foo.py.bak"), [])
+
+    def test_concept_matches_for_chunk_no_longer_false_positives_on_suffix(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "concepts"; root.mkdir()
+            (root / "c.md").write_text(
+                "---\ntype: concept\nid: CON-1\ntitle: C\n"
+                "implemented_by: [src/foo.py]\ntested_by: []\ngoverned_by: []\ninvolved_in: []\n"
+                "---\nBody.\n"
+            )
+            db = Path(td) / "idx.sqlite"
+            reindex(Path(td), db, no_embed=True)
+            conn = memidx.open_db(db, project=memidx.DEFAULT_PROJECT)
+            self.assertEqual(
+                memidx.concept_matches_for_chunk(
+                    conn, memidx.DEFAULT_PROJECT, "src/foo.py.bak", "sym", "sym"
+                ),
+                [],
+            )
+
+    def test_check_invariant_allowed_exemption_no_longer_false_positives_on_suffix(self):
+        with tempfile.TemporaryDirectory() as td:
+            code_root = Path(td)
+            (code_root / "src").mkdir()
+            (code_root / "src" / "foo.py.bak").write_text("BADCALL should not appear\n")
+            hits = memidx.check_invariant(
+                code_root,
+                {"kind": "no-bypass", "pattern": "BADCALL", "allowed": ["src/foo.py"]},
+            )
+            self.assertEqual(hits, ["src/foo.py.bak:1"])
+
+
 if __name__ == "__main__":
     unittest.main()
