@@ -2331,7 +2331,11 @@ def cmd_code_reindex(args) -> int:
     db_path = resolve_code_db_path(args)
 
     if getattr(args, "drop_root", None):
-        conn = open_code_db(db_path)
+        try:
+            conn = open_code_db(db_path)
+        except CodeIndexTooNew as exc:
+            print(f"code-reindex: {exc}", file=sys.stderr)
+            return 1
         root_s = str(Path(args.drop_root).resolve())
         drop_code_root(conn, args.project, root_s)
         conn.commit()
@@ -2356,7 +2360,17 @@ def cmd_code_reindex(args) -> int:
         )
         return 2
 
-    conn = open_code_db(db_path)
+    # Fix-wave item 9 follow-up (coordinator ruling): a db written by a
+    # newer engine must never crash code-reindex either -- same refusal,
+    # same message, but code-reindex has real work it could otherwise
+    # start (root validation above already ran), so it fails closed with
+    # rc=1 rather than code-search/why's rc=0-and-degrade (repo-init turns
+    # this 1 into its own exit 13, with the captured stderr).
+    try:
+        conn = open_code_db(db_path)
+    except CodeIndexTooNew as exc:
+        print(f"code-reindex: {exc}", file=sys.stderr)
+        return 1
     t0 = time.time()
 
     # Task 7: the old hardcoded "swift" --lang default is gone. Omitted

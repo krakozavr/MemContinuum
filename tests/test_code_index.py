@@ -3980,6 +3980,59 @@ class TestCodeIndexTooNew(unittest.TestCase):
                     os.environ["MEMCONTINUUM_HOME"] = prev_home
             self.assertEqual(resolved, "x.py")  # disk-scan fallback, never a crash
 
+    def _version_and_table_names(self, db):
+        conn = sqlite3.connect(str(db))
+        version = conn.execute("SELECT version FROM code_schema").fetchone()[0]
+        tables = {
+            r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        conn.close()
+        return version, tables
+
+    def test_code_reindex_refuses_a_newer_schema_db_without_a_traceback(self):
+        """Coordinator ruling (fix-wave follow-up): cmd_code_reindex's own
+        open_code_db call must catch CodeIndexTooNew too -- code-search/why
+        degrade with rc=0, but code-reindex has real work it could
+        otherwise start, so it fails CLOSED (rc=1, same message, db
+        untouched) rather than letting the exception traceback all the way
+        out (repo-init turns rc 1 into its own exit 13, with the captured
+        stderr -- a raw traceback there is not that)."""
+        with tempfile.TemporaryDirectory() as td:
+            db = self._mk_too_new_db(td)
+            before_version, before_tables = self._version_and_table_names(db)
+            root = Path(td) / "code"; root.mkdir(); (root / "x.py").write_text("def f():\n    pass\n")
+
+            buf, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+                rc = memidx.cmd_code_reindex(ns(
+                    code_root=str(root), drop_root=None, db=str(db), project=memidx.DEFAULT_PROJECT,
+                    no_embed=True, full=False, lang="python",
+                ))
+            self.assertEqual(rc, 1, buf.getvalue() + err.getvalue())
+            self.assertIn("newer engine", err.getvalue())
+
+            after_version, after_tables = self._version_and_table_names(db)
+            self.assertEqual(before_version, after_version)   # not silently rebuilt down
+            self.assertEqual(before_tables, after_tables)     # nothing dropped, nothing added
+
+    def test_code_reindex_drop_root_refuses_a_newer_schema_db_without_a_traceback(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = self._mk_too_new_db(td)
+            before_version, before_tables = self._version_and_table_names(db)
+
+            buf, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+                rc = memidx.cmd_code_reindex(ns(
+                    code_root=None, drop_root=str(Path(td) / "some-root"), db=str(db),
+                    project=memidx.DEFAULT_PROJECT, no_embed=True, full=False, lang=None,
+                ))
+            self.assertEqual(rc, 1, buf.getvalue() + err.getvalue())
+            self.assertIn("newer engine", err.getvalue())
+
+            after_version, after_tables = self._version_and_table_names(db)
+            self.assertEqual(before_version, after_version)
+            self.assertEqual(before_tables, after_tables)
+
 
 if __name__ == "__main__":
     unittest.main()
