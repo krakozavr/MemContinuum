@@ -105,13 +105,17 @@ FORBIDDEN = [
     # letter this project's own development process uses (F=external-
     # review finding, D=decision-index-engine test-class label, H=HOLD-
     # rule class, M=Anatomy milestone, W=docs-round finding, C=Codex-
-    # pending item, G=docs-round finding) followed by digits and a colon,
-    # em dash, or plain hyphen -- the shape a labeled-paragraph heading or
-    # inline reference actually takes ("F8 — ...", "M2a: ...", "W9 -
-    # ..."), not ordinary prose (a bare "F8" with no separator, or a
-    # trailing digit like "R2" from the existing finding-code pattern
-    # above, is left alone).
-    ("internal plan/finding-code label", re.compile(r"\b[FDHMWCG]\d+\s*[—:\-]")),
+    # pending item, G=docs-round finding) followed by digits, an OPTIONAL
+    # single lowercase letter (Anatomy's own milestone-sub-label shape,
+    # "M2a"), then a colon, em dash, or plain hyphen -- the shape a
+    # labeled-paragraph heading or inline reference actually takes
+    # ("F8 — ...", "M2a: ...", "W9 - ..."), not ordinary prose (a bare "F8"
+    # with no separator, or a trailing digit like "R2" from the existing
+    # finding-code pattern above, is left alone). Re-gate item 3: this
+    # comment's own "M2a: ..." claim is now backed by a real test case
+    # (test_forbidden_catches_a_store_record_id_and_a_finding_code_label),
+    # not just asserted in prose.
+    ("internal plan/finding-code label", re.compile(r"\b[FDHMWCG]\d+[a-z]?\s*[—:\-]")),
 ]
 
 PUBLIC_DOCS = [
@@ -775,6 +779,22 @@ class TestDoctrineMachineryCoversDocsRound7Files(unittest.TestCase):
                          "FORBIDDEN has no pattern for a bare TOP-#### store record id")
         self.assertTrue(any(p.search(sample_label) for _, p in FORBIDDEN),
                          "FORBIDDEN has no pattern for an F#: finding-code label")
+
+    def test_forbidden_catches_the_em_dash_hyphen_and_milestone_sub_label_shapes(self):
+        # Re-gate item 3: the widened pattern's OWN self-test used to check
+        # only the colon shape (F1:) -- it never proved the em dash/hyphen
+        # separators the widening was specifically FOR, nor the milestone
+        # sub-label shape (M2a) the pattern's own comment claimed to cover.
+        em_dash_label = "**F8 — no ANN index; a linear scan over every searchable vector.**"
+        hyphen_label = "D3 - decision-index engine test-class label"
+        milestone_sub_label = "Anatomy M2a: binding point 2"
+        for sample, desc in (
+            (em_dash_label, "an em-dash-separated F# label"),
+            (hyphen_label, "a hyphen-separated D# label"),
+            (milestone_sub_label, "a colon-separated M#<letter> milestone sub-label"),
+        ):
+            self.assertTrue(any(p.search(sample) for _, p in FORBIDDEN),
+                             f"FORBIDDEN has no pattern catching {desc}: {sample!r}")
 
 
 if __name__ == "__main__":

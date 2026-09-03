@@ -1143,12 +1143,21 @@ Every reader opens the file with `open_db_noncreating` — a genuinely
 non-creating SQLite URI (`mode=rw`) — never `open_db`'s create-on-connect path,
 which closes a TOCTOU window a plain `exists()` check followed by `connect()`
 still had (the file could be created by a race between the two calls). `root`
-is passed by the two readers that walk the store's own markdown tree —
-`check` always, and `unmapped` (which takes its own `--root`) — so only these
-two can ever see `stale`; `unmapped` branches on it to self-heal (below).
-`search`, `chain`, `for-path` and `drift` never pass a `root` at all — they
-have nothing to walk — so `decision_index_state` can report `upgrade-required`
-for them but never `stale`.
+is REQUIRED on `reindex`, `check`, and `unmapped` (they walk the store's own
+markdown tree by design); `unmapped` branches on `stale` to self-heal (below).
+`search`, `chain`, `for-path`, `why`, and `drift` take `root` as an OPTIONAL
+`--root DIR`: omitted (the default, and unchanged from before),
+`decision_index_state` can still report `upgrade-required` for them but
+never `stale` — they have nothing to walk without it. Given, the same five readers CAN see
+`stale`: a positive match off it is still returned (see the next paragraph),
+with one stderr line naming the cause (`"<cmd>: index is stale (store
+changed since the last reindex); results may be outdated"`). `for-path`'s
+own stale positive match, reached through `hooks/pre-edit-chain.sh` (which
+passes `--root "$MEMCONTINUUM_ROOT"` on both its `for-path` calls whenever
+that env var is set), is logged under its own hook.log outcome name,
+`index-stale-served`, distinct from a plain `matched` — the staleness
+caveat itself reaches `hook.log` only via `for-path`'s own stderr (the
+hook's existing redirect), never the injected `additionalContext` payload.
 
 **A positive match off a non-`current` index stays usable; a negative claim
 does not.** `upgrade-required` and `stale` both warn and proceed — a hit found
@@ -1292,10 +1301,18 @@ down:
   **inside** `fts_ranked`/`vector_ranked`'s own query, before either channel's
   cap and before RRF fusion — a status a caller filtered out can never occupy
   a rank position that starves out a real match, in any mode. `fts_ranked`
-  runs its filtered `ORDER BY bm25(fts) ... LIMIT 1000` (a generous raw
-  ceiling against a pathological match count, not a candidate-starving one),
-  collapses same-topic-family duplicates (see link rows below), then caps to
-  200; `vector_ranked` carries no cap at all — it scores every fresh embedded
+  runs its filtered `ORDER BY bm25(fts)` query with NO raw row limit,
+  walking the ranked cursor in batches of 200 (`fetchmany`), resolving each
+  batch's family in one query and collapsing same-topic-family duplicates
+  (see link rows below) as it goes — stopping the instant 200 DISTINCT
+  families have been collected, never a raw row cap before collapse can see
+  them (a single family that alone contributes over 1000 matching rows used
+  to be able to push a second family's own lone matching row past a raw
+  `LIMIT 1000` cap, starving it out even though both matched and the true
+  family count was nowhere near 200). The tradeoff: a match set with fewer
+  than 200 distinct families is read to its end — every matching row, not a
+  fixed raw ceiling — before the query returns. `vector_ranked` carries no
+  cap at all — it scores every fresh embedded
   row for the project matching the filter — and joins `embeddings` to
   `records` on `embed_sha == sha256` (see
   [Decision index provenance](#decision-index-provenance-and-embedding-lifecycle)),
