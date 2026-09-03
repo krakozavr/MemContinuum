@@ -258,10 +258,11 @@ fi
 
 # Version gate AFTER resolution, against the python that will actually run the
 # engine -- a 3.9 system python is fine for the hooks' own snippets but not for
-# fastembed. Skipped under --dry-run when the venv doesn't exist yet.
+# the pinned dependency set (numpy 2.5.2's own wheels ship for 3.12+). Skipped
+# under --dry-run when the venv doesn't exist yet.
 if [ "$DRY_RUN" -eq 0 ] || [ -x "$PYTHON_BIN" ]; then
     env PYTHONPATH= "$PYTHON_BIN" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)' \
-        || die "$PYTHON_BIN is older than Python 3.12 (fastembed requires it) -- see README.md Requirements"
+        || die "$PYTHON_BIN is older than Python 3.12 (the pinned dependency set requires it) -- see README.md Requirements"
     plan "python is $(env PYTHONPATH= "$PYTHON_BIN" -c 'import sys; print(".".join(map(str, sys.version_info[:3])))')"
 fi
 
