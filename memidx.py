@@ -1335,8 +1335,8 @@ def resolve_symbol_to_path(code_root: Path, symbol: str, project: str | None = N
     Tries the code index first (_resolve_symbol_via_code_index) when
     `project` is given, for speed; always falls back to scanning code_root
     directly -- iter_code_files prunes only chunkers.UNIVERSAL_SKIP_DIRS
-    (global noise: .git, .build, node_modules, vendor, venv, .venv,
-    __pycache__, .tox, .eggs), never a language's own skip_dirs, so `why`
+    (the universal noise set -- see that set's own docstring for the
+    member list and rationale), never a language's own skip_dirs, so `why`
     stays able to resolve a symbol declared under Tests/, a behavior
     change nobody asked for -- so a missing/stale/member-only-index miss
     never regresses a resolution the old regex-based version could already
@@ -4127,7 +4127,12 @@ def main(argv=None) -> int:
     )
     p_code_search.add_argument(
         "--heal-limit", dest="heal_limit", type=int, default=500,
-        help="cap on files an automatic repair re-indexes in one search",
+        help="above this many changed files, skip the automatic repair "
+             "entirely and say so instead of attempting it -- an "
+             "all-or-nothing gate on the preflight's changed count, not a "
+             "per-file cap on what a repair re-indexes; a repair triggered "
+             "only by a backend-availability change (no file content "
+             "changed) is never subject to this gate",
     )
     p_code_search.set_defaults(func=cmd_code_search)
 

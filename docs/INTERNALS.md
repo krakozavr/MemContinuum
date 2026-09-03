@@ -802,11 +802,16 @@ An index written by an older engine is rebuilt on first use, keeping its
 roots and languages: `open_code_db` compares the stored schema version
 against the current one and, on a mismatch, drops and recreates every
 derived table (`chunks`, `fts`, `embeddings`, `file_sha`, `code_meta`) inside
-one transaction, carrying `code_meta`'s `(project, code_root, langs)` rows
-forward into the fresh tables first. `code_project` itself is never dropped,
-so its `langs`/`embedding_mode` survive untouched. The next `code-search`
-then reads the project as `stale` rather than `uninitialized`, and heals or
-prints the same warning a genuinely stale index would.
+one transaction, carrying the old `code_meta`'s `(project, code_root, langs)`
+rows forward into the fresh tables first — an older schema keeps its roots
+and languages in `code_meta` itself, since `code_project` (where `langs`
+lives from schema v2 on) does not exist there yet. `embedding_mode` does
+**not** survive: the fresh `code_project` row this rebuild inserts always
+starts at `none`, since an older schema tracked no such concept to carry
+forward — so the first `code-search` after a rebuild reads the project as
+`stale` (never `uninitialized`, since its roots and languages did survive)
+and, if it heals, heals without embeddings until a `code-reindex` without
+`--no-embed` runs.
 
 ### Skip predicate
 
@@ -942,6 +947,10 @@ was stamped, or a recorded root missing on disk — a missing root can never
 read `current`); otherwise **current**. `failed` files are never part of this
 state calculation at all — an index with only `failed` files reads `current`,
 and `code-search` reports the failed count as its own separate line.
+The preflight is otherwise read-only: the one write it may commit is
+refreshing a drifted-looking file's stored `mtime`/`size` once its content
+turns out unchanged (sha256 still matches) — cache bookkeeping so the same
+file isn't re-hashed on the next call, never a chunk, status, or meta row.
 
 **Heal.** Before answering, `code-search` consults the report and, unless
 `--no-heal` is given, may repair it once: eligible only when the state is
@@ -965,11 +974,12 @@ healing reads `current`; any exception during the heal is fail-open — the
 original report stands and the search still answers from whatever was
 already indexed.
 
-**Multi-root output.** `code-search --json` wraps hits in an envelope: `state`,
-`code_root`/`indexed_at`/`head_sha` (the first recorded root, alphabetically,
-kept for callers written before multi-root existed), `code_roots` (the full
-per-root report list), `changed`, `failed`, `not_indexed`, `embedding_mode`,
-and `results`. In plain output, a hit's location is qualified with its root
+**Multi-root output.** `code-search --json` wraps hits in an envelope:
+`state`; `code_root`/`indexed_at`/`head_sha`, naming the first recorded root
+alphabetically; `code_roots`, the full per-root report list (each entry
+carrying its own `indexed_at`/`head_sha`); `changed`, `failed`,
+`not_indexed`, `embedding_mode`; and `results`. In plain output, a hit's
+location is qualified with its root
 (`root/path:line`) only once a project has more than one recorded root — the
 common single-root case keeps its plain `path:line` line, since only a
 multi-root project can have the same relative path indexed under two roots
