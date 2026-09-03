@@ -76,32 +76,23 @@ def FIXTURES_COPY_OF(name: str, td) -> Path:
 
 
 def _run_search(args):
-    # cmd_search prints; pull the underlying data via the same code path it uses.
+    # cmd_search prints; pull the underlying data via the SAME ranking
+    # helper it uses (memidx._search_hits) rather than reimplementing the
+    # mode-dispatch/RRF logic here a second time -- a duplicate
+    # implementation could silently drift out of sync with F5's real
+    # filter-inside-the-channel/collapse-before-RRF changes and make the
+    # paraphrase-probe gate (TestD5Paraphrase, below) measure stale code.
     conn = memidx.open_db(memidx.resolve_db_path(args))
-    allowed = memidx.filtered_paths(conn, args)
-    if args.mode == "fts":
-        ranked = memidx.fts_ranked(conn, args.query, args.project)
-        results = [(p, float(len(ranked) - i)) for i, p in enumerate(ranked) if p in allowed]
-    elif args.mode == "vector":
-        ranked = memidx.vector_ranked(conn, args.query, args.project)
-        results = [(p, s) for p, s in ranked if p in allowed]
-    else:
-        fts_list = [p for p in memidx.fts_ranked(conn, args.query, args.project) if p in allowed]
-        vec_list = [p for p, _ in memidx.vector_ranked(conn, args.query, args.project) if p in allowed]
-        k = 60
-        scores = {}
-        for i, p in enumerate(fts_list):
-            scores[p] = scores.get(p, 0.0) + 1.0 / (k + i + 1)
-        for i, p in enumerate(vec_list):
-            scores[p] = scores.get(p, 0.0) + 1.0 / (k + i + 1)
-        results = sorted(scores.items(), key=lambda t: t[1], reverse=True)
+    extra_where, extra_params = memidx.build_filter_clause(args, include_project=False)
+    results, _contributing = memidx._search_hits(conn, args, extra_where, extra_params)
     results = results[: args.limit]
     out = []
     for path, score in results:
         row = memidx.record_row_by_path(conn, path)
         if row is None:
             continue
-        out.append({"path": row["path"], "score": score})
+        # F5: a link-row hit reports the real topic path, same as cmd_search.
+        out.append({"path": row["link_topic_path"] or row["path"], "score": score})
     conn.close()
     return out
 
@@ -924,35 +915,60 @@ class TestF2EmbeddingMode(unittest.TestCase):
             self.assertEqual(self._mode(db), "none")
             self.assertIn("embedding mode set to none", buf.getvalue())
 
-    def test_auto_never_writes_mode_but_leaves_a_real_gap_until_the_next_full_reindex(self):
+    def test_auto_recomputes_mode_when_it_actually_changed_a_record(self):
+        # F2/Ruling 73 (binding, supersedes this test's earlier claim that
+        # --auto NEVER writes embedding_mode): an --auto run that actually
+        # changed a row must recompute embedding_mode from real coverage --
+        # `full` must never keep standing over a vector that this very
+        # --auto pass just made stale. Two topics so "some but not all
+        # fresh" (partial) is reachable: edit only the second one.
         with tempfile.TemporaryDirectory() as td:
             root = self._topic(td); db = Path(td) / "idx.sqlite"
+            second = root / "topics" / "second.md"
+            second.write_text(
+                "---\ntype: topic\nid: TOP-2\ntitle: T2\nlinks:\n"
+                "  - link: L1\n    status: active\n    ruling: {text: \"second\", authority: owner-verbatim, source: s}\n"
+                "---\nbody\n"
+            )
             reindex(root, db, no_embed=False)
             self.assertEqual(self._mode(db), "full")
-            (root / "topics" / "t.md").write_text(
-                (root / "topics" / "t.md").read_text().replace("alpha decision", "delta decision")
-            )
+            second.write_text(second.read_text().replace("second", "second-edited"))
             args = ns(root=str(root), db=str(db), project=memidx.DEFAULT_PROJECT,
                        full=False, no_embed=True, auto=True)
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 memidx.cmd_reindex(args)
-            self.assertEqual(self._mode(db), "full", "an --auto heal must never write embedding_mode at all")
-            self.assertNotIn("embedding mode set to", buf.getvalue())
-            path = str(root / "topics" / "t.md")
-            self.assertNotEqual(self._emb(db, path)["embed_sha"], self._rec_sha(db, path))
+            self.assertEqual(self._mode(db), "partial",
+                              "an --auto pass that changed a row must recompute mode from real coverage")
+            self.assertIn("embedding mode set to partial", buf.getvalue())
+
+    def test_auto_still_never_writes_mode_when_nothing_changed(self):
+        # The part of the old contract that DOES survive Ruling 73: a
+        # genuine no-op --auto pass (nothing added/changed/removed) still
+        # never touches embedding_mode at all.
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic(td); db = Path(td) / "idx.sqlite"
             reindex(root, db, no_embed=False)
-            self.assertEqual(self._emb(db, path)["embed_sha"], self._rec_sha(db, path))
+            self.assertEqual(self._mode(db), "full")
+            args = ns(root=str(root), db=str(db), project=memidx.DEFAULT_PROJECT,
+                       full=False, no_embed=True, auto=True)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                memidx.cmd_reindex(args)   # nothing changed on disk
+            self.assertEqual(self._mode(db), "full")
+            self.assertNotIn("embedding mode set to", buf.getvalue())
 
     def test_unchanged_sha_skip_still_requires_a_matching_embed_sha(self):
         # the skip predicate is sha AND embed_sha match -- not sha alone.
+        # 2, not 1: the fixture topic carries one link (F5 adds a link row
+        # alongside the topic row), and both need backfilling here.
         with tempfile.TemporaryDirectory() as td:
             root = self._topic(td); db = Path(td) / "idx.sqlite"
             reindex(root, db, no_embed=True)   # record exists, no embedding at all
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 reindex(root, db, no_embed=False)
-            self.assertIn("1 embedding(s) backfilled", buf.getvalue())
+            self.assertIn("2 embedding(s) backfilled", buf.getvalue())
             path = str(root / "topics" / "t.md")
             self.assertIsNotNone(self._emb(db, path))
 
@@ -1432,6 +1448,397 @@ class TestF4CodeRefMatches(unittest.TestCase):
 
     def test_fragment_only_code_ref_matches_no_path(self):
         self.assertFalse(memidx.code_ref_matches("/home/x/src/foo.py", "#Foo"))
+
+
+class TestF5LinkRows(unittest.TestCase):
+    def _topic_with_two_links(self, td):
+        root = Path(td) / "store"; (root / "topics").mkdir(parents=True)
+        (root / "topics" / "t.md").write_text(
+            "---\ntype: topic\nid: TOP-1\ntitle: Widget cache\nlinks:\n"
+            "  - link: L1\n    status: active\n"
+            "    ruling: {text: \"the widget cache is invalidated on every write\", authority: owner-verbatim, source: s}\n"
+            "  - link: L2\n    status: declined\n"
+            "    ruling: {text: \"a background sweeper thread was rejected\", authority: owner-verbatim, source: s}\n"
+            "---\nBody never mentions invalidation or sweepers.\n"
+        )
+        return root
+
+    def test_ruling_paraphrase_not_in_body_is_found_via_vector_mode(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic_with_two_links(td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=False)
+            conn = memidx.open_db(db, project=memidx.DEFAULT_PROJECT)
+            ranked = memidx.vector_ranked(conn, "cache invalidated on write", memidx.DEFAULT_PROJECT)
+            top3_rows = [memidx.record_row_by_path(conn, p) for p, _ in ranked[:3]]
+            self.assertTrue(any(r is not None and r["link_id"] == "L1" for r in top3_rows), ranked)
+
+    def test_link_record_key_never_collides_with_a_real_path(self):
+        # Codex's specific rejection of Revision 3's f"{topic_path}#{link_id}"
+        # -- # is legal in a real filename, so that scheme was NOT
+        # collision-proof. A hashed surrogate can never collide with
+        # anything walk_markdown yields.
+        key = memidx.link_record_key("/store/topics/t.md", "L1")
+        self.assertNotIn("#", key)
+        self.assertTrue(key.startswith("link:"))
+        self.assertNotEqual(key, "/store/topics/t.md#L1")
+
+    def test_a_real_filename_containing_hash_never_collides_with_a_link_row(self):
+        # Codex's rejection made concrete on disk (not just at the helper
+        # level, per test_link_record_key_never_collides_with_a_real_path
+        # above): '#' is legal in a real POSIX filename -- a topic that
+        # happens to be named that way must still index as an ordinary
+        # topic row, distinct from every one of its own link rows.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "store"; (root / "topics").mkdir(parents=True)
+            weird = root / "topics" / "weird#name.md"
+            weird.write_text(
+                "---\ntype: topic\nid: TOP-HASH\ntitle: Weird\nlinks:\n"
+                "  - link: L1\n    status: active\n"
+                "    ruling: {text: some ruling text, authority: owner-verbatim, source: s}\n"
+                "---\nBody.\n"
+            )
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+            conn = memidx.open_db(db, project=memidx.DEFAULT_PROJECT)
+            rows = conn.execute(
+                "SELECT path, type FROM records WHERE project=?", (memidx.DEFAULT_PROJECT,)
+            ).fetchall()
+            by_path = {r["path"]: r["type"] for r in rows}
+            self.assertEqual(by_path.get(str(weird)), "topic")
+            link_paths = [p for p, t in by_path.items() if t == "link"]
+            self.assertEqual(len(link_paths), 1)
+            self.assertNotEqual(link_paths[0], str(weird))
+            args = ns(db=str(db), project=memidx.DEFAULT_PROJECT, root=str(root), json=True)
+            self.assertEqual(memidx.cmd_check(args), 0)
+
+    def test_an_active_topic_beyond_the_old_200_cap_is_still_returned(self):
+        # F7, folded into F5 (ruling 71): filtering must happen INSIDE the
+        # FTS query, before its own cap -- not after a 200-row pre-filter
+        # cap that a flood of non-matching-status rows (now multiplied by
+        # their own link rows) can push a real match behind.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "topics"; root.mkdir()
+            for i in range(250):
+                (root / f"decoy-{i:03}.md").write_text(
+                    f"---\ntype: topic\nid: TOP-D{i}\ntitle: Decoy {i}\nstatus: superseded\nlinks:\n"
+                    "  - {link: L1, status: superseded, ruling: {text: needle term, authority: owner-verbatim, source: s}}\n"
+                    "---\nBody.\n"
+                )
+            (root / "target.md").write_text(
+                "---\ntype: topic\nid: TOP-TARGET\ntitle: Target\nlinks:\n"
+                "  - {link: L1, status: active, ruling: {text: needle term, authority: owner-verbatim, source: s}}\n"
+                "---\nBody.\n"
+            )
+            db = Path(td) / "idx.sqlite"
+            reindex(Path(td), db, no_embed=True)
+            conn = memidx.open_db(db, project=memidx.DEFAULT_PROJECT)
+            where, params = memidx.build_filter_clause(
+                ns(project=memidx.DEFAULT_PROJECT, status=["active"], type=[], area=None, topic=None, authority=None),
+                include_project=False,
+            )
+            ranked = memidx.fts_ranked(conn, "needle term", memidx.DEFAULT_PROJECT, where, params)
+            # Assert on the FAMILY (topic path), not the raw winning
+            # representative: the target topic and its own single active
+            # link share near-identical ruling text here, and bm25's length
+            # normalization deterministically favors the shorter link
+            # document -- collapse legitimately keeps the LINK row as that
+            # family's representative (records.path is a synthetic
+            # "link:<hash>" key, containing no "target.md" substring at
+            # all). What F7's fix actually promises is that the TARGET
+            # FAMILY is not starved out by the 250-decoy flood; which
+            # member represents it is an incidental tie-break, not the
+            # property under test.
+            families = {memidx._record_family(conn, memidx.DEFAULT_PROJECT, p) for p in ranked}
+            self.assertTrue(any("target.md" in fam for fam in families), (ranked, families))
+
+    def test_unfiltered_search_returns_both_topic_and_link_hits_with_no_type_given(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic_with_two_links(td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+            conn = memidx.open_db(db, project=memidx.DEFAULT_PROJECT)
+            rows = conn.execute("SELECT type FROM records WHERE project=?", (memidx.DEFAULT_PROJECT,)).fetchall()
+            types = {r["type"] for r in rows}
+            self.assertIn("topic", types); self.assertIn("link", types)
+
+    def test_type_topic_excludes_link_rows_type_link_selects_only_them(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic_with_two_links(td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+            conn = memidx.open_db(db, project=memidx.DEFAULT_PROJECT)
+            only_topic = memidx.filtered_paths(conn, ns(project=memidx.DEFAULT_PROJECT, status=[], type=["topic"],
+                                                          area=None, topic=None, authority=None))
+            only_link = memidx.filtered_paths(conn, ns(project=memidx.DEFAULT_PROJECT, status=[], type=["link"],
+                                                         area=None, topic=None, authority=None))
+            self.assertEqual(len(only_topic), 1)
+            self.assertEqual(len(only_link), 2)
+
+    def test_status_active_drops_a_declined_only_match(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic_with_two_links(td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+            conn = memidx.open_db(db, project=memidx.DEFAULT_PROJECT)
+            ranked = [p for p in memidx.fts_ranked(conn, "sweeper", memidx.DEFAULT_PROJECT)
+                      if p in memidx.filtered_paths(conn, ns(project=memidx.DEFAULT_PROJECT, status=["active"],
+                                                              type=[], area=None, topic=None, authority=None))]
+            self.assertEqual(ranked, [], "a declined-only match must be dropped under --status active, never surfaced")
+
+    def test_reindex_check_unmapped_run_twice_report_zero_second_time(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic_with_two_links(td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                memidx.cmd_reindex(ns(root=str(root), db=str(db), project=memidx.DEFAULT_PROJECT,
+                                       full=False, no_embed=True, auto=False))
+            self.assertIn("0 changed", buf.getvalue()); self.assertIn("0 removed", buf.getvalue())
+            conn = memidx.open_db(db, project=memidx.DEFAULT_PROJECT)
+            self.assertFalse(memidx._index_has_drift(conn, root, memidx.DEFAULT_PROJECT))
+
+    def test_dedup_keeps_one_hit_per_family_in_every_mode(self):
+        # Collapse now happens INSIDE fts_ranked/vector_ranked themselves
+        # (ruling 71) -- their returned lists are already collapsed, no
+        # separate _collapse_link_duplicates call needed by the caller.
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic_with_two_links(td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=False)
+            conn = memidx.open_db(db, project=memidx.DEFAULT_PROJECT)
+            fts_list = memidx.fts_ranked(conn, "widget", memidx.DEFAULT_PROJECT)
+            vec_list = [p for p, _ in memidx.vector_ranked(conn, "widget cache behavior", memidx.DEFAULT_PROJECT)]
+            for label, lst in (("fts", fts_list), ("vector", vec_list)):
+                with self.subTest(label):
+                    families = [memidx._record_family(conn, memidx.DEFAULT_PROJECT, p) for p in lst]
+                    self.assertEqual(len(families), len(set(families)), families)
+
+    def test_hybrid_reports_contributing_link_ids_when_channels_disagree(self):
+        # Codex's addition: a single matched_link_id is ambiguous when FTS
+        # and vector retrieval matched different links of the same topic.
+        # Deterministic: patch fts_ranked/vector_ranked directly so the
+        # fusion logic's own disagreement-detection is under test, not
+        # real embedding behavior (which this repo's other tests already
+        # cover for realism).
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic_with_two_links(td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+            conn = memidx.open_db(db, project=memidx.DEFAULT_PROJECT)
+            topic_path = str(root / "topics" / "t.md")
+            l1_path = conn.execute("SELECT path FROM records WHERE type='link' AND link_id='L1'").fetchone()["path"]
+            l2_path = conn.execute("SELECT path FROM records WHERE type='link' AND link_id='L2'").fetchone()["path"]
+            conn.close()
+            with mock.patch.object(memidx, "fts_ranked", return_value=[l1_path]), \
+                 mock.patch.object(memidx, "vector_ranked", return_value=[(l2_path, 0.9)]):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    memidx.cmd_search(ns(project=memidx.DEFAULT_PROJECT, db=str(db), query="x",
+                                          mode="hybrid", status=[], type=[], area=None, topic=None,
+                                          authority=None, limit=10, json=True))
+                out = json.loads(buf.getvalue())
+            hit = next(h for h in out if h["path"].endswith("t.md"))
+            self.assertEqual(hit.get("contributing_link_ids"), {"fts": "L1", "vector": "L2"})
+
+    def test_link_row_hit_reports_real_topic_path_and_link_fields(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic_with_two_links(td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                memidx.cmd_search(ns(project=memidx.DEFAULT_PROJECT, db=str(db), query="sweeper",
+                                      mode="fts", status=[], type=[], area=None, topic=None,
+                                      authority=None, limit=10, json=True))
+            out = json.loads(buf.getvalue())
+            hit = next(h for h in out if h.get("matched_link_id") == "L2")
+            self.assertTrue(hit["path"].endswith("t.md"))
+            self.assertEqual(hit["link_status"], "declined")
+
+    def test_link_row_snippet_is_never_empty(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic_with_two_links(td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+            conn = memidx.open_db(db, project=memidx.DEFAULT_PROJECT)
+            row = conn.execute("SELECT * FROM records WHERE type='link' AND link_id='L1'").fetchone()
+            self.assertTrue(memidx.snippet_for(row))
+
+    def test_migration_from_a_pre_link_column_db_triggers_one_full_reindex(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic_with_two_links(td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+            conn = sqlite3.connect(str(db))
+            conn.execute("ALTER TABLE records RENAME TO records_v1")
+            conn.execute("""CREATE TABLE records (path TEXT PRIMARY KEY, sha256 TEXT NOT NULL, mtime REAL NOT NULL,
+                size INTEGER NOT NULL, project TEXT NOT NULL, type TEXT, id TEXT, title TEXT, area TEXT, topic TEXT,
+                status TEXT, authority TEXT, tags TEXT, code_refs TEXT, body TEXT, ruling_text TEXT)""")
+            conn.execute("""INSERT INTO records SELECT path, sha256, mtime, size, project, type, id, title, area,
+                topic, status, authority, tags, code_refs, body, ruling_text FROM records_v1 WHERE type='topic'""")
+            conn.execute("DROP TABLE records_v1")
+            conn.execute("DELETE FROM db_meta WHERE key='last_reindexed_at'")
+            conn.commit(); conn.close()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                reindex(root, db, no_embed=True)
+            conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
+            types = {r["type"] for r in conn.execute("SELECT type FROM records")}
+            self.assertIn("link", types, "an upgrading db must grow its link rows in one pass, not wait for the next sha change")
+
+    def test_hybrid_dedup_runs_through_the_real_fusion_site_not_just_the_helper(self):
+        # A test that only calls _collapse_link_duplicates directly (as
+        # test_dedup_keeps_one_hit_per_family_in_every_mode above does) would
+        # stay green even if a future refactor moved the collapse call to
+        # AFTER RRF fusion instead of before it (Grok's "a new filter lie"
+        # failure mode) -- this one goes through the real cmd_search hybrid
+        # path end to end.
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic_with_two_links(td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=False)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                memidx.cmd_search(ns(project=memidx.DEFAULT_PROJECT, db=str(db),
+                                      query="widget cache invalidated", mode="hybrid",
+                                      status=[], type=[], area=None, topic=None,
+                                      authority=None, limit=10, json=True))
+            out = json.loads(buf.getvalue())
+            paths = [hit["path"] for hit in out]
+            self.assertEqual(len(paths), len(set(paths)),
+                              f"a topic and its own link row must never both appear in hybrid results: {out}")
+
+    def test_migration_does_not_force_needless_reembedding_of_unchanged_topics(self):
+        # Revision-1 preamble point 4 promises a migration-triggered full
+        # content pass "never forces a needless re-embed" -- prove it: an
+        # already-embedded topic's vector must be byte-identical after the
+        # migration pass, while its brand-new link row still gets embedded.
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic_with_two_links(td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=False)
+            conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
+            topic_path = str(root / "topics" / "t.md")
+            original_vector = conn.execute(
+                "SELECT vector FROM embeddings WHERE path=?", (topic_path,)
+            ).fetchone()["vector"]
+            self.assertIsNotNone(original_vector)
+            # Simulate a pre-F5 schema: the topic's own record/embedding are
+            # left exactly as they are; only the records table itself loses
+            # the link-row shape (no link_topic_path/link_id columns, and no
+            # link rows -- both removed by rebuilding the table).
+            conn.execute("ALTER TABLE records RENAME TO records_v1")
+            conn.execute("""CREATE TABLE records (path TEXT PRIMARY KEY, sha256 TEXT NOT NULL, mtime REAL NOT NULL,
+                size INTEGER NOT NULL, project TEXT NOT NULL, type TEXT, id TEXT, title TEXT, area TEXT, topic TEXT,
+                status TEXT, authority TEXT, tags TEXT, code_refs TEXT, body TEXT, ruling_text TEXT)""")
+            conn.execute("""INSERT INTO records SELECT path, sha256, mtime, size, project, type, id, title, area,
+                topic, status, authority, tags, code_refs, body, ruling_text FROM records_v1 WHERE type='topic'""")
+            conn.execute("DROP TABLE records_v1")
+            conn.execute("DELETE FROM db_meta WHERE key='last_reindexed_at'")
+            conn.commit(); conn.close()
+            reindex(root, db, no_embed=False)   # plain run -- migration-triggered full content pass
+            conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
+            refreshed_vector = conn.execute(
+                "SELECT vector FROM embeddings WHERE path=?", (topic_path,)
+            ).fetchone()["vector"]
+            self.assertEqual(refreshed_vector, original_vector,
+                              "a migration-triggered full content pass must not re-embed an unchanged topic")
+            link_row = conn.execute(
+                "SELECT path FROM records WHERE type='link' AND link_id='L1'"
+            ).fetchone()
+            self.assertIsNotNone(link_row)
+            self.assertIsNotNone(
+                conn.execute("SELECT 1 FROM embeddings WHERE path=?", (link_row["path"],)).fetchone(),
+                "the newly-created link row must still get its own embedding",
+            )
+
+    def test_generation_only_trigger_backfills_evidence_and_link_rows(self):
+        # Ruling 75: cmd_reindex compares the stored index_generation with
+        # the engine's own CURRENT_INDEX_GENERATION independently of the
+        # column-presence probe above -- a db that already has the new
+        # columns/link rows (this test builds one via a real reindex) but
+        # whose generation stamp is behind must still get one full content
+        # pass, closing Task 3's own documented gap (evidence backfill was
+        # promised by that generation bump but never wired until this task).
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "store"; (root / "topics").mkdir(parents=True)
+            (root / "topics" / "t.md").write_text(
+                "---\ntype: topic\nid: TOP-1\ntitle: T\nlinks:\n"
+                "  - link: L1\n    status: active\n"
+                "    ruling: {text: \"r\", authority: reviewer-finding, source: s}\n"
+                "    evidence: [\"a real citation\"]\n"
+                "---\nBody.\n"
+            )
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+            topic_path = str(root / "topics" / "t.md")
+            conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
+            # Columns/link rows are left completely intact -- ONLY the
+            # generation stamp regresses and the evidence value is cleared,
+            # isolating the generation-comparison trigger from the
+            # column-presence one tested above.
+            conn.execute("UPDATE links SET evidence=NULL WHERE topic_path=? AND link='L1'", (topic_path,))
+            conn.execute(
+                "UPDATE db_meta SET value=? WHERE key='index_generation'",
+                (str(memidx.CURRENT_INDEX_GENERATION - 1),),
+            )
+            conn.commit(); conn.close()
+
+            reindex(root, db, no_embed=True)   # plain run -- generation-only migration trigger
+
+            conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
+            ev = conn.execute(
+                "SELECT evidence FROM links WHERE topic_path=? AND link='L1'", (topic_path,)
+            ).fetchone()["evidence"]
+            self.assertIsNotNone(ev, "the generation trigger alone must force a full pass that backfills evidence")
+            self.assertIn("a real citation", ev)
+            link_row = conn.execute(
+                "SELECT path FROM records WHERE type='link' AND link_id='L1'"
+            ).fetchone()
+            self.assertIsNotNone(link_row)
+
+    def test_check_reports_up_to_date_and_unmapped_does_not_self_heal_with_link_rows_present(self):
+        # Coordinator ruling 66: _index_has_drift/cmd_check must not count
+        # type='link' rows as missing source files (they have no file on
+        # disk -- walk_markdown never sees them, only real topic files do).
+        # A regression here would make every reindex containing link rows
+        # look permanently "drifted," and unmapped's self-heal would fire
+        # on every single call, silently reindexing on every hook
+        # invocation. This exercises the PUBLIC cmd_check/cmd_unmapped
+        # entry points directly, not just the internal _index_has_drift
+        # helper (test_reindex_check_unmapped_run_twice_report_zero_second_time
+        # above already covers _index_has_drift and cmd_reindex's own
+        # "0 changed"/"0 removed" line; this test is the public-command-level
+        # companion ruling 66 asks for).
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic_with_two_links(td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)   # produces 2 link rows alongside the 1 topic row
+            conn = memidx.open_db(db, project=memidx.DEFAULT_PROJECT)
+            link_count = conn.execute(
+                "SELECT COUNT(*) AS n FROM records WHERE type='link'"
+            ).fetchone()["n"]
+            self.assertEqual(link_count, 2, "fixture must actually produce link rows for this test to mean anything")
+
+            check_buf = io.StringIO()
+            with contextlib.redirect_stdout(check_buf):
+                check_rc = memidx.cmd_check(ns(project=memidx.DEFAULT_PROJECT, db=str(db),
+                                                root=str(root), json=True))
+            self.assertEqual(check_rc, 0)
+            check_out = json.loads(check_buf.getvalue())
+            self.assertEqual(check_out.get("changed", []), [])
+            self.assertEqual(check_out.get("removed", []), [])
+
+            unmapped_buf = io.StringIO()
+            with contextlib.redirect_stdout(unmapped_buf):
+                memidx.cmd_unmapped(ns(project=memidx.DEFAULT_PROJECT, db=str(db), root=str(root),
+                                        code_root=None, json=True, paths=[]))
+            unmapped_out = json.loads(unmapped_buf.getvalue())
+            self.assertEqual(unmapped_out["coverage_status"], "ok",
+                              "unmapped must not fall into its stale-index self-heal path when the "
+                              "only 'drift' would have been link rows being miscounted as missing files")
 
 
 if __name__ == "__main__":

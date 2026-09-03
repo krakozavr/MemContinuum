@@ -76,14 +76,22 @@ EMBED_BODY_CHARS = 1500
 # decision_index_state (see below) until its next reindex.
 # Bumped to 3 (F3, ruling 70): an unchanged-sha row would otherwise keep
 # links.evidence NULL forever -- the migration guard only adds the COLUMN,
-# it cannot retroactively parse markdown that never gets re-read. A db
-# stamped below generation 3 now reads "upgrade-required" (decision_index_state,
-# below) until its next reindex -- readers warn instead of trusting it as
-# fully current. The reindex-side half of this (forcing a full content pass
-# on a generation mismatch, so an unchanged-sha topic's evidence actually
-# gets backfilled without a real edit) is cmd_reindex's own "migration
-# probe" and is not wired by this change alone; see this task's report.
-CURRENT_INDEX_GENERATION = 3
+# it cannot retroactively parse markdown that never gets re-read.
+# Bumped to 4 (F5, ruling 71/75): link rows (records.source_path/
+# link_topic_path/link_id) are new this generation. A db stamped below
+# generation 4 now reads "upgrade-required" (decision_index_state, below)
+# until its next reindex -- readers warn instead of trusting it as fully
+# current. cmd_reindex's own "migration probe" (run before open_db) now
+# wires the reindex-side half: it forces one full content pass whenever
+# EITHER the stored index_generation is older than this constant OR the
+# records table itself still lacks the source_path column (the more
+# specific, physically-verifiable signal -- catches a hand-restored or
+# partially-migrated schema even when a generation number alone would say
+# "current"). That full pass is what actually backfills links.evidence
+# (generation 3's still-unwired promise) and builds every topic's link
+# rows for the first time, without forcing a needless re-embed of an
+# unchanged topic's own vector (see cmd_reindex's own comments).
+CURRENT_INDEX_GENERATION = 4
 
 # ---------------------------------------------------------------------------
 # frontmatter parsing (shared by memidx and memlint)
@@ -182,15 +190,17 @@ def build_record(root: Path, path: Path, fm: dict, body: str) -> dict:
     if is_topic:
         status, authority = derive_topic_status_authority(links)
         topic = fm.get("topic") or rid
-        ruling_text_parts = []
-        for link in links:
-            ruling = link.get("ruling") or {}
-            rationale = link.get("rationale") or {}
-            if ruling.get("text"):
-                ruling_text_parts.append(str(ruling["text"]))
-            if rationale.get("text"):
-                ruling_text_parts.append(str(rationale["text"]))
-        ruling_text = "\n".join(ruling_text_parts)
+        # F5 (ruling 71): a topic's own aggregate ruling_text now carries
+        # ONLY the current active link's text -- each link's own text lives
+        # on its own link row (see _link_embed_items/insert_record_rows),
+        # so concatenating every link's text here would duplicate content
+        # already searchable per-link and blur which ruling is CURRENT.
+        current_link = newest_active_link(links)
+        ruling_text = ""
+        if current_link:
+            cruling = current_link.get("ruling") or {}
+            crationale = current_link.get("rationale") or {}
+            ruling_text = "\n".join(t for t in (cruling.get("text"), crationale.get("text")) if t)
     else:
         status = fm.get("status")
         authority = fm.get("authority")
@@ -475,6 +485,85 @@ def ensure_links_evidence_column(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE links ADD COLUMN evidence TEXT")
 
 
+def ensure_records_link_columns(conn: sqlite3.Connection) -> bool:
+    """Migration guard shaped like ensure_links_invariant_column. Returns
+    True iff it just added the columns (a pre-F5 db reaching this schema),
+    so cmd_reindex can force one full content pass -- without this, an
+    upgraded topic whose sha never changes again would never grow its link
+    rows. `source_path` is new and general-purpose (populated for EVERY
+    row, topic or link -- see Task 5's Interfaces); it may already exist
+    from a differently-shaped earlier migration in a dev checkout, hence
+    the same guarded ADD COLUMN shape as the other two."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(records)").fetchall()}
+    added = False
+    if "source_path" not in cols:
+        conn.execute("ALTER TABLE records ADD COLUMN source_path TEXT")
+        added = True
+    if "link_topic_path" not in cols:
+        conn.execute("ALTER TABLE records ADD COLUMN link_topic_path TEXT")
+        added = True
+    if "link_id" not in cols:
+        conn.execute("ALTER TABLE records ADD COLUMN link_id TEXT")
+        added = True
+    return added
+
+
+def link_record_key(topic_path: str, link_id: str) -> str:
+    """A collision-proof surrogate for a link row's records.path (its
+    PRIMARY KEY) -- NOT f"{topic_path}#{link_id}" (rejected: '#' is legal
+    in a real filename, so that scheme is not collision-proof). A hashed,
+    prefixed token can never collide with anything walk_markdown yields
+    (no real path is a 64-hex-char token prefixed "link:")."""
+    digest = hashlib.sha256(f"{topic_path}\x00{link_id}".encode()).hexdigest()
+    return f"link:{digest}"
+
+
+def _link_embed_items(rec: dict) -> list[tuple[str, str, str]]:
+    """(link_path, link_id, embed_text) for every link in a topic record
+    that carries retrievable ruling/rationale text -- shared by
+    cmd_reindex's embedding step and insert_record_rows's records/fts
+    inserts, so the two never disagree about which links are retrievable."""
+    if not rec["is_topic"]:
+        return []
+    out = []
+    for link in rec["links"]:
+        lid = str(link.get("link") or "")
+        ruling = link.get("ruling") or {}
+        rationale = link.get("rationale") or {}
+        ltext = "\n".join(t for t in (ruling.get("text"), rationale.get("text")) if t)
+        if lid and ltext:
+            out.append((link_record_key(rec["path"], lid), lid, f"{rec['title']}\n\n{ltext}"))
+    return out
+
+
+def _record_family(conn, project: str, path: str) -> str:
+    """A link row's own parent topic path, else the path itself -- the key
+    that _collapse_link_duplicates/RRF group by so a topic and its own
+    link rows are never scored as unrelated hits."""
+    row = conn.execute(
+        "SELECT link_topic_path FROM records WHERE project=? AND path=?", (project, path)
+    ).fetchone()
+    return row["link_topic_path"] if row and row["link_topic_path"] else path
+
+
+def _collapse_link_duplicates(conn, project: str, ranked_paths: list[str]) -> list[str]:
+    """Keep only the best-ranked (first) member of each topic-or-its-links
+    family, preserving order. Applied to the fts/vector ranked list
+    SEPARATELY, INSIDE fts_ranked/vector_ranked -- BEFORE their own cap and
+    before RRF fusion (ruling 71): collapsing only a fused list lets the
+    two per-mode lists pick different family winners and split credit
+    right back apart."""
+    seen: set[str] = set()
+    out = []
+    for p in ranked_paths:
+        fam = _record_family(conn, project, p)
+        if fam in seen:
+            continue
+        seen.add(fam)
+        out.append(p)
+    return out
+
+
 def _run_decision_migration_guards(conn: sqlite3.Connection, db_path: Path, project: str | None) -> None:
     """Every additive-ALTER migration guard for the decision index, run
     unconditionally on every successful open (create via open_db, or
@@ -488,6 +577,7 @@ def _run_decision_migration_guards(conn: sqlite3.Connection, db_path: Path, proj
     ensure_links_invariant_column(conn)
     ensure_embeddings_embed_sha_column(conn)
     ensure_links_evidence_column(conn)
+    ensure_records_link_columns(conn)
     if project is not None:
         enforce_project_isolation(conn, db_path, project)
 
@@ -575,11 +665,27 @@ def _decision_warn(cmd_name: str, args, state: str) -> None:
 
 
 def delete_record_rows(conn: sqlite3.Connection, path: str, *, keep_embedding: bool = False) -> None:
-    conn.execute("DELETE FROM records WHERE path=?", (path,))
-    conn.execute("DELETE FROM links WHERE topic_path=?", (path,))
+    """F5: a topic's own link rows (records.link_topic_path == path) cascade
+    with it -- select their paths first, then delete fts/embeddings/records
+    for each, all inside this same open connection/transaction (Codex-
+    pending item 4). `keep_embedding` applies uniformly to the topic's own
+    row AND every one of its link rows: a --no-embed/--auto edit keeps
+    every vector in the family physically, stale-excluded from ranking by
+    the freshness join, not deleted-then-hoped-to-refill."""
+    link_paths = [
+        r["path"] for r in
+        conn.execute("SELECT path FROM records WHERE link_topic_path=?", (path,)).fetchall()
+    ]
+    for lp in link_paths:
+        conn.execute("DELETE FROM fts WHERE path=?", (lp,))
+        if not keep_embedding:
+            conn.execute("DELETE FROM embeddings WHERE path=?", (lp,))
+        conn.execute("DELETE FROM records WHERE path=?", (lp,))
     conn.execute("DELETE FROM fts WHERE path=?", (path,))
     if not keep_embedding:
         conn.execute("DELETE FROM embeddings WHERE path=?", (path,))
+    conn.execute("DELETE FROM records WHERE path=?", (path,))
+    conn.execute("DELETE FROM links WHERE topic_path=?", (path,))
     conn.execute("DELETE FROM edges WHERE topic_path=?", (path,))
     conn.execute("DELETE FROM assumptions WHERE topic_path=?", (path,))
     conn.execute("DELETE FROM concepts WHERE path=?", (path,))
@@ -590,12 +696,14 @@ def insert_record_rows(conn: sqlite3.Connection, project: str, rec: dict, sha: s
     conn.execute(
         """INSERT INTO records
            (path, sha256, mtime, size, project, type, id, title, area, topic,
-            status, authority, tags, code_refs, body, ruling_text)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            status, authority, tags, code_refs, body, ruling_text,
+            source_path, link_topic_path, link_id)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             rec["path"], sha, mtime, size, project, rec["type"], rec["id"], rec["title"],
             rec["area"], rec["topic"], rec["status"], rec["authority"], rec["tags"],
             rec["code_refs"], rec["body"], rec["ruling_text"],
+            rec["path"], None, None,
         ),
     )
     conn.execute(
@@ -644,6 +752,29 @@ def insert_record_rows(conn: sqlite3.Connection, project: str, rec: dict, sha: s
                         str(a.get("since") or "") or None,
                     ),
                 )
+
+        # F5 (ruling 71): one searchable row per link -- source_path names
+        # the parent topic file (so reindex's own "existing"/removal
+        # detection and _index_has_drift/cmd_check never mistake it for a
+        # missing source file), link_topic_path is the same value kept as
+        # its own column for display/lookup, link_id is that link's own id.
+        for link_path, link_id, embed_text in _link_embed_items(rec):
+            link = next(l for l in rec["links"] if str(l.get("link")) == link_id)
+            ruling = link.get("ruling") or {}
+            rationale = link.get("rationale") or {}
+            link_ruling_text = embed_text.split("\n\n", 1)[1]
+            conn.execute(
+                """INSERT OR REPLACE INTO records
+                   (path, sha256, mtime, size, project, type, id, title, area, topic,
+                    status, authority, tags, code_refs, body, ruling_text,
+                    source_path, link_topic_path, link_id)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (link_path, sha, mtime, size, project, "link", rec["id"], rec["title"], rec["area"],
+                 rec["topic"], link.get("status"), ruling.get("authority") or rationale.get("authority"),
+                 rec["tags"], "[]", "", link_ruling_text, rec["path"], rec["path"], link_id),
+            )
+            conn.execute("INSERT INTO fts (path, project, title, body, ruling_text) VALUES (?,?,?,?,?)",
+                         (link_path, project, rec["title"], "", link_ruling_text))
 
     if rec.get("concept"):
         c = rec["concept"]
@@ -724,21 +855,77 @@ def walk_markdown(root: Path):
 
 
 def cmd_reindex(args) -> int:
-    """F2 (Ruling 69), self-contained: no link rows, no link_topic_path
-    column, no _link_embed_items call -- Task 5 replaces this function
-    wholesale, not by patching it (see Task 5's own Step 3)."""
+    """F5: full replacement of Task 2's version (see that function's own
+    former docstring, now gone) -- link rows, source_path/link_topic_path/
+    link_id, the generation-driven migration probe, and Ruling 73's
+    --auto-recomputes-mode-when-it-changed-something fix all land here."""
     root = Path(args.root).resolve()
     if not root.is_dir() or not os.access(root, os.R_OK | os.X_OK):
         print(f"reindex: {root} is not a readable directory -- nothing was changed", file=sys.stderr)
         return 2
     db_path = resolve_db_path(args)
-    conn = open_db(db_path, project=args.project)
+
+    # F5/Ruling 75 migration probe -- runs on a SEPARATE plain connection,
+    # BEFORE open_db (which would immediately ALTER the missing columns in
+    # via ensure_records_link_columns, destroying the very signal this
+    # probe needs to read). Two independent triggers, either one forces a
+    # full content pass this run: (1) the records table itself still lacks
+    # source_path -- the more specific, physically-verifiable signal, also
+    # correct for a hand-restored/partially-migrated schema even when the
+    # generation number alone would say "current"; (2) the stored
+    # index_generation is older than CURRENT_INDEX_GENERATION -- catches a
+    # db that already has the new columns (e.g. one generation-3 store
+    # whose evidence backfill, promised by that generation bump, was never
+    # actually wired until this task) but was never told to re-parse its
+    # unchanged-sha topics. A db with no db_meta at all (brand new) hits
+    # neither branch here -- it has no rows yet for "existing" to matter.
+    migrated = False
+    if db_path.exists():
+        probe = sqlite3.connect(str(db_path))
+        try:
+            cols = {row[1] for row in probe.execute("PRAGMA table_info(records)").fetchall()}
+            if cols and "source_path" not in cols:
+                migrated = True
+            else:
+                gen_row = probe.execute(
+                    "SELECT value FROM db_meta WHERE key='index_generation'"
+                ).fetchone()
+                if gen_row is not None and int(gen_row[0]) < CURRENT_INDEX_GENERATION:
+                    migrated = True
+        except sqlite3.OperationalError:
+            pass
+        finally:
+            probe.close()
+
+    conn = open_db(db_path, project=args.project)   # runs _run_decision_migration_guards,
+                                                       # incl. ensure_records_link_columns
     t0 = time.time()
     no_embed = args.no_embed or getattr(args, "auto", False)
+    # content_full stands in for Task 2's plain `args.full` everywhere a
+    # record's CONTENT (records/fts/links/link-rows) needs a rewrite --
+    # `migrated` forces this once, so an upgrading topic grows its link
+    # rows (and gets links.evidence backfilled) even when its sha never
+    # changes again. It does NOT stand in for `args.full` in the
+    # embedding-queue guard below -- a migration-only pass must never
+    # re-embed an already-current vector, only an explicit --full may
+    # force that (Finding 7's fix, carried from Task 2's own history).
+    content_full = args.full or migrated
 
+    # NULL-aware real-file predicate: `source_path IS NULL` covers a row
+    # that ensure_records_link_columns just ALTERed into existence this
+    # very open() (a genuine pre-F5 legacy row -- its NEW columns are NULL
+    # until this pass's own rewrite populates them), `source_path = path`
+    # covers every already-migrated topic row. A link row's source_path
+    # always names its PARENT (never itself, and never NULL once written),
+    # so it is excluded either way -- this is what keeps a link row from
+    # ever being mistaken for a missing/changed source file (ruling 66).
     existing = {
         row["path"]: (row["sha256"], row["mtime"])
-        for row in conn.execute("SELECT path, sha256, mtime FROM records WHERE project=?", (args.project,))
+        for row in conn.execute(
+            "SELECT path, sha256, mtime FROM records WHERE project=? "
+            "AND (source_path IS NULL OR source_path = path)",
+            (args.project,),
+        )
     }
     embedded_shas = {
         row["path"]: row["embed_sha"]
@@ -760,7 +947,7 @@ def cmd_reindex(args) -> int:
         data = f.read_bytes()
         sha = hashlib.sha256(data).hexdigest()
         prev = existing.get(path_str)
-        sha_unchanged = prev is not None and not args.full and prev[0] == sha
+        sha_unchanged = prev is not None and not content_full and prev[0] == sha
         needs_backfill = (not no_embed) and sha_unchanged and embedded_shas.get(path_str) != sha
         if sha_unchanged and not needs_backfill:
             unchanged += 1
@@ -771,10 +958,27 @@ def cmd_reindex(args) -> int:
         if sha_unchanged and needs_backfill:
             backfill_only.append((path_str, rec))
             to_embed_paths.append(path_str); to_embed_texts.append(embed_text_for(rec))
+            for link_path, _lid, ltext in _link_embed_items(rec):
+                if embedded_shas.get(link_path) != sha:
+                    to_embed_paths.append(link_path); to_embed_texts.append(ltext)
             continue
         pending.append((rec, sha, stat.st_mtime, stat.st_size))
         if not no_embed:
-            to_embed_paths.append(path_str); to_embed_texts.append(embed_text_for(rec))
+            # Finding 7's fix: a record reaches `pending` whenever its sha
+            # genuinely changed OR content_full forced a content rewrite
+            # (migration/--full) with the sha unchanged. Re-embedding the
+            # topic's OWN text is only warranted when args.full was asked
+            # for explicitly, or the embedding is actually missing/stale
+            # for the CURRENT sha -- for a genuine edit those are always
+            # true (a fresh sha never has a matching prior embedding), so
+            # this only skips the migration-only, sha-unchanged case.
+            if args.full or embedded_shas.get(path_str) != sha:
+                to_embed_paths.append(path_str); to_embed_texts.append(embed_text_for(rec))
+            for link_path, _lid, ltext in _link_embed_items(rec):
+                # a brand-new link row (the migration case) always
+                # qualifies -- embedded_shas has no entry for it yet.
+                if args.full or embedded_shas.get(link_path) != sha:
+                    to_embed_paths.append(link_path); to_embed_texts.append(ltext)
 
     vectors_by_path: dict[str, bytes] = {}
     if to_embed_texts:
@@ -797,15 +1001,29 @@ def cmd_reindex(args) -> int:
         sha = existing[path_str][0]
         if _upsert_embedding(path_str, sha):
             backfilled += 1
+        for link_path, _lid, _t in _link_embed_items(rec):
+            if _upsert_embedding(link_path, sha):
+                backfilled += 1
 
     added = 0
     changed = 0
     for rec, sha, mtime, size in pending:
         is_new = rec["path"] not in existing
-        keep_embedding = no_embed and not is_new
+        # keep_embedding used to be `no_embed and not is_new` (Task 2): "if
+        # we're not embedding at all this pass, keep the stale vector".
+        # That is no longer sufficient on its own -- the guard above means
+        # `not no_embed` no longer guarantees THIS path is being
+        # re-embedded (a migration-only pass may leave it untouched), so
+        # the real question is "is a fresh vector for this exact path
+        # about to be written", which `rec["path"] in vectors_by_path`
+        # answers directly.
+        will_refresh_embedding = rec["path"] in vectors_by_path
+        keep_embedding = not is_new and not will_refresh_embedding
         delete_record_rows(conn, rec["path"], keep_embedding=keep_embedding)
         insert_record_rows(conn, args.project, rec, sha, mtime, size)
         _upsert_embedding(rec["path"], sha)
+        for link_path, _lid, _t in _link_embed_items(rec):
+            _upsert_embedding(link_path, sha)
         if is_new:
             added += 1
         else:
@@ -817,12 +1035,22 @@ def cmd_reindex(args) -> int:
                                        # vector is dropped, never kept stale.
 
     # Ruling 69: embedding_mode is recomputed from ACTUAL fresh coverage on
-    # every run except --auto -- one uniform rule replaces Revision 3's
-    # special-cased "only downgrade under --no-embed when mutated" branch,
-    # and naturally handles "a backfill restores full" for free (no
-    # separate case needed: fresh coverage is just recomputed and happens
-    # to be 100%).
-    if not getattr(args, "auto", False):
+    # every run except a NO-OP --auto pass -- one uniform rule replaces
+    # Revision 3's special-cased "only downgrade under --no-embed when
+    # mutated" branch, and naturally handles "a backfill restores full"
+    # for free (no separate case needed: fresh coverage is just recomputed
+    # and happens to be 100%).
+    # Ruling 73: an --auto run that actually changed a row (added/changed/
+    # removed -- backfills never happen under --auto, since no_embed is
+    # forced True whenever auto is True) must still recompute mode from
+    # real coverage -- `full` must never keep standing over a vector that
+    # this very --auto pass just made stale. Only a genuine no-op --auto
+    # pass (nothing changed) still skips this block entirely, matching the
+    # original "an internal heal never announces or forces a mode change
+    # for a change that didn't happen" intent.
+    auto = getattr(args, "auto", False)
+    mode_relevant_change = bool(added or changed or removed_paths)
+    if not auto or mode_relevant_change:
         mode_row = conn.execute("SELECT value FROM db_meta WHERE key='embedding_mode'").fetchone()
         mode_now = mode_row["value"] if mode_row else "none"
         total = conn.execute(
@@ -844,8 +1072,6 @@ def cmd_reindex(args) -> int:
             if mode_now == "full" and mode != "full":
                 print(f"reindex: embeddings are now incomplete for {args.project}; embedding mode set "
                       f"to {mode} (run without --no-embed to restore)")
-    # --auto never writes embedding_mode at all -- the project's own mode
-    # is left exactly as it was; content reindexes normally either way.
 
     # F1 (Codex-pending item 1): the successful-reindex stamp and the
     # logical index generation land in the SAME transaction as every other
@@ -907,9 +1133,18 @@ def cosine(a: list[float], b: list[float]) -> float:
 # ---------------------------------------------------------------------------
 
 
-def build_filter_clause(args) -> tuple[str, list]:
-    clauses = ["project=?"]
-    params: list = [args.project]
+def build_filter_clause(args, include_project: bool = True) -> tuple[str, list]:
+    """`include_project=False` omits the `project=?` clause entirely --
+    fts_ranked/vector_ranked (F5) already have their own project predicate
+    in a differently-aliased WHERE (records.project=? / e.project=?), so
+    they call this with include_project=False to avoid a second, redundant
+    one and add whatever this returns as their own extra AND-clause.
+    filtered_paths (unchanged caller) keeps the default True."""
+    clauses = []
+    params: list = []
+    if include_project:
+        clauses.append("project=?")
+        params.append(args.project)
     if args.status:
         clauses.append("status IN (%s)" % ",".join("?" * len(args.status)))
         params.extend(args.status)
@@ -939,17 +1174,40 @@ def record_row_by_path(conn, path: str):
 
 
 def snippet_for(row) -> str:
-    body = row["body"] or ""
-    return body.strip().replace("\n", " ")[:200]
+    """F5: a link row's own body is always "" (its content lives in
+    ruling_text) -- fall back to ruling_text so a link-row hit never
+    reports an empty snippet."""
+    text = row["body"] or row["ruling_text"] or ""
+    return text.strip().replace("\n", " ")[:200]
 
 
-def fts_ranked(conn, query: str, project: str) -> list[str]:
+def fts_ranked(conn, query: str, project: str, filter_clause: str = "", filter_params: list | None = None) -> list[str]:
+    """F5/F7 (ruling 71): status/type/area/topic/authority filtering (from
+    build_filter_clause(args, include_project=False), passed in by the
+    caller) is applied INSIDE this query's own WHERE, and parent-topic
+    collapse runs on the full filtered/ranked result, BOTH before the real
+    per-channel cap below -- not, as before F5, a fixed LIMIT 200 applied
+    BEFORE any status/type filtering, which a flood of non-matching-status
+    link rows (this task's own candidate-count multiplier) could push a
+    real match behind."""
     q = fts_escape(query)
+    where = "fts MATCH ? AND records.project=?"
+    params: list = [q, project]
+    if filter_clause:
+        where += f" AND {filter_clause}"
+        params.extend(filter_params or [])
     rows = conn.execute(
-        "SELECT path FROM fts WHERE fts MATCH ? AND project=? ORDER BY bm25(fts) LIMIT 200",
-        (q, project),
+        f"SELECT fts.path AS path FROM fts JOIN records ON records.path=fts.path "
+        f"WHERE {where} ORDER BY bm25(fts) LIMIT 1000",
+        # 1000, not 200 -- a generous raw ceiling, not a candidate-starving
+        # one. Filtering already happened in this same query's WHERE, so
+        # this only guards a pathological match count; it never discards a
+        # real match before it's even considered (F7's actual bug).
+        params,
     ).fetchall()
-    return [r["path"] for r in rows]
+    ranked = [r["path"] for r in rows]
+    collapsed = _collapse_link_duplicates(conn, project, ranked)   # parent-topic collapse BEFORE the real cap
+    return collapsed[:200]
 
 
 def fts_escape(query: str) -> str:
@@ -957,20 +1215,68 @@ def fts_escape(query: str) -> str:
     return " OR ".join(f'"{t}"' for t in terms) if terms else '""'
 
 
-def vector_ranked(conn, query: str, project: str) -> list[tuple[str, float]]:
+def vector_ranked(conn, query: str, project: str, filter_clause: str = "", filter_params: list | None = None) -> list[tuple[str, float]]:
     """Ruling 69: joins embeddings to records on embed_sha == sha256 -- a
     stale vector (kept physically across a --no-embed/--auto edit) never
-    reaches the scoring loop at all, not merely scores lower."""
+    reaches the scoring loop at all, not merely scores lower. F5/F7 (ruling
+    71): the SAME filter_clause fts_ranked takes, joined into this query's
+    own WHERE alongside the freshness join, plus the same collapse-before-
+    return (vector mode never had a starvation-causing cap -- it scores
+    every fresh row -- but collapse must still happen here, not as a
+    separate post-filter step, or the two channels could disagree about
+    which family member survives)."""
     qvec = compute_query_embedding(query)
+    where = "e.project=?"
+    params: list = [project]
+    if filter_clause:
+        where += f" AND {filter_clause}"
+        params.extend(filter_params or [])
     rows = conn.execute(
-        "SELECT e.path AS path, e.vector AS vector FROM embeddings e "
-        "JOIN records r ON r.path = e.path AND r.sha256 = e.embed_sha "
-        "WHERE e.project=?",
-        (project,),
+        f"SELECT e.path AS path, e.vector AS vector FROM embeddings e "
+        f"JOIN records r ON r.path = e.path AND r.sha256 = e.embed_sha "
+        f"WHERE {where}",
+        params,
     ).fetchall()
     scored = [(r["path"], cosine(qvec, unpack_vector(r["vector"]))) for r in rows]
     scored.sort(key=lambda t: t[1], reverse=True)
-    return scored
+    collapsed = _collapse_link_duplicates(conn, project, [p for p, _ in scored])
+    score_by_path = dict(scored)
+    return [(p, score_by_path[p]) for p in collapsed]
+
+
+def _search_hits(conn, args, extra_where: str, extra_params: list) -> tuple[list[tuple[str, float]], dict[str, dict[str, str]]]:
+    """The mode-dispatch + RRF fusion core shared by cmd_search and (via
+    the test module's own _run_search, which delegates here rather than
+    reimplementing ranking) tests/test_memidx.py -- one ranking
+    implementation, not two that can silently drift apart. Returns
+    (results, contributing): `contributing` maps a family key to
+    {"fts": link_id, "vector": link_id} whenever hybrid mode's two
+    channels picked DIFFERENT link members of the same topic family."""
+    results: list[tuple[str, float]] = []
+    contributing: dict[str, dict[str, str]] = {}
+    if args.mode == "fts":
+        ranked = fts_ranked(conn, args.query, args.project, extra_where, extra_params)
+        results = [(p, float(len(ranked) - i)) for i, p in enumerate(ranked)]
+    elif args.mode == "vector":
+        results = vector_ranked(conn, args.query, args.project, extra_where, extra_params)
+    elif args.mode == "hybrid":
+        fts_list = fts_ranked(conn, args.query, args.project, extra_where, extra_params)
+        vec_list = [p for p, _ in vector_ranked(conn, args.query, args.project, extra_where, extra_params)]
+        k = 60
+        scores: dict[str, float] = {}
+        family_winner: dict[str, str] = {}
+        for channel_name, lst in (("fts", fts_list), ("vector", vec_list)):
+            for i, p in enumerate(lst):
+                fam = _record_family(conn, args.project, p)
+                scores[fam] = scores.get(fam, 0.0) + 1.0 / (k + i + 1)
+                family_winner.setdefault(fam, p)
+                row = record_row_by_path(conn, p)
+                if row is not None and row["type"] == "link":
+                    contributing.setdefault(fam, {})[channel_name] = row["link_id"]
+        results = sorted(((family_winner[fam], s) for fam, s in scores.items()), key=lambda t: t[1], reverse=True)
+    else:
+        raise ValueError(f"unknown mode {args.mode}")
+    return results, contributing
 
 
 def cmd_search(args) -> int:
@@ -983,27 +1289,13 @@ def cmd_search(args) -> int:
         return _decision_reply("search", args, "missing")
     if state in ("upgrade-required", "stale"):
         _decision_warn("search", args, state)
-    allowed = filtered_paths(conn, args)
 
-    results: list[tuple[str, float]] = []
-    if args.mode == "fts":
-        ranked = fts_ranked(conn, args.query, args.project)
-        results = [(p, float(len(ranked) - i)) for i, p in enumerate(ranked) if p in allowed]
-    elif args.mode == "vector":
-        ranked = vector_ranked(conn, args.query, args.project)
-        results = [(p, s) for p, s in ranked if p in allowed]
-    elif args.mode == "hybrid":
-        fts_list = [p for p in fts_ranked(conn, args.query, args.project) if p in allowed]
-        vec_list = [p for p, _ in vector_ranked(conn, args.query, args.project) if p in allowed]
-        k = 60
-        scores: dict[str, float] = {}
-        for i, p in enumerate(fts_list):
-            scores[p] = scores.get(p, 0.0) + 1.0 / (k + i + 1)
-        for i, p in enumerate(vec_list):
-            scores[p] = scores.get(p, 0.0) + 1.0 / (k + i + 1)
-        results = sorted(scores.items(), key=lambda t: t[1], reverse=True)
-    else:
-        raise ValueError(f"unknown mode {args.mode}")
+    # F5/F7 (ruling 71): status/type/area/topic/authority filtering now
+    # lives INSIDE fts_ranked/vector_ranked themselves, before their own
+    # cap and before RRF fusion -- no more Python-side `allowed` set
+    # post-filtering an already-capped, already-fused list.
+    extra_where, extra_params = build_filter_clause(args, include_project=False)
+    results, contributing = _search_hits(conn, args, extra_where, extra_params)
 
     results = results[: args.limit]
     out = []
@@ -1011,19 +1303,29 @@ def cmd_search(args) -> int:
         row = record_row_by_path(conn, path)
         if row is None:
             continue
-        out.append(
-            {
-                "path": row["path"],
-                "id": row["id"],
-                "title": row["title"],
-                "type": row["type"],
-                "status": row["status"],
-                "area": row["area"],
-                "topic": row["topic"],
-                "score": score,
-                "snippet": snippet_for(row),
-            }
-        )
+        entry = {
+            # F5: a link-row hit reports the REAL topic path (never its own
+            # synthetic records.path), via link_topic_path -- every
+            # existing p.endswith("foo.md")-shaped assertion, and for-path/
+            # why (which stay topic-scoped), keep working unchanged.
+            "path": row["link_topic_path"] or row["path"], "id": row["id"], "title": row["title"],
+            "type": row["type"], "status": row["status"], "area": row["area"], "topic": row["topic"],
+            "score": score, "snippet": snippet_for(row),
+        }
+        if row["type"] == "link":
+            entry["matched_link_id"] = row["link_id"]
+            entry["link_status"] = row["status"]
+            entry["link_authority"] = row["authority"]
+        fam = _record_family(conn, args.project, path)
+        links_by_channel = contributing.get(fam)
+        if links_by_channel and len(set(links_by_channel.values())) > 1:
+            # Codex's addition: a single matched_link_id is ambiguous
+            # exactly when the FTS channel's best-ranked family member and
+            # the vector channel's are DIFFERENT links -- single-mode
+            # fts/vector search never hits this (only one channel, no
+            # disagreement possible).
+            entry["contributing_link_ids"] = links_by_channel
+        out.append(entry)
 
     if args.json:
         print(json.dumps(out, indent=2))
@@ -1976,10 +2278,19 @@ def cmd_drift(args) -> int:
 
 def _index_has_drift(conn: sqlite3.Connection, root: Path, project: str) -> bool:
     """Same added/changed/removed-by-mtime-and-size comparison as cmd_check,
-    factored out so `unmapped` can reuse it without cmd_check's printing."""
+    factored out so `unmapped` can reuse it without cmd_check's printing.
+    Ruling 66: a link row is never a real file on disk (walk_markdown never
+    yields one), so it must never be mistaken for one that vanished --
+    the NULL-aware source_path predicate (see cmd_reindex's own comment on
+    the identical query) excludes every link row here; a pre-migration
+    legacy row (source_path still NULL) is still counted as real."""
     existing = {
         row["path"]: (row["mtime"], row["size"])
-        for row in conn.execute("SELECT path, mtime, size FROM records WHERE project=?", (project,))
+        for row in conn.execute(
+            "SELECT path, mtime, size FROM records WHERE project=? "
+            "AND (source_path IS NULL OR source_path = path)",
+            (project,),
+        )
     }
     seen = set()
     for f in walk_markdown(root):
@@ -2157,9 +2468,16 @@ def cmd_check(args) -> int:
         return _decision_reply("check", args, "missing")
     if state in ("upgrade-required", "stale"):
         _decision_warn("check", args, state)
+    # Ruling 66: same NULL-aware source_path predicate as cmd_reindex/
+    # _index_has_drift -- a link row is never a real file, never counted
+    # here as added/changed/removed.
     existing = {
         row["path"]: (row["mtime"], row["size"])
-        for row in conn.execute("SELECT path, mtime, size FROM records WHERE project=?", (args.project,))
+        for row in conn.execute(
+            "SELECT path, mtime, size FROM records WHERE project=? "
+            "AND (source_path IS NULL OR source_path = path)",
+            (args.project,),
+        )
     }
     files = list(walk_markdown(root))
     seen = set()
@@ -2178,6 +2496,21 @@ def cmd_check(args) -> int:
 
     drift = bool(added or changed or removed)
     report = {"added": added, "changed": changed, "removed": removed, "drift": drift}
+    # F5 (Codex's addition): growth-count visibility -- the real
+    # source-topic count vs. the total searchable row/link/vector count, so
+    # a store's index growth from link rows is visible, not hidden inside
+    # one aggregate number.
+    report["source_topic_count"] = conn.execute(
+        "SELECT COUNT(*) AS n FROM records WHERE project=? AND (source_path IS NULL OR source_path = path)",
+        (args.project,),
+    ).fetchone()["n"]
+    report["searchable_row_count"] = conn.execute(
+        "SELECT COUNT(*) AS n FROM records WHERE project=?", (args.project,)
+    ).fetchone()["n"]
+    report["searchable_vector_count"] = conn.execute(
+        "SELECT COUNT(*) AS n FROM embeddings e JOIN records r ON r.path=e.path AND r.sha256=e.embed_sha "
+        "WHERE e.project=?", (args.project,)
+    ).fetchone()["n"]
     if args.json:
         print(json.dumps(report, indent=2))
     else:
@@ -4627,8 +4960,10 @@ def main(argv=None) -> int:
     p_reindex.add_argument("--no-embed", action="store_true")
     p_reindex.add_argument(
         "--auto", action="store_true",
-        help="internal/hook use: reindex content without embedding and leave embedding_mode "
-             "untouched (unlike --no-embed alone, which can downgrade a full project)",
+        help="internal/hook use: reindex content without embedding; embedding_mode is left "
+             "exactly as it was ONLY when this pass changes nothing, and recomputed from real "
+             "coverage (never re-embedding) whenever it does add/change/remove a row -- so "
+             "'full' never keeps standing over a vector this same pass just made stale",
     )
     p_reindex.set_defaults(func=cmd_reindex)
 
