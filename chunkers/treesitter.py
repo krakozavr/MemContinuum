@@ -114,7 +114,7 @@ import hashlib
 import importlib
 import os
 
-from . import BackendUnavailable, ChunkResult, KINDS, LANGUAGE_TABLE
+from . import BackendUnavailable, ChunkResult, LANGUAGE_TABLE
 
 QUERY_DIR = os.path.join(os.path.dirname(__file__), "queries")
 

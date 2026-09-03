@@ -577,7 +577,13 @@ class TestSwiftDeclaredSymbolsBackend(unittest.TestCase):
         self.assertIn("Outer", names)
         self.assertIn("Inner", names)
 
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
     def test_every_language_table_backend_exposes_declared_symbols(self):
+        # Method-level, not class-level: this is the one test in this class
+        # that loops every LANGUAGE_TABLE row (tree-sitter rows included)
+        # and calls get_chunker on each, so it alone needs the grammar
+        # wheels -- the other four tests in this class are pure Swift/
+        # memidx and must keep running in a no-venv checkout.
         for lang in chunkers.LANGUAGE_TABLE:
             backend = chunkers.get_chunker(lang)
             self.assertTrue(
@@ -946,3 +952,78 @@ class TestTreeSitterDedupPriority(unittest.TestCase):
         ]
         deduped = chunkers.treesitter.dedup_nested(entries)
         self.assertEqual(len(deduped), 2)
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestJavaScriptExtraction(unittest.TestCase):
+    CORPUS = REPO_ROOT / "tests" / "fixtures" / "javascript_corpus"
+
+    def _chunk(self, name):
+        chunkers.treesitter.reset_cache()
+        text = (self.CORPUS / name).read_text()
+        return chunkers.get_chunker("javascript").chunk_file(text, name)
+
+    def test_basic_recall_and_capture_count(self):
+        result = self._chunk("basic.js")
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.gaps, [])
+        self.assertEqual(len(result.chunks), 7)   # capture-count golden -- verified in the scratch venv this revision
+        got = sorted((c["kind"], c["qualified_name"]) for c in result.chunks)
+        self.assertEqual(got, sorted([
+            ("function", "plain"), ("function", "arrowed"), ("function", "DefaultNamed"),
+            ("constructor", "Widget.constructor"), ("accessor", "Widget.value"),
+            ("accessor", "Widget.value"), ("method", "Widget.render"),
+        ]))
+        for c in result.chunks:
+            self.assertEqual(c["lang"], "javascript")
+            self.assertIn(c["kind"], chunkers.KINDS)
+
+    def test_react_components_recall_exactly_one_chunk_per_component(self):
+        # Ruling 84: verified this revision in the scratch venv, end to end
+        # through the real grammar AND the dedup pipeline -- 3 components,
+        # 3 chunks, no duplicate spans for the default export.
+        result = self._chunk("react_components.jsx")
+        self.assertEqual(result.status, "ok")
+        got = sorted((c["kind"], c["qualified_name"]) for c in result.chunks)
+        self.assertEqual(got, sorted([
+            ("function", "Foo"), ("function", "Bar"), ("function", "default"),
+        ]))
+        self.assertEqual(len(result.chunks), 3)   # exactly one chunk per component
+
+    def test_no_callable_file_yields_zero_chunks_status_ok(self):
+        result = self._chunk("no_callable.js")
+        self.assertEqual((result.status, result.chunks, result.gaps), ("ok", [], []))
+
+    def test_whole_file_syntax_error(self):
+        result = self._chunk("syntax_error.js")
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.chunks, [])
+        self.assertEqual(len(result.gaps), 1)
+        self.assertEqual(result.gaps[0][2], "parse-error")
+
+    def test_localized_error_is_partial_and_keeps_the_clean_functions(self):
+        result = self._chunk("error_recovery.js")
+        self.assertEqual(result.status, "partial")
+        names = {c["qualified_name"] for c in result.chunks}
+        self.assertEqual(names, {"good", "alsoGood"})
+        self.assertTrue(any(g[2] == "parse-error" for g in result.gaps))
+
+    def test_declared_symbols_matches_chunk_recall(self):
+        chunkers.treesitter.reset_cache()
+        text = (self.CORPUS / "basic.js").read_text()
+        pairs = chunkers.get_chunker("javascript").declared_symbols(text)
+        self.assertIn(("plain", "plain"), pairs)
+        self.assertIn(("value", "Widget.value"), pairs)
+
+    def test_nested_callables_are_kept_as_separate_chunks(self):
+        # Revision 3, binding addition b -- re-verified this revision
+        # against the real grammar: dedup_nested must never merge a
+        # legitimately nested function into its enclosing one.
+        result = self._chunk("nested_calls.js")
+        self.assertEqual(result.status, "ok")
+        got = sorted((c["kind"], c["qualified_name"]) for c in result.chunks)
+        self.assertEqual(got, sorted([
+            ("function", "outer"), ("function", "inner"),
+            ("method", "Widget.method"), ("function", "Widget.helper"),
+        ]))
+        self.assertEqual(len(result.chunks), 4)   # nothing merged

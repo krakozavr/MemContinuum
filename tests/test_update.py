@@ -1629,10 +1629,24 @@ class TestPartiallyRenderedLanguagesAreReported(unittest.TestCase):
             env={**os.environ, "PYTHONPATH": ""})
         return out.stdout.strip().split()
 
+    def _all_langs(self):
+        out = subprocess.run(
+            [VENV_PYTHON, "-c",
+             "import chunkers; print(' '.join(sorted(chunkers.LANGUAGE_TABLE)))"],
+            cwd=str(TOOLS_DIR), capture_output=True, text=True,
+            env={**os.environ, "PYTHONPATH": ""})
+        return out.stdout.strip().split()
+
     @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
     def test_a_half_rendered_language_is_named_not_silently_dropped(self):
         multi = None
-        for lang in ("swift", "python"):
+        # Derived from the live LANGUAGE_TABLE (Task 3 hygiene fix), not a
+        # hardcoded ("swift", "python") pair -- both of those have exactly
+        # one extension each, so the old loop always fell through to
+        # skipTest below and never actually exercised this case. javascript
+        # (.js/.jsx/.mjs/.cjs, four extensions) is now the first
+        # multi-extension row in sorted order.
+        for lang in self._all_langs():
             if len(self._lang_exts(lang)) > 1:
                 multi = lang
                 break

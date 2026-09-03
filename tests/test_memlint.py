@@ -1,3 +1,4 @@
+import os
 import shutil
 import sys
 import tempfile
@@ -7,7 +8,12 @@ from pathlib import Path
 TOOLS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(TOOLS_DIR))
 
+import memidx  # noqa: E402
 import memlint  # noqa: E402
+
+VENV_PYTHON = os.environ.get("MEMCONTINUUM_PYTHON", "")
+_SKIP_NO_VENV = ("MEMCONTINUUM_PYTHON not set -- tree-sitter tests need the fixed venv "
+                 "with the seven pins installed (Task 1's coordinator step)")
 
 FIXTURES = TOOLS_DIR / "fixtures"
 
@@ -451,6 +457,14 @@ class TestF4EmptyCodeRefIsRejected(unittest.TestCase):
             "type: topic\nid: TOP-1\ntitle: T\ncode_refs: [\"src/foo.py\"]\nlinks: []\n"
         )
         self.assertFalse(any("code_refs" in e for e in errors), errors)
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestJavaScriptSymbolRouting(unittest.TestCase):
+    def test_js_symbol_fragment_routes_through_the_registry(self):
+        text = "function widget_loader() {\n  return 1;\n}\n"
+        self.assertTrue(memidx.fragment_declared_in_text("widget_loader", text, rel_path="a.js"))
+        self.assertFalse(memidx.fragment_declared_in_text("nonexistent", text, rel_path="a.js"))
 
 
 if __name__ == "__main__":
