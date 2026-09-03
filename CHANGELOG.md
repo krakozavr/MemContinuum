@@ -27,6 +27,9 @@
 - A code reference now matches by path segment, so a same-prefix
   sibling file or a backup copy is never mistaken for the file a
   decision actually names.
+- An empty or fragment-only code reference now matches no path at all,
+  instead of matching every absolute path; the linter reports such an
+  entry as an error naming the topic and the entry.
 - Individual links inside a topic are now retrievable on their own —
   found by search, carrying their own status and authority, and
   reported back by the real topic path they belong to — not only as

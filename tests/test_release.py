@@ -60,6 +60,24 @@ class TestReleaseHygiene(unittest.TestCase):
                 f"{name} from requirements.txt has no exact-pinned '{name}==...' line in requirements.lock",
             )
 
+    def test_lockfile_carries_no_machine_identifying_path(self):
+        # uv pip compile's default header embeds the absolute --python path
+        # it was run with (e.g. /home/<user>/.../bin/python) -- a real leak
+        # of this dev machine's layout and username into a tracked file.
+        # tests/test_repo_init.py's TestNoMachineIdentifyingContent has the
+        # broader repo-wide version of this check (inline token list, no
+        # shared constant to import); this is the lockfile-specific,
+        # faster-signal counterpart.
+        text = LOCKFILE.read_text()
+        username_needle = "kra" + "kozavr"
+        for needle in ("/home/", "/mnt/", "/Users/", username_needle):
+            self.assertNotIn(
+                needle, text,
+                f"requirements.lock contains machine-identifying text {needle!r} "
+                "-- regenerate with `uv pip compile --no-header` or "
+                "--custom-compile-command so the header carries no absolute path",
+            )
+
     def test_run_bash32_updates_apt_cache_before_downloading(self):
         text = RUN_BASH32.read_text()
         idx_update = text.find("apt-get update")
