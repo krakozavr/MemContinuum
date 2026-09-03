@@ -976,10 +976,11 @@ already indexed.
 
 **Multi-root output.** `code-search --json` wraps hits in an envelope:
 `state`; `code_root`/`indexed_at`/`head_sha`, naming the first recorded root
-alphabetically; `code_roots`, the full per-root report list (each entry
-carrying its own `indexed_at`/`head_sha`); `changed`, `failed`,
-`not_indexed`, `embedding_mode`; and `results`. In plain output, a hit's
-location is qualified with its root
+alphabetically (`indexed_at` here is that root's `last_indexed_at`, renamed
+at this top level only); `code_roots`, the full per-root report list (each
+entry carries its own `last_indexed_at`/`head_sha`, not renamed); `changed`,
+`failed`, `not_indexed`, `embedding_mode`; and `results`. In plain output,
+a hit's location is qualified with its root
 (`root/path:line`) only once a project has more than one recorded root — the
 common single-root case keeps its plain `path:line` line, since only a
 multi-root project can have the same relative path indexed under two roots
