@@ -681,7 +681,16 @@ def decision_index_state(db_path: Path, project: str, root: Path | None = None) 
         if stamp is None:
             return "uninitialized" if has_rows is None else "upgrade-required"
         gen_row = conn.execute("SELECT value FROM db_meta WHERE key='index_generation'").fetchone()
-        generation = int(gen_row["value"]) if gen_row else 1
+        # Whole-branch review item 6: a corrupted index_generation value
+        # raises ValueError (int() on garbage) -- unguarded here, that
+        # would crash all five CLI readers this function serves, before
+        # any of THEIR own try/except gets a chance to run. Same guard
+        # shape as cmd_reindex's own migration probe (line ~993): treat a
+        # non-integer stamp as older than current, the safe direction.
+        try:
+            generation = int(gen_row["value"]) if gen_row else 1
+        except (TypeError, ValueError):
+            return "upgrade-required"
         if generation < CURRENT_INDEX_GENERATION:
             return "upgrade-required"
         if root is not None and _index_has_drift(conn, root, project):
@@ -711,11 +720,45 @@ def _decision_reply(cmd_name: str, args, state: str) -> int:
 def _decision_warn(cmd_name: str, args, state: str) -> None:
     """A positive match off an `upgrade-required`/`stale` index is still
     real, trustworthy evidence (ruling 68) -- the caller keeps querying and
-    injecting, this just surfaces the caveat on stderr."""
+    injecting, this just surfaces the caveat on stderr. Final-fix-wave item
+    2: `stale` (only reachable when the caller opted into `--root`) gets
+    the coordinator-specified wording naming the actual cause -- the store
+    changed since the last reindex -- not just the bare state name;
+    `upgrade-required` (reachable with no `--root` at all -- a schema-
+    generation gap, unrelated to on-disk drift) keeps the pre-existing
+    generic line."""
+    if state == "stale":
+        print(
+            f"{cmd_name}: index is stale (store changed since the last reindex); "
+            f"results may be outdated",
+            file=sys.stderr,
+        )
+        return
     print(
         f"{cmd_name}: index {state} (results may be incomplete) -- run reindex",
         file=sys.stderr,
     )
+
+
+def _for_path_missing_reply(args, state: str) -> int:
+    """Final-fix-wave item 3: for-path's own missing/uninitialized reply --
+    NOT `_decision_reply` (which returns 1; for-path's contract is exit 3,
+    matched BEFORE the hook's generic rc check in hooks/pre-edit-chain.sh).
+    stdout stays exactly `[]` (non-json) / a bare `[]` list is now replaced
+    with the named-state envelope under --json -- a direct caller no
+    longer sees an unlabeled empty list indistinguishable from "queried
+    fine, found nothing"; the hook itself only ever reads the exit code on
+    rc==3 (RESULT_JSON is captured but never parsed on that branch), so
+    this envelope change carries no hook-side risk."""
+    print(
+        f"for-path: decision index {state} -- run: memidx.py reindex --root <store>",
+        file=sys.stderr,
+    )
+    if getattr(args, "json", False):
+        print(json.dumps({"state": state, "results": []}, indent=2))
+    else:
+        print("no topics reference this path")
+    return 3
 
 
 def delete_record_rows(conn: sqlite3.Connection, path: str, *, keep_embedding: bool = False) -> None:
@@ -1059,9 +1102,23 @@ def cmd_reindex(args) -> int:
 
     vectors_by_path: dict[str, bytes] = {}
     if to_embed_texts:
-        vecs = compute_embeddings(to_embed_texts)
-        for p, v in zip(to_embed_paths, vecs):
-            vectors_by_path[p] = pack_vector(v)
+        # Ruling 80: an embedding-backend failure here must fail OPEN, not
+        # crash the whole reindex -- vectors_by_path simply stays empty
+        # (every _upsert_embedding call below is then a no-op, exactly
+        # like a --no-embed run's own "keep whatever vector already
+        # exists, write nothing new" behavior), rows still get committed,
+        # and the coverage-derived embedding_mode block further down
+        # naturally reports "partial"/"none" from the real, now-incomplete
+        # vector coverage -- no separate mode-forcing needed here.
+        vecs, embed_err = try_compute_embeddings(compute_embeddings, to_embed_texts)
+        if embed_err is not None:
+            print(
+                f"reindex: embeddings unavailable ({embed_err}); continuing without embeddings",
+                file=sys.stderr,
+            )
+        else:
+            for p, v in zip(to_embed_paths, vecs):
+                vectors_by_path[p] = pack_vector(v)
 
     def _upsert_embedding(path: str, sha_for: str) -> bool:
         if path not in vectors_by_path:
@@ -1186,6 +1243,33 @@ def compute_query_embedding(text: str):
     return list(model.query_embed([text]))[0]
 
 
+class EmbeddingUnavailableError(Exception):
+    """Ruling 80: raised by vector_ranked/code_hits_vector's own query-
+    embedding step (never by anything else in their bodies) so a caller
+    that wants to fall open on an embedding failure can catch this ONE
+    specific type -- never a blanket `except Exception` around the whole
+    ranking call, which would just as happily swallow an unrelated SQL/
+    logic bug and silently degrade to FTS instead of surfacing it."""
+
+
+def try_compute_embeddings(compute_fn, *args) -> tuple[object | None, str | None]:
+    """Ruling 80 (embedding failure fails open): the ONE helper wrapping
+    BOTH compute_embeddings (the batch/document path -- cmd_reindex, cmd_
+    code_reindex) and compute_query_embedding (the single-query path --
+    vector_ranked, code_hits_vector), instead of four independent try/
+    except blocks that could drift out of sync. Returns (result, None) on
+    success; on ANY exception from the fastembed backend (missing package,
+    a broken/partial model cache, OOM, a network hiccup fetching the model,
+    ...), returns (None, message) where `message` is already formatted as
+    "TypeName: str(exc)" -- exactly the text every caller's own stderr
+    line/EmbeddingUnavailableError needs, so no caller re-inspects the
+    exception itself."""
+    try:
+        return compute_fn(*args), None
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+
+
 def cosine(a: list[float], b: list[float]) -> float:
     """Returns a plain Python float, always -- fastembed's query_embed
     yields a numpy array (numpy.float32 elements), so an un-cast result
@@ -1259,32 +1343,51 @@ def snippet_for(row) -> str:
 
 
 def fts_ranked(conn, query: str, project: str, filter_clause: str = "", filter_params: list | None = None) -> list[str]:
-    """F5/F7 (ruling 71): status/type/area/topic/authority filtering (from
-    build_filter_clause(args, include_project=False), passed in by the
-    caller) is applied INSIDE this query's own WHERE, and parent-topic
-    collapse runs on the full filtered/ranked result, BOTH before the real
-    per-channel cap below -- not, as before F5, a fixed LIMIT 200 applied
-    BEFORE any status/type filtering, which a flood of non-matching-status
-    link rows (this task's own candidate-count multiplier) could push a
-    real match behind."""
+    """F5/F7 (ruling 71, fix-round item 1): status/type/area/topic/authority
+    filtering (from build_filter_clause(args, include_project=False),
+    passed in by the caller) is applied INSIDE this query's own WHERE, and
+    parent-topic collapse runs on the ranked cursor BEFORE any raw-row cap
+    -- a raw `LIMIT 1000` on the SQL side, applied before collapse, is
+    itself a starvation bug once a single family can contribute more than
+    1000 matching rows (Codex's probe: 1001 matching link rows of one
+    topic, ranked ahead of a second topic's own single matching row, would
+    starve that second family out even though it matches and is well
+    within the real 200-family cap). Binding order is filter -> parent
+    collapse -> cap, with NO raw cap in between: the cursor is walked,
+    unbounded, in CHUNKs, collapsing to families as it goes, stopping the
+    instant 200 distinct families have been collected -- so a pathological
+    match count is still bounded (by chunk, not by materializing the whole
+    result), without ever discarding a real match before collapse sees
+    it."""
     q = fts_escape(query)
     where = "fts MATCH ? AND records.project=?"
     params: list = [q, project]
     if filter_clause:
         where += f" AND {filter_clause}"
         params.extend(filter_params or [])
-    rows = conn.execute(
+    cur = conn.execute(
         f"SELECT fts.path AS path FROM fts JOIN records ON records.path=fts.path "
-        f"WHERE {where} ORDER BY bm25(fts) LIMIT 1000",
-        # 1000, not 200 -- a generous raw ceiling, not a candidate-starving
-        # one. Filtering already happened in this same query's WHERE, so
-        # this only guards a pathological match count; it never discards a
-        # real match before it's even considered (F7's actual bug).
+        f"WHERE {where} ORDER BY bm25(fts)",
         params,
-    ).fetchall()
-    ranked = [r["path"] for r in rows]
-    collapsed = _collapse_link_duplicates(conn, project, ranked)   # parent-topic collapse BEFORE the real cap
-    return collapsed[:200]
+    )
+    CHUNK = 200
+    seen_families: set[str] = set()
+    collapsed: list[str] = []
+    while len(collapsed) < 200:
+        chunk_rows = cur.fetchmany(CHUNK)
+        if not chunk_rows:
+            break
+        chunk_paths = [r["path"] for r in chunk_rows]
+        meta = _batch_record_meta(conn, project, chunk_paths)
+        for p in chunk_paths:
+            fam = meta[p]["family"] if p in meta else p
+            if fam in seen_families:
+                continue
+            seen_families.add(fam)
+            collapsed.append(p)
+            if len(collapsed) >= 200:
+                break
+    return collapsed
 
 
 def fts_escape(query: str) -> str:
@@ -1301,8 +1404,13 @@ def vector_ranked(conn, query: str, project: str, filter_clause: str = "", filte
     return (vector mode never had a starvation-causing cap -- it scores
     every fresh row -- but collapse must still happen here, not as a
     separate post-filter step, or the two channels could disagree about
-    which family member survives)."""
-    qvec = compute_query_embedding(query)
+    which family member survives). Ruling 80: a query-embedding failure
+    raises EmbeddingUnavailableError -- the ONE specific type _search_hits
+    catches to fall back to FTS-only -- rather than the bare fastembed
+    exception (which would just crash cmd_search)."""
+    qvec, embed_err = try_compute_embeddings(compute_query_embedding, query)
+    if embed_err is not None:
+        raise EmbeddingUnavailableError(embed_err)
     where = "e.project=?"
     params: list = [project]
     if filter_clause:
@@ -1321,24 +1429,41 @@ def vector_ranked(conn, query: str, project: str, filter_clause: str = "", filte
     return [(p, score_by_path[p]) for p in collapsed]
 
 
-def _search_hits(conn, args, extra_where: str, extra_params: list) -> tuple[list[tuple[str, float]], dict[str, dict[str, str]]]:
+def _search_hits(conn, args, extra_where: str, extra_params: list) -> tuple[list[tuple[str, float]], dict[str, dict[str, str]], bool]:
     """The mode-dispatch + RRF fusion core shared by cmd_search and (via
     the test module's own _run_search, which delegates here rather than
     reimplementing ranking) tests/test_memidx.py -- one ranking
     implementation, not two that can silently drift apart. Returns
-    (results, contributing): `contributing` maps a family key to
-    {"fts": link_id, "vector": link_id} whenever hybrid mode's two
-    channels picked DIFFERENT link members of the same topic family."""
+    (results, contributing, embedding_unavailable): `contributing` maps a
+    family key to {"fts": link_id, "vector": link_id} whenever hybrid
+    mode's two channels picked DIFFERENT link members of the same topic
+    family. Ruling 80: `embedding_unavailable` is True whenever a "vector"
+    or "hybrid" mode's own query-embedding step raised
+    EmbeddingUnavailableError -- caught HERE (the one place that knows
+    both modes' fallback shape), never re-raised, so this always degrades
+    to FTS-only ranking on that specific failure rather than crashing
+    cmd_search; `contributing` never carries a "vector" key on this path
+    (no vector channel actually ran)."""
     results: list[tuple[str, float]] = []
     contributing: dict[str, dict[str, str]] = {}
+    embedding_unavailable = False
     if args.mode == "fts":
         ranked = fts_ranked(conn, args.query, args.project, extra_where, extra_params)
         results = [(p, float(len(ranked) - i)) for i, p in enumerate(ranked)]
     elif args.mode == "vector":
-        results = vector_ranked(conn, args.query, args.project, extra_where, extra_params)
+        try:
+            results = vector_ranked(conn, args.query, args.project, extra_where, extra_params)
+        except EmbeddingUnavailableError:
+            embedding_unavailable = True
+            ranked = fts_ranked(conn, args.query, args.project, extra_where, extra_params)
+            results = [(p, float(len(ranked) - i)) for i, p in enumerate(ranked)]
     elif args.mode == "hybrid":
         fts_list = fts_ranked(conn, args.query, args.project, extra_where, extra_params)
-        vec_list = [p for p, _ in vector_ranked(conn, args.query, args.project, extra_where, extra_params)]
+        try:
+            vec_list = [p for p, _ in vector_ranked(conn, args.query, args.project, extra_where, extra_params)]
+        except EmbeddingUnavailableError:
+            embedding_unavailable = True
+            vec_list = []   # degrades hybrid's own RRF fusion below to FTS-only, not a crash
         # Fix-round item 2 (coordinator review): ONE batched query for
         # both channels' combined candidate set, replacing what used to be
         # a _record_family call PLUS a record_row_by_path call per item
@@ -1359,12 +1484,18 @@ def _search_hits(conn, args, extra_where: str, extra_params: list) -> tuple[list
         results = sorted(((family_winner[fam], s) for fam, s in scores.items()), key=lambda t: t[1], reverse=True)
     else:
         raise ValueError(f"unknown mode {args.mode}")
-    return results, contributing
+    return results, contributing, embedding_unavailable
 
 
 def cmd_search(args) -> int:
     db_path = resolve_db_path(args)
-    state = decision_index_state(db_path, args.project)   # root=None -- this reader never sees "stale"
+    # Final-fix-wave item 2: --root is optional (add_common_args's
+    # optional_root=True) -- omitted, root stays None and this reader can
+    # never see "stale", exactly as before; given, it's resolved and
+    # passed through so an on-disk-drifted store is surfaced, not silently
+    # answered as "current".
+    root = Path(args.root).resolve() if getattr(args, "root", None) else None
+    state = decision_index_state(db_path, args.project, root=root)
     if state in ("missing", "uninitialized"):
         return _decision_reply("search", args, state)
     conn = open_db_noncreating(db_path, project=args.project)
@@ -1378,7 +1509,15 @@ def cmd_search(args) -> int:
     # cap and before RRF fusion -- no more Python-side `allowed` set
     # post-filtering an already-capped, already-fused list.
     extra_where, extra_params = build_filter_clause(args, include_project=False)
-    results, contributing = _search_hits(conn, args, extra_where, extra_params)
+    results, contributing, embedding_unavailable = _search_hits(conn, args, extra_where, extra_params)
+    if embedding_unavailable:
+        # Ruling 80: a "vector"/"hybrid" mode's own query-embedding step
+        # failed -- _search_hits already fell back to FTS-only ranking
+        # (results above ARE the FTS-only results); this just names it.
+        print(
+            "search: embeddings unavailable; falling back to FTS-only",
+            file=sys.stderr,
+        )
 
     results = results[: args.limit]
     out = []
@@ -1420,7 +1559,25 @@ def cmd_search(args) -> int:
         out.append(entry)
 
     if args.json:
-        print(json.dumps(out, indent=2))
+        # Final-fix-wave item 2: "--json carries state" only when the
+        # caller opted into --root AND the state is one worth naming
+        # (upgrade-required/stale) -- a rootless call, or a root-given
+        # call that reads "current", keeps the exact pre-existing bare-
+        # list shape (proven by test_search_still_returns_positive_
+        # matches_under_upgrade_required: no --root -> bare list even
+        # under upgrade-required). Item 4: "embedding": "unavailable" is
+        # added the same way, independent of --root/state -- both can be
+        # present at once (a stale, root-given store whose embedding
+        # backend also failed), so this is a merge, not an either/or.
+        extra: dict = {}
+        if root is not None and state in ("upgrade-required", "stale"):
+            extra["state"] = state
+        if embedding_unavailable:
+            extra["embedding"] = "unavailable"
+        if extra:
+            print(json.dumps({**extra, "results": out}, indent=2))
+        else:
+            print(json.dumps(out, indent=2))
     else:
         for r in out:
             print(f"{r['score']:.4f}  {r['path']}  [{r['type']}] {r['title']}")
@@ -1564,7 +1721,9 @@ def chain_json(topic_row, link_rows, edges_by_from, assumptions_by_link) -> dict
 
 def cmd_chain(args) -> int:
     db_path = resolve_db_path(args)
-    state = decision_index_state(db_path, args.project)   # root=None -- this reader never sees "stale"
+    # Final-fix-wave item 2: see cmd_search's identical comment.
+    root = Path(args.root).resolve() if getattr(args, "root", None) else None
+    state = decision_index_state(db_path, args.project, root=root)
     if state in ("missing", "uninitialized"):
         return _decision_reply("chain", args, state)
     conn = open_db_noncreating(db_path, project=args.project)
@@ -1583,7 +1742,10 @@ def cmd_chain(args) -> int:
     assumptions_by_link = assumptions_for_topic(conn, topic_row["path"])
 
     if args.json:
-        print(json.dumps(chain_json(topic_row, link_rows, edges_by_from, assumptions_by_link), indent=2))
+        payload = chain_json(topic_row, link_rows, edges_by_from, assumptions_by_link)
+        if root is not None and state in ("upgrade-required", "stale"):
+            payload["state"] = state   # item 2: --json carries state when opted into --root
+        print(json.dumps(payload, indent=2))
     else:
         for line in chain_lines(topic_row, link_rows, edges_by_from, assumptions_by_link):
             print(line)
@@ -1842,15 +2004,17 @@ def cmd_for_path(args) -> int:
     catch). upgrade-required/current/stale all proceed normally; a positive
     match off a non-current index stays usable."""
     db_path = resolve_db_path(args)
-    state = decision_index_state(db_path, args.project)
+    # Final-fix-wave item 2: see cmd_search's identical comment.
+    root = Path(args.root).resolve() if getattr(args, "root", None) else None
+    state = decision_index_state(db_path, args.project, root=root)
     if state in ("missing", "uninitialized"):
-        print(json.dumps([], indent=2) if args.json else "no topics reference this path")
-        return 3
+        return _for_path_missing_reply(args, state)
     try:
         conn = open_db_noncreating(db_path, project=args.project)
         if conn is None:
-            print(json.dumps([], indent=2) if args.json else "no topics reference this path")
-            return 3
+            # TOCTOU: the file vanished between the state check above and
+            # this open -- the same outcome as "missing" was just found.
+            return _for_path_missing_reply(args, "missing")
         if state in ("upgrade-required", "stale"):
             _decision_warn("for-path", args, state)
         matches = topic_matches_for_path(conn, args.project, args.file_path)
@@ -1859,7 +2023,12 @@ def cmd_for_path(args) -> int:
         if args.json:
             out = [topic_chain_json(conn, row) for row in matches]
             out.extend(concept_json(conn, args.project, crow) for crow in concept_matches)
-            print(json.dumps(out, indent=2))
+            # Item 2: --json carries state when opted into --root and the
+            # state is worth naming -- see cmd_search's identical gate.
+            if root is not None and state in ("upgrade-required", "stale"):
+                print(json.dumps({"state": state, "results": out}, indent=2))
+            else:
+                print(json.dumps(out, indent=2))
         else:
             if not matches and not concept_matches:
                 print("no topics reference this path")
@@ -2089,7 +2258,9 @@ def cmd_why(args) -> int:
         file_path = resolved
 
     db_path = resolve_db_path(args)
-    state = decision_index_state(db_path, args.project)   # root=None -- this reader never sees "stale"
+    # Final-fix-wave item 2: see cmd_search's identical comment.
+    root = Path(args.root).resolve() if getattr(args, "root", None) else None
+    state = decision_index_state(db_path, args.project, root=root)
     if state in ("missing", "uninitialized"):
         return _decision_reply("why", args, state)
     conn = open_db_noncreating(db_path, project=args.project)
@@ -2101,7 +2272,12 @@ def cmd_why(args) -> int:
 
     if args.json:
         out = [concept_json(conn, args.project, c) for c in concept_matches]
-        print(json.dumps(out, indent=2))
+        # Item 2: --json carries state when opted into --root -- see
+        # cmd_search's identical gate.
+        if root is not None and state in ("upgrade-required", "stale"):
+            print(json.dumps({"state": state, "results": out}, indent=2))
+        else:
+            print(json.dumps(out, indent=2))
     else:
         if not concept_matches:
             print(f"no concept claims {file_path!r}")
@@ -2304,9 +2480,13 @@ def cmd_drift(args) -> int:
     failure even under --strict-holds."""
     db_path = resolve_db_path(args)
     # --code-root points at CODE, not the decision store's own markdown
-    # tree, so this reader cannot compute "stale" either -- root stays None,
-    # same as search/chain/why.
-    state = decision_index_state(db_path, args.project)
+    # tree, so it can never stand in for --root here. Final-fix-wave item
+    # 2: this reader now takes its OWN separate, optional --root (add_
+    # common_args's optional_root=True) naming the markdown store root, so
+    # it CAN see "stale" when a caller supplies it -- omitted, root stays
+    # None, exactly as before (same as search/chain/why with no --root).
+    root = Path(args.root).resolve() if getattr(args, "root", None) else None
+    state = decision_index_state(db_path, args.project, root=root)
     if state in ("missing", "uninitialized"):
         return _decision_reply("drift", args, state)
     conn = open_db_noncreating(db_path, project=args.project)
@@ -2347,8 +2527,11 @@ def cmd_drift(args) -> int:
 
     strict = getattr(args, "strict_holds", False)
     if args.json:
-        print(json.dumps({"violations": violations, "hold_violations": hold_violations,
-                           "skipped": skipped, "revalidate": revalidate}, indent=2))
+        payload = {"violations": violations, "hold_violations": hold_violations,
+                   "skipped": skipped, "revalidate": revalidate}
+        if root is not None and state in ("upgrade-required", "stale"):
+            payload["state"] = state   # item 2: --json carries state when opted into --root
+        print(json.dumps(payload, indent=2))
     else:
         if not violations and not hold_violations:
             print("drift: no invariants violated")
@@ -3561,14 +3744,26 @@ def cmd_code_reindex(args) -> int:
 
     reembeds = 0
     if pending_texts:
-        vecs = compute_embeddings(pending_texts)
+        # Ruling 80: same fail-open shape as cmd_reindex -- on a backend
+        # failure, no new embedding rows are written this pass (`reembeds`
+        # stays 0), the chunk rows themselves are untouched, and the real-
+        # coverage embedding_mode recompute further down naturally reports
+        # the now-incomplete coverage without any extra forcing here.
+        vecs, embed_err = try_compute_embeddings(compute_embeddings, pending_texts)
+        if embed_err is not None:
+            print(
+                f"code-reindex: embeddings unavailable ({embed_err}); continuing without embeddings",
+                file=sys.stderr,
+            )
+            vecs = []
         for cid, v in zip(pending_ids, vecs):
             packed = pack_vector(v)
             conn.execute(
                 "INSERT OR REPLACE INTO embeddings (chunk_id, project, dim, vector) VALUES (?,?,?,?)",
                 (cid, args.project, len(unpack_vector(packed)), packed),
             )
-        reembeds = len(pending_texts)
+        if embed_err is None:
+            reembeds = len(pending_texts)
 
     removed = set(existing.keys()) - seen
     for rel in removed:
@@ -3852,7 +4047,12 @@ def code_hits_fts(conn: sqlite3.Connection, query: str, project: str, limit: int
 
 
 def code_hits_vector(conn: sqlite3.Connection, query: str, project: str):
-    qvec = compute_query_embedding(query)
+    """Ruling 80: same EmbeddingUnavailableError contract as vector_ranked
+    -- cmd_code_search catches this ONE specific type to fall back to
+    FTS-only, never a blanket `except Exception`."""
+    qvec, embed_err = try_compute_embeddings(compute_query_embedding, query)
+    if embed_err is not None:
+        raise EmbeddingUnavailableError(embed_err)
     rows = conn.execute(
         "SELECT chunk_id, vector FROM embeddings WHERE project=?", (project,)
     ).fetchall()
@@ -4172,14 +4372,28 @@ def cmd_code_search(args) -> int:
                 file=sys.stderr,
             )
 
+    # Ruling 80: a "vector"/"hybrid" mode's own query-embedding step
+    # raises EmbeddingUnavailableError (code_hits_vector's own contract,
+    # mirroring vector_ranked) -- caught HERE, once, to fall back to
+    # FTS-only instead of crashing code-search.
+    embedding_unavailable = False
     if args.mode == "fts":
         ids = code_hits_fts(conn, args.query, args.project)
         results = [(cid, float(len(ids) - i)) for i, cid in enumerate(ids)]
     elif args.mode == "vector":
-        results = code_hits_vector(conn, args.query, args.project)
+        try:
+            results = code_hits_vector(conn, args.query, args.project)
+        except EmbeddingUnavailableError:
+            embedding_unavailable = True
+            ids = code_hits_fts(conn, args.query, args.project)
+            results = [(cid, float(len(ids) - i)) for i, cid in enumerate(ids)]
     elif args.mode == "hybrid":
         fts_ids = code_hits_fts(conn, args.query, args.project)
-        vec_ids = [cid for cid, _ in code_hits_vector(conn, args.query, args.project)]
+        try:
+            vec_ids = [cid for cid, _ in code_hits_vector(conn, args.query, args.project)]
+        except EmbeddingUnavailableError:
+            embedding_unavailable = True
+            vec_ids = []   # degrades the RRF fusion below to FTS-only, not a crash
         k = 60
         scores: dict = {}
         for i, cid in enumerate(fts_ids):
@@ -4189,6 +4403,12 @@ def cmd_code_search(args) -> int:
         results = sorted(scores.items(), key=lambda t: t[1], reverse=True)
     else:
         raise ValueError(f"unknown mode {args.mode}")
+
+    if embedding_unavailable:
+        print(
+            "code-search: embeddings unavailable; falling back to FTS-only",
+            file=sys.stderr,
+        )
 
     results = results[: args.limit]
 
@@ -4273,21 +4493,21 @@ def cmd_code_search(args) -> int:
         # own alphabetical order), kept for existing readers; code_roots
         # carries the report's full per-root list.
         first_root = report["roots"][0]
-        print(json.dumps(
-            {
-                "state": state,
-                "code_root": first_root["code_root"],
-                "code_roots": report["roots"],
-                "indexed_at": first_root["last_indexed_at"],
-                "head_sha": first_root["head_sha"],
-                "changed": report["changed"],
-                "failed": report["failed"],
-                "not_indexed": report["not_indexed"],
-                "embedding_mode": report["embedding_mode"],
-                "results": out,
-            },
-            indent=2,
-        ))
+        payload = {
+            "state": state,
+            "code_root": first_root["code_root"],
+            "code_roots": report["roots"],
+            "indexed_at": first_root["last_indexed_at"],
+            "head_sha": first_root["head_sha"],
+            "changed": report["changed"],
+            "failed": report["failed"],
+            "not_indexed": report["not_indexed"],
+            "embedding_mode": report["embedding_mode"],
+            "results": out,
+        }
+        if embedding_unavailable:   # item 4 (ruling 80): a query-embedding failure this call
+            payload["embedding"] = "unavailable"
+        print(json.dumps(payload, indent=2))
     else:
         # Task 6: a path alone is ambiguous once a project has more than
         # one code root (the SAME relative path can be indexed under
@@ -5068,11 +5288,27 @@ def cmd_stats(args) -> int:
 # ---------------------------------------------------------------------------
 
 
-def add_common_args(p: argparse.ArgumentParser, need_root: bool = False) -> None:
+def add_common_args(p: argparse.ArgumentParser, need_root: bool = False, optional_root: bool = False) -> None:
+    """Final-fix-wave item 2: `optional_root` is the plumbing rootless
+    readers (search/chain/for-path/why/drift) opt into -- an OPTIONAL
+    `--root DIR`, unlike `need_root`'s always-required one (reindex/check/
+    unmapped). Omitted (the default for these five subcommands until a
+    caller opts in), `decision_index_state` still runs with `root=None` --
+    exactly today's behavior, so an existing rootless call is unchanged.
+    Given, it lets these readers see the fifth state, `stale`, and surface
+    it as a named warning instead of silently reading a since-edited store
+    as `current`."""
     p.add_argument("--project", default=DEFAULT_PROJECT)
     p.add_argument("--db", default=None, help="override the index DB path")
     if need_root:
         p.add_argument("--root", required=True, help="markdown root to walk")
+    elif optional_root:
+        p.add_argument(
+            "--root", default=None,
+            help="markdown root to check for on-disk drift since the last reindex (the "
+                 "'stale' state) -- omitted, this reader can never observe 'stale', only "
+                 "'missing'/'uninitialized'/'upgrade-required'/'current'",
+        )
 
 
 def main(argv=None) -> int:
@@ -5093,7 +5329,7 @@ def main(argv=None) -> int:
     p_reindex.set_defaults(func=cmd_reindex)
 
     p_search = sub.add_parser("search")
-    add_common_args(p_search)
+    add_common_args(p_search, optional_root=True)
     p_search.add_argument("query")
     p_search.add_argument("--mode", choices=["fts", "vector", "hybrid"], default="hybrid")
     p_search.add_argument("--status", action="append", default=[])
@@ -5106,13 +5342,13 @@ def main(argv=None) -> int:
     p_search.set_defaults(func=cmd_search)
 
     p_chain = sub.add_parser("chain")
-    add_common_args(p_chain)
+    add_common_args(p_chain, optional_root=True)
     p_chain.add_argument("topic")
     p_chain.add_argument("--json", action="store_true")
     p_chain.set_defaults(func=cmd_chain)
 
     p_forpath = sub.add_parser("for-path")
-    add_common_args(p_forpath)
+    add_common_args(p_forpath, optional_root=True)
     p_forpath.add_argument("file_path")
     p_forpath.add_argument("--json", action="store_true")
     p_forpath.set_defaults(func=cmd_for_path)
@@ -5123,7 +5359,7 @@ def main(argv=None) -> int:
     p_check.set_defaults(func=cmd_check)
 
     p_why = sub.add_parser("why")
-    add_common_args(p_why)
+    add_common_args(p_why, optional_root=True)
     p_why.add_argument("symbol_or_path")
     p_why.add_argument("--code-root", dest="code_root", default=None,
                         help="required only to resolve a bare symbol (no slash)")
@@ -5131,7 +5367,7 @@ def main(argv=None) -> int:
     p_why.set_defaults(func=cmd_why)
 
     p_drift = sub.add_parser("drift")
-    add_common_args(p_drift)
+    add_common_args(p_drift, optional_root=True)
     p_drift.add_argument("--code-root", dest="code_root", required=True)
     p_drift.add_argument("--json", action="store_true")
     p_drift.add_argument(

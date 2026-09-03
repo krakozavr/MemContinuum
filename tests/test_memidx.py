@@ -84,7 +84,7 @@ def _run_search(args):
     # paraphrase-probe gate (TestD5Paraphrase, below) measure stale code.
     conn = memidx.open_db(memidx.resolve_db_path(args))
     extra_where, extra_params = memidx.build_filter_clause(args, include_project=False)
-    results, _contributing = memidx._search_hits(conn, args, extra_where, extra_params)
+    results, _contributing, _embedding_unavailable = memidx._search_hits(conn, args, extra_where, extra_params)
     results = results[: args.limit]
     out = []
     for path, score in results:
@@ -587,6 +587,38 @@ class TestF1DecisionIndexState(unittest.TestCase):
             conn.commit(); conn.close()
             self.assertEqual(memidx.decision_index_state(db, memidx.DEFAULT_PROJECT), "upgrade-required")
 
+    def test_corrupted_generation_stamp_is_treated_as_upgrade_required_not_a_crash(self):
+        # Whole-branch review item 6: int(gen_row["value"]) was unguarded
+        # in decision_index_state itself -- a corrupted index_generation
+        # value raised ValueError straight out of all five CLI readers
+        # (search/chain/for-path/why/drift), before any of THEIR own try/
+        # except got a chance to run. Same (TypeError, ValueError) guard
+        # cmd_reindex's own migration probe uses; treated as older, same
+        # safe direction.
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "idx.sqlite"
+            reindex(FIXTURES / "schema_filters", db, no_embed=True)
+            conn = sqlite3.connect(str(db))
+            conn.execute("INSERT OR REPLACE INTO db_meta (key, value) VALUES ('index_generation', 'garbage')")
+            conn.commit(); conn.close()
+            self.assertEqual(memidx.decision_index_state(db, memidx.DEFAULT_PROJECT), "upgrade-required")
+
+            # And through the real reader that used to crash on this: a
+            # corrupted-but-otherwise-populated index still holds real,
+            # trustworthy evidence (ruling 68) -- search prints the
+            # upgrade-required warning and still returns its results, exit
+            # 0, no traceback (never the missing/uninitialized refusal,
+            # which is the only path that returns 1).
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = memidx.cmd_search(ns(project=memidx.DEFAULT_PROJECT, db=str(db), query="the",
+                                           mode="fts", status=[], type=[], area=None, topic=None,
+                                           authority=None, limit=10, json=True))
+            self.assertEqual(rc, 0)
+            self.assertIn("upgrade-required", buf_err.getvalue())
+            self.assertNotIn("Traceback", buf_err.getvalue())
+            json.loads(buf_out.getvalue())   # must still be valid JSON, not a crash
+
     def test_stamped_empty_root_reads_current(self):
         # a real, freshly-reindexed store with zero files under it must never
         # misread as anything but current.
@@ -615,6 +647,53 @@ class TestF1DecisionIndexState(unittest.TestCase):
                 "---\ntype: topic\nid: TOP-NEW\ntitle: New\nlinks: []\n---\nBody.\n"
             )
             self.assertEqual(memidx.decision_index_state(db, memidx.DEFAULT_PROJECT), "current")
+
+    def test_search_with_root_on_a_stale_store_returns_hits_and_the_named_warning(self):
+        # Final-fix-wave item 2: `--root` is now optional plumbing on
+        # search/for-path/why/chain/drift -- given, a store edited since
+        # the last reindex is surfaced as "stale" (a positive match still
+        # returned, per ruling 68) instead of silently answering "current".
+        with tempfile.TemporaryDirectory() as td:
+            root = FIXTURES_COPY_OF("schema_filters", td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+            (root / "new-topic.md").write_text(
+                "---\ntype: topic\nid: TOP-NEW\ntitle: New\nlinks: []\n---\nBody.\n"
+            )
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = memidx.cmd_search(ns(project=memidx.DEFAULT_PROJECT, db=str(db), root=str(root),
+                                           query="the", mode="fts", status=[], type=[], area=None,
+                                           topic=None, authority=None, limit=10, json=True))
+            self.assertEqual(rc, 0)
+            self.assertIn(
+                "search: index is stale (store changed since the last reindex); results may be outdated",
+                buf_err.getvalue(),
+            )
+            out = json.loads(buf_out.getvalue())
+            self.assertEqual(out["state"], "stale")
+            self.assertGreater(len(out["results"]), 0, out)   # positive match still returned, not withheld
+
+    def test_search_rootless_call_is_unchanged_even_when_the_store_has_drifted(self):
+        # Same setup as above, but WITHOUT --root: this reader must never
+        # observe "stale" (it has nothing to walk) and its --json shape
+        # must stay the exact pre-existing bare list -- proving optional_
+        # root really is opt-in, not a behavior change for every caller.
+        with tempfile.TemporaryDirectory() as td:
+            root = FIXTURES_COPY_OF("schema_filters", td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+            (root / "new-topic.md").write_text(
+                "---\ntype: topic\nid: TOP-NEW\ntitle: New\nlinks: []\n---\nBody.\n"
+            )
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = memidx.cmd_search(ns(project=memidx.DEFAULT_PROJECT, db=str(db),
+                                           query="the", mode="fts", status=[], type=[], area=None,
+                                           topic=None, authority=None, limit=10, json=True))
+            self.assertEqual(rc, 0)
+            self.assertNotIn("stale", buf_err.getvalue())
+            self.assertNotIsInstance(json.loads(buf_out.getvalue()), dict)
 
     def test_reindex_stamps_generation_even_with_zero_changes(self):
         with tempfile.TemporaryDirectory() as td:
@@ -682,18 +761,42 @@ class TestF1DecisionIndexState(unittest.TestCase):
             self.assertTrue(len(results) >= 0)  # proves it queried at all, not the refusal envelope
             self.assertNotIsInstance(json.loads(buf_out.getvalue()), dict)  # not the {"state":..} refusal shape
 
-    def test_for_path_missing_or_uninitialized_exits_3_with_bare_list(self):
+    def test_for_path_missing_or_uninitialized_exits_3_with_named_state(self):
+        # Final-fix-wave item 3: a bare `[]` under --json no longer tells a
+        # direct caller WHICH non-current state it got (missing vs.
+        # uninitialized) -- the envelope now names it, matching
+        # _decision_reply's own {"state":..., "results": [...]} shape used
+        # by every other rootless reader's missing/uninitialized refusal.
         for state_setup, label in ((lambda db: None, "missing"),
                                     (lambda db: memidx.open_db(db, project=memidx.DEFAULT_PROJECT).close(), "uninitialized")):
             with self.subTest(label), tempfile.TemporaryDirectory() as td:
                 db = Path(td) / f"{label}.sqlite"
                 state_setup(db)
-                buf = io.StringIO()
-                with contextlib.redirect_stdout(buf):
+                buf_out, buf_err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
                     rc = memidx.cmd_for_path(ns(project=memidx.DEFAULT_PROJECT, db=str(db),
                                                  file_path="src/x.py", json=True))
                 self.assertEqual(rc, 3)
-                self.assertEqual(json.loads(buf.getvalue()), [])
+                self.assertEqual(json.loads(buf_out.getvalue()), {"state": label, "results": []})
+                self.assertIn(f"for-path: decision index {label} -- run: memidx.py reindex --root <store>",
+                              buf_err.getvalue())
+
+    def test_for_path_missing_non_json_stays_plain_text_with_a_named_stderr_line(self):
+        # Same states, non-json mode: stdout stays exactly the pre-existing
+        # plain-text line (never becomes "[]" -- item 3's "keep stdout []"
+        # requirement is about the json shape, not turning the human-
+        # readable mode INTO a bare list); the new stderr line is added
+        # regardless of --json.
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "missing.sqlite"
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = memidx.cmd_for_path(ns(project=memidx.DEFAULT_PROJECT, db=str(db),
+                                             file_path="src/x.py", json=False))
+            self.assertEqual(rc, 3)
+            self.assertEqual(buf_out.getvalue().strip(), "no topics reference this path")
+            self.assertIn("for-path: decision index missing -- run: memidx.py reindex --root <store>",
+                          buf_err.getvalue())
 
     def test_for_path_index_error_fails_open_exits_4(self):
         # A hook-facing reader must fail open on a sqlite3.OperationalError
@@ -971,6 +1074,103 @@ class TestF2EmbeddingMode(unittest.TestCase):
             self.assertIn("2 embedding(s) backfilled", buf.getvalue())
             path = str(root / "topics" / "t.md")
             self.assertIsNotNone(self._emb(db, path))
+
+
+class TestRuling80EmbeddingFailureFailsOpen(unittest.TestCase):
+    """Final-fix-wave item 4 (ruling 80): a broken/missing embedding
+    backend must never crash reindex or search -- it fails open, exactly
+    like a --no-embed run, with one named stderr line."""
+
+    def _topic(self, td):
+        root = Path(td) / "root"; (root / "topics").mkdir(parents=True)
+        (root / "topics" / "t.md").write_text(
+            "---\ntype: topic\nid: TOP-1\ntitle: needle\nlinks:\n"
+            "  - link: L1\n    status: active\n"
+            "    ruling: {text: needle term, authority: owner-verbatim, source: s}\n"
+            "---\nneedle body text\n"
+        )
+        return root
+
+    def test_reindex_with_a_broken_embedding_backend_exits_0_with_mode_none(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic(td)
+            db = Path(td) / "idx.sqlite"
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with mock.patch("fastembed.TextEmbedding", side_effect=RuntimeError("no backend")), \
+                 contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = memidx.cmd_reindex(ns(root=str(root), db=str(db), project=memidx.DEFAULT_PROJECT,
+                                            full=False, no_embed=False, auto=False))
+            self.assertEqual(rc, 0)
+            self.assertIn(
+                "reindex: embeddings unavailable (RuntimeError: no backend); "
+                "continuing without embeddings",
+                buf_err.getvalue(),
+            )
+            # rows still committed despite the embedding failure
+            conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
+            rows = conn.execute("SELECT COUNT(*) AS n FROM records WHERE project=?",
+                                 (memidx.DEFAULT_PROJECT,)).fetchone()
+            self.assertGreater(rows["n"], 0)
+            mode_row = conn.execute("SELECT value FROM db_meta WHERE key='embedding_mode'").fetchone()
+            conn.close()
+            # A missing row means "none" (same convention cmd_reindex's own
+            # mode_now default uses -- a brand-new db that has never had a
+            # SUCCESSFUL embed pass never had a reason to write the key).
+            self.assertEqual(mode_row["value"] if mode_row else "none", "none")
+
+    def test_reindex_broken_backend_does_not_prevent_a_later_healthy_reindex(self):
+        # the failed pass must not poison the db so a real embed run later
+        # can't recover it (e.g. wrongly stamping something that blocks a
+        # real embed pass from ever recomputing "full").
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic(td)
+            db = Path(td) / "idx.sqlite"
+            with mock.patch("fastembed.TextEmbedding", side_effect=RuntimeError("no backend")):
+                memidx.cmd_reindex(ns(root=str(root), db=str(db), project=memidx.DEFAULT_PROJECT,
+                                       full=False, no_embed=False, auto=False))
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = memidx.cmd_reindex(ns(root=str(root), db=str(db), project=memidx.DEFAULT_PROJECT,
+                                            full=True, no_embed=False, auto=False))
+            self.assertEqual(rc, 0)
+            conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
+            mode = conn.execute("SELECT value FROM db_meta WHERE key='embedding_mode'").fetchone()
+            conn.close()
+            self.assertEqual(mode["value"], "full")
+
+    def test_search_hybrid_with_a_broken_embedding_backend_falls_back_to_fts_exits_0(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic(td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)   # a real index exists, just no vectors
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with mock.patch("fastembed.TextEmbedding", side_effect=RuntimeError("no backend")), \
+                 contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = memidx.cmd_search(ns(project=memidx.DEFAULT_PROJECT, db=str(db), query="needle",
+                                           mode="hybrid", status=[], type=[], area=None, topic=None,
+                                           authority=None, limit=10, json=True))
+            self.assertEqual(rc, 0)
+            self.assertIn("search: embeddings unavailable; falling back to FTS-only", buf_err.getvalue())
+            out = json.loads(buf_out.getvalue())
+            self.assertEqual(out["embedding"], "unavailable")
+            self.assertGreater(len(out["results"]), 0, out)   # the FTS-only fallback still finds the match
+
+    def test_search_vector_mode_with_a_broken_embedding_backend_falls_back_to_fts_exits_0(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic(td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with mock.patch("fastembed.TextEmbedding", side_effect=RuntimeError("no backend")), \
+                 contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = memidx.cmd_search(ns(project=memidx.DEFAULT_PROJECT, db=str(db), query="needle",
+                                           mode="vector", status=[], type=[], area=None, topic=None,
+                                           authority=None, limit=10, json=True))
+            self.assertEqual(rc, 0)
+            self.assertIn("search: embeddings unavailable; falling back to FTS-only", buf_err.getvalue())
+            out = json.loads(buf_out.getvalue())
+            self.assertEqual(out["embedding"], "unavailable")
+            self.assertGreater(len(out["results"]), 0, out)
 
 
 class TestF3TrustModel(unittest.TestCase):
@@ -1565,6 +1765,86 @@ class TestF5LinkRows(unittest.TestCase):
             out = json.loads(buf.getvalue())
             self.assertTrue(any(h["path"].endswith("target.md") for h in out), out)
 
+    def test_a_family_beyond_the_old_raw_1000_row_cap_is_not_starved_by_a_flooding_family(self):
+        # Final-fix-wave item 1 (Codex probe): the OLD `fts_ranked` fetched
+        # `ORDER BY bm25(fts) LIMIT 1000` RAW rows, THEN collapsed to
+        # parent-topic families, THEN capped at 200 -- so a single family
+        # that alone contributes more than 1000 matching, equally-ranked-
+        # ahead rows can push a second family's own single matching row
+        # past the raw 1000-row line before collapse ever runs, starving it
+        # out even though it matches and the true family count (2) is far
+        # under the real 200-family cap. Binding order is filter -> parent
+        # collapse -> cap, with no raw cap in between. Both families are
+        # built here as direct records/fts rows (not via reindex over 1001
+        # markdown link entries) purely so the test runs fast -- the shape
+        # matches exactly what insert_record_rows would have produced for
+        # a topic with 1001 links.
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "idx.sqlite"
+            conn = sqlite3.connect(str(db))
+            conn.executescript(memidx.SCHEMA_SQL)
+            conn.commit(); conn.close()
+            conn = memidx.open_db(db, project=memidx.DEFAULT_PROJECT)   # runs the link-column migration guards
+
+            def _topic_row(path, tid, title):
+                conn.execute(
+                    "INSERT INTO records (path, sha256, mtime, size, project, type, id, "
+                    "title, area, topic, status, authority, tags, code_refs, body, "
+                    "ruling_text, source_path, link_topic_path, link_id) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (path, "sha-" + tid, 0.0, 0, memidx.DEFAULT_PROJECT, "topic", tid, title,
+                     None, None, "active", "owner-verbatim", "", "[]", "Body.", "",
+                     path, None, None),
+                )
+
+            _topic_row("/topics/a.md", "TOP-A", "Topic A")
+            _topic_row("/topics/b.md", "TOP-B", "Topic B")
+
+            link_rows = []
+            fts_rows = []
+            for i in range(1001):   # family A: 1001 matching link rows, all ranking ahead of B
+                p = memidx.link_record_key("/topics/a.md", f"La{i}")
+                link_rows.append((p, "sha-a", 0.0, 0, memidx.DEFAULT_PROJECT, "link", "TOP-A", "Topic A",
+                                   None, None, "active", "owner-verbatim", "", "[]", "", "needle",
+                                   "/topics/a.md", "/topics/a.md", f"La{i}"))
+                fts_rows.append((p, memidx.DEFAULT_PROJECT, "Topic A", "", "needle"))
+            b_path = memidx.link_record_key("/topics/b.md", "Lb")
+            # Diluted with filler terms so bm25 ranks it strictly behind
+            # every one of A's exact-match rows -- deterministic, not a tie.
+            b_text = "needle plus several extra filler words diluting the match score"
+            link_rows.append((b_path, "sha-b", 0.0, 0, memidx.DEFAULT_PROJECT, "link", "TOP-B", "Topic B",
+                               None, None, "active", "owner-verbatim", "", "[]", "", b_text,
+                               "/topics/b.md", "/topics/b.md", "Lb"))
+            fts_rows.append((b_path, memidx.DEFAULT_PROJECT, "Topic B", "", b_text))
+
+            conn.executemany(
+                "INSERT INTO records (path, sha256, mtime, size, project, type, id, "
+                "title, area, topic, status, authority, tags, code_refs, body, "
+                "ruling_text, source_path, link_topic_path, link_id) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                link_rows,
+            )
+            conn.executemany(
+                "INSERT INTO fts (path, project, title, body, ruling_text) VALUES (?,?,?,?,?)",
+                fts_rows,
+            )
+            conn.commit()
+
+            # Sanity: confirm the intended bm25 ordering (A rows ahead of B)
+            # actually holds before trusting the rest of the assertion.
+            raw = conn.execute(
+                "SELECT fts.path AS path FROM fts JOIN records ON records.path=fts.path "
+                "WHERE fts MATCH ? AND records.project=? ORDER BY bm25(fts)",
+                (memidx.fts_escape("needle"), memidx.DEFAULT_PROJECT),
+            ).fetchall()
+            self.assertEqual(len(raw), 1002)
+            self.assertEqual(raw[-1]["path"], b_path, "test setup bug: B must rank strictly last")
+
+            ranked = memidx.fts_ranked(conn, "needle", memidx.DEFAULT_PROJECT)
+            families = {memidx._record_family(conn, memidx.DEFAULT_PROJECT, p) for p in ranked}
+            self.assertIn("/topics/a.md", families, (ranked, families))
+            self.assertIn("/topics/b.md", families, (ranked, families))
+
     def test_unfiltered_search_returns_both_topic_and_link_hits_with_no_type_given(self):
         with tempfile.TemporaryDirectory() as td:
             root = self._topic_with_two_links(td)
@@ -1969,9 +2249,14 @@ class TestF5LinkRows(unittest.TestCase):
             reindex(root, db, no_embed=True)
             conn = memidx.open_db(db, project=memidx.DEFAULT_PROJECT)
 
+            # Final-fix-wave item 1: the oracle itself must be the
+            # family-first definition (filter -> collapse -> cap, no raw
+            # row cap in between) -- NOT a copy of the old buggy raw-LIMIT-
+            # 1000-then-collapse ordering, or this "reference" would just
+            # re-assert the bug it's meant to catch.
             raw = conn.execute(
                 "SELECT fts.path AS path FROM fts JOIN records ON records.path=fts.path "
-                "WHERE fts MATCH ? AND records.project=? ORDER BY bm25(fts) LIMIT 1000",
+                "WHERE fts MATCH ? AND records.project=? ORDER BY bm25(fts)",
                 (memidx.fts_escape("shared needle term"), memidx.DEFAULT_PROJECT),
             ).fetchall()
             seen = set(); naive = []
@@ -1982,7 +2267,8 @@ class TestF5LinkRows(unittest.TestCase):
                 if fam in seen:
                     continue
                 seen.add(fam); naive.append(p)
-            naive = naive[:200]
+                if len(naive) >= 200:
+                    break
 
             actual = memidx.fts_ranked(conn, "shared needle term", memidx.DEFAULT_PROJECT)
             self.assertEqual(actual, naive)

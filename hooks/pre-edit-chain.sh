@@ -20,11 +20,17 @@
 #     Windows-site-packages PYTHONPATH that breaks the venv's own packages.
 #
 # Env:
-#   MEMCONTINUUM_ROOT     store markdown root; used ONLY to derive a default
+#   MEMCONTINUUM_ROOT     store markdown root; used to derive a default
 #                    project name ($(basename "$MEMCONTINUUM_ROOT")) when
-#                    MEMCONTINUUM_PROJECT is unset. NOT passed to memidx.py --
-#                    `for-path` has no --root flag (verified: exit 2). See
-#                    "engine request" below.
+#                    MEMCONTINUUM_PROJECT is unset. Also passed to `for-path`
+#                    as `--root` (final-fix-wave item 2 -- `for-path` gained
+#                    an optional --root so it can see the "stale" state
+#                    instead of silently answering "current" off a store
+#                    edited since the last reindex) whenever it's set; when
+#                    unset, `for-path` is still called, just rootless
+#                    (exactly its old behavior -- never "stale"). See
+#                    "engine request" below for the still-open suffix-match
+#                    ask, unrelated to this.
 #   MEMCONTINUUM_PROJECT  project namespace passed to memidx.py --project.
 #                    Defaults to $(basename "$MEMCONTINUUM_ROOT"), else "default"
 #                    (memidx.py's own DEFAULT_PROJECT). The literal default
@@ -235,11 +241,27 @@ fi
 # indistinguishable in the log from real negative evidence. Track whether
 # ANY candidate's query actually ran to completion; if none did, this
 # was never really evaluated at all, so it gets its own distinct outcome.
+#
+# Final-fix-wave item 2: `--root "$MEMCONTINUUM_ROOT"` is now always
+# passed (when set -- see FORPATH_ARGS below, built as a non-empty array
+# from the start so `"${FORPATH_ARGS[@]}"` is always safe under `set -u`
+# on bash 3.2) so a stale store no longer silently answers as current.
+# for-path's own stderr (captured into $LOG by the `2>>"$LOG"` redirect
+# below, same as every other call this script makes) already carries the
+# stale warning line -- this hook only needs to notice the state to log
+# its OWN distinct outcome name, `index-stale-served`, instead of
+# `matched`; the injected additionalContext payload built below is
+# unaffected either way (it comes from CHAIN_TEXT, a separate plain-text
+# call, never from RESULT_JSON).
 MATCHED_CANDIDATE=""
+MATCHED_STATE="current"
 RESULT_JSON=""
 ANY_QUERY_SUCCEEDED=0
 for candidate in "${CANDIDATES[@]}"; do
-    RESULT_JSON="$(PYTHONPATH= "$PY" "$MEMIDX" for-path "$candidate" --project "$PROJECT" --db "$DB_PATH" --json 2>>"$LOG")"
+    FORPATH_ARGS=(for-path "$candidate" --project "$PROJECT" --db "$DB_PATH")
+    [ -n "${MEMCONTINUUM_ROOT:-}" ] && FORPATH_ARGS+=(--root "$MEMCONTINUUM_ROOT")
+    FORPATH_ARGS+=(--json)
+    RESULT_JSON="$(PYTHONPATH= "$PY" "$MEMIDX" "${FORPATH_ARGS[@]}" 2>>"$LOG")"
     RC=$?
     # F1 (ruling 68): for-path's own exit codes -- 3 = missing/uninitialized
     # (the same outcome name the pre-loop [ ! -f "$DB_PATH" ] check above
@@ -258,9 +280,33 @@ for candidate in "${CANDIDATES[@]}"; do
         continue
     fi
     ANY_QUERY_SUCCEEDED=1
-    TRIMMED="$(printf '%s' "$RESULT_JSON" | tr -d '[:space:]')"
+    # Final-fix-wave item 2: --json now wraps as {"state":...,"results":
+    # [...]} whenever --root surfaced a non-current state -- pull the real
+    # results array (falling back to the whole payload for the pre-
+    # existing bare-list shape) and the state name (defaulting to
+    # "current" for that same bare-list shape) out of whichever form this
+    # call actually returned.
+    RESULTS_ONLY="$(printf '%s' "$RESULT_JSON" | "$PY" -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("[]"); sys.exit(0)
+print(json.dumps(d.get("results", d) if isinstance(d, dict) else d))
+' 2>/dev/null)"
+    CANDIDATE_STATE="$(printf '%s' "$RESULT_JSON" | "$PY" -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("current"); sys.exit(0)
+print(d.get("state", "current") if isinstance(d, dict) else "current")
+' 2>/dev/null)"
+    [ -z "$CANDIDATE_STATE" ] && CANDIDATE_STATE="current"
+    TRIMMED="$(printf '%s' "$RESULTS_ONLY" | tr -d '[:space:]')"
     if [ -n "$TRIMMED" ] && [ "$TRIMMED" != "[]" ]; then
         MATCHED_CANDIDATE="$candidate"
+        MATCHED_STATE="$CANDIDATE_STATE"
         break
     fi
 done
@@ -272,10 +318,12 @@ if [ -z "$MATCHED_CANDIDATE" ]; then
     finish "no-match"
 fi
 
-TOPIC_COUNT="$(printf '%s' "$RESULT_JSON" | grep -c '"id":')"
+TOPIC_COUNT="$(printf '%s' "$RESULTS_ONLY" | grep -c '"id":')"
 
 # --- get the pretty chain-view text for the matched candidate --------------
-CHAIN_TEXT="$(PYTHONPATH= "$PY" "$MEMIDX" for-path "$MATCHED_CANDIDATE" --project "$PROJECT" --db "$DB_PATH" 2>>"$LOG")"
+CHAIN_TEXT_ARGS=(for-path "$MATCHED_CANDIDATE" --project "$PROJECT" --db "$DB_PATH")
+[ -n "${MEMCONTINUUM_ROOT:-}" ] && CHAIN_TEXT_ARGS+=(--root "$MEMCONTINUUM_ROOT")
+CHAIN_TEXT="$(PYTHONPATH= "$PY" "$MEMIDX" "${CHAIN_TEXT_ARGS[@]}" 2>>"$LOG")"
 
 if [ -z "$CHAIN_TEXT" ]; then
     finish "empty-chain-text"
@@ -310,4 +358,7 @@ if [ -z "$OUTPUT_JSON" ]; then
 fi
 
 printf '%s\n' "$OUTPUT_JSON"
+if [ "$MATCHED_STATE" = "stale" ]; then
+    finish "index-stale-served"
+fi
 finish "matched"

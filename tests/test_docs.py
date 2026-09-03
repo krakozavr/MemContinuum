@@ -98,7 +98,20 @@ FORBIDDEN = [
     ("backward-compatible wording", re.compile(r"backward-compatible", re.I)),
     ("Migration note heading", re.compile(r"Migration note", re.I)),
     ("store record id", re.compile(r"\bTOP-\d{4}")),
-    ("internal finding-code label", re.compile(r"\bF\d+:")),
+    # Whole-branch review item 7: the old pattern (\bF\d+:) required a
+    # literal colon immediately after the digits -- "**F8 — text**" (an em
+    # dash, not a colon) evaded it entirely, and it only ever covered the
+    # F-series to begin with. Widened to every bare plan/finding-code
+    # letter this project's own development process uses (F=external-
+    # review finding, D=decision-index-engine test-class label, H=HOLD-
+    # rule class, M=Anatomy milestone, W=docs-round finding, C=Codex-
+    # pending item, G=docs-round finding) followed by digits and a colon,
+    # em dash, or plain hyphen -- the shape a labeled-paragraph heading or
+    # inline reference actually takes ("F8 — ...", "M2a: ...", "W9 -
+    # ..."), not ordinary prose (a bare "F8" with no separator, or a
+    # trailing digit like "R2" from the existing finding-code pattern
+    # above, is left alone).
+    ("internal plan/finding-code label", re.compile(r"\b[FDHMWCG]\d+\s*[—:\-]")),
 ]
 
 PUBLIC_DOCS = [

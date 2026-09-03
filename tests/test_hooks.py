@@ -560,6 +560,100 @@ class TestPreEditChainHook(unittest.TestCase):
         self.assertIn("TOP-0042", out["hookSpecificOutput"]["additionalContext"])
 
 
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestPreEditChainRootAndStaleWarning(unittest.TestCase):
+    """Final-fix-wave item 2: pre-edit-chain.sh now passes --root to
+    for-path (whenever MEMCONTINUUM_ROOT is set) so a store edited since
+    the last reindex is served as a positive match (ruling 68 -- never
+    withheld) under its own named hook.log outcome, `index-stale-served`,
+    instead of the generic `matched` -- the stale warning itself reaches
+    hook.log only via for-path's own stderr (captured by the existing
+    `2>>"$LOG"` redirect), never the injected additionalContext payload."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-hook-stale-test-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.root = Path(self.tmp) / "store"
+        shutil.copytree(SCHEMA_FIXTURE_ROOT, self.root)
+        self.memtool_home = str(Path(self.tmp) / "memcontinuum-home")
+        os.makedirs(self.memtool_home, exist_ok=True)
+        self.project = "hookstaletest"
+        args = type(
+            "Args",
+            (),
+            dict(
+                root=str(self.root),
+                project=self.project,
+                db=str(Path(self.memtool_home) / f"{self.project}.sqlite"),
+                full=True,
+                no_embed=True,
+            ),
+        )()
+        memidx.cmd_reindex(args)
+
+    def _matching_payload(self):
+        return json.dumps(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Edit",
+                "cwd": "/some/other/unrelated/dir",
+                "tool_input": {"file_path": "/fake/repo/src/core/scan/scan_plan.py"},
+            }
+        )
+
+    def _run(self):
+        env = clean_env(
+            MEMCONTINUUM_HOME=self.memtool_home,
+            MEMCONTINUUM_PROJECT=self.project,
+            MEMCONTINUUM_PYTHON=VENV_PYTHON,
+            MEMCONTINUUM_STRIP_PREFIX="/fake/repo/",
+            MEMCONTINUUM_ROOT=str(self.root),
+        )
+        return run_hook(self._matching_payload(), env)
+
+    def test_stale_store_logs_index_stale_served_not_matched(self):
+        (self.root / "topics" / "new-topic.md").write_text(
+            "---\ntype: topic\nid: TOP-NEW\ntitle: New\nlinks: []\n---\nBody.\n"
+        )
+        proc, elapsed = self._run()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(proc.stdout.strip(), "expected additionalContext output, got nothing")
+        out = json.loads(proc.stdout)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("TOP-0042", ctx)          # the real match is still injected
+        self.assertNotIn("stale", ctx.lower())  # but the staleness caveat never is
+
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        self.assertIn("outcome=index-stale-served", log_text)
+        self.assertNotIn("outcome=matched", log_text)
+
+    def test_current_store_still_logs_plain_matched(self):
+        proc, elapsed = self._run()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        self.assertIn("outcome=matched", log_text)
+        self.assertNotIn("outcome=index-stale-served", log_text)
+
+    def test_rootless_call_unchanged_still_logs_plain_matched(self):
+        # MEMCONTINUUM_ROOT unset entirely: for-path is still called (just
+        # without --root, exactly its pre-existing behavior) -- proves the
+        # new --root plumbing doesn't fire when the env var isn't there.
+        (self.root / "topics" / "new-topic.md").write_text(
+            "---\ntype: topic\nid: TOP-NEW\ntitle: New\nlinks: []\n---\nBody.\n"
+        )
+        env = clean_env(
+            MEMCONTINUUM_HOME=self.memtool_home,
+            MEMCONTINUUM_PROJECT=self.project,
+            MEMCONTINUUM_PYTHON=VENV_PYTHON,
+            MEMCONTINUUM_STRIP_PREFIX="/fake/repo/",
+        )
+        proc, elapsed = run_hook(self._matching_payload(), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        self.assertIn("outcome=matched", log_text)
+        self.assertNotIn("outcome=index-stale-served", log_text)
+
+
 class TestF6RenderedTimeout(unittest.TestCase):
     """The OUTER Claude Code backstop: `code-root-filter-pair.json.tmpl`
     renders `"timeout": 5` on both the Edit and Write PreToolUse command

@@ -1313,7 +1313,7 @@ down:
   fresh embedding) separately, so a store's growth from link rows is visible,
   not folded into one number that reads like topic growth alone.
 
-  **F8 — no ANN index; a linear scan over every searchable vector.**
+  **No ANN index; a linear scan over every searchable vector.**
   `vector_ranked` scores every fresh row for the project one at a time —
   practical while that count stays small, a real cost once it does not. Run
   `memidx.py check --project <name> --json` on a real store for the actual,
@@ -1329,7 +1329,7 @@ down:
   deterministic adaptation of `docs/SCHEMA.md`'s illustrative chain view, not a
   byte-for-byte reproduction.
 
-  **F9 — `edges_for_topic` is presentation, not reasoning.** It exists to feed
+  **`edges_for_topic` is presentation, not reasoning.** It exists to feed
   `chain`'s own indented edge lines: its only three callers — `cmd_chain`
   (which passes the result into `chain_lines`/`chain_json`), `topic_chain_json`,
   and `print_topic_chain` — all exist to display a chain, never to decide
