@@ -224,6 +224,19 @@ ANY_QUERY_SUCCEEDED=0
 for candidate in "${CANDIDATES[@]}"; do
     RESULT_JSON="$(PYTHONPATH= "$PY" "$MEMIDX" for-path "$candidate" --project "$PROJECT" --db "$DB_PATH" --json 2>>"$LOG")"
     RC=$?
+    # F1 (ruling 68): for-path's own exit codes -- 3 = missing/uninitialized
+    # (the same outcome name the pre-loop [ ! -f "$DB_PATH" ] check above
+    # already uses), 4 = index-error (a schema a migration guard should
+    # already have fixed but didn't). Both get their own named outcome
+    # instead of falling into the generic RC != 0 -> continue -> eventual
+    # "query-failed"/"no-match" below, which would hide which candidate (if
+    # any) actually had a usable index.
+    if [ $RC -eq 3 ]; then
+        finish "index-missing"
+    fi
+    if [ $RC -eq 4 ]; then
+        finish "index-error"
+    fi
     if [ $RC -ne 0 ]; then
         continue
     fi

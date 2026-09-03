@@ -32,6 +32,7 @@ import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 import yaml
 
@@ -66,6 +67,14 @@ DEFAULT_PROJECT = "default"
 # call so tests can override it per-case).
 EMBED_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 EMBED_BODY_CHARS = 1500
+
+# F1 (external-fix round, coordinator ruling 68): the decision index's own
+# logical schema/content generation marker, bumped whenever a change needs
+# every store to run one automatic full rebuild pass on its next reindex --
+# covers this round's own stamp/generation scheme plus later tasks' evidence/
+# link-row columns. A db stamped below this reads "upgrade-required" from
+# decision_index_state (see below) until its next reindex.
+CURRENT_INDEX_GENERATION = 2
 
 # ---------------------------------------------------------------------------
 # frontmatter parsing (shared by memidx and memlint)
@@ -438,14 +447,41 @@ def enforce_project_isolation(conn: sqlite3.Connection, db_path: Path, project: 
         )
 
 
+def _run_decision_migration_guards(conn: sqlite3.Connection, db_path: Path, project: str | None) -> None:
+    """Every additive-ALTER migration guard for the decision index, run
+    unconditionally on every successful open (create via open_db, or
+    noncreating via open_db_noncreating) -- idempotent against an
+    already-migrated file (ruling 65). Replaces open_db's own inline calls
+    to ensure_links_invariant_column/enforce_project_isolation, so there is
+    exactly one guard list, not two; later tasks append one more guard call
+    each here. `project=None` (open_db's own default, used by tests/tools
+    that just want to inspect a db file directly) skips project-isolation
+    enforcement, matching open_db's previous behavior exactly."""
+    ensure_links_invariant_column(conn)
+    if project is not None:
+        enforce_project_isolation(conn, db_path, project)
+
+
 def open_db(db_path: Path, project: str | None = None) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA_SQL)
-    ensure_links_invariant_column(conn)
-    if project is not None:
-        enforce_project_isolation(conn, db_path, project)
+    _run_decision_migration_guards(conn, db_path, project)
+    return conn
+
+
+def open_db_noncreating(db_path: Path, project: str) -> sqlite3.Connection | None:
+    """SQLite URI mode=rw: opens an EXISTING file for read/write, NEVER
+    creates one -- the atomic fix for the TOCTOU window an exists() check
+    followed by plain connect()/open_db() still has (Codex, ruling 68).
+    Returns None when the file doesn't exist (or vanished in the race)."""
+    try:
+        conn = sqlite3.connect(f"file:{quote(db_path.as_posix())}?mode=rw", uri=True)
+    except sqlite3.OperationalError:
+        return None
+    conn.row_factory = sqlite3.Row
+    _run_decision_migration_guards(conn, db_path, project)
     return conn
 
 
@@ -454,6 +490,58 @@ def resolve_db_path(args) -> Path:
         return Path(args.db).expanduser().resolve()
     base = Path(os.environ.get("MEMCONTINUUM_HOME", str(Path.home() / ".memcontinuum")))
     return base / f"{args.project}.sqlite"
+
+
+def decision_index_state(db_path: Path, project: str, root: Path | None = None) -> str:
+    """"missing" | "uninitialized" | "upgrade-required" | "stale" | "current"
+    -- ruling 68's five-state model. `root`, when given, additionally
+    checks for on-disk drift via the existing _index_has_drift (the fifth
+    state, "stale") -- omitted by root-less readers for cheapness (and
+    because a root-less reader has nothing to walk in the first place)."""
+    conn = open_db_noncreating(db_path, project)
+    if conn is None:
+        return "missing"
+    try:
+        stamp = conn.execute("SELECT value FROM db_meta WHERE key='last_reindexed_at'").fetchone()
+        has_rows = conn.execute("SELECT 1 FROM records WHERE project=? LIMIT 1", (project,)).fetchone()
+        if stamp is None:
+            return "uninitialized" if has_rows is None else "upgrade-required"
+        gen_row = conn.execute("SELECT value FROM db_meta WHERE key='index_generation'").fetchone()
+        generation = int(gen_row["value"]) if gen_row else 1
+        if generation < CURRENT_INDEX_GENERATION:
+            return "upgrade-required"
+        if root is not None and _index_has_drift(conn, root, project):
+            return "stale"
+        return "current"
+    finally:
+        conn.close()
+
+
+def _decision_reply(cmd_name: str, args, state: str) -> int:
+    """The shared refuse-and-print helper for `missing`/`uninitialized`: no
+    query is even attempted. The stderr diagnostic always prints (a caller
+    piping stdout for `--json` still needs to see WHY it got an empty
+    envelope); `--json` additionally emits the refusal envelope on stdout.
+    Returns 1 (the reader's own refusal exit code -- see `for-path`'s own
+    distinct 3/4 codes, which don't go through this)."""
+    print(
+        f"{cmd_name}: the decision index is {state} for project "
+        f"{args.project!r} -- run `reindex --root <path>` first",
+        file=sys.stderr,
+    )
+    if getattr(args, "json", False):
+        print(json.dumps({"state": state, "results": []}, indent=2))
+    return 1
+
+
+def _decision_warn(cmd_name: str, args, state: str) -> None:
+    """A positive match off an `upgrade-required`/`stale` index is still
+    real, trustworthy evidence (ruling 68) -- the caller keeps querying and
+    injecting, this just surfaces the caveat on stderr."""
+    print(
+        f"{cmd_name}: index {state} (results may be incomplete) -- run reindex",
+        file=sys.stderr,
+    )
 
 
 def delete_record_rows(conn: sqlite3.Connection, path: str) -> None:
@@ -605,6 +693,9 @@ def walk_markdown(root: Path):
 
 def cmd_reindex(args) -> int:
     root = Path(args.root).resolve()
+    if not root.is_dir() or not os.access(root, os.R_OK | os.X_OK):
+        print(f"reindex: {root} is not a readable directory -- nothing was changed", file=sys.stderr)
+        return 2
     db_path = resolve_db_path(args)
     conn = open_db(db_path, project=args.project)
     t0 = time.time()
@@ -665,6 +756,19 @@ def cmd_reindex(args) -> int:
     for p in removed_paths:
         delete_record_rows(conn, p)
 
+    # F1 (Codex-pending item 1): the successful-reindex stamp and the
+    # logical index generation land in the SAME transaction as every other
+    # write above -- a 0-change run still stamps, so a "reindexed nothing
+    # changed" pass still moves the db out of "upgrade-required"/
+    # "uninitialized" into "current".
+    conn.execute(
+        "INSERT OR REPLACE INTO db_meta (key, value) VALUES ('last_reindexed_at', ?)",
+        (datetime.now(timezone.utc).isoformat(),),
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO db_meta (key, value) VALUES ('index_generation', ?)",
+        (str(CURRENT_INDEX_GENERATION),),
+    )
     conn.commit()
     conn.close()
     elapsed = time.time() - t0
@@ -773,7 +877,14 @@ def vector_ranked(conn, query: str, project: str) -> list[tuple[str, float]]:
 
 def cmd_search(args) -> int:
     db_path = resolve_db_path(args)
-    conn = open_db(db_path, project=args.project)
+    state = decision_index_state(db_path, args.project)   # root=None -- this reader never sees "stale"
+    if state in ("missing", "uninitialized"):
+        return _decision_reply("search", args, state)
+    conn = open_db_noncreating(db_path, project=args.project)
+    if conn is None:
+        return _decision_reply("search", args, "missing")
+    if state in ("upgrade-required", "stale"):
+        _decision_warn("search", args, state)
     allowed = filtered_paths(conn, args)
 
     results: list[tuple[str, float]] = []
@@ -961,7 +1072,14 @@ def chain_json(topic_row, link_rows, edges_by_from, assumptions_by_link) -> dict
 
 def cmd_chain(args) -> int:
     db_path = resolve_db_path(args)
-    conn = open_db(db_path, project=args.project)
+    state = decision_index_state(db_path, args.project)   # root=None -- this reader never sees "stale"
+    if state in ("missing", "uninitialized"):
+        return _decision_reply("chain", args, state)
+    conn = open_db_noncreating(db_path, project=args.project)
+    if conn is None:
+        return _decision_reply("chain", args, "missing")
+    if state in ("upgrade-required", "stale"):
+        _decision_warn("chain", args, state)
     topic_row = find_topic_row(conn, args.project, args.topic)
     if topic_row is None:
         print(f"no topic matching {args.topic!r}", file=sys.stderr)
@@ -1200,26 +1318,53 @@ def concept_json(conn, project: str, concept_row) -> dict:
 
 
 def cmd_for_path(args) -> int:
+    """F1 (ruling 68): 2 stays argparse's own reserved usage-error code; 3 =
+    missing/uninitialized (collapsed -- no positive match worth attempting,
+    including the TOCTOU race where the file vanishes between the state
+    check and the open below); 4 = index-error (a schema a migration guard
+    should already have fixed but didn't -- ruling 65's belt-and-suspenders
+    catch). upgrade-required/current/stale all proceed normally; a positive
+    match off a non-current index stays usable."""
     db_path = resolve_db_path(args)
-    conn = open_db(db_path, project=args.project)
-    matches = topic_matches_for_path(conn, args.project, args.file_path)
-    concept_matches = concept_matches_for_path(conn, args.project, args.file_path)
+    state = decision_index_state(db_path, args.project)
+    if state in ("missing", "uninitialized"):
+        print(json.dumps([], indent=2) if args.json else "no topics reference this path")
+        return 3
+    try:
+        conn = open_db_noncreating(db_path, project=args.project)
+        if conn is None:
+            print(json.dumps([], indent=2) if args.json else "no topics reference this path")
+            return 3
+        if state in ("upgrade-required", "stale"):
+            _decision_warn("for-path", args, state)
+        matches = topic_matches_for_path(conn, args.project, args.file_path)
+        concept_matches = concept_matches_for_path(conn, args.project, args.file_path)
 
-    if args.json:
-        out = [topic_chain_json(conn, row) for row in matches]
-        out.extend(concept_json(conn, args.project, crow) for crow in concept_matches)
-        print(json.dumps(out, indent=2))
-    else:
-        if not matches and not concept_matches:
-            print("no topics reference this path")
-        for row in matches:
-            print_topic_chain(conn, row)
-        for crow in concept_matches:
-            print(f"{crow['id']} {crow['title']} — {crow['owner_boundary']}")
-            for trow in governed_topic_rows(conn, args.project, crow):
-                print_topic_chain(conn, trow)
-    conn.close()
-    return 0
+        if args.json:
+            out = [topic_chain_json(conn, row) for row in matches]
+            out.extend(concept_json(conn, args.project, crow) for crow in concept_matches)
+            print(json.dumps(out, indent=2))
+        else:
+            if not matches and not concept_matches:
+                print("no topics reference this path")
+            for row in matches:
+                print_topic_chain(conn, row)
+            for crow in concept_matches:
+                print(f"{crow['id']} {crow['title']} — {crow['owner_boundary']}")
+                for trow in governed_topic_rows(conn, args.project, crow):
+                    print_topic_chain(conn, trow)
+        conn.close()
+        return 0
+    except (sqlite3.OperationalError, IndexError):
+        # A schema mismatch a migration guard should already have fixed by
+        # now can still surface two ways: a raw SQL query naming a column
+        # that no longer exists (sqlite3.OperationalError), or a `SELECT *`
+        # + row["col"] access on a row whose columns were renamed out from
+        # under it (sqlite3.Row raises IndexError, not OperationalError, for
+        # a missing key) -- both mean the same thing here: fail open, never
+        # crash a hook-facing reader.
+        print(json.dumps([], indent=2) if args.json else "no topics reference this path")
+        return 4
 
 
 # ---------------------------------------------------------------------------
@@ -1428,7 +1573,14 @@ def cmd_why(args) -> int:
         file_path = resolved
 
     db_path = resolve_db_path(args)
-    conn = open_db(db_path, project=args.project)
+    state = decision_index_state(db_path, args.project)   # root=None -- this reader never sees "stale"
+    if state in ("missing", "uninitialized"):
+        return _decision_reply("why", args, state)
+    conn = open_db_noncreating(db_path, project=args.project)
+    if conn is None:
+        return _decision_reply("why", args, "missing")
+    if state in ("upgrade-required", "stale"):
+        _decision_warn("why", args, state)
     concept_matches = concept_matches_for_path(conn, args.project, file_path)
 
     if args.json:
@@ -1515,7 +1667,17 @@ def check_invariant(code_root: Path, invariant: dict) -> list[str]:
 
 def cmd_drift(args) -> int:
     db_path = resolve_db_path(args)
-    conn = open_db(db_path, project=args.project)
+    # --code-root points at CODE, not the decision store's own markdown
+    # tree, so this reader cannot compute "stale" either -- root stays None,
+    # same as search/chain/why.
+    state = decision_index_state(db_path, args.project)
+    if state in ("missing", "uninitialized"):
+        return _decision_reply("drift", args, state)
+    conn = open_db_noncreating(db_path, project=args.project)
+    if conn is None:
+        return _decision_reply("drift", args, "missing")
+    if state in ("upgrade-required", "stale"):
+        _decision_warn("drift", args, state)
     code_root = Path(args.code_root).resolve()
     entries = links_with_active_invariant(conn, args.project)
     conn.close()
@@ -1619,63 +1781,84 @@ def cmd_unmapped(args) -> int:
     querying the existing index, one lookup per candidate per path (O(paths),
     never a code-tree walk). Never imports fastembed.
 
-    Self-healing: runs the same added/changed/removed drift check `check`
-    uses; if the store markdown under --root has drifted since the last
-    reindex, runs `reindex --no-embed` once and re-checks. If drift still
-    can't be resolved (a genuine failure -- corrupt db, unreadable root,
-    etc.) coverage_status is "unknown" and `unmapped` is always [] (a
-    positive match found on a not-fully-current index is still real
-    evidence; the *absence* of a match is what an unknown-freshness index
-    must never be allowed to assert -- docs/DESIGN.md ruling F,
-    "never a false gap").
+    F1 (ruling 68): `coverage_status` mirrors decision_index_state's own
+    five states, collapsed for a NEGATIVE claim's purposes ("no topic covers
+    this file" is untrusted off anything but a genuinely current index):
+    "ok" (state == "current", queried normally), "unknown" (genuine
+    unresolved drift, or any other read failure -- unchanged from before
+    F1), "uninitialized" (state missing/uninitialized, collapsed -- no
+    query attempted, `unmapped` self-heal never fires here), "upgrade-
+    required" (state upgrade-required -- self-heal does NOT fire; that is
+    the rollout's job, not an ad-hoc hook-triggered one), "index-error" (a
+    sqlite3.OperationalError while reading -- ruling 65's belt-and-
+    suspenders fail-open). Self-healing is now gated on state == "stale"
+    (a same-generation on-disk drift decision_index_state already computed
+    above -- no second walk): one `reindex --no-embed` pass, then re-check
+    for drift the same way as before F1. `unmapped` is always [] whenever
+    coverage_status != "ok" (a positive match found on a not-fully-current
+    index is still real evidence; the *absence* of a match is what an
+    unknown-freshness index must never be allowed to assert -- docs/
+    DESIGN.md ruling F, "never a false gap").
     """
     root = Path(args.root).resolve()
     db_path = resolve_db_path(args)
     code_root = Path(args.code_root).resolve() if getattr(args, "code_root", None) else None
 
     coverage_status = "ok"
+    mapped_topic: list[str] = []
+    mapped_concept_only: list[str] = []
+    unmapped: list[str] = []
     conn: sqlite3.Connection | None = None
     try:
-        conn = open_db(db_path, project=args.project)
-        if _index_has_drift(conn, root, args.project):
-            reindex_ns = argparse.Namespace(
-                root=str(root), project=args.project, db=str(db_path), full=False, no_embed=True
-            )
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                cmd_reindex(reindex_ns)
-            conn.close()
-            conn = open_db(db_path, project=args.project)
-            if _index_has_drift(conn, root, args.project):
-                coverage_status = "unknown"
+        state = decision_index_state(db_path, args.project, root=root)
+        if state in ("missing", "uninitialized"):
+            coverage_status = "uninitialized"
+        elif state == "upgrade-required":
+            coverage_status = "upgrade-required"
+        else:
+            conn = open_db_noncreating(db_path, project=args.project)
+            if conn is None:
+                coverage_status = "uninitialized"
+            else:
+                if state == "stale":
+                    reindex_ns = argparse.Namespace(
+                        root=str(root), project=args.project, db=str(db_path), full=False, no_embed=True
+                    )
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        cmd_reindex(reindex_ns)
+                    conn.close()
+                    conn = open_db_noncreating(db_path, project=args.project)
+                    if conn is not None and _index_has_drift(conn, root, args.project):
+                        coverage_status = "unknown"
+                if conn is not None:
+                    for raw_path in args.paths:
+                        candidates = _unmapped_path_candidates(raw_path, code_root)
+                        display = _unmapped_display_path(raw_path, code_root)
+                        topic_hit = any(topic_matches_for_path(conn, args.project, c) for c in candidates)
+                        concept_hit = False
+                        if not topic_hit:
+                            concept_hit = any(
+                                concept_matches_for_path(conn, args.project, c) for c in candidates
+                            )
+                        if topic_hit:
+                            mapped_topic.append(display)
+                        elif concept_hit:
+                            mapped_concept_only.append(display)
+                        elif coverage_status == "ok":
+                            unmapped.append(display)
+    except sqlite3.OperationalError:
+        coverage_status = "index-error"
+        mapped_topic, mapped_concept_only, unmapped = [], [], []
     except Exception:
         coverage_status = "unknown"
+        mapped_topic, mapped_concept_only, unmapped = [], [], []
+    finally:
         if conn is not None:
             try:
                 conn.close()
             except Exception:
                 pass
-            conn = None
-
-    mapped_topic: list[str] = []
-    mapped_concept_only: list[str] = []
-    unmapped: list[str] = []
-
-    if conn is not None:
-        for raw_path in args.paths:
-            candidates = _unmapped_path_candidates(raw_path, code_root)
-            display = _unmapped_display_path(raw_path, code_root)
-            topic_hit = any(topic_matches_for_path(conn, args.project, c) for c in candidates)
-            concept_hit = False
-            if not topic_hit:
-                concept_hit = any(concept_matches_for_path(conn, args.project, c) for c in candidates)
-            if topic_hit:
-                mapped_topic.append(display)
-            elif concept_hit:
-                mapped_concept_only.append(display)
-            elif coverage_status == "ok":
-                unmapped.append(display)
-        conn.close()
 
     result = {
         "mapped_topic": mapped_topic,
@@ -1696,7 +1879,7 @@ def cmd_unmapped(args) -> int:
             print(f"{label}: {len(paths)}")
             for p in paths:
                 print(f"  {p}")
-    return 0
+    return 0 if coverage_status == "ok" else 1
 
 
 # ---------------------------------------------------------------------------
@@ -1707,7 +1890,17 @@ def cmd_unmapped(args) -> int:
 def cmd_check(args) -> int:
     root = Path(args.root).resolve()
     db_path = resolve_db_path(args)
-    conn = open_db(db_path, project=args.project)
+    # The only root-less-in-this-group... exception: `check` DOES take
+    # --root (the decision store's own markdown tree), so it's the one
+    # reader here that can genuinely see "stale".
+    state = decision_index_state(db_path, args.project, root=root)
+    if state in ("missing", "uninitialized"):
+        return _decision_reply("check", args, state)
+    conn = open_db_noncreating(db_path, project=args.project)
+    if conn is None:
+        return _decision_reply("check", args, "missing")
+    if state in ("upgrade-required", "stale"):
+        _decision_warn("check", args, state)
     existing = {
         row["path"]: (row["mtime"], row["size"])
         for row in conn.execute("SELECT path, mtime, size FROM records WHERE project=?", (args.project,))
@@ -3332,21 +3525,24 @@ def cmd_code_search(args) -> int:
     else:
         md_base = Path(os.environ.get("MEMCONTINUUM_HOME", str(Path.home() / ".memcontinuum")))
         md_db_path = md_base / f"{args.project}.sqlite"
+    # F1 (ruling 68): the decision-attach lookup is a decision-index READER
+    # (Codex named it explicitly) -- open_db_noncreating replaces the
+    # exists()-then-open_db TOCTOU pattern; it already returns None when the
+    # file doesn't exist, so no separate exists() check is needed.
     md_conn = None
-    if md_db_path.exists():
-        try:
-            md_conn = open_db(md_db_path, project=args.project)
-        except sqlite3.DatabaseError:
-            md_conn = None
-        except DbProjectMismatchError as e:
-            # Finding 2: a same-file, different-project decision db is a
-            # real misconfiguration, but concept attachment is an
-            # enrichment, not the point of this command -- degrade to
-            # "no attach" + a named warning, never kill the whole search
-            # over it (unlike a direct `open_db` call elsewhere, which
-            # should hard-refuse).
-            print(f"code-search: WARNING decision db not attached: {e}", file=sys.stderr)
-            md_conn = None
+    try:
+        md_conn = open_db_noncreating(md_db_path, project=args.project)
+    except sqlite3.DatabaseError:
+        md_conn = None
+    except DbProjectMismatchError as e:
+        # Finding 2: a same-file, different-project decision db is a
+        # real misconfiguration, but concept attachment is an
+        # enrichment, not the point of this command -- degrade to
+        # "no attach" + a named warning, never kill the whole search
+        # over it (unlike a direct `open_db` call elsewhere, which
+        # should hard-refuse).
+        print(f"code-search: WARNING decision db not attached: {e}", file=sys.stderr)
+        md_conn = None
 
     out = []
     for chunk_id, score in results:

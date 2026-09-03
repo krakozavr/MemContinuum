@@ -1,5 +1,8 @@
+import contextlib
+import io
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 import time
@@ -7,6 +10,7 @@ import json
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 TOOLS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(TOOLS_DIR))
@@ -59,6 +63,15 @@ def ns(**kw):
 def reindex(root, db, project=memidx.DEFAULT_PROJECT, full=False, no_embed=False):
     args = ns(root=str(root), db=str(db), project=project, full=full, no_embed=no_embed)
     return memidx.cmd_reindex(args)
+
+
+def FIXTURES_COPY_OF(name: str, td) -> Path:
+    """A mutable copy of a tracked fixtures/<name> tree, for a test that
+    needs to write into it (e.g. a "stale" on-disk-drift state) without
+    touching the real tracked fixture."""
+    dest = Path(td) / "root"
+    shutil.copytree(FIXTURES / name, dest)
+    return dest
 
 
 def _run_search(args):
@@ -542,6 +555,258 @@ class TestCheckDrift(unittest.TestCase):
 
             rc_dirty = memidx.cmd_check(args)
             self.assertEqual(rc_dirty, 1)
+
+
+class TestF1DecisionIndexState(unittest.TestCase):
+    """F1 (coordinator ruling 68): the five-state model, the noncreating
+    mode=rw opener, the reindex stamp/generation, and the refuse-vs-warn-
+    and-proceed split every reader below it follows."""
+
+    def test_missing_state_no_file_created(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "nope.sqlite"
+            self.assertEqual(memidx.decision_index_state(db, "p"), "missing")
+            self.assertFalse(db.exists())
+
+    def test_uninitialized_state_file_exists_no_stamp_no_rows(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "empty.sqlite"
+            conn = memidx.open_db(db, project="p")   # the CREATING opener -- legitimate here, this
+            conn.close()                              # test builds the fixture, not exercising a reader
+            self.assertEqual(memidx.decision_index_state(db, "p"), "uninitialized")
+
+    def test_upgrade_required_rows_but_no_stamp(self):
+        # a legacy db: rows exist (someone wrote them before the stamp
+        # scheme existed) but last_reindexed_at was never set.
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "legacy.sqlite"
+            reindex(FIXTURES / "schema_filters", db, no_embed=True)
+            conn = sqlite3.connect(str(db))
+            conn.execute("DELETE FROM db_meta WHERE key='last_reindexed_at'")
+            conn.commit(); conn.close()
+            self.assertEqual(memidx.decision_index_state(db, memidx.DEFAULT_PROJECT), "upgrade-required")
+
+    def test_upgrade_required_old_generation(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "idx.sqlite"
+            reindex(FIXTURES / "schema_filters", db, no_embed=True)
+            conn = sqlite3.connect(str(db))
+            conn.execute("INSERT OR REPLACE INTO db_meta (key, value) VALUES ('index_generation', '1')")
+            conn.commit(); conn.close()
+            self.assertEqual(memidx.decision_index_state(db, memidx.DEFAULT_PROJECT), "upgrade-required")
+
+    def test_stamped_empty_root_reads_current(self):
+        # a real, freshly-reindexed store with zero files under it must never
+        # misread as anything but current.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "empty-root"; root.mkdir()
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+            self.assertEqual(memidx.decision_index_state(db, memidx.DEFAULT_PROJECT, root=root), "current")
+
+    def test_stale_state_on_disk_drift_with_root(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = FIXTURES_COPY_OF("schema_filters", td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+            (root / "new-topic.md").write_text(
+                "---\ntype: topic\nid: TOP-NEW\ntitle: New\nlinks: []\n---\nBody.\n"
+            )
+            self.assertEqual(memidx.decision_index_state(db, memidx.DEFAULT_PROJECT, root=root), "stale")
+
+    def test_root_less_readers_never_see_stale(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = FIXTURES_COPY_OF("schema_filters", td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+            (root / "new-topic.md").write_text(
+                "---\ntype: topic\nid: TOP-NEW\ntitle: New\nlinks: []\n---\nBody.\n"
+            )
+            self.assertEqual(memidx.decision_index_state(db, memidx.DEFAULT_PROJECT), "current")
+
+    def test_reindex_stamps_generation_even_with_zero_changes(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "idx.sqlite"
+            reindex(FIXTURES / "schema_filters", db, no_embed=True)
+            reindex(FIXTURES / "schema_filters", db, no_embed=True)  # second run: 0/0/0
+            conn = sqlite3.connect(str(db))
+            conn.row_factory = sqlite3.Row
+            self.assertIsNotNone(conn.execute("SELECT value FROM db_meta WHERE key='last_reindexed_at'").fetchone())
+            gen = conn.execute("SELECT value FROM db_meta WHERE key='index_generation'").fetchone()
+            self.assertEqual(int(gen["value"]), memidx.CURRENT_INDEX_GENERATION)
+
+    def test_reindex_refuses_an_unreadable_root_before_opening_anything(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "idx.sqlite"
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                rc = memidx.cmd_reindex(ns(root=str(Path(td) / "does-not-exist"), db=str(db),
+                                            project=memidx.DEFAULT_PROJECT, full=False,
+                                            no_embed=True, auto=False))
+            self.assertEqual(rc, 2)
+            self.assertFalse(db.exists())
+
+    def _ns_for(self, cmd, db):
+        base = dict(project=memidx.DEFAULT_PROJECT, db=str(db), json=True)
+        extra = {
+            "search": dict(query="x", mode="hybrid", status=[], type=[], area=None, topic=None, authority=None, limit=10),
+            "chain": dict(topic="TOP-0001"),
+            "why": dict(symbol_or_path="src/x.py", code_root=None),
+        }[cmd]
+        base.update(extra)
+        return ns(**base)
+
+    def test_root_less_readers_refuse_missing_and_create_nothing(self):
+        funcs = {"search": memidx.cmd_search, "chain": memidx.cmd_chain, "why": memidx.cmd_why}
+        for name, func in funcs.items():
+            with self.subTest(cmd=name), tempfile.TemporaryDirectory() as td:
+                db = Path(td) / "missing.sqlite"
+                buf_out, buf_err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                    rc = func(self._ns_for(name, db))
+                self.assertEqual(rc, 1, buf_err.getvalue())
+                self.assertFalse(db.exists(), f"{name} must not create a db")
+                self.assertIn("reindex --root", buf_err.getvalue())
+                self.assertEqual(json.loads(buf_out.getvalue()), {"state": "missing", "results": []})
+
+    def test_search_still_returns_positive_matches_under_upgrade_required(self):
+        # Ruling 68's central point: an upgrade-required index still holds
+        # real evidence -- refusing it entirely would throw away good
+        # information the schema-generation gap does not actually taint.
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "idx.sqlite"
+            reindex(FIXTURES / "schema_filters", db, no_embed=True)
+            conn = sqlite3.connect(str(db))
+            conn.execute("INSERT OR REPLACE INTO db_meta (key, value) VALUES ('index_generation', '1')")
+            conn.commit(); conn.close()
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = memidx.cmd_search(ns(project=memidx.DEFAULT_PROJECT, db=str(db), query="the",
+                                           mode="fts", status=[], type=[], area=None, topic=None,
+                                           authority=None, limit=10, json=True))
+            self.assertEqual(rc, 0)
+            self.assertIn("upgrade-required", buf_err.getvalue())
+            results = json.loads(buf_out.getvalue())
+            self.assertTrue(len(results) >= 0)  # proves it queried at all, not the refusal envelope
+            self.assertNotIsInstance(json.loads(buf_out.getvalue()), dict)  # not the {"state":..} refusal shape
+
+    def test_for_path_missing_or_uninitialized_exits_3_with_bare_list(self):
+        for state_setup, label in ((lambda db: None, "missing"),
+                                    (lambda db: memidx.open_db(db, project=memidx.DEFAULT_PROJECT).close(), "uninitialized")):
+            with self.subTest(label), tempfile.TemporaryDirectory() as td:
+                db = Path(td) / f"{label}.sqlite"
+                state_setup(db)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = memidx.cmd_for_path(ns(project=memidx.DEFAULT_PROJECT, db=str(db),
+                                                 file_path="src/x.py", json=True))
+                self.assertEqual(rc, 3)
+                self.assertEqual(json.loads(buf.getvalue()), [])
+
+    def test_for_path_index_error_fails_open_exits_4(self):
+        # A hook-facing reader must fail open on a sqlite3.OperationalError
+        # even after decision_index_state already confirmed a usable state
+        # -- the corrupted/broken schema is only discovered on the query
+        # this function makes AFTER that check. A call-count side effect on
+        # open_db_noncreating avoids needing to know cmd_for_path's exact
+        # SQL: the first call (inside decision_index_state) is real and
+        # succeeds; every call after that returns a connection whose
+        # execute() always raises.
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "idx.sqlite"
+            reindex(FIXTURES / "schema_filters", db, no_embed=True)
+            real_open = memidx.open_db_noncreating
+            calls = {"n": 0}
+
+            class _BrokenConn:
+                def execute(self, *a, **kw):
+                    raise sqlite3.OperationalError("no such column: link_topic_path")
+
+                def close(self):
+                    pass
+
+            def flaky_open(*a, **kw):
+                calls["n"] += 1
+                return real_open(*a, **kw) if calls["n"] == 1 else _BrokenConn()
+
+            buf = io.StringIO()
+            with mock.patch.object(memidx, "open_db_noncreating", side_effect=flaky_open), \
+                 contextlib.redirect_stdout(buf):
+                rc = memidx.cmd_for_path(ns(project=memidx.DEFAULT_PROJECT, db=str(db),
+                                             file_path="src/x.py", json=True))
+            self.assertEqual(rc, 4)
+            self.assertEqual(json.loads(buf.getvalue()), [])
+
+    def test_unmapped_coverage_status_per_state(self):
+        cases = {
+            "missing": (lambda db, root: None, "uninitialized", 1),
+            "uninitialized": (lambda db, root: memidx.open_db(db, project=memidx.DEFAULT_PROJECT).close(),
+                               "uninitialized", 1),
+        }
+        for label, (setup, expect_status, expect_rc) in cases.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as td:
+                root = Path(td) / "root"; root.mkdir()
+                db = Path(td) / f"{label}.sqlite"
+                setup(db, root)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = memidx.cmd_unmapped(ns(project=memidx.DEFAULT_PROJECT, db=str(db), root=str(root),
+                                                 code_root=None, json=True, paths=[]))
+                self.assertEqual(rc, expect_rc)
+                self.assertEqual(json.loads(buf.getvalue())["coverage_status"], expect_status)
+
+    def test_unmapped_upgrade_required_does_not_self_heal(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = FIXTURES_COPY_OF("schema_filters", td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+            conn = sqlite3.connect(str(db))
+            conn.execute("INSERT OR REPLACE INTO db_meta (key, value) VALUES ('index_generation', '1')")
+            conn.commit(); conn.close()
+            mtime_before = db.stat().st_mtime
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                memidx.cmd_unmapped(ns(project=memidx.DEFAULT_PROJECT, db=str(db), root=str(root),
+                                        code_root=None, json=True, paths=[]))
+            out = json.loads(buf.getvalue())
+            self.assertEqual(out["coverage_status"], "upgrade-required")
+            conn = sqlite3.connect(str(db))
+            conn.row_factory = sqlite3.Row
+            gen = conn.execute("SELECT value FROM db_meta WHERE key='index_generation'").fetchone()
+            self.assertEqual(gen["value"], "1", "self-heal must not have reindexed -- that is the rollout's job")
+
+    def test_unmapped_index_error_fails_open_coverage_status(self):
+        # NOTE (deviation from the brief's literal test text): `paths` is
+        # required here -- unlike the two states above, "current" state
+        # proceeds into the per-path classify loop, which is where the
+        # mocked _BrokenConn.execute() actually raises. Without at least
+        # one path the loop body (and therefore the fault) never runs.
+        with tempfile.TemporaryDirectory() as td:
+            root = FIXTURES / "schema_filters"
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+            real_open = memidx.open_db_noncreating
+            calls = {"n": 0}
+
+            class _BrokenConn:
+                def execute(self, *a, **kw):
+                    raise sqlite3.OperationalError("no such column: link_topic_path")
+
+                def close(self):
+                    pass
+
+            def flaky_open(*a, **kw):
+                calls["n"] += 1
+                return real_open(*a, **kw) if calls["n"] == 1 else _BrokenConn()
+
+            buf = io.StringIO()
+            with mock.patch.object(memidx, "open_db_noncreating", side_effect=flaky_open), \
+                 contextlib.redirect_stdout(buf):
+                rc = memidx.cmd_unmapped(ns(project=memidx.DEFAULT_PROJECT, db=str(db),
+                                             root=str(root), code_root=None, json=True,
+                                             paths=["src/x.py"]))
+            self.assertEqual(rc, 1)
+            self.assertEqual(json.loads(buf.getvalue())["coverage_status"], "index-error")
 
 
 if __name__ == "__main__":

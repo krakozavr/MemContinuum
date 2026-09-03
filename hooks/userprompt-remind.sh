@@ -421,8 +421,27 @@ for p in d.get("code_paths", []):
         [ -n "${MEMCONTINUUM_CODE_ROOT:-}" ] && ARGS+=(--code-root "$MEMCONTINUUM_CODE_ROOT")
         RAW="$(env PYTHONPATH= "$MC_PY" "$MC_MEMIDX" "${ARGS[@]}" 2>>"$MC_LOG")"
         RC=$?
-        if [ $RC -eq 0 ] && [ -n "$RAW" ]; then
+        # F1 (ruling 68): `unmapped` now exits 1 (not just 0) on a genuine
+        # coverage_status still worth reading -- uninitialized/upgrade-
+        # required/index-error all print a real JSON body on stderr-free
+        # stdout, just with an empty unmapped list. Accept RC 0 or 1, then
+        # log a distinct outcome per coverage_status so a still-degraded
+        # index is visible in hook.log, not silently folded into whatever
+        # the existing coverage_status != "ok" branch below already does.
+        if { [ $RC -eq 0 ] || [ $RC -eq 1 ]; } && [ -n "$RAW" ]; then
             UNMAPPED_JSON="$RAW"
+            COVERAGE_STATUS="$(printf '%s' "$RAW" | env PYTHONPATH= "$MC_PY" -c '
+import json, sys
+try:
+    print((json.load(sys.stdin) or {}).get("coverage_status", "unknown"))
+except Exception:
+    print("unknown")
+' 2>/dev/null)"
+            case "$COVERAGE_STATUS" in
+                uninitialized)      mc_log "userprompt outcome=index-uninitialized session=${SESSION_ID:-}" ;;
+                upgrade-required)   mc_log "userprompt outcome=index-upgrade-required session=${SESSION_ID:-}" ;;
+                index-error)        mc_log "userprompt outcome=index-error session=${SESSION_ID:-}" ;;
+            esac
         fi
     fi
 

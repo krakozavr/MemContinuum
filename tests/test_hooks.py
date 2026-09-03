@@ -8,6 +8,7 @@ behavior) as much as its output shape.
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -207,6 +208,45 @@ class TestPreEditChainHook(unittest.TestCase):
         matching = [l for l in log_text.splitlines() if "no-file-path" in l]
         self.assertTrue(matching, log_text)
         self.assertIn(f"project={self.project}", matching[-1])
+
+    def test_index_error_fails_open_and_logs_a_distinct_outcome(self):
+        """F1 (ruling 65's belt-and-suspenders catch): for-path's exit 4
+        (index-error). Renaming records.path breaks the query AFTER
+        decision_index_state has already reported a usable state ("current"
+        here, since the state check itself never references `path`) -- the
+        matched candidate's chain-building (topic_row["path"]) is what
+        actually raises. Restores the column afterward (addCleanup) so
+        correctness of the rest of this class's shared class-level db
+        doesn't depend on unittest's alphabetical run order."""
+        db = Path(self.memtool_home) / f"{self.project}.sqlite"
+        conn = sqlite3.connect(str(db))
+        conn.execute("ALTER TABLE records RENAME COLUMN path TO path_broken")
+        conn.commit(); conn.close()
+
+        def _restore():
+            c = sqlite3.connect(str(db))
+            c.execute("ALTER TABLE records RENAME COLUMN path_broken TO path")
+            c.commit(); c.close()
+
+        self.addCleanup(_restore)
+
+        payload = json.dumps(
+            {
+                "session_id": "s-preedit-index-error", "hook_event_name": "PreToolUse",
+                "tool_name": "Edit", "cwd": "/some/other/unrelated/dir",
+                "tool_input": {"file_path": "/fake/repo/src/core/scan/scan_plan.py"},
+            }
+        )
+        env = clean_env(
+            MEMCONTINUUM_HOME=self.memtool_home,
+            MEMCONTINUUM_PROJECT=self.project,
+            MEMCONTINUUM_PYTHON=VENV_PYTHON,
+            MEMCONTINUUM_STRIP_PREFIX="/fake/repo/",
+        )
+        proc, elapsed = run_hook(payload, env, timeout=10.0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        self.assertIn("outcome=index-error", log_text, log_text)
 
     def test_for_path_all_candidates_failing_logs_query_failed_not_no_match(self):
         """Round-3 addendum (review finding): a candidate whose `for-path`

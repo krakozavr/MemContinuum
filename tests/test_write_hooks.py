@@ -17,6 +17,7 @@ import json
 import os
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -266,14 +267,17 @@ class TestUnmappedCommand(unittest.TestCase):
         rc, out = self._run([abs_path], code_root=self.code_root)
         self.assertEqual(out["mapped_topic"], ["src/mapped.py"])
 
-    def test_first_run_self_heals_missing_index(self):
-        # db never built -- unmapped must build it (check -> reindex --no-embed)
-        # and end up coverage_status ok, not unknown, once it converges.
+    def test_first_run_is_uninitialized_not_self_built(self):
+        # F1: a wholly missing db is no longer silently built by unmapped's
+        # self-heal -- only genuine same-generation on-disk drift ("stale")
+        # still self-heals; missing/uninitialized/upgrade-required do not.
         self.assertFalse(self.db.exists())
         rc, out = self._run(["src/mapped.py", "src/nothing.py"])
-        self.assertEqual(out["coverage_status"], "ok")
-        self.assertEqual(out["mapped_topic"], ["src/mapped.py"])
-        self.assertEqual(out["unmapped"], ["src/nothing.py"])
+        self.assertEqual(rc, 1)
+        self.assertEqual(out["coverage_status"], "uninitialized")
+        self.assertEqual(out["mapped_topic"], [])
+        self.assertEqual(out["unmapped"], [])
+        self.assertFalse(self.db.exists(), "an uninitialized read must never create the db")
 
     def test_drift_triggers_incremental_reindex(self):
         reindex(self.store_root, self.db, project=self.project)
@@ -992,6 +996,43 @@ class TestPrecompactPersist(HookTestBase):
         result = subprocess.run([MC_BASH, "-n", str(PRECOMPACT_HOOK)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    # F1 (ruling 68): same three coverage_status outcomes as
+    # TestUserPromptRemind above, using this class's own pre_compact_payload/
+    # PRECOMPACT_HOOK -- a real code-kind ledger entry is required for the
+    # same reason (CODE_PATHS must be non-empty for `unmapped` to run at
+    # all).
+
+    def test_uninitialized_logs_index_uninitialized(self):
+        db = self.home / f"{self.project}.sqlite"
+        db.unlink()
+        session_id = "s-precompact-uninit"
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+        proc, elapsed = run_script(PRECOMPACT_HOOK, self.pre_compact_payload(session_id), self.base_env(), timeout=10.0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("outcome=index-uninitialized", (self.home / "hook.log").read_text())
+
+    def test_upgrade_required_logs_index_upgrade_required(self):
+        db = self.home / f"{self.project}.sqlite"
+        conn = sqlite3.connect(str(db))
+        conn.execute("INSERT OR REPLACE INTO db_meta (key, value) VALUES ('index_generation', '1')")
+        conn.commit(); conn.close()
+        session_id = "s-precompact-upgrade"
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+        proc, elapsed = run_script(PRECOMPACT_HOOK, self.pre_compact_payload(session_id), self.base_env(), timeout=10.0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("outcome=index-upgrade-required", (self.home / "hook.log").read_text())
+
+    def test_index_error_logs_index_error(self):
+        db = self.home / f"{self.project}.sqlite"
+        conn = sqlite3.connect(str(db))
+        conn.execute("ALTER TABLE records RENAME COLUMN path TO path_broken")
+        conn.commit(); conn.close()
+        session_id = "s-precompact-index-error"
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+        proc, elapsed = run_script(PRECOMPACT_HOOK, self.pre_compact_payload(session_id), self.base_env(), timeout=10.0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("outcome=index-error", (self.home / "hook.log").read_text())
+
     def test_exits_zero_with_absolutely_empty_stdout(self):
         session_id = "s-precompact-empty"
         self.seed_ledger(
@@ -1519,6 +1560,46 @@ class TestUserPromptRemind(HookTestBase):
     def test_bash_syntax_valid(self):
         result = subprocess.run([MC_BASH, "-n", str(USERPROMPT_HOOK)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    # F1 (ruling 68): a coverage_status the hook reads off `unmapped` that
+    # isn't "ok" gets its own distinctly-loggable outcome, on top of (not
+    # instead of) the existing degraded-input handling. Each test needs a
+    # real code-kind ledger entry (deviation from the brief's literal test
+    # text, which omits seed_ledger) -- otherwise CODE_PATHS is empty and
+    # the hook never calls `unmapped` at all, so the assertion would pass
+    # or fail for the wrong reason (see test_real_shaped_payload_no_source_
+    # no_agent_proceeds above for the same seeding pattern).
+
+    def test_uninitialized_logs_index_uninitialized(self):
+        db = self.home / f"{self.project}.sqlite"
+        db.unlink()
+        session_id = "s-userprompt-uninit"
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+        proc, elapsed = run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.base_env(), timeout=10.0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("outcome=index-uninitialized", (self.home / "hook.log").read_text())
+
+    def test_upgrade_required_logs_index_upgrade_required(self):
+        db = self.home / f"{self.project}.sqlite"
+        conn = sqlite3.connect(str(db))
+        conn.execute("INSERT OR REPLACE INTO db_meta (key, value) VALUES ('index_generation', '1')")
+        conn.commit(); conn.close()
+        session_id = "s-userprompt-upgrade"
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+        proc, elapsed = run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.base_env(), timeout=10.0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("outcome=index-upgrade-required", (self.home / "hook.log").read_text())
+
+    def test_index_error_logs_index_error(self):
+        db = self.home / f"{self.project}.sqlite"
+        conn = sqlite3.connect(str(db))
+        conn.execute("ALTER TABLE records RENAME COLUMN path TO path_broken")
+        conn.commit(); conn.close()
+        session_id = "s-userprompt-index-error"
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+        proc, elapsed = run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.base_env(), timeout=10.0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("outcome=index-error", (self.home / "hook.log").read_text())
 
     def test_silent_on_empty_evidence(self):
         session_id = "s-prompt-empty"
