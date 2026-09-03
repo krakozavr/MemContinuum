@@ -32,6 +32,7 @@ from memidx import (
     fragment_declared_in_text,
     newest_active_link,
     parse_frontmatter,
+    validated_evidence_list,
     walk_markdown,
 )
 
@@ -135,18 +136,14 @@ def lint_topic(path: Path, fm: dict) -> tuple[list[str], list[str]]:
                     re.compile(ipattern)
                 except re.error as exc:
                     errors.append(f"{prefix}: invariant.pattern {ipattern!r} does not compile: {exc}")
-            if auth == "agent-inference":
-                errors.append(
-                    f"{prefix}: invariant present on an agent-inference link -- this can never be "
-                    "enforced (CONTEXT only); move it to a reviewer-finding/code-derived link with "
-                    "real evidence, an owner-verbatim/owner-ratified link, or drop the invariant"
-                )
-            elif auth not in ("owner-verbatim", "owner-ratified"):
-                raw_evidence = link.get("evidence")
-                validated = (
-                    [e for e in raw_evidence if isinstance(e, str) and e.strip()]
-                    if isinstance(raw_evidence, list) else []
-                )
+            # Ruling 76 (overrides this task's original agent-inference
+            # exclusion): agent-inference is HOLD-eligible exactly like
+            # reviewer-finding/code-derived -- validated evidence makes it
+            # a HOLD, not an error; empty evidence gets the same ERROR
+            # every other non-CONSTRAINT authority gets below. No more
+            # special-cased always-error branch.
+            if auth not in ("owner-verbatim", "owner-ratified"):
+                validated = validated_evidence_list(link.get("evidence"))
                 if not validated:
                     errors.append(
                         f"{prefix}: invariant present but authority {auth!r} is not CONSTRAINT and "

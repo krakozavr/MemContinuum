@@ -1700,40 +1700,58 @@ def cmd_why(args) -> int:
 # ---------------------------------------------------------------------------
 
 
-# F3 (external-fix round, coordinator ruling 70): the trust model's three
-# enforcement classes. docs/SCHEMA.md §4's CONSTRAINT tier is exactly
-# owner-verbatim/owner-ratified; HOLD is only reviewer-finding/code-derived,
-# and only WITH validated evidence -- an agent-inference invariant is never
-# promoted by evidence, however real-looking (Codex's specific correction
-# over a flatter authority-OR-evidence rule).
+# F3 (external-fix round, coordinator ruling 70; HOLD_ELIGIBLE_AUTHORITIES
+# widened by ruling 76, which overrides the brief's original exclusion). The
+# trust model's three enforcement classes. docs/SCHEMA.md §4's CONSTRAINT
+# tier is exactly owner-verbatim/owner-ratified; HOLD is reviewer-finding,
+# code-derived, OR agent-inference, but ONLY with validated evidence in every
+# case -- eligibility is uniform across all three HOLD-eligible authorities,
+# never a bare non-empty list promoting anything by itself (still Codex's
+# specific correction over a flatter authority-OR-evidence rule: an
+# agent-inference link with EMPTY evidence stays CONTEXT, same as any other
+# HOLD-eligible authority with no validated evidence).
 CONSTRAINT_AUTHORITIES = {"owner-verbatim", "owner-ratified"}
-HOLD_ELIGIBLE_AUTHORITIES = {"reviewer-finding", "code-derived"}
+HOLD_ELIGIBLE_AUTHORITIES = {"reviewer-finding", "code-derived", "agent-inference"}
 
 
-def _validated_evidence(link_row) -> list[str]:
-    """Parses `evidence` as a JSON list and keeps only non-blank string
-    entries -- [] and an all-blank list both count as empty (ruling 70:
+def validated_evidence_list(raw) -> list[str]:
+    """The parsed-evidence-shape core shared by drift's classifier
+    (_validated_evidence below) and memlint's own check (memlint.py imports
+    this directly): an `evidence` value is "validated" only when it is an
+    actual list, and only its non-blank string entries count. None, a bare
+    scalar (a string is NOT a list of one string), a dict, and a list of
+    non-strings/blank-strings all normalize to [] (or drop those entries);
+    a mixed list keeps only its non-blank string members. Ruling 70:
     evidence must be validated content, never merely tested for
-    truthiness)."""
-    try:
-        raw = json.loads(link_row["evidence"] or "[]")
-    except (TypeError, ValueError):
-        return []
+    truthiness."""
     if not isinstance(raw, list):
         return []
     return [e.strip() for e in raw if isinstance(e, str) and e.strip()]
 
 
+def _validated_evidence(link_row) -> list[str]:
+    """Parses `evidence` (a `links` row's own JSON-encoded column) and
+    hands it to validated_evidence_list -- the same core memlint uses
+    directly on the raw YAML value."""
+    try:
+        raw = json.loads(link_row["evidence"] or "[]")
+    except (TypeError, ValueError):
+        return []
+    return validated_evidence_list(raw)
+
+
 def invariant_enforcement_class(link_row) -> str:
     """"constraint" | "hold" | "context" -- ruling 70's four-class rule
     (three outcomes; the fourth, "no invariant at all", never reaches this
-    function). "constraint": active owner-verbatim/owner-ratified -- always
-    enforced, a violation always fails the run. "hold": active
-    reviewer-finding/code-derived WITH validated evidence -- reported, only
-    fails the exit under --strict-holds. "context": everything else -- a
-    non-active status, agent-inference at ANY evidence state (an arbitrary
-    non-empty list must never promote it), or a HOLD-eligible authority
-    with no validated evidence."""
+    function; a fifth outcome, "provisional -- reported for revalidation
+    without enforcement," is ruling 74's and lives in cmd_drift's own
+    provisional branch, never here -- this function is never called for a
+    provisional row). "constraint": active owner-verbatim/owner-ratified --
+    always enforced, a violation always fails the run. "hold": active
+    reviewer-finding/code-derived/agent-inference (ruling 76) WITH
+    validated evidence -- reported, only fails the exit under
+    --strict-holds. "context": everything else -- a non-active status, or a
+    HOLD-eligible authority (any of the three) with no validated evidence."""
     if link_row["status"] != "active":
         return "context"
     authority = link_row["ruling_authority"]
@@ -1752,9 +1770,15 @@ class InvariantSkipped(Exception):
 
 
 def links_with_active_invariant(conn, project: str):
-    """(link row, invariant dict) for every active link that carries one."""
+    """(link row, invariant dict) for every active OR provisional link that
+    carries one (ruling 74 widens this from active-only: a provisional
+    invariant must be visible to `drift` for revalidation, never silently
+    absent). cmd_drift itself is what tells the two statuses apart -- a
+    provisional row goes straight to the `revalidate` bucket, never through
+    invariant_enforcement_class at all."""
     rows = conn.execute(
-        "SELECT * FROM links WHERE project=? AND status='active' AND invariant IS NOT NULL",
+        "SELECT * FROM links WHERE project=? AND status IN ('active','provisional') "
+        "AND invariant IS NOT NULL",
         (project,),
     ).fetchall()
     out = []
@@ -1813,8 +1837,15 @@ def check_invariant(code_root: Path, invariant: dict) -> list[str]:
     scope = invariant.get("scope")
     if not scope:
         raise InvariantSkipped("missing scope")
+    matched = sorted(code_root.glob(scope))
+    if not matched:
+        # Coordinator fix: a scope glob matching zero files used to fall
+        # through the empty loop below and return [] -- a vacuous pass
+        # indistinguishable from "every matched file makes the required
+        # call". A scope that matches nothing is unevaluable, not clean.
+        raise InvariantSkipped(f"must-call scope matches no files: {scope}")
     missing = []
-    for fpath in sorted(code_root.glob(scope)):
+    for fpath in matched:
         if not fpath.is_file() or is_binary_file(fpath):
             continue
         rel = str(fpath.relative_to(code_root))
@@ -1839,16 +1870,20 @@ def _format_drift_line(prefix: str, r: dict) -> str:
 
 
 def cmd_drift(args) -> int:
-    """F3 (ruling 70): three buckets, not one flat list -- an active
+    """F3 (ruling 70, HOLD_ELIGIBLE_AUTHORITIES widened by ruling 76):
+    three enforcement buckets, not one flat list -- an active
     owner-verbatim/owner-ratified invariant is a CONSTRAINT violation
-    (always fails the run); an active reviewer-finding/code-derived
-    invariant with validated evidence is a HOLD violation (reported, only
-    fails the exit under --strict-holds); everything else (non-active
-    status, agent-inference at any evidence state, or a HOLD-eligible
-    authority with no validated evidence) is CONTEXT -- named `skipped`,
-    never silently enforced. check_invariant's own InvariantSkipped (bad
-    kind/regex/scope) is caught per-entry and named too, never a
-    traceback."""
+    (always fails the run); an active reviewer-finding/code-derived/
+    agent-inference invariant with validated evidence is a HOLD violation
+    (reported, only fails the exit under --strict-holds); everything else
+    (non-active status, or a HOLD-eligible authority with no validated
+    evidence) is CONTEXT -- named `skipped`, never silently enforced.
+    check_invariant's own InvariantSkipped (bad kind/regex/scope/empty
+    must-call scope) is caught per-entry and named too, never a traceback.
+    Ruling 74 adds a fourth, orthogonal bucket: a `provisional` link
+    carrying an invariant is never classified or checked at all -- it goes
+    straight to `revalidate`, reported for live revalidation, never a
+    failure even under --strict-holds."""
     db_path = resolve_db_path(args)
     # --code-root points at CODE, not the decision store's own markdown
     # tree, so this reader cannot compute "stale" either -- root stays None,
@@ -1865,9 +1900,17 @@ def cmd_drift(args) -> int:
     entries = links_with_active_invariant(conn, args.project)
     conn.close()
 
-    violations, hold_violations, skipped = [], [], []
+    violations, hold_violations, skipped, revalidate = [], [], [], []
     for link_row, invariant in entries:
         label = f"{link_row['topic_id']}/{link_row['link']}"
+        if link_row["status"] == "provisional":
+            # Ruling 74: reported for live revalidation, never checked,
+            # never enforced -- not routed through invariant_enforcement_class
+            # (which is never called for a non-active/provisional row) or
+            # check_invariant at all.
+            revalidate.append({"topic": link_row["topic_id"], "link": link_row["link"],
+                                "kind": invariant.get("kind")})
+            continue
         eclass = invariant_enforcement_class(link_row)
         if eclass == "context":
             reason = "authority" if link_row["status"] == "active" else f"status={link_row['status']}"
@@ -1887,7 +1930,7 @@ def cmd_drift(args) -> int:
     strict = getattr(args, "strict_holds", False)
     if args.json:
         print(json.dumps({"violations": violations, "hold_violations": hold_violations,
-                           "skipped": skipped}, indent=2))
+                           "skipped": skipped, "revalidate": revalidate}, indent=2))
     else:
         if not violations and not hold_violations:
             print("drift: no invariants violated")
@@ -1897,6 +1940,8 @@ def cmd_drift(args) -> int:
             print(_format_drift_line("HOLD", r))
         for s in skipped:
             print(f"drift: skipped {s['link']} ({s['reason']})")
+        for r in revalidate:
+            print(f"revalidate (provisional): {r['topic']}/{r['link']} {r['kind']}")
     return 1 if (violations or (strict and hold_violations)) else 0
 
 
@@ -4608,9 +4653,9 @@ def main(argv=None) -> int:
     p_drift.add_argument(
         "--strict-holds", action="store_true",
         help="also fail the exit code on a HOLD violation (an active reviewer-finding/"
-             "code-derived invariant with validated evidence) -- without this flag, a HOLD "
-             "violation is reported but never blocks (SCHEMA.md §4: a HOLD 'may block', at "
-             "the caller's discretion)",
+             "code-derived/agent-inference invariant with validated evidence) -- without "
+             "this flag, a HOLD violation is reported but never blocks (SCHEMA.md §4: a "
+             "HOLD 'may block', at the caller's discretion)",
     )
     p_drift.set_defaults(func=cmd_drift)
 

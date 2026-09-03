@@ -369,18 +369,29 @@ class TestF3MemlintChecks(unittest.TestCase):
         )
         self.assertTrue(any("does not match any link id" in e for e in errors), errors)
 
-    def test_agent_inference_with_invariant_is_always_an_error_evidence_or_not(self):
-        # Ruling 70: agent-inference can never be promoted -- unlike
-        # Revision 2/3's rule (evidence alone silenced the error), this now
-        # errors even WITH a non-empty evidence list, since no amount of
-        # evidence fixes an agent-inference invariant.
+    def test_agent_inference_with_validated_evidence_is_clean(self):
+        # Ruling 76 (overrides this task's original agent-inference
+        # exclusion): agent-inference is HOLD-eligible exactly like
+        # reviewer-finding/code-derived -- validated evidence makes the
+        # link clean, not an automatic error.
         errors, _ = self._lint(
             "type: topic\nid: TOP-1\ntitle: T\nlinks:\n  - link: L1\n    status: active\n"
             "    ruling: {text: r, authority: agent-inference, source: s}\n"
-            "    evidence: [\"a real-looking citation\"]\n"
+            "    evidence: [\"a real citation\"]\n"
             "    invariant: {kind: no-bypass, pattern: x}\n"
         )
-        self.assertTrue(any("agent-inference" in e for e in errors), errors)
+        self.assertFalse(any("evidence" in e or "agent-inference" in e for e in errors), errors)
+
+    def test_agent_inference_with_empty_evidence_is_error(self):
+        # Same authority, no validated evidence -- gets the same ERROR
+        # every other non-CONSTRAINT authority gets.
+        errors, _ = self._lint(
+            "type: topic\nid: TOP-1\ntitle: T\nlinks:\n  - link: L1\n    status: active\n"
+            "    ruling: {text: r, authority: agent-inference, source: s}\n"
+            "    evidence: []\n"
+            "    invariant: {kind: no-bypass, pattern: x}\n"
+        )
+        self.assertTrue(any("evidence" in e for e in errors), errors)
 
     def test_reviewer_finding_with_only_blank_evidence_is_error(self):
         errors, _ = self._lint(
