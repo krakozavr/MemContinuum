@@ -1057,10 +1057,21 @@ class TestDefaultStoreName(unittest.TestCase):
             subprocess.run(["git", "init", "-q", "."], cwd=repo, check=True)
             proc = run_install(["--project", "p", "--dry-run"], home, cwd=str(repo))
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-            self.assertIn(f"defaulting to {home}/proj-MemContinuum-Store", proc.stdout)
+            # Resolved, not raw: the default store sibling is built from
+            # `git rev-parse --show-toplevel` (physical, symlink-free), and
+            # the default --claude-dir is that same toplevel + "/.claude" --
+            # both necessarily resolved. `home`/`repo` themselves are the RAW
+            # tempfile.mkdtemp() form; on macOS that is /var/folders/...,
+            # itself a symlink to /private/var/folders/.... Comparing raw
+            # against the engine's resolved output was a Linux-only
+            # assumption (Linux's /tmp is not usually symlinked, so raw
+            # happened to equal resolved there).
+            home_r = os.path.realpath(home)
+            repo_r = os.path.realpath(str(repo))
+            self.assertIn(f"defaulting to {home_r}/proj-MemContinuum-Store", proc.stdout)
             # the hooks stay with the REPO, not the parent dir the sibling
             # store happens to land in
-            self.assertIn(f"{repo}/.claude", proc.stdout)
+            self.assertIn(f"{repo_r}/.claude", proc.stdout)
         finally:
             shutil.rmtree(home, ignore_errors=True)
 
@@ -1071,7 +1082,11 @@ class TestDefaultStoreName(unittest.TestCase):
             work.mkdir()
             proc = run_install(["--project", "p", "--dry-run"], home, cwd=str(work))
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-            self.assertIn(f"defaulting to {work}/MemContinuum-Store", proc.stdout)
+            # Resolved, not raw -- see the sibling-store test above: outside
+            # a git repo the default store is "$PWD/MemContinuum-Store",
+            # and a freshly-started bash's $PWD comes from getcwd(), which
+            # is always symlink-free.
+            self.assertIn(f"defaulting to {os.path.realpath(str(work))}/MemContinuum-Store", proc.stdout)
         finally:
             shutil.rmtree(home, ignore_errors=True)
 
@@ -2288,7 +2303,13 @@ class TestMultiRootCodeIndex(unittest.TestCase):
                 paths = {r[0] for r in conn.execute("SELECT DISTINCT path FROM chunks")}
             finally:
                 conn.close()
-            self.assertEqual(roots, {str(first), str(second)}, roots)
+            # Resolved, not raw: memidx.py stores code_root via
+            # Path(args.code_root).resolve(), and `first`/`second` are the
+            # raw tempfile.mkdtemp()-derived form (macOS's /var/folders/...,
+            # a symlink to /private/var/folders/...). The step-line check
+            # above stays raw on purpose -- that line echoes the --code-root
+            # argument as typed, never resolved.
+            self.assertEqual(roots, {str(first.resolve()), str(second.resolve())}, roots)
             self.assertEqual(paths, {"alpha_module.py", "beta_module.py"}, paths)
         finally:
             shutil.rmtree(home, ignore_errors=True)

@@ -508,13 +508,23 @@ class TestPrunedPathsLeaveTheIndex(unittest.TestCase):
                  "buffer", "noise", "0" * 64, 0.0, 1),
             )
             conn.commit()
-            self.assertEqual(self._paths(conn), {str(root / "topics" / "area" / "real.md"), str(noise)})
+            # real.md's expected key is RESOLVED: reindex() canonicalises
+            # root via .resolve() before storing any path, so the row it
+            # wrote for real.md is the resolved form -- raw only matches
+            # by coincidence on Linux, where /tmp is not usually symlinked
+            # (macOS's TMPDIR-derived /var/folders/... is a symlink to
+            # /private/var/folders/...). `noise`'s row, in contrast, was
+            # inserted directly above with its own raw str(noise) key (it
+            # simulates a pre-fix polluted row, never touched by reindex),
+            # so it stays raw on both sides of this comparison.
+            real_path = str((root / "topics" / "area" / "real.md").resolve())
+            self.assertEqual(self._paths(conn), {real_path, str(noise)})
             conn.close()
 
             reindex(root, db, no_embed=True)
 
             conn = memidx.open_db(db, project=memidx.DEFAULT_PROJECT)
-            self.assertEqual(self._paths(conn), {str(root / "topics" / "area" / "real.md")})
+            self.assertEqual(self._paths(conn), {real_path})
             conn.close()
             # The file on disk is never touched -- only the derived index.
             self.assertTrue(noise.is_file())
@@ -929,7 +939,15 @@ class TestF2EmbeddingMode(unittest.TestCase):
             "  - link: L1\n    status: active\n    ruling: {text: \"r\", authority: owner-verbatim, source: s}\n"
             f"---\n{text}\n"
         )
-        return root
+        # Resolved, not raw: cmd_reindex canonicalises root via .resolve()
+        # before it ever touches disk, so every path it stores/returns is
+        # already resolved. A raw fixture root (tempfile's TMPDIR form --
+        # macOS's /var/folders/... is itself a symlink to
+        # /private/var/folders/...) would make every str(root / ...) built
+        # from it disagree with what actually landed in the db. Comparing
+        # raw against the engine's output was a Linux-only assumption: /tmp
+        # is not usually symlinked there, so raw happened to equal resolved.
+        return root.resolve()
 
     def _emb(self, db, path):
         conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
@@ -1661,7 +1679,10 @@ class TestF5LinkRows(unittest.TestCase):
             "    ruling: {text: \"a background sweeper thread was rejected\", authority: owner-verbatim, source: s}\n"
             "---\nBody never mentions invalidation or sweepers.\n"
         )
-        return root
+        # Resolved, not raw -- see TestF2EmbeddingMode._topic's comment: every
+        # path this fixture's callers build from `root` must agree with what
+        # cmd_reindex actually stored (it resolves internally).
+        return root.resolve()
 
     def test_ruling_paraphrase_not_in_body_is_found_via_vector_mode(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1705,10 +1726,12 @@ class TestF5LinkRows(unittest.TestCase):
                 "SELECT path, type FROM records WHERE project=?", (memidx.DEFAULT_PROJECT,)
             ).fetchall()
             by_path = {r["path"]: r["type"] for r in rows}
-            self.assertEqual(by_path.get(str(weird)), "topic")
+            # resolved, not raw: reindex() canonicalises root via .resolve()
+            # before storing any path (see TestF2EmbeddingMode._topic).
+            self.assertEqual(by_path.get(str(weird.resolve())), "topic")
             link_paths = [p for p, t in by_path.items() if t == "link"]
             self.assertEqual(len(link_paths), 1)
-            self.assertNotEqual(link_paths[0], str(weird))
+            self.assertNotEqual(link_paths[0], str(weird.resolve()))
             args = ns(db=str(db), project=memidx.DEFAULT_PROJECT, root=str(root), json=True)
             self.assertEqual(memidx.cmd_check(args), 0)
 
@@ -2141,7 +2164,9 @@ class TestF5LinkRows(unittest.TestCase):
             )
             db = Path(td) / "idx.sqlite"
             reindex(root, db, no_embed=True)
-            topic_path = str(root / "topics" / "t.md")
+            # resolved, not raw: reindex() canonicalises root via .resolve()
+            # before storing any path (see TestF2EmbeddingMode._topic).
+            topic_path = str((root / "topics" / "t.md").resolve())
             conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
             # Columns/link rows are left completely intact -- ONLY the
             # generation stamp regresses and the evidence value is cleared,

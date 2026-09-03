@@ -3009,7 +3009,13 @@ class TestIndexProvenance(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             data = json.loads(result.stdout)
             self.assertEqual(data["state"], "current")
-            self.assertEqual(data["code_root"], str(root))
+            # code_reindex canonicalises via Path(...).resolve() (memidx.py's
+            # cmd_reindex), so the stored/reported code_root is the RESOLVED
+            # path -- on macOS, root itself (built from tempfile's TMPDIR) is
+            # the raw /var/folders/... form, a symlink to /private/var/folders/...
+            # Comparing against the raw root was a Linux-only assumption: /tmp
+            # is not usually symlinked there, so raw == resolved by coincidence.
+            self.assertEqual(data["code_root"], str(root.resolve()))
             self.assertIsInstance(data["indexed_at"], (int, float))
             self.assertGreater(len(data["results"]), 0)
 
