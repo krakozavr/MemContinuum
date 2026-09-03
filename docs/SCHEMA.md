@@ -210,9 +210,10 @@ involved_in: [INC-0004]
 Answers "which existing entity already owns X, and where are its
 boundaries?" — a question symbol search alone cannot answer. `for-path`
 returns the concept(s) a file belongs to, along with their topic chains.
-`memlint.py --code-root DIR` errors when an `implemented_by`/`tested_by` path
-no longer exists under `DIR`, and warns when a concept has no `tested_by` at
-all (promotion needs at least one).
+`memlint.py --code-root DIR` (repeatable, one project can have several code
+roots) errors when an `implemented_by`/`tested_by` path no longer exists
+under any root given, or exists under more than one, and warns when a
+concept has no `tested_by` at all (promotion needs at least one).
 
 ### 8.5 Reading direction from code: "why is this code strange?"
 

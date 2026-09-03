@@ -69,12 +69,12 @@ memidx.py code-search "INTENT PHRASE" --project PROJECT --mode hybrid --json
 Phrase the query as the intent ("write a debug PNG", "embed a view in a scroll box", "hash
 a file's contents"), not as a symbol name — the index is built to match on that. A hit whose
 `concept_id` is set means a decision record governs that code; check it (`memidx.py why <path>`)
-before working around or duplicating it.
-
-The `--json` output carries a `state` field: `uninitialized` (exit non-zero — `code-reindex`
-was never run for this project; a bare `[]` here is a refusal, not a real "nothing found"),
-`stale` (source changed since the last `code-reindex` — a warning, not a block), or `current`.
-**Confirm the code index is initialized/current (or stale with eyes open) before trusting a
-"nothing found" — then run `code-search`; name relevant hits in your report, or say none** —
-the same rule as the markdown search above: silently skipping this check is exactly how a
-second, slightly different `writeDebugImage` gets written next to the first one.
+before working around or duplicating it. The `--json` output wraps hits in an envelope: `state` is
+`uninitialized` (exit non-zero, `[]` is a refusal not "nothing found"), `stale` (a root changed
+since the last `code-reindex`), `degraded` (something is incomplete — an unindexable file, or a
+root missing on disk — with nothing changed), or `current`; `code_roots`, `changed`/`failed`/
+`not_indexed`, and `embedding_mode` carry the detail; `code-search` heals a `stale`/`degraded`
+index itself, once, before answering. **Confirm the code index is current (or stale/degraded with eyes open) before trusting a
+"nothing found" — then run `code-search`; name relevant hits in your report, or say none** — the
+same rule as the markdown search above: silently skipping this check is exactly how a second,
+slightly different `writeDebugImage` gets written next to the first one.

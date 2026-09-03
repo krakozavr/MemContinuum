@@ -1345,12 +1345,13 @@ def resolve_symbol_to_path(code_root: Path, symbol: str, project: str | None = N
     Task 6: dispatch is language-aware, not Swift-only. Each candidate
     file's language is resolved with lang_for_source_file (extension
     first, then a shebang sniff for an extensionless file) BEFORE it is
-    even read -- a file with no resolvable language (an unwired
-    extension, a non-language file drift's iter_code_files also walks) is
-    skipped outright, never sent through the Swift lexer as the old
-    default rel_path="x.swift" silently did (the bug: a `.py` file's `def`
-    syntax never matched Swift's grammar, so a bare Python symbol could
-    never resolve here at all)."""
+    even read -- a file with no resolvable language (an extension with no
+    LANGUAGE_TABLE row at all, checked against the registry, not against
+    this project's wired subset; or a non-language file drift's
+    iter_code_files also walks) is skipped outright, never sent through
+    the Swift lexer as the old default rel_path="x.swift" silently did
+    (the bug: a `.py` file's `def` syntax never matched Swift's grammar,
+    so a bare Python symbol could never resolve here at all)."""
     if project:
         resolved = _resolve_symbol_via_code_index(code_root, symbol, project)
         if resolved is not None:
@@ -1939,10 +1940,14 @@ def lang_for_source_file(path: Path) -> str | None:
     unreadable file simply has no resolvable language here; the reindex
     loop's own per-file guard reports it.
 
-    Used by all three places that used to answer this question separately:
-    the walk's classification, cmd_code_reindex's per-file dispatch (which
-    used to call the extension-only `_lang_for_ext`) and the staleness
-    check's per-file chunker-version comparison."""
+    The one resolution rule every code-index caller that needs a file's
+    language shares, rather than each answering it separately: the walk's
+    classification (`iter_code_source_files`), `cmd_code_reindex`'s
+    per-file dispatch (which used to call the extension-only
+    `_lang_for_ext`), the per-root staleness check's per-file
+    chunker-version comparison (`_root_report`), `code_census`'s
+    supported/unsupported classification, and `resolve_symbol_to_path`'s
+    disk-scan fallback."""
     lang = chunkers.lang_for_path(path)
     if lang is not None:
         return lang
@@ -1988,8 +1993,8 @@ def iter_code_source_files(root: Path, langs: list[str] | None, skipped: Counter
 
     Directory pruning (fix wave C1, superseding Task 7's union rule): a
     language's skip_dirs prune only THAT language's own files. The walk
-    prunes CODE_SKIP_DIR_NAMES (== chunkers.UNIVERSAL_SKIP_DIRS: .git,
-    .build, node_modules, vendor, venv, .venv, __pycache__, .tox, .eggs)
+    prunes CODE_SKIP_DIR_NAMES (an alias of chunkers.UNIVERSAL_SKIP_DIRS --
+    see that set's own docstring for the member list and rationale)
     plus chunkers.common_skip_dirs(wired) -- the INTERSECTION of the wired
     languages' skip sets, a pure optimization since every file under such
     a directory would be dropped by its own language's rule anyway. Every
@@ -2729,9 +2734,9 @@ def code_census(root: Path) -> dict:
     the raw extension string (or NO_EXTENSION_BUCKET) for an unsupported
     one.
 
-    Directory pruning: the walk prunes CODE_SKIP_DIR_NAMES (==
-    chunkers.UNIVERSAL_SKIP_DIRS: .git, .build, node_modules, vendor,
-    venv, .venv, __pycache__, .tox, .eggs) -- the same universal noise set
+    Directory pruning: the walk prunes CODE_SKIP_DIR_NAMES (an alias of
+    chunkers.UNIVERSAL_SKIP_DIRS -- see that set's own docstring for the
+    member list and rationale) -- the same universal noise set
     iter_code_source_files prunes, and nothing wider. A SUPPORTED file is
     then dropped only when an ancestor directory on its root-relative path
     sits in ITS OWN language's skip_dirs (chunkers.path_is_skipped_for_lang
@@ -3212,14 +3217,15 @@ def cmd_code_search(args) -> int:
             "signature": row["signature"],
             "score": score,
         }
-        # Task 6: concept attachment is root-checked -- a stale hit whose
+        # Task 6: concept attachment is root-checked -- a hit whose
         # relative path no longer exists under the root it was indexed
-        # from (the real adversary: the SAME relative path indexed under
-        # TWO roots, one deleted, heal off) must never attach a concept
-        # keyed on that path alone. With a current index this is always
-        # true (nothing stale to guard against); the guard only ever
-        # changes behavior once a hit's own root/path has drifted, which
-        # a single-root project sharing no path with itself never can.
+        # from must never attach a concept keyed on that path alone. This
+        # changes behavior whenever a hit's file is gone from its root --
+        # single-root or multi-root alike, heal off in both cases; the
+        # adversary that motivated it is specifically two roots sharing
+        # one relative path with only one of them still holding the file
+        # (concept attachment could otherwise pick the wrong root's
+        # match), but a single-root project can drift the exact same way.
         if md_conn is not None and (Path(hit_root) / row["path"]).exists():
             # Finding 4: prefer a symbol-level implemented_by/tested_by
             # match over a file-level one for this specific chunk.
@@ -4088,7 +4094,14 @@ def main(argv=None) -> int:
              "langs stored from the first run.",
     )
     p_code_reindex.add_argument("--no-embed", action="store_true")
-    p_code_reindex.add_argument("--full", action="store_true")
+    p_code_reindex.add_argument(
+        "--full", action="store_true",
+        help="re-chunk every file under this root even when its content and "
+             "chunker version already match the stored ones, and -- combined "
+             "with --lang -- allow that flag to drop a language from the "
+             "project's stored set instead of refusing (a plain --lang can "
+             "only add languages, never remove one)",
+    )
     p_code_reindex.add_argument(
         "--no-retry-not-indexed", dest="retry_not_indexed", action="store_false", default=True,
         help="leave not-indexed files alone unless the backend set or the chunker changed "

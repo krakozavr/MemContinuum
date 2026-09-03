@@ -1420,8 +1420,7 @@ if [ "${#CODE_ROOTS_ABS[@]}" -gt 0 ] && [ -n "$CHOSEN_LANGS" ]; then
         if [ "$DRY_RUN" -eq 0 ]; then
             out="$(PYTHONPATH= "${CODE_REINDEX_CMD[@]}" 2>&1)"
             rc=$?
-            CODE_REINDEX_OUT="${CODE_REINDEX_OUT}${out}
-"
+            CODE_REINDEX_OUT="${CODE_REINDEX_OUT:+$CODE_REINDEX_OUT$'\n'}$out"
             [ "$rc" -ne 0 ] && CODE_REINDEX_RC=$rc
         fi
     done
