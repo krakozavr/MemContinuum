@@ -4,13 +4,6 @@
 # userprompt-remind.sh, sessionend-stamp.sh). Source this from each hook
 # script; it is never executed standalone.
 #
-# hooks/newfile-nudge.sh (a PreToolUse hook) also sources this file, but
-# ONLY for mc_path_under_root below, and only lazily (right before its own
-# containment check, after every earlier early-exit) -- it deliberately
-# keeps its own separate PY/LOG/PROJECT resolution rather than adopting
-# this file's (see that file's own header for why), so most invocations
-# never pay this file's mkdir/config.sh cost at all.
-#
 # Contract mirrors pre-edit-chain.sh (docs/DESIGN.md SS8 / docs/DESIGN.md
 # ruling F): hard-clear PYTHONPATH, absolute venv python, MEMCONTINUUM_* env,
 # a single hook.log, fail-open on every path. Every hook that sources this is
@@ -53,6 +46,15 @@
 export PYTHONPATH=
 
 MC_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+
+# mc_path_under_root lives in its own side-effect-free file (symlink-paths
+# review round 1, finding 3) so hooks/newfile-nudge.sh can reach it WITHOUT
+# paying everything below this line's cost -- see mc-path-lib.sh's own
+# header. Sourcing it here costs every OTHER caller of this file nothing
+# beyond defining one more function (no I/O, no side effects of its own).
+# shellcheck source=mc-path-lib.sh
+. "$MC_LIB_DIR/mc-path-lib.sh"
+
 MC_MEMIDX="$MC_LIB_DIR/../memidx.py"
 # Python resolution order (README.md "Requirements" / memcontinuum-setup.sh):
 #   $MEMCONTINUUM_PYTHON -> $MEMCONTINUUM_HOME/config.sh -> <engine>/.venv/bin/python
@@ -334,60 +336,5 @@ mc_prune_old_state() {
     find "$dir" -maxdepth 1 -type f -name '*.json' -mmin "+$minutes" -exec rm -f {} + 2>/dev/null || true
 }
 
-# mc_path_under_root FILE_PATH ROOT
-#
-# Symlink-safe containment: does FILE_PATH's real location sit under ROOT's
-# real location? Originally hooks/newfile-nudge.sh's own fix (2026-08-31
-# review) for its PreToolUse containment check; factored out here so
-# hooks/ledger-post-edit.sh shares the SAME implementation instead of
-# keeping the plain lexical prefix match that fix already replaced in
-# newfile-nudge.sh -- one implementation, both hooks call it.
-#
-# A plain lexical `case "$FILE_PATH" in "$ROOT"/*` prefix match is fooled
-# both by a literal `/../` traversal segment (textually under ROOT while
-# actually resolving to a sibling of it) and by a symlinked ancestor
-# directory (every path segment textually under ROOT, but the real
-# directory it names lives elsewhere). Fixed bash-3.2-safe, no external
-# binaries beyond what every caller here already uses:
-#   1. reject any literal `/../` traversal segment (or a leading `../`, or
-#      a bare `..`) outright, purely as a string -- a syntactic red flag
-#      regardless of what it would resolve to.
-#   2. canonicalize ROOT and the nearest EXISTING ancestor directory of
-#      FILE_PATH (walking up via dirname -- handles both a FILE_PATH that
-#      already exists, ledger-post-edit.sh's usual case, and one that does
-#      not yet, newfile-nudge.sh's usual case) via `cd ... && pwd -P`,
-#      which resolves symlinks, and require that ancestor to sit under the
-#      canonicalized root.
-#
-# Returns WHY, not just yes/no -- newfile-nudge.sh's outcome= vocabulary
-# distinguishes these in hook.log (memidx.py stats greps it); a caller
-# that only needs yes/no (ledger-post-edit.sh) collapses every nonzero
-# into its own single out-of-scope outcome.
-#   0  under ROOT
-#   1  outside ROOT (both resolve, but FILE_PATH's ancestor is not under it)
-#   2  literal `..` traversal segment in FILE_PATH
-#   3  ROOT itself does not resolve (missing, not a directory, etc.)
-#   4  FILE_PATH has no existing ancestor to resolve from
-#   5  FILE_PATH's existing ancestor does not resolve
-mc_path_under_root() {
-    local file_path="$1" root="$2" root_real ancestor next ancestor_real
-    case "$file_path" in
-        */../*|*/..|../*|..) return 2 ;;
-    esac
-    root_real="$(cd "$root" 2>/dev/null && pwd -P)"
-    [ -n "$root_real" ] || return 3
-    ancestor="$file_path"
-    while [ ! -d "$ancestor" ]; do
-        next="$(dirname "$ancestor")"
-        if [ "$next" = "$ancestor" ]; then
-            return 4
-        fi
-        ancestor="$next"
-    done
-    ancestor_real="$(cd "$ancestor" 2>/dev/null && pwd -P)"
-    [ -n "$ancestor_real" ] || return 5
-    case "$ancestor_real" in
-        "$root_real"|"$root_real"/*) return 0 ;;
-        *) return 1 ;;
-    esac
-}
+# mc_path_under_root now lives in mc-path-lib.sh (sourced near the top of
+# this file) -- see that file's own header/doc comment.

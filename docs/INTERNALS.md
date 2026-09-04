@@ -24,8 +24,11 @@ Contents: [hooks](#hooks-and-the-fail-open-contract) ·
 
 ## Hooks and the fail-open contract
 
-Nine hook scripts live under `hooks/`, alongside two shared libraries
-(`memlib.sh`, sourced by the five write-side hooks, and `mc-watchdog.sh`).
+Nine hook scripts live under `hooks/`, alongside three shared libraries
+(`memlib.sh`, sourced by the five write-side hooks; `mc-watchdog.sh`; and
+`mc-path-lib.sh`, one pure side-effect-free function -- symlink-safe
+containment -- sourced by `memlib.sh` and directly by `newfile-nudge.sh`,
+which needs it but deliberately does not source `memlib.sh` itself).
 Seven of the nine are wired into a project's
 `.claude/settings.local.json` by `scripts/repo-init.sh`; `post-commit-reindex.sh`
 is invoked from the store's own git `post-commit`; `memcontinuum-detect.sh` is

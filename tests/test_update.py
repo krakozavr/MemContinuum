@@ -474,6 +474,111 @@ class TestUpdateWalkStaleAndOk(UpdateTestBase):
         self.assertNotIn(declined_repo, proc.stdout)
 
 
+class TestStoreFormStaleVsMismatch(UpdateTestBase):
+    """Symlink-review round 1, findings 6+7: a registry row's store=
+    disagreeing with what is actually rendered has two different causes,
+    and reporting them the same way is itself a bug. A GENUINE mismatch
+    (the row names a different store entirely) must keep failing loudly
+    as store-mismatch, exactly as before. The SAME physical store recorded
+    in an unresolved (symlinked) STRING form -- a row written before
+    Ruling 89, or by a human typing a symlinked path directly into
+    memcontinuum-decide.sh -- is not a mismatch at all: the wiring already
+    renders the physical path, and only the registry's own record of the
+    path is stale."""
+
+    def _rewrite_store_field(self, new_store):
+        """Directly (Python-side, independent of the bash fix under test)
+        rewrites ONLY the store= token of this repo's row, leaving every
+        other token exactly as memcontinuum-decide.sh (setUp) wrote it --
+        simulates a row recorded before this fix, without going through
+        the fix's own registry-write code path."""
+        path = decisions_tsv(self.home)
+        out_lines = []
+        for line in path.read_text().splitlines():
+            if line.startswith("#") or not line.strip():
+                out_lines.append(line)
+                continue
+            key, decision, when, note = line.split("\t", 3)
+            if key == self.repo:
+                tokens = [
+                    (f"store={new_store}" if t.startswith("store=") else t)
+                    for t in note.split(" ")
+                ]
+                note = " ".join(tokens)
+            out_lines.append("\t".join([key, decision, when, note]))
+        path.write_text("\n".join(out_lines) + "\n")
+
+    def _note_fields(self, note):
+        return {t.split("=", 1)[0]: t for t in note.split(" ")}
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_walk_reports_store_form_stale_with_an_apply_hint(self):
+        store_link = Path(self.tmp) / "store-link"
+        store_link.symlink_to(self.store, target_is_directory=True)
+        self._rewrite_store_field(str(store_link))
+        before = decisions_tsv(self.home).read_text()
+
+        proc = run(UPDATE_SH, [], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        rows = self.table_rows(proc.stdout)
+        self.assertEqual(rows[0]["action"], "store-form-stale", proc.stdout)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("re-run with --apply", combined, combined)
+        # Never the decide.sh `wired` remedy -- it rebuilds the note from
+        # scratch and would drop claude-dirs/code-roots/langs/never.
+        self.assertNotIn("memcontinuum-decide.sh wired", combined, combined)
+        self.assertEqual(decisions_tsv(self.home).read_text(), before,
+                         "a plain walk must never write the registry")
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_apply_rewrites_only_the_store_field(self):
+        store_link = Path(self.tmp) / "store-link"
+        store_link.symlink_to(self.store, target_is_directory=True)
+        self._rewrite_store_field(str(store_link))
+        note_before = decisions_tsv(self.home).read_text().splitlines()[-1].split("\t", 3)[3]
+
+        proc = run(UPDATE_SH, ["--apply"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("store-form-updated", proc.stdout, proc.stdout)
+
+        note_after = decisions_tsv(self.home).read_text().splitlines()[-1].split("\t", 3)[3]
+        store_real = os.path.realpath(self.store)
+        self.assertIn(f"store={store_real}", note_after, note_after)
+
+        # Every OTHER field byte-identical to before -- nothing invented,
+        # nothing dropped.
+        fields_before = self._note_fields(note_before)
+        fields_after = self._note_fields(note_after)
+        del fields_before["store"], fields_after["store"]
+        self.assertEqual(fields_after, fields_before, (note_before, note_after))
+        self.assertIn("claude-dirs", fields_after, note_after)
+        self.assertIn("code-roots", fields_after, note_after)
+        self.assertIn("langs", fields_after, note_after)
+        self.assertIn("never", fields_after, note_after)
+
+        # A re-walk now reports ok -- no re-render was needed (the wiring
+        # already rendered the physical path), and the correction sticks.
+        proc2 = run(UPDATE_SH, [], self.home)
+        rows = self.table_rows(proc2.stdout)
+        self.assertEqual(rows[0]["action"], "ok", proc2.stdout)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_a_genuinely_different_store_still_reports_store_mismatch(self):
+        """A DIFFERENT physical store (not the same one in another string
+        form) must keep failing loudly -- store-form-stale/-updated must
+        never become a loophole out of a real mismatch."""
+        other_store = str(Path(self.tmp) / "other-store")
+        marked_store(other_store)
+        self._rewrite_store_field(other_store)
+        before = decisions_tsv(self.home).read_text()
+
+        proc = run(UPDATE_SH, [], self.home)
+        rows = self.table_rows(proc.stdout)
+        self.assertEqual(rows[0]["action"], "store-mismatch", proc.stdout)
+        self.assertNotIn("store-form", proc.stdout, proc.stdout)
+        self.assertEqual(decisions_tsv(self.home).read_text(), before)
+
+
 class TestLegacyRowMigration(unittest.TestCase):
     def setUp(self):
         self.tmp = tmpdir("memcontinuum-update-legacy-test-")
@@ -1863,6 +1968,86 @@ class TestMultiDirLegacyMigrationRecoversPerDir(unittest.TestCase):
         settings = Path(self.claude_a, "settings.local.json").read_text()
         self.assertIn(f"MEMCONTINUUM_CODE_ROOT={code_c_real}", settings)
         self.assertNotIn(f"MEMCONTINUUM_CODE_ROOT={code_c}", settings)
+
+
+class TestMcPhysical(unittest.TestCase):
+    """Direct unit coverage for mc_physical (scripts/memcontinuum-update.sh)
+    -- symlink-review round 1, finding 2. mc_physical has no dependency on
+    anything else the script's top-level body computes, so its definition
+    is extracted verbatim and sourced on its own rather than running the
+    whole CLI (which parses $0's own arguments and walks the registry at
+    the top level -- not sourceable for a pure-function test)."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp(prefix="memcontinuum-mc-physical-test-")
+        self.addCleanup(shutil.rmtree, self.td, ignore_errors=True)
+        text = UPDATE_SH.read_text()
+        start = text.index("mc_physical() {")
+        end = text.index("\n}\n", start) + len("\n}\n")
+        self.func_text = text[start:end]
+        self.assertIn("CDPATH=", self.func_text,
+                      "extraction landed on the wrong/old function body")
+
+    def _call(self, arg, cdpath, cwd):
+        caller = Path(self.td) / "probe.sh"
+        caller.write_text(f'#!/usr/bin/env bash\n{self.func_text}\nmc_physical "$1"\n')
+        env = dict(os.environ)
+        env["CDPATH"] = cdpath
+        proc = subprocess.run(
+            [MC_BASH, str(caller), arg],
+            capture_output=True, text=True, env=env, cwd=cwd, timeout=10,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout
+
+    def test_cdpath_never_corrupts_the_captured_value(self):
+        """The bug (round 1, finding 2): with CDPATH set and a RELATIVE
+        argument CDPATH resolves, bash's own `cd` builtin prints the
+        matched directory to stdout (POSIX-documented CDPATH behavior)
+        BEFORE `pwd -P` runs, so an unguarded `cd "$1" && pwd -P` command
+        substitution captures TWO newline-joined lines instead of one --
+        corrupting whatever field this value feeds (and, for a registry
+        row, literally splitting one TSV line into two). Reproduced
+        directly against the fix: CDPATH points at a directory containing
+        `code-c`, the relative arg is `code-c`, and the calling cwd does
+        NOT itself contain `code-c` -- the only way this could resolve to
+        anything at all is via CDPATH, which the fix deliberately
+        disables for this one `cd` (an intentional, documented trade:
+        CDPATH-assisted search is out of scope for a resolve-the-physical-
+        path helper), so the correct fixed output is the single-line raw
+        fallback, never two lines."""
+        cdpath_base = Path(self.td) / "cdpath-base"
+        (cdpath_base / "code-c").mkdir(parents=True)
+        cwd = Path(self.td) / "elsewhere"
+        cwd.mkdir()
+        self.assertFalse((cwd / "code-c").exists(),
+                         "cwd must not resolve this on its own")
+        out = self._call("code-c", str(cdpath_base), str(cwd))
+        self.assertEqual(len(out.splitlines()), 1, f"corrupted output: {out!r}")
+        # CDPATH is deliberately disabled for this cd -- the correct fixed
+        # behavior is the raw-value fallback, not a CDPATH-assisted match.
+        self.assertEqual(out, "code-c")
+
+    def test_a_local_relative_path_still_resolves_with_cdpath_set(self):
+        """The fix must not regress the ordinary case: a relative argument
+        that resolves against cwd ALONE (no CDPATH assistance needed)
+        still resolves correctly even with an unrelated CDPATH set."""
+        cdpath_base = Path(self.td) / "unrelated-cdpath-base"
+        cdpath_base.mkdir()
+        cwd = Path(self.td) / "cwd"
+        (cwd / "local-dir").mkdir(parents=True)
+        expected = os.path.realpath(str(cwd / "local-dir"))
+        out = self._call("local-dir", str(cdpath_base), str(cwd))
+        self.assertEqual(out, expected)
+
+    def test_a_nonexistent_relative_path_falls_back_to_the_raw_value(self):
+        """No CDPATH involved at all -- a plain nonexistent relative
+        argument still gets the documented raw-value fallback, one line,
+        unchanged by this fix."""
+        cwd = Path(self.td) / "cwd2"
+        cwd.mkdir()
+        out = self._call("does-not-exist", "", str(cwd))
+        self.assertEqual(out, "does-not-exist")
 
 
 class TestStoreMissingOutranksNoWiring(UpdateTestBase):

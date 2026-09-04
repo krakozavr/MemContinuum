@@ -817,14 +817,72 @@ join_semi() {
 # existence check refuses a nonexistent root before a value from here could
 # ever reach the registry, so the fallback only ever surfaces in an error
 # message, never a written row.
+#
+# `CDPATH=` (symlink-review round 1, finding 2): with CDPATH set in the
+# operator's environment and a RELATIVE PATH that CDPATH resolves, bash's
+# `cd` builtin itself prints the matched directory to stdout (POSIX-
+# documented CDPATH behavior) BEFORE `pwd -P` runs, so the command
+# substitution would capture two newline-joined lines instead of one,
+# corrupting the value this function returns. Clearing CDPATH for just
+# this `cd` (not globally -- a local assignment on the command itself)
+# closes it while changing nothing about the resolution itself. Reproduced
+# and verified fixed directly:
+#   CDPATH=/tmp/cdpathbase; cd /tmp && (cd sub && pwd -P)       # two lines
+#   CDPATH=/tmp/cdpathbase; cd /tmp && (CDPATH= cd sub && pwd -P) # one line
 mc_physical() {
     local p
-    p="$(cd "$1" 2>/dev/null && pwd -P)"
+    p="$(CDPATH= cd "$1" 2>/dev/null && pwd -P)"
     if [ -n "$p" ]; then
         printf '%s' "$p"
     else
         printf '%s' "$1"
     fi
+}
+
+# mc_note_replace_field NOTE KEY NEW_VALUE
+#
+# Returns (printf) NOTE with KEY's token's value replaced by
+# mc_note_encode(NEW_VALUE), every OTHER token (and their order) copied
+# through byte-identical. KEY must already be present in NOTE -- this never
+# ADDS a field a row never recorded, only corrects the STRING FORM of one
+# that is already there (symlink-review round 1, finding 6+7: a row's
+# store= recorded before Ruling 89, or typed directly into
+# memcontinuum-decide.sh, may be the SAME store in an unresolved/symlinked
+# form -- correcting just that one field is safe; rebuilding the whole note
+# the way `memcontinuum-decide.sh wired` does would silently drop
+# claude-dirs/code-roots/langs/never that call never re-typed).
+mc_note_replace_field() {
+    local note="$1" key="$2" new_value="$3" tok out="" first=1
+    local -a toks=()
+    read -ra toks <<<"$note"
+    for tok in "${toks[@]:-}"; do
+        case "$tok" in
+            "$key="*) tok="$key=$(mc_note_encode "$new_value")" ;;
+        esac
+        if [ "$first" -eq 1 ]; then out="$tok"; first=0; else out="$out $tok"; fi
+    done
+    printf '%s' "$out"
+}
+
+# mc_registry_rewrite_note DECISIONS_FILE KEY NEW_NOTE
+#
+# Rewrites the ONE row matching KEY with NEW_NOTE (decision stays "wired" --
+# every caller of this function only ever reaches it for a row already
+# confirmed wired; date stamps today, matching memcontinuum-decide.sh's own
+# convention that any registry write refreshes it) -- every OTHER row is
+# copied through byte-identical, same filter-then-append pattern
+# memcontinuum-decide.sh's own rewrite uses. Atomic (temp file + rename).
+mc_registry_rewrite_note() {
+    local file="$1" key="$2" new_note="$3" line k tmp
+    tmp="$file.tmp.$$"
+    {
+        while IFS= read -r line || [ -n "$line" ]; do
+            k="${line%%"$MC_TAB"*}"
+            [ "$k" = "$key" ] && continue
+            printf '%s\n' "$line"
+        done < "$file"
+        printf '%s\t%s\t%s\t%s\n' "$key" "wired" "$(date +%Y-%m-%d)" "$new_note"
+    } > "$tmp" && mv "$tmp" "$file"
 }
 
 TABLE_HEADER_PRINTED=0
@@ -848,6 +906,7 @@ process_claude_dir() {
     local claude_dir="$1"
     local -a lines=()
     local line stamp="" store_match="unknown" action=""
+    local rendered_root="" store_form_stale=0
 
     while IFS= read -r line || [ -n "$line" ]; do
         [ -n "$line" ] && lines+=("$line")
@@ -864,6 +923,7 @@ process_claude_dir() {
         fi
         mc_command_env_value "$line" "MEMCONTINUUM_ROOT"
         if [ -n "$MC_ENV_VALUE" ] && [ -n "$STORE" ]; then
+            [ -z "$rendered_root" ] && rendered_root="$MC_ENV_VALUE"
             if [ "$MC_ENV_VALUE" = "$STORE" ]; then
                 [ "$store_match" = "unknown" ] && store_match="yes"
             else
@@ -872,6 +932,21 @@ process_claude_dir() {
         fi
     done
     [ -n "$stamp" ] || stamp="none"
+
+    # A registry row's store= disagreeing with what is actually rendered
+    # has two different causes, and they must never be reported the same
+    # way (symlink-review round 1, findings 6+7): a GENUINE mismatch (the
+    # row names a different store entirely -- store-mismatch, unchanged
+    # below) versus the SAME physical store recorded in an unresolved
+    # (symlinked) STRING form -- a row written before Ruling 89, or by a
+    # human typing a symlinked path directly into memcontinuum-decide.sh.
+    # mc_physical(STORE) == the rendered value proves the latter: nothing
+    # is actually wrong on disk, only the registry's own record of the
+    # path is stale.
+    if [ "$store_match" = "no" ] && [ -n "$rendered_root" ] \
+            && [ "$(mc_physical "$STORE")" = "$rendered_root" ]; then
+        store_form_stale=1
+    fi
 
     mc_update_rules_state "$claude_dir"
     mc_update_skill_state "$claude_dir"
@@ -919,6 +994,18 @@ process_claude_dir() {
         action="$LEGACY_ACTION"
     elif ! mc_fingerprint_match "$stamp" "$ENGINE_SHA"; then
         action="stale"
+    elif [ "$store_match" = "no" ] && [ "$store_form_stale" -eq 1 ]; then
+        # Same physical store, stale STRING form only -- never the plain
+        # store-mismatch label, and never conflated across modes: walk
+        # mode reports it (and only ever suggests --apply, never the
+        # decide.sh `wired` remedy, which would drop every other field);
+        # --apply mode's own dispatch below rewrites just the store=
+        # field and reports the DISTINCT completed-action name.
+        if [ "$APPLY" -eq 1 ]; then
+            action="store-form-updated"
+        else
+            action="store-form-stale"
+        fi
     elif [ "$store_match" = "no" ]; then
         action="store-mismatch"
     elif [ "$MC_RULES_STATE" = "missing" ]; then
@@ -932,6 +1019,15 @@ process_claude_dir() {
     fi
 
     print_row "$KEY" "$claude_dir" "$stamp" "$store_match" "$MC_RULES_STATE" "$MC_SKILL_STATE" "$action"
+
+    # store-form-stale only ever fires with APPLY=0 (see above) -- the
+    # hint's remedy is always "re-run with --apply", literally, never
+    # `memcontinuum-decide.sh wired ...` (Verdict C's own finding: that
+    # remedy rebuilds the note from scratch and silently drops every
+    # claude-dirs/code-roots/langs/never field this row already carries).
+    if [ "$action" = "store-form-stale" ]; then
+        echo "  $KEY ($claude_dir): store= is recorded in an unresolved (symlinked) form, but the wiring already renders the physical path -- nothing is actually mismatched, so re-run with --apply to correct just the registry's store= field (claude-dirs/code-roots/langs/never are left exactly as recorded)." >&2
+    fi
 
     # `no-wiring` is the one action --apply neither fixes nor fails on: a
     # claude-dir with none of this project's hook lines is a broken or
@@ -995,6 +1091,27 @@ apply_claude_dir() {
             return 0
             ;;
     esac
+
+    # store-form-updated: the SAME physical store, only its STRING form in
+    # the registry is stale (symlink-review round 1, findings 6+7) --
+    # nothing here needs a re-render (the hook lines already carry the
+    # physical path); a surgical rewrite of just the note's store= token
+    # is the whole fix, preserving claude-dirs/code-roots/langs/never
+    # byte-identical. Idempotent: a multi-claude-dir row calls this once
+    # per dir, and every call recomputes the identical corrected note from
+    # the same in-memory $NOTE/$STORE, so a second write is a harmless
+    # no-op rewrite (same content, refreshed date).
+    if [ "$action" = "store-form-updated" ]; then
+        local resolved_store new_note
+        resolved_store="$(mc_physical "$STORE")"
+        new_note="$(mc_note_replace_field "$NOTE" "store" "$resolved_store")"
+        if mc_registry_rewrite_note "$DECISIONS" "$KEY" "$new_note"; then
+            echo "  OK $claude_dir: registry store= corrected to $resolved_store (claude-dirs/code-roots/langs/never unchanged; no re-render needed -- the wiring already rendered the physical path)"
+        else
+            not_applied "  FAILED $claude_dir: could not rewrite the registry row's store= field -- see above"
+        fi
+        return 0
+    fi
 
     if ! mc_is_marked_store "$STORE"; then
         not_applied "  SKIPPED $claude_dir: store-missing -- $STORE is not an existing MemContinuum store (renamed or deleted?) -- fix the row (memcontinuum-decide.sh wired --repo ... --store NEWPATH ...) or restore the store before re-rendering"

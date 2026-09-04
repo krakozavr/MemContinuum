@@ -112,8 +112,8 @@ mkdir -p "$MEMCONTINUUM_HOME" 2>/dev/null || true
 # by project; matches memlib.sh's MC_PROJECT / pre-edit-chain.sh's own PROJECT
 # resolution -- MEMCONTINUUM_PROJECT, else basename(MEMCONTINUUM_ROOT), else
 # "default"). This hook resolves its own copy of PY/LOG/PROJECT rather than
-# adopting memlib.sh's (it sources memlib.sh only lazily, and only for
-# mc_path_under_root -- see below and memlib.sh's own header).
+# sourcing memlib.sh for them -- it never sources memlib.sh at all (see
+# hooks/mc-path-lib.sh below for the one function it does need).
 PROJECT="${MEMCONTINUUM_PROJECT:-}"
 if [ -z "$PROJECT" ]; then
     if [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
@@ -235,13 +235,17 @@ fi
 # ancestor directory (every path segment textually under the root, but
 # the real directory it names lives elsewhere). MEDIUM (2026-08-31
 # review), fixed bash-3.2-safe with no external binaries beyond what this
-# hook already uses -- mc_path_under_root (hooks/memlib.sh) now shared
-# with hooks/ledger-post-edit.sh, so this is the one implementation, not
-# two. Lazily sourced here (not at the top of this file) so every
-# earlier finish() above still short-circuits before paying memlib.sh's
-# mkdir/config.sh cost -- see that file's own header.
-# shellcheck source=memlib.sh
-source "$SCRIPT_DIR/memlib.sh"
+# hook already uses -- mc_path_under_root (hooks/mc-path-lib.sh) now
+# shared with hooks/ledger-post-edit.sh, so this is the one
+# implementation, not two. mc-path-lib.sh is a separate, side-effect-free
+# file (symlink-paths review round 1, finding 3) specifically so this
+# hook never has to source all of memlib.sh (and pay its mkdir/config.sh/
+# MC_PY cost) just to reach this one pure function -- sourced lazily here
+# regardless (not at the top of this file), so every earlier finish()
+# above still short-circuits before paying even mc-path-lib.sh's own
+# (much smaller) sourcing cost.
+# shellcheck source=mc-path-lib.sh
+source "$SCRIPT_DIR/mc-path-lib.sh"
 mc_path_under_root "$FILE_PATH" "$CODE_ROOT"
 case $? in
     0) ;;
