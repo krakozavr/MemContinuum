@@ -967,16 +967,32 @@ class TestJavaScriptExtraction(unittest.TestCase):
         result = self._chunk("basic.js")
         self.assertEqual(result.status, "ok")
         self.assertEqual(result.gaps, [])
-        self.assertEqual(len(result.chunks), 7)   # capture-count golden -- verified in the scratch venv this revision
+        # 8, not 7 (fix round 1): `boxed`, a bound function_expression (not
+        # arrow), was added to exercise javascript.scm:7's untested
+        # function_expression alternation branch (review finding 2).
+        self.assertEqual(len(result.chunks), 8)   # capture-count golden -- verified in the scratch venv this revision
         got = sorted((c["kind"], c["qualified_name"]) for c in result.chunks)
         self.assertEqual(got, sorted([
-            ("function", "plain"), ("function", "arrowed"), ("function", "DefaultNamed"),
+            ("function", "plain"), ("function", "arrowed"), ("function", "boxed"),
+            ("function", "DefaultNamed"),
             ("constructor", "Widget.constructor"), ("accessor", "Widget.value"),
             ("accessor", "Widget.value"), ("method", "Widget.render"),
         ]))
         for c in result.chunks:
             self.assertEqual(c["lang"], "javascript")
             self.assertIn(c["kind"], chunkers.KINDS)
+
+    def test_bound_function_expression_is_a_function_chunk(self):
+        # Review finding 2 (LOW): javascript.scm:7's `[(arrow_function)
+        # (function_expression)]` alternation was only ever exercised by
+        # the arrow branch (`arrowed`) -- `const boxed = function (x) {...}`
+        # is the function_expression branch, same bound-variable-declarator
+        # pattern, symbol/qn taken from the declarator's own name exactly
+        # like the arrow case.
+        result = self._chunk("basic.js")
+        boxed = [c for c in result.chunks if c["qualified_name"] == "boxed"]
+        self.assertEqual(len(boxed), 1)
+        self.assertEqual((boxed[0]["kind"], boxed[0]["symbol"]), ("function", "boxed"))
 
     def test_react_components_recall_exactly_one_chunk_per_component(self):
         # Ruling 84: verified this revision in the scratch venv, end to end
@@ -989,6 +1005,54 @@ class TestJavaScriptExtraction(unittest.TestCase):
             ("function", "Foo"), ("function", "Bar"), ("function", "default"),
         ]))
         self.assertEqual(len(result.chunks), 3)   # exactly one chunk per component
+
+    def test_anonymous_default_export_arrow_yields_one_function_default_chunk(self):
+        # Review finding 1 (MEDIUM): javascript.scm's plain (unwrapped by
+        # memo/forwardRef) anonymous `export default (arrow_function|
+        # function_expression)` pattern fired on no fixture in the original
+        # delivery. B2: "MUST emit a named chunk" -- symbol/qn "default";
+        # span is the arrow_function node's own span (`@chunk.function`,
+        # not the `export_statement` `@chunk.default` wraps -- build_chunks
+        # reads the span from whichever capture supplies the kind, and
+        # "chunk.default" is excluded from that role by name), i.e. lines
+        # 1-3 here, not the file's only line the `export default` keyword
+        # itself sits on plus anything after the trailing `;`.
+        result = self._chunk("anonymous_default_arrow.js")
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(len(result.chunks), 1)
+        c = result.chunks[0]
+        self.assertEqual((c["kind"], c["symbol"], c["qualified_name"]), ("function", "default", "default"))
+        self.assertEqual((c["start_line"], c["end_line"]), (1, 3))
+
+    def test_anonymous_default_export_function_expression_yields_one_function_default_chunk(self):
+        # Review finding 1 (MEDIUM), function_expression half of the same
+        # alternation: `export default function () {...}` (no name --
+        # `export default function Named(){}` is a DIFFERENT grammar shape,
+        # a function_declaration, already covered by basic.js).
+        result = self._chunk("anonymous_default_function.js")
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(len(result.chunks), 1)
+        c = result.chunks[0]
+        self.assertEqual((c["kind"], c["symbol"], c["qualified_name"]), ("function", "default", "default"))
+        self.assertEqual((c["start_line"], c["end_line"]), (1, 3))
+
+    def test_default_export_forwardref_function_expression_span_is_the_inner_callable(self):
+        # Review finding 2 (LOW): the memo/forwardRef-wrapped DEFAULT-EXPORT
+        # pattern (javascript.scm:16-21) was only exercised by its
+        # arrow_function branch (react_components.jsx's `export default
+        # memo(() => {})`) -- this fixture is the function_expression
+        # branch, `export default forwardRef(function (props, ref) {...})`.
+        # Symbol/qn "default" (no @chunk.name on this pattern); span is the
+        # inner function_expression's own lines (3-5), never the wrapping
+        # `forwardRef(...)` call or the `export default` keyword's line (1
+        # is the import, so a wrapper-span bug would show up as (1, 5) or
+        # (3, 5) starting one line early -- this pins the exact span).
+        result = self._chunk("default_export_forwardref.js")
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(len(result.chunks), 1)
+        c = result.chunks[0]
+        self.assertEqual((c["kind"], c["symbol"], c["qualified_name"]), ("function", "default", "default"))
+        self.assertEqual((c["start_line"], c["end_line"]), (3, 5))
 
     def test_no_callable_file_yields_zero_chunks_status_ok(self):
         result = self._chunk("no_callable.js")

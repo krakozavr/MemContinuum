@@ -4,6 +4,8 @@ function plain(a, b) {
 
 const arrowed = (x) => x * 2;
 
+const boxed = function (x) { return x - 1; };
+
 export default function DefaultNamed() {
   return null;
 }
