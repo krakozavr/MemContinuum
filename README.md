@@ -414,9 +414,16 @@ it with `--code-root`, `--langs` and `--set-never-ext` on the command line.
 
 The code index handles **Swift and Python**, both natively — Swift with a tuned
 walker, Python with the standard library's own parser — plus **JavaScript,
-TypeScript (TSX included), Java, PHP, Rust, and Lua** through tree-sitter: one
-generic backend, a grammar and a query file per language, so a new language
-in this tier is a data row and a query, not a new parser.
+TypeScript, TSX, Java, PHP, Rust, and Lua** through tree-sitter: one generic
+backend, a grammar and a query file per language, so a new language in this
+tier is a data row and a query, not a new parser.
+
+TypeScript and TSX are two languages here, not one. `--lang typescript` covers
+`.ts` files; `.tsx` files need `--lang tsx`, and the census offers `tsx` as its
+own proposal alongside `typescript`. A React project wants both. They share one
+grammar and one query file, which is why they behave identically otherwise —
+but wiring only `typescript` leaves every `.tsx` file unindexed, and the
+provenance line at the end of `code-reindex` says so by extension.
 
 A project chooses its languages once, at install, through the census dialogue
 above — not by flag guesswork. `--lang` is **required on a project's first**

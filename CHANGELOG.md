@@ -3,14 +3,21 @@
 ## [0.2.0rc3] — unreleased
 
 ### Languages
-- The code index now chunks JavaScript, TypeScript (TSX included), Java,
-  PHP, Rust, and Lua, alongside the existing native Swift and Python
-  support -- one shared tree-sitter backend, a grammar and a query file per
-  language, so search, `why`, and the linter's symbol check cover these six
-  languages exactly as they already did Swift and Python. `backend-preflight`
-  reports which language backends import in this python, by name; a file a
-  backend cannot chunk is recorded not-indexed rather than dropped, and is
-  retried automatically once the missing grammar is installed.
+- The code index chunks JavaScript, TypeScript, TSX, Java, PHP, Rust, and
+  Lua, alongside the existing native Swift and Python support -- one shared
+  tree-sitter backend, a grammar and a query file per language, so search,
+  `why`, and the linter's symbol check cover them the same way they cover
+  Swift and Python. TypeScript and TSX are two separate `--lang` values
+  sharing one grammar: `--lang typescript` covers `.ts`, `.tsx` files need
+  `--lang tsx`, and the census proposes each on its own.
+  `backend-preflight` reports which language backends import in this
+  python, by name; a file a backend cannot chunk is recorded not-indexed
+  rather than dropped, and is retried automatically once the missing
+  grammar is installed.
+- One difference from the native pair, because a tree-sitter grammar wheel
+  is an optional dependency: where a grammar is not installed, the linter's
+  `#symbol` check reports a warning naming the missing wheel and leaves the
+  record valid, instead of failing on a symbol it cannot read.
 
 ## [0.2.0rc2] — 2026-09-03
 
