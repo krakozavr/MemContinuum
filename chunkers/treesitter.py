@@ -125,7 +125,7 @@ import importlib
 import importlib.metadata
 import os
 
-from . import BackendUnavailable, ChunkResult, LANGUAGE_TABLE
+from . import BackendUnavailable, ChunkingFailed, ChunkResult, LANGUAGE_TABLE
 
 QUERY_DIR = os.path.join(os.path.dirname(__file__), "queries")
 
@@ -163,7 +163,7 @@ ENGINE_VERSION = "2"
 WRAPPER_NODE_TYPES = frozenset({"export_statement"})
 
 
-class TreeSitterFileTooLarge(Exception):
+class TreeSitterFileTooLarge(ChunkingFailed):
     """Revision 4, binding ruling 87 (replaces the removed
     TreeSitterTimeout -- signal.alarm does not bound wall-clock parse
     time, measured, see the module docstring). A file's encoded byte
@@ -683,10 +683,26 @@ class TreeSitterChunker:
         return ChunkResult(chunks, gaps, status)
 
     def declared_symbols(self, text):
-        try:
-            result = self.chunk_file(text, "<memlint>")
-        except Exception:
-            return []
+        """The file's symbol vocabulary, as (symbol, qualified_name) pairs.
+
+        External gate finding 7: a file this backend could not chunk RAISES
+        here -- it never comes back as an empty vocabulary. Over the byte
+        cap raises TreeSitterFileTooLarge, a parse that produced nothing at
+        all raises ChunkingFailed, and any other failure inside chunk_file
+        propagates as itself. An empty list is one specific answer -- "this
+        file parsed, and it declares no callables" -- and memlint turns it
+        into a hard error on a record that names a symbol. A file nothing
+        could be read from must not produce that error; its caller
+        (memidx.fragment_declaration_status) maps every exception here onto
+        the tri-state's "uncheckable" verdict, which memlint reports as a
+        warning naming the reason.
+
+        A PARTIAL parse still answers with what it read: some of the file
+        is unreadable, but the chunks that survived are real declarations,
+        and the gaps are already reported by the surfaces that show them."""
+        result = self.chunk_file(text, "<memlint>")
+        if result.status == "failed":
+            raise ChunkingFailed(f"{self.lang}: the file did not parse")
         seen = set()
         out = []
         for c in result.chunks:

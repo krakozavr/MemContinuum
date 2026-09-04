@@ -801,6 +801,155 @@ class TestTreeSitterRegistry(unittest.TestCase):
 
 
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestSharedEngineImportFailureDegrades(unittest.TestCase):
+    """External gate finding 6. A missing grammar WHEEL was already
+    fail-open; the shared engine module itself was not. chunkers.treesitter
+    is a module like any other -- a half-applied edit or a packaging fault
+    can make it unimportable -- and every tree-sitter row's registry lookup
+    goes through it, so the failure escaped as a bare ModuleNotFoundError
+    out of get_chunker, backend_availability and chunker_version, the three
+    doors code-search, why and every reindex walk through.
+
+    `sys.modules['chunkers.treesitter'] = None` is the reviewers' own probe
+    for it: python raises ModuleNotFoundError on the next import of a name
+    bound to None. All three doors must answer "this backend cannot run
+    here" instead."""
+
+    @contextlib.contextmanager
+    def _engine_unimportable(self):
+        engine = chunkers.treesitter
+        engine.reset_cache()
+        # BOTH halves have to go. An engine that genuinely fails to import
+        # leaves no sys.modules entry AND no attribute on the package; a
+        # process that already imported it holds both, and `from . import
+        # treesitter` reads the attribute without consulting sys.modules at
+        # all -- so patching sys.modules alone would be a probe of nothing.
+        del chunkers.treesitter
+        try:
+            with mock.patch.dict(sys.modules, {"chunkers.treesitter": None}):
+                yield
+        finally:
+            chunkers.treesitter = engine
+            sys.modules["chunkers.treesitter"] = engine
+            engine.reset_cache()
+
+    def test_get_chunker_reports_backend_unavailable(self):
+        with self._engine_unimportable():
+            with self.assertRaises(chunkers.BackendUnavailable) as ctx:
+                chunkers.get_chunker("javascript")
+        self.assertIn("chunkers.treesitter", str(ctx.exception))
+
+    def test_backend_availability_reports_the_rows_missing_not_raises(self):
+        with self._engine_unimportable():
+            avail = chunkers.backend_availability()
+        for lang in ("javascript", "typescript", "tsx", "java", "php", "rust", "lua"):
+            self.assertIn(f"{lang}=missing", avail, avail)
+        self.assertIn("python=ok", avail, avail)   # native rows are a different engine
+
+    def test_chunker_version_still_answers(self):
+        with self._engine_unimportable():
+            cv = chunkers.chunker_version("javascript")
+        self.assertRegex(cv, r"^[0-9a-f]{12}$")
+        # A sentinel payload, so it cannot collide with the fingerprint a
+        # working engine computes -- the files stay marked stale and are
+        # re-examined once the engine imports again.
+        self.assertNotEqual(cv, chunkers.chunker_version("javascript"))
+
+    def test_code_search_survives_it(self):
+        """The first of the two memidx entry points the gate names: a
+        code-search over an index whose language rows all belong to the
+        broken engine must report, not crash. chunker_version is reached
+        per file from code_index_report with only an `except KeyError`
+        around it, which is where this used to die before get_chunker was
+        ever consulted."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            (root / "a.js").write_text("function findable_symbol(){ return 1; }\n")
+            db_path = Path(td) / "code.sqlite"
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                rc = code_reindex(root, db_path, project="engine-gone",
+                                  no_embed=True, lang="javascript")
+            self.assertEqual(rc, 0, out.getvalue())
+            with self._engine_unimportable():
+                buf, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+                    rc = memidx.cmd_code_search(ns(
+                        db=str(db_path), project="engine-gone", query="findable_symbol",
+                        mode="fts", limit=5, json=False, decision_db=None,
+                        no_heal=False, heal_limit=500,
+                    ))
+            self.assertEqual(rc, 0, buf.getvalue() + err.getvalue())
+
+    def test_why_s_symbol_vocabulary_check_survives_it(self):
+        """The second entry point: `why`'s disk-scan fallback resolves a
+        symbol through fragment_declaration_status, which must answer
+        "cannot tell" rather than raise."""
+        with self._engine_unimportable():
+            verdict, reason = memidx.fragment_declaration_status(
+                "findable_symbol", "function findable_symbol(){}\n", rel_path="a.js"
+            )
+            self.assertIsNone(verdict)
+            self.assertIn("chunkers.treesitter", reason)
+            self.assertIsNone(memidx.fragment_declared_in_text(
+                "findable_symbol", "function findable_symbol(){}\n", rel_path="a.js"
+            ))
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestDeclaredSymbolsSeparatesFailureFromAbsence(unittest.TestCase):
+    """External gate finding 7. `declared_symbols` returned an empty list
+    for a file it could not chunk at all, and an empty list is a positive
+    claim: this file parsed and declares nothing. memlint reads it that way
+    and errors on any `#symbol` fragment pointing into the file -- so a file
+    over the per-file byte cap turned every valid record naming a symbol in
+    it into a lint error.
+
+    A file the backend cannot read is UNCHECKABLE: the tri-state's None,
+    which memlint reports as a warning naming the reason, exactly as it
+    already does for a language whose backend cannot run here at all."""
+
+    OVER_CAP = "function valid_symbol(){ return 1; }\n" + ("// filler\n" * 200)
+
+    def test_over_cap_file_raises_instead_of_answering_empty(self):
+        chunkers.treesitter.reset_cache()
+        with mock.patch.dict(os.environ, {"MEMCONTINUUM_MAX_PARSE_BYTES": "64"}):
+            backend = chunkers.get_chunker("javascript")
+            with self.assertRaises(chunkers.ChunkingFailed):
+                backend.declared_symbols(self.OVER_CAP)
+        chunkers.treesitter.reset_cache()
+
+    def test_over_cap_file_is_uncheckable_not_proof_of_absence(self):
+        chunkers.treesitter.reset_cache()
+        with mock.patch.dict(os.environ, {"MEMCONTINUUM_MAX_PARSE_BYTES": "64"}):
+            verdict, reason = memidx.fragment_declaration_status(
+                "valid_symbol", self.OVER_CAP, rel_path="big.js"
+            )
+        chunkers.treesitter.reset_cache()
+        self.assertIsNone(verdict)
+        self.assertIn("TreeSitterFileTooLarge", reason)
+
+    def test_a_file_that_did_not_parse_is_uncheckable_too(self):
+        chunkers.treesitter.reset_cache()
+        verdict, reason = memidx.fragment_declaration_status(
+            "valid_symbol", "@@@ not javascript at all @@@\n", rel_path="broken.js"
+        )
+        chunkers.treesitter.reset_cache()
+        self.assertIsNone(verdict)
+        self.assertIn("ChunkingFailed", reason)
+
+    def test_a_readable_file_still_proves_a_symbol_absent(self):
+        chunkers.treesitter.reset_cache()
+        verdict, reason = memidx.fragment_declaration_status(
+            "no_such_symbol", "function other(){}\n", rel_path="a.js"
+        )
+        self.assertFalse(verdict)
+        self.assertEqual(reason, "")
+        self.assertIsNotNone(verdict, "an absent symbol stays a hard error, not a warning")
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
 class TestTreeSitterFingerprint(unittest.TestCase):
     def test_chunker_version_never_imports_tree_sitter(self):
         with mock.patch.dict(sys.modules, {"tree_sitter": None, "tree_sitter_javascript": None}):

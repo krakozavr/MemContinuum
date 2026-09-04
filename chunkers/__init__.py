@@ -136,10 +136,29 @@ class ChunkResult:
         self.status = status        # "ok" | "partial" | "failed"
 
 
+ENGINE_UNAVAILABLE = "engine-unavailable"
+
+
 class BackendUnavailable(Exception):
     """A LANGUAGE_TABLE backend that cannot run here (missing wheel,
     provider init failure). The indexer records the file as not-indexed
     and retries on the next explicit run, or when availability changes."""
+
+
+class ChunkingFailed(Exception):
+    """One FILE this backend could not chunk -- it did not parse, or it is
+    over the per-file byte cap. Registry-wide, not one backend's private
+    type, because it is part of the `declared_symbols` half of the
+    contract: a backend answers with the file's symbol vocabulary, or it
+    raises, and it never flattens a failure into an empty vocabulary.
+
+    The distinction is what keeps memlint honest. "This file declares no
+    such symbol" is an ERROR on a record that names one; "this file's
+    vocabulary is unknown to me" is a WARNING naming the reason. An empty
+    list means the first, so a file that failed to chunk must not return
+    one. Different from BackendUnavailable, which is about the backend
+    rather than the file: that one says nothing in this language can be
+    read here."""
 
 
 def get_chunker(lang):
@@ -164,7 +183,20 @@ def get_chunker(lang):
         except Exception as exc:
             raise BackendUnavailable(f"{lang}: {type(exc).__name__}: {exc}") from exc
     if row["backend"] == "tree-sitter":
-        from . import treesitter
+        # The SHARED engine's own import is inside the guard, not above it:
+        # `chunkers.treesitter` is a module like any other and can fail to
+        # import for reasons that have nothing to do with a grammar wheel (a
+        # syntax error in a half-applied edit, a packaging fault that ships
+        # the package without it). That is still "this engine cannot run
+        # this backend here", the answer BackendUnavailable exists to give,
+        # and it must reach code-search and why as an unavailable backend
+        # rather than as an exception out of a registry lookup.
+        try:
+            from . import treesitter
+        except Exception as exc:
+            raise BackendUnavailable(
+                f"{lang}: {row['module']}: {type(exc).__name__}: {exc}"
+            ) from exc
         return treesitter.for_language(lang)
     raise BackendUnavailable(f"{lang}: unknown backend {row['backend']!r}")
 
@@ -175,13 +207,21 @@ def backend_availability():
     that code-reindex/heal compare against on a later run to decide
     whether a not-indexed row is worth another try (Anatomy M2a binding
     point 1). Recomputed on every call (no internal caching) -- callers
-    that need it more than once per run cache the single value locally."""
+    that need it more than once per run cache the single value locally.
+
+    Fail-open per row, and not only on BackendUnavailable: this fingerprint
+    is computed on the way into code-search, why and every reindex, none of
+    which may crash because one row's backend has an import bug of its own.
+    A row that raises anything at all reads as `missing` -- the same answer,
+    with the same retry behavior, as a row whose wheel is absent."""
     parts = []
     for lang in sorted(LANGUAGE_TABLE):
         try:
             get_chunker(lang)
             parts.append(f"{lang}=ok")
         except BackendUnavailable:
+            parts.append(f"{lang}=missing")
+        except Exception:
             parts.append(f"{lang}=missing")
     return ";".join(parts)
 
@@ -294,7 +334,23 @@ def chunker_version(lang):
     if row["backend"] == "native":
         payload = f"{row['backend']}:{row['module']}:{row['impl_version']}"
     elif row["backend"] == "tree-sitter":
-        from . import treesitter
+        try:
+            from . import treesitter
+        except Exception:
+            # Same fail-open shape query_fingerprint's QUERY_UNREADABLE
+            # sentinel has, for the same reason: chunker_version is reached
+            # from heal_code_index and code_index_report with only a
+            # `except KeyError` around it, one call per file, so an import
+            # failure here would take down a whole code-search or reindex
+            # walk. It degrades to a fixed token that no successful payload
+            # can collide with -- the stored fingerprint stops matching, so
+            # every file of this language is re-examined once the engine
+            # imports again -- and the fault itself surfaces inside the
+            # per-file guard as the BackendUnavailable get_chunker raises.
+            return hashlib.sha256(
+                f"{row['backend']}:{row['module']}:{ENGINE_UNAVAILABLE}:"
+                f"{row['grammar_module']}:{row['impl_version']}".encode()
+            ).hexdigest()[:12]
         installed = ",".join(
             f"{dist}={version}"
             for dist, _pin, version in treesitter.pinned_vs_installed(row)

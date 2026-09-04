@@ -63,10 +63,12 @@ def _symbol_declaration_status(frag: str, text: str, rel_path: str) -> tuple:
     language-specific branch anywhere on this path.
 
     Tri-state, `(verdict, reason)`: True/False are the backend's own
-    answer, None means the backend for that language cannot run in this
-    python (an optional grammar wheel this interpreter lacks) and `reason`
-    names it. lint_concept warns on None and errors only on False -- see
-    that call site."""
+    answer, None means nothing could be read -- the backend for that
+    language does not run in this python (an optional grammar wheel this
+    interpreter lacks), or it runs and could not read this file (over the
+    per-file byte cap, or it did not parse) -- and `reason` says which.
+    lint_concept warns on None and errors only on False -- see that call
+    site."""
     return fragment_declaration_status(frag, text, rel_path=rel_path)
 
 
@@ -312,18 +314,23 @@ def lint_concept(
                         frag, text, rel_path=ref_path
                     )
                     if declared is None:
-                        # The chunker backend for this file's language does
-                        # not run in this python, so the symbol is neither
-                        # proven present nor proven absent. A record stays
-                        # VALID across that gap: the grammar wheel is
-                        # optional, an install pointed at an interpreter
-                        # without it is supported, and every other surface
-                        # fails open on the same gap. Naming the wheel is
-                        # the whole remedy -- install it and the check runs.
+                        # Nothing could be read: either the chunker backend
+                        # for this file's language does not run in this
+                        # python (an optional grammar wheel it lacks), or it
+                        # runs and could not read this particular file (over
+                        # the per-file byte cap, or it did not parse). The
+                        # symbol is neither proven present nor proven
+                        # absent, and a record stays VALID across either
+                        # gap: every other surface fails open on both -- the
+                        # file lands not-indexed and is retried, the index
+                        # reports itself incomplete. The reason says which
+                        # gap this is and names the wheel when that is what
+                        # it is; backend-preflight reports the same thing
+                        # for the whole machine.
                         warnings.append(
                             f"{path}: {cid} {field} fragment {frag!r} is not checked -- "
-                            f"no chunker backend for {ref_path!r} in this python ({reason}); "
-                            f"install the grammar it names, or run backend-preflight"
+                            f"{ref_path!r} is uncheckable in this python ({reason}); "
+                            f"run backend-preflight to see which backends run here"
                         )
                     elif not declared:
                         errors.append(

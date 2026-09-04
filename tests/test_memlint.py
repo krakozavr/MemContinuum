@@ -594,6 +594,31 @@ class TestMissingGrammarWheelIsAWarningNotAnError(unittest.TestCase):
             f"with the wheel present, an absent symbol is still a hard error: {errors}",
         )
 
+    def test_a_file_over_the_byte_cap_warns_and_names_the_reason(self):
+        """External gate finding 7. A file the backend could not chunk at
+        all -- here, one over the per-file byte cap -- is UNCHECKABLE, not
+        proof its symbols are absent. The symbol below really is declared in
+        the file; before this the empty vocabulary made it a hard error.
+
+        The cap is lowered rather than a megabyte of filler written, and the
+        instance cache is reset on both sides because a chunker instance is
+        cached per (lang, chunker_version) and the cap is part of that
+        fingerprint."""
+        chunkers.treesitter.reset_cache()
+        try:
+            with mock.patch.dict(os.environ, {"MEMCONTINUUM_MAX_PARSE_BYTES": "8"}):
+                errors, warnings = self._lint("widget.js#widget_loader", self.JS_SOURCE)
+        finally:
+            chunkers.treesitter.reset_cache()
+        self.assertEqual(
+            [e for e in errors if "widget_loader" in e], [],
+            f"a file that could not be chunked must not fail the lint: {errors}",
+        )
+        named = [w for w in warnings if "widget_loader" in w]
+        self.assertEqual(len(named), 1, warnings)
+        self.assertIn("uncheckable", named[0])
+        self.assertIn("TreeSitterFileTooLarge", named[0])
+
 
 if __name__ == "__main__":
     unittest.main()
