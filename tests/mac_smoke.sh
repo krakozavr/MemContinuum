@@ -2,12 +2,13 @@
 # tests/mac_smoke.sh -- Anatomy M2b B7 portability smoke: a PARSER PROBE,
 # nothing wider.
 #
-# Pgrep-guards ShotPorter on the target host FIRST, before any command
-# that could touch the machine runs -- abort with a named message if
-# ShotPorter.app is open (the owner's standing rule: never build/test on
-# the Mac mini while it is open). Only once that guard clears does this
-# script go over SSH at all: it creates a disposable temp venv with the
-# EXPLICIT login-shell python3 (never bare `python3` over a remote shell
+# Pgrep-guards the app process named in tests/mac_smoke.local (or the
+# MC_MAC_SMOKE_GUARD_PROCESS env var) on the target host FIRST, before any
+# command that could touch the machine runs -- abort with a named message
+# if that app is open (the owner's standing rule: never build/test on the
+# Mac mini while the guarded app is open). Only once that guard clears
+# does this script go over SSH at all: it creates a disposable temp venv
+# with the EXPLICIT login-shell python3 (never bare `python3` over a remote shell
 # -- that resolves Apple's own /usr/bin/python3 3.9.6, which cannot
 # install these wheels), installs the seven tree-sitter pins BY VERSION,
 # copies this repo's own chunkers/ package over, and for one real fixture
@@ -40,6 +41,24 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# Resolve the guard process name -- what the pgrep guard below checks for
+# on the target host -- BEFORE anything else runs, dry run included: this
+# is the one required source of that name, and this repo's public tracked
+# content must never name the actual app (see tests/test_repo_init.py's
+# TestNoMachineIdentifyingContent). $MC_MAC_SMOKE_GUARD_PROCESS wins if
+# set; otherwise the first line of $MC_MAC_SMOKE_GUARD_FILE (default
+# tests/mac_smoke.local, untracked and gitignored) is used. Neither
+# source set is a hard abort -- fail closed, no default name, no ssh.
+GUARD_FILE="${MC_MAC_SMOKE_GUARD_FILE:-$REPO_ROOT/tests/mac_smoke.local}"
+GUARD_PROCESS="${MC_MAC_SMOKE_GUARD_PROCESS:-}"
+if [ -z "$GUARD_PROCESS" ] && [ -f "$GUARD_FILE" ]; then
+    GUARD_PROCESS="$(head -n 1 "$GUARD_FILE")"
+fi
+if [ -z "$GUARD_PROCESS" ]; then
+    echo "ERROR: guard process name is unset -- set MC_MAC_SMOKE_GUARD_PROCESS or create $GUARD_FILE (one line, the process name to pgrep-guard on the target host)" >&2
+    exit 1
+fi
+
 MAC_PYTHON="/Library/Frameworks/Python.framework/Versions/3.14/bin/python3"
 LOCAL_PYTHON="${MEMCONTINUUM_PYTHON:-python3}"
 
@@ -67,14 +86,14 @@ if [ -z "$PINS" ]; then
 fi
 
 if [ "$DRY_RUN" -eq 1 ]; then
-    echo "dry run: would pgrep-guard ShotPorter on $HOST, then install:"
+    echo "dry run: would pgrep-guard $GUARD_PROCESS on $HOST, then install:"
     printf '%s\n' "$PINS"
     exit 0
 fi
 
-# pgrep-guard ShotPorter before any other ssh call touches the host.
-if ssh -o ConnectTimeout=8 "$HOST" pgrep -x ShotPorter >/dev/null 2>&1; then
-    echo "ERROR: ShotPorter.app is running on $HOST -- abort (never build/test while it's open)" >&2
+# pgrep-guard the resolved process name before any other ssh call touches the host.
+if ssh -o ConnectTimeout=8 "$HOST" pgrep -x "$GUARD_PROCESS" >/dev/null 2>&1; then
+    echo "ERROR: $GUARD_PROCESS is running on $HOST -- abort (never build/test while it's open)" >&2
     exit 1
 fi
 

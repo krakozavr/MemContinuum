@@ -1332,6 +1332,60 @@ class TestNoMachineIdentifyingContent(unittest.TestCase):
             entries.append((meta.split()[0], rel))
         return entries
 
+    @staticmethod
+    def _untracked_entries():
+        """[(mode, path)] for files git sees in the working tree but does not
+        yet track (`git ls-files -o --exclude-standard`) -- a brand-new file
+        sitting in a working tree before its own `git add`. CI only ever
+        scans committed content, so without this a needle-bearing file could
+        sit untracked, pass this test locally, then reach origin on a later
+        `git add -A` elsewhere and only be caught by CI (or not at all, if
+        that CI run is the one adding it). `--exclude-standard` means a
+        gitignored file (tests/mac_smoke.local, by design) never appears
+        here. Mode is always the regular-file sentinel: `git ls-files -o`
+        reports no stat/type info, and an untracked symlink is out of scope
+        the same way test_no_tracked_symlinks scopes the tracked case."""
+        result = subprocess.run(
+            ["git", "ls-files", "-o", "--exclude-standard"], cwd=str(TOOLS_DIR),
+            capture_output=True, text=True, check=True,
+        )
+        return [("100644", rel) for rel in result.stdout.splitlines() if rel]
+
+    @classmethod
+    def _needles(cls):
+        username_needle = "kra" + "kozavr"
+        path_needle = "/mnt/d/!_WORK_" + "!"
+        project_needles = ["mmd" + "-swift", "MMD" + "App", "MMD" + "Core", "Shot" + "Porter"]
+        return [username_needle, path_needle] + project_needles
+
+    @classmethod
+    def _scan_for_needles(cls, entries):
+        """The needle scan test_only_license_names_the_dev_machine performs,
+        factored out so a regression test can prove it also catches an
+        untracked offender."""
+        needles = cls._needles()
+        offenders = {}
+        for mode, rel in entries:
+            p = TOOLS_DIR / rel
+            if mode == "120000":
+                try:
+                    hits = [n for n in needles if n in os.readlink(p)]
+                except OSError:
+                    hits = []
+                if hits:
+                    offenders[rel] = hits
+                continue
+            if not p.is_file():
+                continue
+            try:
+                text = p.read_text(errors="ignore")
+            except Exception:
+                continue
+            hits = [n for n in needles if n in text]
+            if hits:
+                offenders[rel] = hits
+        return offenders
+
     def test_no_tracked_symlinks(self):
         """A tracked symlink is refused outright in this repo. Its blob content
         is the link target, so a link created for local convenience -- e.g. a
@@ -1363,39 +1417,21 @@ class TestNoMachineIdentifyingContent(unittest.TestCase):
         )
 
     def test_only_license_names_the_dev_machine(self):
-        username_needle = "kra" + "kozavr"
-        path_needle = "/mnt/d/!_WORK_" + "!"
         # The private codebase this engine is developed against must not be
         # named either -- not its checkout, not its module prefixes, not its
         # product name. Its symbols and probe queries describe that project's
         # internal architecture, so they live in an untracked probe file
         # (tests/test_code_index.py load_probe_set) rather than in tracked
-        # content. Same split-literal trick as the two needles above.
-        project_needles = ["mmd" + "-swift", "MMD" + "App", "MMD" + "Core", "Shot" + "Porter"]
-        needles = [username_needle, path_needle] + project_needles
-        offenders = {}
-        for mode, rel in self._tracked_entries():
-            p = TOOLS_DIR / rel
-            if mode == "120000":
-                # Read the LINK, not what it points at (test_no_tracked_symlinks
-                # already refuses these outright; this keeps the content scan
-                # honest if that rule is ever relaxed).
-                try:
-                    hits = [n for n in needles if n in os.readlink(p)]
-                except OSError:
-                    hits = []
-                if hits:
-                    offenders[rel] = hits
-                continue
-            if not p.is_file():
-                continue
-            try:
-                text = p.read_text(errors="ignore")
-            except Exception:
-                continue
-            hits = [n for n in needles if n in text]
-            if hits:
-                offenders[rel] = hits
+        # content. Same split-literal trick as the two needles above (see
+        # _needles()).
+        #
+        # Scans tracked AND untracked-but-not-gitignored entries (see
+        # _untracked_entries): a file already `git add`ed is not the only way
+        # a needle reaches a future commit -- a new file sitting in the
+        # working tree, one `git add -A` away from being swept in, is exactly
+        # as dangerous and CI alone would only catch it after the fact.
+        entries = self._tracked_entries() + self._untracked_entries()
+        offenders = self._scan_for_needles(entries)
         # LICENSE's copyright line is the one deliberate exception (and only
         # counts as one if/when LICENSE is actually tracked by git).
         disallowed = {rel: hits for rel, hits in offenders.items() if rel != "LICENSE"}
@@ -1403,6 +1439,30 @@ class TestNoMachineIdentifyingContent(unittest.TestCase):
             disallowed, {},
             f"machine-identifying content found outside the allowed LICENSE exception: {disallowed}",
         )
+
+    def test_untracked_offender_is_reported(self):
+        """Regression test for the scan's untracked coverage: a file that is
+        neither tracked nor gitignored -- e.g. a brand-new file before its
+        own `git add` -- must still be caught. Writes a real temp file
+        directly into this checkout (both `_tracked_entries` and
+        `_untracked_entries` shell out to `git ls-files` with cwd=TOOLS_DIR,
+        so there is no copied-repo indirection available here as there is
+        for the repo-init.sh tests), and removes it in `finally` regardless
+        of outcome."""
+        probe = TOOLS_DIR / "tests" / "_needle_probe_untracked.txt"
+        self.assertFalse(probe.exists(), "stray probe file left over from a previous run")
+        try:
+            probe.write_text("kra" + "kozavr", encoding="utf-8")
+            entries = self._untracked_entries()
+            rels = {rel for _, rel in entries}
+            self.assertIn(
+                "tests/_needle_probe_untracked.txt", rels,
+                "git ls-files -o --exclude-standard did not report the new untracked file",
+            )
+            offenders = self._scan_for_needles(entries)
+            self.assertIn("tests/_needle_probe_untracked.txt", offenders)
+        finally:
+            probe.unlink(missing_ok=True)
 
 
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
