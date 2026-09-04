@@ -38,3 +38,8 @@ mod util {
 trait Named {
     fn name(&self) -> String;
 }
+
+/* Adds two numbers. */
+fn add_two(a: i32, b: i32) -> i32 {
+    a + b
+}

@@ -954,14 +954,25 @@ class TestTreeSitterDedupPriority(unittest.TestCase):
         self.assertEqual(len(deduped), 2)
 
 
+def _tree_sitter_chunk(lang, corpus, name):
+    """Shared helper for every Test*Extraction class below (Task 7 fix
+    round 1, finding 9): reset the tree-sitter instance cache, read `name`
+    from `corpus`, and run it through `lang`'s registered chunker. Hoisted
+    from six identical per-class `_chunk` bodies (JS, TS, TSX, Java, PHP,
+    Rust) -- each class still keeps a thin `_chunk(self, name)` wrapper
+    (its own `self.CORPUS` differs), but none of them duplicate this
+    reset/read/chunk logic any more."""
+    chunkers.treesitter.reset_cache()
+    text = (corpus / name).read_text()
+    return chunkers.get_chunker(lang).chunk_file(text, name)
+
+
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
 class TestJavaScriptExtraction(unittest.TestCase):
     CORPUS = REPO_ROOT / "tests" / "fixtures" / "javascript_corpus"
 
     def _chunk(self, name):
-        chunkers.treesitter.reset_cache()
-        text = (self.CORPUS / name).read_text()
-        return chunkers.get_chunker("javascript").chunk_file(text, name)
+        return _tree_sitter_chunk("javascript", self.CORPUS, name)
 
     def test_basic_recall_and_capture_count(self):
         result = self._chunk("basic.js")
@@ -1102,9 +1113,7 @@ class TestTypeScriptExtraction(unittest.TestCase):
     CORPUS = REPO_ROOT / "tests" / "fixtures" / "typescript_corpus"
 
     def _chunk(self, name):
-        chunkers.treesitter.reset_cache()
-        text = (self.CORPUS / name).read_text()
-        return chunkers.get_chunker("typescript").chunk_file(text, name)
+        return _tree_sitter_chunk("typescript", self.CORPUS, name)
 
     def test_basic_recall_skips_overload_signatures(self):
         result = self._chunk("basic.ts")
@@ -1171,9 +1180,7 @@ class TestTsxExtraction(unittest.TestCase):
     CORPUS = REPO_ROOT / "tests" / "fixtures" / "tsx_corpus"
 
     def _chunk(self, name):
-        chunkers.treesitter.reset_cache()
-        text = (self.CORPUS / name).read_text()
-        return chunkers.get_chunker("tsx").chunk_file(text, name)
+        return _tree_sitter_chunk("tsx", self.CORPUS, name)
 
     def test_react_components_recall_exactly_one_chunk_per_component(self):
         # Ruling 84: re-verified this revision against the real
@@ -1280,9 +1287,7 @@ class TestJavaExtraction(unittest.TestCase):
     CORPUS = REPO_ROOT / "tests" / "fixtures" / "java_corpus"
 
     def _chunk(self, name):
-        chunkers.treesitter.reset_cache()
-        text = (self.CORPUS / name).read_text()
-        return chunkers.get_chunker("java").chunk_file(text, name)
+        return _tree_sitter_chunk("java", self.CORPUS, name)
 
     def test_widget_recall_excludes_interface_and_abstract_signatures(self):
         result = self._chunk("Widget.java")
@@ -1366,8 +1371,9 @@ class TestJavaExtraction(unittest.TestCase):
         self.assertEqual(got, sorted([
             ("method", "greet", "Container.Greeter.greet"),
             ("method", "label", "Container.Color.label"),
+            ("method", "addTwo", "Container.addTwo"),
         ]))
-        self.assertEqual(len(result.chunks), 2)
+        self.assertEqual(len(result.chunks), 3)
         # doc_comment_types' OTHER branch (line_comment) -- Widget.java's
         # own doc test above only exercises block_comment; label() has a
         # `//` line above it so both members of the java row's tuple are
@@ -1377,15 +1383,27 @@ class TestJavaExtraction(unittest.TestCase):
             by_qname["Container.Color.label"]["doc"], "Human-readable label for this color."
         )
 
+    def test_single_line_javadoc_lands_in_its_chunk_doc(self):
+        # Fix round 1, finding 2: Widget.java's own Javadoc test above
+        # (test_javadoc_block_above_a_method_lands_in_its_chunk_doc) only
+        # ever exercised the MULTI-line `/** \n * text \n */` form, where
+        # _doc_for's line-by-line loop returns on the first non-empty line
+        # (the `* text` line) and never reaches the closing `*/` line --
+        # so it never exercised the bug a single-line Javadoc surfaces:
+        # `/** Javadoc. */` used to yield doc == "Javadoc. */", the
+        # trailing delimiter surviving untouched. Container.addTwo's
+        # single-line Javadoc is that regression test.
+        result = self._chunk("InterfaceAndEnum.java")
+        by_qname = {c["qualified_name"]: c for c in result.chunks}
+        self.assertEqual(by_qname["Container.addTwo"]["doc"], "Javadoc.")
+
 
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
 class TestPhpExtraction(unittest.TestCase):
     CORPUS = REPO_ROOT / "tests" / "fixtures" / "php_corpus"
 
     def _chunk(self, name):
-        chunkers.treesitter.reset_cache()
-        text = (self.CORPUS / name).read_text()
-        return chunkers.get_chunker("php").chunk_file(text, name)
+        return _tree_sitter_chunk("php", self.CORPUS, name)
 
     def test_widget_recall_with_embedded_html(self):
         result = self._chunk("widget.php")
@@ -1489,9 +1507,7 @@ class TestRustExtraction(unittest.TestCase):
     CORPUS = REPO_ROOT / "tests" / "fixtures" / "rust_corpus"
 
     def _chunk(self, name):
-        chunkers.treesitter.reset_cache()
-        text = (self.CORPUS / name).read_text()
-        return chunkers.get_chunker("rust").chunk_file(text, name)
+        return _tree_sitter_chunk("rust", self.CORPUS, name)
 
     def test_widget_recall_impl_trait_mod_qualification(self):
         result = self._chunk("widget.rs")
@@ -1503,8 +1519,10 @@ class TestRustExtraction(unittest.TestCase):
             ("method", "Greeter.greet"),        # trait default method
             ("method", "Widget.greet"),         # impl Greeter for Widget -- qualified by the TYPE
             ("function", "util.helper"),        # mod, not a type -- stays `function`
+            ("function", "add_two"),            # single-line block comment above it (fix round 1)
         ]))
-        self.assertEqual(len(result.chunks), 6)   # capture-count golden
+        self.assertEqual(len(result.chunks), 7)   # capture-count golden --
+        # 6 in the brief's own text, +1 for `add_two` (fix round 1, finding 1/2)
         # Coverage rule: bodyless declarations must not produce chunks.
         # widget.rs's own `trait Named { fn name(&self) -> String; }` has a
         # signature with no default body -- verified against the real
@@ -1513,8 +1531,26 @@ class TestRustExtraction(unittest.TestCase):
         # `function_item`, so rust.scm's single pattern (which only matches
         # `function_item` and additionally requires `body: (block)`) never
         # captures it. No chunk named "name" should exist anywhere in the
-        # 6 chunks above.
+        # 7 chunks above.
         self.assertNotIn("name", {c["symbol"] for c in result.chunks})
+
+    def test_single_line_block_comment_lands_in_its_chunk_doc(self):
+        # Fix round 1, findings 1+2: rust's own doc_comment_types row
+        # declares ("line_comment", "block_comment") but only line_comment
+        # had a committed test (see test_triple_slash_doc_comment_lands_in_
+        # its_chunk_doc below) -- block_comment was verified only by a
+        # one-off manual probe during Task 7's original development, per
+        # the review. That probe surfaced a real, pre-existing
+        # chunkers/treesitter.py bug (shared by every language whose
+        # doc_comment_types includes a block-comment type, not specific to
+        # rust): `_doc_for` stripped only the LEFT-hand comment markers, so
+        # a SINGLE-LINE block comment `/* Adds two numbers. */` used to
+        # yield doc == "Adds two numbers. */" -- the closing delimiter
+        # survived. Both are fixed together: widget.rs's own `add_two` has
+        # `/* Adds two numbers. */` immediately above it.
+        result = self._chunk("widget.rs")
+        by_qname = {c["qualified_name"]: c for c in result.chunks}
+        self.assertEqual(by_qname["add_two"]["doc"], "Adds two numbers.")
 
     def test_no_callable_file(self):
         result = self._chunk("no_callable.rs")

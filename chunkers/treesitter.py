@@ -341,13 +341,33 @@ def _render_signature(data, node):
 
 
 def _doc_for(row, data, node):
+    """Task 7 fix round 1, finding 2: marker-stripping is now symmetric.
+    Before this fix, a line was only ever stripped on its LEFT
+    (`lstrip("/*# -")`) -- correct for a multi-line block comment (`/**` on
+    its own opening line strips to "", `* text` on the next line strips its
+    leading `*` and returns "text" before the closing `*/` line is ever
+    reached) but wrong for a SINGLE-LINE block comment, where the opening
+    and closing markers share one line: `/* Adds two numbers. */` used to
+    yield `"Adds two numbers. */"`, the trailing delimiter surviving
+    untouched. Fixed by stripping an exact trailing `*/` (plus the
+    whitespace before it) off each line BEFORE the existing left-strip
+    runs, rather than a blanket `rstrip` of `*/` characters -- a blanket
+    rstrip would also eat a trailing `/` from an ordinary line comment that
+    happens to end in one (e.g. a URL), which this line-by-line, suffix-only
+    check never touches: a `//`/`///`/`#` line comment never ends with the
+    literal two-character sequence "*/", so this new step is a no-op for
+    every non-block-comment language row, matching the fix's "no other
+    language regresses" requirement."""
     prev = node.prev_sibling
     doc_types = row.get("doc_comment_types", ("comment",))
     if prev is None or prev.type not in doc_types:
         return ""
     text = data[prev.start_byte:prev.end_byte].decode("utf-8", "replace")
     for line in text.splitlines():
-        stripped = line.strip().lstrip("/*# -").strip()
+        line = line.strip()
+        if line.endswith("*/"):
+            line = line[:-2].rstrip()
+        stripped = line.lstrip("/*# -").strip()
         if stripped:
             return stripped
     return ""

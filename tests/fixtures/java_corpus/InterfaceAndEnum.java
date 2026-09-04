@@ -13,4 +13,9 @@ public class Container {
             return "color";
         }
     }
+
+    /** Javadoc. */
+    static int addTwo(int a, int b) {
+        return a + b;
+    }
 }
