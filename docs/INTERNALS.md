@@ -918,7 +918,19 @@ language branch on that path.
 `chunker_version(lang)` is the first 12 hex of a sha256 over
 `backend:module:impl_version` for a native row, stored per file in `file_sha`
 alongside the content sha. A file is skipped on reindex only when **both**
-match. A source-sha-only skip would serve chunks from a superseded chunker
+match.
+
+A native row that declares `interpreter_sensitive` — the Python row does, the
+Swift row does not — adds this python's own `major.minor` to that payload.
+Python chunks through `ast.parse`, whose accepted syntax and node shapes move
+with CPython, so the interpreter is part of that chunker the way an installed
+grammar wheel is part of a tree-sitter one: without it, every already-indexed
+`.py` file whose bytes did not change would be left as-is under a parser that
+can now read it differently. `major.minor` only — a patch release does not move
+the grammar, and re-chunking every project on a 3.12.7 → 3.12.8 bump is the cost
+the stamp exists to avoid. Swift is a hand-written lexer over `re` and string
+operations, with no interpreter-provided parser behind it, so its own source
+fingerprint and `impl_version` already cover it. A source-sha-only skip would serve chunks from a superseded chunker
 forever after a backend change — a one-way door. Bumping a row's
 `impl_version` is therefore the supported way to force re-chunking of one
 language's files.

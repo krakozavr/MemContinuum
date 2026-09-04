@@ -40,6 +40,11 @@ TOOLS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(TOOLS_DIR))
 
 import chunkers  # noqa: E402
+# Explicit: `chunkers.treesitter` is a submodule the package imports lazily, so
+# the attribute exists only once something has imported it. Tests here call
+# chunkers.treesitter.reset_cache(), which passed only because another test
+# module in the same discover run happened to import it first.
+import chunkers.treesitter  # noqa: E402,F401
 import memidx  # noqa: E402
 import memlint  # noqa: E402
 

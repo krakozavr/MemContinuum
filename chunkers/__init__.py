@@ -10,6 +10,7 @@ there is no API to register a second backend for an existing language.
 import hashlib
 import importlib
 import os
+import sys
 
 KINDS = frozenset({"function", "method", "constructor", "accessor", "closure"})
 
@@ -41,6 +42,20 @@ LANGUAGE_TABLE = {
     "python": {"backend": "native", "module": "chunkers.python_ast",
                "extensions": (".py",), "shebangs": ("python", "python3"),
                "impl_version": "1",
+               # This row chunks through `ast.parse`, so the INTERPRETER is
+               # part of its chunker the way a grammar wheel is part of a
+               # tree-sitter row's: the accepted syntax and the node shapes
+               # move with CPython, and this repo's own CI runs a 3.12/3.13
+               # matrix. Without the interpreter in chunker_version, every
+               # already-indexed .py file whose bytes did not change is left
+               # as-is under a parser that can now read it differently --
+               # the gap ruling 108 closed for the tree-sitter tier by
+               # hashing the installed runtime. The swift row does NOT
+               # declare this: chunkers/swift.py is a hand-written lexer
+               # over `re` and str operations, with no interpreter-version
+               # -sensitive parse behind it, so its source fingerprint plus
+               # impl_version already covers it.
+               "interpreter_sensitive": True,
                "skip_dirs": frozenset({"build", "dist"})},
     "javascript": {"backend": "tree-sitter", "module": "chunkers.treesitter",
                     "grammar_module": "tree_sitter_javascript", "language_fn": "language",
@@ -340,6 +355,18 @@ def chunker_version(lang):
     Reads LANGUAGE_TABLE fresh on every call (no caching) so a patched
     impl_version is reflected immediately.
 
+    A native row that declares `interpreter_sensitive` adds this python's
+    own major.minor (ruling 112). The python row chunks through
+    `ast.parse`, whose accepted syntax and node shapes move with CPython,
+    so the interpreter is part of that chunker exactly as an installed
+    grammar wheel is part of a tree-sitter one -- and the reindex skip is
+    `prev_sha == sha and prev_cv == cv`, so a payload that ignored the
+    interpreter would leave every already-indexed .py file marked current
+    across an upgrade. Only major.minor: a patch release does not move the
+    grammar, and re-chunking every project on a 3.12.7 -> 3.12.8 bump is
+    the cost this stamp exists to avoid. The swift row declares nothing:
+    it is a hand-written lexer, not a parser this interpreter provides.
+
     A tree-sitter row's payload is wider, because a tree-sitter row's
     output depends on more than its own module name: the shared engine's
     ENGINE_VERSION (one generic module produces every tree-sitter row's
@@ -373,6 +400,8 @@ def chunker_version(lang):
     row = LANGUAGE_TABLE[lang]
     if row["backend"] == "native":
         payload = f"{row['backend']}:{row['module']}:{row['impl_version']}"
+        if row.get("interpreter_sensitive"):
+            payload += f":python{sys.version_info[0]}.{sys.version_info[1]}"
     elif row["backend"] == "tree-sitter":
         try:
             from . import treesitter

@@ -1078,6 +1078,11 @@ class TestTreeSitterFingerprint(unittest.TestCase):
         before = chunkers.chunker_version("javascript")
         probes = {
             "containers": {"class_declaration": "name", "probe_declaration": "name"},
+            # prefix_scopes drives qualified_name for a declaration that
+            # scopes what FOLLOWS it (PHP's `namespace A;`) rather than what
+            # it holds; the javascript row declares none, so gaining one is
+            # the edit under test.
+            "prefix_scopes": {"probe_definition": "name"},
             "method_if_ancestor_in": frozenset({"probe_item"}),
             "doc_comment_types": ("comment", "probe_comment"),
             "max_bytes": 4096,
@@ -1186,13 +1191,53 @@ class TestTreeSitterFingerprint(unittest.TestCase):
     def test_row_shape_ignores_the_order_a_row_is_written_in(self):
         # Sorted, so reordering a row's own containers is not a rechunk.
         row = dict(chunkers.LANGUAGE_TABLE["typescript"])
+        row["prefix_scopes"] = {"alpha_definition": "name", "beta_definition": "name"}
         shuffled = dict(row)
         shuffled["containers"] = {"module": "name", "internal_module": "name",
                                   "class_declaration": "name",
                                   "abstract_class_declaration": "name"}
+        shuffled["prefix_scopes"] = {"beta_definition": "name", "alpha_definition": "name"}
         self.assertEqual(
             chunkers.treesitter.row_shape(row), chunkers.treesitter.row_shape(shuffled)
         )
+
+    def test_chunker_version_of_a_native_row_moves_with_the_interpreter(self):
+        """Ruling 112. chunkers.python_ast chunks through `ast.parse`, whose
+        accepted syntax and node shapes move with CPython, and the reindex
+        skip is `prev_sha == sha and prev_cv == cv` -- so an interpreter
+        upgrade with no payload change would leave every already-indexed .py
+        file as-is under a parser that can read it differently. This is the
+        gap ruling 108 closed for the tree-sitter tier by hashing the
+        installed runtime, carried to the native tier that needs it.
+
+        Swift does not: it is a hand-written lexer over `re` and string
+        operations, with no interpreter-provided parser behind it, so its own
+        source fingerprint and impl_version already cover it."""
+        before_py = chunkers.chunker_version("python")
+        before_swift = chunkers.chunker_version("swift")
+        # A plain tuple: sys.version_info itself cannot be instantiated,
+        # and chunker_version reads it by index.
+        faked = (3, 99, 0, "final", 0)
+        with mock.patch.object(sys, "version_info", faked):
+            self.assertNotEqual(
+                chunkers.chunker_version("python"), before_py,
+                "a python row must re-fingerprint on an interpreter minor-version change",
+            )
+            self.assertEqual(
+                chunkers.chunker_version("swift"), before_swift,
+                "swift's lexer does not move with the interpreter",
+            )
+        self.assertEqual(chunkers.chunker_version("python"), before_py)
+
+    def test_chunker_version_of_a_native_row_ignores_the_patch_level(self):
+        """major.minor only: a patch release does not move the grammar, and
+        re-chunking every project on a 3.12.7 -> 3.12.8 bump is exactly the
+        cost the version stamp exists to avoid."""
+        before = chunkers.chunker_version("python")
+        bumped = (sys.version_info[0], sys.version_info[1],
+                  sys.version_info[2] + 1, "final", 0)
+        with mock.patch.object(sys, "version_info", bumped):
+            self.assertEqual(chunkers.chunker_version("python"), before)
 
     def test_typescript_and_tsx_are_independent_cached_instances(self):
         chunkers.treesitter.reset_cache()
