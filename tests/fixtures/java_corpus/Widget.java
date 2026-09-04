@@ -5,6 +5,9 @@ public class Widget {
         this.x = x;
     }
 
+    /**
+     * Returns the current value.
+     */
     public int getValue() {
         return x;
     }

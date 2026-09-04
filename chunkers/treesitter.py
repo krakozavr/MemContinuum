@@ -340,9 +340,10 @@ def _render_signature(data, node):
     return " ".join(text.split())
 
 
-def _doc_for(data, node):
+def _doc_for(row, data, node):
     prev = node.prev_sibling
-    if prev is None or prev.type not in ("comment",):
+    doc_types = row.get("doc_comment_types", ("comment",))
+    if prev is None or prev.type not in doc_types:
         return ""
     text = data[prev.start_byte:prev.end_byte].decode("utf-8", "replace")
     for line in text.splitlines():
@@ -413,7 +414,7 @@ def build_chunks(lang, row, data, root, matches):
             continue
         chunks.append({
             "kind": e["kind"], "symbol": e["symbol"], "qualified_name": e["qualified_name"],
-            "signature": _render_signature(data, node), "doc": _doc_for(data, node),
+            "signature": _render_signature(data, node), "doc": _doc_for(row, data, node),
             "start_line": node.start_point[0] + 1, "end_line": node.end_point[0] + 1,
         })
 

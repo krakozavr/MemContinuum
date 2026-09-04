@@ -488,5 +488,12 @@ class TestJavaSymbolRouting(unittest.TestCase):
         self.assertTrue(memidx.fragment_declared_in_text("W.getValue", text, rel_path="W.java"))
 
 
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestPhpSymbolRouting(unittest.TestCase):
+    def test_php_symbol_fragment_routes_through_the_registry(self):
+        text = "<?php\nfunction widget_loader() {\n  return 1;\n}\n"
+        self.assertTrue(memidx.fragment_declared_in_text("widget_loader", text, rel_path="a.php"))
+
+
 if __name__ == "__main__":
     unittest.main()

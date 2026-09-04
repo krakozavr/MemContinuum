@@ -1334,3 +1334,115 @@ class TestJavaExtraction(unittest.TestCase):
             ("method", "Outer.outerMethod"), ("method", "Outer.Inner.innerMethod"),
         ]))
         self.assertEqual(len(result.chunks), 2)
+
+    def test_javadoc_block_above_a_method_lands_in_its_chunk_doc(self):
+        # Task 5 review, ruling 94: _doc_for's hardcoded ("comment",) check
+        # never matched Java's own comment node types (block_comment,
+        # line_comment), so every Java chunk's `doc` was "" regardless of a
+        # real Javadoc block sitting right above it. LANGUAGE_TABLE's java
+        # row now carries doc_comment_types=("block_comment",
+        # "line_comment"); Widget.java's getValue() has a /** ... */ block
+        # immediately above it (verified against the real grammar: node
+        # type "block_comment").
+        result = self._chunk("Widget.java")
+        by_qname = {c["qualified_name"]: c for c in result.chunks}
+        self.assertEqual(by_qname["Widget.getValue"]["doc"], "Returns the current value.")
+        # The constructor has no comment above it -- doc stays empty, not a
+        # leftover from some other chunk.
+        self.assertEqual(by_qname["Widget.Widget"]["doc"], "")
+
+    def test_interface_default_method_and_enum_method_are_qualified_by_their_container(self):
+        # Task 5 review finding 1: the java row's `interface_declaration`
+        # and `enum_declaration` container entries had no shipped fixture
+        # exercising them -- Widget.java's own `interface Greeter` and (no
+        # enum at all) never produced a chunk in the first place, since
+        # `greet()` there has no body and the query requires one. This
+        # fixture gives both containers a method WITH a body so the query
+        # actually captures it, then asserts the full (kind, symbol,
+        # qualified_name) triple through both container types.
+        result = self._chunk("InterfaceAndEnum.java")
+        self.assertEqual(result.status, "ok")
+        got = sorted((c["kind"], c["symbol"], c["qualified_name"]) for c in result.chunks)
+        self.assertEqual(got, sorted([
+            ("method", "greet", "Container.Greeter.greet"),
+            ("method", "label", "Container.Color.label"),
+        ]))
+        self.assertEqual(len(result.chunks), 2)
+        # doc_comment_types' OTHER branch (line_comment) -- Widget.java's
+        # own doc test above only exercises block_comment; label() has a
+        # `//` line above it so both members of the java row's tuple are
+        # actually reached, not just declared.
+        by_qname = {c["qualified_name"]: c for c in result.chunks}
+        self.assertEqual(
+            by_qname["Container.Color.label"]["doc"], "Human-readable label for this color."
+        )
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestPhpExtraction(unittest.TestCase):
+    CORPUS = REPO_ROOT / "tests" / "fixtures" / "php_corpus"
+
+    def _chunk(self, name):
+        chunkers.treesitter.reset_cache()
+        text = (self.CORPUS / name).read_text()
+        return chunkers.get_chunker("php").chunk_file(text, name)
+
+    def test_widget_recall_with_embedded_html(self):
+        result = self._chunk("widget.php")
+        self.assertEqual(result.status, "ok")
+        got = sorted((c["kind"], c["qualified_name"]) for c in result.chunks)
+        self.assertEqual(got, sorted([
+            ("function", "top_level"), ("constructor", "Widget.__construct"),
+            ("method", "Widget.render"), ("method", "Greets.greet"),
+        ]))
+        self.assertEqual(len(result.chunks), 4)   # capture-count golden
+
+    def test_no_callable_pure_html_file(self):
+        result = self._chunk("no_callable.php")
+        self.assertEqual((result.status, result.chunks, result.gaps), ("ok", [], []))
+
+    def test_whole_file_syntax_error(self):
+        result = self._chunk("syntax_error.php")
+        self.assertEqual(result.status, "failed")
+
+    def test_localized_error_is_partial(self):
+        # Deviation from the brief's literal fixture (see task-6-report.md):
+        # the brief's unclosed `(` in `broken`'s header does not confine the
+        # ERROR node the way the brief's asserted result requires --
+        # verified against the real grammar: the ERROR span absorbs
+        # `alsoGood`'s own header as a misparsed parameter inside
+        # `broken`'s formal_parameters list, merging both into ONE
+        # function_definition node (no query pattern can capture what isn't
+        # its own function_definition). error_recovery.php's fixture
+        # instead uses a malformed expression (`return @@@;`, PHP's
+        # error-suppression operator applied to a missing operand) inside
+        # `broken`'s otherwise well-formed header+body -- the grammar
+        # leaves a single zero-width MISSING token confined to `broken`'s
+        # own span, so `good` and `alsoGood` both parse as clean,
+        # untainted function_definition nodes; only `broken`'s span
+        # overlaps the taint and is dropped as a gap. Same shape as the
+        # Java ErrorRecovery.java deviation from Task 5.
+        result = self._chunk("error_recovery.php")
+        self.assertEqual(result.status, "partial")
+        names = {c["qualified_name"] for c in result.chunks}
+        self.assertEqual(names, {"good", "alsoGood"})
+
+    def test_nested_function_is_kept_separate_from_the_outer_one(self):
+        result = self._chunk("nested_calls.php")
+        self.assertEqual(result.status, "ok")
+        got = sorted((c["kind"], c["qualified_name"]) for c in result.chunks)
+        self.assertEqual(got, sorted([("function", "outer"), ("function", "inner")]))
+        self.assertEqual(len(result.chunks), 2)
+
+    def test_docblock_above_a_function_lands_in_its_chunk_doc(self):
+        # Task 5 review, ruling 94: PHP's own comment node type is
+        # "comment" (verified against the real grammar -- both /** */
+        # docblocks and // line comments), matching _doc_for's default, so
+        # the php row needs no doc_comment_types override; this asserts
+        # that default actually reaches a PHP docblock end to end.
+        result = self._chunk("doc_comment.php")
+        self.assertEqual(result.status, "ok")
+        by_qname = {c["qualified_name"]: c for c in result.chunks}
+        self.assertEqual(
+            by_qname["compute_total"]["doc"], "Computes the widget total."
+        )
