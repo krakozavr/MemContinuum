@@ -1209,12 +1209,16 @@ non-official-org grammar — this is the reusable rule, not a one-off
 exception for Lua.
 
 `tests/mac_smoke.sh` installs the six tree-sitter grammar wheels and the tree-sitter runtime by exact version
-into a disposable venv and proves each grammar builds a parser and query and
-parses a real fixture on real Mac hardware — a parser probe, and nothing
-wider. It is not a substitute for the macOS arm64 CI job, which installs the
-full hash-locked `requirements.lock` and runs the whole unit test suite
-(`fastembed`/`onnxruntime` included): a green run of one says nothing about
-the other, and neither reading covers what the other checks.
+into a disposable venv, copies this repo's own `chunkers/` package over, and
+for one real fixture per language runs it through the same
+`chunkers.get_chunker(lang).chunk_file(...)` entry point the local suite
+uses — proving each grammar builds a parser and query, parses the fixture on
+real Mac hardware, and reproduces the exact `(kind, qualified_name)` chunk
+identities `tests/test_chunkers.py` already golds for that file. It is a
+parser probe, and nothing wider: not a substitute for the macOS arm64 CI job,
+which installs the full hash-locked `requirements.lock` and runs the whole
+unit test suite (`fastembed`/`onnxruntime` included). A green run of one says
+nothing about the other, and neither reading covers what the other checks.
 
 ### Skip predicate
 

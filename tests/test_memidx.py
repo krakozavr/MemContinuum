@@ -1667,6 +1667,23 @@ class TestF4CodeRefMatches(unittest.TestCase):
     def test_fragment_only_code_ref_matches_no_path(self):
         self.assertFalse(memidx.code_ref_matches("/home/x/src/foo.py", "#Foo"))
 
+    def test_double_hash_code_ref_splits_on_the_first_hash_only(self):
+        # "widget.js##m" is a real shape: a JavaScript private member keeps
+        # its own "#" in its symbol (chunkers/treesitter.py), so a code_ref
+        # naming one is "<path>#<#symbol>" -- two hashes, not one. Every
+        # code_ref splitter in this codebase (memlint.py:252/420,
+        # code_ref_is_named/code_ref_matches/concept_matches_for_chunk here)
+        # splits on the FIRST "#" only (str.partition / str.split(..., 1)),
+        # so this resolves to path "widget.js" and fragment "#m" -- the
+        # private member's own symbol, hash included -- never an empty
+        # fragment and never a path of "widget.js#".
+        ref_str = "widget.js##m"
+        ref_path, _, frag = ref_str.partition("#")
+        self.assertEqual((ref_path, frag), ("widget.js", "#m"))
+        self.assertTrue(memidx.code_ref_matches("widget.js", ref_str))
+        self.assertFalse(memidx.code_ref_matches("widget.js.bak", ref_str))
+        self.assertTrue(memidx.fragment_matches_symbol(frag, "#m", "Widget.#m"))
+
 
 class TestF5LinkRows(unittest.TestCase):
     def _topic_with_two_links(self, td):
