@@ -15,6 +15,14 @@
   full suite, and re-runs the shell-driving suites under the actual bash
   3.2.57 macOS ships, rather than only a bash-3.2-on-Ubuntu simulation.
 
+### Hooks
+- A session that begins with `/clear` now initializes session state the
+  same way a fresh session does, so the coverage and look-back nudges keep
+  firing for the rest of that session instead of going silent. A file
+  edited before the `/clear` that is still unmapped to a decision stays
+  visible to the coverage nudge; turn counts and injection cooldowns reset
+  to a fresh baseline.
+
 ## [0.2.0rc1] — unreleased
 
 ### Code index

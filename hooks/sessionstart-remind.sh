@@ -16,18 +16,31 @@
 #                        continuation: /clear commonly fires on the SAME
 #                        session_id an earlier startup already created state
 #                        for (a /clear mid-process, same CLI run), so unlike
-#                        resume it must DISCARD whatever state is already on
-#                        disk for this session_id before the setdefault init
-#                        below runs -- a leftover ledger/turn-count/pending
-#                        from before the clear would misfire the coverage/
-#                        look-back nudges against turns the cleared context
-#                        no longer has, and a stale SessionEnd `ended_at`
-#                        stamp has no business surviving into a session that
-#                        is still running. The discard happens inside the
-#                        same locked mc_update_state_json transform (state =
-#                        {} at the top, only for clear) so there is no
-#                        separate unlocked delete step and no window where a
-#                        concurrent read sees a half-reset file.
+#                        resume it must DISCARD most of whatever state is
+#                        already on disk for this session_id before the
+#                        setdefault init below runs -- a leftover turn-count/
+#                        pending/look-back baseline from before the clear
+#                        would misfire the coverage/look-back nudges against
+#                        turns the cleared context no longer has, and a stale
+#                        SessionEnd `ended_at` stamp has no business
+#                        surviving into a session that is still running. ONE
+#                        field survives the discard: `ledger` (the edited-
+#                        but-not-yet-mapped-to-a-decision file list) is
+#                        carried over as-is -- userprompt-remind.sh's
+#                        coverage check (`memidx.py unmapped`) classifies
+#                        candidates *only* from `state["ledger"]`, never from
+#                        a tree walk, so wiping it would make any file edited
+#                        before the clear that is still genuinely unmapped
+#                        invisible to the coverage nudge for the rest of the
+#                        session, unless it happens to be touched again post-
+#                        clear -- silent evidence loss of exactly the kind
+#                        this project treats as zero-tolerance. The
+#                        discard-plus-carry-ledger happens inside the same
+#                        locked mc_update_state_json transform (state
+#                        rebuilt to just {"ledger": ...} at the top, only for
+#                        clear) so there is no separate unlocked delete step
+#                        and no window where a concurrent read sees a half-
+#                        reset file.
 #   compact           -- read state.pending (written by precompact-persist.sh
 #                         right before compaction), and if it holds anything,
 #                         inject it ONCE via hookSpecificOutput.additionalContext
@@ -127,9 +140,12 @@ case "${SOURCE:-}" in
 import os, time
 
 # INC-0108: clear discards whatever this session_id had on disk before the
-# setdefault init below runs -- see the header comment above.
+# setdefault init below runs, EXCEPT `ledger` -- see the header comment
+# above for why the ledger alone survives.
 if os.environ.get("MC_SOURCE") == "clear":
+    _prior_ledger = state.get("ledger") or []
     state = {}
+    state["ledger"] = _prior_ledger
 
 state.setdefault("session_id", os.environ.get("MC_SESSION_ID", ""))
 state.setdefault("project", os.environ.get("MC_PROJECT_ENV", ""))

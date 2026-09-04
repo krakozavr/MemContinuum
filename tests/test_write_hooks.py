@@ -1227,14 +1227,17 @@ class TestSessionStartRemind(HookTestBase):
         session_id an earlier startup already created state for (a /clear
         mid-process). Unlike resume (which must preserve the original
         startup's values via setdefault), clear must DISCARD that leftover
-        state and start empty -- a stale ledger/turn-count/pending left over
-        from before the clear would misfire the coverage/look-back nudges
+        state and start empty -- a stale turn-count/pending left over from
+        before the clear would misfire the coverage/look-back nudges
         against turns the cleared context no longer has, and a stale
         sessionend `ended_at` stamp has no business surviving into a session
-        that is still running."""
+        that is still running. Ledger carryover is NOT exercised here (kept
+        empty throughout) -- see test_clear_carries_over_ledger_so_
+        pre_clear_coverage_still_fires for that, the one field that must
+        survive the discard."""
         session_id = "s-start-clear-reset"
         stale_code_sha = "0" * 40
-        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+        self.seed_ledger(session_id, [])
         self.patch_state(
             session_id,
             start_code_sha=stale_code_sha,
@@ -1270,6 +1273,54 @@ class TestSessionStartRemind(HookTestBase):
         self.assertEqual(state.get("lookback_count"), 0)
         self.assertNotIn("pending", state)
         self.assertNotIn("ended_at", state)
+
+    def test_clear_carries_over_ledger_so_pre_clear_coverage_still_fires(self):
+        """Review round 1, HIGH finding: userprompt-remind.sh's coverage
+        check (`memidx.py unmapped`) classifies candidate paths ONLY from
+        state["ledger"] -- it never walks the code tree. If clear wiped the
+        ledger along with everything else, a file edited BEFORE the clear
+        that is still genuinely unmapped would drop out of coverage
+        candidacy until touched again post-clear -- silent evidence loss.
+        This drives the real regression scenario end to end: a ledger entry
+        seeded before the clear, no new edit after it, and the very next
+        userprompt after the clear must still surface that file."""
+        session_id = "s-start-clear-ledger-carryover"
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+        self.patch_state(
+            session_id,
+            user_turn_count=17,
+            last_inject_turn=12,
+            last_inject_time=123.0,
+            last_inject_ts=123.0,
+            last_injected_pairs=[["src/unmapped.py", "somehash"]],
+            last_growth_turn=9,
+            last_growth_ts=100.0,
+            lookback_count=3,
+        )
+
+        payload = self.session_start_payload(session_id, source="clear")
+        proc, _ = run_script(SESSIONSTART_HOOK, payload, self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        state = self.load_state(session_id)
+        ledger_paths = [e.get("path") for e in state.get("ledger") or []]
+        self.assertIn(str(self.code_root / "src" / "unmapped.py"), ledger_paths)
+        self.assertEqual(state.get("user_turn_count"), 0)
+        self.assertEqual(state.get("last_inject_turn"), -999)
+        self.assertEqual(state.get("last_injected_pairs"), [])
+        self.assertEqual(state.get("last_growth_turn"), 0)
+        self.assertEqual(state.get("lookback_count"), 0)
+
+        # No re-seeding, no new edit -- the very next real userprompt call
+        # must still surface the pre-clear file.
+        up_proc, _ = run_script(
+            USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.base_env()
+        )
+        self.assertEqual(up_proc.returncode, 0, up_proc.stderr)
+        self.assertIn("Coverage signal", up_proc.stdout)
+        self.assertIn("src/unmapped.py", up_proc.stdout)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=injected", log_text)
 
     def test_clear_then_userprompt_is_served_not_no_state(self):
         """INC-0108 end-to-end pin: a real SessionStart(source=clear) followed
