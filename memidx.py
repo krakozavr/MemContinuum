@@ -1846,9 +1846,67 @@ def fragment_matches_symbol(frag: str, symbol: str, qualified_name: str) -> bool
     return frag == symbol or frag == qualified_name or qualified_name.endswith("." + frag)
 
 
-def fragment_declared_in_text(frag: str, text: str, rel_path: str) -> bool:
-    """memlint's #symbol vocabulary check (memlint.py's lint_concept): is
-    `frag` a symbol actually DECLARED in `text`?
+_GENERIC_UNCHECKABLE_REMEDY = (
+    "run backend-preflight, and check whether this file itself can be read"
+)
+
+
+def _uncheckable_remedy(exc) -> str:
+    """What a person does about an exception that made a file uncheckable.
+
+    Read off the exception CLASS, which is the failure class: chunkers'
+    BackendUnavailable and ChunkingFailed and treesitter's
+    TreeSitterFileTooLarge each declare their own `remedy` beside their own
+    docstring. Nothing here classifies a message string, and a backend that
+    raises something none of them cover still gets a usable sentence rather
+    than the wrong one."""
+    return getattr(exc, "remedy", "") or _GENERIC_UNCHECKABLE_REMEDY
+
+
+def fragment_declaration_status(frag: str, text: str, rel_path: str) -> tuple:
+    """memlint's #symbol vocabulary check (memlint.py's lint_concept),
+    tri-state: is `frag` a symbol actually DECLARED in `text`?
+
+    Returns `(verdict, reason, remedy)`. `verdict` is True (the backend read
+    the text and found the symbol), False (the backend read the text and the
+    symbol is not there), or None -- nothing could be read, so NOTHING is
+    known about the symbol either way. `reason` says which and `remedy` what
+    to do about it; both are empty for every other verdict.
+
+    Two things produce None, they are different failures with the same
+    honest answer, and each needs a DIFFERENT remedy -- so the remedy is
+    decided here, at the one place that sees the exception TYPE, rather than
+    by a caller reading a message string back. Each exception class carries
+    its own `remedy` string (chunkers' BackendUnavailable and ChunkingFailed,
+    treesitter's TreeSitterFileTooLarge), so this reads it off the exception
+    rather than classifying one; an exception carrying none falls back to a
+    generic line.
+
+      * the backend for this file's language cannot run in this python --
+        `reason` is the BackendUnavailable text, which names the missing
+        wheel by module (e.g. "javascript: ModuleNotFoundError: No module
+        named 'tree_sitter_javascript'"), and the remedy is
+        backend-preflight, which reports the same absence machine-wide;
+      * the backend runs but could not read THIS file -- it is over the
+        per-file byte cap, or it did not parse (external gate finding 7).
+        backend-preflight reports that language `ok` for both -- the backend
+        runs, the FILE is what could not be read -- so the remedy is the cap
+        in the first case and the file's own syntax in the second.
+        `reason` names the language and the failure (e.g. "javascript:
+        TreeSitterFileTooLarge: file too large (1111026 bytes > 1048576)").
+
+    The three states are the whole point. A tree-sitter grammar wheel is
+    optional -- an engine set up with `--python` at an interpreter that
+    lacks it is a supported install (MEMCONTINUUM_VENV_MANAGED=0), and
+    every other surface fails open on it: code-reindex records the file
+    not-indexed, code-search says the index is incomplete, backend-preflight
+    reports MISSING. An unreadable file is the same shape one file down:
+    code-reindex records THAT file not-indexed and retries it. Collapsing
+    "cannot check" into False would make memlint the one surface that turns
+    either gap into a hard error on a record that is perfectly valid. So the
+    caller decides: memlint.py warns on None, naming the reason, and
+    reserves its error for False -- a symbol the backend read the file and
+    proved absent.
 
     Dispatch is fully generic (Anatomy M1 fix wave, I3): the file's
     language comes from chunkers.lang_for_path(rel_path), and the answer
@@ -1866,8 +1924,10 @@ def fragment_declared_in_text(frag: str, text: str, rel_path: str) -> bool:
     None AND rel_path has no extension at all is text's first line sniffed
     for a shebang (chunkers.lang_for_shebang) -- an extension that simply
     doesn't match any LANGUAGE_TABLE row (e.g. ".txt") never falls through
-    to the shebang guess. Still unresolved -> return False: no language
-    means no vocabulary to check against, not a crash.
+    to the shebang guess. Still unresolved -> False: no language means no
+    vocabulary to check against, not a crash. That stays False rather than
+    None because it is not a machine-setup gap a wheel would close -- the
+    record names a path this engine has no language for at all.
 
     Each backend returns `(symbol, qualified_name)` pairs -- including its
     container type names (Swift's class/struct/enum/protocol/extension/
@@ -1880,18 +1940,47 @@ def fragment_declared_in_text(frag: str, text: str, rel_path: str) -> bool:
     if lang is None and not chunkers.extension_of(rel_path):
         lang = chunkers.lang_for_shebang(text.split("\n", 1)[0])
     if lang is None:
-        return False
+        return False, "", ""
     try:
         backend = chunkers.get_chunker(lang)
-        pairs = backend.declared_symbols(text)
+    except chunkers.BackendUnavailable as exc:
+        # The one "cannot tell" case, kept apart from the generic guard
+        # below: this engine has no backend for this language here, so the
+        # symbol is neither proven present nor proven absent.
+        return None, str(exc), _uncheckable_remedy(exc)
     except Exception:
         # Fail open, like every other chunker call site: a backend that
         # cannot answer must not turn a lint into a crash.
-        return False
+        return False, "", ""
+    try:
+        pairs = backend.declared_symbols(text)
+    except Exception as exc:
+        # External gate finding 7: the backend runs here, but it could not
+        # read THIS file -- over the per-file byte cap, or a parse that
+        # produced nothing. That is the same "cannot tell" the missing-wheel
+        # branch above returns, for a different reason, and it gets the same
+        # None: an empty vocabulary would say the symbol is proven absent,
+        # which is a hard error on a record that may be perfectly correct.
+        # The reason names the file's language and the failure, and memlint
+        # prints it beside the remedy that failure class calls for.
+        return None, f"{lang}: {type(exc).__name__}: {exc}", _uncheckable_remedy(exc)
     return any(
         fragment_matches_symbol(frag, symbol, qualified_name)
         for symbol, qualified_name in pairs
-    )
+    ), "", ""
+
+
+def fragment_declared_in_text(frag: str, text: str, rel_path: str):
+    """The verdict half of fragment_declaration_status (see there for the
+    tri-state and its rationale): True, False, or None when the backend for
+    `rel_path`'s language cannot run in this python.
+
+    Callers that only need a yes/no read None as falsy and are right to:
+    `why`'s disk-scan fallback (resolve_symbol_to_path) cannot resolve a
+    symbol it could not check, and answering None there means the same
+    thing as answering no."""
+    verdict, _reason, _remedy = fragment_declaration_status(frag, text, rel_path)
+    return verdict
 
 
 def concept_matches_for_chunk(
@@ -4012,6 +4101,70 @@ def cmd_code_census(args) -> int:
     return 0
 
 
+def cmd_backend_preflight(args) -> int:
+    """`backend-preflight [--json]`. Attempts `chunkers.get_chunker(lang)`
+    for every LANGUAGE_TABLE row (native: module imports; tree-sitter:
+    grammar imports AND the query compiles) and reports a per-row state
+    with its reason. Fail-open (Task 9, B4/TOP-0118): one row's exception
+    never stops the rest -- the same discipline
+    chunkers.backend_availability() already follows, this subcommand just
+    exposes it with a per-row reason instead of a bare ok/missing flag, for
+    `memcontinuum-update.sh --machine`'s dependency-reconciliation report
+    and for a human checking a machine's own install directly.
+
+    Three states, not two (ruling 108):
+
+      * `ok`           -- the backend imports here and its grammar wheel and
+                          the tree-sitter runtime sit at the versions the row
+                          pins.
+      * `pin-mismatch` -- the backend imports, but one of those two
+                          distributions is installed at a DIFFERENT version
+                          than the row pins (chunkers.pin_mismatch names
+                          both). The backend runs; what it produces is not
+                          what the pins describe. Reported, never fatal: the
+                          exit code stays 0 and `ok` stays true, because the
+                          row is usable. Named for the condition rather than
+                          `drift`, which this CLI already spends on the
+                          decision-vs-code check (`memidx.py drift`).
+      * `missing`      -- the backend cannot run here at all (the wheel is
+                          absent, or the query does not compile); `ok` is
+                          false.
+
+    Exit code is 0 for every state -- this command reports a machine's
+    install, it does not gate on it."""
+    report = {}
+    for lang in sorted(chunkers.LANGUAGE_TABLE):
+        try:
+            chunkers.get_chunker(lang)
+        except chunkers.BackendUnavailable as exc:
+            report[lang] = {"ok": False, "state": "missing", "reason": str(exc)}
+            continue
+        except Exception as exc:   # fail-open: a preflight itself must never crash
+            report[lang] = {"ok": False, "state": "missing",
+                            "reason": f"{type(exc).__name__}: {exc}"}
+            continue
+        try:
+            mismatch = chunkers.pin_mismatch(lang)
+        except Exception as exc:   # same fail-open discipline as the import above
+            mismatch = f"pin comparison failed: {type(exc).__name__}: {exc}"
+        if mismatch:
+            report[lang] = {"ok": True, "state": "pin-mismatch", "reason": mismatch}
+        else:
+            report[lang] = {"ok": True, "state": "ok", "reason": None}
+    if getattr(args, "json", False):
+        print(json.dumps(report, indent=2))
+    else:
+        for lang, row in sorted(report.items()):
+            if row["state"] == "ok":
+                status = "ok"
+            elif row["state"] == "pin-mismatch":
+                status = f"PIN-MISMATCH ({row['reason']})"
+            else:
+                status = f"MISSING ({row['reason']})"
+            print(f"{lang}: {status}")
+    return 0
+
+
 def code_hits_fts(conn: sqlite3.Connection, query: str, project: str, limit: int = 200):
     """Task 7 (Anatomy M2a): a bare identifier-shaped query (e.g. a symbol
     or qualified name typed verbatim, not a phrase) puts every chunk whose
@@ -5386,7 +5539,20 @@ def main(argv=None) -> int:
     p_unmapped.add_argument("--json", action="store_true")
     p_unmapped.set_defaults(func=cmd_unmapped)
 
-    p_code_reindex = sub.add_parser("code-reindex")
+    p_code_reindex = sub.add_parser(
+        "code-reindex",
+        description=(
+            "Walk a code root, chunk every file whose extension resolves to a "
+            "wired language, and store the result. A file the resolved "
+            "backend cannot chunk is recorded not-indexed rather than "
+            "dropped -- run backend-preflight to see which language backends "
+            "import here; a not-indexed reason for a tree-sitter language "
+            "(javascript, typescript, tsx, java, php, rust, lua) usually "
+            "names the missing grammar wheel by its module (e.g. \"No module "
+            "named 'tree_sitter_rust'\"), and the row is retried "
+            "automatically once that wheel is installed."
+        ),
+    )
     add_common_args(p_code_reindex)
     p_code_reindex.add_argument("--code-root", dest="code_root", required=False)
     p_code_reindex.add_argument(
@@ -5446,6 +5612,27 @@ def main(argv=None) -> int:
     p_code_census.add_argument("--root", required=True)
     p_code_census.add_argument("--json", action="store_true")
     p_code_census.set_defaults(func=cmd_code_census)
+
+    p_preflight = sub.add_parser(
+        "backend-preflight",
+        help="report which chunker backends import here, and whether their "
+             "installed versions match the pins, by language",
+        description=(
+            "Attempts to import each registered language's chunker backend "
+            "and reports ok, pin-mismatch or missing per language. A native "
+            "backend (swift, python) fails only on an engine bug of its own; a "
+            "tree-sitter backend (javascript, typescript, tsx, java, php, "
+            "rust, lua) is MISSING when its pinned grammar wheel is not "
+            "installed in this python -- the reported reason names that "
+            "wheel -- and PIN-MISMATCH when the wheel or the tree-sitter "
+            "runtime imports at a version the row does not pin, which the "
+            "reason names on both sides. A mismatched backend still runs; it "
+            "produces chunks the pins do not describe. Exit code is 0 either "
+            "way."
+        ),
+    )
+    p_preflight.add_argument("--json", action="store_true")
+    p_preflight.set_defaults(func=cmd_backend_preflight)
 
     p_stats = sub.add_parser(
         "stats",

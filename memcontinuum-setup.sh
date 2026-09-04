@@ -32,6 +32,12 @@
 #                     machine's config. Never touches a venv, a store, any
 #                     per-repo wiring, or your recorded per-repo answers.
 #
+# With neither --python nor --venv given on a real terminal, this blocks on
+# /dev/tty with a python-or-venv menu (choosing abort exits 1) instead of
+# silently creating a venv; a scripted or non-interactive run is unaffected.
+# The menu takes 1, 2 or 3 and nothing else: any other answer is asked again,
+# three times, and then the run aborts having written nothing.
+#
 # Why the model warm is on by default: fastembed downloads ~100 MB the first
 # time anything needs to embed. Left lazy, that download happens inside
 # somebody's first reindex -- or worse, inside a hook -- looking like a hang.
@@ -73,6 +79,12 @@ CLAUDE_DIR="$HOME/.claude"
 MODEL_WARM=1
 DRY_RUN=0
 UNINSTALL=0
+# Whether --python/--venv were given explicitly on THIS invocation, as
+# opposed to left for this step to resolve or create -- read by the
+# MEMCONTINUUM_VENV_MANAGED determination below (Task 9) and by the
+# interactive setup menu, which is skipped whenever either was given.
+PYTHON_EXPLICIT=0
+VENV_EXPLICIT=0
 
 # scan to the explicit end marker above rather than a hardcoded line count --
 # a hardcoded `sed -n '2,Np'` silently truncates or overruns usage() every
@@ -88,8 +100,8 @@ usage() {
 need_value() { [ $# -ge 2 ] || { printf 'missing value for %s\n' "$1" >&2; exit 2; }; }
 while [ $# -gt 0 ]; do
     case "$1" in
-        --venv) need_value "$@"; VENV_DIR="$2"; shift 2 ;;
-        --python) need_value "$@"; PYTHON_BIN="$2"; shift 2 ;;
+        --venv) need_value "$@"; VENV_DIR="$2"; VENV_EXPLICIT=1; shift 2 ;;
+        --python) need_value "$@"; PYTHON_BIN="$2"; PYTHON_EXPLICIT=1; shift 2 ;;
         --claude-dir) need_value "$@"; CLAUDE_DIR="$2"; shift 2 ;;
         --no-model-warm) MODEL_WARM=0; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
@@ -230,6 +242,57 @@ say "1. python"
 # cwd and could run that project's unrelated .venv (reviewer finding).
 case "${PYTHON_BIN:-/}" in /*) ;; *) die "--python must be an absolute path (got: $PYTHON_BIN)" ;; esac
 case "${VENV_DIR:-/}" in /*) ;; *) die "--venv must be an absolute path (got: $VENV_DIR)" ;; esac
+
+# ---------------------------------------------------------------------------
+# Interactive setup menu (Task 9): a truly fresh, unscripted run -- no
+# --python, no --venv, a real terminal on stdin -- asks rather than silently
+# picking "create a venv" the way every other run (scripted, CI, or already
+# told what to do) does. Additive only: guarded exactly like
+# scripts/repo-init.sh's own census dialogue ([ -t 0 ]), so a non-interactive
+# or explicit-flag run never reaches it and keeps today's
+# silent-reuse-or-create behavior untouched.
+#
+# Choosing "1) use this python" is itself an explicit python choice, same as
+# typing --python on the command line -- it sets PYTHON_EXPLICIT so the
+# MEMCONTINUUM_VENV_MANAGED determination below treats it the same way (not
+# managed, unless a later run re-affirms this exact path).
+# ---------------------------------------------------------------------------
+if [ "$PYTHON_EXPLICIT" -eq 0 ] && [ "$VENV_EXPLICIT" -eq 0 ] && [ -t 0 ] && [ "$DRY_RUN" -eq 0 ]; then
+    echo
+    echo "Set up MemContinuum's python environment:"
+    echo "  1) use this python ($BOOT_PY)"
+    echo "  2) create or reuse the engine venv"
+    echo "  3) abort"
+    # Only 1, 2 and 3 are answers. Anything else -- a typo, a stray word, a
+    # bare Enter -- is asked again, up to three times, and then the run
+    # aborts without touching anything (reviewer finding: every response but
+    # 1 and 3 counted as 2, so a mistyped answer created a venv and
+    # installed dependencies the person never agreed to; a bare Enter did
+    # the same, and nothing documents Enter as meaning anything). An abort
+    # here is safe by construction: nothing has been written yet.
+    MENU_TRIES=0
+    MENU_ANSWERED=0
+    while [ "$MENU_TRIES" -lt 3 ]; do
+        MENU_TRIES=$((MENU_TRIES + 1))
+        printf '> '
+        MENU_CHOICE=""
+        read -r MENU_CHOICE < /dev/tty || MENU_CHOICE=""
+        case "$MENU_CHOICE" in
+            1) PYTHON_BIN="$BOOT_PY"; PYTHON_EXPLICIT=1; MENU_ANSWERED=1 ;;
+            2) MENU_ANSWERED=1 ;;   # the create-or-reuse path below
+            3) echo "aborted" >&2; exit 1 ;;
+            *) echo "answer 1, 2 or 3" >&2 ;;
+        esac
+        if [ "$MENU_ANSWERED" -eq 1 ]; then
+            break
+        fi
+    done
+    if [ "$MENU_ANSWERED" -eq 0 ]; then
+        echo "no answer of 1, 2 or 3 after $MENU_TRIES attempts -- aborted" >&2
+        exit 1
+    fi
+fi
+
 if [ -n "$PYTHON_BIN" ]; then
     [ -x "$PYTHON_BIN" ] || die "--python $PYTHON_BIN is not executable"
     plan "use existing python: $PYTHON_BIN"
@@ -264,6 +327,44 @@ if [ "$DRY_RUN" -eq 0 ] || [ -x "$PYTHON_BIN" ]; then
     env PYTHONPATH= "$PYTHON_BIN" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)' \
         || die "$PYTHON_BIN is older than Python 3.12 (the pinned dependency set requires it) -- see README.md Requirements"
     plan "python is $(env PYTHONPATH= "$PYTHON_BIN" -c 'import sys; print(".".join(map(str, sys.version_info[:3])))')"
+fi
+
+# Whether THIS python counts as engine-managed (Task 9) -- read back by
+# scripts/memcontinuum-update.sh --machine to decide whether it may reinstall
+# requirements.lock into it on a stale-fingerprint refresh, or must instead
+# leave a foreign python alone and only report what is missing.
+#
+# Default managed=1: PYTHON_BIN was created or reused by THIS step with no
+# explicit --python (the ordinary case -- an engine-owned venv). An explicit
+# --python (including the interactive menu's "use this python", which sets
+# PYTHON_EXPLICIT the same way) starts unmanaged (0) UNLESS it re-affirms the
+# EXACT SAME path config.sh already recorded as managed=1 -- the STICKY case:
+# scripts/memcontinuum-update.sh --machine always re-resolves and re-passes a
+# python explicitly on every run after the first (SETUP_ARGS --python "$PY"),
+# so without this stickiness an engine-created venv would read managed=0 on
+# its own SECOND refresh and reconciliation could never fire again. Only a
+# GENUINELY new or different explicit path resets it to 0.
+NEW_VENV_MANAGED=1
+if [ "$PYTHON_EXPLICIT" -eq 1 ]; then
+    NEW_VENV_MANAGED=0
+    # mc_config_managed_python (scripts/mc-registry-lib.sh) is the ONE
+    # implementation of this read, shared with scripts/memcontinuum-update.sh
+    # --machine's reconciliation, which needs exactly the same disk truth for
+    # exactly the same reason. See that function for why the read unsets both
+    # names first. The source line near the top of this script tolerates a
+    # missing library elsewhere (it only costs the machine-layer fingerprint
+    # stamp), but stickiness cannot: silently skipping this read on an
+    # incomplete checkout would make an engine-created venv read unmanaged on
+    # its own SECOND refresh, and reconciliation could then never fire again
+    # -- exactly the failure stickiness exists to prevent (whole-branch review
+    # NEW-4). Required here, loudly, rather than degraded.
+    type mc_config_managed_python >/dev/null 2>&1 \
+        || die "scripts/mc-registry-lib.sh did not load -- incomplete checkout, cannot determine managed-venv stickiness"
+    if mc_config_managed_python "$MEMCONTINUUM_HOME/config.sh"; then
+        if [ "$MC_CONFIG_PYTHON" = "$PYTHON_BIN" ] && [ "$MC_CONFIG_MANAGED" = "1" ]; then
+            NEW_VENV_MANAGED=1   # re-affirming a venv THIS engine already owns, not a foreign path
+        fi
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -326,6 +427,7 @@ if [ "$DRY_RUN" -eq 0 ]; then
     Q_PYTHON="$(sh_quote "$PYTHON_BIN")"
     Q_HOME="$(sh_quote "$MEMCONTINUUM_HOME")"
     Q_CLAUDE_DIR="$(sh_quote "$CLAUDE_DIR")"
+    Q_VENV_MANAGED="$(sh_quote "$NEW_VENV_MANAGED")"
     # Machine backup rule: never overwrite a config a previous setup wrote
     # without keeping a copy.
     [ -f "$CONFIG" ] && cp "$CONFIG" "$CONFIG.bak-memcontinuum"
@@ -344,6 +446,11 @@ MEMCONTINUUM_HOME=$Q_HOME
 # up with --claude-dir, report the real install as absent and render a second
 # one at the default path.
 MEMCONTINUUM_MACHINE_CLAUDE_DIR=$Q_CLAUDE_DIR
+# Whether MEMCONTINUUM_PYTHON above is a venv this engine created and may
+# reinstall requirements.lock into on a later --machine refresh (1), or a
+# python this setup was told to use as-is and must never pip-install into
+# (0). See this file's own determination above.
+MEMCONTINUUM_VENV_MANAGED=$Q_VENV_MANAGED
 CONF
     if [ "$IS_CUSTOM_HOME" -eq 1 ]; then
         mkdir -p "$DEFAULT_MEMCONTINUUM_HOME" || die "cannot create $DEFAULT_MEMCONTINUUM_HOME"

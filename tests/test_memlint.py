@@ -1,13 +1,23 @@
+import contextlib
+import os
 import shutil
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 TOOLS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(TOOLS_DIR))
 
+import chunkers  # noqa: E402
+import chunkers.treesitter  # noqa: E402
+import memidx  # noqa: E402
 import memlint  # noqa: E402
+
+VENV_PYTHON = os.environ.get("MEMCONTINUUM_PYTHON", "")
+_SKIP_NO_VENV = ("MEMCONTINUUM_PYTHON not set -- tree-sitter tests need the fixed venv "
+                 "with the seven pins installed (Task 1's coordinator step)")
 
 FIXTURES = TOOLS_DIR / "fixtures"
 
@@ -451,6 +461,256 @@ class TestF4EmptyCodeRefIsRejected(unittest.TestCase):
             "type: topic\nid: TOP-1\ntitle: T\ncode_refs: [\"src/foo.py\"]\nlinks: []\n"
         )
         self.assertFalse(any("code_refs" in e for e in errors), errors)
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestJavaScriptSymbolRouting(unittest.TestCase):
+    def test_js_symbol_fragment_routes_through_the_registry(self):
+        text = "function widget_loader() {\n  return 1;\n}\n"
+        self.assertTrue(memidx.fragment_declared_in_text("widget_loader", text, rel_path="a.js"))
+        self.assertFalse(memidx.fragment_declared_in_text("nonexistent", text, rel_path="a.js"))
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestTypeScriptSymbolRouting(unittest.TestCase):
+    def test_ts_symbol_fragment_routes_through_the_registry(self):
+        text = "function widget_loader(): number {\n  return 1;\n}\n"
+        self.assertTrue(memidx.fragment_declared_in_text("widget_loader", text, rel_path="a.ts"))
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestTsxSymbolRouting(unittest.TestCase):
+    def test_tsx_symbol_fragment_routes_through_the_registry(self):
+        text = "function WidgetLoader(): JSX.Element {\n  return null;\n}\n"
+        self.assertTrue(memidx.fragment_declared_in_text("WidgetLoader", text, rel_path="a.tsx"))
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestJavaSymbolRouting(unittest.TestCase):
+    def test_java_symbol_fragment_routes_through_the_registry(self):
+        text = "public class W {\n  public int getValue() {\n    return 1;\n  }\n}\n"
+        self.assertTrue(memidx.fragment_declared_in_text("W.getValue", text, rel_path="W.java"))
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestPhpSymbolRouting(unittest.TestCase):
+    def test_php_symbol_fragment_routes_through_the_registry(self):
+        text = "<?php\nfunction widget_loader() {\n  return 1;\n}\n"
+        self.assertTrue(memidx.fragment_declared_in_text("widget_loader", text, rel_path="a.php"))
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestRustSymbolRouting(unittest.TestCase):
+    def test_rust_symbol_fragment_routes_through_the_registry(self):
+        text = "fn widget_loader() -> i32 {\n    1\n}\n"
+        self.assertTrue(memidx.fragment_declared_in_text("widget_loader", text, rel_path="a.rs"))
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestLuaSymbolRouting(unittest.TestCase):
+    def test_lua_symbol_fragment_routes_through_the_registry(self):
+        text = "function obj:widget_loader(a)\n  return a\nend\n"
+        self.assertTrue(memidx.fragment_declared_in_text("obj.widget_loader", text, rel_path="a.lua"))
+        self.assertTrue(memidx.fragment_declared_in_text("widget_loader", text, rel_path="a.lua"))
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestMissingGrammarWheelIsAWarningNotAnError(unittest.TestCase):
+    """Whole-branch review, finding 1. A tree-sitter grammar wheel is an
+    OPTIONAL dependency: an engine set up with `--python` at an interpreter
+    that lacks one is a supported install, and every other surface fails
+    open on it. So a `#symbol` fragment on a `.js` path must degrade to a
+    WARNING naming the wheel when javascript's backend cannot run here --
+    not an error that fails the lint on a record nothing is wrong with.
+    The error stays reserved for a symbol the AVAILABLE backend proves
+    absent.
+
+    The wheel is made unavailable with the same `sys.modules` shim
+    tests/test_chunkers.py's registry tests use, around a
+    treesitter.reset_cache() on both sides -- a successful chunker
+    instance is cached per (lang, chunker_version), so a shim with no cache
+    reset would be a no-op against an already-built instance."""
+
+    JS_SOURCE = "function widget_loader() {\n  return 1;\n}\n"
+
+    @contextlib.contextmanager
+    def _javascript_wheel_absent(self):
+        chunkers.treesitter.reset_cache()
+        try:
+            with mock.patch.dict(sys.modules, {"tree_sitter_javascript": None}):
+                yield
+        finally:
+            chunkers.treesitter.reset_cache()
+
+    def _lint(self, ref: str, js_source: str):
+        with tempfile.TemporaryDirectory() as td_str:
+            td = Path(td_str)
+            code_root = td / "code"
+            code_root.mkdir()
+            (code_root / "widget.js").write_text(js_source)
+            (td / "concept.md").write_text(
+                concept_md("CON-js-wheel", ref, title="Fixture -- missing grammar wheel")
+            )
+            return memlint.lint_root(td, code_roots=[code_root])
+
+    def test_predicate_is_none_with_the_wheel_absent_and_names_it(self):
+        with self._javascript_wheel_absent():
+            verdict, reason, remedy = memidx.fragment_declaration_status(
+                "widget_loader", self.JS_SOURCE, rel_path="widget.js"
+            )
+        self.assertIsNone(verdict)
+        self.assertIn("tree_sitter_javascript", reason)
+        # A missing wheel is the ONE case backend-preflight answers: it
+        # reports the same absence for the whole machine.
+        self.assertIn("backend-preflight", remedy)
+        # The thin verdict-only wrapper forwards the same None, so `why`'s
+        # disk-scan fallback still reads it as falsy.
+        with self._javascript_wheel_absent():
+            self.assertIsNone(
+                memidx.fragment_declared_in_text(
+                    "widget_loader", self.JS_SOURCE, rel_path="widget.js"
+                )
+            )
+
+    def test_predicate_is_true_with_the_wheel_present(self):
+        verdict, reason, remedy = memidx.fragment_declaration_status(
+            "widget_loader", self.JS_SOURCE, rel_path="widget.js"
+        )
+        self.assertTrue(verdict)
+        self.assertEqual((reason, remedy), ("", ""))
+
+    def test_lint_warns_and_stays_clean_with_the_wheel_absent(self):
+        with self._javascript_wheel_absent():
+            errors, warnings = self._lint("widget.js#widget_loader", self.JS_SOURCE)
+        self.assertEqual(
+            [e for e in errors if "widget_loader" in e], [],
+            f"a missing optional grammar wheel must not fail the lint: {errors}",
+        )
+        named = [w for w in warnings if "tree_sitter_javascript" in w]
+        self.assertEqual(len(named), 1, warnings)
+        self.assertIn("widget_loader", named[0])
+        self.assertIn("run backend-preflight", named[0])
+
+    def test_lint_still_errors_on_a_symbol_the_available_backend_proves_absent(self):
+        errors, _warnings = self._lint("widget.js#no_such_symbol", self.JS_SOURCE)
+        self.assertTrue(
+            any("no_such_symbol" in e for e in errors),
+            f"with the wheel present, an absent symbol is still a hard error: {errors}",
+        )
+
+    def test_a_file_over_the_byte_cap_warns_and_names_the_reason(self):
+        """External gate finding 7. A file the backend could not chunk at
+        all -- here, one over the per-file byte cap -- is UNCHECKABLE, not
+        proof its symbols are absent. The symbol below really is declared in
+        the file; before this the empty vocabulary made it a hard error.
+
+        The cap is lowered rather than a megabyte of filler written, and the
+        instance cache is reset on both sides because a chunker instance is
+        cached per (lang, chunker_version) and the cap is part of that
+        fingerprint."""
+        chunkers.treesitter.reset_cache()
+        try:
+            with mock.patch.dict(os.environ, {"MEMCONTINUUM_MAX_PARSE_BYTES": "8"}):
+                errors, warnings = self._lint("widget.js#widget_loader", self.JS_SOURCE)
+        finally:
+            chunkers.treesitter.reset_cache()
+        self.assertEqual(
+            [e for e in errors if "widget_loader" in e], [],
+            f"a file that could not be chunked must not fail the lint: {errors}",
+        )
+        named = [w for w in warnings if "widget_loader" in w]
+        self.assertEqual(len(named), 1, warnings)
+        self.assertIn("uncheckable", named[0])
+        self.assertIn("TreeSitterFileTooLarge", named[0])
+        # The remedy names the CAP, not backend-preflight: the backend runs
+        # here, and preflight would report this language ok.
+        self.assertIn("MEMCONTINUUM_MAX_PARSE_BYTES", named[0])
+        self.assertNotIn("backend-preflight", named[0])
+
+
+class TestPythonSyntaxErrorIsAWarningNotAnError(unittest.TestCase):
+    """Follow-up round, external-fix-report residual 6: chunkers.python_ast
+    (the native backend, no grammar wheel involved at all) returned `[]`
+    from `declared_symbols` for a file it could not even parse -- the same
+    dishonesty class TestMissingGrammarWheelIsAWarningNotAnError's
+    over-the-cap case already fixed for tree-sitter (external gate finding
+    7), just never carried to the native backends. `[]` reads as "this file
+    parsed and declares nothing", so a `.py#symbol` reference into a file
+    with a genuine syntax error used to fail the lint on a record that may
+    be perfectly correct -- the symbol below really is declared in the
+    fixture text; a syntax error two lines later is what breaks the parse.
+
+    No grammar-wheel shim needed here (python_ast has none to shim) --
+    the syntax error itself is the failure this test drives."""
+
+    PY_SOURCE = (
+        "def widget_loader():\n"
+        "    return 1\n"
+        "\n"
+        "def (:\n"   # syntax error: an unparseable def
+    )
+
+    def _lint(self, ref: str, py_source: str):
+        with tempfile.TemporaryDirectory() as td_str:
+            td = Path(td_str)
+            code_root = td / "code"
+            code_root.mkdir()
+            (code_root / "widget.py").write_text(py_source)
+            (td / "concept.md").write_text(
+                concept_md("CON-py-syntax-error", ref, title="Fixture -- python syntax error")
+            )
+            return memlint.lint_root(td, code_roots=[code_root])
+
+    def test_predicate_is_none_on_a_syntax_error_and_names_it(self):
+        verdict, reason, remedy = memidx.fragment_declaration_status(
+            "widget_loader", self.PY_SOURCE, rel_path="widget.py"
+        )
+        self.assertIsNone(verdict)
+        self.assertIn("python", reason)
+        self.assertIn("SyntaxError", reason)
+        self.assertIn("syntax", remedy)
+        self.assertNotIn("backend-preflight", remedy)
+        # The thin verdict-only wrapper forwards the same None.
+        self.assertIsNone(
+            memidx.fragment_declared_in_text(
+                "widget_loader", self.PY_SOURCE, rel_path="widget.py"
+            )
+        )
+
+    def test_a_parseable_file_still_proves_a_symbol_present_or_absent(self):
+        clean = "def widget_loader():\n    return 1\n"
+        verdict, reason, remedy = memidx.fragment_declaration_status(
+            "widget_loader", clean, rel_path="widget.py"
+        )
+        self.assertTrue(verdict)
+        self.assertEqual((reason, remedy), ("", ""))
+        verdict, _reason, _remedy = memidx.fragment_declaration_status(
+            "no_such_symbol", clean, rel_path="widget.py"
+        )
+        self.assertFalse(verdict)
+
+    def test_lint_warns_and_stays_clean_with_a_syntax_error(self):
+        errors, warnings = self._lint("widget.py#widget_loader", self.PY_SOURCE)
+        self.assertEqual(
+            [e for e in errors if "widget_loader" in e], [],
+            f"a file that failed to parse must not fail the lint: {errors}",
+        )
+        named = [w for w in warnings if "widget_loader" in w]
+        self.assertEqual(len(named), 1, warnings)
+        self.assertIn("uncheckable", named[0])
+        self.assertIn("SyntaxError", named[0])
+        # The remedy names the FILE's syntax, not backend-preflight: python
+        # has no wheel to be missing and preflight reports it ok.
+        self.assertIn("syntax", named[0])
+        self.assertNotIn("backend-preflight", named[0])
+
+    def test_lint_still_errors_on_a_symbol_a_parseable_file_proves_absent(self):
+        clean = "def widget_loader():\n    return 1\n"
+        errors, _warnings = self._lint("widget.py#no_such_symbol", clean)
+        self.assertTrue(
+            any("no_such_symbol" in e for e in errors),
+            f"a parseable file still fails the lint on a genuinely absent symbol: {errors}",
+        )
 
 
 if __name__ == "__main__":

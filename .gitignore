@@ -7,3 +7,4 @@ memory/
 .venv/
 docs/internal/
 .claude/skills/
+tests/mac_smoke.local

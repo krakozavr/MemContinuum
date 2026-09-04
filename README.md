@@ -185,6 +185,18 @@ uses an existing one that already has `requirements.txt` installed.
 default because, left lazy, that download lands inside somebody's first reindex,
 where it looks like a hang. `--dry-run` prints the plan and writes nothing.
 
+Run it with neither `--venv` nor `--python`, from a real terminal, and it asks
+which python you want (use this python, or create or reuse the engine venv)
+instead of silently picking for you; a scripted or non-interactive run
+keeps the create-if-absent default. The menu takes 1, 2 or 3 and nothing else
+— any other answer, a bare Enter included, is asked again, three times, and
+then the run aborts having written nothing. A venv this step creates is
+engine-managed: `scripts/memcontinuum-update.sh --apply --machine` may
+reinstall `requirements.lock` into it to reconcile the pinned tree-sitter grammar
+wheels and the tree-sitter runtime
+(below). A python you point it at with `--python` is not —
+that command reports what is missing there instead of installing into it.
+
 This step is what makes an un-initialized repository *noticeable*: the
 user-level detector runs at every session start, in every repo on the machine,
 and is the only piece of this tool that does.
@@ -318,6 +330,7 @@ memidx.py drift --code-root DIR --project NAME                                  
 memidx.py reindex --root STORE --project NAME                                    # after editing the store by hand
 memidx.py code-reindex --code-root DIR --project NAME                            # after the code moved on
 memidx.py stats --project NAME [--days 7] [--store DIR]                          # is retrieval actually firing?
+memidx.py backend-preflight [--json]                                             # which backends import here, and do their versions match the pins?
 memlint.py STORE --code-root DIR                                                 # validate records
 ```
 
@@ -402,8 +415,17 @@ it with `--code-root`, `--langs` and `--set-never-ext` on the command line.
 ## Languages
 
 The code index handles **Swift and Python**, both natively — Swift with a tuned
-walker, Python with the standard library's own parser. Support for more
-languages is planned.
+walker, Python with the standard library's own parser — plus **JavaScript,
+TypeScript, TSX, Java, PHP, Rust, and Lua** through tree-sitter: one generic
+backend, a grammar and a query file per language, so a new language in this
+tier is a data row and a query, not a new parser.
+
+TypeScript and TSX are two languages here, not one. `--lang typescript` covers
+`.ts` files; `.tsx` files need `--lang tsx`, and the census offers `tsx` as its
+own proposal alongside `typescript`. A React project wants both. They share one
+grammar and one query file, which is why they behave identically otherwise —
+but wiring only `typescript` leaves every `.tsx` file unindexed, and the
+provenance line at the end of `code-reindex` says so by extension.
 
 A project chooses its languages once, at install, through the census dialogue
 above — not by flag guesswork. `--lang` is **required on a project's first**
@@ -456,10 +478,10 @@ bash tests/run_bash32.sh
 
 The second command re-runs the hook suites under a real bash 3.2.57 — the
 interpreter stock macOS ships — building one into `~/.cache/bash32` on first use
-(or point `MC_BASH32` at an existing binary). The full suite takes about a
-minute. A handful of tests need machine-local data of their own and skip with a
-clear message when it is absent; every fixture tracked in this repository is
-synthetic.
+(or point `MC_BASH32` at an existing binary). The full suite takes about five
+minutes on a 24-core machine; the bash 3.2 harness takes about four. A handful
+of tests need machine-local data of their own and skip with a clear message
+when it is absent; every fixture tracked in this repository is synthetic.
 
 ## Acknowledgements & prior art
 

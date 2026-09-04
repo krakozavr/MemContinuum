@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import importlib.metadata
 import io
 import json
 import os
@@ -39,6 +40,11 @@ TOOLS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(TOOLS_DIR))
 
 import chunkers  # noqa: E402
+# Explicit: `chunkers.treesitter` is a submodule the package imports lazily, so
+# the attribute exists only once something has imported it. Tests here call
+# chunkers.treesitter.reset_cache(), which passed only because another test
+# module in the same discover run happened to import it first.
+import chunkers.treesitter  # noqa: E402,F401
 import memidx  # noqa: E402
 import memlint  # noqa: E402
 
@@ -1274,7 +1280,7 @@ class TestCodeCensus(unittest.TestCase):
 
             counts = memidx.code_census(root)
             self.assertEqual(counts[".blade.php"], {"files": 1, "status": "unsupported"})
-            self.assertEqual(counts[".php"], {"files": 1, "status": "unsupported"})
+            self.assertEqual(counts["php"], {"files": 1, "status": "supported"})
             self.assertEqual(counts[".d.ts"], {"files": 1, "status": "unsupported"})
 
     def test_json_lists_zero_count_rows_for_every_known_language(self):
@@ -4052,6 +4058,137 @@ class TestCodeIndexTooNew(unittest.TestCase):
             after_version, after_tables = self._version_and_table_names(db)
             self.assertEqual(before_version, after_version)
             self.assertEqual(before_tables, after_tables)
+
+
+class TestBackendPreflight(unittest.TestCase):
+    def test_json_reports_every_row_ok_or_missing_with_reason(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = memidx.main(["backend-preflight", "--json"])
+        self.assertEqual(rc, 0)
+        data = json.loads(buf.getvalue())
+        self.assertIn("python", data)
+        self.assertTrue(data["python"]["ok"])
+        self.assertIsNone(data["python"]["reason"])
+
+    @unittest.skipUnless(os.environ.get("MEMCONTINUUM_PYTHON", ""), "needs the fixed venv with the seven pins installed")
+    def test_reports_a_positive_ok_true_for_a_real_installed_tree_sitter_row(self):
+        # Pre-flight finding #1/table-2 gap: neither of the two original
+        # tests here ever asserted ok:true for an actually-installed
+        # tree-sitter row -- both checked only python (native) and
+        # lua-with-the-wheel-mocked-out (negative). Against the real,
+        # unmocked wheels Task 1's coordinator step installed, EVERY
+        # tree-sitter row (all seven, ts/tsx included) must report ok:true.
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = memidx.main(["backend-preflight", "--json"])
+        self.assertEqual(rc, 0)
+        data = json.loads(buf.getvalue())
+        for lang in ("javascript", "typescript", "tsx", "java", "php", "rust", "lua"):
+            self.assertTrue(data[lang]["ok"], f"{lang}: expected ok:true, got {data[lang]}")
+            self.assertIsNone(data[lang]["reason"])
+
+    def test_missing_wheel_is_reported_by_name_not_crashed(self):
+        chunkers.treesitter.reset_cache()
+        with mock.patch.dict(sys.modules, {"tree_sitter_lua": None}):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = memidx.main(["backend-preflight", "--json"])
+            self.assertEqual(rc, 0)
+            data = json.loads(buf.getvalue())
+        chunkers.treesitter.reset_cache()
+        self.assertFalse(data["lua"]["ok"])
+        self.assertEqual(data["lua"]["state"], "missing")
+        self.assertIsNotNone(data["lua"]["reason"])
+
+    @unittest.skipUnless(os.environ.get("MEMCONTINUUM_PYTHON", ""),
+                         "needs the fixed venv with the seven pins installed")
+    def test_an_installed_version_off_the_pin_is_reported_as_pin_mismatch(self):
+        """Ruling 108: a wheel that imports but sits at a version the row
+        does not pin is a THIRD state beside ok and missing. The backend
+        runs, so `ok` stays true and the exit code stays 0; what it produces
+        is not what the pins describe, so the report names the distribution
+        and both versions rather than saying `ok`."""
+        real = importlib.metadata.version
+
+        def fake(name):
+            return "9.9.9" if name == "tree-sitter-lua" else real(name)
+
+        chunkers.treesitter.reset_cache()
+        with mock.patch.object(importlib.metadata, "version", fake):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = memidx.main(["backend-preflight", "--json"])
+            self.assertEqual(rc, 0)
+            data = json.loads(buf.getvalue())
+            text = io.StringIO()
+            with contextlib.redirect_stdout(text):
+                memidx.main(["backend-preflight"])
+        chunkers.treesitter.reset_cache()
+        self.assertEqual(data["lua"]["state"], "pin-mismatch")
+        self.assertTrue(data["lua"]["ok"], "a row off its pins still runs")
+        self.assertIn("9.9.9", data["lua"]["reason"])
+        self.assertIn(chunkers.LANGUAGE_TABLE["lua"]["grammar_pin"], data["lua"]["reason"])
+        self.assertEqual(data["javascript"]["state"], "ok")
+        self.assertIn("PIN-MISMATCH", text.getvalue())
+        # Ruling 111: `drift` is this CLI's decision-vs-code subcommand and
+        # nothing else. The installed-vs-pinned state must not borrow it.
+        self.assertNotIn("DRIFT (", text.getvalue())
+
+
+class TestTreeSitterReindexIntegration(unittest.TestCase):
+    """Task 10: proves the M2a reindex loop, code-search's provenance line/
+    JSON, and code_census are generic over LANGUAGE_TABLE for the six new
+    tree-sitter languages -- no new production code is expected here (see
+    the task-10 brief); a failure in one of these means a real gap, fixed
+    in the file it is found in."""
+
+    def test_not_indexed_row_names_the_missing_wheel_reason(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"; root.mkdir()
+            (root / "x.lua").write_text("function f()\n  return 1\nend\n")
+            db = Path(td) / "idx-code.sqlite"
+            chunkers.treesitter.reset_cache()
+            with mock.patch.dict(sys.modules, {"tree_sitter_lua": None}):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    code_reindex(root, db, lang="lua")
+                self.assertIn("1 not indexed", out.getvalue())
+            chunkers.treesitter.reset_cache()
+            conn = memidx.open_code_db(db)
+            row = conn.execute("SELECT status, reason FROM file_sha WHERE path=?", ("x.lua",)).fetchone()
+            self.assertEqual(row["status"], "not-indexed")
+            self.assertIn("lua", row["reason"].lower())
+
+    def test_code_search_provenance_line_and_json_not_indexed_count(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"; root.mkdir()
+            (root / "x.rs").write_text("fn f() -> i32 { 1 }\n")
+            db = Path(td) / "idx-code.sqlite"
+            chunkers.treesitter.reset_cache()
+            with mock.patch.dict(sys.modules, {"tree_sitter_rust": None}):
+                code_reindex(root, db, lang="rust")
+            chunkers.treesitter.reset_cache()
+            script = ("import sys; sys.path.insert(0, %r); import memidx; "
+                      "memidx.main(['code-search', '--db', %r, 'f', '--mode', 'fts', '--no-heal', '--json'])"
+                      ) % (str(TOOLS_DIR), str(db))
+            r = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=30)
+            data = json.loads(r.stdout)
+            self.assertEqual(data["not_indexed"], 1)
+
+    def test_census_reports_all_seven_rows_as_supported(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"; root.mkdir()
+            (root / "a.js").write_text("function f(){}\n")
+            (root / "a.ts").write_text("function f(){}\n")
+            (root / "a.tsx").write_text("function f(){ return null; }\n")
+            (root / "a.java").write_text("class C { void f() {} }\n")
+            (root / "a.php").write_text("<?php\nfunction f() {}\n")
+            (root / "a.rs").write_text("fn f() {}\n")
+            (root / "a.lua").write_text("function f() end\n")
+            rep = memidx.code_census(root)
+            for lang in ("javascript", "typescript", "tsx", "java", "php", "rust", "lua"):
+                self.assertEqual(rep[lang]["status"], "supported", f"{lang} not supported in census")
 
 
 if __name__ == "__main__":

@@ -7,3 +7,18 @@
 
 fastembed>=0.8.0
 PyYAML>=6.0.3
+
+# tree-sitter chunker backends (Anatomy M2b) -- an EXPLICIT exception to
+# this file's >=-minimums policy above. Reindex reads a query file's bytes
+# and a grammar's version into chunker_version (chunkers/treesitter.py);
+# an unpinned grammar upgrade would silently change what a file's chunks
+# look like without bumping that fingerprint, serving stale chunks after
+# a `pip install -U` no reindex would ever notice. All seven are exact
+# pins. All seven are MIT.
+tree-sitter==0.26.0
+tree-sitter-javascript==0.25.0
+tree-sitter-typescript==0.23.2
+tree-sitter-java==0.23.5
+tree-sitter-php==0.24.1
+tree-sitter-rust==0.24.2
+tree-sitter-lua==0.5.0

@@ -10,13 +10,19 @@ test, nothing here ever touches the real machine's ~/.claude or
 """
 import json
 import os
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 TOOLS_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(TOOLS_DIR))
+
+import memidx  # noqa: E402
+
 DECIDE_SH = TOOLS_DIR / "scripts" / "memcontinuum-decide.sh"
 UPDATE_SH = TOOLS_DIR / "scripts" / "memcontinuum-update.sh"
 INSTALL_SH = TOOLS_DIR / "scripts" / "repo-init.sh"
@@ -88,6 +94,41 @@ def tmpdir(prefix):
     # One helper, not a `realpath` sprinkled onto each of this file's
     # ~25 `self.tmp = tempfile.mkdtemp(...)` setUp lines.
     return os.path.realpath(tempfile.mkdtemp(prefix=prefix))
+
+
+def copy_engine_for_machine_layer(dst):
+    """Copies the whole engine (mirrors test_repo_init.py's own copy_engine,
+    plus memcontinuum-setup.sh, scripts/memcontinuum-update.sh, and
+    requirements.lock -- neither file that helper needs to copy) into dst.
+
+    Needed only by TestMachineDependencyReconciliation's tests that let
+    memcontinuum-setup.sh take its create-a-venv branch (no
+    MEMCONTINUUM_PYTHON resolvable anywhere): that branch creates
+    "$SCRIPT_DIR/.venv", and SCRIPT_DIR is memcontinuum-setup.sh's OWN
+    location -- running the real checkout's copy directly would write a
+    stray .venv/ into this worktree instead of a disposable temp copy.
+    Deliberately duplicated, not imported from test_repo_init.py: these test
+    files stay independently runnable, same convention as this file's own
+    "deliberately duplicated, not sourced" shell helpers (see
+    mc_update_resolve_python's comment in scripts/memcontinuum-update.sh).
+    """
+    dst = Path(dst)
+    dst.mkdir(parents=True, exist_ok=True)
+    (dst / "scripts").mkdir(exist_ok=True)
+    for name in ("repo-init.sh", "mc_settings_merge.py", "mc-registry-lib.sh",
+                 "memcontinuum-decide.sh", "memcontinuum-update.sh"):
+        shutil.copy(TOOLS_DIR / "scripts" / name, dst / "scripts" / name)
+    for name in ("repo-init.sh", "memcontinuum-decide.sh", "memcontinuum-update.sh"):
+        (dst / "scripts" / name).chmod(0o755)
+    shutil.copy(TOOLS_DIR / "memcontinuum-setup.sh", dst / "memcontinuum-setup.sh")
+    (dst / "memcontinuum-setup.sh").chmod(0o755)
+    for name in ("memidx.py", "memlint.py", "requirements.txt", "requirements.lock"):
+        shutil.copy(TOOLS_DIR / name, dst / name)
+    for name in ("hooks", "templates", "skills"):
+        shutil.copytree(TOOLS_DIR / name, dst / name)
+    shutil.copytree(TOOLS_DIR / "chunkers", dst / "chunkers",
+                     ignore=shutil.ignore_patterns("__pycache__"))
+    return dst
 
 
 def engine_sha(root=None, scope="repo"):
@@ -884,6 +925,36 @@ class TestAddLangAndNeverExt(UpdateTestBase):
         self.assertEqual(decisions_tsv(self.home).read_text(), before)
 
 
+class TestAddLangTreeSitter(UpdateTestBase):
+    """Task 10: `--add-lang` end to end for one of the six new tree-sitter
+    languages -- same wiring path TestAddLangAndNeverExt above proves for
+    Swift, exercised once against a real tree-sitter grammar to confirm the
+    reindex actually runs (not just the decisions.tsv/settings.local.json
+    side)."""
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_add_lang_rust_end_to_end(self):
+        (Path(self.code_root) / "lib.rs").write_text("fn f() -> i32 { 1 }\n")
+        proc = run(UPDATE_SH, ["--add-lang", "rust", "--repo", self.repo], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        note = decisions_tsv(self.home).read_text().splitlines()[-1]
+        self.assertIn("langs=python;rust", note, note)
+        self.assertIn("never=.cs", note)   # additive -- setUp's --never-ext survives
+        # LANG_EXTS is this project's wired set and grows additively (same
+        # assertion shape as TestAddLangAndNeverExt's swift precedent
+        # above); KNOWN_EXTS is chunkers.known_extensions() -- the WHOLE
+        # LANGUAGE_TABLE, project-independent -- so it already lists *.rs
+        # before this call and never "grows" from --add-lang.
+        self.assertIn("'*.py *.rs'", self.settings_text())
+
+        db = Path(self.home) / ".memcontinuum" / "proj-code.sqlite"
+        conn = memidx.open_code_db(db)
+        langs = conn.execute("SELECT langs FROM code_project").fetchone()[0]
+        self.assertIn("rust", langs.split(","))
+        chunks = conn.execute("SELECT qualified_name FROM chunks WHERE path='lib.rs'").fetchall()
+        self.assertEqual([r[0] for r in chunks], ["f"])
+
+
 class TestMachineFlag(UpdateTestBase):
     def test_machine_flag_refreshes_the_machine_layer_and_off_by_default(self):
         proc = run(UPDATE_SH, ["--apply"], self.home)
@@ -894,6 +965,546 @@ class TestMachineFlag(UpdateTestBase):
         self.assertEqual(proc2.returncode, 0, proc2.stdout + proc2.stderr)
         self.assertIn("refreshing machine layer", proc2.stdout)
         self.assertTrue(Path(self.home, ".memcontinuum", "config.sh").is_file())
+
+
+class TestMachineDependencyReconciliation(UpdateTestBase):
+    def _fake_uv_bin(self, record, preflight_json=""):
+        # Same idiom as test_repo_init.py's existing bootstrap-venv fakes:
+        # `uv venv DIR` creates DIR/bin/python, a shim that records every
+        # `-m pip ...` invocation and execs the real VENV_PYTHON for
+        # anything else (import checks etc.) -- no real package install,
+        # so this stays fast and hermetic.
+        #
+        # `preflight_json`, when given, makes the same shim answer the
+        # updater's `backend-preflight --json` invocation with canned JSON
+        # instead of running the real one, so a test can put the managed
+        # venv into a state (a row off its pins) that no real install here
+        # is in. Everything else still execs the real python.
+        fakebin = tempfile.mkdtemp(prefix="memcontinuum-fake-uv-")
+        fake_uv = Path(fakebin) / "uv"
+        preflight_branch = ""
+        if preflight_json:
+            preflight_branch = (
+                'if [ "\\$2" = "backend-preflight" ]; then\n'
+                f"    printf '%s' '{preflight_json}'\n"
+                "    exit 0\n"
+                "fi\n"
+            )
+        fake_uv.write_text(
+            "#!/usr/bin/env bash\n"
+            'if [ "$1" = "venv" ]; then\n'
+            '    dir="$2"; mkdir -p "$dir/bin"\n'
+            f'    cat > "$dir/bin/python" <<PYEOF\n'
+            "#!/usr/bin/env bash\n"
+            'if [ "\\$1" = "-m" ] && [ "\\$2" = "pip" ]; then\n'
+            f'    printf \'%s\\n\' "\\$*" >> "{record}"\n'
+            "    exit 0\n"
+            "fi\n"
+            + preflight_branch +
+            f'exec "{VENV_PYTHON}" "\\$@"\n'
+            "PYEOF\n"
+            '    chmod +x "$dir/bin/python"\n'
+            "    exit 0\n"
+            "fi\n"
+            "exit 0\n"
+        )
+        fake_uv.chmod(0o755)
+        return fakebin
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_single_first_ever_run_reconciles_then_a_second_run_is_a_no_op(self):
+        record = Path(self.tmp) / "pip-invocations.log"
+        fakebin = self._fake_uv_bin(record)
+        # Run against a disposable copy of the engine, not this checkout's
+        # own: with no MEMCONTINUUM_PYTHON resolvable anywhere,
+        # memcontinuum-setup.sh's create-a-venv branch writes
+        # "$SCRIPT_DIR/.venv" -- SCRIPT_DIR being wherever the running copy
+        # of memcontinuum-setup.sh itself lives. Against the real checkout
+        # that is this worktree; against a copy it is the disposable copy.
+        engine_dir = tempfile.mkdtemp(prefix="memcontinuum-engine-copy-")
+        copy_engine_for_machine_layer(engine_dir)
+        update_sh = Path(engine_dir) / "scripts" / "memcontinuum-update.sh"
+        try:
+            env = clean_env(self.home)
+            env.pop("MEMCONTINUUM_PYTHON", None)   # force mc_update_resolve_python to find nothing yet
+            env["PATH"] = fakebin + os.pathsep + env["PATH"]
+
+            # --- Run 1: the FIRST EVER --apply --machine on this sandbox ---
+            proc1 = subprocess.run(
+                [MC_BASH, str(update_sh), "--apply", "--machine"],
+                capture_output=True, text=True, timeout=120, env=env, cwd=self.home,
+            )
+            self.assertEqual(proc1.returncode, 0, proc1.stdout + proc1.stderr)
+            self.assertIn("refreshing machine layer", proc1.stdout)
+            config_sh = Path(self.home, ".memcontinuum", "config.sh")
+            self.assertTrue(config_sh.is_file())
+            cfg = config_sh.read_text()
+            # No python was resolvable beforehand -> memcontinuum-setup.sh
+            # created its own venv with no explicit --python -> its sticky
+            # flag logic (this task's fix) writes managed=1 on its own,
+            # unprompted by anything this test injected into config.sh.
+            self.assertIn("MEMCONTINUUM_VENV_MANAGED=", cfg)
+            self.assertNotIn("MEMCONTINUUM_VENV_MANAGED=0", cfg.replace('"', "").replace("'", ""))
+            # Reconciliation ran AFTER the refresh, in this SAME first run,
+            # re-reading the config.sh the refresh had just written.
+            self.assertTrue(record.is_file(), proc1.stdout + proc1.stderr)
+            self.assertIn("requirements.lock", record.read_text())
+
+            # --- Run 2: nothing changed -- must be a true no-op ---
+            record.unlink()
+            proc2 = subprocess.run(
+                [MC_BASH, str(update_sh), "--apply", "--machine"],
+                capture_output=True, text=True, timeout=120, env=env, cwd=self.home,
+            )
+            self.assertEqual(proc2.returncode, 0, proc2.stdout + proc2.stderr)
+            self.assertNotIn("refreshing machine layer", proc2.stdout)
+            self.assertFalse(record.exists(), "a no-op second run must not re-invoke pip at all")
+        finally:
+            shutil.rmtree(fakebin, ignore_errors=True)
+            shutil.rmtree(engine_dir, ignore_errors=True)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_an_already_current_machine_layer_still_reports_a_pin_mismatch(self):
+        """The backend-preflight report answers to a different gate than the
+        pip reinstall does. A pin mismatch is a RUNTIME-INSTALL condition --
+        someone pip-installs a newer grammar into the managed venv and
+        nothing about the wiring goes stale -- so the common way it appears
+        is on a machine layer that is already current, which is exactly the
+        run that used to skip the report entirely.
+
+        Same managed two-run fixture as
+        test_single_first_ever_run_reconciles_then_a_second_run_is_a_no_op
+        above, with the venv shim also answering `backend-preflight --json`
+        with a row off its pins. Run 2 must print the warning AND still not
+        re-invoke pip: the no-op guarantee is about the install, not the
+        report."""
+        record = Path(self.tmp) / "pip-invocations.log"
+        fakebin = self._fake_uv_bin(
+            record,
+            preflight_json=(
+                '{"javascript": {"ok": true, "state": "pin-mismatch", '
+                '"reason": "tree-sitter-javascript: pinned 0.25.0, installed 9.9.9"}, '
+                '"python": {"ok": true, "state": "ok", "reason": null}}'
+            ),
+        )
+        engine_dir = tempfile.mkdtemp(prefix="memcontinuum-engine-copy-")
+        copy_engine_for_machine_layer(engine_dir)
+        update_sh = Path(engine_dir) / "scripts" / "memcontinuum-update.sh"
+        warning = "machine: WARNING installed versions differ from the pins for: javascript"
+        try:
+            env = clean_env(self.home)
+            env.pop("MEMCONTINUUM_PYTHON", None)
+            env["PATH"] = fakebin + os.pathsep + env["PATH"]
+
+            proc1 = subprocess.run(
+                [MC_BASH, str(update_sh), "--apply", "--machine"],
+                capture_output=True, text=True, timeout=120, env=env, cwd=self.home,
+            )
+            self.assertEqual(proc1.returncode, 0, proc1.stdout + proc1.stderr)
+            self.assertIn("refreshing machine layer", proc1.stdout)
+            self.assertIn(warning, proc1.stdout)
+            self.assertTrue(record.is_file())
+
+            record.unlink()
+            proc2 = subprocess.run(
+                [MC_BASH, str(update_sh), "--apply", "--machine"],
+                capture_output=True, text=True, timeout=120, env=env, cwd=self.home,
+            )
+            self.assertEqual(proc2.returncode, 0, proc2.stdout + proc2.stderr)
+            self.assertIn("machine layer already current", proc2.stdout)
+            self.assertIn(warning, proc2.stdout,
+                          "an already-current machine layer still reports a pin mismatch")
+            self.assertFalse(record.exists(),
+                             "the report runs on every apply; the pip install still does not")
+        finally:
+            shutil.rmtree(fakebin, ignore_errors=True)
+            shutil.rmtree(engine_dir, ignore_errors=True)
+
+    def _fake_uv_bin_pip_absent(self, pip_record, uv_pip_record):
+        """Task 10 fix-round carry-over (Task 9 review item 2): the plain
+        `_fake_uv_bin` shim's `-m pip` branch always exits 0, so
+        memcontinuum-update.sh's `elif ... uv pip install --python ...`
+        fallback (scripts/memcontinuum-update.sh lines ~1826-1839) is never
+        actually exercised by any existing test -- it always takes the
+        first `if PYTHONPATH= "$MANAGED_PY" -m pip install ...` branch.
+
+        This variant makes the venv's own `-m pip` FAIL instead (recording
+        the attempt to pip_record first) -- the real shape of a venv `uv
+        venv` creates, which omits pip/setuptools/wheel by default (see the
+        production code's own comment at that elif) -- and gives the fake
+        `uv` binary a `pip install --python PATH -r FILE` subcommand
+        (recording to uv_pip_record, succeeding) so the fallback has
+        somewhere to land."""
+        fakebin = tempfile.mkdtemp(prefix="memcontinuum-fake-uv-pipless-")
+        fake_uv = Path(fakebin) / "uv"
+        fake_uv.write_text(
+            "#!/usr/bin/env bash\n"
+            'if [ "$1" = "venv" ]; then\n'
+            '    dir="$2"; mkdir -p "$dir/bin"\n'
+            f'    cat > "$dir/bin/python" <<PYEOF\n'
+            "#!/usr/bin/env bash\n"
+            'if [ "\\$1" = "-m" ] && [ "\\$2" = "pip" ]; then\n'
+            f'    printf \'%s\\n\' "\\$*" >> "{pip_record}"\n'
+            "    echo 'No module named pip' >&2\n"
+            "    exit 1\n"
+            "fi\n"
+            f'exec "{VENV_PYTHON}" "\\$@"\n'
+            "PYEOF\n"
+            '    chmod +x "$dir/bin/python"\n'
+            "    exit 0\n"
+            "fi\n"
+            'if [ "$1" = "pip" ]; then\n'
+            f'    printf \'%s\\n\' "$*" >> "{uv_pip_record}"\n'
+            "    exit 0\n"
+            "fi\n"
+            "exit 0\n"
+        )
+        fake_uv.chmod(0o755)
+        return fakebin
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_pipless_managed_venv_falls_back_to_uv_pip_install(self):
+        """Task 9 review carry-over item 2: the `uv pip install --python`
+        fallback is real production code (scripts/memcontinuum-update.sh
+        ~1826-1839) but every existing reconciliation test's fake-uv shim
+        makes `-m pip` always succeed, so the fallback branch has never
+        actually run under test. Here `-m pip` fails (pip absent, as a
+        plain `uv venv` really produces) so the elif's `uv pip install`
+        call is the one that reconciles -- asserted both by the "(via uv)"
+        wording in stdout and by the recorded uv invocation naming
+        --python MANAGED_PY and requirements.lock."""
+        pip_record = Path(self.tmp) / "pip-invocations.log"
+        uv_pip_record = Path(self.tmp) / "uv-pip-invocations.log"
+        fakebin = self._fake_uv_bin_pip_absent(pip_record, uv_pip_record)
+        engine_dir = tempfile.mkdtemp(prefix="memcontinuum-engine-copy-")
+        copy_engine_for_machine_layer(engine_dir)
+        update_sh = Path(engine_dir) / "scripts" / "memcontinuum-update.sh"
+        try:
+            env = clean_env(self.home)
+            env.pop("MEMCONTINUUM_PYTHON", None)   # force mc_update_resolve_python to find nothing yet
+            env["PATH"] = fakebin + os.pathsep + env["PATH"]
+
+            proc = subprocess.run(
+                [MC_BASH, str(update_sh), "--apply", "--machine"],
+                capture_output=True, text=True, timeout=120, env=env, cwd=self.home,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertTrue(pip_record.is_file(), "the -m pip attempt (which fails) must still run first")
+            self.assertTrue(uv_pip_record.is_file(), proc.stdout + proc.stderr)
+            uv_call = uv_pip_record.read_text()
+            self.assertIn("--python", uv_call)
+            self.assertIn("requirements.lock", uv_call)
+            self.assertIn("OK: dependencies reconciled (via uv)", proc.stdout)
+        finally:
+            shutil.rmtree(fakebin, ignore_errors=True)
+            shutil.rmtree(engine_dir, ignore_errors=True)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_foreign_python_is_never_pip_installed_into(self):
+        # A DIFFERENT explicit --python than anything config.sh has ever
+        # recorded as managed -- the sticky-flag fix's "genuinely new
+        # explicit path" branch, which must record managed=0.
+        #
+        # This shim also shadows tree_sitter_lua (a stub package on a
+        # PYTHONPATH it injects for itself, ahead of the real one) so
+        # backend-preflight genuinely finds something missing on this
+        # "foreign" python -- without that, this test's assertion that the
+        # remedy text names something missing would depend on this
+        # machine's shared MEMCONTINUUM_PYTHON venv happening to be missing
+        # a wheel, which it is not (Task 1's coordinator step installed all
+        # seven; TestBackendPreflight's own positive test relies on exactly
+        # that). Shadowing one row here, rather than relying on machine
+        # state, is what actually exercises the "still missing" branch.
+        record = Path(self.tmp) / "pip-invocations.log"
+        shadow_pkg = Path(self.tmp) / "shadow" / "tree_sitter_lua"
+        shadow_pkg.mkdir(parents=True, exist_ok=True)
+        (shadow_pkg / "__init__.py").write_text(
+            "raise ImportError('shadowed for TestMachineDependencyReconciliation')\n"
+        )
+        shim = Path(self.tmp) / "foreign-python"
+        shim.write_text(
+            "#!/usr/bin/env bash\n"
+            'if [ "$1" = "-m" ] && [ "$2" = "pip" ]; then\n'
+            f'    printf \'%s\\n\' "$*" >> "{record}"\n'
+            "    exit 0\n"
+            "fi\n"
+            f'export PYTHONPATH="{shadow_pkg.parent}"\n'
+            f'exec "{VENV_PYTHON}" "$@"\n'
+        )
+        shim.chmod(0o755)
+        env = clean_env(self.home)
+        env["MEMCONTINUUM_PYTHON"] = str(shim)   # a genuinely foreign path, never seen before
+
+        engine_dir = tempfile.mkdtemp(prefix="memcontinuum-engine-copy-")
+        copy_engine_for_machine_layer(engine_dir)
+        update_sh = Path(engine_dir) / "scripts" / "memcontinuum-update.sh"
+        try:
+            proc = subprocess.run(
+                [MC_BASH, str(update_sh), "--apply", "--machine"],
+                capture_output=True, text=True, timeout=120, env=env, cwd=self.home,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            config_sh = Path(self.home, ".memcontinuum", "config.sh")
+            cfg = config_sh.read_text()
+            self.assertIn("MEMCONTINUUM_VENV_MANAGED=0", cfg.replace('"', "").replace("'", ""))
+            self.assertFalse(record.exists(), "a foreign (unmanaged) python must never be pip-installed into")
+            self.assertIn("lua", proc.stdout + proc.stderr)     # the shadowed row, named
+            self.assertIn("yourself", proc.stdout + proc.stderr)   # the named remedy text
+        finally:
+            shutil.rmtree(engine_dir, ignore_errors=True)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_backend_preflight_pin_mismatch_is_reported_with_its_own_remedy_line(self):
+        """The `pin-mismatch` branch at scripts/memcontinuum-update.sh's
+        `backend-preflight --json` consumer (ruling 108's third state,
+        named by ruling 111) had no test at all: every existing fixture
+        here only ever produces `ok` or `missing` rows on a real python,
+        because a mismatch needs a genuinely different installed version
+        and nothing here perturbs one.
+
+        Same "genuinely new (foreign) path" idiom as
+        test_foreign_python_is_never_pip_installed_into above (managed=0,
+        so the pip-reconciliation block is skipped and only the
+        unconditional `PREFLIGHT_JSON="$(PYTHONPATH= "$MANAGED_PY" "$MEMIDX"
+        backend-preflight --json)"` step below it runs) -- but this shim
+        intercepts the `backend-preflight` invocation itself and hands back
+        canned JSON reporting two mismatched rows and one clean one,
+        rather than trying to engineer a real version mismatch through a
+        subprocess. Everything else (`-m pip`, version probes, import
+        checks memcontinuum-setup.sh makes along the way) still execs the
+        real venv python, same as the sibling test."""
+        shim = Path(self.tmp) / "pin-mismatch-python"
+        shim.write_text(
+            "#!/usr/bin/env bash\n"
+            'if [ "$1" = "-m" ] && [ "$2" = "pip" ]; then\n'
+            "    exit 0\n"
+            "fi\n"
+            'if [ "$2" = "backend-preflight" ]; then\n'
+            "    cat <<'JSONEOF'\n"
+            '{"javascript": {"ok": true, "state": "pin-mismatch", '
+            '"reason": "tree-sitter-javascript: pinned 0.25.0, installed 9.9.9"}, '
+            '"php": {"ok": true, "state": "pin-mismatch", '
+            '"reason": "tree-sitter-php: pinned 0.24.1, installed 1.0.0"}, '
+            '"python": {"ok": true, "state": "ok", "reason": null}}\n'
+            "JSONEOF\n"
+            "    exit 0\n"
+            "fi\n"
+            f'exec "{VENV_PYTHON}" "$@"\n'
+        )
+        shim.chmod(0o755)
+        env = clean_env(self.home)
+        env["MEMCONTINUUM_PYTHON"] = str(shim)   # a genuinely foreign path, never seen before
+
+        engine_dir = tempfile.mkdtemp(prefix="memcontinuum-engine-copy-")
+        copy_engine_for_machine_layer(engine_dir)
+        update_sh = Path(engine_dir) / "scripts" / "memcontinuum-update.sh"
+        try:
+            proc = subprocess.run(
+                [MC_BASH, str(update_sh), "--apply", "--machine"],
+                capture_output=True, text=True, timeout=120, env=env, cwd=self.home,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            config_sh = Path(self.home, ".memcontinuum", "config.sh")
+            cfg = config_sh.read_text()
+            self.assertIn("MEMCONTINUUM_VENV_MANAGED=0", cfg.replace('"', "").replace("'", ""))
+            out = proc.stdout + proc.stderr
+            self.assertIn(
+                "machine: WARNING installed versions differ from the pins for: javascript,php",
+                out,
+            )
+            self.assertIn("backend-preflight' for the pinned and installed version of each", out)
+            # The clean row (python) must not show up on either line, and
+            # the missing-wheel remedy ("install the pinned tree-sitter
+            # grammar wheels ... yourself") is a DIFFERENT branch that a
+            # mismatch-only report must never also print.
+            self.assertNotIn("not available in", out)
+            self.assertNotIn("still missing after reinstall", out)
+        finally:
+            shutil.rmtree(engine_dir, ignore_errors=True)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_sticky_flag_keeps_managed_true_when_the_same_python_is_reaffirmed(self):
+        # Revision 4: covers the specific branch binding addition (d)
+        # exists to fix -- an explicit --python naming the EXACT SAME
+        # path config.sh already recorded as managed=1 must NOT be
+        # downgraded to managed=0. Tested directly at
+        # memcontinuum-setup.sh's own level (where the sticky logic
+        # lives), not through a second --machine round-trip -- forcing a
+        # SECOND stale-fingerprint refresh without changing which python is
+        # used needs machine-layer-fingerprint internals this test does
+        # not otherwise depend on, and the sticky branch is entirely
+        # setup.sh's own decision regardless of what calls it.
+        record = Path(self.tmp) / "pip-invocations.log"
+        fakebin = self._fake_uv_bin(record)
+        claude_dir = str(Path(self.tmp) / "sticky-claude")
+        engine_dir = tempfile.mkdtemp(prefix="memcontinuum-engine-copy-")
+        copy_engine_for_machine_layer(engine_dir)
+        setup_sh = Path(engine_dir) / "memcontinuum-setup.sh"
+        try:
+            env = clean_env(self.home)
+            env.pop("MEMCONTINUUM_PYTHON", None)
+            env["PATH"] = fakebin + os.pathsep + env["PATH"]
+
+            # Run 1: no --python -> setup.sh creates its own venv, managed=1.
+            proc1 = subprocess.run(
+                [MC_BASH, str(setup_sh), "--claude-dir", claude_dir, "--no-model-warm"],
+                capture_output=True, text=True, timeout=120, env=env, cwd=self.home,
+            )
+            self.assertEqual(proc1.returncode, 0, proc1.stdout + proc1.stderr)
+            config_sh = Path(self.home, ".memcontinuum", "config.sh")
+            cfg1 = config_sh.read_text()
+            self.assertIn("MEMCONTINUUM_VENV_MANAGED=1", cfg1.replace('"', "").replace("'", ""))
+            managed_python = re.search(r"MEMCONTINUUM_PYTHON=['\"]?([^'\"\n]+)", cfg1).group(1)
+
+            # Run 2: --python EXPLICITLY names that SAME path -- the sticky
+            # re-affirmation branch, not the "genuinely new path" branch
+            # test_foreign_python_is_never_pip_installed_into exercises.
+            proc2 = subprocess.run(
+                [MC_BASH, str(setup_sh), "--claude-dir", claude_dir, "--python", managed_python, "--no-model-warm"],
+                capture_output=True, text=True, timeout=120, env=env, cwd=self.home,
+            )
+            self.assertEqual(proc2.returncode, 0, proc2.stdout + proc2.stderr)
+            cfg2 = config_sh.read_text()
+            self.assertIn(
+                "MEMCONTINUUM_VENV_MANAGED=1", cfg2.replace('"', "").replace("'", ""),
+                "an explicit --python re-affirming an already-managed path must stay managed=1 "
+                "-- a regression reverting the sticky fix would leave this reading 0",
+            )
+        finally:
+            shutil.rmtree(fakebin, ignore_errors=True)
+            shutil.rmtree(engine_dir, ignore_errors=True)
+
+
+class TestFailedRefreshReconcilesNothing(UpdateTestBase):
+    """Whole-branch review, finding 5(b). `not_applied` only records
+    WALK_RC=1 and returns, so a FAILED memcontinuum-setup.sh used to fall
+    through into the reconciliation block anyway -- reading a config.sh the
+    failed refresh never rewrote, and pip-installing requirements.lock into
+    whatever python that stale file happened to name. Reconciliation now
+    runs only after a refresh that actually succeeded."""
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_a_failed_machine_refresh_never_reaches_pip(self):
+        record = Path(self.tmp) / "pip-invocations.log"
+        # A python config.sh names as engine-managed. If the guard is
+        # missing, the reconciliation block finds MANAGED_PY=this shim and
+        # MANAGED_FLAG=1 and pip-installs into it.
+        shim = Path(self.tmp) / "recorded-python"
+        shim.write_text(
+            "#!/usr/bin/env bash\n"
+            'if [ "$1" = "-m" ] && [ "$2" = "pip" ]; then\n'
+            f'    printf \'%s\\n\' "$*" >> "{record}"\n'
+            "    exit 0\n"
+            "fi\n"
+            f'exec "{VENV_PYTHON}" "$@"\n'
+        )
+        shim.chmod(0o755)
+        mc_home = Path(self.home) / ".memcontinuum"
+        mc_home.mkdir(parents=True, exist_ok=True)
+        (mc_home / "config.sh").write_text(
+            f"if [ -z \"${{MEMCONTINUUM_PYTHON:-}}\" ]; then MEMCONTINUUM_PYTHON='{shim}'; fi\n"
+            "MEMCONTINUUM_VENV_MANAGED='1'\n"
+        )
+
+        engine_dir = tempfile.mkdtemp(prefix="memcontinuum-engine-copy-")
+        copy_engine_for_machine_layer(engine_dir)
+        # The refresh itself fails, the way a real setup.sh does when it hits
+        # its own python version gate before writing config.sh.
+        setup_stub = Path(engine_dir) / "memcontinuum-setup.sh"
+        setup_stub.write_text(
+            "#!/usr/bin/env bash\n"
+            "echo 'ERROR: refusing, this is the stub' >&2\n"
+            "exit 1\n"
+        )
+        setup_stub.chmod(0o755)
+        update_sh = Path(engine_dir) / "scripts" / "memcontinuum-update.sh"
+        try:
+            proc = subprocess.run(
+                [MC_BASH, str(update_sh), "--apply", "--machine"],
+                capture_output=True, text=True, timeout=120,
+                env=clean_env(self.home), cwd=self.home,
+            )
+            out = proc.stdout + proc.stderr
+            self.assertIn("FAILED: machine layer refresh", out)
+            self.assertNotEqual(proc.returncode, 0, out)
+            self.assertFalse(
+                record.exists(),
+                "a failed refresh must never pip-install into the python a stale "
+                f"config.sh names: {record.read_text() if record.exists() else ''}",
+            )
+            self.assertNotIn("reinstalling requirements.lock", out)
+            self.assertNotIn("dependencies reconciled", out)
+        finally:
+            shutil.rmtree(engine_dir, ignore_errors=True)
+
+
+class TestConfigManagedPythonReadsDiskTruth(unittest.TestCase):
+    """Whole-branch review, finding 5(a). Direct unit coverage for
+    mc_config_managed_python (scripts/mc-registry-lib.sh) -- the ONE
+    implementation of the guarded config.sh read that
+    memcontinuum-setup.sh's sticky managed-venv determination and
+    memcontinuum-update.sh --machine's reconciliation both call. Same shape
+    as TestMcPhysical above: the library is pure (no top-level execution),
+    so it is safely sourceable on its own."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp(prefix="memcontinuum-config-read-test-")
+        self.addCleanup(shutil.rmtree, self.td, ignore_errors=True)
+        self.config = Path(self.td) / "config.sh"
+        # Written exactly the way memcontinuum-setup.sh writes it: the
+        # python line is conditional, the managed flag is not.
+        self.config.write_text(
+            "if [ -z \"${MEMCONTINUUM_PYTHON:-}\" ]; then MEMCONTINUUM_PYTHON='/on/disk/python'; fi\n"
+            "MEMCONTINUUM_VENV_MANAGED='1'\n"
+        )
+
+    def _call(self, config, env_overrides=None):
+        caller = Path(self.td) / "probe.sh"
+        caller.write_text(
+            f'#!/usr/bin/env bash\nset -u\n. "{REGISTRY_LIB}"\n'
+            'mc_config_managed_python "$1"\n'
+            'printf "%s\\n%s\\n%s" "$?" "$MC_CONFIG_PYTHON" "$MC_CONFIG_MANAGED"\n'
+        )
+        env = dict(os.environ)
+        env.pop("MEMCONTINUUM_PYTHON", None)
+        env.pop("MEMCONTINUUM_VENV_MANAGED", None)
+        env.update(env_overrides or {})
+        proc = subprocess.run(
+            [MC_BASH, str(caller), str(config)],
+            capture_output=True, text=True, env=env, timeout=10,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        rc, python, managed = proc.stdout.split("\n")
+        return rc, python, managed
+
+    def test_a_callers_own_env_value_never_shadows_the_recorded_one(self):
+        # The tautology this guard exists for: without the `unset`, the
+        # conditional python line leaves the caller's own value in place and
+        # the read hands it back as if config.sh had recorded it -- while
+        # the unconditional managed flag reads the real file, so a foreign
+        # python pairs with a managed=1 nobody granted it.
+        rc, python, managed = self._call(
+            self.config, {"MEMCONTINUUM_PYTHON": "/foreign/python3.11"}
+        )
+        self.assertEqual(rc, "0")
+        self.assertEqual(python, "/on/disk/python")
+        self.assertEqual(managed, "1")
+
+    def test_reads_the_recorded_values_with_nothing_in_the_environment(self):
+        rc, python, managed = self._call(self.config)
+        self.assertEqual((rc, python, managed), ("0", "/on/disk/python", "1"))
+
+    def test_a_missing_config_returns_one_and_clears_both(self):
+        rc, python, managed = self._call(Path(self.td) / "nowhere" / "config.sh")
+        self.assertEqual((rc, python, managed), ("1", "", "0"))
+
+    def test_both_callers_use_this_one_implementation(self):
+        # The defect was the same read implemented twice, one guarded and
+        # one not. Assert there is one implementation and both callers reach
+        # it, so a future edit cannot silently re-fork it.
+        for script in (TOOLS_DIR / "memcontinuum-setup.sh",
+                       TOOLS_DIR / "scripts" / "memcontinuum-update.sh"):
+            self.assertIn("mc_config_managed_python", script.read_text(), str(script))
 
 
 class TestStoreMissingIsAFirstClassAction(UpdateTestBase):
@@ -1629,10 +2240,24 @@ class TestPartiallyRenderedLanguagesAreReported(unittest.TestCase):
             env={**os.environ, "PYTHONPATH": ""})
         return out.stdout.strip().split()
 
+    def _all_langs(self):
+        out = subprocess.run(
+            [VENV_PYTHON, "-c",
+             "import chunkers; print(' '.join(sorted(chunkers.LANGUAGE_TABLE)))"],
+            cwd=str(TOOLS_DIR), capture_output=True, text=True,
+            env={**os.environ, "PYTHONPATH": ""})
+        return out.stdout.strip().split()
+
     @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
     def test_a_half_rendered_language_is_named_not_silently_dropped(self):
         multi = None
-        for lang in ("swift", "python"):
+        # Derived from the live LANGUAGE_TABLE (Task 3 hygiene fix), not a
+        # hardcoded ("swift", "python") pair -- both of those have exactly
+        # one extension each, so the old loop always fell through to
+        # skipTest below and never actually exercised this case. javascript
+        # (.js/.jsx/.mjs/.cjs, four extensions) is now the first
+        # multi-extension row in sorted order.
+        for lang in self._all_langs():
             if len(self._lang_exts(lang)) > 1:
                 multi = lang
                 break

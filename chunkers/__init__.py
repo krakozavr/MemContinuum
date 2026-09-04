@@ -10,6 +10,7 @@ there is no API to register a second backend for an existing language.
 import hashlib
 import importlib
 import os
+import sys
 
 KINDS = frozenset({"function", "method", "constructor", "accessor", "closure"})
 
@@ -41,7 +42,128 @@ LANGUAGE_TABLE = {
     "python": {"backend": "native", "module": "chunkers.python_ast",
                "extensions": (".py",), "shebangs": ("python", "python3"),
                "impl_version": "1",
+               # This row chunks through `ast.parse`, so the INTERPRETER is
+               # part of its chunker the way a grammar wheel is part of a
+               # tree-sitter row's: the accepted syntax and the node shapes
+               # move with CPython, and this repo's own CI runs a 3.12/3.13
+               # matrix. Without the interpreter in chunker_version, every
+               # already-indexed .py file whose bytes did not change is left
+               # as-is under a parser that can now read it differently --
+               # the gap ruling 108 closed for the tree-sitter tier by
+               # hashing the installed runtime. The swift row does NOT
+               # declare this: chunkers/swift.py is a hand-written lexer
+               # over `re` and str operations, with no interpreter-version
+               # -sensitive parse behind it, so its source fingerprint plus
+               # impl_version already covers it.
+               "interpreter_sensitive": True,
                "skip_dirs": frozenset({"build", "dist"})},
+    "javascript": {"backend": "tree-sitter", "module": "chunkers.treesitter",
+                    "grammar_module": "tree_sitter_javascript", "language_fn": "language",
+                    "runtime_pin": "0.26.0", "grammar_pin": "0.25.0",
+                    "query_file": "javascript.scm", "impl_version": "1",
+                    "extensions": (".js", ".jsx", ".mjs", ".cjs"), "shebangs": ("node",),
+                    "skip_dirs": frozenset({"build", "dist"}),
+                    "containers": {"class_declaration": "name"},
+                    "method_if_ancestor_in": frozenset(), "max_bytes": None},
+    "typescript": {"backend": "tree-sitter", "module": "chunkers.treesitter",
+                    "grammar_module": "tree_sitter_typescript", "language_fn": "language_typescript",
+                    "runtime_pin": "0.26.0", "grammar_pin": "0.23.2",
+                    "query_file": "typescript.scm", "impl_version": "1",
+                    "extensions": (".ts",), "shebangs": (),
+                    "skip_dirs": frozenset({"build", "dist"}),
+                    # `namespace M {}` is an internal_module and `module M {}`
+                    # a module; both declare a scope a reference spells, so
+                    # both qualify what they hold -- otherwise the same source
+                    # qualifies or not depending on which spelling its author
+                    # reached for. The module node type ALSO covers the
+                    # ambient external module `declare module "react" {}`,
+                    # which declares no such scope and whose name is a quoted
+                    # specifier; treesitter._qualify drops a string-literal
+                    # container name, so a declaration inside one keeps its own
+                    # unqualified name instead of `"react".f`.
+                    # `abstract class A {}` is its own node type,
+                    # abstract_class_declaration, distinct from
+                    # class_declaration -- a plain class body reuses the same
+                    # ancestor-qualification rule, so this row must list both.
+                    "containers": {"class_declaration": "name", "internal_module": "name",
+                                    "module": "name", "abstract_class_declaration": "name"},
+                    "method_if_ancestor_in": frozenset(), "max_bytes": None},
+    "tsx": {"backend": "tree-sitter", "module": "chunkers.treesitter",
+            "grammar_module": "tree_sitter_typescript", "language_fn": "language_tsx",
+            "runtime_pin": "0.26.0", "grammar_pin": "0.23.2",
+            "query_file": "typescript.scm", "impl_version": "1",
+            "extensions": (".tsx",), "shebangs": (),
+            "skip_dirs": frozenset({"build", "dist"}),
+            # Same two namespace spellings (and the same string-named
+            # `declare module "x" {}` exclusion) as the typescript row above,
+            # plus the same abstract_class_declaration node type.
+            "containers": {"class_declaration": "name", "internal_module": "name",
+                            "module": "name", "abstract_class_declaration": "name"},
+            "method_if_ancestor_in": frozenset(), "max_bytes": None},
+    "java": {"backend": "tree-sitter", "module": "chunkers.treesitter",
+             "grammar_module": "tree_sitter_java", "language_fn": "language",
+             "runtime_pin": "0.26.0", "grammar_pin": "0.23.5",
+             # impl_version stands at "2" from the fix round that taught this
+             # row to read real Javadoc/line-comment text into a chunk's `doc`
+             # field. That bump is no longer the mechanism it was: whole-branch
+             # review finding 4 folded doc_comment_types (and containers,
+             # method_if_ancestor_in, max_bytes) into chunker_version's payload
+             # through treesitter.row_shape, so editing any of them invalidates
+             # this row on its own. The value stays as it is because lowering it
+             # would only re-collide with a fingerprint some index may already
+             # hold; impl_version remains the per-row escape hatch for a change
+             # no other field in the payload can express.
+             "query_file": "java.scm", "impl_version": "2",
+             "extensions": (".java",), "shebangs": (),
+             "skip_dirs": frozenset({"target", "build", "dist"}),
+             "containers": {"class_declaration": "name", "interface_declaration": "name",
+                             "enum_declaration": "name", "record_declaration": "name"},
+             "method_if_ancestor_in": frozenset(), "max_bytes": None,
+             "doc_comment_types": ("block_comment", "line_comment")},
+    "php": {"backend": "tree-sitter", "module": "chunkers.treesitter",
+            "grammar_module": "tree_sitter_php", "language_fn": "language_php",
+            "runtime_pin": "0.26.0", "grammar_pin": "0.24.1",
+            "query_file": "php.scm", "impl_version": "1",
+            "extensions": (".php",), "shebangs": (),
+            "skip_dirs": frozenset(),
+            "containers": {"class_declaration": "name", "trait_declaration": "name",
+                            "enum_declaration": "name"},
+            # A namespace is written two ways and means one thing:
+            # `namespace A { ... }` holds what it scopes, `namespace A;`
+            # scopes the rest of the file without holding anything. Both
+            # qualify, through the same field -- see treesitter._qualify and
+            # _prefix_scope. Without it, `A\Box::open` and `B\Box::open` in
+            # one file were both stored as `Box.open`.
+            "prefix_scopes": {"namespace_definition": "name"},
+            "method_if_ancestor_in": frozenset(), "max_bytes": None},
+    "rust": {"backend": "tree-sitter", "module": "chunkers.treesitter",
+             "grammar_module": "tree_sitter_rust", "language_fn": "language",
+             "runtime_pin": "0.26.0", "grammar_pin": "0.24.2",
+             "query_file": "rust.scm", "impl_version": "1",
+             "extensions": (".rs",), "shebangs": (),
+             "skip_dirs": frozenset({"target"}),
+             "containers": {"impl_item": "SELF_TYPE", "trait_item": "name", "mod_item": "name"},
+             "method_if_ancestor_in": frozenset({"impl_item", "trait_item"}), "max_bytes": None,
+             # Task 7: rust's own comment node types are "line_comment" and
+             # "block_comment" (verified against the real grammar), not the
+             # `_doc_for` default of ("comment",) -- a `///` doc comment is
+             # NOT a distinct top-level node type in this grammar version;
+             # it parses as an ordinary `line_comment` node whose children
+             # (`outer_doc_comment_marker`, `doc_comment`) carry the `///`
+             # marking internally, so the row-level override below is what
+             # makes ANY comment (doc or plain) reach a rust chunk's `doc`
+             # field at all. This field is part of chunker_version's payload
+             # (treesitter.row_shape), so editing it invalidates this row's
+             # indexed files on its own.
+             "doc_comment_types": ("line_comment", "block_comment")},
+    "lua": {"backend": "tree-sitter", "module": "chunkers.treesitter",
+            "grammar_module": "tree_sitter_lua", "language_fn": "language",
+            "runtime_pin": "0.26.0", "grammar_pin": "0.5.0",
+            "query_file": "lua.scm", "impl_version": "1",
+            "extensions": (".lua",), "shebangs": ("lua",),
+            "skip_dirs": frozenset(),
+            "containers": {},
+            "method_if_ancestor_in": frozenset(), "max_bytes": None},
 }
 
 
@@ -55,10 +177,38 @@ class ChunkResult:
         self.status = status        # "ok" | "partial" | "failed"
 
 
+ENGINE_UNAVAILABLE = "engine-unavailable"
+
+
 class BackendUnavailable(Exception):
     """A LANGUAGE_TABLE backend that cannot run here (missing wheel,
     provider init failure). The indexer records the file as not-indexed
     and retries on the next explicit run, or when availability changes."""
+
+    # What a person does about it. Carried on the exception class rather
+    # than reconstructed by whoever catches it: the type IS the reason
+    # class, so the remedy belongs beside the type and no caller has to
+    # classify a message string to find it. memidx's uncheckable verdict
+    # reads it with getattr and memlint prints it.
+    remedy = "run backend-preflight to see which backends run here"
+
+
+class ChunkingFailed(Exception):
+    """One FILE this backend could not chunk -- it did not parse, or it is
+    over the per-file byte cap. Registry-wide, not one backend's private
+    type, because it is part of the `declared_symbols` half of the
+    contract: a backend answers with the file's symbol vocabulary, or it
+    raises, and it never flattens a failure into an empty vocabulary.
+
+    The distinction is what keeps memlint honest. "This file declares no
+    such symbol" is an ERROR on a record that names one; "this file's
+    vocabulary is unknown to me" is a WARNING naming the reason. An empty
+    list means the first, so a file that failed to chunk must not return
+    one. Different from BackendUnavailable, which is about the backend
+    rather than the file: that one says nothing in this language can be
+    read here."""
+
+    remedy = "fix the syntax error the reason names, or exclude the file"
 
 
 def get_chunker(lang):
@@ -76,11 +226,29 @@ def get_chunker(lang):
     through backend_availability()/code_index_report() into code-search
     and why, none of which may crash on a backend's own import bug.
     """
-    module_name = LANGUAGE_TABLE[lang]["module"]
-    try:
-        return importlib.import_module(module_name)
-    except Exception as exc:
-        raise BackendUnavailable(f"{lang}: {type(exc).__name__}: {exc}") from exc
+    row = LANGUAGE_TABLE[lang]
+    if row["backend"] == "native":
+        try:
+            return importlib.import_module(row["module"])
+        except Exception as exc:
+            raise BackendUnavailable(f"{lang}: {type(exc).__name__}: {exc}") from exc
+    if row["backend"] == "tree-sitter":
+        # The SHARED engine's own import is inside the guard, not above it:
+        # `chunkers.treesitter` is a module like any other and can fail to
+        # import for reasons that have nothing to do with a grammar wheel (a
+        # syntax error in a half-applied edit, a packaging fault that ships
+        # the package without it). That is still "this engine cannot run
+        # this backend here", the answer BackendUnavailable exists to give,
+        # and it must reach code-search and why as an unavailable backend
+        # rather than as an exception out of a registry lookup.
+        try:
+            from . import treesitter
+        except Exception as exc:
+            raise BackendUnavailable(
+                f"{lang}: {row['module']}: {type(exc).__name__}: {exc}"
+            ) from exc
+        return treesitter.for_language(lang)
+    raise BackendUnavailable(f"{lang}: unknown backend {row['backend']!r}")
 
 
 def backend_availability():
@@ -89,7 +257,13 @@ def backend_availability():
     that code-reindex/heal compare against on a later run to decide
     whether a not-indexed row is worth another try (Anatomy M2a binding
     point 1). Recomputed on every call (no internal caching) -- callers
-    that need it more than once per run cache the single value locally."""
+    that need it more than once per run cache the single value locally.
+
+    Fail-open per row, and not only on BackendUnavailable: this fingerprint
+    is computed on the way into code-search, why and every reindex, none of
+    which may crash because one row's backend has an import bug of its own.
+    A row that raises anything at all reads as `missing` -- the same answer,
+    with the same retry behavior, as a row whose wheel is absent."""
     parts = []
     for lang in sorted(LANGUAGE_TABLE):
         try:
@@ -97,7 +271,41 @@ def backend_availability():
             parts.append(f"{lang}=ok")
         except BackendUnavailable:
             parts.append(f"{lang}=missing")
+        except Exception:
+            parts.append(f"{lang}=missing")
     return ";".join(parts)
+
+
+def pin_mismatch(lang):
+    """The gap between what `lang`'s row PINS and what this python has
+    INSTALLED, as one human-readable string, or None when the two agree.
+
+    A row pins a grammar wheel and the tree-sitter runtime; an install
+    pointed at an interpreter this engine does not manage
+    (MEMCONTINUUM_VENV_MANAGED=0) can hold either at a different version.
+    That backend still imports and still chunks -- it simply chunks
+    something the pins do not describe -- so this is a THIRD answer beside
+    ok and missing, and `backend-preflight` reports it as `pin-mismatch`
+    with both versions named. Native rows pin nothing and never mismatch.
+
+    The state is NOT called `drift`: `memidx.py drift` is this product's
+    subcommand for decision-vs-code drift, a different question with a
+    different answer, and one word for two conditions in one CLI's output
+    is a word that stops meaning either.
+
+    chunker_version hashes the installed versions (see there), so a machine
+    off the pins re-chunks its own files rather than serving chunks the pins
+    claim; this function is the surface that tells a human WHY."""
+    row = LANGUAGE_TABLE[lang]
+    if row["backend"] != "tree-sitter":
+        return None
+    from . import treesitter
+    gaps = [
+        f"{dist}: pinned {pin}, installed {version}"
+        for dist, pin, version in treesitter.pinned_vs_installed(row)
+        if version != pin
+    ]
+    return "; ".join(gaps) if gaps else None
 
 
 def extension_of(path):
@@ -146,9 +354,85 @@ def chunker_version(lang):
 
     Reads LANGUAGE_TABLE fresh on every call (no caching) so a patched
     impl_version is reflected immediately.
+
+    A native row that declares `interpreter_sensitive` adds this python's
+    own major.minor (ruling 112). The python row chunks through
+    `ast.parse`, whose accepted syntax and node shapes move with CPython,
+    so the interpreter is part of that chunker exactly as an installed
+    grammar wheel is part of a tree-sitter one -- and the reindex skip is
+    `prev_sha == sha and prev_cv == cv`, so a payload that ignored the
+    interpreter would leave every already-indexed .py file marked current
+    across an upgrade. Only major.minor: a patch release does not move the
+    grammar, and re-chunking every project on a 3.12.7 -> 3.12.8 bump is
+    the cost this stamp exists to avoid. The swift row declares nothing:
+    it is a hand-written lexer, not a parser this interpreter provides.
+
+    A tree-sitter row's payload is wider, because a tree-sitter row's
+    output depends on more than its own module name: the shared engine's
+    ENGINE_VERSION (one generic module produces every tree-sitter row's
+    chunks, so its behavior changes all seven at once), the pinned runtime
+    and grammar versions, the versions of those two distributions ACTUALLY
+    INSTALLED in this python, the effective per-file byte cap, the query
+    file's bytes, and the row's own chunk-shaping data through
+    treesitter.row_shape -- containers, method_if_ancestor_in,
+    doc_comment_types, max_bytes, language_fn. Everything that changes what
+    a chunk looks like is in here; `impl_version` remains the per-row escape
+    hatch on top for anything that is not.
+
+    Ruling 108 puts the two INSTALLED versions in beside the pins: a
+    grammar wheel one version off the pin parses the same source into
+    different nodes, and a fingerprint built from the pins alone would keep
+    every already-indexed file of that language marked current across the
+    swap. The runtime counts the same way -- it is what walks the tree the
+    grammar builds. A distribution with no metadata here contributes the
+    fixed treesitter.VERSION_ABSENT token instead of raising, so this stays
+    answerable on a machine that lacks the wheel entirely (M2a binding
+    point 1); BackendUnavailable out of get_chunker is still the ONLY way a
+    missing wheel is reported.
+
+    The byte cap enters as its EFFECTIVE value -- treesitter.max_parse_bytes,
+    after MEMCONTINUUM_MAX_PARSE_BYTES is applied -- not as the row's raw
+    `max_bytes` field alone (row_shape carries that). The cap decides which
+    files are chunked at all, so raising it must re-attempt the over-cap
+    files an earlier run skipped, and lowering it must re-examine the ones
+    it accepted.
     """
     row = LANGUAGE_TABLE[lang]
-    payload = f"{row['backend']}:{row['module']}:{row['impl_version']}"
+    if row["backend"] == "native":
+        payload = f"{row['backend']}:{row['module']}:{row['impl_version']}"
+        if row.get("interpreter_sensitive"):
+            payload += f":python{sys.version_info[0]}.{sys.version_info[1]}"
+    elif row["backend"] == "tree-sitter":
+        try:
+            from . import treesitter
+        except Exception:
+            # Same fail-open shape query_fingerprint's QUERY_UNREADABLE
+            # sentinel has, for the same reason: chunker_version is reached
+            # from heal_code_index and code_index_report with only a
+            # `except KeyError` around it, one call per file, so an import
+            # failure here would take down a whole code-search or reindex
+            # walk. It degrades to a fixed token that no successful payload
+            # can collide with -- the stored fingerprint stops matching, so
+            # every file of this language is re-examined once the engine
+            # imports again -- and the fault itself surfaces inside the
+            # per-file guard as the BackendUnavailable get_chunker raises.
+            return hashlib.sha256(
+                f"{row['backend']}:{row['module']}:{ENGINE_UNAVAILABLE}:"
+                f"{row['grammar_module']}:{row['impl_version']}".encode()
+            ).hexdigest()[:12]
+        installed = ",".join(
+            f"{dist}={version}"
+            for dist, _pin, version in treesitter.pinned_vs_installed(row)
+        )
+        payload = (f"{row['backend']}:{row['module']}:{treesitter.ENGINE_VERSION}:"
+                   f"{row['runtime_pin']}:"
+                   f"{row['grammar_module']}:{row['grammar_pin']}:"
+                   f"installed{{{installed}}}:"
+                   f"cap{{{treesitter.max_parse_bytes(row)}}}:"
+                   f"{treesitter.query_fingerprint(row)}:{treesitter.row_shape(row)}:"
+                   f"{row['impl_version']}")
+    else:
+        payload = f"{row['backend']}:{row.get('module','?')}:{row.get('impl_version','?')}"
     return hashlib.sha256(payload.encode()).hexdigest()[:12]
 
 

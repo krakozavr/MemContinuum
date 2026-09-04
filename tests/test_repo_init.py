@@ -1332,6 +1332,60 @@ class TestNoMachineIdentifyingContent(unittest.TestCase):
             entries.append((meta.split()[0], rel))
         return entries
 
+    @staticmethod
+    def _untracked_entries():
+        """[(mode, path)] for files git sees in the working tree but does not
+        yet track (`git ls-files -o --exclude-standard`) -- a brand-new file
+        sitting in a working tree before its own `git add`. CI only ever
+        scans committed content, so without this a needle-bearing file could
+        sit untracked, pass this test locally, then reach origin on a later
+        `git add -A` elsewhere and only be caught by CI (or not at all, if
+        that CI run is the one adding it). `--exclude-standard` means a
+        gitignored file (tests/mac_smoke.local, by design) never appears
+        here. Mode is always the regular-file sentinel: `git ls-files -o`
+        reports no stat/type info, and an untracked symlink is out of scope
+        the same way test_no_tracked_symlinks scopes the tracked case."""
+        result = subprocess.run(
+            ["git", "ls-files", "-o", "--exclude-standard"], cwd=str(TOOLS_DIR),
+            capture_output=True, text=True, check=True,
+        )
+        return [("100644", rel) for rel in result.stdout.splitlines() if rel]
+
+    @classmethod
+    def _needles(cls):
+        username_needle = "kra" + "kozavr"
+        path_needle = "/mnt/d/!_WORK_" + "!"
+        project_needles = ["mmd" + "-swift", "MMD" + "App", "MMD" + "Core", "Shot" + "Porter"]
+        return [username_needle, path_needle] + project_needles
+
+    @classmethod
+    def _scan_for_needles(cls, entries):
+        """The needle scan test_only_license_names_the_dev_machine performs,
+        factored out so a regression test can prove it also catches an
+        untracked offender."""
+        needles = cls._needles()
+        offenders = {}
+        for mode, rel in entries:
+            p = TOOLS_DIR / rel
+            if mode == "120000":
+                try:
+                    hits = [n for n in needles if n in os.readlink(p)]
+                except OSError:
+                    hits = []
+                if hits:
+                    offenders[rel] = hits
+                continue
+            if not p.is_file():
+                continue
+            try:
+                text = p.read_text(errors="ignore")
+            except Exception:
+                continue
+            hits = [n for n in needles if n in text]
+            if hits:
+                offenders[rel] = hits
+        return offenders
+
     def test_no_tracked_symlinks(self):
         """A tracked symlink is refused outright in this repo. Its blob content
         is the link target, so a link created for local convenience -- e.g. a
@@ -1363,39 +1417,21 @@ class TestNoMachineIdentifyingContent(unittest.TestCase):
         )
 
     def test_only_license_names_the_dev_machine(self):
-        username_needle = "kra" + "kozavr"
-        path_needle = "/mnt/d/!_WORK_" + "!"
         # The private codebase this engine is developed against must not be
         # named either -- not its checkout, not its module prefixes, not its
         # product name. Its symbols and probe queries describe that project's
         # internal architecture, so they live in an untracked probe file
         # (tests/test_code_index.py load_probe_set) rather than in tracked
-        # content. Same split-literal trick as the two needles above.
-        project_needles = ["mmd" + "-swift", "MMD" + "App", "MMD" + "Core", "Shot" + "Porter"]
-        needles = [username_needle, path_needle] + project_needles
-        offenders = {}
-        for mode, rel in self._tracked_entries():
-            p = TOOLS_DIR / rel
-            if mode == "120000":
-                # Read the LINK, not what it points at (test_no_tracked_symlinks
-                # already refuses these outright; this keeps the content scan
-                # honest if that rule is ever relaxed).
-                try:
-                    hits = [n for n in needles if n in os.readlink(p)]
-                except OSError:
-                    hits = []
-                if hits:
-                    offenders[rel] = hits
-                continue
-            if not p.is_file():
-                continue
-            try:
-                text = p.read_text(errors="ignore")
-            except Exception:
-                continue
-            hits = [n for n in needles if n in text]
-            if hits:
-                offenders[rel] = hits
+        # content. Same split-literal trick as the two needles above (see
+        # _needles()).
+        #
+        # Scans tracked AND untracked-but-not-gitignored entries (see
+        # _untracked_entries): a file already `git add`ed is not the only way
+        # a needle reaches a future commit -- a new file sitting in the
+        # working tree, one `git add -A` away from being swept in, is exactly
+        # as dangerous and CI alone would only catch it after the fact.
+        entries = self._tracked_entries() + self._untracked_entries()
+        offenders = self._scan_for_needles(entries)
         # LICENSE's copyright line is the one deliberate exception (and only
         # counts as one if/when LICENSE is actually tracked by git).
         disallowed = {rel: hits for rel, hits in offenders.items() if rel != "LICENSE"}
@@ -1403,6 +1439,30 @@ class TestNoMachineIdentifyingContent(unittest.TestCase):
             disallowed, {},
             f"machine-identifying content found outside the allowed LICENSE exception: {disallowed}",
         )
+
+    def test_untracked_offender_is_reported(self):
+        """Regression test for the scan's untracked coverage: a file that is
+        neither tracked nor gitignored -- e.g. a brand-new file before its
+        own `git add` -- must still be caught. Writes a real temp file
+        directly into this checkout (both `_tracked_entries` and
+        `_untracked_entries` shell out to `git ls-files` with cwd=TOOLS_DIR,
+        so there is no copied-repo indirection available here as there is
+        for the repo-init.sh tests), and removes it in `finally` regardless
+        of outcome."""
+        probe = TOOLS_DIR / "tests" / "_needle_probe_untracked.txt"
+        self.assertFalse(probe.exists(), "stray probe file left over from a previous run")
+        try:
+            probe.write_text("kra" + "kozavr", encoding="utf-8")
+            entries = self._untracked_entries()
+            rels = {rel for _, rel in entries}
+            self.assertIn(
+                "tests/_needle_probe_untracked.txt", rels,
+                "git ls-files -o --exclude-standard did not report the new untracked file",
+            )
+            offenders = self._scan_for_needles(entries)
+            self.assertIn("tests/_needle_probe_untracked.txt", offenders)
+        finally:
+            probe.unlink(missing_ok=True)
 
 
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
@@ -1923,6 +1983,46 @@ chmod +x "$dir/bin/python"
             shutil.rmtree(engine_dir, ignore_errors=True)
             shutil.rmtree(fakebin, ignore_errors=True)
 
+    def test_bootstrap_fallback_without_ensurepip_names_uv(self):
+        # WSL's python3 -m venv fails here with no ensurepip and no sudo
+        # (DESIGN-anatomy-m2-deltas.md "Verified facts") -- B4 requires the
+        # fallback to fail with a clear, actionable message naming uv, not
+        # a bare "venv creation failed".
+        home = sandbox_home()
+        engine_dir = tempfile.mkdtemp(prefix="memcontinuum-engine-copy-")
+        fakebin = tempfile.mkdtemp(prefix="memcontinuum-fakebin-")
+        try:
+            install_sh = copy_engine(engine_dir)
+            fake_python3 = Path(fakebin) / "python3"
+            fake_python3.write_text(
+                "#!/usr/bin/env bash\n"
+                'if [ "$1" = "-m" ] && [ "$2" = "venv" ]; then\n'
+                '    echo "Error: Command '"'"'/tmp/x/bin/python3 -Im ensurepip '"'"'" >&2\n'
+                '    echo "ensurepip is not available" >&2\n'
+                '    exit 1\n'
+                "fi\n"
+                "exit 0\n"
+            )
+            fake_python3.chmod(0o755)
+            minimal_path = os.pathsep.join([fakebin, "/usr/bin", "/bin"])
+
+            store = str(Path(home) / "store")
+            venv_dir = str(Path(home) / "bootstrapped-venv")
+            proc = run_install_at(
+                install_sh,
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude"),
+                 "--bootstrap-venv", venv_dir],
+                home,
+                extra_env={"PATH": minimal_path},
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("uv", proc.stdout + proc.stderr)
+            self.assertIn("ensurepip", (proc.stdout + proc.stderr).lower())
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+            shutil.rmtree(engine_dir, ignore_errors=True)
+            shutil.rmtree(fakebin, ignore_errors=True)
+
 
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
 class TestClaudeDirRequiredWithExplicitStore(unittest.TestCase):
@@ -2347,7 +2447,10 @@ class TestCodeCensusAndConsentDialogue(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             settings = json.loads((claude_dir / "settings.local.json").read_text())
             item = [g for g in settings["hooks"]["PreToolUse"] if g.get("matcher") == "Write"][0]["hooks"][0]
-            self.assertIn("MEMCONTINUUM_KNOWN_EXTS='*.py *.swift'", item["command"])
+            self.assertIn(
+                "MEMCONTINUUM_KNOWN_EXTS='*.cjs *.java *.js *.jsx *.lua *.mjs *.php *.py *.rs *.swift *.ts *.tsx'",
+                item["command"],
+            )
         finally:
             shutil.rmtree(home, ignore_errors=True)
 
@@ -2370,6 +2473,30 @@ class TestCodeCensusAndConsentDialogue(unittest.TestCase):
             )
             self.assertNotEqual(proc.returncode, 0)
             self.assertIn("tty", (proc.stdout + proc.stderr).lower())
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+
+class TestSetupMenu(unittest.TestCase):
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_non_interactive_setup_skips_the_menu(self):
+        # matches the existing test_repo_init.py tty-refusal pattern
+        # (test_not_a_tty_without_non_interactive_fails_clearly_not_hangs,
+        # above): a non-tty run of memcontinuum-setup.sh with --python
+        # explicit must never block on /dev/tty, proving the menu is
+        # additive, not a new hard requirement. TOOLS_DIR here in place of
+        # the brief's REPO_ROOT -- this file's own module-level constant for
+        # the checkout root; there is no second name for it.
+        home = sandbox_home()
+        try:
+            proc = subprocess.run(
+                ["bash", str(TOOLS_DIR / "memcontinuum-setup.sh"),
+                 "--python", VENV_PYTHON, "--no-model-warm", "--dry-run",
+                 "--claude-dir", str(Path(home) / ".claude")],
+                cwd=home, env={**os.environ, "HOME": home},
+                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         finally:
             shutil.rmtree(home, ignore_errors=True)
 
