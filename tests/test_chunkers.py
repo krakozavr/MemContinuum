@@ -1053,20 +1053,29 @@ class TestTreeSitterDedupPriority(unittest.TestCase):
         deduped = chunkers.treesitter.dedup_nested(entries)
         self.assertEqual(len(deduped), 2)
 
-    def test_same_node_type_nesting_is_never_merged(self):
+    def test_a_containing_definition_is_never_a_wrapper(self):
         # Whole-branch review, finding 2: the discriminating test for the
-        # node-type clause. Two entries agreeing on qualified_name AND kind
-        # AND node type, one containing the other, are a callable nested
-        # inside a same-named callable -- `function f(){ function f(){} }`
-        # -- never a wrapper around a definition. Both levels survive.
-        entries = [
-            {"key": (0, 80), "kind": "function", "symbol": "f", "qualified_name": "f",
-             "node_type": "function_declaration", "start_line": 1, "end_line": 6},
-            {"key": (20, 50), "kind": "function", "symbol": "f", "qualified_name": "f",
-             "node_type": "function_declaration", "start_line": 2, "end_line": 4},
-        ]
-        deduped = chunkers.treesitter.dedup_nested(entries)
-        self.assertEqual(len(deduped), 2)
+        # WRAPPER_NODE_TYPES membership check. Two entries agreeing on
+        # qualified_name AND kind, one containing the other, whose OUTER
+        # node type is a definition rather than a declared wrapper, are a
+        # callable nested inside a same-named callable. Both survive --
+        # `function f(){ function f(){} }` (same node type) and `function
+        # f(){ const f = () => {}; }` (different node types) are the same
+        # case as far as this rule is concerned.
+        for outer_type in ("function_declaration", "method_definition"):
+            entries = [
+                {"key": (0, 80), "kind": "function", "symbol": "f", "qualified_name": "f",
+                 "node_type": outer_type, "start_line": 1, "end_line": 6},
+                {"key": (20, 50), "kind": "function", "symbol": "f", "qualified_name": "f",
+                 "node_type": "arrow_function", "start_line": 2, "end_line": 4},
+            ]
+            deduped = chunkers.treesitter.dedup_nested(entries)
+            self.assertEqual(len(deduped), 2, outer_type)
+
+    def test_only_a_declared_wrapper_node_type_can_be_dropped(self):
+        self.assertIn("export_statement", chunkers.treesitter.WRAPPER_NODE_TYPES)
+        self.assertNotIn("function_declaration", chunkers.treesitter.WRAPPER_NODE_TYPES)
+        self.assertNotIn("arrow_function", chunkers.treesitter.WRAPPER_NODE_TYPES)
 
     def test_legitimately_nested_callable_is_never_merged(self):
         # `function outer(){ function inner(){} }` -- a nested function
@@ -1130,6 +1139,27 @@ class TestSameNamedNestingSurvivesTheRealGrammar(unittest.TestCase):
         self.assertEqual(
             [(c["kind"], c["qualified_name"], c["start_line"]) for c in chunks],
             [("method", "A.m", 2), ("method", "A.A.m", 4)],
+        )
+
+    def test_javascript_arrow_bound_to_the_enclosing_functions_own_name(self):
+        # The shape a difference-based rule gets wrong: the two node types
+        # genuinely DIFFER (function_declaration containing arrow_function)
+        # while the names and the kind all match, so only a membership test
+        # against WRAPPER_NODE_TYPES keeps the outer level. This is the
+        # ordinary `function handler(){ const handler = async () => ...; }`
+        # JS idiom, not a contrived one.
+        chunks = self._chunks("javascript", "a.js", "function f(){\n  const f = () => {};\n}\n")
+        self.assertEqual(
+            [(c["kind"], c["qualified_name"], c["start_line"]) for c in chunks],
+            [("function", "f", 1), ("function", "f", 2)],
+        )
+
+    def test_typescript_function_expression_bound_to_the_same_name(self):
+        chunks = self._chunks("typescript", "a.ts",
+                              "function f(){\n  const f = function(){};\n}\n")
+        self.assertEqual(
+            [(c["kind"], c["qualified_name"], c["start_line"]) for c in chunks],
+            [("function", "f", 1), ("function", "f", 2)],
         )
 
     def test_export_default_still_yields_one_chunk(self):

@@ -728,9 +728,10 @@ default path while the stale one stayed stale. With `--apply` it re-runs
 registry no longer skips it, because a machine can perfectly well have its
 own layer installed before any repository is wired.
 
-Immediately after that refresh (never on an already-`ok` layer, and never
-on its own outside a refresh — no extra "did anything change" check exists
-because there is nothing to check when the refresh itself never ran),
+Immediately after a refresh that SUCCEEDED (never on an already-`ok` layer,
+never on its own outside a refresh, and never after a refresh that failed —
+a failed one leaves a `config.sh` it never rewrote, so the python it names
+is not the one this run was told to use),
 `--apply --machine` also reconciles the pinned tree-sitter grammar wheels and
 the tree-sitter runtime.
 It re-reads `config.sh` fresh — the refresh's own
@@ -765,7 +766,7 @@ reconciliation could never fire again. Choosing "use this python" from
 explicit `--python` for this same determination.
 
 `memcontinuum-setup.sh`'s own interactive setup menu — "1) use this python
-(PATH) / 2) use or create the engine venv / 3) abort" — appears only on a truly
+(PATH) / 2) create or reuse the engine venv / 3) abort" — appears only on a truly
 unscripted run: no `--python`, no `--venv`, and stdin is a real terminal
 (`[ -t 0 ]`, the same guard `repo-init.sh`'s own census dialogue uses). Any
 scripted, CI, or explicit-flag run bypasses it and keeps the plain
@@ -1017,17 +1018,20 @@ method/function; ties keep the first-seen entry). `dedup_nested` then
 resolves a DIFFERENT-span containment — an export wrapper's outer node
 capturing the same callable as the inner definition node it wraps — keeping
 the innermost match and dropping an outer one only when three things hold
-together: the two share a **qualified name**, they share a **kind**, and
-their **node types differ**.
+together: the two share a **qualified name**, they share a **kind**, and the
+outer node's type is a **declared wrapper** — `WRAPPER_NODE_TYPES` in
+`chunkers/treesitter.py`, which holds `export_statement` today.
 
-The node-type clause is what separates a wrapper from a nesting. A wrapper
-node is a different node type from the definition it wraps
-(`export_statement` around `function_declaration`), while a definition
-directly inside another definition of the same node type is a legitimately
-nested callable. So `function f(){ function f(){} }` yields two chunks even
-though both levels carry the same symbol and the same qualified name — a
-function body is not a qualification container in any row's `containers`
-map, so both qualify to plain `f`. Qualified name rather than bare symbol is
+That last clause is a membership test, not a difference test, and the
+distinction is the whole rule. A wrapper is a *known* wrapper node type;
+every other containment is a callable nested inside a callable, and both
+levels are their own chunk. `function f(){ function f(){} }` yields two
+chunks even though both levels carry the same symbol and the same qualified
+name — a function body is not a qualification container in any row's
+`containers` map, so both qualify to plain `f`. So does `function f(){ const
+f = () => {}; }`, where the two node types genuinely differ
+(`function_declaration` containing `arrow_function`) and the outer level is
+still the one a caller imports. Qualified name rather than bare symbol is
 what separates `class A { m(){ class A { m(){} } } }` into `A.m` and
 `A.A.m`, two chunks with two names.
 

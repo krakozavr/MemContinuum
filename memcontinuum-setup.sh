@@ -259,7 +259,7 @@ if [ "$PYTHON_EXPLICIT" -eq 0 ] && [ "$VENV_EXPLICIT" -eq 0 ] && [ -t 0 ] && [ "
     echo
     echo "Set up MemContinuum's python environment:"
     echo "  1) use this python ($BOOT_PY)"
-    echo "  2) use or create the engine venv"
+    echo "  2) create or reuse the engine venv"
     echo "  3) abort"
     printf '> '
     MENU_CHOICE=""

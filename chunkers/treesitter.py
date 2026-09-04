@@ -41,10 +41,10 @@ SAME span with different kinds (a get/set accessor vs. the generic
 method pattern). dedup_by_priority handles the same-span case;
 dedup_nested handles the different-span containment case, run in that
 order in build_chunks. dedup_nested drops the outer match only when the
-two agree on qualified_name and kind AND their node types differ -- a
-wrapper is a different node type from what it wraps, while a definition
-nested inside a same-type definition is a nested callable and both
-levels survive (see that function's own docstring).
+two agree on qualified_name and kind AND the outer node's type is a
+declared wrapper (WRAPPER_NODE_TYPES) -- every other containment is a
+callable nested inside a callable, and both levels survive (see that
+function's own docstring).
 
 No parse timeout (revision 4, binding ruling 87 -- revision 3's
 signal.alarm mechanism is REMOVED, not merely refined). tree-sitter
@@ -147,7 +147,17 @@ DEFAULT_MAX_PARSE_BYTES = 1 * 1024 * 1024   # 1 MiB
 # forgets. Bump this by one whenever the shared engine's OUTPUT changes;
 # leave it alone for a comment, a docstring, or a refactor that provably
 # produces identical chunks.
-ENGINE_VERSION = "1"
+ENGINE_VERSION = "2"
+
+# The node types that WRAP a definition rather than being one -- the outer
+# half of ruling 84's wrapper/inner pair, and the only node types
+# dedup_nested may drop. Engine data, not row data: a node type name is
+# grammar-specific but nothing here collides across grammars, and keeping
+# it module-level means ENGINE_VERSION above covers it (a per-row set would
+# have to join row_shape instead). `export_statement` is javascript's and
+# typescript's; add a grammar's own wrapper here when a query file starts
+# binding @chunk.<kind> to one.
+WRAPPER_NODE_TYPES = frozenset({"export_statement"})
 
 
 class TreeSitterFileTooLarge(Exception):
@@ -304,22 +314,28 @@ def dedup_nested(entries):
       * the two share a KIND. A wrapper/inner pair is always the same
         kind in every query this repo ships, so requiring it is strictly
         safer and catches nothing extra by accident.
-      * the two have DIFFERENT NODE TYPES. This is what separates a
-        wrapper from a nesting. A wrapper node is by definition a
-        different node type from the definition it wraps
-        (`export_statement` around `function_declaration`); a definition
-        directly inside another definition of the SAME node type is a
-        nested callable, never a wrapper. `function f(){ function f(){}
-        }` is two `function_declaration`s -- both survive, even though
-        neither the symbol nor the qualified name tells them apart (a
-        function body is not a qualification container in any row's
-        `containers` map, so both qualify to plain `f`).
+      * the OUTER match's node type is a DECLARED WRAPPER --
+        WRAPPER_NODE_TYPES above. This is what separates a wrapper from a
+        nesting, and it is a membership test, not a difference test: a
+        wrapper is a KNOWN wrapper node type, not merely a node type
+        unlike the one it contains. Every other containment is a callable
+        nested inside a callable, and both levels are their own chunk.
 
-    Without the node-type clause the outer level of a same-named nesting
-    was dropped and the survivor carried the inner span's line numbers --
-    the outer `f`, the one a caller imports, vanished from the index with
-    no gap and no warning. Runs AFTER dedup_by_priority, which already
-    resolved every same-span collision.
+    Two shapes, both probed against the real grammars, show why nothing
+    weaker works. `function f(){ function f(){} }` is two
+    `function_declaration`s that both qualify to plain `f` -- a function
+    body is not a qualification container in any row's `containers` map --
+    so neither symbol nor qualified name tells them apart. And `function
+    f(){ const f = () => {}; }` is a `function_declaration` containing an
+    `arrow_function`, same name, same kind, DIFFERENT node types: a
+    difference test would drop the outer `f` here, which is the ordinary
+    JS shape `function handler(){ const handler = async () => ...; }`.
+    Either way the outer level -- the one a caller imports -- would vanish
+    from the index with no gap and no warning, and the survivor would
+    carry the inner span's line numbers.
+
+    Runs AFTER dedup_by_priority, which already resolved every same-span
+    collision.
 
     Revision 4, binding ruling 88 fix: the comparison direction MUST be
     "does the CURRENT (larger, since we process ascending-by-size) entry
@@ -339,12 +355,13 @@ def dedup_nested(entries):
     kept = []
     for e in ordered:
         s, en = e["key"]
+        if e.get("node_type") not in WRAPPER_NODE_TYPES:
+            kept.append(e)
+            continue
         wraps_a_kept_entry = any(
             s <= ks and ke <= en and (ks, ke) != (s, en)
             and k["qualified_name"] == e["qualified_name"]
             and k["kind"] == e["kind"]
-            and k.get("node_type") is not None
-            and k.get("node_type") != e.get("node_type")
             for k in kept for ks, ke in [k["key"]]
         )
         if wraps_a_kept_entry:
