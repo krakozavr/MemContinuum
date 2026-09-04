@@ -1,13 +1,17 @@
+import contextlib
 import os
 import shutil
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 TOOLS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(TOOLS_DIR))
 
+import chunkers  # noqa: E402
+import chunkers.treesitter  # noqa: E402
 import memidx  # noqa: E402
 import memlint  # noqa: E402
 
@@ -508,6 +512,87 @@ class TestLuaSymbolRouting(unittest.TestCase):
         text = "function obj:widget_loader(a)\n  return a\nend\n"
         self.assertTrue(memidx.fragment_declared_in_text("obj.widget_loader", text, rel_path="a.lua"))
         self.assertTrue(memidx.fragment_declared_in_text("widget_loader", text, rel_path="a.lua"))
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestMissingGrammarWheelIsAWarningNotAnError(unittest.TestCase):
+    """Whole-branch review, finding 1. A tree-sitter grammar wheel is an
+    OPTIONAL dependency: an engine set up with `--python` at an interpreter
+    that lacks one is a supported install, and every other surface fails
+    open on it. So a `#symbol` fragment on a `.js` path must degrade to a
+    WARNING naming the wheel when javascript's backend cannot run here --
+    not an error that fails the lint on a record nothing is wrong with.
+    The error stays reserved for a symbol the AVAILABLE backend proves
+    absent.
+
+    The wheel is made unavailable with the same `sys.modules` shim
+    tests/test_chunkers.py's registry tests use, around a
+    treesitter.reset_cache() on both sides -- a successful chunker
+    instance is cached per (lang, chunker_version), so a shim with no cache
+    reset would be a no-op against an already-built instance."""
+
+    JS_SOURCE = "function widget_loader() {\n  return 1;\n}\n"
+
+    @contextlib.contextmanager
+    def _javascript_wheel_absent(self):
+        chunkers.treesitter.reset_cache()
+        try:
+            with mock.patch.dict(sys.modules, {"tree_sitter_javascript": None}):
+                yield
+        finally:
+            chunkers.treesitter.reset_cache()
+
+    def _lint(self, ref: str, js_source: str):
+        with tempfile.TemporaryDirectory() as td_str:
+            td = Path(td_str)
+            code_root = td / "code"
+            code_root.mkdir()
+            (code_root / "widget.js").write_text(js_source)
+            (td / "concept.md").write_text(
+                concept_md("CON-js-wheel", ref, title="Fixture -- missing grammar wheel")
+            )
+            return memlint.lint_root(td, code_roots=[code_root])
+
+    def test_predicate_is_none_with_the_wheel_absent_and_names_it(self):
+        with self._javascript_wheel_absent():
+            verdict, reason = memidx.fragment_declaration_status(
+                "widget_loader", self.JS_SOURCE, rel_path="widget.js"
+            )
+        self.assertIsNone(verdict)
+        self.assertIn("tree_sitter_javascript", reason)
+        # The thin verdict-only wrapper forwards the same None, so `why`'s
+        # disk-scan fallback still reads it as falsy.
+        with self._javascript_wheel_absent():
+            self.assertIsNone(
+                memidx.fragment_declared_in_text(
+                    "widget_loader", self.JS_SOURCE, rel_path="widget.js"
+                )
+            )
+
+    def test_predicate_is_true_with_the_wheel_present(self):
+        verdict, reason = memidx.fragment_declaration_status(
+            "widget_loader", self.JS_SOURCE, rel_path="widget.js"
+        )
+        self.assertTrue(verdict)
+        self.assertEqual(reason, "")
+
+    def test_lint_warns_and_stays_clean_with_the_wheel_absent(self):
+        with self._javascript_wheel_absent():
+            errors, warnings = self._lint("widget.js#widget_loader", self.JS_SOURCE)
+        self.assertEqual(
+            [e for e in errors if "widget_loader" in e], [],
+            f"a missing optional grammar wheel must not fail the lint: {errors}",
+        )
+        named = [w for w in warnings if "tree_sitter_javascript" in w]
+        self.assertEqual(len(named), 1, warnings)
+        self.assertIn("widget_loader", named[0])
+
+    def test_lint_still_errors_on_a_symbol_the_available_backend_proves_absent(self):
+        errors, _warnings = self._lint("widget.js#no_such_symbol", self.JS_SOURCE)
+        self.assertTrue(
+            any("no_such_symbol" in e for e in errors),
+            f"with the wheel present, an absent symbol is still a hard error: {errors}",
+        )
 
 
 if __name__ == "__main__":

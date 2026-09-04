@@ -608,10 +608,16 @@ class TestSwiftDeclaredSymbolsBackend(unittest.TestCase):
         """The point of I3 is structural, so assert the structure: the
         function body must not name a language."""
         import inspect
-        src = inspect.getsource(memidx.fragment_declared_in_text)
+        # The dispatch itself lives in fragment_declaration_status;
+        # fragment_declared_in_text is the verdict-only wrapper over it
+        # (whole-branch review, finding 1 -- a missing optional grammar
+        # wheel needs a third state the bare predicate cannot carry).
+        src = inspect.getsource(memidx.fragment_declaration_status)
         body = src.split('"""')[-1]
         self.assertNotIn('== "python"', body, body)
         self.assertIn("get_chunker", body, body)
+        wrapper = inspect.getsource(memidx.fragment_declared_in_text)
+        self.assertIn("fragment_declaration_status", wrapper.split('"""')[-1], wrapper)
 
 
 class TestGetChunkerFailsOpenOnAnyBackendException(unittest.TestCase):

@@ -1846,9 +1846,29 @@ def fragment_matches_symbol(frag: str, symbol: str, qualified_name: str) -> bool
     return frag == symbol or frag == qualified_name or qualified_name.endswith("." + frag)
 
 
-def fragment_declared_in_text(frag: str, text: str, rel_path: str) -> bool:
-    """memlint's #symbol vocabulary check (memlint.py's lint_concept): is
-    `frag` a symbol actually DECLARED in `text`?
+def fragment_declaration_status(frag: str, text: str, rel_path: str) -> tuple:
+    """memlint's #symbol vocabulary check (memlint.py's lint_concept),
+    tri-state: is `frag` a symbol actually DECLARED in `text`?
+
+    Returns `(verdict, reason)`. `verdict` is True (the backend read the
+    text and found the symbol), False (the backend read the text and the
+    symbol is not there), or None -- the backend for this file's language
+    cannot run in this python, so NOTHING is known about the symbol either
+    way. `reason` carries the BackendUnavailable text, which names the
+    missing wheel by module (e.g. "javascript: ModuleNotFoundError: No
+    module named 'tree_sitter_javascript'"), and is empty for every other
+    verdict.
+
+    The three states are the whole point. A tree-sitter grammar wheel is
+    optional -- an engine set up with `--python` at an interpreter that
+    lacks it is a supported install (MEMCONTINUUM_VENV_MANAGED=0), and
+    every other surface fails open on it: code-reindex records the file
+    not-indexed, code-search says the index is incomplete, backend-preflight
+    reports MISSING. Collapsing "cannot check" into False would make
+    memlint the one surface that turns a missing optional wheel into a hard
+    error on a record that is perfectly valid. So the caller decides:
+    memlint.py warns on None, naming the wheel, and reserves its error for
+    False -- a symbol the available backend proves absent.
 
     Dispatch is fully generic (Anatomy M1 fix wave, I3): the file's
     language comes from chunkers.lang_for_path(rel_path), and the answer
@@ -1866,8 +1886,10 @@ def fragment_declared_in_text(frag: str, text: str, rel_path: str) -> bool:
     None AND rel_path has no extension at all is text's first line sniffed
     for a shebang (chunkers.lang_for_shebang) -- an extension that simply
     doesn't match any LANGUAGE_TABLE row (e.g. ".txt") never falls through
-    to the shebang guess. Still unresolved -> return False: no language
-    means no vocabulary to check against, not a crash.
+    to the shebang guess. Still unresolved -> False: no language means no
+    vocabulary to check against, not a crash. That stays False rather than
+    None because it is not a machine-setup gap a wheel would close -- the
+    record names a path this engine has no language for at all.
 
     Each backend returns `(symbol, qualified_name)` pairs -- including its
     container type names (Swift's class/struct/enum/protocol/extension/
@@ -1880,18 +1902,39 @@ def fragment_declared_in_text(frag: str, text: str, rel_path: str) -> bool:
     if lang is None and not chunkers.extension_of(rel_path):
         lang = chunkers.lang_for_shebang(text.split("\n", 1)[0])
     if lang is None:
-        return False
+        return False, ""
     try:
         backend = chunkers.get_chunker(lang)
-        pairs = backend.declared_symbols(text)
+    except chunkers.BackendUnavailable as exc:
+        # The one "cannot tell" case, kept apart from the generic guard
+        # below: this engine has no backend for this language here, so the
+        # symbol is neither proven present nor proven absent.
+        return None, str(exc)
     except Exception:
         # Fail open, like every other chunker call site: a backend that
         # cannot answer must not turn a lint into a crash.
-        return False
+        return False, ""
+    try:
+        pairs = backend.declared_symbols(text)
+    except Exception:
+        return False, ""
     return any(
         fragment_matches_symbol(frag, symbol, qualified_name)
         for symbol, qualified_name in pairs
-    )
+    ), ""
+
+
+def fragment_declared_in_text(frag: str, text: str, rel_path: str):
+    """The verdict half of fragment_declaration_status (see there for the
+    tri-state and its rationale): True, False, or None when the backend for
+    `rel_path`'s language cannot run in this python.
+
+    Callers that only need a yes/no read None as falsy and are right to:
+    `why`'s disk-scan fallback (resolve_symbol_to_path) cannot resolve a
+    symbol it could not check, and answering None there means the same
+    thing as answering no."""
+    verdict, _reason = fragment_declaration_status(frag, text, rel_path)
+    return verdict
 
 
 def concept_matches_for_chunk(

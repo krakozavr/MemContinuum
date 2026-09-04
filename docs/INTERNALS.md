@@ -1254,10 +1254,22 @@ own wired entry, with its own `MEMCONTINUUM_CODE_ROOT`, for every
 
 `memlint.py ROOT [--code-root DIR ...]` imports memidx's own walker, so a
 session buffer is never linted as a topic, and reuses
-`memidx.fragment_declared_in_text` — the same predicate `code-search` uses for
+`memidx.fragment_declaration_status` — the same predicate `code-search` uses for
 concept attachment at runtime — rather than a from-scratch regex, so a
 `#symbol` fragment validates exactly the way attachment accepts it, comments and
 string literals already masked out.
+
+That predicate is tri-state, and the severity table below turns on which state
+it returns. True and False are the backend's own answer about the text. The
+third state means the chunker backend for that file's language does not run in
+this python — an optional tree-sitter grammar wheel the interpreter lacks — so
+the symbol is neither proven present nor proven absent. A record stays valid
+across that gap: `memlint` emits a warning naming the missing wheel, and
+reserves its error for a symbol an available backend proves absent. Every other
+surface fails open on the same gap (`code-reindex` records the file
+not-indexed, `code-search` reports the index incomplete, `backend-preflight`
+reports `MISSING`); a lint error there would make an optional dependency
+mandatory in one place only.
 
 Topic-chain rules:
 
@@ -1282,6 +1294,7 @@ one project can have several code roots, and every root given is checked:
 | (`--code-root`) a path does not exist under any code root given | error (names every root tried) |
 | (`--code-root`, several roots) a path exists under more than one code root | error (one reference must name one file) |
 | (`--code-root`) a `#symbol` fragment matches nothing the chunker recognizes in that file | error |
+| (`--code-root`) a `#symbol` fragment on a file whose language backend does not run in this python | warning (names the missing grammar wheel) |
 | (`--code-root`) `implemented_by` with no `#symbol` fragment on a file over 400 lines | error |
 | `governed_by` names a topic id not in the linted corpus | error (only when the corpus has at least one topic) |
 | two concepts claim the same `implemented_by` `path#symbol` | error (corpus-wide; `tested_by` excluded — sharing a test file is fine) |

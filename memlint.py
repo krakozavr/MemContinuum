@@ -30,7 +30,7 @@ from memidx import (
     KINDS,
     STATUSES,
     code_ref_is_named,
-    fragment_declared_in_text,
+    fragment_declaration_status,
     newest_active_link,
     parse_frontmatter,
     validated_evidence_list,
@@ -45,23 +45,29 @@ from memidx import (
 _NOT_THIS_RE = re.compile(r"\bNOT\b|not this concept|Does NOT")
 
 
-def _symbol_declared(frag: str, text: str, rel_path: str) -> bool:
+def _symbol_declaration_status(frag: str, text: str, rel_path: str) -> tuple:
     """Finding 5 (init/subscript/computed var/backtick names) AND finding 4
     (a QUALIFIED fragment, e.g. "Outer.outerFunc", must validate exactly
     like code-search's runtime concept attachment accepts it): this reuses
-    memidx.fragment_declared_in_text -- the SAME single-source-of-truth
+    memidx.fragment_declaration_status -- the SAME single-source-of-truth
     predicate concept_matches_for_chunk uses at attach time -- rather than
     a from-scratch regex or a flattened bare-name set. Also never
     false-positives on a name that only appears inside a comment or string
     literal (the chunker's mask already blanks those out).
 
     `rel_path` (the record's own ref_path when the caller has one) is
-    forwarded to fragment_declared_in_text, which resolves the file's
+    forwarded to fragment_declaration_status, which resolves the file's
     language from it and asks THAT backend's own `declared_symbols` --
     so a "#symbol" fragment on a Python implemented_by/tested_by path is
     checked against Python's vocabulary, not Swift's, with no
-    language-specific branch anywhere on this path."""
-    return fragment_declared_in_text(frag, text, rel_path=rel_path)
+    language-specific branch anywhere on this path.
+
+    Tri-state, `(verdict, reason)`: True/False are the backend's own
+    answer, None means the backend for that language cannot run in this
+    python (an optional grammar wheel this interpreter lacks) and `reason`
+    names it. lint_concept warns on None and errors only on False -- see
+    that call site."""
+    return fragment_declaration_status(frag, text, rel_path=rel_path)
 
 
 def lint_topic(path: Path, fm: dict) -> tuple[list[str], list[str]]:
@@ -302,7 +308,24 @@ def lint_concept(
                         text = full.read_text(encoding="utf-8", errors="ignore")
                     except OSError:
                         text = ""
-                    if not _symbol_declared(frag, text, rel_path=ref_path):
+                    declared, reason = _symbol_declaration_status(
+                        frag, text, rel_path=ref_path
+                    )
+                    if declared is None:
+                        # The chunker backend for this file's language does
+                        # not run in this python, so the symbol is neither
+                        # proven present nor proven absent. A record stays
+                        # VALID across that gap: the grammar wheel is
+                        # optional, an install pointed at an interpreter
+                        # without it is supported, and every other surface
+                        # fails open on the same gap. Naming the wheel is
+                        # the whole remedy -- install it and the check runs.
+                        warnings.append(
+                            f"{path}: {cid} {field} fragment {frag!r} is not checked -- "
+                            f"no chunker backend for {ref_path!r} in this python ({reason}); "
+                            f"install the grammar it names, or run backend-preflight"
+                        )
+                    elif not declared:
                         errors.append(
                             f"{path}: {cid} {field} fragment {frag!r} is not a func/struct/enum/"
                             f"class/subscript declared in {ref_path!r}"
