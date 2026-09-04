@@ -24,8 +24,11 @@ Contents: [hooks](#hooks-and-the-fail-open-contract) ·
 
 ## Hooks and the fail-open contract
 
-Nine hook scripts live under `hooks/`, alongside two shared libraries
-(`memlib.sh`, sourced by the five write-side hooks, and `mc-watchdog.sh`).
+Nine hook scripts live under `hooks/`, alongside three shared libraries
+(`memlib.sh`, sourced by the five write-side hooks; `mc-watchdog.sh`; and
+`mc-path-lib.sh`, one pure side-effect-free function -- symlink-safe
+containment -- sourced by `memlib.sh` and directly by `newfile-nudge.sh`,
+which needs it but deliberately does not source `memlib.sh` itself).
 Seven of the nine are wired into a project's
 `.claude/settings.local.json` by `scripts/repo-init.sh`; `post-commit-reindex.sh`
 is invoked from the store's own git `post-commit`; `memcontinuum-detect.sh` is
@@ -407,11 +410,20 @@ file's identity marker + stamp, and the installed `memory-search` skill
 copy's identity + stamp. It prints one table row per
 (row, claude-dir): `repo | claude-dir | stamped | engine | store-match |
 rules | skill | action`, action being one of `ok`, `stale`, `store-mismatch`,
+`store-form-stale`, `store-form-updated`,
 `rules-missing`, `rules-stale`, `rules-foreign`, `skill-foreign`, `migrate`,
 `migrate-needs-claude-dirs`, `migrate-needs-langs`,
 `migrate-needs-never-exts`, `migrate-dirs-disagree`, `store-missing`,
 `no-wiring`, or
-`unrecoverable`. `--dry-run` (the default with no `--apply`) only prints;
+`unrecoverable`. `store-form-stale` is the reporting walk's answer when the
+row's `store=` names the same store the wiring renders, written in an
+unresolved (symlinked) string form: nothing is mismatched, so the remedy it
+prints is to re-run with `--apply`. `store-form-updated` is what that
+`--apply` pass reports after rewriting just the registry's `store=`
+field, leaving `claude-dirs`/`code-roots`/`langs`/`never` exactly as
+recorded. A `store=` naming a *different* store stays `store-mismatch`,
+which the pair never stands in for.
+`--dry-run` (the default with no `--apply`) only prints;
 `--apply` re-runs `repo-init.sh` per non-`ok` claude-dir with the row's own
 recorded parameters, always passing `--adopt-only` (below), so this command
 cannot create, rename, or delete a store on any path through it.
@@ -488,11 +500,20 @@ recorded rather than reporting a bare miss.
 **Action precedence.** The answers this command will never act on come first:
 `store-missing`, then `no-wiring`, then `rules-foreign`, then
 `skill-foreign`, then the `migrate-needs-*`/`migrate-dirs-disagree`
-questions, and only then the drift it can actually re-render (`stale`,
-`store-mismatch`, `rules-missing`, `rules-stale`, a missing/stale skill copy
-folded into `stale`, `ok`). Ordering them the other way would name some
-lesser drift in the action column and then have `--apply` call the installer
-just to watch it refuse for a reason already known.
+questions, and only then the drift it can act on (`stale`,
+`store-form-stale`/`store-form-updated`, `store-mismatch`, `rules-missing`,
+`rules-stale`, a missing/stale skill copy folded into `stale`, `ok`).
+Ordering them the other way would name some lesser drift in the action
+column and then have `--apply` call the installer just to watch it refuse
+for a reason already known.
+
+`store-form-stale`/`store-form-updated` sit between `stale` and
+`store-mismatch` in that chain, and they are the one answer `--apply` fixes
+without re-rendering anything: the wiring already renders the physical
+store, so only the registry's `store=` field is rewritten. A row that is
+*both* fingerprint-stale and store-form-stale reports the higher `stale`,
+and a single `--apply` still corrects both — the store-form correction rides
+along with that re-render rather than waiting for a second pass.
 
 `store-missing` outranking `no-wiring` matters on its own. A claude-dir with
 no hook lines is normally "finish the install" — but when the row's store is

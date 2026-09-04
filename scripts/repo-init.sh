@@ -250,7 +250,19 @@ step() {
 }
 
 abspath() {
-    "$PYTHON_BIN" -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$1"
+    # PHYSICAL resolution (os.path.realpath, not os.path.abspath): every
+    # caller of this function feeds a value that ends up baked into a
+    # rendered hook line's MEMCONTINUUM_ROOT/MEMCONTINUUM_CODE_ROOT, a
+    # registry row, or the store's own post-commit wrapper -- all of which
+    # must agree with memidx.py's own `Path(...).resolve()` (code_meta.
+    # code_root). os.path.abspath never resolves symlinks (it only joins a
+    # relative path onto cwd and normalizes `.`/`..`), so a symlinked
+    # ancestor -- macOS's /var/folders/... -> /private/var/folders/...,
+    # a symlinked $HOME, a mounted drive -- used to bake the RAW (logical)
+    # form in here while memidx.py stored the resolved one, silently
+    # diverging (Ruling 89). The function name stays "abspath" (every
+    # call site already reads that way); only its resolution changed.
+    "$PYTHON_BIN" -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"
 }
 
 nearest_existing_ancestor() {
@@ -442,8 +454,9 @@ done
 #                              (never inside -- a store must not be absorbed
 #                              into a code repo's history; same rule the
 #                              inside-a-repo refusal below enforces)
-#   cwd not in any git repo -> "$PWD/MemContinuum-Store" (a working FOLDER,
-#                              like a docs dir, hosts its store directly)
+#   cwd not in any git repo -> "$(pwd -P)/MemContinuum-Store" (a working
+#                              FOLDER, like a docs dir, hosts its store
+#                              directly)
 # An explicit --store always wins; the default is printed so nothing lands
 # anywhere silently.
 if [ -z "$STORE" ]; then
@@ -462,7 +475,15 @@ if [ -z "$STORE" ]; then
         # cd-into-the-repo with NO --store, which lands here.
         [ -n "$CLAUDE_DIR" ] || CLAUDE_DIR="$CWD_TOPLEVEL/.claude"
     else
-        STORE="$PWD/MemContinuum-Store"
+        # PHYSICAL, not $PWD directly: a freshly-started bash's own $PWD
+        # comes from getcwd() (physical) UNLESS the environment already
+        # carries a PWD that stat-matches the actual cwd, in which case
+        # bash keeps that string verbatim -- exactly what an interactive
+        # shell that `cd`-ed through a symlink leaves behind (Ruling 89;
+        # the abspath() comment above has the same reasoning for --store/
+        # --code-root). `pwd -P` always resolves symlinks, regardless of
+        # what $PWD itself says.
+        STORE="$(pwd -P)/MemContinuum-Store"
     fi
     echo "note: no --store given -- defaulting to $STORE"
     [ -n "$CLAUDE_DIR" ] && echo "note: hooks will merge into $CLAUDE_DIR"
@@ -541,9 +562,15 @@ else
 fi
 
 declare -a CODE_ROOTS_ABS=()
+# CODE_ROOTS_RAW stays index-parallel to CODE_ROOTS_ABS (same filter, same
+# order) so the code-reindex step line below can echo the --code-root
+# argument as typed rather than its resolved form -- see that step's own
+# comment for why.
+declare -a CODE_ROOTS_RAW=()
 for cr in "${CODE_ROOTS[@]:-}"; do
     [ -z "$cr" ] && continue
     CODE_ROOTS_ABS+=("$(abspath "$cr")")
+    CODE_ROOTS_RAW+=("$cr")
 done
 
 if [ -n "$LANGS_FLAG" ] && [ "${#CODE_ROOTS_ABS[@]}" -eq 0 ]; then
@@ -1419,9 +1446,16 @@ CODE_REINDEX_RC=0
 CODE_REINDEX_OUT=""
 if [ "${#CODE_ROOTS_ABS[@]}" -gt 0 ] && [ -n "$CHOSEN_LANGS" ]; then
     CODE_REINDEX_RAN=1
-    for CODE_REINDEX_ROOT in "${CODE_ROOTS_ABS[@]}"; do
+    for i in "${!CODE_ROOTS_ABS[@]}"; do
+        CODE_REINDEX_ROOT="${CODE_ROOTS_ABS[$i]}"
         CODE_REINDEX_CMD=("$PYTHON_BIN" "$MEMIDX" code-reindex --code-root "$CODE_REINDEX_ROOT" --project "$PROJECT" --lang "$CHOSEN_LANGS" --no-embed)
-        step "code-reindex ($CODE_REINDEX_ROOT): PYTHONPATH= ${CODE_REINDEX_CMD[*]}"
+        # The step LINE echoes the --code-root argument AS TYPED
+        # (CODE_ROOTS_RAW), never the resolved form -- this is the one
+        # human-facing place abspath()'s Ruling 89 switch to physical
+        # resolution deliberately does not reach (see abspath()'s own
+        # comment). The actual command above still uses the resolved
+        # CODE_REINDEX_ROOT, matching what memidx.py stores.
+        step "code-reindex (${CODE_ROOTS_RAW[$i]}): PYTHONPATH= ${CODE_REINDEX_CMD[*]}"
         if [ "$DRY_RUN" -eq 0 ]; then
             out="$(PYTHONPATH= "${CODE_REINDEX_CMD[@]}" 2>&1)"
             rc=$?

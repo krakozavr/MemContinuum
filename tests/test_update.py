@@ -21,6 +21,7 @@ DECIDE_SH = TOOLS_DIR / "scripts" / "memcontinuum-decide.sh"
 UPDATE_SH = TOOLS_DIR / "scripts" / "memcontinuum-update.sh"
 INSTALL_SH = TOOLS_DIR / "scripts" / "repo-init.sh"
 SETUP_SH = TOOLS_DIR / "memcontinuum-setup.sh"
+REGISTRY_LIB = TOOLS_DIR / "scripts" / "mc-registry-lib.sh"
 
 # Same seam tests/test_write_hooks.py uses: tests/run_bash32.sh sets MC_BASH to
 # a real bash 3.2.57 binary so these scripts are exercised under the actual
@@ -75,6 +76,20 @@ def git_repo(path):
     return os.path.realpath(path)
 
 
+def tmpdir(prefix):
+    # Resolved, not raw (Ruling 89, symlink-paths fix): repo-init.sh's
+    # abspath() now resolves symlinks (os.path.realpath, not
+    # os.path.abspath), so every --store/--code-root this file builds
+    # from a setUp's self.tmp and later compares directly against
+    # rendered/registry output must be resolved too -- the identical
+    # reasoning git_repo() above already carries, one layer out: macOS's
+    # TMPDIR (/var/folders/... -> /private/var/folders/...) diverges from
+    # a raw tempfile.mkdtemp() the same way a symlinked git toplevel does.
+    # One helper, not a `realpath` sprinkled onto each of this file's
+    # ~25 `self.tmp = tempfile.mkdtemp(...)` setUp lines.
+    return os.path.realpath(tempfile.mkdtemp(prefix=prefix))
+
+
 def engine_sha(root=None, scope="repo"):
     """The stamp this checkout renders with -- asked of the one function that
     computes it (mc_render_fingerprint), never recomputed here. A test that
@@ -122,7 +137,7 @@ class UpdateTestBase(unittest.TestCase):
     registry row: claude-dirs=/code-roots=/langs=/never= all present)."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-update-test-")
+        self.tmp = tmpdir("memcontinuum-update-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -157,7 +172,7 @@ class UpdateTestBase(unittest.TestCase):
 
 class TestDecideNewFlags(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-decide-test-")
+        self.tmp = tmpdir("memcontinuum-decide-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
 
@@ -190,6 +205,83 @@ class TestDecideNewFlags(unittest.TestCase):
         # store=/project= stay first, unconditional -- back-compat with the
         # pre-D2 row shape.
         self.assertIn(f"store={Path(self.tmp) / 'store'} project=p", note)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_wired_records_every_symlinked_path_argument_physically(self):
+        """Symlink-review round 3, concern 2: memcontinuum-decide.sh used
+        to record --store (and --claude-dir/--code-root) raw, never
+        resolving it -- the one recording site Ruling 89's physical-
+        resolution rule had not reached (every OTHER site -- repo-init.sh's
+        own --store/--code-root, memcontinuum-update.sh's migration
+        overrides -- already did). A human can type any of these three
+        flags directly into this script, bypassing repo-init.sh's own
+        resolution entirely, so this is the one place that class of
+        registry-vs-rendered divergence could still originate. --repo is
+        deliberately not exercised here: it is never written into the
+        note directly, only used to derive the key via mc_repo_key, which
+        is already physical (git resolves via getcwd())."""
+        repo = git_repo(str(Path(self.tmp) / "repo"))
+        real_claude = Path(self.tmp) / "real-claude"
+        real_store = Path(self.tmp) / "real-store"
+        real_code = Path(self.tmp) / "real-code"
+        proc = run(INSTALL_SH, ["--project", "p", "--store", str(real_store),
+                                "--claude-dir", str(real_claude),
+                                "--non-interactive"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        real_code.mkdir()
+
+        claude_link = Path(self.tmp) / "claude-link"
+        store_link = Path(self.tmp) / "store-link"
+        code_link = Path(self.tmp) / "code-link"
+        claude_link.symlink_to(real_claude, target_is_directory=True)
+        store_link.symlink_to(real_store, target_is_directory=True)
+        code_link.symlink_to(real_code, target_is_directory=True)
+
+        proc = run(DECIDE_SH, ["wired", "--repo", repo,
+                               "--store", str(store_link), "--project", "p",
+                               "--claude-dir", str(claude_link),
+                               "--code-root", str(code_link)], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        note = decisions_tsv(self.home).read_text().splitlines()[-1]
+        self.assertIn(f"store={os.path.realpath(str(real_store))}", note, note)
+        self.assertIn(f"claude-dirs={os.path.realpath(str(real_claude))}", note, note)
+        self.assertIn(f"code-roots={os.path.realpath(str(real_code))}", note, note)
+        self.assertNotIn(str(store_link), note, note)
+        self.assertNotIn(str(claude_link), note, note)
+        self.assertNotIn(str(code_link), note, note)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_wired_with_no_claude_dir_records_the_default_physically(self):
+        """Symlink-review round 4: the DEFAULT claude-dir -- <repo>/.claude, used
+        whenever --claude-dir is omitted, which is the `wired` command
+        skills/memcontinuum/SKILL.md documents -- goes through mc_physical
+        exactly like an explicitly given one. The test above covers only
+        the explicit flags; a repo whose own .claude is a symlink records
+        the symlinked string unless the default is resolved too, while
+        repo-init.sh renders into the physical target -- the same
+        registry-vs-rendered divergence the explicit case closes."""
+        repo = git_repo(str(Path(self.tmp) / "repo"))
+        real_claude = Path(self.tmp) / "real-claude"
+        real_claude.mkdir()
+        dot_claude = Path(repo) / ".claude"
+        dot_claude.symlink_to(real_claude, target_is_directory=True)
+        real_claude_physical = os.path.realpath(str(real_claude))
+        self.assertNotEqual(str(dot_claude), real_claude_physical,
+                            "test setup must actually be symlinked")
+
+        store = str(Path(self.tmp) / "store")
+        proc = run(INSTALL_SH, ["--project", "p", "--store", store,
+                                "--claude-dir", str(dot_claude),
+                                "--non-interactive"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+        # No --claude-dir at all -- the SKILL.md-documented invocation.
+        proc = run(DECIDE_SH, ["wired", "--repo", repo,
+                               "--store", store, "--project", "p"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        note = decisions_tsv(self.home).read_text().splitlines()[-1]
+        self.assertIn(f"claude-dirs={real_claude_physical}", note, note)
+        self.assertNotIn(f"{repo}/.claude", note, note)
 
     @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
     def test_repeatable_claude_dir_requires_every_one_fully_wired(self):
@@ -229,7 +321,7 @@ class TestRecordDecisionFlag(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-record-decision-test-")
+        self.tmp = tmpdir("memcontinuum-record-decision-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -460,9 +552,211 @@ class TestUpdateWalkStaleAndOk(UpdateTestBase):
         self.assertNotIn(declined_repo, proc.stdout)
 
 
+class TestStoreFormStaleVsMismatch(UpdateTestBase):
+    """Symlink-review round 1, findings 6+7: a registry row's store=
+    disagreeing with what is actually rendered has two different causes,
+    and reporting them the same way is itself a bug. A GENUINE mismatch
+    (the row names a different store entirely) must keep failing loudly
+    as store-mismatch, exactly as before. The SAME physical store recorded
+    in an unresolved (symlinked) STRING form -- a row written before
+    Ruling 89, or by a human typing a symlinked path directly into
+    memcontinuum-decide.sh -- is not a mismatch at all: the wiring already
+    renders the physical path, and only the registry's own record of the
+    path is stale."""
+
+    def _rewrite_store_field(self, new_store):
+        """Directly (Python-side, independent of the bash fix under test)
+        rewrites ONLY the store= token of this repo's row, leaving every
+        other token exactly as memcontinuum-decide.sh (setUp) wrote it --
+        simulates a row recorded before this fix, without going through
+        the fix's own registry-write code path."""
+        path = decisions_tsv(self.home)
+        out_lines = []
+        for line in path.read_text().splitlines():
+            if line.startswith("#") or not line.strip():
+                out_lines.append(line)
+                continue
+            key, decision, when, note = line.split("\t", 3)
+            if key == self.repo:
+                tokens = [
+                    (f"store={new_store}" if t.startswith("store=") else t)
+                    for t in note.split(" ")
+                ]
+                note = " ".join(tokens)
+            out_lines.append("\t".join([key, decision, when, note]))
+        path.write_text("\n".join(out_lines) + "\n")
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_walk_reports_store_form_stale_with_an_apply_hint(self):
+        store_link = Path(self.tmp) / "store-link"
+        store_link.symlink_to(self.store, target_is_directory=True)
+        self._rewrite_store_field(str(store_link))
+        before = decisions_tsv(self.home).read_text()
+
+        proc = run(UPDATE_SH, [], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        rows = self.table_rows(proc.stdout)
+        self.assertEqual(rows[0]["action"], "store-form-stale", proc.stdout)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("re-run with --apply", combined, combined)
+        # Never the decide.sh `wired` remedy -- it rebuilds the note from
+        # scratch and would drop claude-dirs/code-roots/langs/never.
+        self.assertNotIn("memcontinuum-decide.sh wired", combined, combined)
+        self.assertEqual(decisions_tsv(self.home).read_text(), before,
+                         "a plain walk must never write the registry")
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_apply_rewrites_only_the_store_field(self):
+        store_link = Path(self.tmp) / "store-link"
+        store_link.symlink_to(self.store, target_is_directory=True)
+        self._rewrite_store_field(str(store_link))
+        note_before = decisions_tsv(self.home).read_text().splitlines()[-1].split("\t", 3)[3]
+        # The fixture (UpdateTestBase.setUp, via memcontinuum-decide.sh
+        # wired --code-root/--langs/--never-ext) must actually have written
+        # all four fields -- otherwise the string-substitution check below
+        # would trivially pass on a note that never carried them.
+        for field in ("claude-dirs=", "code-roots=", "langs=", "never="):
+            self.assertIn(field, note_before, note_before)
+
+        proc = run(UPDATE_SH, ["--apply"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("store-form-updated", proc.stdout, proc.stdout)
+
+        note_after = decisions_tsv(self.home).read_text().splitlines()[-1].split("\t", 3)[3]
+        store_real = os.path.realpath(self.store)
+        self.assertIn(f"store={store_real}", note_after, note_after)
+
+        # symlink-review round 2, NEW-3: the WHOLE note, not just its
+        # fields as an unordered set -- substituting ONLY the store=
+        # token's value in note_before must reproduce note_after
+        # EXACTLY, byte for byte. This pins token ORDER (a dict comparison
+        # cannot: {"a": "a=1", "b": "b=2"} == {"b": "b=2", "a": "a=1"}) as
+        # well as catching any field being added, dropped, or changed in
+        # value.
+        expected_note = note_before.replace(f"store={store_link}", f"store={store_real}")
+        self.assertNotEqual(expected_note, note_before,
+                            "the substitution must have actually matched the old store= token")
+        self.assertEqual(note_after, expected_note, (note_before, note_after))
+
+        # A re-walk now reports ok -- no re-render was needed (the wiring
+        # already rendered the physical path), and the correction sticks.
+        proc2 = run(UPDATE_SH, [], self.home)
+        rows = self.table_rows(proc2.stdout)
+        self.assertEqual(rows[0]["action"], "ok", proc2.stdout)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_a_genuinely_different_store_still_reports_store_mismatch(self):
+        """A DIFFERENT physical store (not the same one in another string
+        form) must keep failing loudly -- store-form-stale/-updated must
+        never become a loophole out of a real mismatch."""
+        other_store = str(Path(self.tmp) / "other-store")
+        marked_store(other_store)
+        self._rewrite_store_field(other_store)
+        before = decisions_tsv(self.home).read_text()
+
+        proc = run(UPDATE_SH, [], self.home)
+        rows = self.table_rows(proc.stdout)
+        self.assertEqual(rows[0]["action"], "store-mismatch", proc.stdout)
+        self.assertNotIn("store-form", proc.stdout, proc.stdout)
+        self.assertEqual(decisions_tsv(self.home).read_text(), before)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_a_single_apply_converges_a_stale_engine_and_a_symlinked_store_together(self):
+        """Round 2, NEW-2: the generic fingerprint-mismatch `stale` action
+        ranks above store-form-stale in the walk's own precedence chain --
+        without folding the two together, a row that is BOTH stale (an
+        engine change, e.g. this task's own repo-init.sh edits, which IS a
+        fingerprint input) AND recorded with a raw/symlinked store= would
+        need TWO --apply passes to converge: the first only re-renders
+        (fixing the stamp), and only the SECOND (fingerprint now matching)
+        would ever reach the store-form branch and correct the registry.
+        One --apply must do both in the same pass."""
+        store_link = Path(self.tmp) / "store-link"
+        store_link.symlink_to(self.store, target_is_directory=True)
+        self._rewrite_store_field(str(store_link))
+        drifted = self.settings_text().replace(
+            f"MEMCONTINUUM_RENDERED={engine_sha()}", "MEMCONTINUUM_RENDERED=deadbee")
+        Path(self.claude_dir, "settings.local.json").write_text(drifted)
+
+        # Confirm the table still reports "stale", not "store-form-stale"
+        # -- the WALK's own precedence (fingerprint wins the label) is
+        # unchanged by this fix; only --apply's own behavior is folded.
+        proc0 = run(UPDATE_SH, [], self.home)
+        rows0 = self.table_rows(proc0.stdout)
+        self.assertEqual(rows0[0]["action"], "stale", proc0.stdout)
+
+        proc = run(UPDATE_SH, ["--apply"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f"MEMCONTINUUM_RENDERED={engine_sha()}", self.settings_text())
+        note = decisions_tsv(self.home).read_text().splitlines()[-1]
+        store_real = os.path.realpath(self.store)
+        self.assertIn(f"store={store_real}", note, note)
+
+        # A SINGLE --apply must leave the row fully converged -- a re-walk
+        # now reports ok, not stale/store-mismatch/store-form-stale.
+        proc2 = run(UPDATE_SH, [], self.home)
+        rows2 = self.table_rows(proc2.stdout)
+        self.assertEqual(rows2[0]["action"], "ok", proc2.stdout)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_a_decide_sh_recorded_symlinked_store_never_needs_a_store_form_cycle(self):
+        """Symlink-review round 3, concern 2: memcontinuum-decide.sh now
+        resolves --store itself (scripts/mc-registry-lib.sh's mc_physical,
+        the same helper repo-init.sh and memcontinuum-update.sh's own
+        overrides already used), so a row it records is never the
+        raw/symlinked-string case store-form-stale/-updated exists to
+        correct after the fact. The fix at the RECORDING site closes the
+        gap for good, rather than relying on --apply to notice and repair
+        it -- not even a single store-form-stale detour, let alone the
+        two-pass shape fix round 2 closed for a row recorded some other
+        way (e.g. round 1's own Python-side registry-mutation test
+        fixture, which still simulates a PRE-this-round row)."""
+        store_link = Path(self.tmp) / "store-link-for-decide"
+        store_link.symlink_to(self.store, target_is_directory=True)
+        self.assertNotEqual(str(store_link), self.store,
+                            "test setup must actually be symlinked")
+
+        # Re-record the SAME row through decide.sh directly, with the
+        # symlinked alias -- exactly as a human typing the path by hand
+        # would (memcontinuum-decide.sh's own documented "wired" flow,
+        # independent of repo-init.sh's --record-decision).
+        proc = run(DECIDE_SH, ["wired", "--repo", self.repo, "--store", str(store_link),
+                               "--project", "proj", "--claude-dir", self.claude_dir,
+                               "--code-root", self.code_root, "--langs", "python",
+                               "--never-ext", ".cs"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        store_real = os.path.realpath(self.store)
+        note = decisions_tsv(self.home).read_text().splitlines()[-1]
+        self.assertIn(f"store={store_real}", note, note)
+        self.assertNotIn(str(store_link), note, note)
+
+        # Make the ENGINE stale too (this whole task's own repo-init.sh
+        # edits are themselves a fingerprint input) -- the row is
+        # fingerprint-stale, but was never store-form-stale to begin with.
+        drifted = self.settings_text().replace(
+            f"MEMCONTINUUM_RENDERED={engine_sha()}", "MEMCONTINUUM_RENDERED=deadbee")
+        Path(self.claude_dir, "settings.local.json").write_text(drifted)
+
+        proc0 = run(UPDATE_SH, [], self.home)
+        rows0 = self.table_rows(proc0.stdout)
+        self.assertEqual(rows0[0]["store-match"], "yes", proc0.stdout)
+        self.assertEqual(rows0[0]["action"], "stale", proc0.stdout)
+        self.assertNotIn("store-form", proc0.stdout, proc0.stdout)
+
+        # ONE --apply, and the store-form machinery is never even
+        # invoked -- the fingerprint re-render is the whole fix.
+        proc = run(UPDATE_SH, ["--apply"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("store-form", proc.stdout, proc.stdout)
+
+        proc2 = run(UPDATE_SH, [], self.home)
+        rows2 = self.table_rows(proc2.stdout)
+        self.assertEqual(rows2[0]["action"], "ok", proc2.stdout)
+
+
 class TestLegacyRowMigration(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-update-legacy-test-")
+        self.tmp = tmpdir("memcontinuum-update-legacy-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -658,7 +952,7 @@ class TestNeverExtsSurviveARerender(unittest.TestCase):
     from."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-update-never-test-")
+        self.tmp = tmpdir("memcontinuum-update-never-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -806,7 +1100,7 @@ class TestMigrationNeverGuessesTheClaudeDirSet(unittest.TestCase):
     it can see and refuses to write until a human names the whole set."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-update-cd-test-")
+        self.tmp = tmpdir("memcontinuum-update-cd-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -877,6 +1171,34 @@ class TestMigrationNeverGuessesTheClaudeDirSet(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("--repo", proc.stdout + proc.stderr)
 
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_symlinked_claude_dir_override_records_the_physical_path(self):
+        """Symlink-paths fix (mc_physical, scripts/memcontinuum-update.sh):
+        a legacy row's first-ever claude-dirs record (this command's own
+        --claude-dir, the ONLY way that set is ever written) must resolve
+        PHYSICALLY before it lands in the registry row -- repo-init.sh
+        (re-run below with this same --claude-dir) resolves its own copy
+        physically too (abspath()), so the two must agree."""
+        real_parent = Path(self.tmp) / "real-session-home-parent"
+        real_parent.mkdir()
+        session_link = Path(self.tmp) / "session-home-link"
+        session_link.symlink_to(real_parent, target_is_directory=True)
+        claude_c = session_link / ".claude"
+        proc_install = run(INSTALL_SH, ["--project", "two", "--store", self.store,
+                                        "--claude-dir", str(claude_c), "--non-interactive"], self.home)
+        self.assertEqual(proc_install.returncode, 0, proc_install.stdout + proc_install.stderr)
+        claude_c_real = os.path.realpath(str(claude_c))
+        self.assertNotEqual(str(claude_c), claude_c_real, "test setup must actually be symlinked")
+
+        proc = run(UPDATE_SH, ["--apply", "--repo", self.repo,
+                               "--claude-dir", self.claude_a,
+                               "--claude-dir", str(claude_c)], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        note = decisions_tsv(self.home).read_text().splitlines()[-1]
+        self.assertIn(f"claude-dirs={self.claude_a};{claude_c_real}", note, note)
+        self.assertNotIn(str(claude_c) + ";", note, note)
+        self.assertNotIn(";" + str(claude_c), note, note)
+
 
 class TestMigrationNeverInventsALanguageSet(unittest.TestCase):
     """Wiring rendered before the language set was recorded on the hook line
@@ -885,7 +1207,7 @@ class TestMigrationNeverInventsALanguageSet(unittest.TestCase):
     indexing for a project that had it on."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-update-langs-test-")
+        self.tmp = tmpdir("memcontinuum-update-langs-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -1029,7 +1351,7 @@ class TestRecordDecisionNeverFlipsADeclinedRow(unittest.TestCase):
     the person who declined."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-record-declined-test-")
+        self.tmp = tmpdir("memcontinuum-record-declined-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -1076,7 +1398,7 @@ class TestPathsWithSpaces(unittest.TestCase):
     values are percent-encoded on the way in and decoded on the way out."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-spaces-test-")
+        self.tmp = tmpdir("memcontinuum-spaces-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "my repo"))
@@ -1287,7 +1609,7 @@ class TestPartiallyRenderedLanguagesAreReported(unittest.TestCase):
     nothing about it."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-partial-test-")
+        self.tmp = tmpdir("memcontinuum-partial-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -1359,7 +1681,7 @@ class TestRenderFingerprint(unittest.TestCase):
     false -- every commit to anything marked every repo on the machine stale."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-fp-test-")
+        self.tmp = tmpdir("memcontinuum-fp-test-")
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.engine = Path(self.tmp) / "engine"
         shutil.copytree(TOOLS_DIR, self.engine, symlinks=True,
@@ -1505,7 +1827,7 @@ class TestMachineLayerIsComparedSeparately(unittest.TestCase):
     applies -- and nowhere else."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-machine-test-")
+        self.tmp = tmpdir("memcontinuum-machine-test-")
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.engine = Path(self.tmp) / "engine"
         shutil.copytree(TOOLS_DIR, self.engine, symlinks=True,
@@ -1598,7 +1920,7 @@ class TestTargetedModeRequiresRecordedWiring(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-update-targeted-test-")
+        self.tmp = tmpdir("memcontinuum-update-targeted-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -1671,7 +1993,7 @@ class TestTargetedModeRefusesARowWithNoCodeRoot(unittest.TestCase):
     language set that renders nowhere. Refused before anything is written."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-update-nocr-test-")
+        self.tmp = tmpdir("memcontinuum-update-nocr-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -1708,7 +2030,7 @@ class TestMultiDirLegacyMigrationRecoversPerDir(unittest.TestCase):
     with a set it never had."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-update-multidir-test-")
+        self.tmp = tmpdir("memcontinuum-update-multidir-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -1790,6 +2112,213 @@ class TestMultiDirLegacyMigrationRecoversPerDir(unittest.TestCase):
         self.assertNotIn("unknown argument", combined, combined)
         self.assertIn("ONE registry row", combined, combined)
 
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_symlinked_code_root_override_records_and_renders_the_physical_path(self):
+        """Symlink-paths fix (mc_physical, scripts/memcontinuum-update.sh):
+        an OVERRIDE_CODE_ROOTS value given directly on this command's own
+        --code-root during migration must resolve PHYSICALLY before it
+        lands in the registry row -- otherwise it would disagree with what
+        repo-init.sh (re-run below with this same value) bakes into the
+        rendered hook line for the very same install (Ruling 89's
+        registry-vs-rendered divergence, one layer up)."""
+        real_parent = Path(self.tmp) / "real-code-c-parent"
+        real_parent.mkdir()
+        code_c_link = Path(self.tmp) / "code-c-link"
+        code_c_link.symlink_to(real_parent, target_is_directory=True)
+        code_c = code_c_link / "code-c"
+        code_c.mkdir()
+        (code_c / "z.py").write_text("print(3)\n")
+        code_c_real = os.path.realpath(str(code_c))
+        self.assertNotEqual(str(code_c), code_c_real, "test setup must actually be symlinked")
+
+        proc = run(UPDATE_SH, ["--apply", "--repo", self.repo,
+                               "--claude-dir", self.claude_a,
+                               "--code-root", str(code_c),
+                               "--langs", "python,swift",
+                               "--set-never-ext", ".cs"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        note = decisions_tsv(self.home).read_text().splitlines()[-1]
+        self.assertIn(f"code-roots={code_c_real}", note, note)
+        self.assertNotIn(str(code_c), note, note)
+        settings = Path(self.claude_a, "settings.local.json").read_text()
+        self.assertIn(f"MEMCONTINUUM_CODE_ROOT={code_c_real}", settings)
+        self.assertNotIn(f"MEMCONTINUUM_CODE_ROOT={code_c}", settings)
+
+
+class TestMcPhysical(unittest.TestCase):
+    """Direct unit coverage for mc_physical (scripts/mc-registry-lib.sh --
+    moved here from memcontinuum-update.sh in symlink-review round 3,
+    concern 2, so memcontinuum-decide.sh could reach it too without any new
+    sourcing wired up for either) -- symlink-review round 1, finding 2.
+    mc-registry-lib.sh is a pure library (no top-level CLI execution), so
+    it is safely sourceable on its own."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp(prefix="memcontinuum-mc-physical-test-")
+        self.addCleanup(shutil.rmtree, self.td, ignore_errors=True)
+
+    def _call(self, arg, cdpath, cwd):
+        caller = Path(self.td) / "probe.sh"
+        caller.write_text(
+            f'#!/usr/bin/env bash\n. "{REGISTRY_LIB}"\nmc_physical "$1"\n'
+        )
+        env = dict(os.environ)
+        env["CDPATH"] = cdpath
+        proc = subprocess.run(
+            [MC_BASH, str(caller), arg],
+            capture_output=True, text=True, env=env, cwd=cwd, timeout=10,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout
+
+    def test_cdpath_never_corrupts_the_captured_value(self):
+        """The bug (round 1, finding 2): with CDPATH set and a RELATIVE
+        argument CDPATH resolves, bash's own `cd` builtin prints the
+        matched directory to stdout (POSIX-documented CDPATH behavior)
+        BEFORE `pwd -P` runs, so an unguarded `cd "$1" && pwd -P` command
+        substitution captures TWO newline-joined lines instead of one --
+        corrupting whatever field this value feeds (and, for a registry
+        row, literally splitting one TSV line into two). Reproduced
+        directly against the fix: CDPATH points at a directory containing
+        `code-c`, the relative arg is `code-c`, and the calling cwd does
+        NOT itself contain `code-c` -- the only way this could resolve to
+        anything at all is via CDPATH, which the fix deliberately
+        disables for this one `cd` (an intentional, documented trade:
+        CDPATH-assisted search is out of scope for a resolve-the-physical-
+        path helper), so the correct fixed output is the single-line raw
+        fallback, never two lines."""
+        cdpath_base = Path(self.td) / "cdpath-base"
+        (cdpath_base / "code-c").mkdir(parents=True)
+        cwd = Path(self.td) / "elsewhere"
+        cwd.mkdir()
+        self.assertFalse((cwd / "code-c").exists(),
+                         "cwd must not resolve this on its own")
+        out = self._call("code-c", str(cdpath_base), str(cwd))
+        self.assertEqual(len(out.splitlines()), 1, f"corrupted output: {out!r}")
+        # CDPATH is deliberately disabled for this cd -- the correct fixed
+        # behavior is the raw-value fallback, not a CDPATH-assisted match.
+        self.assertEqual(out, "code-c")
+
+    def test_a_local_relative_path_still_resolves_with_cdpath_set(self):
+        """The fix must not regress the ordinary case: a relative argument
+        that resolves against cwd ALONE (no CDPATH assistance needed)
+        still resolves correctly even with an unrelated CDPATH set."""
+        cdpath_base = Path(self.td) / "unrelated-cdpath-base"
+        cdpath_base.mkdir()
+        cwd = Path(self.td) / "cwd"
+        (cwd / "local-dir").mkdir(parents=True)
+        expected = os.path.realpath(str(cwd / "local-dir"))
+        out = self._call("local-dir", str(cdpath_base), str(cwd))
+        self.assertEqual(out, expected)
+
+    def test_a_nonexistent_relative_path_falls_back_to_the_raw_value(self):
+        """No CDPATH involved at all -- a plain nonexistent relative
+        argument still gets the documented raw-value fallback, one line,
+        unchanged by this fix."""
+        cwd = Path(self.td) / "cwd2"
+        cwd.mkdir()
+        out = self._call("does-not-exist", "", str(cwd))
+        self.assertEqual(out, "does-not-exist")
+
+
+class TestMcRegistryRewriteRow(unittest.TestCase):
+    """Direct unit coverage for mc_registry_rewrite_row
+    (scripts/mc-registry-lib.sh) -- symlink-review round 2, NEW-1: the one
+    shared atomic decisions.tsv rewrite, factored out of
+    memcontinuum-decide.sh's own inline block and memcontinuum-update.sh's
+    now-deleted mc_registry_rewrite_note (which had independently
+    diverged: no `rm -f` on a failed `mv`). mc-registry-lib.sh is a pure
+    library (no top-level CLI execution), so it is safely sourceable on
+    its own -- unlike memcontinuum-update.sh/-decide.sh themselves."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp(prefix="memcontinuum-registry-rewrite-test-")
+        self.addCleanup(shutil.rmtree, self.td, ignore_errors=True)
+
+    def _call(self, file_path, key, new_line=""):
+        caller = Path(self.td) / "probe.sh"
+        caller.write_text(
+            f'#!/usr/bin/env bash\nset -u\n. "{REGISTRY_LIB}"\n'
+            'mc_registry_rewrite_row "$1" "$2" "${3-}"\necho "rc=$?"\n'
+        )
+        proc = subprocess.run(
+            [MC_BASH, str(caller), file_path, key, new_line],
+            capture_output=True, text=True, timeout=10,
+        )
+        return proc
+
+    def test_replaces_the_matching_row_in_place_and_appends_the_new_line(self):
+        f = Path(self.td) / "decisions.tsv"
+        f.write_text("# header\n# key\tdecision\tdate\tnote\n"
+                      "repo1\told\t2026-01-01\told-note\n")
+        proc = self._call(str(f), "repo1", "repo1\twired\t2026-09-03\tnew-note")
+        self.assertEqual(proc.stdout.strip(), "rc=0", proc.stderr)
+        self.assertEqual(
+            f.read_text(),
+            "# header\n# key\tdecision\tdate\tnote\n"
+            "repo1\twired\t2026-09-03\tnew-note\n",
+        )
+
+    def test_omitted_new_line_drops_the_row_entirely(self):
+        """The `forget` shape: NEW_LINE omitted removes the row and appends
+        nothing in its place. This is the exact case this round's own
+        extraction regressed and this test caught RED before the fix: the
+        trailing conditional printf was the LAST statement in the rewrite
+        group, so its own exit status (1, false, on the common
+        NEW_LINE-omitted path) leaked into the group's overall exit status
+        and was misread as a write failure even though the rewrite (a
+        clean row-drop) had actually succeeded."""
+        f = Path(self.td) / "decisions.tsv"
+        f.write_text("# header\n# key\tdecision\tdate\tnote\n"
+                      "repo1\tdeclined\t2026-01-01\t\n"
+                      "repo2\twired\t2026-01-01\tstore=/x\n")
+        proc = self._call(str(f), "repo1")
+        self.assertEqual(proc.stdout.strip(), "rc=0", proc.stderr)
+        text = f.read_text()
+        self.assertNotIn("repo1", text, text)
+        self.assertIn("repo2\twired\t2026-01-01\tstore=/x", text, text)
+
+    def test_other_rows_pass_through_byte_identical(self):
+        f = Path(self.td) / "decisions.tsv"
+        f.write_text("# header\n# key\tdecision\tdate\tnote\n"
+                      "repo1\twired\t2026-01-01\ta\n"
+                      "repo2\twired\t2026-01-01\tb\n")
+        proc = self._call(str(f), "repo1", "repo1\twired\t2026-09-03\tc")
+        self.assertEqual(proc.stdout.strip(), "rc=0", proc.stderr)
+        self.assertIn("repo2\twired\t2026-01-01\tb", f.read_text())
+
+    def test_missing_file_gets_the_standard_header_first(self):
+        f = Path(self.td) / "fresh" / "decisions.tsv"
+        f.parent.mkdir()
+        proc = self._call(str(f), "repo1", "repo1\twired\t2026-09-03\tnote")
+        self.assertEqual(proc.stdout.strip(), "rc=0", proc.stderr)
+        text = f.read_text()
+        self.assertTrue(text.startswith("# MemContinuum per-repo decisions"), text)
+        self.assertIn("repo1\twired\t2026-09-03\tnote", text)
+
+    def test_write_failure_leaves_no_stray_tmp_file(self):
+        """The bug this factoring fixed (NEW-1): the pre-fix, duplicated
+        mc_registry_rewrite_note in memcontinuum-update.sh had no `rm -f`
+        on a failed write/rename -- a failure left a stray
+        `decisions.tsv.tmp.$$` file behind. Point DECISIONS_FILE at a path
+        whose parent directory does not exist, so the write into the
+        atomic temp file itself fails immediately (same directory as the
+        target, by design, so the temp file and the final rename share the
+        same failure mode here) -- and confirm nothing at all is left
+        behind under the real, existing parent."""
+        missing_parent = Path(self.td) / "does-not-exist" / "decisions.tsv"
+        proc = self._call(str(missing_parent), "repo1",
+                          "repo1\twired\t2026-09-03\tnote")
+        self.assertEqual(proc.stdout.strip(), "rc=1", proc.stderr)
+        # self.td itself holds this test's own probe.sh caller script --
+        # what must be absent is a stray *.tmp.<pid> file (there is no
+        # "does-not-exist" directory for one to land under at all, since
+        # mkdir was never attempted).
+        stray = [p for p in Path(self.td).iterdir() if ".tmp." in p.name]
+        self.assertEqual(stray, [], "no stray tmp file may be left behind")
+        self.assertFalse((Path(self.td) / "does-not-exist").exists(),
+                         "the missing parent must not have been created either")
+
 
 class TestStoreMissingOutranksNoWiring(UpdateTestBase):
     """A dir with no wiring AND a store that is gone is not a wiring problem
@@ -1822,7 +2351,7 @@ class TestTargetedMultiDirIsAllOrNothing(unittest.TestCase):
     describes neither half."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-update-txn-test-")
+        self.tmp = tmpdir("memcontinuum-update-txn-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -1881,7 +2410,7 @@ class TestAnUnknownFingerprintNeverComparesEqual(unittest.TestCase):
     checked. Unknown on either side means `stale`: re-render and find out."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-unknown-fp-test-")
+        self.tmp = tmpdir("memcontinuum-unknown-fp-test-")
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
@@ -2030,7 +2559,7 @@ class TestEveryUnfinishedApplyRowFailsTheWalk(unittest.TestCase):
     exception: that is the skill's repair path, not this command's."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-exit-test-")
+        self.tmp = tmpdir("memcontinuum-exit-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -2056,7 +2585,7 @@ class TestMachineClaudeDirIsRecordedAndReused(unittest.TestCase):
     have rendered a SECOND machine layer at the default path."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-machine-cd-test-")
+        self.tmp = tmpdir("memcontinuum-machine-cd-test-")
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.engine = Path(self.tmp) / "engine"
         shutil.copytree(TOOLS_DIR, self.engine, symlinks=True,
@@ -2134,7 +2663,7 @@ class TestTheRowIsRewrittenOnlyWhenEveryDirRendered(unittest.TestCase):
     every future re-render replays that description."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-migrate-skip-test-")
+        self.tmp = tmpdir("memcontinuum-migrate-skip-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -2216,7 +2745,7 @@ class TestThePartialRenderNoteIsOnlyPrintedWhenTrue(unittest.TestCase):
     installed, and names the language that is actually fine as the culprit."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-partial-note-test-")
+        self.tmp = tmpdir("memcontinuum-partial-note-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -2273,7 +2802,7 @@ class TestFlagsTheModeDoesNotConsumeAreRefused(unittest.TestCase):
     they wanted, the command reported success, and it did something else."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-matrix-test-")
+        self.tmp = tmpdir("memcontinuum-matrix-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -2420,7 +2949,7 @@ class TestDisagreementComparesTheRawRenderedValues(unittest.TestCase):
     replay onto the other silently changes what the other indexes."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-rawset-test-")
+        self.tmp = tmpdir("memcontinuum-rawset-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -2499,7 +3028,7 @@ class TestRepoWithoutAWiredRowIsRefused(unittest.TestCase):
     `--repo UNDECIDED --langs python` was neither consumed nor refused."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-norow-test-")
+        self.tmp = tmpdir("memcontinuum-norow-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -2579,7 +3108,7 @@ class TestEmptyFlagValuesAndContradictoryModesAreRefused(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-emptyval-test-")
+        self.tmp = tmpdir("memcontinuum-emptyval-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))

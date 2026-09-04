@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # mc-registry-lib.sh -- shared, pure-bash helpers for the machine-level
 # decision registry. Sourced by memcontinuum-decide.sh, memcontinuum-state.sh,
-# and hooks/memcontinuum-detect.sh -- never executed standalone.
+# hooks/memcontinuum-detect.sh, memcontinuum-update.sh, and repo-init.sh --
+# never executed standalone.
 #
 # Kills the fragment that used to be triplicated three ways (repo-key
 # derivation, decisions.tsv parsing, the wired-hooks scan) and that drifted
@@ -65,6 +66,45 @@ mc_repo_key() {
     return 0
 }
 
+# mc_physical PATH -- resolves PATH to its physical (symlink-free) form via
+# `cd -P && pwd -P`, matching repo-init.sh's abspath()/no-git-default fix
+# (Ruling 89: os.path.realpath / `pwd -P`, not os.path.abspath / raw $PWD).
+# Moved here from memcontinuum-update.sh (symlink-review round 3, concern 2:
+# memcontinuum-decide.sh recorded --store raw, never resolving it, while
+# every OTHER recording site -- repo-init.sh's own --store/--code-root,
+# memcontinuum-update.sh's migration overrides -- already does; every path
+# a --record-decision-shaped write puts into the registry must go through
+# the SAME resolution, so this now lives where both `memcontinuum-decide.sh`
+# and `memcontinuum-update.sh` already source it, with no new sourcing wired
+# up for either -- see those two files' own headers). Falls back to the raw
+# PATH when it does not resolve (does not exist yet, etc.) -- a value that
+# was never going to be usable anyway, unchanged behavior.
+#
+# `CDPATH=` (symlink-review round 1, finding 2): with CDPATH set in the
+# operator's environment and a RELATIVE PATH that CDPATH resolves, bash's
+# `cd` builtin itself prints the matched directory to stdout (POSIX-
+# documented CDPATH behavior) BEFORE `pwd -P` runs, so the command
+# substitution would capture two newline-joined lines instead of one,
+# corrupting the value this function returns. Clearing CDPATH for just
+# this `cd` (not globally -- a local assignment on the command itself)
+# closes it while changing nothing about the resolution itself. Reproduced
+# and verified fixed directly:
+#   CDPATH=/tmp/cdpathbase; cd /tmp && (cd sub && pwd -P)       # two lines
+#   CDPATH=/tmp/cdpathbase; cd /tmp && (CDPATH= cd sub && pwd -P) # one line
+#
+# Never call with an empty PATH: `cd ""` is a silent no-op in bash (stays in
+# the current directory), so this would return the CALLER's own cwd instead
+# of failing -- every caller here guards with `[ -n "$val" ]` first.
+mc_physical() {
+    local p
+    p="$(CDPATH= cd "$1" 2>/dev/null && pwd -P)"
+    if [ -n "$p" ]; then
+        printf '%s' "$p"
+    else
+        printf '%s' "$1"
+    fi
+}
+
 # mc_registry_lookup DECISIONS_FILE KEY
 #
 # Reads DECISIONS_FILE (key<TAB>decision<TAB>iso-date<TAB>note, `#`-comment
@@ -91,6 +131,53 @@ mc_registry_lookup() {
         return 0
     done < "$file"
     return 1
+}
+
+# mc_registry_rewrite_row DECISIONS_FILE KEY [NEW_LINE]
+#
+# The ONE atomic decisions.tsv rewrite (symlink-review round 2, NEW-1): every
+# row is copied through unchanged EXCEPT KEY's own (matched the same way
+# mc_registry_lookup matches it -- exact equality on the text before the
+# first tab, comments and blank lines pass through untouched since their
+# "key" text never equals a real KEY), then NEW_LINE is appended verbatim if
+# given -- a full "key<TAB>decision<TAB>date<TAB>note" row, so a
+# reversal/correction REPLACES the old row rather than shadowing it.
+# Omitting NEW_LINE (memcontinuum-decide.sh's `forget`) drops the row
+# entirely -- nothing is appended in its place. DECISIONS_FILE not existing
+# yet writes the standard two-line header first (unconditionally, even for
+# a NEW_LINE-less `forget` of a repo with no registry at all -- matches this
+# function's one prior caller's own pre-existing behavior exactly, not
+# changed here). Atomic: a `.tmp.$$` file in the same directory (so the
+# rename stays on one filesystem), and REMOVED on any write failure --
+# never left behind for the caller to clean up or trip over later.
+mc_registry_rewrite_row() {
+    local file="$1" key="$2" new_line="${3-}" line k tmp
+    tmp="$file.tmp.$$"
+    {
+        if [ -f "$file" ]; then
+            while IFS= read -r line || [ -n "$line" ]; do
+                k="${line%%"$MC_TAB"*}"
+                [ "$k" = "$key" ] && continue
+                printf '%s\n' "$line"
+            done < "$file"
+        else
+            printf '# MemContinuum per-repo decisions -- written only by memcontinuum-decide.sh\n'
+            printf '# key\tdecision\tdate\tnote\n'
+        fi
+        # `if`, not `[ -n "$new_line" ] && printf ...`: this is the LAST
+        # statement in the group, and `{ ... } > "$tmp"`'s own exit status
+        # is whatever this last statement's was -- `&&` on a FALSE test
+        # (the common `forget`/NEW_LINE-omitted case) returns 1 from the
+        # test itself, which would then trip the `|| { rm -f ...; return
+        # 1; }` below even though the write actually succeeded. `if`
+        # returns 0 when its condition is false and there is no `else`,
+        # so an omitted NEW_LINE reports success correctly. (Caught by
+        # this round's own new failure-branch test going unexpectedly RED
+        # on the `forget` path -- not merely reasoned about.)
+        if [ -n "$new_line" ]; then
+            printf '%s\n' "$new_line"
+        fi
+    } > "$tmp" && mv "$tmp" "$file" || { rm -f "$tmp"; return 1; }
 }
 
 # mc_wiring_scan SETTINGS_FILE...

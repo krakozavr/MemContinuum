@@ -46,7 +46,17 @@ OUR_SCRIPTS = [
 
 
 def sandbox_home():
-    return tempfile.mkdtemp(prefix="memcontinuum-install-test-home-")
+    # Resolved, not raw (Ruling 89, symlink-paths fix): repo-init.sh's
+    # abspath() now resolves symlinks (os.path.realpath, not
+    # os.path.abspath), so every --store/--claude-dir/--code-root this file
+    # builds from `home` and later compares against rendered/registry
+    # output must be resolved too, or the comparison is a Linux-only
+    # assumption again -- macOS's TMPDIR (/var/folders/... ->
+    # /private/var/folders/...) diverges exactly like a symlinked git
+    # toplevel does. Same fix, same reasoning, as git_repo() in
+    # tests/test_update.py -- this file just never needed it before,
+    # because abspath() used to be a no-op on an already-absolute path.
+    return os.path.realpath(tempfile.mkdtemp(prefix="memcontinuum-install-test-home-"))
 
 
 def run_install(args, home, timeout=60, python=VENV_PYTHON, extra_env=None, cwd=None):
@@ -1083,10 +1093,124 @@ class TestDefaultStoreName(unittest.TestCase):
             proc = run_install(["--project", "p", "--dry-run"], home, cwd=str(work))
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             # Resolved, not raw -- see the sibling-store test above: outside
-            # a git repo the default store is "$PWD/MemContinuum-Store",
+            # a git repo the default store is "$(pwd -P)/MemContinuum-Store",
             # and a freshly-started bash's $PWD comes from getcwd(), which
             # is always symlink-free.
             self.assertIn(f"defaulting to {os.path.realpath(str(work))}/MemContinuum-Store", proc.stdout)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_default_in_a_plain_folder_under_a_symlinked_logical_pwd_resolves_physically(self):
+        # Ruling 89: the no-git default used to be plain "$PWD/MemContinuum-
+        # Store", which trusts whatever $PWD says. A freshly spawned bash
+        # normally recomputes $PWD via getcwd() (physical) regardless of
+        # what the caller's environment says -- UNLESS the environment
+        # already carries a PWD that stat-matches the actual cwd, in which
+        # case bash keeps that string VERBATIM. That is exactly what an
+        # interactive shell that `cd`-ed through a symlink leaves behind:
+        # its own $PWD is the logical (symlinked) path, and a subprocess it
+        # spawns inherits that same PWD, matching its own cwd by inode. The
+        # fix (`pwd -P`) must resolve physically regardless. `cwd=` alone
+        # would not reproduce this -- a fresh subprocess.run() with no PWD
+        # override recomputes $PWD physically on its own either way; the
+        # env PWD override is what actually exercises the "kept verbatim"
+        # branch this test is for.
+        home = sandbox_home()
+        try:
+            real_work = Path(home) / "docs-real"
+            real_work.mkdir()
+            work_link = Path(home) / "docs-link"
+            work_link.symlink_to(real_work, target_is_directory=True)
+            proc = run_install(
+                ["--project", "p", "--dry-run"], home,
+                cwd=str(work_link), extra_env={"PWD": str(work_link)},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            work_real = os.path.realpath(str(work_link))
+            self.assertNotEqual(str(work_link), work_real, "test setup must actually be symlinked")
+            self.assertIn(f"defaulting to {work_real}/MemContinuum-Store", proc.stdout)
+            self.assertNotIn(f"{work_link}/MemContinuum-Store", proc.stdout)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestSymlinkedStoreAndCodeRootResolvePhysically(unittest.TestCase):
+    """Ruling 89 / symlink-paths fix: abspath() (scripts/repo-init.sh) used
+    to be os.path.abspath, which never resolves symlinks. A --store or
+    --code-root reached through a symlinked directory (macOS's
+    /var/folders/... -> /private/var/folders/..., a symlinked $HOME, a
+    mounted drive) used to bake the RAW (symlinked) form into every
+    rendered hook line, the store's own post-commit wrapper, and (when
+    --record-decision is given) the registry row -- while memidx.py's own
+    code_meta.code_root is stored via Path(...).resolve(). abspath() now
+    uses os.path.realpath, so every one of these forms must agree."""
+
+    def test_symlinked_store_and_code_root_render_physically_everywhere(self):
+        home = sandbox_home()
+        try:
+            repo = Path(home) / "proj"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "."], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "-c", "user.email=a@b.c", "-c", "user.name=a",
+                 "commit", "-q", "--allow-empty", "-m", "init"],
+                cwd=repo, check=True,
+            )
+
+            real_store_parent = Path(home) / "real-store-parent"
+            real_store_parent.mkdir()
+            store_link = Path(home) / "store-link"
+            store_link.symlink_to(real_store_parent, target_is_directory=True)
+            store = str(store_link / "store")
+            store_real = os.path.realpath(store)
+            self.assertNotEqual(store, store_real, "test setup must actually be symlinked")
+
+            real_code_parent = Path(home) / "real-code-parent"
+            real_code_parent.mkdir()
+            code_link = Path(home) / "code-link"
+            code_link.symlink_to(real_code_parent, target_is_directory=True)
+            code_root = str(code_link / "code")
+            os.makedirs(code_root)
+            code_root_real = os.path.realpath(code_root)
+            self.assertNotEqual(code_root, code_root_real, "test setup must actually be symlinked")
+
+            claude_dir = repo / ".claude"
+            proc = run_install(
+                ["--project", "symtest", "--store", store, "--code-root", code_root,
+                 "--claude-dir", str(claude_dir), "--non-interactive", "--record-decision"],
+                home,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+            # 1. rendered hook line
+            data = json.loads((claude_dir / "settings.local.json").read_text())
+            cmds = [
+                h.get("command", "")
+                for group in data["hooks"]["PostToolUse"]
+                for h in group.get("hooks", [])
+                if "ledger-post-edit.sh" in h.get("command", "")
+            ]
+            self.assertTrue(cmds, data["hooks"])
+            self.assertIn(f"MEMCONTINUUM_ROOT={store_real}", cmds[0])
+            self.assertIn(f"MEMCONTINUUM_CODE_ROOT={code_root_real}", cmds[0])
+            self.assertNotIn(store, cmds[0])
+            self.assertNotIn(code_root, cmds[0])
+
+            # 2. the store's own post-commit reindex wrapper
+            post_commit = Path(store_real) / ".git" / "hooks" / "post-commit"
+            self.assertTrue(post_commit.is_file(), post_commit)
+            text = post_commit.read_text()
+            self.assertIn(f"MEMCONTINUUM_ROOT={store_real}", text)
+            self.assertNotIn(f"MEMCONTINUUM_ROOT={store}", text)
+
+            # 3. the registry row (--record-decision)
+            decisions = Path(home) / ".memcontinuum" / "decisions.tsv"
+            self.assertTrue(decisions.is_file(), "no decisions.tsv written")
+            note = decisions.read_text().splitlines()[-1]
+            self.assertIn(f"store={store_real}", note)
+            self.assertIn(f"code-roots={code_root_real}", note)
+            self.assertNotIn(f"store={store} ", note)
         finally:
             shutil.rmtree(home, ignore_errors=True)
 

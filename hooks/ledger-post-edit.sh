@@ -88,17 +88,21 @@ eval "$(mc_extract_fields "$PAYLOAD" session_id tool_input.file_path agent_id)" 
 [ -z "${SESSION_ID:-}" ] && finish "no-session-id"
 [ -z "${FILE_PATH:-}" ] && finish "no-file-path"
 
+# Symlink-safe containment (mc_path_under_root, hooks/memlib.sh -- shared
+# with hooks/newfile-nudge.sh's own 2026-08-31 fix for this same class): a
+# plain lexical prefix match here is fooled by a literal `/../` traversal
+# segment or a symlinked ancestor directory the same way newfile-nudge.sh's
+# was, silently classifying a real edit as out-of-scope and losing the
+# growth signal (last_growth_turn/last_growth_ts) this hook alone advances.
 UNDER_CODE=0
 UNDER_STORE=0
 if [ -n "${MEMCONTINUUM_CODE_ROOT:-}" ]; then
-    case "$FILE_PATH" in
-        "${MEMCONTINUUM_CODE_ROOT%/}"/*) UNDER_CODE=1 ;;
-    esac
+    mc_path_under_root "$FILE_PATH" "$MEMCONTINUUM_CODE_ROOT"
+    [ $? -eq 0 ] && UNDER_CODE=1
 fi
 if [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
-    case "$FILE_PATH" in
-        "${MEMCONTINUUM_ROOT%/}"/*) UNDER_STORE=1 ;;
-    esac
+    mc_path_under_root "$FILE_PATH" "$MEMCONTINUUM_ROOT"
+    [ $? -eq 0 ] && UNDER_STORE=1
 fi
 
 if [ "$UNDER_CODE" -eq 0 ] && [ "$UNDER_STORE" -eq 0 ]; then

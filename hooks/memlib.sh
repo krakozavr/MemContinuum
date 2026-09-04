@@ -46,6 +46,15 @@
 export PYTHONPATH=
 
 MC_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+
+# mc_path_under_root lives in its own side-effect-free file (symlink-paths
+# review round 1, finding 3) so hooks/newfile-nudge.sh can reach it WITHOUT
+# paying everything below this line's cost -- see mc-path-lib.sh's own
+# header. Sourcing it here costs every OTHER caller of this file nothing
+# beyond defining one more function (no I/O, no side effects of its own).
+# shellcheck source=mc-path-lib.sh
+. "$MC_LIB_DIR/mc-path-lib.sh"
+
 MC_MEMIDX="$MC_LIB_DIR/../memidx.py"
 # Python resolution order (README.md "Requirements" / memcontinuum-setup.sh):
 #   $MEMCONTINUUM_PYTHON -> $MEMCONTINUUM_HOME/config.sh -> <engine>/.venv/bin/python
@@ -326,3 +335,6 @@ mc_prune_old_state() {
     [ -d "$dir" ] || return 0
     find "$dir" -maxdepth 1 -type f -name '*.json' -mmin "+$minutes" -exec rm -f {} + 2>/dev/null || true
 }
+
+# mc_path_under_root now lives in mc-path-lib.sh (sourced near the top of
+# this file) -- see that file's own header/doc comment.

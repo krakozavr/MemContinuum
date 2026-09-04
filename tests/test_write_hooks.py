@@ -53,6 +53,7 @@ SESSIONSTART_HOOK = HOOKS_DIR / "sessionstart-remind.sh"
 USERPROMPT_HOOK = HOOKS_DIR / "userprompt-remind.sh"
 SESSIONEND_HOOK = HOOKS_DIR / "sessionend-stamp.sh"
 MEMLIB = HOOKS_DIR / "memlib.sh"
+MC_PATH_LIB = HOOKS_DIR / "mc-path-lib.sh"
 # A decoy PYTHONPATH entry ahead of a synthetic poison dir elsewhere in this
 # file. It does not need to exist on disk -- Python silently skips a missing
 # PYTHONPATH entry -- it just needs to have no `yaml` module in it.
@@ -585,6 +586,64 @@ class TestLedgerPostEdit(HookTestBase):
     def test_ignores_path_outside_both_roots(self):
         session_id = "s-ledger-outside"
         fpath = "/tmp/somewhere/else/file.py"
+        payload = self.post_tool_use_payload(session_id, fpath)
+        proc, _ = run_script(LEDGER_HOOK, payload, self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        state = self.load_state(session_id)
+        paths = [e["path"] for e in state.get("ledger", [])]
+        self.assertNotIn(fpath, paths)
+
+    def test_appends_path_under_a_symlinked_parent_into_the_store(self):
+        # mc_path_under_root (hooks/memlib.sh): a path that reaches the
+        # store only through a symlinked ancestor -- every segment lexically
+        # OUTSIDE MEMCONTINUUM_ROOT's own string, but resolving physically
+        # into it -- must still count as under-store. The old lexical
+        # `case "$FILE_PATH" in "$MEMCONTINUUM_ROOT"/*` prefix match could
+        # never see this (it only ever matched a literal prefix), the
+        # mirror-image gap of newfile-nudge.sh's own symlink fix.
+        store_link = Path(self.td) / "store-link"
+        store_link.symlink_to(self.store_root, target_is_directory=True)
+        session_id = "s-ledger-symlinked-store"
+        fpath = str(store_link / "topics" / "testing" / "mapped-topic.md")
+        payload = self.post_tool_use_payload(session_id, fpath, tool_name="Write")
+        proc, _ = run_script(LEDGER_HOOK, payload, self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        state = self.load_state(session_id)
+        entry = [e for e in state["ledger"] if e["path"] == fpath][0]
+        self.assertEqual(entry["kind"], "store")
+
+    def test_silent_for_a_symlinked_parent_escaping_the_code_root(self):
+        # Mirror-image of newfile-nudge.sh's own
+        # test_silent_for_a_symlinked_parent_escaping_the_code_root: a path
+        # that is lexically under the code root at every segment, but whose
+        # nearest EXISTING ancestor directory is actually a symlink pointing
+        # OUTSIDE it, must stay out-of-scope -- never appended to the
+        # ledger, never advancing the growth signal.
+        real_outside = Path(self.td) / "real-outside"
+        real_outside.mkdir()
+        escape_link = self.code_root / "escape-link"
+        escape_link.symlink_to(real_outside, target_is_directory=True)
+        session_id = "s-ledger-escape-link"
+        fpath = str(escape_link / "Escaped.py")
+        payload = self.post_tool_use_payload(session_id, fpath)
+        proc, _ = run_script(LEDGER_HOOK, payload, self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        state = self.load_state(session_id)
+        paths = [e["path"] for e in state.get("ledger", [])]
+        self.assertNotIn(fpath, paths)
+
+    def test_silent_for_a_dot_dot_traversal_path(self):
+        # Mirror-image of newfile-nudge.sh's own
+        # test_silent_for_a_dot_dot_traversal_path: `<code_root>/../outside/x.py`
+        # starts with the code-root string textually while actually
+        # resolving to a sibling directory OUTSIDE it. Must stay
+        # out-of-scope.
+        outside_sibling = Path(self.td) / "outside"
+        outside_sibling.mkdir()
+        session_id = "s-ledger-traversal"
+        fpath = f"{self.code_root}/../outside/Escaped.py"
         payload = self.post_tool_use_payload(session_id, fpath)
         proc, _ = run_script(LEDGER_HOOK, payload, self.base_env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -2867,6 +2926,95 @@ class TestMemlib(unittest.TestCase):
         log_text = (home / "hook.log").read_text()
         self.assertIn("no python resolved", log_text)
         self.assertIn("project=nopy-proj", log_text)
+
+
+# ---------------------------------------------------------------------------
+# 7b. mc_path_under_root (hooks/mc-path-lib.sh) -- direct unit coverage
+# ---------------------------------------------------------------------------
+
+
+class TestMcPathUnderRoot(unittest.TestCase):
+    """Direct unit coverage for mc_path_under_root (hooks/mc-path-lib.sh),
+    the one shared containment primitive hooks/newfile-nudge.sh and
+    hooks/ledger-post-edit.sh both call. Previously exercised only
+    indirectly through those two hooks' own tests -- symlink-paths review
+    round 1, finding 5. Runs under MC_BASH (bash 3.2 too, via
+    tests/run_bash32.sh)."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp(prefix="memcontinuum-path-under-root-")
+        self.addCleanup(shutil.rmtree, self.td, ignore_errors=True)
+
+    def _call(self, file_path, root):
+        """Runs `mc_path_under_root FILE_PATH ROOT; echo $?` under MC_BASH
+        and returns the integer return code. FILE_PATH/ROOT are passed as
+        script arguments ($1/$2), never interpolated into the script text,
+        so no quoting concerns for either (including one containing a
+        literal glob character)."""
+        caller = Path(self.td) / "probe.sh"
+        caller.write_text(
+            f'#!/usr/bin/env bash\nsource "{MC_PATH_LIB}"\n'
+            'mc_path_under_root "$1" "$2"\necho $?\n'
+        )
+        proc = subprocess.run(
+            [MC_BASH, str(caller), str(file_path), str(root)],
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(proc.stderr, "", proc.stderr)
+        return int(proc.stdout.strip())
+
+    def test_exact_root_is_under(self):
+        root = Path(self.td) / "root"
+        root.mkdir()
+        self.assertEqual(self._call(root, root), 0)
+
+    def test_a_child_of_root_is_under(self):
+        root = Path(self.td) / "root"
+        (root / "sub").mkdir(parents=True)
+        target = root / "sub" / "file.txt"
+        self.assertEqual(self._call(target, root), 0)
+
+    def test_a_sibling_whose_name_starts_with_the_root_name_is_not_under(self):
+        """/foo must never match a /foobar ancestor -- segment-aware, not
+        a bare string-prefix test (mirrors newfile-nudge.sh's own
+        pre-existing outside-the-code-root test, but exercises the
+        primitive directly)."""
+        root = Path(self.td) / "foo"
+        root.mkdir()
+        sibling = Path(self.td) / "foobar"
+        sibling.mkdir()
+        target = sibling / "file.txt"
+        self.assertEqual(self._call(target, root), 1)
+
+    def test_a_symlinked_child_resolves_under_root(self):
+        real_root = Path(self.td) / "real-root"
+        (real_root / "sub").mkdir(parents=True)
+        link = Path(self.td) / "link-to-root"
+        link.symlink_to(real_root, target_is_directory=True)
+        target_via_link = link / "sub" / "file.txt"
+        # Root given by the symlink, target reached through the same
+        # symlink.
+        self.assertEqual(self._call(target_via_link, link), 0)
+        # Root given by its REAL path, target reached through the
+        # symlink -- both resolve to the same physical location.
+        self.assertEqual(self._call(target_via_link, real_root), 0)
+
+    def test_a_root_containing_a_glob_character_is_matched_literally(self):
+        """A store/code root whose physical directory name contains a
+        shell glob metacharacter must be compared literally, never
+        interpreted as a wildcard (finding 1) -- neither missing a real
+        match nor, the more dangerous direction, falsely widening one."""
+        root = Path(self.td) / "fo*o"
+        (root / "sub").mkdir(parents=True)
+        target = root / "sub" / "file.txt"
+        self.assertEqual(self._call(target, root), 0)
+        # The glob must not accidentally WIDEN the match either: a
+        # differently-named sibling a literal "fo*o" wildcard interpretation
+        # would match must stay outside.
+        sibling = Path(self.td) / "foXo"
+        sibling.mkdir()
+        sibling_target = sibling / "file.txt"
+        self.assertEqual(self._call(sibling_target, root), 1)
 
 
 # ---------------------------------------------------------------------------

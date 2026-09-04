@@ -170,6 +170,52 @@ fi
 REPO="$MC_REPO"
 KEY="$MC_REPO_KEY"
 
+# Resolve every path argument PHYSICALLY before it is validated or written
+# (symlink-review round 3, concern 2): every OTHER recording site --
+# repo-init.sh's own --store/--code-root (abspath(), Ruling 89), and
+# memcontinuum-update.sh's own migration overrides -- already resolves
+# through this same mc_physical (scripts/mc-registry-lib.sh) before the
+# value reaches the registry; this script was the one gap left, recording
+# --store (and --claude-dir/--code-root) raw. A row written here with a
+# symlinked path would otherwise disagree with what repo-init.sh itself
+# renders for the identical value, the exact registry-vs-rendered
+# divergence class this whole task exists to close -- and since a human
+# can type any of these three flags directly into this script (bypassing
+# repo-init.sh's own resolution entirely, "wired"'s normal path when a
+# --record-decision-driven install did not just run it), this is the ONE
+# place that class of divergence can still originate. --repo does NOT need
+# this: it is never written into the note directly, only used to derive
+# REPO/KEY via mc_repo_key above, which is already physical (git resolves
+# via getcwd(), never the shell's logical $PWD). Guarded on non-empty:
+# mc_physical("") would silently return this PROCESS's own cwd (`cd ""` is
+# a no-op in bash), never an error -- worse than leaving an empty value
+# empty for check_storable/the usage checks below to catch as they always
+# have.
+#
+# The `wired` DEFAULT claude-dir is assigned HERE, above the loop, rather
+# than beside the wiring scan that consumes it (symlink-review round 4): an
+# omitted --claude-dir is the skill's own documented `wired` command
+# (skills/memcontinuum/SKILL.md), so a default assigned below this block is
+# the one path that reaches the note unresolved -- a repo whose .claude is
+# itself a symlink recorded raw while repo-init.sh renders into the physical
+# target. Resolving here rather than at the note-building line keeps one
+# choke point AND gives check_storable and the wiring scan the same value
+# the row records: a physical target can carry a `;` its symlink's own name
+# does not, and the scan reports the directory the row names. Every value
+# the note can hold is assigned above this block; nothing below it assigns a
+# path. Guarded on `wired` because that is the only action the default
+# belongs to -- a `declined`/`forget` row names no claude-dir.
+if [ "$ACTION" = "wired" ] && [ "${#CLAUDE_DIRS[@]}" -eq 0 ]; then
+    CLAUDE_DIRS=("$REPO/.claude")
+fi
+[ -n "$STORE" ] && STORE="$(mc_physical "$STORE")"
+for i in "${!CLAUDE_DIRS[@]}"; do
+    [ -n "${CLAUDE_DIRS[$i]}" ] && CLAUDE_DIRS[$i]="$(mc_physical "${CLAUDE_DIRS[$i]}")"
+done
+for i in "${!CODE_ROOTS[@]}"; do
+    [ -n "${CODE_ROOTS[$i]}" ] && CODE_ROOTS[$i]="$(mc_physical "${CODE_ROOTS[$i]}")"
+done
+
 # Recording `wired` is the one write that can lie: a wired row silences the
 # detector forever, whether or not scripts/repo-init.sh ever succeeded. So
 # verify the claim against the repo's own settings before recording it (same
@@ -194,9 +240,9 @@ for CHECK_DIR in "${CODE_ROOTS[@]:-}"; do
 done
 
 if [ "$ACTION" = "wired" ]; then
-    if [ "${#CLAUDE_DIRS[@]}" -eq 0 ]; then
-        CLAUDE_DIRS=("$REPO/.claude")
-    fi
+    # CLAUDE_DIRS is non-empty by here for `wired`: the default above fills
+    # it before the physical resolution runs, so every dir scanned is the
+    # same physical dir the note records.
     for CHECK_DIR in "${CLAUDE_DIRS[@]}"; do
         mc_wiring_scan "$CHECK_DIR/settings.local.json" "$CHECK_DIR/settings.json"
         if [ "$MC_WIRING" != "full" ]; then
@@ -233,24 +279,15 @@ fi
 NOTE="${NOTE# }"
 
 # Rewrite without this key, then append -- so a reversal replaces the old row
-# rather than shadowing it. A temp file in the same directory keeps the
-# replacement atomic on the same filesystem.
-TMP="$DECISIONS.tmp.$$"
-{
-    if [ -f "$DECISIONS" ]; then
-        while IFS= read -r line || [ -n "$line" ]; do
-            k="${line%%"$MC_TAB"*}"
-            [ "$k" = "$KEY" ] && continue
-            printf '%s\n' "$line"
-        done < "$DECISIONS"
-    else
-        printf '# MemContinuum per-repo decisions -- written only by memcontinuum-decide.sh\n'
-        printf '# key\tdecision\tdate\tnote\n'
-    fi
-    if [ "$ACTION" != "forget" ]; then
-        printf '%s\t%s\t%s\t%s\n' "$KEY" "$ACTION" "$(date +%Y-%m-%d)" "$NOTE"
-    fi
-} > "$TMP" && mv "$TMP" "$DECISIONS" || { rm -f "$TMP"; echo "failed to write $DECISIONS" >&2; exit 1; }
+# rather than shadowing it. mc_registry_rewrite_row (scripts/mc-registry-lib.sh
+# -- the one shared implementation, symlink-review round 2 NEW-1) does the
+# atomic temp-file+rename replacement; NEW_LINE omitted entirely for
+# `forget` drops the row instead of replacing it.
+NEW_LINE=""
+if [ "$ACTION" != "forget" ]; then
+    NEW_LINE="$(printf '%s\t%s\t%s\t%s' "$KEY" "$ACTION" "$(date +%Y-%m-%d)" "$NOTE")"
+fi
+mc_registry_rewrite_row "$DECISIONS" "$KEY" "$NEW_LINE" || { echo "failed to write $DECISIONS" >&2; exit 1; }
 
 case "$ACTION" in
     wired)    echo "recorded: $KEY uses MemContinuum${NOTE:+ ($NOTE)}" ;;
