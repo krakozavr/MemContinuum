@@ -3,12 +3,13 @@
 **Long-term memory for Claude Code software projects: what was decided, why,
 and where it lives in the code.**
 
-## The problem — and it has two sides
+## The Two-Side problem
 
 Projects that run for a long time under agent-driven development degrade in two
 different ways.
 
-**Forgotten decisions.** A decision gets made, the conversation that made it
+**Forgotten decisions.** Both people and AI are always forgetting things. 
+It's unavoidable. A decision gets made, the conversation that made it
 scrolls out of context, and three weeks later someone — human or agent —
 re-litigates the same question from scratch. Sometimes they land on the same
 answer; sometimes they reinvent the thing that was already tried and rejected;
