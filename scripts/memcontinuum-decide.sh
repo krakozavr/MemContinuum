@@ -233,24 +233,15 @@ fi
 NOTE="${NOTE# }"
 
 # Rewrite without this key, then append -- so a reversal replaces the old row
-# rather than shadowing it. A temp file in the same directory keeps the
-# replacement atomic on the same filesystem.
-TMP="$DECISIONS.tmp.$$"
-{
-    if [ -f "$DECISIONS" ]; then
-        while IFS= read -r line || [ -n "$line" ]; do
-            k="${line%%"$MC_TAB"*}"
-            [ "$k" = "$KEY" ] && continue
-            printf '%s\n' "$line"
-        done < "$DECISIONS"
-    else
-        printf '# MemContinuum per-repo decisions -- written only by memcontinuum-decide.sh\n'
-        printf '# key\tdecision\tdate\tnote\n'
-    fi
-    if [ "$ACTION" != "forget" ]; then
-        printf '%s\t%s\t%s\t%s\n' "$KEY" "$ACTION" "$(date +%Y-%m-%d)" "$NOTE"
-    fi
-} > "$TMP" && mv "$TMP" "$DECISIONS" || { rm -f "$TMP"; echo "failed to write $DECISIONS" >&2; exit 1; }
+# rather than shadowing it. mc_registry_rewrite_row (scripts/mc-registry-lib.sh
+# -- the one shared implementation, symlink-review round 2 NEW-1) does the
+# atomic temp-file+rename replacement; NEW_LINE omitted entirely for
+# `forget` drops the row instead of replacing it.
+NEW_LINE=""
+if [ "$ACTION" != "forget" ]; then
+    NEW_LINE="$(printf '%s\t%s\t%s\t%s' "$KEY" "$ACTION" "$(date +%Y-%m-%d)" "$NOTE")"
+fi
+mc_registry_rewrite_row "$DECISIONS" "$KEY" "$NEW_LINE" || { echo "failed to write $DECISIONS" >&2; exit 1; }
 
 case "$ACTION" in
     wired)    echo "recorded: $KEY uses MemContinuum${NOTE:+ ($NOTE)}" ;;

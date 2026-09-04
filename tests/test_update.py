@@ -21,6 +21,7 @@ DECIDE_SH = TOOLS_DIR / "scripts" / "memcontinuum-decide.sh"
 UPDATE_SH = TOOLS_DIR / "scripts" / "memcontinuum-update.sh"
 INSTALL_SH = TOOLS_DIR / "scripts" / "repo-init.sh"
 SETUP_SH = TOOLS_DIR / "memcontinuum-setup.sh"
+REGISTRY_LIB = TOOLS_DIR / "scripts" / "mc-registry-lib.sh"
 
 # Same seam tests/test_write_hooks.py uses: tests/run_bash32.sh sets MC_BASH to
 # a real bash 3.2.57 binary so these scripts are exercised under the actual
@@ -508,9 +509,6 @@ class TestStoreFormStaleVsMismatch(UpdateTestBase):
             out_lines.append("\t".join([key, decision, when, note]))
         path.write_text("\n".join(out_lines) + "\n")
 
-    def _note_fields(self, note):
-        return {t.split("=", 1)[0]: t for t in note.split(" ")}
-
     @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
     def test_walk_reports_store_form_stale_with_an_apply_hint(self):
         store_link = Path(self.tmp) / "store-link"
@@ -536,6 +534,12 @@ class TestStoreFormStaleVsMismatch(UpdateTestBase):
         store_link.symlink_to(self.store, target_is_directory=True)
         self._rewrite_store_field(str(store_link))
         note_before = decisions_tsv(self.home).read_text().splitlines()[-1].split("\t", 3)[3]
+        # The fixture (UpdateTestBase.setUp, via memcontinuum-decide.sh
+        # wired --code-root/--langs/--never-ext) must actually have written
+        # all four fields -- otherwise the string-substitution check below
+        # would trivially pass on a note that never carried them.
+        for field in ("claude-dirs=", "code-roots=", "langs=", "never="):
+            self.assertIn(field, note_before, note_before)
 
         proc = run(UPDATE_SH, ["--apply"], self.home)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -545,16 +549,17 @@ class TestStoreFormStaleVsMismatch(UpdateTestBase):
         store_real = os.path.realpath(self.store)
         self.assertIn(f"store={store_real}", note_after, note_after)
 
-        # Every OTHER field byte-identical to before -- nothing invented,
-        # nothing dropped.
-        fields_before = self._note_fields(note_before)
-        fields_after = self._note_fields(note_after)
-        del fields_before["store"], fields_after["store"]
-        self.assertEqual(fields_after, fields_before, (note_before, note_after))
-        self.assertIn("claude-dirs", fields_after, note_after)
-        self.assertIn("code-roots", fields_after, note_after)
-        self.assertIn("langs", fields_after, note_after)
-        self.assertIn("never", fields_after, note_after)
+        # symlink-review round 2, NEW-3: the WHOLE note, not just its
+        # fields as an unordered set -- substituting ONLY the store=
+        # token's value in note_before must reproduce note_after
+        # EXACTLY, byte for byte. This pins token ORDER (a dict comparison
+        # cannot: {"a": "a=1", "b": "b=2"} == {"b": "b=2", "a": "a=1"}) as
+        # well as catching any field being added, dropped, or changed in
+        # value.
+        expected_note = note_before.replace(f"store={store_link}", f"store={store_real}")
+        self.assertNotEqual(expected_note, note_before,
+                            "the substitution must have actually matched the old store= token")
+        self.assertEqual(note_after, expected_note, (note_before, note_after))
 
         # A re-walk now reports ok -- no re-render was needed (the wiring
         # already rendered the physical path), and the correction sticks.
@@ -577,6 +582,44 @@ class TestStoreFormStaleVsMismatch(UpdateTestBase):
         self.assertEqual(rows[0]["action"], "store-mismatch", proc.stdout)
         self.assertNotIn("store-form", proc.stdout, proc.stdout)
         self.assertEqual(decisions_tsv(self.home).read_text(), before)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_a_single_apply_converges_a_stale_engine_and_a_symlinked_store_together(self):
+        """Round 2, NEW-2: the generic fingerprint-mismatch `stale` action
+        ranks above store-form-stale in the walk's own precedence chain --
+        without folding the two together, a row that is BOTH stale (an
+        engine change, e.g. this task's own repo-init.sh edits, which IS a
+        fingerprint input) AND recorded with a raw/symlinked store= would
+        need TWO --apply passes to converge: the first only re-renders
+        (fixing the stamp), and only the SECOND (fingerprint now matching)
+        would ever reach the store-form branch and correct the registry.
+        One --apply must do both in the same pass."""
+        store_link = Path(self.tmp) / "store-link"
+        store_link.symlink_to(self.store, target_is_directory=True)
+        self._rewrite_store_field(str(store_link))
+        drifted = self.settings_text().replace(
+            f"MEMCONTINUUM_RENDERED={engine_sha()}", "MEMCONTINUUM_RENDERED=deadbee")
+        Path(self.claude_dir, "settings.local.json").write_text(drifted)
+
+        # Confirm the table still reports "stale", not "store-form-stale"
+        # -- the WALK's own precedence (fingerprint wins the label) is
+        # unchanged by this fix; only --apply's own behavior is folded.
+        proc0 = run(UPDATE_SH, [], self.home)
+        rows0 = self.table_rows(proc0.stdout)
+        self.assertEqual(rows0[0]["action"], "stale", proc0.stdout)
+
+        proc = run(UPDATE_SH, ["--apply"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f"MEMCONTINUUM_RENDERED={engine_sha()}", self.settings_text())
+        note = decisions_tsv(self.home).read_text().splitlines()[-1]
+        store_real = os.path.realpath(self.store)
+        self.assertIn(f"store={store_real}", note, note)
+
+        # A SINGLE --apply must leave the row fully converged -- a re-walk
+        # now reports ok, not stale/store-mismatch/store-form-stale.
+        proc2 = run(UPDATE_SH, [], self.home)
+        rows2 = self.table_rows(proc2.stdout)
+        self.assertEqual(rows2[0]["action"], "ok", proc2.stdout)
 
 
 class TestLegacyRowMigration(unittest.TestCase):
@@ -2048,6 +2091,105 @@ class TestMcPhysical(unittest.TestCase):
         cwd.mkdir()
         out = self._call("does-not-exist", "", str(cwd))
         self.assertEqual(out, "does-not-exist")
+
+
+class TestMcRegistryRewriteRow(unittest.TestCase):
+    """Direct unit coverage for mc_registry_rewrite_row
+    (scripts/mc-registry-lib.sh) -- symlink-review round 2, NEW-1: the one
+    shared atomic decisions.tsv rewrite, factored out of
+    memcontinuum-decide.sh's own inline block and memcontinuum-update.sh's
+    now-deleted mc_registry_rewrite_note (which had independently
+    diverged: no `rm -f` on a failed `mv`). mc-registry-lib.sh is a pure
+    library (no top-level CLI execution), so it is safely sourceable on
+    its own -- unlike memcontinuum-update.sh/-decide.sh themselves."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp(prefix="memcontinuum-registry-rewrite-test-")
+        self.addCleanup(shutil.rmtree, self.td, ignore_errors=True)
+
+    def _call(self, file_path, key, new_line=""):
+        caller = Path(self.td) / "probe.sh"
+        caller.write_text(
+            f'#!/usr/bin/env bash\nset -u\n. "{REGISTRY_LIB}"\n'
+            'mc_registry_rewrite_row "$1" "$2" "${3-}"\necho "rc=$?"\n'
+        )
+        proc = subprocess.run(
+            [MC_BASH, str(caller), file_path, key, new_line],
+            capture_output=True, text=True, timeout=10,
+        )
+        return proc
+
+    def test_replaces_the_matching_row_in_place_and_appends_the_new_line(self):
+        f = Path(self.td) / "decisions.tsv"
+        f.write_text("# header\n# key\tdecision\tdate\tnote\n"
+                      "repo1\told\t2026-01-01\told-note\n")
+        proc = self._call(str(f), "repo1", "repo1\twired\t2026-09-03\tnew-note")
+        self.assertEqual(proc.stdout.strip(), "rc=0", proc.stderr)
+        self.assertEqual(
+            f.read_text(),
+            "# header\n# key\tdecision\tdate\tnote\n"
+            "repo1\twired\t2026-09-03\tnew-note\n",
+        )
+
+    def test_omitted_new_line_drops_the_row_entirely(self):
+        """The `forget` shape: NEW_LINE omitted removes the row and appends
+        nothing in its place. This is the exact case this round's own
+        extraction regressed and this test caught RED before the fix: the
+        trailing conditional printf was the LAST statement in the rewrite
+        group, so its own exit status (1, false, on the common
+        NEW_LINE-omitted path) leaked into the group's overall exit status
+        and was misread as a write failure even though the rewrite (a
+        clean row-drop) had actually succeeded."""
+        f = Path(self.td) / "decisions.tsv"
+        f.write_text("# header\n# key\tdecision\tdate\tnote\n"
+                      "repo1\tdeclined\t2026-01-01\t\n"
+                      "repo2\twired\t2026-01-01\tstore=/x\n")
+        proc = self._call(str(f), "repo1")
+        self.assertEqual(proc.stdout.strip(), "rc=0", proc.stderr)
+        text = f.read_text()
+        self.assertNotIn("repo1", text, text)
+        self.assertIn("repo2\twired\t2026-01-01\tstore=/x", text, text)
+
+    def test_other_rows_pass_through_byte_identical(self):
+        f = Path(self.td) / "decisions.tsv"
+        f.write_text("# header\n# key\tdecision\tdate\tnote\n"
+                      "repo1\twired\t2026-01-01\ta\n"
+                      "repo2\twired\t2026-01-01\tb\n")
+        proc = self._call(str(f), "repo1", "repo1\twired\t2026-09-03\tc")
+        self.assertEqual(proc.stdout.strip(), "rc=0", proc.stderr)
+        self.assertIn("repo2\twired\t2026-01-01\tb", f.read_text())
+
+    def test_missing_file_gets_the_standard_header_first(self):
+        f = Path(self.td) / "fresh" / "decisions.tsv"
+        f.parent.mkdir()
+        proc = self._call(str(f), "repo1", "repo1\twired\t2026-09-03\tnote")
+        self.assertEqual(proc.stdout.strip(), "rc=0", proc.stderr)
+        text = f.read_text()
+        self.assertTrue(text.startswith("# MemContinuum per-repo decisions"), text)
+        self.assertIn("repo1\twired\t2026-09-03\tnote", text)
+
+    def test_write_failure_leaves_no_stray_tmp_file(self):
+        """The bug this factoring fixed (NEW-1): the pre-fix, duplicated
+        mc_registry_rewrite_note in memcontinuum-update.sh had no `rm -f`
+        on a failed write/rename -- a failure left a stray
+        `decisions.tsv.tmp.$$` file behind. Point DECISIONS_FILE at a path
+        whose parent directory does not exist, so the write into the
+        atomic temp file itself fails immediately (same directory as the
+        target, by design, so the temp file and the final rename share the
+        same failure mode here) -- and confirm nothing at all is left
+        behind under the real, existing parent."""
+        missing_parent = Path(self.td) / "does-not-exist" / "decisions.tsv"
+        proc = self._call(str(missing_parent), "repo1",
+                          "repo1\twired\t2026-09-03\tnote")
+        self.assertEqual(proc.stdout.strip(), "rc=1", proc.stderr)
+        # self.td itself holds this test's own probe.sh caller script --
+        # what must be absent is a stray *.tmp.<pid> file (there is no
+        # "does-not-exist" directory for one to land under at all, since
+        # mkdir was never attempted).
+        stray = [p for p in Path(self.td).iterdir() if ".tmp." in p.name]
+        self.assertEqual(stray, [], "no stray tmp file may be left behind")
+        self.assertFalse((Path(self.td) / "does-not-exist").exists(),
+                         "the missing parent must not have been created either")
 
 
 class TestStoreMissingOutranksNoWiring(UpdateTestBase):

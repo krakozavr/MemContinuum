@@ -864,27 +864,6 @@ mc_note_replace_field() {
     printf '%s' "$out"
 }
 
-# mc_registry_rewrite_note DECISIONS_FILE KEY NEW_NOTE
-#
-# Rewrites the ONE row matching KEY with NEW_NOTE (decision stays "wired" --
-# every caller of this function only ever reaches it for a row already
-# confirmed wired; date stamps today, matching memcontinuum-decide.sh's own
-# convention that any registry write refreshes it) -- every OTHER row is
-# copied through byte-identical, same filter-then-append pattern
-# memcontinuum-decide.sh's own rewrite uses. Atomic (temp file + rename).
-mc_registry_rewrite_note() {
-    local file="$1" key="$2" new_note="$3" line k tmp
-    tmp="$file.tmp.$$"
-    {
-        while IFS= read -r line || [ -n "$line" ]; do
-            k="${line%%"$MC_TAB"*}"
-            [ "$k" = "$key" ] && continue
-            printf '%s\n' "$line"
-        done < "$file"
-        printf '%s\t%s\t%s\t%s\n' "$key" "wired" "$(date +%Y-%m-%d)" "$new_note"
-    } > "$tmp" && mv "$tmp" "$file"
-}
-
 TABLE_HEADER_PRINTED=0
 print_row() {
     # print_row REPO CLAUDE_DIR STAMPED STORE_MATCH RULES SKILL ACTION
@@ -1039,7 +1018,17 @@ process_claude_dir() {
         # compares this against the number that actually re-rendered.
         [ "$LEGACY" -eq 1 ] && MIGRATE_DIRS_WALKED=$((MIGRATE_DIRS_WALKED + 1))
         if [ "$action" != "ok" ] && [ "$action" != "no-wiring" ]; then
-            apply_claude_dir "$claude_dir" "$action"
+            # store_form_stale is passed through regardless of which action
+            # WON the precedence chain above (symlink-review round 2,
+            # NEW-2): a row can be BOTH fingerprint-stale (action="stale",
+            # this diff's own repo-init.sh edits are themselves a
+            # fingerprint input) AND store-form-stale on the very first
+            # --apply after this rollout -- without this, only the SECOND
+            # --apply (once the fingerprint already matches) would ever
+            # reach the store-form branch at all. apply_claude_dir folds
+            # the registry correction into the SAME re-render pass instead
+            # of requiring a second one.
+            apply_claude_dir "$claude_dir" "$action" "$store_form_stale"
         fi
     fi
     return 0
@@ -1060,17 +1049,54 @@ not_applied() {
     WALK_RC=1
 }
 
-# apply_claude_dir CLAUDE_DIR ACTION -- re-runs repo-init.sh for one
-# claude-dir with this row's recorded parameters. Never invoked for
-# action=ok. action=rules-foreign is reported but never applied here
-# (repo-init.sh itself refuses a foreign rules file before writing
-# anything -- calling it would just fail loudly for a reason already named
-# in the table; the fix is a human moving the foreign file aside).
-# action=skill-foreign is skipped for the same reason (repo-init.sh refuses
-# a foreign skill copy before writing anything too, through the same
-# mc_skill_copy_is_ours predicate this table's own skill column uses).
+# apply_store_form_fix CLAUDE_DIR -- the store-form-updated correction
+# (symlink-review round 1, findings 6+7): rewrites ONLY the registry row's
+# store= token to its physical form via mc_registry_rewrite_row
+# (scripts/mc-registry-lib.sh), preserving claude-dirs/code-roots/langs/
+# never byte-identical. Factored out (round 2, NEW-2) so it can run either
+# on its own (action=store-form-updated, no re-render needed at all) or
+# folded into the SAME --apply pass right after a successful re-render
+# (action=stale etc. -- see apply_claude_dir below) -- one implementation,
+# not two copies of the same three-line sequence.
+apply_store_form_fix() {
+    local claude_dir="$1" resolved_store new_note new_line
+    resolved_store="$(mc_physical "$STORE")"
+    new_note="$(mc_note_replace_field "$NOTE" "store" "$resolved_store")"
+    # Decision stays "wired" -- this only ever runs for a row already
+    # confirmed wired -- and the date refreshes, matching
+    # memcontinuum-decide.sh's own convention that any registry write
+    # stamps today.
+    new_line="$(printf '%s\t%s\t%s\t%s' "$KEY" "wired" "$(date +%Y-%m-%d)" "$new_note")"
+    if mc_registry_rewrite_row "$DECISIONS" "$KEY" "$new_line"; then
+        echo "  OK $claude_dir: registry store= corrected to $resolved_store (claude-dirs/code-roots/langs/never unchanged)"
+        return 0
+    fi
+    not_applied "  FAILED $claude_dir: could not rewrite the registry row's store= field -- see above"
+    return 1
+}
+
+# apply_claude_dir CLAUDE_DIR ACTION [STORE_FORM_STALE] -- re-runs
+# repo-init.sh for one claude-dir with this row's recorded parameters.
+# Never invoked for action=ok. action=rules-foreign is reported but never
+# applied here (repo-init.sh itself refuses a foreign rules file before
+# writing anything -- calling it would just fail loudly for a reason
+# already named in the table; the fix is a human moving the foreign file
+# aside). action=skill-foreign is skipped for the same reason (repo-init.sh
+# refuses a foreign skill copy before writing anything too, through the
+# same mc_skill_copy_is_ours predicate this table's own skill column uses).
+# STORE_FORM_STALE (default 0): whether THIS claude-dir's own
+# process_claude_dir call independently found the registry's store= to be
+# the same physical store in a stale string form -- passed through
+# regardless of which action WON the walk's precedence chain (round 2,
+# NEW-2: a row can be both fingerprint-stale, action=stale, and
+# store-form-stale on the very first --apply after a repo-init.sh change
+# like this one's own; without this, only a SECOND --apply, once the
+# fingerprint already matches, would ever reach the dedicated
+# store-form-updated action at all). When true, the registry correction
+# (apply_store_form_fix) runs in the SAME pass, right after a successful
+# re-render below -- never before, and never after a FAILED one.
 apply_claude_dir() {
-    local claude_dir="$1" action="$2"
+    local claude_dir="$1" action="$2" store_form_stale="${3:-0}"
     local -a args=()
     local cr
 
@@ -1094,22 +1120,14 @@ apply_claude_dir() {
 
     # store-form-updated: the SAME physical store, only its STRING form in
     # the registry is stale (symlink-review round 1, findings 6+7) --
-    # nothing here needs a re-render (the hook lines already carry the
-    # physical path); a surgical rewrite of just the note's store= token
-    # is the whole fix, preserving claude-dirs/code-roots/langs/never
-    # byte-identical. Idempotent: a multi-claude-dir row calls this once
-    # per dir, and every call recomputes the identical corrected note from
-    # the same in-memory $NOTE/$STORE, so a second write is a harmless
-    # no-op rewrite (same content, refreshed date).
+    # nothing here needs a re-render at all (the hook lines already carry
+    # the physical path); apply_store_form_fix is the whole fix. Idempotent:
+    # a multi-claude-dir row calls this once per dir, and every call
+    # recomputes the identical corrected note from the same in-memory
+    # $NOTE/$STORE, so a second write is a harmless no-op rewrite (same
+    # content, refreshed date).
     if [ "$action" = "store-form-updated" ]; then
-        local resolved_store new_note
-        resolved_store="$(mc_physical "$STORE")"
-        new_note="$(mc_note_replace_field "$NOTE" "store" "$resolved_store")"
-        if mc_registry_rewrite_note "$DECISIONS" "$KEY" "$new_note"; then
-            echo "  OK $claude_dir: registry store= corrected to $resolved_store (claude-dirs/code-roots/langs/never unchanged; no re-render needed -- the wiring already rendered the physical path)"
-        else
-            not_applied "  FAILED $claude_dir: could not rewrite the registry row's store= field -- see above"
-        fi
+        apply_store_form_fix "$claude_dir"
         return 0
     fi
 
@@ -1135,6 +1153,17 @@ apply_claude_dir() {
         # is what makes the migration gate below say "all of them" rather
         # than "none of them failed loudly enough".
         MIGRATE_DIRS_RENDERED=$((MIGRATE_DIRS_RENDERED + 1))
+        # One --apply pass must converge (round 2, NEW-2): a row can be
+        # fingerprint-stale AND store-form-stale at once (this diff's own
+        # repo-init.sh edits are themselves a fingerprint input, so every
+        # wired row reads "stale" on the first --apply after it lands) --
+        # fold the registry correction into this SAME successful re-render
+        # instead of requiring a second --apply once the fingerprint
+        # already matches. Never runs after a FAILED re-render (the `else`
+        # branch below never reaches here).
+        if [ "$store_form_stale" -eq 1 ]; then
+            apply_store_form_fix "$claude_dir"
+        fi
     else
         local rc=$?
         not_applied "  FAILED $claude_dir (rc=$rc) -- see below"
