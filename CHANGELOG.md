@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.2.0rc3] — unreleased
+## [0.2.0rc3] — 2026-09-04
 
 ### Languages
 - The code index chunks JavaScript, TypeScript, TSX, Java, PHP, Rust, and
