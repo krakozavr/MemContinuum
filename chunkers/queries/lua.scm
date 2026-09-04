@@ -15,17 +15,26 @@
 
 ; `function M.g() ... end` (dot syntax) -> `method`, qn `M.g` via
 ; @chunk.qualifier = `M`.
+;
+; The table is captured as a wildcard, not as an identifier: a multi-segment
+; name (`function App.Services.load()`, the shape of every module of any
+; size) nests one dot_index_expression inside another, so `App.Services` is
+; not an identifier and an identifier-only capture matched nothing at all --
+; the function was dropped with status=ok. Lua's own grammar for a function
+; name is `Name {'.' Name} [':' Name]`, so the wildcard can only ever be a
+; dotted path, and its source text IS the qualifier: `App.Services.load`.
 (function_declaration
   name: (dot_index_expression
-    table: (identifier) @chunk.qualifier
+    table: (_) @chunk.qualifier
     field: (identifier) @chunk.name)) @chunk.method
 
 ; `function obj:m() ... end` (colon/method syntax) -> `method`, qn `obj.m`
 ; (the colon becomes a dot in qualified_name -- matches memlint's
-; qualified_name.endswith("."+frag) acceptance rule).
+; qualified_name.endswith("."+frag) acceptance rule). Same wildcard table as
+; the dot form: `function App.Services:load()` is the common receiver shape.
 (function_declaration
   name: (method_index_expression
-    table: (identifier) @chunk.qualifier
+    table: (_) @chunk.qualifier
     method: (identifier) @chunk.name)) @chunk.method
 
 ; `M.f = function() ... end` (assignment form) -- NOT a function_declaration
@@ -40,6 +49,6 @@
 (assignment_statement
   (variable_list
     (dot_index_expression
-      table: (identifier) @chunk.qualifier
+      table: (_) @chunk.qualifier
       field: (identifier) @chunk.name))
   (expression_list (function_definition) @chunk.method)) @chunk.doc_anchor

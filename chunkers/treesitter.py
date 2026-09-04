@@ -150,7 +150,7 @@ DEFAULT_MAX_PARSE_BYTES = 1 * 1024 * 1024   # 1 MiB
 # forgets. Bump this by one whenever the shared engine's OUTPUT changes;
 # leave it alone for a comment, a docstring, or a refactor that provably
 # produces identical chunks.
-ENGINE_VERSION = "4"
+ENGINE_VERSION = "5"
 
 # The node types that WRAP a definition rather than being one -- the outer
 # half of ruling 84's wrapper/inner pair, and the only node types
@@ -283,13 +283,14 @@ def row_shape(row):
     """The row fields the SHARED engine reads at chunk time, rendered as
     one stable string for chunker_version's payload.
 
-    `containers` drives every qualified_name (_qualify's ancestor walk),
-    `method_if_ancestor_in` drives kind (_kind_for), `doc_comment_types`
-    drives the doc field (_doc_for), `max_bytes` decides which files
-    are chunked at all, and `language_fn` selects which function of
-    `grammar_module` actually parses the file. Editing any of them changes
-    what a row's chunks look like, so each belongs in the fingerprint that
-    decides whether an already-indexed file is re-chunked.
+    `containers` and `prefix_scopes` drive every qualified_name (_qualify's
+    ancestor walk and its sibling scan), `method_if_ancestor_in` drives
+    kind (_kind_for), `doc_comment_types` drives the doc field (_doc_for),
+    `max_bytes` decides which files are chunked at all, and `language_fn`
+    selects which function of `grammar_module` actually parses the file.
+    Editing any of them changes what a row's chunks look like, so each
+    belongs in the fingerprint that decides whether an already-indexed file
+    is re-chunked.
 
     `language_fn` was the one exception until whole-branch review NEW-3:
     typescript and tsx share one grammar_module but call different
@@ -310,12 +311,15 @@ def row_shape(row):
     containers = ",".join(
         "%s=%s" % (k, v) for k, v in sorted(row.get("containers", {}).items())
     )
+    prefix_scopes = ",".join(
+        "%s=%s" % (k, v) for k, v in sorted(row.get("prefix_scopes", {}).items())
+    )
     ancestors = ",".join(sorted(row.get("method_if_ancestor_in", ())))
     doc_types = ",".join(sorted(row.get("doc_comment_types", ("comment",))))
     grammar_fn = "%s.%s" % (row.get("grammar_module"), row.get("language_fn"))
-    return ("containers{%s};method_if_ancestor_in{%s};doc_comment_types{%s};"
-            "max_bytes{%s};grammar_fn{%s}") % (
-        containers, ancestors, doc_types, row.get("max_bytes"), grammar_fn,
+    return ("containers{%s};prefix_scopes{%s};method_if_ancestor_in{%s};"
+            "doc_comment_types{%s};max_bytes{%s};grammar_fn{%s}") % (
+        containers, prefix_scopes, ancestors, doc_types, row.get("max_bytes"), grammar_fn,
     )
 
 
@@ -543,6 +547,61 @@ def _symbol_text(data, name_node):
     return text
 
 
+def _node_text(node):
+    return node.text.decode("utf-8", "replace")
+
+
+def _bare_type_name(node):
+    """An impl block's self type with its generic arguments stripped:
+    `Foo<'a, T>` is `Foo`, which is the name a person writes when they mean
+    that type, and the name every OTHER impl of it already produced --
+    `impl Foo` and `impl<T> Foo<T>` are two impl blocks on one type and
+    belong under one qualifier. Generic impls are the common form, so the
+    unstripped version put most of a real crate's methods under names
+    (`Foo<T>.m`, `Foo<'a, T>.m`) that no reference to them ever spells.
+
+    Descends only through a generic_type's own `type` field, and only
+    while there is one: a path type (`a::Foo`) keeps its whole text,
+    because there the path IS part of the name, and `impl Tr for a::Foo`
+    already produced it."""
+    while node.type == "generic_type":
+        inner = node.child_by_field_name("type")
+        if inner is None:
+            break
+        node = inner
+    return node
+
+
+def _prefix_scope(prefix_scopes, node):
+    """The scope declared BESIDE `node` rather than around it, or None.
+
+    PHP's two namespace spellings are the case this exists for. Braced
+    (`namespace A { ... }`) contains what it scopes, so the ancestor walk
+    finds it like any container. Unbraced (`namespace A;`) contains
+    nothing: it is a statement, and everything after it in the file is in
+    its namespace by position alone. Same construct, same meaning, two
+    grammar shapes -- and without this the second one qualified nothing, so
+    `A\\Box::open` and `B\\Box::open` in one file were both stored as
+    `Box.open`.
+
+    Walks up to `node`'s outermost ancestor (the statement sitting directly
+    under the file's root), then back over that statement's earlier
+    siblings to the NEAREST scope declaration. Nearest, so a file with two
+    unbraced namespaces gives its second half the second namespace. The
+    caller skips this entirely when an ancestor already declared a scope,
+    so a braced namespace can never pick up an earlier one as well."""
+    top = node
+    while top.parent is not None and top.parent.parent is not None:
+        top = top.parent
+    sibling = top.prev_sibling
+    while sibling is not None:
+        if sibling.type in prefix_scopes:
+            named = sibling.child_by_field_name(prefix_scopes[sibling.type])
+            return _node_text(named) if named is not None else None
+        sibling = sibling.prev_sibling
+    return None
+
+
 def _qualify(row, node, symbol, qualifier_text):
     """qualified_name: every qualification container above `node` (the
     row's own `containers` map), then an explicit @chunk.qualifier the
@@ -554,22 +613,41 @@ def _qualify(row, node, symbol, qualifier_text):
     itself sit inside a container the walk DOES name: `namespace N { const
     api = { get(){} } }` is `N.api.get`. Lua, whose rows declare no
     containers at all, is unaffected -- the walk contributes nothing and
-    the qualifier stands alone."""
+    the qualifier stands alone.
+
+    A row's `prefix_scopes` (see _prefix_scope) names node types that
+    qualify what they hold when they hold it, and what FOLLOWS them when
+    they hold nothing -- PHP's braced and unbraced namespaces. They
+    qualify from the ancestor walk like a container in the first shape, and
+    from the sibling scan in the second; never both, or a braced namespace
+    would pick up an earlier one as well."""
     parts = []
     containers = row.get("containers", {})
+    prefix_scopes = row.get("prefix_scopes", {})
+    scoped_by_an_ancestor = False
     p = node.parent
     while p is not None:
+        scope_field = prefix_scopes.get(p.type)
+        if scope_field:
+            scoped_by_an_ancestor = True
+            n = p.child_by_field_name(scope_field)
+            if n is not None:
+                parts.append(_node_text(n))
         field = containers.get(p.type)
         if field == "SELF_TYPE":
             t = p.child_by_field_name("type")
             if t is not None:
-                parts.append(p.text[t.start_byte - p.start_byte: t.end_byte - p.start_byte].decode("utf-8", "replace"))
+                parts.append(_node_text(_bare_type_name(t)))
         elif field:
             n = p.child_by_field_name(field)
             if n is not None:
-                parts.append(p.text[n.start_byte - p.start_byte: n.end_byte - p.start_byte].decode("utf-8", "replace"))
+                parts.append(_node_text(n))
         p = p.parent
     parts.reverse()
+    if not scoped_by_an_ancestor and prefix_scopes:
+        prefix = _prefix_scope(prefix_scopes, node)
+        if prefix is not None:
+            parts.insert(0, prefix)
     if qualifier_text is not None:
         parts.append(qualifier_text)
     parts.append(symbol)

@@ -102,6 +102,13 @@ LANGUAGE_TABLE = {
             "skip_dirs": frozenset(),
             "containers": {"class_declaration": "name", "trait_declaration": "name",
                             "enum_declaration": "name"},
+            # A namespace is written two ways and means one thing:
+            # `namespace A { ... }` holds what it scopes, `namespace A;`
+            # scopes the rest of the file without holding anything. Both
+            # qualify, through the same field -- see treesitter._qualify and
+            # _prefix_scope. Without it, `A\Box::open` and `B\Box::open` in
+            # one file were both stored as `Box.open`.
+            "prefix_scopes": {"namespace_definition": "name"},
             "method_if_ancestor_in": frozenset(), "max_bytes": None},
     "rust": {"backend": "tree-sitter", "module": "chunkers.treesitter",
              "grammar_module": "tree_sitter_rust", "language_fn": "language",

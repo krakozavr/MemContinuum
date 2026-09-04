@@ -2132,6 +2132,39 @@ class TestPhpExtraction(unittest.TestCase):
     def _chunk(self, name):
         return _tree_sitter_chunk("php", self.CORPUS, name)
 
+    def test_braced_namespaces_qualify_their_declarations(self):
+        """External gate finding 4. Two namespaces in one file, each with a
+        class of the same name -- the shape that made the gap visible:
+        without the namespace both `Box::open`s were stored as `Box.open`,
+        one name for two different methods.
+
+        The separator is the dot every other qualified name in this index
+        uses, not PHP's own `\\`: one join character keeps memlint's suffix
+        rule (`qualified_name.endswith("." + fragment)`) working the same
+        way for every language, so `#Box.open` resolves here exactly as it
+        does in Java or Swift."""
+        result = self._chunk("namespaced_braced.php")
+        self.assertEqual((result.status, result.gaps), ("ok", []))
+        got = sorted((c["kind"], c["symbol"], c["qualified_name"]) for c in result.chunks)
+        self.assertEqual(got, [
+            ("method", "open", "Archive.Box.open"),
+            ("method", "open", "Storage.Box.open"),
+        ])
+
+    def test_unbraced_namespace_qualifies_what_follows_it(self):
+        """The other spelling of the same construct, and the harder one:
+        `namespace Storage;` CONTAINS nothing -- it is a statement, and
+        everything after it in the file is in its namespace by position
+        alone -- so the ancestor walk could never find it. A class and a
+        plain function both pick it up."""
+        result = self._chunk("namespaced_unbraced.php")
+        self.assertEqual((result.status, result.gaps), ("ok", []))
+        got = sorted((c["kind"], c["symbol"], c["qualified_name"]) for c in result.chunks)
+        self.assertEqual(got, [
+            ("function", "helper", "Storage.helper"),
+            ("method", "open", "Storage.Box.open"),
+        ])
+
     def test_widget_recall_with_embedded_html(self):
         result = self._chunk("widget.php")
         self.assertEqual(result.status, "ok")
@@ -2236,6 +2269,24 @@ class TestRustExtraction(unittest.TestCase):
     def _chunk(self, name):
         return _tree_sitter_chunk("rust", self.CORPUS, name)
 
+    def test_generic_impls_qualify_by_the_bare_type_name(self):
+        """Second gate finding 1. The impl's self type was copied whole, so
+        `impl<T> Widget<T>` stored `Widget<T>.get` -- a name no reference to
+        that method ever spells, and one that splits a type's methods
+        across as many qualifiers as it has impl blocks. Generic impls are
+        the common form. The lifetime case (`impl<'a> Handle<'a>`) is the
+        same shape, and a trait impl (`impl<T> Render for Widget<T>`)
+        qualifies by the type exactly as `impl Render for Widget` already
+        did."""
+        result = self._chunk("generic_impl.rs")
+        self.assertEqual((result.status, result.gaps), ("ok", []))
+        got = sorted((c["kind"], c["symbol"], c["qualified_name"]) for c in result.chunks)
+        self.assertEqual(got, [
+            ("method", "get", "Widget.get"),
+            ("method", "name", "Handle.name"),
+            ("method", "render", "Widget.render"),
+        ])
+
     def test_widget_recall_impl_trait_mod_qualification(self):
         result = self._chunk("widget.rs")
         self.assertEqual(result.status, "ok")
@@ -2335,6 +2386,23 @@ class TestLuaExtraction(unittest.TestCase):
 
     def _chunk(self, name):
         return _tree_sitter_chunk("lua", self.CORPUS, name)
+
+    def test_multi_segment_table_names_keep_the_whole_path(self):
+        """External gate finding 5, second gate finding 6. A dotted name of
+        more than one segment (`function App.Services.load()`, the shape of
+        every Lua module of any size) nests one dot_index_expression inside
+        another, so the identifier-only table capture matched nothing and
+        the function vanished with status=ok. All three declaration forms
+        -- dot, colon, and the assignment form -- carry the full path."""
+        result = self._chunk("nested_tables.lua")
+        self.assertEqual((result.status, result.gaps), ("ok", []))
+        got = sorted((c["kind"], c["symbol"], c["qualified_name"]) for c in result.chunks)
+        self.assertEqual(got, [
+            ("method", "load", "App.Services.load"),      # function App.Services.load()
+            ("method", "reload", "App.Services.reload"),  # function App.Services:reload()
+            ("method", "save", "App.Services.save"),      # App.Services.save = function()
+            ("method", "single", "M.single"),             # one segment, unchanged
+        ])
 
     def test_widget_recall_dotted_and_colon_forms(self):
         # Pattern-index coverage: widget.lua alone exercises all four

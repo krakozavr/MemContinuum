@@ -933,7 +933,10 @@ by hand is the step someone forgets.
 
 `row_shape` is `treesitter.row_shape(row)`: a sorted, stable rendering of
 the row's own chunk-shaping data — `containers` (which drives every
-`qualified_name`), `method_if_ancestor_in` (which drives `kind`),
+`qualified_name`), `prefix_scopes` (which drives it for a declaration that
+scopes what FOLLOWS it rather than what it holds — PHP's `namespace A;`
+beside its own braced `namespace A { }`), `method_if_ancestor_in` (which
+drives `kind`),
 `doc_comment_types`, `max_bytes`, and `language_fn` (rendered as
 `grammar_module.language_fn`, e.g. `tree_sitter_typescript.language_tsx`).
 Sorted rather than as-written so reordering a row's containers does not
