@@ -1,0 +1,2 @@
+function ok(){}@
+function later(){}

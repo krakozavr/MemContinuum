@@ -150,7 +150,7 @@ DEFAULT_MAX_PARSE_BYTES = 1 * 1024 * 1024   # 1 MiB
 # forgets. Bump this by one whenever the shared engine's OUTPUT changes;
 # leave it alone for a comment, a docstring, or a refactor that provably
 # produces identical chunks.
-ENGINE_VERSION = "2"
+ENGINE_VERSION = "3"
 
 # The node types that WRAP a definition rather than being one -- the outer
 # half of ruling 84's wrapper/inner pair, and the only node types
@@ -455,7 +455,30 @@ def _line_for_byte(data, byte_offset):
 
 
 def _overlapping_intervals(node, intervals):
-    return [iv for iv in intervals if node.start_byte < iv[1] and iv[0] <= node.end_byte]
+    """The error intervals a capture actually shares bytes with.
+
+    Tree-sitter byte ranges are HALF-OPEN -- a node spans
+    [start_byte, end_byte), and so does an ERROR's interval -- so an ERROR
+    that BEGINS exactly at a clean node's end_byte shares no byte with it.
+    `function ok(){}@` glues the ERROR's [26,29) against ok's [0,26): the
+    two touch, they do not overlap, and treating them as overlapping threw
+    away a definition the parser read perfectly, with the source in front
+    of it unchanged. Both ends are therefore strict.
+
+    A MISSING token is the exception and keeps the inclusive test. It is
+    ZERO-WIDTH (start == end): the position where the parser expected
+    something that is not there, and the commonest one -- the closing brace
+    of an unterminated body -- sits exactly AT the end of the node it
+    breaks. A strict test can never match a zero-width interval at all, so
+    it would make every such node read as clean."""
+    out = []
+    for iv in intervals:
+        if iv[0] == iv[1]:
+            if node.start_byte <= iv[0] <= node.end_byte:
+                out.append(iv)
+        elif node.start_byte < iv[1] and iv[0] < node.end_byte:
+            out.append(iv)
+    return out
 
 
 def _merge_error_intervals(root):

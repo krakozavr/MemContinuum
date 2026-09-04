@@ -1289,6 +1289,38 @@ class TestTreeSitterHookIsolation(unittest.TestCase):
         self.assertEqual(r.stdout.strip(), "False", r.stdout + r.stderr)
 
 
+class TestTreeSitterIntervalOverlap(unittest.TestCase):
+    """External gate finding 9 / second gate finding 7, at the unit the
+    finding is about: which error intervals a capture is judged to share
+    bytes with. Node spans and ERROR intervals are both half-open, so a
+    boundary touch is not an overlap -- except for a zero-width MISSING
+    token, which can only ever touch a boundary and must still count."""
+
+    class _Node:
+        def __init__(self, start, end):
+            self.start_byte = start
+            self.end_byte = end
+
+    def _overlaps(self, node_span, intervals):
+        return chunkers.treesitter._overlapping_intervals(self._Node(*node_span), intervals)
+
+    def test_an_error_starting_at_the_exclusive_end_is_not_an_overlap(self):
+        self.assertEqual(self._overlaps((0, 26), [(26, 29)]), [])
+
+    def test_an_error_ending_at_the_start_is_not_an_overlap(self):
+        self.assertEqual(self._overlaps((26, 40), [(20, 26)]), [])
+
+    def test_a_shared_byte_is_an_overlap(self):
+        self.assertEqual(self._overlaps((0, 27), [(26, 29)]), [(26, 29)])
+        self.assertEqual(self._overlaps((0, 40), [(10, 12)]), [(10, 12)])
+
+    def test_a_zero_width_missing_token_counts_at_either_boundary(self):
+        self.assertEqual(self._overlaps((0, 26), [(26, 26)]), [(26, 26)])
+        self.assertEqual(self._overlaps((0, 26), [(0, 0)]), [(0, 0)])
+        self.assertEqual(self._overlaps((0, 26), [(13, 13)]), [(13, 13)])
+        self.assertEqual(self._overlaps((0, 26), [(27, 27)]), [])
+
+
 class TestTreeSitterDedupPriority(unittest.TestCase):
     def test_same_span_two_kinds_keeps_the_more_specific_one(self):
         entries = [
@@ -1593,6 +1625,34 @@ class TestJavaScriptExtraction(unittest.TestCase):
         names = {c["qualified_name"] for c in result.chunks}
         self.assertEqual(names, {"good", "alsoGood"})
         self.assertTrue(any(g[2] == "parse-error" for g in result.gaps))
+
+    def test_an_error_glued_to_a_clean_definition_does_not_taint_it(self):
+        """External gate finding 9 / second gate finding 7. Tree-sitter byte
+        ranges are half-open, so the ERROR at [26,29) that starts exactly
+        where `ok` ends at [0,26) shares no byte with it. `ok` is a
+        definition the parser read perfectly and it survives; the stray
+        token is the gap. The same source with a space before the `@`
+        always kept `ok` -- one character of whitespace is what decided
+        whether a clean definition reached the index."""
+        result = self._chunk("adjacent_error.js")
+        self.assertEqual(result.status, "partial")
+        got = sorted((c["kind"], c["qualified_name"], c["start_line"]) for c in result.chunks)
+        self.assertEqual(got, [("function", "later", 2), ("function", "ok", 1)])
+        self.assertEqual(result.gaps, [(1, 1, "parse-error")])
+
+    def test_a_missing_token_at_a_definition_s_end_still_taints_it(self):
+        """The other half of the same fix: a MISSING token is zero-width,
+        and the commonest one -- the closing brace of an unterminated body
+        -- sits exactly AT the end of the node it breaks. It keeps the
+        inclusive test, so `b` is a gap rather than a chunk the parser only
+        guessed at, while `a` above it is untouched."""
+        chunkers.treesitter.reset_cache()
+        result = chunkers.get_chunker("javascript").chunk_file(
+            "function a(){}\nfunction b(){\n", "unterminated.js"
+        )
+        self.assertEqual(result.status, "partial")
+        self.assertEqual([c["qualified_name"] for c in result.chunks], ["a"])
+        self.assertEqual(result.gaps, [(2, 2, "parse-error")])
 
     def test_declared_symbols_matches_chunk_recall(self):
         chunkers.treesitter.reset_cache()
