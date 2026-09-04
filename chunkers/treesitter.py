@@ -150,7 +150,7 @@ DEFAULT_MAX_PARSE_BYTES = 1 * 1024 * 1024   # 1 MiB
 # forgets. Bump this by one whenever the shared engine's OUTPUT changes;
 # leave it alone for a comment, a docstring, or a refactor that provably
 # produces identical chunks.
-ENGINE_VERSION = "3"
+ENGINE_VERSION = "4"
 
 # The node types that WRAP a definition rather than being one -- the outer
 # half of ruling 84's wrapper/inner pair, and the only node types
@@ -364,7 +364,20 @@ def dedup_by_priority(entries):
     method/function) -- the concrete tie-break for the SAME-span
     collision (a get/set accessor also matching the generic method
     pattern; a constructor also matching the generic method pattern).
-    Ties (same priority) keep the first-seen entry."""
+
+    Equal priority is broken by QUALIFICATION: an entry whose query
+    supplied an explicit @chunk.qualifier is a more specific reading of the
+    same span than one whose ancestor walk found no container. An object
+    literal's method matches both the generic method_definition pattern
+    (which can only name it `open`) and the bound-object pattern (which
+    names it `api.open`), at the same span and the same kind; without this
+    the winner would depend on the order the grammar happened to complete
+    two matches in. Ties with nothing to separate them keep the first-seen
+    entry.
+
+    `has_qualifier` is read with `.get`, like `node_type` in dedup_nested,
+    so an entry built without one (the abstract-tuple unit tests) simply
+    never wins the tie-break rather than raising."""
     best = {}
     order = []
     for e in entries:
@@ -373,7 +386,12 @@ def dedup_by_priority(entries):
             best[key] = e
             order.append(key)
             continue
-        if _KIND_PRIORITY.get(e["kind"], 99) < _KIND_PRIORITY.get(best[key]["kind"], 99):
+        rank = _KIND_PRIORITY.get(e["kind"], 99)
+        kept_rank = _KIND_PRIORITY.get(best[key]["kind"], 99)
+        if rank < kept_rank:
+            best[key] = e
+        elif (rank == kept_rank
+              and e.get("has_qualifier") and not best[key].get("has_qualifier")):
             best[key] = e
     return [best[k] for k in order]
 
@@ -507,9 +525,36 @@ def _merge_error_intervals(root):
     return [tuple(x) for x in merged]
 
 
+def _symbol_text(data, name_node):
+    """The chunk's symbol: the name node's own text, minus a syntax marker
+    that is not part of the name anything else spells.
+
+    JavaScript and TypeScript write a private class member's name as
+    `private_property_identifier`, whose text carries the leading `#`
+    (`#priv`). A record references a symbol as `path#symbol`, so the `#`
+    would land twice -- `widget.js##priv` is not a reference anyone writes
+    -- and the member is `priv` in every other sentence about it, exactly
+    like the class's public methods. TypeScript's own `private m()` needs
+    nothing here: `private` is a modifier, and the name is an ordinary
+    property_identifier already."""
+    text = data[name_node.start_byte:name_node.end_byte].decode("utf-8", "replace")
+    if name_node.type == "private_property_identifier" and text.startswith("#"):
+        return text[1:]
+    return text
+
+
 def _qualify(row, node, symbol, qualifier_text):
-    if qualifier_text is not None:
-        return f"{qualifier_text}.{symbol}"
+    """qualified_name: every qualification container above `node` (the
+    row's own `containers` map), then an explicit @chunk.qualifier the
+    query supplied, then the symbol -- joined with dots.
+
+    The two sources compose rather than one replacing the other. A query
+    captures a qualifier for a binding no ancestor names (Lua's table
+    syntax, a JS object literal bound to a `const`), and that binding can
+    itself sit inside a container the walk DOES name: `namespace N { const
+    api = { get(){} } }` is `N.api.get`. Lua, whose rows declare no
+    containers at all, is unaffected -- the walk contributes nothing and
+    the qualifier stands alone."""
     parts = []
     containers = row.get("containers", {})
     p = node.parent
@@ -525,6 +570,8 @@ def _qualify(row, node, symbol, qualifier_text):
                 parts.append(p.text[n.start_byte - p.start_byte: n.end_byte - p.start_byte].decode("utf-8", "replace"))
         p = p.parent
     parts.reverse()
+    if qualifier_text is not None:
+        parts.append(qualifier_text)
     parts.append(symbol)
     return ".".join(parts)
 
@@ -603,7 +650,7 @@ def build_chunks(lang, row, data, root, matches):
         is_default = "chunk.default" in caps
         if name_node is None and not is_default:
             continue   # unbound callable -- deferred `closure` kind
-        symbol = "default" if name_node is None else data[name_node.start_byte:name_node.end_byte].decode("utf-8", "replace")
+        symbol = "default" if name_node is None else _symbol_text(data, name_node)
         qualifier_text = None
         if qual_node is not None:
             qualifier_text = data[qual_node.start_byte:qual_node.end_byte].decode("utf-8", "replace")
@@ -614,6 +661,7 @@ def build_chunks(lang, row, data, root, matches):
             "kind": resolved_kind,
             "symbol": symbol,
             "qualified_name": qualified_name,
+            "has_qualifier": qual_node is not None,   # dedup_by_priority's tie-break
             "node_type": kind_node.type,   # dedup_nested's wrapper-vs-nesting test
             "node": kind_node,
             "doc_node": doc_anchor_node if doc_anchor_node is not None else kind_node,

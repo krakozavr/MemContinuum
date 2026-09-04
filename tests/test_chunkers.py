@@ -1171,7 +1171,8 @@ class TestTreeSitterFingerprint(unittest.TestCase):
         # Sorted, so reordering a row's own containers is not a rechunk.
         row = dict(chunkers.LANGUAGE_TABLE["typescript"])
         shuffled = dict(row)
-        shuffled["containers"] = {"internal_module": "name", "class_declaration": "name"}
+        shuffled["containers"] = {"module": "name", "internal_module": "name",
+                                  "class_declaration": "name"}
         self.assertEqual(
             chunkers.treesitter.row_shape(row), chunkers.treesitter.row_shape(shuffled)
         )
@@ -1289,6 +1290,26 @@ class TestTreeSitterHookIsolation(unittest.TestCase):
         self.assertEqual(r.stdout.strip(), "False", r.stdout + r.stderr)
 
 
+class TestQueryFilesInSync(unittest.TestCase):
+    """typescript.scm says it is javascript.scm's body with a header of its
+    own -- TS and TSX add types and JSX, neither of which changes how a
+    function, method or class is shaped. That is a claim a person has to
+    honor by hand on every query edit, so it is checked here instead: the
+    two bodies (each file past its own header comment block) must match
+    exactly."""
+
+    @staticmethod
+    def _body(name):
+        text = (REPO_ROOT / "chunkers" / "queries" / name).read_text()
+        _header, _blank, body = text.partition("\n\n")
+        return body
+
+    def test_javascript_and_typescript_query_bodies_are_identical(self):
+        js = self._body("javascript.scm")
+        self.assertTrue(js.strip(), "the body split found nothing -- check the header format")
+        self.assertEqual(js, self._body("typescript.scm"))
+
+
 class TestTreeSitterIntervalOverlap(unittest.TestCase):
     """External gate finding 9 / second gate finding 7, at the unit the
     finding is about: which error intervals a capture is judged to share
@@ -1330,6 +1351,35 @@ class TestTreeSitterDedupPriority(unittest.TestCase):
         deduped = chunkers.treesitter.dedup_by_priority(entries)
         self.assertEqual(len(deduped), 1)
         self.assertEqual(deduped[0]["kind"], "accessor")
+
+    def test_same_span_and_kind_prefers_the_explicitly_qualified_entry(self):
+        # External gate finding 3: an object literal's method matches both
+        # the generic method_definition pattern (which can only name it
+        # `open`) and the bound-object pattern (which names it `api.open`),
+        # at the same span and the same kind. The qualified reading wins by
+        # rule, not by whichever match the grammar happened to complete
+        # first.
+        entries = [
+            {"key": (10, 40), "kind": "method", "symbol": "open", "qualified_name": "open"},
+            {"key": (10, 40), "kind": "method", "symbol": "open", "qualified_name": "api.open",
+             "has_qualifier": True},
+        ]
+        deduped = chunkers.treesitter.dedup_by_priority(entries)
+        self.assertEqual(len(deduped), 1)
+        self.assertEqual(deduped[0]["qualified_name"], "api.open")
+        self.assertEqual(
+            chunkers.treesitter.dedup_by_priority(list(reversed(entries)))[0]["qualified_name"],
+            "api.open", "the winner must not depend on match order",
+        )
+
+    def test_a_more_specific_kind_still_beats_an_explicit_qualifier(self):
+        entries = [
+            {"key": (10, 40), "kind": "method", "symbol": "x", "qualified_name": "api.x",
+             "has_qualifier": True},
+            {"key": (10, 40), "kind": "accessor", "symbol": "x", "qualified_name": "x"},
+        ]
+        deduped = chunkers.treesitter.dedup_by_priority(entries)
+        self.assertEqual([e["kind"] for e in deduped], ["accessor"])
 
     def test_wrapper_span_over_the_same_qualified_name_is_dropped(self):
         # Ruling 84: an outer wrapper match (export_statement) and an
@@ -1608,6 +1658,74 @@ class TestJavaScriptExtraction(unittest.TestCase):
         self.assertEqual((c["kind"], c["symbol"], c["qualified_name"]), ("function", "default", "default"))
         self.assertEqual((c["start_line"], c["end_line"]), (3, 5))
 
+    def test_generators_are_function_chunks_under_their_own_names(self):
+        """External gate finding 2, second gate finding 2. A generator is
+        its own node type -- generator_function_declaration for `function*
+        g(){}` and `async function* g(){}`, generator_function for a bound
+        `function*` expression -- so none of the patterns keyed to
+        function_declaration/function_expression saw one, and the file
+        reported status=ok with the generator silently absent. Generator
+        METHODS were kept the whole time (method_definition covers them),
+        which is what made the gap so hard to see."""
+        result = self._chunk("generators.js")
+        self.assertEqual((result.status, result.gaps), ("ok", []))
+        got = sorted((c["kind"], c["symbol"], c["qualified_name"]) for c in result.chunks)
+        self.assertEqual(got, [
+            ("function", "asyncCounter", "asyncCounter"),
+            ("function", "bound", "bound"),
+            ("function", "counter", "counter"),
+            ("function", "exported", "exported"),
+        ])
+
+    def test_private_class_members_are_chunked_without_the_hash(self):
+        """External gate finding 2, second gate finding 4. A private
+        member's name is a private_property_identifier, a different node
+        type from the property_identifier every method pattern matched, so
+        `#secret(){}` was captured by nothing. The stored symbol drops the
+        leading `#`: a record spells a symbol reference as `path#symbol`,
+        so `widget.js##secret` would be the alternative, and the member is
+        `secret` in every other sentence about it. Private accessors are
+        accessors, same as public ones."""
+        result = self._chunk("private_members.js")
+        self.assertEqual((result.status, result.gaps), ("ok", []))
+        got = sorted((c["kind"], c["symbol"], c["qualified_name"]) for c in result.chunks)
+        self.assertEqual(got, [
+            ("accessor", "hidden", "Box.hidden"),
+            ("accessor", "hidden", "Box.hidden"),   # get and set, two spans
+            ("method", "open", "Box.open"),
+            ("method", "secret", "Box.secret"),
+        ])
+
+    def test_object_literal_methods_carry_the_binding_that_names_them(self):
+        """External gate finding 3. An object literal is no qualification
+        container -- nothing in the ancestor walk names it -- so every
+        object's `get` was stored as the bare name `get`, and two objects
+        in one file were indistinguishable. When the literal is the value
+        of a binding, that binding is the name a reader uses. A literal
+        with no binding to name it keeps the unqualified method: less
+        precise, never dropped."""
+        result = self._chunk("object_literals.js")
+        self.assertEqual((result.status, result.gaps), ("ok", []))
+        got = sorted((c["kind"], c["symbol"], c["qualified_name"]) for c in result.chunks)
+        self.assertEqual(got, [
+            ("method", "get", "api.get"),      # const api = { get(){} }
+            ("method", "get", "get"),          # an argument literal: no binding to name it
+            ("method", "get", "store.get"),    # store = { get(){} }
+        ])
+
+    def test_namespaced_react_wrappers_match_the_same_rule_as_bare_ones(self):
+        """Second gate finding 8. `React.memo(...)` is a member_expression
+        callee, not the identifier the wrapper patterns required, so the
+        component was dropped with status=ok while the `import { memo }`
+        spelling of the very same wrapper was kept."""
+        result = self._chunk("namespaced_wrappers.jsx")
+        self.assertEqual((result.status, result.gaps), ("ok", []))
+        got = sorted((c["kind"], c["symbol"], c["qualified_name"]) for c in result.chunks)
+        self.assertEqual(got, [
+            ("function", "Forwarded", "Forwarded"),
+            ("function", "Memoized", "Memoized"),
+        ])
+
     def test_no_callable_file_yields_zero_chunks_status_ok(self):
         result = self._chunk("no_callable.js")
         self.assertEqual((result.status, result.chunks, result.gaps), ("ok", [], []))
@@ -1698,6 +1816,29 @@ class TestTypeScriptExtraction(unittest.TestCase):
         ]))
         self.assertEqual(len(result.chunks), 6)   # capture-count golden -- overload pair excluded
 
+    def test_module_namespace_generator_private_and_object_literal(self):
+        """The typescript half of the query fixes, in one fixture because
+        they share one file: `module M {}` qualifies what it holds exactly
+        as `namespace M {}` does (they are one construct with two
+        spellings, and the grammar gives them two node types -- second gate
+        finding 5); a generator is a function chunk (finding 2 of both
+        gates); `#secret()` is chunked under the `#`-less name and TS's own
+        `private hidden()` keeps its keyword-less one (second gate finding
+        4 -- `private` is a modifier, so that name was never the problem);
+        and an object literal's method carries the binding that names it
+        (external gate finding 3)."""
+        result = self._chunk("module_and_members.ts")
+        self.assertEqual((result.status, result.gaps), ("ok", []))
+        got = sorted((c["kind"], c["symbol"], c["qualified_name"]) for c in result.chunks)
+        self.assertEqual(got, [
+            ("function", "area", "Shapes.area"),      # module M {}
+            ("function", "ids", "ids"),               # function* ids()
+            ("function", "volume", "Solids.volume"),  # namespace M {}
+            ("method", "get", "api.get"),             # const api = { get(){} }
+            ("method", "hidden", "Box.hidden"),       # private hidden()
+            ("method", "secret", "Box.secret"),       # #secret()
+        ])
+
     def test_no_callable_file(self):
         result = self._chunk("no_callable.ts")
         self.assertEqual((result.status, result.chunks, result.gaps), ("ok", [], []))
@@ -1765,6 +1906,21 @@ class TestTsxExtraction(unittest.TestCase):
             ("function", "Fwd"), ("function", "DefaultOne"),
         ]))
         self.assertEqual(len(result.chunks), 4)   # exactly one chunk per component
+
+    def test_module_namespaced_wrapper_and_private_member(self):
+        """The same query file through the tsx row and grammar: TSX is not
+        assumed to follow typescript, it is checked. `module M {}`
+        qualifies, `React.memo(...)` matches the wrapper rule its bare
+        spelling already matched, and a private member is chunked under its
+        `#`-less name."""
+        result = self._chunk("module_and_wrappers.tsx")
+        self.assertEqual((result.status, result.gaps), ("ok", []))
+        got = sorted((c["kind"], c["symbol"], c["qualified_name"]) for c in result.chunks)
+        self.assertEqual(got, [
+            ("function", "Memoized", "Memoized"),
+            ("function", "area", "Shapes.area"),
+            ("method", "secret", "Box.secret"),
+        ])
 
     def test_localized_error_is_partial(self):
         # Deviation from the brief's literal fixture (see task-4-report.md):

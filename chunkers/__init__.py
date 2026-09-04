@@ -56,7 +56,13 @@ LANGUAGE_TABLE = {
                     "query_file": "typescript.scm", "impl_version": "1",
                     "extensions": (".ts",), "shebangs": (),
                     "skip_dirs": frozenset({"build", "dist"}),
-                    "containers": {"class_declaration": "name", "internal_module": "name"},
+                    # `namespace M {}` and `module M {}` are one construct
+                    # spelled two ways, and the grammar names them with two
+                    # node types -- internal_module and module. Both qualify
+                    # what they hold, or the same source qualifies or not
+                    # depending on which spelling its author reached for.
+                    "containers": {"class_declaration": "name", "internal_module": "name",
+                                    "module": "name"},
                     "method_if_ancestor_in": frozenset(), "max_bytes": None},
     "tsx": {"backend": "tree-sitter", "module": "chunkers.treesitter",
             "grammar_module": "tree_sitter_typescript", "language_fn": "language_tsx",
@@ -64,7 +70,9 @@ LANGUAGE_TABLE = {
             "query_file": "typescript.scm", "impl_version": "1",
             "extensions": (".tsx",), "shebangs": (),
             "skip_dirs": frozenset({"build", "dist"}),
-            "containers": {"class_declaration": "name", "internal_module": "name"},
+            # Same two spellings of one construct as the typescript row above.
+            "containers": {"class_declaration": "name", "internal_module": "name",
+                            "module": "name"},
             "method_if_ancestor_in": frozenset(), "max_bytes": None},
     "java": {"backend": "tree-sitter", "module": "chunkers.treesitter",
              "grammar_module": "tree_sitter_java", "language_fn": "language",
