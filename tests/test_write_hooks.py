@@ -1205,6 +1205,95 @@ class TestSessionStartRemind(HookTestBase):
         self.assertEqual(state.get("start_code_sha"), git_head(self.code_root))
         self.assertEqual(state.get("start_store_sha"), git_head(self.store_root))
 
+    def test_clear_inits_state_with_start_shas_silently(self):
+        """INC-0108: a session that begins with /clear (source=clear) must
+        take the same init path as startup -- a cleared session is a fresh
+        session. Mirrors test_startup_inits_state_with_start_shas_silently
+        exactly, source swapped."""
+        session_id = "s-start-clear"
+        payload = self.session_start_payload(session_id, source="clear")
+        proc, _ = run_script(SESSIONSTART_HOOK, payload, self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        state = self.load_state(session_id)
+        self.assertEqual(state.get("start_code_sha"), git_head(self.code_root))
+        self.assertEqual(state.get("start_store_sha"), git_head(self.store_root))
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=init", log_text)
+        self.assertIn("source=clear", log_text)
+
+    def test_clear_discards_state_left_over_from_before_the_clear(self):
+        """INC-0108 design decision: /clear commonly fires on the SAME
+        session_id an earlier startup already created state for (a /clear
+        mid-process). Unlike resume (which must preserve the original
+        startup's values via setdefault), clear must DISCARD that leftover
+        state and start empty -- a stale ledger/turn-count/pending left over
+        from before the clear would misfire the coverage/look-back nudges
+        against turns the cleared context no longer has, and a stale
+        sessionend `ended_at` stamp has no business surviving into a session
+        that is still running."""
+        session_id = "s-start-clear-reset"
+        stale_code_sha = "0" * 40
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+        self.patch_state(
+            session_id,
+            start_code_sha=stale_code_sha,
+            start_store_sha=stale_code_sha,
+            user_turn_count=17,
+            last_inject_turn=12,
+            last_inject_time=123.0,
+            last_inject_ts=123.0,
+            last_injected_pairs=[["a", "b"]],
+            last_growth_turn=9,
+            last_growth_ts=100.0,
+            lookback_count=3,
+            pending={"unmapped": ["src/unmapped.py"], "coverage_status": "ok"},
+            ended_at=999.0,
+        )
+
+        payload = self.session_start_payload(session_id, source="clear")
+        proc, _ = run_script(SESSIONSTART_HOOK, payload, self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+
+        state = self.load_state(session_id)
+        self.assertEqual(state.get("start_code_sha"), git_head(self.code_root))
+        self.assertNotEqual(state.get("start_code_sha"), stale_code_sha)
+        self.assertEqual(state.get("start_store_sha"), git_head(self.store_root))
+        self.assertEqual(state.get("ledger"), [])
+        self.assertEqual(state.get("user_turn_count"), 0)
+        self.assertEqual(state.get("last_inject_turn"), -999)
+        self.assertEqual(state.get("last_inject_time"), 0)
+        self.assertEqual(state.get("last_inject_ts"), 0)
+        self.assertEqual(state.get("last_injected_pairs"), [])
+        self.assertEqual(state.get("last_growth_turn"), 0)
+        self.assertEqual(state.get("lookback_count"), 0)
+        self.assertNotIn("pending", state)
+        self.assertNotIn("ended_at", state)
+
+    def test_clear_then_userprompt_is_served_not_no_state(self):
+        """INC-0108 end-to-end pin: a real SessionStart(source=clear) followed
+        by a real UserPromptSubmit for the same session must be served
+        (coverage evidence injected), not fall into userprompt-remind.sh's
+        no-state branch the way the incident observed for 2.5 hours."""
+        session_id = "s-start-clear-then-prompt"
+        proc, _ = run_script(
+            SESSIONSTART_HOOK, self.session_start_payload(session_id, source="clear"), self.base_env()
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(self.state_file(session_id).exists())
+
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+
+        up_proc, _ = run_script(
+            USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.base_env()
+        )
+        self.assertEqual(up_proc.returncode, 0, up_proc.stderr)
+        self.assertIn("Coverage signal", up_proc.stdout)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=injected", log_text)
+        self.assertNotIn("outcome=no-state", log_text)
+
     def test_log_line_carries_project(self):
         """Liveness metric fix: every sessionstart-remind.sh outcome line
         must carry project=<MC_PROJECT> (via mc_log in memlib.sh)."""
@@ -1334,7 +1423,10 @@ class TestSessionStartRemind(HookTestBase):
         self.assertIn("Coverage signal", ctx)
 
     def test_other_sources_are_silent(self):
-        for source in ("clear", "fork"):
+        """`clear` moved to the startup|resume|clear arm (INC-0108) and is
+        covered by its own tests above; only genuinely-unhandled sources
+        stay here."""
+        for source in ("fork", "banana"):
             with self.subTest(source=source):
                 proc, _ = run_script(
                     SESSIONSTART_HOOK,
@@ -1343,6 +1435,17 @@ class TestSessionStartRemind(HookTestBase):
                 )
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertEqual(proc.stdout.strip(), "")
+
+    def test_unknown_source_logs_source_not_handled(self):
+        session_id = "s-start-unknown-fork"
+        proc, _ = run_script(
+            SESSIONSTART_HOOK, self.session_start_payload(session_id, source="fork"), self.base_env()
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=source-not-handled", log_text)
+        self.assertIn("source=fork", log_text)
+        self.assertFalse(self.state_file(session_id).exists())
 
     def test_store_byte_identical(self):
         session_id = "s-start-bytesafe"

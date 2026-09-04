@@ -4,12 +4,30 @@
 # level too, but docs/DESIGN.md requires in-script gating as the
 # defense of record):
 #
-#   startup | resume  -- initialize this session's state (start_code_sha /
-#                         start_store_sha captured from the code/store roots'
-#                         current git HEAD, via setdefault so a *resume* never
-#                         resets a startup's original values), then prune
-#                         state files older than 24h across this project.
-#                         Always silent (no stdout).
+#   startup | resume | clear
+#                     -- initialize this session's state (start_code_sha /
+#                        start_store_sha captured from the code/store roots'
+#                        current git HEAD, via setdefault so a *resume* never
+#                        resets a startup's original values), then prune
+#                        state files older than 24h across this project.
+#                        Always silent (no stdout).
+#
+#                        `clear` (INC-0108) is a fresh session, not a
+#                        continuation: /clear commonly fires on the SAME
+#                        session_id an earlier startup already created state
+#                        for (a /clear mid-process, same CLI run), so unlike
+#                        resume it must DISCARD whatever state is already on
+#                        disk for this session_id before the setdefault init
+#                        below runs -- a leftover ledger/turn-count/pending
+#                        from before the clear would misfire the coverage/
+#                        look-back nudges against turns the cleared context
+#                        no longer has, and a stale SessionEnd `ended_at`
+#                        stamp has no business surviving into a session that
+#                        is still running. The discard happens inside the
+#                        same locked mc_update_state_json transform (state =
+#                        {} at the top, only for clear) so there is no
+#                        separate unlocked delete step and no window where a
+#                        concurrent read sees a half-reset file.
 #   compact           -- read state.pending (written by precompact-persist.sh
 #                         right before compaction), and if it holds anything,
 #                         inject it ONCE via hookSpecificOutput.additionalContext
@@ -96,16 +114,22 @@ eval "$(mc_extract_fields "$PAYLOAD" session_id source)" 2>/dev/null
 STATE_FILE="$(mc_state_file_for "$MC_PROJECT" "$SESSION_ID")"
 
 case "${SOURCE:-}" in
-    startup|resume)
+    startup|resume|clear)
         CODE_SHA="$(mc_git_head "${MEMCONTINUUM_CODE_ROOT:-}")"
         STORE_SHA="$(mc_git_head "${MEMCONTINUUM_ROOT:-}")"
         export MC_CODE_SHA="$CODE_SHA"
         export MC_STORE_SHA="$STORE_SHA"
         export MC_SESSION_ID="$SESSION_ID"
         export MC_PROJECT_ENV="$MC_PROJECT"
+        export MC_SOURCE="${SOURCE:-}"
 
         mc_update_state_json "$STATE_FILE" '
 import os, time
+
+# INC-0108: clear discards whatever this session_id had on disk before the
+# setdefault init below runs -- see the header comment above.
+if os.environ.get("MC_SOURCE") == "clear":
+    state = {}
 
 state.setdefault("session_id", os.environ.get("MC_SESSION_ID", ""))
 state.setdefault("project", os.environ.get("MC_PROJECT_ENV", ""))

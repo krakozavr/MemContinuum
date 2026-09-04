@@ -37,7 +37,7 @@ wired one level up, into `~/.claude/settings.json`, by `memcontinuum-setup.sh`.
 | `newfile-nudge.sh` | `PreToolUse` (Write only, filtered to `--code-root`) | fires only when the write target does not exist yet and its extension is wired for this project; injects one reminder to search the code index first |
 | `ledger-post-edit.sh` | `PostToolUse` | appends the edit to a per-session ledger, scoped to `--code-root` and the store root |
 | `precompact-persist.sh` | `PreCompact` | persists session state before context is compacted away |
-| `sessionstart-remind.sh` | `SessionStart` | on `startup`/`resume`, initializes session state only (captures the code/store roots' git HEAD, prunes state older than 24h); only on `source: compact` does it inject what `precompact-persist.sh` left pending |
+| `sessionstart-remind.sh` | `SessionStart` | on `startup`/`resume`/`clear`, initializes session state only (captures the code/store roots' git HEAD, prunes state older than 24h; `clear` discards any state already on disk for the session_id first, `resume` never does); only on `source: compact` does it inject what `precompact-persist.sh` left pending |
 | `userprompt-remind.sh` | `UserPromptSubmit` | never reads the prompt text; fires the coverage or look-back nudge |
 | `sessionend-stamp.sh` | `SessionEnd` | stamps session end into state |
 | `post-commit-reindex.sh` | store's git `post-commit` | reindexes the store after every commit to it |
