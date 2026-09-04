@@ -69,7 +69,19 @@ LANGUAGE_TABLE = {
     "java": {"backend": "tree-sitter", "module": "chunkers.treesitter",
              "grammar_module": "tree_sitter_java", "language_fn": "language",
              "runtime_pin": "0.26.0", "grammar_pin": "0.23.5",
-             "query_file": "java.scm", "impl_version": "1",
+             # impl_version "1"->"2" (fix round 1, finding 5): doc_comment_types
+             # is NOT part of chunker_version's shared tree-sitter fingerprint
+             # payload (backend/module/runtime_pin/grammar_module/grammar_pin/
+             # query_fingerprint/impl_version -- see chunker_version() below),
+             # by design (adding it there would force every OTHER language's
+             # chunker_version to change too). impl_version is the existing,
+             # per-row escape hatch for exactly this: a java chunk's `doc`
+             # field now reads real Javadoc/line-comment text it never did
+             # before, so this row alone needs to force a fresh rechunk of any
+             # already-indexed java file. Free right now (no live index
+             # contains java rows yet -- java was first wired this task); the
+             # cost would only grow once a real --add-lang java rollout exists.
+             "query_file": "java.scm", "impl_version": "2",
              "extensions": (".java",), "shebangs": (),
              "skip_dirs": frozenset({"target", "build", "dist"}),
              "containers": {"class_declaration": "name", "interface_declaration": "name",

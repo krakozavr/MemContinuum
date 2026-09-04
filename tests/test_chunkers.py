@@ -1390,10 +1390,12 @@ class TestPhpExtraction(unittest.TestCase):
     def test_widget_recall_with_embedded_html(self):
         result = self._chunk("widget.php")
         self.assertEqual(result.status, "ok")
-        got = sorted((c["kind"], c["qualified_name"]) for c in result.chunks)
+        got = sorted((c["kind"], c["symbol"], c["qualified_name"]) for c in result.chunks)
         self.assertEqual(got, sorted([
-            ("function", "top_level"), ("constructor", "Widget.__construct"),
-            ("method", "Widget.render"), ("method", "Greets.greet"),
+            ("function", "top_level", "top_level"),
+            ("constructor", "__construct", "Widget.__construct"),
+            ("method", "render", "Widget.render"),
+            ("method", "greet", "Greets.greet"),
         ]))
         self.assertEqual(len(result.chunks), 4)   # capture-count golden
 
@@ -1424,14 +1426,18 @@ class TestPhpExtraction(unittest.TestCase):
         # Java ErrorRecovery.java deviation from Task 5.
         result = self._chunk("error_recovery.php")
         self.assertEqual(result.status, "partial")
-        names = {c["qualified_name"] for c in result.chunks}
-        self.assertEqual(names, {"good", "alsoGood"})
+        got = sorted((c["kind"], c["symbol"], c["qualified_name"]) for c in result.chunks)
+        self.assertEqual(got, sorted([
+            ("function", "good", "good"), ("function", "alsoGood", "alsoGood"),
+        ]))
 
     def test_nested_function_is_kept_separate_from_the_outer_one(self):
         result = self._chunk("nested_calls.php")
         self.assertEqual(result.status, "ok")
-        got = sorted((c["kind"], c["qualified_name"]) for c in result.chunks)
-        self.assertEqual(got, sorted([("function", "outer"), ("function", "inner")]))
+        got = sorted((c["kind"], c["symbol"], c["qualified_name"]) for c in result.chunks)
+        self.assertEqual(got, sorted([
+            ("function", "outer", "outer"), ("function", "inner", "inner"),
+        ]))
         self.assertEqual(len(result.chunks), 2)
 
     def test_docblock_above_a_function_lands_in_its_chunk_doc(self):
@@ -1446,3 +1452,33 @@ class TestPhpExtraction(unittest.TestCase):
         self.assertEqual(
             by_qname["compute_total"]["doc"], "Computes the widget total."
         )
+
+    def test_bodyless_interface_and_abstract_methods_are_never_chunked(self):
+        # Fix round 1, two findings closed by one fixture:
+        # - Finding 1 (moderate): php's own `containers["enum_declaration"]`
+        #   entry had no fixture anywhere in the corpus -- same class of gap
+        #   Task 5's review flagged for Java (closed for Java by this task's
+        #   own item B, not mirrored for PHP until now). `Suit.label` below
+        #   is that coverage.
+        # - Finding 2 (moderate): php.scm's method_declaration patterns now
+        #   require body: (compound_statement) (matching java.scm's own
+        #   body: (block) constraint) -- an interface method signature and
+        #   an abstract method declaration (neither has a body) must never
+        #   become a chunk, unqualified or otherwise. The concrete sibling
+        #   methods in the SAME file (a regular class method, an enum
+        #   method) must still be chunked normally -- the body constraint
+        #   only excludes the specific bodyless nodes, not their
+        #   containers. Deliberately NOT adding `interface_declaration` to
+        #   php's `containers` (coordinator ruling): its methods have no
+        #   bodies, so nothing inside it is ever chunked in the first
+        #   place -- a qualifier entry for it would qualify nothing.
+        result = self._chunk("bodyless_and_enum.php")
+        self.assertEqual(result.status, "ok")
+        got = sorted((c["kind"], c["symbol"], c["qualified_name"]) for c in result.chunks)
+        self.assertEqual(got, sorted([
+            ("method", "describe", "Shape.describe"),
+            ("method", "label", "Suit.label"),
+        ]))
+        self.assertEqual(len(result.chunks), 2)   # capture-count golden --
+        # interface Greeter's greet() and abstract class Shape's area()
+        # both excluded, no unqualified "greet"/"area" chunk of any kind
