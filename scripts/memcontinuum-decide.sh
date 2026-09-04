@@ -170,6 +170,35 @@ fi
 REPO="$MC_REPO"
 KEY="$MC_REPO_KEY"
 
+# Resolve every path argument PHYSICALLY before it is validated or written
+# (symlink-review round 3, concern 2): every OTHER recording site --
+# repo-init.sh's own --store/--code-root (abspath(), Ruling 89), and
+# memcontinuum-update.sh's own migration overrides -- already resolves
+# through this same mc_physical (scripts/mc-registry-lib.sh) before the
+# value reaches the registry; this script was the one gap left, recording
+# --store (and --claude-dir/--code-root) raw. A row written here with a
+# symlinked path would otherwise disagree with what repo-init.sh itself
+# renders for the identical value, the exact registry-vs-rendered
+# divergence class this whole task exists to close -- and since a human
+# can type any of these three flags directly into this script (bypassing
+# repo-init.sh's own resolution entirely, "wired"'s normal path when a
+# --record-decision-driven install did not just run it), this is the ONE
+# place that class of divergence can still originate. --repo does NOT need
+# this: it is never written into the note directly, only used to derive
+# REPO/KEY via mc_repo_key above, which is already physical (git resolves
+# via getcwd(), never the shell's logical $PWD). Guarded on non-empty:
+# mc_physical("") would silently return this PROCESS's own cwd (`cd ""` is
+# a no-op in bash), never an error -- worse than leaving an empty value
+# empty for check_storable/the usage checks below to catch as they always
+# have.
+[ -n "$STORE" ] && STORE="$(mc_physical "$STORE")"
+for i in "${!CLAUDE_DIRS[@]}"; do
+    [ -n "${CLAUDE_DIRS[$i]}" ] && CLAUDE_DIRS[$i]="$(mc_physical "${CLAUDE_DIRS[$i]}")"
+done
+for i in "${!CODE_ROOTS[@]}"; do
+    [ -n "${CODE_ROOTS[$i]}" ] && CODE_ROOTS[$i]="$(mc_physical "${CODE_ROOTS[$i]}")"
+done
+
 # Recording `wired` is the one write that can lie: a wired row silences the
 # detector forever, whether or not scripts/repo-init.sh ever succeeded. So
 # verify the claim against the repo's own settings before recording it (same

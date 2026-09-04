@@ -207,6 +207,50 @@ class TestDecideNewFlags(unittest.TestCase):
         self.assertIn(f"store={Path(self.tmp) / 'store'} project=p", note)
 
     @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_wired_records_every_symlinked_path_argument_physically(self):
+        """Symlink-review round 3, concern 2: memcontinuum-decide.sh used
+        to record --store (and --claude-dir/--code-root) raw, never
+        resolving it -- the one recording site Ruling 89's physical-
+        resolution rule had not reached (every OTHER site -- repo-init.sh's
+        own --store/--code-root, memcontinuum-update.sh's migration
+        overrides -- already did). A human can type any of these three
+        flags directly into this script, bypassing repo-init.sh's own
+        resolution entirely, so this is the one place that class of
+        registry-vs-rendered divergence could still originate. --repo is
+        deliberately not exercised here: it is never written into the
+        note directly, only used to derive the key via mc_repo_key, which
+        is already physical (git resolves via getcwd())."""
+        repo = git_repo(str(Path(self.tmp) / "repo"))
+        real_claude = Path(self.tmp) / "real-claude"
+        real_store = Path(self.tmp) / "real-store"
+        real_code = Path(self.tmp) / "real-code"
+        proc = run(INSTALL_SH, ["--project", "p", "--store", str(real_store),
+                                "--claude-dir", str(real_claude),
+                                "--non-interactive"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        real_code.mkdir()
+
+        claude_link = Path(self.tmp) / "claude-link"
+        store_link = Path(self.tmp) / "store-link"
+        code_link = Path(self.tmp) / "code-link"
+        claude_link.symlink_to(real_claude, target_is_directory=True)
+        store_link.symlink_to(real_store, target_is_directory=True)
+        code_link.symlink_to(real_code, target_is_directory=True)
+
+        proc = run(DECIDE_SH, ["wired", "--repo", repo,
+                               "--store", str(store_link), "--project", "p",
+                               "--claude-dir", str(claude_link),
+                               "--code-root", str(code_link)], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        note = decisions_tsv(self.home).read_text().splitlines()[-1]
+        self.assertIn(f"store={os.path.realpath(str(real_store))}", note, note)
+        self.assertIn(f"claude-dirs={os.path.realpath(str(real_claude))}", note, note)
+        self.assertIn(f"code-roots={os.path.realpath(str(real_code))}", note, note)
+        self.assertNotIn(str(store_link), note, note)
+        self.assertNotIn(str(claude_link), note, note)
+        self.assertNotIn(str(code_link), note, note)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
     def test_repeatable_claude_dir_requires_every_one_fully_wired(self):
         """INC-0104: one project, two claude-dirs. `wired` must refuse
         unless BOTH are fully wired -- recording it with only one checked
@@ -617,6 +661,61 @@ class TestStoreFormStaleVsMismatch(UpdateTestBase):
 
         # A SINGLE --apply must leave the row fully converged -- a re-walk
         # now reports ok, not stale/store-mismatch/store-form-stale.
+        proc2 = run(UPDATE_SH, [], self.home)
+        rows2 = self.table_rows(proc2.stdout)
+        self.assertEqual(rows2[0]["action"], "ok", proc2.stdout)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_a_decide_sh_recorded_symlinked_store_never_needs_a_store_form_cycle(self):
+        """Symlink-review round 3, concern 2: memcontinuum-decide.sh now
+        resolves --store itself (scripts/mc-registry-lib.sh's mc_physical,
+        the same helper repo-init.sh and memcontinuum-update.sh's own
+        overrides already used), so a row it records is never the
+        raw/symlinked-string case store-form-stale/-updated exists to
+        correct after the fact. The fix at the RECORDING site closes the
+        gap for good, rather than relying on --apply to notice and repair
+        it -- not even a single store-form-stale detour, let alone the
+        two-pass shape fix round 2 closed for a row recorded some other
+        way (e.g. round 1's own Python-side registry-mutation test
+        fixture, which still simulates a PRE-this-round row)."""
+        store_link = Path(self.tmp) / "store-link-for-decide"
+        store_link.symlink_to(self.store, target_is_directory=True)
+        self.assertNotEqual(str(store_link), self.store,
+                            "test setup must actually be symlinked")
+
+        # Re-record the SAME row through decide.sh directly, with the
+        # symlinked alias -- exactly as a human typing the path by hand
+        # would (memcontinuum-decide.sh's own documented "wired" flow,
+        # independent of repo-init.sh's --record-decision).
+        proc = run(DECIDE_SH, ["wired", "--repo", self.repo, "--store", str(store_link),
+                               "--project", "proj", "--claude-dir", self.claude_dir,
+                               "--code-root", self.code_root, "--langs", "python",
+                               "--never-ext", ".cs"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        store_real = os.path.realpath(self.store)
+        note = decisions_tsv(self.home).read_text().splitlines()[-1]
+        self.assertIn(f"store={store_real}", note, note)
+        self.assertNotIn(str(store_link), note, note)
+
+        # Make the ENGINE stale too (this whole task's own repo-init.sh
+        # edits are themselves a fingerprint input) -- the row is
+        # fingerprint-stale, but was never store-form-stale to begin with.
+        drifted = self.settings_text().replace(
+            f"MEMCONTINUUM_RENDERED={engine_sha()}", "MEMCONTINUUM_RENDERED=deadbee")
+        Path(self.claude_dir, "settings.local.json").write_text(drifted)
+
+        proc0 = run(UPDATE_SH, [], self.home)
+        rows0 = self.table_rows(proc0.stdout)
+        self.assertEqual(rows0[0]["store-match"], "yes", proc0.stdout)
+        self.assertEqual(rows0[0]["action"], "stale", proc0.stdout)
+        self.assertNotIn("store-form", proc0.stdout, proc0.stdout)
+
+        # ONE --apply, and the store-form machinery is never even
+        # invoked -- the fingerprint re-render is the whole fix.
+        proc = run(UPDATE_SH, ["--apply"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("store-form", proc.stdout, proc.stdout)
+
         proc2 = run(UPDATE_SH, [], self.home)
         rows2 = self.table_rows(proc2.stdout)
         self.assertEqual(rows2[0]["action"], "ok", proc2.stdout)
@@ -2014,26 +2113,22 @@ class TestMultiDirLegacyMigrationRecoversPerDir(unittest.TestCase):
 
 
 class TestMcPhysical(unittest.TestCase):
-    """Direct unit coverage for mc_physical (scripts/memcontinuum-update.sh)
-    -- symlink-review round 1, finding 2. mc_physical has no dependency on
-    anything else the script's top-level body computes, so its definition
-    is extracted verbatim and sourced on its own rather than running the
-    whole CLI (which parses $0's own arguments and walks the registry at
-    the top level -- not sourceable for a pure-function test)."""
+    """Direct unit coverage for mc_physical (scripts/mc-registry-lib.sh --
+    moved here from memcontinuum-update.sh in symlink-review round 3,
+    concern 2, so memcontinuum-decide.sh could reach it too without any new
+    sourcing wired up for either) -- symlink-review round 1, finding 2.
+    mc-registry-lib.sh is a pure library (no top-level CLI execution), so
+    it is safely sourceable on its own."""
 
     def setUp(self):
         self.td = tempfile.mkdtemp(prefix="memcontinuum-mc-physical-test-")
         self.addCleanup(shutil.rmtree, self.td, ignore_errors=True)
-        text = UPDATE_SH.read_text()
-        start = text.index("mc_physical() {")
-        end = text.index("\n}\n", start) + len("\n}\n")
-        self.func_text = text[start:end]
-        self.assertIn("CDPATH=", self.func_text,
-                      "extraction landed on the wrong/old function body")
 
     def _call(self, arg, cdpath, cwd):
         caller = Path(self.td) / "probe.sh"
-        caller.write_text(f'#!/usr/bin/env bash\n{self.func_text}\nmc_physical "$1"\n')
+        caller.write_text(
+            f'#!/usr/bin/env bash\n. "{REGISTRY_LIB}"\nmc_physical "$1"\n'
+        )
         env = dict(os.environ)
         env["CDPATH"] = cdpath
         proc = subprocess.run(

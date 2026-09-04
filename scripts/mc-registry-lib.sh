@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # mc-registry-lib.sh -- shared, pure-bash helpers for the machine-level
 # decision registry. Sourced by memcontinuum-decide.sh, memcontinuum-state.sh,
-# and hooks/memcontinuum-detect.sh -- never executed standalone.
+# hooks/memcontinuum-detect.sh, memcontinuum-update.sh, and repo-init.sh --
+# never executed standalone.
 #
 # Kills the fragment that used to be triplicated three ways (repo-key
 # derivation, decisions.tsv parsing, the wired-hooks scan) and that drifted
@@ -63,6 +64,45 @@ mc_repo_key() {
     fi
     MC_REPO_KEY="$(printf '%s' "$MC_REPO_KEY" | tr '\t\n' '__')"
     return 0
+}
+
+# mc_physical PATH -- resolves PATH to its physical (symlink-free) form via
+# `cd -P && pwd -P`, matching repo-init.sh's abspath()/no-git-default fix
+# (Ruling 89: os.path.realpath / `pwd -P`, not os.path.abspath / raw $PWD).
+# Moved here from memcontinuum-update.sh (symlink-review round 3, concern 2:
+# memcontinuum-decide.sh recorded --store raw, never resolving it, while
+# every OTHER recording site -- repo-init.sh's own --store/--code-root,
+# memcontinuum-update.sh's migration overrides -- already does; every path
+# a --record-decision-shaped write puts into the registry must go through
+# the SAME resolution, so this now lives where both `memcontinuum-decide.sh`
+# and `memcontinuum-update.sh` already source it, with no new sourcing wired
+# up for either -- see those two files' own headers). Falls back to the raw
+# PATH when it does not resolve (does not exist yet, etc.) -- a value that
+# was never going to be usable anyway, unchanged behavior.
+#
+# `CDPATH=` (symlink-review round 1, finding 2): with CDPATH set in the
+# operator's environment and a RELATIVE PATH that CDPATH resolves, bash's
+# `cd` builtin itself prints the matched directory to stdout (POSIX-
+# documented CDPATH behavior) BEFORE `pwd -P` runs, so the command
+# substitution would capture two newline-joined lines instead of one,
+# corrupting the value this function returns. Clearing CDPATH for just
+# this `cd` (not globally -- a local assignment on the command itself)
+# closes it while changing nothing about the resolution itself. Reproduced
+# and verified fixed directly:
+#   CDPATH=/tmp/cdpathbase; cd /tmp && (cd sub && pwd -P)       # two lines
+#   CDPATH=/tmp/cdpathbase; cd /tmp && (CDPATH= cd sub && pwd -P) # one line
+#
+# Never call with an empty PATH: `cd ""` is a silent no-op in bash (stays in
+# the current directory), so this would return the CALLER's own cwd instead
+# of failing -- every caller here guards with `[ -n "$val" ]` first.
+mc_physical() {
+    local p
+    p="$(CDPATH= cd "$1" 2>/dev/null && pwd -P)"
+    if [ -n "$p" ]; then
+        printf '%s' "$p"
+    else
+        printf '%s' "$1"
+    fi
 }
 
 # mc_registry_lookup DECISIONS_FILE KEY

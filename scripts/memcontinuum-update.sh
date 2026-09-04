@@ -803,41 +803,11 @@ join_semi() {
     printf '%s' "$out"
 }
 
-# mc_physical PATH -- resolves PATH to its physical (symlink-free) form via
-# `cd -P && pwd -P`, matching repo-init.sh's abspath()/no-git-default fix
-# (Ruling 89: os.path.realpath / `pwd -P`, not os.path.abspath / raw $PWD).
-# A --code-root/--claude-dir OVERRIDE the human types here on the command
-# line (migrate mode / a legacy row's first claude-dir) flows straight into
-# the registry row this command writes via decide.sh -- unresolved, it
-# would disagree with what repo-init.sh itself bakes into the rendered hook
-# line for the very same re-render this command drives, the same
-# registry-vs-rendered divergence class Ruling 89 fixed for repo-init.sh's
-# own --store/--code-root. Falls back to the raw PATH when it does not
-# resolve (does not exist, etc.) -- repo-init.sh's own --code-root
-# existence check refuses a nonexistent root before a value from here could
-# ever reach the registry, so the fallback only ever surfaces in an error
-# message, never a written row.
-#
-# `CDPATH=` (symlink-review round 1, finding 2): with CDPATH set in the
-# operator's environment and a RELATIVE PATH that CDPATH resolves, bash's
-# `cd` builtin itself prints the matched directory to stdout (POSIX-
-# documented CDPATH behavior) BEFORE `pwd -P` runs, so the command
-# substitution would capture two newline-joined lines instead of one,
-# corrupting the value this function returns. Clearing CDPATH for just
-# this `cd` (not globally -- a local assignment on the command itself)
-# closes it while changing nothing about the resolution itself. Reproduced
-# and verified fixed directly:
-#   CDPATH=/tmp/cdpathbase; cd /tmp && (cd sub && pwd -P)       # two lines
-#   CDPATH=/tmp/cdpathbase; cd /tmp && (CDPATH= cd sub && pwd -P) # one line
-mc_physical() {
-    local p
-    p="$(CDPATH= cd "$1" 2>/dev/null && pwd -P)"
-    if [ -n "$p" ]; then
-        printf '%s' "$p"
-    else
-        printf '%s' "$1"
-    fi
-}
+# mc_physical now lives in scripts/mc-registry-lib.sh (symlink-review round
+# 3, concern 2 -- memcontinuum-decide.sh needed it too, and mc-registry-lib.sh
+# is the one file both this script and memcontinuum-decide.sh already
+# source, so moving it there needed no new sourcing wired up for either).
+# See that file's own doc comment.
 
 # mc_note_replace_field NOTE KEY NEW_VALUE
 #
