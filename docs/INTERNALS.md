@@ -917,9 +917,26 @@ forever after a backend change — a one-way door. Bumping a row's
 language's files.
 
 For a tree-sitter row the payload is wider:
-`backend:module:runtime_pin:grammar_module:grammar_pin:query_fingerprint:impl_version`,
+`backend:module:engine_version:runtime_pin:grammar_module:grammar_pin:query_fingerprint:row_shape:impl_version`,
 where `query_fingerprint` is the first 12 hex of a sha256 over the row's
-`.scm` query file's own bytes. `runtime_pin` and `grammar_pin` are the
+`.scm` query file's own bytes.
+
+`engine_version` is `chunkers/treesitter.py`'s own `ENGINE_VERSION`. One
+generic module produces the chunks for all seven tree-sitter rows, so a
+behavior change inside it — the dedup passes, qualification, kind
+resolution, doc extraction, signature rendering — changes stored chunk
+content for every one of those languages at once. Bumping it is the one
+knob that invalidates all of them together; bumping seven `impl_version`s
+by hand is the step someone forgets.
+
+`row_shape` is `treesitter.row_shape(row)`: a sorted, stable rendering of
+the row's own chunk-shaping data — `containers` (which drives every
+`qualified_name`), `method_if_ancestor_in` (which drives `kind`),
+`doc_comment_types` and `max_bytes`. Sorted rather than as-written so
+reordering a row's containers does not force a rechunk while adding,
+removing or repointing one does.
+
+`runtime_pin` and `grammar_pin` are the
 **pinned** version strings
 `LANGUAGE_TABLE` declares — read straight off the row, never off whatever
 package version is actually importable in this python — so the fingerprint
@@ -998,12 +1015,20 @@ keeping the highest-priority kind (constructor, then accessor, then
 method/function; ties keep the first-seen entry). `dedup_nested` then
 resolves a DIFFERENT-span containment — an export wrapper's outer node
 capturing the same callable as the inner definition node it wraps — keeping
-the innermost match and dropping an outer one only when it shares BOTH the
-same symbol AND the same kind as an already-kept inner match. A containing
-span with a different symbol is never touched by this rule: a legitimately
-nested callable (a function inside a function, a method inside a class
-inside a function) shares neither symbol nor the trigger by construction, so
-every level survives as its own chunk with its own in-file qualification.
+the innermost match and dropping an outer one only when three things hold
+together: the two share a **qualified name**, they share a **kind**, and
+their **node types differ**.
+
+The node-type clause is what separates a wrapper from a nesting. A wrapper
+node is a different node type from the definition it wraps
+(`export_statement` around `function_declaration`), while a definition
+directly inside another definition of the same node type is a legitimately
+nested callable. So `function f(){ function f(){} }` yields two chunks even
+though both levels carry the same symbol and the same qualified name — a
+function body is not a qualification container in any row's `containers`
+map, so both qualify to plain `f`. Qualified name rather than bare symbol is
+what separates `class A { m(){ class A { m(){} } } }` into `A.m` and
+`A.A.m`, two chunks with two names.
 
 ### Parse safety: a byte cap, not a timeout
 

@@ -781,6 +781,110 @@ class TestTreeSitterFingerprint(unittest.TestCase):
         finally:
             qpath.write_bytes(original)
 
+    def test_an_unreadable_query_file_never_escapes_the_per_file_guard(self):
+        """Whole-branch review, finding 14. chunker_version is reached from
+        heal_code_index with only a `except KeyError` around it, so an
+        OSError out of query_fingerprint would take down a whole walk over
+        one row's packaging fault. The fingerprint degrades to a sentinel
+        instead; the fault surfaces one step later, inside the guard, as a
+        BackendUnavailable naming the file, and the source file lands in
+        the retryable not-indexed bucket."""
+        chunkers.treesitter.reset_cache()
+        row = chunkers.LANGUAGE_TABLE["javascript"]
+        original = row["query_file"]
+        row["query_file"] = "no-such-query-file.scm"
+        try:
+            cv = chunkers.chunker_version("javascript")
+            self.assertRegex(cv, r"^[0-9a-f]{12}$")
+            self.assertEqual(
+                chunkers.treesitter.query_fingerprint(row),
+                chunkers.treesitter.QUERY_UNREADABLE,
+            )
+            with self.assertRaises(chunkers.BackendUnavailable) as ctx:
+                chunkers.get_chunker("javascript")
+            self.assertIn("no-such-query-file.scm", str(ctx.exception))
+
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td) / "code"
+                root.mkdir()
+                (root / "a.js").write_text("function f(){}\n")
+                db_path = Path(td) / "code.sqlite"
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    rc = code_reindex(root, db_path, project="unreadable-query",
+                                      no_embed=True, lang="javascript")
+                self.assertEqual(rc, 0, out.getvalue() + err.getvalue())
+                self.assertIn("1 not indexed", out.getvalue())
+                conn = memidx.open_code_db(db_path)
+                sha_row = conn.execute(
+                    "SELECT status, reason FROM file_sha WHERE path=?", ("a.js",)
+                ).fetchone()
+                conn.close()
+                self.assertEqual(sha_row["status"], "not-indexed")
+                self.assertIn("no-such-query-file.scm", sha_row["reason"])
+        finally:
+            row["query_file"] = original
+            chunkers.treesitter.reset_cache()
+
+    def test_chunker_version_is_stable_across_two_calls_on_an_unchanged_row(self):
+        for lang in ("javascript", "typescript", "tsx", "java", "php", "rust", "lua"):
+            self.assertEqual(
+                chunkers.chunker_version(lang), chunkers.chunker_version(lang),
+                f"{lang}'s fingerprint must not depend on anything but the row and the query file",
+            )
+
+    def test_chunker_version_changes_when_the_shared_engine_version_changes(self):
+        # Whole-branch review, finding 4: one generic module produces every
+        # tree-sitter row's chunks, so its own version is the knob that
+        # invalidates all of them at once.
+        before = {lang: chunkers.chunker_version(lang)
+                  for lang in ("javascript", "typescript", "tsx", "java", "php", "rust", "lua")}
+        with mock.patch.object(chunkers.treesitter, "ENGINE_VERSION", "probe"):
+            after = {lang: chunkers.chunker_version(lang) for lang in before}
+        for lang in before:
+            self.assertNotEqual(before[lang], after[lang], lang)
+        # Native rows are a different engine and must not move with it.
+        with mock.patch.object(chunkers.treesitter, "ENGINE_VERSION", "probe"):
+            self.assertEqual(chunkers.chunker_version("swift"),
+                             chunkers.chunker_version("swift"))
+
+    def test_chunker_version_changes_with_each_row_shaping_field(self):
+        # containers drives qualified_name, method_if_ancestor_in drives
+        # kind, doc_comment_types drives doc, max_bytes decides whether a
+        # file is chunked at all -- each one changes what a chunk looks
+        # like, so each must change the fingerprint.
+        row = chunkers.LANGUAGE_TABLE["javascript"]
+        before = chunkers.chunker_version("javascript")
+        probes = {
+            "containers": {"class_declaration": "name", "probe_declaration": "name"},
+            "method_if_ancestor_in": frozenset({"probe_item"}),
+            "doc_comment_types": ("comment", "probe_comment"),
+            "max_bytes": 4096,
+        }
+        for field, value in probes.items():
+            original = row.get(field, "<<absent>>")
+            row[field] = value
+            try:
+                self.assertNotEqual(
+                    chunkers.chunker_version("javascript"), before,
+                    f"editing {field} must change javascript's chunker_version",
+                )
+            finally:
+                if original == "<<absent>>":
+                    row.pop(field, None)
+                else:
+                    row[field] = original
+        self.assertEqual(chunkers.chunker_version("javascript"), before)
+
+    def test_row_shape_ignores_the_order_a_row_is_written_in(self):
+        # Sorted, so reordering a row's own containers is not a rechunk.
+        row = dict(chunkers.LANGUAGE_TABLE["typescript"])
+        shuffled = dict(row)
+        shuffled["containers"] = {"internal_module": "name", "class_declaration": "name"}
+        self.assertEqual(
+            chunkers.treesitter.row_shape(row), chunkers.treesitter.row_shape(shuffled)
+        )
+
     def test_typescript_and_tsx_are_independent_cached_instances(self):
         chunkers.treesitter.reset_cache()
         ts_chunker = chunkers.treesitter.for_language("typescript")
@@ -904,60 +1008,140 @@ class TestTreeSitterDedupPriority(unittest.TestCase):
         self.assertEqual(len(deduped), 1)
         self.assertEqual(deduped[0]["kind"], "accessor")
 
-    def test_containing_span_with_the_same_symbol_is_dropped(self):
-        # Ruling 84: an outer wrapper match (e.g. export_statement) and an
-        # inner definition match (e.g. function_declaration) can both name
-        # symbol "Named" with DIFFERENT spans, the outer containing the
-        # inner -- keep only the innermost.
+    def test_wrapper_span_over_the_same_qualified_name_is_dropped(self):
+        # Ruling 84: an outer wrapper match (export_statement) and an
+        # inner definition match (function_declaration) can both name
+        # "Named" with DIFFERENT spans, the outer containing the inner --
+        # keep only the innermost. Two different NODE TYPES is what makes
+        # this a wrapper rather than a nesting.
         entries = [
-            {"key": (0, 50), "kind": "function", "symbol": "Named", "start_line": 1, "end_line": 3},
-            {"key": (7, 45), "kind": "function", "symbol": "Named", "start_line": 1, "end_line": 3},
+            {"key": (0, 50), "kind": "function", "symbol": "Named", "qualified_name": "Named",
+             "node_type": "export_statement", "start_line": 1, "end_line": 3},
+            {"key": (7, 45), "kind": "function", "symbol": "Named", "qualified_name": "Named",
+             "node_type": "function_declaration", "start_line": 1, "end_line": 3},
         ]
         deduped = chunkers.treesitter.dedup_nested(entries)
         self.assertEqual(len(deduped), 1)
         self.assertEqual(deduped[0]["key"], (7, 45))
 
-    def test_containing_span_with_a_different_symbol_is_kept(self):
+    def test_containing_span_with_a_different_qualified_name_is_kept(self):
         # A method inside a class is CONTAINED by the class's own span, but
-        # they name different symbols -- containment alone must never merge
-        # unrelated captures (this is not the same hazard as #2 above).
+        # they name different qualified names -- containment alone must
+        # never merge unrelated captures.
         entries = [
-            {"key": (0, 100), "kind": "function", "symbol": "Outer", "start_line": 1, "end_line": 10},
-            {"key": (10, 40), "kind": "method", "symbol": "Outer.inner", "start_line": 2, "end_line": 4},
+            {"key": (0, 100), "kind": "function", "symbol": "Outer", "qualified_name": "Outer",
+             "node_type": "function_declaration", "start_line": 1, "end_line": 10},
+            {"key": (10, 40), "kind": "method", "symbol": "inner", "qualified_name": "Outer.inner",
+             "node_type": "method_definition", "start_line": 2, "end_line": 4},
         ]
         deduped = chunkers.treesitter.dedup_nested(entries)
         self.assertEqual(len(deduped), 2)
 
-    def test_containing_span_with_the_same_symbol_but_a_different_kind_is_kept(self):
-        # Revision 3, binding addition b: the drop trigger is symbol AND
-        # kind, not symbol alone. Two entries sharing a symbol but
+    def test_containing_span_with_the_same_name_but_a_different_kind_is_kept(self):
+        # Revision 3, binding addition b: the drop trigger includes kind,
+        # not the name alone. Two entries sharing a qualified name but
         # disagreeing on kind (a shape no shipped query actually produces,
         # but the engine rule must not assume that) must both survive --
         # this is the discriminating test proving `and k["kind"] ==
         # e["kind"]` actually gates the drop, not just documents it.
         entries = [
-            {"key": (0, 60), "kind": "function", "symbol": "value", "start_line": 1, "end_line": 5},
-            {"key": (10, 40), "kind": "method", "symbol": "value", "start_line": 2, "end_line": 4},
+            {"key": (0, 60), "kind": "function", "symbol": "value", "qualified_name": "value",
+             "node_type": "export_statement", "start_line": 1, "end_line": 5},
+            {"key": (10, 40), "kind": "method", "symbol": "value", "qualified_name": "value",
+             "node_type": "method_definition", "start_line": 2, "end_line": 4},
+        ]
+        deduped = chunkers.treesitter.dedup_nested(entries)
+        self.assertEqual(len(deduped), 2)
+
+    def test_same_node_type_nesting_is_never_merged(self):
+        # Whole-branch review, finding 2: the discriminating test for the
+        # node-type clause. Two entries agreeing on qualified_name AND kind
+        # AND node type, one containing the other, are a callable nested
+        # inside a same-named callable -- `function f(){ function f(){} }`
+        # -- never a wrapper around a definition. Both levels survive.
+        entries = [
+            {"key": (0, 80), "kind": "function", "symbol": "f", "qualified_name": "f",
+             "node_type": "function_declaration", "start_line": 1, "end_line": 6},
+            {"key": (20, 50), "kind": "function", "symbol": "f", "qualified_name": "f",
+             "node_type": "function_declaration", "start_line": 2, "end_line": 4},
         ]
         deduped = chunkers.treesitter.dedup_nested(entries)
         self.assertEqual(len(deduped), 2)
 
     def test_legitimately_nested_callable_is_never_merged(self):
-        # Revision 3, binding addition b: `function outer(){ function
-        # inner(){} }` -- a nested function inside another function, the
-        # same shape as tests/fixtures/python_corpus/nested_in_method.py's
+        # `function outer(){ function inner(){} }` -- a nested function
+        # inside another function, the same shape as
+        # tests/fixtures/python_corpus/nested_in_method.py's
         # def-inside-a-method case -- must produce TWO chunks, never one.
-        # Different symbols (outer vs inner) already guarantees this via
-        # the symbol check alone; this test documents the shape each
-        # per-language task's own nested-callable fixture (Tasks 3-8)
-        # exercises end to end through the real grammar, not just here in
-        # the abstract.
+        # Different names already guarantee this on their own; this test
+        # documents the shape each per-language task's own nested-callable
+        # fixture (Tasks 3-8) exercises end to end through the real
+        # grammar, not just here in the abstract.
         entries = [
-            {"key": (0, 80), "kind": "function", "symbol": "outer", "start_line": 1, "end_line": 6},
-            {"key": (20, 50), "kind": "function", "symbol": "inner", "start_line": 2, "end_line": 4},
+            {"key": (0, 80), "kind": "function", "symbol": "outer", "qualified_name": "outer",
+             "node_type": "function_declaration", "start_line": 1, "end_line": 6},
+            {"key": (20, 50), "kind": "function", "symbol": "inner", "qualified_name": "inner",
+             "node_type": "function_declaration", "start_line": 2, "end_line": 4},
         ]
         deduped = chunkers.treesitter.dedup_nested(entries)
         self.assertEqual(len(deduped), 2)
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestSameNamedNestingSurvivesTheRealGrammar(unittest.TestCase):
+    """Whole-branch review, finding 2, against the real grammars rather
+    than abstract tuples. Before the fix each of these produced ONE chunk:
+    the outer level -- the one a caller imports -- was dropped and the
+    survivor carried the inner span's line numbers, with status `ok`, no
+    gap and no warning."""
+
+    def _chunks(self, lang, rel, src):
+        chunkers.treesitter.reset_cache()
+        result = chunkers.get_chunker(lang).chunk_file(src, rel)
+        self.assertEqual(result.status, "ok", result.gaps)
+        return result.chunks
+
+    def test_javascript_function_nested_in_a_same_named_function(self):
+        chunks = self._chunks("javascript", "a.js", "function f(){\n  function f(){}\n}\n")
+        # A function body is not a qualification container in javascript's
+        # `containers` map, so both levels qualify to plain "f" -- the
+        # node-type clause, not the name, is what keeps them apart. Line
+        # numbers are what distinguish them to a reader.
+        self.assertEqual(
+            [(c["kind"], c["qualified_name"], c["start_line"]) for c in chunks],
+            [("function", "f", 1), ("function", "f", 2)],
+        )
+
+    def test_rust_fn_nested_in_a_same_named_fn(self):
+        chunks = self._chunks("rust", "a.rs", "fn f(){\n  fn f(){}\n}\n")
+        self.assertEqual(
+            [(c["kind"], c["qualified_name"], c["start_line"]) for c in chunks],
+            [("function", "f", 1), ("function", "f", 2)],
+        )
+
+    def test_javascript_method_in_a_same_named_class_inside_that_method(self):
+        chunks = self._chunks(
+            "javascript", "a.js",
+            "class A {\n  m(){\n    class A {\n      m(){}\n    }\n  }\n}\n",
+        )
+        # Two class_declaration containers nest, so the inner method
+        # qualifies as A.A.m and the outer as A.m -- different names,
+        # and both are their own chunk.
+        self.assertEqual(
+            [(c["kind"], c["qualified_name"], c["start_line"]) for c in chunks],
+            [("method", "A.m", 2), ("method", "A.A.m", 4)],
+        )
+
+    def test_export_default_still_yields_one_chunk(self):
+        # Ruling 84's own case: the shipped queries put both patterns on
+        # the SAME function_declaration span, so dedup_by_priority resolves
+        # it and dedup_nested never sees a containment at all. The fix must
+        # not change this.
+        chunks = self._chunks("javascript", "a.js", "export default function Named(){}\n")
+        self.assertEqual(
+            [(c["kind"], c["qualified_name"]) for c in chunks],
+            [("function", "Named")],
+        )
 
 
 def _tree_sitter_chunk(lang, corpus, name):

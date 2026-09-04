@@ -40,7 +40,11 @@ outer node vs. the inner definition node it wraps) as well as at the
 SAME span with different kinds (a get/set accessor vs. the generic
 method pattern). dedup_by_priority handles the same-span case;
 dedup_nested handles the different-span containment case, run in that
-order in build_chunks.
+order in build_chunks. dedup_nested drops the outer match only when the
+two agree on qualified_name and kind AND their node types differ -- a
+wrapper is a different node type from what it wraps, while a definition
+nested inside a same-type definition is a nested callable and both
+levels survive (see that function's own docstring).
 
 No parse timeout (revision 4, binding ruling 87 -- revision 3's
 signal.alarm mechanism is REMOVED, not merely refined). tree-sitter
@@ -131,6 +135,20 @@ _INSTANCE_CACHE = {}   # lang -> (fingerprint, TreeSitterChunker)
 
 DEFAULT_MAX_PARSE_BYTES = 1 * 1024 * 1024   # 1 MiB
 
+# The SHARED engine's own version, hashed into every tree-sitter row's
+# chunker_version (chunkers.chunker_version). One generic module produces
+# the chunks for all seven rows, so a behavior change inside build_chunks /
+# _doc_for / _qualify / _kind_for / _render_signature / the dedup passes
+# changes stored chunk content for EVERY tree-sitter language at once --
+# and a file already in an index is skipped on a sha + chunker_version
+# match, so without this knob it would keep serving pre-change chunks
+# forever. A row's own `impl_version` cannot do this job: it invalidates
+# one language, and bumping seven of them by hand is a step someone
+# forgets. Bump this by one whenever the shared engine's OUTPUT changes;
+# leave it alone for a comment, a docstring, or a refactor that provably
+# produces identical chunks.
+ENGINE_VERSION = "1"
+
 
 class TreeSitterFileTooLarge(Exception):
     """Revision 4, binding ruling 87 (replaces the removed
@@ -159,15 +177,60 @@ def max_parse_bytes(row):
     return DEFAULT_MAX_PARSE_BYTES
 
 
+QUERY_UNREADABLE = "query-unreadable"
+
+
 def query_fingerprint(row):
     """sha256[:12] of the row's query file's bytes -- reads off disk only,
     NEVER imports the grammar (chunker_version must compute this even when
     the wheel is missing -- M2a binding point 1: a not-indexed row still
     stores its chunker_version). `query_file` is always a plain string
     (ruling 83 removed the only multi-file row, revision 1's dict-shaped
-    `typescript`)."""
-    with open(os.path.join(QUERY_DIR, row["query_file"]), "rb") as f:
-        return hashlib.sha256(f.read()).hexdigest()[:12]
+    `typescript`).
+
+    A query file this process cannot read yields the fixed sentinel
+    QUERY_UNREADABLE instead of raising. chunker_version is reached from
+    places that sit OUTSIDE code-reindex's per-file guard --
+    heal_code_index computes one per file with only a `except KeyError`
+    around it -- so an OSError here would take down a whole walk over a
+    packaging fault in one row. The fault still surfaces, one step later
+    and inside the guard: for_language opens the same file and wraps the
+    failure as BackendUnavailable naming it, so the file lands in the
+    retryable not-indexed bucket with a reason a human can act on. That is
+    the same shape a missing grammar wheel takes, and the same remedy --
+    repair the install, run again."""
+    try:
+        with open(os.path.join(QUERY_DIR, row["query_file"]), "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:12]
+    except OSError:
+        return QUERY_UNREADABLE
+
+
+def row_shape(row):
+    """The row fields the SHARED engine reads at chunk time, rendered as
+    one stable string for chunker_version's payload.
+
+    `containers` drives every qualified_name (_qualify's ancestor walk),
+    `method_if_ancestor_in` drives kind (_kind_for), `doc_comment_types`
+    drives the doc field (_doc_for) and `max_bytes` decides which files
+    are chunked at all. Editing any of them changes what a row's chunks
+    look like, so each belongs in the fingerprint that decides whether an
+    already-indexed file is re-chunked.
+
+    Sorted, not as-written: a dict's repr follows insertion order and a
+    frozenset's follows its hash layout, so an unsorted rendering would
+    make the fingerprint depend on the order someone typed the row in --
+    or, for a frozenset, on nothing reproducible at all. Reordering a
+    row's containers without changing the set must not force a rechunk;
+    adding, removing or repointing one must."""
+    containers = ",".join(
+        "%s=%s" % (k, v) for k, v in sorted(row.get("containers", {}).items())
+    )
+    ancestors = ",".join(sorted(row.get("method_if_ancestor_in", ())))
+    doc_types = ",".join(sorted(row.get("doc_comment_types", ("comment",))))
+    return "containers{%s};method_if_ancestor_in{%s};doc_comment_types{%s};max_bytes{%s}" % (
+        containers, ancestors, doc_types, row.get("max_bytes"),
+    )
 
 
 def for_language(lang):
@@ -229,20 +292,34 @@ def dedup_nested(entries):
     """Ruling 84: two DIFFERENT-span matches can still capture what a
     human reads as ONE callable -- an export-wrapper's outer node (e.g.
     `export_statement`) vs. the inner definition node it wraps (e.g.
-    `function_declaration`), both naming the same symbol AND the same
-    kind. Keep the INNERMOST match; drop any match whose span CONTAINS an
-    already-kept match's span AND names the SAME SYMBOL AND THE SAME KIND
-    (revision 3, binding addition b -- kind is now part of the trigger,
-    not just symbol: a wrapper/inner pair is always the same kind in
-    every query this plan ships, so requiring both is strictly safer and
-    catches nothing extra by accident). A containing span with a
-    DIFFERENT symbol -- most importantly a LEGITIMATELY NESTED callable,
-    `function outer(){ function inner(){} }` or a method inside a class
-    inside a function -- is NEVER touched: containment alone is not the
-    trigger, same-symbol-and-kind containment is, so both `outer` and
-    `inner` (or the class's own method) survive as their own chunks with
-    their own in-file qualification. Runs AFTER dedup_by_priority, which
-    already resolved every same-span collision.
+    `function_declaration`). Keep the INNERMOST match; drop a match whose
+    span CONTAINS an already-kept match's span when all three of these
+    hold as well:
+
+      * the two share a QUALIFIED NAME. Not a bare symbol: two callables
+        can be genuinely different and still be spelled the same, and the
+        qualified name is what distinguishes them. `class A { m(){ class
+        A { m(){} } } }` yields `A.m` and `A.A.m` -- two names, two
+        chunks.
+      * the two share a KIND. A wrapper/inner pair is always the same
+        kind in every query this repo ships, so requiring it is strictly
+        safer and catches nothing extra by accident.
+      * the two have DIFFERENT NODE TYPES. This is what separates a
+        wrapper from a nesting. A wrapper node is by definition a
+        different node type from the definition it wraps
+        (`export_statement` around `function_declaration`); a definition
+        directly inside another definition of the SAME node type is a
+        nested callable, never a wrapper. `function f(){ function f(){}
+        }` is two `function_declaration`s -- both survive, even though
+        neither the symbol nor the qualified name tells them apart (a
+        function body is not a qualification container in any row's
+        `containers` map, so both qualify to plain `f`).
+
+    Without the node-type clause the outer level of a same-named nesting
+    was dropped and the survivor carried the inner span's line numbers --
+    the outer `f`, the one a caller imports, vanished from the index with
+    no gap and no warning. Runs AFTER dedup_by_priority, which already
+    resolved every same-span collision.
 
     Revision 4, binding ruling 88 fix: the comparison direction MUST be
     "does the CURRENT (larger, since we process ascending-by-size) entry
@@ -253,22 +330,25 @@ def dedup_nested(entries):
     under ascending-size processing, every already-kept entry's span is
     always <= the current entry's span by construction, so that direction
     could only ever fire on an exact-span duplicate (already excluded by
-    the `!=` guard) and was a structural no-op: verified by running that
-    exact revision-3 function body against this file's own first unit
-    test and getting `len(deduped) == 2`, not the `1` the test asserts.
-    The runnable probe below (Step 1) reproduces both the bug and the fix
-    against the real grammar, not just these abstract tuples."""
+    the `!=` guard) and was a structural no-op.
+
+    `node_type` is read with `.get`, so an entry built without one (the
+    abstract-tuple unit tests) simply never triggers the drop rather than
+    raising."""
     ordered = sorted(entries, key=lambda e: (e["key"][1] - e["key"][0]))
     kept = []
     for e in ordered:
         s, en = e["key"]
-        contains_a_kept_entry = any(
+        wraps_a_kept_entry = any(
             s <= ks and ke <= en and (ks, ke) != (s, en)
-            and k["symbol"] == e["symbol"] and k["kind"] == e["kind"]
+            and k["qualified_name"] == e["qualified_name"]
+            and k["kind"] == e["kind"]
+            and k.get("node_type") is not None
+            and k.get("node_type") != e.get("node_type")
             for k in kept for ks, ke in [k["key"]]
         )
-        if contains_a_kept_entry:
-            continue   # e is the OUTER (larger) match of an already-kept inner one -- drop it
+        if wraps_a_kept_entry:
+            continue   # e is the WRAPPER (larger) match of an already-kept inner one -- drop it
         kept.append(e)
     return kept
 
@@ -414,6 +494,7 @@ def build_chunks(lang, row, data, root, matches):
             "kind": resolved_kind,
             "symbol": symbol,
             "qualified_name": qualified_name,
+            "node_type": kind_node.type,   # dedup_nested's wrapper-vs-nesting test
             "node": kind_node,
             "doc_node": doc_anchor_node if doc_anchor_node is not None else kind_node,
         })

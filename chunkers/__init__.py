@@ -69,18 +69,16 @@ LANGUAGE_TABLE = {
     "java": {"backend": "tree-sitter", "module": "chunkers.treesitter",
              "grammar_module": "tree_sitter_java", "language_fn": "language",
              "runtime_pin": "0.26.0", "grammar_pin": "0.23.5",
-             # impl_version "1"->"2" (fix round 1, finding 5): doc_comment_types
-             # is NOT part of chunker_version's shared tree-sitter fingerprint
-             # payload (backend/module/runtime_pin/grammar_module/grammar_pin/
-             # query_fingerprint/impl_version -- see chunker_version() below),
-             # by design (adding it there would force every OTHER language's
-             # chunker_version to change too). impl_version is the existing,
-             # per-row escape hatch for exactly this: a java chunk's `doc`
-             # field now reads real Javadoc/line-comment text it never did
-             # before, so this row alone needs to force a fresh rechunk of any
-             # already-indexed java file. Free right now (no live index
-             # contains java rows yet -- java was first wired this task); the
-             # cost would only grow once a real --add-lang java rollout exists.
+             # impl_version stands at "2" from the fix round that taught this
+             # row to read real Javadoc/line-comment text into a chunk's `doc`
+             # field. That bump is no longer the mechanism it was: whole-branch
+             # review finding 4 folded doc_comment_types (and containers,
+             # method_if_ancestor_in, max_bytes) into chunker_version's payload
+             # through treesitter.row_shape, so editing any of them invalidates
+             # this row on its own. The value stays as it is because lowering it
+             # would only re-collide with a fingerprint some index may already
+             # hold; impl_version remains the per-row escape hatch for a change
+             # no other field in the payload can express.
              "query_file": "java.scm", "impl_version": "2",
              "extensions": (".java",), "shebangs": (),
              "skip_dirs": frozenset({"target", "build", "dist"}),
@@ -113,9 +111,9 @@ LANGUAGE_TABLE = {
              # (`outer_doc_comment_marker`, `doc_comment`) carry the `///`
              # marking internally, so the row-level override below is what
              # makes ANY comment (doc or plain) reach a rust chunk's `doc`
-             # field at all -- first wiring, no live index exists yet, so
-             # no impl_version bump is needed (unlike java's Task 6 fix,
-             # which retrofitted an already-shipped row).
+             # field at all. This field is part of chunker_version's payload
+             # (treesitter.row_shape), so editing it invalidates this row's
+             # indexed files on its own.
              "doc_comment_types": ("line_comment", "block_comment")},
     "lua": {"backend": "tree-sitter", "module": "chunkers.treesitter",
             "grammar_module": "tree_sitter_lua", "language_fn": "language",
@@ -234,15 +232,27 @@ def chunker_version(lang):
 
     Reads LANGUAGE_TABLE fresh on every call (no caching) so a patched
     impl_version is reflected immediately.
+
+    A tree-sitter row's payload is wider, because a tree-sitter row's
+    output depends on more than its own module name: the shared engine's
+    ENGINE_VERSION (one generic module produces every tree-sitter row's
+    chunks, so its behavior changes all seven at once), the pinned runtime
+    and grammar versions, the query file's bytes, and the row's own
+    chunk-shaping data through treesitter.row_shape -- containers,
+    method_if_ancestor_in, doc_comment_types, max_bytes. Everything that
+    changes what a chunk looks like is in here; `impl_version` remains the
+    per-row escape hatch on top for anything that is not.
     """
     row = LANGUAGE_TABLE[lang]
     if row["backend"] == "native":
         payload = f"{row['backend']}:{row['module']}:{row['impl_version']}"
     elif row["backend"] == "tree-sitter":
         from . import treesitter
-        payload = (f"{row['backend']}:{row['module']}:{row['runtime_pin']}:"
+        payload = (f"{row['backend']}:{row['module']}:{treesitter.ENGINE_VERSION}:"
+                   f"{row['runtime_pin']}:"
                    f"{row['grammar_module']}:{row['grammar_pin']}:"
-                   f"{treesitter.query_fingerprint(row)}:{row['impl_version']}")
+                   f"{treesitter.query_fingerprint(row)}:{treesitter.row_shape(row)}:"
+                   f"{row['impl_version']}")
     else:
         payload = f"{row['backend']}:{row.get('module','?')}:{row.get('impl_version','?')}"
     return hashlib.sha256(payload.encode()).hexdigest()[:12]
