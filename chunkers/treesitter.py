@@ -244,7 +244,7 @@ def pinned_vs_installed(row):
     distributions a tree-sitter row's output depends on: the shared
     `tree-sitter` runtime and the row's own grammar wheel. One list, read by
     both `chunkers.chunker_version` (which hashes the installed halves) and
-    `chunkers.pin_drift` (which compares the two halves), so the pair of
+    `chunkers.pin_mismatch` (which compares the two halves), so the pair of
     distributions is named in exactly one place."""
     return [
         (RUNTIME_DISTRIBUTION, row["runtime_pin"], installed_version(RUNTIME_DISTRIBUTION)),

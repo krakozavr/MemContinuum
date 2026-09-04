@@ -10,14 +10,19 @@
   Swift and Python. TypeScript and TSX are two separate `--lang` values
   sharing one grammar: `--lang typescript` covers `.ts`, `.tsx` files need
   `--lang tsx`, and the census proposes each on its own.
-  `backend-preflight` reports which language backends import in this
-  python, by name; a file a backend cannot chunk is recorded not-indexed
-  rather than dropped, and is retried automatically once the missing
-  grammar is installed.
-- One difference from the native pair, because a tree-sitter grammar wheel
-  is an optional dependency: where a grammar is not installed, the linter's
-  `#symbol` check reports a warning naming the missing wheel and leaves the
-  record valid, instead of failing on a symbol it cannot read.
+  `backend-preflight` reports each language backend by name in one of three
+  states -- `ok`, `pin-mismatch` (the backend runs, but its grammar wheel or
+  the tree-sitter runtime is installed at a version the pins do not name,
+  and the report gives both versions), or `missing`. A file a backend cannot
+  chunk is recorded not-indexed rather than dropped, and is retried
+  automatically once the missing grammar is installed.
+- The linter's `#symbol` check separates "not there" from "I cannot tell".
+  Three things leave a file unreadable -- a grammar wheel that is not
+  installed, a file over the per-file byte cap, and a file that does not
+  parse, the last two including Python, where no grammar wheel is involved
+  at all. Each is a warning that names the reason and the remedy for that
+  reason, and the record stays valid; a hard error is reserved for a symbol
+  a readable file proves absent.
 
 ## [0.2.0rc2] — 2026-09-03
 

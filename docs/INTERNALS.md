@@ -978,8 +978,8 @@ language marked current across the swap. Reading the metadata never imports
 the wheel, so `chunker_version` still answers on a machine that has none — an
 absent distribution contributes the fixed token `absent`, and
 `BackendUnavailable` out of `get_chunker` stays the only report of a missing
-wheel. `backend-preflight` names the same mismatch as `drift` (below) for a
-human, with both versions.
+wheel. `backend-preflight` names the same mismatch as `pin-mismatch` (below)
+for a human, with both versions.
 
 The **effective** per-file byte cap joins them — `max_parse_bytes(row)`, the
 row's own `max_bytes` or `MEMCONTINUUM_MAX_PARSE_BYTES` or the 1 MiB default,
