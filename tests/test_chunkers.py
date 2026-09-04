@@ -1181,7 +1181,8 @@ class TestTreeSitterFingerprint(unittest.TestCase):
         row = dict(chunkers.LANGUAGE_TABLE["typescript"])
         shuffled = dict(row)
         shuffled["containers"] = {"module": "name", "internal_module": "name",
-                                  "class_declaration": "name"}
+                                  "class_declaration": "name",
+                                  "abstract_class_declaration": "name"}
         self.assertEqual(
             chunkers.treesitter.row_shape(row), chunkers.treesitter.row_shape(shuffled)
         )
@@ -1835,7 +1836,10 @@ class TestTypeScriptExtraction(unittest.TestCase):
         `private hidden()` keeps its keyword-less one (second gate finding
         4 -- `private` is a modifier, so that name was never the problem);
         and an object literal's method carries the binding that names it
-        (external gate finding 3)."""
+        (external gate finding 3); `abstract class A {}` qualifies what it
+        holds exactly as `class A {}` does -- it is a different node type,
+        abstract_class_declaration, that was missing from this row's
+        containers (external-gate report residual 9)."""
         result = self._chunk("module_and_members.ts")
         self.assertEqual((result.status, result.gaps), ("ok", []))
         got = sorted((c["kind"], c["symbol"], c["qualified_name"]) for c in result.chunks)
@@ -1845,6 +1849,7 @@ class TestTypeScriptExtraction(unittest.TestCase):
             ("function", "volume", "Solids.volume"),  # namespace M {}
             ("method", "get", "api.get"),             # const api = { get(){} }
             ("method", "hidden", "Box.hidden"),       # private hidden()
+            ("method", "m2", "A.m2"),                 # abstract class A { m2(){} }
             ("method", "secret", "Box.secret"),       # #secret()
         ])
 

@@ -46,7 +46,7 @@ from __future__ import annotations
 
 import ast
 
-from chunkers import ChunkResult
+from chunkers import ChunkingFailed, ChunkResult
 
 # ---------------------------------------------------------------------------
 # expression rendering (annotations, defaults) -- bounded, ast.unparse-free
@@ -303,12 +303,24 @@ def declared_symbols(text: str) -> list:
     Returns `(symbol, qualified_name)` pairs in source order,
     de-duplicated (a `@property`/`@x.setter` pair share one qualified_name,
     e.g. `Gadget.value` from two separate defs -- listing it once is enough
-    for a vocabulary check). On a syntax error, returns `[]` -- fail-open,
-    matching chunk_file's `status="failed"` case (no exception escapes)."""
+    for a vocabulary check). On a syntax error, RAISES `chunkers.ChunkingFailed`
+    instead of returning `[]` -- the same registry-wide "this file could not
+    be read" signal chunkers.treesitter.TreeSitterChunker.declared_symbols
+    uses (external gate finding 7; this backend was left out of that fix and
+    is the follow-up round's honesty fix). An empty list means "this file
+    parsed, and it declares no callables" -- a file this backend could not
+    even parse must not return that: memidx.fragment_declared_in_text's
+    generic `except Exception` around every backend's declared_symbols call
+    already turns any exception here into the tri-state's "uncheckable"
+    verdict (None, reason), which memlint reports as a WARNING naming the
+    reason rather than a hard ERROR on a record that may be perfectly
+    correct -- the same net chunk_file's own `status="failed"` case already
+    reports through result.status; this is that same fact told to the
+    OTHER contract method, which used to disagree with it silently."""
     try:
         tree = ast.parse(text)
-    except (SyntaxError, ValueError):
-        return []
+    except (SyntaxError, ValueError) as exc:
+        raise ChunkingFailed(f"python: {type(exc).__name__}: {exc}") from exc
 
     records = _walk_defs(tree)
     seen: set = set()

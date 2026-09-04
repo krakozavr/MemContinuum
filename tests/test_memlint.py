@@ -620,5 +620,84 @@ class TestMissingGrammarWheelIsAWarningNotAnError(unittest.TestCase):
         self.assertIn("TreeSitterFileTooLarge", named[0])
 
 
+class TestPythonSyntaxErrorIsAWarningNotAnError(unittest.TestCase):
+    """Follow-up round, external-fix-report residual 6: chunkers.python_ast
+    (the native backend, no grammar wheel involved at all) returned `[]`
+    from `declared_symbols` for a file it could not even parse -- the same
+    dishonesty class TestMissingGrammarWheelIsAWarningNotAnError's
+    over-the-cap case already fixed for tree-sitter (external gate finding
+    7), just never carried to the native backends. `[]` reads as "this file
+    parsed and declares nothing", so a `.py#symbol` reference into a file
+    with a genuine syntax error used to fail the lint on a record that may
+    be perfectly correct -- the symbol below really is declared in the
+    fixture text; a syntax error two lines later is what breaks the parse.
+
+    No grammar-wheel shim needed here (python_ast has none to shim) --
+    the syntax error itself is the failure this test drives."""
+
+    PY_SOURCE = (
+        "def widget_loader():\n"
+        "    return 1\n"
+        "\n"
+        "def (:\n"   # syntax error: an unparseable def
+    )
+
+    def _lint(self, ref: str, py_source: str):
+        with tempfile.TemporaryDirectory() as td_str:
+            td = Path(td_str)
+            code_root = td / "code"
+            code_root.mkdir()
+            (code_root / "widget.py").write_text(py_source)
+            (td / "concept.md").write_text(
+                concept_md("CON-py-syntax-error", ref, title="Fixture -- python syntax error")
+            )
+            return memlint.lint_root(td, code_roots=[code_root])
+
+    def test_predicate_is_none_on_a_syntax_error_and_names_it(self):
+        verdict, reason = memidx.fragment_declaration_status(
+            "widget_loader", self.PY_SOURCE, rel_path="widget.py"
+        )
+        self.assertIsNone(verdict)
+        self.assertIn("python", reason)
+        self.assertIn("SyntaxError", reason)
+        # The thin verdict-only wrapper forwards the same None.
+        self.assertIsNone(
+            memidx.fragment_declared_in_text(
+                "widget_loader", self.PY_SOURCE, rel_path="widget.py"
+            )
+        )
+
+    def test_a_parseable_file_still_proves_a_symbol_present_or_absent(self):
+        clean = "def widget_loader():\n    return 1\n"
+        verdict, reason = memidx.fragment_declaration_status(
+            "widget_loader", clean, rel_path="widget.py"
+        )
+        self.assertTrue(verdict)
+        self.assertEqual(reason, "")
+        verdict, _reason = memidx.fragment_declaration_status(
+            "no_such_symbol", clean, rel_path="widget.py"
+        )
+        self.assertFalse(verdict)
+
+    def test_lint_warns_and_stays_clean_with_a_syntax_error(self):
+        errors, warnings = self._lint("widget.py#widget_loader", self.PY_SOURCE)
+        self.assertEqual(
+            [e for e in errors if "widget_loader" in e], [],
+            f"a file that failed to parse must not fail the lint: {errors}",
+        )
+        named = [w for w in warnings if "widget_loader" in w]
+        self.assertEqual(len(named), 1, warnings)
+        self.assertIn("uncheckable", named[0])
+        self.assertIn("SyntaxError", named[0])
+
+    def test_lint_still_errors_on_a_symbol_a_parseable_file_proves_absent(self):
+        clean = "def widget_loader():\n    return 1\n"
+        errors, _warnings = self._lint("widget.py#no_such_symbol", clean)
+        self.assertTrue(
+            any("no_such_symbol" in e for e in errors),
+            f"a parseable file still fails the lint on a genuinely absent symbol: {errors}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

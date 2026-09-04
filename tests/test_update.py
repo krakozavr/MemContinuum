@@ -1182,6 +1182,75 @@ class TestMachineDependencyReconciliation(UpdateTestBase):
             shutil.rmtree(engine_dir, ignore_errors=True)
 
     @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_backend_preflight_drift_is_reported_with_its_own_remedy_line(self):
+        """The `drift` branch at scripts/memcontinuum-update.sh's
+        `backend-preflight --json` consumer (ruling 108's third state) had
+        no test at all: every existing fixture here only ever produces
+        `ok` or `missing` rows on a real python, never `drift`, because
+        drift needs a genuinely mismatched installed version and nothing
+        here perturbs one.
+
+        Same "genuinely new (foreign) path" idiom as
+        test_foreign_python_is_never_pip_installed_into above (managed=0,
+        so the pip-reconciliation block is skipped and only the
+        unconditional `PREFLIGHT_JSON="$(PYTHONPATH= "$MANAGED_PY" "$MEMIDX"
+        backend-preflight --json)"` step below it runs) -- but this shim
+        intercepts the `backend-preflight` invocation itself and hands back
+        canned JSON reporting two drifted rows and one clean one, rather
+        than trying to engineer a real version mismatch through a
+        subprocess. Everything else (`-m pip`, version probes, import
+        checks memcontinuum-setup.sh makes along the way) still execs the
+        real venv python, same as the sibling test."""
+        shim = Path(self.tmp) / "drift-python"
+        shim.write_text(
+            "#!/usr/bin/env bash\n"
+            'if [ "$1" = "-m" ] && [ "$2" = "pip" ]; then\n'
+            "    exit 0\n"
+            "fi\n"
+            'if [ "$2" = "backend-preflight" ]; then\n'
+            "    cat <<'JSONEOF'\n"
+            '{"javascript": {"ok": true, "state": "drift", '
+            '"reason": "tree-sitter-javascript: pinned 0.25.0, installed 9.9.9"}, '
+            '"php": {"ok": true, "state": "drift", '
+            '"reason": "tree-sitter-php: pinned 0.24.1, installed 1.0.0"}, '
+            '"python": {"ok": true, "state": "ok", "reason": null}}\n'
+            "JSONEOF\n"
+            "    exit 0\n"
+            "fi\n"
+            f'exec "{VENV_PYTHON}" "$@"\n'
+        )
+        shim.chmod(0o755)
+        env = clean_env(self.home)
+        env["MEMCONTINUUM_PYTHON"] = str(shim)   # a genuinely foreign path, never seen before
+
+        engine_dir = tempfile.mkdtemp(prefix="memcontinuum-engine-copy-")
+        copy_engine_for_machine_layer(engine_dir)
+        update_sh = Path(engine_dir) / "scripts" / "memcontinuum-update.sh"
+        try:
+            proc = subprocess.run(
+                [MC_BASH, str(update_sh), "--apply", "--machine"],
+                capture_output=True, text=True, timeout=120, env=env, cwd=self.home,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            config_sh = Path(self.home, ".memcontinuum", "config.sh")
+            cfg = config_sh.read_text()
+            self.assertIn("MEMCONTINUUM_VENV_MANAGED=0", cfg.replace('"', "").replace("'", ""))
+            out = proc.stdout + proc.stderr
+            self.assertIn(
+                "machine: WARNING installed versions differ from the pins for: javascript,php",
+                out,
+            )
+            self.assertIn("backend-preflight' for the pinned and installed version of each", out)
+            # The clean row (python) must not show up on either line, and
+            # the missing-wheel remedy ("install the pinned tree-sitter
+            # grammar wheels ... yourself") is a DIFFERENT branch that a
+            # drift-only report must never also print.
+            self.assertNotIn("not available in", out)
+            self.assertNotIn("still missing after reinstall", out)
+        finally:
+            shutil.rmtree(engine_dir, ignore_errors=True)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
     def test_sticky_flag_keeps_managed_true_when_the_same_python_is_reaffirmed(self):
         # Revision 4: covers the specific branch binding addition (d)
         # exists to fix -- an explicit --python naming the EXACT SAME

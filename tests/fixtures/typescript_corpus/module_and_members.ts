@@ -29,3 +29,9 @@ const api = {
     return 3;
   },
 };
+
+abstract class A {
+  m2(): number {
+    return 1;
+  }
+}
