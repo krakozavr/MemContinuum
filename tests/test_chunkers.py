@@ -240,38 +240,74 @@ class TestChunkerSourceFingerprints(unittest.TestCase):
     fails here with instructions. Editing a comment will trip it too --
     that is deliberate. A noisy prompt to think about the version stamp
     costs one golden regeneration; a missed bump costs every project's
-    index silently."""
+    index silently.
 
-    BACKENDS = ("chunkers/swift.py", "chunkers/python_ast.py")
+    Extended (whole-branch review NEW-1): a NATIVE backend module still
+    fingerprints as a bare sha256 of its source, with that row's own
+    impl_version the knob to bump on a real edit -- same as always. A
+    SHARED-ENGINE module -- today only chunkers/treesitter.py, which
+    produces all seven tree-sitter rows' chunks from one generic module --
+    fingerprints as a {sha256, engine_version} PAIR instead. Pinning the
+    hash alone would let someone regenerate the golden after a real edit
+    without also bumping treesitter.ENGINE_VERSION; pinning the pair makes
+    the new ENGINE_VERSION a value that must be typed into the golden diff,
+    so the bump becomes a deliberate, reviewable act rather than an
+    accidental hash regeneration. Before this, nothing here even looked at
+    chunkers/treesitter.py: BACKENDS listed the two native modules only,
+    and the coverage test below filtered to backend == "native" by
+    construction, so the shared engine could never join the golden at all
+    (self-reported by the implementer of finding 4's fix, fix report
+    "Other observations")."""
+
+    NATIVE_BACKENDS = ("chunkers/swift.py", "chunkers/python_ast.py")
+    SHARED_ENGINE_BACKENDS = ("chunkers/treesitter.py",)
 
     @staticmethod
     def _fingerprint(rel):
         return hashlib.sha256((REPO_ROOT / rel).read_bytes()).hexdigest()
 
+    def _golden_entry(self, rel):
+        sha = self._fingerprint(rel)
+        if rel in self.SHARED_ENGINE_BACKENDS:
+            return {"sha256": sha, "engine_version": chunkers.treesitter.ENGINE_VERSION}
+        return sha
+
     def test_backend_sources_match_the_recorded_fingerprints(self):
         with open(FINGERPRINT_GOLDEN_PATH) as f:
             golden = json.load(f)
-        got = {rel: self._fingerprint(rel) for rel in self.BACKENDS}
+        rels = self.NATIVE_BACKENDS + self.SHARED_ENGINE_BACKENDS
+        got = {rel: self._golden_entry(rel) for rel in rels}
         self.assertEqual(
             got, golden,
-            "chunker source changed: bump impl_version AND regenerate the "
-            "fingerprint golden (tests/goldens/chunker_source_fingerprints.json) "
-            "-- if the change cannot alter any chunk this backend emits (a "
-            "comment, a docstring), regenerate the golden alone and say so in "
-            "the commit message.",
+            "chunker source changed: for chunkers/treesitter.py (the shared "
+            "tree-sitter engine -- moves all seven tree-sitter rows at "
+            "once) bump ENGINE_VERSION in chunkers/treesitter.py; for any "
+            "other backend module bump that row's own impl_version in "
+            "chunkers/__init__.py's LANGUAGE_TABLE. Either way, then "
+            "regenerate the fingerprint golden (tests/goldens/"
+            "chunker_source_fingerprints.json) -- if the change provably "
+            "alters no chunk this backend emits (a comment, a docstring), "
+            "regenerate the golden alone and say so in the commit message.",
         )
 
-    def test_the_golden_covers_every_native_backend_in_the_table(self):
-        """A new LANGUAGE_TABLE row must not slip past the tripwire just by
-        not being listed here."""
+    def test_the_golden_covers_every_distinct_backend_module_in_the_table(self):
+        """A new LANGUAGE_TABLE row -- native, or sharing chunkers/treesitter.py
+        (or a future engine module of its own), or a wholly new backend
+        module -- must not slip past the tripwire just by not being listed
+        here."""
         with open(FINGERPRINT_GOLDEN_PATH) as f:
             golden = json.load(f)
         expected = {
             row["module"].replace(".", "/") + ".py"
             for row in chunkers.LANGUAGE_TABLE.values()
-            if row["backend"] == "native"
         }
         self.assertEqual(set(golden), expected)
+        self.assertEqual(
+            set(self.NATIVE_BACKENDS) | set(self.SHARED_ENGINE_BACKENDS), expected,
+            "a new backend module appeared in LANGUAGE_TABLE -- add it to "
+            "NATIVE_BACKENDS or SHARED_ENGINE_BACKENDS above, whichever it "
+            "is, and add its entry to the fingerprint golden.",
+        )
 
 
 class TestImplVersionBumpForcesSwiftRechunk(unittest.TestCase):
@@ -848,11 +884,30 @@ class TestTreeSitterFingerprint(unittest.TestCase):
             self.assertEqual(chunkers.chunker_version("swift"),
                              chunkers.chunker_version("swift"))
 
+    def test_typescript_and_tsx_have_different_chunker_versions(self):
+        # Whole-branch review NEW-3: typescript and tsx share a
+        # grammar_module, grammar_pin, runtime_pin and query_file --
+        # everything chunker_version's payload used to fold in EXCEPT
+        # language_fn ("language_typescript" vs "language_tsx"), the one
+        # field that decides which function of the grammar module actually
+        # parses the file. Before row_shape carried it, the two rows
+        # fingerprinted IDENTICALLY despite parsing the same source
+        # differently. Each is checked stable across two calls too, same
+        # as every row (see test_chunker_version_is_stable_across_two_calls
+        # _on_an_unchanged_row above), named here explicitly since this
+        # pair is what the finding is about.
+        ts = chunkers.chunker_version("typescript")
+        tsx = chunkers.chunker_version("tsx")
+        self.assertNotEqual(ts, tsx)
+        self.assertEqual(ts, chunkers.chunker_version("typescript"))
+        self.assertEqual(tsx, chunkers.chunker_version("tsx"))
+
     def test_chunker_version_changes_with_each_row_shaping_field(self):
         # containers drives qualified_name, method_if_ancestor_in drives
         # kind, doc_comment_types drives doc, max_bytes decides whether a
-        # file is chunked at all -- each one changes what a chunk looks
-        # like, so each must change the fingerprint.
+        # file is chunked at all, language_fn selects which grammar
+        # function actually parses the file (NEW-3) -- each one changes
+        # what a chunk looks like, so each must change the fingerprint.
         row = chunkers.LANGUAGE_TABLE["javascript"]
         before = chunkers.chunker_version("javascript")
         probes = {
@@ -860,6 +915,7 @@ class TestTreeSitterFingerprint(unittest.TestCase):
             "method_if_ancestor_in": frozenset({"probe_item"}),
             "doc_comment_types": ("comment", "probe_comment"),
             "max_bytes": 4096,
+            "language_fn": "probe_language_fn",
         }
         for field, value in probes.items():
             original = row.get(field, "<<absent>>")

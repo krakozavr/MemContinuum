@@ -186,8 +186,8 @@ default because, left lazy, that download lands inside somebody's first reindex,
 where it looks like a hang. `--dry-run` prints the plan and writes nothing.
 
 Run it with neither `--venv` nor `--python`, from a real terminal, and it asks
-which python you want (use one you already have, or let it create the engine
-venv) instead of silently picking for you; a scripted or non-interactive run
+which python you want (use this python, or create or reuse the engine venv)
+instead of silently picking for you; a scripted or non-interactive run
 keeps the create-if-absent default. A venv this step creates is
 engine-managed: `scripts/memcontinuum-update.sh --apply --machine` may
 reinstall `requirements.lock` into it to reconcile the pinned tree-sitter grammar

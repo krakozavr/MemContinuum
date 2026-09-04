@@ -239,9 +239,10 @@ def chunker_version(lang):
     chunks, so its behavior changes all seven at once), the pinned runtime
     and grammar versions, the query file's bytes, and the row's own
     chunk-shaping data through treesitter.row_shape -- containers,
-    method_if_ancestor_in, doc_comment_types, max_bytes. Everything that
-    changes what a chunk looks like is in here; `impl_version` remains the
-    per-row escape hatch on top for anything that is not.
+    method_if_ancestor_in, doc_comment_types, max_bytes, language_fn.
+    Everything that changes what a chunk looks like is in here;
+    `impl_version` remains the per-row escape hatch on top for anything
+    that is not.
     """
     row = LANGUAGE_TABLE[lang]
     if row["backend"] == "native":

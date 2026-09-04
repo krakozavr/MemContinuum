@@ -934,9 +934,14 @@ by hand is the step someone forgets.
 `row_shape` is `treesitter.row_shape(row)`: a sorted, stable rendering of
 the row's own chunk-shaping data — `containers` (which drives every
 `qualified_name`), `method_if_ancestor_in` (which drives `kind`),
-`doc_comment_types` and `max_bytes`. Sorted rather than as-written so
-reordering a row's containers does not force a rechunk while adding,
-removing or repointing one does.
+`doc_comment_types`, `max_bytes`, and `language_fn` (rendered as
+`grammar_module.language_fn`, e.g. `tree_sitter_typescript.language_tsx`).
+Sorted rather than as-written so reordering a row's containers does not
+force a rechunk while adding, removing or repointing one does.
+`language_fn` joined the payload after `typescript` and `tsx` were found to
+fingerprint identically despite calling different functions
+(`language_typescript` vs `language_tsx`) on the same grammar module — same
+`chunker_version`, different parse behavior for the same source.
 
 `runtime_pin` and `grammar_pin` are the
 **pinned** version strings

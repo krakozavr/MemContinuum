@@ -12,6 +12,7 @@ Only the first is covered here; scripts/repo-init.sh has its own file.
 """
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -59,6 +60,33 @@ def run(script, args, home, mc_home, stdin=None, timeout=120):
         input=stdin, capture_output=True, text=True,
         env=clean_env(home, mc_home), timeout=timeout,
     )
+
+
+def copy_setup_engine(dst, include_registry_lib=True):
+    """Copies just the files memcontinuum-setup.sh needs (not memory/,
+    .claude/, fixtures/, tests/) into dst, so a test can run a COPIED
+    checkout without ever touching the real one this suite lives in.
+
+    include_registry_lib=False plants an incomplete checkout missing ONLY
+    scripts/mc-registry-lib.sh (whole-branch review NEW-4). Every other
+    file the script's own completeness gate (memcontinuum-setup.sh:229-231)
+    checks -- hooks/memcontinuum-detect.sh, skills/memcontinuum/SKILL.md,
+    scripts/mc_settings_merge.py -- is still present, so that gate does not
+    fire and the sticky managed-python read is the first thing to notice
+    the missing library."""
+    dst = Path(dst)
+    dst.mkdir(parents=True, exist_ok=True)
+    shutil.copy(SETUP_SH, dst / "memcontinuum-setup.sh")
+    (dst / "memcontinuum-setup.sh").chmod(0o755)
+    (dst / "scripts").mkdir(exist_ok=True)
+    shutil.copy(TOOLS_DIR / "scripts" / "mc_settings_merge.py",
+                dst / "scripts" / "mc_settings_merge.py")
+    if include_registry_lib:
+        shutil.copy(TOOLS_DIR / "scripts" / "mc-registry-lib.sh",
+                    dst / "scripts" / "mc-registry-lib.sh")
+    for name in ("hooks", "skills"):
+        shutil.copytree(TOOLS_DIR / name, dst / name)
+    return dst / "memcontinuum-setup.sh"
 
 
 def git_repo(path):
@@ -1026,6 +1054,41 @@ class TestSkillSnippetResolvesEngineViaPointer(BootstrapCase):
         env = clean_env(self.home)  # no MEMCONTINUUM_HOME at all, like a real assistant shell
         proc = subprocess.run(["bash", "-c", probe], capture_output=True, text=True, env=env)
         self.assertEqual(proc.stdout.strip(), str(TOOLS_DIR), proc.stderr)
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestMissingRegistryLibFailsLoudlyAtStickyRead(BootstrapCase):
+    """Whole-branch review NEW-4(a): the sticky managed-venv read
+    (memcontinuum-setup.sh's `type mc_config_managed_python` guard, right
+    before the mc_config_managed_python call) used to silently skip
+    stickiness when scripts/mc-registry-lib.sh had not loaded -- reachable
+    from an incomplete checkout that still has every OTHER file the
+    script's own completeness gate checks. An engine-created venv would
+    then read unmanaged on its own second refresh, and reconciliation
+    could never fire again: the exact failure stickiness exists to
+    prevent, with no signal to the person running it. The read is now
+    required at that point: a missing library dies loudly, naming
+    scripts/mc-registry-lib.sh, instead of degrading."""
+
+    def test_missing_library_dies_naming_the_script(self):
+        engine = Path(self.tmp) / "engine-no-registry-lib"
+        setup_sh = copy_setup_engine(engine, include_registry_lib=False)
+        proc = run(setup_sh, [
+            "--python", VENV_PYTHON, "--claude-dir", self.claude, "--no-model-warm",
+        ], self.home, self.mc_home)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("scripts/mc-registry-lib.sh", proc.stderr)
+
+    def test_present_library_still_bootstraps_normally(self):
+        # Sanity check the other direction: a COMPLETE copied checkout
+        # (library included) is unaffected by the new gate -- it isn't a
+        # blanket "always die" regression.
+        engine = Path(self.tmp) / "engine-with-registry-lib"
+        setup_sh = copy_setup_engine(engine, include_registry_lib=True)
+        proc = run(setup_sh, [
+            "--python", VENV_PYTHON, "--claude-dir", self.claude, "--no-model-warm",
+        ], self.home, self.mc_home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
 
 if __name__ == "__main__":

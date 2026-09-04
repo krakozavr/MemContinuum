@@ -329,11 +329,16 @@ if [ "$PYTHON_EXPLICIT" -eq 1 ]; then
     # implementation of this read, shared with scripts/memcontinuum-update.sh
     # --machine's reconciliation, which needs exactly the same disk truth for
     # exactly the same reason. See that function for why the read unsets both
-    # names first. Guarded by `type` because this script tolerates a missing
-    # library (see the source line near the top): without it the disk truth is
-    # unreadable, and an unreadable prior record is not a re-affirmation.
-    if type mc_config_managed_python >/dev/null 2>&1 \
-            && mc_config_managed_python "$MEMCONTINUUM_HOME/config.sh"; then
+    # names first. The source line near the top of this script tolerates a
+    # missing library elsewhere (it only costs the machine-layer fingerprint
+    # stamp), but stickiness cannot: silently skipping this read on an
+    # incomplete checkout would make an engine-created venv read unmanaged on
+    # its own SECOND refresh, and reconciliation could then never fire again
+    # -- exactly the failure stickiness exists to prevent (whole-branch review
+    # NEW-4). Required here, loudly, rather than degraded.
+    type mc_config_managed_python >/dev/null 2>&1 \
+        || die "scripts/mc-registry-lib.sh did not load -- incomplete checkout, cannot determine managed-venv stickiness"
+    if mc_config_managed_python "$MEMCONTINUUM_HOME/config.sh"; then
         if [ "$MC_CONFIG_PYTHON" = "$PYTHON_BIN" ] && [ "$MC_CONFIG_MANAGED" = "1" ]; then
             NEW_VENV_MANAGED=1   # re-affirming a venv THIS engine already owns, not a foreign path
         fi

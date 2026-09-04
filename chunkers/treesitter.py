@@ -222,10 +222,21 @@ def row_shape(row):
 
     `containers` drives every qualified_name (_qualify's ancestor walk),
     `method_if_ancestor_in` drives kind (_kind_for), `doc_comment_types`
-    drives the doc field (_doc_for) and `max_bytes` decides which files
-    are chunked at all. Editing any of them changes what a row's chunks
-    look like, so each belongs in the fingerprint that decides whether an
-    already-indexed file is re-chunked.
+    drives the doc field (_doc_for), `max_bytes` decides which files
+    are chunked at all, and `language_fn` selects which function of
+    `grammar_module` actually parses the file. Editing any of them changes
+    what a row's chunks look like, so each belongs in the fingerprint that
+    decides whether an already-indexed file is re-chunked.
+
+    `language_fn` was the one exception until whole-branch review NEW-3:
+    typescript and tsx share one grammar_module but call different
+    functions on it (`language_typescript` vs `language_tsx`), so before
+    this they fingerprinted IDENTICALLY -- same chunker_version -- while
+    parsing the same source differently (`const C = () => <div/>;` is a
+    parse error under typescript, a valid component under tsx). Rendered
+    as "<grammar_module>.<language_fn>" (e.g.
+    "tree_sitter_typescript.language_tsx") so the value names the exact
+    function, not just its bare, collision-prone name.
 
     Sorted, not as-written: a dict's repr follows insertion order and a
     frozenset's follows its hash layout, so an unsorted rendering would
@@ -238,8 +249,10 @@ def row_shape(row):
     )
     ancestors = ",".join(sorted(row.get("method_if_ancestor_in", ())))
     doc_types = ",".join(sorted(row.get("doc_comment_types", ("comment",))))
-    return "containers{%s};method_if_ancestor_in{%s};doc_comment_types{%s};max_bytes{%s}" % (
-        containers, ancestors, doc_types, row.get("max_bytes"),
+    grammar_fn = "%s.%s" % (row.get("grammar_module"), row.get("language_fn"))
+    return ("containers{%s};method_if_ancestor_in{%s};doc_comment_types{%s};"
+            "max_bytes{%s};grammar_fn{%s}") % (
+        containers, ancestors, doc_types, row.get("max_bytes"), grammar_fn,
     )
 
 
