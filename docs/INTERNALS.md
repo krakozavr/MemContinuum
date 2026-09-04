@@ -865,10 +865,28 @@ same suite under a different interpreter.
 ### Registry
 
 `chunkers/` is a backend-neutral registry. `LANGUAGE_TABLE` holds one row per
-language — `{backend, module, extensions, shebangs, impl_version, skip_dirs}` —
-and there is exactly one row per language: exclusivity is structural, with no
-API to register a second backend for an existing language. Backends are imported
-lazily through `get_chunker(lang)`.
+language, and there is exactly one row per language: exclusivity is
+structural, with no API to register a second backend for an existing
+language. Backends are imported lazily through `get_chunker(lang)`.
+
+Two backend kinds share the table. A native backend (`swift`, `python`) is its
+own hand-written module and carries `{backend, module, extensions, shebangs,
+impl_version, skip_dirs}`. A tree-sitter backend (`javascript`, `typescript`,
+`tsx`, `java`, `php`, `rust`, `lua`) is ONE generic module
+(`chunkers/treesitter.py`) driven entirely by each row's own data and a
+per-language `.scm` query file under `chunkers/queries/` — never a
+per-language Python function — and carries those same keys plus
+`grammar_module`, `language_fn`, `runtime_pin`, `grammar_pin`, `query_file`,
+`containers` (the ancestor-walk qualification map), `method_if_ancestor_in`,
+`max_bytes` (optional, absent by default), and `doc_comment_types` (optional,
+defaults to `("comment",)`; java's row sets `block_comment`/`line_comment`,
+rust's sets `line_comment`/`block_comment` — a `///` doc comment is not a
+distinct top-level node type in this grammar; it parses as an ordinary
+`line_comment` node whose own children carry the `///` marking internally).
+`typescript` and `tsx` are two separate rows
+sharing one grammar module and query file but different `language_fn`s
+(`language_typescript` / `language_tsx`) — `get_chunker`/`for_language` still
+take `lang` alone, with no per-file dialect selection anywhere.
 
 The public contract is `chunk_file(text, rel_path) -> ChunkResult`, where
 `ChunkResult` carries `chunks`, `gaps` (`(start_line, end_line, reason)`) and
@@ -891,11 +909,29 @@ language branch on that path.
 ### `chunker_version`
 
 `chunker_version(lang)` is the first 12 hex of a sha256 over
-`backend:module:impl_version`, stored per file in `file_sha` alongside the
-content sha. A file is skipped on reindex only when **both** match. A
-source-sha-only skip would serve chunks from a superseded chunker forever after
-a backend change — a one-way door. Bumping a row's `impl_version` is therefore
-the supported way to force re-chunking of one language's files.
+`backend:module:impl_version` for a native row, stored per file in `file_sha`
+alongside the content sha. A file is skipped on reindex only when **both**
+match. A source-sha-only skip would serve chunks from a superseded chunker
+forever after a backend change — a one-way door. Bumping a row's
+`impl_version` is therefore the supported way to force re-chunking of one
+language's files.
+
+For a tree-sitter row the payload is wider:
+`backend:module:runtime_pin:grammar_module:grammar_pin:query_fingerprint:impl_version`,
+where `query_fingerprint` is the first 12 hex of a sha256 over the row's
+`.scm` query file's own bytes. `runtime_pin` and `grammar_pin` are the
+**pinned** version strings
+`LANGUAGE_TABLE` declares — read straight off the row, never off whatever
+package version is actually importable in this python — so the fingerprint
+changes when the table's own pin changes, not when an unpinned install drifts
+underneath it; a grammar installed at the wrong version is a wiring problem
+`backend-preflight` surfaces, not something `chunker_version` can detect on
+its own, because it never introspects the installed package. `impl_version`
+stays each row's own escape hatch on top of that: bumping it forces a
+re-chunk of one language's files without changing what any other row's
+`chunker_version` computes to, which matters the moment a chunker-behavior
+fix (not a pin change) needs to invalidate only its own already-indexed
+files.
 
 `open_code_db` compares the stored schema version against the current
 one. When the stored version is OLDER, the index is rebuilt on first use,
@@ -917,6 +953,122 @@ own, `open_code_db` refuses the db outright (`CodeIndexTooNew`, a
 `sqlite3.DatabaseError`) rather than silently using or rebuilding it —
 `code-search`/`why` fail open around that refusal (a message, no crash,
 no results) instead of destroying an index a newer engine wrote.
+
+### Tree-sitter capture convention
+
+A query file's capture names carry the whole per-language contract, so the
+generic backend never needs a per-language branch. `@chunk.<kind>` names a
+span and its kind (`function`/`method`/`constructor`/`accessor`); an optional
+`@chunk.name` gives the symbol; an optional `@chunk.qualifier` supplies an
+explicit qualifier prefix in place of the ancestor walk, for a shape with no
+lexical container to walk (Lua's table/method syntax); an optional
+`@chunk.default` marks the export-default case, whose symbol and qualified
+name are both the literal string `default`; an optional `@chunk.doc_anchor`
+names a DIFFERENT node than `@chunk.<kind>` to look for a preceding doc
+comment on, for the one shape where the kind node itself has no sibling of
+its own (Lua's `M.f = function() ... end` binds the kind capture to the
+anonymous function nested inside the assignment; the doc comment sits above
+the assignment statement instead, so that outer node is the anchor). A match
+with neither `@chunk.name` nor `@chunk.default` is dropped — the deferred,
+unbound `closure` kind.
+
+### Interval-taint gaps and dedup
+
+Every tree-sitter chunker shares one gap rule. `_merge_error_intervals`
+collects and merges every `ERROR` node's byte span and every `is_missing`
+token's zero-width position into one sorted interval list — the taint set. A
+capture becomes a gap (reason `parse-error`) when its own node's span
+overlaps one of those intervals, or when its own node is a descendant of an
+`ERROR` node even with no byte overlap. An interval that overlaps no capture
+at all still surfaces as its own gap, derived from its raw byte offsets, so
+garbage between two clean functions with nothing query-shaped nearby is never
+silently absorbed. A file with any error and no surviving chunks at all is
+`failed` outright, not a file of all-gaps `partial` chunks.
+
+Tree-sitter's own error recovery can pull a syntactically clean neighbouring
+definition into the same `ERROR` subtree as a genuinely broken one — observed
+on the TypeScript grammar, after an unclosed bracket — so a file reported
+`partial` is a cue to look at the neighbours of the reported gap line, not
+only the line itself.
+
+Two dedup passes run before gaps are computed, in this order.
+`dedup_by_priority` resolves a SAME-span collision — a get/set accessor also
+matching the generic method pattern, a constructor also matching it —
+keeping the highest-priority kind (constructor, then accessor, then
+method/function; ties keep the first-seen entry). `dedup_nested` then
+resolves a DIFFERENT-span containment — an export wrapper's outer node
+capturing the same callable as the inner definition node it wraps — keeping
+the innermost match and dropping an outer one only when it shares BOTH the
+same symbol AND the same kind as an already-kept inner match. A containing
+span with a different symbol is never touched by this rule: a legitimately
+nested callable (a function inside a function, a method inside a class
+inside a function) shares neither symbol nor the trigger by construction, so
+every level survives as its own chunk with its own in-file qualification.
+
+### Parse safety: a byte cap, not a timeout
+
+A per-file byte cap bounds parse cost instead of a wall-clock timeout:
+`DEFAULT_MAX_PARSE_BYTES` (1 MiB), overridable by the
+`MEMCONTINUUM_MAX_PARSE_BYTES` environment variable, with a language row's
+own `max_bytes` (optional) taking priority over both. The cap is checked
+before a single byte reaches the parser, never during or after — a file over
+it raises before parsing starts and is recorded not-indexed, retried like any
+other not-indexed row on the next explicit `code-reindex` (the automatic heal
+itself only retries a not-indexed row when the backend set or the chunker
+version changed, not on a plain re-run); editing the file down under the cap
+and running `code-reindex` again picks it back up.
+
+A `signal.alarm`-based wall-clock timeout was tried first and measured not to
+bound parse time at all: a registered signal handler only actually runs
+between CPython bytecodes, and a single call into the tree-sitter C
+extension does not return control to the interpreter until it finishes, so
+the OS delivers the alarm on schedule but Python never observes it mid-call.
+Measured directly against one large (30 MB) file: the plain, unguarded parse
+took 8.65s wall time; the same file through the alarm-based mechanism raised
+its "timeout" exception at 11.08s — later than the parse it was meant to cut
+short, not a bound on it. A subprocess-per-file timeout was considered and
+rejected too, not on correctness (it would genuinely bound wall-clock time)
+but on fit: `code-reindex` is an interactive command a person can interrupt,
+no hook ever calls a tree-sitter backend, and forking a process per file
+would dominate a reindex's own runtime for a case the byte cap already
+screens out before parsing is ever attempted.
+
+### `backend-preflight` and grammar admission
+
+`backend-preflight [--json]` attempts `get_chunker(lang)` for every table row
+and reports ok/missing by language, fail-open per row so one backend's own
+import bug never hides the rest of the report. A native row fails only on an
+engine bug of its own; a tree-sitter row fails when its pinned grammar wheel
+is not installed in this python, and the reported reason names that wheel by
+module — the same underlying missing-module reason a `code-reindex` row
+stamps `not-indexed` for when the same backend goes missing mid-run (that
+row's own reason text carries an extra `BackendUnavailable:` wrapper around
+the identical exception), so a not-indexed reason for a tree-sitter language
+usually names the same module this reports. `memcontinuum-update.sh
+--apply --machine` runs this check right after reconciling the engine-managed
+venv and warns by name about any row still missing.
+
+Five of the six grammar wheels (`tree-sitter` itself, the seventh pin, is the
+runtime, not a grammar) come from the official `github.com/tree-sitter/`
+organization; `tree-sitter-lua` is the one exception, published under
+`github.com/tree-sitter-grammars/`. A grammar admitted from outside the
+official org clears five checks — a process rule this doc states as policy,
+not something any code path enforces — before it is wired into the table: an
+MIT/SPDX-clean license, an exact version pin with no floor, a wheel matrix
+that covers every platform this engine ships on (verified by installing and
+importing it on real Mac hardware, not assumed from a PyPI listing), a real
+parse-and-query probe against a fixture rather than a bare import check, and
+fixtures/goldens shipped alongside it. The same five checks admit any future
+non-official-org grammar — this is the reusable rule, not a one-off
+exception for Lua.
+
+`tests/mac_smoke.sh` installs the seven tree-sitter pins by exact version
+into a disposable venv and proves each grammar builds a parser and query and
+parses a real fixture on real Mac hardware — a parser probe, and nothing
+wider. It is not a substitute for the macOS arm64 CI job, which installs the
+full hash-locked `requirements.lock` and runs the whole unit test suite
+(`fastembed`/`onnxruntime` included): a green run of one says nothing about
+the other, and neither reading covers what the other checks.
 
 ### Skip predicate
 

@@ -5414,7 +5414,20 @@ def main(argv=None) -> int:
     p_unmapped.add_argument("--json", action="store_true")
     p_unmapped.set_defaults(func=cmd_unmapped)
 
-    p_code_reindex = sub.add_parser("code-reindex")
+    p_code_reindex = sub.add_parser(
+        "code-reindex",
+        description=(
+            "Walk a code root, chunk every file whose extension resolves to a "
+            "wired language, and store the result. A file the resolved "
+            "backend cannot chunk is recorded not-indexed rather than "
+            "dropped -- run backend-preflight to see which language backends "
+            "import here; a not-indexed reason for a tree-sitter language "
+            "(javascript, typescript, tsx, java, php, rust, lua) usually "
+            "names the missing grammar wheel by its module (e.g. \"No module "
+            "named 'tree_sitter_rust'\"), and the row is retried "
+            "automatically once that wheel is installed."
+        ),
+    )
     add_common_args(p_code_reindex)
     p_code_reindex.add_argument("--code-root", dest="code_root", required=False)
     p_code_reindex.add_argument(
@@ -5478,6 +5491,14 @@ def main(argv=None) -> int:
     p_preflight = sub.add_parser(
         "backend-preflight",
         help="report which chunker backends can import here, by language",
+        description=(
+            "Attempts to import each registered language's chunker backend "
+            "and reports ok/missing per language. A native backend (swift, "
+            "python) fails only on an engine bug of its own; a tree-sitter "
+            "backend (javascript, typescript, tsx, java, php, rust, lua) "
+            "fails when its pinned grammar wheel is not installed in this "
+            "python -- the reported reason names that wheel."
+        ),
     )
     p_preflight.add_argument("--json", action="store_true")
     p_preflight.set_defaults(func=cmd_backend_preflight)

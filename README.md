@@ -412,8 +412,10 @@ it with `--code-root`, `--langs` and `--set-never-ext` on the command line.
 ## Languages
 
 The code index handles **Swift and Python**, both natively — Swift with a tuned
-walker, Python with the standard library's own parser. Support for more
-languages is planned.
+walker, Python with the standard library's own parser — plus **JavaScript,
+TypeScript (TSX included), Java, PHP, Rust, and Lua** through tree-sitter: one
+generic backend, a grammar and a query file per language, so a new language
+in this tier is a data row and a query, not a new parser.
 
 A project chooses its languages once, at install, through the census dialogue
 above — not by flag guesswork. `--lang` is **required on a project's first**
@@ -466,10 +468,10 @@ bash tests/run_bash32.sh
 
 The second command re-runs the hook suites under a real bash 3.2.57 — the
 interpreter stock macOS ships — building one into `~/.cache/bash32` on first use
-(or point `MC_BASH32` at an existing binary). The full suite takes about a
-minute. A handful of tests need machine-local data of their own and skip with a
-clear message when it is absent; every fixture tracked in this repository is
-synthetic.
+(or point `MC_BASH32` at an existing binary). The full suite takes about five
+minutes on a 24-core machine; the bash 3.2 harness takes about four. A handful
+of tests need machine-local data of their own and skip with a clear message
+when it is absent; every fixture tracked in this repository is synthetic.
 
 ## Acknowledgements & prior art
 

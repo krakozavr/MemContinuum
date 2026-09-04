@@ -25,6 +25,7 @@ from pathlib import Path
 TOOLS_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TOOLS_DIR))
 
+import chunkers  # noqa: E402
 import memidx  # noqa: E402
 
 README = TOOLS_DIR / "README.md"
@@ -72,6 +73,7 @@ HELP_COMMANDS = [
     for sub in [
         "reindex", "search", "chain", "for-path", "check", "why", "drift",
         "unmapped", "code-reindex", "code-search", "code-census", "stats",
+        "backend-preflight",
     ]
 ]
 
@@ -795,6 +797,27 @@ class TestDoctrineMachineryCoversDocsRound7Files(unittest.TestCase):
         ):
             self.assertTrue(any(p.search(sample) for _, p in FORBIDDEN),
                              f"FORBIDDEN has no pattern catching {desc}: {sample!r}")
+
+
+class TestInternalsDocumentsTreeSitterTier(unittest.TestCase):
+    """Task 12: the Code index section must name backend-preflight,
+    MEMCONTINUUM_VENV_MANAGED, and every LANGUAGE_TABLE row's own language
+    name (tsx included) so a reader of docs/INTERNALS.md alone knows the
+    tree-sitter tier exists and how to check it -- not just the README's
+    six human-named languages, but all seven registry rows."""
+
+    def test_mentions_backend_preflight_and_venv_managed(self):
+        text = INTERNALS.read_text()
+        self.assertIn("backend-preflight", text)
+        self.assertIn("MEMCONTINUUM_VENV_MANAGED", text)
+
+    def test_mentions_every_registry_language_name(self):
+        text = INTERNALS.read_text()
+        for lang in chunkers.LANGUAGE_TABLE:
+            self.assertIn(
+                lang, text,
+                f"docs/INTERNALS.md never names the {lang!r} LANGUAGE_TABLE row",
+            )
 
 
 if __name__ == "__main__":
