@@ -410,11 +410,20 @@ file's identity marker + stamp, and the installed `memory-search` skill
 copy's identity + stamp. It prints one table row per
 (row, claude-dir): `repo | claude-dir | stamped | engine | store-match |
 rules | skill | action`, action being one of `ok`, `stale`, `store-mismatch`,
+`store-form-stale`, `store-form-updated`,
 `rules-missing`, `rules-stale`, `rules-foreign`, `skill-foreign`, `migrate`,
 `migrate-needs-claude-dirs`, `migrate-needs-langs`,
 `migrate-needs-never-exts`, `migrate-dirs-disagree`, `store-missing`,
 `no-wiring`, or
-`unrecoverable`. `--dry-run` (the default with no `--apply`) only prints;
+`unrecoverable`. `store-form-stale` is the reporting walk's answer when the
+row's `store=` names the same store the wiring renders, written in an
+unresolved (symlinked) string form: nothing is mismatched, so the remedy it
+prints is to re-run with `--apply`. `store-form-updated` is what that
+`--apply` pass reports once it has rewritten just the registry's `store=`
+field, leaving `claude-dirs`/`code-roots`/`langs`/`never` exactly as
+recorded. A `store=` naming a *different* store stays `store-mismatch`,
+which the pair never stands in for.
+`--dry-run` (the default with no `--apply`) only prints;
 `--apply` re-runs `repo-init.sh` per non-`ok` claude-dir with the row's own
 recorded parameters, always passing `--adopt-only` (below), so this command
 cannot create, rename, or delete a store on any path through it.
@@ -491,11 +500,20 @@ recorded rather than reporting a bare miss.
 **Action precedence.** The answers this command will never act on come first:
 `store-missing`, then `no-wiring`, then `rules-foreign`, then
 `skill-foreign`, then the `migrate-needs-*`/`migrate-dirs-disagree`
-questions, and only then the drift it can actually re-render (`stale`,
-`store-mismatch`, `rules-missing`, `rules-stale`, a missing/stale skill copy
-folded into `stale`, `ok`). Ordering them the other way would name some
-lesser drift in the action column and then have `--apply` call the installer
-just to watch it refuse for a reason already known.
+questions, and only then the drift it can act on (`stale`,
+`store-form-stale`/`store-form-updated`, `store-mismatch`, `rules-missing`,
+`rules-stale`, a missing/stale skill copy folded into `stale`, `ok`).
+Ordering them the other way would name some lesser drift in the action
+column and then have `--apply` call the installer just to watch it refuse
+for a reason already known.
+
+`store-form-stale`/`store-form-updated` sit between `stale` and
+`store-mismatch` in that chain, and they are the one answer `--apply` fixes
+without re-rendering anything: the wiring already renders the physical
+store, so only the registry's `store=` field is rewritten. A row that is
+*both* fingerprint-stale and store-form-stale reports the higher `stale`,
+and a single `--apply` still corrects both — the store-form correction rides
+along with that re-render rather than waiting for a second pass.
 
 `store-missing` outranking `no-wiring` matters on its own. A claude-dir with
 no hook lines is normally "finish the install" — but when the row's store is

@@ -31,11 +31,22 @@
 #     skill        ok/stale/missing/foreign -- <claude-dir>/skills/
 #                  memory-search/SKILL.md's own identity (a `name:
 #                  memory-search` frontmatter line) and stamp
-#     action       ok | stale | store-mismatch | rules-stale | rules-missing
-#                  | rules-foreign | skill-foreign | migrate |
+#     action       ok | stale | store-mismatch | store-form-stale |
+#                  store-form-updated | rules-stale | rules-missing |
+#                  rules-foreign | skill-foreign | migrate |
 #                  migrate-needs-claude-dirs | migrate-needs-langs |
 #                  migrate-needs-never-exts | migrate-dirs-disagree |
 #                  store-missing | no-wiring | unrecoverable
+#
+#                  store-form-stale (reporting walk): the row's store= names
+#                  the same store the wiring renders, written in an
+#                  unresolved (symlinked) string form -- nothing is actually
+#                  mismatched, and the remedy is to re-run with --apply.
+#                  store-form-updated (--apply): that pass rewrote just the
+#                  registry's store= field, leaving claude-dirs/code-roots/
+#                  langs/never exactly as recorded. A store= naming a
+#                  DIFFERENT store is store-mismatch, which this pair never
+#                  stands in for.
 #
 #                  store-missing outranks every other answer, including a
 #                  stamp and a store= that both look right: those compare

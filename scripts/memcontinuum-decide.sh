@@ -191,6 +191,23 @@ KEY="$MC_REPO_KEY"
 # a no-op in bash), never an error -- worse than leaving an empty value
 # empty for check_storable/the usage checks below to catch as they always
 # have.
+#
+# The `wired` DEFAULT claude-dir is assigned HERE, above the loop, rather
+# than beside the wiring scan that consumes it (fix-round-4 finding): an
+# omitted --claude-dir is the skill's own documented `wired` command
+# (skills/memcontinuum/SKILL.md), so a default assigned below this block is
+# the one path that reaches the note unresolved -- a repo whose .claude is
+# itself a symlink recorded raw while repo-init.sh renders into the physical
+# target. Resolving here rather than at the note-building line keeps one
+# choke point AND gives check_storable and the wiring scan the same value
+# the row records: a physical target can carry a `;` its symlink's own name
+# does not, and the scan reports the directory the row names. Every value
+# the note can hold is assigned above this block; nothing below it assigns a
+# path. Guarded on `wired` because that is the only action the default
+# belongs to -- a `declined`/`forget` row names no claude-dir.
+if [ "$ACTION" = "wired" ] && [ "${#CLAUDE_DIRS[@]}" -eq 0 ]; then
+    CLAUDE_DIRS=("$REPO/.claude")
+fi
 [ -n "$STORE" ] && STORE="$(mc_physical "$STORE")"
 for i in "${!CLAUDE_DIRS[@]}"; do
     [ -n "${CLAUDE_DIRS[$i]}" ] && CLAUDE_DIRS[$i]="$(mc_physical "${CLAUDE_DIRS[$i]}")"
@@ -223,9 +240,9 @@ for CHECK_DIR in "${CODE_ROOTS[@]:-}"; do
 done
 
 if [ "$ACTION" = "wired" ]; then
-    if [ "${#CLAUDE_DIRS[@]}" -eq 0 ]; then
-        CLAUDE_DIRS=("$REPO/.claude")
-    fi
+    # CLAUDE_DIRS is non-empty by here for `wired`: the default above fills
+    # it before the physical resolution runs, so every dir scanned is the
+    # same physical dir the note records.
     for CHECK_DIR in "${CLAUDE_DIRS[@]}"; do
         mc_wiring_scan "$CHECK_DIR/settings.local.json" "$CHECK_DIR/settings.json"
         if [ "$MC_WIRING" != "full" ]; then

@@ -251,6 +251,39 @@ class TestDecideNewFlags(unittest.TestCase):
         self.assertNotIn(str(code_link), note, note)
 
     @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_wired_with_no_claude_dir_records_the_default_physically(self):
+        """Fix round 4: the DEFAULT claude-dir -- <repo>/.claude, used
+        whenever --claude-dir is omitted, which is the `wired` command
+        skills/memcontinuum/SKILL.md documents -- goes through mc_physical
+        exactly like an explicitly given one. The test above covers only
+        the explicit flags; a repo whose own .claude is a symlink records
+        the symlinked string unless the default is resolved too, while
+        repo-init.sh renders into the physical target -- the same
+        registry-vs-rendered divergence the explicit case closes."""
+        repo = git_repo(str(Path(self.tmp) / "repo"))
+        real_claude = Path(self.tmp) / "real-claude"
+        real_claude.mkdir()
+        dot_claude = Path(repo) / ".claude"
+        dot_claude.symlink_to(real_claude, target_is_directory=True)
+        real_claude_physical = os.path.realpath(str(real_claude))
+        self.assertNotEqual(str(dot_claude), real_claude_physical,
+                            "test setup must actually be symlinked")
+
+        store = str(Path(self.tmp) / "store")
+        proc = run(INSTALL_SH, ["--project", "p", "--store", store,
+                                "--claude-dir", str(dot_claude),
+                                "--non-interactive"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+        # No --claude-dir at all -- the SKILL.md-documented invocation.
+        proc = run(DECIDE_SH, ["wired", "--repo", repo,
+                               "--store", store, "--project", "p"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        note = decisions_tsv(self.home).read_text().splitlines()[-1]
+        self.assertIn(f"claude-dirs={real_claude_physical}", note, note)
+        self.assertNotIn(f"{repo}/.claude", note, note)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
     def test_repeatable_claude_dir_requires_every_one_fully_wired(self):
         """INC-0104: one project, two claude-dirs. `wired` must refuse
         unless BOTH are fully wired -- recording it with only one checked
