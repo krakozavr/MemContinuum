@@ -13,11 +13,16 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 TOOLS_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(TOOLS_DIR))
+
+import memidx  # noqa: E402
+
 DECIDE_SH = TOOLS_DIR / "scripts" / "memcontinuum-decide.sh"
 UPDATE_SH = TOOLS_DIR / "scripts" / "memcontinuum-update.sh"
 INSTALL_SH = TOOLS_DIR / "scripts" / "repo-init.sh"
@@ -920,6 +925,36 @@ class TestAddLangAndNeverExt(UpdateTestBase):
         self.assertEqual(decisions_tsv(self.home).read_text(), before)
 
 
+class TestAddLangTreeSitter(UpdateTestBase):
+    """Task 10: `--add-lang` end to end for one of the six new tree-sitter
+    languages -- same wiring path TestAddLangAndNeverExt above proves for
+    Swift, exercised once against a real tree-sitter grammar to confirm the
+    reindex actually runs (not just the decisions.tsv/settings.local.json
+    side)."""
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_add_lang_rust_end_to_end(self):
+        (Path(self.code_root) / "lib.rs").write_text("fn f() -> i32 { 1 }\n")
+        proc = run(UPDATE_SH, ["--add-lang", "rust", "--repo", self.repo], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        note = decisions_tsv(self.home).read_text().splitlines()[-1]
+        self.assertIn("langs=python;rust", note, note)
+        self.assertIn("never=.cs", note)   # additive -- setUp's --never-ext survives
+        # LANG_EXTS is this project's wired set and grows additively (same
+        # assertion shape as TestAddLangAndNeverExt's swift precedent
+        # above); KNOWN_EXTS is chunkers.known_extensions() -- the WHOLE
+        # LANGUAGE_TABLE, project-independent -- so it already lists *.rs
+        # before this call and never "grows" from --add-lang.
+        self.assertIn("'*.py *.rs'", self.settings_text())
+
+        db = Path(self.home) / ".memcontinuum" / "proj-code.sqlite"
+        conn = memidx.open_code_db(db)
+        langs = conn.execute("SELECT langs FROM code_project").fetchone()[0]
+        self.assertIn("rust", langs.split(","))
+        chunks = conn.execute("SELECT qualified_name FROM chunks WHERE path='lib.rs'").fetchall()
+        self.assertEqual([r[0] for r in chunks], ["f"])
+
+
 class TestMachineFlag(UpdateTestBase):
     def test_machine_flag_refreshes_the_machine_layer_and_off_by_default(self):
         proc = run(UPDATE_SH, ["--apply"], self.home)
@@ -1009,6 +1044,85 @@ class TestMachineDependencyReconciliation(UpdateTestBase):
             self.assertEqual(proc2.returncode, 0, proc2.stdout + proc2.stderr)
             self.assertNotIn("refreshing machine layer", proc2.stdout)
             self.assertFalse(record.exists(), "a no-op second run must not re-invoke pip at all")
+        finally:
+            shutil.rmtree(fakebin, ignore_errors=True)
+            shutil.rmtree(engine_dir, ignore_errors=True)
+
+    def _fake_uv_bin_pip_absent(self, pip_record, uv_pip_record):
+        """Task 10 fix-round carry-over (Task 9 review item 2): the plain
+        `_fake_uv_bin` shim's `-m pip` branch always exits 0, so
+        memcontinuum-update.sh's `elif ... uv pip install --python ...`
+        fallback (scripts/memcontinuum-update.sh lines ~1826-1839) is never
+        actually exercised by any existing test -- it always takes the
+        first `if PYTHONPATH= "$MANAGED_PY" -m pip install ...` branch.
+
+        This variant makes the venv's own `-m pip` FAIL instead (recording
+        the attempt to pip_record first) -- the real shape of a venv `uv
+        venv` creates, which omits pip/setuptools/wheel by default (see the
+        production code's own comment at that elif) -- and gives the fake
+        `uv` binary a `pip install --python PATH -r FILE` subcommand
+        (recording to uv_pip_record, succeeding) so the fallback has
+        somewhere to land."""
+        fakebin = tempfile.mkdtemp(prefix="memcontinuum-fake-uv-pipless-")
+        fake_uv = Path(fakebin) / "uv"
+        fake_uv.write_text(
+            "#!/usr/bin/env bash\n"
+            'if [ "$1" = "venv" ]; then\n'
+            '    dir="$2"; mkdir -p "$dir/bin"\n'
+            f'    cat > "$dir/bin/python" <<PYEOF\n'
+            "#!/usr/bin/env bash\n"
+            'if [ "\\$1" = "-m" ] && [ "\\$2" = "pip" ]; then\n'
+            f'    printf \'%s\\n\' "\\$*" >> "{pip_record}"\n'
+            "    echo 'No module named pip' >&2\n"
+            "    exit 1\n"
+            "fi\n"
+            f'exec "{VENV_PYTHON}" "\\$@"\n'
+            "PYEOF\n"
+            '    chmod +x "$dir/bin/python"\n'
+            "    exit 0\n"
+            "fi\n"
+            'if [ "$1" = "pip" ]; then\n'
+            f'    printf \'%s\\n\' "$*" >> "{uv_pip_record}"\n'
+            "    exit 0\n"
+            "fi\n"
+            "exit 0\n"
+        )
+        fake_uv.chmod(0o755)
+        return fakebin
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_pipless_managed_venv_falls_back_to_uv_pip_install(self):
+        """Task 9 review carry-over item 2: the `uv pip install --python`
+        fallback is real production code (scripts/memcontinuum-update.sh
+        ~1826-1839) but every existing reconciliation test's fake-uv shim
+        makes `-m pip` always succeed, so the fallback branch has never
+        actually run under test. Here `-m pip` fails (pip absent, as a
+        plain `uv venv` really produces) so the elif's `uv pip install`
+        call is the one that reconciles -- asserted both by the "(via uv)"
+        wording in stdout and by the recorded uv invocation naming
+        --python MANAGED_PY and requirements.lock."""
+        pip_record = Path(self.tmp) / "pip-invocations.log"
+        uv_pip_record = Path(self.tmp) / "uv-pip-invocations.log"
+        fakebin = self._fake_uv_bin_pip_absent(pip_record, uv_pip_record)
+        engine_dir = tempfile.mkdtemp(prefix="memcontinuum-engine-copy-")
+        copy_engine_for_machine_layer(engine_dir)
+        update_sh = Path(engine_dir) / "scripts" / "memcontinuum-update.sh"
+        try:
+            env = clean_env(self.home)
+            env.pop("MEMCONTINUUM_PYTHON", None)   # force mc_update_resolve_python to find nothing yet
+            env["PATH"] = fakebin + os.pathsep + env["PATH"]
+
+            proc = subprocess.run(
+                [MC_BASH, str(update_sh), "--apply", "--machine"],
+                capture_output=True, text=True, timeout=120, env=env, cwd=self.home,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertTrue(pip_record.is_file(), "the -m pip attempt (which fails) must still run first")
+            self.assertTrue(uv_pip_record.is_file(), proc.stdout + proc.stderr)
+            uv_call = uv_pip_record.read_text()
+            self.assertIn("--python", uv_call)
+            self.assertIn("requirements.lock", uv_call)
+            self.assertIn("OK: dependencies reconciled (via uv)", proc.stdout)
         finally:
             shutil.rmtree(fakebin, ignore_errors=True)
             shutil.rmtree(engine_dir, ignore_errors=True)

@@ -4095,5 +4095,60 @@ class TestBackendPreflight(unittest.TestCase):
         self.assertIsNotNone(data["lua"]["reason"])
 
 
+class TestTreeSitterReindexIntegration(unittest.TestCase):
+    """Task 10: proves the M2a reindex loop, code-search's provenance line/
+    JSON, and code_census are generic over LANGUAGE_TABLE for the six new
+    tree-sitter languages -- no new production code is expected here (see
+    the task-10 brief); a failure in one of these means a real gap, fixed
+    in the file it is found in."""
+
+    def test_not_indexed_row_names_the_missing_wheel_reason(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"; root.mkdir()
+            (root / "x.lua").write_text("function f()\n  return 1\nend\n")
+            db = Path(td) / "idx-code.sqlite"
+            chunkers.treesitter.reset_cache()
+            with mock.patch.dict(sys.modules, {"tree_sitter_lua": None}):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    code_reindex(root, db, lang="lua")
+                self.assertIn("1 not indexed", out.getvalue())
+            chunkers.treesitter.reset_cache()
+            conn = memidx.open_code_db(db)
+            row = conn.execute("SELECT status, reason FROM file_sha WHERE path=?", ("x.lua",)).fetchone()
+            self.assertEqual(row["status"], "not-indexed")
+            self.assertIn("lua", row["reason"].lower())
+
+    def test_code_search_provenance_line_and_json_not_indexed_count(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"; root.mkdir()
+            (root / "x.rs").write_text("fn f() -> i32 { 1 }\n")
+            db = Path(td) / "idx-code.sqlite"
+            chunkers.treesitter.reset_cache()
+            with mock.patch.dict(sys.modules, {"tree_sitter_rust": None}):
+                code_reindex(root, db, lang="rust")
+            chunkers.treesitter.reset_cache()
+            script = ("import sys; sys.path.insert(0, %r); import memidx; "
+                      "memidx.main(['code-search', '--db', %r, 'f', '--mode', 'fts', '--no-heal', '--json'])"
+                      ) % (str(TOOLS_DIR), str(db))
+            r = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=30)
+            data = json.loads(r.stdout)
+            self.assertEqual(data["not_indexed"], 1)
+
+    def test_census_reports_all_seven_rows_as_supported(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"; root.mkdir()
+            (root / "a.js").write_text("function f(){}\n")
+            (root / "a.ts").write_text("function f(){}\n")
+            (root / "a.tsx").write_text("function f(){ return null; }\n")
+            (root / "a.java").write_text("class C { void f() {} }\n")
+            (root / "a.php").write_text("<?php\nfunction f() {}\n")
+            (root / "a.rs").write_text("fn f() {}\n")
+            (root / "a.lua").write_text("function f() end\n")
+            rep = memidx.code_census(root)
+            for lang in ("javascript", "typescript", "tsx", "java", "php", "rust", "lua"):
+                self.assertEqual(rep[lang]["status"], "supported", f"{lang} not supported in census")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -61,6 +61,17 @@ def clean_env(**overrides):
     return env
 
 
+# Task 9 review carry-over item 3: how much extra wall time a config.sh
+# resolution hop (a couple of file reads/`source`s before the same venv
+# python + FTS-search call every hook makes anyway) is allowed to cost on
+# top of the SAME-run, single-hop baseline measured alongside it -- see
+# TestPreEditChainHook._direct_python_baseline_elapsed. Generous on purpose:
+# a real regression here means seconds (a hang, a retry loop), not
+# milliseconds, so this never needs tightening for a genuine resolution-chain
+# slowdown to still be caught.
+CONFIG_CHAIN_SLACK_S = 2.0
+
+
 def run_hook(payload_text: str, env: dict, timeout: float = 5.0):
     start = time.monotonic()
     proc = subprocess.run(
@@ -433,6 +444,28 @@ class TestPreEditChainHook(unittest.TestCase):
         log_text = (Path(self.memtool_home) / "hook.log").read_text()
         self.assertIn("poisoned PYTHONPATH not cleared", log_text)
 
+    def _direct_python_baseline_elapsed(self, payload):
+        """Task 10 fix-round carry-over (Task 9 review item 3): an absolute
+        1.0s wall-clock bound flaked under machine load (observed at load
+        10+) -- venv-python startup and the fixture DB's FTS query both
+        slow down under CPU contention, for reasons that have nothing to
+        do with the config.sh resolution chain under test. Running this
+        SAME hook once more with MEMCONTINUUM_PYTHON given directly (the
+        single-hop, no-resolution-needed env
+        test_a_matching_path_emits_chain_with_citation_reminder uses),
+        in the SAME test, gives a load-normalized floor: whatever the box
+        is doing right now, this number reflects it too, so a comparison
+        against it (see CONFIG_CHAIN_SLACK_S) stays meaningful at any load
+        instead of chasing a bigger and bigger constant."""
+        env = clean_env(
+            MEMCONTINUUM_HOME=self.memtool_home,
+            MEMCONTINUUM_PROJECT=self.project,
+            MEMCONTINUUM_PYTHON=VENV_PYTHON,
+            MEMCONTINUUM_STRIP_PREFIX="/fake/repo/",
+        )
+        _, elapsed = run_hook(payload, env)
+        return elapsed
+
     def test_f_resolves_python_via_config_sh_when_env_unset(self):
         """F6 regression, round 4: this hook's own python resolution used
         to be two-step only ($MEMCONTINUUM_PYTHON, else the engine's
@@ -462,7 +495,13 @@ class TestPreEditChainHook(unittest.TestCase):
         env.pop("MEMCONTINUUM_PYTHON", None)
         proc, elapsed = run_hook(payload, env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertLess(elapsed, 1.0, f"hook took {elapsed:.3f}s")
+        baseline = self._direct_python_baseline_elapsed(payload)
+        self.assertLess(
+            elapsed, baseline + CONFIG_CHAIN_SLACK_S,
+            f"hook took {elapsed:.3f}s vs a same-run direct-python baseline of "
+            f"{baseline:.3f}s -- the config.sh resolution hop should add only "
+            "milliseconds, not seconds",
+        )
         self.assertTrue(proc.stdout.strip(), "expected additionalContext output, got nothing")
         out = json.loads(proc.stdout)
         self.assertIn("TOP-0042", out["hookSpecificOutput"]["additionalContext"])
@@ -510,7 +549,13 @@ class TestPreEditChainHook(unittest.TestCase):
         env.pop("MEMCONTINUUM_PYTHON", None)
         proc, elapsed = run_hook(payload, env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertLess(elapsed, 1.0, f"hook took {elapsed:.3f}s")
+        baseline = self._direct_python_baseline_elapsed(payload)
+        self.assertLess(
+            elapsed, baseline + CONFIG_CHAIN_SLACK_S,
+            f"hook took {elapsed:.3f}s vs a same-run direct-python baseline of "
+            f"{baseline:.3f}s -- the two-hop pointer-config chain should add only "
+            "milliseconds, not seconds",
+        )
         self.assertTrue(proc.stdout.strip(), "expected additionalContext output, got nothing")
         out = json.loads(proc.stdout)
         self.assertIn("TOP-0042", out["hookSpecificOutput"]["additionalContext"])

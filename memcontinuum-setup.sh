@@ -32,6 +32,10 @@
 #                     machine's config. Never touches a venv, a store, any
 #                     per-repo wiring, or your recorded per-repo answers.
 #
+# With neither --python nor --venv given on a real terminal, this blocks on
+# /dev/tty with a python-or-venv menu (choosing abort exits 1) instead of
+# silently creating a venv; a scripted or non-interactive run is unaffected.
+#
 # Why the model warm is on by default: fastembed downloads ~100 MB the first
 # time anything needs to embed. Left lazy, that download happens inside
 # somebody's first reindex -- or worse, inside a hook -- looking like a hang.
