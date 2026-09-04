@@ -174,6 +174,9 @@ class TreeSitterFileTooLarge(ChunkingFailed):
     editing the file down in size and re-running code-reindex picks it
     back up."""
 
+    remedy = ("raise the cap with MEMCONTINUUM_MAX_PARSE_BYTES, or split "
+              "the file")
+
 
 def max_parse_bytes(row):
     """Priority: the row's own `max_bytes` (optional, per-language) >

@@ -4098,7 +4098,7 @@ class TestBackendPreflight(unittest.TestCase):
 
     @unittest.skipUnless(os.environ.get("MEMCONTINUUM_PYTHON", ""),
                          "needs the fixed venv with the seven pins installed")
-    def test_an_installed_version_off_the_pin_is_reported_as_drift(self):
+    def test_an_installed_version_off_the_pin_is_reported_as_pin_mismatch(self):
         """Ruling 108: a wheel that imports but sits at a version the row
         does not pin is a THIRD state beside ok and missing. The backend
         runs, so `ok` stays true and the exit code stays 0; what it produces
@@ -4120,12 +4120,15 @@ class TestBackendPreflight(unittest.TestCase):
             with contextlib.redirect_stdout(text):
                 memidx.main(["backend-preflight"])
         chunkers.treesitter.reset_cache()
-        self.assertEqual(data["lua"]["state"], "drift")
-        self.assertTrue(data["lua"]["ok"], "a drifted row still runs")
+        self.assertEqual(data["lua"]["state"], "pin-mismatch")
+        self.assertTrue(data["lua"]["ok"], "a row off its pins still runs")
         self.assertIn("9.9.9", data["lua"]["reason"])
         self.assertIn(chunkers.LANGUAGE_TABLE["lua"]["grammar_pin"], data["lua"]["reason"])
         self.assertEqual(data["javascript"]["state"], "ok")
-        self.assertIn("DRIFT", text.getvalue())
+        self.assertIn("PIN-MISMATCH", text.getvalue())
+        # Ruling 111: `drift` is this CLI's decision-vs-code subcommand and
+        # nothing else. The installed-vs-pinned state must not borrow it.
+        self.assertNotIn("DRIFT (", text.getvalue())
 
 
 class TestTreeSitterReindexIntegration(unittest.TestCase):

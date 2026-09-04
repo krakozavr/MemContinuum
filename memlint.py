@@ -62,13 +62,13 @@ def _symbol_declaration_status(frag: str, text: str, rel_path: str) -> tuple:
     checked against Python's vocabulary, not Swift's, with no
     language-specific branch anywhere on this path.
 
-    Tri-state, `(verdict, reason)`: True/False are the backend's own
+    Tri-state, `(verdict, reason, remedy)`: True/False are the backend's own
     answer, None means nothing could be read -- the backend for that
     language does not run in this python (an optional grammar wheel this
     interpreter lacks), or it runs and could not read this file (over the
-    per-file byte cap, or it did not parse) -- and `reason` says which.
-    lint_concept warns on None and errors only on False -- see that call
-    site."""
+    per-file byte cap, or it did not parse) -- `reason` says which, and
+    `remedy` says what to do about that particular one. lint_concept warns
+    on None and errors only on False -- see that call site."""
     return fragment_declaration_status(frag, text, rel_path=rel_path)
 
 
@@ -310,7 +310,7 @@ def lint_concept(
                         text = full.read_text(encoding="utf-8", errors="ignore")
                     except OSError:
                         text = ""
-                    declared, reason = _symbol_declaration_status(
+                    declared, reason, remedy = _symbol_declaration_status(
                         frag, text, rel_path=ref_path
                     )
                     if declared is None:
@@ -323,14 +323,20 @@ def lint_concept(
                         # absent, and a record stays VALID across either
                         # gap: every other surface fails open on both -- the
                         # file lands not-indexed and is retried, the index
-                        # reports itself incomplete. The reason says which
-                        # gap this is and names the wheel when that is what
-                        # it is; backend-preflight reports the same thing
-                        # for the whole machine.
+                        # reports itself incomplete.
+                        #
+                        # The reason says which gap this is and the remedy
+                        # what to do about THAT one -- both decided at
+                        # memidx.fragment_declaration_status, the one place
+                        # that sees the failure's own type. A missing wheel
+                        # sends the reader to backend-preflight; an
+                        # over-cap or unparseable file must not, because
+                        # backend-preflight reports that language ok and
+                        # would answer a question nobody asked.
                         warnings.append(
                             f"{path}: {cid} {field} fragment {frag!r} is not checked -- "
                             f"{ref_path!r} is uncheckable in this python ({reason}); "
-                            f"run backend-preflight to see which backends run here"
+                            f"{remedy}"
                         )
                     elif not declared:
                         errors.append(

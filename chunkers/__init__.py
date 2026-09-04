@@ -170,6 +170,13 @@ class BackendUnavailable(Exception):
     provider init failure). The indexer records the file as not-indexed
     and retries on the next explicit run, or when availability changes."""
 
+    # What a person does about it. Carried on the exception class rather
+    # than reconstructed by whoever catches it: the type IS the reason
+    # class, so the remedy belongs beside the type and no caller has to
+    # classify a message string to find it. memidx's uncheckable verdict
+    # reads it with getattr and memlint prints it.
+    remedy = "run backend-preflight to see which backends run here"
+
 
 class ChunkingFailed(Exception):
     """One FILE this backend could not chunk -- it did not parse, or it is
@@ -185,6 +192,8 @@ class ChunkingFailed(Exception):
     one. Different from BackendUnavailable, which is about the backend
     rather than the file: that one says nothing in this language can be
     read here."""
+
+    remedy = "fix the syntax error the reason names, or exclude the file"
 
 
 def get_chunker(lang):
@@ -252,7 +261,7 @@ def backend_availability():
     return ";".join(parts)
 
 
-def pin_drift(lang):
+def pin_mismatch(lang):
     """The gap between what `lang`'s row PINS and what this python has
     INSTALLED, as one human-readable string, or None when the two agree.
 
@@ -261,11 +270,16 @@ def pin_drift(lang):
     (MEMCONTINUUM_VENV_MANAGED=0) can hold either at a different version.
     That backend still imports and still chunks -- it simply chunks
     something the pins do not describe -- so this is a THIRD answer beside
-    ok and missing, and `backend-preflight` reports it as `drift` with both
-    versions named. Native rows pin nothing and never drift.
+    ok and missing, and `backend-preflight` reports it as `pin-mismatch`
+    with both versions named. Native rows pin nothing and never mismatch.
 
-    chunker_version hashes the installed versions (see there), so a drifted
-    machine re-chunks its own files rather than serving chunks the pins
+    The state is NOT called `drift`: `memidx.py drift` is this product's
+    subcommand for decision-vs-code drift, a different question with a
+    different answer, and one word for two conditions in one CLI's output
+    is a word that stops meaning either.
+
+    chunker_version hashes the installed versions (see there), so a machine
+    off the pins re-chunks its own files rather than serving chunks the pins
     claim; this function is the surface that tells a human WHY."""
     row = LANGUAGE_TABLE[lang]
     if row["backend"] != "tree-sitter":

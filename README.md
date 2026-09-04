@@ -330,7 +330,7 @@ memidx.py drift --code-root DIR --project NAME                                  
 memidx.py reindex --root STORE --project NAME                                    # after editing the store by hand
 memidx.py code-reindex --code-root DIR --project NAME                            # after the code moved on
 memidx.py stats --project NAME [--days 7] [--store DIR]                          # is retrieval actually firing?
-memidx.py backend-preflight [--json]                                             # which chunker backends import here?
+memidx.py backend-preflight [--json]                                             # which backends import here, and do their versions match the pins?
 memlint.py STORE --code-root DIR                                                 # validate records
 ```
 

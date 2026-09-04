@@ -555,11 +555,14 @@ class TestMissingGrammarWheelIsAWarningNotAnError(unittest.TestCase):
 
     def test_predicate_is_none_with_the_wheel_absent_and_names_it(self):
         with self._javascript_wheel_absent():
-            verdict, reason = memidx.fragment_declaration_status(
+            verdict, reason, remedy = memidx.fragment_declaration_status(
                 "widget_loader", self.JS_SOURCE, rel_path="widget.js"
             )
         self.assertIsNone(verdict)
         self.assertIn("tree_sitter_javascript", reason)
+        # A missing wheel is the ONE case backend-preflight answers: it
+        # reports the same absence for the whole machine.
+        self.assertIn("backend-preflight", remedy)
         # The thin verdict-only wrapper forwards the same None, so `why`'s
         # disk-scan fallback still reads it as falsy.
         with self._javascript_wheel_absent():
@@ -570,11 +573,11 @@ class TestMissingGrammarWheelIsAWarningNotAnError(unittest.TestCase):
             )
 
     def test_predicate_is_true_with_the_wheel_present(self):
-        verdict, reason = memidx.fragment_declaration_status(
+        verdict, reason, remedy = memidx.fragment_declaration_status(
             "widget_loader", self.JS_SOURCE, rel_path="widget.js"
         )
         self.assertTrue(verdict)
-        self.assertEqual(reason, "")
+        self.assertEqual((reason, remedy), ("", ""))
 
     def test_lint_warns_and_stays_clean_with_the_wheel_absent(self):
         with self._javascript_wheel_absent():
@@ -586,6 +589,7 @@ class TestMissingGrammarWheelIsAWarningNotAnError(unittest.TestCase):
         named = [w for w in warnings if "tree_sitter_javascript" in w]
         self.assertEqual(len(named), 1, warnings)
         self.assertIn("widget_loader", named[0])
+        self.assertIn("run backend-preflight", named[0])
 
     def test_lint_still_errors_on_a_symbol_the_available_backend_proves_absent(self):
         errors, _warnings = self._lint("widget.js#no_such_symbol", self.JS_SOURCE)
@@ -618,6 +622,10 @@ class TestMissingGrammarWheelIsAWarningNotAnError(unittest.TestCase):
         self.assertEqual(len(named), 1, warnings)
         self.assertIn("uncheckable", named[0])
         self.assertIn("TreeSitterFileTooLarge", named[0])
+        # The remedy names the CAP, not backend-preflight: the backend runs
+        # here, and preflight would report this language ok.
+        self.assertIn("MEMCONTINUUM_MAX_PARSE_BYTES", named[0])
+        self.assertNotIn("backend-preflight", named[0])
 
 
 class TestPythonSyntaxErrorIsAWarningNotAnError(unittest.TestCase):
@@ -654,12 +662,14 @@ class TestPythonSyntaxErrorIsAWarningNotAnError(unittest.TestCase):
             return memlint.lint_root(td, code_roots=[code_root])
 
     def test_predicate_is_none_on_a_syntax_error_and_names_it(self):
-        verdict, reason = memidx.fragment_declaration_status(
+        verdict, reason, remedy = memidx.fragment_declaration_status(
             "widget_loader", self.PY_SOURCE, rel_path="widget.py"
         )
         self.assertIsNone(verdict)
         self.assertIn("python", reason)
         self.assertIn("SyntaxError", reason)
+        self.assertIn("syntax", remedy)
+        self.assertNotIn("backend-preflight", remedy)
         # The thin verdict-only wrapper forwards the same None.
         self.assertIsNone(
             memidx.fragment_declared_in_text(
@@ -669,12 +679,12 @@ class TestPythonSyntaxErrorIsAWarningNotAnError(unittest.TestCase):
 
     def test_a_parseable_file_still_proves_a_symbol_present_or_absent(self):
         clean = "def widget_loader():\n    return 1\n"
-        verdict, reason = memidx.fragment_declaration_status(
+        verdict, reason, remedy = memidx.fragment_declaration_status(
             "widget_loader", clean, rel_path="widget.py"
         )
         self.assertTrue(verdict)
-        self.assertEqual(reason, "")
-        verdict, _reason = memidx.fragment_declaration_status(
+        self.assertEqual((reason, remedy), ("", ""))
+        verdict, _reason, _remedy = memidx.fragment_declaration_status(
             "no_such_symbol", clean, rel_path="widget.py"
         )
         self.assertFalse(verdict)
@@ -689,6 +699,10 @@ class TestPythonSyntaxErrorIsAWarningNotAnError(unittest.TestCase):
         self.assertEqual(len(named), 1, warnings)
         self.assertIn("uncheckable", named[0])
         self.assertIn("SyntaxError", named[0])
+        # The remedy names the FILE's syntax, not backend-preflight: python
+        # has no wheel to be missing and preflight reports it ok.
+        self.assertIn("syntax", named[0])
+        self.assertNotIn("backend-preflight", named[0])
 
     def test_lint_still_errors_on_a_symbol_a_parseable_file_proves_absent(self):
         clean = "def widget_loader():\n    return 1\n"

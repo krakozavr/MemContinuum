@@ -1145,7 +1145,7 @@ screens out before parsing is ever attempted.
 ### `backend-preflight` and grammar admission
 
 `backend-preflight [--json]` attempts `get_chunker(lang)` for every table row
-and reports one of three states by language — `ok`, `drift`, `missing` —
+and reports one of three states by language — `ok`, `pin-mismatch`, `missing` —
 fail-open per row so one backend's own import bug never hides the rest of the
 report. A native row fails only on an engine bug of its own; a tree-sitter row
 is `missing` when its pinned grammar wheel is not installed in this python, and
@@ -1156,18 +1156,31 @@ same backend goes missing mid-run (that row's own reason text carries an extra
 not-indexed reason for a tree-sitter language usually names the same module
 this reports.
 
-`drift` is the third state: the backend imports, but the grammar wheel or the
-`tree-sitter` runtime is installed at a version the row does not pin, and the
+`pin-mismatch` is the third state: the backend imports, but the grammar wheel or
+the `tree-sitter` runtime is installed at a version the row does not pin, and the
 reason names the distribution with both versions (`tree-sitter-javascript:
-pinned 0.25.0, installed 0.25.1`). A drifted row is usable — `ok` stays true in
-the JSON and the exit code stays 0 — so this is a report, not a gate; the
+pinned 0.25.0, installed 0.25.1`). A mismatched row is usable — `ok` stays true
+in the JSON and the exit code stays 0 — so this is a report, not a gate; the
 index it feeds is honest either way, because `chunker_version` hashes those
 same installed versions and re-chunks the language's files. An install pointed
 at an interpreter the engine does not manage (`MEMCONTINUUM_VENV_MANAGED=0`) is
-where drift actually appears, since a managed venv is reinstalled from
-`requirements.lock`. `memcontinuum-update.sh --apply --machine` runs this check
-right after reconciling the engine-managed venv, warns by name about any row
-still missing, and warns separately about any row that drifted.
+where a mismatch actually appears, since a managed venv is reinstalled from
+`requirements.lock`.
+
+The state is deliberately not called `drift`. `memidx.py drift` is this
+product's subcommand for decision-vs-code drift — a different question, a
+different answer, and the name users already know it by — so the installed-vs-pinned
+condition carries its own word rather than a second meaning for that one.
+
+`memcontinuum-update.sh --apply --machine` runs this check on EVERY `--apply
+--machine` run, warns by name about any row missing, and warns separately about
+any row off its pins. The report sits outside the staleness gate that decides
+whether the machine layer is re-rendered and the lockfile reinstalled: a
+pin mismatch is a runtime-install condition — someone pip-installs a newer
+grammar into the venv and nothing about the wiring goes stale — so gating the
+report on staleness would have hidden exactly the case it exists to report.
+The pip reinstall itself stays gated, which is what the no-op-reconciliation
+guarantee is about.
 
 Five of the six grammar wheels (`tree-sitter` itself, the seventh pin, is the
 runtime, not a grammar) come from the official `github.com/tree-sitter/`

@@ -887,11 +887,12 @@ class TestSharedEngineImportFailureDegrades(unittest.TestCase):
         symbol through fragment_declaration_status, which must answer
         "cannot tell" rather than raise."""
         with self._engine_unimportable():
-            verdict, reason = memidx.fragment_declaration_status(
+            verdict, reason, remedy = memidx.fragment_declaration_status(
                 "findable_symbol", "function findable_symbol(){}\n", rel_path="a.js"
             )
             self.assertIsNone(verdict)
             self.assertIn("chunkers.treesitter", reason)
+            self.assertIn("backend-preflight", remedy)
             self.assertIsNone(memidx.fragment_declared_in_text(
                 "findable_symbol", "function findable_symbol(){}\n", rel_path="a.js"
             ))
@@ -923,29 +924,35 @@ class TestDeclaredSymbolsSeparatesFailureFromAbsence(unittest.TestCase):
     def test_over_cap_file_is_uncheckable_not_proof_of_absence(self):
         chunkers.treesitter.reset_cache()
         with mock.patch.dict(os.environ, {"MEMCONTINUUM_MAX_PARSE_BYTES": "64"}):
-            verdict, reason = memidx.fragment_declaration_status(
+            verdict, reason, remedy = memidx.fragment_declaration_status(
                 "valid_symbol", self.OVER_CAP, rel_path="big.js"
             )
         chunkers.treesitter.reset_cache()
         self.assertIsNone(verdict)
         self.assertIn("TreeSitterFileTooLarge", reason)
+        # The backend RUNS here -- backend-preflight would report this
+        # language ok -- so the remedy is the cap, not that command.
+        self.assertIn("MEMCONTINUUM_MAX_PARSE_BYTES", remedy)
+        self.assertNotIn("backend-preflight", remedy)
 
     def test_a_file_that_did_not_parse_is_uncheckable_too(self):
         chunkers.treesitter.reset_cache()
-        verdict, reason = memidx.fragment_declaration_status(
+        verdict, reason, remedy = memidx.fragment_declaration_status(
             "valid_symbol", "@@@ not javascript at all @@@\n", rel_path="broken.js"
         )
         chunkers.treesitter.reset_cache()
         self.assertIsNone(verdict)
         self.assertIn("ChunkingFailed", reason)
+        self.assertIn("syntax", remedy)
+        self.assertNotIn("backend-preflight", remedy)
 
     def test_a_readable_file_still_proves_a_symbol_absent(self):
         chunkers.treesitter.reset_cache()
-        verdict, reason = memidx.fragment_declaration_status(
+        verdict, reason, remedy = memidx.fragment_declaration_status(
             "no_such_symbol", "function other(){}\n", rel_path="a.js"
         )
         self.assertFalse(verdict)
-        self.assertEqual(reason, "")
+        self.assertEqual((reason, remedy), ("", ""))
         self.assertIsNotNone(verdict, "an absent symbol stays a hard error, not a warning")
 
 
@@ -1155,13 +1162,13 @@ class TestTreeSitterFingerprint(unittest.TestCase):
             self.assertNotEqual(chunkers.chunker_version("javascript"), before)
         self.assertEqual(chunkers.chunker_version("javascript"), before)
 
-    def test_pin_drift_is_none_when_the_install_matches_the_pins(self):
+    def test_pin_mismatch_is_none_when_the_install_matches_the_pins(self):
         chunkers.treesitter.reset_cache()
         for lang in ("javascript", "typescript", "tsx", "java", "php", "rust", "lua"):
-            self.assertIsNone(chunkers.pin_drift(lang), lang)
-        self.assertIsNone(chunkers.pin_drift("python"))   # native rows pin nothing
+            self.assertIsNone(chunkers.pin_mismatch(lang), lang)
+        self.assertIsNone(chunkers.pin_mismatch("python"))   # native rows pin nothing
 
-    def test_pin_drift_names_the_distribution_and_both_versions(self):
+    def test_pin_mismatch_names_the_distribution_and_both_versions(self):
         real = importlib.metadata.version
 
         def fake(name):
@@ -1169,12 +1176,12 @@ class TestTreeSitterFingerprint(unittest.TestCase):
 
         chunkers.treesitter.reset_cache()
         with mock.patch.object(importlib.metadata, "version", fake):
-            drift = chunkers.pin_drift("lua")
+            mismatch = chunkers.pin_mismatch("lua")
         chunkers.treesitter.reset_cache()
-        self.assertIsNotNone(drift)
-        self.assertIn("tree-sitter-lua", drift)
-        self.assertIn("9.9.9", drift)
-        self.assertIn(chunkers.LANGUAGE_TABLE["lua"]["grammar_pin"], drift)
+        self.assertIsNotNone(mismatch)
+        self.assertIn("tree-sitter-lua", mismatch)
+        self.assertIn("9.9.9", mismatch)
+        self.assertIn(chunkers.LANGUAGE_TABLE["lua"]["grammar_pin"], mismatch)
 
     def test_row_shape_ignores_the_order_a_row_is_written_in(self):
         # Sorted, so reordering a row's own containers is not a rechunk.

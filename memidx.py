@@ -1846,25 +1846,52 @@ def fragment_matches_symbol(frag: str, symbol: str, qualified_name: str) -> bool
     return frag == symbol or frag == qualified_name or qualified_name.endswith("." + frag)
 
 
+_GENERIC_UNCHECKABLE_REMEDY = (
+    "run backend-preflight, and check whether this file itself can be read"
+)
+
+
+def _uncheckable_remedy(exc) -> str:
+    """What a person does about an exception that made a file uncheckable.
+
+    Read off the exception CLASS, which is the failure class: chunkers'
+    BackendUnavailable and ChunkingFailed and treesitter's
+    TreeSitterFileTooLarge each declare their own `remedy` beside their own
+    docstring. Nothing here classifies a message string, and a backend that
+    raises something none of them cover still gets a usable sentence rather
+    than the wrong one."""
+    return getattr(exc, "remedy", "") or _GENERIC_UNCHECKABLE_REMEDY
+
+
 def fragment_declaration_status(frag: str, text: str, rel_path: str) -> tuple:
     """memlint's #symbol vocabulary check (memlint.py's lint_concept),
     tri-state: is `frag` a symbol actually DECLARED in `text`?
 
-    Returns `(verdict, reason)`. `verdict` is True (the backend read the
-    text and found the symbol), False (the backend read the text and the
+    Returns `(verdict, reason, remedy)`. `verdict` is True (the backend read
+    the text and found the symbol), False (the backend read the text and the
     symbol is not there), or None -- nothing could be read, so NOTHING is
-    known about the symbol either way. `reason` says which, and is empty for
-    every other verdict.
+    known about the symbol either way. `reason` says which and `remedy` what
+    to do about it; both are empty for every other verdict.
 
-    Two things produce None, and they are different failures with the same
-    honest answer:
+    Two things produce None, they are different failures with the same
+    honest answer, and each needs a DIFFERENT remedy -- so the remedy is
+    decided here, at the one place that sees the exception TYPE, rather than
+    by a caller reading a message string back. Each exception class carries
+    its own `remedy` string (chunkers' BackendUnavailable and ChunkingFailed,
+    treesitter's TreeSitterFileTooLarge), so this reads it off the exception
+    rather than classifying one; an exception carrying none falls back to a
+    generic line.
 
       * the backend for this file's language cannot run in this python --
         `reason` is the BackendUnavailable text, which names the missing
         wheel by module (e.g. "javascript: ModuleNotFoundError: No module
-        named 'tree_sitter_javascript'");
+        named 'tree_sitter_javascript'"), and the remedy is
+        backend-preflight, which reports the same absence machine-wide;
       * the backend runs but could not read THIS file -- it is over the
         per-file byte cap, or it did not parse (external gate finding 7).
+        backend-preflight reports that language `ok` for both -- the backend
+        runs, the FILE is what could not be read -- so the remedy is the cap
+        in the first case and the file's own syntax in the second.
         `reason` names the language and the failure (e.g. "javascript:
         TreeSitterFileTooLarge: file too large (1111026 bytes > 1048576)").
 
@@ -1913,18 +1940,18 @@ def fragment_declaration_status(frag: str, text: str, rel_path: str) -> tuple:
     if lang is None and not chunkers.extension_of(rel_path):
         lang = chunkers.lang_for_shebang(text.split("\n", 1)[0])
     if lang is None:
-        return False, ""
+        return False, "", ""
     try:
         backend = chunkers.get_chunker(lang)
     except chunkers.BackendUnavailable as exc:
         # The one "cannot tell" case, kept apart from the generic guard
         # below: this engine has no backend for this language here, so the
         # symbol is neither proven present nor proven absent.
-        return None, str(exc)
+        return None, str(exc), _uncheckable_remedy(exc)
     except Exception:
         # Fail open, like every other chunker call site: a backend that
         # cannot answer must not turn a lint into a crash.
-        return False, ""
+        return False, "", ""
     try:
         pairs = backend.declared_symbols(text)
     except Exception as exc:
@@ -1935,12 +1962,12 @@ def fragment_declaration_status(frag: str, text: str, rel_path: str) -> tuple:
         # None: an empty vocabulary would say the symbol is proven absent,
         # which is a hard error on a record that may be perfectly correct.
         # The reason names the file's language and the failure, and memlint
-        # prints it.
-        return None, f"{lang}: {type(exc).__name__}: {exc}"
+        # prints it beside the remedy that failure class calls for.
+        return None, f"{lang}: {type(exc).__name__}: {exc}", _uncheckable_remedy(exc)
     return any(
         fragment_matches_symbol(frag, symbol, qualified_name)
         for symbol, qualified_name in pairs
-    ), ""
+    ), "", ""
 
 
 def fragment_declared_in_text(frag: str, text: str, rel_path: str):
@@ -1952,7 +1979,7 @@ def fragment_declared_in_text(frag: str, text: str, rel_path: str):
     `why`'s disk-scan fallback (resolve_symbol_to_path) cannot resolve a
     symbol it could not check, and answering None there means the same
     thing as answering no."""
-    verdict, _reason = fragment_declaration_status(frag, text, rel_path)
+    verdict, _reason, _remedy = fragment_declaration_status(frag, text, rel_path)
     return verdict
 
 
@@ -4087,16 +4114,21 @@ def cmd_backend_preflight(args) -> int:
 
     Three states, not two (ruling 108):
 
-      * `ok`      -- the backend imports here and its grammar wheel and the
-                     tree-sitter runtime sit at the versions the row pins.
-      * `drift`   -- the backend imports, but one of those two
-                     distributions is installed at a DIFFERENT version than
-                     the row pins (chunkers.pin_drift names both). The
-                     backend runs; what it produces is not what the pins
-                     describe. Reported, never fatal: the exit code stays 0
-                     and `ok` stays true, because the row is usable.
-      * `missing` -- the backend cannot run here at all (the wheel is
-                     absent, or the query does not compile); `ok` is false.
+      * `ok`           -- the backend imports here and its grammar wheel and
+                          the tree-sitter runtime sit at the versions the row
+                          pins.
+      * `pin-mismatch` -- the backend imports, but one of those two
+                          distributions is installed at a DIFFERENT version
+                          than the row pins (chunkers.pin_mismatch names
+                          both). The backend runs; what it produces is not
+                          what the pins describe. Reported, never fatal: the
+                          exit code stays 0 and `ok` stays true, because the
+                          row is usable. Named for the condition rather than
+                          `drift`, which this CLI already spends on the
+                          decision-vs-code check (`memidx.py drift`).
+      * `missing`      -- the backend cannot run here at all (the wheel is
+                          absent, or the query does not compile); `ok` is
+                          false.
 
     Exit code is 0 for every state -- this command reports a machine's
     install, it does not gate on it."""
@@ -4112,11 +4144,11 @@ def cmd_backend_preflight(args) -> int:
                             "reason": f"{type(exc).__name__}: {exc}"}
             continue
         try:
-            drift = chunkers.pin_drift(lang)
+            mismatch = chunkers.pin_mismatch(lang)
         except Exception as exc:   # same fail-open discipline as the import above
-            drift = f"pin comparison failed: {type(exc).__name__}: {exc}"
-        if drift:
-            report[lang] = {"ok": True, "state": "drift", "reason": drift}
+            mismatch = f"pin comparison failed: {type(exc).__name__}: {exc}"
+        if mismatch:
+            report[lang] = {"ok": True, "state": "pin-mismatch", "reason": mismatch}
         else:
             report[lang] = {"ok": True, "state": "ok", "reason": None}
     if getattr(args, "json", False):
@@ -4125,8 +4157,8 @@ def cmd_backend_preflight(args) -> int:
         for lang, row in sorted(report.items()):
             if row["state"] == "ok":
                 status = "ok"
-            elif row["state"] == "drift":
-                status = f"DRIFT ({row['reason']})"
+            elif row["state"] == "pin-mismatch":
+                status = f"PIN-MISMATCH ({row['reason']})"
             else:
                 status = f"MISSING ({row['reason']})"
             print(f"{lang}: {status}")
@@ -5587,15 +5619,16 @@ def main(argv=None) -> int:
              "installed versions match the pins, by language",
         description=(
             "Attempts to import each registered language's chunker backend "
-            "and reports ok, drift or missing per language. A native backend "
-            "(swift, python) fails only on an engine bug of its own; a "
+            "and reports ok, pin-mismatch or missing per language. A native "
+            "backend (swift, python) fails only on an engine bug of its own; a "
             "tree-sitter backend (javascript, typescript, tsx, java, php, "
             "rust, lua) is MISSING when its pinned grammar wheel is not "
             "installed in this python -- the reported reason names that "
-            "wheel -- and DRIFT when the wheel or the tree-sitter runtime "
-            "imports at a version the row does not pin, which the reason "
-            "names on both sides. A drifted backend still runs; it produces "
-            "chunks the pins do not describe. Exit code is 0 either way."
+            "wheel -- and PIN-MISMATCH when the wheel or the tree-sitter "
+            "runtime imports at a version the row does not pin, which the "
+            "reason names on both sides. A mismatched backend still runs; it "
+            "produces chunks the pins do not describe. Exit code is 0 either "
+            "way."
         ),
     )
     p_preflight.add_argument("--json", action="store_true")

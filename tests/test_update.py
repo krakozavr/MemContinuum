@@ -968,14 +968,28 @@ class TestMachineFlag(UpdateTestBase):
 
 
 class TestMachineDependencyReconciliation(UpdateTestBase):
-    def _fake_uv_bin(self, record):
+    def _fake_uv_bin(self, record, preflight_json=""):
         # Same idiom as test_repo_init.py's existing bootstrap-venv fakes:
         # `uv venv DIR` creates DIR/bin/python, a shim that records every
         # `-m pip ...` invocation and execs the real VENV_PYTHON for
         # anything else (import checks etc.) -- no real package install,
         # so this stays fast and hermetic.
+        #
+        # `preflight_json`, when given, makes the same shim answer the
+        # updater's `backend-preflight --json` invocation with canned JSON
+        # instead of running the real one, so a test can put the managed
+        # venv into a state (a row off its pins) that no real install here
+        # is in. Everything else still execs the real python.
         fakebin = tempfile.mkdtemp(prefix="memcontinuum-fake-uv-")
         fake_uv = Path(fakebin) / "uv"
+        preflight_branch = ""
+        if preflight_json:
+            preflight_branch = (
+                'if [ "\\$2" = "backend-preflight" ]; then\n'
+                f"    printf '%s' '{preflight_json}'\n"
+                "    exit 0\n"
+                "fi\n"
+            )
         fake_uv.write_text(
             "#!/usr/bin/env bash\n"
             'if [ "$1" = "venv" ]; then\n'
@@ -986,6 +1000,7 @@ class TestMachineDependencyReconciliation(UpdateTestBase):
             f'    printf \'%s\\n\' "\\$*" >> "{record}"\n'
             "    exit 0\n"
             "fi\n"
+            + preflight_branch +
             f'exec "{VENV_PYTHON}" "\\$@"\n'
             "PYEOF\n"
             '    chmod +x "$dir/bin/python"\n'
@@ -1044,6 +1059,63 @@ class TestMachineDependencyReconciliation(UpdateTestBase):
             self.assertEqual(proc2.returncode, 0, proc2.stdout + proc2.stderr)
             self.assertNotIn("refreshing machine layer", proc2.stdout)
             self.assertFalse(record.exists(), "a no-op second run must not re-invoke pip at all")
+        finally:
+            shutil.rmtree(fakebin, ignore_errors=True)
+            shutil.rmtree(engine_dir, ignore_errors=True)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_an_already_current_machine_layer_still_reports_a_pin_mismatch(self):
+        """The backend-preflight report answers to a different gate than the
+        pip reinstall does. A pin mismatch is a RUNTIME-INSTALL condition --
+        someone pip-installs a newer grammar into the managed venv and
+        nothing about the wiring goes stale -- so the common way it appears
+        is on a machine layer that is already current, which is exactly the
+        run that used to skip the report entirely.
+
+        Same managed two-run fixture as
+        test_single_first_ever_run_reconciles_then_a_second_run_is_a_no_op
+        above, with the venv shim also answering `backend-preflight --json`
+        with a row off its pins. Run 2 must print the warning AND still not
+        re-invoke pip: the no-op guarantee is about the install, not the
+        report."""
+        record = Path(self.tmp) / "pip-invocations.log"
+        fakebin = self._fake_uv_bin(
+            record,
+            preflight_json=(
+                '{"javascript": {"ok": true, "state": "pin-mismatch", '
+                '"reason": "tree-sitter-javascript: pinned 0.25.0, installed 9.9.9"}, '
+                '"python": {"ok": true, "state": "ok", "reason": null}}'
+            ),
+        )
+        engine_dir = tempfile.mkdtemp(prefix="memcontinuum-engine-copy-")
+        copy_engine_for_machine_layer(engine_dir)
+        update_sh = Path(engine_dir) / "scripts" / "memcontinuum-update.sh"
+        warning = "machine: WARNING installed versions differ from the pins for: javascript"
+        try:
+            env = clean_env(self.home)
+            env.pop("MEMCONTINUUM_PYTHON", None)
+            env["PATH"] = fakebin + os.pathsep + env["PATH"]
+
+            proc1 = subprocess.run(
+                [MC_BASH, str(update_sh), "--apply", "--machine"],
+                capture_output=True, text=True, timeout=120, env=env, cwd=self.home,
+            )
+            self.assertEqual(proc1.returncode, 0, proc1.stdout + proc1.stderr)
+            self.assertIn("refreshing machine layer", proc1.stdout)
+            self.assertIn(warning, proc1.stdout)
+            self.assertTrue(record.is_file())
+
+            record.unlink()
+            proc2 = subprocess.run(
+                [MC_BASH, str(update_sh), "--apply", "--machine"],
+                capture_output=True, text=True, timeout=120, env=env, cwd=self.home,
+            )
+            self.assertEqual(proc2.returncode, 0, proc2.stdout + proc2.stderr)
+            self.assertIn("machine layer already current", proc2.stdout)
+            self.assertIn(warning, proc2.stdout,
+                          "an already-current machine layer still reports a pin mismatch")
+            self.assertFalse(record.exists(),
+                             "the report runs on every apply; the pip install still does not")
         finally:
             shutil.rmtree(fakebin, ignore_errors=True)
             shutil.rmtree(engine_dir, ignore_errors=True)
@@ -1182,13 +1254,13 @@ class TestMachineDependencyReconciliation(UpdateTestBase):
             shutil.rmtree(engine_dir, ignore_errors=True)
 
     @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
-    def test_backend_preflight_drift_is_reported_with_its_own_remedy_line(self):
-        """The `drift` branch at scripts/memcontinuum-update.sh's
-        `backend-preflight --json` consumer (ruling 108's third state) had
-        no test at all: every existing fixture here only ever produces
-        `ok` or `missing` rows on a real python, never `drift`, because
-        drift needs a genuinely mismatched installed version and nothing
-        here perturbs one.
+    def test_backend_preflight_pin_mismatch_is_reported_with_its_own_remedy_line(self):
+        """The `pin-mismatch` branch at scripts/memcontinuum-update.sh's
+        `backend-preflight --json` consumer (ruling 108's third state,
+        named by ruling 111) had no test at all: every existing fixture
+        here only ever produces `ok` or `missing` rows on a real python,
+        because a mismatch needs a genuinely different installed version
+        and nothing here perturbs one.
 
         Same "genuinely new (foreign) path" idiom as
         test_foreign_python_is_never_pip_installed_into above (managed=0,
@@ -1196,12 +1268,12 @@ class TestMachineDependencyReconciliation(UpdateTestBase):
         unconditional `PREFLIGHT_JSON="$(PYTHONPATH= "$MANAGED_PY" "$MEMIDX"
         backend-preflight --json)"` step below it runs) -- but this shim
         intercepts the `backend-preflight` invocation itself and hands back
-        canned JSON reporting two drifted rows and one clean one, rather
-        than trying to engineer a real version mismatch through a
+        canned JSON reporting two mismatched rows and one clean one,
+        rather than trying to engineer a real version mismatch through a
         subprocess. Everything else (`-m pip`, version probes, import
         checks memcontinuum-setup.sh makes along the way) still execs the
         real venv python, same as the sibling test."""
-        shim = Path(self.tmp) / "drift-python"
+        shim = Path(self.tmp) / "pin-mismatch-python"
         shim.write_text(
             "#!/usr/bin/env bash\n"
             'if [ "$1" = "-m" ] && [ "$2" = "pip" ]; then\n'
@@ -1209,9 +1281,9 @@ class TestMachineDependencyReconciliation(UpdateTestBase):
             "fi\n"
             'if [ "$2" = "backend-preflight" ]; then\n'
             "    cat <<'JSONEOF'\n"
-            '{"javascript": {"ok": true, "state": "drift", '
+            '{"javascript": {"ok": true, "state": "pin-mismatch", '
             '"reason": "tree-sitter-javascript: pinned 0.25.0, installed 9.9.9"}, '
-            '"php": {"ok": true, "state": "drift", '
+            '"php": {"ok": true, "state": "pin-mismatch", '
             '"reason": "tree-sitter-php: pinned 0.24.1, installed 1.0.0"}, '
             '"python": {"ok": true, "state": "ok", "reason": null}}\n'
             "JSONEOF\n"
@@ -1244,7 +1316,7 @@ class TestMachineDependencyReconciliation(UpdateTestBase):
             # The clean row (python) must not show up on either line, and
             # the missing-wheel remedy ("install the pinned tree-sitter
             # grammar wheels ... yourself") is a DIFFERENT branch that a
-            # drift-only report must never also print.
+            # mismatch-only report must never also print.
             self.assertNotIn("not available in", out)
             self.assertNotIn("still missing after reinstall", out)
         finally:

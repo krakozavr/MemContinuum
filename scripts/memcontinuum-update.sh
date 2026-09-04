@@ -1790,112 +1790,126 @@ if [ "$MACHINE" -eq 1 ]; then
     echo "machine: $MACHINE_CLAUDE_DIR rendered by $MACHINE_STAMP, engine at $MACHINE_ENGINE -- $MACHINE_ACTION"
 
     if [ "$APPLY" -eq 1 ]; then
+        REFRESH_OK=0
         if [ "$MACHINE_ACTION" = "ok" ]; then
             echo "machine layer already current -- nothing to refresh"
+            # Nothing was re-rendered, and nothing needed to be: the stamp
+            # matched the engine, so the config.sh already on disk is the one
+            # a refresh would have written. It is safe to READ below.
+            REFRESH_OK=1
         else
             echo "refreshing machine layer: $MC_BASH_BIN $SETUP --claude-dir $MACHINE_CLAUDE_DIR"
             PY="$(mc_update_resolve_python)" || PY=""
             SETUP_ARGS=(--claude-dir "$MACHINE_CLAUDE_DIR" --no-model-warm)
             [ -n "$PY" ] && SETUP_ARGS=(--claude-dir "$MACHINE_CLAUDE_DIR" --python "$PY" --no-model-warm)
-            REFRESH_OK=0
             if "$MC_BASH_BIN" "$SETUP" "${SETUP_ARGS[@]}"; then
                 echo "OK: machine layer refreshed"
                 REFRESH_OK=1
             else
                 not_applied "FAILED: machine layer refresh -- see above"
             fi
+        fi
 
-            # --- Task 9 (B4/TOP-0118): dependency reconciliation ---------------
-            # Runs ONLY here, immediately after a SUCCESSFUL
-            # memcontinuum-setup.sh -- re-reading the config.sh that refresh
-            # just wrote (it may have rewritten MEMCONTINUUM_VENV_MANAGED via
-            # its own sticky-flag determination, see memcontinuum-setup.sh).
-            #
-            # The REFRESH_OK gate is load-bearing. not_applied only records
-            # WALK_RC=1 and returns, so a FAILED setup used to fall through to
-            # the pip install below -- against a config.sh that failed setup
-            # never rewrote. A setup that dies at its own python version gate,
-            # for instance, leaves the previous run's MEMCONTINUUM_PYTHON and
-            # MEMCONTINUUM_VENV_MANAGED=1 on disk while the python this run
-            # was told to use is a different, foreign one: reconciliation would
-            # then pip-install the lockfile into a python the engine does not
-            # own. Nothing is reconciled unless the refresh that decides what
-            # to reconcile INTO actually succeeded.
-            #
-            # A SECOND, non-stale --apply --machine run takes the "already
-            # current" branch above instead of this one at all, so pip is never
-            # re-invoked and backend-preflight is never re-run -- the no-op
-            # reconciliation guarantees by construction, with no extra "did
-            # anything change" check needed.
-            MANAGED_PY=""
-            MANAGED_FLAG="0"
-            # mc_config_managed_python (scripts/mc-registry-lib.sh) is the ONE
-            # implementation of this read, shared with memcontinuum-setup.sh's
-            # own sticky-flag determination. Both need the DISK truth rather
-            # than the ordinary env-wins resolution mc_update_resolve_python
-            # does, and both would otherwise read a caller's own
-            # MEMCONTINUUM_PYTHON back as if it were what config.sh records --
-            # see that function for the full reason.
-            if [ "$REFRESH_OK" -eq 1 ] && mc_config_managed_python "$MEMCONTINUUM_HOME/config.sh"; then
-                MANAGED_PY="$MC_CONFIG_PYTHON"
-                MANAGED_FLAG="$MC_CONFIG_MANAGED"
-            fi
-            if [ -n "$MANAGED_PY" ]; then
-                if [ "$MANAGED_FLAG" = "1" ]; then
-                    echo "machine: reinstalling requirements.lock into the engine-managed venv ($MANAGED_PY)"
-                    RECONCILE_LOG="$(mktemp 2>/dev/null || printf '/tmp/mc-reconcile-log.%s' "$$")"
-                    if PYTHONPATH= "$MANAGED_PY" -m pip install -r "$ENGINE_ROOT/requirements.lock" >"$RECONCILE_LOG" 2>&1; then
-                        echo "OK: dependencies reconciled"
-                    elif command -v uv >/dev/null 2>&1 \
-                            && PYTHONPATH= uv pip install --python "$MANAGED_PY" -r "$ENGINE_ROOT/requirements.lock" >>"$RECONCILE_LOG" 2>&1; then
-                        # A `-m pip` failure here almost always means a
-                        # uv-created managed venv (uv venv omits pip/
-                        # setuptools/wheel by default -- verified against the
-                        # real uv on this machine: `-m pip` raises "No module
-                        # named pip" in a plain `uv venv` target). uv's own
-                        # installer needs no pip inside the target venv at
-                        # all, so it is the fallback here, not the first
-                        # attempt -- same preference order scripts/repo-init.sh's
-                        # own bootstrap_venv already uses (uv over pip when
-                        # both could apply).
-                        echo "OK: dependencies reconciled (via uv)"
-                    else
-                        cat "$RECONCILE_LOG" >&2
-                        not_applied "FAILED: dependency reconciliation into $MANAGED_PY -- see above"
-                    fi
-                    rm -f "$RECONCILE_LOG"
+        # --- Task 9 (B4/TOP-0118): dependency reconciliation -------------------
+        # Two different things live here, and they answer to different gates.
+        #
+        # The pip REINSTALL runs only after a refresh actually re-rendered the
+        # machine layer, re-reading the config.sh that refresh just wrote (it
+        # may have rewritten MEMCONTINUUM_VENV_MANAGED via its own sticky-flag
+        # determination, see memcontinuum-setup.sh). A second, non-stale
+        # --apply --machine run must not re-invoke pip: that is the
+        # no-op-reconciliation guarantee.
+        #
+        # The backend-preflight REPORT runs on every --apply --machine run,
+        # stale or not. It installs nothing and changes nothing; and the
+        # condition it reports -- a grammar wheel or the tree-sitter runtime
+        # installed at a version the row does not pin -- is a runtime-install
+        # condition. Someone pip-installs a newer grammar into the venv and
+        # nothing about the wiring goes stale, so a report gated on staleness
+        # would stay silent for exactly the case it exists to catch.
+        #
+        # The REFRESH_OK gate on the config read is load-bearing for both.
+        # not_applied only records WALK_RC=1 and returns, so a FAILED setup
+        # used to fall through to the pip install -- against a config.sh that
+        # failed setup never rewrote. A setup that dies at its own python
+        # version gate, for instance, leaves the previous run's
+        # MEMCONTINUUM_PYTHON and MEMCONTINUUM_VENV_MANAGED=1 on disk while
+        # the python this run was told to use is a different, foreign one:
+        # reconciliation would then pip-install the lockfile into a python the
+        # engine does not own.
+        MANAGED_PY=""
+        MANAGED_FLAG="0"
+        RECONCILED=0
+        # mc_config_managed_python (scripts/mc-registry-lib.sh) is the ONE
+        # implementation of this read, shared with memcontinuum-setup.sh's
+        # own sticky-flag determination. Both need the DISK truth rather
+        # than the ordinary env-wins resolution mc_update_resolve_python
+        # does, and both would otherwise read a caller's own
+        # MEMCONTINUUM_PYTHON back as if it were what config.sh records --
+        # see that function for the full reason.
+        if [ "$REFRESH_OK" -eq 1 ] && mc_config_managed_python "$MEMCONTINUUM_HOME/config.sh"; then
+            MANAGED_PY="$MC_CONFIG_PYTHON"
+            MANAGED_FLAG="$MC_CONFIG_MANAGED"
+        fi
+        if [ -n "$MANAGED_PY" ]; then
+            if [ "$MACHINE_ACTION" != "ok" ] && [ "$MANAGED_FLAG" = "1" ]; then
+                echo "machine: reinstalling requirements.lock into the engine-managed venv ($MANAGED_PY)"
+                RECONCILE_LOG="$(mktemp 2>/dev/null || printf '/tmp/mc-reconcile-log.%s' "$$")"
+                if PYTHONPATH= "$MANAGED_PY" -m pip install -r "$ENGINE_ROOT/requirements.lock" >"$RECONCILE_LOG" 2>&1; then
+                    echo "OK: dependencies reconciled"
+                    RECONCILED=1
+                elif command -v uv >/dev/null 2>&1 \
+                        && PYTHONPATH= uv pip install --python "$MANAGED_PY" -r "$ENGINE_ROOT/requirements.lock" >>"$RECONCILE_LOG" 2>&1; then
+                    # A `-m pip` failure here almost always means a
+                    # uv-created managed venv (uv venv omits pip/
+                    # setuptools/wheel by default -- verified against the
+                    # real uv on this machine: `-m pip` raises "No module
+                    # named pip" in a plain `uv venv` target). uv's own
+                    # installer needs no pip inside the target venv at
+                    # all, so it is the fallback here, not the first
+                    # attempt -- same preference order scripts/repo-init.sh's
+                    # own bootstrap_venv already uses (uv over pip when
+                    # both could apply).
+                    echo "OK: dependencies reconciled (via uv)"
+                    RECONCILED=1
+                else
+                    cat "$RECONCILE_LOG" >&2
+                    not_applied "FAILED: dependency reconciliation into $MANAGED_PY -- see above"
                 fi
-                PREFLIGHT_JSON="$(PYTHONPATH= "$MANAGED_PY" "$MEMIDX" backend-preflight --json 2>/dev/null)" || PREFLIGHT_JSON=""
-                if [ -n "$PREFLIGHT_JSON" ]; then
-                    # Two lines out, one python: line 1 is the rows whose
-                    # backend cannot run here at all, line 2 the rows that
-                    # run at a version their pin does not name (ruling 108's
-                    # `drift`). Both need saying, and they need different
-                    # remedies, so neither is folded into the other.
-                    PREFLIGHT_SUMMARY="$(printf '%s' "$PREFLIGHT_JSON" | PYTHONPATH= "$MANAGED_PY" -c '
+                rm -f "$RECONCILE_LOG"
+            fi
+            PREFLIGHT_JSON="$(PYTHONPATH= "$MANAGED_PY" "$MEMIDX" backend-preflight --json 2>/dev/null)" || PREFLIGHT_JSON=""
+            if [ -n "$PREFLIGHT_JSON" ]; then
+                # Two lines out, one python: line 1 is the rows whose
+                # backend cannot run here at all, line 2 the rows that
+                # run at a version their pin does not name (ruling 108's
+                # pin-mismatch state). Both need saying, and they need
+                # different remedies, so neither is folded into the other.
+                PREFLIGHT_SUMMARY="$(printf '%s' "$PREFLIGHT_JSON" | PYTHONPATH= "$MANAGED_PY" -c '
 import json, sys
 data = json.load(sys.stdin)
 missing = [lang for lang, row in data.items() if not row["ok"]]
-drifted = [lang for lang, row in data.items() if row.get("state") == "drift"]
+mismatched = [lang for lang, row in data.items() if row.get("state") == "pin-mismatch"]
 print(",".join(sorted(missing)))
-print(",".join(sorted(drifted)))
+print(",".join(sorted(mismatched)))
 ')"
-                    MISSING="$(printf '%s\n' "$PREFLIGHT_SUMMARY" | sed -n '1p')"
-                    DRIFTED="$(printf '%s\n' "$PREFLIGHT_SUMMARY" | sed -n '2p')"
-                    if [ -n "$DRIFTED" ]; then
-                        echo "machine: WARNING installed versions differ from the pins for: $DRIFTED -- run 'PYTHONPATH= $MANAGED_PY $MEMIDX backend-preflight' for the pinned and installed version of each"
-                    fi
-                    if [ -n "$MISSING" ]; then
-                        if [ "$MANAGED_FLAG" = "1" ]; then
-                            echo "machine: WARNING still missing after reinstall: $MISSING"
-                        else
-                            echo "machine: $MISSING not available in $MANAGED_PY -- install the pinned tree-sitter grammar wheels and the tree-sitter runtime (see requirements.lock) into it yourself, or re-run memcontinuum-setup.sh without --python to get an engine-managed venv this updater can maintain"
-                        fi
+                MISSING="$(printf '%s\n' "$PREFLIGHT_SUMMARY" | sed -n '1p')"
+                MISMATCHED="$(printf '%s\n' "$PREFLIGHT_SUMMARY" | sed -n '2p')"
+                if [ -n "$MISMATCHED" ]; then
+                    echo "machine: WARNING installed versions differ from the pins for: $MISMATCHED -- run 'PYTHONPATH= $MANAGED_PY $MEMIDX backend-preflight' for the pinned and installed version of each"
+                fi
+                if [ -n "$MISSING" ]; then
+                    if [ "$RECONCILED" -eq 1 ]; then
+                        echo "machine: WARNING still missing after reinstall: $MISSING"
+                    elif [ "$MANAGED_FLAG" = "1" ]; then
+                        echo "machine: WARNING $MISSING not installed in the engine-managed venv ($MANAGED_PY) -- run 'PYTHONPATH= $MANAGED_PY -m pip install -r $ENGINE_ROOT/requirements.lock' to install the pinned wheels into it"
+                    else
+                        echo "machine: $MISSING not available in $MANAGED_PY -- install the pinned tree-sitter grammar wheels and the tree-sitter runtime (see requirements.lock) into it yourself, or re-run memcontinuum-setup.sh without --python to get an engine-managed venv this updater can maintain"
                     fi
                 fi
             fi
-            # --- end Task 9 dependency reconciliation ---------------------------
         fi
+        # --- end Task 9 dependency reconciliation -----------------------------
     fi
 fi
 
