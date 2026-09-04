@@ -419,7 +419,10 @@ The code index handles **Swift and Python**, both natively — Swift with a tune
 walker, Python with the standard library's own parser — plus **JavaScript,
 TypeScript, TSX, Java, PHP, Rust, and Lua** through tree-sitter: one generic
 backend, a grammar and a query file per language, so a new language in this
-tier is a data row and a query, not a new parser.
+tier is a data row and a query, not a new parser. 
+
+More languages follow the same path: a pinned grammar, a query file, a table row 
+and a fixture corpus. Contributions in that shape are welcome.
 
 TypeScript and TSX are two languages here, not one. `--lang typescript` covers
 `.ts` files; `.tsx` files need `--lang tsx`, and the census offers `tsx` as its
