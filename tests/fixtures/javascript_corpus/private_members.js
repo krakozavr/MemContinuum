@@ -15,3 +15,13 @@ class Box {
     return this.#secret();
   }
 }
+
+class Vault {
+  #open() {
+    return 1;
+  }
+
+  open() {
+    return this.#open();
+  }
+}

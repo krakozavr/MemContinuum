@@ -16,3 +16,21 @@ register({
     return 3;
   },
 });
+
+const first = {
+  get open() {
+    return 4;
+  },
+};
+
+const second = {
+  get open() {
+    return 5;
+  },
+  set open(v) {
+    this._v = v;
+  },
+  constructor() {
+    return 6;
+  },
+};

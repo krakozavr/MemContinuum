@@ -56,11 +56,16 @@ LANGUAGE_TABLE = {
                     "query_file": "typescript.scm", "impl_version": "1",
                     "extensions": (".ts",), "shebangs": (),
                     "skip_dirs": frozenset({"build", "dist"}),
-                    # `namespace M {}` and `module M {}` are one construct
-                    # spelled two ways, and the grammar names them with two
-                    # node types -- internal_module and module. Both qualify
-                    # what they hold, or the same source qualifies or not
-                    # depending on which spelling its author reached for.
+                    # `namespace M {}` is an internal_module and `module M {}`
+                    # a module; both declare a scope a reference spells, so
+                    # both qualify what they hold -- otherwise the same source
+                    # qualifies or not depending on which spelling its author
+                    # reached for. The module node type ALSO covers the
+                    # ambient external module `declare module "react" {}`,
+                    # which declares no such scope and whose name is a quoted
+                    # specifier; treesitter._qualify drops a string-literal
+                    # container name, so a declaration inside one keeps its own
+                    # unqualified name instead of `"react".f`.
                     # `abstract class A {}` is its own node type,
                     # abstract_class_declaration, distinct from
                     # class_declaration -- a plain class body reuses the same
@@ -74,7 +79,8 @@ LANGUAGE_TABLE = {
             "query_file": "typescript.scm", "impl_version": "1",
             "extensions": (".tsx",), "shebangs": (),
             "skip_dirs": frozenset({"build", "dist"}),
-            # Same two spellings of one construct as the typescript row above,
+            # Same two namespace spellings (and the same string-named
+            # `declare module "x" {}` exclusion) as the typescript row above,
             # plus the same abstract_class_declaration node type.
             "containers": {"class_declaration": "name", "internal_module": "name",
                             "module": "name", "abstract_class_declaration": "name"},

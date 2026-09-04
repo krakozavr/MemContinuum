@@ -1687,24 +1687,44 @@ class TestJavaScriptExtraction(unittest.TestCase):
             ("function", "exported", "exported"),
         ])
 
-    def test_private_class_members_are_chunked_without_the_hash(self):
-        """External gate finding 2, second gate finding 4. A private
-        member's name is a private_property_identifier, a different node
-        type from the property_identifier every method pattern matched, so
-        `#secret(){}` was captured by nothing. The stored symbol drops the
-        leading `#`: a record spells a symbol reference as `path#symbol`,
-        so `widget.js##secret` would be the alternative, and the member is
-        `secret` in every other sentence about it. Private accessors are
-        accessors, same as public ones."""
+    def test_private_class_members_keep_the_hash_that_names_them(self):
+        """A private member's name is a private_property_identifier, a
+        different node type from the property_identifier every method
+        pattern matched, so `#secret(){}` was captured by nothing.
+
+        The `#` STAYS in the symbol and the qualified name. `#open()` and
+        `open()` are two different members of one class -- an idiomatic
+        pair, the private worker and its public wrapper -- and a stripped
+        symbol stored both as `Vault.open`, so a reference to either
+        matched both. A record spells the reference `widget.js##open`; the
+        path/fragment split takes the first `#`, so the fragment keeps its
+        own. Private accessors are accessors, same as public ones."""
         result = self._chunk("private_members.js")
         self.assertEqual((result.status, result.gaps), ("ok", []))
         got = sorted((c["kind"], c["symbol"], c["qualified_name"]) for c in result.chunks)
         self.assertEqual(got, [
-            ("accessor", "hidden", "Box.hidden"),
-            ("accessor", "hidden", "Box.hidden"),   # get and set, two spans
+            ("accessor", "#hidden", "Box.#hidden"),
+            ("accessor", "#hidden", "Box.#hidden"),   # get and set, two spans
+            ("method", "#open", "Vault.#open"),       # beside a public `open()`
+            ("method", "#secret", "Box.#secret"),
             ("method", "open", "Box.open"),
-            ("method", "secret", "Box.secret"),
+            ("method", "open", "Vault.open"),
         ])
+
+    def test_a_private_member_and_its_public_namesake_resolve_apart(self):
+        """The collision the `#` prevents, at the predicate a record is
+        checked with: `#Vault.#open` names the private member and nothing
+        else, `#Vault.open` the public one."""
+        text = (self.CORPUS / "private_members.js").read_text()
+        rel = "private_members.js"
+        pairs = chunkers.get_chunker("javascript").declared_symbols(text)
+        for frag, expected in (("Vault.#open", "Vault.#open"), ("Vault.open", "Vault.open")):
+            matched = [qn for _sym, qn in pairs
+                       if memidx.fragment_matches_symbol(frag, _sym, qn)]
+            self.assertEqual(matched, [expected], frag)
+        self.assertIs(
+            memidx.fragment_declared_in_text("Vault.#open", text, rel), True
+        )
 
     def test_object_literal_methods_carry_the_binding_that_names_them(self):
         """External gate finding 3. An object literal is no qualification
@@ -1718,6 +1738,15 @@ class TestJavaScriptExtraction(unittest.TestCase):
         self.assertEqual((result.status, result.gaps), ("ok", []))
         got = sorted((c["kind"], c["symbol"], c["qualified_name"]) for c in result.chunks)
         self.assertEqual(got, [
+            # An accessor and a constructor of a bound literal carry the
+            # binding too, and each meets its bare reading at its OWN kind:
+            # dedup_by_priority sorts kind first, so a bound METHOD reading
+            # of `get open(){}` would lose to the bare ACCESSOR one and take
+            # the binding down with it.
+            ("accessor", "open", "first.open"),
+            ("accessor", "open", "second.open"),   # get and set, two spans
+            ("accessor", "open", "second.open"),
+            ("constructor", "constructor", "second.constructor"),
             ("method", "get", "api.get"),      # const api = { get(){} }
             ("method", "get", "get"),          # an argument literal: no binding to name it
             ("method", "get", "store.get"),    # store = { get(){} }
@@ -1846,11 +1875,15 @@ class TestTypeScriptExtraction(unittest.TestCase):
         self.assertEqual(got, [
             ("function", "area", "Shapes.area"),      # module M {}
             ("function", "ids", "ids"),               # function* ids()
+            # declare module "vendor-lib" {}: an ambient EXTERNAL module,
+            # the same `module` node type as `module M {}` but named by a
+            # quoted specifier, not a scope. It qualifies nothing.
+            ("function", "shim", "shim"),
             ("function", "volume", "Solids.volume"),  # namespace M {}
+            ("method", "#secret", "Box.#secret"),     # #secret()
             ("method", "get", "api.get"),             # const api = { get(){} }
             ("method", "hidden", "Box.hidden"),       # private hidden()
             ("method", "m2", "A.m2"),                 # abstract class A { m2(){} }
-            ("method", "secret", "Box.secret"),       # #secret()
         ])
 
     def test_no_callable_file(self):
@@ -1933,7 +1966,8 @@ class TestTsxExtraction(unittest.TestCase):
         self.assertEqual(got, [
             ("function", "Memoized", "Memoized"),
             ("function", "area", "Shapes.area"),
-            ("method", "secret", "Box.secret"),
+            ("function", "shim", "shim"),          # declare module "vendor-lib" {}
+            ("method", "#secret", "Box.#secret"),
         ])
 
     def test_localized_error_is_partial(self):

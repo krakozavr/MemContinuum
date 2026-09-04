@@ -35,3 +35,9 @@ abstract class A {
     return 1;
   }
 }
+
+declare module "vendor-lib" {
+  export function shim(): number {
+    return 4;
+  }
+}

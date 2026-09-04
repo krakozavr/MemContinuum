@@ -150,7 +150,7 @@ DEFAULT_MAX_PARSE_BYTES = 1 * 1024 * 1024   # 1 MiB
 # forgets. Bump this by one whenever the shared engine's OUTPUT changes;
 # leave it alone for a comment, a docstring, or a refactor that provably
 # produces identical chunks.
-ENGINE_VERSION = "5"
+ENGINE_VERSION = "6"
 
 # The node types that WRAP a definition rather than being one -- the outer
 # half of ruling 84's wrapper/inner pair, and the only node types
@@ -529,25 +529,19 @@ def _merge_error_intervals(root):
     return [tuple(x) for x in merged]
 
 
-def _symbol_text(data, name_node):
-    """The chunk's symbol: the name node's own text, minus a syntax marker
-    that is not part of the name anything else spells.
-
-    JavaScript and TypeScript write a private class member's name as
-    `private_property_identifier`, whose text carries the leading `#`
-    (`#priv`). A record references a symbol as `path#symbol`, so the `#`
-    would land twice -- `widget.js##priv` is not a reference anyone writes
-    -- and the member is `priv` in every other sentence about it, exactly
-    like the class's public methods. TypeScript's own `private m()` needs
-    nothing here: `private` is a modifier, and the name is an ordinary
-    property_identifier already."""
-    text = data[name_node.start_byte:name_node.end_byte].decode("utf-8", "replace")
-    if name_node.type == "private_property_identifier" and text.startswith("#"):
-        return text[1:]
-    return text
-
-
 def _node_text(node):
+    """The one spelling of "this node's own text" in this module. Every
+    name, qualifier and doc-comment node reads through here; a chunk's
+    signature is the one span that is NOT a whole node (it stops at the
+    body) and slices the source directly.
+
+    A JavaScript private member keeps its `#`. `#m` and `m` are two
+    different members of the same class, so a symbol with the marker
+    stripped would store both at one name and a `#m` reference would match
+    either. A record spells the reference `widget.js##m`: the path/fragment
+    split takes the FIRST `#`, so the fragment keeps its own marker and
+    resolves. TypeScript's `private m()` is unaffected -- there `private` is
+    a modifier and the name is an ordinary property_identifier."""
     return node.text.decode("utf-8", "replace")
 
 
@@ -615,6 +609,15 @@ def _qualify(row, node, symbol, qualifier_text):
     containers at all, is unaffected -- the walk contributes nothing and
     the qualifier stands alone.
 
+    A container whose name field is a STRING LITERAL is not a container at
+    all, and contributes nothing. TypeScript's `module` node type covers
+    both `module M { }` -- a namespace, whose name is an identifier -- and
+    the ambient external module `declare module "react" { }`, whose name is
+    a quoted module specifier. The first names a scope a reference spells;
+    the second names a package, and taking it as a qualifier stored
+    `"react".f`, quotes and all, for a symbol every reference to it writes
+    as `f`.
+
     A row's `prefix_scopes` (see _prefix_scope) names node types that
     qualify what they hold when they hold it, and what FOLLOWS them when
     they hold nothing -- PHP's braced and unbraced namespaces. They
@@ -640,7 +643,7 @@ def _qualify(row, node, symbol, qualifier_text):
                 parts.append(_node_text(_bare_type_name(t)))
         elif field:
             n = p.child_by_field_name(field)
-            if n is not None:
+            if n is not None and n.type != "string":
                 parts.append(_node_text(n))
         p = p.parent
     parts.reverse()
@@ -671,7 +674,7 @@ def _render_signature(data, node):
     return " ".join(text.split())
 
 
-def _doc_for(row, data, node):
+def _doc_for(row, node):
     """Task 7 fix round 1, finding 2: marker-stripping is now symmetric.
     Before this fix, a line was only ever stripped on its LEFT
     (`lstrip("/*# -")`) -- correct for a multi-line block comment (`/**` on
@@ -693,8 +696,7 @@ def _doc_for(row, data, node):
     doc_types = row.get("doc_comment_types", ("comment",))
     if prev is None or prev.type not in doc_types:
         return ""
-    text = data[prev.start_byte:prev.end_byte].decode("utf-8", "replace")
-    for line in text.splitlines():
+    for line in _node_text(prev).splitlines():
         line = line.strip()
         if line.endswith("*/"):
             line = line[:-2].rstrip()
@@ -728,10 +730,8 @@ def build_chunks(lang, row, data, root, matches):
         is_default = "chunk.default" in caps
         if name_node is None and not is_default:
             continue   # unbound callable -- deferred `closure` kind
-        symbol = "default" if name_node is None else _symbol_text(data, name_node)
-        qualifier_text = None
-        if qual_node is not None:
-            qualifier_text = data[qual_node.start_byte:qual_node.end_byte].decode("utf-8", "replace")
+        symbol = "default" if name_node is None else _node_text(name_node)
+        qualifier_text = None if qual_node is None else _node_text(qual_node)
         qualified_name = "default" if name_node is None else _qualify(row, kind_node, symbol, qualifier_text)
         resolved_kind = _kind_for(row, kind, kind_node)
         entries.append({
@@ -771,7 +771,7 @@ def build_chunks(lang, row, data, root, matches):
             continue
         chunks.append({
             "kind": e["kind"], "symbol": e["symbol"], "qualified_name": e["qualified_name"],
-            "signature": _render_signature(data, node), "doc": _doc_for(row, data, e["doc_node"]),
+            "signature": _render_signature(data, node), "doc": _doc_for(row, e["doc_node"]),
             "start_line": node.start_point[0] + 1, "end_line": node.end_point[0] + 1,
         })
 

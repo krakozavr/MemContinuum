@@ -60,15 +60,47 @@
 ; @chunk.qualifier says so explicitly. A literal with no binding to name it
 ; (an argument, a nested value) keeps the unqualified method: less precise,
 ; never dropped.
-(variable_declarator
-  name: (identifier) @chunk.qualifier
-  value: (object
-    (method_definition name: (property_identifier) @chunk.name) @chunk.method))
+;
+; Every KIND a literal can hold needs its own bound pattern, not the plain
+; method alone. dedup_by_priority resolves a same-span collision by kind
+; first (constructor, then accessor, then method) and only then by which
+; reading carried a qualifier, so a bound `get open(){}` matched by the
+; generic accessor pattern and by a bound METHOD pattern would keep the
+; accessor -- the better kind -- and lose the binding with it. Bound and
+; bare readings must therefore meet at the SAME kind, where the qualifier
+; decides.
+(
+  [
+    (variable_declarator
+      name: (identifier) @chunk.qualifier
+      value: (object (method_definition name: (property_identifier) @chunk.name) @chunk.method))
+    (assignment_expression
+      left: (identifier) @chunk.qualifier
+      right: (object (method_definition name: (property_identifier) @chunk.name) @chunk.method))
+  ]
+  (#not-eq? @chunk.name "constructor"))
 
-(assignment_expression
-  left: (identifier) @chunk.qualifier
-  right: (object
-    (method_definition name: (property_identifier) @chunk.name) @chunk.method))
+(
+  [
+    (variable_declarator
+      name: (identifier) @chunk.qualifier
+      value: (object (method_definition name: (property_identifier) @chunk.name) @chunk.constructor))
+    (assignment_expression
+      left: (identifier) @chunk.qualifier
+      right: (object (method_definition name: (property_identifier) @chunk.name) @chunk.constructor))
+  ]
+  (#eq? @chunk.name "constructor"))
+
+[
+  (variable_declarator
+    name: (identifier) @chunk.qualifier
+    value: (object
+      (method_definition ["get" "set"] name: (property_identifier) @chunk.name) @chunk.accessor))
+  (assignment_expression
+    left: (identifier) @chunk.qualifier
+    right: (object
+      (method_definition ["get" "set"] name: (property_identifier) @chunk.name) @chunk.accessor))
+]
 
 (method_definition
   name: (property_identifier) @chunk.name
@@ -88,8 +120,10 @@
 
 ; A private member's name is a private_property_identifier, a different node
 ; type from the property_identifier every pattern above matches, so `#m(){}`
-; was captured by nothing at all. The stored symbol drops the leading `#`
-; (chunkers/treesitter.py's _symbol_text) -- a record references a symbol as
-; `path#symbol`, and `widget.js##m` is not a reference anyone writes.
+; was captured by nothing at all. The `#` is part of the stored symbol:
+; `#m` and `m` are two different members of the same class, and a symbol
+; that dropped the marker would make them one name at two spans. A record
+; references it as `widget.js##m` -- the path/fragment split takes the FIRST
+; `#`, so the fragment keeps its own.
 (method_definition
   name: (private_property_identifier) @chunk.name) @chunk.method

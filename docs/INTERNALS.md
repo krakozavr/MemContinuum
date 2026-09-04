@@ -924,9 +924,11 @@ forever after a backend change — a one-way door. Bumping a row's
 language's files.
 
 For a tree-sitter row the payload is wider:
-`backend:module:engine_version:runtime_pin:grammar_module:grammar_pin:query_fingerprint:row_shape:impl_version`,
-where `query_fingerprint` is the first 12 hex of a sha256 over the row's
-`.scm` query file's own bytes.
+`backend:module:engine_version:runtime_pin:grammar_module:grammar_pin:installed{<dist>=<version>,…}:cap{<effective max bytes>}:query_fingerprint:row_shape:impl_version`,
+where `installed{}` names the two distributions the row depends on at the
+versions this python actually has, `cap{}` is the effective per-file byte cap
+(both below), and `query_fingerprint` is the first 12 hex of a sha256 over the
+row's `.scm` query file's own bytes.
 
 `engine_version` is `chunkers/treesitter.py`'s own `ENGINE_VERSION`. One
 generic module produces the chunks for all seven tree-sitter rows, so a
@@ -1006,8 +1008,8 @@ A query file's capture names carry the whole per-language contract, so the
 generic backend never needs a per-language branch. `@chunk.<kind>` names a
 span and its kind (`function`/`method`/`constructor`/`accessor`); an optional
 `@chunk.name` gives the symbol; an optional `@chunk.qualifier` supplies an
-explicit qualifier prefix in place of the ancestor walk, for a shape with no
-lexical container to walk (Lua's table/method syntax); an optional
+explicit qualifier prefix, for a binding no lexical container names (Lua's
+table/method syntax, a JavaScript object literal bound to a `const`); an optional
 `@chunk.default` marks the export-default case, whose symbol and qualified
 name are both the literal string `default`; an optional `@chunk.doc_anchor`
 names a DIFFERENT node than `@chunk.<kind>` to look for a preceding doc
@@ -1018,6 +1020,37 @@ the assignment statement instead, so that outer node is the anchor). A match
 with neither `@chunk.name` nor `@chunk.default` is dropped — the deferred,
 unbound `closure` kind.
 
+**Qualification composes; it does not replace.** A chunk's `qualified_name` is
+every qualification container the ancestor walk finds above the node (the row's
+own `containers` map), then the query's `@chunk.qualifier` if it captured one,
+then the symbol — joined with dots. The two sources are about different things,
+so a binding a query names can itself sit inside a container the walk names:
+`class A { run(){ const api = { open(){} } } }` is `A.api.open`. A row that
+declares no containers at all (Lua) simply contributes nothing from the walk and
+the query's qualifier stands alone.
+
+Three consequences of that rule are worth stating on their own, because each is
+a name a reader will look up:
+
+- **A container whose name is a string literal is not a container.**
+  TypeScript's `module` node type spells both `module M { }`, a namespace, and
+  the ambient external module `declare module "react" { }`, whose name is a
+  quoted package specifier. The first names a scope; the second does not, so a
+  declaration inside it keeps its own unqualified name rather than `"react".f`.
+- **A JavaScript private member keeps its `#`.** `#open()` and `open()` are two
+  different members of one class — the private worker and its public wrapper are
+  an idiom, not a coincidence — so the symbol is `#open` and the qualified name
+  `Vault.#open`. A record spells the reference `widget.js##open`: the
+  path/fragment split takes the FIRST `#`, so the fragment keeps its own marker
+  and resolves. TypeScript's `private m()` is a modifier on an ordinary name and
+  is unaffected.
+- **A bound object literal qualifies every kind it holds, not just methods.**
+  An object literal is no container, so `const A = { open(){} }` needs the
+  query's qualifier to become `A.open`. Its accessors and a member spelled
+  `constructor` need their own bound patterns for the reason the dedup section
+  below gives: kind is resolved before qualification, so a bound reading must
+  meet its bare reading at the SAME kind or lose.
+
 ### Interval-taint gaps and dedup
 
 Every tree-sitter chunker shares one gap rule. `_merge_error_intervals`
@@ -1025,7 +1058,18 @@ collects and merges every `ERROR` node's byte span and every `is_missing`
 token's zero-width position into one sorted interval list — the taint set. A
 capture becomes a gap (reason `parse-error`) when its own node's span
 overlaps one of those intervals, or when its own node is a descendant of an
-`ERROR` node even with no byte overlap. An interval that overlaps no capture
+`ERROR` node even with no byte overlap.
+
+Overlap is measured half-open at both ends, because that is what both spans
+are: an interval `[s, e)` and a node `[ns, ne)` overlap when `ns < e` and
+`s < ne`. A definition that merely TOUCHES a broken neighbour therefore
+survives — `function ok(){}` immediately before a stray token keeps its chunk
+instead of being dropped with it. The one exception is a ZERO-WIDTH interval, a
+MISSING token: it has no width to overlap with and is judged inclusively, since
+the closing brace an unterminated body lacks is reported exactly at the end of
+the node it breaks and a strict test would read every such node as clean.
+
+An interval that overlaps no capture
 at all still surfaces as its own gap, derived from its raw byte offsets, so
 garbage between two clean functions with nothing query-shaped nearby is never
 silently absorbed. A file with any error and no surviving chunks at all is
@@ -1041,7 +1085,15 @@ Two dedup passes run before gaps are computed, in this order.
 `dedup_by_priority` resolves a SAME-span collision — a get/set accessor also
 matching the generic method pattern, a constructor also matching it —
 keeping the highest-priority kind (constructor, then accessor, then
-method/function; ties keep the first-seen entry). `dedup_nested` then
+method/function). An equal-kind tie is broken by QUALIFICATION: an entry whose
+query supplied an explicit `@chunk.qualifier` is the more specific reading of
+the same span, and it wins over one whose ancestor walk found no container —
+which is what makes a bound object literal's `A.open` beat the bare `open` the
+generic pattern reads at the identical span, rather than the winner depending
+on the order the grammar completed two matches in. Kind is decided FIRST, so a
+qualifier never rescues a worse kind, and a bound reading of an accessor or a
+constructor has to be written at that kind to survive. Ties with nothing left
+to separate them keep the first-seen entry. `dedup_nested` then
 resolves a DIFFERENT-span containment — an export wrapper's outer node
 capturing the same callable as the inner definition node it wraps — keeping
 the innermost match and dropping an outer one only when three things hold
