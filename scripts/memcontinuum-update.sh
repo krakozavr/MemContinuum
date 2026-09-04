@@ -1867,12 +1867,24 @@ if [ "$MACHINE" -eq 1 ]; then
                 fi
                 PREFLIGHT_JSON="$(PYTHONPATH= "$MANAGED_PY" "$MEMIDX" backend-preflight --json 2>/dev/null)" || PREFLIGHT_JSON=""
                 if [ -n "$PREFLIGHT_JSON" ]; then
-                    MISSING="$(printf '%s' "$PREFLIGHT_JSON" | PYTHONPATH= "$MANAGED_PY" -c '
+                    # Two lines out, one python: line 1 is the rows whose
+                    # backend cannot run here at all, line 2 the rows that
+                    # run at a version their pin does not name (ruling 108's
+                    # `drift`). Both need saying, and they need different
+                    # remedies, so neither is folded into the other.
+                    PREFLIGHT_SUMMARY="$(printf '%s' "$PREFLIGHT_JSON" | PYTHONPATH= "$MANAGED_PY" -c '
 import json, sys
 data = json.load(sys.stdin)
 missing = [lang for lang, row in data.items() if not row["ok"]]
+drifted = [lang for lang, row in data.items() if row.get("state") == "drift"]
 print(",".join(sorted(missing)))
+print(",".join(sorted(drifted)))
 ')"
+                    MISSING="$(printf '%s\n' "$PREFLIGHT_SUMMARY" | sed -n '1p')"
+                    DRIFTED="$(printf '%s\n' "$PREFLIGHT_SUMMARY" | sed -n '2p')"
+                    if [ -n "$DRIFTED" ]; then
+                        echo "machine: WARNING installed versions differ from the pins for: $DRIFTED -- run 'PYTHONPATH= $MANAGED_PY $MEMIDX backend-preflight' for the pinned and installed version of each"
+                    fi
                     if [ -n "$MISSING" ]; then
                         if [ "$MANAGED_FLAG" = "1" ]; then
                             echo "machine: WARNING still missing after reinstall: $MISSING"

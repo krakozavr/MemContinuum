@@ -1,6 +1,7 @@
 import contextlib
 import hashlib
 import importlib
+import importlib.metadata
 import io
 import json
 import os
@@ -931,6 +932,91 @@ class TestTreeSitterFingerprint(unittest.TestCase):
                 else:
                     row[field] = original
         self.assertEqual(chunkers.chunker_version("javascript"), before)
+
+    def test_chunker_version_changes_when_the_installed_grammar_version_changes(self):
+        """Ruling 108, external gate finding 1 (BLOCKING) / finding 3 of the
+        second gate. The pins alone cannot describe what a machine actually
+        parses with: a wheel one version off the pin emits different nodes
+        for the same source, and a fingerprint that ignored it would leave
+        every already-indexed file of that language marked current across
+        the swap. Both distributions count -- the row's grammar wheel and
+        the shared tree-sitter runtime, which walks the tree the grammar
+        builds -- so each is probed on its own."""
+        real = importlib.metadata.version
+
+        def patched(dist, target):
+            def fake(name):
+                return "9.9.9" if name == target else real(name)
+            return fake
+
+        chunkers.treesitter.reset_cache()
+        before = chunkers.chunker_version("javascript")
+        for target in ("tree-sitter-javascript", "tree-sitter"):
+            with mock.patch.object(importlib.metadata, "version", patched(target, target)):
+                chunkers.treesitter.reset_cache()
+                self.assertNotEqual(
+                    chunkers.chunker_version("javascript"), before,
+                    f"an installed {target} at a version the row does not pin "
+                    "must change the fingerprint",
+                )
+            chunkers.treesitter.reset_cache()
+        self.assertEqual(chunkers.chunker_version("javascript"), before)
+
+    def test_chunker_version_still_answers_when_the_grammar_is_not_installed(self):
+        """Fail-open half of ruling 108: a not-indexed row still stores its
+        chunker_version (M2a binding point 1), and a missing wheel is
+        exactly the case that produces one -- so the absent version
+        contributes a fixed token rather than an exception, and
+        BackendUnavailable out of get_chunker stays the only report of the
+        absence itself."""
+        real = importlib.metadata.version
+
+        def absent(name):
+            if name == "tree-sitter-javascript":
+                raise importlib.metadata.PackageNotFoundError(name)
+            return real(name)
+
+        chunkers.treesitter.reset_cache()
+        with mock.patch.object(importlib.metadata, "version", absent):
+            cv = chunkers.chunker_version("javascript")
+            self.assertRegex(cv, r"^[0-9a-f]{12}$")
+            self.assertEqual(
+                chunkers.treesitter.installed_version("tree-sitter-javascript"),
+                chunkers.treesitter.VERSION_ABSENT,
+            )
+        chunkers.treesitter.reset_cache()
+
+    def test_chunker_version_changes_when_the_effective_byte_cap_changes(self):
+        """External gate finding 8: MEMCONTINUUM_MAX_PARSE_BYTES decides
+        which files are chunked at all, so a cap change must re-examine
+        them. Raising it has to re-attempt the over-cap files an earlier run
+        skipped; lowering it has to re-examine the ones it accepted."""
+        chunkers.treesitter.reset_cache()
+        before = chunkers.chunker_version("javascript")
+        with mock.patch.dict(os.environ, {"MEMCONTINUUM_MAX_PARSE_BYTES": "4096"}):
+            self.assertNotEqual(chunkers.chunker_version("javascript"), before)
+        self.assertEqual(chunkers.chunker_version("javascript"), before)
+
+    def test_pin_drift_is_none_when_the_install_matches_the_pins(self):
+        chunkers.treesitter.reset_cache()
+        for lang in ("javascript", "typescript", "tsx", "java", "php", "rust", "lua"):
+            self.assertIsNone(chunkers.pin_drift(lang), lang)
+        self.assertIsNone(chunkers.pin_drift("python"))   # native rows pin nothing
+
+    def test_pin_drift_names_the_distribution_and_both_versions(self):
+        real = importlib.metadata.version
+
+        def fake(name):
+            return "9.9.9" if name == "tree-sitter-lua" else real(name)
+
+        chunkers.treesitter.reset_cache()
+        with mock.patch.object(importlib.metadata, "version", fake):
+            drift = chunkers.pin_drift("lua")
+        chunkers.treesitter.reset_cache()
+        self.assertIsNotNone(drift)
+        self.assertIn("tree-sitter-lua", drift)
+        self.assertIn("9.9.9", drift)
+        self.assertIn(chunkers.LANGUAGE_TABLE["lua"]["grammar_pin"], drift)
 
     def test_row_shape_ignores_the_order_a_row_is_written_in(self):
         # Sorted, so reordering a row's own containers is not a rechunk.

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import importlib.metadata
 import io
 import json
 import os
@@ -4092,7 +4093,39 @@ class TestBackendPreflight(unittest.TestCase):
             data = json.loads(buf.getvalue())
         chunkers.treesitter.reset_cache()
         self.assertFalse(data["lua"]["ok"])
+        self.assertEqual(data["lua"]["state"], "missing")
         self.assertIsNotNone(data["lua"]["reason"])
+
+    @unittest.skipUnless(os.environ.get("MEMCONTINUUM_PYTHON", ""),
+                         "needs the fixed venv with the seven pins installed")
+    def test_an_installed_version_off_the_pin_is_reported_as_drift(self):
+        """Ruling 108: a wheel that imports but sits at a version the row
+        does not pin is a THIRD state beside ok and missing. The backend
+        runs, so `ok` stays true and the exit code stays 0; what it produces
+        is not what the pins describe, so the report names the distribution
+        and both versions rather than saying `ok`."""
+        real = importlib.metadata.version
+
+        def fake(name):
+            return "9.9.9" if name == "tree-sitter-lua" else real(name)
+
+        chunkers.treesitter.reset_cache()
+        with mock.patch.object(importlib.metadata, "version", fake):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = memidx.main(["backend-preflight", "--json"])
+            self.assertEqual(rc, 0)
+            data = json.loads(buf.getvalue())
+            text = io.StringIO()
+            with contextlib.redirect_stdout(text):
+                memidx.main(["backend-preflight"])
+        chunkers.treesitter.reset_cache()
+        self.assertEqual(data["lua"]["state"], "drift")
+        self.assertTrue(data["lua"]["ok"], "a drifted row still runs")
+        self.assertIn("9.9.9", data["lua"]["reason"])
+        self.assertIn(chunkers.LANGUAGE_TABLE["lua"]["grammar_pin"], data["lua"]["reason"])
+        self.assertEqual(data["javascript"]["state"], "ok")
+        self.assertIn("DRIFT", text.getvalue())
 
 
 class TestTreeSitterReindexIntegration(unittest.TestCase):

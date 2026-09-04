@@ -186,6 +186,33 @@ def backend_availability():
     return ";".join(parts)
 
 
+def pin_drift(lang):
+    """The gap between what `lang`'s row PINS and what this python has
+    INSTALLED, as one human-readable string, or None when the two agree.
+
+    A row pins a grammar wheel and the tree-sitter runtime; an install
+    pointed at an interpreter this engine does not manage
+    (MEMCONTINUUM_VENV_MANAGED=0) can hold either at a different version.
+    That backend still imports and still chunks -- it simply chunks
+    something the pins do not describe -- so this is a THIRD answer beside
+    ok and missing, and `backend-preflight` reports it as `drift` with both
+    versions named. Native rows pin nothing and never drift.
+
+    chunker_version hashes the installed versions (see there), so a drifted
+    machine re-chunks its own files rather than serving chunks the pins
+    claim; this function is the surface that tells a human WHY."""
+    row = LANGUAGE_TABLE[lang]
+    if row["backend"] != "tree-sitter":
+        return None
+    from . import treesitter
+    gaps = [
+        f"{dist}: pinned {pin}, installed {version}"
+        for dist, pin, version in treesitter.pinned_vs_installed(row)
+        if version != pin
+    ]
+    return "; ".join(gaps) if gaps else None
+
+
 def extension_of(path):
     """The extension a census/provenance tally should key `path` under.
 
@@ -237,21 +264,46 @@ def chunker_version(lang):
     output depends on more than its own module name: the shared engine's
     ENGINE_VERSION (one generic module produces every tree-sitter row's
     chunks, so its behavior changes all seven at once), the pinned runtime
-    and grammar versions, the query file's bytes, and the row's own
-    chunk-shaping data through treesitter.row_shape -- containers,
-    method_if_ancestor_in, doc_comment_types, max_bytes, language_fn.
-    Everything that changes what a chunk looks like is in here;
-    `impl_version` remains the per-row escape hatch on top for anything
-    that is not.
+    and grammar versions, the versions of those two distributions ACTUALLY
+    INSTALLED in this python, the effective per-file byte cap, the query
+    file's bytes, and the row's own chunk-shaping data through
+    treesitter.row_shape -- containers, method_if_ancestor_in,
+    doc_comment_types, max_bytes, language_fn. Everything that changes what
+    a chunk looks like is in here; `impl_version` remains the per-row escape
+    hatch on top for anything that is not.
+
+    Ruling 108 puts the two INSTALLED versions in beside the pins: a
+    grammar wheel one version off the pin parses the same source into
+    different nodes, and a fingerprint built from the pins alone would keep
+    every already-indexed file of that language marked current across the
+    swap. The runtime counts the same way -- it is what walks the tree the
+    grammar builds. A distribution with no metadata here contributes the
+    fixed treesitter.VERSION_ABSENT token instead of raising, so this stays
+    answerable on a machine that lacks the wheel entirely (M2a binding
+    point 1); BackendUnavailable out of get_chunker is still the ONLY way a
+    missing wheel is reported.
+
+    The byte cap enters as its EFFECTIVE value -- treesitter.max_parse_bytes,
+    after MEMCONTINUUM_MAX_PARSE_BYTES is applied -- not as the row's raw
+    `max_bytes` field alone (row_shape carries that). The cap decides which
+    files are chunked at all, so raising it must re-attempt the over-cap
+    files an earlier run skipped, and lowering it must re-examine the ones
+    it accepted.
     """
     row = LANGUAGE_TABLE[lang]
     if row["backend"] == "native":
         payload = f"{row['backend']}:{row['module']}:{row['impl_version']}"
     elif row["backend"] == "tree-sitter":
         from . import treesitter
+        installed = ",".join(
+            f"{dist}={version}"
+            for dist, _pin, version in treesitter.pinned_vs_installed(row)
+        )
         payload = (f"{row['backend']}:{row['module']}:{treesitter.ENGINE_VERSION}:"
                    f"{row['runtime_pin']}:"
                    f"{row['grammar_module']}:{row['grammar_pin']}:"
+                   f"installed{{{installed}}}:"
+                   f"cap{{{treesitter.max_parse_bytes(row)}}}:"
                    f"{treesitter.query_fingerprint(row)}:{treesitter.row_shape(row)}:"
                    f"{row['impl_version']}")
     else:

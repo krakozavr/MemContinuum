@@ -122,6 +122,7 @@ ever invoking it; see TestTreeSitterHookIsolation below).
 
 import hashlib
 import importlib
+import importlib.metadata
 import os
 
 from . import BackendUnavailable, ChunkResult, LANGUAGE_TABLE
@@ -131,6 +132,8 @@ QUERY_DIR = os.path.join(os.path.dirname(__file__), "queries")
 _KIND_PRIORITY = {"constructor": 0, "accessor": 1, "method": 2, "function": 2}
 
 _INSTANCE_CACHE = {}   # lang -> (fingerprint, TreeSitterChunker)
+
+_VERSION_CACHE = {}    # distribution name -> version string | VERSION_ABSENT
 
 
 DEFAULT_MAX_PARSE_BYTES = 1 * 1024 * 1024   # 1 MiB
@@ -185,6 +188,66 @@ def max_parse_bytes(row):
         except ValueError:
             pass
     return DEFAULT_MAX_PARSE_BYTES
+
+
+RUNTIME_DISTRIBUTION = "tree-sitter"
+
+# The stand-in a version component takes when its distribution has no
+# metadata in this python -- a grammar wheel that is simply not installed
+# here. Fixed, so `chunker_version` still returns for a row whose wheel is
+# absent (M2a binding point 1: a not-indexed row stores its
+# chunker_version, and the wheel is exactly what it lacks). The absence
+# itself surfaces one step later and inside code-reindex's per-file guard,
+# as the BackendUnavailable `get_chunker` raises.
+VERSION_ABSENT = "absent"
+
+
+def distribution_of(grammar_module):
+    """The PyPI distribution name that ships `grammar_module`.
+
+    Every grammar this table wires is published under its module name with
+    underscores written as hyphens (`tree_sitter_javascript` ships as
+    `tree-sitter-javascript`), which is also the only transformation
+    `importlib.metadata`'s own lookup normalizes away, so one rule covers
+    the whole table and no row has to carry a second name that can drift
+    out of step with `grammar_module`."""
+    return grammar_module.replace("_", "-")
+
+
+def installed_version(distribution):
+    """The version of `distribution` installed in THIS python, or
+    VERSION_ABSENT when it has no metadata here. Never imports the package:
+    `importlib.metadata` reads the installed distribution's metadata off
+    disk, so this stays usable from `chunker_version`, which must not pull
+    a grammar wheel into the process (and must answer even when there is no
+    wheel to pull).
+
+    Memoized per process: `chunker_version` is called once per file by
+    `heal_code_index` and `code_index_report`, and an installed
+    distribution's version cannot change under a running interpreter.
+    `reset_cache()` clears this alongside the instance cache."""
+    if distribution in _VERSION_CACHE:
+        return _VERSION_CACHE[distribution]
+    try:
+        version = importlib.metadata.version(distribution)
+    except Exception:
+        version = VERSION_ABSENT
+    _VERSION_CACHE[distribution] = version
+    return version
+
+
+def pinned_vs_installed(row):
+    """[(distribution, pinned_version, installed_version), ...] for the two
+    distributions a tree-sitter row's output depends on: the shared
+    `tree-sitter` runtime and the row's own grammar wheel. One list, read by
+    both `chunkers.chunker_version` (which hashes the installed halves) and
+    `chunkers.pin_drift` (which compares the two halves), so the pair of
+    distributions is named in exactly one place."""
+    return [
+        (RUNTIME_DISTRIBUTION, row["runtime_pin"], installed_version(RUNTIME_DISTRIBUTION)),
+        (distribution_of(row["grammar_module"]), row["grammar_pin"],
+         installed_version(distribution_of(row["grammar_module"]))),
+    ]
 
 
 QUERY_UNREADABLE = "query-unreadable"
@@ -286,8 +349,12 @@ def for_language(lang):
 
 
 def reset_cache():
-    """Test helper: drop every cached parser/query instance."""
+    """Test helper: drop every cached parser/query instance, and every
+    memoized installed-distribution version with them (a test that patches
+    `importlib.metadata.version` needs the next `chunker_version` call to
+    read the patched value)."""
     _INSTANCE_CACHE.clear()
+    _VERSION_CACHE.clear()
 
 
 def dedup_by_priority(entries):

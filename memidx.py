@@ -4058,27 +4058,58 @@ def cmd_code_census(args) -> int:
 def cmd_backend_preflight(args) -> int:
     """`backend-preflight [--json]`. Attempts `chunkers.get_chunker(lang)`
     for every LANGUAGE_TABLE row (native: module imports; tree-sitter:
-    grammar imports AND the query compiles) and reports ok/reason per row.
-    Fail-open (Task 9, B4/TOP-0118): one row's exception never stops the
-    rest -- the same discipline chunkers.backend_availability() already
-    follows, this subcommand just exposes it with a per-row reason instead
-    of a bare ok/missing flag, for `memcontinuum-update.sh --machine`'s
-    dependency-reconciliation report and for a human checking a machine's
-    own install directly."""
+    grammar imports AND the query compiles) and reports a per-row state
+    with its reason. Fail-open (Task 9, B4/TOP-0118): one row's exception
+    never stops the rest -- the same discipline
+    chunkers.backend_availability() already follows, this subcommand just
+    exposes it with a per-row reason instead of a bare ok/missing flag, for
+    `memcontinuum-update.sh --machine`'s dependency-reconciliation report
+    and for a human checking a machine's own install directly.
+
+    Three states, not two (ruling 108):
+
+      * `ok`      -- the backend imports here and its grammar wheel and the
+                     tree-sitter runtime sit at the versions the row pins.
+      * `drift`   -- the backend imports, but one of those two
+                     distributions is installed at a DIFFERENT version than
+                     the row pins (chunkers.pin_drift names both). The
+                     backend runs; what it produces is not what the pins
+                     describe. Reported, never fatal: the exit code stays 0
+                     and `ok` stays true, because the row is usable.
+      * `missing` -- the backend cannot run here at all (the wheel is
+                     absent, or the query does not compile); `ok` is false.
+
+    Exit code is 0 for every state -- this command reports a machine's
+    install, it does not gate on it."""
     report = {}
     for lang in sorted(chunkers.LANGUAGE_TABLE):
         try:
             chunkers.get_chunker(lang)
-            report[lang] = {"ok": True, "reason": None}
         except chunkers.BackendUnavailable as exc:
-            report[lang] = {"ok": False, "reason": str(exc)}
+            report[lang] = {"ok": False, "state": "missing", "reason": str(exc)}
+            continue
         except Exception as exc:   # fail-open: a preflight itself must never crash
-            report[lang] = {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
+            report[lang] = {"ok": False, "state": "missing",
+                            "reason": f"{type(exc).__name__}: {exc}"}
+            continue
+        try:
+            drift = chunkers.pin_drift(lang)
+        except Exception as exc:   # same fail-open discipline as the import above
+            drift = f"pin comparison failed: {type(exc).__name__}: {exc}"
+        if drift:
+            report[lang] = {"ok": True, "state": "drift", "reason": drift}
+        else:
+            report[lang] = {"ok": True, "state": "ok", "reason": None}
     if getattr(args, "json", False):
         print(json.dumps(report, indent=2))
     else:
         for lang, row in sorted(report.items()):
-            status = "ok" if row["ok"] else f"MISSING ({row['reason']})"
+            if row["state"] == "ok":
+                status = "ok"
+            elif row["state"] == "drift":
+                status = f"DRIFT ({row['reason']})"
+            else:
+                status = f"MISSING ({row['reason']})"
             print(f"{lang}: {status}")
     return 0
 
@@ -5533,14 +5564,19 @@ def main(argv=None) -> int:
 
     p_preflight = sub.add_parser(
         "backend-preflight",
-        help="report which chunker backends can import here, by language",
+        help="report which chunker backends import here, and whether their "
+             "installed versions match the pins, by language",
         description=(
             "Attempts to import each registered language's chunker backend "
-            "and reports ok/missing per language. A native backend (swift, "
-            "python) fails only on an engine bug of its own; a tree-sitter "
-            "backend (javascript, typescript, tsx, java, php, rust, lua) "
-            "fails when its pinned grammar wheel is not installed in this "
-            "python -- the reported reason names that wheel."
+            "and reports ok, drift or missing per language. A native backend "
+            "(swift, python) fails only on an engine bug of its own; a "
+            "tree-sitter backend (javascript, typescript, tsx, java, php, "
+            "rust, lua) is MISSING when its pinned grammar wheel is not "
+            "installed in this python -- the reported reason names that "
+            "wheel -- and DRIFT when the wheel or the tree-sitter runtime "
+            "imports at a version the row does not pin, which the reason "
+            "names on both sides. A drifted backend still runs; it produces "
+            "chunks the pins do not describe. Exit code is 0 either way."
         ),
     )
     p_preflight.add_argument("--json", action="store_true")

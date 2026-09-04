@@ -2,7 +2,7 @@
   "chunkers/python_ast.py": "537ab7746f35188501b119502b844ca35c5ad926f98ef541f80292f1a89348d3",
   "chunkers/swift.py": "cd31159934190350253e77c874a72506c07e8b0cea3fba62f085073e2cf98ee5",
   "chunkers/treesitter.py": {
-    "sha256": "2ad48351629aaa59679993b52773426a52974e4ebc7cb29592a785821fd35668",
+    "sha256": "1ac90f78ca74dd71f187a29bb92e83e32b7a9e35e70a0e05111c868181462c86",
     "engine_version": "2"
   }
 }

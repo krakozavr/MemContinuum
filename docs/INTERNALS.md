@@ -943,14 +943,28 @@ fingerprint identically despite calling different functions
 (`language_typescript` vs `language_tsx`) on the same grammar module — same
 `chunker_version`, different parse behavior for the same source.
 
-`runtime_pin` and `grammar_pin` are the
-**pinned** version strings
-`LANGUAGE_TABLE` declares — read straight off the row, never off whatever
-package version is actually importable in this python — so the fingerprint
-changes when the table's own pin changes, not when an unpinned install drifts
-underneath it; a grammar installed at the wrong version is a wiring problem
-`backend-preflight` surfaces, not something `chunker_version` can detect on
-its own, because it never introspects the installed package. `impl_version`
+`runtime_pin` and `grammar_pin` are the **pinned** version strings
+`LANGUAGE_TABLE` declares, and each is joined by the version of that same
+distribution **installed in this python** — `importlib.metadata.version` of
+`tree-sitter` and of the row's own grammar wheel (`tree_sitter_javascript`
+ships as `tree-sitter-javascript`: one hyphen rule covers the table, so no row
+carries a second name to keep in step). The fingerprint therefore moves both
+when the table's pin changes and when the install underneath it drifts: a
+grammar one version off the pin parses the same source into different nodes,
+and a fingerprint built from the pins alone would leave every file of that
+language marked current across the swap. Reading the metadata never imports
+the wheel, so `chunker_version` still answers on a machine that has none — an
+absent distribution contributes the fixed token `absent`, and
+`BackendUnavailable` out of `get_chunker` stays the only report of a missing
+wheel. `backend-preflight` names the same mismatch as `drift` (below) for a
+human, with both versions.
+
+The **effective** per-file byte cap joins them — `max_parse_bytes(row)`, the
+row's own `max_bytes` or `MEMCONTINUUM_MAX_PARSE_BYTES` or the 1 MiB default,
+whichever wins — not just the row's raw `max_bytes` field that `row_shape`
+already carries. The cap decides which files are chunked at all, so raising it
+re-attempts the over-cap files an earlier run skipped and lowering it
+re-examines the ones it accepted. `impl_version`
 stays each row's own escape hatch on top of that: bumping it forces a
 re-chunk of one language's files without changing what any other row's
 `chunker_version` computes to, which matters the moment a chunker-behavior
@@ -1071,17 +1085,29 @@ screens out before parsing is ever attempted.
 ### `backend-preflight` and grammar admission
 
 `backend-preflight [--json]` attempts `get_chunker(lang)` for every table row
-and reports ok/missing by language, fail-open per row so one backend's own
-import bug never hides the rest of the report. A native row fails only on an
-engine bug of its own; a tree-sitter row fails when its pinned grammar wheel
-is not installed in this python, and the reported reason names that wheel by
-module — the same underlying missing-module reason a `code-reindex` row
-stamps `not-indexed` for when the same backend goes missing mid-run (that
-row's own reason text carries an extra `BackendUnavailable:` wrapper around
-the identical exception), so a not-indexed reason for a tree-sitter language
-usually names the same module this reports. `memcontinuum-update.sh
---apply --machine` runs this check right after reconciling the engine-managed
-venv and warns by name about any row still missing.
+and reports one of three states by language — `ok`, `drift`, `missing` —
+fail-open per row so one backend's own import bug never hides the rest of the
+report. A native row fails only on an engine bug of its own; a tree-sitter row
+is `missing` when its pinned grammar wheel is not installed in this python, and
+the reported reason names that wheel by module — the same underlying
+missing-module reason a `code-reindex` row stamps `not-indexed` for when the
+same backend goes missing mid-run (that row's own reason text carries an extra
+`BackendUnavailable:` wrapper around the identical exception), so a
+not-indexed reason for a tree-sitter language usually names the same module
+this reports.
+
+`drift` is the third state: the backend imports, but the grammar wheel or the
+`tree-sitter` runtime is installed at a version the row does not pin, and the
+reason names the distribution with both versions (`tree-sitter-javascript:
+pinned 0.25.0, installed 0.25.1`). A drifted row is usable — `ok` stays true in
+the JSON and the exit code stays 0 — so this is a report, not a gate; the
+index it feeds is honest either way, because `chunker_version` hashes those
+same installed versions and re-chunks the language's files. An install pointed
+at an interpreter the engine does not manage (`MEMCONTINUUM_VENV_MANAGED=0`) is
+where drift actually appears, since a managed venv is reinstalled from
+`requirements.lock`. `memcontinuum-update.sh --apply --machine` runs this check
+right after reconciling the engine-managed venv, warns by name about any row
+still missing, and warns separately about any row that drifted.
 
 Five of the six grammar wheels (`tree-sitter` itself, the seventh pin, is the
 runtime, not a grammar) come from the official `github.com/tree-sitter/`
