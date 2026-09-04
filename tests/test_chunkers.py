@@ -1157,12 +1157,12 @@ class TestTypeScriptExtraction(unittest.TestCase):
         # neither applies to two sibling accessor methods.
         result = self._chunk("extra_patterns.ts")
         accessors = sorted(
-            (c["kind"], c["qualified_name"], c["start_line"], c["end_line"])
+            (c["kind"], c["symbol"], c["qualified_name"], c["start_line"], c["end_line"])
             for c in result.chunks if c["qualified_name"] == "Accessors.value"
         )
         self.assertEqual(accessors, [
-            ("accessor", "Accessors.value", 6, 8),
-            ("accessor", "Accessors.value", 10, 12),
+            ("accessor", "value", "Accessors.value", 6, 8),
+            ("accessor", "value", "Accessors.value", 10, 12),
         ])
 
 
@@ -1224,7 +1224,7 @@ class TestTsxExtraction(unittest.TestCase):
         self.assertEqual(result.status, "ok")
         self.assertEqual(len(result.chunks), 1)
         c = result.chunks[0]
-        self.assertEqual((c["kind"], c["qualified_name"]), ("function", "Boxed"))
+        self.assertEqual((c["kind"], c["symbol"], c["qualified_name"]), ("function", "Boxed", "Boxed"))
         self.assertEqual((c["start_line"], c["end_line"]), (3, 5))
 
     def test_default_export_wrapped_arrow_yields_one_function_default_chunk(self):
@@ -1273,3 +1273,64 @@ class TestTsxExtraction(unittest.TestCase):
         c = result.chunks[0]
         self.assertEqual((c["kind"], c["symbol"], c["qualified_name"]), ("function", "default", "default"))
         self.assertEqual((c["start_line"], c["end_line"]), (1, 3))
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestJavaExtraction(unittest.TestCase):
+    CORPUS = REPO_ROOT / "tests" / "fixtures" / "java_corpus"
+
+    def _chunk(self, name):
+        chunkers.treesitter.reset_cache()
+        text = (self.CORPUS / name).read_text()
+        return chunkers.get_chunker("java").chunk_file(text, name)
+
+    def test_widget_recall_excludes_interface_and_abstract_signatures(self):
+        result = self._chunk("Widget.java")
+        self.assertEqual(result.status, "ok")
+        got = sorted((c["kind"], c["qualified_name"]) for c in result.chunks)
+        self.assertEqual(got, sorted([
+            ("constructor", "Widget.Widget"), ("method", "Widget.getValue"),
+            ("constructor", "Widget.Point.Point"),
+        ]))
+        self.assertEqual(len(result.chunks), 3)   # capture-count golden -- greet()/act() excluded
+
+    def test_no_callable_file(self):
+        result = self._chunk("NoCallable.java")
+        self.assertEqual((result.status, result.chunks, result.gaps), ("ok", [], []))
+
+    def test_whole_file_syntax_error(self):
+        result = self._chunk("SyntaxError.java")
+        self.assertEqual(result.status, "failed")
+
+    def test_localized_error_is_partial(self):
+        # Deviation from the brief's literal fixture (see task-5-report.md):
+        # the brief's unclosed `(` in `broken`'s header does not confine the
+        # ERROR node the way the brief's asserted result requires -- verified
+        # against the real grammar: the ERROR span absorbs `alsoGood`'s own
+        # header as a misparsed `formal_parameter` inside `broken`'s
+        # parameter list, so `alsoGood` never becomes its own
+        # method_declaration node at all (no query pattern can capture what
+        # isn't a method_declaration). ErrorRecovery.java's fixture instead
+        # uses a malformed expression (`@@@`) inside `broken`'s (otherwise
+        # well-formed) body -- the grammar recovers from this locally, so
+        # `good` and `alsoGood` both parse as clean method_declaration
+        # nodes; only `broken`'s own span overlaps the ERROR interval and is
+        # dropped as a gap.
+        result = self._chunk("ErrorRecovery.java")
+        self.assertEqual(result.status, "partial")
+        names = {c["qualified_name"] for c in result.chunks}
+        self.assertEqual(names, {"ErrorRecovery.good", "ErrorRecovery.alsoGood"})
+
+    def test_inner_class_method_is_kept_separate_from_the_outer_method(self):
+        # Revision 3, binding addition b -- Java's "legitimately nested
+        # callable" shape is a method inside an inner CLASS (Java has no
+        # local/nested named function declarations); re-verified against the
+        # real grammar this revision: dedup_nested never merges the two --
+        # different symbols ("outerMethod" vs "innerMethod").
+        result = self._chunk("NestedClass.java")
+        self.assertEqual(result.status, "ok")
+        got = sorted((c["kind"], c["qualified_name"]) for c in result.chunks)
+        self.assertEqual(got, sorted([
+            ("method", "Outer.outerMethod"), ("method", "Outer.Inner.innerMethod"),
+        ]))
+        self.assertEqual(len(result.chunks), 2)
