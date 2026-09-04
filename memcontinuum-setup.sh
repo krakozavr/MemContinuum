@@ -35,6 +35,8 @@
 # With neither --python nor --venv given on a real terminal, this blocks on
 # /dev/tty with a python-or-venv menu (choosing abort exits 1) instead of
 # silently creating a venv; a scripted or non-interactive run is unaffected.
+# The menu takes 1, 2 or 3 and nothing else: any other answer is asked again,
+# three times, and then the run aborts having written nothing.
 #
 # Why the model warm is on by default: fastembed downloads ~100 MB the first
 # time anything needs to embed. Left lazy, that download happens inside
@@ -261,14 +263,34 @@ if [ "$PYTHON_EXPLICIT" -eq 0 ] && [ "$VENV_EXPLICIT" -eq 0 ] && [ -t 0 ] && [ "
     echo "  1) use this python ($BOOT_PY)"
     echo "  2) create or reuse the engine venv"
     echo "  3) abort"
-    printf '> '
-    MENU_CHOICE=""
-    read -r MENU_CHOICE < /dev/tty
-    case "$MENU_CHOICE" in
-        1) PYTHON_BIN="$BOOT_PY"; PYTHON_EXPLICIT=1 ;;
-        3) echo "aborted" >&2; exit 1 ;;
-        *) : ;;   # 2, empty, or anything else -- falls through to the create-venv default below
-    esac
+    # Only 1, 2 and 3 are answers. Anything else -- a typo, a stray word, a
+    # bare Enter -- is asked again, up to three times, and then the run
+    # aborts without touching anything (reviewer finding: every response but
+    # 1 and 3 counted as 2, so a mistyped answer created a venv and
+    # installed dependencies the person never agreed to; a bare Enter did
+    # the same, and nothing documents Enter as meaning anything). An abort
+    # here is safe by construction: nothing has been written yet.
+    MENU_TRIES=0
+    MENU_ANSWERED=0
+    while [ "$MENU_TRIES" -lt 3 ]; do
+        MENU_TRIES=$((MENU_TRIES + 1))
+        printf '> '
+        MENU_CHOICE=""
+        read -r MENU_CHOICE < /dev/tty || MENU_CHOICE=""
+        case "$MENU_CHOICE" in
+            1) PYTHON_BIN="$BOOT_PY"; PYTHON_EXPLICIT=1; MENU_ANSWERED=1 ;;
+            2) MENU_ANSWERED=1 ;;   # the create-or-reuse path below
+            3) echo "aborted" >&2; exit 1 ;;
+            *) echo "answer 1, 2 or 3" >&2 ;;
+        esac
+        if [ "$MENU_ANSWERED" -eq 1 ]; then
+            break
+        fi
+    done
+    if [ "$MENU_ANSWERED" -eq 0 ]; then
+        echo "no answer of 1, 2 or 3 after $MENU_TRIES attempts -- aborted" >&2
+        exit 1
+    fi
 fi
 
 if [ -n "$PYTHON_BIN" ]; then

@@ -772,6 +772,11 @@ unscripted run: no `--python`, no `--venv`, and stdin is a real terminal
 scripted, CI, or explicit-flag run bypasses it and keeps the plain
 create-if-absent default this script has always had.
 
+Only `1`, `2` and `3` are answers. Anything else — a typo, a stray word, a
+bare Enter — is asked again, up to three times, and then the run aborts with
+exit 1 having written nothing. Enter is not a shortcut for any option: the
+create-if-absent default belongs to the runs that never see this menu.
+
 `memcontinuum-state.sh` stays python-free and prints one extra line,
 `update: wiring rendered by X, engine at Y -- run scripts/memcontinuum-update.sh`,
 only when the two differ — pulled from the same registry-pinned hook command

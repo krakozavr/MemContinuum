@@ -10,11 +10,14 @@ The split under test:
   scripts/repo-init.sh    repository level -- one store, seven per-project hooks
 Only the first is covered here; scripts/repo-init.sh has its own file.
 """
+import fcntl
 import json
 import os
+import pty
 import shutil
 import subprocess
 import tempfile
+import termios
 import unittest
 from pathlib import Path
 
@@ -1089,6 +1092,95 @@ class TestMissingRegistryLibFailsLoudlyAtStickyRead(BootstrapCase):
             "--python", VENV_PYTHON, "--claude-dir", self.claude, "--no-model-warm",
         ], self.home, self.mc_home)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+
+def run_on_a_tty(script, args, home, mc_home, answers, timeout=120):
+    """Run `script` with a real controlling terminal and feed it `answers`.
+
+    The setup menu is guarded by `[ -t 0 ]` and reads from `/dev/tty`, so a
+    pipe on stdin cannot reach it at all -- the guard skips it, and even
+    past the guard `/dev/tty` resolves to nothing. A pty pair gives stdin a
+    terminal; `setsid` plus `TIOCSCTTY` in the child makes that pty its
+    CONTROLLING terminal, which is the thing `/dev/tty` actually names.
+    Inheriting the pty as a file descriptor alone does neither."""
+    master, slave = pty.openpty()
+
+    def attach_controlling_terminal():
+        os.setsid()
+        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+    proc = subprocess.Popen(
+        [MC_BASH, str(script)] + args,
+        stdin=slave, stdout=slave, stderr=slave,
+        env=clean_env(home, mc_home),
+        preexec_fn=attach_controlling_terminal,
+    )
+    os.close(slave)
+    captured = []
+    try:
+        for answer in answers:
+            os.write(master, answer.encode())
+        while True:
+            try:
+                data = os.read(master, 4096)
+            except OSError:      # EIO: the child closed the last slave fd
+                break
+            if not data:
+                break
+            captured.append(data)
+        rc = proc.wait(timeout=timeout)
+    finally:
+        os.close(master)
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=timeout)
+    return rc, b"".join(captured).decode("utf-8", "replace")
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestInteractiveMenuRejectsUnknownAnswers(BootstrapCase):
+    """External gate finding 10. The menu accepted 1 and 3 and treated
+    EVERYTHING else -- a typo, a stray word, a bare Enter -- as 2, so a
+    mistyped answer created a venv and installed dependencies the person
+    never agreed to. Nothing documents Enter as meaning anything either, so
+    it is not a shortcut for any option.
+
+    Only 1, 2 and 3 are answers now; anything else is asked again, three
+    times, and then the run aborts having written nothing.
+
+    These drive the real script on a real pty -- the menu cannot be reached
+    any other way (see run_on_a_tty)."""
+
+    def _menu_args(self):
+        # No --python and no --venv: the two flags that skip the menu.
+        return ["--claude-dir", self.claude, "--no-model-warm"]
+
+    def test_three_unknown_answers_abort_without_writing_anything(self):
+        engine = Path(self.tmp) / "engine-menu-abort"
+        setup_sh = copy_setup_engine(engine)
+        rc, output = run_on_a_tty(
+            setup_sh, self._menu_args(), self.home, self.mc_home,
+            answers=["oops\n", "\n", "2 please\n"],
+        )
+        self.assertEqual(rc, 1, output)
+        self.assertEqual(output.count("answer 1, 2 or 3"), 3, output)
+        self.assertIn("aborted", output)
+        self.assertFalse((engine / ".venv").exists(), "aborted before any venv is created")
+        self.assertFalse(Path(self.mc_home, "config.sh").exists(), output)
+        self.assertEqual(self.our_commands(), [], "no user-level hook installed")
+
+    def test_an_unknown_answer_is_asked_again_rather_than_ending_the_run(self):
+        engine = Path(self.tmp) / "engine-menu-retry"
+        setup_sh = copy_setup_engine(engine)
+        rc, output = run_on_a_tty(
+            setup_sh, self._menu_args(), self.home, self.mc_home,
+            answers=["oops\n", "3\n"],
+        )
+        self.assertEqual(rc, 1, output)
+        self.assertEqual(output.count("answer 1, 2 or 3"), 1, output)
+        self.assertIn("aborted", output)
+        self.assertNotIn("attempts", output, "this is the explicit abort, not the exhausted one")
+        self.assertFalse((engine / ".venv").exists())
 
 
 if __name__ == "__main__":

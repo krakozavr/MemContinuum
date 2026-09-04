@@ -957,15 +957,24 @@ class TestTreeSitterFingerprint(unittest.TestCase):
         self.assertEqual(len(v), 12)
 
     def test_chunker_version_changes_when_query_file_changes(self):
-        qpath = Path(chunkers.treesitter.QUERY_DIR) / chunkers.LANGUAGE_TABLE["javascript"]["query_file"]
-        original = qpath.read_bytes()
-        before = chunkers.chunker_version("javascript")
-        try:
-            qpath.write_bytes(original + b"\n; probe\n")
-            after = chunkers.chunker_version("javascript")
-            self.assertNotEqual(before, after)
-        finally:
-            qpath.write_bytes(original)
+        """External gate finding 11: the probe edits a COPY in a temp
+        directory with QUERY_DIR pointed at it, never the tracked query
+        file. Editing the real one fails outright in a read-only checkout,
+        and leaves the worktree dirty if the process dies between the write
+        and the restore -- a test must not be able to modify the tree it is
+        testing."""
+        query_file = chunkers.LANGUAGE_TABLE["javascript"]["query_file"]
+        source = Path(chunkers.treesitter.QUERY_DIR) / query_file
+        with tempfile.TemporaryDirectory() as td:
+            copy = Path(td) / query_file
+            copy.write_bytes(source.read_bytes())
+            with mock.patch.object(chunkers.treesitter, "QUERY_DIR", td):
+                before = chunkers.chunker_version("javascript")
+                copy.write_bytes(copy.read_bytes() + b"\n; probe\n")
+                after = chunkers.chunker_version("javascript")
+        self.assertNotEqual(before, after)
+        self.assertEqual(source.read_bytes(),
+                         (Path(chunkers.treesitter.QUERY_DIR) / query_file).read_bytes())
 
     def test_an_unreadable_query_file_never_escapes_the_per_file_guard(self):
         """Whole-branch review, finding 14. chunker_version is reached from

@@ -188,7 +188,9 @@ where it looks like a hang. `--dry-run` prints the plan and writes nothing.
 Run it with neither `--venv` nor `--python`, from a real terminal, and it asks
 which python you want (use this python, or create or reuse the engine venv)
 instead of silently picking for you; a scripted or non-interactive run
-keeps the create-if-absent default. A venv this step creates is
+keeps the create-if-absent default. The menu takes 1, 2 or 3 and nothing else
+— any other answer, a bare Enter included, is asked again, three times, and
+then the run aborts having written nothing. A venv this step creates is
 engine-managed: `scripts/memcontinuum-update.sh --apply --machine` may
 reinstall `requirements.lock` into it to reconcile the pinned tree-sitter grammar
 wheels and the tree-sitter runtime
