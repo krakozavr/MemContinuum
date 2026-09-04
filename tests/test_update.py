@@ -252,7 +252,7 @@ class TestDecideNewFlags(unittest.TestCase):
 
     @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
     def test_wired_with_no_claude_dir_records_the_default_physically(self):
-        """Fix round 4: the DEFAULT claude-dir -- <repo>/.claude, used
+        """Symlink-review round 4: the DEFAULT claude-dir -- <repo>/.claude, used
         whenever --claude-dir is omitted, which is the `wired` command
         skills/memcontinuum/SKILL.md documents -- goes through mc_physical
         exactly like an explicitly given one. The test above covers only

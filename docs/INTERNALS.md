@@ -419,7 +419,7 @@ rules | skill | action`, action being one of `ok`, `stale`, `store-mismatch`,
 row's `store=` names the same store the wiring renders, written in an
 unresolved (symlinked) string form: nothing is mismatched, so the remedy it
 prints is to re-run with `--apply`. `store-form-updated` is what that
-`--apply` pass reports once it has rewritten just the registry's `store=`
+`--apply` pass reports after rewriting just the registry's `store=`
 field, leaving `claude-dirs`/`code-roots`/`langs`/`never` exactly as
 recorded. A `store=` naming a *different* store stays `store-mismatch`,
 which the pair never stands in for.

@@ -42,7 +42,7 @@
 #                  the same store the wiring renders, written in an
 #                  unresolved (symlinked) string form -- nothing is actually
 #                  mismatched, and the remedy is to re-run with --apply.
-#                  store-form-updated (--apply): that pass rewrote just the
+#                  store-form-updated (--apply): that pass rewrites just the
 #                  registry's store= field, leaving claude-dirs/code-roots/
 #                  langs/never exactly as recorded. A store= naming a
 #                  DIFFERENT store is store-mismatch, which this pair never

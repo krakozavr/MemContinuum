@@ -193,7 +193,7 @@ KEY="$MC_REPO_KEY"
 # have.
 #
 # The `wired` DEFAULT claude-dir is assigned HERE, above the loop, rather
-# than beside the wiring scan that consumes it (fix-round-4 finding): an
+# than beside the wiring scan that consumes it (symlink-review round 4): an
 # omitted --claude-dir is the skill's own documented `wired` command
 # (skills/memcontinuum/SKILL.md), so a default assigned below this block is
 # the one path that reaches the note unresolved -- a repo whose .claude is
