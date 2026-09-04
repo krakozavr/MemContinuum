@@ -731,7 +731,8 @@ own layer installed before any repository is wired.
 Immediately after that refresh (never on an already-`ok` layer, and never
 on its own outside a refresh — no extra "did anything change" check exists
 because there is nothing to check when the refresh itself never ran),
-`--apply --machine` also reconciles the six tree-sitter grammar wheels and the tree-sitter runtime.
+`--apply --machine` also reconciles the pinned tree-sitter grammar wheels and
+the tree-sitter runtime.
 It re-reads `config.sh` fresh — the refresh's own
 `memcontinuum-setup.sh` call may just have rewritten
 `MEMCONTINUUM_VENV_MANAGED` via that script's sticky-flag determination
@@ -764,7 +765,7 @@ reconciliation could never fire again. Choosing "use this python" from
 explicit `--python` for this same determination.
 
 `memcontinuum-setup.sh`'s own interactive setup menu — "1) use this python
-(PATH) / 2) create the engine venv / 3) abort" — appears only on a truly
+(PATH) / 2) use or create the engine venv / 3) abort" — appears only on a truly
 unscripted run: no `--python`, no `--venv`, and stdin is a real terminal
 (`[ -t 0 ]`, the same guard `repo-init.sh`'s own census dialogue uses). Any
 scripted, CI, or explicit-flag run bypasses it and keeps the plain

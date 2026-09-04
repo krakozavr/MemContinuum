@@ -85,7 +85,8 @@
 #            stale. Off by default -- most drift is per-repo.
 #
 #            Right after a stale refresh, --apply --machine also reconciles
-#            the six tree-sitter grammar wheels and the tree-sitter runtime: when the refreshed
+#            the pinned tree-sitter grammar wheels and the tree-sitter runtime:
+#            when the refreshed
 #            config.sh records an engine-managed venv (MEMCONTINUUM_VENV_MANAGED=1
 #            -- memcontinuum-setup.sh's own venv, not a python you pointed it
 #            at with --python), it reinstalls requirements.lock into that
@@ -1796,27 +1797,48 @@ if [ "$MACHINE" -eq 1 ]; then
             PY="$(mc_update_resolve_python)" || PY=""
             SETUP_ARGS=(--claude-dir "$MACHINE_CLAUDE_DIR" --no-model-warm)
             [ -n "$PY" ] && SETUP_ARGS=(--claude-dir "$MACHINE_CLAUDE_DIR" --python "$PY" --no-model-warm)
+            REFRESH_OK=0
             if "$MC_BASH_BIN" "$SETUP" "${SETUP_ARGS[@]}"; then
                 echo "OK: machine layer refreshed"
+                REFRESH_OK=1
             else
                 not_applied "FAILED: machine layer refresh -- see above"
             fi
 
             # --- Task 9 (B4/TOP-0118): dependency reconciliation ---------------
-            # Runs ONLY here, immediately after memcontinuum-setup.sh just
-            # returned -- re-reads config.sh FRESH (the call above may just
-            # have rewritten MEMCONTINUUM_VENV_MANAGED via its own sticky-flag
-            # determination, see memcontinuum-setup.sh), never a value cached
-            # from before this refresh. A SECOND, non-stale --apply --machine
-            # run takes the "already current" branch above instead of this one
-            # at all, so pip is never re-invoked and backend-preflight is never
-            # re-run -- the no-op reconciliation guarantees by construction,
-            # with no extra "did anything change" check needed.
+            # Runs ONLY here, immediately after a SUCCESSFUL
+            # memcontinuum-setup.sh -- re-reading the config.sh that refresh
+            # just wrote (it may have rewritten MEMCONTINUUM_VENV_MANAGED via
+            # its own sticky-flag determination, see memcontinuum-setup.sh).
+            #
+            # The REFRESH_OK gate is load-bearing. not_applied only records
+            # WALK_RC=1 and returns, so a FAILED setup used to fall through to
+            # the pip install below -- against a config.sh that failed setup
+            # never rewrote. A setup that dies at its own python version gate,
+            # for instance, leaves the previous run's MEMCONTINUUM_PYTHON and
+            # MEMCONTINUUM_VENV_MANAGED=1 on disk while the python this run
+            # was told to use is a different, foreign one: reconciliation would
+            # then pip-install the lockfile into a python the engine does not
+            # own. Nothing is reconciled unless the refresh that decides what
+            # to reconcile INTO actually succeeded.
+            #
+            # A SECOND, non-stale --apply --machine run takes the "already
+            # current" branch above instead of this one at all, so pip is never
+            # re-invoked and backend-preflight is never re-run -- the no-op
+            # reconciliation guarantees by construction, with no extra "did
+            # anything change" check needed.
             MANAGED_PY=""
             MANAGED_FLAG="0"
-            if [ -f "$MEMCONTINUUM_HOME/config.sh" ]; then
-                MANAGED_PY="$(. "$MEMCONTINUUM_HOME/config.sh" >/dev/null 2>&1; printf '%s' "${MEMCONTINUUM_PYTHON:-}")"
-                MANAGED_FLAG="$(. "$MEMCONTINUUM_HOME/config.sh" >/dev/null 2>&1; printf '%s' "${MEMCONTINUUM_VENV_MANAGED:-0}")"
+            # mc_config_managed_python (scripts/mc-registry-lib.sh) is the ONE
+            # implementation of this read, shared with memcontinuum-setup.sh's
+            # own sticky-flag determination. Both need the DISK truth rather
+            # than the ordinary env-wins resolution mc_update_resolve_python
+            # does, and both would otherwise read a caller's own
+            # MEMCONTINUUM_PYTHON back as if it were what config.sh records --
+            # see that function for the full reason.
+            if [ "$REFRESH_OK" -eq 1 ] && mc_config_managed_python "$MEMCONTINUUM_HOME/config.sh"; then
+                MANAGED_PY="$MC_CONFIG_PYTHON"
+                MANAGED_FLAG="$MC_CONFIG_MANAGED"
             fi
             if [ -n "$MANAGED_PY" ]; then
                 if [ "$MANAGED_FLAG" = "1" ]; then
@@ -1855,7 +1877,7 @@ print(",".join(sorted(missing)))
                         if [ "$MANAGED_FLAG" = "1" ]; then
                             echo "machine: WARNING still missing after reinstall: $MISSING"
                         else
-                            echo "machine: $MISSING not available in $MANAGED_PY -- install the six tree-sitter grammar wheels and the tree-sitter runtime into it yourself, or re-run memcontinuum-setup.sh without --python to get an engine-managed venv this updater can maintain"
+                            echo "machine: $MISSING not available in $MANAGED_PY -- install the pinned tree-sitter grammar wheels and the tree-sitter runtime (see requirements.lock) into it yourself, or re-run memcontinuum-setup.sh without --python to get an engine-managed venv this updater can maintain"
                         fi
                     fi
                 fi

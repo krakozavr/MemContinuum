@@ -190,7 +190,8 @@ which python you want (use one you already have, or let it create the engine
 venv) instead of silently picking for you; a scripted or non-interactive run
 keeps the create-if-absent default. A venv this step creates is
 engine-managed: `scripts/memcontinuum-update.sh --apply --machine` may
-reinstall `requirements.lock` into it to reconcile the six tree-sitter grammar wheels and the tree-sitter runtime
+reinstall `requirements.lock` into it to reconcile the pinned tree-sitter grammar
+wheels and the tree-sitter runtime
 (below). A python you point it at with `--python` is not —
 that command reports what is missing there instead of installing into it.
 

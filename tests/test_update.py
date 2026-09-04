@@ -1234,6 +1234,138 @@ class TestMachineDependencyReconciliation(UpdateTestBase):
             shutil.rmtree(engine_dir, ignore_errors=True)
 
 
+class TestFailedRefreshReconcilesNothing(UpdateTestBase):
+    """Whole-branch review, finding 5(b). `not_applied` only records
+    WALK_RC=1 and returns, so a FAILED memcontinuum-setup.sh used to fall
+    through into the reconciliation block anyway -- reading a config.sh the
+    failed refresh never rewrote, and pip-installing requirements.lock into
+    whatever python that stale file happened to name. Reconciliation now
+    runs only after a refresh that actually succeeded."""
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_a_failed_machine_refresh_never_reaches_pip(self):
+        record = Path(self.tmp) / "pip-invocations.log"
+        # A python config.sh names as engine-managed. If the guard is
+        # missing, the reconciliation block finds MANAGED_PY=this shim and
+        # MANAGED_FLAG=1 and pip-installs into it.
+        shim = Path(self.tmp) / "recorded-python"
+        shim.write_text(
+            "#!/usr/bin/env bash\n"
+            'if [ "$1" = "-m" ] && [ "$2" = "pip" ]; then\n'
+            f'    printf \'%s\\n\' "$*" >> "{record}"\n'
+            "    exit 0\n"
+            "fi\n"
+            f'exec "{VENV_PYTHON}" "$@"\n'
+        )
+        shim.chmod(0o755)
+        mc_home = Path(self.home) / ".memcontinuum"
+        mc_home.mkdir(parents=True, exist_ok=True)
+        (mc_home / "config.sh").write_text(
+            f"if [ -z \"${{MEMCONTINUUM_PYTHON:-}}\" ]; then MEMCONTINUUM_PYTHON='{shim}'; fi\n"
+            "MEMCONTINUUM_VENV_MANAGED='1'\n"
+        )
+
+        engine_dir = tempfile.mkdtemp(prefix="memcontinuum-engine-copy-")
+        copy_engine_for_machine_layer(engine_dir)
+        # The refresh itself fails, the way a real setup.sh does when it hits
+        # its own python version gate before writing config.sh.
+        setup_stub = Path(engine_dir) / "memcontinuum-setup.sh"
+        setup_stub.write_text(
+            "#!/usr/bin/env bash\n"
+            "echo 'ERROR: refusing, this is the stub' >&2\n"
+            "exit 1\n"
+        )
+        setup_stub.chmod(0o755)
+        update_sh = Path(engine_dir) / "scripts" / "memcontinuum-update.sh"
+        try:
+            proc = subprocess.run(
+                [MC_BASH, str(update_sh), "--apply", "--machine"],
+                capture_output=True, text=True, timeout=120,
+                env=clean_env(self.home), cwd=self.home,
+            )
+            out = proc.stdout + proc.stderr
+            self.assertIn("FAILED: machine layer refresh", out)
+            self.assertNotEqual(proc.returncode, 0, out)
+            self.assertFalse(
+                record.exists(),
+                "a failed refresh must never pip-install into the python a stale "
+                f"config.sh names: {record.read_text() if record.exists() else ''}",
+            )
+            self.assertNotIn("reinstalling requirements.lock", out)
+            self.assertNotIn("dependencies reconciled", out)
+        finally:
+            shutil.rmtree(engine_dir, ignore_errors=True)
+
+
+class TestConfigManagedPythonReadsDiskTruth(unittest.TestCase):
+    """Whole-branch review, finding 5(a). Direct unit coverage for
+    mc_config_managed_python (scripts/mc-registry-lib.sh) -- the ONE
+    implementation of the guarded config.sh read that
+    memcontinuum-setup.sh's sticky managed-venv determination and
+    memcontinuum-update.sh --machine's reconciliation both call. Same shape
+    as TestMcPhysical above: the library is pure (no top-level execution),
+    so it is safely sourceable on its own."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp(prefix="memcontinuum-config-read-test-")
+        self.addCleanup(shutil.rmtree, self.td, ignore_errors=True)
+        self.config = Path(self.td) / "config.sh"
+        # Written exactly the way memcontinuum-setup.sh writes it: the
+        # python line is conditional, the managed flag is not.
+        self.config.write_text(
+            "if [ -z \"${MEMCONTINUUM_PYTHON:-}\" ]; then MEMCONTINUUM_PYTHON='/on/disk/python'; fi\n"
+            "MEMCONTINUUM_VENV_MANAGED='1'\n"
+        )
+
+    def _call(self, config, env_overrides=None):
+        caller = Path(self.td) / "probe.sh"
+        caller.write_text(
+            f'#!/usr/bin/env bash\nset -u\n. "{REGISTRY_LIB}"\n'
+            'mc_config_managed_python "$1"\n'
+            'printf "%s\\n%s\\n%s" "$?" "$MC_CONFIG_PYTHON" "$MC_CONFIG_MANAGED"\n'
+        )
+        env = dict(os.environ)
+        env.pop("MEMCONTINUUM_PYTHON", None)
+        env.pop("MEMCONTINUUM_VENV_MANAGED", None)
+        env.update(env_overrides or {})
+        proc = subprocess.run(
+            [MC_BASH, str(caller), str(config)],
+            capture_output=True, text=True, env=env, timeout=10,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        rc, python, managed = proc.stdout.split("\n")
+        return rc, python, managed
+
+    def test_a_callers_own_env_value_never_shadows_the_recorded_one(self):
+        # The tautology this guard exists for: without the `unset`, the
+        # conditional python line leaves the caller's own value in place and
+        # the read hands it back as if config.sh had recorded it -- while
+        # the unconditional managed flag reads the real file, so a foreign
+        # python pairs with a managed=1 nobody granted it.
+        rc, python, managed = self._call(
+            self.config, {"MEMCONTINUUM_PYTHON": "/foreign/python3.11"}
+        )
+        self.assertEqual(rc, "0")
+        self.assertEqual(python, "/on/disk/python")
+        self.assertEqual(managed, "1")
+
+    def test_reads_the_recorded_values_with_nothing_in_the_environment(self):
+        rc, python, managed = self._call(self.config)
+        self.assertEqual((rc, python, managed), ("0", "/on/disk/python", "1"))
+
+    def test_a_missing_config_returns_one_and_clears_both(self):
+        rc, python, managed = self._call(Path(self.td) / "nowhere" / "config.sh")
+        self.assertEqual((rc, python, managed), ("1", "", "0"))
+
+    def test_both_callers_use_this_one_implementation(self):
+        # The defect was the same read implemented twice, one guarded and
+        # one not. Assert there is one implementation and both callers reach
+        # it, so a future edit cannot silently re-fork it.
+        for script in (TOOLS_DIR / "memcontinuum-setup.sh",
+                       TOOLS_DIR / "scripts" / "memcontinuum-update.sh"):
+            self.assertIn("mc_config_managed_python", script.read_text(), str(script))
+
+
 class TestStoreMissingIsAFirstClassAction(UpdateTestBase):
     """A row whose store path is no longer an existing, marked store is
     `store-missing` in the ACTION column -- even when everything else agrees.

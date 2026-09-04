@@ -259,7 +259,7 @@ if [ "$PYTHON_EXPLICIT" -eq 0 ] && [ "$VENV_EXPLICIT" -eq 0 ] && [ -t 0 ] && [ "
     echo
     echo "Set up MemContinuum's python environment:"
     echo "  1) use this python ($BOOT_PY)"
-    echo "  2) create the engine venv"
+    echo "  2) use or create the engine venv"
     echo "  3) abort"
     printf '> '
     MENU_CHOICE=""
@@ -325,25 +325,16 @@ fi
 NEW_VENV_MANAGED=1
 if [ "$PYTHON_EXPLICIT" -eq 1 ]; then
     NEW_VENV_MANAGED=0
-    if [ -f "$MEMCONTINUUM_HOME/config.sh" ]; then
-        # `unset` first, inside the subshell: config.sh's own
-        # MEMCONTINUUM_PYTHON line only assigns when that name is not
-        # ALREADY set (`if [ -z "${MEMCONTINUUM_PYTHON:-}" ]`, deliberately,
-        # so an explicit env override still wins downstream) -- and a
-        # subshell inherits every variable this process has, exported or
-        # not. Left unguarded, a caller with MEMCONTINUUM_PYTHON already in
-        # its own environment (this run's own --python may have come from
-        # exactly that) would make this read back its OWN just-passed value
-        # instead of what config.sh actually has on disk, so a genuinely
-        # new/different python could tautologically "match itself" and be
-        # misread as re-affirming a prior managed path it never recorded.
-        # This determination needs the disk truth specifically, not the
-        # ordinary env-wins-over-config.sh resolution order.
-        PREV_PYTHON="$(unset MEMCONTINUUM_PYTHON MEMCONTINUUM_VENV_MANAGED
-            . "$MEMCONTINUUM_HOME/config.sh" >/dev/null 2>&1; printf '%s' "${MEMCONTINUUM_PYTHON:-}")"
-        PREV_MANAGED="$(unset MEMCONTINUUM_PYTHON MEMCONTINUUM_VENV_MANAGED
-            . "$MEMCONTINUUM_HOME/config.sh" >/dev/null 2>&1; printf '%s' "${MEMCONTINUUM_VENV_MANAGED:-0}")"
-        if [ "$PREV_PYTHON" = "$PYTHON_BIN" ] && [ "$PREV_MANAGED" = "1" ]; then
+    # mc_config_managed_python (scripts/mc-registry-lib.sh) is the ONE
+    # implementation of this read, shared with scripts/memcontinuum-update.sh
+    # --machine's reconciliation, which needs exactly the same disk truth for
+    # exactly the same reason. See that function for why the read unsets both
+    # names first. Guarded by `type` because this script tolerates a missing
+    # library (see the source line near the top): without it the disk truth is
+    # unreadable, and an unreadable prior record is not a re-affirmation.
+    if type mc_config_managed_python >/dev/null 2>&1 \
+            && mc_config_managed_python "$MEMCONTINUUM_HOME/config.sh"; then
+        if [ "$MC_CONFIG_PYTHON" = "$PYTHON_BIN" ] && [ "$MC_CONFIG_MANAGED" = "1" ]; then
             NEW_VENV_MANAGED=1   # re-affirming a venv THIS engine already owns, not a foreign path
         fi
     fi

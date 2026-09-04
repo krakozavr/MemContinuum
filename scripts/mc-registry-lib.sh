@@ -812,3 +812,48 @@ mc_resolve_home() {
     [ -n "${MEMCONTINUUM_HOME:-}" ] || MEMCONTINUUM_HOME="$default_home"
     return 0
 }
+
+# mc_config_managed_python CONFIG_FILE
+#
+# Read MEMCONTINUUM_PYTHON and MEMCONTINUUM_VENV_MANAGED off a config.sh AS
+# THEY STAND ON DISK, ignoring whatever the calling environment already has
+# under those names. Sets MC_CONFIG_PYTHON (empty when the file records
+# none) and MC_CONFIG_MANAGED ("0" or "1"); returns 0 when the file was
+# read, 1 when it does not exist, with both cleared.
+#
+# The `unset` inside each subshell is the whole point, and it is not
+# optional. config.sh writes its python line conditionally --
+# `if [ -z "${MEMCONTINUUM_PYTHON:-}" ]; then MEMCONTINUUM_PYTHON=...; fi`,
+# deliberately, so an explicit env override still wins for ordinary
+# resolution -- and a subshell inherits every variable this process has,
+# exported or not. Left unguarded, a caller that already has
+# MEMCONTINUUM_PYTHON set reads back its OWN value and calls it the disk
+# truth, while MEMCONTINUUM_VENV_MANAGED (written unconditionally) reads the
+# real file. That mismatched pair is how a foreign python acquires a
+# managed=1 flag it never earned.
+#
+# Two decisions need this specific read, and both are decisions ABOUT the
+# recorded install rather than about which python to run now:
+# memcontinuum-setup.sh's sticky managed-venv determination, and
+# memcontinuum-update.sh --machine's choice of whether it may reinstall
+# requirements.lock into that python. Ordinary "which python do I run"
+# resolution stays env-first and does not come through here.
+mc_config_managed_python() {
+    local config="${1:-}"
+    MC_CONFIG_PYTHON=""
+    MC_CONFIG_MANAGED="0"
+    [ -n "$config" ] && [ -f "$config" ] || return 1
+    MC_CONFIG_PYTHON="$(
+        unset MEMCONTINUUM_PYTHON MEMCONTINUUM_VENV_MANAGED
+        # shellcheck source=/dev/null
+        . "$config" >/dev/null 2>&1
+        printf '%s' "${MEMCONTINUUM_PYTHON:-}"
+    )"
+    MC_CONFIG_MANAGED="$(
+        unset MEMCONTINUUM_PYTHON MEMCONTINUUM_VENV_MANAGED
+        # shellcheck source=/dev/null
+        . "$config" >/dev/null 2>&1
+        printf '%s' "${MEMCONTINUUM_VENV_MANAGED:-0}"
+    )"
+    return 0
+}
