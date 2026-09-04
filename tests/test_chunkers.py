@@ -1091,3 +1091,185 @@ class TestJavaScriptExtraction(unittest.TestCase):
             ("method", "Widget.method"), ("function", "Widget.helper"),
         ]))
         self.assertEqual(len(result.chunks), 4)   # nothing merged
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestTypeScriptExtraction(unittest.TestCase):
+    # Task 4: chunkers/queries/typescript.scm is the SAME file the "tsx"
+    # LANGUAGE_TABLE row reads (ruling 83) -- this class exercises it
+    # through the "typescript" row/grammar; TestTsxExtraction below
+    # exercises the identical file through the "tsx" row/grammar.
+    CORPUS = REPO_ROOT / "tests" / "fixtures" / "typescript_corpus"
+
+    def _chunk(self, name):
+        chunkers.treesitter.reset_cache()
+        text = (self.CORPUS / name).read_text()
+        return chunkers.get_chunker("typescript").chunk_file(text, name)
+
+    def test_basic_recall_skips_overload_signatures(self):
+        result = self._chunk("basic.ts")
+        self.assertEqual(result.status, "ok")
+        got = sorted((c["kind"], c["qualified_name"]) for c in result.chunks)
+        self.assertEqual(got, sorted([
+            ("function", "plain"), ("function", "arrowed"),
+            ("function", "overloaded"),          # the ONE implementation, not the two signatures
+            ("function", "Util.helper"),
+            ("constructor", "Widget.constructor"), ("accessor", "Widget.value"),
+        ]))
+        self.assertEqual(len(result.chunks), 6)   # capture-count golden -- overload pair excluded
+
+    def test_no_callable_file(self):
+        result = self._chunk("no_callable.ts")
+        self.assertEqual((result.status, result.chunks, result.gaps), ("ok", [], []))
+
+    def test_whole_file_syntax_error(self):
+        result = self._chunk("syntax_error.ts")
+        self.assertEqual(result.status, "failed")
+
+    def test_nested_callables_are_kept_as_separate_chunks(self):
+        result = self._chunk("nested_calls.ts")
+        self.assertEqual(result.status, "ok")
+        got = sorted((c["kind"], c["qualified_name"]) for c in result.chunks)
+        self.assertEqual(got, sorted([
+            ("function", "outer"), ("function", "inner"),
+            ("method", "Widget.method"), ("function", "Widget.helper"),
+        ]))
+        self.assertEqual(len(result.chunks), 4)
+
+    def test_bound_function_expression_is_a_function_chunk(self):
+        # typescript.scm's variable_declarator pattern's function_expression
+        # branch -- unexercised by any brief-listed fixture (basic.ts's
+        # `arrowed` only hits the arrow_function branch of the same
+        # alternation), same gap Task 3's review round 1 found in
+        # javascript.scm. `const boxed = function (x) {...}`.
+        result = self._chunk("extra_patterns.ts")
+        boxed = [c for c in result.chunks if c["qualified_name"] == "boxed"]
+        self.assertEqual(len(boxed), 1)
+        self.assertEqual((boxed[0]["kind"], boxed[0]["symbol"]), ("function", "boxed"))
+        self.assertEqual((boxed[0]["start_line"], boxed[0]["end_line"]), (1, 3))
+
+    def test_set_accessor_is_its_own_accessor_chunk(self):
+        # typescript.scm's "set" method_definition pattern -- unexercised by
+        # any brief-listed fixture (basic.ts's Widget has only `get value`).
+        # Both the get and the set accessor for the same symbol survive as
+        # separate chunks (different spans, same qualified_name) -- dedup
+        # only merges same-span or same-symbol-containment matches, and
+        # neither applies to two sibling accessor methods.
+        result = self._chunk("extra_patterns.ts")
+        accessors = sorted(
+            (c["kind"], c["qualified_name"], c["start_line"], c["end_line"])
+            for c in result.chunks if c["qualified_name"] == "Accessors.value"
+        )
+        self.assertEqual(accessors, [
+            ("accessor", "Accessors.value", 6, 8),
+            ("accessor", "Accessors.value", 10, 12),
+        ])
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestTsxExtraction(unittest.TestCase):
+    CORPUS = REPO_ROOT / "tests" / "fixtures" / "tsx_corpus"
+
+    def _chunk(self, name):
+        chunkers.treesitter.reset_cache()
+        text = (self.CORPUS / name).read_text()
+        return chunkers.get_chunker("tsx").chunk_file(text, name)
+
+    def test_react_components_recall_exactly_one_chunk_per_component(self):
+        # Ruling 84: re-verified this revision against the real
+        # language_tsx() grammar plus the dedup pipeline, not merely
+        # assumed identical to the plain-JS case.
+        result = self._chunk("react_components.tsx")
+        self.assertEqual(result.status, "ok")
+        got = sorted((c["kind"], c["qualified_name"]) for c in result.chunks)
+        self.assertEqual(got, sorted([
+            ("function", "Plain"), ("function", "Named"),
+            ("function", "Fwd"), ("function", "DefaultOne"),
+        ]))
+        self.assertEqual(len(result.chunks), 4)   # exactly one chunk per component
+
+    def test_localized_error_is_partial(self):
+        # Deviation from the brief's literal fixture (see task-4-report.md):
+        # an unclosed `(` in a TSX function header does not confine the
+        # ERROR node the way it does in the JS grammar -- verified against
+        # the real language_tsx() (and language_typescript()) grammar, the
+        # unclosed paren's ERROR recovery swallows every following token,
+        # including AlsoGood's own definition (reparsed as an unbound,
+        # nested function_expression no query pattern matches), all the way
+        # to EOF. error_recovery.tsx instead uses a malformed expression
+        # `@@@` inside Broken's (otherwise well-formed) body, which the TSX
+        # grammar recovers from locally -- Good and AlsoGood both parse as
+        # their own clean function_declaration nodes; only Broken's own
+        # function_declaration span overlaps the ERROR interval and is
+        # dropped as a gap.
+        result = self._chunk("error_recovery.tsx")
+        self.assertEqual(result.status, "partial")
+        names = {c["qualified_name"] for c in result.chunks}
+        self.assertEqual(names, {"Good", "AlsoGood"})
+        self.assertEqual(result.gaps, [(5, 7, "parse-error")])
+
+    def test_typescript_and_tsx_are_independent_rows(self):
+        chunkers.treesitter.reset_cache()
+        ts_inst = chunkers.treesitter.for_language("typescript")
+        tsx_inst = chunkers.treesitter.for_language("tsx")
+        self.assertIsNot(ts_inst, tsx_inst)
+        chunkers.treesitter.reset_cache()
+
+    def test_wrapped_function_expression_is_a_function_chunk(self):
+        # typescript.scm's memo/forwardRef-wrapped variable_declarator
+        # pattern's function_expression branch -- react_components.tsx's
+        # `Named`/`Fwd` only exercise the arrow_function branch of the same
+        # alternation. `const Boxed = memo(function (props) {...})`.
+        result = self._chunk("wrapped_function_expression.tsx")
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(len(result.chunks), 1)
+        c = result.chunks[0]
+        self.assertEqual((c["kind"], c["qualified_name"]), ("function", "Boxed"))
+        self.assertEqual((c["start_line"], c["end_line"]), (3, 5))
+
+    def test_default_export_wrapped_arrow_yields_one_function_default_chunk(self):
+        # typescript.scm's `export default memo/forwardRef(...)` pattern --
+        # entirely unexercised by any brief-listed fixture (DefaultOne in
+        # react_components.tsx is a plain `export default function`, a
+        # DIFFERENT pattern). Arrow branch: `export default memo(() => {...})`.
+        result = self._chunk("default_export_wrapped_arrow.tsx")
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(len(result.chunks), 1)
+        c = result.chunks[0]
+        self.assertEqual((c["kind"], c["symbol"], c["qualified_name"]), ("function", "default", "default"))
+        self.assertEqual((c["start_line"], c["end_line"]), (3, 5))
+
+    def test_default_export_wrapped_function_expression_span_is_the_inner_callable(self):
+        # Same pattern as above, function_expression branch:
+        # `export default forwardRef(function (props, ref) {...})`. Span is
+        # the inner function_expression's own lines, not the wrapping call
+        # or the `export default` keyword's line.
+        result = self._chunk("default_export_wrapped_function.tsx")
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(len(result.chunks), 1)
+        c = result.chunks[0]
+        self.assertEqual((c["kind"], c["symbol"], c["qualified_name"]), ("function", "default", "default"))
+        self.assertEqual((c["start_line"], c["end_line"]), (3, 5))
+
+    def test_anonymous_default_export_arrow_yields_one_function_default_chunk(self):
+        # typescript.scm's plain (unwrapped) anonymous `export default
+        # (arrow_function|function_expression)` pattern -- entirely
+        # unexercised by any brief-listed fixture. Arrow branch.
+        result = self._chunk("anonymous_default_arrow.tsx")
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(len(result.chunks), 1)
+        c = result.chunks[0]
+        self.assertEqual((c["kind"], c["symbol"], c["qualified_name"]), ("function", "default", "default"))
+        self.assertEqual((c["start_line"], c["end_line"]), (1, 3))
+
+    def test_anonymous_default_export_function_expression_yields_one_function_default_chunk(self):
+        # Same pattern, function_expression branch: `export default
+        # function () {...}` (no name -- `export default function Named(){}`
+        # is a DIFFERENT grammar shape, a named function_declaration,
+        # already covered by react_components.tsx's DefaultOne).
+        result = self._chunk("anonymous_default_function.tsx")
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(len(result.chunks), 1)
+        c = result.chunks[0]
+        self.assertEqual((c["kind"], c["symbol"], c["qualified_name"]), ("function", "default", "default"))
+        self.assertEqual((c["start_line"], c["end_line"]), (1, 3))

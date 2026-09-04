@@ -467,5 +467,19 @@ class TestJavaScriptSymbolRouting(unittest.TestCase):
         self.assertFalse(memidx.fragment_declared_in_text("nonexistent", text, rel_path="a.js"))
 
 
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestTypeScriptSymbolRouting(unittest.TestCase):
+    def test_ts_symbol_fragment_routes_through_the_registry(self):
+        text = "function widget_loader(): number {\n  return 1;\n}\n"
+        self.assertTrue(memidx.fragment_declared_in_text("widget_loader", text, rel_path="a.ts"))
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestTsxSymbolRouting(unittest.TestCase):
+    def test_tsx_symbol_fragment_routes_through_the_registry(self):
+        text = "function WidgetLoader(): JSX.Element {\n  return null;\n}\n"
+        self.assertTrue(memidx.fragment_declared_in_text("WidgetLoader", text, rel_path="a.tsx"))
+
+
 if __name__ == "__main__":
     unittest.main()
