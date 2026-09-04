@@ -1600,3 +1600,83 @@ class TestRustExtraction(unittest.TestCase):
         self.assertEqual(by_qname["top_level"]["doc"], "Adds one to the input.")
         # A container method with no comment above it -- doc stays empty.
         self.assertEqual(by_qname["Widget.new"]["doc"], "")
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestLuaExtraction(unittest.TestCase):
+    CORPUS = REPO_ROOT / "tests" / "fixtures" / "lua_corpus"
+
+    def _chunk(self, name):
+        return _tree_sitter_chunk("lua", self.CORPUS, name)
+
+    def test_widget_recall_dotted_and_colon_forms(self):
+        # Pattern-index coverage: widget.lua alone exercises all four
+        # lua.scm patterns -- pattern 0 (plain/local function_declaration:
+        # `plain`, `loc`), pattern 1 (dot_index_expression method:
+        # `M.g`), pattern 2 (method_index_expression: `obj.m`), pattern 3
+        # (assignment_statement RHS function_definition: `M.f`). Verified
+        # against the real grammar (tree_sitter_lua 0.5.0) this revision.
+        result = self._chunk("widget.lua")
+        self.assertEqual(result.status, "ok")
+        # kind, symbol AND qualified_name -- not just the pair -- so
+        # patterns 1/2/3's own job (stripping the qualifier back out of
+        # the symbol: `M.g` -> symbol `g`, `obj.m` -> symbol `m`, `M.f` ->
+        # symbol `f`) is actually asserted, not just the qualified result
+        # patterns 0/1/2/3 all happen to agree on.
+        got = sorted((c["kind"], c["symbol"], c["qualified_name"]) for c in result.chunks)
+        self.assertEqual(got, sorted([
+            ("function", "plain", "plain"), ("function", "loc", "loc"),
+            ("method", "f", "M.f"), ("method", "g", "M.g"), ("method", "m", "obj.m"),
+        ]))
+        self.assertEqual(len(result.chunks), 5)   # capture-count golden
+        for c in result.chunks:
+            self.assertEqual(c["lang"], "lua")
+            self.assertIn(c["kind"], chunkers.KINDS)
+
+    def test_no_callable_file(self):
+        result = self._chunk("no_callable.lua")
+        self.assertEqual((result.status, result.chunks, result.gaps), ("ok", [], []))
+
+    def test_whole_file_syntax_error(self):
+        result = self._chunk("syntax_error.lua")
+        self.assertEqual(result.status, "failed")
+
+    def test_localized_error_is_partial(self):
+        result = self._chunk("error_recovery.lua")
+        self.assertEqual(result.status, "partial")
+        names = {c["qualified_name"] for c in result.chunks}
+        self.assertEqual(names, {"good", "also_good"})
+
+    def test_declared_symbols_accepts_bare_and_dotted_fragment(self):
+        chunkers.treesitter.reset_cache()
+        text = (self.CORPUS / "widget.lua").read_text()
+        pairs = chunkers.get_chunker("lua").declared_symbols(text)
+        self.assertIn(("m", "obj.m"), pairs)
+
+    def test_nested_local_function_is_kept_separate_from_the_outer_one(self):
+        # Revision 3, binding addition b: a `local function` nested inside
+        # another `function` is its own `function` chunk, never merged
+        # with the enclosing one -- verified against the real grammar,
+        # both function_declaration nodes match pattern 0, different
+        # symbols (outer vs inner) so dedup_nested never collides them.
+        result = self._chunk("nested_calls.lua")
+        self.assertEqual(result.status, "ok")
+        got = sorted((c["kind"], c["symbol"], c["qualified_name"]) for c in result.chunks)
+        self.assertEqual(got, sorted([
+            ("function", "outer", "outer"), ("function", "inner", "inner"),
+        ]))
+        self.assertEqual(len(result.chunks), 2)
+
+    def test_dash_dash_doc_comment_lands_in_its_chunk_doc(self):
+        # Context note (not in the brief's literal fixture list): Lua's own
+        # comment node type is "comment" (verified against the real
+        # grammar -- a `--` line comment and a `--[[ ]]` block comment are
+        # both node type "comment"), matching _doc_for's default
+        # ("comment",), so the lua row needs no doc_comment_types override
+        # -- this asserts that default actually reaches a Lua `--` doc
+        # comment end to end (same shape as php's doc_comment.php, which
+        # needed no override for the identical reason).
+        result = self._chunk("doc_comment.lua")
+        self.assertEqual(result.status, "ok")
+        by_qname = {c["qualified_name"]: c for c in result.chunks}
+        self.assertEqual(by_qname["compute_total"]["doc"], "Computes the widget total.")

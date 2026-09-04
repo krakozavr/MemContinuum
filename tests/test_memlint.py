@@ -502,5 +502,13 @@ class TestRustSymbolRouting(unittest.TestCase):
         self.assertTrue(memidx.fragment_declared_in_text("widget_loader", text, rel_path="a.rs"))
 
 
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestLuaSymbolRouting(unittest.TestCase):
+    def test_lua_symbol_fragment_routes_through_the_registry(self):
+        text = "function obj:widget_loader(a)\n  return a\nend\n"
+        self.assertTrue(memidx.fragment_declared_in_text("obj.widget_loader", text, rel_path="a.lua"))
+        self.assertTrue(memidx.fragment_declared_in_text("widget_loader", text, rel_path="a.lua"))
+
+
 if __name__ == "__main__":
     unittest.main()
