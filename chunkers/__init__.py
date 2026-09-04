@@ -104,7 +104,19 @@ LANGUAGE_TABLE = {
              "extensions": (".rs",), "shebangs": (),
              "skip_dirs": frozenset({"target"}),
              "containers": {"impl_item": "SELF_TYPE", "trait_item": "name", "mod_item": "name"},
-             "method_if_ancestor_in": frozenset({"impl_item", "trait_item"}), "max_bytes": None},
+             "method_if_ancestor_in": frozenset({"impl_item", "trait_item"}), "max_bytes": None,
+             # Task 7: rust's own comment node types are "line_comment" and
+             # "block_comment" (verified against the real grammar), not the
+             # `_doc_for` default of ("comment",) -- a `///` doc comment is
+             # NOT a distinct top-level node type in this grammar version;
+             # it parses as an ordinary `line_comment` node whose children
+             # (`outer_doc_comment_marker`, `doc_comment`) carry the `///`
+             # marking internally, so the row-level override below is what
+             # makes ANY comment (doc or plain) reach a rust chunk's `doc`
+             # field at all -- first wiring, no live index exists yet, so
+             # no impl_version bump is needed (unlike java's Task 6 fix,
+             # which retrofitted an already-shipped row).
+             "doc_comment_types": ("line_comment", "block_comment")},
     "lua": {"backend": "tree-sitter", "module": "chunkers.treesitter",
             "grammar_module": "tree_sitter_lua", "language_fn": "language",
             "runtime_pin": "0.26.0", "grammar_pin": "0.5.0",

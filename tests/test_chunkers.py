@@ -1482,3 +1482,85 @@ class TestPhpExtraction(unittest.TestCase):
         self.assertEqual(len(result.chunks), 2)   # capture-count golden --
         # interface Greeter's greet() and abstract class Shape's area()
         # both excluded, no unqualified "greet"/"area" chunk of any kind
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestRustExtraction(unittest.TestCase):
+    CORPUS = REPO_ROOT / "tests" / "fixtures" / "rust_corpus"
+
+    def _chunk(self, name):
+        chunkers.treesitter.reset_cache()
+        text = (self.CORPUS / name).read_text()
+        return chunkers.get_chunker("rust").chunk_file(text, name)
+
+    def test_widget_recall_impl_trait_mod_qualification(self):
+        result = self._chunk("widget.rs")
+        self.assertEqual(result.status, "ok")
+        got = sorted((c["kind"], c["qualified_name"]) for c in result.chunks)
+        self.assertEqual(got, sorted([
+            ("function", "top_level"),
+            ("method", "Widget.new"), ("method", "Widget.value"),
+            ("method", "Greeter.greet"),        # trait default method
+            ("method", "Widget.greet"),         # impl Greeter for Widget -- qualified by the TYPE
+            ("function", "util.helper"),        # mod, not a type -- stays `function`
+        ]))
+        self.assertEqual(len(result.chunks), 6)   # capture-count golden
+        # Coverage rule: bodyless declarations must not produce chunks.
+        # widget.rs's own `trait Named { fn name(&self) -> String; }` has a
+        # signature with no default body -- verified against the real
+        # grammar (tree_sitter_rust 0.24.2) that this parses as the
+        # DISTINCT node type `function_signature_item`, never
+        # `function_item`, so rust.scm's single pattern (which only matches
+        # `function_item` and additionally requires `body: (block)`) never
+        # captures it. No chunk named "name" should exist anywhere in the
+        # 6 chunks above.
+        self.assertNotIn("name", {c["symbol"] for c in result.chunks})
+
+    def test_no_callable_file(self):
+        result = self._chunk("no_callable.rs")
+        self.assertEqual((result.status, result.chunks, result.gaps), ("ok", [], []))
+
+    def test_whole_file_syntax_error(self):
+        result = self._chunk("syntax_error.rs")
+        self.assertEqual(result.status, "failed")
+
+    def test_localized_error_is_partial(self):
+        result = self._chunk("error_recovery.rs")
+        self.assertEqual(result.status, "partial")
+        names = {c["qualified_name"] for c in result.chunks}
+        self.assertEqual(names, {"good", "also_good"})
+
+    def test_nested_fn_is_kept_separate_from_the_outer_one(self):
+        # Revision 3, binding addition b: a `fn` nested inside another `fn`
+        # is its own `function` chunk, never merged with the enclosing one
+        # -- and when the OUTER fn sits inside an `impl` block, the ancestor
+        # walk that promotes `outer` to `method` finds the same `impl_item`
+        # ancestor for the nested `inner` fn too (the walk does not stop at
+        # the first function boundary), so BOTH `Widget.method` and
+        # `Widget.helper` come back kind `method`, as two separate chunks
+        # since their symbols differ -- never a dedup_nested hazard because
+        # it never collides on symbol. Verified against the real grammar.
+        result = self._chunk("nested_calls.rs")
+        self.assertEqual(result.status, "ok")
+        got = sorted((c["kind"], c["qualified_name"]) for c in result.chunks)
+        self.assertEqual(got, sorted([
+            ("function", "outer"), ("function", "inner"),
+            ("method", "Widget.method"), ("method", "Widget.helper"),
+        ]))
+        self.assertEqual(len(result.chunks), 4)
+
+    def test_triple_slash_doc_comment_lands_in_its_chunk_doc(self):
+        # Context note (not in the brief's literal steps): rust's own
+        # comment node types are "line_comment"/"block_comment", verified
+        # against the real grammar -- and a `///` doc comment is NOT a
+        # distinct top-level node type in this grammar version; it parses
+        # as an ordinary `line_comment` node whose children
+        # (`outer_doc_comment_marker`, `doc_comment`) carry the marking
+        # internally, so the FULL node text (including the `///` prefix)
+        # is what _doc_for reads and strips. widget.rs's own `top_level`
+        # has `/// Adds one to the input.` immediately above it.
+        result = self._chunk("widget.rs")
+        by_qname = {c["qualified_name"]: c for c in result.chunks}
+        self.assertEqual(by_qname["top_level"]["doc"], "Adds one to the input.")
+        # A container method with no comment above it -- doc stays empty.
+        self.assertEqual(by_qname["Widget.new"]["doc"], "")

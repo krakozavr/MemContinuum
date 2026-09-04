@@ -495,5 +495,12 @@ class TestPhpSymbolRouting(unittest.TestCase):
         self.assertTrue(memidx.fragment_declared_in_text("widget_loader", text, rel_path="a.php"))
 
 
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestRustSymbolRouting(unittest.TestCase):
+    def test_rust_symbol_fragment_routes_through_the_registry(self):
+        text = "fn widget_loader() -> i32 {\n    1\n}\n"
+        self.assertTrue(memidx.fragment_declared_in_text("widget_loader", text, rel_path="a.rs"))
+
+
 if __name__ == "__main__":
     unittest.main()
