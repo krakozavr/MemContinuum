@@ -731,7 +731,7 @@ own layer installed before any repository is wired.
 Immediately after that refresh (never on an already-`ok` layer, and never
 on its own outside a refresh — no extra "did anything change" check exists
 because there is nothing to check when the refresh itself never ran),
-`--apply --machine` also reconciles the seven tree-sitter grammar wheels.
+`--apply --machine` also reconciles the six tree-sitter grammar wheels and the tree-sitter runtime.
 It re-reads `config.sh` fresh — the refresh's own
 `memcontinuum-setup.sh` call may just have rewritten
 `MEMCONTINUUM_VENV_MANAGED` via that script's sticky-flag determination
@@ -1062,7 +1062,7 @@ fixtures/goldens shipped alongside it. The same five checks admit any future
 non-official-org grammar — this is the reusable rule, not a one-off
 exception for Lua.
 
-`tests/mac_smoke.sh` installs the seven tree-sitter pins by exact version
+`tests/mac_smoke.sh` installs the six tree-sitter grammar wheels and the tree-sitter runtime by exact version
 into a disposable venv and proves each grammar builds a parser and query and
 parses a real fixture on real Mac hardware — a parser probe, and nothing
 wider. It is not a substitute for the macOS arm64 CI job, which installs the

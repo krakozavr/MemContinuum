@@ -85,7 +85,7 @@
 #            stale. Off by default -- most drift is per-repo.
 #
 #            Right after a stale refresh, --apply --machine also reconciles
-#            the seven tree-sitter grammar wheels: when the refreshed
+#            the six tree-sitter grammar wheels and the tree-sitter runtime: when the refreshed
 #            config.sh records an engine-managed venv (MEMCONTINUUM_VENV_MANAGED=1
 #            -- memcontinuum-setup.sh's own venv, not a python you pointed it
 #            at with --python), it reinstalls requirements.lock into that
@@ -1855,7 +1855,7 @@ print(",".join(sorted(missing)))
                         if [ "$MANAGED_FLAG" = "1" ]; then
                             echo "machine: WARNING still missing after reinstall: $MISSING"
                         else
-                            echo "machine: $MISSING not available in $MANAGED_PY -- install the seven tree-sitter pins into it yourself, or re-run memcontinuum-setup.sh without --python to get an engine-managed venv this updater can maintain"
+                            echo "machine: $MISSING not available in $MANAGED_PY -- install the six tree-sitter grammar wheels and the tree-sitter runtime into it yourself, or re-run memcontinuum-setup.sh without --python to get an engine-managed venv this updater can maintain"
                         fi
                     fi
                 fi

@@ -5,7 +5,7 @@
 ### Languages
 - The code index now chunks JavaScript, TypeScript (TSX included), Java,
   PHP, Rust, and Lua, alongside the existing native Swift and Python
-  support — one shared tree-sitter backend, a grammar and a query file per
+  support -- one shared tree-sitter backend, a grammar and a query file per
   language, so search, `why`, and the linter's symbol check cover these six
   languages exactly as they already did Swift and Python. `backend-preflight`
   reports which language backends import in this python, by name; a file a
