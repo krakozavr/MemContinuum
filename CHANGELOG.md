@@ -1,6 +1,21 @@
 # Changelog
 
-## [0.2.0rc2] — unreleased
+## [0.2.0rc2] — 2026-09-03
+
+### Install and update
+- The installer and the decide script now record a project's store,
+  claude-dir, and code-root paths in physical form (symlinks resolved),
+  so a project reached through a symlinked path -- a macOS `/var` mount,
+  a symlinked checkout -- gets one registry row that matches what the
+  hooks themselves see, instead of a second row for each spelling.
+- The updater's walk now reports `store-form-stale` when a recorded
+  store path is a symlinked spelling of the same directory, and
+  `--apply` rewrites only that field -- reported as
+  `store-form-updated` -- in the same pass as any other re-render.
+- The ledger hook's containment check and the new-file nudge now share
+  one symlink-safe path helper, `hooks/mc-path-lib.sh`, so an edit
+  under a symlinked store or code root is classified correctly by
+  both.
 
 ### Release
 - The declared minimum Python is now 3.12 everywhere a floor is named --
