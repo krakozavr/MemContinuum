@@ -84,6 +84,20 @@
 #            re-runs memcontinuum-setup.sh, but only when it is actually
 #            stale. Off by default -- most drift is per-repo.
 #
+#            Right after a stale refresh, --apply --machine also reconciles
+#            the seven tree-sitter grammar wheels: when the refreshed
+#            config.sh records an engine-managed venv (MEMCONTINUUM_VENV_MANAGED=1
+#            -- memcontinuum-setup.sh's own venv, not a python you pointed it
+#            at with --python), it reinstalls requirements.lock into that
+#            venv, then runs backend-preflight and names any row still
+#            missing. Against a python you supplied with --python, it never
+#            installs anything -- it only reports what backend-preflight
+#            finds missing there, and the remedy (install those pins
+#            yourself, or re-run memcontinuum-setup.sh without --python for
+#            a venv this command can maintain). A machine layer that is
+#            already current runs neither step -- this reconciliation is
+#            part of the refresh, not a separate check.
+#
 # MODES, AND WHICH FLAGS EACH ONE TAKES
 #
 # The same option names mean different things depending on what is being
@@ -239,6 +253,7 @@ ENGINE_ROOT="$(cd "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd)"
 REPO_INIT="$SCRIPT_DIR/repo-init.sh"
 DECIDE="$SCRIPT_DIR/memcontinuum-decide.sh"
 SETUP="$ENGINE_ROOT/memcontinuum-setup.sh"
+MEMIDX="$ENGINE_ROOT/memidx.py"
 
 # The bash that is running THIS script, for the scripts it shells out to.
 # `bash` off PATH would silently hop interpreters mid-command -- which is
@@ -1786,6 +1801,66 @@ if [ "$MACHINE" -eq 1 ]; then
             else
                 not_applied "FAILED: machine layer refresh -- see above"
             fi
+
+            # --- Task 9 (B4/TOP-0118): dependency reconciliation ---------------
+            # Runs ONLY here, immediately after memcontinuum-setup.sh just
+            # returned -- re-reads config.sh FRESH (the call above may just
+            # have rewritten MEMCONTINUUM_VENV_MANAGED via its own sticky-flag
+            # determination, see memcontinuum-setup.sh), never a value cached
+            # from before this refresh. A SECOND, non-stale --apply --machine
+            # run takes the "already current" branch above instead of this one
+            # at all, so pip is never re-invoked and backend-preflight is never
+            # re-run -- the no-op reconciliation guarantees by construction,
+            # with no extra "did anything change" check needed.
+            MANAGED_PY=""
+            MANAGED_FLAG="0"
+            if [ -f "$MEMCONTINUUM_HOME/config.sh" ]; then
+                MANAGED_PY="$(. "$MEMCONTINUUM_HOME/config.sh" >/dev/null 2>&1; printf '%s' "${MEMCONTINUUM_PYTHON:-}")"
+                MANAGED_FLAG="$(. "$MEMCONTINUUM_HOME/config.sh" >/dev/null 2>&1; printf '%s' "${MEMCONTINUUM_VENV_MANAGED:-0}")"
+            fi
+            if [ -n "$MANAGED_PY" ]; then
+                if [ "$MANAGED_FLAG" = "1" ]; then
+                    echo "machine: reinstalling requirements.lock into the engine-managed venv ($MANAGED_PY)"
+                    RECONCILE_LOG="$(mktemp 2>/dev/null || printf '/tmp/mc-reconcile-log.%s' "$$")"
+                    if PYTHONPATH= "$MANAGED_PY" -m pip install -r "$ENGINE_ROOT/requirements.lock" >"$RECONCILE_LOG" 2>&1; then
+                        echo "OK: dependencies reconciled"
+                    elif command -v uv >/dev/null 2>&1 \
+                            && PYTHONPATH= uv pip install --python "$MANAGED_PY" -r "$ENGINE_ROOT/requirements.lock" >>"$RECONCILE_LOG" 2>&1; then
+                        # A `-m pip` failure here almost always means a
+                        # uv-created managed venv (uv venv omits pip/
+                        # setuptools/wheel by default -- verified against the
+                        # real uv on this machine: `-m pip` raises "No module
+                        # named pip" in a plain `uv venv` target). uv's own
+                        # installer needs no pip inside the target venv at
+                        # all, so it is the fallback here, not the first
+                        # attempt -- same preference order scripts/repo-init.sh's
+                        # own bootstrap_venv already uses (uv over pip when
+                        # both could apply).
+                        echo "OK: dependencies reconciled (via uv)"
+                    else
+                        cat "$RECONCILE_LOG" >&2
+                        not_applied "FAILED: dependency reconciliation into $MANAGED_PY -- see above"
+                    fi
+                    rm -f "$RECONCILE_LOG"
+                fi
+                PREFLIGHT_JSON="$(PYTHONPATH= "$MANAGED_PY" "$MEMIDX" backend-preflight --json 2>/dev/null)" || PREFLIGHT_JSON=""
+                if [ -n "$PREFLIGHT_JSON" ]; then
+                    MISSING="$(printf '%s' "$PREFLIGHT_JSON" | PYTHONPATH= "$MANAGED_PY" -c '
+import json, sys
+data = json.load(sys.stdin)
+missing = [lang for lang, row in data.items() if not row["ok"]]
+print(",".join(sorted(missing)))
+')"
+                    if [ -n "$MISSING" ]; then
+                        if [ "$MANAGED_FLAG" = "1" ]; then
+                            echo "machine: WARNING still missing after reinstall: $MISSING"
+                        else
+                            echo "machine: $MISSING not available in $MANAGED_PY -- install the seven tree-sitter pins into it yourself, or re-run memcontinuum-setup.sh without --python to get an engine-managed venv this updater can maintain"
+                        fi
+                    fi
+                fi
+            fi
+            # --- end Task 9 dependency reconciliation ---------------------------
         fi
     fi
 fi

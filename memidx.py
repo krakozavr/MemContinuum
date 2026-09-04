@@ -4012,6 +4012,34 @@ def cmd_code_census(args) -> int:
     return 0
 
 
+def cmd_backend_preflight(args) -> int:
+    """`backend-preflight [--json]`. Attempts `chunkers.get_chunker(lang)`
+    for every LANGUAGE_TABLE row (native: module imports; tree-sitter:
+    grammar imports AND the query compiles) and reports ok/reason per row.
+    Fail-open (Task 9, B4/TOP-0118): one row's exception never stops the
+    rest -- the same discipline chunkers.backend_availability() already
+    follows, this subcommand just exposes it with a per-row reason instead
+    of a bare ok/missing flag, for `memcontinuum-update.sh --machine`'s
+    dependency-reconciliation report and for a human checking a machine's
+    own install directly."""
+    report = {}
+    for lang in sorted(chunkers.LANGUAGE_TABLE):
+        try:
+            chunkers.get_chunker(lang)
+            report[lang] = {"ok": True, "reason": None}
+        except chunkers.BackendUnavailable as exc:
+            report[lang] = {"ok": False, "reason": str(exc)}
+        except Exception as exc:   # fail-open: a preflight itself must never crash
+            report[lang] = {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
+    if getattr(args, "json", False):
+        print(json.dumps(report, indent=2))
+    else:
+        for lang, row in sorted(report.items()):
+            status = "ok" if row["ok"] else f"MISSING ({row['reason']})"
+            print(f"{lang}: {status}")
+    return 0
+
+
 def code_hits_fts(conn: sqlite3.Connection, query: str, project: str, limit: int = 200):
     """Task 7 (Anatomy M2a): a bare identifier-shaped query (e.g. a symbol
     or qualified name typed verbatim, not a phrase) puts every chunk whose
@@ -5446,6 +5474,13 @@ def main(argv=None) -> int:
     p_code_census.add_argument("--root", required=True)
     p_code_census.add_argument("--json", action="store_true")
     p_code_census.set_defaults(func=cmd_code_census)
+
+    p_preflight = sub.add_parser(
+        "backend-preflight",
+        help="report which chunker backends can import here, by language",
+    )
+    p_preflight.add_argument("--json", action="store_true")
+    p_preflight.set_defaults(func=cmd_backend_preflight)
 
     p_stats = sub.add_parser(
         "stats",

@@ -2417,6 +2417,30 @@ class TestCodeCensusAndConsentDialogue(unittest.TestCase):
             shutil.rmtree(home, ignore_errors=True)
 
 
+class TestSetupMenu(unittest.TestCase):
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_non_interactive_setup_skips_the_menu(self):
+        # matches the existing test_repo_init.py tty-refusal pattern
+        # (test_not_a_tty_without_non_interactive_fails_clearly_not_hangs,
+        # above): a non-tty run of memcontinuum-setup.sh with --python
+        # explicit must never block on /dev/tty, proving the menu is
+        # additive, not a new hard requirement. TOOLS_DIR here in place of
+        # the brief's REPO_ROOT -- this file's own module-level constant for
+        # the checkout root; there is no second name for it.
+        home = sandbox_home()
+        try:
+            proc = subprocess.run(
+                ["bash", str(TOOLS_DIR / "memcontinuum-setup.sh"),
+                 "--python", VENV_PYTHON, "--no-model-warm", "--dry-run",
+                 "--claude-dir", str(Path(home) / ".claude")],
+                cwd=home, env={**os.environ, "HOME": home},
+                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+
 class TestMultiRootCodeIndex(unittest.TestCase):
     """`code-reindex` is root-scoped: indexing one root touches only that
     root's own stored rows (code_meta is keyed by (project, code_root)), so

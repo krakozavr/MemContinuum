@@ -24,9 +24,15 @@ section for the full rationale): @chunk.<kind> names the span+kind,
 optional @chunk.name gives the symbol, optional @chunk.qualifier gives an
 explicit qualifier prefix (Lua's table/method syntax has no lexical
 ancestor to walk), optional @chunk.default marks the export-default
-"symbol=qualified_name='default'" case, and a match with neither
-@chunk.name nor @chunk.default is dropped (the deferred, unbound
-`closure` kind).
+"symbol=qualified_name='default'" case, optional @chunk.doc_anchor names a
+DIFFERENT node than @chunk.<kind> to look for a preceding doc comment on
+(Lua's assignment form -- `M.f = function() ... end` -- binds @chunk.method
+to the anonymous function_definition nested inside expression_list, which
+has no sibling of its own; the doc comment sits above the enclosing
+assignment_statement instead, so that node is what doc_anchor names; every
+other query's @chunk.<kind> node already sits at the right sibling
+position and needs no anchor), and a match with neither @chunk.name nor
+@chunk.default is dropped (the deferred, unbound `closure` kind).
 
 Dedup (ruling 84): two DIFFERENT query patterns can independently match
 the SAME conceptual callable at DIFFERENT spans (an export-wrapper's
@@ -384,13 +390,16 @@ def build_chunks(lang, row, data, root, matches):
         kind_node = None
         kind = None
         for cname, nodes in caps.items():
-            if cname.startswith("chunk.") and cname not in ("chunk.name", "chunk.qualifier", "chunk.default"):
+            if cname.startswith("chunk.") and cname not in (
+                "chunk.name", "chunk.qualifier", "chunk.default", "chunk.doc_anchor",
+            ):
                 kind_node = nodes[0]
                 kind = cname.split(".", 1)[1]
         if kind_node is None:
             continue
         name_node = caps.get("chunk.name", [None])[0]
         qual_node = caps.get("chunk.qualifier", [None])[0]
+        doc_anchor_node = caps.get("chunk.doc_anchor", [None])[0]
         is_default = "chunk.default" in caps
         if name_node is None and not is_default:
             continue   # unbound callable -- deferred `closure` kind
@@ -406,6 +415,7 @@ def build_chunks(lang, row, data, root, matches):
             "symbol": symbol,
             "qualified_name": qualified_name,
             "node": kind_node,
+            "doc_node": doc_anchor_node if doc_anchor_node is not None else kind_node,
         })
     entries = dedup_by_priority(entries)   # same-span kind collisions (ruling 84's sibling case)
     entries = dedup_nested(entries)        # different-span, same-symbol containment (ruling 84)
@@ -434,7 +444,7 @@ def build_chunks(lang, row, data, root, matches):
             continue
         chunks.append({
             "kind": e["kind"], "symbol": e["symbol"], "qualified_name": e["qualified_name"],
-            "signature": _render_signature(data, node), "doc": _doc_for(row, data, node),
+            "signature": _render_signature(data, node), "doc": _doc_for(row, data, e["doc_node"]),
             "start_line": node.start_point[0] + 1, "end_line": node.end_point[0] + 1,
         })
 

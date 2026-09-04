@@ -31,9 +31,15 @@
 ; `M.f = function() ... end` (assignment form) -- NOT a function_declaration
 ; at all; the RHS is an anonymous function_definition bound via
 ; assignment_statement. Genuinely different grammar shape, its own pattern.
+; @chunk.doc_anchor marks the assignment_statement itself, not the inner
+; function_definition @chunk.method binds: a `--` doc comment sits directly
+; above the ASSIGNMENT (the whole statement, one block-level sibling), never
+; above the anonymous function_definition nested inside expression_list,
+; which has no earlier sibling of its own to find it on (Task 8 review
+; finding 2 -- verified against the real grammar this task).
 (assignment_statement
   (variable_list
     (dot_index_expression
       table: (identifier) @chunk.qualifier
       field: (identifier) @chunk.name))
-  (expression_list (function_definition) @chunk.method))
+  (expression_list (function_definition) @chunk.method)) @chunk.doc_anchor

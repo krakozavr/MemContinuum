@@ -4054,5 +4054,46 @@ class TestCodeIndexTooNew(unittest.TestCase):
             self.assertEqual(before_tables, after_tables)
 
 
+class TestBackendPreflight(unittest.TestCase):
+    def test_json_reports_every_row_ok_or_missing_with_reason(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = memidx.main(["backend-preflight", "--json"])
+        self.assertEqual(rc, 0)
+        data = json.loads(buf.getvalue())
+        self.assertIn("python", data)
+        self.assertTrue(data["python"]["ok"])
+        self.assertIsNone(data["python"]["reason"])
+
+    @unittest.skipUnless(os.environ.get("MEMCONTINUUM_PYTHON", ""), "needs the fixed venv with the seven pins installed")
+    def test_reports_a_positive_ok_true_for_a_real_installed_tree_sitter_row(self):
+        # Pre-flight finding #1/table-2 gap: neither of the two original
+        # tests here ever asserted ok:true for an actually-installed
+        # tree-sitter row -- both checked only python (native) and
+        # lua-with-the-wheel-mocked-out (negative). Against the real,
+        # unmocked wheels Task 1's coordinator step installed, EVERY
+        # tree-sitter row (all seven, ts/tsx included) must report ok:true.
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = memidx.main(["backend-preflight", "--json"])
+        self.assertEqual(rc, 0)
+        data = json.loads(buf.getvalue())
+        for lang in ("javascript", "typescript", "tsx", "java", "php", "rust", "lua"):
+            self.assertTrue(data[lang]["ok"], f"{lang}: expected ok:true, got {data[lang]}")
+            self.assertIsNone(data[lang]["reason"])
+
+    def test_missing_wheel_is_reported_by_name_not_crashed(self):
+        chunkers.treesitter.reset_cache()
+        with mock.patch.dict(sys.modules, {"tree_sitter_lua": None}):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = memidx.main(["backend-preflight", "--json"])
+            self.assertEqual(rc, 0)
+            data = json.loads(buf.getvalue())
+        chunkers.treesitter.reset_cache()
+        self.assertFalse(data["lua"]["ok"])
+        self.assertIsNotNone(data["lua"]["reason"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -728,6 +728,48 @@ default path while the stale one stayed stale. With `--apply` it re-runs
 registry no longer skips it, because a machine can perfectly well have its
 own layer installed before any repository is wired.
 
+Immediately after that refresh (never on an already-`ok` layer, and never
+on its own outside a refresh — no extra "did anything change" check exists
+because there is nothing to check when the refresh itself never ran),
+`--apply --machine` also reconciles the seven tree-sitter grammar wheels.
+It re-reads `config.sh` fresh — the refresh's own
+`memcontinuum-setup.sh` call may just have rewritten
+`MEMCONTINUUM_VENV_MANAGED` via that script's sticky-flag determination
+(below) — and branches on it: `1` (an engine-managed venv, one
+`memcontinuum-setup.sh` created itself with no explicit `--python`)
+reinstalls `requirements.lock` into it (`<python> -m pip install -r
+requirements.lock`, falling back to `uv pip install --python <python> -r
+requirements.lock` when `-m pip` fails and `uv` is on `PATH` — a
+`uv venv`-created venv ships no `pip` module by default, verified against
+this machine's own `uv`, so the fallback is what actually reconciles one of
+those rather than the primary attempt failing silently on the exact venvs
+this step exists to maintain) and then runs `memidx.py backend-preflight
+--json`, warning by name about any row still `ok:false`. `0` (a foreign
+`--python`) skips the reinstall entirely — this command never pip-installs
+into a python it was not told to manage — and instead reports each missing
+row by name with the remedy: install the seven pins into that python
+yourself, or re-run `memcontinuum-setup.sh` without `--python` for a venv
+this command can maintain.
+
+`MEMCONTINUUM_VENV_MANAGED`'s own sticky-flag rule lives in
+`memcontinuum-setup.sh`, not here: an explicit `--python` starts unmanaged
+(`0`) unless it re-affirms the *exact same path* `config.sh` already
+recorded as managed (`1`) — the case that matters because
+`memcontinuum-update.sh --machine` always re-resolves and re-passes a
+python explicitly (`mc_update_resolve_python` / `--python "$PY"` in
+`SETUP_ARGS`) on every run after the first, so an engine-created venv would
+otherwise read back as a "foreign" `--python` on its own second refresh and
+reconciliation could never fire again. Choosing "use this python" from
+`memcontinuum-setup.sh`'s own interactive setup menu (below) counts as an
+explicit `--python` for this same determination.
+
+`memcontinuum-setup.sh`'s own interactive setup menu — "1) use this python
+(PATH) / 2) create the engine venv / 3) abort" — appears only on a truly
+unscripted run: no `--python`, no `--venv`, and stdin is a real terminal
+(`[ -t 0 ]`, the same guard `repo-init.sh`'s own census dialogue uses). Any
+scripted, CI, or explicit-flag run bypasses it and keeps the plain
+create-if-absent default this script has always had.
+
 `memcontinuum-state.sh` stays python-free and prints one extra line,
 `update: wiring rendered by X, engine at Y -- run scripts/memcontinuum-update.sh`,
 only when the two differ — pulled from the same registry-pinned hook command

@@ -1667,6 +1667,17 @@ class TestLuaExtraction(unittest.TestCase):
         ]))
         self.assertEqual(len(result.chunks), 2)
 
+    def test_assignment_form_doc_comment_anchors_on_the_statement_not_the_rhs(self):
+        # Task 8 review, finding 2: `M.f = function() ... end`'s @chunk.method
+        # capture binds the anonymous function_definition nested inside
+        # expression_list, which has no preceding sibling of its own -- a
+        # `--` doc comment directly above the ASSIGNMENT never reached the
+        # chunk's `doc` field until lua.scm's @chunk.doc_anchor fix (Task 9).
+        result = self._chunk("widget.lua")
+        self.assertEqual(result.status, "ok")
+        by_qname = {c["qualified_name"]: c for c in result.chunks}
+        self.assertEqual(by_qname["M.f"]["doc"], "Overwrites the widget's f field.")
+
     def test_dash_dash_doc_comment_lands_in_its_chunk_doc(self):
         # Context note (not in the brief's literal fixture list): Lua's own
         # comment node type is "comment" (verified against the real
