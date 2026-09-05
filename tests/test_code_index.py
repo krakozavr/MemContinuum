@@ -4357,6 +4357,32 @@ class TestHealIgnoresMissingRootAvailability(unittest.TestCase):
             self.assertEqual(memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)["state"], "degraded")
             conn.close()
 
+    def test_missing_root_never_reports_verified_true_under_verify_content(self):
+        """task-3-review MODERATE #3: a missing root must not read
+        verified: True even under --verify-content -- nothing was hashed
+        for a root that doesn't exist, so `_root_report`'s early-return
+        branch must set verified back to False despite verify_content=True
+        being requested for the whole call."""
+        with tempfile.TemporaryDirectory() as td:
+            a = Path(td) / "a"; b = Path(td) / "b"; a.mkdir(); b.mkdir()
+            (a / "x.py").write_text("def fx():\n    pass\n")
+            (b / "y.py").write_text("def fy():\n    pass\n")
+            db = Path(td) / "idx-code.sqlite"
+            code_reindex(a, db, lang="python")
+            code_reindex(b, db, lang="python")
+            shutil.rmtree(b)  # root b now missing entirely
+
+            conn = memidx.open_code_db(db)
+            report = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT, verify_content=True)
+            conn.close()
+            missing = [r for r in report["roots"] if not r["exists"]]
+            self.assertEqual(len(missing), 1, report["roots"])
+            self.assertFalse(missing[0]["verified"], missing[0])
+            # the present root really was proven, so the aggregate state
+            # must not read this test as a false negative on the fix itself
+            present = [r for r in report["roots"] if r["exists"]]
+            self.assertTrue(present[0]["verified"], present[0])
+
 
 class TestHealLimitAndFailurePathCleanup(unittest.TestCase):
     """Fix-wave items 6 and 7: the heal-limit refusal names the report's
