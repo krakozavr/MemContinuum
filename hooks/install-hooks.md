@@ -151,8 +151,12 @@ records without a fresh vector, in which case the script also touches
 `memidx.py embed-worker` detached (a Python `subprocess.Popen(
 start_new_session=True)` — never bash `&`, never a `setsid` binary, which
 macOS does not ship) to backfill embeddings in the background; `clean` means
-nothing was left to embed; `skipped` means the content pass itself failed or
-was killed by the watchdog. `MEMCONTINUUM_EMBED_WORKER=0` disables the spawn
+nothing was left to embed; `skipped` means the content pass returned non-zero
+within budget (e.g. an integrity failure). A genuine watchdog kill never
+reaches this script's own final line at all — it produces only the
+launcher's own `outcome=watchdog-killed hook=post-commit-reindex.sh` line in
+`hook.log`, with no `embed=` token for that invocation.
+`MEMCONTINUUM_EMBED_WORKER=0` disables the spawn
 (the marker is still touched) — set it wherever a detached background
 process must not be left running (tests, CI). The embed-worker coalesces
 repeated commits: a second worker finding the first one's `<project>.embed.lock`
@@ -185,7 +189,7 @@ merged into `.claude/settings.json` or `.claude/settings.local.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_CODE_ROOT=<code-root> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/ledger-post-edit.sh"
+            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_CODE_ROOT=<code-root> MEMCONTINUUM_CODE_ROOTS=<code-roots-json> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/ledger-post-edit.sh"
           }
         ]
       }
@@ -195,7 +199,7 @@ merged into `.claude/settings.json` or `.claude/settings.local.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_CODE_ROOT=<code-root> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/precompact-persist.sh"
+            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_CODE_ROOT=<code-root> MEMCONTINUUM_CODE_ROOTS=<code-roots-json> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/precompact-persist.sh"
           }
         ]
       }
@@ -205,7 +209,7 @@ merged into `.claude/settings.json` or `.claude/settings.local.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_CODE_ROOT=<code-root> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/sessionstart-remind.sh"
+            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_CODE_ROOT=<code-root> MEMCONTINUUM_CODE_ROOTS=<code-roots-json> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/sessionstart-remind.sh"
           }
         ]
       }
@@ -215,7 +219,7 @@ merged into `.claude/settings.json` or `.claude/settings.local.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_CODE_ROOT=<code-root> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/userprompt-remind.sh"
+            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_CODE_ROOT=<code-root> MEMCONTINUUM_CODE_ROOTS=<code-roots-json> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/userprompt-remind.sh"
           }
         ]
       }
@@ -225,7 +229,7 @@ merged into `.claude/settings.json` or `.claude/settings.local.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_CODE_ROOT=<code-root> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/sessionend-stamp.sh"
+            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_CODE_ROOT=<code-root> MEMCONTINUUM_CODE_ROOTS=<code-roots-json> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/sessionend-stamp.sh"
           }
         ]
       }
@@ -254,10 +258,14 @@ Notes:
   hook — not rendered by this installer, see its own header comment) also gates on `source` for
   the same reason — both are the correct, documented use of that field; `UserPromptSubmit` is the
   one event that never carries it.
-- `MEMCONTINUUM_CODE_ROOT` is new here (not used by `pre-edit-chain.sh`/`post-commit-reindex.sh`):
-  it is the code root `ledger-post-edit.sh` scopes edits to. The five write-side hooks only
-  support **one** `MEMCONTINUUM_CODE_ROOT` each — with multiple `--code-root`s given to
-  `scripts/repo-init.sh`, the first one given is what they get.
+- `MEMCONTINUUM_CODE_ROOT`/`MEMCONTINUUM_CODE_ROOTS` are new here (not used by
+  `pre-edit-chain.sh`/`post-commit-reindex.sh`): every configured `--code-root` reaches the five
+  write-side hooks, not just one. `MEMCONTINUUM_CODE_ROOT` carries the first (kept for a reader
+  that only ever looks at one root); `MEMCONTINUUM_CODE_ROOTS` carries the complete JSON list of
+  physical paths, read by `hooks/memlib.sh`'s `mc_code_roots` (falling back to the single variable
+  when the list is absent — old-shape wiring, or a hand-written config). `ledger-post-edit.sh`
+  checks the edited path against every root; `userprompt-remind.sh`/`precompact-persist.sh` pass
+  every root to `unmapped --code-root` (repeatable) in one call.
 - `MEMCONTINUUM_HOME` is deliberately omitted here, same reason and same resolution as section 1
   above (default, then the pointer, then a custom value only if given) — and it must never point
   at a synced/cloud drive.

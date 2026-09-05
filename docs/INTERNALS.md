@@ -38,7 +38,7 @@ wired one level up, into `~/.claude/settings.json`, by `memcontinuum-setup.sh`.
 |---|---|---|
 | `pre-edit-chain.sh` | `PreToolUse` (Edit/Write, filtered to `--code-root`) | `for-path` lookup on the file being edited; injects matching chains as `additionalContext` |
 | `newfile-nudge.sh` | `PreToolUse` (Write only, filtered to `--code-root`) | fires only when the write target does not exist yet and its extension is wired for this project; injects one reminder to search the code index first |
-| `ledger-post-edit.sh` | `PostToolUse` | appends the edit to a per-session ledger, scoped to `--code-root` and the store root |
+| `ledger-post-edit.sh` | `PostToolUse` | appends the edit to a per-session ledger, scoped to every configured code root and the store root; the row records which root matched |
 | `precompact-persist.sh` | `PreCompact` | persists session state before context is compacted away |
 | `sessionstart-remind.sh` | `SessionStart` | on `startup`/`resume`/`clear`, initializes session state only (captures the code/store roots' git HEAD, prunes state older than 24h; `clear` resets the session's counters and pending nudges but carries the edit ledger over, `resume` keeps everything); only on `source: compact` does it inject what `precompact-persist.sh` left pending |
 | `userprompt-remind.sh` | `UserPromptSubmit` | never reads the prompt text; fires the coverage or look-back nudge |
@@ -817,9 +817,15 @@ doubles it. `hooks/install-hooks.md` documents the wiring each hook receives.
 Each `--code-root` gets its own correctly-scoped entry in both PreToolUse
 hooks: `pre-edit-chain.sh` an `Edit`/`Write` pair, `newfile-nudge.sh` a `Write`
 entry with `MEMCONTINUUM_CODE_ROOT` set to that specific directory. The five
-write-side hooks support one `MEMCONTINUUM_CODE_ROOT` each — a limitation of
-`hooks/memlib.sh`, not of the installer — so with several `--code-root`s they
-get the first.
+write-side hooks receive every configured code root: `MEMCONTINUUM_CODE_ROOT`
+carries the first (kept, for a reader that only ever looks at one root) and
+`MEMCONTINUUM_CODE_ROOTS` carries the complete JSON list of physical paths.
+`hooks/memlib.sh`'s `mc_code_roots` reads the list (falling back to the single
+variable when the list is absent) and every write-side hook containment/
+comparison walks it — `ledger-post-edit.sh` checks a path against every root,
+`userprompt-remind.sh`/`precompact-persist.sh` pass every root to `unmapped
+--code-root` (repeatable) in one call, and `sessionstart-remind.sh` records
+each root's git HEAD.
 
 ## The watchdog
 
@@ -1469,12 +1475,17 @@ root — the common single-root case keeps its plain `path:line` line, since
 only a multi-root project can have the same relative path indexed under two
 roots at once.
 
-The write-side hooks stay single-root, for a different reason: `memlib.sh`
-carries one `MEMCONTINUUM_CODE_ROOT`, so the edit ledger — and therefore the
-coverage and look-back nudges that read it — only ever sees the first
-`--code-root` given. `newfile-nudge.sh` is the one per-root hook: it gets its
-own wired entry, with its own `MEMCONTINUUM_CODE_ROOT`, for every
-`--code-root` given.
+The write-side hooks see every code root. `ledger-post-edit.sh` checks an
+edited path against each configured root and stamps the ledger row with the
+physical root it matched (`""` for a store-root row) plus `source: "tool"`;
+`userprompt-remind.sh`/`precompact-persist.sh` classify the ledger's code
+paths with one `unmapped` call carrying every root, and compare each root's
+current git HEAD against the session's own start-of-session map — "code HEAD
+changed" is true when any root moved. `newfile-nudge.sh` stays the one
+per-root **lifecycle** hook: it gets its own wired entry, with its own
+`MEMCONTINUUM_CODE_ROOT`, for every `--code-root` given — the other five
+write-side hooks fire once per event regardless of root count, never once per
+root.
 
 ## memlint
 

@@ -130,8 +130,20 @@ case "${SOURCE:-}" in
     startup|resume|clear)
         CODE_SHA="$(mc_git_head "${MEMCONTINUUM_CODE_ROOT:-}")"
         STORE_SHA="$(mc_git_head "${MEMCONTINUUM_ROOT:-}")"
+        # Design R5 (audit MC-P1-05, TOP-0123 L5): start_code_sha stays
+        # (first root, kept for older readers) AND start_code_shas
+        # ({root: sha}) is added for every configured root -- one extra
+        # python spawn (mc_code_roots, memlib.sh), the per-root git HEADs
+        # (mc_git_head, no python) folded into the SAME state-update
+        # transform below, no additional spawn for the map itself.
+        CODE_HEADS=""
+        while IFS= read -r CR; do
+            [ -n "$CR" ] || continue
+            CODE_HEADS="$CODE_HEADS$CR"$'\t'"$(mc_git_head "$CR")"$'\n'
+        done < <(mc_code_roots)
         export MC_CODE_SHA="$CODE_SHA"
         export MC_STORE_SHA="$STORE_SHA"
+        export MC_CODE_HEADS="$CODE_HEADS"
         export MC_SESSION_ID="$SESSION_ID"
         export MC_PROJECT_ENV="$MC_PROJECT"
         export MC_SOURCE="${SOURCE:-}"
@@ -147,9 +159,16 @@ if os.environ.get("MC_SOURCE") == "clear":
     state = {}
     state["ledger"] = _prior_ledger
 
+_code_heads = {}
+for _line in (os.environ.get("MC_CODE_HEADS") or "").splitlines():
+    if _line and "\t" in _line:
+        _root, _sha = _line.split("\t", 1)
+        _code_heads[_root] = _sha
+
 state.setdefault("session_id", os.environ.get("MC_SESSION_ID", ""))
 state.setdefault("project", os.environ.get("MC_PROJECT_ENV", ""))
 state.setdefault("start_code_sha", os.environ.get("MC_CODE_SHA", ""))
+state.setdefault("start_code_shas", _code_heads)
 state.setdefault("start_store_sha", os.environ.get("MC_STORE_SHA", ""))
 state.setdefault("created_at", time.time())
 state.setdefault("ledger", [])

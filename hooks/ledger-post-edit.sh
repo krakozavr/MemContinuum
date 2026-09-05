@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # PostToolUse hook (matcher: Edit|Write|NotebookEdit): silently appends
-# every edited file_path under the code root or the store root to this
-# session's ledger ($MEMCONTINUUM_HOME/sessions/<project>/<session_id>.json).
+# every edited file_path under any configured code root or the store root to
+# this session's ledger ($MEMCONTINUUM_HOME/sessions/<project>/<session_id>.json).
 # Never prints anything (PostToolUse additionalContext exists but this hook
 # never uses it -- it is pure evidence-gathering, not a reminder point --
 # docs/DESIGN.md ruling A/E). Runs identically inside a subagent
@@ -94,12 +94,23 @@ eval "$(mc_extract_fields "$PAYLOAD" session_id tool_input.file_path agent_id)" 
 # segment or a symlinked ancestor directory the same way newfile-nudge.sh's
 # was, silently classifying a real edit as out-of-scope and losing the
 # growth signal (last_growth_turn/last_growth_ts) this hook alone advances.
+#
+# Design R5 (audit MC-P1-05, TOP-0123 L5): checked against EVERY configured
+# code root (mc_code_roots, one python spawn regardless of root count) --
+# the FIRST match wins for kind=code and its physical root string is
+# exported as MC_ROOT. The store root check stays a single check.
 UNDER_CODE=0
 UNDER_STORE=0
-if [ -n "${MEMCONTINUUM_CODE_ROOT:-}" ]; then
-    mc_path_under_root "$FILE_PATH" "$MEMCONTINUUM_CODE_ROOT"
-    [ $? -eq 0 ] && UNDER_CODE=1
-fi
+MC_MATCHED_ROOT=""
+while IFS= read -r ROOT_CANDIDATE; do
+    [ -n "$ROOT_CANDIDATE" ] || continue
+    mc_path_under_root "$FILE_PATH" "$ROOT_CANDIDATE"
+    if [ $? -eq 0 ]; then
+        UNDER_CODE=1
+        MC_MATCHED_ROOT="$ROOT_CANDIDATE"
+        break
+    fi
+done < <(mc_code_roots)
 if [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
     mc_path_under_root "$FILE_PATH" "$MEMCONTINUUM_ROOT"
     [ $? -eq 0 ] && UNDER_STORE=1
@@ -116,6 +127,7 @@ STATE_FILE="$(mc_state_file_for "$MC_PROJECT" "$SESSION_ID")"
 
 export MC_FILE_PATH="$FILE_PATH"
 export MC_KIND="$KIND"
+export MC_ROOT="$MC_MATCHED_ROOT"
 export MC_SESSION_ID="$SESSION_ID"
 export MC_PROJECT_ENV="$MC_PROJECT"
 export MC_NOW="$(date +%s 2>/dev/null || echo 0)"
@@ -125,6 +137,11 @@ import hashlib, os, time
 
 path = os.environ.get("MC_FILE_PATH", "")
 kind = os.environ.get("MC_KIND", "code")
+# Design R5 (audit MC-P1-05, TOP-0123 L5): the physical root this path
+# matched, "" for a store row (MC_ROOT is only ever set when the code-root
+# containment loop found a match, and a store-kind row must not carry a
+# code root even if one also happened to match).
+root = os.environ.get("MC_ROOT", "") if kind == "code" else ""
 try:
     now = float(os.environ.get("MC_NOW") or time.time())
 except Exception:
@@ -146,6 +163,8 @@ if path:
             entry["kind"] = kind
             entry["content_sha256"] = content_sha
             entry["seen_at"] = now
+            entry["root"] = root
+            entry["source"] = "tool"
             break
     if not found:
         ledger.append({
@@ -153,6 +172,8 @@ if path:
             "kind": kind,
             "content_sha256": content_sha,
             "seen_at": now,
+            "root": root,
+            "source": "tool",
         })
 
     is_new_pair = (not found) or (previous_sha != content_sha)

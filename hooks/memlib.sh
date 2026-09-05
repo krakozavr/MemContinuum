@@ -32,16 +32,23 @@
 #                        Defaults to $(basename "$MEMCONTINUUM_ROOT"), else
 #                        "default" (memidx.py's own DEFAULT_PROJECT).
 #   MEMCONTINUUM_ROOT        store markdown root (the decision-chain repo).
-#   MEMCONTINUUM_CODE_ROOT   code root these hooks watch edits under.
+#   MEMCONTINUUM_CODE_ROOT   code root these hooks watch edits under (single-
+#                        root fallback; see MEMCONTINUUM_CODE_ROOTS below).
+#   MEMCONTINUUM_CODE_ROOTS  JSON array of every configured code root's
+#                        physical path (design R5, audit MC-P1-05, TOP-0123
+#                        L5). mc_code_roots() reads this first and falls
+#                        back to the single MEMCONTINUUM_CODE_ROOT above
+#                        when unset, so a project with one root never needs
+#                        to set both.
 #   MEMCONTINUUM_PYTHON      absolute path to the venv python. Falls back to
 #                        <engine>/.venv/bin/python (see scripts/repo-init.sh
 #                        --bootstrap-venv) when unset.
 #
 # WRITE-LOCK (ruling E): these scripts' only writable surface is
 # $MEMCONTINUUM_HOME/sessions/**/*.json[.lock] and $MEMCONTINUUM_HOME/hook.log.
-# Never write anything under MEMCONTINUUM_ROOT (the store) or
-# MEMCONTINUUM_CODE_ROOT (the code tree) from any function in this file or any
-# script that sources it.
+# Never write anything under MEMCONTINUUM_ROOT (the store) or any code root
+# named by MEMCONTINUUM_CODE_ROOT or MEMCONTINUUM_CODE_ROOTS from any
+# function in this file or any script that sources it.
 
 export PYTHONPATH=
 
@@ -180,6 +187,12 @@ for f in fields:
     if f == "tool_input.file_path":
         v = (d.get("tool_input") or {}).get("file_path") or ""
         name = "FILE_PATH"
+    elif f == "tool_input.notebook_path":
+        # R5/R6 (audit MC-P1-05/MC-P1-04, TOP-0123 L5/T8): a NotebookEdit
+        # payload carries notebook_path, not file_path -- added here so
+        # Task 8 does not need to touch memlib.sh itself.
+        v = (d.get("tool_input") or {}).get("notebook_path") or ""
+        name = "NOTEBOOK_PATH"
     elif f == "_prompt_hash":
         pid = d.get("prompt_id") or ""
         v = hashlib.sha256(pid.encode()).hexdigest()[:16] if pid else ""
@@ -194,6 +207,38 @@ for f in fields:
         name = f.upper()
     print(f"{name}={shlex.quote(str(v))}")
 ' "$@" 2>>"$MC_LOG"
+}
+
+# mc_code_roots -- prints one PHYSICAL code root per line, read by callers
+# via the existing bash-3.2-safe idiom:
+#   while IFS= read -r root; do ... ; done < <(mc_code_roots)
+# (process substitution, never a pipe -- a pipe would run the loop in a
+# subshell and drop any variable assignments made inside it). Design R5
+# (audit MC-P1-05, TOP-0123 L5): parses MEMCONTINUUM_CODE_ROOTS (a JSON
+# list, repo-init.sh's own esc_cmd(json.dumps(code_roots))) via ONE python
+# call -- the same one-python-call discipline mc_extract_fields already
+# uses, never a second process per root. Falls back to the single
+# MEMCONTINUUM_CODE_ROOT when the list variable is unset (old-shape
+# wiring rendered before this task, or a hand-written config) -- the list,
+# when present, IS the complete set; the single var is a strict subset/
+# legacy alias of it, never additional information, so this never reads
+# both.
+mc_code_roots() {
+    if [ -n "${MEMCONTINUUM_CODE_ROOTS:-}" ]; then
+        printf '%s' "$MEMCONTINUUM_CODE_ROOTS" | env PYTHONPATH= "$MC_PY" -c '
+import json, sys
+try:
+    roots = json.load(sys.stdin)
+except Exception:
+    roots = []
+if isinstance(roots, list):
+    for r in roots:
+        if isinstance(r, str) and r:
+            print(r)
+' 2>>"$MC_LOG"
+    elif [ -n "${MEMCONTINUUM_CODE_ROOT:-}" ]; then
+        printf '%s\n' "$MEMCONTINUUM_CODE_ROOT"
+    fi
 }
 
 # mc_git_head DIR -- read-only; empty string if DIR is missing or not a repo.

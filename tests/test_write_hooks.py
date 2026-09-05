@@ -3075,6 +3075,248 @@ class TestSessionEndStamp(HookTestBase):
 
 
 # ---------------------------------------------------------------------------
+# 6b. R5 (TOP-0123 L5): write-side hooks see every code root
+# ---------------------------------------------------------------------------
+
+
+class TestMultiRootWriteSide(HookTestBase):
+    """Design R5 (audit MC-P1-05, TOP-0123 L5): the five write-side hooks
+    receive every configured code root (JSON list, physical paths), not
+    just the first; ledger rows carry which physical root they matched;
+    `mc_code_roots`/`mc_extract_fields` (memlib.sh) gain the tokens the
+    hooks below need. `self.code_root` (HookTestBase) is root A;
+    `self.code_root_b` is a second, sibling git repo -- root B."""
+
+    def setUp(self):
+        super().setUp()
+        self.code_root_b = Path(self.td) / "code-b"
+        self.code_root_b.mkdir()
+        _write(self.code_root_b / "src" / "b.py", "# b\n")
+        git_init(self.code_root_b)
+
+    def multiroot_env(self, **overrides):
+        roots = [str(self.code_root.resolve()), str(self.code_root_b.resolve())]
+        env = self.base_env(
+            MEMCONTINUUM_CODE_ROOT=roots[0],
+            MEMCONTINUUM_CODE_ROOTS=json.dumps(roots),
+        )
+        env.update(overrides)
+        return env
+
+    def _memidx_argv_shim(self):
+        """A MEMCONTINUUM_PYTHON replacement that transparently forwards to
+        the real venv python (same technique as the existing hang_py/slow_py
+        shims elsewhere in this file) but first appends the FULL argv to a
+        log file whenever one of the args names memidx.py -- a spy, not a
+        stub: the real memidx.py still runs and the hook still gets real
+        output, so this proves how many times/with what args it was called
+        without reimplementing any of its logic."""
+        argv_log = Path(self.td) / "argv.log"
+        shim = Path(self.td) / "memidx-argv-shim.sh"
+        shim.write_text(
+            "#!/usr/bin/env bash\n"
+            "for a in \"$@\"; do\n"
+            "  case \"$a\" in\n"
+            "    *memidx.py) printf '%s\\n' \"$*\" >> \"$MC_TEST_ARGV_LOG\" ;;\n"
+            "  esac\n"
+            "done\n"
+            "exec \"$MC_TEST_REAL_PYTHON\" \"$@\"\n"
+        )
+        shim.chmod(0o755)
+        return shim, argv_log
+
+    # -- 2: ledger rows carry root/source; same relative path in two roots
+    #       does not collide; a path under neither root is out-of-scope ----
+
+    def test_ledger_row_under_second_root_carries_root_and_source(self):
+        session_id = "s-multiroot-ledger-b"
+        fpath = str(self.code_root_b / "src" / "b.py")
+        payload = self.post_tool_use_payload(session_id, fpath)
+        proc, _ = run_script(LEDGER_HOOK, payload, self.multiroot_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        state = self.load_state(session_id)
+        self.assertEqual(len(state["ledger"]), 1, state["ledger"])
+        entry = state["ledger"][0]
+        self.assertEqual(entry["path"], fpath)
+        self.assertEqual(entry["kind"], "code")
+        self.assertEqual(entry["root"], str(self.code_root_b.resolve()))
+        self.assertEqual(entry["source"], "tool")
+
+    def test_ledger_same_relative_path_under_two_roots_yields_two_rows(self):
+        session_id = "s-multiroot-ledger-samerel"
+        _write(self.code_root_b / "src" / "mapped.py", "# also mapped\n")
+        fpath_a = str(self.code_root / "src" / "mapped.py")
+        fpath_b = str(self.code_root_b / "src" / "mapped.py")
+        run_script(LEDGER_HOOK, self.post_tool_use_payload(session_id, fpath_a), self.multiroot_env())
+        run_script(LEDGER_HOOK, self.post_tool_use_payload(session_id, fpath_b), self.multiroot_env())
+        state = self.load_state(session_id)
+        by_path = {e["path"]: e for e in state["ledger"]}
+        self.assertEqual(set(by_path), {fpath_a, fpath_b})
+        self.assertEqual(by_path[fpath_a]["root"], str(self.code_root.resolve()))
+        self.assertEqual(by_path[fpath_b]["root"], str(self.code_root_b.resolve()))
+
+    def test_ledger_store_row_has_empty_root(self):
+        session_id = "s-multiroot-ledger-store"
+        fpath = str(self.store_root / "topics" / "testing" / "mapped-topic.md")
+        payload = self.post_tool_use_payload(session_id, fpath, tool_name="Write")
+        proc, _ = run_script(LEDGER_HOOK, payload, self.multiroot_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        state = self.load_state(session_id)
+        entry = [e for e in state["ledger"] if e["path"] == fpath][0]
+        self.assertEqual(entry["kind"], "store")
+        self.assertEqual(entry.get("root"), "")
+
+    def test_ledger_path_under_neither_root_is_out_of_scope(self):
+        session_id = "s-multiroot-ledger-outside"
+        fpath = "/tmp/somewhere/else/multiroot-nowhere.py"
+        payload = self.post_tool_use_payload(session_id, fpath)
+        proc, _ = run_script(LEDGER_HOOK, payload, self.multiroot_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        state = self.load_state(session_id)
+        paths = [e["path"] for e in state.get("ledger", [])]
+        self.assertNotIn(fpath, paths)
+
+    # -- memlib.sh: mc_code_roots / mc_extract_fields's new tokens ----------
+
+    def test_mc_code_roots_prints_every_root_and_falls_back_to_single(self):
+        caller = Path(self.td) / "code-roots-caller.sh"
+        caller.write_text(f'#!/usr/bin/env bash\nset -u\nsource "{MEMLIB}"\nmc_code_roots\n')
+
+        proc = subprocess.run(
+            [MC_BASH, str(caller)], capture_output=True, text=True, env=self.multiroot_env(), timeout=10,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        lines = [l for l in proc.stdout.splitlines() if l]
+        self.assertEqual(lines, [str(self.code_root.resolve()), str(self.code_root_b.resolve())])
+
+        # Falls back to the single MEMCONTINUUM_CODE_ROOT when the list
+        # variable is unset (old-shape wiring, or a hand-written config).
+        proc2 = subprocess.run(
+            [MC_BASH, str(caller)], capture_output=True, text=True, env=self.base_env(), timeout=10,
+        )
+        self.assertEqual(proc2.returncode, 0, proc2.stderr)
+        lines2 = [l for l in proc2.stdout.splitlines() if l]
+        self.assertEqual(lines2, [str(self.code_root)])
+
+    def test_mc_extract_fields_gains_notebook_path_token(self):
+        """`tool_input.notebook_path` is a NEW special token (Task 8 uses it,
+        added here so that task does not need to touch memlib.sh itself).
+        `tool_name` needs no code change at all -- it is already a plain
+        top-level key, handled by mc_extract_fields's existing generic
+        branch -- this same call proves that too."""
+        caller = Path(self.td) / "extract-fields-caller.sh"
+        caller.write_text(
+            f'#!/usr/bin/env bash\nset -u\nsource "{MEMLIB}"\n'
+            'mc_extract_fields "$1" tool_name tool_input.notebook_path\n'
+        )
+        payload = json.dumps({"tool_name": "NotebookEdit", "tool_input": {"notebook_path": "/x/nb.ipynb"}})
+        proc = subprocess.run(
+            [MC_BASH, str(caller), payload], capture_output=True, text=True, env=self.base_env(), timeout=10,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("TOOL_NAME=NotebookEdit", proc.stdout)
+        self.assertIn("NOTEBOOK_PATH=/x/nb.ipynb", proc.stdout)
+
+    # -- 4/5: userprompt-remind.sh / precompact-persist.sh see every root ---
+
+    def test_userprompt_remind_multiroot_coverage_and_head_changed(self):
+        session_id = "s-multiroot-userprompt"
+        fpath_a = str(self.code_root / "src" / "unmapped.py")
+        fpath_b = str(self.code_root_b / "src" / "b.py")
+        self.seed_ledger(session_id, [(fpath_a, "code"), (fpath_b, "code")])
+        state = self.load_state(session_id)
+        state["start_code_shas"] = {
+            str(self.code_root.resolve()): git_head(self.code_root),
+            str(self.code_root_b.resolve()): git_head(self.code_root_b),
+        }
+        self.state_file(session_id).write_text(json.dumps(state))
+
+        # Advance root B's HEAD only.
+        _write(self.code_root_b / "src" / "new.py", "# new\n")
+        subprocess.run(["git", "add", "-A"], cwd=self.code_root_b, check=True)
+        subprocess.run(["git", "-c", "user.email=a@b.c", "-c", "user.name=a",
+                        "commit", "-q", "-m", "b change"], cwd=self.code_root_b, check=True)
+
+        shim, argv_log = self._memidx_argv_shim()
+        env = self.multiroot_env(
+            MEMCONTINUUM_PYTHON=str(shim), MC_TEST_REAL_PYTHON=VENV_PYTHON, MC_TEST_ARGV_LOG=str(argv_log),
+        )
+        proc, _ = run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), env, timeout=10.0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        self.assertTrue(argv_log.exists(), proc.stdout + proc.stderr)
+        argv_lines = [l for l in argv_log.read_text().splitlines() if " unmapped " in l]
+        self.assertEqual(len(argv_lines), 1, argv_log.read_text())
+        line = argv_lines[0]
+        self.assertEqual(line.count("--code-root"), 2, line)
+        self.assertIn(f"--code-root {self.code_root.resolve()}", line)
+        self.assertIn(f"--code-root {self.code_root_b.resolve()}", line)
+
+        out = json.loads(proc.stdout)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("src/unmapped.py", ctx)
+        self.assertIn("src/b.py", ctx)
+        self.assertIn("code HEAD changed: yes", ctx)
+
+    def test_precompact_persist_multiroot_coverage_and_head_changed(self):
+        session_id = "s-multiroot-precompact"
+        fpath_a = str(self.code_root / "src" / "unmapped.py")
+        fpath_b = str(self.code_root_b / "src" / "b.py")
+        self.seed_ledger(session_id, [(fpath_a, "code"), (fpath_b, "code")])
+        state = self.load_state(session_id)
+        state["start_code_shas"] = {
+            str(self.code_root.resolve()): git_head(self.code_root),
+            str(self.code_root_b.resolve()): git_head(self.code_root_b),
+        }
+        self.state_file(session_id).write_text(json.dumps(state))
+
+        # Advance root B's HEAD only.
+        _write(self.code_root_b / "src" / "new.py", "# new\n")
+        subprocess.run(["git", "add", "-A"], cwd=self.code_root_b, check=True)
+        subprocess.run(["git", "-c", "user.email=a@b.c", "-c", "user.name=a",
+                        "commit", "-q", "-m", "b change"], cwd=self.code_root_b, check=True)
+
+        shim, argv_log = self._memidx_argv_shim()
+        env = self.multiroot_env(
+            MEMCONTINUUM_PYTHON=str(shim), MC_TEST_REAL_PYTHON=VENV_PYTHON, MC_TEST_ARGV_LOG=str(argv_log),
+        )
+        proc, _ = run_script(PRECOMPACT_HOOK, self.pre_compact_payload(session_id), env, timeout=10.0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        self.assertTrue(argv_log.exists(), proc.stdout + proc.stderr)
+        argv_lines = [l for l in argv_log.read_text().splitlines() if " unmapped " in l]
+        self.assertEqual(len(argv_lines), 1, argv_log.read_text())
+        line = argv_lines[0]
+        self.assertEqual(line.count("--code-root"), 2, line)
+        self.assertIn(f"--code-root {self.code_root.resolve()}", line)
+        self.assertIn(f"--code-root {self.code_root_b.resolve()}", line)
+
+        pending = self.load_state(session_id)["pending"]
+        self.assertIn("src/unmapped.py", pending["unmapped"])
+        self.assertIn("src/b.py", pending["unmapped"])
+        self.assertTrue(pending["code_head_changed"])
+
+    # -- 5: sessionstart-remind.sh records start_code_shas for every root ---
+
+    def test_sessionstart_remind_records_start_code_shas_for_both_roots(self):
+        session_id = "s-multiroot-sessionstart"
+        proc, _ = run_script(
+            SESSIONSTART_HOOK, self.session_start_payload(session_id, "startup"), self.multiroot_env(),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        state = self.load_state(session_id)
+        self.assertEqual(state.get("start_code_sha"), git_head(self.code_root))
+        self.assertEqual(
+            state.get("start_code_shas"),
+            {
+                str(self.code_root.resolve()): git_head(self.code_root),
+                str(self.code_root_b.resolve()): git_head(self.code_root_b),
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
 # 7. memlib.sh exists / is sourceable
 # ---------------------------------------------------------------------------
 

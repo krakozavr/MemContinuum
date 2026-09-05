@@ -1245,6 +1245,72 @@ class TestF1DecisionIndexState(unittest.TestCase):
             self.assertNotIn("degraded", out)
 
 
+class TestUnmappedMultipleCodeRoots(unittest.TestCase):
+    """Design R5 (audit MC-P1-05, TOP-0123 L5): `unmapped --code-root`
+    becomes repeatable (action="append", via a `_code_roots_arg` helper
+    accepting `str | list | None`); per path the LONGEST matching resolved
+    root wins (nested roots)."""
+
+    def test_unmapped_tries_every_code_root_longest_wins_and_string_still_works(self):
+        with tempfile.TemporaryDirectory() as td:
+            root_a = Path(td) / "root-a"; root_a.mkdir()
+            root_b = Path(td) / "root-b"; root_b.mkdir()
+            nested_b = root_a / "nested-b"; nested_b.mkdir()
+            for r, name in ((root_b, "b.py"), (nested_b, "n.py")):
+                (r / "src").mkdir()
+                (r / "src" / name).write_text(f"# {name}\n")
+
+            store = Path(td) / "store"
+            (store / "topics").mkdir(parents=True)
+            (store / "topics" / "t.md").write_text(
+                "---\nid: TOP-1\ntitle: T\nstatus: active\ncode_refs:\n"
+                "  - src/b.py\n  - src/n.py\n---\n\nBody.\n"
+            )
+            db = Path(td) / "idx.sqlite"
+            reindex(store, db, no_embed=True)
+
+            fpath_b = str((root_b / "src" / "b.py").resolve())
+            fpath_n = str((nested_b / "src" / "n.py").resolve())
+
+            # append: a file physically under the SECOND --code-root is
+            # still mapped (its code_refs entry is repo-relative to
+            # root_b, invisible to root_a alone -- this is the concrete
+            # false-gap regression the audit's acceptance list names).
+            # Nested roots: nested_b is ALSO a configured --code-root,
+            # sitting INSIDE root_a -- the LONGEST (most specific) resolved
+            # root among the ones actually configured must win the
+            # relativisation (root_a alone would give "nested-b/src/n.py",
+            # which does not match code_refs' "src/n.py" -- a false gap).
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = memidx.cmd_unmapped(ns(
+                    project=memidx.DEFAULT_PROJECT, db=str(db), root=str(store),
+                    code_root=[str(root_a), str(root_b), str(nested_b)], json=True,
+                    paths=[fpath_b, fpath_n],
+                ))
+            out = json.loads(buf.getvalue())
+            self.assertEqual(rc, 0, out)
+            self.assertEqual(out["unmapped"], [], out)
+            self.assertCountEqual(out["mapped_topic"], ["src/b.py", "src/n.py"], out)
+            self.assertEqual(
+                out["roots"],
+                [str(root_a.resolve()), str(root_b.resolve()), str(nested_b.resolve())],
+            )
+
+            # SimpleNamespace(code_root=str) -- the pre-append single-value
+            # shape -- still works unchanged.
+            buf2 = io.StringIO()
+            with contextlib.redirect_stdout(buf2):
+                rc2 = memidx.cmd_unmapped(ns(
+                    project=memidx.DEFAULT_PROJECT, db=str(db), root=str(store),
+                    code_root=str(root_b), json=True, paths=[fpath_b],
+                ))
+            out2 = json.loads(buf2.getvalue())
+            self.assertEqual(rc2, 0, out2)
+            self.assertEqual(out2["mapped_topic"], ["src/b.py"], out2)
+            self.assertEqual(out2["roots"], [str(root_b.resolve())])
+
+
 class TestF2EmbeddingMode(unittest.TestCase):
     """F2 (coordinator ruling 69): embed_sha provenance, the freshness join
     excluding a stale vector from ranking, --auto never writing
@@ -4003,6 +4069,47 @@ class TestEmbedWorker(unittest.TestCase):
         self.assertEqual(backlog["rows_without_fresh_vector"], 1)
         self.assertFalse(backlog["worker_lock_held"])
         marker.unlink()
+
+    # -- MOD-1 (task-6-review.md): a fail-open embedding-backend failure
+    # (not a crash -- cmd_reindex catches it internally and returns 0 by
+    # R4/R7's own fail-open contract) must still leave the marker and
+    # signal failure to the worker's own caller, via an explicit
+    # module-level signal cmd_reindex sets (never stdout-parsed, never the
+    # awaiting-embedding count -- a legitimately un-embeddable row also
+    # leaves that count > 0 and must not make the worker spin on it) ------
+
+    def test_broken_backend_leaves_the_marker_and_exits_3(self):
+        root = self._topic()
+        db = self._db()
+        reindex(root, db, project=self.project, no_embed=True)
+        marker = self._marker()
+        marker.touch()
+        with mock.patch.dict(os.environ, {"MEMCONTINUUM_HOME": str(self.home)}), \
+             mock.patch.object(memidx, "load_embedding_model",
+                                side_effect=RuntimeError("fastembed not installed")):
+            rc = memidx.cmd_embed_worker(self._args(root, db))
+        self.assertEqual(rc, 3, "a fail-open embedding-backend failure must signal failure, not success")
+        self.assertTrue(marker.exists(), "a broken backend must leave the marker for a later retry")
+
+    # -- LOW-1 (task-6-review.md): worker_lock_held reads True while a
+    # worker holds the lock (previously untested; the "held" branch was
+    # correct but never exercised) -----------------------------------------
+
+    def test_worker_lock_held_true_while_a_worker_holds_the_lock(self):
+        root = self._topic()
+        db = self._db()
+        reindex(root, db, project=self.project, no_embed=True)
+        lock_path = self.home / f"{self.project}.embed.lock"
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            backlog = memidx.embedding_backlog(db, self.project, self.home)
+            self.assertTrue(backlog["worker_lock_held"])
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+        backlog2 = memidx.embedding_backlog(db, self.project, self.home)
+        self.assertFalse(backlog2["worker_lock_held"])
 
 
 if __name__ == "__main__":

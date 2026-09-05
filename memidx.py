@@ -221,6 +221,30 @@ def _fingerprint_static_prefix(fp: str) -> str:
     idx = fp.find(marker)
     return fp if idx == -1 else fp[: idx + len(marker)]
 
+
+def _records_fresh_vector_counts(conn: "sqlite3.Connection", project: str) -> tuple[int, int]:
+    """LOW-2 (task-6-review.md): `(total, fresh)` -- how many of this
+    project's records exist, and how many have a FRESH vector (embed_sha
+    matches AND the embedding's fingerprint STATIC prefix matches the
+    CURRENT static fingerprint), computed WITHOUT loading a model. Shared
+    by three previously near-identical copies of this same pair of
+    queries: cmd_reindex's no-model branch, embedding_backlog, and
+    _decision_vector_index_state. Uses `r.project` throughout --
+    `r.project`/`e.project` are provably equivalent here (both `records`
+    and `embeddings` key `path` as PRIMARY KEY -- one owning project per db
+    file, by construction, per the schema's own header comment)."""
+    total = conn.execute(
+        "SELECT COUNT(*) AS n FROM records r WHERE r.project=?", (project,)
+    ).fetchone()["n"]
+    static_prefix = _fingerprint_static_prefix(embedding_fingerprint(model=None))
+    fresh = conn.execute(
+        "SELECT COUNT(*) AS n FROM records r JOIN embeddings e "
+        "ON e.path=r.path AND e.embed_sha=r.sha256 "
+        "WHERE r.project=? AND e.embed_fp IS NOT NULL AND substr(e.embed_fp,1,?)=?",
+        (project, len(static_prefix), static_prefix),
+    ).fetchone()["n"]
+    return total, fresh
+
 # F1 (external-fix round, coordinator ruling 68): the decision index's own
 # logical schema/content generation marker, bumped whenever a change needs
 # every store to run one automatic full rebuild pass on its next reindex --
@@ -1450,11 +1474,36 @@ def walk_markdown(root: Path, *, skipped: list | None = None):
         stack.extend(reversed(subdirs))
 
 
+# MOD-1 (task-6-review.md, carried into TOP-0123 L5/T7): cmd_reindex fails
+# OPEN on a broken embedding backend (Ruling 80/R4/R7's own contract) --
+# model load failure, a compute failure, or a malformed batch return all
+# print a stderr line and return 0, exactly like a --no-embed run. That is
+# correct for `reindex` itself, but it means `cmd_embed_worker` (which calls
+# cmd_reindex in-process and watches its RETURN VALUE for "did this pass
+# actually work") cannot tell a genuine success from a silently-swallowed
+# backend failure by rc alone. This module-level flag is the explicit
+# signal: reset to False at the top of every cmd_reindex call, set True in
+# each of the three "embeddings unavailable"/batch-mismatch branches below,
+# read back by cmd_embed_worker via reindex_embedding_backend_failed().
+# Deliberately NOT the awaiting-embedding count -- a legitimately
+# un-embeddable/no-op row also leaves that count > 0, and treating it as a
+# failure signal would make the worker spin forever on it.
+_last_reindex_embedding_backend_failed = False
+
+
+def reindex_embedding_backend_failed() -> bool:
+    """Whether the MOST RECENT cmd_reindex call hit a fail-open embedding-
+    backend failure (see _last_reindex_embedding_backend_failed above)."""
+    return _last_reindex_embedding_backend_failed
+
+
 def cmd_reindex(args) -> int:
     """F5: full replacement of Task 2's version (see that function's own
     former docstring, now gone) -- link rows, source_path/link_topic_path/
     link_id, the generation-driven migration probe, and Ruling 73's
     --auto-recomputes-mode-when-it-changed-something fix all land here."""
+    global _last_reindex_embedding_backend_failed
+    _last_reindex_embedding_backend_failed = False
     root = Path(args.root).resolve()
     if not root.is_dir() or not os.access(root, os.R_OK | os.X_OK):
         print(f"reindex: {root} is not a readable directory -- nothing was changed", file=sys.stderr)
@@ -1577,6 +1626,7 @@ def cmd_reindex(args) -> int:
                 file=sys.stderr,
             )
             no_embed = True
+            _last_reindex_embedding_backend_failed = True
         else:
             model, current_fp = loaded
             if embedded_shas and not fingerprints_match(stored_fp, current_fp):
@@ -1681,6 +1731,7 @@ def cmd_reindex(args) -> int:
                 f"reindex: embeddings unavailable ({embed_err}); continuing without embeddings",
                 file=sys.stderr,
             )
+            _last_reindex_embedding_backend_failed = True
         elif len(vecs) != len(to_embed_texts):
             # Design R4 item 5 (audit MC-P1-06): the batch-length check
             # BEFORE any zip -- a backend returning fewer/more vectors than
@@ -1692,6 +1743,7 @@ def cmd_reindex(args) -> int:
                 f"{len(to_embed_texts)} texts); continuing without embeddings",
                 file=sys.stderr,
             )
+            _last_reindex_embedding_backend_failed = True
         else:
             for p, v in zip(to_embed_paths, vecs):
                 vectors_by_path[p] = pack_vector(v)
@@ -1858,10 +1910,10 @@ def cmd_reindex(args) -> int:
     # fingerprint's prefix (compared in SQL, not via fingerprints_match in
     # Python -- avoids fetching every row) is all that can be checked
     # without touching fastembed.
-    total = conn.execute(
-        "SELECT COUNT(*) AS n FROM records WHERE project=?", (args.project,)
-    ).fetchone()["n"]
     if model is not None:
+        total = conn.execute(
+            "SELECT COUNT(*) AS n FROM records WHERE project=?", (args.project,)
+        ).fetchone()["n"]
         fresh = conn.execute(
             "SELECT COUNT(*) AS n FROM records r JOIN embeddings e "
             "ON e.path=r.path AND e.embed_sha=r.sha256 "
@@ -1869,13 +1921,9 @@ def cmd_reindex(args) -> int:
             (args.project, current_fp),
         ).fetchone()["n"]
     else:
-        static_prefix = _fingerprint_static_prefix(embedding_fingerprint(model=None))
-        fresh = conn.execute(
-            "SELECT COUNT(*) AS n FROM records r JOIN embeddings e "
-            "ON e.path=r.path AND e.embed_sha=r.sha256 "
-            "WHERE r.project=? AND e.embed_fp IS NOT NULL AND substr(e.embed_fp,1,?)=?",
-            (args.project, len(static_prefix), static_prefix),
-        ).fetchone()["n"]
+        # LOW-2 (task-6-review.md): shared with embedding_backlog and
+        # _decision_vector_index_state -- see _records_fresh_vector_counts.
+        total, fresh = _records_fresh_vector_counts(conn, args.project)
     awaiting_embedding = max(total - fresh, 0)
     if not auto or mode_relevant_change:
         mode_row = conn.execute("SELECT value FROM db_meta WHERE key='embedding_mode'").fetchone()
@@ -1976,6 +2024,7 @@ def cmd_embed_worker(args) -> int:
     traceback to `<project>.embed.log` (never stdout -- this process has
     no terminal, its whole point is running off the clock), and exit 3.
     """
+    global _last_reindex_embedding_backend_failed
     home = Path(os.environ.get("MEMCONTINUUM_HOME", str(Path.home() / ".memcontinuum")))
     lock_path = _embed_lock_path(home, args.project)
     marker_path = _embed_marker_path(home, args.project)
@@ -2000,6 +2049,13 @@ def cmd_embed_worker(args) -> int:
                 root=args.root, project=args.project, db=args.db,
                 full=False, no_embed=False, auto=False,
             )
+            # Reset explicitly BEFORE the call, not just relying on
+            # cmd_reindex's own reset at its top: a test (or any other
+            # caller) that mocks cmd_reindex out entirely never runs that
+            # reset, and this module-level flag would otherwise leak a
+            # stale True from an EARLIER, unrelated cmd_reindex call in the
+            # same process across into this pass's own verdict.
+            _last_reindex_embedding_backend_failed = False
             try:
                 cmd_reindex(reindex_ns)
             except Exception as exc:
@@ -2009,6 +2065,26 @@ def cmd_embed_worker(args) -> int:
                     tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
                     with log_path.open("a", encoding="utf-8") as fh:
                         fh.write(f"--- {ts} embed-worker ---\n{tb}\n")
+                except Exception:
+                    pass
+                return 3
+            if reindex_embedding_backend_failed():
+                # MOD-1 (task-6-review.md): cmd_reindex fails OPEN on a
+                # broken embedding backend (Ruling 80/R4/R7's own contract)
+                # and returns 0 -- no exception reaches here, but the marker
+                # must not be dropped as if this pass had actually embedded
+                # something. Treated exactly like the exception arm above:
+                # leave the marker, log why, exit 3 (the next commit or a
+                # manual worker run retries it).
+                try:
+                    home.mkdir(parents=True, exist_ok=True)
+                    ts = datetime.now(timezone.utc).isoformat()
+                    with log_path.open("a", encoding="utf-8") as fh:
+                        fh.write(
+                            f"--- {ts} embed-worker ---\n"
+                            "embedding backend failed (reindex reported no exception but could "
+                            "not embed); marker left in place for retry\n"
+                        )
                 except Exception:
                     pass
                 return 3
@@ -2075,17 +2151,9 @@ def embedding_backlog(db_path: Path, project: str, home: Path) -> dict:
         conn = open_db_noncreating(db_path, project=project)
         if conn is not None:
             try:
-                total = conn.execute(
-                    "SELECT COUNT(*) AS n FROM records WHERE project=?", (project,)
-                ).fetchone()["n"]
-                static_current = embedding_fingerprint(model=None)
-                static_prefix = _fingerprint_static_prefix(static_current)
-                fresh = conn.execute(
-                    "SELECT COUNT(*) AS n FROM records r JOIN embeddings e "
-                    "ON e.path=r.path AND e.embed_sha=r.sha256 "
-                    "WHERE r.project=? AND e.embed_fp IS NOT NULL AND substr(e.embed_fp,1,?)=?",
-                    (project, len(static_prefix), static_prefix),
-                ).fetchone()["n"]
+                # LOW-2 (task-6-review.md): shared with cmd_reindex's
+                # no-model branch and _decision_vector_index_state.
+                total, fresh = _records_fresh_vector_counts(conn, project)
                 rows_without_fresh_vector = max(total - fresh, 0)
             finally:
                 conn.close()
@@ -3886,41 +3954,89 @@ def _index_has_drift(
     return bool(r["added"] or r["changed"] or r["removed"])
 
 
-def _unmapped_path_candidates(raw_path: str, code_root: Path | None) -> list[str]:
+def _code_roots_arg(value: str | list | None) -> list[Path]:
+    """Design R5 (audit MC-P1-05, TOP-0123 L5): normalizes `unmapped`'s
+    `--code-root` argparse value into a list of RESOLVED Path objects.
+    `--code-root` is `action="append"` (argparse hands back `None` when
+    never given, else a list of every value given); a bare string is also
+    accepted (`SimpleNamespace(code_root=str)` -- the pre-append shape
+    still used directly by several callers/tests) for backward
+    compatibility. An unresolvable entry (OSError) is dropped, not fatal --
+    the remaining roots still apply."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = [value]
+    roots: list[Path] = []
+    for v in value:
+        if not v:
+            continue
+        try:
+            roots.append(Path(v).resolve())
+        except OSError:
+            continue
+    return roots
+
+
+def _unmapped_best_root(resolved_path: Path, code_roots: list[Path]) -> Path | None:
+    """The LONGEST resolved root (most specific) that contains
+    resolved_path -- correct for nested roots (one root inside another):
+    the innermost/most-specific one wins the relativisation."""
+    best = None
+    for cr in code_roots:
+        try:
+            resolved_path.relative_to(cr)
+        except ValueError:
+            continue
+        if best is None or len(str(cr)) > len(str(best)):
+            best = cr
+    return best
+
+
+def _unmapped_path_candidates(raw_path: str, code_roots: list[Path]) -> list[str]:
     """Candidates to try against the index's (repo-relative) code_refs /
-    concept paths: the path as given, and -- when --code-root is supplied and
-    the given path is absolute -- that path made relative to code_root. This
-    is the engine-side fix for the multi-candidate workaround documented at
-    the top of hooks/pre-edit-chain.sh (a PreToolUse/PostToolUse file_path is
-    always absolute; code_refs are conventionally repo-relative)."""
+    concept paths: the path as given, and -- when at least one --code-root
+    is supplied, the given path is absolute, and it resolves under one of
+    them -- that path made relative to the LONGEST (most specific)
+    matching root. This is the engine-side fix for the multi-candidate
+    workaround documented at the top of hooks/pre-edit-chain.sh (a
+    PreToolUse/PostToolUse file_path is always absolute; code_refs are
+    conventionally repo-relative)."""
     candidates = [raw_path]
-    if code_root is not None:
+    if code_roots:
         try:
             p = Path(raw_path)
             if p.is_absolute():
-                rel = str(p.resolve().relative_to(code_root))
-                if rel not in candidates:
-                    candidates.append(rel)
+                resolved = p.resolve()
+                best = _unmapped_best_root(resolved, code_roots)
+                if best is not None:
+                    rel = str(resolved.relative_to(best))
+                    if rel not in candidates:
+                        candidates.append(rel)
         except (OSError, ValueError):
             pass
     return candidates
 
 
-def _unmapped_display_path(raw_path: str, code_root: Path | None) -> str:
+def _unmapped_display_path(raw_path: str, code_roots: list[Path]) -> str:
     """The path string reported back for one PATH argument: relative to
-    --code-root when that's resolvable, else the path exactly as given."""
-    if code_root is not None:
+    the LONGEST matching --code-root when resolvable, else the path
+    exactly as given."""
+    if code_roots:
         try:
             p = Path(raw_path)
             if p.is_absolute():
-                return str(p.resolve().relative_to(code_root))
+                resolved = p.resolve()
+                best = _unmapped_best_root(resolved, code_roots)
+                if best is not None:
+                    return str(resolved.relative_to(best))
         except (OSError, ValueError):
             pass
     return raw_path
 
 
 def cmd_unmapped(args) -> int:
-    """`memidx.py unmapped PATH... --root R [--code-root CR] [--json]`
+    """`memidx.py unmapped PATH... --root R [--code-root CR ...] [--json]`
 
     For each PATH, classifies it as mapped_topic (a topic's code_refs
     references it), mapped_concept_only (no topic does, but a concept's
@@ -3952,7 +4068,11 @@ def cmd_unmapped(args) -> int:
     """
     root = Path(args.root).resolve()
     db_path = resolve_db_path(args)
-    code_root = Path(args.code_root).resolve() if getattr(args, "code_root", None) else None
+    # Design R5 (audit MC-P1-05, TOP-0123 L5): --code-root is repeatable
+    # (action="append"); _code_roots_arg also accepts a bare string
+    # (SimpleNamespace(code_root=str), the pre-append shape several
+    # existing callers/tests still use directly).
+    code_roots = _code_roots_arg(getattr(args, "code_root", None))
 
     coverage_status = "ok"
     mapped_topic: list[str] = []
@@ -3995,8 +4115,8 @@ def cmd_unmapped(args) -> int:
                         coverage_status = "unknown"
                 if conn is not None:
                     for raw_path in args.paths:
-                        candidates = _unmapped_path_candidates(raw_path, code_root)
-                        display = _unmapped_display_path(raw_path, code_root)
+                        candidates = _unmapped_path_candidates(raw_path, code_roots)
+                        display = _unmapped_display_path(raw_path, code_roots)
                         topic_hit = any(topic_matches_for_path(conn, args.project, c) for c in candidates)
                         concept_hit = False
                         if not topic_hit:
@@ -4045,6 +4165,11 @@ def cmd_unmapped(args) -> int:
         "mapped_concept_only": mapped_concept_only,
         "unmapped": unmapped,
         "coverage_status": coverage_status,
+        # Design R5 (audit MC-P1-05, TOP-0123 L5): an echo of every
+        # resolved --code-root this call used, NOT a per-entry root
+        # annotation -- the output shape (a list of display paths) stays
+        # exactly as before.
+        "roots": [str(r) for r in code_roots],
     }
     if degraded is not None:
         result["degraded"] = degraded
@@ -4088,14 +4213,11 @@ def _decision_vector_index_state(conn: sqlite3.Connection, project: str) -> str:
     static_current = embedding_fingerprint(model=None)
     if stored_fp and not fingerprints_match(stored_fp, static_current):
         return "mismatch"
-    total = conn.execute("SELECT COUNT(*) AS n FROM records WHERE project=?", (project,)).fetchone()["n"]
-    static_prefix = _fingerprint_static_prefix(static_current)
-    fresh = conn.execute(
-        "SELECT COUNT(*) AS n FROM records r JOIN embeddings e "
-        "ON e.path=r.path AND e.embed_sha=r.sha256 "
-        "WHERE e.project=? AND e.embed_fp IS NOT NULL AND substr(e.embed_fp,1,?)=?",
-        (project, len(static_prefix), static_prefix),
-    ).fetchone()["n"]
+    # LOW-2 (task-6-review.md): shared with cmd_reindex's no-model branch
+    # and embedding_backlog -- see _records_fresh_vector_counts. (This
+    # function used to filter the fresh-join on `e.project=?`; that is
+    # provably equivalent to `r.project=?`, which the shared helper uses.)
+    total, fresh = _records_fresh_vector_counts(conn, project)
     if total == 0 or fresh == 0:
         return "none"
     if fresh == total:
@@ -7393,7 +7515,10 @@ def main(argv=None) -> int:
     p_unmapped = sub.add_parser("unmapped")
     add_common_args(p_unmapped, need_root=True)
     p_unmapped.add_argument("paths", nargs="+", metavar="PATH")
-    p_unmapped.add_argument("--code-root", dest="code_root", default=None)
+    # Design R5 (audit MC-P1-05, TOP-0123 L5): repeatable -- one call now
+    # serves every configured code root (never given -> None; one or more
+    # times -> a list, via argparse's own action="append" semantics).
+    p_unmapped.add_argument("--code-root", dest="code_root", action="append", default=None)
     p_unmapped.add_argument("--json", action="store_true")
     p_unmapped.set_defaults(func=cmd_unmapped)
 

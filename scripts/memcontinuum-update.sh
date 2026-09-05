@@ -658,17 +658,76 @@ mc_update_recover_from_settings() {
     local nudge_seen=0 lang_present=0
     lang_glob_str=""
     never_glob_str=""
+
+    # Design R5 (audit MC-P1-05, TOP-0123 L5): read MEMCONTINUUM_CODE_ROOTS
+    # (JSON) from the write-side lines FIRST -- one always-present line
+    # already carries every recorded root, so this recovers roots even for
+    # a project with zero newfile-nudge lines (rationale-only wiring) or
+    # wiring whose nudge lines were swept away for some other reason. The
+    # newfile-nudge scan below stays the fallback for wiring rendered
+    # BEFORE this task (an old-shape write-side line with no ROOTS token).
+    #
+    # Escaping note: the settings file is itself one JSON document, so the
+    # array's internal double quotes are backslash-escaped in the RAW file
+    # text mc_command_env_value reads (`MEMCONTINUUM_CODE_ROOTS='[\"a\", \"b\"]'`)
+    # -- decoding needs one extra step (treat the captured text as the
+    # interior of a JSON string literal) before json.loads sees a real
+    # array. A root path containing a literal `'` would still truncate
+    # mc_command_env_value's own capture at that point regardless of this
+    # decode (documented, not solved -- pre-existing limitation of that
+    # helper, MC-P1-05's own note).
+    local root_json="" have_json_roots=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        [ -n "$line" ] || continue
+        mc_command_env_value "$line" "MEMCONTINUUM_CODE_ROOTS"
+        if [ -n "$MC_ENV_VALUE" ]; then
+            root_json="$MC_ENV_VALUE"
+            break
+        fi
+    done < <(mc_wired_commands_for_project "$project" \
+                 "$claude_dir/settings.local.json" "$claude_dir/settings.json")
+    if [ -n "$root_json" ]; then
+        local py2=""
+        py2="$(mc_update_resolve_python)" || py2=""
+        if [ -n "$py2" ]; then
+            while IFS= read -r rp || [ -n "$rp" ]; do
+                [ -n "$rp" ] || continue
+                case ";$root_seen;" in
+                    *";$rp;"*) ;;
+                    *) roots+=("$rp"); root_seen="$root_seen;$rp" ;;
+                esac
+            done < <(MC_UPDATE_ROOTS_JSON="$root_json" PYTHONPATH= "$py2" -c '
+import json, os
+raw = os.environ.get("MC_UPDATE_ROOTS_JSON", "")
+try:
+    parsed = json.loads(raw)
+except Exception:
+    try:
+        parsed = json.loads(json.loads(chr(34) + raw + chr(34)))
+    except Exception:
+        parsed = []
+if isinstance(parsed, list):
+    for r in parsed:
+        if isinstance(r, str) and r:
+            print(r)
+' 2>/dev/null)
+            [ "${#roots[@]}" -gt 0 ] && have_json_roots=1
+        fi
+    fi
+
     while IFS= read -r line || [ -n "$line" ]; do
         [ -n "$line" ] || continue
         case "$line" in
             *newfile-nudge.sh*)
                 nudge_seen=1
-                mc_command_env_value "$line" "MEMCONTINUUM_CODE_ROOT"
-                if [ -n "$MC_ENV_VALUE" ]; then
-                    case ";$root_seen;" in
-                        *";$MC_ENV_VALUE;"*) ;;
-                        *) roots+=("$MC_ENV_VALUE"); root_seen="$root_seen;$MC_ENV_VALUE" ;;
-                    esac
+                if [ "$have_json_roots" -eq 0 ]; then
+                    mc_command_env_value "$line" "MEMCONTINUUM_CODE_ROOT"
+                    if [ -n "$MC_ENV_VALUE" ]; then
+                        case ";$root_seen;" in
+                            *";$MC_ENV_VALUE;"*) ;;
+                            *) roots+=("$MC_ENV_VALUE"); root_seen="$root_seen;$MC_ENV_VALUE" ;;
+                        esac
+                    fi
                 fi
                 if [ "$lang_present" -eq 0 ]; then
                     mc_command_env_value "$line" "MEMCONTINUUM_LANG_EXTS"

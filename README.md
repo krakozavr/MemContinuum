@@ -462,9 +462,9 @@ exist to prevent.
 
 With several `--code-root` directories, every one of them is indexed and
 searchable — `code-reindex`/`code-search` are scoped per root, so repairing
-one root never touches another's rows. The write-side hooks are the one
-exception: the edit ledger and the nudges that read it follow the **first**
-root only, so edits under a later root do not reach them. The new-file
+one root never touches another's rows. The write-side hooks watch every root
+too: the edit ledger records which root an edit landed under, and the
+coverage/look-back nudges classify edits across all of them. The new-file
 reminder is the one per-root hook: it is wired for, and fires under, every
 `--code-root` given.
 

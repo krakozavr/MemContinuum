@@ -412,13 +412,23 @@ for p in d.get("code_paths", []):
     print(p)
 ' "$DECIDE_TMP" 2>>"$MC_LOG")
 
+    # Design R5 (audit MC-P1-05, TOP-0123 L5): every configured code root,
+    # captured ONCE (one python spawn via mc_code_roots, memlib.sh) and
+    # reused below by BOTH the `unmapped` call and the per-root HEAD
+    # comparison -- a herestring-fed while-read loop (bash 3.2 safe, no
+    # array-of-roots to guard against `set -u`'s empty-array expansion).
+    CODE_ROOTS_TEXT="$(mc_code_roots)"
+
     # Phase 2 (outside the lock): the real, possibly-heavier classification call.
     UNMAPPED_JSON="{}"
     if [ "${#CODE_PATHS[@]}" -gt 0 ] && [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
         ARGS=(unmapped)
         ARGS+=("${CODE_PATHS[@]}")
         ARGS+=(--root "$MEMCONTINUUM_ROOT" --project "$MC_PROJECT" --db "$MC_DB_PATH" --json)
-        [ -n "${MEMCONTINUUM_CODE_ROOT:-}" ] && ARGS+=(--code-root "$MEMCONTINUUM_CODE_ROOT")
+        while IFS= read -r CR; do
+            [ -n "$CR" ] || continue
+            ARGS+=(--code-root "$CR")
+        done <<<"$CODE_ROOTS_TEXT"
         RAW="$(env PYTHONPATH= "$MC_PY" "$MC_MEMIDX" "${ARGS[@]}" 2>>"$MC_LOG")"
         RC=$?
         # F1 (ruling 68): `unmapped` now exits 1 (not just 0) on a genuine
@@ -464,37 +474,63 @@ print(d.get("reason_code", "") if isinstance(d, dict) else "")
         fi
     fi
 
-    CUR_CODE_SHA="$(mc_git_head "${MEMCONTINUUM_CODE_ROOT:-}")"
+    # Design R5 (audit MC-P1-05, TOP-0123 L5): per-root HEAD comparison --
+    # code_head_changed = ANY configured root moved since session start.
+    # `git rev-parse HEAD` per root (mc_git_head, no python) is unavoidable
+    # (bash 3.2 cannot do a dict lookup without one), but the state-file
+    # lookup/comparison is ONE combined python call covering BOTH code
+    # (per-root map, with a fallback to the single legacy start_code_sha for
+    # a root the map has no entry for -- old-shape state predating this
+    # task) and store (unchanged, single root) -- replacing the former TWO
+    # separate START_CODE_SHA/START_STORE_SHA spawns with one, so this
+    # hook's total python-spawn count stays flat despite the new
+    # mc_code_roots call above.
+    CODE_HEADS=""
+    while IFS= read -r CR; do
+        [ -n "$CR" ] || continue
+        CODE_HEADS="$CODE_HEADS$CR"$'\t'"$(mc_git_head "$CR")"$'\n'
+    done <<<"$CODE_ROOTS_TEXT"
     CUR_STORE_SHA="$(mc_git_head "${MEMCONTINUUM_ROOT:-}")"
-    START_CODE_SHA="$(env PYTHONPATH= "$MC_PY" -c '
-import json, sys
-try:
-    with open(sys.argv[1]) as f:
-        state = json.load(f)
-except Exception:
-    state = {}
-print(state.get("start_code_sha") or "")
-' "$STATE_FILE" 2>>"$MC_LOG")"
-    START_STORE_SHA="$(env PYTHONPATH= "$MC_PY" -c '
-import json, sys
-try:
-    with open(sys.argv[1]) as f:
-        state = json.load(f)
-except Exception:
-    state = {}
-print(state.get("start_store_sha") or "")
-' "$STATE_FILE" 2>>"$MC_LOG")"
 
-    if [ -n "$CUR_CODE_SHA" ] && [ "$CUR_CODE_SHA" != "$START_CODE_SHA" ]; then
-        CODE_CHANGED="true"
-    else
-        CODE_CHANGED="false"
-    fi
-    if [ -n "$CUR_STORE_SHA" ] && [ "$CUR_STORE_SHA" != "$START_STORE_SHA" ]; then
-        STORE_CHANGED="true"
-    else
-        STORE_CHANGED="false"
-    fi
+    # Safe defaults in case the python call below prints nothing (interpreter
+    # gone, unexpected crash) -- under `set -u` an unset CODE_CHANGED/
+    # STORE_CHANGED would otherwise abort the hook with no log line.
+    CODE_CHANGED="false"
+    STORE_CHANGED="false"
+    eval "$(CODE_HEADS="$CODE_HEADS" CUR_STORE_SHA="$CUR_STORE_SHA" \
+        env PYTHONPATH= "$MC_PY" -c '
+import json, os, shlex, sys
+
+try:
+    with open(sys.argv[1]) as f:
+        state = json.load(f)
+    if not isinstance(state, dict):
+        state = {}
+except Exception:
+    state = {}
+
+starts = state.get("start_code_shas")
+if not isinstance(starts, dict):
+    starts = {}
+legacy_start = state.get("start_code_sha") or ""
+heads = os.environ.get("CODE_HEADS") or ""
+code_changed = False
+for line in heads.splitlines():
+    if not line or "\t" not in line:
+        continue
+    root, cur = line.split("\t", 1)
+    start = starts[root] if root in starts else legacy_start
+    if cur and cur != start:
+        code_changed = True
+        break
+
+cur_store = os.environ.get("CUR_STORE_SHA") or ""
+start_store = state.get("start_store_sha") or ""
+store_changed = bool(cur_store) and cur_store != start_store
+
+print("CODE_CHANGED=" + shlex.quote("true" if code_changed else "false"))
+print("STORE_CHANGED=" + shlex.quote("true" if store_changed else "false"))
+' "$STATE_FILE" 2>>"$MC_LOG")"
 
     OUTPUT_JSON="$(UNMAPPED_JSON="$UNMAPPED_JSON" CODE_CHANGED="$CODE_CHANGED" STORE_CHANGED="$STORE_CHANGED" \
         MEMCONTINUUM_ROOT="${MEMCONTINUUM_ROOT:-}" \

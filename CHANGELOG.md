@@ -82,6 +82,17 @@
   it prints `heal did not complete (code-reindex exit N)` instead and still
   answers from the current index.
 
+### Hooks
+- The five write-side hooks (edit ledger, coverage/look-back nudges,
+  session-start/-end) now see every configured code root, not just the
+  first -- an edit under a second or third `--code-root` is ledgered and
+  classified for coverage exactly like one under the first. Each ledger row
+  now records which physical root it matched (or none, for a store edit);
+  "code HEAD changed" is true when any configured root's git HEAD moved.
+  `unmapped --code-root` is now repeatable, picking the most specific
+  (longest) matching root when roots nest. Existing installs pick this up
+  on their next `memcontinuum-update.sh --apply` -- no re-install needed.
+
 ## [0.2.0rc3] — 2026-09-04
 
 ### Languages
