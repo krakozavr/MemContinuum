@@ -443,6 +443,24 @@ except Exception:
                 index-error)        mc_log "userprompt outcome=index-error session=${SESSION_ID:-}" ;;
                 quarantined)        mc_log "userprompt outcome=index-quarantined session=${SESSION_ID:-}" ;;
             esac
+            # Design R7 (audit MC-P2-03, TOP-0123 L7): a typed internal
+            # error collapses coverage_status to "unknown" like any other
+            # read failure (no new case arm there -- see 2.3 of the map),
+            # but carries its own `degraded` object naming the reason. One
+            # more hook.log token, same case-arm style as index-error
+            # above, so `stats` can count it separately from a plain
+            # unknown.
+            DEGRADED_REASON="$(printf '%s' "$RAW" | env PYTHONPATH= "$MC_PY" -c '
+import json, sys
+try:
+    d = (json.load(sys.stdin) or {}).get("degraded")
+except Exception:
+    d = None
+print(d.get("reason_code", "") if isinstance(d, dict) else "")
+' 2>/dev/null)"
+            if [ -n "$DEGRADED_REASON" ]; then
+                mc_log "userprompt outcome=index-degraded reason=${DEGRADED_REASON} session=${SESSION_ID:-}"
+            fi
         fi
     fi
 

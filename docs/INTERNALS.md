@@ -51,7 +51,9 @@ commit — not on a missing python, not on a stale index, not on a lookup error,
 not on its own timeout. A hook that cannot do its job logs and exits 0. The
 reason is asymmetric cost: a missed reminder costs one un-recorded ruling; a
 hook that blocks an edit costs the user their tool, and the first thing anyone
-does with a tool that blocks edits is remove it.
+does with a tool that blocks edits is remove it. Failing open also names its
+reason: a degraded answer carries `reason_code`, `exception_type` and a safe
+message; the traceback goes to `memidx-debug.log`; `--debug` re-raises.
 
 **Logging, per hook.** The seven project-level hooks each write exactly one
 `outcome=` line per run to `$MEMCONTINUUM_HOME/hook.log`.
@@ -77,6 +79,10 @@ plain `reindex --no-embed --auto` when the session only touched the store.
 `--auto` keeps the self-heal mode-preserving: it never embeds inside a hook's
 time budget, and never lets a no-op heal pass claim a fuller `embedding_mode`
 than the index already had (see [Decision index provenance](#decision-index-provenance-and-embedding-lifecycle)).
+`memidx.py` itself may also write `$MEMCONTINUUM_HOME/memidx-debug.log` — a
+timestamped traceback appended whenever a command degrades on an internal
+error, only when that directory already exists (it is never what creates
+`$MEMCONTINUUM_HOME`), and never surfaced to stdout/stderr/JSON.
 
 **Session state** lives at `$MEMCONTINUUM_HOME/sessions/<project>/<id>.json`,
 written by atomic rename (`os.replace`) and guarded by a real
@@ -1345,6 +1351,19 @@ longer matches the current one — never on an unrelated edit elsewhere in the
 tree with nothing about the backend or the chunker having changed, which is
 exactly the situation `code-search`'s heal (below) runs in.
 
+Writing a `failed`/`not-indexed` row is itself guarded: each file's whole
+write (the chunk INSERTs, or the failure-path purge-and-stamp) runs under its
+own savepoint, released on success and rolled back on any failure — so a
+mid-file exception can never leave a partial write committed alongside the
+files before and after it. If the purge or the status write ITSELF fails
+(disk error, a locked db), the savepoint rolls back that attempt too — the
+file's previous chunks and status row are left exactly as they were, nothing
+is half-updated — `code-reindex` prints `cannot purge stale rows for <path>
+(<Type>: <msg>); index integrity not guaranteed`, counts it as an integrity
+failure, and continues with the next file; every file that DID complete
+cleanly is still committed. A run with one or more integrity failures exits
+**5** and its summary line gains an `N integrity failure(s)` token.
+
 **`code_index_report(project)`** is the preflight both `code-search` and the
 heal consult, one entry per recorded root. States, in order: **uninitialized**
 (no `code-reindex` has ever run for this project — no `code_meta` rows at
@@ -1405,11 +1424,15 @@ the project's language set); it reindexes with embeddings only when the
 project's own `embedding_mode` is already `full`, otherwise with
 `--no-embed` — a heal can never be what silently leaves a `full` project's
 new chunks unembedded, but it also never upgrades a `none` project to `full`
-on its own. `code-search` prints `index healed` only when the state after
-healing reads `current` or `metadata-current` (both mean `changed == 0` —
-the only difference is whether this call proved it with a full hash); any
-exception during the heal is fail-open — the original report stands and the
-search still answers from whatever was already indexed.
+on its own. `code-search` prints `index healed` only when EVERY in-process
+`code-reindex` call it ran exited 0 AND the state after healing reads
+`current` or `metadata-current` (both mean `changed == 0` — the only
+difference is whether this call proved it with a full hash) — a non-zero
+exit (an integrity failure on some root) prints `heal did not complete
+(code-reindex exit N); answering from the current index` instead, never
+"healed" over it. Any exception during the heal is fail-open — the original
+report stands and the search still answers from whatever was already
+indexed.
 
 **Multi-root output.** `code-search --json` wraps hits in an envelope:
 `state`; `code_root`/`indexed_at`/`head_sha`, naming the first recorded root
@@ -1852,6 +1875,17 @@ since been deleted has its row deleted too. `decision_index_state` reports
 below); `check` lists each one under its own `quarantined` key alongside
 `added`/`changed`/`removed`.
 
+A record that parsed CLEANLY (so it never reaches the quarantine path above)
+but whose own database write then fails — a DB-level fault, not a parse/shape
+problem — is a different, honestly-reported case: each record's write runs
+under its own savepoint, released on success and rolled back on failure, so
+one record's write fault can never touch its neighbours. `reindex` prints
+`cannot index <path> (<Type>: <msg>); index integrity not guaranteed`, counts
+it as an integrity failure (never as quarantined — that word is reserved for
+a genuine parse/shape problem), and continues; a run with one or more
+integrity failures exits **5**, after every record that DID write cleanly is
+committed.
+
 **Lazy imports.** `fastembed` (and, transitively, numpy) is imported only inside
 `compute_embeddings`, `compute_query_embedding`, `load_embedding_model`, and
 the branches of `cmd_search`/`cmd_code_search` that call them. `reindex
@@ -1986,8 +2020,14 @@ down:
   `"quarantined"` (`index_errors` holds rows for this project — no self-heal;
   a malformed record does not clear itself by reindexing again),
   `"index-error"` (a `sqlite3.OperationalError` while reading), or `"unknown"`
-  (state was `stale`, self-heal ran, and drift still persisted afterward —
-  unchanged from before). `unmapped`'s own `stale` check, like `check`'s, is
+  (state was `stale`, self-heal ran, and drift still persisted afterward — the
+  `sqlite3.OperationalError` path above is unchanged; a broader failure here
+  additionally attaches an optional `"degraded": {reason_code:
+  "internal-error", exception_type, safe_message}` object to the JSON and
+  prints one `unmapped: degraded reason=internal-error type=<Type>: <msg>`
+  stderr line, so a genuine read failure is distinguishable from a code
+  defect without ever changing the collapsed `coverage_status` itself).
+  `unmapped`'s own `stale` check, like `check`'s, is
   content-proven (hashed, not metadata-only) — a negative claim is exactly
   where a same-size, same-`mtime_ns` rewrite must not slip through as
   `current`. Self-healing only fires on `stale`: one `reindex --no-embed

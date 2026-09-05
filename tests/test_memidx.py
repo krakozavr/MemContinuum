@@ -1235,7 +1235,12 @@ class TestF1DecisionIndexState(unittest.TestCase):
                                              root=str(root), code_root=None, json=True,
                                              paths=["src/x.py"]))
             self.assertEqual(rc, 1)
-            self.assertEqual(json.loads(buf.getvalue())["coverage_status"], "index-error")
+            out = json.loads(buf.getvalue())
+            self.assertEqual(out["coverage_status"], "index-error")
+            # Design R7 (audit MC-P2-03, TOP-0123 L7): this arm is UNCHANGED --
+            # no `degraded` object, only the broad `except Exception` branch
+            # (a genuine programmer bug or non-operational DB failure) gets one.
+            self.assertNotIn("degraded", out)
 
 
 class TestF2EmbeddingMode(unittest.TestCase):
@@ -3407,6 +3412,37 @@ class TestEmbeddingFingerprint(unittest.TestCase):
                 self.assertIn("different model", buf_err.getvalue(), mode)
                 self.assertGreater(len(out["results"]), 0, (mode, out))
 
+    # -- Task 4 review finding M1 (carried into Task 5's commit per
+    # brief): zero embeddings rows but a FOREIGN stored fingerprint used
+    # to be silent (no "embedding" key, no stderr) because the old gate
+    # was `has_vectors` alone; the disjunction now catches it too.
+
+    def test_zero_rows_but_foreign_fingerprint_still_reports_mismatch(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic(td, text="needle term for search")
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)  # zero embeddings rows
+
+            conn = sqlite3.connect(str(db))
+            conn.execute(
+                "INSERT OR REPLACE INTO db_meta (key, value) VALUES ('embedding_fingerprint', ?)",
+                (self.FOREIGN_FP,),
+            )
+            conn.commit(); conn.close()
+
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with mock.patch.object(memidx, "load_embedding_model", side_effect=self._fake_loader(self.FP1)), \
+                 contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = memidx.cmd_search(ns(
+                    project=memidx.DEFAULT_PROJECT, db=str(db), query="needle term for search",
+                    mode="vector", status=[], type=[], area=None, topic=None, authority=None,
+                    limit=10, json=True,
+                ))
+            self.assertEqual(rc, 0)
+            out = json.loads(buf_out.getvalue())
+            self.assertEqual(out["embedding"], "fingerprint-mismatch", out)
+            self.assertIn("different model", buf_err.getvalue())
+
     # -- Red 6/11: an old DB (vectors with NULL embed_fp) invalidates only
     # the vector layer; check --json never reads "mismatch" for it; one
     # embedding reindex refills every row and reads "full".
@@ -3523,6 +3559,259 @@ class TestEmbeddingFingerprint(unittest.TestCase):
             self.assertIn("different model", buf_err.getvalue())
             self.assertEqual(self._emb_rows(db), rows_before,
                               "a --no-embed/--auto pass must not repair a standing mismatch")
+
+
+class TestFingerprintsMatchContract(unittest.TestCase):
+    """Task 4 review finding L4 (carried into Task 5's commit per brief):
+    `fingerprints_match`'s own contract had no direct unit test -- every
+    existing test exercised it only indirectly, through a full DB
+    mismatch/no-mismatch scenario. These pin the 10 edge cases directly."""
+
+    REAL_A = "model=fake;dim=4;pipeline=1;prefix=none;norm=l2;fastembed=0.0.0;revision=rev1"
+    REAL_A_DIFFERENT_REVISION = "model=fake;dim=4;pipeline=1;prefix=none;norm=l2;fastembed=0.0.0;revision=rev2"
+    REAL_A_DIFFERENT_DIM = "model=fake;dim=8;pipeline=1;prefix=none;norm=l2;fastembed=0.0.0;revision=rev1"
+    REAL_A_UNKNOWN_REVISION = "model=fake;dim=4;pipeline=1;prefix=none;norm=l2;fastembed=0.0.0;revision=unknown"
+
+    def test_unknown_on_stored_side_is_a_wildcard(self):
+        self.assertTrue(memidx.fingerprints_match(self.REAL_A_UNKNOWN_REVISION, self.REAL_A))
+
+    def test_unknown_on_current_side_is_a_wildcard(self):
+        self.assertTrue(memidx.fingerprints_match(self.REAL_A, self.REAL_A_UNKNOWN_REVISION))
+
+    def test_both_unknown_matches(self):
+        self.assertTrue(memidx.fingerprints_match(self.REAL_A_UNKNOWN_REVISION, self.REAL_A_UNKNOWN_REVISION))
+
+    def test_both_real_and_identical_matches(self):
+        self.assertTrue(memidx.fingerprints_match(self.REAL_A, self.REAL_A))
+
+    def test_both_real_differing_only_in_revision_does_not_match(self):
+        self.assertFalse(memidx.fingerprints_match(self.REAL_A, self.REAL_A_DIFFERENT_REVISION))
+
+    def test_differing_in_a_single_static_key_does_not_match(self):
+        self.assertFalse(memidx.fingerprints_match(self.REAL_A, self.REAL_A_DIFFERENT_DIM))
+
+    def test_stored_none_never_matches(self):
+        self.assertFalse(memidx.fingerprints_match(None, self.REAL_A))
+
+    def test_stored_empty_string_never_matches(self):
+        self.assertFalse(memidx.fingerprints_match("", self.REAL_A))
+
+    def test_stored_malformed_never_matches(self):
+        self.assertFalse(memidx.fingerprints_match("garbage", self.REAL_A))
+
+    def test_current_none_never_matches(self):
+        self.assertFalse(memidx.fingerprints_match(self.REAL_A, None))
+
+
+class TestTypedDegradation(unittest.TestCase):
+    """Design R7 (audit MC-P2-03, TOP-0123 L7): `_degraded`/`_debug_log`,
+    `cmd_unmapped`'s programmer-bug branch, `--debug`, per-file/per-record
+    savepoints on the decision side, and `cmd_stats`'s typed fail-open
+    line."""
+
+    def _store_with_one_topic(self, td):
+        root = Path(td) / "root"; (root / "topics").mkdir(parents=True)
+        (root / "topics" / "t.md").write_text(
+            "---\ntype: topic\nid: TOP-9000\ntitle: T\nlinks:\n"
+            "  - link: L1\n    status: active\n    ruling: {text: \"r\", authority: owner-verbatim, source: s}\n"
+            "---\nbody\n"
+        )
+        return root.resolve()
+
+    # -- Red 1: a genuine programmer bug (AttributeError, nothing to do
+    # with sqlite) inside cmd_unmapped's per-path classify loop is named,
+    # not silently folded into a bare "unknown".
+
+    def test_programmer_error_in_unmapped_is_named_and_debug_logged(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._store_with_one_topic(td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+            debug_home = Path(td) / "debughome"; debug_home.mkdir()
+
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with mock.patch.object(memidx, "topic_matches_for_path", side_effect=AttributeError("boom")), \
+                 mock.patch.dict(os.environ, {"MEMCONTINUUM_HOME": str(debug_home)}), \
+                 contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = memidx.cmd_unmapped(ns(project=memidx.DEFAULT_PROJECT, db=str(db),
+                                             root=str(root), code_root=None, json=True,
+                                             paths=["topics/t.md"]))
+            out = json.loads(buf_out.getvalue())
+            self.assertEqual(out["coverage_status"], "unknown")
+            self.assertIn("degraded", out)
+            self.assertEqual(out["degraded"]["reason_code"], "internal-error")
+            self.assertEqual(out["degraded"]["exception_type"], "AttributeError")
+            self.assertIn("boom", out["degraded"]["safe_message"])
+            self.assertIn("unmapped: degraded reason=internal-error type=AttributeError",
+                           buf_err.getvalue())
+            log_path = debug_home / "memidx-debug.log"
+            self.assertTrue(log_path.is_file(), "memidx-debug.log must exist under MEMCONTINUUM_HOME")
+            log_text = log_path.read_text()
+            self.assertIn("AttributeError", log_text)
+            self.assertIn("boom", log_text)
+            self.assertIn("Traceback", log_text)
+
+    def test_debug_flag_reraises_unmapped_internal_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._store_with_one_topic(td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+            with mock.patch.object(memidx, "topic_matches_for_path", side_effect=AttributeError("boom")), \
+                 mock.patch.object(memidx, "DEBUG", True):
+                with self.assertRaises(AttributeError):
+                    memidx.cmd_unmapped(ns(project=memidx.DEFAULT_PROJECT, db=str(db),
+                                            root=str(root), code_root=None, json=True,
+                                            paths=["topics/t.md"]))
+
+    # -- Red 5 (decision side): a DB-level write failure on one record
+    # never touches its neighbours, and the run reports it honestly
+    # (a hard error, rc != 0) rather than silently mislabeling a DB
+    # failure as a parse/shape quarantine -- see report section on this
+    # deviation for the reasoning.
+
+    def test_decision_savepoint_isolates_write_failure_to_one_record(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"; (root / "topics").mkdir(parents=True)
+            for name, tid in (("a.md", "TOP-9001"), ("b.md", "TOP-9002"), ("c.md", "TOP-9003")):
+                (root / "topics" / name).write_text(
+                    "---\ntype: topic\nid: {}\ntitle: T\nlinks:\n"
+                    "  - link: L1\n    status: active\n    ruling: {{text: \"r\", authority: owner-verbatim, source: s}}\n"
+                    "---\nbody\n".format(tid)
+                )
+            root = root.resolve()
+            db = Path(td) / "idx.sqlite"
+
+            real_insert = memidx.insert_record_rows
+
+            def flaky_insert(conn, project, rec, sha, mtime, size):
+                if rec["path"].endswith("b.md"):
+                    raise sqlite3.OperationalError("disk I/O error (injected)")
+                return real_insert(conn, project, rec, sha, mtime, size)
+
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with mock.patch.object(memidx, "insert_record_rows", side_effect=flaky_insert), \
+                 contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = reindex(root, db, no_embed=True)
+            self.assertEqual(rc, 5)
+            self.assertIn("integrity failure", buf_out.getvalue())
+            self.assertIn("index integrity not guaranteed", buf_err.getvalue())
+
+            conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
+            paths = {r["path"] for r in conn.execute("SELECT path FROM records")}
+            b_embeddings = conn.execute(
+                "SELECT COUNT(*) AS n FROM embeddings WHERE path LIKE '%b.md'"
+            ).fetchone()["n"]
+            conn.close()
+            self.assertTrue(any(p.endswith("a.md") for p in paths), paths)
+            self.assertTrue(any(p.endswith("c.md") for p in paths), paths)
+            self.assertFalse(any(p.endswith("b.md") for p in paths), paths)
+            self.assertEqual(b_embeddings, 0, "b.md's embedding upsert must have rolled back too")
+
+    # -- Regression (advisor review, post-fix): the per-record SAVEPOINT
+    # loop must nest inside ONE transaction that commits only once, at the
+    # very end of the function -- not one micro-commit per SAVEPOINT/
+    # RELEASE pair. Proven black-box (no connection tracing needed): force
+    # the mode-recompute step that runs AFTER the loop but BEFORE the
+    # final conn.commit() to raise, and confirm NOTHING landed. Before the
+    # `if not conn.in_transaction: conn.execute("BEGIN")` guard this read
+    # 3 (each RELEASE had already committed its own record); it must read
+    # 0 now that the whole loop shares one transaction closed only by the
+    # function's own final commit.
+
+    def test_decision_single_commit_nothing_lands_if_post_loop_step_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"; (root / "topics").mkdir(parents=True)
+            for name, tid in (("a.md", "TOP-9001"), ("b.md", "TOP-9002"), ("c.md", "TOP-9003")):
+                (root / "topics" / name).write_text(
+                    "---\ntype: topic\nid: {}\ntitle: T\nlinks:\n"
+                    "  - link: L1\n    status: active\n    ruling: {{text: \"r\", authority: owner-verbatim, source: s}}\n"
+                    "---\nbody\n".format(tid)
+                )
+            root = root.resolve()
+            db = Path(td) / "idx.sqlite"
+
+            with mock.patch.object(memidx, "_fingerprint_static_prefix", side_effect=RuntimeError("boom")):
+                with self.assertRaises(RuntimeError):
+                    reindex(root, db, no_embed=True)
+
+            conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
+            n = conn.execute("SELECT COUNT(*) AS n FROM records").fetchone()["n"]
+            conn.close()
+            self.assertEqual(
+                n, 0,
+                "a failure AFTER the per-record loop but before the final commit must roll back "
+                "every record the loop touched -- proves the SAVEPOINTs share one transaction",
+            )
+
+    # -- Red 7 (cmd_stats): the fail-open catch-all is retyped.
+
+    def test_stats_internal_error_prints_typed_degraded_line(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"; home.mkdir()
+            (home / "hook.log").write_text("2026-09-04T00:00:00+00:00 outcome=ok project=p\n")
+            buf_out = io.StringIO()
+            with mock.patch.object(memidx, "_stats_report", side_effect=AttributeError("boom")), \
+                 contextlib.redirect_stdout(buf_out):
+                rc = memidx.cmd_stats(ns(project=memidx.DEFAULT_PROJECT, days=7, home=str(home),
+                                          store=None, json=False, now=None))
+            self.assertEqual(rc, 0)
+            self.assertIn("stats: degraded reason=internal-error type=AttributeError: boom -- exit 0 (fail-open)",
+                           buf_out.getvalue())
+
+    def test_debug_flag_reraises_stats_internal_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"; home.mkdir()
+            (home / "hook.log").write_text("2026-09-04T00:00:00+00:00 outcome=ok project=p\n")
+            with mock.patch.object(memidx, "_stats_report", side_effect=AttributeError("boom")), \
+                 mock.patch.object(memidx, "DEBUG", True):
+                with self.assertRaises(AttributeError):
+                    memidx.cmd_stats(ns(project=memidx.DEFAULT_PROJECT, days=7, home=str(home),
+                                         store=None, json=False, now=None))
+
+    # -- Direct unit coverage of the new helpers themselves.
+
+    def test_degraded_helper_shape_and_truncation(self):
+        exc = ValueError("x" * 300 + "\nsecond line")
+        d = memidx._degraded("internal-error", exc)
+        self.assertEqual(d["reason_code"], "internal-error")
+        self.assertEqual(d["exception_type"], "ValueError")
+        self.assertLessEqual(len(d["safe_message"]), 200)
+        self.assertNotIn("\n", d["safe_message"])
+
+    def test_degraded_helper_no_exception(self):
+        d = memidx._degraded("index-missing")
+        self.assertEqual(d, {"reason_code": "index-missing", "exception_type": None, "safe_message": None})
+
+    def test_debug_log_writes_traceback_when_home_exists(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"; home.mkdir()
+            try:
+                raise RuntimeError("kaboom")
+            except RuntimeError as exc:
+                with mock.patch.dict(os.environ, {"MEMCONTINUUM_HOME": str(home)}):
+                    memidx._debug_log(exc, "unit-test")
+            text = (home / "memidx-debug.log").read_text()
+            self.assertIn("kaboom", text)
+            self.assertIn("unit-test", text)
+            self.assertIn("Traceback", text)
+
+    def test_debug_log_never_creates_the_home_directory(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "does-not-exist"
+            try:
+                raise RuntimeError("kaboom")
+            except RuntimeError as exc:
+                with mock.patch.dict(os.environ, {"MEMCONTINUUM_HOME": str(home)}):
+                    memidx._debug_log(exc, "unit-test")  # must not raise, must not create home
+            self.assertFalse(home.exists())
+
+    def test_index_integrity_error_carries_rel_and_cause(self):
+        cause = sqlite3.OperationalError("disk I/O error")
+        err = memidx.IndexIntegrityError("src/x.py", cause)
+        self.assertEqual(err.rel, "src/x.py")
+        self.assertIs(err.cause, cause)
+        self.assertIn("src/x.py", str(err))
+        self.assertIn("OperationalError", str(err))
 
 
 if __name__ == "__main__":

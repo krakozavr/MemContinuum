@@ -37,6 +37,17 @@
   of vectors for a batch writes nothing rather than mis-assigning them.
   `check --json` gains `vector_index_state` (`none`/`partial`/`full`/
   `mismatch`), computed without loading the embedding model.
+- `unmapped` no longer folds a genuine programmer bug into the same silent
+  `unknown` a real read failure gets: a broader internal error now attaches a
+  typed `degraded` object (`reason_code`, `exception_type`, a short safe
+  message) to the JSON, names it on stderr, and appends the traceback to a new
+  `memidx-debug.log` -- `coverage_status` itself is unchanged. `stats`'s own
+  fail-open catch-all is named the same way. A new `--debug` flag re-raises
+  instead of degrading, for local debugging. Each record's write in `reindex`
+  now runs under its own savepoint -- one record's write failure can no longer
+  affect its neighbours, is reported honestly (never mislabeled as a
+  quarantine), and a run with one or more such failures exits 5 after every
+  other record is still committed.
 
 ### Code index
 - The code index's freshness check now compares five stat signals per file
@@ -60,6 +71,16 @@
   `code-reindex` re-embeds every chunk on a mismatch, and `reembeds` in its
   summary line now counts vectors actually written, not chunks merely sent
   to the backend.
+- Each file's write in `code-reindex` now runs under its own savepoint;
+  a failure that leaves the purge-and-stamp step itself unable to complete
+  (rather than a normal chunker failure, already handled) rolls back that
+  file's attempt instead of committing a half-updated row, prints
+  `cannot purge stale rows for <path> ...; index integrity not guaranteed`,
+  and the run exits 5 with an `N integrity failure(s)` token in its summary
+  -- every other file is still committed. `code-search`'s heal never prints
+  "index healed" over a `code-reindex` exit it did not get a clean 0 from;
+  it prints `heal did not complete (code-reindex exit N)` instead and still
+  answers from the current index.
 
 ## [0.2.0rc3] — 2026-09-04
 

@@ -358,7 +358,11 @@ index is proven current, metadata-checked, stale, or incomplete, rather than
 returning an empty list that reads like "nothing found", and `--verify-content`
 proves it by hashing every indexed file; either way it heals a stale or
 incomplete index itself before searching, in one attempt, when the drift is
-small enough. Run any command with `--help` for its full flag list.
+small enough. A failed cleanup — the rare case where the index itself cannot
+be safely updated for one file or record — fails the reindex with a non-zero
+exit instead of reporting success, and internal errors are named by reason
+rather than folded into a bare "something went wrong". Run any command with
+`--help` for its full flag list.
 
 **Keeping a wired repo up to date.** A fix that only touches a script (a hook,
 `memidx.py`, `memlint.py`) reaches every wired repo the moment you pull —

@@ -184,6 +184,21 @@ except Exception:
             index-error)        mc_log "precompact outcome=index-error session=${SESSION_ID:-}" ;;
             quarantined)        mc_log "precompact outcome=index-quarantined session=${SESSION_ID:-}" ;;
         esac
+        # Design R7 (audit MC-P2-03, TOP-0123 L7): see userprompt-remind.sh's
+        # identical block -- a typed internal error stays coverage_status
+        # "unknown" but carries its own `degraded` object; one more
+        # hook.log token, same case-arm style, so `stats` can count it.
+        DEGRADED_REASON="$(printf '%s' "$RAW" | env PYTHONPATH= "$MC_PY" -c '
+import json, sys
+try:
+    d = (json.load(sys.stdin) or {}).get("degraded")
+except Exception:
+    d = None
+print(d.get("reason_code", "") if isinstance(d, dict) else "")
+' 2>/dev/null)"
+        if [ -n "$DEGRADED_REASON" ]; then
+            mc_log "precompact outcome=index-degraded reason=${DEGRADED_REASON} session=${SESSION_ID:-}"
+        fi
     fi
 fi
 

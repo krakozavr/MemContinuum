@@ -29,6 +29,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import traceback
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -74,6 +75,75 @@ EMBED_DIM = 384
 # gets excluded and re-embedded (see embedding_fingerprint below).
 EMBED_PIPELINE_VERSION = 1
 EMBED_BODY_CHARS = 1500  # bump EMBED_PIPELINE_VERSION when this changes
+
+# Design R7 (audit MC-P2-03, TOP-0123 L7): a small, typed shape for a
+# degraded answer, shared by cmd_unmapped and cmd_stats (and anything
+# later that reports a coverage-shaped state off a broad exception).
+DEGRADED_REASON_CODES = (
+    "index-missing", "index-error", "backend-missing", "file-unreadable", "internal-error",
+)
+
+# Set by the --debug global flag (main()); tests set this module
+# attribute directly (mock.patch.object(memidx, "DEBUG", True)) since
+# cmd_* functions are normally called without going through argparse at
+# all. When True, every catch that would otherwise produce an
+# "internal-error" Degraded answer re-raises instead of degrading --
+# useful for developing/debugging a new code path that should never
+# itself throw.
+DEBUG = False
+
+
+def _degraded(reason_code: str, exc: BaseException | None = None, *, safe_message: str | None = None) -> dict:
+    """Design R7: `{"reason_code", "exception_type", "safe_message"}` --
+    `reason_code` is one of DEGRADED_REASON_CODES, `exception_type` is the
+    caught exception's class name (or None when there is no exception,
+    e.g. a state derived without ever catching one), and `safe_message` is
+    `str(exc)` with every run of whitespace (including newlines)
+    collapsed to a single space and truncated to 200 chars -- NEVER a
+    traceback, NEVER file contents. The real traceback goes to
+    `_debug_log`'s file, never into this dict, stdout, or a JSON response."""
+    if safe_message is None and exc is not None:
+        safe_message = " ".join(str(exc).split())[:200]
+    return {
+        "reason_code": reason_code,
+        "exception_type": type(exc).__name__ if exc is not None else None,
+        "safe_message": safe_message,
+    }
+
+
+def _debug_log(exc: BaseException, context: str) -> None:
+    """Design R7: appends a timestamped traceback to
+    $MEMCONTINUUM_HOME/memidx-debug.log -- same home resolution as every
+    other MEMCONTINUUM_HOME consumer in this file (env var, else
+    ~/.memcontinuum). Created only if the directory already exists (this
+    must never be the thing that creates ~/.memcontinuum out of nowhere);
+    any failure to write -- a missing dir, a permission error, a full
+    disk -- is swallowed, fail-open: a debug logger must never itself
+    become a second silent failure mode."""
+    try:
+        home = Path(os.environ.get("MEMCONTINUUM_HOME", str(Path.home() / ".memcontinuum")))
+        if not home.is_dir():
+            return
+        ts = datetime.now(timezone.utc).isoformat()
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        with (home / "memidx-debug.log").open("a", encoding="utf-8") as fh:
+            fh.write(f"--- {ts} {context} ---\n{tb}\n")
+    except Exception:
+        pass
+
+
+class IndexIntegrityError(Exception):
+    """Design R7 (audit MC-P2-03, TOP-0123 L7): raised by
+    `_record_index_failure` when the purge or the status write ITSELF
+    fails -- the caller cannot trust the index for this path any more and
+    must roll back to its per-file savepoint rather than commit a
+    half-updated row. Carries the path and the original exception so the
+    caller can name both without re-inspecting a formatted string."""
+
+    def __init__(self, rel: str, cause: BaseException):
+        self.rel = rel
+        self.cause = cause
+        super().__init__(f"{rel}: {type(cause).__name__}: {cause}")
 
 
 def embedding_fingerprint(model=None) -> str:
@@ -1650,6 +1720,21 @@ def cmd_reindex(args) -> int:
 
     added = 0
     changed = 0
+    integrity_failures = 0  # design R7 (audit MC-P2-03, TOP-0123 L7)
+    # Design R7: a bare SAVEPOINT issued while the connection is NOT
+    # already inside a transaction starts one itself (SQLite semantics --
+    # verified empirically, not assumed), and RELEASEing the outermost
+    # savepoint then COMMITS it -- silently splitting "the single final
+    # commit stays" (rule 5) into one commit per record. This explicit
+    # BEGIN (skipped if something upstream already opened one) guarantees
+    # every per-record SAVEPOINT below nests INSIDE one already-open
+    # transaction, so its own RELEASE only closes the savepoint, never
+    # the whole transaction; the real commit stays the one at the very
+    # end of this function. sqlite3's own autocommit check (`in_transaction`)
+    # is exactly what BEGIN needs to avoid a "cannot start a transaction
+    # within a transaction" error if a prior write already opened one.
+    if not conn.in_transaction:
+        conn.execute("BEGIN")
     for rec, sha, mtime, size in pending:
         is_new = rec["path"] not in existing
         # keep_embedding used to be `no_embed and not is_new` (Task 2): "if
@@ -1662,11 +1747,33 @@ def cmd_reindex(args) -> int:
         # answers directly.
         will_refresh_embedding = rec["path"] in vectors_by_path
         keep_embedding = not is_new and not will_refresh_embedding
-        delete_record_rows(conn, rec["path"], keep_embedding=keep_embedding)
-        insert_record_rows(conn, args.project, rec, sha, mtime, size)
-        _upsert_embedding(rec["path"], sha)
-        for link_path, _lid, _t in _link_embed_items(rec):
-            _upsert_embedding(link_path, sha)
+        # Design R7: one savepoint per record, covering its delete/insert/
+        # embedding-upsert triplet. This record's content already parsed
+        # clean (loop 1 above) -- a failure here is a genuine DB-level (or
+        # programmer) fault, not a parse/shape problem, so it is reported
+        # honestly as an integrity failure (rc != 0) rather than folded
+        # into the quarantine bucket that means something else (see the
+        # report for the reasoning). RELEASE on success, ROLLBACK TO +
+        # RELEASE on failure -- this record's neighbours are unaffected
+        # either way, and the single final commit below still runs.
+        conn.execute("SAVEPOINT record")
+        try:
+            delete_record_rows(conn, rec["path"], keep_embedding=keep_embedding)
+            insert_record_rows(conn, args.project, rec, sha, mtime, size)
+            _upsert_embedding(rec["path"], sha)
+            for link_path, _lid, _t in _link_embed_items(rec):
+                _upsert_embedding(link_path, sha)
+        except Exception as exc:
+            conn.execute("ROLLBACK TO SAVEPOINT record")
+            conn.execute("RELEASE SAVEPOINT record")
+            integrity_failures += 1
+            print(
+                f"reindex: cannot index {rec['path']} ({type(exc).__name__}: {exc}); "
+                "index integrity not guaranteed",
+                file=sys.stderr,
+            )
+            continue
+        conn.execute("RELEASE SAVEPOINT record")
         if is_new:
             added += 1
         else:
@@ -1794,10 +1901,20 @@ def cmd_reindex(args) -> int:
     conn.commit()
     conn.close()
     elapsed = time.time() - t0
-    print(f"reindex: {len(files)} files scanned, {added} added, {changed} changed, "
-          f"{unchanged} unchanged, {len(removed_paths)} removed, {len(quarantined)} quarantined, "
-          f"{backfilled} embedding(s) backfilled, {elapsed:.3f}s")
-    return 0
+    summary = (
+        f"reindex: {len(files)} files scanned, {added} added, {changed} changed, "
+        f"{unchanged} unchanged, {len(removed_paths)} removed, {len(quarantined)} quarantined, "
+        f"{backfilled} embedding(s) backfilled"
+    )
+    if integrity_failures:
+        # Design R7 (audit MC-P2-03, TOP-0123 L7): appended only when
+        # non-zero, same convention as cmd_code_reindex's summary line --
+        # a run with no integrity failure prints byte-identical to before
+        # this task.
+        summary += f", {integrity_failures} integrity failure(s)"
+    summary += f", {elapsed:.3f}s"
+    print(summary)
+    return 5 if integrity_failures else 0
 
 
 def load_embedding_model():
@@ -2015,6 +2132,82 @@ def fts_escape(query: str) -> str:
     return " OR ".join(f'"{t}"' for t in terms) if terms else '""'
 
 
+def _embed_qvec(query: str, model=None):
+    """Task 4 review finding L1 (carried into Task 5's commit per brief):
+    shared by `vector_ranked` and `code_hits_vector` -- both used to
+    reimplement this identically. Resolves the model (loading one when
+    none is given) and the query's own embedding vector, raising
+    `EmbeddingUnavailableError` on either failure -- the ONE specific type
+    both callers' own callers (`_search_hits`/`cmd_code_search`) catch to
+    fall back to FTS-only rather than crashing. `model=None` loads its own
+    (every direct caller); a caller that already loaded one this
+    invocation passes it in and only `embedding_fingerprint(model)` is
+    recomputed (cheap, no import) -- so a hybrid-mode call still makes at
+    most one model load. Returns (model, current_fp, qvec)."""
+    if model is None:
+        loaded, embed_err = try_compute_embeddings(load_embedding_model)
+        if embed_err is not None:
+            raise EmbeddingUnavailableError(embed_err)
+        model, current_fp = loaded
+    else:
+        current_fp = embedding_fingerprint(model)
+    qvec, embed_err = try_compute_embeddings(compute_query_embedding, query, model)
+    if embed_err is not None:
+        raise EmbeddingUnavailableError(embed_err)
+    return model, current_fp, qvec
+
+
+def _score_rows_by_cosine(rows, qvec, id_key: str, *, stats: dict | None = None) -> list[tuple]:
+    """Task 4 review finding L1 (carried into Task 5's commit per brief):
+    shared per-row scoring loop -- `vector_ranked` and `code_hits_vector`
+    used to reimplement this identically. Each row (a sqlite3.Row exposing
+    `id_key` and `vector`) is scored against `qvec` via `cosine`; a
+    dimension mismatch (a corrupt blob whose stored `dim` column lied) is
+    caught, skipped, and counted into `stats['dimension_mismatch_rows']`
+    when `stats` is given, rather than raised -- the SQL `dim=?` gate at
+    each call site already makes this a defensive path, not the common
+    one. Returns `(id, score)` pairs, best score first."""
+    scored = []
+    dim_mismatch = 0
+    for r in rows:
+        try:
+            scored.append((r[id_key], cosine(qvec, unpack_vector(r["vector"]))))
+        except ValueError:
+            dim_mismatch += 1
+    if stats is not None and dim_mismatch:
+        stats["dimension_mismatch_rows"] = stats.get("dimension_mismatch_rows", 0) + dim_mismatch
+    scored.sort(key=lambda t: t[1], reverse=True)
+    return scored
+
+
+def _fingerprint_mismatch_check(conn, project: str, stored_fp: str | None, current_fp: str | None) -> bool:
+    """Task 4 review findings M1 + L1 (carried into Task 5's commit per
+    brief): shared by `_search_hits` (decision) and `cmd_code_search`
+    (code) -- both used to reimplement this identically, and the
+    duplicate had a gap (M1): gating on `has_vectors` ALONE (rows
+    present) missed a reachable state where zero rows are present but a
+    FOREIGN fingerprint is still stored (`check` itself gates on
+    `stored_fp` truthy, with no row-count check at all, so it caught this
+    state and query time silently didn't). The correct gate is the
+    disjunction: `has_vectors` (design R4 rule 9's migration signal -- an
+    old DB has rows with a NULL/foreign `embed_fp` and no stored
+    fingerprint at all; must still invalidate the vector layer, never
+    just skip the check) OR `stored_fp is not None` (a fingerprint was
+    recorded even though, in this state, no row currently carries a
+    matching one). A project that has genuinely never been embedded has
+    NEITHER -- no rows, no stored fingerprint, for an unremarkable reason
+    -- and is correctly left alone; a bare `stored_fp is not None` swap
+    (no disjunction) would have regressed the old-DB migration case
+    instead of closing this gap. Returns True when the caller should
+    report a fingerprint mismatch and skip the vector query."""
+    has_vectors = conn.execute(
+        "SELECT 1 FROM embeddings WHERE project=? LIMIT 1", (project,)
+    ).fetchone() is not None
+    if not (has_vectors or stored_fp is not None):
+        return False
+    return not fingerprints_match(stored_fp, current_fp)
+
+
 def vector_ranked(
     conn, query: str, project: str, filter_clause: str = "", filter_params: list | None = None,
     *, model=None, stats: dict | None = None,
@@ -2044,16 +2237,7 @@ def vector_ranked(
     column lies) is caught, skipped, and counted into `stats`
     ["dimension_mismatch_rows"] when a `stats` dict is given -- the SQL
     `dim` gate makes this a defensive path, not the common one."""
-    if model is None:
-        loaded, embed_err = try_compute_embeddings(load_embedding_model)
-        if embed_err is not None:
-            raise EmbeddingUnavailableError(embed_err)
-        model, current_fp = loaded
-    else:
-        current_fp = embedding_fingerprint(model)
-    qvec, embed_err = try_compute_embeddings(compute_query_embedding, query, model)
-    if embed_err is not None:
-        raise EmbeddingUnavailableError(embed_err)
+    model, current_fp, qvec = _embed_qvec(query, model)
     where = "e.project=? AND e.embed_fp=? AND e.dim=?"
     params: list = [project, current_fp, len(qvec)]
     if filter_clause:
@@ -2065,16 +2249,7 @@ def vector_ranked(
         f"WHERE {where}",
         params,
     ).fetchall()
-    scored = []
-    dim_mismatch = 0
-    for r in rows:
-        try:
-            scored.append((r["path"], cosine(qvec, unpack_vector(r["vector"]))))
-        except ValueError:
-            dim_mismatch += 1
-    if stats is not None and dim_mismatch:
-        stats["dimension_mismatch_rows"] = stats.get("dimension_mismatch_rows", 0) + dim_mismatch
-    scored.sort(key=lambda t: t[1], reverse=True)
+    scored = _score_rows_by_cosine(rows, qvec, "path", stats=stats)
     collapsed = _collapse_link_duplicates(conn, project, [p for p, _ in scored])
     score_by_path = dict(scored)
     return [(p, score_by_path[p]) for p in collapsed]
@@ -2100,16 +2275,18 @@ def _search_hits(conn, args, extra_where: str, extra_params: list) -> tuple[list
 
     Design R4 (audit MC-P1-06): for "vector"/"hybrid" modes, the model is
     loaded ONCE here (before either mode dispatches), and its fingerprint
-    compared against the stored `db_meta.embedding_fingerprint` -- ONLY
-    when the project already has at least one embeddings row (a project
-    that has never been embedded at all has a NULL stored fingerprint for
-    an unremarkable reason, not a model swap, so it is never reported as a
-    mismatch). On a mismatch, `state = "fingerprint-mismatch"` and the
-    vector query is skipped entirely (never calls vector_ranked -- no
-    second, wasted model interaction); the ALREADY-loaded model is passed
-    into vector_ranked when there is no mismatch, so the whole call makes
-    at most one model load, not two (the "second load in hybrid searches"
-    a persistent cache would otherwise be needed to avoid).
+    compared against the stored `db_meta.embedding_fingerprint` via
+    `_fingerprint_mismatch_check` (M1/L1, Task 4 review, carried into this
+    task) -- gated on rows already present OR a fingerprint already
+    stored, never on rows alone (a project that has genuinely never been
+    embedded has neither, for an unremarkable reason, and is never
+    reported as a mismatch). On a mismatch, `state = "fingerprint-
+    mismatch"` and the vector query is skipped entirely (never calls
+    vector_ranked -- no second, wasted model interaction); the
+    ALREADY-loaded model is passed into vector_ranked when there is no
+    mismatch, so the whole call makes at most one model load, not two
+    (the "second load in hybrid searches" a persistent cache would
+    otherwise be needed to avoid).
     `contributing` never carries a "vector" key when the vector channel
     did not actually run (unavailable or mismatched)."""
     results: list[tuple[str, float]] = []
@@ -2122,19 +2299,15 @@ def _search_hits(conn, args, extra_where: str, extra_params: list) -> tuple[list
             embed_info["state"] = "unavailable"
         else:
             model, current_fp = loaded
-            has_vectors = conn.execute(
-                "SELECT 1 FROM embeddings WHERE project=? LIMIT 1", (args.project,)
-            ).fetchone() is not None
-            if has_vectors:
-                stored_row = conn.execute(
-                    "SELECT value FROM db_meta WHERE key='embedding_fingerprint'"
-                ).fetchone()
-                stored_fp = stored_row["value"] if stored_row else None
-                if not fingerprints_match(stored_fp, current_fp):
-                    embed_info["state"] = "fingerprint-mismatch"
-                    embed_info["stored_fingerprint"] = stored_fp
-                    embed_info["current_fingerprint"] = current_fp
-                    model = None   # signals "do not run the vector query" below
+            stored_row = conn.execute(
+                "SELECT value FROM db_meta WHERE key='embedding_fingerprint'"
+            ).fetchone()
+            stored_fp = stored_row["value"] if stored_row else None
+            if _fingerprint_mismatch_check(conn, args.project, stored_fp, current_fp):
+                embed_info["state"] = "fingerprint-mismatch"
+                embed_info["stored_fingerprint"] = stored_fp
+                embed_info["current_fingerprint"] = current_fp
+                model = None   # signals "do not run the vector query" below
     if args.mode == "fts":
         ranked = fts_ranked(conn, args.query, args.project, extra_where, extra_params)
         results = [(p, float(len(ranked) - i)) for i, p in enumerate(ranked)]
@@ -3603,6 +3776,7 @@ def cmd_unmapped(args) -> int:
     mapped_topic: list[str] = []
     mapped_concept_only: list[str] = []
     unmapped: list[str] = []
+    degraded: dict | None = None
     conn: sqlite3.Connection | None = None
     try:
         # Design R3 (audit MC-P1-02): unmapped's is a NEGATIVE claim
@@ -3656,9 +3830,27 @@ def cmd_unmapped(args) -> int:
     except sqlite3.OperationalError:
         coverage_status = "index-error"
         mapped_topic, mapped_concept_only, unmapped = [], [], []
-    except Exception:
+    except Exception as exc:
+        # Design R7 (audit MC-P2-03, TOP-0123 L7): this is the ONE branch
+        # that used to conflate a genuine operational failure with an
+        # actual programmer bug (an AttributeError/TypeError from this
+        # engine's own code, nothing to do with sqlite) -- both landed in
+        # the same silent "unknown" with no diagnostic. coverage_status
+        # stays "unknown" (a negative claim off this branch is still
+        # refused, same as before), but the caller -- and whoever reads
+        # hook.log/memidx-debug.log -- now sees WHICH kind of failure this
+        # was. --debug re-raises instead, for local debugging.
+        if DEBUG:
+            raise
         coverage_status = "unknown"
         mapped_topic, mapped_concept_only, unmapped = [], [], []
+        degraded = _degraded("internal-error", exc)
+        print(
+            f"unmapped: degraded reason=internal-error type={degraded['exception_type']}: "
+            f"{degraded['safe_message']}",
+            file=sys.stderr,
+        )
+        _debug_log(exc, "unmapped")
     finally:
         if conn is not None:
             try:
@@ -3672,11 +3864,15 @@ def cmd_unmapped(args) -> int:
         "unmapped": unmapped,
         "coverage_status": coverage_status,
     }
+    if degraded is not None:
+        result["degraded"] = degraded
 
     if args.json:
         print(json.dumps(result, indent=2))
     else:
         print(f"coverage_status: {coverage_status}")
+        if degraded is not None:
+            print(f"degraded: {degraded['reason_code']} ({degraded['exception_type']}: {degraded['safe_message']})")
         for label, paths in (
             ("mapped_topic", mapped_topic),
             ("mapped_concept_only", mapped_concept_only),
@@ -4066,6 +4262,11 @@ def open_code_db(db_path: Path) -> sqlite3.Connection:
             conn.execute("INSERT INTO code_schema (version) VALUES (?)", (CODE_SCHEMA_VERSION,))
             conn.commit()
         except Exception:
+            # Design R7 (audit MC-P2-03, TOP-0123 L7): transparent, not a
+            # mask -- ANY exception here rolls back this migration
+            # transaction before propagating unchanged (narrowing to
+            # sqlite3.Error would skip the rollback for e.g. a KeyError
+            # bug in _preserved_code_config).
             conn.rollback()
             raise
     else:
@@ -4292,7 +4493,13 @@ def _git_head_sha(root: Path) -> str | None:
             ["git", "-C", str(root), "rev-parse", "HEAD"],
             capture_output=True, text=True, timeout=2,
         )
-    except Exception:
+    # Design R7 (audit MC-P2-03, TOP-0123 L7): narrowed from a bare
+    # except Exception -- subprocess.run's own documented failure modes
+    # are a missing/unexecutable binary (OSError, e.g. FileNotFoundError)
+    # and a timeout (subprocess.TimeoutExpired, a SubprocessError). Both
+    # stay best-effort/None, same as before; anything else is a real bug
+    # and now surfaces instead of vanishing here.
+    except (OSError, subprocess.SubprocessError):
         return None
     if result.returncode != 0:
         return None
@@ -4314,7 +4521,8 @@ def _git_call_budgeted(root: Path, extra_args: list[str], deadline: float) -> st
             ["git", "-C", str(root)] + extra_args,
             capture_output=True, text=True, timeout=min(2.0, remaining),
         )
-    except Exception:
+    # Design R7: same narrowing as _git_head_sha above.
+    except (OSError, subprocess.SubprocessError):
         return None
     if result.returncode != 0:
         return None
@@ -4436,7 +4644,15 @@ def _record_index_failure(conn, project, code_root, rel, f, *, sha, cv, status, 
     gets a row, with every stat signal NULL, so the index keeps reporting
     it rather than going silent. (A permission-denied file still `stat()`s
     fine on POSIX -- only the read fails -- so the signals are usually
-    real for those; NULL is specifically the vanished-file case.)"""
+    real for those; NULL is specifically the vanished-file case.)
+
+    Design R7 (audit MC-P2-03, TOP-0123 L7): returns True on success. The
+    stat sub-try above stays best-effort (a vanished file is expected and
+    handled), but a failure in the purge (`delete_code_chunks_for_path`)
+    or the status write (`write_file_status`) itself is no longer
+    swallowed -- it raises `IndexIntegrityError` so `cmd_code_reindex`'s
+    caller can roll back to this file's savepoint instead of committing a
+    half-updated row."""
     try:
         delete_code_chunks_for_path(conn, project, code_root, rel)
         try:
@@ -4447,8 +4663,9 @@ def _record_index_failure(conn, project, code_root, rel, f, *, sha, cv, status, 
             conn, project, code_root, rel, sha=sha, stat=st, gap_count=0,
             chunker_version=cv, status=status, reason=reason, attempt_key=attempt_key,
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        raise IndexIntegrityError(rel, exc) from exc
+    return True
 
 
 def cmd_code_reindex(args) -> int:
@@ -4602,9 +4819,20 @@ def cmd_code_reindex(args) -> int:
     files = list(iter_code_source_files(root, langs, skipped_unknown))
     seen = set()
     added_files = changed_files = unchanged_files = failed_files = not_indexed_files = 0
+    integrity_failures = 0  # design R7 (audit MC-P2-03, TOP-0123 L7)
     total_gaps = 0
     pending_texts: list = []
     pending_ids: list = []
+    # Design R7: same reasoning as cmd_reindex's own loop 2 -- a bare
+    # SAVEPOINT on a connection with no transaction already open starts
+    # one itself, and RELEASEing the outermost savepoint then COMMITS it
+    # (verified empirically), silently splitting the single final commit
+    # into one per file. This explicit BEGIN (skipped if something
+    # upstream -- root registration, a schema migration -- already opened
+    # one) guarantees every per-file SAVEPOINT below nests inside one
+    # already-open transaction.
+    if not conn.in_transaction:
+        conn.execute("BEGIN")
 
     # B1/C3 (Anatomy M1 fix wave). Two changes to the per-file loop:
     #
@@ -4627,6 +4855,40 @@ def cmd_code_reindex(args) -> int:
     #
     # A "partial" status still indexes its chunks and writes file_sha with
     # gap_count = len(gaps) -- the existing gap behavior, unchanged.
+    def _finish_file_failure(*, sha, cv, status, reason, attempt_key=None) -> bool:
+        """Design R7 (audit MC-P2-03, TOP-0123 L7): shared tail of both
+        except arms below (`rel`/`f` are this closure's current loop
+        values). First, ROLLBACK TO this file's savepoint -- undo
+        whatever partial DML the failed attempt itself did before this
+        arm ran. Then call _record_index_failure inside its own guard:
+        on success, RELEASE and return True (the caller counts the file
+        and prints its own warning line); on IndexIntegrityError (the
+        purge or the status write itself failed), ROLLBACK TO the
+        savepoint AGAIN -- undoing whatever partial DML THAT attempt did
+        too -- then RELEASE, count the integrity failure, print the
+        distinct stderr line, and return False (the caller must NOT count
+        this file as failed/not-indexed: nothing was safely recorded, and
+        the row -- whatever it was before this run -- is unchanged)."""
+        nonlocal integrity_failures
+        conn.execute("ROLLBACK TO SAVEPOINT file")
+        try:
+            _record_index_failure(
+                conn, args.project, root_s, rel, f, sha=sha, cv=cv, status=status,
+                reason=reason, attempt_key=attempt_key,
+            )
+        except IndexIntegrityError as ie:
+            conn.execute("ROLLBACK TO SAVEPOINT file")
+            conn.execute("RELEASE SAVEPOINT file")
+            integrity_failures += 1
+            print(
+                f"code-reindex: cannot purge stale rows for {ie.rel} "
+                f"({type(ie.cause).__name__}: {ie.cause}); index integrity not guaranteed",
+                file=sys.stderr,
+            )
+            return False
+        conn.execute("RELEASE SAVEPOINT file")
+        return True
+
     for f in files:
         try:
             rel = str(f.relative_to(root))
@@ -4638,6 +4900,15 @@ def cmd_code_reindex(args) -> int:
         # a deletion.
         seen.add(rel)
         sha = cv = None
+        # Design R7 (audit MC-P2-03, TOP-0123 L7): one savepoint per file,
+        # covering the whole guarded body below (both the normal write
+        # path and the two failure arms all fall under the SAME try) --
+        # RELEASEd at every normal exit, ROLLBACK TO + RELEASEd on any
+        # failure, so a mid-file exception can never leave a partial
+        # INSERT committed alongside the files before/after it. The
+        # single final conn.commit() at the end of this function is
+        # unchanged.
+        conn.execute("SAVEPOINT file")
         try:
             # Task 4 carried-in fix 1 (Task 3 review, Ruling 57): lang, cv
             # and the not-indexed retry decision need only the path and the
@@ -4679,6 +4950,7 @@ def cmd_code_reindex(args) -> int:
                         _refresh_file_sha_stat(conn, args.project, root_s, rel, f.stat())
                     except OSError:
                         pass  # best-effort only -- the row itself stays exactly as stamped
+                    conn.execute("RELEASE SAVEPOINT file")
                     continue
                 prev_sha = prev_cv = None  # a not-indexed row never carries a real sha to compare
             else:
@@ -4727,6 +4999,7 @@ def cmd_code_reindex(args) -> int:
                             }
                             pending_texts.append(code_embed_text_for(rel, stub, body_lines))
                             pending_ids.append(mrow["id"])
+                conn.execute("RELEASE SAVEPOINT file")
                 continue
             is_new = rel not in existing
 
@@ -4794,6 +5067,7 @@ def cmd_code_reindex(args) -> int:
             )
             pending_texts.extend(file_texts)
             pending_ids.extend(file_ids)
+            conn.execute("RELEASE SAVEPOINT file")
             if is_new:
                 added_files += 1
             else:
@@ -4806,16 +5080,13 @@ def cmd_code_reindex(args) -> int:
             # stored) so it is skipped incrementally while the source and
             # chunker are unchanged, and retried on a source edit or
             # --full -- never silently, and never every run.
-            _record_index_failure(
-                conn, args.project, root_s, rel, f, sha=sha, cv=cv, status="failed",
-                reason=f"{type(exc).__name__}: {exc}",
-            )
-            failed_files += 1
-            print(
-                f"code-reindex: WARNING {rel} failed to index: {type(exc).__name__}: {exc} -- "
-                "previous chunks removed; retried when the file or the chunker changes, or with --full",
-                file=sys.stderr,
-            )
+            if _finish_file_failure(sha=sha, cv=cv, status="failed", reason=f"{type(exc).__name__}: {exc}"):
+                failed_files += 1
+                print(
+                    f"code-reindex: WARNING {rel} failed to index: {type(exc).__name__}: {exc} -- "
+                    "previous chunks removed; retried when the file or the chunker changes, or with --full",
+                    file=sys.stderr,
+                )
             continue
         except Exception as exc:
             # B1: purge whatever this path still has in the index, so no
@@ -4826,16 +5097,16 @@ def cmd_code_reindex(args) -> int:
             # retryable bucket (a missing backend, a permission error, any
             # other exception this engine did not itself validate), and the
             # index still reads "stale" while it holds a not-indexed row.
-            _record_index_failure(
-                conn, args.project, root_s, rel, f, sha=None, cv=cv, status="not-indexed",
+            if _finish_file_failure(
+                sha=None, cv=cv, status="not-indexed",
                 reason=f"{type(exc).__name__}: {exc}", attempt_key=availability,
-            )
-            not_indexed_files += 1
-            print(
-                f"code-reindex: {rel} not indexed: {type(exc).__name__}: {exc} "
-                "(retried on the next run)",
-                file=sys.stderr,
-            )
+            ):
+                not_indexed_files += 1
+                print(
+                    f"code-reindex: {rel} not indexed: {type(exc).__name__}: {exc} "
+                    "(retried on the next run)",
+                    file=sys.stderr,
+                )
             continue
 
     reembeds = 0
@@ -4958,12 +5229,20 @@ def cmd_code_reindex(args) -> int:
     conn.commit()
     conn.close()
     elapsed = time.time() - t0
-    print(
+    summary = (
         f"code-reindex: {len(files)} files scanned, {added_files} added, {changed_files} changed, "
         f"{unchanged_files} unchanged, {len(removed)} removed, {failed_files} failed, "
-        f"{not_indexed_files} not indexed, {reembeds} chunk(s) (re-)embedded, {total_gaps} gap(s) warned, "
-        f"{elapsed:.3f}s"
+        f"{not_indexed_files} not indexed, {reembeds} chunk(s) (re-)embedded, {total_gaps} gap(s) warned"
     )
+    if integrity_failures:
+        # Design R7 (audit MC-P2-03, TOP-0123 L7): appended only when
+        # non-zero -- every existing summary_re/parsing site (heal_code_
+        # index's own regex included) matches on the fields BEFORE this
+        # one, so a run with no integrity failure prints byte-identical to
+        # before this task.
+        summary += f", {integrity_failures} integrity failure(s)"
+    summary += f", {elapsed:.3f}s"
+    print(summary)
     if downgraded:
         print(
             f"code-reindex: embeddings are now incomplete for {args.project}; embedding mode set "
@@ -4988,7 +5267,12 @@ def cmd_code_reindex(args) -> int:
             f"code-reindex: {total_skipped} files with unsupported/unwired extensions "
             f"not indexed: {breakdown}"
         )
-    return 0
+    # Design R7 (audit MC-P2-03, TOP-0123 L7): an integrity failure is the
+    # one condition that makes this command exit non-zero -- everything
+    # that succeeded (every file whose savepoint released cleanly) is
+    # already committed above; this is reported, not silently folded into
+    # the always-0 return every other outcome here still gets.
+    return 5 if integrity_failures else 0
 
 
 # ---------------------------------------------------------------------------
@@ -5186,13 +5470,21 @@ def cmd_backend_preflight(args) -> int:
             report[lang] = {"ok": False, "state": "missing", "reason": str(exc)}
             continue
         except Exception as exc:   # fail-open: a preflight itself must never crash
+            # Design R7 (audit MC-P2-03, TOP-0123 L7): kept broad on
+            # purpose -- get_chunker's contract is BackendUnavailable, but
+            # a preflight must survive whatever else a backend's own
+            # import could raise too; already typed via `reason` (maps to
+            # the "backend-missing" degraded reason conceptually), and the
+            # traceback now also reaches memidx-debug.log.
             report[lang] = {"ok": False, "state": "missing",
                             "reason": f"{type(exc).__name__}: {exc}"}
+            _debug_log(exc, f"backend-preflight:{lang}")
             continue
         try:
             mismatch = chunkers.pin_mismatch(lang)
         except Exception as exc:   # same fail-open discipline as the import above
             mismatch = f"pin comparison failed: {type(exc).__name__}: {exc}"
+            _debug_log(exc, f"backend-preflight:{lang}:pin_mismatch")
         if mismatch:
             report[lang] = {"ok": True, "state": "pin-mismatch", "reason": mismatch}
         else:
@@ -5256,31 +5548,12 @@ def code_hits_vector(conn: sqlite3.Connection, query: str, project: str, *, mode
     ranked); `model=None` loads its own (every existing direct caller);
     a per-row dimension mismatch is caught, skipped, and counted into
     `stats["dimension_mismatch_rows"]` when given."""
-    if model is None:
-        loaded, embed_err = try_compute_embeddings(load_embedding_model)
-        if embed_err is not None:
-            raise EmbeddingUnavailableError(embed_err)
-        model, current_fp = loaded
-    else:
-        current_fp = embedding_fingerprint(model)
-    qvec, embed_err = try_compute_embeddings(compute_query_embedding, query, model)
-    if embed_err is not None:
-        raise EmbeddingUnavailableError(embed_err)
+    model, current_fp, qvec = _embed_qvec(query, model)
     rows = conn.execute(
         "SELECT chunk_id, vector FROM embeddings WHERE project=? AND embed_fp=? AND dim=?",
         (project, current_fp, len(qvec)),
     ).fetchall()
-    scored = []
-    dim_mismatch = 0
-    for r in rows:
-        try:
-            scored.append((r["chunk_id"], cosine(qvec, unpack_vector(r["vector"]))))
-        except ValueError:
-            dim_mismatch += 1
-    if stats is not None and dim_mismatch:
-        stats["dimension_mismatch_rows"] = stats.get("dimension_mismatch_rows", 0) + dim_mismatch
-    scored.sort(key=lambda t: t[1], reverse=True)
-    return scored
+    return _score_rows_by_cosine(rows, qvec, "chunk_id", stats=stats)
 
 
 def _root_report(
@@ -5651,21 +5924,35 @@ def heal_code_index(
     try:
         conn.close()
         reindexed = 0
+        # Design R7 (audit MC-P2-03, TOP-0123 L7): the rc of every
+        # in-process cmd_code_reindex call here is now checked, not
+        # discarded -- a non-zero rc means at least one root hit an
+        # integrity failure (savepoint rollback, purge/status-write not
+        # trusted), and this heal must never claim "index healed" over
+        # that, whatever the after-report's own state happens to say.
+        reindex_rc = 0
         for r in report["roots"]:
             if not r["exists"]:
                 continue
             out = io.StringIO()
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
-                cmd_code_reindex(argparse.Namespace(
+                rc = cmd_code_reindex(argparse.Namespace(
                     code_root=r["code_root"], drop_root=None, db=str(db_path), project=project,
                     lang=langs or None, no_embed=no_embed, full=False, retry_not_indexed=False,
                 ))
+            reindex_rc = max(reindex_rc, rc)  # the worst rc across every root, not just the last
             m = summary_re.search(out.getvalue())
             if m:
                 reindexed += sum(int(g) for g in m.groups())
         conn = open_code_db(db_path)
         after = code_index_report(conn, project, verify_content=verify_content)
-        if after["state"] in ("current", "metadata-current"):
+        if reindex_rc != 0:
+            print(
+                f"code-search: heal did not complete (code-reindex exit {reindex_rc}); "
+                "answering from the current index",
+                file=sys.stderr,
+            )
+        elif after["state"] in ("current", "metadata-current"):
             print(f"code-search: index healed ({reindexed} file(s) re-indexed)", file=sys.stderr)
         return after, conn
     except Exception as exc:
@@ -5686,6 +5973,12 @@ def heal_code_index(
             f"code-search: heal failed ({type(exc).__name__}: {exc}); answering from the current index",
             file=sys.stderr,
         )
+        # Design R7: kept broad on purpose (a heal must never crash
+        # code-search, whatever kind of exception it hits -- this already
+        # names type+message the same way _degraded would), but the full
+        # traceback now also reaches memidx-debug.log for a real defect
+        # buried under this fail-open message.
+        _debug_log(exc, "heal_code_index")
         return report, conn
 
 
@@ -5781,10 +6074,10 @@ def cmd_code_search(args) -> int:
     # (code_hits_vector's own EmbeddingUnavailableError contract, mirroring
     # vector_ranked) -- caught HERE, once, to fall back to FTS-only instead
     # of crashing code-search. Design R4: a fingerprint mismatch is
-    # detected the SAME way as the decision side's _search_hits (model
-    # loaded once, compared against `stored_code_fp`, ONLY when the
-    # project already has embedding rows) -- on a mismatch the vector
-    # query is skipped entirely (never calls code_hits_vector).
+    # detected the SAME way as the decision side's _search_hits, via the
+    # shared `_fingerprint_mismatch_check` (M1/L1, Task 4 review, carried
+    # into this task) -- on a mismatch the vector query is skipped
+    # entirely (never calls code_hits_vector).
     embed_state = None
     dim_mismatch_rows = 0
     current_code_fp = None
@@ -5795,10 +6088,7 @@ def cmd_code_search(args) -> int:
             embed_state = "unavailable"
         else:
             model, current_code_fp = loaded
-            has_vectors = conn.execute(
-                "SELECT 1 FROM embeddings WHERE project=? LIMIT 1", (args.project,)
-            ).fetchone() is not None
-            if has_vectors and not fingerprints_match(stored_code_fp, current_code_fp):
+            if _fingerprint_mismatch_check(conn, args.project, stored_code_fp, current_code_fp):
                 embed_state = "fingerprint-mismatch"
                 model = None   # signals "do not run the vector query" below
 
@@ -6152,7 +6442,12 @@ def _parse_hook_log_line_ts(line: str):
     if naive is not None:
         try:
             return naive.astimezone(), line[end:].lstrip(" ")
-        except Exception:
+        # Design R7 (audit MC-P2-03, TOP-0123 L7): narrowed from a bare
+        # except Exception -- .astimezone() on a naive datetime can only
+        # fail on an out-of-range/overflowing value (OverflowError,
+        # OSError on some platforms) or a malformed value ValueError;
+        # anything else is a real bug and now surfaces.
+        except (OverflowError, OSError, ValueError):
             return None, line
     return None, line
 
@@ -6457,7 +6752,10 @@ def _count_store_commits(store_dir: str, cutoff: datetime, now: datetime):
              f"--since={cutoff.isoformat()}", f"--until={now.isoformat()}", "--oneline"],
             capture_output=True, text=True, timeout=10,
         )
-    except Exception:
+    # Design R7 (audit MC-P2-03, TOP-0123 L7): same narrowing as
+    # _git_head_sha/_git_call_budgeted -- a missing/unexecutable git
+    # binary or a timeout stays best-effort/None; anything else surfaces.
+    except (OSError, subprocess.SubprocessError):
         return None
     if result.returncode != 0:
         return None
@@ -6736,8 +7034,20 @@ def cmd_stats(args) -> int:
             print(f"projects seen in window: {', '.join(result['projects_seen'])}")
         return 0
     except Exception as e:  # fail-open: a broken liveness check is not
-        # allowed to become a second silent failure mode.
-        print(f"stats: internal error ({e}) -- exit 0 (fail-open)")
+        # allowed to become a second silent failure mode. Design R7
+        # (audit MC-P2-03, TOP-0123 L7): the message is now typed the same
+        # way cmd_unmapped's is, and the traceback reaches memidx-debug.log
+        # -- still exit 0, still fail-open, just no longer silent about
+        # WHAT broke. --debug re-raises, same as every other internal-error
+        # catch (rule 2 is unqualified: EVERY such catch honors it).
+        if DEBUG:
+            raise
+        degraded = _degraded("internal-error", e)
+        print(
+            f"stats: degraded reason=internal-error type={degraded['exception_type']}: "
+            f"{degraded['safe_message']} -- exit 0 (fail-open)"
+        )
+        _debug_log(e, "stats")
         return 0
 
 
@@ -6771,6 +7081,11 @@ def add_common_args(p: argparse.ArgumentParser, need_root: bool = False, optiona
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="memidx.py")
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="re-raise internal errors instead of returning a degraded "
+             "answer; use when developing or debugging a new code path",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_reindex = sub.add_parser("reindex")
@@ -7017,6 +7332,8 @@ def main(argv=None) -> int:
     p_stats.set_defaults(func=cmd_stats)
 
     args = parser.parse_args(argv)
+    global DEBUG
+    DEBUG = args.debug
     return args.func(args)
 
 

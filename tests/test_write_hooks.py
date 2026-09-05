@@ -321,6 +321,12 @@ Body.
         rc, out = self._run(["src/mapped.py", "src/nothing.py"])
         self.assertEqual(out["coverage_status"], "unknown")
         self.assertEqual(out["unmapped"], [])
+        # Design R7 (audit MC-P2-03, TOP-0123 L7): a corrupt-blob
+        # sqlite3.DatabaseError is not an OperationalError, so it lands in
+        # the broad except arm and now carries a typed `degraded` object
+        # too -- unknown stays unknown, but no longer silent about why.
+        self.assertIn("degraded", out)
+        self.assertEqual(out["degraded"]["reason_code"], "internal-error")
 
     def test_no_paths_matches_in_unknown_status_still_absent_from_unmapped(self):
         self.db.write_bytes(b"not a sqlite file at all")
@@ -1814,6 +1820,21 @@ class TestUserPromptRemind(HookTestBase):
         proc, elapsed = run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.base_env(), timeout=10.0)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("outcome=index-error", (self.home / "hook.log").read_text())
+
+    def test_degraded_logs_index_degraded(self):
+        """Design R7 (audit MC-P2-03, TOP-0123 L7): a corrupt-blob sqlite
+        file lands in `unmapped`'s broad except arm (a sqlite3.DatabaseError
+        that is not an OperationalError), which now attaches a `degraded`
+        object to the JSON -- the hook logs a distinct outcome token for it
+        (on top of, never instead of, the existing coverage-unknown
+        handling), so `stats` can count it."""
+        db = self.home / f"{self.project}.sqlite"
+        db.write_bytes(b"not a sqlite file at all")
+        session_id = "s-userprompt-degraded"
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+        proc, elapsed = run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.base_env(), timeout=10.0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("outcome=index-degraded reason=internal-error", (self.home / "hook.log").read_text())
 
     def test_quarantined_logs_index_quarantined_and_omits_the_unmapped_list(self):
         """audit MC-P1-03 / design R2 (TOP-0123 L2): a store holding one
