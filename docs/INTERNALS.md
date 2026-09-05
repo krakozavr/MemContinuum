@@ -1422,6 +1422,19 @@ not-indexed, `code-search` reports the index incomplete, `backend-preflight`
 reports `MISSING`); a lint error there would make an optional dependency
 mandatory in one place only.
 
+Parse-level rules — every record, before the type-specific rules below even
+run (see "Tolerant parsing and quarantine" above for the full mechanism):
+
+| rule | severity |
+|---|---|
+| frontmatter does not parse (unreadable file, not UTF-8, unterminated block, malformed YAML on a canonical record) | error, naming the file and the failure |
+| a typed field is the wrong shape (`links` not a list of mappings, a link missing its `link` id, `ruling`/`rationale`/`invariant` not a mapping, `tags`/`code_refs`/… not a list of scalars) on a canonical record | error, naming the field |
+
+A note's own parse diagnostics (malformed YAML recovered leniently, an
+unterminated frontmatter block) are warnings instead — a note has no chain
+shape to protect, and the rule pass below is skipped only for a record these
+parse-level rules flagged as an error, never for a mere warning.
+
 Topic-chain rules:
 
 | rule | severity |
@@ -1522,7 +1535,8 @@ The decision index (`<project>.sqlite`) carries the same provenance discipline
 | `uninitialized` | file exists, has a `db_meta` row for this project, but no `last_reindexed_at` stamp and no `records` rows | refuse (no query attempted) |
 | `upgrade-required` | no `last_reindexed_at` stamp but `records` rows already exist (an older engine's db), or the stamped `index_generation` is behind the engine's current one | proceed, warn on stderr |
 | `stale` | current generation, stamped, but `check`'s own on-disk drift comparison (mtime/size against what `reindex` last recorded) finds added/changed/removed files — only computed when a `root` is given | proceed, warn on stderr |
-| `current` | stamped, current generation, no drift | proceed silently |
+| `quarantined` | current generation, not `stale` (a `root`-taking reader's own drift check passed or was not asked for), and `index_errors` holds at least one row for this project (one or more records could not be safely indexed — see "Tolerant parsing and quarantine" above); needs no `root` — a plain table lookup | proceed, warn on stderr naming the skipped-record count; `unmapped` refuses the negative claim (below) |
+| `current` | stamped, current generation, no drift, no quarantined record | proceed silently |
 
 Every reader opens the file with `open_db_noncreating` — a genuinely
 non-creating SQLite URI (`mode=rw`) — never `open_db`'s create-on-connect path,
@@ -1532,26 +1546,31 @@ is REQUIRED on `reindex`, `check`, and `unmapped` (they walk the store's own
 markdown tree by design); `unmapped` branches on `stale` to self-heal (below).
 `search`, `chain`, `for-path`, `why`, and `drift` take `root` as an OPTIONAL
 `--root DIR`: omitted (the default, and unchanged from before),
-`decision_index_state` can still report `upgrade-required` for them but
-never `stale` — they have nothing to walk without it. Given, the same five readers CAN see
-`stale`: a positive match off it is still returned (see the next paragraph),
-with one stderr line naming the cause (`"<cmd>: index is stale (store
-changed since the last reindex); results may be outdated"`). `for-path`'s
-own stale positive match, reached through `hooks/pre-edit-chain.sh` (which
-passes `--root "$MEMCONTINUUM_ROOT"` on both its `for-path` calls whenever
-that env var is set), is logged under its own hook.log outcome name,
-`index-stale-served`, distinct from a plain `matched` — the staleness
-caveat itself reaches `hook.log` only via `for-path`'s own stderr (the
-hook's existing redirect), never the injected `additionalContext` payload.
+`decision_index_state` can still report `upgrade-required` or `quarantined`
+for them but never `stale` — they have nothing to walk without it. Given, the
+same five readers CAN see `stale`: a positive match off it is still returned
+(see the next paragraph), with one stderr line naming the cause (`"<cmd>:
+index is stale (store changed since the last reindex); results may be
+outdated"`). `for-path`'s own stale positive match, reached through
+`hooks/pre-edit-chain.sh` (which passes `--root "$MEMCONTINUUM_ROOT"` on both
+its `for-path` calls whenever that env var is set), is logged under its own
+hook.log outcome name, `index-stale-served`, distinct from a plain `matched`
+— the staleness caveat itself reaches `hook.log` only via `for-path`'s own
+stderr (the hook's existing redirect), never the injected `additionalContext`
+payload.
 
 **A positive match off a non-`current` index stays usable; a negative claim
-does not.** `upgrade-required` and `stale` both warn and proceed — a hit found
-there is real evidence, not withheld just because the index is not perfectly
-fresh. What must never be trusted off anything but `current` is the *absence*
-of a match: `unmapped`'s `coverage_status` collapses `missing`/`uninitialized`
-to `"uninitialized"` and `upgrade-required` to its own `"upgrade-required"`
-state, and in both cases returns `unmapped: []` rather than asserting "nothing
-governs this file" from an index that cannot back that claim. Only
+does not.** `upgrade-required`, `stale`, and `quarantined` all warn and
+proceed — a hit found there is real evidence, not withheld just because the
+index is not perfectly fresh or is skipping some other, unrelated malformed
+record. What must never be trusted off anything but `current` is the
+*absence* of a match: `unmapped`'s `coverage_status` collapses
+`missing`/`uninitialized` to `"uninitialized"`, `upgrade-required` to its own
+`"upgrade-required"` state, and `quarantined` to its own `"quarantined"`
+state, and in every case returns `unmapped: []` rather than asserting
+"nothing governs this file" from an index that cannot back that claim (a
+quarantined store never self-heals for `unmapped` either — a malformed
+record does not clear itself by reindexing again). Only
 `coverage_status == "ok"` (state was `current`, or `stale` and the self-heal
 below cleared it) actually populates `unmapped`.
 
@@ -1660,13 +1679,51 @@ header line agree on this, which keeps a file whose dates are out of order but
 whose positions are correct handled predictably. Authors should still keep dates
 and positions in agreement.
 
-**Tolerant parsing.** `parse_frontmatter()` never raises on malformed YAML: it
-logs a warning to stderr and falls back to pulling simple top-level `key: value`
-lines out of the frontmatter block by regex, so `title`/`name`/`type` survive and
-the file stays indexed. The branch is taken on a YAML parse error and nothing
-else, so it is invisible to any record that parses — which is every well-formed
-hand-authored one. It exists for pre-existing markdown a project wants indexed
-as-is.
+**Tolerant parsing and quarantine.** `parse_record()` returns a typed
+`ParseResult` (`frontmatter`, `body`, `diagnostics` — a list of `(field,
+message)` pairs, `valid`, `fallback`) and never raises: a read failure
+(`OSError`/`UnicodeDecodeError`), a malformed or non-mapping frontmatter block,
+and a wrongly-shaped typed field are all diagnostics, never exceptions.
+`parse_frontmatter()` stays as a thin `(dict, str)` wrapper over it for callers
+that only need the untyped shape.
+
+A record is *canonical* — it carries the append-only chain the rest of this
+document describes — when its frontmatter has a schema `id` (`TOP-`/`INC-`/
+`INV-`/`CON-`), a `links` list, or a schema `type` (`topic`/`incident`/
+`investigation`/`concept`). Everything else is a *note*: pre-existing markdown a
+project wants indexed as-is, with no chain to validate. `validate_record_shape()`
+runs after a successful YAML parse and checks every typed field is its declared
+shape or absent — `links` a list of mappings each with a scalar `link` id,
+`ruling`/`rationale`/`invariant` mappings, `edges`/`assumptions`/`alternatives`
+lists of mappings, `tags`/`code_refs`/`implemented_by`/`tested_by`/
+`governed_by`/`involved_in` lists of scalars, `metadata` a mapping. A violation
+on a *canonical* record makes it invalid; the same violation on a note is
+recorded but never blocks it — a note has no chain shape to protect.
+
+On a YAML parse error, the lenient regex fallback pulls `id`/`title`/`name`/
+`type`/`area`/`topic`/`date`/`status`/`authority`/`current`/`project`/
+`description`/`permalink` — scalar fields only — out of unindented `key: value`
+lines, logging one warning to stderr, so a note's `title`/`name`/`type` survive
+and it stays indexed. A complex field (`links`, `tags`, `code_refs`, `edges`,
+`assumptions`, `invariant`, `metadata`, `ruling`, `rationale`, `alternatives`,
+`evidence`, `implemented_by`, `tested_by`, `governed_by`, `involved_in`) is
+never recovered this way — regex text can't tell "no value" from "an unclosed
+flow collection" (`links: [` is the reproduction that motivated this: recovered
+blindly, the literal string `"["` would be handed to code expecting a list of
+mappings and crash several calls deep). A canonical record whose frontmatter
+took this fallback path is invalid.
+
+An invalid record is quarantined by `reindex`, not built: its previous rows (if
+any) are purged, one row is written to `index_errors` (path, project, sha256,
+mtime, size, its diagnostics as JSON, and when it was last seen), one stderr
+line names the file and the first diagnostic
+(`quarantined (<field>: <message>)`), and the run continues and exits 0 — its
+neighbours index normally. A record that parses cleanly on a later run has its
+`index_errors` row deleted in the same run; a quarantined path whose file has
+since been deleted has its row deleted too. `decision_index_state` reports
+`quarantined` for a project with rows in `index_errors` (see the state table
+below); `check` lists each one under its own `quarantined` key alongside
+`added`/`changed`/`removed`.
 
 **Lazy imports.** `fastembed` (and, transitively, numpy) is imported only inside
 `compute_embeddings`, `compute_query_embedding`, and the branches of
@@ -1762,14 +1819,23 @@ down:
   reported as drift.) Its `--json` report also carries `source_topic_count`/
   `searchable_row_count`/`searchable_vector_count` — see the `search` bullet
   above — and `symlinks_skipped`, the count of symlinked directories/files the
-  walker skipped this run.
+  walker skipped this run; and `state` (the same word `decision_index_state`
+  reports) and `quarantined` — one `{path, diagnostics}` entry per row in
+  `index_errors`, hashed (only these files) and compared against the sha
+  `reindex` stored: unchanged stays reported under `quarantined`, changed
+  content counts as `changed` instead (it will be re-parsed on the next
+  reindex), and a quarantined file whose path has vanished counts as
+  `removed`. Text mode adds `check: N record(s) quarantined` and one
+  `! <path>: <field>: <message>` line per entry.
 - **`unmapped PATH...`** — classifies each path as `mapped_topic`,
   `mapped_concept_only`, or `unmapped` without walking the code tree.
-  `coverage_status` mirrors the decision index's five states, collapsed for a
+  `coverage_status` mirrors the decision index's states, collapsed for a
   *negative* claim's purposes: `"ok"` (state was `current`, queried normally —
   the only state that actually populates `unmapped`), `"uninitialized"`
   (`missing`/`uninitialized`, no query attempted), `"upgrade-required"` (no
   self-heal — that is the rollout's job, not an ad-hoc hook-triggered one),
+  `"quarantined"` (`index_errors` holds rows for this project — no self-heal;
+  a malformed record does not clear itself by reindexing again),
   `"index-error"` (a `sqlite3.OperationalError` while reading), or `"unknown"`
   (state was `stale`, self-heal ran, and drift still persisted afterward —
   unchanged from before). Self-healing only fires on `stale`: one

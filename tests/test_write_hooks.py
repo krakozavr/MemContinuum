@@ -1815,6 +1815,33 @@ class TestUserPromptRemind(HookTestBase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("outcome=index-error", (self.home / "hook.log").read_text())
 
+    def test_quarantined_logs_index_quarantined_and_omits_the_unmapped_list(self):
+        """audit MC-P1-03 / design R2 (TOP-0123 L2): a store holding one
+        malformed record (already quarantined by a prior reindex) must
+        make `unmapped` refuse the negative claim -- coverage_status
+        "quarantined", `unmapped: []` -- and the hook logs a distinct
+        outcome and prints the real status word instead of the hardcoded
+        "stale", never falling back to listing (an empty) unmapped set."""
+        db = self.home / f"{self.project}.sqlite"
+        _write(self.store_root / "topics" / "bad.md",
+               "---\ntype: topic\nid: TOP-9401\ntitle: Bad\nlinks: [\n---\nBody.\n")
+        reindex(self.store_root, db, project=self.project)  # populates index_errors before the hook runs
+        conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
+        self.assertIsNotNone(
+            conn.execute("SELECT 1 FROM index_errors").fetchone(),
+            "test setup bug: the bad record must already be quarantined",
+        )
+        conn.close()
+
+        session_id = "s-userprompt-quarantined"
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+        proc, elapsed = run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.base_env(), timeout=10.0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("outcome=index-quarantined", (self.home / "hook.log").read_text())
+        self.assertIn("Coverage signal", proc.stdout)
+        self.assertIn("store index quarantined", proc.stdout)
+        self.assertNotIn("unmapped.py", proc.stdout)
+
     def test_silent_on_empty_evidence(self):
         session_id = "s-prompt-empty"
         self.seed_ledger(session_id, [])

@@ -97,43 +97,211 @@ CURRENT_INDEX_GENERATION = 4
 # frontmatter parsing (shared by memidx and memlint)
 # ---------------------------------------------------------------------------
 
+# Audit MC-P1-03 / design R2 (TOP-0123 L2): a record is CANONICAL when its
+# frontmatter carries a schema id (one of these four prefixes), a `links`
+# list, or a schema `type`. Everything else is a NOTE -- tolerant, never
+# quarantined, even when its own frontmatter is malformed (the private test
+# corpus's Basic-Memory-style notes rely on exactly this).
+CANONICAL_ID_PREFIXES = ("TOP-", "INC-", "INV-", "CON-")
+CANONICAL_TYPES = {"topic", "incident", "investigation", "concept"}
 
-def parse_frontmatter(path: Path) -> tuple[dict, str]:
-    """Split a markdown file into (frontmatter dict, body text).
+# The lenient regex fallback (yaml.YAMLError only) recovers ONLY these
+# scalar fields -- never a complex one (a list/mapping-shaped field),
+# because a regex over unindented `key: value` lines cannot tell "no
+# value" (falsy, harmless) from "an unclosed flow collection" (e.g.
+# `links: [` -> the literal string "[", the audit's own reproducer).
+FALLBACK_SCALAR_FIELDS = {
+    "id", "title", "name", "type", "area", "topic", "date", "status",
+    "authority", "current", "project", "description", "permalink",
+}
+FALLBACK_COMPLEX_FIELDS = {
+    "links", "code_refs", "tags", "edges", "assumptions", "invariant",
+    "metadata", "ruling", "rationale", "alternatives", "evidence",
+    "implemented_by", "tested_by", "governed_by", "involved_in",
+}
 
-    Tolerant of files with no frontmatter (returns ({}, whole text)).
-    """
-    text = path.read_text(encoding="utf-8")
+
+class ParseResult:
+    """Typed result of parse_record: `frontmatter`/`body` exactly like the
+    old `(dict, str)` pair, plus `diagnostics` (a list of `(field,
+    message)` tuples -- never raised, never silently swallowed),
+    `valid` (False only for a CANONICAL record carrying at least one
+    diagnostic, or for any record the file itself could not be read/
+    decoded), and `fallback` (True only when the lenient regex recovery
+    path was taken)."""
+
+    __slots__ = ("frontmatter", "body", "diagnostics", "valid", "fallback")
+
+    def __init__(self, frontmatter: dict, body: str, diagnostics: list, valid: bool, fallback: bool) -> None:
+        self.frontmatter = frontmatter
+        self.body = body
+        self.diagnostics = diagnostics
+        self.valid = valid
+        self.fallback = fallback
+
+    def __repr__(self) -> str:
+        return (
+            f"ParseResult(frontmatter={self.frontmatter!r}, diagnostics={self.diagnostics!r}, "
+            f"valid={self.valid!r}, fallback={self.fallback!r})"
+        )
+
+
+def is_canonical_frontmatter(fm: dict) -> bool:
+    rid = fm.get("id")
+    if isinstance(rid, str) and rid.startswith(CANONICAL_ID_PREFIXES):
+        return True
+    if isinstance(fm.get("links"), list):
+        return True
+    if fm.get("type") in CANONICAL_TYPES:
+        return True
+    return False
+
+
+def _shape_ok_list_of_scalars(val) -> bool:
+    if not val:
+        return True
+    if not isinstance(val, list):
+        return False
+    return not any(isinstance(item, (dict, list)) for item in val)
+
+
+def _shape_ok_mapping(val) -> bool:
+    return not val or isinstance(val, dict)
+
+
+def validate_record_shape(fm: dict) -> list:
+    """Design R2 rule 5: every rule is "this type, OR absent/null/empty".
+    Runs on frontmatter that already parsed as a YAML mapping (never on
+    the fallback path, which never recovers a complex field in the first
+    place). Returns a list of `(field, message)` diagnostics; empty means
+    the shape is clean. This is what `build_record`'s own guard (below)
+    exists to make unreachable in practice -- the validator runs first,
+    inside parse_record, and a canonical violation is quarantined before
+    build_record is ever called for that record."""
+    diagnostics: list = []
+
+    for field in ("tags", "code_refs", "implemented_by", "tested_by", "governed_by", "involved_in"):
+        if not _shape_ok_list_of_scalars(fm.get(field)):
+            diagnostics.append((field, f"{field} must be a list of scalars"))
+
+    if not _shape_ok_mapping(fm.get("metadata")):
+        diagnostics.append(("metadata", "metadata must be a mapping"))
+
+    links = fm.get("links")
+    if links:
+        if not isinstance(links, list):
+            diagnostics.append(("links", "links must be a list of mappings"))
+        else:
+            for i, link in enumerate(links):
+                prefix = f"links[{i}]"
+                if not isinstance(link, dict):
+                    diagnostics.append((prefix, f"{prefix} must be a mapping"))
+                    continue
+                lid = link.get("link")
+                if lid is None or lid == "" or isinstance(lid, (dict, list)):
+                    diagnostics.append((f"{prefix}.link", f"{prefix}.link must be a scalar link id"))
+                for sub in ("ruling", "rationale", "invariant"):
+                    if not _shape_ok_mapping(link.get(sub)):
+                        diagnostics.append((f"{prefix}.{sub}", f"{prefix}.{sub} must be a mapping"))
+                for sub in ("edges", "assumptions", "alternatives"):
+                    subval = link.get(sub)
+                    if subval and (not isinstance(subval, list) or any(not isinstance(x, dict) for x in subval)):
+                        diagnostics.append((f"{prefix}.{sub}", f"{prefix}.{sub} must be a list of mappings"))
+
+    return diagnostics
+
+
+def parse_record(path: Path) -> ParseResult:
+    """Typed replacement for the old parse_frontmatter: read/shape/YAML
+    failures are DIAGNOSTICS, never exceptions -- design R2 (audit
+    MC-P1-03, TOP-0123 L2). `valid=False` unconditionally for a file that
+    could not be read/decoded at all (nothing further can be determined
+    about it, canonical or not); otherwise `valid=False` only for a
+    CANONICAL record (schema id/links-list/schema type) carrying at least
+    one diagnostic -- a note stays valid and indexed as today, its
+    diagnostics surfacing only as warnings (memlint) or nothing at all
+    (reindex, beyond the one stderr line the lenient-fallback path always
+    prints, unchanged from before this task)."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return ParseResult({}, "", [("file", "not UTF-8")], valid=False, fallback=False)
+    except OSError as exc:
+        msg = exc.strerror or str(exc)
+        return ParseResult({}, "", [("file", f"unreadable: {msg}")], valid=False, fallback=False)
+
     if not text.startswith("---"):
-        return {}, text
+        return ParseResult({}, text, [], valid=True, fallback=False)
     lines = text.splitlines(keepends=True)
     if not lines or not lines[0].startswith("---"):
-        return {}, text
+        return ParseResult({}, text, [], valid=True, fallback=False)
     end_idx = None
     for i in range(1, len(lines)):
         if lines[i].rstrip("\n") == "---":
             end_idx = i
             break
     if end_idx is None:
-        return {}, text
+        # An opening --- with no closing --- -- always a NOTE (there is no
+        # frontmatter dict at all to carry a schema id/links/type), so this
+        # is a warning-only diagnostic, never a quarantine (design R2 rule 3).
+        body = "".join(lines[1:]).lstrip("\n")
+        return ParseResult(
+            {}, body, [("frontmatter", "unterminated frontmatter block (no closing ---)")],
+            valid=True, fallback=False,
+        )
     fm_text = "".join(lines[1:end_idx])
-    body = "".join(lines[end_idx + 1 :])
+    body = "".join(lines[end_idx + 1:]).lstrip("\n")
     try:
         fm = yaml.safe_load(fm_text) or {}
         if not isinstance(fm, dict):
-            fm = {}
+            # Same reasoning as the unterminated-delimiter case above: a
+            # non-mapping top-level YAML document can never itself carry a
+            # schema id/links/type, so it is always a note.
+            return ParseResult(
+                {}, body, [("frontmatter", "frontmatter did not parse to a mapping")],
+                valid=True, fallback=False,
+            )
     except yaml.YAMLError:
         # Tolerant fallback for real-world notes with malformed frontmatter
         # (e.g. an unclosed quoted scalar): pull out simple top-level
-        # `key: value` lines so at least title/name/type survive for search.
-        # docs/SCHEMA.md canonical records are hand-authored and never hit this path.
+        # `key: value` lines so at least title/name/type survive for
+        # search. A COMPLEX field (links/tags/code_refs/...) is never
+        # recovered this way -- recovering it blindly is exactly the
+        # audit's own crash (`links: [` -> the literal string "[") -- it
+        # instead yields its own diagnostic naming the field, ordered
+        # BEFORE the generic fallback notice below so a quarantine's
+        # first-named-field stderr line names the real offender.
         print(f"memidx: WARNING: {path}: malformed YAML frontmatter, using lenient fallback parse", file=sys.stderr)
         fm = {}
+        diagnostics: list = []
         for line in fm_text.splitlines():
             m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*):\s*(.*)$", line)
-            if m and m.group(1) not in fm:
-                fm[m.group(1)] = m.group(2).strip().strip("'\"")
-    return fm, body.lstrip("\n")
+            if not m or m.group(1) in fm:
+                continue
+            key = m.group(1)
+            raw_val = m.group(2).strip().strip("'\"")
+            if key in FALLBACK_SCALAR_FIELDS:
+                fm[key] = raw_val
+            elif key in FALLBACK_COMPLEX_FIELDS and raw_val:
+                diagnostics.append((key, "not recovered from malformed YAML"))
+        diagnostics.append(("frontmatter", "malformed YAML frontmatter, using lenient fallback parse"))
+        canonical = is_canonical_frontmatter(fm)
+        return ParseResult(fm, body, diagnostics, valid=not canonical, fallback=True)
+
+    diagnostics = validate_record_shape(fm)
+    canonical = is_canonical_frontmatter(fm)
+    valid = not (canonical and diagnostics)
+    return ParseResult(fm, body, diagnostics, valid=valid, fallback=False)
+
+
+def parse_frontmatter(path: Path) -> tuple[dict, str]:
+    """Thin wrapper over parse_record, kept for callers that only need the
+    untyped (dict, str) shape (test call sites and, previously, the three
+    memlint walks -- now switched to parse_record directly). Never raises
+    on a read/shape/YAML failure, same as parse_record: a caller that
+    needs to know WHY now needs parse_record instead."""
+    result = parse_record(path)
+    return result.frontmatter, result.body
 
 
 def infer_type(root: Path, path: Path, fm: dict) -> str:
@@ -179,6 +347,13 @@ def derive_topic_status_authority(links: list[dict]) -> tuple[str | None, str | 
 
 def build_record(root: Path, path: Path, fm: dict, body: str) -> dict:
     links = fm.get("links") or []
+    # Design R2 rule 6: defensive -- validate_record_shape (inside
+    # parse_record) already quarantines a canonical record before it ever
+    # reaches here, so this should be unreachable in practice; it exists so
+    # a caller that skips validation gets a clear, named failure instead of
+    # an AttributeError several frames deeper.
+    if not isinstance(links, list) or any(not isinstance(link, dict) for link in links):
+        raise ValueError(f"{path}: links must be a list of mappings (validate first)")
     is_topic = bool(links) or fm.get("type") == "topic"
     rtype = infer_type(root, path, fm)
     title = fm.get("title") or fm.get("name") or path.stem
@@ -618,6 +793,27 @@ def _collapse_link_duplicates(conn, project: str, ranked_paths: list[str]) -> li
     return out
 
 
+def ensure_index_errors_table(conn: sqlite3.Connection) -> None:
+    """Migration guard shaped like ensure_links_invariant_column (design R2,
+    audit MC-P1-03, TOP-0123 L2): one row per quarantined markdown record --
+    a record whose frontmatter is malformed or wrongly-shaped and could not
+    be safely indexed. `CREATE TABLE IF NOT EXISTS` is idempotent/cheap, so
+    this runs unconditionally, same as every other guard here; no
+    CURRENT_INDEX_GENERATION bump (a new table, not a new column on an
+    existing one -- nothing here needs a re-parse of already-valid rows)."""
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS index_errors (
+             path TEXT PRIMARY KEY,
+             project TEXT NOT NULL,
+             sha256 TEXT NOT NULL,
+             mtime REAL,
+             size INTEGER,
+             diagnostics TEXT NOT NULL,
+             seen_at REAL NOT NULL
+           )"""
+    )
+
+
 def _run_decision_migration_guards(conn: sqlite3.Connection, db_path: Path, project: str | None) -> None:
     """Every additive-ALTER migration guard for the decision index, run
     unconditionally on every successful open (create via open_db, or
@@ -632,6 +828,7 @@ def _run_decision_migration_guards(conn: sqlite3.Connection, db_path: Path, proj
     ensure_embeddings_embed_sha_column(conn)
     ensure_links_evidence_column(conn)
     ensure_records_link_columns(conn)
+    ensure_index_errors_table(conn)
     if project is not None:
         enforce_project_isolation(conn, db_path, project)
 
@@ -667,11 +864,16 @@ def resolve_db_path(args) -> Path:
 
 
 def decision_index_state(db_path: Path, project: str, root: Path | None = None) -> str:
-    """"missing" | "uninitialized" | "upgrade-required" | "stale" | "current"
-    -- ruling 68's five-state model. `root`, when given, additionally
-    checks for on-disk drift via the existing _index_has_drift (the fifth
-    state, "stale") -- omitted by root-less readers for cheapness (and
-    because a root-less reader has nothing to walk in the first place)."""
+    """"missing" | "uninitialized" | "upgrade-required" | "stale" |
+    "quarantined" | "current" -- ruling 68's five-state model, plus
+    "quarantined" (design R2, audit MC-P1-03, TOP-0123 L2). `root`, when
+    given, additionally checks for on-disk drift via the existing
+    _index_has_drift (the "stale" state) -- omitted by root-less readers
+    for cheapness (and because a root-less reader has nothing to walk in
+    the first place). "quarantined" is a plain table lookup (index_errors
+    holds rows for this project) and needs no root -- a root-less reader
+    CAN see it. "stale" still wins over "quarantined" when both apply
+    (real on-disk drift is the more urgent signal)."""
     conn = open_db_noncreating(db_path, project)
     if conn is None:
         return "missing"
@@ -695,6 +897,9 @@ def decision_index_state(db_path: Path, project: str, root: Path | None = None) 
             return "upgrade-required"
         if root is not None and _index_has_drift(conn, root, project):
             return "stale"
+        has_errors = conn.execute("SELECT 1 FROM index_errors WHERE project=? LIMIT 1", (project,)).fetchone()
+        if has_errors is not None:
+            return "quarantined"
         return "current"
     finally:
         conn.close()
@@ -717,20 +922,36 @@ def _decision_reply(cmd_name: str, args, state: str) -> int:
     return 1
 
 
-def _decision_warn(cmd_name: str, args, state: str) -> None:
-    """A positive match off an `upgrade-required`/`stale` index is still
-    real, trustworthy evidence (ruling 68) -- the caller keeps querying and
-    injecting, this just surfaces the caveat on stderr. Final-fix-wave item
-    2: `stale` (only reachable when the caller opted into `--root`) gets
-    the coordinator-specified wording naming the actual cause -- the store
-    changed since the last reindex -- not just the bare state name;
-    `upgrade-required` (reachable with no `--root` at all -- a schema-
-    generation gap, unrelated to on-disk drift) keeps the pre-existing
-    generic line."""
+def _decision_warn(cmd_name: str, args, state: str, conn: sqlite3.Connection | None = None) -> None:
+    """A positive match off an `upgrade-required`/`stale`/`quarantined`
+    index is still real, trustworthy evidence (ruling 68) -- the caller
+    keeps querying and injecting, this just surfaces the caveat on
+    stderr. Final-fix-wave item 2: `stale` (only reachable when the
+    caller opted into `--root`) gets the coordinator-specified wording
+    naming the actual cause -- the store changed since the last reindex --
+    not just the bare state name; `upgrade-required` (reachable with no
+    `--root` at all -- a schema-generation gap, unrelated to on-disk
+    drift) keeps the pre-existing generic line. `quarantined` (design R2,
+    audit MC-P1-03) names the count of skipped records -- `conn` (already
+    open at every one of the six call sites) is how that count is read;
+    omitted (or a caller that passes no conn), the count is reported as 0
+    rather than crashing."""
     if state == "stale":
         print(
             f"{cmd_name}: index is stale (store changed since the last reindex); "
             f"results may be outdated",
+            file=sys.stderr,
+        )
+        return
+    if state == "quarantined":
+        n = 0
+        if conn is not None:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM index_errors WHERE project=?", (args.project,)
+            ).fetchone()
+            n = row["n"] if row else 0
+        print(
+            f"{cmd_name}: index quarantined ({n} record(s) skipped as malformed; run check)",
             file=sys.stderr,
         )
         return
@@ -1096,6 +1317,14 @@ def cmd_reindex(args) -> int:
         row["path"]: row["embed_sha"]
         for row in conn.execute("SELECT path, embed_sha FROM embeddings WHERE project=?", (args.project,))
     }
+    # Design R2 (audit MC-P1-03, TOP-0123 L2): the previous run's quarantine
+    # table, keyed by path -- a path missing here after this run's loop
+    # either recovered (parsed clean) or vanished; either way its row is
+    # stale and gets deleted below.
+    index_errors_before = {
+        row["path"]: row["sha256"]
+        for row in conn.execute("SELECT path, sha256 FROM index_errors WHERE project=?", (args.project,))
+    }
 
     files = sorted(walk_markdown(root))
     seen = set()
@@ -1103,13 +1332,26 @@ def cmd_reindex(args) -> int:
     to_embed_texts: list[str] = []
     pending: list[tuple[dict, str, float, int]] = []
     backfill_only: list[tuple[str, dict]] = []
+    quarantined: list[tuple[str, str, float, int, list]] = []
     unchanged = 0
 
     for f in files:
         path_str = str(f)
-        seen.add(path_str)
-        stat = f.stat()
-        data = f.read_bytes()
+        seen.add(path_str)   # ALWAYS first -- a quarantined/unreadable file
+                              # must never be counted as removed (design R2 rule 7).
+        try:
+            stat = f.stat()
+        except OSError:
+            stat = None
+        try:
+            data = f.read_bytes()
+        except OSError as exc:
+            msg = exc.strerror or str(exc)
+            quarantined.append((
+                path_str, "", stat.st_mtime if stat else 0.0, stat.st_size if stat else 0,
+                [("file", f"unreadable: {msg}")],
+            ))
+            continue
         sha = hashlib.sha256(data).hexdigest()
         prev = existing.get(path_str)
         sha_unchanged = prev is not None and not content_full and prev[0] == sha
@@ -1117,7 +1359,11 @@ def cmd_reindex(args) -> int:
         if sha_unchanged and not needs_backfill:
             unchanged += 1
             continue
-        fm, body = parse_frontmatter(f)
+        result = parse_record(f)
+        if not result.valid:
+            quarantined.append((path_str, sha, stat.st_mtime, stat.st_size, result.diagnostics))
+            continue
+        fm, body = result.frontmatter, result.body
         rec = build_record(root, f, fm, body)
         rec["project"] = args.project
         if sha_unchanged and needs_backfill:
@@ -1213,6 +1459,29 @@ def cmd_reindex(args) -> int:
         delete_record_rows(conn, p)   # keep_embedding=False always -- a removed record's
                                        # vector is dropped, never kept stale.
 
+    # Design R2 (audit MC-P1-03, TOP-0123 L2): an invalid record is NOT
+    # built -- its previous rows (if any: it may have been valid on an
+    # earlier run) are purged, one row is upserted into index_errors, one
+    # named stderr WARNING line is printed, and the run continues. Neither
+    # `added` nor `changed` counts a quarantined path.
+    now = time.time()
+    for path_str, sha, mtime, size, diagnostics in quarantined:
+        delete_record_rows(conn, path_str)
+        conn.execute(
+            "INSERT OR REPLACE INTO index_errors (path, project, sha256, mtime, size, diagnostics, seen_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (path_str, args.project, sha, mtime, size, json.dumps(diagnostics), now),
+        )
+        field, message = diagnostics[0]
+        print(f"memidx: WARNING: {path_str}: quarantined ({field}: {message})", file=sys.stderr)
+
+    # A path that WAS quarantined before this run but is not quarantined
+    # NOW (it parsed clean, or it vanished from disk entirely -- either
+    # way it's not in `quarantined` above) has a stale index_errors row.
+    resolved_paths = set(index_errors_before) - {q[0] for q in quarantined}
+    for p in resolved_paths:
+        conn.execute("DELETE FROM index_errors WHERE project=? AND path=?", (args.project, p))
+
     # Ruling 69: embedding_mode is recomputed from ACTUAL fresh coverage on
     # every run except a NO-OP --auto pass -- one uniform rule replaces
     # Revision 3's special-cased "only downgrade under --no-embed when
@@ -1269,8 +1538,8 @@ def cmd_reindex(args) -> int:
     conn.close()
     elapsed = time.time() - t0
     print(f"reindex: {len(files)} files scanned, {added} added, {changed} changed, "
-          f"{unchanged} unchanged, {len(removed_paths)} removed, {backfilled} embedding(s) backfilled, "
-          f"{elapsed:.3f}s")
+          f"{unchanged} unchanged, {len(removed_paths)} removed, {len(quarantined)} quarantined, "
+          f"{backfilled} embedding(s) backfilled, {elapsed:.3f}s")
     return 0
 
 
@@ -1546,8 +1815,8 @@ def cmd_search(args) -> int:
     conn = open_db_noncreating(db_path, project=args.project)
     if conn is None:
         return _decision_reply("search", args, "missing")
-    if state in ("upgrade-required", "stale"):
-        _decision_warn("search", args, state)
+    if state in ("upgrade-required", "stale", "quarantined"):
+        _decision_warn("search", args, state, conn=conn)
 
     # F5/F7 (ruling 71): status/type/area/topic/authority filtering now
     # lives INSIDE fts_ranked/vector_ranked themselves, before their own
@@ -1615,7 +1884,7 @@ def cmd_search(args) -> int:
         # present at once (a stale, root-given store whose embedding
         # backend also failed), so this is a merge, not an either/or.
         extra: dict = {}
-        if root is not None and state in ("upgrade-required", "stale"):
+        if root is not None and state in ("upgrade-required", "stale", "quarantined"):
             extra["state"] = state
         if embedding_unavailable:
             extra["embedding"] = "unavailable"
@@ -1774,8 +2043,8 @@ def cmd_chain(args) -> int:
     conn = open_db_noncreating(db_path, project=args.project)
     if conn is None:
         return _decision_reply("chain", args, "missing")
-    if state in ("upgrade-required", "stale"):
-        _decision_warn("chain", args, state)
+    if state in ("upgrade-required", "stale", "quarantined"):
+        _decision_warn("chain", args, state, conn=conn)
     topic_row = find_topic_row(conn, args.project, args.topic)
     if topic_row is None:
         print(f"no topic matching {args.topic!r}", file=sys.stderr)
@@ -1788,7 +2057,7 @@ def cmd_chain(args) -> int:
 
     if args.json:
         payload = chain_json(topic_row, link_rows, edges_by_from, assumptions_by_link)
-        if root is not None and state in ("upgrade-required", "stale"):
+        if root is not None and state in ("upgrade-required", "stale", "quarantined"):
             payload["state"] = state   # item 2: --json carries state when opted into --root
         print(json.dumps(payload, indent=2))
     else:
@@ -2135,8 +2404,8 @@ def cmd_for_path(args) -> int:
     including the TOCTOU race where the file vanishes between the state
     check and the open below); 4 = index-error (a schema a migration guard
     should already have fixed but didn't -- ruling 65's belt-and-suspenders
-    catch). upgrade-required/current/stale all proceed normally; a positive
-    match off a non-current index stays usable."""
+    catch). upgrade-required/current/stale/quarantined all proceed normally;
+    a positive match off a non-current index stays usable."""
     db_path = resolve_db_path(args)
     # Final-fix-wave item 2: see cmd_search's identical comment.
     root = Path(args.root).resolve() if getattr(args, "root", None) else None
@@ -2149,8 +2418,8 @@ def cmd_for_path(args) -> int:
             # TOCTOU: the file vanished between the state check above and
             # this open -- the same outcome as "missing" was just found.
             return _for_path_missing_reply(args, "missing")
-        if state in ("upgrade-required", "stale"):
-            _decision_warn("for-path", args, state)
+        if state in ("upgrade-required", "stale", "quarantined"):
+            _decision_warn("for-path", args, state, conn=conn)
         matches = topic_matches_for_path(conn, args.project, args.file_path)
         concept_matches = concept_matches_for_path(conn, args.project, args.file_path)
 
@@ -2159,7 +2428,7 @@ def cmd_for_path(args) -> int:
             out.extend(concept_json(conn, args.project, crow) for crow in concept_matches)
             # Item 2: --json carries state when opted into --root and the
             # state is worth naming -- see cmd_search's identical gate.
-            if root is not None and state in ("upgrade-required", "stale"):
+            if root is not None and state in ("upgrade-required", "stale", "quarantined"):
                 print(json.dumps({"state": state, "results": out}, indent=2))
             else:
                 print(json.dumps(out, indent=2))
@@ -2400,15 +2669,15 @@ def cmd_why(args) -> int:
     conn = open_db_noncreating(db_path, project=args.project)
     if conn is None:
         return _decision_reply("why", args, "missing")
-    if state in ("upgrade-required", "stale"):
-        _decision_warn("why", args, state)
+    if state in ("upgrade-required", "stale", "quarantined"):
+        _decision_warn("why", args, state, conn=conn)
     concept_matches = concept_matches_for_path(conn, args.project, file_path)
 
     if args.json:
         out = [concept_json(conn, args.project, c) for c in concept_matches]
         # Item 2: --json carries state when opted into --root -- see
         # cmd_search's identical gate.
-        if root is not None and state in ("upgrade-required", "stale"):
+        if root is not None and state in ("upgrade-required", "stale", "quarantined"):
             print(json.dumps({"state": state, "results": out}, indent=2))
         else:
             print(json.dumps(out, indent=2))
@@ -2626,8 +2895,8 @@ def cmd_drift(args) -> int:
     conn = open_db_noncreating(db_path, project=args.project)
     if conn is None:
         return _decision_reply("drift", args, "missing")
-    if state in ("upgrade-required", "stale"):
-        _decision_warn("drift", args, state)
+    if state in ("upgrade-required", "stale", "quarantined"):
+        _decision_warn("drift", args, state, conn=conn)
     code_root = Path(args.code_root).resolve()
     entries = links_with_active_invariant(conn, args.project)
     conn.close()
@@ -2663,7 +2932,7 @@ def cmd_drift(args) -> int:
     if args.json:
         payload = {"violations": violations, "hold_violations": hold_violations,
                    "skipped": skipped, "revalidate": revalidate}
-        if root is not None and state in ("upgrade-required", "stale"):
+        if root is not None and state in ("upgrade-required", "stale", "quarantined"):
             payload["state"] = state   # item 2: --json carries state when opted into --root
         print(json.dumps(payload, indent=2))
     else:
@@ -2692,7 +2961,16 @@ def _index_has_drift(conn: sqlite3.Connection, root: Path, project: str) -> bool
     yields one), so it must never be mistaken for one that vanished --
     the NULL-aware source_path predicate (see cmd_reindex's own comment on
     the identical query) excludes every link row here; a pre-migration
-    legacy row (source_path still NULL) is still counted as real."""
+    legacy row (source_path still NULL) is still counted as real.
+
+    Design R2 (audit MC-P1-03, TOP-0123 L2): a walked path with no
+    `records` row that IS quarantined is hashed (a few files only -- never
+    a general content hash here, design R3 lands that for real records in
+    Task 3) and compared against its stored `index_errors.sha256`: equal
+    -> ACCOUNTED (not drift), different -> drift (it gets re-parsed on the
+    next reindex). A quarantined path whose FILE has vanished is also
+    drift -- otherwise the state sticks at "quarantined" on a phantom row
+    forever, never reaching a reindex that would clear it."""
     existing = {
         row["path"]: (row["mtime"], row["size"])
         for row in conn.execute(
@@ -2701,15 +2979,33 @@ def _index_has_drift(conn: sqlite3.Connection, root: Path, project: str) -> bool
             (project,),
         )
     }
+    quarantined_shas = {
+        row["path"]: row["sha256"]
+        for row in conn.execute("SELECT path, sha256 FROM index_errors WHERE project=?", (project,))
+    }
     seen = set()
     for f in walk_markdown(root):
         path_str = str(f)
         seen.add(path_str)
         stat = f.stat()
         prev = existing.get(path_str)
-        if prev is None or prev[0] != stat.st_mtime or prev[1] != stat.st_size:
-            return True
+        if prev is not None:
+            if prev[0] != stat.st_mtime or prev[1] != stat.st_size:
+                return True
+            continue
+        qsha = quarantined_shas.get(path_str)
+        if qsha is not None:
+            try:
+                current_sha = hashlib.sha256(f.read_bytes()).hexdigest()
+            except OSError:
+                continue   # still unreadable -- nothing new to prove, stays accounted
+            if current_sha != qsha:
+                return True
+            continue
+        return True   # a genuinely new/unindexed, non-quarantined path
     if set(existing.keys()) - seen:
+        return True
+    if set(quarantined_shas.keys()) - seen:
         return True
     return False
 
@@ -2757,19 +3053,22 @@ def cmd_unmapped(args) -> int:
     never a code-tree walk). Never imports fastembed.
 
     F1 (ruling 68): `coverage_status` mirrors decision_index_state's own
-    five states, collapsed for a NEGATIVE claim's purposes ("no topic covers
+    states, collapsed for a NEGATIVE claim's purposes ("no topic covers
     this file" is untrusted off anything but a genuinely current index):
     "ok" (state == "current", queried normally), "unknown" (genuine
     unresolved drift, or any other read failure -- unchanged from before
     F1), "uninitialized" (state missing/uninitialized, collapsed -- no
     query attempted, `unmapped` self-heal never fires here), "upgrade-
     required" (state upgrade-required -- self-heal does NOT fire; that is
-    the rollout's job, not an ad-hoc hook-triggered one), "index-error" (a
-    sqlite3.OperationalError while reading -- ruling 65's belt-and-
-    suspenders fail-open). Self-healing is now gated on state == "stale"
-    (a same-generation on-disk drift decision_index_state already computed
-    above -- no second walk): one `reindex --no-embed` pass, then re-check
-    for drift the same way as before F1. `unmapped` is always [] whenever
+    the rollout's job, not an ad-hoc hook-triggered one), "quarantined"
+    (design R2, audit MC-P1-03, TOP-0123 L2: `index_errors` holds rows for
+    this project -- NO self-heal, `unmapped` stays [], same reasoning as
+    the other refused states), "index-error" (a sqlite3.OperationalError
+    while reading -- ruling 65's belt-and-suspenders fail-open).
+    Self-healing is now gated on state == "stale" (a same-generation
+    on-disk drift decision_index_state already computed above -- no
+    second walk): one `reindex --no-embed` pass, then re-check for drift
+    the same way as before F1. `unmapped` is always [] whenever
     coverage_status != "ok" (a positive match found on a not-fully-current
     index is still real evidence; the *absence* of a match is what an
     unknown-freshness index must never be allowed to assert -- docs/
@@ -2790,6 +3089,13 @@ def cmd_unmapped(args) -> int:
             coverage_status = "uninitialized"
         elif state == "upgrade-required":
             coverage_status = "upgrade-required"
+        elif state == "quarantined":
+            # Design R2 (audit MC-P1-03, TOP-0123 L2): NO self-heal (a
+            # malformed record does not clear itself by reindexing again),
+            # `unmapped` stays [] -- a negative claim off a store that is
+            # KNOWN to be skipping some records as malformed is exactly
+            # the untrusted-index case this collapse exists to refuse.
+            coverage_status = "quarantined"
         else:
             conn = open_db_noncreating(db_path, project=args.project)
             if conn is None:
@@ -2875,8 +3181,8 @@ def cmd_check(args) -> int:
     conn = open_db_noncreating(db_path, project=args.project)
     if conn is None:
         return _decision_reply("check", args, "missing")
-    if state in ("upgrade-required", "stale"):
-        _decision_warn("check", args, state)
+    if state in ("upgrade-required", "stale", "quarantined"):
+        _decision_warn("check", args, state, conn=conn)
     # Ruling 66: same NULL-aware source_path predicate as cmd_reindex/
     # _index_has_drift -- a link row is never a real file, never counted
     # here as added/changed/removed.
@@ -2888,25 +3194,53 @@ def cmd_check(args) -> int:
             (args.project,),
         )
     }
+    # Design R2 (audit MC-P1-03, TOP-0123 L2): the same accounting
+    # `_index_has_drift` uses -- a walked path with no `records` row that
+    # IS quarantined is hashed (a few files only) and compared against its
+    # stored sha: equal -> reported under `quarantined`, not `added`/
+    # `changed`; different -> `changed` (it will be re-parsed on the next
+    # reindex). A quarantined path whose file has vanished is reported
+    # under `removed`, same as any other vanished path.
+    quarantined_rows = {
+        row["path"]: (row["sha256"], row["diagnostics"])
+        for row in conn.execute(
+            "SELECT path, sha256, diagnostics FROM index_errors WHERE project=?", (args.project,)
+        )
+    }
     symlinks_skipped: list[Path] = []
     files = list(walk_markdown(root, skipped=symlinks_skipped))
     seen = set()
     changed = []
     added = []
+    quarantined_report = []
     for f in files:
         path_str = str(f)
         seen.add(path_str)
         stat = f.stat()
         prev = existing.get(path_str)
-        if prev is None:
-            added.append(path_str)
-        elif prev[0] != stat.st_mtime or prev[1] != stat.st_size:
-            changed.append(path_str)
-    removed = sorted(set(existing.keys()) - seen)
+        if prev is not None:
+            if prev[0] != stat.st_mtime or prev[1] != stat.st_size:
+                changed.append(path_str)
+            continue
+        qentry = quarantined_rows.get(path_str)
+        if qentry is not None:
+            stored_sha, diagnostics_json = qentry
+            try:
+                current_sha = hashlib.sha256(f.read_bytes()).hexdigest()
+            except OSError:
+                current_sha = stored_sha   # still unreadable -- can't re-verify, stays accounted
+            if current_sha != stored_sha:
+                changed.append(path_str)
+            else:
+                quarantined_report.append({"path": path_str, "diagnostics": json.loads(diagnostics_json)})
+            continue
+        added.append(path_str)
+    removed = sorted((set(existing.keys()) | set(quarantined_rows.keys())) - seen)
 
     drift = bool(added or changed or removed)
     report = {"added": added, "changed": changed, "removed": removed, "drift": drift,
-              "symlinks_skipped": len(symlinks_skipped)}
+              "symlinks_skipped": len(symlinks_skipped),
+              "state": state, "quarantined": quarantined_report}
     # F5 (Codex's addition): growth-count visibility -- the real
     # source-topic count vs. the total searchable row/link/vector count, so
     # a store's index growth from link rows is visible, not hidden inside
@@ -2937,6 +3271,11 @@ def cmd_check(args) -> int:
                 print(f"  - {p}")
         if symlinks_skipped:
             print(f"check: {len(symlinks_skipped)} symlink(s) skipped")
+        if quarantined_report:
+            print(f"check: {len(quarantined_report)} record(s) quarantined")
+            for entry in quarantined_report:
+                field, message = entry["diagnostics"][0]
+                print(f"  ! {entry['path']}: {field}: {message}")
     conn.close()
     return 1 if drift else 0
 
@@ -5509,7 +5848,7 @@ def add_common_args(p: argparse.ArgumentParser, need_root: bool = False, optiona
             "--root", default=None,
             help="markdown root to check for on-disk drift since the last reindex (the "
                  "'stale' state) -- omitted, this reader can never observe 'stale', only "
-                 "'missing'/'uninitialized'/'upgrade-required'/'current'",
+                 "'missing'/'uninitialized'/'upgrade-required'/'quarantined'/'current'",
         )
 
 

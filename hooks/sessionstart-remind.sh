@@ -207,8 +207,9 @@ def yn(v):
 
 if coverage_status != "ok":
     fact_line = (
-        "Coverage signal — decision-topic coverage unknown (store index "
-        f"stale); code HEAD changed: {yn(code_changed)}; store HEAD changed: {yn(store_changed)}"
+        "Coverage signal — decision-topic coverage unknown "
+        f"(store index {coverage_status}); code HEAD changed: {yn(code_changed)}; "
+        f"store HEAD changed: {yn(store_changed)}"
     )
     has_evidence = bool(code_changed) or bool(store_changed)
 else:

@@ -6,6 +6,13 @@
 - The store walker no longer follows symlinks -- a symlinked directory or
   file inside the store is skipped with a warning instead of walked, and
   `check` counts the skips.
+- A malformed or wrongly-shaped record no longer crashes `reindex` or
+  `memlint` -- it is quarantined (its previous rows purged, one row written
+  to a new `index_errors` table, one stderr line naming the file and field),
+  its neighbours index normally, and the run exits 0. The index reports a new
+  `quarantined` state until the record is fixed or removed; `check --json`
+  lists each one, and `unmapped` refuses the negative claim off a quarantined
+  store the same way it already does for an uninitialized one.
 
 ## [0.2.0rc3] — 2026-09-04
 

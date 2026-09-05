@@ -182,6 +182,7 @@ except Exception:
             uninitialized)      mc_log "precompact outcome=index-uninitialized session=${SESSION_ID:-}" ;;
             upgrade-required)   mc_log "precompact outcome=index-upgrade-required session=${SESSION_ID:-}" ;;
             index-error)        mc_log "precompact outcome=index-error session=${SESSION_ID:-}" ;;
+            quarantined)        mc_log "precompact outcome=index-quarantined session=${SESSION_ID:-}" ;;
         esac
     fi
 fi

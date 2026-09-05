@@ -2550,5 +2550,306 @@ class TestF5LinkRows(unittest.TestCase):
                                             "migration -- link rows must still be present")
 
 
+def _write_record(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+def _valid_topic_text(tid: str, title: str = "Good", body: str = "Body text.") -> str:
+    return (
+        f"---\ntype: topic\nid: {tid}\ntitle: {title}\nlinks:\n"
+        f'  - link: L1\n    status: active\n    ruling: {{text: "r", authority: owner-verbatim, source: s}}\n'
+        f"---\n{body}\n"
+    )
+
+
+class TestMalformedRecordQuarantine(unittest.TestCase):
+    """audit MC-P1-03 / design R2 (TOP-0123 L2): a malformed record must
+    never crash reindex/memlint -- it is quarantined into `index_errors`,
+    its neighbours stay indexed, and the run exits 0."""
+
+    def _index_errors_rows(self, db):
+        conn = sqlite3.connect(str(db))
+        conn.row_factory = sqlite3.Row
+        try:
+            return [dict(r) for r in conn.execute("SELECT * FROM index_errors ORDER BY path").fetchall()]
+        finally:
+            conn.close()
+
+    # -- scenario 1: the audit's own reproducer, `links: [`, beside two good topics
+
+    def test_links_flow_open_beside_two_valid_topics(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            _write_record(root / "topics" / "good1.md", _valid_topic_text("TOP-9001"))
+            _write_record(root / "topics" / "good2.md", _valid_topic_text("TOP-9002"))
+            bad_path = root / "topics" / "bad.md"
+            _write_record(bad_path, "---\ntype: topic\nid: TOP-9003\ntitle: Bad\nlinks: [\n---\nBody.\n")
+            db = Path(td) / "idx.sqlite"
+
+            out_buf, err_buf = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+                rc = reindex(root, db, no_embed=True)
+            self.assertEqual(rc, 0, err_buf.getvalue())
+            self.assertNotIn("Traceback", err_buf.getvalue())
+
+            rows = self._index_errors_rows(db)
+            self.assertEqual(len(rows), 1, rows)
+            self.assertEqual(rows[0]["path"], str(bad_path.resolve()))
+            diagnostics = json.loads(rows[0]["diagnostics"])
+            fields = [d[0] for d in diagnostics]
+            self.assertIn("links", fields, diagnostics)
+
+            self.assertEqual(
+                memidx.decision_index_state(db, memidx.DEFAULT_PROJECT, root=root), "quarantined"
+            )
+
+            search_buf = io.StringIO()
+            with contextlib.redirect_stdout(search_buf):
+                rc_s = memidx.cmd_search(ns(
+                    project=memidx.DEFAULT_PROJECT, db=str(db), root=str(root),
+                    query="Body text", mode="fts", status=[], type=[], area=None,
+                    topic=None, authority=None, limit=10, json=True,
+                ))
+            self.assertEqual(rc_s, 0)
+            out = json.loads(search_buf.getvalue())
+            self.assertEqual(out.get("state"), "quarantined")
+            found_paths = {r["path"] for r in out["results"]}
+            self.assertIn(str((root / "topics" / "good1.md").resolve()), found_paths)
+            self.assertIn(str((root / "topics" / "good2.md").resolve()), found_paths)
+
+            check_buf = io.StringIO()
+            with contextlib.redirect_stdout(check_buf):
+                rc_c = memidx.cmd_check(ns(db=str(db), project=memidx.DEFAULT_PROJECT, root=str(root), json=True))
+            self.assertEqual(rc_c, 0)
+            report = json.loads(check_buf.getvalue())
+            self.assertEqual(report["state"], "quarantined")
+            self.assertEqual(len(report["quarantined"]), 1, report)
+            self.assertEqual(report["quarantined"][0]["path"], str(bad_path.resolve()))
+
+    # -- scenario 2: valid YAML, wrong shapes -- each names the offending field
+
+    def test_valid_yaml_wrong_shapes_are_quarantined_with_field_named(self):
+        cases = [
+            ("links_not_a_list", "id: TOP-9101\ntype: topic\nlinks: some text\n", "links"),
+            ("tags_not_a_list", "id: TOP-9102\ntype: topic\ntags: a-string\n", "tags"),
+            ("code_refs_scalar", "id: TOP-9103\ntype: topic\ncode_refs: src/x.py\n", "code_refs"),
+            (
+                "ruling_plain_text",
+                "id: TOP-9104\ntype: topic\nlinks:\n  - link: L1\n    status: active\n    ruling: plain text\n",
+                "links[0].ruling",
+            ),
+            (
+                "links_bad_elements",
+                "id: TOP-9105\ntype: topic\nlinks:\n  - not-a-mapping\n  - 42\n",
+                "links[0]",
+            ),
+        ]
+        for name, fm_body, expected_field in cases:
+            with self.subTest(case=name):
+                with tempfile.TemporaryDirectory() as td:
+                    root = Path(td) / "root"
+                    _write_record(root / "topics" / "bad.md", f"---\n{fm_body}title: Bad\n---\nBody.\n")
+                    db = Path(td) / "idx.sqlite"
+                    err_buf = io.StringIO()
+                    with contextlib.redirect_stderr(err_buf), contextlib.redirect_stdout(io.StringIO()):
+                        rc = reindex(root, db, no_embed=True)
+                    self.assertEqual(rc, 0, err_buf.getvalue())
+                    self.assertNotIn("Traceback", err_buf.getvalue())
+                    rows = self._index_errors_rows(db)
+                    self.assertEqual(len(rows), 1, rows)
+                    diagnostics = json.loads(rows[0]["diagnostics"])
+                    fields = [d[0] for d in diagnostics]
+                    self.assertIn(expected_field, fields, diagnostics)
+
+    # -- scenario 3: a link with no `link:` id -- must quarantine, not IntegrityError
+
+    def test_link_with_no_id_is_quarantined_not_integrity_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            _write_record(
+                root / "topics" / "bad.md",
+                "---\nid: TOP-9106\ntype: topic\ntitle: Bad\nlinks:\n"
+                '  - status: active\n    ruling: {text: "r", authority: owner-verbatim, source: s}\n'
+                "---\nBody.\n",
+            )
+            db = Path(td) / "idx.sqlite"
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf), contextlib.redirect_stdout(io.StringIO()):
+                rc = reindex(root, db, no_embed=True)
+            self.assertEqual(rc, 0, err_buf.getvalue())
+            self.assertNotIn("IntegrityError", err_buf.getvalue())
+            self.assertNotIn("Traceback", err_buf.getvalue())
+            rows = self._index_errors_rows(db)
+            self.assertEqual(len(rows), 1, rows)
+            diagnostics = json.loads(rows[0]["diagnostics"])
+            fields = [d[0] for d in diagnostics]
+            self.assertIn("links[0].link", fields, diagnostics)
+
+    # -- scenario 4: unreadable file / non-UTF-8 file -- quarantined naming "file"
+
+    @unittest.skipIf(
+        os.name != "posix" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+        "chmod 000 is meaningless on Windows or as root",
+    )
+    def test_unreadable_file_is_quarantined_with_file_named(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            bad = root / "topics" / "bad.md"
+            _write_record(bad, _valid_topic_text("TOP-9107"))
+            os.chmod(bad, 0o000)
+            db = Path(td) / "idx.sqlite"
+            try:
+                err_buf = io.StringIO()
+                with contextlib.redirect_stderr(err_buf), contextlib.redirect_stdout(io.StringIO()):
+                    rc = reindex(root, db, no_embed=True)
+                self.assertEqual(rc, 0, err_buf.getvalue())
+                self.assertNotIn("Traceback", err_buf.getvalue())
+                rows = self._index_errors_rows(db)
+                self.assertEqual(len(rows), 1, rows)
+                diagnostics = json.loads(rows[0]["diagnostics"])
+                fields = [d[0] for d in diagnostics]
+                self.assertIn("file", fields, diagnostics)
+            finally:
+                os.chmod(bad, 0o644)
+
+    def test_non_utf8_file_is_quarantined_with_file_named(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            bad = root / "topics" / "bad.md"
+            bad.parent.mkdir(parents=True, exist_ok=True)
+            bad.write_bytes(b"---\ntitle: Bad\n---\n\xff\xfe broken bytes\n")
+            db = Path(td) / "idx.sqlite"
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf), contextlib.redirect_stdout(io.StringIO()):
+                rc = reindex(root, db, no_embed=True)
+            self.assertEqual(rc, 0, err_buf.getvalue())
+            self.assertNotIn("Traceback", err_buf.getvalue())
+            rows = self._index_errors_rows(db)
+            self.assertEqual(len(rows), 1, rows)
+            diagnostics = json.loads(rows[0]["diagnostics"])
+            fields = [d[0] for d in diagnostics]
+            self.assertIn("file", fields, diagnostics)
+
+    # -- scenario 5: fixing the record clears the quarantine on the next reindex
+
+    def test_fixing_the_record_clears_quarantine_next_reindex(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            bad_path = root / "topics" / "bad.md"
+            _write_record(bad_path, "---\ntype: topic\nid: TOP-9108\ntitle: Bad\nlinks: [\n---\nBody.\n")
+            db = Path(td) / "idx.sqlite"
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                reindex(root, db, no_embed=True)
+            self.assertEqual(len(self._index_errors_rows(db)), 1)
+
+            _write_record(bad_path, _valid_topic_text("TOP-9108"))
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                rc = reindex(root, db, no_embed=True)
+            self.assertEqual(rc, 0)
+            self.assertEqual(self._index_errors_rows(db), [])
+            self.assertEqual(
+                memidx.decision_index_state(db, memidx.DEFAULT_PROJECT, root=root), "current"
+            )
+            conn = sqlite3.connect(str(db))
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT 1 FROM records WHERE id='TOP-9108'").fetchone()
+            conn.close()
+            self.assertIsNotNone(row)
+
+    # -- scenario 6: deleting the bad file clears the quarantine on the next reindex
+
+    def test_deleting_the_bad_file_clears_quarantine_next_reindex(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            bad_path = root / "topics" / "bad.md"
+            _write_record(bad_path, "---\ntype: topic\nid: TOP-9109\ntitle: Bad\nlinks: [\n---\nBody.\n")
+            db = Path(td) / "idx.sqlite"
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                reindex(root, db, no_embed=True)
+            self.assertEqual(len(self._index_errors_rows(db)), 1)
+
+            bad_path.unlink()
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                rc = reindex(root, db, no_embed=True)
+            self.assertEqual(rc, 0)
+            self.assertEqual(self._index_errors_rows(db), [])
+            self.assertEqual(
+                memidx.decision_index_state(db, memidx.DEFAULT_PROJECT, root=root), "current"
+            )
+
+    # -- scenario 7: `unmapped` on a quarantined store refuses the negative claim, no self-heal
+
+    def test_unmapped_on_quarantined_store_refuses_negative_claim(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            _write_record(root / "topics" / "good.md", _valid_topic_text("TOP-9110"))
+            _write_record(
+                root / "topics" / "bad.md",
+                "---\ntype: topic\nid: TOP-9111\ntitle: Bad\nlinks: [\n---\nBody.\n",
+            )
+            db = Path(td) / "idx.sqlite"
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                reindex(root, db, no_embed=True)
+            rows_before = self._index_errors_rows(db)
+            self.assertEqual(len(rows_before), 1)
+            seen_at_before = rows_before[0]["seen_at"]
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = memidx.cmd_unmapped(ns(
+                    project=memidx.DEFAULT_PROJECT, db=str(db), root=str(root),
+                    code_root=None, paths=["some/file.py"], json=True,
+                ))
+            self.assertEqual(rc, 1)
+            out = json.loads(buf.getvalue())
+            self.assertEqual(out["coverage_status"], "quarantined")
+            self.assertEqual(out["unmapped"], [])
+
+            rows_after = self._index_errors_rows(db)
+            self.assertEqual(len(rows_after), 1)
+            self.assertEqual(
+                rows_after[0]["seen_at"], seen_at_before,
+                "unmapped must not self-heal (reindex) on a quarantined store",
+            )
+
+    # -- scenario 8: a note (no id/links/type) with malformed YAML stays indexed
+
+    def test_note_with_malformed_yaml_stays_indexed_not_quarantined(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            note_path = root / "notes" / "note.md"
+            _write_record(
+                note_path,
+                "---\n"
+                "title: 'Unterminated quote note\n"
+                "name: my-note\n"
+                "description: no quotes here at all\n"
+                "metadata:\n"
+                "  node_type: memory\n"
+                "permalink: sandbox/notes/my-note\n"
+                "---\n"
+                "Body text of the note.\n",
+            )
+            db = Path(td) / "idx.sqlite"
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf), contextlib.redirect_stdout(io.StringIO()):
+                rc = reindex(root, db, no_embed=True)
+            self.assertEqual(rc, 0, err_buf.getvalue())
+            self.assertEqual(self._index_errors_rows(db), [], "a note must never be quarantined")
+
+            result = memidx.parse_record(note_path)
+            self.assertTrue(result.valid)
+            self.assertTrue(result.fallback)
+            self.assertEqual(result.frontmatter.get("title"), "Unterminated quote note")
+            self.assertEqual(len(result.diagnostics), 1, result.diagnostics)
+
+            conn = sqlite3.connect(str(db))
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT 1 FROM records WHERE title=?", ("Unterminated quote note",)).fetchone()
+            conn.close()
+            self.assertIsNotNone(row, "the note must still be indexed")
+
+
 if __name__ == "__main__":
     unittest.main()

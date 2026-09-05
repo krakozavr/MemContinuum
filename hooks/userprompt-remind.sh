@@ -441,6 +441,7 @@ except Exception:
                 uninitialized)      mc_log "userprompt outcome=index-uninitialized session=${SESSION_ID:-}" ;;
                 upgrade-required)   mc_log "userprompt outcome=index-upgrade-required session=${SESSION_ID:-}" ;;
                 index-error)        mc_log "userprompt outcome=index-error session=${SESSION_ID:-}" ;;
+                quarantined)        mc_log "userprompt outcome=index-quarantined session=${SESSION_ID:-}" ;;
             esac
         fi
     fi
@@ -501,8 +502,9 @@ def yn(v):
 
 if coverage_status != "ok":
     fact_line = (
-        "Coverage signal — decision-topic coverage unknown (store index "
-        f"stale); code HEAD changed: {yn(code_changed)}; store HEAD changed: {yn(store_changed)}"
+        "Coverage signal — decision-topic coverage unknown "
+        f"(store index {coverage_status}); code HEAD changed: {yn(code_changed)}; "
+        f"store HEAD changed: {yn(store_changed)}"
     )
     has_evidence = code_changed or store_changed
 else:

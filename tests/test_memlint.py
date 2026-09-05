@@ -1,4 +1,5 @@
 import contextlib
+import io
 import os
 import shutil
 import sys
@@ -711,6 +712,104 @@ class TestPythonSyntaxErrorIsAWarningNotAnError(unittest.TestCase):
             any("no_such_symbol" in e for e in errors),
             f"a parseable file still fails the lint on a genuinely absent symbol: {errors}",
         )
+
+
+def _write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+class TestMalformedRecordDiagnostics(unittest.TestCase):
+    """audit MC-P1-03 / design R2 (TOP-0123 L2): every malformed-record
+    diagnostic becomes an `ERROR: <path>: <field>: <message>` line, never
+    a traceback; a note under the lenient fallback is a WARNING, not an
+    error, and stays exit 0."""
+
+    def test_links_flow_open_is_an_error_naming_links(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _write(root / "topics" / "bad.md", "---\ntype: topic\nid: TOP-9201\ntitle: Bad\nlinks: [\n---\nBody.\n")
+            errors, _warnings = memlint.lint_root(root)
+            self.assertTrue(any("links" in e for e in errors), errors)
+            rc = memlint.main([str(root)])
+            self.assertEqual(rc, 1)
+
+    def test_valid_yaml_wrong_shapes_are_errors_naming_the_field(self):
+        cases = [
+            ("links_not_a_list", "id: TOP-9202\ntype: topic\nlinks: some text\n", "links"),
+            ("tags_not_a_list", "id: TOP-9203\ntype: topic\ntags: a-string\n", "tags"),
+            ("code_refs_scalar", "id: TOP-9204\ntype: topic\ncode_refs: src/x.py\n", "code_refs"),
+            (
+                "ruling_plain_text",
+                "id: TOP-9205\ntype: topic\nlinks:\n  - link: L1\n    status: active\n    ruling: plain text\n",
+                "links[0].ruling",
+            ),
+        ]
+        for name, fm_body, expected_field in cases:
+            with self.subTest(case=name):
+                with tempfile.TemporaryDirectory() as td:
+                    root = Path(td)
+                    _write(root / "topics" / "bad.md", f"---\n{fm_body}title: Bad\n---\nBody.\n")
+                    errors, _warnings = memlint.lint_root(root)
+                    self.assertTrue(any(expected_field in e for e in errors), errors)
+                    rc = memlint.main([str(root)])
+                    self.assertEqual(rc, 1)
+
+    def test_link_with_no_id_is_an_error_naming_links_link(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _write(
+                root / "topics" / "bad.md",
+                "---\nid: TOP-9206\ntype: topic\ntitle: Bad\nlinks:\n"
+                '  - status: active\n    ruling: {text: "r", authority: owner-verbatim, source: s}\n'
+                "---\nBody.\n",
+            )
+            errors, _warnings = memlint.lint_root(root)
+            self.assertTrue(any("links[0].link" in e for e in errors), errors)
+
+    def test_unreadable_and_non_utf8_files_are_errors_naming_file_never_traceback(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            bad = root / "topics" / "bad.md"
+            bad.parent.mkdir(parents=True, exist_ok=True)
+            bad.write_bytes(b"---\ntitle: Bad\n---\n\xff\xfe broken bytes\n")
+            errors, _warnings = memlint.lint_root(root)
+            self.assertTrue(any(": file:" in e for e in errors), errors)
+            rc = memlint.main([str(root)])
+            self.assertEqual(rc, 1)
+
+    def test_memlint_never_tracebacks_on_any_malformed_case(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _write(root / "topics" / "bad1.md", "---\ntype: topic\nid: TOP-9207\ntitle: Bad\nlinks: [\n---\nBody.\n")
+            _write(root / "topics" / "bad2.md", "---\nid: TOP-9208\ntype: topic\ntags: a-string\ntitle: Bad\n---\nBody.\n")
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = memlint.main([str(root)])
+            self.assertEqual(rc, 1)
+            self.assertNotIn("Traceback", buf_out.getvalue())
+            self.assertNotIn("Traceback", buf_err.getvalue())
+
+    def test_note_with_malformed_yaml_is_a_warning_not_an_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _write(
+                root / "notes" / "note.md",
+                "---\n"
+                "title: 'Unterminated quote note\n"
+                "name: my-note\n"
+                "description: no quotes here at all\n"
+                "metadata:\n"
+                "  node_type: memory\n"
+                "permalink: sandbox/notes/my-note\n"
+                "---\n"
+                "Body text of the note.\n",
+            )
+            errors, warnings = memlint.lint_root(root)
+            self.assertEqual(errors, [], errors)
+            self.assertTrue(any("malformed YAML" in w for w in warnings), warnings)
+            rc = memlint.main([str(root)])
+            self.assertEqual(rc, 0)
 
 
 if __name__ == "__main__":
