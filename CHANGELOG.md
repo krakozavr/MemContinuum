@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0] — unreleased
+
+### Decision index
+- The store walker no longer follows symlinks -- a symlinked directory or
+  file inside the store is skipped with a warning instead of walked, and
+  `check` counts the skips.
+
 ## [0.2.0rc3] — 2026-09-04
 
 ### Languages

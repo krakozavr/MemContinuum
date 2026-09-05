@@ -1403,7 +1403,8 @@ own wired entry, with its own `MEMCONTINUUM_CODE_ROOT`, for every
 ## memlint
 
 `memlint.py ROOT [--code-root DIR ...]` imports memidx's own walker, so a
-session buffer is never linted as a topic, and reuses
+session buffer is never linted as a topic, the walker's no-symlinks rule
+applies here too, and reuses
 `memidx.fragment_declaration_status` — the same predicate `code-search` uses for
 concept attachment at runtime — rather than a from-scratch regex, so a
 `#symbol` fragment validates exactly the way attachment accepts it, comments and
@@ -1482,7 +1483,13 @@ same walker — walk every non-hidden `.md` file under `--root` but prune
 dot-directories, dotfiles and `node_modules` at every depth. The root itself is
 never pruned, so a store that legitimately lives at `~/.memory/` still indexes
 in full. A `.gitignore` cannot express this pruning, because this is a
-filesystem walk rather than a git one.
+filesystem walk rather than a git one. The walker also does not follow
+symlinks: a symlinked directory is not descended and a symlinked file is
+skipped rather than read, each skip warned on stderr and counted by `check` as
+`symlinks_skipped`. A `--root` that is itself a symlink to the store is
+resolved first and still works. The code index walker likewise does not
+descend a symlinked directory, but — the deliberate difference — it does
+index a symlinked source file through the link.
 
 Every `.md` file the walk does not prune IS indexed as a record — including
 one with no frontmatter at all (`parse_frontmatter` is tolerant of that, see
@@ -1754,7 +1761,8 @@ down:
   re-embedding; `check` uses the cheaper pair so a bare `touch` is still
   reported as drift.) Its `--json` report also carries `source_topic_count`/
   `searchable_row_count`/`searchable_vector_count` — see the `search` bullet
-  above.
+  above — and `symlinks_skipped`, the count of symlinked directories/files the
+  walker skipped this run.
 - **`unmapped PATH...`** — classifies each path as `mapped_topic`,
   `mapped_concept_only`, or `unmapped` without walking the code tree.
   `coverage_status` mirrors the decision index's five states, collapsed for a

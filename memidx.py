@@ -929,26 +929,54 @@ def unpack_vector(blob: bytes):
 # per-file check. `os.walk` never prunes the root it is given, so a store that
 # legitimately lives at e.g. `~/.memory/` still indexes in full.
 #
-# Known and accepted gap (reviewer finding, 2026-08-31): with followlinks=True
-# a NON-hidden directory that symlinks AT a hidden one is still walked, since
-# the prune tests the local name. Closing it would cost a realpath() per
-# directory on every walk to defend against a store deliberately aliasing its
-# own noise, which nothing observed does. A hidden directory reached by its own
-# name is pruned whether or not it is a symlink.
+# The walker does not follow symlinks: a symlinked directory is pruned before
+# os.walk descends into it (whether or not its own name would also have been
+# pruned as hidden), and a symlinked file that would otherwise be indexed is
+# skipped rather than read. Both are warned on stderr, one line per skip, and
+# counted, so a store is defended against escaping its own root through an
+# alias without a per-path containment check. A hidden directory reached by
+# its own name is pruned whether or not it is a symlink.
 STORE_SKIP_DIR_NAMES = {"node_modules"}
 
 
-def walk_markdown(root: Path):
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
-        dirnames[:] = [
-            d for d in dirnames
-            if not d.startswith(".") and d not in STORE_SKIP_DIR_NAMES
-        ]
+def _warn_symlink_skipped(path: Path, skipped: list | None) -> None:
+    print(
+        f"memidx: WARNING: {path}: symlink skipped (the store walker does not follow symlinks)",
+        file=sys.stderr,
+    )
+    if skipped is not None:
+        skipped.append(path)
+
+
+def walk_markdown(root: Path, *, skipped: list | None = None):
+    """Yield every non-hidden `.md` file under `root`, pruning dot-directories/
+    dotfiles/node_modules at every depth (see the comment above). `root` is
+    resolved first, so a caller passing a symlinked --root still walks the
+    real tree and yields paths under the resolved root. Neither a symlinked
+    directory nor a symlinked file is ever walked/yielded -- each is warned on
+    stderr and, when the caller passes a `skipped` list, appended to it (e.g.
+    cmd_check's symlinks_skipped count)."""
+    root = Path(root).resolve()
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        kept_dirnames = []
+        for d in dirnames:
+            full = Path(dirpath) / d
+            if full.is_symlink():
+                _warn_symlink_skipped(full, skipped)
+                continue
+            if d.startswith(".") or d in STORE_SKIP_DIR_NAMES:
+                continue
+            kept_dirnames.append(d)
+        dirnames[:] = kept_dirnames
         for fname in filenames:
             # Hidden files get the same treatment as hidden directories, and
             # for the same reason: a dotfile is tooling's, not a record.
             if fname.endswith(".md") and not fname.startswith("."):
-                yield Path(dirpath) / fname
+                full = Path(dirpath) / fname
+                if full.is_symlink():
+                    _warn_symlink_skipped(full, skipped)
+                    continue
+                yield full
 
 
 def cmd_reindex(args) -> int:
@@ -2843,7 +2871,8 @@ def cmd_check(args) -> int:
             (args.project,),
         )
     }
-    files = list(walk_markdown(root))
+    symlinks_skipped: list[Path] = []
+    files = list(walk_markdown(root, skipped=symlinks_skipped))
     seen = set()
     changed = []
     added = []
@@ -2859,7 +2888,8 @@ def cmd_check(args) -> int:
     removed = sorted(set(existing.keys()) - seen)
 
     drift = bool(added or changed or removed)
-    report = {"added": added, "changed": changed, "removed": removed, "drift": drift}
+    report = {"added": added, "changed": changed, "removed": removed, "drift": drift,
+              "symlinks_skipped": len(symlinks_skipped)}
     # F5 (Codex's addition): growth-count visibility -- the real
     # source-topic count vs. the total searchable row/link/vector count, so
     # a store's index growth from link rows is visible, not hidden inside
@@ -2888,6 +2918,8 @@ def cmd_check(args) -> int:
                 print(f"  ~ {p}")
             for p in removed:
                 print(f"  - {p}")
+        if symlinks_skipped:
+            print(f"check: {len(symlinks_skipped)} symlink(s) skipped")
     conn.close()
     return 1 if drift else 0
 

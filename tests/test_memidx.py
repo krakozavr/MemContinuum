@@ -477,6 +477,166 @@ class TestStoreWalkPruning(unittest.TestCase):
             self.assertEqual([p.name for p in memidx.walk_markdown(root)], ["real.md"])
 
 
+class TestStoreWalkerSymlinks(unittest.TestCase):
+    """The store walker must not follow symlinks out of the root (audit
+    MC-P1-01): a symlinked directory or file is pruned/skipped instead of
+    walked, each skip is warned on stderr and counted, and a --root that is
+    itself a symlink to the store still resolves and indexes correctly."""
+
+    def _symlink(self, target, link_path) -> None:
+        try:
+            os.symlink(target, link_path)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"os.symlink unsupported on this filesystem: {exc}")
+
+    @staticmethod
+    def _record_paths(db, project=None):
+        project = project or memidx.DEFAULT_PROJECT
+        conn = sqlite3.connect(str(db))
+        try:
+            return {
+                row[0] for row in conn.execute(
+                    "SELECT path FROM records WHERE project=?", (project,)
+                )
+            }
+        finally:
+            conn.close()
+
+    def test_external_directory_symlink_is_not_followed(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = Path(td) / "store"
+            (store / "topics").mkdir(parents=True)
+            (store / "topics" / "real.md").write_text("# real\n")
+            outside = Path(td) / "outside"
+            outside.mkdir()
+            (outside / "private.md").write_text("# private\n")
+            self._symlink("../outside", str(store / "linked"))
+
+            db = Path(td) / "idx.sqlite"
+            rc = reindex(store, db, no_embed=True)
+            self.assertEqual(rc, 0)
+
+            paths = self._record_paths(db)
+            self.assertEqual(len(paths), 1)
+            self.assertTrue(any(p.endswith("real.md") for p in paths))
+            self.assertFalse(any("linked" in p for p in paths))
+            self.assertFalse(any("private.md" in p for p in paths))
+
+            buf_out = io.StringIO()
+            with contextlib.redirect_stdout(buf_out):
+                rc_check = memidx.cmd_check(
+                    ns(db=str(db), project=memidx.DEFAULT_PROJECT, root=str(store), json=True)
+                )
+            self.assertEqual(rc_check, 0)
+            report = json.loads(buf_out.getvalue())
+            self.assertFalse(report["drift"])
+            self.assertGreaterEqual(report["symlinks_skipped"], 1)
+
+            errors, _warnings = memlint.lint_root(store)
+            self.assertFalse(any("private.md" in e for e in errors))
+
+    def test_parent_cycle_terminates_and_indexes_each_file_once(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = Path(td) / "store"
+            (store / "topics").mkdir(parents=True)
+            (store / "topics" / "one.md").write_text("# one\n")
+            (store / "topics" / "two.md").write_text("# two\n")
+            self._symlink(".", str(store / "loop"))
+
+            db = Path(td) / "idx.sqlite"
+            rc = reindex(store, db, no_embed=True)
+            self.assertEqual(rc, 0)
+
+            paths = self._record_paths(db)
+            self.assertEqual(len(paths), 2)
+            self.assertFalse(any("loop/" in p for p in paths))
+
+    def test_symlinked_file_is_skipped_with_a_warning(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = Path(td) / "store"
+            (store / "topics").mkdir(parents=True)
+            (store / "topics" / "real.md").write_text("# real\n")
+            outside = Path(td) / "outside"
+            outside.mkdir()
+            (outside / "x.md").write_text("# outside x\n")
+            self._symlink("../../outside/x.md", str(store / "topics" / "linked-file.md"))
+
+            db = Path(td) / "idx.sqlite"
+            buf_err = io.StringIO()
+            with contextlib.redirect_stderr(buf_err):
+                rc = reindex(store, db, no_embed=True)
+            self.assertEqual(rc, 0)
+
+            paths = self._record_paths(db)
+            self.assertEqual(len(paths), 1)
+            self.assertTrue(any(p.endswith("real.md") for p in paths))
+
+            stderr = buf_err.getvalue()
+            self.assertIn("linked-file.md", stderr)
+            self.assertIn("symlink skipped", stderr)
+
+    def test_reindex_check_and_memlint_walk_the_same_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = Path(td) / "store"
+            (store / "topics").mkdir(parents=True)
+            (store / "topics" / "real.md").write_text("# real\n")
+            outside = Path(td) / "outside"
+            outside.mkdir()
+            (outside / "private.md").write_text("# private\n")
+            self._symlink("../outside", str(store / "linked"))
+            (outside / "x.md").write_text(
+                "---\ntype: topic\nid: TOP-BAD\ntitle: Bad\nlinks: []\n"
+                "status: superseded\n---\nBody.\n"
+            )
+            self._symlink("../../outside/x.md", str(store / "topics" / "linked-file.md"))
+
+            db = Path(td) / "idx.sqlite"
+            rc = reindex(store, db, no_embed=True)
+            self.assertEqual(rc, 0)
+            reindexed_paths = self._record_paths(db)
+            self.assertEqual(len(reindexed_paths), 1)
+
+            buf_out = io.StringIO()
+            with contextlib.redirect_stdout(buf_out):
+                rc_check = memidx.cmd_check(
+                    ns(db=str(db), project=memidx.DEFAULT_PROJECT, root=str(store), json=True)
+                )
+            self.assertEqual(rc_check, 0)
+            report = json.loads(buf_out.getvalue())
+            self.assertEqual(report["added"], [])
+            self.assertEqual(report["removed"], [])
+
+            errors, _warnings = memlint.lint_root(store)
+            self.assertFalse(any("TOP-BAD" in e for e in errors))
+            self.assertFalse(any("superseded" in e for e in errors))
+
+    def test_root_given_through_a_symlink_still_indexes(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td) / "tmp"
+            store = tmp / "store"
+            store.mkdir(parents=True)
+            (store / "real.md").write_text("# real\n")
+            link = tmp / "link-to-store"
+            self._symlink(str(store), str(link))
+
+            db = Path(td) / "idx.sqlite"
+            rc = reindex(link, db, no_embed=True)
+            self.assertEqual(rc, 0)
+
+            paths = self._record_paths(db)
+            self.assertEqual(len(paths), 1)
+            resolved_store = str(store.resolve())
+            self.assertTrue(next(iter(paths)).startswith(resolved_store))
+
+            buf_out = io.StringIO()
+            with contextlib.redirect_stdout(buf_out):
+                rc2 = reindex(store, db, no_embed=True)
+            self.assertEqual(rc2, 0)
+            out = buf_out.getvalue()
+            self.assertIn("0 added", out)
+            self.assertIn("1 unchanged", out)
+
+
 class TestPrunedPathsLeaveTheIndex(unittest.TestCase):
     """Pruning the walker is only half the fix: an ALREADY-polluted index has
     to lose those rows too. reindex drops anything the walk no longer yields,
