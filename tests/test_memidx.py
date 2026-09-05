@@ -2850,6 +2850,190 @@ class TestMalformedRecordQuarantine(unittest.TestCase):
             conn.close()
             self.assertIsNotNone(row, "the note must still be indexed")
 
+    # -- Fix round 1, finding A1 (BLOCKING): canonicity must be decided from
+    # the RAW frontmatter text, not the post-failure {} dict, in every
+    # parse-failure branch. Each of the three shapes below is a fully
+    # schema-conformant topic (id, type, block-style links) undone by only
+    # ONE unrelated defect -- it must still be quarantined, not silently
+    # reduced to a filename-derived "note".
+
+    def _assert_quarantined_and_unsearchable(self, root, db, bad_path):
+        err_buf = io.StringIO()
+        with contextlib.redirect_stderr(err_buf), contextlib.redirect_stdout(io.StringIO()):
+            rc = reindex(root, db, no_embed=True)
+        self.assertEqual(rc, 0, err_buf.getvalue())
+        rows = self._index_errors_rows(db)
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0]["path"], str(bad_path.resolve()))
+        self.assertEqual(
+            memidx.decision_index_state(db, memidx.DEFAULT_PROJECT, root=root), "quarantined"
+        )
+        search_buf = io.StringIO()
+        with contextlib.redirect_stdout(search_buf):
+            memidx.cmd_search(ns(
+                project=memidx.DEFAULT_PROJECT, db=str(db), root=str(root),
+                query="Body", mode="fts", status=[], type=[], area=None,
+                topic=None, authority=None, limit=10, json=True,
+            ))
+        out = json.loads(search_buf.getvalue())
+        self.assertEqual(out["results"], [], "a quarantined record must never appear in search")
+        return rows[0]
+
+    def test_unterminated_frontmatter_on_a_canonical_topic_is_quarantined(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            bad_path = root / "topics" / "bad.md"
+            _write_record(
+                bad_path,
+                "---\ntype: topic\nid: TOP-9301\ntitle: T\nlinks:\n"
+                '  - link: L1\n    status: active\n    ruling: {authority: owner-verbatim, text: t, source: s}\n'
+                "Body.\n",   # deliberately no closing ---
+            )
+            db = Path(td) / "idx.sqlite"
+            self._assert_quarantined_and_unsearchable(root, db, bad_path)
+
+    def test_yaml_error_on_a_canonical_topic_is_quarantined(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            bad_path = root / "topics" / "bad.md"
+            _write_record(
+                bad_path,
+                "---\ntype: topic\nid: TOP-9302\ntitle: a: b\nlinks:\n"
+                '  - link: L1\n    status: active\n    ruling: {authority: owner-verbatim, text: t, source: s}\n'
+                "---\nBody mentioning xyzzy123.\n",
+            )
+            db = Path(td) / "idx.sqlite"
+            self._assert_quarantined_and_unsearchable(root, db, bad_path)
+
+    def test_frontmatter_parsing_to_a_list_on_a_canonical_topic_is_quarantined(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            bad_path = root / "topics" / "bad.md"
+            _write_record(
+                bad_path,
+                "---\n- type: topic\n- id: TOP-9303\n- links:\n"
+                "    - link: L1\n      status: active\n"
+                '      ruling: {authority: owner-verbatim, text: t, source: s}\n'
+                "---\nBody.\n",
+            )
+            db = Path(td) / "idx.sqlite"
+            self._assert_quarantined_and_unsearchable(root, db, bad_path)
+
+    def test_links_only_canonical_marker_under_fallback_is_quarantined(self):
+        """No id:/type: at all -- `links:` alone must still make this
+        canonical (finding A1 instance (a)); the fallback must also still
+        name `links` in its diagnostics even though its own header line
+        (`links:`) is blank (finding A2 -- the blank carve-out is for
+        notes only)."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            bad_path = root / "topics" / "bad.md"
+            _write_record(
+                bad_path,
+                "---\ntitle: a: b\nlinks:\n"
+                '  - link: TOP-0001\n    status: active\n    ruling: {authority: owner-verbatim, text: something, source: s}\n'
+                "---\nBody text mentioning searchable phrase xyzzy123.\n",
+            )
+            db = Path(td) / "idx.sqlite"
+            row = self._assert_quarantined_and_unsearchable(root, db, bad_path)
+            diagnostics = json.loads(row["diagnostics"])
+            fields = [d[0] for d in diagnostics]
+            self.assertIn("links", fields, diagnostics)
+
+    def test_memlint_on_a1_regressions_reports_error_never_traceback(self):
+        cases = {
+            "unterminated": (
+                "---\ntype: topic\nid: TOP-9304\ntitle: T\nlinks:\n"
+                '  - link: L1\n    status: active\n    ruling: {authority: owner-verbatim, text: t, source: s}\n'
+                "Body.\n"
+            ),
+            "yaml_error": (
+                "---\ntype: topic\nid: TOP-9305\ntitle: a: b\nlinks:\n"
+                '  - link: L1\n    status: active\n    ruling: {authority: owner-verbatim, text: t, source: s}\n'
+                "---\nBody.\n"
+            ),
+            "parses_to_list": (
+                "---\n- type: topic\n- id: TOP-9306\n- links:\n"
+                "    - link: L1\n      status: active\n"
+                '      ruling: {authority: owner-verbatim, text: t, source: s}\n'
+                "---\nBody.\n"
+            ),
+        }
+        for name, text in cases.items():
+            with self.subTest(case=name):
+                with tempfile.TemporaryDirectory() as td:
+                    root = Path(td)
+                    _write_record(root / "topics" / "bad.md", text)
+                    buf_out, buf_err = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                        rc = memlint.main([str(root)])
+                    self.assertEqual(rc, 1, buf_out.getvalue())
+                    self.assertIn("ERROR:", buf_out.getvalue())
+                    self.assertNotIn("Traceback", buf_out.getvalue())
+                    self.assertNotIn("Traceback", buf_err.getvalue())
+
+    # -- Fix round 1, finding B2 (MODERATE): a quarantine-only transition
+    # (nothing added/changed/removed, only a record's own quarantine
+    # status flipping) must still recompute embedding_mode under --auto.
+
+    def test_mode_relevant_change_includes_quarantine_transitions(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            topic_path = root / "topics" / "t1.md"
+            _write_record(topic_path, _valid_topic_text("TOP-9601"))
+            db = Path(td) / "idx.sqlite"
+
+            def fake_embed(texts):
+                return [[0.1, 0.2, 0.3, 0.4] for _ in texts]
+
+            with mock.patch.object(memidx, "compute_embeddings", side_effect=fake_embed):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    reindex(root, db, no_embed=False)
+            self.assertEqual(self._mode(db), "full")
+
+            # The only record becomes quarantined; nothing else changes.
+            # Under --auto (no_embed forced True), mode must still drop.
+            _write_record(topic_path, "---\ntype: topic\nid: TOP-9601\ntitle: Bad\nlinks: [\n---\nBody.\n")
+            args = ns(root=str(root), db=str(db), project=memidx.DEFAULT_PROJECT,
+                      full=False, no_embed=True, auto=True)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                rc = memidx.cmd_reindex(args)
+            self.assertEqual(rc, 0)
+            self.assertIn("1 quarantined", buf.getvalue())
+            self.assertEqual(
+                self._mode(db), "none",
+                "quarantining the only record must drop embedding_mode to none even under --auto",
+            )
+
+            # Un-quarantine it and restore full coverage with a real
+            # (mocked) embedding pass.
+            _write_record(topic_path, _valid_topic_text("TOP-9601"))
+            with mock.patch.object(memidx, "compute_embeddings", side_effect=fake_embed):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc2 = reindex(root, db, no_embed=False)
+            self.assertEqual(rc2, 0)
+            self.assertEqual(self._mode(db), "full")
+
+    def _mode(self, db):
+        conn = sqlite3.connect(str(db))
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT value FROM db_meta WHERE key='embedding_mode'").fetchone()
+        conn.close()
+        return row["value"] if row else None
+
+    # -- Fix round 1, finding B5 (NIT): build_record's defensive ValueError
+    # guard, directly.
+
+    def test_build_record_raises_on_links_not_a_list(self):
+        with self.assertRaises(ValueError) as ctx:
+            memidx.build_record(Path("/root"), Path("/root/topics/t.md"), {"links": "not-a-list"}, "body")
+        self.assertIn("links must be a list of mappings", str(ctx.exception))
+
+    def test_build_record_raises_on_links_list_with_non_mapping_element(self):
+        with self.assertRaises(ValueError):
+            memidx.build_record(Path("/root"), Path("/root/topics/t.md"), {"links": ["not-a-mapping"]}, "body")
+
 
 if __name__ == "__main__":
     unittest.main()

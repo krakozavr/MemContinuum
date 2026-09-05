@@ -1700,6 +1700,18 @@ lists of mappings, `tags`/`code_refs`/`implemented_by`/`tested_by`/
 on a *canonical* record makes it invalid; the same violation on a note is
 recorded but never blocks it — a note has no chain shape to protect.
 
+**Canonicity is checked against the raw frontmatter text whenever no usable
+parsed dict exists** — an unterminated frontmatter block (an opening `---`
+with no closing one), frontmatter that parses to something other than a
+mapping (a top-level YAML list, say), and the lenient regex fallback below (a
+complex field like `links` is never recovered into the parsed dict at all, so
+a record canonical only via a bare `links:` key would otherwise never be
+recognized as canonical). In each of these, the raw lines are scanned for the
+same three signals — a schema `id:` prefix, a `links:` key, a schema `type:` —
+so a fully schema-conformant record undone by only one of these failures is
+still quarantined, not silently reduced to a filename-derived note with its
+real `id`/`type`/`links` thrown away.
+
 On a YAML parse error, the lenient regex fallback pulls `id`/`title`/`name`/
 `type`/`area`/`topic`/`date`/`status`/`authority`/`current`/`project`/
 `description`/`permalink` — scalar fields only — out of unindented `key: value`
@@ -1710,8 +1722,13 @@ and it stays indexed. A complex field (`links`, `tags`, `code_refs`, `edges`,
 never recovered this way — regex text can't tell "no value" from "an unclosed
 flow collection" (`links: [` is the reproduction that motivated this: recovered
 blindly, the literal string `"["` would be handed to code expecting a list of
-mappings and crash several calls deep). A canonical record whose frontmatter
-took this fallback path is invalid.
+mappings and crash several calls deep) — and gets its own diagnostic naming the
+field, EXCEPT a blank header line (`links:` with nothing after the colon) on a
+*note*, which is silently dropped instead (neither recovered nor diagnosed;
+this is what keeps a bare `metadata:` line harmless on ordinary pre-existing
+markdown). A canonical record's own blank complex-field line still gets its
+diagnostic — the carve-out is for notes only. A canonical record whose
+frontmatter took this fallback path is invalid.
 
 An invalid record is quarantined by `reindex`, not built: its previous rows (if
 any) are purged, one row is written to `index_errors` (path, project, sha256,

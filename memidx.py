@@ -157,6 +157,37 @@ def is_canonical_frontmatter(fm: dict) -> bool:
     return False
 
 
+_RAW_CANONICAL_ID_RE = re.compile(r"^id:\s*(TOP|INC|INV|CON)-")
+_RAW_CANONICAL_LINKS_RE = re.compile(r"^links:")
+_RAW_CANONICAL_TYPE_RE = re.compile(r"^type:\s*(topic|incident|investigation|concept)\b")
+
+
+def _raw_frontmatter_is_canonical(fm_text: str) -> bool:
+    """Fix round 1, finding A1 (BLOCKING): canonicity must be decided from
+    the RAW frontmatter text whenever the YAML did not yield a usable
+    dict -- an unterminated `---` block, frontmatter that parses to a
+    non-mapping (e.g. a top-level list), and the lenient YAMLError
+    fallback (whose recovered `fm` never carries `links` at all, a
+    complex field never recovered) can each hide a genuinely canonical
+    record's `id`/`type`/`links` behind a parse failure that otherwise
+    defaults to `{}`. Scans every line for the three canonical markers
+    `is_canonical_frontmatter` itself checks, applied to text instead of
+    a dict: a schema `id:` prefix, a `links:` key (block OR flow, any
+    value or none), a schema `type:`. A leading list-item marker (`- `,
+    from a frontmatter block that parsed -- or almost parsed -- as a
+    top-level list) is stripped before matching, so `- id: TOP-1` is
+    still recognized: a false positive here only ever makes MORE records
+    canonical (and therefore quarantined, not silently emptied), never
+    fewer -- the safe direction."""
+    for raw_line in fm_text.splitlines():
+        line = raw_line.strip()
+        if line.startswith("- "):
+            line = line[2:].strip()
+        if _RAW_CANONICAL_ID_RE.match(line) or _RAW_CANONICAL_LINKS_RE.match(line) or _RAW_CANONICAL_TYPE_RE.match(line):
+            return True
+    return False
+
+
 def _shape_ok_list_of_scalars(val) -> bool:
     if not val:
         return True
@@ -221,7 +252,7 @@ def parse_record(path: Path) -> ParseResult:
     one diagnostic -- a note stays valid and indexed as today, its
     diagnostics surfacing only as warnings (memlint) or nothing at all
     (reindex, beyond the one stderr line the lenient-fallback path always
-    prints, unchanged from before this task)."""
+    prints)."""
     try:
         text = path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
@@ -241,26 +272,37 @@ def parse_record(path: Path) -> ParseResult:
             end_idx = i
             break
     if end_idx is None:
-        # An opening --- with no closing --- -- always a NOTE (there is no
-        # frontmatter dict at all to carry a schema id/links/type), so this
-        # is a warning-only diagnostic, never a quarantine (design R2 rule 3).
-        body = "".join(lines[1:]).lstrip("\n")
-        return ParseResult(
-            {}, body, [("frontmatter", "unterminated frontmatter block (no closing ---)")],
-            valid=True, fallback=False,
-        )
+        # Fix round 1, finding A1 (BLOCKING): an opening --- with no
+        # closing --- has no parsed dict to check -- but the raw text can
+        # still be a fully schema-conformant record (id/type/links all
+        # present, just missing the closing delimiter). Decide canonicity
+        # from the raw text instead of assuming {} can never be canonical.
+        raw_fm_text = "".join(lines[1:])
+        body = raw_fm_text.lstrip("\n")
+        canonical = _raw_frontmatter_is_canonical(raw_fm_text)
+        if canonical:
+            msg = ("unterminated frontmatter block (no closing ---) on what appears to be a "
+                   "canonical record (id/type/links present) -- cannot be safely parsed")
+        else:
+            msg = "unterminated frontmatter block (no closing ---)"
+        return ParseResult({}, body, [("frontmatter", msg)], valid=not canonical, fallback=False)
     fm_text = "".join(lines[1:end_idx])
     body = "".join(lines[end_idx + 1:]).lstrip("\n")
     try:
         fm = yaml.safe_load(fm_text) or {}
         if not isinstance(fm, dict):
-            # Same reasoning as the unterminated-delimiter case above: a
-            # non-mapping top-level YAML document can never itself carry a
-            # schema id/links/type, so it is always a note.
-            return ParseResult(
-                {}, body, [("frontmatter", "frontmatter did not parse to a mapping")],
-                valid=True, fallback=False,
-            )
+            # Fix round 1, finding A1 (BLOCKING): same reasoning as the
+            # unterminated-delimiter case above -- a non-mapping top-level
+            # YAML document (e.g. a list of one-key mappings) has no dict
+            # `is_canonical_frontmatter` could inspect, but the raw text
+            # can still name a schema id/type/links.
+            canonical = _raw_frontmatter_is_canonical(fm_text)
+            if canonical:
+                msg = ("frontmatter did not parse to a mapping, on what appears to be a canonical "
+                       "record (id/type/links present) -- cannot be safely parsed")
+            else:
+                msg = "frontmatter did not parse to a mapping"
+            return ParseResult({}, body, [("frontmatter", msg)], valid=not canonical, fallback=False)
     except yaml.YAMLError:
         # Tolerant fallback for real-world notes with malformed frontmatter
         # (e.g. an unclosed quoted scalar): pull out simple top-level
@@ -274,6 +316,12 @@ def parse_record(path: Path) -> ParseResult:
         print(f"memidx: WARNING: {path}: malformed YAML frontmatter, using lenient fallback parse", file=sys.stderr)
         fm = {}
         diagnostics: list = []
+        # Fix round 1, finding A1 (BLOCKING): canonicity is decided from
+        # the RAW text up front -- `links` (a complex field) is NEVER
+        # recovered into `fm` under this fallback, so a record whose only
+        # canonical marker is a bare block-style `links:` key (no id/type)
+        # would otherwise never be seen as canonical at all.
+        canonical = _raw_frontmatter_is_canonical(fm_text)
         for line in fm_text.splitlines():
             m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*):\s*(.*)$", line)
             if not m or m.group(1) in fm:
@@ -282,10 +330,18 @@ def parse_record(path: Path) -> ParseResult:
             raw_val = m.group(2).strip().strip("'\"")
             if key in FALLBACK_SCALAR_FIELDS:
                 fm[key] = raw_val
-            elif key in FALLBACK_COMPLEX_FIELDS and raw_val:
-                diagnostics.append((key, "not recovered from malformed YAML"))
+            elif key in FALLBACK_COMPLEX_FIELDS:
+                # Fix round 1, finding A2 (MODERATE): the blank-value
+                # carve-out (a bare `key:` header line with nothing after
+                # the colon, e.g. the private corpus's bare `metadata:`)
+                # applies to a NOTE only -- a canonical record's own
+                # complex field, even blank, still gets its own
+                # diagnostic naming it (brief rule 4 has no such
+                # carve-out; only the note-tolerance policy does).
+                if raw_val or canonical:
+                    diagnostics.append((key, "not recovered from malformed YAML"))
         diagnostics.append(("frontmatter", "malformed YAML frontmatter, using lenient fallback parse"))
-        canonical = is_canonical_frontmatter(fm)
+        canonical = canonical or is_canonical_frontmatter(fm)
         return ParseResult(fm, body, diagnostics, valid=not canonical, fallback=True)
 
     diagnostics = validate_record_shape(fm)
@@ -295,11 +351,11 @@ def parse_record(path: Path) -> ParseResult:
 
 
 def parse_frontmatter(path: Path) -> tuple[dict, str]:
-    """Thin wrapper over parse_record, kept for callers that only need the
-    untyped (dict, str) shape (test call sites and, previously, the three
-    memlint walks -- now switched to parse_record directly). Never raises
-    on a read/shape/YAML failure, same as parse_record: a caller that
-    needs to know WHY now needs parse_record instead."""
+    """Thin wrapper over parse_record, for callers that only need the
+    untyped (dict, str) shape. Every one of the three memlint walks calls
+    parse_record directly instead, for its diagnostics/valid fields. Never
+    raises on a read/shape/YAML failure, same as parse_record: a caller
+    that needs to know WHY calls parse_record instead."""
     result = parse_record(path)
     return result.frontmatter, result.body
 
@@ -1496,8 +1552,20 @@ def cmd_reindex(args) -> int:
     # pass (nothing changed) still skips this block entirely, matching the
     # original "an internal heal never announces or forces a mode change
     # for a change that didn't happen" intent.
+    # Fix round 1, finding B2 (MODERATE): a record newly quarantined this
+    # run (`quarantined`) had its own embeddings purged by
+    # `delete_record_rows`'s default `keep_embedding=False` above -- a real
+    # change to the fresh/total ratio this block recomputes; a record
+    # newly UN-quarantined (`resolved_paths`, when it parsed clean rather
+    # than vanished) is a real change too (it is now a normal pending row,
+    # counted in `added`/`changed` already, but reindex's OWN loop 1 skip
+    # logic (`sha_unchanged`) never applies to a path that was quarantined
+    # -- it was never in `existing` -- so this is belt-and-suspenders, not
+    # dead weight). Neither transition alone moves `added`/`changed`/
+    # `removed_paths`, so a run whose ONLY effect is a quarantine
+    # transition must still be counted as mode-relevant.
     auto = getattr(args, "auto", False)
-    mode_relevant_change = bool(added or changed or removed_paths)
+    mode_relevant_change = bool(added or changed or removed_paths or quarantined or resolved_paths)
     if not auto or mode_relevant_change:
         mode_row = conn.execute("SELECT value FROM db_meta WHERE key='embedding_mode'").fetchone()
         mode_now = mode_row["value"] if mode_row else "none"

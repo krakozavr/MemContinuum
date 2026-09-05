@@ -811,6 +811,47 @@ class TestMalformedRecordDiagnostics(unittest.TestCase):
             rc = memlint.main([str(root)])
             self.assertEqual(rc, 0)
 
+    def test_a1_regressions_are_errors_naming_the_field_never_a_clean_note(self):
+        """Fix round 1, finding A1 (BLOCKING): a fully schema-conformant
+        topic (id, type, block-style links) undone by only ONE unrelated
+        parse defect must be an ERROR, never silently waved through as a
+        clean note (`memlint: clean`)."""
+        cases = {
+            "unterminated": (
+                "---\ntype: topic\nid: TOP-9304\ntitle: T\nlinks:\n"
+                '  - link: L1\n    status: active\n    ruling: {authority: owner-verbatim, text: t, source: s}\n'
+                "Body.\n"
+            ),
+            "yaml_error": (
+                "---\ntype: topic\nid: TOP-9305\ntitle: a: b\nlinks:\n"
+                '  - link: L1\n    status: active\n    ruling: {authority: owner-verbatim, text: t, source: s}\n'
+                "---\nBody.\n"
+            ),
+            "parses_to_list": (
+                "---\n- type: topic\n- id: TOP-9306\n- links:\n"
+                "    - link: L1\n      status: active\n"
+                '      ruling: {authority: owner-verbatim, text: t, source: s}\n'
+                "---\nBody.\n"
+            ),
+            "links_only_no_id_type": (
+                "---\ntitle: a: b\nlinks:\n"
+                '  - link: TOP-0001\n    status: active\n    ruling: {authority: owner-verbatim, text: something, source: s}\n'
+                "---\nBody.\n"
+            ),
+        }
+        for name, text in cases.items():
+            with self.subTest(case=name):
+                with tempfile.TemporaryDirectory() as td:
+                    root = Path(td)
+                    _write(root / "topics" / "bad.md", text)
+                    errors, _warnings = memlint.lint_root(root)
+                    self.assertTrue(errors, f"{name}: expected at least one ERROR, got none")
+                    self.assertTrue(
+                        any("frontmatter" in e or "links" in e for e in errors), errors
+                    )
+                    rc = memlint.main([str(root)])
+                    self.assertEqual(rc, 1, f"{name}: memlint must exit 1, never wave this through clean")
+
 
 if __name__ == "__main__":
     unittest.main()
