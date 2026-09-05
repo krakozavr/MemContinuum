@@ -133,9 +133,34 @@ exec bash "<this-repo>/hooks/post-commit-reindex.sh"
 
 Since it `exec`s the canonical script by absolute path rather than copying it,
 edits to `post-commit-reindex.sh` are picked up automatically without
-re-installing. A failed reindex must never block the commit — the script
+re-installing — an existing install therefore picks up this bounded-pass/
+embed-worker redesign on its very next commit, with no re-install step. A
+failed reindex must never block the commit — the script
 always exits 0 (see its own comments) and logs failures to
 `$MEMCONTINUUM_HOME/hook.log` instead.
+
+The script itself now runs its content pass (`reindex --root … --project …
+--db … --no-embed --auto`) through the same watchdog launcher the write-side
+hooks use (`hooks/mc-watchdog.sh`), under its own budget
+(`MEMCONTINUUM_POST_COMMIT_BUDGET`, default 30 seconds) — a hung or slow
+embedding backend can never delay the commit, because this pass never calls
+the embedding backend at all. Its own log line gains one more token,
+`embed=pending|clean|skipped`: `pending` means the reindex left one or more
+records without a fresh vector, in which case the script also touches
+`$MEMCONTINUUM_HOME/<project>.embed-pending` and spawns
+`memidx.py embed-worker` detached (a Python `subprocess.Popen(
+start_new_session=True)` — never bash `&`, never a `setsid` binary, which
+macOS does not ship) to backfill embeddings in the background; `clean` means
+nothing was left to embed; `skipped` means the content pass itself failed or
+was killed by the watchdog. `MEMCONTINUUM_EMBED_WORKER=0` disables the spawn
+(the marker is still touched) — set it wherever a detached background
+process must not be left running (tests, CI). The embed-worker coalesces
+repeated commits: a second worker finding the first one's `<project>.embed.lock`
+already held exits 0 immediately, and the marker is removed only after a
+pass whose content it actually reflects (a commit landing mid-pass retouches
+the marker, and the worker loops again rather than declaring victory early).
+See docs/INTERNALS.md's watchdog and embedding-lifecycle sections for the
+full contract, including the crash/retry behavior.
 
 ## 4. Write-side reminder hooks — five more Claude Code hooks in the target project
 
@@ -243,6 +268,9 @@ Notes:
   it never embeds, and never claims a fuller embedding mode than the index already had, inside a
   hook's own time budget), so the decision index's own SQLite cache is written too. `git diff`/`git status` in either root staying empty across
   every hook invocation is a permanent regression test (`tests/test_write_hooks.py`).
+  `post-commit-reindex.sh` (section 3 above, not one of these five) additionally writes
+  `$MEMCONTINUUM_HOME/<project>.embed-pending`, `<project>.embed.lock` and `<project>.embed.log`
+  when its content pass leaves rows without a fresh vector.
 
 
 > Invocation note: every example above runs a hook as `bash <path>` rather than

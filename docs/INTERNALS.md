@@ -43,7 +43,7 @@ wired one level up, into `~/.claude/settings.json`, by `memcontinuum-setup.sh`.
 | `sessionstart-remind.sh` | `SessionStart` | on `startup`/`resume`/`clear`, initializes session state only (captures the code/store roots' git HEAD, prunes state older than 24h; `clear` resets the session's counters and pending nudges but carries the edit ledger over, `resume` keeps everything); only on `source: compact` does it inject what `precompact-persist.sh` left pending |
 | `userprompt-remind.sh` | `UserPromptSubmit` | never reads the prompt text; fires the coverage or look-back nudge |
 | `sessionend-stamp.sh` | `SessionEnd` | stamps session end into state |
-| `post-commit-reindex.sh` | store's git `post-commit` | reindexes the store after every commit to it |
+| `post-commit-reindex.sh` | store's git `post-commit` | a bounded content-only reindex after every commit; spawns a background embed-worker when vectors are left behind |
 | `memcontinuum-detect.sh` | `SessionStart`, user level | classifies an un-initialized repo and asks once; no python, no watchdog, no logging by default |
 
 **Fail-open is the contract, not a fallback.** No hook may block an edit or a
@@ -63,7 +63,8 @@ guarded hook cannot write its own outcome line then — it may be mid-call, or m
 never have reached that code — so `mc-watchdog.sh` writes
 `outcome=watchdog-killed hook=<name>` itself before exiting. The two hooks
 outside that rule are deliberate: `post-commit-reindex.sh` writes its own
-`post-commit-reindex: rc=… elapsed=… project=… root=…` line instead, and
+`post-commit-reindex: rc=… elapsed=… project=… root=… embed=pending|clean|skipped`
+line instead, and
 `memcontinuum-detect.sh` writes nothing at all unless
 `$MEMCONTINUUM_DETECT_LOG` is set — it runs in every repo on the machine, so its
 default is silence.
@@ -79,6 +80,13 @@ plain `reindex --no-embed --auto` when the session only touched the store.
 `--auto` keeps the self-heal mode-preserving: it never embeds inside a hook's
 time budget, and never lets a no-op heal pass claim a fuller `embedding_mode`
 than the index already had (see [Decision index provenance](#decision-index-provenance-and-embedding-lifecycle)).
+`post-commit-reindex.sh` (the store's git `post-commit`, not one of the
+five write-side hooks above) writes the decision index directly (that is its
+whole job) plus, when its content pass leaves rows without a fresh vector,
+`$MEMCONTINUUM_HOME/<project>.embed-pending` (a marker), `<project>.embed.lock`
+(an `fcntl.flock` target for the embed-worker it spawns) and
+`<project>.embed.log` (the worker's own stdout/stderr, never the shared
+`hook.log`).
 `memidx.py` itself may also write `$MEMCONTINUUM_HOME/memidx-debug.log` — a
 timestamped traceback appended whenever a command degrades on an internal
 error, only when that directory already exists (it is never what creates
@@ -255,8 +263,11 @@ room than a help line.
 - **The install-time `reindex` passes `--no-embed`.** A freshly seeded store
   holds only stub content, and a real embed here would make a first install
   depend on network access (or a warm fastembed cache) it otherwise does not
-  need. The store's own `post-commit` runs a full reindex on the first real
-  commit of content.
+  need. The store's own `post-commit` runs its own bounded, content-only pass
+  (`--no-embed --auto`, under the watchdog) on every commit -- including the
+  first real one -- and the first EMBED is the background embed-worker's,
+  spawned whenever that content pass leaves rows without a fresh vector (see
+  [Decision index provenance](#decision-index-provenance-and-embedding-lifecycle)).
 
 ## Decision registry keying
 
@@ -820,8 +831,11 @@ Python launcher that kills the whole child process group once a budget expires �
 
 Guarded: the five write-side hooks, plus `newfile-nudge.sh` (which has no
 write-side state of its own but shares the same guard rather than growing a
-second bespoke timeout story for the one hook that happens to be fast) and
-`pre-edit-chain.sh`. Unguarded: `post-commit-reindex.sh`,
+second bespoke timeout story for the one hook that happens to be fast),
+`pre-edit-chain.sh`, and `post-commit-reindex.sh` (its own budget,
+`MEMCONTINUUM_POST_COMMIT_BUDGET`, default 30 seconds -- generous on purpose:
+its guarded content pass is measured well under a second; the budget is a
+backstop against a hung/slow filesystem, not a tuned ceiling). Unguarded:
 `memcontinuum-detect.sh`.
 
 `pre-edit-chain.sh`'s own inner budget is confirmed against a real
@@ -1759,8 +1773,40 @@ nothing is embedded, and — per the paragraph above — the run never claims a
 fuller `embedding_mode` than the coverage it actually produced. It is what
 `unmapped`'s self-heal (`reindex --no-embed --auto`, on state `stale` only —
 never on `upgrade-required`, which is the rollout's job, not an ad-hoc
-hook-triggered one) and `precompact-persist.sh` use to keep a hook-triggered
-repair honest about what it did and did not refresh.
+hook-triggered one), `precompact-persist.sh`, and the store's own
+`post-commit-reindex.sh` (its bounded content pass, on every commit) use to
+keep a hook-triggered repair honest about what it did and did not refresh.
+Every reindex pass -- `--auto` or not -- also now prints, at the end of its
+summary line, `N record(s) awaiting embedding`: rows whose vector is missing,
+stale (`embed_sha` mismatch), or from a different model fingerprint,
+computed after the writes. `post-commit-reindex.sh` parses this off the end
+of the line to decide `embed=pending|clean` (see the embed-worker section
+below); it is `0` on a fully-embedded store, never omitted.
+
+**The background embed-worker** (`memidx.py embed-worker`): when the
+post-commit hook's content pass leaves `N > 0`, it touches
+`$MEMCONTINUUM_HOME/<project>.embed-pending` and spawns
+`embed-worker --root … --project … --db …` detached
+(`subprocess.Popen(start_new_session=True)` from Python -- never bash `&`,
+never a `setsid` binary, which macOS does not ship; stdio redirected to
+`<project>.embed.log`, never the shared `hook.log`). `embed-worker` takes a
+non-blocking `fcntl.flock` on `<project>.embed.lock` first -- a second
+worker finding it already held exits 0 immediately, so two quick commits
+never run two overlapping embedding passes. It then loops: while the marker
+exists, note its mtime, run the embedding backfill in-process (`cmd_reindex`
+with embedding enabled), and on success remove the marker ONLY if its mtime
+is still what was noted before the pass -- a commit landing mid-pass
+retouches the marker, and the loop runs again rather than declaring victory
+over content it never saw. On any exception from the backfill (a locked db,
+a genuine bug), the marker is left in place, the traceback is appended to
+`<project>.embed.log`, and the process exits 3 -- a crash is therefore
+always retriable: the next commit, or a manual `embed-worker` run, picks the
+marker back up. `check --json` and `stats --json` both report
+`embedding_backlog: {pending_marker, worker_lock_held,
+rows_without_fresh_vector}` (fail-open; the row count uses the same
+static-fingerprint SQL comparison `vector_index_state` does, never loading
+the model) -- `vector_index_state` itself keeps its four-value enum
+unchanged; "pending" is not one of its values.
 
 **Project isolation, on the decision db.** The default per-project filename does
 the work in the normal case. Beyond that, the guarantee is a *refusal*, not a

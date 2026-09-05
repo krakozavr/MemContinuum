@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import fcntl
 import fnmatch
 import hashlib
 import io
@@ -1772,6 +1773,13 @@ def cmd_reindex(args) -> int:
                 "index integrity not guaranteed",
                 file=sys.stderr,
             )
+            # LOW-3 (task-5-review.md): a genuine programmer bug hitting
+            # this arm previously lost its traceback -- logged here (never
+            # re-raised: this is a transactional failure arm, not one of
+            # the internal-error-typed catches rule 2's re-raise contract
+            # covers, and re-raising would leave this record's SAVEPOINT
+            # rolled back but the loop over the rest of `pending` unrun).
+            _debug_log(exc, "reindex")
             continue
         conn.execute("RELEASE SAVEPOINT record")
         if is_new:
@@ -1835,35 +1843,43 @@ def cmd_reindex(args) -> int:
     # transition must still be counted as mode-relevant.
     auto = getattr(args, "auto", False)
     mode_relevant_change = bool(added or changed or removed_paths or quarantined or resolved_paths)
+    # Design R8 (audit MC-P2-02, TOP-0123 L7): `total`/`fresh` (and the
+    # `awaiting_embedding` count derived from them) are now computed
+    # UNCONDITIONALLY -- moved out of the `mode_relevant_change` gate below
+    # (which only ever guarded the embedding_mode WRITE) -- because the
+    # post-commit hook's own `--no-embed --auto` pass is very often a
+    # genuine no-op (nothing added/changed/removed) and still needs this
+    # run's own honest count of records lacking a fresh vector to decide
+    # `embed=pending|clean`. A row counts as fresh only when its sha AND
+    # its fingerprint match -- an old-model vector must not read as
+    # coverage. `model` was loaded above whenever this run had embedding
+    # enabled (real revision known); a --no-embed/--auto pass (or a run
+    # whose model load itself failed) has no loaded model, so the STATIC
+    # fingerprint's prefix (compared in SQL, not via fingerprints_match in
+    # Python -- avoids fetching every row) is all that can be checked
+    # without touching fastembed.
+    total = conn.execute(
+        "SELECT COUNT(*) AS n FROM records WHERE project=?", (args.project,)
+    ).fetchone()["n"]
+    if model is not None:
+        fresh = conn.execute(
+            "SELECT COUNT(*) AS n FROM records r JOIN embeddings e "
+            "ON e.path=r.path AND e.embed_sha=r.sha256 "
+            "WHERE r.project=? AND e.embed_fp=?",
+            (args.project, current_fp),
+        ).fetchone()["n"]
+    else:
+        static_prefix = _fingerprint_static_prefix(embedding_fingerprint(model=None))
+        fresh = conn.execute(
+            "SELECT COUNT(*) AS n FROM records r JOIN embeddings e "
+            "ON e.path=r.path AND e.embed_sha=r.sha256 "
+            "WHERE r.project=? AND e.embed_fp IS NOT NULL AND substr(e.embed_fp,1,?)=?",
+            (args.project, len(static_prefix), static_prefix),
+        ).fetchone()["n"]
+    awaiting_embedding = max(total - fresh, 0)
     if not auto or mode_relevant_change:
         mode_row = conn.execute("SELECT value FROM db_meta WHERE key='embedding_mode'").fetchone()
         mode_now = mode_row["value"] if mode_row else "none"
-        total = conn.execute(
-            "SELECT COUNT(*) AS n FROM records WHERE project=?", (args.project,)
-        ).fetchone()["n"]
-        # Design R4 (audit MC-P1-06): a row counts as fresh only when its
-        # sha AND its fingerprint match -- an old-model vector must not
-        # read as coverage. `model` was loaded above whenever this run had
-        # embedding enabled (real revision known); a --no-embed/--auto
-        # pass (or a run whose model load itself failed) has no loaded
-        # model, so the STATIC fingerprint's prefix (documented: compared
-        # in SQL, not via fingerprints_match in Python -- avoids fetching
-        # every row) is all that can be checked without touching fastembed.
-        if model is not None:
-            fresh = conn.execute(
-                "SELECT COUNT(*) AS n FROM records r JOIN embeddings e "
-                "ON e.path=r.path AND e.embed_sha=r.sha256 "
-                "WHERE r.project=? AND e.embed_fp=?",
-                (args.project, current_fp),
-            ).fetchone()["n"]
-        else:
-            static_prefix = _fingerprint_static_prefix(embedding_fingerprint(model=None))
-            fresh = conn.execute(
-                "SELECT COUNT(*) AS n FROM records r JOIN embeddings e "
-                "ON e.path=r.path AND e.embed_sha=r.sha256 "
-                "WHERE r.project=? AND e.embed_fp IS NOT NULL AND substr(e.embed_fp,1,?)=?",
-                (args.project, len(static_prefix), static_prefix),
-            ).fetchone()["n"]
         if total == 0 or fresh == 0:
             mode = "none"
         elif fresh == total:
@@ -1913,8 +1929,174 @@ def cmd_reindex(args) -> int:
         # this task.
         summary += f", {integrity_failures} integrity failure(s)"
     summary += f", {elapsed:.3f}s"
+    # Design R8 (audit MC-P2-02, TOP-0123 L7): always the LAST token --
+    # the post-commit hook parses it off the end of this line without
+    # `[[ =~ ]]` (bash 3.2 safe). Printed unconditionally, including
+    # "0 record(s) awaiting embedding" -- both the hook and tests parse
+    # the number either way.
+    summary += f", {awaiting_embedding} record(s) awaiting embedding"
     print(summary)
     return 5 if integrity_failures else 0
+
+
+def _embed_marker_path(home: Path, project: str) -> Path:
+    return home / f"{project}.embed-pending"
+
+
+def _embed_lock_path(home: Path, project: str) -> Path:
+    return home / f"{project}.embed.lock"
+
+
+def _embed_log_path(home: Path, project: str) -> Path:
+    return home / f"{project}.embed.log"
+
+
+def cmd_embed_worker(args) -> int:
+    """Design R8 (audit MC-P2-02, TOP-0123 L7): backfills embeddings for a
+    store in the background; coalesces commits; safe to run twice. Spawned
+    detached (subprocess.Popen, a new session) by `hooks/post-commit-
+    reindex.sh` whenever its own bounded content pass leaves records
+    without a fresh vector; never blocks a commit -- this command runs
+    entirely on its own, off the git hook's own clock.
+
+    Lock: `fcntl.flock(LOCK_EX | LOCK_NB)` on `<project>.embed.lock` --
+    `BlockingIOError` means another worker already owns the marker; this
+    process exits 0 immediately (never blocks, never errors).
+
+    Loop: while the marker exists, note its `mtime_ns`, then run the
+    embedding backfill in-process (`cmd_reindex` with embedding enabled --
+    `no_embed=False, auto=False, full=False`, the same shape a real
+    `reindex` call without `--no-embed`/`--auto` builds). On success:
+    if the marker's mtime_ns is STILL what was noted before the pass, this
+    pass's own content is exactly what the marker was raised for -- unlink
+    it and stop. If it changed (a commit landed mid-pass and retouched
+    it), loop again -- no sleep needed, the next pass picks up whatever is
+    now stale. On ANY exception from the backfill: leave the marker (so a
+    later commit or a manual worker run retries it), log the exception's
+    traceback to `<project>.embed.log` (never stdout -- this process has
+    no terminal, its whole point is running off the clock), and exit 3.
+    """
+    home = Path(os.environ.get("MEMCONTINUUM_HOME", str(Path.home() / ".memcontinuum")))
+    lock_path = _embed_lock_path(home, args.project)
+    marker_path = _embed_marker_path(home, args.project)
+    log_path = _embed_log_path(home, args.project)
+
+    lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        # Another worker already owns the marker -- nothing to do here.
+        os.close(lock_fd)
+        return 0
+    try:
+        while marker_path.exists():
+            try:
+                m0 = marker_path.stat().st_mtime_ns
+            except OSError:
+                # Vanished between exists() and stat() -- another process
+                # (a worker run by hand, concurrently) already cleared it.
+                break
+            reindex_ns = argparse.Namespace(
+                root=args.root, project=args.project, db=args.db,
+                full=False, no_embed=False, auto=False,
+            )
+            try:
+                cmd_reindex(reindex_ns)
+            except Exception as exc:
+                try:
+                    home.mkdir(parents=True, exist_ok=True)
+                    ts = datetime.now(timezone.utc).isoformat()
+                    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+                    with log_path.open("a", encoding="utf-8") as fh:
+                        fh.write(f"--- {ts} embed-worker ---\n{tb}\n")
+                except Exception:
+                    pass
+                return 3
+            try:
+                still = marker_path.stat().st_mtime_ns
+            except OSError:
+                still = None
+            if still == m0:
+                try:
+                    marker_path.unlink()
+                except OSError:
+                    pass
+                break
+            # else: retouched mid-pass (a commit landed while this one
+            # ran) -- loop again, no sleep needed.
+        return 0
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(lock_fd)
+
+
+def embedding_backlog(db_path: Path, project: str, home: Path) -> dict:
+    """Design R8 (audit MC-P2-02, TOP-0123 L7): `{"pending_marker": bool,
+    "worker_lock_held": bool, "rows_without_fresh_vector": int | None}` --
+    read by `check --json` and `stats --json`, both fail-open.
+
+    Deliberately read-only end to end (a deviation from the literal "try a
+    non-blocking flock on the lock file and release it": this never
+    `O_CREAT`s the lock file -- it only probes it when it ALREADY exists).
+    Both `check` and `stats` are called constantly by tests and real users
+    that never set MEMCONTINUUM_HOME, defaulting to the real
+    ~/.memcontinuum -- a probe that creates a lock file as a side effect
+    of merely REPORTING would write into that real directory on every
+    such call. `open_db_noncreating` already never creates a db file;
+    `marker_path.exists()` is a bare stat. The net effect is identical for
+    every real caller: a project that has never had a worker run for it
+    correctly reports `worker_lock_held: False` either way.
+    """
+    marker_path = _embed_marker_path(home, project)
+    lock_path = _embed_lock_path(home, project)
+
+    pending_marker = marker_path.exists()
+
+    worker_lock_held = False
+    if lock_path.exists():
+        try:
+            fd = os.open(str(lock_path), os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                worker_lock_held = False
+            except BlockingIOError:
+                worker_lock_held = True
+            finally:
+                os.close(fd)
+        except OSError:
+            worker_lock_held = False
+
+    rows_without_fresh_vector = None
+    try:
+        conn = open_db_noncreating(db_path, project=project)
+        if conn is not None:
+            try:
+                total = conn.execute(
+                    "SELECT COUNT(*) AS n FROM records WHERE project=?", (project,)
+                ).fetchone()["n"]
+                static_current = embedding_fingerprint(model=None)
+                static_prefix = _fingerprint_static_prefix(static_current)
+                fresh = conn.execute(
+                    "SELECT COUNT(*) AS n FROM records r JOIN embeddings e "
+                    "ON e.path=r.path AND e.embed_sha=r.sha256 "
+                    "WHERE r.project=? AND e.embed_fp IS NOT NULL AND substr(e.embed_fp,1,?)=?",
+                    (project, len(static_prefix), static_prefix),
+                ).fetchone()["n"]
+                rows_without_fresh_vector = max(total - fresh, 0)
+            finally:
+                conn.close()
+    except Exception:
+        rows_without_fresh_vector = None
+
+    return {
+        "pending_marker": pending_marker,
+        "worker_lock_held": worker_lock_held,
+        "rows_without_fresh_vector": rows_without_fresh_vector,
+    }
 
 
 def load_embedding_model():
@@ -3986,6 +4168,11 @@ def cmd_check(args) -> int:
         "WHERE e.project=?", (args.project,)
     ).fetchone()["n"]
     report["vector_index_state"] = _decision_vector_index_state(conn, args.project)
+    # Design R8 (audit MC-P2-02, TOP-0123 L7): fail-open, same helper
+    # `stats --json` uses; `vector_index_state` above keeps R4's own enum
+    # unchanged -- "pending" is not one of its values.
+    home = Path(os.environ.get("MEMCONTINUUM_HOME", str(Path.home() / ".memcontinuum")))
+    report["embedding_backlog"] = embedding_backlog(db_path, args.project, home)
     if args.json:
         print(json.dumps(report, indent=2))
     else:
@@ -4885,6 +5072,13 @@ def cmd_code_reindex(args) -> int:
                 f"({type(ie.cause).__name__}: {ie.cause}); index integrity not guaranteed",
                 file=sys.stderr,
             )
+            # LOW-3 (task-5-review.md): same rationale as cmd_reindex's
+            # loop-2 arm above -- logged, never re-raised (this is a
+            # transactional failure arm, not a rule-2 internal-error-typed
+            # catch; re-raising would abandon the remaining files in
+            # `files` rather than finishing them per the caller's own
+            # per-file contract).
+            _debug_log(ie.cause, "code-reindex")
             return False
         conn.execute("RELEASE SAVEPOINT file")
         return True
@@ -6836,6 +7030,19 @@ def _stats_report(
     nf_lang_not_wired = nf.get("language-available-not-wired", 0)
     nf_never = nf.get("never-extension", 0)
 
+    # LOW-2 (task-5-review.md): outcomes["precompact"] was already counted
+    # by the scan loop but never surfaced here -- precompact-persist.sh's
+    # index-error/index-quarantined/index-degraded tokens (and its own
+    # `computed` finish() outcome) were written to hook.log and silently
+    # never reported.
+    pc = outcomes["precompact"]
+    pc_computed = pc.get("computed", 0)
+    pc_index_uninitialized = pc.get("index-uninitialized", 0)
+    pc_index_upgrade_required = pc.get("index-upgrade-required", 0)
+    pc_index_error = pc.get("index-error", 0)
+    pc_index_quarantined = pc.get("index-quarantined", 0)
+    pc_index_degraded = pc.get("index-degraded", 0)
+
     flags = []
     if args.project != UNKNOWN_STATS_PROJECT:
         if nudges_total >= 3 and ledger_store == 0:
@@ -6897,6 +7104,15 @@ def _stats_report(
             "language_available_not_wired": nf_lang_not_wired,
             "never_extension": nf_never,
             "outcomes": dict(nf),
+        },
+        "precompact": {
+            "computed": pc_computed,
+            "index_uninitialized": pc_index_uninitialized,
+            "index_upgrade_required": pc_index_upgrade_required,
+            "index_error": pc_index_error,
+            "index_quarantined": pc_index_quarantined,
+            "index_degraded": pc_index_degraded,
+            "outcomes": dict(pc),
         },
         "store_commits": store_commits,
         "unknown_lines": unknown_lines,
@@ -6974,6 +7190,12 @@ def cmd_stats(args) -> int:
             args, buckets, unknown_lines, projects_seen, now, cutoff, store_commits,
             unparseable_lines, untimestamped_lines,
         )
+        # Design R8 (audit MC-P2-02, TOP-0123 L7): fail-open, same helper
+        # `check --json` uses; stats has no `--db` flag, so the db path is
+        # the same default `resolve_db_path` would build (home/<project>.sqlite).
+        result["embedding_backlog"] = embedding_backlog(
+            db_path=home / f"{args.project}.sqlite", project=args.project, home=home,
+        )
 
         if args.json:
             print(json.dumps(result, indent=2))
@@ -7008,6 +7230,15 @@ def cmd_stats(args) -> int:
               f"not-indexed-extension={nf['not_indexed_extension']} "
               f"language-available-not-wired={nf['language_available_not_wired']} "
               f"never-extension={nf['never_extension']}")
+        pc = result["precompact"]
+        print(f"precompact: computed={pc['computed']} index-error={pc['index_error']} "
+              f"index-quarantined={pc['index_quarantined']} index-degraded={pc['index_degraded']} "
+              f"index-uninitialized={pc['index_uninitialized']} "
+              f"index-upgrade-required={pc['index_upgrade_required']}")
+        eb = result["embedding_backlog"]
+        rows_txt = "unknown (db unreadable)" if eb["rows_without_fresh_vector"] is None else eb["rows_without_fresh_vector"]
+        print(f"embedding backlog: pending-marker={eb['pending_marker']} "
+              f"worker-lock-held={eb['worker_lock_held']} rows-without-fresh-vector={rows_txt}")
         print()
         if result["store_commits"] is None:
             print("store commits (all projects, corroboration only) in window: not measured (pass --store to measure)")
@@ -7100,6 +7331,13 @@ def main(argv=None) -> int:
              "'full' never keeps standing over a vector this same pass just made stale",
     )
     p_reindex.set_defaults(func=cmd_reindex)
+
+    p_embed_worker = sub.add_parser(
+        "embed-worker",
+        help="backfill embeddings for a store in the background; coalesces commits; safe to run twice",
+    )
+    add_common_args(p_embed_worker, need_root=True)
+    p_embed_worker.set_defaults(func=cmd_embed_worker)
 
     p_search = sub.add_parser("search")
     add_common_args(p_search, optional_root=True)

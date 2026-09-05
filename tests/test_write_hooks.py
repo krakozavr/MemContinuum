@@ -1099,6 +1099,24 @@ class TestPrecompactPersist(HookTestBase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("outcome=index-error", (self.home / "hook.log").read_text())
 
+    def test_degraded_logs_index_degraded(self):
+        """LOW-1 (task-5-review.md): symmetric with
+        TestUserPromptRemind.test_degraded_logs_index_degraded -- same
+        corrupt-blob-db technique, this hook's own `DEGRADED_REASON=...`
+        block (hooks/precompact-persist.sh) logs the same distinct
+        outcome, additive to (never instead of) the existing `computed`
+        line. Behaviorally already correct (confirmed independently by
+        the Task 5 review's own probe against the real hook subprocess);
+        this closes the coverage gap the review noted -- no hook script
+        change needed."""
+        db = self.home / f"{self.project}.sqlite"
+        db.write_bytes(b"not a sqlite file at all")
+        session_id = "s-precompact-degraded"
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+        proc, elapsed = run_script(PRECOMPACT_HOOK, self.pre_compact_payload(session_id), self.base_env(), timeout=10.0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("outcome=index-degraded reason=internal-error", (self.home / "hook.log").read_text())
+
     def test_exits_zero_with_absolutely_empty_stdout(self):
         session_id = "s-precompact-empty"
         self.seed_ledger(
@@ -4285,10 +4303,11 @@ class TestNewFileNudgeHook(unittest.TestCase):
 
 
 class TestF2AutoCallers(unittest.TestCase):
-    """F2 (coordinator ruling 69): the exactly-two --auto callers --
-    unmapped's in-process self-heal and precompact-persist.sh's direct
-    reindex call -- and repo-init.sh's install-time reindex staying an
-    explicit --no-embed initializer without --auto."""
+    """F2 (coordinator ruling 69): the --auto callers -- unmapped's
+    in-process self-heal, precompact-persist.sh's direct reindex call, and
+    (design R8, audit MC-P2-02, TOP-0123 L7) post-commit-reindex.sh's own
+    bounded content pass, now three -- and repo-init.sh's install-time
+    reindex staying an explicit --no-embed initializer without --auto."""
 
     def test_unmapped_self_heal_passes_auto(self):
         src = inspect.getsource(memidx.cmd_unmapped)

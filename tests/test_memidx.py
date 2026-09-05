@@ -1,8 +1,10 @@
 import contextlib
+import fcntl
 import io
 import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -3812,6 +3814,195 @@ class TestTypedDegradation(unittest.TestCase):
         self.assertIs(err.cause, cause)
         self.assertIn("src/x.py", str(err))
         self.assertIn("OperationalError", str(err))
+
+
+class TestEmbedWorker(unittest.TestCase):
+    """Design R8 (audit MC-P2-02, TOP-0123 L7): the coalescing background
+    embed-worker -- `cmd_embed_worker`, the marker/lock file contract, and
+    `embedding_backlog`. Every test sets a temp MEMCONTINUUM_HOME via
+    mock.patch.dict(os.environ, ...) (never touches the real one) and
+    never leaves a worker holding its lock (tearDown asserts the lock is
+    free)."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp(prefix="memcontinuum-embedworker-")
+        self.addCleanup(shutil.rmtree, self.td, ignore_errors=True)
+        self.home = Path(self.td) / "home"
+        self.home.mkdir()
+        self.project = "ew-test"
+
+    def tearDown(self):
+        lock_path = self.home / f"{self.project}.embed.lock"
+        if lock_path.exists():
+            fd = os.open(str(lock_path), os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except BlockingIOError:
+                self.fail(f"{lock_path} is still held after the test")
+            finally:
+                os.close(fd)
+
+    def _topic(self, text="the widget cache invalidates on write"):
+        root = Path(self.td) / "root"
+        (root / "topics").mkdir(parents=True, exist_ok=True)
+        p = root / "topics" / "t.md"
+        p.write_text(f"---\nid: T-1\ntitle: T\nstatus: active\n---\n{text}\n")
+        return root.resolve()
+
+    def _db(self):
+        return Path(self.td) / f"{self.project}.sqlite"
+
+    def _marker(self):
+        return self.home / f"{self.project}.embed-pending"
+
+    def _log(self):
+        return self.home / f"{self.project}.embed.log"
+
+    def _args(self, root, db):
+        return SimpleNamespace(root=str(root), project=self.project, db=str(db))
+
+    @staticmethod
+    def _fake_embed(texts, model=None):
+        return [[0.01] * memidx.EMBED_DIM for _ in texts]
+
+    def _mode(self, db):
+        conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
+        r = conn.execute("SELECT value FROM db_meta WHERE key='embedding_mode'").fetchone()
+        conn.close()
+        return r["value"] if r else "none"
+
+    # -- 3: worker embeds everything and clears the marker ------------------
+
+    def test_worker_embeds_everything_and_clears_marker(self):
+        root = self._topic()
+        db = self._db()
+        reindex(root, db, project=self.project, no_embed=True)  # content only, no vector yet
+        marker = self._marker()
+        marker.touch()
+        with mock.patch.dict(os.environ, {"MEMCONTINUUM_HOME": str(self.home)}), \
+             mock.patch.object(memidx, "compute_embeddings", side_effect=self._fake_embed):
+            rc = memidx.cmd_embed_worker(self._args(root, db))
+        self.assertEqual(rc, 0)
+        self.assertFalse(marker.exists(), "a clean pass must remove the marker")
+        conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT vector FROM embeddings WHERE path=?", (str(root / "topics" / "t.md"),)).fetchone()
+        conn.close()
+        self.assertIsNotNone(row, "every record must be embedded")
+        self.assertEqual(self._mode(db), "full")
+
+    # -- 3: two commits during one pass coalesce into one job ---------------
+
+    def test_worker_coalesces_a_marker_retouched_mid_pass(self):
+        root = self._topic()
+        db = self._db()
+        reindex(root, db, project=self.project, no_embed=True)
+        marker = self._marker()
+        marker.touch()
+
+        calls = []
+
+        def fake_backfill(args):
+            calls.append(args)
+            if len(calls) == 1:
+                # Simulate a second commit landing WHILE this pass runs:
+                # retouch the marker mid-way (a later mtime_ns than the
+                # worker captured before this call).
+                time.sleep(0.01)
+                marker.touch()
+            return 0
+
+        with mock.patch.dict(os.environ, {"MEMCONTINUUM_HOME": str(self.home)}), \
+             mock.patch.object(memidx, "cmd_reindex", side_effect=fake_backfill):
+            rc = memidx.cmd_embed_worker(self._args(root, db))
+        self.assertEqual(rc, 0)
+        self.assertFalse(marker.exists(), "the loop must run again and clear the marker on the untouched pass")
+        self.assertGreaterEqual(len(calls), 2, "a mid-pass retouch must make the loop run at least twice")
+
+    # -- 4: a crash leaves a retriable marker --------------------------------
+
+    def test_worker_crash_leaves_marker_and_logs_exception(self):
+        root = self._topic()
+        db = self._db()
+        reindex(root, db, project=self.project, no_embed=True)
+        marker = self._marker()
+        marker.touch()
+
+        with mock.patch.dict(os.environ, {"MEMCONTINUUM_HOME": str(self.home)}), \
+             mock.patch.object(memidx, "cmd_reindex", side_effect=RuntimeError("kaboom")):
+            rc = memidx.cmd_embed_worker(self._args(root, db))
+        self.assertEqual(rc, 3)
+        self.assertTrue(marker.exists(), "a crash must leave the marker for a later retry")
+        log_text = self._log().read_text()
+        self.assertIn("kaboom", log_text)
+        self.assertIn("RuntimeError", log_text)
+        self.assertIn("Traceback", log_text)
+
+        # A second, healthy run clears it.
+        with mock.patch.dict(os.environ, {"MEMCONTINUUM_HOME": str(self.home)}), \
+             mock.patch.object(memidx, "compute_embeddings", side_effect=self._fake_embed):
+            rc2 = memidx.cmd_embed_worker(self._args(root, db))
+        self.assertEqual(rc2, 0)
+        self.assertFalse(marker.exists(), "a subsequent healthy run must clear the retriable marker")
+
+    # -- 5: a second worker exits 0 immediately while the first holds the lock
+
+    def test_second_worker_exits_0_while_first_holds_lock(self):
+        root = self._topic()
+        db = self._db()
+        reindex(root, db, project=self.project, no_embed=True)
+        marker = self._marker()
+        marker.touch()
+        lock_path = self.home / f"{self.project}.embed.lock"
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            with mock.patch.dict(os.environ, {"MEMCONTINUUM_HOME": str(self.home)}), \
+                 mock.patch.object(memidx, "compute_embeddings", side_effect=self._fake_embed):
+                rc = memidx.cmd_embed_worker(self._args(root, db))
+            self.assertEqual(rc, 0, "the second worker must exit 0 immediately, not block or error")
+            self.assertTrue(marker.exists(), "the SECOND worker (locked out) must not touch the marker's state")
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+        # Now that the first "worker" released, drain the marker for real
+        # so tearDown's lock-free assertion has nothing outstanding.
+        with mock.patch.dict(os.environ, {"MEMCONTINUUM_HOME": str(self.home)}), \
+             mock.patch.object(memidx, "compute_embeddings", side_effect=self._fake_embed):
+            memidx.cmd_embed_worker(self._args(root, db))
+
+    # -- 6: --help exits 0 and is id-free ------------------------------------
+
+    def test_embed_worker_help_exits_0_and_is_id_free(self):
+        env = dict(os.environ); env["PYTHONPATH"] = ""
+        proc = subprocess.run(
+            [sys.executable, str(TOOLS_DIR / "memidx.py"), "embed-worker", "--help"],
+            capture_output=True, text=True, env=env,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(proc.stdout.strip())
+        for token in ("TOP-0123", "MC-P2-02", "R8"):
+            self.assertNotIn(token, proc.stdout)
+
+    # -- 6: check --json reports embedding_backlog ---------------------------
+
+    def test_check_json_reports_embedding_backlog(self):
+        root = self._topic()
+        db = self._db()
+        reindex(root, db, project=self.project, no_embed=True)
+        marker = self._marker()
+        marker.touch()
+        with mock.patch.dict(os.environ, {"MEMCONTINUUM_HOME": str(self.home)}):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                memidx.cmd_check(ns(project=self.project, db=str(db), root=str(root), json=True))
+        out = json.loads(buf.getvalue())
+        self.assertIn("embedding_backlog", out)
+        backlog = out["embedding_backlog"]
+        self.assertTrue(backlog["pending_marker"])
+        self.assertEqual(backlog["rows_without_fresh_vector"], 1)
+        self.assertFalse(backlog["worker_lock_held"])
+        marker.unlink()
 
 
 if __name__ == "__main__":

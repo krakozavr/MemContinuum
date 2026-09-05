@@ -910,5 +910,67 @@ class TestF6StatsExposesPreEditWatchdogKills(StatsTestBase):
         self.assertFalse(any("timing out" in f for f in out["flags"]), out["flags"])
 
 
+class TestStatsEmbeddingBacklog(StatsTestBase):
+    """Design R8 (audit MC-P2-02, TOP-0123 L7): `stats --json` gains
+    `embedding_backlog` (fail-open, same helper `check --json` uses)."""
+
+    def test_embedding_backlog_reports_marker_and_row_count(self):
+        root = Path(self.td) / "store"
+        (root / "topics").mkdir(parents=True)
+        (root / "topics" / "t.md").write_text(
+            "---\nid: T-1\ntitle: T\nstatus: active\n---\nbody\n"
+        )
+        db = self.home / "demo.sqlite"
+        memidx.cmd_reindex(SimpleNamespace(
+            root=str(root), project="demo", db=str(db), full=False, no_embed=True,
+        ))
+        marker = self.home / "demo.embed-pending"
+        marker.touch()
+        self.write_log([f"{ts(1)} sessionstart outcome=init session=s1 source=startup project=demo"])
+        rc, out = run_stats_json(home=str(self.home), project="demo")
+        self.assertEqual(rc, 0)
+        self.assertIn("embedding_backlog", out)
+        backlog = out["embedding_backlog"]
+        self.assertTrue(backlog["pending_marker"])
+        self.assertEqual(backlog["rows_without_fresh_vector"], 1)
+        self.assertFalse(backlog["worker_lock_held"])
+
+    def test_embedding_backlog_fails_open_when_db_unreadable(self):
+        """A corrupt/unreadable db must never surface rows_without_fresh_
+        vector as 0 -- that would read as "nothing pending" -- it must be
+        `null` (None), same fail-open contract as check/stats's other
+        broad catches."""
+        db = self.home / "demo.sqlite"
+        db.write_text("not a real sqlite file")
+        self.write_log([f"{ts(1)} sessionstart outcome=init session=s1 source=startup project=demo"])
+        rc, out = run_stats_json(home=str(self.home), project="demo")
+        self.assertEqual(rc, 0)
+        self.assertIsNone(out["embedding_backlog"]["rows_without_fresh_vector"])
+
+
+class TestStatsPrecompactBucket(StatsTestBase):
+    """LOW-2 (Task 5 review): `_stats_report` scans `outcomes["precompact"]`
+    into the per-kind Counter dynamically but never surfaced it in the
+    report at all -- so `index-degraded`/`index-error`/`index-quarantined`
+    tokens written by precompact-persist.sh were counted but never
+    reported by `stats`."""
+
+    def test_precompact_outcomes_are_reported(self):
+        lines = [
+            f"{ts(1)} precompact outcome=index-degraded reason=internal-error session=s1 project=demo",
+            f"{ts(1)} precompact outcome=index-error session=s1 project=demo",
+            f"{ts(1)} precompact outcome=computed code_paths=1 store_touched=true session=s1 project=demo",
+        ]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home), project="demo")
+        self.assertEqual(rc, 0)
+        self.assertIn("precompact", out)
+        pc = out["precompact"]
+        self.assertEqual(pc["index_degraded"], 1)
+        self.assertEqual(pc["index_error"], 1)
+        self.assertEqual(pc["computed"], 1)
+        self.assertEqual(pc["outcomes"]["index-degraded"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

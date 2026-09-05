@@ -71,7 +71,7 @@ HELP_COMMANDS = [
 ] + [
     (f"memidx.py {sub} --help", [PYTHON, str(TOOLS_DIR / "memidx.py"), sub, "--help"])
     for sub in [
-        "reindex", "search", "chain", "for-path", "check", "why", "drift",
+        "reindex", "embed-worker", "search", "chain", "for-path", "check", "why", "drift",
         "unmapped", "code-reindex", "code-search", "code-census", "stats",
         "backend-preflight",
     ]

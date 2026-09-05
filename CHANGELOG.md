@@ -143,6 +143,16 @@
   edited before the `/clear` that is still unmapped to a decision stays
   visible to the coverage nudge; turn counts and injection cooldowns reset
   to a fresh baseline.
+- The store's `post-commit` hook no longer runs a full (embedding) reindex
+  synchronously inside `git commit` -- it now runs a bounded, content-only
+  pass (`--no-embed --auto`, under the same watchdog every write-side hook
+  uses) so a hung or slow embedding backend can never delay a commit; text
+  is searchable the instant the hook returns. When records are left
+  without a fresh vector, the hook spawns a detached, coalescing background
+  worker (`memidx.py embed-worker`, safe to run twice) that backfills them;
+  `check --json` and `stats --json` both gain `embedding_backlog` so the
+  catch-up is visible. Existing installs pick this up automatically on
+  their next commit -- no re-install needed.
 
 ## [0.2.0rc1] — unreleased
 

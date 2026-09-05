@@ -2211,6 +2211,13 @@ class TestAdoptClassification(unittest.TestCase):
                 if k.startswith("MEMCONTINUUM_"):
                     del commit_env[k]
             commit_env["HOME"] = home
+            # Design R8 (audit MC-P2-02, TOP-0123 L7): this real commit's
+            # content pass leaves the new topic's vector missing (E>0), so
+            # the post-commit hook would otherwise spawn a REAL detached
+            # embed-worker (a real python, real fastembed) that would
+            # outlive this test. Disabled -- this test's own subject (the
+            # content pass recreating the index db) is unaffected.
+            commit_env["MEMCONTINUUM_EMBED_WORKER"] = "0"
             (Path(worktree) / "topics" / "T-0002.md").write_text(
                 "---\ntype: topic\nid: T-0002\ntitle: wt\narea: test\n---\nBody\n"
             )
@@ -2226,6 +2233,10 @@ class TestAdoptClassification(unittest.TestCase):
             self.assertTrue(
                 index_db.is_file(),
                 "a commit made in the linked worktree must run the post-commit reindex wrapper",
+            )
+            self.assertFalse(
+                (Path(home) / ".memcontinuum" / "p.embed.lock").exists(),
+                "MEMCONTINUUM_EMBED_WORKER=0 must leave no worker/lock behind",
             )
         finally:
             shutil.rmtree(home, ignore_errors=True)

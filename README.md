@@ -154,7 +154,11 @@ wrong. Pick its one home.
   Python's own `sqlite3` module provides — nothing to install separately.
 - ~100 MB of disk for the embedding model, downloaded once the first time
   something actually needs to embed. `--no-embed` and `--mode fts` never trigger
-  that download. The index records which model (and dimension) made its
+  that download; neither does committing to the store -- the store's
+  `post-commit` hook runs a bounded, content-only pass and never touches the
+  embedding backend itself, so that download (and the embedding work it
+  precedes) happens in the background embed-worker it spawns, never inside
+  `git commit`. The index records which model (and dimension) made its
   vectors and never mixes vectors from a different model or dimension into a
   ranking; a changed model means a re-embed, not a silently mixed result.
 - Somewhere local for the index. It lives under `~/.memcontinuum/` by default;
@@ -331,6 +335,7 @@ memidx.py for-path <file> --project NAME                                        
 memidx.py chain <topic-id> --project NAME                                        # one question's full history
 memidx.py drift --code-root DIR --project NAME                                   # has the code grown a bypass?
 memidx.py reindex --root STORE --project NAME                                    # after editing the store by hand
+memidx.py embed-worker --root STORE --project NAME --db DB                       # run the background embed backfill by hand
 memidx.py code-reindex --code-root DIR --project NAME                            # after the code moved on
 memidx.py stats --project NAME [--days 7] [--store DIR]                          # is retrieval actually firing?
 memidx.py backend-preflight [--json]                                             # which backends import here, and do their versions match the pins?
@@ -351,8 +356,12 @@ window — every hook here fails open, so a dead hook and a healthy one that
 found nothing look identical from inside a session; `stats` is what tells them
 apart, and flags the silent side when it finds one.
 
-Two more things worth knowing: committing the store reindexes it automatically,
-so `reindex` by hand is only for edits you have not committed yet; and a
+A few more things worth knowing: committing the store refreshes its text
+index at once (the post-commit hook's own bounded, content-only pass), so
+`reindex` by hand is only for edits you have not committed yet; vectors
+follow in the background (a detached embed-worker the same hook spawns,
+coalescing repeated commits into one pass), and `stats`/`check --json` show
+the backlog (`embedding_backlog`) while it catches up. A
 project can have several code roots — `code-search` says whether a root's
 index is proven current, metadata-checked, stale, or incomplete, rather than
 returning an empty list that reads like "nothing found", and `--verify-content`
@@ -473,7 +482,9 @@ Project level, by hand:
 2. Delete `<claude-dir>/skills/memory-search/`.
 3. Delete `<store>/.git/hooks/post-commit`.
 4. Delete `~/.memcontinuum/<project>.sqlite`, and
-   `~/.memcontinuum/<project>-code.sqlite` if `code-reindex` was ever run (or
+   `~/.memcontinuum/<project>-code.sqlite` if `code-reindex` was ever run, and
+   `~/.memcontinuum/<project>.embed-pending`, `<project>.embed.lock` and
+   `<project>.embed.log` if the post-commit hook's embed-worker ever ran (or
    wherever `MEMCONTINUUM_HOME` points).
 
 Leave `<store>` itself alone. It is your decision history, not an installer

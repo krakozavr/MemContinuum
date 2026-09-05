@@ -5,6 +5,7 @@ of its logic -- because the thing under test is the script's environment
 handling (the PYTHONPATH trap, env-driven project/root resolution, fail-open
 behavior) as much as its output shape.
 """
+import fcntl
 import json
 import os
 import shutil
@@ -15,6 +16,8 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 TOOLS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(TOOLS_DIR))
@@ -868,7 +871,15 @@ class TestPostCommitReindexHook(unittest.TestCase):
             "---\nid: T-0001\ntitle: Test\nstatus: active\n---\nbody\n"
         )
 
-        env = clean_env(HOME=str(fake_home), MEMCONTINUUM_ROOT=str(store_root), MEMCONTINUUM_PROJECT="pc-test")
+        # Design R8: this store's one topic has no vector yet, so the
+        # content pass leaves E>0 and the hook would otherwise spawn a
+        # REAL background embed-worker (a real python resolved via the
+        # pointer chain, genuinely embedding) that would outlive this
+        # test. MEMCONTINUUM_EMBED_WORKER=0 disables the spawn -- the
+        # marker is still touched, the content pass (this test's actual
+        # subject) is unaffected.
+        env = clean_env(HOME=str(fake_home), MEMCONTINUUM_ROOT=str(store_root), MEMCONTINUUM_PROJECT="pc-test",
+                         MEMCONTINUUM_EMBED_WORKER="0")
         env.pop("MEMCONTINUUM_HOME", None)
         env.pop("MEMCONTINUUM_PYTHON", None)
         proc = subprocess.run(
@@ -882,6 +893,254 @@ class TestPostCommitReindexHook(unittest.TestCase):
         log_text = (custom_home / "hook.log").read_text()
         self.assertIn("rc=0", log_text, log_text)
         self.assertFalse((default_mc_home / "pc-test.sqlite").exists())
+        self.assertFalse(
+            (custom_home / "pc-test.embed.lock").exists(),
+            "no worker was ever spawned (MEMCONTINUUM_EMBED_WORKER=0) -- no lock file either",
+        )
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestPostCommitReindexEmbedWorker(unittest.TestCase):
+    """Design R8 (audit MC-P2-02, TOP-0123 L7): the redesigned hook runs a
+    bounded content-only pass (`reindex --no-embed --auto`, through the
+    shared watchdog launcher) and, only when rows are left without a fresh
+    vector, touches a marker and spawns a detached `embed-worker`. Every
+    test here sets a temp MEMCONTINUUM_HOME and MEMCONTINUUM_EMBED_WORKER=0
+    unless it is specifically testing the spawn (test_h below)."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp(prefix="memcontinuum-postcommit-embed-")
+        self.addCleanup(shutil.rmtree, self.td, ignore_errors=True)
+        self.home = Path(self.td) / "home"
+        self.home.mkdir()
+
+    def tearDown(self):
+        # No test here may leave a real embed-worker holding its lock.
+        lock_paths = list(self.home.glob("*.embed.lock")) if self.home.exists() else []
+        for lock_path in lock_paths:
+            fd = os.open(str(lock_path), os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except BlockingIOError:
+                self.fail(f"{lock_path} is still held by a worker after the test")
+            finally:
+                os.close(fd)
+
+    def _store_with_one_unembedded_topic(self, project="pc-embed"):
+        # Same minimal frontmatter shape TestPostCommitReindexHook's own
+        # test_r2_resolves_python_via_pointer_config_at_custom_home
+        # already proves reindexes cleanly (id/title/status, no type/area).
+        root = Path(self.td) / f"{project}-store"
+        (root / "topics").mkdir(parents=True)
+        (root / "topics" / "T-0001.md").write_text(
+            "---\nid: T-0001\ntitle: Widget cache\nstatus: active\n---\n"
+            "the widget cache invalidates on write\n"
+        )
+        return root
+
+    def _wrapper_python(self, name, body):
+        """A bash impersonation of MEMCONTINUUM_PYTHON (same
+        marker-based dispatch idiom as TestPreEditChainWatchdog's own
+        _hang_python above, extended to intercept BOTH `-c` shapes this
+        hook now uses -- the watchdog launcher's own `-c
+        "$MC_WATCHDOG_LAUNCHER_PY"` call AND the hook's own worker-spawn
+        `-c '...Popen(...)...'` call -- passed straight through to the
+        real venv python unmodified (both need the real interpreter to
+        run); only a script-path invocation ("$PY" "$MEMIDX" <subcommand>
+        ...) is intercepted, running a real-python `-c` snippet that
+        monkeypatches memidx.compute_embeddings with `body` before handing
+        off to memidx.main(). Launching the embed-worker with THIS SAME
+        $PY (not sys.executable -- see the hook's own comment) is what
+        lets the spawned worker subprocess hit this same interception."""
+        wrapper = Path(self.td) / name
+        wrapper.write_text(
+            "#!/usr/bin/env bash\n"
+            f'REAL_PY="{VENV_PYTHON}"\n'
+            'if [ "$1" = "-c" ]; then\n'
+            '    exec "$REAL_PY" "$@"\n'
+            'fi\n'
+            'shift\n'
+            f'exec "$REAL_PY" -c \'\n'
+            'import sys\n'
+            # Double-quoted, not repr() -- the whole snippet is itself
+            # wrapped in a bash SINGLE-quoted `-c '...'` string below, so a
+            # literal single quote here (what !r would produce) would
+            # break out of that bash quoting early.
+            f'sys.path.insert(0, "{TOOLS_DIR}")\n'
+            'import memidx\n'
+            f'{body}\n'
+            'sys.exit(memidx.main(sys.argv[1:]))\n'
+            "' \"$@\"\n"
+        )
+        wrapper.chmod(0o755)
+        return wrapper
+
+    def _hang_stub(self):
+        return self._wrapper_python(
+            "embed-stub-hang",
+            "def _hang(texts, model=None):\n"
+            "    import time\n"
+            "    time.sleep(60)\n"
+            "    return []\n"
+            "memidx.compute_embeddings = _hang\n",
+        )
+
+    def _fast_stub(self):
+        return self._wrapper_python(
+            "embed-stub-fast",
+            "def _fake(texts, model=None):\n"
+            "    return [[0.01] * memidx.EMBED_DIM for _ in texts]\n"
+            "memidx.compute_embeddings = _fake\n",
+        )
+
+    def _run(self, env, timeout=15.0):
+        return subprocess.run(
+            [MC_BASH, str(POST_COMMIT_HOOK)], capture_output=True, text=True, env=env, timeout=timeout,
+        )
+
+    # -- 1: a hung embedding backend never delays the hook -----------------
+
+    def test_hung_embedding_backend_does_not_delay_the_hook(self):
+        """Red today: the unmodified hook runs a FULL (embedding) reindex
+        synchronously, so a hung `compute_embeddings` blocks the whole
+        `git commit`. After the fix, the content pass is `--no-embed
+        --auto` and never calls the embedding backend at all -- a hung
+        backend (real or stubbed) can never delay it. The FTS index must
+        already find the committed content the moment the hook returns."""
+        root = self._store_with_one_unembedded_topic("pc-hang")
+        hang_py = self._hang_stub()
+        env = clean_env(MEMCONTINUUM_HOME=str(self.home), MEMCONTINUUM_PYTHON=str(hang_py),
+                         MEMCONTINUUM_PROJECT="pc-hang", MEMCONTINUUM_ROOT=str(root),
+                         MEMCONTINUUM_EMBED_WORKER="0")
+        start = time.monotonic()
+        proc = self._run(env, timeout=10.0)
+        elapsed = time.monotonic() - start
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertLess(elapsed, 5.0, f"the hook took {elapsed:.1f}s -- must return within the content pass")
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("rc=0", log_text, log_text)
+        self.assertIn("embed=pending", log_text, log_text)
+
+        # The FTS index already finds the committed content (`search
+        # --mode fts` semantics -- queried directly against the `fts`
+        # table here rather than via cmd_search, which prints instead of
+        # returning).
+        conn = sqlite3.connect(str(self.home / "pc-hang.sqlite"))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT path FROM fts WHERE fts MATCH ? AND project = ?", ("widget", "pc-hang"),
+        ).fetchall()
+        conn.close()
+        self.assertTrue(rows, "FTS must already find the committed content when the hook returns")
+
+    # -- 2: marker present iff E > 0 ----------------------------------------
+
+    def test_marker_present_when_pending_absent_when_clean(self):
+        root = self._store_with_one_unembedded_topic("pc-marker")
+        env = clean_env(MEMCONTINUUM_HOME=str(self.home), MEMCONTINUUM_PYTHON=VENV_PYTHON,
+                         MEMCONTINUUM_PROJECT="pc-marker", MEMCONTINUUM_ROOT=str(root),
+                         MEMCONTINUUM_EMBED_WORKER="0")
+        proc = self._run(env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        marker = self.home / "pc-marker.embed-pending"
+        self.assertTrue(marker.is_file(), "a brand-new store has E>0 -- the marker must be touched")
+
+        # A second commit with nothing new to embed (still --no-embed, so
+        # the vector stays missing -- E stays > 0) keeps the marker. To
+        # observe E==0/no-marker, embed for real once in-process (a mocked
+        # compute_embeddings, deterministic vectors), then run the hook
+        # again on unchanged content.
+        args = SimpleNamespace(root=str(root), project="pc-marker", db=str(self.home / "pc-marker.sqlite"),
+                                full=False, no_embed=False)
+        with mock.patch.object(memidx, "compute_embeddings", side_effect=lambda texts, model=None: [
+            [0.01] * memidx.EMBED_DIM for _ in texts
+        ]):
+            memidx.cmd_reindex(args)
+        marker.unlink()
+
+        env2 = clean_env(MEMCONTINUUM_HOME=str(self.home), MEMCONTINUUM_PYTHON=VENV_PYTHON,
+                          MEMCONTINUUM_PROJECT="pc-marker", MEMCONTINUUM_ROOT=str(root),
+                          MEMCONTINUUM_EMBED_WORKER="0")
+        proc2 = self._run(env2)
+        self.assertEqual(proc2.returncode, 0, proc2.stderr)
+        self.assertFalse(marker.is_file(), "every record has a fresh vector -- E==0, no marker")
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("embed=clean", log_text, log_text)
+
+    # -- 7 (existing pins) is covered by TestPostCommitReindexHook's own
+    # tests above (test_r2_resolves_..., unchanged assertions plus the
+    # MEMCONTINUUM_EMBED_WORKER=0 addition).
+
+    # -- 8: the worker actually spawns, detached, and clears the marker ----
+
+    @unittest.skipUnless(hasattr(fcntl, "flock"), "fcntl.flock required")
+    def test_h_worker_spawns_detached_and_clears_the_marker(self):
+        root = self._store_with_one_unembedded_topic("pc-spawn")
+        fast_py = self._fast_stub()
+        env = clean_env(MEMCONTINUUM_HOME=str(self.home), MEMCONTINUUM_PYTHON=str(fast_py),
+                         MEMCONTINUUM_PROJECT="pc-spawn", MEMCONTINUUM_ROOT=str(root))
+        env.pop("MEMCONTINUUM_EMBED_WORKER", None)
+        proc = self._run(env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        marker = self.home / "pc-spawn.embed-pending"
+        log_path = self.home / "pc-spawn.embed.log"
+        self.assertTrue(marker.is_file(), "content pass alone must not clear the marker")
+
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            if log_path.exists() and not marker.exists():
+                break
+            time.sleep(0.2)
+        self.assertTrue(log_path.exists(), "the detached worker must have written its own log file")
+        self.assertFalse(marker.exists(), "the detached worker must clear the marker within 30s")
+
+        # tearDown asserts the lock is free -- give the worker a moment to
+        # release it after clearing the marker.
+        lock_path = self.home / "pc-spawn.embed.lock"
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and lock_path.exists():
+            fd = os.open(str(lock_path), os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                break
+            except BlockingIOError:
+                time.sleep(0.2)
+            finally:
+                os.close(fd)
+
+    # -- extra: the watchdog budget actually bounds this hook ---------------
+
+    def test_watchdog_kills_a_hung_content_pass_within_budget(self):
+        """Beyond the brief's own item 1 (which the redesigned hook makes
+        moot for embeddings specifically, since the content pass never
+        touches them): this proves the watchdog wiring itself -- a
+        content pass that hangs for ANY reason is still bounded by
+        MEMCONTINUUM_POST_COMMIT_BUDGET, via the same shared watchdog
+        launcher every other guarded hook uses."""
+        root = self._store_with_one_unembedded_topic("pc-wd")
+        always_hang = Path(self.td) / "always-hang"
+        always_hang.write_text(
+            "#!/usr/bin/env bash\n"
+            f'REAL_PY="{VENV_PYTHON}"\n'
+            'if [ "$1" = "-c" ]; then\n'
+            '    exec "$REAL_PY" "$@"\n'
+            'fi\n'
+            'sleep 6\n'
+        )
+        always_hang.chmod(0o755)
+        env = clean_env(MEMCONTINUUM_HOME=str(self.home), MEMCONTINUUM_PYTHON=str(always_hang),
+                         MEMCONTINUUM_PROJECT="pc-wd", MEMCONTINUUM_ROOT=str(root),
+                         MEMCONTINUUM_EMBED_WORKER="0", MEMCONTINUUM_POST_COMMIT_BUDGET="2")
+        start = time.monotonic()
+        proc = self._run(env, timeout=10.0)
+        elapsed = time.monotonic() - start
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertLess(elapsed, 4.0, f"took {elapsed:.1f}s -- the 2s watchdog budget must bound this")
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=watchdog-killed", log_text)
+        self.assertIn("hook=post-commit-reindex.sh", log_text)
 
 
 class TestMemorySearchSkill(unittest.TestCase):
