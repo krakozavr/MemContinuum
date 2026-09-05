@@ -3147,7 +3147,11 @@ class TestMalformedRecordQuarantine(unittest.TestCase):
             _write_record(topic_path, _valid_topic_text("TOP-9601"))
             db = Path(td) / "idx.sqlite"
 
-            def fake_embed(texts):
+            # Design R4 (audit MC-P1-06): compute_embeddings gained an
+            # optional `model=` param (cmd_reindex now passes the model it
+            # already loaded for the fingerprint check) -- widened here,
+            # same precedent as Task 3's write_file_status signature change.
+            def fake_embed(texts, model=None):
                 return [[0.1, 0.2, 0.3, 0.4] for _ in texts]
 
             with mock.patch.object(memidx, "compute_embeddings", side_effect=fake_embed):
@@ -3197,6 +3201,328 @@ class TestMalformedRecordQuarantine(unittest.TestCase):
     def test_build_record_raises_on_links_list_with_non_mapping_element(self):
         with self.assertRaises(ValueError):
             memidx.build_record(Path("/root"), Path("/root/topics/t.md"), {"links": ["not-a-mapping"]}, "body")
+
+
+class TestEmbeddingFingerprint(unittest.TestCase):
+    """Design R4 (audit MC-P1-06, TOP-0123 L4): embedding_fingerprint /
+    fingerprints_match, cosine's typed dimension/non-finite errors, the
+    batch-length check before the reindex zip, the freshness join's
+    embed_fp/dim gate, fingerprint-mismatch handling at query time, and
+    check --json's vector_index_state. Deterministic fake vectors/
+    fingerprints throughout except the two tests named explicitly as
+    real-model (kept few, per the brief)."""
+
+    FP1 = "model=fake;dim=4;pipeline=1;prefix=none;norm=l2;fastembed=0.0.0;revision=rev1"
+    FP2 = "model=fake;dim=4;pipeline=1;prefix=none;norm=l2;fastembed=0.0.0;revision=rev2"
+    FOREIGN_FP = "model=other-model;dim=4;pipeline=1;prefix=none;norm=l2;fastembed=0.0.0;revision=revX"
+
+    def _topic(self, td, text="alpha decision", tid="TOP-1", name="t.md"):
+        root = Path(td) / "root"
+        (root / "topics").mkdir(parents=True, exist_ok=True)
+        p = root / "topics" / name
+        p.write_text(
+            f"---\ntype: topic\nid: {tid}\ntitle: T\nlinks:\n"
+            "  - link: L1\n    status: active\n"
+            "    ruling: {text: \"r\", authority: owner-verbatim, source: s}\n"
+            f"---\n{text}\n"
+        )
+        return root.resolve()
+
+    @staticmethod
+    def _fake_embed(texts, model=None):
+        return [[0.1, 0.2, 0.3, 0.4] for _ in texts]
+
+    @staticmethod
+    def _fake_loader(fp):
+        return lambda: (object(), fp)
+
+    def _mode(self, db):
+        conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
+        r = conn.execute("SELECT value FROM db_meta WHERE key='embedding_mode'").fetchone()
+        conn.close(); return r["value"] if r else "none"
+
+    def _stored_fp(self, db):
+        conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
+        r = conn.execute("SELECT value FROM db_meta WHERE key='embedding_fingerprint'").fetchone()
+        conn.close(); return r["value"] if r else None
+
+    def _emb_rows(self, db):
+        conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT path, embed_fp, dim FROM embeddings ORDER BY path").fetchall()
+        conn.close(); return [dict(r) for r in rows]
+
+    # -- Red 1: cosine's typed dimension/non-finite errors --
+
+    def test_cosine_raises_vector_dimension_mismatch_on_unequal_lengths(self):
+        with self.assertRaises(memidx.VectorDimensionMismatch):
+            memidx.cosine([1.0, 0.0], [1.0])
+
+    def test_vector_dimension_mismatch_is_a_value_error(self):
+        self.assertTrue(issubclass(memidx.VectorDimensionMismatch, ValueError))
+
+    def test_cosine_raises_value_error_on_non_finite_component(self):
+        with self.assertRaises(ValueError):
+            memidx.cosine([1.0, float("nan")], [1.0, 0.0])
+
+    # -- Red 2: same text, new fingerprint -> reindex re-embeds every row;
+    # a second run at the SAME fingerprint re-embeds nothing.
+
+    def test_new_fingerprint_forces_full_reembed_then_settles(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic(td)
+            db = Path(td) / "idx.sqlite"
+            with mock.patch.object(memidx, "compute_embeddings", side_effect=self._fake_embed), \
+                 mock.patch.object(memidx, "load_embedding_model", side_effect=self._fake_loader(self.FP1)):
+                reindex(root, db, no_embed=False)
+            rows1 = self._emb_rows(db)
+            self.assertEqual(len(rows1), 2, rows1)   # topic + its one link row
+            self.assertTrue(all(r["embed_fp"] == self.FP1 for r in rows1), rows1)
+            self.assertEqual(self._stored_fp(db), self.FP1)
+
+            def _boom(*a, **kw):
+                raise AssertionError("compute_embeddings must not run when nothing changed and the fingerprint matches")
+
+            with mock.patch.object(memidx, "compute_embeddings", side_effect=_boom), \
+                 mock.patch.object(memidx, "load_embedding_model", side_effect=self._fake_loader(self.FP1)):
+                reindex(root, db, no_embed=False)
+            self.assertEqual({r["embed_fp"] for r in self._emb_rows(db)}, {self.FP1})
+
+            with mock.patch.object(memidx, "compute_embeddings", side_effect=self._fake_embed), \
+                 mock.patch.object(memidx, "load_embedding_model", side_effect=self._fake_loader(self.FP2)):
+                reindex(root, db, no_embed=False)
+            rows3 = self._emb_rows(db)
+            self.assertEqual(len(rows3), 2, rows3)
+            self.assertTrue(all(r["embed_fp"] == self.FP2 for r in rows3), rows3)
+            self.assertEqual(self._stored_fp(db), self.FP2)
+
+    # -- Red 3: a dimension-mismatched row is skipped, not ranked, and
+    # counted; other rows still rank.
+
+    def test_dimension_mismatch_row_is_skipped_and_counted(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic(td, text="widget cache invalidates on write")
+            second = self._topic(td, text="second body about caching widgets", tid="TOP-2", name="second.md")
+            db = Path(td) / "idx.sqlite"
+            with mock.patch.object(memidx, "compute_embeddings", side_effect=self._fake_embed), \
+                 mock.patch.object(memidx, "load_embedding_model", side_effect=self._fake_loader(self.FP1)):
+                reindex(root, db, no_embed=False)
+
+            path = str(root / "topics" / "t.md")
+            conn = sqlite3.connect(str(db))
+            conn.execute(
+                "UPDATE embeddings SET vector=?, dim=4 WHERE path=?",
+                (memidx.pack_vector([0.1, 0.2, 0.3]), path),
+            )
+            conn.commit(); conn.close()
+
+            def fake_qe(text, model=None):
+                return [1.0, 0.0, 0.0, 0.0]
+
+            conn = memidx.open_db(db, project=memidx.DEFAULT_PROJECT)
+            stats = {}
+            with mock.patch.object(memidx, "compute_query_embedding", side_effect=fake_qe), \
+                 mock.patch.object(memidx, "embedding_fingerprint", return_value=self.FP1):
+                ranked = memidx.vector_ranked(conn, "second", memidx.DEFAULT_PROJECT, model=object(), stats=stats)
+            conn.close()
+            self.assertFalse(any(p == path for p, _ in ranked), ranked)
+            self.assertEqual(stats.get("dimension_mismatch_rows"), 1, stats)
+            self.assertTrue(any(p == str(root / "topics" / "second.md") for p, _ in ranked), ranked)
+
+    # -- Red 4: short/long batch -> nothing written, stderr names N and M,
+    # embedding_mode recompute reads none/partial, never full.
+
+    def test_short_batch_writes_nothing_and_names_counts(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic(td)
+            self._topic(td, text="second body", tid="TOP-2", name="second.md")
+            db = Path(td) / "idx.sqlite"
+
+            def short_embed(texts, model=None):
+                return [[0.1, 0.2, 0.3, 0.4] for _ in texts[:-1]]
+
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with mock.patch.object(memidx, "compute_embeddings", side_effect=short_embed), \
+                 mock.patch.object(memidx, "load_embedding_model", side_effect=self._fake_loader(self.FP1)), \
+                 contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = memidx.cmd_reindex(ns(root=str(root), db=str(db), project=memidx.DEFAULT_PROJECT,
+                                            full=False, no_embed=False, auto=False))
+            self.assertEqual(rc, 0)
+            self.assertIn("backend returned 3 vectors for 4 texts", buf_err.getvalue())
+            self.assertEqual(len(self._emb_rows(db)), 0)
+            self.assertEqual(self._mode(db), "none")
+
+    def test_long_batch_also_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic(td)
+            self._topic(td, text="second body", tid="TOP-2", name="second.md")
+            db = Path(td) / "idx.sqlite"
+
+            def long_embed(texts, model=None):
+                return [[0.1, 0.2, 0.3, 0.4] for _ in texts] + [[0.9, 0.9, 0.9, 0.9]]
+
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with mock.patch.object(memidx, "compute_embeddings", side_effect=long_embed), \
+                 mock.patch.object(memidx, "load_embedding_model", side_effect=self._fake_loader(self.FP1)), \
+                 contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = memidx.cmd_reindex(ns(root=str(root), db=str(db), project=memidx.DEFAULT_PROJECT,
+                                            full=False, no_embed=False, auto=False))
+            self.assertEqual(rc, 0)
+            self.assertIn("backend returned 5 vectors for 4 texts", buf_err.getvalue())
+            self.assertEqual(len(self._emb_rows(db)), 0)
+            self.assertEqual(self._mode(db), "none")
+
+    # -- Red 5: hybrid/vector under a fingerprint mismatch -> FTS list,
+    # "embedding": "fingerprint-mismatch", stderr line, exit 0.
+
+    def test_hybrid_and_vector_under_fingerprint_mismatch_fall_back_to_fts(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic(td, text="needle term for search")
+            db = Path(td) / "idx.sqlite"
+            with mock.patch.object(memidx, "compute_embeddings", side_effect=self._fake_embed), \
+                 mock.patch.object(memidx, "load_embedding_model", side_effect=self._fake_loader(self.FP1)):
+                reindex(root, db, no_embed=False)
+
+            conn = sqlite3.connect(str(db))
+            conn.execute(
+                "UPDATE db_meta SET value=? WHERE key='embedding_fingerprint'", (self.FOREIGN_FP,)
+            )
+            conn.commit(); conn.close()
+
+            def _boom(*a, **kw):
+                raise AssertionError("compute_query_embedding must not run under a fingerprint mismatch")
+
+            for mode in ("hybrid", "vector"):
+                buf_out, buf_err = io.StringIO(), io.StringIO()
+                with mock.patch.object(memidx, "compute_query_embedding", side_effect=_boom), \
+                     mock.patch.object(memidx, "load_embedding_model", side_effect=self._fake_loader(self.FP1)), \
+                     contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                    rc = memidx.cmd_search(ns(
+                        project=memidx.DEFAULT_PROJECT, db=str(db), query="needle term for search",
+                        mode=mode, status=[], type=[], area=None, topic=None, authority=None,
+                        limit=10, json=True,
+                    ))
+                self.assertEqual(rc, 0, mode)
+                out = json.loads(buf_out.getvalue())
+                self.assertEqual(out["embedding"], "fingerprint-mismatch", (mode, out))
+                self.assertIn("different model", buf_err.getvalue(), mode)
+                self.assertGreater(len(out["results"]), 0, (mode, out))
+
+    # -- Red 6/11: an old DB (vectors with NULL embed_fp) invalidates only
+    # the vector layer; check --json never reads "mismatch" for it; one
+    # embedding reindex refills every row and reads "full".
+
+    def test_old_db_with_null_embed_fp_invalidates_vector_layer_not_fts(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic(td, text="legacy vector needle phrase")
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)   # rows exist, never embedded
+
+            path = str(root / "topics" / "t.md")
+            conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
+            sha = conn.execute("SELECT sha256 FROM records WHERE path=?", (path,)).fetchone()["sha256"]
+            conn.execute(
+                "INSERT INTO embeddings (path, project, dim, embed_sha, embed_fp, vector) VALUES (?,?,?,?,?,?)",
+                (path, memidx.DEFAULT_PROJECT, 4, sha, None, memidx.pack_vector([0.1, 0.2, 0.3, 0.4])),
+            )
+            conn.commit(); conn.close()
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                memidx.cmd_check(ns(root=str(root), db=str(db), project=memidx.DEFAULT_PROJECT, json=True))
+            report = json.loads(buf.getvalue())
+            self.assertIn(report["vector_index_state"], ("none", "partial"), report)
+
+            fts_out = io.StringIO()
+            with contextlib.redirect_stdout(fts_out):
+                memidx.cmd_search(ns(
+                    project=memidx.DEFAULT_PROJECT, db=str(db), query="legacy vector needle phrase",
+                    mode="fts", status=[], type=[], area=None, topic=None, authority=None,
+                    limit=10, json=True,
+                ))
+            fts_results = json.loads(fts_out.getvalue())
+            self.assertGreater(len(fts_results), 0, fts_results)
+
+            vec_out, vec_err = io.StringIO(), io.StringIO()
+            with mock.patch.object(memidx, "load_embedding_model", side_effect=self._fake_loader(self.FP1)), \
+                 contextlib.redirect_stdout(vec_out), contextlib.redirect_stderr(vec_err):
+                rc = memidx.cmd_search(ns(
+                    project=memidx.DEFAULT_PROJECT, db=str(db), query="legacy vector needle phrase",
+                    mode="vector", status=[], type=[], area=None, topic=None, authority=None,
+                    limit=10, json=True,
+                ))
+            self.assertEqual(rc, 0)
+            vec_json = json.loads(vec_out.getvalue())
+            self.assertGreater(len(vec_json["results"]), 0, vec_json)
+
+            # check's own vector_index_state compares against the REAL
+            # static fingerprint (it never loads a model) -- so the refill
+            # here must carry a fingerprint that shares that static prefix
+            # (same model/dim/pipeline/prefix/norm/fastembed version),
+            # differing only in revision, to read back as "full" rather
+            # than "mismatch" against a fake model name.
+            real_static_prefix = memidx._fingerprint_static_prefix(memidx.embedding_fingerprint())
+            fp_real_revision = real_static_prefix + "rev-test"
+            with mock.patch.object(memidx, "compute_embeddings", side_effect=self._fake_embed), \
+                 mock.patch.object(memidx, "load_embedding_model", side_effect=self._fake_loader(fp_real_revision)):
+                reindex(root, db, no_embed=False)
+            buf2 = io.StringIO()
+            with contextlib.redirect_stdout(buf2):
+                memidx.cmd_check(ns(root=str(root), db=str(db), project=memidx.DEFAULT_PROJECT, json=True))
+            report2 = json.loads(buf2.getvalue())
+            self.assertEqual(report2["vector_index_state"], "full", report2)
+            rows = self._emb_rows(db)
+            self.assertTrue(all(r["embed_fp"] for r in rows), rows)
+
+    # -- Red 7: check reports "full" on a healthy embedded DB, without
+    # importing fastembed (real model -- kept to this one case).
+
+    def test_check_reports_full_vector_index_state_without_importing_fastembed(self):
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic(td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=False)   # real model -- one of the few real-model cases here
+
+            script = (
+                "import sys, io, contextlib, json; sys.path.insert(0, %r); import memidx\n"
+                "buf = io.StringIO()\n"
+                "with contextlib.redirect_stdout(buf):\n"
+                "    rc = memidx.main(['check', '--root', %r, '--db', %r, '--json'])\n"
+                "assert 'fastembed' not in sys.modules, 'fastembed was imported'\n"
+                "report = json.loads(buf.getvalue())\n"
+                "assert report['vector_index_state'] == 'full', report\n"
+                "print('OK')\n"
+            ) % (str(TOOLS_DIR), str(root), str(db))
+            result = subprocess.run(
+                [sys.executable, "-c", script], capture_output=True, text=True, timeout=30
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("OK", result.stdout)
+
+    # -- Red 9: --no-embed/--auto on a mismatched DB reports and does not repair.
+
+    def test_no_embed_auto_reports_mismatch_without_repairing(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic(td)
+            db = Path(td) / "idx.sqlite"
+            with mock.patch.object(memidx, "compute_embeddings", side_effect=self._fake_embed), \
+                 mock.patch.object(memidx, "load_embedding_model", side_effect=self._fake_loader(self.FP1)):
+                reindex(root, db, no_embed=False)
+            rows_before = self._emb_rows(db)
+
+            conn = sqlite3.connect(str(db))
+            conn.execute("UPDATE db_meta SET value=? WHERE key='embedding_fingerprint'", (self.FOREIGN_FP,))
+            conn.commit(); conn.close()
+
+            buf_err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(buf_err):
+                rc = memidx.cmd_reindex(ns(root=str(root), db=str(db), project=memidx.DEFAULT_PROJECT,
+                                            full=False, no_embed=True, auto=True))
+            self.assertEqual(rc, 0)
+            self.assertIn("different model", buf_err.getvalue())
+            self.assertEqual(self._emb_rows(db), rows_before,
+                              "a --no-embed/--auto pass must not repair a standing mismatch")
 
 
 if __name__ == "__main__":

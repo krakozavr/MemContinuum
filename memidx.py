@@ -66,7 +66,89 @@ DEFAULT_PROJECT = "default"
 # (see resolve_db_path, which reads the environment variable fresh on every
 # call so tests can override it per-case).
 EMBED_MODEL_NAME = "BAAI/bge-small-en-v1.5"
-EMBED_BODY_CHARS = 1500
+EMBED_DIM = 384
+# Design R4 (audit MC-P1-06, TOP-0123 L4): bump EMBED_PIPELINE_VERSION when
+# embed_text_for/_link_embed_items/code_embed_text_for/EMBED_BODY_CHARS
+# change -- anything that changes what TEXT a vector is computed from,
+# without changing records.sha256, needs its own signal so a stale vector
+# gets excluded and re-embedded (see embedding_fingerprint below).
+EMBED_PIPELINE_VERSION = 1
+EMBED_BODY_CHARS = 1500  # bump EMBED_PIPELINE_VERSION when this changes
+
+
+def embedding_fingerprint(model=None) -> str:
+    """Design R4: a flat `key=value;...` string identifying the model/
+    pipeline that produced (or would produce) a vector. The STATIC part
+    (model name, dim, pipeline version, prefix, norm, fastembed's
+    installed version) needs no fastembed import -- `importlib.metadata.
+    version("fastembed")` reads the installed package's dist-info without
+    ever executing `fastembed/__init__.py` (verified empirically; this is
+    what keeps `check`, and any other caller that never loads a model,
+    off the fastembed-import path pinned by test_for_path_does_not_import_
+    fastembed and this task's own sibling tests). `revision` is the
+    basename of `getattr(model.model, "_model_dir", None)` when a loaded
+    `TextEmbedding` is passed (fastembed 0.8.0 exposes it; the basename is
+    the HF snapshot commit) -- "unknown" otherwise (no model given, or the
+    attribute is absent on a different fastembed version)."""
+    import importlib.metadata
+
+    try:
+        fastembed_version = importlib.metadata.version("fastembed")
+    except importlib.metadata.PackageNotFoundError:
+        fastembed_version = "absent"
+    revision = "unknown"
+    if model is not None:
+        model_dir = getattr(getattr(model, "model", None), "_model_dir", None)
+        if model_dir:
+            revision = Path(model_dir).name
+    return (
+        f"model={EMBED_MODEL_NAME};dim={EMBED_DIM};pipeline={EMBED_PIPELINE_VERSION};"
+        f"prefix=none;norm=l2;fastembed={fastembed_version};revision={revision}"
+    )
+
+
+def _parse_fingerprint(fp: str | None) -> dict | None:
+    if not fp:
+        return None
+    parsed: dict = {}
+    for part in fp.split(";"):
+        if "=" not in part:
+            return None
+        k, v = part.split("=", 1)
+        parsed[k] = v
+    return parsed
+
+
+def fingerprints_match(stored: str | None, current: str | None) -> bool:
+    """Design R4: equal on every key except `revision`; `revision` is
+    compared only when NEITHER side is "unknown" (a command that never
+    loaded a model -- `check`, a `--no-embed`/`--auto` reindex report --
+    cannot verify revision and must not call a healthy DB "mismatch"). A
+    `None`/empty/malformed `stored` value never matches (an old,
+    pre-fingerprint DB, or a corrupted db_meta row)."""
+    sd = _parse_fingerprint(stored)
+    cd = _parse_fingerprint(current)
+    if sd is None or cd is None:
+        return False
+    keys = set(sd) | set(cd)
+    for key in keys:
+        if key == "revision":
+            continue
+        if sd.get(key) != cd.get(key):
+            return False
+    if sd.get("revision") == "unknown" or cd.get("revision") == "unknown":
+        return True
+    return sd.get("revision") == cd.get("revision")
+
+
+def _fingerprint_static_prefix(fp: str) -> str:
+    """The portion of a fingerprint string up to and including
+    ";revision=" -- used where a per-row SQL comparison must match every
+    static field without loading a model (check's vector_index_state
+    fresh-count, the --no-embed/--auto embedding_mode recompute)."""
+    marker = ";revision="
+    idx = fp.find(marker)
+    return fp if idx == -1 else fp[: idx + len(marker)]
 
 # F1 (external-fix round, coordinator ruling 68): the decision index's own
 # logical schema/content generation marker, bumped whenever a change needs
@@ -472,6 +554,7 @@ def build_record(root: Path, path: Path, fm: dict, body: str) -> dict:
 
 
 def embed_text_for(record: dict) -> str:
+    # bump EMBED_PIPELINE_VERSION when this changes
     body = record["body"][:EMBED_BODY_CHARS]
     return f"{record['title']}\n\n{body}"
 
@@ -707,6 +790,18 @@ def ensure_embeddings_embed_sha_column(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE embeddings ADD COLUMN embed_sha TEXT")
 
 
+def ensure_embeddings_embed_fp_column(conn: sqlite3.Connection) -> None:
+    """Design R4 (audit MC-P1-06, TOP-0123 L4): an embeddings row must
+    remember the FINGERPRINT of the model that produced it (embed_sha
+    alone answers "which source text"; embed_fp answers "which model/
+    revision/pipeline") -- NULL on a pre-existing row, which is exactly
+    what excludes it from the freshness join until a re-embed writes a
+    real one."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(embeddings)").fetchall()}
+    if "embed_fp" not in cols:
+        conn.execute("ALTER TABLE embeddings ADD COLUMN embed_fp TEXT")
+
+
 def ensure_links_evidence_column(conn: sqlite3.Connection) -> None:
     """Migration guard shaped like ensure_links_invariant_column: a `links`
     row must carry its own `evidence` (F3, ruling 70), or invariant_enforcement_class
@@ -766,7 +861,8 @@ def _link_embed_items(rec: dict) -> list[tuple[str, str, str]]:
     """(link_path, link_id, embed_text) for every link in a topic record
     that carries retrievable ruling/rationale text -- shared by
     cmd_reindex's embedding step and insert_record_rows's records/fts
-    inserts, so the two never disagree about which links are retrievable."""
+    inserts, so the two never disagree about which links are retrievable.
+    bump EMBED_PIPELINE_VERSION when this changes."""
     if not rec["is_topic"]:
         return []
     out = []
@@ -882,6 +978,7 @@ def _run_decision_migration_guards(conn: sqlite3.Connection, db_path: Path, proj
     enforcement, matching open_db's previous behavior exactly."""
     ensure_links_invariant_column(conn)
     ensure_embeddings_embed_sha_column(conn)
+    ensure_embeddings_embed_fp_column(conn)
     ensure_links_evidence_column(conn)
     ensure_records_link_columns(conn)
     ensure_index_errors_table(conn)
@@ -1382,6 +1479,44 @@ def cmd_reindex(args) -> int:
         row["path"]: row["embed_sha"]
         for row in conn.execute("SELECT path, embed_sha FROM embeddings WHERE project=?", (args.project,))
     }
+
+    # Design R4 (audit MC-P1-06, TOP-0123 L4): a stored embedding-
+    # fingerprint mismatch means EVERY row is due for re-embed, regardless
+    # of whether its sha changed -- seeding embedded_shas empty makes the
+    # existing needs_backfill/pending logic below treat every path as
+    # lacking a fresh vector, with no separate branch duplicating that
+    # logic. Only when this run actually embeds (`not no_embed`) is the
+    # model loaded (to get the REAL current fingerprint, revision
+    # included) -- a `--no-embed`/`--auto` run reports a standing
+    # mismatch using only the STATIC fingerprint (no model load, matching
+    # the no-embed-never-touches-fastembed guarantee) and never repairs
+    # it. A load failure here is treated exactly like today's embedding-
+    # unavailable path: the SAME stderr line, printed once, no second
+    # attempt later (to_embed_texts stays empty since no_embed becomes
+    # True, so the batch zip below never runs at all).
+    stored_fp_row = conn.execute("SELECT value FROM db_meta WHERE key='embedding_fingerprint'").fetchone()
+    stored_fp = stored_fp_row["value"] if stored_fp_row else None
+    model = None
+    current_fp = None
+    if not no_embed:
+        loaded, embed_load_err = try_compute_embeddings(load_embedding_model)
+        if embed_load_err is not None:
+            print(
+                f"reindex: embeddings unavailable ({embed_load_err}); continuing without embeddings",
+                file=sys.stderr,
+            )
+            no_embed = True
+        else:
+            model, current_fp = loaded
+            if embedded_shas and not fingerprints_match(stored_fp, current_fp):
+                embedded_shas = {}
+    elif embedded_shas and not fingerprints_match(stored_fp, embedding_fingerprint(model=None)):
+        print(
+            "reindex: stored embeddings were made by a different model; "
+            "run without --no-embed to re-embed",
+            file=sys.stderr,
+        )
+
     # Design R2 (audit MC-P1-03, TOP-0123 L2): the previous run's quarantine
     # table, keyed by path -- a path missing here after this run's loop
     # either recovered (parsed clean) or vanished; either way its row is
@@ -1466,24 +1601,42 @@ def cmd_reindex(args) -> int:
         # and the coverage-derived embedding_mode block further down
         # naturally reports "partial"/"none" from the real, now-incomplete
         # vector coverage -- no separate mode-forcing needed here.
-        vecs, embed_err = try_compute_embeddings(compute_embeddings, to_embed_texts)
+        # Design R4 (audit MC-P1-06): `model` was already loaded above (to
+        # decide the fingerprint-mismatch question), so this reuses it --
+        # one model load for the whole embedding-enabled run, not two.
+        vecs, embed_err = try_compute_embeddings(compute_embeddings, to_embed_texts, model)
         if embed_err is not None:
             print(
                 f"reindex: embeddings unavailable ({embed_err}); continuing without embeddings",
+                file=sys.stderr,
+            )
+        elif len(vecs) != len(to_embed_texts):
+            # Design R4 item 5 (audit MC-P1-06): the batch-length check
+            # BEFORE any zip -- a backend returning fewer/more vectors than
+            # texts is an embedding failure, not a partial success; nothing
+            # is written (a mis-ordered/short/long return is otherwise
+            # undetectable and would silently mis-assign vectors to paths).
+            print(
+                f"reindex: embeddings unavailable (backend returned {len(vecs)} vectors for "
+                f"{len(to_embed_texts)} texts); continuing without embeddings",
                 file=sys.stderr,
             )
         else:
             for p, v in zip(to_embed_paths, vecs):
                 vectors_by_path[p] = pack_vector(v)
 
+    any_vector_written = False
+
     def _upsert_embedding(path: str, sha_for: str) -> bool:
+        nonlocal any_vector_written
         if path not in vectors_by_path:
             return False
         vec = vectors_by_path[path]
         conn.execute(
-            "INSERT OR REPLACE INTO embeddings (path, project, dim, embed_sha, vector) VALUES (?,?,?,?,?)",
-            (path, args.project, len(unpack_vector(vec)), sha_for, vec),
+            "INSERT OR REPLACE INTO embeddings (path, project, dim, embed_sha, embed_fp, vector) VALUES (?,?,?,?,?,?)",
+            (path, args.project, len(unpack_vector(vec)), sha_for, current_fp, vec),
         )
+        any_vector_written = True
         return True
 
     backfilled = 0
@@ -1581,11 +1734,29 @@ def cmd_reindex(args) -> int:
         total = conn.execute(
             "SELECT COUNT(*) AS n FROM records WHERE project=?", (args.project,)
         ).fetchone()["n"]
-        fresh = conn.execute(
-            "SELECT COUNT(*) AS n FROM records r JOIN embeddings e "
-            "ON e.path=r.path AND e.embed_sha=r.sha256 WHERE r.project=?",
-            (args.project,),
-        ).fetchone()["n"]
+        # Design R4 (audit MC-P1-06): a row counts as fresh only when its
+        # sha AND its fingerprint match -- an old-model vector must not
+        # read as coverage. `model` was loaded above whenever this run had
+        # embedding enabled (real revision known); a --no-embed/--auto
+        # pass (or a run whose model load itself failed) has no loaded
+        # model, so the STATIC fingerprint's prefix (documented: compared
+        # in SQL, not via fingerprints_match in Python -- avoids fetching
+        # every row) is all that can be checked without touching fastembed.
+        if model is not None:
+            fresh = conn.execute(
+                "SELECT COUNT(*) AS n FROM records r JOIN embeddings e "
+                "ON e.path=r.path AND e.embed_sha=r.sha256 "
+                "WHERE r.project=? AND e.embed_fp=?",
+                (args.project, current_fp),
+            ).fetchone()["n"]
+        else:
+            static_prefix = _fingerprint_static_prefix(embedding_fingerprint(model=None))
+            fresh = conn.execute(
+                "SELECT COUNT(*) AS n FROM records r JOIN embeddings e "
+                "ON e.path=r.path AND e.embed_sha=r.sha256 "
+                "WHERE r.project=? AND e.embed_fp IS NOT NULL AND substr(e.embed_fp,1,?)=?",
+                (args.project, len(static_prefix), static_prefix),
+            ).fetchone()["n"]
         if total == 0 or fresh == 0:
             mode = "none"
         elif fresh == total:
@@ -1597,6 +1768,15 @@ def cmd_reindex(args) -> int:
             if mode_now == "full" and mode != "full":
                 print(f"reindex: embeddings are now incomplete for {args.project}; embedding mode set "
                       f"to {mode} (run without --no-embed to restore)")
+
+    # Design R4 (audit MC-P1-06): the new fingerprint lands in the SAME
+    # transaction as the vectors of a run that embedded anything -- never
+    # written on a run that wrote no vector at all (nothing to attest to).
+    if any_vector_written and current_fp is not None:
+        conn.execute(
+            "INSERT OR REPLACE INTO db_meta (key, value) VALUES ('embedding_fingerprint', ?)",
+            (current_fp,),
+        )
 
     # F1 (Codex-pending item 1): the successful-reindex stamp and the
     # logical index generation land in the SAME transaction as every other
@@ -1620,17 +1800,39 @@ def cmd_reindex(args) -> int:
     return 0
 
 
-def compute_embeddings(texts: list[str]):
+def load_embedding_model():
+    """Design R4: the ONE loader for a real `TextEmbedding` instance,
+    returning `(model, fingerprint)` -- `fingerprint` carries the model's
+    REAL revision (embedding_fingerprint(model)). Deliberately NOT cached
+    at module scope: a persistent cache would make a later `mock.patch(
+    "fastembed.TextEmbedding", side_effect=...)` (the house style for
+    simulating a broken backend, see TestRuling80EmbeddingFailureFailsOpen)
+    silently inert once some earlier test/call in the same process had
+    already loaded a real model successfully. Callers that need the SAME
+    model for more than one step within one command invocation (a
+    fingerprint check followed by the actual embedding work) load ONCE and
+    thread the returned `model` through explicitly (`compute_embeddings`/
+    `compute_query_embedding`'s own `model=` parameter) -- caching lives at
+    the call-site/one-invocation level, never at process level."""
     from fastembed import TextEmbedding
 
     model = TextEmbedding(model_name=EMBED_MODEL_NAME)
+    return model, embedding_fingerprint(model)
+
+
+def compute_embeddings(texts: list[str], model=None):
+    if model is None:
+        from fastembed import TextEmbedding
+
+        model = TextEmbedding(model_name=EMBED_MODEL_NAME)
     return list(model.embed(texts))
 
 
-def compute_query_embedding(text: str):
-    from fastembed import TextEmbedding
+def compute_query_embedding(text: str, model=None):
+    if model is None:
+        from fastembed import TextEmbedding
 
-    model = TextEmbedding(model_name=EMBED_MODEL_NAME)
+        model = TextEmbedding(model_name=EMBED_MODEL_NAME)
     return list(model.query_embed([text]))[0]
 
 
@@ -1648,7 +1850,10 @@ def try_compute_embeddings(compute_fn, *args) -> tuple[object | None, str | None
     BOTH compute_embeddings (the batch/document path -- cmd_reindex, cmd_
     code_reindex) and compute_query_embedding (the single-query path --
     vector_ranked, code_hits_vector), instead of four independent try/
-    except blocks that could drift out of sync. Returns (result, None) on
+    except blocks that could drift out of sync. Design R4: also wraps
+    load_embedding_model (a real `TextEmbedding()` construction can fail
+    exactly like an embed call) so the fingerprint-mismatch check that
+    needs a loaded model fails open identically. Returns (result, None) on
     success; on ANY exception from the fastembed backend (missing package,
     a broken/partial model cache, OOM, a network hiccup fetching the model,
     ...), returns (None, message) where `message` is already formatted as
@@ -1661,6 +1866,13 @@ def try_compute_embeddings(compute_fn, *args) -> tuple[object | None, str | None
         return None, f"{type(exc).__name__}: {exc}"
 
 
+class VectorDimensionMismatch(ValueError):
+    """Design R4 (audit MC-P1-06): raised by cosine() when the two vectors
+    it is asked to compare have different lengths -- a ValueError subclass
+    so every existing `except ValueError` scoring-loop catch (below, and
+    in code_hits_vector) needs no new except clause to also catch this."""
+
+
 def cosine(a: list[float], b: list[float]) -> float:
     """Returns a plain Python float, always -- fastembed's query_embed
     yields a numpy array (numpy.float32 elements), so an un-cast result
@@ -1669,9 +1881,26 @@ def cosine(a: list[float], b: list[float]) -> float:
     the moment a caller's score reaches --json output. Pre-existing on the
     markdown `search --mode vector --json` path too (same helper); fixed
     here since code-search inherits the identical bug via the same
-    cosine()/compute_query_embedding() pair."""
+    cosine()/compute_query_embedding() pair.
+
+    Design R4 (audit MC-P1-06): `zip` used to silently truncate to the
+    shorter vector on a dimension mismatch (`cosine([1.0, 0.0], [1.0]) ==
+    1.0`, the audit's own reproducer) -- now a typed VectorDimensionMismatch.
+    A non-finite component (NaN/inf, e.g. from a corrupted blob) raises a
+    plain ValueError. Both are caught, per row, by vector_ranked/
+    code_hits_vector's scoring loops -- a corrupt blob whose stored `dim`
+    column lies still reaches this defensive path even though the SQL
+    freshness join already gates on `dim` for the common case."""
     import math
 
+    if len(a) != len(b):
+        raise VectorDimensionMismatch(f"vector length mismatch: {len(a)} vs {len(b)}")
+    for x in a:
+        if not math.isfinite(x):
+            raise ValueError(f"non-finite component in vector a: {x!r}")
+    for y in b:
+        if not math.isfinite(y):
+            raise ValueError(f"non-finite component in vector b: {y!r}")
     dot = sum(x * y for x, y in zip(a, b))
     na = math.sqrt(sum(x * x for x in a))
     nb = math.sqrt(sum(y * y for y in b))
@@ -1786,7 +2015,10 @@ def fts_escape(query: str) -> str:
     return " OR ".join(f'"{t}"' for t in terms) if terms else '""'
 
 
-def vector_ranked(conn, query: str, project: str, filter_clause: str = "", filter_params: list | None = None) -> list[tuple[str, float]]:
+def vector_ranked(
+    conn, query: str, project: str, filter_clause: str = "", filter_params: list | None = None,
+    *, model=None, stats: dict | None = None,
+) -> list[tuple[str, float]]:
     """Ruling 69: joins embeddings to records on embed_sha == sha256 -- a
     stale vector (kept physically across a --no-embed/--auto edit) never
     reaches the scoring loop at all, not merely scores lower. F5/F7 (ruling
@@ -1798,12 +2030,32 @@ def vector_ranked(conn, query: str, project: str, filter_clause: str = "", filte
     which family member survives). Ruling 80: a query-embedding failure
     raises EmbeddingUnavailableError -- the ONE specific type _search_hits
     catches to fall back to FTS-only -- rather than the bare fastembed
-    exception (which would just crash cmd_search)."""
-    qvec, embed_err = try_compute_embeddings(compute_query_embedding, query)
+    exception (which would just crash cmd_search).
+
+    Design R4 (audit MC-P1-06): the freshness join gains `AND e.embed_fp =
+    ? AND e.dim = ?` against the CURRENT fingerprint/query-vector length --
+    a NULL or foreign-model `embed_fp` row is therefore never ranked (an
+    old or model-swapped DB's vector layer is invalidated; FTS untouched).
+    `model=None` (the default -- every existing direct caller) loads its
+    own model via load_embedding_model(); a caller that already loaded one
+    this invocation (`_search_hits`, avoiding a second ~0.45s load) passes
+    it in and only embedding_fingerprint(model) is recomputed (cheap, no
+    import). A per-row dimension mismatch (a corrupt blob whose `dim`
+    column lies) is caught, skipped, and counted into `stats`
+    ["dimension_mismatch_rows"] when a `stats` dict is given -- the SQL
+    `dim` gate makes this a defensive path, not the common one."""
+    if model is None:
+        loaded, embed_err = try_compute_embeddings(load_embedding_model)
+        if embed_err is not None:
+            raise EmbeddingUnavailableError(embed_err)
+        model, current_fp = loaded
+    else:
+        current_fp = embedding_fingerprint(model)
+    qvec, embed_err = try_compute_embeddings(compute_query_embedding, query, model)
     if embed_err is not None:
         raise EmbeddingUnavailableError(embed_err)
-    where = "e.project=?"
-    params: list = [project]
+    where = "e.project=? AND e.embed_fp=? AND e.dim=?"
+    params: list = [project, current_fp, len(qvec)]
     if filter_clause:
         where += f" AND {filter_clause}"
         params.extend(filter_params or [])
@@ -1813,48 +2065,112 @@ def vector_ranked(conn, query: str, project: str, filter_clause: str = "", filte
         f"WHERE {where}",
         params,
     ).fetchall()
-    scored = [(r["path"], cosine(qvec, unpack_vector(r["vector"]))) for r in rows]
+    scored = []
+    dim_mismatch = 0
+    for r in rows:
+        try:
+            scored.append((r["path"], cosine(qvec, unpack_vector(r["vector"]))))
+        except ValueError:
+            dim_mismatch += 1
+    if stats is not None and dim_mismatch:
+        stats["dimension_mismatch_rows"] = stats.get("dimension_mismatch_rows", 0) + dim_mismatch
     scored.sort(key=lambda t: t[1], reverse=True)
     collapsed = _collapse_link_duplicates(conn, project, [p for p, _ in scored])
     score_by_path = dict(scored)
     return [(p, score_by_path[p]) for p in collapsed]
 
 
-def _search_hits(conn, args, extra_where: str, extra_params: list) -> tuple[list[tuple[str, float]], dict[str, dict[str, str]], bool]:
+def _search_hits(conn, args, extra_where: str, extra_params: list) -> tuple[list[tuple[str, float]], dict[str, dict[str, str]], dict]:
     """The mode-dispatch + RRF fusion core shared by cmd_search and (via
     the test module's own _run_search, which delegates here rather than
     reimplementing ranking) tests/test_memidx.py -- one ranking
     implementation, not two that can silently drift apart. Returns
-    (results, contributing, embedding_unavailable): `contributing` maps a
-    family key to {"fts": link_id, "vector": link_id} whenever hybrid
-    mode's two channels picked DIFFERENT link members of the same topic
-    family. Ruling 80: `embedding_unavailable` is True whenever a "vector"
-    or "hybrid" mode's own query-embedding step raised
-    EmbeddingUnavailableError -- caught HERE (the one place that knows
-    both modes' fallback shape), never re-raised, so this always degrades
-    to FTS-only ranking on that specific failure rather than crashing
-    cmd_search; `contributing` never carries a "vector" key on this path
-    (no vector channel actually ran)."""
+    (results, contributing, embed_info): `contributing` maps a family key
+    to {"fts": link_id, "vector": link_id} whenever hybrid mode's two
+    channels picked DIFFERENT link members of the same topic family.
+    `embed_info` is `{"state": None | "unavailable" | "fingerprint-
+    mismatch", "dimension_mismatch_rows": N, "stored_fingerprint": ...,
+    "current_fingerprint": ...}` (the last two only set on a mismatch).
+
+    Ruling 80: `state == "unavailable"` whenever a "vector"/"hybrid" mode's
+    own query-embedding (or model-load) step failed -- caught HERE (the
+    one place that knows both modes' fallback shape), never re-raised, so
+    this always degrades to FTS-only ranking on that specific failure
+    rather than crashing cmd_search.
+
+    Design R4 (audit MC-P1-06): for "vector"/"hybrid" modes, the model is
+    loaded ONCE here (before either mode dispatches), and its fingerprint
+    compared against the stored `db_meta.embedding_fingerprint` -- ONLY
+    when the project already has at least one embeddings row (a project
+    that has never been embedded at all has a NULL stored fingerprint for
+    an unremarkable reason, not a model swap, so it is never reported as a
+    mismatch). On a mismatch, `state = "fingerprint-mismatch"` and the
+    vector query is skipped entirely (never calls vector_ranked -- no
+    second, wasted model interaction); the ALREADY-loaded model is passed
+    into vector_ranked when there is no mismatch, so the whole call makes
+    at most one model load, not two (the "second load in hybrid searches"
+    a persistent cache would otherwise be needed to avoid).
+    `contributing` never carries a "vector" key when the vector channel
+    did not actually run (unavailable or mismatched)."""
     results: list[tuple[str, float]] = []
     contributing: dict[str, dict[str, str]] = {}
-    embedding_unavailable = False
+    embed_info: dict = {"state": None, "dimension_mismatch_rows": 0}
+    model = None
+    if args.mode in ("vector", "hybrid"):
+        loaded, embed_load_err = try_compute_embeddings(load_embedding_model)
+        if embed_load_err is not None:
+            embed_info["state"] = "unavailable"
+        else:
+            model, current_fp = loaded
+            has_vectors = conn.execute(
+                "SELECT 1 FROM embeddings WHERE project=? LIMIT 1", (args.project,)
+            ).fetchone() is not None
+            if has_vectors:
+                stored_row = conn.execute(
+                    "SELECT value FROM db_meta WHERE key='embedding_fingerprint'"
+                ).fetchone()
+                stored_fp = stored_row["value"] if stored_row else None
+                if not fingerprints_match(stored_fp, current_fp):
+                    embed_info["state"] = "fingerprint-mismatch"
+                    embed_info["stored_fingerprint"] = stored_fp
+                    embed_info["current_fingerprint"] = current_fp
+                    model = None   # signals "do not run the vector query" below
     if args.mode == "fts":
         ranked = fts_ranked(conn, args.query, args.project, extra_where, extra_params)
         results = [(p, float(len(ranked) - i)) for i, p in enumerate(ranked)]
     elif args.mode == "vector":
-        try:
-            results = vector_ranked(conn, args.query, args.project, extra_where, extra_params)
-        except EmbeddingUnavailableError:
-            embedding_unavailable = True
+        if embed_info["state"] in ("unavailable", "fingerprint-mismatch"):
             ranked = fts_ranked(conn, args.query, args.project, extra_where, extra_params)
             results = [(p, float(len(ranked) - i)) for i, p in enumerate(ranked)]
+        else:
+            stats: dict = {}
+            try:
+                results = vector_ranked(
+                    conn, args.query, args.project, extra_where, extra_params, model=model, stats=stats
+                )
+            except EmbeddingUnavailableError:
+                embed_info["state"] = "unavailable"
+                ranked = fts_ranked(conn, args.query, args.project, extra_where, extra_params)
+                results = [(p, float(len(ranked) - i)) for i, p in enumerate(ranked)]
+            else:
+                embed_info["dimension_mismatch_rows"] = stats.get("dimension_mismatch_rows", 0)
     elif args.mode == "hybrid":
         fts_list = fts_ranked(conn, args.query, args.project, extra_where, extra_params)
-        try:
-            vec_list = [p for p, _ in vector_ranked(conn, args.query, args.project, extra_where, extra_params)]
-        except EmbeddingUnavailableError:
-            embedding_unavailable = True
+        if embed_info["state"] in ("unavailable", "fingerprint-mismatch"):
             vec_list = []   # degrades hybrid's own RRF fusion below to FTS-only, not a crash
+        else:
+            stats = {}
+            try:
+                vec_list = [
+                    p for p, _ in vector_ranked(
+                        conn, args.query, args.project, extra_where, extra_params, model=model, stats=stats
+                    )
+                ]
+            except EmbeddingUnavailableError:
+                embed_info["state"] = "unavailable"
+                vec_list = []
+            else:
+                embed_info["dimension_mismatch_rows"] = stats.get("dimension_mismatch_rows", 0)
         # Fix-round item 2 (coordinator review): ONE batched query for
         # both channels' combined candidate set, replacing what used to be
         # a _record_family call PLUS a record_row_by_path call per item
@@ -1875,7 +2191,7 @@ def _search_hits(conn, args, extra_where: str, extra_params: list) -> tuple[list
         results = sorted(((family_winner[fam], s) for fam, s in scores.items()), key=lambda t: t[1], reverse=True)
     else:
         raise ValueError(f"unknown mode {args.mode}")
-    return results, contributing, embedding_unavailable
+    return results, contributing, embed_info
 
 
 def cmd_search(args) -> int:
@@ -1900,13 +2216,31 @@ def cmd_search(args) -> int:
     # cap and before RRF fusion -- no more Python-side `allowed` set
     # post-filtering an already-capped, already-fused list.
     extra_where, extra_params = build_filter_clause(args, include_project=False)
-    results, contributing, embedding_unavailable = _search_hits(conn, args, extra_where, extra_params)
-    if embedding_unavailable:
+    results, contributing, embed_info = _search_hits(conn, args, extra_where, extra_params)
+    embed_state = embed_info.get("state")
+    if embed_state == "unavailable":
         # Ruling 80: a "vector"/"hybrid" mode's own query-embedding step
         # failed -- _search_hits already fell back to FTS-only ranking
         # (results above ARE the FTS-only results); this just names it.
         print(
             "search: embeddings unavailable; falling back to FTS-only",
+            file=sys.stderr,
+        )
+    elif embed_state == "fingerprint-mismatch":
+        # Design R4 (audit MC-P1-06): the stored vectors were made by a
+        # different model/pipeline -- _search_hits already fell back to
+        # FTS-only (the vector query never ran at all).
+        print(
+            f"search: embeddings were made by a different model "
+            f"({embed_info['stored_fingerprint']} vs {embed_info['current_fingerprint']}); "
+            "using FTS only -- run reindex to re-embed",
+            file=sys.stderr,
+        )
+    dim_mismatch_rows = embed_info.get("dimension_mismatch_rows", 0)
+    if dim_mismatch_rows:
+        print(
+            f"search: {dim_mismatch_rows} vector row(s) skipped (dimension mismatch); "
+            "results may be incomplete",
             file=sys.stderr,
         )
 
@@ -1963,8 +2297,10 @@ def cmd_search(args) -> int:
         extra: dict = {}
         if root is not None and state in ("upgrade-required", "stale", "quarantined"):
             extra["state"] = state
-        if embedding_unavailable:
-            extra["embedding"] = "unavailable"
+        if embed_state:
+            extra["embedding"] = embed_state
+        if dim_mismatch_rows:
+            extra["dimension_mismatch_rows"] = dim_mismatch_rows
         if extra:
             print(json.dumps({**extra, "results": out}, indent=2))
         else:
@@ -2584,7 +2920,13 @@ def _resolve_symbol_via_code_index(code_root: Path, symbol: str, project: str) -
     same preflight code-search's own heal decision reads) may still commit
     a stored file's mtime/size cache refresh when a drifted-looking row's
     content turns out unchanged (cache bookkeeping, not a repair -- see
-    _root_report's own docstring). Untrusted (returns None, sending the caller to the disk
+    _root_report's own docstring), AND -- design R3's git trigger, task-3-
+    review NIT #5 -- may equally commit a bare `code_meta.head_sha` refresh
+    on this same call path, when the repo's HEAD moved but every diffed
+    path still verifies unchanged (_root_report's own `git_delta ==
+    "verified"` branch). Same bookkeeping-not-repair status either way:
+    fail-open, no chunk/status row is ever written by either refresh.
+    Untrusted (returns None, sending the caller to the disk
     scan) whenever: the report's overall state is `stale` (some root's
     content has drifted -- a state-wide caution, since a chunk this SAME
     root reports as current could still be a false hit once ANY root in
@@ -3049,6 +3391,7 @@ def _refresh_record_stat(conn: sqlite3.Connection, project: str, path: str, stat
 def _decision_content_compare(
     conn: sqlite3.Connection, root: Path, project: str, *,
     verify_content: bool = False, skipped: list | None = None,
+    stop_at_first_mismatch: bool = False,
 ) -> dict:
     """Shared by `_index_has_drift` (reduces this to a bool, for the five
     metadata-only readers and `unmapped`'s content-proven self-heal gate)
@@ -3082,6 +3425,22 @@ def _decision_content_compare(
     on a phantom row forever, never reaching a reindex that would clear
     it.
 
+    `stop_at_first_mismatch=True` (task-3-review MODERATE #1): breaks the
+    walk the instant `added` or `changed` gets its first entry -- restores
+    the pre-Task-3 `_index_has_drift`'s early-exit-on-first-mismatch for
+    the five metadata-only readers' hot path (their default
+    `verify_content=False` call, via `_index_has_drift` below), which this
+    function's single-walk restructure had lost (a bounded regression: the
+    common no-drift case already required a full walk either way, since
+    proving "nothing was removed" needs to see every stored path -- this
+    flag only ever shortens the DRIFT-FOUND case, never the clean one).
+    `removed` is NOT accurately computed when the walk broke early (it
+    needs the full `seen` set to know what's missing) -- callers that only
+    need a bool (`_index_has_drift`) don't care, since `added`/`changed`
+    already being non-empty is sufficient; `cmd_check` never passes this
+    flag (it always needs the exact, complete lists) so its own `removed`
+    is unaffected.
+
     Returns `{"added": [...], "changed": [...], "removed": [...],
     "quarantined": [{"path", "diagnostics"}]}` (all lists of path strings
     except `quarantined`; `removed` is sorted, matching cmd_check's prior
@@ -3105,6 +3464,7 @@ def _decision_content_compare(
     changed: list = []
     quarantined_report: list = []
     touched = False
+    removed: list = []
     for f in walk_markdown(root, skipped=skipped):
         path_str = str(f)
         seen.add(path_str)
@@ -3117,6 +3477,8 @@ def _decision_content_compare(
                     current_sha = hashlib.sha256(f.read_bytes()).hexdigest()
                 except OSError:
                     changed.append(path_str)
+                    if stop_at_first_mismatch:
+                        break
                     continue
                 if current_sha != prev_sha:
                     changed.append(path_str)
@@ -3125,6 +3487,8 @@ def _decision_content_compare(
                     touched = True
             elif prev_mtime != stat.st_mtime or prev_size != stat.st_size:
                 changed.append(path_str)
+            if stop_at_first_mismatch and changed:
+                break
             continue
         qentry = quarantined_rows.get(path_str)
         if qentry is not None:
@@ -3135,11 +3499,18 @@ def _decision_content_compare(
                 current_sha = stored_sha   # still unreadable -- can't re-verify, stays accounted
             if current_sha != stored_sha:
                 changed.append(path_str)
+                if stop_at_first_mismatch:
+                    break
             else:
                 quarantined_report.append({"path": path_str, "diagnostics": json.loads(diagnostics_json)})
             continue
         added.append(path_str)
-    removed = sorted((set(existing.keys()) | set(quarantined_rows.keys())) - seen)
+        if stop_at_first_mismatch:
+            break
+    else:
+        # The walk completed WITHOUT an early break -- only then is
+        # `removed` (existing/quarantined paths never `seen`) knowable.
+        removed = sorted((set(existing.keys()) | set(quarantined_rows.keys())) - seen)
     if touched:
         conn.commit()
     return {"added": added, "changed": changed, "removed": removed, "quarantined": quarantined_report}
@@ -3151,8 +3522,12 @@ def _index_has_drift(
     """The boolean reduction of `_decision_content_compare`, for
     `decision_index_state`'s `stale` check (five metadata-only readers,
     default `verify_content=False`) and `unmapped`'s content-proven
-    self-heal gate (`verify_content=True`)."""
-    r = _decision_content_compare(conn, root, project, verify_content=verify_content)
+    self-heal gate (`verify_content=True`). task-3-review MODERATE #1:
+    `stop_at_first_mismatch=True` restores this function's pre-Task-3
+    early-exit-on-first-mismatch (a bool answer never needs the complete
+    added/changed/removed lists -- see _decision_content_compare's own
+    docstring for the bound on this)."""
+    r = _decision_content_compare(conn, root, project, verify_content=verify_content, stop_at_first_mismatch=True)
     return bool(r["added"] or r["changed"] or r["removed"])
 
 
@@ -3318,6 +3693,38 @@ def cmd_unmapped(args) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _decision_vector_index_state(conn: sqlite3.Connection, project: str) -> str:
+    """Design R4 (audit MC-P1-06, TOP-0123 L4): `check`'s vector_index_state
+    ('none' | 'partial' | 'full' | 'mismatch'), computed WITHOUT loading a
+    model (check must never import fastembed). `mismatch`: a stored
+    db_meta.embedding_fingerprint exists and does not match the STATIC
+    current fingerprint (fingerprints_match wildcards `revision` whenever
+    either side is "unknown" -- the static fingerprint's revision always
+    is -- so a healthy DB, embedded by any revision of the same model/
+    pipeline, never reads `mismatch` from `check`). Otherwise the fresh-
+    join count (embed_sha matches AND embed_fp's STATIC prefix matches --
+    compared in SQL, not via fingerprints_match in Python, so this never
+    fetches every row)."""
+    stored_row = conn.execute("SELECT value FROM db_meta WHERE key='embedding_fingerprint'").fetchone()
+    stored_fp = stored_row["value"] if stored_row else None
+    static_current = embedding_fingerprint(model=None)
+    if stored_fp and not fingerprints_match(stored_fp, static_current):
+        return "mismatch"
+    total = conn.execute("SELECT COUNT(*) AS n FROM records WHERE project=?", (project,)).fetchone()["n"]
+    static_prefix = _fingerprint_static_prefix(static_current)
+    fresh = conn.execute(
+        "SELECT COUNT(*) AS n FROM records r JOIN embeddings e "
+        "ON e.path=r.path AND e.embed_sha=r.sha256 "
+        "WHERE e.project=? AND e.embed_fp IS NOT NULL AND substr(e.embed_fp,1,?)=?",
+        (project, len(static_prefix), static_prefix),
+    ).fetchone()["n"]
+    if total == 0 or fresh == 0:
+        return "none"
+    if fresh == total:
+        return "full"
+    return "partial"
+
+
 def cmd_check(args) -> int:
     root = Path(args.root).resolve()
     db_path = resolve_db_path(args)
@@ -3382,6 +3789,7 @@ def cmd_check(args) -> int:
         "SELECT COUNT(*) AS n FROM embeddings e JOIN records r ON r.path=e.path AND r.sha256=e.embed_sha "
         "WHERE e.project=?", (args.project,)
     ).fetchone()["n"]
+    report["vector_index_state"] = _decision_vector_index_state(conn, args.project)
     if args.json:
         print(json.dumps(report, indent=2))
     else:
@@ -3819,7 +4227,8 @@ def split_qualified(qualified_name: str) -> str:
 
 def code_embed_text_for(rel_path: str, chunk: dict, body_lines: list) -> str:
     """file path, qualified name PLUS split tokens, signature, doc comment,
-    first ~25 body lines -- in that order (per the spec)."""
+    first ~25 body lines -- in that order (per the spec).
+    bump EMBED_PIPELINE_VERSION when this changes."""
     split_tokens = split_qualified(chunk["qualified_name"])
     parts = [
         rel_path,
@@ -4165,6 +4574,30 @@ def cmd_code_reindex(args) -> int:
     availability = chunkers.backend_availability()
     retry_not_indexed = getattr(args, "retry_not_indexed", True)
 
+    # Design R4 (audit MC-P1-06, TOP-0123 L4): load the model up front,
+    # once, whenever this run may embed -- both the per-file "unchanged
+    # file, top up its missing embeddings" query below and the final zip
+    # need the REAL current fingerprint (revision included), and an old-
+    # fingerprint chunk must look exactly like a missing one to either
+    # query (no separate "seed everything as due" flag needed: adding
+    # `AND e.embed_fp = ?` to the LEFT JOINs that already detect "lacks a
+    # vector" does it). A load failure here is treated exactly like
+    # today's embedding-unavailable path: one stderr line, `args.no_embed`
+    # forced True for the rest of this run (no chunk is queued for
+    # embedding, so the final zip below never runs and never repeats it).
+    model = None
+    current_fp = None
+    if not args.no_embed:
+        loaded, embed_load_err = try_compute_embeddings(load_embedding_model)
+        if embed_load_err is not None:
+            print(
+                f"code-reindex: embeddings unavailable ({embed_load_err}); continuing without embeddings",
+                file=sys.stderr,
+            )
+            args.no_embed = True
+        else:
+            model, current_fp = loaded
+
     skipped_unknown: Counter = Counter()
     files = list(iter_code_source_files(root, langs, skipped_unknown))
     seen = set()
@@ -4272,11 +4705,16 @@ def cmd_code_reindex(args) -> int:
                     # file's chunks may still lack embeddings left by an
                     # earlier --no-embed run, so top those up without
                     # re-chunking a file whose content didn't move.
+                    # Design R4 (audit MC-P1-06): `AND e.embed_fp = ?` makes
+                    # an old-fingerprint (or NULL, pre-fingerprint) vector
+                    # look exactly like a missing one -- the SAME query
+                    # that already tops up a genuinely missing embedding
+                    # also re-embeds a stale one, with no separate branch.
                     missing = conn.execute(
                         "SELECT c.id, c.qualified_name, c.signature, c.doc, c.start_line, c.end_line "
-                        "FROM chunks c LEFT JOIN embeddings e ON e.chunk_id = c.id "
+                        "FROM chunks c LEFT JOIN embeddings e ON e.chunk_id = c.id AND e.embed_fp = ? "
                         "WHERE c.project=? AND c.code_root=? AND c.path=? AND e.chunk_id IS NULL",
-                        (args.project, root_s, rel),
+                        (current_fp, args.project, root_s, rel),
                     ).fetchall()
                     if missing:
                         unchanged_text_lines = data.decode("utf-8", errors="replace").splitlines()
@@ -4407,21 +4845,30 @@ def cmd_code_reindex(args) -> int:
         # stays 0), the chunk rows themselves are untouched, and the real-
         # coverage embedding_mode recompute further down naturally reports
         # the now-incomplete coverage without any extra forcing here.
-        vecs, embed_err = try_compute_embeddings(compute_embeddings, pending_texts)
+        # Design R4: `model` was already loaded above (before the per-file
+        # loop) -- reused here, one load for the whole run, not two.
+        vecs, embed_err = try_compute_embeddings(compute_embeddings, pending_texts, model)
         if embed_err is not None:
             print(
                 f"code-reindex: embeddings unavailable ({embed_err}); continuing without embeddings",
                 file=sys.stderr,
             )
-            vecs = []
-        for cid, v in zip(pending_ids, vecs):
-            packed = pack_vector(v)
-            conn.execute(
-                "INSERT OR REPLACE INTO embeddings (chunk_id, project, dim, vector) VALUES (?,?,?,?)",
-                (cid, args.project, len(unpack_vector(packed)), packed),
+        elif len(vecs) != len(pending_texts):
+            # Design R4 item 5 (audit MC-P1-06): batch-length check BEFORE
+            # any zip -- nothing is written on a short/long return.
+            print(
+                f"code-reindex: embeddings unavailable (backend returned {len(vecs)} vectors for "
+                f"{len(pending_texts)} texts); continuing without embeddings",
+                file=sys.stderr,
             )
-        if embed_err is None:
-            reembeds = len(pending_texts)
+        else:
+            for cid, v in zip(pending_ids, vecs):
+                packed = pack_vector(v)
+                conn.execute(
+                    "INSERT OR REPLACE INTO embeddings (chunk_id, project, dim, vector, embed_fp) VALUES (?,?,?,?,?)",
+                    (cid, args.project, len(unpack_vector(packed)), packed, current_fp),
+                )
+            reembeds = len(vecs)
 
     removed = set(existing.keys()) - seen
     for rel in removed:
@@ -4467,16 +4914,46 @@ def cmd_code_reindex(args) -> int:
                 "UPDATE code_project SET embedding_mode='none' WHERE project=?", (args.project,)
             )
             downgraded = True
+        # Design R4 item 9 (audit MC-P1-06): a --no-embed run reports a
+        # standing fingerprint mismatch (STATIC comparison only -- no
+        # model load) but never repairs it; only when the project already
+        # has embedding rows (a project that has never been embedded has
+        # no stored fingerprint for an unremarkable reason).
+        stored_fp_row = conn.execute(
+            "SELECT embedding_fingerprint FROM code_project WHERE project=?", (args.project,)
+        ).fetchone()
+        stored_code_fp = stored_fp_row["embedding_fingerprint"] if stored_fp_row else None
+        has_vectors = conn.execute(
+            "SELECT 1 FROM embeddings WHERE project=? LIMIT 1", (args.project,)
+        ).fetchone() is not None
+        if has_vectors and not fingerprints_match(stored_code_fp, embedding_fingerprint(model=None)):
+            print(
+                "code-reindex: stored embeddings were made by a different model; "
+                "run without --no-embed to re-embed",
+                file=sys.stderr,
+            )
     else:
+        # Design R4: same `AND e.embed_fp = ?` addition -- an old-
+        # fingerprint chunk in another root counts as stranded, so `full`
+        # is never claimed while any chunk project-wide still carries a
+        # foreign-model vector.
         stranded_elsewhere = conn.execute(
-            "SELECT COUNT(*) AS n FROM chunks c LEFT JOIN embeddings e ON e.chunk_id = c.id "
+            "SELECT COUNT(*) AS n FROM chunks c LEFT JOIN embeddings e ON e.chunk_id = c.id AND e.embed_fp = ? "
             "WHERE c.project=? AND e.chunk_id IS NULL",
-            (args.project,),
+            (current_fp, args.project),
         ).fetchone()["n"]
         conn.execute(
             "UPDATE code_project SET embedding_mode=? WHERE project=?",
             ("none" if stranded_elsewhere else "full", args.project),
         )
+        # Design R4 (audit MC-P1-06): the new fingerprint lands in the SAME
+        # transaction as the vectors of a run that embedded anything --
+        # never written on a run that wrote no vector at all.
+        if reembeds > 0 and current_fp is not None:
+            conn.execute(
+                "UPDATE code_project SET embedding_fingerprint=? WHERE project=?",
+                (current_fp, args.project),
+            )
 
     conn.commit()
     conn.close()
@@ -4768,17 +5245,40 @@ def code_hits_fts(conn: sqlite3.Connection, query: str, project: str, limit: int
     return exact + [i for i in ids if i not in exact_set]
 
 
-def code_hits_vector(conn: sqlite3.Connection, query: str, project: str):
+def code_hits_vector(conn: sqlite3.Connection, query: str, project: str, *, model=None, stats: dict | None = None):
     """Ruling 80: same EmbeddingUnavailableError contract as vector_ranked
     -- cmd_code_search catches this ONE specific type to fall back to
-    FTS-only, never a blanket `except Exception`."""
-    qvec, embed_err = try_compute_embeddings(compute_query_embedding, query)
+    FTS-only, never a blanket `except Exception`.
+
+    Design R4 (audit MC-P1-06): same shape as vector_ranked -- the
+    freshness filter gains `embed_fp = ? AND dim = ?` against the CURRENT
+    fingerprint/query-vector length (a NULL or foreign-model row is never
+    ranked); `model=None` loads its own (every existing direct caller);
+    a per-row dimension mismatch is caught, skipped, and counted into
+    `stats["dimension_mismatch_rows"]` when given."""
+    if model is None:
+        loaded, embed_err = try_compute_embeddings(load_embedding_model)
+        if embed_err is not None:
+            raise EmbeddingUnavailableError(embed_err)
+        model, current_fp = loaded
+    else:
+        current_fp = embedding_fingerprint(model)
+    qvec, embed_err = try_compute_embeddings(compute_query_embedding, query, model)
     if embed_err is not None:
         raise EmbeddingUnavailableError(embed_err)
     rows = conn.execute(
-        "SELECT chunk_id, vector FROM embeddings WHERE project=?", (project,)
+        "SELECT chunk_id, vector FROM embeddings WHERE project=? AND embed_fp=? AND dim=?",
+        (project, current_fp, len(qvec)),
     ).fetchall()
-    scored = [(r["chunk_id"], cosine(qvec, unpack_vector(r["vector"]))) for r in rows]
+    scored = []
+    dim_mismatch = 0
+    for r in rows:
+        try:
+            scored.append((r["chunk_id"], cosine(qvec, unpack_vector(r["vector"]))))
+        except ValueError:
+            dim_mismatch += 1
+    if stats is not None and dim_mismatch:
+        stats["dimension_mismatch_rows"] = stats.get("dimension_mismatch_rows", 0) + dim_mismatch
     scored.sort(key=lambda t: t[1], reverse=True)
     return scored
 
@@ -4864,6 +5364,13 @@ def _root_report(
         # count as changed -- code_index_report folds this into `degraded`
         # (never `current`) via missing_root, binding point 5. No git
         # trigger for a root that isn't there to diff against.
+        # task-3-review MODERATE #3: `verified` must not read True here --
+        # nothing was hashed for a root that doesn't exist, and this is
+        # the ONLY field a caller reading a single root's own entry (not
+        # the aggregate `state`) sees; `verified: True` on a missing root
+        # was technically true to "verify_content was requested" but reads
+        # as "this root's content was proven", which it wasn't.
+        rep["verified"] = False
         return rep
     seen = set()
     hashed = set()
@@ -5259,28 +5766,74 @@ def cmd_code_search(args) -> int:
                 file=sys.stderr,
             )
 
-    # Ruling 80: a "vector"/"hybrid" mode's own query-embedding step
-    # raises EmbeddingUnavailableError (code_hits_vector's own contract,
-    # mirroring vector_ranked) -- caught HERE, once, to fall back to
-    # FTS-only instead of crashing code-search.
-    embedding_unavailable = False
+    # Design R4 (audit MC-P1-06, TOP-0123 L4): the stored fingerprint is
+    # read once, unconditionally (cheap, no model) -- code-search --json
+    # always carries it, and the vector/hybrid modes below compare it
+    # against the loaded model's real fingerprint before ever running a
+    # vector query.
+    stored_code_fp_row = conn.execute(
+        "SELECT embedding_fingerprint FROM code_project WHERE project=?", (args.project,)
+    ).fetchone()
+    stored_code_fp = stored_code_fp_row["embedding_fingerprint"] if stored_code_fp_row else None
+
+    # Ruling 80: a "vector"/"hybrid" mode's own query-embedding (or model-
+    # load) step failure is reported as `embed_state == "unavailable"`
+    # (code_hits_vector's own EmbeddingUnavailableError contract, mirroring
+    # vector_ranked) -- caught HERE, once, to fall back to FTS-only instead
+    # of crashing code-search. Design R4: a fingerprint mismatch is
+    # detected the SAME way as the decision side's _search_hits (model
+    # loaded once, compared against `stored_code_fp`, ONLY when the
+    # project already has embedding rows) -- on a mismatch the vector
+    # query is skipped entirely (never calls code_hits_vector).
+    embed_state = None
+    dim_mismatch_rows = 0
+    current_code_fp = None
+    model = None
+    if args.mode in ("vector", "hybrid"):
+        loaded, embed_load_err = try_compute_embeddings(load_embedding_model)
+        if embed_load_err is not None:
+            embed_state = "unavailable"
+        else:
+            model, current_code_fp = loaded
+            has_vectors = conn.execute(
+                "SELECT 1 FROM embeddings WHERE project=? LIMIT 1", (args.project,)
+            ).fetchone() is not None
+            if has_vectors and not fingerprints_match(stored_code_fp, current_code_fp):
+                embed_state = "fingerprint-mismatch"
+                model = None   # signals "do not run the vector query" below
+
     if args.mode == "fts":
         ids = code_hits_fts(conn, args.query, args.project)
         results = [(cid, float(len(ids) - i)) for i, cid in enumerate(ids)]
     elif args.mode == "vector":
-        try:
-            results = code_hits_vector(conn, args.query, args.project)
-        except EmbeddingUnavailableError:
-            embedding_unavailable = True
+        if embed_state in ("unavailable", "fingerprint-mismatch"):
             ids = code_hits_fts(conn, args.query, args.project)
             results = [(cid, float(len(ids) - i)) for i, cid in enumerate(ids)]
+        else:
+            stats: dict = {}
+            try:
+                results = code_hits_vector(conn, args.query, args.project, model=model, stats=stats)
+            except EmbeddingUnavailableError:
+                embed_state = "unavailable"
+                ids = code_hits_fts(conn, args.query, args.project)
+                results = [(cid, float(len(ids) - i)) for i, cid in enumerate(ids)]
+            else:
+                dim_mismatch_rows = stats.get("dimension_mismatch_rows", 0)
     elif args.mode == "hybrid":
         fts_ids = code_hits_fts(conn, args.query, args.project)
-        try:
-            vec_ids = [cid for cid, _ in code_hits_vector(conn, args.query, args.project)]
-        except EmbeddingUnavailableError:
-            embedding_unavailable = True
+        if embed_state in ("unavailable", "fingerprint-mismatch"):
             vec_ids = []   # degrades the RRF fusion below to FTS-only, not a crash
+        else:
+            stats = {}
+            try:
+                vec_ids = [
+                    cid for cid, _ in code_hits_vector(conn, args.query, args.project, model=model, stats=stats)
+                ]
+            except EmbeddingUnavailableError:
+                embed_state = "unavailable"
+                vec_ids = []
+            else:
+                dim_mismatch_rows = stats.get("dimension_mismatch_rows", 0)
         k = 60
         scores: dict = {}
         for i, cid in enumerate(fts_ids):
@@ -5291,9 +5844,21 @@ def cmd_code_search(args) -> int:
     else:
         raise ValueError(f"unknown mode {args.mode}")
 
-    if embedding_unavailable:
+    if embed_state == "unavailable":
         print(
             "code-search: embeddings unavailable; falling back to FTS-only",
+            file=sys.stderr,
+        )
+    elif embed_state == "fingerprint-mismatch":
+        print(
+            f"code-search: embeddings were made by a different model "
+            f"({stored_code_fp} vs {current_code_fp}); using FTS only -- run code-reindex to re-embed",
+            file=sys.stderr,
+        )
+    if dim_mismatch_rows:
+        print(
+            f"code-search: {dim_mismatch_rows} vector row(s) skipped (dimension mismatch); "
+            "results may be incomplete",
             file=sys.stderr,
         )
 
@@ -5390,10 +5955,16 @@ def cmd_code_search(args) -> int:
             "failed": report["failed"],
             "not_indexed": report["not_indexed"],
             "embedding_mode": report["embedding_mode"],
+            # Design R4 (audit MC-P1-06): the stored fingerprint, always
+            # present (None on a project never embedded) -- independent of
+            # mode, so a caller can see it without a mismatch happening.
+            "embedding_fingerprint": stored_code_fp,
             "results": out,
         }
-        if embedding_unavailable:   # item 4 (ruling 80): a query-embedding failure this call
-            payload["embedding"] = "unavailable"
+        if embed_state:   # item 4 (ruling 80) / design R4: this call's own vector-channel outcome
+            payload["embedding"] = embed_state
+        if dim_mismatch_rows:
+            payload["dimension_mismatch_rows"] = dim_mismatch_rows
         print(json.dumps(payload, indent=2))
     else:
         # Task 6: a path alone is ambiguous once a project has more than

@@ -1664,9 +1664,65 @@ real reindex refreshes it. The row is never deleted on a stale edit — deleting
 it would lose the "this needs a backfill" signal the sha mismatch itself
 carries — only replaced on the next embedding-capable pass.
 
+**`embed_sha` alone answers "which source text"; `embed_fp` answers "which
+model".** Every `embeddings` row also carries `embed_fp`, a flat
+`model=<name>;dim=<n>;pipeline=<v>;prefix=none;norm=l2;fastembed=<version>;
+revision=<snapshot or "unknown">` string identifying the model/pipeline that
+produced that specific vector (`embedding_fingerprint()`; the code index's
+`embeddings.embed_fp`/`code_project.embedding_fingerprint` carry the same
+shape). `revision` is the loaded model's HF snapshot directory basename when
+a real model was loaded, `"unknown"` otherwise; two fingerprints are
+considered equal (`fingerprints_match`) key-for-key except `revision`, which
+is compared only when NEITHER side is `"unknown"` — a command that never
+loaded a model (`check`, a `--no-embed`/`--auto` reindex) cannot verify
+revision and must never call a healthy db `mismatch` over it. `vector_ranked`/
+`code_hits_vector`'s freshness join adds `AND e.embed_fp = ? AND e.dim = ?`
+against the CURRENT model's real fingerprint and the query vector's length —
+a NULL `embed_fp` (a pre-fingerprint row) or a foreign one (a model swap)
+is therefore excluded from ranking exactly like a stale `embed_sha`, never
+mixed with same-project vectors from a different model or dimension. `cosine`
+itself raises a typed `VectorDimensionMismatch` (a `ValueError` subclass) on
+unequal-length vectors and a plain `ValueError` on a non-finite component
+(`zip` used to silently truncate a length mismatch instead); the scoring
+loops catch either, per row, skip it, and count it into the JSON envelope's
+`dimension_mismatch_rows` when > 0 — a defensive path (the SQL `dim` gate
+already excludes the common case), reached only by a corrupted blob whose
+stored `dim` column lies. Before either embedding zip (decision or code
+index), `len(vectors) != len(texts)` is treated as a full embedding failure —
+nothing is written, stderr names both counts — rather than silently
+mis-zipping a short/long/mis-ordered backend response; `reembeds` (code
+index) and `backfilled` (decision index) both count vectors *actually
+written*, never texts merely sent.
+
+At query time (`search`/`code-search`, vector and hybrid modes), the model is
+loaded once and its fingerprint compared against the stored one — ONLY when
+the project already has at least one embeddings row (a project that has
+never been embedded has no stored fingerprint for an unremarkable reason, not
+a model swap). On a mismatch the vector query is skipped entirely (never
+calls `vector_ranked`/`code_hits_vector`): stderr names
+`search: embeddings were made by a different model (<stored> vs <current>);
+using FTS only -- run reindex to re-embed` (code: `run code-reindex`), the
+`--json` envelope's `"embedding"` field reads `"fingerprint-mismatch"` (the
+same slot that reads `"unavailable"` on a broken backend), hybrid returns the
+FTS-only list, and the command exits 0.
+
+At reindex time (embedding enabled), the model is loaded once, up front —
+before deciding what needs re-embedding — specifically so a fingerprint
+mismatch can be caught even when no row's `sha256` moved: on a mismatch (or a
+NULL stored fingerprint while the project already has embedding rows) every
+row is treated as due for re-embed, and the new fingerprint lands in the same
+transaction as the vectors of the run that wrote it. Under `--no-embed`
+(decision side: `--no-embed`/`--auto`) the mismatch is reported once on
+stderr, using only the STATIC fingerprint (no model load — a `--no-embed`
+run never touches fastembed), and is deliberately NOT repaired.
+
 **`embedding_mode`** (`db_meta['embedding_mode']`, one of `none` / `partial` /
 `full`) mirrors the code index's own field and is recomputed from *actual
-fresh coverage* — `fresh == 0` → `none`, `fresh == total` → `full`, otherwise
+fresh coverage* — a row counts as fresh only when its `embed_sha` AND its
+`embed_fp` (matched against the current fingerprint's static fields — the
+model was loaded this run whenever embedding was enabled; a `--no-embed`/
+`--auto` run compares only the static prefix, since no model was loaded)
+both match — `fresh == 0` → `none`, `fresh == total` → `full`, otherwise
 `partial` — on every reindex except a no-op `--auto` pass (nothing added,
 changed, or removed): an internal heal must never announce, or force, a mode
 change for a change that did not happen. A run that does change rows under
@@ -1797,11 +1853,17 @@ below); `check` lists each one under its own `quarantined` key alongside
 `added`/`changed`/`removed`.
 
 **Lazy imports.** `fastembed` (and, transitively, numpy) is imported only inside
-`compute_embeddings`, `compute_query_embedding`, and the branches of
-`cmd_search` that call them. `reindex --no-embed`, `chain`, `for-path` and
-`search --mode fts` never trigger those imports — asserted by a
-subprocess-isolated test (`test_for_path_does_not_import_fastembed`), because
-`for-path` runs in a pre-edit hook and must not pay a numpy import.
+`compute_embeddings`, `compute_query_embedding`, `load_embedding_model`, and
+the branches of `cmd_search`/`cmd_code_search` that call them. `reindex
+--no-embed`, `chain`, `for-path` and `search --mode fts` never trigger those
+imports — asserted by a subprocess-isolated test
+(`test_for_path_does_not_import_fastembed`), because `for-path` runs in a
+pre-edit hook and must not pay a numpy import. `embedding_fingerprint()`'s
+STATIC part (everything but `revision`, which needs a loaded model) reads
+`importlib.metadata.version("fastembed")` — the installed package's dist-info,
+without ever executing `fastembed/__init__.py` — so `check`'s
+`vector_index_state` reports `mismatch`/`none`/`partial`/`full` without
+importing fastembed either, verified the same way.
 
 ## CLI semantics
 
@@ -1827,10 +1889,12 @@ down:
   fixed raw ceiling — before the query returns. `vector_ranked` carries no
   cap at all — it scores every fresh embedded
   row for the project matching the filter — and joins `embeddings` to
-  `records` on `embed_sha == sha256` (see
+  `records` on `embed_sha == sha256`, PLUS `embed_fp`/`dim` against the
+  current model's real fingerprint and the query vector's length (see
   [Decision index provenance](#decision-index-provenance-and-embedding-lifecycle)),
-  so a vector kept stale across a `--no-embed`/`--auto` edit is never a
-  candidate at all. Each `--json` hit reports the topic's real path (never a
+  so a vector kept stale across a `--no-embed`/`--auto` edit, or one made by
+  a different model/dimension entirely, is never a candidate at all. Each
+  `--json` hit reports the topic's real path (never a
   link row's own synthetic surrogate path); a hit whose fused winner was a
   link row also carries `matched_link_id`/`link_status`/`link_authority` (that
   link's own `status`, checked independently of its parent topic's — `--status`
@@ -1895,7 +1959,14 @@ down:
   sha mismatch IS `changed` (`changed` means content changed, not metadata
   moved). Exits 1 on any drift. Its `--json` report also carries
   `source_topic_count`/`searchable_row_count`/`searchable_vector_count` —
-  see the `search` bullet above — and `symlinks_skipped`, the count of
+  see the `search` bullet above — `vector_index_state` (`none` / `partial` /
+  `full` / `mismatch`, computed WITHOUT loading a model: `mismatch` when a
+  stored `db_meta['embedding_fingerprint']` exists and does not match the
+  STATIC current fingerprint — `revision` is always `"unknown"` on the
+  no-model-loaded side, so a healthy db, embedded by any revision of the
+  same model/pipeline, never reads `mismatch` here; otherwise the fresh-join
+  count, gated on the row's `embed_fp` matching the static fingerprint's
+  prefix) — and `symlinks_skipped`, the count of
   symlinked directories/files the walker skipped this run; and `state`
   (the same word `decision_index_state` reports, computed from THIS same
   walk rather than a second one) and `quarantined` — one `{path,
@@ -1986,18 +2057,27 @@ down:
   answer stays honest uncertainty under **metadata-current**, evidence only
   under **current**, never silently upgraded. `--json` wraps hits in
   `{"state", "code_root", "code_roots", "indexed_at", "head_sha", "changed",
-  "failed", "not_indexed", "embedding_mode", "results"}`, where each
+  "failed", "not_indexed", "embedding_mode", "embedding_fingerprint",
+  "results"}` — `embedding_fingerprint` is the STORED `code_project`
+  fingerprint (`None` on a project never embedded), always present
+  regardless of mode — where each
   `code_roots` entry also carries its own `git_delta` (`"unavailable"` — no
   stored `head_sha` to compare, or git failed/timed out; `"unchanged"` — HEAD
   hasn't moved; `"verified"` — HEAD moved and every path the diff touched in
   this root proved clean; `"changed"` — HEAD moved and the diff hashed a real
-  change) and `verified` (whether THIS call hashed the whole root). A db
-  written by a newer engine (see `CodeIndexTooNew` above) never reaches
+  change) and `verified` (whether THIS call hashed the whole root — never
+  `True` for a root that does not `exist`). A vector/hybrid call whose
+  fingerprint check finds a mismatch (only checked when the project already
+  has embedding rows) skips the vector query entirely: `"embedding":
+  "fingerprint-mismatch"` (the same slot that reads `"unavailable"` on a
+  broken backend), stderr names `<stored> vs <current>`, and results are the
+  FTS-only list; a per-row dimension mismatch adds `dimension_mismatch_rows`.
+  A db written by a newer engine (see `CodeIndexTooNew` above) never reaches
   `code_index_report` at all — `code-search` exits 0 with the refusal on
   stderr and, in `--json`, a minimal `{"state": "unavailable", "code_root":
   null, "indexed_at": null, "head_sha": null, "results": []}` (no
-  `code_roots`/`changed`/`failed`/`not_indexed`/`embedding_mode`, since none
-  of those were ever computed).
+  `code_roots`/`changed`/`failed`/`not_indexed`/`embedding_mode`/
+  `embedding_fingerprint`, since none of those were ever computed).
 
 ## Test conventions
 

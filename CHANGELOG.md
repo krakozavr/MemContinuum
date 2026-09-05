@@ -22,6 +22,21 @@
   reported as drift -- the inverse of `check`'s old behaviour. `search`,
   `chain`, `for-path`, `why`, and `drift` keep the metadata-only comparison
   (unchanged) -- `check`/`unmapped` are what prove content, not every reader.
+- Every vector now carries a fingerprint of the model that produced it
+  (model name, dimension, pipeline version, normalization, the installed
+  fastembed version, and the loaded model's revision) -- a vector made by a
+  different model or dimension is never mixed into a ranking. A stale or
+  foreign-model vector is excluded from ranking the same way a stale
+  `embed_sha` already was, not merely scored lower. `search`'s vector/hybrid
+  modes detect a model swap at query time and fall back to FTS-only with a
+  named stderr line and `"embedding": "fingerprint-mismatch"` in `--json`,
+  rather than silently degrading; a reindex with embedding enabled detects
+  the same mismatch and re-embeds every row, once. `cosine` now rejects a
+  dimension mismatch and a non-finite vector component with a typed error
+  instead of silently truncating; a backend that returns the wrong number
+  of vectors for a batch writes nothing rather than mis-assigning them.
+  `check --json` gains `vector_index_state` (`none`/`partial`/`full`/
+  `mismatch`), computed without loading the embedding model.
 
 ### Code index
 - The code index's freshness check now compares five stat signals per file
@@ -36,6 +51,15 @@
   `code_roots` entry in `--json` also carries `git_delta`. The code index
   schema bumps to version 3 (a rebuild on first use, same as any schema
   bump -- roots and languages survive, embeddings do not).
+- The code index's vectors now carry the same model fingerprint as the
+  decision index's (`embeddings.embed_fp`, `code_project.embedding_fingerprint`
+  -- reserved by the schema-3 bump above, wired here): an old-model or
+  foreign-dimension vector is invisible to ranking, `code-search --json`
+  gains `embedding_fingerprint` and, on a query-time mismatch,
+  `"embedding": "fingerprint-mismatch"` with an FTS-only fallback;
+  `code-reindex` re-embeds every chunk on a mismatch, and `reembeds` in its
+  summary line now counts vectors actually written, not chunks merely sent
+  to the backend.
 
 ## [0.2.0rc3] — 2026-09-04
 

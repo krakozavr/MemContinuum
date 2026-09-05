@@ -154,7 +154,9 @@ wrong. Pick its one home.
   Python's own `sqlite3` module provides — nothing to install separately.
 - ~100 MB of disk for the embedding model, downloaded once the first time
   something actually needs to embed. `--no-embed` and `--mode fts` never trigger
-  that download.
+  that download. The index records which model (and dimension) made its
+  vectors and never mixes vectors from a different model or dimension into a
+  ranking; a changed model means a re-embed, not a silently mixed result.
 - Somewhere local for the index. It lives under `~/.memcontinuum/` by default;
   never put it on a synced or cloud-backed drive, where SQLite locking is not
   reliable.
