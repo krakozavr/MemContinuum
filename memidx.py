@@ -919,7 +919,9 @@ def resolve_db_path(args) -> Path:
     return base / f"{args.project}.sqlite"
 
 
-def decision_index_state(db_path: Path, project: str, root: Path | None = None) -> str:
+def decision_index_state(
+    db_path: Path, project: str, root: Path | None = None, *, verify_content: bool = False,
+) -> str:
     """"missing" | "uninitialized" | "upgrade-required" | "stale" |
     "quarantined" | "current" -- ruling 68's five-state model, plus
     "quarantined" (design R2, audit MC-P1-03, TOP-0123 L2). `root`, when
@@ -929,7 +931,14 @@ def decision_index_state(db_path: Path, project: str, root: Path | None = None) 
     the first place). "quarantined" is a plain table lookup (index_errors
     holds rows for this project) and needs no root -- a root-less reader
     CAN see it. "stale" still wins over "quarantined" when both apply
-    (real on-disk drift is the more urgent signal)."""
+    (real on-disk drift is the more urgent signal).
+
+    `verify_content` (design R3, audit MC-P1-02) passes straight through
+    to `_index_has_drift` -- meaningless without `root` (there is nothing
+    to hash). `check`'s OWN drift verdict never comes through this
+    parameter (its restructured loop calls `_decision_content_compare`
+    directly, so the store is walked once, not twice); `cmd_unmapped`'s
+    self-heal gate is the caller that passes `verify_content=True` here."""
     conn = open_db_noncreating(db_path, project)
     if conn is None:
         return "missing"
@@ -951,7 +960,7 @@ def decision_index_state(db_path: Path, project: str, root: Path | None = None) 
             return "upgrade-required"
         if generation < CURRENT_INDEX_GENERATION:
             return "upgrade-required"
-        if root is not None and _index_has_drift(conn, root, project):
+        if root is not None and _index_has_drift(conn, root, project, verify_content=verify_content):
             return "stale"
         has_errors = conn.execute("SELECT 1 FROM index_errors WHERE project=? LIMIT 1", (project,)).fetchone()
         if has_errors is not None:
@@ -3022,60 +3031,129 @@ def cmd_drift(args) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _index_has_drift(conn: sqlite3.Connection, root: Path, project: str) -> bool:
-    """Same added/changed/removed-by-mtime-and-size comparison as cmd_check,
-    factored out so `unmapped` can reuse it without cmd_check's printing.
-    Ruling 66: a link row is never a real file on disk (walk_markdown never
-    yields one), so it must never be mistaken for one that vanished --
-    the NULL-aware source_path predicate (see cmd_reindex's own comment on
-    the identical query) excludes every link row here; a pre-migration
-    legacy row (source_path still NULL) is still counted as real.
+def _refresh_record_stat(conn: sqlite3.Connection, project: str, path: str, stat) -> None:
+    """Design R3 (audit MC-P1-02): bookkeeping-only mtime/size refresh for
+    a same-sha rewrite whose metadata moved -- content, sha256, and every
+    other column stay exactly as stored. One UPDATE reaches BOTH the
+    topic/note row (`path=path`) and every link row `insert_record_rows`
+    derived from it (`source_path=path`) in the same statement: a link
+    row's own `path` differs from the parent's (its `source_path` is what
+    ties it back), but it carries the PARENT's sha/mtime/size, so it needs
+    the identical refresh whenever the parent does."""
+    conn.execute(
+        "UPDATE records SET mtime=?, size=? WHERE project=? AND (path=? OR source_path=?)",
+        (stat.st_mtime, stat.st_size, project, path, path),
+    )
 
-    Design R2 (audit MC-P1-03, TOP-0123 L2): a walked path with no
-    `records` row that IS quarantined is hashed (a few files only -- never
-    a general content hash here, design R3 lands that for real records in
-    Task 3) and compared against its stored `index_errors.sha256`: equal
-    -> ACCOUNTED (not drift), different -> drift (it gets re-parsed on the
-    next reindex). A quarantined path whose FILE has vanished is also
-    drift -- otherwise the state sticks at "quarantined" on a phantom row
-    forever, never reaching a reindex that would clear it."""
+
+def _decision_content_compare(
+    conn: sqlite3.Connection, root: Path, project: str, *,
+    verify_content: bool = False, skipped: list | None = None,
+) -> dict:
+    """Shared by `_index_has_drift` (reduces this to a bool, for the five
+    metadata-only readers and `unmapped`'s content-proven self-heal gate)
+    and `cmd_check` (consumes the lists directly) -- ONE walk of `root`,
+    never two (design R3, audit MC-P1-02: `check` used to call
+    `decision_index_state(root=...)`, itself a full walk via this
+    function's predecessor, and then walk again on its own).
+
+    Ruling 66: a link row is never a real file on disk (walk_markdown
+    never yields one), so it must never be mistaken for one that vanished
+    -- the NULL-aware source_path predicate (see cmd_reindex's own comment
+    on the identical query) excludes every link row from `existing`; a
+    pre-migration legacy row (source_path still NULL) is still counted as
+    real.
+
+    `verify_content=True` hashes every walked record that HAS a stored row
+    and compares against `records.sha256`: a sha match whose mtime/size
+    moved is bookkeeping-refreshed in place (`_refresh_record_stat`) and
+    is NOT changed; a sha mismatch IS changed. `verify_content=False` (the
+    five readers' default) keeps the plain mtime/size comparison -- no
+    hashing, no write, exactly today's behavior.
+
+    Design R2 (audit MC-P1-03, TOP-0123 L2)'s quarantine accounting is
+    UNCONDITIONAL either way (not gated on verify_content -- it already
+    hashes a handful of quarantined files regardless): a walked path with
+    no `records` row that IS quarantined is hashed and compared against
+    its stored `index_errors.sha256` -- equal -> ACCOUNTED (listed under
+    `quarantined`, not `added`/`changed`), different -> `changed` (it is
+    re-parsed on the next reindex). A quarantined path whose file has
+    vanished is `removed` -- otherwise the state sticks at "quarantined"
+    on a phantom row forever, never reaching a reindex that would clear
+    it.
+
+    Returns `{"added": [...], "changed": [...], "removed": [...],
+    "quarantined": [{"path", "diagnostics"}]}` (all lists of path strings
+    except `quarantined`; `removed` is sorted, matching cmd_check's prior
+    output order)."""
     existing = {
-        row["path"]: (row["mtime"], row["size"])
+        row["path"]: (row["sha256"], row["mtime"], row["size"])
         for row in conn.execute(
-            "SELECT path, mtime, size FROM records WHERE project=? "
+            "SELECT path, sha256, mtime, size FROM records WHERE project=? "
             "AND (source_path IS NULL OR source_path = path)",
             (project,),
         )
     }
-    quarantined_shas = {
-        row["path"]: row["sha256"]
-        for row in conn.execute("SELECT path, sha256 FROM index_errors WHERE project=?", (project,))
+    quarantined_rows = {
+        row["path"]: (row["sha256"], row["diagnostics"])
+        for row in conn.execute(
+            "SELECT path, sha256, diagnostics FROM index_errors WHERE project=?", (project,)
+        )
     }
     seen = set()
-    for f in walk_markdown(root):
+    added: list = []
+    changed: list = []
+    quarantined_report: list = []
+    touched = False
+    for f in walk_markdown(root, skipped=skipped):
         path_str = str(f)
         seen.add(path_str)
-        stat = f.stat()
         prev = existing.get(path_str)
         if prev is not None:
-            if prev[0] != stat.st_mtime or prev[1] != stat.st_size:
-                return True
+            prev_sha, prev_mtime, prev_size = prev
+            stat = f.stat()
+            if verify_content:
+                try:
+                    current_sha = hashlib.sha256(f.read_bytes()).hexdigest()
+                except OSError:
+                    changed.append(path_str)
+                    continue
+                if current_sha != prev_sha:
+                    changed.append(path_str)
+                elif prev_mtime != stat.st_mtime or prev_size != stat.st_size:
+                    _refresh_record_stat(conn, project, path_str, stat)
+                    touched = True
+            elif prev_mtime != stat.st_mtime or prev_size != stat.st_size:
+                changed.append(path_str)
             continue
-        qsha = quarantined_shas.get(path_str)
-        if qsha is not None:
+        qentry = quarantined_rows.get(path_str)
+        if qentry is not None:
+            stored_sha, diagnostics_json = qentry
             try:
                 current_sha = hashlib.sha256(f.read_bytes()).hexdigest()
             except OSError:
-                continue   # still unreadable -- nothing new to prove, stays accounted
-            if current_sha != qsha:
-                return True
+                current_sha = stored_sha   # still unreadable -- can't re-verify, stays accounted
+            if current_sha != stored_sha:
+                changed.append(path_str)
+            else:
+                quarantined_report.append({"path": path_str, "diagnostics": json.loads(diagnostics_json)})
             continue
-        return True   # a genuinely new/unindexed, non-quarantined path
-    if set(existing.keys()) - seen:
-        return True
-    if set(quarantined_shas.keys()) - seen:
-        return True
-    return False
+        added.append(path_str)
+    removed = sorted((set(existing.keys()) | set(quarantined_rows.keys())) - seen)
+    if touched:
+        conn.commit()
+    return {"added": added, "changed": changed, "removed": removed, "quarantined": quarantined_report}
+
+
+def _index_has_drift(
+    conn: sqlite3.Connection, root: Path, project: str, *, verify_content: bool = False,
+) -> bool:
+    """The boolean reduction of `_decision_content_compare`, for
+    `decision_index_state`'s `stale` check (five metadata-only readers,
+    default `verify_content=False`) and `unmapped`'s content-proven
+    self-heal gate (`verify_content=True`)."""
+    r = _decision_content_compare(conn, root, project, verify_content=verify_content)
+    return bool(r["added"] or r["changed"] or r["removed"])
 
 
 def _unmapped_path_candidates(raw_path: str, code_root: Path | None) -> list[str]:
@@ -3152,7 +3230,10 @@ def cmd_unmapped(args) -> int:
     unmapped: list[str] = []
     conn: sqlite3.Connection | None = None
     try:
-        state = decision_index_state(db_path, args.project, root=root)
+        # Design R3 (audit MC-P1-02): unmapped's is a NEGATIVE claim
+        # ("no topic covers this file"), so its self-heal gate hashes
+        # content rather than trusting a metadata-only comparison.
+        state = decision_index_state(db_path, args.project, root=root, verify_content=True)
         if state in ("missing", "uninitialized"):
             coverage_status = "uninitialized"
         elif state == "upgrade-required":
@@ -3179,7 +3260,7 @@ def cmd_unmapped(args) -> int:
                         cmd_reindex(reindex_ns)
                     conn.close()
                     conn = open_db_noncreating(db_path, project=args.project)
-                    if conn is not None and _index_has_drift(conn, root, args.project):
+                    if conn is not None and _index_has_drift(conn, root, args.project, verify_content=True):
                         coverage_status = "unknown"
                 if conn is not None:
                     for raw_path in args.paths:
@@ -3240,70 +3321,47 @@ def cmd_unmapped(args) -> int:
 def cmd_check(args) -> int:
     root = Path(args.root).resolve()
     db_path = resolve_db_path(args)
-    # The only root-less-in-this-group... exception: `check` DOES take
-    # --root (the decision store's own markdown tree), so it's the one
-    # reader here that can genuinely see "stale".
-    state = decision_index_state(db_path, args.project, root=root)
-    if state in ("missing", "uninitialized"):
-        return _decision_reply("check", args, state)
+    # Design R3 (audit MC-P1-02): check walks ONCE. The cheap, root-less
+    # generation/stamp check (no walk at all -- root=None skips
+    # _index_has_drift entirely) gives missing/uninitialized/
+    # upgrade-required; check's actual stale/quarantined/current verdict
+    # comes from THIS command's own content-verified walk below, via the
+    # same helper `_index_has_drift` reduces to a bool -- never a second
+    # decision_index_state(root=...) call (that WAS the second walk this
+    # restructure removes).
+    prelim_state = decision_index_state(db_path, args.project)
+    if prelim_state in ("missing", "uninitialized"):
+        return _decision_reply("check", args, prelim_state)
     conn = open_db_noncreating(db_path, project=args.project)
     if conn is None:
         return _decision_reply("check", args, "missing")
+
+    symlinks_skipped: list[Path] = []
+    compare = _decision_content_compare(
+        conn, root, args.project, verify_content=True, skipped=symlinks_skipped
+    )
+    added = compare["added"]
+    changed = compare["changed"]
+    removed = compare["removed"]
+    quarantined_report = compare["quarantined"]
+
+    # `upgrade-required` (a schema-generation gap, unrelated to on-disk
+    # drift -- decision_index_state's generation check never even reaches
+    # a walk) wins the reported state regardless of what this walk found,
+    # matching the pre-restructure precedence (generation checked before
+    # drift, before quarantine). Otherwise the state is THIS walk's own
+    # content-proven verdict -- `changed` now means content changed, not
+    # metadata moved.
+    if prelim_state == "upgrade-required":
+        state = "upgrade-required"
+    elif added or changed or removed:
+        state = "stale"
+    elif quarantined_report:
+        state = "quarantined"
+    else:
+        state = "current"
     if state in ("upgrade-required", "stale", "quarantined"):
         _decision_warn("check", args, state, conn=conn)
-    # Ruling 66: same NULL-aware source_path predicate as cmd_reindex/
-    # _index_has_drift -- a link row is never a real file, never counted
-    # here as added/changed/removed.
-    existing = {
-        row["path"]: (row["mtime"], row["size"])
-        for row in conn.execute(
-            "SELECT path, mtime, size FROM records WHERE project=? "
-            "AND (source_path IS NULL OR source_path = path)",
-            (args.project,),
-        )
-    }
-    # Design R2 (audit MC-P1-03, TOP-0123 L2): the same accounting
-    # `_index_has_drift` uses -- a walked path with no `records` row that
-    # IS quarantined is hashed (a few files only) and compared against its
-    # stored sha: equal -> reported under `quarantined`, not `added`/
-    # `changed`; different -> `changed` (it will be re-parsed on the next
-    # reindex). A quarantined path whose file has vanished is reported
-    # under `removed`, same as any other vanished path.
-    quarantined_rows = {
-        row["path"]: (row["sha256"], row["diagnostics"])
-        for row in conn.execute(
-            "SELECT path, sha256, diagnostics FROM index_errors WHERE project=?", (args.project,)
-        )
-    }
-    symlinks_skipped: list[Path] = []
-    files = list(walk_markdown(root, skipped=symlinks_skipped))
-    seen = set()
-    changed = []
-    added = []
-    quarantined_report = []
-    for f in files:
-        path_str = str(f)
-        seen.add(path_str)
-        stat = f.stat()
-        prev = existing.get(path_str)
-        if prev is not None:
-            if prev[0] != stat.st_mtime or prev[1] != stat.st_size:
-                changed.append(path_str)
-            continue
-        qentry = quarantined_rows.get(path_str)
-        if qentry is not None:
-            stored_sha, diagnostics_json = qentry
-            try:
-                current_sha = hashlib.sha256(f.read_bytes()).hexdigest()
-            except OSError:
-                current_sha = stored_sha   # still unreadable -- can't re-verify, stays accounted
-            if current_sha != stored_sha:
-                changed.append(path_str)
-            else:
-                quarantined_report.append({"path": path_str, "diagnostics": json.loads(diagnostics_json)})
-            continue
-        added.append(path_str)
-    removed = sorted((set(existing.keys()) | set(quarantined_rows.keys())) - seen)
 
     drift = bool(added or changed or removed)
     report = {"added": added, "changed": changed, "removed": removed, "drift": drift,
@@ -3392,7 +3450,13 @@ LANG_EXTENSIONS = {lang: row["extensions"] for lang, row in chunkers.LANGUAGE_TA
 # set. One definition, two names kept for their own call sites' history.
 CODE_SKIP_DIR_NAMES = chunkers.UNIVERSAL_SKIP_DIRS
 
-CODE_SCHEMA_VERSION = 2
+CODE_SCHEMA_VERSION = 3
+# Design R3/R4 (audit MC-P1-02/MC-P1-06): v2 -> v3 adds five stat signals
+# to file_sha (mtime_ns, ctime_ns, ino, dev alongside the existing mtime/
+# size -- content-proven freshness's stat pass) and two fingerprint
+# columns RESERVED for the embedding-fingerprint work still to land
+# (embeddings.embed_fp, code_project.embedding_fingerprint) -- written
+# NULL by this bump, not read anywhere yet. One rebuild for both, not two.
 # Fix-wave item 8: code_project belongs here too -- the v1->v2 preserving
 # path (_preserved_code_config, below) reads the OLD code_meta before this
 # drop runs and reinserts code_project rows from it, but a rebuild that
@@ -3407,7 +3471,8 @@ CODE_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS code_project (
   project TEXT PRIMARY KEY,
   langs TEXT,
-  embedding_mode TEXT NOT NULL DEFAULT 'none'
+  embedding_mode TEXT NOT NULL DEFAULT 'none',
+  embedding_fingerprint TEXT
 );
 
 CREATE TABLE IF NOT EXISTS chunks (
@@ -3437,7 +3502,8 @@ CREATE TABLE IF NOT EXISTS embeddings (
   chunk_id INTEGER PRIMARY KEY,
   project TEXT NOT NULL,
   dim INTEGER NOT NULL,
-  vector BLOB NOT NULL
+  vector BLOB NOT NULL,
+  embed_fp TEXT
 );
 
 CREATE TABLE IF NOT EXISTS file_sha (
@@ -3447,6 +3513,10 @@ CREATE TABLE IF NOT EXISTS file_sha (
   sha256 TEXT,
   mtime REAL,
   size INTEGER,
+  mtime_ns INTEGER,
+  ctime_ns INTEGER,
+  ino INTEGER,
+  dev INTEGER,
   gap_count INTEGER NOT NULL DEFAULT 0,
   chunker_version TEXT,
   status TEXT NOT NULL DEFAULT 'ok',
@@ -3802,11 +3872,16 @@ def _git_head_sha(root: Path) -> str | None:
     code-reindex time, stored in code_meta alongside code_root/
     last_indexed_at, when `root` is (inside) a git repo and git is on
     PATH. Best-effort only -- None (not an exception) on any failure, so a
-    non-git code_root or a missing git binary never breaks code-reindex."""
+    non-git code_root or a missing git binary never breaks code-reindex.
+
+    Design R3 (audit MC-P1-02): also the first call of `_root_report`'s
+    git trigger (is HEAD still what code_meta says?) -- timeout lowered
+    from 5s to 2s to fit inside that trigger's overall 3s-per-report git
+    budget."""
     try:
         result = subprocess.run(
             ["git", "-C", str(root), "rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=2,
         )
     except Exception:
         return None
@@ -3814,6 +3889,27 @@ def _git_head_sha(root: Path) -> str | None:
         return None
     sha = result.stdout.strip()
     return sha or None
+
+
+def _git_call_budgeted(root: Path, extra_args: list[str], deadline: float) -> str | None:
+    """One git call whose timeout shrinks to fit `deadline` (a
+    `time.monotonic()` value) -- the git trigger's diff/show-prefix calls
+    share a single 3s-per-report budget with the initial `_git_head_sha`
+    call (design R3). None (never an exception) on a failure, a timeout,
+    or a deadline already passed."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root)] + extra_args,
+            capture_output=True, text=True, timeout=min(2.0, remaining),
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout
 
 
 CHUNK_REQUIRED_KEYS = (
@@ -3879,50 +3975,67 @@ DETERMINISTIC_FAILURES = (SyntaxError, ValueError)
 
 def write_file_status(
     conn: sqlite3.Connection, project: str, code_root: str, rel: str, *,
-    sha, mtime, size, gap_count, chunker_version, status, reason=None, attempt_key=None,
+    sha, stat, gap_count, chunker_version, status, reason=None, attempt_key=None,
 ) -> None:
     """Single writer for every file_sha row cmd_code_reindex produces --
     success (ok/partial) and failure (failed/not-indexed) alike -- so the
-    column list lives in exactly one place."""
+    column list lives in exactly one place.
+
+    Design R3 (audit MC-P1-02): `stat` is a real `os.stat_result` (or
+    `None` for a vanished file) -- every one of the five freshness signals
+    (mtime, size, and the v3 additions mtime_ns/ctime_ns/ino/dev) comes
+    from that ONE object, so there is exactly one place that can get the
+    unit or the column list wrong. `None` writes every signal NULL (the
+    vanished-file case _record_index_failure already handled by passing
+    mtime=size=None before this change)."""
+    if stat is not None:
+        mtime, size, mtime_ns, ctime_ns, ino, dev = (
+            stat.st_mtime, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino, stat.st_dev,
+        )
+    else:
+        mtime = size = mtime_ns = ctime_ns = ino = dev = None
     conn.execute(
         "INSERT OR REPLACE INTO file_sha (path, project, code_root, sha256, mtime, size, "
-        "gap_count, chunker_version, status, reason, attempt_key) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        (rel, project, code_root, sha, mtime, size, gap_count, chunker_version, status, reason, attempt_key),
+        "mtime_ns, ctime_ns, ino, dev, gap_count, chunker_version, status, reason, attempt_key) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (rel, project, code_root, sha, mtime, size, mtime_ns, ctime_ns, ino, dev,
+         gap_count, chunker_version, status, reason, attempt_key),
     )
 
 
 def _refresh_file_sha_stat(conn: sqlite3.Connection, project: str, code_root: str, rel: str, stat) -> None:
-    """Single writer for the mtime/size-only refresh (Task 4 carried-in fix
-    2, Ruling 57 -- dedupe): content, sha256, gap_count, chunker_version,
+    """Single writer for the stat-only refresh (Task 4 carried-in fix 2,
+    Ruling 57 -- dedupe; design R3 widens it from mtime/size to all five
+    freshness signals): content, sha256, gap_count, chunker_version,
     status and reason are all left exactly as stored. Cache bookkeeping
     only -- a bare `touch` (or a not-indexed row left alone, or a report's
     own sha-confirmed match) must not by itself read as a change on the
     next comparison. Used by cmd_code_reindex's unchanged-file and
-    left-alone-not-indexed branches and by code_index_report's sha-match
+    left-alone-not-indexed branches and by _root_report's sha-match
     refresh, so the identical UPDATE lives in exactly one place."""
     conn.execute(
-        "UPDATE file_sha SET mtime=?, size=? WHERE project=? AND code_root=? AND path=?",
-        (stat.st_mtime, stat.st_size, project, code_root, rel),
+        "UPDATE file_sha SET mtime=?, size=?, mtime_ns=?, ctime_ns=?, ino=?, dev=? "
+        "WHERE project=? AND code_root=? AND path=?",
+        (stat.st_mtime, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino, stat.st_dev,
+         project, code_root, rel),
     )
 
 
 def _record_index_failure(conn, project, code_root, rel, f, *, sha, cv, status, reason, attempt_key=None):
     """Shared tail of both failure paths (B1: fail open, purge stale
-    state). `f` is best-effort stat'd for mtime/size -- a file that
-    vanished mid-run still gets a row, with NULL mtime/size, so the index
-    keeps reporting it rather than going silent. (A permission-denied file
-    still `stat()`s fine on POSIX -- only the read fails -- so mtime/size
-    are usually real for those; NULL is specifically the vanished-file
-    case.)"""
+    state). `f` is best-effort stat'd -- a file that vanished mid-run still
+    gets a row, with every stat signal NULL, so the index keeps reporting
+    it rather than going silent. (A permission-denied file still `stat()`s
+    fine on POSIX -- only the read fails -- so the signals are usually
+    real for those; NULL is specifically the vanished-file case.)"""
     try:
         delete_code_chunks_for_path(conn, project, code_root, rel)
         try:
             st = f.stat()
-            mtime, size = st.st_mtime, st.st_size
         except OSError:
-            mtime = size = None
+            st = None
         write_file_status(
-            conn, project, code_root, rel, sha=sha, mtime=mtime, size=size, gap_count=0,
+            conn, project, code_root, rel, sha=sha, stat=st, gap_count=0,
             chunker_version=cv, status=status, reason=reason, attempt_key=attempt_key,
         )
     except Exception:
@@ -4238,7 +4351,7 @@ def cmd_code_reindex(args) -> int:
 
             stat = f.stat()
             write_file_status(
-                conn, args.project, root_s, rel, sha=sha, mtime=stat.st_mtime, size=stat.st_size,
+                conn, args.project, root_s, rel, sha=sha, stat=stat,
                 gap_count=len(gaps), chunker_version=cv, status="partial" if gaps else "ok",
             )
             pending_texts.extend(file_texts)
@@ -4670,37 +4783,69 @@ def code_hits_vector(conn: sqlite3.Connection, query: str, project: str):
     return scored
 
 
-def _root_report(conn: sqlite3.Connection, project: str, root_s: str, langs: list[str] | None, avail: str) -> dict:
+def _root_report(
+    conn: sqlite3.Connection, project: str, root_s: str, langs: list[str] | None, avail: str,
+    *, verify_content: bool = False,
+) -> dict:
     """One code_root's slice of `code_index_report`: preflight only, never
     a mutation of index content -- the tree and the stored `file_sha` rows
     for THIS root are compared, and a drifted-but-sha-confirmed row's
-    mtime/size is refreshed (cache bookkeeping, committed by the caller).
-    No chunk, status, reason, or meta row is ever written here.
+    stat signals are refreshed (cache bookkeeping, committed by the
+    caller). No chunk, status, reason, or meta row is ever written here.
 
     `avail` is the backend availability fingerprint for this WHOLE report
     call (chunkers.backend_availability() itself warns against recomputing
     it per call within one run) -- every root in one code_index_report
     call is judged against the same fingerprint.
 
-    `changed` counts: a row missing entirely, OR a drifted row (mtime/size
-    disagree) whose recomputed sha256 differs from the stored one (binding
-    point 4: a drifted row with sha NULL -- a not-indexed file -- carries
-    no source evidence and is NEVER counted here; it is governed by
-    cmd_code_reindex's retry rule alone), OR a stored `chunker_version`
+    Design R3 (audit MC-P1-02): the stat pass now compares FIVE signals --
+    size, mtime_ns, ctime_ns, ino, dev (one `os.stat()` call gives all
+    five; the cost model is unchanged) -- any one differing triggers a
+    hash, catching a same-size, same-mtime_ns content rewrite the old
+    mtime/size-only gate could not (a row written before this change has
+    every new signal NULL, which reads as "differs", so the very first
+    report after the schema bump hashes once and fills them in).
+    `verify_content=True` forces every yielded file to be treated as
+    differing (a full hash pass), regardless of its stored signals.
+
+    `changed` counts: a row missing entirely, OR a drifted row (any signal
+    disagrees) whose recomputed sha256 differs from the stored one
+    (binding point 4: a drifted row with sha NULL -- a not-indexed file --
+    carries no source evidence and is NEVER counted here; it is governed
+    by cmd_code_reindex's retry rule alone), OR a stored `chunker_version`
     that no longer matches what this engine would produce today (every
     status, not-indexed included -- the table stamps its version even when
     the chunker itself could not run), plus every path on disk with no
-    surviving row (`removed`)."""
+    surviving row (`removed`).
+
+    After the stat pass, a GIT TRIGGER (design R3): when `code_meta.head_sha`
+    is stored for this root and the repo's current HEAD differs, the
+    commits' own changed paths (remapped root-relative via `git diff
+    --name-only`/`--show-prefix`) are hashed regardless of the stat
+    verdict -- catching a same-signal rewrite the stat pass cannot see --
+    and `head_sha` is refreshed only once every one of those paths (that
+    fall inside this root and are still a yielded source file) verifies.
+    Any git failure, timeout, or missing binary leaves `git_delta`
+    `"unavailable"` and never blocks the report. `verify_content=True`
+    already hashed every file in the stat pass, so the trigger there is
+    just a HEAD comparison (one `git rev-parse HEAD` call) to set
+    `git_delta` and, on a clean (changed == 0) result, refresh `head_sha`
+    -- no redundant diff/hash work.
+
+    Return shape gains `git_delta` (`"unavailable" | "unchanged" |
+    "verified" | "changed"`) and `verified` (True iff `verify_content` was
+    requested for this call -- `code_index_report`'s `current` state
+    requires it on EVERY root)."""
     root = Path(root_s)
     rep = {
         "code_root": root_s, "exists": _root_is_readable_dir(root), "changed": 0, "removed": 0,
-        "failed": 0, "not_indexed": 0,
+        "failed": 0, "not_indexed": 0, "git_delta": "unavailable", "verified": bool(verify_content),
     }
     rows = {
         r["path"]: r
         for r in conn.execute(
-            "SELECT path, sha256, mtime, size, chunker_version, status, attempt_key FROM file_sha "
-            "WHERE project=? AND code_root=?",
+            "SELECT path, sha256, mtime, size, mtime_ns, ctime_ns, ino, dev, chunker_version, "
+            "status, attempt_key FROM file_sha WHERE project=? AND code_root=?",
             (project, root_s),
         )
     }
@@ -4709,12 +4854,20 @@ def _root_report(conn: sqlite3.Connection, project: str, root_s: str, langs: lis
     rep["availability_changed"] = any(
         r["status"] == "not-indexed" and r["attempt_key"] != avail for r in rows.values()
     )
+    stored_head_row = conn.execute(
+        "SELECT head_sha FROM code_meta WHERE project=? AND code_root=?", (project, root_s)
+    ).fetchone()
+    stored_head_sha = stored_head_row["head_sha"] if stored_head_row else None
+    rep["head_sha"] = stored_head_sha
     if not rep["exists"]:
         # A missing root contributes exists: False and does not itself
         # count as changed -- code_index_report folds this into `degraded`
-        # (never `current`) via missing_root, binding point 5.
+        # (never `current`) via missing_root, binding point 5. No git
+        # trigger for a root that isn't there to diff against.
         return rep
     seen = set()
+    hashed = set()
+    changed_rels: set = set()
     touched = False
     for f in iter_code_source_files(root, langs):
         try:
@@ -4725,6 +4878,7 @@ def _root_report(conn: sqlite3.Connection, project: str, root_s: str, langs: lis
         prev = rows.get(rel)
         if prev is None:
             rep["changed"] += 1
+            changed_rels.add(rel)
             continue
         try:
             cv = chunkers.chunker_version(lang_for_source_file(f))
@@ -4732,6 +4886,7 @@ def _root_report(conn: sqlite3.Connection, project: str, root_s: str, langs: lis
             cv = "unversioned"
         if prev["chunker_version"] != cv:
             rep["changed"] += 1
+            changed_rels.add(rel)
             continue
         if prev["sha256"] is None:
             continue  # not-indexed: no source evidence -- the retry rule owns it
@@ -4739,29 +4894,133 @@ def _root_report(conn: sqlite3.Connection, project: str, root_s: str, langs: lis
             st = f.stat()
         except OSError:
             rep["changed"] += 1
+            changed_rels.add(rel)
             continue
-        if prev["mtime"] != st.st_mtime or prev["size"] != st.st_size:
-            try:
-                if hashlib.sha256(f.read_bytes()).hexdigest() != prev["sha256"]:
-                    rep["changed"] += 1
-                else:
-                    _refresh_file_sha_stat(conn, project, root_s, rel, st)
-                    touched = True
-            except OSError:
+        signals_differ = (
+            verify_content
+            or prev["size"] != st.st_size
+            or prev["mtime_ns"] != st.st_mtime_ns
+            or prev["ctime_ns"] != st.st_ctime_ns
+            or prev["ino"] != st.st_ino
+            or prev["dev"] != st.st_dev
+        )
+        if not signals_differ:
+            continue
+        try:
+            if hashlib.sha256(f.read_bytes()).hexdigest() != prev["sha256"]:
                 rep["changed"] += 1
+                changed_rels.add(rel)
+            else:
+                _refresh_file_sha_stat(conn, project, root_s, rel, st)
+                touched = True
+            hashed.add(rel)
+        except OSError:
+            rep["changed"] += 1
+            changed_rels.add(rel)
     rep["removed"] = len(set(rows) - seen)
     rep["changed"] += rep["removed"]
+
+    if verify_content:
+        # Everything was just hashed above -- the trigger is a bare HEAD
+        # comparison, never a second hash pass.
+        if stored_head_sha is None:
+            rep["git_delta"] = "unavailable"
+        else:
+            current_head = _git_head_sha(root)
+            if current_head is None:
+                rep["git_delta"] = "unavailable"
+            elif current_head == stored_head_sha:
+                rep["git_delta"] = "unchanged"
+            elif rep["changed"] == 0:
+                conn.execute(
+                    "UPDATE code_meta SET head_sha=? WHERE project=? AND code_root=?",
+                    (current_head, project, root_s),
+                )
+                touched = True
+                rep["git_delta"] = "verified"
+                rep["head_sha"] = current_head
+            else:
+                rep["git_delta"] = "changed"
+    elif stored_head_sha is None:
+        rep["git_delta"] = "unavailable"
+    else:
+        deadline = time.monotonic() + 3.0
+        current_head = _git_head_sha(root)
+        if current_head is None:
+            rep["git_delta"] = "unavailable"
+        elif current_head == stored_head_sha:
+            rep["git_delta"] = "unchanged"
+        else:
+            diff_out = _git_call_budgeted(
+                root, ["diff", "--name-only", stored_head_sha, current_head], deadline
+            )
+            prefix_out = _git_call_budgeted(root, ["rev-parse", "--show-prefix"], deadline)
+            if diff_out is None or prefix_out is None:
+                rep["git_delta"] = "unavailable"
+            else:
+                prefix = prefix_out.strip()
+                diffed_in_root = []
+                for line in diff_out.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if prefix:
+                        if not line.startswith(prefix):
+                            continue  # outside this root -- ignored
+                        line = line[len(prefix):]
+                    if line in seen:
+                        diffed_in_root.append(line)
+                for rel in diffed_in_root:
+                    # Already accounted for by the stat pass -- `hashed`
+                    # covers a path it hashed and matched OR mismatched;
+                    # `changed_rels` alone covers the three paths the stat
+                    # pass counts changed WITHOUT hashing (a brand new row,
+                    # a chunker_version bump, a stat() failure). Either way,
+                    # re-hashing here would double-count the same file.
+                    if rel in hashed or rel in changed_rels:
+                        continue
+                    prev = rows.get(rel)
+                    if prev is not None and prev["sha256"] is None:
+                        continue  # not-indexed: the retry rule owns it, same as the stat pass
+                    gf = root / rel
+                    try:
+                        current_sha = hashlib.sha256(gf.read_bytes()).hexdigest()
+                    except OSError:
+                        rep["changed"] += 1
+                        changed_rels.add(rel)
+                        continue
+                    if prev is None or prev["sha256"] != current_sha:
+                        rep["changed"] += 1
+                        changed_rels.add(rel)
+                    else:
+                        try:
+                            gst = gf.stat()
+                            _refresh_file_sha_stat(conn, project, root_s, rel, gst)
+                            touched = True
+                        except OSError:
+                            pass
+                    hashed.add(rel)
+                if any(p in changed_rels for p in diffed_in_root):
+                    rep["git_delta"] = "changed"
+                else:
+                    conn.execute(
+                        "UPDATE code_meta SET head_sha=? WHERE project=? AND code_root=?",
+                        (current_head, project, root_s),
+                    )
+                    touched = True
+                    rep["git_delta"] = "verified"
+                    rep["head_sha"] = current_head
     if touched:
         conn.commit()
     return rep
 
 
-def code_index_report(conn: sqlite3.Connection, project: str) -> dict:
+def code_index_report(conn: sqlite3.Connection, project: str, *, verify_content: bool = False) -> dict:
     """Finding 1 (HIGH, index provenance) + Anatomy M2a Task 4: the
     preflight code-search consults before every search and code-reindex's
     heal (Task 5) consumes to decide what to repair -- per code_root,
     status-aware, and sha-confirmed (a drifted-but-unchanged file is never
-    reported as a change). Read-only except for the mtime/size cache
+    reported as a change). Read-only except for the stat-signal cache
     refresh `_root_report` may commit; never writes a chunk, status, or
     meta row.
 
@@ -4769,7 +5028,12 @@ def code_index_report(conn: sqlite3.Connection, project: str) -> dict:
     never run for this project); any root's `changed > 0` -> "stale";
     else `not_indexed > 0`, or `availability_changed`, or any root missing
     on disk -> "degraded" (binding point 5: a missing recorded root can
-    never read "current"); else "current"."""
+    never read "current"); else "current" ONLY when `verify_content`
+    hashed every file in every root THIS call (design R3, audit MC-P1-02 --
+    `_root_report`'s `verified` flag mirrors the call-wide `verify_content`
+    argument); otherwise "metadata-current" -- the honest default: stat
+    signals (and, when it fired, the git trigger) found nothing, but
+    nothing was proven by a full hash either."""
     proj = conn.execute(
         "SELECT langs, embedding_mode FROM code_project WHERE project=?", (project,)
     ).fetchone()
@@ -4786,9 +5050,8 @@ def code_index_report(conn: sqlite3.Connection, project: str) -> dict:
     avail = chunkers.backend_availability()  # one fingerprint for every root in this call
     roots = []
     for m in metas:
-        r = _root_report(conn, project, m["code_root"], langs, avail)
+        r = _root_report(conn, project, m["code_root"], langs, avail, verify_content=verify_content)
         r["last_indexed_at"] = m["last_indexed_at"]
-        r["head_sha"] = m["head_sha"]
         roots.append(r)
     changed = sum(r["changed"] for r in roots)
     failed = sum(r["failed"] for r in roots)
@@ -4809,8 +5072,10 @@ def code_index_report(conn: sqlite3.Connection, project: str) -> dict:
         state = "stale"
     elif not_indexed or availability_changed or missing_root:
         state = "degraded"
-    else:
+    elif all(r["verified"] for r in roots):
         state = "current"
+    else:
+        state = "metadata-current"
     return {
         "state": state, "langs": langs, "embedding_mode": (proj["embedding_mode"] if proj else "none"),
         "availability_changed": availability_changed, "roots": roots, "changed": changed,
@@ -4818,7 +5083,10 @@ def code_index_report(conn: sqlite3.Connection, project: str) -> dict:
     }
 
 
-def heal_code_index(conn: sqlite3.Connection, db_path: Path, project: str, report: dict, *, limit: int):
+def heal_code_index(
+    conn: sqlite3.Connection, db_path: Path, project: str, report: dict, *, limit: int,
+    verify_content: bool = False,
+):
     """Anatomy M2a Task 5: `code-search`'s one-attempt preflighted heal --
     consulted right after code_index_report, before a search ever answers.
     Eligible when the report is `stale` or `degraded` AND has something to
@@ -4837,6 +5105,14 @@ def heal_code_index(conn: sqlite3.Connection, db_path: Path, project: str, repor
     return, never the one this function may have closed along the way;
     cmd_code_search's caller reads report/conn from this call's own return
     value, never the ones it passed in.
+
+    Design R3 (audit MC-P1-02): `verify_content` (`--verify-content` on the
+    caller) is threaded into the AFTER-heal report too, so a healed index's
+    post-heal state is `current` (proven) rather than `metadata-current`
+    exactly when the caller asked for proof. The "index healed" line prints
+    for either honest post-heal state -- `current` or `metadata-current` --
+    since both mean `changed == 0` (state derivation already puts `stale`
+    ahead of both), never for a heal that leaves real drift behind.
 
     Any exception during the heal is fail-open: the db is reopened, the
     ORIGINAL (pre-heal) report is returned unchanged, and code-search still
@@ -4881,8 +5157,8 @@ def heal_code_index(conn: sqlite3.Connection, db_path: Path, project: str, repor
             if m:
                 reindexed += sum(int(g) for g in m.groups())
         conn = open_code_db(db_path)
-        after = code_index_report(conn, project)
-        if after["state"] == "current":
+        after = code_index_report(conn, project, verify_content=verify_content)
+        if after["state"] in ("current", "metadata-current"):
             print(f"code-search: index healed ({reindexed} file(s) re-indexed)", file=sys.stderr)
         return after, conn
     except Exception as exc:
@@ -4923,7 +5199,8 @@ def cmd_code_search(args) -> int:
             ))
         return 0
 
-    report = code_index_report(conn, args.project)
+    verify_content = getattr(args, "verify_content", False)
+    report = code_index_report(conn, args.project, verify_content=verify_content)
 
     if report["state"] == "uninitialized":
         print(
@@ -4947,7 +5224,8 @@ def cmd_code_search(args) -> int:
     # itself failed open) or may now read current.
     if not getattr(args, "no_heal", False):
         report, conn = heal_code_index(
-            conn, db_path, args.project, report, limit=getattr(args, "heal_limit", 500)
+            conn, db_path, args.project, report, limit=getattr(args, "heal_limit", 500),
+            verify_content=verify_content,
         )
     state = report["state"]
 
@@ -6061,6 +6339,11 @@ def main(argv=None) -> int:
              "per-file cap on what a repair re-indexes; a repair triggered "
              "only by a backend-availability change (no file content "
              "changed) is never subject to this gate",
+    )
+    p_code_search.add_argument(
+        "--verify-content", dest="verify_content", action="store_true",
+        help="hash every indexed file before answering so the reported "
+             "state is content-proven, not metadata-current",
     )
     p_code_search.set_defaults(func=cmd_code_search)
 

@@ -696,7 +696,13 @@ class TestPrunedPathsLeaveTheIndex(unittest.TestCase):
 
 
 class TestCheckDrift(unittest.TestCase):
-    def test_check_detects_touched_file(self):
+    """audit MC-P1-02 / design R3 (TOP-0123 L3) -- the inversion: a pure
+    touch (mtime moves, content unchanged) is no longer drift; a same-size,
+    same-mtime_ns content rewrite (invisible to a metadata-only comparison)
+    is. This replaces the old test_check_detects_touched_file, which
+    asserted the opposite for a touch."""
+
+    def test_touch_is_not_drift(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "root"
             topic_dir = root / "topics" / "processing"
@@ -712,11 +718,169 @@ class TestCheckDrift(unittest.TestCase):
 
             # touch: change mtime without changing content
             new_time = time.time() + 5
-            import os
             os.utime(target, (new_time, new_time))
 
             rc_dirty = memidx.cmd_check(args)
-            self.assertEqual(rc_dirty, 1)
+            self.assertEqual(rc_dirty, 0, "a bare touch must not read as drift (design R3)")
+
+    def test_same_size_same_mtime_ns_rewrite_is_drift(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            topic_dir = root / "topics" / "processing"
+            topic_dir.mkdir(parents=True)
+            target = topic_dir / HIDDEN_FILES_FIXTURE.name
+            shutil.copy(HIDDEN_FILES_FIXTURE, target)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+
+            args = ns(db=str(db), project=memidx.DEFAULT_PROJECT, root=str(root), json=True)
+            self.assertEqual(memidx.cmd_check(args), 0)
+
+            st = target.stat()
+            orig_ns = st.st_mtime_ns
+            text = target.read_text()
+            new_text = text.replace("Dotfiles", "DOTFILES", 1)
+            self.assertNotEqual(new_text, text, "fixture bug: the word to rewrite is not present")
+            self.assertEqual(len(new_text), len(text), "fixture bug: rewrite must be same length")
+            target.write_text(new_text)
+            os.utime(target, ns=(orig_ns, orig_ns))
+
+            rc_dirty = memidx.cmd_check(args)
+            self.assertEqual(
+                rc_dirty, 1, "a same-size, same-mtime_ns content rewrite must be drift"
+            )
+
+
+def _write_topic(path: Path, tid: str, body: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"---\ntype: topic\nid: {tid}\ntitle: T\nlinks:\n"
+        f'  - link: L1\n    status: active\n    ruling: {{text: "r", authority: owner-verbatim, source: s}}\n'
+        f"---\n{body}\n"
+    )
+
+
+def _rewrite_same_size(path: Path, old: str, new: str, *, restore_mtime_ns: bool = True) -> None:
+    """Verify-report reproducer shape (audit MC-P1-02): replace `old` with
+    `new` (same length -- size never moves) and, unless told otherwise,
+    restore the exact `mtime_ns` afterwards -- a rewrite a metadata-only
+    comparison cannot distinguish from an untouched file."""
+    st = path.stat()
+    orig_ns = st.st_mtime_ns
+    text = path.read_text()
+    new_text = text.replace(old, new)
+    assert new_text != text, "fixture bug: nothing to rewrite"
+    assert len(new_text) == len(text), "fixture bug: rewrite must be same length"
+    path.write_text(new_text)
+    if restore_mtime_ns:
+        os.utime(path, ns=(orig_ns, orig_ns))
+
+
+class TestContentProvenFreshness(unittest.TestCase):
+    """audit MC-P1-02 / design R3 (TOP-0123 L3), decision side: content is
+    hashed where a NEGATIVE claim is made (`check`, `unmapped`'s self-heal)
+    -- readers (`search`/`chain`/`for-path`/`why`/`drift`, via
+    `decision_index_state` with no override) keep the metadata-only
+    comparison. Reproducer shape from the verify report: replace every
+    `alpha` with `bravo` (same length) in a topic's body, then restore the
+    exact `mtime_ns`."""
+
+    def test_same_size_rewrite_is_drift_under_check_and_unmapped_self_heals(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            p = root / "topics" / "t.md"
+            _write_topic(p, "TOP-9500", "alpha")
+            db = Path(td) / "idx.sqlite"
+            with contextlib.redirect_stdout(io.StringIO()):
+                reindex(root, db, no_embed=True)
+
+            _rewrite_same_size(p, "alpha", "bravo")
+
+            check_buf = io.StringIO()
+            with contextlib.redirect_stdout(check_buf):
+                rc = memidx.cmd_check(
+                    ns(db=str(db), project=memidx.DEFAULT_PROJECT, root=str(root), json=True)
+                )
+            report = json.loads(check_buf.getvalue())
+            self.assertTrue(report["drift"], report)
+            self.assertIn(str(p), report["changed"], report)
+            self.assertEqual(rc, 1)
+
+            # unmapped's self-heal (state == "stale", content-proven) must
+            # reindex the new content -- proven by a search for "bravo"
+            # afterwards actually hitting.
+            with contextlib.redirect_stdout(io.StringIO()):
+                memidx.cmd_unmapped(ns(
+                    db=str(db), project=memidx.DEFAULT_PROJECT, root=str(root),
+                    code_root=None, paths=[], json=True,
+                ))
+
+            hits = _run_search(ns(
+                db=str(db), project=memidx.DEFAULT_PROJECT, query="bravo", mode="fts",
+                status=[], type=[], area=None, topic=None, authority=None, limit=5, json=True,
+            ))
+            self.assertTrue(hits, "unmapped's self-heal must have re-indexed the new content")
+
+    def test_pure_touch_is_not_drift_and_refreshes_bookkeeping(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            p = root / "topics" / "t.md"
+            _write_topic(p, "TOP-9501", "alpha")
+            db = Path(td) / "idx.sqlite"
+            with contextlib.redirect_stdout(io.StringIO()):
+                reindex(root, db, no_embed=True)
+
+            new_time = time.time() + 5
+            os.utime(p, (new_time, new_time))
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = memidx.cmd_check(
+                    ns(db=str(db), project=memidx.DEFAULT_PROJECT, root=str(root), json=True)
+                )
+            self.assertEqual(rc, 0, buf.getvalue())
+            report = json.loads(buf.getvalue())
+            self.assertFalse(report["drift"], report)
+
+            conn = sqlite3.connect(str(db))
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT mtime FROM records WHERE path=?", (str(p),)).fetchone()
+            conn.close()
+            self.assertAlmostEqual(row["mtime"], new_time, delta=1.0)
+
+            # a following reader (no --verify-content) still reads current
+            # off the refreshed bookkeeping -- no residual false drift.
+            self.assertEqual(
+                memidx.decision_index_state(db, memidx.DEFAULT_PROJECT, root=root), "current"
+            )
+
+    def test_reader_stays_metadata_only_while_check_proves(self):
+        """The documented boundary: a reader opts into --root but never
+        hashes (design R3) -- `search --root` on the exact same rewrite
+        that `check` catches still reads `current`. Both halves asserted
+        so the boundary between "reader" and "proof" stays explicit."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            p = root / "topics" / "t.md"
+            _write_topic(p, "TOP-9502", "alpha")
+            db = Path(td) / "idx.sqlite"
+            with contextlib.redirect_stdout(io.StringIO()):
+                reindex(root, db, no_embed=True)
+
+            _rewrite_same_size(p, "alpha", "bravo")
+
+            # the reader: metadata-only, still "current" -- a documented
+            # limitation, not a bug.
+            self.assertEqual(
+                memidx.decision_index_state(db, memidx.DEFAULT_PROJECT, root=root), "current"
+            )
+            # the proof: check hashes and finds the drift.
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = memidx.cmd_check(
+                    ns(db=str(db), project=memidx.DEFAULT_PROJECT, root=str(root), json=True)
+                )
+            self.assertEqual(rc, 1, buf.getvalue())
 
 
 class TestF1DecisionIndexState(unittest.TestCase):

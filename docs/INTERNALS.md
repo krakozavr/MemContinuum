@@ -1311,9 +1311,11 @@ handling already fails open, so a non-zero exit there is structural.
 A project has one language set (`code_project.langs`, `code_project.embedding_mode`)
 shared by every code root it indexes, and one row per root
 (`code_meta(project, code_root)`, holding that root's `last_indexed_at` and
-`head_sha`). `chunks` and `file_sha` carry `code_root` in their key, so a
-project can index several trees at once without one root's rows colliding
-with another's.
+`head_sha`). `head_sha` is a git-diff TRIGGER, not proof by itself: it names
+the HEAD this root was last hashed clean against, and refreshes only once
+every file that HEAD's diff touched verifies (below). `chunks` and
+`file_sha` carry `code_root` in their key, so a project can index several
+trees at once without one root's rows colliding with another's.
 
 `code-reindex --code-root DIR` touches only that root: it queries, writes and
 deletes `file_sha`/`chunks` rows scoped to `(project, code_root)` alone, and
@@ -1348,16 +1350,43 @@ heal consult, one entry per recorded root. States, in order: **uninitialized**
 (no `code-reindex` has ever run for this project — no `code_meta` rows at
 all); **stale** (some root has files that changed, were removed, or moved to
 a new chunker version since the last `code-reindex` — a removed file counts
-as changed too); **degraded** (nothing changed, but some root has a
-`not-indexed` file, a backend-availability change since a `not-indexed` row
-was stamped, or a recorded root missing on disk — a missing root can never
-read `current`); otherwise **current**. `failed` files are never part of this
-state calculation at all — an index with only `failed` files reads `current`,
-and `code-search` reports the failed count as its own separate line.
-The preflight is otherwise read-only: the one write it may commit is
-refreshing a drifted-looking file's stored `mtime`/`size` once its content
-turns out unchanged (sha256 still matches) — cache bookkeeping so the same
-file isn't re-hashed on the next call, never a chunk, status, or meta row.
+as changed too, and `changed` here means CONTENT changed: a stat-signal
+match or the git trigger proved it, never metadata alone); **degraded**
+(nothing changed, but some root has a `not-indexed` file, a
+backend-availability change since a `not-indexed` row was stamped, or a
+recorded root missing on disk — a missing root can never read `current`);
+**current** ONLY when `--verify-content` hashed every file in every recorded
+root during THIS call; otherwise **metadata-current** — the honest default:
+the stat signals (and, when it fired, the git trigger) found nothing, but
+nothing was proven by a full hash either. `failed` files are never part of
+this state calculation at all — an index with only `failed` files still
+reads `metadata-current`/`current`, and `code-search` reports the failed
+count as its own separate line. The preflight is otherwise read-only: the
+one write it may commit is refreshing a drifted-looking file's stored stat
+signals once its content turns out unchanged (sha256 still matches) — cache
+bookkeeping so the same file isn't re-hashed on the next call, never a
+chunk, status, or meta row.
+
+**Stat signals and the git trigger.** A file's freshness gate does not stop
+at `chunker_version` or a bare mtime/size comparison: `file_sha` stores five
+signals from ONE `os.stat()` call — size, `mtime_ns`, `ctime_ns`, inode,
+device — and any one differing from the stored row triggers a content hash
+(a row written before this signal set existed has every new signal NULL,
+which reads as differing, so the very first report after the upgrade hashes
+once and fills them in). A same-size, same-`mtime_ns` rewrite — a
+metadata-preserving restore, a coarse-timestamp filesystem, some sync tools
+— moves `ctime`/inode/device regardless; userspace cannot fake those, so the
+signal set catches it where mtime/size alone could not. After the stat
+pass, when a root's stored `head_sha` differs from its current git HEAD,
+the commit's own changed paths (`git diff --name-only`, remapped
+root-relative via `git rev-parse --show-prefix`) are hashed too, regardless
+of what the stat pass already decided — a TRIGGER, not proof on its own: a
+path the diff never touched is never hashed by it, and a non-git root, a
+missing `head_sha` (never reindexed inside a git repo), or any git failure
+or timeout (a 3-second budget per report call, `git rev-parse HEAD` alone
+capped at 2 seconds) leaves this signal off without blocking the report.
+`head_sha` refreshes only once every one of those diffed, in-root,
+still-source paths verifies clean.
 
 **Heal.** Before answering, `code-search` consults the report and, unless
 `--no-heal` is given, may repair it once: eligible only when the state is
@@ -1377,21 +1406,31 @@ project's own `embedding_mode` is already `full`, otherwise with
 `--no-embed` — a heal can never be what silently leaves a `full` project's
 new chunks unembedded, but it also never upgrades a `none` project to `full`
 on its own. `code-search` prints `index healed` only when the state after
-healing reads `current`; any exception during the heal is fail-open — the
-original report stands and the search still answers from whatever was
-already indexed.
+healing reads `current` or `metadata-current` (both mean `changed == 0` —
+the only difference is whether this call proved it with a full hash); any
+exception during the heal is fail-open — the original report stands and the
+search still answers from whatever was already indexed.
 
 **Multi-root output.** `code-search --json` wraps hits in an envelope:
 `state`; `code_root`/`indexed_at`/`head_sha`, naming the first recorded root
 alphabetically (`indexed_at` here is that root's `last_indexed_at`, renamed
 at this top level only); `code_roots`, the full per-root report list (each
-entry carries its own `last_indexed_at`/`head_sha`, not renamed); `changed`,
-`failed`, `not_indexed`, `embedding_mode`; and `results`. In plain output,
-a hit's location is qualified with its root
-(`root/path:line`) only once a project has more than one recorded root — the
-common single-root case keeps its plain `path:line` line, since only a
-multi-root project can have the same relative path indexed under two roots
-at once.
+entry carries its own `last_indexed_at`/`head_sha`/`git_delta`/`verified`,
+not renamed); `changed`, `failed`, `not_indexed`, `embedding_mode`; and
+`results`. `--verify-content` hashes every indexed file before answering, so
+the reported state is content-proven (`current`) rather than the
+metadata-only default (`metadata-current`) — there is no automatic
+verification on an empty result; the caller asks for proof explicitly. A
+`code_roots` entry's `git_delta` is `unavailable` (no stored HEAD to compare,
+or git failed/timed out), `unchanged` (HEAD hasn't moved), `verified` (HEAD
+moved, every diffed path in this root proved clean), or `changed` (HEAD
+moved and the diff hashed a real change). A nothing-found result is evidence
+only under `current` — under `metadata-current` it is honest uncertainty,
+not proof of absence. In plain output, a hit's location is qualified with
+its root (`root/path:line`) only once a project has more than one recorded
+root — the common single-root case keeps its plain `path:line` line, since
+only a multi-root project can have the same relative path indexed under two
+roots at once.
 
 The write-side hooks stay single-root, for a different reason: `memlib.sh`
 carries one `MEMCONTINUUM_CODE_ROOT`, so the edit ledger — and therefore the
@@ -1534,9 +1573,24 @@ The decision index (`<project>.sqlite`) carries the same provenance discipline
 | `missing` | no db file at that path | refuse (no query attempted) |
 | `uninitialized` | file exists, has a `db_meta` row for this project, but no `last_reindexed_at` stamp and no `records` rows | refuse (no query attempted) |
 | `upgrade-required` | no `last_reindexed_at` stamp but `records` rows already exist (an older engine's db), or the stamped `index_generation` is behind the engine's current one | proceed, warn on stderr |
-| `stale` | current generation, stamped, but `check`'s own on-disk drift comparison (mtime/size against what `reindex` last recorded) finds added/changed/removed files — only computed when a `root` is given | proceed, warn on stderr |
+| `stale` | current generation, stamped, but the store's on-disk drift comparison finds added/changed/removed files — only computed when a `root` is given. For the five metadata-only readers (`search`/`chain`/`for-path`/`why`/`drift`, given `--root`) this is a plain mtime/size comparison against what `reindex` last recorded — **metadata moved, content unverified**. For `check` and `unmapped` it is content-PROVEN: every walked record with a stored row is hashed and compared to `records.sha256`, so a same-size, same-`mtime_ns` rewrite a metadata comparison alone would miss is still caught (a sha match whose metadata moved is bookkeeping-refreshed in place, not drift) | proceed, warn on stderr |
 | `quarantined` | current generation, not `stale` (a `root`-taking reader's own drift check passed or was not asked for), and `index_errors` holds at least one row for this project (one or more records could not be safely indexed — see "Tolerant parsing and quarantine" above); needs no `root` — a plain table lookup | proceed, warn on stderr naming the skipped-record count; `unmapped` refuses the negative claim (below) |
 | `current` | stamped, current generation, no drift, no quarantined record | proceed silently |
+
+**Readers never hash; `check` and `unmapped` are the proof.** Hashing every
+record on every reader call would put a full store read on the pre-edit hot
+path — `for-path` runs twice per pre-edit under its own watchdog, on a store
+whose stat-only walk already costs over a second on a slow (drvfs/9P)
+filesystem — so the five metadata-only readers keep the plain mtime/size
+comparison unconditionally; only the two commands that may WRITE the cache
+(`check`'s own report, `unmapped`'s self-heal gate) hash. A reader's `stale`
+therefore means "metadata moved, not yet proven"; `check --json`'s `changed`
+list means content changed, proven by a hash, and a bare `touch` (mtime
+moves, content identical) is bookkeeping-refreshed and reported neither
+`changed` nor `drift`. This is a documented boundary, not an oversight: a
+same-size, same-`mtime_ns` content rewrite reads `current` off `search
+--root` and every other reader until the next `check` or `unmapped` call
+proves otherwise.
 
 Every reader opens the file with `open_db_noncreating` — a genuinely
 non-creating SQLite URI (`mode=rw`) — never `open_db`'s create-on-connect path,
@@ -1829,21 +1883,28 @@ down:
   segment-awareness above, apply uniformly everywhere a `code_ref` is
   consulted. See [Decision index provenance](#decision-index-provenance-and-embedding-lifecycle)
   above for its `2`/`3`/`4` exit codes.
-- **`check`** — compares current mtime/size against what was stored at the last
-  `reindex`, without re-hashing or loading the embedding model. Exits 1 on any
-  drift. (`reindex` uses sha256 to decide whether content changed and needs
-  re-embedding; `check` uses the cheaper pair so a bare `touch` is still
-  reported as drift.) Its `--json` report also carries `source_topic_count`/
-  `searchable_row_count`/`searchable_vector_count` — see the `search` bullet
-  above — and `symlinks_skipped`, the count of symlinked directories/files the
-  walker skipped this run; and `state` (the same word `decision_index_state`
-  reports) and `quarantined` — one `{path, diagnostics}` entry per row in
-  `index_errors`, hashed (only these files) and compared against the sha
-  `reindex` stored: unchanged stays reported under `quarantined`, changed
-  content counts as `changed` instead (it will be re-parsed on the next
-  reindex), and a quarantined file whose path has vanished counts as
-  `removed`. Text mode adds `check: N record(s) quarantined` and one
-  `! <path>: <field>: <message>` line per entry.
+- **`check`** — the one command that hashes every record (it walks the store
+  ONCE, never loading the embedding model): every walked path with a stored
+  row is read and its sha256 compared against `records.sha256`, so a
+  same-size, same-`mtime_ns` content rewrite a metadata comparison alone
+  could not see is reported as drift. A sha match whose mtime/size moved
+  (a bare `touch`) is bookkeeping-refreshed in place — one `UPDATE` reaching
+  both the topic/note row and every link row derived from it, since a link
+  row's own `path` differs from its parent's but shares the parent's stat —
+  and is reported neither `added`, `changed`, nor `drift`; a genuine
+  sha mismatch IS `changed` (`changed` means content changed, not metadata
+  moved). Exits 1 on any drift. Its `--json` report also carries
+  `source_topic_count`/`searchable_row_count`/`searchable_vector_count` —
+  see the `search` bullet above — and `symlinks_skipped`, the count of
+  symlinked directories/files the walker skipped this run; and `state`
+  (the same word `decision_index_state` reports, computed from THIS same
+  walk rather than a second one) and `quarantined` — one `{path,
+  diagnostics}` entry per row in `index_errors`, hashed (only these files)
+  and compared against the sha `reindex` stored: unchanged stays reported
+  under `quarantined`, changed content counts as `changed` instead (it
+  will be re-parsed on the next reindex), and a quarantined file whose path
+  has vanished counts as `removed`. Text mode adds `check: N record(s)
+  quarantined` and one `! <path>: <field>: <message>` line per entry.
 - **`unmapped PATH...`** — classifies each path as `mapped_topic`,
   `mapped_concept_only`, or `unmapped` without walking the code tree.
   `coverage_status` mirrors the decision index's states, collapsed for a
@@ -1855,9 +1916,12 @@ down:
   a malformed record does not clear itself by reindexing again),
   `"index-error"` (a `sqlite3.OperationalError` while reading), or `"unknown"`
   (state was `stale`, self-heal ran, and drift still persisted afterward —
-  unchanged from before). Self-healing only fires on `stale`: one
-  `reindex --no-embed --auto` pass, then a recheck. This is what
-  `userprompt-remind.sh`'s coverage signal and `precompact-persist.sh` call.
+  unchanged from before). `unmapped`'s own `stale` check, like `check`'s, is
+  content-proven (hashed, not metadata-only) — a negative claim is exactly
+  where a same-size, same-`mtime_ns` rewrite must not slip through as
+  `current`. Self-healing only fires on `stale`: one `reindex --no-embed
+  --auto` pass, then a recheck. This is what `userprompt-remind.sh`'s
+  coverage signal and `precompact-persist.sh` call.
 - **`why`** — resolves a symbol or path to its concept(s), then prints those
   concepts' `governed_by` chains in full, including any `kind: declined` link
   (there is no separate "rejected alternative" field; a declined link *is* that
@@ -1912,15 +1976,28 @@ down:
   1, error on stderr, `results` is `[]` in `--json` too, since an empty list
   would otherwise read as a real "nothing found"); **stale** and **degraded**
   both warn on stderr and still search, naming the failed-file count and any
-  missing root separately when they apply. `--json` wraps hits in
+  missing root separately when they apply. Text mode prints nothing extra for
+  **metadata-current**, the normal state — only **stale**/**degraded** get a
+  line. `--verify-content` hashes every indexed file (in every recorded root)
+  before answering, so a clean report proves **current** rather than the
+  metadata-only default; it is passed into the heal's after-report too, so a
+  healed index reads **current** exactly when the caller asked for proof.
+  There is no automatic verification on an empty result — a nothing-found
+  answer stays honest uncertainty under **metadata-current**, evidence only
+  under **current**, never silently upgraded. `--json` wraps hits in
   `{"state", "code_root", "code_roots", "indexed_at", "head_sha", "changed",
-  "failed", "not_indexed", "embedding_mode", "results"}`. A "nothing found" is
-  only evidence when `state` is `current`. A db written by a newer engine
-  (see `CodeIndexTooNew` above) never reaches `code_index_report` at all —
-  `code-search` exits 0 with the refusal on stderr and, in `--json`, a
-  minimal `{"state": "unavailable", "code_root": null, "indexed_at": null,
-  "head_sha": null, "results": []}` (no `code_roots`/`changed`/`failed`/
-  `not_indexed`/`embedding_mode`, since none of those were ever computed).
+  "failed", "not_indexed", "embedding_mode", "results"}`, where each
+  `code_roots` entry also carries its own `git_delta` (`"unavailable"` — no
+  stored `head_sha` to compare, or git failed/timed out; `"unchanged"` — HEAD
+  hasn't moved; `"verified"` — HEAD moved and every path the diff touched in
+  this root proved clean; `"changed"` — HEAD moved and the diff hashed a real
+  change) and `verified` (whether THIS call hashed the whole root). A db
+  written by a newer engine (see `CodeIndexTooNew` above) never reaches
+  `code_index_report` at all — `code-search` exits 0 with the refusal on
+  stderr and, in `--json`, a minimal `{"state": "unavailable", "code_root":
+  null, "indexed_at": null, "head_sha": null, "results": []}` (no
+  `code_roots`/`changed`/`failed`/`not_indexed`/`embedding_mode`, since none
+  of those were ever computed).
 
 ## Test conventions
 

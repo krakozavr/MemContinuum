@@ -140,7 +140,13 @@ def code_reindex(code_root, db, project=memidx.DEFAULT_PROJECT, no_embed=True, f
     return memidx.cmd_code_reindex(args)
 
 
-class TestCodeSchemaV2(unittest.TestCase):
+class TestCodeSchemaV3(unittest.TestCase):
+    """Design R3/R4 (audit MC-P1-02/MC-P1-06): renamed from the class's
+    original TestCodeSchemaV2 name when CODE_SCHEMA_VERSION bumped 2->3
+    (file_sha gains mtime_ns/ctime_ns/ino/dev, embeddings gains embed_fp,
+    code_project gains embedding_fingerprint -- the two fingerprint
+    columns reserved for the embedding-fingerprint work still to land)."""
+
     V1_DDL = """
       CREATE TABLE chunks (id INTEGER PRIMARY KEY, path TEXT, project TEXT, lang TEXT, kind TEXT,
         symbol TEXT, qualified_name TEXT, signature TEXT, doc TEXT, start_line INTEGER, end_line INTEGER);
@@ -162,14 +168,22 @@ class TestCodeSchemaV2(unittest.TestCase):
         conn = sqlite3.connect(str(db)); conn.executescript(self.V1_DDL); conn.commit(); conn.close()
         return db
 
-    def test_fresh_db_has_v2_shape(self):
+    def test_fresh_db_has_v3_shape(self):
         with tempfile.TemporaryDirectory() as td:
             conn = memidx.open_code_db(Path(td) / "c.sqlite")
-            self.assertEqual(memidx.code_schema_version(conn), 2)
+            self.assertEqual(memidx.code_schema_version(conn), 3)
             self.assertIn("code_root", self._cols(conn, "chunks"))
             self.assertTrue({"code_root", "status", "reason", "chunker_version"} <= self._cols(conn, "file_sha"))
+            self.assertTrue(
+                {"mtime_ns", "ctime_ns", "ino", "dev"} <= self._cols(conn, "file_sha"),
+                "design R3: the four new stat-signal columns",
+            )
+            self.assertIn("embed_fp", self._cols(conn, "embeddings"), "design R4: reserved, NULL for now")
             self.assertNotIn("langs", self._cols(conn, "code_meta"))
-            self.assertEqual(self._cols(conn, "code_project"), {"project", "langs", "embedding_mode"})
+            self.assertEqual(
+                self._cols(conn, "code_project"),
+                {"project", "langs", "embedding_mode", "embedding_fingerprint"},
+            )
             self.assertIn("attempt_key", self._cols(conn, "file_sha"))
             pk = sorted(r[1] for r in conn.execute("PRAGMA table_info(code_meta)") if r[5])
             self.assertEqual(pk, ["code_root", "project"])
@@ -178,7 +192,7 @@ class TestCodeSchemaV2(unittest.TestCase):
     def test_older_db_keeps_roots_and_langs_but_drops_derived_rows(self):
         with tempfile.TemporaryDirectory() as td:
             conn = memidx.open_code_db(self._v1(td))
-            self.assertEqual(memidx.code_schema_version(conn), 2)
+            self.assertEqual(memidx.code_schema_version(conn), 3)
             self.assertEqual(conn.execute("SELECT count(*) FROM chunks").fetchone()[0], 0)
             self.assertEqual(conn.execute("SELECT count(*) FROM file_sha").fetchone()[0], 0)
             self.assertEqual(conn.execute("SELECT project, code_root FROM code_meta").fetchall()[0][:], ("p", "/old/root"))
@@ -226,6 +240,424 @@ class TestCodeSchemaV2(unittest.TestCase):
                 conn.execute("SELECT langs FROM code_project WHERE project=?", (memidx.DEFAULT_PROJECT,)).fetchone()[0],
                 "python",
             )
+
+
+# The v2 schema, captured verbatim from CODE_SCHEMA_SQL before this task
+# bumps CODE_SCHEMA_VERSION to 3 -- the "older schema" input for the v2->v3
+# rebuild red test (design R3/R4, audit MC-P1-02): a REAL v2 db, not just
+# TestCodeSchemaV3.V1_DDL's hand-written v1 shape, must also survive.
+CODE_SCHEMA_V2_DDL = """
+CREATE TABLE IF NOT EXISTS code_project (
+  project TEXT PRIMARY KEY,
+  langs TEXT,
+  embedding_mode TEXT NOT NULL DEFAULT 'none'
+);
+
+CREATE TABLE IF NOT EXISTS chunks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  path TEXT NOT NULL,
+  project TEXT NOT NULL,
+  code_root TEXT NOT NULL,
+  lang TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  qualified_name TEXT NOT NULL,
+  signature TEXT,
+  doc TEXT,
+  start_line INTEGER NOT NULL,
+  end_line INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_code_chunks_path ON chunks(project, path);
+CREATE INDEX IF NOT EXISTS idx_code_chunks_qname ON chunks(project, qualified_name);
+CREATE INDEX IF NOT EXISTS idx_code_chunks_root_path ON chunks(project, code_root, path);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(
+  qualified_name, split_tokens, signature, doc, body,
+  tokenize = "unicode61 tokenchars '_'"
+);
+
+CREATE TABLE IF NOT EXISTS embeddings (
+  chunk_id INTEGER PRIMARY KEY,
+  project TEXT NOT NULL,
+  dim INTEGER NOT NULL,
+  vector BLOB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS file_sha (
+  path TEXT NOT NULL,
+  project TEXT NOT NULL,
+  code_root TEXT NOT NULL,
+  sha256 TEXT,
+  mtime REAL,
+  size INTEGER,
+  gap_count INTEGER NOT NULL DEFAULT 0,
+  chunker_version TEXT,
+  status TEXT NOT NULL DEFAULT 'ok',
+  reason TEXT,
+  attempt_key TEXT,
+  PRIMARY KEY (project, code_root, path)
+);
+
+CREATE TABLE IF NOT EXISTS code_meta (
+  project TEXT NOT NULL,
+  code_root TEXT NOT NULL,
+  last_indexed_at REAL,
+  head_sha TEXT,
+  PRIMARY KEY (project, code_root)
+);
+
+CREATE TABLE IF NOT EXISTS code_schema (
+  version INTEGER NOT NULL
+);
+"""
+
+
+def _copy_new_signals_into_file_sha(db_path, project, code_root, rel) -> None:
+    """Test helper (design R3, audit MC-P1-02, red tests 4b/6): simulates a
+    stat-identical `file_sha` row by copying the CURRENT file's five stat
+    signals onto its own row -- ctime cannot be restored from userspace,
+    so this is how a test proves the --verify-content/git-trigger
+    fallback rather than the primary ctime/ino/dev signal. PRAGMA
+    table_info-tolerant: against UNMODIFIED (pre-migration) code, file_sha
+    has no mtime_ns/ctime_ns/ino/dev columns at all, so this only writes
+    mtime/size there -- the red run then fails on the freshness VERDICT
+    (`current` vs `metadata-current`), not on a missing-column error."""
+    f = Path(code_root) / rel
+    st = f.stat()
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(file_sha)")}
+        sets = ["mtime=?", "size=?"]
+        params = [st.st_mtime, st.st_size]
+        for col, val in (
+            ("mtime_ns", st.st_mtime_ns), ("ctime_ns", st.st_ctime_ns),
+            ("ino", st.st_ino), ("dev", st.st_dev),
+        ):
+            if col in cols:
+                sets.append(f"{col}=?")
+                params.append(val)
+        params.extend([project, str(code_root), rel])
+        conn.execute(
+            f"UPDATE file_sha SET {', '.join(sets)} WHERE project=? AND code_root=? AND path=?",
+            params,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _rewrite_same_size(path: Path, old: str, new: str, *, restore_mtime_ns: bool = True) -> None:
+    """Verify-report reproducer shape (audit MC-P1-02): replace `old` with
+    `new` (same length) and, unless told otherwise, restore the exact
+    `mtime_ns` afterwards."""
+    st = path.stat()
+    orig_ns = st.st_mtime_ns
+    text = path.read_text()
+    new_text = text.replace(old, new)
+    assert new_text != text, "fixture bug: nothing to rewrite"
+    assert len(new_text) == len(text), "fixture bug: rewrite must be same length"
+    path.write_text(new_text)
+    if restore_mtime_ns:
+        os.utime(path, ns=(orig_ns, orig_ns))
+
+
+def _init_git_repo(root: Path) -> None:
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    _git_commit_all(root, "init")
+
+
+def _git_commit_all(root: Path, msg: str) -> None:
+    subprocess.run(
+        ["git", "-C", str(root), "-c", "user.email=t@t.t", "-c", "user.name=t", "add", "-A"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(root), "-c", "user.email=t@t.t", "-c", "user.name=t",
+         "commit", "-q", "-m", msg],
+        check=True,
+    )
+
+
+class TestContentProvenFreshness(unittest.TestCase):
+    """audit MC-P1-02 / design R3 (TOP-0123 L3), code side: stat signals
+    (size/mtime_ns/ctime_ns/ino/dev), the git trigger, --verify-content,
+    and the current/metadata-current split. Reproducer shape from the
+    verify report: replace `alpha` with `bravo` (same length) in a source
+    file, then restore the exact `mtime_ns` (ctime cannot be restored from
+    userspace at all -- the "stat-identical row" variants below simulate
+    it instead via _copy_new_signals_into_file_sha, proving the
+    --verify-content/git-trigger fallback rather than the ctime/ino/dev
+    signal)."""
+
+    def _one_file_root(self, td, name="a.py", body="def alpha():\n    return 1\n"):
+        root = Path(td) / "code"
+        root.mkdir()
+        (root / name).write_text(body)
+        return root, root / name
+
+    def test_same_size_rewrite_with_restored_mtime_ns_is_stale_via_ctime(self):
+        """Variant a: only mtime_ns is restored -- ctime moves on write
+        regardless (userspace cannot fake it), so the stat-signal set
+        alone must catch this without any git trigger or --verify-content."""
+        with tempfile.TemporaryDirectory() as td:
+            root, p = self._one_file_root(td)
+            db = Path(td) / "idx-code.sqlite"
+            code_reindex(root, db, no_embed=True, lang="python")
+
+            _rewrite_same_size(p, "alpha", "bravo")
+
+            conn = memidx.open_code_db(db)
+            rep = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)
+            conn.close()
+            self.assertEqual(rep["state"], "stale", rep)
+
+    def test_stat_identical_row_reads_metadata_current_and_serves_the_old_symbol(self):
+        """Variant b: every one of the five stat signals is made to match
+        (simulated). The default (no --verify-content) report must NOT
+        claim `current`; it reads `metadata-current` and the stale symbol
+        is still what a search answers by default. --verify-content
+        hashes anyway, proves `stale`, heals, and the new symbol is found."""
+        with tempfile.TemporaryDirectory() as td:
+            root, p = self._one_file_root(td)
+            db = Path(td) / "idx-code.sqlite"
+            code_reindex(root, db, no_embed=True, lang="python")
+
+            _rewrite_same_size(p, "alpha", "bravo")
+            _copy_new_signals_into_file_sha(db, memidx.DEFAULT_PROJECT, root, "a.py")
+
+            conn = memidx.open_code_db(db)
+            rep = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)
+            conn.close()
+            self.assertEqual(rep["state"], "metadata-current", rep)
+
+            out_buf = io.StringIO()
+            with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(io.StringIO()):
+                memidx.cmd_code_search(ns(
+                    db=str(db), project=memidx.DEFAULT_PROJECT, query="alpha", mode="fts",
+                    limit=10, json=True, decision_db=None, no_heal=True,
+                ))
+            data = json.loads(out_buf.getvalue())
+            self.assertTrue(any(h["qualified_name"] == "alpha" for h in data["results"]), data)
+
+            out_buf2 = io.StringIO()
+            with contextlib.redirect_stdout(out_buf2), contextlib.redirect_stderr(io.StringIO()):
+                memidx.cmd_code_search(ns(
+                    db=str(db), project=memidx.DEFAULT_PROJECT, query="bravo", mode="fts",
+                    limit=10, json=True, decision_db=None, no_heal=False, verify_content=True,
+                ))
+            data2 = json.loads(out_buf2.getvalue())
+            self.assertEqual(data2["state"], "current", data2)
+            self.assertTrue(any(h["qualified_name"] == "bravo" for h in data2["results"]), data2)
+
+    def test_touch_is_metadata_current_no_rechunk_no_reembed(self):
+        """5 (brief note): the no-rechunk/no-reembed mechanism for a bare
+        touch predates this task, so only the state is checked loosely
+        here (not "stale") -- the exact "metadata-current" vocabulary is
+        pinned by test_verify_content_proves_current_default_is_metadata_current
+        instead."""
+        with tempfile.TemporaryDirectory() as td:
+            root, p = self._one_file_root(td)
+            db = Path(td) / "idx-code.sqlite"
+            code_reindex(root, db, no_embed=True, lang="python")
+
+            conn = memidx.open_code_db(db)
+            chunk_id_before = conn.execute(
+                "SELECT id FROM chunks WHERE path=?", ("a.py",)
+            ).fetchone()["id"]
+            conn.close()
+
+            os.utime(p, (time.time() + 3600, time.time() + 3600))
+
+            def _boom(*a, **kw):
+                raise AssertionError("compute_embeddings must not be called for a bare touch")
+
+            with mock.patch.object(memidx, "compute_embeddings", side_effect=_boom):
+                code_reindex(root, db, no_embed=True, lang="python")
+
+            conn = memidx.open_code_db(db)
+            chunk_id_after = conn.execute(
+                "SELECT id FROM chunks WHERE path=?", ("a.py",)
+            ).fetchone()["id"]
+            emb_count = conn.execute("SELECT COUNT(*) AS c FROM embeddings").fetchone()["c"]
+            rep = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)
+            conn.close()
+            self.assertEqual(chunk_id_before, chunk_id_after)
+            self.assertEqual(emb_count, 0)
+            self.assertNotEqual(rep["state"], "stale", rep)
+
+    def test_git_trigger_catches_a_stat_identical_commit(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, p = self._one_file_root(td)
+            _init_git_repo(root)
+            db = Path(td) / "idx-code.sqlite"
+            code_reindex(root, db, no_embed=True, lang="python")
+
+            _rewrite_same_size(p, "alpha", "bravo")
+            _copy_new_signals_into_file_sha(db, memidx.DEFAULT_PROJECT, root, "a.py")
+            _git_commit_all(root, "rewrite alpha to bravo")
+
+            conn = memidx.open_code_db(db)
+            rep = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)
+            conn.close()
+            self.assertEqual(rep["state"], "stale", rep)
+            self.assertEqual(rep["roots"][0]["git_delta"], "changed", rep)
+
+    def test_git_trigger_does_not_double_count_a_new_committed_file(self):
+        """A brand-new file is already counted `changed` by the stat pass
+        (`prev is None`, never hashed there); the git trigger's diff also
+        names it (a new file IS a diffed path) -- it must not re-count the
+        same file a second time just because it wasn't in `hashed`."""
+        with tempfile.TemporaryDirectory() as td:
+            root, p = self._one_file_root(td)
+            _init_git_repo(root)
+            db = Path(td) / "idx-code.sqlite"
+            code_reindex(root, db, no_embed=True, lang="python")
+
+            (root / "b.py").write_text("def bravo():\n    return 2\n")
+            _git_commit_all(root, "add b.py")
+
+            conn = memidx.open_code_db(db)
+            rep = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)
+            conn.close()
+            self.assertEqual(rep["state"], "stale", rep)
+            self.assertEqual(rep["changed"], 1, rep)
+            self.assertEqual(rep["roots"][0]["git_delta"], "changed", rep)
+
+    def test_head_moved_on_a_non_source_file_still_verifies_and_refreshes(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, p = self._one_file_root(td)
+            _init_git_repo(root)
+            db = Path(td) / "idx-code.sqlite"
+            code_reindex(root, db, no_embed=True, lang="python")
+            conn = memidx.open_code_db(db)
+            head_before = conn.execute(
+                "SELECT head_sha FROM code_meta WHERE project=?", (memidx.DEFAULT_PROJECT,)
+            ).fetchone()["head_sha"]
+            conn.close()
+
+            (root / "README.md").write_text("notes\n")
+            _git_commit_all(root, "add readme")
+
+            conn = memidx.open_code_db(db)
+            rep = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)
+            head_after = conn.execute(
+                "SELECT head_sha FROM code_meta WHERE project=?", (memidx.DEFAULT_PROJECT,)
+            ).fetchone()["head_sha"]
+            conn.close()
+            self.assertEqual(rep["state"], "metadata-current", rep)
+            self.assertEqual(rep["roots"][0]["git_delta"], "verified", rep)
+            self.assertNotEqual(head_before, head_after)
+
+    def test_non_git_root_git_delta_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, p = self._one_file_root(td)
+            db = Path(td) / "idx-code.sqlite"
+            code_reindex(root, db, no_embed=True, lang="python")
+            conn = memidx.open_code_db(db)
+            rep = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)
+            conn.close()
+            self.assertEqual(rep["roots"][0]["git_delta"], "unavailable", rep)
+            self.assertEqual(rep["state"], "metadata-current", rep)
+
+    def test_verify_content_proves_current_default_is_metadata_current(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, p = self._one_file_root(td)
+            db = Path(td) / "idx-code.sqlite"
+            code_reindex(root, db, no_embed=True, lang="python")
+
+            conn = memidx.open_code_db(db)
+            rep_default = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)
+            rep_verified = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT, verify_content=True)
+            conn.close()
+            self.assertEqual(rep_default["state"], "metadata-current", rep_default)
+            self.assertEqual(rep_verified["state"], "current", rep_verified)
+
+            out_buf = io.StringIO()
+            with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(io.StringIO()):
+                memidx.cmd_code_search(ns(
+                    db=str(db), project=memidx.DEFAULT_PROJECT, query="alpha", mode="fts",
+                    limit=10, json=True, decision_db=None, no_heal=True, verify_content=True,
+                ))
+            data = json.loads(out_buf.getvalue())
+            self.assertEqual(data["state"], "current", data)
+
+    def test_why_fast_path_trusts_metadata_current_and_distrusts_stale(self):
+        """7 (brief note): _resolve_symbol_via_code_index's own gate
+        (`report["state"] == "stale"`) is unchanged code -- "metadata-
+        current" is simply not "stale", so the fast path already trusts
+        it; this proves that and the stale-bypass side by side."""
+        with tempfile.TemporaryDirectory() as td:
+            root, p = self._one_file_root(td)
+            project = "why-fastpath-freshness"
+            home = Path(td) / "home"
+            home.mkdir()
+            prev_home = os.environ.get("MEMCONTINUUM_HOME")
+            os.environ["MEMCONTINUUM_HOME"] = str(home)
+            try:
+                code_args = ns(
+                    project=project, code_root=str(root), db=None,
+                    no_embed=True, full=False, lang="python",
+                )
+                self.assertEqual(memidx.cmd_code_reindex(code_args), 0)
+
+                with mock.patch.object(memidx, "fragment_declared_in_text", return_value=False):
+                    resolved = memidx.resolve_symbol_to_path(root, "alpha", project=project)
+                self.assertEqual(resolved, "a.py")
+
+                # a real content + mtime change -- genuine stale drift.
+                p.write_text("def alpha():\n    return 2\n")
+                os.utime(p, (time.time() + 3600, time.time() + 3600))
+                with mock.patch.object(memidx, "fragment_declared_in_text", return_value=False):
+                    resolved_stale = memidx.resolve_symbol_to_path(root, "alpha", project=project)
+                self.assertIsNone(
+                    resolved_stale,
+                    "the fast path must not trust a stale index (fragment fallback disabled)",
+                )
+            finally:
+                if prev_home is None:
+                    os.environ.pop("MEMCONTINUUM_HOME", None)
+                else:
+                    os.environ["MEMCONTINUUM_HOME"] = prev_home
+
+    def test_v2_db_rebuilds_to_v3_preserving_roots_and_langs(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "c.sqlite"
+            conn = sqlite3.connect(str(db))
+            conn.executescript(CODE_SCHEMA_V2_DDL)
+            conn.execute(
+                "INSERT INTO code_project (project, langs, embedding_mode) VALUES ('p','python','none')"
+            )
+            conn.execute(
+                "INSERT INTO code_meta (project, code_root, last_indexed_at, head_sha) "
+                "VALUES ('p','/old/root',0,'abc')"
+            )
+            conn.execute("INSERT INTO code_schema (version) VALUES (2)")
+            conn.commit()
+            conn.close()
+
+            conn = memidx.open_code_db(db)
+            self.assertEqual(memidx.code_schema_version(conn), 3)
+            self.assertEqual(
+                conn.execute("SELECT project, code_root FROM code_meta").fetchall()[0][:],
+                ("p", "/old/root"),
+            )
+            self.assertEqual(
+                conn.execute("SELECT langs FROM code_project").fetchone()[0], "python",
+            )
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0], 0)
+            conn.close()
+
+    def test_v1_fixture_still_rebuilds_to_v3(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "c.sqlite"
+            conn = sqlite3.connect(str(db))
+            conn.executescript(TestCodeSchemaV3.V1_DDL)
+            conn.commit()
+            conn.close()
+            conn = memidx.open_code_db(db)
+            self.assertEqual(memidx.code_schema_version(conn), 3)
+            conn.close()
 
 
 class TestMultiRootReindex(unittest.TestCase):
@@ -281,7 +713,7 @@ class TestMultiRootReindex(unittest.TestCase):
             self.assertFalse(db.exists())
             # an older-schema db must not be rebuilt by a refused run
             v1 = Path(td) / "v1.sqlite"
-            conn = sqlite3.connect(str(v1)); conn.executescript(TestCodeSchemaV2.V1_DDL); conn.commit(); conn.close()
+            conn = sqlite3.connect(str(v1)); conn.executescript(TestCodeSchemaV3.V1_DDL); conn.commit(); conn.close()
             with contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(code_reindex(Path(td) / "missing", v1, lang="python"), 2)
             conn = sqlite3.connect(str(v1))
@@ -2110,7 +2542,9 @@ class TestStaleCheckConsultsChunkerVersion(unittest.TestCase):
             conn = memidx.open_code_db(db)
             try:
                 state_before = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)["state"]
-                self.assertEqual(state_before, "current")
+                # design R3 (audit MC-P1-02): no --verify-content here, so
+                # a clean report reads "metadata-current", not "current".
+                self.assertEqual(state_before, "metadata-current")
 
                 prev = chunkers.LANGUAGE_TABLE["swift"]
                 bumped = dict(prev)
@@ -2380,7 +2814,9 @@ class TestVectorAndHybridJSONIsSerializable(unittest.TestCase):
             "'--mode', %r, '--limit', '3', '--json'])\n"
             "assert rc == 0, rc\n"
             "env = json.loads(buf.getvalue())\n"
-            "assert env['state'] == 'current', env['state']\n"
+            # design R3 (audit MC-P1-02): no --verify-content -- a clean
+            # reindex+search reads "metadata-current", not "current".
+            "assert env['state'] == 'metadata-current', env['state']\n"
             "out = env['results']\n"
             "assert len(out) > 0, 'zero hits -- the float32 path was never exercised'\n"
             "for h in out:\n"
@@ -2679,7 +3115,9 @@ class TestCodeIndexReport(unittest.TestCase):
             db = Path(td) / "idx-code.sqlite"; code_reindex(root, db, lang="python")
             os.utime(p, (time.time() + 3600, time.time() + 3600))
             conn = memidx.open_code_db(db)
-            self.assertEqual(memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)["state"], "current"); conn.close()
+            # design R3 (audit MC-P1-02): touch is bookkeeping-refreshed,
+            # not a change -- but no --verify-content, so "metadata-current".
+            self.assertEqual(memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)["state"], "metadata-current"); conn.close()
             p.write_text("def other():\n    pass\n"); os.utime(p, (time.time() + 7200, time.time() + 7200))
             conn = memidx.open_code_db(db)
             rep = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)
@@ -2746,7 +3184,9 @@ class TestCodeIndexReport(unittest.TestCase):
             (root / "bad.py").write_text("def (:\n"); (root / "ok.py").write_text("def fine():\n    pass\n")
             db = Path(td) / "idx-code.sqlite"; code_reindex(root, db, lang="python")
             env = json.loads(self._search(db, "fine", "--json").stdout)
-            self.assertEqual(env["state"], "current"); self.assertEqual(env["failed"], 1); self.assertEqual(env["not_indexed"], 0)
+            # design R3 (audit MC-P1-02): a failed-only report still reads
+            # "metadata-current" (not "degraded") with no --verify-content.
+            self.assertEqual(env["state"], "metadata-current"); self.assertEqual(env["failed"], 1); self.assertEqual(env["not_indexed"], 0)
             self.assertEqual(env["code_roots"][0]["code_root"], str(root.resolve())); self.assertEqual(env["embedding_mode"], "none")
 
 
@@ -2788,7 +3228,11 @@ class TestHealOnSearch(unittest.TestCase):
             root, db = self._stale_tree(td)
             r = self._run(db, "new_name", "--json")
             env = json.loads(r.stdout)
-            self.assertEqual(env["state"], "current")
+            # design R3 (audit MC-P1-02): a heal succeeds into
+            # "metadata-current" without --verify-content -- "index healed"
+            # prints for either honest post-heal state, this run asked for
+            # neither proof.
+            self.assertEqual(env["state"], "metadata-current")
             self.assertEqual(env["changed"], 0)
             self.assertTrue(
                 any(h["qualified_name"] == "new_name" for h in env["results"]), env["results"]
@@ -3003,7 +3447,7 @@ class TestIndexProvenance(unittest.TestCase):
             self.assertEqual(data["state"], "uninitialized")
             self.assertEqual(data["results"], [])
 
-    def test_current_index_json_carries_indexed_at_and_root(self):
+    def test_metadata_current_index_json_carries_indexed_at_and_root(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "code"
             root.mkdir()
@@ -3014,7 +3458,9 @@ class TestIndexProvenance(unittest.TestCase):
             result = self._run(["code-search", "--db", str(db), "outer func", "--mode", "fts", "--json"])
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             data = json.loads(result.stdout)
-            self.assertEqual(data["state"], "current")
+            # design R3 (audit MC-P1-02): no --verify-content -- a clean
+            # reindex+search reads "metadata-current", not "current".
+            self.assertEqual(data["state"], "metadata-current")
             # code_reindex canonicalises via Path(...).resolve() (memidx.py's
             # cmd_reindex), so the stored/reported code_root is the RESOLVED
             # path -- on macOS, root itself (built from tempfile's TMPDIR) is
@@ -3763,7 +4209,7 @@ class TestWhyNeverRebuildsAnOlderIndex(unittest.TestCase):
             project = "why-v1-guard"
             db_path = home / f"{project}-code.sqlite"
             conn = sqlite3.connect(str(db_path))
-            conn.executescript(TestCodeSchemaV2.V1_DDL)
+            conn.executescript(TestCodeSchemaV3.V1_DDL)
             conn.commit()
             conn.close()
 
@@ -3921,11 +4367,16 @@ class TestHealLimitAndFailurePathCleanup(unittest.TestCase):
             real_report = memidx.code_index_report
             seen_conns = []
 
-            def spying_report(c, project):
+            def spying_report(c, project, **kwargs):
+                # design R3 (audit MC-P1-02): heal_code_index now calls
+                # code_index_report with verify_content= -- accept it (and
+                # any future keyword) so this mock's signature can't itself
+                # become the TypeError the except-block below swallows,
+                # silently changing what this test proves.
                 seen_conns.append(c)
                 if len(seen_conns) == 1:
                     raise RuntimeError("boom after reopen")
-                return real_report(c, project)
+                return real_report(c, project, **kwargs)
 
             memidx.code_index_report = spying_report
             try:

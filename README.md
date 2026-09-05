@@ -351,11 +351,12 @@ apart, and flags the silent side when it finds one.
 
 Two more things worth knowing: committing the store reindexes it automatically,
 so `reindex` by hand is only for edits you have not committed yet; and a
-project can have several code roots — `code-search` tells you when their index
-is missing or stale rather than returning an empty list that reads like
-"nothing found", and heals a stale or incomplete index itself before
-searching, in one attempt, when the drift is small enough. Run any command
-with `--help` for its full flag list.
+project can have several code roots — `code-search` says whether a root's
+index is proven current, metadata-checked, stale, or incomplete, rather than
+returning an empty list that reads like "nothing found", and `--verify-content`
+proves it by hashing every indexed file; either way it heals a stale or
+incomplete index itself before searching, in one attempt, when the drift is
+small enough. Run any command with `--help` for its full flag list.
 
 **Keeping a wired repo up to date.** A fix that only touches a script (a hook,
 `memidx.py`, `memlint.py`) reaches every wired repo the moment you pull —

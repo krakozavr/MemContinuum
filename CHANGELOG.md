@@ -13,6 +13,29 @@
   `quarantined` state until the record is fixed or removed; `check --json`
   lists each one, and `unmapped` refuses the negative claim off a quarantined
   store the same way it already does for an uninitialized one.
+- `check` and `unmapped` now hash every record instead of trusting mtime/size
+  alone -- a same-size, same-mtime content rewrite (a metadata-preserving
+  restore, a coarse-timestamp filesystem, some sync tools) used to read as
+  no drift; it is now reported under `changed`, `check` exits 1, and
+  `unmapped` refuses the negative claim off it. A bare `touch` (mtime moves,
+  content unchanged) is bookkeeping-refreshed in place and is no longer
+  reported as drift -- the inverse of `check`'s old behaviour. `search`,
+  `chain`, `for-path`, `why`, and `drift` keep the metadata-only comparison
+  (unchanged) -- `check`/`unmapped` are what prove content, not every reader.
+
+### Code index
+- The code index's freshness check now compares five stat signals per file
+  (size, mtime, ctime, inode, device) instead of mtime/size alone, catching a
+  same-size, same-mtime content rewrite the old comparison could not; when a
+  root's stored git HEAD has moved, the commit's own changed files are hashed
+  too, as a trigger (not proof on its own). `code-search`'s reported state
+  splits `current` (this call hashed every file and proved it, only under the
+  new `--verify-content` flag) from `metadata-current` (the honest default --
+  nothing looks changed, but nothing was proven by a hash either); a
+  nothing-found result is real evidence only under `current`. Each
+  `code_roots` entry in `--json` also carries `git_delta`. The code index
+  schema bumps to version 3 (a rebuild on first use, same as any schema
+  bump -- roots and languages survive, embeddings do not).
 
 ## [0.2.0rc3] — 2026-09-04
 

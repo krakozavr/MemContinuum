@@ -3907,7 +3907,10 @@ class TestNewFileNudgeHook(unittest.TestCase):
         data = json.loads(proc.stdout)
         ctx = data["hookSpecificOutput"]["additionalContext"]
         self.assertIn(str(self.code_root), ctx)
-        self.assertIn("confirm the code index is initialized/current", ctx)
+        # design R3 (audit MC-P1-02): "current" dropped from the message --
+        # the word now means content-proven, which this hook has no way to
+        # check without paying for a python+sqlite read on every Write.
+        self.assertIn("confirm the code index is initialized and not stale", ctx)
         self.assertIn("code-search", ctx)
         self.assertIn("New source file under", ctx)
         # exactly one line of additionalContext.
