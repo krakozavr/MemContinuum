@@ -930,12 +930,24 @@ def unpack_vector(blob: bytes):
 # legitimately lives at e.g. `~/.memory/` still indexes in full.
 #
 # The walker does not follow symlinks: a symlinked directory is pruned before
-# os.walk descends into it (whether or not its own name would also have been
-# pruned as hidden), and a symlinked file that would otherwise be indexed is
-# skipped rather than read. Both are warned on stderr, one line per skip, and
-# counted, so a store is defended against escaping its own root through an
-# alias without a per-path containment check. A hidden directory reached by
-# its own name is pruned whether or not it is a symlink.
+# it is descended into, and a symlinked file that would otherwise be indexed
+# is skipped rather than read. Both are warned on stderr, one line per skip,
+# and counted, so a store is defended against escaping its own root through an
+# alias without a per-path containment check. Name-pruning (hidden,
+# node_modules) is tested BEFORE the symlink test, so a hidden symlinked
+# directory is pruned as hidden, silently, exactly like a hidden real one --
+# it never reaches the symlink check and is never warned about.
+#
+# os.scandir, not os.walk: an explicit iterative stack over DirEntry objects,
+# so is_symlink()/is_dir() read the directory-read's own cached entry type
+# instead of issuing a fresh lstat per name -- on a slow/networked filesystem
+# (a 9P-mounted Windows drive, say) the per-lstat cost this walk previously
+# paid for every directory and every .md file is what made the walker itself
+# the store's slowest step; scandir avoids it while keeping the identical
+# rules. Entries are sorted by name at each level so traversal order stays
+# deterministic across platforms (most callers re-sort the full path list
+# anyway, but the walker no longer depends on the OS's own enumeration
+# order to do so).
 STORE_SKIP_DIR_NAMES = {"node_modules"}
 
 
@@ -955,28 +967,33 @@ def walk_markdown(root: Path, *, skipped: list | None = None):
     real tree and yields paths under the resolved root. Neither a symlinked
     directory nor a symlinked file is ever walked/yielded -- each is warned on
     stderr and, when the caller passes a `skipped` list, appended to it (e.g.
-    cmd_check's symlinks_skipped count)."""
+    cmd_check's symlinks_skipped count) -- unless it was already pruned by
+    name (hidden/node_modules), which happens silently, no warning."""
     root = Path(root).resolve()
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        kept_dirnames = []
-        for d in dirnames:
-            full = Path(dirpath) / d
-            if full.is_symlink():
-                _warn_symlink_skipped(full, skipped)
+    stack = [str(root)]
+    while stack:
+        dirpath = stack.pop()
+        try:
+            entries = sorted(os.scandir(dirpath), key=lambda e: e.name)
+        except OSError:
+            continue
+        subdirs = []
+        for entry in entries:
+            name = entry.name
+            # Name-pruning first: a hidden entry (or node_modules) is never
+            # even lstat'd for symlink-ness -- it is noise regardless.
+            if name.startswith(".") or name in STORE_SKIP_DIR_NAMES:
                 continue
-            if d.startswith(".") or d in STORE_SKIP_DIR_NAMES:
+            if entry.is_symlink():
+                _warn_symlink_skipped(Path(entry.path), skipped)
                 continue
-            kept_dirnames.append(d)
-        dirnames[:] = kept_dirnames
-        for fname in filenames:
-            # Hidden files get the same treatment as hidden directories, and
-            # for the same reason: a dotfile is tooling's, not a record.
-            if fname.endswith(".md") and not fname.startswith("."):
-                full = Path(dirpath) / fname
-                if full.is_symlink():
-                    _warn_symlink_skipped(full, skipped)
-                    continue
-                yield full
+            if entry.is_dir(follow_symlinks=False):
+                subdirs.append(entry.path)
+            elif name.endswith(".md"):
+                yield Path(entry.path)
+        # Push in reverse so pop() (LIFO) visits subdirectories in the same
+        # sorted order they were scanned, depth-first.
+        stack.extend(reversed(subdirs))
 
 
 def cmd_reindex(args) -> int:
