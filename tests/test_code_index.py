@@ -321,7 +321,18 @@ def _copy_new_signals_into_file_sha(db_path, project, code_root, rel) -> None:
     table_info-tolerant: against UNMODIFIED (pre-migration) code, file_sha
     has no mtime_ns/ctime_ns/ino/dev columns at all, so this only writes
     mtime/size there -- the red run then fails on the freshness VERDICT
-    (`current` vs `metadata-current`), not on a missing-column error."""
+    (`current` vs `metadata-current`), not on a missing-column error.
+
+    Fix round 3: `code_root` is matched RESOLVED here -- cmd_code_reindex
+    stores `Path(args.code_root).resolve()`, so on a platform where the
+    caller's own root string sits behind a symlinked ancestor (macOS: a
+    tempfile.TemporaryDirectory under /var/folders/..., itself a symlink
+    to /private/var/folders/...) matching on the raw, unresolved string
+    finds zero rows and silently no-ops -- the row is never actually
+    changed, the test's whole premise (a stat-identical row) never lands,
+    and the assertion below fails for a reason that has nothing to do
+    with the freshness logic under test."""
+    resolved_root = str(Path(code_root).resolve())
     f = Path(code_root) / rel
     st = f.stat()
     conn = sqlite3.connect(str(db_path))
@@ -337,10 +348,14 @@ def _copy_new_signals_into_file_sha(db_path, project, code_root, rel) -> None:
             if col in cols:
                 sets.append(f"{col}=?")
                 params.append(val)
-        params.extend([project, str(code_root), rel])
-        conn.execute(
+        params.extend([project, resolved_root, rel])
+        cur = conn.execute(
             f"UPDATE file_sha SET {', '.join(sets)} WHERE project=? AND code_root=? AND path=?",
             params,
+        )
+        assert cur.rowcount == 1, (
+            f"fixture bug: expected exactly one file_sha row for "
+            f"({project!r}, {resolved_root!r}, {rel!r}), updated {cur.rowcount}"
         )
         conn.commit()
     finally:
@@ -542,11 +557,21 @@ class TestContentProvenFreshness(unittest.TestCase):
             # chunker_version left untouched so the stat pass's OWN
             # chunker-version check (which runs before the sha256-IS-NULL
             # skip) does not itself count this row as changed.
+            # Fix round 3: match on the RESOLVED code_root, the same value
+            # cmd_code_reindex actually stored (Path(args.code_root)
+            # .resolve()) -- matching on the raw `root` string finds zero
+            # rows on a platform where it sits behind a symlinked ancestor
+            # (macOS's /var/folders/... vs /private/var/folders/...),
+            # silently no-oping the simulated not-indexed row and leaving
+            # the git trigger to see a genuinely-indexed file instead.
             conn = sqlite3.connect(str(db))
-            conn.execute(
+            cur = conn.execute(
                 "UPDATE file_sha SET status='not-indexed', sha256=NULL "
                 "WHERE project=? AND code_root=? AND path=?",
-                (memidx.DEFAULT_PROJECT, str(root), "a.py"),
+                (memidx.DEFAULT_PROJECT, str(root.resolve()), "a.py"),
+            )
+            assert cur.rowcount == 1, (
+                f"fixture bug: expected exactly one file_sha row, updated {cur.rowcount}"
             )
             conn.commit()
             conn.close()

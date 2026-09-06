@@ -1189,7 +1189,12 @@ class TestMutationSurface(HookTestBase):
         state2 = self.load_state(session_id)
         rows = [e for e in state2["ledger"] if e.get("source") == "shell-diff"]
         self.assertEqual(len(rows), 1, state2["ledger"])
-        self.assertEqual(rows[0]["path"], str(target))
+        # Fix round 3: the shell-diff baseline is keyed (and rows are
+        # filed) by the PHYSICAL root -- str(target) itself may still be
+        # spelled through a symlinked ancestor (macOS's TMPDIR under
+        # /var/folders/..., a symlink to /private/var/folders/...), so
+        # the row's path is compared in its resolved form.
+        self.assertEqual(rows[0]["path"], str(target.resolve()))
         self.assertEqual(rows[0]["kind"], "code")
         self.assertEqual(rows[0]["root"], str(self.code_root.resolve()))
         log2 = (self.home / "hook.log").read_text()
@@ -1257,18 +1262,22 @@ class TestMutationSurface(HookTestBase):
         state2 = self.load_state(session_id)
         rows = {e["path"]: e for e in state2.get("ledger", []) if e.get("source") == "shell-diff"}
 
+        # Fix round 3: shell-diff rows are filed under the PHYSICAL root
+        # (self.code_root.resolve()) -- see test_bash_overwrite_lands_as_shell_diff_row.
+        target_r = str(target.resolve())
+        child_r = str(child.resolve())
         self.assertIn(
-            str(target), rows,
+            target_r, rows,
             f"the tracked-file deletion must still be ledgered even though a directory now "
             f"occupies its path: {rows}",
         )
-        self.assertEqual(rows[str(target)]["content_sha256"], "")
+        self.assertEqual(rows[target_r]["content_sha256"], "")
 
-        self.assertIn(str(child), rows, f"the new child file must also be ledgered: {rows}")
-        self.assertNotEqual(rows[str(child)]["content_sha256"], "")
+        self.assertIn(child_r, rows, f"the new child file must also be ledgered: {rows}")
+        self.assertNotEqual(rows[child_r]["content_sha256"], "")
 
         log2 = (self.home / "hook.log").read_text()
-        self.assertIn("ledger outcome=appended kind=code source=shell-diff file=" + str(target), log2)
+        self.assertIn("ledger outcome=appended kind=code source=shell-diff file=" + target_r, log2)
 
     # -- codex re-gate MINOR 2, mirror-image case caught at review: the
     # BASELINE loop has its own copy of the G3 directory guard, and it
@@ -1346,11 +1355,13 @@ class TestMutationSurface(HookTestBase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         state = self.load_state(session_id)
         rows = {e["path"]: e for e in state["ledger"] if e.get("source") == "shell-diff"}
-        self.assertIn(str(new_file), rows, rows)
-        self.assertIn(str(self.code_root / "src" / "renamed.py"), rows, rows)
-        self.assertIn(str(self.code_root / "src" / "unmapped.py"), rows, rows)
-        self.assertIn(str(deleted), rows, rows)
-        self.assertEqual(rows[str(deleted)]["content_sha256"], "")
+        # Fix round 3: shell-diff rows are filed under the PHYSICAL root.
+        deleted_r = str(deleted.resolve())
+        self.assertIn(str(new_file.resolve()), rows, rows)
+        self.assertIn(str((self.code_root / "src" / "renamed.py").resolve()), rows, rows)
+        self.assertIn(str((self.code_root / "src" / "unmapped.py").resolve()), rows, rows)
+        self.assertIn(deleted_r, rows, rows)
+        self.assertEqual(rows[deleted_r]["content_sha256"], "")
 
     # -- 7: pre-existing dirt is not attributed -------------------------------
 
@@ -1366,7 +1377,8 @@ class TestMutationSurface(HookTestBase):
         proc, _ = run_script(LEDGER_HOOK, self.bash_payload(session_id), self.base_env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
         state2 = self.load_state(session_id)
-        rows = [e for e in state2["ledger"] if e["path"] == str(target)]
+        # Fix round 3: shell-diff rows are filed under the PHYSICAL root.
+        rows = [e for e in state2["ledger"] if e["path"] == str(target.resolve())]
         self.assertEqual(len(rows), 1, state2["ledger"])
 
     # -- 8: a shell edit under the store root is a kind: store row ------------
@@ -1379,7 +1391,9 @@ class TestMutationSurface(HookTestBase):
         proc, _ = run_script(LEDGER_HOOK, self.bash_payload(session_id), self.base_env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
         state = self.load_state(session_id)
-        rows = [e for e in state["ledger"] if e["path"] == str(target)]
+        # Fix round 3: shell-diff rows are filed under the PHYSICAL root
+        # (the store root is realpath'd too, not just code roots).
+        rows = [e for e in state["ledger"] if e["path"] == str(target.resolve())]
         self.assertEqual(len(rows), 1, state["ledger"])
         self.assertEqual(rows[0]["kind"], "store")
         self.assertEqual(rows[0]["source"], "shell-diff")
@@ -1410,7 +1424,10 @@ class TestMutationSurface(HookTestBase):
         state2 = self.load_state(session_id)
         rows = [e for e in state2["ledger"] if e.get("source") == "shell-diff"]
         self.assertEqual(len(rows), 1, state2["ledger"])
-        self.assertEqual(rows[0]["path"], str(target))
+        # Fix round 3: same physical-path comparison as the overwrite test
+        # above -- `target` here is built from the unresolved `worktree`,
+        # while the row's path comes back through the realpath'd root.
+        self.assertEqual(rows[0]["path"], str(target.resolve()))
 
     # -- 9: a slow root times out and is counted; the other root still works -
 
@@ -1479,7 +1496,8 @@ class TestMutationSurface(HookTestBase):
         log_text = (self.home / "hook.log").read_text()
         self.assertIn("outcome=unsupported-mutation-surface tool=SomeMcpTool", log_text)
         state = self.load_state(session_id)
-        rows = [e for e in state["ledger"] if e["path"] == str(target)]
+        # Fix round 3: shell-diff rows are filed under the PHYSICAL root.
+        rows = [e for e in state["ledger"] if e["path"] == str(target.resolve())]
         self.assertEqual(len(rows), 1, state["ledger"])
         self.assertEqual(rows[0]["source"], "shell-diff")
 
@@ -1496,7 +1514,8 @@ class TestMutationSurface(HookTestBase):
         log_text = (self.home / "hook.log").read_text()
         self.assertIn("outcome=unsupported-mutation-surface tool=unknown", log_text)
         state = self.load_state(session_id)
-        rows = [e for e in state["ledger"] if e["path"] == str(target)]
+        # Fix round 3: shell-diff rows are filed under the PHYSICAL root.
+        rows = [e for e in state["ledger"] if e["path"] == str(target.resolve())]
         self.assertEqual(len(rows), 1, state["ledger"])
 
     # -- 12: the hook script never reads the command text or the tool's

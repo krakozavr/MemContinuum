@@ -308,10 +308,20 @@ def log_line(text):
 roots = []
 for _line in (os.environ.get("MC_CODE_ROOTS_LINES") or "").splitlines():
     if _line:
-        roots.append((_line, "code"))
+        # Fix round 3: realpath ONCE per root here, before it is ever used
+        # as a shell_baseline dict key or a ledger row path/root field --
+        # a raw (non-physical) root string leaves both keyed by whichever
+        # spelling the caller happened to pass (e.g. macOS with
+        # /var/folders/... vs the /private/var/folders/... every stat/git
+        # call actually resolves through), causing the same root to never
+        # match an earlier baseline. The installer already renders every
+        # configured code root through os.path.realpath
+        # (scripts/repo-init.sh) -- this keeps the hook own idea of a root
+        # physically consistent with that.
+        roots.append((os.path.realpath(_line), "code"))
 store_root = os.environ.get("MEMCONTINUUM_ROOT") or ""
 if store_root:
-    roots.append((store_root, "store"))
+    roots.append((os.path.realpath(store_root), "store"))
 
 try:
     total_budget = float(os.environ.get("MEMCONTINUUM_SHELL_DIFF_BUDGET") or "1.2")

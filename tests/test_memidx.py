@@ -805,7 +805,12 @@ class TestContentProvenFreshness(unittest.TestCase):
                 )
             report = json.loads(check_buf.getvalue())
             self.assertTrue(report["drift"], report)
-            self.assertIn(str(p), report["changed"], report)
+            # Fix round 3: walk_markdown resolves `root` before it ever
+            # walks it, so the stored (and reported) path is the
+            # RESOLVED one -- on macOS, td (from tempfile) sits under
+            # /var/folders/..., a symlink to /private/var/folders/...,
+            # so `p` itself must be resolved before comparison.
+            self.assertIn(str(p.resolve()), report["changed"], report)
             self.assertEqual(rc, 1)
 
             # unmapped's self-heal (state == "stale", content-proven) must
@@ -846,7 +851,12 @@ class TestContentProvenFreshness(unittest.TestCase):
 
             conn = sqlite3.connect(str(db))
             conn.row_factory = sqlite3.Row
-            row = conn.execute("SELECT mtime FROM records WHERE path=?", (str(p),)).fetchone()
+            # Fix round 3: records.path is stored resolved (walk_markdown
+            # resolves `root` up front) -- see the matching comment in
+            # test_same_size_rewrite_is_drift_under_check_and_unmapped_self_heals.
+            row = conn.execute(
+                "SELECT mtime FROM records WHERE path=?", (str(p.resolve()),)
+            ).fetchone()
             conn.close()
             self.assertAlmostEqual(row["mtime"], new_time, delta=1.0)
 
