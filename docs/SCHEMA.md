@@ -115,6 +115,16 @@ is handled by **splitting the link into scoped claims before promotion**
 > **CONTEXT** — informs only. `agent-inference` may never by itself override
 > a fix that code and tests already accept.
 
+**Conflict resolution.** Two `status: active` links can genuinely conflict — the schema allows
+several active rulings at once (one topic's own chain, or across topics), it does not guarantee
+they agree. When they do, the tier above decides: the higher-tier link prevails, and the reader
+names both links and says so, rather than silently picking one. Equal tier does not resolve
+itself: two conflicting rulings at `agent-inference` (or any other equal, non-owner tier) are
+resolved by the orchestrator, who writes a new link reversing one of them (`kind: reversed`,
+`reverses: <the losing link>`, per §7's rule that its target must no longer be active); two
+conflicting `owner-verbatim`/`owner-ratified` links go back to the owner, and the owner's answer
+is recorded as a new `owner-verbatim` link (`TOP-xxxx Ln`), never inferred on their behalf.
+
 ## 5. Promotion — how an inference becomes a ruling
 
 1. The record exists as `agent-inference` / `provisional`.
