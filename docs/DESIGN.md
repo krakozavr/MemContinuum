@@ -42,9 +42,18 @@ hoping it remembers to do so is exactly the failure mode this engine exists
 to route around — the same failure mode that "remember to write things down"
 already suffers from at the note-taking end. Instead, a `PreToolUse` hook
 looks up whatever the file being edited is governed by and injects it as
-context *at the moment of the edit*, before any code gets written. Retrieval
-that depends on being remembered eventually isn't retrieval; it's one more
-thing to forget. The same logic runs the other direction: write-side hooks
+context *at the moment of the edit*, before any code gets written — for
+edits made through the Edit and Write tools. That is structured
+pre-retrieval, not a universal guarantee: a file changed from the shell (a
+script, a formatter, `git apply`, anything run as a Bash command) gets no
+such lookup beforehand. The PostToolUse ledger hook still sees it, but only
+afterwards, from a tree diff against the last state it saw — best effort,
+never called pre-retrieval, because it is not one. The ledger entry it
+writes is bookkeeping (a record that some path changed), not a decision
+record, and it is not proof anything governing that path was looked up
+first. Retrieval that depends on being remembered eventually isn't
+retrieval; it's one more thing to forget. The same logic runs the other
+direction: write-side hooks
 remind a session that a decision it just made might be worth recording —
 again, a nudge at the moment it matters, not a hope that someone remembers to
 write the note later. The triggers are deliberately blind to what was typed:

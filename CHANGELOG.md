@@ -92,6 +92,32 @@
   `unmapped --code-root` is now repeatable, picking the most specific
   (longest) matching root when roots nest. Existing installs pick this up
   on their next `memcontinuum-update.sh --apply` -- no re-install needed.
+- The store's `post-commit` hook no longer runs a full (embedding) reindex
+  synchronously inside `git commit` -- it now runs a bounded, content-only
+  pass (`--no-embed --auto`, under the same watchdog every write-side hook
+  uses) so a hung or slow embedding backend can never delay a commit; text
+  is searchable the instant the hook returns. When records are left
+  without a fresh vector, the hook spawns a detached, coalescing background
+  worker (`memidx.py embed-worker`, safe to run twice) that backfills them;
+  `check --json` and `stats --json` both gain `embedding_backlog` so the
+  catch-up is visible. Existing installs pick this up automatically on
+  their next commit -- no re-install needed.
+- The edit ledger now sees every tool call, not only `Edit`/`Write`/
+  `MultiEdit`/`NotebookEdit` -- a cheap prefilter still skips the read-only
+  built-ins before the watchdog even starts, but a file changed from the
+  shell (or by any tool this hook has no dedicated branch for) is now
+  caught by a tree diff against the last-seen state of every configured
+  code root and the store root, and appended to the same ledger; an
+  unrecognized or missing tool name is logged by name and still diffed
+  rather than silently skipped. `stats` reports how often each of those
+  two paths fired.
+
+### Documentation
+- The README, `docs/DESIGN.md`, and `docs/INTERNALS.md` now say plainly
+  where the automatic retrieval-before-an-edit boundary sits: it only
+  covers edits made with the Edit and Write tools. A file changed from the
+  shell gets no lookup beforehand -- only an after-the-fact entry in the
+  edit ledger, once a tree diff notices it.
 
 ## [0.2.0rc3] — 2026-09-04
 
@@ -154,16 +180,6 @@
   edited before the `/clear` that is still unmapped to a decision stays
   visible to the coverage nudge; turn counts and injection cooldowns reset
   to a fresh baseline.
-- The store's `post-commit` hook no longer runs a full (embedding) reindex
-  synchronously inside `git commit` -- it now runs a bounded, content-only
-  pass (`--no-embed --auto`, under the same watchdog every write-side hook
-  uses) so a hung or slow embedding backend can never delay a commit; text
-  is searchable the instant the hook returns. When records are left
-  without a fresh vector, the hook spawns a detached, coalescing background
-  worker (`memidx.py embed-worker`, safe to run twice) that backfills them;
-  `check --json` and `stats --json` both gain `embedding_backlog` so the
-  catch-up is visible. Existing installs pick this up automatically on
-  their next commit -- no re-install needed.
 
 ## [0.2.0rc1] — unreleased
 

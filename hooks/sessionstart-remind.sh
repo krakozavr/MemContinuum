@@ -135,12 +135,10 @@ case "${SOURCE:-}" in
         # ({root: sha}) is added for every configured root -- one extra
         # python spawn (mc_code_roots, memlib.sh), the per-root git HEADs
         # (mc_git_head, no python) folded into the SAME state-update
-        # transform below, no additional spawn for the map itself.
-        CODE_HEADS=""
-        while IFS= read -r CR; do
-            [ -n "$CR" ] || continue
-            CODE_HEADS="$CODE_HEADS$CR"$'\t'"$(mc_git_head "$CR")"$'\n'
-        done < <(mc_code_roots)
+        # transform below, no additional spawn for the map itself. LOW-3
+        # (task-7-review.md): the per-root loop itself now lives once in
+        # memlib.sh's mc_code_heads_from.
+        CODE_HEADS="$(mc_code_heads_from "$(mc_code_roots)")"
         export MC_CODE_SHA="$CODE_SHA"
         export MC_STORE_SHA="$STORE_SHA"
         export MC_CODE_HEADS="$CODE_HEADS"
@@ -152,12 +150,19 @@ case "${SOURCE:-}" in
 import os, time
 
 # INC-0108: clear discards whatever this session_id had on disk before the
-# setdefault init below runs, EXCEPT `ledger` -- see the header comment
-# above for why the ledger alone survives.
+# setdefault init below runs, EXCEPT ledger -- see the header comment
+# above for why the ledger alone survives. Design R6 (audit MC-P1-04,
+# TOP-0123 L6): shell_baseline (the shell-diff branch own per-root
+# baseline map) is kept alongside it for the same reason -- wiping it
+# would silently re-baseline every root on the next Bash call, losing the
+# distinction between pre- and post-clear shell dirt for the rest of the
+# session.
 if os.environ.get("MC_SOURCE") == "clear":
     _prior_ledger = state.get("ledger") or []
+    _prior_shell_baseline = state.get("shell_baseline") or {}
     state = {}
     state["ledger"] = _prior_ledger
+    state["shell_baseline"] = _prior_shell_baseline
 
 _code_heads = {}
 for _line in (os.environ.get("MC_CODE_HEADS") or "").splitlines():

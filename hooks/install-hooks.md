@@ -68,6 +68,11 @@ Notes:
   `code-root-filter-pair.json.tmpl` and `newfile-nudge-filter-pair.json.tmpl` compose `if` as
   `Edit(/{{CODE_ROOT}}/**)` / `Write(/{{CODE_ROOT}}/**)` — the rendered value always has exactly
   two leading slashes.
+- There is no `Bash` matcher here, and none is added: an `if` condition like `Edit(...)`/
+  `Write(...)` names a file path a tool is about to touch, and an arbitrary shell command has no
+  single such path to filter on before it runs. A file changed from the shell gets no pre-edit
+  lookup at all — section 4's `ledger-post-edit.sh` is what records it, but only afterwards, from
+  a tree diff, never before the change the way this hook works for `Edit`/`Write`.
 
 ## 2. `newfile-nudge.sh` — Claude Code `PreToolUse` hook (Write only)
 
@@ -147,7 +152,11 @@ embedding backend can never delay the commit, because this pass never calls
 the embedding backend at all. Its own log line gains one more token,
 `embed=pending|clean|skipped`: `pending` means the reindex left one or more
 records without a fresh vector, in which case the script also touches
-`$MEMCONTINUUM_HOME/<project>.embed-pending` and spawns
+`$MEMCONTINUUM_HOME/<project>.embed-pending` (this script always builds its
+own database path as `$MEMCONTINUUM_HOME/<project>.sqlite`, so this is the
+same "beside the database" location `docs/INTERNALS.md`'s writable-surface
+section describes -- a diverging custom `--db` is only possible calling
+`memidx.py embed-worker` directly, not through this hook) and spawns
 `memidx.py embed-worker` detached (a Python `subprocess.Popen(
 start_new_session=True)` — never bash `&`, never a `setsid` binary, which
 macOS does not ship) to backfill embeddings in the background; `clean` means
@@ -185,7 +194,6 @@ merged into `.claude/settings.json` or `.claude/settings.local.json`:
   "hooks": {
     "PostToolUse": [
       {
-        "matcher": "Edit|Write|NotebookEdit",
         "hooks": [
           {
             "type": "command",
@@ -244,7 +252,9 @@ Notes:
   is no settings-level `if` for `PreCompact`, `SessionStart`, `UserPromptSubmit`, or `SessionEnd`.
   If you want `ledger-post-edit.sh` scoped the same way `pre-edit-chain.sh` is (e.g. only a
   specific subtree), add `"if": "Edit(...)"` / `"if": "Write(...)"` entries the same way as
-  section 1 above; the other four scripts gate on payload fields (`trigger`, `agent_id`/
+  section 1 above — but `if` cannot scope a `Bash` entry the same way: there is no path-shaped
+  condition for an arbitrary shell command, so any such filter only ever narrows the Edit/Write
+  side of this hook, never the shell-diff branch that watches `Bash`. The other four scripts gate on payload fields (`trigger`, `agent_id`/
   `agent_type`) in-script instead, since they have no `if` to lean on. `source` is a
   `SessionStart`-only field (see the next note) — `precompact-persist.sh` gates on `trigger`
   (PreCompact's own field, `manual`/`auto`), and `userprompt-remind.sh` gates on `agent_id`/
@@ -274,8 +284,11 @@ Notes:
   `userprompt-remind.sh`'s coverage check and `precompact-persist.sh` call `memidx.py unmapped`,
   which self-heals a drifted decision index with a `reindex --no-embed --auto` (mode-preserving —
   it never embeds, and never claims a fuller embedding mode than the index already had, inside a
-  hook's own time budget), so the decision index's own SQLite cache is written too. `git diff`/`git status` in either root staying empty across
-  every hook invocation is a permanent regression test (`tests/test_write_hooks.py`).
+  hook's own time budget), so the decision index's own SQLite cache is written too.
+  `ledger-post-edit.sh`'s shell-diff branch additionally runs `git status --porcelain -z` (via
+  `--no-optional-locks`) in every code root and the store root on a `Bash` or unrecognized-tool
+  payload — that call is read-only, so `git diff`/`git status` in either root staying empty across
+  every hook invocation remains a permanent regression test (`tests/test_write_hooks.py`).
   `post-commit-reindex.sh` (section 3 above, not one of these five) additionally writes
   `$MEMCONTINUUM_HOME/<project>.embed-pending`, `<project>.embed.lock` and `<project>.embed.log`
   when its content pass leaves rows without a fresh vector.

@@ -3712,12 +3712,20 @@ class TestTypedDegradation(unittest.TestCase):
             self.assertIn("boom", out["degraded"]["safe_message"])
             self.assertIn("unmapped: degraded reason=internal-error type=AttributeError",
                            buf_err.getvalue())
-            log_path = debug_home / "memidx-debug.log"
-            self.assertTrue(log_path.is_file(), "memidx-debug.log must exist under MEMCONTINUUM_HOME")
+            # Ruling 132: _debug_log lands beside the database this call
+            # served (db.parent), never under MEMCONTINUUM_HOME -- prove
+            # both directions: the file exists at db.parent, and the
+            # patched (but now-irrelevant) MEMCONTINUUM_HOME stays empty.
+            log_path = db.parent / "memidx-debug.log"
+            self.assertTrue(log_path.is_file(), "memidx-debug.log must exist beside the database")
             log_text = log_path.read_text()
             self.assertIn("AttributeError", log_text)
             self.assertIn("boom", log_text)
             self.assertIn("Traceback", log_text)
+            self.assertEqual(
+                list(debug_home.iterdir()), [],
+                "MEMCONTINUUM_HOME must not receive the debug log when a db_path is in scope",
+            )
 
     def test_debug_flag_reraises_unmapped_internal_error(self):
         with tempfile.TemporaryDirectory() as td:
@@ -3873,6 +3881,34 @@ class TestTypedDegradation(unittest.TestCase):
                     memidx._debug_log(exc, "unit-test")  # must not raise, must not create home
             self.assertFalse(home.exists())
 
+    def test_debug_log_writes_beside_db_path_ignoring_home(self):
+        """Ruling 132 (coordinator, TOP-0123 L6 review): `_debug_log` must
+        place its file BESIDE THE DATABASE it serves (`Path(db_path).parent`)
+        when a caller has one -- never resolved from a default home,
+        independently of whatever `--db` the caller was actually given.
+        Proven here with MEMCONTINUUM_HOME UNSET and `Path.home()` patched
+        to a temp dir that must stay completely untouched."""
+        with tempfile.TemporaryDirectory() as td:
+            fake_home = Path(td) / "fake-home"
+            fake_home.mkdir()
+            db_dir = Path(td) / "custom-db-dir"
+            db_dir.mkdir()
+            db_path = db_dir / "project.sqlite"
+            try:
+                raise RuntimeError("kaboom")
+            except RuntimeError as exc:
+                with mock.patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop("MEMCONTINUUM_HOME", None)
+                    with mock.patch.object(memidx.Path, "home", return_value=fake_home):
+                        memidx._debug_log(exc, "unit-test", db_path)
+            log_path = db_dir / "memidx-debug.log"
+            self.assertTrue(log_path.is_file(), "the log must land beside the db path")
+            text = log_path.read_text()
+            self.assertIn("kaboom", text)
+            self.assertIn("unit-test", text)
+            self.assertFalse((fake_home / "memidx-debug.log").exists())
+            self.assertEqual(list(fake_home.iterdir()), [], "nothing may land in the patched home")
+
     def test_index_integrity_error_carries_rel_and_cause(self):
         cause = sqlite3.OperationalError("disk I/O error")
         err = memidx.IndexIntegrityError("src/x.py", cause)
@@ -3898,7 +3934,11 @@ class TestEmbedWorker(unittest.TestCase):
         self.project = "ew-test"
 
     def tearDown(self):
-        lock_path = self.home / f"{self.project}.embed.lock"
+        # Ruling 132: marker/lock/log land beside the database
+        # (db.parent), never under the home the test happens to patch --
+        # this must track cmd_embed_worker's own resolution or a held
+        # lock at the WRONG path would silently never be detected.
+        lock_path = self._db().parent / f"{self.project}.embed.lock"
         if lock_path.exists():
             fd = os.open(str(lock_path), os.O_RDWR)
             try:
@@ -3920,10 +3960,10 @@ class TestEmbedWorker(unittest.TestCase):
         return Path(self.td) / f"{self.project}.sqlite"
 
     def _marker(self):
-        return self.home / f"{self.project}.embed-pending"
+        return self._db().parent / f"{self.project}.embed-pending"
 
     def _log(self):
-        return self.home / f"{self.project}.embed.log"
+        return self._db().parent / f"{self.project}.embed.log"
 
     def _args(self, root, db):
         return SimpleNamespace(root=str(root), project=self.project, db=str(db))
@@ -3956,6 +3996,13 @@ class TestEmbedWorker(unittest.TestCase):
         conn.close()
         self.assertIsNotNone(row, "every record must be embedded")
         self.assertEqual(self._mode(db), "full")
+        # Ruling 132: marker/lock/log land beside the database, never
+        # under the patched MEMCONTINUUM_HOME -- prove the OLD location
+        # stays empty, not merely that the new one has the right files.
+        self.assertEqual(
+            list(self.home.iterdir()), [],
+            "embed-worker must not write any companion file under home",
+        )
 
     # -- 3: two commits during one pass coalesce into one job ---------------
 
@@ -4019,7 +4066,7 @@ class TestEmbedWorker(unittest.TestCase):
         reindex(root, db, project=self.project, no_embed=True)
         marker = self._marker()
         marker.touch()
-        lock_path = self.home / f"{self.project}.embed.lock"
+        lock_path = self._db().parent / f"{self.project}.embed.lock"
         fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
@@ -4099,16 +4146,16 @@ class TestEmbedWorker(unittest.TestCase):
         root = self._topic()
         db = self._db()
         reindex(root, db, project=self.project, no_embed=True)
-        lock_path = self.home / f"{self.project}.embed.lock"
+        lock_path = self._db().parent / f"{self.project}.embed.lock"
         fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
-            backlog = memidx.embedding_backlog(db, self.project, self.home)
+            backlog = memidx.embedding_backlog(db, self.project)
             self.assertTrue(backlog["worker_lock_held"])
         finally:
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
-        backlog2 = memidx.embedding_backlog(db, self.project, self.home)
+        backlog2 = memidx.embedding_backlog(db, self.project)
         self.assertFalse(backlog2["worker_lock_held"])
 
 

@@ -112,22 +112,27 @@ def _degraded(reason_code: str, exc: BaseException | None = None, *, safe_messag
     }
 
 
-def _debug_log(exc: BaseException, context: str) -> None:
-    """Design R7: appends a timestamped traceback to
-    $MEMCONTINUUM_HOME/memidx-debug.log -- same home resolution as every
-    other MEMCONTINUUM_HOME consumer in this file (env var, else
+def _debug_log(exc: BaseException, context: str, db_path: Path | str | None = None) -> None:
+    """Design R7 / ruling 132: appends a timestamped traceback beside the
+    database this call is serving -- Path(db_path).parent -- so a custom
+    `--db` never diverges from where this companion file lands. When no
+    database is in scope for the caller (e.g. backend-preflight), falls
+    back to the historical $MEMCONTINUUM_HOME resolution (env var, else
     ~/.memcontinuum). Created only if the directory already exists (this
-    must never be the thing that creates ~/.memcontinuum out of nowhere);
-    any failure to write -- a missing dir, a permission error, a full
-    disk -- is swallowed, fail-open: a debug logger must never itself
-    become a second silent failure mode."""
+    must never be the thing that creates a directory out of nowhere); any
+    failure to write -- a missing dir, a permission error, a full disk --
+    is swallowed, fail-open: a debug logger must never itself become a
+    second silent failure mode."""
     try:
-        home = Path(os.environ.get("MEMCONTINUUM_HOME", str(Path.home() / ".memcontinuum")))
-        if not home.is_dir():
+        if db_path is not None:
+            log_dir = Path(db_path).parent
+        else:
+            log_dir = Path(os.environ.get("MEMCONTINUUM_HOME", str(Path.home() / ".memcontinuum")))
+        if not log_dir.is_dir():
             return
         ts = datetime.now(timezone.utc).isoformat()
         tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-        with (home / "memidx-debug.log").open("a", encoding="utf-8") as fh:
+        with (log_dir / "memidx-debug.log").open("a", encoding="utf-8") as fh:
             fh.write(f"--- {ts} {context} ---\n{tb}\n")
     except Exception:
         pass
@@ -1831,7 +1836,7 @@ def cmd_reindex(args) -> int:
             # the internal-error-typed catches rule 2's re-raise contract
             # covers, and re-raising would leave this record's SAVEPOINT
             # rolled back but the loop over the rest of `pending` unrun).
-            _debug_log(exc, "reindex")
+            _debug_log(exc, "reindex", db_path)
             continue
         conn.execute("RELEASE SAVEPOINT record")
         if is_new:
@@ -1987,16 +1992,19 @@ def cmd_reindex(args) -> int:
     return 5 if integrity_failures else 0
 
 
-def _embed_marker_path(home: Path, project: str) -> Path:
-    return home / f"{project}.embed-pending"
+def _embed_marker_path(db_path: Path, project: str) -> Path:
+    # Ruling 132: beside the database this worker serves, not a
+    # MEMCONTINUUM_HOME default -- a custom --db must never diverge from
+    # where these companion files land.
+    return Path(db_path).parent / f"{project}.embed-pending"
 
 
-def _embed_lock_path(home: Path, project: str) -> Path:
-    return home / f"{project}.embed.lock"
+def _embed_lock_path(db_path: Path, project: str) -> Path:
+    return Path(db_path).parent / f"{project}.embed.lock"
 
 
-def _embed_log_path(home: Path, project: str) -> Path:
-    return home / f"{project}.embed.log"
+def _embed_log_path(db_path: Path, project: str) -> Path:
+    return Path(db_path).parent / f"{project}.embed.log"
 
 
 def cmd_embed_worker(args) -> int:
@@ -2025,10 +2033,10 @@ def cmd_embed_worker(args) -> int:
     no terminal, its whole point is running off the clock), and exit 3.
     """
     global _last_reindex_embedding_backend_failed
-    home = Path(os.environ.get("MEMCONTINUUM_HOME", str(Path.home() / ".memcontinuum")))
-    lock_path = _embed_lock_path(home, args.project)
-    marker_path = _embed_marker_path(home, args.project)
-    log_path = _embed_log_path(home, args.project)
+    db_path = resolve_db_path(args)
+    lock_path = _embed_lock_path(db_path, args.project)
+    marker_path = _embed_marker_path(db_path, args.project)
+    log_path = _embed_log_path(db_path, args.project)
 
     lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
     try:
@@ -2060,7 +2068,7 @@ def cmd_embed_worker(args) -> int:
                 cmd_reindex(reindex_ns)
             except Exception as exc:
                 try:
-                    home.mkdir(parents=True, exist_ok=True)
+                    db_path.parent.mkdir(parents=True, exist_ok=True)
                     ts = datetime.now(timezone.utc).isoformat()
                     tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
                     with log_path.open("a", encoding="utf-8") as fh:
@@ -2077,7 +2085,7 @@ def cmd_embed_worker(args) -> int:
                 # leave the marker, log why, exit 3 (the next commit or a
                 # manual worker run retries it).
                 try:
-                    home.mkdir(parents=True, exist_ok=True)
+                    db_path.parent.mkdir(parents=True, exist_ok=True)
                     ts = datetime.now(timezone.utc).isoformat()
                     with log_path.open("a", encoding="utf-8") as fh:
                         fh.write(
@@ -2109,7 +2117,7 @@ def cmd_embed_worker(args) -> int:
         os.close(lock_fd)
 
 
-def embedding_backlog(db_path: Path, project: str, home: Path) -> dict:
+def embedding_backlog(db_path: Path, project: str) -> dict:
     """Design R8 (audit MC-P2-02, TOP-0123 L7): `{"pending_marker": bool,
     "worker_lock_held": bool, "rows_without_fresh_vector": int | None}` --
     read by `check --json` and `stats --json`, both fail-open.
@@ -2126,8 +2134,8 @@ def embedding_backlog(db_path: Path, project: str, home: Path) -> dict:
     every real caller: a project that has never had a worker run for it
     correctly reports `worker_lock_held: False` either way.
     """
-    marker_path = _embed_marker_path(home, project)
-    lock_path = _embed_lock_path(home, project)
+    marker_path = _embed_marker_path(db_path, project)
+    lock_path = _embed_lock_path(db_path, project)
 
     pending_marker = marker_path.exists()
 
@@ -4152,7 +4160,7 @@ def cmd_unmapped(args) -> int:
             f"{degraded['safe_message']}",
             file=sys.stderr,
         )
-        _debug_log(exc, "unmapped")
+        _debug_log(exc, "unmapped", db_path)
     finally:
         if conn is not None:
             try:
@@ -4292,9 +4300,10 @@ def cmd_check(args) -> int:
     report["vector_index_state"] = _decision_vector_index_state(conn, args.project)
     # Design R8 (audit MC-P2-02, TOP-0123 L7): fail-open, same helper
     # `stats --json` uses; `vector_index_state` above keeps R4's own enum
-    # unchanged -- "pending" is not one of its values.
-    home = Path(os.environ.get("MEMCONTINUUM_HOME", str(Path.home() / ".memcontinuum")))
-    report["embedding_backlog"] = embedding_backlog(db_path, args.project, home)
+    # unchanged -- "pending" is not one of its values. Ruling 132:
+    # embedding_backlog derives the marker/lock/log directory from
+    # db_path.parent itself now -- no separate home to pass.
+    report["embedding_backlog"] = embedding_backlog(db_path, args.project)
     if args.json:
         print(json.dumps(report, indent=2))
     else:
@@ -5200,7 +5209,7 @@ def cmd_code_reindex(args) -> int:
             # catch; re-raising would abandon the remaining files in
             # `files` rather than finishing them per the caller's own
             # per-file contract).
-            _debug_log(ie.cause, "code-reindex")
+            _debug_log(ie.cause, "code-reindex", db_path)
             return False
         conn.execute("RELEASE SAVEPOINT file")
         return True
@@ -6294,7 +6303,7 @@ def heal_code_index(
         # names type+message the same way _degraded would), but the full
         # traceback now also reaches memidx-debug.log for a real defect
         # buried under this fail-open message.
-        _debug_log(exc, "heal_code_index")
+        _debug_log(exc, "heal_code_index", db_path)
         return report, conn
 
 
@@ -7136,6 +7145,14 @@ def _stats_report(
     led = outcomes["ledger"]
     ledger_code = led.get("appended:code", 0)
     ledger_store = led.get("appended:store", 0)
+    # Design R6 (audit MC-P1-04, TOP-0123 L6): the shell-diff branch's own
+    # per-call summary line (one per PostToolUse invocation that fell
+    # through to the tree-diff branch) and the unsupported-mutation-
+    # surface line (an unrecognized or missing tool_name) -- counted
+    # dynamically like every other ledger outcome, never a separate
+    # counter incremented in the scan loop.
+    ledger_shell_diff_calls = led.get("shell-diff", 0)
+    ledger_unsupported_surface = led.get("unsupported-mutation-surface", 0)
 
     up = outcomes["userprompt"]
     coverage_injected = up.get("injected", 0)
@@ -7210,6 +7227,8 @@ def _stats_report(
         "ledger_appends": {
             "code": ledger_code,
             "store": ledger_store,
+            "shell_diff_calls": ledger_shell_diff_calls,
+            "unsupported_surface": ledger_unsupported_surface,
             "outcomes": dict(led),
         },
         "nudges": {
@@ -7315,8 +7334,10 @@ def cmd_stats(args) -> int:
         # Design R8 (audit MC-P2-02, TOP-0123 L7): fail-open, same helper
         # `check --json` uses; stats has no `--db` flag, so the db path is
         # the same default `resolve_db_path` would build (home/<project>.sqlite).
+        # Ruling 132: embedding_backlog derives its marker/lock/log
+        # directory from db_path.parent itself now -- no separate home.
         result["embedding_backlog"] = embedding_backlog(
-            db_path=home / f"{args.project}.sqlite", project=args.project, home=home,
+            db_path=home / f"{args.project}.sqlite", project=args.project,
         )
 
         if args.json:
@@ -7341,7 +7362,9 @@ def cmd_stats(args) -> int:
               f"(failed/never-attempted, not counted as a lookup) -- total lines {pe['total']}; "
               f"watchdog-killed={pe['watchdog_killed']}")
         la = result["ledger_appends"]
-        print(f"ledger appends: code={la['code']} store={la['store']}")
+        print(f"ledger appends: code={la['code']} store={la['store']} "
+              f"shell-diff-calls={la['shell_diff_calls']} "
+              f"unsupported-surface={la['unsupported_surface']}")
         print()
         nu = result["nudges"]
         print(f"write-side nudges: coverage-injected={nu['coverage_injected']} "
@@ -7400,7 +7423,18 @@ def cmd_stats(args) -> int:
             f"stats: degraded reason=internal-error type={degraded['exception_type']}: "
             f"{degraded['safe_message']} -- exit 0 (fail-open)"
         )
-        _debug_log(e, "stats")
+        # Ruling 132: best-effort db_path so this debug line lands beside
+        # the database stats was serving, matching cmd_reindex/cmd_unmapped
+        # /cmd_code_reindex/heal_code_index -- `home` may itself be the
+        # thing that failed to resolve (a broken --home), so this is a
+        # defensive best-effort, never load-bearing: db_path=None falls
+        # back to the legacy MEMCONTINUUM_HOME resolution either way.
+        db_for_log = None
+        try:
+            db_for_log = home / f"{args.project}.sqlite"
+        except Exception:
+            pass
+        _debug_log(e, "stats", db_for_log)
         return 0
 
 

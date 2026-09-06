@@ -297,6 +297,18 @@ class TestFreshInstall(unittest.TestCase):
             self.assertIn(f"MEMCONTINUUM_CODE_ROOT={self.code_root}", matching[0])
             self.assertIn(str(TOOLS_DIR / "hooks" / script), matching[0])
 
+    def test_post_tool_use_group_has_no_matcher(self):
+        """Design R6 (audit MC-P1-04, TOP-0123 L6): the PostToolUse group
+        must fire for every tool -- a matcher-limited hook can never
+        observe an unknown mutation tool. Same script, same basename: hook
+        counts / mc_wiring_scan / MC_HOOK_BASENAMES identity are keyed on
+        the basename, never the matcher (see test_mc_settings_merge.py and
+        mc-registry-lib.sh's own basenames_identity)."""
+        data = json.loads(self.settings_path.read_text())
+        post = data["hooks"]["PostToolUse"]
+        self.assertEqual(len(post), 1, post)
+        self.assertNotIn("matcher", post[0], post[0])
+
     def test_settings_contains_pre_edit_hook_with_right_paths(self):
         data = json.loads(self.settings_path.read_text())
         pre = data["hooks"]["PreToolUse"]

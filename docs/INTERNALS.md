@@ -38,7 +38,7 @@ wired one level up, into `~/.claude/settings.json`, by `memcontinuum-setup.sh`.
 |---|---|---|
 | `pre-edit-chain.sh` | `PreToolUse` (Edit/Write, filtered to `--code-root`) | `for-path` lookup on the file being edited; injects matching chains as `additionalContext` |
 | `newfile-nudge.sh` | `PreToolUse` (Write only, filtered to `--code-root`) | fires only when the write target does not exist yet and its extension is wired for this project; injects one reminder to search the code index first |
-| `ledger-post-edit.sh` | `PostToolUse` | appends the edit to a per-session ledger, scoped to every configured code root and the store root; the row records which root matched |
+| `ledger-post-edit.sh` | `PostToolUse` (every tool; no settings-level matcher) | a bash-only prefilter exits before the watchdog for read-only built-ins (`Read`, `Grep`, ...); `Edit`/`Write`/`MultiEdit`/`NotebookEdit` ledger the tool's own file path (`source: tool`); `Bash` and any tool this hook has no dedicated branch for fall through to a shell-diff (`git status`) tree comparison against a per-root baseline (`source: shell-diff`); an unrecognized or missing `tool_name` additionally logs `outcome=unsupported-mutation-surface` |
 | `precompact-persist.sh` | `PreCompact` | persists session state before context is compacted away |
 | `sessionstart-remind.sh` | `SessionStart` | on `startup`/`resume`/`clear`, initializes session state only (captures the code/store roots' git HEAD, prunes state older than 24h; `clear` resets the session's counters and pending nudges but carries the edit ledger over, `resume` keeps everything); only on `source: compact` does it inject what `precompact-persist.sh` left pending |
 | `userprompt-remind.sh` | `UserPromptSubmit` | never reads the prompt text; fires the coverage or look-back nudge |
@@ -69,10 +69,30 @@ line instead, and
 `$MEMCONTINUUM_DETECT_LOG` is set — it runs in every repo on the machine, so its
 default is silence.
 
+`ledger-post-edit.sh` itself has two further exceptions to "exactly one
+`outcome=` line". A read-only built-in (`Read`, `Grep`, ...) is caught by the
+prefilter before the watchdog and writes nothing at all — no line, no
+process spawned. The shell-diff branch (`Bash`, or any tool with no
+dedicated branch) can write several lines in one run: one
+`outcome=appended kind=<code|store> source=shell-diff` per path the tree
+diff found changed, always followed by exactly one summary line,
+`outcome=shell-diff appended=N roots=R timeouts=T non-git=G
+baseline-too-large=L`, so a call that touched zero paths still counts as one
+line (and `stats` counts calls, not paths, from that summary line alone).
+An unrecognized or missing `tool_name` adds one more line ahead of the
+shell-diff pass, `outcome=unsupported-mutation-surface tool=<name>`.
+
 **Writable surface.** The write-side hooks may write
 `$MEMCONTINUUM_HOME/sessions/<project>/` and `hook.log`, and nothing else —
-never the store, never the code root. Two of them reach the decision index's own
-SQLite cache as well, and only that: `userprompt-remind.sh`'s coverage check
+never the store, never the code root. `ledger-post-edit.sh`'s shell-diff
+branch runs `git status --porcelain -z` (via `git --no-optional-locks`) in
+every configured code root and the store root on a `Bash` (or unrecognized-
+tool) invocation — that call is read-only end to end, so it does not widen
+this surface: a `git status`/`git diff` run in that root afterwards reports
+exactly what it would have before (the regression test for this claim is
+`test_shell_diff_git_status_calls_leave_the_tree_exactly_as_found`). Two
+hooks reach the decision index's own SQLite cache as well, and only that:
+`userprompt-remind.sh`'s coverage check
 calls `memidx.py unmapped`, which self-heals a drifted index with a
 `reindex --no-embed --auto`, and `precompact-persist.sh` runs the same
 self-healing `unmapped` call for ledger entries under the code root — or a
@@ -83,20 +103,65 @@ than the index already had (see [Decision index provenance](#decision-index-prov
 `post-commit-reindex.sh` (the store's git `post-commit`, not one of the
 five write-side hooks above) writes the decision index directly (that is its
 whole job) plus, when its content pass leaves rows without a fresh vector,
-`$MEMCONTINUUM_HOME/<project>.embed-pending` (a marker), `<project>.embed.lock`
+`<project>.embed-pending` (a marker), `<project>.embed.lock`
 (an `fcntl.flock` target for the embed-worker it spawns) and
 `<project>.embed.log` (the worker's own stdout/stderr, never the shared
-`hook.log`).
-`memidx.py` itself may also write `$MEMCONTINUUM_HOME/memidx-debug.log` — a
-timestamped traceback appended whenever a command degrades on an internal
-error, only when that directory already exists (it is never what creates
-`$MEMCONTINUUM_HOME`), and never surfaced to stdout/stderr/JSON.
+`hook.log`). These three, and `memidx-debug.log` (a timestamped traceback
+`memidx.py` appends whenever a command degrades on an internal error), all
+land beside the database the command in question is serving
+(`Path(db_path).parent`) rather than at a fixed `$MEMCONTINUUM_HOME` path —
+a custom `--db` moves them with it. Only when no database is in scope at all
+(`backend-preflight`) does `memidx-debug.log` fall back to
+`$MEMCONTINUUM_HOME`. Every one of these files is created only when its
+directory already exists (none of them is what creates that directory out of
+nowhere), and none is ever surfaced to stdout/stderr/JSON.
 
 **Session state** lives at `$MEMCONTINUUM_HOME/sessions/<project>/<id>.json`,
 written by atomic rename (`os.replace`) and guarded by a real
 `fcntl.flock(LOCK_EX)` (retried up to 2s) taken inside the state-update helper
 in `memlib.sh` — a Python call, never a shelled-out `flock` binary, which macOS
 does not ship.
+
+**The shell-diff ledger branch.** `ledger-post-edit.sh` runs the tree-diff
+pass for `Bash` and any tool it has no dedicated branch for, inside the same
+locked python transform `mc_update_state_json` already uses (one subprocess,
+one flock, no extra process per root). For every root — each configured code
+root, then the store root — it skips a root with no `.git` (counted
+`non-git`) and otherwise runs `git --no-optional-locks status --porcelain -z
+--untracked-files=all` under a `subprocess.run(..., timeout=...)`, budgeted
+by two env vars: `MEMCONTINUUM_SHELL_DIFF_BUDGET` (default 1.2s, the total
+wall-clock ceiling for the whole call, tracked with `time.monotonic()`) and
+`MEMCONTINUUM_SHELL_DIFF_ROOT_BUDGET` (default 0.8s, the per-root ceiling —
+the smaller of the two, or whatever total budget remains, is what each `git`
+call actually gets). A timed-out or failing root counts `timeouts` and is
+retried on the next call; it never touches that root's baseline. The `-z`
+porcelain output is NUL-delimited (`XY<space>PATH\0`); a rename or copy
+status (`R`/`C`) is followed by a second NUL-terminated path (the source),
+and both are treated as changed. The FIRST successful `git status` seen for
+a root only establishes a baseline (a `{path: sha256}` map, `None` instead
+when the root has more than 500 dirty paths, counted `baseline-too-large`
+and never retried) and appends nothing — a file already dirty before
+MemContinuum ever looked is not something a later, unrelated edit gets
+credited or blamed for. Every call after that compares the current dirty
+set against the baseline and appends a ledger row (`source: shell-diff`,
+`kind: code` or `store`) for every path whose content hash changed,
+including a deleted path (`content_sha256: ""`). Each appended row logs its
+own `outcome=appended kind=<kind> source=shell-diff file=<path>` line, and
+every call — even one that appended nothing — ends with exactly one summary
+line, `outcome=shell-diff appended=N roots=R timeouts=T non-git=G
+baseline-too-large=L`; `memidx.py stats` counts these dynamically under
+`ledger_appends.shell_diff_calls`, the same way it already counted
+`ledger_appends.code`/`store`. An unrecognized or missing `tool_name` (an
+MCP tool this hook has no branch for, or a malformed payload) logs one more
+line, `outcome=unsupported-mutation-surface tool=<name-or-"unknown">`,
+counted under `ledger_appends.unsupported_surface`, and still runs the same
+tree-diff pass — an unrecognized tool that mutated a file is still caught.
+
+This is deliberately best-effort, not strict mutation coverage: nothing here
+refuses an undeclared shell mutation or blocks a commit over one. Structured
+edits (`Edit`/`Write`/`MultiEdit`/`NotebookEdit`) get pre-retrieval, before
+the edit happens; shell mutations get best-effort post-detection, after the
+fact, bounded by whatever the git-status budget above could see in time.
 
 **The detector is deliberately unlike the others.** It fires on every session
 start on the machine, including in repositories that have nothing to do with

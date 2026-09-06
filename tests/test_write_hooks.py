@@ -1053,6 +1053,355 @@ class TestLedgerPostEdit(HookTestBase):
 
 
 # ---------------------------------------------------------------------------
+# 2b. Mutation-surface honesty (design R6, audit MC-P1-04, TOP-0123 L6)
+# ---------------------------------------------------------------------------
+
+
+class TestMutationSurface(HookTestBase):
+    """The PostToolUse group carries no settings-level matcher any more (see
+    tests.test_repo_init for the rendering pin) -- ledger-post-edit.sh fires
+    for every tool and does its OWN gating in-script: a cheap bash-only
+    prefilter exits before the watchdog for the read-only built-ins;
+    Edit/Write/MultiEdit/NotebookEdit still ledger the tool's own file_path
+    (source: tool); Bash and any tool this hook has no dedicated branch for
+    fall through to a shell-diff (git status) tree comparison
+    (source: shell-diff), logging outcome=unsupported-mutation-surface for
+    the latter two."""
+
+    def bash_payload(self, session_id, command="true"):
+        return json.dumps({
+            "session_id": session_id,
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "cwd": str(self.code_root),
+            "tool_input": {"command": command},
+            "tool_response": {"stdout": "", "stderr": "", "interrupted": False},
+        })
+
+    def read_only_payload(self, session_id, tool_name="Read", file_path=None):
+        d = {
+            "session_id": session_id,
+            "hook_event_name": "PostToolUse",
+            "tool_name": tool_name,
+            "cwd": str(self.code_root),
+            "tool_input": ({"file_path": file_path} if file_path else {"pattern": "x"}),
+        }
+        return json.dumps(d)
+
+    def notebook_edit_payload(self, session_id, notebook_path, file_path=None):
+        ti = {"notebook_path": notebook_path, "new_source": "# x", "cell_type": "code"}
+        if file_path:
+            ti["file_path"] = file_path
+        return json.dumps({
+            "session_id": session_id,
+            "hook_event_name": "PostToolUse",
+            "tool_name": "NotebookEdit",
+            "cwd": str(self.code_root),
+            "tool_input": ti,
+        })
+
+    def unknown_tool_payload(self, session_id, tool_name="SomeMcpTool"):
+        return json.dumps({
+            "session_id": session_id,
+            "hook_event_name": "PostToolUse",
+            "tool_name": tool_name,
+            "cwd": str(self.code_root),
+            "tool_input": {"whatever": "x"},
+        })
+
+    def no_tool_name_payload(self, session_id):
+        return json.dumps({
+            "session_id": session_id,
+            "hook_event_name": "PostToolUse",
+            "cwd": str(self.code_root),
+            "tool_input": {},
+        })
+
+    # -- 2: cheap prefilter exits before the watchdog for read-only tools ---
+
+    def test_read_only_tool_exits_fast_with_no_log_line(self):
+        session_id = "s-mutation-readonly"
+        payload = self.read_only_payload(
+            session_id, "Read", file_path=str(self.code_root / "src" / "mapped.py")
+        )
+        proc, elapsed = run_script(LEDGER_HOOK, payload, self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        self.assertLess(elapsed, 0.05, elapsed)
+        log_path = self.home / "hook.log"
+        self.assertFalse(
+            log_path.exists() and log_path.read_text().strip(),
+            "hook.log must stay untouched for a read-only tool",
+        )
+
+    def test_grep_tool_also_exits_fast_with_no_log_line(self):
+        session_id = "s-mutation-grep"
+        payload = self.read_only_payload(session_id, "Grep")
+        proc, elapsed = run_script(LEDGER_HOOK, payload, self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        self.assertLess(elapsed, 0.05, elapsed)
+        log_path = self.home / "hook.log"
+        self.assertFalse(log_path.exists() and log_path.read_text().strip())
+
+    # -- 4: NotebookEdit ledgered via notebook_path when file_path is absent -
+
+    def test_notebook_edit_uses_notebook_path_when_file_path_absent(self):
+        session_id = "s-mutation-notebook"
+        nb = self.code_root / "nb.ipynb"
+        _write(nb, "{}")
+        payload = self.notebook_edit_payload(session_id, str(nb))
+        proc, _ = run_script(LEDGER_HOOK, payload, self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        state = self.load_state(session_id)
+        paths = [e["path"] for e in state.get("ledger", [])]
+        self.assertIn(str(nb), paths)
+        entry = [e for e in state["ledger"] if e["path"] == str(nb)][0]
+        self.assertEqual(entry["source"], "tool")
+        self.assertEqual(entry["kind"], "code")
+
+    # -- 5: Bash overwrite -- baseline call, then a shell-diff row ----------
+
+    def test_bash_overwrite_lands_as_shell_diff_row(self):
+        session_id = "s-mutation-bash"
+        target = self.code_root / "src" / "mapped.py"
+
+        proc1, _ = run_script(LEDGER_HOOK, self.bash_payload(session_id), self.base_env())
+        self.assertEqual(proc1.returncode, 0, proc1.stderr)
+        state1 = self.load_state(session_id)
+        self.assertEqual(state1.get("ledger", []), [])
+        self.assertIn(str(self.code_root.resolve()), state1.get("shell_baseline", {}))
+        log1 = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=shell-diff appended=0", log1)
+
+        _write(target, "# mapped, changed from the shell\n")
+        proc2, _ = run_script(LEDGER_HOOK, self.bash_payload(session_id), self.base_env())
+        self.assertEqual(proc2.returncode, 0, proc2.stderr)
+        state2 = self.load_state(session_id)
+        rows = [e for e in state2["ledger"] if e.get("source") == "shell-diff"]
+        self.assertEqual(len(rows), 1, state2["ledger"])
+        self.assertEqual(rows[0]["path"], str(target))
+        self.assertEqual(rows[0]["kind"], "code")
+        self.assertEqual(rows[0]["root"], str(self.code_root.resolve()))
+        log2 = (self.home / "hook.log").read_text()
+        self.assertIn("ledger outcome=appended kind=code source=shell-diff file=", log2)
+        self.assertIn("outcome=shell-diff appended=1", log2)
+
+        # A second identical payload appends nothing more.
+        proc3, _ = run_script(LEDGER_HOOK, self.bash_payload(session_id), self.base_env())
+        self.assertEqual(proc3.returncode, 0, proc3.stderr)
+        state3 = self.load_state(session_id)
+        rows3 = [e for e in state3["ledger"] if e.get("source") == "shell-diff"]
+        self.assertEqual(len(rows3), 1, state3["ledger"])
+
+    # -- writable-surface regression guard: the shell-diff branch's own
+    # `git status` calls must be read-only -- INTERNALS.md's writable-
+    # surface claim depends on this staying true, since this hook now runs
+    # `git status` in every configured code root and the store root on
+    # every Bash (or unrecognized-tool) invocation.
+
+    def test_shell_diff_git_status_calls_leave_the_tree_exactly_as_found(self):
+        session_id = "s-mutation-readonly-git"
+        run_script(LEDGER_HOOK, self.bash_payload(session_id), self.base_env())  # baseline
+        before = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=self.code_root,
+            capture_output=True, text=True, check=True,
+        ).stdout
+        proc, _ = run_script(LEDGER_HOOK, self.bash_payload(session_id), self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        after = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=self.code_root,
+            capture_output=True, text=True, check=True,
+        ).stdout
+        self.assertEqual(
+            before, after,
+            "the hook's own git status calls must never change what a "
+            "subsequent git status in that root reports",
+        )
+
+    # -- 6: create, rename, delete --------------------------------------------
+
+    def test_bash_create_rename_delete(self):
+        session_id = "s-mutation-crud"
+        run_script(LEDGER_HOOK, self.bash_payload(session_id), self.base_env())  # baseline
+
+        new_file = self.code_root / "src" / "new_from_shell.py"
+        _write(new_file, "# new\n")
+        subprocess.run(["git", "add", "-A"], cwd=self.code_root, check=True)
+        subprocess.run(
+            ["git", "mv", "src/unmapped.py", "src/renamed.py"], cwd=self.code_root, check=True
+        )
+        deleted = self.code_root / "src" / "mapped.py"
+        deleted.unlink()
+
+        proc, _ = run_script(LEDGER_HOOK, self.bash_payload(session_id), self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        state = self.load_state(session_id)
+        rows = {e["path"]: e for e in state["ledger"] if e.get("source") == "shell-diff"}
+        self.assertIn(str(new_file), rows, rows)
+        self.assertIn(str(self.code_root / "src" / "renamed.py"), rows, rows)
+        self.assertIn(str(self.code_root / "src" / "unmapped.py"), rows, rows)
+        self.assertIn(str(deleted), rows, rows)
+        self.assertEqual(rows[str(deleted)]["content_sha256"], "")
+
+    # -- 7: pre-existing dirt is not attributed -------------------------------
+
+    def test_dirt_before_baseline_is_not_attributed(self):
+        session_id = "s-mutation-predirt"
+        target = self.code_root / "src" / "mapped.py"
+        _write(target, "# dirty before the baseline call\n")
+        run_script(LEDGER_HOOK, self.bash_payload(session_id), self.base_env())
+        state = self.load_state(session_id)
+        self.assertEqual(state.get("ledger", []), [])
+
+        _write(target, "# dirty AFTER the baseline call too\n")
+        proc, _ = run_script(LEDGER_HOOK, self.bash_payload(session_id), self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        state2 = self.load_state(session_id)
+        rows = [e for e in state2["ledger"] if e["path"] == str(target)]
+        self.assertEqual(len(rows), 1, state2["ledger"])
+
+    # -- 8: a shell edit under the store root is a kind: store row ------------
+
+    def test_bash_edit_under_store_root_is_kind_store(self):
+        session_id = "s-mutation-store"
+        run_script(LEDGER_HOOK, self.bash_payload(session_id), self.base_env())  # baseline
+        target = self.store_root / "topics" / "testing" / "mapped-topic.md"
+        _write(target, TOPIC_MD + "\nedited from the shell\n")
+        proc, _ = run_script(LEDGER_HOOK, self.bash_payload(session_id), self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        state = self.load_state(session_id)
+        rows = [e for e in state["ledger"] if e["path"] == str(target)]
+        self.assertEqual(len(rows), 1, state["ledger"])
+        self.assertEqual(rows[0]["kind"], "store")
+        self.assertEqual(rows[0]["source"], "shell-diff")
+
+    # -- a code root that is a git WORKTREE (".git" is a file, not a
+    # directory) must still be diffed, not silently counted non-git -------
+
+    def test_bash_edit_under_a_worktree_code_root_is_still_diffed(self):
+        session_id = "s-mutation-worktree"
+        worktree = Path(self.td) / "code-worktree"
+        subprocess.run(
+            ["git", "worktree", "add", "-q", "-b", "wt-branch", str(worktree)],
+            cwd=self.code_root, check=True,
+        )
+        env = self.base_env(
+            MEMCONTINUUM_CODE_ROOT=str(worktree.resolve()),
+            MEMCONTINUUM_CODE_ROOTS=json.dumps([str(worktree.resolve())]),
+        )
+        proc1, _ = run_script(LEDGER_HOOK, self.bash_payload(session_id), env)  # baseline
+        self.assertEqual(proc1.returncode, 0, proc1.stderr)
+        log1 = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=shell-diff appended=0 roots=2 timeouts=0 non-git=0", log1)
+
+        target = worktree / "src" / "mapped.py"
+        _write(target, "# mapped, changed inside the worktree\n")
+        proc2, _ = run_script(LEDGER_HOOK, self.bash_payload(session_id), env)
+        self.assertEqual(proc2.returncode, 0, proc2.stderr)
+        state2 = self.load_state(session_id)
+        rows = [e for e in state2["ledger"] if e.get("source") == "shell-diff"]
+        self.assertEqual(len(rows), 1, state2["ledger"])
+        self.assertEqual(rows[0]["path"], str(target))
+
+    # -- 9: a slow root times out and is counted; the other root still works -
+
+    def test_slow_root_times_out_other_root_still_diffed(self):
+        session_id = "s-mutation-slow"
+        code_root_b = Path(self.td) / "code-b"
+        code_root_b.mkdir()
+        _write(code_root_b / "b.py", "# b\n")
+        git_init(code_root_b)
+
+        real_git = shutil.which("git")
+        self.assertIsNotNone(real_git, "this test needs a real git on PATH")
+        fake_git_dir = Path(self.td) / "fake-git-bin"
+        fake_git_dir.mkdir()
+        fake_git = fake_git_dir / "git"
+        fake_git.write_text(
+            "#!/bin/sh\n"
+            "prev=\"\"\n"
+            "slow=0\n"
+            "for a in \"$@\"; do\n"
+            "  if [ \"$prev\" = \"-C\" ] && [ \"$a\" = \"$SLOW_ROOT\" ]; then slow=1; fi\n"
+            "  prev=\"$a\"\n"
+            "done\n"
+            "if [ \"$slow\" = 1 ]; then exec sleep 2; fi\n"
+            "exec \"$REAL_GIT\" \"$@\"\n"
+        )
+        fake_git.chmod(0o755)
+
+        env = self.base_env(
+            MEMCONTINUUM_CODE_ROOTS=json.dumps(
+                [str(self.code_root.resolve()), str(code_root_b.resolve())]
+            ),
+            SLOW_ROOT=str(self.code_root.resolve()),
+            REAL_GIT=real_git,
+            PATH=f"{fake_git_dir}:{os.environ.get('PATH', '')}",
+            MEMCONTINUUM_SHELL_DIFF_ROOT_BUDGET="0.3",
+        )
+        proc, elapsed = run_script(LEDGER_HOOK, self.bash_payload(session_id), env, timeout=5.0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertLess(elapsed, 2.0, elapsed)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("timeouts=1", log_text)
+        self.assertNotIn("watchdog-killed", log_text)
+        state = self.load_state(session_id)
+        self.assertIn(str(code_root_b.resolve()), state.get("shell_baseline", {}))
+        self.assertNotIn(str(self.code_root.resolve()), state.get("shell_baseline", {}))
+
+        # The next call retries the timed-out root's baseline (still under
+        # the fake/slow git) while the healthy root keeps working.
+        _write(code_root_b / "b.py", "# b changed\n")
+        run_script(LEDGER_HOOK, self.bash_payload(session_id), env, timeout=5.0)
+        state2 = self.load_state(session_id)
+        rows = [e for e in state2["ledger"] if e.get("root") == str(code_root_b.resolve())]
+        self.assertEqual(len(rows), 1, state2["ledger"])
+
+    # -- 10: an unknown tool is logged AND still diffed -----------------------
+
+    def test_unknown_tool_logs_unsupported_and_still_diffs(self):
+        session_id = "s-mutation-unknown"
+        run_script(LEDGER_HOOK, self.bash_payload(session_id), self.base_env())  # baseline
+        target = self.code_root / "src" / "mapped.py"
+        _write(target, "# changed by an mcp tool\n")
+        payload = self.unknown_tool_payload(session_id, "SomeMcpTool")
+        proc, _ = run_script(LEDGER_HOOK, payload, self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=unsupported-mutation-surface tool=SomeMcpTool", log_text)
+        state = self.load_state(session_id)
+        rows = [e for e in state["ledger"] if e["path"] == str(target)]
+        self.assertEqual(len(rows), 1, state["ledger"])
+        self.assertEqual(rows[0]["source"], "shell-diff")
+
+    # -- 11: a missing tool_name is logged as tool=unknown --------------------
+
+    def test_missing_tool_name_logs_unknown_and_still_diffs(self):
+        session_id = "s-mutation-missing-tool"
+        run_script(LEDGER_HOOK, self.bash_payload(session_id), self.base_env())  # baseline
+        target = self.code_root / "src" / "mapped.py"
+        _write(target, "# changed with no tool_name at all\n")
+        payload = self.no_tool_name_payload(session_id)
+        proc, _ = run_script(LEDGER_HOOK, payload, self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=unsupported-mutation-surface tool=unknown", log_text)
+        state = self.load_state(session_id)
+        rows = [e for e in state["ledger"] if e["path"] == str(target)]
+        self.assertEqual(len(rows), 1, state["ledger"])
+
+    # -- 12: the hook script never reads the command text or the tool's
+    #        response (guard against re-reading the arbitrary shell command
+    #        or its output -- ruling B) -----------------------------------
+
+    def test_script_never_reads_command_or_tool_response(self):
+        text = LEDGER_HOOK.read_text()
+        self.assertNotIn("tool_input.command", text)
+        self.assertNotIn("tool_response", text)
+
+
+# ---------------------------------------------------------------------------
 # 3. precompact-persist.sh
 # ---------------------------------------------------------------------------
 
@@ -1404,6 +1753,30 @@ class TestSessionStartRemind(HookTestBase):
         self.assertIn("src/unmapped.py", up_proc.stdout)
         log_text = (self.home / "hook.log").read_text()
         self.assertIn("outcome=injected", log_text)
+
+    def test_clear_carries_over_shell_baseline_too(self):
+        """Design R6 (audit MC-P1-04, TOP-0123 L6): `shell_baseline` is the
+        shell-diff branch's own per-root baseline map -- INC-0108's clear
+        discard must keep it alongside `ledger`, or a mid-session /clear
+        would silently re-baseline every root (losing the distinction
+        between pre- and post-clear shell dirt for the rest of the
+        session, exactly the class of evidence loss `ledger` is already
+        protected against)."""
+        session_id = "s-start-clear-shell-baseline"
+        self.patch_state(
+            session_id,
+            shell_baseline={str(self.code_root.resolve()): {"src/mapped.py": "deadbeef"}},
+            user_turn_count=5,
+        )
+        payload = self.session_start_payload(session_id, source="clear")
+        proc, _ = run_script(SESSIONSTART_HOOK, payload, self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        state = self.load_state(session_id)
+        self.assertEqual(
+            state.get("shell_baseline"),
+            {str(self.code_root.resolve()): {"src/mapped.py": "deadbeef"}},
+        )
+        self.assertEqual(state.get("user_turn_count"), 0)
 
     def test_clear_then_userprompt_is_served_not_no_state(self):
         """INC-0108 end-to-end pin: a real SessionStart(source=clear) followed
@@ -3166,6 +3539,32 @@ class TestMultiRootWriteSide(HookTestBase):
         self.assertEqual(entry["kind"], "store")
         self.assertEqual(entry.get("root"), "")
 
+    def test_ledger_row_under_nested_root_uses_longest_match(self):
+        """Ruling 131 (coordinator, folded from task-7-review.md NIT-1): the
+        ledger's own containment check picks the LONGEST containing root
+        when roots nest, the same rule memidx.py's `unmapped --code-root`
+        uses (`_unmapped_best_root`) -- so the ledger's `root` annotation
+        always names the same root a later `unmapped` classification would
+        use for the same path (before this fix the ledger picked whichever
+        root came FIRST in `mc_code_roots`' emission order instead)."""
+        session_id = "s-multiroot-nested"
+        outer = self.code_root  # root A
+        inner = self.code_root / "nested-b"  # root B, physically inside A
+        inner.mkdir()
+        _write(inner / "src" / "inner.py", "# inner\n")
+        git_init(inner)
+
+        env = self.multiroot_env(
+            MEMCONTINUUM_CODE_ROOTS=json.dumps([str(outer.resolve()), str(inner.resolve())]),
+        )
+        fpath = str(inner / "src" / "inner.py")
+        payload = self.post_tool_use_payload(session_id, fpath)
+        proc, _ = run_script(LEDGER_HOOK, payload, env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        state = self.load_state(session_id)
+        entry = [e for e in state["ledger"] if e["path"] == fpath][0]
+        self.assertEqual(entry["root"], str(inner.resolve()), state["ledger"])
+
     def test_ledger_path_under_neither_root_is_out_of_scope(self):
         session_id = "s-multiroot-ledger-outside"
         fpath = "/tmp/somewhere/else/multiroot-nowhere.py"
@@ -3296,6 +3695,49 @@ class TestMultiRootWriteSide(HookTestBase):
         self.assertIn("src/unmapped.py", pending["unmapped"])
         self.assertIn("src/b.py", pending["unmapped"])
         self.assertTrue(pending["code_head_changed"])
+
+    # -- LOW-4 (task-7-review.md): a root ABSENT from start_code_shas falls
+    #    back to legacy_start ONLY when it IS the first configured root ----
+
+    def test_userprompt_remind_root_missing_from_start_map_is_not_falsely_changed(self):
+        """A root missing from `start_code_shas` (not "no commits yet" --
+        genuinely absent, e.g. the transitional window before a resume
+        repopulates the map) must be treated as unknown/skipped, never
+        compared against a DIFFERENT root's start sha -- root B's actual
+        current HEAD can never equal root A's start sha (two unrelated git
+        repos), so the pre-fix fallback always misread this as "changed:
+        yes"."""
+        session_id = "s-multiroot-lowfour-userprompt"
+        fpath_a = str(self.code_root / "src" / "unmapped.py")
+        self.seed_ledger(session_id, [(fpath_a, "code")])
+        state = self.load_state(session_id)
+        state["start_code_sha"] = git_head(self.code_root)
+        state["start_code_shas"] = {str(self.code_root.resolve()): git_head(self.code_root)}
+        self.state_file(session_id).write_text(json.dumps(state))
+
+        proc, _ = run_script(
+            USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.multiroot_env(), timeout=10.0,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("code HEAD changed: no", ctx, ctx)
+
+    def test_precompact_persist_root_missing_from_start_map_is_not_falsely_changed(self):
+        session_id = "s-multiroot-lowfour-precompact"
+        fpath_a = str(self.code_root / "src" / "unmapped.py")
+        self.seed_ledger(session_id, [(fpath_a, "code")])
+        state = self.load_state(session_id)
+        state["start_code_sha"] = git_head(self.code_root)
+        state["start_code_shas"] = {str(self.code_root.resolve()): git_head(self.code_root)}
+        self.state_file(session_id).write_text(json.dumps(state))
+
+        proc, _ = run_script(
+            PRECOMPACT_HOOK, self.pre_compact_payload(session_id), self.multiroot_env(), timeout=10.0,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        pending = self.load_state(session_id)["pending"]
+        self.assertFalse(pending["code_head_changed"], pending)
 
     # -- 5: sessionstart-remind.sh records start_code_shas for every root ---
 

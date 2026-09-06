@@ -479,17 +479,15 @@ print(d.get("reason_code", "") if isinstance(d, dict) else "")
     # `git rev-parse HEAD` per root (mc_git_head, no python) is unavoidable
     # (bash 3.2 cannot do a dict lookup without one), but the state-file
     # lookup/comparison is ONE combined python call covering BOTH code
-    # (per-root map, with a fallback to the single legacy start_code_sha for
-    # a root the map has no entry for -- old-shape state predating this
-    # task) and store (unchanged, single root) -- replacing the former TWO
+    # (per-root map, LOW-4-fixed: a root missing from the map falls back to
+    # the single legacy start_code_sha only when it IS the first configured
+    # root) and store (unchanged, single root) -- replacing the former TWO
     # separate START_CODE_SHA/START_STORE_SHA spawns with one, so this
     # hook's total python-spawn count stays flat despite the new
-    # mc_code_roots call above.
-    CODE_HEADS=""
-    while IFS= read -r CR; do
-        [ -n "$CR" ] || continue
-        CODE_HEADS="$CODE_HEADS$CR"$'\t'"$(mc_git_head "$CR")"$'\n'
-    done <<<"$CODE_ROOTS_TEXT"
+    # mc_code_roots call above. LOW-3/LOW-4 (task-7-review.md): both the
+    # per-root HEAD loop and this comparison now live once in memlib.sh
+    # (mc_code_heads_from / mc_head_changed).
+    CODE_HEADS="$(mc_code_heads_from "$CODE_ROOTS_TEXT")"
     CUR_STORE_SHA="$(mc_git_head "${MEMCONTINUUM_ROOT:-}")"
 
     # Safe defaults in case the python call below prints nothing (interpreter
@@ -497,40 +495,7 @@ print(d.get("reason_code", "") if isinstance(d, dict) else "")
     # STORE_CHANGED would otherwise abort the hook with no log line.
     CODE_CHANGED="false"
     STORE_CHANGED="false"
-    eval "$(CODE_HEADS="$CODE_HEADS" CUR_STORE_SHA="$CUR_STORE_SHA" \
-        env PYTHONPATH= "$MC_PY" -c '
-import json, os, shlex, sys
-
-try:
-    with open(sys.argv[1]) as f:
-        state = json.load(f)
-    if not isinstance(state, dict):
-        state = {}
-except Exception:
-    state = {}
-
-starts = state.get("start_code_shas")
-if not isinstance(starts, dict):
-    starts = {}
-legacy_start = state.get("start_code_sha") or ""
-heads = os.environ.get("CODE_HEADS") or ""
-code_changed = False
-for line in heads.splitlines():
-    if not line or "\t" not in line:
-        continue
-    root, cur = line.split("\t", 1)
-    start = starts[root] if root in starts else legacy_start
-    if cur and cur != start:
-        code_changed = True
-        break
-
-cur_store = os.environ.get("CUR_STORE_SHA") or ""
-start_store = state.get("start_store_sha") or ""
-store_changed = bool(cur_store) and cur_store != start_store
-
-print("CODE_CHANGED=" + shlex.quote("true" if code_changed else "false"))
-print("STORE_CHANGED=" + shlex.quote("true" if store_changed else "false"))
-' "$STATE_FILE" 2>>"$MC_LOG")"
+    eval "$(mc_head_changed "$STATE_FILE" "$CODE_HEADS" "$CUR_STORE_SHA" "${MEMCONTINUUM_CODE_ROOT:-}")"
 
     OUTPUT_JSON="$(UNMAPPED_JSON="$UNMAPPED_JSON" CODE_CHANGED="$CODE_CHANGED" STORE_CHANGED="$STORE_CHANGED" \
         MEMCONTINUUM_ROOT="${MEMCONTINUUM_ROOT:-}" \

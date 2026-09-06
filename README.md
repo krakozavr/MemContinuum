@@ -40,12 +40,17 @@ in the chain, never an edit to the old one, so "we tried X, it did not work
 because Y, so we do Z instead" stays intact and citable. The linter does not enforce
 this invariant; git history is the record's own audit trail.
 
-Retrieval is **automatic**, not left to anyone's discipline. Before an edit
-touches a file, a hook looks up whatever decision governs that file and hands it
-over. Every hook here fails open: a missing index, a missing python, a failed
-lookup, or the hook running too long means the hook stays silent (or, on a
-timeout specifically, says outright that retrieval timed out rather than
-staying silent) — never that your edit is blocked. That lookup runs under a
+Retrieval is **automatic** for edits made with the Edit and Write tools, not
+left to anyone's discipline. Before one of those touches a file, a hook looks
+up whatever decision governs that file and hands it over. Every hook here
+fails open: a missing index, a missing python, a failed lookup, or the hook
+running too long means the hook stays silent (or, on a timeout specifically,
+says outright that retrieval timed out rather than staying silent) — never
+that your edit is blocked. A file changed from the shell instead — a script,
+`sed`, `git apply`, anything run as a Bash command — gets no lookup before the
+change; MemContinuum only learns about it afterwards, from a tree diff, and
+records it in the edit ledger rather than handing anything back beforehand.
+That lookup runs under a
 2-second watchdog deadline — a real lookup measures in the low tenths of a
 second, comfortably under it; a stale-but-present index is not one of the
 fail-open cases: it still answers from whatever it has, which is why keeping
@@ -83,11 +88,14 @@ carries that concept's id, so the trail from "code that does roughly this" to
 the `memory-search` skill tell agents to run `code-search` *before* writing a
 new helper.
 
-Creating a brand-new source file gets that reminder by itself: a hook fires the
-moment something writes to a path that does not exist yet and asks for the code
-index to be searched first — the one moment a duplicate helper is most likely to
-be written instead of found. It only ever adds a line of context; it never
-blocks the write.
+Creating a brand-new source file with the Write tool gets that reminder by
+itself: a hook fires the moment the Write tool creates a path that does not
+exist yet and asks for the code index to be searched first — the one moment a
+duplicate helper is most likely to be written instead of found. It only ever
+adds a line of context; it never blocks the write. A file created from the
+shell instead does not trigger this particular reminder — like any other
+shell-made change, it still lands in the edit ledger once something diffs the
+tree.
 
 Further reading: `docs/DESIGN.md` for why the engine is shaped this way,
 `docs/SCHEMA.md` for authoring records, and — for maintainers —
@@ -105,7 +113,10 @@ role from editing a store file directly. Each store gets
 record" and "the orchestrator writes it up" stay two deliberate steps by habit.
 
 Subagents get the relevant decision history handed to them before they touch a
-file; they do not have to go looking for it.
+file with the Edit or Write tools; they do not have to go looking for it. A
+subagent that changes a file from the shell instead gets no such hand-off —
+the edit still reaches the ledger afterwards, from the tree diff, same as any
+other shell-made change.
 
 The engine and the store are plain CLI tools and markdown files, so nothing here
 is locked to Claude Code — other agent stacks can adopt the same store. The
@@ -138,7 +149,9 @@ never auto-loaded. Once a fact graduates into a real ruling it moves into the
 store, and auto-memory keeps a one-line pointer to it — never a copy, because
 copies drift and a drifted copy gets quoted as if it were still true. The
 pre-edit hook is the bridge running the other way: it pulls a store record into
-the session exactly when a file it governs gets touched.
+the session exactly when a file it governs gets touched with the Edit or
+Write tools (a shell-made change to that same file gets no such pull — only
+the after-the-fact ledger entry).
 
 If the same fact lives in two of these places at once, one of them is already
 wrong. Pick its one home.
@@ -307,7 +320,9 @@ To stop the question in every repo on the machine at once, not just this one:
 `scripts/memcontinuum-decide.sh never-ask`, undone with `ask-again`.
 
 **`/memory-search`** is the other skill: a deliberate, on-demand search of the
-store and the code index, rather than the automatic per-edit lookup.
+store and the code index, rather than the automatic per-edit lookup (which
+only fires for the Edit and Write tools — reach for this skill by hand before
+changing a file from the shell instead).
 
 **A nudge is an action item, not a notice.** When the session is reminded that
 recent work is not covered by any decision record, the answer is either new

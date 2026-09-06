@@ -249,6 +249,95 @@ mc_git_head() {
     git -C "$dir" rev-parse HEAD 2>>"$MC_LOG" || printf ''
 }
 
+# mc_code_heads_from CODE_ROOTS_TEXT -- prints "root<TAB>head\n" for every
+# non-empty line of CODE_ROOTS_TEXT (mc_code_roots's own newline-separated
+# output), via mc_git_head (no python -- git only). LOW-3 (task-7-review.md):
+# shared by sessionstart-remind.sh, userprompt-remind.sh, and
+# precompact-persist.sh, collapsing the per-root HEAD-reading loop that used
+# to be duplicated (byte-for-byte in two of the three) across all three.
+# Never spawns python itself -- the caller already paid for the ONE
+# mc_code_roots call that produced CODE_ROOTS_TEXT, so folding this in adds
+# no new spawn.
+mc_code_heads_from() {
+    local roots_text="$1"
+    local cr
+    while IFS= read -r cr; do
+        [ -n "$cr" ] || continue
+        printf '%s\t%s\n' "$cr" "$(mc_git_head "$cr")"
+    done <<<"$roots_text"
+}
+
+# mc_head_changed STATE_FILE CODE_HEADS CUR_STORE_SHA FIRST_ROOT
+#
+# Prints "CODE_CHANGED=true|false" and "STORE_CHANGED=true|false"
+# (shlex-quoted, suitable for `eval "$(...)"`) -- the shared "did any
+# configured root's HEAD move since session start" comparison. LOW-3
+# (task-7-review.md): this ~30-line python heredoc used to be duplicated
+# byte-for-byte in userprompt-remind.sh and precompact-persist.sh; now
+# lives here once. CODE_HEADS is mc_code_heads_from's own output
+# ("root<TAB>head\n" lines); STATE_FILE's `start_code_shas` ({root: sha})
+# is the per-root map sessionstart-remind.sh writes; `start_code_sha`
+# (singular) is the pre-multi-root legacy value, recorded only for the
+# FIRST configured root (repo-init.sh always renders MEMCONTINUUM_CODE_ROOT
+# as code_roots[0] whenever any code root is configured, so FIRST_ROOT ==
+# that value identifies the one root the legacy key was ever measuring).
+#
+# LOW-4 fix (task-7-review.md): a root OTHER than FIRST_ROOT that is
+# missing from `start_code_shas` (the transitional window before a resume
+# repopulates the map -- see sessionstart-remind.sh's own header comment)
+# is treated as UNKNOWN and skipped, never compared against a DIFFERENT
+# root's start sha -- the pre-fix fallback compared every such root's
+# current HEAD against the first root's own start sha (two unrelated git
+# repositories), which could only ever read as a false "changed: yes".
+mc_head_changed() {
+    local state_file="$1"
+    local code_heads="$2"
+    local cur_store_sha="$3"
+    local first_root="$4"
+    CODE_HEADS="$code_heads" CUR_STORE_SHA="$cur_store_sha" MC_FIRST_ROOT="$first_root" \
+        env PYTHONPATH= "$MC_PY" -c '
+import json, os, shlex, sys
+
+try:
+    with open(sys.argv[1]) as f:
+        state = json.load(f)
+    if not isinstance(state, dict):
+        state = {}
+except Exception:
+    state = {}
+
+starts = state.get("start_code_shas")
+if not isinstance(starts, dict):
+    starts = {}
+legacy_start = state.get("start_code_sha") or ""
+first_root = os.environ.get("MC_FIRST_ROOT") or ""
+heads = os.environ.get("CODE_HEADS") or ""
+code_changed = False
+for line in heads.splitlines():
+    if not line or "\t" not in line:
+        continue
+    root, cur = line.split("\t", 1)
+    if root in starts:
+        start = starts[root]
+    elif root == first_root:
+        start = legacy_start
+    else:
+        # LOW-4: no start sha recorded for this root and it is not the
+        # one root the legacy key ever measured -- unknown, not compared.
+        continue
+    if cur and cur != start:
+        code_changed = True
+        break
+
+cur_store = os.environ.get("CUR_STORE_SHA") or ""
+start_store = state.get("start_store_sha") or ""
+store_changed = bool(cur_store) and cur_store != start_store
+
+print("CODE_CHANGED=" + shlex.quote("true" if code_changed else "false"))
+print("STORE_CHANGED=" + shlex.quote("true" if store_changed else "false"))
+' "$state_file" 2>>"$MC_LOG"
+}
+
 # mc_update_state_json STATE_FILE PY_TRANSFORM
 #
 # The one shared "lock + atomic-rename JSON update" primitive. Everything --

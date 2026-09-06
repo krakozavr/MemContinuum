@@ -171,6 +171,31 @@ class TestStatsHealthyCase(StatsTestBase):
         self.assertEqual(out["ledger_appends"]["store"], 1)
         self.assertEqual(out["store_commits"], 1)
 
+    def test_ledger_reports_shell_diff_calls_and_unsupported_surface(self):
+        """Design R6 (audit MC-P1-04, TOP-0123 L6): the shell-diff branch's
+        own summary line (`outcome=shell-diff`) and the unsupported-tool
+        line (`outcome=unsupported-mutation-surface`) are counted
+        dynamically like every other ledger outcome and exposed as named
+        views alongside the existing appended:code/store ones."""
+        lines = [
+            f"{ts(1)} ledger outcome=appended kind=code source=shell-diff "
+            f"file=/x.py session=s1 project=demo",
+            f"{ts(1)} ledger outcome=shell-diff appended=1 roots=2 timeouts=0 "
+            f"non-git=0 project=demo",
+            f"{ts(1)} ledger outcome=shell-diff appended=0 roots=2 timeouts=1 "
+            f"non-git=0 project=demo",
+            f"{ts(1)} ledger outcome=unsupported-mutation-surface tool=SomeMcpTool "
+            f"session=s1 project=demo",
+            f"{ts(1)} ledger outcome=unsupported-mutation-surface tool=unknown "
+            f"session=s1 project=demo",
+        ]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home))
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["ledger_appends"]["code"], 1)
+        self.assertEqual(out["ledger_appends"]["shell_diff_calls"], 2)
+        self.assertEqual(out["ledger_appends"]["unsupported_surface"], 2)
+
     def test_pre_edit_no_match_and_other_classified_separately(self):
         """The named fields (matched/no_match/other/total/lookups) are
         VIEWS over the dynamic per-outcome `outcomes` dict (fix round 1) --

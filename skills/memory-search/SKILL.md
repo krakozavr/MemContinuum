@@ -22,8 +22,7 @@ memidx.py search "QUERY" --mode hybrid --project PROJECT --status active [--area
 memidx.py chain <topic-id-or-slug> --project PROJECT --json
 ```
 
-**What a file is governed by**, before editing it (this is also what the PreToolUse hook runs
-automatically — use it by hand when working outside an edit, e.g. while planning):
+**What a file is governed by**, before editing it (this is also what the PreToolUse hook runs before an Edit/Write — use it by hand when you are about to change files from the shell, or while planning):
 ```
 memidx.py for-path path/to/file.ext --project PROJECT --json
 ```
