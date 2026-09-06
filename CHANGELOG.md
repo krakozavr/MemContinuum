@@ -95,6 +95,12 @@
   ref must find the marker at that symbol, else a warning (existing stores
   carry none yet) -- a `path#symbol` the chunker proves absent is an error
   instead (the ref itself is dangling), not merely a missing marker.
+- A record under `inbox/` (a reviewer's freeform consult drop, not yet
+  promoted) now indexes as `type: inbox` unconditionally -- even one that
+  carries its own conflicting frontmatter `type:` -- and `search` excludes
+  it from results by default; `--include-inbox` (or an explicit
+  `--type inbox`) widens back. `check`/`reindex` counts, and
+  `chain`/`for-path`/`why`, are unaffected.
 
 ### Code index
 - The code index's freshness check now compares five stat signals per file

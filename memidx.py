@@ -646,6 +646,17 @@ def parse_frontmatter(path: Path) -> tuple[dict, str]:
 
 
 def infer_type(root: Path, path: Path, fm: dict) -> str:
+    try:
+        rel_parts = path.relative_to(root).parts
+    except ValueError:
+        rel_parts = path.parts
+    # search-inbox-downrank: a path under inbox/ is type: inbox
+    # unconditionally -- even a drop that carries its own frontmatter
+    # `type:` (a consult note pasted with a stray field, say) is never a
+    # first-class record just because it claims to be one; only its
+    # directory decides.
+    if rel_parts and rel_parts[0] == "inbox":
+        return "inbox"
     t = fm.get("type")
     if t:
         return str(t)
@@ -653,10 +664,6 @@ def infer_type(root: Path, path: Path, fm: dict) -> str:
     t = meta.get("type")
     if t:
         return str(t)
-    try:
-        rel_parts = path.relative_to(root).parts
-    except ValueError:
-        rel_parts = path.parts
     if rel_parts:
         seg = rel_parts[0]
         return seg[:-1] if seg.endswith("s") else seg
@@ -2788,6 +2795,16 @@ def cmd_search(args) -> int:
     effective_args = copy.copy(args)
     effective_args.status = _resolve_search_status(getattr(args, "status", None) or [])
     extra_where, extra_params = build_filter_clause(effective_args, include_project=False)
+
+    # search-inbox-downrank: inbox/ records (indexed as type: inbox --
+    # infer_type) are excluded from search by default -- a freeform consult
+    # drop, not a ruling. --include-inbox widens back; an explicit
+    # `--type inbox` also counts as asking for them (otherwise it would
+    # silently AND itself into an empty result against the exclusion below).
+    include_inbox = bool(getattr(args, "include_inbox", False)) or "inbox" in (args.type or [])
+    if not include_inbox:
+        inbox_clause = "type != 'inbox'"
+        extra_where = f"({extra_where}) AND {inbox_clause}" if extra_where else inbox_clause
     results, contributing, embed_info = _search_hits(conn, args, extra_where, extra_params)
     embed_state = embed_info.get("state")
     if embed_state == "unavailable":
@@ -7742,6 +7759,12 @@ def main(argv=None) -> int:
     p_search.add_argument("--authority", default=None)
     p_search.add_argument("--limit", type=int, default=10)
     p_search.add_argument("--json", action="store_true")
+    p_search.add_argument(
+        "--include-inbox", action="store_true",
+        help="search-inbox-downrank: inbox/ records are excluded by default "
+             "(they are freeform consult drops, not rulings); pass this to "
+             "widen results to include them",
+    )
     p_search.set_defaults(func=cmd_search)
 
     p_chain = sub.add_parser("chain")

@@ -115,6 +115,10 @@ governance pattern, not an access control: nothing in the code stops another
 role from editing a store file directly. Each store gets
 `inbox/{codex,grok,audit}` directories precisely so that "a reviewer proposes a
 record" and "the orchestrator writes it up" stay two deliberate steps by habit.
+An inbox drop indexes (so `check`/`reindex` count it) but is not first-class:
+it types as `inbox` and `search` leaves it out of results by default
+(`--include-inbox` widens back) until the orchestrator promotes it into a real
+record.
 
 Subagents get the relevant decision history handed to them before they touch a
 file with the Edit or Write tools; they do not have to go looking for it. A

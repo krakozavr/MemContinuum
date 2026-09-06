@@ -2545,6 +2545,72 @@ class TestF5LinkRows(unittest.TestCase):
                                            "surfacing the declined-only match")
             self.assertEqual(out[0]["status"], "declined")
 
+    def test_inbox_records_are_typed_inbox_and_excluded_from_search_unless_included(self):
+        # search-inbox-downrank: a record under inbox/ indexes as
+        # type: inbox (unconditionally -- even one carrying an explicit,
+        # conflicting frontmatter `type:`, since an inbox drop is never a
+        # first-class record whatever it claims to be) and is excluded
+        # from `search` results unless --include-inbox is given. status=
+        # ["any"] throughout isolates this from search-default-active
+        # (item 1): both assertions below use the SAME status filter, so
+        # only include_inbox varies.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "store"
+            (root / "topics").mkdir(parents=True)
+            (root / "inbox").mkdir(parents=True)
+            (root / "topics" / "t.md").write_text(
+                "---\ntype: topic\nid: TOP-1\ntitle: Topic\nlinks:\n"
+                "  - link: L1\n    status: active\n"
+                "    ruling: {text: \"zephyr shows up in a real active decision\", "
+                "authority: owner-verbatim, source: s}\n"
+                "---\nBody.\n"
+            )
+            # No frontmatter at all -- the real shape of a consult drop
+            # (inbox/grok/*.md, inbox/codex/*.md in this store's own tree).
+            (root / "inbox" / "freeform.md").write_text(
+                "# A consult note\nzephyr also shows up here, freeform, no frontmatter.\n"
+            )
+            # An inbox file that DOES carry frontmatter, deliberately
+            # claiming a different type -- still must index as inbox.
+            (root / "inbox" / "claims-topic.md").write_text(
+                "---\ntype: topic\nid: TOP-9\ntitle: A note masquerading as a topic\n"
+                "---\nzephyr, a third time, in a file that claims type: topic.\n"
+            )
+            root = root.resolve()
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+
+            conn = memidx.open_db(db, project=memidx.DEFAULT_PROJECT)
+            freeform_row = memidx.record_row_by_path(conn, str(root / "inbox" / "freeform.md"))
+            claims_row = memidx.record_row_by_path(conn, str(root / "inbox" / "claims-topic.md"))
+            self.assertEqual(freeform_row["type"], "inbox")
+            self.assertEqual(claims_row["type"], "inbox",
+                              "a path under inbox/ must index as type: inbox even when its own "
+                              "frontmatter claims a different type")
+            conn.close()
+
+            def run(include_inbox):
+                buf = io.StringIO()
+                kwargs = dict(project=memidx.DEFAULT_PROJECT, db=str(db), query="zephyr",
+                               mode="fts", status=["any"], type=[], area=None, topic=None,
+                               authority=None, limit=10, json=True)
+                if include_inbox:
+                    kwargs["include_inbox"] = True
+                with contextlib.redirect_stdout(buf):
+                    memidx.cmd_search(ns(**kwargs))
+                return json.loads(buf.getvalue())
+
+            default_out = run(include_inbox=False)
+            paths = [r["path"] for r in default_out]
+            self.assertTrue(any(p.endswith("t.md") for p in paths), paths)
+            self.assertFalse(any(p.endswith("freeform.md") or p.endswith("claims-topic.md")
+                                  for p in paths), paths)
+
+            included_out = run(include_inbox=True)
+            paths = [r["path"] for r in included_out]
+            self.assertTrue(any(p.endswith("freeform.md") for p in paths), paths)
+            self.assertTrue(any(p.endswith("claims-topic.md") for p in paths), paths)
+
     def test_reindex_check_unmapped_run_twice_report_zero_second_time(self):
         with tempfile.TemporaryDirectory() as td:
             root = self._topic_with_two_links(td)

@@ -15,7 +15,7 @@ checkout (or wherever `MEMCONTINUUM_HOME`/`--project` are configured for this pr
 ```
 memidx.py search "QUERY" --mode hybrid --project PROJECT --status active [--area AREA] [--type topic] --json
 ```
-`hybrid` (the engine's default) is what this skill recommends too — a ruling's own text is retrievable through either channel, so no single-channel mode is needed. `--status active` here is just naming the engine's own default explicitly: `search` with no `--status` filter already means active-only; pass `--status any` to widen to superseded/historical/declined/provisional records too, or name one or more of them explicitly. `--authority owner-verbatim`/`owner-ratified` narrows to CONSTRAINT-citable rulings only.
+`hybrid` (the engine's default) is what this skill recommends too — a ruling's own text is retrievable through either channel, so no single-channel mode is needed. `--status active` here is just naming the engine's own default explicitly: `search` with no `--status` filter already means active-only; pass `--status any` to widen to superseded/historical/declined/provisional records too, or name one or more of them explicitly. `--authority owner-verbatim`/`owner-ratified` narrows to CONSTRAINT-citable rulings only. `search` also leaves `inbox/` drops (freeform reviewer consults, not yet promoted to a record) out of its results by default; pass `--include-inbox` on the rare occasion you need to search those too.
 
 **A specific topic's full chain**, once you have its id or slug:
 ```

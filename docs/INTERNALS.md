@@ -1780,7 +1780,16 @@ below, and `infer_type` falls back to the containing directory name), so
 "put arbitrary markdown under the store root" is not a safe way to keep it out
 of `search`/`chain`/`for-path` results. The directory-name pruning above (a
 `.remember/now.md` session buffer, a project's `.claude/`) is the only thing
-that keeps non-record markdown out of the walk.
+that keeps non-record markdown out of the walk. One directory IS a
+deliberate exception to "everything under the root is first-class": a path
+under `inbox/` indexes as `type: inbox` unconditionally (`infer_type` checks
+the directory before it ever reads frontmatter, so a drop that carries its
+own conflicting `type:` field still indexes as `inbox`), and `search`
+excludes `type: inbox` rows unless `--include-inbox` (or an explicit
+`--type inbox`) is given -- a freeform consult drop stays out of the way of
+`search`'s default results without being invisible to the index (`check`/
+`reindex` counts, `chain`/`for-path`/`why` are all unaffected, since none of
+them ever return an inbox record in the first place).
 
 **Two databases.** `<project>.sqlite` (decisions) and `<project>-code.sqlite`
 (Anatomy's code index) are separate physical files by default, each with its own
@@ -2159,6 +2168,9 @@ down:
   `--status any` widens back to every status (superseded/historical/
   declined/provisional included), and any other explicit value (or several,
   repeated) passes through unchanged, exactly as before this default existed.
+  `type: inbox` rows (search-inbox-downrank) are excluded the same way,
+  independent of `--status`: `--include-inbox`, or an explicit
+  `--type inbox`, widens back to include them.
   Filters (`--status`, `--type`,
   `--area`, `--topic`, `--authority`) are always ANDed, and are applied
   **inside** `fts_ranked`/`vector_ranked`'s own query, before either channel's
