@@ -1407,6 +1407,25 @@ class TestMemlintDecisionMarkers(unittest.TestCase):
             any("markers not checked" in w and "x.rb" in w for w in warnings), warnings
         )
 
+    # Mem-3 (task-a2-2-review.md): the marker-scan "markers not checked"
+    # warning must carry the SAME remedy lint_concept's identical wheel-
+    # absent failure already gives (backend-preflight) -- the marker path
+    # used to compute and then discard it.
+    def test_mem3_marker_uncheckable_warning_carries_remedy(self):
+        topic = _marker_topic("TOP-0054", ["widget.js#widget_loader"], _CONSTRAINT_LINK_L1)
+        code = {"widget.js": "function widget_loader() {\n  return 1;\n}\n"}
+        chunkers.treesitter.reset_cache()
+        try:
+            with mock.patch.dict(sys.modules, {"tree_sitter_javascript": None}):
+                errors, warnings = self._lint({"t.md": topic}, code)
+        finally:
+            chunkers.treesitter.reset_cache()
+        self.assertEqual(errors, [], errors)
+        named = [w for w in warnings if "widget.js" in w and "markers not checked" in w]
+        self.assertEqual(len(named), 1, warnings)
+        self.assertIn("tree_sitter_javascript", named[0])
+        self.assertIn("run backend-preflight", named[0])
+
     # (g) two roots -- the ref resolved against the right one.
     def test_g_two_roots_ref_resolved_against_the_right_one(self):
         topic = _marker_topic("TOP-0047", ["thing.py#f"], _CONSTRAINT_LINK_L1)
@@ -1460,6 +1479,112 @@ class TestMemlintDecisionMarkers(unittest.TestCase):
         self.assertEqual(errors, [], errors)
         self.assertTrue(
             any("no marker at src/x.py#alpha" in w for w in warnings), warnings
+        )
+
+    # Mem-5 (task-a2-2-review.md): a marker naming a TOPIC id that does not
+    # exist anywhere in the store at all (distinct from test_c's "topic
+    # exists, link does not").
+    def test_mem5_marker_at_nonexistent_topic_is_error(self):
+        topic = _marker_topic("TOP-0049", ["src/x.py#alpha"], _CONSTRAINT_LINK_L1)
+        code = {"src/x.py": "# decision: TOP-9999 L1\ndef alpha():\n    return 1\n"}
+        errors, _warnings = self._lint({"t.md": topic}, code)
+        self.assertTrue(
+            any("TOP-9999" in e and "no such topic" in e for e in errors), errors
+        )
+
+    # Mem-1 (task-a2-2-review.md): a topic's code_refs DOES carry a
+    # path#symbol ref for this file -- it just names a DIFFERENT symbol
+    # than the one the marker actually sits on. The old message denied any
+    # path#symbol ref existed at all (the glob/bare-path wording); the
+    # fixed one names the mismatch truthfully.
+    def test_mem1_marker_names_a_path_symbol_ref_for_the_wrong_symbol(self):
+        topic = _marker_topic("TOP-0050", ["src/x.py#beta"], _CONSTRAINT_LINK_L1)
+        code = {
+            "src/x.py": (
+                "def beta():\n"
+                "    return 2\n"
+                "# decision: TOP-0050 L1\n"
+                "def alpha():\n"
+                "    return 1\n"
+            )
+        }
+        errors, _warnings = self._lint({"t.md": topic}, code)
+        hit = [e for e in errors if "TOP-0050" in e and "L1" in e]
+        self.assertTrue(hit, errors)
+        self.assertIn("src/x.py#beta", hit[0])
+        self.assertIn("not src/x.py#alpha", hit[0])
+        self.assertNotIn("glob", hit[0])
+        self.assertNotIn("never marker-verified", hit[0])
+
+    # Mem-1, the container variant: a marker meant for a container (`class
+    # Foo:`) is attributed to a MEMBER starting within 3 lines below it
+    # instead (chunk_file never gives a container its own chunk) -- the
+    # topic's code_refs names the CONTAINER (#Foo), so this is the same
+    # "wrong symbol" situation, not a glob/bare-path one, and the fix
+    # (adding a #method entry) would be wrong -- the message must not
+    # suggest it.
+    def test_mem1_marker_above_container_misattributed_to_nearby_member(self):
+        topic = _marker_topic("TOP-0051", ["src/x.py#Foo"], _CONSTRAINT_LINK_L1)
+        code = {
+            "src/x.py": (
+                "# decision: TOP-0051 L1\n"
+                "class Foo:\n"
+                "    def method(self):\n"
+                "        return 1\n"
+            )
+        }
+        errors, _warnings = self._lint({"t.md": topic}, code)
+        hit = [e for e in errors if "TOP-0051" in e and "L1" in e]
+        self.assertTrue(hit, errors)
+        self.assertIn("src/x.py#Foo", hit[0])
+        self.assertIn("not src/x.py#method", hit[0])
+        self.assertNotIn("glob", hit[0])
+
+    # Ruling 144 (TOP-0122 L4): a path#symbol ref whose symbol the chunker
+    # never reports as its own chunk (a Swift protocol requirement --
+    # signature only, no body) is a WARNING, not an error, when the name is
+    # genuinely present in the file text -- the declaration cannot be
+    # VERIFIED by this engine's parser layer, which is not the same claim
+    # as DISPROVEN.
+    def test_ruling144_swift_protocol_requirement_name_present_is_warning(self):
+        topic = _marker_topic("TOP-0052", ["proto.swift#cleanup"], _CONSTRAINT_LINK_L1)
+        code = {
+            "proto.swift": (
+                "protocol Cleanup {\n"
+                "    func cleanup()\n"
+                "}\n"
+            )
+        }
+        errors, warnings = self._lint({"t.md": topic}, code)
+        self.assertEqual(errors, [], errors)
+        self.assertTrue(
+            any(
+                "TOP-0052:L1: proto.swift#cleanup cannot be verified by the chunker"
+                in w and "name present, no declaration reported" in w
+                for w in warnings
+            ),
+            warnings,
+        )
+        self.assertFalse(any("dangling" in w for w in warnings), warnings)
+
+    # Ruling 144's other half: the symbol's NAME is genuinely absent from
+    # the file text (not merely unreported as a declaration) -- this stays
+    # the ERROR ruling 144 keeps (ordinary dangling-ref behavior,
+    # unchanged; ties this class's coverage explicitly to the ruling, not
+    # just to the pre-existing test (e) above).
+    def test_ruling144_name_genuinely_absent_stays_error(self):
+        topic = _marker_topic("TOP-0053", ["src/y.py#totally_absent_name"], _CONSTRAINT_LINK_L1)
+        code = {"src/y.py": "def alpha():\n    return 1\n"}
+        errors, warnings = self._lint({"t.md": topic}, code)
+        self.assertTrue(
+            any(
+                "TOP-0053" in e and "dangling" in e and "totally_absent_name" in e
+                for e in errors
+            ),
+            errors,
+        )
+        self.assertFalse(
+            any("cannot be verified by the chunker" in w for w in warnings), warnings
         )
 
 

@@ -42,7 +42,7 @@ wired one level up, into `~/.claude/settings.json`, by `memcontinuum-setup.sh`.
 | `ledger-post-edit.sh` | `PostToolUse` (every tool; no settings-level matcher) | a bash-only prefilter exits before the watchdog for read-only built-ins (`Read`, `Grep`, ...); `Edit`/`Write`/`MultiEdit`/`NotebookEdit` ledger the tool's own file path (`source: tool`); `Bash` and any tool this hook has no dedicated branch for fall through to a shell-diff (`git status`) tree comparison against a per-root baseline (`source: shell-diff`); an unrecognized or missing `tool_name` additionally logs `outcome=unsupported-mutation-surface` |
 | `precompact-persist.sh` | `PreCompact` | persists session state before context is compacted away |
 | `sessionstart-remind.sh` | `SessionStart` | on `startup`/`resume`/`clear`, initializes session state only (captures the code/store roots' git HEAD, prunes state older than 24h; `clear` resets the session's counters and pending nudges but carries the edit ledger over, `resume` keeps everything); only on `source: compact` does it inject what `precompact-persist.sh` left pending |
-| `userprompt-remind.sh` | `UserPromptSubmit` | never reads the prompt text; fires the coverage or look-back nudge |
+| `userprompt-remind.sh` | `UserPromptSubmit` | never reads the prompt text or diff; fires the coverage, commit, or look-back nudge |
 | `sessionend-stamp.sh` | `SessionEnd` | stamps session end into state |
 | `post-commit-reindex.sh` | store's git `post-commit` | a bounded content-only reindex after every commit; spawns a background embed-worker when vectors are left behind |
 | `pre-commit-append-only.sh` | store's git `pre-commit` | runs `memlint.py --against-ref HEAD --staged`; BLOCKS the commit on an append-only violation (an edited, removed, deleted, or renamed link); fails open (lets the commit through) on an unborn HEAD, a missing python, or any engine failure |
@@ -134,6 +134,32 @@ written by atomic rename (`os.replace`) and guarded by a real
 `fcntl.flock(LOCK_EX)` (retried up to 2s) taken inside the state-update helper
 in `memlib.sh` — a Python call, never a shelled-out `flock` binary, which macOS
 does not ship.
+
+**The commit nudge.** Commit messages name the decision they land under
+(a routine, not enforced elsewhere) — `userprompt-remind.sh` nudges once
+when a commit does not. State gains two keys: `last_seen_heads` (`{root:
+sha}`, seeded at `SessionStart` alongside `start_code_shas` and advanced on
+every candidate prompt) is the per-PROMPT baseline this compares against,
+distinct from `start_code_shas`' per-SESSION one; `nudged_commits` (a list
+of sha, bounded to the last 20) dedupes a commit that keeps coming back as
+HEAD across prompts. `clear` re-seeds both from the current HEADs, the same
+way it re-seeds `start_code_shas` — nothing here survives a clear. On a
+candidate turn, for every configured root whose HEAD differs from
+`last_seen_heads[root]`, the hook reads the new commit's subject and body
+(one `git log -1`, no timeout of its own beyond the hook's own outer
+watchdog) and, when the message names no decision id and the SAME
+`unmapped` call this turn's coverage signal already made finds at least
+one edited file under that root with no topic, adds one fact line to the
+same `additionalContext` block and logs `userprompt outcome=commit-nudge
+sha=<short> root=<root>` (one line per nudge, `project=` last like every
+other `mc_log` line). A root whose message already names a decision, or
+whose edited files are all covered, or whose commit was already nudged,
+adds no line — but `last_seen_heads` still advances, so that commit is
+never re-examined. The nudge never reads the diff and never reads the
+prompt; it shares coverage's own delivery, cooldown, and prompt-hash
+dedupe rather than any throttle of its own. `stats` counts it as
+`nudges.commit_nudges`, separate from `nudges.total` (it can co-occur with
+`nudges.coverage_injected` on the same turn).
 
 **The shell-diff ledger branch.** `ledger-post-edit.sh` runs the tree-diff
 pass for `Bash` and any tool it has no dedicated branch for, inside the same

@@ -269,18 +269,19 @@ mc_code_heads_from() {
 
 # mc_head_changed STATE_FILE CODE_HEADS CUR_STORE_SHA FIRST_ROOT
 #
-# Prints "CODE_CHANGED=true|false" and "STORE_CHANGED=true|false"
-# (shlex-quoted, suitable for `eval "$(...)"`) -- the shared "did any
-# configured root's HEAD move since session start" comparison. LOW-3
-# (task-7-review.md): this ~30-line python heredoc used to be duplicated
-# byte-for-byte in userprompt-remind.sh and precompact-persist.sh; now
-# lives here once. CODE_HEADS is mc_code_heads_from's own output
-# ("root<TAB>head\n" lines); STATE_FILE's `start_code_shas` ({root: sha})
-# is the per-root map sessionstart-remind.sh writes; `start_code_sha`
-# (singular) is the pre-multi-root legacy value, recorded only for the
-# FIRST configured root (repo-init.sh always renders MEMCONTINUUM_CODE_ROOT
-# as code_roots[0] whenever any code root is configured, so FIRST_ROOT ==
-# that value identifies the one root the legacy key was ever measuring).
+# Prints "CODE_CHANGED=true|false", "STORE_CHANGED=true|false", and
+# "MOVED_ROOTS=<root>\t<head>\n..." (shlex-quoted, suitable for
+# `eval "$(...)"`) -- the shared "did any configured root's HEAD move"
+# comparisons. LOW-3 (task-7-review.md): this ~30-line python heredoc used
+# to be duplicated byte-for-byte in userprompt-remind.sh and
+# precompact-persist.sh; now lives here once. CODE_HEADS is
+# mc_code_heads_from's own output ("root<TAB>head\n" lines); STATE_FILE's
+# `start_code_shas` ({root: sha}) is the per-root map sessionstart-remind.sh
+# writes; `start_code_sha` (singular) is the pre-multi-root legacy value,
+# recorded only for the FIRST configured root (repo-init.sh always renders
+# MEMCONTINUUM_CODE_ROOT as code_roots[0] whenever any code root is
+# configured, so FIRST_ROOT == that value identifies the one root the
+# legacy key was ever measuring).
 #
 # LOW-4 fix (task-7-review.md): a root OTHER than FIRST_ROOT that is
 # missing from `start_code_shas` (the transitional window before a resume
@@ -289,6 +290,18 @@ mc_code_heads_from() {
 # root's start sha -- the pre-fix fallback compared every such root's
 # current HEAD against the first root's own start sha (two unrelated git
 # repositories), which could only ever read as a false "changed: yes".
+#
+# MOVED_ROOTS (TOP-0122 L1 rule 2a, the commit nudge): a SEPARATE, per-
+# PROMPT comparison against `last_seen_heads` ({root: sha}, distinct from
+# the per-SESSION `start_code_shas` above) -- folded into this same read
+# (one state-file load, one CODE_HEADS scan) purely so the common "nothing
+# moved" turn costs userprompt-remind.sh no extra python spawn at all. This
+# is a CHEAP GATE only, not the authoritative decision: a root missing from
+# `last_seen_heads` is treated as unknown and never reported moved (mirrors
+# the LOW-4 policy above), and the caller re-derives the real comparison
+# (and does the actual bookkeeping write) from a freshly-loaded state
+# inside its own locked transform before acting on it -- this avoids ever
+# trusting a value read outside a lock as the basis for a write.
 mc_head_changed() {
     local state_file="$1"
     local code_heads="$2"
@@ -310,9 +323,13 @@ starts = state.get("start_code_shas")
 if not isinstance(starts, dict):
     starts = {}
 legacy_start = state.get("start_code_sha") or ""
+last_seen = state.get("last_seen_heads")
+if not isinstance(last_seen, dict):
+    last_seen = {}
 first_root = os.environ.get("MC_FIRST_ROOT") or ""
 heads = os.environ.get("CODE_HEADS") or ""
 code_changed = False
+moved_lines = []
 for line in heads.splitlines():
     if not line or "\t" not in line:
         continue
@@ -322,12 +339,13 @@ for line in heads.splitlines():
     elif root == first_root:
         start = legacy_start
     else:
-        # LOW-4: no start sha recorded for this root and it is not the
-        # one root the legacy key ever measured -- unknown, not compared.
-        continue
-    if cur and cur != start:
+        start = None
+    if start is not None and cur and cur != start:
         code_changed = True
-        break
+
+    prev = last_seen.get(root)
+    if prev is not None and cur and cur != prev:
+        moved_lines.append(root + "\t" + cur)
 
 cur_store = os.environ.get("CUR_STORE_SHA") or ""
 start_store = state.get("start_store_sha") or ""
@@ -335,6 +353,7 @@ store_changed = bool(cur_store) and cur_store != start_store
 
 print("CODE_CHANGED=" + shlex.quote("true" if code_changed else "false"))
 print("STORE_CHANGED=" + shlex.quote("true" if store_changed else "false"))
+print("MOVED_ROOTS=" + shlex.quote("\n".join(moved_lines)))
 ' "$state_file" 2>>"$MC_LOG"
 }
 

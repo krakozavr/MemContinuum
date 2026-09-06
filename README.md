@@ -399,6 +399,10 @@ A constraint or hold ruling can also be mirrored at its bound symbol with a
 that is not a constraint or hold) is an error, and a constraint whose symbol
 carries no marker yet is a warning.
 
+Name the decision the change lands under in the commit message too
+(`TOP-xxxx Ln`): the session nudges once when a commit names none and its
+edited files carry no topic.
+
 **Keeping a wired repo up to date.** A fix that only touches a script (a hook,
 `memidx.py`, `memlint.py`) reaches every wired repo the moment you pull —
 nothing to run. A fix that changes what gets *rendered* into a repo (the hook

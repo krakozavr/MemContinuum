@@ -7354,6 +7354,14 @@ def _stats_report(
     lookback_injected = up.get("lookback-injected", 0)
     no_evidence = up.get("no-evidence", 0)
     duplicate_delivery = up.get("duplicate-delivery", 0)
+    # TOP-0122 L1 rule 2a: the commit nudge logs its own outcome line
+    # (userprompt-remind.sh, one per nudged commit) alongside whatever
+    # else fires that same turn -- counted here, but NOT folded into
+    # `nudges_total`: it can co-occur with `injected` on the same turn
+    # (both share this turn's delivery), and double-counting it there
+    # would shift the write-side FLAG's own threshold for no reason the
+    # spec ever asked for.
+    commit_nudges = up.get("commit-nudge", 0)
     nudges_total = coverage_injected + lookback_injected
     non_user_prompt_lines = sum(up.get(k, 0) for k in _NON_USER_PROMPT_OUTCOMES)
     user_prompts = sum(up.values()) - non_user_prompt_lines
@@ -7431,6 +7439,7 @@ def _stats_report(
             "lookback_injected": lookback_injected,
             "no_evidence": no_evidence,
             "duplicate_delivery": duplicate_delivery,
+            "commit_nudges": commit_nudges,
             "total": nudges_total,
             "outcomes": dict(up),
         },
@@ -7563,7 +7572,8 @@ def cmd_stats(args) -> int:
         print()
         nu = result["nudges"]
         print(f"write-side nudges: coverage-injected={nu['coverage_injected']} "
-              f"lookback-injected={nu['lookback_injected']} no-evidence={nu['no_evidence']} "
+              f"lookback-injected={nu['lookback_injected']} commit-nudges={nu['commit_nudges']} "
+              f"no-evidence={nu['no_evidence']} "
               f"duplicate-delivery={nu['duplicate_delivery']}")
         nf = result["newfile_nudge"]
         print(f"new-file nudges: nudged={nf['nudged']} "

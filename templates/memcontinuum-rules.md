@@ -20,7 +20,8 @@ Never both; never copy content across layers.
 
 How to write a store record: docs/SCHEMA.md in the engine; lint it, then commit
 the store (committing reindexes it). Constraint and hold links may be mirrored
-by a `decision: TOP-xxxx Ln` comment at the bound symbol; memlint checks both ways.
+by a `decision: TOP-xxxx Ln` comment at the bound symbol; memlint checks both
+ways. Name the decision in commit messages too (`TOP-xxxx Ln`).
 
 A coverage or look-back nudge is an ACTION ITEM, not a notice: answer it with
 records or an explicit "none".

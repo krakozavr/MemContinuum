@@ -31,11 +31,14 @@ import chunkers
 
 from memidx import (
     AUTHORITIES,
+    CONSTRAINT_AUTHORITIES,
     EDGE_RELS,
+    HOLD_ELIGIBLE_AUTHORITIES,
     INVARIANT_KINDS,
     KINDS,
     STATUSES,
     ParseResult,
+    _uncheckable_remedy,
     code_ref_is_named,
     code_ref_matches,
     fragment_declaration_status,
@@ -577,17 +580,21 @@ def _link_tier(link: dict) -> str:
     parses, and is deliberately NARROWER for agent-inference than that
     uniform rule (ruling 76) -- SCHEMA sec3's authority table is explicit
     that agent-inference needs an invariant AND validated evidence to be a
-    HOLD eligible for a marker, not evidence alone."""
+    HOLD eligible for a marker, not evidence alone. Mem-2 (task-a2-2-
+    review.md): the CONSTRAINT/HOLD authority sets themselves are
+    memidx's own CONSTRAINT_AUTHORITIES/HOLD_ELIGIBLE_AUTHORITIES,
+    imported rather than re-typed here, so a future authority never
+    silently drifts between the two classifiers."""
     if link.get("status") != "active":
         return "context"
     ruling = link.get("ruling") or {}
     authority = ruling.get("authority")
-    if authority in ("owner-verbatim", "owner-ratified"):
+    if authority in CONSTRAINT_AUTHORITIES:
         return "constraint"
     evidence = validated_evidence_list(link.get("evidence"))
-    if authority in ("reviewer-finding", "code-derived") and evidence:
-        return "hold"
-    if authority == "agent-inference" and link.get("invariant") and evidence:
+    if authority in HOLD_ELIGIBLE_AUTHORITIES and evidence and (
+        authority != "agent-inference" or link.get("invariant")
+    ):
         return "hold"
     return "context"
 
@@ -620,36 +627,55 @@ def _root_containing(code_roots: list[Path], rel_path: str) -> Path | None:
     return None
 
 
-def _read_and_chunk(full_path: Path, rel_path: str) -> tuple[str | None, list[dict] | None, str]:
+def _read_and_chunk(full_path: Path, rel_path: str) -> tuple[str | None, list[dict] | None, str, str]:
     """Reads `full_path` and chunks it via the registry. Returns (text,
-    chunks, reason): `chunks` is None when this file could not be attempted
-    at all -- no chunker for its language, the backend cannot run in this
-    python (an optional grammar wheel it lacks), or it ran and could not
-    read THIS file (over the per-file byte cap, or a parse failure) -- the
-    same tri-state memidx.fragment_declaration_status already carries for
-    the single-symbol check, applied here to the whole file's chunk list.
-    `text` is populated whenever the read itself succeeded, even when
-    `chunks` ends up None, so a caller that also needs the tri-state
-    single-symbol predicate (fragment_declaration_status) never has to
-    re-read the file."""
+    chunks, reason, remedy): `chunks` is None when this file could not be
+    attempted at all -- no chunker for its language, the backend cannot run
+    in this python (an optional grammar wheel it lacks), or it ran and
+    could not read THIS file (over the per-file byte cap, or a parse
+    failure) -- the same tri-state memidx.fragment_declaration_status
+    already carries for the single-symbol check, applied here to the whole
+    file's chunk list. `text` is populated whenever the read itself
+    succeeded, even when `chunks` ends up None, so a caller that also needs
+    the tri-state single-symbol predicate (fragment_declaration_status)
+    never has to re-read the file.
+
+    Mem-3 (task-a2-2-review.md): `remedy` mirrors what
+    fragment_declaration_status/_uncheckable_remedy already give the
+    identical exception classes for the single-symbol check -- empty for
+    "no chunker for this file's language" (nothing to remedy: this
+    language is simply not wired here) and for a plain OSError reading the
+    file itself, populated for every exception-driven path (a missing
+    grammar wheel, or a backend that ran but could not read this file),
+    via the SAME helper, not a second copy of its exception-to-sentence
+    mapping."""
     try:
         text = full_path.read_text(encoding="utf-8", errors="ignore")
     except OSError as exc:
-        return None, None, f"could not read file: {exc}"
+        return None, None, f"could not read file: {exc}", ""
     lang = lang_for_source_file(full_path)
     if lang is None:
-        return text, None, "no chunker for this file's language"
+        return text, None, "no chunker for this file's language", ""
     try:
         backend = chunkers.get_chunker(lang)
     except chunkers.BackendUnavailable as exc:
-        return text, None, str(exc)
+        return text, None, str(exc), _uncheckable_remedy(exc)
     except Exception as exc:
-        return text, None, f"{lang}: {type(exc).__name__}: {exc}"
+        return text, None, f"{lang}: {type(exc).__name__}: {exc}", _uncheckable_remedy(exc)
     try:
         result = backend.chunk_file(text, rel_path)
     except Exception as exc:
-        return text, None, f"{lang}: {type(exc).__name__}: {exc}"
-    return text, result.chunks, ""
+        return text, None, f"{lang}: {type(exc).__name__}: {exc}", _uncheckable_remedy(exc)
+    return text, result.chunks, "", ""
+
+
+def _uncheckable_message(prefix: str, reason: str, remedy: str) -> str:
+    """The shared "markers not checked" wording, matching lint_concept's own
+    tri-state phrasing (Mem-3): the remedy is appended only when one exists
+    (empty for "no chunker for this file's language", which has none)."""
+    if remedy:
+        return f"{prefix}: markers not checked ({reason}); {remedy}"
+    return f"{prefix}: markers not checked ({reason})"
 
 
 def _scan_set_for_markers(code_roots: list[Path], topics: dict) -> list[tuple[Path, Path, str]]:
@@ -715,19 +741,39 @@ def _marker_to_store_errors(
         ]
 
     matched_exact = False
-    matched_any = False
+    matched_glob_or_path = False
+    wrong_symbols: list[str] = []
     for ref in fm.get("code_refs") or []:
         ref = str(ref)
         if not code_ref_matches(rel_path, ref):
             continue
         _ref_path, has_frag, ref_symbol = ref.partition("#")
-        if has_frag and fragment_matches_symbol(ref_symbol, chunk["symbol"], chunk["qualified_name"]):
+        if not has_frag:
+            matched_glob_or_path = True
+            continue
+        if fragment_matches_symbol(ref_symbol, chunk["symbol"], chunk["qualified_name"]):
             matched_exact = True
             break
-        matched_any = True
+        if ref_symbol not in wrong_symbols:
+            wrong_symbols.append(ref_symbol)
     if matched_exact:
         return []
-    if matched_any:
+    if wrong_symbols:
+        # Mem-1 (task-a2-2-review.md): a `path#symbol` ref for THIS file
+        # exists, it just names a DIFFERENT symbol than the one under the
+        # marker (a wrong-symbol typo, or a marker meant for a container
+        # whose own #symbol ref the chunker attributes to a nearby member
+        # instead) -- a real, distinct situation from "no path#symbol ref
+        # at all", and the message says so truthfully rather than denying
+        # there is one (the old message conflated both into the glob/
+        # bare-path wording below, which is both factually wrong here --
+        # there IS a path#symbol ref -- and prescribes the wrong fix).
+        named = ", ".join(f"{rel_path}#{s}" for s in wrong_symbols)
+        return [
+            f"{prefix}: topic {topic_id}'s code_refs name {named}, "
+            f"not {rel_path}#{chunk['symbol']}"
+        ]
+    if matched_glob_or_path:
         return [
             f"{prefix}: topic {topic_id}'s code_refs match {rel_path} only via a path/glob ref -- "
             f"globs (and bare paths) are never marker-verified; add a path#symbol entry for "
@@ -738,15 +784,19 @@ def _marker_to_store_errors(
 
 def _store_to_code_check(
     tid: str, link_id: str, path_part: str, symbol_part: str,
-    code_roots: list[Path], warned_uncheckable: set, warned_container: set,
+    code_roots: list[Path], warned_uncheckable: set, warned_symbol_unverifiable: set,
 ) -> tuple[list[str], list[str]]:
     """Rule 5, one (topic, active CONSTRAINT/HOLD link, path#symbol ref)
     triple: locates the symbol and checks for a matching marker. Returns
     (errors, warnings) -- a dangling ref (the path is missing under every
-    root given, or the chunker proves the symbol absent) is an ERROR; an
-    uncheckable file is a WARNING naming the reason (rule 2), deduped per
-    absolute path across the whole run; a checkable symbol with no marker
-    is the plain WARNING rule 5 names."""
+    root given, or the symbol's NAME is genuinely absent from the file
+    text -- ruling 144, TOP-0122 L4) is an ERROR; an uncheckable file is a
+    WARNING naming the reason (rule 2), deduped per absolute path across
+    the whole run; a symbol whose name is present but that the chunker
+    reports no declaration for (a container type, or ruling 144's
+    unverifiable case -- a Swift protocol requirement, say) is also a
+    WARNING, deduped per (file, symbol) via `warned_symbol_unverifiable`;
+    a checkable symbol with no marker is the plain WARNING rule 5 names."""
     errors: list[str] = []
     warnings: list[str] = []
     root = _root_containing(code_roots, path_part)
@@ -758,7 +808,7 @@ def _store_to_code_check(
         )
         return errors, warnings
     full = (root / path_part).resolve()
-    text, chunks, reason = _read_and_chunk(full, path_part)
+    text, chunks, reason, remedy = _read_and_chunk(full, path_part)
     if chunks is None:
         if text is None:
             errors.append(
@@ -767,7 +817,7 @@ def _store_to_code_check(
             )
         elif full not in warned_uncheckable:
             warned_uncheckable.add(full)
-            warnings.append(f"{full}: markers not checked ({reason})")
+            warnings.append(_uncheckable_message(str(full), reason, remedy))
         return errors, warnings
 
     match = next(
@@ -781,22 +831,43 @@ def _store_to_code_check(
         # genuinely dangling ref apart from an uncheckable file apart
         # from a real symbol chunk_file simply never emits its own chunk
         # for (a container type: class/struct/enum/... -- SCHEMA sec8.3).
-        verdict, fd_reason, _fd_remedy = fragment_declaration_status(
+        verdict, fd_reason, fd_remedy = fragment_declaration_status(
             symbol_part, text, rel_path=path_part
         )
         if verdict is False:
-            errors.append(
-                f"{tid}:{link_id}: {path_part}#{symbol_part}: decision ref is dangling -- "
-                f"{symbol_part!r} is not declared in {path_part}"
-            )
+            # Ruling 144 (TOP-0122 L4, task-a2-2-review.md): the chunker
+            # reporting no declaration is an ERROR only when the symbol's
+            # NAME is genuinely absent from the file text -- a
+            # word-boundary text search on the last dotted component,
+            # never a declaration proof of its own. When the name IS
+            # present (a Swift protocol requirement -- signature only, no
+            # body -- or a container the chunker layer does not emit its
+            # own chunk for), the declaration truly cannot be verified by
+            # this engine's parser layer, not disproven, so this is a
+            # WARNING and the marker check is skipped for this ref, the
+            # same way an uncheckable file already is.
+            name = symbol_part.rsplit(".", 1)[-1]
+            if re.search(r"\b" + re.escape(name) + r"\b", text):
+                key = (full, symbol_part)
+                if key not in warned_symbol_unverifiable:
+                    warned_symbol_unverifiable.add(key)
+                    warnings.append(
+                        f"{tid}:{link_id}: {path_part}#{symbol_part} cannot be verified "
+                        "by the chunker (name present, no declaration reported)"
+                    )
+            else:
+                errors.append(
+                    f"{tid}:{link_id}: {path_part}#{symbol_part}: decision ref is dangling -- "
+                    f"{symbol_part!r} is not declared in {path_part}"
+                )
         elif verdict is None:
             if full not in warned_uncheckable:
                 warned_uncheckable.add(full)
-                warnings.append(f"{full}: markers not checked ({fd_reason})")
+                warnings.append(_uncheckable_message(str(full), fd_reason, fd_remedy))
         else:
             key = (full, symbol_part)
-            if key not in warned_container:
-                warned_container.add(key)
+            if key not in warned_symbol_unverifiable:
+                warned_symbol_unverifiable.add(key)
                 warnings.append(
                     f"{full}: markers not checked ({symbol_part!r} is a container type; "
                     "the chunker reports no start line for it)"
@@ -821,15 +892,15 @@ def lint_markers(root: Path, code_roots: list[Path]) -> tuple[list[str], list[st
         return errors, warnings
     topics = _collect_topics(root)
     warned_uncheckable: set[Path] = set()
-    warned_container: set[tuple] = set()
+    warned_symbol_unverifiable: set[tuple] = set()
 
     # direction 1: marker -> store (errors)
     for full, _file_root, rel_path in _scan_set_for_markers(code_roots, topics):
-        text, chunks, reason = _read_and_chunk(full, rel_path)
+        text, chunks, reason, remedy = _read_and_chunk(full, rel_path)
         if chunks is None:
             if full not in warned_uncheckable:
                 warned_uncheckable.add(full)
-                warnings.append(f"{full}: markers not checked ({reason})")
+                warnings.append(_uncheckable_message(str(full), reason, remedy))
             continue
         lines = text.splitlines()
         for chunk in chunks:
@@ -857,7 +928,7 @@ def lint_markers(root: Path, code_roots: list[Path]) -> tuple[list[str], list[st
                     continue
                 errs, warns = _store_to_code_check(
                     tid, link_id, path_part, symbol_part, code_roots,
-                    warned_uncheckable, warned_container,
+                    warned_uncheckable, warned_symbol_unverifiable,
                 )
                 errors.extend(errs)
                 warnings.extend(warns)
@@ -1223,9 +1294,15 @@ ERROR:/WARNING: line per finding. Exit 1 if any error was found, 0 otherwise
                      project with several code roots -- a path found under
                      exactly one root is fine; found under none is an error
                      naming every root tried; found under more than one is an
-                     error (one reference must name one file). Omit it
-                     entirely and those checks are skipped; every other rule
-                     still runs.
+                     error (one reference must name one file). Also drives
+                     decision-marker verification: a `decision: TOP-xxxx Ln`
+                     comment under a code root must name an active
+                     CONSTRAINT/HOLD link whose topic's code_refs name that
+                     file (an error otherwise), and every such link with a
+                     path#symbol ref is checked for a marker at that symbol
+                     (a warning if none is found yet). Omit --code-root
+                     entirely and all of these checks are skipped; every
+                     other rule still runs.
   -h, --help         print this and exit
 
 Append-only history mode (a second, independent check -- given

@@ -172,6 +172,19 @@
   alone swings by roughly a quarter between runs) -- this collapse
   removes a full process start's worth of margin without loosening the
   bar itself.
+- Commit messages now name the decision they land under, and the prompt
+  hook nudges once when they do not. When a configured code root's HEAD
+  moves since the last prompt and the new commit names no decision id,
+  and the same call that already computes the coverage signal finds at
+  least one edited file under that root with no topic, one more fact
+  line is added to the same reminder and the nudge is logged, once per
+  commit -- a commit that already names a decision, or whose edits are
+  all covered, gets no line. State gains `last_seen_heads` (the per-prompt
+  baseline this compares against) and `nudged_commits` (bounded to the
+  last 20); both re-seed from the current HEADs on a session clear. The
+  nudge never reads the diff or the prompt, and shares the coverage
+  signal's own delivery, cooldown, and dedupe. `stats` counts it under
+  `nudges.commit_nudges`.
 
 ### Documentation
 - The README, `docs/DESIGN.md`, and `docs/INTERNALS.md` now say plainly

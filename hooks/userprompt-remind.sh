@@ -42,6 +42,17 @@
 # read a stale/zero last_inject_time and fire right through the cooldown
 # that's supposed to follow a look-back (dual-gate review finding 4).
 #
+# The commit nudge (TOP-0122 L1 rule 2a; docs/INTERNALS.md "The commit
+# nudge"): rides along inside a coverage-candidate turn only -- for each
+# configured code root whose HEAD differs from state's last_seen_heads
+# since the last prompt, reads that commit's own message (one `git log -1`,
+# never the diff, never the prompt) and, when it names no decision id and
+# this turn's own `unmapped` call already finds an edited file under that
+# root with no topic, folds one more fact line into the SAME
+# additionalContext block and logs `outcome=commit-nudge` once per commit
+# (state's `nudged_commits`). It never gets a second turn, a second
+# cooldown, or a second `unmapped` call of its own.
+#
 # This hook NEVER reads transcript_path, user_input, prompt, or
 # last_assistant_message from the payload (ruling B; the addendum extends
 # the not-read invariant to `prompt`, the alternate payload key Claude Code
@@ -492,13 +503,189 @@ print(d.get("reason_code", "") if isinstance(d, dict) else "")
 
     # Safe defaults in case the python call below prints nothing (interpreter
     # gone, unexpected crash) -- under `set -u` an unset CODE_CHANGED/
-    # STORE_CHANGED would otherwise abort the hook with no log line.
+    # STORE_CHANGED/MOVED_ROOTS would otherwise abort the hook with no log
+    # line.
     CODE_CHANGED="false"
     STORE_CHANGED="false"
+    MOVED_ROOTS=""
     eval "$(mc_head_changed "$STATE_FILE" "$CODE_HEADS" "$CUR_STORE_SHA" "${MEMCONTINUUM_CODE_ROOT:-}")"
 
+    # Commit nudge (TOP-0122 L1 rule 2a; ruling 140/144): MOVED_ROOTS (just
+    # computed, above) is a CHEAP GATE only -- a root whose HEAD differs
+    # from state's last_seen_heads[root] since the last prompt. When it is
+    # non-empty, do the real work in ONE locked transform: re-derive the
+    # authoritative comparison from a freshly-loaded state (never trust the
+    # gate's own unlocked read for the write), read each moved root's new
+    # commit message (subprocess, 2s timeout, failure -> skip that root
+    # silently -- no traceback, no advance), and decide the nudge from the
+    # SAME `unmapped` call already made above -- never a second `unmapped`
+    # call, never the diff, never the prompt. last_seen_heads always
+    # advances to the new HEAD for a root this turn actually read the
+    # message for, whether or not it ends up nudging; nudged_commits is
+    # bounded to the last 20. Nothing here runs when MOVED_ROOTS is empty --
+    # the overwhelmingly common turn (no root moved) costs zero extra spawns
+    # beyond mc_head_changed's own existing one.
+    NUDGE_FACT_TEXT=""
+    if [ -n "$MOVED_ROOTS" ]; then
+        CODE_PATHS_TEXT=""
+        if [ "${#CODE_PATHS[@]}" -gt 0 ]; then
+            CODE_PATHS_TEXT="$(printf '%s\n' "${CODE_PATHS[@]}")"
+        fi
+        NUDGE_TMP="$(mktemp 2>/dev/null)"
+        if [ -n "$NUDGE_TMP" ]; then
+            export MC_CODE_HEADS="$CODE_HEADS"
+            export MC_CODE_ROOTS_TEXT="$CODE_ROOTS_TEXT"
+            export MC_CODE_PATHS_TEXT="$CODE_PATHS_TEXT"
+            export MC_UNMAPPED_JSON="$UNMAPPED_JSON"
+            export MC_NUDGE_OUT="$NUDGE_TMP"
+            mc_update_state_json "$STATE_FILE" '
+import json, os, re, subprocess
+from pathlib import Path
+
+TOP_RE = re.compile(r"TOP-\d{4}")
+
+code_heads = {}
+for _line in (os.environ.get("MC_CODE_HEADS") or "").splitlines():
+    if _line and "\t" in _line:
+        _r, _h = _line.split("\t", 1)
+        code_heads[_r] = _h
+
+last_seen = state.get("last_seen_heads")
+if not isinstance(last_seen, dict):
+    last_seen = {}
+nudged = state.get("nudged_commits")
+if not isinstance(nudged, list):
+    nudged = []
+nudged_set = set(nudged)
+
+# (resolved_root, original_config_string) pairs -- resolving mirrors
+# memidx._code_roots_arg exactly (a code root is always matched resolved),
+# but the ORIGINAL string is what code_heads/last_seen_heads key by, so a
+# match reports that string back, never the resolved one.
+code_roots = []
+for _line in (os.environ.get("MC_CODE_ROOTS_TEXT") or "").splitlines():
+    _line = _line.strip()
+    if not _line:
+        continue
+    try:
+        code_roots.append((Path(_line).resolve(), _line))
+    except OSError:
+        continue
+
+code_paths = [p for p in (os.environ.get("MC_CODE_PATHS_TEXT") or "").splitlines() if p]
+
+try:
+    _unmapped_out = json.loads(os.environ.get("MC_UNMAPPED_JSON") or "{}")
+    if not isinstance(_unmapped_out, dict):
+        _unmapped_out = {}
+except Exception:
+    _unmapped_out = {}
+unmapped_set = set(_unmapped_out.get("unmapped") or [])
+
+
+def _best_root_key(raw_path):
+    try:
+        resolved = Path(raw_path).resolve()
+    except OSError:
+        return None, None
+    best_resolved = None
+    best_key = None
+    for _cr_resolved, _cr_key in code_roots:
+        try:
+            resolved.relative_to(_cr_resolved)
+        except ValueError:
+            continue
+        if best_resolved is None or len(str(_cr_resolved)) > len(str(best_resolved)):
+            best_resolved = _cr_resolved
+            best_key = _cr_key
+    if best_resolved is None:
+        return None, None
+    try:
+        return best_key, str(resolved.relative_to(best_resolved))
+    except ValueError:
+        return None, None
+
+
+nudge_out_lines = []
+for root, cur in code_heads.items():
+    if not cur:
+        continue
+    prev = last_seen.get(root)
+    if prev is None or cur == prev:
+        continue
+    # root genuinely moved since the last prompt (freshly re-derived here,
+    # under the lock -- never trusting the gate own unlocked read above).
+    try:
+        result = subprocess.run(
+            ["git", "-C", root, "log", "-1", "--format=%B"],
+            capture_output=True, text=True, timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        # git failed (root deleted, corrupt, timed out, ...) -- skip
+        # silently; last_seen_heads does not advance for this root this
+        # turn (self-healing: re-examined on the next prompt).
+        continue
+    if result.returncode != 0:
+        continue
+
+    message = result.stdout
+    last_seen[root] = cur
+
+    if TOP_RE.search(message):
+        continue
+    if cur in nudged_set:
+        continue
+
+    count = 0
+    for raw in code_paths:
+        _b, _rel = _best_root_key(raw)
+        if _b == root and _rel in unmapped_set:
+            count += 1
+    if count <= 0:
+        continue
+
+    short = cur[:7]
+    root_name = os.path.basename(os.path.normpath(root)) or root
+    fact = (
+        "Commit " + short + " under " + root_name + " names no decision; "
+        + str(count) + " of its edited file(s) have no topic — name "
+        "the decision (TOP-xxxx Ln) in the message, or write the record."
+    )
+    nudged.append(cur)
+    nudged_set.add(cur)
+    nudge_out_lines.append(short + "\t" + root + "\t" + fact)
+
+state["last_seen_heads"] = last_seen
+state["nudged_commits"] = nudged[-20:]
+
+try:
+    with open(os.environ["MC_NUDGE_OUT"], "w") as f:
+        for _l in nudge_out_lines:
+            f.write(_l + "\n")
+except OSError:
+    pass
+
+print(json.dumps(state))
+' >>"$MC_LOG" 2>&1
+
+            if [ -s "$NUDGE_TMP" ]; then
+                while IFS=$'\t' read -r NUDGE_SHA NUDGE_ROOT NUDGE_FACT; do
+                    [ -n "$NUDGE_SHA" ] || continue
+                    mc_log "userprompt outcome=commit-nudge sha=$NUDGE_SHA root=$NUDGE_ROOT session=${SESSION_ID:-}"
+                    if [ -n "$NUDGE_FACT_TEXT" ]; then
+                        NUDGE_FACT_TEXT="$NUDGE_FACT_TEXT
+$NUDGE_FACT"
+                    else
+                        NUDGE_FACT_TEXT="$NUDGE_FACT"
+                    fi
+                done <"$NUDGE_TMP"
+            fi
+            rm -f "$NUDGE_TMP" 2>/dev/null
+        fi
+    fi
+
     OUTPUT_JSON="$(UNMAPPED_JSON="$UNMAPPED_JSON" CODE_CHANGED="$CODE_CHANGED" STORE_CHANGED="$STORE_CHANGED" \
-        MEMCONTINUUM_ROOT="${MEMCONTINUUM_ROOT:-}" \
+        MEMCONTINUUM_ROOT="${MEMCONTINUUM_ROOT:-}" MC_NUDGE_FACT_TEXT="$NUDGE_FACT_TEXT" \
         env PYTHONPATH= "$MC_PY" -c '
 import json, os
 
@@ -513,6 +700,10 @@ unmapped = unmapped_out.get("unmapped") or []
 coverage_status = unmapped_out.get("coverage_status", "unknown")
 code_changed = os.environ.get("CODE_CHANGED") == "true"
 store_changed = os.environ.get("STORE_CHANGED") == "true"
+# The commit nudge (TOP-0122 L1 rule 2a): computed just above, off the SAME
+# unmapped call this fact_line already reads -- shares this same turn
+# delivery/cooldown/dedupe rather than any nudge logic of its own.
+nudge_lines = [l for l in (os.environ.get("MC_NUDGE_FACT_TEXT") or "").splitlines() if l]
 
 
 def yn(v):
@@ -539,7 +730,7 @@ else:
     )
     has_evidence = (n > 0) or code_changed or store_changed
 
-if not has_evidence:
+if not has_evidence and not nudge_lines:
     raise SystemExit(3)
 
 store_root = os.environ.get("MEMCONTINUUM_ROOT") or "<store root not configured>"
@@ -550,7 +741,10 @@ question = (
     "incidents/ (see docs/SCHEMA.md); NOT Claude Code auto-memory. If none, "
     "say so once."
 )
-ctx = fact_line + "\n\n" + question
+ctx = fact_line
+for _nl in nudge_lines:
+    ctx += "\n" + _nl
+ctx += "\n\n" + question
 print(json.dumps({
     "hookSpecificOutput": {
         "hookEventName": "UserPromptSubmit",
