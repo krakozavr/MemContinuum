@@ -146,7 +146,7 @@ HEAD across prompts. `clear` re-seeds both from the current HEADs, the same
 way it re-seeds `start_code_shas` — nothing here survives a clear. On a
 candidate turn, for every configured root whose HEAD differs from
 `last_seen_heads[root]`, the hook reads the new commit's subject and body
-(one `git log -1`, no timeout of its own beyond the hook's own outer
+(one `git log -1`, a 2s timeout of its own, tighter than the hook's outer
 watchdog) and, when the message names no decision id and the SAME
 `unmapped` call this turn's coverage signal already made finds at least
 one edited file under that root with no topic, adds one fact line to the

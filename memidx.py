@@ -4241,6 +4241,52 @@ def _unmapped_path_candidates(raw_path: str, code_roots: list[Path]) -> list[str
     return candidates
 
 
+def _unmapped_ref_hit(
+    matcher, conn, project: str, candidates: list[str], own_root: Path | None,
+    code_roots: list[Path],
+) -> bool:
+    """LOW-1 (a2-3 review, carried into A3): `matcher` is `topic_matches_
+    for_path` or `concept_matches_for_path`, both of which match a bare
+    relative string project-wide -- a code_ref carries no root of its own,
+    so when two configured --code-root's each have their OWN unrelated
+    file at the identical relative path, a match found via that string
+    cannot, by itself, tell which root it was written for. The absolute
+    candidate (candidates[0], always the raw path as given) is trusted
+    unconditionally -- it names an exact file, nothing to disambiguate.
+    The relative candidate (candidates[1], when present) is refused ONLY
+    when the match is provably about a DIFFERENT, more specific,
+    ALSO-configured root's own file at that identical relative path:
+    ruling 131 (TOP-0123 L10) resolves a nested-root ambiguity to the
+    longest (most specific) containing root, so a relative string that
+    ALSO resolves to a real file under a root strictly inside this one is
+    attributed to that inner root, not this outer one -- this file's own
+    match does not count. Sibling (non-nested) roots that happen to share
+    a relative path stay UNDECIDABLE with today's schema (a code_ref
+    carries no root tag) -- design ruling F ("never a false gap") forbids
+    guessing there, so the match is trusted exactly as it was before this
+    function existed."""
+    if matcher(conn, project, candidates[0]):
+        return True
+    if len(candidates) < 2:
+        return False
+    rel = candidates[1]
+    if not matcher(conn, project, rel):
+        return False
+    if own_root is None or len(code_roots) < 2:
+        return True
+    existing_roots = [cr for cr in code_roots if (cr / rel).exists()]
+    if not existing_roots:
+        return True
+    attributed_root = max(existing_roots, key=lambda r: len(str(r)))
+    if attributed_root == own_root:
+        return True
+    try:
+        attributed_root.relative_to(own_root)
+    except ValueError:
+        return True  # not nested inside own_root -- sibling ambiguity, unchanged
+    return False  # attributed_root sits strictly inside own_root -- refuse
+
+
 def _unmapped_display_path(raw_path: str, code_roots: list[Path]) -> str:
     """The path string reported back for one PATH argument: relative to
     the LONGEST matching --code-root when resolvable, else the path
@@ -4359,11 +4405,23 @@ def cmd_unmapped(args) -> int:
                     for raw_path in args.paths:
                         candidates = _unmapped_path_candidates(raw_path, code_roots)
                         display = _unmapped_display_path(raw_path, code_roots)
-                        topic_hit = any(topic_matches_for_path(conn, args.project, c) for c in candidates)
+                        own_root = None
+                        if code_roots:
+                            try:
+                                p = Path(raw_path)
+                                if p.is_absolute():
+                                    own_root = _unmapped_best_root(p.resolve(), code_roots)
+                            except (OSError, ValueError):
+                                pass
+                        topic_hit = _unmapped_ref_hit(
+                            topic_matches_for_path, conn, args.project, candidates,
+                            own_root, code_roots,
+                        )
                         concept_hit = False
                         if not topic_hit:
-                            concept_hit = any(
-                                concept_matches_for_path(conn, args.project, c) for c in candidates
+                            concept_hit = _unmapped_ref_hit(
+                                concept_matches_for_path, conn, args.project, candidates,
+                                own_root, code_roots,
                             )
                         if topic_hit:
                             mapped_topic.append(display)

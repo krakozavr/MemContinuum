@@ -275,8 +275,13 @@ marked file with the matching `path#symbol` (a prefix or glob that merely happen
 same FILE does not count — that is the error `path#symbol` exists to prevent) — else an error
 naming the file, line, and reason. Store → code: every active CONSTRAINT/HOLD link whose topic
 has a `path#symbol` ref must find the marker at that symbol — else a warning (existing stores
-carry none yet); a `path#symbol` the chunker proves absent (the ref itself is dangling) is an
-error instead, not merely a missing marker.
+carry none yet). A symbol the chunker reports no declaration for splits into two cases: the
+symbol's own NAME genuinely absent from the file's text is a dangling ref, an error instead of a
+missing-marker warning; the name IS present but the chunker simply
+never emits a chunk for it (a Swift protocol requirement — signature only, no body — or a
+container type the chunker layer does not report a declaration line for) is a warning that the
+symbol cannot be verified by the chunker, and the marker check is skipped for it rather than
+either erroring or asserting a false absence.
 
 ### 8.4 Concept records (`type: concept`) — the code graph's authored layer
 

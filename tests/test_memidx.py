@@ -1489,6 +1489,93 @@ class TestUnmappedMultipleCodeRoots(unittest.TestCase):
             self.assertEqual(out2["mapped_topic"], ["src/b.py"], out2)
             self.assertEqual(out2["roots"], [str(root_b.resolve())])
 
+    def test_classification_is_root_aware_for_a_relative_path_two_nested_roots_share(self):
+        # LOW-1 (a2-3 review, carried into A3): a bare relative-path
+        # code_ref carries no root of its own -- topic_matches_for_path
+        # matches it project-wide. When TWO roots are configured and BOTH
+        # happen to have a file at the identical relative path, the
+        # classification must not let the wrong one borrow the other's
+        # coverage. Ruling 131 (TOP-0123 L10): an ambiguous relative
+        # string resolves to the LONGEST (most specific) containing root
+        # -- here, outer O and inner I = O/subdir/inner, both configured,
+        # both carrying their OWN unrelated "src/x.py". The topic's
+        # code_ref names only "src/x.py", meant for I's file; O's own
+        # "src/x.py" is genuinely undocumented and must not borrow it.
+        with tempfile.TemporaryDirectory() as td:
+            outer = Path(td) / "outer"; outer.mkdir()
+            inner = outer / "subdir" / "inner"; inner.mkdir(parents=True)
+            (outer / "src").mkdir()
+            (outer / "src" / "x.py").write_text("# outer's own, undocumented\n")
+            (inner / "src").mkdir()
+            (inner / "src" / "x.py").write_text("# inner's own, documented\n")
+
+            store = Path(td) / "store"
+            (store / "topics").mkdir(parents=True)
+            (store / "topics" / "t.md").write_text(
+                "---\nid: TOP-2\ntitle: T\nstatus: active\ncode_refs:\n"
+                "  - src/x.py\n---\n\nBody.\n"
+            )
+            db = Path(td) / "idx.sqlite"
+            reindex(store, db, no_embed=True)
+
+            outer_x = str((outer / "src" / "x.py").resolve())
+            inner_x = str((inner / "src" / "x.py").resolve())
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = memidx.cmd_unmapped(ns(
+                    project=memidx.DEFAULT_PROJECT, db=str(db), root=str(store),
+                    code_root=[str(outer), str(inner)], json=True,
+                    paths=[outer_x, inner_x],
+                ))
+            out = json.loads(buf.getvalue())
+            self.assertEqual(rc, 0, out)
+            self.assertEqual(out["unmapped"], ["src/x.py"],
+                              "outer's own, undocumented src/x.py must not borrow "
+                              "inner's coverage just because the relative string matches")
+            self.assertEqual(out["mapped_topic"], ["src/x.py"],
+                              "inner's src/x.py, the one the topic actually names, "
+                              "must still be classified as covered")
+
+    def test_sibling_roots_sharing_a_relative_path_keep_todays_behavior(self):
+        # The companion case to the one above: A and B are SIBLINGS (neither
+        # contains the other) -- the schema carries no root tag on a
+        # code_ref, so which of the two the topic meant is genuinely
+        # undecidable with today's data. Design ruling F ("never a false
+        # gap") forbids guessing here: both stay mapped, exactly as before
+        # this fix, a documented limitation rather than a silent regression.
+        with tempfile.TemporaryDirectory() as td:
+            root_a = Path(td) / "root-a"; root_a.mkdir()
+            root_b = Path(td) / "root-b"; root_b.mkdir()
+            (root_a / "src").mkdir()
+            (root_a / "src" / "dup.py").write_text("# root-a's own, undocumented\n")
+            (root_b / "src").mkdir()
+            (root_b / "src" / "dup.py").write_text("# root-b's own, documented\n")
+
+            store = Path(td) / "store"
+            (store / "topics").mkdir(parents=True)
+            (store / "topics" / "t.md").write_text(
+                "---\nid: TOP-3\ntitle: T\nstatus: active\ncode_refs:\n"
+                "  - src/dup.py\n---\n\nBody.\n"
+            )
+            db = Path(td) / "idx.sqlite"
+            reindex(store, db, no_embed=True)
+
+            path_a = str((root_a / "src" / "dup.py").resolve())
+            path_b = str((root_b / "src" / "dup.py").resolve())
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = memidx.cmd_unmapped(ns(
+                    project=memidx.DEFAULT_PROJECT, db=str(db), root=str(store),
+                    code_root=[str(root_a), str(root_b)], json=True,
+                    paths=[path_a, path_b],
+                ))
+            out = json.loads(buf.getvalue())
+            self.assertEqual(rc, 0, out)
+            self.assertEqual(out["unmapped"], [], out)
+            self.assertCountEqual(out["mapped_topic"], ["src/dup.py", "src/dup.py"], out)
+
 
 class TestF2EmbeddingMode(unittest.TestCase):
     """F2 (coordinator ruling 69): embed_sha provenance, the freshness join
