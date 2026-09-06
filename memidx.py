@@ -274,7 +274,21 @@ def _records_fresh_vector_counts(conn: "sqlite3.Connection", project: str) -> tu
 # (generation 3's still-unwired promise) and builds every topic's link
 # rows for the first time, without forcing a needless re-embed of an
 # unchanged topic's own vector (see cmd_reindex's own comments).
-CURRENT_INDEX_GENERATION = 4
+# Bumped to 5 (Codex 4, fix wave 1 G3): inbox/ classification (infer_type
+# returning "inbox" unconditionally for anything under inbox/, wired
+# alongside this same fix wave's search-inbox-downrank/Codex-3 fix) has no
+# effect on a row an OLDER index already parsed with its old type -- a
+# db reindexed at generation 4 with an unchanged sha would otherwise keep
+# reporting a pre-existing inbox/ file under its stale (pre-inbox-
+# classification) type forever, and default search's inbox exclusion
+# (keyed on records.type='inbox' / a link row's source_path) would never
+# see it. The same migration probe below forces one full content pass on
+# any generation-4-or-older db, which re-parses every record's frontmatter
+# (including re-running infer_type) even when its sha is unchanged --
+# without forcing a needless re-embed (a migration-only pass never queues
+# an unchanged vector; see the migration-probe comment just below and
+# cmd_reindex's own no_embed guard).
+CURRENT_INDEX_GENERATION = 5
 
 # ---------------------------------------------------------------------------
 # frontmatter parsing (shared by memidx and memlint)
@@ -2498,13 +2512,20 @@ def fts_ranked(conn, query: str, project: str, filter_clause: str = "", filter_p
     result), without ever discarding a real match before collapse sees
     it."""
     q = fts_escape(query)
-    where = "fts MATCH ? AND records.project=?"
+    # Codex 3 (fix wave 1 G3): `records` is now aliased `r` here, matching
+    # vector_ranked's own alias below -- the inbox-exclusion clause
+    # cmd_search builds needs to name the OUTER row's `source_path`
+    # unambiguously from inside its own correlated subquery (which touches
+    # `records` again, under a different alias, to look up the parent's
+    # type); a shared, fixed outer alias lets that clause be written once,
+    # correctly, in both query shapes, rather than parametrized per caller.
+    where = "fts MATCH ? AND r.project=?"
     params: list = [q, project]
     if filter_clause:
         where += f" AND {filter_clause}"
         params.extend(filter_params or [])
     cur = conn.execute(
-        f"SELECT fts.path AS path FROM fts JOIN records ON records.path=fts.path "
+        f"SELECT fts.path AS path FROM fts JOIN records r ON r.path=fts.path "
         f"WHERE {where} ORDER BY bm25(fts)",
         params,
     )
@@ -2768,7 +2789,7 @@ def _search_hits(conn, args, extra_where: str, extra_params: list) -> tuple[list
     return results, contributing, embed_info
 
 
-def _resolve_search_status(status: list[str]) -> list[str]:
+def _resolve_search_status(status: list[str]) -> tuple[list[str], bool]:
     """search-default-active: no `--status` given at all (an empty list --
     argparse's own `default=[]`, and every direct-Namespace caller that
     passes `status=[]` the same way) defaults to `["active"]`, matching
@@ -2777,12 +2798,28 @@ def _resolve_search_status(status: list[str]) -> list[str]:
     to every status (dropping the status clause from the query entirely,
     same as the pre-existing empty-list behavior); any OTHER explicit
     value (or combination) passes through completely unchanged -- this
-    only touches the CASE that used to mean "no status given"."""
+    only touches the CASE that used to mean "no status given".
+
+    whole-branch-review MODERATE-3/4 (ruling 148): the second return value,
+    `is_default`, is True only for the true no-flag-given case. A record
+    that is never topic-shaped (no `links:`, so build_record's own
+    `status = fm.get("status")` branch runs) and carries no explicit
+    `status:` field of its own -- a `sources/` record, the store README, an
+    inbox drop with no frontmatter at all -- has a NULL status column, not
+    `"active"`. The plain `status IN ('active')` clause this used to
+    resolve to therefore excluded every one of those from EVERY default
+    search, a silent regression search-default-active introduced (a
+    `sources/` record findable on 751782c became unfindable by any
+    default-status search at all, not merely down-ranked). The caller uses
+    `is_default` to OR in `status IS NULL` only for this true-default case
+    -- an EXPLICIT `--status active` is a deliberate, narrower request and
+    must keep meaning exactly that, never silently widened to also include
+    status-less records the caller did not ask for."""
     if not status:
-        return ["active"]
+        return ["active"], True
     if "any" in status:
-        return []
-    return status
+        return [], False
+    return status, False
 
 
 def cmd_search(args) -> int:
@@ -2812,19 +2849,75 @@ def cmd_search(args) -> int:
     # meaning "no status given" as "no filter"); only `search`'s own
     # resolution of args.status is touched, via a shallow copy so the
     # caller's own Namespace/args object is never mutated.
+    #
+    # whole-branch-review MODERATE-3/4 (ruling 148): build_filter_clause's
+    # own `status IN (...)` clause is left for every OTHER case (an
+    # explicit --status, or --status any's empty list), but the true
+    # default (`is_default`) never reaches build_filter_clause with
+    # `status` set at all -- its own status clause is built here instead,
+    # OR-ing in `status IS NULL` (a record that was never topic-shaped and
+    # carries no explicit `status:` of its own -- sources/, README, a
+    # frontmatter-less inbox drop) alongside `status='active'`, so a
+    # `sources/` record findable before search-default-active existed
+    # stays findable by a plain default `search`, not only by `--status any`.
+    resolved_status, status_is_default = _resolve_search_status(getattr(args, "status", None) or [])
     effective_args = copy.copy(args)
-    effective_args.status = _resolve_search_status(getattr(args, "status", None) or [])
+    effective_args.status = [] if status_is_default else resolved_status
     extra_where, extra_params = build_filter_clause(effective_args, include_project=False)
+    if status_is_default:
+        placeholders = ",".join("?" * len(resolved_status))
+        status_clause = f"(status IN ({placeholders}) OR status IS NULL)"
+        extra_where = f"({extra_where}) AND {status_clause}" if extra_where else status_clause
+        extra_params = extra_params + resolved_status
 
     # search-inbox-downrank: inbox/ records (indexed as type: inbox --
     # infer_type) are excluded from search by default -- a freeform consult
     # drop, not a ruling. --include-inbox widens back; an explicit
     # `--type inbox` also counts as asking for them (otherwise it would
     # silently AND itself into an empty result against the exclusion below).
+    #
+    # Codex 3 (MAJOR): the old clause was `type != 'inbox'`, which only
+    # ever matches a row's OWN type column -- a link derived from an inbox
+    # topic gets its own `records` row (F5, one searchable row per link),
+    # but that row's `type` is the literal string "link" (build_record's
+    # per-link INSERT hardcodes it), never "inbox", regardless of its
+    # parent topic's classification. A fresh inbox/draft.md with an active
+    # owner-verbatim link used to appear in default search through that
+    # link row alone, even though the topic row itself was correctly
+    # excluded. The fix keys off `source_path` instead -- the column every
+    # row (topic or link) already carries naming its real underlying file
+    # (self for a topic/concept/standalone row, the parent topic's path
+    # for a link row, per build_record) -- so excluding every row whose
+    # source_path names an inbox-classified path catches the topic row AND
+    # every one of its derived link rows through the same test.
+    #
+    # A correlated `NOT EXISTS` subquery, not a concrete `NOT IN (paths...)`
+    # list bound as individual parameters: SQLite's default
+    # SQLITE_MAX_VARIABLE_NUMBER is 999 on many still-current builds (32766
+    # only from 3.32.0 on) -- a store with a few hundred inbox/ drops
+    # accumulated over time would blow past that as a flat parameter list.
+    # `r.source_path` names the OUTER query's own records row explicitly --
+    # fts_ranked's query aliases its own records table `r` (matching
+    # vector_ranked's own alias) for exactly this, so a bare `source_path`
+    # inside the subquery below can never bind to the SUBQUERY's own
+    # `records __inbox` instead (both tables share that column name; an
+    # unqualified reference inside a correlated subquery resolves to the
+    # innermost matching table first, which would silently turn this into
+    # a query-independent "does any inbox row's own source_path equal its
+    # own path" check, true the instant a single inbox file exists at all,
+    # rather than one that means anything about the specific outer row).
+    # `r.source_path IS NULL` (a pre-F5 legacy row not yet migrated -- see
+    # reindex's own identical NULL-aware predicate above) is never treated
+    # as inbox; it will get a real source_path the next full pass touches it.
     include_inbox = bool(getattr(args, "include_inbox", False)) or "inbox" in (args.type or [])
     if not include_inbox:
-        inbox_clause = "type != 'inbox'"
+        inbox_clause = (
+            "(r.source_path IS NULL OR NOT EXISTS ("
+            "SELECT 1 FROM records __inbox WHERE __inbox.project=? "
+            "AND __inbox.type='inbox' AND __inbox.path = r.source_path))"
+        )
         extra_where = f"({extra_where}) AND {inbox_clause}" if extra_where else inbox_clause
+        extra_params = extra_params + [args.project]
     results, contributing, embed_info = _search_hits(conn, args, extra_where, extra_params)
     embed_state = embed_info.get("state")
     if embed_state == "unavailable":

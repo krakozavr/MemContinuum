@@ -95,12 +95,29 @@
   ref must find the marker at that symbol, else a warning (existing stores
   carry none yet) -- a `path#symbol` the chunker proves absent is an error
   instead (the ref itself is dangling), not merely a missing marker.
+- `search` now defaults to `status: active` when no `--status` is given at
+  all -- matching every other reader's assumption that "the decision"
+  means the current one -- and drops any other status (`superseded`,
+  `historical`, `declined`, `provisional`) from an unfiltered search;
+  `--status any` widens back to every status, and any other explicit
+  `--status` value is unchanged. A record that carries no status of its
+  own at all (never topic-shaped -- no `links:` -- and no explicit
+  `status:` field: a `sources/` record, the store README, a frontmatter-
+  less `inbox/` drop) stays findable by this default too -- the default
+  filter is `status: active` OR no status at all, never narrowed to
+  exclude a record that was never a ruling to begin with.
 - A record under `inbox/` (a reviewer's freeform consult drop, not yet
   promoted) now indexes as `type: inbox` unconditionally -- even one that
   carries its own conflicting frontmatter `type:` -- and `search` excludes
-  it from results by default; `--include-inbox` (or an explicit
-  `--type inbox`) widens back. `check`/`reindex` counts, and
-  `chain`/`for-path`/`why`, are unaffected.
+  it from results by default, a topic's own derived link rows included (a
+  proposed topic's link, itself its own searchable row, is excluded
+  through its parent's inbox classification, not just the topic row
+  itself); `--include-inbox` (or an explicit `--type inbox`) widens back,
+  and works at the default status (above) with no second flag needed.
+  `check`/`reindex` counts, and `chain`/`for-path`/`why`, are unaffected.
+  Reindexing an existing index picks up this classification automatically
+  on its next run (a bumped index generation forces one full content pass,
+  even for an unchanged file).
 
 ### Code index
 - The code index's freshness check now compares five stat signals per file
