@@ -147,6 +147,8 @@ copied inline.
 `memlint.py` enforces:
 
 - `owner-verbatim` or `owner-ratified` without `ruling.text` and `source` → error
+- an `owner-verbatim` `ruling.text` ending in `?` (after trimming quotes/whitespace) → error, a
+  question is not a ruling (`owner-ratified` is the orchestrator's own paraphrase, not covered)
 - `status: superseded` without `superseded_by` → error
 - `reverses:` without `reason_for_change` → error
 - `current` not equal to the newest link with `status: active` → error (names the correct value)

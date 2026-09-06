@@ -84,6 +84,45 @@ class TestMemlintViolations(unittest.TestCase):
         self.assertEqual(errors, [], errors)
         self.assertTrue(any("code_refs" in w for w in warnings), warnings)
 
+    def test_owner_verbatim_question_mark_is_error(self):
+        # lint-question-mark-verbatim: an owner-verbatim ruling whose text
+        # ends with "?" is a question, not a ruling -- schema-usage
+        # laundering (a question dressed up as a citable owner ruling).
+        errors, _warnings = lint_single_file("bad_owner_verbatim_question.md")
+        self.assertTrue(
+            any("owner-verbatim" in e and "question" in e for e in errors), errors
+        )
+
+    def test_owner_verbatim_question_mark_trims_quotes_and_whitespace_first(self):
+        # The text ends "...instead?\" " (a trailing quote-then-space
+        # artifact) in the raw YAML value -- the check must trim that
+        # before deciding the text ends with "?", not require the
+        # question mark to be the literal last character.
+        errors, _warnings = lint_single_file("bad_owner_verbatim_question_trailing_quote.md")
+        self.assertTrue(
+            any("owner-verbatim" in e and "question" in e for e in errors), errors
+        )
+
+    def test_owner_ratified_question_mark_is_not_flagged(self):
+        # The rule is owner-verbatim ONLY -- owner-ratified is the
+        # orchestrator's own paraphrase of what the owner affirmed (SCHEMA
+        # section 5), never a literal transcript of the owner's own words,
+        # so a question mark in it is not the same laundering risk.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "topics").mkdir()
+            (root / "topics" / "t.md").write_text(
+                "---\ntype: topic\nid: TOP-9008\ntitle: Ratified question mark\n"
+                "current: L1\nlinks:\n  - link: L1\n    date: 2026-08-29\n"
+                "    status: active\n    kind: adopted\n    ruling:\n"
+                "      text: \"is this the right call?\"\n"
+                "      authority: owner-ratified\n"
+                "      source: \"owner message 2026-08-29\"\n"
+                "    recorded_by: agent\n    recorded_at: 2026-08-29\n---\n\nBody.\n"
+            )
+            errors, _warnings = memlint.lint_root(root)
+        self.assertFalse(any("question" in e for e in errors), errors)
+
 
 class TestMemlintClean(unittest.TestCase):
     def test_clean_fixtures_pass(self):

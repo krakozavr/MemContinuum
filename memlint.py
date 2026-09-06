@@ -125,6 +125,24 @@ def lint_topic(path: Path, fm: dict) -> tuple[list[str], list[str]]:
                     f"(owner-verbatim/owner-ratified rulings must carry ruling.text and ruling.source)"
                 )
 
+        # lint-question-mark-verbatim: owner-verbatim is a literal
+        # transcript of the owner's own words (SCHEMA section 3/5) -- a
+        # question is not a ruling, whoever asked it, so a
+        # question-mark-terminated owner-verbatim text is schema-usage
+        # laundering, not a citable decision. owner-ratified is the
+        # orchestrator's own paraphrase of what the owner affirmed, never a
+        # literal transcript, so it is not covered by this rule. Trim
+        # trailing quote characters and whitespace first (a copy-paste
+        # artifact can leave a stray quote or space after the real "?");
+        # skip when text is falsy -- the missing-field error above already
+        # covers that case.
+        if auth == "owner-verbatim":
+            text = ruling.get("text")
+            if text and str(text).strip(" \t\r\n\"'").endswith("?"):
+                errors.append(
+                    f"{prefix}: owner-verbatim text is a question, not a ruling"
+                )
+
         if status == "superseded" and not link.get("superseded_by"):
             errors.append(f"{prefix}: status: superseded but no superseded_by")
 
