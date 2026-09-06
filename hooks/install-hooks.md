@@ -181,8 +181,9 @@ full contract, including the crash/retry behavior.
 ### 3b. `pre-commit-append-only.sh` — the store's `pre-commit`
 
 Enforces the append-only invariant docs/SCHEMA.md section 7 describes —
-editing, removing, or renaming an already-recorded link is refused; a
-changed mind is always a new link.
+editing a recorded link's body, or removing or renaming it, is refused (its
+three lifecycle fields — status, superseded_by, promoted_by — may each move
+forward once); a changed mind is always a new link.
 
 `scripts/repo-init.sh` writes this wrapper as `<store>/.git/hooks/pre-commit`,
 same shape as `post-commit` above (same three exports, `exec`s the canonical

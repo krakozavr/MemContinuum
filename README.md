@@ -39,7 +39,10 @@ finding, or something derived from code and tests. A changed mind is a new entry
 in the chain, never an edit to the old one, so "we tried X, it did not work
 because Y, so we do Z instead" stays intact and citable. The linter enforces this
 invariant on every commit: the store's own git hook refuses to commit an edit to
-a link already recorded, and the same check can run again in CI for a
+a recorded link's body (its three lifecycle fields — status, the link it was
+superseded by, the link that promoted it — may each move forward once, since
+closing a link or promoting it is bookkeeping, not a change of mind), and the
+same check can run again in CI for a
 guarantee `git commit --no-verify` cannot bypass locally.
 
 Retrieval is **automatic** for edits made with the Edit and Write tools, not
@@ -380,8 +383,9 @@ memlint.py STORE --code-root DIR                                                
 
 `--project NAME` is not optional in practice: leave it out and everything goes
 to a shared `default` namespace and its `default.sqlite`, mixing projects into
-one index. `search` defaults to `--status active` on its own — no flag needed
-for the common case; `--status any` widens to superseded, declined,
+one index. `search` defaults to `active` records — plus anything that never
+carries a `status` of its own at all (a `sources/` file, an `inbox/` drop) —
+with no flag needed for the common case; `--status any` widens to superseded, declined,
 provisional and historical rulings too, and plain (non-`--json`) output does
 not show each hit's status, so a stray one there reads as current. `drift` is the one
 that reads rulings written with a checkable shape ("all deletes go through the

@@ -93,8 +93,13 @@
   exact `path#symbol` entry counts), else an error naming the file and
   line; every active CONSTRAINT/HOLD link whose topic carries a `path#symbol`
   ref must find the marker at that symbol, else a warning (existing stores
-  carry none yet) -- a `path#symbol` the chunker proves absent is an error
-  instead (the ref itself is dangling), not merely a missing marker.
+  carry none yet) -- a `path#symbol` whose symbol NAME is genuinely absent
+  from the file's text is an error instead (the ref itself is dangling), not
+  merely a missing marker. When the name IS present but the chunker reports
+  no declaration for it (a container type, or a language whose chunker
+  cannot verify a declaration it can still see named), that stays a warning,
+  same as an ordinary missing marker, rather than escalating to an error the
+  chunker itself cannot actually support.
 - `search` now defaults to `status: active` when no `--status` is given at
   all -- matching every other reader's assumption that "the decision"
   means the current one -- and drops any other status (`superseded`,

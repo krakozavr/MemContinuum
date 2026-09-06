@@ -45,7 +45,7 @@ wired one level up, into `~/.claude/settings.json`, by `memcontinuum-setup.sh`.
 | `userprompt-remind.sh` | `UserPromptSubmit` | never reads the prompt text or diff; fires the coverage, commit, or look-back nudge |
 | `sessionend-stamp.sh` | `SessionEnd` | stamps session end into state |
 | `post-commit-reindex.sh` | store's git `post-commit` | a bounded content-only reindex after every commit; spawns a background embed-worker when vectors are left behind |
-| `pre-commit-append-only.sh` | store's git `pre-commit` | runs `memlint.py --against-ref HEAD --staged`; BLOCKS the commit on an append-only violation (an edited, removed, deleted, or renamed link); fails open (lets the commit through) on an unborn HEAD, a missing python, its own cwd not being the store, or any engine failure |
+| `pre-commit-append-only.sh` | store's git `pre-commit` | runs `memlint.py --against-ref HEAD --staged`; BLOCKS the commit on an append-only violation (a recorded link's body edited, or a link removed, deleted, or renamed — its three lifecycle fields may each move forward once); fails open (lets the commit through) on an unborn HEAD, a missing python, its own cwd not being the store, or any engine failure |
 | `memcontinuum-detect.sh` | `SessionStart`, user level | classifies an un-initialized repo and asks once; no python, no watchdog, no logging by default |
 
 **Fail-open is the contract, not a fallback — with one deliberate exception.**
@@ -57,10 +57,16 @@ tool, and the first thing anyone does with a tool that blocks edits is remove
 it. Failing open also names its reason: a degraded answer carries
 `reason_code`, `exception_type` and a safe message; the traceback goes to
 `memidx-debug.log`; `--debug` re-raises. `pre-commit-append-only.sh` is the one
-exception, and only for the one failure mode it exists to catch: an edit to an
-already-recorded link. The asymmetry inverts there — a rewritten link is
-unrecoverable history the moment it is committed, while a refused commit costs
-one message and a `git commit --no-verify` away. Every OTHER way this hook can
+exception, and only for the one failure mode it exists to catch: an edit to a
+recorded link's body (its three lifecycle fields are exempt — see the
+append-only table below). The asymmetry inverts there — the guard exists to
+stop a rewrite from ever becoming this store's own committed history in the
+first place; once one gets through, the superseded content is still sitting
+in git's own history (an earlier commit, recoverable the same way any commit
+is), but nothing else guarantees a later reader ever compares against that
+earlier commit rather than trusting the rewritten one as current. A refused
+commit, by contrast, costs one message and a `git commit --no-verify` away.
+Every OTHER way this hook can
 fail (no python, an unborn HEAD, memlint erroring out, its own cwd not being
 the store) still fails open exactly
 like every other hook.
@@ -1779,8 +1785,7 @@ scan never opens a file nothing references, even to check whether it is binary.
 |---|---|
 | a marker names a topic id or link id that does not exist | error |
 | a marker names a link that is not `active`, or whose tier (§4) is CONTEXT, not CONSTRAINT/HOLD | error |
-| a marker's topic has no `path#symbol` code_refs entry naming this exact file and symbol (a prefix or glob that merely matches the FILE does not count) | error |
-| a marker's topic names a `path#symbol` that matches no chunk anywhere in the file, and no chunk sits under the marker either | error (the ref itself is dangling) |
+| a marker's topic has no `path#symbol` code_refs entry naming this exact file and symbol — either no entry names this file at all (a prefix or glob that merely matches the FILE does not count), or one does but names a DIFFERENT symbol at it | error, naming the symbol the code_refs entry actually names when there is one |
 | a marker's topic names a `path#symbol` that matches no chunk anywhere in the file, but the chunker confirms the symbol IS declared (a container — class/struct/enum/… — chunk_file never gives one its own chunk) | silent on this side (never misattributed to a nearby member); direction 2's own "container type" row below still warns |
 | an active CONSTRAINT/HOLD link's `path#symbol` ref finds no marker at that symbol | warning |
 | an active CONSTRAINT/HOLD link's `path#symbol` ref names a symbol the chunker proves absent | error (the ref itself is dangling) |
