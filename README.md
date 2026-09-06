@@ -48,8 +48,10 @@ running too long means the hook stays silent (or, on a timeout specifically,
 says outright that retrieval timed out rather than staying silent) — never
 that your edit is blocked. A file changed from the shell instead — a script,
 `sed`, `git apply`, anything run as a Bash command — gets no lookup before the
-change; MemContinuum only learns about it afterwards, from a tree diff, and
-records it in the edit ledger rather than handing anything back beforehand.
+change and no requirement to declare what it touched: MemContinuum's best
+effort is to notice it afterwards, from a tree diff, and record it in the
+edit ledger, never to block the change over it — though one committed away
+in the same breath, or made under a path git ignores, is not seen at all.
 That lookup runs under a
 2-second watchdog deadline — a real lookup measures in the low tenths of a
 second, comfortably under it; a stale-but-present index is not one of the
@@ -339,8 +341,9 @@ most a one-line pointer to a store record. Never both; never copy content across
 the two.
 
 **The commands a person actually types.** The store's own `README.md` lists
-most of these with your paths already filled in — all but the two code-index
-commands:
+most of these with your paths already filled in — not the code-index or
+maintenance commands (`code-search`, `code-reindex`, `embed-worker`, `stats`,
+`backend-preflight`):
 
 ```bash
 memidx.py why <symbol-or-path> --project NAME --code-root DIR                    # why is this here?

@@ -185,11 +185,15 @@ def run_script(script: Path, payload_text: str, env: dict, timeout: float = 6.0,
     return proc, elapsed
 
 
-def poisoned_env(tmp_dir: Path, **overrides):
+def _poisoned_pythonpath(tmp_dir: Path) -> str:
     poison_dir = Path(tmp_dir) / "poison-site-packages"
     poison_dir.mkdir(exist_ok=True)
     (poison_dir / "yaml.py").write_text('raise RuntimeError("poisoned PYTHONPATH not cleared")\n')
-    env = clean_env(PYTHONPATH=f"{POISONED_SITE_PACKAGES}:{poison_dir}")
+    return f"{POISONED_SITE_PACKAGES}:{poison_dir}"
+
+
+def poisoned_env(tmp_dir: Path, **overrides):
+    env = clean_env(PYTHONPATH=_poisoned_pythonpath(tmp_dir))
     env.update(overrides)
     return env
 
@@ -413,8 +417,13 @@ class HookTestBase(unittest.TestCase):
         return env
 
     def poisoned_base_env(self, **overrides):
-        env = self.base_env()
-        env.update(poisoned_env(self.td))
+        # Build on the already-correctly-scoped base_env rather than a
+        # second, fresh `clean_env()` snapshot -- that fresh snapshot's
+        # ambient MEMCONTINUUM_HOME (whatever the invoking shell exports)
+        # used to overwrite this class's own MEMCONTINUUM_HOME=self.home
+        # (task-8-review.md LOW-2).
+        env = dict(self.base_env())
+        env["PYTHONPATH"] = _poisoned_pythonpath(self.td)
         env.update(overrides)
         return env
 

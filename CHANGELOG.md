@@ -48,6 +48,14 @@
   affect its neighbours, is reported honestly (never mislabeled as a
   quarantine), and a run with one or more such failures exits 5 after every
   other record is still committed.
+- `memidx.py`'s per-database companion files -- the embed-worker's marker,
+  lock and log, and `memidx-debug.log` -- now land beside the database a
+  command is actually serving (`Path(db_path).parent`) rather than always
+  under `$MEMCONTINUUM_HOME`; a custom `--db` moves them with it. The one
+  caller that always builds `--db` under `$MEMCONTINUUM_HOME`
+  (`post-commit-reindex.sh`) is unaffected; `backend-preflight`, which has no
+  database in scope, still falls back to `$MEMCONTINUUM_HOME` for its own
+  debug log.
 
 ### Code index
 - The code index's freshness check now compares five stat signals per file
