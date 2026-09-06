@@ -78,9 +78,10 @@ MEMIDX="$SCRIPT_DIR/../memidx.py"
 # own report for the full per-store table.
 # That leaves roughly 10x headroom under the unmodified default budget
 # (MC_WATCHDOG_BUDGET unset here -- the five-write-side-hooks 2s default,
-# not sessionend-stamp.sh's tighter 1.2s: two sequential for-path calls on
-# a miss need the fuller budget), so 2s is confirmed by measurement, not
-# assumed. Sourcing this also resolves MEMCONTINUUM_HOME and MC_GUARD_PY
+# not sessionend-stamp.sh's tighter 1.2s: one for-path call per candidate,
+# and a miss walks every candidate, so the fuller budget still covers
+# that multi-candidate worst case), so 2s is confirmed by measurement,
+# not assumed. Sourcing this also resolves MEMCONTINUUM_HOME and MC_GUARD_PY
 # (env -> config.sh -> engine venv), so the duplicate resolution this file
 # used to carry inline is gone -- PY below reads MC_GUARD_PY directly
 # instead of re-deriving it.
@@ -367,8 +368,29 @@ for entry in results:
         topic_ids.add(entry["id"])
 topic_count = str(len(topic_ids))
 
+# Round 7 fix (Codex MAJOR): this stream is field-delimited by chr(0) and
+# read back with read -d "", which treats ANY NUL byte as the end of the
+# CURRENT read -- not just the one this loop appends after each field. A
+# record whose decoded text embeds a real NUL (e.g. YAML "before\0after"
+# in a ruling/rationale/owner_boundary string -- json.dumps escapes it as
+# six ASCII characters, backslash-u-0-0-0-0, in transit, and json.load
+# decodes that back to an actual NUL byte here) used to truncate that
+# read call current field AND silently discard every field still queued
+# behind it in the SAME stream (here chain_text is last, so nothing
+# downstream was lost, but the same one-shared-stream risk applies to any
+# future field added after it) -- the topic_count computed above from the
+# untruncated results still reported the full count, while
+# additionalContext itself went missing everything past the embedded
+# NUL. The pre-round-5 transport (three separate command substitutions,
+# one value per call) never hit this: plain command substitution in bash
+# silently DROPS embedded NUL bytes from captured output, it does not
+# truncate the surrounding text. Matching that behavior -- not somehow
+# delivering a real NUL through a NUL-delimited protocol -- is the fix:
+# strip NULs from each field before it enters the shared stream, so a
+# NUL can never be mistaken for the chr(0) delimiter, and no text past
+# it is ever lost.
 for field in (matched, state, topic_count, chain_text):
-    sys.stdout.write(field)
+    sys.stdout.write(field.replace(chr(0), ""))
     sys.stdout.write(chr(0))
 ' 2>/dev/null)
     [ -z "$CANDIDATE_STATE" ] && CANDIDATE_STATE="current"
@@ -395,6 +417,27 @@ TOPIC_COUNT="$MATCHED_TOPIC_COUNT"
 if [ -z "$CHAIN_TEXT" ]; then
     finish "empty-chain-text"
 fi
+
+# Round 7 fix (Codex MINOR): the pre-round-5 transport captured this text
+# via `$(...)` command substitution, which strips every trailing newline
+# unconditionally. The round-5 transport threads CHAIN_TEXT through the
+# NUL-delimited `read -d ''` parser instead, which preserves it exactly
+# as memidx.py rendered it -- and for_path_chain_lines can end in a
+# newline when its LAST line is a concept row whose owner_boundary came
+# from a YAML `|` block scalar (block-scalar clipping keeps exactly one
+# trailing newline). Left alone, that trailing newline plus the "\n\n"
+# join separator below produces an extra blank line before
+# CITATION_REMINDER in additionalContext, diverging from the frozen
+# pre-round-5 oracle byte-for-byte. Strip every trailing newline here, at
+# the hook boundary, to restore the old `$(...)` parity -- a `case`/`%`
+# loop, not `${var: -1}` or any bash-4-only trick, so this stays bash
+# 3.2-safe; never touches a newline embedded INSIDE the text.
+while true; do
+    case "$CHAIN_TEXT" in
+        *$'\n') CHAIN_TEXT="${CHAIN_TEXT%$'\n'}" ;;
+        *) break ;;
+    esac
+done
 
 CITATION_REMINDER='CONSTRAINT only if authority is owner-verbatim/owner-ratified and status active; HOLD for evidence-bearing incidents; everything else is context.'
 HEADER="Decision-chain memory: ${TOPIC_COUNT} topic(s) reference this file."

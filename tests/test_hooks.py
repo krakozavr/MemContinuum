@@ -1056,6 +1056,19 @@ class TestPreEditChainOracleParity(unittest.TestCase):
             "---\nBody.\n"
         )
 
+    def _topic_with_nul_in_ruling(self, tid: str, code_ref: str) -> str:
+        """Round 7 red test fixture: a YAML double-quoted `\\0` escape
+        decodes (PyYAML) to a real NUL byte in the ruling text -- the
+        rendered chain line then embeds that NUL, verbatim, in the middle
+        of the plain-text chain_text this topic contributes."""
+        return (
+            f"---\ntype: topic\nid: {tid}\ntitle: T-{tid}\n"
+            f"code_refs:\n  - {code_ref}\n"
+            "links:\n"
+            '  - link: L1\n    status: active\n    ruling: {text: "before\\0after", authority: owner-verbatim, source: s}\n'
+            "---\nBody.\n"
+        )
+
     def test_match_with_a_chain(self):
         project = "oracle-match"
         home = self._new_home(project)
@@ -1119,6 +1132,93 @@ class TestPreEditChainOracleParity(unittest.TestCase):
         # The current script computes a real count: two topics matched,
         # header says "2" -- this is the fix this round makes.
         self.assertIn("Decision-chain memory: 2 topic(s) reference this file.", new_proc.stdout)
+
+    def test_nul_in_ruling_text_does_not_truncate_or_drop_later_topics(self):
+        """Round 7 red test (Codex MAJOR, hooks/pre-edit-chain.sh's own
+        candidate-loop parser): chain_text crosses from memidx.py into
+        this hook through a chr(0)-delimited stream, read back with
+        `read -d ''` -- which treats ANY NUL byte as the end of the
+        CURRENT field, not just the delimiter this loop itself appends.
+        A record whose decoded ruling text embeds a real NUL (YAML
+        `"before\\0after"`) used to truncate chain_text right there,
+        silently dropping every topic whose rendered chain came after it
+        in the SAME chain_text string -- even though the header (computed
+        separately, from the untruncated `results` list) still reported
+        the full topic count. The frozen pre-round-5 oracle never hit
+        this: its own transport was three separate `$(...)` command
+        substitutions, and plain command substitution in bash silently
+        DROPS an embedded NUL byte from captured output rather than
+        truncating the surrounding text -- so the oracle is also the
+        correct-behavior reference here, not just a parity fixture: BOTH
+        scripts must retain both topics and the concatenated
+        "beforeafter" text (NUL dropped, nothing lost), not merely agree
+        with each other."""
+        project = "oracle-embedded-nul"
+        home = self._new_home(project)
+        root = Path(self.tmp) / f"{project}-store"
+        (root / "topics").mkdir(parents=True)
+        (root / "topics" / "one.md").write_text(
+            self._topic_with_nul_in_ruling("TOP-3001", "src/core/scan/scan_plan.py")
+        )
+        (root / "topics" / "two.md").write_text(
+            self._topic_with_code_ref("TOP-3002", "src/core/scan/scan_plan.py")
+        )
+        self._reindex(root, project, home / f"{project}.sqlite")
+
+        oracle_proc, new_proc, oracle_outcome, new_outcome = self._run_pair(
+            home, self._matching_payload(),
+            dict(MEMCONTINUUM_PROJECT=project, MEMCONTINUUM_STRIP_PREFIX="/fake/repo/"),
+        )
+        self.assertEqual(oracle_proc.returncode, 0, oracle_proc.stderr)
+        self.assertEqual(new_proc.returncode, 0, new_proc.stderr)
+        self.assertEqual(new_outcome, oracle_outcome)
+        self.assertEqual(new_outcome, "matched")
+        self._assert_stdout_matches_except_topic_count(new_proc.stdout, oracle_proc.stdout)
+        for label, stdout in (("oracle", oracle_proc.stdout), ("new", new_proc.stdout)):
+            with self.subTest(label):
+                self.assertIn("beforeafter", stdout)
+                self.assertIn("TOP-3001", stdout)
+                self.assertIn("TOP-3002", stdout)
+        self.assertIn("Decision-chain memory: 2 topic(s) reference this file.", new_proc.stdout)
+
+    def test_ungoverned_concept_multiline_owner_boundary_trailing_newline_parity(self):
+        """Round 7 red test (Codex MINOR): for_path_chain_lines' concept
+        line embeds owner_boundary verbatim -- f"{id} {title} -- {boundary}".
+        A YAML `|` block scalar clips to exactly one trailing newline, so
+        an UNGOVERNED concept (no governed_by topics, so this is the
+        only/last chain_text line) makes chain_text itself end in a
+        newline. The frozen pre-round-5 oracle captured chain_text
+        through a `$(...)` command substitution, which strips every
+        trailing newline unconditionally; the round-5 transport (read
+        -d '' off a chr(0)-delimited stream) preserves it instead, so the
+        final "\\n\\n".join(...) in the OUTPUT_JSON assembly step below
+        inserted an extra blank line before CONSTRAINT that the oracle
+        never produced. Byte-identical parity (topic-count header
+        normalised only, same as every other case in this class) is the
+        bar."""
+        project = "oracle-concept-boundary-newline"
+        home = self._new_home(project)
+        root = Path(self.tmp) / f"{project}-store"
+        (root / "concepts").mkdir(parents=True)
+        (root / "concepts" / "c1.md").write_text(
+            "---\ntype: concept\nid: CPT-1\ntitle: C-CPT-1\n"
+            "implemented_by:\n  - src/core/scan/scan_plan.py\n"
+            "owner_boundary: |\n  line one\n  line two\n"
+            "---\nBody.\n"
+        )
+        self._reindex(root, project, home / f"{project}.sqlite")
+
+        oracle_proc, new_proc, oracle_outcome, new_outcome = self._run_pair(
+            home, self._matching_payload(),
+            dict(MEMCONTINUUM_PROJECT=project, MEMCONTINUUM_STRIP_PREFIX="/fake/repo/"),
+        )
+        self.assertEqual(oracle_proc.returncode, 0, oracle_proc.stderr)
+        self.assertEqual(new_proc.returncode, 0, new_proc.stderr)
+        self.assertTrue(oracle_proc.stdout.strip())
+        self._assert_stdout_matches_except_topic_count(new_proc.stdout, oracle_proc.stdout)
+        self.assertEqual(new_outcome, oracle_outcome)
+        self.assertEqual(new_outcome, "matched")
+        self.assertIn("line one\\nline two", new_proc.stdout)
 
     def test_no_match(self):
         project = "oracle-nomatch"

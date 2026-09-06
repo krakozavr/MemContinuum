@@ -1193,6 +1193,30 @@ class TestF1DecisionIndexState(unittest.TestCase):
                 self.assertIn(f"for-path: decision index {label} -- run: memidx.py reindex --root <store>",
                               buf_err.getvalue())
 
+    def test_for_path_missing_or_uninitialized_with_chain_text_includes_chain_text_key(self):
+        """Round 7 fix (Grok NIT): the rc==4 index-error branch already
+        carries {"state", "results", "chain_text"} under --with-chain-text
+        (test_for_path_index_error_with_chain_text_returns_object_shape);
+        this rc==3 missing/uninitialized branch (_for_path_missing_reply)
+        was still returning {"state", "results"} with no chain_text key at
+        all -- not even the empty string every other --with-chain-text
+        envelope promises. A direct --json --with-chain-text caller must
+        see the same three-key object shape from every for-path refusal
+        branch, not just the error one."""
+        for state_setup, label in ((lambda db: None, "missing"),
+                                    (lambda db: memidx.open_db(db, project=memidx.DEFAULT_PROJECT).close(), "uninitialized")):
+            with self.subTest(label), tempfile.TemporaryDirectory() as td:
+                db = Path(td) / f"{label}.sqlite"
+                state_setup(db)
+                buf_out, buf_err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                    rc = memidx.cmd_for_path(ns(project=memidx.DEFAULT_PROJECT, db=str(db),
+                                                 file_path="src/x.py", json=True,
+                                                 with_chain_text=True))
+                self.assertEqual(rc, 3)
+                self.assertEqual(json.loads(buf_out.getvalue()),
+                                  {"state": label, "results": [], "chain_text": ""})
+
     def test_for_path_missing_non_json_stays_plain_text_with_a_named_stderr_line(self):
         # Same states, non-json mode: stdout stays exactly the pre-existing
         # plain-text line (never becomes "[]" -- item 3's "keep stdout []"

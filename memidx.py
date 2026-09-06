@@ -1326,7 +1326,17 @@ def _for_path_missing_reply(args, state: str) -> int:
         file=sys.stderr,
     )
     if getattr(args, "json", False):
-        print(json.dumps({"state": state, "results": []}, indent=2))
+        # Round 7 fix (Grok NIT): under --with-chain-text the object shape
+        # this flag promises is {"state", "results", "chain_text"} -- the
+        # rc==4 index-error branch in cmd_for_path already carries all
+        # three; this rc==3 missing/uninitialized branch was still
+        # dropping chain_text. The hook itself never parses this (it
+        # branches on RC before touching RESULT_JSON), so this only
+        # matters to a direct CLI/JSON consumer asking for the flag.
+        payload = {"state": state, "results": []}
+        if getattr(args, "with_chain_text", False):
+            payload["chain_text"] = ""
+        print(json.dumps(payload, indent=2))
     else:
         print("no topics reference this path")
     return 3
