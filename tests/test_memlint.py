@@ -783,12 +783,52 @@ class TestMalformedRecordDiagnostics(unittest.TestCase):
             root = Path(td)
             _write(root / "topics" / "bad1.md", "---\ntype: topic\nid: TOP-9207\ntitle: Bad\nlinks: [\n---\nBody.\n")
             _write(root / "topics" / "bad2.md", "---\nid: TOP-9208\ntype: topic\ntags: a-string\ntitle: Bad\n---\nBody.\n")
+            # Fix wave 1, G1 (Grok BLOCKING 1): a note whose own complex
+            # field parses to the wrong shape used to crash `lint_file`'s
+            # dispatch -- `links: see TOP-1` made `is_topic` true off the
+            # unvalidated frontmatter, then `lint_topic` iterated the
+            # string character by character (`bool("see TOP-1").get`);
+            # `metadata: foo`/`metadata: [a, b]` crashed `infer_type`
+            # inside `build_record` on the reindex side of the same
+            # unvalidated shape. These three must warn, never traceback.
+            _write(root / "notes" / "note-links.md", "---\ntitle: my note\nlinks: see TOP-1\n---\nBody.\n")
+            _write(root / "notes" / "note-metadata-scalar.md", "---\ntitle: my note\nmetadata: foo\n---\nBody.\n")
+            _write(root / "notes" / "note-metadata-list.md", "---\ntitle: my note\nmetadata: [a, b]\n---\nBody.\n")
             buf_out, buf_err = io.StringIO(), io.StringIO()
             with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
                 rc = memlint.main([str(root)])
             self.assertEqual(rc, 1)
             self.assertNotIn("Traceback", buf_out.getvalue())
             self.assertNotIn("Traceback", buf_err.getvalue())
+            self.assertIn("WARNING: ", buf_out.getvalue())
+
+    def test_note_with_shape_diagnostic_is_a_warning_not_an_error(self):
+        """Fix wave 1, G1 (Grok BLOCKING 1, MINOR 6-7; design R2 as
+        amended, ruling 133): a note's own wrongly-shaped complex field is
+        a WARNING naming the field as dropped/ignored, never an ERROR --
+        and `lint_file` must dispatch on the VALIDATED frontmatter (the
+        field already dropped), never the raw one."""
+        cases = [
+            ("links_scalar", "links: see TOP-1", "links", "not a list of mappings; ignored"),
+            ("metadata_scalar", "metadata: foo", "metadata", "not a mapping; ignored"),
+            ("metadata_list", "metadata: [a, b]", "metadata", "not a mapping; ignored"),
+        ]
+        for name, fm_line, field, message in cases:
+            with self.subTest(case=name):
+                with tempfile.TemporaryDirectory() as td:
+                    root = Path(td)
+                    _write(root / "notes" / "note.md", f"---\ntitle: my note\n{fm_line}\n---\nBody.\n")
+                    errors, warnings = memlint.lint_root(root)
+                    self.assertEqual(errors, [], errors)
+                    self.assertTrue(
+                        any(f"{field}: {message}" in w for w in warnings), warnings
+                    )
+                    buf_out, buf_err = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                        rc = memlint.main([str(root)])
+                    self.assertEqual(rc, 0)
+                    self.assertNotIn("Traceback", buf_out.getvalue())
+                    self.assertNotIn("Traceback", buf_err.getvalue())
 
     def test_note_with_malformed_yaml_is_a_warning_not_an_error(self):
         with tempfile.TemporaryDirectory() as td:

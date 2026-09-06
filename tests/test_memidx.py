@@ -3087,6 +3087,111 @@ class TestMalformedRecordQuarantine(unittest.TestCase):
             conn.close()
             self.assertIsNotNone(row, "the note must still be indexed")
 
+    # -- scenario 8b/8c/8d: fix wave 1, G1 (Grok BLOCKING 1, MINOR 6-7;
+    # design R2 as amended, ruling 133) -- a note (no id/type/links-list)
+    # whose OWN complex field parses to VALID YAML but the WRONG shape must
+    # be indexed with that field DROPPED (never quarantined, never a
+    # traceback in build_record/infer_type/memlint).
+
+    def test_note_with_scalar_links_is_indexed_with_links_dropped_and_warned(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            _write_record(root / "topics" / "good.md", _valid_topic_text("TOP-9401"))
+            note_path = root / "notes" / "note.md"
+            _write_record(note_path, "---\ntitle: my note\nlinks: see TOP-1\n---\nBody text.\n")
+            db = Path(td) / "idx.sqlite"
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf), contextlib.redirect_stdout(io.StringIO()):
+                rc = reindex(root, db, no_embed=True)
+            self.assertEqual(rc, 0, err_buf.getvalue())
+            self.assertNotIn("Traceback", err_buf.getvalue())
+            warning_lines = [l for l in err_buf.getvalue().splitlines() if "WARNING" in l]
+            self.assertEqual(len(warning_lines), 1, err_buf.getvalue())
+            self.assertIn("links: not a list of mappings; ignored", warning_lines[0])
+            self.assertEqual(self._index_errors_rows(db), [], "a note must never be quarantined")
+
+            result = memidx.parse_record(note_path)
+            self.assertTrue(result.valid)
+            self.assertNotIn("links", result.frontmatter)
+
+            conn = sqlite3.connect(str(db))
+            conn.row_factory = sqlite3.Row
+            good_row = conn.execute("SELECT 1 FROM records WHERE id='TOP-9401'").fetchone()
+            note_row = conn.execute("SELECT 1 FROM records WHERE title='my note'").fetchone()
+            conn.close()
+            self.assertIsNotNone(good_row, "the neighbouring topic must still be indexed")
+            self.assertIsNotNone(note_row, "the note itself must still be indexed")
+
+    def test_note_with_scalar_metadata_is_indexed_with_metadata_dropped_and_warned(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            _write_record(root / "topics" / "good.md", _valid_topic_text("TOP-9402"))
+            note_path = root / "notes" / "note.md"
+            _write_record(note_path, "---\ntitle: my note\nmetadata: foo\n---\nBody text.\n")
+            db = Path(td) / "idx.sqlite"
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf), contextlib.redirect_stdout(io.StringIO()):
+                rc = reindex(root, db, no_embed=True)
+            self.assertEqual(rc, 0, err_buf.getvalue())
+            self.assertNotIn("Traceback", err_buf.getvalue())
+            warning_lines = [l for l in err_buf.getvalue().splitlines() if "WARNING" in l]
+            self.assertEqual(len(warning_lines), 1, err_buf.getvalue())
+            self.assertIn("metadata: not a mapping; ignored", warning_lines[0])
+            self.assertEqual(self._index_errors_rows(db), [])
+
+            result = memidx.parse_record(note_path)
+            self.assertTrue(result.valid)
+            self.assertNotIn("metadata", result.frontmatter)
+
+            conn = sqlite3.connect(str(db))
+            conn.row_factory = sqlite3.Row
+            note_row = conn.execute("SELECT 1 FROM records WHERE title='my note'").fetchone()
+            conn.close()
+            self.assertIsNotNone(note_row, "the note itself must still be indexed")
+
+    def test_note_with_list_metadata_is_indexed_with_metadata_dropped_and_warned(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            _write_record(root / "topics" / "good.md", _valid_topic_text("TOP-9403"))
+            note_path = root / "notes" / "note.md"
+            _write_record(note_path, "---\ntitle: my note\nmetadata: [a, b]\n---\nBody text.\n")
+            db = Path(td) / "idx.sqlite"
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf), contextlib.redirect_stdout(io.StringIO()):
+                rc = reindex(root, db, no_embed=True)
+            self.assertEqual(rc, 0, err_buf.getvalue())
+            self.assertNotIn("Traceback", err_buf.getvalue())
+            warning_lines = [l for l in err_buf.getvalue().splitlines() if "WARNING" in l]
+            self.assertEqual(len(warning_lines), 1, err_buf.getvalue())
+            self.assertIn("metadata: not a mapping; ignored", warning_lines[0])
+            self.assertEqual(self._index_errors_rows(db), [])
+
+            result = memidx.parse_record(note_path)
+            self.assertTrue(result.valid)
+            self.assertNotIn("metadata", result.frontmatter)
+
+    def test_indented_links_marker_does_not_make_unterminated_note_canonical(self):
+        """Grok MINOR 6: `_raw_frontmatter_is_canonical` must match only
+        column-zero lines -- an indented `- links:` line inside an
+        otherwise note-shaped, unterminated frontmatter block must never
+        flip the record to canonical (and therefore to quarantine)."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            note_path = root / "notes" / "note.md"
+            _write_record(
+                note_path,
+                "---\ntitle: my note\n  - links:\n    - link: TOP-1\nBody, no closing delimiter.\n",
+            )
+            db = Path(td) / "idx.sqlite"
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf), contextlib.redirect_stdout(io.StringIO()):
+                rc = reindex(root, db, no_embed=True)
+            self.assertEqual(rc, 0, err_buf.getvalue())
+            self.assertEqual(self._index_errors_rows(db), [], "must stay a note, never quarantined")
+
+            result = memidx.parse_record(note_path)
+            self.assertTrue(result.valid)
+
     # -- Fix round 1, finding A1 (BLOCKING): canonicity must be decided from
     # the RAW frontmatter text, not the post-failure {} dict, in every
     # parse-failure branch. Each of the three shapes below is a fully

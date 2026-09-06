@@ -352,16 +352,23 @@ def _raw_frontmatter_is_canonical(fm_text: str) -> bool:
     fallback (whose recovered `fm` never carries `links` at all, a
     complex field never recovered) can each hide a genuinely canonical
     record's `id`/`type`/`links` behind a parse failure that otherwise
-    defaults to `{}`. Scans every line for the three canonical markers
-    `is_canonical_frontmatter` itself checks, applied to text instead of
-    a dict: a schema `id:` prefix, a `links:` key (block OR flow, any
-    value or none), a schema `type:`. A leading list-item marker (`- `,
-    from a frontmatter block that parsed -- or almost parsed -- as a
-    top-level list) is stripped before matching, so `- id: TOP-1` is
-    still recognized: a false positive here only ever makes MORE records
-    canonical (and therefore quarantined, not silently emptied), never
-    fewer -- the safe direction."""
+    defaults to `{}`. Scans every COLUMN-ZERO line for the three
+    canonical markers `is_canonical_frontmatter` itself checks, applied
+    to text instead of a dict: a schema `id:` prefix, a `links:` key
+    (block OR flow, any value or none), a schema `type:`. A leading
+    list-item marker (`- `, itself at column zero -- from a frontmatter
+    block that parsed, or almost parsed, as a top-level list) is stripped
+    before matching, so `- id: TOP-1` is still recognized; an INDENTED
+    line is never checked at all (fix wave 1, G1 / Grok MINOR 6) -- a
+    nested `- links:`/`- type: topic` several levels deep inside some
+    other malformed structure is not a top-level frontmatter key and must
+    never flip a note to canonical. A false positive on a genuine
+    column-zero line only ever makes MORE records canonical (and
+    therefore quarantined, not silently emptied), never fewer -- the safe
+    direction."""
     for raw_line in fm_text.splitlines():
+        if raw_line[:1] in (" ", "\t"):
+            continue
         line = raw_line.strip()
         if line.startswith("- "):
             line = line[2:].strip()
@@ -528,8 +535,52 @@ def parse_record(path: Path) -> ParseResult:
 
     diagnostics = validate_record_shape(fm)
     canonical = is_canonical_frontmatter(fm)
+    if not canonical and diagnostics:
+        diagnostics = _drop_note_shape_violations(path, fm, diagnostics)
     valid = not (canonical and diagnostics)
     return ParseResult(fm, body, diagnostics, valid=valid, fallback=False)
+
+
+def _note_shape_drop_message(field: str, message: str) -> str:
+    """Fix wave 1, G1: rewrite `validate_record_shape`'s "<field> must be a
+    <shape>" message into "not a <shape>; ignored" -- same field name, so
+    the printed `<field>: <message>` line still names it, but the wording
+    now says what actually happens to a NOTE's own field (dropped, not
+    quarantined)."""
+    prefix = f"{field} must be a "
+    if message.startswith(prefix):
+        return "not a " + message[len(prefix):] + "; ignored"
+    return message + "; ignored"
+
+
+def _drop_note_shape_violations(path: Path, fm: dict, diagnostics: list) -> list:
+    """Fix wave 1, G1 (Grok BLOCKING 1, MINOR 7; design R2 as amended,
+    ruling 133): a NOTE (not canonical) keeps a wrongly-shaped complex
+    field as a WARNING, never a quarantine -- but the field itself must
+    be DROPPED from `fm` before this record ever reaches `build_record`
+    (which requires `links` to already be a list), `infer_type` (which
+    calls `.get` on `metadata`), or memlint's own `lint_file` dispatch
+    (which routes on `fm.get("links")` truthiness -- a note whose broken
+    `links` was dropped here is linted as a plain record, never a topic).
+    Only a TOP-LEVEL field name (no "." or "[", i.e. never a nested
+    `links[i]...` diagnostic) is dropped: that nested shape only ever
+    fires when `links` is already a list, which makes `is_canonical_
+    frontmatter` true and routes the record to quarantine instead, so
+    this function never runs for it. Each dropped field prints its own
+    `memidx: WARNING:` line, same register as the lenient-fallback notice
+    above -- `cmd_reindex` calls `parse_record` exactly once per file, so
+    this is the single warning line a reindex run prints per affected
+    note."""
+    kept: list = []
+    for field, message in diagnostics:
+        if "." in field or "[" in field or field not in fm:
+            kept.append((field, message))
+            continue
+        del fm[field]
+        new_message = _note_shape_drop_message(field, message)
+        print(f"memidx: WARNING: {path}: {field}: {new_message}", file=sys.stderr)
+        kept.append((field, new_message))
+    return kept
 
 
 def parse_frontmatter(path: Path) -> tuple[dict, str]:
