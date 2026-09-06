@@ -1693,6 +1693,55 @@ class TestMemlintDecisionMarkers(unittest.TestCase):
             any("markers not checked" in w and "x.rb" in w for w in warnings), warnings
         )
 
+    def test_codex13_scan_never_opens_an_unreferenced_file(self):
+        """Codex 13: the marker scan must open only files at least one
+        topic's code_refs names -- a probe observed an unrelated file
+        being opened (for its binary-file check) purely because it sat
+        in the code root, never because anything referenced it."""
+        topic = _marker_topic("TOP-0066", ["src/x.py#alpha"], _CONSTRAINT_LINK_L1)
+        code = {
+            "src/x.py": "# decision: TOP-0066 L1\ndef alpha():\n    return 1\n",
+            "src/not-referenced.txt": "nothing to see here\n",
+        }
+        checked = []
+        original = memlint.is_binary_file
+
+        def spy(path):
+            checked.append(str(path))
+            return original(path)
+
+        with mock.patch.object(memlint, "is_binary_file", side_effect=spy):
+            errors, _warnings = self._lint({"t.md": topic}, code)
+        self.assertEqual(errors, [], errors)
+        self.assertTrue(any(p.endswith("x.py") for p in checked), checked)
+        self.assertFalse(any("not-referenced.txt" in p for p in checked), checked)
+
+    def test_macos_duplicate_warning_is_keyed_by_physical_path(self):
+        """The macOS duplicate warning (whole-branch-review, reproduced on
+        CI, test_mem3...): a code root reached through a symlink (macOS's
+        own /var -> /private/var, reproduced here with an explicit
+        symlink) must never turn ONE physical file's "markers not
+        checked" warning into two -- direction 1 (_scan_set_for_markers)
+        and direction 2 (_store_to_code_check) must key the SAME shared
+        `warned_uncheckable` set on the SAME (physical, .resolve()'d)
+        path, whichever spelling of the root each happened to walk
+        through."""
+        with tempfile.TemporaryDirectory() as td_str:
+            td = Path(td_str)
+            store = td / "store"
+            (store / "topics").mkdir(parents=True)
+            topic = _marker_topic("TOP-0065", ["src/x.rb#thing"], _CONSTRAINT_LINK_L1)
+            (store / "topics" / "t.md").write_text(topic)
+            real_code = td / "real_code"
+            (real_code / "src").mkdir(parents=True)
+            (real_code / "src" / "x.rb").write_text("# decision: TOP-0065 L1\ndef thing\nend\n")
+            link_code = td / "link_code"
+            link_code.symlink_to(real_code, target_is_directory=True)
+            errors, warnings = memlint.lint_root(store, code_roots=[link_code])
+            self.assertEqual(errors, [], errors)
+            hits = [w for w in warnings if "markers not checked" in w and "x.rb" in w]
+            self.assertEqual(len(hits), 1, warnings)
+
     # Mem-3 (task-a2-2-review.md): the marker-scan "markers not checked"
     # warning must carry the SAME remedy lint_concept's identical wheel-
     # absent failure already gives (backend-preflight) -- the marker path
@@ -1802,14 +1851,19 @@ class TestMemlintDecisionMarkers(unittest.TestCase):
         self.assertNotIn("glob", hit[0])
         self.assertNotIn("never marker-verified", hit[0])
 
-    # Mem-1, the container variant: a marker meant for a container (`class
-    # Foo:`) is attributed to a MEMBER starting within 3 lines below it
-    # instead (chunk_file never gives a container its own chunk) -- the
-    # topic's code_refs names the CONTAINER (#Foo), so this is the same
-    # "wrong symbol" situation, not a glob/bare-path one, and the fix
-    # (adding a #method entry) would be wrong -- the message must not
-    # suggest it.
-    def test_mem1_marker_above_container_misattributed_to_nearby_member(self):
+    # Mem-1, the container variant, corrected (Codex 8, fix wave 1 G2): a
+    # marker meant for a container (`class Foo:`) used to be attributed to
+    # a MEMBER starting within 3 lines below it (chunk_file never gives a
+    # container its own chunk), reported as a "wrong symbol" ERROR -- which
+    # conflicted with ruling 144's own container carve-out (direction 2,
+    # below, already treats this container ref as unverifiable-by-marker,
+    # a WARNING, never an error). Direction 1 must agree: `Foo` names no
+    # chunk anywhere in the file (only `method` does), and
+    # fragment_declaration_status confirms `Foo` really is declared (a
+    # container) -- so this ref is dropped from consideration entirely,
+    # never misattributed to `method`, and never invents the wrong fix
+    # (there is no member to point the code_ref at).
+    def test_mem1_marker_above_container_is_not_misattributed_to_nearby_member(self):
         topic = _marker_topic("TOP-0051", ["src/x.py#Foo"], _CONSTRAINT_LINK_L1)
         code = {
             "src/x.py": (
@@ -1819,12 +1873,83 @@ class TestMemlintDecisionMarkers(unittest.TestCase):
                 "        return 1\n"
             )
         }
+        errors, warnings = self._lint({"t.md": topic}, code)
+        self.assertEqual([e for e in errors if "TOP-0051" in e], [], errors)
+        self.assertTrue(
+            any(
+                "'Foo' is a container type" in w and "src/x.py" in w
+                for w in warnings
+            ),
+            warnings,
+        )
+
+    # Codex 8: two adjacent short declarations, each with its own marker
+    # (or none) -- a marker window must never cross into the PREVIOUS
+    # declaration's own line, even when the flat 3-lines-above count would
+    # otherwise reach it.
+    def test_codex8_marker_window_never_crosses_into_the_previous_declaration(self):
+        topic_alpha = _marker_topic("TOP-0060", ["src/x.py#alpha"], _CONSTRAINT_LINK_L1)
+        topic_beta = _marker_topic("TOP-0061", ["src/x.py#beta"], _CONSTRAINT_LINK_L1)
+        code = {
+            "src/x.py": (
+                "# decision: TOP-0060 L1\n"
+                "def alpha():\n"
+                "    pass\n"
+                "def beta():\n"
+                "    pass\n"
+            )
+        }
+        errors, warnings = self._lint({"a.md": topic_alpha, "b.md": topic_beta}, code)
+        # alpha's own marker (one line above it) matches cleanly.
+        self.assertEqual([e for e in errors if "TOP-0060" in e], [], errors)
+        # beta's window must never reach alpha's marker three lines up --
+        # beta gets the plain "no marker yet" warning, never a false
+        # match on alpha's TOP-0060.
+        self.assertEqual([e for e in errors if "TOP-0061" in e], [], errors)
+        self.assertTrue(
+            any("TOP-0061" in w and "no marker at src/x.py#beta" in w for w in warnings),
+            warnings,
+        )
+
+    # Codex 7: every marker in the window is examined, not just the first
+    # (nearest) one found -- a valid marker (on the definition line) must
+    # not shadow a bogus one sitting farther up, or vice versa.
+    def test_codex7_valid_marker_followed_by_a_bogus_one_errors_on_the_bogus_one(self):
+        # Valid marker FARTHEST (topmost), bogus one NEAREST gamma's own
+        # definition line: the old single-match scan (forward, farthest
+        # match wins) found only the valid one and stopped, so the bogus
+        # marker's error went entirely unreported.
+        topic = _marker_topic("TOP-0062", ["src/x.py#gamma"], _CONSTRAINT_LINK_L1)
+        code = {
+            "src/x.py": (
+                "# decision: TOP-0062 L1\n"  # valid: matches gamma below, farthest
+                "# decision: TOP-9997 L1\n"  # bogus: no such topic, nearest
+                "def gamma():\n"
+                "    return 3\n"
+            )
+        }
         errors, _warnings = self._lint({"t.md": topic}, code)
-        hit = [e for e in errors if "TOP-0051" in e and "L1" in e]
-        self.assertTrue(hit, errors)
-        self.assertIn("src/x.py#Foo", hit[0])
-        self.assertIn("not src/x.py#method", hit[0])
-        self.assertNotIn("glob", hit[0])
+        self.assertEqual([e for e in errors if "TOP-0062" in e], [], errors)
+        self.assertTrue(
+            any("TOP-9997" in e and "no such topic" in e for e in errors), errors
+        )
+
+    # Codex 7: two valid markers in one window each satisfy their own
+    # topic -- a member constrained by two independent rules at once.
+    def test_codex7_two_valid_markers_each_satisfy_their_own_topic(self):
+        topic_a = _marker_topic("TOP-0063", ["src/x.py#delta"], _CONSTRAINT_LINK_L1)
+        topic_b = _marker_topic("TOP-0064", ["src/x.py#delta"], _CONSTRAINT_LINK_L1)
+        code = {
+            "src/x.py": (
+                "# decision: TOP-0063 L1\n"
+                "# decision: TOP-0064 L1\n"
+                "def delta():\n"
+                "    return 4\n"
+            )
+        }
+        errors, warnings = self._lint({"a.md": topic_a, "b.md": topic_b}, code)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(warnings, [], warnings)
 
     # Ruling 144 (TOP-0122 L4): a path#symbol ref whose symbol the chunker
     # never reports as its own chunk (a Swift protocol requirement --

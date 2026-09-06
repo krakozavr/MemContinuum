@@ -22,6 +22,7 @@ history invariant instead of the schema rules above -- see
 """
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -45,7 +46,7 @@ from memidx import (
     code_ref_matches,
     fragment_declaration_status,
     fragment_matches_symbol,
-    iter_code_files,
+    is_binary_file,
     lang_for_source_file,
     newest_active_link,
     parse_record,
@@ -604,23 +605,67 @@ def lint_root(root: Path, code_roots: list[Path] | None = None) -> tuple[list[st
 # ---------------------------------------------------------------------------
 
 
-_DECISION_MARKER_RE = re.compile(r"decision:\s*(TOP-\d{4})\s+(L\d+)\b")
+# Codex 16 / whole-branch-review LOW-3 (fix wave 1 G2): `TOP-\d+`, not
+# `TOP-\d{4}` -- SCHEMA sec8.3's own running example topic is `id: TOP-42`
+# (SCHEMA.md's own `id: TOP-42` convention, sec1), so its copy-pasted
+# marker example `# decision: TOP-42 L4` used to silently never match this
+# regex at all. Any positive integer id, matching how ids are actually
+# authored elsewhere in this store (no fixed digit count is enforced on
+# `id:` itself).
+_DECISION_MARKER_RE = re.compile(r"decision:\s*(TOP-\d+)\s+(L\d+)\b")
 
 
-def _find_marker(lines: list[str], start_line: int) -> tuple[str, str, int] | None:
-    """(topic_id, link_id, 1-indexed marker_line) for the first decision
-    marker on `start_line` (a chunk's own definition line, 1-indexed) or
-    within the three lines immediately above it -- spec test (h): three
-    lines above counts, four does not. None when no line in that window
-    matches. The regex is applied to the raw line text regardless of the
-    file's comment syntax (SCHEMA sec8.3: "language-agnostic ... the regex
-    ignores the comment leader")."""
+def _declaration_boundaries(chunks: list[dict]) -> list[int]:
+    """Sorted, deduped 1-indexed start_lines for every chunk in a file --
+    the set of "another declaration's line" a marker window must never
+    cross (Codex 8, fix wave 1 G2)."""
+    return sorted({c["start_line"] for c in chunks})
+
+
+def _find_markers(
+    lines: list[str], start_line: int, boundaries: list[int] | None = None,
+) -> list[tuple[str, str, int]]:
+    """Every decision marker belonging to the declaration whose definition
+    line is `start_line` (1-indexed): a marker on that line itself, or on
+    any of the (up to three) lines immediately above it -- spec test (h):
+    three lines above counts, four does not.
+
+    Searched NEAREST FIRST (Codex 7, fix wave 1 G2): a stale or
+    neighboring declaration's marker sitting farther up used to be found
+    ahead of a valid marker sitting ON the definition line itself, simply
+    because the old scan went top-down and returned the FIRST hit --
+    reversed here so the closest line to `start_line` is checked first,
+    the farthest last.
+
+    NEVER crosses another declaration's own line (Codex 8): when
+    `boundaries` is given, the window's upper (backward) limit is clipped
+    just below the nearest PRECEDING boundary strictly less than
+    `start_line` -- a marker belonging to an earlier declaration must
+    never also be attributed to this one merely because it falls within
+    the flat 3-line count (two adjacent short declarations, or one right
+    after another with no body lines between them).
+
+    EVERY marker actually inside the (possibly clipped) window is
+    returned, nearest first (Codex 7): a valid marker followed -- farther
+    up -- by a second, bogus one used to be entirely invisible once the
+    first (nearest) one was found; both are now returned and the caller
+    (rule 4's own marker->store validation) examines each one, not just
+    the first. The regex is applied to the raw line text regardless of
+    the file's comment syntax (SCHEMA sec8.3: "language-agnostic ... the
+    regex ignores the comment leader")."""
     lo = max(0, start_line - 4)
-    for lineno, line in enumerate(lines[lo:start_line], start=lo + 1):
-        m = _DECISION_MARKER_RE.search(line)
+    if boundaries:
+        prev = max((b for b in boundaries if b < start_line), default=None)
+        if prev is not None:
+            lo = max(lo, prev)
+    found: list[tuple[str, str, int]] = []
+    for lineno in range(start_line, lo, -1):
+        if lineno < 1 or lineno > len(lines):
+            continue
+        m = _DECISION_MARKER_RE.search(lines[lineno - 1])
         if m:
-            return m.group(1), m.group(2), lineno
-    return None
+            found.append((m.group(1), m.group(2), lineno))
+    return found
 
 
 def _link_tier(link: dict) -> str:
@@ -737,13 +782,36 @@ def _scan_set_for_markers(code_roots: list[Path], topics: dict) -> list[tuple[Pa
     code root that at least one topic's code_refs names, by ANY form
     (prefix, glob, or path#symbol -- rule 1 restricts which forms take part
     in marker VERIFICATION, not which files are worth opening to look for
-    one). Never the whole tree otherwise.
+    one). Never the whole tree otherwise -- Codex 13 (fix wave 1 G2): this
+    used to walk `iter_code_files(root)`, which opens and reads EVERY file
+    under `root` for its binary-file check before this function's own ref
+    match filter ever runs (a probe observed a wholly unreferenced
+    not-referenced.txt being opened alongside the single referenced x.py,
+    contradicting INTERNALS' "the scan never walks a whole code root").
+    The directory walk itself still has to visit every directory (there is
+    no way to know which subtrees a glob/prefix code_ref might reach
+    without looking), but each FILENAME is matched against every code_ref
+    -- pure string work, no I/O -- BEFORE it is ever opened; `is_binary_
+    file` (an actual read) only ever runs on a file that already matched.
 
     A file reachable under more than one given root (nested roots) is
     attributed to the LONGEST (its own, most specific) root only -- roots
     are walked longest-first and a file's resolved absolute path, once
     claimed, is never revisited under a shallower root, so its rel_path is
-    never computed against the wrong root."""
+    never computed against the wrong root.
+
+    The macOS duplicate warning (whole-branch-review, reproduced on CI):
+    `full` in the returned tuple is the PHYSICAL path (`.resolve()`,
+    matching `_store_to_code_check`'s own `(root / path_part).resolve()`)
+    -- keyed on the raw, possibly-symlinked path instead, `/var/folders/
+    ...` and macOS's own `/private/var/folders/...` alias for the exact
+    same file were two different dict/set keys to lint_markers' shared
+    `warned_uncheckable`, so the identical "markers not checked" warning
+    for one physical file was emitted once per spelling. `rel` is
+    still computed from the UNRESOLVED `full` against the UNRESOLVED
+    `root` (matching how `root` was actually walked) -- resolving first
+    would break `relative_to` whenever `root` itself sits behind a
+    symlink component `full` no longer shares a literal prefix with."""
     all_refs = [
         str(ref)
         for info in topics.values()
@@ -756,27 +824,37 @@ def _scan_set_for_markers(code_roots: list[Path], topics: dict) -> list[tuple[Pa
     claimed: set[Path] = set()
     out: list[tuple[Path, Path, str]] = []
     for root in ordered_roots:
-        for full in iter_code_files(root):
-            resolved = full.resolve()
-            if resolved in claimed:
-                continue
-            claimed.add(resolved)
-            try:
-                rel = full.relative_to(root)
-            except ValueError:
-                continue
-            rel_str = str(rel).replace("\\", "/")
-            if any(code_ref_matches(rel_str, ref) for ref in all_refs):
-                out.append((full, root, rel_str))
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in chunkers.UNIVERSAL_SKIP_DIRS]
+            for fname in filenames:
+                full = Path(dirpath) / fname
+                try:
+                    rel = full.relative_to(root)
+                except ValueError:
+                    continue
+                rel_str = str(rel).replace("\\", "/")
+                if not any(code_ref_matches(rel_str, ref) for ref in all_refs):
+                    continue
+                resolved = full.resolve()
+                if resolved in claimed:
+                    continue
+                claimed.add(resolved)
+                if is_binary_file(full):
+                    continue
+                out.append((resolved, root, rel_str))
     return out
 
 
 def _marker_to_store_errors(
     full: Path, marker_line: int, topic_id: str, link_id: str,
-    rel_path: str, chunk: dict, topics: dict,
+    rel_path: str, chunk: dict, topics: dict, text: str, chunks: list[dict],
 ) -> list[str]:
     """Rule 4: one found marker, validated against the store. Returns zero
-    or more ERROR strings (no `ERROR:` prefix -- callers add that)."""
+    or more ERROR strings (no `ERROR:` prefix -- callers add that).
+
+    `text`/`chunks` (the WHOLE file's text and full chunk list, not just
+    `chunk`) are needed for the container carve-out below (Codex 8 /
+    ruling 144)."""
     prefix = f"{full}:{marker_line}: decision marker {topic_id} {link_id}"
     info = topics.get(topic_id)
     if info is None:
@@ -796,6 +874,7 @@ def _marker_to_store_errors(
     matched_exact = False
     matched_glob_or_path = False
     wrong_symbols: list[str] = []
+    container_ref_seen = False
     for ref in fm.get("code_refs") or []:
         ref = str(ref)
         if not code_ref_matches(rel_path, ref):
@@ -807,6 +886,27 @@ def _marker_to_store_errors(
         if fragment_matches_symbol(ref_symbol, chunk["symbol"], chunk["qualified_name"]):
             matched_exact = True
             break
+        # Codex 8 (fix wave 1 G2): a ref naming a symbol NO chunk in this
+        # file reports of its own (a container -- class/struct/enum/... --
+        # chunk_file never gives one its own chunk; see chunk_source's own
+        # docstring) is unverifiable by this marker-window check, not a
+        # genuine wrong-symbol mismatch -- ruling 144's own carve-out for
+        # exactly this case (ruling144_swift_protocol_requirement /
+        # _store_to_code_check's identical `verdict is True, no chunk`
+        # branch, direction 2). Reporting "not rel_path#chunk['symbol']"
+        # here would misattribute a container's own marker to whichever
+        # member chunk merely happens to sit within 3 lines of it, AND
+        # prescribe the wrong fix (there is no member to point the code_ref
+        # at). Direction 2 already gives its own "markers not checked
+        # (container type)" warning for this same ref; direction 1 stays
+        # silent rather than inventing a second, contradictory finding.
+        if not any(
+            fragment_matches_symbol(ref_symbol, c["symbol"], c["qualified_name"]) for c in chunks
+        ):
+            verdict, _reason, _remedy = fragment_declaration_status(ref_symbol, text, rel_path=rel_path)
+            if verdict is True:
+                container_ref_seen = True
+                continue
         if ref_symbol not in wrong_symbols:
             wrong_symbols.append(ref_symbol)
     if matched_exact:
@@ -814,13 +914,12 @@ def _marker_to_store_errors(
     if wrong_symbols:
         # Mem-1 (task-a2-2-review.md): a `path#symbol` ref for THIS file
         # exists, it just names a DIFFERENT symbol than the one under the
-        # marker (a wrong-symbol typo, or a marker meant for a container
-        # whose own #symbol ref the chunker attributes to a nearby member
-        # instead) -- a real, distinct situation from "no path#symbol ref
-        # at all", and the message says so truthfully rather than denying
-        # there is one (the old message conflated both into the glob/
-        # bare-path wording below, which is both factually wrong here --
-        # there IS a path#symbol ref -- and prescribes the wrong fix).
+        # marker (a wrong-symbol typo) -- a real, distinct situation from
+        # "no path#symbol ref at all", and the message says so truthfully
+        # rather than denying there is one (the old message conflated both
+        # into the glob/bare-path wording below, which is both factually
+        # wrong here -- there IS a path#symbol ref -- and prescribes the
+        # wrong fix).
         named = ", ".join(f"{rel_path}#{s}" for s in wrong_symbols)
         return [
             f"{prefix}: topic {topic_id}'s code_refs name {named}, "
@@ -832,6 +931,8 @@ def _marker_to_store_errors(
             f"globs (and bare paths) are never marker-verified; add a path#symbol entry for "
             f"{rel_path}#{chunk['symbol']}"
         ]
+    if container_ref_seen:
+        return []
     return [f"{prefix}: topic {topic_id}'s code_refs do not name {rel_path}"]
 
 
@@ -927,8 +1028,14 @@ def _store_to_code_check(
                 )
         return errors, warnings
 
-    found = _find_marker(text.splitlines(), match["start_line"])
-    if found and found[0] == tid and found[1] == link_id:
+    # Codex 7: every marker in the window is examined, not just the
+    # nearest -- two legitimate markers can sit in the same window (one
+    # per topic/link a member satisfies), and the expected (tid, link_id)
+    # pair may be either one, not necessarily the first found.
+    found_markers = _find_markers(
+        text.splitlines(), match["start_line"], _declaration_boundaries(chunks)
+    )
+    if any(f[0] == tid and f[1] == link_id for f in found_markers):
         return errors, warnings
     warnings.append(f"{tid}:{link_id}: no marker at {path_part}#{symbol_part}")
     return errors, warnings
@@ -956,14 +1063,19 @@ def lint_markers(root: Path, code_roots: list[Path]) -> tuple[list[str], list[st
                 warnings.append(_uncheckable_message(str(full), reason, remedy))
             continue
         lines = text.splitlines()
+        boundaries = _declaration_boundaries(chunks)
         for chunk in chunks:
-            found = _find_marker(lines, chunk["start_line"])
-            if not found:
-                continue
-            topic_id, link_id, marker_line = found
-            errors.extend(
-                _marker_to_store_errors(full, marker_line, topic_id, link_id, rel_path, chunk, topics)
-            )
+            # Codex 7: every marker actually in the window is examined,
+            # not just the first (nearest) one found -- a valid marker
+            # followed (farther up) by a bogus one must still error on
+            # the bogus one; two valid markers must each satisfy their
+            # own topic.
+            for topic_id, link_id, marker_line in _find_markers(lines, chunk["start_line"], boundaries):
+                errors.extend(
+                    _marker_to_store_errors(
+                        full, marker_line, topic_id, link_id, rel_path, chunk, topics, text, chunks,
+                    )
+                )
 
     # direction 2: store -> code (warnings; a dangling ref is an error)
     for tid, info in topics.items():

@@ -1695,17 +1695,31 @@ one project can have several code roots, and every root given is checked:
 | a concept body has no "not this concept" sentence | warning |
 
 Decision marker rules (`--code-root`; SCHEMA §2/§8.3). A marker is a comment line matching
-`decision: TOP-\d{4} Ln` on a symbol's own definition line, or within the three lines above it —
+`decision: TOP-\d+ Ln` (any positive integer id — SCHEMA's own running example is `TOP-42`, not a
+fixed four digits) on a symbol's own definition line, or within the (up to) three lines above it —
 located through the chunker registry, same as the concept rules above, so a language with no
 wired chunker warns rather than errors. Only a topic's `path#symbol` code_refs entries take part;
-a prefix or a glob names no symbol and is never marker-verified. The scan never walks a whole code
-root — only files at least one topic's `code_refs` already names (by any of the three forms):
+a prefix or a glob names no symbol and is never marker-verified.
+
+The window is searched nearest-first (the definition line itself, then one line up, then two,
+then three) and never crosses into another declaration's own line — two adjacent short
+declarations with no body between them each keep their own window, never borrowing the other's
+marker. Every marker actually inside the window is examined, not just the first one found: a
+valid marker followed, farther up, by a bogus one still errors on the bogus one, and two markers
+in one window (a member two independent topics each constrain) each satisfy their own topic.
+
+The scan does still visit every directory under a code root (there is no way to know which
+subtrees a glob/prefix code_ref might reach without looking), but a file is opened only after its
+FILENAME already matches at least one topic's code_refs (by any of the three forms) — the
+scan never opens a file nothing references, even to check whether it is binary.
 
 | rule | severity |
 |---|---|
 | a marker names a topic id or link id that does not exist | error |
 | a marker names a link that is not `active`, or whose tier (§4) is CONTEXT, not CONSTRAINT/HOLD | error |
 | a marker's topic has no `path#symbol` code_refs entry naming this exact file and symbol (a prefix or glob that merely matches the FILE does not count) | error |
+| a marker's topic names a `path#symbol` that matches no chunk anywhere in the file, and no chunk sits under the marker either | error (the ref itself is dangling) |
+| a marker's topic names a `path#symbol` that matches no chunk anywhere in the file, but the chunker confirms the symbol IS declared (a container — class/struct/enum/… — chunk_file never gives one its own chunk) | silent on this side (never misattributed to a nearby member); direction 2's own "container type" row below still warns |
 | an active CONSTRAINT/HOLD link's `path#symbol` ref finds no marker at that symbol | warning |
 | an active CONSTRAINT/HOLD link's `path#symbol` ref names a symbol the chunker proves absent | error (the ref itself is dangling) |
 | a file in scope whose language has no chunker, or whose backend cannot run here | warning (names the reason), never an error |
