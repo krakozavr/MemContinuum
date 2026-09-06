@@ -119,6 +119,14 @@
   unrecognized or missing tool name is logged by name and still diffed
   rather than silently skipped. `stats` reports how often each of those
   two paths fired.
+- The pre-edit chain hook now walks the store at most once per run --
+  `--root` (the flag that triggers `for-path`'s on-disk drift check) is
+  passed only on the FIRST `for-path` call, the one that finds the
+  matching candidate and determines the index state; the second call
+  (fetching the pretty chain-view text for that same, already-matched
+  candidate) no longer repeats the walk. A CI run on the macOS runner
+  under real bash 3.2 had measured the unmodified hook at 1.003s against
+  its own 1.0s timing bar.
 
 ### Documentation
 - The README, `docs/DESIGN.md`, and `docs/INTERNALS.md` now say plainly

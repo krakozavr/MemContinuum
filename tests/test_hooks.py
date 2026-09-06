@@ -89,6 +89,42 @@ def run_hook(payload_text: str, env: dict, timeout: float = 5.0):
     return proc, elapsed
 
 
+def memidx_wrapper_python(target_dir, name: str, body: str, real_py: str = ""):
+    """A bash impersonation of MEMCONTINUUM_PYTHON, shared by every test
+    that needs to observe or modify what memidx.py's own machinery does
+    without touching the hook script under test: any `-c` call (the
+    watchdog launcher's own `-c "$MC_WATCHDOG_LAUNCHER_PY"` invocation, or
+    a hook's own inline JSON-parsing/assembly `-c` calls) passes straight
+    through to the real venv python unmodified (both need the real
+    interpreter to run); only a script-path invocation ("$PY"
+    "<engine>/memidx.py" <subcommand> ...) is intercepted, running a
+    real-python `-c` snippet that executes `body` (e.g. recording
+    `sys.argv[1:]`, monkeypatching a memidx.py function) before handing
+    off to memidx.main(sys.argv[1:])."""
+    wrapper = Path(target_dir) / name
+    wrapper.write_text(
+        "#!/usr/bin/env bash\n"
+        f'REAL_PY="{real_py or VENV_PYTHON}"\n'
+        'if [ "$1" = "-c" ]; then\n'
+        '    exec "$REAL_PY" "$@"\n'
+        'fi\n'
+        'shift\n'
+        f'exec "$REAL_PY" -c \'\n'
+        'import sys\n'
+        # Double-quoted, not repr() -- the whole snippet is itself
+        # wrapped in a bash SINGLE-quoted `-c '...'` string below, so a
+        # literal single quote here (what !r would produce) would
+        # break out of that bash quoting early.
+        f'sys.path.insert(0, "{TOOLS_DIR}")\n'
+        'import memidx\n'
+        f'{body}\n'
+        'sys.exit(memidx.main(sys.argv[1:]))\n'
+        "' \"$@\"\n"
+    )
+    wrapper.chmod(0o755)
+    return wrapper
+
+
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
 class TestPreEditChainHook(unittest.TestCase):
     @classmethod
@@ -701,6 +737,61 @@ class TestPreEditChainRootAndStaleWarning(unittest.TestCase):
         self.assertIn("outcome=matched", log_text)
         self.assertNotIn("outcome=index-stale-served", log_text)
 
+    def test_second_for_path_call_omits_root_the_first_call_keeps_it(self):
+        """ruling 136 / CI evidence (macOS runner, real bash 3.2): the
+        hook's SECOND store walk. `--root` on `for-path` is what triggers
+        `_index_has_drift`, a real on-disk walk of the store -- the first
+        `for-path` call (FORPATH_ARGS, the match-finding loop) already pays
+        that cost and determines the state (`current`/`stale`/
+        `quarantined`), warning on it via its own stderr. The second call
+        (CHAIN_TEXT_ARGS, only fetching the pretty chain-view text for the
+        candidate the first call already matched) must not walk the store
+        again -- it never passes --root once the fix lands. A fake
+        memidx.py wrapper (`memidx_wrapper_python`) records every
+        script-path invocation's argv so both calls can be inspected
+        directly, independent of what for-path itself prints or logs.
+
+        A single matching candidate (the raw file_path itself, no cwd/
+        strip-prefix fallback needed) keeps this deterministic: exactly
+        one FORPATH_ARGS call (matches immediately, loop breaks) then
+        exactly one CHAIN_TEXT_ARGS call -- two `for-path` invocations
+        total, first then second, no ambiguity about which is which."""
+        argv_log = Path(self.tmp) / "argv.jsonl"
+        wrapper = memidx_wrapper_python(
+            self.tmp, "argv-recorder",
+            f'ARGV_LOG = "{argv_log}"\n'
+            'import json\n'
+            'with open(ARGV_LOG, "a") as _f:\n'
+            '    _f.write(json.dumps(sys.argv[1:]))\n'
+            '    _f.write(chr(10))\n',
+        )
+        payload = json.dumps(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Edit",
+                "cwd": "/nowhere-relevant",
+                "tool_input": {"file_path": "src/core/scan/scan_plan.py"},
+            }
+        )
+        env = clean_env(
+            MEMCONTINUUM_HOME=self.memtool_home,
+            MEMCONTINUUM_PROJECT=self.project,
+            MEMCONTINUUM_PYTHON=str(wrapper),
+            MEMCONTINUUM_ROOT=str(self.root),
+        )
+        proc, elapsed = run_hook(payload, env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(proc.stdout.strip(), "expected additionalContext output, got nothing")
+
+        calls = [json.loads(line) for line in argv_log.read_text().splitlines() if line.strip()]
+        for_path_calls = [c for c in calls if c and c[0] == "for-path"]
+        self.assertEqual(len(for_path_calls), 2, for_path_calls)
+        self.assertIn("--root", for_path_calls[0], for_path_calls[0])
+        self.assertNotIn(
+            "--root", for_path_calls[1],
+            f"the second for-path call must not walk the store again: {for_path_calls[1]}",
+        )
+
 
 class TestF6RenderedTimeout(unittest.TestCase):
     """The OUTER Claude Code backstop: `code-root-filter-pair.json.tmpl`
@@ -940,10 +1031,9 @@ class TestPostCommitReindexEmbedWorker(unittest.TestCase):
         return root
 
     def _wrapper_python(self, name, body):
-        """A bash impersonation of MEMCONTINUUM_PYTHON (same
-        marker-based dispatch idiom as TestPreEditChainWatchdog's own
-        _hang_python above, extended to intercept BOTH `-c` shapes this
-        hook now uses -- the watchdog launcher's own `-c
+        """A bash impersonation of MEMCONTINUUM_PYTHON: the module-level
+        `memidx_wrapper_python` dispatch idiom, extended to intercept BOTH
+        `-c` shapes this hook now uses -- the watchdog launcher's own `-c
         "$MC_WATCHDOG_LAUNCHER_PY"` call AND the hook's own worker-spawn
         `-c '...Popen(...)...'` call -- passed straight through to the
         real venv python unmodified (both need the real interpreter to
@@ -953,27 +1043,7 @@ class TestPostCommitReindexEmbedWorker(unittest.TestCase):
         off to memidx.main(). Launching the embed-worker with THIS SAME
         $PY (not sys.executable -- see the hook's own comment) is what
         lets the spawned worker subprocess hit this same interception."""
-        wrapper = Path(self.td) / name
-        wrapper.write_text(
-            "#!/usr/bin/env bash\n"
-            f'REAL_PY="{VENV_PYTHON}"\n'
-            'if [ "$1" = "-c" ]; then\n'
-            '    exec "$REAL_PY" "$@"\n'
-            'fi\n'
-            'shift\n'
-            f'exec "$REAL_PY" -c \'\n'
-            'import sys\n'
-            # Double-quoted, not repr() -- the whole snippet is itself
-            # wrapped in a bash SINGLE-quoted `-c '...'` string below, so a
-            # literal single quote here (what !r would produce) would
-            # break out of that bash quoting early.
-            f'sys.path.insert(0, "{TOOLS_DIR}")\n'
-            'import memidx\n'
-            f'{body}\n'
-            'sys.exit(memidx.main(sys.argv[1:]))\n'
-            "' \"$@\"\n"
-        )
-        wrapper.chmod(0o755)
+        wrapper = memidx_wrapper_python(self.td, name, body)
         return wrapper
 
     def _hang_stub(self):

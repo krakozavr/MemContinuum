@@ -321,8 +321,18 @@ fi
 TOPIC_COUNT="$(printf '%s' "$RESULTS_ONLY" | grep -c '"id":')"
 
 # --- get the pretty chain-view text for the matched candidate --------------
+# Fix round 4 (ruling 136 / CI evidence): no --root here. The FORPATH_ARGS
+# loop above already resolved decision_index_state(root=...) for this exact
+# store/project (walking it via _index_has_drift when --root is set) and
+# already emitted any stale/quarantined warning off that same call's own
+# stderr (captured into $LOG, same as this one). Passing --root again here
+# would make THIS call re-run that same on-disk walk a second time for a
+# candidate already known to match -- one hook run, one store walk. Losing
+# --root here can only ever downgrade what THIS call itself might report as
+# "stale" back to "quarantined" or "current" (never gain a state it
+# shouldn't have) -- MATCHED_STATE/the outcome name logged by finish() still
+# come from the first call, unaffected.
 CHAIN_TEXT_ARGS=(for-path "$MATCHED_CANDIDATE" --project "$PROJECT" --db "$DB_PATH")
-[ -n "${MEMCONTINUUM_ROOT:-}" ] && CHAIN_TEXT_ARGS+=(--root "$MEMCONTINUUM_ROOT")
 CHAIN_TEXT="$(PYTHONPATH= "$PY" "$MEMIDX" "${CHAIN_TEXT_ARGS[@]}" 2>>"$LOG")"
 
 if [ -z "$CHAIN_TEXT" ]; then

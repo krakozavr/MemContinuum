@@ -378,17 +378,32 @@ def _raw_frontmatter_is_canonical(fm_text: str) -> bool:
     shallower) is still scanned and can still register a false positive;
     a false positive only ever makes MORE records canonical (and
     therefore quarantined, not silently emptied), never fewer -- the safe
-    direction."""
+    direction.
+
+    codex-final.md (final pass, BLOCKING): a comment-only line (optional
+    leading whitespace then `#`) must never anchor and must never be
+    matched -- it carries no structural indentation of its own. Before
+    this fix the FIRST non-blank line was used as the anchor even when
+    it was a YAML comment, which broke both directions: a column-zero
+    comment above a uniformly indented mapping anchored "top level" to
+    column zero and buried the mapping's real (indented) id/type/links
+    as merely "deeper than top" (a canonical topic silently read as a
+    note); an indented comment above a note anchored "top level" too
+    deep and let a nested marker (e.g. `metadata:` -> `links:`) that
+    sits shallower than the comment but deeper than the note's real
+    top level read as "not deeper than top" (a note wrongly flipped to
+    canonical). The anchor -- and every line eligible to match -- is
+    the first line that is neither blank nor a comment."""
     base_indent = None
     for raw_line in fm_text.splitlines():
-        if not raw_line.strip():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
             continue
         indent = len(raw_line) - len(raw_line.lstrip(" \t"))
         if base_indent is None:
             base_indent = indent
         if indent > base_indent:
             continue
-        line = raw_line.strip()
         if line.startswith("- "):
             line = line[2:].strip()
         if _RAW_CANONICAL_ID_RE.match(line) or _RAW_CANONICAL_LINKS_RE.match(line) or _RAW_CANONICAL_TYPE_RE.match(line):

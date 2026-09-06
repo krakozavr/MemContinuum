@@ -1723,12 +1723,19 @@ same five readers CAN see `stale`: a positive match off it is still returned
 (see the next paragraph), with one stderr line naming the cause (`"<cmd>:
 index is stale (store changed since the last reindex); results may be
 outdated"`). `for-path`'s own stale positive match, reached through
-`hooks/pre-edit-chain.sh` (which passes `--root "$MEMCONTINUUM_ROOT"` on both
-its `for-path` calls whenever that env var is set), is logged under its own
-hook.log outcome name, `index-stale-served`, distinct from a plain `matched`
-— the staleness caveat itself reaches `hook.log` only via `for-path`'s own
-stderr (the hook's existing redirect), never the injected `additionalContext`
-payload.
+`hooks/pre-edit-chain.sh` (which passes `--root "$MEMCONTINUUM_ROOT"` on its
+FIRST `for-path` call — the match-finding loop — whenever that env var is
+set), is logged under its own hook.log outcome name, `index-stale-served`,
+distinct from a plain `matched` — the staleness caveat itself reaches
+`hook.log` only via that first call's own stderr (the hook's existing
+redirect), never the injected `additionalContext` payload. The hook's SECOND
+`for-path` call — fetching the pretty chain-view text for the candidate the
+first call already matched — never passes `--root`. The first call already
+walked the store (via `_index_has_drift`) and already determined the state;
+a second `--root` there would re-walk the same store a second time for the
+same hook run, for no new information (the outcome name `finish()` logs, and
+whether the staleness caveat gets a stderr line at all, both come from the
+first call alone). One hook run walks the store at most once.
 
 **A positive match off a non-`current` index stays usable; a negative claim
 does not.** `upgrade-required`, `stale`, and `quarantined` all warn and

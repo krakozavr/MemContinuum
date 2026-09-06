@@ -3177,6 +3177,106 @@ class TestMalformedRecordQuarantine(unittest.TestCase):
             self.assertEqual(len(rows), 1, rows)
             self.assertEqual(rows[0]["path"], str(covering.resolve()))
 
+    # -- scenario 7d: codex-final.md BLOCKING -- a column-zero YAML comment
+    # must never itself become the structural indentation anchor.
+    # `_raw_frontmatter_is_canonical` anchored on the block's first
+    # NON-BLANK line, which the comment-carrying variant makes a `#
+    # leading comment` sitting at column zero -- every real key of the
+    # uniformly 4-space-indented mapping below it then reads as "deeper
+    # than top" and is skipped, so a fully schema-conformant topic loses
+    # its closing delimiter and is silently demoted to a note instead of
+    # quarantined. Comment-only lines must never anchor and must never be
+    # matched themselves; the anchor is the first line that is neither
+    # blank nor a comment.
+
+    def test_unmapped_self_heal_with_leading_comment_before_uniformly_indented_frontmatter_stays_quarantined(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            covering = root / "topics" / "covering.md"
+            _write_record(
+                covering,
+                "---\n# leading YAML comment\n    type: topic\n    id: TOP-9114\n    title: Covering\n"
+                "    code_refs: [src/mapped.py]\n"
+                "    links:\n"
+                '        - link: L1\n          status: active\n'
+                '          ruling: {text: "r", authority: owner-verbatim, source: s}\n'
+                "---\nBody text.\n",
+            )
+            db = Path(td) / "idx.sqlite"
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                rc0 = reindex(root, db, no_embed=True)
+            self.assertEqual(rc0, 0)
+            self.assertEqual(self._index_errors_rows(db), [])
+
+            # On-disk drift: remove ONLY the closing delimiter -- the
+            # comment and the fully schema-conformant, uniformly-indented
+            # mapping are both untouched.
+            _write_record(
+                covering,
+                "---\n# leading YAML comment\n    type: topic\n    id: TOP-9114\n    title: Covering\n"
+                "    code_refs: [src/mapped.py]\n"
+                "    links:\n"
+                '        - link: L1\n          status: active\n'
+                '          ruling: {text: "r", authority: owner-verbatim, source: s}\n'
+                "Body text.\n",
+            )
+            self.assertEqual(
+                memidx.decision_index_state(db, memidx.DEFAULT_PROJECT, root=root, verify_content=True),
+                "stale",
+            )
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                rc = memidx.cmd_unmapped(ns(
+                    project=memidx.DEFAULT_PROJECT, db=str(db), root=str(root),
+                    code_root=None, paths=["src/mapped.py"], json=True,
+                ))
+            out = json.loads(buf.getvalue())
+            self.assertEqual(rc, 1, out)
+            self.assertEqual(out["coverage_status"], "quarantined", out)
+            self.assertEqual(
+                out["unmapped"], [],
+                "a leading column-zero comment must never become the indentation anchor and "
+                "must never make a uniformly-indented canonical mapping read as merely a note, "
+                "leaving a false coverage gap",
+            )
+
+            rows = self._index_errors_rows(db)
+            self.assertEqual(len(rows), 1, rows)
+            self.assertEqual(rows[0]["path"], str(covering.resolve()))
+
+    def test_indented_comment_before_nested_metadata_links_does_not_make_unterminated_note_canonical(self):
+        """codex-final.md BLOCKING, opposite transition: a 4-space-indented
+        comment sitting above an unterminated note must not become the
+        indentation anchor either. The note's only frontmatter marker
+        that could ever match a canonical regex is a `links:` key nested
+        TWO levels deep, under `metadata:` -- never at the block's real
+        top-level indent (column zero, where `title:`/`metadata:` sit).
+        A buggy anchor taken from the indented comment (4 spaces) would
+        make that nested `links:` (2 spaces) read as "not deeper than
+        top" and wrongly flip the note to canonical/quarantined."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            note_path = root / "notes" / "note.md"
+            _write_record(
+                note_path,
+                "---\n    # indented comment\ntitle: my note\nmetadata:\n  links:\n"
+                "    - link: TOP-1\nBody, no closing delimiter.\n",
+            )
+            db = Path(td) / "idx.sqlite"
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf), contextlib.redirect_stdout(io.StringIO()):
+                rc = reindex(root, db, no_embed=True)
+            self.assertEqual(rc, 0, err_buf.getvalue())
+            self.assertEqual(
+                self._index_errors_rows(db), [],
+                "an indented comment must never become the anchor and must never let a nested "
+                "metadata.links marker masquerade as top-level canonical",
+            )
+
+            result = memidx.parse_record(note_path)
+            self.assertTrue(result.valid)
+
     # -- scenario 8: a note (no id/links/type) with malformed YAML stays indexed
 
     def test_note_with_malformed_yaml_stays_indexed_not_quarantined(self):
