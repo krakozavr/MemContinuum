@@ -14,6 +14,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Round 6: tests/test_hooks.py's TestPreEditChainOracleParity
+          # class does `git show 0732ac4:hooks/pre-edit-chain.sh` to get
+          # the REAL pre-round-5 script (not a reimplementation) as its
+          # oracle. actions/checkout@v4 defaults to fetch-depth: 1 (tip
+          # commit only) -- 0732ac4 is this checkout's own history (an
+          # ancestor of every commit after fix round 5), so a shallow
+          # clone never has it and every oracle-parity test skips
+          # instead of running (gated by
+          # test_hooks._oracle_commit_available(), not an error).
+          # fetch-depth: 0 (full history) is the fix; a fixed positive
+          # depth would rot the moment one more commit lands and pushes
+          # 0732ac4 out of range again.
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
@@ -53,6 +67,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Same reason as the unittest job's checkout step above: without
+          # this, tests/test_hooks.py's TestPreEditChainOracleParity class
+          # skips its whole class on every CI run here too (it needs
+          # 0732ac4's real blob, which a shallow default clone never has).
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -79,6 +99,9 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Same reason as the unittest job's checkout step above.
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

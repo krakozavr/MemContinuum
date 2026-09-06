@@ -40,12 +40,19 @@ in the chain, never an edit to the old one, so "we tried X, it did not work
 because Y, so we do Z instead" stays intact and citable. The linter does not enforce
 this invariant; git history is the record's own audit trail.
 
-Retrieval is **automatic**, not left to anyone's discipline. Before an edit
-touches a file, a hook looks up whatever decision governs that file and hands it
-over. Every hook here fails open: a missing index, a missing python, a failed
-lookup, or the hook running too long means the hook stays silent (or, on a
-timeout specifically, says outright that retrieval timed out rather than
-staying silent) — never that your edit is blocked. That lookup runs under a
+Retrieval is **automatic** for edits made with the Edit and Write tools, not
+left to anyone's discipline. Before one of those touches a file, a hook looks
+up whatever decision governs that file and hands it over. Every hook here
+fails open: a missing index, a missing python, a failed lookup, or the hook
+running too long means the hook stays silent (or, on a timeout specifically,
+says outright that retrieval timed out rather than staying silent) — never
+that your edit is blocked. A file changed from the shell instead — a script,
+`sed`, `git apply`, anything run as a Bash command — gets no lookup before the
+change and no requirement to declare what it touched: MemContinuum's best
+effort is to notice it afterwards, from a tree diff, and record it in the
+edit ledger, never to block the change over it — though one committed away
+in the same breath, or made under a path git ignores, is not seen at all.
+That lookup runs under a
 2-second watchdog deadline — a real lookup measures in the low tenths of a
 second, comfortably under it; a stale-but-present index is not one of the
 fail-open cases: it still answers from whatever it has, which is why keeping
@@ -83,11 +90,14 @@ carries that concept's id, so the trail from "code that does roughly this" to
 the `memory-search` skill tell agents to run `code-search` *before* writing a
 new helper.
 
-Creating a brand-new source file gets that reminder by itself: a hook fires the
-moment something writes to a path that does not exist yet and asks for the code
-index to be searched first — the one moment a duplicate helper is most likely to
-be written instead of found. It only ever adds a line of context; it never
-blocks the write.
+Creating a brand-new source file with the Write tool gets that reminder by
+itself: a hook fires the moment the Write tool creates a path that does not
+exist yet and asks for the code index to be searched first — the one moment a
+duplicate helper is most likely to be written instead of found. It only ever
+adds a line of context; it never blocks the write. A file created from the
+shell instead does not trigger this particular reminder — like any other
+shell-made change, it still lands in the edit ledger once something diffs the
+tree.
 
 Further reading: `docs/DESIGN.md` for why the engine is shaped this way,
 `docs/SCHEMA.md` for authoring records, and — for maintainers —
@@ -105,7 +115,10 @@ role from editing a store file directly. Each store gets
 record" and "the orchestrator writes it up" stay two deliberate steps by habit.
 
 Subagents get the relevant decision history handed to them before they touch a
-file; they do not have to go looking for it.
+file with the Edit or Write tools; they do not have to go looking for it. A
+subagent that changes a file from the shell instead gets no such hand-off —
+the edit still reaches the ledger afterwards, from the tree diff, same as any
+other shell-made change.
 
 The engine and the store are plain CLI tools and markdown files, so nothing here
 is locked to Claude Code — other agent stacks can adopt the same store. The
@@ -138,7 +151,9 @@ never auto-loaded. Once a fact graduates into a real ruling it moves into the
 store, and auto-memory keeps a one-line pointer to it — never a copy, because
 copies drift and a drifted copy gets quoted as if it were still true. The
 pre-edit hook is the bridge running the other way: it pulls a store record into
-the session exactly when a file it governs gets touched.
+the session exactly when a file it governs gets touched with the Edit or
+Write tools (a shell-made change to that same file gets no such pull — only
+the after-the-fact ledger entry).
 
 If the same fact lives in two of these places at once, one of them is already
 wrong. Pick its one home.
@@ -154,7 +169,13 @@ wrong. Pick its one home.
   Python's own `sqlite3` module provides — nothing to install separately.
 - ~100 MB of disk for the embedding model, downloaded once the first time
   something actually needs to embed. `--no-embed` and `--mode fts` never trigger
-  that download.
+  that download; neither does committing to the store -- the store's
+  `post-commit` hook runs a bounded, content-only pass and never touches the
+  embedding backend itself, so that download (and the embedding work it
+  precedes) happens in the background embed-worker it spawns, never inside
+  `git commit`. The index records which model (and dimension) made its
+  vectors and never mixes vectors from a different model or dimension into a
+  ranking; a changed model means a re-embed, not a silently mixed result.
 - Somewhere local for the index. It lives under `~/.memcontinuum/` by default;
   never put it on a synced or cloud-backed drive, where SQLite locking is not
   reliable.
@@ -301,7 +322,9 @@ To stop the question in every repo on the machine at once, not just this one:
 `scripts/memcontinuum-decide.sh never-ask`, undone with `ask-again`.
 
 **`/memory-search`** is the other skill: a deliberate, on-demand search of the
-store and the code index, rather than the automatic per-edit lookup.
+store and the code index, rather than the automatic per-edit lookup (which
+only fires for the Edit and Write tools — reach for this skill by hand before
+changing a file from the shell instead).
 
 **A nudge is an action item, not a notice.** When the session is reminded that
 recent work is not covered by any decision record, the answer is either new
@@ -318,8 +341,9 @@ most a one-line pointer to a store record. Never both; never copy content across
 the two.
 
 **The commands a person actually types.** The store's own `README.md` lists
-most of these with your paths already filled in — all but the two code-index
-commands:
+most of these with your paths already filled in — not the code-index or
+maintenance commands (`code-search`, `code-reindex`, `embed-worker`, `stats`,
+`backend-preflight`):
 
 ```bash
 memidx.py why <symbol-or-path> --project NAME --code-root DIR                    # why is this here?
@@ -329,6 +353,7 @@ memidx.py for-path <file> --project NAME                                        
 memidx.py chain <topic-id> --project NAME                                        # one question's full history
 memidx.py drift --code-root DIR --project NAME                                   # has the code grown a bypass?
 memidx.py reindex --root STORE --project NAME                                    # after editing the store by hand
+memidx.py embed-worker --root STORE --project NAME --db DB                       # run the background embed backfill by hand
 memidx.py code-reindex --code-root DIR --project NAME                            # after the code moved on
 memidx.py stats --project NAME [--days 7] [--store DIR]                          # is retrieval actually firing?
 memidx.py backend-preflight [--json]                                             # which backends import here, and do their versions match the pins?
@@ -349,13 +374,22 @@ window — every hook here fails open, so a dead hook and a healthy one that
 found nothing look identical from inside a session; `stats` is what tells them
 apart, and flags the silent side when it finds one.
 
-Two more things worth knowing: committing the store reindexes it automatically,
-so `reindex` by hand is only for edits you have not committed yet; and a
-project can have several code roots — `code-search` tells you when their index
-is missing or stale rather than returning an empty list that reads like
-"nothing found", and heals a stale or incomplete index itself before
-searching, in one attempt, when the drift is small enough. Run any command
-with `--help` for its full flag list.
+A few more things worth knowing: committing the store refreshes its text
+index at once (the post-commit hook's own bounded, content-only pass), so
+`reindex` by hand is only for edits you have not committed yet; vectors
+follow in the background (a detached embed-worker the same hook spawns,
+coalescing repeated commits into one pass), and `stats`/`check --json` show
+the backlog (`embedding_backlog`) while it catches up. A
+project can have several code roots — `code-search` says whether a root's
+index is proven current, metadata-checked, stale, or incomplete, rather than
+returning an empty list that reads like "nothing found", and `--verify-content`
+proves it by hashing every indexed file; either way it heals a stale or
+incomplete index itself before searching, in one attempt, when the drift is
+small enough. A failed cleanup — the rare case where the index itself cannot
+be safely updated for one file or record — fails the reindex with a non-zero
+exit instead of reporting success, and internal errors are named by reason
+rather than folded into a bare "something went wrong". Run any command with
+`--help` for its full flag list.
 
 **Keeping a wired repo up to date.** A fix that only touches a script (a hook,
 `memidx.py`, `memlint.py`) reaches every wired repo the moment you pull —
@@ -446,9 +480,9 @@ exist to prevent.
 
 With several `--code-root` directories, every one of them is indexed and
 searchable — `code-reindex`/`code-search` are scoped per root, so repairing
-one root never touches another's rows. The write-side hooks are the one
-exception: the edit ledger and the nudges that read it follow the **first**
-root only, so edits under a later root do not reach them. The new-file
+one root never touches another's rows. The write-side hooks watch every root
+too: the edit ledger records which root an edit landed under, and the
+coverage/look-back nudges classify edits across all of them. The new-file
 reminder is the one per-root hook: it is wired for, and fires under, every
 `--code-root` given.
 
@@ -466,7 +500,10 @@ Project level, by hand:
 2. Delete `<claude-dir>/skills/memory-search/`.
 3. Delete `<store>/.git/hooks/post-commit`.
 4. Delete `~/.memcontinuum/<project>.sqlite`, and
-   `~/.memcontinuum/<project>-code.sqlite` if `code-reindex` was ever run (or
+   `~/.memcontinuum/<project>-code.sqlite` if `code-reindex` was ever run, and
+   `~/.memcontinuum/<project>.embed-pending`, `<project>.embed.lock` and
+   `<project>.embed.log` if the post-commit hook's embed-worker ever ran, and
+   `memidx-debug.log` if any command ever degraded on an internal error (or
    wherever `MEMCONTINUUM_HOME` points).
 
 Leave `<store>` itself alone. It is your decision history, not an installer

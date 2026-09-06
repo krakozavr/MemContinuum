@@ -372,11 +372,13 @@ class TestWhy(unittest.TestCase):
         fall back to scanning code_root every time. Isolated by disabling
         the fallback's own matcher (fragment_declared_in_text) rather than
         deleting the source file: Anatomy M2a Task 5 makes the fast path
-        distrust a report state of anything but current/degraded-without-
-        drift, and a removed file counts as a change (state -> stale), so
-        deletion would (correctly) route this query to the disabled
-        fallback and fail instead of proving the fast path was used. The
-        file stays on disk, unedited, so the report reads "current" and the
+        distrust a report state of anything but stale (design R3, audit
+        MC-P1-02: that gate is `report["state"] == "stale"`, so
+        metadata-current and current are equally trusted), and a removed
+        file counts as a change (state -> stale), so deletion would
+        (correctly) route this query to the disabled fallback and fail
+        instead of proving the fast path was used. The file stays on
+        disk, unedited, so the report reads "metadata-current" and the
         fast path is what must answer."""
         with tempfile.TemporaryDirectory() as td:
             code_root = Path(td) / "code"

@@ -5,8 +5,10 @@ of its logic -- because the thing under test is the script's environment
 handling (the PYTHONPATH trap, env-driven project/root resolution, fail-open
 behavior) as much as its output shape.
 """
+import fcntl
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -15,6 +17,8 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 TOOLS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(TOOLS_DIR))
@@ -84,6 +88,42 @@ def run_hook(payload_text: str, env: dict, timeout: float = 5.0):
     )
     elapsed = time.monotonic() - start
     return proc, elapsed
+
+
+def memidx_wrapper_python(target_dir, name: str, body: str, real_py: str = ""):
+    """A bash impersonation of MEMCONTINUUM_PYTHON, shared by every test
+    that needs to observe or modify what memidx.py's own machinery does
+    without touching the hook script under test: any `-c` call (the
+    watchdog launcher's own `-c "$MC_WATCHDOG_LAUNCHER_PY"` invocation, or
+    a hook's own inline JSON-parsing/assembly `-c` calls) passes straight
+    through to the real venv python unmodified (both need the real
+    interpreter to run); only a script-path invocation ("$PY"
+    "<engine>/memidx.py" <subcommand> ...) is intercepted, running a
+    real-python `-c` snippet that executes `body` (e.g. recording
+    `sys.argv[1:]`, monkeypatching a memidx.py function) before handing
+    off to memidx.main(sys.argv[1:])."""
+    wrapper = Path(target_dir) / name
+    wrapper.write_text(
+        "#!/usr/bin/env bash\n"
+        f'REAL_PY="{real_py or VENV_PYTHON}"\n'
+        'if [ "$1" = "-c" ]; then\n'
+        '    exec "$REAL_PY" "$@"\n'
+        'fi\n'
+        'shift\n'
+        f'exec "$REAL_PY" -c \'\n'
+        'import sys\n'
+        # Double-quoted, not repr() -- the whole snippet is itself
+        # wrapped in a bash SINGLE-quoted `-c '...'` string below, so a
+        # literal single quote here (what !r would produce) would
+        # break out of that bash quoting early.
+        f'sys.path.insert(0, "{TOOLS_DIR}")\n'
+        'import memidx\n'
+        f'{body}\n'
+        'sys.exit(memidx.main(sys.argv[1:]))\n'
+        "' \"$@\"\n"
+    )
+    wrapper.chmod(0o755)
+    return wrapper
 
 
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
@@ -698,6 +738,62 @@ class TestPreEditChainRootAndStaleWarning(unittest.TestCase):
         self.assertIn("outcome=matched", log_text)
         self.assertNotIn("outcome=index-stale-served", log_text)
 
+    def test_single_for_path_call_carries_root_and_with_chain_text(self):
+        """Round 5 (ruling 137 / CI evidence: the macOS runner measured
+        this hook at 1.003-1.022s against its own 1.0s bar). `--root` on
+        `for-path` is what triggers `_index_has_drift`, a real on-disk walk
+        of the store -- the match-finding loop's call already pays that
+        cost and determines the state (`current`/`stale`/`quarantined`),
+        warning on it via its own stderr. `--with-chain-text` (memidx.py
+        item 1) now folds the pretty chain-view text into that SAME call's
+        JSON envelope, so the old second `for-path` call (CHAIN_TEXT_ARGS,
+        fetching only the chain text for the candidate the first call
+        already matched) is gone entirely -- one hook run makes exactly
+        ONE `for-path` invocation, carrying both flags. A fake memidx.py
+        wrapper (`memidx_wrapper_python`) records every script-path
+        invocation's argv, independent of what for-path itself prints or
+        logs.
+
+        A single matching candidate (the raw file_path itself, no cwd/
+        strip-prefix fallback needed) keeps this deterministic: exactly
+        one `for-path` invocation total, no ambiguity about which call it
+        is."""
+        argv_log = Path(self.tmp) / "argv.jsonl"
+        wrapper = memidx_wrapper_python(
+            self.tmp, "argv-recorder",
+            f'ARGV_LOG = "{argv_log}"\n'
+            'import json\n'
+            'with open(ARGV_LOG, "a") as _f:\n'
+            '    _f.write(json.dumps(sys.argv[1:]))\n'
+            '    _f.write(chr(10))\n',
+        )
+        payload = json.dumps(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Edit",
+                "cwd": "/nowhere-relevant",
+                "tool_input": {"file_path": "src/core/scan/scan_plan.py"},
+            }
+        )
+        env = clean_env(
+            MEMCONTINUUM_HOME=self.memtool_home,
+            MEMCONTINUUM_PROJECT=self.project,
+            MEMCONTINUUM_PYTHON=str(wrapper),
+            MEMCONTINUUM_ROOT=str(self.root),
+        )
+        proc, elapsed = run_hook(payload, env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(proc.stdout.strip(), "expected additionalContext output, got nothing")
+
+        calls = [json.loads(line) for line in argv_log.read_text().splitlines() if line.strip()]
+        for_path_calls = [c for c in calls if c and c[0] == "for-path"]
+        self.assertEqual(
+            len(for_path_calls), 1,
+            f"one memidx invocation per hook run: {for_path_calls}",
+        )
+        self.assertIn("--root", for_path_calls[0], for_path_calls[0])
+        self.assertIn("--with-chain-text", for_path_calls[0], for_path_calls[0])
+
 
 class TestF6RenderedTimeout(unittest.TestCase):
     """The OUTER Claude Code backstop: `code-root-filter-pair.json.tmpl`
@@ -795,6 +891,442 @@ class TestPreEditChainWatchdog(unittest.TestCase):
         self.assertIn("not established", ctx.lower())
 
 
+ORACLE_COMMIT = "0732ac4"
+
+
+def _oracle_commit_available() -> bool:
+    """A shallow CI checkout (actions/checkout's default fetch-depth: 1)
+    only has the tip commit -- once this round's own commit lands,
+    ORACLE_COMMIT is its PARENT and absent from history entirely. `git
+    show`/`cat-file` on a missing object fails outright rather than
+    returning something empty, so this must be checked BEFORE setUpClass
+    ever calls `git show`, not caught there."""
+    try:
+        subprocess.run(
+            ["git", "cat-file", "-e", f"{ORACLE_COMMIT}^{{commit}}"],
+            cwd=str(TOOLS_DIR), capture_output=True, check=True,
+        )
+        return True
+    except (subprocess.CalledProcessError, OSError):
+        return False
+
+
+_ORACLE_COMMIT_AVAILABLE = _oracle_commit_available()
+_SKIP_NO_ORACLE_COMMIT = (
+    f"commit {ORACLE_COMMIT} is not present in this checkout's history "
+    "(a shallow clone only fetches the tip commit) -- the oracle-parity "
+    "check needs the actual pre-round-5 script, not a reimplementation, "
+    "so it skips rather than fabricating one"
+)
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+@unittest.skipUnless(_ORACLE_COMMIT_AVAILABLE, _SKIP_NO_ORACLE_COMMIT)
+class TestPreEditChainOracleParity(unittest.TestCase):
+    """Round 5 rewrote pre-edit-chain.sh's candidate loop and chain-text
+    fetch to make ONE `for-path` call (--with-chain-text) and ONE parser
+    per hook run instead of two calls and three parsers. This class
+    proves the rewrite is behavior-preserving: the oracle is the REAL
+    pre-round-5 script -- the committed ORACLE_COMMIT blob, copied to a
+    temp file, not a reimplementation of its logic -- run against the
+    exact same inputs as the current script. Only the outcome NAME is
+    compared out of hook.log (never the full line: elapsed=/timestamp
+    naturally differ run to run).
+
+    Round 6 fixed a real bug the frozen oracle still has: its
+    "Decision-chain memory: N topic(s) reference this file." header
+    always said "1" for ANY match, because the old `grep -c '"id":'`
+    counted matching LINES of a one-line JSON dump (always exactly one
+    line), never a real per-topic count. The current script now computes
+    a real count of the DISTINCT topics whose chains actually get
+    rendered (see hooks/pre-edit-chain.sh's own comment at the
+    `topic_ids` loop) -- so on a multi-topic/concept match the oracle and
+    the current script now legitimately print DIFFERENT header counts,
+    by design, not by regression.
+    `_assert_stdout_matches_except_topic_count` below normalises only
+    that one digit before comparing, so every other byte of
+    additionalContext (chain text, citation
+    reminder, JSON structure) still has to match exactly."""
+
+    _TOPIC_COUNT_HEADER_RE = re.compile(
+        r"Decision-chain memory: \d+ topic\(s\) reference this file\."
+    )
+
+    def _assert_stdout_matches_except_topic_count(self, new_stdout, oracle_stdout):
+        def _normalized(text):
+            return self._TOPIC_COUNT_HEADER_RE.sub(
+                "Decision-chain memory: N topic(s) reference this file.", text
+            )
+
+        self.assertEqual(
+            _normalized(new_stdout), _normalized(oracle_stdout),
+            "byte-identical stdout (topic-count header normalised -- round 6 "
+            "made it a real count, so it may legitimately differ from the "
+            "frozen pre-round-5 oracle's always-1 quirk)",
+        )
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="memcontinuum-hook-oracle-test-")
+        oracle_text = subprocess.run(
+            ["git", "show", f"{ORACLE_COMMIT}:hooks/pre-edit-chain.sh"],
+            cwd=str(TOOLS_DIR), capture_output=True, text=True, check=True,
+        ).stdout
+        # The oracle script computes MEMIDX/mc-watchdog.sh relative to its
+        # OWN location ($SCRIPT_DIR/../memidx.py, $SCRIPT_DIR/mc-
+        # watchdog.sh) -- it needs a sibling layout to resolve, not a bare
+        # standalone file. Symlinked at the real (current) memidx.py and
+        # mc-watchdog.sh: memidx.py's own for-path/--with-chain-text
+        # change is additive (the pre-existing --json shape and the
+        # two-call sequence the oracle script itself drives are both
+        # unchanged), so this is exactly "the pre-round-5 script talking
+        # to the same engine", not a different oracle.
+        oracle_repo = Path(cls.tmp) / "oracle-repo"
+        (oracle_repo / "hooks").mkdir(parents=True)
+        (oracle_repo / "memidx.py").symlink_to(TOOLS_DIR / "memidx.py")
+        (oracle_repo / "hooks" / "mc-watchdog.sh").symlink_to(TOOLS_DIR / "hooks" / "mc-watchdog.sh")
+        cls.oracle_script = oracle_repo / "hooks" / "pre-edit-chain.sh"
+        cls.oracle_script.write_text(oracle_text)
+        cls.oracle_script.chmod(0o755)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def _new_home(self, project):
+        home = Path(self.tmp) / f"home-{project}"
+        home.mkdir(exist_ok=True)
+        return home
+
+    def _run(self, script_path, payload_text, env, timeout=10.0):
+        return subprocess.run(
+            [MC_BASH, str(script_path)], input=payload_text,
+            capture_output=True, text=True, env=env, timeout=timeout,
+        )
+
+    def _outcome_name(self, log_slice):
+        matches = re.findall(r"outcome=(\S+)", log_slice)
+        return matches[-1] if matches else None
+
+    def _run_pair(self, home, payload, env_overrides):
+        """Runs the oracle then the current script against the SAME
+        MEMCONTINUUM_HOME/db (read-only queries, so no risk of one run's
+        state affecting the other) and returns
+        (oracle_proc, new_proc, oracle_outcome, new_outcome)."""
+        log_path = home / "hook.log"
+        env = clean_env(MEMCONTINUUM_HOME=str(home), MEMCONTINUUM_PYTHON=VENV_PYTHON, **env_overrides)
+
+        before = log_path.read_text() if log_path.exists() else ""
+        oracle_proc = self._run(self.oracle_script, payload, env)
+        after_oracle = log_path.read_text()
+        oracle_outcome = self._outcome_name(after_oracle[len(before):])
+
+        new_proc = self._run(HOOK_SCRIPT, payload, env)
+        after_new = log_path.read_text()
+        new_outcome = self._outcome_name(after_new[len(after_oracle):])
+
+        return oracle_proc, new_proc, oracle_outcome, new_outcome
+
+    def _matching_payload(self):
+        return json.dumps({
+            "hook_event_name": "PreToolUse", "tool_name": "Edit",
+            "cwd": "/some/other/unrelated/dir",
+            "tool_input": {"file_path": "/fake/repo/src/core/scan/scan_plan.py"},
+        })
+
+    def _nonmatching_payload(self):
+        return json.dumps({
+            "hook_event_name": "PreToolUse", "tool_name": "Edit",
+            "cwd": "/nowhere",
+            "tool_input": {"file_path": "/nowhere/near/anything.py"},
+        })
+
+    def _reindex(self, root, project, db):
+        args = type(
+            "Args", (), dict(root=str(root), project=project, db=str(db), full=True, no_embed=True),
+        )()
+        memidx.cmd_reindex(args)
+
+    def _topic_with_code_ref(self, tid: str, code_ref: str) -> str:
+        return (
+            f"---\ntype: topic\nid: {tid}\ntitle: T-{tid}\n"
+            f"code_refs:\n  - {code_ref}\n"
+            "links:\n"
+            '  - link: L1\n    status: active\n    ruling: {text: "r", authority: owner-verbatim, source: s}\n'
+            "---\nBody.\n"
+        )
+
+    def _topic_with_nul_in_ruling(self, tid: str, code_ref: str) -> str:
+        """Round 7 red test fixture: a YAML double-quoted `\\0` escape
+        decodes (PyYAML) to a real NUL byte in the ruling text -- the
+        rendered chain line then embeds that NUL, verbatim, in the middle
+        of the plain-text chain_text this topic contributes."""
+        return (
+            f"---\ntype: topic\nid: {tid}\ntitle: T-{tid}\n"
+            f"code_refs:\n  - {code_ref}\n"
+            "links:\n"
+            '  - link: L1\n    status: active\n    ruling: {text: "before\\0after", authority: owner-verbatim, source: s}\n'
+            "---\nBody.\n"
+        )
+
+    def test_match_with_a_chain(self):
+        project = "oracle-match"
+        home = self._new_home(project)
+        self._reindex(SCHEMA_FIXTURE_ROOT, project, home / f"{project}.sqlite")
+
+        oracle_proc, new_proc, oracle_outcome, new_outcome = self._run_pair(
+            home, self._matching_payload(),
+            dict(MEMCONTINUUM_PROJECT=project, MEMCONTINUUM_STRIP_PREFIX="/fake/repo/"),
+        )
+        self.assertEqual(oracle_proc.returncode, 0, oracle_proc.stderr)
+        self.assertEqual(new_proc.returncode, 0, new_proc.stderr)
+        self.assertTrue(oracle_proc.stdout.strip())
+        self._assert_stdout_matches_except_topic_count(new_proc.stdout, oracle_proc.stdout)
+        # The topic-count normalisation above widens the comparison from
+        # a literal byte match -- pin the one-topic count explicitly here
+        # so this scenario still proves "1", not just "whatever number
+        # both scripts happen to agree on".
+        self.assertIn("Decision-chain memory: 1 topic(s) reference this file.", new_proc.stdout)
+        self.assertEqual(new_outcome, oracle_outcome)
+        self.assertEqual(new_outcome, "matched")
+
+    def test_match_with_two_topics_gets_a_real_topic_count(self):
+        """Round 6 red test: a store where TWO topics both reference the
+        same file is the one scenario that distinguishes a real per-topic
+        COUNT from the old `grep -c '"id":'` quirk -- the other scenarios
+        (one topic, no concepts) all print "1" either way and can't tell
+        the difference. The frozen oracle (0732ac4) still has the old bug
+        (`grep -c` counts matching LINES of a one-line JSON dump, always
+        exactly one line, so its header always says "1" no matter how many
+        topics matched) -- that is now an EXPECTED divergence from the
+        current script, not a parity failure, so the raw byte-for-byte
+        stdout comparison every other scenario in this class uses is
+        replaced here with `_assert_stdout_matches_except_topic_count`,
+        which normalises away only the header's digit before comparing
+        everything else (chain text, citation reminder, JSON structure)."""
+        project = "oracle-two-topics"
+        home = self._new_home(project)
+        root = Path(self.tmp) / f"{project}-store"
+        (root / "topics").mkdir(parents=True)
+        (root / "topics" / "one.md").write_text(
+            self._topic_with_code_ref("TOP-2001", "src/core/scan/scan_plan.py")
+        )
+        (root / "topics" / "two.md").write_text(
+            self._topic_with_code_ref("TOP-2002", "src/core/scan/scan_plan.py")
+        )
+        self._reindex(root, project, home / f"{project}.sqlite")
+
+        oracle_proc, new_proc, oracle_outcome, new_outcome = self._run_pair(
+            home, self._matching_payload(),
+            dict(MEMCONTINUUM_PROJECT=project, MEMCONTINUUM_STRIP_PREFIX="/fake/repo/"),
+        )
+        self.assertEqual(oracle_proc.returncode, 0, oracle_proc.stderr)
+        self.assertEqual(new_proc.returncode, 0, new_proc.stderr)
+        self.assertTrue(oracle_proc.stdout.strip())
+        self._assert_stdout_matches_except_topic_count(new_proc.stdout, oracle_proc.stdout)
+        self.assertEqual(new_outcome, oracle_outcome)
+        self.assertEqual(new_outcome, "matched")
+        # The oracle still has the old quirk: two topics matched, header
+        # still says "1" -- exactly what 0732ac4 always said.
+        self.assertIn("Decision-chain memory: 1 topic(s) reference this file.", oracle_proc.stdout)
+        # The current script computes a real count: two topics matched,
+        # header says "2" -- this is the fix this round makes.
+        self.assertIn("Decision-chain memory: 2 topic(s) reference this file.", new_proc.stdout)
+
+    def test_nul_in_ruling_text_does_not_truncate_or_drop_later_topics(self):
+        """Round 7 red test (Codex MAJOR, hooks/pre-edit-chain.sh's own
+        candidate-loop parser): chain_text crosses from memidx.py into
+        this hook through a chr(0)-delimited stream, read back with
+        `read -d ''` -- which treats ANY NUL byte as the end of the
+        CURRENT field, not just the delimiter this loop itself appends.
+        A record whose decoded ruling text embeds a real NUL (YAML
+        `"before\\0after"`) used to truncate chain_text right there,
+        silently dropping every topic whose rendered chain came after it
+        in the SAME chain_text string -- even though the header (computed
+        separately, from the untruncated `results` list) still reported
+        the full topic count. The frozen pre-round-5 oracle never hit
+        this: its own transport was three separate `$(...)` command
+        substitutions, and plain command substitution in bash silently
+        DROPS an embedded NUL byte from captured output rather than
+        truncating the surrounding text -- so the oracle is also the
+        correct-behavior reference here, not just a parity fixture: BOTH
+        scripts must retain both topics and the concatenated
+        "beforeafter" text (NUL dropped, nothing lost), not merely agree
+        with each other."""
+        project = "oracle-embedded-nul"
+        home = self._new_home(project)
+        root = Path(self.tmp) / f"{project}-store"
+        (root / "topics").mkdir(parents=True)
+        (root / "topics" / "one.md").write_text(
+            self._topic_with_nul_in_ruling("TOP-3001", "src/core/scan/scan_plan.py")
+        )
+        (root / "topics" / "two.md").write_text(
+            self._topic_with_code_ref("TOP-3002", "src/core/scan/scan_plan.py")
+        )
+        self._reindex(root, project, home / f"{project}.sqlite")
+
+        oracle_proc, new_proc, oracle_outcome, new_outcome = self._run_pair(
+            home, self._matching_payload(),
+            dict(MEMCONTINUUM_PROJECT=project, MEMCONTINUUM_STRIP_PREFIX="/fake/repo/"),
+        )
+        self.assertEqual(oracle_proc.returncode, 0, oracle_proc.stderr)
+        self.assertEqual(new_proc.returncode, 0, new_proc.stderr)
+        self.assertEqual(new_outcome, oracle_outcome)
+        self.assertEqual(new_outcome, "matched")
+        self._assert_stdout_matches_except_topic_count(new_proc.stdout, oracle_proc.stdout)
+        for label, stdout in (("oracle", oracle_proc.stdout), ("new", new_proc.stdout)):
+            with self.subTest(label):
+                self.assertIn("beforeafter", stdout)
+                self.assertIn("TOP-3001", stdout)
+                self.assertIn("TOP-3002", stdout)
+        self.assertIn("Decision-chain memory: 2 topic(s) reference this file.", new_proc.stdout)
+
+    def test_ungoverned_concept_multiline_owner_boundary_trailing_newline_parity(self):
+        """Round 7 red test (Codex MINOR): for_path_chain_lines' concept
+        line embeds owner_boundary verbatim -- f"{id} {title} -- {boundary}".
+        A YAML `|` block scalar clips to exactly one trailing newline, so
+        an UNGOVERNED concept (no governed_by topics, so this is the
+        only/last chain_text line) makes chain_text itself end in a
+        newline. The frozen pre-round-5 oracle captured chain_text
+        through a `$(...)` command substitution, which strips every
+        trailing newline unconditionally; the round-5 transport (read
+        -d '' off a chr(0)-delimited stream) preserves it instead, so the
+        final "\\n\\n".join(...) in the OUTPUT_JSON assembly step below
+        inserted an extra blank line before CONSTRAINT that the oracle
+        never produced. Byte-identical parity (topic-count header
+        normalised only, same as every other case in this class) is the
+        bar."""
+        project = "oracle-concept-boundary-newline"
+        home = self._new_home(project)
+        root = Path(self.tmp) / f"{project}-store"
+        (root / "concepts").mkdir(parents=True)
+        (root / "concepts" / "c1.md").write_text(
+            "---\ntype: concept\nid: CPT-1\ntitle: C-CPT-1\n"
+            "implemented_by:\n  - src/core/scan/scan_plan.py\n"
+            "owner_boundary: |\n  line one\n  line two\n"
+            "---\nBody.\n"
+        )
+        self._reindex(root, project, home / f"{project}.sqlite")
+
+        oracle_proc, new_proc, oracle_outcome, new_outcome = self._run_pair(
+            home, self._matching_payload(),
+            dict(MEMCONTINUUM_PROJECT=project, MEMCONTINUUM_STRIP_PREFIX="/fake/repo/"),
+        )
+        self.assertEqual(oracle_proc.returncode, 0, oracle_proc.stderr)
+        self.assertEqual(new_proc.returncode, 0, new_proc.stderr)
+        self.assertTrue(oracle_proc.stdout.strip())
+        self._assert_stdout_matches_except_topic_count(new_proc.stdout, oracle_proc.stdout)
+        self.assertEqual(new_outcome, oracle_outcome)
+        self.assertEqual(new_outcome, "matched")
+        self.assertIn("line one\\nline two", new_proc.stdout)
+
+    def test_no_match(self):
+        project = "oracle-nomatch"
+        home = self._new_home(project)
+        self._reindex(SCHEMA_FIXTURE_ROOT, project, home / f"{project}.sqlite")
+
+        oracle_proc, new_proc, oracle_outcome, new_outcome = self._run_pair(
+            home, self._nonmatching_payload(), dict(MEMCONTINUUM_PROJECT=project),
+        )
+        self.assertEqual(oracle_proc.returncode, 0, oracle_proc.stderr)
+        self.assertEqual(new_proc.returncode, 0, new_proc.stderr)
+        self.assertEqual(new_proc.stdout.strip(), oracle_proc.stdout.strip())
+        self.assertEqual(new_proc.stdout.strip(), "")
+        self.assertEqual(new_outcome, oracle_outcome)
+        self.assertEqual(new_outcome, "no-match")
+
+    def test_stale_index_with_root(self):
+        project = "oracle-stale"
+        home = self._new_home(project)
+        root = Path(self.tmp) / f"{project}-store"
+        shutil.copytree(SCHEMA_FIXTURE_ROOT, root)
+        self._reindex(root, project, home / f"{project}.sqlite")
+        (root / "topics" / "new-topic.md").write_text(
+            "---\ntype: topic\nid: TOP-NEW\ntitle: New\nlinks: []\n---\nBody.\n"
+        )
+
+        oracle_proc, new_proc, oracle_outcome, new_outcome = self._run_pair(
+            home, self._matching_payload(),
+            dict(MEMCONTINUUM_PROJECT=project, MEMCONTINUUM_STRIP_PREFIX="/fake/repo/",
+                 MEMCONTINUUM_ROOT=str(root)),
+        )
+        self.assertEqual(oracle_proc.returncode, 0, oracle_proc.stderr)
+        self.assertEqual(new_proc.returncode, 0, new_proc.stderr)
+        self.assertTrue(oracle_proc.stdout.strip())
+        self._assert_stdout_matches_except_topic_count(new_proc.stdout, oracle_proc.stdout)
+        self.assertEqual(new_outcome, oracle_outcome)
+        self.assertEqual(new_outcome, "index-stale-served")
+
+    def test_quarantined_index(self):
+        project = "oracle-quarantine"
+        home = self._new_home(project)
+        root = Path(self.tmp) / f"{project}-store"
+        shutil.copytree(SCHEMA_FIXTURE_ROOT, root)
+        (root / "topics" / "bad.md").write_text(
+            "---\ntype: topic\nid: TOP-9999\ntitle: Bad\nlinks: [\n---\nBody.\n"
+        )
+        db = home / f"{project}.sqlite"
+        self._reindex(root, project, db)
+        self.assertEqual(memidx.decision_index_state(db, project, root=root), "quarantined")
+
+        oracle_proc, new_proc, oracle_outcome, new_outcome = self._run_pair(
+            home, self._matching_payload(),
+            dict(MEMCONTINUUM_PROJECT=project, MEMCONTINUUM_STRIP_PREFIX="/fake/repo/",
+                 MEMCONTINUUM_ROOT=str(root)),
+        )
+        self.assertEqual(oracle_proc.returncode, 0, oracle_proc.stderr)
+        self.assertEqual(new_proc.returncode, 0, new_proc.stderr)
+        self.assertTrue(oracle_proc.stdout.strip())
+        self._assert_stdout_matches_except_topic_count(new_proc.stdout, oracle_proc.stdout)
+        self.assertEqual(new_outcome, oracle_outcome)
+        self.assertEqual(new_outcome, "matched")
+
+    def test_missing_index(self):
+        project = "oracle-missing"
+        home = self._new_home(project)
+        # no db ever created for this project -- both scripts' own
+        # pre-loop [ ! -f "$DB_PATH" ] check must catch it before any
+        # `for-path` call is attempted.
+
+        oracle_proc, new_proc, oracle_outcome, new_outcome = self._run_pair(
+            home, self._matching_payload(),
+            dict(MEMCONTINUUM_PROJECT=project, MEMCONTINUUM_STRIP_PREFIX="/fake/repo/"),
+        )
+        self.assertEqual(oracle_proc.returncode, 0, oracle_proc.stderr)
+        self.assertEqual(new_proc.returncode, 0, new_proc.stderr)
+        self.assertEqual(new_proc.stdout.strip(), oracle_proc.stdout.strip())
+        self.assertEqual(new_proc.stdout.strip(), "")
+        self.assertEqual(new_outcome, oracle_outcome)
+        self.assertEqual(new_outcome, "index-missing")
+
+    def test_index_error_rc4(self):
+        project = "oracle-indexerror"
+        home = self._new_home(project)
+        db = home / f"{project}.sqlite"
+        self._reindex(SCHEMA_FIXTURE_ROOT, project, db)
+        conn = sqlite3.connect(str(db))
+        conn.execute("ALTER TABLE records RENAME COLUMN path TO path_broken")
+        conn.commit(); conn.close()
+
+        def _restore():
+            c = sqlite3.connect(str(db))
+            c.execute("ALTER TABLE records RENAME COLUMN path_broken TO path")
+            c.commit(); c.close()
+
+        self.addCleanup(_restore)
+
+        oracle_proc, new_proc, oracle_outcome, new_outcome = self._run_pair(
+            home, self._matching_payload(),
+            dict(MEMCONTINUUM_PROJECT=project, MEMCONTINUUM_STRIP_PREFIX="/fake/repo/"),
+        )
+        self.assertEqual(oracle_proc.returncode, 0, oracle_proc.stderr)
+        self.assertEqual(new_proc.returncode, 0, new_proc.stderr)
+        self.assertEqual(new_proc.stdout.strip(), oracle_proc.stdout.strip())
+        self.assertEqual(new_proc.stdout.strip(), "")
+        self.assertEqual(new_outcome, oracle_outcome)
+        self.assertEqual(new_outcome, "index-error")
+
+
 POST_COMMIT_HOOK = TOOLS_DIR / "hooks" / "post-commit-reindex.sh"
 
 
@@ -868,7 +1400,15 @@ class TestPostCommitReindexHook(unittest.TestCase):
             "---\nid: T-0001\ntitle: Test\nstatus: active\n---\nbody\n"
         )
 
-        env = clean_env(HOME=str(fake_home), MEMCONTINUUM_ROOT=str(store_root), MEMCONTINUUM_PROJECT="pc-test")
+        # Design R8: this store's one topic has no vector yet, so the
+        # content pass leaves E>0 and the hook would otherwise spawn a
+        # REAL background embed-worker (a real python resolved via the
+        # pointer chain, genuinely embedding) that would outlive this
+        # test. MEMCONTINUUM_EMBED_WORKER=0 disables the spawn -- the
+        # marker is still touched, the content pass (this test's actual
+        # subject) is unaffected.
+        env = clean_env(HOME=str(fake_home), MEMCONTINUUM_ROOT=str(store_root), MEMCONTINUUM_PROJECT="pc-test",
+                         MEMCONTINUUM_EMBED_WORKER="0")
         env.pop("MEMCONTINUUM_HOME", None)
         env.pop("MEMCONTINUUM_PYTHON", None)
         proc = subprocess.run(
@@ -882,6 +1422,233 @@ class TestPostCommitReindexHook(unittest.TestCase):
         log_text = (custom_home / "hook.log").read_text()
         self.assertIn("rc=0", log_text, log_text)
         self.assertFalse((default_mc_home / "pc-test.sqlite").exists())
+        self.assertFalse(
+            (custom_home / "pc-test.embed.lock").exists(),
+            "no worker was ever spawned (MEMCONTINUUM_EMBED_WORKER=0) -- no lock file either",
+        )
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestPostCommitReindexEmbedWorker(unittest.TestCase):
+    """Design R8 (audit MC-P2-02, TOP-0123 L7): the redesigned hook runs a
+    bounded content-only pass (`reindex --no-embed --auto`, through the
+    shared watchdog launcher) and, only when rows are left without a fresh
+    vector, touches a marker and spawns a detached `embed-worker`. Every
+    test here sets a temp MEMCONTINUUM_HOME and MEMCONTINUUM_EMBED_WORKER=0
+    unless it is specifically testing the spawn (test_h below)."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp(prefix="memcontinuum-postcommit-embed-")
+        self.addCleanup(shutil.rmtree, self.td, ignore_errors=True)
+        self.home = Path(self.td) / "home"
+        self.home.mkdir()
+
+    def tearDown(self):
+        # No test here may leave a real embed-worker holding its lock.
+        lock_paths = list(self.home.glob("*.embed.lock")) if self.home.exists() else []
+        for lock_path in lock_paths:
+            fd = os.open(str(lock_path), os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except BlockingIOError:
+                self.fail(f"{lock_path} is still held by a worker after the test")
+            finally:
+                os.close(fd)
+
+    def _store_with_one_unembedded_topic(self, project="pc-embed"):
+        # Same minimal frontmatter shape TestPostCommitReindexHook's own
+        # test_r2_resolves_python_via_pointer_config_at_custom_home
+        # already proves reindexes cleanly (id/title/status, no type/area).
+        root = Path(self.td) / f"{project}-store"
+        (root / "topics").mkdir(parents=True)
+        (root / "topics" / "T-0001.md").write_text(
+            "---\nid: T-0001\ntitle: Widget cache\nstatus: active\n---\n"
+            "the widget cache invalidates on write\n"
+        )
+        return root
+
+    def _wrapper_python(self, name, body):
+        """A bash impersonation of MEMCONTINUUM_PYTHON: the module-level
+        `memidx_wrapper_python` dispatch idiom, extended to intercept BOTH
+        `-c` shapes this hook now uses -- the watchdog launcher's own `-c
+        "$MC_WATCHDOG_LAUNCHER_PY"` call AND the hook's own worker-spawn
+        `-c '...Popen(...)...'` call -- passed straight through to the
+        real venv python unmodified (both need the real interpreter to
+        run); only a script-path invocation ("$PY" "$MEMIDX" <subcommand>
+        ...) is intercepted, running a real-python `-c` snippet that
+        monkeypatches memidx.compute_embeddings with `body` before handing
+        off to memidx.main(). Launching the embed-worker with THIS SAME
+        $PY (not sys.executable -- see the hook's own comment) is what
+        lets the spawned worker subprocess hit this same interception."""
+        wrapper = memidx_wrapper_python(self.td, name, body)
+        return wrapper
+
+    def _hang_stub(self):
+        return self._wrapper_python(
+            "embed-stub-hang",
+            "def _hang(texts, model=None):\n"
+            "    import time\n"
+            "    time.sleep(60)\n"
+            "    return []\n"
+            "memidx.compute_embeddings = _hang\n",
+        )
+
+    def _fast_stub(self):
+        return self._wrapper_python(
+            "embed-stub-fast",
+            "def _fake(texts, model=None):\n"
+            "    return [[0.01] * memidx.EMBED_DIM for _ in texts]\n"
+            "memidx.compute_embeddings = _fake\n",
+        )
+
+    def _run(self, env, timeout=15.0):
+        return subprocess.run(
+            [MC_BASH, str(POST_COMMIT_HOOK)], capture_output=True, text=True, env=env, timeout=timeout,
+        )
+
+    # -- 1: a hung embedding backend never delays the hook -----------------
+
+    def test_hung_embedding_backend_does_not_delay_the_hook(self):
+        """Red today: the unmodified hook runs a FULL (embedding) reindex
+        synchronously, so a hung `compute_embeddings` blocks the whole
+        `git commit`. After the fix, the content pass is `--no-embed
+        --auto` and never calls the embedding backend at all -- a hung
+        backend (real or stubbed) can never delay it. The FTS index must
+        already find the committed content the moment the hook returns."""
+        root = self._store_with_one_unembedded_topic("pc-hang")
+        hang_py = self._hang_stub()
+        env = clean_env(MEMCONTINUUM_HOME=str(self.home), MEMCONTINUUM_PYTHON=str(hang_py),
+                         MEMCONTINUUM_PROJECT="pc-hang", MEMCONTINUUM_ROOT=str(root),
+                         MEMCONTINUUM_EMBED_WORKER="0")
+        start = time.monotonic()
+        proc = self._run(env, timeout=10.0)
+        elapsed = time.monotonic() - start
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertLess(elapsed, 5.0, f"the hook took {elapsed:.1f}s -- must return within the content pass")
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("rc=0", log_text, log_text)
+        self.assertIn("embed=pending", log_text, log_text)
+
+        # The FTS index already finds the committed content (`search
+        # --mode fts` semantics -- queried directly against the `fts`
+        # table here rather than via cmd_search, which prints instead of
+        # returning).
+        conn = sqlite3.connect(str(self.home / "pc-hang.sqlite"))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT path FROM fts WHERE fts MATCH ? AND project = ?", ("widget", "pc-hang"),
+        ).fetchall()
+        conn.close()
+        self.assertTrue(rows, "FTS must already find the committed content when the hook returns")
+
+    # -- 2: marker present iff E > 0 ----------------------------------------
+
+    def test_marker_present_when_pending_absent_when_clean(self):
+        root = self._store_with_one_unembedded_topic("pc-marker")
+        env = clean_env(MEMCONTINUUM_HOME=str(self.home), MEMCONTINUUM_PYTHON=VENV_PYTHON,
+                         MEMCONTINUUM_PROJECT="pc-marker", MEMCONTINUUM_ROOT=str(root),
+                         MEMCONTINUUM_EMBED_WORKER="0")
+        proc = self._run(env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        marker = self.home / "pc-marker.embed-pending"
+        self.assertTrue(marker.is_file(), "a brand-new store has E>0 -- the marker must be touched")
+
+        # A second commit with nothing new to embed (still --no-embed, so
+        # the vector stays missing -- E stays > 0) keeps the marker. To
+        # observe E==0/no-marker, embed for real once in-process (a mocked
+        # compute_embeddings, deterministic vectors), then run the hook
+        # again on unchanged content.
+        args = SimpleNamespace(root=str(root), project="pc-marker", db=str(self.home / "pc-marker.sqlite"),
+                                full=False, no_embed=False)
+        with mock.patch.object(memidx, "compute_embeddings", side_effect=lambda texts, model=None: [
+            [0.01] * memidx.EMBED_DIM for _ in texts
+        ]):
+            memidx.cmd_reindex(args)
+        marker.unlink()
+
+        env2 = clean_env(MEMCONTINUUM_HOME=str(self.home), MEMCONTINUUM_PYTHON=VENV_PYTHON,
+                          MEMCONTINUUM_PROJECT="pc-marker", MEMCONTINUUM_ROOT=str(root),
+                          MEMCONTINUUM_EMBED_WORKER="0")
+        proc2 = self._run(env2)
+        self.assertEqual(proc2.returncode, 0, proc2.stderr)
+        self.assertFalse(marker.is_file(), "every record has a fresh vector -- E==0, no marker")
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("embed=clean", log_text, log_text)
+
+    # -- 7 (existing pins) is covered by TestPostCommitReindexHook's own
+    # tests above (test_r2_resolves_..., unchanged assertions plus the
+    # MEMCONTINUUM_EMBED_WORKER=0 addition).
+
+    # -- 8: the worker actually spawns, detached, and clears the marker ----
+
+    @unittest.skipUnless(hasattr(fcntl, "flock"), "fcntl.flock required")
+    def test_h_worker_spawns_detached_and_clears_the_marker(self):
+        root = self._store_with_one_unembedded_topic("pc-spawn")
+        fast_py = self._fast_stub()
+        env = clean_env(MEMCONTINUUM_HOME=str(self.home), MEMCONTINUUM_PYTHON=str(fast_py),
+                         MEMCONTINUUM_PROJECT="pc-spawn", MEMCONTINUUM_ROOT=str(root))
+        env.pop("MEMCONTINUUM_EMBED_WORKER", None)
+        proc = self._run(env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        marker = self.home / "pc-spawn.embed-pending"
+        log_path = self.home / "pc-spawn.embed.log"
+        self.assertTrue(marker.is_file(), "content pass alone must not clear the marker")
+
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            if log_path.exists() and not marker.exists():
+                break
+            time.sleep(0.2)
+        self.assertTrue(log_path.exists(), "the detached worker must have written its own log file")
+        self.assertFalse(marker.exists(), "the detached worker must clear the marker within 30s")
+
+        # tearDown asserts the lock is free -- give the worker a moment to
+        # release it after clearing the marker.
+        lock_path = self.home / "pc-spawn.embed.lock"
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and lock_path.exists():
+            fd = os.open(str(lock_path), os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                break
+            except BlockingIOError:
+                time.sleep(0.2)
+            finally:
+                os.close(fd)
+
+    # -- extra: the watchdog budget actually bounds this hook ---------------
+
+    def test_watchdog_kills_a_hung_content_pass_within_budget(self):
+        """Beyond the brief's own item 1 (which the redesigned hook makes
+        moot for embeddings specifically, since the content pass never
+        touches them): this proves the watchdog wiring itself -- a
+        content pass that hangs for ANY reason is still bounded by
+        MEMCONTINUUM_POST_COMMIT_BUDGET, via the same shared watchdog
+        launcher every other guarded hook uses."""
+        root = self._store_with_one_unembedded_topic("pc-wd")
+        always_hang = Path(self.td) / "always-hang"
+        always_hang.write_text(
+            "#!/usr/bin/env bash\n"
+            f'REAL_PY="{VENV_PYTHON}"\n'
+            'if [ "$1" = "-c" ]; then\n'
+            '    exec "$REAL_PY" "$@"\n'
+            'fi\n'
+            'sleep 6\n'
+        )
+        always_hang.chmod(0o755)
+        env = clean_env(MEMCONTINUUM_HOME=str(self.home), MEMCONTINUUM_PYTHON=str(always_hang),
+                         MEMCONTINUUM_PROJECT="pc-wd", MEMCONTINUUM_ROOT=str(root),
+                         MEMCONTINUUM_EMBED_WORKER="0", MEMCONTINUUM_POST_COMMIT_BUDGET="2")
+        start = time.monotonic()
+        proc = self._run(env, timeout=10.0)
+        elapsed = time.monotonic() - start
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertLess(elapsed, 4.0, f"took {elapsed:.1f}s -- the 2s watchdog budget must bound this")
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=watchdog-killed", log_text)
+        self.assertIn("hook=post-commit-reindex.sh", log_text)
 
 
 class TestMemorySearchSkill(unittest.TestCase):

@@ -2770,6 +2770,101 @@ class TestMultiDirLegacyMigrationRecoversPerDir(unittest.TestCase):
         self.assertNotIn(f"MEMCONTINUUM_CODE_ROOT={code_c}", settings)
 
 
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestMultiRootWriteSideMigration(unittest.TestCase):
+    """R5 (TOP-0123 L5, task-7-brief.md red test 6): the write-side line's
+    NEW MEMCONTINUUM_CODE_ROOTS JSON token -- both for a normally-wired row
+    (--apply re-renders from the registry's own recorded code-roots=a;b)
+    and for mc_update_recover_from_settings's OWN read of that token (a
+    legacy row with no PreToolUse hooks at all left to recover roots
+    from)."""
+
+    def setUp(self):
+        self.tmp = tmpdir("memcontinuum-update-multiroot-migration-test-")
+        self.home = str(Path(self.tmp) / "home")
+        os.makedirs(self.home, exist_ok=True)
+        self.repo = git_repo(str(Path(self.tmp) / "repo"))
+        self.code_a = str(Path(self.tmp) / "code-a")
+        self.code_b = str(Path(self.tmp) / "code-b")
+        os.makedirs(self.code_a, exist_ok=True)
+        os.makedirs(self.code_b, exist_ok=True)
+        (Path(self.code_a) / "a.py").write_text("print('a')\n")
+        (Path(self.code_b) / "b.py").write_text("print('b')\n")
+        self.store = str(Path(self.tmp) / "store")
+        self.claude_dir = str(Path(self.repo) / ".claude")
+        proc = run(INSTALL_SH, [
+            "--project", "multiroot", "--store", self.store, "--claude-dir", self.claude_dir,
+            "--code-root", self.code_a, "--code-root", self.code_b,
+            "--langs", "python", "--non-interactive",
+        ], self.home)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    def test_old_shape_line_migrates_and_json_token_recovers_both_roots(self):
+        # --- part 1: a NORMALLY WIRED row (registry already knows both
+        # roots) whose CURRENT write-side line is still the OLD shape
+        # (first root only -- pre-fix). --dry-run reports stale, --apply
+        # renders BOTH tokens, a second --apply is a genuine no-op.
+        proc = run(DECIDE_SH, [
+            "wired", "--repo", self.repo, "--store", self.store, "--project", "multiroot",
+            "--claude-dir", self.claude_dir,
+            "--code-root", self.code_a, "--code-root", self.code_b,
+            "--langs", "python",
+        ], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+        text = Path(self.claude_dir, "settings.local.json").read_text()
+        old_shape = re.sub(r" MEMCONTINUUM_CODE_ROOTS='[^']*'", "", text)
+        self.assertNotEqual(old_shape, text, "fixture must actually strip a CODE_ROOTS token")
+        old_shape = old_shape.replace(
+            f"MEMCONTINUUM_RENDERED={engine_sha()}", "MEMCONTINUUM_RENDERED=deadbee"
+        )
+        Path(self.claude_dir, "settings.local.json").write_text(old_shape)
+
+        proc = run(UPDATE_SH, [], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("stale", proc.stdout, proc.stdout)
+
+        proc = run(UPDATE_SH, ["--apply"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        settings = Path(self.claude_dir, "settings.local.json").read_text()
+        self.assertIn(f"MEMCONTINUUM_CODE_ROOT={self.code_a}", settings)
+        self.assertEqual(settings.count("MEMCONTINUUM_CODE_ROOTS="), 5, settings)
+        self.assertIn(self.code_b, settings)
+
+        before_second_apply = settings
+        proc = run(UPDATE_SH, ["--apply"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(
+            Path(self.claude_dir, "settings.local.json").read_text(), before_second_apply,
+            "a second --apply must be a genuine no-op",
+        )
+        proc = run(UPDATE_SH, [], self.home)
+        self.assertIn("ok", proc.stdout)
+        self.assertNotIn("stale", proc.stdout)
+
+        # --- part 2: mc_update_recover_from_settings's own read of the
+        # write-side line's MEMCONTINUUM_CODE_ROOTS token -- a LEGACY row
+        # (no claude-dirs recorded) whose settings file has NO PreToolUse
+        # hooks at all (no newfile-nudge lines to fall back on), so the
+        # ONLY way to recover BOTH roots is the write-side line's own JSON
+        # token this task adds.
+        data = json.loads(Path(self.claude_dir, "settings.local.json").read_text())
+        data["hooks"].pop("PreToolUse", None)
+        Path(self.claude_dir, "settings.local.json").write_text(json.dumps(data, indent=2))
+
+        decisions_tsv(self.home).unlink()
+        write_row(self.home, self.repo, "wired", note=f"store={self.store} project=multiroot")
+
+        proc = run(UPDATE_SH, [], self.home)
+        self.assertIn("legacy rows found", proc.stdout + proc.stderr)
+
+        proc = run(UPDATE_SH, ["--apply", "--repo", self.repo,
+                                "--claude-dir", self.claude_dir], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        note = decisions_tsv(self.home).read_text().splitlines()[-1]
+        self.assertIn(f"code-roots={self.code_a};{self.code_b}", note, note)
+
+
 class TestMcPhysical(unittest.TestCase):
     """Direct unit coverage for mc_physical (scripts/mc-registry-lib.sh --
     moved here from memcontinuum-update.sh in symlink-review round 3,

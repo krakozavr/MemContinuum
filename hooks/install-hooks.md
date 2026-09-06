@@ -68,6 +68,11 @@ Notes:
   `code-root-filter-pair.json.tmpl` and `newfile-nudge-filter-pair.json.tmpl` compose `if` as
   `Edit(/{{CODE_ROOT}}/**)` / `Write(/{{CODE_ROOT}}/**)` — the rendered value always has exactly
   two leading slashes.
+- There is no `Bash` matcher here, and none is added: an `if` condition like `Edit(...)`/
+  `Write(...)` names a file path a tool is about to touch, and an arbitrary shell command has no
+  single such path to filter on before it runs. A file changed from the shell gets no pre-edit
+  lookup at all — section 4's `ledger-post-edit.sh` is what records it, but only afterwards, from
+  a tree diff, never before the change the way this hook works for `Edit`/`Write`.
 
 ## 2. `newfile-nudge.sh` — Claude Code `PreToolUse` hook (Write only)
 
@@ -133,9 +138,42 @@ exec bash "<this-repo>/hooks/post-commit-reindex.sh"
 
 Since it `exec`s the canonical script by absolute path rather than copying it,
 edits to `post-commit-reindex.sh` are picked up automatically without
-re-installing. A failed reindex must never block the commit — the script
+re-installing — an existing install therefore picks up this bounded-pass/
+embed-worker redesign on its very next commit, with no re-install step. A
+failed reindex must never block the commit — the script
 always exits 0 (see its own comments) and logs failures to
 `$MEMCONTINUUM_HOME/hook.log` instead.
+
+The script itself now runs its content pass (`reindex --root … --project …
+--db … --no-embed --auto`) through the same watchdog launcher the write-side
+hooks use (`hooks/mc-watchdog.sh`), under its own budget
+(`MEMCONTINUUM_POST_COMMIT_BUDGET`, default 30 seconds) — a hung or slow
+embedding backend can never delay the commit, because this pass never calls
+the embedding backend at all. Its own log line gains one more token,
+`embed=pending|clean|skipped`: `pending` means the reindex left one or more
+records without a fresh vector, in which case the script also touches
+`$MEMCONTINUUM_HOME/<project>.embed-pending` (this script always builds its
+own database path as `$MEMCONTINUUM_HOME/<project>.sqlite`, so this is the
+same "beside the database" location `docs/INTERNALS.md`'s writable-surface
+section describes -- a diverging custom `--db` is only possible calling
+`memidx.py embed-worker` directly, not through this hook) and spawns
+`memidx.py embed-worker` detached (a Python `subprocess.Popen(
+start_new_session=True)` — never bash `&`, never a `setsid` binary, which
+macOS does not ship) to backfill embeddings in the background; `clean` means
+nothing was left to embed; `skipped` means the content pass returned non-zero
+within budget (e.g. an integrity failure). A genuine watchdog kill never
+reaches this script's own final line at all — it produces only the
+launcher's own `outcome=watchdog-killed hook=post-commit-reindex.sh` line in
+`hook.log`, with no `embed=` token for that invocation.
+`MEMCONTINUUM_EMBED_WORKER=0` disables the spawn
+(the marker is still touched) — set it wherever a detached background
+process must not be left running (tests, CI). The embed-worker coalesces
+repeated commits: a second worker finding the first one's `<project>.embed.lock`
+already held exits 0 immediately, and the marker is removed only after a
+pass whose content it actually reflects (a commit landing mid-pass retouches
+the marker, and the worker loops again rather than declaring victory early).
+See docs/INTERNALS.md's watchdog and embedding-lifecycle sections for the
+full contract, including the crash/retry behavior.
 
 ## 4. Write-side reminder hooks — five more Claude Code hooks in the target project
 
@@ -156,11 +194,10 @@ merged into `.claude/settings.json` or `.claude/settings.local.json`:
   "hooks": {
     "PostToolUse": [
       {
-        "matcher": "Edit|Write|NotebookEdit",
         "hooks": [
           {
             "type": "command",
-            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_CODE_ROOT=<code-root> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/ledger-post-edit.sh"
+            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_CODE_ROOT=<code-root> MEMCONTINUUM_CODE_ROOTS=<code-roots-json> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/ledger-post-edit.sh"
           }
         ]
       }
@@ -170,7 +207,7 @@ merged into `.claude/settings.json` or `.claude/settings.local.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_CODE_ROOT=<code-root> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/precompact-persist.sh"
+            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_CODE_ROOT=<code-root> MEMCONTINUUM_CODE_ROOTS=<code-roots-json> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/precompact-persist.sh"
           }
         ]
       }
@@ -180,7 +217,7 @@ merged into `.claude/settings.json` or `.claude/settings.local.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_CODE_ROOT=<code-root> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/sessionstart-remind.sh"
+            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_CODE_ROOT=<code-root> MEMCONTINUUM_CODE_ROOTS=<code-roots-json> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/sessionstart-remind.sh"
           }
         ]
       }
@@ -190,7 +227,7 @@ merged into `.claude/settings.json` or `.claude/settings.local.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_CODE_ROOT=<code-root> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/userprompt-remind.sh"
+            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_CODE_ROOT=<code-root> MEMCONTINUUM_CODE_ROOTS=<code-roots-json> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/userprompt-remind.sh"
           }
         ]
       }
@@ -200,7 +237,7 @@ merged into `.claude/settings.json` or `.claude/settings.local.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_CODE_ROOT=<code-root> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/sessionend-stamp.sh"
+            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_CODE_ROOT=<code-root> MEMCONTINUUM_CODE_ROOTS=<code-roots-json> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/sessionend-stamp.sh"
           }
         ]
       }
@@ -215,7 +252,9 @@ Notes:
   is no settings-level `if` for `PreCompact`, `SessionStart`, `UserPromptSubmit`, or `SessionEnd`.
   If you want `ledger-post-edit.sh` scoped the same way `pre-edit-chain.sh` is (e.g. only a
   specific subtree), add `"if": "Edit(...)"` / `"if": "Write(...)"` entries the same way as
-  section 1 above; the other four scripts gate on payload fields (`trigger`, `agent_id`/
+  section 1 above — but `if` cannot scope a `Bash` entry the same way: there is no path-shaped
+  condition for an arbitrary shell command, so any such filter only ever narrows the Edit/Write
+  side of this hook, never the shell-diff branch that watches `Bash`. The other four scripts gate on payload fields (`trigger`, `agent_id`/
   `agent_type`) in-script instead, since they have no `if` to lean on. `source` is a
   `SessionStart`-only field (see the next note) — `precompact-persist.sh` gates on `trigger`
   (PreCompact's own field, `manual`/`auto`), and `userprompt-remind.sh` gates on `agent_id`/
@@ -229,10 +268,14 @@ Notes:
   hook — not rendered by this installer, see its own header comment) also gates on `source` for
   the same reason — both are the correct, documented use of that field; `UserPromptSubmit` is the
   one event that never carries it.
-- `MEMCONTINUUM_CODE_ROOT` is new here (not used by `pre-edit-chain.sh`/`post-commit-reindex.sh`):
-  it is the code root `ledger-post-edit.sh` scopes edits to. The five write-side hooks only
-  support **one** `MEMCONTINUUM_CODE_ROOT` each — with multiple `--code-root`s given to
-  `scripts/repo-init.sh`, the first one given is what they get.
+- `MEMCONTINUUM_CODE_ROOT`/`MEMCONTINUUM_CODE_ROOTS` are new here (not used by
+  `pre-edit-chain.sh`/`post-commit-reindex.sh`): every configured `--code-root` reaches the five
+  write-side hooks, not just one. `MEMCONTINUUM_CODE_ROOT` carries the first (kept for a reader
+  that only ever looks at one root); `MEMCONTINUUM_CODE_ROOTS` carries the complete JSON list of
+  physical paths, read by `hooks/memlib.sh`'s `mc_code_roots` (falling back to the single variable
+  when the list is absent — old-shape wiring, or a hand-written config). `ledger-post-edit.sh`
+  checks the edited path against every root; `userprompt-remind.sh`/`precompact-persist.sh` pass
+  every root to `unmapped --code-root` (repeatable) in one call.
 - `MEMCONTINUUM_HOME` is deliberately omitted here, same reason and same resolution as section 1
   above (default, then the pointer, then a custom value only if given) — and it must never point
   at a synced/cloud drive.
@@ -241,8 +284,14 @@ Notes:
   `userprompt-remind.sh`'s coverage check and `precompact-persist.sh` call `memidx.py unmapped`,
   which self-heals a drifted decision index with a `reindex --no-embed --auto` (mode-preserving —
   it never embeds, and never claims a fuller embedding mode than the index already had, inside a
-  hook's own time budget), so the decision index's own SQLite cache is written too. `git diff`/`git status` in either root staying empty across
-  every hook invocation is a permanent regression test (`tests/test_write_hooks.py`).
+  hook's own time budget), so the decision index's own SQLite cache is written too.
+  `ledger-post-edit.sh`'s shell-diff branch additionally runs `git status --porcelain -z` (via
+  `--no-optional-locks`) in every code root and the store root on a `Bash` or unrecognized-tool
+  payload — that call is read-only, so `git diff`/`git status` in either root staying empty across
+  every hook invocation remains a permanent regression test (`tests/test_write_hooks.py`).
+  `post-commit-reindex.sh` (section 3 above, not one of these five) additionally writes
+  `$MEMCONTINUUM_HOME/<project>.embed-pending`, `<project>.embed.lock` and `<project>.embed.log`
+  when its content pass leaves rows without a fresh vector.
 
 
 > Invocation note: every example above runs a hook as `bash <path>` rather than

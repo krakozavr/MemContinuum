@@ -32,7 +32,7 @@ from memidx import (
     code_ref_is_named,
     fragment_declaration_status,
     newest_active_link,
-    parse_frontmatter,
+    parse_record,
     validated_evidence_list,
     walk_markdown,
 )
@@ -389,13 +389,28 @@ def lint_file(
     code_roots: list[Path] | None = None,
     known_topic_ids: set[str] | None = None,
 ) -> tuple[list[str], list[str]]:
-    fm, body = parse_frontmatter(path)
+    """Design R2 (audit MC-P1-03, TOP-0123 L2): every diagnostic
+    parse_record surfaced becomes `ERROR: <path>: <field>: <message>` for
+    an INVALID (canonical, malformed/wrongly-shaped) record -- and the
+    rule pass below is skipped entirely for it (there is nothing typed
+    enough left to check). A valid record's own diagnostics (only
+    reachable for a note under the lenient fallback) are WARNINGs instead,
+    and the rule pass still runs normally on top of them."""
+    result = parse_record(path)
+    if not result.valid:
+        errors = [f"{path}: {field}: {message}" for field, message in result.diagnostics]
+        return errors, []
+    warnings = [f"{path}: {field}: {message}" for field, message in result.diagnostics]
+    fm, body = result.frontmatter, result.body
     if fm.get("type") == "concept":
-        return lint_concept(path, fm, code_roots or [], body=body, known_topic_ids=known_topic_ids)
-    is_topic = bool(fm.get("links")) or fm.get("type") == "topic"
-    if is_topic:
-        return lint_topic(path, fm)
-    return lint_record(path, fm)
+        errors, more_warnings = lint_concept(path, fm, code_roots or [], body=body, known_topic_ids=known_topic_ids)
+    else:
+        is_topic = bool(fm.get("links")) or fm.get("type") == "topic"
+        if is_topic:
+            errors, more_warnings = lint_topic(path, fm)
+        else:
+            errors, more_warnings = lint_record(path, fm)
+    return errors, warnings + more_warnings
 
 
 def _duplicate_claim_errors(root: Path) -> list[str]:
@@ -409,7 +424,10 @@ def _duplicate_claim_errors(root: Path) -> list[str]:
     above, which do use that exact concatenation."""
     claims: dict[str, list[tuple[str, Path]]] = {}
     for f in sorted(walk_markdown(root)):
-        fm, _body = parse_frontmatter(f)
+        result = parse_record(f)
+        if not result.valid:
+            continue
+        fm = result.frontmatter
         if fm.get("type") != "concept":
             continue
         cid = fm.get("id") or f.stem
@@ -441,7 +459,10 @@ def lint_root(root: Path, code_roots: list[Path] | None = None) -> tuple[list[st
     id_owners: dict[str, list[Path]] = {}
     stem_owners: dict[str, list[Path]] = {}
     for f in sorted(walk_markdown(root)):
-        fm, _body = parse_frontmatter(f)
+        result = parse_record(f)
+        if not result.valid:
+            continue
+        fm = result.frontmatter
         is_topic = bool(fm.get("links")) or fm.get("type") == "topic"
         if is_topic:
             tid = fm.get("id") or f.stem

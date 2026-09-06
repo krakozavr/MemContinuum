@@ -22,8 +22,7 @@ memidx.py search "QUERY" --mode hybrid --project PROJECT --status active [--area
 memidx.py chain <topic-id-or-slug> --project PROJECT --json
 ```
 
-**What a file is governed by**, before editing it (this is also what the PreToolUse hook runs
-automatically — use it by hand when working outside an edit, e.g. while planning):
+**What a file is governed by**, before editing it (this is also what the PreToolUse hook runs before an Edit/Write — use it by hand when you are about to change files from the shell, or while planning):
 ```
 memidx.py for-path path/to/file.ext --project PROJECT --json
 ```
@@ -67,11 +66,14 @@ Phrase the query as the intent ("write a debug PNG", "embed a view in a scroll b
 a file's contents"), not as a symbol name — the index is built to match on that. A hit whose
 `concept_id` is set means a decision record governs that code; check it (`memidx.py why <path>`)
 before working around or duplicating it. The `--json` output wraps hits in an envelope: `state` is
-`uninitialized` (exit non-zero, `[]` is a refusal not "nothing found"), `stale` (a root changed
-since the last `code-reindex`), `degraded` (something is incomplete — an unindexable file, or a
-root missing on disk — with nothing changed), or `current`; `code_roots`, `changed`/`failed`/
-`not_indexed`, and `embedding_mode` carry the detail; `code-search` heals a `stale`/`degraded`
-index itself, once, before answering. **Confirm the code index is current (or stale/degraded with eyes open) before trusting a
-"nothing found" — then run `code-search`; name relevant hits in your report, or say none** — the
-same rule as the markdown search above: silently skipping this check is exactly how a second,
-slightly different `writeDebugImage` gets written next to the first one.
+`uninitialized` (exit non-zero, `[]` is a refusal not "nothing found"), `stale` (a root's content
+changed since the last `code-reindex`), `degraded` (something is incomplete, nothing changed), or
+`metadata-current`/`current` (nothing changed; `current` only under `--verify-content`, which
+hashes every file to prove it — the default `metadata-current` did not); `code_roots`,
+`changed`/`failed`/`not_indexed`, and `embedding_mode` carry the detail; `code-search` heals a
+`stale`/`degraded` index itself, once, before answering. **Confirm the code index is initialized
+and not stale before trusting a "nothing found"** — real evidence only under `current`; under
+`metadata-current` it is honest uncertainty, not proof of absence — **pass `--verify-content` when
+that matters, then run `code-search`; name relevant hits in your report, or say none** — the same
+rule as the markdown search above: silently skipping this check is exactly how a second, slightly
+different `writeDebugImage` gets written next to the first one.

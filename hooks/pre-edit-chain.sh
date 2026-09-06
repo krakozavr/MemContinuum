@@ -78,9 +78,10 @@ MEMIDX="$SCRIPT_DIR/../memidx.py"
 # own report for the full per-store table.
 # That leaves roughly 10x headroom under the unmodified default budget
 # (MC_WATCHDOG_BUDGET unset here -- the five-write-side-hooks 2s default,
-# not sessionend-stamp.sh's tighter 1.2s: two sequential for-path calls on
-# a miss need the fuller budget), so 2s is confirmed by measurement, not
-# assumed. Sourcing this also resolves MEMCONTINUUM_HOME and MC_GUARD_PY
+# not sessionend-stamp.sh's tighter 1.2s: one for-path call per candidate,
+# and a miss walks every candidate, so the fuller budget still covers
+# that multi-candidate worst case), so 2s is confirmed by measurement,
+# not assumed. Sourcing this also resolves MEMCONTINUUM_HOME and MC_GUARD_PY
 # (env -> config.sh -> engine venv), so the duplicate resolution this file
 # used to carry inline is gone -- PY below reads MC_GUARD_PY directly
 # instead of re-deriving it.
@@ -250,17 +251,32 @@ fi
 # below, same as every other call this script makes) already carries the
 # stale warning line -- this hook only needs to notice the state to log
 # its OWN distinct outcome name, `index-stale-served`, instead of
-# `matched`; the injected additionalContext payload built below is
-# unaffected either way (it comes from CHAIN_TEXT, a separate plain-text
-# call, never from RESULT_JSON).
+# `matched`.
+#
+# Round 5 (ruling 137 / CI evidence: the macOS runner measured this hook
+# at 1.003-1.022s against its own 1.0s bar, 27% runner-speed variance
+# between runs -- the cost is process starts, not real work). `for-path`
+# now takes `--with-chain-text` (memidx.py item 1): FORPATH_ARGS always
+# carries it, so the SAME call that finds the matching candidate and its
+# state also returns the plain-text chain rendering, in the same JSON
+# envelope -- there is no longer a second, separate `for-path` call once a
+# match is found (the old CHAIN_TEXT_ARGS call is gone). The three
+# separate `python -c` parsers this loop used to run per candidate
+# (results-only, candidate-state, topic-count via a `grep -c` besides)
+# collapse into the one `python -c` call below, which prints all four
+# values -- matched flag, state, topic count, chain text -- NUL-separated.
+# Read via `read -d ''` off a process substitution (`< <(...)`), not a
+# `|` pipe, so the values land in THIS shell rather than a subshell that
+# would discard them on exit -- no mapfile, so this stays bash-3.2-safe.
 MATCHED_CANDIDATE=""
 MATCHED_STATE="current"
-RESULT_JSON=""
+MATCHED_TOPIC_COUNT="0"
+CHAIN_TEXT=""
 ANY_QUERY_SUCCEEDED=0
 for candidate in "${CANDIDATES[@]}"; do
     FORPATH_ARGS=(for-path "$candidate" --project "$PROJECT" --db "$DB_PATH")
     [ -n "${MEMCONTINUUM_ROOT:-}" ] && FORPATH_ARGS+=(--root "$MEMCONTINUUM_ROOT")
-    FORPATH_ARGS+=(--json)
+    FORPATH_ARGS+=(--json --with-chain-text)
     RESULT_JSON="$(PYTHONPATH= "$PY" "$MEMIDX" "${FORPATH_ARGS[@]}" 2>>"$LOG")"
     RC=$?
     # F1 (ruling 68): for-path's own exit codes -- 3 = missing/uninitialized
@@ -280,33 +296,109 @@ for candidate in "${CANDIDATES[@]}"; do
         continue
     fi
     ANY_QUERY_SUCCEEDED=1
-    # Final-fix-wave item 2: --json now wraps as {"state":...,"results":
-    # [...]} whenever --root surfaced a non-current state -- pull the real
-    # results array (falling back to the whole payload for the pre-
-    # existing bare-list shape) and the state name (defaulting to
-    # "current" for that same bare-list shape) out of whichever form this
-    # call actually returned.
-    RESULTS_ONLY="$(printf '%s' "$RESULT_JSON" | "$PY" -c '
+    # --json --with-chain-text always wraps as an object -- {"results":
+    # [...], "chain_text": "...", maybe "state": ...} -- but this parser
+    # stays defensive about a malformed/bare-list payload (same fallbacks
+    # the old two parsers each had) since it is fed straight from
+    # $RESULT_JSON, not re-validated first.
+    #
+    # Round 6 fix: `topic_count` is now a REAL count of the DISTINCT
+    # topics whose chains actually appear in chain_text -- every direct
+    # topic match in `results`, plus, per matched concept ("kind":
+    # "concept"), the topics in its own "governed_by" list (the exact set
+    # for_path_chain_lines in memidx.py iterates for that concept; the
+    # concept entry itself is never counted -- it isn't a topic). Ids are
+    # collected into a SET, not just summed, so a topic that is both a
+    # direct match and a governor of a matched concept (or governs two
+    # matched concepts at once) is counted once in the header, matching
+    # the header's own wording ("N topic(s) REFERENCE this file" -- a
+    # count of distinct topics, not of chain renderings). chain_text
+    # itself is unaffected by this and keeps rendering that topic's chain
+    # once per role (for_path_chain_lines has no dedup of its own) -- the
+    # header and the body are allowed to disagree in that one direction.
+    # Round 5 had instead replicated the
+    # OLD `grep -c '"id":'` behavior verbatim, quirk included: `grep -c`
+    # counts matching LINES, not occurrences, and the old RESULTS_ONLY (a
+    # plain `json.dumps`, no `indent=`) was always exactly one line -- so
+    # the header always said "1 topic(s)" no matter how many topics or
+    # concepts actually matched. That quirk is what this round fixes: a
+    # two-topic match now reports "2", not "1" (tests/test_hooks.py's
+    # oracle-parity class normalises this one field before its
+    # byte-for-byte comparison against the frozen pre-round-5 script,
+    # documenting why there).
+    MATCHED_FLAG=""
+    CANDIDATE_STATE=""
+    CANDIDATE_TOPIC_COUNT=""
+    CANDIDATE_CHAIN_TEXT=""
+    {
+        IFS= read -r -d '' MATCHED_FLAG
+        IFS= read -r -d '' CANDIDATE_STATE
+        IFS= read -r -d '' CANDIDATE_TOPIC_COUNT
+        IFS= read -r -d '' CANDIDATE_CHAIN_TEXT
+    } < <(printf '%s' "$RESULT_JSON" | PYTHONPATH= "$PY" -c '
 import json, sys
+
 try:
     d = json.load(sys.stdin)
 except Exception:
-    print("[]"); sys.exit(0)
-print(json.dumps(d.get("results", d) if isinstance(d, dict) else d))
-' 2>/dev/null)"
-    CANDIDATE_STATE="$(printf '%s' "$RESULT_JSON" | "$PY" -c '
-import json, sys
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    print("current"); sys.exit(0)
-print(d.get("state", "current") if isinstance(d, dict) else "current")
-' 2>/dev/null)"
+    d = None
+
+if isinstance(d, dict):
+    results = d.get("results", [])
+    state = d.get("state", "current") or "current"
+    chain_text = d.get("chain_text", "") or ""
+else:
+    results = d if isinstance(d, list) else []
+    state = "current"
+    chain_text = ""
+
+matched = "1" if results else "0"
+
+topic_ids = set()
+for entry in results:
+    if not isinstance(entry, dict):
+        continue
+    if entry.get("kind") == "concept":
+        governed = entry.get("governed_by")
+        if isinstance(governed, list):
+            for grow in governed:
+                if isinstance(grow, dict) and "id" in grow:
+                    topic_ids.add(grow["id"])
+    elif "id" in entry:
+        topic_ids.add(entry["id"])
+topic_count = str(len(topic_ids))
+
+# Round 7 fix (Codex MAJOR): this stream is field-delimited by chr(0) and
+# read back with read -d "", which treats ANY NUL byte as the end of the
+# CURRENT read -- not just the one this loop appends after each field. A
+# record whose decoded text embeds a real NUL (e.g. YAML "before\0after"
+# in a ruling/rationale/owner_boundary string -- json.dumps escapes it as
+# six ASCII characters, backslash-u-0-0-0-0, in transit, and json.load
+# decodes that back to an actual NUL byte here) used to truncate that
+# read call current field AND silently discard every field still queued
+# behind it in the SAME stream (here chain_text is last, so nothing
+# downstream was lost, but the same one-shared-stream risk applies to any
+# future field added after it) -- the topic_count computed above from the
+# untruncated results still reported the full count, while
+# additionalContext itself went missing everything past the embedded
+# NUL. The pre-round-5 transport (three separate command substitutions,
+# one value per call) never hit this: plain command substitution in bash
+# silently DROPS embedded NUL bytes from captured output, it does not
+# truncate the surrounding text. Matching that behavior -- not somehow
+# delivering a real NUL through a NUL-delimited protocol -- is the fix:
+# strip NULs from each field before it enters the shared stream, so a
+# NUL can never be mistaken for the chr(0) delimiter, and no text past
+# it is ever lost.
+for field in (matched, state, topic_count, chain_text):
+    sys.stdout.write(field.replace(chr(0), ""))
+    sys.stdout.write(chr(0))
+' 2>/dev/null)
     [ -z "$CANDIDATE_STATE" ] && CANDIDATE_STATE="current"
-    TRIMMED="$(printf '%s' "$RESULTS_ONLY" | tr -d '[:space:]')"
-    if [ -n "$TRIMMED" ] && [ "$TRIMMED" != "[]" ]; then
+    if [ "$MATCHED_FLAG" = "1" ]; then
         MATCHED_CANDIDATE="$candidate"
         MATCHED_STATE="$CANDIDATE_STATE"
+        MATCHED_TOPIC_COUNT="$CANDIDATE_TOPIC_COUNT"
+        CHAIN_TEXT="$CANDIDATE_CHAIN_TEXT"
         break
     fi
 done
@@ -318,16 +410,34 @@ if [ -z "$MATCHED_CANDIDATE" ]; then
     finish "no-match"
 fi
 
-TOPIC_COUNT="$(printf '%s' "$RESULTS_ONLY" | grep -c '"id":')"
+TOPIC_COUNT="$MATCHED_TOPIC_COUNT"
 
-# --- get the pretty chain-view text for the matched candidate --------------
-CHAIN_TEXT_ARGS=(for-path "$MATCHED_CANDIDATE" --project "$PROJECT" --db "$DB_PATH")
-[ -n "${MEMCONTINUUM_ROOT:-}" ] && CHAIN_TEXT_ARGS+=(--root "$MEMCONTINUUM_ROOT")
-CHAIN_TEXT="$(PYTHONPATH= "$PY" "$MEMIDX" "${CHAIN_TEXT_ARGS[@]}" 2>>"$LOG")"
-
+# CHAIN_TEXT came off the SAME matched candidate's for-path call above
+# (--with-chain-text) -- no second `for-path` invocation fetches it.
 if [ -z "$CHAIN_TEXT" ]; then
     finish "empty-chain-text"
 fi
+
+# Round 7 fix (Codex MINOR): the pre-round-5 transport captured this text
+# via `$(...)` command substitution, which strips every trailing newline
+# unconditionally. The round-5 transport threads CHAIN_TEXT through the
+# NUL-delimited `read -d ''` parser instead, which preserves it exactly
+# as memidx.py rendered it -- and for_path_chain_lines can end in a
+# newline when its LAST line is a concept row whose owner_boundary came
+# from a YAML `|` block scalar (block-scalar clipping keeps exactly one
+# trailing newline). Left alone, that trailing newline plus the "\n\n"
+# join separator below produces an extra blank line before
+# CITATION_REMINDER in additionalContext, diverging from the frozen
+# pre-round-5 oracle byte-for-byte. Strip every trailing newline here, at
+# the hook boundary, to restore the old `$(...)` parity -- a `case`/`%`
+# loop, not `${var: -1}` or any bash-4-only trick, so this stays bash
+# 3.2-safe; never touches a newline embedded INSIDE the text.
+while true; do
+    case "$CHAIN_TEXT" in
+        *$'\n') CHAIN_TEXT="${CHAIN_TEXT%$'\n'}" ;;
+        *) break ;;
+    esac
+done
 
 CITATION_REMINDER='CONSTRAINT only if authority is owner-verbatim/owner-ratified and status active; HOLD for evidence-bearing incidents; everything else is context.'
 HEADER="Decision-chain memory: ${TOPIC_COUNT} topic(s) reference this file."

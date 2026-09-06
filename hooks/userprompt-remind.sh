@@ -412,13 +412,23 @@ for p in d.get("code_paths", []):
     print(p)
 ' "$DECIDE_TMP" 2>>"$MC_LOG")
 
+    # Design R5 (audit MC-P1-05, TOP-0123 L5): every configured code root,
+    # captured ONCE (one python spawn via mc_code_roots, memlib.sh) and
+    # reused below by BOTH the `unmapped` call and the per-root HEAD
+    # comparison -- a herestring-fed while-read loop (bash 3.2 safe, no
+    # array-of-roots to guard against `set -u`'s empty-array expansion).
+    CODE_ROOTS_TEXT="$(mc_code_roots)"
+
     # Phase 2 (outside the lock): the real, possibly-heavier classification call.
     UNMAPPED_JSON="{}"
     if [ "${#CODE_PATHS[@]}" -gt 0 ] && [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
         ARGS=(unmapped)
         ARGS+=("${CODE_PATHS[@]}")
         ARGS+=(--root "$MEMCONTINUUM_ROOT" --project "$MC_PROJECT" --db "$MC_DB_PATH" --json)
-        [ -n "${MEMCONTINUUM_CODE_ROOT:-}" ] && ARGS+=(--code-root "$MEMCONTINUUM_CODE_ROOT")
+        while IFS= read -r CR; do
+            [ -n "$CR" ] || continue
+            ARGS+=(--code-root "$CR")
+        done <<<"$CODE_ROOTS_TEXT"
         RAW="$(env PYTHONPATH= "$MC_PY" "$MC_MEMIDX" "${ARGS[@]}" 2>>"$MC_LOG")"
         RC=$?
         # F1 (ruling 68): `unmapped` now exits 1 (not just 0) on a genuine
@@ -441,41 +451,51 @@ except Exception:
                 uninitialized)      mc_log "userprompt outcome=index-uninitialized session=${SESSION_ID:-}" ;;
                 upgrade-required)   mc_log "userprompt outcome=index-upgrade-required session=${SESSION_ID:-}" ;;
                 index-error)        mc_log "userprompt outcome=index-error session=${SESSION_ID:-}" ;;
+                quarantined)        mc_log "userprompt outcome=index-quarantined session=${SESSION_ID:-}" ;;
             esac
+            # Design R7 (audit MC-P2-03, TOP-0123 L7): a typed internal
+            # error collapses coverage_status to "unknown" like any other
+            # read failure (no new case arm there -- see 2.3 of the map),
+            # but carries its own `degraded` object naming the reason. One
+            # more hook.log token, same case-arm style as index-error
+            # above, so `stats` can count it separately from a plain
+            # unknown.
+            DEGRADED_REASON="$(printf '%s' "$RAW" | env PYTHONPATH= "$MC_PY" -c '
+import json, sys
+try:
+    d = (json.load(sys.stdin) or {}).get("degraded")
+except Exception:
+    d = None
+print(d.get("reason_code", "") if isinstance(d, dict) else "")
+' 2>/dev/null)"
+            if [ -n "$DEGRADED_REASON" ]; then
+                mc_log "userprompt outcome=index-degraded reason=${DEGRADED_REASON} session=${SESSION_ID:-}"
+            fi
         fi
     fi
 
-    CUR_CODE_SHA="$(mc_git_head "${MEMCONTINUUM_CODE_ROOT:-}")"
+    # Design R5 (audit MC-P1-05, TOP-0123 L5): per-root HEAD comparison --
+    # code_head_changed = ANY configured root moved since session start.
+    # `git rev-parse HEAD` per root (mc_git_head, no python) is unavoidable
+    # (bash 3.2 cannot do a dict lookup without one), but the state-file
+    # lookup/comparison is ONE combined python call covering BOTH code
+    # (per-root map, LOW-4-fixed: a root missing from the map falls back to
+    # the single legacy start_code_sha only when it IS the first configured
+    # root) and store (unchanged, single root) -- replacing the former TWO
+    # separate START_CODE_SHA/START_STORE_SHA spawns with one, so this
+    # hook's total python-spawn count stays flat despite the new
+    # mc_code_roots call above. LOW-3/LOW-4 (task-7-review.md): both the
+    # per-root HEAD loop and this comparison now live once in memlib.sh
+    # (mc_code_heads_from / mc_head_changed).
+    CODE_HEADS="$(mc_code_heads_from "$CODE_ROOTS_TEXT")"
     CUR_STORE_SHA="$(mc_git_head "${MEMCONTINUUM_ROOT:-}")"
-    START_CODE_SHA="$(env PYTHONPATH= "$MC_PY" -c '
-import json, sys
-try:
-    with open(sys.argv[1]) as f:
-        state = json.load(f)
-except Exception:
-    state = {}
-print(state.get("start_code_sha") or "")
-' "$STATE_FILE" 2>>"$MC_LOG")"
-    START_STORE_SHA="$(env PYTHONPATH= "$MC_PY" -c '
-import json, sys
-try:
-    with open(sys.argv[1]) as f:
-        state = json.load(f)
-except Exception:
-    state = {}
-print(state.get("start_store_sha") or "")
-' "$STATE_FILE" 2>>"$MC_LOG")"
 
-    if [ -n "$CUR_CODE_SHA" ] && [ "$CUR_CODE_SHA" != "$START_CODE_SHA" ]; then
-        CODE_CHANGED="true"
-    else
-        CODE_CHANGED="false"
-    fi
-    if [ -n "$CUR_STORE_SHA" ] && [ "$CUR_STORE_SHA" != "$START_STORE_SHA" ]; then
-        STORE_CHANGED="true"
-    else
-        STORE_CHANGED="false"
-    fi
+    # Safe defaults in case the python call below prints nothing (interpreter
+    # gone, unexpected crash) -- under `set -u` an unset CODE_CHANGED/
+    # STORE_CHANGED would otherwise abort the hook with no log line.
+    CODE_CHANGED="false"
+    STORE_CHANGED="false"
+    eval "$(mc_head_changed "$STATE_FILE" "$CODE_HEADS" "$CUR_STORE_SHA" "${MEMCONTINUUM_CODE_ROOT:-}")"
 
     OUTPUT_JSON="$(UNMAPPED_JSON="$UNMAPPED_JSON" CODE_CHANGED="$CODE_CHANGED" STORE_CHANGED="$STORE_CHANGED" \
         MEMCONTINUUM_ROOT="${MEMCONTINUUM_ROOT:-}" \
@@ -501,8 +521,9 @@ def yn(v):
 
 if coverage_status != "ok":
     fact_line = (
-        "Coverage signal — decision-topic coverage unknown (store index "
-        f"stale); code HEAD changed: {yn(code_changed)}; store HEAD changed: {yn(store_changed)}"
+        "Coverage signal — decision-topic coverage unknown "
+        f"(store index {coverage_status}); code HEAD changed: {yn(code_changed)}; "
+        f"store HEAD changed: {yn(store_changed)}"
     )
     has_evidence = code_changed or store_changed
 else:

@@ -130,8 +130,18 @@ case "${SOURCE:-}" in
     startup|resume|clear)
         CODE_SHA="$(mc_git_head "${MEMCONTINUUM_CODE_ROOT:-}")"
         STORE_SHA="$(mc_git_head "${MEMCONTINUUM_ROOT:-}")"
+        # Design R5 (audit MC-P1-05, TOP-0123 L5): start_code_sha stays
+        # (first root, kept for older readers) AND start_code_shas
+        # ({root: sha}) is added for every configured root -- one extra
+        # python spawn (mc_code_roots, memlib.sh), the per-root git HEADs
+        # (mc_git_head, no python) folded into the SAME state-update
+        # transform below, no additional spawn for the map itself. LOW-3
+        # (task-7-review.md): the per-root loop itself now lives once in
+        # memlib.sh's mc_code_heads_from.
+        CODE_HEADS="$(mc_code_heads_from "$(mc_code_roots)")"
         export MC_CODE_SHA="$CODE_SHA"
         export MC_STORE_SHA="$STORE_SHA"
+        export MC_CODE_HEADS="$CODE_HEADS"
         export MC_SESSION_ID="$SESSION_ID"
         export MC_PROJECT_ENV="$MC_PROJECT"
         export MC_SOURCE="${SOURCE:-}"
@@ -140,16 +150,30 @@ case "${SOURCE:-}" in
 import os, time
 
 # INC-0108: clear discards whatever this session_id had on disk before the
-# setdefault init below runs, EXCEPT `ledger` -- see the header comment
-# above for why the ledger alone survives.
+# setdefault init below runs, EXCEPT ledger -- see the header comment
+# above for why the ledger alone survives. Design R6 (audit MC-P1-04,
+# TOP-0123 L6): shell_baseline (the shell-diff branch own per-root
+# baseline map) is kept alongside it for the same reason -- wiping it
+# would silently re-baseline every root on the next Bash call, losing the
+# distinction between pre- and post-clear shell dirt for the rest of the
+# session.
 if os.environ.get("MC_SOURCE") == "clear":
     _prior_ledger = state.get("ledger") or []
+    _prior_shell_baseline = state.get("shell_baseline") or {}
     state = {}
     state["ledger"] = _prior_ledger
+    state["shell_baseline"] = _prior_shell_baseline
+
+_code_heads = {}
+for _line in (os.environ.get("MC_CODE_HEADS") or "").splitlines():
+    if _line and "\t" in _line:
+        _root, _sha = _line.split("\t", 1)
+        _code_heads[_root] = _sha
 
 state.setdefault("session_id", os.environ.get("MC_SESSION_ID", ""))
 state.setdefault("project", os.environ.get("MC_PROJECT_ENV", ""))
 state.setdefault("start_code_sha", os.environ.get("MC_CODE_SHA", ""))
+state.setdefault("start_code_shas", _code_heads)
 state.setdefault("start_store_sha", os.environ.get("MC_STORE_SHA", ""))
 state.setdefault("created_at", time.time())
 state.setdefault("ledger", [])
@@ -207,8 +231,9 @@ def yn(v):
 
 if coverage_status != "ok":
     fact_line = (
-        "Coverage signal — decision-topic coverage unknown (store index "
-        f"stale); code HEAD changed: {yn(code_changed)}; store HEAD changed: {yn(store_changed)}"
+        "Coverage signal — decision-topic coverage unknown "
+        f"(store index {coverage_status}); code HEAD changed: {yn(code_changed)}; "
+        f"store HEAD changed: {yn(store_changed)}"
     )
     has_evidence = bool(code_changed) or bool(store_changed)
 else:

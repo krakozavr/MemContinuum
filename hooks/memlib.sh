@@ -32,16 +32,23 @@
 #                        Defaults to $(basename "$MEMCONTINUUM_ROOT"), else
 #                        "default" (memidx.py's own DEFAULT_PROJECT).
 #   MEMCONTINUUM_ROOT        store markdown root (the decision-chain repo).
-#   MEMCONTINUUM_CODE_ROOT   code root these hooks watch edits under.
+#   MEMCONTINUUM_CODE_ROOT   code root these hooks watch edits under (single-
+#                        root fallback; see MEMCONTINUUM_CODE_ROOTS below).
+#   MEMCONTINUUM_CODE_ROOTS  JSON array of every configured code root's
+#                        physical path (design R5, audit MC-P1-05, TOP-0123
+#                        L5). mc_code_roots() reads this first and falls
+#                        back to the single MEMCONTINUUM_CODE_ROOT above
+#                        when unset, so a project with one root never needs
+#                        to set both.
 #   MEMCONTINUUM_PYTHON      absolute path to the venv python. Falls back to
 #                        <engine>/.venv/bin/python (see scripts/repo-init.sh
 #                        --bootstrap-venv) when unset.
 #
 # WRITE-LOCK (ruling E): these scripts' only writable surface is
 # $MEMCONTINUUM_HOME/sessions/**/*.json[.lock] and $MEMCONTINUUM_HOME/hook.log.
-# Never write anything under MEMCONTINUUM_ROOT (the store) or
-# MEMCONTINUUM_CODE_ROOT (the code tree) from any function in this file or any
-# script that sources it.
+# Never write anything under MEMCONTINUUM_ROOT (the store) or any code root
+# named by MEMCONTINUUM_CODE_ROOT or MEMCONTINUUM_CODE_ROOTS from any
+# function in this file or any script that sources it.
 
 export PYTHONPATH=
 
@@ -180,6 +187,12 @@ for f in fields:
     if f == "tool_input.file_path":
         v = (d.get("tool_input") or {}).get("file_path") or ""
         name = "FILE_PATH"
+    elif f == "tool_input.notebook_path":
+        # R5/R6 (audit MC-P1-05/MC-P1-04, TOP-0123 L5/T8): a NotebookEdit
+        # payload carries notebook_path, not file_path -- added here so
+        # Task 8 does not need to touch memlib.sh itself.
+        v = (d.get("tool_input") or {}).get("notebook_path") or ""
+        name = "NOTEBOOK_PATH"
     elif f == "_prompt_hash":
         pid = d.get("prompt_id") or ""
         v = hashlib.sha256(pid.encode()).hexdigest()[:16] if pid else ""
@@ -196,12 +209,133 @@ for f in fields:
 ' "$@" 2>>"$MC_LOG"
 }
 
+# mc_code_roots -- prints one PHYSICAL code root per line, read by callers
+# via the existing bash-3.2-safe idiom:
+#   while IFS= read -r root; do ... ; done < <(mc_code_roots)
+# (process substitution, never a pipe -- a pipe would run the loop in a
+# subshell and drop any variable assignments made inside it). Design R5
+# (audit MC-P1-05, TOP-0123 L5): parses MEMCONTINUUM_CODE_ROOTS (a JSON
+# list, repo-init.sh's own esc_cmd(json.dumps(code_roots))) via ONE python
+# call -- the same one-python-call discipline mc_extract_fields already
+# uses, never a second process per root. Falls back to the single
+# MEMCONTINUUM_CODE_ROOT when the list variable is unset (old-shape
+# wiring rendered before this task, or a hand-written config) -- the list,
+# when present, IS the complete set; the single var is a strict subset/
+# legacy alias of it, never additional information, so this never reads
+# both.
+mc_code_roots() {
+    if [ -n "${MEMCONTINUUM_CODE_ROOTS:-}" ]; then
+        printf '%s' "$MEMCONTINUUM_CODE_ROOTS" | env PYTHONPATH= "$MC_PY" -c '
+import json, sys
+try:
+    roots = json.load(sys.stdin)
+except Exception:
+    roots = []
+if isinstance(roots, list):
+    for r in roots:
+        if isinstance(r, str) and r:
+            print(r)
+' 2>>"$MC_LOG"
+    elif [ -n "${MEMCONTINUUM_CODE_ROOT:-}" ]; then
+        printf '%s\n' "$MEMCONTINUUM_CODE_ROOT"
+    fi
+}
+
 # mc_git_head DIR -- read-only; empty string if DIR is missing or not a repo.
 # Never mutates DIR. No per-call timeout (see the file header).
 mc_git_head() {
     local dir="$1"
     [ -n "$dir" ] && [ -d "$dir" ] || { printf ''; return; }
     git -C "$dir" rev-parse HEAD 2>>"$MC_LOG" || printf ''
+}
+
+# mc_code_heads_from CODE_ROOTS_TEXT -- prints "root<TAB>head\n" for every
+# non-empty line of CODE_ROOTS_TEXT (mc_code_roots's own newline-separated
+# output), via mc_git_head (no python -- git only). LOW-3 (task-7-review.md):
+# shared by sessionstart-remind.sh, userprompt-remind.sh, and
+# precompact-persist.sh, collapsing the per-root HEAD-reading loop that used
+# to be duplicated (byte-for-byte in two of the three) across all three.
+# Never spawns python itself -- the caller already paid for the ONE
+# mc_code_roots call that produced CODE_ROOTS_TEXT, so folding this in adds
+# no new spawn.
+mc_code_heads_from() {
+    local roots_text="$1"
+    local cr
+    while IFS= read -r cr; do
+        [ -n "$cr" ] || continue
+        printf '%s\t%s\n' "$cr" "$(mc_git_head "$cr")"
+    done <<<"$roots_text"
+}
+
+# mc_head_changed STATE_FILE CODE_HEADS CUR_STORE_SHA FIRST_ROOT
+#
+# Prints "CODE_CHANGED=true|false" and "STORE_CHANGED=true|false"
+# (shlex-quoted, suitable for `eval "$(...)"`) -- the shared "did any
+# configured root's HEAD move since session start" comparison. LOW-3
+# (task-7-review.md): this ~30-line python heredoc used to be duplicated
+# byte-for-byte in userprompt-remind.sh and precompact-persist.sh; now
+# lives here once. CODE_HEADS is mc_code_heads_from's own output
+# ("root<TAB>head\n" lines); STATE_FILE's `start_code_shas` ({root: sha})
+# is the per-root map sessionstart-remind.sh writes; `start_code_sha`
+# (singular) is the pre-multi-root legacy value, recorded only for the
+# FIRST configured root (repo-init.sh always renders MEMCONTINUUM_CODE_ROOT
+# as code_roots[0] whenever any code root is configured, so FIRST_ROOT ==
+# that value identifies the one root the legacy key was ever measuring).
+#
+# LOW-4 fix (task-7-review.md): a root OTHER than FIRST_ROOT that is
+# missing from `start_code_shas` (the transitional window before a resume
+# repopulates the map -- see sessionstart-remind.sh's own header comment)
+# is treated as UNKNOWN and skipped, never compared against a DIFFERENT
+# root's start sha -- the pre-fix fallback compared every such root's
+# current HEAD against the first root's own start sha (two unrelated git
+# repositories), which could only ever read as a false "changed: yes".
+mc_head_changed() {
+    local state_file="$1"
+    local code_heads="$2"
+    local cur_store_sha="$3"
+    local first_root="$4"
+    CODE_HEADS="$code_heads" CUR_STORE_SHA="$cur_store_sha" MC_FIRST_ROOT="$first_root" \
+        env PYTHONPATH= "$MC_PY" -c '
+import json, os, shlex, sys
+
+try:
+    with open(sys.argv[1]) as f:
+        state = json.load(f)
+    if not isinstance(state, dict):
+        state = {}
+except Exception:
+    state = {}
+
+starts = state.get("start_code_shas")
+if not isinstance(starts, dict):
+    starts = {}
+legacy_start = state.get("start_code_sha") or ""
+first_root = os.environ.get("MC_FIRST_ROOT") or ""
+heads = os.environ.get("CODE_HEADS") or ""
+code_changed = False
+for line in heads.splitlines():
+    if not line or "\t" not in line:
+        continue
+    root, cur = line.split("\t", 1)
+    if root in starts:
+        start = starts[root]
+    elif root == first_root:
+        start = legacy_start
+    else:
+        # LOW-4: no start sha recorded for this root and it is not the
+        # one root the legacy key ever measured -- unknown, not compared.
+        continue
+    if cur and cur != start:
+        code_changed = True
+        break
+
+cur_store = os.environ.get("CUR_STORE_SHA") or ""
+start_store = state.get("start_store_sha") or ""
+store_changed = bool(cur_store) and cur_store != start_store
+
+print("CODE_CHANGED=" + shlex.quote("true" if code_changed else "false"))
+print("STORE_CHANGED=" + shlex.quote("true" if store_changed else "false"))
+' "$state_file" 2>>"$MC_LOG"
 }
 
 # mc_update_state_json STATE_FILE PY_TRANSFORM

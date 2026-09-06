@@ -12,8 +12,9 @@
 #
 # What it does:
 #   - loads this session's ledger from state
-#   - for ledger entries under the code root: runs `memidx.py unmapped`
-#     (self-healing: check -> reindex --no-embed on drift) to classify them
+#   - for ledger entries under any configured code root: runs `memidx.py
+#     unmapped` (self-healing: check -> reindex --no-embed on drift),
+#     `--code-root` passed once per configured root, to classify them
 #   - for ledger entries under the store root with no code entries present:
 #     runs a plain `memidx.py reindex --no-embed --auto` directly, so
 #     store-only edits still get reconciled into the index even with
@@ -21,8 +22,11 @@
 #     RECONCILIATION, not reminders") -- --auto (ruling 69) keeps
 #     embedding_mode untouched, since this hook-triggered heal never
 #     re-embeds
-#   - compares the code/store roots' current git HEAD against the session's
-#     start_code_sha/start_store_sha (captured by sessionstart-remind.sh)
+#   - compares every configured code root's current git HEAD against the
+#     session's start_code_shas map (falling back to the single legacy
+#     start_code_sha for a root the map has no entry for) and the store
+#     root's HEAD against start_store_sha (all captured by
+#     sessionstart-remind.sh)
 #   - writes the result to state.pending, replacing whatever was there
 #
 # Timeout: this whole script runs under a 2s watchdog (see the guard just
@@ -87,7 +91,8 @@ eval "$(mc_extract_fields "$PAYLOAD" session_id trigger)" 2>/dev/null
 STATE_FILE="$(mc_state_file_for "$MC_PROJECT" "$SESSION_ID")"
 [ -f "$STATE_FILE" ] || finish "no-state"
 
-# --- pull what we need out of state (ledger, start SHAs) without mutating it --
+# --- pull what we need out of state (ledger) without mutating it -- start
+# SHAs are read directly off STATE_FILE further down, not through here --
 READ_TMP="$(mktemp 2>/dev/null)" || finish "mktemp-failed"
 trap 'rm -f "$READ_TMP" "${PENDING_TMP:-}" 2>/dev/null' EXIT
 
@@ -106,8 +111,6 @@ store_touched = any(e.get("kind") == "store" for e in ledger)
 out = {
     "code_paths": code_paths,
     "store_touched": store_touched,
-    "start_code_sha": state.get("start_code_sha", ""),
-    "start_store_sha": state.get("start_store_sha", ""),
 }
 with open(sys.argv[2], "w") as f:
     json.dump(out, f)
@@ -130,8 +133,6 @@ print(json.dumps(v) if not isinstance(v, str) else v)
 }
 
 STORE_TOUCHED="$(read_field store_touched)"
-START_CODE_SHA="$(read_field start_code_sha)"
-START_STORE_SHA="$(read_field start_store_sha)"
 
 # bash 3.2 has no `mapfile`/`readarray` -- process substitution (never a
 # pipe, which would run the loop in a subshell and drop the assignments)
@@ -146,6 +147,11 @@ with open(sys.argv[1]) as f:
 for p in d.get("code_paths", []):
     print(p)
 ' "$READ_TMP" 2>>"$MC_LOG")
+
+# Design R5 (audit MC-P1-05, TOP-0123 L5): every configured code root,
+# captured ONCE (one python spawn via mc_code_roots, memlib.sh) and reused
+# below by BOTH the `unmapped` call and the per-root HEAD comparison.
+CODE_ROOTS_TEXT="$(mc_code_roots)"
 
 # --- store-only reconciliation (no code paths to classify) ------------------
 if [ "${#CODE_PATHS[@]}" -eq 0 ]; then
@@ -162,7 +168,10 @@ if [ "${#CODE_PATHS[@]}" -gt 0 ] && [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
     ARGS=(unmapped)
     ARGS+=("${CODE_PATHS[@]}")
     ARGS+=(--root "$MEMCONTINUUM_ROOT" --project "$MC_PROJECT" --db "$MC_DB_PATH" --json)
-    [ -n "${MEMCONTINUUM_CODE_ROOT:-}" ] && ARGS+=(--code-root "$MEMCONTINUUM_CODE_ROOT")
+    while IFS= read -r CR; do
+        [ -n "$CR" ] || continue
+        ARGS+=(--code-root "$CR")
+    done <<<"$CODE_ROOTS_TEXT"
     RAW="$(env PYTHONPATH= "$MC_PY" "$MC_MEMIDX" "${ARGS[@]}" 2>>"$MC_LOG")"
     RC=$?
     # F1 (ruling 68): see userprompt-remind.sh's identical block -- accept
@@ -182,24 +191,47 @@ except Exception:
             uninitialized)      mc_log "precompact outcome=index-uninitialized session=${SESSION_ID:-}" ;;
             upgrade-required)   mc_log "precompact outcome=index-upgrade-required session=${SESSION_ID:-}" ;;
             index-error)        mc_log "precompact outcome=index-error session=${SESSION_ID:-}" ;;
+            quarantined)        mc_log "precompact outcome=index-quarantined session=${SESSION_ID:-}" ;;
         esac
+        # Design R7 (audit MC-P2-03, TOP-0123 L7): see userprompt-remind.sh's
+        # identical block -- a typed internal error stays coverage_status
+        # "unknown" but carries its own `degraded` object; one more
+        # hook.log token, same case-arm style, so `stats` can count it.
+        DEGRADED_REASON="$(printf '%s' "$RAW" | env PYTHONPATH= "$MC_PY" -c '
+import json, sys
+try:
+    d = (json.load(sys.stdin) or {}).get("degraded")
+except Exception:
+    d = None
+print(d.get("reason_code", "") if isinstance(d, dict) else "")
+' 2>/dev/null)"
+        if [ -n "$DEGRADED_REASON" ]; then
+            mc_log "precompact outcome=index-degraded reason=${DEGRADED_REASON} session=${SESSION_ID:-}"
+        fi
     fi
 fi
 
 # --- git HEAD comparison -----------------------------------------------------
-CUR_CODE_SHA="$(mc_git_head "${MEMCONTINUUM_CODE_ROOT:-}")"
+# Design R5 (audit MC-P1-05, TOP-0123 L5): per-root HEAD comparison --
+# code_head_changed = ANY configured root moved since session start. One
+# combined python call (reading STATE_FILE directly, not READ_TMP) covers
+# BOTH code (per-root map, LOW-4-fixed: a root missing from the map falls
+# back to the single legacy start_code_sha only when it IS the first
+# configured root) and store (unchanged, single root) -- replacing the two
+# READ_TMP-based start_code_sha/start_store_sha read_field spawns above
+# with one call here, so this hook's total python-spawn count stays flat
+# despite the new mc_code_roots call above. LOW-3/LOW-4 (task-7-review.md):
+# both the per-root HEAD loop and this comparison now live once in
+# memlib.sh (mc_code_heads_from / mc_head_changed).
+CODE_HEADS="$(mc_code_heads_from "$CODE_ROOTS_TEXT")"
 CUR_STORE_SHA="$(mc_git_head "${MEMCONTINUUM_ROOT:-}")"
 
-if [ -n "$CUR_CODE_SHA" ] && [ "$CUR_CODE_SHA" != "$START_CODE_SHA" ]; then
-    CODE_CHANGED="true"
-else
-    CODE_CHANGED="false"
-fi
-if [ -n "$CUR_STORE_SHA" ] && [ "$CUR_STORE_SHA" != "$START_STORE_SHA" ]; then
-    STORE_CHANGED="true"
-else
-    STORE_CHANGED="false"
-fi
+# Safe defaults in case the python call below prints nothing (interpreter
+# gone, unexpected crash) -- under `set -u` an unset CODE_CHANGED/
+# STORE_CHANGED would otherwise abort the hook with no log line.
+CODE_CHANGED="false"
+STORE_CHANGED="false"
+eval "$(mc_head_changed "$STATE_FILE" "$CODE_HEADS" "$CUR_STORE_SHA" "${MEMCONTINUUM_CODE_ROOT:-}")"
 
 export MC_UNMAPPED_JSON="$UNMAPPED_JSON"
 export MC_CODE_CHANGED="$CODE_CHANGED"

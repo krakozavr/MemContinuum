@@ -20,6 +20,7 @@ from pathlib import Path
 
 TOOLS_DIR = Path(__file__).resolve().parent.parent
 INSTALL_SH = TOOLS_DIR / "scripts" / "repo-init.sh"
+REGISTRY_LIB = TOOLS_DIR / "scripts" / "mc-registry-lib.sh"
 PY_CORPUS = TOOLS_DIR / "tests" / "fixtures" / "python_corpus"
 # This machine's venv python is never hardcoded in tracked test code -- set
 # $MEMCONTINUUM_PYTHON in your own (untracked) shell environment before
@@ -295,6 +296,18 @@ class TestFreshInstall(unittest.TestCase):
             self.assertIn("MEMCONTINUUM_PROJECT=widgetco", matching[0])
             self.assertIn(f"MEMCONTINUUM_CODE_ROOT={self.code_root}", matching[0])
             self.assertIn(str(TOOLS_DIR / "hooks" / script), matching[0])
+
+    def test_post_tool_use_group_has_no_matcher(self):
+        """Design R6 (audit MC-P1-04, TOP-0123 L6): the PostToolUse group
+        must fire for every tool -- a matcher-limited hook can never
+        observe an unknown mutation tool. Same script, same basename: hook
+        counts / mc_wiring_scan / MC_HOOK_BASENAMES identity are keyed on
+        the basename, never the matcher (see test_mc_settings_merge.py and
+        mc-registry-lib.sh's own basenames_identity)."""
+        data = json.loads(self.settings_path.read_text())
+        post = data["hooks"]["PostToolUse"]
+        self.assertEqual(len(post), 1, post)
+        self.assertNotIn("matcher", post[0], post[0])
 
     def test_settings_contains_pre_edit_hook_with_right_paths(self):
         data = json.loads(self.settings_path.read_text())
@@ -688,9 +701,12 @@ class TestMultipleCodeRoots(unittest.TestCase):
                 root = root_a if root_a in h["if"] else root_b
                 self.assertIn(f"MEMCONTINUUM_CODE_ROOT={root}", h["command"])
 
-            # write hooks only support one MEMCONTINUUM_CODE_ROOT -- must be the first root given
+            # R5 (TOP-0123 L5): write hooks carry BOTH the first root (kept,
+            # for older readers/the updater's fallback) and the full JSON
+            # list of every recorded root.
             post_cmd = data["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
             self.assertIn(f"MEMCONTINUUM_CODE_ROOT={root_a}", post_cmd)
+            self.assertIn(f"MEMCONTINUUM_CODE_ROOTS={shlex.quote(json.dumps([root_a, root_b]))}", post_cmd)
         finally:
             shutil.rmtree(home, ignore_errors=True)
 
@@ -757,6 +773,102 @@ class TestMultipleCodeRoots(unittest.TestCase):
             # either `printf %q` backslash-escaping or a quoted string.
             tokens = shlex.split(recipe)
             self.assertIn(root_with_space, tokens, recipe)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_write_side_lines_carry_code_root_and_code_roots_json(self):
+        """R5 (TOP-0123 L5) red test 1: every write-side line carries BOTH
+        MEMCONTINUUM_CODE_ROOT=<first> and MEMCONTINUUM_CODE_ROOTS=<JSON
+        list>, exact quoting per repo-init.sh's own esc_cmd; exactly one
+        entry per lifecycle event; two pre-edit pairs; two newfile-nudge
+        entries. Compares against the PARSED command string (json.loads of
+        the settings file), never raw file bytes -- the settings file's own
+        JSON layer re-escapes internal quotes in the raw text."""
+        home = sandbox_home()
+        try:
+            store = str(Path(home) / "store")
+            root_a = str(Path(home) / "code-a")
+            root_b = str(Path(home) / "code-b")
+            os.makedirs(root_a, exist_ok=True)
+            os.makedirs(root_b, exist_ok=True)
+            proc = run_install(
+                ["--project", "multi2", "--store", store,
+                 "--code-root", root_a, "--code-root", root_b,
+                 "--claude-dir", str(Path(home) / ".claude")],
+                home,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            data = json.loads((Path(home) / ".claude" / "settings.local.json").read_text())
+
+            expected_root = f"MEMCONTINUUM_CODE_ROOT={root_a}"
+            expected_roots = f"MEMCONTINUUM_CODE_ROOTS={shlex.quote(json.dumps([root_a, root_b]))}"
+
+            for event in ("PostToolUse", "PreCompact", "SessionStart", "UserPromptSubmit", "SessionEnd"):
+                groups = data["hooks"][event]
+                items = [h for g in groups for h in g.get("hooks", [])]
+                self.assertEqual(len(items), 1, (event, items))
+                cmd = items[0]["command"]
+                self.assertIn(expected_root, cmd, (event, cmd))
+                self.assertIn(expected_roots, cmd, (event, cmd))
+
+            pre_items = [h for g in data["hooks"]["PreToolUse"] for h in g.get("hooks", [])]
+            pre_edit_items = [h for h in pre_items if "pre-edit-chain.sh" in h["command"]]
+            nudge_items = [h for h in pre_items if "newfile-nudge.sh" in h["command"]]
+            self.assertEqual(len(pre_edit_items), 4, pre_edit_items)  # 2 roots x (Edit+Write)
+            self.assertEqual(len(nudge_items), 2, nudge_items)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_rendered_code_roots_token_survives_mc_command_env_value(self):
+        """R5 (TOP-0123 L5): scripts/mc-registry-lib.sh's mc_command_env_value
+        (used by memcontinuum-update.sh's detection/recovery) reads a
+        `'...'`-quoted value off the RAW settings-file line text -- verify
+        the rendered MEMCONTINUUM_CODE_ROOTS token survives that read.
+        Because the settings file is itself one JSON document, the array's
+        internal double quotes are backslash-escaped in the raw file text
+        (`MEMCONTINUUM_CODE_ROOTS='[\\"A\\", \\"B\\"]'`); mc_command_env_value
+        captures that escaped form verbatim, so decoding it needs one extra
+        step (treat the captured text as the interior of a JSON string
+        literal) before json.loads sees a real array. This does NOT affect
+        hook runtime -- memlib.sh's mc_code_roots reads the real environment
+        variable, already unescaped once by Claude Code's own JSON-aware
+        settings loader -- only code that greps the raw settings file needs
+        the extra decode step (documented, not solved, for a root path
+        containing a literal `'`: mc_command_env_value would truncate at it
+        regardless of this task)."""
+        home = sandbox_home()
+        try:
+            store = str(Path(home) / "store")
+            root_a = str(Path(home) / "code-a")
+            root_b = str(Path(home) / "code-b")
+            os.makedirs(root_a, exist_ok=True)
+            os.makedirs(root_b, exist_ok=True)
+            proc = run_install(
+                ["--project", "multi3", "--store", store,
+                 "--code-root", root_a, "--code-root", root_b,
+                 "--claude-dir", str(Path(home) / ".claude")],
+                home,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            settings_path = Path(home) / ".claude" / "settings.local.json"
+            raw_line = next(
+                l for l in settings_path.read_text().splitlines()
+                if "ledger-post-edit.sh" in l and "MEMCONTINUUM_CODE_ROOTS=" in l
+            )
+            probe = Path(home) / "probe.sh"
+            probe.write_text(
+                f'#!/usr/bin/env bash\n. "{REGISTRY_LIB}"\n'
+                'mc_command_env_value "$1" "MEMCONTINUUM_CODE_ROOTS"\n'
+                'printf "%s" "$MC_ENV_VALUE"\n'
+            )
+            proc2 = subprocess.run(
+                [MC_BASH, str(probe), raw_line], capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(proc2.returncode, 0, proc2.stderr)
+            captured = proc2.stdout
+            self.assertTrue(captured, "mc_command_env_value captured nothing")
+            decoded = json.loads(json.loads('"' + captured + '"'))
+            self.assertEqual(decoded, [root_a, root_b])
         finally:
             shutil.rmtree(home, ignore_errors=True)
 
@@ -2211,6 +2323,13 @@ class TestAdoptClassification(unittest.TestCase):
                 if k.startswith("MEMCONTINUUM_"):
                     del commit_env[k]
             commit_env["HOME"] = home
+            # Design R8 (audit MC-P2-02, TOP-0123 L7): this real commit's
+            # content pass leaves the new topic's vector missing (E>0), so
+            # the post-commit hook would otherwise spawn a REAL detached
+            # embed-worker (a real python, real fastembed) that would
+            # outlive this test. Disabled -- this test's own subject (the
+            # content pass recreating the index db) is unaffected.
+            commit_env["MEMCONTINUUM_EMBED_WORKER"] = "0"
             (Path(worktree) / "topics" / "T-0002.md").write_text(
                 "---\ntype: topic\nid: T-0002\ntitle: wt\narea: test\n---\nBody\n"
             )
@@ -2226,6 +2345,10 @@ class TestAdoptClassification(unittest.TestCase):
             self.assertTrue(
                 index_db.is_file(),
                 "a commit made in the linked worktree must run the post-commit reindex wrapper",
+            )
+            self.assertFalse(
+                (Path(home) / ".memcontinuum" / "p.embed.lock").exists(),
+                "MEMCONTINUUM_EMBED_WORKER=0 must leave no worker/lock behind",
             )
         finally:
             shutil.rmtree(home, ignore_errors=True)

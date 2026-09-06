@@ -38,12 +38,12 @@ wired one level up, into `~/.claude/settings.json`, by `memcontinuum-setup.sh`.
 |---|---|---|
 | `pre-edit-chain.sh` | `PreToolUse` (Edit/Write, filtered to `--code-root`) | `for-path` lookup on the file being edited; injects matching chains as `additionalContext` |
 | `newfile-nudge.sh` | `PreToolUse` (Write only, filtered to `--code-root`) | fires only when the write target does not exist yet and its extension is wired for this project; injects one reminder to search the code index first |
-| `ledger-post-edit.sh` | `PostToolUse` | appends the edit to a per-session ledger, scoped to `--code-root` and the store root |
+| `ledger-post-edit.sh` | `PostToolUse` (every tool; no settings-level matcher) | a bash-only prefilter exits before the watchdog for read-only built-ins (`Read`, `Grep`, ...); `Edit`/`Write`/`MultiEdit`/`NotebookEdit` ledger the tool's own file path (`source: tool`); `Bash` and any tool this hook has no dedicated branch for fall through to a shell-diff (`git status`) tree comparison against a per-root baseline (`source: shell-diff`); an unrecognized or missing `tool_name` additionally logs `outcome=unsupported-mutation-surface` |
 | `precompact-persist.sh` | `PreCompact` | persists session state before context is compacted away |
 | `sessionstart-remind.sh` | `SessionStart` | on `startup`/`resume`/`clear`, initializes session state only (captures the code/store roots' git HEAD, prunes state older than 24h; `clear` resets the session's counters and pending nudges but carries the edit ledger over, `resume` keeps everything); only on `source: compact` does it inject what `precompact-persist.sh` left pending |
 | `userprompt-remind.sh` | `UserPromptSubmit` | never reads the prompt text; fires the coverage or look-back nudge |
 | `sessionend-stamp.sh` | `SessionEnd` | stamps session end into state |
-| `post-commit-reindex.sh` | store's git `post-commit` | reindexes the store after every commit to it |
+| `post-commit-reindex.sh` | store's git `post-commit` | a bounded content-only reindex after every commit; spawns a background embed-worker when vectors are left behind |
 | `memcontinuum-detect.sh` | `SessionStart`, user level | classifies an un-initialized repo and asks once; no python, no watchdog, no logging by default |
 
 **Fail-open is the contract, not a fallback.** No hook may block an edit or a
@@ -51,7 +51,9 @@ commit — not on a missing python, not on a stale index, not on a lookup error,
 not on its own timeout. A hook that cannot do its job logs and exits 0. The
 reason is asymmetric cost: a missed reminder costs one un-recorded ruling; a
 hook that blocks an edit costs the user their tool, and the first thing anyone
-does with a tool that blocks edits is remove it.
+does with a tool that blocks edits is remove it. Failing open also names its
+reason: a degraded answer carries `reason_code`, `exception_type` and a safe
+message; the traceback goes to `memidx-debug.log`; `--debug` re-raises.
 
 **Logging, per hook.** The seven project-level hooks each write exactly one
 `outcome=` line per run to `$MEMCONTINUUM_HOME/hook.log`.
@@ -61,15 +63,36 @@ guarded hook cannot write its own outcome line then — it may be mid-call, or m
 never have reached that code — so `mc-watchdog.sh` writes
 `outcome=watchdog-killed hook=<name>` itself before exiting. The two hooks
 outside that rule are deliberate: `post-commit-reindex.sh` writes its own
-`post-commit-reindex: rc=… elapsed=… project=… root=…` line instead, and
+`post-commit-reindex: rc=… elapsed=… project=… root=… embed=pending|clean|skipped`
+line instead, and
 `memcontinuum-detect.sh` writes nothing at all unless
 `$MEMCONTINUUM_DETECT_LOG` is set — it runs in every repo on the machine, so its
 default is silence.
 
+`ledger-post-edit.sh` itself has two further exceptions to "exactly one
+`outcome=` line". A read-only built-in (`Read`, `Grep`, ...) is caught by the
+prefilter before the watchdog and writes nothing at all — no line, no
+process spawned. The shell-diff branch (`Bash`, or any tool with no
+dedicated branch) can write several lines in one run: one
+`outcome=appended kind=<code|store> source=shell-diff` per path the tree
+diff found changed, always followed by exactly one summary line,
+`outcome=shell-diff appended=N roots=R timeouts=T non-git=G
+baseline-too-large=L`, so a call that touched zero paths still counts as one
+line (and `stats` counts calls, not paths, from that summary line alone).
+An unrecognized or missing `tool_name` adds one more line ahead of the
+shell-diff pass, `outcome=unsupported-mutation-surface tool=<name>`.
+
 **Writable surface.** The write-side hooks may write
 `$MEMCONTINUUM_HOME/sessions/<project>/` and `hook.log`, and nothing else —
-never the store, never the code root. Two of them reach the decision index's own
-SQLite cache as well, and only that: `userprompt-remind.sh`'s coverage check
+never the store, never the code root. `ledger-post-edit.sh`'s shell-diff
+branch runs `git status --porcelain -z` (via `git --no-optional-locks`) in
+every configured code root and the store root on a `Bash` (or unrecognized-
+tool) invocation — that call is read-only end to end, so it does not widen
+this surface: a `git status`/`git diff` run in that root afterwards reports
+exactly what it would have before (the regression test for this claim is
+`test_shell_diff_git_status_calls_leave_the_tree_exactly_as_found`). Two
+hooks reach the decision index's own SQLite cache as well, and only that:
+`userprompt-remind.sh`'s coverage check
 calls `memidx.py unmapped`, which self-heals a drifted index with a
 `reindex --no-embed --auto`, and `precompact-persist.sh` runs the same
 self-healing `unmapped` call for ledger entries under the code root — or a
@@ -77,12 +100,72 @@ plain `reindex --no-embed --auto` when the session only touched the store.
 `--auto` keeps the self-heal mode-preserving: it never embeds inside a hook's
 time budget, and never lets a no-op heal pass claim a fuller `embedding_mode`
 than the index already had (see [Decision index provenance](#decision-index-provenance-and-embedding-lifecycle)).
+`post-commit-reindex.sh` (the store's git `post-commit`, not one of the
+five write-side hooks above) writes the decision index directly (that is its
+whole job) plus, when its content pass leaves rows without a fresh vector,
+`<project>.embed-pending` (a marker), `<project>.embed.lock`
+(an `fcntl.flock` target for the embed-worker it spawns) and
+`<project>.embed.log` (the worker's own stdout/stderr, never the shared
+`hook.log`). These three, and `memidx-debug.log` (a timestamped traceback
+`memidx.py` appends whenever a command degrades on an internal error), all
+land beside the database the command in question is serving
+(`Path(db_path).parent`) rather than at a fixed `$MEMCONTINUUM_HOME` path —
+a custom `--db` moves them with it. Only when no database is in scope at all
+(`backend-preflight`) does `memidx-debug.log` fall back to
+`$MEMCONTINUUM_HOME`. Every one of these files is created only when its
+directory already exists (none of them is what creates that directory out of
+nowhere), and none is ever surfaced to stdout/stderr/JSON.
 
 **Session state** lives at `$MEMCONTINUUM_HOME/sessions/<project>/<id>.json`,
 written by atomic rename (`os.replace`) and guarded by a real
 `fcntl.flock(LOCK_EX)` (retried up to 2s) taken inside the state-update helper
 in `memlib.sh` — a Python call, never a shelled-out `flock` binary, which macOS
 does not ship.
+
+**The shell-diff ledger branch.** `ledger-post-edit.sh` runs the tree-diff
+pass for `Bash` and any tool it has no dedicated branch for, inside the same
+locked python transform `mc_update_state_json` already uses (one subprocess,
+one flock, no extra process per root). For every root — each configured code
+root, then the store root — it skips a root with no `.git` (counted
+`non-git`) and otherwise runs `git --no-optional-locks status --porcelain -z
+--untracked-files=all` under a `subprocess.run(..., timeout=...)`, budgeted
+by two env vars: `MEMCONTINUUM_SHELL_DIFF_BUDGET` (default 1.2s, the total
+wall-clock ceiling for the whole call, tracked with `time.monotonic()`) and
+`MEMCONTINUUM_SHELL_DIFF_ROOT_BUDGET` (default 0.8s, the per-root ceiling —
+the smaller of the two, or whatever total budget remains, is what each `git`
+call actually gets). A timed-out or failing root counts `timeouts` and is
+retried on the next call; it never touches that root's baseline. The `-z`
+porcelain output is NUL-delimited (`XY<space>PATH\0`); a rename or copy
+status (`R`/`C`) is followed by a second NUL-terminated path (the source),
+and both are treated as changed. The FIRST successful `git status` seen for
+a root only establishes a baseline (a `{path: sha256}` map, `None` instead
+when the root has more than 500 dirty paths, counted `baseline-too-large`
+and never retried) and appends nothing — a file already dirty before
+MemContinuum ever looked is not something a later, unrelated edit gets
+credited or blamed for. Every call after that compares the current dirty
+set against the baseline and appends a ledger row (`source: shell-diff`,
+`kind: code` or `store`) for every path whose content hash changed,
+including a deleted path (`content_sha256: ""`). Each appended row logs its
+own `outcome=appended kind=<kind> source=shell-diff file=<path>` line, and
+every call — even one that appended nothing — ends with exactly one summary
+line, `outcome=shell-diff appended=N roots=R timeouts=T non-git=G
+baseline-too-large=L`; `memidx.py stats` counts these dynamically under
+`ledger_appends.shell_diff_calls`, the same way it already counted
+`ledger_appends.code`/`store`. An unrecognized or missing `tool_name` (an
+MCP tool this hook has no branch for, or a malformed payload) logs one more
+line, `outcome=unsupported-mutation-surface tool=<name-or-"unknown">`,
+counted under `ledger_appends.unsupported_surface`, and still runs the same
+tree-diff pass — an unrecognized tool that mutated a file is still caught.
+
+This is deliberately best-effort, not strict mutation coverage: nothing here
+refuses an undeclared shell mutation or blocks a commit over one. Structured
+edits get pre-retrieval, before the edit happens, but only for the `Edit`
+and `Write` tools — the `PreToolUse` matcher names only those two, and the
+hook reads only `tool_input.file_path`, so it has no branch that could fire
+for a notebook payload. `MultiEdit` and `NotebookEdit` are ledgered after
+the fact (`source: "tool"`, same as `Edit`/`Write`) but are not
+pre-retrieved. Shell mutations get best-effort post-detection, after the
+fact, bounded by whatever the git-status budget above could see in time.
 
 **The detector is deliberately unlike the others.** It fires on every session
 start on the machine, including in repositories that have nothing to do with
@@ -249,8 +332,11 @@ room than a help line.
 - **The install-time `reindex` passes `--no-embed`.** A freshly seeded store
   holds only stub content, and a real embed here would make a first install
   depend on network access (or a warm fastembed cache) it otherwise does not
-  need. The store's own `post-commit` runs a full reindex on the first real
-  commit of content.
+  need. The store's own `post-commit` runs its own bounded, content-only pass
+  (`--no-embed --auto`, under the watchdog) on every commit -- including the
+  first real one -- and the first EMBED is the background embed-worker's,
+  spawned whenever that content pass leaves rows without a fresh vector (see
+  [Decision index provenance](#decision-index-provenance-and-embedding-lifecycle)).
 
 ## Decision registry keying
 
@@ -800,9 +886,15 @@ doubles it. `hooks/install-hooks.md` documents the wiring each hook receives.
 Each `--code-root` gets its own correctly-scoped entry in both PreToolUse
 hooks: `pre-edit-chain.sh` an `Edit`/`Write` pair, `newfile-nudge.sh` a `Write`
 entry with `MEMCONTINUUM_CODE_ROOT` set to that specific directory. The five
-write-side hooks support one `MEMCONTINUUM_CODE_ROOT` each — a limitation of
-`hooks/memlib.sh`, not of the installer — so with several `--code-root`s they
-get the first.
+write-side hooks receive every configured code root: `MEMCONTINUUM_CODE_ROOT`
+carries the first (kept, for a reader that only ever looks at one root) and
+`MEMCONTINUUM_CODE_ROOTS` carries the complete JSON list of physical paths.
+`hooks/memlib.sh`'s `mc_code_roots` reads the list (falling back to the single
+variable when the list is absent) and every write-side hook containment/
+comparison walks it — `ledger-post-edit.sh` checks a path against every root,
+`userprompt-remind.sh`/`precompact-persist.sh` pass every root to `unmapped
+--code-root` (repeatable) in one call, and `sessionstart-remind.sh` records
+each root's git HEAD.
 
 ## The watchdog
 
@@ -814,8 +906,11 @@ Python launcher that kills the whole child process group once a budget expires �
 
 Guarded: the five write-side hooks, plus `newfile-nudge.sh` (which has no
 write-side state of its own but shares the same guard rather than growing a
-second bespoke timeout story for the one hook that happens to be fast) and
-`pre-edit-chain.sh`. Unguarded: `post-commit-reindex.sh`,
+second bespoke timeout story for the one hook that happens to be fast),
+`pre-edit-chain.sh`, and `post-commit-reindex.sh` (its own budget,
+`MEMCONTINUUM_POST_COMMIT_BUDGET`, default 30 seconds -- generous on purpose:
+its guarded content pass is measured well under a second; the budget is a
+backstop against a hung/slow filesystem, not a tuned ceiling). Unguarded:
 `memcontinuum-detect.sh`.
 
 `pre-edit-chain.sh`'s own inner budget is confirmed against a real
@@ -1311,9 +1406,11 @@ handling already fails open, so a non-zero exit there is structural.
 A project has one language set (`code_project.langs`, `code_project.embedding_mode`)
 shared by every code root it indexes, and one row per root
 (`code_meta(project, code_root)`, holding that root's `last_indexed_at` and
-`head_sha`). `chunks` and `file_sha` carry `code_root` in their key, so a
-project can index several trees at once without one root's rows colliding
-with another's.
+`head_sha`). `head_sha` is a git-diff TRIGGER, not proof by itself: it names
+the HEAD this root was last hashed clean against, and refreshes only once
+every file that HEAD's diff touched verifies (below). `chunks` and
+`file_sha` carry `code_root` in their key, so a project can index several
+trees at once without one root's rows colliding with another's.
 
 `code-reindex --code-root DIR` touches only that root: it queries, writes and
 deletes `file_sha`/`chunks` rows scoped to `(project, code_root)` alone, and
@@ -1343,21 +1440,61 @@ longer matches the current one — never on an unrelated edit elsewhere in the
 tree with nothing about the backend or the chunker having changed, which is
 exactly the situation `code-search`'s heal (below) runs in.
 
+Writing a `failed`/`not-indexed` row is itself guarded: each file's whole
+write (the chunk INSERTs, or the failure-path purge-and-stamp) runs under its
+own savepoint, released on success and rolled back on any failure — so a
+mid-file exception can never leave a partial write committed alongside the
+files before and after it. If the purge or the status write ITSELF fails
+(disk error, a locked db), the savepoint rolls back that attempt too — the
+file's previous chunks and status row are left exactly as they were, nothing
+is half-updated — `code-reindex` prints `cannot purge stale rows for <path>
+(<Type>: <msg>); index integrity not guaranteed`, counts it as an integrity
+failure, and continues with the next file; every file that DID complete
+cleanly is still committed. A run with one or more integrity failures exits
+**5** and its summary line gains an `N integrity failure(s)` token.
+
 **`code_index_report(project)`** is the preflight both `code-search` and the
 heal consult, one entry per recorded root. States, in order: **uninitialized**
 (no `code-reindex` has ever run for this project — no `code_meta` rows at
 all); **stale** (some root has files that changed, were removed, or moved to
 a new chunker version since the last `code-reindex` — a removed file counts
-as changed too); **degraded** (nothing changed, but some root has a
-`not-indexed` file, a backend-availability change since a `not-indexed` row
-was stamped, or a recorded root missing on disk — a missing root can never
-read `current`); otherwise **current**. `failed` files are never part of this
-state calculation at all — an index with only `failed` files reads `current`,
-and `code-search` reports the failed count as its own separate line.
-The preflight is otherwise read-only: the one write it may commit is
-refreshing a drifted-looking file's stored `mtime`/`size` once its content
-turns out unchanged (sha256 still matches) — cache bookkeeping so the same
-file isn't re-hashed on the next call, never a chunk, status, or meta row.
+as changed too, and `changed` here means CONTENT changed: a stat-signal
+match or the git trigger proved it, never metadata alone); **degraded**
+(nothing changed, but some root has a `not-indexed` file, a
+backend-availability change since a `not-indexed` row was stamped, or a
+recorded root missing on disk — a missing root can never read `current`);
+**current** ONLY when `--verify-content` hashed every file in every recorded
+root during THIS call; otherwise **metadata-current** — the honest default:
+the stat signals (and, when it fired, the git trigger) found nothing, but
+nothing was proven by a full hash either. `failed` files are never part of
+this state calculation at all — an index with only `failed` files still
+reads `metadata-current`/`current`, and `code-search` reports the failed
+count as its own separate line. The preflight is otherwise read-only: the
+one write it may commit is refreshing a drifted-looking file's stored stat
+signals once its content turns out unchanged (sha256 still matches) — cache
+bookkeeping so the same file isn't re-hashed on the next call, never a
+chunk, status, or meta row.
+
+**Stat signals and the git trigger.** A file's freshness gate does not stop
+at `chunker_version` or a bare mtime/size comparison: `file_sha` stores five
+signals from ONE `os.stat()` call — size, `mtime_ns`, `ctime_ns`, inode,
+device — and any one differing from the stored row triggers a content hash
+(a row written before this signal set existed has every new signal NULL,
+which reads as differing, so the very first report after the upgrade hashes
+once and fills them in). A same-size, same-`mtime_ns` rewrite — a
+metadata-preserving restore, a coarse-timestamp filesystem, some sync tools
+— moves `ctime`/inode/device regardless; userspace cannot fake those, so the
+signal set catches it where mtime/size alone could not. After the stat
+pass, when a root's stored `head_sha` differs from its current git HEAD,
+the commit's own changed paths (`git diff --name-only`, remapped
+root-relative via `git rev-parse --show-prefix`) are hashed too, regardless
+of what the stat pass already decided — a TRIGGER, not proof on its own: a
+path the diff never touched is never hashed by it, and a non-git root, a
+missing `head_sha` (never reindexed inside a git repo), or any git failure
+or timeout (a 3-second budget per report call, `git rev-parse HEAD` alone
+capped at 2 seconds) leaves this signal off without blocking the report.
+`head_sha` refreshes only once every one of those diffed, in-root,
+still-source paths verifies clean.
 
 **Heal.** Before answering, `code-search` consults the report and, unless
 `--no-heal` is given, may repair it once: eligible only when the state is
@@ -1376,34 +1513,54 @@ the project's language set); it reindexes with embeddings only when the
 project's own `embedding_mode` is already `full`, otherwise with
 `--no-embed` — a heal can never be what silently leaves a `full` project's
 new chunks unembedded, but it also never upgrades a `none` project to `full`
-on its own. `code-search` prints `index healed` only when the state after
-healing reads `current`; any exception during the heal is fail-open — the
-original report stands and the search still answers from whatever was
-already indexed.
+on its own. `code-search` prints `index healed` only when EVERY in-process
+`code-reindex` call it ran exited 0 AND the state after healing reads
+`current` or `metadata-current` (both mean `changed == 0` — the only
+difference is whether this call proved it with a full hash) — a non-zero
+exit (an integrity failure on some root) prints `heal did not complete
+(code-reindex exit N); answering from the current index` instead, never
+"healed" over it. Any exception during the heal is fail-open — the original
+report stands and the search still answers from whatever was already
+indexed.
 
 **Multi-root output.** `code-search --json` wraps hits in an envelope:
 `state`; `code_root`/`indexed_at`/`head_sha`, naming the first recorded root
 alphabetically (`indexed_at` here is that root's `last_indexed_at`, renamed
 at this top level only); `code_roots`, the full per-root report list (each
-entry carries its own `last_indexed_at`/`head_sha`, not renamed); `changed`,
-`failed`, `not_indexed`, `embedding_mode`; and `results`. In plain output,
-a hit's location is qualified with its root
-(`root/path:line`) only once a project has more than one recorded root — the
-common single-root case keeps its plain `path:line` line, since only a
-multi-root project can have the same relative path indexed under two roots
-at once.
+entry carries its own `last_indexed_at`/`head_sha`/`git_delta`/`verified`,
+not renamed); `changed`, `failed`, `not_indexed`, `embedding_mode`; and
+`results`. `--verify-content` hashes every indexed file before answering, so
+the reported state is content-proven (`current`) rather than the
+metadata-only default (`metadata-current`) — there is no automatic
+verification on an empty result; the caller asks for proof explicitly. A
+`code_roots` entry's `git_delta` is `unavailable` (no stored HEAD to compare,
+or git failed/timed out), `unchanged` (HEAD hasn't moved), `verified` (HEAD
+moved, every diffed path in this root proved clean), or `changed` (HEAD
+moved and the diff hashed a real change). A nothing-found result is evidence
+only under `current` — under `metadata-current` it is honest uncertainty,
+not proof of absence. In plain output, a hit's location is qualified with
+its root (`root/path:line`) only once a project has more than one recorded
+root — the common single-root case keeps its plain `path:line` line, since
+only a multi-root project can have the same relative path indexed under two
+roots at once.
 
-The write-side hooks stay single-root, for a different reason: `memlib.sh`
-carries one `MEMCONTINUUM_CODE_ROOT`, so the edit ledger — and therefore the
-coverage and look-back nudges that read it — only ever sees the first
-`--code-root` given. `newfile-nudge.sh` is the one per-root hook: it gets its
-own wired entry, with its own `MEMCONTINUUM_CODE_ROOT`, for every
-`--code-root` given.
+The write-side hooks see every code root. `ledger-post-edit.sh` checks an
+edited path against each configured root and stamps the ledger row with the
+physical root it matched (`""` for a store-root row) plus `source: "tool"`;
+`userprompt-remind.sh`/`precompact-persist.sh` classify the ledger's code
+paths with one `unmapped` call carrying every root, and compare each root's
+current git HEAD against the session's own start-of-session map — "code HEAD
+changed" is true when any root moved. `newfile-nudge.sh` stays the one
+per-root **lifecycle** hook: it gets its own wired entry, with its own
+`MEMCONTINUUM_CODE_ROOT`, for every `--code-root` given — the other five
+write-side hooks fire once per event regardless of root count, never once per
+root.
 
 ## memlint
 
 `memlint.py ROOT [--code-root DIR ...]` imports memidx's own walker, so a
-session buffer is never linted as a topic, and reuses
+session buffer is never linted as a topic, the walker's no-symlinks rule
+applies here too, and reuses
 `memidx.fragment_declaration_status` — the same predicate `code-search` uses for
 concept attachment at runtime — rather than a from-scratch regex, so a
 `#symbol` fragment validates exactly the way attachment accepts it, comments and
@@ -1420,6 +1577,19 @@ surface fails open on the same gap (`code-reindex` records the file
 not-indexed, `code-search` reports the index incomplete, `backend-preflight`
 reports `MISSING`); a lint error there would make an optional dependency
 mandatory in one place only.
+
+Parse-level rules — every record, before the type-specific rules below even
+run (see "Tolerant parsing and quarantine" above for the full mechanism):
+
+| rule | severity |
+|---|---|
+| frontmatter does not parse (unreadable file, not UTF-8, unterminated block, malformed YAML on a canonical record) | error, naming the file and the failure |
+| a typed field is the wrong shape (`links` not a list of mappings, a link missing its `link` id, `ruling`/`rationale`/`invariant` not a mapping, `tags`/`code_refs`/… not a list of scalars) on a canonical record | error, naming the field |
+
+A note's own parse diagnostics (malformed YAML recovered leniently, an
+unterminated frontmatter block) are warnings instead — a note has no chain
+shape to protect, and the rule pass below is skipped only for a record these
+parse-level rules flagged as an error, never for a mere warning.
 
 Topic-chain rules:
 
@@ -1482,7 +1652,13 @@ same walker — walk every non-hidden `.md` file under `--root` but prune
 dot-directories, dotfiles and `node_modules` at every depth. The root itself is
 never pruned, so a store that legitimately lives at `~/.memory/` still indexes
 in full. A `.gitignore` cannot express this pruning, because this is a
-filesystem walk rather than a git one.
+filesystem walk rather than a git one. The walker also does not follow
+symlinks: a symlinked directory is not descended and a symlinked file is
+skipped rather than read, each skip warned on stderr and counted by `check` as
+`symlinks_skipped`. A `--root` that is itself a symlink to the store is
+resolved first and still works. The code index walker likewise does not
+descend a symlinked directory, but — the deliberate difference — it does
+index a symlinked source file through the link.
 
 Every `.md` file the walk does not prune IS indexed as a record — including
 one with no frontmatter at all (`parse_frontmatter` is tolerant of that, see
@@ -1514,8 +1690,24 @@ The decision index (`<project>.sqlite`) carries the same provenance discipline
 | `missing` | no db file at that path | refuse (no query attempted) |
 | `uninitialized` | file exists, has a `db_meta` row for this project, but no `last_reindexed_at` stamp and no `records` rows | refuse (no query attempted) |
 | `upgrade-required` | no `last_reindexed_at` stamp but `records` rows already exist (an older engine's db), or the stamped `index_generation` is behind the engine's current one | proceed, warn on stderr |
-| `stale` | current generation, stamped, but `check`'s own on-disk drift comparison (mtime/size against what `reindex` last recorded) finds added/changed/removed files — only computed when a `root` is given | proceed, warn on stderr |
-| `current` | stamped, current generation, no drift | proceed silently |
+| `stale` | current generation, stamped, but the store's on-disk drift comparison finds added/changed/removed files — only computed when a `root` is given. For the five metadata-only readers (`search`/`chain`/`for-path`/`why`/`drift`, given `--root`) this is a plain mtime/size comparison against what `reindex` last recorded — **metadata moved, content unverified**. For `check` and `unmapped` it is content-PROVEN: every walked record with a stored row is hashed and compared to `records.sha256`, so a same-size, same-`mtime_ns` rewrite a metadata comparison alone would miss is still caught (a sha match whose metadata moved is bookkeeping-refreshed in place, not drift) | proceed, warn on stderr |
+| `quarantined` | current generation, not `stale` (a `root`-taking reader's own drift check passed or was not asked for), and `index_errors` holds at least one row for this project (one or more records could not be safely indexed — see "Tolerant parsing and quarantine" above); needs no `root` — a plain table lookup | proceed, warn on stderr naming the skipped-record count; `unmapped` refuses the negative claim (below) |
+| `current` | stamped, current generation, no drift, no quarantined record | proceed silently |
+
+**Readers never hash; `check` and `unmapped` are the proof.** Hashing every
+record on every reader call would put a full store read on the pre-edit hot
+path — `for-path` runs once per pre-edit candidate under its own watchdog, on a
+store whose stat-only walk already costs over a second on a slow (drvfs/9P)
+filesystem — so the five metadata-only readers keep the plain mtime/size
+comparison unconditionally; only the two commands that may WRITE the cache
+(`check`'s own report, `unmapped`'s self-heal gate) hash. A reader's `stale`
+therefore means "metadata moved, not yet proven"; `check --json`'s `changed`
+list means content changed, proven by a hash, and a bare `touch` (mtime
+moves, content identical) is bookkeeping-refreshed and reported neither
+`changed` nor `drift`. This is a documented boundary, not an oversight: a
+same-size, same-`mtime_ns` content rewrite reads `current` off `search
+--root` and every other reader until the next `check` or `unmapped` call
+proves otherwise.
 
 Every reader opens the file with `open_db_noncreating` — a genuinely
 non-creating SQLite URI (`mode=rw`) — never `open_db`'s create-on-connect path,
@@ -1525,26 +1717,38 @@ is REQUIRED on `reindex`, `check`, and `unmapped` (they walk the store's own
 markdown tree by design); `unmapped` branches on `stale` to self-heal (below).
 `search`, `chain`, `for-path`, `why`, and `drift` take `root` as an OPTIONAL
 `--root DIR`: omitted (the default, and unchanged from before),
-`decision_index_state` can still report `upgrade-required` for them but
-never `stale` — they have nothing to walk without it. Given, the same five readers CAN see
-`stale`: a positive match off it is still returned (see the next paragraph),
-with one stderr line naming the cause (`"<cmd>: index is stale (store
-changed since the last reindex); results may be outdated"`). `for-path`'s
-own stale positive match, reached through `hooks/pre-edit-chain.sh` (which
-passes `--root "$MEMCONTINUUM_ROOT"` on both its `for-path` calls whenever
-that env var is set), is logged under its own hook.log outcome name,
-`index-stale-served`, distinct from a plain `matched` — the staleness
-caveat itself reaches `hook.log` only via `for-path`'s own stderr (the
-hook's existing redirect), never the injected `additionalContext` payload.
+`decision_index_state` can still report `upgrade-required` or `quarantined`
+for them but never `stale` — they have nothing to walk without it. Given, the
+same five readers CAN see `stale`: a positive match off it is still returned
+(see the next paragraph), with one stderr line naming the cause (`"<cmd>:
+index is stale (store changed since the last reindex); results may be
+outdated"`). `for-path`'s own stale positive match, reached through
+`hooks/pre-edit-chain.sh` (which passes `--root "$MEMCONTINUUM_ROOT"` on the
+one `for-path` call it makes per candidate, whenever that env var is set), is
+logged under its own hook.log outcome name, `index-stale-served`, distinct
+from a plain `matched` — the staleness caveat itself reaches `hook.log` only
+via that call's own stderr (the hook's existing redirect), never the injected
+`additionalContext` payload. `for-path` also takes an opt-in `--with-chain-text`
+(added alongside this), which folds the plain-text chain rendering into the
+same `--json` envelope as a `chain_text` field — the hook passes it on every
+candidate call so the SAME call that finds the matching candidate and its
+state also returns the text `additionalContext` is built from; there is no
+second `for-path` call fetching that text separately, so one hook run walks
+the store at most once per candidate, and makes exactly one `for-path`
+invocation for whichever candidate matches.
 
 **A positive match off a non-`current` index stays usable; a negative claim
-does not.** `upgrade-required` and `stale` both warn and proceed — a hit found
-there is real evidence, not withheld just because the index is not perfectly
-fresh. What must never be trusted off anything but `current` is the *absence*
-of a match: `unmapped`'s `coverage_status` collapses `missing`/`uninitialized`
-to `"uninitialized"` and `upgrade-required` to its own `"upgrade-required"`
-state, and in both cases returns `unmapped: []` rather than asserting "nothing
-governs this file" from an index that cannot back that claim. Only
+does not.** `upgrade-required`, `stale`, and `quarantined` all warn and
+proceed — a hit found there is real evidence, not withheld just because the
+index is not perfectly fresh or is skipping some other, unrelated malformed
+record. What must never be trusted off anything but `current` is the
+*absence* of a match: `unmapped`'s `coverage_status` collapses
+`missing`/`uninitialized` to `"uninitialized"`, `upgrade-required` to its own
+`"upgrade-required"` state, and `quarantined` to its own `"quarantined"`
+state, and in every case returns `unmapped: []` rather than asserting
+"nothing governs this file" from an index that cannot back that claim (a
+quarantined store never self-heals for `unmapped` either — a malformed
+record does not clear itself by reindexing again). Only
 `coverage_status == "ok"` (state was `current`, or `stale` and the self-heal
 below cleared it) actually populates `unmapped`.
 
@@ -1584,9 +1788,65 @@ real reindex refreshes it. The row is never deleted on a stale edit — deleting
 it would lose the "this needs a backfill" signal the sha mismatch itself
 carries — only replaced on the next embedding-capable pass.
 
+**`embed_sha` alone answers "which source text"; `embed_fp` answers "which
+model".** Every `embeddings` row also carries `embed_fp`, a flat
+`model=<name>;dim=<n>;pipeline=<v>;prefix=none;norm=l2;fastembed=<version>;
+revision=<snapshot or "unknown">` string identifying the model/pipeline that
+produced that specific vector (`embedding_fingerprint()`; the code index's
+`embeddings.embed_fp`/`code_project.embedding_fingerprint` carry the same
+shape). `revision` is the loaded model's HF snapshot directory basename when
+a real model was loaded, `"unknown"` otherwise; two fingerprints are
+considered equal (`fingerprints_match`) key-for-key except `revision`, which
+is compared only when NEITHER side is `"unknown"` — a command that never
+loaded a model (`check`, a `--no-embed`/`--auto` reindex) cannot verify
+revision and must never call a healthy db `mismatch` over it. `vector_ranked`/
+`code_hits_vector`'s freshness join adds `AND e.embed_fp = ? AND e.dim = ?`
+against the CURRENT model's real fingerprint and the query vector's length —
+a NULL `embed_fp` (a pre-fingerprint row) or a foreign one (a model swap)
+is therefore excluded from ranking exactly like a stale `embed_sha`, never
+mixed with same-project vectors from a different model or dimension. `cosine`
+itself raises a typed `VectorDimensionMismatch` (a `ValueError` subclass) on
+unequal-length vectors and a plain `ValueError` on a non-finite component
+(`zip` used to silently truncate a length mismatch instead); the scoring
+loops catch either, per row, skip it, and count it into the JSON envelope's
+`dimension_mismatch_rows` when > 0 — a defensive path (the SQL `dim` gate
+already excludes the common case), reached only by a corrupted blob whose
+stored `dim` column lies. Before either embedding zip (decision or code
+index), `len(vectors) != len(texts)` is treated as a full embedding failure —
+nothing is written, stderr names both counts — rather than silently
+mis-zipping a short/long/mis-ordered backend response; `reembeds` (code
+index) and `backfilled` (decision index) both count vectors *actually
+written*, never texts merely sent.
+
+At query time (`search`/`code-search`, vector and hybrid modes), the model is
+loaded once and its fingerprint compared against the stored one — ONLY when
+the project already has at least one embeddings row (a project that has
+never been embedded has no stored fingerprint for an unremarkable reason, not
+a model swap). On a mismatch the vector query is skipped entirely (never
+calls `vector_ranked`/`code_hits_vector`): stderr names
+`search: embeddings were made by a different model (<stored> vs <current>);
+using FTS only -- run reindex to re-embed` (code: `run code-reindex`), the
+`--json` envelope's `"embedding"` field reads `"fingerprint-mismatch"` (the
+same slot that reads `"unavailable"` on a broken backend), hybrid returns the
+FTS-only list, and the command exits 0.
+
+At reindex time (embedding enabled), the model is loaded once, up front —
+before deciding what needs re-embedding — specifically so a fingerprint
+mismatch can be caught even when no row's `sha256` moved: on a mismatch (or a
+NULL stored fingerprint while the project already has embedding rows) every
+row is treated as due for re-embed, and the new fingerprint lands in the same
+transaction as the vectors of the run that wrote it. Under `--no-embed`
+(decision side: `--no-embed`/`--auto`) the mismatch is reported once on
+stderr, using only the STATIC fingerprint (no model load — a `--no-embed`
+run never touches fastembed), and is deliberately NOT repaired.
+
 **`embedding_mode`** (`db_meta['embedding_mode']`, one of `none` / `partial` /
 `full`) mirrors the code index's own field and is recomputed from *actual
-fresh coverage* — `fresh == 0` → `none`, `fresh == total` → `full`, otherwise
+fresh coverage* — a row counts as fresh only when its `embed_sha` AND its
+`embed_fp` (matched against the current fingerprint's static fields — the
+model was loaded this run whenever embedding was enabled; a `--no-embed`/
+`--auto` run compares only the static prefix, since no model was loaded)
+both match — `fresh == 0` → `none`, `fresh == total` → `full`, otherwise
 `partial` — on every reindex except a no-op `--auto` pass (nothing added,
 changed, or removed): an internal heal must never announce, or force, a mode
 change for a change that did not happen. A run that does change rows under
@@ -1600,8 +1860,40 @@ nothing is embedded, and — per the paragraph above — the run never claims a
 fuller `embedding_mode` than the coverage it actually produced. It is what
 `unmapped`'s self-heal (`reindex --no-embed --auto`, on state `stale` only —
 never on `upgrade-required`, which is the rollout's job, not an ad-hoc
-hook-triggered one) and `precompact-persist.sh` use to keep a hook-triggered
-repair honest about what it did and did not refresh.
+hook-triggered one), `precompact-persist.sh`, and the store's own
+`post-commit-reindex.sh` (its bounded content pass, on every commit) use to
+keep a hook-triggered repair honest about what it did and did not refresh.
+Every reindex pass -- `--auto` or not -- also now prints, at the end of its
+summary line, `N record(s) awaiting embedding`: rows whose vector is missing,
+stale (`embed_sha` mismatch), or from a different model fingerprint,
+computed after the writes. `post-commit-reindex.sh` parses this off the end
+of the line to decide `embed=pending|clean` (see the embed-worker section
+below); it is `0` on a fully-embedded store, never omitted.
+
+**The background embed-worker** (`memidx.py embed-worker`): when the
+post-commit hook's content pass leaves `N > 0`, it touches
+`$MEMCONTINUUM_HOME/<project>.embed-pending` and spawns
+`embed-worker --root … --project … --db …` detached
+(`subprocess.Popen(start_new_session=True)` from Python -- never bash `&`,
+never a `setsid` binary, which macOS does not ship; stdio redirected to
+`<project>.embed.log`, never the shared `hook.log`). `embed-worker` takes a
+non-blocking `fcntl.flock` on `<project>.embed.lock` first -- a second
+worker finding it already held exits 0 immediately, so two quick commits
+never run two overlapping embedding passes. It then loops: while the marker
+exists, note its mtime, run the embedding backfill in-process (`cmd_reindex`
+with embedding enabled), and on success remove the marker ONLY if its mtime
+is still what was noted before the pass -- a commit landing mid-pass
+retouches the marker, and the loop runs again rather than declaring victory
+over content it never saw. On any exception from the backfill (a locked db,
+a genuine bug), the marker is left in place, the traceback is appended to
+`<project>.embed.log`, and the process exits 3 -- a crash is therefore
+always retriable: the next commit, or a manual `embed-worker` run, picks the
+marker back up. `check --json` and `stats --json` both report
+`embedding_backlog: {pending_marker, worker_lock_held,
+rows_without_fresh_vector}` (fail-open; the row count uses the same
+static-fingerprint SQL comparison `vector_index_state` does, never loading
+the model) -- `vector_index_state` itself keeps its four-value enum
+unchanged; "pending" is not one of its values.
 
 **Project isolation, on the decision db.** The default per-project filename does
 the work in the normal case. Beyond that, the guarantee is a *refusal*, not a
@@ -1653,20 +1945,92 @@ header line agree on this, which keeps a file whose dates are out of order but
 whose positions are correct handled predictably. Authors should still keep dates
 and positions in agreement.
 
-**Tolerant parsing.** `parse_frontmatter()` never raises on malformed YAML: it
-logs a warning to stderr and falls back to pulling simple top-level `key: value`
-lines out of the frontmatter block by regex, so `title`/`name`/`type` survive and
-the file stays indexed. The branch is taken on a YAML parse error and nothing
-else, so it is invisible to any record that parses — which is every well-formed
-hand-authored one. It exists for pre-existing markdown a project wants indexed
-as-is.
+**Tolerant parsing and quarantine.** `parse_record()` returns a typed
+`ParseResult` (`frontmatter`, `body`, `diagnostics` — a list of `(field,
+message)` pairs, `valid`, `fallback`) and never raises: a read failure
+(`OSError`/`UnicodeDecodeError`), a malformed or non-mapping frontmatter block,
+and a wrongly-shaped typed field are all diagnostics, never exceptions.
+`parse_frontmatter()` stays as a thin `(dict, str)` wrapper over it for callers
+that only need the untyped shape.
+
+A record is *canonical* — it carries the append-only chain the rest of this
+document describes — when its frontmatter has a schema `id` (`TOP-`/`INC-`/
+`INV-`/`CON-`), a `links` list, or a schema `type` (`topic`/`incident`/
+`investigation`/`concept`). Everything else is a *note*: pre-existing markdown a
+project wants indexed as-is, with no chain to validate. `validate_record_shape()`
+runs after a successful YAML parse and checks every typed field is its declared
+shape or absent — `links` a list of mappings each with a scalar `link` id,
+`ruling`/`rationale`/`invariant` mappings, `edges`/`assumptions`/`alternatives`
+lists of mappings, `tags`/`code_refs`/`implemented_by`/`tested_by`/
+`governed_by`/`involved_in` lists of scalars, `metadata` a mapping. A violation
+on a *canonical* record makes it invalid; the same violation on a note is
+recorded but never blocks it — a note has no chain shape to protect.
+
+**Canonicity is checked against the raw frontmatter text whenever no usable
+parsed dict exists** — an unterminated frontmatter block (an opening `---`
+with no closing one), frontmatter that parses to something other than a
+mapping (a top-level YAML list, say), and the lenient regex fallback below (a
+complex field like `links` is never recovered into the parsed dict at all, so
+a record canonical only via a bare `links:` key would otherwise never be
+recognized as canonical). In each of these, the raw lines are scanned for the
+same three signals — a schema `id:` prefix, a `links:` key, a schema `type:` —
+so a fully schema-conformant record undone by only one of these failures is
+still quarantined, not silently reduced to a filename-derived note with its
+real `id`/`type`/`links` thrown away.
+
+On a YAML parse error, the lenient regex fallback pulls `id`/`title`/`name`/
+`type`/`area`/`topic`/`date`/`status`/`authority`/`current`/`project`/
+`description`/`permalink` — scalar fields only — out of unindented `key: value`
+lines, logging one warning to stderr, so a note's `title`/`name`/`type` survive
+and it stays indexed. A complex field (`links`, `tags`, `code_refs`, `edges`,
+`assumptions`, `invariant`, `metadata`, `ruling`, `rationale`, `alternatives`,
+`evidence`, `implemented_by`, `tested_by`, `governed_by`, `involved_in`) is
+never recovered this way — regex text can't tell "no value" from "an unclosed
+flow collection" (`links: [` is the reproduction that motivated this: recovered
+blindly, the literal string `"["` would be handed to code expecting a list of
+mappings and crash several calls deep) — and gets its own diagnostic naming the
+field, EXCEPT a blank header line (`links:` with nothing after the colon) on a
+*note*, which is silently dropped instead (neither recovered nor diagnosed;
+this is what keeps a bare `metadata:` line harmless on ordinary pre-existing
+markdown). A canonical record's own blank complex-field line still gets its
+diagnostic — the carve-out is for notes only. A canonical record whose
+frontmatter took this fallback path is invalid.
+
+An invalid record is quarantined by `reindex`, not built: its previous rows (if
+any) are purged, one row is written to `index_errors` (path, project, sha256,
+mtime, size, its diagnostics as JSON, and when it was last seen), one stderr
+line names the file and the first diagnostic
+(`quarantined (<field>: <message>)`), and the run continues and exits 0 — its
+neighbours index normally. A record that parses cleanly on a later run has its
+`index_errors` row deleted in the same run; a quarantined path whose file has
+since been deleted has its row deleted too. `decision_index_state` reports
+`quarantined` for a project with rows in `index_errors` (see the state table
+below); `check` lists each one under its own `quarantined` key alongside
+`added`/`changed`/`removed`.
+
+A record that parsed CLEANLY (so it never reaches the quarantine path above)
+but whose own database write then fails — a DB-level fault, not a parse/shape
+problem — is a different, honestly-reported case: each record's write runs
+under its own savepoint, released on success and rolled back on failure, so
+one record's write fault can never touch its neighbours. `reindex` prints
+`cannot index <path> (<Type>: <msg>); index integrity not guaranteed`, counts
+it as an integrity failure (never as quarantined — that word is reserved for
+a genuine parse/shape problem), and continues; a run with one or more
+integrity failures exits **5**, after every record that DID write cleanly is
+committed.
 
 **Lazy imports.** `fastembed` (and, transitively, numpy) is imported only inside
-`compute_embeddings`, `compute_query_embedding`, and the branches of
-`cmd_search` that call them. `reindex --no-embed`, `chain`, `for-path` and
-`search --mode fts` never trigger those imports — asserted by a
-subprocess-isolated test (`test_for_path_does_not_import_fastembed`), because
-`for-path` runs in a pre-edit hook and must not pay a numpy import.
+`compute_embeddings`, `compute_query_embedding`, `load_embedding_model`, and
+the branches of `cmd_search`/`cmd_code_search` that call them. `reindex
+--no-embed`, `chain`, `for-path` and `search --mode fts` never trigger those
+imports — asserted by a subprocess-isolated test
+(`test_for_path_does_not_import_fastembed`), because `for-path` runs in a
+pre-edit hook and must not pay a numpy import. `embedding_fingerprint()`'s
+STATIC part (everything but `revision`, which needs a loaded model) reads
+`importlib.metadata.version("fastembed")` — the installed package's dist-info,
+without ever executing `fastembed/__init__.py` — so `check`'s
+`vector_index_state` reports `mismatch`/`none`/`partial`/`full` without
+importing fastembed either, verified the same way.
 
 ## CLI semantics
 
@@ -1692,10 +2056,12 @@ down:
   fixed raw ceiling — before the query returns. `vector_ranked` carries no
   cap at all — it scores every fresh embedded
   row for the project matching the filter — and joins `embeddings` to
-  `records` on `embed_sha == sha256` (see
+  `records` on `embed_sha == sha256`, PLUS `embed_fp`/`dim` against the
+  current model's real fingerprint and the query vector's length (see
   [Decision index provenance](#decision-index-provenance-and-embedding-lifecycle)),
-  so a vector kept stale across a `--no-embed`/`--auto` edit is never a
-  candidate at all. Each `--json` hit reports the topic's real path (never a
+  so a vector kept stale across a `--no-embed`/`--auto` edit, or one made by
+  a different model/dimension entirely, is never a candidate at all. Each
+  `--json` hit reports the topic's real path (never a
   link row's own synthetic surrogate path); a hit whose fused winner was a
   link row also carries `matched_link_id`/`link_status`/`link_authority` (that
   link's own `status`, checked independently of its parent topic's — `--status`
@@ -1748,25 +2114,58 @@ down:
   segment-awareness above, apply uniformly everywhere a `code_ref` is
   consulted. See [Decision index provenance](#decision-index-provenance-and-embedding-lifecycle)
   above for its `2`/`3`/`4` exit codes.
-- **`check`** — compares current mtime/size against what was stored at the last
-  `reindex`, without re-hashing or loading the embedding model. Exits 1 on any
-  drift. (`reindex` uses sha256 to decide whether content changed and needs
-  re-embedding; `check` uses the cheaper pair so a bare `touch` is still
-  reported as drift.) Its `--json` report also carries `source_topic_count`/
-  `searchable_row_count`/`searchable_vector_count` — see the `search` bullet
-  above.
+- **`check`** — the one command that hashes every record (it walks the store
+  ONCE, never loading the embedding model): every walked path with a stored
+  row is read and its sha256 compared against `records.sha256`, so a
+  same-size, same-`mtime_ns` content rewrite a metadata comparison alone
+  could not see is reported as drift. A sha match whose mtime/size moved
+  (a bare `touch`) is bookkeeping-refreshed in place — one `UPDATE` reaching
+  both the topic/note row and every link row derived from it, since a link
+  row's own `path` differs from its parent's but shares the parent's stat —
+  and is reported neither `added`, `changed`, nor `drift`; a genuine
+  sha mismatch IS `changed` (`changed` means content changed, not metadata
+  moved). Exits 1 on any drift. Its `--json` report also carries
+  `source_topic_count`/`searchable_row_count`/`searchable_vector_count` —
+  see the `search` bullet above — `vector_index_state` (`none` / `partial` /
+  `full` / `mismatch`, computed WITHOUT loading a model: `mismatch` when a
+  stored `db_meta['embedding_fingerprint']` exists and does not match the
+  STATIC current fingerprint — `revision` is always `"unknown"` on the
+  no-model-loaded side, so a healthy db, embedded by any revision of the
+  same model/pipeline, never reads `mismatch` here; otherwise the fresh-join
+  count, gated on the row's `embed_fp` matching the static fingerprint's
+  prefix) — and `symlinks_skipped`, the count of
+  symlinked directories/files the walker skipped this run; and `state`
+  (the same word `decision_index_state` reports, computed from THIS same
+  walk rather than a second one) and `quarantined` — one `{path,
+  diagnostics}` entry per row in `index_errors`, hashed (only these files)
+  and compared against the sha `reindex` stored: unchanged stays reported
+  under `quarantined`, changed content counts as `changed` instead (it
+  will be re-parsed on the next reindex), and a quarantined file whose path
+  has vanished counts as `removed`. Text mode adds `check: N record(s)
+  quarantined` and one `! <path>: <field>: <message>` line per entry.
 - **`unmapped PATH...`** — classifies each path as `mapped_topic`,
   `mapped_concept_only`, or `unmapped` without walking the code tree.
-  `coverage_status` mirrors the decision index's five states, collapsed for a
+  `coverage_status` mirrors the decision index's states, collapsed for a
   *negative* claim's purposes: `"ok"` (state was `current`, queried normally —
   the only state that actually populates `unmapped`), `"uninitialized"`
   (`missing`/`uninitialized`, no query attempted), `"upgrade-required"` (no
   self-heal — that is the rollout's job, not an ad-hoc hook-triggered one),
+  `"quarantined"` (`index_errors` holds rows for this project — no self-heal;
+  a malformed record does not clear itself by reindexing again),
   `"index-error"` (a `sqlite3.OperationalError` while reading), or `"unknown"`
-  (state was `stale`, self-heal ran, and drift still persisted afterward —
-  unchanged from before). Self-healing only fires on `stale`: one
-  `reindex --no-embed --auto` pass, then a recheck. This is what
-  `userprompt-remind.sh`'s coverage signal and `precompact-persist.sh` call.
+  (state was `stale`, self-heal ran, and drift still persisted afterward — the
+  `sqlite3.OperationalError` path above is unchanged; a broader failure here
+  additionally attaches an optional `"degraded": {reason_code:
+  "internal-error", exception_type, safe_message}` object to the JSON and
+  prints one `unmapped: degraded reason=internal-error type=<Type>: <msg>`
+  stderr line, so a genuine read failure is distinguishable from a code
+  defect without ever changing the collapsed `coverage_status` itself).
+  `unmapped`'s own `stale` check, like `check`'s, is
+  content-proven (hashed, not metadata-only) — a negative claim is exactly
+  where a same-size, same-`mtime_ns` rewrite must not slip through as
+  `current`. Self-healing only fires on `stale`: one `reindex --no-embed
+  --auto` pass, then a recheck. This is what `userprompt-remind.sh`'s
+  coverage signal and `precompact-persist.sh` call.
 - **`why`** — resolves a symbol or path to its concept(s), then prints those
   concepts' `governed_by` chains in full, including any `kind: declined` link
   (there is no separate "rejected alternative" field; a declined link *is* that
@@ -1821,15 +2220,37 @@ down:
   1, error on stderr, `results` is `[]` in `--json` too, since an empty list
   would otherwise read as a real "nothing found"); **stale** and **degraded**
   both warn on stderr and still search, naming the failed-file count and any
-  missing root separately when they apply. `--json` wraps hits in
+  missing root separately when they apply. Text mode prints nothing extra for
+  **metadata-current**, the normal state — only **stale**/**degraded** get a
+  line. `--verify-content` hashes every indexed file (in every recorded root)
+  before answering, so a clean report proves **current** rather than the
+  metadata-only default; it is passed into the heal's after-report too, so a
+  healed index reads **current** exactly when the caller asked for proof.
+  There is no automatic verification on an empty result — a nothing-found
+  answer stays honest uncertainty under **metadata-current**, evidence only
+  under **current**, never silently upgraded. `--json` wraps hits in
   `{"state", "code_root", "code_roots", "indexed_at", "head_sha", "changed",
-  "failed", "not_indexed", "embedding_mode", "results"}`. A "nothing found" is
-  only evidence when `state` is `current`. A db written by a newer engine
-  (see `CodeIndexTooNew` above) never reaches `code_index_report` at all —
-  `code-search` exits 0 with the refusal on stderr and, in `--json`, a
-  minimal `{"state": "unavailable", "code_root": null, "indexed_at": null,
-  "head_sha": null, "results": []}` (no `code_roots`/`changed`/`failed`/
-  `not_indexed`/`embedding_mode`, since none of those were ever computed).
+  "failed", "not_indexed", "embedding_mode", "embedding_fingerprint",
+  "results"}` — `embedding_fingerprint` is the STORED `code_project`
+  fingerprint (`None` on a project never embedded), always present
+  regardless of mode — where each
+  `code_roots` entry also carries its own `git_delta` (`"unavailable"` — no
+  stored `head_sha` to compare, or git failed/timed out; `"unchanged"` — HEAD
+  hasn't moved; `"verified"` — HEAD moved and every path the diff touched in
+  this root proved clean; `"changed"` — HEAD moved and the diff hashed a real
+  change) and `verified` (whether THIS call hashed the whole root — never
+  `True` for a root that does not `exist`). A vector/hybrid call whose
+  fingerprint check finds a mismatch (only checked when the project already
+  has embedding rows) skips the vector query entirely: `"embedding":
+  "fingerprint-mismatch"` (the same slot that reads `"unavailable"` on a
+  broken backend), stderr names `<stored> vs <current>`, and results are the
+  FTS-only list; a per-row dimension mismatch adds `dimension_mismatch_rows`.
+  A db written by a newer engine (see `CodeIndexTooNew` above) never reaches
+  `code_index_report` at all — `code-search` exits 0 with the refusal on
+  stderr and, in `--json`, a minimal `{"state": "unavailable", "code_root":
+  null, "indexed_at": null, "head_sha": null, "results": []}` (no
+  `code_roots`/`changed`/`failed`/`not_indexed`/`embedding_mode`/
+  `embedding_fingerprint`, since none of those were ever computed).
 
 ## Test conventions
 

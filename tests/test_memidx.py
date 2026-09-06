@@ -1,8 +1,10 @@
 import contextlib
+import fcntl
 import io
 import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -441,6 +443,72 @@ class TestD8TimingAndForPath(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_for_path_json_with_chain_text_matches_plain_text_and_wraps_results(self):
+        """memidx.py item 1 (round 5, `--with-chain-text`): a caller (the
+        pre-edit hook) needs only ONE `for-path` call per candidate instead
+        of a second, separate plain-text call for the chain view. The
+        `chain_text` field must hold EXACTLY the text `for-path`'s own
+        plain-text mode prints for this same path -- one function
+        (for_path_chain_lines) renders both, so this also pins "no
+        duplicated formatting". The bare list becomes an object carrying
+        `results` once the flag is given."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            root.mkdir()
+            topic_dir = root / "topics" / "processing"
+            topic_dir.mkdir(parents=True)
+            shutil.copy(HIDDEN_FILES_FIXTURE, topic_dir / HIDDEN_FILES_FIXTURE.name)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+
+            plain_buf = io.StringIO()
+            with contextlib.redirect_stdout(plain_buf):
+                rc_plain = memidx.cmd_for_path(ns(
+                    db=str(db), project=memidx.DEFAULT_PROJECT,
+                    file_path="src/core/scan/scan_plan.py", json=False,
+                ))
+            self.assertEqual(rc_plain, 0)
+
+            json_buf = io.StringIO()
+            with contextlib.redirect_stdout(json_buf):
+                rc_json = memidx.cmd_for_path(ns(
+                    db=str(db), project=memidx.DEFAULT_PROJECT,
+                    file_path="src/core/scan/scan_plan.py", json=True,
+                    with_chain_text=True,
+                ))
+            self.assertEqual(rc_json, 0)
+            payload = json.loads(json_buf.getvalue())
+            self.assertIsInstance(payload, dict)
+            self.assertEqual(set(payload.keys()), {"results", "chain_text"})
+            self.assertIsInstance(payload["results"], list)
+            self.assertTrue(payload["results"])
+            self.assertEqual(payload["chain_text"], plain_buf.getvalue().rstrip("\n"))
+
+    def test_for_path_json_without_flag_stays_a_bare_list_on_a_real_match(self):
+        """Regression pin: --with-chain-text is opt-in -- omitted, --json
+        keeps its pre-existing bare-list shape even on a real match (the
+        other shape tests around for-path only cover the missing/error
+        states, never a positive match)."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            root.mkdir()
+            topic_dir = root / "topics" / "processing"
+            topic_dir.mkdir(parents=True)
+            shutil.copy(HIDDEN_FILES_FIXTURE, topic_dir / HIDDEN_FILES_FIXTURE.name)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = memidx.cmd_for_path(ns(
+                    db=str(db), project=memidx.DEFAULT_PROJECT,
+                    file_path="src/core/scan/scan_plan.py", json=True,
+                ))
+            self.assertEqual(rc, 0)
+            payload = json.loads(buf.getvalue())
+            self.assertIsInstance(payload, list)
+            self.assertTrue(payload)
+
 
 class TestStoreWalkPruning(unittest.TestCase):
     """walk_markdown must not index markdown that merely happens to sit under
@@ -475,6 +543,166 @@ class TestStoreWalkPruning(unittest.TestCase):
             (root / "topics").mkdir(parents=True)
             (root / "topics" / "real.md").write_text("# real\n")
             self.assertEqual([p.name for p in memidx.walk_markdown(root)], ["real.md"])
+
+
+class TestStoreWalkerSymlinks(unittest.TestCase):
+    """The store walker must not follow symlinks out of the root (audit
+    MC-P1-01): a symlinked directory or file is pruned/skipped instead of
+    walked, each skip is warned on stderr and counted, and a --root that is
+    itself a symlink to the store still resolves and indexes correctly."""
+
+    def _symlink(self, target, link_path) -> None:
+        try:
+            os.symlink(target, link_path)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"os.symlink unsupported on this filesystem: {exc}")
+
+    @staticmethod
+    def _record_paths(db, project=None):
+        project = project or memidx.DEFAULT_PROJECT
+        conn = sqlite3.connect(str(db))
+        try:
+            return {
+                row[0] for row in conn.execute(
+                    "SELECT path FROM records WHERE project=?", (project,)
+                )
+            }
+        finally:
+            conn.close()
+
+    def test_external_directory_symlink_is_not_followed(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = Path(td) / "store"
+            (store / "topics").mkdir(parents=True)
+            (store / "topics" / "real.md").write_text("# real\n")
+            outside = Path(td) / "outside"
+            outside.mkdir()
+            (outside / "private.md").write_text("# private\n")
+            self._symlink("../outside", str(store / "linked"))
+
+            db = Path(td) / "idx.sqlite"
+            rc = reindex(store, db, no_embed=True)
+            self.assertEqual(rc, 0)
+
+            paths = self._record_paths(db)
+            self.assertEqual(len(paths), 1)
+            self.assertTrue(any(p.endswith("real.md") for p in paths))
+            self.assertFalse(any("linked" in p for p in paths))
+            self.assertFalse(any("private.md" in p for p in paths))
+
+            buf_out = io.StringIO()
+            with contextlib.redirect_stdout(buf_out):
+                rc_check = memidx.cmd_check(
+                    ns(db=str(db), project=memidx.DEFAULT_PROJECT, root=str(store), json=True)
+                )
+            self.assertEqual(rc_check, 0)
+            report = json.loads(buf_out.getvalue())
+            self.assertFalse(report["drift"])
+            self.assertGreaterEqual(report["symlinks_skipped"], 1)
+
+            errors, _warnings = memlint.lint_root(store)
+            self.assertFalse(any("private.md" in e for e in errors))
+
+    def test_parent_cycle_terminates_and_indexes_each_file_once(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = Path(td) / "store"
+            (store / "topics").mkdir(parents=True)
+            (store / "topics" / "one.md").write_text("# one\n")
+            (store / "topics" / "two.md").write_text("# two\n")
+            self._symlink(".", str(store / "loop"))
+
+            db = Path(td) / "idx.sqlite"
+            rc = reindex(store, db, no_embed=True)
+            self.assertEqual(rc, 0)
+
+            paths = self._record_paths(db)
+            self.assertEqual(len(paths), 2)
+            self.assertFalse(any("loop/" in p for p in paths))
+
+    def test_symlinked_file_is_skipped_with_a_warning(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = Path(td) / "store"
+            (store / "topics").mkdir(parents=True)
+            (store / "topics" / "real.md").write_text("# real\n")
+            outside = Path(td) / "outside"
+            outside.mkdir()
+            (outside / "x.md").write_text("# outside x\n")
+            self._symlink("../../outside/x.md", str(store / "topics" / "linked-file.md"))
+
+            db = Path(td) / "idx.sqlite"
+            buf_err = io.StringIO()
+            with contextlib.redirect_stderr(buf_err):
+                rc = reindex(store, db, no_embed=True)
+            self.assertEqual(rc, 0)
+
+            paths = self._record_paths(db)
+            self.assertEqual(len(paths), 1)
+            self.assertTrue(any(p.endswith("real.md") for p in paths))
+
+            stderr = buf_err.getvalue()
+            self.assertIn("linked-file.md", stderr)
+            self.assertIn("symlink skipped", stderr)
+
+    def test_reindex_check_and_memlint_walk_the_same_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = Path(td) / "store"
+            (store / "topics").mkdir(parents=True)
+            (store / "topics" / "real.md").write_text("# real\n")
+            outside = Path(td) / "outside"
+            outside.mkdir()
+            (outside / "private.md").write_text("# private\n")
+            self._symlink("../outside", str(store / "linked"))
+            (outside / "x.md").write_text(
+                "---\ntype: topic\nid: TOP-BAD\ntitle: Bad\nlinks: []\n"
+                "status: superseded\n---\nBody.\n"
+            )
+            self._symlink("../../outside/x.md", str(store / "topics" / "linked-file.md"))
+
+            db = Path(td) / "idx.sqlite"
+            rc = reindex(store, db, no_embed=True)
+            self.assertEqual(rc, 0)
+            reindexed_paths = self._record_paths(db)
+            self.assertEqual(len(reindexed_paths), 1)
+
+            buf_out = io.StringIO()
+            with contextlib.redirect_stdout(buf_out):
+                rc_check = memidx.cmd_check(
+                    ns(db=str(db), project=memidx.DEFAULT_PROJECT, root=str(store), json=True)
+                )
+            self.assertEqual(rc_check, 0)
+            report = json.loads(buf_out.getvalue())
+            self.assertEqual(report["added"], [])
+            self.assertEqual(report["removed"], [])
+
+            errors, _warnings = memlint.lint_root(store)
+            self.assertFalse(any("TOP-BAD" in e for e in errors))
+            self.assertFalse(any("superseded" in e for e in errors))
+
+    def test_root_given_through_a_symlink_still_indexes(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td) / "tmp"
+            store = tmp / "store"
+            store.mkdir(parents=True)
+            (store / "real.md").write_text("# real\n")
+            link = tmp / "link-to-store"
+            self._symlink(str(store), str(link))
+
+            db = Path(td) / "idx.sqlite"
+            rc = reindex(link, db, no_embed=True)
+            self.assertEqual(rc, 0)
+
+            paths = self._record_paths(db)
+            self.assertEqual(len(paths), 1)
+            resolved_store = str(store.resolve())
+            self.assertTrue(next(iter(paths)).startswith(resolved_store))
+
+            buf_out = io.StringIO()
+            with contextlib.redirect_stdout(buf_out):
+                rc2 = reindex(store, db, no_embed=True)
+            self.assertEqual(rc2, 0)
+            out = buf_out.getvalue()
+            self.assertIn("0 added", out)
+            self.assertIn("1 unchanged", out)
 
 
 class TestPrunedPathsLeaveTheIndex(unittest.TestCase):
@@ -536,7 +764,13 @@ class TestPrunedPathsLeaveTheIndex(unittest.TestCase):
 
 
 class TestCheckDrift(unittest.TestCase):
-    def test_check_detects_touched_file(self):
+    """audit MC-P1-02 / design R3 (TOP-0123 L3) -- the inversion: a pure
+    touch (mtime moves, content unchanged) is no longer drift; a same-size,
+    same-mtime_ns content rewrite (invisible to a metadata-only comparison)
+    is. This replaces the old test_check_detects_touched_file, which
+    asserted the opposite for a touch."""
+
+    def test_touch_is_not_drift(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "root"
             topic_dir = root / "topics" / "processing"
@@ -552,11 +786,179 @@ class TestCheckDrift(unittest.TestCase):
 
             # touch: change mtime without changing content
             new_time = time.time() + 5
-            import os
             os.utime(target, (new_time, new_time))
 
             rc_dirty = memidx.cmd_check(args)
-            self.assertEqual(rc_dirty, 1)
+            self.assertEqual(rc_dirty, 0, "a bare touch must not read as drift (design R3)")
+
+    def test_same_size_same_mtime_ns_rewrite_is_drift(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            topic_dir = root / "topics" / "processing"
+            topic_dir.mkdir(parents=True)
+            target = topic_dir / HIDDEN_FILES_FIXTURE.name
+            shutil.copy(HIDDEN_FILES_FIXTURE, target)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+
+            args = ns(db=str(db), project=memidx.DEFAULT_PROJECT, root=str(root), json=True)
+            self.assertEqual(memidx.cmd_check(args), 0)
+
+            st = target.stat()
+            orig_ns = st.st_mtime_ns
+            text = target.read_text()
+            new_text = text.replace("Dotfiles", "DOTFILES", 1)
+            self.assertNotEqual(new_text, text, "fixture bug: the word to rewrite is not present")
+            self.assertEqual(len(new_text), len(text), "fixture bug: rewrite must be same length")
+            target.write_text(new_text)
+            os.utime(target, ns=(orig_ns, orig_ns))
+
+            rc_dirty = memidx.cmd_check(args)
+            self.assertEqual(
+                rc_dirty, 1, "a same-size, same-mtime_ns content rewrite must be drift"
+            )
+
+
+def _write_topic(path: Path, tid: str, body: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"---\ntype: topic\nid: {tid}\ntitle: T\nlinks:\n"
+        f'  - link: L1\n    status: active\n    ruling: {{text: "r", authority: owner-verbatim, source: s}}\n'
+        f"---\n{body}\n"
+    )
+
+
+def _rewrite_same_size(path: Path, old: str, new: str, *, restore_mtime_ns: bool = True) -> None:
+    """Verify-report reproducer shape (audit MC-P1-02): replace `old` with
+    `new` (same length -- size never moves) and, unless told otherwise,
+    restore the exact `mtime_ns` afterwards -- a rewrite a metadata-only
+    comparison cannot distinguish from an untouched file."""
+    st = path.stat()
+    orig_ns = st.st_mtime_ns
+    text = path.read_text()
+    new_text = text.replace(old, new)
+    assert new_text != text, "fixture bug: nothing to rewrite"
+    assert len(new_text) == len(text), "fixture bug: rewrite must be same length"
+    path.write_text(new_text)
+    if restore_mtime_ns:
+        os.utime(path, ns=(orig_ns, orig_ns))
+
+
+class TestContentProvenFreshness(unittest.TestCase):
+    """audit MC-P1-02 / design R3 (TOP-0123 L3), decision side: content is
+    hashed where a NEGATIVE claim is made (`check`, `unmapped`'s self-heal)
+    -- readers (`search`/`chain`/`for-path`/`why`/`drift`, via
+    `decision_index_state` with no override) keep the metadata-only
+    comparison. Reproducer shape from the verify report: replace every
+    `alpha` with `bravo` (same length) in a topic's body, then restore the
+    exact `mtime_ns`."""
+
+    def test_same_size_rewrite_is_drift_under_check_and_unmapped_self_heals(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            p = root / "topics" / "t.md"
+            _write_topic(p, "TOP-9500", "alpha")
+            db = Path(td) / "idx.sqlite"
+            with contextlib.redirect_stdout(io.StringIO()):
+                reindex(root, db, no_embed=True)
+
+            _rewrite_same_size(p, "alpha", "bravo")
+
+            check_buf = io.StringIO()
+            with contextlib.redirect_stdout(check_buf):
+                rc = memidx.cmd_check(
+                    ns(db=str(db), project=memidx.DEFAULT_PROJECT, root=str(root), json=True)
+                )
+            report = json.loads(check_buf.getvalue())
+            self.assertTrue(report["drift"], report)
+            # Fix round 3: walk_markdown resolves `root` before it ever
+            # walks it, so the stored (and reported) path is the
+            # RESOLVED one -- on macOS, td (from tempfile) sits under
+            # /var/folders/..., a symlink to /private/var/folders/...,
+            # so `p` itself must be resolved before comparison.
+            self.assertIn(str(p.resolve()), report["changed"], report)
+            self.assertEqual(rc, 1)
+
+            # unmapped's self-heal (state == "stale", content-proven) must
+            # reindex the new content -- proven by a search for "bravo"
+            # afterwards actually hitting.
+            with contextlib.redirect_stdout(io.StringIO()):
+                memidx.cmd_unmapped(ns(
+                    db=str(db), project=memidx.DEFAULT_PROJECT, root=str(root),
+                    code_root=None, paths=[], json=True,
+                ))
+
+            hits = _run_search(ns(
+                db=str(db), project=memidx.DEFAULT_PROJECT, query="bravo", mode="fts",
+                status=[], type=[], area=None, topic=None, authority=None, limit=5, json=True,
+            ))
+            self.assertTrue(hits, "unmapped's self-heal must have re-indexed the new content")
+
+    def test_pure_touch_is_not_drift_and_refreshes_bookkeeping(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            p = root / "topics" / "t.md"
+            _write_topic(p, "TOP-9501", "alpha")
+            db = Path(td) / "idx.sqlite"
+            with contextlib.redirect_stdout(io.StringIO()):
+                reindex(root, db, no_embed=True)
+
+            new_time = time.time() + 5
+            os.utime(p, (new_time, new_time))
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = memidx.cmd_check(
+                    ns(db=str(db), project=memidx.DEFAULT_PROJECT, root=str(root), json=True)
+                )
+            self.assertEqual(rc, 0, buf.getvalue())
+            report = json.loads(buf.getvalue())
+            self.assertFalse(report["drift"], report)
+
+            conn = sqlite3.connect(str(db))
+            conn.row_factory = sqlite3.Row
+            # Fix round 3: records.path is stored resolved (walk_markdown
+            # resolves `root` up front) -- see the matching comment in
+            # test_same_size_rewrite_is_drift_under_check_and_unmapped_self_heals.
+            row = conn.execute(
+                "SELECT mtime FROM records WHERE path=?", (str(p.resolve()),)
+            ).fetchone()
+            conn.close()
+            self.assertAlmostEqual(row["mtime"], new_time, delta=1.0)
+
+            # a following reader (no --verify-content) still reads current
+            # off the refreshed bookkeeping -- no residual false drift.
+            self.assertEqual(
+                memidx.decision_index_state(db, memidx.DEFAULT_PROJECT, root=root), "current"
+            )
+
+    def test_reader_stays_metadata_only_while_check_proves(self):
+        """The documented boundary: a reader opts into --root but never
+        hashes (design R3) -- `search --root` on the exact same rewrite
+        that `check` catches still reads `current`. Both halves asserted
+        so the boundary between "reader" and "proof" stays explicit."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            p = root / "topics" / "t.md"
+            _write_topic(p, "TOP-9502", "alpha")
+            db = Path(td) / "idx.sqlite"
+            with contextlib.redirect_stdout(io.StringIO()):
+                reindex(root, db, no_embed=True)
+
+            _rewrite_same_size(p, "alpha", "bravo")
+
+            # the reader: metadata-only, still "current" -- a documented
+            # limitation, not a bug.
+            self.assertEqual(
+                memidx.decision_index_state(db, memidx.DEFAULT_PROJECT, root=root), "current"
+            )
+            # the proof: check hashes and finds the drift.
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = memidx.cmd_check(
+                    ns(db=str(db), project=memidx.DEFAULT_PROJECT, root=str(root), json=True)
+                )
+            self.assertEqual(rc, 1, buf.getvalue())
 
 
 class TestF1DecisionIndexState(unittest.TestCase):
@@ -791,6 +1193,30 @@ class TestF1DecisionIndexState(unittest.TestCase):
                 self.assertIn(f"for-path: decision index {label} -- run: memidx.py reindex --root <store>",
                               buf_err.getvalue())
 
+    def test_for_path_missing_or_uninitialized_with_chain_text_includes_chain_text_key(self):
+        """Round 7 fix (Grok NIT): the rc==4 index-error branch already
+        carries {"state", "results", "chain_text"} under --with-chain-text
+        (test_for_path_index_error_with_chain_text_returns_object_shape);
+        this rc==3 missing/uninitialized branch (_for_path_missing_reply)
+        was still returning {"state", "results"} with no chain_text key at
+        all -- not even the empty string every other --with-chain-text
+        envelope promises. A direct --json --with-chain-text caller must
+        see the same three-key object shape from every for-path refusal
+        branch, not just the error one."""
+        for state_setup, label in ((lambda db: None, "missing"),
+                                    (lambda db: memidx.open_db(db, project=memidx.DEFAULT_PROJECT).close(), "uninitialized")):
+            with self.subTest(label), tempfile.TemporaryDirectory() as td:
+                db = Path(td) / f"{label}.sqlite"
+                state_setup(db)
+                buf_out, buf_err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                    rc = memidx.cmd_for_path(ns(project=memidx.DEFAULT_PROJECT, db=str(db),
+                                                 file_path="src/x.py", json=True,
+                                                 with_chain_text=True))
+                self.assertEqual(rc, 3)
+                self.assertEqual(json.loads(buf_out.getvalue()),
+                                  {"state": label, "results": [], "chain_text": ""})
+
     def test_for_path_missing_non_json_stays_plain_text_with_a_named_stderr_line(self):
         # Same states, non-json mode: stdout stays exactly the pre-existing
         # plain-text line (never becomes "[]" -- item 3's "keep stdout []"
@@ -841,6 +1267,85 @@ class TestF1DecisionIndexState(unittest.TestCase):
                                              file_path="src/x.py", json=True))
             self.assertEqual(rc, 4)
             self.assertEqual(json.loads(buf.getvalue()), [])
+
+    def test_for_path_index_error_with_chain_text_returns_object_shape(self):
+        """Round 6 fix: the `--json --with-chain-text` envelope is a
+        promise about SHAPE ({"results": [...], "chain_text": "..."}), not
+        just about the happy path -- this same
+        sqlite3.OperationalError/IndexError fail-open branch must keep
+        that shape when the flag is given, not fall back to the flag-less
+        bare `[]`. Same flaky-open rig as
+        test_for_path_index_error_fails_open_exits_4, plus
+        with_chain_text=True."""
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "idx.sqlite"
+            reindex(FIXTURES / "schema_filters", db, no_embed=True)
+            real_open = memidx.open_db_noncreating
+            calls = {"n": 0}
+
+            class _BrokenConn:
+                def execute(self, *a, **kw):
+                    raise sqlite3.OperationalError("no such column: link_topic_path")
+
+                def close(self):
+                    pass
+
+            def flaky_open(*a, **kw):
+                calls["n"] += 1
+                return real_open(*a, **kw) if calls["n"] == 1 else _BrokenConn()
+
+            buf = io.StringIO()
+            with mock.patch.object(memidx, "open_db_noncreating", side_effect=flaky_open), \
+                 contextlib.redirect_stdout(buf):
+                rc = memidx.cmd_for_path(ns(project=memidx.DEFAULT_PROJECT, db=str(db),
+                                             file_path="src/x.py", json=True,
+                                             with_chain_text=True))
+            self.assertEqual(rc, 4)
+            self.assertEqual(json.loads(buf.getvalue()), {"results": [], "chain_text": ""})
+
+    def test_for_path_index_error_with_chain_text_and_stale_root_includes_state(self):
+        """Same failure, but with --root pointed at a store that has
+        drifted since the last reindex (decision_index_state already read
+        "stale" before the try block ever runs): the object shape must
+        also carry "state" -- the same `state_worth_naming` gate
+        (root is not None and state in (...)) the main --json branch
+        uses, mirrored here rather than silently dropped in the
+        exception path."""
+        with tempfile.TemporaryDirectory() as td:
+            root = FIXTURES_COPY_OF("schema_filters", td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+            (root / "new-topic.md").write_text(
+                "---\ntype: topic\nid: TOP-NEW\ntitle: New\nlinks: []\n---\nBody.\n"
+            )
+            self.assertEqual(
+                memidx.decision_index_state(db, memidx.DEFAULT_PROJECT, root=root), "stale"
+            )
+
+            real_open = memidx.open_db_noncreating
+            calls = {"n": 0}
+
+            class _BrokenConn:
+                def execute(self, *a, **kw):
+                    raise sqlite3.OperationalError("no such column: link_topic_path")
+
+                def close(self):
+                    pass
+
+            def flaky_open(*a, **kw):
+                calls["n"] += 1
+                return real_open(*a, **kw) if calls["n"] == 1 else _BrokenConn()
+
+            buf = io.StringIO()
+            with mock.patch.object(memidx, "open_db_noncreating", side_effect=flaky_open), \
+                 contextlib.redirect_stdout(buf):
+                rc = memidx.cmd_for_path(ns(project=memidx.DEFAULT_PROJECT, db=str(db), root=str(root),
+                                             file_path="src/x.py", json=True,
+                                             with_chain_text=True))
+            self.assertEqual(rc, 4)
+            self.assertEqual(
+                json.loads(buf.getvalue()), {"state": "stale", "results": [], "chain_text": ""}
+            )
 
     def test_unmapped_coverage_status_per_state(self):
         cases = {
@@ -911,7 +1416,78 @@ class TestF1DecisionIndexState(unittest.TestCase):
                                              root=str(root), code_root=None, json=True,
                                              paths=["src/x.py"]))
             self.assertEqual(rc, 1)
-            self.assertEqual(json.loads(buf.getvalue())["coverage_status"], "index-error")
+            out = json.loads(buf.getvalue())
+            self.assertEqual(out["coverage_status"], "index-error")
+            # Design R7 (audit MC-P2-03, TOP-0123 L7): this arm is UNCHANGED --
+            # no `degraded` object, only the broad `except Exception` branch
+            # (a genuine programmer bug or non-operational DB failure) gets one.
+            self.assertNotIn("degraded", out)
+
+
+class TestUnmappedMultipleCodeRoots(unittest.TestCase):
+    """Design R5 (audit MC-P1-05, TOP-0123 L5): `unmapped --code-root`
+    becomes repeatable (action="append", via a `_code_roots_arg` helper
+    accepting `str | list | None`); per path the LONGEST matching resolved
+    root wins (nested roots)."""
+
+    def test_unmapped_tries_every_code_root_longest_wins_and_string_still_works(self):
+        with tempfile.TemporaryDirectory() as td:
+            root_a = Path(td) / "root-a"; root_a.mkdir()
+            root_b = Path(td) / "root-b"; root_b.mkdir()
+            nested_b = root_a / "nested-b"; nested_b.mkdir()
+            for r, name in ((root_b, "b.py"), (nested_b, "n.py")):
+                (r / "src").mkdir()
+                (r / "src" / name).write_text(f"# {name}\n")
+
+            store = Path(td) / "store"
+            (store / "topics").mkdir(parents=True)
+            (store / "topics" / "t.md").write_text(
+                "---\nid: TOP-1\ntitle: T\nstatus: active\ncode_refs:\n"
+                "  - src/b.py\n  - src/n.py\n---\n\nBody.\n"
+            )
+            db = Path(td) / "idx.sqlite"
+            reindex(store, db, no_embed=True)
+
+            fpath_b = str((root_b / "src" / "b.py").resolve())
+            fpath_n = str((nested_b / "src" / "n.py").resolve())
+
+            # append: a file physically under the SECOND --code-root is
+            # still mapped (its code_refs entry is repo-relative to
+            # root_b, invisible to root_a alone -- this is the concrete
+            # false-gap regression the audit's acceptance list names).
+            # Nested roots: nested_b is ALSO a configured --code-root,
+            # sitting INSIDE root_a -- the LONGEST (most specific) resolved
+            # root among the ones actually configured must win the
+            # relativisation (root_a alone would give "nested-b/src/n.py",
+            # which does not match code_refs' "src/n.py" -- a false gap).
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = memidx.cmd_unmapped(ns(
+                    project=memidx.DEFAULT_PROJECT, db=str(db), root=str(store),
+                    code_root=[str(root_a), str(root_b), str(nested_b)], json=True,
+                    paths=[fpath_b, fpath_n],
+                ))
+            out = json.loads(buf.getvalue())
+            self.assertEqual(rc, 0, out)
+            self.assertEqual(out["unmapped"], [], out)
+            self.assertCountEqual(out["mapped_topic"], ["src/b.py", "src/n.py"], out)
+            self.assertEqual(
+                out["roots"],
+                [str(root_a.resolve()), str(root_b.resolve()), str(nested_b.resolve())],
+            )
+
+            # SimpleNamespace(code_root=str) -- the pre-append single-value
+            # shape -- still works unchanged.
+            buf2 = io.StringIO()
+            with contextlib.redirect_stdout(buf2):
+                rc2 = memidx.cmd_unmapped(ns(
+                    project=memidx.DEFAULT_PROJECT, db=str(db), root=str(store),
+                    code_root=str(root_b), json=True, paths=[fpath_b],
+                ))
+            out2 = json.loads(buf2.getvalue())
+            self.assertEqual(rc2, 0, out2)
+            self.assertEqual(out2["mapped_topic"], ["src/b.py"], out2)
+            self.assertEqual(out2["roots"], [str(root_b.resolve())])
 
 
 class TestF2EmbeddingMode(unittest.TestCase):
@@ -2388,6 +2964,1735 @@ class TestF5LinkRows(unittest.TestCase):
             link_row = conn.execute("SELECT 1 FROM records WHERE type='link' AND link_id='L1'").fetchone()
             self.assertIsNotNone(link_row, "the corrupted-stamp pass must still be treated as a "
                                             "migration -- link rows must still be present")
+
+
+def _write_record(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+def _valid_topic_text(tid: str, title: str = "Good", body: str = "Body text.") -> str:
+    return (
+        f"---\ntype: topic\nid: {tid}\ntitle: {title}\nlinks:\n"
+        f'  - link: L1\n    status: active\n    ruling: {{text: "r", authority: owner-verbatim, source: s}}\n'
+        f"---\n{body}\n"
+    )
+
+
+class TestMalformedRecordQuarantine(unittest.TestCase):
+    """audit MC-P1-03 / design R2 (TOP-0123 L2): a malformed record must
+    never crash reindex/memlint -- it is quarantined into `index_errors`,
+    its neighbours stay indexed, and the run exits 0."""
+
+    def _index_errors_rows(self, db):
+        conn = sqlite3.connect(str(db))
+        conn.row_factory = sqlite3.Row
+        try:
+            return [dict(r) for r in conn.execute("SELECT * FROM index_errors ORDER BY path").fetchall()]
+        finally:
+            conn.close()
+
+    # -- scenario 1: the audit's own reproducer, `links: [`, beside two good topics
+
+    def test_links_flow_open_beside_two_valid_topics(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            _write_record(root / "topics" / "good1.md", _valid_topic_text("TOP-9001"))
+            _write_record(root / "topics" / "good2.md", _valid_topic_text("TOP-9002"))
+            bad_path = root / "topics" / "bad.md"
+            _write_record(bad_path, "---\ntype: topic\nid: TOP-9003\ntitle: Bad\nlinks: [\n---\nBody.\n")
+            db = Path(td) / "idx.sqlite"
+
+            out_buf, err_buf = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+                rc = reindex(root, db, no_embed=True)
+            self.assertEqual(rc, 0, err_buf.getvalue())
+            self.assertNotIn("Traceback", err_buf.getvalue())
+
+            rows = self._index_errors_rows(db)
+            self.assertEqual(len(rows), 1, rows)
+            self.assertEqual(rows[0]["path"], str(bad_path.resolve()))
+            diagnostics = json.loads(rows[0]["diagnostics"])
+            fields = [d[0] for d in diagnostics]
+            self.assertIn("links", fields, diagnostics)
+
+            self.assertEqual(
+                memidx.decision_index_state(db, memidx.DEFAULT_PROJECT, root=root), "quarantined"
+            )
+
+            search_buf = io.StringIO()
+            with contextlib.redirect_stdout(search_buf):
+                rc_s = memidx.cmd_search(ns(
+                    project=memidx.DEFAULT_PROJECT, db=str(db), root=str(root),
+                    query="Body text", mode="fts", status=[], type=[], area=None,
+                    topic=None, authority=None, limit=10, json=True,
+                ))
+            self.assertEqual(rc_s, 0)
+            out = json.loads(search_buf.getvalue())
+            self.assertEqual(out.get("state"), "quarantined")
+            found_paths = {r["path"] for r in out["results"]}
+            self.assertIn(str((root / "topics" / "good1.md").resolve()), found_paths)
+            self.assertIn(str((root / "topics" / "good2.md").resolve()), found_paths)
+
+            check_buf = io.StringIO()
+            with contextlib.redirect_stdout(check_buf):
+                rc_c = memidx.cmd_check(ns(db=str(db), project=memidx.DEFAULT_PROJECT, root=str(root), json=True))
+            self.assertEqual(rc_c, 0)
+            report = json.loads(check_buf.getvalue())
+            self.assertEqual(report["state"], "quarantined")
+            self.assertEqual(len(report["quarantined"]), 1, report)
+            self.assertEqual(report["quarantined"][0]["path"], str(bad_path.resolve()))
+
+    # -- scenario 2: valid YAML, wrong shapes -- each names the offending field
+
+    def test_valid_yaml_wrong_shapes_are_quarantined_with_field_named(self):
+        cases = [
+            ("links_not_a_list", "id: TOP-9101\ntype: topic\nlinks: some text\n", "links"),
+            ("tags_not_a_list", "id: TOP-9102\ntype: topic\ntags: a-string\n", "tags"),
+            ("code_refs_scalar", "id: TOP-9103\ntype: topic\ncode_refs: src/x.py\n", "code_refs"),
+            (
+                "ruling_plain_text",
+                "id: TOP-9104\ntype: topic\nlinks:\n  - link: L1\n    status: active\n    ruling: plain text\n",
+                "links[0].ruling",
+            ),
+            (
+                "links_bad_elements",
+                "id: TOP-9105\ntype: topic\nlinks:\n  - not-a-mapping\n  - 42\n",
+                "links[0]",
+            ),
+        ]
+        for name, fm_body, expected_field in cases:
+            with self.subTest(case=name):
+                with tempfile.TemporaryDirectory() as td:
+                    root = Path(td) / "root"
+                    _write_record(root / "topics" / "bad.md", f"---\n{fm_body}title: Bad\n---\nBody.\n")
+                    db = Path(td) / "idx.sqlite"
+                    err_buf = io.StringIO()
+                    with contextlib.redirect_stderr(err_buf), contextlib.redirect_stdout(io.StringIO()):
+                        rc = reindex(root, db, no_embed=True)
+                    self.assertEqual(rc, 0, err_buf.getvalue())
+                    self.assertNotIn("Traceback", err_buf.getvalue())
+                    rows = self._index_errors_rows(db)
+                    self.assertEqual(len(rows), 1, rows)
+                    diagnostics = json.loads(rows[0]["diagnostics"])
+                    fields = [d[0] for d in diagnostics]
+                    self.assertIn(expected_field, fields, diagnostics)
+
+    # -- scenario 3: a link with no `link:` id -- must quarantine, not IntegrityError
+
+    def test_link_with_no_id_is_quarantined_not_integrity_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            _write_record(
+                root / "topics" / "bad.md",
+                "---\nid: TOP-9106\ntype: topic\ntitle: Bad\nlinks:\n"
+                '  - status: active\n    ruling: {text: "r", authority: owner-verbatim, source: s}\n'
+                "---\nBody.\n",
+            )
+            db = Path(td) / "idx.sqlite"
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf), contextlib.redirect_stdout(io.StringIO()):
+                rc = reindex(root, db, no_embed=True)
+            self.assertEqual(rc, 0, err_buf.getvalue())
+            self.assertNotIn("IntegrityError", err_buf.getvalue())
+            self.assertNotIn("Traceback", err_buf.getvalue())
+            rows = self._index_errors_rows(db)
+            self.assertEqual(len(rows), 1, rows)
+            diagnostics = json.loads(rows[0]["diagnostics"])
+            fields = [d[0] for d in diagnostics]
+            self.assertIn("links[0].link", fields, diagnostics)
+
+    # -- scenario 4: unreadable file / non-UTF-8 file -- quarantined naming "file"
+
+    @unittest.skipIf(
+        os.name != "posix" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+        "chmod 000 is meaningless on Windows or as root",
+    )
+    def test_unreadable_file_is_quarantined_with_file_named(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            bad = root / "topics" / "bad.md"
+            _write_record(bad, _valid_topic_text("TOP-9107"))
+            os.chmod(bad, 0o000)
+            db = Path(td) / "idx.sqlite"
+            try:
+                err_buf = io.StringIO()
+                with contextlib.redirect_stderr(err_buf), contextlib.redirect_stdout(io.StringIO()):
+                    rc = reindex(root, db, no_embed=True)
+                self.assertEqual(rc, 0, err_buf.getvalue())
+                self.assertNotIn("Traceback", err_buf.getvalue())
+                rows = self._index_errors_rows(db)
+                self.assertEqual(len(rows), 1, rows)
+                diagnostics = json.loads(rows[0]["diagnostics"])
+                fields = [d[0] for d in diagnostics]
+                self.assertIn("file", fields, diagnostics)
+            finally:
+                os.chmod(bad, 0o644)
+
+    def test_non_utf8_file_is_quarantined_with_file_named(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            bad = root / "topics" / "bad.md"
+            bad.parent.mkdir(parents=True, exist_ok=True)
+            bad.write_bytes(b"---\ntitle: Bad\n---\n\xff\xfe broken bytes\n")
+            db = Path(td) / "idx.sqlite"
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf), contextlib.redirect_stdout(io.StringIO()):
+                rc = reindex(root, db, no_embed=True)
+            self.assertEqual(rc, 0, err_buf.getvalue())
+            self.assertNotIn("Traceback", err_buf.getvalue())
+            rows = self._index_errors_rows(db)
+            self.assertEqual(len(rows), 1, rows)
+            diagnostics = json.loads(rows[0]["diagnostics"])
+            fields = [d[0] for d in diagnostics]
+            self.assertIn("file", fields, diagnostics)
+
+    # -- scenario 5: fixing the record clears the quarantine on the next reindex
+
+    def test_fixing_the_record_clears_quarantine_next_reindex(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            bad_path = root / "topics" / "bad.md"
+            _write_record(bad_path, "---\ntype: topic\nid: TOP-9108\ntitle: Bad\nlinks: [\n---\nBody.\n")
+            db = Path(td) / "idx.sqlite"
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                reindex(root, db, no_embed=True)
+            self.assertEqual(len(self._index_errors_rows(db)), 1)
+
+            _write_record(bad_path, _valid_topic_text("TOP-9108"))
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                rc = reindex(root, db, no_embed=True)
+            self.assertEqual(rc, 0)
+            self.assertEqual(self._index_errors_rows(db), [])
+            self.assertEqual(
+                memidx.decision_index_state(db, memidx.DEFAULT_PROJECT, root=root), "current"
+            )
+            conn = sqlite3.connect(str(db))
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT 1 FROM records WHERE id='TOP-9108'").fetchone()
+            conn.close()
+            self.assertIsNotNone(row)
+
+    # -- scenario 6: deleting the bad file clears the quarantine on the next reindex
+
+    def test_deleting_the_bad_file_clears_quarantine_next_reindex(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            bad_path = root / "topics" / "bad.md"
+            _write_record(bad_path, "---\ntype: topic\nid: TOP-9109\ntitle: Bad\nlinks: [\n---\nBody.\n")
+            db = Path(td) / "idx.sqlite"
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                reindex(root, db, no_embed=True)
+            self.assertEqual(len(self._index_errors_rows(db)), 1)
+
+            bad_path.unlink()
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                rc = reindex(root, db, no_embed=True)
+            self.assertEqual(rc, 0)
+            self.assertEqual(self._index_errors_rows(db), [])
+            self.assertEqual(
+                memidx.decision_index_state(db, memidx.DEFAULT_PROJECT, root=root), "current"
+            )
+
+    # -- scenario 7: `unmapped` on a quarantined store refuses the negative claim, no self-heal
+
+    def test_unmapped_on_quarantined_store_refuses_negative_claim(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            _write_record(root / "topics" / "good.md", _valid_topic_text("TOP-9110"))
+            _write_record(
+                root / "topics" / "bad.md",
+                "---\ntype: topic\nid: TOP-9111\ntitle: Bad\nlinks: [\n---\nBody.\n",
+            )
+            db = Path(td) / "idx.sqlite"
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                reindex(root, db, no_embed=True)
+            rows_before = self._index_errors_rows(db)
+            self.assertEqual(len(rows_before), 1)
+            seen_at_before = rows_before[0]["seen_at"]
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = memidx.cmd_unmapped(ns(
+                    project=memidx.DEFAULT_PROJECT, db=str(db), root=str(root),
+                    code_root=None, paths=["some/file.py"], json=True,
+                ))
+            self.assertEqual(rc, 1)
+            out = json.loads(buf.getvalue())
+            self.assertEqual(out["coverage_status"], "quarantined")
+            self.assertEqual(out["unmapped"], [])
+
+            rows_after = self._index_errors_rows(db)
+            self.assertEqual(len(rows_after), 1)
+            self.assertEqual(
+                rows_after[0]["seen_at"], seen_at_before,
+                "unmapped must not self-heal (reindex) on a quarantined store",
+            )
+
+    # -- scenario 7b: fix wave 1, G2 (Grok MAJOR 2 / whole-branch-review
+    # BLOCKING-1) -- a self-heal reindex that PURGES the covering record
+    # into quarantine must never answer coverage_status: "ok" with the
+    # file it used to cover listed as an uncovered gap.
+
+    def test_unmapped_self_heal_that_creates_quarantine_maps_to_quarantined_not_gap(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            covering = root / "topics" / "covering.md"
+            _write_record(
+                covering,
+                "---\ntype: topic\nid: TOP-9112\ntitle: Covering\ncode_refs: [src/mapped.py]\nlinks:\n"
+                '  - link: L1\n    status: active\n    ruling: {text: "r", authority: owner-verbatim, source: s}\n'
+                "---\nBody text.\n",
+            )
+            db = Path(td) / "idx.sqlite"
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                rc0 = reindex(root, db, no_embed=True)
+            self.assertEqual(rc0, 0)
+            self.assertEqual(self._index_errors_rows(db), [])
+
+            # On-disk drift: rewrite the SAME file into a malformed shape.
+            # decision_index_state must read "stale" (real content drift)
+            # -- nothing has been reindexed since the edit, so it is not
+            # "quarantined" yet.
+            _write_record(
+                covering,
+                "---\ntype: topic\nid: TOP-9112\ntitle: Covering\nlinks: [\n---\nBody text.\n",
+            )
+            self.assertEqual(
+                memidx.decision_index_state(db, memidx.DEFAULT_PROJECT, root=root, verify_content=True),
+                "stale",
+            )
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                rc = memidx.cmd_unmapped(ns(
+                    project=memidx.DEFAULT_PROJECT, db=str(db), root=str(root),
+                    code_root=None, paths=["src/mapped.py"], json=True,
+                ))
+            out = json.loads(buf.getvalue())
+            self.assertEqual(rc, 1, out)
+            self.assertEqual(out["coverage_status"], "quarantined", out)
+            self.assertEqual(
+                out["unmapped"], [],
+                "the self-heal that just quarantined the covering record must never assert a "
+                "false gap for the path it used to cover",
+            )
+
+            rows = self._index_errors_rows(db)
+            self.assertEqual(len(rows), 1, rows)
+            self.assertEqual(rows[0]["path"], str(covering.resolve()))
+
+    # -- scenario 7c: codex re-gate BLOCKING 1 (ruling 134) -- canonicity
+    # must be read from the block's OWN top-level indent, not column zero
+    # and not a global minimum over the whole scanned text. A valid topic
+    # whose entire frontmatter mapping is uniformly indented, later
+    # stripped of only its closing `---`, leaves an unindented body line
+    # ("Body text.") merged into the raw text handed to
+    # `_raw_frontmatter_is_canonical` (no end delimiter means no separate
+    # body slice at all). A global-minimum rule would anchor "top level"
+    # to that stray column-zero body line and never see the real
+    # (indented) id:/type: keys -- silently demoting a still fully
+    # schema-conformant record to a note.
+
+    def test_unmapped_self_heal_with_uniformly_indented_frontmatter_stays_quarantined(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            covering = root / "topics" / "covering.md"
+            _write_record(
+                covering,
+                "---\n  type: topic\n  id: TOP-9113\n  title: Covering\n  code_refs: [src/mapped.py]\n"
+                "  links:\n"
+                '    - link: L1\n      status: active\n      ruling: {text: "r", authority: owner-verbatim, source: s}\n'
+                "---\nBody text.\n",
+            )
+            db = Path(td) / "idx.sqlite"
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                rc0 = reindex(root, db, no_embed=True)
+            self.assertEqual(rc0, 0)
+            self.assertEqual(self._index_errors_rows(db), [])
+
+            # On-disk drift: remove ONLY the closing delimiter -- the
+            # frontmatter mapping itself is untouched and still fully
+            # schema-conformant (id/type/links/code_refs all present).
+            _write_record(
+                covering,
+                "---\n  type: topic\n  id: TOP-9113\n  title: Covering\n  code_refs: [src/mapped.py]\n"
+                "  links:\n"
+                '    - link: L1\n      status: active\n      ruling: {text: "r", authority: owner-verbatim, source: s}\n'
+                "Body text.\n",
+            )
+            self.assertEqual(
+                memidx.decision_index_state(db, memidx.DEFAULT_PROJECT, root=root, verify_content=True),
+                "stale",
+            )
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                rc = memidx.cmd_unmapped(ns(
+                    project=memidx.DEFAULT_PROJECT, db=str(db), root=str(root),
+                    code_root=None, paths=["src/mapped.py"], json=True,
+                ))
+            out = json.loads(buf.getvalue())
+            self.assertEqual(rc, 1, out)
+            self.assertEqual(out["coverage_status"], "quarantined", out)
+            self.assertEqual(
+                out["unmapped"], [],
+                "a uniformly-indented canonical mapping missing only its closing delimiter "
+                "must still be quarantined, never silently demoted to a note that leaves a "
+                "false coverage gap",
+            )
+
+            rows = self._index_errors_rows(db)
+            self.assertEqual(len(rows), 1, rows)
+            self.assertEqual(rows[0]["path"], str(covering.resolve()))
+
+    # -- scenario 7d: codex-final.md BLOCKING -- a column-zero YAML comment
+    # must never itself become the structural indentation anchor.
+    # `_raw_frontmatter_is_canonical` anchored on the block's first
+    # NON-BLANK line, which the comment-carrying variant makes a `#
+    # leading comment` sitting at column zero -- every real key of the
+    # uniformly 4-space-indented mapping below it then reads as "deeper
+    # than top" and is skipped, so a fully schema-conformant topic loses
+    # its closing delimiter and is silently demoted to a note instead of
+    # quarantined. Comment-only lines must never anchor and must never be
+    # matched themselves; the anchor is the first line that is neither
+    # blank nor a comment.
+
+    def test_unmapped_self_heal_with_leading_comment_before_uniformly_indented_frontmatter_stays_quarantined(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            covering = root / "topics" / "covering.md"
+            _write_record(
+                covering,
+                "---\n# leading YAML comment\n    type: topic\n    id: TOP-9114\n    title: Covering\n"
+                "    code_refs: [src/mapped.py]\n"
+                "    links:\n"
+                '        - link: L1\n          status: active\n'
+                '          ruling: {text: "r", authority: owner-verbatim, source: s}\n'
+                "---\nBody text.\n",
+            )
+            db = Path(td) / "idx.sqlite"
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                rc0 = reindex(root, db, no_embed=True)
+            self.assertEqual(rc0, 0)
+            self.assertEqual(self._index_errors_rows(db), [])
+
+            # On-disk drift: remove ONLY the closing delimiter -- the
+            # comment and the fully schema-conformant, uniformly-indented
+            # mapping are both untouched.
+            _write_record(
+                covering,
+                "---\n# leading YAML comment\n    type: topic\n    id: TOP-9114\n    title: Covering\n"
+                "    code_refs: [src/mapped.py]\n"
+                "    links:\n"
+                '        - link: L1\n          status: active\n'
+                '          ruling: {text: "r", authority: owner-verbatim, source: s}\n'
+                "Body text.\n",
+            )
+            self.assertEqual(
+                memidx.decision_index_state(db, memidx.DEFAULT_PROJECT, root=root, verify_content=True),
+                "stale",
+            )
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                rc = memidx.cmd_unmapped(ns(
+                    project=memidx.DEFAULT_PROJECT, db=str(db), root=str(root),
+                    code_root=None, paths=["src/mapped.py"], json=True,
+                ))
+            out = json.loads(buf.getvalue())
+            self.assertEqual(rc, 1, out)
+            self.assertEqual(out["coverage_status"], "quarantined", out)
+            self.assertEqual(
+                out["unmapped"], [],
+                "a leading column-zero comment must never become the indentation anchor and "
+                "must never make a uniformly-indented canonical mapping read as merely a note, "
+                "leaving a false coverage gap",
+            )
+
+            rows = self._index_errors_rows(db)
+            self.assertEqual(len(rows), 1, rows)
+            self.assertEqual(rows[0]["path"], str(covering.resolve()))
+
+    def test_indented_comment_before_nested_metadata_links_does_not_make_unterminated_note_canonical(self):
+        """codex-final.md BLOCKING, opposite transition: a 4-space-indented
+        comment sitting above an unterminated note must not become the
+        indentation anchor either. The note's only frontmatter marker
+        that could ever match a canonical regex is a `links:` key nested
+        TWO levels deep, under `metadata:` -- never at the block's real
+        top-level indent (column zero, where `title:`/`metadata:` sit).
+        A buggy anchor taken from the indented comment (4 spaces) would
+        make that nested `links:` (2 spaces) read as "not deeper than
+        top" and wrongly flip the note to canonical/quarantined."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            note_path = root / "notes" / "note.md"
+            _write_record(
+                note_path,
+                "---\n    # indented comment\ntitle: my note\nmetadata:\n  links:\n"
+                "    - link: TOP-1\nBody, no closing delimiter.\n",
+            )
+            db = Path(td) / "idx.sqlite"
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf), contextlib.redirect_stdout(io.StringIO()):
+                rc = reindex(root, db, no_embed=True)
+            self.assertEqual(rc, 0, err_buf.getvalue())
+            self.assertEqual(
+                self._index_errors_rows(db), [],
+                "an indented comment must never become the anchor and must never let a nested "
+                "metadata.links marker masquerade as top-level canonical",
+            )
+
+            result = memidx.parse_record(note_path)
+            self.assertTrue(result.valid)
+
+    # -- scenario 8: a note (no id/links/type) with malformed YAML stays indexed
+
+    def test_note_with_malformed_yaml_stays_indexed_not_quarantined(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            note_path = root / "notes" / "note.md"
+            _write_record(
+                note_path,
+                "---\n"
+                "title: 'Unterminated quote note\n"
+                "name: my-note\n"
+                "description: no quotes here at all\n"
+                "metadata:\n"
+                "  node_type: memory\n"
+                "permalink: sandbox/notes/my-note\n"
+                "---\n"
+                "Body text of the note.\n",
+            )
+            db = Path(td) / "idx.sqlite"
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf), contextlib.redirect_stdout(io.StringIO()):
+                rc = reindex(root, db, no_embed=True)
+            self.assertEqual(rc, 0, err_buf.getvalue())
+            self.assertEqual(self._index_errors_rows(db), [], "a note must never be quarantined")
+
+            result = memidx.parse_record(note_path)
+            self.assertTrue(result.valid)
+            self.assertTrue(result.fallback)
+            self.assertEqual(result.frontmatter.get("title"), "Unterminated quote note")
+            self.assertEqual(len(result.diagnostics), 1, result.diagnostics)
+
+            conn = sqlite3.connect(str(db))
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT 1 FROM records WHERE title=?", ("Unterminated quote note",)).fetchone()
+            conn.close()
+            self.assertIsNotNone(row, "the note must still be indexed")
+
+    # -- scenario 8b/8c/8d: fix wave 1, G1 (Grok BLOCKING 1, MINOR 6-7;
+    # design R2 as amended, ruling 133) -- a note (no id/type/links-list)
+    # whose OWN complex field parses to VALID YAML but the WRONG shape must
+    # be indexed with that field DROPPED (never quarantined, never a
+    # traceback in build_record/infer_type/memlint).
+
+    def test_note_with_scalar_links_is_indexed_with_links_dropped_and_warned(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            _write_record(root / "topics" / "good.md", _valid_topic_text("TOP-9401"))
+            note_path = root / "notes" / "note.md"
+            _write_record(note_path, "---\ntitle: my note\nlinks: see TOP-1\n---\nBody text.\n")
+            db = Path(td) / "idx.sqlite"
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf), contextlib.redirect_stdout(io.StringIO()):
+                rc = reindex(root, db, no_embed=True)
+            self.assertEqual(rc, 0, err_buf.getvalue())
+            self.assertNotIn("Traceback", err_buf.getvalue())
+            warning_lines = [l for l in err_buf.getvalue().splitlines() if "WARNING" in l]
+            self.assertEqual(len(warning_lines), 1, err_buf.getvalue())
+            self.assertIn("links: not a list of mappings; ignored", warning_lines[0])
+            self.assertEqual(self._index_errors_rows(db), [], "a note must never be quarantined")
+
+            result = memidx.parse_record(note_path)
+            self.assertTrue(result.valid)
+            self.assertNotIn("links", result.frontmatter)
+
+            conn = sqlite3.connect(str(db))
+            conn.row_factory = sqlite3.Row
+            good_row = conn.execute("SELECT 1 FROM records WHERE id='TOP-9401'").fetchone()
+            note_row = conn.execute("SELECT 1 FROM records WHERE title='my note'").fetchone()
+            conn.close()
+            self.assertIsNotNone(good_row, "the neighbouring topic must still be indexed")
+            self.assertIsNotNone(note_row, "the note itself must still be indexed")
+
+    def test_note_with_scalar_metadata_is_indexed_with_metadata_dropped_and_warned(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            _write_record(root / "topics" / "good.md", _valid_topic_text("TOP-9402"))
+            note_path = root / "notes" / "note.md"
+            _write_record(note_path, "---\ntitle: my note\nmetadata: foo\n---\nBody text.\n")
+            db = Path(td) / "idx.sqlite"
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf), contextlib.redirect_stdout(io.StringIO()):
+                rc = reindex(root, db, no_embed=True)
+            self.assertEqual(rc, 0, err_buf.getvalue())
+            self.assertNotIn("Traceback", err_buf.getvalue())
+            warning_lines = [l for l in err_buf.getvalue().splitlines() if "WARNING" in l]
+            self.assertEqual(len(warning_lines), 1, err_buf.getvalue())
+            self.assertIn("metadata: not a mapping; ignored", warning_lines[0])
+            self.assertEqual(self._index_errors_rows(db), [])
+
+            result = memidx.parse_record(note_path)
+            self.assertTrue(result.valid)
+            self.assertNotIn("metadata", result.frontmatter)
+
+            conn = sqlite3.connect(str(db))
+            conn.row_factory = sqlite3.Row
+            note_row = conn.execute("SELECT 1 FROM records WHERE title='my note'").fetchone()
+            conn.close()
+            self.assertIsNotNone(note_row, "the note itself must still be indexed")
+
+    def test_note_with_list_metadata_is_indexed_with_metadata_dropped_and_warned(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            _write_record(root / "topics" / "good.md", _valid_topic_text("TOP-9403"))
+            note_path = root / "notes" / "note.md"
+            _write_record(note_path, "---\ntitle: my note\nmetadata: [a, b]\n---\nBody text.\n")
+            db = Path(td) / "idx.sqlite"
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf), contextlib.redirect_stdout(io.StringIO()):
+                rc = reindex(root, db, no_embed=True)
+            self.assertEqual(rc, 0, err_buf.getvalue())
+            self.assertNotIn("Traceback", err_buf.getvalue())
+            warning_lines = [l for l in err_buf.getvalue().splitlines() if "WARNING" in l]
+            self.assertEqual(len(warning_lines), 1, err_buf.getvalue())
+            self.assertIn("metadata: not a mapping; ignored", warning_lines[0])
+            self.assertEqual(self._index_errors_rows(db), [])
+
+            result = memidx.parse_record(note_path)
+            self.assertTrue(result.valid)
+            self.assertNotIn("metadata", result.frontmatter)
+
+    def test_indented_links_marker_does_not_make_unterminated_note_canonical(self):
+        """Grok MINOR 6: `_raw_frontmatter_is_canonical` must match only
+        lines at the block's own top-level indent (its first non-blank
+        line's indent -- here column zero) -- an indented `- links:` line
+        inside an otherwise note-shaped, unterminated frontmatter block
+        must never flip the record to canonical (and therefore to
+        quarantine)."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            note_path = root / "notes" / "note.md"
+            _write_record(
+                note_path,
+                "---\ntitle: my note\n  - links:\n    - link: TOP-1\nBody, no closing delimiter.\n",
+            )
+            db = Path(td) / "idx.sqlite"
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf), contextlib.redirect_stdout(io.StringIO()):
+                rc = reindex(root, db, no_embed=True)
+            self.assertEqual(rc, 0, err_buf.getvalue())
+            self.assertEqual(self._index_errors_rows(db), [], "must stay a note, never quarantined")
+
+            result = memidx.parse_record(note_path)
+            self.assertTrue(result.valid)
+
+    # -- Fix round 1, finding A1 (BLOCKING): canonicity must be decided from
+    # the RAW frontmatter text, not the post-failure {} dict, in every
+    # parse-failure branch. Each of the three shapes below is a fully
+    # schema-conformant topic (id, type, block-style links) undone by only
+    # ONE unrelated defect -- it must still be quarantined, not silently
+    # reduced to a filename-derived "note".
+
+    def _assert_quarantined_and_unsearchable(self, root, db, bad_path):
+        err_buf = io.StringIO()
+        with contextlib.redirect_stderr(err_buf), contextlib.redirect_stdout(io.StringIO()):
+            rc = reindex(root, db, no_embed=True)
+        self.assertEqual(rc, 0, err_buf.getvalue())
+        rows = self._index_errors_rows(db)
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0]["path"], str(bad_path.resolve()))
+        self.assertEqual(
+            memidx.decision_index_state(db, memidx.DEFAULT_PROJECT, root=root), "quarantined"
+        )
+        search_buf = io.StringIO()
+        with contextlib.redirect_stdout(search_buf):
+            memidx.cmd_search(ns(
+                project=memidx.DEFAULT_PROJECT, db=str(db), root=str(root),
+                query="Body", mode="fts", status=[], type=[], area=None,
+                topic=None, authority=None, limit=10, json=True,
+            ))
+        out = json.loads(search_buf.getvalue())
+        self.assertEqual(out["results"], [], "a quarantined record must never appear in search")
+        return rows[0]
+
+    def test_unterminated_frontmatter_on_a_canonical_topic_is_quarantined(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            bad_path = root / "topics" / "bad.md"
+            _write_record(
+                bad_path,
+                "---\ntype: topic\nid: TOP-9301\ntitle: T\nlinks:\n"
+                '  - link: L1\n    status: active\n    ruling: {authority: owner-verbatim, text: t, source: s}\n'
+                "Body.\n",   # deliberately no closing ---
+            )
+            db = Path(td) / "idx.sqlite"
+            self._assert_quarantined_and_unsearchable(root, db, bad_path)
+
+    def test_yaml_error_on_a_canonical_topic_is_quarantined(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            bad_path = root / "topics" / "bad.md"
+            _write_record(
+                bad_path,
+                "---\ntype: topic\nid: TOP-9302\ntitle: a: b\nlinks:\n"
+                '  - link: L1\n    status: active\n    ruling: {authority: owner-verbatim, text: t, source: s}\n'
+                "---\nBody mentioning xyzzy123.\n",
+            )
+            db = Path(td) / "idx.sqlite"
+            self._assert_quarantined_and_unsearchable(root, db, bad_path)
+
+    def test_frontmatter_parsing_to_a_list_on_a_canonical_topic_is_quarantined(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            bad_path = root / "topics" / "bad.md"
+            _write_record(
+                bad_path,
+                "---\n- type: topic\n- id: TOP-9303\n- links:\n"
+                "    - link: L1\n      status: active\n"
+                '      ruling: {authority: owner-verbatim, text: t, source: s}\n'
+                "---\nBody.\n",
+            )
+            db = Path(td) / "idx.sqlite"
+            self._assert_quarantined_and_unsearchable(root, db, bad_path)
+
+    def test_links_only_canonical_marker_under_fallback_is_quarantined(self):
+        """No id:/type: at all -- `links:` alone must still make this
+        canonical (finding A1 instance (a)); the fallback must also still
+        name `links` in its diagnostics even though its own header line
+        (`links:`) is blank (finding A2 -- the blank carve-out is for
+        notes only)."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            bad_path = root / "topics" / "bad.md"
+            _write_record(
+                bad_path,
+                "---\ntitle: a: b\nlinks:\n"
+                '  - link: TOP-0001\n    status: active\n    ruling: {authority: owner-verbatim, text: something, source: s}\n'
+                "---\nBody text mentioning searchable phrase xyzzy123.\n",
+            )
+            db = Path(td) / "idx.sqlite"
+            row = self._assert_quarantined_and_unsearchable(root, db, bad_path)
+            diagnostics = json.loads(row["diagnostics"])
+            fields = [d[0] for d in diagnostics]
+            self.assertIn("links", fields, diagnostics)
+
+    def test_memlint_on_a1_regressions_reports_error_never_traceback(self):
+        cases = {
+            "unterminated": (
+                "---\ntype: topic\nid: TOP-9304\ntitle: T\nlinks:\n"
+                '  - link: L1\n    status: active\n    ruling: {authority: owner-verbatim, text: t, source: s}\n'
+                "Body.\n"
+            ),
+            "yaml_error": (
+                "---\ntype: topic\nid: TOP-9305\ntitle: a: b\nlinks:\n"
+                '  - link: L1\n    status: active\n    ruling: {authority: owner-verbatim, text: t, source: s}\n'
+                "---\nBody.\n"
+            ),
+            "parses_to_list": (
+                "---\n- type: topic\n- id: TOP-9306\n- links:\n"
+                "    - link: L1\n      status: active\n"
+                '      ruling: {authority: owner-verbatim, text: t, source: s}\n'
+                "---\nBody.\n"
+            ),
+        }
+        for name, text in cases.items():
+            with self.subTest(case=name):
+                with tempfile.TemporaryDirectory() as td:
+                    root = Path(td)
+                    _write_record(root / "topics" / "bad.md", text)
+                    buf_out, buf_err = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                        rc = memlint.main([str(root)])
+                    self.assertEqual(rc, 1, buf_out.getvalue())
+                    self.assertIn("ERROR:", buf_out.getvalue())
+                    self.assertNotIn("Traceback", buf_out.getvalue())
+                    self.assertNotIn("Traceback", buf_err.getvalue())
+
+    # -- Fix round 1, finding B2 (MODERATE): a quarantine-only transition
+    # (nothing added/changed/removed, only a record's own quarantine
+    # status flipping) must still recompute embedding_mode under --auto.
+
+    def test_mode_relevant_change_includes_quarantine_transitions(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            topic_path = root / "topics" / "t1.md"
+            _write_record(topic_path, _valid_topic_text("TOP-9601"))
+            db = Path(td) / "idx.sqlite"
+
+            # Design R4 (audit MC-P1-06): compute_embeddings gained an
+            # optional `model=` param (cmd_reindex now passes the model it
+            # already loaded for the fingerprint check) -- widened here,
+            # same precedent as Task 3's write_file_status signature change.
+            def fake_embed(texts, model=None):
+                return [[0.1, 0.2, 0.3, 0.4] for _ in texts]
+
+            with mock.patch.object(memidx, "compute_embeddings", side_effect=fake_embed):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    reindex(root, db, no_embed=False)
+            self.assertEqual(self._mode(db), "full")
+
+            # The only record becomes quarantined; nothing else changes.
+            # Under --auto (no_embed forced True), mode must still drop.
+            _write_record(topic_path, "---\ntype: topic\nid: TOP-9601\ntitle: Bad\nlinks: [\n---\nBody.\n")
+            args = ns(root=str(root), db=str(db), project=memidx.DEFAULT_PROJECT,
+                      full=False, no_embed=True, auto=True)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                rc = memidx.cmd_reindex(args)
+            self.assertEqual(rc, 0)
+            self.assertIn("1 quarantined", buf.getvalue())
+            self.assertEqual(
+                self._mode(db), "none",
+                "quarantining the only record must drop embedding_mode to none even under --auto",
+            )
+
+            # Un-quarantine it and restore full coverage with a real
+            # (mocked) embedding pass.
+            _write_record(topic_path, _valid_topic_text("TOP-9601"))
+            with mock.patch.object(memidx, "compute_embeddings", side_effect=fake_embed):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc2 = reindex(root, db, no_embed=False)
+            self.assertEqual(rc2, 0)
+            self.assertEqual(self._mode(db), "full")
+
+    def _mode(self, db):
+        conn = sqlite3.connect(str(db))
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT value FROM db_meta WHERE key='embedding_mode'").fetchone()
+        conn.close()
+        return row["value"] if row else None
+
+    # -- Fix round 1, finding B5 (NIT): build_record's defensive ValueError
+    # guard, directly.
+
+    def test_build_record_raises_on_links_not_a_list(self):
+        with self.assertRaises(ValueError) as ctx:
+            memidx.build_record(Path("/root"), Path("/root/topics/t.md"), {"links": "not-a-list"}, "body")
+        self.assertIn("links must be a list of mappings", str(ctx.exception))
+
+    def test_build_record_raises_on_links_list_with_non_mapping_element(self):
+        with self.assertRaises(ValueError):
+            memidx.build_record(Path("/root"), Path("/root/topics/t.md"), {"links": ["not-a-mapping"]}, "body")
+
+
+class TestEmbeddingFingerprint(unittest.TestCase):
+    """Design R4 (audit MC-P1-06, TOP-0123 L4): embedding_fingerprint /
+    fingerprints_match, cosine's typed dimension/non-finite errors, the
+    batch-length check before the reindex zip, the freshness join's
+    embed_fp/dim gate, fingerprint-mismatch handling at query time, and
+    check --json's vector_index_state. Deterministic fake vectors/
+    fingerprints throughout except the two tests named explicitly as
+    real-model (kept few, per the brief)."""
+
+    FP1 = "model=fake;dim=4;pipeline=1;prefix=none;norm=l2;fastembed=0.0.0;revision=rev1"
+    FP2 = "model=fake;dim=4;pipeline=1;prefix=none;norm=l2;fastembed=0.0.0;revision=rev2"
+    FOREIGN_FP = "model=other-model;dim=4;pipeline=1;prefix=none;norm=l2;fastembed=0.0.0;revision=revX"
+
+    def _topic(self, td, text="alpha decision", tid="TOP-1", name="t.md"):
+        root = Path(td) / "root"
+        (root / "topics").mkdir(parents=True, exist_ok=True)
+        p = root / "topics" / name
+        p.write_text(
+            f"---\ntype: topic\nid: {tid}\ntitle: T\nlinks:\n"
+            "  - link: L1\n    status: active\n"
+            "    ruling: {text: \"r\", authority: owner-verbatim, source: s}\n"
+            f"---\n{text}\n"
+        )
+        return root.resolve()
+
+    @staticmethod
+    def _fake_embed(texts, model=None):
+        return [[0.1, 0.2, 0.3, 0.4] for _ in texts]
+
+    @staticmethod
+    def _fake_loader(fp):
+        return lambda: (object(), fp)
+
+    def _mode(self, db):
+        conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
+        r = conn.execute("SELECT value FROM db_meta WHERE key='embedding_mode'").fetchone()
+        conn.close(); return r["value"] if r else "none"
+
+    def _stored_fp(self, db):
+        conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
+        r = conn.execute("SELECT value FROM db_meta WHERE key='embedding_fingerprint'").fetchone()
+        conn.close(); return r["value"] if r else None
+
+    def _emb_rows(self, db):
+        conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT path, embed_fp, dim FROM embeddings ORDER BY path").fetchall()
+        conn.close(); return [dict(r) for r in rows]
+
+    # -- Red 1: cosine's typed dimension/non-finite errors --
+
+    def test_cosine_raises_vector_dimension_mismatch_on_unequal_lengths(self):
+        with self.assertRaises(memidx.VectorDimensionMismatch):
+            memidx.cosine([1.0, 0.0], [1.0])
+
+    def test_vector_dimension_mismatch_is_a_value_error(self):
+        self.assertTrue(issubclass(memidx.VectorDimensionMismatch, ValueError))
+
+    def test_cosine_raises_value_error_on_non_finite_component(self):
+        with self.assertRaises(ValueError):
+            memidx.cosine([1.0, float("nan")], [1.0, 0.0])
+
+    # -- Red 2: same text, new fingerprint -> reindex re-embeds every row;
+    # a second run at the SAME fingerprint re-embeds nothing.
+
+    def test_new_fingerprint_forces_full_reembed_then_settles(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic(td)
+            db = Path(td) / "idx.sqlite"
+            with mock.patch.object(memidx, "compute_embeddings", side_effect=self._fake_embed), \
+                 mock.patch.object(memidx, "load_embedding_model", side_effect=self._fake_loader(self.FP1)):
+                reindex(root, db, no_embed=False)
+            rows1 = self._emb_rows(db)
+            self.assertEqual(len(rows1), 2, rows1)   # topic + its one link row
+            self.assertTrue(all(r["embed_fp"] == self.FP1 for r in rows1), rows1)
+            self.assertEqual(self._stored_fp(db), self.FP1)
+
+            def _boom(*a, **kw):
+                raise AssertionError("compute_embeddings must not run when nothing changed and the fingerprint matches")
+
+            with mock.patch.object(memidx, "compute_embeddings", side_effect=_boom), \
+                 mock.patch.object(memidx, "load_embedding_model", side_effect=self._fake_loader(self.FP1)):
+                reindex(root, db, no_embed=False)
+            self.assertEqual({r["embed_fp"] for r in self._emb_rows(db)}, {self.FP1})
+
+            with mock.patch.object(memidx, "compute_embeddings", side_effect=self._fake_embed), \
+                 mock.patch.object(memidx, "load_embedding_model", side_effect=self._fake_loader(self.FP2)):
+                reindex(root, db, no_embed=False)
+            rows3 = self._emb_rows(db)
+            self.assertEqual(len(rows3), 2, rows3)
+            self.assertTrue(all(r["embed_fp"] == self.FP2 for r in rows3), rows3)
+            self.assertEqual(self._stored_fp(db), self.FP2)
+
+    # -- Red 3: a dimension-mismatched row is skipped, not ranked, and
+    # counted; other rows still rank.
+
+    def test_dimension_mismatch_row_is_skipped_and_counted(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic(td, text="widget cache invalidates on write")
+            second = self._topic(td, text="second body about caching widgets", tid="TOP-2", name="second.md")
+            db = Path(td) / "idx.sqlite"
+            with mock.patch.object(memidx, "compute_embeddings", side_effect=self._fake_embed), \
+                 mock.patch.object(memidx, "load_embedding_model", side_effect=self._fake_loader(self.FP1)):
+                reindex(root, db, no_embed=False)
+
+            path = str(root / "topics" / "t.md")
+            conn = sqlite3.connect(str(db))
+            conn.execute(
+                "UPDATE embeddings SET vector=?, dim=4 WHERE path=?",
+                (memidx.pack_vector([0.1, 0.2, 0.3]), path),
+            )
+            conn.commit(); conn.close()
+
+            def fake_qe(text, model=None):
+                return [1.0, 0.0, 0.0, 0.0]
+
+            conn = memidx.open_db(db, project=memidx.DEFAULT_PROJECT)
+            stats = {}
+            with mock.patch.object(memidx, "compute_query_embedding", side_effect=fake_qe), \
+                 mock.patch.object(memidx, "embedding_fingerprint", return_value=self.FP1):
+                ranked = memidx.vector_ranked(conn, "second", memidx.DEFAULT_PROJECT, model=object(), stats=stats)
+            conn.close()
+            self.assertFalse(any(p == path for p, _ in ranked), ranked)
+            self.assertEqual(stats.get("dimension_mismatch_rows"), 1, stats)
+            self.assertTrue(any(p == str(root / "topics" / "second.md") for p, _ in ranked), ranked)
+
+    # -- Red 4: short/long batch -> nothing written, stderr names N and M,
+    # embedding_mode recompute reads none/partial, never full.
+
+    def test_short_batch_writes_nothing_and_names_counts(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic(td)
+            self._topic(td, text="second body", tid="TOP-2", name="second.md")
+            db = Path(td) / "idx.sqlite"
+
+            def short_embed(texts, model=None):
+                return [[0.1, 0.2, 0.3, 0.4] for _ in texts[:-1]]
+
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with mock.patch.object(memidx, "compute_embeddings", side_effect=short_embed), \
+                 mock.patch.object(memidx, "load_embedding_model", side_effect=self._fake_loader(self.FP1)), \
+                 contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = memidx.cmd_reindex(ns(root=str(root), db=str(db), project=memidx.DEFAULT_PROJECT,
+                                            full=False, no_embed=False, auto=False))
+            self.assertEqual(rc, 0)
+            self.assertIn("backend returned 3 vectors for 4 texts", buf_err.getvalue())
+            self.assertEqual(len(self._emb_rows(db)), 0)
+            self.assertEqual(self._mode(db), "none")
+
+    def test_long_batch_also_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic(td)
+            self._topic(td, text="second body", tid="TOP-2", name="second.md")
+            db = Path(td) / "idx.sqlite"
+
+            def long_embed(texts, model=None):
+                return [[0.1, 0.2, 0.3, 0.4] for _ in texts] + [[0.9, 0.9, 0.9, 0.9]]
+
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with mock.patch.object(memidx, "compute_embeddings", side_effect=long_embed), \
+                 mock.patch.object(memidx, "load_embedding_model", side_effect=self._fake_loader(self.FP1)), \
+                 contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = memidx.cmd_reindex(ns(root=str(root), db=str(db), project=memidx.DEFAULT_PROJECT,
+                                            full=False, no_embed=False, auto=False))
+            self.assertEqual(rc, 0)
+            self.assertIn("backend returned 5 vectors for 4 texts", buf_err.getvalue())
+            self.assertEqual(len(self._emb_rows(db)), 0)
+            self.assertEqual(self._mode(db), "none")
+
+    # -- Red 5: hybrid/vector under a fingerprint mismatch -> FTS list,
+    # "embedding": "fingerprint-mismatch", stderr line, exit 0.
+
+    def test_hybrid_and_vector_under_fingerprint_mismatch_fall_back_to_fts(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic(td, text="needle term for search")
+            db = Path(td) / "idx.sqlite"
+            with mock.patch.object(memidx, "compute_embeddings", side_effect=self._fake_embed), \
+                 mock.patch.object(memidx, "load_embedding_model", side_effect=self._fake_loader(self.FP1)):
+                reindex(root, db, no_embed=False)
+
+            conn = sqlite3.connect(str(db))
+            conn.execute(
+                "UPDATE db_meta SET value=? WHERE key='embedding_fingerprint'", (self.FOREIGN_FP,)
+            )
+            conn.commit(); conn.close()
+
+            def _boom(*a, **kw):
+                raise AssertionError("compute_query_embedding must not run under a fingerprint mismatch")
+
+            for mode in ("hybrid", "vector"):
+                buf_out, buf_err = io.StringIO(), io.StringIO()
+                with mock.patch.object(memidx, "compute_query_embedding", side_effect=_boom), \
+                     mock.patch.object(memidx, "load_embedding_model", side_effect=self._fake_loader(self.FP1)), \
+                     contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                    rc = memidx.cmd_search(ns(
+                        project=memidx.DEFAULT_PROJECT, db=str(db), query="needle term for search",
+                        mode=mode, status=[], type=[], area=None, topic=None, authority=None,
+                        limit=10, json=True,
+                    ))
+                self.assertEqual(rc, 0, mode)
+                out = json.loads(buf_out.getvalue())
+                self.assertEqual(out["embedding"], "fingerprint-mismatch", (mode, out))
+                self.assertIn("different model", buf_err.getvalue(), mode)
+                self.assertGreater(len(out["results"]), 0, (mode, out))
+
+    # -- Task 4 review finding M1 (carried into Task 5's commit per
+    # brief): zero embeddings rows but a FOREIGN stored fingerprint used
+    # to be silent (no "embedding" key, no stderr) because the old gate
+    # was `has_vectors` alone; the disjunction now catches it too.
+
+    def test_zero_rows_but_foreign_fingerprint_still_reports_mismatch(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic(td, text="needle term for search")
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)  # zero embeddings rows
+
+            conn = sqlite3.connect(str(db))
+            conn.execute(
+                "INSERT OR REPLACE INTO db_meta (key, value) VALUES ('embedding_fingerprint', ?)",
+                (self.FOREIGN_FP,),
+            )
+            conn.commit(); conn.close()
+
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with mock.patch.object(memidx, "load_embedding_model", side_effect=self._fake_loader(self.FP1)), \
+                 contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = memidx.cmd_search(ns(
+                    project=memidx.DEFAULT_PROJECT, db=str(db), query="needle term for search",
+                    mode="vector", status=[], type=[], area=None, topic=None, authority=None,
+                    limit=10, json=True,
+                ))
+            self.assertEqual(rc, 0)
+            out = json.loads(buf_out.getvalue())
+            self.assertEqual(out["embedding"], "fingerprint-mismatch", out)
+            self.assertIn("different model", buf_err.getvalue())
+
+    # -- Red 6/11: an old DB (vectors with NULL embed_fp) invalidates only
+    # the vector layer; check --json never reads "mismatch" for it; one
+    # embedding reindex refills every row and reads "full".
+
+    def test_old_db_with_null_embed_fp_invalidates_vector_layer_not_fts(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic(td, text="legacy vector needle phrase")
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)   # rows exist, never embedded
+
+            path = str(root / "topics" / "t.md")
+            conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
+            sha = conn.execute("SELECT sha256 FROM records WHERE path=?", (path,)).fetchone()["sha256"]
+            conn.execute(
+                "INSERT INTO embeddings (path, project, dim, embed_sha, embed_fp, vector) VALUES (?,?,?,?,?,?)",
+                (path, memidx.DEFAULT_PROJECT, 4, sha, None, memidx.pack_vector([0.1, 0.2, 0.3, 0.4])),
+            )
+            conn.commit(); conn.close()
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                memidx.cmd_check(ns(root=str(root), db=str(db), project=memidx.DEFAULT_PROJECT, json=True))
+            report = json.loads(buf.getvalue())
+            self.assertIn(report["vector_index_state"], ("none", "partial"), report)
+
+            fts_out = io.StringIO()
+            with contextlib.redirect_stdout(fts_out):
+                memidx.cmd_search(ns(
+                    project=memidx.DEFAULT_PROJECT, db=str(db), query="legacy vector needle phrase",
+                    mode="fts", status=[], type=[], area=None, topic=None, authority=None,
+                    limit=10, json=True,
+                ))
+            fts_results = json.loads(fts_out.getvalue())
+            self.assertGreater(len(fts_results), 0, fts_results)
+
+            vec_out, vec_err = io.StringIO(), io.StringIO()
+            with mock.patch.object(memidx, "load_embedding_model", side_effect=self._fake_loader(self.FP1)), \
+                 contextlib.redirect_stdout(vec_out), contextlib.redirect_stderr(vec_err):
+                rc = memidx.cmd_search(ns(
+                    project=memidx.DEFAULT_PROJECT, db=str(db), query="legacy vector needle phrase",
+                    mode="vector", status=[], type=[], area=None, topic=None, authority=None,
+                    limit=10, json=True,
+                ))
+            self.assertEqual(rc, 0)
+            vec_json = json.loads(vec_out.getvalue())
+            self.assertGreater(len(vec_json["results"]), 0, vec_json)
+
+            # check's own vector_index_state compares against the REAL
+            # static fingerprint (it never loads a model) -- so the refill
+            # here must carry a fingerprint that shares that static prefix
+            # (same model/dim/pipeline/prefix/norm/fastembed version),
+            # differing only in revision, to read back as "full" rather
+            # than "mismatch" against a fake model name.
+            real_static_prefix = memidx._fingerprint_static_prefix(memidx.embedding_fingerprint())
+            fp_real_revision = real_static_prefix + "rev-test"
+            with mock.patch.object(memidx, "compute_embeddings", side_effect=self._fake_embed), \
+                 mock.patch.object(memidx, "load_embedding_model", side_effect=self._fake_loader(fp_real_revision)):
+                reindex(root, db, no_embed=False)
+            buf2 = io.StringIO()
+            with contextlib.redirect_stdout(buf2):
+                memidx.cmd_check(ns(root=str(root), db=str(db), project=memidx.DEFAULT_PROJECT, json=True))
+            report2 = json.loads(buf2.getvalue())
+            self.assertEqual(report2["vector_index_state"], "full", report2)
+            rows = self._emb_rows(db)
+            self.assertTrue(all(r["embed_fp"] for r in rows), rows)
+
+    # -- Fix wave 1, G3 (whole-branch-review MODERATE-1): `check --json`'s
+    # `searchable_vector_count` must use the SAME "fresh" definition
+    # (embed_sha AND embed_fp match) as `vector_index_state` and
+    # `embedding_backlog` in the same envelope -- a migrated DB with a
+    # NULL-fp row must report 0, not 1.
+
+    def test_searchable_vector_count_matches_vector_index_state_on_a_migrated_db(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic(td, text="migrated vector needle phrase")
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)   # rows exist, never embedded
+
+            path = str(root / "topics" / "t.md")
+            conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
+            sha = conn.execute("SELECT sha256 FROM records WHERE path=?", (path,)).fetchone()["sha256"]
+            conn.execute(
+                "INSERT INTO embeddings (path, project, dim, embed_sha, embed_fp, vector) VALUES (?,?,?,?,?,?)",
+                (path, memidx.DEFAULT_PROJECT, 4, sha, None, memidx.pack_vector([0.1, 0.2, 0.3, 0.4])),
+            )
+            conn.commit(); conn.close()
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                memidx.cmd_check(ns(root=str(root), db=str(db), project=memidx.DEFAULT_PROJECT, json=True))
+            report = json.loads(buf.getvalue())
+            self.assertEqual(report["vector_index_state"], "none", report)
+            self.assertEqual(report["embedding_backlog"]["rows_without_fresh_vector"], 2, report)
+            self.assertEqual(
+                report["searchable_vector_count"], 0,
+                "a NULL-embed_fp row is not a FRESH vector -- searchable_vector_count must agree "
+                "with vector_index_state and embedding_backlog in the same envelope: " + str(report),
+            )
+
+    # -- Red 7: check reports "full" on a healthy embedded DB, without
+    # importing fastembed (real model -- kept to this one case).
+
+    def test_check_reports_full_vector_index_state_without_importing_fastembed(self):
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic(td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=False)   # real model -- one of the few real-model cases here
+
+            script = (
+                "import sys, io, contextlib, json; sys.path.insert(0, %r); import memidx\n"
+                "buf = io.StringIO()\n"
+                "with contextlib.redirect_stdout(buf):\n"
+                "    rc = memidx.main(['check', '--root', %r, '--db', %r, '--json'])\n"
+                "assert 'fastembed' not in sys.modules, 'fastembed was imported'\n"
+                "report = json.loads(buf.getvalue())\n"
+                "assert report['vector_index_state'] == 'full', report\n"
+                "print('OK')\n"
+            ) % (str(TOOLS_DIR), str(root), str(db))
+            result = subprocess.run(
+                [sys.executable, "-c", script], capture_output=True, text=True, timeout=30
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("OK", result.stdout)
+
+    # -- Red 9: --no-embed/--auto on a mismatched DB reports and does not repair.
+
+    def test_no_embed_auto_reports_mismatch_without_repairing(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic(td)
+            db = Path(td) / "idx.sqlite"
+            with mock.patch.object(memidx, "compute_embeddings", side_effect=self._fake_embed), \
+                 mock.patch.object(memidx, "load_embedding_model", side_effect=self._fake_loader(self.FP1)):
+                reindex(root, db, no_embed=False)
+            rows_before = self._emb_rows(db)
+
+            conn = sqlite3.connect(str(db))
+            conn.execute("UPDATE db_meta SET value=? WHERE key='embedding_fingerprint'", (self.FOREIGN_FP,))
+            conn.commit(); conn.close()
+
+            buf_err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(buf_err):
+                rc = memidx.cmd_reindex(ns(root=str(root), db=str(db), project=memidx.DEFAULT_PROJECT,
+                                            full=False, no_embed=True, auto=True))
+            self.assertEqual(rc, 0)
+            self.assertIn("different model", buf_err.getvalue())
+            self.assertEqual(self._emb_rows(db), rows_before,
+                              "a --no-embed/--auto pass must not repair a standing mismatch")
+
+
+class TestFingerprintsMatchContract(unittest.TestCase):
+    """Task 4 review finding L4 (carried into Task 5's commit per brief):
+    `fingerprints_match`'s own contract had no direct unit test -- every
+    existing test exercised it only indirectly, through a full DB
+    mismatch/no-mismatch scenario. These pin the 10 edge cases directly."""
+
+    REAL_A = "model=fake;dim=4;pipeline=1;prefix=none;norm=l2;fastembed=0.0.0;revision=rev1"
+    REAL_A_DIFFERENT_REVISION = "model=fake;dim=4;pipeline=1;prefix=none;norm=l2;fastembed=0.0.0;revision=rev2"
+    REAL_A_DIFFERENT_DIM = "model=fake;dim=8;pipeline=1;prefix=none;norm=l2;fastembed=0.0.0;revision=rev1"
+    REAL_A_UNKNOWN_REVISION = "model=fake;dim=4;pipeline=1;prefix=none;norm=l2;fastembed=0.0.0;revision=unknown"
+
+    def test_unknown_on_stored_side_is_a_wildcard(self):
+        self.assertTrue(memidx.fingerprints_match(self.REAL_A_UNKNOWN_REVISION, self.REAL_A))
+
+    def test_unknown_on_current_side_is_a_wildcard(self):
+        self.assertTrue(memidx.fingerprints_match(self.REAL_A, self.REAL_A_UNKNOWN_REVISION))
+
+    def test_both_unknown_matches(self):
+        self.assertTrue(memidx.fingerprints_match(self.REAL_A_UNKNOWN_REVISION, self.REAL_A_UNKNOWN_REVISION))
+
+    def test_both_real_and_identical_matches(self):
+        self.assertTrue(memidx.fingerprints_match(self.REAL_A, self.REAL_A))
+
+    def test_both_real_differing_only_in_revision_does_not_match(self):
+        self.assertFalse(memidx.fingerprints_match(self.REAL_A, self.REAL_A_DIFFERENT_REVISION))
+
+    def test_differing_in_a_single_static_key_does_not_match(self):
+        self.assertFalse(memidx.fingerprints_match(self.REAL_A, self.REAL_A_DIFFERENT_DIM))
+
+    def test_stored_none_never_matches(self):
+        self.assertFalse(memidx.fingerprints_match(None, self.REAL_A))
+
+    def test_stored_empty_string_never_matches(self):
+        self.assertFalse(memidx.fingerprints_match("", self.REAL_A))
+
+    def test_stored_malformed_never_matches(self):
+        self.assertFalse(memidx.fingerprints_match("garbage", self.REAL_A))
+
+    def test_current_none_never_matches(self):
+        self.assertFalse(memidx.fingerprints_match(self.REAL_A, None))
+
+
+class TestTypedDegradation(unittest.TestCase):
+    """Design R7 (audit MC-P2-03, TOP-0123 L7): `_degraded`/`_debug_log`,
+    `cmd_unmapped`'s programmer-bug branch, `--debug`, per-file/per-record
+    savepoints on the decision side, and `cmd_stats`'s typed fail-open
+    line."""
+
+    def _store_with_one_topic(self, td):
+        root = Path(td) / "root"; (root / "topics").mkdir(parents=True)
+        (root / "topics" / "t.md").write_text(
+            "---\ntype: topic\nid: TOP-9000\ntitle: T\nlinks:\n"
+            "  - link: L1\n    status: active\n    ruling: {text: \"r\", authority: owner-verbatim, source: s}\n"
+            "---\nbody\n"
+        )
+        return root.resolve()
+
+    # -- Red 1: a genuine programmer bug (AttributeError, nothing to do
+    # with sqlite) inside cmd_unmapped's per-path classify loop is named,
+    # not silently folded into a bare "unknown".
+
+    def test_programmer_error_in_unmapped_is_named_and_debug_logged(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._store_with_one_topic(td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+            debug_home = Path(td) / "debughome"; debug_home.mkdir()
+
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with mock.patch.object(memidx, "topic_matches_for_path", side_effect=AttributeError("boom")), \
+                 mock.patch.dict(os.environ, {"MEMCONTINUUM_HOME": str(debug_home)}), \
+                 contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = memidx.cmd_unmapped(ns(project=memidx.DEFAULT_PROJECT, db=str(db),
+                                             root=str(root), code_root=None, json=True,
+                                             paths=["topics/t.md"]))
+            out = json.loads(buf_out.getvalue())
+            self.assertEqual(out["coverage_status"], "unknown")
+            self.assertIn("degraded", out)
+            self.assertEqual(out["degraded"]["reason_code"], "internal-error")
+            self.assertEqual(out["degraded"]["exception_type"], "AttributeError")
+            self.assertIn("boom", out["degraded"]["safe_message"])
+            self.assertIn("unmapped: degraded reason=internal-error type=AttributeError",
+                           buf_err.getvalue())
+            # Ruling 132: _debug_log lands beside the database this call
+            # served (db.parent), never under MEMCONTINUUM_HOME -- prove
+            # both directions: the file exists at db.parent, and the
+            # patched (but now-irrelevant) MEMCONTINUUM_HOME stays empty.
+            log_path = db.parent / "memidx-debug.log"
+            self.assertTrue(log_path.is_file(), "memidx-debug.log must exist beside the database")
+            log_text = log_path.read_text()
+            self.assertIn("AttributeError", log_text)
+            self.assertIn("boom", log_text)
+            self.assertIn("Traceback", log_text)
+            self.assertEqual(
+                list(debug_home.iterdir()), [],
+                "MEMCONTINUUM_HOME must not receive the debug log when a db_path is in scope",
+            )
+
+    def test_debug_flag_reraises_unmapped_internal_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._store_with_one_topic(td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+            with mock.patch.object(memidx, "topic_matches_for_path", side_effect=AttributeError("boom")), \
+                 mock.patch.object(memidx, "DEBUG", True):
+                with self.assertRaises(AttributeError):
+                    memidx.cmd_unmapped(ns(project=memidx.DEFAULT_PROJECT, db=str(db),
+                                            root=str(root), code_root=None, json=True,
+                                            paths=["topics/t.md"]))
+
+    # -- Red 5 (decision side): a DB-level write failure on one record
+    # never touches its neighbours, and the run reports it honestly
+    # (a hard error, rc != 0) rather than silently mislabeling a DB
+    # failure as a parse/shape quarantine -- see report section on this
+    # deviation for the reasoning.
+
+    def test_decision_savepoint_isolates_write_failure_to_one_record(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"; (root / "topics").mkdir(parents=True)
+            for name, tid in (("a.md", "TOP-9001"), ("b.md", "TOP-9002"), ("c.md", "TOP-9003")):
+                (root / "topics" / name).write_text(
+                    "---\ntype: topic\nid: {}\ntitle: T\nlinks:\n"
+                    "  - link: L1\n    status: active\n    ruling: {{text: \"r\", authority: owner-verbatim, source: s}}\n"
+                    "---\nbody\n".format(tid)
+                )
+            root = root.resolve()
+            db = Path(td) / "idx.sqlite"
+
+            real_insert = memidx.insert_record_rows
+
+            def flaky_insert(conn, project, rec, sha, mtime, size):
+                if rec["path"].endswith("b.md"):
+                    raise sqlite3.OperationalError("disk I/O error (injected)")
+                return real_insert(conn, project, rec, sha, mtime, size)
+
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with mock.patch.object(memidx, "insert_record_rows", side_effect=flaky_insert), \
+                 contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = reindex(root, db, no_embed=True)
+            self.assertEqual(rc, 5)
+            self.assertIn("integrity failure", buf_out.getvalue())
+            self.assertIn("index integrity not guaranteed", buf_err.getvalue())
+
+            conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
+            paths = {r["path"] for r in conn.execute("SELECT path FROM records")}
+            b_embeddings = conn.execute(
+                "SELECT COUNT(*) AS n FROM embeddings WHERE path LIKE '%b.md'"
+            ).fetchone()["n"]
+            conn.close()
+            self.assertTrue(any(p.endswith("a.md") for p in paths), paths)
+            self.assertTrue(any(p.endswith("c.md") for p in paths), paths)
+            self.assertFalse(any(p.endswith("b.md") for p in paths), paths)
+            self.assertEqual(b_embeddings, 0, "b.md's embedding upsert must have rolled back too")
+
+    # -- Regression (advisor review, post-fix): the per-record SAVEPOINT
+    # loop must nest inside ONE transaction that commits only once, at the
+    # very end of the function -- not one micro-commit per SAVEPOINT/
+    # RELEASE pair. Proven black-box (no connection tracing needed): force
+    # the mode-recompute step that runs AFTER the loop but BEFORE the
+    # final conn.commit() to raise, and confirm NOTHING landed. Before the
+    # `if not conn.in_transaction: conn.execute("BEGIN")` guard this read
+    # 3 (each RELEASE had already committed its own record); it must read
+    # 0 now that the whole loop shares one transaction closed only by the
+    # function's own final commit.
+
+    def test_decision_single_commit_nothing_lands_if_post_loop_step_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"; (root / "topics").mkdir(parents=True)
+            for name, tid in (("a.md", "TOP-9001"), ("b.md", "TOP-9002"), ("c.md", "TOP-9003")):
+                (root / "topics" / name).write_text(
+                    "---\ntype: topic\nid: {}\ntitle: T\nlinks:\n"
+                    "  - link: L1\n    status: active\n    ruling: {{text: \"r\", authority: owner-verbatim, source: s}}\n"
+                    "---\nbody\n".format(tid)
+                )
+            root = root.resolve()
+            db = Path(td) / "idx.sqlite"
+
+            with mock.patch.object(memidx, "_fingerprint_static_prefix", side_effect=RuntimeError("boom")):
+                with self.assertRaises(RuntimeError):
+                    reindex(root, db, no_embed=True)
+
+            conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
+            n = conn.execute("SELECT COUNT(*) AS n FROM records").fetchone()["n"]
+            conn.close()
+            self.assertEqual(
+                n, 0,
+                "a failure AFTER the per-record loop but before the final commit must roll back "
+                "every record the loop touched -- proves the SAVEPOINTs share one transaction",
+            )
+
+    # -- Red 7 (cmd_stats): the fail-open catch-all is retyped.
+
+    def test_stats_internal_error_prints_typed_degraded_line(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"; home.mkdir()
+            (home / "hook.log").write_text("2026-09-04T00:00:00+00:00 outcome=ok project=p\n")
+            buf_out = io.StringIO()
+            with mock.patch.object(memidx, "_stats_report", side_effect=AttributeError("boom")), \
+                 contextlib.redirect_stdout(buf_out):
+                rc = memidx.cmd_stats(ns(project=memidx.DEFAULT_PROJECT, days=7, home=str(home),
+                                          store=None, json=False, now=None))
+            self.assertEqual(rc, 0)
+            self.assertIn("stats: degraded reason=internal-error type=AttributeError: boom -- exit 0 (fail-open)",
+                           buf_out.getvalue())
+
+    def test_debug_flag_reraises_stats_internal_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"; home.mkdir()
+            (home / "hook.log").write_text("2026-09-04T00:00:00+00:00 outcome=ok project=p\n")
+            with mock.patch.object(memidx, "_stats_report", side_effect=AttributeError("boom")), \
+                 mock.patch.object(memidx, "DEBUG", True):
+                with self.assertRaises(AttributeError):
+                    memidx.cmd_stats(ns(project=memidx.DEFAULT_PROJECT, days=7, home=str(home),
+                                         store=None, json=False, now=None))
+
+    # -- Direct unit coverage of the new helpers themselves.
+
+    def test_degraded_helper_shape_and_truncation(self):
+        exc = ValueError("x" * 300 + "\nsecond line")
+        d = memidx._degraded("internal-error", exc)
+        self.assertEqual(d["reason_code"], "internal-error")
+        self.assertEqual(d["exception_type"], "ValueError")
+        self.assertLessEqual(len(d["safe_message"]), 200)
+        self.assertNotIn("\n", d["safe_message"])
+
+    def test_degraded_helper_no_exception(self):
+        d = memidx._degraded("index-missing")
+        self.assertEqual(d, {"reason_code": "index-missing", "exception_type": None, "safe_message": None})
+
+    def test_debug_log_writes_traceback_when_home_exists(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"; home.mkdir()
+            try:
+                raise RuntimeError("kaboom")
+            except RuntimeError as exc:
+                with mock.patch.dict(os.environ, {"MEMCONTINUUM_HOME": str(home)}):
+                    memidx._debug_log(exc, "unit-test")
+            text = (home / "memidx-debug.log").read_text()
+            self.assertIn("kaboom", text)
+            self.assertIn("unit-test", text)
+            self.assertIn("Traceback", text)
+
+    def test_debug_log_never_creates_the_home_directory(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "does-not-exist"
+            try:
+                raise RuntimeError("kaboom")
+            except RuntimeError as exc:
+                with mock.patch.dict(os.environ, {"MEMCONTINUUM_HOME": str(home)}):
+                    memidx._debug_log(exc, "unit-test")  # must not raise, must not create home
+            self.assertFalse(home.exists())
+
+    def test_debug_log_writes_beside_db_path_ignoring_home(self):
+        """Ruling 132 (coordinator, TOP-0123 L6 review): `_debug_log` must
+        place its file BESIDE THE DATABASE it serves (`Path(db_path).parent`)
+        when a caller has one -- never resolved from a default home,
+        independently of whatever `--db` the caller was actually given.
+        Proven here with MEMCONTINUUM_HOME UNSET and `Path.home()` patched
+        to a temp dir that must stay completely untouched."""
+        with tempfile.TemporaryDirectory() as td:
+            fake_home = Path(td) / "fake-home"
+            fake_home.mkdir()
+            db_dir = Path(td) / "custom-db-dir"
+            db_dir.mkdir()
+            db_path = db_dir / "project.sqlite"
+            try:
+                raise RuntimeError("kaboom")
+            except RuntimeError as exc:
+                with mock.patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop("MEMCONTINUUM_HOME", None)
+                    with mock.patch.object(memidx.Path, "home", return_value=fake_home):
+                        memidx._debug_log(exc, "unit-test", db_path)
+            log_path = db_dir / "memidx-debug.log"
+            self.assertTrue(log_path.is_file(), "the log must land beside the db path")
+            text = log_path.read_text()
+            self.assertIn("kaboom", text)
+            self.assertIn("unit-test", text)
+            self.assertFalse((fake_home / "memidx-debug.log").exists())
+            self.assertEqual(list(fake_home.iterdir()), [], "nothing may land in the patched home")
+
+    def test_index_integrity_error_carries_rel_and_cause(self):
+        cause = sqlite3.OperationalError("disk I/O error")
+        err = memidx.IndexIntegrityError("src/x.py", cause)
+        self.assertEqual(err.rel, "src/x.py")
+        self.assertIs(err.cause, cause)
+        self.assertIn("src/x.py", str(err))
+        self.assertIn("OperationalError", str(err))
+
+
+class TestEmbedWorker(unittest.TestCase):
+    """Design R8 (audit MC-P2-02, TOP-0123 L7): the coalescing background
+    embed-worker -- `cmd_embed_worker`, the marker/lock file contract, and
+    `embedding_backlog`. Every test sets a temp MEMCONTINUUM_HOME via
+    mock.patch.dict(os.environ, ...) (never touches the real one) and
+    never leaves a worker holding its lock (tearDown asserts the lock is
+    free)."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp(prefix="memcontinuum-embedworker-")
+        self.addCleanup(shutil.rmtree, self.td, ignore_errors=True)
+        self.home = Path(self.td) / "home"
+        self.home.mkdir()
+        self.project = "ew-test"
+
+    def tearDown(self):
+        # Ruling 132: marker/lock/log land beside the database
+        # (db.parent), never under the home the test happens to patch --
+        # this must track cmd_embed_worker's own resolution or a held
+        # lock at the WRONG path would silently never be detected.
+        lock_path = self._db().parent / f"{self.project}.embed.lock"
+        if lock_path.exists():
+            fd = os.open(str(lock_path), os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except BlockingIOError:
+                self.fail(f"{lock_path} is still held after the test")
+            finally:
+                os.close(fd)
+
+    def _topic(self, text="the widget cache invalidates on write"):
+        root = Path(self.td) / "root"
+        (root / "topics").mkdir(parents=True, exist_ok=True)
+        p = root / "topics" / "t.md"
+        p.write_text(f"---\nid: T-1\ntitle: T\nstatus: active\n---\n{text}\n")
+        return root.resolve()
+
+    def _db(self):
+        return Path(self.td) / f"{self.project}.sqlite"
+
+    def _marker(self):
+        return self._db().parent / f"{self.project}.embed-pending"
+
+    def _log(self):
+        return self._db().parent / f"{self.project}.embed.log"
+
+    def _args(self, root, db):
+        return SimpleNamespace(root=str(root), project=self.project, db=str(db))
+
+    @staticmethod
+    def _fake_embed(texts, model=None):
+        return [[0.01] * memidx.EMBED_DIM for _ in texts]
+
+    def _mode(self, db):
+        conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
+        r = conn.execute("SELECT value FROM db_meta WHERE key='embedding_mode'").fetchone()
+        conn.close()
+        return r["value"] if r else "none"
+
+    # -- 3: worker embeds everything and clears the marker ------------------
+
+    def test_worker_embeds_everything_and_clears_marker(self):
+        root = self._topic()
+        db = self._db()
+        reindex(root, db, project=self.project, no_embed=True)  # content only, no vector yet
+        marker = self._marker()
+        marker.touch()
+        with mock.patch.dict(os.environ, {"MEMCONTINUUM_HOME": str(self.home)}), \
+             mock.patch.object(memidx, "compute_embeddings", side_effect=self._fake_embed):
+            rc = memidx.cmd_embed_worker(self._args(root, db))
+        self.assertEqual(rc, 0)
+        self.assertFalse(marker.exists(), "a clean pass must remove the marker")
+        conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT vector FROM embeddings WHERE path=?", (str(root / "topics" / "t.md"),)).fetchone()
+        conn.close()
+        self.assertIsNotNone(row, "every record must be embedded")
+        self.assertEqual(self._mode(db), "full")
+        # Ruling 132: marker/lock/log land beside the database, never
+        # under the patched MEMCONTINUUM_HOME -- prove the OLD location
+        # stays empty, not merely that the new one has the right files.
+        self.assertEqual(
+            list(self.home.iterdir()), [],
+            "embed-worker must not write any companion file under home",
+        )
+
+    # -- 3: two commits during one pass coalesce into one job ---------------
+
+    def test_worker_coalesces_a_marker_retouched_mid_pass(self):
+        root = self._topic()
+        db = self._db()
+        reindex(root, db, project=self.project, no_embed=True)
+        marker = self._marker()
+        marker.touch()
+
+        calls = []
+
+        def fake_backfill(args):
+            calls.append(args)
+            if len(calls) == 1:
+                # Simulate a second commit landing WHILE this pass runs:
+                # retouch the marker mid-way (a later mtime_ns than the
+                # worker captured before this call).
+                time.sleep(0.01)
+                marker.touch()
+            return 0
+
+        with mock.patch.dict(os.environ, {"MEMCONTINUUM_HOME": str(self.home)}), \
+             mock.patch.object(memidx, "cmd_reindex", side_effect=fake_backfill):
+            rc = memidx.cmd_embed_worker(self._args(root, db))
+        self.assertEqual(rc, 0)
+        self.assertFalse(marker.exists(), "the loop must run again and clear the marker on the untouched pass")
+        self.assertGreaterEqual(len(calls), 2, "a mid-pass retouch must make the loop run at least twice")
+
+    # -- 4: a crash leaves a retriable marker --------------------------------
+
+    def test_worker_crash_leaves_marker_and_logs_exception(self):
+        root = self._topic()
+        db = self._db()
+        reindex(root, db, project=self.project, no_embed=True)
+        marker = self._marker()
+        marker.touch()
+
+        with mock.patch.dict(os.environ, {"MEMCONTINUUM_HOME": str(self.home)}), \
+             mock.patch.object(memidx, "cmd_reindex", side_effect=RuntimeError("kaboom")):
+            rc = memidx.cmd_embed_worker(self._args(root, db))
+        self.assertEqual(rc, 3)
+        self.assertTrue(marker.exists(), "a crash must leave the marker for a later retry")
+        log_text = self._log().read_text()
+        self.assertIn("kaboom", log_text)
+        self.assertIn("RuntimeError", log_text)
+        self.assertIn("Traceback", log_text)
+
+        # A second, healthy run clears it.
+        with mock.patch.dict(os.environ, {"MEMCONTINUUM_HOME": str(self.home)}), \
+             mock.patch.object(memidx, "compute_embeddings", side_effect=self._fake_embed):
+            rc2 = memidx.cmd_embed_worker(self._args(root, db))
+        self.assertEqual(rc2, 0)
+        self.assertFalse(marker.exists(), "a subsequent healthy run must clear the retriable marker")
+
+    # -- 5: a second worker exits 0 immediately while the first holds the lock
+
+    def test_second_worker_exits_0_while_first_holds_lock(self):
+        root = self._topic()
+        db = self._db()
+        reindex(root, db, project=self.project, no_embed=True)
+        marker = self._marker()
+        marker.touch()
+        lock_path = self._db().parent / f"{self.project}.embed.lock"
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            with mock.patch.dict(os.environ, {"MEMCONTINUUM_HOME": str(self.home)}), \
+                 mock.patch.object(memidx, "compute_embeddings", side_effect=self._fake_embed):
+                rc = memidx.cmd_embed_worker(self._args(root, db))
+            self.assertEqual(rc, 0, "the second worker must exit 0 immediately, not block or error")
+            self.assertTrue(marker.exists(), "the SECOND worker (locked out) must not touch the marker's state")
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+        # Now that the first "worker" released, drain the marker for real
+        # so tearDown's lock-free assertion has nothing outstanding.
+        with mock.patch.dict(os.environ, {"MEMCONTINUUM_HOME": str(self.home)}), \
+             mock.patch.object(memidx, "compute_embeddings", side_effect=self._fake_embed):
+            memidx.cmd_embed_worker(self._args(root, db))
+
+    # -- 6: --help exits 0 and is id-free ------------------------------------
+
+    def test_embed_worker_help_exits_0_and_is_id_free(self):
+        env = dict(os.environ); env["PYTHONPATH"] = ""
+        proc = subprocess.run(
+            [sys.executable, str(TOOLS_DIR / "memidx.py"), "embed-worker", "--help"],
+            capture_output=True, text=True, env=env,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(proc.stdout.strip())
+        for token in ("TOP-0123", "MC-P2-02", "R8"):
+            self.assertNotIn(token, proc.stdout)
+
+    # -- 6: check --json reports embedding_backlog ---------------------------
+
+    def test_check_json_reports_embedding_backlog(self):
+        root = self._topic()
+        db = self._db()
+        reindex(root, db, project=self.project, no_embed=True)
+        marker = self._marker()
+        marker.touch()
+        with mock.patch.dict(os.environ, {"MEMCONTINUUM_HOME": str(self.home)}):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                memidx.cmd_check(ns(project=self.project, db=str(db), root=str(root), json=True))
+        out = json.loads(buf.getvalue())
+        self.assertIn("embedding_backlog", out)
+        backlog = out["embedding_backlog"]
+        self.assertTrue(backlog["pending_marker"])
+        self.assertEqual(backlog["rows_without_fresh_vector"], 1)
+        self.assertFalse(backlog["worker_lock_held"])
+        marker.unlink()
+
+    # -- MOD-1 (task-6-review.md): a fail-open embedding-backend failure
+    # (not a crash -- cmd_reindex catches it internally and returns 0 by
+    # R4/R7's own fail-open contract) must still leave the marker and
+    # signal failure to the worker's own caller, via an explicit
+    # module-level signal cmd_reindex sets (never stdout-parsed, never the
+    # awaiting-embedding count -- a legitimately un-embeddable row also
+    # leaves that count > 0 and must not make the worker spin on it) ------
+
+    def test_broken_backend_leaves_the_marker_and_exits_3(self):
+        root = self._topic()
+        db = self._db()
+        reindex(root, db, project=self.project, no_embed=True)
+        marker = self._marker()
+        marker.touch()
+        with mock.patch.dict(os.environ, {"MEMCONTINUUM_HOME": str(self.home)}), \
+             mock.patch.object(memidx, "load_embedding_model",
+                                side_effect=RuntimeError("fastembed not installed")):
+            rc = memidx.cmd_embed_worker(self._args(root, db))
+        self.assertEqual(rc, 3, "a fail-open embedding-backend failure must signal failure, not success")
+        self.assertTrue(marker.exists(), "a broken backend must leave the marker for a later retry")
+
+    # -- LOW-1 (task-6-review.md): worker_lock_held reads True while a
+    # worker holds the lock (previously untested; the "held" branch was
+    # correct but never exercised) -----------------------------------------
+
+    def test_worker_lock_held_true_while_a_worker_holds_the_lock(self):
+        root = self._topic()
+        db = self._db()
+        reindex(root, db, project=self.project, no_embed=True)
+        lock_path = self._db().parent / f"{self.project}.embed.lock"
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            backlog = memidx.embedding_backlog(db, self.project)
+            self.assertTrue(backlog["worker_lock_held"])
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+        backlog2 = memidx.embedding_backlog(db, self.project)
+        self.assertFalse(backlog2["worker_lock_held"])
 
 
 if __name__ == "__main__":

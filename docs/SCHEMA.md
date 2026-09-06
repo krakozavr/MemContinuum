@@ -146,6 +146,10 @@ copied inline.
 - `current` not equal to the newest link with `status: active` → error (names the correct value)
 - a topic in area `processing/*` or `deletion/*` with no `code_refs` → warning
 - any `status` / `authority` / `kind` value outside the five/five/five enumerated above → error
+- frontmatter that does not parse (unreadable, not UTF-8, unterminated, malformed YAML on a
+  canonical record), or a typed field in the wrong shape (`links` not a list of mappings, a link
+  missing its `link` id, `ruling`/`rationale`/`invariant` not a mapping, a list field carrying a
+  non-scalar) → error naming the file/field; the same on a note (no schema id/links/type) → warning
 
 **Deliberately not implemented:** "a link edited after being recorded (hash
 mismatch vs git) → reject". That check needs the canonical records to live in

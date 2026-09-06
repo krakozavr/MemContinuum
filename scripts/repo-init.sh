@@ -1142,9 +1142,19 @@ def render(text, mapping):
 blocks = {}  # event_name -> list of new group dicts
 
 # --- write-hooks block (always present) ---
+# Design R5 (audit MC-P1-05, TOP-0123 L5): the five write-side hooks used
+# to see ONLY code_roots[0] -- this now renders BOTH tokens: the first
+# root (kept, for older readers and the updater's own recovery fallback)
+# AND the full JSON list of every recorded root (physical paths, matching
+# code_roots' own abspath()=realpath resolution). {{CODE_ROOT_ENV}} stays
+# the single placeholder -- templates/write-hooks.json.tmpl's own shape is
+# unchanged.
 code_root_env = ""
 if code_roots:
-    code_root_env = "MEMCONTINUUM_CODE_ROOT=%s " % esc_cmd(code_roots[0])
+    code_root_env = "MEMCONTINUUM_CODE_ROOT=%s MEMCONTINUUM_CODE_ROOTS=%s " % (
+        esc_cmd(code_roots[0]),
+        esc_cmd(json.dumps(code_roots)),
+    )
 
 # Task 10: newfile-nudge's env-driven extension gate (Task 9). KNOWN_EXTS is
 # a constant of this engine version (every LANGUAGE_TABLE row's extensions),

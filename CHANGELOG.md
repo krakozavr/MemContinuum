@@ -1,5 +1,146 @@
 # Changelog
 
+## [0.2.0] — unreleased
+
+### Decision index
+- The store walker no longer follows symlinks -- a symlinked directory or
+  file inside the store is skipped with a warning instead of walked, and
+  `check` counts the skips.
+- A malformed or wrongly-shaped record no longer crashes `reindex` or
+  `memlint` -- it is quarantined (its previous rows purged, one row written
+  to a new `index_errors` table, one stderr line naming the file and field),
+  its neighbours index normally, and the run exits 0. The index reports a new
+  `quarantined` state until the record is fixed or removed; `check --json`
+  lists each one, and `unmapped` refuses the negative claim off a quarantined
+  store the same way it already does for an uninitialized one.
+- `check` and `unmapped` now hash every record instead of trusting mtime/size
+  alone -- a same-size, same-mtime content rewrite (a metadata-preserving
+  restore, a coarse-timestamp filesystem, some sync tools) used to read as
+  no drift; it is now reported under `changed`, `check` exits 1, and
+  `unmapped` refuses the negative claim off it. A bare `touch` (mtime moves,
+  content unchanged) is bookkeeping-refreshed in place and is no longer
+  reported as drift -- the inverse of `check`'s old behaviour. `search`,
+  `chain`, `for-path`, `why`, and `drift` keep the metadata-only comparison
+  (unchanged) -- `check`/`unmapped` are what prove content, not every reader.
+- Every vector now carries a fingerprint of the model that produced it
+  (model name, dimension, pipeline version, normalization, the installed
+  fastembed version, and the loaded model's revision) -- a vector made by a
+  different model or dimension is never mixed into a ranking. A stale or
+  foreign-model vector is excluded from ranking the same way a stale
+  `embed_sha` already was, not merely scored lower. `search`'s vector/hybrid
+  modes detect a model swap at query time and fall back to FTS-only with a
+  named stderr line and `"embedding": "fingerprint-mismatch"` in `--json`,
+  rather than silently degrading; a reindex with embedding enabled detects
+  the same mismatch and re-embeds every row, once. `cosine` now rejects a
+  dimension mismatch and a non-finite vector component with a typed error
+  instead of silently truncating; a backend that returns the wrong number
+  of vectors for a batch writes nothing rather than mis-assigning them.
+  `check --json` gains `vector_index_state` (`none`/`partial`/`full`/
+  `mismatch`), computed without loading the embedding model.
+- `unmapped` no longer folds a genuine programmer bug into the same silent
+  `unknown` a real read failure gets: a broader internal error now attaches a
+  typed `degraded` object (`reason_code`, `exception_type`, a short safe
+  message) to the JSON, names it on stderr, and appends the traceback to a new
+  `memidx-debug.log` -- `coverage_status` itself is unchanged. `stats`'s own
+  fail-open catch-all is named the same way. A new `--debug` flag re-raises
+  instead of degrading, for local debugging. Each record's write in `reindex`
+  now runs under its own savepoint -- one record's write failure can no longer
+  affect its neighbours, is reported honestly (never mislabeled as a
+  quarantine), and a run with one or more such failures exits 5 after every
+  other record is still committed.
+- `memidx.py`'s per-database companion files -- the embed-worker's marker,
+  lock and log, and `memidx-debug.log` -- now land beside the database a
+  command is actually serving (`Path(db_path).parent`) rather than always
+  under `$MEMCONTINUUM_HOME`; a custom `--db` moves them with it. The one
+  caller that always builds `--db` under `$MEMCONTINUUM_HOME`
+  (`post-commit-reindex.sh`) is unaffected; `backend-preflight`, which has no
+  database in scope, still falls back to `$MEMCONTINUUM_HOME` for its own
+  debug log.
+
+### Code index
+- The code index's freshness check now compares five stat signals per file
+  (size, mtime, ctime, inode, device) instead of mtime/size alone, catching a
+  same-size, same-mtime content rewrite the old comparison could not; when a
+  root's stored git HEAD has moved, the commit's own changed files are hashed
+  too, as a trigger (not proof on its own). `code-search`'s reported state
+  splits `current` (this call hashed every file and proved it, only under the
+  new `--verify-content` flag) from `metadata-current` (the honest default --
+  nothing looks changed, but nothing was proven by a hash either); a
+  nothing-found result is real evidence only under `current`. Each
+  `code_roots` entry in `--json` also carries `git_delta`. The code index
+  schema bumps to version 3 (a rebuild on first use, same as any schema
+  bump -- roots and languages survive, embeddings do not).
+- The code index's vectors now carry the same model fingerprint as the
+  decision index's (`embeddings.embed_fp`, `code_project.embedding_fingerprint`
+  -- reserved by the schema-3 bump above, wired here): an old-model or
+  foreign-dimension vector is invisible to ranking, `code-search --json`
+  gains `embedding_fingerprint` and, on a query-time mismatch,
+  `"embedding": "fingerprint-mismatch"` with an FTS-only fallback;
+  `code-reindex` re-embeds every chunk on a mismatch, and `reembeds` in its
+  summary line now counts vectors actually written, not chunks merely sent
+  to the backend.
+- Each file's write in `code-reindex` now runs under its own savepoint;
+  a failure that leaves the purge-and-stamp step itself unable to complete
+  (rather than a normal chunker failure, already handled) rolls back that
+  file's attempt instead of committing a half-updated row, prints
+  `cannot purge stale rows for <path> ...; index integrity not guaranteed`,
+  and the run exits 5 with an `N integrity failure(s)` token in its summary
+  -- every other file is still committed. `code-search`'s heal never prints
+  "index healed" over a `code-reindex` exit it did not get a clean 0 from;
+  it prints `heal did not complete (code-reindex exit N)` instead and still
+  answers from the current index.
+
+### Hooks
+- The five write-side hooks (edit ledger, coverage/look-back nudges,
+  session-start/-end) now see every configured code root, not just the
+  first -- an edit under a second or third `--code-root` is ledgered and
+  classified for coverage exactly like one under the first. Each ledger row
+  now records which physical root it matched (or none, for a store edit);
+  "code HEAD changed" is true when any configured root's git HEAD moved.
+  `unmapped --code-root` is now repeatable, picking the most specific
+  (longest) matching root when roots nest. Existing installs pick this up
+  on their next `memcontinuum-update.sh --apply` -- no re-install needed.
+- The store's `post-commit` hook no longer runs a full (embedding) reindex
+  synchronously inside `git commit` -- it now runs a bounded, content-only
+  pass (`--no-embed --auto`, under the same watchdog every write-side hook
+  uses) so a hung or slow embedding backend can never delay a commit; text
+  is searchable the instant the hook returns. When records are left
+  without a fresh vector, the hook spawns a detached, coalescing background
+  worker (`memidx.py embed-worker`, safe to run twice) that backfills them;
+  `check --json` and `stats --json` both gain `embedding_backlog` so the
+  catch-up is visible. Existing installs pick this up automatically on
+  their next commit -- no re-install needed.
+- The edit ledger now sees every tool call, not only `Edit`/`Write`/
+  `MultiEdit`/`NotebookEdit` -- a cheap prefilter still skips the read-only
+  built-ins before the watchdog even starts, but a file changed from the
+  shell (or by any tool this hook has no dedicated branch for) is now
+  caught by a tree diff against the last-seen state of every configured
+  code root and the store root, and appended to the same ledger; an
+  unrecognized or missing tool name is logged by name and still diffed
+  rather than silently skipped. `stats` reports how often each of those
+  two paths fired.
+- The pre-edit chain hook now makes exactly one `for-path` call per
+  candidate, not two, and parses its JSON answer with one small python
+  script, not three. `for-path --json` gained an opt-in
+  `--with-chain-text` flag that folds the plain-text chain rendering into
+  the same JSON answer; the hook's single call -- carrying both `--root`
+  (the flag that triggers `for-path`'s on-disk drift check) and
+  `--with-chain-text` -- now finds the matching candidate, determines the
+  index state, and returns its chain text all at once, so the store is
+  walked at most once per run either way. Two separate CI measurements on
+  the macOS runner motivated this: 1.003s against the hook's own 1.0s
+  timing bar, and later 1.003-1.022s against that same bar (runner speed
+  alone swings by roughly a quarter between runs) -- this collapse
+  removes a full process start's worth of margin without loosening the
+  bar itself.
+
+### Documentation
+- The README, `docs/DESIGN.md`, and `docs/INTERNALS.md` now say plainly
+  where the automatic retrieval-before-an-edit boundary sits: it only
+  covers edits made with the Edit and Write tools. A file changed from the
+  shell gets no lookup beforehand -- only an after-the-fact entry in the
+  edit ledger, once a tree diff notices it.
+
 ## [0.2.0rc3] — 2026-09-04
 
 ### Languages

@@ -256,7 +256,7 @@ case $? in
     *) finish "outside-code-root" ;;
 esac
 
-MESSAGE="New source file under ${CODE_ROOT} — confirm the code index is initialized/current, then run code-search; name relevant hits or say none."
+MESSAGE="New source file under ${CODE_ROOT} — confirm the code index is initialized and not stale, then run code-search; name relevant hits or say none."
 
 export HOOK_MESSAGE="$MESSAGE"
 OUTPUT_JSON="$(PYTHONPATH= "$PY" -c '
