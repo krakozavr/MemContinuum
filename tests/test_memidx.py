@@ -1489,25 +1489,35 @@ class TestUnmappedMultipleCodeRoots(unittest.TestCase):
             self.assertEqual(out2["mapped_topic"], ["src/b.py"], out2)
             self.assertEqual(out2["roots"], [str(root_b.resolve())])
 
-    def test_classification_is_root_aware_for_a_relative_path_two_nested_roots_share(self):
-        # LOW-1 (a2-3 review, carried into A3): a bare relative-path
-        # code_ref carries no root of its own -- topic_matches_for_path
-        # matches it project-wide. When TWO roots are configured and BOTH
-        # happen to have a file at the identical relative path, the
-        # classification must not let the wrong one borrow the other's
-        # coverage. Ruling 131 (TOP-0123 L10): an ambiguous relative
-        # string resolves to the LONGEST (most specific) containing root
-        # -- here, outer O and inner I = O/subdir/inner, both configured,
-        # both carrying their OWN unrelated "src/x.py". The topic's
-        # code_ref names only "src/x.py", meant for I's file; O's own
-        # "src/x.py" is genuinely undocumented and must not borrow it.
+    def test_nested_roots_sharing_a_relative_path_are_treated_like_siblings(self):
+        # LOW-1 (a2-3 review, carried into A3), corrected by fix wave 1 G6
+        # (whole-branch-review Codex 10): a bare relative-path code_ref
+        # carries no root of its own -- topic_matches_for_path matches it
+        # project-wide. A PRIOR version of this fix (ruling 131, TOP-0123
+        # L10) tried to resolve a nested-root collision by attributing an
+        # ambiguous match to the LONGEST (most specific) containing root
+        # among ALL roots that happen to have a file at that relative
+        # offset -- but that compares the file actually being classified
+        # against a DIFFERENT, unrelated physical file that merely shares
+        # its relative name, inventing ownership between them with no real
+        # evidence either way. Codex 10, reproduced directly: an existing,
+        # genuinely covered outer/src/x.py went from mapped_topic to
+        # unmapped the moment inner/src/x.py was ALSO configured as a code
+        # root -- configuring an unrelated root silently un-covered a file
+        # nothing about it had changed. Now: outer O and inner I =
+        # O/subdir/inner, both configured, both carrying their OWN
+        # unrelated "src/x.py"; the topic's code_ref names only "src/x.py"
+        # and could mean either file -- design ruling F ("never a false
+        # gap") refuses to guess, so BOTH are credited, exactly the same
+        # way two SIBLING roots sharing a relative path already are (see
+        # the test below).
         with tempfile.TemporaryDirectory() as td:
             outer = Path(td) / "outer"; outer.mkdir()
             inner = outer / "subdir" / "inner"; inner.mkdir(parents=True)
             (outer / "src").mkdir()
-            (outer / "src" / "x.py").write_text("# outer's own, undocumented\n")
+            (outer / "src" / "x.py").write_text("# outer's own\n")
             (inner / "src").mkdir()
-            (inner / "src" / "x.py").write_text("# inner's own, documented\n")
+            (inner / "src" / "x.py").write_text("# inner's own\n")
 
             store = Path(td) / "store"
             (store / "topics").mkdir(parents=True)
@@ -1521,6 +1531,22 @@ class TestUnmappedMultipleCodeRoots(unittest.TestCase):
             outer_x = str((outer / "src" / "x.py").resolve())
             inner_x = str((inner / "src" / "x.py").resolve())
 
+            # outer_x classified ALONE first (only O configured) -- this is
+            # the "existing covered file" half of Codex 10's reproduction:
+            # genuinely mapped before I is ever configured at all.
+            buf0 = io.StringIO()
+            with contextlib.redirect_stdout(buf0):
+                rc0 = memidx.cmd_unmapped(ns(
+                    project=memidx.DEFAULT_PROJECT, db=str(db), root=str(store),
+                    code_root=[str(outer)], json=True, paths=[outer_x],
+                ))
+            out0 = json.loads(buf0.getvalue())
+            self.assertEqual(rc0, 0, out0)
+            self.assertEqual(out0["mapped_topic"], ["src/x.py"], out0)
+
+            # Now I is ALSO configured (inner/src/x.py present) -- outer_x's
+            # own classification must be UNAFFECTED by configuring a wholly
+            # unrelated root's file at a colliding relative name.
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 rc = memidx.cmd_unmapped(ns(
@@ -1530,12 +1556,13 @@ class TestUnmappedMultipleCodeRoots(unittest.TestCase):
                 ))
             out = json.loads(buf.getvalue())
             self.assertEqual(rc, 0, out)
-            self.assertEqual(out["unmapped"], ["src/x.py"],
-                              "outer's own, undocumented src/x.py must not borrow "
-                              "inner's coverage just because the relative string matches")
-            self.assertEqual(out["mapped_topic"], ["src/x.py"],
-                              "inner's src/x.py, the one the topic actually names, "
-                              "must still be classified as covered")
+            self.assertEqual(out["unmapped"], [], out)
+            self.assertCountEqual(out["mapped_topic"], ["src/x.py", "src/x.py"], out)
+            self.assertEqual(out["by_path"][outer_x], "mapped_topic",
+                              "outer/src/x.py must stay mapped once inner/src/x.py is "
+                              "ALSO configured -- an outer file's mapping is unaffected "
+                              "by an inner root's file")
+            self.assertEqual(out["by_path"][inner_x], "mapped_topic")
 
     def test_sibling_roots_sharing_a_relative_path_keep_todays_behavior(self):
         # The companion case to the one above: A and B are SIBLINGS (neither
