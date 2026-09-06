@@ -46,7 +46,9 @@
 # the errors on stderr, one hook.log line carrying rc=1); 0 lets it
 # through, either because the check was clean (rc=0) or because something
 # ABOUT RUNNING THE CHECK failed (skipped=<reason>: MEMCONTINUUM_ROOT
-# unset, an unborn HEAD, no python, or memlint itself erroring out with no
+# unset, the invoking repo is not-the-store (Codex 1 -- this wrapper fired
+# for a commit outside MEMCONTINUUM_ROOT, e.g. a shared core.hooksPath),
+# an unborn HEAD, no python, or memlint itself erroring out with no
 # recognizable summary line) -- fail-open for infrastructure, fail-closed
 # only for a genuine history edit. `git commit --no-verify` bypasses this
 # hook entirely, same as any git hook; the real guarantee against a
@@ -85,6 +87,32 @@ if [ -z "${MEMCONTINUUM_ROOT:-}" ]; then
 fi
 
 PROJECT="${MEMCONTINUUM_PROJECT:-$(basename "$MEMCONTINUUM_ROOT")}"
+
+# Codex 1 (BLOCKING, fix wave 1 G1): this wrapper is generated once per
+# store, but a shared or global core.hooksPath can still make git invoke
+# the very same wrapper for an UNRELATED repository's commit (repo-init.sh
+# now refuses to install into one, but an already-installed shared
+# hooksPath, or a hand-copied wrapper, is not something this hook can
+# assume away). Compare the PHYSICAL toplevel of the repo git is ACTUALLY
+# committing in right now (never MEMCONTINUUM_ROOT itself, which may be
+# stale or simply belong to a different store) against MEMCONTINUUM_
+# ROOT's own physical path -- a mismatch means this hook fired for a repo
+# that is not its store: skip, never block that repo's ordinary commit.
+# `git rev-parse --show-toplevel` with no `-C` reads the invoking repo,
+# since git runs hooks with cwd already at that repo's own working tree
+# root. Both sides resolved with `cd ... && pwd -P` (portable physical
+# resolution, bash 3.2-safe, matching the same technique used elsewhere
+# in this codebase) rather than `realpath`/`readlink -f` (not on every
+# macOS).
+_INVOKING_TOPLEVEL="$(git rev-parse --show-toplevel 2>/dev/null)"
+if [ -n "$_INVOKING_TOPLEVEL" ]; then
+    _INVOKING_TOPLEVEL_PHYS="$(cd "$_INVOKING_TOPLEVEL" 2>/dev/null && pwd -P)"
+    _ROOT_PHYS="$(cd "$MEMCONTINUUM_ROOT" 2>/dev/null && pwd -P)"
+    if [ -z "$_ROOT_PHYS" ] || [ "$_INVOKING_TOPLEVEL_PHYS" != "$_ROOT_PHYS" ]; then
+        log_line "skipped=not-the-store project=$PROJECT"
+        exit 0
+    fi
+fi
 
 # Cheapest skip first (no python needed): a brand-new repo with no commits
 # yet has no HEAD to compare against -- there is no history to protect,

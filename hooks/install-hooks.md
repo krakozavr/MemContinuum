@@ -206,10 +206,13 @@ whatever else sits in the working tree) and, unlike every other hook here,
 BLOCKS the commit (exit 1) when that check finds an append-only violation —
 the errors on stderr, one `hook.log` line
 (`pre-commit-append-only: rc=1 changed=<n> project=…`). A clean check exits 0
-with `rc=0 changed=<n> project=…`; an unborn HEAD, a missing python, or
-memlint itself failing to produce a recognizable result all exit 0 with
-`skipped=<reason> project=…` instead — fail-open for infrastructure,
-fail-closed only for a genuine history edit. See docs/INTERNALS.md's memlint
+with `rc=0 changed=<n> project=…`; an unborn HEAD, a missing python,
+memlint itself failing to produce a recognizable result, or (fix wave 1 G1)
+the hook's own cwd not matching `MEMCONTINUUM_ROOT` (`skipped=not-the-store`
+— a wrapper invoked from another repository, e.g. through a mistakenly
+shared `core.hooksPath`, must never judge that repository's commit) all
+exit 0 with `skipped=<reason> project=…` instead — fail-open for
+infrastructure, fail-closed only for a genuine history edit. See docs/INTERNALS.md's memlint
 section (`--against-ref`) for the full rule table, and its "Fail-open is the
 contract" and "The watchdog" sections for why this one hook blocks and why it
 carries no timeout guard. `git commit --no-verify` bypasses this hook

@@ -45,7 +45,7 @@ wired one level up, into `~/.claude/settings.json`, by `memcontinuum-setup.sh`.
 | `userprompt-remind.sh` | `UserPromptSubmit` | never reads the prompt text or diff; fires the coverage, commit, or look-back nudge |
 | `sessionend-stamp.sh` | `SessionEnd` | stamps session end into state |
 | `post-commit-reindex.sh` | store's git `post-commit` | a bounded content-only reindex after every commit; spawns a background embed-worker when vectors are left behind |
-| `pre-commit-append-only.sh` | store's git `pre-commit` | runs `memlint.py --against-ref HEAD --staged`; BLOCKS the commit on an append-only violation (an edited, removed, deleted, or renamed link); fails open (lets the commit through) on an unborn HEAD, a missing python, or any engine failure |
+| `pre-commit-append-only.sh` | store's git `pre-commit` | runs `memlint.py --against-ref HEAD --staged`; BLOCKS the commit on an append-only violation (an edited, removed, deleted, or renamed link); fails open (lets the commit through) on an unborn HEAD, a missing python, its own cwd not being the store, or any engine failure |
 | `memcontinuum-detect.sh` | `SessionStart`, user level | classifies an un-initialized repo and asks once; no python, no watchdog, no logging by default |
 
 **Fail-open is the contract, not a fallback — with one deliberate exception.**
@@ -61,7 +61,8 @@ exception, and only for the one failure mode it exists to catch: an edit to an
 already-recorded link. The asymmetry inverts there — a rewritten link is
 unrecoverable history the moment it is committed, while a refused commit costs
 one message and a `git commit --no-verify` away. Every OTHER way this hook can
-fail (no python, an unborn HEAD, memlint erroring out) still fails open exactly
+fail (no python, an unborn HEAD, memlint erroring out, its own cwd not being
+the store) still fails open exactly
 like every other hook.
 
 **Logging, per hook.** The seven project-level hooks each write exactly one
@@ -76,8 +77,12 @@ outside that rule are deliberate: `post-commit-reindex.sh` writes its own
 line instead, `pre-commit-append-only.sh` writes its own line, one of
 `pre-commit-append-only: rc=1 changed=<n> project=…` (refused the commit),
 `rc=0 changed=<n> project=…` (clean), or `skipped=<reason> project=…` — an
-unborn HEAD, no python, an engine failure — when nothing was actually
-judged (no `changed=` on that shape: nothing was compared), and
+unborn HEAD, no python, an engine failure, or (fix wave 1 G1) the hook
+running with its cwd outside `MEMCONTINUUM_ROOT` (`skipped=not-the-store` —
+a wrapper invoked from another repository entirely, e.g. through a
+mistakenly shared `core.hooksPath`, must never judge or block THAT
+repository's commit) — when nothing was actually judged (no `changed=` on
+that shape: nothing was compared), and
 `memcontinuum-detect.sh` writes nothing at all unless
 `$MEMCONTINUUM_DETECT_LOG` is set — it runs in every repo on the machine, so its
 default is silence.
@@ -1744,9 +1749,14 @@ id:
 | `promoted_by` changes after already being set | error, `<path>:<link>: promoted_by: …` (no status coupling — it may be added regardless of the link's own status) |
 | a lifecycle move (`status` and/or `superseded_by` and/or `promoted_by`, otherwise valid) bundled with any body-field edit | error on the lifecycle field too, naming it, in addition to the body field's own error |
 | a link present at `REF` is missing now | error, `<path>:<link>: link removed after being recorded` |
-| a topic file present at `REF` is deleted or renamed | error naming the path (`--no-renames` means a rename is a plain delete + a plain add, so one rule covers both) |
+| a topic-like record present at `REF` is deleted or renamed | error naming the path and its real kind (`topic`/`incident`/`investigation`/`concept`, or `record` when the kind itself could not be recovered) — `--no-renames` means a rename is a plain delete + a plain add, so one rule covers both |
+| a duplicate link id within one topic, on either side | error naming the id, `<path>: duplicate link id '<id>' used <n> times` — the same `memidx.validate_record_shape` diagnostic every consumer shares; a record with a duplicate id is quarantined before this check ever compares its links |
 | a valid forward `status` move (with `superseded_by` added when the new status is `superseded`), `promoted_by` added, alone on the link; new links; changes to `current`, `title`, `tags`, `code_refs`, or the body text | free |
-| frontmatter that does not parse (either side) | error, the typed-parse diagnostic — never a traceback |
+| the `REF`-side blob never parsed at all, and the new blob now parses cleanly | a note, not an error (`repaired — the blob at REF could not be safely parsed …`) — a blob that was never validly a record recorded no link history to freeze, so fixing it is a repair, never an append-only violation |
+| frontmatter that does not parse on the new side, or on both sides | error, the typed-parse diagnostic — never a traceback |
+| a record whose recoverable kind is not topic-like (`type: incident`/`investigation`/`concept` with no `links:`) | out of scope for this check entirely — there is no recorded link history to protect, so neither an error nor a note |
+| `--code-root` given together with `--against-ref` | exit 2 — append-only mode never uses a code root, and the flag is rejected rather than silently ignored |
+| a `REF` argument that starts with `-` (would otherwise swallow the next flag, e.g. `--staged`, as if it were the ref) | exit 2 naming the flag-shaped token that was refused |
 | `ROOT` is not inside a git repository, or `REF` does not resolve to a commit | exit 2 with a message (not exit 1 — this is an infrastructure/usage failure, not a content finding) |
 
 The three lifecycle fields exist because a link is not always closed the

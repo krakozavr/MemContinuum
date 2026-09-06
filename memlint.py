@@ -31,6 +31,8 @@ import chunkers
 
 from memidx import (
     AUTHORITIES,
+    CANONICAL_ID_PREFIXES,
+    CANONICAL_TYPES,
     CONSTRAINT_AUTHORITIES,
     EDGE_RELS,
     HOLD_ELIGIBLE_AUTHORITIES,
@@ -132,13 +134,21 @@ def lint_topic(path: Path, fm: dict) -> tuple[list[str], list[str]]:
         # laundering, not a citable decision. owner-ratified is the
         # orchestrator's own paraphrase of what the owner affirmed, never a
         # literal transcript, so it is not covered by this rule. Trim
-        # trailing quote characters and whitespace first (a copy-paste
-        # artifact can leave a stray quote or space after the real "?");
+        # trailing quote/bracket characters and whitespace first (a
+        # copy-paste artifact can leave a stray quote, space, or closing
+        # bracket after the real "?" -- whole-branch-review MODERATE-2:
+        # `)]}` joined the strip set so "...decisionmaking?)" is still
+        # caught, not silently passed because of one trailing paren);
         # skip when text is falsy -- the missing-field error above already
-        # covers that case.
-        if auth == "owner-verbatim":
+        # covers that case. Ruling 149 (whole-branch-review MODERATE-2):
+        # scoped to status active/provisional only -- a superseded link is
+        # history, and the append-only guard already forbids rewriting it,
+        # so flagging it here can never be cleared by superseding (the
+        # exact permanently-red-store bug the finding reproduced on both
+        # real stores).
+        if auth == "owner-verbatim" and status in ("active", "provisional"):
             text = ruling.get("text")
-            if text and str(text).strip(" \t\r\n\"'").endswith("?"):
+            if text and str(text).strip(" \t\r\n\"')]}").endswith("?"):
                 errors.append(
                     f"{prefix}: owner-verbatim text is a question, not a ruling"
                 )
@@ -201,13 +211,24 @@ def lint_topic(path: Path, fm: dict) -> tuple[list[str], list[str]]:
                         "only enforces as a HOLD with real evidence, and even then only under --strict-holds"
                     )
 
+    # Codex 2 (BLOCKING, fix wave 1 G1): a duplicate link id within one
+    # topic used to be flagged HERE, but only when the record otherwise
+    # parsed cleanly enough to reach lint_topic at all -- check_append_only
+    # (a dict keyed by id) and reindex (memidx.build_record's own link
+    # rows) each silently kept a DIFFERENT occurrence (last-wins), so a
+    # duplicate id could bypass append-only comparison entirely and index
+    # a different link's content than the one a human reading the file
+    # sees first. The check now lives in memidx.validate_record_shape --
+    # the one typed-parse gate every consumer (this linter, reindex,
+    # check_append_only's own git-blob parse) already goes through -- so a
+    # topic with a duplicate link id is QUARANTINED (ParseResult.valid is
+    # False) before any of those three ever sees it, rather than being
+    # caught three different ways with three different blast radii. See
+    # lint_file's own `ERROR: <path>: links: duplicate link id ...` line,
+    # which fires from that same diagnostic.
     topic_link_ids = {str(l.get("link")) for l in links if l.get("link")}
     topic_links_by_id = {str(l.get("link")): l for l in links if l.get("link")}
-    seen_link_ids: dict[str, int] = {}
     for link in links:
-        lid = str(link.get("link") or "")
-        if lid:
-            seen_link_ids[lid] = seen_link_ids.get(lid, 0) + 1
         rev = link.get("reverses")
         if rev and str(rev) not in topic_link_ids:
             errors.append(f"{path}:{link.get('link','?')}: reverses {rev!r} does not match any link id in this topic")
@@ -230,9 +251,6 @@ def lint_topic(path: Path, fm: dict) -> tuple[list[str], list[str]]:
         sb = link.get("superseded_by")
         if sb and str(sb) not in topic_link_ids:
             errors.append(f"{path}:{link.get('link','?')}: superseded_by {sb!r} does not match any link id in this topic")
-    for lid, count in seen_link_ids.items():
-        if count > 1:
-            errors.append(f"{path}: link id {lid!r} used {count} times within this topic -- link ids must be unique per topic")
 
     current_field = fm.get("current")
     if current_field is not None:
@@ -1075,15 +1093,70 @@ def _parse_git_blob(data: bytes | None, label) -> ParseResult:
     return parse_record_text(text, label)
 
 
+_KIND_BY_ID_PREFIX = {
+    "TOP-": "topic", "INC-": "incident", "INV-": "investigation", "CON-": "concept",
+}
+
+
+def _record_kind(fm: dict) -> str | None:
+    """Best-effort real kind ("topic"/"incident"/"investigation"/
+    "concept") of a record's frontmatter, even a partially recovered one
+    -- an explicit `type:` first (a FALLBACK_SCALAR_FIELD, always
+    recovered by parse_record_text's lenient fallback even when the rest
+    of the YAML is broken), else the id prefix (also a scalar, always
+    recovered), else a `links` list read as "topic" (the one CANONICAL
+    signal is_topic_frontmatter/is_canonical_frontmatter treat that way).
+    None when nothing usable was recovered at all (an unterminated block,
+    a non-mapping document, an unreadable file) -- there is no real kind
+    to report there, only "canonical but a total blank"."""
+    t = fm.get("type")
+    if t in CANONICAL_TYPES:
+        return t
+    rid = fm.get("id")
+    if isinstance(rid, str):
+        for prefix in CANONICAL_ID_PREFIXES:
+            if rid.startswith(prefix):
+                return _KIND_BY_ID_PREFIX[prefix]
+    if fm.get("links"):
+        return "topic"
+    return None
+
+
+def _record_kind_label(result: ParseResult) -> str:
+    """The real kind for check_append_only's own messages ("topic file
+    deleted", etc.) -- Grok N11: an unparseable blob must never be
+    universally reported as "topic" just because _is_topic_like's
+    conservative default (below) still treats it as protected; "record"
+    is the honest generic fallback only when the real kind truly cannot
+    be recovered at all."""
+    if result.valid:
+        return "topic" if _is_topic_frontmatter(result.frontmatter) else (
+            _record_kind(result.frontmatter) or "record"
+        )
+    return _record_kind(result.frontmatter) or "record"
+
+
 def _is_topic_like(result: ParseResult) -> bool:
-    """A canonical-but-unparseable record (result.valid is False) is
-    treated as topic-relevant unconditionally -- it was schema-shaped
-    (an id/type/links marker was present in the raw text) even though it
-    could not be safely parsed, and silently skipping it would let a
-    broken-but-canonical record's link history go completely unchecked.
-    A record that parsed cleanly is topic-relevant the same way lint_file
-    decides it (N1: shares _is_topic_frontmatter rather than its own copy)."""
+    """Grok N11 / whole-branch-review MODERATE-1: an unparseable blob is
+    topic-like only when the recoverable signal actually NAMES topic --
+    `type: topic`, a `TOP-` id, or (on a clean parse) a real `links` list.
+    A `type: investigation`/`incident`/`concept` record -- MODERATE-1's
+    real-world repro, a partner store's own INV- record with no links at
+    all, broken only by an unquoted colon in its title -- is not protected by
+    this append-only mechanism (there is no recorded link history to
+    freeze) and must never be reported as one; the old unconditional
+    `True` blocked exactly that record's own repair commit. Only when
+    NOTHING at all could be recovered (an unterminated block, a
+    non-mapping document, an unreadable/non-UTF-8 file -- `_record_kind`
+    returns None) does this still default to True: a genuinely corrupted
+    TOPIC's link history must never go silently unprotected just because
+    nothing could be read from it. A record that parsed cleanly is
+    topic-relevant the same way lint_file decides it (N1: shares
+    _is_topic_frontmatter rather than its own copy)."""
     if not result.valid:
+        kind = _record_kind(result.frontmatter)
+        if kind is not None:
+            return kind == "topic"
         return True
     return _is_topic_frontmatter(result.frontmatter)
 
@@ -1187,13 +1260,15 @@ def _link_diff_errors(full_path, lid: str, old_link: dict, new_link: dict) -> li
     return errors
 
 
-def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], int]:
-    """Returns (errors, changed) -- `changed` is the number of topic files
-    the diff actually concerned (topic-relevant at REF), independent of
-    whether any of them produced an error. Raises GitError for a root that
-    is not a git repository or a REF that does not resolve to a commit
-    (spec test (i)); every other failure mode is an ordinary ERROR: entry
-    in the returned list (spec test (j) -- never a traceback)."""
+def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], int, list[str]]:
+    """Returns (errors, changed, notes) -- `changed` is the number of
+    topic files the diff actually concerned (topic-relevant at REF),
+    independent of whether any of them produced an error; `notes` are
+    informational, non-error lines (a REPAIR of a record that never
+    parsed at REF -- see below). Raises GitError for a root that is not a
+    git repository or a REF that does not resolve to a commit (spec test
+    (i)); every other failure mode is an ordinary ERROR: entry in the
+    returned list (spec test (j) -- never a traceback)."""
     toplevel = _git_toplevel(root)
     _resolve_ref(toplevel, ref)
     try:
@@ -1214,6 +1289,7 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
     entries = _parse_name_status_z(raw.stdout)
 
     errors: list[str] = []
+    notes: list[str] = []
     changed = 0
     for status, relpath in entries:
         path_in_root = relpath[len(prefix):] if prefix and relpath.startswith(prefix) else relpath
@@ -1231,8 +1307,9 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
         changed += 1
 
         if status == "D":
+            kind = _record_kind_label(old_result)
             errors.append(
-                f"{full_path}: topic file deleted or renamed after being recorded "
+                f"{full_path}: {kind} file deleted or renamed after being recorded "
                 "(append-only; a store never loses history)"
             )
             continue
@@ -1242,14 +1319,33 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
         else:
             new_blob = _read_worktree(root / path_in_root)
         if new_blob is None:
+            kind = _record_kind_label(old_result)
             errors.append(
-                f"{full_path}: topic file deleted or renamed after being recorded "
+                f"{full_path}: {kind} file deleted or renamed after being recorded "
                 "(append-only; a store never loses history)"
             )
             continue
         new_result = _parse_git_blob(new_blob, path_in_root)
 
         if not old_result.valid:
+            if new_result.valid:
+                # Grok M2 / whole-branch-review MODERATE-1: the REF-side
+                # blob never parsed -- it recorded no link history at all
+                # (the real-world repro: a `type: investigation` record
+                # with no links, broken only by an unquoted colon in its
+                # title) -- and the new blob parses cleanly. This is a
+                # REPAIR, not a history edit: nothing here to freeze, so
+                # it is never an append-only error, only a note.
+                old_reasons = "; ".join(message for _field, message in old_result.diagnostics)
+                notes.append(
+                    f"{full_path}: repaired -- the blob at {ref} could not be safely "
+                    f"parsed ({old_reasons}); the new blob parses cleanly, so there is "
+                    "no recorded link history here to protect"
+                )
+                continue
+            # Both sides unparseable: still fail closed (test_j: malformed
+            # -> malformed is still refused), reported from the OLD side's
+            # diagnostics, same as before this fix.
             for field, message in old_result.diagnostics:
                 errors.append(f"{full_path}: {field}: {message} (at {ref})")
             continue
@@ -1259,6 +1355,15 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
             continue
 
         old_links = old_result.frontmatter.get("links") or []
+
+        # Codex 2 (BLOCKING): a duplicate link id on EITHER side already
+        # made that side's own ParseResult invalid above (memidx.
+        # validate_record_shape's own diagnostic -- the one typed-parse
+        # gate this function's old_result.valid/new_result.valid checks
+        # already go through), so a file with a duplicate id never
+        # reaches this point at all: it is refused above, naming the id,
+        # via that shared diagnostic rather than a second copy of the
+        # same check here.
         new_links_by_id = {
             str(l.get("link")): l
             for l in (new_result.frontmatter.get("links") or [])
@@ -1278,7 +1383,7 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
             elif new_link != old_link:
                 errors.extend(_link_diff_errors(full_path, lid, old_link, new_link))
 
-    return errors, changed
+    return errors, changed, notes
 
 
 def parse_argv(argv: list[str]) -> tuple[str | None, list[str], str | None]:
@@ -1344,22 +1449,35 @@ Append-only history mode (a second, independent check -- given
 --against-ref, this runs INSTEAD of the schema rules above, never both):
 
   --against-ref REF  compare every topic file's links now against what they
-                     were at REF (a commit-ish git understands). A link
-                     present at REF must be unchanged; a link removed, or a
-                     topic file deleted or renamed, is an error. New links,
-                     and changes to current/title/tags/code_refs/the body,
-                     are free. Exit 1 on any append-only error; exit 2 if
+                     were at REF (a commit-ish git understands). Without
+                     --staged (the default), "now" means the WORKING TREE;
+                     with --staged, it means the INDEX -- what `git commit`
+                     would actually commit. A link's body present at REF
+                     must be unchanged; its three lifecycle fields --
+                     status, superseded_by, promoted_by -- may each move
+                     forward once. A link removed, or a topic file deleted
+                     or renamed, is an error. New links, and changes to
+                     current/title/tags/code_refs/the body text outside a
+                     link, are free. A REF that never parsed is repaired
+                     (a note, not an error) when the new side now parses
+                     cleanly -- there is no recorded link history to
+                     freeze on a blob that was never validly a record.
+                     REF must not start with "-" (it would otherwise
+                     swallow the next flag, e.g. --staged, as if it were
+                     the ref). --code-root is rejected together with
+                     --against-ref (append-only mode never uses a code
+                     root). Exit 1 on any append-only error; exit 2 if
                      ROOT is not inside a git repository or REF does not
                      resolve to a commit.
   --staged           compare REF to the INDEX (what `git commit` would
-                     actually commit) instead of the working tree -- the
-                     default with --against-ref and no --staged.
+                     actually commit) instead of the working tree (the
+                     default).
 
 Rule reference: docs/SCHEMA.md sections 7 and 8.4; the complete table of what
 this linter checks is in docs/INTERNALS.md (memlint section)."""
 
 
-def _extract_against_ref_flags(argv: list[str]) -> tuple[list[str], str | None, bool, bool]:
+def _extract_against_ref_flags(argv: list[str]) -> tuple[list[str], str | None, bool, bool, str | None]:
     """Pulls --against-ref REF and --staged out of argv before the
     remainder reaches parse_argv unchanged -- parse_argv's own 3-tuple
     contract (and the tests that call it directly) stays exactly as it
@@ -1372,37 +1490,58 @@ def _extract_against_ref_flags(argv: list[str]) -> tuple[list[str], str | None, 
     discarded, so `main()` fell through to the ORDINARY schema-lint mode
     instead of refusing the malformed invocation -- a mistyped
     `memlint.py ROOT --against-ref` used to exit 0 printing `memlint: clean`,
-    never mentioning the missing REF."""
+    never mentioning the missing REF.
+
+    The fifth return value, `dash_ref`, is the flag-shaped token
+    immediately following `--against-ref` when it was refused as a REF
+    (Grok M8): `--against-ref --staged HEAD` used to swallow the literal
+    string "--staged" as REF (a GitError trying to resolve ref
+    '--staged'), silently discarding the real --staged flag that followed
+    it. A token starting with "-" is never consumed as REF -- it is left
+    in place so the NEXT loop iteration still recognizes it as its own
+    flag -- and `against_ref` stays None so main()'s "--against-ref
+    requires REF" refusal fires, now naming the flag-shaped token it
+    refused instead of silently misreading it."""
     rest: list[str] = []
     against_ref = None
     staged = False
     saw_against_ref = False
+    dash_ref = None
     i = 0
     while i < len(argv):
         a = argv[i]
         if a == "--against-ref":
             saw_against_ref = True
+            if i + 1 < len(argv):
+                candidate = argv[i + 1]
+                if candidate.startswith("-"):
+                    dash_ref = candidate
+                else:
+                    against_ref = candidate
+                    i += 1
             i += 1
-            if i < len(argv):
-                against_ref = argv[i]
-        elif a == "--staged":
+            continue
+        if a == "--staged":
             staged = True
-        else:
-            rest.append(a)
+            i += 1
+            continue
+        rest.append(a)
         i += 1
-    return rest, against_ref, staged, saw_against_ref
+    return rest, against_ref, staged, saw_against_ref, dash_ref
 
 
 def _run_append_only(root_str: str, ref: str, staged: bool) -> int:
     root = Path(root_str).resolve()
     try:
-        errors, changed = check_append_only(root, ref, staged)
+        errors, changed, notes = check_append_only(root, ref, staged)
     except GitError as exc:
         print(f"memlint: {exc}", file=sys.stderr)
         return 2
     except Exception as exc:  # never a bare traceback -- spec test (j)/(i)
         print(f"memlint: unexpected failure checking append-only history: {exc}", file=sys.stderr)
         return 2
+    for n in notes:
+        print(f"NOTE: {n}")
     for e in errors:
         print(f"ERROR: {e}")
     print(f"memlint: append-only against {ref}: changed={changed} errors={len(errors)}")
@@ -1417,9 +1556,16 @@ def main(argv=None) -> int:
     if "-h" in argv or "--help" in argv:
         print(USAGE)
         return 0
-    rest, against_ref, staged, saw_against_ref = _extract_against_ref_flags(argv)
+    rest, against_ref, staged, saw_against_ref, dash_ref = _extract_against_ref_flags(argv)
     if saw_against_ref and against_ref is None:
-        print("--against-ref requires REF", file=sys.stderr)
+        if dash_ref is not None:
+            print(
+                f"--against-ref REF must not start with '-' ({dash_ref!r} looks like "
+                "another option, not a ref) -- reorder the flags",
+                file=sys.stderr,
+            )
+        else:
+            print("--against-ref requires REF", file=sys.stderr)
         print(USAGE, file=sys.stderr)
         return 2
     if staged and against_ref is None:
@@ -1435,6 +1581,18 @@ def main(argv=None) -> int:
         print(USAGE, file=sys.stderr)
         return 2
     if against_ref is not None:
+        if code_root_strs:
+            # NIT-3 (whole-branch-review): silently ignoring --code-root
+            # here used to let `memlint.py --against-ref HEAD STORE
+            # --code-root DIR` exit 0 running only the append-only pass,
+            # with no sign the flag did nothing -- rejected instead.
+            print(
+                "--code-root is rejected together with --against-ref "
+                "(append-only mode never uses a code root)",
+                file=sys.stderr,
+            )
+            print(USAGE, file=sys.stderr)
+            return 2
         return _run_append_only(root_str, against_ref, staged)
     root = Path(root_str).resolve()
     # Dedupe by resolved path, preserving first-seen order: `--code-root A

@@ -1855,6 +1855,16 @@ class TestRuling80EmbeddingFailureFailsOpen(unittest.TestCase):
 
 
 class TestF3TrustModel(unittest.TestCase):
+    # Fix wave 1 G1 (Codex 2): the second link used to share id "L1" with
+    # the first, deliberately, as one more of the "five simultaneous
+    # violations" this fixture packs in -- but a duplicate link id is now
+    # its OWN dedicated, whole-record-quarantining diagnostic (memidx.
+    # validate_record_shape), which makes this record invalid and short-
+    # circuits lint_file to that ONE diagnostic before any of the other
+    # four checks below ever run (see TestDuplicateLinkIdShapeDiagnostic
+    # for that check's own dedicated coverage). Renamed to "L2" so this
+    # fixture still proves five INDEPENDENT schema violations fire
+    # together, undisturbed by the duplicate-id short-circuit.
     SYNTHETIC_TOPIC = """---
 type: topic
 id: TOP-9100
@@ -1867,7 +1877,7 @@ links:
     alternatives:
       - {option: "o", rejected_because: "b", authority: also-not-real}
     invariant: {kind: not-a-real-kind, pattern: "("}
-  - link: L1
+  - link: L2
     status: active
     ruling: {text: "dup", authority: owner-verbatim, source: s}
     reverses: L99
@@ -3292,6 +3302,46 @@ class TestMalformedRecordQuarantine(unittest.TestCase):
             diagnostics = json.loads(rows[0]["diagnostics"])
             fields = [d[0] for d in diagnostics]
             self.assertIn("links[0].link", fields, diagnostics)
+
+    # -- scenario 3b: a duplicate link id -- quarantined, never last-wins indexed
+
+    def test_duplicate_link_id_is_quarantined_not_last_wins_indexed(self):
+        """Codex 2 (BLOCKING, fix wave 1 G1): a topic with two links
+        sharing id "L2" (one agent-inference, one owner-verbatim) used to
+        parse as VALID -- build_record's own link-embedding pass and any
+        id-keyed dict elsewhere would each silently keep a DIFFERENT
+        occurrence, so the searchable index could carry different content
+        than a human reading the raw file sees first. It must now be
+        quarantined entirely (never indexed under either reading)."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            _write_record(
+                root / "topics" / "bad.md",
+                "---\nid: TOP-9108\ntype: topic\ntitle: Bad\nlinks:\n"
+                '  - link: L2\n    status: active\n    ruling: {text: "a", authority: agent-inference}\n'
+                '  - link: L2\n    status: active\n    ruling: {text: "b", authority: owner-verbatim, source: s}\n'
+                "---\nBody.\n",
+            )
+            db = Path(td) / "idx.sqlite"
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf), contextlib.redirect_stdout(io.StringIO()):
+                rc = reindex(root, db, no_embed=True)
+            self.assertEqual(rc, 0, err_buf.getvalue())
+            self.assertNotIn("Traceback", err_buf.getvalue())
+            rows = self._index_errors_rows(db)
+            self.assertEqual(len(rows), 1, rows)
+            diagnostics = json.loads(rows[0]["diagnostics"])
+            fields = [d[0] for d in diagnostics]
+            self.assertIn("links", fields, diagnostics)
+            messages = [d[1] for d in diagnostics]
+            self.assertTrue(any("duplicate link id 'L2'" in m for m in messages), diagnostics)
+
+            conn = sqlite3.connect(str(db))
+            try:
+                link_rows = conn.execute("SELECT * FROM links WHERE link = 'L2'").fetchall()
+            finally:
+                conn.close()
+            self.assertEqual(link_rows, [], "a quarantined record's links must never be indexed at all")
 
     # -- scenario 4: unreadable file / non-UTF-8 file -- quarantined naming "file"
 

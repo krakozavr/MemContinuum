@@ -862,6 +862,25 @@ class TestMalformedRecordDiagnostics(unittest.TestCase):
             errors, _warnings = memlint.lint_root(root)
             self.assertTrue(any("links[0].link" in e for e in errors), errors)
 
+    def test_duplicate_link_id_within_one_topic_is_an_error(self):
+        """Codex 2 (BLOCKING): schema mode errors on two links sharing one
+        id within one topic (memidx.validate_record_shape's own
+        diagnostic, surfaced here as an ordinary ERROR: line, exactly like
+        every other malformed-record diagnostic in this class)."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _write(
+                root / "topics" / "bad.md",
+                "---\nid: TOP-9207\ntype: topic\ntitle: Bad\nlinks:\n"
+                '  - link: L2\n    status: active\n    ruling: {text: "a", authority: agent-inference}\n'
+                '  - link: L2\n    status: active\n    ruling: {text: "b", authority: owner-verbatim, source: s}\n'
+                "---\nBody.\n",
+            )
+            errors, _warnings = memlint.lint_root(root)
+            self.assertTrue(any("duplicate link id 'L2'" in e for e in errors), errors)
+            rc = memlint.main([str(root)])
+            self.assertEqual(rc, 1)
+
     def test_unreadable_and_non_utf8_files_are_errors_naming_file_never_traceback(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1355,6 +1374,179 @@ class TestMemlintAgainstRef(unittest.TestCase):
             rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
             self.assertEqual(rc, 1, out)
             self.assertIn("foo.md", out)
+
+    def test_k_dash_prefixed_ref_is_rejected_not_swallowed_as_ref(self):
+        """Grok M8: `--against-ref --staged HEAD` used to hand git the
+        literal ref '--staged' (a GitError), silently discarding the real
+        --staged flag that followed. The dash-shaped token must never be
+        consumed as REF."""
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = memlint.main(["--against-ref", "--staged", "HEAD", str(root)])
+            self.assertEqual(rc, 2, buf_out.getvalue() + buf_err.getvalue())
+            self.assertIn("--against-ref", buf_err.getvalue())
+            self.assertNotIn("memlint: clean", buf_out.getvalue())
+
+    def test_k_code_root_rejected_under_against_ref(self):
+        """NIT-3 (whole-branch-review): --code-root used to be silently
+        ignored under --against-ref (accepted, ran only the append-only
+        pass, rc=0) -- now rejected with a message naming the conflict."""
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            code_root = Path(td) / "code"; code_root.mkdir()
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = memlint.main(
+                    ["--against-ref", "HEAD", str(root), "--code-root", str(code_root)]
+                )
+            self.assertEqual(rc, 2, buf_out.getvalue() + buf_err.getvalue())
+            self.assertIn("--code-root", buf_err.getvalue())
+            self.assertIn("--against-ref", buf_err.getvalue())
+
+    def test_l_duplicate_link_id_on_old_side_is_refused_naming_the_id(self):
+        """Codex 2 (BLOCKING): a duplicate link id must refuse comparison
+        (naming the id, rc 1) rather than silently comparing whichever
+        occurrence a dict comprehension happens to keep."""
+        dup_base = (
+            "---\ntype: topic\nid: TOP-1\ntitle: T\nlinks:\n"
+            '  - link: L2\n    date: "2024-01-01"\n    status: active\n'
+            '    ruling: {text: "first", authority: agent-inference}\n'
+            '  - link: L2\n    date: "2024-01-02"\n    status: active\n'
+            '    ruling: {text: "second", authority: owner-verbatim, source: s}\n'
+            "---\n\nBody.\n"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = self._store_with_base_text(td, dup_base)
+            (root / "topics" / "foo.md").write_text(dup_base.replace("Body.", "Body edited."))
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("duplicate link id 'L2'", out)
+
+    def test_l_duplicate_link_id_on_new_side_is_refused_naming_the_id(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)  # TOP_L1_L2, clean ids L1/L2
+            dup_text = TOPIC_L1_L2.replace("link: L1", "link: L2", 1)
+            (root / "topics" / "foo.md").write_text(dup_text)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("duplicate link id 'L2'", out)
+
+    def test_m_investigation_record_repair_is_not_blocked_at_all(self):
+        """Grok M2 / whole-branch-review MODERATE-1, the real repro: a
+        partner store's own commit that fixed an unquoted colon in a
+        `type: investigation` record's title (no links at all -- there is no
+        recorded link history for append-only to protect). _is_topic_like
+        now recognizes the recovered `type: investigation` and treats it
+        as out of scope for this mechanism entirely -- not even a note,
+        since there was never anything here to repair FROM this
+        mechanism's point of view."""
+        with tempfile.TemporaryDirectory() as td:
+            root = _git_store(td)
+            (root / "investigations").mkdir()
+            (root / "investigations" / "gate.md").write_text(
+                "---\ntitle: broken: colon\ntype: investigation\nid: INV-9300\n---\nBody.\n"
+            )
+            _commit_all(root, "base (malformed title, unquoted colon)")
+            (root / "investigations" / "gate.md").write_text(
+                "---\ntitle: 'fixed: colon'\ntype: investigation\nid: INV-9300\n---\nBody.\n"
+            )
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 0, out)
+            self.assertNotIn("ERROR:", out)
+
+    def test_m_repair_of_a_broken_topic_that_now_parses_is_a_note_not_an_error(self):
+        """The topic-kind analogue: a genuinely topic-shaped record (kind
+        recovers as "topic" via the lenient fallback, same shape test_j
+        already uses) that never parsed at REF IS topic-relevant, so the
+        repair path actually runs -- a note, never an error, once the new
+        blob parses cleanly."""
+        with tempfile.TemporaryDirectory() as td:
+            root = _git_store(td)
+            (root / "topics").mkdir()
+            (root / "topics" / "bad.md").write_text(
+                "---\ntype: topic\nid: TOP-9301\nlinks: [\n---\nBody.\n"
+            )
+            _commit_all(root, "base (malformed)")
+            (root / "topics" / "bad.md").write_text(
+                "---\ntype: topic\nid: TOP-9301\ntitle: Fixed\nlinks: []\n---\nBody.\n"
+            )
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 0, out)
+            self.assertIn("NOTE:", out)
+            self.assertIn("repaired", out)
+            self.assertNotIn("ERROR:", out)
+
+    def test_m_deleted_record_with_nothing_recoverable_is_reported_as_record_not_topic(self):
+        """Grok N11: when NOTHING at all could be recovered from the old
+        side (an unterminated frontmatter block -- frontmatter stays `{}`,
+        unlike the lenient-fallback cases above, which always recover
+        type/id scalars), the conservative default still treats it as
+        protected (a genuinely corrupted topic must never go silently
+        unprotected), but the message must not claim it was specifically a
+        "topic" when the real kind could not be determined -- "record" is
+        the honest generic label."""
+        with tempfile.TemporaryDirectory() as td:
+            root = _git_store(td)
+            (root / "concepts").mkdir()
+            (root / "concepts" / "c.md").write_text(
+                "---\ntype: concept\nid: CON-9302\ntitle: Something\n"
+                # No closing "---" at all -- parse_record_text's
+                # unterminated-block branch, which never populates fm.
+            )
+            _commit_all(root, "base (malformed concept, no closing ---)")
+            (root / "concepts" / "c.md").unlink()
+            _commit_all(root, "delete it")
+            rc, out = _run_memlint(["--against-ref", "HEAD~1", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("record file deleted", out)
+            self.assertNotIn("topic file deleted", out)
+
+
+class TestQuestionMarkRuleScope(unittest.TestCase):
+    """Ruling 149 / whole-branch-review MODERATE-2: the question-mark rule
+    applies only to links whose status is active or provisional -- a
+    superseded question is history, and append-only forbids rewriting it
+    (so the rule could never be cleared by superseding); the trim set
+    gained `)]}` so a trailing bracket never hides a real question."""
+
+    def _topic(self, status: str, text: str) -> str:
+        return (
+            "---\ntype: topic\nid: TOP-9400\ntitle: T\nlinks:\n"
+            f"  - link: L1\n    status: {status}\n    kind: adopted\n"
+            f'    ruling: {{text: "{text}", authority: owner-verbatim, source: s}}\n'
+            + ("    superseded_by: L2\n" if status == "superseded" else "")
+            + ("  - link: L2\n    status: active\n    kind: adopted\n"
+               '    ruling: {text: "a real ruling", authority: owner-verbatim, source: s}\n'
+               if status == "superseded" else "")
+            + "---\n\nBody.\n"
+        )
+
+    def _lint(self, text):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _write(root / "topics" / "t.md", text)
+            return memlint.lint_root(root)
+
+    def test_active_question_mark_is_an_error(self):
+        errors, _ = self._lint(self._topic("active", "should we do X?"))
+        self.assertTrue(any("question, not a ruling" in e for e in errors), errors)
+
+    def test_provisional_question_mark_is_an_error(self):
+        errors, _ = self._lint(self._topic("provisional", "should we do X?"))
+        self.assertTrue(any("question, not a ruling" in e for e in errors), errors)
+
+    def test_superseded_question_mark_is_clean(self):
+        """A superseded link is history -- flagging it can never be
+        cleared (append-only forbids rewriting a superseded link's own
+        body), so the rule must not fire on it at all."""
+        errors, _ = self._lint(self._topic("superseded", "should we do X instead?"))
+        self.assertFalse(any("question, not a ruling" in e for e in errors), errors)
+
+    def test_trailing_bracket_after_question_mark_is_still_caught(self):
+        errors, _ = self._lint(self._topic("active", "does this affect decisionmaking?)"))
+        self.assertTrue(any("question, not a ruling" in e for e in errors), errors)
 
 
 def _marker_topic(tid: str, code_refs: list, link_yaml: str, area: str = "memory") -> str:

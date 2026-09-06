@@ -447,6 +447,7 @@ def validate_record_shape(fm: dict) -> list:
         if not isinstance(links, list):
             diagnostics.append(("links", "links must be a list of mappings"))
         else:
+            seen_link_ids: dict[str, int] = {}
             for i, link in enumerate(links):
                 prefix = f"links[{i}]"
                 if not isinstance(link, dict):
@@ -455,6 +456,9 @@ def validate_record_shape(fm: dict) -> list:
                 lid = link.get("link")
                 if lid is None or lid == "" or isinstance(lid, (dict, list)):
                     diagnostics.append((f"{prefix}.link", f"{prefix}.link must be a scalar link id"))
+                else:
+                    lid_key = str(lid)
+                    seen_link_ids[lid_key] = seen_link_ids.get(lid_key, 0) + 1
                 for sub in ("ruling", "rationale", "invariant"):
                     if not _shape_ok_mapping(link.get(sub)):
                         diagnostics.append((f"{prefix}.{sub}", f"{prefix}.{sub} must be a mapping"))
@@ -462,6 +466,22 @@ def validate_record_shape(fm: dict) -> list:
                     subval = link.get(sub)
                     if subval and (not isinstance(subval, list) or any(not isinstance(x, dict) for x in subval)):
                         diagnostics.append((f"{prefix}.{sub}", f"{prefix}.{sub} must be a list of mappings"))
+            # Codex 2 (BLOCKING, fix wave 1 G1): a duplicate link id makes
+            # this record's shape invalid (quarantined by reindex, below
+            # parse_record's own valid computation) rather than silently
+            # indexed -- every downstream consumer that keys links by id
+            # (this file's own link-embedding/indexing pass, memlint's
+            # check_append_only comparison) would otherwise pick whichever
+            # occurrence its own dict comprehension happens to keep,
+            # possibly a DIFFERENT one than a sibling consumer keeps, with
+            # no error anywhere naming the ambiguity.
+            for lid_key, count in seen_link_ids.items():
+                if count > 1:
+                    diagnostics.append((
+                        "links",
+                        f"duplicate link id {lid_key!r} used {count} times -- link ids "
+                        "must be unique per topic",
+                    ))
 
     return diagnostics
 

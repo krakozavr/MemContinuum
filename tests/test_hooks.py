@@ -1767,7 +1767,15 @@ class TestPreCommitAppendOnlyHook(unittest.TestCase):
             HOME=str(tmp), MEMCONTINUUM_HOME=str(home), MEMCONTINUUM_ROOT=str(store),
             MEMCONTINUUM_PROJECT="unborn-proj", MEMCONTINUUM_PYTHON=VENV_PYTHON,
         )
-        proc = subprocess.run([MC_BASH, str(PRE_COMMIT_HOOK)], capture_output=True, text=True, env=env, timeout=10)
+        # cwd=store (fix wave 1 G1, Codex 1): git always invokes a
+        # pre-commit hook with cwd at the repo's own working-tree root --
+        # the hook's own not-the-store guard compares `git rev-parse
+        # --show-toplevel` (no `-C`, reading cwd) against MEMCONTINUUM_ROOT,
+        # so a direct subprocess invocation must reproduce that same cwd
+        # to exercise anything past that guard.
+        proc = subprocess.run(
+            [MC_BASH, str(PRE_COMMIT_HOOK)], capture_output=True, text=True, env=env, timeout=10, cwd=store,
+        )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         log_text = (home / "hook.log").read_text()
         self.assertIn("skipped=unborn-head", log_text)
@@ -1782,7 +1790,10 @@ class TestPreCommitAppendOnlyHook(unittest.TestCase):
             HOME=str(tmp), MEMCONTINUUM_HOME=str(home), MEMCONTINUUM_ROOT=str(store),
             MEMCONTINUUM_PROJECT="nopy-proj", MEMCONTINUUM_PYTHON="/nonexistent/python",
         )
-        proc = subprocess.run([MC_BASH, str(PRE_COMMIT_HOOK)], capture_output=True, text=True, env=env, timeout=10)
+        # cwd=store: see test_unborn_head_skips's comment above.
+        proc = subprocess.run(
+            [MC_BASH, str(PRE_COMMIT_HOOK)], capture_output=True, text=True, env=env, timeout=10, cwd=store,
+        )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         log_text = (home / "hook.log").read_text()
         self.assertIn("skipped=no-python", log_text)
@@ -1800,7 +1811,10 @@ class TestPreCommitAppendOnlyHook(unittest.TestCase):
             HOME=str(tmp), MEMCONTINUUM_HOME=str(home), MEMCONTINUUM_ROOT=str(store),
             MEMCONTINUUM_PROJECT="clean-proj", MEMCONTINUUM_PYTHON=VENV_PYTHON,
         )
-        proc = subprocess.run([MC_BASH, str(PRE_COMMIT_HOOK)], capture_output=True, text=True, env=env, timeout=15)
+        # cwd=store: see test_unborn_head_skips's comment above.
+        proc = subprocess.run(
+            [MC_BASH, str(PRE_COMMIT_HOOK)], capture_output=True, text=True, env=env, timeout=15, cwd=store,
+        )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         log_text = (home / "hook.log").read_text()
         self.assertIn("pre-commit-append-only: rc=0", log_text)
@@ -1820,7 +1834,10 @@ class TestPreCommitAppendOnlyHook(unittest.TestCase):
             HOME=str(tmp), MEMCONTINUUM_HOME=str(home), MEMCONTINUUM_ROOT=str(store),
             MEMCONTINUUM_PROJECT="bad-proj", MEMCONTINUUM_PYTHON=VENV_PYTHON,
         )
-        proc = subprocess.run([MC_BASH, str(PRE_COMMIT_HOOK)], capture_output=True, text=True, env=env, timeout=15)
+        # cwd=store: see test_unborn_head_skips's comment above.
+        proc = subprocess.run(
+            [MC_BASH, str(PRE_COMMIT_HOOK)], capture_output=True, text=True, env=env, timeout=15, cwd=store,
+        )
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
         self.assertIn("changed after being recorded", proc.stderr)
         log_text = (home / "hook.log").read_text()

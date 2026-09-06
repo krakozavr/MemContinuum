@@ -693,6 +693,64 @@ class TestPreCommitForeignHook(unittest.TestCase):
         finally:
             shutil.rmtree(home, ignore_errors=True)
 
+    def test_pre_commit_with_extra_lines_around_a_real_exec_line_is_still_foreign(self):
+        """Codex 6 (fix wave 1 G1): the old identity check was a
+        single-line regex match ANYWHERE in the file (`grep -qE "^exec
+        bash .*SCRIPT\\$"`), so a hand-authored wrapper that added its
+        OWN lines around a real `exec bash .../pre-commit-append-only.sh`
+        line (a local policy check before deferring to the canonical
+        script) still matched that one line and was misclassified as
+        "ours" -- silently overwritten, losing the added policy. The
+        check is now the COMPLETE generated shape (exactly five lines);
+        one extra line makes it foreign."""
+        home = sandbox_home()
+        try:
+            store = str(Path(home) / "store")
+            os.makedirs(store)
+            subprocess.run(["git", "init", "-q", store], check=True)
+            topics = Path(store) / "topics"
+            topics.mkdir()
+            (topics / "existing.md").write_text(
+                "---\ntype: topic\nid: TOP-9503\ntitle: existing\narea: test\n---\nBody\n"
+            )
+            subprocess.run(
+                ["git", "-C", store, "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+                 "add", "-A"], check=True,
+            )
+            subprocess.run(
+                ["git", "-C", store, "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+                 "commit", "-q", "-m", "seed"], check=True,
+            )
+            hooks_dir = Path(store) / ".git" / "hooks"
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            hooks_scripts_dir = TOOLS_DIR / "hooks"
+            foreign_text = (
+                "#!/usr/bin/env bash\n"
+                "echo custom local policy check first\n"
+                "export MEMCONTINUUM_ROOT=/somewhere\n"
+                "export MEMCONTINUUM_PROJECT=p\n"
+                "export MEMCONTINUUM_PYTHON=/usr/bin/python3\n"
+                f"exec bash {hooks_scripts_dir}/pre-commit-append-only.sh\n"
+            )
+            foreign = hooks_dir / "pre-commit"
+            foreign.write_text(foreign_text)
+            foreign.chmod(0o755)
+
+            proc = run_install(
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude")],
+                home,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(
+                foreign.read_text(), foreign_text,
+                "a wrapper with an extra line around a real exec line must still be "
+                "classified as foreign, never regenerated",
+            )
+            self.assertIn("SKIPPED", proc.stdout)
+            self.assertIn("foreign", proc.stdout.lower())
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
     def test_no_pre_commit_at_all_still_gets_one(self):
         home = sandbox_home()
         try:
@@ -772,6 +830,115 @@ class TestPostCommitForeignHook(unittest.TestCase):
             post_commit = Path(store) / ".git" / "hooks" / "post-commit"
             self.assertTrue(post_commit.is_file())
             self.assertIn("post-commit-reindex.sh", post_commit.read_text())
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestSharedHooksPathRefusal(unittest.TestCase):
+    """Codex 1 (BLOCKING, fix wave 1 G1): a store whose git hooks resolve
+    OUTSIDE its own .git (a global or shared core.hooksPath) must never
+    get the pre-commit/post-commit wrappers installed there -- that would
+    make the append-only guard fire for every OTHER repository sharing
+    that hooks directory, not only this store."""
+
+    def _seeded_store_with_shared_hookspath(self, home):
+        store = str(Path(home) / "store")
+        os.makedirs(store)
+        subprocess.run(["git", "init", "-q", store], check=True)
+        topics = Path(store) / "topics"
+        topics.mkdir()
+        (topics / "existing.md").write_text(
+            "---\ntype: topic\nid: TOP-9504\ntitle: existing\narea: test\n---\nBody\n"
+        )
+        subprocess.run(
+            ["git", "-C", store, "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+             "add", "-A"], check=True,
+        )
+        subprocess.run(
+            ["git", "-C", store, "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+             "commit", "-q", "-m", "seed"], check=True,
+        )
+        shared_hooks = Path(home) / "shared-hooks"
+        shared_hooks.mkdir()
+        subprocess.run(
+            ["git", "-C", store, "config", "--local", "core.hooksPath", str(shared_hooks)],
+            check=True,
+        )
+        return store, shared_hooks
+
+    def test_shared_hooks_path_refuses_installation_with_a_note(self):
+        home = sandbox_home()
+        try:
+            store, shared_hooks = self._seeded_store_with_shared_hookspath(home)
+            proc = run_install(
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude")],
+                home,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertFalse((shared_hooks / "pre-commit").exists())
+            self.assertFalse((shared_hooks / "post-commit").exists())
+            combined = proc.stdout + proc.stderr
+            self.assertIn("core.hooksPath", combined)
+            self.assertIn("SKIPPED", proc.stdout)
+            self.assertIn("--store-hooks-dir", combined)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_a_wrapper_invoked_from_another_repository_never_blocks_its_commit(self):
+        """Even setting the shared-hooksPath refusal aside, the wrapper
+        itself must never block an UNRELATED repo's commit if it somehow
+        ends up invoked there (hooks/pre-commit-append-only.sh's own
+        runtime not-the-store guard) -- reproduced directly against the
+        real hook script, not through repo-init.sh's own refusal above."""
+        home = sandbox_home()
+        try:
+            store, _shared_hooks = self._seeded_store_with_shared_hookspath(home)
+            # An unrelated ordinary code repo, sharing nothing with `store`
+            # except (hypothetically) the same hooks directory a shared
+            # core.hooksPath might have pointed both at.
+            other_repo = Path(home) / "other-repo"
+            other_repo.mkdir()
+            subprocess.run(["git", "init", "-q", str(other_repo)], check=True)
+            subprocess.run(
+                ["git", "-C", str(other_repo), "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+                 "commit", "--allow-empty", "-q", "-m", "seed"], check=True,
+            )
+            (other_repo / "file.txt").write_text("hello\n")
+            subprocess.run(["git", "-C", str(other_repo), "add", "-A"], check=True)
+
+            hook_script = TOOLS_DIR / "hooks" / "pre-commit-append-only.sh"
+            env = dict(os.environ)
+            env["MEMCONTINUUM_ROOT"] = store  # a DIFFERENT repo than other_repo
+            env["MEMCONTINUUM_PROJECT"] = "p"
+            env["MEMCONTINUUM_PYTHON"] = VENV_PYTHON
+            env["MEMCONTINUUM_HOME"] = str(Path(home) / ".memcontinuum")
+            proc = subprocess.run(
+                ["bash", str(hook_script)],
+                cwd=str(other_repo), capture_output=True, text=True, env=env, timeout=30,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            # The positive half of this test: rc=0 alone is also what the
+            # guard-less fallthrough path would produce (the seeded store
+            # has nothing staged, so an unguarded hook would just find it
+            # clean) -- the guard is only proven to have actually FIRED by
+            # the hook.log line it writes instead of running memlint at
+            # all.
+            hook_log = Path(env["MEMCONTINUUM_HOME"]) / "hook.log"
+            log_text = hook_log.read_text() if hook_log.exists() else ""
+            self.assertIn("skipped=not-the-store", log_text, log_text)
+            self.assertNotIn("changed=", log_text, log_text)
+            commit = subprocess.run(
+                ["git", "-C", str(other_repo), "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+                 "commit", "-q", "-m", "ordinary commit"],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(commit.returncode, 0, commit.stdout + commit.stderr)
+            log = subprocess.run(
+                ["git", "-C", str(other_repo), "log", "--oneline"],
+                capture_output=True, text=True, check=True,
+            )
+            self.assertIn("ordinary commit", log.stdout)
         finally:
             shutil.rmtree(home, ignore_errors=True)
 
