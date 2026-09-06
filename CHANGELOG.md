@@ -239,13 +239,17 @@
   different checkouts sharing one (`client-a/app`, `client-b/app`) used to
   collapse onto the identical store and silently share it. The installer
   now checks whether the plain name already belongs to a different checkout
-  or project (`decisions.tsv`'s own `store=` field when a row exists, else
-  the rendered store `README.md`'s project name) before handing it out a
-  second time; when it does, the checkout's own parent directory name
-  disambiguates it instead (`<parent>-<repo>-MemContinuum-Store`), and when
-  even that name is already taken, the installer refuses (exit 17) rather
-  than guess a third name or adopt a foreign store. A same-checkout re-run,
-  even under a renamed `--project`, still lands on the plain name unchanged.
+  or project before handing it out a second time: `decisions.tsv`'s own
+  `store=` field when a row exists, else the store's own rendered
+  `<!-- memcontinuum-checkout: PATH -->` marker (stamped at store-creation
+  time) compared against the checkout's physical path, else, only when
+  neither has anything to say, the rendered `README.md`'s project name. When
+  it does, the checkout's own parent directory name disambiguates it instead
+  (`<parent>-<repo>-MemContinuum-Store`), and when even that name is already
+  taken, the installer refuses (exit 17) rather than guess a third name or
+  adopt a foreign store. A same-checkout re-run, even under a renamed
+  `--project`, still lands on the plain name unchanged -- now true even with
+  no `--record-decision` row at all, via the checkout marker.
 
 ### Documentation
 - The README, `docs/DESIGN.md`, and `docs/INTERNALS.md` now say plainly

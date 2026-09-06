@@ -743,7 +743,11 @@ class TestStatsFlags(StatsTestBase):
         self.write_log(lines)
         store = self.git_store(commit_dates=[NOW - timedelta(days=400)])
 
-        id_pattern = re.compile(r"INC-\d{4}|TOP-\d{4}")
+        # G9: TOP-\d+, not TOP-\d{4} -- no fixed digit count is enforced on
+        # a topic id anywhere in this store (SCHEMA.md's own running example
+        # is `id: TOP-42`, two digits), so a fixed-width check here could
+        # itself miss a real, shorter id leaking into a flag line.
+        id_pattern = re.compile(r"INC-\d{4}|TOP-\d+")
 
         rc, out = run_stats_json(home=str(self.home), store=str(store))
         self.assertEqual(len(out["flags"]), 2)

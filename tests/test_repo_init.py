@@ -1832,12 +1832,15 @@ class TestMcDefaultStoreForCollisions(unittest.TestCase):
         return store, why, refused_why, int(rc)
 
     @staticmethod
-    def _make_marked_store(path, project_name):
+    def _make_marked_store(path, project_name, checkout=None):
         path = Path(path)
         path.mkdir(parents=True)
         subprocess.run(["git", "init", "-q", str(path)], check=True)
+        checkout_stamp = checkout if checkout is not None else "unknown"
         (path / "README.md").write_text(
-            f"# {project_name} Rationale store\n\nThis is MemContinuum's Rationale graph.\n"
+            f"# {project_name} Rationale store\n\n"
+            f"<!-- memcontinuum-checkout: {checkout_stamp} -->\n\n"
+            "This is MemContinuum's Rationale graph.\n"
         )
 
     @staticmethod
@@ -1860,6 +1863,41 @@ class TestMcDefaultStoreForCollisions(unittest.TestCase):
         self.assertEqual(refused_why, "")
         self.assertEqual(store, f"{home}/dev/client-b-app-MemContinuum-Store")
         self.assertIn("already belongs to a different checkout or project", why)
+
+    def test_checkout_marker_disambiguates_even_with_same_project_name_and_no_registry_row(self):
+        """G9 (the G5 residual): the SAME --project value, no decisions.tsv
+        row at all -- mc_store_project_identity alone would read this as
+        "ours". The store's own rendered checkout marker (mc_store_
+        checkout_identity), naming a DIFFERENT physical checkout, must still
+        disambiguate."""
+        home = Path(self.td) / "home"
+        (home / "dev").mkdir(parents=True)
+        plain = home / "dev" / "app-MemContinuum-Store"
+        self._make_marked_store(plain, "shared-name", checkout="/some/other/checkout/app")
+        store, why, refused_why, rc = self._call("/mnt/c/Users/client-b/app", "shared-name", str(home))
+        self.assertEqual(rc, 0)
+        self.assertEqual(refused_why, "")
+        self.assertEqual(store, f"{home}/dev/client-b-app-MemContinuum-Store")
+        self.assertIn("already belongs to a different checkout or project", why)
+
+    def test_checkout_marker_matching_this_checkout_wins_over_a_mismatched_project_name(self):
+        """The checkout marker is checked BEFORE the project-name fallback
+        (priority order in mc_store_belongs_elsewhere's own docstring): a
+        same-checkout re-run under a RENAMED --project must still land on
+        the plain name, the same guarantee the registry-row test above
+        gives for the --record-decision case, now also true with no
+        registry row at all."""
+        home = Path(self.td) / "home"
+        (home / "dev").mkdir(parents=True)
+        checkout = home / "mnt-stand-in" / "app"
+        checkout.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+        plain = home / "dev" / "app-MemContinuum-Store"
+        self._make_marked_store(plain, "renamed-project", checkout=str(checkout))
+        store, why, refused_why, rc = self._call(str(checkout), "mine", str(home))
+        self.assertEqual(rc, 0)
+        self.assertEqual(refused_why, "")
+        self.assertEqual(store, str(plain))
 
     def test_registry_row_for_a_different_checkout_disambiguates_even_with_same_project_name(self):
         """The registry is authoritative when it speaks (advisor
@@ -2062,6 +2100,59 @@ class TestDefaultStoreOnWindowsMountedCheckout(unittest.TestCase):
             self.assertIn(f"defaulting to {disambiguated}", proc_b.stdout)
             self.assertIn("already belongs to a different checkout or project", proc_b.stdout)
             # never silently adopted the first checkout's store
+            self.assertNotIn(f"defaulting to {home_r}/dev/app-MemContinuum-Store", proc_b.stdout)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_g_same_project_name_across_two_checkouts_still_disambiguates(self):
+        """G9 (the G5 residual, whole-branch-review Codex 5 follow-up): the
+        exact pair test_f's own project-name check alone cannot tell apart
+        -- two DIFFERENT checkouts sharing a basename ("app") AND the
+        IDENTICAL --project value, neither ever run through
+        --record-decision. mc_store_project_identity alone would read the
+        second as "ours" (the project name matches by construction); the
+        store's own rendered checkout marker (mc_store_checkout_identity)
+        must still tell them apart by physical path."""
+        home = sandbox_home()
+        try:
+            (Path(home) / "dev").mkdir()
+
+            client_a = Path(home) / "client-a" / "app"
+            client_a.mkdir(parents=True)
+            subprocess.run(["git", "init", "-q", "."], cwd=client_a, check=True)
+            subprocess.run(
+                ["git", "-c", "user.email=a@b.c", "-c", "user.name=a",
+                 "commit", "-q", "--allow-empty", "-m", "init"],
+                cwd=client_a, check=True,
+            )
+            proc_a = run_install(
+                ["--project", "shared", "--non-interactive"],
+                home, cwd=str(client_a),
+                extra_env={"MEMCONTINUUM_TEST_WSL_MOUNT": "1"},
+            )
+            self.assertEqual(proc_a.returncode, 0, proc_a.stdout + proc_a.stderr)
+            home_r = os.path.realpath(home)
+            client_a_r = os.path.realpath(str(client_a))
+            plain_store = Path(home_r) / "dev" / "app-MemContinuum-Store"
+            self.assertTrue(plain_store.is_dir(), "first install did not create the plain-named store")
+            readme = (plain_store / "README.md").read_text()
+            self.assertEqual(readme.splitlines()[0], "# shared Rationale store")
+            self.assertIn(f"<!-- memcontinuum-checkout: {client_a_r} -->", readme)
+
+            client_b = Path(home) / "client-b" / "app"
+            client_b.mkdir(parents=True)
+            subprocess.run(["git", "init", "-q", "."], cwd=client_b, check=True)
+            proc_b = run_install(
+                ["--project", "shared", "--dry-run"],
+                home, cwd=str(client_b),
+                extra_env={"MEMCONTINUUM_TEST_WSL_MOUNT": "1"},
+            )
+            self.assertEqual(proc_b.returncode, 0, proc_b.stdout + proc_b.stderr)
+            disambiguated = f"{home_r}/dev/client-b-app-MemContinuum-Store"
+            self.assertIn(f"defaulting to {disambiguated}", proc_b.stdout)
+            self.assertIn("already belongs to a different checkout or project", proc_b.stdout)
+            # never silently adopted client-a's store just because the
+            # project name happens to match
             self.assertNotIn(f"defaulting to {home_r}/dev/app-MemContinuum-Store", proc_b.stdout)
         finally:
             shutil.rmtree(home, ignore_errors=True)

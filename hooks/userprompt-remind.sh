@@ -560,7 +560,14 @@ print(d.get("reason_code", "") if isinstance(d, dict) else "")
 import json, os, re, subprocess
 from pathlib import Path
 
-TOP_RE = re.compile(r"TOP-\d{4}")
+
+# G9 (Codex 16 class carried into this hook): TOP-\\d+, not TOP-\\d{4} --
+# SCHEMA.md own running example topic is id: TOP-42, two digits, and no
+# fixed digit count is enforced on id: anywhere else in this store,
+# matching memlint.py own decision-marker regex (fix wave 1 G2). A commit
+# naming a genuinely shorter or longer id used to read as naming no
+# decision at all and got wrongly nudged.
+TOP_RE = re.compile(r"TOP-\d+")
 
 code_heads = {}
 for _line in (os.environ.get("MC_CODE_HEADS") or "").splitlines():

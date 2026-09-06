@@ -1161,8 +1161,23 @@ else
             fi
         done
 
+        # G5 residual (whole-branch-review Codex 5 follow-up, TOP-0109 L5):
+        # the WSL-disk default's own identity check (mc_store_belongs_
+        # elsewhere, scripts/mc-registry-lib.sh) used to have no signal that
+        # survives two checkouts sharing a basename AND a --project value
+        # with neither ever run through --record-decision -- the store's
+        # own README named only the project, which matches by construction.
+        # Stamping the checkout's own physical path here, unconditionally,
+        # at store-creation time, gives that check an unambiguous identity
+        # to compare against regardless of --project. CWD_TOPLEVEL is only
+        # ever set inside the "no --store given" branch above (${..:-} for
+        # the explicit-store case, where no one checkout owns this install).
+        CHECKOUT_STAMP="${CWD_TOPLEVEL:-}"
+        [ -n "$CHECKOUT_STAMP" ] || CHECKOUT_STAMP="unknown"
+
         README_TMPL="$(cat "$TEMPLATES_DIR/store-README.md.tmpl")"
         README_TMPL="${README_TMPL//\{\{PROJECT\}\}/$PROJECT}"
+        README_TMPL="${README_TMPL//\{\{CHECKOUT_STAMP\}\}/$CHECKOUT_STAMP}"
         README_TMPL="${README_TMPL//\{\{STORE\}\}/$STORE}"
         README_TMPL="${README_TMPL//\{\{PYTHON\}\}/$PYTHON_BIN}"
         README_TMPL="${README_TMPL//\{\{ENGINE_DIR\}\}/$ENGINE_ROOT}"

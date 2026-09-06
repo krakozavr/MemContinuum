@@ -428,13 +428,24 @@ room than a help line.
   for the first checkout that ever wants it (never disambiguated
   preemptively); `mc_store_belongs_elsewhere` (same file) then checks
   whether an EXISTING marked store at that path already belongs to a
-  different checkout or project before handing out a name a second time —
-  `decisions.tsv`'s own `store=` field, keyed by `mc_repo_key`, when a row
-  exists (authoritative either way, self or foreign, since it is the one
-  signal a same-checkout re-run under a renamed `--project` cannot fool);
-  otherwise the rendered store `README.md`'s first line (the project name
-  templates/store-README.md.tmpl stamps there) compared against this run's
-  `--project`. When the plain name is already someone else's, the checkout's
+  different checkout or project before handing out a name a second time,
+  three signals in priority order: `decisions.tsv`'s own `store=` field,
+  keyed by `mc_repo_key`, when a row exists (authoritative either way, self
+  or foreign, since it is the one signal a same-checkout re-run under a
+  renamed `--project` cannot fool); otherwise the rendered store
+  `README.md`'s own `<!-- memcontinuum-checkout: PATH -->` marker
+  (`mc_store_checkout_identity`, stamped at store-creation time with the
+  checkout's physical path, never rewritten on a re-run) compared physically
+  against this run's checkout — an unambiguous path comparison a shared
+  `--project` value cannot fool either, closing the one gap the registry and
+  project-name signals alone left open (two checkouts sharing a basename
+  AND a `--project` value, neither ever run through `--record-decision`);
+  only when NEITHER of those has anything to say (an older store from before
+  this marker existed, or a hand-authored README) does the rendered
+  `README.md`'s first line (the project name templates/store-README.md.tmpl
+  stamps there) compared against this run's `--project` decide it — the
+  weakest of the three, since two checkouts can legitimately share a
+  `--project` value by coincidence. When the plain name is already someone else's, the checkout's
   own parent directory name disambiguates it instead
   (`<parent>-<repo>-MemContinuum-Store`); when that name is ALSO already
   someone else's, the installer refuses (exit 17) and asks for an explicit

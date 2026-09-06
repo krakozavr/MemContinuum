@@ -3645,6 +3645,32 @@ class TestUserPromptCommitNudge(HookTestBase):
         state = self.load_state(session_id)
         self.assertEqual(state["last_seen_heads"][str(self.code_root)], new_sha)
 
+    def test_commit_naming_a_decision_with_a_short_id_is_not_nudged(self):
+        """G9 (Codex 16's class, carried into this hook): SCHEMA.md's own
+        running example topic is `id: TOP-42`, two digits -- no fixed digit
+        count is enforced on `id:` anywhere else in this store, matching
+        memlint.py's own decision-marker regex (`TOP-\\d+`, fixed in fix wave
+        1 G2). This hook's own TOP_RE used to require exactly four digits,
+        so a commit naming a genuinely shorter (or longer) id read as naming
+        NO decision at all and got wrongly nudged."""
+        session_id = "s-nudge-c2"
+        start_sha = git_head(self.code_root)
+        self._seed_last_seen(session_id, {str(self.code_root): start_sha})
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+
+        new_sha = self._commit(self.code_root, "TOP-42 L1 names its own decision")
+
+        proc, _ = run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertNotIn("outcome=commit-nudge", log_text)
+        if proc.stdout.strip():
+            ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+            self.assertNotIn("names no decision", ctx)
+
+        state = self.load_state(session_id)
+        self.assertEqual(state["last_seen_heads"][str(self.code_root)], new_sha)
+
     def test_commit_with_no_unmapped_edits_is_not_nudged_but_last_seen_advances(self):
         session_id = "s-nudge-d"
         start_sha = git_head(self.code_root)

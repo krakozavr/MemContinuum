@@ -536,6 +536,44 @@ mc_store_project_identity() {
     return 1
 }
 
+# mc_store_checkout_identity STORE
+#
+# G5 residual (fix wave 1 G9, whole-branch-review Codex 5 follow-up): reads
+# STORE/README.md for the "memcontinuum-checkout: PATH" marker
+# scripts/repo-init.sh stamps at store-CREATION time (never rewritten on a
+# re-run -- the README render is write-if-absent), and, when found and not
+# the "unknown" placeholder (an explicit --store given from a cwd with no
+# git checkout of its own), sets MC_STORE_CHECKOUT to PATH and returns 0.
+# This is the one signal mc_store_project_identity's own PROJECT-name
+# comparison could never carry: an unambiguous physical checkout path, so
+# two DIFFERENT checkouts sharing a basename AND a --project value (neither
+# ever run through --record-decision, so the registry has nothing to say
+# either) still read as distinct, rather than the second one being read as
+# "ours" purely because the project name happens to match.
+#
+# Returns 1 (MC_STORE_CHECKOUT cleared) when the file is missing, carries no
+# such marker at all (a hand-authored README, or a store this fix predates),
+# or the marker is the "unknown" placeholder -- every one of those is
+# "identity unknown", not a mismatch, so callers must fall back to
+# mc_store_project_identity rather than treat an absent marker as foreign.
+mc_store_checkout_identity() {
+    local store="$1" line
+    MC_STORE_CHECKOUT=""
+    [ -f "$store/README.md" ] || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            "<!-- memcontinuum-checkout: "*" -->")
+                line="${line#<!-- memcontinuum-checkout: }"
+                line="${line% -->}"
+                [ -n "$line" ] && [ "$line" != "unknown" ] || return 1
+                MC_STORE_CHECKOUT="$line"
+                return 0
+                ;;
+        esac
+    done < "$store/README.md"
+    return 1
+}
+
 # mc_registry_owner_of_store DECISIONS_FILE STORE_PHYSICAL SELF_KEY
 #
 # Reverse lookup decisions.tsv (forward lookup, by KEY, already exists as
@@ -595,22 +633,29 @@ mc_registry_owner_of_store() {
 # True iff CANDIDATE already exists as a marked store (mc_is_marked_store)
 # belonging to a checkout or project OTHER than CHECKOUT/PROJECT -- the
 # guard mc_default_store_for below needs before it can silently hand out a
-# path shared by unrelated checkouts. Two signals, registry first:
+# path shared by unrelated checkouts. Three signals, most authoritative
+# first:
 #   1. decisions.tsv's own store= field (mc_registry_owner_of_store), keyed
 #      by CHECKOUT's own repo identity (mc_repo_key) -- authoritative when a
 #      row exists for this exact store path, self or foreign, and only then.
-#   2. Only when the registry has nothing to say about CANDIDATE at all: the
-#      rendered store README's project name (mc_store_project_identity)
-#      compared against PROJECT. This is the common case, since
-#      --record-decision is optional and most installs never run it.
+#   2. Only when the registry has nothing to say: the rendered store
+#      README's own checkout marker (mc_store_checkout_identity, fix wave 1
+#      G9) compared PHYSICALLY against CHECKOUT -- an unambiguous path
+#      comparison, unlike PROJECT, so two checkouts sharing a basename AND a
+#      --project value still read as distinct (the G5 residual this closes).
+#   3. Only when NEITHER of the above has anything to say (an older store
+#      that predates the checkout marker, or a hand-authored README): the
+#      rendered PROJECT name (mc_store_project_identity) compared against
+#      PROJECT -- the weakest signal, since two checkouts CAN legitimately
+#      share a --project value by coincidence.
 # Returns 1 (does not belong elsewhere) when CANDIDATE does not exist yet,
 # is not a marked store, PROJECT is empty (identity unknowable -- an older
 # caller, or a direct unit test, that never had a project to compare), or
-# neither signal disagrees with us. Never fails open into a false positive:
-# an unknown identity is treated as "not elsewhere", same as before this
+# no signal disagrees with us. Never fails open into a false positive: an
+# unknown identity is treated as "not elsewhere", same as before this
 # function existed.
 mc_store_belongs_elsewhere() {
-    local candidate="$1" checkout="$2" project="$3" phys decisions self_key
+    local candidate="$1" checkout="$2" project="$3" phys decisions self_key checkout_phys
     [ -e "$candidate" ] || return 1
     mc_is_marked_store "$candidate" || return 1
     phys="$(mc_physical "$candidate")"
@@ -620,6 +665,11 @@ mc_store_belongs_elsewhere() {
     mc_repo_key "$checkout" && self_key="$MC_REPO_KEY"
     if mc_registry_owner_of_store "$decisions" "$phys" "$self_key"; then
         [ "$MC_REGISTRY_STORE_OWNER" = "self" ] && return 1
+        return 0
+    fi
+    if mc_store_checkout_identity "$candidate"; then
+        checkout_phys="$(mc_physical "$checkout")"
+        [ "$MC_STORE_CHECKOUT" = "$checkout_phys" ] && return 1
         return 0
     fi
     [ -n "$project" ] || return 1
