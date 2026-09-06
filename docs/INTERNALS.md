@@ -414,6 +414,26 @@ room than a help line.
   bare `$HOME/<repo>-MemContinuum-Store` — printing one line naming why.
   `--claude-dir` is unaffected (see above); an explicit `--store` always wins
   and skips this rule entirely, on WSL or anywhere else.
+- **The WSL-disk name is disambiguated, or refused, rather than silently
+  shared, when it already belongs to someone else**: the plain name keys
+  only on the checkout's basename, so two different checkouts sharing one
+  (`client-a/app`, `client-b/app`) used to collapse onto the identical
+  default. `mc_default_store_for` now tries the plain name first, unchanged,
+  for the first checkout that ever wants it (never disambiguated
+  preemptively); `mc_store_belongs_elsewhere` (same file) then checks
+  whether an EXISTING marked store at that path already belongs to a
+  different checkout or project before handing out a name a second time —
+  `decisions.tsv`'s own `store=` field, keyed by `mc_repo_key`, when a row
+  exists (authoritative either way, self or foreign, since it is the one
+  signal a same-checkout re-run under a renamed `--project` cannot fool);
+  otherwise the rendered store `README.md`'s first line (the project name
+  templates/store-README.md.tmpl stamps there) compared against this run's
+  `--project`. When the plain name is already someone else's, the checkout's
+  own parent directory name disambiguates it instead
+  (`<parent>-<repo>-MemContinuum-Store`); when that name is ALSO already
+  someone else's, the installer refuses (exit 17) and asks for an explicit
+  `--store DIR --claude-dir DIR` rather than guess a third name or adopt a
+  foreign store.
 - **An existing git repo at `--store` carrying none of this tool's markers is
   refused** (exit 9) — markers being a `topics/`, `incidents/` or `concepts/`
   directory, or a `README.md` mentioning MemContinuum. A mistyped `--store`

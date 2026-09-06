@@ -248,7 +248,13 @@ that is not a git repo. On a checkout physically on a Windows-mounted drive
 under WSL, where a store walk costs seconds rather than milliseconds, the
 default instead lands on the WSL disk — `$HOME/dev/<repo>-MemContinuum-Store`,
 or bare `$HOME/<repo>-MemContinuum-Store` when `$HOME/dev` does not exist —
-and the installer prints one line saying why.
+and the installer prints one line saying why. That name is keyed on the
+checkout's basename alone, so two different checkouts sharing one (two
+clients both named `app`, say) never silently share it: when the plain name
+already belongs to a different checkout or project, the checkout's own
+parent directory disambiguates it instead (`<parent>-<repo>-MemContinuum-
+Store`); when even that name is already taken, the installer refuses and
+asks for an explicit `--store` rather than guess a third name.
 
 `--code-root DIR` (repeatable) is the code checkout
 whose edits should trigger retrieval; omit it entirely for a rationale-only

@@ -255,6 +255,11 @@ Exit codes (0 on success, including a --dry-run preview that hit no refusal):
   16  <claude-dir>/skills/memory-search/SKILL.md already exists and was
       not rendered by this installer (foreign or hand-authored) -- refused
       before any mutation, never overwritten, same as 14.
+  17  no --store was given, the checkout is on a Windows-mounted drive
+      under WSL, and the computed default (plain, and its parent-
+      disambiguated fallback) already belongs to a different checkout's
+      or project's store -- refusing to guess a third name or silently
+      share it; pass --store explicitly.
 USAGE
 }
 
@@ -605,7 +610,9 @@ done
 if [ -z "$STORE" ]; then
     CWD_TOPLEVEL="$(git rev-parse --show-toplevel 2>/dev/null || true)"
     if [ -n "$CWD_TOPLEVEL" ]; then
-        mc_default_store_for "$CWD_TOPLEVEL"
+        if ! mc_default_store_for "$CWD_TOPLEVEL" "$PROJECT"; then
+            fail "the default store for this checkout already belongs to a different checkout or project ($MC_DEFAULT_STORE_REFUSED_WHY) -- refusing to adopt or rewrite it. Pass --store DIR --claude-dir DIR to choose a location explicitly." 17
+        fi
         STORE="$MC_DEFAULT_STORE"
         [ -n "$MC_DEFAULT_STORE_WHY" ] && echo "note: $MC_DEFAULT_STORE_WHY"
         # A defaulted store must not drag --claude-dir's own default
