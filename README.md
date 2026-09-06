@@ -393,6 +393,12 @@ exit instead of reporting success, and internal errors are named by reason
 rather than folded into a bare "something went wrong". Run any command with
 `--help` for its full flag list.
 
+A constraint or hold ruling can also be mirrored at its bound symbol with a
+`decision: TOP-xxxx Ln` comment — the linter checks both ways with
+`--code-root`: a marker naming a decision the store does not carry (or one
+that is not a constraint or hold) is an error, and a constraint whose symbol
+carries no marker yet is a warning.
+
 **Keeping a wired repo up to date.** A fix that only touches a script (a hook,
 `memidx.py`, `memlint.py`) reaches every wired repo the moment you pull —
 nothing to run. A fix that changes what gets *rendered* into a repo (the hook

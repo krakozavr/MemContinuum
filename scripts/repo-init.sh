@@ -299,6 +299,62 @@ git_hooks_dir_for() {
     esac
 }
 
+# install_store_hook_wrapper NAME SCRIPT -- writes <STORE_HOOKS_DIR>/NAME as
+# a wrapper exporting MEMCONTINUUM_ROOT/PROJECT/PYTHON and `exec`ing
+# <HOOKS_DIR>/SCRIPT by absolute path (so an edit to SCRIPT needs no
+# reinstall). A2-1 review finding M2: post-commit's and pre-commit's wrapper
+# generation used to be two hand-copied blocks (same shape: identity grep,
+# `step` message, printf heredoc, chmod +x) differing only in the hook name
+# and target script -- factored into this one call, so a third store git
+# hook never repeats the pattern (or its own status-var/log-message pair,
+# which used to be free to drift out of sync by hand) a third time.
+#
+# Foreign-hook refusal (fix round 1, TOP-0122 L3 -- both hooks now share
+# it): a NAME already present at $STORE_HOOKS_DIR that this installer did
+# not render is left untouched and reported, never silently overwritten;
+# absent entirely, or present and ours (possibly stale), it is written/
+# regenerated. Identity is anchored on the wrapper's own `exec` line naming
+# SCRIPT (N2 -- not a substring match anywhere in the file, which would
+# misclassify a hand-authored hook that merely MENTIONS the canonical
+# script's name, e.g. in a comment, as "ours" and silently regenerate it).
+#
+# Sets two globals the caller reads afterward, named from NAME (`tr`, not
+# `${NAME^^}` -- this script runs under real bash 3.2, tests/run_bash32.sh):
+# POST_COMMIT/POST_COMMIT_STATUS for NAME=post-commit, PRE_COMMIT/
+# PRE_COMMIT_STATUS for NAME=pre-commit. The step/log label ("reindex" /
+# "append-only") is derived from SCRIPT by stripping the "<NAME>-" prefix
+# and ".sh" suffix, so the two log messages cannot drift out of sync by
+# hand either.
+install_store_hook_wrapper() {
+    local name="$1" script="$2"
+    local varbase label hookpath escaped_script
+    varbase="$(printf '%s' "$name" | tr 'a-z-' 'A-Z_')"
+    label="${script#"$name"-}"
+    label="${label%.sh}"
+    hookpath="$STORE_HOOKS_DIR/$name"
+    escaped_script="${script//./\\.}"
+
+    if [ -f "$hookpath" ] && ! grep -qE "^exec bash .*${escaped_script}\$" "$hookpath" 2>/dev/null; then
+        printf -v "${varbase}_STATUS" '%s' "skipped-foreign"
+        step "git $name $label wrapper: SKIPPED -- $hookpath already exists and was not rendered by this installer (foreign or hand-authored); move it aside first if you want repo-init to install one here"
+    else
+        printf -v "${varbase}_STATUS" '%s' "written"
+        step "git $name $label wrapper: $hookpath -> $HOOKS_DIR/$script"
+        if [ "$DRY_RUN" -eq 0 ]; then
+            mkdir -p "$STORE_HOOKS_DIR" || fail "could not create $STORE_HOOKS_DIR"
+            {
+                printf '#!/usr/bin/env bash\n'
+                printf 'export MEMCONTINUUM_ROOT=%s\n' "$(printf '%q' "$STORE")"
+                printf 'export MEMCONTINUUM_PROJECT=%s\n' "$(printf '%q' "$PROJECT")"
+                printf 'export MEMCONTINUUM_PYTHON=%s\n' "$(printf '%q' "$PYTHON_BIN")"
+                printf 'exec bash %s\n' "$(printf '%q' "$HOOKS_DIR/$script")"
+            } > "$hookpath" || fail "could not write $hookpath"
+            chmod +x "$hookpath" || fail "could not chmod $hookpath"
+        fi
+    fi
+    printf -v "$varbase" '%s' "$hookpath"
+}
+
 # resolve_python -- prints an absolute python path on stdout and returns 0,
 # or returns 1 with nothing printed. Order (README.md "Requirements",
 # hooks/memlib.sh): $MEMCONTINUUM_PYTHON env, then the MEMCONTINUUM_PYTHON
@@ -1406,27 +1462,8 @@ if is_git_repo "$STORE"; then
     # post-commit this installer did not render is left ALONE and
     # reported, never silently clobbered, closing the asymmetry the
     # previous round's own report flagged (post-commit used to be
-    # overwritten unconditionally on every run, no check at all). Identity
-    # is the wrapper's own `exec` line naming hooks/post-commit-reindex.sh.
-    POST_COMMIT="$STORE_HOOKS_DIR/post-commit"
-    POST_COMMIT_STATUS="written"
-    if [ -f "$POST_COMMIT" ] && ! grep -q "hooks/post-commit-reindex.sh" "$POST_COMMIT" 2>/dev/null; then
-        POST_COMMIT_STATUS="skipped-foreign"
-        step "git post-commit reindex wrapper: SKIPPED -- $POST_COMMIT already exists and was not rendered by this installer (foreign or hand-authored); move it aside first if you want repo-init to install one here"
-    else
-        step "git post-commit reindex wrapper: $POST_COMMIT -> $HOOKS_DIR/post-commit-reindex.sh"
-        if [ "$DRY_RUN" -eq 0 ]; then
-            mkdir -p "$STORE_HOOKS_DIR" || fail "could not create $STORE_HOOKS_DIR"
-            {
-                printf '#!/usr/bin/env bash\n'
-                printf 'export MEMCONTINUUM_ROOT=%s\n' "$(printf '%q' "$STORE")"
-                printf 'export MEMCONTINUUM_PROJECT=%s\n' "$(printf '%q' "$PROJECT")"
-                printf 'export MEMCONTINUUM_PYTHON=%s\n' "$(printf '%q' "$PYTHON_BIN")"
-                printf 'exec bash %s\n' "$(printf '%q' "$HOOKS_DIR/post-commit-reindex.sh")"
-            } > "$POST_COMMIT" || fail "could not write $POST_COMMIT"
-            chmod +x "$POST_COMMIT" || fail "could not chmod $POST_COMMIT"
-        fi
-    fi
+    # overwritten unconditionally on every run, no check at all).
+    install_store_hook_wrapper post-commit post-commit-reindex.sh
 
     # --- 6b. git pre-commit append-only wrapper ---------------------------
     #
@@ -1439,26 +1476,8 @@ if is_git_repo "$STORE"; then
     # reported (never fatal -- this step runs after the settings merge, so
     # a hard failure here would leave exactly the half-installed state the
     # "refused before any mutation" pattern elsewhere in this file exists
-    # to avoid). Identity is the wrapper's own `exec` line naming
-    # hooks/pre-commit-append-only.sh.
-    PRE_COMMIT="$STORE_HOOKS_DIR/pre-commit"
-    PRE_COMMIT_STATUS="written"
-    if [ -f "$PRE_COMMIT" ] && ! grep -q "hooks/pre-commit-append-only.sh" "$PRE_COMMIT" 2>/dev/null; then
-        PRE_COMMIT_STATUS="skipped-foreign"
-        step "git pre-commit append-only wrapper: SKIPPED -- $PRE_COMMIT already exists and was not rendered by this installer (foreign or hand-authored); move it aside first if you want repo-init to install one here"
-    else
-        step "git pre-commit append-only wrapper: $PRE_COMMIT -> $HOOKS_DIR/pre-commit-append-only.sh"
-        if [ "$DRY_RUN" -eq 0 ]; then
-            {
-                printf '#!/usr/bin/env bash\n'
-                printf 'export MEMCONTINUUM_ROOT=%s\n' "$(printf '%q' "$STORE")"
-                printf 'export MEMCONTINUUM_PROJECT=%s\n' "$(printf '%q' "$PROJECT")"
-                printf 'export MEMCONTINUUM_PYTHON=%s\n' "$(printf '%q' "$PYTHON_BIN")"
-                printf 'exec bash %s\n' "$(printf '%q' "$HOOKS_DIR/pre-commit-append-only.sh")"
-            } > "$PRE_COMMIT" || fail "could not write $PRE_COMMIT"
-            chmod +x "$PRE_COMMIT" || fail "could not chmod $PRE_COMMIT"
-        fi
-    fi
+    # to avoid).
+    install_store_hook_wrapper pre-commit pre-commit-append-only.sh
 fi
 
 # --- 7. reindex + lint --------------------------------------------------

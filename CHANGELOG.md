@@ -62,21 +62,39 @@
   (`ruling`, `rationale`, `alternatives`, `evidence`, `revisit_if`, `edges`,
   `assumptions`, `invariant`, `date`, `kind`, `reverses`,
   `reason_for_change`, `recorded_by`, `recorded_at` -- any diff there is an
-  error naming the field). Two lifecycle fields may move forward only, once:
-  `status` from `active`/`provisional` to `superseded`/`historical`/
-  `declined` (never back, never between the three terminal values), and
+  error naming the field). Three lifecycle fields may move forward only,
+  once: `status` from `active`/`provisional` to `superseded`/`historical`/
+  `declined` (never back, never between the three terminal values),
   `superseded_by` may be added in that same move (never changed afterwards,
-  never present without that status); a lifecycle move bundled with any
-  body edit is an error too, on both fields. A link removed, or a topic
-  file deleted or renamed, is also an error (new links, and changes to
-  `current`, `title`, `tags`, `code_refs`, or the body text, stay free). A
-  new store git `pre-commit` hook (`hooks/pre-commit-append-only.sh`, wired
-  by `scripts/repo-init.sh` alongside `post-commit`, both refusing to
-  overwrite a foreign hook they did not render) runs this on every commit
-  and blocks the ones that fail it -- fail-open on an unborn HEAD, a missing
-  python, or an engine failure, `--no-verify` bypasses it locally, and the
-  same check can run again in CI for a guarantee local bypasses cannot
-  reach.
+  never present without that status), and `promoted_by` may be added with
+  no such status coupling (the promotion procedure names the new link on
+  the old one, whatever the old link's own status); a lifecycle move
+  bundled with any body edit is an error too, on every lifecycle field
+  involved. A link removed, or a topic file deleted or renamed, is also an
+  error (new links, and changes to `current`, `title`, `tags`, `code_refs`,
+  or the body text, stay free). A new store git `pre-commit` hook
+  (`hooks/pre-commit-append-only.sh`, wired by `scripts/repo-init.sh`
+  alongside `post-commit`, both refusing to overwrite a foreign hook they
+  did not render) runs this on every commit and blocks the ones that fail
+  it -- fail-open on an unborn HEAD, a missing python, or an engine
+  failure, `--no-verify` bypasses it locally, and the same check can run
+  again in CI for a guarantee local bypasses cannot reach.
+- `code_refs` now documents its three forms explicitly (a repo-relative path
+  prefix, an fnmatch glob, or `path#symbol`, a qualified symbol name as the
+  chunkers report it) -- retrieval matching is unchanged, but only
+  `path#symbol` entries take part in the new check below. A constraint or
+  hold link may be mirrored at its bound symbol with a `decision:
+  TOP-xxxx Ln` comment -- located through the chunker registry, so the rule
+  is language-agnostic, and skipped with a warning (not an error) for a
+  file whose language has no chunker or whose backend cannot run here.
+  `memlint.py --code-root DIR` now checks the pair both ways: every marker
+  under a code root must name a topic and link that exist, are `active`,
+  and are a CONSTRAINT or HOLD (never a glob or bare-path match -- only an
+  exact `path#symbol` entry counts), else an error naming the file and
+  line; every active CONSTRAINT/HOLD link whose topic carries a `path#symbol`
+  ref must find the marker at that symbol, else a warning (existing stores
+  carry none yet) -- a `path#symbol` the chunker proves absent is an error
+  instead (the ref itself is dangling), not merely a missing marker.
 
 ### Code index
 - The code index's freshness check now compares five stat signals per file

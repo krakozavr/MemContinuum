@@ -1087,6 +1087,39 @@ class TestMemlintAgainstRef(unittest.TestCase):
             self.assertIn("L2", out)
             self.assertIn("superseded_by", out)
 
+    def test_c_promoted_by_added_the_schema_way_is_clean(self):
+        """Ruling 143 (TOP-0122 L1, task A2-2): `promoted_by` is a third
+        forward-once field -- SCHEMA sec5 step 3's literal procedure adds
+        it to the OLD (agent-inference/provisional) link when a NEW
+        owner-ratified link promotes it. Adding it alone (no other field
+        on L1 touched) must be clean, same as a superseded_by add."""
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            text = TOPIC_L1_L2.replace(
+                "    status: historical\n    kind: adopted\n    ruling:\n      text: \"first ruling\"",
+                "    status: historical\n    promoted_by: L2\n    kind: adopted\n    ruling:\n      text: \"first ruling\"",
+            )
+            self.assertNotEqual(text, TOPIC_L1_L2, "fixture edit must actually change the text")
+            (root / "topics" / "foo.md").write_text(text)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 0, out)
+
+    def test_c_promoted_by_changed_after_being_set_is_error(self):
+        """Ruling 143: promoted_by is immutable once set, exactly like
+        superseded_by."""
+        with tempfile.TemporaryDirectory() as td:
+            base = TOPIC_L1_L2.replace(
+                "    status: historical\n    kind: adopted\n    ruling:\n      text: \"first ruling\"",
+                "    status: historical\n    promoted_by: L2\n    kind: adopted\n    ruling:\n      text: \"first ruling\"",
+            )
+            root = self._store_with_base_text(td, base)
+            text = base.replace("promoted_by: L2", "promoted_by: L9")
+            (root / "topics" / "foo.md").write_text(text)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("L1", out)
+            self.assertIn("promoted_by", out)
+
     def test_c_status_change_plus_body_edit_is_error(self):
         """Ruling 142: a lifecycle move must be the ONLY change on a
         recorded link -- combined with a body edit, both the body field
@@ -1184,6 +1217,23 @@ class TestMemlintAgainstRef(unittest.TestCase):
             rc, out = _run_memlint(["--against-ref", "not-a-real-ref-xyz", str(root)])
             self.assertEqual(rc, 2, out)
 
+    def test_i_against_ref_with_no_ref_exits_2(self):
+        """A2-1 review finding L1: `--against-ref` at the end of argv (no
+        REF token follows) used to leave `against_ref` None and fall
+        through to the ORDINARY schema-lint mode instead of refusing --
+        `memlint.py ROOT --against-ref` exited 0 printing `memlint: clean`,
+        never mentioning the missing REF. Now exits 2 with a usage
+        message, same as every other malformed invocation."""
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = memlint.main([str(root), "--against-ref"])
+            self.assertEqual(rc, 2, buf_out.getvalue() + buf_err.getvalue())
+            self.assertIn("--against-ref", buf_err.getvalue())
+            self.assertIn("usage:", buf_err.getvalue())
+            self.assertNotIn("memlint: clean", buf_out.getvalue())
+
     def test_j_malformed_frontmatter_old_side_is_diagnostic_not_traceback(self):
         with tempfile.TemporaryDirectory() as td:
             root = _git_store(td)
@@ -1211,6 +1261,206 @@ class TestMemlintAgainstRef(unittest.TestCase):
             rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
             self.assertEqual(rc, 1, out)
             self.assertIn("foo.md", out)
+
+
+def _marker_topic(tid: str, code_refs: list, link_yaml: str, area: str = "memory") -> str:
+    """A minimal topic record for marker-verification tests: one topic id,
+    a code_refs list (any mix of forms), and caller-supplied link YAML
+    (already indented as `links:` entries)."""
+    refs_block = "".join(f"  - {r}\n" for r in code_refs)
+    code_refs_yaml = f"code_refs:\n{refs_block}" if code_refs else ""
+    return (
+        "---\n"
+        "type: topic\n"
+        f"id: {tid}\n"
+        f"title: Fixture -- {tid}\n"
+        f"area: {area}\n"
+        f"{code_refs_yaml}"
+        "links:\n"
+        f"{link_yaml}"
+        "---\n\nBody.\n"
+    )
+
+
+_CONSTRAINT_LINK_L1 = (
+    "  - link: L1\n"
+    "    date: '2026-01-01'\n"
+    "    status: active\n"
+    "    kind: adopted\n"
+    "    ruling:\n"
+    '      text: "the constraint"\n'
+    "      authority: owner-verbatim\n"
+    '      source: "s"\n'
+)
+
+_CONTEXT_LINK_L1 = (
+    "  - link: L1\n"
+    "    date: '2026-01-01'\n"
+    "    status: active\n"
+    "    kind: adopted\n"
+    "    ruling:\n"
+    '      text: "an inference, no evidence"\n'
+    "      authority: agent-inference\n"
+)
+
+
+class TestMemlintDecisionMarkers(unittest.TestCase):
+    """Task A2-2 (TOP-0122 L1 rule 2b): `decision: TOP-xxxx Ln` comments
+    verified both ways. Each test builds its own throwaway store + code
+    tree (never fixtures/ or the engine's own store)."""
+
+    def _lint(self, topic_files: dict, code_files: dict, code_roots=None):
+        with tempfile.TemporaryDirectory() as td_str:
+            td = Path(td_str)
+            root = td / "store"
+            (root / "topics").mkdir(parents=True)
+            for name, text in topic_files.items():
+                (root / "topics" / name).write_text(text)
+            code_root = td / "code"
+            code_root.mkdir()
+            for rel, text in code_files.items():
+                p = code_root / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(text)
+            roots = code_roots if code_roots is not None else [code_root]
+            return memlint.lint_root(root, code_roots=roots)
+
+    # (a) constraint link, marker present and matching -> clean.
+    def test_a_marker_matching_a_constraint_link_is_clean(self):
+        topic = _marker_topic("TOP-0042", ["src/x.py#alpha"], _CONSTRAINT_LINK_L1)
+        code = {"src/x.py": "# decision: TOP-0042 L1\ndef alpha():\n    return 1\n"}
+        errors, warnings = self._lint({"t.md": topic}, code)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(warnings, [], warnings)
+
+    # (b) same, marker absent -> warning, no error.
+    def test_b_marker_absent_is_a_warning_not_an_error(self):
+        topic = _marker_topic("TOP-0042", ["src/x.py#alpha"], _CONSTRAINT_LINK_L1)
+        code = {"src/x.py": "def alpha():\n    return 1\n"}
+        errors, warnings = self._lint({"t.md": topic}, code)
+        self.assertEqual(errors, [], errors)
+        self.assertTrue(
+            any("no marker at src/x.py#alpha" in w for w in warnings), warnings
+        )
+
+    # (c) marker pointing at a non-existent link -> error.
+    def test_c_marker_at_nonexistent_link_is_error(self):
+        topic = _marker_topic("TOP-0042", ["src/x.py#alpha"], _CONSTRAINT_LINK_L1)
+        code = {"src/x.py": "# decision: TOP-0042 L99\ndef alpha():\n    return 1\n"}
+        errors, _warnings = self._lint({"t.md": topic}, code)
+        self.assertTrue(
+            any("TOP-0042" in e and "L99" in e and "no such link" in e for e in errors), errors
+        )
+
+    # (c) marker pointing at a CONTEXT-only link -> error.
+    def test_c_marker_at_context_only_link_is_error(self):
+        topic = _marker_topic("TOP-0042", ["src/x.py#alpha"], _CONTEXT_LINK_L1)
+        code = {"src/x.py": "# decision: TOP-0042 L1\ndef alpha():\n    return 1\n"}
+        errors, _warnings = self._lint({"t.md": topic}, code)
+        self.assertTrue(
+            any("TOP-0042" in e and "L1" in e and "CONTEXT" in e for e in errors), errors
+        )
+
+    # (c) marker pointing at a topic whose code_refs do not name the file -> error.
+    def test_c_marker_at_topic_whose_code_refs_do_not_name_the_file_is_error(self):
+        topic_a = _marker_topic("TOP-0042", ["src/x.py#alpha"], _CONSTRAINT_LINK_L1)
+        topic_b = _marker_topic("TOP-0043", ["other/file.py"], _CONSTRAINT_LINK_L1)
+        code = {"src/x.py": "# decision: TOP-0043 L1\ndef alpha():\n    return 1\n"}
+        errors, _warnings = self._lint({"a.md": topic_a, "b.md": topic_b}, code)
+        self.assertTrue(
+            any(
+                "TOP-0043" in e and "L1" in e and "code_refs do not name" in e
+                for e in errors
+            ),
+            errors,
+        )
+
+    # (d) a marker at a symbol under a glob-only ref -> error naming globs.
+    def test_d_marker_under_glob_only_ref_is_error_naming_globs(self):
+        topic = _marker_topic("TOP-0044", ["src/*.py"], _CONSTRAINT_LINK_L1)
+        code = {"src/x.py": "# decision: TOP-0044 L1\ndef alpha():\n    return 1\n"}
+        errors, _warnings = self._lint({"t.md": topic}, code)
+        hit = [e for e in errors if "TOP-0044" in e and "L1" in e]
+        self.assertTrue(hit, errors)
+        self.assertIn("never marker-verified", hit[0])
+
+    # (e) a dangling path#symbol -> error.
+    def test_e_dangling_path_symbol_is_error(self):
+        topic = _marker_topic("TOP-0045", ["src/x.py#missing_symbol"], _CONSTRAINT_LINK_L1)
+        code = {"src/x.py": "def alpha():\n    return 1\n"}
+        errors, _warnings = self._lint({"t.md": topic}, code)
+        self.assertTrue(
+            any(
+                "TOP-0045" in e and "L1" in e and "dangling" in e and "missing_symbol" in e
+                for e in errors
+            ),
+            errors,
+        )
+
+    # (f) a language without a chunker -> warning, no traceback.
+    def test_f_language_without_a_chunker_is_warning_not_traceback(self):
+        topic = _marker_topic("TOP-0046", ["src/x.rb#thing"], _CONSTRAINT_LINK_L1)
+        code = {"src/x.rb": "# decision: TOP-0046 L1\ndef thing\nend\n"}
+        errors, warnings = self._lint({"t.md": topic}, code)
+        self.assertEqual(errors, [], errors)
+        self.assertTrue(
+            any("markers not checked" in w and "x.rb" in w for w in warnings), warnings
+        )
+
+    # (g) two roots -- the ref resolved against the right one.
+    def test_g_two_roots_ref_resolved_against_the_right_one(self):
+        topic = _marker_topic("TOP-0047", ["thing.py#f"], _CONSTRAINT_LINK_L1)
+        with tempfile.TemporaryDirectory() as td_str:
+            td = Path(td_str)
+            root = td / "store"
+            (root / "topics").mkdir(parents=True)
+            (root / "topics" / "t.md").write_text(topic)
+            root_a = td / "root_a"
+            root_b = td / "root_b"
+            root_a.mkdir()
+            root_b.mkdir()
+            (root_b / "thing.py").write_text(
+                "# decision: TOP-0047 L1\ndef f():\n    return 1\n"
+            )
+            errors, warnings = memlint.lint_root(root, code_roots=[root_a, root_b])
+            self.assertEqual(errors, [], errors)
+            self.assertFalse(
+                any("TOP-0047" in w for w in warnings), warnings
+            )
+
+    # (h) three lines above the definition counts; four does not.
+    def test_h_marker_three_lines_above_counts(self):
+        topic = _marker_topic("TOP-0048", ["src/x.py#alpha"], _CONSTRAINT_LINK_L1)
+        code = {
+            "src/x.py": (
+                "# decision: TOP-0048 L1\n"
+                "# filler 1\n"
+                "# filler 2\n"
+                "def alpha():\n"
+                "    return 1\n"
+            )
+        }
+        errors, warnings = self._lint({"t.md": topic}, code)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(warnings, [], warnings)
+
+    def test_h_marker_four_lines_above_does_not_count(self):
+        topic = _marker_topic("TOP-0048", ["src/x.py#alpha"], _CONSTRAINT_LINK_L1)
+        code = {
+            "src/x.py": (
+                "# decision: TOP-0048 L1\n"
+                "# filler 1\n"
+                "# filler 2\n"
+                "# filler 3\n"
+                "def alpha():\n"
+                "    return 1\n"
+            )
+        }
+        errors, warnings = self._lint({"t.md": topic}, code)
+        self.assertEqual(errors, [], errors)
+        self.assertTrue(
+            any("no marker at src/x.py#alpha" in w for w in warnings), warnings
+        )
 
 
 if __name__ == "__main__":

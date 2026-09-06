@@ -27,6 +27,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import chunkers
+
 from memidx import (
     AUTHORITIES,
     EDGE_RELS,
@@ -35,7 +37,11 @@ from memidx import (
     STATUSES,
     ParseResult,
     code_ref_is_named,
+    code_ref_matches,
     fragment_declaration_status,
+    fragment_matches_symbol,
+    iter_code_files,
+    lang_for_source_file,
     newest_active_link,
     parse_record,
     parse_record_text,
@@ -76,6 +82,14 @@ def _symbol_declaration_status(frag: str, text: str, rel_path: str) -> tuple:
     `remedy` says what to do about that particular one. lint_concept warns
     on None and errors only on False -- see that call site."""
     return fragment_declaration_status(frag, text, rel_path=rel_path)
+
+
+def _is_topic_frontmatter(fm: dict) -> bool:
+    """Whether `fm` belongs to a TOPIC record: `links` present, or an
+    explicit `type: topic`. The one place this predicate is written (A2-1
+    review finding N1 -- it used to be copied three times: here, lint_root's
+    pre-pass, and _is_topic_like's own docstring-acknowledged mirror below)."""
+    return bool(fm.get("links")) or fm.get("type") == "topic"
 
 
 def lint_topic(path: Path, fm: dict) -> tuple[list[str], list[str]]:
@@ -411,7 +425,7 @@ def lint_file(
     if fm.get("type") == "concept":
         errors, more_warnings = lint_concept(path, fm, code_roots or [], body=body, known_topic_ids=known_topic_ids)
     else:
-        is_topic = bool(fm.get("links")) or fm.get("type") == "topic"
+        is_topic = _is_topic_frontmatter(fm)
         if is_topic:
             errors, more_warnings = lint_topic(path, fm)
         else:
@@ -469,7 +483,7 @@ def lint_root(root: Path, code_roots: list[Path] | None = None) -> tuple[list[st
         if not result.valid:
             continue
         fm = result.frontmatter
-        is_topic = bool(fm.get("links")) or fm.get("type") == "topic"
+        is_topic = _is_topic_frontmatter(fm)
         if is_topic:
             tid = fm.get("id") or f.stem
             known_topic_ids.add(str(tid))
@@ -492,6 +506,10 @@ def lint_root(root: Path, code_roots: list[Path] | None = None) -> tuple[list[st
         all_errors.extend(errors)
         all_warnings.extend(warnings)
     all_errors.extend(_duplicate_claim_errors(root))
+    if code_roots:
+        marker_errors, marker_warnings = lint_markers(root, code_roots)
+        all_errors.extend(marker_errors)
+        all_warnings.extend(marker_warnings)
     for rid, files in id_owners.items():
         if len(files) > 1:
             listing = ", ".join(str(f) for f in files)
@@ -511,6 +529,340 @@ def lint_root(root: Path, code_roots: list[Path] | None = None) -> tuple[list[st
                 f"-- `chain {stem}` is ambiguous; give each an explicit id"
             )
     return all_errors, all_warnings
+
+
+# ---------------------------------------------------------------------------
+# Constraint marker comments verified both ways (task A2-2, TOP-0122 L1 rule
+# 2b). SCHEMA sec2/sec8.3: a `decision: TOP-xxxx Ln` comment on a symbol's
+# definition line, or within the three lines above it, mirrors a CONSTRAINT
+# or HOLD link at the code it binds; memlint checks the pair both ways.
+# Rule 1 (SCHEMA sec2): only a `path#symbol` code_refs entry takes part in
+# marker verification -- a bare path or an fnmatch glob keeps serving
+# retrieval (code_ref_matches, unchanged) but names no SYMBOL, so it can
+# never satisfy either direction below.
+#
+# Gated on code_roots exactly like lint_concept's own checks: nothing here
+# is checkable without at least one code root, and lint_root skips this
+# section entirely when none is given. Never runs under --against-ref
+# (check_append_only is a wholly separate mode; see its own module comment).
+# ---------------------------------------------------------------------------
+
+
+_DECISION_MARKER_RE = re.compile(r"decision:\s*(TOP-\d{4})\s+(L\d+)\b")
+
+
+def _find_marker(lines: list[str], start_line: int) -> tuple[str, str, int] | None:
+    """(topic_id, link_id, 1-indexed marker_line) for the first decision
+    marker on `start_line` (a chunk's own definition line, 1-indexed) or
+    within the three lines immediately above it -- spec test (h): three
+    lines above counts, four does not. None when no line in that window
+    matches. The regex is applied to the raw line text regardless of the
+    file's comment syntax (SCHEMA sec8.3: "language-agnostic ... the regex
+    ignores the comment leader")."""
+    lo = max(0, start_line - 4)
+    for lineno, line in enumerate(lines[lo:start_line], start=lo + 1):
+        m = _DECISION_MARKER_RE.search(line)
+        if m:
+            return m.group(1), m.group(2), lineno
+    return None
+
+
+def _link_tier(link: dict) -> str:
+    """"constraint" | "hold" | "context" -- SCHEMA sec3/sec4's citation
+    tiers, for marker verification specifically (task A2-2 rule 3). Not
+    memidx.invariant_enforcement_class: that predicate reads a SQLite row
+    shape (`link_row["ruling_authority"]`, JSON-encoded evidence) and is
+    only ever called on a link that already carries an invariant (drift's
+    own precondition); this reads the raw YAML link dict memlint already
+    parses, and is deliberately NARROWER for agent-inference than that
+    uniform rule (ruling 76) -- SCHEMA sec3's authority table is explicit
+    that agent-inference needs an invariant AND validated evidence to be a
+    HOLD eligible for a marker, not evidence alone."""
+    if link.get("status") != "active":
+        return "context"
+    ruling = link.get("ruling") or {}
+    authority = ruling.get("authority")
+    if authority in ("owner-verbatim", "owner-ratified"):
+        return "constraint"
+    evidence = validated_evidence_list(link.get("evidence"))
+    if authority in ("reviewer-finding", "code-derived") and evidence:
+        return "hold"
+    if authority == "agent-inference" and link.get("invariant") and evidence:
+        return "hold"
+    return "context"
+
+
+def _collect_topics(root: Path) -> dict[str, dict]:
+    """id -> {"path": Path, "fm": dict} for every topic-shaped record under
+    root. A pass of its own (not lint_root's id-collision pre-pass, which
+    only needs bare ids) because marker verification reads each topic's
+    full `links`/`code_refs`."""
+    topics: dict[str, dict] = {}
+    for f in sorted(walk_markdown(root)):
+        result = parse_record(f)
+        if not result.valid:
+            continue
+        fm = result.frontmatter
+        if not _is_topic_frontmatter(fm):
+            continue
+        tid = str(fm.get("id") or f.stem)
+        topics[tid] = {"path": f, "fm": fm}
+    return topics
+
+
+def _root_containing(code_roots: list[Path], rel_path: str) -> Path | None:
+    """The code root that contains `rel_path`, when several are given --
+    longest path first, so a nested root wins over a shallower one that
+    also happens to contain a same-named file (rule 6)."""
+    for root in sorted(code_roots, key=lambda r: -len(str(r))):
+        if (root / rel_path).exists():
+            return root
+    return None
+
+
+def _read_and_chunk(full_path: Path, rel_path: str) -> tuple[str | None, list[dict] | None, str]:
+    """Reads `full_path` and chunks it via the registry. Returns (text,
+    chunks, reason): `chunks` is None when this file could not be attempted
+    at all -- no chunker for its language, the backend cannot run in this
+    python (an optional grammar wheel it lacks), or it ran and could not
+    read THIS file (over the per-file byte cap, or a parse failure) -- the
+    same tri-state memidx.fragment_declaration_status already carries for
+    the single-symbol check, applied here to the whole file's chunk list.
+    `text` is populated whenever the read itself succeeded, even when
+    `chunks` ends up None, so a caller that also needs the tri-state
+    single-symbol predicate (fragment_declaration_status) never has to
+    re-read the file."""
+    try:
+        text = full_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError as exc:
+        return None, None, f"could not read file: {exc}"
+    lang = lang_for_source_file(full_path)
+    if lang is None:
+        return text, None, "no chunker for this file's language"
+    try:
+        backend = chunkers.get_chunker(lang)
+    except chunkers.BackendUnavailable as exc:
+        return text, None, str(exc)
+    except Exception as exc:
+        return text, None, f"{lang}: {type(exc).__name__}: {exc}"
+    try:
+        result = backend.chunk_file(text, rel_path)
+    except Exception as exc:
+        return text, None, f"{lang}: {type(exc).__name__}: {exc}"
+    return text, result.chunks, ""
+
+
+def _scan_set_for_markers(code_roots: list[Path], topics: dict) -> list[tuple[Path, Path, str]]:
+    """[(full_path, containing_root, rel_path)] for every file to scan for
+    decision markers -- rule 4's bounded scan set: a file under any given
+    code root that at least one topic's code_refs names, by ANY form
+    (prefix, glob, or path#symbol -- rule 1 restricts which forms take part
+    in marker VERIFICATION, not which files are worth opening to look for
+    one). Never the whole tree otherwise.
+
+    A file reachable under more than one given root (nested roots) is
+    attributed to the LONGEST (its own, most specific) root only -- roots
+    are walked longest-first and a file's resolved absolute path, once
+    claimed, is never revisited under a shallower root, so its rel_path is
+    never computed against the wrong root."""
+    all_refs = [
+        str(ref)
+        for info in topics.values()
+        for ref in (info["fm"].get("code_refs") or [])
+        if code_ref_is_named(str(ref))
+    ]
+    if not all_refs or not code_roots:
+        return []
+    ordered_roots = sorted(code_roots, key=lambda r: -len(str(r)))
+    claimed: set[Path] = set()
+    out: list[tuple[Path, Path, str]] = []
+    for root in ordered_roots:
+        for full in iter_code_files(root):
+            resolved = full.resolve()
+            if resolved in claimed:
+                continue
+            claimed.add(resolved)
+            try:
+                rel = full.relative_to(root)
+            except ValueError:
+                continue
+            rel_str = str(rel).replace("\\", "/")
+            if any(code_ref_matches(rel_str, ref) for ref in all_refs):
+                out.append((full, root, rel_str))
+    return out
+
+
+def _marker_to_store_errors(
+    full: Path, marker_line: int, topic_id: str, link_id: str,
+    rel_path: str, chunk: dict, topics: dict,
+) -> list[str]:
+    """Rule 4: one found marker, validated against the store. Returns zero
+    or more ERROR strings (no `ERROR:` prefix -- callers add that)."""
+    prefix = f"{full}:{marker_line}: decision marker {topic_id} {link_id}"
+    info = topics.get(topic_id)
+    if info is None:
+        return [f"{prefix}: no such topic {topic_id!r}"]
+    fm = info["fm"]
+    link = next((l for l in fm.get("links") or [] if str(l.get("link")) == link_id), None)
+    if link is None:
+        return [f"{prefix}: no such link {link_id!r} in topic {topic_id}"]
+    if link.get("status") != "active":
+        return [f"{prefix}: link status is {link.get('status')!r}, not active"]
+    if _link_tier(link) == "context":
+        return [
+            f"{prefix}: link is CONTEXT, not CONSTRAINT/HOLD -- "
+            "a marker may only cite a CONSTRAINT or HOLD link"
+        ]
+
+    matched_exact = False
+    matched_any = False
+    for ref in fm.get("code_refs") or []:
+        ref = str(ref)
+        if not code_ref_matches(rel_path, ref):
+            continue
+        _ref_path, has_frag, ref_symbol = ref.partition("#")
+        if has_frag and fragment_matches_symbol(ref_symbol, chunk["symbol"], chunk["qualified_name"]):
+            matched_exact = True
+            break
+        matched_any = True
+    if matched_exact:
+        return []
+    if matched_any:
+        return [
+            f"{prefix}: topic {topic_id}'s code_refs match {rel_path} only via a path/glob ref -- "
+            f"globs (and bare paths) are never marker-verified; add a path#symbol entry for "
+            f"{rel_path}#{chunk['symbol']}"
+        ]
+    return [f"{prefix}: topic {topic_id}'s code_refs do not name {rel_path}"]
+
+
+def _store_to_code_check(
+    tid: str, link_id: str, path_part: str, symbol_part: str,
+    code_roots: list[Path], warned_uncheckable: set, warned_container: set,
+) -> tuple[list[str], list[str]]:
+    """Rule 5, one (topic, active CONSTRAINT/HOLD link, path#symbol ref)
+    triple: locates the symbol and checks for a matching marker. Returns
+    (errors, warnings) -- a dangling ref (the path is missing under every
+    root given, or the chunker proves the symbol absent) is an ERROR; an
+    uncheckable file is a WARNING naming the reason (rule 2), deduped per
+    absolute path across the whole run; a checkable symbol with no marker
+    is the plain WARNING rule 5 names."""
+    errors: list[str] = []
+    warnings: list[str] = []
+    root = _root_containing(code_roots, path_part)
+    if root is None:
+        roots_desc = ", ".join(str(r) for r in code_roots)
+        errors.append(
+            f"{tid}:{link_id}: {path_part}#{symbol_part}: decision ref is dangling -- "
+            f"{path_part!r} does not exist under any code root given ({roots_desc})"
+        )
+        return errors, warnings
+    full = (root / path_part).resolve()
+    text, chunks, reason = _read_and_chunk(full, path_part)
+    if chunks is None:
+        if text is None:
+            errors.append(
+                f"{tid}:{link_id}: {path_part}#{symbol_part}: decision ref is dangling -- "
+                f"{path_part!r} could not be read ({reason})"
+            )
+        elif full not in warned_uncheckable:
+            warned_uncheckable.add(full)
+            warnings.append(f"{full}: markers not checked ({reason})")
+        return errors, warnings
+
+    match = next(
+        (c for c in chunks if fragment_matches_symbol(symbol_part, c["symbol"], c["qualified_name"])),
+        None,
+    )
+    if match is None:
+        # Not a chunk the registry reports -- ask the SAME tri-state
+        # predicate lint_concept already uses (reuse, not a duplicate
+        # existence check, per rule 5's own instruction) to tell a
+        # genuinely dangling ref apart from an uncheckable file apart
+        # from a real symbol chunk_file simply never emits its own chunk
+        # for (a container type: class/struct/enum/... -- SCHEMA sec8.3).
+        verdict, fd_reason, _fd_remedy = fragment_declaration_status(
+            symbol_part, text, rel_path=path_part
+        )
+        if verdict is False:
+            errors.append(
+                f"{tid}:{link_id}: {path_part}#{symbol_part}: decision ref is dangling -- "
+                f"{symbol_part!r} is not declared in {path_part}"
+            )
+        elif verdict is None:
+            if full not in warned_uncheckable:
+                warned_uncheckable.add(full)
+                warnings.append(f"{full}: markers not checked ({fd_reason})")
+        else:
+            key = (full, symbol_part)
+            if key not in warned_container:
+                warned_container.add(key)
+                warnings.append(
+                    f"{full}: markers not checked ({symbol_part!r} is a container type; "
+                    "the chunker reports no start line for it)"
+                )
+        return errors, warnings
+
+    found = _find_marker(text.splitlines(), match["start_line"])
+    if found and found[0] == tid and found[1] == link_id:
+        return errors, warnings
+    warnings.append(f"{tid}:{link_id}: no marker at {path_part}#{symbol_part}")
+    return errors, warnings
+
+
+def lint_markers(root: Path, code_roots: list[Path]) -> tuple[list[str], list[str]]:
+    """Task A2-2 (TOP-0122 L1 rule 2b): constraint/hold decision markers
+    verified both ways -- see the module comment above this section for
+    the rule summary. Skipped entirely when code_roots is empty (like
+    lint_concept, nothing here is checkable without at least one root)."""
+    errors: list[str] = []
+    warnings: list[str] = []
+    if not code_roots:
+        return errors, warnings
+    topics = _collect_topics(root)
+    warned_uncheckable: set[Path] = set()
+    warned_container: set[tuple] = set()
+
+    # direction 1: marker -> store (errors)
+    for full, _file_root, rel_path in _scan_set_for_markers(code_roots, topics):
+        text, chunks, reason = _read_and_chunk(full, rel_path)
+        if chunks is None:
+            if full not in warned_uncheckable:
+                warned_uncheckable.add(full)
+                warnings.append(f"{full}: markers not checked ({reason})")
+            continue
+        lines = text.splitlines()
+        for chunk in chunks:
+            found = _find_marker(lines, chunk["start_line"])
+            if not found:
+                continue
+            topic_id, link_id, marker_line = found
+            errors.extend(
+                _marker_to_store_errors(full, marker_line, topic_id, link_id, rel_path, chunk, topics)
+            )
+
+    # direction 2: store -> code (warnings; a dangling ref is an error)
+    for tid, info in topics.items():
+        fm = info["fm"]
+        for link in fm.get("links") or []:
+            if link.get("status") != "active" or _link_tier(link) not in ("constraint", "hold"):
+                continue
+            link_id = str(link.get("link"))
+            for ref in fm.get("code_refs") or []:
+                ref = str(ref)
+                if not code_ref_is_named(ref):
+                    continue
+                path_part, has_frag, symbol_part = ref.partition("#")
+                if not has_frag:
+                    continue
+                errs, warns = _store_to_code_check(
+                    tid, link_id, path_part, symbol_part, code_roots,
+                    warned_uncheckable, warned_container,
+                )
+                errors.extend(errs)
+                warnings.extend(warns)
+
+    return errors, warnings
 
 
 # ---------------------------------------------------------------------------
@@ -624,39 +976,43 @@ def _is_topic_like(result: ParseResult) -> bool:
     could not be safely parsed, and silently skipping it would let a
     broken-but-canonical record's link history go completely unchecked.
     A record that parsed cleanly is topic-relevant the same way lint_file
-    decides it: `links` present, or an explicit `type: topic`."""
+    decides it (N1: shares _is_topic_frontmatter rather than its own copy)."""
     if not result.valid:
         return True
-    fm = result.frontmatter
-    return bool(fm.get("links")) or fm.get("type") == "topic"
+    return _is_topic_frontmatter(result.frontmatter)
 
 
-# Ruling 142 (TOP-0122 L3, fix round 1): append-only freezes a recorded
-# link's BODY -- every field except these two, which are lifecycle
-# fields allowed to move FORWARD ONLY and ONCE. `status` may move from
-# active/provisional to superseded/historical/declined (never back to
-# active/provisional, never between the three terminal values -- so a
-# provisional record can only ever be PROMOTED by a NEW link per
+# Ruling 142 (TOP-0122 L3, fix round 1) plus ruling 143 (task A2-2): append-
+# only freezes a recorded link's BODY -- every field except these THREE,
+# which are lifecycle fields allowed to move FORWARD ONLY and ONCE. `status`
+# may move from active/provisional to superseded/historical/declined (never
+# back to active/provisional, never between the three terminal values -- so
+# a provisional record can only ever be PROMOTED by a NEW link per
 # docs/SCHEMA.md section 5, never by editing this field to `active`).
 # `superseded_by` may be ADDED once status is (or becomes, in the SAME
 # link) `superseded`; it is immutable once set, and may never be present
-# when status is not `superseded`. `link` (the id) is excluded from the
-# generic body-field diff below for a different reason -- it is the key
-# callers already match old/new links by, so it is definitionally equal
-# and never worth its own diagnostic.
+# when status is not `superseded`. `promoted_by` (ruling 143) may be ADDED
+# once, with no such status coupling -- SCHEMA section 5 step 3: a later
+# owner-ratified link promotes an agent-inference/provisional one by
+# appending a NEW link and adding `promoted_by: L<n>` to the OLD link,
+# whatever its own status; it is immutable once set, exactly like
+# `superseded_by`. `link` (the id) is excluded from the generic body-field
+# diff below for a different reason -- it is the key callers already match
+# old/new links by, so it is definitionally equal and never worth its own
+# diagnostic.
 _LIFECYCLE_ONLY_STATUSES = ("active", "provisional")
 _LIFECYCLE_TERMINAL_STATUSES = ("superseded", "historical", "declined")
-_LINK_NON_BODY_FIELDS = {"link", "status", "superseded_by"}
+_LINK_NON_BODY_FIELDS = {"link", "status", "superseded_by", "promoted_by"}
 
 
 def _link_diff_errors(full_path, lid: str, old_link: dict, new_link: dict) -> list[str]:
     """Compares one link present at both REF and now; returns zero or more
     ERROR strings (no path/`ERROR:` prefix -- callers add that), each
     naming the one field it is about. A lifecycle move (`status` and/or
-    `superseded_by`) is valid only when it is the SOLE change on the link
-    -- any co-occurring body-field edit invalidates it too, each getting
-    its own message (so a status change bundled with a `ruling.text` edit
-    reports both, not just one)."""
+    `superseded_by` and/or `promoted_by`, ruling 143) is valid only when it
+    is the SOLE change on the link -- any co-occurring body-field edit
+    invalidates it too, each getting its own message (so a status change
+    bundled with a `ruling.text` edit reports both, not just one)."""
     errors: list[str] = []
 
     body_fields = (set(old_link) | set(new_link)) - _LINK_NON_BODY_FIELDS
@@ -703,6 +1059,21 @@ def _link_diff_errors(full_path, lid: str, old_link: dict, new_link: dict) -> li
         elif not lifecycle_only:
             errors.append(
                 f"{full_path}:{lid}: superseded_by: added together with other field "
+                "edit(s) after being recorded (append-only; a lifecycle move must be "
+                "the only change on a recorded link)"
+            )
+
+    old_pb = old_link.get("promoted_by")
+    new_pb = new_link.get("promoted_by")
+    if old_pb != new_pb:
+        if old_pb is not None:
+            errors.append(
+                f"{full_path}:{lid}: promoted_by: changed after being recorded "
+                "(append-only; immutable once set)"
+            )
+        elif not lifecycle_only:
+            errors.append(
+                f"{full_path}:{lid}: promoted_by: added together with other field "
                 "edit(s) after being recorded (append-only; a lifecycle move must be "
                 "the only change on a recorded link)"
             )
@@ -876,18 +1247,29 @@ Rule reference: docs/SCHEMA.md sections 7 and 8.4; the complete table of what
 this linter checks is in docs/INTERNALS.md (memlint section)."""
 
 
-def _extract_against_ref_flags(argv: list[str]) -> tuple[list[str], str | None, bool]:
+def _extract_against_ref_flags(argv: list[str]) -> tuple[list[str], str | None, bool, bool]:
     """Pulls --against-ref REF and --staged out of argv before the
     remainder reaches parse_argv unchanged -- parse_argv's own 3-tuple
     contract (and the tests that call it directly) stays exactly as it
-    was; this is a preprocessing pass, not a parse_argv change."""
+    was; this is a preprocessing pass, not a parse_argv change.
+
+    The fourth return value, `saw_against_ref`, is True whenever the
+    `--against-ref` TOKEN appeared in argv at all, independent of whether a
+    REF followed it (A2-1 review finding L1). Without it, `--against-ref`
+    at the very end of argv left `against_ref` None and the flag silently
+    discarded, so `main()` fell through to the ORDINARY schema-lint mode
+    instead of refusing the malformed invocation -- a mistyped
+    `memlint.py ROOT --against-ref` used to exit 0 printing `memlint: clean`,
+    never mentioning the missing REF."""
     rest: list[str] = []
     against_ref = None
     staged = False
+    saw_against_ref = False
     i = 0
     while i < len(argv):
         a = argv[i]
         if a == "--against-ref":
+            saw_against_ref = True
             i += 1
             if i < len(argv):
                 against_ref = argv[i]
@@ -896,7 +1278,7 @@ def _extract_against_ref_flags(argv: list[str]) -> tuple[list[str], str | None, 
         else:
             rest.append(a)
         i += 1
-    return rest, against_ref, staged
+    return rest, against_ref, staged, saw_against_ref
 
 
 def _run_append_only(root_str: str, ref: str, staged: bool) -> int:
@@ -923,7 +1305,11 @@ def main(argv=None) -> int:
     if "-h" in argv or "--help" in argv:
         print(USAGE)
         return 0
-    rest, against_ref, staged = _extract_against_ref_flags(argv)
+    rest, against_ref, staged, saw_against_ref = _extract_against_ref_flags(argv)
+    if saw_against_ref and against_ref is None:
+        print("--against-ref requires REF", file=sys.stderr)
+        print(USAGE, file=sys.stderr)
+        return 2
     if staged and against_ref is None:
         print("--staged requires --against-ref", file=sys.stderr)
         print(USAGE, file=sys.stderr)

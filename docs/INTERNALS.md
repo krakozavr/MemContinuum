@@ -1640,6 +1640,23 @@ one project can have several code roots, and every root given is checked:
 | a concept has no `tested_by` | warning, unconditional |
 | a concept body has no "not this concept" sentence | warning |
 
+Decision marker rules (`--code-root`; SCHEMA §2/§8.3). A marker is a comment line matching
+`decision: TOP-\d{4} Ln` on a symbol's own definition line, or within the three lines above it —
+located through the chunker registry, same as the concept rules above, so a language with no
+wired chunker warns rather than errors. Only a topic's `path#symbol` code_refs entries take part;
+a prefix or a glob names no symbol and is never marker-verified. The scan never walks a whole code
+root — only files at least one topic's `code_refs` already names (by any of the three forms):
+
+| rule | severity |
+|---|---|
+| a marker names a topic id or link id that does not exist | error |
+| a marker names a link that is not `active`, or whose tier (§4) is CONTEXT, not CONSTRAINT/HOLD | error |
+| a marker's topic has no `path#symbol` code_refs entry naming this exact file and symbol (a prefix or glob that merely matches the FILE does not count) | error |
+| an active CONSTRAINT/HOLD link's `path#symbol` ref finds no marker at that symbol | warning |
+| an active CONSTRAINT/HOLD link's `path#symbol` ref names a symbol the chunker proves absent | error (the ref itself is dangling) |
+| a file in scope whose language has no chunker, or whose backend cannot run here | warning (names the reason), never an error |
+| a `path#symbol` naming a container type (class/struct/enum/…) the chunker reports no definition line for | warning (uncheckable, not "no marker") |
+
 Corpus-wide identity rules, applied to every record regardless of type:
 
 | rule | severity |
@@ -1675,20 +1692,23 @@ id:
 | a link present at `REF` has a BODY field changed (`ruling`, `rationale`, `alternatives`, `evidence`, `revisit_if`, `edges`, `assumptions`, `invariant`, `date`, `kind`, `reverses`, `reason_for_change`, `recorded_by`, `recorded_at`) | error naming the field, `<path>:<link>: <field>: link field changed after being recorded` |
 | `status` changes other than `active`/`provisional` → `superseded`/`historical`/`declined` (backward, or between the three terminal values) | error, `<path>:<link>: status: changed from … to … after being recorded` |
 | `superseded_by` changes after already being set, or is added while `status` is not `superseded` | error, `<path>:<link>: superseded_by: …` |
-| a lifecycle move (`status` and/or `superseded_by`, otherwise valid) bundled with any body-field edit | error on the lifecycle field too, naming it, in addition to the body field's own error |
+| `promoted_by` changes after already being set | error, `<path>:<link>: promoted_by: …` (no status coupling — it may be added regardless of the link's own status) |
+| a lifecycle move (`status` and/or `superseded_by` and/or `promoted_by`, otherwise valid) bundled with any body-field edit | error on the lifecycle field too, naming it, in addition to the body field's own error |
 | a link present at `REF` is missing now | error, `<path>:<link>: link removed after being recorded` |
 | a topic file present at `REF` is deleted or renamed | error naming the path (`--no-renames` means a rename is a plain delete + a plain add, so one rule covers both) |
-| a valid forward `status` move (with `superseded_by` added when the new status is `superseded`), alone on the link; new links; changes to `current`, `title`, `tags`, `code_refs`, or the body text | free |
+| a valid forward `status` move (with `superseded_by` added when the new status is `superseded`), `promoted_by` added, alone on the link; new links; changes to `current`, `title`, `tags`, `code_refs`, or the body text | free |
 | frontmatter that does not parse (either side) | error, the typed-parse diagnostic — never a traceback |
 | `ROOT` is not inside a git repository, or `REF` does not resolve to a commit | exit 2 with a message (not exit 1 — this is an infrastructure/usage failure, not a content finding) |
 
-The two lifecycle fields exist because a link is not always closed the
+The three lifecycle fields exist because a link is not always closed the
 instant it stops being current: marking one `superseded`/`historical`/
 `declined` — and naming its successor once that exists — is bookkeeping, not
 a change of mind, and forcing a whole new link for it would just move the
 same edit into a place this check cannot see it happen. Promotion (§5) still
-appends a new link rather than editing `status` to `active`/`provisional` in
-place — those two directions were never legal moves for this field.
+appends a NEW link rather than editing `status` to `active`/`provisional` in
+place — those two directions were never legal moves for that field; what
+promotion DOES edit on the OLD link is `promoted_by`, once, naming the new
+link, with no requirement that the old link's own status move at all.
 
 `--staged` compares `REF` to the INDEX (`git show :path`, what `git commit`
 would actually commit); the default compares `REF` to the working tree

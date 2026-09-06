@@ -640,6 +640,59 @@ class TestPreCommitForeignHook(unittest.TestCase):
         finally:
             shutil.rmtree(home, ignore_errors=True)
 
+    def test_pre_commit_merely_mentioning_the_script_name_in_a_comment_is_still_foreign(self):
+        """A2-1 review finding N2: identity used to be a loose substring
+        grep (`grep -q "hooks/pre-commit-append-only.sh" "$PRE_COMMIT"`),
+        matching the canonical script's name ANYWHERE in the file -- a
+        hand-authored hook that merely mentions it in a comment (never as
+        the wrapper's own `exec` line) would misclassify as "ours" and get
+        silently regenerated in place. install_store_hook_wrapper now
+        anchors on `^exec bash .*pre-commit-append-only\\.sh$`."""
+        home = sandbox_home()
+        try:
+            store = str(Path(home) / "store")
+            os.makedirs(store)
+            subprocess.run(["git", "init", "-q", store], check=True)
+            topics = Path(store) / "topics"
+            topics.mkdir()
+            (topics / "existing.md").write_text(
+                "---\ntype: topic\nid: TOP-9502\ntitle: existing\narea: test\n---\nBody\n"
+            )
+            subprocess.run(
+                ["git", "-C", store, "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+                 "add", "-A"], check=True,
+            )
+            subprocess.run(
+                ["git", "-C", store, "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+                 "commit", "-q", "-m", "seed"], check=True,
+            )
+            hooks_dir = Path(store) / ".git" / "hooks"
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            foreign_text = (
+                "#!/usr/bin/env bash\n"
+                "# do not confuse me with hooks/pre-commit-append-only.sh\n"
+                "echo hand-authored guard, name-dropped only in a comment\n"
+                "exit 1\n"
+            )
+            foreign = hooks_dir / "pre-commit"
+            foreign.write_text(foreign_text)
+            foreign.chmod(0o755)
+
+            proc = run_install(
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude")],
+                home,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(
+                foreign.read_text(), foreign_text,
+                "a hook merely NAMING the canonical script in a comment must still be "
+                "classified as foreign, never regenerated",
+            )
+            self.assertIn("SKIPPED", proc.stdout)
+            self.assertIn("foreign", proc.stdout.lower())
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
     def test_no_pre_commit_at_all_still_gets_one(self):
         home = sandbox_home()
         try:

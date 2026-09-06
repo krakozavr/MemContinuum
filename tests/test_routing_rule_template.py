@@ -37,9 +37,15 @@ class TestRoutingRuleTemplate(unittest.TestCase):
         self.assertEqual(text.count("{{STORE}}"), 1)
 
     def test_short(self):
+        # Cap moved 25 -> 26: task A2-2 (TOP-0122 L1 rule 2b) adds one
+        # sentence documenting the decision-marker convention (constraint/
+        # hold links mirrored by a comment at the bound symbol), folded
+        # into the existing "how to write a store record" paragraph rather
+        # than its own blank-line-delimited block -- a genuine, minimal,
+        # net +1-line content addition, not budget creep.
         text = TEMPLATE.read_text()
         lines = text.splitlines()
-        self.assertLessEqual(len(lines), 25, f"template is {len(lines)} lines, want <= 25")
+        self.assertLessEqual(len(lines), 26, f"template is {len(lines)} lines, want <= 26")
 
     def test_names_the_record_shapes_and_auto_memory_distinction(self):
         text = TEMPLATE.read_text()

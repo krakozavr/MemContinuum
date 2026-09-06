@@ -25,11 +25,17 @@ title: Hidden files in the processed count
 area: processing/status
 project: notecatcher
 current: L4                 # newest active link id — hand-set; memlint errors if it does not match the newest active link
-code_refs:                  # the decision→code link
-  - src/core/scan/scan_plan.py#hidden_count
-  - src/app/summary/summary_card.py#appendix
+code_refs:                  # the decision→code link — three forms, freely mixed
+  - src/core/scan/                    # a repo-relative PATH PREFIX — matches every file under it
+  - src/app/summary/*.py              # an fnmatch GLOB
+  - src/core/scan/scan_plan.py#hidden_count   # PATH#SYMBOL — a qualified symbol name as the chunkers report it
 tags: []
 ```
+
+A prefix and a glob keep serving retrieval exactly as before — `for-path`/`unmapped` match either
+against a file path, unchanged (§8.4). Only `path#symbol` names an actual symbol, so only
+`path#symbol` refs take part in marker verification (§8.3): a marker can never be checked against
+a ref that names no symbol.
 
 ## 3. Link (one ruling) — fields, and authority PER FIELD
 
@@ -157,13 +163,17 @@ file's links now against what they were at `REF`. A link present at `REF`
 has its BODY frozen — `ruling`, `rationale`, `alternatives`, `evidence`,
 `revisit_if`, `edges`, `assumptions`, `invariant`, `date`, `kind`, `reverses`,
 `reason_for_change`, `recorded_by`, `recorded_at` may never change; any diff
-there is an error naming the field. Exactly two fields are lifecycle fields,
-allowed to move **forward only, once**: `status` may move from `active` or
-`provisional` to `superseded`, `historical`, or `declined` — never back to
-`active`/`provisional`, never between the three terminal values (so a
-provisional record is *promoted* by a new link, per §5, never by editing this
-field to `active`) — and `superseded_by` may be *added* in that same move
-(never changed afterwards, never present unless `status` is `superseded`). A
+there is an error naming the field. Exactly three fields are lifecycle
+fields, allowed to move **forward only, once**: `status` may move from
+`active` or `provisional` to `superseded`, `historical`, or `declined` —
+never back to `active`/`provisional`, never between the three terminal
+values (so a provisional record is *promoted* by a new link, per §5, never
+by editing this field to `active`) — `superseded_by` may be *added* in that
+same move (never changed afterwards, never present unless `status` is
+`superseded`) — and `promoted_by` may be *added* once, with no such status
+coupling: §5 step 3's promotion procedure appends a new link and adds
+`promoted_by: L<n>` to the OLD link it promotes, whatever that old link's
+own status; it is immutable once set, exactly like `superseded_by`. A
 lifecycle move must be the only change on the link; bundled with any body
 edit, both get their own error. A link removed, or a topic file deleted or
 renamed, is an error naming the path. New links, and changes to `current`,
@@ -222,6 +232,36 @@ assumption cites it with an `abandons` edge.
 A CONSTRAINT-tier link with an `invariant` is a tripwire, not prose:
 `memidx.py drift` runs every invariant against the code tree and reports
 "implementation has drifted from active decision `<id>`".
+
+**A CONSTRAINT or HOLD link may also be mirrored at its bound symbol**, a comment carrying the
+decision it implements:
+
+```python
+# decision: TOP-42 L4
+def hidden_count(entries):
+    ...
+```
+
+Syntax is language-agnostic: any comment LINE containing `decision: TOP-xxxx Ln` — on the
+symbol's own definition line, or within the three lines immediately above it — is a marker,
+whatever the language's comment leader (`#`, `//`, `--`, …); the check is a plain text match, not a
+parse of the comment itself. The symbol's definition line is found through the chunker registry
+(`chunkers.get_chunker(lang).chunk_file`), so the same rule serves every wired language; a file
+whose language has no chunker, or whose backend cannot run here, is skipped with a warning rather
+than treated as carrying no marker. Markers verify at functions, methods, and computed
+vars/properties — whatever the chunker itself reports a definition line for; a container type
+(a class, struct, enum, …) has no such line of its own and is uncheckable.
+
+`memlint.py --code-root DIR` checks the pair both ways. Only a `path#symbol` code_refs entry
+takes part — a glob or a bare path names no symbol, so a marker under one is an error, not a
+skip. Marker → store: every marker under a code root must point at a topic and link that exist,
+that link must be `active` and CONSTRAINT or HOLD, and that topic's `code_refs` must name the
+marked file with the matching `path#symbol` (a prefix or glob that merely happens to match the
+same FILE does not count — that is the error `path#symbol` exists to prevent) — else an error
+naming the file, line, and reason. Store → code: every active CONSTRAINT/HOLD link whose topic
+has a `path#symbol` ref must find the marker at that symbol — else a warning (existing stores
+carry none yet); a `path#symbol` the chunker proves absent (the ref itself is dangling) is an
+error instead, not merely a missing marker.
 
 ### 8.4 Concept records (`type: concept`) — the code graph's authored layer
 

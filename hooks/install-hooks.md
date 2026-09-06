@@ -126,7 +126,10 @@ repo — not this tool repo, and not the code repo it describes.
 `scripts/repo-init.sh` writes this wrapper as `<store>/.git/hooks/post-commit`
 (not a bare symlink — a symlinked git hook carries no environment of its
 own, and `post-commit-reindex.sh` silently no-ops without `MEMCONTINUUM_ROOT`
-set):
+set). A `post-commit` this installer did not render is left untouched and
+reported, never silently overwritten — the same foreign-hook refusal §3b
+describes for `pre-commit`, identity anchored on the wrapper's own `exec`
+line:
 
 ```bash
 #!/usr/bin/env bash
@@ -183,12 +186,11 @@ changed mind is always a new link.
 
 `scripts/repo-init.sh` writes this wrapper as `<store>/.git/hooks/pre-commit`,
 same shape as `post-commit` above (same three exports, `exec`s the canonical
-script by absolute path so an edit to it needs no reinstall) — with one
-difference in installer behavior: a `pre-commit` this installer did not
-render is left untouched and reported, never silently overwritten (`post-commit`
-has no such check and is always regenerated; a `pre-commit` is far likelier to
-already carry a hand-authored guard of its own, and its whole job is to be
-able to block a commit).
+script by absolute path so an edit to it needs no reinstall) — with the same
+foreign-hook refusal `post-commit` now has too: a `pre-commit` this
+installer did not render is left untouched and reported, never silently
+overwritten. Identity is the wrapper's own `exec` line naming the canonical
+script, not a substring match anywhere in the file.
 
 ```bash
 #!/usr/bin/env bash
