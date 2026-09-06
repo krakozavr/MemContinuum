@@ -3050,6 +3050,59 @@ class TestMalformedRecordQuarantine(unittest.TestCase):
                 "unmapped must not self-heal (reindex) on a quarantined store",
             )
 
+    # -- scenario 7b: fix wave 1, G2 (Grok MAJOR 2 / whole-branch-review
+    # BLOCKING-1) -- a self-heal reindex that PURGES the covering record
+    # into quarantine must never answer coverage_status: "ok" with the
+    # file it used to cover listed as an uncovered gap.
+
+    def test_unmapped_self_heal_that_creates_quarantine_maps_to_quarantined_not_gap(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            covering = root / "topics" / "covering.md"
+            _write_record(
+                covering,
+                "---\ntype: topic\nid: TOP-9112\ntitle: Covering\ncode_refs: [src/mapped.py]\nlinks:\n"
+                '  - link: L1\n    status: active\n    ruling: {text: "r", authority: owner-verbatim, source: s}\n'
+                "---\nBody text.\n",
+            )
+            db = Path(td) / "idx.sqlite"
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                rc0 = reindex(root, db, no_embed=True)
+            self.assertEqual(rc0, 0)
+            self.assertEqual(self._index_errors_rows(db), [])
+
+            # On-disk drift: rewrite the SAME file into a malformed shape.
+            # decision_index_state must read "stale" (real content drift)
+            # -- nothing has been reindexed since the edit, so it is not
+            # "quarantined" yet.
+            _write_record(
+                covering,
+                "---\ntype: topic\nid: TOP-9112\ntitle: Covering\nlinks: [\n---\nBody text.\n",
+            )
+            self.assertEqual(
+                memidx.decision_index_state(db, memidx.DEFAULT_PROJECT, root=root, verify_content=True),
+                "stale",
+            )
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                rc = memidx.cmd_unmapped(ns(
+                    project=memidx.DEFAULT_PROJECT, db=str(db), root=str(root),
+                    code_root=None, paths=["src/mapped.py"], json=True,
+                ))
+            out = json.loads(buf.getvalue())
+            self.assertEqual(rc, 1, out)
+            self.assertEqual(out["coverage_status"], "quarantined", out)
+            self.assertEqual(
+                out["unmapped"], [],
+                "the self-heal that just quarantined the covering record must never assert a "
+                "false gap for the path it used to cover",
+            )
+
+            rows = self._index_errors_rows(db)
+            self.assertEqual(len(rows), 1, rows)
+            self.assertEqual(rows[0]["path"], str(covering.resolve()))
+
     # -- scenario 8: a note (no id/links/type) with malformed YAML stays indexed
 
     def test_note_with_malformed_yaml_stays_indexed_not_quarantined(self):

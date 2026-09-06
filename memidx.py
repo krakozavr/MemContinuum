@@ -4170,8 +4170,27 @@ def cmd_unmapped(args) -> int:
                         cmd_reindex(reindex_ns)
                     conn.close()
                     conn = open_db_noncreating(db_path, project=args.project)
-                    if conn is not None and _index_has_drift(conn, root, args.project, verify_content=True):
-                        coverage_status = "unknown"
+                    if conn is not None:
+                        # Fix wave 1, G2 (Grok MAJOR 2 / whole-branch-review
+                        # BLOCKING-1): a self-heal that PURGES a record into
+                        # quarantine leaves the store QUARANTINED, not
+                        # current -- re-reading decision_index_state (not
+                        # just _index_has_drift, which only answers "is
+                        # there still real drift") after the heal catches
+                        # that case and maps it exactly like the pre-heal
+                        # `quarantined` arm above: no coverage claim at all,
+                        # not even a positive one, off an index that is
+                        # KNOWN to have just quarantined the very record
+                        # whose coverage this call is asking about.
+                        post_state = decision_index_state(
+                            db_path, args.project, root=root, verify_content=True
+                        )
+                        if post_state == "quarantined":
+                            coverage_status = "quarantined"
+                            conn.close()
+                            conn = None
+                        elif post_state != "current":
+                            coverage_status = "unknown"
                 if conn is not None:
                     for raw_path in args.paths:
                         candidates = _unmapped_path_candidates(raw_path, code_roots)

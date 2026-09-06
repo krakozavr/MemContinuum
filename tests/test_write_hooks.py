@@ -2263,6 +2263,46 @@ class TestUserPromptRemind(HookTestBase):
         self.assertIn("store index quarantined", proc.stdout)
         self.assertNotIn("unmapped.py", proc.stdout)
 
+    def test_quarantined_logs_index_quarantined_after_self_heal_creates_it(self):
+        """Fix wave 1, G2 (Grok MAJOR 2 / whole-branch-review BLOCKING-1):
+        the PRE-heal path above starts from a store already quarantined by
+        an explicit prior reindex. This covers the OTHER path: corrupting
+        the covering topic ON DISK, without reindexing first, leaves the
+        index STALE (real on-disk drift), not yet quarantined --
+        userprompt-remind.sh's own `unmapped` call is what self-heals
+        (reindex), which is what purges/quarantines the record. The hook
+        must still log outcome=index-quarantined and never assert a false
+        gap for the file that record used to cover (TOP-9001 covers
+        src/mapped.py -- see TOPIC_MD/build_store_root above)."""
+        topic_path = self.store_root / "topics" / "testing" / "mapped-topic.md"
+        _write(topic_path, TOPIC_MD.replace("links:\n", "links: [\n", 1))
+        db = self.home / f"{self.project}.sqlite"
+        self.assertEqual(
+            memidx.decision_index_state(db, self.project, root=self.store_root, verify_content=True),
+            "stale",
+            "test setup bug: corrupting the file without reindexing must read as on-disk drift, "
+            "not yet quarantined",
+        )
+
+        session_id = "s-userprompt-quarantined-self-heal"
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "mapped.py"), "code")])
+        proc, elapsed = run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.base_env(), timeout=10.0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("outcome=index-quarantined", (self.home / "hook.log").read_text())
+        self.assertIn("Coverage signal", proc.stdout)
+        self.assertIn("store index quarantined", proc.stdout)
+        self.assertNotIn(
+            "mapped.py", proc.stdout,
+            "must never assert a gap for a file the just-quarantined record used to cover",
+        )
+
+        conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
+        self.assertIsNotNone(
+            conn.execute("SELECT 1 FROM index_errors").fetchone(),
+            "test setup bug: the hook's own self-heal must have quarantined the corrupted topic",
+        )
+        conn.close()
+
     def test_silent_on_empty_evidence(self):
         session_id = "s-prompt-empty"
         self.seed_ledger(session_id, [])
