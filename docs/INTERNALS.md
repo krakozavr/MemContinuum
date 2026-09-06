@@ -2398,6 +2398,14 @@ bash tests/run_bash32.sh
 - Tests do not fall back to `<checkout>/.venv/bin/python` the way
   `repo-init.sh` does: they read `$MEMCONTINUUM_PYTHON` and skip with a clear
   message when the tests that need a real venv cannot get one.
+- **The venv gate itself is guarded.** `tests/test_env_gate.py` fails the run
+  (naming `$MEMCONTINUUM_PYTHON` and the live count of test classes that
+  would silently skip -- computed by re-walking the discovered suite, not a
+  hardcoded number) unless the variable is set or `$MEMCONTINUUM_ALLOW_UNGATED=1`
+  is, so a machine without the pinned venv gets one loud failure instead of a
+  quiet "OK (skipped=N)" that reads like full coverage. CI already sets
+  `$MEMCONTINUUM_PYTHON` (`.github/workflows/tests.yml`), so this never fires
+  there.
 - Nearly every test builds its own temp directory and passes an explicit `--db`
   (or sets `MEMCONTINUUM_HOME`), so a run never touches a real
   `~/.memcontinuum/` index. The gated real-corpus tests are the exception,

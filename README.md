@@ -541,6 +541,13 @@ minutes on a 24-core machine; the bash 3.2 harness takes about four. A handful
 of tests need machine-local data of their own and skip with a clear message
 when it is absent; every fixture tracked in this repository is synthetic.
 
+Leaving `$MEMCONTINUUM_PYTHON` unset does not read as "OK (skipped=N)" —
+dozens of whole test classes need the pinned venv (tree-sitter, embeddings,
+dependency reconciliation), and one guard test (`tests/test_env_gate.py`)
+fails the run instead, naming the variable and how many classes would
+silently skip. Set `$MEMCONTINUUM_ALLOW_UNGATED=1` to run without the venv
+anyway, accepting the skipped coverage.
+
 ## Acknowledgements & prior art
 
 - [fastembed](https://github.com/qdrant/fastembed) — the embedding runtime this
