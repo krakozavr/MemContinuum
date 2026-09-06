@@ -788,10 +788,10 @@ class TestStatsUnknownProject(StatsTestBase):
         self.assertEqual(out2["nudges"]["coverage_injected"], 2, "requesting (unknown) surfaces the legacy lines")
 
     def test_wrong_project_name_reports_zero_not_someone_elses_data(self):
-        self.write_log([f"{ts(1)} userprompt outcome=injected session=s1 project=shotporter"])
+        self.write_log([f"{ts(1)} userprompt outcome=injected session=s1 project=otherproject"])
         rc, out = run_stats_json(home=str(self.home), project="demo")
         self.assertEqual(out["nudges"]["coverage_injected"], 0)
-        self.assertIn("shotporter", out["projects_seen"])
+        self.assertIn("otherproject", out["projects_seen"])
 
     def test_unknown_project_never_flags_even_when_thresholds_met(self):
         """Round 2, ruling 2 (Grok gate BLOCKING finding): >=10 userprompt

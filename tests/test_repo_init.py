@@ -1684,7 +1684,14 @@ class TestNoMachineIdentifyingContent(unittest.TestCase):
         username_needle = "kra" + "kozavr"
         path_needle = "/mnt/d/!_WORK_" + "!"
         project_needles = ["mmd" + "-swift", "MMD" + "App", "MMD" + "Core", "Shot" + "Porter"]
-        return [username_needle, path_needle] + project_needles
+        # test-stats-lowercase-project-id: a lowercase-only rendering (a
+        # test author typing a project id straight, with no capitalization
+        # convention) is a different string to a plain substring scan --
+        # the first project needle above is already all-lowercase, so only
+        # the two PascalCase-only ones below need a lowercase form, built
+        # the same split way so this file does not trip itself.
+        project_needles_lower = ["mmd" + "app", "mmd" + "core", "shot" + "porter"]
+        return [username_needle, path_needle] + project_needles + project_needles_lower
 
     @classmethod
     def _scan_for_needles(cls, entries):
