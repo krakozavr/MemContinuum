@@ -127,6 +127,15 @@
   candidate) no longer repeats the walk. A CI run on the macOS runner
   under real bash 3.2 had measured the unmodified hook at 1.003s against
   its own 1.0s timing bar.
+- `for-path --json` gained an opt-in `--with-chain-text` flag: it folds
+  the plain-text chain rendering into the same JSON answer, so a caller
+  that already needs both (the pre-edit chain hook) now makes one
+  `for-path` call per candidate instead of two, and the hook's own three
+  small python parses per candidate collapse into one. A later CI run on
+  the macOS runner measured the hook at 1.003-1.022s against that same
+  1.0s timing bar -- runner speed alone swings by roughly a quarter
+  between runs -- so this removes a full process start's worth of margin
+  without loosening the bar itself.
 
 ### Documentation
 - The README, `docs/DESIGN.md`, and `docs/INTERNALS.md` now say plainly

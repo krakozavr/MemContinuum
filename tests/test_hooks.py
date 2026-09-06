@@ -8,6 +8,7 @@ behavior) as much as its output shape.
 import fcntl
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -737,25 +738,26 @@ class TestPreEditChainRootAndStaleWarning(unittest.TestCase):
         self.assertIn("outcome=matched", log_text)
         self.assertNotIn("outcome=index-stale-served", log_text)
 
-    def test_second_for_path_call_omits_root_the_first_call_keeps_it(self):
-        """ruling 136 / CI evidence (macOS runner, real bash 3.2): the
-        hook's SECOND store walk. `--root` on `for-path` is what triggers
-        `_index_has_drift`, a real on-disk walk of the store -- the first
-        `for-path` call (FORPATH_ARGS, the match-finding loop) already pays
-        that cost and determines the state (`current`/`stale`/
-        `quarantined`), warning on it via its own stderr. The second call
-        (CHAIN_TEXT_ARGS, only fetching the pretty chain-view text for the
-        candidate the first call already matched) must not walk the store
-        again -- it never passes --root once the fix lands. A fake
-        memidx.py wrapper (`memidx_wrapper_python`) records every
-        script-path invocation's argv so both calls can be inspected
-        directly, independent of what for-path itself prints or logs.
+    def test_single_for_path_call_carries_root_and_with_chain_text(self):
+        """Round 5 (ruling 137 / CI evidence: the macOS runner measured
+        this hook at 1.003-1.022s against its own 1.0s bar). `--root` on
+        `for-path` is what triggers `_index_has_drift`, a real on-disk walk
+        of the store -- the match-finding loop's call already pays that
+        cost and determines the state (`current`/`stale`/`quarantined`),
+        warning on it via its own stderr. `--with-chain-text` (memidx.py
+        item 1) now folds the pretty chain-view text into that SAME call's
+        JSON envelope, so the old second `for-path` call (CHAIN_TEXT_ARGS,
+        fetching only the chain text for the candidate the first call
+        already matched) is gone entirely -- one hook run makes exactly
+        ONE `for-path` invocation, carrying both flags. A fake memidx.py
+        wrapper (`memidx_wrapper_python`) records every script-path
+        invocation's argv, independent of what for-path itself prints or
+        logs.
 
         A single matching candidate (the raw file_path itself, no cwd/
         strip-prefix fallback needed) keeps this deterministic: exactly
-        one FORPATH_ARGS call (matches immediately, loop breaks) then
-        exactly one CHAIN_TEXT_ARGS call -- two `for-path` invocations
-        total, first then second, no ambiguity about which is which."""
+        one `for-path` invocation total, no ambiguity about which call it
+        is."""
         argv_log = Path(self.tmp) / "argv.jsonl"
         wrapper = memidx_wrapper_python(
             self.tmp, "argv-recorder",
@@ -785,12 +787,12 @@ class TestPreEditChainRootAndStaleWarning(unittest.TestCase):
 
         calls = [json.loads(line) for line in argv_log.read_text().splitlines() if line.strip()]
         for_path_calls = [c for c in calls if c and c[0] == "for-path"]
-        self.assertEqual(len(for_path_calls), 2, for_path_calls)
-        self.assertIn("--root", for_path_calls[0], for_path_calls[0])
-        self.assertNotIn(
-            "--root", for_path_calls[1],
-            f"the second for-path call must not walk the store again: {for_path_calls[1]}",
+        self.assertEqual(
+            len(for_path_calls), 1,
+            f"one memidx invocation per hook run: {for_path_calls}",
         )
+        self.assertIn("--root", for_path_calls[0], for_path_calls[0])
+        self.assertIn("--with-chain-text", for_path_calls[0], for_path_calls[0])
 
 
 class TestF6RenderedTimeout(unittest.TestCase):
@@ -887,6 +889,298 @@ class TestPreEditChainWatchdog(unittest.TestCase):
         ctx = payload_out["hookSpecificOutput"]["additionalContext"]
         self.assertIn("timed out", ctx.lower())
         self.assertIn("not established", ctx.lower())
+
+
+ORACLE_COMMIT = "0732ac4"
+
+
+def _oracle_commit_available() -> bool:
+    """A shallow CI checkout (actions/checkout's default fetch-depth: 1)
+    only has the tip commit -- once this round's own commit lands,
+    ORACLE_COMMIT is its PARENT and absent from history entirely. `git
+    show`/`cat-file` on a missing object fails outright rather than
+    returning something empty, so this must be checked BEFORE setUpClass
+    ever calls `git show`, not caught there."""
+    try:
+        subprocess.run(
+            ["git", "cat-file", "-e", f"{ORACLE_COMMIT}^{{commit}}"],
+            cwd=str(TOOLS_DIR), capture_output=True, check=True,
+        )
+        return True
+    except (subprocess.CalledProcessError, OSError):
+        return False
+
+
+_ORACLE_COMMIT_AVAILABLE = _oracle_commit_available()
+_SKIP_NO_ORACLE_COMMIT = (
+    f"commit {ORACLE_COMMIT} is not present in this checkout's history "
+    "(a shallow clone only fetches the tip commit) -- the oracle-parity "
+    "check needs the actual pre-round-5 script, not a reimplementation, "
+    "so it skips rather than fabricating one"
+)
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+@unittest.skipUnless(_ORACLE_COMMIT_AVAILABLE, _SKIP_NO_ORACLE_COMMIT)
+class TestPreEditChainOracleParity(unittest.TestCase):
+    """Round 5 rewrote pre-edit-chain.sh's candidate loop and chain-text
+    fetch to make ONE `for-path` call (--with-chain-text) and ONE parser
+    per hook run instead of two calls and three parsers. This class
+    proves the rewrite is behavior-preserving: the oracle is the REAL
+    pre-round-5 script -- the committed ORACLE_COMMIT blob, copied to a
+    temp file, not a reimplementation of its logic -- run against the
+    exact same inputs as the current script. Only the outcome NAME is
+    compared out of hook.log (never the full line: elapsed=/timestamp
+    naturally differ run to run)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="memcontinuum-hook-oracle-test-")
+        oracle_text = subprocess.run(
+            ["git", "show", f"{ORACLE_COMMIT}:hooks/pre-edit-chain.sh"],
+            cwd=str(TOOLS_DIR), capture_output=True, text=True, check=True,
+        ).stdout
+        # The oracle script computes MEMIDX/mc-watchdog.sh relative to its
+        # OWN location ($SCRIPT_DIR/../memidx.py, $SCRIPT_DIR/mc-
+        # watchdog.sh) -- it needs a sibling layout to resolve, not a bare
+        # standalone file. Symlinked at the real (current) memidx.py and
+        # mc-watchdog.sh: memidx.py's own for-path/--with-chain-text
+        # change is additive (the pre-existing --json shape and the
+        # two-call sequence the oracle script itself drives are both
+        # unchanged), so this is exactly "the pre-round-5 script talking
+        # to the same engine", not a different oracle.
+        oracle_repo = Path(cls.tmp) / "oracle-repo"
+        (oracle_repo / "hooks").mkdir(parents=True)
+        (oracle_repo / "memidx.py").symlink_to(TOOLS_DIR / "memidx.py")
+        (oracle_repo / "hooks" / "mc-watchdog.sh").symlink_to(TOOLS_DIR / "hooks" / "mc-watchdog.sh")
+        cls.oracle_script = oracle_repo / "hooks" / "pre-edit-chain.sh"
+        cls.oracle_script.write_text(oracle_text)
+        cls.oracle_script.chmod(0o755)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def _new_home(self, project):
+        home = Path(self.tmp) / f"home-{project}"
+        home.mkdir(exist_ok=True)
+        return home
+
+    def _run(self, script_path, payload_text, env, timeout=10.0):
+        return subprocess.run(
+            [MC_BASH, str(script_path)], input=payload_text,
+            capture_output=True, text=True, env=env, timeout=timeout,
+        )
+
+    def _outcome_name(self, log_slice):
+        matches = re.findall(r"outcome=(\S+)", log_slice)
+        return matches[-1] if matches else None
+
+    def _run_pair(self, home, payload, env_overrides):
+        """Runs the oracle then the current script against the SAME
+        MEMCONTINUUM_HOME/db (read-only queries, so no risk of one run's
+        state affecting the other) and returns
+        (oracle_proc, new_proc, oracle_outcome, new_outcome)."""
+        log_path = home / "hook.log"
+        env = clean_env(MEMCONTINUUM_HOME=str(home), MEMCONTINUUM_PYTHON=VENV_PYTHON, **env_overrides)
+
+        before = log_path.read_text() if log_path.exists() else ""
+        oracle_proc = self._run(self.oracle_script, payload, env)
+        after_oracle = log_path.read_text()
+        oracle_outcome = self._outcome_name(after_oracle[len(before):])
+
+        new_proc = self._run(HOOK_SCRIPT, payload, env)
+        after_new = log_path.read_text()
+        new_outcome = self._outcome_name(after_new[len(after_oracle):])
+
+        return oracle_proc, new_proc, oracle_outcome, new_outcome
+
+    def _matching_payload(self):
+        return json.dumps({
+            "hook_event_name": "PreToolUse", "tool_name": "Edit",
+            "cwd": "/some/other/unrelated/dir",
+            "tool_input": {"file_path": "/fake/repo/src/core/scan/scan_plan.py"},
+        })
+
+    def _nonmatching_payload(self):
+        return json.dumps({
+            "hook_event_name": "PreToolUse", "tool_name": "Edit",
+            "cwd": "/nowhere",
+            "tool_input": {"file_path": "/nowhere/near/anything.py"},
+        })
+
+    def _reindex(self, root, project, db):
+        args = type(
+            "Args", (), dict(root=str(root), project=project, db=str(db), full=True, no_embed=True),
+        )()
+        memidx.cmd_reindex(args)
+
+    def _topic_with_code_ref(self, tid: str, code_ref: str) -> str:
+        return (
+            f"---\ntype: topic\nid: {tid}\ntitle: T-{tid}\n"
+            f"code_refs:\n  - {code_ref}\n"
+            "links:\n"
+            '  - link: L1\n    status: active\n    ruling: {text: "r", authority: owner-verbatim, source: s}\n'
+            "---\nBody.\n"
+        )
+
+    def test_match_with_a_chain(self):
+        project = "oracle-match"
+        home = self._new_home(project)
+        self._reindex(SCHEMA_FIXTURE_ROOT, project, home / f"{project}.sqlite")
+
+        oracle_proc, new_proc, oracle_outcome, new_outcome = self._run_pair(
+            home, self._matching_payload(),
+            dict(MEMCONTINUUM_PROJECT=project, MEMCONTINUUM_STRIP_PREFIX="/fake/repo/"),
+        )
+        self.assertEqual(oracle_proc.returncode, 0, oracle_proc.stderr)
+        self.assertEqual(new_proc.returncode, 0, new_proc.stderr)
+        self.assertTrue(oracle_proc.stdout.strip())
+        self.assertEqual(new_proc.stdout, oracle_proc.stdout, "byte-identical stdout")
+        self.assertEqual(new_outcome, oracle_outcome)
+        self.assertEqual(new_outcome, "matched")
+
+    def test_match_with_two_topics_keeps_the_old_topic_count_quirk(self):
+        """Review finding: the old `grep -c '"id":'` topic count counts
+        matching LINES, not occurrences -- and the old RESULTS_ONLY (a
+        plain `json.dumps`, no `indent=`) was always exactly one line, so
+        the pre-round-5 count was always "1" for any match, never a real
+        per-topic count, however many topics actually matched. A store
+        where TWO topics both reference the same file is the one scenario
+        that would catch a parser replicating a real per-topic COUNT
+        instead of this exact quirk -- the two other scenarios above (one
+        topic, no concepts) cannot distinguish "1" from "a real count"."""
+        project = "oracle-two-topics"
+        home = self._new_home(project)
+        root = Path(self.tmp) / f"{project}-store"
+        (root / "topics").mkdir(parents=True)
+        (root / "topics" / "one.md").write_text(
+            self._topic_with_code_ref("TOP-2001", "src/core/scan/scan_plan.py")
+        )
+        (root / "topics" / "two.md").write_text(
+            self._topic_with_code_ref("TOP-2002", "src/core/scan/scan_plan.py")
+        )
+        self._reindex(root, project, home / f"{project}.sqlite")
+
+        oracle_proc, new_proc, oracle_outcome, new_outcome = self._run_pair(
+            home, self._matching_payload(),
+            dict(MEMCONTINUUM_PROJECT=project, MEMCONTINUUM_STRIP_PREFIX="/fake/repo/"),
+        )
+        self.assertEqual(oracle_proc.returncode, 0, oracle_proc.stderr)
+        self.assertEqual(new_proc.returncode, 0, new_proc.stderr)
+        self.assertTrue(oracle_proc.stdout.strip())
+        self.assertEqual(new_proc.stdout, oracle_proc.stdout, "byte-identical stdout")
+        self.assertEqual(new_outcome, oracle_outcome)
+        self.assertEqual(new_outcome, "matched")
+        # Pins the quirk itself, not just parity: two topics matched, but
+        # the header still says "1" -- exactly what 0732ac4 always said.
+        self.assertIn("Decision-chain memory: 1 topic(s) reference this file.", oracle_proc.stdout)
+
+    def test_no_match(self):
+        project = "oracle-nomatch"
+        home = self._new_home(project)
+        self._reindex(SCHEMA_FIXTURE_ROOT, project, home / f"{project}.sqlite")
+
+        oracle_proc, new_proc, oracle_outcome, new_outcome = self._run_pair(
+            home, self._nonmatching_payload(), dict(MEMCONTINUUM_PROJECT=project),
+        )
+        self.assertEqual(oracle_proc.returncode, 0, oracle_proc.stderr)
+        self.assertEqual(new_proc.returncode, 0, new_proc.stderr)
+        self.assertEqual(new_proc.stdout.strip(), oracle_proc.stdout.strip())
+        self.assertEqual(new_proc.stdout.strip(), "")
+        self.assertEqual(new_outcome, oracle_outcome)
+        self.assertEqual(new_outcome, "no-match")
+
+    def test_stale_index_with_root(self):
+        project = "oracle-stale"
+        home = self._new_home(project)
+        root = Path(self.tmp) / f"{project}-store"
+        shutil.copytree(SCHEMA_FIXTURE_ROOT, root)
+        self._reindex(root, project, home / f"{project}.sqlite")
+        (root / "topics" / "new-topic.md").write_text(
+            "---\ntype: topic\nid: TOP-NEW\ntitle: New\nlinks: []\n---\nBody.\n"
+        )
+
+        oracle_proc, new_proc, oracle_outcome, new_outcome = self._run_pair(
+            home, self._matching_payload(),
+            dict(MEMCONTINUUM_PROJECT=project, MEMCONTINUUM_STRIP_PREFIX="/fake/repo/",
+                 MEMCONTINUUM_ROOT=str(root)),
+        )
+        self.assertEqual(oracle_proc.returncode, 0, oracle_proc.stderr)
+        self.assertEqual(new_proc.returncode, 0, new_proc.stderr)
+        self.assertTrue(oracle_proc.stdout.strip())
+        self.assertEqual(new_proc.stdout, oracle_proc.stdout, "byte-identical stdout")
+        self.assertEqual(new_outcome, oracle_outcome)
+        self.assertEqual(new_outcome, "index-stale-served")
+
+    def test_quarantined_index(self):
+        project = "oracle-quarantine"
+        home = self._new_home(project)
+        root = Path(self.tmp) / f"{project}-store"
+        shutil.copytree(SCHEMA_FIXTURE_ROOT, root)
+        (root / "topics" / "bad.md").write_text(
+            "---\ntype: topic\nid: TOP-9999\ntitle: Bad\nlinks: [\n---\nBody.\n"
+        )
+        db = home / f"{project}.sqlite"
+        self._reindex(root, project, db)
+        self.assertEqual(memidx.decision_index_state(db, project, root=root), "quarantined")
+
+        oracle_proc, new_proc, oracle_outcome, new_outcome = self._run_pair(
+            home, self._matching_payload(),
+            dict(MEMCONTINUUM_PROJECT=project, MEMCONTINUUM_STRIP_PREFIX="/fake/repo/",
+                 MEMCONTINUUM_ROOT=str(root)),
+        )
+        self.assertEqual(oracle_proc.returncode, 0, oracle_proc.stderr)
+        self.assertEqual(new_proc.returncode, 0, new_proc.stderr)
+        self.assertTrue(oracle_proc.stdout.strip())
+        self.assertEqual(new_proc.stdout, oracle_proc.stdout, "byte-identical stdout")
+        self.assertEqual(new_outcome, oracle_outcome)
+        self.assertEqual(new_outcome, "matched")
+
+    def test_missing_index(self):
+        project = "oracle-missing"
+        home = self._new_home(project)
+        # no db ever created for this project -- both scripts' own
+        # pre-loop [ ! -f "$DB_PATH" ] check must catch it before any
+        # `for-path` call is attempted.
+
+        oracle_proc, new_proc, oracle_outcome, new_outcome = self._run_pair(
+            home, self._matching_payload(),
+            dict(MEMCONTINUUM_PROJECT=project, MEMCONTINUUM_STRIP_PREFIX="/fake/repo/"),
+        )
+        self.assertEqual(oracle_proc.returncode, 0, oracle_proc.stderr)
+        self.assertEqual(new_proc.returncode, 0, new_proc.stderr)
+        self.assertEqual(new_proc.stdout.strip(), oracle_proc.stdout.strip())
+        self.assertEqual(new_proc.stdout.strip(), "")
+        self.assertEqual(new_outcome, oracle_outcome)
+        self.assertEqual(new_outcome, "index-missing")
+
+    def test_index_error_rc4(self):
+        project = "oracle-indexerror"
+        home = self._new_home(project)
+        db = home / f"{project}.sqlite"
+        self._reindex(SCHEMA_FIXTURE_ROOT, project, db)
+        conn = sqlite3.connect(str(db))
+        conn.execute("ALTER TABLE records RENAME COLUMN path TO path_broken")
+        conn.commit(); conn.close()
+
+        def _restore():
+            c = sqlite3.connect(str(db))
+            c.execute("ALTER TABLE records RENAME COLUMN path_broken TO path")
+            c.commit(); c.close()
+
+        self.addCleanup(_restore)
+
+        oracle_proc, new_proc, oracle_outcome, new_outcome = self._run_pair(
+            home, self._matching_payload(),
+            dict(MEMCONTINUUM_PROJECT=project, MEMCONTINUUM_STRIP_PREFIX="/fake/repo/"),
+        )
+        self.assertEqual(oracle_proc.returncode, 0, oracle_proc.stderr)
+        self.assertEqual(new_proc.returncode, 0, new_proc.stderr)
+        self.assertEqual(new_proc.stdout.strip(), oracle_proc.stdout.strip())
+        self.assertEqual(new_proc.stdout.strip(), "")
+        self.assertEqual(new_outcome, oracle_outcome)
+        self.assertEqual(new_outcome, "index-error")
 
 
 POST_COMMIT_HOOK = TOOLS_DIR / "hooks" / "post-commit-reindex.sh"

@@ -3304,16 +3304,41 @@ def topic_chain_json(conn, topic_row) -> dict:
     )
 
 
-def print_topic_chain(conn, topic_row) -> None:
+def topic_chain_lines(conn, topic_row) -> list:
+    """The plain-text chain-view lines for one topic row -- factored out of
+    print_topic_chain so `for-path`'s own renderer (for_path_chain_lines,
+    below) can build the exact same text without printing it (round 5: one
+    memidx invocation and one result-parsing python per pre-edit hook run,
+    where the chain text used to need its own separate `for-path` call)."""
     link_rows = conn.execute(
         "SELECT * FROM links WHERE topic_path=? ORDER BY seq ASC", (topic_row["path"],)
     ).fetchall()
-    for line in chain_lines(
+    return chain_lines(
         topic_row, link_rows,
         edges_for_topic(conn, topic_row["path"]),
         assumptions_for_topic(conn, topic_row["path"]),
-    ):
+    )
+
+
+def print_topic_chain(conn, topic_row) -> None:
+    for line in topic_chain_lines(conn, topic_row):
         print(line)
+
+
+def for_path_chain_lines(conn, project: str, matches, concept_matches) -> list:
+    """`for-path`'s plain-text rendering, shared by its own non-JSON CLI
+    mode and by `--json --with-chain-text` (round 5): one function, one
+    text, whichever mode asks for it -- no duplicated formatting."""
+    lines = []
+    if not matches and not concept_matches:
+        lines.append("no topics reference this path")
+    for row in matches:
+        lines.extend(topic_chain_lines(conn, row))
+    for crow in concept_matches:
+        lines.append(f"{crow['id']} {crow['title']} — {crow['owner_boundary']}")
+        for trow in governed_topic_rows(conn, project, crow):
+            lines.extend(topic_chain_lines(conn, trow))
+    return lines
 
 
 def concept_json(conn, project: str, concept_row) -> dict:
@@ -3360,19 +3385,29 @@ def cmd_for_path(args) -> int:
             out.extend(concept_json(conn, args.project, crow) for crow in concept_matches)
             # Item 2: --json carries state when opted into --root and the
             # state is worth naming -- see cmd_search's identical gate.
-            if root is not None and state in ("upgrade-required", "stale", "quarantined"):
+            state_worth_naming = root is not None and state in ("upgrade-required", "stale", "quarantined")
+            # Round 5: --with-chain-text folds the plain-text chain view
+            # (for_path_chain_lines -- the exact text non-JSON mode prints)
+            # into the JSON envelope itself, so a caller (hooks/pre-edit-
+            # chain.sh) needs only ONE `for-path` call per candidate instead
+            # of a second, separate plain-text call. The bare-list shape is
+            # kept byte-for-byte when the flag is absent -- tests pin it.
+            if getattr(args, "with_chain_text", False):
+                payload = {}
+                if state_worth_naming:
+                    payload["state"] = state
+                payload["results"] = out
+                payload["chain_text"] = "\n".join(
+                    for_path_chain_lines(conn, args.project, matches, concept_matches)
+                )
+                print(json.dumps(payload, indent=2))
+            elif state_worth_naming:
                 print(json.dumps({"state": state, "results": out}, indent=2))
             else:
                 print(json.dumps(out, indent=2))
         else:
-            if not matches and not concept_matches:
-                print("no topics reference this path")
-            for row in matches:
-                print_topic_chain(conn, row)
-            for crow in concept_matches:
-                print(f"{crow['id']} {crow['title']} — {crow['owner_boundary']}")
-                for trow in governed_topic_rows(conn, args.project, crow):
-                    print_topic_chain(conn, trow)
+            for line in for_path_chain_lines(conn, args.project, matches, concept_matches):
+                print(line)
         conn.close()
         return 0
     except (sqlite3.OperationalError, IndexError):
@@ -7629,6 +7664,14 @@ def main(argv=None) -> int:
     add_common_args(p_forpath, optional_root=True)
     p_forpath.add_argument("file_path")
     p_forpath.add_argument("--json", action="store_true")
+    p_forpath.add_argument(
+        "--with-chain-text", action="store_true",
+        help="add a chain_text field to the --json envelope, holding exactly "
+             "what for-path prints for this path when --json is omitted -- "
+             "wraps a bare-list answer as {\"results\": [...], \"chain_text\": "
+             "\"...\"} (a caller like a pre-edit hook needs only one for-path "
+             "call per candidate, not a second call for the human-readable text)",
+    )
     p_forpath.set_defaults(func=cmd_for_path)
 
     p_check = sub.add_parser("check")

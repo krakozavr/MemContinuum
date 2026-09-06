@@ -1696,8 +1696,8 @@ The decision index (`<project>.sqlite`) carries the same provenance discipline
 
 **Readers never hash; `check` and `unmapped` are the proof.** Hashing every
 record on every reader call would put a full store read on the pre-edit hot
-path — `for-path` runs twice per pre-edit under its own watchdog, on a store
-whose stat-only walk already costs over a second on a slow (drvfs/9P)
+path — `for-path` runs once per pre-edit candidate under its own watchdog, on a
+store whose stat-only walk already costs over a second on a slow (drvfs/9P)
 filesystem — so the five metadata-only readers keep the plain mtime/size
 comparison unconditionally; only the two commands that may WRITE the cache
 (`check`'s own report, `unmapped`'s self-heal gate) hash. A reader's `stale`
@@ -1723,19 +1723,19 @@ same five readers CAN see `stale`: a positive match off it is still returned
 (see the next paragraph), with one stderr line naming the cause (`"<cmd>:
 index is stale (store changed since the last reindex); results may be
 outdated"`). `for-path`'s own stale positive match, reached through
-`hooks/pre-edit-chain.sh` (which passes `--root "$MEMCONTINUUM_ROOT"` on its
-FIRST `for-path` call — the match-finding loop — whenever that env var is
-set), is logged under its own hook.log outcome name, `index-stale-served`,
-distinct from a plain `matched` — the staleness caveat itself reaches
-`hook.log` only via that first call's own stderr (the hook's existing
-redirect), never the injected `additionalContext` payload. The hook's SECOND
-`for-path` call — fetching the pretty chain-view text for the candidate the
-first call already matched — never passes `--root`. The first call already
-walked the store (via `_index_has_drift`) and already determined the state;
-a second `--root` there would re-walk the same store a second time for the
-same hook run, for no new information (the outcome name `finish()` logs, and
-whether the staleness caveat gets a stderr line at all, both come from the
-first call alone). One hook run walks the store at most once.
+`hooks/pre-edit-chain.sh` (which passes `--root "$MEMCONTINUUM_ROOT"` on the
+one `for-path` call it makes per candidate, whenever that env var is set), is
+logged under its own hook.log outcome name, `index-stale-served`, distinct
+from a plain `matched` — the staleness caveat itself reaches `hook.log` only
+via that call's own stderr (the hook's existing redirect), never the injected
+`additionalContext` payload. `for-path` also takes an opt-in `--with-chain-text`
+(added alongside this), which folds the plain-text chain rendering into the
+same `--json` envelope as a `chain_text` field — the hook passes it on every
+candidate call so the SAME call that finds the matching candidate and its
+state also returns the text `additionalContext` is built from; there is no
+second `for-path` call fetching that text separately, so one hook run walks
+the store at most once per candidate, and makes exactly one `for-path`
+invocation for whichever candidate matches.
 
 **A positive match off a non-`current` index stays usable; a negative claim
 does not.** `upgrade-required`, `stale`, and `quarantined` all warn and

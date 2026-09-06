@@ -443,6 +443,72 @@ class TestD8TimingAndForPath(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_for_path_json_with_chain_text_matches_plain_text_and_wraps_results(self):
+        """memidx.py item 1 (round 5, `--with-chain-text`): a caller (the
+        pre-edit hook) needs only ONE `for-path` call per candidate instead
+        of a second, separate plain-text call for the chain view. The
+        `chain_text` field must hold EXACTLY the text `for-path`'s own
+        plain-text mode prints for this same path -- one function
+        (for_path_chain_lines) renders both, so this also pins "no
+        duplicated formatting". The bare list becomes an object carrying
+        `results` once the flag is given."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            root.mkdir()
+            topic_dir = root / "topics" / "processing"
+            topic_dir.mkdir(parents=True)
+            shutil.copy(HIDDEN_FILES_FIXTURE, topic_dir / HIDDEN_FILES_FIXTURE.name)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+
+            plain_buf = io.StringIO()
+            with contextlib.redirect_stdout(plain_buf):
+                rc_plain = memidx.cmd_for_path(ns(
+                    db=str(db), project=memidx.DEFAULT_PROJECT,
+                    file_path="src/core/scan/scan_plan.py", json=False,
+                ))
+            self.assertEqual(rc_plain, 0)
+
+            json_buf = io.StringIO()
+            with contextlib.redirect_stdout(json_buf):
+                rc_json = memidx.cmd_for_path(ns(
+                    db=str(db), project=memidx.DEFAULT_PROJECT,
+                    file_path="src/core/scan/scan_plan.py", json=True,
+                    with_chain_text=True,
+                ))
+            self.assertEqual(rc_json, 0)
+            payload = json.loads(json_buf.getvalue())
+            self.assertIsInstance(payload, dict)
+            self.assertEqual(set(payload.keys()), {"results", "chain_text"})
+            self.assertIsInstance(payload["results"], list)
+            self.assertTrue(payload["results"])
+            self.assertEqual(payload["chain_text"], plain_buf.getvalue().rstrip("\n"))
+
+    def test_for_path_json_without_flag_stays_a_bare_list_on_a_real_match(self):
+        """Regression pin: --with-chain-text is opt-in -- omitted, --json
+        keeps its pre-existing bare-list shape even on a real match (the
+        other shape tests around for-path only cover the missing/error
+        states, never a positive match)."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            root.mkdir()
+            topic_dir = root / "topics" / "processing"
+            topic_dir.mkdir(parents=True)
+            shutil.copy(HIDDEN_FILES_FIXTURE, topic_dir / HIDDEN_FILES_FIXTURE.name)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = memidx.cmd_for_path(ns(
+                    db=str(db), project=memidx.DEFAULT_PROJECT,
+                    file_path="src/core/scan/scan_plan.py", json=True,
+                ))
+            self.assertEqual(rc, 0)
+            payload = json.loads(buf.getvalue())
+            self.assertIsInstance(payload, list)
+            self.assertTrue(payload)
+
 
 class TestStoreWalkPruning(unittest.TestCase):
     """walk_markdown must not index markdown that merely happens to sit under

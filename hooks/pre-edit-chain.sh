@@ -250,17 +250,32 @@ fi
 # below, same as every other call this script makes) already carries the
 # stale warning line -- this hook only needs to notice the state to log
 # its OWN distinct outcome name, `index-stale-served`, instead of
-# `matched`; the injected additionalContext payload built below is
-# unaffected either way (it comes from CHAIN_TEXT, a separate plain-text
-# call, never from RESULT_JSON).
+# `matched`.
+#
+# Round 5 (ruling 137 / CI evidence: the macOS runner measured this hook
+# at 1.003-1.022s against its own 1.0s bar, 27% runner-speed variance
+# between runs -- the cost is process starts, not real work). `for-path`
+# now takes `--with-chain-text` (memidx.py item 1): FORPATH_ARGS always
+# carries it, so the SAME call that finds the matching candidate and its
+# state also returns the plain-text chain rendering, in the same JSON
+# envelope -- there is no longer a second, separate `for-path` call once a
+# match is found (the old CHAIN_TEXT_ARGS call is gone). The three
+# separate `python -c` parsers this loop used to run per candidate
+# (results-only, candidate-state, topic-count via a `grep -c` besides)
+# collapse into the one `python -c` call below, which prints all four
+# values -- matched flag, state, topic count, chain text -- NUL-separated.
+# Read via `read -d ''` off a process substitution (`< <(...)`), not a
+# `|` pipe, so the values land in THIS shell rather than a subshell that
+# would discard them on exit -- no mapfile, so this stays bash-3.2-safe.
 MATCHED_CANDIDATE=""
 MATCHED_STATE="current"
-RESULT_JSON=""
+MATCHED_TOPIC_COUNT="0"
+CHAIN_TEXT=""
 ANY_QUERY_SUCCEEDED=0
 for candidate in "${CANDIDATES[@]}"; do
     FORPATH_ARGS=(for-path "$candidate" --project "$PROJECT" --db "$DB_PATH")
     [ -n "${MEMCONTINUUM_ROOT:-}" ] && FORPATH_ARGS+=(--root "$MEMCONTINUUM_ROOT")
-    FORPATH_ARGS+=(--json)
+    FORPATH_ARGS+=(--json --with-chain-text)
     RESULT_JSON="$(PYTHONPATH= "$PY" "$MEMIDX" "${FORPATH_ARGS[@]}" 2>>"$LOG")"
     RC=$?
     # F1 (ruling 68): for-path's own exit codes -- 3 = missing/uninitialized
@@ -280,33 +295,59 @@ for candidate in "${CANDIDATES[@]}"; do
         continue
     fi
     ANY_QUERY_SUCCEEDED=1
-    # Final-fix-wave item 2: --json now wraps as {"state":...,"results":
-    # [...]} whenever --root surfaced a non-current state -- pull the real
-    # results array (falling back to the whole payload for the pre-
-    # existing bare-list shape) and the state name (defaulting to
-    # "current" for that same bare-list shape) out of whichever form this
-    # call actually returned.
-    RESULTS_ONLY="$(printf '%s' "$RESULT_JSON" | "$PY" -c '
+    # --json --with-chain-text always wraps as an object -- {"results":
+    # [...], "chain_text": "...", maybe "state": ...} -- but this parser
+    # stays defensive about a malformed/bare-list payload (same fallbacks
+    # the old two parsers each had) since it is fed straight from
+    # $RESULT_JSON, not re-validated first. `topic_count` replicates the
+    # OLD `grep -c '"id":'` behavior EXACTLY, quirk included: `grep -c`
+    # counts matching LINES, not occurrences, and the old RESULTS_ONLY
+    # (like `results_dump` below) was always exactly one line (plain
+    # `json.dumps`, no `indent=`) -- so the pre-existing count was always
+    # "1" for any match, never a real per-topic/per-concept count however
+    # many "id" keys the results actually held (a concept match nests its
+    # governed topics' own "id" too). Byte-identical parity with the
+    # pre-round-5 script means keeping that quirk here, not fixing it.
+    MATCHED_FLAG=""
+    CANDIDATE_STATE=""
+    CANDIDATE_TOPIC_COUNT=""
+    CANDIDATE_CHAIN_TEXT=""
+    {
+        IFS= read -r -d '' MATCHED_FLAG
+        IFS= read -r -d '' CANDIDATE_STATE
+        IFS= read -r -d '' CANDIDATE_TOPIC_COUNT
+        IFS= read -r -d '' CANDIDATE_CHAIN_TEXT
+    } < <(printf '%s' "$RESULT_JSON" | PYTHONPATH= "$PY" -c '
 import json, sys
+
 try:
     d = json.load(sys.stdin)
 except Exception:
-    print("[]"); sys.exit(0)
-print(json.dumps(d.get("results", d) if isinstance(d, dict) else d))
-' 2>/dev/null)"
-    CANDIDATE_STATE="$(printf '%s' "$RESULT_JSON" | "$PY" -c '
-import json, sys
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    print("current"); sys.exit(0)
-print(d.get("state", "current") if isinstance(d, dict) else "current")
-' 2>/dev/null)"
+    d = None
+
+if isinstance(d, dict):
+    results = d.get("results", [])
+    state = d.get("state", "current") or "current"
+    chain_text = d.get("chain_text", "") or ""
+else:
+    results = d if isinstance(d, list) else []
+    state = "current"
+    chain_text = ""
+
+results_dump = json.dumps(results)
+matched = "1" if results else "0"
+topic_count = "1" if "\"id\":" in results_dump else "0"
+
+for field in (matched, state, topic_count, chain_text):
+    sys.stdout.write(field)
+    sys.stdout.write(chr(0))
+' 2>/dev/null)
     [ -z "$CANDIDATE_STATE" ] && CANDIDATE_STATE="current"
-    TRIMMED="$(printf '%s' "$RESULTS_ONLY" | tr -d '[:space:]')"
-    if [ -n "$TRIMMED" ] && [ "$TRIMMED" != "[]" ]; then
+    if [ "$MATCHED_FLAG" = "1" ]; then
         MATCHED_CANDIDATE="$candidate"
         MATCHED_STATE="$CANDIDATE_STATE"
+        MATCHED_TOPIC_COUNT="$CANDIDATE_TOPIC_COUNT"
+        CHAIN_TEXT="$CANDIDATE_CHAIN_TEXT"
         break
     fi
 done
@@ -318,23 +359,10 @@ if [ -z "$MATCHED_CANDIDATE" ]; then
     finish "no-match"
 fi
 
-TOPIC_COUNT="$(printf '%s' "$RESULTS_ONLY" | grep -c '"id":')"
+TOPIC_COUNT="$MATCHED_TOPIC_COUNT"
 
-# --- get the pretty chain-view text for the matched candidate --------------
-# Fix round 4 (ruling 136 / CI evidence): no --root here. The FORPATH_ARGS
-# loop above already resolved decision_index_state(root=...) for this exact
-# store/project (walking it via _index_has_drift when --root is set) and
-# already emitted any stale/quarantined warning off that same call's own
-# stderr (captured into $LOG, same as this one). Passing --root again here
-# would make THIS call re-run that same on-disk walk a second time for a
-# candidate already known to match -- one hook run, one store walk. Losing
-# --root here can only ever downgrade what THIS call itself might report as
-# "stale" back to "quarantined" or "current" (never gain a state it
-# shouldn't have) -- MATCHED_STATE/the outcome name logged by finish() still
-# come from the first call, unaffected.
-CHAIN_TEXT_ARGS=(for-path "$MATCHED_CANDIDATE" --project "$PROJECT" --db "$DB_PATH")
-CHAIN_TEXT="$(PYTHONPATH= "$PY" "$MEMIDX" "${CHAIN_TEXT_ARGS[@]}" 2>>"$LOG")"
-
+# CHAIN_TEXT came off the SAME matched candidate's for-path call above
+# (--with-chain-text) -- no second `for-path` invocation fetches it.
 if [ -z "$CHAIN_TEXT" ]; then
     finish "empty-chain-text"
 fi
