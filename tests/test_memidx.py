@@ -1244,6 +1244,85 @@ class TestF1DecisionIndexState(unittest.TestCase):
             self.assertEqual(rc, 4)
             self.assertEqual(json.loads(buf.getvalue()), [])
 
+    def test_for_path_index_error_with_chain_text_returns_object_shape(self):
+        """Round 6 fix: the `--json --with-chain-text` envelope is a
+        promise about SHAPE ({"results": [...], "chain_text": "..."}), not
+        just about the happy path -- this same
+        sqlite3.OperationalError/IndexError fail-open branch must keep
+        that shape when the flag is given, not fall back to the flag-less
+        bare `[]`. Same flaky-open rig as
+        test_for_path_index_error_fails_open_exits_4, plus
+        with_chain_text=True."""
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "idx.sqlite"
+            reindex(FIXTURES / "schema_filters", db, no_embed=True)
+            real_open = memidx.open_db_noncreating
+            calls = {"n": 0}
+
+            class _BrokenConn:
+                def execute(self, *a, **kw):
+                    raise sqlite3.OperationalError("no such column: link_topic_path")
+
+                def close(self):
+                    pass
+
+            def flaky_open(*a, **kw):
+                calls["n"] += 1
+                return real_open(*a, **kw) if calls["n"] == 1 else _BrokenConn()
+
+            buf = io.StringIO()
+            with mock.patch.object(memidx, "open_db_noncreating", side_effect=flaky_open), \
+                 contextlib.redirect_stdout(buf):
+                rc = memidx.cmd_for_path(ns(project=memidx.DEFAULT_PROJECT, db=str(db),
+                                             file_path="src/x.py", json=True,
+                                             with_chain_text=True))
+            self.assertEqual(rc, 4)
+            self.assertEqual(json.loads(buf.getvalue()), {"results": [], "chain_text": ""})
+
+    def test_for_path_index_error_with_chain_text_and_stale_root_includes_state(self):
+        """Same failure, but with --root pointed at a store that has
+        drifted since the last reindex (decision_index_state already read
+        "stale" before the try block ever runs): the object shape must
+        also carry "state" -- the same `state_worth_naming` gate
+        (root is not None and state in (...)) the main --json branch
+        uses, mirrored here rather than silently dropped in the
+        exception path."""
+        with tempfile.TemporaryDirectory() as td:
+            root = FIXTURES_COPY_OF("schema_filters", td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+            (root / "new-topic.md").write_text(
+                "---\ntype: topic\nid: TOP-NEW\ntitle: New\nlinks: []\n---\nBody.\n"
+            )
+            self.assertEqual(
+                memidx.decision_index_state(db, memidx.DEFAULT_PROJECT, root=root), "stale"
+            )
+
+            real_open = memidx.open_db_noncreating
+            calls = {"n": 0}
+
+            class _BrokenConn:
+                def execute(self, *a, **kw):
+                    raise sqlite3.OperationalError("no such column: link_topic_path")
+
+                def close(self):
+                    pass
+
+            def flaky_open(*a, **kw):
+                calls["n"] += 1
+                return real_open(*a, **kw) if calls["n"] == 1 else _BrokenConn()
+
+            buf = io.StringIO()
+            with mock.patch.object(memidx, "open_db_noncreating", side_effect=flaky_open), \
+                 contextlib.redirect_stdout(buf):
+                rc = memidx.cmd_for_path(ns(project=memidx.DEFAULT_PROJECT, db=str(db), root=str(root),
+                                             file_path="src/x.py", json=True,
+                                             with_chain_text=True))
+            self.assertEqual(rc, 4)
+            self.assertEqual(
+                json.loads(buf.getvalue()), {"state": "stale", "results": [], "chain_text": ""}
+            )
+
     def test_unmapped_coverage_status_per_state(self):
         cases = {
             "missing": (lambda db, root: None, "uninitialized", 1),

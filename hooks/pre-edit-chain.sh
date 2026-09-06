@@ -299,15 +299,32 @@ for candidate in "${CANDIDATES[@]}"; do
     # [...], "chain_text": "...", maybe "state": ...} -- but this parser
     # stays defensive about a malformed/bare-list payload (same fallbacks
     # the old two parsers each had) since it is fed straight from
-    # $RESULT_JSON, not re-validated first. `topic_count` replicates the
-    # OLD `grep -c '"id":'` behavior EXACTLY, quirk included: `grep -c`
-    # counts matching LINES, not occurrences, and the old RESULTS_ONLY
-    # (like `results_dump` below) was always exactly one line (plain
-    # `json.dumps`, no `indent=`) -- so the pre-existing count was always
-    # "1" for any match, never a real per-topic/per-concept count however
-    # many "id" keys the results actually held (a concept match nests its
-    # governed topics' own "id" too). Byte-identical parity with the
-    # pre-round-5 script means keeping that quirk here, not fixing it.
+    # $RESULT_JSON, not re-validated first.
+    #
+    # Round 6 fix: `topic_count` is now a REAL count of the DISTINCT
+    # topics whose chains actually appear in chain_text -- every direct
+    # topic match in `results`, plus, per matched concept ("kind":
+    # "concept"), the topics in its own "governed_by" list (the exact set
+    # for_path_chain_lines in memidx.py iterates for that concept; the
+    # concept entry itself is never counted -- it isn't a topic). Ids are
+    # collected into a SET, not just summed, so a topic that is both a
+    # direct match and a governor of a matched concept (or governs two
+    # matched concepts at once) is counted once in the header, matching
+    # the header's own wording ("N topic(s) REFERENCE this file" -- a
+    # count of distinct topics, not of chain renderings). chain_text
+    # itself is unaffected by this and keeps rendering that topic's chain
+    # once per role (for_path_chain_lines has no dedup of its own) -- the
+    # header and the body are allowed to disagree in that one direction.
+    # Round 5 had instead replicated the
+    # OLD `grep -c '"id":'` behavior verbatim, quirk included: `grep -c`
+    # counts matching LINES, not occurrences, and the old RESULTS_ONLY (a
+    # plain `json.dumps`, no `indent=`) was always exactly one line -- so
+    # the header always said "1 topic(s)" no matter how many topics or
+    # concepts actually matched. That quirk is what this round fixes: a
+    # two-topic match now reports "2", not "1" (tests/test_hooks.py's
+    # oracle-parity class normalises this one field before its
+    # byte-for-byte comparison against the frozen pre-round-5 script,
+    # documenting why there).
     MATCHED_FLAG=""
     CANDIDATE_STATE=""
     CANDIDATE_TOPIC_COUNT=""
@@ -334,9 +351,21 @@ else:
     state = "current"
     chain_text = ""
 
-results_dump = json.dumps(results)
 matched = "1" if results else "0"
-topic_count = "1" if "\"id\":" in results_dump else "0"
+
+topic_ids = set()
+for entry in results:
+    if not isinstance(entry, dict):
+        continue
+    if entry.get("kind") == "concept":
+        governed = entry.get("governed_by")
+        if isinstance(governed, list):
+            for grow in governed:
+                if isinstance(grow, dict) and "id" in grow:
+                    topic_ids.add(grow["id"])
+    elif "id" in entry:
+        topic_ids.add(entry["id"])
+topic_count = str(len(topic_ids))
 
 for field in (matched, state, topic_count, chain_text):
     sys.stdout.write(field)

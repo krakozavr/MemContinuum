@@ -3418,7 +3418,29 @@ def cmd_for_path(args) -> int:
         # under it (sqlite3.Row raises IndexError, not OperationalError, for
         # a missing key) -- both mean the same thing here: fail open, never
         # crash a hook-facing reader.
-        print(json.dumps([], indent=2) if args.json else "no topics reference this path")
+        #
+        # Round 6 fix: under `--with-chain-text` this must still be the
+        # object shape the flag promises -- {"results": [], "chain_text":
+        # ""}, plus "state" when known and worth naming (the exact
+        # `state_worth_naming` gate the main path above uses; `state` and
+        # `root` are both already resolved before the try block, so they
+        # are in scope here too) -- not the bare-list shape, which is only
+        # correct without the flag. The hook itself never sees this: it
+        # branches on for-path's RC==4 before parsing any JSON, so this
+        # only matters to a direct CLI/JSON consumer asking for the flag.
+        if args.json:
+            if getattr(args, "with_chain_text", False):
+                state_worth_naming = root is not None and state in ("upgrade-required", "stale", "quarantined")
+                payload = {}
+                if state_worth_naming:
+                    payload["state"] = state
+                payload["results"] = []
+                payload["chain_text"] = ""
+                print(json.dumps(payload, indent=2))
+            else:
+                print(json.dumps([], indent=2))
+        else:
+            print("no topics reference this path")
         return 4
 
 

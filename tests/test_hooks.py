@@ -931,7 +931,39 @@ class TestPreEditChainOracleParity(unittest.TestCase):
     temp file, not a reimplementation of its logic -- run against the
     exact same inputs as the current script. Only the outcome NAME is
     compared out of hook.log (never the full line: elapsed=/timestamp
-    naturally differ run to run)."""
+    naturally differ run to run).
+
+    Round 6 fixed a real bug the frozen oracle still has: its
+    "Decision-chain memory: N topic(s) reference this file." header
+    always said "1" for ANY match, because the old `grep -c '"id":'`
+    counted matching LINES of a one-line JSON dump (always exactly one
+    line), never a real per-topic count. The current script now computes
+    a real count of the DISTINCT topics whose chains actually get
+    rendered (see hooks/pre-edit-chain.sh's own comment at the
+    `topic_ids` loop) -- so on a multi-topic/concept match the oracle and
+    the current script now legitimately print DIFFERENT header counts,
+    by design, not by regression.
+    `_assert_stdout_matches_except_topic_count` below normalises only
+    that one digit before comparing, so every other byte of
+    additionalContext (chain text, citation
+    reminder, JSON structure) still has to match exactly."""
+
+    _TOPIC_COUNT_HEADER_RE = re.compile(
+        r"Decision-chain memory: \d+ topic\(s\) reference this file\."
+    )
+
+    def _assert_stdout_matches_except_topic_count(self, new_stdout, oracle_stdout):
+        def _normalized(text):
+            return self._TOPIC_COUNT_HEADER_RE.sub(
+                "Decision-chain memory: N topic(s) reference this file.", text
+            )
+
+        self.assertEqual(
+            _normalized(new_stdout), _normalized(oracle_stdout),
+            "byte-identical stdout (topic-count header normalised -- round 6 "
+            "made it a real count, so it may legitimately differ from the "
+            "frozen pre-round-5 oracle's always-1 quirk)",
+        )
 
     @classmethod
     def setUpClass(cls):
@@ -1036,20 +1068,29 @@ class TestPreEditChainOracleParity(unittest.TestCase):
         self.assertEqual(oracle_proc.returncode, 0, oracle_proc.stderr)
         self.assertEqual(new_proc.returncode, 0, new_proc.stderr)
         self.assertTrue(oracle_proc.stdout.strip())
-        self.assertEqual(new_proc.stdout, oracle_proc.stdout, "byte-identical stdout")
+        self._assert_stdout_matches_except_topic_count(new_proc.stdout, oracle_proc.stdout)
+        # The topic-count normalisation above widens the comparison from
+        # a literal byte match -- pin the one-topic count explicitly here
+        # so this scenario still proves "1", not just "whatever number
+        # both scripts happen to agree on".
+        self.assertIn("Decision-chain memory: 1 topic(s) reference this file.", new_proc.stdout)
         self.assertEqual(new_outcome, oracle_outcome)
         self.assertEqual(new_outcome, "matched")
 
-    def test_match_with_two_topics_keeps_the_old_topic_count_quirk(self):
-        """Review finding: the old `grep -c '"id":'` topic count counts
-        matching LINES, not occurrences -- and the old RESULTS_ONLY (a
-        plain `json.dumps`, no `indent=`) was always exactly one line, so
-        the pre-round-5 count was always "1" for any match, never a real
-        per-topic count, however many topics actually matched. A store
-        where TWO topics both reference the same file is the one scenario
-        that would catch a parser replicating a real per-topic COUNT
-        instead of this exact quirk -- the two other scenarios above (one
-        topic, no concepts) cannot distinguish "1" from "a real count"."""
+    def test_match_with_two_topics_gets_a_real_topic_count(self):
+        """Round 6 red test: a store where TWO topics both reference the
+        same file is the one scenario that distinguishes a real per-topic
+        COUNT from the old `grep -c '"id":'` quirk -- the other scenarios
+        (one topic, no concepts) all print "1" either way and can't tell
+        the difference. The frozen oracle (0732ac4) still has the old bug
+        (`grep -c` counts matching LINES of a one-line JSON dump, always
+        exactly one line, so its header always says "1" no matter how many
+        topics matched) -- that is now an EXPECTED divergence from the
+        current script, not a parity failure, so the raw byte-for-byte
+        stdout comparison every other scenario in this class uses is
+        replaced here with `_assert_stdout_matches_except_topic_count`,
+        which normalises away only the header's digit before comparing
+        everything else (chain text, citation reminder, JSON structure)."""
         project = "oracle-two-topics"
         home = self._new_home(project)
         root = Path(self.tmp) / f"{project}-store"
@@ -1069,12 +1110,15 @@ class TestPreEditChainOracleParity(unittest.TestCase):
         self.assertEqual(oracle_proc.returncode, 0, oracle_proc.stderr)
         self.assertEqual(new_proc.returncode, 0, new_proc.stderr)
         self.assertTrue(oracle_proc.stdout.strip())
-        self.assertEqual(new_proc.stdout, oracle_proc.stdout, "byte-identical stdout")
+        self._assert_stdout_matches_except_topic_count(new_proc.stdout, oracle_proc.stdout)
         self.assertEqual(new_outcome, oracle_outcome)
         self.assertEqual(new_outcome, "matched")
-        # Pins the quirk itself, not just parity: two topics matched, but
-        # the header still says "1" -- exactly what 0732ac4 always said.
+        # The oracle still has the old quirk: two topics matched, header
+        # still says "1" -- exactly what 0732ac4 always said.
         self.assertIn("Decision-chain memory: 1 topic(s) reference this file.", oracle_proc.stdout)
+        # The current script computes a real count: two topics matched,
+        # header says "2" -- this is the fix this round makes.
+        self.assertIn("Decision-chain memory: 2 topic(s) reference this file.", new_proc.stdout)
 
     def test_no_match(self):
         project = "oracle-nomatch"
@@ -1109,7 +1153,7 @@ class TestPreEditChainOracleParity(unittest.TestCase):
         self.assertEqual(oracle_proc.returncode, 0, oracle_proc.stderr)
         self.assertEqual(new_proc.returncode, 0, new_proc.stderr)
         self.assertTrue(oracle_proc.stdout.strip())
-        self.assertEqual(new_proc.stdout, oracle_proc.stdout, "byte-identical stdout")
+        self._assert_stdout_matches_except_topic_count(new_proc.stdout, oracle_proc.stdout)
         self.assertEqual(new_outcome, oracle_outcome)
         self.assertEqual(new_outcome, "index-stale-served")
 
@@ -1133,7 +1177,7 @@ class TestPreEditChainOracleParity(unittest.TestCase):
         self.assertEqual(oracle_proc.returncode, 0, oracle_proc.stderr)
         self.assertEqual(new_proc.returncode, 0, new_proc.stderr)
         self.assertTrue(oracle_proc.stdout.strip())
-        self.assertEqual(new_proc.stdout, oracle_proc.stdout, "byte-identical stdout")
+        self._assert_stdout_matches_except_topic_count(new_proc.stdout, oracle_proc.stdout)
         self.assertEqual(new_outcome, oracle_outcome)
         self.assertEqual(new_outcome, "matched")
 
