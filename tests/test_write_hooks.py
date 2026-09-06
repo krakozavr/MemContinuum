@@ -1233,6 +1233,75 @@ class TestMutationSurface(HookTestBase):
         log2 = (self.home / "hook.log").read_text()
         self.assertNotIn("ledger outcome=appended kind=code source=shell-diff", log2)
 
+    # -- codex re-gate MINOR 2: the G3 directory guard above must not also
+    # discard a genuine TRACKED-FILE DELETION -- when a directory now
+    # occupies the exact path a tracked file was deleted from, porcelain
+    # still reports the deletion (` D`), and that row must still be
+    # ledgered (content_sha256=""), alongside the new child file underneath.
+
+    def test_tracked_file_replaced_by_directory_still_ledgers_the_deletion(self):
+        session_id = "s-mutation-file-to-dir"
+
+        proc1, _ = run_script(LEDGER_HOOK, self.bash_payload(session_id), self.base_env())
+        self.assertEqual(proc1.returncode, 0, proc1.stderr)
+        state1 = self.load_state(session_id)
+        self.assertEqual(state1.get("ledger", []), [])
+
+        target = self.code_root / "src" / "mapped.py"
+        target.unlink()
+        child = target / "child.py"
+        _write(child, "# child\n")  # target is now a directory
+
+        proc2, _ = run_script(LEDGER_HOOK, self.bash_payload(session_id), self.base_env())
+        self.assertEqual(proc2.returncode, 0, proc2.stderr)
+        state2 = self.load_state(session_id)
+        rows = {e["path"]: e for e in state2.get("ledger", []) if e.get("source") == "shell-diff"}
+
+        self.assertIn(
+            str(target), rows,
+            f"the tracked-file deletion must still be ledgered even though a directory now "
+            f"occupies its path: {rows}",
+        )
+        self.assertEqual(rows[str(target)]["content_sha256"], "")
+
+        self.assertIn(str(child), rows, f"the new child file must also be ledgered: {rows}")
+        self.assertNotEqual(rows[str(child)]["content_sha256"], "")
+
+        log2 = (self.home / "hook.log").read_text()
+        self.assertIn("ledger outcome=appended kind=code source=shell-diff file=" + str(target), log2)
+
+    # -- codex re-gate MINOR 2, mirror-image case caught at review: the
+    # BASELINE loop has its own copy of the G3 directory guard, and it
+    # must record a pre-baseline tracked-file-to-directory deletion as ""
+    # (matching an ordinary pre-baseline deletion, which already lands as
+    # "" via sha_of() on a missing path) -- never simply drop the path
+    # from the baseline entirely, or the very same deletion the per-call
+    # fix above now preserves gets falsely attributed as NEW dirt on the
+    # very first post-baseline call, violating the same invariant
+    # test_dirt_before_baseline_is_not_attributed protects for every
+    # other pre-baseline change shape.
+
+    def test_file_to_directory_before_baseline_is_not_attributed(self):
+        session_id = "s-mutation-predirt-dir"
+        target = self.code_root / "src" / "mapped.py"
+        target.unlink()
+        _write(target / "child.py", "# child\n")  # replaced BEFORE the baseline call
+
+        proc1, _ = run_script(LEDGER_HOOK, self.bash_payload(session_id), self.base_env())
+        self.assertEqual(proc1.returncode, 0, proc1.stderr)
+        state1 = self.load_state(session_id)
+        self.assertEqual(state1.get("ledger", []), [])
+
+        proc2, _ = run_script(LEDGER_HOOK, self.bash_payload(session_id), self.base_env())
+        self.assertEqual(proc2.returncode, 0, proc2.stderr)
+        state2 = self.load_state(session_id)
+        rows = [e for e in state2.get("ledger", []) if e.get("source") == "shell-diff"]
+        self.assertEqual(
+            rows, [],
+            f"a file-to-directory replacement that happened BEFORE the baseline call must "
+            f"never be attributed as new dirt on the next call: {rows}",
+        )
+
     # -- writable-surface regression guard: the shell-diff branch's own
     # `git status` calls must be read-only -- INTERNALS.md's writable-
     # surface claim depends on this staying true, since this hook now runs

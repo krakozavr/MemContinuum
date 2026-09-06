@@ -128,13 +128,15 @@ esac
 # strictly BEFORE sourcing memlib.sh (which does its own mkdir -p work)
 # -- see hooks/userprompt-remind.sh's
 # test_outer_deadline_covers_memlib_sourcing for why this ordering
-# matters. Fix wave 1, G3 (task-8-review NIT-2): the cheap, bash-only
-# prefilter above (a `cat` and a `case` scan, no python, no subprocess)
-# now runs before this guard block, so it is no longer the literal first
-# thing after resolving SCRIPT_DIR -- but it is still the first thing
-# that could possibly cost anything (spawn python, touch a subprocess),
-# which is the property this guard's position actually protects. A tiny
-# python launcher
+# matters. Fix wave 1, G3 (task-8-review NIT-2); codex re-gate NIT 3: the
+# actual order is PAYLOAD="$(cat)" above (line ~93, one unguarded read of
+# stdin -- itself a subprocess, `cat`) first, then the bash-only prefilter
+# (the `case` scan just above this comment, no further subprocess) still
+# ahead of this guard block, so this guard is no longer the literal first
+# thing after resolving SCRIPT_DIR, and the prefilter it follows is not
+# subprocess-free either. What this guard's position still protects is
+# being the first launch of PYTHON -- the one cost a hung or malicious
+# payload could turn into an unbounded wait. A tiny python launcher
 # (mc-watchdog.sh's MC_WATCHDOG_LAUNCHER_PY) starts this same script as a
 # child in its own process group and kills the WHOLE group on a
 # wall-clock budget (2s here; see hooks/mc-watchdog.sh), so an orphaned
@@ -234,7 +236,13 @@ esac
 # identical seven-key `state.setdefault(...)` bootstrap verbatim into
 # their own python heredoc -- factored into one snippet here, concatenated
 # into both (bash 3.2-safe `'...'"$VAR"'...'` quoting), so a future new
-# default key is added once, not twice.
+# default key is added once, not twice. Codex re-gate NIT 4: the same
+# duplication applied to MC_NOW -- both branches independently exported it
+# from bash and independently re-derived a float `now` from it in python;
+# both pieces now live in exactly one place each (this export, and the
+# `now` assignment inside the shared snippet below), still concatenated
+# into both payloads.
+export MC_NOW="$(date +%s 2>/dev/null || echo 0)"
 MC_STATE_BOOTSTRAP_PY='
 def _mc_bootstrap_state(state):
     state.setdefault("user_turn_count", 0)
@@ -244,6 +252,11 @@ def _mc_bootstrap_state(state):
     state.setdefault("last_injected_pairs", [])
     state.setdefault("last_growth_turn", 0)
     state.setdefault("lookback_count", 0)
+
+try:
+    now = float(os.environ.get("MC_NOW") or time.time())
+except Exception:
+    now = time.time()
 '
 
 if [ "$MC_SOURCE_TAG" = "shell-diff" ]; then
@@ -255,7 +268,6 @@ if [ "$MC_SOURCE_TAG" = "shell-diff" ]; then
     export MC_CODE_ROOTS_LINES="$CODE_ROOTS_TEXT"
     export MC_SESSION_ID="$SESSION_ID"
     export MC_PROJECT_ENV="$MC_PROJECT"
-    export MC_NOW="$(date +%s 2>/dev/null || echo 0)"
     export MC_LOG_PATH="$MC_LOG"
 
     mc_update_state_json "$STATE_FILE" '
@@ -292,11 +304,6 @@ def log_line(text):
     except OSError:
         pass
 
-
-try:
-    now = float(os.environ.get("MC_NOW") or time.time())
-except Exception:
-    now = time.time()
 
 roots = []
 for _line in (os.environ.get("MC_CODE_ROOTS_LINES") or "").splitlines():
@@ -364,6 +371,13 @@ for root, kind in roots:
     if entries and entries[-1] == "":
         entries.pop()
     dirty = []
+    # Codex re-gate MINOR 2: the directory guard below (fix wave 1, G3)
+    # needs each path own porcelain status to tell a genuine deletion
+    # apart from a directory that was simply never a tracked file
+    # content in the first place. Keyed on path, not identity of entry --
+    # a rename old_path shares its rename status, which never carries a
+    # deletion signal on its own.
+    path_status = {}
     idx = 0
     while idx < len(entries):
         entry = entries[idx]
@@ -373,12 +387,14 @@ for root, kind in roots:
         xy = entry[:2]
         path = entry[3:]
         dirty.append(path)
+        path_status[path] = xy
         if "R" in xy or "C" in xy:
             if idx < len(entries):
                 old_path = entries[idx]
                 idx += 1
                 if old_path:
                     dirty.append(old_path)
+                    path_status.setdefault(old_path, xy)
     dirty = sorted(set(dirty))
 
     if root not in shell_baseline:
@@ -407,8 +423,22 @@ for root, kind in roots:
                 # entry -- sha_of() on a directory raises
                 # IsADirectoryError (caught, returns "") which is
                 # indistinguishable from a genuine deletion. Skip a dirty
-                # entry that IS a directory before ever hashing it.
+                # entry that IS a directory before ever hashing it. Codex
+                # re-gate MINOR 2, mirror-image case: a path deleted
+                # BEFORE this very first call, with a directory now
+                # occupying it, must still land in the baseline as ""
+                # (matching an ordinary pre-baseline deletion, which
+                # already lands as "" via sha_of() on a missing path) --
+                # dropping it from the map entirely instead makes the
+                # NEXT call see no baseline entry (None) for a path whose
+                # current state is deletion-shaped ("", once the per-call
+                # loop own status-aware guard runs), falsely attributing
+                # pre-baseline dirt as newly appended.
+                xy = path_status.get(p, "")
                 if os.path.isdir(full):
+                    if "D" not in xy:
+                        continue
+                    baseline_map[p] = ""
                     continue
                 baseline_map[p] = sha_of(full)
             if budget_hit:
@@ -431,10 +461,23 @@ for root, kind in roots:
         full = os.path.normpath(os.path.join(root, p))
         # Fix wave 1, G3: same directory guard as the baseline loop above
         # -- a nested git repo created AFTER the baseline is a directory
-        # entry here too, and must never be hashed or ledgered.
+        # entry here too, and must never be hashed or ledgered. Codex
+        # re-gate MINOR 2: that guard must not also eat a genuine
+        # TRACKED-FILE DELETION -- when porcelain reports a deletion
+        # (`D` in either status column: unstaged ` D`, staged `D `, or
+        # any other XY that still carries one) for a path a directory now
+        # occupies (a replacement directory created after the delete),
+        # the deletion is real and still belongs in the ledger with an
+        # empty content_sha256; only a NON-deletion status is what this
+        # guard exists to protect (a nested repo or new directory was
+        # never tracked content to hash in the first place).
+        xy = path_status.get(p, "")
         if os.path.isdir(full):
-            continue
-        sha = sha_of(full)
+            if "D" not in xy:
+                continue
+            sha = ""
+        else:
+            sha = sha_of(full)
         if root_baseline.get(p) == sha:
             continue
         pair = (full, sha)
@@ -523,7 +566,6 @@ export MC_KIND="$KIND"
 export MC_ROOT="$MC_MATCHED_ROOT"
 export MC_SESSION_ID="$SESSION_ID"
 export MC_PROJECT_ENV="$MC_PROJECT"
-export MC_NOW="$(date +%s 2>/dev/null || echo 0)"
 
 mc_update_state_json "$STATE_FILE" '
 import hashlib, os, time
@@ -536,10 +578,6 @@ kind = os.environ.get("MC_KIND", "code")
 # containment loop found a match, and a store-kind row must not carry a
 # code root even if one also happened to match).
 root = os.environ.get("MC_ROOT", "") if kind == "code" else ""
-try:
-    now = float(os.environ.get("MC_NOW") or time.time())
-except Exception:
-    now = time.time()
 if path:
     try:
         with open(path, "rb") as f:

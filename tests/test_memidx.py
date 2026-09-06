@@ -3103,6 +3103,70 @@ class TestMalformedRecordQuarantine(unittest.TestCase):
             self.assertEqual(len(rows), 1, rows)
             self.assertEqual(rows[0]["path"], str(covering.resolve()))
 
+    # -- scenario 7c: codex re-gate BLOCKING 1 (ruling 134) -- canonicity
+    # must be read from the block's OWN top-level indent, not column zero
+    # and not a global minimum over the whole scanned text. A valid topic
+    # whose entire frontmatter mapping is uniformly indented, later
+    # stripped of only its closing `---`, leaves an unindented body line
+    # ("Body text.") merged into the raw text handed to
+    # `_raw_frontmatter_is_canonical` (no end delimiter means no separate
+    # body slice at all). A global-minimum rule would anchor "top level"
+    # to that stray column-zero body line and never see the real
+    # (indented) id:/type: keys -- silently demoting a still fully
+    # schema-conformant record to a note.
+
+    def test_unmapped_self_heal_with_uniformly_indented_frontmatter_stays_quarantined(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            covering = root / "topics" / "covering.md"
+            _write_record(
+                covering,
+                "---\n  type: topic\n  id: TOP-9113\n  title: Covering\n  code_refs: [src/mapped.py]\n"
+                "  links:\n"
+                '    - link: L1\n      status: active\n      ruling: {text: "r", authority: owner-verbatim, source: s}\n'
+                "---\nBody text.\n",
+            )
+            db = Path(td) / "idx.sqlite"
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                rc0 = reindex(root, db, no_embed=True)
+            self.assertEqual(rc0, 0)
+            self.assertEqual(self._index_errors_rows(db), [])
+
+            # On-disk drift: remove ONLY the closing delimiter -- the
+            # frontmatter mapping itself is untouched and still fully
+            # schema-conformant (id/type/links/code_refs all present).
+            _write_record(
+                covering,
+                "---\n  type: topic\n  id: TOP-9113\n  title: Covering\n  code_refs: [src/mapped.py]\n"
+                "  links:\n"
+                '    - link: L1\n      status: active\n      ruling: {text: "r", authority: owner-verbatim, source: s}\n'
+                "Body text.\n",
+            )
+            self.assertEqual(
+                memidx.decision_index_state(db, memidx.DEFAULT_PROJECT, root=root, verify_content=True),
+                "stale",
+            )
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                rc = memidx.cmd_unmapped(ns(
+                    project=memidx.DEFAULT_PROJECT, db=str(db), root=str(root),
+                    code_root=None, paths=["src/mapped.py"], json=True,
+                ))
+            out = json.loads(buf.getvalue())
+            self.assertEqual(rc, 1, out)
+            self.assertEqual(out["coverage_status"], "quarantined", out)
+            self.assertEqual(
+                out["unmapped"], [],
+                "a uniformly-indented canonical mapping missing only its closing delimiter "
+                "must still be quarantined, never silently demoted to a note that leaves a "
+                "false coverage gap",
+            )
+
+            rows = self._index_errors_rows(db)
+            self.assertEqual(len(rows), 1, rows)
+            self.assertEqual(rows[0]["path"], str(covering.resolve()))
+
     # -- scenario 8: a note (no id/links/type) with malformed YAML stays indexed
 
     def test_note_with_malformed_yaml_stays_indexed_not_quarantined(self):
@@ -3225,9 +3289,11 @@ class TestMalformedRecordQuarantine(unittest.TestCase):
 
     def test_indented_links_marker_does_not_make_unterminated_note_canonical(self):
         """Grok MINOR 6: `_raw_frontmatter_is_canonical` must match only
-        column-zero lines -- an indented `- links:` line inside an
-        otherwise note-shaped, unterminated frontmatter block must never
-        flip the record to canonical (and therefore to quarantine)."""
+        lines at the block's own top-level indent (its first non-blank
+        line's indent -- here column zero) -- an indented `- links:` line
+        inside an otherwise note-shaped, unterminated frontmatter block
+        must never flip the record to canonical (and therefore to
+        quarantine)."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "root"
             note_path = root / "notes" / "note.md"

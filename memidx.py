@@ -352,22 +352,41 @@ def _raw_frontmatter_is_canonical(fm_text: str) -> bool:
     fallback (whose recovered `fm` never carries `links` at all, a
     complex field never recovered) can each hide a genuinely canonical
     record's `id`/`type`/`links` behind a parse failure that otherwise
-    defaults to `{}`. Scans every COLUMN-ZERO line for the three
-    canonical markers `is_canonical_frontmatter` itself checks, applied
-    to text instead of a dict: a schema `id:` prefix, a `links:` key
-    (block OR flow, any value or none), a schema `type:`. A leading
-    list-item marker (`- `, itself at column zero -- from a frontmatter
-    block that parsed, or almost parsed, as a top-level list) is stripped
-    before matching, so `- id: TOP-1` is still recognized; an INDENTED
-    line is never checked at all (fix wave 1, G1 / Grok MINOR 6) -- a
-    nested `- links:`/`- type: topic` several levels deep inside some
-    other malformed structure is not a top-level frontmatter key and must
-    never flip a note to canonical. A false positive on a genuine
-    column-zero line only ever makes MORE records canonical (and
+    defaults to `{}`. Scans every TOP-LEVEL line of the block for the
+    three canonical markers `is_canonical_frontmatter` itself checks,
+    applied to text instead of a dict: a schema `id:` prefix, a `links:`
+    key (block OR flow, any value or none), a schema `type:`.
+
+    Fix round 2, codex re-gate BLOCKING 1 (ruling 134): "top-level" is the
+    indentation of the block's own FIRST non-blank line, not column zero
+    -- a whole frontmatter mapping uniformly indented (e.g. two spaces,
+    however it got that way) has its real id/type/links at THAT indent,
+    and must be read there. A line indented deeper than that first line
+    is nested (a nested `- links:`, a nested `id:` several levels into
+    some other malformed structure) and is never checked -- it must never
+    flip a note to canonical (fix wave 1, G1 / Grok MINOR 6).
+
+    Anchoring to the first line rather than the minimum indent over the
+    WHOLE text matters for the one caller (`parse_record`'s missing-`---`
+    branch) that hands this function text extending past the frontmatter
+    block itself into whatever follows (there is no closing delimiter to
+    stop at): an ordinary, unindented body line mixed into that text must
+    never redefine "top level" down to column zero and bury a genuinely
+    indented mapping's keys as merely "deeper than top" -- exactly the
+    false-note regression the finding reports. A line at or above the
+    first line's indent (including a body line that happens to sit
+    shallower) is still scanned and can still register a false positive;
+    a false positive only ever makes MORE records canonical (and
     therefore quarantined, not silently emptied), never fewer -- the safe
     direction."""
+    base_indent = None
     for raw_line in fm_text.splitlines():
-        if raw_line[:1] in (" ", "\t"):
+        if not raw_line.strip():
+            continue
+        indent = len(raw_line) - len(raw_line.lstrip(" \t"))
+        if base_indent is None:
+            base_indent = indent
+        if indent > base_indent:
             continue
         line = raw_line.strip()
         if line.startswith("- "):
