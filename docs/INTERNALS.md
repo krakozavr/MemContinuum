@@ -340,10 +340,33 @@ room than a help line.
 - **Explicit `--store` with no `--claude-dir` is a hard error** (exit 2). An
   explicit store may legitimately be wired from any cwd — a test harness, a
   script, an unrelated checkout — so the cwd is not a safe signal for where the
-  hooks belong, and even a git cwd can be the wrong repo. `--claude-dir`
-  defaults from the store's parent *only* when `--store` was also omitted, in
-  which case the store defaulted beside the repo the cwd is in and that is a
-  reliable signal.
+  hooks belong, and even a git cwd can be the wrong repo. When `--store` is
+  omitted instead, `--claude-dir` defaults from the CHECKOUT the cwd is in
+  (that repo's own `.claude`) — never from wherever the defaulted store itself
+  ends up landing. Those two happen to coincide when the cwd is not inside any
+  git repo (the store then defaults directly into the cwd, and `--claude-dir`
+  derives from that same cwd), but deliberately do not for a checkout that is
+  a git repo: the store defaults beside it, "`<repo>-MemContinuum-Store`",
+  while `--claude-dir` still comes from the repo's own toplevel, not the
+  store's parent. This split matters for the WSL rule below — a checkout on a
+  Windows-mounted drive defaults its store onto an entirely different disk,
+  and the hooks must stay with the repo regardless.
+- **The default store lands on the WSL disk, not beside the repo, when the
+  checkout itself is Windows-mounted**: a checkout whose
+  physical path resolves under `/mnt/<letter>/` while running under WSL (its
+  kernel names Microsoft — case-insensitive) walks that store over drvfs/9P
+  on every retrieval and ledger call, costing seconds instead of milliseconds.
+  `mc_default_store_for` (`scripts/mc-registry-lib.sh`, shared with no other
+  caller today — `memcontinuum-decide.sh` only ever records a `--store` it is
+  explicitly given, and `hooks/memcontinuum-detect.sh` never proposes a path
+  at all) detects this (`mc_is_windows_mounted_checkout`, with
+  `MEMCONTINUUM_PROC_VERSION_FILE`/`MEMCONTINUUM_TEST_WSL_MOUNT` test seams so
+  the check need not depend on the CI runner actually being WSL) and defaults
+  the store instead to `$HOME/dev/<repo>-MemContinuum-Store` when `$HOME/dev`
+  is a directory (this machine's convention for where checkouts live), else
+  bare `$HOME/<repo>-MemContinuum-Store` — printing one line naming why.
+  `--claude-dir` is unaffected (see above); an explicit `--store` always wins
+  and skips this rule entirely, on WSL or anywhere else.
 - **An existing git repo at `--store` carrying none of this tool's markers is
   refused** (exit 9) — markers being a `topics/`, `incidents/` or `concepts/`
   directory, or a `README.md` mentioning MemContinuum. A mistyped `--store`

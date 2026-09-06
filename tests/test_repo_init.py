@@ -1462,6 +1462,246 @@ class TestDefaultStoreName(unittest.TestCase):
             shutil.rmtree(home, ignore_errors=True)
 
 
+class TestMcIsWindowsMountedCheckout(unittest.TestCase):
+    """Direct unit coverage for mc_is_windows_mounted_checkout
+    (scripts/mc-registry-lib.sh, TOP-0109 L5): true iff /proc/version names
+    Microsoft's kernel build AND the checkout resolves under
+    /mnt/<letter>/. Both real-world signals are driven through the two test
+    seams (MEMCONTINUUM_PROC_VERSION_FILE, MEMCONTINUUM_TEST_WSL_MOUNT)
+    rather than the machine this suite happens to run on -- CI may or may
+    not itself be WSL, and even a real WSL box has no actual /mnt/<letter>
+    checkout inside a throwaway sandbox HOME. mc-registry-lib.sh is a pure
+    library (no top-level CLI execution), so it is safely sourceable on its
+    own -- same pattern as TestMcPhysical in tests/test_update.py."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp(prefix="memcontinuum-wsl-mount-test-")
+        self.addCleanup(shutil.rmtree, self.td, ignore_errors=True)
+        self.caller = Path(self.td) / "probe.sh"
+        self.caller.write_text(
+            f'#!/usr/bin/env bash\nset -u\n. "{REGISTRY_LIB}"\n'
+            'mc_is_windows_mounted_checkout "$1" && echo YES || echo NO\n'
+        )
+
+    def _call(self, checkout, proc_version_text=None, force=None):
+        env = dict(os.environ)
+        for k in ("MEMCONTINUUM_PROC_VERSION_FILE", "MEMCONTINUUM_TEST_WSL_MOUNT"):
+            env.pop(k, None)
+        if proc_version_text is not None:
+            pv = Path(self.td) / "proc-version"
+            pv.write_text(proc_version_text)
+            env["MEMCONTINUUM_PROC_VERSION_FILE"] = str(pv)
+        else:
+            # A path that cannot exist -- exercises the "no /proc/version at
+            # all" branch (macOS, or any non-Linux box) the same way a
+            # missing real /proc/version would: `read <file` fails, and the
+            # function must return NOT-mounted, never guess.
+            env["MEMCONTINUUM_PROC_VERSION_FILE"] = str(Path(self.td) / "does-not-exist")
+        if force is not None:
+            env["MEMCONTINUUM_TEST_WSL_MOUNT"] = force
+        proc = subprocess.run(
+            [MC_BASH, str(self.caller), checkout],
+            capture_output=True, text=True, env=env, timeout=10,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout.strip()
+
+    def test_microsoft_kernel_and_mnt_path_is_mounted(self):
+        out = self._call("/mnt/c/Users/x/proj", proc_version_text="Linux version 5.15.90.1-microsoft-standard-WSL2")
+        self.assertEqual(out, "YES")
+
+    def test_kernel_name_match_is_case_insensitive(self):
+        out = self._call("/mnt/z/proj", proc_version_text="Linux version foo MICROSOFT bar")
+        self.assertEqual(out, "YES")
+
+    def test_microsoft_kernel_but_native_path_is_not_mounted(self):
+        """Test (d)'s other half: WSL itself, checkout on the native disk
+        (not under /mnt) -- the sibling rule still applies."""
+        out = self._call("/home/x/proj", proc_version_text="Linux version 5.15.90.1-microsoft-standard-WSL2")
+        self.assertEqual(out, "NO")
+
+    def test_mnt_path_but_no_microsoft_kernel_is_not_mounted(self):
+        """Test (d): macOS/Linux without WSL -- a literal /mnt path (an
+        unrelated real mount, nothing to do with WSL) must not read as a
+        Windows-mounted checkout just because of its spelling."""
+        out = self._call("/mnt/c/Users/x/proj", proc_version_text="Linux version 6.1.0-generic")
+        self.assertEqual(out, "NO")
+
+    def test_no_proc_version_at_all_is_not_mounted(self):
+        """macOS (and any non-Linux box) has no /proc/version -- fails
+        open to NOT-mounted, never a guess."""
+        out = self._call("/mnt/c/Users/x/proj")
+        self.assertEqual(out, "NO")
+
+    def test_neither_signal_is_not_mounted(self):
+        out = self._call("/home/x/proj", proc_version_text="Linux version 6.1.0-generic")
+        self.assertEqual(out, "NO")
+
+    def test_force_override_bypasses_both_real_checks(self):
+        """MEMCONTINUUM_TEST_WSL_MOUNT=1 forces true even for a path and a
+        kernel string that would otherwise both say NO -- the seam an
+        end-to-end installer test uses when its sandbox checkout cannot
+        physically be under /mnt."""
+        out = self._call("/home/x/proj", proc_version_text="Linux version 6.1.0-generic", force="1")
+        self.assertEqual(out, "YES")
+
+    def test_force_override_any_other_value_does_not_force(self):
+        out = self._call("/home/x/proj", proc_version_text="Linux version 6.1.0-generic", force="0")
+        self.assertEqual(out, "NO")
+
+
+class TestMcDefaultStoreFor(unittest.TestCase):
+    """Direct unit coverage for mc_default_store_for
+    (scripts/mc-registry-lib.sh, TOP-0109 L5): the sibling rule ordinarily,
+    the WSL-disk rule when the checkout is Windows-mounted -- $HOME/dev
+    when that directory exists, else bare $HOME."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp(prefix="memcontinuum-default-store-test-")
+        self.addCleanup(shutil.rmtree, self.td, ignore_errors=True)
+        self.caller = Path(self.td) / "probe.sh"
+        self.caller.write_text(
+            f'#!/usr/bin/env bash\nset -u\n. "{REGISTRY_LIB}"\n'
+            'mc_default_store_for "$1"\n'
+            'printf \'%s\\n%s\\n\' "$MC_DEFAULT_STORE" "$MC_DEFAULT_STORE_WHY"\n'
+        )
+
+    def _call(self, checkout, home, force=None):
+        env = dict(os.environ)
+        env["HOME"] = home
+        env.pop("MEMCONTINUUM_TEST_WSL_MOUNT", None)
+        if force is not None:
+            env["MEMCONTINUUM_TEST_WSL_MOUNT"] = force
+        proc = subprocess.run(
+            [MC_BASH, str(self.caller), checkout],
+            capture_output=True, text=True, env=env, timeout=10,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        lines = proc.stdout.splitlines()
+        return lines[0], (lines[1] if len(lines) > 1 else "")
+
+    def test_windows_mounted_checkout_with_home_dev_lands_under_dev(self):
+        home = Path(self.td) / "home1"
+        (home / "dev").mkdir(parents=True)
+        store, why = self._call("/mnt/c/Users/x/proj", str(home), force="1")
+        self.assertEqual(store, f"{home}/dev/proj-MemContinuum-Store")
+        self.assertIn(f"store defaults to {home}/dev/proj-MemContinuum-Store", why)
+        self.assertIn("Windows-mounted drive", why)
+        self.assertIn("costs seconds", why)
+
+    def test_windows_mounted_checkout_without_home_dev_lands_bare(self):
+        home = Path(self.td) / "home2"
+        home.mkdir()
+        store, why = self._call("/mnt/c/Users/x/proj", str(home), force="1")
+        self.assertEqual(store, f"{home}/proj-MemContinuum-Store")
+        self.assertIn(f"store defaults to {home}/proj-MemContinuum-Store", why)
+
+    def test_non_windows_mounted_checkout_keeps_the_sibling_rule(self):
+        home = Path(self.td) / "home3"
+        (home / "dev").mkdir(parents=True)
+        store, why = self._call("/home/x/proj", str(home))
+        self.assertEqual(store, "/home/x/proj-MemContinuum-Store")
+        self.assertEqual(why, "")
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestDefaultStoreOnWindowsMountedCheckout(unittest.TestCase):
+    """End-to-end coverage (TOP-0109 L5, brief items a/c/e): scripts/repo-
+    init.sh applies the WSL-disk default when the checkout is a Windows-
+    mounted drive under WSL. The sandbox checkout itself can never
+    physically be under /mnt, so MEMCONTINUUM_TEST_WSL_MOUNT=1 (the seam
+    mc_is_windows_mounted_checkout defines) stands in for a real one."""
+
+    def test_a_home_dev_exists_store_lands_under_it_with_explanation(self):
+        home = sandbox_home()
+        try:
+            (Path(home) / "dev").mkdir()
+            repo = Path(home) / "proj"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "."], cwd=repo, check=True)
+            proc = run_install(
+                ["--project", "p", "--dry-run"], home, cwd=str(repo),
+                extra_env={"MEMCONTINUUM_TEST_WSL_MOUNT": "1"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            home_r = os.path.realpath(home)
+            repo_r = os.path.realpath(str(repo))
+            self.assertIn(f"defaulting to {home_r}/dev/proj-MemContinuum-Store", proc.stdout)
+            self.assertIn(
+                f"store defaults to {home_r}/dev/proj-MemContinuum-Store: "
+                "the checkout is on a Windows-mounted drive, where a store "
+                "walk costs seconds",
+                proc.stdout,
+            )
+            # hooks stay with the REPO, never dragged onto the store's disk
+            self.assertIn(f"{repo_r}/.claude", proc.stdout)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_a_no_home_dev_store_lands_bare_under_home(self):
+        home = sandbox_home()
+        try:
+            # sandbox_home() never creates a "dev" subdirectory of its own.
+            self.assertFalse((Path(home) / "dev").is_dir())
+            repo = Path(home) / "proj"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "."], cwd=repo, check=True)
+            proc = run_install(
+                ["--project", "p", "--dry-run"], home, cwd=str(repo),
+                extra_env={"MEMCONTINUUM_TEST_WSL_MOUNT": "1"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            home_r = os.path.realpath(home)
+            self.assertIn(f"defaulting to {home_r}/proj-MemContinuum-Store", proc.stdout)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_c_explicit_store_wins_even_on_a_windows_mounted_checkout(self):
+        home = sandbox_home()
+        try:
+            repo = Path(home) / "proj"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "."], cwd=repo, check=True)
+            explicit_store = str(Path(home) / "elsewhere" / "store")
+            proc = run_install(
+                ["--project", "p", "--store", explicit_store,
+                 "--claude-dir", str(repo / ".claude"), "--dry-run"],
+                home,
+                extra_env={"MEMCONTINUUM_TEST_WSL_MOUNT": "1"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertNotIn("Windows-mounted drive", proc.stdout)
+            self.assertNotIn("proj-MemContinuum-Store", proc.stdout)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_e_record_decision_registry_row_names_the_physical_wsl_store(self):
+        home = sandbox_home()
+        try:
+            (Path(home) / "dev").mkdir()
+            repo = Path(home) / "proj"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "."], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "-c", "user.email=a@b.c", "-c", "user.name=a",
+                 "commit", "-q", "--allow-empty", "-m", "init"],
+                cwd=repo, check=True,
+            )
+            proc = run_install(
+                ["--project", "p", "--non-interactive", "--record-decision"],
+                home, cwd=str(repo),
+                extra_env={"MEMCONTINUUM_TEST_WSL_MOUNT": "1"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            home_r = os.path.realpath(home)
+            decisions = Path(home) / ".memcontinuum" / "decisions.tsv"
+            self.assertTrue(decisions.is_file(), "no decisions.tsv written")
+            note = decisions.read_text().splitlines()[-1]
+            self.assertIn(f"store={home_r}/dev/proj-MemContinuum-Store", note)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
 class TestSymlinkedStoreAndCodeRootResolvePhysically(unittest.TestCase):
     """Ruling 89 / symlink-paths fix: abspath() (scripts/repo-init.sh) used

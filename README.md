@@ -244,7 +244,13 @@ and the index filename (`[A-Za-z0-9._-]` only — it is embedded in every hook
 line this installer writes). `--store DIR` is where the markdown store lives;
 omit it and the conventional name is used — `<repo>-MemContinuum-Store` beside
 the repo you are in, or `MemContinuum-Store` inside the current directory when
-that is not a git repo. `--code-root DIR` (repeatable) is the code checkout
+that is not a git repo. On a checkout physically on a Windows-mounted drive
+under WSL, where a store walk costs seconds rather than milliseconds, the
+default instead lands on the WSL disk — `$HOME/dev/<repo>-MemContinuum-Store`,
+or bare `$HOME/<repo>-MemContinuum-Store` when `$HOME/dev` does not exist —
+and the installer prints one line saying why.
+
+`--code-root DIR` (repeatable) is the code checkout
 whose edits should trigger retrieval; omit it entirely for a rationale-only
 install, and the two edit-time hooks are simply not wired. `--python PATH`
 names the python to run the engine with, and `--bootstrap-venv [DIR]` creates

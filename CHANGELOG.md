@@ -192,6 +192,21 @@
   signal's own delivery, cooldown, and dedupe. `stats` counts it under
   `nudges.commit_nudges`.
 
+### Install and update
+- `scripts/repo-init.sh`'s default `--store` (no `--store` given, cwd inside
+  a git repo) now lands on the WSL-native disk instead of beside the repo
+  when the checkout itself is physically on a Windows-mounted drive under
+  WSL -- `$HOME/dev/<repo>-MemContinuum-Store` when `$HOME/dev` is a
+  directory, else bare `$HOME/<repo>-MemContinuum-Store` -- because a store
+  walk over a Windows-mounted drive costs seconds, not milliseconds. The
+  installer prints one line naming why; an explicit `--store` is unaffected
+  and still wins outright, and `--claude-dir` still defaults from the
+  checkout's own `.claude`, never from wherever the store itself lands. The
+  detection (a shared helper, `mc_default_store_for` in
+  `scripts/mc-registry-lib.sh`) is the one place this default is computed --
+  `memcontinuum-decide.sh` and the SessionStart detector never propose a
+  store path of their own.
+
 ### Documentation
 - The README, `docs/DESIGN.md`, and `docs/INTERNALS.md` now say plainly
   where the automatic retrieval-before-an-edit boundary sits: it only

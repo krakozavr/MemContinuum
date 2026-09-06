@@ -448,6 +448,104 @@ mc_is_marked_store() {
     return 1
 }
 
+# mc_is_windows_mounted_checkout CHECKOUT
+#
+# True iff CHECKOUT (a physical path -- the caller resolves symlinks first,
+# same as everywhere else in this file) sits on a Windows-mounted drive
+# inside WSL: `/proc/version` names Microsoft's kernel build (case-
+# insensitive -- WSL1 and WSL2 spell it differently) AND CHECKOUT resolves
+# under `/mnt/<single letter>/` -- the WSL convention for a mounted Windows
+# drive (drvfs, or 9P on WSL1). Neither check alone is enough: a plain path
+# named `/mnt/x/...` on a non-WSL Linux box (an unrelated real mount) must
+# not trigger this, and a WSL box with the checkout on its native ext4 disk
+# (not under `/mnt`) must not either -- only the AND is the "a store walk
+# here costs seconds, not milliseconds" case this exists to catch (measured;
+# TOP-0109 L5).
+#
+# Two test seams, because a machine running this suite may or may not
+# itself be WSL, and even a real WSL box has no actual `/mnt/<letter>`
+# checkout inside a throwaway sandbox HOME -- a test cannot otherwise
+# exercise every quadrant of the AND deterministically:
+#   MEMCONTINUUM_PROC_VERSION_FILE  overrides the file read in place of the
+#     real /proc/version (default), so the kernel-name check can be driven
+#     with a fixture file instead of the real machine's kernel string.
+#   MEMCONTINUUM_TEST_WSL_MOUNT=1   forces this whole predicate true,
+#     unconditionally, bypassing both real checks -- the end-to-end seam
+#     an installer-level test uses when it needs "a Windows-mounted
+#     checkout" but the sandbox checkout itself cannot physically be one.
+#     Any other value (or unset) never forces the other direction: there
+#     is no "force false" knob, because the ordinary unset case already
+#     exercises that path on every machine that is not itself a
+#     Windows-mounted WSL checkout.
+mc_is_windows_mounted_checkout() {
+    local checkout="$1" proc_version_file proc_version=""
+    [ "${MEMCONTINUUM_TEST_WSL_MOUNT:-}" = "1" ] && return 0
+    proc_version_file="${MEMCONTINUUM_PROC_VERSION_FILE:-/proc/version}"
+    # `|| :`, exit status ignored on purpose (mc_rules_identity_marker,
+    # above, does the same): a file with no trailing newline on its last
+    # line -- exactly a raw `/proc/version` read, and every fixture this
+    # function's own tests write -- makes `read` return NON-zero even
+    # though it assigned the variable correctly. `[ -n ]` on the RESULT,
+    # not the read's own exit code, is what tells "no such file" (stays
+    # empty) apart from "read the one line, no trailing newline" (still
+    # gets the content).
+    IFS= read -r proc_version < "$proc_version_file" 2>/dev/null || :
+    [ -n "$proc_version" ] || return 1
+    case "$proc_version" in
+        *[Mm][Ii][Cc][Rr][Oo][Ss][Oo][Ff][Tt]*) ;;
+        *) return 1 ;;
+    esac
+    case "$checkout" in
+        /mnt/[a-zA-Z]/*|/mnt/[a-zA-Z]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# mc_default_store_for CHECKOUT
+#
+# The default --store scripts/repo-init.sh applies when a git checkout's cwd
+# gives it none: ordinarily the marked SIBLING name,
+# "<dirname>/<basename>-MemContinuum-Store" (owner convention, 2026-08-31:
+# never a generic "memory/", never a bare "MemContinuum"). But when CHECKOUT
+# sits on a Windows-mounted drive under WSL (mc_is_windows_mounted_checkout
+# above), a store there costs SECONDS per walk (drvfs/9P latency), not
+# milliseconds -- so the default instead lands on the WSL-native disk:
+# "$HOME/dev/<basename>-MemContinuum-Store" when "$HOME/dev" is a directory
+# (this machine's convention for where checkouts live), else
+# "$HOME/<basename>-MemContinuum-Store" (TOP-0109 L5).
+#
+# CHECKOUT is expected already physical (git rev-parse --show-toplevel's own
+# output, which the one caller here already is) -- this function does no
+# resolution of its own.
+#
+# Sets MC_DEFAULT_STORE (the computed path) and MC_DEFAULT_STORE_WHY --
+# empty for the ordinary sibling rule, or the one-line explanation the
+# installer prints when the WSL rule fired. Always returns 0. Deliberately
+# the ONE place either rule is computed: scripts/memcontinuum-decide.sh and
+# hooks/memcontinuum-detect.sh never compute or print a default store of
+# their own (verified by reading both -- decide.sh only ever records a
+# --store it is explicitly given, and detect.sh only ever reports whether a
+# decision exists, never a proposed path), so this function currently has
+# exactly one caller. Kept here anyway, alongside every other shared
+# predicate in this file, rather than inlined into repo-init.sh, so a
+# second caller never has to duplicate it to agree.
+mc_default_store_for() {
+    local checkout="$1" name
+    name="$(basename "$checkout")"
+    MC_DEFAULT_STORE_WHY=""
+    if mc_is_windows_mounted_checkout "$checkout"; then
+        if [ -d "$HOME/dev" ]; then
+            MC_DEFAULT_STORE="$HOME/dev/$name-MemContinuum-Store"
+        else
+            MC_DEFAULT_STORE="$HOME/$name-MemContinuum-Store"
+        fi
+        MC_DEFAULT_STORE_WHY="store defaults to $MC_DEFAULT_STORE: the checkout is on a Windows-mounted drive, where a store walk costs seconds"
+    else
+        MC_DEFAULT_STORE="$(dirname "$checkout")/$name-MemContinuum-Store"
+    fi
+    return 0
+}
+
 # mc_note_encode VALUE / mc_note_decode VALUE
 #
 # The registry row's NOTE column is space-separated `key=value` fields with

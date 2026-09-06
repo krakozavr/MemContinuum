@@ -85,7 +85,12 @@ and let them decide.
   generic `memory/` (collides with other memory systems) and never bare
   `MemContinuum` (reads as the tool itself). Omit `--store` and repo-init
   applies the convention on its own: `<repo>-MemContinuum-Store` beside the
-  git repo the cwd is in, else `MemContinuum-Store` inside the cwd. Only pass
+  git repo the cwd is in, else `MemContinuum-Store` inside the cwd — except
+  when the checkout is physically on a Windows-mounted drive under WSL, where
+  a store walk costs seconds rather than milliseconds: there the default
+  instead lands on the WSL disk, at `$HOME/dev/<repo>-MemContinuum-Store` (or
+  bare `$HOME/<repo>-MemContinuum-Store` when `$HOME/dev` does not exist),
+  and `repo-init.sh` prints why. Only pass
   `--store` when the human wants a different place — and when you do, pass
   `--claude-dir` alongside it (`repo-init.sh` refuses an explicit `--store`
   with no explicit `--claude-dir` rather than guess which `.claude` its hooks

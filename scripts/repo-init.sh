@@ -103,7 +103,13 @@ Usage: repo-init.sh --project NAME [--store DIR] [--code-root DIR ...]
   --store DIR        the markdown store root to create/wire. Optional: the
                       default is the conventional marked name --
                       "<repo>-MemContinuum-Store" beside the git repo the
-                      cwd is in, else "$PWD/MemContinuum-Store". Never a
+                      cwd is in, else "$PWD/MemContinuum-Store". On a
+                      checkout physically on a Windows-mounted drive under
+                      WSL, the default instead lands at
+                      "$HOME/dev/<repo>-MemContinuum-Store" (or
+                      "$HOME/<repo>-MemContinuum-Store" when "$HOME/dev"
+                      does not exist) -- a store walk on that drive costs
+                      seconds, not milliseconds. Never a
                       generic "memory/" (collides with other memory
                       systems) and never bare "MemContinuum" (reads as the
                       tool itself). An existing git repo at DIR with none of
@@ -523,26 +529,38 @@ done
 #   cwd inside a git repo   -> a SIBLING of that repo, "<name>-MemContinuum-Store"
 #                              (never inside -- a store must not be absorbed
 #                              into a code repo's history; same rule the
-#                              inside-a-repo refusal below enforces)
+#                              inside-a-repo refusal below enforces) -- UNLESS
+#                              the checkout is a Windows-mounted drive under
+#                              WSL, in which case the sibling rule is replaced
+#                              by mc_default_store_for's WSL-disk rule (see
+#                              scripts/mc-registry-lib.sh; TOP-0109 L5): a
+#                              store walk on a Windows-mounted drive costs
+#                              seconds, not milliseconds.
 #   cwd not in any git repo -> "$(pwd -P)/MemContinuum-Store" (a working
 #                              FOLDER, like a docs dir, hosts its store
-#                              directly)
+#                              directly) -- the WSL rule does not apply here,
+#                              it is about CHECKOUTS specifically.
 # An explicit --store always wins; the default is printed so nothing lands
 # anywhere silently.
 if [ -z "$STORE" ]; then
     CWD_TOPLEVEL="$(git rev-parse --show-toplevel 2>/dev/null || true)"
     if [ -n "$CWD_TOPLEVEL" ]; then
-        STORE="$(dirname "$CWD_TOPLEVEL")/$(basename "$CWD_TOPLEVEL")-MemContinuum-Store"
-        # A defaulted SIBLING store must not drag --claude-dir's own default
+        mc_default_store_for "$CWD_TOPLEVEL"
+        STORE="$MC_DEFAULT_STORE"
+        [ -n "$MC_DEFAULT_STORE_WHY" ] && echo "note: $MC_DEFAULT_STORE_WHY"
+        # A defaulted store must not drag --claude-dir's own default
         # (<dirname of store>/.claude) up to the parent directory -- the hooks
         # belong to the repo being initialized, so they default into that
-        # repo's .claude. Deliberately scoped to the defaulted-store flow
-        # only: with an EXPLICIT --store, the cwd is no signal at all (the
-        # command may be run from anywhere -- a test harness, a script, an
-        # unrelated checkout -- to set up paths elsewhere; round-3's fix
-        # attempt keyed on cwd unconditionally and wired a test run's hooks
-        # into the engine repo's own .claude). The skill's documented flow is
-        # cd-into-the-repo with NO --store, which lands here.
+        # repo's .claude REGARDLESS of where the store itself defaulted (the
+        # WSL rule moves the store, on purpose, to a different disk -- it
+        # must never move the hooks with it). Deliberately scoped to the
+        # defaulted-store flow only: with an EXPLICIT --store, the cwd is no
+        # signal at all (the command may be run from anywhere -- a test
+        # harness, a script, an unrelated checkout -- to set up paths
+        # elsewhere; round-3's fix attempt keyed on cwd unconditionally and
+        # wired a test run's hooks into the engine repo's own .claude). The
+        # skill's documented flow is cd-into-the-repo with NO --store, which
+        # lands here.
         [ -n "$CLAUDE_DIR" ] || CLAUDE_DIR="$CWD_TOPLEVEL/.claude"
     else
         # PHYSICAL, not $PWD directly: a freshly-started bash's own $PWD
