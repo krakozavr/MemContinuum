@@ -151,6 +151,9 @@ copied inline.
   question is not a ruling (`owner-ratified` is the orchestrator's own paraphrase, not covered)
 - `status: superseded` without `superseded_by` → error
 - `reverses:` without `reason_for_change` → error
+- a `kind: reversed` link whose `reverses:` target's `status` is still `active` or `provisional` →
+  error, naming the target and its status (`kind: amended` leaves its predecessor active on
+  purpose — not covered)
 - `current` not equal to the newest link with `status: active` → error (names the correct value)
 - a topic in area `processing/*` or `deletion/*` with no `code_refs` → warning
 - any `status` / `authority` / `kind` value outside the five/five/five enumerated above → error

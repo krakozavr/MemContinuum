@@ -123,6 +123,61 @@ class TestMemlintViolations(unittest.TestCase):
             errors, _warnings = memlint.lint_root(root)
         self.assertFalse(any("question" in e for e in errors), errors)
 
+    def test_reversed_link_pointing_at_a_still_active_target_is_error(self):
+        # lint-two-active-links replacement (owner ruling 2026-09-06 10:41,
+        # TOP-0122 L5): a kind: reversed link must name a reverses target
+        # whose status has moved off active/provisional.
+        errors, _warnings = lint_single_file("bad_reversed_target_still_active.md")
+        self.assertTrue(
+            any("reverses" in e and "L1" in e and "still active" in e for e in errors),
+            errors,
+        )
+
+    def test_reversed_link_pointing_at_a_still_provisional_target_is_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "topics").mkdir()
+            (root / "topics" / "t.md").write_text(
+                "---\ntype: topic\nid: TOP-9012\ntitle: Reverses a provisional link\n"
+                "current: L2\nlinks:\n"
+                "  - link: L2\n    date: 2026-08-30\n    status: active\n"
+                "    kind: reversed\n    reverses: L1\n"
+                "    reason_for_change: new-evidence\n"
+                "    ruling: {text: \"changed my mind\", authority: agent-inference}\n"
+                "    recorded_by: agent\n    recorded_at: 2026-08-30\n"
+                "  - link: L1\n    date: 2026-08-01\n    status: provisional\n"
+                "    kind: adopted\n"
+                "    ruling: {text: \"a provisional first answer\", authority: agent-inference}\n"
+                "    recorded_by: agent\n    recorded_at: 2026-08-29\n---\n\nBody.\n"
+            )
+            errors, _warnings = memlint.lint_root(root)
+        self.assertTrue(
+            any("reverses" in e and "L1" in e and "still provisional" in e for e in errors),
+            errors,
+        )
+
+    def test_amended_link_leaves_predecessor_active_with_no_rule(self):
+        # kind: amended is exactly the case where the predecessor stays
+        # active on purpose (SCHEMA section 3) -- no rule fires.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "topics").mkdir()
+            (root / "topics" / "t.md").write_text(
+                "---\ntype: topic\nid: TOP-9013\ntitle: Amended, not reversed\n"
+                "current: L2\nlinks:\n"
+                "  - link: L2\n    date: 2026-08-30\n    status: active\n"
+                "    kind: amended\n    reverses: L1\n"
+                "    reason_for_change: new-evidence\n"
+                "    ruling: {text: \"refines the earlier ruling\", authority: agent-inference}\n"
+                "    recorded_by: agent\n    recorded_at: 2026-08-30\n"
+                "  - link: L1\n    date: 2026-08-01\n    status: active\n"
+                "    kind: adopted\n"
+                "    ruling: {text: \"the original, still-active ruling\", authority: agent-inference}\n"
+                "    recorded_by: agent\n    recorded_at: 2026-08-29\n---\n\nBody.\n"
+            )
+            errors, _warnings = memlint.lint_root(root)
+        self.assertFalse(any("reverses" in e and "still" in e for e in errors), errors)
+
 
 class TestMemlintClean(unittest.TestCase):
     def test_clean_fixtures_pass(self):

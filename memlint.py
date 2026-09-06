@@ -202,6 +202,7 @@ def lint_topic(path: Path, fm: dict) -> tuple[list[str], list[str]]:
                     )
 
     topic_link_ids = {str(l.get("link")) for l in links if l.get("link")}
+    topic_links_by_id = {str(l.get("link")): l for l in links if l.get("link")}
     seen_link_ids: dict[str, int] = {}
     for link in links:
         lid = str(link.get("link") or "")
@@ -210,6 +211,22 @@ def lint_topic(path: Path, fm: dict) -> tuple[list[str], list[str]]:
         rev = link.get("reverses")
         if rev and str(rev) not in topic_link_ids:
             errors.append(f"{path}:{link.get('link','?')}: reverses {rev!r} does not match any link id in this topic")
+        elif rev and link.get("kind") == "reversed":
+            # Replaces the backlog row "two active links in one chain is an
+            # error" (owner ruling 2026-09-06 10:41, TOP-0122 L5): that
+            # check would fail every area topic, where several active
+            # rulings apply at once by design. The mechanical check that
+            # survives is narrower -- a link declaring kind: reversed must
+            # point at a link that is no longer active or provisional.
+            # kind: amended leaves its predecessor active on purpose
+            # (SCHEMA section 3/6.1's "reverses:" table): no rule for it.
+            target = topic_links_by_id.get(str(rev))
+            target_status = target.get("status") if target else None
+            if target_status in ("active", "provisional"):
+                errors.append(
+                    f"{path}:{link.get('link','?')}: reverses {rev!r} which is still "
+                    f"{target_status} (mark it superseded)"
+                )
         sb = link.get("superseded_by")
         if sb and str(sb) not in topic_link_ids:
             errors.append(f"{path}:{link.get('link','?')}: superseded_by {sb!r} does not match any link id in this topic")
