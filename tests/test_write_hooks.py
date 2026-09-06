@@ -1203,6 +1203,36 @@ class TestMutationSurface(HookTestBase):
         rows3 = [e for e in state3["ledger"] if e.get("source") == "shell-diff"]
         self.assertEqual(len(rows3), 1, state3["ledger"])
 
+    # -- fix wave 1, G3 (Grok MINOR 5 / whole-branch-review LOW-2 /
+    # task-8-review LOW-3): a nested git repo created AFTER the baseline
+    # must never ledger a deletion-shaped row (a directory path with an
+    # empty content_sha256).
+
+    def test_nested_git_repo_created_after_baseline_produces_no_deletion_shaped_row(self):
+        session_id = "s-mutation-nested-repo"
+
+        proc1, _ = run_script(LEDGER_HOOK, self.bash_payload(session_id), self.base_env())
+        self.assertEqual(proc1.returncode, 0, proc1.stderr)
+        state1 = self.load_state(session_id)
+        self.assertEqual(state1.get("ledger", []), [])
+
+        nested = self.code_root / "vendored-repo"
+        _write(nested / "f.py", "# vendored\n")
+        git_init(nested)  # a genuine nested git repo -- git status on the
+                           # OUTER root now collapses it to one "?? vendored-repo/" entry
+
+        proc2, _ = run_script(LEDGER_HOOK, self.bash_payload(session_id), self.base_env())
+        self.assertEqual(proc2.returncode, 0, proc2.stderr)
+        state2 = self.load_state(session_id)
+        rows = [e for e in state2.get("ledger", []) if e.get("source") == "shell-diff"]
+        self.assertEqual(rows, [], f"a directory entry must never be ledgered: {rows}")
+        self.assertFalse(
+            any(e.get("content_sha256") == "" for e in state2.get("ledger", [])),
+            "no ledger row may carry an empty content_sha256 for what is actually a live directory",
+        )
+        log2 = (self.home / "hook.log").read_text()
+        self.assertNotIn("ledger outcome=appended kind=code source=shell-diff", log2)
+
     # -- writable-surface regression guard: the shell-diff branch's own
     # `git status` calls must be read-only -- INTERNALS.md's writable-
     # surface claim depends on this staying true, since this hook now runs

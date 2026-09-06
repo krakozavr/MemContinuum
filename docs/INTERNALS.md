@@ -159,8 +159,12 @@ tree-diff pass — an unrecognized tool that mutated a file is still caught.
 
 This is deliberately best-effort, not strict mutation coverage: nothing here
 refuses an undeclared shell mutation or blocks a commit over one. Structured
-edits (`Edit`/`Write`/`MultiEdit`/`NotebookEdit`) get pre-retrieval, before
-the edit happens; shell mutations get best-effort post-detection, after the
+edits get pre-retrieval, before the edit happens, but only for the `Edit`
+and `Write` tools — the `PreToolUse` matcher names only those two, and the
+hook reads only `tool_input.file_path`, so it has no branch that could fire
+for a notebook payload. `MultiEdit` and `NotebookEdit` are ledgered after
+the fact (`source: "tool"`, same as `Edit`/`Write`) but are not
+pre-retrieved. Shell mutations get best-effort post-detection, after the
 fact, bounded by whatever the git-status budget above could see in time.
 
 **The detector is deliberately unlike the others.** It fires on every session

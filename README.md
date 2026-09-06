@@ -502,7 +502,8 @@ Project level, by hand:
 4. Delete `~/.memcontinuum/<project>.sqlite`, and
    `~/.memcontinuum/<project>-code.sqlite` if `code-reindex` was ever run, and
    `~/.memcontinuum/<project>.embed-pending`, `<project>.embed.lock` and
-   `<project>.embed.log` if the post-commit hook's embed-worker ever ran (or
+   `<project>.embed.log` if the post-commit hook's embed-worker ever ran, and
+   `memidx-debug.log` if any command ever degraded on an internal error (or
    wherever `MEMCONTINUUM_HOME` points).
 
 Leave `<store>` itself alone. It is your decision history, not an installer

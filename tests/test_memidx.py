@@ -3735,6 +3735,39 @@ class TestEmbeddingFingerprint(unittest.TestCase):
             rows = self._emb_rows(db)
             self.assertTrue(all(r["embed_fp"] for r in rows), rows)
 
+    # -- Fix wave 1, G3 (whole-branch-review MODERATE-1): `check --json`'s
+    # `searchable_vector_count` must use the SAME "fresh" definition
+    # (embed_sha AND embed_fp match) as `vector_index_state` and
+    # `embedding_backlog` in the same envelope -- a migrated DB with a
+    # NULL-fp row must report 0, not 1.
+
+    def test_searchable_vector_count_matches_vector_index_state_on_a_migrated_db(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic(td, text="migrated vector needle phrase")
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)   # rows exist, never embedded
+
+            path = str(root / "topics" / "t.md")
+            conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
+            sha = conn.execute("SELECT sha256 FROM records WHERE path=?", (path,)).fetchone()["sha256"]
+            conn.execute(
+                "INSERT INTO embeddings (path, project, dim, embed_sha, embed_fp, vector) VALUES (?,?,?,?,?,?)",
+                (path, memidx.DEFAULT_PROJECT, 4, sha, None, memidx.pack_vector([0.1, 0.2, 0.3, 0.4])),
+            )
+            conn.commit(); conn.close()
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                memidx.cmd_check(ns(root=str(root), db=str(db), project=memidx.DEFAULT_PROJECT, json=True))
+            report = json.loads(buf.getvalue())
+            self.assertEqual(report["vector_index_state"], "none", report)
+            self.assertEqual(report["embedding_backlog"]["rows_without_fresh_vector"], 2, report)
+            self.assertEqual(
+                report["searchable_vector_count"], 0,
+                "a NULL-embed_fp row is not a FRESH vector -- searchable_vector_count must agree "
+                "with vector_index_state and embedding_backlog in the same envelope: " + str(report),
+            )
+
     # -- Red 7: check reports "full" on a healthy embedded DB, without
     # importing fastembed (real model -- kept to this one case).
 

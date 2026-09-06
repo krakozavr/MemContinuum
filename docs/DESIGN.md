@@ -48,7 +48,9 @@ pre-retrieval, not a universal guarantee: a file changed from the shell (a
 script, a formatter, `git apply`, anything run as a Bash command) gets no
 such lookup beforehand. The PostToolUse ledger hook still sees it, but only
 afterwards, from a tree diff against the last state it saw — best effort,
-never called pre-retrieval, because it is not one. The ledger entry it
+never called pre-retrieval, because it is not one, and not a guarantee
+either: a change committed away in the same breath, or made under a path
+git ignores, is not seen at all. The ledger entry it
 writes is bookkeeping (a record that some path changed), not a decision
 record, and it is not proof anything governing that path was looked up
 first. Retrieval that depends on being remembered eventually isn't

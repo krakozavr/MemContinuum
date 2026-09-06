@@ -1264,7 +1264,10 @@ def _decision_warn(cmd_name: str, args, state: str, conn: sqlite3.Connection | N
             ).fetchone()
             n = row["n"] if row else 0
         print(
-            f"{cmd_name}: index quarantined ({n} record(s) skipped as malformed; run check)",
+            # Fix wave 1, G3 (whole-branch-review NIT-1): matches design
+            # R2's wording verbatim -- "skipped as malformed" was a
+            # two-word drift from the design text, not pinned by any test.
+            f"{cmd_name}: index quarantined ({n} record(s) skipped; run check)",
             file=sys.stderr,
         )
         return
@@ -4363,10 +4366,14 @@ def cmd_check(args) -> int:
     report["searchable_row_count"] = conn.execute(
         "SELECT COUNT(*) AS n FROM records WHERE project=?", (args.project,)
     ).fetchone()["n"]
-    report["searchable_vector_count"] = conn.execute(
-        "SELECT COUNT(*) AS n FROM embeddings e JOIN records r ON r.path=e.path AND r.sha256=e.embed_sha "
-        "WHERE e.project=?", (args.project,)
-    ).fetchone()["n"]
+    # Fix wave 1, G3 (whole-branch-review MODERATE-1): this was the one
+    # site `_records_fresh_vector_counts` (its own docstring: "three
+    # previously near-identical copies of this same pair of queries")
+    # missed converting -- it counted embed_sha matches only, the pre-T4
+    # definition of "fresh", contradicting `vector_index_state` and
+    # `embedding_backlog` (both embed_sha AND embed_fp) in the same
+    # envelope on any migrated database.
+    report["searchable_vector_count"] = _records_fresh_vector_counts(conn, args.project)[1]
     report["vector_index_state"] = _decision_vector_index_state(conn, args.project)
     # Design R8 (audit MC-P2-02, TOP-0123 L7): fail-open, same helper
     # `stats --json` uses; `vector_index_state` above keeps R4's own enum

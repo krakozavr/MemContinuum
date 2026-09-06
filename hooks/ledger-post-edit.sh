@@ -124,13 +124,17 @@ EnterPlanMode|ExitPlanMode|ListMcpResourcesTool|ReadMcpResourceTool)
 esac
 
 # Watchdog guard (macOS port, docs/DESIGN.md SS8 port note, 2026-08-30;
-# deduped into hooks/mc-watchdog.sh, finding 1, 2026-08-31): must be the
-# literal first thing after resolving SCRIPT_DIR and sourcing
-# mc-watchdog.sh (see its own header for what
-# running it costs), strictly BEFORE sourcing memlib.sh (which
-# does its own mkdir -p work) -- see
-# hooks/userprompt-remind.sh's test_outer_deadline_covers_memlib_sourcing
-# for why this ordering matters. A tiny python launcher
+# deduped into hooks/mc-watchdog.sh, finding 1, 2026-08-31): must run
+# strictly BEFORE sourcing memlib.sh (which does its own mkdir -p work)
+# -- see hooks/userprompt-remind.sh's
+# test_outer_deadline_covers_memlib_sourcing for why this ordering
+# matters. Fix wave 1, G3 (task-8-review NIT-2): the cheap, bash-only
+# prefilter above (a `cat` and a `case` scan, no python, no subprocess)
+# now runs before this guard block, so it is no longer the literal first
+# thing after resolving SCRIPT_DIR -- but it is still the first thing
+# that could possibly cost anything (spawn python, touch a subprocess),
+# which is the property this guard's position actually protects. A tiny
+# python launcher
 # (mc-watchdog.sh's MC_WATCHDOG_LAUNCHER_PY) starts this same script as a
 # child in its own process group and kills the WHOLE group on a
 # wall-clock budget (2s here; see hooks/mc-watchdog.sh), so an orphaned
@@ -225,6 +229,23 @@ case "${TOOL_NAME:-}" in
         ;;
 esac
 
+# Fix wave 1, G3 (Grok NIT 8 / whole-branch-review NIT-4 / task-8-review
+# NIT-1): the shell-diff branch and the tool branch below each spliced an
+# identical seven-key `state.setdefault(...)` bootstrap verbatim into
+# their own python heredoc -- factored into one snippet here, concatenated
+# into both (bash 3.2-safe `'...'"$VAR"'...'` quoting), so a future new
+# default key is added once, not twice.
+MC_STATE_BOOTSTRAP_PY='
+def _mc_bootstrap_state(state):
+    state.setdefault("user_turn_count", 0)
+    state.setdefault("last_inject_turn", -999)
+    state.setdefault("last_inject_time", 0)
+    state.setdefault("last_inject_ts", 0)
+    state.setdefault("last_injected_pairs", [])
+    state.setdefault("last_growth_turn", 0)
+    state.setdefault("lookback_count", 0)
+'
+
 if [ "$MC_SOURCE_TAG" = "shell-diff" ]; then
     # ---- Bash / unknown-tool branch: diff every configured root's tree
     # against its own lazily-established baseline (design R6). ------------
@@ -239,7 +260,7 @@ if [ "$MC_SOURCE_TAG" = "shell-diff" ]; then
 
     mc_update_state_json "$STATE_FILE" '
 import hashlib, os, subprocess, time
-
+'"$MC_STATE_BOOTSTRAP_PY"'
 
 def now_ts():
     import datetime
@@ -380,6 +401,15 @@ for root, kind in roots:
                     budget_hit = True
                     break
                 full = os.path.normpath(os.path.join(root, p))
+                # Fix wave 1, G3 (Grok MINOR 5 / whole-branch-review LOW-2
+                # / task-8-review LOW-3): `git status` on an OUTER root
+                # collapses a nested git repository to one directory
+                # entry -- sha_of() on a directory raises
+                # IsADirectoryError (caught, returns "") which is
+                # indistinguishable from a genuine deletion. Skip a dirty
+                # entry that IS a directory before ever hashing it.
+                if os.path.isdir(full):
+                    continue
                 baseline_map[p] = sha_of(full)
             if budget_hit:
                 timeouts += 1
@@ -399,6 +429,11 @@ for root, kind in roots:
 
     for p in dirty:
         full = os.path.normpath(os.path.join(root, p))
+        # Fix wave 1, G3: same directory guard as the baseline loop above
+        # -- a nested git repo created AFTER the baseline is a directory
+        # entry here too, and must never be hashed or ledgered.
+        if os.path.isdir(full):
+            continue
         sha = sha_of(full)
         if root_baseline.get(p) == sha:
             continue
@@ -421,13 +456,7 @@ for root, kind in roots:
 
 state["session_id"] = session_id or state.get("session_id")
 state["project"] = project or state.get("project")
-state.setdefault("user_turn_count", 0)
-state.setdefault("last_inject_turn", -999)
-state.setdefault("last_inject_time", 0)
-state.setdefault("last_inject_ts", 0)
-state.setdefault("last_injected_pairs", [])
-state.setdefault("last_growth_turn", 0)
-state.setdefault("lookback_count", 0)
+_mc_bootstrap_state(state)
 
 log_line(
     "ledger outcome=shell-diff appended=" + str(appended) + " roots=" + str(len(roots))
@@ -498,6 +527,7 @@ export MC_NOW="$(date +%s 2>/dev/null || echo 0)"
 
 mc_update_state_json "$STATE_FILE" '
 import hashlib, os, time
+'"$MC_STATE_BOOTSTRAP_PY"'
 
 path = os.environ.get("MC_FILE_PATH", "")
 kind = os.environ.get("MC_KIND", "code")
@@ -547,13 +577,7 @@ if path:
 
     state["session_id"] = os.environ.get("MC_SESSION_ID") or state.get("session_id")
     state["project"] = os.environ.get("MC_PROJECT_ENV") or state.get("project")
-    state.setdefault("user_turn_count", 0)
-    state.setdefault("last_inject_turn", -999)
-    state.setdefault("last_inject_time", 0)
-    state.setdefault("last_inject_ts", 0)
-    state.setdefault("last_injected_pairs", [])
-    state.setdefault("last_growth_turn", 0)
-    state.setdefault("lookback_count", 0)
+    _mc_bootstrap_state(state)
 
 print(json.dumps(state))
 '
