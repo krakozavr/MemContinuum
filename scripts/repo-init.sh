@@ -1400,43 +1400,47 @@ if is_git_repo "$STORE"; then
     # --git-path hooks` -- which for a linked worktree is the shared
     # repo's .git/hooks, never .git/worktrees/<name>/hooks.
     STORE_HOOKS_DIR="$(git_hooks_dir_for "$STORE")" || fail "could not resolve git hooks dir for $STORE"
-    step "git post-commit reindex wrapper: $STORE_HOOKS_DIR/post-commit -> $HOOKS_DIR/post-commit-reindex.sh"
-    if [ "$DRY_RUN" -eq 0 ]; then
-        mkdir -p "$STORE_HOOKS_DIR" || fail "could not create $STORE_HOOKS_DIR"
-        POST_COMMIT="$STORE_HOOKS_DIR/post-commit"
-        {
-            printf '#!/usr/bin/env bash\n'
-            printf 'export MEMCONTINUUM_ROOT=%s\n' "$(printf '%q' "$STORE")"
-            printf 'export MEMCONTINUUM_PROJECT=%s\n' "$(printf '%q' "$PROJECT")"
-            printf 'export MEMCONTINUUM_PYTHON=%s\n' "$(printf '%q' "$PYTHON_BIN")"
-            printf 'exec bash %s\n' "$(printf '%q' "$HOOKS_DIR/post-commit-reindex.sh")"
-        } > "$POST_COMMIT" || fail "could not write $POST_COMMIT"
-        chmod +x "$POST_COMMIT" || fail "could not chmod $POST_COMMIT"
+
+    # Fix round 1 (TOP-0122 L3): post-commit gets the SAME foreign-hook
+    # refusal policy pre-commit already has below (6b) -- a hand-authored
+    # post-commit this installer did not render is left ALONE and
+    # reported, never silently clobbered, closing the asymmetry the
+    # previous round's own report flagged (post-commit used to be
+    # overwritten unconditionally on every run, no check at all). Identity
+    # is the wrapper's own `exec` line naming hooks/post-commit-reindex.sh.
+    POST_COMMIT="$STORE_HOOKS_DIR/post-commit"
+    POST_COMMIT_STATUS="written"
+    if [ -f "$POST_COMMIT" ] && ! grep -q "hooks/post-commit-reindex.sh" "$POST_COMMIT" 2>/dev/null; then
+        POST_COMMIT_STATUS="skipped-foreign"
+        step "git post-commit reindex wrapper: SKIPPED -- $POST_COMMIT already exists and was not rendered by this installer (foreign or hand-authored); move it aside first if you want repo-init to install one here"
+    else
+        step "git post-commit reindex wrapper: $POST_COMMIT -> $HOOKS_DIR/post-commit-reindex.sh"
+        if [ "$DRY_RUN" -eq 0 ]; then
+            mkdir -p "$STORE_HOOKS_DIR" || fail "could not create $STORE_HOOKS_DIR"
+            {
+                printf '#!/usr/bin/env bash\n'
+                printf 'export MEMCONTINUUM_ROOT=%s\n' "$(printf '%q' "$STORE")"
+                printf 'export MEMCONTINUUM_PROJECT=%s\n' "$(printf '%q' "$PROJECT")"
+                printf 'export MEMCONTINUUM_PYTHON=%s\n' "$(printf '%q' "$PYTHON_BIN")"
+                printf 'exec bash %s\n' "$(printf '%q' "$HOOKS_DIR/post-commit-reindex.sh")"
+            } > "$POST_COMMIT" || fail "could not write $POST_COMMIT"
+            chmod +x "$POST_COMMIT" || fail "could not chmod $POST_COMMIT"
+        fi
     fi
 
     # --- 6b. git pre-commit append-only wrapper ---------------------------
     #
     # Task A2-1 (TOP-0122 L1 rule 3): same generated-wrapper shape as
     # post-commit above (exports the three vars, execs the canonical
-    # script by absolute path so an edit to it needs no reinstall) --
-    # EXCEPT for one deliberate asymmetry. Unlike post-commit (which this
-    # installer has always overwritten unconditionally, on every run, with
-    # no check at all -- idempotent only because its content is generated
-    # deterministically), an existing pre-commit this installer did not
-    # render is left ALONE, never silently clobbered: a repo's pre-commit
-    # is far likelier to already carry a hand-authored guard of its own (a
-    # formatter, a secret scanner...) than its post-commit, which nothing
-    # here has ever protected against overwriting, and pre-commit's whole
-    # job is to be able to BLOCK a commit -- silently replacing one a user
-    # wrote on purpose is a worse mistake than silently replacing a
-    # fire-and-forget reindex hook. Identity is the wrapper's own `exec`
-    # line naming hooks/pre-commit-append-only.sh: present (ours, possibly
-    # stale) -> regenerated in place, same as post-commit always is;
-    # absent entirely -> written; present and NOT ours -> left untouched
-    # and reported (never fatal -- this step runs after the settings
-    # merge, so a hard failure here would leave exactly the half-installed
-    # state the "refused before any mutation" pattern elsewhere in this
-    # file exists to avoid).
+    # script by absolute path so an edit to it needs no reinstall), and --
+    # as of the fix round above -- the SAME foreign-hook refusal policy:
+    # present (ours, possibly stale) -> regenerated in place; absent
+    # entirely -> written; present and NOT ours -> left untouched and
+    # reported (never fatal -- this step runs after the settings merge, so
+    # a hard failure here would leave exactly the half-installed state the
+    # "refused before any mutation" pattern elsewhere in this file exists
+    # to avoid). Identity is the wrapper's own `exec` line naming
+    # hooks/pre-commit-append-only.sh.
     PRE_COMMIT="$STORE_HOOKS_DIR/pre-commit"
     PRE_COMMIT_STATUS="written"
     if [ -f "$PRE_COMMIT" ] && ! grep -q "hooks/pre-commit-append-only.sh" "$PRE_COMMIT" 2>/dev/null; then
@@ -1551,7 +1555,9 @@ else
     echo "Settings file  : $CLAUDE_DIR/settings.local.json"
     echo "Rules file     : $RULES_DEST (rendered by $RENDERED_SHA)"
     echo "Skill installed: $CLAUDE_DIR/skills/memory-search/SKILL.md"
-    if [ -n "${STORE_HOOKS_DIR:-}" ] && [ -f "$STORE_HOOKS_DIR/post-commit" ]; then
+    if [ "${POST_COMMIT_STATUS:-}" = "skipped-foreign" ]; then
+        echo "Post-commit    : SKIPPED -- foreign hook at $STORE_HOOKS_DIR/post-commit (not rendered by this installer)"
+    elif [ -n "${STORE_HOOKS_DIR:-}" ] && [ -f "$STORE_HOOKS_DIR/post-commit" ]; then
         echo "Post-commit    : $STORE_HOOKS_DIR/post-commit (wraps $HOOKS_DIR/post-commit-reindex.sh)"
     fi
     if [ "${PRE_COMMIT_STATUS:-}" = "skipped-foreign" ]; then

@@ -959,12 +959,15 @@ class TestMemlintAgainstRef(unittest.TestCase):
     history enforcement. Each test builds its own throwaway git store (never
     the fixtures/ or the engine's own store)."""
 
-    def _base_store(self, td):
+    def _store_with_base_text(self, td, text):
         root = _git_store(td)
         (root / "topics").mkdir()
-        (root / "topics" / "foo.md").write_text(TOPIC_L1_L2)
+        (root / "topics" / "foo.md").write_text(text)
         _commit_all(root, "base")
         return root
+
+    def _base_store(self, td):
+        return self._store_with_base_text(td, TOPIC_L1_L2)
 
     def test_a_prepend_new_link_is_clean(self):
         with tempfile.TemporaryDirectory() as td:
@@ -998,7 +1001,11 @@ class TestMemlintAgainstRef(unittest.TestCase):
             self.assertIn("L1", out)
             self.assertIn("changed after being recorded", out)
 
-    def test_c_status_change_in_place_is_error(self):
+    def test_c_forward_status_change_with_superseded_by_is_clean(self):
+        """Ruling 142 (TOP-0122 L3): status may move active/provisional ->
+        superseded/historical/declined, once, and superseded_by may be
+        ADDED in that same move -- this is the honest way to mark a link
+        superseded, not an append-only violation."""
         with tempfile.TemporaryDirectory() as td:
             root = self._base_store(td)
             text = TOPIC_L1_L2.replace(
@@ -1008,9 +1015,94 @@ class TestMemlintAgainstRef(unittest.TestCase):
             self.assertNotEqual(text, TOPIC_L1_L2, "fixture edit must actually change the text")
             (root / "topics" / "foo.md").write_text(text)
             rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 0, out)
+
+    def test_c_terminal_status_reverting_to_active_is_error(self):
+        """Ruling 142: never back to active/provisional."""
+        with tempfile.TemporaryDirectory() as td:
+            base = TOPIC_L1_L2.replace(
+                "    status: active\n    kind: adopted\n    ruling:\n      text: \"second ruling\"",
+                "    status: superseded\n    kind: adopted\n    ruling:\n      text: \"second ruling\"",
+            )
+            root = self._store_with_base_text(td, base)
+            text = base.replace(
+                "    status: superseded\n    kind: adopted\n    ruling:\n      text: \"second ruling\"",
+                "    status: active\n    kind: adopted\n    ruling:\n      text: \"second ruling\"",
+            )
+            (root / "topics" / "foo.md").write_text(text)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
             self.assertEqual(rc, 1, out)
             self.assertIn("L2", out)
-            self.assertIn("changed after being recorded", out)
+            self.assertIn("status", out)
+
+    def test_c_between_terminal_statuses_is_error(self):
+        """Ruling 142: never between the three terminal values. L1 is
+        already `status: historical` in the fixture -- move it sideways
+        to `declined`."""
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            text = TOPIC_L1_L2.replace(
+                "    status: historical\n    kind: adopted\n    ruling:\n      text: \"first ruling\"",
+                "    status: declined\n    kind: adopted\n    ruling:\n      text: \"first ruling\"",
+            )
+            (root / "topics" / "foo.md").write_text(text)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("L1", out)
+            self.assertIn("status", out)
+
+    def test_c_provisional_promoted_to_active_in_place_is_error(self):
+        """Ruling 142 / docs/SCHEMA.md section 5: promotion is a NEW link
+        (owner-ratified/owner-verbatim), never an edit of the provisional
+        link's own status to active -- verified against section 5's own
+        text (see the coordinator response for the exact quote)."""
+        with tempfile.TemporaryDirectory() as td:
+            base = TOPIC_L1_L2.replace(
+                "    status: active\n    kind: adopted\n    ruling:\n      text: \"second ruling\"",
+                "    status: provisional\n    kind: adopted\n    ruling:\n      text: \"second ruling\"",
+            )
+            root = self._store_with_base_text(td, base)
+            text = base.replace(
+                "    status: provisional\n    kind: adopted\n    ruling:\n      text: \"second ruling\"",
+                "    status: active\n    kind: adopted\n    ruling:\n      text: \"second ruling\"",
+            )
+            (root / "topics" / "foo.md").write_text(text)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("L2", out)
+            self.assertIn("status", out)
+
+    def test_c_superseded_by_changed_after_being_set_is_error(self):
+        """Ruling 142: superseded_by is immutable once set."""
+        with tempfile.TemporaryDirectory() as td:
+            base = TOPIC_L1_L2.replace(
+                "    status: active\n    kind: adopted\n    ruling:\n      text: \"second ruling\"",
+                "    status: superseded\n    superseded_by: L1\n    kind: adopted\n    ruling:\n      text: \"second ruling\"",
+            )
+            root = self._store_with_base_text(td, base)
+            text = base.replace("superseded_by: L1", "superseded_by: L9")
+            (root / "topics" / "foo.md").write_text(text)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("L2", out)
+            self.assertIn("superseded_by", out)
+
+    def test_c_status_change_plus_body_edit_is_error(self):
+        """Ruling 142: a lifecycle move must be the ONLY change on a
+        recorded link -- combined with a body edit, both the body field
+        and the status field get their own error message."""
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            text = TOPIC_L1_L2.replace(
+                "    status: active\n    kind: adopted\n    ruling:\n      text: \"second ruling\"",
+                "    status: superseded\n    superseded_by: L1\n    kind: adopted\n    ruling:\n      text: \"EDITED second ruling\"",
+            )
+            (root / "topics" / "foo.md").write_text(text)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("L2", out)
+            self.assertIn("ruling", out)
+            self.assertIn("status", out)
 
     def test_d_delete_a_link_is_error(self):
         with tempfile.TemporaryDirectory() as td:

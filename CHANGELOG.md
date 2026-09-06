@@ -58,11 +58,21 @@
   debug log.
 - Append-only history is now enforced, not only documented: `memlint.py
   --against-ref REF [--staged] ROOT` compares every topic file's links now
-  against what they were at `REF` and errors on an edited or removed link,
-  or a topic file deleted or renamed (new links, and changes to `current`,
-  `title`, `tags`, `code_refs`, or the body, stay free). A new store git
-  `pre-commit` hook (`hooks/pre-commit-append-only.sh`, wired by
-  `scripts/repo-init.sh` alongside `post-commit`) runs this on every commit
+  against what they were at `REF` and freezes a recorded link's BODY
+  (`ruling`, `rationale`, `alternatives`, `evidence`, `revisit_if`, `edges`,
+  `assumptions`, `invariant`, `date`, `kind`, `reverses`,
+  `reason_for_change`, `recorded_by`, `recorded_at` -- any diff there is an
+  error naming the field). Two lifecycle fields may move forward only, once:
+  `status` from `active`/`provisional` to `superseded`/`historical`/
+  `declined` (never back, never between the three terminal values), and
+  `superseded_by` may be added in that same move (never changed afterwards,
+  never present without that status); a lifecycle move bundled with any
+  body edit is an error too, on both fields. A link removed, or a topic
+  file deleted or renamed, is also an error (new links, and changes to
+  `current`, `title`, `tags`, `code_refs`, or the body text, stay free). A
+  new store git `pre-commit` hook (`hooks/pre-commit-append-only.sh`, wired
+  by `scripts/repo-init.sh` alongside `post-commit`, both refusing to
+  overwrite a foreign hook they did not render) runs this on every commit
   and blocks the ones that fail it -- fail-open on an unborn HEAD, a missing
   python, or an engine failure, `--no-verify` bypasses it locally, and the
   same check can run again in CI for a guarantee local bypasses cannot

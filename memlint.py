@@ -631,6 +631,85 @@ def _is_topic_like(result: ParseResult) -> bool:
     return bool(fm.get("links")) or fm.get("type") == "topic"
 
 
+# Ruling 142 (TOP-0122 L3, fix round 1): append-only freezes a recorded
+# link's BODY -- every field except these two, which are lifecycle
+# fields allowed to move FORWARD ONLY and ONCE. `status` may move from
+# active/provisional to superseded/historical/declined (never back to
+# active/provisional, never between the three terminal values -- so a
+# provisional record can only ever be PROMOTED by a NEW link per
+# docs/SCHEMA.md section 5, never by editing this field to `active`).
+# `superseded_by` may be ADDED once status is (or becomes, in the SAME
+# link) `superseded`; it is immutable once set, and may never be present
+# when status is not `superseded`. `link` (the id) is excluded from the
+# generic body-field diff below for a different reason -- it is the key
+# callers already match old/new links by, so it is definitionally equal
+# and never worth its own diagnostic.
+_LIFECYCLE_ONLY_STATUSES = ("active", "provisional")
+_LIFECYCLE_TERMINAL_STATUSES = ("superseded", "historical", "declined")
+_LINK_NON_BODY_FIELDS = {"link", "status", "superseded_by"}
+
+
+def _link_diff_errors(full_path, lid: str, old_link: dict, new_link: dict) -> list[str]:
+    """Compares one link present at both REF and now; returns zero or more
+    ERROR strings (no path/`ERROR:` prefix -- callers add that), each
+    naming the one field it is about. A lifecycle move (`status` and/or
+    `superseded_by`) is valid only when it is the SOLE change on the link
+    -- any co-occurring body-field edit invalidates it too, each getting
+    its own message (so a status change bundled with a `ruling.text` edit
+    reports both, not just one)."""
+    errors: list[str] = []
+
+    body_fields = (set(old_link) | set(new_link)) - _LINK_NON_BODY_FIELDS
+    body_changed = sorted(f for f in body_fields if old_link.get(f) != new_link.get(f))
+    for field in body_changed:
+        errors.append(
+            f"{full_path}:{lid}: {field}: link field changed after being recorded "
+            "(append-only; add a new link instead)"
+        )
+
+    old_status = old_link.get("status")
+    new_status = new_link.get("status")
+    old_sb = old_link.get("superseded_by")
+    new_sb = new_link.get("superseded_by")
+    lifecycle_only = not body_changed
+
+    if old_status != new_status:
+        forward_ok = old_status in _LIFECYCLE_ONLY_STATUSES and new_status in _LIFECYCLE_TERMINAL_STATUSES
+        if not forward_ok:
+            errors.append(
+                f"{full_path}:{lid}: status: changed from {old_status!r} to {new_status!r} "
+                "after being recorded (append-only; only active/provisional -> "
+                "superseded/historical/declined is allowed, once -- a promotion to "
+                "active/provisional is a NEW link, never an edit to this one)"
+            )
+        elif not lifecycle_only:
+            errors.append(
+                f"{full_path}:{lid}: status: changed from {old_status!r} to {new_status!r} "
+                "together with other field edit(s) after being recorded (append-only; "
+                "a lifecycle move must be the only change on a recorded link)"
+            )
+
+    if old_sb != new_sb:
+        if old_sb is not None:
+            errors.append(
+                f"{full_path}:{lid}: superseded_by: changed after being recorded "
+                "(append-only; immutable once set)"
+            )
+        elif new_status != "superseded":
+            errors.append(
+                f"{full_path}:{lid}: superseded_by: added but status is {new_status!r}, "
+                "not superseded (append-only)"
+            )
+        elif not lifecycle_only:
+            errors.append(
+                f"{full_path}:{lid}: superseded_by: added together with other field "
+                "edit(s) after being recorded (append-only; a lifecycle move must be "
+                "the only change on a recorded link)"
+            )
+
+    return errors
+
+
 def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], int]:
     """Returns (errors, changed) -- `changed` is the number of topic files
     the diff actually concerned (topic-relevant at REF), independent of
@@ -720,10 +799,7 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
                     "(append-only; a store never loses history)"
                 )
             elif new_link != old_link:
-                errors.append(
-                    f"{full_path}:{lid}: link changed after being recorded "
-                    "(append-only; add a new link instead)"
-                )
+                errors.extend(_link_diff_errors(full_path, lid, old_link, new_link))
 
     return errors, changed
 

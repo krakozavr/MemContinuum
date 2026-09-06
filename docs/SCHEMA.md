@@ -153,11 +153,21 @@ copied inline.
 
 **A link edited after being recorded is caught too**, in a second, independent
 check: `memlint.py --against-ref REF [--staged] ROOT` compares every topic
-file's links now against what they were at `REF` — a link present at `REF`
-must be unchanged (a status change, a new `superseded_by`, anything at all
-about it, is a NEW link instead); a link removed, or a topic file deleted or
+file's links now against what they were at `REF`. A link present at `REF`
+has its BODY frozen — `ruling`, `rationale`, `alternatives`, `evidence`,
+`revisit_if`, `edges`, `assumptions`, `invariant`, `date`, `kind`, `reverses`,
+`reason_for_change`, `recorded_by`, `recorded_at` may never change; any diff
+there is an error naming the field. Exactly two fields are lifecycle fields,
+allowed to move **forward only, once**: `status` may move from `active` or
+`provisional` to `superseded`, `historical`, or `declined` — never back to
+`active`/`provisional`, never between the three terminal values (so a
+provisional record is *promoted* by a new link, per §5, never by editing this
+field to `active`) — and `superseded_by` may be *added* in that same move
+(never changed afterwards, never present unless `status` is `superseded`). A
+lifecycle move must be the only change on the link; bundled with any body
+edit, both get their own error. A link removed, or a topic file deleted or
 renamed, is an error naming the path. New links, and changes to `current`,
-`title`, `tags`, `code_refs`, or the body, are free. A store's own git
+`title`, `tags`, `code_refs`, or the body text, are free. A store's own git
 `pre-commit` hook (`hooks/pre-commit-append-only.sh`, wired by
 `scripts/repo-init.sh` the same way `post-commit-reindex.sh` is) runs this on
 every commit and blocks the ones that fail it; the same check can run again in

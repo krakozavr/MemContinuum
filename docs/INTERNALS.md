@@ -1672,12 +1672,23 @@ id:
 
 | rule | severity |
 |---|---|
-| a link present at `REF` differs at all (any field, including `status`, `superseded_by`, `reverses` — a status change is a NEW link, never an edit) | error, `<path>:<link>: link changed after being recorded` |
+| a link present at `REF` has a BODY field changed (`ruling`, `rationale`, `alternatives`, `evidence`, `revisit_if`, `edges`, `assumptions`, `invariant`, `date`, `kind`, `reverses`, `reason_for_change`, `recorded_by`, `recorded_at`) | error naming the field, `<path>:<link>: <field>: link field changed after being recorded` |
+| `status` changes other than `active`/`provisional` → `superseded`/`historical`/`declined` (backward, or between the three terminal values) | error, `<path>:<link>: status: changed from … to … after being recorded` |
+| `superseded_by` changes after already being set, or is added while `status` is not `superseded` | error, `<path>:<link>: superseded_by: …` |
+| a lifecycle move (`status` and/or `superseded_by`, otherwise valid) bundled with any body-field edit | error on the lifecycle field too, naming it, in addition to the body field's own error |
 | a link present at `REF` is missing now | error, `<path>:<link>: link removed after being recorded` |
 | a topic file present at `REF` is deleted or renamed | error naming the path (`--no-renames` means a rename is a plain delete + a plain add, so one rule covers both) |
-| new links; changes to `current`, `title`, `tags`, `code_refs`, or the body | free |
+| a valid forward `status` move (with `superseded_by` added when the new status is `superseded`), alone on the link; new links; changes to `current`, `title`, `tags`, `code_refs`, or the body text | free |
 | frontmatter that does not parse (either side) | error, the typed-parse diagnostic — never a traceback |
 | `ROOT` is not inside a git repository, or `REF` does not resolve to a commit | exit 2 with a message (not exit 1 — this is an infrastructure/usage failure, not a content finding) |
+
+The two lifecycle fields exist because a link is not always closed the
+instant it stops being current: marking one `superseded`/`historical`/
+`declined` — and naming its successor once that exists — is bookkeeping, not
+a change of mind, and forcing a whole new link for it would just move the
+same edit into a place this check cannot see it happen. Promotion (§5) still
+appends a new link rather than editing `status` to `active`/`provisional` in
+place — those two directions were never legal moves for this field.
 
 `--staged` compares `REF` to the INDEX (`git show :path`, what `git commit`
 would actually commit); the default compares `REF` to the working tree

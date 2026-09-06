@@ -589,9 +589,10 @@ class TestReinstallIdempotent(unittest.TestCase):
 
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
 class TestPreCommitForeignHook(unittest.TestCase):
-    """Task A2-1: unlike post-commit (always overwritten, no check at all),
-    an existing pre-commit this installer did not render must be left
-    untouched and reported -- never silently clobbered."""
+    """Task A2-1 (fix round 1 gives post-commit the identical policy below,
+    TestPostCommitForeignHook): an existing pre-commit this installer did
+    not render must be left untouched and reported -- never silently
+    clobbered."""
 
     def test_foreign_pre_commit_is_left_untouched_and_reported(self):
         home = sandbox_home()
@@ -633,9 +634,8 @@ class TestPreCommitForeignHook(unittest.TestCase):
             )
             self.assertIn("SKIPPED", proc.stdout)
             self.assertIn("foreign", proc.stdout.lower())
-            # post-commit, with no such check, is still installed as always
-            # -- the asymmetry is deliberate, not a side effect of a shared
-            # failure.
+            # post-commit was never foreign in this scenario (only
+            # pre-commit was) -- still installed normally.
             self.assertTrue((hooks_dir / "post-commit").is_file())
         finally:
             shutil.rmtree(home, ignore_errors=True)
@@ -652,6 +652,73 @@ class TestPreCommitForeignHook(unittest.TestCase):
             pre_commit = Path(store) / ".git" / "hooks" / "pre-commit"
             self.assertTrue(pre_commit.is_file())
             self.assertIn("pre-commit-append-only.sh", pre_commit.read_text())
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestPostCommitForeignHook(unittest.TestCase):
+    """Fix round 1 (TOP-0122 L3): post-commit gets the identical
+    foreign-hook refusal policy pre-commit already has above -- mirrors
+    TestPreCommitForeignHook exactly, swapped to post-commit."""
+
+    def test_foreign_post_commit_is_left_untouched_and_reported(self):
+        home = sandbox_home()
+        try:
+            store = str(Path(home) / "store")
+            os.makedirs(store)
+            subprocess.run(["git", "init", "-q", store], check=True)
+            # Same adoption-marker seeding as TestPreCommitForeignHook --
+            # this installer refuses --store at an existing git repo with
+            # none of its markers (exit 9).
+            topics = Path(store) / "topics"
+            topics.mkdir()
+            (topics / "existing.md").write_text(
+                "---\ntype: topic\nid: TOP-9501\ntitle: existing\narea: test\n---\nBody\n"
+            )
+            subprocess.run(
+                ["git", "-C", store, "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+                 "add", "-A"], check=True,
+            )
+            subprocess.run(
+                ["git", "-C", store, "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+                 "commit", "-q", "-m", "seed"], check=True,
+            )
+            hooks_dir = Path(store) / ".git" / "hooks"
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            foreign = hooks_dir / "post-commit"
+            foreign.write_text("#!/usr/bin/env bash\necho hand-authored post-commit guard\n")
+            foreign.chmod(0o755)
+
+            proc = run_install(
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude")],
+                home,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(
+                foreign.read_text(), "#!/usr/bin/env bash\necho hand-authored post-commit guard\n",
+                "a foreign post-commit must never be overwritten",
+            )
+            self.assertIn("SKIPPED", proc.stdout)
+            self.assertIn("foreign", proc.stdout.lower())
+            # pre-commit was never foreign in this scenario -- still
+            # installed normally.
+            self.assertTrue((hooks_dir / "pre-commit").is_file())
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_no_post_commit_at_all_still_gets_one(self):
+        home = sandbox_home()
+        try:
+            store = str(Path(home) / "store")
+            proc = run_install(
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude")],
+                home,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            post_commit = Path(store) / ".git" / "hooks" / "post-commit"
+            self.assertTrue(post_commit.is_file())
+            self.assertIn("post-commit-reindex.sh", post_commit.read_text())
         finally:
             shutil.rmtree(home, ignore_errors=True)
 
