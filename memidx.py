@@ -4460,6 +4460,7 @@ def cmd_unmapped(args) -> int:
     mapped_topic: list[str] = []
     mapped_concept_only: list[str] = []
     unmapped: list[str] = []
+    by_path: dict[str, str] = {}
     degraded: dict | None = None
     conn: sqlite3.Connection | None = None
     try:
@@ -4515,6 +4516,26 @@ def cmd_unmapped(args) -> int:
                         elif post_state != "current":
                             coverage_status = "unknown"
                 if conn is not None:
+                    # Codex 11 / Grok M6 (fix wave 1 G4): `unmapped` (and
+                    # its two mapped siblings) is a flat list of DISPLAY
+                    # strings -- relative to each path's own best root, per
+                    # `_unmapped_display_path` -- so two sibling code roots
+                    # that happen to share a relative path (both have
+                    # `src/mapped.py`, say) produce the SAME string in that
+                    # list from two entirely different physical files. A
+                    # caller trying to test "is THIS specific absolute path
+                    # unmapped" by membership-testing a display string
+                    # against that flat list (userprompt-remind.sh's own
+                    # per-commit nudge count did exactly this) can match
+                    # the WRONG root's file. `by_path` below is additive
+                    # (the three display-string lists are unchanged, for
+                    # every existing consumer) and keyed by each raw_path
+                    # EXACTLY as given in args.paths -- already the
+                    # unambiguous, caller-supplied identity every caller
+                    # that cares about one specific physical file already
+                    # has on hand, sidestepping the display-string collision
+                    # entirely rather than trying to reconstruct a safe
+                    # (root, relative_path) pair from a lossy string.
                     for raw_path in args.paths:
                         candidates = _unmapped_path_candidates(raw_path, code_roots)
                         display = _unmapped_display_path(raw_path, code_roots)
@@ -4538,13 +4559,16 @@ def cmd_unmapped(args) -> int:
                             )
                         if topic_hit:
                             mapped_topic.append(display)
+                            by_path[raw_path] = "mapped_topic"
                         elif concept_hit:
                             mapped_concept_only.append(display)
+                            by_path[raw_path] = "mapped_concept_only"
                         elif coverage_status == "ok":
                             unmapped.append(display)
+                            by_path[raw_path] = "unmapped"
     except sqlite3.OperationalError:
         coverage_status = "index-error"
-        mapped_topic, mapped_concept_only, unmapped = [], [], []
+        mapped_topic, mapped_concept_only, unmapped, by_path = [], [], [], {}
     except Exception as exc:
         # Design R7 (audit MC-P2-03, TOP-0123 L7): this is the ONE branch
         # that used to conflate a genuine operational failure with an
@@ -4558,7 +4582,7 @@ def cmd_unmapped(args) -> int:
         if DEBUG:
             raise
         coverage_status = "unknown"
-        mapped_topic, mapped_concept_only, unmapped = [], [], []
+        mapped_topic, mapped_concept_only, unmapped, by_path = [], [], [], {}
         degraded = _degraded("internal-error", exc)
         print(
             f"unmapped: degraded reason=internal-error type={degraded['exception_type']}: "
@@ -4579,10 +4603,19 @@ def cmd_unmapped(args) -> int:
         "unmapped": unmapped,
         "coverage_status": coverage_status,
         # Design R5 (audit MC-P1-05, TOP-0123 L5): an echo of every
-        # resolved --code-root this call used, NOT a per-entry root
-        # annotation -- the output shape (a list of display paths) stays
-        # exactly as before.
+        # resolved --code-root this call used.
         "roots": [str(r) for r in code_roots],
+        # Codex 11 / Grok M6 (fix wave 1 G4): additive -- the three lists
+        # above are unchanged, display-path strings, for every existing
+        # consumer. `by_path` is the unambiguous per-INPUT-path
+        # classification (keyed by each raw_path exactly as given in
+        # args.paths, never a display string two different roots' files
+        # could share) a caller needs when it wants to know "is THIS
+        # specific absolute path mapped or not" without re-deriving a
+        # (root, relative_path) pair from a lossy string itself. Empty
+        # whenever no path was actually classified this call (every branch
+        # above that resets the three lists to [] resets this to {} too).
+        "by_path": by_path,
     }
     if degraded is not None:
         result["degraded"] = degraded
@@ -7093,9 +7126,16 @@ UNKNOWN_STATS_PROJECT = "(unknown)"
 # Excluded from `user_prompts` so ten of THESE alone can never satisfy
 # the read-side FLAG's ">=10 prompts" busy-signal on their own -- they
 # prove the hook ran, not that a human was actively prompting.
+#
+# Codex 12 (fix wave 1 G4): `commit-nudge` is a SUPPLEMENTAL line the SAME
+# turn's own real outcome line (`injected`, `no-evidence`, ...) may ALSO
+# write, one per newly-moved-and-examined code root, never a turn's own
+# terminal outcome by itself -- a turn that both injects AND nudges a
+# commit writes TWO userprompt lines for the one prompt. Five injected
+# prompts plus five commit-nudge lines used to report ten prompts.
 _NON_USER_PROMPT_OUTCOMES = frozenset({
     "duplicate-delivery", "agent-source", "non-user-source",
-    "empty-payload", "no-session-id", "no-state",
+    "empty-payload", "no-session-id", "no-state", "commit-nudge",
 })
 
 _MONTH_ABBR = {

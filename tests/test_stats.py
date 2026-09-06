@@ -556,6 +556,24 @@ class TestStatsFlags(StatsTestBase):
         rc, out = run_stats_json(home=str(self.home))
         self.assertFalse(any("write side silent" in f for f in out["flags"]))
 
+    def test_commit_nudge_lines_are_not_counted_as_prompts(self):
+        """Codex 12 (fix wave 1 G4): a commit-nudge line is SUPPLEMENTAL --
+        the same invocation's own real outcome line (injected, here) is a
+        SEPARATE line for the SAME one prompt. Five real prompts, five
+        commit-nudge lines (one per prompt, as the hook actually writes
+        them) must report five prompts, not ten."""
+        lines = []
+        for i in range(5):
+            lines.append(f"{ts(1)} userprompt outcome=injected session=s1 project=demo")
+            lines.append(
+                f"{ts(1)} userprompt outcome=commit-nudge sha=abc{i:04d} "
+                "root=/code session=s1 project=demo"
+            )
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home))
+        self.assertEqual(out["user_prompts"], 5, out)
+        self.assertEqual(out["nudges"]["commit_nudges"], 5, out)
+
     def test_read_side_silent_flag(self):
         lines = [f"{ts(1)} userprompt outcome=no-evidence session=s1 project=demo" for _ in range(10)]
         self.write_log(lines)

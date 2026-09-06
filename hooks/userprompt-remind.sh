@@ -43,15 +43,23 @@
 # that's supposed to follow a look-back (dual-gate review finding 4).
 #
 # The commit nudge (TOP-0122 L1 rule 2a; docs/INTERNALS.md "The commit
-# nudge"): rides along inside a coverage-candidate turn only -- for each
-# configured code root whose HEAD differs from state's last_seen_heads
-# since the last prompt, reads that commit's own message (one `git log -1`,
-# never the diff, never the prompt) and, when it names no decision id and
-# this turn's own `unmapped` call already finds an edited file under that
-# root with no topic, folds one more fact line into the SAME
-# additionalContext block and logs `outcome=commit-nudge` once per commit
-# (state's `nudged_commits`). It never gets a second turn, a second
-# cooldown, or a second `unmapped` call of its own.
+# nudge"): the moved-HEAD check itself runs on EVERY prompt, independent of
+# coverage's own candidacy (ledger-growth/cooldown) gate -- only the actual
+# nudge work (the `unmapped` call, the commit-message read, the fact line)
+# is skipped on a turn that is neither a coverage candidate nor has any
+# root moved. For each configured code root whose HEAD differs from
+# state's last_seen_heads since the last prompt, reads that commit's own
+# message (one `git log -1`, never the diff, never the prompt) and, when
+# it names no decision id and this turn's own `unmapped` call already
+# finds a file edited under that root during the session with no topic,
+# adds one fact line and logs `outcome=commit-nudge` once per commit
+# (state's `nudged_commits`). On a coverage-candidate turn the fact line
+# joins coverage's own additionalContext block; on a turn that is not a
+# candidate but a root moved, it is the WHOLE additionalContext (no
+# coverage content), the turn's own outcome is `nudge-only`, and
+# coverage's own cooldown/delivery bookkeeping is left untouched. It never
+# gets a second turn, a second cooldown of its own, or a second `unmapped`
+# call.
 #
 # This hook NEVER reads transcript_path, user_input, prompt, or
 # last_assistant_message from the payload (ruling B; the addendum extends
@@ -408,7 +416,48 @@ if [ "${DUPLICATE:-0}" = "1" ]; then
     finish "duplicate-delivery"
 fi
 
-if [ "${CANDIDATE:-0}" = "1" ]; then
+# Codex 9 (BLOCKING, fix wave 1 G4): a moved HEAD is now checked on EVERY
+# prompt, independent of coverage candidacy (bool(pairs) and grew and
+# cooldown_ok, above -- the LEDGER's own growth/cooldown signal, unrelated
+# to whether a code root's commit history moved). The old placement lived
+# entirely inside `if CANDIDATE=1`, so once a coverage reminder had already
+# fired once (consuming `grew` against last_injected_pairs), a commit with
+# no decision id followed by any number of further prompts with no NEW
+# ledger growth produced zero commit nudges -- last_seen_heads never even
+# advanced, because the moved-HEAD comparison itself never ran. Design R5
+# (audit MC-P1-05, TOP-0123 L5): every configured code root, captured ONCE
+# (one python spawn via mc_code_roots, memlib.sh) and reused below by BOTH
+# the `unmapped` call and the per-root HEAD comparison -- a herestring-fed
+# while-read loop (bash 3.2 safe, no array-of-roots to guard against
+# `set -u`'s empty-array expansion). `git rev-parse HEAD` per root
+# (mc_git_head, no python) is unavoidable (bash 3.2 cannot do a dict
+# lookup without one), but the state-file lookup/comparison is ONE
+# combined python call covering BOTH code (per-root map) and store
+# (unchanged, single root) -- LOW-3/LOW-4 (task-7-review.md): both the
+# per-root HEAD loop and this comparison live once in memlib.sh
+# (mc_code_heads_from / mc_head_changed). MOVED_ROOTS itself is a CHEAP
+# GATE only -- git rev-parse per root plus one python call, no `unmapped`
+# invocation yet -- so the overwhelmingly common turn (no root moved, not
+# a coverage candidate either) still costs zero extra spawns beyond this.
+CODE_ROOTS_TEXT="$(mc_code_roots)"
+CODE_HEADS="$(mc_code_heads_from "$CODE_ROOTS_TEXT")"
+CUR_STORE_SHA="$(mc_git_head "${MEMCONTINUUM_ROOT:-}")"
+
+# Safe defaults in case the python call below prints nothing (interpreter
+# gone, unexpected crash) -- under `set -u` an unset CODE_CHANGED/
+# STORE_CHANGED/MOVED_ROOTS would otherwise abort the hook with no log line.
+CODE_CHANGED="false"
+STORE_CHANGED="false"
+MOVED_ROOTS=""
+eval "$(mc_head_changed "$STATE_FILE" "$CODE_HEADS" "$CUR_STORE_SHA" "${MEMCONTINUUM_CODE_ROOT:-}")"
+
+# The coverage candidacy gate stays, but ONLY for the coverage nudge itself
+# (Codex 9's own wording) -- this block now also runs whenever a root
+# actually moved, regardless of candidacy, so the moved-HEAD attribution
+# (last_seen_heads advance, the commit-nudge count, nudged_commits dedup)
+# is checked on every prompt a root moved on, never gated behind ledger
+# growth.
+if [ "${CANDIDATE:-0}" = "1" ] || [ -n "$MOVED_ROOTS" ]; then
     # bash 3.2 has no `mapfile`/`readarray` -- process substitution (never a
     # pipe, which would run the loop in a subshell and drop the assignments)
     # feeding a plain while-read loop is the portable equivalent.
@@ -422,13 +471,6 @@ with open(sys.argv[1]) as f:
 for p in d.get("code_paths", []):
     print(p)
 ' "$DECIDE_TMP" 2>>"$MC_LOG")
-
-    # Design R5 (audit MC-P1-05, TOP-0123 L5): every configured code root,
-    # captured ONCE (one python spawn via mc_code_roots, memlib.sh) and
-    # reused below by BOTH the `unmapped` call and the per-root HEAD
-    # comparison -- a herestring-fed while-read loop (bash 3.2 safe, no
-    # array-of-roots to guard against `set -u`'s empty-array expansion).
-    CODE_ROOTS_TEXT="$(mc_code_roots)"
 
     # Phase 2 (outside the lock): the real, possibly-heavier classification call.
     UNMAPPED_JSON="{}"
@@ -485,34 +527,10 @@ print(d.get("reason_code", "") if isinstance(d, dict) else "")
         fi
     fi
 
-    # Design R5 (audit MC-P1-05, TOP-0123 L5): per-root HEAD comparison --
-    # code_head_changed = ANY configured root moved since session start.
-    # `git rev-parse HEAD` per root (mc_git_head, no python) is unavoidable
-    # (bash 3.2 cannot do a dict lookup without one), but the state-file
-    # lookup/comparison is ONE combined python call covering BOTH code
-    # (per-root map, LOW-4-fixed: a root missing from the map falls back to
-    # the single legacy start_code_sha only when it IS the first configured
-    # root) and store (unchanged, single root) -- replacing the former TWO
-    # separate START_CODE_SHA/START_STORE_SHA spawns with one, so this
-    # hook's total python-spawn count stays flat despite the new
-    # mc_code_roots call above. LOW-3/LOW-4 (task-7-review.md): both the
-    # per-root HEAD loop and this comparison now live once in memlib.sh
-    # (mc_code_heads_from / mc_head_changed).
-    CODE_HEADS="$(mc_code_heads_from "$CODE_ROOTS_TEXT")"
-    CUR_STORE_SHA="$(mc_git_head "${MEMCONTINUUM_ROOT:-}")"
-
-    # Safe defaults in case the python call below prints nothing (interpreter
-    # gone, unexpected crash) -- under `set -u` an unset CODE_CHANGED/
-    # STORE_CHANGED/MOVED_ROOTS would otherwise abort the hook with no log
-    # line.
-    CODE_CHANGED="false"
-    STORE_CHANGED="false"
-    MOVED_ROOTS=""
-    eval "$(mc_head_changed "$STATE_FILE" "$CODE_HEADS" "$CUR_STORE_SHA" "${MEMCONTINUUM_CODE_ROOT:-}")"
-
-    # Commit nudge (TOP-0122 L1 rule 2a; ruling 140/144): MOVED_ROOTS (just
-    # computed, above) is a CHEAP GATE only -- a root whose HEAD differs
-    # from state's last_seen_heads[root] since the last prompt. When it is
+    # Commit nudge (TOP-0122 L1 rule 2a; ruling 140/144): MOVED_ROOTS (already
+    # computed, unconditionally, above CANDIDATE's own gate) is a CHEAP GATE
+    # only -- a root whose HEAD differs from state's last_seen_heads[root]
+    # since the last prompt. When it is
     # non-empty, do the real work in ONE locked transform: re-derive the
     # authoritative comparison from a freshly-loaded state (never trust the
     # gate's own unlocked read for the write), read each moved root's new
@@ -580,7 +598,21 @@ try:
         _unmapped_out = {}
 except Exception:
     _unmapped_out = {}
-unmapped_set = set(_unmapped_out.get("unmapped") or [])
+# Codex 11 / Grok M6 (fix wave 1 G4): `unmapped` alone is a flat list of
+# DISPLAY strings -- each relative to its own best root -- so two sibling
+# code roots that happen to share a relative path (both have src/mapped.py,
+# say) can produce the identical string from two entirely different
+# physical files; membership-testing a display string against that flat
+# set (the old `unmapped_set`) could then count -- or miss -- the wrong
+# file of the two. `by_path` (memidx.py own addition, keyed by each
+# absolute path exactly as this hook fed it into `unmapped PATH...`)
+# resolves this unambiguously: this hook already knows the exact absolute
+# path of every code_paths entry, so a per-path lookup needs no
+# (root, relative_path) reconstruction at all -- no apostrophe anywhere in
+# this comment block, since it lives inside a single-quoted bash string.
+by_path = _unmapped_out.get("by_path")
+if not isinstance(by_path, dict):
+    by_path = {}
 
 
 def _best_root_key(raw_path):
@@ -639,17 +671,30 @@ for root, cur in code_heads.items():
     count = 0
     for raw in code_paths:
         _b, _rel = _best_root_key(raw)
-        if _b == root and _rel in unmapped_set:
+        if _b == root and by_path.get(raw) == "unmapped":
             count += 1
     if count <= 0:
         continue
 
     short = cur[:7]
     root_name = os.path.basename(os.path.normpath(root)) or root
+    # Codex 14 (fix wave 1 G4): `count` is the session ledger own
+    # unmapped-file count under this root -- it was never derived from
+    # this SPECIFIC commit own diff (no `git show`/`git diff-tree` runs
+    # here at all) -- so "of ITS edited file(s)" claimed an attribution
+    # this code never actually checked. The shipped positive test proved
+    # it: it commits a file named newcommit.py while the count comes from
+    # a ledger entry named unmapped.py, a file that commit never touched.
+    # Reworded to describe what was actually measured: files edited under
+    # this root during the SESSION (the ledger), not this commit own
+    # tree -- the no-diff implementation (still no `git show` call) is
+    # unchanged, only the claim now matches it. No apostrophe anywhere in
+    # this comment block, since it lives inside a single-quoted bash string.
     fact = (
         "Commit " + short + " under " + root_name + " names no decision; "
-        + str(count) + " of its edited file(s) have no topic — name "
-        "the decision (TOP-xxxx Ln) in the message, or write the record."
+        + str(count) + " file(s) edited under this root in the session "
+        "have no topic — name the decision (TOP-xxxx Ln) in the message, "
+        "or write the record."
     )
     nudged.append(cur)
     nudged_set.add(cur)
@@ -686,6 +731,7 @@ $NUDGE_FACT"
 
     OUTPUT_JSON="$(UNMAPPED_JSON="$UNMAPPED_JSON" CODE_CHANGED="$CODE_CHANGED" STORE_CHANGED="$STORE_CHANGED" \
         MEMCONTINUUM_ROOT="${MEMCONTINUUM_ROOT:-}" MC_NUDGE_FACT_TEXT="$NUDGE_FACT_TEXT" \
+        MC_CANDIDATE="${CANDIDATE:-0}" \
         env PYTHONPATH= "$MC_PY" -c '
 import json, os
 
@@ -700,6 +746,7 @@ unmapped = unmapped_out.get("unmapped") or []
 coverage_status = unmapped_out.get("coverage_status", "unknown")
 code_changed = os.environ.get("CODE_CHANGED") == "true"
 store_changed = os.environ.get("STORE_CHANGED") == "true"
+is_candidate = os.environ.get("MC_CANDIDATE") == "1"
 # The commit nudge (TOP-0122 L1 rule 2a): computed just above, off the SAME
 # unmapped call this fact_line already reads -- shares this same turn
 # delivery/cooldown/dedupe rather than any nudge logic of its own.
@@ -709,6 +756,24 @@ nudge_lines = [l for l in (os.environ.get("MC_NUDGE_FACT_TEXT") or "").splitline
 def yn(v):
     return "yes" if v else "no"
 
+
+# Codex 9 (fix wave 1 G4): this block now also runs on a turn that is NOT
+# a coverage candidate, when a root moved (MOVED_ROOTS, checked by the
+# bash `if` above this whole python invocation is nested in). On such a
+# turn, the coverage fact_line/has_evidence/question below are the
+# COVERAGE nudge own content -- coverage was never asked to fire this
+# turn, so none of it belongs in the output; only nudge_lines (already
+# computed, unconditionally, above) may justify emitting anything at all.
+if not is_candidate:
+    if not nudge_lines:
+        raise SystemExit(3)
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": "\n".join(nudge_lines),
+        }
+    }))
+    raise SystemExit(0)
 
 if coverage_status != "ok":
     fact_line = (
@@ -757,21 +822,28 @@ print(json.dumps({
     if [ $OUT_RC -eq 0 ] && [ -n "$OUTPUT_JSON" ]; then
         printf '%s\n' "$OUTPUT_JSON"
 
-        # Phase 3 (locked): commit the injection bookkeeping now that we know
-        # it actually happened. last_inject_ts mirrors last_inject_time (the
-        # look-back's shared "since last inject of any kind" clock).
-        PAIRS_JSON="$(env PYTHONPATH= "$MC_PY" -c '
+        if [ "${CANDIDATE:-0}" = "1" ]; then
+            # Phase 3 (locked): commit the injection bookkeeping now that we
+            # know it actually happened. last_inject_ts mirrors
+            # last_inject_time (the look-back's shared "since last inject of
+            # any kind" clock). Codex 9: this must never run on a nudge-only
+            # turn (CANDIDATE=0) -- it is coverage's OWN cooldown/dedupe
+            # bookkeeping (last_injected_pairs, last_inject_turn/time/ts), and
+            # a nudge-only turn resetting it would let a commit nudge quietly
+            # re-arm coverage's cooldown clock without coverage ever actually
+            # having fired.
+            PAIRS_JSON="$(env PYTHONPATH= "$MC_PY" -c '
 import json, sys
 with open(sys.argv[1]) as f:
     d = json.load(f)
 print(json.dumps(d.get("pairs", [])))
 ' "$DECIDE_TMP" 2>>"$MC_LOG")"
 
-        export MC_PAIRS_JSON="$PAIRS_JSON"
-        export MC_TURN_NUM="$TURN"
-        export MC_NOW
+            export MC_PAIRS_JSON="$PAIRS_JSON"
+            export MC_TURN_NUM="$TURN"
+            export MC_NOW
 
-        mc_update_state_json "$STATE_FILE" '
+            mc_update_state_json "$STATE_FILE" '
 import json, os
 
 try:
@@ -799,7 +871,18 @@ state["delivery_open"] = False
 print(json.dumps(state))
 ' >>"$MC_LOG" 2>&1
 
-        finish "injected"
+            finish "injected"
+        else
+            # Codex 9: a nudge fired on a turn coverage was never a
+            # candidate on -- a genuine, distinct turn outcome (counted as a
+            # real user prompt by stats; NOT the same thing as the
+            # supplemental per-commit `outcome=commit-nudge` line(s) this
+            # turn also already wrote, which stats excludes instead). finish
+            # (not in its own "injected"/"lookback-injected" exemption list)
+            # closes delivery_open on our behalf, same as any other
+            # genuinely-finished turn.
+            finish "nudge-only"
+        fi
     fi
 fi
 

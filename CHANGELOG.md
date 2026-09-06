@@ -196,18 +196,25 @@
   removes a full process start's worth of margin without loosening the
   bar itself.
 - Commit messages now name the decision they land under, and the prompt
-  hook nudges once when they do not. When a configured code root's HEAD
-  moves since the last prompt and the new commit names no decision id,
-  and the same call that already computes the coverage signal finds at
-  least one edited file under that root with no topic, one more fact
-  line is added to the same reminder and the nudge is logged, once per
-  commit -- a commit that already names a decision, or whose edits are
-  all covered, gets no line. State gains `last_seen_heads` (the per-prompt
-  baseline this compares against) and `nudged_commits` (bounded to the
-  last 20); both re-seed from the current HEADs on a session clear. The
-  nudge never reads the diff or the prompt, and shares the coverage
-  signal's own delivery, cooldown, and dedupe. `stats` counts it under
-  `nudges.commit_nudges`.
+  hook nudges once when they do not. The check runs on every prompt --
+  independent of the coverage signal's own ledger-growth/cooldown
+  candidacy -- so a commit made between coverage reminders is still
+  examined, not silently skipped until the next unrelated edit happens to
+  re-arm coverage. When a configured code root's HEAD moves since the
+  last prompt and the new commit names no decision id, and an `unmapped`
+  call finds at least one file edited under that root during the session
+  with no topic, one more fact line is added and the nudge is logged, once
+  per commit -- a commit that already names a decision, or whose edits are
+  all covered, gets no line. On a turn that is also a coverage candidate,
+  the fact line joins the same reminder; otherwise it is the whole
+  reminder on its own, with no coverage content and no store-record
+  question attached, and coverage's own delivery/cooldown bookkeeping is
+  left untouched. State gains `last_seen_heads` (the per-prompt baseline
+  this compares against) and `nudged_commits` (bounded to the last 20);
+  both re-seed from the current HEADs on a session clear. The nudge never
+  reads the diff or the prompt. `stats` counts it under
+  `nudges.commit_nudges`, excluded from `user_prompts` (it is supplemental
+  to the turn's own outcome line, not a second prompt).
 
 ### Install and update
 - `scripts/repo-init.sh`'s default `--store` (no `--store` given, cwd inside

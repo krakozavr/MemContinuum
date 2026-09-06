@@ -87,6 +87,16 @@ that shape: nothing was compared), and
 `$MEMCONTINUUM_DETECT_LOG` is set — it runs in every repo on the machine, so its
 default is silence.
 
+`userprompt-remind.sh` has its own exception too (Codex 12, fix wave 1 G4): a
+turn whose HEAD-moved check (independent of coverage candidacy — see "The
+commit nudge" below) finds one or more newly-examined, undecided commits
+writes one SUPPLEMENTAL `userprompt outcome=commit-nudge sha=<n> root=<r>
+session=<s>` line per such commit, in addition to — never instead of — that
+same turn's own real outcome line (`injected`, `no-evidence`, ...). `stats`
+excludes `commit-nudge` from its `user_prompts` tally for exactly this
+reason: it is not a second prompt, and counting it as one used to inflate a
+handful of real turns into double their number.
+
 `ledger-post-edit.sh` itself has two further exceptions to "exactly one
 `outcome=` line". A read-only built-in (`Read`, `Grep`, ...) is caught by the
 prefilter before the watchdog and writes nothing at all — no line, no
@@ -144,27 +154,59 @@ does not ship.
 (a routine, not enforced elsewhere) — `userprompt-remind.sh` nudges once
 when a commit does not. State gains two keys: `last_seen_heads` (`{root:
 sha}`, seeded at `SessionStart` alongside `start_code_shas` and advanced on
-every candidate prompt) is the per-PROMPT baseline this compares against,
-distinct from `start_code_shas`' per-SESSION one; `nudged_commits` (a list
-of sha, bounded to the last 20) dedupes a commit that keeps coming back as
-HEAD across prompts. `clear` re-seeds both from the current HEADs, the same
-way it re-seeds `start_code_shas` — nothing here survives a clear. On a
-candidate turn, for every configured root whose HEAD differs from
-`last_seen_heads[root]`, the hook reads the new commit's subject and body
-(one `git log -1`, a 2s timeout of its own, tighter than the hook's outer
-watchdog) and, when the message names no decision id and the SAME
-`unmapped` call this turn's coverage signal already made finds at least
-one edited file under that root with no topic, adds one fact line to the
-same `additionalContext` block and logs `userprompt outcome=commit-nudge
-sha=<short> root=<root>` (one line per nudge, `project=` last like every
-other `mc_log` line). A root whose message already names a decision, or
-whose edited files are all covered, or whose commit was already nudged,
-adds no line — but `last_seen_heads` still advances, so that commit is
-never re-examined. The nudge never reads the diff and never reads the
-prompt; it shares coverage's own delivery, cooldown, and prompt-hash
-dedupe rather than any throttle of its own. `stats` counts it as
-`nudges.commit_nudges`, separate from `nudges.total` (it can co-occur with
-`nudges.coverage_injected` on the same turn).
+every prompt this check actually runs on) is the per-PROMPT baseline this
+compares against, distinct from `start_code_shas`' per-SESSION one;
+`nudged_commits` (a list of sha, bounded to the last 20) dedupes a commit
+that keeps coming back as HEAD across prompts. `clear` re-seeds both from
+the current HEADs, the same way it re-seeds `start_code_shas` — nothing
+here survives a clear.
+
+Codex 9 (fix wave 1 G4): the moved-HEAD comparison itself runs on EVERY
+prompt, independent of coverage's own candidacy (ledger-growth/cooldown)
+gate — only computing the actual nudge (the `unmapped` call, the commit
+message read, the fact line) is skipped when NEITHER coverage is a
+candidate NOR any root actually moved, so the overwhelmingly common turn
+still costs nothing extra. Before this fix, the whole comparison lived
+inside coverage's own candidacy gate: once a coverage reminder had fired
+once (consuming the ledger-growth signal), a commit with no decision id
+followed by any number of further prompts with no NEW ledger growth
+produced zero commit nudges at all — `last_seen_heads` never even
+advanced, because the comparison never ran.
+
+For every configured root whose HEAD differs from `last_seen_heads[root]`,
+the hook reads the new commit's subject and body (one `git log -1`, a 2s
+timeout of its own, tighter than the hook's outer watchdog) and, when the
+message names no decision id and the SAME `unmapped` call this turn already
+made finds at least one file edited under that root during the SESSION
+(the ledger — never that specific commit's own diff, which this feature
+never reads) with no topic, adds one fact line and logs `userprompt
+outcome=commit-nudge sha=<short> root=<root>` (one line per nudge,
+`project=` last like every other `mc_log` line). Which of the session's
+ledger files count toward that per-root number is decided by `memidx.py
+unmapped`'s own `by_path` field — keyed by the exact absolute path the
+hook fed it, never a bare relative-path string two sibling code roots
+could otherwise share. A root whose message already names a
+decision, or whose edited files are all covered, or whose commit was
+already nudged, adds no line — but `last_seen_heads` still advances, so
+that commit is never re-examined.
+
+On a turn where coverage IS a candidate, the fact line(s) above are folded
+into the SAME `additionalContext` block as coverage's own fact line, and
+the turn's outcome is `injected` (or `lookback-injected`), same as before
+this fix. On a turn where coverage is NOT a candidate but a root moved, the
+nudge fact line(s) are the WHOLE `additionalContext` (no coverage fact
+line, no store-record question — those are coverage's own content, and
+coverage was never asked to fire this turn); the turn's own outcome is
+`userprompt outcome=nudge-only`, and coverage's own cooldown/delivery
+bookkeeping (`last_injected_pairs`, `last_inject_turn`, `last_inject_time`)
+is left untouched — a nudge must never quietly re-arm coverage's own
+cooldown clock. The nudge never reads the diff and never reads the prompt.
+`stats` counts `outcome=commit-nudge` as `nudges.commit_nudges`, separate
+from `nudges.total`, and excludes it from `user_prompts` (Codex 12: it is
+SUPPLEMENTAL to the turn's own real outcome line — `injected`,
+`nudge-only`, or otherwise — not a second prompt of its own; five real
+prompts each also writing their own commit-nudge line used to report ten
+prompts, not five).
 
 **The shell-diff ledger branch.** `ledger-post-edit.sh` runs the tree-diff
 pass for `Bash` and any tool it has no dedicated branch for, inside the same
