@@ -2152,7 +2152,14 @@ importing fastembed either, verified the same way.
 down:
 
 - **`search`** — `--mode fts` and `--mode vector` never both run; `hybrid` (the
-  default) runs both and fuses ranks with RRF. Filters (`--status`, `--type`,
+  default) runs both and fuses ranks with RRF. `--status` defaults to
+  active-only when omitted entirely (`_resolve_search_status`, applied inside
+  `cmd_search` on a shallow copy of `args` -- `build_filter_clause` itself,
+  and every other caller of it, keeps "no status given" meaning "no filter");
+  `--status any` widens back to every status (superseded/historical/
+  declined/provisional included), and any other explicit value (or several,
+  repeated) passes through unchanged, exactly as before this default existed.
+  Filters (`--status`, `--type`,
   `--area`, `--topic`, `--authority`) are always ANDed, and are applied
   **inside** `fts_ranked`/`vector_ranked`'s own query, before either channel's
   cap and before RRF fusion — a status a caller filtered out can never occupy

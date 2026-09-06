@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import fcntl
 import fnmatch
 import hashlib
@@ -2740,6 +2741,23 @@ def _search_hits(conn, args, extra_where: str, extra_params: list) -> tuple[list
     return results, contributing, embed_info
 
 
+def _resolve_search_status(status: list[str]) -> list[str]:
+    """search-default-active: no `--status` given at all (an empty list --
+    argparse's own `default=[]`, and every direct-Namespace caller that
+    passes `status=[]` the same way) defaults to `["active"]`, matching
+    every other reader's own default assumption that "the decision" means
+    the current, active one. `--status any` is the one way to widen back
+    to every status (dropping the status clause from the query entirely,
+    same as the pre-existing empty-list behavior); any OTHER explicit
+    value (or combination) passes through completely unchanged -- this
+    only touches the CASE that used to mean "no status given"."""
+    if not status:
+        return ["active"]
+    if "any" in status:
+        return []
+    return status
+
+
 def cmd_search(args) -> int:
     db_path = resolve_db_path(args)
     # Final-fix-wave item 2: --root is optional (add_common_args's
@@ -2761,7 +2779,15 @@ def cmd_search(args) -> int:
     # lives INSIDE fts_ranked/vector_ranked themselves, before their own
     # cap and before RRF fusion -- no more Python-side `allowed` set
     # post-filtering an already-capped, already-fused list.
-    extra_where, extra_params = build_filter_clause(args, include_project=False)
+    #
+    # search-default-active: build_filter_clause itself is unchanged (every
+    # OTHER caller -- filtered_paths, cmd_unmapped's callers -- keeps
+    # meaning "no status given" as "no filter"); only `search`'s own
+    # resolution of args.status is touched, via a shallow copy so the
+    # caller's own Namespace/args object is never mutated.
+    effective_args = copy.copy(args)
+    effective_args.status = _resolve_search_status(getattr(args, "status", None) or [])
+    extra_where, extra_params = build_filter_clause(effective_args, include_project=False)
     results, contributing, embed_info = _search_hits(conn, args, extra_where, extra_params)
     embed_state = embed_info.get("state")
     if embed_state == "unavailable":
@@ -7704,7 +7730,12 @@ def main(argv=None) -> int:
     add_common_args(p_search, optional_root=True)
     p_search.add_argument("query")
     p_search.add_argument("--mode", choices=["fts", "vector", "hybrid"], default="hybrid")
-    p_search.add_argument("--status", action="append", default=[])
+    p_search.add_argument(
+        "--status", action="append", default=[],
+        help="repeatable; defaults to active-only when omitted -- pass "
+             "--status any to widen to every status, or one/more of "
+             "active/provisional/superseded/historical/declined explicitly",
+    )
     p_search.add_argument("--type", action="append", default=[])
     p_search.add_argument("--area", default=None)
     p_search.add_argument("--topic", default=None)

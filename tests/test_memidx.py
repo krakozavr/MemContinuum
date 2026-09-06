@@ -2512,6 +2512,39 @@ class TestF5LinkRows(unittest.TestCase):
             self.assertEqual(out, [], "cmd_search --status active must return no hits for a "
                                        "declined-only match")
 
+    def test_search_defaults_to_status_active_and_any_widens(self):
+        # search-default-active: no --status given at all (a bare Namespace
+        # with status=[], exactly what argparse's own default produces)
+        # must behave exactly like an explicit --status active -- a
+        # declined-only match is dropped by default, with no caller ever
+        # having to say so. --status any is the one way to widen back to
+        # every status; any OTHER explicit value keeps meaning exactly what
+        # it already means (test_status_active_drops_a_declined_only_match,
+        # just above, pins that unchanged half).
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic_with_two_links(td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                memidx.cmd_search(ns(project=memidx.DEFAULT_PROJECT, db=str(db), query="sweeper",
+                                      mode="fts", status=[], type=[], area=None, topic=None,
+                                      authority=None, limit=10, json=True))
+            out = json.loads(buf.getvalue())
+            self.assertEqual(out, [], "no --status given must default to active-only, dropping "
+                                       "a declined-only match")
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                memidx.cmd_search(ns(project=memidx.DEFAULT_PROJECT, db=str(db), query="sweeper",
+                                      mode="fts", status=["any"], type=[], area=None, topic=None,
+                                      authority=None, limit=10, json=True))
+            out = json.loads(buf.getvalue())
+            self.assertEqual(len(out), 1, "--status any must widen back to every status, "
+                                           "surfacing the declined-only match")
+            self.assertEqual(out[0]["status"], "declined")
+
     def test_reindex_check_unmapped_run_twice_report_zero_second_time(self):
         with tempfile.TemporaryDirectory() as td:
             root = self._topic_with_two_links(td)
@@ -2633,8 +2666,13 @@ class TestF5LinkRows(unittest.TestCase):
             reindex(root, db, no_embed=True)
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
+                # search-default-active: this test's own intent is the
+                # link-row field shape (path/link_status/matched_link_id),
+                # not status filtering -- its query only ever matches L2,
+                # which is declined, so it must widen explicitly now that
+                # an empty status list defaults to active-only.
                 memidx.cmd_search(ns(project=memidx.DEFAULT_PROJECT, db=str(db), query="sweeper",
-                                      mode="fts", status=[], type=[], area=None, topic=None,
+                                      mode="fts", status=["any"], type=[], area=None, topic=None,
                                       authority=None, limit=10, json=True))
             out = json.loads(buf.getvalue())
             hit = next(h for h in out if h.get("matched_link_id") == "L2")

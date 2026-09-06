@@ -364,9 +364,10 @@ memlint.py STORE --code-root DIR                                                
 
 `--project NAME` is not optional in practice: leave it out and everything goes
 to a shared `default` namespace and its `default.sqlite`, mixing projects into
-one index. `search` without `--status active` also returns superseded,
-declined and historical rulings — plain (non-`--json`) output does not show
-each hit's status, so a stray one there reads as current. `drift` is the one
+one index. `search` defaults to `--status active` on its own — no flag needed
+for the common case; `--status any` widens to superseded, declined,
+provisional and historical rulings too, and plain (non-`--json`) output does
+not show each hit's status, so a stray one there reads as current. `drift` is the one
 that reads rulings written with a checkable shape ("all deletes go through the
 one gate") and turns them into failing checks when the code quietly grows a
 way around them. `stats` is the health check: it reads `hook.log` and reports,
