@@ -245,6 +245,24 @@ class TestFreshInstall(unittest.TestCase):
         self.assertIn("MEMCONTINUUM_ROOT", text)
         self.assertIn("MEMCONTINUUM_PROJECT", text)
 
+    def test_pre_commit_wrapper_present(self):
+        """Task A2-1: the store's git pre-commit is a generated wrapper,
+        installed alongside post-commit, same shape (three exports + an
+        exec of the canonical script by absolute path)."""
+        pre_commit = Path(self.store) / ".git" / "hooks" / "pre-commit"
+        self.assertTrue(pre_commit.is_file(), "pre-commit hook missing")
+        st = pre_commit.stat()
+        self.assertTrue(st.st_mode & stat.S_IXUSR, "pre-commit hook not executable")
+        text = pre_commit.read_text()
+        self.assertIn("pre-commit-append-only.sh", text)
+        self.assertIn("MEMCONTINUUM_ROOT", text)
+        self.assertIn("MEMCONTINUUM_PROJECT", text)
+        self.assertIn("MEMCONTINUUM_PYTHON", text)
+
+    def test_pre_commit_wrapper_reported_in_summary(self):
+        self.assertIn("Pre-commit", self.proc.stdout)
+        self.assertIn("pre-commit-append-only.sh", self.proc.stdout)
+
     def test_skill_copied(self):
         # D1 (updater workstream): the installed copy carries one extra
         # line -- a "<!-- memcontinuum-rendered: SHA -->" stamp right after
@@ -558,6 +576,84 @@ class TestReinstallIdempotent(unittest.TestCase):
     def test_backup_file_written(self):
         backup = Path(str(self.settings_path) + ".bak-memcontinuum")
         self.assertTrue(backup.is_file())
+
+    def test_pre_commit_wrapper_stable_across_reruns(self):
+        pre_commit = Path(self.store) / ".git" / "hooks" / "pre-commit"
+        self.assertTrue(pre_commit.is_file())
+        text = pre_commit.read_text()
+        self.assertIn("pre-commit-append-only.sh", text)
+        # Regenerated in place on the second run -- still ours, same
+        # deterministic content (mirrors post-commit's own idempotency).
+        self.assertIn(self.store, text)
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestPreCommitForeignHook(unittest.TestCase):
+    """Task A2-1: unlike post-commit (always overwritten, no check at all),
+    an existing pre-commit this installer did not render must be left
+    untouched and reported -- never silently clobbered."""
+
+    def test_foreign_pre_commit_is_left_untouched_and_reported(self):
+        home = sandbox_home()
+        try:
+            store = str(Path(home) / "store")
+            os.makedirs(store)
+            subprocess.run(["git", "init", "-q", store], check=True)
+            # This installer refuses --store at an existing git repo that
+            # carries none of its markers (exit 9) -- give it a marker
+            # (topics/) and a commit so it classifies as "adopt", same as
+            # TestAdoptClassification's own fixtures.
+            topics = Path(store) / "topics"
+            topics.mkdir()
+            (topics / "existing.md").write_text(
+                "---\ntype: topic\nid: TOP-9500\ntitle: existing\narea: test\n---\nBody\n"
+            )
+            subprocess.run(
+                ["git", "-C", store, "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+                 "add", "-A"], check=True,
+            )
+            subprocess.run(
+                ["git", "-C", store, "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+                 "commit", "-q", "-m", "seed"], check=True,
+            )
+            hooks_dir = Path(store) / ".git" / "hooks"
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            foreign = hooks_dir / "pre-commit"
+            foreign.write_text("#!/usr/bin/env bash\necho hand-authored guard\nexit 1\n")
+            foreign.chmod(0o755)
+
+            proc = run_install(
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude")],
+                home,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(
+                foreign.read_text(), "#!/usr/bin/env bash\necho hand-authored guard\nexit 1\n",
+                "a foreign pre-commit must never be overwritten",
+            )
+            self.assertIn("SKIPPED", proc.stdout)
+            self.assertIn("foreign", proc.stdout.lower())
+            # post-commit, with no such check, is still installed as always
+            # -- the asymmetry is deliberate, not a side effect of a shared
+            # failure.
+            self.assertTrue((hooks_dir / "post-commit").is_file())
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_no_pre_commit_at_all_still_gets_one(self):
+        home = sandbox_home()
+        try:
+            store = str(Path(home) / "store")
+            proc = run_install(
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude")],
+                home,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            pre_commit = Path(store) / ".git" / "hooks" / "pre-commit"
+            self.assertTrue(pre_commit.is_file())
+            self.assertIn("pre-commit-append-only.sh", pre_commit.read_text())
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
 
 
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)

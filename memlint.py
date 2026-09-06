@@ -1,9 +1,7 @@
 #!/usr/bin/env python
 """memlint.py -- docs/SCHEMA.md section 7 linter for MemContinuum store markdown.
 
-Rules implemented, a subset of docs/SCHEMA.md section 7 -- the append-only
-git-hash-mismatch rule is deliberately out of scope (see that section: the
-check belongs where a canonical store's commits are made, not in the linter):
+Rules implemented, a subset of docs/SCHEMA.md section 7:
 
   * a link whose ruling.authority is owner-verbatim/owner-ratified with no
     ruling.text and/or ruling.source            -> error
@@ -16,10 +14,16 @@ check belongs where a canonical store's commits are made, not in the linter):
     enumerated in docs/SCHEMA.md section 3                                  -> error
 
 Exit 1 if any error was found anywhere under ROOT (warnings alone -> exit 0).
+
+Task A2-1 (TOP-0122 L1 rule 3) adds a second, independent mode:
+`memlint.py --against-ref REF [--staged] ROOT` checks the append-only
+history invariant instead of the schema rules above -- see
+`check_append_only` and `main`'s dispatch for the full contract.
 """
 from __future__ import annotations
 
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -29,10 +33,12 @@ from memidx import (
     INVARIANT_KINDS,
     KINDS,
     STATUSES,
+    ParseResult,
     code_ref_is_named,
     fragment_declaration_status,
     newest_active_link,
     parse_record,
+    parse_record_text,
     validated_evidence_list,
     walk_markdown,
 )
@@ -507,6 +513,221 @@ def lint_root(root: Path, code_roots: list[Path] | None = None) -> tuple[list[st
     return all_errors, all_warnings
 
 
+# ---------------------------------------------------------------------------
+# Append-only history (task A2-1, TOP-0122 L1 rule 3): `memlint.py
+# --against-ref REF [--staged] ROOT`. A wholly separate check from
+# lint_root/lint_file above -- when --against-ref is given, main() runs
+# ONLY this and never the schema-rule pass, deliberately: an ADOPTED store
+# may carry pre-existing schema findings the installer already tolerates
+# (docs/INTERNALS.md), and this check must never fail a commit over a
+# condition nobody ruled on just because it happens to also run lint_root.
+# ---------------------------------------------------------------------------
+
+
+class GitError(Exception):
+    """A root that is not a git repository, or a REF that does not resolve
+    to a commit -- main() maps this to `memlint: <message>` on stderr and
+    exit 2 (spec test (i)). Never raised for a content problem (malformed
+    frontmatter on either side is a diagnostic -- see _parse_git_blob --
+    and surfaces as an ordinary ERROR: line / exit 1, not this)."""
+
+
+def _run_git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
+    """Runs git, returns the completed process (stdout/stderr as bytes,
+    never decoded here). Never raises for the ordinary "this ref/path does
+    not exist" case -- callers that care check the return code themselves;
+    this only wraps the "git itself could not even be started" case (a bad
+    cwd, no git on PATH) into a GitError so a caller never has to catch
+    OSError separately."""
+    try:
+        proc = subprocess.run(["git"] + args, cwd=str(cwd), capture_output=True)
+    except OSError as exc:
+        raise GitError(f"could not run git in {cwd}: {exc}") from exc
+    return proc
+
+
+def _git_toplevel(root: Path) -> Path:
+    proc = _run_git(["-C", str(root), "rev-parse", "--show-toplevel"], root)
+    if proc.returncode != 0:
+        stderr = proc.stderr.decode("utf-8", "replace").strip()
+        raise GitError(f"{root} is not inside a git repository" + (f" ({stderr})" if stderr else ""))
+    return Path(proc.stdout.decode("utf-8", "replace").strip()).resolve()
+
+
+def _resolve_ref(toplevel: Path, ref: str) -> None:
+    proc = _run_git(["-C", str(toplevel), "rev-parse", "--verify", "-q", f"{ref}^{{commit}}"], toplevel)
+    if proc.returncode != 0:
+        raise GitError(f"unknown ref {ref!r} in {toplevel}")
+
+
+def _git_show(cwd: Path, spec: str) -> bytes | None:
+    """None means "this path does not exist at this ref/index stage" --
+    the ordinary, expected shape for a brand-new or deleted path; callers
+    decide what None means from the diff status they already have, they
+    never have to guess from git's exit code alone."""
+    proc = _run_git(["show", spec], cwd)
+    if proc.returncode != 0:
+        return None
+    return proc.stdout
+
+
+def _read_worktree(path: Path) -> bytes | None:
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
+def _parse_name_status_z(raw: bytes) -> list[tuple[str, str]]:
+    """`git diff --name-status -z --no-renames` output: NUL-separated
+    STATUS, PATH pairs (a trailing NUL leaves one empty token at the end).
+    --no-renames means a rename/copy never appears as one R/C entry with a
+    similarity score -- it is always a plain D (old path) + A (new path)
+    pair instead, which is exactly what lets "a topic file deleted or
+    renamed" share one code path below (see check_append_only): the OLD
+    path's own D is the only entry that matters, regardless of whether a
+    similarly-shaped A shows up elsewhere in the same diff."""
+    tokens = raw.split(b"\x00")
+    entries: list[tuple[str, str]] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if not tok:
+            i += 1
+            continue
+        status = tok.decode("utf-8", "replace")[:1]
+        path_tok = tokens[i + 1] if i + 1 < len(tokens) else b""
+        path = path_tok.decode("utf-8", "surrogateescape")
+        entries.append((status, path))
+        i += 2
+    return entries
+
+
+def _parse_git_blob(data: bytes | None, label) -> ParseResult:
+    """The typed-parse entry point for git-blob content (a path that does
+    not exist at this side becomes an empty, non-canonical ParseResult --
+    "no record here", never an error of its own; a missing path is judged
+    entirely by the diff status the caller already has)."""
+    if data is None:
+        return ParseResult({}, "", [], valid=True, fallback=False)
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return ParseResult({}, "", [("file", "not UTF-8")], valid=False, fallback=False)
+    return parse_record_text(text, label)
+
+
+def _is_topic_like(result: ParseResult) -> bool:
+    """A canonical-but-unparseable record (result.valid is False) is
+    treated as topic-relevant unconditionally -- it was schema-shaped
+    (an id/type/links marker was present in the raw text) even though it
+    could not be safely parsed, and silently skipping it would let a
+    broken-but-canonical record's link history go completely unchecked.
+    A record that parsed cleanly is topic-relevant the same way lint_file
+    decides it: `links` present, or an explicit `type: topic`."""
+    if not result.valid:
+        return True
+    fm = result.frontmatter
+    return bool(fm.get("links")) or fm.get("type") == "topic"
+
+
+def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], int]:
+    """Returns (errors, changed) -- `changed` is the number of topic files
+    the diff actually concerned (topic-relevant at REF), independent of
+    whether any of them produced an error. Raises GitError for a root that
+    is not a git repository or a REF that does not resolve to a commit
+    (spec test (i)); every other failure mode is an ordinary ERROR: entry
+    in the returned list (spec test (j) -- never a traceback)."""
+    toplevel = _git_toplevel(root)
+    _resolve_ref(toplevel, ref)
+    try:
+        rel_root = root.relative_to(toplevel)
+    except ValueError:
+        rel_root = Path(".")
+    prefix = "" if str(rel_root) == "." else str(rel_root).replace("\\", "/") + "/"
+    pathspec = prefix.rstrip("/") or "."
+
+    diff_args = ["diff", "--no-renames", "--name-status", "-z"]
+    if staged:
+        diff_args.append("--cached")
+    diff_args += [ref, "--", pathspec]
+    raw = _run_git(diff_args, toplevel)
+    if raw.returncode != 0:
+        stderr = raw.stderr.decode("utf-8", "replace").strip()
+        raise GitError(f"git diff against {ref!r} failed" + (f" ({stderr})" if stderr else ""))
+    entries = _parse_name_status_z(raw.stdout)
+
+    errors: list[str] = []
+    changed = 0
+    for status, relpath in entries:
+        path_in_root = relpath[len(prefix):] if prefix and relpath.startswith(prefix) else relpath
+        full_path = root / path_in_root
+
+        if status == "A":
+            # Nothing existed at REF for this path -- no history to
+            # protect; a brand-new topic (or a brand-new anything) is free.
+            continue
+
+        old_blob = _git_show(toplevel, f"{ref}:{relpath}")
+        old_result = _parse_git_blob(old_blob, f"{relpath} (at {ref})")
+        if not _is_topic_like(old_result):
+            continue
+        changed += 1
+
+        if status == "D":
+            errors.append(
+                f"{full_path}: topic file deleted or renamed after being recorded "
+                "(append-only; a store never loses history)"
+            )
+            continue
+
+        if staged:
+            new_blob = _git_show(toplevel, f":{relpath}")
+        else:
+            new_blob = _read_worktree(root / path_in_root)
+        if new_blob is None:
+            errors.append(
+                f"{full_path}: topic file deleted or renamed after being recorded "
+                "(append-only; a store never loses history)"
+            )
+            continue
+        new_result = _parse_git_blob(new_blob, path_in_root)
+
+        if not old_result.valid:
+            for field, message in old_result.diagnostics:
+                errors.append(f"{full_path}: {field}: {message} (at {ref})")
+            continue
+        if not new_result.valid:
+            for field, message in new_result.diagnostics:
+                errors.append(f"{full_path}: {field}: {message}")
+            continue
+
+        old_links = old_result.frontmatter.get("links") or []
+        new_links_by_id = {
+            str(l.get("link")): l
+            for l in (new_result.frontmatter.get("links") or [])
+            if l.get("link") is not None
+        }
+        for old_link in old_links:
+            lid = old_link.get("link")
+            if lid is None:
+                continue
+            lid = str(lid)
+            new_link = new_links_by_id.get(lid)
+            if new_link is None:
+                errors.append(
+                    f"{full_path}:{lid}: link removed after being recorded "
+                    "(append-only; a store never loses history)"
+                )
+            elif new_link != old_link:
+                errors.append(
+                    f"{full_path}:{lid}: link changed after being recorded "
+                    "(append-only; add a new link instead)"
+                )
+
+    return errors, changed
+
+
 def parse_argv(argv: list[str]) -> tuple[str | None, list[str], str | None]:
     """ROOT positional + repeatable --code-root PATH, in either order.
 
@@ -541,6 +762,7 @@ def parse_argv(argv: list[str]) -> tuple[str | None, list[str], str | None]:
 
 
 USAGE = """usage: memlint.py ROOT [--code-root PATH ...]
+       memlint.py --against-ref REF [--staged] ROOT
 
 Validate every MemContinuum record under ROOT against the schema and print one
 ERROR:/WARNING: line per finding. Exit 1 if any error was found, 0 otherwise
@@ -559,8 +781,62 @@ ERROR:/WARNING: line per finding. Exit 1 if any error was found, 0 otherwise
                      still runs.
   -h, --help         print this and exit
 
+Append-only history mode (a second, independent check -- given
+--against-ref, this runs INSTEAD of the schema rules above, never both):
+
+  --against-ref REF  compare every topic file's links now against what they
+                     were at REF (a commit-ish git understands). A link
+                     present at REF must be unchanged; a link removed, or a
+                     topic file deleted or renamed, is an error. New links,
+                     and changes to current/title/tags/code_refs/the body,
+                     are free. Exit 1 on any append-only error; exit 2 if
+                     ROOT is not inside a git repository or REF does not
+                     resolve to a commit.
+  --staged           compare REF to the INDEX (what `git commit` would
+                     actually commit) instead of the working tree -- the
+                     default with --against-ref and no --staged.
+
 Rule reference: docs/SCHEMA.md sections 7 and 8.4; the complete table of what
 this linter checks is in docs/INTERNALS.md (memlint section)."""
+
+
+def _extract_against_ref_flags(argv: list[str]) -> tuple[list[str], str | None, bool]:
+    """Pulls --against-ref REF and --staged out of argv before the
+    remainder reaches parse_argv unchanged -- parse_argv's own 3-tuple
+    contract (and the tests that call it directly) stays exactly as it
+    was; this is a preprocessing pass, not a parse_argv change."""
+    rest: list[str] = []
+    against_ref = None
+    staged = False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--against-ref":
+            i += 1
+            if i < len(argv):
+                against_ref = argv[i]
+        elif a == "--staged":
+            staged = True
+        else:
+            rest.append(a)
+        i += 1
+    return rest, against_ref, staged
+
+
+def _run_append_only(root_str: str, ref: str, staged: bool) -> int:
+    root = Path(root_str).resolve()
+    try:
+        errors, changed = check_append_only(root, ref, staged)
+    except GitError as exc:
+        print(f"memlint: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # never a bare traceback -- spec test (j)/(i)
+        print(f"memlint: unexpected failure checking append-only history: {exc}", file=sys.stderr)
+        return 2
+    for e in errors:
+        print(f"ERROR: {e}")
+    print(f"memlint: append-only against {ref}: changed={changed} errors={len(errors)}")
+    return 1 if errors else 0
 
 
 def main(argv=None) -> int:
@@ -571,7 +847,12 @@ def main(argv=None) -> int:
     if "-h" in argv or "--help" in argv:
         print(USAGE)
         return 0
-    root_str, code_root_strs, unknown = parse_argv(argv)
+    rest, against_ref, staged = _extract_against_ref_flags(argv)
+    if staged and against_ref is None:
+        print("--staged requires --against-ref", file=sys.stderr)
+        print(USAGE, file=sys.stderr)
+        return 2
+    root_str, code_root_strs, unknown = parse_argv(rest)
     if unknown is not None:
         print(f"unknown argument: {unknown}", file=sys.stderr)
         print(USAGE, file=sys.stderr)
@@ -579,6 +860,8 @@ def main(argv=None) -> int:
     if not root_str:
         print(USAGE, file=sys.stderr)
         return 2
+    if against_ref is not None:
+        return _run_append_only(root_str, against_ref, staged)
     root = Path(root_str).resolve()
     # Dedupe by resolved path, preserving first-seen order: `--code-root A
     # --code-root A` (or two spellings of the same directory) must not turn

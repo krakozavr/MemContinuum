@@ -2,6 +2,7 @@ import contextlib
 import io
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -891,6 +892,233 @@ class TestMalformedRecordDiagnostics(unittest.TestCase):
                     )
                     rc = memlint.main([str(root)])
                     self.assertEqual(rc, 1, f"{name}: memlint must exit 1, never wave this through clean")
+
+
+def _git(args, cwd, check=True):
+    return subprocess.run(
+        ["git"] + args, cwd=str(cwd), capture_output=True, text=True, check=check
+    )
+
+
+def _git_store(td):
+    """A throwaway git repo, isolated from this machine's real gitconfig
+    (a bare -c user.name/user.email pair rather than requiring one to be
+    globally configured -- same reasoning tests/test_repo_init.py's own
+    git helpers use)."""
+    root = Path(td)
+    _git(["init", "-q", str(root)], cwd=root)
+    _git(["config", "user.email", "test@example.com"], cwd=root)
+    _git(["config", "user.name", "Test"], cwd=root)
+    return root
+
+
+def _commit_all(root, message):
+    _git(["add", "-A"], cwd=root)
+    _git(["commit", "-q", "-m", message], cwd=root)
+
+
+TOPIC_L1_L2 = (
+    "---\n"
+    "type: topic\n"
+    "id: TOP-1\n"
+    "title: Test topic\n"
+    "area: memory\n"
+    "current: L2\n"
+    "tags: []\n"
+    "links:\n"
+    "  - link: L2\n"
+    "    date: '2024-01-02'\n"
+    "    status: active\n"
+    "    kind: adopted\n"
+    "    ruling:\n"
+    "      text: \"second ruling\"\n"
+    "      authority: agent-inference\n"
+    "  - link: L1\n"
+    "    date: '2024-01-01'\n"
+    "    status: historical\n"
+    "    kind: adopted\n"
+    "    ruling:\n"
+    "      text: \"first ruling\"\n"
+    "      authority: agent-inference\n"
+    "---\n\nBody.\n"
+)
+
+
+def _run_memlint(args):
+    """memlint.main([...]) is a pure function of argv (no subprocess) --
+    this just captures stdout so the caller can assert on the printed
+    ERROR:/summary lines without a subprocess round trip."""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = memlint.main(args)
+    return rc, buf.getvalue()
+
+
+class TestMemlintAgainstRef(unittest.TestCase):
+    """Task A2-1: `memlint --against-ref REF [--staged] ROOT` -- append-only
+    history enforcement. Each test builds its own throwaway git store (never
+    the fixtures/ or the engine's own store)."""
+
+    def _base_store(self, td):
+        root = _git_store(td)
+        (root / "topics").mkdir()
+        (root / "topics" / "foo.md").write_text(TOPIC_L1_L2)
+        _commit_all(root, "base")
+        return root
+
+    def test_a_prepend_new_link_is_clean(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            text = TOPIC_L1_L2.replace(
+                "current: L2\n",
+                "current: L3\n",
+            ).replace(
+                "links:\n",
+                "links:\n"
+                "  - link: L3\n"
+                "    date: '2024-01-03'\n"
+                "    status: active\n"
+                "    kind: adopted\n"
+                "    ruling:\n"
+                "      text: \"third ruling\"\n"
+                "      authority: agent-inference\n",
+            )
+            (root / "topics" / "foo.md").write_text(text)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 0, out)
+
+    def test_b_edit_existing_ruling_text_is_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            text = TOPIC_L1_L2.replace("first ruling", "EDITED first ruling")
+            (root / "topics" / "foo.md").write_text(text)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("foo.md", out)
+            self.assertIn("L1", out)
+            self.assertIn("changed after being recorded", out)
+
+    def test_c_status_change_in_place_is_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            text = TOPIC_L1_L2.replace(
+                "    status: active\n    kind: adopted\n    ruling:\n      text: \"second ruling\"",
+                "    status: superseded\n    superseded_by: L1\n    kind: adopted\n    ruling:\n      text: \"second ruling\"",
+            )
+            self.assertNotEqual(text, TOPIC_L1_L2, "fixture edit must actually change the text")
+            (root / "topics" / "foo.md").write_text(text)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("L2", out)
+            self.assertIn("changed after being recorded", out)
+
+    def test_d_delete_a_link_is_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            # Drop the whole L1 entry, keep L2 and the rest of the shape valid.
+            lines = TOPIC_L1_L2.splitlines(keepends=True)
+            start = next(i for i, l in enumerate(lines) if l.strip() == "- link: L1")
+            end = next(
+                i for i in range(start + 1, len(lines))
+                if lines[i].strip() == "---"
+            )
+            text = "".join(lines[:start] + lines[end:])
+            (root / "topics" / "foo.md").write_text(text)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("L1", out)
+            self.assertIn("removed after being recorded", out)
+
+    def test_e_delete_topic_file_is_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            (root / "topics" / "foo.md").unlink()
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("foo.md", out)
+            self.assertIn("deleted or renamed", out)
+
+    def test_f_rename_topic_file_is_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            (root / "topics" / "foo.md").rename(root / "topics" / "bar.md")
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("foo.md", out)
+            self.assertIn("deleted or renamed", out)
+
+    def test_g_free_fields_stay_clean(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            text = (
+                TOPIC_L1_L2
+                .replace("title: Test topic", "title: Renamed title")
+                .replace("tags: []", "tags: [a, b]")
+                .replace("area: memory\n", "area: memory\ncode_refs:\n  - src/x.py\n")
+                .replace("Body.\n", "New body text entirely.\n")
+            )
+            (root / "topics" / "foo.md").write_text(text)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 0, out)
+
+    def test_h_staged_judges_the_index_not_the_working_tree(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            bad_text = TOPIC_L1_L2.replace("first ruling", "EDITED first ruling")
+            (root / "topics" / "foo.md").write_text(bad_text)
+            _git(["add", "-A"], cwd=root)
+            # Working tree now reverts back to the ORIGINAL (unstaged) --
+            # the index still carries the bad edit.
+            (root / "topics" / "foo.md").write_text(TOPIC_L1_L2)
+
+            rc_worktree, out_worktree = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc_worktree, 0, out_worktree)
+
+            rc_staged, out_staged = _run_memlint(["--against-ref", "HEAD", "--staged", str(root)])
+            self.assertEqual(rc_staged, 1, out_staged)
+            self.assertIn("changed after being recorded", out_staged)
+
+    def test_i_not_a_git_repo_exits_2(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "topics").mkdir()
+            (root / "topics" / "foo.md").write_text(TOPIC_L1_L2)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 2, out)
+
+    def test_i_unknown_ref_exits_2(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            rc, out = _run_memlint(["--against-ref", "not-a-real-ref-xyz", str(root)])
+            self.assertEqual(rc, 2, out)
+
+    def test_j_malformed_frontmatter_old_side_is_diagnostic_not_traceback(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = _git_store(td)
+            (root / "topics").mkdir()
+            # Canonical-shaped (has links:) but an unterminated flow
+            # collection -- the audit's own classic malformed-YAML
+            # reproducer.
+            (root / "topics" / "bad.md").write_text(
+                "---\ntype: topic\nid: TOP-2\nlinks: [\n---\nBody.\n"
+            )
+            _commit_all(root, "base (malformed)")
+            (root / "topics" / "bad.md").write_text(
+                "---\ntype: topic\nid: TOP-2\nlinks: [\ntitle: changed\n---\nBody.\n"
+            )
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("bad.md", out)
+
+    def test_j_malformed_frontmatter_new_side_is_diagnostic_not_traceback(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            (root / "topics" / "foo.md").write_text(
+                "---\ntype: topic\nid: TOP-1\nlinks: [\n---\nBody.\n"
+            )
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("foo.md", out)
 
 
 if __name__ == "__main__":

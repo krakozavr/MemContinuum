@@ -151,12 +151,19 @@ copied inline.
   missing its `link` id, `ruling`/`rationale`/`invariant` not a mapping, a list field carrying a
   non-scalar) → error naming the file/field; the same on a note (no schema id/links/type) → warning
 
-**Deliberately not implemented:** "a link edited after being recorded (hash
-mismatch vs git) → reject". That check needs the canonical records to live in
-a git repo with an append-only enforcement process around it, which is a
-property of how a *store* is operated, not of this schema or its linter.
-Anyone wiring a canonical append-only store on top of this should add that
-check at the point where commits are made.
+**A link edited after being recorded is caught too**, in a second, independent
+check: `memlint.py --against-ref REF [--staged] ROOT` compares every topic
+file's links now against what they were at `REF` — a link present at `REF`
+must be unchanged (a status change, a new `superseded_by`, anything at all
+about it, is a NEW link instead); a link removed, or a topic file deleted or
+renamed, is an error naming the path. New links, and changes to `current`,
+`title`, `tags`, `code_refs`, or the body, are free. A store's own git
+`pre-commit` hook (`hooks/pre-commit-append-only.sh`, wired by
+`scripts/repo-init.sh` the same way `post-commit-reindex.sh` is) runs this on
+every commit and blocks the ones that fail it; the same check can run again in
+CI against a wider range, for a guarantee `--no-verify` cannot bypass. See
+`hooks/install-hooks.md` for how it is wired and `docs/INTERNALS.md`'s memlint
+section for the full rule table.
 
 ---
 

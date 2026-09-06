@@ -9,6 +9,7 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -1649,6 +1650,278 @@ class TestPostCommitReindexEmbedWorker(unittest.TestCase):
         log_text = (self.home / "hook.log").read_text()
         self.assertIn("outcome=watchdog-killed", log_text)
         self.assertIn("hook=post-commit-reindex.sh", log_text)
+
+
+PRE_COMMIT_HOOK = TOOLS_DIR / "hooks" / "pre-commit-append-only.sh"
+
+_TOPIC_TWO_LINKS = (
+    "---\n"
+    "type: topic\n"
+    "id: TOP-9001\n"
+    "title: Fixture topic\n"
+    "area: memory\n"
+    "current: L2\n"
+    "tags: []\n"
+    "links:\n"
+    "  - link: L2\n"
+    "    date: '2024-01-02'\n"
+    "    status: active\n"
+    "    kind: adopted\n"
+    "    ruling:\n"
+    "      text: \"second ruling\"\n"
+    "      authority: agent-inference\n"
+    "  - link: L1\n"
+    "    date: '2024-01-01'\n"
+    "    status: historical\n"
+    "    kind: adopted\n"
+    "    ruling:\n"
+    "      text: \"first ruling\"\n"
+    "      authority: agent-inference\n"
+    "---\n\nBody.\n"
+)
+
+_NEW_LINK_PREPEND = (
+    "  - link: L3\n"
+    "    date: '2024-01-03'\n"
+    "    status: active\n"
+    "    kind: adopted\n"
+    "    ruling:\n"
+    "      text: \"third ruling\"\n"
+    "      authority: agent-inference\n"
+)
+
+
+def _git(args, cwd, check=True):
+    return subprocess.run(
+        ["git"] + list(args), cwd=str(cwd), capture_output=True, text=True, check=check
+    )
+
+
+def _init_topic_store(root):
+    """A throwaway store repo (never fixtures/ or the engine's own store):
+    one committed topic file with two links, isolated gitconfig identity."""
+    root.mkdir(parents=True, exist_ok=True)
+    _git(["init", "-q", str(root)], cwd=root)
+    _git(["config", "user.email", "test@example.com"], cwd=root)
+    _git(["config", "user.name", "Test"], cwd=root)
+    (root / "topics").mkdir()
+    (root / "topics" / "foo.md").write_text(_TOPIC_TWO_LINKS)
+    _git(["add", "-A"], cwd=root)
+    _git(["commit", "-q", "-m", "base"], cwd=root)
+    return root
+
+
+def _prepend_new_link(text):
+    return text.replace("links:\n", "links:\n" + _NEW_LINK_PREPEND).replace(
+        "current: L2", "current: L3"
+    )
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestPreCommitAppendOnlyHook(unittest.TestCase):
+    """Task A2-1 (TOP-0122 L1 rule 3): hooks/pre-commit-append-only.sh --
+    direct subprocess invocations of the script (fail-open infrastructure
+    cases, and the clean/violating outcomes against a staged edit). The
+    real-`git commit` path (git actually invoking the installed wrapper)
+    is TestPreCommitAppendOnlyRealCommit below."""
+
+    def test_bash_syntax_is_valid(self):
+        result = subprocess.run([MC_BASH, "-n", str(PRE_COMMIT_HOOK)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_root_not_set_skips_and_names_project(self):
+        tmp = tempfile.mkdtemp(prefix="memcontinuum-precommit-root-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        home = Path(tmp) / "home"
+        home.mkdir()
+        env = clean_env(HOME=str(tmp), MEMCONTINUUM_HOME=str(home), MEMCONTINUUM_PROJECT="pre-proj")
+        env.pop("MEMCONTINUUM_ROOT", None)
+        proc = subprocess.run([MC_BASH, str(PRE_COMMIT_HOOK)], capture_output=True, text=True, env=env, timeout=10)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (home / "hook.log").read_text()
+        self.assertIn("skipped=root-unset", log_text)
+        self.assertIn("project=pre-proj", log_text)
+
+    def test_root_not_set_defaults_project_when_unset(self):
+        tmp = tempfile.mkdtemp(prefix="memcontinuum-precommit-root-default-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        home = Path(tmp) / "home"
+        home.mkdir()
+        env = clean_env(HOME=str(tmp), MEMCONTINUUM_HOME=str(home))
+        env.pop("MEMCONTINUUM_ROOT", None)
+        env.pop("MEMCONTINUUM_PROJECT", None)
+        proc = subprocess.run([MC_BASH, str(PRE_COMMIT_HOOK)], capture_output=True, text=True, env=env, timeout=10)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (home / "hook.log").read_text()
+        self.assertIn("project=default", log_text)
+
+    def test_unborn_head_skips(self):
+        tmp = tempfile.mkdtemp(prefix="memcontinuum-precommit-unborn-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        home = Path(tmp) / "home"
+        home.mkdir()
+        store = Path(tmp) / "store"
+        store.mkdir()
+        _git(["init", "-q", str(store)], cwd=store)
+        env = clean_env(
+            HOME=str(tmp), MEMCONTINUUM_HOME=str(home), MEMCONTINUUM_ROOT=str(store),
+            MEMCONTINUUM_PROJECT="unborn-proj", MEMCONTINUUM_PYTHON=VENV_PYTHON,
+        )
+        proc = subprocess.run([MC_BASH, str(PRE_COMMIT_HOOK)], capture_output=True, text=True, env=env, timeout=10)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (home / "hook.log").read_text()
+        self.assertIn("skipped=unborn-head", log_text)
+
+    def test_missing_python_skips(self):
+        tmp = tempfile.mkdtemp(prefix="memcontinuum-precommit-nopython-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        home = Path(tmp) / "home"
+        home.mkdir()
+        store = _init_topic_store(Path(tmp) / "store")
+        env = clean_env(
+            HOME=str(tmp), MEMCONTINUUM_HOME=str(home), MEMCONTINUUM_ROOT=str(store),
+            MEMCONTINUUM_PROJECT="nopy-proj", MEMCONTINUUM_PYTHON="/nonexistent/python",
+        )
+        proc = subprocess.run([MC_BASH, str(PRE_COMMIT_HOOK)], capture_output=True, text=True, env=env, timeout=10)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (home / "hook.log").read_text()
+        self.assertIn("skipped=no-python", log_text)
+
+    def test_clean_staged_edit_exits_0_and_logs_rc0(self):
+        tmp = tempfile.mkdtemp(prefix="memcontinuum-precommit-clean-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        home = Path(tmp) / "home"
+        home.mkdir()
+        store = _init_topic_store(Path(tmp) / "store")
+        text = _prepend_new_link((store / "topics" / "foo.md").read_text())
+        (store / "topics" / "foo.md").write_text(text)
+        _git(["add", "-A"], cwd=store)
+        env = clean_env(
+            HOME=str(tmp), MEMCONTINUUM_HOME=str(home), MEMCONTINUUM_ROOT=str(store),
+            MEMCONTINUUM_PROJECT="clean-proj", MEMCONTINUUM_PYTHON=VENV_PYTHON,
+        )
+        proc = subprocess.run([MC_BASH, str(PRE_COMMIT_HOOK)], capture_output=True, text=True, env=env, timeout=15)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (home / "hook.log").read_text()
+        self.assertIn("pre-commit-append-only: rc=0", log_text)
+        self.assertIn("changed=1", log_text)
+        self.assertIn("project=clean-proj", log_text)
+
+    def test_violating_staged_edit_exits_1_and_logs_rc1(self):
+        tmp = tempfile.mkdtemp(prefix="memcontinuum-precommit-violation-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        home = Path(tmp) / "home"
+        home.mkdir()
+        store = _init_topic_store(Path(tmp) / "store")
+        text = (store / "topics" / "foo.md").read_text().replace("first ruling", "EDITED first ruling")
+        (store / "topics" / "foo.md").write_text(text)
+        _git(["add", "-A"], cwd=store)
+        env = clean_env(
+            HOME=str(tmp), MEMCONTINUUM_HOME=str(home), MEMCONTINUUM_ROOT=str(store),
+            MEMCONTINUUM_PROJECT="bad-proj", MEMCONTINUUM_PYTHON=VENV_PYTHON,
+        )
+        proc = subprocess.run([MC_BASH, str(PRE_COMMIT_HOOK)], capture_output=True, text=True, env=env, timeout=15)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("changed after being recorded", proc.stderr)
+        log_text = (home / "hook.log").read_text()
+        self.assertIn("pre-commit-append-only: rc=1", log_text)
+        self.assertIn("changed=1", log_text)
+        self.assertIn("project=bad-proj", log_text)
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestPreCommitAppendOnlyRealCommit(unittest.TestCase):
+    """Task A2-1 red test: a real `git commit`, with the generated wrapper
+    installed as .git/hooks/pre-commit (same shape scripts/repo-init.sh
+    generates), actually gets refused for an edited old link and succeeds
+    for a new one -- exercising git's own hook-invocation path, not a
+    direct subprocess call of the script."""
+
+    def _install_wrapper(self, store, home):
+        hooks_dir = Path(_git(["rev-parse", "--git-path", "hooks"], cwd=store).stdout.strip())
+        if not hooks_dir.is_absolute():
+            hooks_dir = store / hooks_dir
+        wrapper = hooks_dir / "pre-commit"
+        # exec's the real script under MC_BASH (bash 3.2 during the
+        # tests/run_bash32.sh harness), never a bare "bash" that would
+        # resolve back to whatever modern bash is on PATH -- otherwise a
+        # bash32 run of this test would never actually exercise the
+        # script's own bash-3.2-safe claim.
+        wrapper.write_text(
+            "#!/usr/bin/env bash\n"
+            f"export MEMCONTINUUM_ROOT={shlex.quote(str(store))}\n"
+            "export MEMCONTINUUM_PROJECT=realcommit-proj\n"
+            f"export MEMCONTINUUM_PYTHON={shlex.quote(VENV_PYTHON)}\n"
+            f"export MEMCONTINUUM_HOME={shlex.quote(str(home))}\n"
+            f'exec "{MC_BASH}" {shlex.quote(str(PRE_COMMIT_HOOK))}\n'
+        )
+        wrapper.chmod(0o755)
+        return wrapper
+
+    def _commit_env(self, home):
+        env = clean_env(HOME=str(home))
+        for k in list(env):
+            if k.startswith("MEMCONTINUUM_"):
+                del env[k]
+        return env
+
+    def _head(self, store):
+        return _git(["rev-parse", "HEAD"], cwd=store).stdout.strip()
+
+    def _commit(self, store, env, message, extra_args=()):
+        return subprocess.run(
+            ["git", "-c", "user.email=test@example.com", "-c", "user.name=Test",
+             "commit", "-q", "-m", message] + list(extra_args),
+            cwd=str(store), capture_output=True, text=True, env=env, timeout=20,
+        )
+
+    def test_real_commit_with_edited_old_link_is_refused(self):
+        tmp = tempfile.mkdtemp(prefix="memcontinuum-precommit-realcommit-refuse-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        home = Path(tmp) / "home"
+        home.mkdir()
+        store = _init_topic_store(Path(tmp) / "store")
+        self._install_wrapper(store, home)
+        head_before = self._head(store)
+
+        text = (store / "topics" / "foo.md").read_text().replace("first ruling", "EDITED first ruling")
+        (store / "topics" / "foo.md").write_text(text)
+        _git(["add", "-A"], cwd=store)
+        proc = self._commit(store, self._commit_env(home), "bad edit")
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(head_before, self._head(store), "the refused commit must not have been created")
+
+    def test_real_commit_with_new_link_succeeds(self):
+        tmp = tempfile.mkdtemp(prefix="memcontinuum-precommit-realcommit-ok-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        home = Path(tmp) / "home"
+        home.mkdir()
+        store = _init_topic_store(Path(tmp) / "store")
+        self._install_wrapper(store, home)
+        head_before = self._head(store)
+
+        text = _prepend_new_link((store / "topics" / "foo.md").read_text())
+        (store / "topics" / "foo.md").write_text(text)
+        _git(["add", "-A"], cwd=store)
+        proc = self._commit(store, self._commit_env(home), "good edit")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotEqual(head_before, self._head(store), "the clean commit must have been created")
+
+    def test_no_verify_bypasses(self):
+        tmp = tempfile.mkdtemp(prefix="memcontinuum-precommit-realcommit-noverify-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        home = Path(tmp) / "home"
+        home.mkdir()
+        store = _init_topic_store(Path(tmp) / "store")
+        self._install_wrapper(store, home)
+        head_before = self._head(store)
+
+        text = (store / "topics" / "foo.md").read_text().replace("first ruling", "EDITED first ruling")
+        (store / "topics" / "foo.md").write_text(text)
+        _git(["add", "-A"], cwd=store)
+        proc = self._commit(store, self._commit_env(home), "bad edit bypassed", extra_args=["--no-verify"])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotEqual(head_before, self._head(store), "--no-verify must let the commit through")
 
 
 class TestMemorySearchSkill(unittest.TestCase):

@@ -56,6 +56,17 @@
   (`post-commit-reindex.sh`) is unaffected; `backend-preflight`, which has no
   database in scope, still falls back to `$MEMCONTINUUM_HOME` for its own
   debug log.
+- Append-only history is now enforced, not only documented: `memlint.py
+  --against-ref REF [--staged] ROOT` compares every topic file's links now
+  against what they were at `REF` and errors on an edited or removed link,
+  or a topic file deleted or renamed (new links, and changes to `current`,
+  `title`, `tags`, `code_refs`, or the body, stay free). A new store git
+  `pre-commit` hook (`hooks/pre-commit-append-only.sh`, wired by
+  `scripts/repo-init.sh` alongside `post-commit`) runs this on every commit
+  and blocks the ones that fail it -- fail-open on an unborn HEAD, a missing
+  python, or an engine failure, `--no-verify` bypasses it locally, and the
+  same check can run again in CI for a guarantee local bypasses cannot
+  reach.
 
 ### Code index
 - The code index's freshness check now compares five stat signals per file

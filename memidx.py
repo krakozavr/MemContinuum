@@ -475,7 +475,13 @@ def parse_record(path: Path) -> ParseResult:
     one diagnostic -- a note stays valid and indexed as today, its
     diagnostics surfacing only as warnings (memlint) or nothing at all
     (reindex, beyond the one stderr line the lenient-fallback path always
-    prints)."""
+    prints).
+
+    Thin file-reading wrapper over `parse_record_text` (task A2-1): every
+    diagnostic/shape rule below lives there so a caller that already has a
+    record's bytes from somewhere other than a plain file read (memlint
+    `--against-ref`'s git-blob content, from `git show REF:path`) can reuse
+    the exact same typed parse without a file on disk at all."""
     try:
         text = path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
@@ -483,7 +489,18 @@ def parse_record(path: Path) -> ParseResult:
     except OSError as exc:
         msg = exc.strerror or str(exc)
         return ParseResult({}, "", [("file", f"unreadable: {msg}")], valid=False, fallback=False)
+    return parse_record_text(text, path)
 
+
+def parse_record_text(text: str, path) -> ParseResult:
+    """Text-based twin of `parse_record` -- everything past the file read
+    itself. `path` is used only for string labeling in the diagnostics and
+    warnings below (every use is an f-string), never opened, stat'd, or
+    otherwise treated as a real filesystem path -- a caller with no real
+    Path (memlint `--against-ref` handing this a git-blob's content under a
+    store-relative label, e.g. "topics/foo.md (at HEAD)") may pass any
+    object with a useful `__str__`. Behavior is otherwise identical to the
+    tail of the old single `parse_record` function this was split from."""
     if not text.startswith("---"):
         return ParseResult({}, text, [], valid=True, fallback=False)
     lines = text.splitlines(keepends=True)

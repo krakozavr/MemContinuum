@@ -711,13 +711,16 @@ class TestDocsRound7(unittest.TestCase):
         text = README.read_text()
         self.assertIn("HOLD", text)
 
-    def test_readme_append_only_notes_the_linter_does_not_enforce_it(self):
-        # W8 was vacuous as first drafted: README.md already contains the
-        # substring "git history" today, in an unrelated sentence, so
-        # assertIn("git history", ...) alone passes on the UNEDITED file
-        # and never goes red. Assert the actual new clause instead.
+    def test_readme_append_only_notes_the_linter_enforces_it(self):
+        # Originally pinned "linter does not enforce" (the append-only
+        # check used to be schema documentation only, deliberately not
+        # implemented -- see docs/SCHEMA.md section 7's old text). Task
+        # A2-1 (TOP-0122 L1 rule 3) implemented it as `memlint.py
+        # --against-ref` plus a store pre-commit hook, so the sentence
+        # became false and was rewritten to say so; this pin moves with
+        # it, in the same commit, rather than pinning stale wording.
         text = README.read_text()
-        self.assertIn("linter does not enforce", text.lower())
+        self.assertIn("linter enforces this", text.lower())
 
     def test_schema_current_field_comment_says_hand_set(self):
         text = SCHEMA.read_text()

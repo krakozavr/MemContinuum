@@ -37,8 +37,10 @@ newest first, dated, and tagged with *who actually said it* — the project
 owner's own words, a summary they confirmed, an agent's inference, a reviewer's
 finding, or something derived from code and tests. A changed mind is a new entry
 in the chain, never an edit to the old one, so "we tried X, it did not work
-because Y, so we do Z instead" stays intact and citable. The linter does not enforce
-this invariant; git history is the record's own audit trail.
+because Y, so we do Z instead" stays intact and citable. The linter enforces this
+invariant on every commit: the store's own git hook refuses to commit an edit to
+a link already recorded, and the same check can run again in CI for a
+guarantee `git commit --no-verify` cannot bypass locally.
 
 Retrieval is **automatic** for edits made with the Edit and Write tools, not
 left to anyone's discipline. Before one of those touches a file, a hook looks

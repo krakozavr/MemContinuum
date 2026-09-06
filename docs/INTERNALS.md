@@ -24,14 +24,15 @@ Contents: [hooks](#hooks-and-the-fail-open-contract) ·
 
 ## Hooks and the fail-open contract
 
-Nine hook scripts live under `hooks/`, alongside three shared libraries
+Ten hook scripts live under `hooks/`, alongside three shared libraries
 (`memlib.sh`, sourced by the five write-side hooks; `mc-watchdog.sh`; and
 `mc-path-lib.sh`, one pure side-effect-free function -- symlink-safe
 containment -- sourced by `memlib.sh` and directly by `newfile-nudge.sh`,
 which needs it but deliberately does not source `memlib.sh` itself).
-Seven of the nine are wired into a project's
+Seven of the ten are wired into a project's
 `.claude/settings.local.json` by `scripts/repo-init.sh`; `post-commit-reindex.sh`
-is invoked from the store's own git `post-commit`; `memcontinuum-detect.sh` is
+and `pre-commit-append-only.sh` are invoked from the store's own git
+`post-commit`/`pre-commit`; `memcontinuum-detect.sh` is
 wired one level up, into `~/.claude/settings.json`, by `memcontinuum-setup.sh`.
 
 | script | event | does |
@@ -44,16 +45,24 @@ wired one level up, into `~/.claude/settings.json`, by `memcontinuum-setup.sh`.
 | `userprompt-remind.sh` | `UserPromptSubmit` | never reads the prompt text; fires the coverage or look-back nudge |
 | `sessionend-stamp.sh` | `SessionEnd` | stamps session end into state |
 | `post-commit-reindex.sh` | store's git `post-commit` | a bounded content-only reindex after every commit; spawns a background embed-worker when vectors are left behind |
+| `pre-commit-append-only.sh` | store's git `pre-commit` | runs `memlint.py --against-ref HEAD --staged`; BLOCKS the commit on an append-only violation (an edited, removed, deleted, or renamed link); fails open (lets the commit through) on an unborn HEAD, a missing python, or any engine failure |
 | `memcontinuum-detect.sh` | `SessionStart`, user level | classifies an un-initialized repo and asks once; no python, no watchdog, no logging by default |
 
-**Fail-open is the contract, not a fallback.** No hook may block an edit or a
-commit — not on a missing python, not on a stale index, not on a lookup error,
-not on its own timeout. A hook that cannot do its job logs and exits 0. The
-reason is asymmetric cost: a missed reminder costs one un-recorded ruling; a
-hook that blocks an edit costs the user their tool, and the first thing anyone
-does with a tool that blocks edits is remove it. Failing open also names its
-reason: a degraded answer carries `reason_code`, `exception_type` and a safe
-message; the traceback goes to `memidx-debug.log`; `--debug` re-raises.
+**Fail-open is the contract, not a fallback — with one deliberate exception.**
+No hook may block an edit or a commit — not on a missing python, not on a
+stale index, not on a lookup error, not on its own timeout. A hook that cannot
+do its job logs and exits 0. The reason is asymmetric cost: a missed reminder
+costs one un-recorded ruling; a hook that blocks an edit costs the user their
+tool, and the first thing anyone does with a tool that blocks edits is remove
+it. Failing open also names its reason: a degraded answer carries
+`reason_code`, `exception_type` and a safe message; the traceback goes to
+`memidx-debug.log`; `--debug` re-raises. `pre-commit-append-only.sh` is the one
+exception, and only for the one failure mode it exists to catch: an edit to an
+already-recorded link. The asymmetry inverts there — a rewritten link is
+unrecoverable history the moment it is committed, while a refused commit costs
+one message and a `git commit --no-verify` away. Every OTHER way this hook can
+fail (no python, an unborn HEAD, memlint erroring out) still fails open exactly
+like every other hook.
 
 **Logging, per hook.** The seven project-level hooks each write exactly one
 `outcome=` line per run to `$MEMCONTINUUM_HOME/hook.log`.
@@ -61,10 +70,14 @@ Diagnostic lines may precede it (`pre-edit-chain.sh` logs a missing-python note
 before its own `outcome=`). A watchdog kill is included in "every run": the
 guarded hook cannot write its own outcome line then — it may be mid-call, or may
 never have reached that code — so `mc-watchdog.sh` writes
-`outcome=watchdog-killed hook=<name>` itself before exiting. The two hooks
+`outcome=watchdog-killed hook=<name>` itself before exiting. The three hooks
 outside that rule are deliberate: `post-commit-reindex.sh` writes its own
 `post-commit-reindex: rc=… elapsed=… project=… root=… embed=pending|clean|skipped`
-line instead, and
+line instead, `pre-commit-append-only.sh` writes its own line, one of
+`pre-commit-append-only: rc=1 changed=<n> project=…` (refused the commit),
+`rc=0 changed=<n> project=…` (clean), or `skipped=<reason> project=…` — an
+unborn HEAD, no python, an engine failure — when nothing was actually
+judged (no `changed=` on that shape: nothing was compared), and
 `memcontinuum-detect.sh` writes nothing at all unless
 `$MEMCONTINUUM_DETECT_LOG` is set — it runs in every repo on the machine, so its
 default is silence.
@@ -911,7 +924,13 @@ second bespoke timeout story for the one hook that happens to be fast),
 `MEMCONTINUUM_POST_COMMIT_BUDGET`, default 30 seconds -- generous on purpose:
 its guarded content pass is measured well under a second; the budget is a
 backstop against a hung/slow filesystem, not a tuned ceiling). Unguarded:
-`memcontinuum-detect.sh`.
+`memcontinuum-detect.sh` and `pre-commit-append-only.sh` — deliberately, in
+the second case: this hook's whole point is to fail CLOSED on a history edit,
+and a watchdog that kills a slow check and lets the commit through anyway
+would turn the exact slowness the check exists to catch into a bypass. It
+still sources `mc-watchdog.sh` for the `MEMCONTINUUM_HOME`/`config.sh`
+pointer-chain resolution the guard block also performs, but never invokes
+that guard block itself.
 
 `pre-edit-chain.sh`'s own inner budget is confirmed against a real
 measurement of its wired command line across the engine's own store and two
@@ -1639,9 +1658,47 @@ untyped plain markdown with no `id:`, no `type:`, and no `links:` (a README,
 an inbox drop) — nobody chains those by stem, and two files sharing one is
 the normal state of the tree.
 
-**Deliberately not implemented:** "a link edited after being recorded (hash
-mismatch vs git) → reject". See `docs/SCHEMA.md` §7 — that check belongs where a
-canonical store's commits are made, not inside the linter.
+### Append-only history (`--against-ref`)
+
+`memlint.py --against-ref REF [--staged] ROOT` is a second, independent check
+— when given, it replaces the schema-rule pass above entirely (never both in
+one invocation): an adopted store may carry pre-existing schema findings the
+installer already tolerates, and this check must never fail a commit over a
+condition nobody ruled on.
+
+For every topic file present at `REF` and now, it parses both sides with the
+same typed parser (`parse_record`/`parse_record_text`) and compares links by
+id:
+
+| rule | severity |
+|---|---|
+| a link present at `REF` differs at all (any field, including `status`, `superseded_by`, `reverses` — a status change is a NEW link, never an edit) | error, `<path>:<link>: link changed after being recorded` |
+| a link present at `REF` is missing now | error, `<path>:<link>: link removed after being recorded` |
+| a topic file present at `REF` is deleted or renamed | error naming the path (`--no-renames` means a rename is a plain delete + a plain add, so one rule covers both) |
+| new links; changes to `current`, `title`, `tags`, `code_refs`, or the body | free |
+| frontmatter that does not parse (either side) | error, the typed-parse diagnostic — never a traceback |
+| `ROOT` is not inside a git repository, or `REF` does not resolve to a commit | exit 2 with a message (not exit 1 — this is an infrastructure/usage failure, not a content finding) |
+
+`--staged` compares `REF` to the INDEX (`git show :path`, what `git commit`
+would actually commit); the default compares `REF` to the working tree
+(`git diff REF` — the standard "everything you'd get if you staged
+everything" comparison). The summary line
+(`memlint: append-only against <ref>: changed=<n> errors=<n>`) is what
+`hooks/pre-commit-append-only.sh` parses `changed=` off of for its own
+`hook.log` line; `changed` counts topic files the diff actually concerned,
+independent of whether any produced an error.
+
+The store's own git `pre-commit` hook (`hooks/pre-commit-append-only.sh`,
+wired by `scripts/repo-init.sh` step 6b the same way `post-commit-reindex.sh`
+is wired at step 6) runs `--against-ref HEAD --staged` on every commit and
+BLOCKS the ones that fail it — see "Fail-open is the contract, not a
+fallback" above for the one deliberate exception this makes to every other
+hook's fail-open rule, and "The watchdog"'s `Unguarded:` list for why no
+timeout wraps it. `git commit --no-verify` bypasses it, same as any git hook;
+the same check run again in CI against a wider range, plus a protected
+branch, is the real guarantee against a rewritten history for a store other
+machines also touch — not this hook alone, which only ever sees one commit
+at a time on one machine.
 
 ## Storage and index
 
