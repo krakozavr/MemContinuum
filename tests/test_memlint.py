@@ -1503,6 +1503,89 @@ class TestMemlintAgainstRef(unittest.TestCase):
             self.assertIn("record file deleted", out)
             self.assertNotIn("topic file deleted", out)
 
+    # -- Grok re-gate MAJOR 1: a shape error unrelated to links (or a
+    # duplicate link id) still leaves `links` fully populated in the
+    # recovered frontmatter -- the repair/skip path must not be taken
+    # just because `old_result.valid` is False; it must be taken only
+    # when NO links were actually recovered.
+
+    def test_n_shape_error_recovers_links_and_still_freezes_them(self):
+        """(a): REF has a shape error on an UNRELATED field (`tags:
+        not-a-list`) plus a clean L1 link -- links WERE recovered, so this
+        is not a free repair. Fixing `tags` AND rewriting L1's recorded
+        ruling text in the same commit must still be refused."""
+        with tempfile.TemporaryDirectory() as td:
+            base = (
+                "---\ntype: topic\nid: TOP-9401\ntitle: T\ntags: not-a-list\nlinks:\n"
+                '  - link: L1\n    status: active\n'
+                '    ruling: {text: "first", authority: agent-inference}\n'
+                "---\n\nBody.\n"
+            )
+            root = self._store_with_base_text(td, base)
+            fixed = base.replace("tags: not-a-list", "tags: []").replace(
+                '{text: "first", authority: agent-inference}',
+                '{text: "EDITED first", authority: agent-inference}',
+            )
+            (root / "topics" / "foo.md").write_text(fixed)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("L1", out)
+            self.assertIn("changed after being recorded", out)
+
+    def test_n_shape_error_recovers_links_clean_field_fix_is_ok(self):
+        """(b): same REF as (a), but the new blob fixes ONLY `tags` --
+        L1's recorded body is untouched, so this must be clean."""
+        with tempfile.TemporaryDirectory() as td:
+            base = (
+                "---\ntype: topic\nid: TOP-9401\ntitle: T\ntags: not-a-list\nlinks:\n"
+                '  - link: L1\n    status: active\n'
+                '    ruling: {text: "first", authority: agent-inference}\n'
+                "---\n\nBody.\n"
+            )
+            root = self._store_with_base_text(td, base)
+            fixed = base.replace("tags: not-a-list", "tags: []")
+            (root / "topics" / "foo.md").write_text(fixed)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 0, out)
+
+    def test_n_duplicate_id_on_ref_recovers_first_occurrence_as_history(self):
+        """(c): REF has two links both `link: L1` -- the FIRST occurrence
+        in file order is the recorded history (the same first-wins
+        reading memidx.validate_record_shape's own duplicate-count
+        diagnostic is built from). Deduping to that first body is clean;
+        landing on the second body is an append-only violation."""
+        with tempfile.TemporaryDirectory() as td:
+            dup_base = (
+                "---\ntype: topic\nid: TOP-9402\ntitle: T\nlinks:\n"
+                '  - link: L1\n    status: active\n'
+                '    ruling: {text: "first", authority: agent-inference}\n'
+                '  - link: L1\n    status: active\n'
+                '    ruling: {text: "second", authority: owner-verbatim, source: s}\n'
+                "---\n\nBody.\n"
+            )
+            root = self._store_with_base_text(td, dup_base)
+            clean_first = (
+                "---\ntype: topic\nid: TOP-9402\ntitle: T\nlinks:\n"
+                '  - link: L1\n    status: active\n'
+                '    ruling: {text: "first", authority: agent-inference}\n'
+                "---\n\nBody.\n"
+            )
+            (root / "topics" / "foo.md").write_text(clean_first)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 0, out)
+
+            clean_second = (
+                "---\ntype: topic\nid: TOP-9402\ntitle: T\nlinks:\n"
+                '  - link: L1\n    status: active\n'
+                '    ruling: {text: "second", authority: owner-verbatim, source: s}\n'
+                "---\n\nBody.\n"
+            )
+            (root / "topics" / "foo.md").write_text(clean_second)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("L1", out)
+            self.assertIn("changed after being recorded", out)
+
 
 class TestQuestionMarkRuleScope(unittest.TestCase):
     """Ruling 149 / whole-branch-review MODERATE-2: the question-mark rule

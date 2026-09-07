@@ -1372,6 +1372,39 @@ def _link_diff_errors(full_path, lid: str, old_link: dict, new_link: dict) -> li
     return errors
 
 
+def _recovered_old_links(fm: dict) -> list[dict] | None:
+    """Grok re-gate MAJOR 1: pulls a usable, de-duplicated `links` list out
+    of a REF-side frontmatter dict whose record failed FULL validation --
+    a shape error on some UNRELATED field (`tags: not-a-list`), or two
+    links sharing an id -- either of which leaves `fm["links"]` fully
+    populated: `validate_record_shape` only ever ADDS a diagnostic, and
+    `_drop_note_shape_violations`'s dropping never runs for a CANONICAL
+    record (one with a real `links` list is always canonical). Returns
+    None when nothing usable survives at all (`links` absent/empty, not a
+    list, or with no entry carrying a scalar id) -- callers treat that as
+    "no recorded history to protect", the pre-existing repair path.
+    Otherwise returns one dict per distinct id, KEEPING THE FIRST
+    OCCURRENCE when an id repeats (file order) -- the same first-wins
+    reading `validate_record_shape`'s own duplicate-id diagnostic is built
+    from (it counts occurrences in file order without ever picking a
+    "winner" itself; the first is what a human reading the raw file sees
+    first for that id, so it is the history to protect)."""
+    links = fm.get("links")
+    if not isinstance(links, list):
+        return None
+    recovered: dict[str, dict] = {}
+    for link in links:
+        if not isinstance(link, dict):
+            continue
+        lid = link.get("link")
+        if lid is None or lid == "" or isinstance(lid, (dict, list)):
+            continue
+        lid_key = str(lid)
+        if lid_key not in recovered:
+            recovered[lid_key] = link
+    return list(recovered.values()) if recovered else None
+
+
 def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], int, list[str]]:
     """Returns (errors, changed, notes) -- `changed` is the number of
     topic files the diff actually concerned (topic-relevant at REF),
@@ -1439,34 +1472,58 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
             continue
         new_result = _parse_git_blob(new_blob, path_in_root)
 
+        repair_note = None
         if not old_result.valid:
-            if new_result.valid:
-                # Grok M2 / whole-branch-review MODERATE-1: the REF-side
-                # blob never parsed -- it recorded no link history at all
-                # (the real-world repro: a `type: investigation` record
-                # with no links, broken only by an unquoted colon in its
-                # title) -- and the new blob parses cleanly. This is a
-                # REPAIR, not a history edit: nothing here to freeze, so
-                # it is never an append-only error, only a note.
-                old_reasons = "; ".join(message for _field, message in old_result.diagnostics)
-                notes.append(
-                    f"{full_path}: repaired -- the blob at {ref} could not be safely "
-                    f"parsed ({old_reasons}); the new blob parses cleanly, so there is "
-                    "no recorded link history here to protect"
-                )
+            old_links = _recovered_old_links(old_result.frontmatter)
+            if old_links is None:
+                if new_result.valid:
+                    # Grok M2 / whole-branch-review MODERATE-1: the REF-side
+                    # blob never parsed -- it recorded no link history at all
+                    # (the real-world repro: a `type: investigation` record
+                    # with no links, broken only by an unquoted colon in its
+                    # title) -- and the new blob parses cleanly. This is a
+                    # REPAIR, not a history edit: nothing here to freeze, so
+                    # it is never an append-only error, only a note.
+                    old_reasons = "; ".join(message for _field, message in old_result.diagnostics)
+                    notes.append(
+                        f"{full_path}: repaired -- the blob at {ref} could not be safely "
+                        f"parsed ({old_reasons}); the new blob parses cleanly, so there is "
+                        "no recorded link history here to protect"
+                    )
+                    continue
+                # Both sides unparseable: still fail closed (test_j: malformed
+                # -> malformed is still refused), reported from the OLD side's
+                # diagnostics, same as before this fix.
+                for field, message in old_result.diagnostics:
+                    errors.append(f"{full_path}: {field}: {message} (at {ref})")
                 continue
-            # Both sides unparseable: still fail closed (test_j: malformed
-            # -> malformed is still refused), reported from the OLD side's
-            # diagnostics, same as before this fix.
-            for field, message in old_result.diagnostics:
-                errors.append(f"{full_path}: {field}: {message} (at {ref})")
-            continue
+            # Grok re-gate MAJOR 1: the REF blob failed full validation but
+            # its `links` were still recovered (see _recovered_old_links) --
+            # there IS recorded link history here, so the repair/skip path
+            # above must not apply. Fall through to the ordinary comparison
+            # below using the recovered links instead.
+            old_reasons = "; ".join(message for _field, message in old_result.diagnostics)
+            raw_links = old_result.frontmatter.get("links")
+            dup_note = (
+                " (a duplicate link id was recovered as its first occurrence)"
+                if isinstance(raw_links, list) and len(raw_links) != len(old_links)
+                else ""
+            )
+            repair_note = (
+                f"{full_path}: the blob at {ref} could not be safely parsed "
+                f"({old_reasons}){dup_note}, but its links were recovered and are "
+                "still compared against the current blob for append-only violations"
+            )
+        else:
+            old_links = old_result.frontmatter.get("links") or []
+
         if not new_result.valid:
             for field, message in new_result.diagnostics:
                 errors.append(f"{full_path}: {field}: {message}")
             continue
 
-        old_links = old_result.frontmatter.get("links") or []
+        if repair_note is not None:
+            notes.append(repair_note)
 
         # Codex 2 (BLOCKING): a duplicate link id on EITHER side already
         # made that side's own ParseResult invalid above (memidx.
