@@ -1019,5 +1019,43 @@ class TestStatsPrecompactBucket(StatsTestBase):
         self.assertEqual(pc["outcomes"]["index-degraded"], 1)
 
 
+class TestStatsPreCommitBucket(StatsTestBase):
+    """Grok re-gate NIT 4 (whole-branch NIT-2, carried over from fix wave
+    1): hooks/pre-commit-append-only.sh writes `pre-commit-append-only:
+    rc=<n> changed=<n>` / `skipped=<reason>` lines to hook.log, and `stats`
+    never counted them at all -- they fell into the generic "other"
+    bucket, indistinguishable from every other uncategorized line."""
+
+    def test_pre_commit_outcomes_are_reported_and_not_counted_as_prompts(self):
+        lines = [
+            f"{ts(1)} pre-commit-append-only: rc=0 changed=2 project=demo",
+            f"{ts(1)} pre-commit-append-only: rc=1 changed=1 project=demo",
+            f"{ts(1)} pre-commit-append-only: skipped=not-the-store project=demo",
+        ]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home), project="demo")
+        self.assertEqual(rc, 0)
+        self.assertIn("pre_commit", out)
+        pcm = out["pre_commit"]
+        self.assertEqual(pcm["pass"], 1)
+        self.assertEqual(pcm["refused"], 1)
+        self.assertEqual(pcm["skipped"], 1)
+        self.assertEqual(pcm["outcomes"]["skipped:not-the-store"], 1)
+        # These three lines must never inflate user_prompts (they carry no
+        # `outcome=` field at all, and route through their own "pre-commit"
+        # kind, never "userprompt").
+        self.assertEqual(out["user_prompts"], 0)
+        self.assertNotIn("other", pcm)
+
+    def test_pre_commit_engine_failure_skip_is_named(self):
+        lines = [f"{ts(1)} pre-commit-append-only: skipped=engine-failure rc=2 project=demo"]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home), project="demo")
+        self.assertEqual(rc, 0)
+        pcm = out["pre_commit"]
+        self.assertEqual(pcm["skipped"], 1)
+        self.assertEqual(pcm["outcomes"]["skipped:engine-failure"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

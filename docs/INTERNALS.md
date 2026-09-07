@@ -88,7 +88,11 @@ running with its cwd outside `MEMCONTINUUM_ROOT` (`skipped=not-the-store` —
 a wrapper invoked from another repository entirely, e.g. through a
 mistakenly shared `core.hooksPath`, must never judge or block THAT
 repository's commit) — when nothing was actually judged (no `changed=` on
-that shape: nothing was compared), and
+that shape: nothing was compared). `memidx.py stats` reports these under a
+`pre_commit` block (`pass`/`refused`/`skipped`, the last summing every
+`skipped:<reason>` outcome its own `outcomes` dict names), exactly like
+every other hook kind — these lines carry no `outcome=` field of their own
+and are never folded into `user_prompts`.
 `memcontinuum-detect.sh` writes nothing at all unless
 `$MEMCONTINUUM_DETECT_LOG` is set — it runs in every repo on the machine, so its
 default is silence.

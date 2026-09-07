@@ -7240,6 +7240,15 @@ def _hook_log_line_kind(rest: str) -> str:
         return "pre-edit"
     if stripped.startswith("outcome=watchdog-killed") and "hook=pre-edit-chain.sh" in stripped:
         return "pre-edit"
+    # Grok re-gate NIT 4 (whole-branch NIT-2): hooks/pre-commit-append-
+    # only.sh's own log_line() writes "pre-commit-append-only: <fields>",
+    # not the "<keyword> <fields>" shape every _HOOK_LOG_KEYWORDS producer
+    # uses -- special-cased here the same way the two pre-edit checks
+    # above are, rather than joining that keyword list (its own kind
+    # string, "pre-commit", is also shorter than the log line's literal
+    # producer name).
+    if stripped.startswith("pre-commit-append-only: "):
+        return "pre-commit"
     for kw in _HOOK_LOG_KEYWORDS:
         if stripped.startswith(kw + " ") or stripped == kw:
             return kw
@@ -7251,7 +7260,7 @@ def _hook_log_line_kind(rest: str) -> str:
 # never saw (never a KeyError, never a silent `.get(..., {})` fallback).
 _STATS_KINDS = (
     "userprompt", "ledger", "pre-edit", "newfile-nudge",
-    "sessionstart", "sessionend", "precompact", "other",
+    "sessionstart", "sessionend", "precompact", "pre-commit", "other",
 )
 
 
@@ -7474,6 +7483,24 @@ def _scan_hook_log(log_path: Path, cutoff: datetime, now: datetime):
                 outcome_key = f"appended:{fields.get('kind') or 'unknown'}"
             bucket["outcomes"]["ledger"][outcome_key] += 1
             continue
+        elif kind == "pre-commit":
+            # This producer carries no `outcome=` field at all (see
+            # _hook_log_line_kind) -- its own fields are `rc=`/`changed=`
+            # on a pass/refusal, or `skipped=<reason>` (sometimes alongside
+            # its own `rc=`, e.g. `skipped=engine-failure rc=2`) on a
+            # fail-open skip. `skipped=` is checked first since a line can
+            # carry both.
+            skip_reason = fields.get("skipped")
+            if skip_reason:
+                outcome_key = f"skipped:{skip_reason}"
+            elif fields.get("rc") == "0":
+                outcome_key = "pass"
+            elif fields.get("rc") == "1":
+                outcome_key = "refused"
+            else:
+                outcome_key = f"rc:{fields.get('rc') or 'unknown'}"
+            bucket["outcomes"]["pre-commit"][outcome_key] += 1
+            continue
         bucket["outcomes"][kind][outcome] += 1
         # userprompt: `user_prompts` is derived at report time from this
         # same outcomes["userprompt"] Counter (round 2, item 8) -- no
@@ -7623,6 +7650,19 @@ def _stats_report(
     pc_index_quarantined = pc.get("index-quarantined", 0)
     pc_index_degraded = pc.get("index-degraded", 0)
 
+    # Grok re-gate NIT 4 (whole-branch NIT-2): the store's pre-commit
+    # append-only guard writes its own pass/refusal/skip lines to
+    # hook.log (see _scan_hook_log's "pre-commit" branch for the
+    # outcome-key shapes: "pass", "refused", "skipped:<reason>") and they
+    # were never surfaced here at all -- silently folded into "other".
+    # These lines carry no `outcome=` field and route through their own
+    # "pre-commit" kind, never "userprompt", so they can never inflate
+    # `user_prompts` above.
+    pcm = outcomes["pre-commit"]
+    pcm_pass = pcm.get("pass", 0)
+    pcm_refused = pcm.get("refused", 0)
+    pcm_skipped = sum(v for k, v in pcm.items() if k.startswith("skipped:"))
+
     flags = []
     if args.project != UNKNOWN_STATS_PROJECT:
         if nudges_total >= 3 and ledger_store == 0:
@@ -7696,6 +7736,12 @@ def _stats_report(
             "index_quarantined": pc_index_quarantined,
             "index_degraded": pc_index_degraded,
             "outcomes": dict(pc),
+        },
+        "pre_commit": {
+            "pass": pcm_pass,
+            "refused": pcm_refused,
+            "skipped": pcm_skipped,
+            "outcomes": dict(pcm),
         },
         "store_commits": store_commits,
         "unknown_lines": unknown_lines,
@@ -7823,6 +7869,9 @@ def cmd_stats(args) -> int:
               f"index-quarantined={pc['index_quarantined']} index-degraded={pc['index_degraded']} "
               f"index-uninitialized={pc['index_uninitialized']} "
               f"index-upgrade-required={pc['index_upgrade_required']}")
+        pcm = result["pre_commit"]
+        print(f"pre-commit (store append-only guard): pass={pcm['pass']} "
+              f"refused={pcm['refused']} skipped={pcm['skipped']}")
         eb = result["embedding_backlog"]
         rows_txt = "unknown (db unreadable)" if eb["rows_without_fresh_vector"] is None else eb["rows_without_fresh_vector"]
         print(f"embedding backlog: pending-marker={eb['pending_marker']} "

@@ -128,8 +128,9 @@ repo — not this tool repo, and not the code repo it describes.
 own, and `post-commit-reindex.sh` silently no-ops without `MEMCONTINUUM_ROOT`
 set). A `post-commit` this installer did not render is left untouched and
 reported, never silently overwritten — the same foreign-hook refusal §3b
-describes for `pre-commit`, identity anchored on the wrapper's own `exec`
-line:
+describes for `pre-commit`, identity anchored on the complete five-line
+wrapper this installer renders (the shebang, the three `MEMCONTINUUM_*`
+exports, and the `exec` line), never the `exec` line alone:
 
 ```bash
 #!/usr/bin/env bash
@@ -190,8 +191,10 @@ same shape as `post-commit` above (same three exports, `exec`s the canonical
 script by absolute path so an edit to it needs no reinstall) — with the same
 foreign-hook refusal `post-commit` now has too: a `pre-commit` this
 installer did not render is left untouched and reported, never silently
-overwritten. Identity is the wrapper's own `exec` line naming the canonical
-script, not a substring match anywhere in the file.
+overwritten. Identity is the complete five-line wrapper this installer
+renders — the shebang, the three `MEMCONTINUUM_*` exports, and the `exec`
+line naming the canonical script — never the `exec` line alone, and never a
+substring match anywhere in the file.
 
 ```bash
 #!/usr/bin/env bash
