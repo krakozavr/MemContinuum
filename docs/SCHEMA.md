@@ -262,8 +262,12 @@ symbol's own definition line, or within the three lines immediately above it —
 whatever the language's comment leader (`#`, `//`, `--`, …); the check is a plain text match, not a
 parse of the comment itself. The symbol's definition line is found through the chunker registry
 (`chunkers.get_chunker(lang).chunk_file`), so the same rule serves every wired language; a file
-whose language has no chunker, or whose backend cannot run here, is skipped with a warning rather
-than treated as carrying no marker. Markers verify at functions, methods, and computed
+whose backend cannot run here is skipped with a warning naming the reason, while a file whose
+language has no chunker at all is instead scanned for a marker by plain regex alone — silent when
+it holds none, and, when it does, checked against everything that needs no symbol location (the
+topic and link exist, are active CONSTRAINT/HOLD, and the topic's code_refs name the file) with a
+warning that the marker cannot be attributed to a symbol, rather than warned regardless of whether
+it carries a marker at all. Markers verify at functions, methods, and computed
 vars/properties — whatever the chunker itself reports a definition line for; a container type
 (a class, struct, enum, …) has no such line of its own and is uncheckable.
 

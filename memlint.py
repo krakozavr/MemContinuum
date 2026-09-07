@@ -936,6 +936,47 @@ def _marker_to_store_errors(
     return [f"{prefix}: topic {topic_id}'s code_refs do not name {rel_path}"]
 
 
+def _marker_to_store_errors_no_chunker(
+    full: Path, marker_line: int, topic_id: str, link_id: str, rel_path: str, topics: dict,
+) -> tuple[list[str], list[str]]:
+    """Rule 4's counterpart for a marker found in a file whose language has
+    no chunker at all (Grok re-gate R6): there is no chunk and no symbol,
+    so nothing here can be located against one -- but the store-side rules
+    that need no symbol location at all still apply (a marker naming a
+    dead topic/link, an inactive link, a CONTEXT-tier link, or a topic
+    whose code_refs do not even name this FILE, is exactly as wrong here
+    as it would be in a chunked file). `code_ref_matches` already strips
+    any `#symbol` fragment before comparing, so a path#symbol entry counts
+    exactly like a bare path or glob for this file-level check -- a
+    specific symbol can never be verified here regardless of which form
+    named the file. Returns (errors, warnings): when every store-side
+    check passes, the one thing that genuinely cannot be done -- pointing
+    the marker at a specific symbol -- is reported as the WARNING, never
+    an error; there is nothing wrong with the record, only something this
+    engine's parser layer cannot do for this language."""
+    prefix = f"{full}:{marker_line}: decision marker {topic_id} {link_id}"
+    info = topics.get(topic_id)
+    if info is None:
+        return [f"{prefix}: no such topic {topic_id!r}"], []
+    fm = info["fm"]
+    link = next((l for l in fm.get("links") or [] if str(l.get("link")) == link_id), None)
+    if link is None:
+        return [f"{prefix}: no such link {link_id!r} in topic {topic_id}"], []
+    if link.get("status") != "active":
+        return [f"{prefix}: link status is {link.get('status')!r}, not active"], []
+    if _link_tier(link) == "context":
+        return [
+            f"{prefix}: link is CONTEXT, not CONSTRAINT/HOLD -- "
+            "a marker may only cite a CONSTRAINT or HOLD link"
+        ], []
+    if not any(code_ref_matches(rel_path, str(ref)) for ref in fm.get("code_refs") or []):
+        return [f"{prefix}: topic {topic_id}'s code_refs do not name {rel_path}"], []
+    return [], [
+        f"{full}:{marker_line}: marker cannot be attributed to a symbol "
+        "(no chunker for this file's language)"
+    ]
+
+
 def _store_to_code_check(
     tid: str, link_id: str, path_part: str, symbol_part: str,
     code_roots: list[Path], warned_uncheckable: set, warned_symbol_unverifiable: set,
@@ -1058,6 +1099,29 @@ def lint_markers(root: Path, code_roots: list[Path]) -> tuple[list[str], list[st
     for full, _file_root, rel_path in _scan_set_for_markers(code_roots, topics):
         text, chunks, reason, remedy = _read_and_chunk(full, rel_path)
         if chunks is None:
+            if reason == "no chunker for this file's language":
+                # Grok re-gate R6: this is not a failure -- the language is
+                # simply not wired here, and the file's own text (`text` is
+                # always populated for this exact reason -- see
+                # _read_and_chunk) is still fully readable. Scan it with
+                # the marker regex alone, with no chunk-derived window
+                # (there is no declaration to anchor one to): silent when
+                # it holds no marker at all, instead of the old blanket
+                # per-file warning that fired regardless. A real backend
+                # failure (a missing grammar wheel, an unexpected chunking
+                # exception) still falls through to the ordinary
+                # uncheckable-file warning below -- that IS a genuine gap
+                # worth naming, unlike a language that was never wired.
+                for lineno, line in enumerate(text.splitlines(), start=1):
+                    m = _DECISION_MARKER_RE.search(line)
+                    if not m:
+                        continue
+                    errs, warns = _marker_to_store_errors_no_chunker(
+                        full, lineno, m.group(1), m.group(2), rel_path, topics,
+                    )
+                    errors.extend(errs)
+                    warnings.extend(warns)
+                continue
             if full not in warned_uncheckable:
                 warned_uncheckable.add(full)
                 warnings.append(_uncheckable_message(str(full), reason, remedy))

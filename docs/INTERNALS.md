@@ -1804,7 +1804,8 @@ scan never opens a file nothing references, even to check whether it is binary.
 | a marker's topic names a `path#symbol` that matches no chunk anywhere in the file, but the chunker confirms the symbol IS declared (a container — class/struct/enum/… — chunk_file never gives one its own chunk) | silent on this side (never misattributed to a nearby member); direction 2's own "container type" row below still warns |
 | an active CONSTRAINT/HOLD link's `path#symbol` ref finds no marker at that symbol | warning |
 | an active CONSTRAINT/HOLD link's `path#symbol` ref names a symbol the chunker proves absent | error (the ref itself is dangling) |
-| a file in scope whose language has no chunker, or whose backend cannot run here | warning (names the reason), never an error |
+| a file in scope whose backend cannot run here (a missing optional grammar wheel, or a genuine chunking failure) | warning (names the reason), never an error |
+| a file in scope whose language has no chunker at all | not a failure — scanned for a `decision:` marker by plain regex alone (no chunk-derived window); silent when it holds none. When it does, checked against every marker→store rule above that needs no symbol location (topic/link exist, active, CONSTRAINT/HOLD, code_refs name the file — the code_ref's own `#symbol` fragment, if any, is stripped before this comparison, so it counts exactly like a bare path or glob); a violation there is still the matching error, and clean is ONE warning that the marker cannot be attributed to a symbol — never the old blanket per-file warning fired regardless of whether the file held a marker at all |
 | a `path#symbol` naming a container type (class/struct/enum/…) the chunker reports no definition line for | warning (uncheckable, not "no marker") |
 
 Corpus-wide identity rules, applied to every record regardless of type:

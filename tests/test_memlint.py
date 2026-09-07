@@ -1776,6 +1776,59 @@ class TestMemlintDecisionMarkers(unittest.TestCase):
             any("markers not checked" in w and "x.rb" in w for w in warnings), warnings
         )
 
+    # Fix round 2 R6: a no-chunker file with plain-path/glob-only code_refs
+    # and no marker at all must never warn -- the old blanket "markers not
+    # checked (no chunker for this file's language)" fired once per such
+    # file in scope regardless of whether it held a marker, which meant a
+    # real store with plain-path-only code_refs into bash/markdown/toml/
+    # json files (no markers used anywhere yet) carried a warning for every
+    # single one of them.
+
+    def test_g_no_chunker_file_named_by_a_plain_path_with_no_marker_is_clean(self):
+        topic = _marker_topic("TOP-0047", ["src/deploy.sh"], _CONSTRAINT_LINK_L1)
+        code = {"src/deploy.sh": "#!/usr/bin/env bash\necho hello\n"}
+        errors, warnings = self._lint({"t.md": topic}, code)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(warnings, [], warnings)
+
+    def test_g_no_chunker_file_with_a_valid_marker_gets_one_attribution_warning(self):
+        topic = _marker_topic("TOP-0047", ["src/deploy.sh"], _CONSTRAINT_LINK_L1)
+        code = {"src/deploy.sh": "#!/usr/bin/env bash\n# decision: TOP-0047 L1\necho hello\n"}
+        errors, warnings = self._lint({"t.md": topic}, code)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("cannot be attributed to a symbol", warnings[0])
+        self.assertIn("no chunker for this file's language", warnings[0])
+        self.assertIn("deploy.sh", warnings[0])
+
+    def test_g_no_chunker_file_with_a_marker_naming_a_missing_link_is_error(self):
+        topic = _marker_topic("TOP-0047", ["src/deploy.sh"], _CONSTRAINT_LINK_L1)
+        code = {"src/deploy.sh": "#!/usr/bin/env bash\n# decision: TOP-0047 L99\necho hello\n"}
+        errors, _warnings = self._lint({"t.md": topic}, code)
+        self.assertTrue(
+            any("TOP-0047" in e and "L99" in e and "no such link" in e for e in errors), errors
+        )
+
+    def test_g_path_symbol_ref_into_a_no_chunker_file_keeps_its_own_warning(self):
+        """direction 2 (store -> code) is unaffected by this fix: a
+        CONSTRAINT/HOLD link's own path#symbol ref still cannot locate its
+        symbol without a chunker, and still warns -- even with no marker
+        anywhere in the file (direction 1 stays silent here, per the test
+        above)."""
+        topic = _marker_topic("TOP-0048", ["src/deploy.sh#main"], _CONSTRAINT_LINK_L1)
+        code = {"src/deploy.sh": "#!/usr/bin/env bash\necho hello\n"}
+        errors, warnings = self._lint({"t.md": topic}, code)
+        self.assertEqual(errors, [], errors)
+        self.assertTrue(
+            any(
+                "markers not checked" in w
+                and "no chunker for this file's language" in w
+                and "deploy.sh" in w
+                for w in warnings
+            ),
+            warnings,
+        )
+
     def test_codex13_scan_never_opens_an_unreferenced_file(self):
         """Codex 13: the marker scan must open only files at least one
         topic's code_refs names -- a probe observed an unrelated file
