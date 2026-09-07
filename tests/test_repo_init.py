@@ -1979,7 +1979,12 @@ class TestMcDefaultStoreForCollisions(unittest.TestCase):
         subprocess.run(["git", "init", "-q", str(checkout)], check=True)
         plain = home / "dev" / "app-MemContinuum-Store"
         self._make_marked_store(plain, "renamed-project")
-        self._write_registry_row(str(home), str(checkout), str(plain), "renamed-project")
+        # The recorder keys the row on git's toplevel, which is the PHYSICAL
+        # path (on macOS a $TMPDIR checkout is /var/... logically and
+        # /private/var/... physically); a hand-written row must match it.
+        self._write_registry_row(
+            str(home), os.path.realpath(str(checkout)), str(plain), "renamed-project"
+        )
         # PROJECT given this run ("mine") deliberately differs from the
         # registry row's recorded project= ("renamed-project") -- a
         # same-checkout re-run under a renamed --project must still be
