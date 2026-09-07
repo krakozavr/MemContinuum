@@ -1172,7 +1172,18 @@ else
         # to compare against regardless of --project. CWD_TOPLEVEL is only
         # ever set inside the "no --store given" branch above (${..:-} for
         # the explicit-store case, where no one checkout owns this install).
-        CHECKOUT_STAMP="${CWD_TOPLEVEL:-}"
+        #
+        # Fix round 2 R5: this comment always claimed "physical path", but
+        # CWD_TOPLEVEL (git rev-parse --show-toplevel, which honors $PWD)
+        # was stamped verbatim -- LOGICAL, not physical. On macOS a
+        # checkout under $TMPDIR is /var/folders/... logically and
+        # /private/var/folders/... physically, so a store created from
+        # there never matched its own checkout once compared physically
+        # (mc_store_belongs_elsewhere, scripts/mc-registry-lib.sh). Now
+        # resolved through mc_physical (falls back to the raw value when
+        # the path does not exist, same "unknown"-shaped fallback below).
+        CHECKOUT_STAMP=""
+        [ -n "${CWD_TOPLEVEL:-}" ] && CHECKOUT_STAMP="$(mc_physical "$CWD_TOPLEVEL")"
         [ -n "$CHECKOUT_STAMP" ] || CHECKOUT_STAMP="unknown"
 
         README_TMPL="$(cat "$TEMPLATES_DIR/store-README.md.tmpl")"

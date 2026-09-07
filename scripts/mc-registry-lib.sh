@@ -669,7 +669,19 @@ mc_store_belongs_elsewhere() {
     fi
     if mc_store_checkout_identity "$candidate"; then
         checkout_phys="$(mc_physical "$checkout")"
-        [ "$MC_STORE_CHECKOUT" = "$checkout_phys" ] && return 1
+        # Fix round 2 R5 (CI's macOS job, reproduced on the Mac mini at
+        # 77e52d1): the stamp used to be compared VERBATIM against
+        # mc_physical(CHECKOUT) -- correct only when the stamped path and
+        # the live checkout already resolve to the identical string. On
+        # macOS a checkout under $TMPDIR is /var/folders/... logically and
+        # /private/var/folders/... physically; CWD_TOPLEVEL (what repo-
+        # init.sh stamps at store-creation time, below) returns the
+        # logical form, so a store never matched its own checkout there.
+        # mc_physical falls back to its input unchanged when the path does
+        # not (or no longer) exist, so a stamp whose directory is gone
+        # still stays a verbatim comparison -- still a mismatch, same as
+        # before this fix.
+        [ "$(mc_physical "$MC_STORE_CHECKOUT")" = "$checkout_phys" ] && return 1
         return 0
     fi
     [ -n "$project" ] || return 1

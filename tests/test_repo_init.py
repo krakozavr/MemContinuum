@@ -1899,6 +1899,41 @@ class TestMcDefaultStoreForCollisions(unittest.TestCase):
         self.assertEqual(refused_why, "")
         self.assertEqual(store, str(plain))
 
+    def test_checkout_marker_recorded_via_a_symlinked_path_is_still_recognized_as_self(self):
+        """Fix round 2 R5: mc_store_belongs_elsewhere used to compare the
+        raw checkout stamp VERBATIM against mc_physical(CHECKOUT) -- fine
+        when the stamp and the live checkout resolve to the same string,
+        wrong the moment they don't, even though they name the identical
+        checkout. This is exactly what happens on macOS, where a checkout
+        under $TMPDIR is /var/folders/... logically and
+        /private/var/folders/... physically: CWD_TOPLEVEL (what repo-init.sh
+        stamps at creation) returns the logical form, so a store never
+        matched its own checkout there. Reproduced here on Linux with an
+        ordinary symlinked ancestor directory instead: the stamp is
+        recorded via the SYMLINK path (what CWD_TOPLEVEL would have
+        returned had repo-init.sh run from there), and the live checkout is
+        looked up the same way -- both must resolve physically before
+        comparison, or this reads as a foreign checkout and wrongly
+        disambiguates."""
+        home = Path(self.td) / "home"
+        (home / "dev").mkdir(parents=True)
+        real_base = home / "real-mnt"
+        real_base.mkdir()
+        checkout = real_base / "app"
+        checkout.mkdir()
+        subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+        symlinked_base = home / "mnt-stand-in"
+        symlinked_base.symlink_to(real_base)
+        checkout_via_symlink = symlinked_base / "app"
+        plain = home / "dev" / "app-MemContinuum-Store"
+        # Stamped with the SYMLINK path -- what CWD_TOPLEVEL would have
+        # returned had repo-init.sh created this store from that path.
+        self._make_marked_store(plain, "renamed-project", checkout=str(checkout_via_symlink))
+        store, why, refused_why, rc = self._call(str(checkout_via_symlink), "mine", str(home))
+        self.assertEqual(rc, 0)
+        self.assertEqual(refused_why, "")
+        self.assertEqual(store, str(plain))
+
     def test_registry_row_for_a_different_checkout_disambiguates_even_with_same_project_name(self):
         """The registry is authoritative when it speaks (advisor
         refinement): a decisions.tsv row naming the plain path for a
