@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.2.0] — unreleased
+## [0.2.0rc4] — 2026-09-07
 
 ### Decision index
 - The store walker no longer follows symlinks -- a symlinked directory or
