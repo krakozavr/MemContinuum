@@ -123,6 +123,18 @@
   Reindexing an existing index picks up this classification automatically
   on its next run (a bumped index generation forces one full content pass,
   even for an unchanged file).
+- `memlint.py` now errors on an `owner-verbatim` ruling whose text ends in
+  a question mark, after trimming trailing quote/bracket characters left by
+  a copy-paste -- a question is not a ruling, whoever asked it. The check
+  applies only to `active`/`provisional` links: a superseded link is
+  history the append-only guard already protects, so flagging it there
+  could never be cleared by superseding it. `owner-ratified` (the
+  orchestrator's own paraphrase, never a literal transcript) is not
+  covered.
+- A `kind: reversed` link whose `reverses:` target's `status` is still
+  `active` or `provisional` is now a linter error, naming the target and
+  its current status. `kind: amended` leaves its predecessor active on
+  purpose and is not covered by this check.
 
 ### Code index
 - The code index's freshness check now compares five stat signals per file
@@ -257,6 +269,17 @@
   covers edits made with the Edit and Write tools. A file changed from the
   shell gets no lookup beforehand -- only an after-the-fact entry in the
   edit ledger, once a tree diff notices it.
+
+### Release process
+- The test suite now fails loudly, not silently, when `$MEMCONTINUUM_PYTHON`
+  is unset: a guard test names the variable and how many test classes
+  (tree-sitter chunkers, embeddings, dependency reconciliation, the
+  real-bash write-hook suites) would otherwise skip every one of their
+  tests while the run still reads as clean. Set `$MEMCONTINUUM_PYTHON` to a
+  venv python with the pinned dependencies installed, or set
+  `$MEMCONTINUUM_ALLOW_UNGATED=1` to run without it anyway, accepting the
+  skipped coverage; continuous integration already sets the variable, so
+  this never fires there.
 
 ## [0.2.0rc3] — 2026-09-04
 
