@@ -2,6 +2,7 @@ import contextlib
 import io
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -82,6 +83,100 @@ class TestMemlintViolations(unittest.TestCase):
         errors, warnings = lint_single_file("warn_no_code_refs.md")
         self.assertEqual(errors, [], errors)
         self.assertTrue(any("code_refs" in w for w in warnings), warnings)
+
+    def test_owner_verbatim_question_mark_is_error(self):
+        # lint-question-mark-verbatim: an owner-verbatim ruling whose text
+        # ends with "?" is a question, not a ruling -- schema-usage
+        # laundering (a question dressed up as a citable owner ruling).
+        errors, _warnings = lint_single_file("bad_owner_verbatim_question.md")
+        self.assertTrue(
+            any("owner-verbatim" in e and "question" in e for e in errors), errors
+        )
+
+    def test_owner_verbatim_question_mark_trims_quotes_and_whitespace_first(self):
+        # The text ends "...instead?\" " (a trailing quote-then-space
+        # artifact) in the raw YAML value -- the check must trim that
+        # before deciding the text ends with "?", not require the
+        # question mark to be the literal last character.
+        errors, _warnings = lint_single_file("bad_owner_verbatim_question_trailing_quote.md")
+        self.assertTrue(
+            any("owner-verbatim" in e and "question" in e for e in errors), errors
+        )
+
+    def test_owner_ratified_question_mark_is_not_flagged(self):
+        # The rule is owner-verbatim ONLY -- owner-ratified is the
+        # orchestrator's own paraphrase of what the owner affirmed (SCHEMA
+        # section 5), never a literal transcript of the owner's own words,
+        # so a question mark in it is not the same laundering risk.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "topics").mkdir()
+            (root / "topics" / "t.md").write_text(
+                "---\ntype: topic\nid: TOP-9008\ntitle: Ratified question mark\n"
+                "current: L1\nlinks:\n  - link: L1\n    date: 2026-08-29\n"
+                "    status: active\n    kind: adopted\n    ruling:\n"
+                "      text: \"is this the right call?\"\n"
+                "      authority: owner-ratified\n"
+                "      source: \"owner message 2026-08-29\"\n"
+                "    recorded_by: agent\n    recorded_at: 2026-08-29\n---\n\nBody.\n"
+            )
+            errors, _warnings = memlint.lint_root(root)
+        self.assertFalse(any("question" in e for e in errors), errors)
+
+    def test_reversed_link_pointing_at_a_still_active_target_is_error(self):
+        # lint-two-active-links replacement (owner ruling 2026-09-06 10:41,
+        # TOP-0122 L5): a kind: reversed link must name a reverses target
+        # whose status has moved off active/provisional.
+        errors, _warnings = lint_single_file("bad_reversed_target_still_active.md")
+        self.assertTrue(
+            any("reverses" in e and "L1" in e and "still active" in e for e in errors),
+            errors,
+        )
+
+    def test_reversed_link_pointing_at_a_still_provisional_target_is_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "topics").mkdir()
+            (root / "topics" / "t.md").write_text(
+                "---\ntype: topic\nid: TOP-9012\ntitle: Reverses a provisional link\n"
+                "current: L2\nlinks:\n"
+                "  - link: L2\n    date: 2026-08-30\n    status: active\n"
+                "    kind: reversed\n    reverses: L1\n"
+                "    reason_for_change: new-evidence\n"
+                "    ruling: {text: \"changed my mind\", authority: agent-inference}\n"
+                "    recorded_by: agent\n    recorded_at: 2026-08-30\n"
+                "  - link: L1\n    date: 2026-08-01\n    status: provisional\n"
+                "    kind: adopted\n"
+                "    ruling: {text: \"a provisional first answer\", authority: agent-inference}\n"
+                "    recorded_by: agent\n    recorded_at: 2026-08-29\n---\n\nBody.\n"
+            )
+            errors, _warnings = memlint.lint_root(root)
+        self.assertTrue(
+            any("reverses" in e and "L1" in e and "still provisional" in e for e in errors),
+            errors,
+        )
+
+    def test_amended_link_leaves_predecessor_active_with_no_rule(self):
+        # kind: amended is exactly the case where the predecessor stays
+        # active on purpose (SCHEMA section 3) -- no rule fires.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "topics").mkdir()
+            (root / "topics" / "t.md").write_text(
+                "---\ntype: topic\nid: TOP-9013\ntitle: Amended, not reversed\n"
+                "current: L2\nlinks:\n"
+                "  - link: L2\n    date: 2026-08-30\n    status: active\n"
+                "    kind: amended\n    reverses: L1\n"
+                "    reason_for_change: new-evidence\n"
+                "    ruling: {text: \"refines the earlier ruling\", authority: agent-inference}\n"
+                "    recorded_by: agent\n    recorded_at: 2026-08-30\n"
+                "  - link: L1\n    date: 2026-08-01\n    status: active\n"
+                "    kind: adopted\n"
+                "    ruling: {text: \"the original, still-active ruling\", authority: agent-inference}\n"
+                "    recorded_by: agent\n    recorded_at: 2026-08-29\n---\n\nBody.\n"
+            )
+            errors, _warnings = memlint.lint_root(root)
+        self.assertFalse(any("reverses" in e and "still" in e for e in errors), errors)
 
 
 class TestMemlintClean(unittest.TestCase):
@@ -767,6 +862,25 @@ class TestMalformedRecordDiagnostics(unittest.TestCase):
             errors, _warnings = memlint.lint_root(root)
             self.assertTrue(any("links[0].link" in e for e in errors), errors)
 
+    def test_duplicate_link_id_within_one_topic_is_an_error(self):
+        """Codex 2 (BLOCKING): schema mode errors on two links sharing one
+        id within one topic (memidx.validate_record_shape's own
+        diagnostic, surfaced here as an ordinary ERROR: line, exactly like
+        every other malformed-record diagnostic in this class)."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _write(
+                root / "topics" / "bad.md",
+                "---\nid: TOP-9207\ntype: topic\ntitle: Bad\nlinks:\n"
+                '  - link: L2\n    status: active\n    ruling: {text: "a", authority: agent-inference}\n'
+                '  - link: L2\n    status: active\n    ruling: {text: "b", authority: owner-verbatim, source: s}\n'
+                "---\nBody.\n",
+            )
+            errors, _warnings = memlint.lint_root(root)
+            self.assertTrue(any("duplicate link id 'L2'" in e for e in errors), errors)
+            rc = memlint.main([str(root)])
+            self.assertEqual(rc, 1)
+
     def test_unreadable_and_non_utf8_files_are_errors_naming_file_never_traceback(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -891,6 +1005,1161 @@ class TestMalformedRecordDiagnostics(unittest.TestCase):
                     )
                     rc = memlint.main([str(root)])
                     self.assertEqual(rc, 1, f"{name}: memlint must exit 1, never wave this through clean")
+
+
+def _git(args, cwd, check=True):
+    return subprocess.run(
+        ["git"] + args, cwd=str(cwd), capture_output=True, text=True, check=check
+    )
+
+
+def _git_store(td):
+    """A throwaway git repo, isolated from this machine's real gitconfig
+    (a bare -c user.name/user.email pair rather than requiring one to be
+    globally configured -- same reasoning tests/test_repo_init.py's own
+    git helpers use)."""
+    root = Path(td)
+    _git(["init", "-q", str(root)], cwd=root)
+    _git(["config", "user.email", "test@example.com"], cwd=root)
+    _git(["config", "user.name", "Test"], cwd=root)
+    return root
+
+
+def _commit_all(root, message):
+    _git(["add", "-A"], cwd=root)
+    _git(["commit", "-q", "-m", message], cwd=root)
+
+
+TOPIC_L1_L2 = (
+    "---\n"
+    "type: topic\n"
+    "id: TOP-1\n"
+    "title: Test topic\n"
+    "area: memory\n"
+    "current: L2\n"
+    "tags: []\n"
+    "links:\n"
+    "  - link: L2\n"
+    "    date: '2024-01-02'\n"
+    "    status: active\n"
+    "    kind: adopted\n"
+    "    ruling:\n"
+    "      text: \"second ruling\"\n"
+    "      authority: agent-inference\n"
+    "  - link: L1\n"
+    "    date: '2024-01-01'\n"
+    "    status: historical\n"
+    "    kind: adopted\n"
+    "    ruling:\n"
+    "      text: \"first ruling\"\n"
+    "      authority: agent-inference\n"
+    "---\n\nBody.\n"
+)
+
+
+def _run_memlint(args):
+    """memlint.main([...]) is a pure function of argv (no subprocess) --
+    this just captures stdout so the caller can assert on the printed
+    ERROR:/summary lines without a subprocess round trip."""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = memlint.main(args)
+    return rc, buf.getvalue()
+
+
+class TestMemlintAgainstRef(unittest.TestCase):
+    """Task A2-1: `memlint --against-ref REF [--staged] ROOT` -- append-only
+    history enforcement. Each test builds its own throwaway git store (never
+    the fixtures/ or the engine's own store)."""
+
+    def _store_with_base_text(self, td, text):
+        root = _git_store(td)
+        (root / "topics").mkdir()
+        (root / "topics" / "foo.md").write_text(text)
+        _commit_all(root, "base")
+        return root
+
+    def _base_store(self, td):
+        return self._store_with_base_text(td, TOPIC_L1_L2)
+
+    def test_a_prepend_new_link_is_clean(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            text = TOPIC_L1_L2.replace(
+                "current: L2\n",
+                "current: L3\n",
+            ).replace(
+                "links:\n",
+                "links:\n"
+                "  - link: L3\n"
+                "    date: '2024-01-03'\n"
+                "    status: active\n"
+                "    kind: adopted\n"
+                "    ruling:\n"
+                "      text: \"third ruling\"\n"
+                "      authority: agent-inference\n",
+            )
+            (root / "topics" / "foo.md").write_text(text)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 0, out)
+
+    def test_b_edit_existing_ruling_text_is_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            text = TOPIC_L1_L2.replace("first ruling", "EDITED first ruling")
+            (root / "topics" / "foo.md").write_text(text)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("foo.md", out)
+            self.assertIn("L1", out)
+            self.assertIn("changed after being recorded", out)
+
+    def test_c_forward_status_change_with_superseded_by_is_clean(self):
+        """Ruling 142 (TOP-0122 L3): status may move active/provisional ->
+        superseded/historical/declined, once, and superseded_by may be
+        ADDED in that same move -- this is the honest way to mark a link
+        superseded, not an append-only violation."""
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            text = TOPIC_L1_L2.replace(
+                "    status: active\n    kind: adopted\n    ruling:\n      text: \"second ruling\"",
+                "    status: superseded\n    superseded_by: L1\n    kind: adopted\n    ruling:\n      text: \"second ruling\"",
+            )
+            self.assertNotEqual(text, TOPIC_L1_L2, "fixture edit must actually change the text")
+            (root / "topics" / "foo.md").write_text(text)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 0, out)
+
+    def test_c_terminal_status_reverting_to_active_is_error(self):
+        """Ruling 142: never back to active/provisional."""
+        with tempfile.TemporaryDirectory() as td:
+            base = TOPIC_L1_L2.replace(
+                "    status: active\n    kind: adopted\n    ruling:\n      text: \"second ruling\"",
+                "    status: superseded\n    kind: adopted\n    ruling:\n      text: \"second ruling\"",
+            )
+            root = self._store_with_base_text(td, base)
+            text = base.replace(
+                "    status: superseded\n    kind: adopted\n    ruling:\n      text: \"second ruling\"",
+                "    status: active\n    kind: adopted\n    ruling:\n      text: \"second ruling\"",
+            )
+            (root / "topics" / "foo.md").write_text(text)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("L2", out)
+            self.assertIn("status", out)
+
+    def test_c_between_terminal_statuses_is_error(self):
+        """Ruling 142: never between the three terminal values. L1 is
+        already `status: historical` in the fixture -- move it sideways
+        to `declined`."""
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            text = TOPIC_L1_L2.replace(
+                "    status: historical\n    kind: adopted\n    ruling:\n      text: \"first ruling\"",
+                "    status: declined\n    kind: adopted\n    ruling:\n      text: \"first ruling\"",
+            )
+            (root / "topics" / "foo.md").write_text(text)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("L1", out)
+            self.assertIn("status", out)
+
+    def test_c_provisional_promoted_to_active_in_place_is_error(self):
+        """Ruling 142 / docs/SCHEMA.md section 5: promotion is a NEW link
+        (owner-ratified/owner-verbatim), never an edit of the provisional
+        link's own status to active -- verified against section 5's own
+        text (see the coordinator response for the exact quote)."""
+        with tempfile.TemporaryDirectory() as td:
+            base = TOPIC_L1_L2.replace(
+                "    status: active\n    kind: adopted\n    ruling:\n      text: \"second ruling\"",
+                "    status: provisional\n    kind: adopted\n    ruling:\n      text: \"second ruling\"",
+            )
+            root = self._store_with_base_text(td, base)
+            text = base.replace(
+                "    status: provisional\n    kind: adopted\n    ruling:\n      text: \"second ruling\"",
+                "    status: active\n    kind: adopted\n    ruling:\n      text: \"second ruling\"",
+            )
+            (root / "topics" / "foo.md").write_text(text)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("L2", out)
+            self.assertIn("status", out)
+
+    def test_c_superseded_by_changed_after_being_set_is_error(self):
+        """Ruling 142: superseded_by is immutable once set."""
+        with tempfile.TemporaryDirectory() as td:
+            base = TOPIC_L1_L2.replace(
+                "    status: active\n    kind: adopted\n    ruling:\n      text: \"second ruling\"",
+                "    status: superseded\n    superseded_by: L1\n    kind: adopted\n    ruling:\n      text: \"second ruling\"",
+            )
+            root = self._store_with_base_text(td, base)
+            text = base.replace("superseded_by: L1", "superseded_by: L9")
+            (root / "topics" / "foo.md").write_text(text)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("L2", out)
+            self.assertIn("superseded_by", out)
+
+    def test_c_promoted_by_added_the_schema_way_is_clean(self):
+        """Ruling 143 (TOP-0122 L1, task A2-2): `promoted_by` is a third
+        forward-once field -- SCHEMA sec5 step 3's literal procedure adds
+        it to the OLD (agent-inference/provisional) link when a NEW
+        owner-ratified link promotes it. Adding it alone (no other field
+        on L1 touched) must be clean, same as a superseded_by add."""
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            text = TOPIC_L1_L2.replace(
+                "    status: historical\n    kind: adopted\n    ruling:\n      text: \"first ruling\"",
+                "    status: historical\n    promoted_by: L2\n    kind: adopted\n    ruling:\n      text: \"first ruling\"",
+            )
+            self.assertNotEqual(text, TOPIC_L1_L2, "fixture edit must actually change the text")
+            (root / "topics" / "foo.md").write_text(text)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 0, out)
+
+    def test_c_promoted_by_changed_after_being_set_is_error(self):
+        """Ruling 143: promoted_by is immutable once set, exactly like
+        superseded_by."""
+        with tempfile.TemporaryDirectory() as td:
+            base = TOPIC_L1_L2.replace(
+                "    status: historical\n    kind: adopted\n    ruling:\n      text: \"first ruling\"",
+                "    status: historical\n    promoted_by: L2\n    kind: adopted\n    ruling:\n      text: \"first ruling\"",
+            )
+            root = self._store_with_base_text(td, base)
+            text = base.replace("promoted_by: L2", "promoted_by: L9")
+            (root / "topics" / "foo.md").write_text(text)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("L1", out)
+            self.assertIn("promoted_by", out)
+
+    def test_c_status_change_plus_body_edit_is_error(self):
+        """Ruling 142: a lifecycle move must be the ONLY change on a
+        recorded link -- combined with a body edit, both the body field
+        and the status field get their own error message."""
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            text = TOPIC_L1_L2.replace(
+                "    status: active\n    kind: adopted\n    ruling:\n      text: \"second ruling\"",
+                "    status: superseded\n    superseded_by: L1\n    kind: adopted\n    ruling:\n      text: \"EDITED second ruling\"",
+            )
+            (root / "topics" / "foo.md").write_text(text)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("L2", out)
+            self.assertIn("ruling", out)
+            self.assertIn("status", out)
+
+    def test_d_delete_a_link_is_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            # Drop the whole L1 entry, keep L2 and the rest of the shape valid.
+            lines = TOPIC_L1_L2.splitlines(keepends=True)
+            start = next(i for i, l in enumerate(lines) if l.strip() == "- link: L1")
+            end = next(
+                i for i in range(start + 1, len(lines))
+                if lines[i].strip() == "---"
+            )
+            text = "".join(lines[:start] + lines[end:])
+            (root / "topics" / "foo.md").write_text(text)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("L1", out)
+            self.assertIn("removed after being recorded", out)
+
+    def test_e_delete_topic_file_is_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            (root / "topics" / "foo.md").unlink()
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("foo.md", out)
+            self.assertIn("deleted or renamed", out)
+
+    def test_f_rename_topic_file_is_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            (root / "topics" / "foo.md").rename(root / "topics" / "bar.md")
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("foo.md", out)
+            self.assertIn("deleted or renamed", out)
+
+    def test_g_free_fields_stay_clean(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            text = (
+                TOPIC_L1_L2
+                .replace("title: Test topic", "title: Renamed title")
+                .replace("tags: []", "tags: [a, b]")
+                .replace("area: memory\n", "area: memory\ncode_refs:\n  - src/x.py\n")
+                .replace("Body.\n", "New body text entirely.\n")
+            )
+            (root / "topics" / "foo.md").write_text(text)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 0, out)
+
+    def test_h_staged_judges_the_index_not_the_working_tree(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            bad_text = TOPIC_L1_L2.replace("first ruling", "EDITED first ruling")
+            (root / "topics" / "foo.md").write_text(bad_text)
+            _git(["add", "-A"], cwd=root)
+            # Working tree now reverts back to the ORIGINAL (unstaged) --
+            # the index still carries the bad edit.
+            (root / "topics" / "foo.md").write_text(TOPIC_L1_L2)
+
+            rc_worktree, out_worktree = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc_worktree, 0, out_worktree)
+
+            rc_staged, out_staged = _run_memlint(["--against-ref", "HEAD", "--staged", str(root)])
+            self.assertEqual(rc_staged, 1, out_staged)
+            self.assertIn("changed after being recorded", out_staged)
+
+    def test_i_not_a_git_repo_exits_2(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "topics").mkdir()
+            (root / "topics" / "foo.md").write_text(TOPIC_L1_L2)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 2, out)
+
+    def test_i_unknown_ref_exits_2(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            rc, out = _run_memlint(["--against-ref", "not-a-real-ref-xyz", str(root)])
+            self.assertEqual(rc, 2, out)
+
+    def test_i_against_ref_with_no_ref_exits_2(self):
+        """A2-1 review finding L1: `--against-ref` at the end of argv (no
+        REF token follows) used to leave `against_ref` None and fall
+        through to the ORDINARY schema-lint mode instead of refusing --
+        `memlint.py ROOT --against-ref` exited 0 printing `memlint: clean`,
+        never mentioning the missing REF. Now exits 2 with a usage
+        message, same as every other malformed invocation."""
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = memlint.main([str(root), "--against-ref"])
+            self.assertEqual(rc, 2, buf_out.getvalue() + buf_err.getvalue())
+            self.assertIn("--against-ref", buf_err.getvalue())
+            self.assertIn("usage:", buf_err.getvalue())
+            self.assertNotIn("memlint: clean", buf_out.getvalue())
+
+    def test_j_malformed_frontmatter_old_side_is_diagnostic_not_traceback(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = _git_store(td)
+            (root / "topics").mkdir()
+            # Canonical-shaped (has links:) but an unterminated flow
+            # collection -- the audit's own classic malformed-YAML
+            # reproducer.
+            (root / "topics" / "bad.md").write_text(
+                "---\ntype: topic\nid: TOP-2\nlinks: [\n---\nBody.\n"
+            )
+            _commit_all(root, "base (malformed)")
+            (root / "topics" / "bad.md").write_text(
+                "---\ntype: topic\nid: TOP-2\nlinks: [\ntitle: changed\n---\nBody.\n"
+            )
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("bad.md", out)
+
+    def test_j_malformed_frontmatter_new_side_is_diagnostic_not_traceback(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            (root / "topics" / "foo.md").write_text(
+                "---\ntype: topic\nid: TOP-1\nlinks: [\n---\nBody.\n"
+            )
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("foo.md", out)
+
+    def test_k_dash_prefixed_ref_is_rejected_not_swallowed_as_ref(self):
+        """Grok M8: `--against-ref --staged HEAD` used to hand git the
+        literal ref '--staged' (a GitError), silently discarding the real
+        --staged flag that followed. The dash-shaped token must never be
+        consumed as REF."""
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = memlint.main(["--against-ref", "--staged", "HEAD", str(root)])
+            self.assertEqual(rc, 2, buf_out.getvalue() + buf_err.getvalue())
+            self.assertIn("--against-ref", buf_err.getvalue())
+            self.assertNotIn("memlint: clean", buf_out.getvalue())
+
+    def test_k_code_root_rejected_under_against_ref(self):
+        """NIT-3 (whole-branch-review): --code-root used to be silently
+        ignored under --against-ref (accepted, ran only the append-only
+        pass, rc=0) -- now rejected with a message naming the conflict."""
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            code_root = Path(td) / "code"; code_root.mkdir()
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = memlint.main(
+                    ["--against-ref", "HEAD", str(root), "--code-root", str(code_root)]
+                )
+            self.assertEqual(rc, 2, buf_out.getvalue() + buf_err.getvalue())
+            self.assertIn("--code-root", buf_err.getvalue())
+            self.assertIn("--against-ref", buf_err.getvalue())
+
+    def test_l_duplicate_link_id_on_old_side_is_refused_naming_the_id(self):
+        """Codex 2 (BLOCKING): a duplicate link id must refuse comparison
+        (naming the id, rc 1) rather than silently comparing whichever
+        occurrence a dict comprehension happens to keep."""
+        dup_base = (
+            "---\ntype: topic\nid: TOP-1\ntitle: T\nlinks:\n"
+            '  - link: L2\n    date: "2024-01-01"\n    status: active\n'
+            '    ruling: {text: "first", authority: agent-inference}\n'
+            '  - link: L2\n    date: "2024-01-02"\n    status: active\n'
+            '    ruling: {text: "second", authority: owner-verbatim, source: s}\n'
+            "---\n\nBody.\n"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = self._store_with_base_text(td, dup_base)
+            (root / "topics" / "foo.md").write_text(dup_base.replace("Body.", "Body edited."))
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("duplicate link id 'L2'", out)
+
+    def test_l_duplicate_link_id_on_new_side_is_refused_naming_the_id(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)  # TOP_L1_L2, clean ids L1/L2
+            dup_text = TOPIC_L1_L2.replace("link: L1", "link: L2", 1)
+            (root / "topics" / "foo.md").write_text(dup_text)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("duplicate link id 'L2'", out)
+
+    def test_m_investigation_record_repair_is_not_blocked_at_all(self):
+        """Grok M2 / whole-branch-review MODERATE-1, the real repro: a
+        partner store's own commit that fixed an unquoted colon in a
+        `type: investigation` record's title (no links at all -- there is no
+        recorded link history for append-only to protect). _is_topic_like
+        now recognizes the recovered `type: investigation` and treats it
+        as out of scope for this mechanism entirely -- not even a note,
+        since there was never anything here to repair FROM this
+        mechanism's point of view."""
+        with tempfile.TemporaryDirectory() as td:
+            root = _git_store(td)
+            (root / "investigations").mkdir()
+            (root / "investigations" / "gate.md").write_text(
+                "---\ntitle: broken: colon\ntype: investigation\nid: INV-9300\n---\nBody.\n"
+            )
+            _commit_all(root, "base (malformed title, unquoted colon)")
+            (root / "investigations" / "gate.md").write_text(
+                "---\ntitle: 'fixed: colon'\ntype: investigation\nid: INV-9300\n---\nBody.\n"
+            )
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 0, out)
+            self.assertNotIn("ERROR:", out)
+
+    def test_m_repair_of_a_broken_topic_that_now_parses_is_a_note_not_an_error(self):
+        """The topic-kind analogue: a genuinely topic-shaped record (kind
+        recovers as "topic" via the lenient fallback, same shape test_j
+        already uses) that never parsed at REF IS topic-relevant, so the
+        repair path actually runs -- a note, never an error, once the new
+        blob parses cleanly."""
+        with tempfile.TemporaryDirectory() as td:
+            root = _git_store(td)
+            (root / "topics").mkdir()
+            (root / "topics" / "bad.md").write_text(
+                "---\ntype: topic\nid: TOP-9301\nlinks: [\n---\nBody.\n"
+            )
+            _commit_all(root, "base (malformed)")
+            (root / "topics" / "bad.md").write_text(
+                "---\ntype: topic\nid: TOP-9301\ntitle: Fixed\nlinks: []\n---\nBody.\n"
+            )
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 0, out)
+            self.assertIn("NOTE:", out)
+            self.assertIn("repaired", out)
+            self.assertNotIn("ERROR:", out)
+
+    def test_m_deleted_record_with_nothing_recoverable_is_reported_as_record_not_topic(self):
+        """Grok N11: when NOTHING at all could be recovered from the old
+        side (an unterminated frontmatter block -- frontmatter stays `{}`,
+        unlike the lenient-fallback cases above, which always recover
+        type/id scalars), the conservative default still treats it as
+        protected (a genuinely corrupted topic must never go silently
+        unprotected), but the message must not claim it was specifically a
+        "topic" when the real kind could not be determined -- "record" is
+        the honest generic label."""
+        with tempfile.TemporaryDirectory() as td:
+            root = _git_store(td)
+            (root / "concepts").mkdir()
+            (root / "concepts" / "c.md").write_text(
+                "---\ntype: concept\nid: CON-9302\ntitle: Something\n"
+                # No closing "---" at all -- parse_record_text's
+                # unterminated-block branch, which never populates fm.
+            )
+            _commit_all(root, "base (malformed concept, no closing ---)")
+            (root / "concepts" / "c.md").unlink()
+            _commit_all(root, "delete it")
+            rc, out = _run_memlint(["--against-ref", "HEAD~1", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("record file deleted", out)
+            self.assertNotIn("topic file deleted", out)
+
+    # -- Grok re-gate MAJOR 1: a shape error unrelated to links (or a
+    # duplicate link id) still leaves `links` fully populated in the
+    # recovered frontmatter -- the repair/skip path must not be taken
+    # just because `old_result.valid` is False; it must be taken only
+    # when NO links were actually recovered.
+
+    def test_n_shape_error_recovers_links_and_still_freezes_them(self):
+        """(a): REF has a shape error on an UNRELATED field (`tags:
+        not-a-list`) plus a clean L1 link -- links WERE recovered, so this
+        is not a free repair. Fixing `tags` AND rewriting L1's recorded
+        ruling text in the same commit must still be refused."""
+        with tempfile.TemporaryDirectory() as td:
+            base = (
+                "---\ntype: topic\nid: TOP-9401\ntitle: T\ntags: not-a-list\nlinks:\n"
+                '  - link: L1\n    status: active\n'
+                '    ruling: {text: "first", authority: agent-inference}\n'
+                "---\n\nBody.\n"
+            )
+            root = self._store_with_base_text(td, base)
+            fixed = base.replace("tags: not-a-list", "tags: []").replace(
+                '{text: "first", authority: agent-inference}',
+                '{text: "EDITED first", authority: agent-inference}',
+            )
+            (root / "topics" / "foo.md").write_text(fixed)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("L1", out)
+            self.assertIn("changed after being recorded", out)
+
+    def test_n_shape_error_recovers_links_clean_field_fix_is_ok(self):
+        """(b): same REF as (a), but the new blob fixes ONLY `tags` --
+        L1's recorded body is untouched, so this must be clean."""
+        with tempfile.TemporaryDirectory() as td:
+            base = (
+                "---\ntype: topic\nid: TOP-9401\ntitle: T\ntags: not-a-list\nlinks:\n"
+                '  - link: L1\n    status: active\n'
+                '    ruling: {text: "first", authority: agent-inference}\n'
+                "---\n\nBody.\n"
+            )
+            root = self._store_with_base_text(td, base)
+            fixed = base.replace("tags: not-a-list", "tags: []")
+            (root / "topics" / "foo.md").write_text(fixed)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 0, out)
+
+    def test_n_duplicate_id_on_ref_recovers_first_occurrence_as_history(self):
+        """(c): REF has two links both `link: L1` -- the FIRST occurrence
+        in file order is the recorded history (the same first-wins
+        reading memidx.validate_record_shape's own duplicate-count
+        diagnostic is built from). Deduping to that first body is clean;
+        landing on the second body is an append-only violation."""
+        with tempfile.TemporaryDirectory() as td:
+            dup_base = (
+                "---\ntype: topic\nid: TOP-9402\ntitle: T\nlinks:\n"
+                '  - link: L1\n    status: active\n'
+                '    ruling: {text: "first", authority: agent-inference}\n'
+                '  - link: L1\n    status: active\n'
+                '    ruling: {text: "second", authority: owner-verbatim, source: s}\n'
+                "---\n\nBody.\n"
+            )
+            root = self._store_with_base_text(td, dup_base)
+            clean_first = (
+                "---\ntype: topic\nid: TOP-9402\ntitle: T\nlinks:\n"
+                '  - link: L1\n    status: active\n'
+                '    ruling: {text: "first", authority: agent-inference}\n'
+                "---\n\nBody.\n"
+            )
+            (root / "topics" / "foo.md").write_text(clean_first)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 0, out)
+
+            clean_second = (
+                "---\ntype: topic\nid: TOP-9402\ntitle: T\nlinks:\n"
+                '  - link: L1\n    status: active\n'
+                '    ruling: {text: "second", authority: owner-verbatim, source: s}\n'
+                "---\n\nBody.\n"
+            )
+            (root / "topics" / "foo.md").write_text(clean_second)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("L1", out)
+            self.assertIn("changed after being recorded", out)
+
+
+class TestQuestionMarkRuleScope(unittest.TestCase):
+    """Ruling 149 / whole-branch-review MODERATE-2: the question-mark rule
+    applies only to links whose status is active or provisional -- a
+    superseded question is history, and append-only forbids rewriting it
+    (so the rule could never be cleared by superseding); the trim set
+    gained `)]}` so a trailing bracket never hides a real question."""
+
+    def _topic(self, status: str, text: str) -> str:
+        return (
+            "---\ntype: topic\nid: TOP-9400\ntitle: T\nlinks:\n"
+            f"  - link: L1\n    status: {status}\n    kind: adopted\n"
+            f'    ruling: {{text: "{text}", authority: owner-verbatim, source: s}}\n'
+            + ("    superseded_by: L2\n" if status == "superseded" else "")
+            + ("  - link: L2\n    status: active\n    kind: adopted\n"
+               '    ruling: {text: "a real ruling", authority: owner-verbatim, source: s}\n'
+               if status == "superseded" else "")
+            + "---\n\nBody.\n"
+        )
+
+    def _lint(self, text):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _write(root / "topics" / "t.md", text)
+            return memlint.lint_root(root)
+
+    def test_active_question_mark_is_an_error(self):
+        errors, _ = self._lint(self._topic("active", "should we do X?"))
+        self.assertTrue(any("question, not a ruling" in e for e in errors), errors)
+
+    def test_provisional_question_mark_is_an_error(self):
+        errors, _ = self._lint(self._topic("provisional", "should we do X?"))
+        self.assertTrue(any("question, not a ruling" in e for e in errors), errors)
+
+    def test_superseded_question_mark_is_clean(self):
+        """A superseded link is history -- flagging it can never be
+        cleared (append-only forbids rewriting a superseded link's own
+        body), so the rule must not fire on it at all."""
+        errors, _ = self._lint(self._topic("superseded", "should we do X instead?"))
+        self.assertFalse(any("question, not a ruling" in e for e in errors), errors)
+
+    def test_trailing_bracket_after_question_mark_is_still_caught(self):
+        errors, _ = self._lint(self._topic("active", "does this affect decisionmaking?)"))
+        self.assertTrue(any("question, not a ruling" in e for e in errors), errors)
+
+
+def _marker_topic(tid: str, code_refs: list, link_yaml: str, area: str = "memory") -> str:
+    """A minimal topic record for marker-verification tests: one topic id,
+    a code_refs list (any mix of forms), and caller-supplied link YAML
+    (already indented as `links:` entries)."""
+    refs_block = "".join(f"  - {r}\n" for r in code_refs)
+    code_refs_yaml = f"code_refs:\n{refs_block}" if code_refs else ""
+    return (
+        "---\n"
+        "type: topic\n"
+        f"id: {tid}\n"
+        f"title: Fixture -- {tid}\n"
+        f"area: {area}\n"
+        f"{code_refs_yaml}"
+        "links:\n"
+        f"{link_yaml}"
+        "---\n\nBody.\n"
+    )
+
+
+_CONSTRAINT_LINK_L1 = (
+    "  - link: L1\n"
+    "    date: '2026-01-01'\n"
+    "    status: active\n"
+    "    kind: adopted\n"
+    "    ruling:\n"
+    '      text: "the constraint"\n'
+    "      authority: owner-verbatim\n"
+    '      source: "s"\n'
+)
+
+_CONTEXT_LINK_L1 = (
+    "  - link: L1\n"
+    "    date: '2026-01-01'\n"
+    "    status: active\n"
+    "    kind: adopted\n"
+    "    ruling:\n"
+    '      text: "an inference, no evidence"\n'
+    "      authority: agent-inference\n"
+)
+
+
+class TestMemlintDecisionMarkers(unittest.TestCase):
+    """Task A2-2 (TOP-0122 L1 rule 2b): `decision: TOP-xxxx Ln` comments
+    verified both ways. Each test builds its own throwaway store + code
+    tree (never fixtures/ or the engine's own store)."""
+
+    def _lint(self, topic_files: dict, code_files: dict, code_roots=None):
+        with tempfile.TemporaryDirectory() as td_str:
+            td = Path(td_str)
+            root = td / "store"
+            (root / "topics").mkdir(parents=True)
+            for name, text in topic_files.items():
+                (root / "topics" / name).write_text(text)
+            code_root = td / "code"
+            code_root.mkdir()
+            for rel, text in code_files.items():
+                p = code_root / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(text)
+            roots = code_roots if code_roots is not None else [code_root]
+            return memlint.lint_root(root, code_roots=roots)
+
+    # (a) constraint link, marker present and matching -> clean.
+    def test_a_marker_matching_a_constraint_link_is_clean(self):
+        topic = _marker_topic("TOP-0042", ["src/x.py#alpha"], _CONSTRAINT_LINK_L1)
+        code = {"src/x.py": "# decision: TOP-0042 L1\ndef alpha():\n    return 1\n"}
+        errors, warnings = self._lint({"t.md": topic}, code)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(warnings, [], warnings)
+
+    # (b) same, marker absent -> warning, no error.
+    def test_b_marker_absent_is_a_warning_not_an_error(self):
+        topic = _marker_topic("TOP-0042", ["src/x.py#alpha"], _CONSTRAINT_LINK_L1)
+        code = {"src/x.py": "def alpha():\n    return 1\n"}
+        errors, warnings = self._lint({"t.md": topic}, code)
+        self.assertEqual(errors, [], errors)
+        self.assertTrue(
+            any("no marker at src/x.py#alpha" in w for w in warnings), warnings
+        )
+
+    # (c) marker pointing at a non-existent link -> error.
+    def test_c_marker_at_nonexistent_link_is_error(self):
+        topic = _marker_topic("TOP-0042", ["src/x.py#alpha"], _CONSTRAINT_LINK_L1)
+        code = {"src/x.py": "# decision: TOP-0042 L99\ndef alpha():\n    return 1\n"}
+        errors, _warnings = self._lint({"t.md": topic}, code)
+        self.assertTrue(
+            any("TOP-0042" in e and "L99" in e and "no such link" in e for e in errors), errors
+        )
+
+    # (c) marker pointing at a CONTEXT-only link -> error.
+    def test_c_marker_at_context_only_link_is_error(self):
+        topic = _marker_topic("TOP-0042", ["src/x.py#alpha"], _CONTEXT_LINK_L1)
+        code = {"src/x.py": "# decision: TOP-0042 L1\ndef alpha():\n    return 1\n"}
+        errors, _warnings = self._lint({"t.md": topic}, code)
+        self.assertTrue(
+            any("TOP-0042" in e and "L1" in e and "CONTEXT" in e for e in errors), errors
+        )
+
+    # (c) marker pointing at a topic whose code_refs do not name the file -> error.
+    def test_c_marker_at_topic_whose_code_refs_do_not_name_the_file_is_error(self):
+        topic_a = _marker_topic("TOP-0042", ["src/x.py#alpha"], _CONSTRAINT_LINK_L1)
+        topic_b = _marker_topic("TOP-0043", ["other/file.py"], _CONSTRAINT_LINK_L1)
+        code = {"src/x.py": "# decision: TOP-0043 L1\ndef alpha():\n    return 1\n"}
+        errors, _warnings = self._lint({"a.md": topic_a, "b.md": topic_b}, code)
+        self.assertTrue(
+            any(
+                "TOP-0043" in e and "L1" in e and "code_refs do not name" in e
+                for e in errors
+            ),
+            errors,
+        )
+
+    # (d) a marker at a symbol under a glob-only ref -> error naming globs.
+    def test_d_marker_under_glob_only_ref_is_error_naming_globs(self):
+        topic = _marker_topic("TOP-0044", ["src/*.py"], _CONSTRAINT_LINK_L1)
+        code = {"src/x.py": "# decision: TOP-0044 L1\ndef alpha():\n    return 1\n"}
+        errors, _warnings = self._lint({"t.md": topic}, code)
+        hit = [e for e in errors if "TOP-0044" in e and "L1" in e]
+        self.assertTrue(hit, errors)
+        self.assertIn("never marker-verified", hit[0])
+
+    # (e) a dangling path#symbol -> error.
+    def test_e_dangling_path_symbol_is_error(self):
+        topic = _marker_topic("TOP-0045", ["src/x.py#missing_symbol"], _CONSTRAINT_LINK_L1)
+        code = {"src/x.py": "def alpha():\n    return 1\n"}
+        errors, _warnings = self._lint({"t.md": topic}, code)
+        self.assertTrue(
+            any(
+                "TOP-0045" in e and "L1" in e and "dangling" in e and "missing_symbol" in e
+                for e in errors
+            ),
+            errors,
+        )
+
+    # (f) a language without a chunker -> warning, no traceback.
+    def test_f_language_without_a_chunker_is_warning_not_traceback(self):
+        """Round 2b (Grok re-gate NIT 4): this file both CARRIES a marker
+        (direction 1) and is named by a path#symbol ref on an active
+        CONSTRAINT link (direction 2) -- both used to independently warn
+        about the same underlying fact (no chunker for .rb), printing it
+        twice. Exactly one "no chunker" line for this file now: direction
+        1's attribution warning suppresses direction 2's generic per-file
+        line in favor of naming this specific ref's own inability to
+        locate its symbol."""
+        topic = _marker_topic("TOP-0046", ["src/x.rb#thing"], _CONSTRAINT_LINK_L1)
+        code = {"src/x.rb": "# decision: TOP-0046 L1\ndef thing\nend\n"}
+        errors, warnings = self._lint({"t.md": topic}, code)
+        self.assertEqual(errors, [], errors)
+        no_chunker_warnings = [w for w in warnings if "no chunker for this file's language" in w and "x.rb" in w]
+        self.assertEqual(len(no_chunker_warnings), 1, warnings)
+
+    def test_g_no_chunker_marker_failing_store_checks_plus_path_symbol_ref_still_falls_back_to_generic(self):
+        """Round 2b (NIT 4) coverage gap: the marker in this no-chunker
+        file names a MISSING link, so direction 1 produces an ERROR, not
+        the attribution warning -- this file never enters
+        `chunkerless_pending`. Direction 2's own path#symbol ref into the
+        same file must still fall through to the ordinary generic
+        uncheckable-file warning; it has nothing more specific to defer
+        to."""
+        topic = _marker_topic("TOP-0049", ["src/x.rb#thing"], _CONSTRAINT_LINK_L1)
+        code = {"src/x.rb": "# decision: TOP-0049 L99\ndef thing\nend\n"}
+        errors, warnings = self._lint({"t.md": topic}, code)
+        self.assertEqual(len(errors), 1, errors)
+        self.assertTrue(
+            "TOP-0049" in errors[0] and "L99" in errors[0] and "no such link" in errors[0], errors
+        )
+        no_chunker_warnings = [w for w in warnings if "no chunker for this file's language" in w and "x.rb" in w]
+        self.assertEqual(len(no_chunker_warnings), 1, warnings)
+        self.assertIn("markers not checked", no_chunker_warnings[0])
+
+    # Fix round 2 R6: a no-chunker file with plain-path/glob-only code_refs
+    # and no marker at all must never warn -- the old blanket "markers not
+    # checked (no chunker for this file's language)" fired once per such
+    # file in scope regardless of whether it held a marker, which meant a
+    # real store with plain-path-only code_refs into bash/markdown/toml/
+    # json files (no markers used anywhere yet) carried a warning for every
+    # single one of them.
+
+    def test_g_no_chunker_file_named_by_a_plain_path_with_no_marker_is_clean(self):
+        topic = _marker_topic("TOP-0047", ["src/deploy.sh"], _CONSTRAINT_LINK_L1)
+        code = {"src/deploy.sh": "#!/usr/bin/env bash\necho hello\n"}
+        errors, warnings = self._lint({"t.md": topic}, code)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(warnings, [], warnings)
+
+    def test_g_no_chunker_file_with_a_valid_marker_gets_one_attribution_warning(self):
+        topic = _marker_topic("TOP-0047", ["src/deploy.sh"], _CONSTRAINT_LINK_L1)
+        code = {"src/deploy.sh": "#!/usr/bin/env bash\n# decision: TOP-0047 L1\necho hello\n"}
+        errors, warnings = self._lint({"t.md": topic}, code)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("cannot be attributed to a symbol", warnings[0])
+        self.assertIn("no chunker for this file's language", warnings[0])
+        self.assertIn("deploy.sh", warnings[0])
+
+    def test_g_no_chunker_file_with_a_marker_naming_a_missing_link_is_error(self):
+        topic = _marker_topic("TOP-0047", ["src/deploy.sh"], _CONSTRAINT_LINK_L1)
+        code = {"src/deploy.sh": "#!/usr/bin/env bash\n# decision: TOP-0047 L99\necho hello\n"}
+        errors, _warnings = self._lint({"t.md": topic}, code)
+        self.assertTrue(
+            any("TOP-0047" in e and "L99" in e and "no such link" in e for e in errors), errors
+        )
+
+    def test_g_path_symbol_ref_into_a_no_chunker_file_keeps_its_own_warning(self):
+        """direction 2 (store -> code) is unaffected by this fix: a
+        CONSTRAINT/HOLD link's own path#symbol ref still cannot locate its
+        symbol without a chunker, and still warns -- even with no marker
+        anywhere in the file (direction 1 stays silent here, per the test
+        above)."""
+        topic = _marker_topic("TOP-0048", ["src/deploy.sh#main"], _CONSTRAINT_LINK_L1)
+        code = {"src/deploy.sh": "#!/usr/bin/env bash\necho hello\n"}
+        errors, warnings = self._lint({"t.md": topic}, code)
+        self.assertEqual(errors, [], errors)
+        self.assertTrue(
+            any(
+                "markers not checked" in w
+                and "no chunker for this file's language" in w
+                and "deploy.sh" in w
+                for w in warnings
+            ),
+            warnings,
+        )
+
+    def test_codex13_scan_never_opens_an_unreferenced_file(self):
+        """Codex 13: the marker scan must open only files at least one
+        topic's code_refs names -- a probe observed an unrelated file
+        being opened (for its binary-file check) purely because it sat
+        in the code root, never because anything referenced it."""
+        topic = _marker_topic("TOP-0066", ["src/x.py#alpha"], _CONSTRAINT_LINK_L1)
+        code = {
+            "src/x.py": "# decision: TOP-0066 L1\ndef alpha():\n    return 1\n",
+            "src/not-referenced.txt": "nothing to see here\n",
+        }
+        checked = []
+        original = memlint.is_binary_file
+
+        def spy(path):
+            checked.append(str(path))
+            return original(path)
+
+        with mock.patch.object(memlint, "is_binary_file", side_effect=spy):
+            errors, _warnings = self._lint({"t.md": topic}, code)
+        self.assertEqual(errors, [], errors)
+        self.assertTrue(any(p.endswith("x.py") for p in checked), checked)
+        self.assertFalse(any("not-referenced.txt" in p for p in checked), checked)
+
+    def test_macos_duplicate_warning_is_keyed_by_physical_path(self):
+        """The macOS duplicate warning (whole-branch-review, reproduced on
+        CI, test_mem3...): a code root reached through a symlink (macOS's
+        own /var -> /private/var, reproduced here with an explicit
+        symlink) must never turn ONE physical file's own no-chunker
+        warning into two -- direction 1's held-back attribution warning
+        and direction 2's own dedup bookkeeping (round 2b, NIT 4:
+        `chunkerless_pending`/`chunkerless_covered`, same shared-
+        `warned_uncheckable`-style keying) must key on the SAME (physical,
+        .resolve()'d) path, whichever spelling of the root each happened
+        to walk through."""
+        with tempfile.TemporaryDirectory() as td_str:
+            td = Path(td_str)
+            store = td / "store"
+            (store / "topics").mkdir(parents=True)
+            topic = _marker_topic("TOP-0065", ["src/x.rb#thing"], _CONSTRAINT_LINK_L1)
+            (store / "topics" / "t.md").write_text(topic)
+            real_code = td / "real_code"
+            (real_code / "src").mkdir(parents=True)
+            (real_code / "src" / "x.rb").write_text("# decision: TOP-0065 L1\ndef thing\nend\n")
+            link_code = td / "link_code"
+            link_code.symlink_to(real_code, target_is_directory=True)
+            errors, warnings = memlint.lint_root(store, code_roots=[link_code])
+            self.assertEqual(errors, [], errors)
+            hits = [w for w in warnings if "no chunker for this file's language" in w and "x.rb" in w]
+            self.assertEqual(len(hits), 1, warnings)
+
+    # Mem-3 (task-a2-2-review.md): the marker-scan "markers not checked"
+    # warning must carry the SAME remedy lint_concept's identical wheel-
+    # absent failure already gives (backend-preflight) -- the marker path
+    # used to compute and then discard it.
+    def test_mem3_marker_uncheckable_warning_carries_remedy(self):
+        topic = _marker_topic("TOP-0054", ["widget.js#widget_loader"], _CONSTRAINT_LINK_L1)
+        code = {"widget.js": "function widget_loader() {\n  return 1;\n}\n"}
+        chunkers.treesitter.reset_cache()
+        try:
+            with mock.patch.dict(sys.modules, {"tree_sitter_javascript": None}):
+                errors, warnings = self._lint({"t.md": topic}, code)
+        finally:
+            chunkers.treesitter.reset_cache()
+        self.assertEqual(errors, [], errors)
+        named = [w for w in warnings if "widget.js" in w and "markers not checked" in w]
+        self.assertEqual(len(named), 1, warnings)
+        self.assertIn("tree_sitter_javascript", named[0])
+        self.assertIn("run backend-preflight", named[0])
+
+    # (g) two roots -- the ref resolved against the right one.
+    def test_g_two_roots_ref_resolved_against_the_right_one(self):
+        topic = _marker_topic("TOP-0047", ["thing.py#f"], _CONSTRAINT_LINK_L1)
+        with tempfile.TemporaryDirectory() as td_str:
+            td = Path(td_str)
+            root = td / "store"
+            (root / "topics").mkdir(parents=True)
+            (root / "topics" / "t.md").write_text(topic)
+            root_a = td / "root_a"
+            root_b = td / "root_b"
+            root_a.mkdir()
+            root_b.mkdir()
+            (root_b / "thing.py").write_text(
+                "# decision: TOP-0047 L1\ndef f():\n    return 1\n"
+            )
+            errors, warnings = memlint.lint_root(root, code_roots=[root_a, root_b])
+            self.assertEqual(errors, [], errors)
+            self.assertFalse(
+                any("TOP-0047" in w for w in warnings), warnings
+            )
+
+    # (h) three lines above the definition counts; four does not.
+    def test_h_marker_three_lines_above_counts(self):
+        topic = _marker_topic("TOP-0048", ["src/x.py#alpha"], _CONSTRAINT_LINK_L1)
+        code = {
+            "src/x.py": (
+                "# decision: TOP-0048 L1\n"
+                "# filler 1\n"
+                "# filler 2\n"
+                "def alpha():\n"
+                "    return 1\n"
+            )
+        }
+        errors, warnings = self._lint({"t.md": topic}, code)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(warnings, [], warnings)
+
+    def test_h_marker_four_lines_above_does_not_count(self):
+        topic = _marker_topic("TOP-0048", ["src/x.py#alpha"], _CONSTRAINT_LINK_L1)
+        code = {
+            "src/x.py": (
+                "# decision: TOP-0048 L1\n"
+                "# filler 1\n"
+                "# filler 2\n"
+                "# filler 3\n"
+                "def alpha():\n"
+                "    return 1\n"
+            )
+        }
+        errors, warnings = self._lint({"t.md": topic}, code)
+        self.assertEqual(errors, [], errors)
+        self.assertTrue(
+            any("no marker at src/x.py#alpha" in w for w in warnings), warnings
+        )
+
+    # Mem-5 (task-a2-2-review.md): a marker naming a TOPIC id that does not
+    # exist anywhere in the store at all (distinct from test_c's "topic
+    # exists, link does not").
+    def test_mem5_marker_at_nonexistent_topic_is_error(self):
+        topic = _marker_topic("TOP-0049", ["src/x.py#alpha"], _CONSTRAINT_LINK_L1)
+        code = {"src/x.py": "# decision: TOP-9999 L1\ndef alpha():\n    return 1\n"}
+        errors, _warnings = self._lint({"t.md": topic}, code)
+        self.assertTrue(
+            any("TOP-9999" in e and "no such topic" in e for e in errors), errors
+        )
+
+    # Mem-1 (task-a2-2-review.md): a topic's code_refs DOES carry a
+    # path#symbol ref for this file -- it just names a DIFFERENT symbol
+    # than the one the marker actually sits on. The old message denied any
+    # path#symbol ref existed at all (the glob/bare-path wording); the
+    # fixed one names the mismatch truthfully.
+    def test_mem1_marker_names_a_path_symbol_ref_for_the_wrong_symbol(self):
+        topic = _marker_topic("TOP-0050", ["src/x.py#beta"], _CONSTRAINT_LINK_L1)
+        code = {
+            "src/x.py": (
+                "def beta():\n"
+                "    return 2\n"
+                "# decision: TOP-0050 L1\n"
+                "def alpha():\n"
+                "    return 1\n"
+            )
+        }
+        errors, _warnings = self._lint({"t.md": topic}, code)
+        hit = [e for e in errors if "TOP-0050" in e and "L1" in e]
+        self.assertTrue(hit, errors)
+        self.assertIn("src/x.py#beta", hit[0])
+        self.assertIn("not src/x.py#alpha", hit[0])
+        self.assertNotIn("glob", hit[0])
+        self.assertNotIn("never marker-verified", hit[0])
+
+    # Mem-1, the container variant, corrected (Codex 8, fix wave 1 G2): a
+    # marker meant for a container (`class Foo:`) used to be attributed to
+    # a MEMBER starting within 3 lines below it (chunk_file never gives a
+    # container its own chunk), reported as a "wrong symbol" ERROR -- which
+    # conflicted with ruling 144's own container carve-out (direction 2,
+    # below, already treats this container ref as unverifiable-by-marker,
+    # a WARNING, never an error). Direction 1 must agree: `Foo` names no
+    # chunk anywhere in the file (only `method` does), and
+    # fragment_declaration_status confirms `Foo` really is declared (a
+    # container) -- so this ref is dropped from consideration entirely,
+    # never misattributed to `method`, and never invents the wrong fix
+    # (there is no member to point the code_ref at).
+    def test_mem1_marker_above_container_is_not_misattributed_to_nearby_member(self):
+        topic = _marker_topic("TOP-0051", ["src/x.py#Foo"], _CONSTRAINT_LINK_L1)
+        code = {
+            "src/x.py": (
+                "# decision: TOP-0051 L1\n"
+                "class Foo:\n"
+                "    def method(self):\n"
+                "        return 1\n"
+            )
+        }
+        errors, warnings = self._lint({"t.md": topic}, code)
+        self.assertEqual([e for e in errors if "TOP-0051" in e], [], errors)
+        self.assertTrue(
+            any(
+                "'Foo' is a container type" in w and "src/x.py" in w
+                for w in warnings
+            ),
+            warnings,
+        )
+
+    # Codex 8: two adjacent short declarations, each with its own marker
+    # (or none) -- a marker window must never cross into the PREVIOUS
+    # declaration's own line, even when the flat 3-lines-above count would
+    # otherwise reach it.
+    def test_codex8_marker_window_never_crosses_into_the_previous_declaration(self):
+        topic_alpha = _marker_topic("TOP-0060", ["src/x.py#alpha"], _CONSTRAINT_LINK_L1)
+        topic_beta = _marker_topic("TOP-0061", ["src/x.py#beta"], _CONSTRAINT_LINK_L1)
+        code = {
+            "src/x.py": (
+                "# decision: TOP-0060 L1\n"
+                "def alpha():\n"
+                "    pass\n"
+                "def beta():\n"
+                "    pass\n"
+            )
+        }
+        errors, warnings = self._lint({"a.md": topic_alpha, "b.md": topic_beta}, code)
+        # alpha's own marker (one line above it) matches cleanly.
+        self.assertEqual([e for e in errors if "TOP-0060" in e], [], errors)
+        # beta's window must never reach alpha's marker three lines up --
+        # beta gets the plain "no marker yet" warning, never a false
+        # match on alpha's TOP-0060.
+        self.assertEqual([e for e in errors if "TOP-0061" in e], [], errors)
+        self.assertTrue(
+            any("TOP-0061" in w and "no marker at src/x.py#beta" in w for w in warnings),
+            warnings,
+        )
+
+    # Codex 7: every marker in the window is examined, not just the first
+    # (nearest) one found -- a valid marker (on the definition line) must
+    # not shadow a bogus one sitting farther up, or vice versa.
+    def test_codex7_valid_marker_followed_by_a_bogus_one_errors_on_the_bogus_one(self):
+        # Valid marker FARTHEST (topmost), bogus one NEAREST gamma's own
+        # definition line: the old single-match scan (forward, farthest
+        # match wins) found only the valid one and stopped, so the bogus
+        # marker's error went entirely unreported.
+        topic = _marker_topic("TOP-0062", ["src/x.py#gamma"], _CONSTRAINT_LINK_L1)
+        code = {
+            "src/x.py": (
+                "# decision: TOP-0062 L1\n"  # valid: matches gamma below, farthest
+                "# decision: TOP-9997 L1\n"  # bogus: no such topic, nearest
+                "def gamma():\n"
+                "    return 3\n"
+            )
+        }
+        errors, _warnings = self._lint({"t.md": topic}, code)
+        self.assertEqual([e for e in errors if "TOP-0062" in e], [], errors)
+        self.assertTrue(
+            any("TOP-9997" in e and "no such topic" in e for e in errors), errors
+        )
+
+    # Codex 7: two valid markers in one window each satisfy their own
+    # topic -- a member constrained by two independent rules at once.
+    def test_codex7_two_valid_markers_each_satisfy_their_own_topic(self):
+        topic_a = _marker_topic("TOP-0063", ["src/x.py#delta"], _CONSTRAINT_LINK_L1)
+        topic_b = _marker_topic("TOP-0064", ["src/x.py#delta"], _CONSTRAINT_LINK_L1)
+        code = {
+            "src/x.py": (
+                "# decision: TOP-0063 L1\n"
+                "# decision: TOP-0064 L1\n"
+                "def delta():\n"
+                "    return 4\n"
+            )
+        }
+        errors, warnings = self._lint({"a.md": topic_a, "b.md": topic_b}, code)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(warnings, [], warnings)
+
+    # Ruling 144 (TOP-0122 L4): a path#symbol ref whose symbol the chunker
+    # never reports as its own chunk (a Swift protocol requirement --
+    # signature only, no body) is a WARNING, not an error, when the name is
+    # genuinely present in the file text -- the declaration cannot be
+    # VERIFIED by this engine's parser layer, which is not the same claim
+    # as DISPROVEN.
+    def test_ruling144_swift_protocol_requirement_name_present_is_warning(self):
+        topic = _marker_topic("TOP-0052", ["proto.swift#cleanup"], _CONSTRAINT_LINK_L1)
+        code = {
+            "proto.swift": (
+                "protocol Cleanup {\n"
+                "    func cleanup()\n"
+                "}\n"
+            )
+        }
+        errors, warnings = self._lint({"t.md": topic}, code)
+        self.assertEqual(errors, [], errors)
+        self.assertTrue(
+            any(
+                "TOP-0052:L1: proto.swift#cleanup cannot be verified by the chunker"
+                in w and "name present, no declaration reported" in w
+                for w in warnings
+            ),
+            warnings,
+        )
+        self.assertFalse(any("dangling" in w for w in warnings), warnings)
+
+    # Ruling 144's other half: the symbol's NAME is genuinely absent from
+    # the file text (not merely unreported as a declaration) -- this stays
+    # the ERROR ruling 144 keeps (ordinary dangling-ref behavior,
+    # unchanged; ties this class's coverage explicitly to the ruling, not
+    # just to the pre-existing test (e) above).
+    def test_ruling144_name_genuinely_absent_stays_error(self):
+        topic = _marker_topic("TOP-0053", ["src/y.py#totally_absent_name"], _CONSTRAINT_LINK_L1)
+        code = {"src/y.py": "def alpha():\n    return 1\n"}
+        errors, warnings = self._lint({"t.md": topic}, code)
+        self.assertTrue(
+            any(
+                "TOP-0053" in e and "dangling" in e and "totally_absent_name" in e
+                for e in errors
+            ),
+            errors,
+        )
+        self.assertFalse(
+            any("cannot be verified by the chunker" in w for w in warnings), warnings
+        )
 
 
 if __name__ == "__main__":

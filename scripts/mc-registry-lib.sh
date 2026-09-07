@@ -448,6 +448,333 @@ mc_is_marked_store() {
     return 1
 }
 
+# mc_is_windows_mounted_checkout CHECKOUT
+#
+# True iff CHECKOUT (a physical path -- the caller resolves symlinks first,
+# same as everywhere else in this file) sits on a Windows-mounted drive
+# inside WSL: `/proc/version` names Microsoft's kernel build (case-
+# insensitive -- WSL1 and WSL2 spell it differently) AND CHECKOUT resolves
+# under `/mnt/<single letter>/` -- the WSL convention for a mounted Windows
+# drive (drvfs, or 9P on WSL1). Neither check alone is enough: a plain path
+# named `/mnt/x/...` on a non-WSL Linux box (an unrelated real mount) must
+# not trigger this, and a WSL box with the checkout on its native ext4 disk
+# (not under `/mnt`) must not either -- only the AND is the "a store walk
+# here costs seconds, not milliseconds" case this exists to catch (measured;
+# TOP-0109 L5).
+#
+# Two test seams, because a machine running this suite may or may not
+# itself be WSL, and even a real WSL box has no actual `/mnt/<letter>`
+# checkout inside a throwaway sandbox HOME -- a test cannot otherwise
+# exercise every quadrant of the AND deterministically:
+#   MEMCONTINUUM_PROC_VERSION_FILE  overrides the file read in place of the
+#     real /proc/version (default), so the kernel-name check can be driven
+#     with a fixture file instead of the real machine's kernel string.
+#   MEMCONTINUUM_TEST_WSL_MOUNT=1   forces this whole predicate true,
+#     unconditionally, bypassing both real checks -- the end-to-end seam
+#     an installer-level test uses when it needs "a Windows-mounted
+#     checkout" but the sandbox checkout itself cannot physically be one.
+#     Any other value (or unset) never forces the other direction: there
+#     is no "force false" knob, because the ordinary unset case already
+#     exercises that path on every machine that is not itself a
+#     Windows-mounted WSL checkout.
+mc_is_windows_mounted_checkout() {
+    local checkout="$1" proc_version_file proc_version=""
+    [ "${MEMCONTINUUM_TEST_WSL_MOUNT:-}" = "1" ] && return 0
+    proc_version_file="${MEMCONTINUUM_PROC_VERSION_FILE:-/proc/version}"
+    # `|| :`, exit status ignored on purpose (mc_rules_identity_marker,
+    # above, does the same): a file with no trailing newline on its last
+    # line -- exactly a raw `/proc/version` read, and every fixture this
+    # function's own tests write -- makes `read` return NON-zero even
+    # though it assigned the variable correctly. `[ -n ]` on the RESULT,
+    # not the read's own exit code, is what tells "no such file" (stays
+    # empty) apart from "read the one line, no trailing newline" (still
+    # gets the content).
+    #
+    # `2>/dev/null` BEFORE the `<` input redirect, not after (whole-branch
+    # review NIT-1): redirections apply left to right, so with the
+    # stderr-silencer last, a MISSING proc_version_file still prints "No
+    # such file or directory" to the real stderr before `read` ever runs --
+    # reproduced with MEMCONTINUUM_PROC_VERSION_FILE=/nonexistent/procver on
+    # both bash 5 and bash 3.2. Silencing stderr first suppresses that
+    # message the same way it already suppresses `read`'s own complaint,
+    # while still reading a file with no trailing newline correctly.
+    IFS= read -r proc_version 2>/dev/null < "$proc_version_file" || :
+    [ -n "$proc_version" ] || return 1
+    case "$proc_version" in
+        *[Mm][Ii][Cc][Rr][Oo][Ss][Oo][Ff][Tt]*) ;;
+        *) return 1 ;;
+    esac
+    case "$checkout" in
+        /mnt/[a-zA-Z]/*|/mnt/[a-zA-Z]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# mc_store_project_identity STORE
+#
+# Reads STORE/README.md's FIRST line and, only when it matches exactly the
+# shape templates/store-README.md.tmpl renders ("# {{PROJECT}} Rationale
+# store"), sets MC_STORE_PROJECT to the captured {{PROJECT}} text and
+# returns 0. Returns 1 (MC_STORE_PROJECT cleared) when the file is missing,
+# empty, or its first line does not match -- a hand-authored or foreign
+# README (mc_is_marked_store's own "*MemContinuum*" match is looser, on
+# purpose, than this) tells us nothing about WHICH project, so callers must
+# treat that as "identity unknown", never as a mismatch.
+mc_store_project_identity() {
+    local store="$1" first_line
+    MC_STORE_PROJECT=""
+    [ -f "$store/README.md" ] || return 1
+    IFS= read -r first_line 2>/dev/null < "$store/README.md" || :
+    case "$first_line" in
+        "# "*" Rationale store")
+            first_line="${first_line#\# }"
+            MC_STORE_PROJECT="${first_line% Rationale store}"
+            [ -n "$MC_STORE_PROJECT" ] && return 0
+            ;;
+    esac
+    MC_STORE_PROJECT=""
+    return 1
+}
+
+# mc_store_checkout_identity STORE
+#
+# G5 residual (fix wave 1 G9, whole-branch-review Codex 5 follow-up): reads
+# STORE/README.md for the "memcontinuum-checkout: PATH" marker
+# scripts/repo-init.sh stamps at store-CREATION time (never rewritten on a
+# re-run -- the README render is write-if-absent), and, when found and not
+# the "unknown" placeholder (an explicit --store given from a cwd with no
+# git checkout of its own), sets MC_STORE_CHECKOUT to PATH and returns 0.
+# This is the one signal mc_store_project_identity's own PROJECT-name
+# comparison could never carry: an unambiguous physical checkout path, so
+# two DIFFERENT checkouts sharing a basename AND a --project value (neither
+# ever run through --record-decision, so the registry has nothing to say
+# either) still read as distinct, rather than the second one being read as
+# "ours" purely because the project name happens to match.
+#
+# Returns 1 (MC_STORE_CHECKOUT cleared) when the file is missing, carries no
+# such marker at all (a hand-authored README, or a store this fix predates),
+# or the marker is the "unknown" placeholder -- every one of those is
+# "identity unknown", not a mismatch, so callers must fall back to
+# mc_store_project_identity rather than treat an absent marker as foreign.
+mc_store_checkout_identity() {
+    local store="$1" line
+    MC_STORE_CHECKOUT=""
+    [ -f "$store/README.md" ] || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            "<!-- memcontinuum-checkout: "*" -->")
+                line="${line#<!-- memcontinuum-checkout: }"
+                line="${line% -->}"
+                [ -n "$line" ] && [ "$line" != "unknown" ] || return 1
+                MC_STORE_CHECKOUT="$line"
+                return 0
+                ;;
+        esac
+    done < "$store/README.md"
+    return 1
+}
+
+# mc_registry_owner_of_store DECISIONS_FILE STORE_PHYSICAL SELF_KEY
+#
+# Reverse lookup decisions.tsv (forward lookup, by KEY, already exists as
+# mc_registry_lookup above -- this instead asks "who owns this STORE path")
+# for a "wired" row whose note's store= field (mc_note_field) resolves
+# (mc_physical) to STORE_PHYSICAL, which the caller has already resolved the
+# same way. Three outcomes, because the registry is authoritative WHEN IT
+# SPEAKS and silent otherwise:
+#   * a row for SELF_KEY itself already names STORE_PHYSICAL -- this is our
+#     own store from a prior --record-decision run (a re-run, possibly
+#     under a renamed --project); sets MC_REGISTRY_STORE_OWNER="self" and
+#     returns 0 immediately, before any other row is even considered, so a
+#     same-checkout re-run is never second-guessed by a stale README
+#     project name check.
+#   * a row for a DIFFERENT key names STORE_PHYSICAL -- another checkout
+#     already owns it; sets MC_REGISTRY_STORE_OWNER to that row's KEY and
+#     returns 0.
+#   * no row anywhere names STORE_PHYSICAL (including a missing decisions
+#     file, or no --record-decision ever run) -- the registry has nothing
+#     to say; sets MC_REGISTRY_STORE_OWNER="" and returns 1, telling the
+#     caller to fall back to the README check.
+mc_registry_owner_of_store() {
+    local file="$1" store_phys="$2" self_key="$3"
+    local line k rest decision when note store_val self_row_found=0
+    MC_REGISTRY_STORE_OWNER=""
+    [ -f "$file" ] || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            \#*|"") continue ;;
+        esac
+        k="${line%%"$MC_TAB"*}"
+        rest="${line#*"$MC_TAB"}"
+        IFS="$MC_TAB" read -r decision when note <<<"$rest"
+        mc_note_field "$note" "store"
+        store_val="$MC_NOTE_FIELD"
+        [ -n "$store_val" ] || continue
+        [ "$(mc_physical "$store_val")" = "$store_phys" ] || continue
+        if [ "$k" = "$self_key" ]; then
+            MC_REGISTRY_STORE_OWNER="self"
+            return 0
+        fi
+        # A foreign row matched -- keep scanning only long enough to make
+        # sure a LATER row for SELF_KEY (decisions.tsv is append-only per
+        # key via mc_registry_rewrite_row, so at most one row per key
+        # exists at a time, but nothing here assumes that) does not also
+        # claim this path; remember it and continue.
+        MC_REGISTRY_STORE_OWNER="$k"
+        self_row_found=1
+    done < "$file"
+    [ "$self_row_found" -eq 1 ] && return 0
+    MC_REGISTRY_STORE_OWNER=""
+    return 1
+}
+
+# mc_store_belongs_elsewhere CANDIDATE CHECKOUT PROJECT
+#
+# True iff CANDIDATE already exists as a marked store (mc_is_marked_store)
+# belonging to a checkout or project OTHER than CHECKOUT/PROJECT -- the
+# guard mc_default_store_for below needs before it can silently hand out a
+# path shared by unrelated checkouts. Three signals, most authoritative
+# first:
+#   1. decisions.tsv's own store= field (mc_registry_owner_of_store), keyed
+#      by CHECKOUT's own repo identity (mc_repo_key) -- authoritative when a
+#      row exists for this exact store path, self or foreign, and only then.
+#   2. Only when the registry has nothing to say: the rendered store
+#      README's own checkout marker (mc_store_checkout_identity, fix wave 1
+#      G9) compared PHYSICALLY against CHECKOUT -- an unambiguous path
+#      comparison, unlike PROJECT, so two checkouts sharing a basename AND a
+#      --project value still read as distinct (the G5 residual this closes).
+#   3. Only when NEITHER of the above has anything to say (an older store
+#      that predates the checkout marker, or a hand-authored README): the
+#      rendered PROJECT name (mc_store_project_identity) compared against
+#      PROJECT -- the weakest signal, since two checkouts CAN legitimately
+#      share a --project value by coincidence.
+# Returns 1 (does not belong elsewhere) when CANDIDATE does not exist yet,
+# is not a marked store, PROJECT is empty (identity unknowable -- an older
+# caller, or a direct unit test, that never had a project to compare), or
+# no signal disagrees with us. Never fails open into a false positive: an
+# unknown identity is treated as "not elsewhere", same as before this
+# function existed.
+mc_store_belongs_elsewhere() {
+    local candidate="$1" checkout="$2" project="$3" phys decisions self_key checkout_phys
+    [ -e "$candidate" ] || return 1
+    mc_is_marked_store "$candidate" || return 1
+    phys="$(mc_physical "$candidate")"
+    mc_resolve_home
+    decisions="$MEMCONTINUUM_HOME/decisions.tsv"
+    self_key=""
+    mc_repo_key "$checkout" && self_key="$MC_REPO_KEY"
+    if mc_registry_owner_of_store "$decisions" "$phys" "$self_key"; then
+        [ "$MC_REGISTRY_STORE_OWNER" = "self" ] && return 1
+        return 0
+    fi
+    if mc_store_checkout_identity "$candidate"; then
+        checkout_phys="$(mc_physical "$checkout")"
+        # Fix round 2 R5 (CI's macOS job, reproduced on the Mac mini at
+        # 77e52d1): the stamp used to be compared VERBATIM against
+        # mc_physical(CHECKOUT) -- correct only when the stamped path and
+        # the live checkout already resolve to the identical string. On
+        # macOS a checkout under $TMPDIR is /var/folders/... logically and
+        # /private/var/folders/... physically; CWD_TOPLEVEL (what repo-
+        # init.sh stamps at store-creation time, below) returns the
+        # logical form, so a store never matched its own checkout there.
+        # mc_physical falls back to its input unchanged when the path does
+        # not (or no longer) exist, so a stamp whose directory is gone
+        # still stays a verbatim comparison -- still a mismatch, same as
+        # before this fix.
+        [ "$(mc_physical "$MC_STORE_CHECKOUT")" = "$checkout_phys" ] && return 1
+        return 0
+    fi
+    [ -n "$project" ] || return 1
+    if mc_store_project_identity "$candidate"; then
+        [ "$MC_STORE_PROJECT" != "$project" ] && return 0
+    fi
+    return 1
+}
+
+# mc_default_store_for CHECKOUT [PROJECT]
+#
+# The default --store scripts/repo-init.sh applies when a git checkout's cwd
+# gives it none: ordinarily the marked SIBLING name,
+# "<dirname>/<basename>-MemContinuum-Store" (owner convention, 2026-08-31:
+# never a generic "memory/", never a bare "MemContinuum"). But when CHECKOUT
+# sits on a Windows-mounted drive under WSL (mc_is_windows_mounted_checkout
+# above), a store there costs SECONDS per walk (drvfs/9P latency), not
+# milliseconds -- so the default instead lands on the WSL-native disk:
+# "$HOME/dev/<basename>-MemContinuum-Store" when "$HOME/dev" is a directory
+# (this machine's convention for where checkouts live), else
+# "$HOME/<basename>-MemContinuum-Store" (TOP-0109 L5).
+#
+# The sibling rule can never collide (a directory cannot hold two entries
+# named alike), but the WSL-disk rule keys ONLY on CHECKOUT's basename --
+# two different checkouts sharing one (client-a/app and client-b/app) used
+# to collapse onto the identical default and silently share one store
+# (whole-branch-review Codex 5). Now, only on the WSL branch: the plain name
+# is tried first, UNCHANGED, for the first checkout ever to want it (never
+# preemptively disambiguated); when it is already a DIFFERENT checkout's or
+# project's store (mc_store_belongs_elsewhere), the checkout's own PARENT
+# directory name disambiguates it ("<parent>-<basename>-MemContinuum-
+# Store"); when even THAT is already a different checkout's or project's
+# store, this refuses outright (MC_DEFAULT_STORE cleared,
+# MC_DEFAULT_STORE_REFUSED_WHY set, returns 1) rather than guess a third
+# name or silently share -- the installer asks for --store instead. A
+# checkout re-running against its OWN already-registered or
+# already-same-project store never disambiguates or refuses; it lands on
+# the plain name exactly as before this fix.
+#
+# PROJECT is optional (mc_store_belongs_elsewhere treats an empty PROJECT as
+# "identity unknowable", never as a mismatch) so every existing direct
+# caller of this function that passes only CHECKOUT keeps its prior
+# behaviour unchanged.
+#
+# CHECKOUT is expected already physical (git rev-parse --show-toplevel's own
+# output, which the one caller here already is) -- this function does no
+# resolution of its own.
+#
+# Sets MC_DEFAULT_STORE (the computed path, or "" on refusal) and
+# MC_DEFAULT_STORE_WHY -- empty for the ordinary sibling rule, or a one-line
+# explanation the installer prints when the WSL rule (plain or
+# disambiguated) fired. MC_DEFAULT_STORE_REFUSED_WHY is set only when this
+# returns 1. Deliberately the ONE place either rule is computed:
+# scripts/memcontinuum-decide.sh and hooks/memcontinuum-detect.sh never
+# compute or print a default store of their own (verified by reading both
+# -- decide.sh only ever records a --store it is explicitly given, and
+# detect.sh only ever reports whether a decision exists, never a proposed
+# path), so this function currently has exactly one caller. Kept here
+# anyway, alongside every other shared predicate in this file, rather than
+# inlined into repo-init.sh, so a second caller never has to duplicate it
+# to agree.
+mc_default_store_for() {
+    local checkout="$1" project="${2:-}" name base_dir plain candidate parent
+    name="$(basename "$checkout")"
+    MC_DEFAULT_STORE_WHY=""
+    MC_DEFAULT_STORE_REFUSED_WHY=""
+    if mc_is_windows_mounted_checkout "$checkout"; then
+        if [ -d "$HOME/dev" ]; then
+            base_dir="$HOME/dev"
+        else
+            base_dir="$HOME"
+        fi
+        plain="$base_dir/$name-MemContinuum-Store"
+        if mc_store_belongs_elsewhere "$plain" "$checkout" "$project"; then
+            parent="$(basename "$(dirname "$checkout")")"
+            candidate="$base_dir/$parent-$name-MemContinuum-Store"
+            if mc_store_belongs_elsewhere "$candidate" "$checkout" "$project"; then
+                MC_DEFAULT_STORE=""
+                MC_DEFAULT_STORE_REFUSED_WHY="both $plain and $candidate already belong to a different checkout or project"
+                return 1
+            fi
+            MC_DEFAULT_STORE="$candidate"
+            MC_DEFAULT_STORE_WHY="store defaults to $MC_DEFAULT_STORE: the checkout is on a Windows-mounted drive, and the plain name $plain already belongs to a different checkout or project, so the parent directory name disambiguates"
+        else
+            MC_DEFAULT_STORE="$plain"
+            MC_DEFAULT_STORE_WHY="store defaults to $MC_DEFAULT_STORE: the checkout is on a Windows-mounted drive, where a store walk costs seconds"
+        fi
+    else
+        MC_DEFAULT_STORE="$(dirname "$checkout")/$name-MemContinuum-Store"
+    fi
+    return 0
+}
+
 # mc_note_encode VALUE / mc_note_decode VALUE
 #
 # The registry row's NOTE column is space-separated `key=value` fields with

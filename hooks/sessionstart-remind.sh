@@ -174,6 +174,18 @@ state.setdefault("session_id", os.environ.get("MC_SESSION_ID", ""))
 state.setdefault("project", os.environ.get("MC_PROJECT_ENV", ""))
 state.setdefault("start_code_sha", os.environ.get("MC_CODE_SHA", ""))
 state.setdefault("start_code_shas", _code_heads)
+# TOP-0122 L1 rule 2a (the commit nudge): last_seen_heads is a SEPARATE,
+# per-PROMPT baseline (userprompt-remind.sh advances it turn by turn),
+# distinct from the per-SESSION start_code_shas above -- seeded from the
+# same current-HEAD map. clear (INC-0108, see the header comment) rebuilds
+# state to just {ledger, shell_baseline} before this setdefault block
+# runs, so a clear re-seeds last_seen_heads (and nudged_commits) from the
+# CURRENT heads exactly like start_code_shas, never carrying either across
+# a clear -- a commit already nudged before the clear is simply eligible
+# again if that root HEAD ever revisits that sha, which is moot once
+# last_seen_heads itself has just been reset to the current HEAD.
+state.setdefault("last_seen_heads", dict(_code_heads))
+state.setdefault("nudged_commits", [])
 state.setdefault("start_store_sha", os.environ.get("MC_STORE_SHA", ""))
 state.setdefault("created_at", time.time())
 state.setdefault("ledger", [])

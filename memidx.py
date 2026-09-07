@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import fcntl
 import fnmatch
 import hashlib
@@ -273,7 +274,21 @@ def _records_fresh_vector_counts(conn: "sqlite3.Connection", project: str) -> tu
 # (generation 3's still-unwired promise) and builds every topic's link
 # rows for the first time, without forcing a needless re-embed of an
 # unchanged topic's own vector (see cmd_reindex's own comments).
-CURRENT_INDEX_GENERATION = 4
+# Bumped to 5 (Codex 4, fix wave 1 G3): inbox/ classification (infer_type
+# returning "inbox" unconditionally for anything under inbox/, wired
+# alongside this same fix wave's search-inbox-downrank/Codex-3 fix) has no
+# effect on a row an OLDER index already parsed with its old type -- a
+# db reindexed at generation 4 with an unchanged sha would otherwise keep
+# reporting a pre-existing inbox/ file under its stale (pre-inbox-
+# classification) type forever, and default search's inbox exclusion
+# (keyed on records.type='inbox' / a link row's source_path) would never
+# see it. The same migration probe below forces one full content pass on
+# any generation-4-or-older db, which re-parses every record's frontmatter
+# (including re-running infer_type) even when its sha is unchanged --
+# without forcing a needless re-embed (a migration-only pass never queues
+# an unchanged vector; see the migration-probe comment just below and
+# cmd_reindex's own no_embed guard).
+CURRENT_INDEX_GENERATION = 5
 
 # ---------------------------------------------------------------------------
 # frontmatter parsing (shared by memidx and memlint)
@@ -446,6 +461,7 @@ def validate_record_shape(fm: dict) -> list:
         if not isinstance(links, list):
             diagnostics.append(("links", "links must be a list of mappings"))
         else:
+            seen_link_ids: dict[str, int] = {}
             for i, link in enumerate(links):
                 prefix = f"links[{i}]"
                 if not isinstance(link, dict):
@@ -454,6 +470,9 @@ def validate_record_shape(fm: dict) -> list:
                 lid = link.get("link")
                 if lid is None or lid == "" or isinstance(lid, (dict, list)):
                     diagnostics.append((f"{prefix}.link", f"{prefix}.link must be a scalar link id"))
+                else:
+                    lid_key = str(lid)
+                    seen_link_ids[lid_key] = seen_link_ids.get(lid_key, 0) + 1
                 for sub in ("ruling", "rationale", "invariant"):
                     if not _shape_ok_mapping(link.get(sub)):
                         diagnostics.append((f"{prefix}.{sub}", f"{prefix}.{sub} must be a mapping"))
@@ -461,6 +480,22 @@ def validate_record_shape(fm: dict) -> list:
                     subval = link.get(sub)
                     if subval and (not isinstance(subval, list) or any(not isinstance(x, dict) for x in subval)):
                         diagnostics.append((f"{prefix}.{sub}", f"{prefix}.{sub} must be a list of mappings"))
+            # Codex 2 (BLOCKING, fix wave 1 G1): a duplicate link id makes
+            # this record's shape invalid (quarantined by reindex, below
+            # parse_record's own valid computation) rather than silently
+            # indexed -- every downstream consumer that keys links by id
+            # (this file's own link-embedding/indexing pass, memlint's
+            # check_append_only comparison) would otherwise pick whichever
+            # occurrence its own dict comprehension happens to keep,
+            # possibly a DIFFERENT one than a sibling consumer keeps, with
+            # no error anywhere naming the ambiguity.
+            for lid_key, count in seen_link_ids.items():
+                if count > 1:
+                    diagnostics.append((
+                        "links",
+                        f"duplicate link id {lid_key!r} used {count} times -- link ids "
+                        "must be unique per topic",
+                    ))
 
     return diagnostics
 
@@ -475,7 +510,13 @@ def parse_record(path: Path) -> ParseResult:
     one diagnostic -- a note stays valid and indexed as today, its
     diagnostics surfacing only as warnings (memlint) or nothing at all
     (reindex, beyond the one stderr line the lenient-fallback path always
-    prints)."""
+    prints).
+
+    Thin file-reading wrapper over `parse_record_text` (task A2-1): every
+    diagnostic/shape rule below lives there so a caller that already has a
+    record's bytes from somewhere other than a plain file read (memlint
+    `--against-ref`'s git-blob content, from `git show REF:path`) can reuse
+    the exact same typed parse without a file on disk at all."""
     try:
         text = path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
@@ -483,7 +524,18 @@ def parse_record(path: Path) -> ParseResult:
     except OSError as exc:
         msg = exc.strerror or str(exc)
         return ParseResult({}, "", [("file", f"unreadable: {msg}")], valid=False, fallback=False)
+    return parse_record_text(text, path)
 
+
+def parse_record_text(text: str, path) -> ParseResult:
+    """Text-based twin of `parse_record` -- everything past the file read
+    itself. `path` is used only for string labeling in the diagnostics and
+    warnings below (every use is an f-string), never opened, stat'd, or
+    otherwise treated as a real filesystem path -- a caller with no real
+    Path (memlint `--against-ref` handing this a git-blob's content under a
+    store-relative label, e.g. "topics/foo.md (at HEAD)") may pass any
+    object with a useful `__str__`. Behavior is otherwise identical to the
+    tail of the old single `parse_record` function this was split from."""
     if not text.startswith("---"):
         return ParseResult({}, text, [], valid=True, fallback=False)
     lines = text.splitlines(keepends=True)
@@ -628,6 +680,17 @@ def parse_frontmatter(path: Path) -> tuple[dict, str]:
 
 
 def infer_type(root: Path, path: Path, fm: dict) -> str:
+    try:
+        rel_parts = path.relative_to(root).parts
+    except ValueError:
+        rel_parts = path.parts
+    # search-inbox-downrank: a path under inbox/ is type: inbox
+    # unconditionally -- even a drop that carries its own frontmatter
+    # `type:` (a consult note pasted with a stray field, say) is never a
+    # first-class record just because it claims to be one; only its
+    # directory decides.
+    if rel_parts and rel_parts[0] == "inbox":
+        return "inbox"
     t = fm.get("type")
     if t:
         return str(t)
@@ -635,10 +698,6 @@ def infer_type(root: Path, path: Path, fm: dict) -> str:
     t = meta.get("type")
     if t:
         return str(t)
-    try:
-        rel_parts = path.relative_to(root).parts
-    except ValueError:
-        rel_parts = path.parts
     if rel_parts:
         seg = rel_parts[0]
         return seg[:-1] if seg.endswith("s") else seg
@@ -2453,13 +2512,20 @@ def fts_ranked(conn, query: str, project: str, filter_clause: str = "", filter_p
     result), without ever discarding a real match before collapse sees
     it."""
     q = fts_escape(query)
-    where = "fts MATCH ? AND records.project=?"
+    # Codex 3 (fix wave 1 G3): `records` is now aliased `r` here, matching
+    # vector_ranked's own alias below -- the inbox-exclusion clause
+    # cmd_search builds needs to name the OUTER row's `source_path`
+    # unambiguously from inside its own correlated subquery (which touches
+    # `records` again, under a different alias, to look up the parent's
+    # type); a shared, fixed outer alias lets that clause be written once,
+    # correctly, in both query shapes, rather than parametrized per caller.
+    where = "fts MATCH ? AND r.project=?"
     params: list = [q, project]
     if filter_clause:
         where += f" AND {filter_clause}"
         params.extend(filter_params or [])
     cur = conn.execute(
-        f"SELECT fts.path AS path FROM fts JOIN records ON records.path=fts.path "
+        f"SELECT fts.path AS path FROM fts JOIN records r ON r.path=fts.path "
         f"WHERE {where} ORDER BY bm25(fts)",
         params,
     )
@@ -2723,6 +2789,39 @@ def _search_hits(conn, args, extra_where: str, extra_params: list) -> tuple[list
     return results, contributing, embed_info
 
 
+def _resolve_search_status(status: list[str]) -> tuple[list[str], bool]:
+    """search-default-active: no `--status` given at all (an empty list --
+    argparse's own `default=[]`, and every direct-Namespace caller that
+    passes `status=[]` the same way) defaults to `["active"]`, matching
+    every other reader's own default assumption that "the decision" means
+    the current, active one. `--status any` is the one way to widen back
+    to every status (dropping the status clause from the query entirely,
+    same as the pre-existing empty-list behavior); any OTHER explicit
+    value (or combination) passes through completely unchanged -- this
+    only touches the CASE that used to mean "no status given".
+
+    whole-branch-review MODERATE-3/4 (ruling 148): the second return value,
+    `is_default`, is True only for the true no-flag-given case. A record
+    that is never topic-shaped (no `links:`, so build_record's own
+    `status = fm.get("status")` branch runs) and carries no explicit
+    `status:` field of its own -- a `sources/` record, the store README, an
+    inbox drop with no frontmatter at all -- has a NULL status column, not
+    `"active"`. The plain `status IN ('active')` clause this used to
+    resolve to therefore excluded every one of those from EVERY default
+    search, a silent regression search-default-active introduced (a
+    `sources/` record findable on 751782c became unfindable by any
+    default-status search at all, not merely down-ranked). The caller uses
+    `is_default` to OR in `status IS NULL` only for this true-default case
+    -- an EXPLICIT `--status active` is a deliberate, narrower request and
+    must keep meaning exactly that, never silently widened to also include
+    status-less records the caller did not ask for."""
+    if not status:
+        return ["active"], True
+    if "any" in status:
+        return [], False
+    return status, False
+
+
 def cmd_search(args) -> int:
     db_path = resolve_db_path(args)
     # Final-fix-wave item 2: --root is optional (add_common_args's
@@ -2744,7 +2843,81 @@ def cmd_search(args) -> int:
     # lives INSIDE fts_ranked/vector_ranked themselves, before their own
     # cap and before RRF fusion -- no more Python-side `allowed` set
     # post-filtering an already-capped, already-fused list.
-    extra_where, extra_params = build_filter_clause(args, include_project=False)
+    #
+    # search-default-active: build_filter_clause itself is unchanged (every
+    # OTHER caller -- filtered_paths, cmd_unmapped's callers -- keeps
+    # meaning "no status given" as "no filter"); only `search`'s own
+    # resolution of args.status is touched, via a shallow copy so the
+    # caller's own Namespace/args object is never mutated.
+    #
+    # whole-branch-review MODERATE-3/4 (ruling 148): build_filter_clause's
+    # own `status IN (...)` clause is left for every OTHER case (an
+    # explicit --status, or --status any's empty list), but the true
+    # default (`is_default`) never reaches build_filter_clause with
+    # `status` set at all -- its own status clause is built here instead,
+    # OR-ing in `status IS NULL` (a record that was never topic-shaped and
+    # carries no explicit `status:` of its own -- sources/, README, a
+    # frontmatter-less inbox drop) alongside `status='active'`, so a
+    # `sources/` record findable before search-default-active existed
+    # stays findable by a plain default `search`, not only by `--status any`.
+    resolved_status, status_is_default = _resolve_search_status(getattr(args, "status", None) or [])
+    effective_args = copy.copy(args)
+    effective_args.status = [] if status_is_default else resolved_status
+    extra_where, extra_params = build_filter_clause(effective_args, include_project=False)
+    if status_is_default:
+        placeholders = ",".join("?" * len(resolved_status))
+        status_clause = f"(status IN ({placeholders}) OR status IS NULL)"
+        extra_where = f"({extra_where}) AND {status_clause}" if extra_where else status_clause
+        extra_params = extra_params + resolved_status
+
+    # search-inbox-downrank: inbox/ records (indexed as type: inbox --
+    # infer_type) are excluded from search by default -- a freeform consult
+    # drop, not a ruling. --include-inbox widens back; an explicit
+    # `--type inbox` also counts as asking for them (otherwise it would
+    # silently AND itself into an empty result against the exclusion below).
+    #
+    # Codex 3 (MAJOR): the old clause was `type != 'inbox'`, which only
+    # ever matches a row's OWN type column -- a link derived from an inbox
+    # topic gets its own `records` row (F5, one searchable row per link),
+    # but that row's `type` is the literal string "link" (build_record's
+    # per-link INSERT hardcodes it), never "inbox", regardless of its
+    # parent topic's classification. A fresh inbox/draft.md with an active
+    # owner-verbatim link used to appear in default search through that
+    # link row alone, even though the topic row itself was correctly
+    # excluded. The fix keys off `source_path` instead -- the column every
+    # row (topic or link) already carries naming its real underlying file
+    # (self for a topic/concept/standalone row, the parent topic's path
+    # for a link row, per build_record) -- so excluding every row whose
+    # source_path names an inbox-classified path catches the topic row AND
+    # every one of its derived link rows through the same test.
+    #
+    # A correlated `NOT EXISTS` subquery, not a concrete `NOT IN (paths...)`
+    # list bound as individual parameters: SQLite's default
+    # SQLITE_MAX_VARIABLE_NUMBER is 999 on many still-current builds (32766
+    # only from 3.32.0 on) -- a store with a few hundred inbox/ drops
+    # accumulated over time would blow past that as a flat parameter list.
+    # `r.source_path` names the OUTER query's own records row explicitly --
+    # fts_ranked's query aliases its own records table `r` (matching
+    # vector_ranked's own alias) for exactly this, so a bare `source_path`
+    # inside the subquery below can never bind to the SUBQUERY's own
+    # `records __inbox` instead (both tables share that column name; an
+    # unqualified reference inside a correlated subquery resolves to the
+    # innermost matching table first, which would silently turn this into
+    # a query-independent "does any inbox row's own source_path equal its
+    # own path" check, true the instant a single inbox file exists at all,
+    # rather than one that means anything about the specific outer row).
+    # `r.source_path IS NULL` (a pre-F5 legacy row not yet migrated -- see
+    # reindex's own identical NULL-aware predicate above) is never treated
+    # as inbox; it will get a real source_path the next full pass touches it.
+    include_inbox = bool(getattr(args, "include_inbox", False)) or "inbox" in (args.type or [])
+    if not include_inbox:
+        inbox_clause = (
+            "(r.source_path IS NULL OR NOT EXISTS ("
+            "SELECT 1 FROM records __inbox WHERE __inbox.project=? "
+            "AND __inbox.type='inbox' AND __inbox.path = r.source_path))"
+        )
+        extra_where = f"({extra_where}) AND {inbox_clause}" if extra_where else inbox_clause
+        extra_params = extra_params + [args.project]
     results, contributing, embed_info = _search_hits(conn, args, extra_where, extra_params)
     embed_state = embed_info.get("state")
     if embed_state == "unavailable":
@@ -4181,6 +4354,46 @@ def _unmapped_path_candidates(raw_path: str, code_roots: list[Path]) -> list[str
     return candidates
 
 
+def _unmapped_ref_hit(matcher, conn, project: str, candidates: list[str]) -> bool:
+    """LOW-1 (a2-3 review, carried into A3; corrected by fix wave 1 G6,
+    whole-branch-review Codex 10): `matcher` is `topic_matches_for_path` or
+    `concept_matches_for_path`, both of which match a bare relative string
+    project-wide -- a code_ref carries no root of its own, so when two
+    configured --code-root's each have their OWN file at the identical
+    relative path, a match found via that string cannot, by itself, tell
+    which root it was written for. The absolute candidate (candidates[0],
+    always the raw path as given) is trusted unconditionally -- it names an
+    exact file, nothing to disambiguate. The relative candidate
+    (candidates[1], when present) is trusted exactly the same way: design
+    ruling F ("never a false gap", docs/DESIGN.md) refuses to guess which
+    root an ambiguous bare relative string was meant for, so a SIBLING
+    root's file sharing that relative path and a NESTED root's file sharing
+    it are credited identically -- neither is ever refused.
+
+    A prior version (ruling 131, TOP-0123 L10) tried to resolve the nested
+    case differently: attribute an ambiguous match to the LONGEST (most
+    specific) containing root among ALL configured roots that happen to
+    have a file at that relative offset, refusing the match for every
+    other one. That reasoning silently compared the file actually being
+    classified (own_root always has a real file at that relative offset --
+    it is the very file resolved from disk) against a DIFFERENT, unrelated
+    physical file that merely shares its relative name, and invented an
+    ownership call between them with no real evidence either way. Codex 10
+    reproduced the consequence directly: an existing, genuinely covered
+    outer/src/x.py silently became unmapped the moment an UNRELATED
+    inner/src/x.py was ALSO configured as a code root -- configuring a
+    second root un-covered a file nothing about it had changed. Longest-
+    root selection (`_unmapped_best_root`) is still the right rule for
+    resolving which root owns the SAME physical path (used to compute
+    `candidates` and the display path above) -- it was never the right
+    rule for arbitrating between two DIFFERENT files."""
+    if matcher(conn, project, candidates[0]):
+        return True
+    if len(candidates) < 2:
+        return False
+    return matcher(conn, project, candidates[1])
+
+
 def _unmapped_display_path(raw_path: str, code_roots: list[Path]) -> str:
     """The path string reported back for one PATH argument: relative to
     the LONGEST matching --code-root when resolvable, else the path
@@ -4241,6 +4454,7 @@ def cmd_unmapped(args) -> int:
     mapped_topic: list[str] = []
     mapped_concept_only: list[str] = []
     unmapped: list[str] = []
+    by_path: dict[str, str] = {}
     degraded: dict | None = None
     conn: sqlite3.Connection | None = None
     try:
@@ -4296,24 +4510,49 @@ def cmd_unmapped(args) -> int:
                         elif post_state != "current":
                             coverage_status = "unknown"
                 if conn is not None:
+                    # Codex 11 / Grok M6 (fix wave 1 G4): `unmapped` (and
+                    # its two mapped siblings) is a flat list of DISPLAY
+                    # strings -- relative to each path's own best root, per
+                    # `_unmapped_display_path` -- so two sibling code roots
+                    # that happen to share a relative path (both have
+                    # `src/mapped.py`, say) produce the SAME string in that
+                    # list from two entirely different physical files. A
+                    # caller trying to test "is THIS specific absolute path
+                    # unmapped" by membership-testing a display string
+                    # against that flat list (userprompt-remind.sh's own
+                    # per-commit nudge count did exactly this) can match
+                    # the WRONG root's file. `by_path` below is additive
+                    # (the three display-string lists are unchanged, for
+                    # every existing consumer) and keyed by each raw_path
+                    # EXACTLY as given in args.paths -- already the
+                    # unambiguous, caller-supplied identity every caller
+                    # that cares about one specific physical file already
+                    # has on hand, sidestepping the display-string collision
+                    # entirely rather than trying to reconstruct a safe
+                    # (root, relative_path) pair from a lossy string.
                     for raw_path in args.paths:
                         candidates = _unmapped_path_candidates(raw_path, code_roots)
                         display = _unmapped_display_path(raw_path, code_roots)
-                        topic_hit = any(topic_matches_for_path(conn, args.project, c) for c in candidates)
+                        topic_hit = _unmapped_ref_hit(
+                            topic_matches_for_path, conn, args.project, candidates,
+                        )
                         concept_hit = False
                         if not topic_hit:
-                            concept_hit = any(
-                                concept_matches_for_path(conn, args.project, c) for c in candidates
+                            concept_hit = _unmapped_ref_hit(
+                                concept_matches_for_path, conn, args.project, candidates,
                             )
                         if topic_hit:
                             mapped_topic.append(display)
+                            by_path[raw_path] = "mapped_topic"
                         elif concept_hit:
                             mapped_concept_only.append(display)
+                            by_path[raw_path] = "mapped_concept_only"
                         elif coverage_status == "ok":
                             unmapped.append(display)
+                            by_path[raw_path] = "unmapped"
     except sqlite3.OperationalError:
         coverage_status = "index-error"
-        mapped_topic, mapped_concept_only, unmapped = [], [], []
+        mapped_topic, mapped_concept_only, unmapped, by_path = [], [], [], {}
     except Exception as exc:
         # Design R7 (audit MC-P2-03, TOP-0123 L7): this is the ONE branch
         # that used to conflate a genuine operational failure with an
@@ -4327,7 +4566,7 @@ def cmd_unmapped(args) -> int:
         if DEBUG:
             raise
         coverage_status = "unknown"
-        mapped_topic, mapped_concept_only, unmapped = [], [], []
+        mapped_topic, mapped_concept_only, unmapped, by_path = [], [], [], {}
         degraded = _degraded("internal-error", exc)
         print(
             f"unmapped: degraded reason=internal-error type={degraded['exception_type']}: "
@@ -4348,10 +4587,19 @@ def cmd_unmapped(args) -> int:
         "unmapped": unmapped,
         "coverage_status": coverage_status,
         # Design R5 (audit MC-P1-05, TOP-0123 L5): an echo of every
-        # resolved --code-root this call used, NOT a per-entry root
-        # annotation -- the output shape (a list of display paths) stays
-        # exactly as before.
+        # resolved --code-root this call used.
         "roots": [str(r) for r in code_roots],
+        # Codex 11 / Grok M6 (fix wave 1 G4): additive -- the three lists
+        # above are unchanged, display-path strings, for every existing
+        # consumer. `by_path` is the unambiguous per-INPUT-path
+        # classification (keyed by each raw_path exactly as given in
+        # args.paths, never a display string two different roots' files
+        # could share) a caller needs when it wants to know "is THIS
+        # specific absolute path mapped or not" without re-deriving a
+        # (root, relative_path) pair from a lossy string itself. Empty
+        # whenever no path was actually classified this call (every branch
+        # above that resets the three lists to [] resets this to {} too).
+        "by_path": by_path,
     }
     if degraded is not None:
         result["degraded"] = degraded
@@ -6862,9 +7110,16 @@ UNKNOWN_STATS_PROJECT = "(unknown)"
 # Excluded from `user_prompts` so ten of THESE alone can never satisfy
 # the read-side FLAG's ">=10 prompts" busy-signal on their own -- they
 # prove the hook ran, not that a human was actively prompting.
+#
+# Codex 12 (fix wave 1 G4): `commit-nudge` is a SUPPLEMENTAL line the SAME
+# turn's own real outcome line (`injected`, `no-evidence`, ...) may ALSO
+# write, one per newly-moved-and-examined code root, never a turn's own
+# terminal outcome by itself -- a turn that both injects AND nudges a
+# commit writes TWO userprompt lines for the one prompt. Five injected
+# prompts plus five commit-nudge lines used to report ten prompts.
 _NON_USER_PROMPT_OUTCOMES = frozenset({
     "duplicate-delivery", "agent-source", "non-user-source",
-    "empty-payload", "no-session-id", "no-state",
+    "empty-payload", "no-session-id", "no-state", "commit-nudge",
 })
 
 _MONTH_ABBR = {
@@ -6985,6 +7240,15 @@ def _hook_log_line_kind(rest: str) -> str:
         return "pre-edit"
     if stripped.startswith("outcome=watchdog-killed") and "hook=pre-edit-chain.sh" in stripped:
         return "pre-edit"
+    # Grok re-gate NIT 4 (whole-branch NIT-2): hooks/pre-commit-append-
+    # only.sh's own log_line() writes "pre-commit-append-only: <fields>",
+    # not the "<keyword> <fields>" shape every _HOOK_LOG_KEYWORDS producer
+    # uses -- special-cased here the same way the two pre-edit checks
+    # above are, rather than joining that keyword list (its own kind
+    # string, "pre-commit", is also shorter than the log line's literal
+    # producer name).
+    if stripped.startswith("pre-commit-append-only: "):
+        return "pre-commit"
     for kw in _HOOK_LOG_KEYWORDS:
         if stripped.startswith(kw + " ") or stripped == kw:
             return kw
@@ -6996,7 +7260,7 @@ def _hook_log_line_kind(rest: str) -> str:
 # never saw (never a KeyError, never a silent `.get(..., {})` fallback).
 _STATS_KINDS = (
     "userprompt", "ledger", "pre-edit", "newfile-nudge",
-    "sessionstart", "sessionend", "precompact", "other",
+    "sessionstart", "sessionend", "precompact", "pre-commit", "other",
 )
 
 
@@ -7219,6 +7483,24 @@ def _scan_hook_log(log_path: Path, cutoff: datetime, now: datetime):
                 outcome_key = f"appended:{fields.get('kind') or 'unknown'}"
             bucket["outcomes"]["ledger"][outcome_key] += 1
             continue
+        elif kind == "pre-commit":
+            # This producer carries no `outcome=` field at all (see
+            # _hook_log_line_kind) -- its own fields are `rc=`/`changed=`
+            # on a pass/refusal, or `skipped=<reason>` (sometimes alongside
+            # its own `rc=`, e.g. `skipped=engine-failure rc=2`) on a
+            # fail-open skip. `skipped=` is checked first since a line can
+            # carry both.
+            skip_reason = fields.get("skipped")
+            if skip_reason:
+                outcome_key = f"skipped:{skip_reason}"
+            elif fields.get("rc") == "0":
+                outcome_key = "pass"
+            elif fields.get("rc") == "1":
+                outcome_key = "refused"
+            else:
+                outcome_key = f"rc:{fields.get('rc') or 'unknown'}"
+            bucket["outcomes"]["pre-commit"][outcome_key] += 1
+            continue
         bucket["outcomes"][kind][outcome] += 1
         # userprompt: `user_prompts` is derived at report time from this
         # same outcomes["userprompt"] Counter (round 2, item 8) -- no
@@ -7337,6 +7619,14 @@ def _stats_report(
     lookback_injected = up.get("lookback-injected", 0)
     no_evidence = up.get("no-evidence", 0)
     duplicate_delivery = up.get("duplicate-delivery", 0)
+    # TOP-0122 L1 rule 2a: the commit nudge logs its own outcome line
+    # (userprompt-remind.sh, one per nudged commit) alongside whatever
+    # else fires that same turn -- counted here, but NOT folded into
+    # `nudges_total`: it can co-occur with `injected` on the same turn
+    # (both share this turn's delivery), and double-counting it there
+    # would shift the write-side FLAG's own threshold for no reason the
+    # spec ever asked for.
+    commit_nudges = up.get("commit-nudge", 0)
     nudges_total = coverage_injected + lookback_injected
     non_user_prompt_lines = sum(up.get(k, 0) for k in _NON_USER_PROMPT_OUTCOMES)
     user_prompts = sum(up.values()) - non_user_prompt_lines
@@ -7359,6 +7649,19 @@ def _stats_report(
     pc_index_error = pc.get("index-error", 0)
     pc_index_quarantined = pc.get("index-quarantined", 0)
     pc_index_degraded = pc.get("index-degraded", 0)
+
+    # Grok re-gate NIT 4 (whole-branch NIT-2): the store's pre-commit
+    # append-only guard writes its own pass/refusal/skip lines to
+    # hook.log (see _scan_hook_log's "pre-commit" branch for the
+    # outcome-key shapes: "pass", "refused", "skipped:<reason>") and they
+    # were never surfaced here at all -- silently folded into "other".
+    # These lines carry no `outcome=` field and route through their own
+    # "pre-commit" kind, never "userprompt", so they can never inflate
+    # `user_prompts` above.
+    pcm = outcomes["pre-commit"]
+    pcm_pass = pcm.get("pass", 0)
+    pcm_refused = pcm.get("refused", 0)
+    pcm_skipped = sum(v for k, v in pcm.items() if k.startswith("skipped:"))
 
     flags = []
     if args.project != UNKNOWN_STATS_PROJECT:
@@ -7414,6 +7717,7 @@ def _stats_report(
             "lookback_injected": lookback_injected,
             "no_evidence": no_evidence,
             "duplicate_delivery": duplicate_delivery,
+            "commit_nudges": commit_nudges,
             "total": nudges_total,
             "outcomes": dict(up),
         },
@@ -7432,6 +7736,12 @@ def _stats_report(
             "index_quarantined": pc_index_quarantined,
             "index_degraded": pc_index_degraded,
             "outcomes": dict(pc),
+        },
+        "pre_commit": {
+            "pass": pcm_pass,
+            "refused": pcm_refused,
+            "skipped": pcm_skipped,
+            "outcomes": dict(pcm),
         },
         "store_commits": store_commits,
         "unknown_lines": unknown_lines,
@@ -7546,7 +7856,8 @@ def cmd_stats(args) -> int:
         print()
         nu = result["nudges"]
         print(f"write-side nudges: coverage-injected={nu['coverage_injected']} "
-              f"lookback-injected={nu['lookback_injected']} no-evidence={nu['no_evidence']} "
+              f"lookback-injected={nu['lookback_injected']} commit-nudges={nu['commit_nudges']} "
+              f"no-evidence={nu['no_evidence']} "
               f"duplicate-delivery={nu['duplicate_delivery']}")
         nf = result["newfile_nudge"]
         print(f"new-file nudges: nudged={nf['nudged']} "
@@ -7558,6 +7869,9 @@ def cmd_stats(args) -> int:
               f"index-quarantined={pc['index_quarantined']} index-degraded={pc['index_degraded']} "
               f"index-uninitialized={pc['index_uninitialized']} "
               f"index-upgrade-required={pc['index_upgrade_required']}")
+        pcm = result["pre_commit"]
+        print(f"pre-commit (store append-only guard): pass={pcm['pass']} "
+              f"refused={pcm['refused']} skipped={pcm['skipped']}")
         eb = result["embedding_backlog"]
         rows_txt = "unknown (db unreadable)" if eb["rows_without_fresh_vector"] is None else eb["rows_without_fresh_vector"]
         print(f"embedding backlog: pending-marker={eb['pending_marker']} "
@@ -7677,13 +7991,24 @@ def main(argv=None) -> int:
     add_common_args(p_search, optional_root=True)
     p_search.add_argument("query")
     p_search.add_argument("--mode", choices=["fts", "vector", "hybrid"], default="hybrid")
-    p_search.add_argument("--status", action="append", default=[])
+    p_search.add_argument(
+        "--status", action="append", default=[],
+        help="repeatable; defaults to active-only when omitted -- pass "
+             "--status any to widen to every status, or one/more of "
+             "active/provisional/superseded/historical/declined explicitly",
+    )
     p_search.add_argument("--type", action="append", default=[])
     p_search.add_argument("--area", default=None)
     p_search.add_argument("--topic", default=None)
     p_search.add_argument("--authority", default=None)
     p_search.add_argument("--limit", type=int, default=10)
     p_search.add_argument("--json", action="store_true")
+    p_search.add_argument(
+        "--include-inbox", action="store_true",
+        help="search-inbox-downrank: inbox/ records are excluded by default "
+             "(they are freeform consult drops, not rulings); pass this to "
+             "widen results to include them",
+    )
     p_search.set_defaults(func=cmd_search)
 
     p_chain = sub.add_parser("chain")

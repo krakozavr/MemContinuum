@@ -118,7 +118,7 @@ Notes:
   below, even though its own logic never calls python for real work — one shared mechanism, not a
   second bespoke timeout story for the one hook that happens to be fast.
 
-## 3. `post-commit-reindex.sh` — git hook in the STORE repo
+## 3. Git hooks in the STORE repo — `post-commit-reindex.sh` and `pre-commit-append-only.sh`
 
 Lives in this repo too, but runs as a `post-commit` hook inside the **store**
 repo — not this tool repo, and not the code repo it describes.
@@ -126,7 +126,11 @@ repo — not this tool repo, and not the code repo it describes.
 `scripts/repo-init.sh` writes this wrapper as `<store>/.git/hooks/post-commit`
 (not a bare symlink — a symlinked git hook carries no environment of its
 own, and `post-commit-reindex.sh` silently no-ops without `MEMCONTINUUM_ROOT`
-set):
+set). A `post-commit` this installer did not render is left untouched and
+reported, never silently overwritten — the same foreign-hook refusal §3b
+describes for `pre-commit`, identity anchored on the complete five-line
+wrapper this installer renders (the shebang, the three `MEMCONTINUUM_*`
+exports, and the `exec` line), never the `exec` line alone:
 
 ```bash
 #!/usr/bin/env bash
@@ -174,6 +178,51 @@ pass whose content it actually reflects (a commit landing mid-pass retouches
 the marker, and the worker loops again rather than declaring victory early).
 See docs/INTERNALS.md's watchdog and embedding-lifecycle sections for the
 full contract, including the crash/retry behavior.
+
+### 3b. `pre-commit-append-only.sh` — the store's `pre-commit`
+
+Enforces the append-only invariant docs/SCHEMA.md section 7 describes —
+editing a recorded link's body, or removing or renaming it, is refused (its
+three lifecycle fields — status, superseded_by, promoted_by — may each move
+forward once); a changed mind is always a new link.
+
+`scripts/repo-init.sh` writes this wrapper as `<store>/.git/hooks/pre-commit`,
+same shape as `post-commit` above (same three exports, `exec`s the canonical
+script by absolute path so an edit to it needs no reinstall) — with the same
+foreign-hook refusal `post-commit` now has too: a `pre-commit` this
+installer did not render is left untouched and reported, never silently
+overwritten. Identity is the complete five-line wrapper this installer
+renders — the shebang, the three `MEMCONTINUUM_*` exports, and the `exec`
+line naming the canonical script — never the `exec` line alone, and never a
+substring match anywhere in the file.
+
+```bash
+#!/usr/bin/env bash
+export MEMCONTINUUM_ROOT="<store>"
+export MEMCONTINUUM_PROJECT="<project>"
+export MEMCONTINUUM_PYTHON="<python>"
+exec bash "<this-repo>/hooks/pre-commit-append-only.sh"
+```
+
+The script runs `memlint.py --against-ref HEAD --staged <store>` (`--staged`
+so it judges what is actually about to be committed — the index, not
+whatever else sits in the working tree) and, unlike every other hook here,
+BLOCKS the commit (exit 1) when that check finds an append-only violation —
+the errors on stderr, one `hook.log` line
+(`pre-commit-append-only: rc=1 changed=<n> project=…`). A clean check exits 0
+with `rc=0 changed=<n> project=…`; an unborn HEAD, a missing python,
+memlint itself failing to produce a recognizable result, or (fix wave 1 G1)
+the hook's own cwd not matching `MEMCONTINUUM_ROOT` (`skipped=not-the-store`
+— a wrapper invoked from another repository, e.g. through a mistakenly
+shared `core.hooksPath`, must never judge that repository's commit) all
+exit 0 with `skipped=<reason> project=…` instead — fail-open for
+infrastructure, fail-closed only for a genuine history edit. See docs/INTERNALS.md's memlint
+section (`--against-ref`) for the full rule table, and its "Fail-open is the
+contract" and "The watchdog" sections for why this one hook blocks and why it
+carries no timeout guard. `git commit --no-verify` bypasses this hook
+entirely, same as any git hook — for a store other machines or CI also
+commit to, the real guarantee is the same check run again in CI plus a
+protected branch, not this hook alone.
 
 ## 4. Write-side reminder hooks — five more Claude Code hooks in the target project
 

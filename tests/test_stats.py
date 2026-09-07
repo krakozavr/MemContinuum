@@ -556,6 +556,24 @@ class TestStatsFlags(StatsTestBase):
         rc, out = run_stats_json(home=str(self.home))
         self.assertFalse(any("write side silent" in f for f in out["flags"]))
 
+    def test_commit_nudge_lines_are_not_counted_as_prompts(self):
+        """Codex 12 (fix wave 1 G4): a commit-nudge line is SUPPLEMENTAL --
+        the same invocation's own real outcome line (injected, here) is a
+        SEPARATE line for the SAME one prompt. Five real prompts, five
+        commit-nudge lines (one per prompt, as the hook actually writes
+        them) must report five prompts, not ten."""
+        lines = []
+        for i in range(5):
+            lines.append(f"{ts(1)} userprompt outcome=injected session=s1 project=demo")
+            lines.append(
+                f"{ts(1)} userprompt outcome=commit-nudge sha=abc{i:04d} "
+                "root=/code session=s1 project=demo"
+            )
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home))
+        self.assertEqual(out["user_prompts"], 5, out)
+        self.assertEqual(out["nudges"]["commit_nudges"], 5, out)
+
     def test_read_side_silent_flag(self):
         lines = [f"{ts(1)} userprompt outcome=no-evidence session=s1 project=demo" for _ in range(10)]
         self.write_log(lines)
@@ -725,7 +743,11 @@ class TestStatsFlags(StatsTestBase):
         self.write_log(lines)
         store = self.git_store(commit_dates=[NOW - timedelta(days=400)])
 
-        id_pattern = re.compile(r"INC-\d{4}|TOP-\d{4}")
+        # G9: TOP-\d+, not TOP-\d{4} -- no fixed digit count is enforced on
+        # a topic id anywhere in this store (SCHEMA.md's own running example
+        # is `id: TOP-42`, two digits), so a fixed-width check here could
+        # itself miss a real, shorter id leaking into a flag line.
+        id_pattern = re.compile(r"INC-\d{4}|TOP-\d+")
 
         rc, out = run_stats_json(home=str(self.home), store=str(store))
         self.assertEqual(len(out["flags"]), 2)
@@ -788,10 +810,10 @@ class TestStatsUnknownProject(StatsTestBase):
         self.assertEqual(out2["nudges"]["coverage_injected"], 2, "requesting (unknown) surfaces the legacy lines")
 
     def test_wrong_project_name_reports_zero_not_someone_elses_data(self):
-        self.write_log([f"{ts(1)} userprompt outcome=injected session=s1 project=shotporter"])
+        self.write_log([f"{ts(1)} userprompt outcome=injected session=s1 project=otherproject"])
         rc, out = run_stats_json(home=str(self.home), project="demo")
         self.assertEqual(out["nudges"]["coverage_injected"], 0)
-        self.assertIn("shotporter", out["projects_seen"])
+        self.assertIn("otherproject", out["projects_seen"])
 
     def test_unknown_project_never_flags_even_when_thresholds_met(self):
         """Round 2, ruling 2 (Grok gate BLOCKING finding): >=10 userprompt
@@ -995,6 +1017,44 @@ class TestStatsPrecompactBucket(StatsTestBase):
         self.assertEqual(pc["index_error"], 1)
         self.assertEqual(pc["computed"], 1)
         self.assertEqual(pc["outcomes"]["index-degraded"], 1)
+
+
+class TestStatsPreCommitBucket(StatsTestBase):
+    """Grok re-gate NIT 4 (whole-branch NIT-2, carried over from fix wave
+    1): hooks/pre-commit-append-only.sh writes `pre-commit-append-only:
+    rc=<n> changed=<n>` / `skipped=<reason>` lines to hook.log, and `stats`
+    never counted them at all -- they fell into the generic "other"
+    bucket, indistinguishable from every other uncategorized line."""
+
+    def test_pre_commit_outcomes_are_reported_and_not_counted_as_prompts(self):
+        lines = [
+            f"{ts(1)} pre-commit-append-only: rc=0 changed=2 project=demo",
+            f"{ts(1)} pre-commit-append-only: rc=1 changed=1 project=demo",
+            f"{ts(1)} pre-commit-append-only: skipped=not-the-store project=demo",
+        ]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home), project="demo")
+        self.assertEqual(rc, 0)
+        self.assertIn("pre_commit", out)
+        pcm = out["pre_commit"]
+        self.assertEqual(pcm["pass"], 1)
+        self.assertEqual(pcm["refused"], 1)
+        self.assertEqual(pcm["skipped"], 1)
+        self.assertEqual(pcm["outcomes"]["skipped:not-the-store"], 1)
+        # These three lines must never inflate user_prompts (they carry no
+        # `outcome=` field at all, and route through their own "pre-commit"
+        # kind, never "userprompt").
+        self.assertEqual(out["user_prompts"], 0)
+        self.assertNotIn("other", pcm)
+
+    def test_pre_commit_engine_failure_skip_is_named(self):
+        lines = [f"{ts(1)} pre-commit-append-only: skipped=engine-failure rc=2 project=demo"]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home), project="demo")
+        self.assertEqual(rc, 0)
+        pcm = out["pre_commit"]
+        self.assertEqual(pcm["skipped"], 1)
+        self.assertEqual(pcm["outcomes"]["skipped:engine-failure"], 1)
 
 
 if __name__ == "__main__":

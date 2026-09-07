@@ -245,6 +245,24 @@ class TestFreshInstall(unittest.TestCase):
         self.assertIn("MEMCONTINUUM_ROOT", text)
         self.assertIn("MEMCONTINUUM_PROJECT", text)
 
+    def test_pre_commit_wrapper_present(self):
+        """Task A2-1: the store's git pre-commit is a generated wrapper,
+        installed alongside post-commit, same shape (three exports + an
+        exec of the canonical script by absolute path)."""
+        pre_commit = Path(self.store) / ".git" / "hooks" / "pre-commit"
+        self.assertTrue(pre_commit.is_file(), "pre-commit hook missing")
+        st = pre_commit.stat()
+        self.assertTrue(st.st_mode & stat.S_IXUSR, "pre-commit hook not executable")
+        text = pre_commit.read_text()
+        self.assertIn("pre-commit-append-only.sh", text)
+        self.assertIn("MEMCONTINUUM_ROOT", text)
+        self.assertIn("MEMCONTINUUM_PROJECT", text)
+        self.assertIn("MEMCONTINUUM_PYTHON", text)
+
+    def test_pre_commit_wrapper_reported_in_summary(self):
+        self.assertIn("Pre-commit", self.proc.stdout)
+        self.assertIn("pre-commit-append-only.sh", self.proc.stdout)
+
     def test_skill_copied(self):
         # D1 (updater workstream): the installed copy carries one extra
         # line -- a "<!-- memcontinuum-rendered: SHA -->" stamp right after
@@ -558,6 +576,371 @@ class TestReinstallIdempotent(unittest.TestCase):
     def test_backup_file_written(self):
         backup = Path(str(self.settings_path) + ".bak-memcontinuum")
         self.assertTrue(backup.is_file())
+
+    def test_pre_commit_wrapper_stable_across_reruns(self):
+        pre_commit = Path(self.store) / ".git" / "hooks" / "pre-commit"
+        self.assertTrue(pre_commit.is_file())
+        text = pre_commit.read_text()
+        self.assertIn("pre-commit-append-only.sh", text)
+        # Regenerated in place on the second run -- still ours, same
+        # deterministic content (mirrors post-commit's own idempotency).
+        self.assertIn(self.store, text)
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestPreCommitForeignHook(unittest.TestCase):
+    """Task A2-1 (fix round 1 gives post-commit the identical policy below,
+    TestPostCommitForeignHook): an existing pre-commit this installer did
+    not render must be left untouched and reported -- never silently
+    clobbered."""
+
+    def test_foreign_pre_commit_is_left_untouched_and_reported(self):
+        home = sandbox_home()
+        try:
+            store = str(Path(home) / "store")
+            os.makedirs(store)
+            subprocess.run(["git", "init", "-q", store], check=True)
+            # This installer refuses --store at an existing git repo that
+            # carries none of its markers (exit 9) -- give it a marker
+            # (topics/) and a commit so it classifies as "adopt", same as
+            # TestAdoptClassification's own fixtures.
+            topics = Path(store) / "topics"
+            topics.mkdir()
+            (topics / "existing.md").write_text(
+                "---\ntype: topic\nid: TOP-9500\ntitle: existing\narea: test\n---\nBody\n"
+            )
+            subprocess.run(
+                ["git", "-C", store, "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+                 "add", "-A"], check=True,
+            )
+            subprocess.run(
+                ["git", "-C", store, "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+                 "commit", "-q", "-m", "seed"], check=True,
+            )
+            hooks_dir = Path(store) / ".git" / "hooks"
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            foreign = hooks_dir / "pre-commit"
+            foreign.write_text("#!/usr/bin/env bash\necho hand-authored guard\nexit 1\n")
+            foreign.chmod(0o755)
+
+            proc = run_install(
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude")],
+                home,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(
+                foreign.read_text(), "#!/usr/bin/env bash\necho hand-authored guard\nexit 1\n",
+                "a foreign pre-commit must never be overwritten",
+            )
+            self.assertIn("SKIPPED", proc.stdout)
+            self.assertIn("foreign", proc.stdout.lower())
+            # post-commit was never foreign in this scenario (only
+            # pre-commit was) -- still installed normally.
+            self.assertTrue((hooks_dir / "post-commit").is_file())
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_pre_commit_merely_mentioning_the_script_name_in_a_comment_is_still_foreign(self):
+        """A2-1 review finding N2: identity used to be a loose substring
+        grep (`grep -q "hooks/pre-commit-append-only.sh" "$PRE_COMMIT"`),
+        matching the canonical script's name ANYWHERE in the file -- a
+        hand-authored hook that merely mentions it in a comment (never as
+        the wrapper's own `exec` line) would misclassify as "ours" and get
+        silently regenerated in place. install_store_hook_wrapper now
+        anchors on `^exec bash .*pre-commit-append-only\\.sh$`."""
+        home = sandbox_home()
+        try:
+            store = str(Path(home) / "store")
+            os.makedirs(store)
+            subprocess.run(["git", "init", "-q", store], check=True)
+            topics = Path(store) / "topics"
+            topics.mkdir()
+            (topics / "existing.md").write_text(
+                "---\ntype: topic\nid: TOP-9502\ntitle: existing\narea: test\n---\nBody\n"
+            )
+            subprocess.run(
+                ["git", "-C", store, "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+                 "add", "-A"], check=True,
+            )
+            subprocess.run(
+                ["git", "-C", store, "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+                 "commit", "-q", "-m", "seed"], check=True,
+            )
+            hooks_dir = Path(store) / ".git" / "hooks"
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            foreign_text = (
+                "#!/usr/bin/env bash\n"
+                "# do not confuse me with hooks/pre-commit-append-only.sh\n"
+                "echo hand-authored guard, name-dropped only in a comment\n"
+                "exit 1\n"
+            )
+            foreign = hooks_dir / "pre-commit"
+            foreign.write_text(foreign_text)
+            foreign.chmod(0o755)
+
+            proc = run_install(
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude")],
+                home,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(
+                foreign.read_text(), foreign_text,
+                "a hook merely NAMING the canonical script in a comment must still be "
+                "classified as foreign, never regenerated",
+            )
+            self.assertIn("SKIPPED", proc.stdout)
+            self.assertIn("foreign", proc.stdout.lower())
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_pre_commit_with_extra_lines_around_a_real_exec_line_is_still_foreign(self):
+        """Codex 6 (fix wave 1 G1): the old identity check was a
+        single-line regex match ANYWHERE in the file (`grep -qE "^exec
+        bash .*SCRIPT\\$"`), so a hand-authored wrapper that added its
+        OWN lines around a real `exec bash .../pre-commit-append-only.sh`
+        line (a local policy check before deferring to the canonical
+        script) still matched that one line and was misclassified as
+        "ours" -- silently overwritten, losing the added policy. The
+        check is now the COMPLETE generated shape (exactly five lines);
+        one extra line makes it foreign."""
+        home = sandbox_home()
+        try:
+            store = str(Path(home) / "store")
+            os.makedirs(store)
+            subprocess.run(["git", "init", "-q", store], check=True)
+            topics = Path(store) / "topics"
+            topics.mkdir()
+            (topics / "existing.md").write_text(
+                "---\ntype: topic\nid: TOP-9503\ntitle: existing\narea: test\n---\nBody\n"
+            )
+            subprocess.run(
+                ["git", "-C", store, "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+                 "add", "-A"], check=True,
+            )
+            subprocess.run(
+                ["git", "-C", store, "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+                 "commit", "-q", "-m", "seed"], check=True,
+            )
+            hooks_dir = Path(store) / ".git" / "hooks"
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            hooks_scripts_dir = TOOLS_DIR / "hooks"
+            foreign_text = (
+                "#!/usr/bin/env bash\n"
+                "echo custom local policy check first\n"
+                "export MEMCONTINUUM_ROOT=/somewhere\n"
+                "export MEMCONTINUUM_PROJECT=p\n"
+                "export MEMCONTINUUM_PYTHON=/usr/bin/python3\n"
+                f"exec bash {hooks_scripts_dir}/pre-commit-append-only.sh\n"
+            )
+            foreign = hooks_dir / "pre-commit"
+            foreign.write_text(foreign_text)
+            foreign.chmod(0o755)
+
+            proc = run_install(
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude")],
+                home,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(
+                foreign.read_text(), foreign_text,
+                "a wrapper with an extra line around a real exec line must still be "
+                "classified as foreign, never regenerated",
+            )
+            self.assertIn("SKIPPED", proc.stdout)
+            self.assertIn("foreign", proc.stdout.lower())
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_no_pre_commit_at_all_still_gets_one(self):
+        home = sandbox_home()
+        try:
+            store = str(Path(home) / "store")
+            proc = run_install(
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude")],
+                home,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            pre_commit = Path(store) / ".git" / "hooks" / "pre-commit"
+            self.assertTrue(pre_commit.is_file())
+            self.assertIn("pre-commit-append-only.sh", pre_commit.read_text())
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestPostCommitForeignHook(unittest.TestCase):
+    """Fix round 1 (TOP-0122 L3): post-commit gets the identical
+    foreign-hook refusal policy pre-commit already has above -- mirrors
+    TestPreCommitForeignHook exactly, swapped to post-commit."""
+
+    def test_foreign_post_commit_is_left_untouched_and_reported(self):
+        home = sandbox_home()
+        try:
+            store = str(Path(home) / "store")
+            os.makedirs(store)
+            subprocess.run(["git", "init", "-q", store], check=True)
+            # Same adoption-marker seeding as TestPreCommitForeignHook --
+            # this installer refuses --store at an existing git repo with
+            # none of its markers (exit 9).
+            topics = Path(store) / "topics"
+            topics.mkdir()
+            (topics / "existing.md").write_text(
+                "---\ntype: topic\nid: TOP-9501\ntitle: existing\narea: test\n---\nBody\n"
+            )
+            subprocess.run(
+                ["git", "-C", store, "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+                 "add", "-A"], check=True,
+            )
+            subprocess.run(
+                ["git", "-C", store, "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+                 "commit", "-q", "-m", "seed"], check=True,
+            )
+            hooks_dir = Path(store) / ".git" / "hooks"
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            foreign = hooks_dir / "post-commit"
+            foreign.write_text("#!/usr/bin/env bash\necho hand-authored post-commit guard\n")
+            foreign.chmod(0o755)
+
+            proc = run_install(
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude")],
+                home,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(
+                foreign.read_text(), "#!/usr/bin/env bash\necho hand-authored post-commit guard\n",
+                "a foreign post-commit must never be overwritten",
+            )
+            self.assertIn("SKIPPED", proc.stdout)
+            self.assertIn("foreign", proc.stdout.lower())
+            # pre-commit was never foreign in this scenario -- still
+            # installed normally.
+            self.assertTrue((hooks_dir / "pre-commit").is_file())
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_no_post_commit_at_all_still_gets_one(self):
+        home = sandbox_home()
+        try:
+            store = str(Path(home) / "store")
+            proc = run_install(
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude")],
+                home,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            post_commit = Path(store) / ".git" / "hooks" / "post-commit"
+            self.assertTrue(post_commit.is_file())
+            self.assertIn("post-commit-reindex.sh", post_commit.read_text())
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestSharedHooksPathRefusal(unittest.TestCase):
+    """Codex 1 (BLOCKING, fix wave 1 G1): a store whose git hooks resolve
+    OUTSIDE its own .git (a global or shared core.hooksPath) must never
+    get the pre-commit/post-commit wrappers installed there -- that would
+    make the append-only guard fire for every OTHER repository sharing
+    that hooks directory, not only this store."""
+
+    def _seeded_store_with_shared_hookspath(self, home):
+        store = str(Path(home) / "store")
+        os.makedirs(store)
+        subprocess.run(["git", "init", "-q", store], check=True)
+        topics = Path(store) / "topics"
+        topics.mkdir()
+        (topics / "existing.md").write_text(
+            "---\ntype: topic\nid: TOP-9504\ntitle: existing\narea: test\n---\nBody\n"
+        )
+        subprocess.run(
+            ["git", "-C", store, "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+             "add", "-A"], check=True,
+        )
+        subprocess.run(
+            ["git", "-C", store, "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+             "commit", "-q", "-m", "seed"], check=True,
+        )
+        shared_hooks = Path(home) / "shared-hooks"
+        shared_hooks.mkdir()
+        subprocess.run(
+            ["git", "-C", store, "config", "--local", "core.hooksPath", str(shared_hooks)],
+            check=True,
+        )
+        return store, shared_hooks
+
+    def test_shared_hooks_path_refuses_installation_with_a_note(self):
+        home = sandbox_home()
+        try:
+            store, shared_hooks = self._seeded_store_with_shared_hookspath(home)
+            proc = run_install(
+                ["--project", "p", "--store", store, "--claude-dir", str(Path(home) / ".claude")],
+                home,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertFalse((shared_hooks / "pre-commit").exists())
+            self.assertFalse((shared_hooks / "post-commit").exists())
+            combined = proc.stdout + proc.stderr
+            self.assertIn("core.hooksPath", combined)
+            self.assertIn("SKIPPED", proc.stdout)
+            self.assertIn("--store-hooks-dir", combined)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_a_wrapper_invoked_from_another_repository_never_blocks_its_commit(self):
+        """Even setting the shared-hooksPath refusal aside, the wrapper
+        itself must never block an UNRELATED repo's commit if it somehow
+        ends up invoked there (hooks/pre-commit-append-only.sh's own
+        runtime not-the-store guard) -- reproduced directly against the
+        real hook script, not through repo-init.sh's own refusal above."""
+        home = sandbox_home()
+        try:
+            store, _shared_hooks = self._seeded_store_with_shared_hookspath(home)
+            # An unrelated ordinary code repo, sharing nothing with `store`
+            # except (hypothetically) the same hooks directory a shared
+            # core.hooksPath might have pointed both at.
+            other_repo = Path(home) / "other-repo"
+            other_repo.mkdir()
+            subprocess.run(["git", "init", "-q", str(other_repo)], check=True)
+            subprocess.run(
+                ["git", "-C", str(other_repo), "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+                 "commit", "--allow-empty", "-q", "-m", "seed"], check=True,
+            )
+            (other_repo / "file.txt").write_text("hello\n")
+            subprocess.run(["git", "-C", str(other_repo), "add", "-A"], check=True)
+
+            hook_script = TOOLS_DIR / "hooks" / "pre-commit-append-only.sh"
+            env = dict(os.environ)
+            env["MEMCONTINUUM_ROOT"] = store  # a DIFFERENT repo than other_repo
+            env["MEMCONTINUUM_PROJECT"] = "p"
+            env["MEMCONTINUUM_PYTHON"] = VENV_PYTHON
+            env["MEMCONTINUUM_HOME"] = str(Path(home) / ".memcontinuum")
+            proc = subprocess.run(
+                ["bash", str(hook_script)],
+                cwd=str(other_repo), capture_output=True, text=True, env=env, timeout=30,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            # The positive half of this test: rc=0 alone is also what the
+            # guard-less fallthrough path would produce (the seeded store
+            # has nothing staged, so an unguarded hook would just find it
+            # clean) -- the guard is only proven to have actually FIRED by
+            # the hook.log line it writes instead of running memlint at
+            # all.
+            hook_log = Path(env["MEMCONTINUUM_HOME"]) / "hook.log"
+            log_text = hook_log.read_text() if hook_log.exists() else ""
+            self.assertIn("skipped=not-the-store", log_text, log_text)
+            self.assertNotIn("changed=", log_text, log_text)
+            commit = subprocess.run(
+                ["git", "-C", str(other_repo), "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+                 "commit", "-q", "-m", "ordinary commit"],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(commit.returncode, 0, commit.stdout + commit.stderr)
+            log = subprocess.run(
+                ["git", "-C", str(other_repo), "log", "--oneline"],
+                capture_output=True, text=True, check=True,
+            )
+            self.assertIn("ordinary commit", log.stdout)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
 
 
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
@@ -1246,6 +1629,575 @@ class TestDefaultStoreName(unittest.TestCase):
             shutil.rmtree(home, ignore_errors=True)
 
 
+class TestMcIsWindowsMountedCheckout(unittest.TestCase):
+    """Direct unit coverage for mc_is_windows_mounted_checkout
+    (scripts/mc-registry-lib.sh, TOP-0109 L5): true iff /proc/version names
+    Microsoft's kernel build AND the checkout resolves under
+    /mnt/<letter>/. Both real-world signals are driven through the two test
+    seams (MEMCONTINUUM_PROC_VERSION_FILE, MEMCONTINUUM_TEST_WSL_MOUNT)
+    rather than the machine this suite happens to run on -- CI may or may
+    not itself be WSL, and even a real WSL box has no actual /mnt/<letter>
+    checkout inside a throwaway sandbox HOME. mc-registry-lib.sh is a pure
+    library (no top-level CLI execution), so it is safely sourceable on its
+    own -- same pattern as TestMcPhysical in tests/test_update.py."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp(prefix="memcontinuum-wsl-mount-test-")
+        self.addCleanup(shutil.rmtree, self.td, ignore_errors=True)
+        self.caller = Path(self.td) / "probe.sh"
+        self.caller.write_text(
+            f'#!/usr/bin/env bash\nset -u\n. "{REGISTRY_LIB}"\n'
+            'mc_is_windows_mounted_checkout "$1" && echo YES || echo NO\n'
+        )
+
+    def _call(self, checkout, proc_version_text=None, force=None):
+        env = dict(os.environ)
+        for k in ("MEMCONTINUUM_PROC_VERSION_FILE", "MEMCONTINUUM_TEST_WSL_MOUNT"):
+            env.pop(k, None)
+        if proc_version_text is not None:
+            pv = Path(self.td) / "proc-version"
+            pv.write_text(proc_version_text)
+            env["MEMCONTINUUM_PROC_VERSION_FILE"] = str(pv)
+        else:
+            # A path that cannot exist -- exercises the "no /proc/version at
+            # all" branch (macOS, or any non-Linux box) the same way a
+            # missing real /proc/version would: `read <file` fails, and the
+            # function must return NOT-mounted, never guess.
+            env["MEMCONTINUUM_PROC_VERSION_FILE"] = str(Path(self.td) / "does-not-exist")
+        if force is not None:
+            env["MEMCONTINUUM_TEST_WSL_MOUNT"] = force
+        proc = subprocess.run(
+            [MC_BASH, str(self.caller), checkout],
+            capture_output=True, text=True, env=env, timeout=10,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout.strip()
+
+    def test_microsoft_kernel_and_mnt_path_is_mounted(self):
+        out = self._call("/mnt/c/Users/x/proj", proc_version_text="Linux version 5.15.90.1-microsoft-standard-WSL2")
+        self.assertEqual(out, "YES")
+
+    def test_kernel_name_match_is_case_insensitive(self):
+        out = self._call("/mnt/z/proj", proc_version_text="Linux version foo MICROSOFT bar")
+        self.assertEqual(out, "YES")
+
+    def test_microsoft_kernel_but_native_path_is_not_mounted(self):
+        """Test (d)'s other half: WSL itself, checkout on the native disk
+        (not under /mnt) -- the sibling rule still applies."""
+        out = self._call("/home/x/proj", proc_version_text="Linux version 5.15.90.1-microsoft-standard-WSL2")
+        self.assertEqual(out, "NO")
+
+    def test_mnt_path_but_no_microsoft_kernel_is_not_mounted(self):
+        """Test (d): macOS/Linux without WSL -- a literal /mnt path (an
+        unrelated real mount, nothing to do with WSL) must not read as a
+        Windows-mounted checkout just because of its spelling."""
+        out = self._call("/mnt/c/Users/x/proj", proc_version_text="Linux version 6.1.0-generic")
+        self.assertEqual(out, "NO")
+
+    def test_no_proc_version_at_all_is_not_mounted(self):
+        """macOS (and any non-Linux box) has no /proc/version -- fails
+        open to NOT-mounted, never a guess."""
+        out = self._call("/mnt/c/Users/x/proj")
+        self.assertEqual(out, "NO")
+
+    def test_neither_signal_is_not_mounted(self):
+        out = self._call("/home/x/proj", proc_version_text="Linux version 6.1.0-generic")
+        self.assertEqual(out, "NO")
+
+    def test_force_override_bypasses_both_real_checks(self):
+        """MEMCONTINUUM_TEST_WSL_MOUNT=1 forces true even for a path and a
+        kernel string that would otherwise both say NO -- the seam an
+        end-to-end installer test uses when its sandbox checkout cannot
+        physically be under /mnt."""
+        out = self._call("/home/x/proj", proc_version_text="Linux version 6.1.0-generic", force="1")
+        self.assertEqual(out, "YES")
+
+    def test_force_override_any_other_value_does_not_force(self):
+        out = self._call("/home/x/proj", proc_version_text="Linux version 6.1.0-generic", force="0")
+        self.assertEqual(out, "NO")
+
+    def test_missing_proc_version_file_never_leaks_a_redirection_error_to_stderr(self):
+        """whole-branch-review NIT-1: `IFS= read ... < "$file" 2>/dev/null`
+        silences `read`'s own complaint but NOT bash's own "No such file or
+        directory" for the failed `<` redirect itself -- redirections apply
+        left to right, so `2>/dev/null` must come BEFORE `<` to silence
+        both. Reproduced directly (bypassing self._call, which never looked
+        at stderr) with a proc-version path that cannot exist."""
+        env = dict(os.environ)
+        env.pop("MEMCONTINUUM_PROC_VERSION_FILE", None)
+        env.pop("MEMCONTINUUM_TEST_WSL_MOUNT", None)
+        env["MEMCONTINUUM_PROC_VERSION_FILE"] = str(Path(self.td) / "does-not-exist-at-all")
+        proc = subprocess.run(
+            [MC_BASH, str(self.caller), "/mnt/c/Users/x/proj"],
+            capture_output=True, text=True, env=env, timeout=10,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "NO")
+        self.assertEqual(proc.stderr, "", "a missing proc-version file must never print a raw redirection error")
+
+
+class TestMcDefaultStoreFor(unittest.TestCase):
+    """Direct unit coverage for mc_default_store_for
+    (scripts/mc-registry-lib.sh, TOP-0109 L5): the sibling rule ordinarily,
+    the WSL-disk rule when the checkout is Windows-mounted -- $HOME/dev
+    when that directory exists, else bare $HOME."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp(prefix="memcontinuum-default-store-test-")
+        self.addCleanup(shutil.rmtree, self.td, ignore_errors=True)
+        self.caller = Path(self.td) / "probe.sh"
+        self.caller.write_text(
+            f'#!/usr/bin/env bash\nset -u\n. "{REGISTRY_LIB}"\n'
+            'mc_default_store_for "$1"\n'
+            'printf \'%s\\n%s\\n\' "$MC_DEFAULT_STORE" "$MC_DEFAULT_STORE_WHY"\n'
+        )
+
+    def _call(self, checkout, home, force=None):
+        env = dict(os.environ)
+        env["HOME"] = home
+        env.pop("MEMCONTINUUM_TEST_WSL_MOUNT", None)
+        if force is not None:
+            env["MEMCONTINUUM_TEST_WSL_MOUNT"] = force
+        proc = subprocess.run(
+            [MC_BASH, str(self.caller), checkout],
+            capture_output=True, text=True, env=env, timeout=10,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        lines = proc.stdout.splitlines()
+        return lines[0], (lines[1] if len(lines) > 1 else "")
+
+    def test_windows_mounted_checkout_with_home_dev_lands_under_dev(self):
+        home = Path(self.td) / "home1"
+        (home / "dev").mkdir(parents=True)
+        store, why = self._call("/mnt/c/Users/x/proj", str(home), force="1")
+        self.assertEqual(store, f"{home}/dev/proj-MemContinuum-Store")
+        self.assertIn(f"store defaults to {home}/dev/proj-MemContinuum-Store", why)
+        self.assertIn("Windows-mounted drive", why)
+        self.assertIn("costs seconds", why)
+
+    def test_windows_mounted_checkout_without_home_dev_lands_bare(self):
+        home = Path(self.td) / "home2"
+        home.mkdir()
+        store, why = self._call("/mnt/c/Users/x/proj", str(home), force="1")
+        self.assertEqual(store, f"{home}/proj-MemContinuum-Store")
+        self.assertIn(f"store defaults to {home}/proj-MemContinuum-Store", why)
+
+    def test_non_windows_mounted_checkout_keeps_the_sibling_rule(self):
+        home = Path(self.td) / "home3"
+        (home / "dev").mkdir(parents=True)
+        store, why = self._call("/home/x/proj", str(home))
+        self.assertEqual(store, "/home/x/proj-MemContinuum-Store")
+        self.assertEqual(why, "")
+
+
+class TestMcDefaultStoreForCollisions(unittest.TestCase):
+    """Direct unit coverage for mc_default_store_for's collision guard
+    (whole-branch-review Codex 5 / TOP-0109 L5 follow-up): the WSL-disk
+    default used to key on CHECKOUT's basename alone, so two different
+    checkouts sharing one (client-a/app, client-b/app) silently collapsed
+    onto the identical store. Now: plain name first (never preemptively
+    disambiguated), the checkout's own parent directory name when the plain
+    name already belongs to a different checkout or project, and an
+    outright refusal when even that is already someone else's."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp(prefix="memcontinuum-default-store-collision-test-")
+        self.addCleanup(shutil.rmtree, self.td, ignore_errors=True)
+        self.caller = Path(self.td) / "probe.sh"
+        self.caller.write_text(
+            f'#!/usr/bin/env bash\nset -u\n. "{REGISTRY_LIB}"\n'
+            'mc_default_store_for "$1" "$2"\n'
+            'rc=$?\n'
+            'printf \'%s\\n%s\\n%s\\n%d\\n\' '
+            '"$MC_DEFAULT_STORE" "$MC_DEFAULT_STORE_WHY" '
+            '"$MC_DEFAULT_STORE_REFUSED_WHY" "$rc"\n'
+        )
+
+    def _call(self, checkout, project, home):
+        env = dict(os.environ)
+        for k in list(env):
+            if k.startswith("MEMCONTINUUM_"):
+                del env[k]
+        env["HOME"] = home
+        env["MEMCONTINUUM_TEST_WSL_MOUNT"] = "1"
+        proc = subprocess.run(
+            [MC_BASH, str(self.caller), checkout, project],
+            capture_output=True, text=True, env=env, timeout=10,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        lines = proc.stdout.splitlines()
+        while len(lines) < 4:
+            lines.append("")
+        store, why, refused_why, rc = lines[0], lines[1], lines[2], lines[3]
+        return store, why, refused_why, int(rc)
+
+    @staticmethod
+    def _make_marked_store(path, project_name, checkout=None):
+        path = Path(path)
+        path.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(path)], check=True)
+        checkout_stamp = checkout if checkout is not None else "unknown"
+        (path / "README.md").write_text(
+            f"# {project_name} Rationale store\n\n"
+            f"<!-- memcontinuum-checkout: {checkout_stamp} -->\n\n"
+            "This is MemContinuum's Rationale graph.\n"
+        )
+
+    @staticmethod
+    def _write_registry_row(home, key, store_path, project_name):
+        decisions = Path(home) / ".memcontinuum"
+        decisions.mkdir(parents=True, exist_ok=True)
+        (decisions / "decisions.tsv").write_text(
+            "# MemContinuum per-repo decisions -- written only by memcontinuum-decide.sh\n"
+            "# key\tdecision\tdate\tnote\n"
+            f"{key}\twired\t2026-01-01T00:00:00Z\tstore={store_path} project={project_name}\n"
+        )
+
+    def test_second_checkout_same_basename_different_project_disambiguates_by_parent(self):
+        home = Path(self.td) / "home"
+        (home / "dev").mkdir(parents=True)
+        plain = home / "dev" / "app-MemContinuum-Store"
+        self._make_marked_store(plain, "other")
+        store, why, refused_why, rc = self._call("/mnt/c/Users/client-b/app", "mine", str(home))
+        self.assertEqual(rc, 0)
+        self.assertEqual(refused_why, "")
+        self.assertEqual(store, f"{home}/dev/client-b-app-MemContinuum-Store")
+        self.assertIn("already belongs to a different checkout or project", why)
+
+    def test_checkout_marker_disambiguates_even_with_same_project_name_and_no_registry_row(self):
+        """G9 (the G5 residual): the SAME --project value, no decisions.tsv
+        row at all -- mc_store_project_identity alone would read this as
+        "ours". The store's own rendered checkout marker (mc_store_
+        checkout_identity), naming a DIFFERENT physical checkout, must still
+        disambiguate."""
+        home = Path(self.td) / "home"
+        (home / "dev").mkdir(parents=True)
+        plain = home / "dev" / "app-MemContinuum-Store"
+        self._make_marked_store(plain, "shared-name", checkout="/some/other/checkout/app")
+        store, why, refused_why, rc = self._call("/mnt/c/Users/client-b/app", "shared-name", str(home))
+        self.assertEqual(rc, 0)
+        self.assertEqual(refused_why, "")
+        self.assertEqual(store, f"{home}/dev/client-b-app-MemContinuum-Store")
+        self.assertIn("already belongs to a different checkout or project", why)
+
+    def test_checkout_marker_matching_this_checkout_wins_over_a_mismatched_project_name(self):
+        """The checkout marker is checked BEFORE the project-name fallback
+        (priority order in mc_store_belongs_elsewhere's own docstring): a
+        same-checkout re-run under a RENAMED --project must still land on
+        the plain name, the same guarantee the registry-row test above
+        gives for the --record-decision case, now also true with no
+        registry row at all."""
+        home = Path(self.td) / "home"
+        (home / "dev").mkdir(parents=True)
+        checkout = home / "mnt-stand-in" / "app"
+        checkout.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+        plain = home / "dev" / "app-MemContinuum-Store"
+        self._make_marked_store(plain, "renamed-project", checkout=str(checkout))
+        store, why, refused_why, rc = self._call(str(checkout), "mine", str(home))
+        self.assertEqual(rc, 0)
+        self.assertEqual(refused_why, "")
+        self.assertEqual(store, str(plain))
+
+    def test_checkout_marker_recorded_via_a_symlinked_path_is_still_recognized_as_self(self):
+        """Fix round 2 R5: mc_store_belongs_elsewhere used to compare the
+        raw checkout stamp VERBATIM against mc_physical(CHECKOUT) -- fine
+        when the stamp and the live checkout resolve to the same string,
+        wrong the moment they don't, even though they name the identical
+        checkout. This is exactly what happens on macOS, where a checkout
+        under $TMPDIR is /var/folders/... logically and
+        /private/var/folders/... physically: CWD_TOPLEVEL (what repo-init.sh
+        stamps at creation) returns the logical form, so a store never
+        matched its own checkout there. Reproduced here on Linux with an
+        ordinary symlinked ancestor directory instead: the stamp is
+        recorded via the SYMLINK path (what CWD_TOPLEVEL would have
+        returned had repo-init.sh run from there), and the live checkout is
+        looked up the same way -- both must resolve physically before
+        comparison, or this reads as a foreign checkout and wrongly
+        disambiguates."""
+        home = Path(self.td) / "home"
+        (home / "dev").mkdir(parents=True)
+        real_base = home / "real-mnt"
+        real_base.mkdir()
+        checkout = real_base / "app"
+        checkout.mkdir()
+        subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+        symlinked_base = home / "mnt-stand-in"
+        symlinked_base.symlink_to(real_base)
+        checkout_via_symlink = symlinked_base / "app"
+        plain = home / "dev" / "app-MemContinuum-Store"
+        # Stamped with the SYMLINK path -- what CWD_TOPLEVEL would have
+        # returned had repo-init.sh created this store from that path.
+        self._make_marked_store(plain, "renamed-project", checkout=str(checkout_via_symlink))
+        store, why, refused_why, rc = self._call(str(checkout_via_symlink), "mine", str(home))
+        self.assertEqual(rc, 0)
+        self.assertEqual(refused_why, "")
+        self.assertEqual(store, str(plain))
+
+    def test_registry_row_for_a_different_checkout_disambiguates_even_with_same_project_name(self):
+        """The registry is authoritative when it speaks (advisor
+        refinement): a decisions.tsv row naming the plain path for a
+        DIFFERENT repo key must still disambiguate even when the two
+        checkouts happen to share the SAME --project name -- a README-only
+        check would wrongly call this "ours"."""
+        home = Path(self.td) / "home"
+        (home / "dev").mkdir(parents=True)
+        plain = home / "dev" / "app-MemContinuum-Store"
+        self._make_marked_store(plain, "shared-name")
+        self._write_registry_row(str(home), "/some/other/checkout/app", str(plain), "shared-name")
+        store, why, refused_why, rc = self._call("/mnt/c/Users/client-b/app", "shared-name", str(home))
+        self.assertEqual(rc, 0)
+        self.assertEqual(refused_why, "")
+        self.assertEqual(store, f"{home}/dev/client-b-app-MemContinuum-Store")
+
+    def test_both_plain_and_disambiguated_taken_refuses_rather_than_guessing_a_third_name(self):
+        home = Path(self.td) / "home"
+        (home / "dev").mkdir(parents=True)
+        plain = home / "dev" / "app-MemContinuum-Store"
+        disambiguated = home / "dev" / "client-b-app-MemContinuum-Store"
+        self._make_marked_store(plain, "other-a")
+        self._make_marked_store(disambiguated, "other-b")
+        store, why, refused_why, rc = self._call("/mnt/c/Users/client-b/app", "mine", str(home))
+        self.assertEqual(rc, 1)
+        self.assertEqual(store, "")
+        self.assertNotEqual(refused_why, "")
+        self.assertIn(str(plain), refused_why)
+        self.assertIn(str(disambiguated), refused_why)
+
+    def test_registry_row_for_this_checkout_itself_never_disambiguates(self):
+        """Regression guard, not a red test for this fix: a checkout
+        re-running against its OWN already-registered store (mc_repo_key
+        keyed on the checkout's real git toplevel) must land on the plain
+        name unchanged, never disambiguated. Passes before and after this
+        fix (mc_default_store_for touched neither the registry nor the
+        README before), stated here so a future change to the collision
+        guard cannot regress it silently."""
+        home = Path(self.td) / "home"
+        (home / "dev").mkdir(parents=True)
+        checkout = home / "mnt-stand-in" / "app"
+        checkout.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+        plain = home / "dev" / "app-MemContinuum-Store"
+        self._make_marked_store(plain, "renamed-project")
+        # The recorder keys the row on git's toplevel, which is the PHYSICAL
+        # path (on macOS a $TMPDIR checkout is /var/... logically and
+        # /private/var/... physically); a hand-written row must match it.
+        self._write_registry_row(
+            str(home), os.path.realpath(str(checkout)), str(plain), "renamed-project"
+        )
+        # PROJECT given this run ("mine") deliberately differs from the
+        # registry row's recorded project= ("renamed-project") -- a
+        # same-checkout re-run under a renamed --project must still be
+        # recognized as "self" via the registry, not second-guessed by the
+        # now-stale README/project mismatch.
+        store, why, refused_why, rc = self._call(str(checkout), "mine", str(home))
+        self.assertEqual(rc, 0)
+        self.assertEqual(refused_why, "")
+        self.assertEqual(store, str(plain))
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestDefaultStoreOnWindowsMountedCheckout(unittest.TestCase):
+    """End-to-end coverage (TOP-0109 L5, brief items a/c/e): scripts/repo-
+    init.sh applies the WSL-disk default when the checkout is a Windows-
+    mounted drive under WSL. The sandbox checkout itself can never
+    physically be under /mnt, so MEMCONTINUUM_TEST_WSL_MOUNT=1 (the seam
+    mc_is_windows_mounted_checkout defines) stands in for a real one."""
+
+    def test_a_home_dev_exists_store_lands_under_it_with_explanation(self):
+        home = sandbox_home()
+        try:
+            (Path(home) / "dev").mkdir()
+            repo = Path(home) / "proj"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "."], cwd=repo, check=True)
+            proc = run_install(
+                ["--project", "p", "--dry-run"], home, cwd=str(repo),
+                extra_env={"MEMCONTINUUM_TEST_WSL_MOUNT": "1"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            home_r = os.path.realpath(home)
+            repo_r = os.path.realpath(str(repo))
+            self.assertIn(f"defaulting to {home_r}/dev/proj-MemContinuum-Store", proc.stdout)
+            self.assertIn(
+                f"store defaults to {home_r}/dev/proj-MemContinuum-Store: "
+                "the checkout is on a Windows-mounted drive, where a store "
+                "walk costs seconds",
+                proc.stdout,
+            )
+            # hooks stay with the REPO, never dragged onto the store's disk
+            self.assertIn(f"{repo_r}/.claude", proc.stdout)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_a_no_home_dev_store_lands_bare_under_home(self):
+        home = sandbox_home()
+        try:
+            # sandbox_home() never creates a "dev" subdirectory of its own.
+            self.assertFalse((Path(home) / "dev").is_dir())
+            repo = Path(home) / "proj"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "."], cwd=repo, check=True)
+            proc = run_install(
+                ["--project", "p", "--dry-run"], home, cwd=str(repo),
+                extra_env={"MEMCONTINUUM_TEST_WSL_MOUNT": "1"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            home_r = os.path.realpath(home)
+            self.assertIn(f"defaulting to {home_r}/proj-MemContinuum-Store", proc.stdout)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_c_explicit_store_wins_even_on_a_windows_mounted_checkout(self):
+        home = sandbox_home()
+        try:
+            repo = Path(home) / "proj"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "."], cwd=repo, check=True)
+            explicit_store = str(Path(home) / "elsewhere" / "store")
+            proc = run_install(
+                ["--project", "p", "--store", explicit_store,
+                 "--claude-dir", str(repo / ".claude"), "--dry-run"],
+                home,
+                extra_env={"MEMCONTINUUM_TEST_WSL_MOUNT": "1"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertNotIn("Windows-mounted drive", proc.stdout)
+            self.assertNotIn("proj-MemContinuum-Store", proc.stdout)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_e_record_decision_registry_row_names_the_physical_wsl_store(self):
+        home = sandbox_home()
+        try:
+            (Path(home) / "dev").mkdir()
+            repo = Path(home) / "proj"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "."], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "-c", "user.email=a@b.c", "-c", "user.name=a",
+                 "commit", "-q", "--allow-empty", "-m", "init"],
+                cwd=repo, check=True,
+            )
+            proc = run_install(
+                ["--project", "p", "--non-interactive", "--record-decision"],
+                home, cwd=str(repo),
+                extra_env={"MEMCONTINUUM_TEST_WSL_MOUNT": "1"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            home_r = os.path.realpath(home)
+            decisions = Path(home) / ".memcontinuum" / "decisions.tsv"
+            self.assertTrue(decisions.is_file(), "no decisions.tsv written")
+            note = decisions.read_text().splitlines()[-1]
+            self.assertIn(f"store={home_r}/dev/proj-MemContinuum-Store", note)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_f_two_checkouts_sharing_a_basename_get_distinct_stores_never_a_silent_share(self):
+        """End-to-end (whole-branch-review Codex 5): two DIFFERENT checkouts
+        that happen to share a basename ("app") both default onto the WSL-
+        disk rule. A real first install renders that checkout's actual
+        store README via templates/store-README.md.tmpl -- proving the
+        template's first line and mc_store_project_identity's parser agree,
+        not just that a hand-written fixture happens to match today. The
+        second checkout's --dry-run must then land on the parent-
+        disambiguated name instead of silently adopting the first one's
+        store."""
+        home = sandbox_home()
+        try:
+            (Path(home) / "dev").mkdir()
+
+            client_a = Path(home) / "client-a" / "app"
+            client_a.mkdir(parents=True)
+            subprocess.run(["git", "init", "-q", "."], cwd=client_a, check=True)
+            subprocess.run(
+                ["git", "-c", "user.email=a@b.c", "-c", "user.name=a",
+                 "commit", "-q", "--allow-empty", "-m", "init"],
+                cwd=client_a, check=True,
+            )
+            proc_a = run_install(
+                ["--project", "app-a", "--non-interactive"],
+                home, cwd=str(client_a),
+                extra_env={"MEMCONTINUUM_TEST_WSL_MOUNT": "1"},
+            )
+            self.assertEqual(proc_a.returncode, 0, proc_a.stdout + proc_a.stderr)
+            home_r = os.path.realpath(home)
+            plain_store = Path(home_r) / "dev" / "app-MemContinuum-Store"
+            self.assertTrue(plain_store.is_dir(), "first install did not create the plain-named store")
+            readme = (plain_store / "README.md").read_text()
+            self.assertEqual(readme.splitlines()[0], "# app-a Rationale store")
+
+            client_b = Path(home) / "client-b" / "app"
+            client_b.mkdir(parents=True)
+            subprocess.run(["git", "init", "-q", "."], cwd=client_b, check=True)
+            proc_b = run_install(
+                ["--project", "app-b", "--dry-run"],
+                home, cwd=str(client_b),
+                extra_env={"MEMCONTINUUM_TEST_WSL_MOUNT": "1"},
+            )
+            self.assertEqual(proc_b.returncode, 0, proc_b.stdout + proc_b.stderr)
+            disambiguated = f"{home_r}/dev/client-b-app-MemContinuum-Store"
+            self.assertIn(f"defaulting to {disambiguated}", proc_b.stdout)
+            self.assertIn("already belongs to a different checkout or project", proc_b.stdout)
+            # never silently adopted the first checkout's store
+            self.assertNotIn(f"defaulting to {home_r}/dev/app-MemContinuum-Store", proc_b.stdout)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_g_same_project_name_across_two_checkouts_still_disambiguates(self):
+        """G9 (the G5 residual, whole-branch-review Codex 5 follow-up): the
+        exact pair test_f's own project-name check alone cannot tell apart
+        -- two DIFFERENT checkouts sharing a basename ("app") AND the
+        IDENTICAL --project value, neither ever run through
+        --record-decision. mc_store_project_identity alone would read the
+        second as "ours" (the project name matches by construction); the
+        store's own rendered checkout marker (mc_store_checkout_identity)
+        must still tell them apart by physical path."""
+        home = sandbox_home()
+        try:
+            (Path(home) / "dev").mkdir()
+
+            client_a = Path(home) / "client-a" / "app"
+            client_a.mkdir(parents=True)
+            subprocess.run(["git", "init", "-q", "."], cwd=client_a, check=True)
+            subprocess.run(
+                ["git", "-c", "user.email=a@b.c", "-c", "user.name=a",
+                 "commit", "-q", "--allow-empty", "-m", "init"],
+                cwd=client_a, check=True,
+            )
+            proc_a = run_install(
+                ["--project", "shared", "--non-interactive"],
+                home, cwd=str(client_a),
+                extra_env={"MEMCONTINUUM_TEST_WSL_MOUNT": "1"},
+            )
+            self.assertEqual(proc_a.returncode, 0, proc_a.stdout + proc_a.stderr)
+            home_r = os.path.realpath(home)
+            client_a_r = os.path.realpath(str(client_a))
+            plain_store = Path(home_r) / "dev" / "app-MemContinuum-Store"
+            self.assertTrue(plain_store.is_dir(), "first install did not create the plain-named store")
+            readme = (plain_store / "README.md").read_text()
+            self.assertEqual(readme.splitlines()[0], "# shared Rationale store")
+            self.assertIn(f"<!-- memcontinuum-checkout: {client_a_r} -->", readme)
+
+            client_b = Path(home) / "client-b" / "app"
+            client_b.mkdir(parents=True)
+            subprocess.run(["git", "init", "-q", "."], cwd=client_b, check=True)
+            proc_b = run_install(
+                ["--project", "shared", "--dry-run"],
+                home, cwd=str(client_b),
+                extra_env={"MEMCONTINUUM_TEST_WSL_MOUNT": "1"},
+            )
+            self.assertEqual(proc_b.returncode, 0, proc_b.stdout + proc_b.stderr)
+            disambiguated = f"{home_r}/dev/client-b-app-MemContinuum-Store"
+            self.assertIn(f"defaulting to {disambiguated}", proc_b.stdout)
+            self.assertIn("already belongs to a different checkout or project", proc_b.stdout)
+            # never silently adopted client-a's store just because the
+            # project name happens to match
+            self.assertNotIn(f"defaulting to {home_r}/dev/app-MemContinuum-Store", proc_b.stdout)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
 class TestSymlinkedStoreAndCodeRootResolvePhysically(unittest.TestCase):
     """Ruling 89 / symlink-paths fix: abspath() (scripts/repo-init.sh) used
@@ -1468,7 +2420,14 @@ class TestNoMachineIdentifyingContent(unittest.TestCase):
         username_needle = "kra" + "kozavr"
         path_needle = "/mnt/d/!_WORK_" + "!"
         project_needles = ["mmd" + "-swift", "MMD" + "App", "MMD" + "Core", "Shot" + "Porter"]
-        return [username_needle, path_needle] + project_needles
+        # test-stats-lowercase-project-id: a lowercase-only rendering (a
+        # test author typing a project id straight, with no capitalization
+        # convention) is a different string to a plain substring scan --
+        # the first project needle above is already all-lowercase, so only
+        # the two PascalCase-only ones below need a lowercase form, built
+        # the same split way so this file does not trip itself.
+        project_needles_lower = ["mmd" + "app", "mmd" + "core", "shot" + "porter"]
+        return [username_needle, path_needle] + project_needles + project_needles_lower
 
     @classmethod
     def _scan_for_needles(cls, entries):

@@ -3507,6 +3507,448 @@ class TestUserPromptLookback(HookTestBase):
 
 
 # ---------------------------------------------------------------------------
+# 5c. userprompt-remind.sh -- the commit nudge (TOP-0122 L1 rule 2a)
+# ---------------------------------------------------------------------------
+
+
+class TestUserPromptCommitNudge(HookTestBase):
+    """Commit messages name the decision (TOP-0122 L1 rule 2a; rulings 140,
+    144, DESIGN-a2a3.md A2-3): when a code root's HEAD moves since the last
+    prompt (state `last_seen_heads`, distinct from the per-SESSION
+    `start_code_shas`) and the new commit names no TOP-xxxx id, and the
+    session's own `unmapped` call already finds at least one edited file
+    under that root with no topic, userprompt-remind.sh adds one fact line
+    and logs `outcome=commit-nudge`, once per commit (`nudged_commits`,
+    bounded to the last 20 in state). `last_seen_heads` always advances to
+    the new HEAD once a root is examined, whether or not it nudges."""
+
+    def _commit(self, repo, message, filename="newcommit.py", content="# x\n"):
+        _write(repo / "src" / filename, content)
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "-c", "user.email=a@b.c", "-c", "user.name=a",
+             "commit", "-q", "-m", message],
+            cwd=repo, check=True,
+        )
+        return git_head(repo)
+
+    def _seed_last_seen(self, session_id, heads: dict):
+        """Directly seeds state["last_seen_heads"] -- the multi-root suite's
+        own established pattern for start_code_shas (see
+        test_userprompt_remind_multiroot_coverage_and_head_changed)."""
+        state_file = self.state_file(session_id)
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        state = {}
+        if state_file.exists():
+            state = json.loads(state_file.read_text())
+        state["last_seen_heads"] = heads
+        state_file.write_text(json.dumps(state))
+
+    def test_commit_without_top_id_and_unmapped_edit_gets_nudged(self):
+        session_id = "s-nudge-a"
+        start_sha = git_head(self.code_root)
+        self._seed_last_seen(session_id, {str(self.code_root): start_sha})
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+
+        new_sha = self._commit(self.code_root, "a plain commit, no decision id")
+
+        proc, _ = run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        short = new_sha[:7]
+        root_name = self.code_root.name
+        self.assertIn(
+            f"Commit {short} under {root_name} names no decision; "
+            "1 file(s) edited under this root in the session have no topic",
+            ctx,
+        )
+        self.assertIn(
+            "name the decision (TOP-xxxx Ln) in the message, or write the record.", ctx
+        )
+        self.assertEqual(scan_forbidden_lines(ctx), [])
+
+        log_text = (self.home / "hook.log").read_text()
+        nudge_lines = [l for l in log_text.splitlines() if "outcome=commit-nudge" in l]
+        self.assertEqual(len(nudge_lines), 1, log_text)
+        self.assertIn(f"sha={short}", nudge_lines[0])
+        self.assertIn(f"root={self.code_root}", nudge_lines[0])
+        self.assertTrue(
+            nudge_lines[0].rstrip().endswith(f"project={self.project}"), nudge_lines[0]
+        )
+        self.assertNotIn("Traceback", log_text)
+
+        state = self.load_state(session_id)
+        self.assertEqual(state["last_seen_heads"][str(self.code_root)], new_sha)
+        self.assertIn(new_sha, state["nudged_commits"])
+
+    def test_same_commit_next_prompt_does_not_repeat(self):
+        session_id = "s-nudge-b"
+        start_sha = git_head(self.code_root)
+        self._seed_last_seen(session_id, {str(self.code_root): start_sha})
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+        self._commit(self.code_root, "no decision here either")
+
+        run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.base_env())
+        log_before = (self.home / "hook.log").read_text()
+        self.assertEqual(log_before.count("outcome=commit-nudge"), 1, log_before)
+
+        # Same commit still HEAD -- a second prompt must not repeat the nudge.
+        proc2, _ = run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.base_env())
+        self.assertEqual(proc2.returncode, 0, proc2.stderr)
+        log_after = (self.home / "hook.log").read_text()
+        self.assertEqual(log_after.count("outcome=commit-nudge"), 1, log_after)
+
+    def test_revisited_sha_already_nudged_is_not_renudged(self):
+        """Beyond the brief's own list: exercises nudged_commits itself (not
+        just the trivial "HEAD did not move" case above) -- HEAD moves away
+        from an already-nudged commit and back to it; the revisit must not
+        re-nudge even though last_seen_heads reads it as "moved" again."""
+        session_id = "s-nudge-b2"
+        start_sha = git_head(self.code_root)
+        self._seed_last_seen(session_id, {str(self.code_root): start_sha})
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+
+        nudged_sha = self._commit(self.code_root, "no decision on this one")
+        run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.base_env())
+        log1 = (self.home / "hook.log").read_text()
+        self.assertEqual(log1.count("outcome=commit-nudge"), 1, log1)
+
+        self._commit(
+            self.code_root, "TOP-0042 L3 a second, decided commit",
+            filename="secondcommit.py", content="# second\n",
+        )
+        run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.base_env())
+
+        subprocess.run(["git", "reset", "-q", "--hard", nudged_sha], cwd=self.code_root, check=True)
+        proc3, _ = run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.base_env())
+        self.assertEqual(proc3.returncode, 0, proc3.stderr)
+        log3 = (self.home / "hook.log").read_text()
+        self.assertEqual(log3.count("outcome=commit-nudge"), 1, log3)
+
+    def test_commit_naming_a_decision_is_not_nudged(self):
+        session_id = "s-nudge-c"
+        start_sha = git_head(self.code_root)
+        self._seed_last_seen(session_id, {str(self.code_root): start_sha})
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+
+        new_sha = self._commit(self.code_root, "TOP-0042 L3 names its own decision")
+
+        proc, _ = run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertNotIn("outcome=commit-nudge", log_text)
+        if proc.stdout.strip():
+            ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+            self.assertNotIn("names no decision", ctx)
+
+        state = self.load_state(session_id)
+        self.assertEqual(state["last_seen_heads"][str(self.code_root)], new_sha)
+
+    def test_commit_naming_a_decision_with_a_short_id_is_not_nudged(self):
+        """G9 (Codex 16's class, carried into this hook): SCHEMA.md's own
+        running example topic is `id: TOP-42`, two digits -- no fixed digit
+        count is enforced on `id:` anywhere else in this store, matching
+        memlint.py's own decision-marker regex (`TOP-\\d+`, fixed in fix wave
+        1 G2). This hook's own TOP_RE used to require exactly four digits,
+        so a commit naming a genuinely shorter (or longer) id read as naming
+        NO decision at all and got wrongly nudged."""
+        session_id = "s-nudge-c2"
+        start_sha = git_head(self.code_root)
+        self._seed_last_seen(session_id, {str(self.code_root): start_sha})
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+
+        new_sha = self._commit(self.code_root, "TOP-42 L1 names its own decision")
+
+        proc, _ = run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertNotIn("outcome=commit-nudge", log_text)
+        if proc.stdout.strip():
+            ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+            self.assertNotIn("names no decision", ctx)
+
+        state = self.load_state(session_id)
+        self.assertEqual(state["last_seen_heads"][str(self.code_root)], new_sha)
+
+    def test_commit_with_no_unmapped_edits_is_not_nudged_but_last_seen_advances(self):
+        session_id = "s-nudge-d"
+        start_sha = git_head(self.code_root)
+        self._seed_last_seen(session_id, {str(self.code_root): start_sha})
+        # Only a MAPPED file in the ledger -- unmapped's own list for this
+        # root is empty, so the nudge's own count-under-root is 0.
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "mapped.py"), "code")])
+
+        new_sha = self._commit(self.code_root, "no decision, but nothing unmapped either")
+
+        proc, _ = run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertNotIn("outcome=commit-nudge", log_text)
+        if proc.stdout.strip():
+            ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+            self.assertNotIn("names no decision", ctx)
+
+        # Rule 3: last_seen_heads still advances even when nothing is nudged.
+        state = self.load_state(session_id)
+        self.assertEqual(state["last_seen_heads"][str(self.code_root)], new_sha)
+
+    def test_two_roots_only_one_moved_nudges_only_that_root(self):
+        session_id = "s-nudge-e"
+        code_root_b = Path(self.td) / "code-b"
+        code_root_b.mkdir()
+        _write(code_root_b / "src" / "b_unmapped.py", "# b unmapped\n")
+        git_init(code_root_b)
+
+        roots = [str(self.code_root.resolve()), str(code_root_b.resolve())]
+        env = self.base_env(
+            MEMCONTINUUM_CODE_ROOT=roots[0], MEMCONTINUUM_CODE_ROOTS=json.dumps(roots),
+        )
+        self._seed_last_seen(session_id, {
+            str(self.code_root.resolve()): git_head(self.code_root),
+            str(code_root_b.resolve()): git_head(code_root_b),
+        })
+        self.seed_ledger(session_id, [
+            (str(self.code_root / "src" / "unmapped.py"), "code"),
+            (str(code_root_b / "src" / "b_unmapped.py"), "code"),
+        ])
+
+        # Advance root B only, with no decision id.
+        new_sha_b = self._commit(code_root_b, "root b change, no decision")
+
+        proc, _ = run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(f"Commit {new_sha_b[:7]} under {code_root_b.name} names no decision", ctx)
+        self.assertEqual(ctx.count("names no decision"), 1, ctx)
+
+        log_text = (self.home / "hook.log").read_text()
+        self.assertEqual(log_text.count("outcome=commit-nudge"), 1, log_text)
+        self.assertIn(f"root={code_root_b.resolve()}", log_text)
+
+        state = self.load_state(session_id)
+        self.assertEqual(
+            state["last_seen_heads"][str(self.code_root.resolve())], git_head(self.code_root)
+        )
+        self.assertEqual(state["last_seen_heads"][str(code_root_b.resolve())], new_sha_b)
+
+    def test_colliding_relative_names_across_sibling_roots_count_independently(self):
+        """Codex 11 / Grok M6: two sibling (non-nested) code roots each have
+        their OWN unrelated file at the identical relative path
+        (src/collide.py), neither topic-covered. Both edited this session;
+        only root B is committed, with no decision id. The nudge count for
+        root B's own commit must be exactly 1 (root B's own file) -- never
+        2 (double-counting root A's unrelated file merely because its
+        relative-path STRING happens to match), and never 0 (a
+        `by_path`/set-membership regression that fails to recognize root
+        B's own file at all)."""
+        session_id = "s-nudge-collide"
+        code_root_b = Path(self.td) / "code-b"
+        code_root_b.mkdir()
+        _write(code_root_b / "src" / "collide.py", "# root b, unmapped\n")
+        git_init(code_root_b)
+        # self.code_root already has src/mapped.py (topic-covered) and
+        # src/unmapped.py from HookTestBase.setUp; add the colliding name.
+        _write(self.code_root / "src" / "collide.py", "# root a, unmapped\n")
+        subprocess.run(["git", "add", "-A"], cwd=self.code_root, check=True)
+        subprocess.run(
+            ["git", "-c", "user.email=a@b.c", "-c", "user.name=a",
+             "commit", "-q", "-m", "seed root a collide.py"],
+            cwd=self.code_root, check=True,
+        )
+
+        roots = [str(self.code_root.resolve()), str(code_root_b.resolve())]
+        env = self.base_env(
+            MEMCONTINUUM_CODE_ROOT=roots[0], MEMCONTINUUM_CODE_ROOTS=json.dumps(roots),
+        )
+        self._seed_last_seen(session_id, {
+            str(self.code_root.resolve()): git_head(self.code_root),
+            str(code_root_b.resolve()): git_head(code_root_b),
+        })
+        self.seed_ledger(session_id, [
+            (str(self.code_root / "src" / "collide.py"), "code"),
+            (str(code_root_b / "src" / "collide.py"), "code"),
+        ])
+
+        new_sha_b = self._commit(
+            code_root_b, "root b collide, no decision", filename="collide.py",
+            content="# root b, unmapped, edited again\n",
+        )
+
+        proc, _ = run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(
+            f"Commit {new_sha_b[:7]} under {code_root_b.name} names no decision; "
+            "1 file(s) edited under this root in the session have no topic",
+            ctx,
+        )
+        log_text = (self.home / "hook.log").read_text()
+        self.assertEqual(log_text.count("outcome=commit-nudge"), 1, log_text)
+
+    def test_deleted_root_fails_open_no_traceback(self):
+        session_id = "s-nudge-f"
+        start_sha = git_head(self.code_root)
+        self._seed_last_seen(session_id, {str(self.code_root): start_sha})
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+
+        shutil.rmtree(self.code_root)
+
+        proc, _ = run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertNotIn("outcome=commit-nudge", log_text)
+        self.assertNotIn("Traceback", log_text)
+        self.assertNotIn("Traceback", proc.stderr)
+
+    def test_git_log_failure_after_real_head_move_fails_open(self):
+        """A corrupted commit object: `git rev-parse HEAD` (mc_git_head,
+        used for CODE_HEADS/the gate) still succeeds, but `git log -1
+        --format=%B` (this feature's own call) fails -- the failure this
+        rule's own subprocess call must itself absorb, distinct from a
+        wholly deleted root (the gate never even sees a moved head there)."""
+        session_id = "s-nudge-f2"
+        start_sha = git_head(self.code_root)
+        self._seed_last_seen(session_id, {str(self.code_root): start_sha})
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+
+        new_sha = self._commit(self.code_root, "a commit whose object goes missing")
+        obj_file = self.code_root / ".git" / "objects" / new_sha[:2] / new_sha[2:]
+        self.assertTrue(obj_file.is_file(), obj_file)
+        obj_file.rename(obj_file.with_suffix(".bak"))
+
+        proc, _ = run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertNotIn("outcome=commit-nudge", log_text)
+        self.assertNotIn("Traceback", log_text)
+        self.assertNotIn("Traceback", proc.stderr)
+
+    def test_clear_reseeds_last_seen_heads_from_current_head(self):
+        session_id = "s-nudge-g"
+        run_script(SESSIONSTART_HOOK, self.session_start_payload(session_id, "startup"), self.base_env())
+        start_state = self.load_state(session_id)
+        self.assertEqual(
+            start_state["last_seen_heads"][str(self.code_root)], git_head(self.code_root)
+        )
+
+        new_sha = self._commit(self.code_root, "advance past startup, no decision")
+        self.assertNotEqual(new_sha, start_state["last_seen_heads"][str(self.code_root)])
+
+        proc, _ = run_script(
+            SESSIONSTART_HOOK, self.session_start_payload(session_id, "clear"), self.base_env()
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        cleared_state = self.load_state(session_id)
+        self.assertEqual(cleared_state["last_seen_heads"][str(self.code_root)], new_sha)
+        self.assertEqual(cleared_state["nudged_commits"], [])
+
+    def test_moved_head_is_checked_regardless_of_coverage_candidacy(self):
+        """Codex 9 (BLOCKING): the brief's own shape -- a coverage reminder
+        fires first (a genuine candidate turn, consuming `grew` against
+        last_injected_pairs), THEN a commit with no decision id, THEN five
+        more prompts with no NEW ledger growth (so coverage candidacy is
+        False on every one of them). The moved-HEAD check -- and the
+        commit nudge it gates -- must still fire exactly once across those
+        five prompts; last_seen_heads must still advance. On the old code,
+        the whole moved-HEAD computation lived inside `if CANDIDATE=1`, so
+        none of those five prompts ever even looked at HEAD: zero nudges,
+        last_seen_heads frozen at whatever it was after prompt 1."""
+        session_id = "s-nudge-candidacy"
+        start_sha = git_head(self.code_root)
+        self._seed_last_seen(session_id, {str(self.code_root): start_sha})
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+
+        # Prompt 1: a genuine coverage candidate turn (first ever ledger
+        # pairs, nothing injected yet) -- fires "injected", consuming grew.
+        proc1, _ = run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.base_env())
+        self.assertEqual(proc1.returncode, 0, proc1.stderr)
+        self.assertTrue(proc1.stdout.strip(), "prompt 1 must be a genuine coverage candidate")
+        state_after_1 = self.load_state(session_id)
+        self.assertTrue(state_after_1.get("last_injected_pairs"), state_after_1)
+
+        new_sha = self._commit(self.code_root, "a commit with no decision id, after the reminder")
+
+        # Five more prompts, same session, same (unchanged) ledger -- grew
+        # is False every time, so coverage is never a candidate again.
+        for _ in range(5):
+            proc, _ = run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.base_env())
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        log_text = (self.home / "hook.log").read_text()
+        self.assertEqual(
+            log_text.count("outcome=commit-nudge"), 1,
+            "the commit nudge must fire exactly once across the five non-candidate "
+            "prompts following the commit, not zero",
+        )
+        self.assertIn("outcome=nudge-only", log_text)
+        self.assertNotIn("Traceback", log_text)
+
+        state = self.load_state(session_id)
+        self.assertEqual(state["last_seen_heads"][str(self.code_root)], new_sha)
+        self.assertIn(new_sha, state["nudged_commits"])
+
+    def test_nudge_only_turn_never_touches_coverage_cooldown_bookkeeping(self):
+        """Codex 9, the risk the advisor named alongside the fix: a
+        nudge-only turn (CANDIDATE=0, a root moved) must never run
+        coverage's OWN Phase-3 bookkeeping (last_injected_pairs,
+        last_inject_turn/time/ts) -- doing so would let a commit nudge
+        quietly re-arm coverage's cooldown clock without coverage ever
+        actually having fired again. Kept to a single nudge-only prompt
+        (unlike the five-prompt brief scenario above) so the unrelated
+        T-thin look-back reminder -- which legitimately touches this same
+        bookkeeping once it becomes eligible after enough turns -- never
+        confounds this specific assertion."""
+        session_id = "s-nudge-cooldown"
+        start_sha = git_head(self.code_root)
+        self._seed_last_seen(session_id, {str(self.code_root): start_sha})
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+
+        proc1, _ = run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.base_env())
+        self.assertEqual(proc1.returncode, 0, proc1.stderr)
+        state_after_1 = self.load_state(session_id)
+        self.assertTrue(state_after_1.get("last_injected_pairs"), state_after_1)
+
+        self._commit(self.code_root, "no decision id, one nudge-only prompt follows")
+
+        proc2, _ = run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.base_env())
+        self.assertEqual(proc2.returncode, 0, proc2.stderr)
+
+        log_text = (self.home / "hook.log").read_text()
+        self.assertEqual(log_text.count("outcome=commit-nudge"), 1, log_text)
+        self.assertIn("outcome=nudge-only", log_text)
+
+        state = self.load_state(session_id)
+        self.assertEqual(state["last_injected_pairs"], state_after_1["last_injected_pairs"])
+        self.assertEqual(state["last_inject_turn"], state_after_1["last_inject_turn"])
+        self.assertEqual(state["last_inject_time"], state_after_1["last_inject_time"])
+
+    def test_stats_reports_commit_nudges(self):
+        session_id = "s-nudge-h"
+        start_sha = git_head(self.code_root)
+        self._seed_last_seen(session_id, {str(self.code_root): start_sha})
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+        self._commit(self.code_root, "counted by stats, no decision")
+
+        proc, _ = run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertEqual(log_text.count("outcome=commit-nudge"), 1, log_text)
+
+        stats_args = SimpleNamespace(
+            project=self.project, days=7, home=str(self.home), store=None, json=True, now=None,
+        )
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = memidx.cmd_stats(stats_args)
+        self.assertEqual(rc, 0)
+        result = json.loads(buf.getvalue())
+        self.assertEqual(result["nudges"]["commit_nudges"], 1, result["nudges"])
+
+
+# ---------------------------------------------------------------------------
 # 6. sessionend-stamp.sh
 # ---------------------------------------------------------------------------
 

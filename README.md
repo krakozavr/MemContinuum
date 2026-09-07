@@ -37,8 +37,13 @@ newest first, dated, and tagged with *who actually said it* — the project
 owner's own words, a summary they confirmed, an agent's inference, a reviewer's
 finding, or something derived from code and tests. A changed mind is a new entry
 in the chain, never an edit to the old one, so "we tried X, it did not work
-because Y, so we do Z instead" stays intact and citable. The linter does not enforce
-this invariant; git history is the record's own audit trail.
+because Y, so we do Z instead" stays intact and citable. The linter enforces this
+invariant on every commit: the store's own git hook refuses to commit an edit to
+a recorded link's body (its three lifecycle fields — status, the link it was
+superseded by, the link that promoted it — may each move forward once, since
+closing a link or promoting it is bookkeeping, not a change of mind), and the
+same check can run again in CI for a
+guarantee `git commit --no-verify` cannot bypass locally.
 
 Retrieval is **automatic** for edits made with the Edit and Write tools, not
 left to anyone's discipline. Before one of those touches a file, a hook looks
@@ -113,6 +118,10 @@ governance pattern, not an access control: nothing in the code stops another
 role from editing a store file directly. Each store gets
 `inbox/{codex,grok,audit}` directories precisely so that "a reviewer proposes a
 record" and "the orchestrator writes it up" stay two deliberate steps by habit.
+An inbox drop indexes (so `check`/`reindex` count it) but is not first-class:
+it types as `inbox` and `search` leaves it out of results by default
+(`--include-inbox` widens back) until the orchestrator promotes it into a real
+record.
 
 Subagents get the relevant decision history handed to them before they touch a
 file with the Edit or Write tools; they do not have to go looking for it. A
@@ -238,7 +247,19 @@ and the index filename (`[A-Za-z0-9._-]` only — it is embedded in every hook
 line this installer writes). `--store DIR` is where the markdown store lives;
 omit it and the conventional name is used — `<repo>-MemContinuum-Store` beside
 the repo you are in, or `MemContinuum-Store` inside the current directory when
-that is not a git repo. `--code-root DIR` (repeatable) is the code checkout
+that is not a git repo. On a checkout physically on a Windows-mounted drive
+under WSL, where a store walk costs seconds rather than milliseconds, the
+default instead lands on the WSL disk — `$HOME/dev/<repo>-MemContinuum-Store`,
+or bare `$HOME/<repo>-MemContinuum-Store` when `$HOME/dev` does not exist —
+and the installer prints one line saying why. That name is keyed on the
+checkout's basename alone, so two different checkouts sharing one (two
+clients both named `app`, say) never silently share it: when the plain name
+already belongs to a different checkout or project, the checkout's own
+parent directory disambiguates it instead (`<parent>-<repo>-MemContinuum-
+Store`); when even that name is already taken, the installer refuses and
+asks for an explicit `--store` rather than guess a third name.
+
+`--code-root DIR` (repeatable) is the code checkout
 whose edits should trigger retrieval; omit it entirely for a rationale-only
 install, and the two edit-time hooks are simply not wired. `--python PATH`
 names the python to run the engine with, and `--bootstrap-venv [DIR]` creates
@@ -362,9 +383,11 @@ memlint.py STORE --code-root DIR                                                
 
 `--project NAME` is not optional in practice: leave it out and everything goes
 to a shared `default` namespace and its `default.sqlite`, mixing projects into
-one index. `search` without `--status active` also returns superseded,
-declined and historical rulings — plain (non-`--json`) output does not show
-each hit's status, so a stray one there reads as current. `drift` is the one
+one index. `search` defaults to `active` records — plus anything that never
+carries a `status` of its own at all (a `sources/` file, an `inbox/` drop) —
+with no flag needed for the common case; `--status any` widens to superseded, declined,
+provisional and historical rulings too, and plain (non-`--json`) output does
+not show each hit's status, so a stray one there reads as current. `drift` is the one
 that reads rulings written with a checkable shape ("all deletes go through the
 one gate") and turns them into failing checks when the code quietly grows a
 way around them. `stats` is the health check: it reads `hook.log` and reports,
@@ -390,6 +413,16 @@ be safely updated for one file or record — fails the reindex with a non-zero
 exit instead of reporting success, and internal errors are named by reason
 rather than folded into a bare "something went wrong". Run any command with
 `--help` for its full flag list.
+
+A constraint or hold ruling can also be mirrored at its bound symbol with a
+`decision: TOP-xxxx Ln` comment — the linter checks both ways with
+`--code-root`: a marker naming a decision the store does not carry (or one
+that is not a constraint or hold) is an error, and a constraint whose symbol
+carries no marker yet is a warning.
+
+Name the decision the change lands under in the commit message too
+(`TOP-xxxx Ln`): the session nudges once when a commit names none and its
+edited files carry no topic.
 
 **Keeping a wired repo up to date.** A fix that only touches a script (a hook,
 `memidx.py`, `memlint.py`) reaches every wired repo the moment you pull —
@@ -523,6 +556,13 @@ interpreter stock macOS ships — building one into `~/.cache/bash32` on first u
 minutes on a 24-core machine; the bash 3.2 harness takes about four. A handful
 of tests need machine-local data of their own and skip with a clear message
 when it is absent; every fixture tracked in this repository is synthetic.
+
+Leaving `$MEMCONTINUUM_PYTHON` unset does not read as "OK (skipped=N)" —
+dozens of whole test classes need the pinned venv (tree-sitter, embeddings,
+dependency reconciliation), and one guard test (`tests/test_env_gate.py`)
+fails the run instead, naming the variable and how many classes would
+silently skip. Set `$MEMCONTINUUM_ALLOW_UNGATED=1` to run without the venv
+anyway, accepting the skipped coverage.
 
 ## Acknowledgements & prior art
 

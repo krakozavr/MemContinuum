@@ -56,6 +56,91 @@
   (`post-commit-reindex.sh`) is unaffected; `backend-preflight`, which has no
   database in scope, still falls back to `$MEMCONTINUUM_HOME` for its own
   debug log.
+- Append-only history is now enforced, not only documented: `memlint.py
+  --against-ref REF [--staged] ROOT` compares every topic file's links now
+  against what they were at `REF` and freezes a recorded link's BODY
+  (`ruling`, `rationale`, `alternatives`, `evidence`, `revisit_if`, `edges`,
+  `assumptions`, `invariant`, `date`, `kind`, `reverses`,
+  `reason_for_change`, `recorded_by`, `recorded_at` -- any diff there is an
+  error naming the field). Three lifecycle fields may move forward only,
+  once: `status` from `active`/`provisional` to `superseded`/`historical`/
+  `declined` (never back, never between the three terminal values),
+  `superseded_by` may be added in that same move (never changed afterwards,
+  never present without that status), and `promoted_by` may be added with
+  no such status coupling (the promotion procedure names the new link on
+  the old one, whatever the old link's own status); a lifecycle move
+  bundled with any body edit is an error too, on every lifecycle field
+  involved. A link removed, or a topic file deleted or renamed, is also an
+  error (new links, and changes to `current`, `title`, `tags`, `code_refs`,
+  or the body text, stay free). A new store git `pre-commit` hook
+  (`hooks/pre-commit-append-only.sh`, wired by `scripts/repo-init.sh`
+  alongside `post-commit`, both refusing to overwrite a foreign hook they
+  did not render) runs this on every commit and blocks the ones that fail
+  it -- fail-open on an unborn HEAD, a missing python, or an engine
+  failure, `--no-verify` bypasses it locally, and the same check can run
+  again in CI for a guarantee local bypasses cannot reach.
+- `code_refs` now documents its three forms explicitly (a repo-relative path
+  prefix, an fnmatch glob, or `path#symbol`, a qualified symbol name as the
+  chunkers report it) -- retrieval matching is unchanged. A constraint or
+  hold link may be mirrored at its bound symbol with a `decision:
+  TOP-xxxx Ln` comment -- located through the chunker registry, so the rule
+  is language-agnostic; a file whose backend cannot run here is skipped
+  with a warning naming the reason, while a file whose language has no
+  chunker at all is instead scanned for the marker by plain regex alone --
+  silent when it carries none, and, when it does, checked against every
+  rule below that needs no symbol location, with a warning (not an error)
+  that the marker cannot be attributed to a symbol.
+  `memlint.py --code-root DIR` now checks the pair both ways: in a file
+  WITH a chunker, every marker under a code root must name a topic and
+  link that exist, are `active`, and are a CONSTRAINT or HOLD (never a
+  glob or bare-path match -- only an exact `path#symbol` entry counts),
+  else an error naming the file and line; a no-chunker file's marker is
+  held to the same topic/link/status/tier rules, but any code_refs form
+  naming the file satisfies it, since there is no symbol to verify
+  against; every active CONSTRAINT/HOLD link whose topic carries a `path#symbol`
+  ref must find the marker at that symbol, else a warning (existing stores
+  carry none yet) -- a `path#symbol` whose symbol NAME is genuinely absent
+  from the file's text is an error instead (the ref itself is dangling), not
+  merely a missing marker. When the name IS present but the chunker reports
+  no declaration for it (a container type, or a language whose chunker
+  cannot verify a declaration it can still see named), that stays a warning,
+  same as an ordinary missing marker, rather than escalating to an error the
+  chunker itself cannot actually support.
+- `search` now defaults to `status: active` when no `--status` is given at
+  all -- matching every other reader's assumption that "the decision"
+  means the current one -- and drops any other status (`superseded`,
+  `historical`, `declined`, `provisional`) from an unfiltered search;
+  `--status any` widens back to every status, and any other explicit
+  `--status` value is unchanged. A record that carries no status of its
+  own at all (never topic-shaped -- no `links:` -- and no explicit
+  `status:` field: a `sources/` record, the store README, a frontmatter-
+  less `inbox/` drop) stays findable by this default too -- the default
+  filter is `status: active` OR no status at all, never narrowed to
+  exclude a record that was never a ruling to begin with.
+- A record under `inbox/` (a reviewer's freeform consult drop, not yet
+  promoted) now indexes as `type: inbox` unconditionally -- even one that
+  carries its own conflicting frontmatter `type:` -- and `search` excludes
+  it from results by default, a topic's own derived link rows included (a
+  proposed topic's link, itself its own searchable row, is excluded
+  through its parent's inbox classification, not just the topic row
+  itself); `--include-inbox` (or an explicit `--type inbox`) widens back,
+  and works at the default status (above) with no second flag needed.
+  `check`/`reindex` counts, and `chain`/`for-path`/`why`, are unaffected.
+  Reindexing an existing index picks up this classification automatically
+  on its next run (a bumped index generation forces one full content pass,
+  even for an unchanged file).
+- `memlint.py` now errors on an `owner-verbatim` ruling whose text ends in
+  a question mark, after trimming trailing quote/bracket characters left by
+  a copy-paste -- a question is not a ruling, whoever asked it. The check
+  applies only to `active`/`provisional` links: a superseded link is
+  history the append-only guard already protects, so flagging it there
+  could never be cleared by superseding it. `owner-ratified` (the
+  orchestrator's own paraphrase, never a literal transcript) is not
+  covered.
+- A `kind: reversed` link whose `reverses:` target's `status` is still
+  `active` or `provisional` is now a linter error, naming the target and
+  its current status. `kind: amended` leaves its predecessor active on
+  purpose and is not covered by this check.
 
 ### Code index
 - The code index's freshness check now compares five stat signals per file
@@ -133,6 +218,56 @@
   alone swings by roughly a quarter between runs) -- this collapse
   removes a full process start's worth of margin without loosening the
   bar itself.
+- Commit messages now name the decision they land under, and the prompt
+  hook nudges once when they do not. The check runs on every prompt --
+  independent of the coverage signal's own ledger-growth/cooldown
+  candidacy -- so a commit made between coverage reminders is still
+  examined, not silently skipped until the next unrelated edit happens to
+  re-arm coverage. When a configured code root's HEAD moves since the
+  last prompt and the new commit names no decision id, and an `unmapped`
+  call finds at least one file edited under that root during the session
+  with no topic, one more fact line is added and the nudge is logged, once
+  per commit -- a commit that already names a decision, or whose edits are
+  all covered, gets no line. On a turn that is also a coverage candidate,
+  the fact line joins the same reminder; otherwise it is the whole
+  reminder on its own, with no coverage content and no store-record
+  question attached, and coverage's own delivery/cooldown bookkeeping is
+  left untouched. State gains `last_seen_heads` (the per-prompt baseline
+  this compares against) and `nudged_commits` (bounded to the last 20);
+  both re-seed from the current HEADs on a session clear. The nudge never
+  reads the diff or the prompt. `stats` counts it under
+  `nudges.commit_nudges`, excluded from `user_prompts` (it is supplemental
+  to the turn's own outcome line, not a second prompt).
+
+### Install and update
+- `scripts/repo-init.sh`'s default `--store` (no `--store` given, cwd inside
+  a git repo) now lands on the WSL-native disk instead of beside the repo
+  when the checkout itself is physically on a Windows-mounted drive under
+  WSL -- `$HOME/dev/<repo>-MemContinuum-Store` when `$HOME/dev` is a
+  directory, else bare `$HOME/<repo>-MemContinuum-Store` -- because a store
+  walk over a Windows-mounted drive costs seconds, not milliseconds. The
+  installer prints one line naming why; an explicit `--store` is unaffected
+  and still wins outright, and `--claude-dir` still defaults from the
+  checkout's own `.claude`, never from wherever the store itself lands. The
+  detection (a shared helper, `mc_default_store_for` in
+  `scripts/mc-registry-lib.sh`) is the one place this default is computed --
+  `memcontinuum-decide.sh` and the SessionStart detector never propose a
+  store path of their own.
+- That WSL-disk default name keyed only on the checkout's basename, so two
+  different checkouts sharing one (`client-a/app`, `client-b/app`) used to
+  collapse onto the identical store and silently share it. The installer
+  now checks whether the plain name already belongs to a different checkout
+  or project before handing it out a second time: `decisions.tsv`'s own
+  `store=` field when a row exists, else the store's own rendered
+  `<!-- memcontinuum-checkout: PATH -->` marker (stamped at store-creation
+  time) compared against the checkout's physical path, else, only when
+  neither has anything to say, the rendered `README.md`'s project name. When
+  it does, the checkout's own parent directory name disambiguates it instead
+  (`<parent>-<repo>-MemContinuum-Store`), and when even that name is already
+  taken, the installer refuses (exit 17) rather than guess a third name or
+  adopt a foreign store. A same-checkout re-run, even under a renamed
+  `--project`, still lands on the plain name unchanged -- now true even with
+  no `--record-decision` row at all, via the checkout marker.
 
 ### Documentation
 - The README, `docs/DESIGN.md`, and `docs/INTERNALS.md` now say plainly
@@ -140,6 +275,17 @@
   covers edits made with the Edit and Write tools. A file changed from the
   shell gets no lookup beforehand -- only an after-the-fact entry in the
   edit ledger, once a tree diff notices it.
+
+### Release process
+- The test suite now fails loudly, not silently, when `$MEMCONTINUUM_PYTHON`
+  is unset: a guard test names the variable and how many test classes
+  (tree-sitter chunkers, embeddings, dependency reconciliation, the
+  real-bash write-hook suites) would otherwise skip every one of their
+  tests while the run still reads as clean. Set `$MEMCONTINUUM_PYTHON` to a
+  venv python with the pinned dependencies installed, or set
+  `$MEMCONTINUUM_ALLOW_UNGATED=1` to run without it anyway, accepting the
+  skipped coverage; continuous integration already sets the variable, so
+  this never fires there.
 
 ## [0.2.0rc3] — 2026-09-04
 

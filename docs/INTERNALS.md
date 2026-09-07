@@ -24,14 +24,15 @@ Contents: [hooks](#hooks-and-the-fail-open-contract) ·
 
 ## Hooks and the fail-open contract
 
-Nine hook scripts live under `hooks/`, alongside three shared libraries
+Ten hook scripts live under `hooks/`, alongside three shared libraries
 (`memlib.sh`, sourced by the five write-side hooks; `mc-watchdog.sh`; and
 `mc-path-lib.sh`, one pure side-effect-free function -- symlink-safe
 containment -- sourced by `memlib.sh` and directly by `newfile-nudge.sh`,
 which needs it but deliberately does not source `memlib.sh` itself).
-Seven of the nine are wired into a project's
+Seven of the ten are wired into a project's
 `.claude/settings.local.json` by `scripts/repo-init.sh`; `post-commit-reindex.sh`
-is invoked from the store's own git `post-commit`; `memcontinuum-detect.sh` is
+and `pre-commit-append-only.sh` are invoked from the store's own git
+`post-commit`/`pre-commit`; `memcontinuum-detect.sh` is
 wired one level up, into `~/.claude/settings.json`, by `memcontinuum-setup.sh`.
 
 | script | event | does |
@@ -41,19 +42,34 @@ wired one level up, into `~/.claude/settings.json`, by `memcontinuum-setup.sh`.
 | `ledger-post-edit.sh` | `PostToolUse` (every tool; no settings-level matcher) | a bash-only prefilter exits before the watchdog for read-only built-ins (`Read`, `Grep`, ...); `Edit`/`Write`/`MultiEdit`/`NotebookEdit` ledger the tool's own file path (`source: tool`); `Bash` and any tool this hook has no dedicated branch for fall through to a shell-diff (`git status`) tree comparison against a per-root baseline (`source: shell-diff`); an unrecognized or missing `tool_name` additionally logs `outcome=unsupported-mutation-surface` |
 | `precompact-persist.sh` | `PreCompact` | persists session state before context is compacted away |
 | `sessionstart-remind.sh` | `SessionStart` | on `startup`/`resume`/`clear`, initializes session state only (captures the code/store roots' git HEAD, prunes state older than 24h; `clear` resets the session's counters and pending nudges but carries the edit ledger over, `resume` keeps everything); only on `source: compact` does it inject what `precompact-persist.sh` left pending |
-| `userprompt-remind.sh` | `UserPromptSubmit` | never reads the prompt text; fires the coverage or look-back nudge |
+| `userprompt-remind.sh` | `UserPromptSubmit` | never reads the prompt text or diff; fires the coverage, commit, or look-back nudge |
 | `sessionend-stamp.sh` | `SessionEnd` | stamps session end into state |
 | `post-commit-reindex.sh` | store's git `post-commit` | a bounded content-only reindex after every commit; spawns a background embed-worker when vectors are left behind |
+| `pre-commit-append-only.sh` | store's git `pre-commit` | runs `memlint.py --against-ref HEAD --staged`; BLOCKS the commit on an append-only violation (a recorded link's body edited, or a link removed, deleted, or renamed — its three lifecycle fields may each move forward once); fails open (lets the commit through) on an unborn HEAD, a missing python, its own cwd not being the store, or any engine failure |
 | `memcontinuum-detect.sh` | `SessionStart`, user level | classifies an un-initialized repo and asks once; no python, no watchdog, no logging by default |
 
-**Fail-open is the contract, not a fallback.** No hook may block an edit or a
-commit — not on a missing python, not on a stale index, not on a lookup error,
-not on its own timeout. A hook that cannot do its job logs and exits 0. The
-reason is asymmetric cost: a missed reminder costs one un-recorded ruling; a
-hook that blocks an edit costs the user their tool, and the first thing anyone
-does with a tool that blocks edits is remove it. Failing open also names its
-reason: a degraded answer carries `reason_code`, `exception_type` and a safe
-message; the traceback goes to `memidx-debug.log`; `--debug` re-raises.
+**Fail-open is the contract, not a fallback — with one deliberate exception.**
+No hook may block an edit or a commit — not on a missing python, not on a
+stale index, not on a lookup error, not on its own timeout. A hook that cannot
+do its job logs and exits 0. The reason is asymmetric cost: a missed reminder
+costs one un-recorded ruling; a hook that blocks an edit costs the user their
+tool, and the first thing anyone does with a tool that blocks edits is remove
+it. Failing open also names its reason: a degraded answer carries
+`reason_code`, `exception_type` and a safe message; the traceback goes to
+`memidx-debug.log`; `--debug` re-raises. `pre-commit-append-only.sh` is the one
+exception, and only for the one failure mode it exists to catch: an edit to a
+recorded link's body (its three lifecycle fields are exempt — see the
+append-only table below). The asymmetry inverts there — the guard exists to
+stop a rewrite from ever becoming this store's own committed history in the
+first place; once one gets through, the superseded content is still sitting
+in git's own history (an earlier commit, recoverable the same way any commit
+is), but nothing else guarantees a later reader ever compares against that
+earlier commit rather than trusting the rewritten one as current. A refused
+commit, by contrast, costs one message and a `git commit --no-verify` away.
+Every OTHER way this hook can
+fail (no python, an unborn HEAD, memlint erroring out, its own cwd not being
+the store) still fails open exactly
+like every other hook.
 
 **Logging, per hook.** The seven project-level hooks each write exactly one
 `outcome=` line per run to `$MEMCONTINUUM_HOME/hook.log`.
@@ -61,13 +77,35 @@ Diagnostic lines may precede it (`pre-edit-chain.sh` logs a missing-python note
 before its own `outcome=`). A watchdog kill is included in "every run": the
 guarded hook cannot write its own outcome line then — it may be mid-call, or may
 never have reached that code — so `mc-watchdog.sh` writes
-`outcome=watchdog-killed hook=<name>` itself before exiting. The two hooks
+`outcome=watchdog-killed hook=<name>` itself before exiting. The three hooks
 outside that rule are deliberate: `post-commit-reindex.sh` writes its own
 `post-commit-reindex: rc=… elapsed=… project=… root=… embed=pending|clean|skipped`
-line instead, and
+line instead, `pre-commit-append-only.sh` writes its own line, one of
+`pre-commit-append-only: rc=1 changed=<n> project=…` (refused the commit),
+`rc=0 changed=<n> project=…` (clean), or `skipped=<reason> project=…` — an
+unborn HEAD, no python, an engine failure, or (fix wave 1 G1) the hook
+running with its cwd outside `MEMCONTINUUM_ROOT` (`skipped=not-the-store` —
+a wrapper invoked from another repository entirely, e.g. through a
+mistakenly shared `core.hooksPath`, must never judge or block THAT
+repository's commit) — when nothing was actually judged (no `changed=` on
+that shape: nothing was compared). `memidx.py stats` reports these under a
+`pre_commit` block (`pass`/`refused`/`skipped`, the last summing every
+`skipped:<reason>` outcome its own `outcomes` dict names), exactly like
+every other hook kind — these lines carry no `outcome=` field of their own
+and are never folded into `user_prompts`.
 `memcontinuum-detect.sh` writes nothing at all unless
 `$MEMCONTINUUM_DETECT_LOG` is set — it runs in every repo on the machine, so its
 default is silence.
+
+`userprompt-remind.sh` has its own exception too (Codex 12, fix wave 1 G4): a
+turn whose HEAD-moved check (independent of coverage candidacy — see "The
+commit nudge" below) finds one or more newly-examined, undecided commits
+writes one SUPPLEMENTAL `userprompt outcome=commit-nudge sha=<n> root=<r>
+session=<s>` line per such commit, in addition to — never instead of — that
+same turn's own real outcome line (`injected`, `no-evidence`, ...). `stats`
+excludes `commit-nudge` from its `user_prompts` tally for exactly this
+reason: it is not a second prompt, and counting it as one used to inflate a
+handful of real turns into double their number.
 
 `ledger-post-edit.sh` itself has two further exceptions to "exactly one
 `outcome=` line". A read-only built-in (`Read`, `Grep`, ...) is caught by the
@@ -121,6 +159,64 @@ written by atomic rename (`os.replace`) and guarded by a real
 `fcntl.flock(LOCK_EX)` (retried up to 2s) taken inside the state-update helper
 in `memlib.sh` — a Python call, never a shelled-out `flock` binary, which macOS
 does not ship.
+
+**The commit nudge.** Commit messages name the decision they land under
+(a routine, not enforced elsewhere) — `userprompt-remind.sh` nudges once
+when a commit does not. State gains two keys: `last_seen_heads` (`{root:
+sha}`, seeded at `SessionStart` alongside `start_code_shas` and advanced on
+every prompt this check actually runs on) is the per-PROMPT baseline this
+compares against, distinct from `start_code_shas`' per-SESSION one;
+`nudged_commits` (a list of sha, bounded to the last 20) dedupes a commit
+that keeps coming back as HEAD across prompts. `clear` re-seeds both from
+the current HEADs, the same way it re-seeds `start_code_shas` — nothing
+here survives a clear.
+
+Codex 9 (fix wave 1 G4): the moved-HEAD comparison itself runs on EVERY
+prompt, independent of coverage's own candidacy (ledger-growth/cooldown)
+gate — only computing the actual nudge (the `unmapped` call, the commit
+message read, the fact line) is skipped when NEITHER coverage is a
+candidate NOR any root actually moved, so the overwhelmingly common turn
+still costs nothing extra. Before this fix, the whole comparison lived
+inside coverage's own candidacy gate: once a coverage reminder had fired
+once (consuming the ledger-growth signal), a commit with no decision id
+followed by any number of further prompts with no NEW ledger growth
+produced zero commit nudges at all — `last_seen_heads` never even
+advanced, because the comparison never ran.
+
+For every configured root whose HEAD differs from `last_seen_heads[root]`,
+the hook reads the new commit's subject and body (one `git log -1`, a 2s
+timeout of its own, tighter than the hook's outer watchdog) and, when the
+message names no decision id and the SAME `unmapped` call this turn already
+made finds at least one file edited under that root during the SESSION
+(the ledger — never that specific commit's own diff, which this feature
+never reads) with no topic, adds one fact line and logs `userprompt
+outcome=commit-nudge sha=<short> root=<root>` (one line per nudge,
+`project=` last like every other `mc_log` line). Which of the session's
+ledger files count toward that per-root number is decided by `memidx.py
+unmapped`'s own `by_path` field — keyed by the exact absolute path the
+hook fed it, never a bare relative-path string two sibling code roots
+could otherwise share. A root whose message already names a
+decision, or whose edited files are all covered, or whose commit was
+already nudged, adds no line — but `last_seen_heads` still advances, so
+that commit is never re-examined.
+
+On a turn where coverage IS a candidate, the fact line(s) above are folded
+into the SAME `additionalContext` block as coverage's own fact line, and
+the turn's outcome is `injected` (or `lookback-injected`), same as before
+this fix. On a turn where coverage is NOT a candidate but a root moved, the
+nudge fact line(s) are the WHOLE `additionalContext` (no coverage fact
+line, no store-record question — those are coverage's own content, and
+coverage was never asked to fire this turn); the turn's own outcome is
+`userprompt outcome=nudge-only`, and coverage's own cooldown/delivery
+bookkeeping (`last_injected_pairs`, `last_inject_turn`, `last_inject_time`)
+is left untouched — a nudge must never quietly re-arm coverage's own
+cooldown clock. The nudge never reads the diff and never reads the prompt.
+`stats` counts `outcome=commit-nudge` as `nudges.commit_nudges`, separate
+from `nudges.total`, and excludes it from `user_prompts` (Codex 12: it is
+SUPPLEMENTAL to the turn's own real outcome line — `injected`,
+`nudge-only`, or otherwise — not a second prompt of its own; five real
+prompts each also writing their own commit-nudge line used to report ten
+prompts, not five).
 
 **The shell-diff ledger branch.** `ledger-post-edit.sh` runs the tree-diff
 pass for `Bash` and any tool it has no dedicated branch for, inside the same
@@ -301,10 +397,64 @@ room than a help line.
 - **Explicit `--store` with no `--claude-dir` is a hard error** (exit 2). An
   explicit store may legitimately be wired from any cwd — a test harness, a
   script, an unrelated checkout — so the cwd is not a safe signal for where the
-  hooks belong, and even a git cwd can be the wrong repo. `--claude-dir`
-  defaults from the store's parent *only* when `--store` was also omitted, in
-  which case the store defaulted beside the repo the cwd is in and that is a
-  reliable signal.
+  hooks belong, and even a git cwd can be the wrong repo. When `--store` is
+  omitted instead, `--claude-dir` defaults from the CHECKOUT the cwd is in
+  (that repo's own `.claude`) — never from wherever the defaulted store itself
+  ends up landing. Those two happen to coincide when the cwd is not inside any
+  git repo (the store then defaults directly into the cwd, and `--claude-dir`
+  derives from that same cwd), but deliberately do not for a checkout that is
+  a git repo: the store defaults beside it, "`<repo>-MemContinuum-Store`",
+  while `--claude-dir` still comes from the repo's own toplevel, not the
+  store's parent. This split matters for the WSL rule below — a checkout on a
+  Windows-mounted drive defaults its store onto an entirely different disk,
+  and the hooks must stay with the repo regardless.
+- **The default store lands on the WSL disk, not beside the repo, when the
+  checkout itself is Windows-mounted**: a checkout whose
+  physical path resolves under `/mnt/<letter>/` while running under WSL (its
+  kernel names Microsoft — case-insensitive) walks that store over drvfs/9P
+  on every retrieval and ledger call, costing seconds instead of milliseconds.
+  `mc_default_store_for` (`scripts/mc-registry-lib.sh`, shared with no other
+  caller today — `memcontinuum-decide.sh` only ever records a `--store` it is
+  explicitly given, and `hooks/memcontinuum-detect.sh` never proposes a path
+  at all) detects this (`mc_is_windows_mounted_checkout`, with
+  `MEMCONTINUUM_PROC_VERSION_FILE`/`MEMCONTINUUM_TEST_WSL_MOUNT` test seams so
+  the check need not depend on the CI runner actually being WSL) and defaults
+  the store instead to `$HOME/dev/<repo>-MemContinuum-Store` when `$HOME/dev`
+  is a directory (this machine's convention for where checkouts live), else
+  bare `$HOME/<repo>-MemContinuum-Store` — printing one line naming why.
+  `--claude-dir` is unaffected (see above); an explicit `--store` always wins
+  and skips this rule entirely, on WSL or anywhere else.
+- **The WSL-disk name is disambiguated, or refused, rather than silently
+  shared, when it already belongs to someone else**: the plain name keys
+  only on the checkout's basename, so two different checkouts sharing one
+  (`client-a/app`, `client-b/app`) used to collapse onto the identical
+  default. `mc_default_store_for` now tries the plain name first, unchanged,
+  for the first checkout that ever wants it (never disambiguated
+  preemptively); `mc_store_belongs_elsewhere` (same file) then checks
+  whether an EXISTING marked store at that path already belongs to a
+  different checkout or project before handing out a name a second time,
+  three signals in priority order: `decisions.tsv`'s own `store=` field,
+  keyed by `mc_repo_key`, when a row exists (authoritative either way, self
+  or foreign, since it is the one signal a same-checkout re-run under a
+  renamed `--project` cannot fool); otherwise the rendered store
+  `README.md`'s own `<!-- memcontinuum-checkout: PATH -->` marker
+  (`mc_store_checkout_identity`, stamped at store-creation time with the
+  checkout's physical path, never rewritten on a re-run) compared physically
+  against this run's checkout — an unambiguous path comparison a shared
+  `--project` value cannot fool either, closing the one gap the registry and
+  project-name signals alone left open (two checkouts sharing a basename
+  AND a `--project` value, neither ever run through `--record-decision`);
+  only when NEITHER of those has anything to say (an older store from before
+  this marker existed, or a hand-authored README) does the rendered
+  `README.md`'s first line (the project name templates/store-README.md.tmpl
+  stamps there) compared against this run's `--project` decide it — the
+  weakest of the three, since two checkouts can legitimately share a
+  `--project` value by coincidence. When the plain name is already someone else's, the checkout's
+  own parent directory name disambiguates it instead
+  (`<parent>-<repo>-MemContinuum-Store`); when that name is ALSO already
+  someone else's, the installer refuses (exit 17) and asks for an explicit
+  `--store DIR --claude-dir DIR` rather than guess a third name or adopt a
+  foreign store.
 - **An existing git repo at `--store` carrying none of this tool's markers is
   refused** (exit 9) — markers being a `topics/`, `incidents/` or `concepts/`
   directory, or a `README.md` mentioning MemContinuum. A mistyped `--store`
@@ -911,7 +1061,13 @@ second bespoke timeout story for the one hook that happens to be fast),
 `MEMCONTINUUM_POST_COMMIT_BUDGET`, default 30 seconds -- generous on purpose:
 its guarded content pass is measured well under a second; the budget is a
 backstop against a hung/slow filesystem, not a tuned ceiling). Unguarded:
-`memcontinuum-detect.sh`.
+`memcontinuum-detect.sh` and `pre-commit-append-only.sh` — deliberately, in
+the second case: this hook's whole point is to fail CLOSED on a history edit,
+and a watchdog that kills a slow check and lets the commit through anyway
+would turn the exact slowness the check exists to catch into a bypass. It
+still sources `mc-watchdog.sh` for the `MEMCONTINUUM_HOME`/`config.sh`
+pointer-chain resolution the guard block also performs, but never invokes
+that guard block itself.
 
 `pre-edit-chain.sh`'s own inner budget is confirmed against a real
 measurement of its wired command line across the engine's own store and two
@@ -1621,6 +1777,39 @@ one project can have several code roots, and every root given is checked:
 | a concept has no `tested_by` | warning, unconditional |
 | a concept body has no "not this concept" sentence | warning |
 
+Decision marker rules (`--code-root`; SCHEMA §2/§8.3). A marker is a comment line matching
+`decision: TOP-\d+ Ln` (any positive integer id — SCHEMA's own running example is `TOP-42`, not a
+fixed four digits) on a symbol's own definition line, or within the (up to) three lines above it —
+located through the chunker registry, same as the concept rules above; a language whose backend
+cannot run here warns rather than errors, while a language with no wired chunker at all is scanned
+by plain regex instead (see the no-chunker row in the table below). In a file WITH a chunker, only
+a topic's `path#symbol` code_refs entries take part; a prefix or a glob names no symbol there and
+is never marker-verified.
+
+The window is searched nearest-first (the definition line itself, then one line up, then two,
+then three) and never crosses into another declaration's own line — two adjacent short
+declarations with no body between them each keep their own window, never borrowing the other's
+marker. Every marker actually inside the window is examined, not just the first one found: a
+valid marker followed, farther up, by a bogus one still errors on the bogus one, and two markers
+in one window (a member two independent topics each constrain) each satisfy their own topic.
+
+The scan does still visit every directory under a code root (there is no way to know which
+subtrees a glob/prefix code_ref might reach without looking), but a file is opened only after its
+FILENAME already matches at least one topic's code_refs (by any of the three forms) — the
+scan never opens a file nothing references, even to check whether it is binary.
+
+| rule | severity |
+|---|---|
+| a marker names a topic id or link id that does not exist | error |
+| a marker names a link that is not `active`, or whose tier (§4) is CONTEXT, not CONSTRAINT/HOLD | error |
+| in a file WITH a chunker, a marker's topic has no `path#symbol` code_refs entry naming this exact file and symbol — either no entry names this file at all (a prefix or glob that merely matches the FILE does not count), or one does but names a DIFFERENT symbol at it | error, naming the symbol the code_refs entry actually names when there is one — the no-chunker row below is the file-level-only counterpart of this rule, where a prefix/glob DOES count (there is no symbol to hold it to a stricter standard) |
+| a marker's topic names a `path#symbol` that matches no chunk anywhere in the file, but the chunker confirms the symbol IS declared (a container — class/struct/enum/… — chunk_file never gives one its own chunk) | silent on this side (never misattributed to a nearby member); direction 2's own "container type" row below still warns |
+| an active CONSTRAINT/HOLD link's `path#symbol` ref finds no marker at that symbol | warning |
+| an active CONSTRAINT/HOLD link's `path#symbol` ref names a symbol the chunker proves absent | error (the ref itself is dangling) |
+| a file in scope whose backend cannot run here (a missing optional grammar wheel, or a genuine chunking failure) | warning (names the reason), never an error |
+| a file in scope whose language has no chunker at all | not a failure — scanned for a `decision:` marker by plain regex alone (no chunk-derived window); silent when it holds none. When it does, checked against every marker→store rule above that needs no symbol location (topic/link exist, active, CONSTRAINT/HOLD, code_refs name the file — the code_ref's own `#symbol` fragment, if any, is stripped before this comparison, so it counts exactly like a bare path or glob); a violation there is still the matching error, and clean is ONE warning that the marker cannot be attributed to a symbol — never the old blanket per-file warning fired regardless of whether the file held a marker at all |
+| a `path#symbol` naming a container type (class/struct/enum/…) the chunker reports no definition line for | warning (uncheckable, not "no marker") |
+
 Corpus-wide identity rules, applied to every record regardless of type:
 
 | rule | severity |
@@ -1639,9 +1828,67 @@ untyped plain markdown with no `id:`, no `type:`, and no `links:` (a README,
 an inbox drop) — nobody chains those by stem, and two files sharing one is
 the normal state of the tree.
 
-**Deliberately not implemented:** "a link edited after being recorded (hash
-mismatch vs git) → reject". See `docs/SCHEMA.md` §7 — that check belongs where a
-canonical store's commits are made, not inside the linter.
+### Append-only history (`--against-ref`)
+
+`memlint.py --against-ref REF [--staged] ROOT` is a second, independent check
+— when given, it replaces the schema-rule pass above entirely (never both in
+one invocation): an adopted store may carry pre-existing schema findings the
+installer already tolerates, and this check must never fail a commit over a
+condition nobody ruled on.
+
+For every topic file present at `REF` and now, it parses both sides with the
+same typed parser (`parse_record`/`parse_record_text`) and compares links by
+id:
+
+| rule | severity |
+|---|---|
+| a link present at `REF` has a BODY field changed (`ruling`, `rationale`, `alternatives`, `evidence`, `revisit_if`, `edges`, `assumptions`, `invariant`, `date`, `kind`, `reverses`, `reason_for_change`, `recorded_by`, `recorded_at`) | error naming the field, `<path>:<link>: <field>: link field changed after being recorded` |
+| `status` changes other than `active`/`provisional` → `superseded`/`historical`/`declined` (backward, or between the three terminal values) | error, `<path>:<link>: status: changed from … to … after being recorded` |
+| `superseded_by` changes after already being set, or is added while `status` is not `superseded` | error, `<path>:<link>: superseded_by: …` |
+| `promoted_by` changes after already being set | error, `<path>:<link>: promoted_by: …` (no status coupling — it may be added regardless of the link's own status) |
+| a lifecycle move (`status` and/or `superseded_by` and/or `promoted_by`, otherwise valid) bundled with any body-field edit | error on the lifecycle field too, naming it, in addition to the body field's own error |
+| a link present at `REF` is missing now | error, `<path>:<link>: link removed after being recorded` |
+| a topic-like record present at `REF` is deleted or renamed | error naming the path and its real kind (`topic`/`incident`/`investigation`/`concept`, or `record` when the kind itself could not be recovered) — `--no-renames` means a rename is a plain delete + a plain add, so one rule covers both |
+| a duplicate link id within one topic on the NEW side | error naming the id, `<path>: duplicate link id '<id>' used <n> times` — the same `memidx.validate_record_shape` diagnostic every consumer shares |
+| a valid forward `status` move (with `superseded_by` added when the new status is `superseded`), `promoted_by` added, alone on the link; new links; changes to `current`, `title`, `tags`, `code_refs`, or the body text | free |
+| the `REF`-side blob failed full validation (a shape error, or a duplicate link id) but its `links` field itself still recovers at least one usable entry | not a repair — those recovered links (a duplicate id keeps its FIRST occurrence, file order) are still compared against the new side by every rule above, exactly as if the REF blob had parsed cleanly, with a note naming the REF-side diagnostic that made the blob invalid |
+| the `REF`-side blob never parsed at all (or parsed but recovered no usable `links`), and the new blob now parses cleanly | a note, not an error (`repaired — the blob at REF could not be safely parsed …`) — nothing here was ever recorded link history to freeze, so fixing it is a repair, never an append-only violation |
+| frontmatter that does not parse on the new side, or on both sides | error, the typed-parse diagnostic — never a traceback |
+| a record whose recoverable kind is not topic-like (`type: incident`/`investigation`/`concept` with no `links:`) | out of scope for this check entirely — there is no recorded link history to protect, so neither an error nor a note |
+| `--code-root` given together with `--against-ref` | exit 2 — append-only mode never uses a code root, and the flag is rejected rather than silently ignored |
+| a `REF` argument that starts with `-` (would otherwise swallow the next flag, e.g. `--staged`, as if it were the ref) | exit 2 naming the flag-shaped token that was refused |
+| `ROOT` is not inside a git repository, or `REF` does not resolve to a commit | exit 2 with a message (not exit 1 — this is an infrastructure/usage failure, not a content finding) |
+
+The three lifecycle fields exist because a link is not always closed the
+instant it stops being current: marking one `superseded`/`historical`/
+`declined` — and naming its successor once that exists — is bookkeeping, not
+a change of mind, and forcing a whole new link for it would just move the
+same edit into a place this check cannot see it happen. Promotion (§5) still
+appends a NEW link rather than editing `status` to `active`/`provisional` in
+place — those two directions were never legal moves for that field; what
+promotion DOES edit on the OLD link is `promoted_by`, once, naming the new
+link, with no requirement that the old link's own status move at all.
+
+`--staged` compares `REF` to the INDEX (`git show :path`, what `git commit`
+would actually commit); the default compares `REF` to the working tree
+(`git diff REF` — the standard "everything you'd get if you staged
+everything" comparison). The summary line
+(`memlint: append-only against <ref>: changed=<n> errors=<n>`) is what
+`hooks/pre-commit-append-only.sh` parses `changed=` off of for its own
+`hook.log` line; `changed` counts topic files the diff actually concerned,
+independent of whether any produced an error.
+
+The store's own git `pre-commit` hook (`hooks/pre-commit-append-only.sh`,
+wired by `scripts/repo-init.sh` step 6b the same way `post-commit-reindex.sh`
+is wired at step 6) runs `--against-ref HEAD --staged` on every commit and
+BLOCKS the ones that fail it — see "Fail-open is the contract, not a
+fallback" above for the one deliberate exception this makes to every other
+hook's fail-open rule, and "The watchdog"'s `Unguarded:` list for why no
+timeout wraps it. `git commit --no-verify` bypasses it, same as any git hook;
+the same check run again in CI against a wider range, plus a protected
+branch, is the real guarantee against a rewritten history for a store other
+machines also touch — not this hook alone, which only ever sees one commit
+at a time on one machine.
 
 ## Storage and index
 
@@ -1666,7 +1913,16 @@ below, and `infer_type` falls back to the containing directory name), so
 "put arbitrary markdown under the store root" is not a safe way to keep it out
 of `search`/`chain`/`for-path` results. The directory-name pruning above (a
 `.remember/now.md` session buffer, a project's `.claude/`) is the only thing
-that keeps non-record markdown out of the walk.
+that keeps non-record markdown out of the walk. One directory IS a
+deliberate exception to "everything under the root is first-class": a path
+under `inbox/` indexes as `type: inbox` unconditionally (`infer_type` checks
+the directory before it ever reads frontmatter, so a drop that carries its
+own conflicting `type:` field still indexes as `inbox`), and `search`
+excludes `type: inbox` rows unless `--include-inbox` (or an explicit
+`--type inbox`) is given -- a freeform consult drop stays out of the way of
+`search`'s default results without being invisible to the index (`check`/
+`reindex` counts, `chain`/`for-path`/`why` are all unaffected, since none of
+them ever return an inbox record in the first place).
 
 **Two databases.** `<project>.sqlite` (decisions) and `<project>-code.sqlite`
 (Anatomy's code index) are separate physical files by default, each with its own
@@ -2038,7 +2294,17 @@ importing fastembed either, verified the same way.
 down:
 
 - **`search`** — `--mode fts` and `--mode vector` never both run; `hybrid` (the
-  default) runs both and fuses ranks with RRF. Filters (`--status`, `--type`,
+  default) runs both and fuses ranks with RRF. `--status` defaults to
+  active-only when omitted entirely (`_resolve_search_status`, applied inside
+  `cmd_search` on a shallow copy of `args` -- `build_filter_clause` itself,
+  and every other caller of it, keeps "no status given" meaning "no filter");
+  `--status any` widens back to every status (superseded/historical/
+  declined/provisional included), and any other explicit value (or several,
+  repeated) passes through unchanged, exactly as before this default existed.
+  `type: inbox` rows (search-inbox-downrank) are excluded the same way,
+  independent of `--status`: `--include-inbox`, or an explicit
+  `--type inbox`, widens back to include them.
+  Filters (`--status`, `--type`,
   `--area`, `--topic`, `--authority`) are always ANDed, and are applied
   **inside** `fts_ranked`/`vector_ranked`'s own query, before either channel's
   cap and before RRF fusion — a status a caller filtered out can never occupy
@@ -2265,6 +2531,14 @@ bash tests/run_bash32.sh
 - Tests do not fall back to `<checkout>/.venv/bin/python` the way
   `repo-init.sh` does: they read `$MEMCONTINUUM_PYTHON` and skip with a clear
   message when the tests that need a real venv cannot get one.
+- **The venv gate itself is guarded.** `tests/test_env_gate.py` fails the run
+  (naming `$MEMCONTINUUM_PYTHON` and the live count of test classes that
+  would silently skip -- computed by re-walking the discovered suite, not a
+  hardcoded number) unless the variable is set or `$MEMCONTINUUM_ALLOW_UNGATED=1`
+  is, so a machine without the pinned venv gets one loud failure instead of a
+  quiet "OK (skipped=N)" that reads like full coverage. CI already sets
+  `$MEMCONTINUUM_PYTHON` (`.github/workflows/tests.yml`), so this never fires
+  there.
 - Nearly every test builds its own temp directory and passes an explicit `--db`
   (or sets `MEMCONTINUUM_HOME`), so a run never touches a real
   `~/.memcontinuum/` index. The gated real-corpus tests are the exception,

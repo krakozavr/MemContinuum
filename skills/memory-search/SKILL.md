@@ -13,9 +13,9 @@ checkout (or wherever `MEMCONTINUUM_HOME`/`--project` are configured for this pr
 
 **Semantic search with filters** — the default entry point:
 ```
-memidx.py search "QUERY" --mode hybrid --project PROJECT --status active [--area AREA] [--type topic] --json
+memidx.py search "QUERY" --mode hybrid --project PROJECT [--area AREA] [--type topic] --json
 ```
-`hybrid` (the engine's default) is what this skill recommends too — a ruling's own text is retrievable through either channel, so no single-channel mode is needed. `--status active` is this skill's convention, not the engine's: `search` with no `--status` filter also returns superseded/historical/declined records; drop it only when you want those. `--authority owner-verbatim`/`owner-ratified` narrows to CONSTRAINT-citable rulings only.
+`hybrid` (the engine's default) is what this skill recommends too — a ruling's own text is retrievable through either channel, so no single-channel mode is needed. Leave `--status` off: the no-flag default already keeps active records plus anything that never carries a `status` of its own at all (a record that was never topic-shaped — a `sources/` note, this store's own README, a frontmatter-less `inbox/` drop) -- that status-less case is exactly what an explicit `--status active` would drop, so passing it here would be STRICTER than the default, not merely spelling it out. Pass `--status any` to widen further, to superseded/historical/declined/provisional records, or name one or more of them explicitly. `--authority owner-verbatim`/`owner-ratified` narrows to CONSTRAINT-citable rulings only. `search` also leaves `inbox/` drops (freeform reviewer consults, not yet promoted to a record) out of its results by default; pass `--include-inbox` on the rare occasion you need to search those too — it works at the default status shown above with no second flag, since a freeform drop with no frontmatter at all is exactly the status-less case that default already covers.
 
 **A specific topic's full chain**, once you have its id or slug:
 ```

@@ -1489,6 +1489,120 @@ class TestUnmappedMultipleCodeRoots(unittest.TestCase):
             self.assertEqual(out2["mapped_topic"], ["src/b.py"], out2)
             self.assertEqual(out2["roots"], [str(root_b.resolve())])
 
+    def test_nested_roots_sharing_a_relative_path_are_treated_like_siblings(self):
+        # LOW-1 (a2-3 review, carried into A3), corrected by fix wave 1 G6
+        # (whole-branch-review Codex 10): a bare relative-path code_ref
+        # carries no root of its own -- topic_matches_for_path matches it
+        # project-wide. A PRIOR version of this fix (ruling 131, TOP-0123
+        # L10) tried to resolve a nested-root collision by attributing an
+        # ambiguous match to the LONGEST (most specific) containing root
+        # among ALL roots that happen to have a file at that relative
+        # offset -- but that compares the file actually being classified
+        # against a DIFFERENT, unrelated physical file that merely shares
+        # its relative name, inventing ownership between them with no real
+        # evidence either way. Codex 10, reproduced directly: an existing,
+        # genuinely covered outer/src/x.py went from mapped_topic to
+        # unmapped the moment inner/src/x.py was ALSO configured as a code
+        # root -- configuring an unrelated root silently un-covered a file
+        # nothing about it had changed. Now: outer O and inner I =
+        # O/subdir/inner, both configured, both carrying their OWN
+        # unrelated "src/x.py"; the topic's code_ref names only "src/x.py"
+        # and could mean either file -- design ruling F ("never a false
+        # gap") refuses to guess, so BOTH are credited, exactly the same
+        # way two SIBLING roots sharing a relative path already are (see
+        # the test below).
+        with tempfile.TemporaryDirectory() as td:
+            outer = Path(td) / "outer"; outer.mkdir()
+            inner = outer / "subdir" / "inner"; inner.mkdir(parents=True)
+            (outer / "src").mkdir()
+            (outer / "src" / "x.py").write_text("# outer's own\n")
+            (inner / "src").mkdir()
+            (inner / "src" / "x.py").write_text("# inner's own\n")
+
+            store = Path(td) / "store"
+            (store / "topics").mkdir(parents=True)
+            (store / "topics" / "t.md").write_text(
+                "---\nid: TOP-2\ntitle: T\nstatus: active\ncode_refs:\n"
+                "  - src/x.py\n---\n\nBody.\n"
+            )
+            db = Path(td) / "idx.sqlite"
+            reindex(store, db, no_embed=True)
+
+            outer_x = str((outer / "src" / "x.py").resolve())
+            inner_x = str((inner / "src" / "x.py").resolve())
+
+            # outer_x classified ALONE first (only O configured) -- this is
+            # the "existing covered file" half of Codex 10's reproduction:
+            # genuinely mapped before I is ever configured at all.
+            buf0 = io.StringIO()
+            with contextlib.redirect_stdout(buf0):
+                rc0 = memidx.cmd_unmapped(ns(
+                    project=memidx.DEFAULT_PROJECT, db=str(db), root=str(store),
+                    code_root=[str(outer)], json=True, paths=[outer_x],
+                ))
+            out0 = json.loads(buf0.getvalue())
+            self.assertEqual(rc0, 0, out0)
+            self.assertEqual(out0["mapped_topic"], ["src/x.py"], out0)
+
+            # Now I is ALSO configured (inner/src/x.py present) -- outer_x's
+            # own classification must be UNAFFECTED by configuring a wholly
+            # unrelated root's file at a colliding relative name.
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = memidx.cmd_unmapped(ns(
+                    project=memidx.DEFAULT_PROJECT, db=str(db), root=str(store),
+                    code_root=[str(outer), str(inner)], json=True,
+                    paths=[outer_x, inner_x],
+                ))
+            out = json.loads(buf.getvalue())
+            self.assertEqual(rc, 0, out)
+            self.assertEqual(out["unmapped"], [], out)
+            self.assertCountEqual(out["mapped_topic"], ["src/x.py", "src/x.py"], out)
+            self.assertEqual(out["by_path"][outer_x], "mapped_topic",
+                              "outer/src/x.py must stay mapped once inner/src/x.py is "
+                              "ALSO configured -- an outer file's mapping is unaffected "
+                              "by an inner root's file")
+            self.assertEqual(out["by_path"][inner_x], "mapped_topic")
+
+    def test_sibling_roots_sharing_a_relative_path_keep_todays_behavior(self):
+        # The companion case to the one above: A and B are SIBLINGS (neither
+        # contains the other) -- the schema carries no root tag on a
+        # code_ref, so which of the two the topic meant is genuinely
+        # undecidable with today's data. Design ruling F ("never a false
+        # gap") forbids guessing here: both stay mapped, exactly as before
+        # this fix, a documented limitation rather than a silent regression.
+        with tempfile.TemporaryDirectory() as td:
+            root_a = Path(td) / "root-a"; root_a.mkdir()
+            root_b = Path(td) / "root-b"; root_b.mkdir()
+            (root_a / "src").mkdir()
+            (root_a / "src" / "dup.py").write_text("# root-a's own, undocumented\n")
+            (root_b / "src").mkdir()
+            (root_b / "src" / "dup.py").write_text("# root-b's own, documented\n")
+
+            store = Path(td) / "store"
+            (store / "topics").mkdir(parents=True)
+            (store / "topics" / "t.md").write_text(
+                "---\nid: TOP-3\ntitle: T\nstatus: active\ncode_refs:\n"
+                "  - src/dup.py\n---\n\nBody.\n"
+            )
+            db = Path(td) / "idx.sqlite"
+            reindex(store, db, no_embed=True)
+
+            path_a = str((root_a / "src" / "dup.py").resolve())
+            path_b = str((root_b / "src" / "dup.py").resolve())
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = memidx.cmd_unmapped(ns(
+                    project=memidx.DEFAULT_PROJECT, db=str(db), root=str(store),
+                    code_root=[str(root_a), str(root_b)], json=True,
+                    paths=[path_a, path_b],
+                ))
+            out = json.loads(buf.getvalue())
+            self.assertEqual(rc, 0, out)
+            self.assertEqual(out["unmapped"], [], out)
+            self.assertCountEqual(out["mapped_topic"], ["src/dup.py", "src/dup.py"], out)
+
 
 class TestF2EmbeddingMode(unittest.TestCase):
     """F2 (coordinator ruling 69): embed_sha provenance, the freshness join
@@ -1768,6 +1882,16 @@ class TestRuling80EmbeddingFailureFailsOpen(unittest.TestCase):
 
 
 class TestF3TrustModel(unittest.TestCase):
+    # Fix wave 1 G1 (Codex 2): the second link used to share id "L1" with
+    # the first, deliberately, as one more of the "five simultaneous
+    # violations" this fixture packs in -- but a duplicate link id is now
+    # its OWN dedicated, whole-record-quarantining diagnostic (memidx.
+    # validate_record_shape), which makes this record invalid and short-
+    # circuits lint_file to that ONE diagnostic before any of the other
+    # four checks below ever run (see TestDuplicateLinkIdShapeDiagnostic
+    # for that check's own dedicated coverage). Renamed to "L2" so this
+    # fixture still proves five INDEPENDENT schema violations fire
+    # together, undisturbed by the duplicate-id short-circuit.
     SYNTHETIC_TOPIC = """---
 type: topic
 id: TOP-9100
@@ -1780,7 +1904,7 @@ links:
     alternatives:
       - {option: "o", rejected_because: "b", authority: also-not-real}
     invariant: {kind: not-a-real-kind, pattern: "("}
-  - link: L1
+  - link: L2
     status: active
     ruling: {text: "dup", authority: owner-verbatim, source: s}
     reverses: L99
@@ -2512,6 +2636,275 @@ class TestF5LinkRows(unittest.TestCase):
             self.assertEqual(out, [], "cmd_search --status active must return no hits for a "
                                        "declined-only match")
 
+    def test_search_defaults_to_status_active_and_any_widens(self):
+        # search-default-active: no --status given at all (a bare Namespace
+        # with status=[], exactly what argparse's own default produces)
+        # must behave exactly like an explicit --status active -- a
+        # declined-only match is dropped by default, with no caller ever
+        # having to say so. --status any is the one way to widen back to
+        # every status; any OTHER explicit value keeps meaning exactly what
+        # it already means (test_status_active_drops_a_declined_only_match,
+        # just above, pins that unchanged half).
+        with tempfile.TemporaryDirectory() as td:
+            root = self._topic_with_two_links(td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                memidx.cmd_search(ns(project=memidx.DEFAULT_PROJECT, db=str(db), query="sweeper",
+                                      mode="fts", status=[], type=[], area=None, topic=None,
+                                      authority=None, limit=10, json=True))
+            out = json.loads(buf.getvalue())
+            self.assertEqual(out, [], "no --status given must default to active-only, dropping "
+                                       "a declined-only match")
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                memidx.cmd_search(ns(project=memidx.DEFAULT_PROJECT, db=str(db), query="sweeper",
+                                      mode="fts", status=["any"], type=[], area=None, topic=None,
+                                      authority=None, limit=10, json=True))
+            out = json.loads(buf.getvalue())
+            self.assertEqual(len(out), 1, "--status any must widen back to every status, "
+                                           "surfacing the declined-only match")
+            self.assertEqual(out[0]["status"], "declined")
+
+    def test_a_status_less_sources_record_is_findable_by_a_plain_default_search(self):
+        """whole-branch-review MODERATE-3/4 (ruling 148): a `sources/`
+        record (never topic-shaped -- no `links:` -- and carrying no
+        explicit `status:` of its own, the real shape of every sources/
+        record in this store) has a NULL status column. search-default-
+        active's plain `status IN ('active')` used to drop every one of
+        these from a completely ordinary default search -- not merely
+        down-rank them -- a silent regression from how `search` behaved
+        before that feature existed. The default status filter must OR in
+        `status IS NULL` so a status-less record stays findable by a plain
+        `search`, with no flag at all."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "store"
+            (root / "sources").mkdir(parents=True)
+            (root / "sources" / "filter-repo.md").write_text(
+                "---\ntype: source\nid: SRC-1\ntitle: filter-repo tool notes\n---\n"
+                "Notes about filter-repo, a status-less sources/ record.\n"
+            )
+            root = root.resolve()
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+
+            row = memidx.record_row_by_path(memidx.open_db(db, project=memidx.DEFAULT_PROJECT),
+                                             str(root / "sources" / "filter-repo.md"))
+            self.assertIsNone(row["status"], "a sources/ record with no explicit status: must "
+                                              "index with a NULL status column")
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                memidx.cmd_search(ns(project=memidx.DEFAULT_PROJECT, db=str(db), query="filter-repo",
+                                      mode="fts", status=[], type=[], area=None, topic=None,
+                                      authority=None, limit=10, json=True))
+            out = json.loads(buf.getvalue())
+            self.assertTrue(any("filter-repo.md" in r["path"] for r in out), out)
+
+            # An EXPLICIT --status active must stay strict, never silently
+            # widened to also catch a status-less record the caller did not
+            # ask for -- only the true no-flag-given default ORs in NULL.
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                memidx.cmd_search(ns(project=memidx.DEFAULT_PROJECT, db=str(db), query="filter-repo",
+                                      mode="fts", status=["active"], type=[], area=None, topic=None,
+                                      authority=None, limit=10, json=True))
+            out = json.loads(buf.getvalue())
+            self.assertEqual(out, [], "an explicit --status active must not widen to NULL-status records")
+
+    def test_inbox_exclusion_uses_a_bounded_parameter_count_not_one_per_inbox_file(self):
+        """Codex 3 fix, defensive design point: a concrete `source_path NOT
+        IN (paths...)` list -- one bound SQL parameter per inbox/ file --
+        would hit SQLite's default SQLITE_MAX_VARIABLE_NUMBER (999 on many
+        still-current builds; this venv's SQLite -- 3.45.1 -- defaults to
+        32766, too high to reproduce a real crash here without an
+        impractical number of files) once a store's accumulated inbox/
+        drops crossed that count. The shipped query is a correlated `NOT
+        EXISTS` subquery instead -- ONE parameter regardless of how many
+        inbox files exist. Proven directly rather than by scale: the
+        connection's own variable-count limit is clamped down to 5 (a
+        correlated-subquery-shaped query has room to spare there; a flat
+        per-path list would not, with even a handful of inbox files) --
+        the search must still succeed."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "store"
+            (root / "topics").mkdir(parents=True)
+            (root / "inbox").mkdir(parents=True)
+            (root / "topics" / "t.md").write_text(
+                "---\ntype: topic\nid: TOP-9403\ntitle: Topic\nlinks:\n"
+                "  - link: L1\n    status: active\n"
+                "    ruling: {text: \"marlin is the real decision text\", "
+                "authority: owner-verbatim, source: s}\n"
+                "---\nBody.\n"
+            )
+            for i in range(8):
+                (root / "inbox" / f"drop{i}.md").write_text(f"consult note {i}, no frontmatter.\n")
+            root = root.resolve()
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+
+            original_open = memidx.open_db_noncreating
+
+            def clamped_open(*a, **kw):
+                conn = original_open(*a, **kw)
+                if conn is not None:
+                    conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 5)
+                return conn
+
+            buf = io.StringIO()
+            with mock.patch.object(memidx, "open_db_noncreating", side_effect=clamped_open):
+                with contextlib.redirect_stdout(buf):
+                    memidx.cmd_search(ns(project=memidx.DEFAULT_PROJECT, db=str(db), query="marlin",
+                                          mode="fts", status=[], type=[], area=None, topic=None,
+                                          authority=None, limit=10, json=True))
+            out = json.loads(buf.getvalue())
+            self.assertTrue(any("t.md" in r["path"] for r in out), out)
+
+    def test_include_inbox_at_the_default_status_returns_a_status_less_inbox_draft(self):
+        """whole-branch-review MODERATE-3/4: the real-world shape of most
+        inbox/ drops (a freeform reviewer consult, no frontmatter at all --
+        `infer_type` still classifies it `type: inbox` unconditionally) has
+        a NULL status too. Before this fix, finding one required BOTH
+        `--include-inbox` (to lift the type='inbox' exclusion) AND
+        `--status any` (to lift the active-only default) -- two flags for
+        one ordinary "let me see that inbox note" request. With MODERATE-3/4
+        landed, `--include-inbox` alone, at the default status, is enough."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "store"
+            (root / "inbox").mkdir(parents=True)
+            (root / "inbox" / "freeform.md").write_text(
+                "# A consult note\ntalbot shows up here, freeform, no frontmatter at all.\n"
+            )
+            root = root.resolve()
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                memidx.cmd_search(ns(project=memidx.DEFAULT_PROJECT, db=str(db), query="talbot",
+                                      mode="fts", status=[], type=[], area=None, topic=None,
+                                      authority=None, limit=10, include_inbox=True, json=True))
+            out = json.loads(buf.getvalue())
+            self.assertTrue(any("freeform.md" in r["path"] for r in out), out)
+
+            # --type inbox also counts as asking for them, same as before.
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                memidx.cmd_search(ns(project=memidx.DEFAULT_PROJECT, db=str(db), query="talbot",
+                                      mode="fts", status=[], type=["inbox"], area=None, topic=None,
+                                      authority=None, limit=10, json=True))
+            out = json.loads(buf.getvalue())
+            self.assertTrue(any("freeform.md" in r["path"] for r in out), out)
+
+    def test_inbox_records_are_typed_inbox_and_excluded_from_search_unless_included(self):
+        # search-inbox-downrank: a record under inbox/ indexes as
+        # type: inbox (unconditionally -- even one carrying an explicit,
+        # conflicting frontmatter `type:`, since an inbox drop is never a
+        # first-class record whatever it claims to be) and is excluded
+        # from `search` results unless --include-inbox is given. status=
+        # ["any"] throughout isolates this from search-default-active
+        # (item 1): both assertions below use the SAME status filter, so
+        # only include_inbox varies.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "store"
+            (root / "topics").mkdir(parents=True)
+            (root / "inbox").mkdir(parents=True)
+            (root / "topics" / "t.md").write_text(
+                "---\ntype: topic\nid: TOP-1\ntitle: Topic\nlinks:\n"
+                "  - link: L1\n    status: active\n"
+                "    ruling: {text: \"zephyr shows up in a real active decision\", "
+                "authority: owner-verbatim, source: s}\n"
+                "---\nBody.\n"
+            )
+            # No frontmatter at all -- the real shape of a consult drop
+            # (inbox/grok/*.md, inbox/codex/*.md in this store's own tree).
+            (root / "inbox" / "freeform.md").write_text(
+                "# A consult note\nzephyr also shows up here, freeform, no frontmatter.\n"
+            )
+            # An inbox file that DOES carry frontmatter, deliberately
+            # claiming a different type -- still must index as inbox.
+            (root / "inbox" / "claims-topic.md").write_text(
+                "---\ntype: topic\nid: TOP-9\ntitle: A note masquerading as a topic\n"
+                "---\nzephyr, a third time, in a file that claims type: topic.\n"
+            )
+            root = root.resolve()
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+
+            conn = memidx.open_db(db, project=memidx.DEFAULT_PROJECT)
+            freeform_row = memidx.record_row_by_path(conn, str(root / "inbox" / "freeform.md"))
+            claims_row = memidx.record_row_by_path(conn, str(root / "inbox" / "claims-topic.md"))
+            self.assertEqual(freeform_row["type"], "inbox")
+            self.assertEqual(claims_row["type"], "inbox",
+                              "a path under inbox/ must index as type: inbox even when its own "
+                              "frontmatter claims a different type")
+            conn.close()
+
+            def run(include_inbox):
+                buf = io.StringIO()
+                kwargs = dict(project=memidx.DEFAULT_PROJECT, db=str(db), query="zephyr",
+                               mode="fts", status=["any"], type=[], area=None, topic=None,
+                               authority=None, limit=10, json=True)
+                if include_inbox:
+                    kwargs["include_inbox"] = True
+                with contextlib.redirect_stdout(buf):
+                    memidx.cmd_search(ns(**kwargs))
+                return json.loads(buf.getvalue())
+
+            default_out = run(include_inbox=False)
+            paths = [r["path"] for r in default_out]
+            self.assertTrue(any(p.endswith("t.md") for p in paths), paths)
+            self.assertFalse(any(p.endswith("freeform.md") or p.endswith("claims-topic.md")
+                                  for p in paths), paths)
+
+            included_out = run(include_inbox=True)
+            paths = [r["path"] for r in included_out]
+            self.assertTrue(any(p.endswith("freeform.md") for p in paths), paths)
+            self.assertTrue(any(p.endswith("claims-topic.md") for p in paths), paths)
+
+    def test_inbox_topics_own_link_rows_are_also_excluded_by_default(self):
+        """Codex 3 (MAJOR): the real repro -- a COMPLETE proposed topic
+        (with an actual `links:` list, not the freeform/claims-topic
+        fixtures above, neither of which produces a link row at all) sitting
+        under inbox/. F5 gives every link its own searchable `records` row
+        (type='link', source_path naming the parent topic) -- the OLD
+        exclusion (`type != 'inbox'`) only ever matched a row's own type
+        column, never "link", so this link row appeared in default search
+        even though its parent topic was correctly excluded."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "store"
+            (root / "inbox").mkdir(parents=True)
+            (root / "inbox" / "draft.md").write_text(
+                "---\ntype: topic\nid: TOP-9401\ntitle: A proposed topic, not yet adopted\n"
+                "links:\n  - link: L1\n    status: active\n"
+                "    ruling: {text: \"quetzal names the proposed decision text itself\", "
+                "authority: owner-verbatim, source: s}\n"
+                "---\nBody.\n"
+            )
+            root = root.resolve()
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+
+            def run(include_inbox):
+                buf = io.StringIO()
+                kwargs = dict(project=memidx.DEFAULT_PROJECT, db=str(db), query="quetzal",
+                               mode="fts", status=["any"], type=[], area=None, topic=None,
+                               authority=None, limit=10, json=True)
+                if include_inbox:
+                    kwargs["include_inbox"] = True
+                with contextlib.redirect_stdout(buf):
+                    memidx.cmd_search(ns(**kwargs))
+                return json.loads(buf.getvalue())
+
+            default_out = run(include_inbox=False)
+            self.assertEqual(default_out, [], default_out)
+
+            included_out = run(include_inbox=True)
+            self.assertTrue(any("draft.md" in r["path"] for r in included_out), included_out)
+
     def test_reindex_check_unmapped_run_twice_report_zero_second_time(self):
         with tempfile.TemporaryDirectory() as td:
             root = self._topic_with_two_links(td)
@@ -2633,8 +3026,13 @@ class TestF5LinkRows(unittest.TestCase):
             reindex(root, db, no_embed=True)
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
+                # search-default-active: this test's own intent is the
+                # link-row field shape (path/link_status/matched_link_id),
+                # not status filtering -- its query only ever matches L2,
+                # which is declined, so it must widen explicitly now that
+                # an empty status list defaults to active-only.
                 memidx.cmd_search(ns(project=memidx.DEFAULT_PROJECT, db=str(db), query="sweeper",
-                                      mode="fts", status=[], type=[], area=None, topic=None,
+                                      mode="fts", status=["any"], type=[], area=None, topic=None,
                                       authority=None, limit=10, json=True))
             out = json.loads(buf.getvalue())
             hit = next(h for h in out if h.get("matched_link_id") == "L2")
@@ -2784,6 +3182,71 @@ class TestF5LinkRows(unittest.TestCase):
                 "SELECT path FROM records WHERE type='link' AND link_id='L1'"
             ).fetchone()
             self.assertIsNotNone(link_row)
+
+    def test_generation_bump_migrates_a_stale_topic_classified_inbox_file(self):
+        """Codex 4 (MAJOR): an index built before inbox/ classification
+        existed (or simply stamped at generation 4, before this fix wave)
+        recorded a file physically under inbox/ as type='topic' (its own
+        frontmatter's honest claim, pre-infer_type-override). Indexing at
+        751782c then reindexing at HEAD with an UNCHANGED sha used to
+        report "0 changed" and leave that stale type='topic' row exactly
+        as it was -- inbox exclusion (Codex 3's fix, keyed on
+        records.type='inbox') would never see it. Bumping
+        CURRENT_INDEX_GENERATION forces the same full-content-pass
+        migration path (proven above) to re-run infer_type on every
+        unchanged-sha row, which corrects the classification without a
+        second, undocumented full-rebuild step."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "store"
+            (root / "inbox").mkdir(parents=True)
+            (root / "inbox" / "draft.md").write_text(
+                "---\ntype: topic\nid: TOP-9402\ntitle: A proposed topic\nlinks:\n"
+                "  - link: L1\n    status: active\n"
+                "    ruling: {text: \"grouper is the search term for this drift\", "
+                "authority: owner-verbatim, source: s}\n"
+                "---\nBody.\n"
+            )
+            root = root.resolve()
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+            draft_path = str(root / "inbox" / "draft.md")
+
+            # Simulate the pre-classification state: the row correctly
+            # indexed as type='inbox' by THIS run is rolled back to what an
+            # older engine (no infer_type inbox override, or a generation-4
+            # index that never re-parsed after the override was added)
+            # would have stored -- its own frontmatter's literal type:topic
+            # -- and the generation stamp regresses to CURRENT_INDEX_
+            # GENERATION - 1, exactly like the sibling test above.
+            # The stamp is pinned to the LITERAL pre-this-fix-wave value (4,
+            # not `CURRENT_INDEX_GENERATION - 1`) -- this is the specific
+            # claim Codex 4 makes: a db built under the generation that
+            # shipped WITHOUT this migration must still get one. Pinning it
+            # relative to whatever the constant currently is would make
+            # this test pass trivially whether or not the bump landed.
+            conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
+            conn.execute("UPDATE records SET type='topic' WHERE path=? AND source_path=path", (draft_path,))
+            conn.execute("UPDATE db_meta SET value='4' WHERE key='index_generation'")
+            conn.commit(); conn.close()
+
+            reindex(root, db, no_embed=True)   # plain run, unchanged sha -- generation-only trigger
+
+            conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT type FROM records WHERE path=?", (draft_path,)).fetchone()
+            self.assertEqual(row["type"], "inbox",
+                              "a generation-triggered full pass must re-run infer_type even on an "
+                              "unchanged sha, correcting a stale pre-classification type")
+            conn.close()
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                memidx.cmd_search(ns(
+                    project=memidx.DEFAULT_PROJECT, db=str(db), query="grouper", mode="fts",
+                    status=["any"], type=[], area=None, topic=None, authority=None, limit=10, json=True,
+                ))
+            self.assertEqual(json.loads(buf.getvalue()), [],
+                              "the migrated, now-correctly-typed inbox row must be excluded from "
+                              "default search without needing --include-inbox")
 
     def test_check_reports_up_to_date_and_unmapped_does_not_self_heal_with_link_rows_present(self):
         # Coordinator ruling 66: _index_has_drift/cmd_check must not count
@@ -3101,6 +3564,46 @@ class TestMalformedRecordQuarantine(unittest.TestCase):
             diagnostics = json.loads(rows[0]["diagnostics"])
             fields = [d[0] for d in diagnostics]
             self.assertIn("links[0].link", fields, diagnostics)
+
+    # -- scenario 3b: a duplicate link id -- quarantined, never last-wins indexed
+
+    def test_duplicate_link_id_is_quarantined_not_last_wins_indexed(self):
+        """Codex 2 (BLOCKING, fix wave 1 G1): a topic with two links
+        sharing id "L2" (one agent-inference, one owner-verbatim) used to
+        parse as VALID -- build_record's own link-embedding pass and any
+        id-keyed dict elsewhere would each silently keep a DIFFERENT
+        occurrence, so the searchable index could carry different content
+        than a human reading the raw file sees first. It must now be
+        quarantined entirely (never indexed under either reading)."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            _write_record(
+                root / "topics" / "bad.md",
+                "---\nid: TOP-9108\ntype: topic\ntitle: Bad\nlinks:\n"
+                '  - link: L2\n    status: active\n    ruling: {text: "a", authority: agent-inference}\n'
+                '  - link: L2\n    status: active\n    ruling: {text: "b", authority: owner-verbatim, source: s}\n'
+                "---\nBody.\n",
+            )
+            db = Path(td) / "idx.sqlite"
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf), contextlib.redirect_stdout(io.StringIO()):
+                rc = reindex(root, db, no_embed=True)
+            self.assertEqual(rc, 0, err_buf.getvalue())
+            self.assertNotIn("Traceback", err_buf.getvalue())
+            rows = self._index_errors_rows(db)
+            self.assertEqual(len(rows), 1, rows)
+            diagnostics = json.loads(rows[0]["diagnostics"])
+            fields = [d[0] for d in diagnostics]
+            self.assertIn("links", fields, diagnostics)
+            messages = [d[1] for d in diagnostics]
+            self.assertTrue(any("duplicate link id 'L2'" in m for m in messages), diagnostics)
+
+            conn = sqlite3.connect(str(db))
+            try:
+                link_rows = conn.execute("SELECT * FROM links WHERE link = 'L2'").fetchall()
+            finally:
+                conn.close()
+            self.assertEqual(link_rows, [], "a quarantined record's links must never be indexed at all")
 
     # -- scenario 4: unreadable file / non-UTF-8 file -- quarantined naming "file"
 

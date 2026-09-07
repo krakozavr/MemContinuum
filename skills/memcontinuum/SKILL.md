@@ -85,7 +85,12 @@ and let them decide.
   generic `memory/` (collides with other memory systems) and never bare
   `MemContinuum` (reads as the tool itself). Omit `--store` and repo-init
   applies the convention on its own: `<repo>-MemContinuum-Store` beside the
-  git repo the cwd is in, else `MemContinuum-Store` inside the cwd. Only pass
+  git repo the cwd is in, else `MemContinuum-Store` inside the cwd — except
+  when the checkout is physically on a Windows-mounted drive under WSL, where
+  a store walk costs seconds rather than milliseconds: there the default
+  instead lands on the WSL disk, at `$HOME/dev/<repo>-MemContinuum-Store` (or
+  bare `$HOME/<repo>-MemContinuum-Store` when `$HOME/dev` does not exist),
+  and `repo-init.sh` prints why. Only pass
   `--store` when the human wants a different place — and when you do, pass
   `--claude-dir` alongside it (`repo-init.sh` refuses an explicit `--store`
   with no explicit `--claude-dir` rather than guess which `.claude` its hooks
@@ -193,3 +198,12 @@ Either direction, at any point in a repo's life:
 - Never write a decision the human did not give you.
 - If `state=no-config`, MemContinuum was never bootstrapped on this machine.
   Point at `memcontinuum-setup.sh`; do not run it unasked.
+- When two `status: active` links (in the same topic or across topics)
+  genuinely conflict, the citation tiers already decide: the higher tier
+  prevails (CONSTRAINT over HOLD over CONTEXT — SCHEMA section 4), and say
+  so to whoever asked. Equal tier is not yours to pick between: two
+  conflicting agent-level rulings are resolved by the orchestrator writing a
+  new link that reverses one of them (`TOP-xxxx Ln`, `kind: reversed`,
+  naming the other as the reason); two conflicting owner-level rulings go
+  back to the owner, and the owner's answer is recorded as a new
+  `owner-verbatim` link, not inferred.

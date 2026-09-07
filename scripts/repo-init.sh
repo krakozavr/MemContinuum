@@ -74,6 +74,7 @@ RENDERED_SHA="$MC_RENDER_FINGERPRINT"
 PROJECT=""
 STORE=""
 STORE_GIVEN=0
+STORE_HOOKS_DIR_OVERRIDE=""
 CLAUDE_DIR=""
 PYTHON_BIN=""
 PYTHON_BIN_EXPLICIT=0
@@ -103,7 +104,13 @@ Usage: repo-init.sh --project NAME [--store DIR] [--code-root DIR ...]
   --store DIR        the markdown store root to create/wire. Optional: the
                       default is the conventional marked name --
                       "<repo>-MemContinuum-Store" beside the git repo the
-                      cwd is in, else "$PWD/MemContinuum-Store". Never a
+                      cwd is in, else "$PWD/MemContinuum-Store". On a
+                      checkout physically on a Windows-mounted drive under
+                      WSL, the default instead lands at
+                      "$HOME/dev/<repo>-MemContinuum-Store" (or
+                      "$HOME/<repo>-MemContinuum-Store" when "$HOME/dev"
+                      does not exist) -- a store walk on that drive costs
+                      seconds, not milliseconds. Never a
                       generic "memory/" (collides with other memory
                       systems) and never bare "MemContinuum" (reads as the
                       tool itself). An existing git repo at DIR with none of
@@ -111,6 +118,22 @@ Usage: repo-init.sh --project NAME [--store DIR] [--code-root DIR ...]
                       no README mentioning MemContinuum) is refused, not
                       silently adopted -- protects against a mistyped
                       --store landing store dirs in an unrelated repo.
+  --store-hooks-dir DIR
+                      install the store's git hooks (post-commit/
+                      pre-commit) at DIR instead of wherever `git
+                      rev-parse --git-path hooks` resolves for --store.
+                      Use this when that resolution is refused (Codex 1,
+                      fix wave 1 G1): a global or shared `core.hooksPath`
+                      pointing OUTSIDE --store's own .git means the
+                      append-only guard would run for every repo that
+                      shares that hooks directory, not just this store --
+                      refused rather than installed there. Fix it either
+                      by running `git config --local core.hooksPath
+                      .git/hooks` inside --store (undoing the shared
+                      setting for this repo only), or by pointing this
+                      flag at a directory that IS store-local (this flag
+                      trusts the location you give it; it does not itself
+                      re-check that DIR is inside --store's .git).
   --code-root DIR     a code checkout the PreToolUse hook should watch for
                       Edit/Write and the write-side hooks should scope
                       ledger entries to. Repeatable. Optional -- omit for a
@@ -232,6 +255,11 @@ Exit codes (0 on success, including a --dry-run preview that hit no refusal):
   16  <claude-dir>/skills/memory-search/SKILL.md already exists and was
       not rendered by this installer (foreign or hand-authored) -- refused
       before any mutation, never overwritten, same as 14.
+  17  no --store was given, the checkout is on a Windows-mounted drive
+      under WSL, and the computed default (plain, and its parent-
+      disambiguated fallback) already belongs to a different checkout's
+      or project's store -- refusing to guess a third name or silently
+      share it; pass --store explicitly.
 USAGE
 }
 
@@ -297,6 +325,104 @@ git_hooks_dir_for() {
         /*) printf '%s' "$d" ;;
         *)  printf '%s' "$1/$d" ;;
     esac
+}
+
+# install_store_hook_wrapper NAME SCRIPT -- writes <STORE_HOOKS_DIR>/NAME as
+# a wrapper exporting MEMCONTINUUM_ROOT/PROJECT/PYTHON and `exec`ing
+# <HOOKS_DIR>/SCRIPT by absolute path (so an edit to SCRIPT needs no
+# reinstall). A2-1 review finding M2: post-commit's and pre-commit's wrapper
+# generation used to be two hand-copied blocks (same shape: identity grep,
+# `step` message, printf heredoc, chmod +x) differing only in the hook name
+# and target script -- factored into this one call, so a third store git
+# hook never repeats the pattern (or its own status-var/log-message pair,
+# which used to be free to drift out of sync by hand) a third time.
+#
+# Foreign-hook refusal (fix round 1, TOP-0122 L3 -- both hooks now share
+# it): a NAME already present at $STORE_HOOKS_DIR that this installer did
+# not render is left untouched and reported, never silently overwritten;
+# absent entirely, or present and ours (possibly stale), it is written/
+# regenerated. Identity is anchored on the COMPLETE generated shape
+# (_installer_wrapper_shape below), not merely a substring or single-line
+# match anywhere in the file -- Codex 6 (fix wave 1 G1): the old check was
+# `grep -qE "^exec bash .*SCRIPT\$"` against the WHOLE file, so a
+# hand-authored wrapper that added its own lines AROUND a real `exec bash
+# .../SCRIPT` line (e.g. a local policy check before deferring to the
+# canonical script) still matched that one line and was misclassified as
+# "ours", silently overwritten, and lost its added policy. A wrapper this
+# installer did not write is foreign the moment it carries even one extra
+# (or missing) line, whatever that line is.
+#
+# Sets two globals the caller reads afterward, named from NAME (`tr`, not
+# `${NAME^^}` -- this script runs under real bash 3.2, tests/run_bash32.sh):
+# POST_COMMIT/POST_COMMIT_STATUS for NAME=post-commit, PRE_COMMIT/
+# PRE_COMMIT_STATUS for NAME=pre-commit. The step/log label ("reindex" /
+# "append-only") is derived from SCRIPT by stripping the "<NAME>-" prefix
+# and ".sh" suffix, so the two log messages cannot drift out of sync by
+# hand either.
+
+# _installer_wrapper_shape HOOKPATH SCRIPT -- true (rc 0) only when
+# HOOKPATH is EXACTLY the shape install_store_hook_wrapper itself
+# generates: five lines, no more and no fewer -- a shebang, the three
+# MEMCONTINUUM_* exports (values may be stale from an earlier install with
+# a different STORE/PROJECT/PYTHON_BIN -- only the KEYS are checked so a
+# stale-but-ours wrapper is still recognized and regenerated), and an exec
+# line naming $HOOKS_DIR/SCRIPT verbatim (byte-for-byte -- that line never
+# varies run to run for a given SCRIPT, since $HOOKS_DIR is this checkout's
+# own fixed hooks directory).
+_installer_wrapper_shape() {
+    local hookpath="$1" script="$2"
+    local expected_exec line n=0
+    local -a lines=()
+    expected_exec="exec bash $(printf '%q' "$HOOKS_DIR/$script")"
+    while IFS= read -r line || [ -n "$line" ]; do
+        lines[$n]="$line"
+        n=$((n + 1))
+    done < "$hookpath"
+    [ "$n" -eq 5 ] || return 1
+    [ "${lines[0]}" = "#!/usr/bin/env bash" ] || return 1
+    case "${lines[1]}" in
+        "export MEMCONTINUUM_ROOT="*) ;;
+        *) return 1 ;;
+    esac
+    case "${lines[2]}" in
+        "export MEMCONTINUUM_PROJECT="*) ;;
+        *) return 1 ;;
+    esac
+    case "${lines[3]}" in
+        "export MEMCONTINUUM_PYTHON="*) ;;
+        *) return 1 ;;
+    esac
+    [ "${lines[4]}" = "$expected_exec" ] || return 1
+    return 0
+}
+
+install_store_hook_wrapper() {
+    local name="$1" script="$2"
+    local varbase label hookpath
+    varbase="$(printf '%s' "$name" | tr 'a-z-' 'A-Z_')"
+    label="${script#"$name"-}"
+    label="${label%.sh}"
+    hookpath="$STORE_HOOKS_DIR/$name"
+
+    if [ -f "$hookpath" ] && ! _installer_wrapper_shape "$hookpath" "$script"; then
+        printf -v "${varbase}_STATUS" '%s' "skipped-foreign"
+        step "git $name $label wrapper: SKIPPED -- $hookpath already exists and was not rendered by this installer (foreign or hand-authored); move it aside first if you want repo-init to install one here"
+    else
+        printf -v "${varbase}_STATUS" '%s' "written"
+        step "git $name $label wrapper: $hookpath -> $HOOKS_DIR/$script"
+        if [ "$DRY_RUN" -eq 0 ]; then
+            mkdir -p "$STORE_HOOKS_DIR" || fail "could not create $STORE_HOOKS_DIR"
+            {
+                printf '#!/usr/bin/env bash\n'
+                printf 'export MEMCONTINUUM_ROOT=%s\n' "$(printf '%q' "$STORE")"
+                printf 'export MEMCONTINUUM_PROJECT=%s\n' "$(printf '%q' "$PROJECT")"
+                printf 'export MEMCONTINUUM_PYTHON=%s\n' "$(printf '%q' "$PYTHON_BIN")"
+                printf 'exec bash %s\n' "$(printf '%q' "$HOOKS_DIR/$script")"
+            } > "$hookpath" || fail "could not write $hookpath"
+            chmod +x "$hookpath" || fail "could not chmod $hookpath"
+        fi
+    fi
+    printf -v "$varbase" '%s' "$hookpath"
 }
 
 # resolve_python -- prints an absolute python path on stdout and returns 0,
@@ -434,6 +560,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --project) mc_need_value "$@"; PROJECT="$2"; shift 2 ;;
         --store) mc_need_value "$@"; STORE="$2"; STORE_GIVEN=1; shift 2 ;;
+        --store-hooks-dir) mc_need_value "$@"; STORE_HOOKS_DIR_OVERRIDE="$2"; shift 2 ;;
         --code-root) mc_need_value "$@"; CODE_ROOTS+=("$2"); shift 2 ;;
         --claude-dir) mc_need_value "$@"; CLAUDE_DIR="$2"; shift 2 ;;
         --python) mc_need_value "$@"; PYTHON_BIN="$2"; PYTHON_BIN_EXPLICIT=1; shift 2 ;;
@@ -467,26 +594,40 @@ done
 #   cwd inside a git repo   -> a SIBLING of that repo, "<name>-MemContinuum-Store"
 #                              (never inside -- a store must not be absorbed
 #                              into a code repo's history; same rule the
-#                              inside-a-repo refusal below enforces)
+#                              inside-a-repo refusal below enforces) -- UNLESS
+#                              the checkout is a Windows-mounted drive under
+#                              WSL, in which case the sibling rule is replaced
+#                              by mc_default_store_for's WSL-disk rule (see
+#                              scripts/mc-registry-lib.sh; TOP-0109 L5): a
+#                              store walk on a Windows-mounted drive costs
+#                              seconds, not milliseconds.
 #   cwd not in any git repo -> "$(pwd -P)/MemContinuum-Store" (a working
 #                              FOLDER, like a docs dir, hosts its store
-#                              directly)
+#                              directly) -- the WSL rule does not apply here,
+#                              it is about CHECKOUTS specifically.
 # An explicit --store always wins; the default is printed so nothing lands
 # anywhere silently.
 if [ -z "$STORE" ]; then
     CWD_TOPLEVEL="$(git rev-parse --show-toplevel 2>/dev/null || true)"
     if [ -n "$CWD_TOPLEVEL" ]; then
-        STORE="$(dirname "$CWD_TOPLEVEL")/$(basename "$CWD_TOPLEVEL")-MemContinuum-Store"
-        # A defaulted SIBLING store must not drag --claude-dir's own default
+        if ! mc_default_store_for "$CWD_TOPLEVEL" "$PROJECT"; then
+            fail "the default store for this checkout already belongs to a different checkout or project ($MC_DEFAULT_STORE_REFUSED_WHY) -- refusing to adopt or rewrite it. Pass --store DIR --claude-dir DIR to choose a location explicitly." 17
+        fi
+        STORE="$MC_DEFAULT_STORE"
+        [ -n "$MC_DEFAULT_STORE_WHY" ] && echo "note: $MC_DEFAULT_STORE_WHY"
+        # A defaulted store must not drag --claude-dir's own default
         # (<dirname of store>/.claude) up to the parent directory -- the hooks
         # belong to the repo being initialized, so they default into that
-        # repo's .claude. Deliberately scoped to the defaulted-store flow
-        # only: with an EXPLICIT --store, the cwd is no signal at all (the
-        # command may be run from anywhere -- a test harness, a script, an
-        # unrelated checkout -- to set up paths elsewhere; round-3's fix
-        # attempt keyed on cwd unconditionally and wired a test run's hooks
-        # into the engine repo's own .claude). The skill's documented flow is
-        # cd-into-the-repo with NO --store, which lands here.
+        # repo's .claude REGARDLESS of where the store itself defaulted (the
+        # WSL rule moves the store, on purpose, to a different disk -- it
+        # must never move the hooks with it). Deliberately scoped to the
+        # defaulted-store flow only: with an EXPLICIT --store, the cwd is no
+        # signal at all (the command may be run from anywhere -- a test
+        # harness, a script, an unrelated checkout -- to set up paths
+        # elsewhere; round-3's fix attempt keyed on cwd unconditionally and
+        # wired a test run's hooks into the engine repo's own .claude). The
+        # skill's documented flow is cd-into-the-repo with NO --store, which
+        # lands here.
         [ -n "$CLAUDE_DIR" ] || CLAUDE_DIR="$CWD_TOPLEVEL/.claude"
     else
         # PHYSICAL, not $PWD directly: a freshly-started bash's own $PWD
@@ -1020,8 +1161,34 @@ else
             fi
         done
 
+        # G5 residual (whole-branch-review Codex 5 follow-up, TOP-0109 L5):
+        # the WSL-disk default's own identity check (mc_store_belongs_
+        # elsewhere, scripts/mc-registry-lib.sh) used to have no signal that
+        # survives two checkouts sharing a basename AND a --project value
+        # with neither ever run through --record-decision -- the store's
+        # own README named only the project, which matches by construction.
+        # Stamping the checkout's own physical path here, unconditionally,
+        # at store-creation time, gives that check an unambiguous identity
+        # to compare against regardless of --project. CWD_TOPLEVEL is only
+        # ever set inside the "no --store given" branch above (${..:-} for
+        # the explicit-store case, where no one checkout owns this install).
+        #
+        # Fix round 2 R5: this comment always claimed "physical path", but
+        # CWD_TOPLEVEL (git rev-parse --show-toplevel, which honors $PWD)
+        # was stamped verbatim -- LOGICAL, not physical. On macOS a
+        # checkout under $TMPDIR is /var/folders/... logically and
+        # /private/var/folders/... physically, so a store created from
+        # there never matched its own checkout once compared physically
+        # (mc_store_belongs_elsewhere, scripts/mc-registry-lib.sh). Now
+        # resolved through mc_physical (falls back to the raw value when
+        # the path does not exist, same "unknown"-shaped fallback below).
+        CHECKOUT_STAMP=""
+        [ -n "${CWD_TOPLEVEL:-}" ] && CHECKOUT_STAMP="$(mc_physical "$CWD_TOPLEVEL")"
+        [ -n "$CHECKOUT_STAMP" ] || CHECKOUT_STAMP="unknown"
+
         README_TMPL="$(cat "$TEMPLATES_DIR/store-README.md.tmpl")"
         README_TMPL="${README_TMPL//\{\{PROJECT\}\}/$PROJECT}"
+        README_TMPL="${README_TMPL//\{\{CHECKOUT_STAMP\}\}/$CHECKOUT_STAMP}"
         README_TMPL="${README_TMPL//\{\{STORE\}\}/$STORE}"
         README_TMPL="${README_TMPL//\{\{PYTHON\}\}/$PYTHON_BIN}"
         README_TMPL="${README_TMPL//\{\{ENGINE_DIR\}\}/$ENGINE_ROOT}"
@@ -1395,23 +1562,85 @@ fi
 # (because the wrapper execs the canonical file, it never copies it).
 
 if is_git_repo "$STORE"; then
-    # R8 fix, round 4 (corrected in regate round 2): install where git
-    # actually RUNS post-commit for commits in $STORE -- `rev-parse
-    # --git-path hooks` -- which for a linked worktree is the shared
-    # repo's .git/hooks, never .git/worktrees/<name>/hooks.
-    STORE_HOOKS_DIR="$(git_hooks_dir_for "$STORE")" || fail "could not resolve git hooks dir for $STORE"
-    step "git post-commit reindex wrapper: $STORE_HOOKS_DIR/post-commit -> $HOOKS_DIR/post-commit-reindex.sh"
-    if [ "$DRY_RUN" -eq 0 ]; then
-        mkdir -p "$STORE_HOOKS_DIR" || fail "could not create $STORE_HOOKS_DIR"
-        POST_COMMIT="$STORE_HOOKS_DIR/post-commit"
-        {
-            printf '#!/usr/bin/env bash\n'
-            printf 'export MEMCONTINUUM_ROOT=%s\n' "$(printf '%q' "$STORE")"
-            printf 'export MEMCONTINUUM_PROJECT=%s\n' "$(printf '%q' "$PROJECT")"
-            printf 'export MEMCONTINUUM_PYTHON=%s\n' "$(printf '%q' "$PYTHON_BIN")"
-            printf 'exec bash %s\n' "$(printf '%q' "$HOOKS_DIR/post-commit-reindex.sh")"
-        } > "$POST_COMMIT" || fail "could not write $POST_COMMIT"
-        chmod +x "$POST_COMMIT" || fail "could not chmod $POST_COMMIT"
+    if [ -n "$STORE_HOOKS_DIR_OVERRIDE" ]; then
+        # --store-hooks-dir trusts the caller's explicit choice -- skips
+        # the shared-hooksPath resolution/check below entirely (see its
+        # usage() entry for why someone would need this).
+        STORE_HOOKS_DIR="$(abspath "$STORE_HOOKS_DIR_OVERRIDE")"
+    else
+        # R8 fix, round 4 (corrected in regate round 2): install where git
+        # actually RUNS post-commit for commits in $STORE -- `rev-parse
+        # --git-path hooks` -- which for a linked worktree is the shared
+        # repo's .git/hooks, never .git/worktrees/<name>/hooks.
+        GIT_RESOLVED_HOOKS_DIR="$(git_hooks_dir_for "$STORE")" || fail "could not resolve git hooks dir for $STORE"
+
+        # Codex 1 (BLOCKING, fix wave 1 G1): refuse to install EITHER
+        # wrapper when git resolves the store's hooks directory to
+        # somewhere OUTSIDE the store's own .git -- a global or shared
+        # `core.hooksPath` means the SAME hook would fire for every other
+        # repository that shares that hooks directory, not only this
+        # store, and the append-only guard must act only for its own
+        # store (ruling 145). Reproduced: a shared hooks dir installed via
+        # core.hooksPath, then an ordinary code commit in an UNRELATED
+        # repo failed because the STORE had a staged history violation.
+        # Compared PHYSICALLY (abspath = os.path.realpath, same as every
+        # other cross-checkout comparison in this file) so a symlinked
+        # .git or hooks dir is never mistaken for "outside".
+        #
+        # `--git-common-dir`, NOT `--absolute-git-dir`: for a store
+        # checked out as a LINKED WORKTREE (git_hooks_dir_for's own R8
+        # case above), `--absolute-git-dir` is the per-worktree PRIVATE
+        # dir (.git/worktrees/<name>), which git never uses for hooks --
+        # `--git-path hooks` (what git_hooks_dir_for already calls, and
+        # what GIT_RESOLVED_HOOKS_DIR holds) resolves against the SHARED
+        # main checkout's .git instead, same as it always does for a
+        # worktree with no core.hooksPath at all. Boundary-checking
+        # against the private dir would misclassify that ordinary,
+        # unconfigured worktree case as "outside" and refuse a perfectly
+        # normal install.
+        STORE_GIT_DIR="$(git -C "$STORE" rev-parse --git-common-dir 2>/dev/null)" || fail "could not resolve git dir for $STORE"
+        case "$STORE_GIT_DIR" in
+            /*) ;;
+            *) STORE_GIT_DIR="$STORE/$STORE_GIT_DIR" ;;
+        esac
+        STORE_GIT_DIR_PHYS="$(abspath "$STORE_GIT_DIR")"
+        GIT_RESOLVED_HOOKS_DIR_PHYS="$(abspath "$GIT_RESOLVED_HOOKS_DIR")"
+        case "$GIT_RESOLVED_HOOKS_DIR_PHYS" in
+            "$STORE_GIT_DIR_PHYS"/*)
+                STORE_HOOKS_DIR="$GIT_RESOLVED_HOOKS_DIR"
+                ;;
+            *)
+                echo "note: refusing to install the store's git hooks -- git resolves the hooks directory for $STORE to $GIT_RESOLVED_HOOKS_DIR, which is OUTSIDE its own .git ($STORE_GIT_DIR): core.hooksPath is set to a shared or global location, and the append-only guard must never run for repositories other than its own store. Fix it either by running 'git config --local core.hooksPath .git/hooks' inside $STORE (undoes the shared setting for this repo only), or by re-running with --store-hooks-dir DIR to choose a store-local location yourself." >&2
+                POST_COMMIT_STATUS="skipped-shared-hookspath"
+                PRE_COMMIT_STATUS="skipped-shared-hookspath"
+                STORE_HOOKS_DIR=""
+                STORE_HOOKS_DIR_REFUSED="$GIT_RESOLVED_HOOKS_DIR"
+                ;;
+        esac
+    fi
+
+    if [ -n "$STORE_HOOKS_DIR" ]; then
+        # Fix round 1 (TOP-0122 L3): post-commit gets the SAME foreign-hook
+        # refusal policy pre-commit already has below (6b) -- a hand-authored
+        # post-commit this installer did not render is left ALONE and
+        # reported, never silently clobbered, closing the asymmetry the
+        # previous round's own report flagged (post-commit used to be
+        # overwritten unconditionally on every run, no check at all).
+        install_store_hook_wrapper post-commit post-commit-reindex.sh
+
+        # --- 6b. git pre-commit append-only wrapper ---------------------------
+        #
+        # Task A2-1 (TOP-0122 L1 rule 3): same generated-wrapper shape as
+        # post-commit above (exports the three vars, execs the canonical
+        # script by absolute path so an edit to it needs no reinstall), and --
+        # as of the fix round above -- the SAME foreign-hook refusal policy:
+        # present (ours, possibly stale) -> regenerated in place; absent
+        # entirely -> written; present and NOT ours -> left untouched and
+        # reported (never fatal -- this step runs after the settings merge, so
+        # a hard failure here would leave exactly the half-installed state the
+        # "refused before any mutation" pattern elsewhere in this file exists
+        # to avoid).
+        install_store_hook_wrapper pre-commit pre-commit-append-only.sh
     fi
 fi
 
@@ -1509,8 +1738,19 @@ else
     echo "Settings file  : $CLAUDE_DIR/settings.local.json"
     echo "Rules file     : $RULES_DEST (rendered by $RENDERED_SHA)"
     echo "Skill installed: $CLAUDE_DIR/skills/memory-search/SKILL.md"
-    if [ -n "${STORE_HOOKS_DIR:-}" ] && [ -f "$STORE_HOOKS_DIR/post-commit" ]; then
+    if [ "${POST_COMMIT_STATUS:-}" = "skipped-shared-hookspath" ]; then
+        echo "Post-commit    : SKIPPED -- ${STORE_HOOKS_DIR_REFUSED:-a shared hooks directory} is outside the store's own .git (core.hooksPath); see the note above, or pass --store-hooks-dir"
+    elif [ "${POST_COMMIT_STATUS:-}" = "skipped-foreign" ]; then
+        echo "Post-commit    : SKIPPED -- foreign hook at $STORE_HOOKS_DIR/post-commit (not rendered by this installer)"
+    elif [ -n "${STORE_HOOKS_DIR:-}" ] && [ -f "$STORE_HOOKS_DIR/post-commit" ]; then
         echo "Post-commit    : $STORE_HOOKS_DIR/post-commit (wraps $HOOKS_DIR/post-commit-reindex.sh)"
+    fi
+    if [ "${PRE_COMMIT_STATUS:-}" = "skipped-shared-hookspath" ]; then
+        echo "Pre-commit     : SKIPPED -- ${STORE_HOOKS_DIR_REFUSED:-a shared hooks directory} is outside the store's own .git (core.hooksPath); see the note above, or pass --store-hooks-dir"
+    elif [ "${PRE_COMMIT_STATUS:-}" = "skipped-foreign" ]; then
+        echo "Pre-commit     : SKIPPED -- foreign hook at $STORE_HOOKS_DIR/pre-commit (not rendered by this installer)"
+    elif [ -n "${STORE_HOOKS_DIR:-}" ] && [ -f "$STORE_HOOKS_DIR/pre-commit" ]; then
+        echo "Pre-commit     : $STORE_HOOKS_DIR/pre-commit (wraps $HOOKS_DIR/pre-commit-append-only.sh)"
     fi
     echo "Reindex        : rc=$REINDEX_RC"
     [ -n "$REINDEX_OUT" ] && echo "$REINDEX_OUT" | sed 's/^/  /'
@@ -1640,6 +1880,7 @@ else
      $CLAUDE_DIR/skills/memory-search/
      $RULES_DEST
      ${STORE_HOOKS_DIR:-$STORE/.git/hooks}/post-commit
+     ${STORE_HOOKS_DIR:-$STORE/.git/hooks}/pre-commit
      ~/.memcontinuum/$PROJECT.sqlite
    (leave $STORE itself alone -- it is the store's own git history).
 EOF

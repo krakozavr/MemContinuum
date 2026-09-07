@@ -25,11 +25,19 @@ title: Hidden files in the processed count
 area: processing/status
 project: notecatcher
 current: L4                 # newest active link id — hand-set; memlint errors if it does not match the newest active link
-code_refs:                  # the decision→code link
-  - src/core/scan/scan_plan.py#hidden_count
-  - src/app/summary/summary_card.py#appendix
+code_refs:                  # the decision→code link — three forms, freely mixed
+  - src/core/scan/                    # a repo-relative PATH PREFIX — matches every file under it
+  - src/app/summary/*.py              # an fnmatch GLOB
+  - src/core/scan/scan_plan.py#hidden_count   # PATH#SYMBOL — a qualified symbol name as the chunkers report it
 tags: []
 ```
+
+A prefix and a glob keep serving retrieval exactly as before — `for-path`/`unmapped` match either
+against a file path, unchanged (§8.4). Only `path#symbol` names an actual symbol, so in a file
+WITH a chunker only `path#symbol` refs take part in marker verification (§8.3): a marker there can
+never be checked against a ref that names no symbol. A file whose language has no chunker at all
+has no symbol to check against in the first place, so any code_refs form naming the file takes
+part instead (§8.3).
 
 ## 3. Link (one ruling) — fields, and authority PER FIELD
 
@@ -109,6 +117,16 @@ is handled by **splitting the link into scoped claims before promotion**
 > **CONTEXT** — informs only. `agent-inference` may never by itself override
 > a fix that code and tests already accept.
 
+**Conflict resolution.** Two `status: active` links can genuinely conflict — the schema allows
+several active rulings at once (one topic's own chain, or across topics), it does not guarantee
+they agree. When they do, the tier above decides: the higher-tier link prevails, and the reader
+names both links and says so, rather than silently picking one. Equal tier does not resolve
+itself: two conflicting rulings at `agent-inference` (or any other equal, non-owner tier) are
+resolved by the orchestrator, who writes a new link reversing one of them (`kind: reversed`,
+`reverses: <the losing link>`, per §7's rule that its target must no longer be active); two
+conflicting `owner-verbatim`/`owner-ratified` links go back to the owner, and the owner's answer
+is recorded as a new `owner-verbatim` link (`TOP-xxxx Ln`), never inferred on their behalf.
+
 ## 5. Promotion — how an inference becomes a ruling
 
 1. The record exists as `agent-inference` / `provisional`.
@@ -141,8 +159,13 @@ copied inline.
 `memlint.py` enforces:
 
 - `owner-verbatim` or `owner-ratified` without `ruling.text` and `source` → error
+- an `owner-verbatim` `ruling.text` ending in `?` (after trimming quotes/whitespace) → error, a
+  question is not a ruling (`owner-ratified` is the orchestrator's own paraphrase, not covered)
 - `status: superseded` without `superseded_by` → error
 - `reverses:` without `reason_for_change` → error
+- a `kind: reversed` link whose `reverses:` target's `status` is still `active` or `provisional` →
+  error, naming the target and its status (`kind: amended` leaves its predecessor active on
+  purpose — not covered)
 - `current` not equal to the newest link with `status: active` → error (names the correct value)
 - a topic in area `processing/*` or `deletion/*` with no `code_refs` → warning
 - any `status` / `authority` / `kind` value outside the five/five/five enumerated above → error
@@ -151,12 +174,33 @@ copied inline.
   missing its `link` id, `ruling`/`rationale`/`invariant` not a mapping, a list field carrying a
   non-scalar) → error naming the file/field; the same on a note (no schema id/links/type) → warning
 
-**Deliberately not implemented:** "a link edited after being recorded (hash
-mismatch vs git) → reject". That check needs the canonical records to live in
-a git repo with an append-only enforcement process around it, which is a
-property of how a *store* is operated, not of this schema or its linter.
-Anyone wiring a canonical append-only store on top of this should add that
-check at the point where commits are made.
+**A link edited after being recorded is caught too**, in a second, independent
+check: `memlint.py --against-ref REF [--staged] ROOT` compares every topic
+file's links now against what they were at `REF`. A link present at `REF`
+has its BODY frozen — `ruling`, `rationale`, `alternatives`, `evidence`,
+`revisit_if`, `edges`, `assumptions`, `invariant`, `date`, `kind`, `reverses`,
+`reason_for_change`, `recorded_by`, `recorded_at` may never change; any diff
+there is an error naming the field. Exactly three fields are lifecycle
+fields, allowed to move **forward only, once**: `status` may move from
+`active` or `provisional` to `superseded`, `historical`, or `declined` —
+never back to `active`/`provisional`, never between the three terminal
+values (so a provisional record is *promoted* by a new link, per §5, never
+by editing this field to `active`) — `superseded_by` may be *added* in that
+same move (never changed afterwards, never present unless `status` is
+`superseded`) — and `promoted_by` may be *added* once, with no such status
+coupling: §5 step 3's promotion procedure appends a new link and adds
+`promoted_by: L<n>` to the OLD link it promotes, whatever that old link's
+own status; it is immutable once set, exactly like `superseded_by`. A
+lifecycle move must be the only change on the link; bundled with any body
+edit, both get their own error. A link removed, or a topic file deleted or
+renamed, is an error naming the path. New links, and changes to `current`,
+`title`, `tags`, `code_refs`, or the body text, are free. A store's own git
+`pre-commit` hook (`hooks/pre-commit-append-only.sh`, wired by
+`scripts/repo-init.sh` the same way `post-commit-reindex.sh` is) runs this on
+every commit and blocks the ones that fail it; the same check can run again in
+CI against a wider range, for a guarantee `--no-verify` cannot bypass. See
+`hooks/install-hooks.md` for how it is wired and `docs/INTERNALS.md`'s memlint
+section for the full rule table.
 
 ---
 
@@ -205,6 +249,53 @@ assumption cites it with an `abandons` edge.
 A CONSTRAINT-tier link with an `invariant` is a tripwire, not prose:
 `memidx.py drift` runs every invariant against the code tree and reports
 "implementation has drifted from active decision `<id>`".
+
+**A CONSTRAINT or HOLD link may also be mirrored at its bound symbol**, a comment carrying the
+decision it implements:
+
+```python
+# decision: TOP-42 L4
+def hidden_count(entries):
+    ...
+```
+
+Syntax is language-agnostic: any comment LINE containing `decision: TOP-xxxx Ln` — on the
+symbol's own definition line, or within the three lines immediately above it — is a marker,
+whatever the language's comment leader (`#`, `//`, `--`, …); the check is a plain text match, not a
+parse of the comment itself. The symbol's definition line is found through the chunker registry
+(`chunkers.get_chunker(lang).chunk_file`), so the same rule serves every wired language; a file
+whose backend cannot run here is skipped with a warning naming the reason, while a file whose
+language has no chunker at all is instead scanned for a marker by plain regex alone — silent when
+it holds none, and, when it does, checked against everything that needs no symbol location (the
+topic and link exist, are active CONSTRAINT/HOLD, and the topic's code_refs name the file) with a
+warning that the marker cannot be attributed to a symbol, rather than warned regardless of whether
+it carries a marker at all. Markers verify at functions, methods, and computed
+vars/properties — whatever the chunker itself reports a definition line for; a container type
+(a class, struct, enum, …) has no such line of its own and is uncheckable.
+
+`memlint.py --code-root DIR` checks the pair both ways. In a file WITH a chunker, only a
+`path#symbol` code_refs entry takes part — a glob or a bare path names no symbol, so a marker
+under one is an error, not a skip; a file whose language has no chunker at all has no symbol to
+hold a marker to that stricter standard, so any code_refs form naming the file (bare path, glob,
+or path#symbol) satisfies it instead, per the no-chunker rule above.
+
+Marker → store, in a file WITH a chunker: every marker under a code root must point at a topic and
+link that exist, that link must be `active` and CONSTRAINT or HOLD, and that topic's `code_refs`
+must name the marked file with the matching `path#symbol` (a prefix or glob that merely happens to
+match the same FILE does not count — that is the error `path#symbol` exists to prevent) — else an
+error naming the file, line, and reason. In a file with no chunker at all, the same topic/link/
+status/tier checks apply, but any code_refs form naming the file (bare path, glob, or path#symbol)
+satisfies the code_refs check instead — there is no symbol to hold it to the stricter standard
+above, and the one thing left unverified (attribution to a specific symbol) is a warning, not an
+error (§2, §8.3 above). Store → code: every active CONSTRAINT/HOLD link whose topic
+has a `path#symbol` ref must find the marker at that symbol — else a warning (existing stores
+carry none yet). A symbol the chunker reports no declaration for splits into two cases: the
+symbol's own NAME genuinely absent from the file's text is a dangling ref, an error instead of a
+missing-marker warning; the name IS present but the chunker simply
+never emits a chunk for it (a Swift protocol requirement — signature only, no body — or a
+container type the chunker layer does not report a declaration line for) is a warning that the
+symbol cannot be verified by the chunker, and the marker check is skipped for it rather than
+either erroring or asserting a false absence.
 
 ### 8.4 Concept records (`type: concept`) — the code graph's authored layer
 
