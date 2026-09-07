@@ -1768,13 +1768,39 @@ class TestMemlintDecisionMarkers(unittest.TestCase):
 
     # (f) a language without a chunker -> warning, no traceback.
     def test_f_language_without_a_chunker_is_warning_not_traceback(self):
+        """Round 2b (Grok re-gate NIT 4): this file both CARRIES a marker
+        (direction 1) and is named by a path#symbol ref on an active
+        CONSTRAINT link (direction 2) -- both used to independently warn
+        about the same underlying fact (no chunker for .rb), printing it
+        twice. Exactly one "no chunker" line for this file now: direction
+        1's attribution warning suppresses direction 2's generic per-file
+        line in favor of naming this specific ref's own inability to
+        locate its symbol."""
         topic = _marker_topic("TOP-0046", ["src/x.rb#thing"], _CONSTRAINT_LINK_L1)
         code = {"src/x.rb": "# decision: TOP-0046 L1\ndef thing\nend\n"}
         errors, warnings = self._lint({"t.md": topic}, code)
         self.assertEqual(errors, [], errors)
+        no_chunker_warnings = [w for w in warnings if "no chunker for this file's language" in w and "x.rb" in w]
+        self.assertEqual(len(no_chunker_warnings), 1, warnings)
+
+    def test_g_no_chunker_marker_failing_store_checks_plus_path_symbol_ref_still_falls_back_to_generic(self):
+        """Round 2b (NIT 4) coverage gap: the marker in this no-chunker
+        file names a MISSING link, so direction 1 produces an ERROR, not
+        the attribution warning -- this file never enters
+        `chunkerless_pending`. Direction 2's own path#symbol ref into the
+        same file must still fall through to the ordinary generic
+        uncheckable-file warning; it has nothing more specific to defer
+        to."""
+        topic = _marker_topic("TOP-0049", ["src/x.rb#thing"], _CONSTRAINT_LINK_L1)
+        code = {"src/x.rb": "# decision: TOP-0049 L99\ndef thing\nend\n"}
+        errors, warnings = self._lint({"t.md": topic}, code)
+        self.assertEqual(len(errors), 1, errors)
         self.assertTrue(
-            any("markers not checked" in w and "x.rb" in w for w in warnings), warnings
+            "TOP-0049" in errors[0] and "L99" in errors[0] and "no such link" in errors[0], errors
         )
+        no_chunker_warnings = [w for w in warnings if "no chunker for this file's language" in w and "x.rb" in w]
+        self.assertEqual(len(no_chunker_warnings), 1, warnings)
+        self.assertIn("markers not checked", no_chunker_warnings[0])
 
     # Fix round 2 R6: a no-chunker file with plain-path/glob-only code_refs
     # and no marker at all must never warn -- the old blanket "markers not
@@ -1856,12 +1882,13 @@ class TestMemlintDecisionMarkers(unittest.TestCase):
         """The macOS duplicate warning (whole-branch-review, reproduced on
         CI, test_mem3...): a code root reached through a symlink (macOS's
         own /var -> /private/var, reproduced here with an explicit
-        symlink) must never turn ONE physical file's "markers not
-        checked" warning into two -- direction 1 (_scan_set_for_markers)
-        and direction 2 (_store_to_code_check) must key the SAME shared
-        `warned_uncheckable` set on the SAME (physical, .resolve()'d)
-        path, whichever spelling of the root each happened to walk
-        through."""
+        symlink) must never turn ONE physical file's own no-chunker
+        warning into two -- direction 1's held-back attribution warning
+        and direction 2's own dedup bookkeeping (round 2b, NIT 4:
+        `chunkerless_pending`/`chunkerless_covered`, same shared-
+        `warned_uncheckable`-style keying) must key on the SAME (physical,
+        .resolve()'d) path, whichever spelling of the root each happened
+        to walk through."""
         with tempfile.TemporaryDirectory() as td_str:
             td = Path(td_str)
             store = td / "store"
@@ -1875,7 +1902,7 @@ class TestMemlintDecisionMarkers(unittest.TestCase):
             link_code.symlink_to(real_code, target_is_directory=True)
             errors, warnings = memlint.lint_root(store, code_roots=[link_code])
             self.assertEqual(errors, [], errors)
-            hits = [w for w in warnings if "markers not checked" in w and "x.rb" in w]
+            hits = [w for w in warnings if "no chunker for this file's language" in w and "x.rb" in w]
             self.assertEqual(len(hits), 1, warnings)
 
     # Mem-3 (task-a2-2-review.md): the marker-scan "markers not checked"

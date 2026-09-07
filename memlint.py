@@ -980,6 +980,7 @@ def _marker_to_store_errors_no_chunker(
 def _store_to_code_check(
     tid: str, link_id: str, path_part: str, symbol_part: str,
     code_roots: list[Path], warned_uncheckable: set, warned_symbol_unverifiable: set,
+    chunkerless_pending: dict | None = None, chunkerless_covered: set | None = None,
 ) -> tuple[list[str], list[str]]:
     """Rule 5, one (topic, active CONSTRAINT/HOLD link, path#symbol ref)
     triple: locates the symbol and checks for a matching marker. Returns
@@ -991,7 +992,18 @@ def _store_to_code_check(
     reports no declaration for (a container type, or ruling 144's
     unverifiable case -- a Swift protocol requirement, say) is also a
     WARNING, deduped per (file, symbol) via `warned_symbol_unverifiable`;
-    a checkable symbol with no marker is the plain WARNING rule 5 names."""
+    a checkable symbol with no marker is the plain WARNING rule 5 names.
+
+    Round 2b (NIT 4): when this file has no chunker AND direction 1
+    already earned it a held-back attribution warning (`full` is a key of
+    `chunkerless_pending`), the generic per-file "markers not checked (no
+    chunker for this file's language)" line would only repeat the same
+    fact that file-level warning already carries -- this ref's own line
+    instead names ITS symbol specifically (never deduped against another
+    (topic, link) pair naming the same file: each is a genuinely distinct
+    record needing its own answer), and the file is recorded in
+    `chunkerless_covered` so `lint_markers` never also appends the
+    held-back generic warning for it."""
     errors: list[str] = []
     warnings: list[str] = []
     root = _root_containing(code_roots, path_part)
@@ -1009,6 +1021,17 @@ def _store_to_code_check(
             errors.append(
                 f"{tid}:{link_id}: {path_part}#{symbol_part}: decision ref is dangling -- "
                 f"{path_part!r} could not be read ({reason})"
+            )
+        elif (
+            reason == "no chunker for this file's language"
+            and chunkerless_pending is not None
+            and full in chunkerless_pending
+        ):
+            if chunkerless_covered is not None:
+                chunkerless_covered.add(full)
+            warnings.append(
+                f"{tid}:{link_id}: symbol {path_part}#{symbol_part} cannot be located "
+                "(no chunker for this file's language)"
             )
         elif full not in warned_uncheckable:
             warned_uncheckable.add(full)
@@ -1094,6 +1117,26 @@ def lint_markers(root: Path, code_roots: list[Path]) -> tuple[list[str], list[st
     topics = _collect_topics(root)
     warned_uncheckable: set[Path] = set()
     warned_symbol_unverifiable: set[tuple] = set()
+    # Round 2b (NIT 4): a no-chunker file that both carries a marker
+    # (direction 1's own attribution warning) AND is named by an active
+    # CONSTRAINT/HOLD link's path#symbol ref (direction 2) used to warn
+    # about the identical underlying fact -- no chunker for this file's
+    # language -- twice, once generically per file, once again as the
+    # file-level attribution warning. Direction 1's attribution warning
+    # for such a file is now HELD BACK (not appended to `warnings`
+    # directly) in `chunkerless_pending` (full path -> its one message);
+    # direction 2, for each active CONSTRAINT/HOLD path#symbol ref it
+    # finds into a pending file, reports THAT ref's own inability to
+    # locate its symbol instead (naming the ref, not deduped -- two
+    # different links citing the same file each get their own answer)
+    # and records the file in `chunkerless_covered`. Once both directions
+    # have run, any file that earned an attribution warning but was NEVER
+    # reached by direction 2 (no path#symbol ref names it -- only a bare
+    # path or glob does, or none at all) still gets its one held-back
+    # warning appended at the end -- direction 2 never had anything more
+    # specific to say about it.
+    chunkerless_pending: dict[Path, str] = {}
+    chunkerless_covered: set[Path] = set()
 
     # direction 1: marker -> store (errors)
     for full, _file_root, rel_path in _scan_set_for_markers(code_roots, topics):
@@ -1120,7 +1163,8 @@ def lint_markers(root: Path, code_roots: list[Path]) -> tuple[list[str], list[st
                         full, lineno, m.group(1), m.group(2), rel_path, topics,
                     )
                     errors.extend(errs)
-                    warnings.extend(warns)
+                    if warns:
+                        chunkerless_pending.setdefault(full, warns[0])
                 continue
             if full not in warned_uncheckable:
                 warned_uncheckable.add(full)
@@ -1158,9 +1202,17 @@ def lint_markers(root: Path, code_roots: list[Path]) -> tuple[list[str], list[st
                 errs, warns = _store_to_code_check(
                     tid, link_id, path_part, symbol_part, code_roots,
                     warned_uncheckable, warned_symbol_unverifiable,
+                    chunkerless_pending, chunkerless_covered,
                 )
                 errors.extend(errs)
                 warnings.extend(warns)
+
+    # Round 2b (NIT 4): a pending attribution warning direction 2 never
+    # reached (no path#symbol ref names that file) is still owed -- append
+    # it now, exactly once per file, same as before this fix.
+    for full, msg in chunkerless_pending.items():
+        if full not in chunkerless_covered:
+            warnings.append(msg)
 
     return errors, warnings
 

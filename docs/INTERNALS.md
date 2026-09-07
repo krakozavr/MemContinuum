@@ -1780,9 +1780,11 @@ one project can have several code roots, and every root given is checked:
 Decision marker rules (`--code-root`; SCHEMA §2/§8.3). A marker is a comment line matching
 `decision: TOP-\d+ Ln` (any positive integer id — SCHEMA's own running example is `TOP-42`, not a
 fixed four digits) on a symbol's own definition line, or within the (up to) three lines above it —
-located through the chunker registry, same as the concept rules above, so a language with no
-wired chunker warns rather than errors. Only a topic's `path#symbol` code_refs entries take part;
-a prefix or a glob names no symbol and is never marker-verified.
+located through the chunker registry, same as the concept rules above; a language whose backend
+cannot run here warns rather than errors, while a language with no wired chunker at all is scanned
+by plain regex instead (see the no-chunker row in the table below). In a file WITH a chunker, only
+a topic's `path#symbol` code_refs entries take part; a prefix or a glob names no symbol there and
+is never marker-verified.
 
 The window is searched nearest-first (the definition line itself, then one line up, then two,
 then three) and never crosses into another declaration's own line — two adjacent short
@@ -1849,7 +1851,7 @@ id:
 | a topic-like record present at `REF` is deleted or renamed | error naming the path and its real kind (`topic`/`incident`/`investigation`/`concept`, or `record` when the kind itself could not be recovered) — `--no-renames` means a rename is a plain delete + a plain add, so one rule covers both |
 | a duplicate link id within one topic on the NEW side | error naming the id, `<path>: duplicate link id '<id>' used <n> times` — the same `memidx.validate_record_shape` diagnostic every consumer shares |
 | a valid forward `status` move (with `superseded_by` added when the new status is `superseded`), `promoted_by` added, alone on the link; new links; changes to `current`, `title`, `tags`, `code_refs`, or the body text | free |
-| the `REF`-side blob failed full validation (a shape error, or a duplicate link id) but its `links` field itself still recovers at least one usable entry | not a repair — Grok re-gate MAJOR 1: those recovered links (a duplicate id keeps its FIRST occurrence, file order) are still compared against the new side by every rule above, exactly as if the REF blob had parsed cleanly, with a note naming the REF-side diagnostic that made the blob invalid |
+| the `REF`-side blob failed full validation (a shape error, or a duplicate link id) but its `links` field itself still recovers at least one usable entry | not a repair — those recovered links (a duplicate id keeps its FIRST occurrence, file order) are still compared against the new side by every rule above, exactly as if the REF blob had parsed cleanly, with a note naming the REF-side diagnostic that made the blob invalid |
 | the `REF`-side blob never parsed at all (or parsed but recovered no usable `links`), and the new blob now parses cleanly | a note, not an error (`repaired — the blob at REF could not be safely parsed …`) — nothing here was ever recorded link history to freeze, so fixing it is a repair, never an append-only violation |
 | frontmatter that does not parse on the new side, or on both sides | error, the typed-parse diagnostic — never a traceback |
 | a record whose recoverable kind is not topic-like (`type: incident`/`investigation`/`concept` with no `links:`) | out of scope for this check entirely — there is no recorded link history to protect, so neither an error nor a note |

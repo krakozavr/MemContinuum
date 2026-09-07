@@ -81,17 +81,23 @@
   again in CI for a guarantee local bypasses cannot reach.
 - `code_refs` now documents its three forms explicitly (a repo-relative path
   prefix, an fnmatch glob, or `path#symbol`, a qualified symbol name as the
-  chunkers report it) -- retrieval matching is unchanged, but only
-  `path#symbol` entries take part in the new check below. A constraint or
+  chunkers report it) -- retrieval matching is unchanged. A constraint or
   hold link may be mirrored at its bound symbol with a `decision:
   TOP-xxxx Ln` comment -- located through the chunker registry, so the rule
-  is language-agnostic, and skipped with a warning (not an error) for a
-  file whose language has no chunker or whose backend cannot run here.
-  `memlint.py --code-root DIR` now checks the pair both ways: every marker
-  under a code root must name a topic and link that exist, are `active`,
-  and are a CONSTRAINT or HOLD (never a glob or bare-path match -- only an
-  exact `path#symbol` entry counts), else an error naming the file and
-  line; every active CONSTRAINT/HOLD link whose topic carries a `path#symbol`
+  is language-agnostic; a file whose backend cannot run here is skipped
+  with a warning naming the reason, while a file whose language has no
+  chunker at all is instead scanned for the marker by plain regex alone --
+  silent when it carries none, and, when it does, checked against every
+  rule below that needs no symbol location, with a warning (not an error)
+  that the marker cannot be attributed to a symbol.
+  `memlint.py --code-root DIR` now checks the pair both ways: in a file
+  WITH a chunker, every marker under a code root must name a topic and
+  link that exist, are `active`, and are a CONSTRAINT or HOLD (never a
+  glob or bare-path match -- only an exact `path#symbol` entry counts),
+  else an error naming the file and line; a no-chunker file's marker is
+  held to the same topic/link/status/tier rules, but any code_refs form
+  naming the file satisfies it, since there is no symbol to verify
+  against; every active CONSTRAINT/HOLD link whose topic carries a `path#symbol`
   ref must find the marker at that symbol, else a warning (existing stores
   carry none yet) -- a `path#symbol` whose symbol NAME is genuinely absent
   from the file's text is an error instead (the ref itself is dangling), not

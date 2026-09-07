@@ -33,9 +33,11 @@ tags: []
 ```
 
 A prefix and a glob keep serving retrieval exactly as before — `for-path`/`unmapped` match either
-against a file path, unchanged (§8.4). Only `path#symbol` names an actual symbol, so only
-`path#symbol` refs take part in marker verification (§8.3): a marker can never be checked against
-a ref that names no symbol.
+against a file path, unchanged (§8.4). Only `path#symbol` names an actual symbol, so in a file
+WITH a chunker only `path#symbol` refs take part in marker verification (§8.3): a marker there can
+never be checked against a ref that names no symbol. A file whose language has no chunker at all
+has no symbol to check against in the first place, so any code_refs form naming the file takes
+part instead (§8.3).
 
 ## 3. Link (one ruling) — fields, and authority PER FIELD
 
@@ -277,11 +279,15 @@ under one is an error, not a skip; a file whose language has no chunker at all h
 hold a marker to that stricter standard, so any code_refs form naming the file (bare path, glob,
 or path#symbol) satisfies it instead, per the no-chunker rule above.
 
-Marker → store: every marker under a code root must point at a topic and link that exist,
-that link must be `active` and CONSTRAINT or HOLD, and that topic's `code_refs` must name the
-marked file with the matching `path#symbol` (a prefix or glob that merely happens to match the
-same FILE does not count — that is the error `path#symbol` exists to prevent) — else an error
-naming the file, line, and reason. Store → code: every active CONSTRAINT/HOLD link whose topic
+Marker → store, in a file WITH a chunker: every marker under a code root must point at a topic and
+link that exist, that link must be `active` and CONSTRAINT or HOLD, and that topic's `code_refs`
+must name the marked file with the matching `path#symbol` (a prefix or glob that merely happens to
+match the same FILE does not count — that is the error `path#symbol` exists to prevent) — else an
+error naming the file, line, and reason. In a file with no chunker at all, the same topic/link/
+status/tier checks apply, but any code_refs form naming the file (bare path, glob, or path#symbol)
+satisfies the code_refs check instead — there is no symbol to hold it to the stricter standard
+above, and the one thing left unverified (attribution to a specific symbol) is a warning, not an
+error (§2, §8.3 above). Store → code: every active CONSTRAINT/HOLD link whose topic
 has a `path#symbol` ref must find the marker at that symbol — else a warning (existing stores
 carry none yet). A symbol the chunker reports no declaration for splits into two cases: the
 symbol's own NAME genuinely absent from the file's text is a dangling ref, an error instead of a
