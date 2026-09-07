@@ -1800,7 +1800,7 @@ scan never opens a file nothing references, even to check whether it is binary.
 |---|---|
 | a marker names a topic id or link id that does not exist | error |
 | a marker names a link that is not `active`, or whose tier (§4) is CONTEXT, not CONSTRAINT/HOLD | error |
-| a marker's topic has no `path#symbol` code_refs entry naming this exact file and symbol — either no entry names this file at all (a prefix or glob that merely matches the FILE does not count), or one does but names a DIFFERENT symbol at it | error, naming the symbol the code_refs entry actually names when there is one |
+| in a file WITH a chunker, a marker's topic has no `path#symbol` code_refs entry naming this exact file and symbol — either no entry names this file at all (a prefix or glob that merely matches the FILE does not count), or one does but names a DIFFERENT symbol at it | error, naming the symbol the code_refs entry actually names when there is one — the no-chunker row below is the file-level-only counterpart of this rule, where a prefix/glob DOES count (there is no symbol to hold it to a stricter standard) |
 | a marker's topic names a `path#symbol` that matches no chunk anywhere in the file, but the chunker confirms the symbol IS declared (a container — class/struct/enum/… — chunk_file never gives one its own chunk) | silent on this side (never misattributed to a nearby member); direction 2's own "container type" row below still warns |
 | an active CONSTRAINT/HOLD link's `path#symbol` ref finds no marker at that symbol | warning |
 | an active CONSTRAINT/HOLD link's `path#symbol` ref names a symbol the chunker proves absent | error (the ref itself is dangling) |

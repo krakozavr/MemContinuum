@@ -1589,14 +1589,20 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
         if repair_note is not None:
             notes.append(repair_note)
 
-        # Codex 2 (BLOCKING): a duplicate link id on EITHER side already
-        # made that side's own ParseResult invalid above (memidx.
-        # validate_record_shape's own diagnostic -- the one typed-parse
-        # gate this function's old_result.valid/new_result.valid checks
-        # already go through), so a file with a duplicate id never
-        # reaches this point at all: it is refused above, naming the id,
-        # via that shared diagnostic rather than a second copy of the
-        # same check here.
+        # Codex 2 (BLOCKING): a duplicate link id on the NEW side already
+        # made new_result invalid above (memidx.validate_record_shape's
+        # own diagnostic -- the one typed-parse gate new_result.valid
+        # already goes through), so a NEW blob with a duplicate id never
+        # reaches this point: it is refused above, naming the id, via that
+        # shared diagnostic rather than a second copy of the same check
+        # here. A duplicate id on the OLD (REF) side is different since
+        # the recovered-links fix (Grok re-gate MAJOR 1): old_result is
+        # ALSO invalid there, but `old_links` was populated above from
+        # `_recovered_old_links`, which already resolved the duplicate to
+        # its FIRST occurrence -- `old_links` here carries at most one
+        # entry per id either way, so the dict comprehension below never
+        # has an old-side duplicate to silently pick a "last one wins"
+        # winner from.
         new_links_by_id = {
             str(l.get("link")): l
             for l in (new_result.frontmatter.get("links") or [])

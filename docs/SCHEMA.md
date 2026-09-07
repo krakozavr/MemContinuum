@@ -271,9 +271,13 @@ it carries a marker at all. Markers verify at functions, methods, and computed
 vars/properties — whatever the chunker itself reports a definition line for; a container type
 (a class, struct, enum, …) has no such line of its own and is uncheckable.
 
-`memlint.py --code-root DIR` checks the pair both ways. Only a `path#symbol` code_refs entry
-takes part — a glob or a bare path names no symbol, so a marker under one is an error, not a
-skip. Marker → store: every marker under a code root must point at a topic and link that exist,
+`memlint.py --code-root DIR` checks the pair both ways. In a file WITH a chunker, only a
+`path#symbol` code_refs entry takes part — a glob or a bare path names no symbol, so a marker
+under one is an error, not a skip; a file whose language has no chunker at all has no symbol to
+hold a marker to that stricter standard, so any code_refs form naming the file (bare path, glob,
+or path#symbol) satisfies it instead, per the no-chunker rule above.
+
+Marker → store: every marker under a code root must point at a topic and link that exist,
 that link must be `active` and CONSTRAINT or HOLD, and that topic's `code_refs` must name the
 marked file with the matching `path#symbol` (a prefix or glob that merely happens to match the
 same FILE does not count — that is the error `path#symbol` exists to prevent) — else an error
