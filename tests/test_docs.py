@@ -690,6 +690,17 @@ class TestDocsRound7(unittest.TestCase):
         self.assertNotIn("--mode vector", text.split("## Reading the output")[0])
         self.assertIn("--mode hybrid", text)
 
+    def test_skill_search_recipe_does_not_call_status_active_the_default(self):
+        """Grok re-gate MINOR 3: the no-flag default is active-OR-no-status,
+        while an explicit `--status active` is STRICTER (it drops the
+        status-less records the default keeps) -- the recipe must not pass
+        `--status active` and call it merely a spelled-out default."""
+        text = SEARCH_SKILL.read_text()
+        recipe_line = next(l for l in text.splitlines() if "memidx.py search" in l)
+        self.assertNotIn("--status", recipe_line)
+        self.assertNotIn("naming the engine's own default explicitly", text)
+        self.assertIn("status-less", text)
+
     def test_store_readme_search_recipe_carries_status_active(self):
         text = STORE_README_TMPL.read_text()
         recipe_line = next(l for l in text.splitlines() if "memidx.py search" in l)
