@@ -1169,5 +1169,64 @@ class TestStatsPreEditTopics(StatsTestBase):
         self.assertIn("TOP-0042", out)
 
 
+class TestStatsSpansRotatedHookLog(StatsTestBase):
+    """eval-topic-logging section 5 (owner-approved add-on): nothing used
+    to truncate or prune hook.log -- sessionstart-remind.sh now rotates it
+    into hook.log.1 (replacing any previous one) once it crosses
+    MEMCONTINUUM_LOG_MAX_BYTES. `stats` must read hook.log.1 (when
+    present) alongside hook.log so a `--days N` window spanning a rotation
+    still sees the rotated-out side exactly once -- not dropped, not
+    double-counted."""
+
+    def write_rotated_log(self, lines):
+        (self.home / "hook.log.1").write_text("\n".join(lines) + "\n")
+
+    def test_counts_lines_from_both_files(self):
+        self.write_rotated_log([
+            f"{ts(2)} outcome=matched elapsed=0s project=demo file=/old.py",
+        ])
+        self.write_log([
+            f"{ts(1)} outcome=matched elapsed=0s project=demo file=/new.py",
+        ])
+        rc, out = run_stats_json(home=str(self.home))
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["pre_edit"]["matched"], 2)
+
+    def test_window_spanning_rotation_excludes_only_the_out_of_window_line(self):
+        self.write_rotated_log([
+            # 8 days ago -- outside a 7-day window
+            f"{ts(24 * 8)} outcome=matched elapsed=0s project=demo file=/too-old.py",
+            # 3 days ago -- inside a 7-day window, but rotated out of hook.log
+            f"{ts(24 * 3)} outcome=matched elapsed=0s project=demo file=/still-in-window.py",
+        ])
+        self.write_log([
+            f"{ts(1)} outcome=matched elapsed=0s project=demo file=/fresh.py",
+        ])
+        rc, out = run_stats_json(home=str(self.home), days=7)
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            out["pre_edit"]["matched"], 2,
+            "the too-old line must not count; the in-window rotated line must count exactly once",
+        )
+
+    def test_missing_hook_log_1_is_the_ordinary_pre_rotation_case(self):
+        """No rotation has ever happened -- must behave exactly as it did
+        before this feature existed."""
+        self.write_log([f"{ts(1)} outcome=matched elapsed=0s project=demo file=/a.py"])
+        rc, out = run_stats_json(home=str(self.home))
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["pre_edit"]["matched"], 1)
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores permission bits")
+    def test_unreadable_hook_log_1_is_ignored_not_fatal(self):
+        self.write_rotated_log([f"{ts(2)} outcome=matched elapsed=0s project=demo file=/old.py"])
+        (self.home / "hook.log.1").chmod(0o000)
+        self.addCleanup((self.home / "hook.log.1").chmod, 0o644)
+        self.write_log([f"{ts(1)} outcome=matched elapsed=0s project=demo file=/new.py"])
+        rc, out = run_stats_json(home=str(self.home))
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["pre_edit"]["matched"], 1, "only hook.log's own line should be counted")
+
+
 if __name__ == "__main__":
     unittest.main()

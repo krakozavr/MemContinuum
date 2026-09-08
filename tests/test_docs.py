@@ -654,6 +654,25 @@ class TestInternalsDocumentsPreEditTopicsLogging(unittest.TestCase):
         section = text[unreleased_idx:rc4_idx]
         self.assertIn("topics=", section)
 
+    def test_internals_documents_rotation_env_var_and_two_file_policy(self):
+        text = INTERNALS.read_text()
+        self.assertIn("MEMCONTINUUM_LOG_MAX_BYTES", text)
+        self.assertIn("hook.log.1", text)
+
+    def test_internals_rotation_paragraph_names_stats_and_data_loss_by_design(self):
+        text = INTERNALS.read_text()
+        idx = text.index("MEMCONTINUUM_LOG_MAX_BYTES")
+        snippet = text[max(0, idx - 400):idx + 1200]
+        self.assertIn("stats", snippet.lower())
+        self.assertRegex(snippet, r"gone|lost|discarded")
+
+    def test_changelog_unreleased_section_mentions_rotation(self):
+        text = CHANGELOG.read_text()
+        unreleased_idx = text.index("## [Unreleased]")
+        rc4_idx = text.index("## [0.2.0rc4]")
+        section = text[unreleased_idx:rc4_idx]
+        self.assertIn("hook.log.1", section)
+
     def test_rc4_section_untouched(self):
         """The rc4 release is already shipped -- this change must not edit
         a single byte of its own section, only add a new one above it."""

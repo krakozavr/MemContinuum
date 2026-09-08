@@ -2115,6 +2115,109 @@ class TestSessionStartRemind(HookTestBase):
         self.assertEqual(state.get("start_code_sha"), git_head(self.code_root))
 
 
+class TestSessionStartHookLogRotation(HookTestBase):
+    """eval-topic-logging section 5 (owner-approved add-on): rotation runs
+    from sessionstart-remind.sh, once per session, at the startup/resume/
+    clear session-init boundary only -- never on the write path itself.
+    mc_rotate_hook_log's own mechanics are covered directly in
+    TestMcRotateHookLog; this class proves sessionstart-remind.sh actually
+    calls it there, and nowhere else."""
+
+    def test_below_threshold_no_rotation(self):
+        hook_log = self.home / "hook.log"
+        hook_log.write_text("old content\n" * 2)
+        env = self.base_env(MEMCONTINUUM_LOG_MAX_BYTES="1000000")
+        proc, _ = run_script(
+            SESSIONSTART_HOOK, self.session_start_payload("s-rotate-below", "startup"), env
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse((self.home / "hook.log.1").exists())
+        text = hook_log.read_text()
+        self.assertIn("old content", text)
+        self.assertIn("outcome=init", text)
+
+    def test_startup_rotates_past_threshold(self):
+        hook_log = self.home / "hook.log"
+        old_content = "old content line\n" * 30
+        hook_log.write_text(old_content)
+        env = self.base_env(MEMCONTINUUM_LOG_MAX_BYTES=str(len(old_content) - 1))
+        proc, _ = run_script(
+            SESSIONSTART_HOOK, self.session_start_payload("s-rotate-above", "startup"), env
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        rotated = self.home / "hook.log.1"
+        self.assertTrue(rotated.exists(), "hook.log.1 must exist once the threshold is crossed")
+        self.assertEqual(rotated.read_text(), old_content)
+        new_text = hook_log.read_text()
+        self.assertNotIn("old content", new_text)
+        self.assertIn("outcome=init", new_text)
+
+    def test_resume_and_clear_also_rotate(self):
+        """Every session-init source (not just startup) sits above the
+        rotation call in sessionstart-remind.sh's own branch."""
+        for source in ("resume", "clear"):
+            with self.subTest(source=source):
+                hook_log = self.home / "hook.log"
+                rotated = self.home / "hook.log.1"
+                for p in (hook_log, rotated):
+                    p.unlink(missing_ok=True)
+                old_content = f"old {source} content\n" * 30
+                hook_log.write_text(old_content)
+                env = self.base_env(MEMCONTINUUM_LOG_MAX_BYTES=str(len(old_content) - 1))
+                proc, _ = run_script(
+                    SESSIONSTART_HOOK,
+                    self.session_start_payload(f"s-rotate-{source}", source),
+                    env,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertTrue(rotated.exists())
+                self.assertEqual(rotated.read_text(), old_content)
+
+    def test_compact_source_never_rotates(self):
+        """Rotation is tied to the session-INIT boundary only -- a mid-
+        session compact must never trigger it, even past threshold."""
+        hook_log = self.home / "hook.log"
+        old_content = "old content line\n" * 30
+        hook_log.write_text(old_content)
+        env = self.base_env(MEMCONTINUUM_LOG_MAX_BYTES=str(len(old_content) - 1))
+        proc, _ = run_script(
+            SESSIONSTART_HOOK, self.session_start_payload("s-rotate-compact", "compact"), env
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse((self.home / "hook.log.1").exists())
+        self.assertIn("old content", hook_log.read_text())
+
+    def test_unhandled_source_never_rotates(self):
+        hook_log = self.home / "hook.log"
+        old_content = "old content line\n" * 30
+        hook_log.write_text(old_content)
+        env = self.base_env(MEMCONTINUUM_LOG_MAX_BYTES=str(len(old_content) - 1))
+        proc, _ = run_script(
+            SESSIONSTART_HOOK, self.session_start_payload("s-rotate-fork", "fork"), env
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse((self.home / "hook.log.1").exists())
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores permission bits")
+    def test_unwritable_home_dir_does_not_break_sessionstart(self):
+        """End-to-end fail-open proof (TestMcRotateHookLog's own
+        test_unwritable_home_dir_fails_open_leaves_log_alone covers the
+        rotation primitive in isolation; this proves the whole
+        sessionstart-remind.sh run still completes normally around it)."""
+        hook_log = self.home / "hook.log"
+        old_content = "old content line\n" * 30
+        hook_log.write_text(old_content)
+        env = self.base_env(MEMCONTINUUM_LOG_MAX_BYTES=str(len(old_content) - 1))
+        self.home.chmod(0o555)  # read+execute only -- mv/mkdir inside it must fail
+        self.addCleanup(self.home.chmod, 0o755)
+        proc, _ = run_script(
+            SESSIONSTART_HOOK, self.session_start_payload("s-rotate-unwritable", "startup"), env
+        )
+        self.home.chmod(0o755)  # restore before the assertion below reads the directory
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse((self.home / "hook.log.1").exists())
+
+
 # ---------------------------------------------------------------------------
 # 4b. sessionstart-remind.sh (source=compact) -- the look-back twin
 #     (docs/DESIGN.md 2026-08-30)
@@ -4439,6 +4542,105 @@ class TestMemlib(unittest.TestCase):
         log_text = (home / "hook.log").read_text()
         self.assertIn("no python resolved", log_text)
         self.assertIn("project=nopy-proj", log_text)
+
+
+# ---------------------------------------------------------------------------
+# 6b. mc_rotate_hook_log (hooks/memlib.sh) -- direct unit coverage
+#
+# eval-topic-logging section 5 (owner-approved add-on): nothing used to
+# truncate or prune hook.log (mc_prune_old_state only ever clears session-
+# state JSON). Measured on a real machine: 1.77 MB / 10,481 lines over ten
+# days, ~177 KB/day -- unbounded growth, and every `memidx.py stats` run
+# reads the whole file. mc_rotate_hook_log is the rotation primitive;
+# TestSessionStartHookLogRotation below is the end-to-end proof that
+# sessionstart-remind.sh actually calls it at the right (and only the
+# right) session boundary.
+# ---------------------------------------------------------------------------
+
+
+class TestMcRotateHookLog(unittest.TestCase):
+    def setUp(self):
+        self.td = tempfile.mkdtemp(prefix="memcontinuum-rotate-")
+        self.addCleanup(shutil.rmtree, self.td, ignore_errors=True)
+        self.home = Path(self.td) / "home"
+        self.home.mkdir()
+
+    def _call_rotate(self, **env_overrides):
+        caller = Path(self.td) / "rotate-caller.sh"
+        caller.write_text(
+            f'#!/usr/bin/env bash\nset -u\nsource "{MEMLIB}"\nmc_rotate_hook_log\necho "RC=$?"\n'
+        )
+        env = clean_env(
+            MEMCONTINUUM_HOME=str(self.home),
+            MEMCONTINUUM_PROJECT="rotate-proj",
+            MEMCONTINUUM_PYTHON=VENV_PYTHON,
+        )
+        env.update(env_overrides)
+        return subprocess.run(
+            [MC_BASH, str(caller)], capture_output=True, text=True, env=env, timeout=10
+        )
+
+    def test_below_threshold_never_rotates(self):
+        hook_log = self.home / "hook.log"
+        hook_log.write_text("small\n")
+        proc = self._call_rotate(MEMCONTINUUM_LOG_MAX_BYTES="1000000")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("RC=0", proc.stdout, proc.stdout)
+        self.assertFalse((self.home / "hook.log.1").exists())
+        self.assertEqual(hook_log.read_text(), "small\n")
+
+    def test_above_threshold_rotates_content_byte_for_byte_and_new_log_starts_empty(self):
+        hook_log = self.home / "hook.log"
+        content = "x" * 5000
+        hook_log.write_text(content)
+        proc = self._call_rotate(MEMCONTINUUM_LOG_MAX_BYTES="100")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("RC=0", proc.stdout, proc.stdout)
+        rotated = self.home / "hook.log.1"
+        self.assertTrue(rotated.exists(), "hook.log.1 must exist once the threshold is crossed")
+        self.assertEqual(rotated.read_text(), content)
+        self.assertTrue(hook_log.exists(), "a fresh hook.log must exist right after rotation")
+        self.assertEqual(hook_log.read_text(), "", "the new hook.log must start empty")
+
+    def test_no_hook_log_at_all_is_a_silent_no_op(self):
+        proc = self._call_rotate(MEMCONTINUUM_LOG_MAX_BYTES="1")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("RC=0", proc.stdout, proc.stdout)
+        self.assertFalse((self.home / "hook.log").exists())
+        self.assertFalse((self.home / "hook.log.1").exists())
+
+    def test_default_threshold_is_five_mib_when_env_unset(self):
+        hook_log = self.home / "hook.log"
+        hook_log.write_text("y" * (5 * 1024 * 1024 - 10))  # just under the documented default
+        proc = self._call_rotate()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse((self.home / "hook.log.1").exists())
+
+    def test_second_rotation_replaces_dot_1_never_creates_dot_2(self):
+        hook_log = self.home / "hook.log"
+        hook_log.write_text("first\n" * 100)
+        self._call_rotate(MEMCONTINUUM_LOG_MAX_BYTES="10")
+        rotated = self.home / "hook.log.1"
+        self.assertEqual(rotated.read_text(), "first\n" * 100)
+
+        hook_log.write_text("second\n" * 100)
+        self._call_rotate(MEMCONTINUUM_LOG_MAX_BYTES="10")
+        self.assertEqual(rotated.read_text(), "second\n" * 100)
+        self.assertFalse((self.home / "hook.log.2").exists())
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores permission bits")
+    def test_unwritable_home_dir_fails_open_leaves_log_alone(self):
+        hook_log = self.home / "hook.log"
+        content = "x" * 5000
+        hook_log.write_text(content)
+        self.home.chmod(0o555)  # read+execute only -- mv/rename inside it must fail
+        self.addCleanup(self.home.chmod, 0o755)
+        proc = self._call_rotate(MEMCONTINUUM_LOG_MAX_BYTES="10")
+        self.home.chmod(0o755)  # restore before the assertions below read the directory
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("RC=0", proc.stdout, proc.stdout)
+        self.assertFalse((self.home / "hook.log.1").exists())
+        self.assertEqual(hook_log.read_text(), content, "an unwritable home must leave the log untouched")
 
 
 # ---------------------------------------------------------------------------

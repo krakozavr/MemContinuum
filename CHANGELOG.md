@@ -12,6 +12,13 @@
   and `top_topics` (top 5 by injection count). Absent entirely on any outcome
   other than a real match, and on an older log line from before this field
   existed — both parse and contribute nothing.
+- hook.log now rotates instead of growing forever: `sessionstart-remind.sh`
+  moves it to `hook.log.1` (replacing any previous one) once it exceeds
+  `MEMCONTINUUM_LOG_MAX_BYTES` (default 5 MiB), once per session, never on
+  the append path itself. At most two files ever exist; `memidx.py stats`
+  reads both so a `--days` window spanning a rotation still sees the
+  rotated-out side, and data older than the previous rotation is gone by
+  design.
 
 ## [0.2.0rc4] — 2026-09-07
 

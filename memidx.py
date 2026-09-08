@@ -7294,7 +7294,7 @@ def _new_stats_bucket():
         # governing topics, contributes 0); `pre_edit_topic_counts` maps
         # topic id -> how many separate runs injected it (used for both
         # `topics_distinct`, its length, and `top_topics`, its top 5) --
-        # see _stats_report and _CAP_MARKER_RE below.
+        # see _stats_report and _TOPICS_CAP_MARKER_RE below.
         "pre_edit_topics_named": 0,
         "pre_edit_topic_counts": Counter(),
     }
@@ -7435,15 +7435,35 @@ def _scan_hook_log(log_path: Path, cutoff: datetime, now: datetime):
     under `unparseable_lines` would make that number tick on every single
     healthy run, burying the ratio's only real discriminator ("this is
     new/unexpected breakage") under permanent, harmless noise. They are
-    counted here instead, separately."""
+    counted here instead, separately.
+
+    eval-topic-logging section 5: `<log_path>.1` (hooks/memlib.sh's
+    mc_rotate_hook_log rotates hook.log there once it crosses
+    MEMCONTINUUM_LOG_MAX_BYTES) is read FIRST, when present, so a --days
+    window spanning a rotation still sees the older, rotated-out side --
+    every count below is order-independent (Counters and sets, never a
+    windowed sequence), so simply concatenating the two files' lines
+    before the per-line loop is enough; nothing here needs the two kept
+    or scanned separately. A missing or unreadable `.1` contributes
+    nothing and is never itself a failure -- it is normal on every host
+    that has never rotated yet, and the primary hook.log's own OSError
+    branch immediately below already carries this function's real
+    self-liveness signal."""
     buckets: dict[str, dict] = {}
     unknown_lines = 0
     unparseable_lines = 0
     untimestamped_lines = 0
     projects_seen: set[str] = set()
 
+    rotated_path = log_path.parent / (log_path.name + ".1")
+    rotated_lines: list[str] = []
     try:
-        raw_lines = log_path.read_text(errors="replace").splitlines()
+        rotated_lines = rotated_path.read_text(errors="replace").splitlines()
+    except OSError:
+        pass
+
+    try:
+        raw_lines = rotated_lines + log_path.read_text(errors="replace").splitlines()
     except OSError:
         # Fix round 1 (review finding, IMPORTANT; historical -- at the
         # time, this function returned a 4-tuple): this branch used to
