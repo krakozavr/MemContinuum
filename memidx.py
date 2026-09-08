@@ -2677,6 +2677,134 @@ def vector_ranked(
     return [(p, score_by_path[p]) for p in collapsed]
 
 
+# ---------------------------------------------------------------------------
+# INC-0115: hybrid's FTS-step-aside threshold
+# ---------------------------------------------------------------------------
+#
+# Diagnosis (INC-0115, confirmed by instrumenting fts_ranked/vector_ranked
+# around real hybrid-mode calls on bench/queries.jsonl's paraphrase slice,
+# not guessed): on a genuine paraphrase query -- zero shared vocabulary
+# with its target record -- the FTS channel never returns EMPTY. fts_escape
+# ORs every raw query token, stopwords included, so on this benchmark's
+# 32-record corpus every paraphrase query's FTS channel matched all 32
+# records every time; it returns a full-corpus ranking that is noise
+# relative to the true target, not "no results." RRF then averages that
+# noise into an otherwise-correct vector ranking and drags the right
+# answer down (worked example, para-01: the correct record's combined
+# score 1/(60+1) [vector rank 1] + 1/(60+22) [fts rank 22] = 0.0286 loses
+# to a wrong record's 1/(60+4) + 1/(60+2) = 0.0318, purely because FTS
+# handed the wrong record a plausible-looking mid-table rank while the
+# right record's own FTS rank was deep and uninformative).
+#
+# A "channel returned literally nothing" check therefore can never fire on
+# a real paraphrase query. The gate has to be about CONFIDENCE, not
+# emptiness. Three cheap candidates were measured and rejected before this
+# one: raw bm25 magnitude of the FTS channel's own top-1 hit, and the bm25
+# gap between its rank-1 and rank-2 hits -- both overlap heavily between
+# genuine hits (bench's kw- slice) and noise hits (bench's para- slice),
+# so neither separates them (see the INC-0115 report for the measured
+# ranges); and a QUERY-SHAPE rule (does the query itself carry an exact
+# identifier/path/version anchor -- decidable before any search runs, no
+# threshold needed) -- rejected because it is decided on the wrong side:
+# `para-10` carries no such anchor yet FTS is genuinely, correctly
+# confident there (its top-1 pick shares real vocabulary with the query,
+# just with the wrong record) and fusion is what gets that query right; a
+# query-shape rule would exclude it from fusion regardless and cost that
+# hit. What does separate them cleanly, because it looks at what FTS
+# actually found rather than what the query looks like: CONTENT-TERM
+# COVERAGE of the FTS channel's own top-1 candidate -- the fraction of
+# the query's own non-stopword tokens that literally appear in that
+# candidate's own indexed text (title + body for a topic/incident row;
+# title + that one link's own ruling+rationale text, with an EMPTY body,
+# for a link row -- see insert_record_rows -- exactly what fts_ranked/
+# vector_ranked are themselves scored against). Measured against the REAL
+# fts_ranked() top-1
+# (status-filtered, family-collapsed -- not a raw, unfiltered `fts MATCH`
+# query, which can surface a superseded link row real search would never
+# return and understate coverage) on the same benchmark: kw- (ordinary
+# keyword-shaped questions) top-1 coverage ranges 0.556-1.0; the exact-term
+# slice added for this same investigation (id prefix `et-`: an error
+# message/file name/symbol/flag/quoted phrase a keyword search should
+# nail) ranges 0.500-1.0; para- (zero-vocabulary-with-TARGET paraphrases)
+# is 0.091-0.211 for 10 of its 11 queries -- the one exception, para-10 at
+# 0.286, is a case where FTS's top-1 pick is a genuinely different, WRONG
+# record that happens to share real vocabulary with the query (paraphrase
+# queries are constructed to share no vocabulary with their own target,
+# not with every other record in the corpus); this gate correctly leaves
+# that query to fuse normally rather than second-guessing a real (if
+# misdirected) FTS signal, and fusion still lands on the right answer
+# there via the vector channel's own contribution. So: a clean, wide empty
+# band between 0.211 (the real paraphrase-noise ceiling) and 0.500 (the
+# kw-/et- floor), with para-10 correctly on the confident side of it, not
+# inside it.
+#
+# FTS_STEP_ASIDE_COVERAGE sits in that empty band, deliberately closer to
+# the noise ceiling (0.211) than the confident floor (0.500): stepping
+# aside too readily just means hybrid quietly becomes vector-only for one
+# more borderline query, and this same benchmark shows vector alone
+# already matches or beats hybrid on every slice measured (paraphrase,
+# exact-term, and plain) -- so the cost of a false "step aside" is small.
+# The cost of NOT stepping aside on real noise is INC-0115 itself.
+#
+# tests/test_bench.py's TestFtsStepAsideCoverage pins these ranges against
+# the real fts_ranked()-based gate (not a reimplementation), so a later
+# corpus/threshold edit that breaks this separation fails loudly instead
+# of silently rotting the reasoning above.
+FTS_STEP_ASIDE_COVERAGE = 0.25
+
+_STOPWORDS = frozenset("""
+a an the is are was were be been being do does did doing have has had having
+i you he she it we they me him her us them my your his its our their this
+that these those to of in on at by for with about against between into
+through during before after above below from up down out off over under
+again further then once here there when where why how all any both each
+few more most other some such no nor not only own same so than too very
+can will just don should now what which who whom or and but if because as
+until while
+""".split())
+_CONTENT_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _content_terms(text: str) -> set[str]:
+    """INC-0115: non-stopword, length>1 tokens -- the same definition
+    tests/test_bench.py's paraphrase-independence check uses to verify a
+    paraphrase query shares no vocabulary with its target, now reused (not
+    duplicated) here to decide, at query time, whether the FTS channel's
+    own top hit actually shares any."""
+    return {w for w in _CONTENT_TOKEN_RE.findall(text.lower()) if w not in _STOPWORDS and len(w) > 1}
+
+
+def _fts_top_hit_is_confident(conn, project: str, query: str, top_fts_path: str) -> bool:
+    """True unless the FTS channel's own top-1 candidate's content-term
+    coverage of `query` is below FTS_STEP_ASIDE_COVERAGE (see above). One
+    extra single-row lookup by primary key (`path`), only ever run when
+    hybrid mode's FTS and vector channels have BOTH already returned at
+    least one candidate -- no new dependency, no model call, no
+    measurable added latency next to the fts_ranked/vector_ranked calls
+    that already ran this query. `title`/`body`/`ruling_text` are read
+    exactly as stored (insert_record_rows): a topic/incident row carries
+    its own body and, for a topic, its CURRENT active link's ruling_text;
+    a link row's own `body` is always "" and `ruling_text` is that one
+    link's own text -- `top_fts_path` can legitimately be either row shape
+    (fts_ranked ranks both), so both are read the same way here rather
+    than assumed to be a topic row. A query with no content tokens of its
+    own (e.g. `--mode hybrid ""`, or a query that is pure stopwords) has
+    nothing to gate on and is left alone -- FTS is not second-guessed on a
+    query this heuristic cannot meaningfully score."""
+    qtok = _content_terms(query)
+    if not qtok:
+        return True
+    row = conn.execute(
+        "SELECT title, body, ruling_text FROM records WHERE project=? AND path=?",
+        (project, top_fts_path),
+    ).fetchone()
+    if row is None:
+        return True
+    doctok = _content_terms(" ".join(filter(None, [row["title"], row["body"], row["ruling_text"]])))
+    coverage = len(qtok & doctok) / len(qtok)
+    return coverage >= FTS_STEP_ASIDE_COVERAGE
+
+
 def _search_hits(conn, args, extra_where: str, extra_params: list) -> tuple[list[tuple[str, float]], dict[str, dict[str, str]], dict]:
     """The mode-dispatch + RRF fusion core shared by cmd_search and (via
     the test module's own _run_search, which delegates here rather than
@@ -2751,39 +2879,56 @@ def _search_hits(conn, args, extra_where: str, extra_params: list) -> tuple[list
                 embed_info["dimension_mismatch_rows"] = stats.get("dimension_mismatch_rows", 0)
     elif args.mode == "hybrid":
         fts_list = fts_ranked(conn, args.query, args.project, extra_where, extra_params)
+        vec_scored: list[tuple[str, float]] = []
         if embed_info["state"] in ("unavailable", "fingerprint-mismatch"):
             vec_list = []   # degrades hybrid's own RRF fusion below to FTS-only, not a crash
         else:
             stats = {}
             try:
-                vec_list = [
-                    p for p, _ in vector_ranked(
-                        conn, args.query, args.project, extra_where, extra_params, model=model, stats=stats
-                    )
-                ]
+                vec_scored = vector_ranked(
+                    conn, args.query, args.project, extra_where, extra_params, model=model, stats=stats
+                )
             except EmbeddingUnavailableError:
                 embed_info["state"] = "unavailable"
                 vec_list = []
             else:
                 embed_info["dimension_mismatch_rows"] = stats.get("dimension_mismatch_rows", 0)
-        # Fix-round item 2 (coordinator review): ONE batched query for
-        # both channels' combined candidate set, replacing what used to be
-        # a _record_family call PLUS a record_row_by_path call per item
-        # per channel (two N-query passes on top of fts_ranked/
-        # vector_ranked's own now-batched internal collapse).
-        meta = _batch_record_meta(conn, args.project, fts_list + vec_list)
-        k = 60
-        scores: dict[str, float] = {}
-        family_winner: dict[str, str] = {}
-        for channel_name, lst in (("fts", fts_list), ("vector", vec_list)):
-            for i, p in enumerate(lst):
-                m = meta.get(p) or {"family": p, "type": None, "link_id": None}
-                fam = m["family"]
-                scores[fam] = scores.get(fam, 0.0) + 1.0 / (k + i + 1)
-                family_winner.setdefault(fam, p)
-                if m["type"] == "link":
-                    contributing.setdefault(fam, {})[channel_name] = m["link_id"]
-        results = sorted(((family_winner[fam], s) for fam, s in scores.items()), key=lambda t: t[1], reverse=True)
+                vec_list = [p for p, _ in vec_scored]
+
+        # INC-0115: both channels found at least one candidate, but the
+        # FTS channel's own top pick doesn't share real vocabulary with
+        # the query (see FTS_STEP_ASIDE_COVERAGE above) -- step aside and
+        # let vector answer alone, exactly as --mode vector would (same
+        # ranking, same scores; `contributing` stays {} like every other
+        # single-channel mode). Both-empty and either-alone-empty cases
+        # fall through to the RRF fusion below unchanged -- that already
+        # degrades correctly (an empty channel contributes nothing to the
+        # sum), and is NOT this incident's mechanism (an empty channel is
+        # never the paraphrase case: see the block comment above).
+        if (
+            fts_list and vec_scored
+            and not _fts_top_hit_is_confident(conn, args.project, args.query, fts_list[0])
+        ):
+            results = vec_scored
+        else:
+            # Fix-round item 2 (coordinator review): ONE batched query for
+            # both channels' combined candidate set, replacing what used to be
+            # a _record_family call PLUS a record_row_by_path call per item
+            # per channel (two N-query passes on top of fts_ranked/
+            # vector_ranked's own now-batched internal collapse).
+            meta = _batch_record_meta(conn, args.project, fts_list + vec_list)
+            k = 60
+            scores: dict[str, float] = {}
+            family_winner: dict[str, str] = {}
+            for channel_name, lst in (("fts", fts_list), ("vector", vec_list)):
+                for i, p in enumerate(lst):
+                    m = meta.get(p) or {"family": p, "type": None, "link_id": None}
+                    fam = m["family"]
+                    scores[fam] = scores.get(fam, 0.0) + 1.0 / (k + i + 1)
+                    family_winner.setdefault(fam, p)
+                    if m["type"] == "link":
+                        contributing.setdefault(fam, {})[channel_name] = m["link_id"]
+            results = sorted(((family_winner[fam], s) for fam, s in scores.items()), key=lambda t: t[1], reverse=True)
     else:
         raise ValueError(f"unknown mode {args.mode}")
     return results, contributing, embed_info

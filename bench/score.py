@@ -187,9 +187,19 @@ def run_all(queries: list[dict], corpus: Path, runner_specs: list[str], limit: i
 
 def summarize(report: dict, queries: list[dict]) -> dict:
     """{display_name: {"overall": {...}, "path": {...}, "question": {...},
-    "paraphrase": {...}, "errors": n}} -- a query with a runner error is
-    excluded from that runner's own aggregates (never silently scored as
-    zero, never silently dropped without a count)."""
+    "paraphrase": {...}, "exact-term": {...}, "plain": {...}, "errors": n}}
+    -- a query with a runner error is excluded from that runner's own
+    aggregates (never silently scored as zero, never silently dropped
+    without a count).
+
+    Three disjoint sub-slices of `question` by id prefix: "paraphrase"
+    (`para-`, zero shared vocabulary with the target -- see bench/README.md),
+    "exact-term" (`et-`, an error message/file name/symbol/flag/quoted
+    phrase a keyword search should nail -- INC-0115 step 2), and "plain"
+    (`kw-`, ordinary keyword-shaped developer questions, the baseline
+    "plain" slice INC-0115 step 4 measures a fix against for regressions).
+    `question` itself stays the union of all three (plus any other
+    question-kind query), unchanged, for backward compatibility."""
     by_id = {q["id"]: q for q in queries}
     out = {}
     for display, data in report.items():
@@ -203,6 +213,8 @@ def summarize(report: dict, queries: list[dict]) -> dict:
             "path": aggregate(subset(lambda q: q["kind"] == "path")),
             "question": aggregate(subset(lambda q: q["kind"] == "question")),
             "paraphrase": aggregate(subset(lambda q: q["id"].startswith("para-"))),
+            "exact-term": aggregate(subset(lambda q: q["id"].startswith("et-"))),
+            "plain": aggregate(subset(lambda q: q["id"].startswith("kw-"))),
             "errors": len(data["errors"]),
         }
     return out
@@ -213,7 +225,7 @@ def summarize(report: dict, queries: list[dict]) -> dict:
 # ---------------------------------------------------------------------------
 
 def print_table(summary: dict) -> None:
-    rows = ["overall", "path", "question", "paraphrase"]
+    rows = ["overall", "path", "question", "paraphrase", "exact-term", "plain"]
     header = f"{'runner':<22}{'slice':<11}{'n':>4}{'R@1':>7}{'R@3':>7}{'R@10':>7}{'MRR':>7}{'errors':>8}"
     print(header)
     print("-" * len(header))

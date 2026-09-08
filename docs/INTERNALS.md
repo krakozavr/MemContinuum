@@ -2235,6 +2235,15 @@ sides.
 similarities live on incomparable scales, so any weighted sum of the two is
 arbitrary.
 
+**Hybrid steps aside to vector-only, before fusing, when FTS's own top-1
+candidate doesn't share real vocabulary with the query** (content-term
+coverage below `FTS_STEP_ASIDE_COVERAGE`, `_fts_top_hit_is_confident`) — a
+plain "the FTS channel returned nothing" check can't catch this: `fts_escape`
+ORs every raw token including stopwords, so a query with zero real overlap
+with its target can still match most of a store, and RRF would otherwise fuse
+that noise into an accurate vector ranking. `--mode fts`/`--mode vector` are
+unaffected; only hybrid's own hit set can equal `--mode vector`'s exactly.
+
 **`current` is derived from list order, not from `date:`.** Links are defined to
 be stored newest-first, so "the newest active link" is "the first link with
 `status: active`". The linter's `current` check and the `chain`/`for-path`
@@ -2335,7 +2344,10 @@ importing fastembed either, verified the same way.
 down:
 
 - **`search`** — `--mode fts` and `--mode vector` never both run; `hybrid` (the
-  default) runs both and fuses ranks with RRF. `--status` defaults to
+  default) runs both and fuses ranks with RRF, unless FTS's own top-1 pick
+  lacks real vocabulary overlap with the query, in which case hybrid returns
+  exactly `--mode vector`'s own result instead of fusing. `--status` defaults
+  to
   active-only when omitted entirely (`_resolve_search_status`, applied inside
   `cmd_search` on a shallow copy of `args` -- `build_filter_clause` itself,
   and every other caller of it, keeps "no status given" meaning "no filter");

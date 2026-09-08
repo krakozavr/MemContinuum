@@ -13,10 +13,11 @@ the system temp directory, never $MEMCONTINUUM_HOME.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import math
 import os
-import re
 import subprocess
 import sys
 import tempfile
@@ -370,21 +371,11 @@ class TestPathOracle(unittest.TestCase):
 # 6. paraphrase queries genuinely share no vocabulary with their target
 # ---------------------------------------------------------------------------
 
-_STOPWORDS = frozenset("""
-a an the is are was were be been being do does did doing have has had having
-i you he she it we they me him her us them my your his its our their this
-that these those to of in on at by for with about against between into
-through during before after above below from up down out off over under
-again further then once here there when where why how all any both each
-few more most other some such no nor not only own same so than too very
-can will just don should now what which who whom or and but if because as
-until while
-""".split())
-_TOKEN_RE = re.compile(r"[a-z0-9]+")
-
-
-def _tokens(text: str) -> set[str]:
-    return {w for w in _TOKEN_RE.findall(text.lower()) if w not in _STOPWORDS and len(w) > 1}
+# INC-0115: this stopword list/tokenizer used to be defined here only; it
+# now also backs memidx._fts_top_hit_is_confident's own content-term
+# coverage gate (hybrid's FTS-step-aside threshold), so it lives in
+# memidx.py and is imported, not duplicated, here.
+_tokens = memidx._content_terms
 
 
 def _indexed_text_for(record_id: str, topics: dict, incidents: dict) -> str:
@@ -452,6 +443,77 @@ class TestParaphraseIndependence(unittest.TestCase):
             indexed = _indexed_text_for(target, topics, incidents)
             overlap = _tokens(q["query"]) & _tokens(indexed)
             self.assertNotEqual(overlap, set(), f"{q['id']} -> {target}: expected some shared vocabulary")
+
+
+# ---------------------------------------------------------------------------
+# 7. INC-0115's FTS-step-aside threshold: pin the coverage separation the
+#    code comment next to FTS_STEP_ASIDE_COVERAGE claims, against the REAL
+#    gate memidx._fts_top_hit_is_confident and the REAL, status-filtered,
+#    family-collapsed fts_ranked() top-1 -- not a reimplementation of
+#    either, which is exactly the kind of drift that produced a wrong
+#    number in that comment's first draft (a raw, unfiltered `fts MATCH`
+#    query can surface a superseded link row real search never returns).
+# ---------------------------------------------------------------------------
+
+class TestFtsStepAsideCoverage(unittest.TestCase):
+    # para-10 is the one paraphrase query whose FTS top-1 pick is a
+    # genuinely different, wrong record that happens to share real
+    # vocabulary with the query -- paraphrase queries are constructed to
+    # share no vocabulary with their OWN target (see
+    # TestParaphraseIndependence above), not with every other record in
+    # the corpus. The gate correctly leaves it to fuse normally.
+    EXPECTED_NOT_CONFIDENT = {
+        "para-01", "para-02", "para-03", "para-04", "para-05",
+        "para-06", "para-07", "para-08", "para-09", "para-11",
+    }
+    EXPECTED_CONFIDENT_EXCEPTION = "para-10"
+
+    def test_kw_and_et_always_confident_para_mostly_not(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            db = Path(td) / "idx.sqlite"
+            rc = memidx.cmd_reindex(type("NS", (), {
+                "root": str(CORPUS), "db": str(db), "project": memidx.DEFAULT_PROJECT,
+                "full": False, "no_embed": False,
+            })())
+            self.assertEqual(rc, 0)
+
+            orig_gate = memidx._fts_top_hit_is_confident
+            questions = [q for q in load_queries() if q["kind"] == "question"]
+            verdicts: dict[str, bool] = {}
+            try:
+                for q in questions:
+                    captured = {}
+
+                    def wrapped(conn, project, query, top_path, _cap=captured):
+                        v = orig_gate(conn, project, query, top_path)
+                        _cap["verdict"] = v
+                        return v
+
+                    memidx._fts_top_hit_is_confident = wrapped
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        rc = memidx.main([
+                            "search", "--project", memidx.DEFAULT_PROJECT, "--db", str(db),
+                            q["query"], "--mode", "hybrid", "--json", "--limit", "1",
+                        ])
+                    self.assertEqual(rc, 0, q["id"])
+                    # The gate is only called when both channels return at
+                    # least one candidate (see _search_hits); every query
+                    # in this corpus does, so it must have been captured.
+                    self.assertIn("verdict", captured, f"{q['id']}: gate was not invoked")
+                    verdicts[q["id"]] = captured["verdict"]
+            finally:
+                memidx._fts_top_hit_is_confident = orig_gate
+
+            for q in questions:
+                qid = q["id"]
+                if qid.startswith("kw-") or qid.startswith("et-"):
+                    self.assertTrue(verdicts[qid], f"{qid}: expected FTS to be confident (plain/exact-term query)")
+                elif qid == self.EXPECTED_CONFIDENT_EXCEPTION:
+                    self.assertTrue(verdicts[qid], f"{qid}: expected the documented confident-but-wrong exception")
+                elif qid in self.EXPECTED_NOT_CONFIDENT:
+                    self.assertFalse(verdicts[qid], f"{qid}: expected FTS to step aside (paraphrase noise)")
 
 
 if __name__ == "__main__":
