@@ -218,7 +218,8 @@ class TestStatsHealthyCase(StatsTestBase):
         self.assertEqual(
             {k: v for k, v in pe.items() if k != "outcomes"},
             {"matched": 1, "no_match": 1, "other": 2, "total": 4, "lookups": 2,
-             "watchdog_killed": 0},
+             "watchdog_killed": 0, "topics_named": 0, "topics_distinct": 0,
+             "top_topics": []},
         )
         self.assertEqual(
             pe["outcomes"],
@@ -1055,6 +1056,117 @@ class TestStatsPreCommitBucket(StatsTestBase):
         pcm = out["pre_commit"]
         self.assertEqual(pcm["skipped"], 1)
         self.assertEqual(pcm["outcomes"]["skipped:engine-failure"], 1)
+
+
+class TestStatsPreEditTopics(StatsTestBase):
+    """eval-topic-logging: `pre_edit.topics_named` (how many matched/
+    index-stale-served runs actually named the topics they injected),
+    `pre_edit.topics_distinct` (the number of distinct topic ids ever
+    injected in the window), and `pre_edit.top_topics` (the top 5 by
+    injection count, `{"id", "count"}`, ties broken by id ascending for a
+    deterministic report) -- all derived from the `topics=` field
+    pre-edit-chain.sh's finish() now writes on a match. Older log lines with
+    no `topics=` at all must still parse and simply not contribute."""
+
+    def test_single_matched_line_with_topics_counts_named_and_distinct(self):
+        lines = [
+            f"{ts(1)} outcome=matched elapsed=0s topics=TOP-0109 project=demo file=/a.py",
+        ]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home))
+        pe = out["pre_edit"]
+        self.assertEqual(pe["topics_named"], 1)
+        self.assertEqual(pe["topics_distinct"], 1)
+        self.assertEqual(pe["top_topics"], [{"id": "TOP-0109", "count": 1}])
+
+    def test_repeated_and_distinct_topics_ranked_by_injection_count(self):
+        lines = (
+            [f"{ts(1)} outcome=matched elapsed=0s topics=TOP-0109,TOP-0122 project=demo file=/a.py"] * 3
+            + [f"{ts(1)} outcome=matched elapsed=0s topics=TOP-0122 project=demo file=/b.py"] * 2
+            + [f"{ts(1)} outcome=matched elapsed=0s topics=TOP-0200 project=demo file=/c.py"]
+        )
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home))
+        pe = out["pre_edit"]
+        self.assertEqual(pe["topics_named"], 6)
+        self.assertEqual(pe["topics_distinct"], 3)
+        self.assertEqual(
+            pe["top_topics"],
+            [
+                {"id": "TOP-0122", "count": 5},
+                {"id": "TOP-0109", "count": 3},
+                {"id": "TOP-0200", "count": 1},
+            ],
+        )
+
+    def test_top_topics_capped_at_five_with_deterministic_tie_break(self):
+        # six distinct topics, all injected once -- only 5 make the report,
+        # and a flat tie must resolve by id ascending, not insertion order.
+        ids = [f"TOP-{n:04d}" for n in (600, 100, 500, 200, 400, 300)]
+        lines = [
+            f"{ts(1)} outcome=matched elapsed=0s topics={tid} project=demo file=/{tid}.py"
+            for tid in ids
+        ]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home))
+        pe = out["pre_edit"]
+        self.assertEqual(pe["topics_distinct"], 6)
+        self.assertEqual(
+            pe["top_topics"],
+            [{"id": tid, "count": 1} for tid in sorted(ids)[:5]],
+        )
+
+    def test_capped_plus_n_marker_excluded_from_topic_counting(self):
+        """A pathological-file line's `topics=` carries a `+N` marker for
+        ids beyond the 10-id cap -- it names a COUNT, not a topic, and must
+        never be treated as one."""
+        lines = [
+            f"{ts(1)} outcome=matched elapsed=0s "
+            f"topics=TOP-0001,TOP-0002,TOP-0003,TOP-0004,TOP-0005,"
+            f"TOP-0006,TOP-0007,TOP-0008,TOP-0009,TOP-0010,+30 "
+            f"project=demo file=/big.py",
+        ]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home))
+        pe = out["pre_edit"]
+        self.assertEqual(pe["topics_distinct"], 10)
+        self.assertNotIn("+30", [t["id"] for t in pe["top_topics"]])
+
+    def test_older_lines_without_topics_field_parse_and_dont_contribute(self):
+        """Mixed-shape fixture (round-4 style regression guard): an older
+        `matched` line with no `topics=` at all must still parse cleanly and
+        simply contribute nothing to the topics view, alongside a newer
+        line that does carry one."""
+        lines = [
+            f"{ts(1)} outcome=matched elapsed=0s project=demo file=/old.py",
+            f"{ts(1)} outcome=matched elapsed=0s topics=TOP-0042 project=demo file=/new.py",
+        ]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home))
+        pe = out["pre_edit"]
+        self.assertEqual(pe["matched"], 2)
+        self.assertEqual(pe["topics_named"], 1)
+        self.assertEqual(pe["topics_distinct"], 1)
+        self.assertEqual(pe["top_topics"], [{"id": "TOP-0042", "count": 1}])
+
+    def test_no_topics_at_all_reports_empty_not_missing(self):
+        lines = [f"{ts(1)} outcome=no-match elapsed=0s project=demo file=/x.py"]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home))
+        pe = out["pre_edit"]
+        self.assertEqual(pe["topics_named"], 0)
+        self.assertEqual(pe["topics_distinct"], 0)
+        self.assertEqual(pe["top_topics"], [])
+
+    def test_plain_text_report_includes_topics_summary(self):
+        lines = [
+            f"{ts(1)} outcome=matched elapsed=0s topics=TOP-0042 project=demo file=/a.py",
+        ]
+        self.write_log(lines)
+        rc, out = run_stats(home=str(self.home))
+        self.assertEqual(rc, 0)
+        self.assertIn("topics", out.lower())
+        self.assertIn("TOP-0042", out)
 
 
 if __name__ == "__main__":

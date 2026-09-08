@@ -616,6 +616,63 @@ class TestInternalsDocumentsPreEditChainWatchdog(unittest.TestCase):
         self.assertIn("watchdog-killed", text)
 
 
+class TestInternalsDocumentsPreEditTopicsLogging(unittest.TestCase):
+    """eval-topic-logging: a matched hook.log line now names which topic
+    ids were injected -- INTERNALS' "Logging, per hook" section must say so,
+    name the cap, and say why (retrieval quality can be graded later), and
+    CHANGELOG.md must record the change under a new Unreleased heading
+    without touching the already-released rc4 section. No real `TOP-nnnn`-
+    shaped store record id may appear in either (public-docs doctrine) --
+    `TOP-nnnn` is the placeholder used instead."""
+
+    def test_internals_documents_the_topics_field_and_its_cap(self):
+        text = INTERNALS.read_text()
+        self.assertIn("topics=", text)
+        self.assertIn("10", text)
+        self.assertRegex(text, r"grad(e|ing|ed)")
+
+    def test_internals_uses_the_nnnn_placeholder_not_a_real_topic_id(self):
+        text = INTERNALS.read_text()
+        idx = text.index("topics=")
+        snippet = text[max(0, idx - 200):idx + 400]
+        self.assertIn("TOP-nnnn", snippet)
+
+    def test_changelog_has_an_unreleased_heading_above_rc4(self):
+        text = CHANGELOG.read_text()
+        self.assertIn("## [Unreleased]", text)
+        unreleased_idx = text.index("## [Unreleased]")
+        rc4_idx = text.index("## [0.2.0rc4]")
+        self.assertLess(
+            unreleased_idx, rc4_idx,
+            "Unreleased must sit above the already-released rc4 section",
+        )
+
+    def test_changelog_unreleased_section_mentions_topics_logging(self):
+        text = CHANGELOG.read_text()
+        unreleased_idx = text.index("## [Unreleased]")
+        rc4_idx = text.index("## [0.2.0rc4]")
+        section = text[unreleased_idx:rc4_idx]
+        self.assertIn("topics=", section)
+
+    def test_rc4_section_untouched(self):
+        """The rc4 release is already shipped -- this change must not edit
+        a single byte of its own section, only add a new one above it."""
+        proc = subprocess.run(
+            ["git", "show", "HEAD:CHANGELOG.md"],
+            cwd=str(TOOLS_DIR), capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            self.skipTest("no committed CHANGELOG.md at HEAD to diff against")
+        old_text = proc.stdout
+        old_idx = old_text.index("## [0.2.0rc4]")
+        old_rc4 = old_text[old_idx:]
+
+        new_text = CHANGELOG.read_text()
+        new_idx = new_text.index("## [0.2.0rc4]")
+        new_rc4 = new_text[new_idx:]
+        self.assertEqual(old_rc4, new_rc4, "the rc4 section must not change")
+
+
 class TestReadmeListsEveryDocumentedMemidxSubcommand(unittest.TestCase):
     """A memidx.py subcommand only shows up in `memidx.py --help`'s own
     subcommand listing when its subparser was given a `help=` description

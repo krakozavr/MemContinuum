@@ -1328,6 +1328,172 @@ class TestPreEditChainOracleParity(unittest.TestCase):
         self.assertEqual(new_outcome, "index-error")
 
 
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestPreEditChainTopicsLogging(unittest.TestCase):
+    """eval-topic-logging: a `matched`/`index-stale-served` hook.log line now
+    names WHICH topic ids were actually injected (`topics=<comma-separated,
+    sorted ids>`), turning a matched edit into a gradeable eval sample (which
+    decisions were shown, not just that something matched). Field order is
+    `elapsed=Ns topics=... project=P file=F` -- topics= sits between
+    elapsed= and project=, so project=/file= keep their existing position for
+    memidx.py's own parser. Capped at 10 ids (`,+N` beyond that) so a
+    pathological multi-topic file can't blow up hook.log with one line."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-hook-topics-test-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _matching_payload(self):
+        return json.dumps({
+            "hook_event_name": "PreToolUse", "tool_name": "Edit",
+            "cwd": "/some/other/unrelated/dir",
+            "tool_input": {"file_path": "/fake/repo/src/core/scan/scan_plan.py"},
+        })
+
+    def _nonmatching_payload(self):
+        return json.dumps({
+            "hook_event_name": "PreToolUse", "tool_name": "Edit",
+            "cwd": "/nowhere",
+            "tool_input": {"file_path": "/nowhere/near/anything.py"},
+        })
+
+    def _topic_with_code_ref(self, tid: str, code_ref: str) -> str:
+        return (
+            f"---\ntype: topic\nid: {tid}\ntitle: T-{tid}\n"
+            f"code_refs:\n  - {code_ref}\n"
+            "links:\n"
+            '  - link: L1\n    status: active\n    ruling: {text: "r", authority: owner-verbatim, source: s}\n'
+            "---\nBody.\n"
+        )
+
+    def _build_home(self, project: str, topic_ids):
+        root = Path(self.tmp) / f"{project}-store"
+        (root / "topics").mkdir(parents=True)
+        for i, tid in enumerate(topic_ids):
+            (root / "topics" / f"t{i}.md").write_text(
+                self._topic_with_code_ref(tid, "src/core/scan/scan_plan.py")
+            )
+        home = Path(self.tmp) / f"home-{project}"
+        home.mkdir()
+        args = type(
+            "Args", (), dict(
+                root=str(root), project=project, db=str(home / f"{project}.sqlite"),
+                full=True, no_embed=True,
+            ),
+        )()
+        memidx.cmd_reindex(args)
+        return home
+
+    def _run(self, home, project, payload=None, **env_overrides):
+        env = clean_env(
+            MEMCONTINUUM_HOME=str(home),
+            MEMCONTINUUM_PROJECT=project,
+            MEMCONTINUUM_PYTHON=VENV_PYTHON,
+            MEMCONTINUUM_STRIP_PREFIX="/fake/repo/",
+            **env_overrides,
+        )
+        return run_hook(payload or self._matching_payload(), env)
+
+    def _last_outcome_line(self, home):
+        log_text = (home / "hook.log").read_text()
+        matching = [l for l in log_text.splitlines() if "outcome=" in l]
+        self.assertTrue(matching, log_text)
+        return matching[-1]
+
+    def test_single_topic_logs_its_id_between_elapsed_and_project(self):
+        project = "topics-one"
+        home = self._build_home(project, ["TOP-9001"])
+        proc, _elapsed = self._run(home, project)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        line = self._last_outcome_line(home)
+        self.assertIn("outcome=matched", line)
+        self.assertRegex(
+            line, r"elapsed=\d+s topics=TOP-9001 project=\S+ file=",
+            line,
+        )
+
+    def test_two_topics_logged_sorted_comma_separated(self):
+        project = "topics-two"
+        # deliberately out of sorted order on disk
+        home = self._build_home(project, ["TOP-9002", "TOP-9001"])
+        proc, _elapsed = self._run(home, project)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        line = self._last_outcome_line(home)
+        self.assertIn("topics=TOP-9001,TOP-9002", line)
+
+    def test_no_match_never_logs_a_topics_field(self):
+        project = "topics-none"
+        home = self._build_home(project, ["TOP-9001"])
+        proc, _elapsed = self._run(home, project, payload=self._nonmatching_payload())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        line = self._last_outcome_line(home)
+        self.assertIn("outcome=no-match", line)
+        self.assertNotIn("topics=", line)
+
+    def test_other_failure_outcomes_never_log_a_topics_field(self):
+        """no-file-path never even reaches the candidate loop -- topics=
+        must not appear there either."""
+        home = Path(self.tmp) / "home-nofile"
+        home.mkdir()
+        env = clean_env(
+            MEMCONTINUUM_HOME=str(home),
+            MEMCONTINUUM_PROJECT="topics-nofile",
+            MEMCONTINUUM_PYTHON=VENV_PYTHON,
+        )
+        proc, _elapsed = run_hook("{}", env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        line = self._last_outcome_line(home)
+        self.assertIn("outcome=no-file-path", line)
+        self.assertNotIn("topics=", line)
+
+    def test_pathological_many_topics_caps_at_ten_with_plus_n_marker(self):
+        project = "topics-forty"
+        ids = [f"TOP-{9100 + i}" for i in range(40)]
+        home = self._build_home(project, ids)
+        proc, _elapsed = self._run(home, project)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        line = self._last_outcome_line(home)
+        self.assertIn("outcome=matched", line)
+        m = re.search(r"topics=(\S+)", line)
+        self.assertIsNotNone(m, line)
+        parts = m.group(1).split(",")
+        self.assertEqual(len(parts), 11, parts)  # 10 ids + one "+N" marker
+        self.assertEqual(parts[-1], "+30", parts)
+        self.assertEqual(parts[:-1], sorted(ids)[:10], parts)
+        self.assertLess(
+            len(line.encode()), 500,
+            f"a 40-topic match must not blow up hook.log with one huge line: {len(line)} bytes",
+        )
+
+    def test_stale_served_outcome_also_carries_topics(self):
+        """index-stale-served shares the same matched-candidate path as
+        `matched` -- it must carry topics= too, not just the plain-matched
+        outcome."""
+        root = Path(self.tmp) / "stale-store"
+        (root / "topics").mkdir(parents=True)
+        (root / "topics" / "one.md").write_text(
+            self._topic_with_code_ref("TOP-9500", "src/core/scan/scan_plan.py")
+        )
+        home = Path(self.tmp) / "home-stale"
+        home.mkdir()
+        project = "topics-stale"
+        args = type(
+            "Args", (), dict(
+                root=str(root), project=project, db=str(home / f"{project}.sqlite"),
+                full=True, no_embed=True,
+            ),
+        )()
+        memidx.cmd_reindex(args)
+        (root / "topics" / "new-topic.md").write_text(
+            "---\ntype: topic\nid: TOP-NEW\ntitle: New\nlinks: []\n---\nBody.\n"
+        )
+        proc, _elapsed = self._run(home, project, MEMCONTINUUM_ROOT=str(root))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        line = self._last_outcome_line(home)
+        self.assertIn("outcome=index-stale-served", line)
+        self.assertIn("topics=TOP-9500", line)
+
+
 POST_COMMIT_HOOK = TOOLS_DIR / "hooks" / "post-commit-reindex.sh"
 
 

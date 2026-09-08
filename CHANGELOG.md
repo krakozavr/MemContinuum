@@ -1,5 +1,18 @@
 # Changelog
 
+## [Unreleased]
+
+### Decision index
+- `pre-edit-chain.sh` now names which topics a matched edit actually
+  injected: a `matched`/`index-stale-served` hook.log line carries a new
+  `topics=` field (sorted, comma-separated topic ids, capped at 10 with a
+  trailing `+N` for the rest) between `elapsed=` and `project=`, turning a
+  matched edit into a gradeable retrieval-quality sample. `memidx.py stats`
+  reports it under the `pre_edit` block as `topics_named`, `topics_distinct`,
+  and `top_topics` (top 5 by injection count). Absent entirely on any outcome
+  other than a real match, and on an older log line from before this field
+  existed — both parse and contribute nothing.
+
 ## [0.2.0rc4] — 2026-09-07
 
 ### Decision index

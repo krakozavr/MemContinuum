@@ -7285,10 +7285,29 @@ def _new_stats_bucket():
         # some future hook edit introduces shows up in `outcomes` on the
         # very next run with no code change here.
         "outcomes": {k: Counter() for k in _STATS_KINDS},
+        # eval-topic-logging: WHICH topics a pre-edit-chain.sh match actually
+        # injected, not just that it matched -- separate from `outcomes`
+        # above (a Counter of OUTCOME NAMES, not topic ids) because this
+        # needs its own per-id tally across every `topics=` field seen in
+        # the window. `pre_edit_topics_named` counts LINES that carried a
+        # non-empty `topics=` (an older line, or a matched CONCEPT with no
+        # governing topics, contributes 0); `pre_edit_topic_counts` maps
+        # topic id -> how many separate runs injected it (used for both
+        # `topics_distinct`, its length, and `top_topics`, its top 5) --
+        # see _stats_report and _CAP_MARKER_RE below.
+        "pre_edit_topics_named": 0,
+        "pre_edit_topic_counts": Counter(),
     }
 
 
 _FIELD_RE = re.compile(r"(?:^|\s)(\w+)=(\S*)")
+
+# eval-topic-logging: pre-edit-chain.sh caps a `topics=` field at 10 real
+# ids, appending a trailing `+N` marker (never a topic id itself) when more
+# were injected than that. Matched and dropped before any topic is counted
+# distinct or ranked -- a fixture with 40 governing topics must never make
+# "+30" show up as the top "topic".
+_TOPICS_CAP_MARKER_RE = re.compile(r"^\+\d+$")
 
 
 _TRAILING_PROJECT_TOKEN_RE = re.compile(r"^project=([A-Za-z0-9._-]+)$")
@@ -7501,6 +7520,25 @@ def _scan_hook_log(log_path: Path, cutoff: datetime, now: datetime):
                 outcome_key = f"rc:{fields.get('rc') or 'unknown'}"
             bucket["outcomes"]["pre-commit"][outcome_key] += 1
             continue
+        elif kind == "pre-edit":
+            # eval-topic-logging: `topics=` is present only on a matched/
+            # index-stale-served line whose MATCHED_TOPIC_IDS was non-empty
+            # (pre-edit-chain.sh's finish()) -- absent entirely on every
+            # other outcome and on any older line from before this field
+            # existed. `fields.get` already returns "" for both, so there is
+            # nothing to special-case beyond the empty check itself. Falls
+            # through to the generic outcome increment below like every
+            # other pre-edit line always has.
+            topics_raw = fields.get("topics", "")
+            if topics_raw:
+                ids = [
+                    tid for tid in topics_raw.split(",")
+                    if tid and not _TOPICS_CAP_MARKER_RE.match(tid)
+                ]
+                if ids:
+                    bucket["pre_edit_topics_named"] += 1
+                    for tid in ids:
+                        bucket["pre_edit_topic_counts"][tid] += 1
         bucket["outcomes"][kind][outcome] += 1
         # userprompt: `user_prompts` is derived at report time from this
         # same outcomes["userprompt"] Counter (round 2, item 8) -- no
@@ -7601,6 +7639,22 @@ def _stats_report(
     # REPEATED timeout pattern can raise its own FLAG below, not just sit
     # inside the generic `other` count.
     pre_edit_watchdog_killed = pe.get("watchdog-killed", 0)
+    # eval-topic-logging: `topics_named` counts RUNS (lines) that carried a
+    # non-empty `topics=`; `topics_distinct` is the number of distinct topic
+    # ids ever injected in the window; `top_topics` is the top 5 by
+    # injection count, tie-broken by id ascending (`(-count, id)`) so the
+    # report is deterministic rather than dependent on Counter insertion
+    # order. Both are VIEWS over `pre_edit_topic_counts`, same pattern as
+    # every other named field in this function.
+    pre_edit_topics_named = b["pre_edit_topics_named"]
+    pre_edit_topic_counts = b["pre_edit_topic_counts"]
+    pre_edit_topics_distinct = len(pre_edit_topic_counts)
+    pre_edit_top_topics = [
+        {"id": tid, "count": count}
+        for tid, count in sorted(
+            pre_edit_topic_counts.items(), key=lambda kv: (-kv[1], kv[0])
+        )[:5]
+    ]
 
     led = outcomes["ledger"]
     ledger_code = led.get("appended:code", 0)
@@ -7703,6 +7757,9 @@ def _stats_report(
             "total": pre_edit_total,
             "lookups": pre_edit_lookups,
             "watchdog_killed": pre_edit_watchdog_killed,
+            "topics_named": pre_edit_topics_named,
+            "topics_distinct": pre_edit_topics_distinct,
+            "top_topics": pre_edit_top_topics,
             "outcomes": dict(pe),
         },
         "ledger_appends": {
@@ -7849,6 +7906,11 @@ def cmd_stats(args) -> int:
               f"(real lookups {pe['lookups']}); other={pe['other']} "
               f"(failed/never-attempted, not counted as a lookup) -- total lines {pe['total']}; "
               f"watchdog-killed={pe['watchdog_killed']}")
+        top_topics_txt = ", ".join(
+            f"{t['id']}:{t['count']}" for t in pe["top_topics"]
+        ) or "(none)"
+        print(f"pre-edit topics: named={pe['topics_named']} distinct={pe['topics_distinct']} "
+              f"top5={top_topics_txt}")
         la = result["ledger_appends"]
         print(f"ledger appends: code={la['code']} store={la['store']} "
               f"shell-diff-calls={la['shell_diff_calls']} "
