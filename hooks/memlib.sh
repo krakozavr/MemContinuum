@@ -144,6 +144,61 @@ mc_log() {
     printf '%s %s project=%s\n' "$(date -Iseconds 2>/dev/null || date)" "$1" "$MC_PROJECT" >>"$MC_LOG" 2>/dev/null || true
 }
 
+# mc_rotate_hook_log -- eval-topic-logging section 5 (owner-approved
+# add-on): nothing used to truncate or prune hook.log (mc_prune_old_state
+# only ever clears session-state JSON) -- measured on a real machine,
+# ~177 KB/day, tens of MB/year, unbounded, and every `memidx.py stats` run
+# reads the whole file cold. If $MC_LOG is larger than
+# MEMCONTINUUM_LOG_MAX_BYTES (default 5242880 = 5 MiB), its current
+# content is moved to $MC_LOG.1 (replacing whatever was there before) and
+# a fresh, empty $MC_LOG is created. At most two files, ever -- no `.2`,
+# no dated archive, no compression; data older than the PREVIOUS rotation
+# is gone by design (memidx.py stats only ever reads hook.log.1 + hook.log).
+#
+# Called ONLY from sessionstart-remind.sh's own startup/resume/clear
+# branch, once per session -- NEVER from mc_log above, or from
+# pre-edit-chain.sh's own independent logger, both of which are hot append
+# paths that must not gain a stat() call for this.
+#
+# Fail-open, like every other path in this file: a missing/unwritable
+# $MEMCONTINUUM_HOME, a size that can't be read, or a concurrent session
+# racing this same check all leave the log alone and return 0 -- this is
+# best-effort housekeeping, never a correctness guarantee, and must never
+# raise or block the calling hook. The rename-to-a-pid-unique-temp-name
+# step below (rather than a direct `mv "$MC_LOG" "$MC_LOG.1"`) means at
+# most ONE of two sessions racing this same rotation ever wins: the
+# loser's own `mv "$MC_LOG" ...` simply fails (the winner already moved
+# it) and returns cleanly, rather than both racing to write `.1` and one
+# silently clobbering the other's already-rotated content.
+mc_rotate_hook_log() {
+    [ -f "$MC_LOG" ] || return 0
+
+    local max_bytes="${MEMCONTINUUM_LOG_MAX_BYTES:-}"
+    case "$max_bytes" in
+        ''|*[!0-9]*) max_bytes=5242880 ;;
+    esac
+
+    local size
+    size="$(wc -c <"$MC_LOG" 2>/dev/null)"
+    size="${size//[[:space:]]/}"
+    case "$size" in
+        ''|*[!0-9]*) return 0 ;;
+    esac
+    [ "$size" -gt "$max_bytes" ] || return 0
+
+    local tmp="$MC_LOG.rotating.$$"
+    mv "$MC_LOG" "$tmp" 2>/dev/null || return 0
+    mv -f "$tmp" "$MC_LOG.1" 2>/dev/null || return 0
+    # `touch`, never `: >`/`>`: a concurrent writer (a second session's
+    # mc_log/pre-edit-chain.sh append) can create a brand-new hook.log via
+    # its own `>>` in the gap between the mv above and this line -- a bare
+    # truncating redirect here would silently destroy that line the instant
+    # it lands. `touch` creates the file when it's genuinely still missing
+    # and is a no-op (never truncates) when it already exists.
+    touch "$MC_LOG" 2>/dev/null || true
+    return 0
+}
+
 # mc_state_dir_for PROJECT
 mc_state_dir_for() {
     printf '%s/sessions/%s' "$MEMCONTINUUM_HOME" "$1"

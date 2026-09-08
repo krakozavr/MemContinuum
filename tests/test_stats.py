@@ -218,7 +218,8 @@ class TestStatsHealthyCase(StatsTestBase):
         self.assertEqual(
             {k: v for k, v in pe.items() if k != "outcomes"},
             {"matched": 1, "no_match": 1, "other": 2, "total": 4, "lookups": 2,
-             "watchdog_killed": 0},
+             "watchdog_killed": 0, "topics_named": 0, "topics_distinct": 0,
+             "top_topics": []},
         )
         self.assertEqual(
             pe["outcomes"],
@@ -1055,6 +1056,176 @@ class TestStatsPreCommitBucket(StatsTestBase):
         pcm = out["pre_commit"]
         self.assertEqual(pcm["skipped"], 1)
         self.assertEqual(pcm["outcomes"]["skipped:engine-failure"], 1)
+
+
+class TestStatsPreEditTopics(StatsTestBase):
+    """eval-topic-logging: `pre_edit.topics_named` (how many matched/
+    index-stale-served runs actually named the topics they injected),
+    `pre_edit.topics_distinct` (the number of distinct topic ids ever
+    injected in the window), and `pre_edit.top_topics` (the top 5 by
+    injection count, `{"id", "count"}`, ties broken by id ascending for a
+    deterministic report) -- all derived from the `topics=` field
+    pre-edit-chain.sh's finish() now writes on a match. Older log lines with
+    no `topics=` at all must still parse and simply not contribute."""
+
+    def test_single_matched_line_with_topics_counts_named_and_distinct(self):
+        lines = [
+            f"{ts(1)} outcome=matched elapsed=0s topics=TOP-0109 project=demo file=/a.py",
+        ]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home))
+        pe = out["pre_edit"]
+        self.assertEqual(pe["topics_named"], 1)
+        self.assertEqual(pe["topics_distinct"], 1)
+        self.assertEqual(pe["top_topics"], [{"id": "TOP-0109", "count": 1}])
+
+    def test_repeated_and_distinct_topics_ranked_by_injection_count(self):
+        lines = (
+            [f"{ts(1)} outcome=matched elapsed=0s topics=TOP-0109,TOP-0122 project=demo file=/a.py"] * 3
+            + [f"{ts(1)} outcome=matched elapsed=0s topics=TOP-0122 project=demo file=/b.py"] * 2
+            + [f"{ts(1)} outcome=matched elapsed=0s topics=TOP-0200 project=demo file=/c.py"]
+        )
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home))
+        pe = out["pre_edit"]
+        self.assertEqual(pe["topics_named"], 6)
+        self.assertEqual(pe["topics_distinct"], 3)
+        self.assertEqual(
+            pe["top_topics"],
+            [
+                {"id": "TOP-0122", "count": 5},
+                {"id": "TOP-0109", "count": 3},
+                {"id": "TOP-0200", "count": 1},
+            ],
+        )
+
+    def test_top_topics_capped_at_five_with_deterministic_tie_break(self):
+        # six distinct topics, all injected once -- only 5 make the report,
+        # and a flat tie must resolve by id ascending, not insertion order.
+        ids = [f"TOP-{n:04d}" for n in (600, 100, 500, 200, 400, 300)]
+        lines = [
+            f"{ts(1)} outcome=matched elapsed=0s topics={tid} project=demo file=/{tid}.py"
+            for tid in ids
+        ]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home))
+        pe = out["pre_edit"]
+        self.assertEqual(pe["topics_distinct"], 6)
+        self.assertEqual(
+            pe["top_topics"],
+            [{"id": tid, "count": 1} for tid in sorted(ids)[:5]],
+        )
+
+    def test_capped_plus_n_marker_excluded_from_topic_counting(self):
+        """A pathological-file line's `topics=` carries a `+N` marker for
+        ids beyond the 10-id cap -- it names a COUNT, not a topic, and must
+        never be treated as one."""
+        lines = [
+            f"{ts(1)} outcome=matched elapsed=0s "
+            f"topics=TOP-0001,TOP-0002,TOP-0003,TOP-0004,TOP-0005,"
+            f"TOP-0006,TOP-0007,TOP-0008,TOP-0009,TOP-0010,+30 "
+            f"project=demo file=/big.py",
+        ]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home))
+        pe = out["pre_edit"]
+        self.assertEqual(pe["topics_distinct"], 10)
+        self.assertNotIn("+30", [t["id"] for t in pe["top_topics"]])
+
+    def test_older_lines_without_topics_field_parse_and_dont_contribute(self):
+        """Mixed-shape fixture (round-4 style regression guard): an older
+        `matched` line with no `topics=` at all must still parse cleanly and
+        simply contribute nothing to the topics view, alongside a newer
+        line that does carry one."""
+        lines = [
+            f"{ts(1)} outcome=matched elapsed=0s project=demo file=/old.py",
+            f"{ts(1)} outcome=matched elapsed=0s topics=TOP-0042 project=demo file=/new.py",
+        ]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home))
+        pe = out["pre_edit"]
+        self.assertEqual(pe["matched"], 2)
+        self.assertEqual(pe["topics_named"], 1)
+        self.assertEqual(pe["topics_distinct"], 1)
+        self.assertEqual(pe["top_topics"], [{"id": "TOP-0042", "count": 1}])
+
+    def test_no_topics_at_all_reports_empty_not_missing(self):
+        lines = [f"{ts(1)} outcome=no-match elapsed=0s project=demo file=/x.py"]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home))
+        pe = out["pre_edit"]
+        self.assertEqual(pe["topics_named"], 0)
+        self.assertEqual(pe["topics_distinct"], 0)
+        self.assertEqual(pe["top_topics"], [])
+
+    def test_plain_text_report_includes_topics_summary(self):
+        lines = [
+            f"{ts(1)} outcome=matched elapsed=0s topics=TOP-0042 project=demo file=/a.py",
+        ]
+        self.write_log(lines)
+        rc, out = run_stats(home=str(self.home))
+        self.assertEqual(rc, 0)
+        self.assertIn("topics", out.lower())
+        self.assertIn("TOP-0042", out)
+
+
+class TestStatsSpansRotatedHookLog(StatsTestBase):
+    """eval-topic-logging section 5 (owner-approved add-on): nothing used
+    to truncate or prune hook.log -- sessionstart-remind.sh now rotates it
+    into hook.log.1 (replacing any previous one) once it crosses
+    MEMCONTINUUM_LOG_MAX_BYTES. `stats` must read hook.log.1 (when
+    present) alongside hook.log so a `--days N` window spanning a rotation
+    still sees the rotated-out side exactly once -- not dropped, not
+    double-counted."""
+
+    def write_rotated_log(self, lines):
+        (self.home / "hook.log.1").write_text("\n".join(lines) + "\n")
+
+    def test_counts_lines_from_both_files(self):
+        self.write_rotated_log([
+            f"{ts(2)} outcome=matched elapsed=0s project=demo file=/old.py",
+        ])
+        self.write_log([
+            f"{ts(1)} outcome=matched elapsed=0s project=demo file=/new.py",
+        ])
+        rc, out = run_stats_json(home=str(self.home))
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["pre_edit"]["matched"], 2)
+
+    def test_window_spanning_rotation_excludes_only_the_out_of_window_line(self):
+        self.write_rotated_log([
+            # 8 days ago -- outside a 7-day window
+            f"{ts(24 * 8)} outcome=matched elapsed=0s project=demo file=/too-old.py",
+            # 3 days ago -- inside a 7-day window, but rotated out of hook.log
+            f"{ts(24 * 3)} outcome=matched elapsed=0s project=demo file=/still-in-window.py",
+        ])
+        self.write_log([
+            f"{ts(1)} outcome=matched elapsed=0s project=demo file=/fresh.py",
+        ])
+        rc, out = run_stats_json(home=str(self.home), days=7)
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            out["pre_edit"]["matched"], 2,
+            "the too-old line must not count; the in-window rotated line must count exactly once",
+        )
+
+    def test_missing_hook_log_1_is_the_ordinary_pre_rotation_case(self):
+        """No rotation has ever happened -- must behave exactly as it did
+        before this feature existed."""
+        self.write_log([f"{ts(1)} outcome=matched elapsed=0s project=demo file=/a.py"])
+        rc, out = run_stats_json(home=str(self.home))
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["pre_edit"]["matched"], 1)
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores permission bits")
+    def test_unreadable_hook_log_1_is_ignored_not_fatal(self):
+        self.write_rotated_log([f"{ts(2)} outcome=matched elapsed=0s project=demo file=/old.py"])
+        (self.home / "hook.log.1").chmod(0o000)
+        self.addCleanup((self.home / "hook.log.1").chmod, 0o644)
+        self.write_log([f"{ts(1)} outcome=matched elapsed=0s project=demo file=/new.py"])
+        rc, out = run_stats_json(home=str(self.home))
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["pre_edit"]["matched"], 1, "only hook.log's own line should be counted")
 
 
 if __name__ == "__main__":

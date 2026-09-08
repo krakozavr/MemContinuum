@@ -151,12 +151,22 @@ log() {
 }
 
 finish() {
-    # $1 = one-word outcome for the log line; everything after stays 0.
+    # $1 = one-word outcome for the log line; $2 = optional extra
+    # "key=value" text spliced in between elapsed= and project= (eval-
+    # topic-logging: the only caller today is the matched/index-stale-
+    # served path, passing "topics=<ids>" -- see MATCHED_TOPIC_IDS below).
+    # project=/file= keep their existing trailing position and order no
+    # matter what $2 is, so memidx.py's own parser (which locates the
+    # LINE's project=/file= structurally, not by counting fields) never
+    # sees a shape it doesn't already handle. Everything after stays 0.
     local outcome="$1"
-    local now elapsed
+    local extra="${2:-}"
+    local now elapsed extra_part
     now=$(date +%s 2>/dev/null || echo "$START_TS")
     elapsed=$(( now - START_TS ))
-    log "$(date -Iseconds 2>/dev/null || date) outcome=$outcome elapsed=${elapsed}s project=${PROJECT:-} file=${FILE_PATH:-}"
+    extra_part=""
+    [ -n "$extra" ] && extra_part=" $extra"
+    log "$(date -Iseconds 2>/dev/null || date) outcome=$outcome elapsed=${elapsed}s${extra_part} project=${PROJECT:-} file=${FILE_PATH:-}"
     exit 0
 }
 
@@ -271,6 +281,7 @@ fi
 MATCHED_CANDIDATE=""
 MATCHED_STATE="current"
 MATCHED_TOPIC_COUNT="0"
+MATCHED_TOPIC_IDS=""
 CHAIN_TEXT=""
 ANY_QUERY_SUCCEEDED=0
 for candidate in "${CANDIDATES[@]}"; do
@@ -329,11 +340,13 @@ for candidate in "${CANDIDATES[@]}"; do
     MATCHED_FLAG=""
     CANDIDATE_STATE=""
     CANDIDATE_TOPIC_COUNT=""
+    CANDIDATE_TOPIC_IDS=""
     CANDIDATE_CHAIN_TEXT=""
     {
         IFS= read -r -d '' MATCHED_FLAG
         IFS= read -r -d '' CANDIDATE_STATE
         IFS= read -r -d '' CANDIDATE_TOPIC_COUNT
+        IFS= read -r -d '' CANDIDATE_TOPIC_IDS
         IFS= read -r -d '' CANDIDATE_CHAIN_TEXT
     } < <(printf '%s' "$RESULT_JSON" | PYTHONPATH= "$PY" -c '
 import json, sys
@@ -368,6 +381,27 @@ for entry in results:
         topic_ids.add(entry["id"])
 topic_count = str(len(topic_ids))
 
+# eval-topic-logging: WHICH topics matched, not just how many -- turns a
+# matched edit into a gradeable sample (file, decisions shown, a later
+# judgement of whether they were the right ones). Sorted so the log line is
+# deterministic (byte-identical across runs of the same match) and capped at
+# 10 ids (a trailing "+N" names how many more were left out) so a
+# pathological file governed by dozens of topics can never blow up a single
+# hook.log line. Isolated in its own try/except: this is new, cosmetic-only
+# formatting layered on top of the topic_ids set the topic_count line above
+# already computed and relies on -- a failure HERE must never turn a real
+# match into a false "no-match" (fail-open discipline), it must just come
+# back as an empty NUL field, same as an old build that never sent one at
+# all.
+try:
+    _sorted_ids = sorted(str(i) for i in topic_ids)
+    if len(_sorted_ids) > 10:
+        topics_field = ",".join(_sorted_ids[:10]) + ",+" + str(len(_sorted_ids) - 10)
+    else:
+        topics_field = ",".join(_sorted_ids)
+except Exception:
+    topics_field = ""
+
 # Round 7 fix (Codex MAJOR): this stream is field-delimited by chr(0) and
 # read back with read -d "", which treats ANY NUL byte as the end of the
 # CURRENT read -- not just the one this loop appends after each field. A
@@ -389,7 +423,14 @@ topic_count = str(len(topic_ids))
 # strip NULs from each field before it enters the shared stream, so a
 # NUL can never be mistaken for the chr(0) delimiter, and no text past
 # it is ever lost.
-for field in (matched, state, topic_count, chain_text):
+#
+# eval-topic-logging is exactly the "future field added after it" this
+# comment warned about -- topics_field is inserted here, BEFORE chain_text,
+# never after, so chain_text keeps the guarantee above (it is still the
+# LAST field in the stream, so nothing can ever queue behind IT to be lost
+# the way this comment describes). Same NUL-stripping treatment as every
+# other field, for the same reason.
+for field in (matched, state, topic_count, topics_field, chain_text):
     sys.stdout.write(field.replace(chr(0), ""))
     sys.stdout.write(chr(0))
 ' 2>/dev/null)
@@ -398,6 +439,7 @@ for field in (matched, state, topic_count, chain_text):
         MATCHED_CANDIDATE="$candidate"
         MATCHED_STATE="$CANDIDATE_STATE"
         MATCHED_TOPIC_COUNT="$CANDIDATE_TOPIC_COUNT"
+        MATCHED_TOPIC_IDS="$CANDIDATE_TOPIC_IDS"
         CHAIN_TEXT="$CANDIDATE_CHAIN_TEXT"
         break
     fi
@@ -468,7 +510,15 @@ if [ -z "$OUTPUT_JSON" ]; then
 fi
 
 printf '%s\n' "$OUTPUT_JSON"
+# eval-topic-logging: name which topics were actually injected, on the log
+# line only -- never in additionalContext (the model-facing payload above is
+# already final by this point). Omitted entirely (never an empty `topics=`
+# token) when MATCHED_TOPIC_IDS is empty -- e.g. a matched CONCEPT with no
+# governing topics -- so a reader can always tell "named" from "nothing to
+# name" apart from a truncated/older line.
+TOPICS_EXTRA=""
+[ -n "$MATCHED_TOPIC_IDS" ] && TOPICS_EXTRA="topics=$MATCHED_TOPIC_IDS"
 if [ "$MATCHED_STATE" = "stale" ]; then
-    finish "index-stale-served"
+    finish "index-stale-served" "$TOPICS_EXTRA"
 fi
-finish "matched"
+finish "matched" "$TOPICS_EXTRA"

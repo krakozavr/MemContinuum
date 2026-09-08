@@ -97,6 +97,47 @@ and are never folded into `user_prompts`.
 `$MEMCONTINUUM_DETECT_LOG` is set — it runs in every repo on the machine, so its
 default is silence.
 
+**pre-edit-chain.sh's `topics=` field.** A `matched` or `index-stale-served`
+line also names which topic ids were actually injected, not just that
+something matched: `outcome=matched elapsed=1s topics=TOP-nnnn,TOP-nnnn
+project=P file=F` — sorted, comma-separated, sitting between `elapsed=` and
+`project=` so `project=`/`file=` keep their existing trailing position (the
+one thing `memidx.py stats`'s own line parser structurally relies on). This
+exists so a later grading pass can check WHICH decisions a matched edit
+actually saw, turning a matched edit into a gradeable sample: file, decisions
+shown, and a later judgement of whether they were the right ones. Capped at
+10 ids: beyond that, a trailing `+N` names how many more were left out, so a
+pathological file governed by dozens of topics can never blow up a single
+hook.log line. The field is omitted entirely — never an empty `topics=`
+token — on every outcome besides a real match (no-match, index-missing,
+query-failed, …) and on a matched concept with no governing topics; a line
+written before this field existed simply has none, and still parses.
+`memidx.py stats` reports this under the `pre_edit` block: `topics_named`
+(how many matched runs named at least one topic), `topics_distinct` (how
+many distinct topic ids were ever injected in the window), and `top_topics`
+(the top 5 by injection count, ties broken by id) — a `+N` cap marker is
+never counted as a topic.
+
+**hook.log rotation.** Nothing truncates or prunes hook.log on its own —
+`mc_prune_old_state` only ever clears session-state JSON — so it grows
+forever: measured on a real machine, ~177 KB/day, tens of MB per year per
+machine, with every `memidx.py stats` run reading the whole file cold.
+`sessionstart-remind.sh` now rotates it once per session, at the
+startup/resume/clear session-init boundary only — never from `mc_log`'s own
+append path, or from `pre-edit-chain.sh`'s independent logger, both of which
+are hot paths that must not gain a `stat()` call for this, and never
+re-checked on a mid-session `compact`. Once hook.log exceeds
+`MEMCONTINUUM_LOG_MAX_BYTES` (default 5242880 bytes, 5 MiB), its current
+content moves to `hook.log.1` — replacing whatever was there before — and a
+fresh, empty hook.log starts. At most two files exist, ever: no `.2`, no
+dated archive, no compression, and data older than the *previous* rotation
+is gone by design once a second one happens. `memidx.py stats` reads
+`hook.log.1` (when present) alongside hook.log, so a `--days N` window that
+spans a rotation still sees the rotated-out side. Fail-open like every other
+path here: a missing/unwritable `$MEMCONTINUUM_HOME`, an unreadable size, or
+a concurrent session racing the same rotation all leave the log alone and
+never block `SessionStart`.
+
 `userprompt-remind.sh` has its own exception too (Codex 12, fix wave 1 G4): a
 turn whose HEAD-moved check (independent of coverage candidacy — see "The
 commit nudge" below) finds one or more newly-examined, undecided commits

@@ -208,6 +208,14 @@ print(json.dumps(state))
 
         mc_prune_old_state "$MC_PROJECT" 1440
 
+        # eval-topic-logging section 5 (owner-approved add-on): rotation
+        # lives here, once per session at the session-INIT boundary
+        # (startup/resume/clear) only -- never on mc_log's own append
+        # path, and never re-checked on a mid-session `compact` (see
+        # hooks/memlib.sh's mc_rotate_hook_log for the mechanics and the
+        # fail-open/race-safety discussion).
+        mc_rotate_hook_log
+
         finish "init"
         ;;
 
