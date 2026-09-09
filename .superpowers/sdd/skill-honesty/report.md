@@ -143,13 +143,6 @@ Full `tests/test_docs.py`: 59 tests, 57 passed, 2 skipped (both pre-existing, en
 no `.claude/skills/*/SKILL.md` render target in this worktree, no `memory/incidents` copy — this
 engine repo's own gitignored store, not part of the task).
 
-## Still to do
-- S4 audit of `templates/memcontinuum-rules.md`
-- `tests.test_docs tests.test_repo_init tests.test_update tests.test_setup` natively
-- Full suite in foreground (600000 ms timeout)
-- `bash tests/run_bash32.sh`
-- Two dry-run verifications (`/mnt/c` path and `$HOME` path)
-
 ## S4 — `templates/memcontinuum-rules.md` audit — no change
 
 Read the full template (27 lines). It contains no restated repo-init.sh/mc-registry-lib.sh-computed
@@ -180,3 +173,44 @@ one machine-wide render row goes stale (fixed by `memcontinuum-update.sh --apply
 per-repo rows are untouched. This corrects the brief's S4 note ("it will flip every wired row to
 stale") — that would only be true had `templates/memcontinuum-rules.md` or `repo-init.sh` itself
 been edited, which they were not.
+
+## Verify
+
+All run natively (`PYTHONPATH=` cleared, `MEMCONTINUUM_PYTHON` the pinned venv), foreground,
+bounded timeouts, on the `skill-honesty` branch in `~/dev/memcontinuum-skill`.
+
+- `python -m unittest tests.test_docs tests.test_repo_init tests.test_update tests.test_setup`:
+  **Ran 409 tests in 201.649s -- OK (skipped=2)**.
+- Full suite, `python -m unittest discover -s tests`: **Ran 1641 tests in 426.844s -- OK
+  (skipped=4)**, exit 0. (The `ERROR:`/`WARNING:` lines inside the log are memlint's own
+  deliberate-malformed-fixture output, printed by the tests under test, not failures -- the
+  summary line is the actual result.)
+- `bash tests/run_bash32.sh`: **Ran 665 tests in 351.215s -- OK**, exit 0, closing line
+  `== CI SUMMARY: bash 3.2.57 (~/.cache/bash32/bin/bash) -- PASS ==`.
+
+### Two dry runs -- same command, two checkout locations, `skill-honesty` branch's `repo-init.sh`
+
+`/mnt/c` checkout (Windows-mounted -- a throwaway `mc-probeB-<ts>` git repo under
+`/mnt/c/Users/User/AppData/Local/Temp`, removed after):
+```
+note: store defaults to ~/dev/mc-probeB-1788962843-MemContinuum-Store: the checkout is on a Windows-mounted drive, where a store walk costs seconds
+note: no --store given -- defaulting to ~/dev/mc-probeB-1788962843-MemContinuum-Store
+note: hooks will merge into /mnt/c/Users/User/AppData/Local/Temp/mc-probeB-1788962843/.claude
+  store       : ~/dev/mc-probeB-1788962843-MemContinuum-Store
+```
+
+`$HOME/dev` checkout (native WSL disk -- a throwaway `mc-probeH-<ts>` git repo under `~/dev`,
+removed after):
+```
+note: no --store given -- defaulting to ~/dev/mc-probeH-1788962843-MemContinuum-Store
+note: hooks will merge into ~/dev/mc-probeH-1788962843/.claude
+  store       : ~/dev/mc-probeH-1788962843-MemContinuum-Store
+```
+
+The `$HOME/dev` run carries no `Windows-mounted` note and no WSL-specific language at all -- just
+the plain "no --store given -- defaulting to..." line -- so a Mac- or Linux-shaped checkout (never
+on `/mnt/*`, `mc_is_windows_mounted_checkout` false) sees exactly this plain form. Behaviour for
+that user is unchanged by this task: repo-init.sh itself was not touched, only the skill's prose
+about it, and the skill no longer says anything platform-specific to contradict what a non-WSL
+user's own dry-run prints.
+
