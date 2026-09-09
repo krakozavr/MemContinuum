@@ -99,6 +99,16 @@ class TestQueriesShapeAndExpectIds(unittest.TestCase):
         para = [q for q in queries if q["id"].startswith("para-")]
         self.assertGreaterEqual(len(para), 10)
 
+    def test_at_least_10_exact_term_queries(self):
+        """Grok 13: the et- slice had no floor -- it could silently vanish
+        (or shrink to nothing meaningful) without failing the suite. This
+        does not check that each query's claimed phrase is actually
+        present in its target (that is still verified by hand -- see
+        bench/README.md's "The exact-term queries"), only that the slice
+        itself cannot quietly disappear."""
+        et = [q for q in load_queries() if q["id"].startswith("et-")]
+        self.assertGreaterEqual(len(et), 10)
+
     def test_both_kinds_present(self):
         kinds = {q["kind"] for q in load_queries()}
         self.assertEqual(kinds, {"path", "question"})
@@ -191,6 +201,47 @@ class TestScorerMetrics(unittest.TestCase):
         self.assertEqual(agg["n"], 0)
         self.assertEqual(agg["recall@1"], 0.0)
         self.assertEqual(agg["mrr"], 0.0)
+
+
+# ---------------------------------------------------------------------------
+# 3b. --json's envelope shape (Codex 9): {"runners", "negative_control"},
+#     an untested breaking change vs. main's old flat-dict-of-runner-names
+#     shape when this was introduced -- pinned here so a future change to
+#     it is a deliberate, visible diff, not a silent break.
+# ---------------------------------------------------------------------------
+
+class TestJSONOutputShape(unittest.TestCase):
+    def test_json_envelope_is_runners_and_negative_control(self):
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = score.main(["--json", "--runner", "nomemory", "--runner", "keyword"])
+        payload = json.loads(buf.getvalue())
+        self.assertEqual(set(payload.keys()), {"runners", "negative_control"})
+        self.assertEqual(set(payload["runners"].keys()), {"nomemory", "keyword"})
+        for slices in payload["runners"].values():
+            self.assertEqual(
+                set(slices.keys()),
+                {"overall", "path", "question", "paraphrase", "exact-term", "plain", "errors"},
+            )
+        nc = payload["negative_control"]
+        self.assertEqual(set(nc.keys()) - {"nomemory", "keyword"}, {"verdict", "failed_runners"})
+        for runner_result in (nc["nomemory"], nc["keyword"]):
+            self.assertEqual(
+                set(runner_result.keys()),
+                {"real_mrr", "shuffled_mrr", "gain", "spread", "returns_nothing",
+                 "is_exempt_baseline", "separates"},
+            )
+        # nomemory (declared, empty, zero errors, full coverage) always
+        # separates by exemption; the real corpus + keyword always
+        # separates too (TestNegativeControl's own live-corpus test covers
+        # this properly) -- both true here means the run is "ok", so this
+        # doubles as a check that --json's exit code matches its own
+        # printed verdict (M3).
+        self.assertEqual(nc["verdict"], "ok")
+        self.assertEqual(rc, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -407,6 +458,20 @@ def _indexed_text_for(record_id: str, topics: dict, incidents: dict) -> str:
     return " ".join([fm.get("title", ""), body])
 
 
+def _record_paths_by_id() -> dict[str, Path]:
+    """record id -> the markdown file it lives in, for the stricter
+    full-raw-file independence check below (keyword_baseline.py's own
+    search surface, not memidx's narrower indexed-text subset)."""
+    out: dict[str, Path] = {}
+    for f in memidx.walk_markdown(CORPUS):
+        result = memidx.parse_record(f)
+        if not result.valid:
+            continue
+        rid = str(result.frontmatter.get("id") or f.stem)
+        out[rid] = f
+    return out
+
+
 def _load_topics_and_incidents_with_body() -> tuple[dict, dict]:
     topics: dict[str, tuple] = {}
     incidents: dict[str, tuple] = {}
@@ -437,6 +502,34 @@ class TestParaphraseIndependence(unittest.TestCase):
                 overlap, set(),
                 f"{q['id']} -> {target}: shares vocabulary {sorted(overlap)} with its target's "
                 f"indexed text -- this is no longer a genuine paraphrase",
+            )
+
+    def test_paraphrase_queries_share_no_vocabulary_with_the_full_raw_record(self):
+        """Fix round (Grok 8, MAJOR/must-fix in that gate): the check above
+        matches what memidx.py/memcontinuum actually index and search, but
+        bench/README.md's `keyword` baseline searches the ENTIRE raw
+        markdown file -- frontmatter, `alternatives`, `evidence`, `tags`,
+        even a superseded link's own text. A query can pass the
+        indexed-text check above and still leak through a field that check
+        never reads: para-01 did, before this fix round -- 'behave' and
+        'version' leaked via TOP-107's `alternatives.rejected_because` and
+        its superseded L1 link's own ruling text, and keyword ranked
+        TOP-107 first (MRR 1.0) for what was supposed to be the hard case.
+        This is the stricter check against that whole surface, so a future
+        corpus edit that reintroduces a full-file leak fails the suite the
+        same way the indexed-text-only leak used to slip through."""
+        paths = _record_paths_by_id()
+        para = [q for q in load_queries() if q["id"].startswith("para-")]
+        for q in para:
+            target = q["expect"][0]
+            raw = paths[target].read_text(encoding="utf-8")
+            overlap = _tokens(q["query"]) & _tokens(raw)
+            self.assertEqual(
+                overlap, set(),
+                f"{q['id']} -> {target}: shares vocabulary {sorted(overlap)} with its target's "
+                f"FULL RAW FILE (not just its indexed text) -- keyword_baseline.py searches "
+                f"this whole surface, so this leak can inflate keyword's score on what should "
+                f"be the hard case",
             )
 
     def test_kw_queries_are_not_accidentally_zero_overlap(self):

@@ -38,9 +38,18 @@ For each query we compute, per runner:
 - **MRR** — `1 / rank of the first expected id` anywhere in the runner's
   output (not capped at any k). Zero if no expected id was returned at all.
 
-`bench/score.py` reports these per `kind` (`path`, `question`), a
-`paraphrase` slice (queries whose id starts with `para-` — see below), and
-`overall`.
+`bench/score.py` reports these per `kind` (`path`, `question`), three
+disjoint sub-slices of `question` by id prefix — `paraphrase` (`para-`, see
+below), `exact-term` (`et-`, an error message/file name/symbol/flag/quoted
+phrase a keyword search should nail — see "The exact-term queries" below),
+`plain` (`kw-`, ordinary keyword-shaped developer questions, see "The
+paraphrase queries" below) — and `overall`. `overall` and `question` are
+each the union of every query of that shape, `exact-term` included: they
+moved slightly easier when the 12 `et-` queries were added (fix round: was
+45 queries with no `et-` slice; the exact-term R@1/MRR are near-ceiling by
+construction, since that is the point of the slice), which is exactly why
+the sliced numbers exist — read `paraphrase` as the hard number and
+`overall`/`question` as a blend, not the other way around.
 
 ## How to run it
 
@@ -104,7 +113,7 @@ for its own sake:
   superseded link's own row, so a query about the *old* choice is only
   answerable at all through what the *current* link says about it. A query
   that needed `--status any` to be answerable would be testing
-  `memidx.py`'s CLI, not the corpus, so none of the 45 queries need it.
+  `memidx.py`'s CLI, not the corpus, so none of the 57 queries need it.
 - **Concept boundaries that pull in topics no direct `code_refs` would
   find.** `CON-303` ("Upload Pipeline") is governed by both `TOP-110`
   (retry, this file's own `code_refs`) and `TOP-113` (streaming, a
@@ -150,7 +159,7 @@ running `memidx.py` at all.
 
 ### The paraphrase queries
 
-11 of the 25 `question` queries (id prefix `para-`, exceeding the 10
+11 of the 37 `question` queries (id prefix `para-`, exceeding the 10
 required) share **zero word-level vocabulary** with their target record's
 own indexed text: lowercase, `[a-z0-9]+`-tokenized, common-English-stopword
 -removed, no stemming, checked against the target's title + body + (for a
@@ -178,9 +187,27 @@ The 14 `kw-` queries are ordinary keyword-shaped developer questions
 keyword search is *supposed* to do well on, kept in the same file so the
 paraphrase slice's difficulty is visible by contrast, not assumed.
 
+### The exact-term queries
+
+The 12 `et-` queries each quote (or near-quote) a specific error
+message/file name/symbol/flag/figure/proper noun that appears verbatim in
+exactly one record's own indexed text (`et-05`'s `256MB`, `et-08`'s
+`Credential Manager`, `et-11`'s near-verbatim quote of an incident's own
+title — see each query's own `notes` for its literal phrase and source
+line). This is the case a keyword search is expected to nail outright
+(`tests/test_bench.py`'s corpus-lint and expect-id checks cover this
+slice like any other, and a floor on its own count keeps it from silently
+shrinking away, but there is no dedicated mechanical check that a claimed
+exact phrase is actually present in the target's text — verified by hand,
+once, against the corpus, when each query was written; see "Honest
+limitations"). Folded into `overall`/`question` for backward
+compatibility with the pre-`et-` query set (see "What is measured" above)
+— read the `exact-term` row in isolation to compare it against
+`paraphrase`, not against `overall`.
+
 ### `notes`
 
-Every one of the 45 queries' `notes` field states which record(s) are
+Every one of the 57 queries' `notes` field states which record(s) are
 expected and why, in terms of what is actually in the corpus (a
 `code_refs` entry, a concept's `governed_by`, shared or absent vocabulary)
 — never "because the tool returns this," which would make the key a
@@ -255,6 +282,16 @@ shell has exported (`--db` overrides this explicitly if a caller wants a
 fixed path). `PYTHONPATH` is cleared for every `memidx.py` subprocess call
 it makes.
 
+This system-temp cache is deliberate residue, not an oversight (Codex 8):
+its whole point is to survive between runs (`bench/runners/memcontinuum.py`
+reuses it instead of reindexing from scratch on every single-query
+subprocess call this file makes), and its path is keyed off a hash of the
+corpus's own resolved path, so a different `--corpus` never collides with
+it. It lives under `tempfile.gettempdir()`, never under `MEMCONTINUUM_HOME`
+or any real store, and it holds nothing but a rebuild of this file's own
+public, synthetic corpus — safe to delete by hand at any time; the next
+run just rebuilds it.
+
 For `kind: path`, it flattens `for-path --json`'s match structure exactly
 as described in "The path-kind answer key" above: top-level topic/concept
 ids plus, for each matched concept, its nested `governed_by` topic ids,
@@ -290,11 +327,36 @@ PYTHONPATH= "$MEMCONTINUUM_PYTHON" python -m unittest tests.test_bench -v
   independence check) but not against a second reviewer's independent
   read. A key that is wrong in a way its own author cannot see is not
   caught by that author re-checking their own work.
-- **32 records and 45 queries is small.** Recall@k on a corpus this size
+- **32 records and 57 queries is small.** Recall@k on a corpus this size
   moves by more than one query's worth of luck; treat single-decimal
   differences between runners as noise and multi-decimal differences (the
   paraphrase-slice gap between `keyword` and `memcontinuum:vector`, for
   instance) as the signal worth trusting.
+- **The `keyword` baseline's TF-IDF has no document-length normalization,
+  so a paraphrase query can be vocabulary-independent by this file's own
+  definition (zero *content* words shared, stopwords removed) and still
+  rank the target first for `keyword`.** Found during the fix round that
+  closed Grok 8: after removing every leaked content word from `para-01`,
+  `keyword` still ranked its target (`TOP-107`) first, dominated by raw
+  counts of "the"/"a"/"is"/"and" and similar words this file's own
+  independence check deliberately excludes (that is what "stopword" means
+  here) but `bench/runners/keyword_baseline.py`'s scorer does not — a
+  longer or more repetitively-worded record accumulates more of these
+  regardless of query content, with no length normalization (BM25-style or
+  cosine) to correct for it. `para-06` (a similarly two-link topic,
+  `TOP-116`) does NOT show the same effect, so this is not simply "every
+  long record wins" — it was not chased further than the one probe that
+  found it. Not fixed here: changing `keyword_baseline.py`'s scoring
+  formula moves every keyword number in every slice this file and both
+  external gates already cite, which is a design decision for its own
+  review, not a drive-by edit inside a query-wording fix.
+- **The exact-term slice's literal phrases are hand-verified, not
+  mechanically checked.** `tests/test_bench.py` floors the slice's own
+  count (Grok 13) but does not assert that each query's claimed quoted
+  phrase actually appears in its target's text — that check was done once,
+  by hand, against the corpus, when each `et-` query was written (see "The
+  exact-term queries" above), and could in principle rot silently on a
+  future corpus edit.
 - **A system we did not run is named as not run, never compared from its
   documentation.** No hosted or third-party retrieval system has a runner
   here yet; adding one is exactly the "drop in a script" path described
@@ -315,23 +377,48 @@ PYTHONPATH= "$MEMCONTINUUM_PYTHON" python -m unittest tests.test_bench -v
 ## The negative control
 
 A benchmark can report a flattering number while separating nothing. If the
-query set is easy enough that a deliberately crippled runner scores the same as
-the real one, the metric is measuring the corpus rather than the retrieval, and
-the headline figure is noise.
+query set is easy enough that a runner ignoring the query entirely scores as
+well as the real one, the metric is measuring the corpus rather than the
+retrieval, and the headline figure is noise.
 
-Every run therefore also scores each runner against its own **reversed**
-ranking. Reversal rather than shuffling: no random seed, reproducible
-everywhere, and it moves a correct top-1 answer to the bottom, which is the
-strongest degradation available without inventing results the runner never
-returned. A runner must beat its reversed twin by at least 0.05 mean
-reciprocal rank overall to count as separating. A runner that returns nothing
-by design (the empty baseline) is excluded from the verdict rather than counted
-as a failure.
+**Fix-round history.** The first version of this control reversed each
+runner's own ranked output and rescored it against the SAME query's expect.
+Two external reviews (Codex, Grok) independently proved that tests ranking
+*order*, not query-sensitivity: a query-blind runner that returns the
+identical list for every query passed (reversing a fixed list can still look
+query-sensitive if the corpus rewards that fixed order on average), and
+reversing a length-1 list or a match-set whose order is not a ranking at all
+(this file's own `path` kind) is a no-op — MRR cannot change, so all 20 `path`
+queries were structurally invisible to it regardless of the runner.
+
+**What it does now.** Every run also scores each runner against a
+**query-shuffled** twin: each query's already-computed ranked output is
+rescored against a *different* query's expected answer, the pairing fixed by
+a deterministic derangement (no fixed point) of the query id list — a
+half-length rotation, no random seed, reproducible everywhere (see
+`bench/score.py`'s `negative_control` for the full derivation, including an
+algebraic proof that a query-blind runner's gain is EXACTLY zero under this
+design, and why a length-1/match-set result now participates). The threshold
+is calibrated from the run's own data rather than a picked constant: the mean
+paired difference between each query's real and shuffled score must exceed
+that difference's own standard error across the query set.
+
+A runner that returns nothing is excluded from the verdict, rather than
+counted as a failure, **only** when it is explicitly declared the null
+baseline (`nomemory`) AND it has zero errors AND it covered every query —
+anything else that returns nothing, or has any error at all, makes that
+runner's own result inconclusive rather than excused.
 
 If any runner fails, the harness prints **INCONCLUSIVE**, names the runners,
-and says the numbers say nothing about retrieval quality. That verdict is in
-`--json` too, under `negative_control`. A published number without an `ok`
-verdict beside it should not be believed.
+and says the numbers say nothing about retrieval quality — and now (fix
+round) `score.py`'s own exit code is nonzero on that verdict too (was:
+always `0`, silently unnoticed by any caller checking only the exit code).
+That verdict is in `--json` too, under `negative_control`. A published number
+without an `ok` verdict beside it should not be believed. `score.py
+--private` computes and prints this control too, on nothing but the
+aggregate numbers already safe to print there — the same "every run" promise
+this section makes, minus a query count under 2 (a derangement needs at
+least two queries), which it states and skips cleanly instead of crashing.
 
 Idea taken from klypix-mcp, whose benchmark runs unlocked writers as a negative
 control and declares itself inconclusive if they lose nothing.
