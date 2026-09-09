@@ -62,8 +62,17 @@ PYTHONPATH= "$MEMCONTINUUM_PYTHON" bench/score.py
 `score.py` (no fastembed/PyYAML needed for `score.py`, `nomemory`, or
 `keyword` — only the `memcontinuum` runner's own subprocess call into
 `memidx.py` needs `$MEMCONTINUUM_PYTHON`, and it reads that variable
-itself). `--json` gets the same result as machine-readable JSON instead of
-a table. `--runner NAME[:mode]` (repeatable) selects a subset; see "Runner
+itself). `--json` gets the same result as a machine-readable envelope
+instead of a table: `{"runners": {<display name>: {"overall", "path",
+"question", "paraphrase", "exact-term", "plain", "errors"}}, "negative_
+control": {<display name>: {"real_mrr", "shuffled_mrr", "gain", "spread",
+"returns_nothing", "is_exempt_baseline", "separates"}, "verdict",
+"failed_runners"}}` — pinned by `tests/test_bench.py::TestJSONOutputShape`
+so a future change to this shape is a deliberate, visible diff, not a
+silent break. (Fix round: `negative_control`'s own per-runner keys changed
+again this pass — `reversed_mrr`/`min_gain` are gone, `shuffled_mrr`/
+`spread`/`is_exempt_baseline` are new — see "The negative control" below.)
+`--runner NAME[:mode]` (repeatable) selects a subset; see "Runner
 interface" below for what `NAME` can be. Everything runs strictly
 sequentially — several `memcontinuum:*` runner invocations share one
 on-disk SQLite index (see below), and concurrent writers to one SQLite file

@@ -27,11 +27,13 @@ does arithmetic on their output.
         fixtures/records/queries.json (PRIVATE, untracked) against a
         throwaway copy of the private incident corpus, the same
         construction tests/test_memidx.py::TestD5Paraphrase uses, and
-        prints ONLY the aggregate table -- never a query's own text or the
-        path substring it resolves against, so nothing private reaches
-        report.md or any other tracked output even by accident. Skips
-        cleanly, printing why, when fixtures/records/ is absent (a fresh
-        clone, or any checkout other than the one this was authored on).
+        prints ONLY the aggregate table plus the negative control's own
+        aggregate numbers (fix round, M3: "every run" now means this path
+        too) -- never a query's own text or the path substring it resolves
+        against, so nothing private reaches report.md or any other tracked
+        output even by accident. Skips cleanly, printing why, when
+        fixtures/records/ is absent (a fresh clone, or any checkout other
+        than the one this was authored on).
 """
 from __future__ import annotations
 
@@ -233,9 +235,10 @@ def run_all(queries: list[dict], corpus: Path, runner_specs: list[str], limit: i
 # are therefore EXACTLY equal (not approximately, not "usually"): gain is 0
 # for any query-blind ranker, for any R, on any query set, at any threshold.
 # The corollary is also correct behavior, not a loophole: two queries that
-# legitimately share the same expect (this corpus has three such pairs,
-# path-06/path-07, path-09/path-10, path-13/path-14, sharing a concept's
-# whole expansion) are mutually indistinguishable under a derangement that
+# legitimately share the same expect (this corpus has four such pairs,
+# path-01/path-20, path-06/path-07, path-09/path-10, path-13/path-14, each
+# sharing a concept's whole expansion) are mutually indistinguishable under
+# a derangement that
 # happens to pair them -- exactly as they should be, since a runner cannot
 # be faulted for not telling apart two queries whose correct answer is
 # identical.
@@ -251,9 +254,10 @@ def run_all(queries: list[dict], corpus: Path, runner_specs: list[str], limit: i
 # length. Any nonzero rotation has no fixed point (i + n/2 == i (mod n)
 # would require n/2 == 0 (mod n), false for 0 < n/2 < n), so this is a valid
 # derangement for any query count >= 2. Half the list length, rather than a
-# rotation by 1, is deliberate: three pairs of ADJACENT queries in
-# bench/queries.jsonl share an identical expect (see corollary above) purely
-# because they were authored next to each other, not because a derangement
+# rotation by 1, is deliberate: three of the four same-expect pairs above
+# are also ADJACENT in bench/queries.jsonl (path-01/path-20 is not -- 19
+# apart) purely because they were authored next to each other, not because
+# a derangement
 # should privilege pairing neighbors -- a rotate-by-1 derangement would pair
 # exactly those adjacent duplicates with each other on every run, which
 # weakens the control precisely where authoring order, not query content,
@@ -273,7 +277,16 @@ def run_all(queries: list[dict], corpus: Path, runner_specs: list[str], limit: i
 # comparing a MEAN gain against it penalizes exactly the runners that are
 # consistently, moderately better across many queries (division by sqrt(n)
 # is the textbook correction from "how noisy is one query" to "how noisy is
-# the mean of n queries," which is what the gain actually estimates).
+# the mean of n queries," which is what the gain actually estimates). The
+# multiplier on that standard error is 1x, not 2x or another value chosen
+# for a stricter confidence level: this control's job is a FLOOR (reject a
+# runner statistically indistinguishable from query-blind), not a
+# significance certificate, and the printed gain/spread numbers are exactly
+# what a reader needs to judge the margin for themselves -- widening the
+# multiplier only matters near the boundary, and every runner measured on
+# this corpus so far clears 1x SE by roughly an order of magnitude (see
+# bench-hardening's fix-round report for the actual before/after numbers),
+# so it has not yet been the deciding choice in practice.
 # Documented, known limitation of any threshold on a benchmark this size: a
 # runner correct on exactly one query and empty on every other one produces
 # a paired-difference distribution close to a single spike, whose standard
