@@ -191,11 +191,99 @@ def run_all(queries: list[dict], corpus: Path, runner_specs: list[str], limit: i
     return report
 
 
+# --- negative control -------------------------------------------------------
+#
+# A benchmark can report a flattering number while measuring almost nothing:
+# if the query set is so easy that a deliberately crippled runner scores the
+# same as the real one, the metric is not separating anything and the headline
+# figure is noise. The control answers "would this query set notice if the
+# ranking were destroyed?"
+#
+# The cripple is a deterministic reversal of each runner's own ranked output.
+# Reversal, not shuffling: it needs no random seed, it is reproducible on every
+# machine, and it moves a correct top-1 answer to the bottom of the list, which
+# is the strongest degradation available without inventing results the runner
+# never returned. A runner that returns nothing (the empty baseline) is
+# unaffected by definition, so it is excluded from the verdict rather than
+# counted as a failure.
+#
+# Threshold: the real run must beat its reversed twin by at least this much
+# mean reciprocal rank, overall. Below it the harness declares itself
+# INCONCLUSIVE and says so in the table and in --json, instead of printing a
+# number a reader would trust.
+NEGATIVE_CONTROL_MIN_MRR_GAIN = 0.05
+
+
+def reverse_report(report: dict) -> dict:
+    """The same report with every ranked list reversed and re-scored."""
+    out = {}
+    for display, data in report.items():
+        per_query = {}
+        for qid, metrics in data["per_query"].items():
+            ranked = list(reversed(metrics.get("ranked") or []))
+            expect = metrics.get("expect")
+            re_scored = dict(metrics)
+            if expect is not None:
+                re_scored = evaluate_query(expect, ranked)
+            re_scored["ranked"] = ranked
+            per_query[qid] = re_scored
+        out[display] = {"per_query": per_query, "errors": dict(data["errors"])}
+    return out
+
+
+def negative_control(report: dict, queries: list[dict]) -> dict:
+    """{runner: {"real": mrr, "reversed": mrr, "gain": float, "separates": bool}}
+    plus "verdict": "ok" | "inconclusive", naming the runners that failed."""
+    expect_by_id = {q["id"]: q["expect"] for q in queries}
+    seeded = {}
+    for display, data in report.items():
+        per_query = {}
+        for qid, metrics in data["per_query"].items():
+            m = dict(metrics)
+            m["expect"] = expect_by_id.get(qid)
+            per_query[qid] = m
+        seeded[display] = {"per_query": per_query, "errors": data["errors"]}
+    reversed_report = reverse_report(seeded)
+
+    result = {}
+    failed = []
+    for display, data in report.items():
+        real = aggregate(list(data["per_query"].values()))["mrr"]
+        rev = aggregate(list(reversed_report[display]["per_query"].values()))["mrr"]
+        returns_nothing = all(
+            not (m.get("ranked") or []) for m in data["per_query"].values()
+        )
+        separates = returns_nothing or (real - rev) >= NEGATIVE_CONTROL_MIN_MRR_GAIN
+        result[display] = {
+            "real_mrr": round(real, 4),
+            "reversed_mrr": round(rev, 4),
+            "gain": round(real - rev, 4),
+            "returns_nothing": returns_nothing,
+            "separates": separates,
+        }
+        if not separates:
+            failed.append(display)
+    result["verdict"] = "inconclusive" if failed else "ok"
+    result["failed_runners"] = failed
+    result["min_gain"] = NEGATIVE_CONTROL_MIN_MRR_GAIN
+    return result
+
+
 def summarize(report: dict, queries: list[dict]) -> dict:
     """{display_name: {"overall": {...}, "path": {...}, "question": {...},
-    "paraphrase": {...}, "errors": n}} -- a query with a runner error is
-    excluded from that runner's own aggregates (never silently scored as
-    zero, never silently dropped without a count)."""
+    "paraphrase": {...}, "exact-term": {...}, "plain": {...}, "errors": n}}
+    -- a query with a runner error is excluded from that runner's own
+    aggregates (never silently scored as zero, never silently dropped
+    without a count).
+
+    Three disjoint sub-slices of `question` by id prefix: "paraphrase"
+    (`para-`, zero shared vocabulary with the target -- see bench/README.md),
+    "exact-term" (`et-`, an error message/file name/symbol/flag/quoted
+    phrase a keyword search should nail -- INC-0115 step 2), and "plain"
+    (`kw-`, ordinary keyword-shaped developer questions, the baseline
+    "plain" slice INC-0115 step 4 measures a fix against for regressions).
+    `question` itself stays the union of all three (plus any other
+    question-kind query), unchanged, for backward compatibility."""
     by_id = {q["id"]: q for q in queries}
     out = {}
     for display, data in report.items():
@@ -209,6 +297,8 @@ def summarize(report: dict, queries: list[dict]) -> dict:
             "path": aggregate(subset(lambda q: q["kind"] == "path")),
             "question": aggregate(subset(lambda q: q["kind"] == "question")),
             "paraphrase": aggregate(subset(lambda q: q["id"].startswith("para-"))),
+            "exact-term": aggregate(subset(lambda q: q["id"].startswith("et-"))),
+            "plain": aggregate(subset(lambda q: q["id"].startswith("kw-"))),
             "errors": len(data["errors"]),
         }
     return out
@@ -219,7 +309,7 @@ def summarize(report: dict, queries: list[dict]) -> dict:
 # ---------------------------------------------------------------------------
 
 def print_table(summary: dict) -> None:
-    rows = ["overall", "path", "question", "paraphrase"]
+    rows = ["overall", "path", "question", "paraphrase", "exact-term", "plain"]
     header = f"{'runner':<22}{'slice':<11}{'n':>4}{'R@1':>7}{'R@3':>7}{'R@10':>7}{'MRR':>7}{'errors':>8}"
     print(header)
     print("-" * len(header))
@@ -338,15 +428,33 @@ def main(argv=None) -> int:
     corpus = Path(args.corpus)
     report = run_all(queries, corpus, runner_specs, args.limit)
     summary = summarize(report, queries)
+    control = negative_control(report, queries)
 
     if args.json:
-        print(json.dumps(summary, indent=2))
+        # keep the control OUT of `summary` itself: print_table and every
+        # consumer iterate summary's keys as runner names.
+        print(json.dumps({"runners": summary, "negative_control": control}, indent=2))
     else:
         print(f"{len(queries)} queries ({sum(1 for q in queries if q['kind']=='path')} path, "
               f"{sum(1 for q in queries if q['kind']=='question')} question, "
               f"{sum(1 for q in queries if q['id'].startswith('para-'))} paraphrase) "
               f"against corpus={corpus}\n")
         print_table(summary)
+        print()
+        print(f"negative control (ranking reversed; a runner must gain >= "
+              f"{control['min_gain']} MRR to count as separating):")
+        for display in [d for d in summary if d in control]:
+            c = control[display]
+            note = " (returns nothing by design)" if c["returns_nothing"] else ""
+            flag = "ok " if c["separates"] else "FLAT"
+            print(f"  {flag}  {display:22s} real {c['real_mrr']:.2f}  "
+                  f"reversed {c['reversed_mrr']:.2f}  gain {c['gain']:+.2f}{note}")
+        if control["verdict"] == "inconclusive":
+            print()
+            print("INCONCLUSIVE: " + ", ".join(control["failed_runners"])
+                  + " scored no better than their own reversed ranking. The query "
+                    "set does not separate a working ranking from a destroyed one, "
+                    "so these numbers say nothing about retrieval quality.")
         for display, data in report.items():
             for qid, msg in data["errors"].items():
                 print(f"ERROR  {display}  {qid}: {msg}", file=sys.stderr)

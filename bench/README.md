@@ -311,3 +311,27 @@ PYTHONPATH= "$MEMCONTINUUM_PYTHON" python -m unittest tests.test_bench -v
   ("which function implements X") than the decision-memory retrieval this
   harness measures ("which ruling governs X"). Nothing here runs against
   it, and nothing here claims to.
+
+## The negative control
+
+A benchmark can report a flattering number while separating nothing. If the
+query set is easy enough that a deliberately crippled runner scores the same as
+the real one, the metric is measuring the corpus rather than the retrieval, and
+the headline figure is noise.
+
+Every run therefore also scores each runner against its own **reversed**
+ranking. Reversal rather than shuffling: no random seed, reproducible
+everywhere, and it moves a correct top-1 answer to the bottom, which is the
+strongest degradation available without inventing results the runner never
+returned. A runner must beat its reversed twin by at least 0.05 mean
+reciprocal rank overall to count as separating. A runner that returns nothing
+by design (the empty baseline) is excluded from the verdict rather than counted
+as a failure.
+
+If any runner fails, the harness prints **INCONCLUSIVE**, names the runners,
+and says the numbers say nothing about retrieval quality. That verdict is in
+`--json` too, under `negative_control`. A published number without an `ok`
+verdict beside it should not be believed.
+
+Idea taken from klypix-mcp, whose benchmark runs unlocked writers as a negative
+control and declares itself inconclusive if they lose nothing.

@@ -483,3 +483,56 @@ class TestRunnersDoNotShadowStdlib(unittest.TestCase):
             if origin == "built-in" or "lib/python" in origin.replace("\\", "/"):
                 offenders.append(f"{script.name} shadows stdlib {name!r} ({origin})")
         self.assertEqual(offenders, [], "; ".join(offenders))
+
+
+class TestNegativeControl(unittest.TestCase):
+    """A benchmark can report a flattering number while separating nothing.
+    The control reverses each runner's own ranking and requires the real run
+    to beat its reversed twin; below the threshold the harness declares
+    itself inconclusive instead of printing a number a reader would trust."""
+
+    def _report(self, ranked_by_qid, expect_by_qid):
+        per_query = {}
+        for qid, ranked in ranked_by_qid.items():
+            m = score.evaluate_query(expect_by_qid[qid], ranked)
+            m["ranked"] = ranked
+            per_query[qid] = m
+        return {"r": {"per_query": per_query, "errors": {}}}
+
+    def _queries(self, expect_by_qid):
+        return [{"id": q, "kind": "question", "query": "q", "expect": e}
+                for q, e in expect_by_qid.items()]
+
+    def test_a_good_ranking_separates_from_its_reverse(self):
+        expect = {"q1": ["a"], "q2": ["b"]}
+        rep = self._report({"q1": ["a", "x", "y"], "q2": ["b", "x", "y"]}, expect)
+        c = score.negative_control(rep, self._queries(expect))
+        self.assertEqual(c["verdict"], "ok")
+        self.assertTrue(c["r"]["separates"])
+        self.assertGreater(c["r"]["gain"], score.NEGATIVE_CONTROL_MIN_MRR_GAIN)
+
+    def test_a_query_set_that_cannot_tell_them_apart_is_inconclusive(self):
+        # every expected id sits in the MIDDLE of a 3-long list, so reversing
+        # the ranking changes nothing: the query set separates nothing.
+        expect = {"q1": ["a"], "q2": ["b"]}
+        rep = self._report({"q1": ["x", "a", "y"], "q2": ["x", "b", "y"]}, expect)
+        c = score.negative_control(rep, self._queries(expect))
+        self.assertEqual(c["verdict"], "inconclusive")
+        self.assertIn("r", c["failed_runners"])
+        self.assertFalse(c["r"]["separates"])
+
+    def test_a_runner_that_returns_nothing_is_excluded_not_failed(self):
+        expect = {"q1": ["a"]}
+        rep = self._report({"q1": []}, expect)
+        c = score.negative_control(rep, self._queries(expect))
+        self.assertTrue(c["r"]["returns_nothing"])
+        self.assertTrue(c["r"]["separates"])
+        self.assertEqual(c["verdict"], "ok")
+
+    def test_the_live_corpus_separates_for_the_keyword_baseline(self):
+        # the real thing, not a fixture: if this ever goes inconclusive the
+        # query set has decayed and every published number is suspect.
+        queries = score.load_queries(QUERIES_PATH)
+        rep = score.run_all(queries, CORPUS, ["keyword"], 10)
+        c = score.negative_control(rep, queries)
+        self.assertEqual(c["verdict"], "ok", c)
