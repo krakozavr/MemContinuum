@@ -329,6 +329,18 @@ PYTHONPATH= "$MEMCONTINUUM_PYTHON" python -m unittest tests.test_bench -v
 
 ## Honest limitations
 
+- **A custom `--queries` file with fewer than 2 queries of some `kind` makes
+  the negative control traceback, uncaught, instead of running.** The
+  kind-preserving derangement (see "The negative control") needs at least 2
+  queries per kind group to build a same-kind pairing; `score.py --private`
+  guards this itself (its query set is a single kind, `question`, and it
+  checks `len(queries) >= 2` before calling the control), but `score.py`'s
+  main path does not. Not a live problem for this file's own 57-query set
+  (20 `path`, 37 `question`, nowhere near the boundary) — documented as a
+  known limit of a custom query set, not fixed, because the right behavior
+  (skip the lone-kind query? skip the whole control? skip just that kind?)
+  is a design decision for whoever hits it with a real query set, not one
+  worth guessing at in the abstract.
 - **The corpus is synthetic.** "Driftwood" does not exist. A real
   project's decisions are messier — inconsistent authoring, real
   disagreement between rulings, records nobody had time to write well.

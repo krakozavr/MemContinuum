@@ -281,23 +281,29 @@ def run_all(queries: list[dict], corpus: Path, runner_specs: list[str], limit: i
 #   already cached as `ranked[perm(i)]` -- the runner cannot know it is
 #   being fed a "deranged" query; feeding it query perm(i)'s own real input
 #   is indistinguishable, to the runner, from having been asked query
-#   perm(i) honestly. So the re-run design's "shuffled" score for slot i,
-#   `score(expect_i, ranked[perm(i)])`, is the SAME family of quantity as
-#   the label-shuffle design's `score(expect_perm(i), ranked_i)` -- literally
-#   equal once you substitute j = perm(i), modulo using perm's inverse
-#   instead of perm. It is the identical test at 2x the cost (a second full
-#   subprocess pass per runner, doubling wall-clock time and doubling
-#   exposure to timeouts/flakiness for anything that shells out, e.g. the
-#   `memcontinuum` runners), and it does NOT close anything label-shuffle
-#   cannot: empirically, re-running con_inc.py (this file's counterexample
-#   fixture, kept as a test fixture below) against the OLD, non-kind-
-#   preserving corpus-wide derangement gave gain +0.115, an even LARGER
-#   pass margin than the label-shuffle version's +0.084 on the same
-#   derangement -- re-running bought nothing because the leak was never
-#   about staleness of the cached output, it was about the derangement
-#   crossing kinds. Kind-preserving derangement closes the identified leak
-#   at zero extra cost; re-running does not close it at all unless the
-#   derangement is ALSO made kind-preserving, at which point re-running adds
+#   perm(i) honestly. VERIFIED, not just argued: re-running con_inc.py
+#   against every one of the 57 queries reproduced its cached output at
+#   perm(i) byte-for-byte, 0 mismatches out of 57. So the re-run design's
+#   "shuffled" score for slot i, `score(expect_i, ranked[perm(i)])`, is the
+#   SAME family of quantity as the label-shuffle design's
+#   `score(expect_perm(i), ranked_i)` -- literally equal once you substitute
+#   j = perm(i), modulo using perm's inverse instead of perm. VERIFIED: on
+#   the OLD, non-kind-preserving corpus-wide half-rotation, re-running
+#   con_inc.py gave real 0.121345, shuffled 0.005848, gain +0.115497;
+#   label-shuffling the SAME cached output under that derangement's inverse
+#   permutation (offset 29, not 28) gave real 0.121345, shuffled 0.005848,
+#   gain +0.115497 -- identical to 6 decimal places, exactly as the
+#   substitution predicts. It is the identical test at 2x the cost (a
+#   second full subprocess pass per runner, doubling wall-clock time and
+#   doubling exposure to timeouts/flakiness for anything that shells out,
+#   e.g. the `memcontinuum` runners), and it does NOT close anything
+#   label-shuffle cannot: that same +0.115 re-run gain is an even LARGER
+#   pass margin than the label-shuffle version's +0.084 on the SAME
+#   (forward) derangement -- re-running bought nothing because the leak was
+#   never about staleness of the cached output, it was about the
+#   derangement crossing kinds. Kind-preserving derangement closes the
+#   identified leak at zero extra cost; re-running does not close it at all
+#   unless the derangement is ALSO made kind-preserving, at which point re-running adds
 #   cost without adding power over the cheaper design already chosen.
 #
 # Why kind-preserving derangement is immune to BOTH reviewers' counterexample
@@ -460,7 +466,22 @@ def _kind_preserving_derangement(queries: list[dict]) -> dict[str, str]:
     two queries of different `kind` -- one single-cycle rotation per kind
     group (see `_coprime_offset_near_half`), as {id: paired_id}. See the
     module comment above `negative_control` for why crossing `kind` in the
-    derangement is exactly the leak fix round 2 closed."""
+    derangement is exactly the leak fix round 2 closed.
+
+    KNOWN LIMIT, not fixed here: a kind group with fewer than 2 queries has
+    no valid derangement partner and raises (below), uncaught, all the way
+    out of `negative_control` -- unlike `run_private_gate`, which checks
+    `len(queries) >= 2` up front and skips cleanly (its query set is all
+    `question`, a single group, so that check is sufficient for it). The
+    public 57-query set (20 `path`, 37 `question`) is never near this
+    boundary. A custom `--queries` file with, say, exactly one `path` query
+    and several `question` ones would traceback here where the pre-fix-
+    round-2 code (one derangement over the whole list) would have run.
+    Documented rather than fixed: skipping a lone-kind query's own
+    participation silently would need its own decision about whether the
+    REST of the control can still run without it, which is a design
+    question for whoever hits this in practice, not a corner worth guessing
+    at without a real case in front of it."""
     by_kind: dict[str, list[str]] = {}
     for q in queries:
         by_kind.setdefault(q["kind"], []).append(q["id"])
@@ -538,7 +559,24 @@ def negative_control(report: dict, queries: list[dict]) -> dict:
             # support a verdict either way.
             separates = False
         else:
-            separates = gain > se
+            # A runner correct on exactly one query, empty everywhere else,
+            # is an EXACT algebraic tie between gain and sample SE (both
+            # equal 1/n -- see the module comment) for any n. Floating-point
+            # arithmetic does not reliably preserve that tie: gain and se
+            # are each the result of a different chain of roundings (a mean
+            # vs. a Bessel-corrected variance's square root divided by
+            # sqrt(n)). Swept empirically across n = 2..1000, the raw
+            # (unrounded) comparison landed on the PASSING side at n in
+            # {5, 10, 20} and the failing side everywhere else tried
+            # (including this benchmark's own n=57) -- pure rounding noise,
+            # not a property of those particular sizes, and nothing stops a
+            # future query count (this benchmark's own, or a private query
+            # set's) from landing on the wrong side by the same accident.
+            # `gain > se` alone would make this round's one-hit fix
+            # illusory whenever that happens. An explicit near-tie guard
+            # makes the decision independent of which way rounding falls:
+            # a tie is not a pass, on any n.
+            separates = gain > se and not math.isclose(gain, se, rel_tol=1e-9, abs_tol=1e-12)
 
         result[display] = {
             "real_mrr": round(real, 4),

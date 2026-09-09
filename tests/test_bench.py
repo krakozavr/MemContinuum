@@ -801,6 +801,40 @@ if __name__ == "__main__":
     sys.exit(main())
 '''
 
+# Codex's own counterexample from the re-gate (a distinct shape from
+# Grok's above, kept as its own fixture per the brief's literal ask to keep
+# BOTH reviewers' scripts): "a runner returning the same corpus-class
+# ranking for every path (CON, then TOP, then INC) and another fixed
+# ranking for every question (INC, then TOP, then CON)" -- still never
+# reads --query, but interleaves all three id classes instead of only two.
+_CODEX_KIND_SPLIT_RUNNER = '''#!/usr/bin/env python
+"""Codex's re-gate counterexample: a fixed corpus-class ranking per kind,
+covering all three id classes (CON/TOP/INC), never reading --query."""
+import argparse, sys
+
+CON = ["CON-301", "CON-302", "CON-303", "CON-304"]
+TOP = ["TOP-101", "TOP-102", "TOP-103", "TOP-104", "TOP-105", "TOP-106",
+       "TOP-107", "TOP-108", "TOP-109", "TOP-110", "TOP-111", "TOP-112",
+       "TOP-113", "TOP-114", "TOP-115", "TOP-116", "TOP-117", "TOP-118",
+       "TOP-119", "TOP-120", "TOP-121", "TOP-122"]
+INC = ["INC-201", "INC-202", "INC-203", "INC-204", "INC-205", "INC-206"]
+
+def main(argv=None):
+    p = argparse.ArgumentParser()
+    p.add_argument("--corpus", required=True)
+    p.add_argument("--kind", required=True)
+    p.add_argument("--query", required=True)
+    p.add_argument("--limit", type=int, default=10)
+    p.add_argument("--mode", default=None)
+    args = p.parse_args(argv)
+    out = (CON + TOP + INC) if args.kind == "path" else (INC + TOP + CON)
+    print("\\n".join(out[:args.limit] if args.limit else out))
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
 
 class TestKindPreservingDerangementClosesTheKindLeak(unittest.TestCase):
     """R1 (fix round 2, Codex 1 BLOCKING / Grok 1 MAJOR on re-gate): the
@@ -827,6 +861,27 @@ class TestKindPreservingDerangementClosesTheKindLeak(unittest.TestCase):
             rep = score.run_all(queries, CORPUS, [str(script)], 10)
             c = score.negative_control(rep, queries)
         display = "con_inc"
+        self.assertIn(display, c)
+        self.assertAlmostEqual(c[display]["gain"], 0.0, places=9,
+                                msg="a runner that only ever reads --kind must score "
+                                    "EXACTLY zero gain under a kind-preserving derangement")
+        self.assertFalse(c[display]["separates"])
+        self.assertEqual(c["verdict"], "inconclusive")
+        self.assertIn(display, c["failed_runners"])
+
+    def test_codexs_own_kind_split_counterexample_also_scores_exactly_zero_gain(self):
+        """Codex's counterexample is a distinct shape from Grok's above (all
+        three id classes, interleaved differently per kind) -- kept as its
+        own fixture rather than assuming one proof stands for both, per the
+        brief's explicit ask to keep both reviewers' scripts."""
+        queries = score.load_queries(QUERIES_PATH)
+        with tempfile.TemporaryDirectory() as td:
+            script = Path(td) / "codex_kindsplit.py"
+            script.write_text(_CODEX_KIND_SPLIT_RUNNER, encoding="utf-8")
+            script.chmod(0o755)
+            rep = score.run_all(queries, CORPUS, [str(script)], 10)
+            c = score.negative_control(rep, queries)
+        display = "codex_kindsplit"
         self.assertIn(display, c)
         self.assertAlmostEqual(c[display]["gain"], 0.0, places=9,
                                 msg="a runner that only ever reads --kind must score "
@@ -890,20 +945,31 @@ class TestSampleStandardErrorReplacesPopulation(unittest.TestCase):
     ALWAYS pass -- for a single 1.0 among (n-1) zeros, mean > population_se
     reduces algebraically to sqrt(n) > sqrt(n-1), true for every n. The
     sample-SD version makes that an EXACT algebraic tie (mean == sample_se
-    == 1/n), so the strict `gain > se` correctly reports it as not
-    separating. This is a floor-arithmetic fix, not a claim that every
-    one-hit-shaped runner now fails -- see bench/score.py's negative_control
-    module comment for why a real single correct answer nobody else could
-    reproduce by chance can still legitimately separate."""
+    == 1/n) -- but floating point does not reliably preserve an exact
+    algebraic tie (gain and se are each the end of a DIFFERENT chain of
+    roundings: a plain mean vs. a Bessel-corrected variance's square root
+    divided by sqrt(n)). Swept across n = 2..1000 with `gain > se` alone
+    (no tie guard), the comparison landed on the PASSING side at n in
+    {5, 10, 20} -- Codex's own re-gate report specifically flagged n=10 as
+    still passing. `negative_control` now requires the gain to clear se by
+    more than a `math.isclose` tolerance, not just be numerically greater;
+    this test sweeps every n in that swept set (plus a few more) to prove
+    the tie fails on ALL of them now, not just the corpus's own n=57. This
+    is a floor-arithmetic fix, not a claim that every one-hit-shaped runner
+    now fails -- see bench/score.py's negative_control module comment for
+    why a real single correct answer nobody else could reproduce by chance
+    can still legitimately separate."""
 
-    def test_one_hit_among_many_empties_is_now_a_tie_not_a_guaranteed_pass(self):
-        n = 57
-        expect = {f"q{i}": [f"ans{i}"] for i in range(n)}
-        ranked = {f"q{i}": (["ans0"] if i == 0 else []) for i in range(n)}
-        rep = TestNegativeControl()._report(ranked, expect, display="one-hit")
-        c = score.negative_control(rep, TestNegativeControl()._queries(expect))
-        self.assertAlmostEqual(c["one-hit"]["gain"], c["one-hit"]["se"], places=9)
-        self.assertFalse(c["one-hit"]["separates"])
+    def test_one_hit_among_many_empties_is_a_tie_not_a_pass_at_every_swept_n(self):
+        for n in (2, 3, 4, 5, 10, 20, 57, 100, 200, 1000):
+            with self.subTest(n=n):
+                expect = {f"q{i}": [f"ans{i}"] for i in range(n)}
+                ranked = {f"q{i}": (["ans0"] if i == 0 else []) for i in range(n)}
+                rep = TestNegativeControl()._report(ranked, expect, display="one-hit")
+                c = score.negative_control(rep, TestNegativeControl()._queries(expect))
+                self.assertAlmostEqual(c["one-hit"]["gain"], c["one-hit"]["se"], places=4,
+                                        msg=f"n={n}: gain and se should be an algebraic tie (1/n)")
+                self.assertFalse(c["one-hit"]["separates"], f"n={n}: a tie must not pass")
 
 
 if __name__ == "__main__":
