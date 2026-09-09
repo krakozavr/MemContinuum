@@ -948,26 +948,45 @@ class TestSampleStandardErrorReplacesPopulation(unittest.TestCase):
     == 1/n) -- but floating point does not reliably preserve an exact
     algebraic tie (gain and se are each the end of a DIFFERENT chain of
     roundings: a plain mean vs. a Bessel-corrected variance's square root
-    divided by sqrt(n)). Swept across n = 2..1000 with `gain > se` alone
-    (no tie guard), the comparison landed on the PASSING side at n in
-    {5, 10, 20} -- Codex's own re-gate report specifically flagged n=10 as
-    still passing. `negative_control` now requires the gain to clear se by
-    more than a `math.isclose` tolerance, not just be numerically greater;
-    this test sweeps every n in that swept set (plus a few more) to prove
-    the tie fails on ALL of them now, not just the corpus's own n=57. This
-    is a floor-arithmetic fix, not a claim that every one-hit-shaped runner
-    now fails -- see bench/score.py's negative_control module comment for
-    why a real single correct answer nobody else could reproduce by chance
-    can still legitimately separate."""
+    divided by sqrt(n)). Swept across n = 2..1000 with `gain > se` alone (no
+    tie guard), the raw comparison lands on the PASSING side at 149 of
+    those 999 values, starting at n = 5, 10, 20, 40, 51, 58, ... (fix round
+    3, re-gate: the prior version of this docstring said only "{5, 10, 20}"
+    and this test sampled ten hand-picked n and compared already-rounded
+    gain/se rather than reproducing that count -- Grok's re-gate actually
+    drove the raw, unrounded comparison and found the fuller set. This test
+    does not itself re-derive that 149-of-999 count (it checks the guarded
+    `separates` decision, not the raw pre-guard comparison); it sweeps that
+    whole n = 2..1000 range, exactly, not a sample of it, so every n Grok
+    found on the passing side is actually exercised here, guard included).
+    `negative_control` now requires the gain to clear se by more than a
+    `math.isclose` tolerance, not just be numerically greater; this test
+    sweeps EVERY n from 2 to 1000 inclusive to prove the tie fails on ALL
+    of them now, not just the corpus's own n=57 or the ten values a sample
+    would have picked. This is a floor-arithmetic fix, not a claim that
+    every one-hit-shaped runner now fails -- see bench/score.py's
+    negative_control module comment for why a real single correct answer
+    nobody else could reproduce by chance can still legitimately separate."""
 
-    def test_one_hit_among_many_empties_is_a_tie_not_a_pass_at_every_swept_n(self):
-        for n in (2, 3, 4, 5, 10, 20, 57, 100, 200, 1000):
+    def test_one_hit_among_many_empties_is_a_tie_not_a_pass_at_every_n_from_2_to_1000(self):
+        for n in range(2, 1001):
             with self.subTest(n=n):
                 expect = {f"q{i}": [f"ans{i}"] for i in range(n)}
                 ranked = {f"q{i}": (["ans0"] if i == 0 else []) for i in range(n)}
                 rep = TestNegativeControl()._report(ranked, expect, display="one-hit")
                 c = score.negative_control(rep, TestNegativeControl()._queries(expect))
-                self.assertAlmostEqual(c["one-hit"]["gain"], c["one-hit"]["se"], places=4,
+                # gain and se are each rounded (for display) from a DIFFERENT
+                # chain of floating-point roundings -- see this class's
+                # docstring -- so their rounded values can differ by a unit
+                # in the last printed place (observed at n=160: 0.0063 vs
+                # 0.0062, both from the same exact 1/160) without that being
+                # a defect; places=3 tolerates that display noise while
+                # still failing if gain and se were not close to the same
+                # algebraic quantity. The real assertion of correctness is
+                # `separates` below, computed from the RAW (unrounded)
+                # gain/se plus the `math.isclose` tie guard, not from these
+                # rounded display values.
+                self.assertAlmostEqual(c["one-hit"]["gain"], c["one-hit"]["se"], places=3,
                                         msg=f"n={n}: gain and se should be an algebraic tie (1/n)")
                 self.assertFalse(c["one-hit"]["separates"], f"n={n}: a tie must not pass")
 

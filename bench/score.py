@@ -648,13 +648,17 @@ def negative_control(report: dict, queries: list[dict]) -> dict:
             # arithmetic does not reliably preserve that tie: gain and se
             # are each the result of a different chain of roundings (a mean
             # vs. a Bessel-corrected variance's square root divided by
-            # sqrt(n)). Swept empirically across n = 2..1000, the raw
-            # (unrounded) comparison landed on the PASSING side at n in
-            # {5, 10, 20} and the failing side everywhere else tried
-            # (including this benchmark's own n=57) -- pure rounding noise,
-            # not a property of those particular sizes, and nothing stops a
-            # future query count (this benchmark's own, or a private query
-            # set's) from landing on the wrong side by the same accident.
+            # sqrt(n)). Swept exhaustively across n = 2..1000 (fix round 3,
+            # re-gate: the previous comment here undercounted this -- Grok
+            # actually drove the raw, unrounded comparison and found the
+            # PASSING side at 149 of those 999 values, starting at n=5, 10,
+            # 20, 40, 51, 58, ... -- not just the three this comment used to
+            # name), the raw comparison lands on the passing side often
+            # enough that it is pure rounding noise, not a property of a
+            # handful of particular sizes, and nothing stops a future query
+            # count (this benchmark's own n=57, which is NOT among the 149,
+            # or a private query set's) from landing on the wrong side by
+            # the same accident.
             # `gain > se` alone would make this round's one-hit fix
             # illusory whenever that happens. An explicit near-tie guard
             # makes the decision independent of which way rounding falls:
