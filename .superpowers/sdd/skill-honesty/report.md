@@ -149,3 +149,34 @@ engine repo's own gitignored store, not part of the task).
 - Full suite in foreground (600000 ms timeout)
 - `bash tests/run_bash32.sh`
 - Two dry-run verifications (`/mnt/c` path and `$HOME` path)
+
+## S4 — `templates/memcontinuum-rules.md` audit — no change
+
+Read the full template (27 lines). It contains no restated repo-init.sh/mc-registry-lib.sh-computed
+value in the audited pattern ("refuses X" / "defaults to Y" / "must match Z") — no store location,
+no refusal logic, no project-name regex, nothing from the installer's decision-making at all. Its
+content is:
+- where to write what (store vs. Claude Code auto-memory) — a *policy* choice, not a code-computed
+  fact;
+- the authority-label vocabulary (owner-verbatim / owner-ratified / agent-inference /
+  reviewer-finding / code-derived) — this is `docs/SCHEMA.md`'s vocabulary, a stable schema
+  contract, not something repo-init.sh computes;
+- "committing the store reindexes it" — describes the store's own post-commit hook's behaviour
+  (a real, stable fact about this system, referenced identically in README.md/INTERNALS.md), not a
+  value repo-init.sh derives that could point somewhere else tomorrow.
+
+No edit made. Confirmed via `mc_render_fingerprint` (`scripts/mc-registry-lib.sh:982-1075`) that
+`templates/*` is a **`repo`**-scope render input (not `machine`) — so even if this file had needed
+an edit, it would only ever flip the *per-repo* fingerprint (the row a repo's own
+`memcontinuum-update.sh` walk checks), never the machine-level one. Since it is unmodified, and
+`scripts/repo-init.sh` itself is unmodified by this task, the repo-scope fingerprint is unaffected
+by this change entirely.
+
+The `skills/memcontinuum/SKILL.md` edits (S1/S2/S3/S5, commit f21d877) **are** a `machine`-scope
+render input (`mc_render_fingerprint`'s `machine` branch lists
+`skills/memcontinuum/SKILL.md` explicitly, alongside `memcontinuum-setup.sh` and
+`scripts/mc_settings_merge.py`). So this task's real effect on the fingerprint machinery is: the
+one machine-wide render row goes stale (fixed by `memcontinuum-update.sh --apply --machine`);
+per-repo rows are untouched. This corrects the brief's S4 note ("it will flip every wired row to
+stale") — that would only be true had `templates/memcontinuum-rules.md` or `repo-init.sh` itself
+been edited, which they were not.
