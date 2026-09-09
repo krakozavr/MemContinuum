@@ -14,6 +14,7 @@ a public-facing doc. These are the two mechanical halves of that rule:
 2. docs/INTERNALS.md exists and the README links it exactly where a maintainer
    would look for it.
 """
+import contextlib
 import os
 import re
 import subprocess
@@ -969,11 +970,19 @@ class TestSkillHonesty(unittest.TestCase):
          "the Windows-mounted-drive default-location rule repo-init.sh computes"),
         (re.compile(r'\$HOME/dev\b'),
          "the WSL default store location repo-init.sh computes"),
-        (re.compile(r'--store\b.{0,60}requires?\b.{0,60}--claude-dir', re.IGNORECASE | re.DOTALL),
+        (re.compile(
+            r'--store\b.{0,80}(?:requires?|must\s+(?:be\s+)?(?:paired|accompanied)|needs?)'
+            r'\b.{0,80}--claude-dir',
+            re.IGNORECASE | re.DOTALL,
+         ),
          "the --store/--claude-dir pairing repo-init.sh already enforces and reports"),
         (re.compile(r'inside an existing git repo', re.IGNORECASE),
          "the nested-repo refusal message repo-init.sh already prints"),
-        (re.compile(r'\bfive hooks\b', re.IGNORECASE),
+        # Widened from a literal "five hooks" (regate round 2, Grok N6): a
+        # mutation reworded this as "five write-side hooks" and slipped
+        # through the exact two-word phrase. Up to two words may sit between
+        # the count and "hooks" now.
+        (re.compile(r'\bfive\b(?:\s+\S+){0,2}\s+hooks\b', re.IGNORECASE),
          "a hardcoded hook count (the write-side count is a fact of the templates, not this prose)"),
     ]
 
@@ -1175,19 +1184,61 @@ class TestSkillHonesty(unittest.TestCase):
 
 
 class TestSkillHonestyMutations(unittest.TestCase):
-    """Proves the pinned tests above actually catch what they claim to.
-    Both reviewers mutated a copy of SKILL.md and reported that every one of
-    the ORIGINAL TestSkillHonesty's eight tests still passed against it.
-    Each test here re-applies one of those mutations to SKILL.md's text IN
-    MEMORY (never touches the real file, never runs `unittest` as a
-    subprocess) and asserts the specific assertion that should catch it now
-    raises. A mutation whose regex/replace finds nothing to change is a
-    stale fixture, not a passing test -- guarded by assertNotEqual against
-    the unmutated text first."""
+    """Proves the pinned tests above actually catch what they claim to --
+    against the REAL production assertions, not a second, independently
+    written check that merely replicates what the guard is supposed to do.
+
+    Fix round 3 (skill-honesty re-gate, Codex 5 / Grok 5): the previous
+    version of this class re-implemented each assertion inline (comparing
+    `_state_options()` output, or re-scanning FORBIDDEN_PATTERNS, by hand)
+    instead of calling the `TestSkillHonesty` method it claimed to be
+    proving. Codex demonstrated the gap by replacing every production
+    honesty test with a no-op in memory and reran this class: all eight
+    still passed. That made this class fixture coverage, not proof.
+
+    Every test below now uses `_mutated_skill()` to point the shared module
+    global `SKILL` at a temp file holding the mutated text, then calls the
+    actual bound `TestSkillHonesty` test method by name -- the same method
+    that runs in the real suite, reading `SKILL.read_text()` itself. If a
+    future edit ever weakens or deletes the underlying production
+    assertion, the corresponding test here fails too, because there is no
+    second copy of the logic left to keep passing on its own.
+
+    A mutation whose regex/replace finds nothing to change is a stale
+    fixture, not a passing test -- guarded by assertNotEqual against the
+    unmutated text first."""
 
     def setUp(self):
         self.text = SKILL.read_text()
-        self.honesty = TestSkillHonesty()
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _mutated_skill(mutated_text):
+        """Point the module-level SKILL global at a temp file holding
+        `mutated_text` for the duration of the `with` block, then restore
+        it. Test methods on TestSkillHonesty reference the bare module
+        global `SKILL` (resolved at call time, not bound to `self`), so
+        this makes their own `SKILL.read_text()` read the mutation."""
+        global SKILL
+        real_skill = SKILL
+        fd, tmp_name = tempfile.mkstemp(suffix=".md")
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(mutated_text)
+            SKILL = tmp_path
+            yield
+        finally:
+            SKILL = real_skill
+            tmp_path.unlink(missing_ok=True)
+
+    def _assert_production_test_catches(self, mutated_text, test_name):
+        with self._mutated_skill(mutated_text):
+            with self.assertRaises(
+                AssertionError,
+                msg=f"TestSkillHonesty.{test_name} did not fail against the mutation",
+            ):
+                getattr(TestSkillHonesty(test_name), test_name)()
 
     def test_dropping_a_wired_option_is_caught(self):
         mutated = self.text.replace(
@@ -1197,11 +1248,7 @@ class TestSkillHonestyMutations(unittest.TestCase):
             "1. Keep as is — nothing changes\n",
         )
         self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
-        with self.assertRaises(AssertionError):
-            self.assertEqual(
-                self.honesty._state_options(mutated, "**`wired`**", "**`declined`**"),
-                self.honesty._state_options(self.text, "**`wired`**", "**`declined`**"),
-            )
+        self._assert_production_test_catches(mutated, "test_wired_names_both_options_exactly")
 
     def test_reordering_partial_wired_options_is_caught(self):
         mutated = self.text.replace(
@@ -1213,11 +1260,7 @@ class TestSkillHonestyMutations(unittest.TestCase):
             "3. Not now — leave it half-wired; asked again next session\n",
         )
         self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
-        with self.assertRaises(AssertionError):
-            self.assertEqual(
-                self.honesty._state_options(mutated, "**`partial-wired`**", "**`wired`**"),
-                self.honesty._state_options(self.text, "**`partial-wired`**", "**`wired`**"),
-            )
+        self._assert_production_test_catches(mutated, "test_partial_wired_names_all_three_options_exactly")
 
     def test_adding_an_extra_undecided_option_is_caught(self):
         mutated = self.text.replace(
@@ -1228,19 +1271,13 @@ class TestSkillHonestyMutations(unittest.TestCase):
             "**`partial-wired`**",
         )
         self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
-        with self.assertRaises(AssertionError):
-            self.assertEqual(
-                len(self.honesty._state_options(mutated, "**`undecided`**", "**`partial-wired`**")),
-                len(self.honesty._state_options(self.text, "**`undecided`**", "**`partial-wired`**")),
-            )
+        self._assert_production_test_catches(mutated, "test_undecided_names_all_four_options_exactly")
 
     def test_making_the_dry_run_optional_is_caught(self):
         mutated = self.text.replace("Always dry-run first, show the plan, then run it.",
                                      "Optionally dry-run first, show the plan, then run it.")
         self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
-        section = TestSkillHonesty._section(mutated, "## 3. Act on the answer", "## 4. Reversing")
-        normalized = " ".join(section.split())
-        self.assertNotIn("Always dry-run first, show the plan, then run it.", normalized)
+        self._assert_production_test_catches(mutated, "test_dry_run_is_never_optional")
 
     def test_allowing_store_deletion_is_caught(self):
         mutated = self.text.replace(
@@ -1248,10 +1285,7 @@ class TestSkillHonestyMutations(unittest.TestCase):
             "1. Keep declined\n2. Wire it after all\n3. Delete the store and start over\n",
         )
         self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
-        with self.assertRaises(AssertionError):
-            for start, end in TestSkillHonesty.STATE_MARKERS:
-                for opt in self.honesty._state_options(mutated, start, end):
-                    self.assertIsNone(re.search(r'delete', opt, re.IGNORECASE), opt)
+        self._assert_production_test_catches(mutated, "test_no_option_ever_reads_as_deleting_a_store")
 
     def test_reintroducing_the_wsl_rule_in_different_words_is_caught(self):
         mutated = self.text.replace(
@@ -1260,20 +1294,18 @@ class TestSkillHonestyMutations(unittest.TestCase):
             "$HOME/dev.\n\n**`undecided`** — four options:",
         )
         self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
-        with self.assertRaises(AssertionError):
-            for pattern, _label in TestSkillHonesty.FORBIDDEN_PATTERNS:
-                self.assertIsNone(pattern.search(mutated))
+        self._assert_production_test_catches(mutated, "test_no_computed_rule_restated_in_different_wording")
 
     def test_deleting_the_never_delete_rule_is_caught(self):
         mutated = self.text.replace(
             "- Never delete a store, ever, regardless of what is asked. Never move one\n"
-            "  either — this skill has no flow that relocates a store.\n",
+            "  on your own judgment either — step 4's relocation path is a deliberate,\n"
+            "  human-directed command, never something this skill decides or automates\n"
+            "  by itself.\n",
             "",
         )
         self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
-        rules = mutated[mutated.index("## 5. Rules"):]
-        with self.assertRaises(AssertionError):
-            self.assertIn("Never delete a store, ever", rules)
+        self._assert_production_test_catches(mutated, "test_no_option_ever_deletes_a_store_is_a_stated_rule")
 
     def test_restoring_the_claude_dir_requirement_is_caught(self):
         mutated = self.text.replace(
@@ -1283,9 +1315,32 @@ class TestSkillHonestyMutations(unittest.TestCase):
             1,
         )
         self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
-        with self.assertRaises(AssertionError):
-            for pattern, _label in TestSkillHonesty.FORBIDDEN_PATTERNS:
-                self.assertIsNone(pattern.search(mutated))
+        self._assert_production_test_catches(mutated, "test_no_computed_rule_restated_in_different_wording")
+
+    def test_widened_hook_count_rewording_is_caught(self):
+        # Regate round 2, Grok N6: "five write-side hooks" slipped past the
+        # old literal "five hooks" FORBIDDEN_PATTERNS entry. Proves the
+        # widened pattern (see FORBIDDEN_PATTERNS above) now catches it via
+        # the real production test, not just a standalone regex check.
+        mutated = self.text.replace(
+            "## 5. Rules",
+            "This wiring always installs five write-side hooks.\n\n## 5. Rules",
+            1,
+        )
+        self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
+        self._assert_production_test_catches(mutated, "test_no_computed_rule_restated_in_different_wording")
+
+    def test_rewording_the_store_claude_dir_pairing_without_requires_is_caught(self):
+        # Regate round 2, Grok N1: "--store must be paired with --claude-dir"
+        # (no "requires") slipped past the old requires?-only pattern.
+        mutated = self.text.replace(
+            "## 3. Act on the answer",
+            "An explicit --store must be paired with an explicit --claude-dir.\n\n"
+            "## 3. Act on the answer",
+            1,
+        )
+        self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
+        self._assert_production_test_catches(mutated, "test_no_computed_rule_restated_in_different_wording")
 
 
 if __name__ == "__main__":
