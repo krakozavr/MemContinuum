@@ -66,12 +66,15 @@ itself). `--json` gets the same result as a machine-readable envelope
 instead of a table: `{"runners": {<display name>: {"overall", "path",
 "question", "paraphrase", "exact-term", "plain", "errors"}}, "negative_
 control": {<display name>: {"real_mrr", "shuffled_mrr", "gain", "spread",
-"returns_nothing", "is_exempt_baseline", "separates"}, "verdict",
+"se", "returns_nothing", "is_exempt_baseline", "separates"}, "verdict",
 "failed_runners"}}` — pinned by `tests/test_bench.py::TestJSONOutputShape`
 so a future change to this shape is a deliberate, visible diff, not a
 silent break. (Fix round: `negative_control`'s own per-runner keys changed
 again this pass — `reversed_mrr`/`min_gain` are gone, `shuffled_mrr`/
-`spread`/`is_exempt_baseline` are new — see "The negative control" below.)
+`spread`/`is_exempt_baseline` are new. Fix round 2: `se` is new — the
+`spread` field is the raw sample standard deviation of the per-query paired
+differences; `se` is what the pass/fail decision actually compares `gain`
+against (`spread / sqrt(n)`) — see "The negative control" below.)
 `--runner NAME[:mode]` (repeatable) selects a subset; see "Runner
 interface" below for what `NAME` can be. Everything runs strictly
 sequentially — several `memcontinuum:*` runner invocations share one
@@ -390,6 +393,17 @@ query set is easy enough that a runner ignoring the query entirely scores as
 well as the real one, the metric is measuring the corpus rather than the
 retrieval, and the headline figure is noise.
 
+**What this control actually claims (narrowed, fix round 2).** It catches a
+runner that ignores the query TEXT and, at most, branches on `kind` — the one
+other channel `score.py` hands a runner separately from the query text (see
+"Runner interface" above: `--kind` and `--query` are both passed). It is
+**not** a general proof that "any query-blind runner fails" — a runner that
+reads the query text and branches on some OTHER signal uncorrelated with
+`kind` is not provably caught by this design. `kind` is the one channel
+targeted because it is the one this benchmark's own CLI contract hands a
+runner outside the query text, and it is the one two independent external
+reviewers demonstrated a working exploit against.
+
 **Fix-round history.** The first version of this control reversed each
 runner's own ranked output and rescored it against the SAME query's expect.
 Two external reviews (Codex, Grok) independently proved that tests ranking
@@ -400,34 +414,64 @@ reversing a length-1 list or a match-set whose order is not a ranking at all
 (this file's own `path` kind) is a no-op — MRR cannot change, so all 20 `path`
 queries were structurally invisible to it regardless of the runner.
 
-**What it does now.** Every run also scores each runner against a
-**query-shuffled** twin: each query's already-computed ranked output is
-rescored against a *different* query's expected answer, the pairing fixed by
-a deterministic derangement (no fixed point) of the query id list — a
-half-length rotation, no random seed, reproducible everywhere (see
-`bench/score.py`'s `negative_control` for the full derivation, including an
-algebraic proof that a query-blind runner's gain is EXACTLY zero under this
-design, and why a length-1/match-set result now participates). The threshold
-is calibrated from the run's own data rather than a picked constant: the mean
-paired difference between each query's real and shuffled score must exceed
-that difference's own standard error across the query set.
+The replacement severed the QUERY-TO-RESULT association: each query's
+already-computed ranked output is rescored against a *different* query's
+expected answer, the pairing fixed by a single deterministic derangement (no
+fixed point) of the WHOLE query id list. A SECOND external re-gate (again two
+independent reviewers, same finding) showed this still leaked: `path` and
+`question` queries have systematically different expect distributions (path
+expects skew toward `CON-*` ids; some question expects are `INC-*` ids), so
+that single derangement paired a `path` query with a `question` query about
+70% of the time, and a runner that never reads `--query` — a fixed
+concept-id list for `path`, a fixed incident-id list otherwise — beat its own
+shuffled twin and passed.
+
+**What it does now.** The derangement is **kind-preserving**: one rotation
+per `kind` group (`path` queries only ever pair with other `path` queries,
+`question` with `question`), each by an offset coprime with that group's own
+size so the rotation is a single cycle rather than several short ones — see
+`bench/score.py`'s `negative_control` module comment for the full derivation,
+including the algebraic proof that a runner whose output depends only on
+`kind` scores EXACTLY zero gain under this design, why a length-1/match-set
+result participates, and why re-running each runner on deranged
+(kind, query-text) pairs instead (considered, per an external reviewer's
+suggestion) was rejected — for a deterministic runner it is the identical
+test at twice the cost, not a stronger one.
+
+The threshold is a **minimum-effect floor, not a calibrated significance
+test** — this is also narrowed from an earlier claim, in the same fix round.
+The mean paired difference between each query's real and shuffled score must
+exceed that difference's own SAMPLE standard error (Bessel-corrected, not
+population — using population SD previously let a runner correct on exactly
+one query, empty everywhere else, always pass, for any query-set size; see
+the module comment for the exact algebraic reason) across the query set. This
+is not a full permutation test (one fixed derangement is not a null
+distribution, and its paired differences are not independent draws in the
+rigorous sense) and does not claim to be one — the printed `se` value and the
+`--json` field of the same name are exactly the quantity the pass/fail line
+compares against, not a different "spread" number a reader could mistake for
+it.
 
 A runner that returns nothing is excluded from the verdict, rather than
-counted as a failure, **only** when it is explicitly declared the null
-baseline (`nomemory`) AND it has zero errors AND it covered every query —
-anything else that returns nothing, or has any error at all, makes that
-runner's own result inconclusive rather than excused.
+counted as a failure, **only** when its resolved runner script is the
+repository's own canonical `bench/runners/nomemory.py` (bound to the
+resolved script PATH, never to a runner spec's display name — a
+user-controlled path spec's display is `script.stem`, and fix round 2 closed
+an exploit where an impostor script merely NAMED `nomemory.py` anywhere was
+exempted) AND it has zero errors AND it covered every query — anything else
+that returns nothing, or has any error at all, makes that runner's own
+result inconclusive rather than excused.
 
 If any runner fails, the harness prints **INCONCLUSIVE**, names the runners,
-and says the numbers say nothing about retrieval quality — and now (fix
-round) `score.py`'s own exit code is nonzero on that verdict too (was:
-always `0`, silently unnoticed by any caller checking only the exit code).
-That verdict is in `--json` too, under `negative_control`. A published number
-without an `ok` verdict beside it should not be believed. `score.py
---private` computes and prints this control too, on nothing but the
-aggregate numbers already safe to print there — the same "every run" promise
-this section makes, minus a query count under 2 (a derangement needs at
-least two queries), which it states and skips cleanly instead of crashing.
+and says the numbers say nothing about retrieval quality — and (fix round 1)
+`score.py`'s own exit code is nonzero on that verdict too (was: always `0`,
+silently unnoticed by any caller checking only the exit code). That verdict
+is in `--json` too, under `negative_control`. A published number without an
+`ok` verdict beside it should not be believed. `score.py --private` computes
+and prints this control too, on nothing but the aggregate numbers already
+safe to print there — the same "every run" promise this section makes, minus
+a query count under 2 per kind (a derangement needs at least two queries of
+the same kind), which it states and skips cleanly instead of crashing.
 
 Idea taken from klypix-mcp, whose benchmark runs unlocked writers as a negative
 control and declares itself inconclusive if they lose nothing.

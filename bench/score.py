@@ -174,12 +174,28 @@ def aggregate(per_query: list[dict], ks: tuple[int, ...] = KS) -> dict:
 # driving a whole run
 # ---------------------------------------------------------------------------
 
+NULL_BASELINE_SCRIPT = RUNNERS_DIR / "nomemory.py"
+
+
 def run_all(queries: list[dict], corpus: Path, runner_specs: list[str], limit: int) -> dict:
     """{display_name: {"per_query": {qid: {...metrics, "ranked": [...]}},
-    "errors": {qid: "message"}}}"""
+    "errors": {qid: "message"}, "is_canonical_null_baseline": bool}}
+
+    `is_canonical_null_baseline` is set from the RESOLVED SCRIPT PATH, not
+    from `display` -- fix round 2 (external re-gate, two independent
+    reviewers): the old check matched `display`'s own basename against
+    "nomemory", and `display` for a path spec is `script.stem`, which is
+    whatever the caller named their file. An empty impostor script saved as
+    `/anywhere/nomemory.py` produced `display == "nomemory"` and was
+    exempted from the negative control; the identical file saved as
+    `empty.py` correctly failed it. A user-controlled filename must never
+    grant a free pass -- only actually BEING the repository's own
+    `bench/runners/nomemory.py` (resolved, so a symlink to it still
+    counts -- the symlink IS that file) does."""
     report = {}
     for spec in runner_specs:
         display, script, mode = resolve_runner(spec)
+        is_canonical_null_baseline = script.resolve() == NULL_BASELINE_SCRIPT.resolve()
         per_query = {}
         errors = {}
         for q in queries:
@@ -191,7 +207,11 @@ def run_all(queries: list[dict], corpus: Path, runner_specs: list[str], limit: i
             metrics = evaluate_query(q["expect"], ranked)
             metrics["ranked"] = ranked
             per_query[q["id"]] = metrics
-        report[display] = {"per_query": per_query, "errors": errors}
+        report[display] = {
+            "per_query": per_query,
+            "errors": errors,
+            "is_canonical_null_baseline": is_canonical_null_baseline,
+        }
     return report
 
 
@@ -200,8 +220,13 @@ def run_all(queries: list[dict], corpus: Path, runner_specs: list[str], limit: i
 # A benchmark can report a flattering number while measuring almost nothing:
 # if the query set is so easy that a deliberately crippled runner scores the
 # same as the real one, the metric is not separating anything and the headline
-# figure is noise. The control answers "would this query set notice if a
-# runner ignored the query entirely?"
+# figure is noise. The control's PRECISE, narrowed claim (see "Fix round 2"
+# below for why it is narrowed): would this query set notice a runner that
+# ignores the query text and, at most, branches on `kind` -- the one other
+# channel a runner actually receives (see `run_query`'s `--kind` argument)?
+# It does not, and cannot, promise to catch every conceivable way a runner
+# could be blind to a query's actual content (see "What this does not claim"
+# at the end of this comment).
 #
 # Fix-round history: the first version of this control REVERSED each
 # runner's own ranked output and rescored it against the SAME query's own
@@ -218,113 +243,250 @@ def run_all(queries: list[dict], corpus: Path, runner_specs: list[str], limit: i
 # severe enough (gameable in one direction, blind in the other) that a
 # second number next to a misleading one adds confusion, not signal.
 #
-# The replacement severs the QUERY-TO-RESULT association instead of
-# reordering a single result list: query i's ALREADY-COMPUTED ranked output
-# is rescored against query perm(i)'s expect, where perm is a fixed,
-# deterministic derangement (a permutation with no fixed point) of the query
-# id list -- no RNG, reproducible on every machine, defined below.
+# Fix round 2 (a SECOND external re-gate, two independent reviewers, same
+# residual hole): the replacement above severed the QUERY-TO-RESULT
+# association by rescoring query i's ranked output against query perm(i)'s
+# expect, where perm was a SINGLE derangement of the WHOLE 57-query id list,
+# mixing `path` and `question` ids freely. Both reviewers built a runner that
+# never reads `--query` at all and branches only on `--kind` -- a fixed
+# concept-id list for `path`, a fixed incident-id list otherwise -- and it
+# PASSED (gain +0.08 to +0.12 depending on which reviewer's exact fixed
+# lists). The reason: this corpus's `path` and `question` populations have
+# systematically different expect distributions (path expects skew toward
+# CON-* ids; some question expects are INC-* ids that essentially no path
+# query ever expects), so a derangement that pairs a path query with a
+# question query is comparing two different populations, not testing
+# query-sensitivity -- exactly the kind of leak the ORIGINAL corpus-wide
+# derangement was supposed to prevent, just moved one level up (from
+# "ignores the query" to "ignores the query but reads `kind`").
 #
-# Why this is immune to counterexample (1): a query-blind runner returns the
-# same ranked list R for every query, so its real score is
-#   mean_i score(expect_i, R)
-# and its shuffled score is
-#   mean_i score(expect_perm(i), R).
-# Because perm is a bijection on the query id set, {perm(i) : all i} is the
-# SAME SET as {i : all i}, just relabeled -- summing score(expect_x, R) over
-# every x in that set gives the identical total either way. The two means
-# are therefore EXACTLY equal (not approximately, not "usually"): gain is 0
-# for any query-blind ranker, for any R, on any query set, at any threshold.
-# The corollary is also correct behavior, not a loophole: two queries that
-# legitimately share the same expect (this corpus has four such pairs,
-# path-01/path-20, path-06/path-07, path-09/path-10, path-13/path-14, each
-# sharing a concept's whole expansion) are mutually indistinguishable under
-# a derangement that
-# happens to pair them -- exactly as they should be, since a runner cannot
-# be faulted for not telling apart two queries whose correct answer is
-# identical.
+# Two designs were evaluated for the fix, not just one:
 #
-# Why this is immune to counterexample (2): the control never reorders a
-# result list, so it does not depend on that list having an order to
-# destroy. A length-1 or match-set ranked output ["A"] scored against its
-# own expect ["A"] (real MRR 1.0) and against some OTHER query's expect
-# ["B"] (shuffled MRR 0.0, since "A" != "B") differ exactly as they should --
-# `path` queries participate in the control for the first time in this file.
+# - KIND-PRESERVING DERANGEMENT (chosen): restrict the derangement so it
+#   never pairs a query with one of a different `kind` -- one rotation per
+#   kind group instead of one rotation over the whole list. Zero extra
+#   runner invocations (still rescores the SAME already-computed `ranked`
+#   output, just against a same-kind partner's expect). Verified (see
+#   tests/test_bench.py and this round's fix report): both reviewers'
+#   counterexample runners now score EXACTLY gain 0.0 -- not approximately,
+#   the same algebraic-identity argument as the original design (below)
+#   applies per kind group instead of over the whole list, since a
+#   kind-branching runner's output is CONSTANT within each kind group.
 #
-# The derangement: rotate the (file-order) query id list by half its own
-# length. Any nonzero rotation has no fixed point (i + n/2 == i (mod n)
-# would require n/2 == 0 (mod n), false for 0 < n/2 < n), so this is a valid
-# derangement for any query count >= 2. Half the list length, rather than a
-# rotation by 1, is deliberate: three of the four same-expect pairs above
-# are also ADJACENT in bench/queries.jsonl (path-01/path-20 is not -- 19
-# apart) purely because they were authored next to each other, not because
-# a derangement
-# should privilege pairing neighbors -- a rotate-by-1 derangement would pair
-# exactly those adjacent duplicates with each other on every run, which
-# weakens the control precisely where authoring order, not query content,
-# put two expects next to each other. A half-length rotation is far enough
-# from every adjacent pair in this file to avoid that, and (57 being odd)
-# produces a single 57-element cycle rather than many short ones, spreading
-# the mismatch across the whole query set rather than a few local swaps.
+# - RE-RUNNING each runner on deranged (kind, query-text) pairs instead of
+#   relabeling the cached output (this round's brief, citing the second
+#   reviewer): rejected. For a DETERMINISTIC runner (every runner this
+#   benchmark measures; `run_query` passes no randomness), re-invoking the
+#   runner on query perm(i)'s (kind, text) produces EXACTLY the same output
+#   already cached as `ranked[perm(i)]` -- the runner cannot know it is
+#   being fed a "deranged" query; feeding it query perm(i)'s own real input
+#   is indistinguishable, to the runner, from having been asked query
+#   perm(i) honestly. So the re-run design's "shuffled" score for slot i,
+#   `score(expect_i, ranked[perm(i)])`, is the SAME family of quantity as
+#   the label-shuffle design's `score(expect_perm(i), ranked_i)` -- literally
+#   equal once you substitute j = perm(i), modulo using perm's inverse
+#   instead of perm. It is the identical test at 2x the cost (a second full
+#   subprocess pass per runner, doubling wall-clock time and doubling
+#   exposure to timeouts/flakiness for anything that shells out, e.g. the
+#   `memcontinuum` runners), and it does NOT close anything label-shuffle
+#   cannot: empirically, re-running con_inc.py (this file's counterexample
+#   fixture, kept as a test fixture below) against the OLD, non-kind-
+#   preserving corpus-wide derangement gave gain +0.115, an even LARGER
+#   pass margin than the label-shuffle version's +0.084 on the same
+#   derangement -- re-running bought nothing because the leak was never
+#   about staleness of the cached output, it was about the derangement
+#   crossing kinds. Kind-preserving derangement closes the identified leak
+#   at zero extra cost; re-running does not close it at all unless the
+#   derangement is ALSO made kind-preserving, at which point re-running adds
+#   cost without adding power over the cheaper design already chosen.
+#
+# Why kind-preserving derangement is immune to BOTH reviewers' counterexample
+# (the general argument, restated per kind group): a runner whose output for
+# a query of kind k depends only on k (not on the query's own text) returns
+# the same ranked list R_k for every query of that kind, so its real score
+# restricted to kind k is mean_{i in k} score(expect_i, R_k) and its
+# shuffled score restricted to kind k is mean_{i in k} score(expect_perm(i),
+# R_k). Because perm restricted to kind k is a bijection ON kind k's own id
+# set (never leaves the group), {perm(i) : i in k} is the SAME SET as
+# {i : i in k}, just relabeled -- summing score(expect_x, R_k) over that set
+# gives the identical total either way, for EACH kind group independently.
+# The overall gain, a weighted average of the two (now individually zero)
+# per-kind gains, is therefore also exactly zero. This generalizes the
+# original (pre-fix-round-2) proof, which only had one kind group to begin
+# with in that argument's own terms -- restricting the derangement to be
+# kind-preserving is what makes the "same set, just relabeled" step true
+# when the corpus has more than one population with different expect
+# distributions.
+#
+# Why this is still immune to the reversal-era counterexample (2): the
+# control never reorders a result list, so it does not depend on that list
+# having an order to destroy. A length-1 or match-set ranked output ["A"]
+# scored against its own expect ["A"] (real MRR 1.0) and against some OTHER
+# same-kind query's expect ["B"] (shuffled MRR 0.0, since "A" != "B") differ
+# exactly as they should -- `path` queries participate in the control.
+#
+# What this does not claim: a runner that reads the query TEXT and branches
+# on some OTHER discrete signal uncorrelated with `kind` (say, a hardcoded
+# check for one specific substring, or a length threshold that does not
+# track path-vs-question) is not provably caught by this design -- the
+# provable-zero argument above only holds for a partition the derangement is
+# built to preserve, and `kind` is the one channel this benchmark's own CLI
+# contract (`run_query`) hands a runner SEPARATELY from the query text, which
+# is why it is the one this control targets. This IS the narrowed claim the
+# coordinator's decision rule for this round asked for if a broader one
+# could not be delivered: this control catches a runner that is blind to
+# query TEXT and keys on `kind` (or on anything else that happens to
+# partition the query set exactly the way `kind` does) -- not "any runner
+# that is blind to the query" in full generality. bench/README.md states
+# this narrowed claim too.
+#
+# The derangement: one rotation per kind group (not one rotation over the
+# whole list), each by an offset COPRIME with that group's own size --
+# `_coprime_offset_near_half` -- rather than always using half the group's
+# length. This matters for a reason fix round 2 also surfaced (a MAJOR
+# finding on the calibration, not the derangement, but the same fix serves
+# both): half of an EVEN group size is not coprime with it (half of 20 is
+# 10, and gcd(10, 20) = 10, not 1), so a half-length rotation of an even
+# group splits into gcd(offset, n) separate short cycles -- for `path`
+# (n=20) that would be ten 2-cycles, each pairing query i with i+10 and
+# i+10 back with i. A 2-cycle's two paired differences are exact NEGATIVES
+# of each other (diff(i) = real_i - shuffled_i where shuffled_i uses i+10's
+# expect, and diff(i+10) uses i's expect against i+10's own shuffled score --
+# not independent observations by construction), which is exactly the kind
+# of correlated-observation problem the calibration below must not silently
+# assume away. Choosing the offset closest to half that is still coprime
+# with the group's size guarantees a SINGLE cycle spanning the whole group
+# (no fixed points, and no short cycles either), while staying close to the
+# original "half length, not adjacent, spread the mismatch across the whole
+# group" reasoning. For `question` (n=37, prime) every offset 1..36 is
+# already coprime with 37, so the offset is unchanged from before (18, i.e.
+# half of 37 rounded down). For `path` (n=20) the nearest coprime offset is
+# 11. Under these offsets, exactly ONE of this corpus's same-expect pairs
+# (see below) happens to coincide with the derangement: kw-12 <-> et-05,
+# both expecting only TOP-113 -- correct behavior, not a loophole, since a
+# runner cannot be faulted for not telling apart two queries whose correct
+# answer is identical. (para-03 and path-08 also share an expect, TOP-109,
+# but can never coincide under this derangement now that `path` and
+# `question` never pair with each other -- resolved for free by kind
+# preservation, not by choice of offset.)
 #
 # Calibration: for each query, take the PAIRED difference between its real
 # score and its shuffled score (real_i - shuffled_i), then require the MEAN
-# of those paired differences to exceed their own standard error
-# (population standard deviation of the per-query differences / sqrt(n)) --
-# a lightweight one-sample test of "is this gain distinguishable from the
-# per-query noise in the shuffled scores," rather than an unexplained
-# constant someone picked. Standard error, not the raw per-query standard
-# deviation: the raw spread is a property of ONE query's score, and
-# comparing a MEAN gain against it penalizes exactly the runners that are
-# consistently, moderately better across many queries (division by sqrt(n)
-# is the textbook correction from "how noisy is one query" to "how noisy is
-# the mean of n queries," which is what the gain actually estimates). The
-# multiplier on that standard error is 1x, not 2x or another value chosen
-# for a stricter confidence level: this control's job is a FLOOR (reject a
-# runner statistically indistinguishable from query-blind), not a
-# significance certificate, and the printed gain/spread numbers are exactly
-# what a reader needs to judge the margin for themselves -- widening the
-# multiplier only matters near the boundary, and every runner measured on
-# this corpus so far clears 1x SE by roughly an order of magnitude (see
-# bench-hardening's fix-round report for the actual before/after numbers),
-# so it has not yet been the deciding choice in practice.
-# Documented, known limitation of any threshold on a benchmark this size: a
-# runner correct on exactly one query and empty on every other one produces
-# a paired-difference distribution close to a single spike, whose standard
-# error is (by construction, for large n) always just under its own tiny
-# mean gain -- such a runner passes marginally. No fixed-size control can
-# rule this out; it is a reason to read the MRR/Recall numbers alongside the
-# verdict, not instead of it, exactly as bench/README.md's "Honest
-# limitations" section already says about the corpus size.
-def _derangement(ids: list[str]) -> dict[str, str]:
-    """A fixed-point-free permutation of `ids`, as {id: paired_id}. See the
-    module comment above `negative_control` for why a half-length rotation,
-    not a rotation by 1 or a random permutation, is used."""
-    n = len(ids)
+# of those paired differences to exceed their own SAMPLE standard error
+# (SAMPLE standard deviation of the per-query differences, not population --
+# see below -- divided by sqrt(n)). Be precise about what this is NOT: it is
+# not a calibrated significance test. A true null distribution would come
+# from MANY independent derangements; this control uses exactly ONE fixed
+# derangement (deliberately, for reproducibility -- no RNG, same numbers on
+# every machine), so there is only one realization of "what would a
+# query-blind runner's gain look like," not a sampling distribution of it.
+# The n per-query differences from that one derangement are also not n
+# independent draws in the rigorous sense -- they all come from the SAME
+# permutation. This is a MINIMUM-EFFECT FLOOR, not a p-value: "the observed
+# gain must clear the spread already visible in this one derangement's own
+# paired differences," nothing more. (Fix round 2 considered replacing this
+# with a real permutation test over many kind-preserving derangements
+# instead -- cheap, since it only re-scores the already-cached `ranked`
+# output rather than re-running any runner. It was NOT adopted: built and
+# checked against the one-hit-runner case below, it does not actually fail
+# that case either -- when another query in the same kind group happens to
+# share the one-hit runner's lone correct expect (this corpus has such
+# pairs, e.g. path-01/path-20), a permutation test correctly and honestly
+# reports that single hit as distinguishable from chance, because under
+# that specific null model it genuinely is: no relabeling among that
+# derangement family ever reproduces it by luck. The one-hit-runner
+# complaint below is a SMALL-SAMPLE EFFECT-SIZE problem, not a defect in
+# how the null is built -- a fancier null does not fix it, so the simpler,
+# cheaper, already-narrowly-scoped calibration was kept instead of adding
+# permutation-test machinery that would not have changed this outcome.)
+#
+# Fix round 2 also corrected an arithmetic error in the calibration itself
+# (MAJOR, both reviewers): the previous code used `statistics.pstdev`
+# (population standard deviation) over the per-query differences. The n
+# differences are a SAMPLE of the underlying variability, not the full
+# population of it, so the textbook-correct estimator is the SAMPLE standard
+# deviation (`statistics.stdev`, Bessel-corrected, dividing by n-1 not n).
+# Using population SD instead of sample SD is not a stylistic choice -- it
+# is why a runner correct on exactly ONE query and empty on every other one
+# used to ALWAYS pass, for any n: for a single 1.0 among (n-1) zeros, the
+# mean is 1/n and population-SD-based SE works out to sqrt(n-1)/n**1.5,
+# and mean > population_se reduces algebraically to sqrt(n) > sqrt(n-1),
+# true for every n -- a guaranteed pass, not a coincidence, and not a
+# statistical property of the runner at all. The sample-SD version makes
+# the identical one-hit case an EXACT ALGEBRAIC TIE (mean == sample SE ==
+# 1/n) for any n, so `gain > se` (a strict inequality) correctly reports it
+# as NOT separating, in exact arithmetic. This still does not mean every
+# one-hit-shaped runner fails in practice (see the permutation-test
+# discussion above: a real single correct answer nobody else could
+# reproduce by chance IS informative, and floating-point rounding on a
+# specific corpus can tip an exact tie either way) -- it means the
+# calibration no longer manufactures a GUARANTEED pass via the wrong
+# formula. The printed control line and the `--json` output both show the
+# `se` value the decision actually uses (Grok's finding 2, this round: the
+# previous printout showed `spread` -- the raw sample SD of the per-query
+# differences -- labeled in a way a reader could mistake for the quantity
+# the pass/fail line compares against, when the decision actually divides
+# that by sqrt(n) first).
+#
+# The multiplier on standard error is still 1x, not 2x or another value
+# chosen for a stricter confidence level: this control's job is a FLOOR
+# (reject a runner statistically indistinguishable from query-blind), not a
+# significance certificate, and the printed gain/se numbers are exactly what
+# a reader needs to judge the margin for themselves.
+def _coprime_offset_near_half(n: int) -> int:
+    """The offset closest to n // 2 (ties broken toward the LARGER offset)
+    that is coprime with n, for 1 <= offset <= n - 1. A rotation by this
+    offset is always a single n-cycle (no fixed point, and -- unlike a
+    non-coprime offset -- no short cycles either): see the module comment
+    above `_coprime_offset_near_half`'s callers for why a short cycle (in
+    particular a 2-cycle) breaks the calibration's per-query-difference
+    accounting. n must be >= 2 (every integer >= 2 has at least one such
+    offset: 1 is always coprime with n)."""
     if n < 2:
-        raise ValueError(f"negative_control needs at least 2 queries for a derangement, got {n}")
-    offset = n // 2
-    return {ids[i]: ids[(i + offset) % n] for i in range(n)}
+        raise ValueError(f"_coprime_offset_near_half needs n >= 2, got {n}")
+    half = n // 2
+    for delta in range(n):
+        hi = half + delta
+        if 1 <= hi <= n - 1 and math.gcd(hi, n) == 1:
+            return hi
+        lo = half - delta
+        if delta and 1 <= lo <= n - 1 and math.gcd(lo, n) == 1:
+            return lo
+    raise AssertionError(f"unreachable: no offset coprime with {n} in [1, {n - 1}]")  # pragma: no cover
 
 
-NULL_BASELINE_RUNNERS = frozenset({"nomemory"})
-
-
-def _is_declared_null_baseline(display: str) -> bool:
-    """Only a runner spec whose base name (before any `:mode` suffix) is
-    explicitly listed here is allowed to skip the gain requirement -- see
-    the exemption's four-way AND in negative_control below. Nothing else
-    that returns empty output, declared or not, gets a free pass."""
-    return display.split(":", 1)[0] in NULL_BASELINE_RUNNERS
+def _kind_preserving_derangement(queries: list[dict]) -> dict[str, str]:
+    """A fixed-point-free permutation of the query id list that NEVER pairs
+    two queries of different `kind` -- one single-cycle rotation per kind
+    group (see `_coprime_offset_near_half`), as {id: paired_id}. See the
+    module comment above `negative_control` for why crossing `kind` in the
+    derangement is exactly the leak fix round 2 closed."""
+    by_kind: dict[str, list[str]] = {}
+    for q in queries:
+        by_kind.setdefault(q["kind"], []).append(q["id"])
+    perm: dict[str, str] = {}
+    for kind, ids in by_kind.items():
+        n = len(ids)
+        if n < 2:
+            raise ValueError(
+                f"negative_control needs at least 2 queries of kind {kind!r} for a "
+                f"kind-preserving derangement, got {n}"
+            )
+        offset = _coprime_offset_near_half(n)
+        for i in range(n):
+            perm[ids[i]] = ids[(i + offset) % n]
+    return perm
 
 
 def negative_control(report: dict, queries: list[dict]) -> dict:
-    """{runner: {"real_mrr", "shuffled_mrr", "gain", "spread", "returns_nothing",
-    "separates"}} plus "verdict": "ok" | "inconclusive", naming the runners
-    that failed. See the module comment above for the derangement and the
-    calibrated threshold; see NULL_BASELINE_RUNNERS for the one exemption."""
-    ids = [q["id"] for q in queries]
+    """{runner: {"real_mrr", "shuffled_mrr", "gain", "spread", "se",
+    "returns_nothing", "is_exempt_baseline", "separates"}} plus "verdict":
+    "ok" | "inconclusive", naming the runners that failed. See the module
+    comment above for the derangement and the calibrated threshold; see
+    `run_all`'s `is_canonical_null_baseline` for the one exemption, bound to
+    the resolved runner script path, never to `display`."""
     expect_by_id = {q["id"]: q["expect"] for q in queries}
-    perm = _derangement(ids)
+    perm = _kind_preserving_derangement(queries)
 
     result = {}
     failed = []
@@ -355,13 +517,16 @@ def negative_control(report: dict, queries: list[dict]) -> dict:
             for qid, metrics in pq.items()
         ])["mrr"] if pq else 0.0
         gain = real - shuffled
-        spread = statistics.pstdev(diffs) if len(diffs) > 1 else 0.0
+        # Sample standard deviation (Bessel-corrected), not population: see
+        # the module comment -- these n differences are a sample, and using
+        # population SD is what let a one-hit runner always pass.
+        spread = statistics.stdev(diffs) if len(diffs) > 1 else 0.0
         se = spread / math.sqrt(len(diffs)) if diffs else 0.0
 
         returns_nothing = bool(pq) and all(not (m.get("ranked") or []) for m in pq.values())
         full_coverage = len(pq) == len(queries)
         is_exempt_baseline = (
-            _is_declared_null_baseline(display) and returns_nothing and not errors and full_coverage
+            data.get("is_canonical_null_baseline", False) and returns_nothing and not errors and full_coverage
         )
 
         if is_exempt_baseline:
@@ -380,6 +545,7 @@ def negative_control(report: dict, queries: list[dict]) -> dict:
             "shuffled_mrr": round(shuffled, 4),
             "gain": round(gain, 4),
             "spread": round(spread, 4),
+            "se": round(se, 4),
             "returns_nothing": returns_nothing,
             "is_exempt_baseline": is_exempt_baseline,
             "separates": separates,
@@ -452,10 +618,12 @@ def print_control(control: dict, runner_names) -> None:
     private gate (M3: "every run" in bench/README.md means every run --
     the private gate calls this too, on nothing but the aggregate numbers
     already safe to print there)."""
-    print("negative control (query/result association broken by a deterministic "
-          "derangement of the query list -- see bench/score.py's negative_control "
-          "comment; a runner must beat its own query-shuffled score by more than "
-          "that shuffled score's standard error to count as separating):")
+    print("negative control (query/result association broken by a deterministic, "
+          "kind-preserving derangement of the query list -- see bench/score.py's "
+          "negative_control comment; a MINIMUM-EFFECT FLOOR, not a calibrated "
+          "significance test: a runner must beat its own query-shuffled score by "
+          "more than that shuffled score's sample standard error, printed below "
+          "as `se`, to count as separating):")
     for display in runner_names:
         if display not in control:
             continue
@@ -464,12 +632,12 @@ def print_control(control: dict, runner_names) -> None:
         flag = "ok " if c["separates"] else "FLAT"
         print(f"  {flag}  {display:22s} real {c['real_mrr']:.2f}  "
               f"shuffled {c['shuffled_mrr']:.2f}  gain {c['gain']:+.2f}  "
-              f"(shuffled spread {c['spread']:.2f}){note}")
+              f"(need > se {c['se']:.4f}, spread {c['spread']:.2f}){note}")
     if control["verdict"] == "inconclusive":
         print()
         print("INCONCLUSIVE: " + ", ".join(control["failed_runners"])
               + " did not beat their own query-shuffled score by more than that "
-                "score's standard error. The query set does not separate a "
+                "score's sample standard error. The query set does not separate a "
                 "query-sensitive ranking from a query-blind one for these "
                 "runners, so their numbers say nothing about retrieval quality.")
 
