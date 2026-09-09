@@ -528,11 +528,17 @@ answers survive a reinstall.
 
 Project level, by hand:
 
-1. Remove this tool's hook entries from the project's `settings.local.json` — or
-   restore `settings.local.json.bak-memcontinuum`.
+1. Remove this tool's hook entries from the project's `settings.local.json` —
+   identified by these script basenames in their `"command"` fields, safe to
+   hand-delete — or restore `settings.local.json.bak-memcontinuum`:
+   `pre-edit-chain.sh newfile-nudge.sh ledger-post-edit.sh
+   precompact-persist.sh sessionstart-remind.sh userprompt-remind.sh
+   sessionend-stamp.sh`
 2. Delete `<claude-dir>/skills/memory-search/`.
-3. Delete `<store>/.git/hooks/post-commit`.
-4. Delete `~/.memcontinuum/<project>.sqlite`, and
+3. Delete `<claude-dir>/rules/memcontinuum.md`.
+4. Delete `<store>/.git/hooks/post-commit` and `<store>/.git/hooks/pre-commit`
+   (or wherever `--store-hooks-dir` pointed them).
+5. Delete `~/.memcontinuum/<project>.sqlite`, and
    `~/.memcontinuum/<project>-code.sqlite` if `code-reindex` was ever run, and
    `~/.memcontinuum/<project>.embed-pending`, `<project>.embed.lock` and
    `<project>.embed.log` if the post-commit hook's embed-worker ever ran, and
