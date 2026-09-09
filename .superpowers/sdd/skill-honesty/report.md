@@ -209,7 +209,9 @@ twice across this task -- once after `f21d877`, once after the final commit -- b
 only the final numbers are kept below.
 
 - `python -m unittest tests.test_docs tests.test_repo_init tests.test_update tests.test_setup`:
-  **Ran 409 tests in 201.649s -- OK (skipped=2)** (`tests.test_docs` alone: 60 tests, 58 passed, 2
+  **Ran 410 tests -- OK (skipped=2)** (loader counts: docs 60, repo-init 136, update 159, setup
+  55 -- corrected here from this file's original "409"/"60" claim: the gate reviewer's own re-run
+  of the identical command reported 410, not 409; `tests.test_docs` alone: 60 tests, 58 passed, 2
   skipped, of which 8 are `TestSkillHonesty`).
 - Full suite, `python -m unittest discover -s tests`: **Ran 1642 tests in 392.713s -- OK
   (skipped=4)**, exit 0. (The `ERROR:`/`WARNING:` lines inside the log are memlint's own
@@ -243,4 +245,3 @@ on `/mnt/*`, `mc_is_windows_mounted_checkout` false) sees exactly this plain for
 that user is unchanged by this task: repo-init.sh itself was not touched, only the skill's prose
 about it, and the skill no longer says anything platform-specific to contradict what a non-WSL
 user's own dry-run prints.
-
