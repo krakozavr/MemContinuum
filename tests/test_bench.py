@@ -454,10 +454,6 @@ class TestParaphraseIndependence(unittest.TestCase):
             self.assertNotEqual(overlap, set(), f"{q['id']} -> {target}: expected some shared vocabulary")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestRunnersDoNotShadowStdlib(unittest.TestCase):
     """A runner is executed as a script, so its own directory is first on
     sys.path. A runner named after a standard-library module therefore
@@ -487,47 +483,144 @@ class TestRunnersDoNotShadowStdlib(unittest.TestCase):
 
 class TestNegativeControl(unittest.TestCase):
     """A benchmark can report a flattering number while separating nothing.
-    The control reverses each runner's own ranking and requires the real run
-    to beat its reversed twin; below the threshold the harness declares
-    itself inconclusive instead of printing a number a reader would trust."""
+    Fix round (external review, two independent gates): the ORIGINAL control
+    reversed each runner's own ranked output and rescored it against the
+    SAME query's expect. That tested ranking order, not query-sensitivity --
+    a query-blind fixed-list runner passed (reversing a fixed list still
+    looks query-sensitive on average), and a length-1 or match-set result
+    (this corpus's own `path` kind) could never change under reversal at
+    all, so 20 of 57 queries were invisible to it. The control now severs
+    the QUERY-TO-RESULT association instead: each query's own ranked output
+    is rescored against a DIFFERENT query's expect (a fixed, deterministic
+    derangement of the query id list -- see bench/score.py's negative_control
+    module comment for the full derivation, including why the fixed-ranker
+    case below produces an EXACT zero gain, not an approximate one)."""
 
-    def _report(self, ranked_by_qid, expect_by_qid):
+    def _report(self, ranked_by_qid, expect_by_qid, display="r"):
         per_query = {}
         for qid, ranked in ranked_by_qid.items():
             m = score.evaluate_query(expect_by_qid[qid], ranked)
             m["ranked"] = ranked
             per_query[qid] = m
-        return {"r": {"per_query": per_query, "errors": {}}}
+        return {display: {"per_query": per_query, "errors": {}}}
 
-    def _queries(self, expect_by_qid):
-        return [{"id": q, "kind": "question", "query": "q", "expect": e}
+    def _queries(self, expect_by_qid, kind="question"):
+        return [{"id": q, "kind": kind, "query": "q", "expect": e}
                 for q, e in expect_by_qid.items()]
 
-    def test_a_good_ranking_separates_from_its_reverse(self):
-        expect = {"q1": ["a"], "q2": ["b"]}
-        rep = self._report({"q1": ["a", "x", "y"], "q2": ["b", "x", "y"]}, expect)
+    def test_a_good_ranking_separates_from_its_shuffle(self):
+        expect = {"q1": ["a"], "q2": ["b"], "q3": ["c"], "q4": ["d"]}
+        ranked = {"q1": ["a", "x", "y"], "q2": ["b", "x", "y"],
+                  "q3": ["c", "x", "y"], "q4": ["d", "x", "y"]}
+        rep = self._report(ranked, expect)
         c = score.negative_control(rep, self._queries(expect))
-        self.assertEqual(c["verdict"], "ok")
+        self.assertEqual(c["verdict"], "ok", c)
         self.assertTrue(c["r"]["separates"])
-        self.assertGreater(c["r"]["gain"], score.NEGATIVE_CONTROL_MIN_MRR_GAIN)
+        self.assertAlmostEqual(c["r"]["real_mrr"], 1.0)
+        self.assertAlmostEqual(c["r"]["shuffled_mrr"], 0.0)
+        self.assertGreater(c["r"]["gain"], 0)
+
+    def test_a_query_blind_fixed_ranker_gets_exactly_zero_gain_and_fails(self):
+        """Codex's counterexample against the OLD (reversal) control: a
+        runner that returns the identical list for every query, ignoring
+        the query entirely, used to pass with gain +0.4583. Here the same
+        shape of runner gets EXACTLY zero gain (proven algebraically in
+        bench/score.py, not just empirically low) and fails."""
+        expect = {"q1": ["a"], "q2": ["b"], "q3": ["c"], "q4": ["d"]}
+        fixed_list = ["a", "b", "c", "d"]  # returned for every query, unchanged
+        ranked = {qid: fixed_list for qid in expect}
+        rep = self._report(ranked, expect, display="fixed")
+        c = score.negative_control(rep, self._queries(expect))
+        self.assertAlmostEqual(c["fixed"]["gain"], 0.0, places=9)
+        self.assertFalse(c["fixed"]["separates"])
+        self.assertEqual(c["verdict"], "inconclusive")
+        self.assertIn("fixed", c["failed_runners"])
+
+    def test_a_perfect_ranker_passes_and_path_kind_length_one_results_participate(self):
+        """The OLD control could never move a length-1 (or match-set)
+        result at all -- this benchmark's own `path` queries were
+        structurally invisible to it. Here a perfect `path`-shaped runner
+        (one exact id per query, the for-path match-set shape) shows a real
+        gain, proving path-kind queries now participate."""
+        expect = {"p1": ["A"], "p2": ["B"], "p3": ["C"], "p4": ["D"]}
+        ranked = {"p1": ["A"], "p2": ["B"], "p3": ["C"], "p4": ["D"]}
+        rep = self._report(ranked, expect, display="path-perfect")
+        c = score.negative_control(rep, self._queries(expect, kind="path"))
+        self.assertEqual(c["verdict"], "ok", c)
+        self.assertTrue(c["path-perfect"]["separates"])
+        self.assertAlmostEqual(c["path-perfect"]["real_mrr"], 1.0)
+        self.assertGreater(c["path-perfect"]["gain"], 0,
+                            "a length-1 path-kind result must be able to show a nonzero "
+                            "gain now -- reversal could never move it at all")
 
     def test_a_query_set_that_cannot_tell_them_apart_is_inconclusive(self):
-        # every expected id sits in the MIDDLE of a 3-long list, so reversing
-        # the ranking changes nothing: the query set separates nothing.
-        expect = {"q1": ["a"], "q2": ["b"]}
-        rep = self._report({"q1": ["x", "a", "y"], "q2": ["x", "b", "y"]}, expect)
+        # every runner scores identically against every query's own expect
+        # AND against its derangement partner's expect (all four expects
+        # are found at the same rank in every ranked list) -- nothing
+        # distinguishes a real run from a shuffled one.
+        expect = {"q1": ["x"], "q2": ["x"], "q3": ["x"], "q4": ["x"]}
+        ranked = {qid: ["x", "y"] for qid in expect}
+        rep = self._report(ranked, expect)
         c = score.negative_control(rep, self._queries(expect))
         self.assertEqual(c["verdict"], "inconclusive")
         self.assertIn("r", c["failed_runners"])
         self.assertFalse(c["r"]["separates"])
 
-    def test_a_runner_that_returns_nothing_is_excluded_not_failed(self):
-        expect = {"q1": ["a"]}
-        rep = self._report({"q1": []}, expect)
+    def test_all_erroring_runner_is_inconclusive_not_excused(self):
+        """B2: all(...) over an empty per_query used to be vacuously True,
+        so a runner that errors on every query was reported `ok`."""
+        expect = {"q1": ["a"], "q2": ["b"]}
+        rep = {"broken": {"per_query": {}, "errors": {"q1": "boom", "q2": "boom"}}}
         c = score.negative_control(rep, self._queries(expect))
-        self.assertTrue(c["r"]["returns_nothing"])
-        self.assertTrue(c["r"]["separates"])
+        self.assertFalse(c["broken"]["separates"])
+        self.assertEqual(c["verdict"], "inconclusive")
+        self.assertIn("broken", c["failed_runners"])
+
+    def test_silently_empty_undeclared_runner_is_inconclusive_not_excused(self):
+        """B2: only the runner explicitly declared as the null baseline
+        (score.NULL_BASELINE_RUNNERS) may return nothing and still pass."""
+        expect = {"q1": ["a"], "q2": ["b"]}
+        rep = self._report({"q1": [], "q2": []}, expect, display="mystery-empty")
+        c = score.negative_control(rep, self._queries(expect))
+        self.assertTrue(c["mystery-empty"]["returns_nothing"])
+        self.assertFalse(c["mystery-empty"]["is_exempt_baseline"])
+        self.assertFalse(c["mystery-empty"]["separates"])
+        self.assertEqual(c["verdict"], "inconclusive")
+
+    def test_the_real_nomemory_baseline_is_still_ok(self):
+        """B2 red test: the one runner actually entitled to the exemption
+        (declared, empty by design, zero errors, full coverage) still
+        passes."""
+        expect = {"q1": ["a"], "q2": ["b"]}
+        rep = self._report({"q1": [], "q2": []}, expect, display="nomemory")
+        c = score.negative_control(rep, self._queries(expect))
+        self.assertTrue(c["nomemory"]["returns_nothing"])
+        self.assertTrue(c["nomemory"]["is_exempt_baseline"])
+        self.assertTrue(c["nomemory"]["separates"])
         self.assertEqual(c["verdict"], "ok")
+
+    def test_declared_baseline_with_errors_is_not_exempt(self):
+        """The nomemory NAME alone is not the exemption -- it must also
+        have zero errors and full query coverage (Grok's 'footgun for any
+        other caller' concern, made explicit rather than implicit)."""
+        expect = {"q1": ["a"], "q2": ["b"]}
+        m = score.evaluate_query(expect["q1"], [])
+        m["ranked"] = []
+        rep = {"nomemory": {"per_query": {"q1": m}, "errors": {"q2": "boom"}}}
+        c = score.negative_control(rep, self._queries(expect))
+        self.assertFalse(c["nomemory"]["separates"])
+        self.assertEqual(c["verdict"], "inconclusive")
+
+    def test_unknown_query_id_fails_closed_with_a_clear_message(self):
+        """Grok 10: a report carrying a qid absent from the query set used
+        to KeyError deep inside the derangement lookup. Now it raises a
+        clear, specific error instead."""
+        expect = {"q1": ["a"], "q2": ["b"]}
+        rep = self._report({"q1": ["a"], "not-a-real-query": ["a"]},
+                            {"q1": ["a"], "not-a-real-query": ["a"]})
+        with self.assertRaises(ValueError) as ctx:
+            score.negative_control(rep, self._queries(expect))
+        self.assertIn("not-a-real-query", str(ctx.exception))
 
     def test_the_live_corpus_separates_for_the_keyword_baseline(self):
         # the real thing, not a fixture: if this ever goes inconclusive the
@@ -536,3 +629,7 @@ class TestNegativeControl(unittest.TestCase):
         rep = score.run_all(queries, CORPUS, ["keyword"], 10)
         c = score.negative_control(rep, queries)
         self.assertEqual(c["verdict"], "ok", c)
+
+
+if __name__ == "__main__":
+    unittest.main()

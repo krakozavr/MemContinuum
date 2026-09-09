@@ -37,9 +37,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -196,76 +198,183 @@ def run_all(queries: list[dict], corpus: Path, runner_specs: list[str], limit: i
 # A benchmark can report a flattering number while measuring almost nothing:
 # if the query set is so easy that a deliberately crippled runner scores the
 # same as the real one, the metric is not separating anything and the headline
-# figure is noise. The control answers "would this query set notice if the
-# ranking were destroyed?"
+# figure is noise. The control answers "would this query set notice if a
+# runner ignored the query entirely?"
 #
-# The cripple is a deterministic reversal of each runner's own ranked output.
-# Reversal, not shuffling: it needs no random seed, it is reproducible on every
-# machine, and it moves a correct top-1 answer to the bottom of the list, which
-# is the strongest degradation available without inventing results the runner
-# never returned. A runner that returns nothing (the empty baseline) is
-# unaffected by definition, so it is excluded from the verdict rather than
-# counted as a failure.
+# Fix-round history: the first version of this control REVERSED each
+# runner's own ranked output and rescored it against the SAME query's own
+# expect. That tests whether the ORDER of a result list carries information,
+# not whether the result RESPONDS TO THE QUERY -- two counterexamples from
+# external review proved it wrong. (1) A query-blind runner that returns the
+# identical fixed list for every query passed with gain +0.4583: reversing a
+# fixed list still looks query-sensitive if the corpus happens to reward that
+# fixed order on average. (2) Reversing a length-1 list, or a match-set whose
+# order is not a ranking at all (this benchmark's own `path` kind -- see
+# bench/README.md), is a no-op: MRR cannot change, so 20 of this file's 57
+# queries were structurally invisible to the control regardless of the
+# runner. Reversal is not kept as a secondary signal: both failure modes are
+# severe enough (gameable in one direction, blind in the other) that a
+# second number next to a misleading one adds confusion, not signal.
 #
-# Threshold: the real run must beat its reversed twin by at least this much
-# mean reciprocal rank, overall. Below it the harness declares itself
-# INCONCLUSIVE and says so in the table and in --json, instead of printing a
-# number a reader would trust.
-NEGATIVE_CONTROL_MIN_MRR_GAIN = 0.05
+# The replacement severs the QUERY-TO-RESULT association instead of
+# reordering a single result list: query i's ALREADY-COMPUTED ranked output
+# is rescored against query perm(i)'s expect, where perm is a fixed,
+# deterministic derangement (a permutation with no fixed point) of the query
+# id list -- no RNG, reproducible on every machine, defined below.
+#
+# Why this is immune to counterexample (1): a query-blind runner returns the
+# same ranked list R for every query, so its real score is
+#   mean_i score(expect_i, R)
+# and its shuffled score is
+#   mean_i score(expect_perm(i), R).
+# Because perm is a bijection on the query id set, {perm(i) : all i} is the
+# SAME SET as {i : all i}, just relabeled -- summing score(expect_x, R) over
+# every x in that set gives the identical total either way. The two means
+# are therefore EXACTLY equal (not approximately, not "usually"): gain is 0
+# for any query-blind ranker, for any R, on any query set, at any threshold.
+# The corollary is also correct behavior, not a loophole: two queries that
+# legitimately share the same expect (this corpus has three such pairs,
+# path-06/path-07, path-09/path-10, path-13/path-14, sharing a concept's
+# whole expansion) are mutually indistinguishable under a derangement that
+# happens to pair them -- exactly as they should be, since a runner cannot
+# be faulted for not telling apart two queries whose correct answer is
+# identical.
+#
+# Why this is immune to counterexample (2): the control never reorders a
+# result list, so it does not depend on that list having an order to
+# destroy. A length-1 or match-set ranked output ["A"] scored against its
+# own expect ["A"] (real MRR 1.0) and against some OTHER query's expect
+# ["B"] (shuffled MRR 0.0, since "A" != "B") differ exactly as they should --
+# `path` queries participate in the control for the first time in this file.
+#
+# The derangement: rotate the (file-order) query id list by half its own
+# length. Any nonzero rotation has no fixed point (i + n/2 == i (mod n)
+# would require n/2 == 0 (mod n), false for 0 < n/2 < n), so this is a valid
+# derangement for any query count >= 2. Half the list length, rather than a
+# rotation by 1, is deliberate: three pairs of ADJACENT queries in
+# bench/queries.jsonl share an identical expect (see corollary above) purely
+# because they were authored next to each other, not because a derangement
+# should privilege pairing neighbors -- a rotate-by-1 derangement would pair
+# exactly those adjacent duplicates with each other on every run, which
+# weakens the control precisely where authoring order, not query content,
+# put two expects next to each other. A half-length rotation is far enough
+# from every adjacent pair in this file to avoid that, and (57 being odd)
+# produces a single 57-element cycle rather than many short ones, spreading
+# the mismatch across the whole query set rather than a few local swaps.
+#
+# Calibration: for each query, take the PAIRED difference between its real
+# score and its shuffled score (real_i - shuffled_i), then require the MEAN
+# of those paired differences to exceed their own standard error
+# (population standard deviation of the per-query differences / sqrt(n)) --
+# a lightweight one-sample test of "is this gain distinguishable from the
+# per-query noise in the shuffled scores," rather than an unexplained
+# constant someone picked. Standard error, not the raw per-query standard
+# deviation: the raw spread is a property of ONE query's score, and
+# comparing a MEAN gain against it penalizes exactly the runners that are
+# consistently, moderately better across many queries (division by sqrt(n)
+# is the textbook correction from "how noisy is one query" to "how noisy is
+# the mean of n queries," which is what the gain actually estimates).
+# Documented, known limitation of any threshold on a benchmark this size: a
+# runner correct on exactly one query and empty on every other one produces
+# a paired-difference distribution close to a single spike, whose standard
+# error is (by construction, for large n) always just under its own tiny
+# mean gain -- such a runner passes marginally. No fixed-size control can
+# rule this out; it is a reason to read the MRR/Recall numbers alongside the
+# verdict, not instead of it, exactly as bench/README.md's "Honest
+# limitations" section already says about the corpus size.
+def _derangement(ids: list[str]) -> dict[str, str]:
+    """A fixed-point-free permutation of `ids`, as {id: paired_id}. See the
+    module comment above `negative_control` for why a half-length rotation,
+    not a rotation by 1 or a random permutation, is used."""
+    n = len(ids)
+    if n < 2:
+        raise ValueError(f"negative_control needs at least 2 queries for a derangement, got {n}")
+    offset = n // 2
+    return {ids[i]: ids[(i + offset) % n] for i in range(n)}
 
 
-def reverse_report(report: dict) -> dict:
-    """The same report with every ranked list reversed and re-scored."""
-    out = {}
-    for display, data in report.items():
-        per_query = {}
-        for qid, metrics in data["per_query"].items():
-            ranked = list(reversed(metrics.get("ranked") or []))
-            expect = metrics.get("expect")
-            re_scored = dict(metrics)
-            if expect is not None:
-                re_scored = evaluate_query(expect, ranked)
-            re_scored["ranked"] = ranked
-            per_query[qid] = re_scored
-        out[display] = {"per_query": per_query, "errors": dict(data["errors"])}
-    return out
+NULL_BASELINE_RUNNERS = frozenset({"nomemory"})
+
+
+def _is_declared_null_baseline(display: str) -> bool:
+    """Only a runner spec whose base name (before any `:mode` suffix) is
+    explicitly listed here is allowed to skip the gain requirement -- see
+    the exemption's four-way AND in negative_control below. Nothing else
+    that returns empty output, declared or not, gets a free pass."""
+    return display.split(":", 1)[0] in NULL_BASELINE_RUNNERS
 
 
 def negative_control(report: dict, queries: list[dict]) -> dict:
-    """{runner: {"real": mrr, "reversed": mrr, "gain": float, "separates": bool}}
-    plus "verdict": "ok" | "inconclusive", naming the runners that failed."""
+    """{runner: {"real_mrr", "shuffled_mrr", "gain", "spread", "returns_nothing",
+    "separates"}} plus "verdict": "ok" | "inconclusive", naming the runners
+    that failed. See the module comment above for the derangement and the
+    calibrated threshold; see NULL_BASELINE_RUNNERS for the one exemption."""
+    ids = [q["id"] for q in queries]
     expect_by_id = {q["id"]: q["expect"] for q in queries}
-    seeded = {}
-    for display, data in report.items():
-        per_query = {}
-        for qid, metrics in data["per_query"].items():
-            m = dict(metrics)
-            m["expect"] = expect_by_id.get(qid)
-            per_query[qid] = m
-        seeded[display] = {"per_query": per_query, "errors": data["errors"]}
-    reversed_report = reverse_report(seeded)
+    perm = _derangement(ids)
 
     result = {}
     failed = []
     for display, data in report.items():
-        real = aggregate(list(data["per_query"].values()))["mrr"]
-        rev = aggregate(list(reversed_report[display]["per_query"].values()))["mrr"]
-        returns_nothing = all(
-            not (m.get("ranked") or []) for m in data["per_query"].values()
+        pq = data["per_query"]
+        errors = data.get("errors", {})
+        unknown = set(pq) - expect_by_id.keys()
+        if unknown:
+            raise ValueError(
+                f"negative_control: runner {display!r} reported result(s) for "
+                f"query id(s) {sorted(unknown)} not present in the query set passed in -- "
+                f"cannot pair them with a derangement partner"
+            )
+
+        diffs = []
+        for qid, metrics in pq.items():
+            ranked = metrics.get("ranked") or []
+            real_mrr = metrics["mrr"]
+            shuffled_mrr = evaluate_query(expect_by_id[perm[qid]], ranked)["mrr"]
+            diffs.append(real_mrr - shuffled_mrr)
+
+        real = aggregate(list(pq.values()))["mrr"]
+        # shuffled_mrr is its own quantity (not derived from the paired
+        # diffs' mean, though the two agree by construction) so the printed
+        # table shows an average a reader could recompute independently.
+        shuffled = aggregate([
+            {**metrics, "mrr": evaluate_query(expect_by_id[perm[qid]], metrics.get("ranked") or [])["mrr"]}
+            for qid, metrics in pq.items()
+        ])["mrr"] if pq else 0.0
+        gain = real - shuffled
+        spread = statistics.pstdev(diffs) if len(diffs) > 1 else 0.0
+        se = spread / math.sqrt(len(diffs)) if diffs else 0.0
+
+        returns_nothing = bool(pq) and all(not (m.get("ranked") or []) for m in pq.values())
+        full_coverage = len(pq) == len(queries)
+        is_exempt_baseline = (
+            _is_declared_null_baseline(display) and returns_nothing and not errors and full_coverage
         )
-        separates = returns_nothing or (real - rev) >= NEGATIVE_CONTROL_MIN_MRR_GAIN
+
+        if is_exempt_baseline:
+            separates = True
+        elif errors or not full_coverage:
+            # A runner that errored on any query (compounded: score.py drops
+            # errored queries from per_query entirely -- run_all above) or
+            # otherwise did not cover every query cannot be trusted to
+            # support a verdict either way.
+            separates = False
+        else:
+            separates = gain > se
+
         result[display] = {
             "real_mrr": round(real, 4),
-            "reversed_mrr": round(rev, 4),
-            "gain": round(real - rev, 4),
+            "shuffled_mrr": round(shuffled, 4),
+            "gain": round(gain, 4),
+            "spread": round(spread, 4),
             "returns_nothing": returns_nothing,
+            "is_exempt_baseline": is_exempt_baseline,
             "separates": separates,
         }
         if not separates:
             failed.append(display)
     result["verdict"] = "inconclusive" if failed else "ok"
     result["failed_runners"] = failed
-    result["min_gain"] = NEGATIVE_CONTROL_MIN_MRR_GAIN
     return result
 
 
@@ -323,6 +432,33 @@ def print_table(summary: dict) -> None:
                 f"{s['recall@10']:>7.2f}{s['mrr']:>7.2f}{errcol:>8}"
             )
         print()
+
+
+def print_control(control: dict, runner_names) -> None:
+    """Prints the negative-control block for either the public or the
+    private gate (M3: "every run" in bench/README.md means every run --
+    the private gate calls this too, on nothing but the aggregate numbers
+    already safe to print there)."""
+    print("negative control (query/result association broken by a deterministic "
+          "derangement of the query list -- see bench/score.py's negative_control "
+          "comment; a runner must beat its own query-shuffled score by more than "
+          "that shuffled score's standard error to count as separating):")
+    for display in runner_names:
+        if display not in control:
+            continue
+        c = control[display]
+        note = " (returns nothing by design)" if c["is_exempt_baseline"] else ""
+        flag = "ok " if c["separates"] else "FLAT"
+        print(f"  {flag}  {display:22s} real {c['real_mrr']:.2f}  "
+              f"shuffled {c['shuffled_mrr']:.2f}  gain {c['gain']:+.2f}  "
+              f"(shuffled spread {c['spread']:.2f}){note}")
+    if control["verdict"] == "inconclusive":
+        print()
+        print("INCONCLUSIVE: " + ", ".join(control["failed_runners"])
+              + " did not beat their own query-shuffled score by more than that "
+                "score's standard error. The query set does not separate a "
+                "query-sensitive ranking from a query-blind one for these "
+                "runners, so their numbers say nothing about retrieval quality.")
 
 
 # ---------------------------------------------------------------------------
@@ -394,11 +530,21 @@ def run_private_gate(runner_specs: list[str], limit: int) -> int:
             return 0
         report = run_all(queries, root, runner_specs, limit)
         summary = summarize(report, queries)
-    # Only the aggregate table is ever printed here -- never a query's own
-    # text or the path substring it resolved against (see module docstring).
+        control = negative_control(report, queries) if len(queries) >= 2 else None
+    # Only the aggregate table and the control's own numbers are ever
+    # printed here -- never a query's own text or the path substring it
+    # resolved against (see module docstring). The control's inputs are
+    # score.py's own already-redacted `expect`/`ranked` id lists, never the
+    # private query text itself, so this is safe on the same grounds.
     print(f"private gate: {len(queries)} private questions, corpus = fixtures/records/ (untracked)\n")
     print_table(summary)
-    return 0
+    print()
+    if control is None:
+        print(f"negative control: skipped -- {len(queries)} private query(ies) resolved, "
+              f"need >= 2 for a derangement.")
+        return 0
+    print_control(control, list(summary))
+    return 1 if control["verdict"] == "inconclusive" else 0
 
 
 # ---------------------------------------------------------------------------
@@ -441,24 +587,15 @@ def main(argv=None) -> int:
               f"against corpus={corpus}\n")
         print_table(summary)
         print()
-        print(f"negative control (ranking reversed; a runner must gain >= "
-              f"{control['min_gain']} MRR to count as separating):")
-        for display in [d for d in summary if d in control]:
-            c = control[display]
-            note = " (returns nothing by design)" if c["returns_nothing"] else ""
-            flag = "ok " if c["separates"] else "FLAT"
-            print(f"  {flag}  {display:22s} real {c['real_mrr']:.2f}  "
-                  f"reversed {c['reversed_mrr']:.2f}  gain {c['gain']:+.2f}{note}")
-        if control["verdict"] == "inconclusive":
-            print()
-            print("INCONCLUSIVE: " + ", ".join(control["failed_runners"])
-                  + " scored no better than their own reversed ranking. The query "
-                    "set does not separate a working ranking from a destroyed one, "
-                    "so these numbers say nothing about retrieval quality.")
+        print_control(control, list(summary))
         for display, data in report.items():
             for qid, msg in data["errors"].items():
                 print(f"ERROR  {display}  {qid}: {msg}", file=sys.stderr)
-    return 0
+    # M3 (fix round, external review): INCONCLUSIVE used to still exit 0,
+    # so a caller/CI step that only checks the exit code would never
+    # notice the harness disowning its own numbers. bench/README.md
+    # documents this.
+    return 1 if control["verdict"] == "inconclusive" else 0
 
 
 if __name__ == "__main__":
