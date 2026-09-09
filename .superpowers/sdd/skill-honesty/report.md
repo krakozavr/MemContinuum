@@ -85,7 +85,7 @@ Deleted the advocacy paragraph ("It earns its keep on a codebase with contested 
 which of those you think this repo is, and let them decide.") per the correction and the original
 brief's "no reading of whether this particular repo deserves one."
 
-### S5 — owner follow-up: every state gets a prompt, safe option first
+### S5 — coordinator follow-up: every state gets a prompt, never destructive by accident
 
 Extended `## 2. Ask` to cover every reachable state, not just `undecided`:
 - `wired` — report facts first (`decision`, `wiring`, `decided_at`, `store`, `project`, `settings`
@@ -201,37 +201,40 @@ per-repo rows are untouched. This corrects the brief's S4 note ("it will flip ev
 stale") — that would only be true had `templates/memcontinuum-rules.md` or `repo-init.sh` itself
 been edited, which they were not.
 
-## Verify
+## Verify (re-run on the final shipped state, after the review-pass fixes in `4ee6e25`)
 
 All run natively (`PYTHONPATH=` cleared, `MEMCONTINUUM_PYTHON` the pinned venv), foreground,
-bounded timeouts, on the `skill-honesty` branch in `~/dev/memcontinuum-skill`.
+bounded timeouts, on the `skill-honesty` branch in `~/dev/memcontinuum-skill`. Each command was run
+twice across this task -- once after `f21d877`, once after the final commit -- both times clean;
+only the final numbers are kept below.
 
 - `python -m unittest tests.test_docs tests.test_repo_init tests.test_update tests.test_setup`:
-  **Ran 409 tests in 201.649s -- OK (skipped=2)**.
-- Full suite, `python -m unittest discover -s tests`: **Ran 1641 tests in 426.844s -- OK
+  **Ran 409 tests in 201.649s -- OK (skipped=2)** (`tests.test_docs` alone: 60 tests, 58 passed, 2
+  skipped, of which 8 are `TestSkillHonesty`).
+- Full suite, `python -m unittest discover -s tests`: **Ran 1642 tests in 392.713s -- OK
   (skipped=4)**, exit 0. (The `ERROR:`/`WARNING:` lines inside the log are memlint's own
   deliberate-malformed-fixture output, printed by the tests under test, not failures -- the
   summary line is the actual result.)
-- `bash tests/run_bash32.sh`: **Ran 665 tests in 351.215s -- OK**, exit 0, closing line
+- `bash tests/run_bash32.sh`: **Ran 665 tests in 327.660s -- OK**, exit 0, closing line
   `== CI SUMMARY: bash 3.2.57 (~/.cache/bash32/bin/bash) -- PASS ==`.
 
 ### Two dry runs -- same command, two checkout locations, `skill-honesty` branch's `repo-init.sh`
 
-`/mnt/c` checkout (Windows-mounted -- a throwaway `mc-probeB-<ts>` git repo under
+`/mnt/c` checkout (Windows-mounted -- a throwaway `mc-probeC-<ts>` git repo under
 `/mnt/c/Users/User/AppData/Local/Temp`, removed after):
 ```
-note: store defaults to ~/dev/mc-probeB-1788962843-MemContinuum-Store: the checkout is on a Windows-mounted drive, where a store walk costs seconds
-note: no --store given -- defaulting to ~/dev/mc-probeB-1788962843-MemContinuum-Store
-note: hooks will merge into /mnt/c/Users/User/AppData/Local/Temp/mc-probeB-1788962843/.claude
-  store       : ~/dev/mc-probeB-1788962843-MemContinuum-Store
+note: store defaults to ~/dev/mc-probeC-1788964066-MemContinuum-Store: the checkout is on a Windows-mounted drive, where a store walk costs seconds
+note: no --store given -- defaulting to ~/dev/mc-probeC-1788964066-MemContinuum-Store
+note: hooks will merge into /mnt/c/Users/User/AppData/Local/Temp/mc-probeC-1788964066/.claude
+  store       : ~/dev/mc-probeC-1788964066-MemContinuum-Store
 ```
 
-`$HOME/dev` checkout (native WSL disk -- a throwaway `mc-probeH-<ts>` git repo under `~/dev`,
+`$HOME/dev` checkout (native WSL disk -- a throwaway `mc-probeD-<ts>` git repo under `~/dev`,
 removed after):
 ```
-note: no --store given -- defaulting to ~/dev/mc-probeH-1788962843-MemContinuum-Store
-note: hooks will merge into ~/dev/mc-probeH-1788962843/.claude
-  store       : ~/dev/mc-probeH-1788962843-MemContinuum-Store
+note: no --store given -- defaulting to ~/dev/mc-probeD-1788964066-MemContinuum-Store
+note: hooks will merge into ~/dev/mc-probeD-1788964066/.claude
+  store       : ~/dev/mc-probeD-1788964066-MemContinuum-Store
 ```
 
 The `$HOME/dev` run carries no `Windows-mounted` note and no WSL-specific language at all -- just
