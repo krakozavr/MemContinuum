@@ -921,7 +921,28 @@ class TestSkillHonesty(unittest.TestCase):
     must be a pinned structured prompt for every state the skill can see --
     not prose, and not silent for `wired`/`declined`/`partial-wired`, which
     used to leave the agent to improvise (the same defect S2 fixed for
-    `undecided`, in three more states)."""
+    `undecided`, in three more states).
+
+    Fix round 2 (skill-honesty gate): both reviewers mutated a copy of
+    SKILL.md -- dropping options, reordering them, making the dry-run
+    optional, allowing store deletion, reintroducing a removed computed
+    rule under different wording -- and the ORIGINAL version of this class
+    caught none of it, because it only checked isolated substrings.
+    `_options()` below now pins each state's COMPLETE option list (text,
+    order, and count in one `assertEqual`, so a drop/add/reorder/reword all
+    fail), FORBIDDEN_PATTERNS below catches a removed rule regrown in
+    different words (not just its exact historical phrase), and
+    TestSkillHonestyMutations re-applies the reviewers' own mutations,
+    in-memory, against these tests to prove each one now fails.
+
+    What this class cannot catch, by construction: a computed rule restated
+    in wording that matches none of FORBIDDEN_PATTERNS (the pattern list is
+    finite, not a semantic diff against the tool's own source); a
+    dropped/altered SENTENCE inside an option's pinned text that some other
+    assertion doesn't happen to cover; and anything about behavior once an
+    agent leaves the page -- these tests read SKILL.md as text, they never
+    run it.
+    """
 
     # Exact phrases the old SKILL.md used to restate a rule repo-init.sh /
     # mc-registry-lib.sh computes on its own -- the default store's WSL-disk
@@ -934,6 +955,33 @@ class TestSkillHonesty(unittest.TestCase):
         "beside the git repo the cwd is in",
         "[A-Za-z0-9._-]+",
         "earns its keep",
+        "does not enforce this name",
+        "is REQUIRED here",
+        "except the one flow in step 4",
+    ]
+
+    # Same removed rules, but matched as PATTERNS rather than one exact
+    # historical phrase -- a reviewer mutation reintroduced the WSL rule as
+    # "Windows mounted" (no hyphen) and "$HOME/dev" (no full suffix),
+    # neither of which REMOVED_PHRASES above would catch.
+    FORBIDDEN_PATTERNS = [
+        (re.compile(r'windows[\s-]?mounted', re.IGNORECASE),
+         "the Windows-mounted-drive default-location rule repo-init.sh computes"),
+        (re.compile(r'\$HOME/dev\b'),
+         "the WSL default store location repo-init.sh computes"),
+        (re.compile(r'--store\b.{0,60}requires?\b.{0,60}--claude-dir', re.IGNORECASE | re.DOTALL),
+         "the --store/--claude-dir pairing repo-init.sh already enforces and reports"),
+        (re.compile(r'inside an existing git repo', re.IGNORECASE),
+         "the nested-repo refusal message repo-init.sh already prints"),
+        (re.compile(r'\bfive hooks\b', re.IGNORECASE),
+         "a hardcoded hook count (the write-side count is a fact of the templates, not this prose)"),
+    ]
+
+    STATE_MARKERS = [
+        ("**`undecided`**", "**`partial-wired`**"),
+        ("**`partial-wired`**", "**`wired`**"),
+        ("**`wired`**", "**`declined`**"),
+        ("**`declined`**", "**`not-a-repo`"),
     ]
 
     @staticmethod
@@ -941,6 +989,50 @@ class TestSkillHonesty(unittest.TestCase):
         start = text.index(start_marker)
         end = text.index(end_marker, start)
         return text[start:end]
+
+    @classmethod
+    def _ask_section(cls, text):
+        return cls._section(text, "## 2. Ask", "## 3. Act on the answer")
+
+    @staticmethod
+    def _options(section):
+        """Every top-level numbered option ("N. ...") in one state's prompt
+        section, in document order, each whitespace-normalized across its
+        own continuation lines (markdown hard-wraps prose, so a pinned
+        option can legitimately carry a newline+indent that isn't a wording
+        change). Line-based, not a single normalize-then-regex pass over
+        the whole section: a numbered list's continuation lines are never
+        blank-separated from their own item, but ARE separated from
+        whatever prose follows the list (e.g. `wired`'s "Moving a wired
+        store..." paragraph after its two options) -- the first blank line
+        ends the list, and nothing after it is captured, however many
+        digits it contains. Pinning len()+order+text in one assertEqual
+        against this list's output fails on a dropped, added, reordered, OR
+        reworded option -- not just a phrase substring, which is what let
+        every one of the reviewers' option mutations slip past the
+        original version of this class."""
+        items = []
+        current = None
+        for line in section.splitlines():
+            m = re.match(r'^\s*(\d+)\.\s+(.*)$', line)
+            if m:
+                if current is not None:
+                    items.append(current)
+                current = m.group(2).strip()
+            elif current is not None:
+                stripped = line.strip()
+                if stripped == "":
+                    items.append(current)
+                    current = None
+                else:
+                    current += " " + stripped
+        if current is not None:
+            items.append(current)
+        return items
+
+    @classmethod
+    def _state_options(cls, text, start_marker, end_marker):
+        return cls._options(cls._section(cls._ask_section(text), start_marker, end_marker))
 
     def test_no_computed_store_rules_restated(self):
         text = SKILL.read_text()
@@ -952,6 +1044,15 @@ class TestSkillHonesty(unittest.TestCase):
                 "output instead of predicting it"
             )
 
+    def test_no_computed_rule_restated_in_different_wording(self):
+        text = SKILL.read_text()
+        for pattern, label in self.FORBIDDEN_PATTERNS:
+            match = pattern.search(text)
+            self.assertIsNone(
+                match, f"SKILL.md restates {label}, using wording "
+                f"REMOVED_PHRASES does not pin ({match.group(0) if match else ''!r})"
+            )
+
     def test_store_location_points_at_the_dry_run_verbatim(self):
         text = SKILL.read_text()
         self.assertIn("dry-run", text)
@@ -960,7 +1061,7 @@ class TestSkillHonesty(unittest.TestCase):
 
     def test_consent_section_names_the_structured_prompt(self):
         text = SKILL.read_text()
-        section = self._section(text, "## 2. Ask", "## 3. Act on the answer")
+        section = self._ask_section(text)
         # Whitespace-normalized: markdown hard-wraps prose at ~80 columns, so
         # a pinned multi-word phrase can legitimately carry a newline+indent
         # between two of its words without the sentence having changed.
@@ -968,35 +1069,43 @@ class TestSkillHonesty(unittest.TestCase):
         self.assertIn("structured multiple-choice prompt", normalized)
         self.assertIn("never prose", normalized)
 
-    def test_undecided_names_all_four_options_in_order(self):
-        text = SKILL.read_text()
-        section = self._section(text, "## 2. Ask", "## 3. Act on the answer")
-        undecided = self._section(section, "**`undecided`**", "**`partial-wired`**")
-        options = [
-            "Yes, with code retrieval",
-            "Yes, rationale only",
+    def test_undecided_names_all_four_options_exactly(self):
+        options = self._state_options(SKILL.read_text(), "**`undecided`**", "**`partial-wired`**")
+        self.assertEqual(options, [
+            "Yes, with code retrieval — records, plus decisions surfaced before edits under the named code root",
+            "Yes, rationale only — records, no code retrieval",
             "No — record the decline; this repo is never asked again",
             "Not now — nothing is recorded; you will be asked again next session",
-        ]
-        positions = [undecided.index(opt) for opt in options]
-        self.assertEqual(positions, sorted(positions),
-                          "the four undecided options must appear in this exact order")
+        ])
 
-    def test_partial_wired_declined_wired_each_get_a_prompt(self):
-        # S5: a defect of the same shape as S2's ("one question, no
-        # advocacy" specified for `undecided` alone, leaving every other
-        # state to improvised prose) existed for `wired`, `declined` and
-        # `partial-wired` too. Each must now name its own prompt.
-        text = SKILL.read_text()
-        section = self._section(text, "## 2. Ask", "## 3. Act on the answer")
-        partial = self._section(section, "**`partial-wired`**", "**`wired`**")
-        wired = self._section(section, "**`wired`**", "**`declined`**")
-        declined = self._section(section, "**`declined`**", "**`not-a-repo`")
-        self.assertIn("1. Complete the wiring", partial)
-        self.assertIn("2. Remove what is there", partial)
-        self.assertIn("3. Not now", partial)
-        self.assertIn("1. Keep as is — nothing changes", wired)
-        self.assertIn("1. Keep declined", declined)
+    def test_partial_wired_names_all_three_options_exactly(self):
+        options = self._state_options(SKILL.read_text(), "**`partial-wired`**", "**`wired`**")
+        self.assertEqual(options, [
+            "Complete the wiring — finishes what a prior install left half-done",
+            "Remove what is there",
+            "Not now — leave it half-wired; asked again next session",
+        ])
+
+    def test_wired_names_both_options_exactly(self):
+        # Fix round 2 (B1): "Change where the store lives" and "Add or
+        # remove code retrieval" were dropped -- repo-init.sh re-renders a
+        # hook group entirely from the current invocation's own flags with
+        # no way to read back what was already wired, so either option was
+        # a data-loss trap (see step 4 and memory/incidents/ for the
+        # reproduction). Only the two options the tooling can do safely
+        # remain.
+        options = self._state_options(SKILL.read_text(), "**`wired`**", "**`declined`**")
+        self.assertEqual(options, [
+            "Keep as is — nothing changes",
+            "Stop using MemContinuum here — record the decline (the hooks stay wired until removed by hand; say so)",
+        ])
+
+    def test_declined_names_both_options_exactly(self):
+        options = self._state_options(SKILL.read_text(), "**`declined`**", "**`not-a-repo`")
+        self.assertEqual(options, [
+            "Keep declined",
+            "Wire it after all",
+        ])
 
     def test_wired_and_declined_first_option_keeps_the_recorded_answer(self):
         # The true invariant (corrected mid-task: the coordinator's own
@@ -1006,25 +1115,171 @@ class TestSkillHonesty(unittest.TestCase):
         # holds everywhere: a repo with a recorded answer (`wired`,
         # `declined`) always offers that answer, unchanged, as option 1.
         text = SKILL.read_text()
-        section = self._section(text, "## 2. Ask", "## 3. Act on the answer")
-        wired = self._section(section, "**`wired`**", "**`declined`**")
-        declined = self._section(section, "**`declined`**", "**`not-a-repo`")
-        self.assertIn("1. Keep as is — nothing changes", wired)
-        self.assertIn("1. Keep declined", declined)
+        wired = self._state_options(text, "**`wired`**", "**`declined`**")
+        declined = self._state_options(text, "**`declined`**", "**`not-a-repo`")
+        self.assertEqual(wired[0], "Keep as is — nothing changes")
+        self.assertEqual(declined[0], "Keep declined")
+
+    def test_no_option_ever_reads_as_deleting_a_store(self):
+        # Behavior-level guard rather than a phrase: scan every option's
+        # own text, in every state, for anything that reads as destroying
+        # the store -- catches a NEW destructive option added anywhere,
+        # regardless of the words it uses.
+        text = SKILL.read_text()
+        destructive = re.compile(r'delete|destroy|\bwipe\b|rm -rf', re.IGNORECASE)
+        for start, end in self.STATE_MARKERS:
+            for opt in self._state_options(text, start, end):
+                self.assertIsNone(
+                    destructive.search(opt),
+                    f"an option in {start} reads as deleting the store: {opt!r}"
+                )
 
     def test_no_option_ever_deletes_a_store_is_a_stated_rule(self):
         text = SKILL.read_text()
         # "## 5. Rules" is the last section -- slice to end of file rather
         # than to a following marker that does not exist.
         rules = text[text.index("## 5. Rules"):]
+        self.assertIn("Never delete a store, ever", rules)
         self.assertIn("never destructive by accident", rules)
         self.assertIn("recorded answer", rules)
 
+    def test_dry_run_is_never_optional(self):
+        # Pins the canonical dry-run paragraphs, whitespace-normalized,
+        # rather than a loose substring -- "make the dry-run optional" was
+        # one of the reviewers' mutations and the word "Always" is exactly
+        # what such a mutation would drop or hedge.
+        text = SKILL.read_text()
+        section = self._section(text, "## 3. Act on the answer", "## 4. Reversing")
+        normalized = " ".join(section.split())
+        self.assertIn(
+            "**Always dry-run first, and read the `store :` line — and any "
+            "`note:` line above it — out of that dry-run's own output, "
+            "verbatim, to the human.**",
+            normalized,
+        )
+        self.assertIn("Always dry-run first, show the plan, then run it.", normalized)
+
     def test_not_a_repo_and_no_config_get_no_prompt(self):
         text = SKILL.read_text()
-        section = self._section(text, "## 2. Ask", "## 3. Act on the answer")
+        section = self._ask_section(text)
         tail = section[section.index("**`not-a-repo`"):]
         self.assertIn("no prompt", tail)
+
+
+class TestSkillHonestyMutations(unittest.TestCase):
+    """Proves the pinned tests above actually catch what they claim to.
+    Both reviewers mutated a copy of SKILL.md and reported that every one of
+    the ORIGINAL TestSkillHonesty's eight tests still passed against it.
+    Each test here re-applies one of those mutations to SKILL.md's text IN
+    MEMORY (never touches the real file, never runs `unittest` as a
+    subprocess) and asserts the specific assertion that should catch it now
+    raises. A mutation whose regex/replace finds nothing to change is a
+    stale fixture, not a passing test -- guarded by assertNotEqual against
+    the unmutated text first."""
+
+    def setUp(self):
+        self.text = SKILL.read_text()
+        self.honesty = TestSkillHonesty()
+
+    def test_dropping_a_wired_option_is_caught(self):
+        mutated = self.text.replace(
+            "1. Keep as is — nothing changes\n"
+            "2. Stop using MemContinuum here — record the decline (the hooks stay wired\n"
+            "   until removed by hand; say so)\n",
+            "1. Keep as is — nothing changes\n",
+        )
+        self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
+        with self.assertRaises(AssertionError):
+            self.assertEqual(
+                self.honesty._state_options(mutated, "**`wired`**", "**`declined`**"),
+                self.honesty._state_options(self.text, "**`wired`**", "**`declined`**"),
+            )
+
+    def test_reordering_partial_wired_options_is_caught(self):
+        mutated = self.text.replace(
+            "1. Complete the wiring — finishes what a prior install left half-done\n"
+            "2. Remove what is there\n"
+            "3. Not now — leave it half-wired; asked again next session\n",
+            "1. Remove what is there\n"
+            "2. Complete the wiring — finishes what a prior install left half-done\n"
+            "3. Not now — leave it half-wired; asked again next session\n",
+        )
+        self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
+        with self.assertRaises(AssertionError):
+            self.assertEqual(
+                self.honesty._state_options(mutated, "**`partial-wired`**", "**`wired`**"),
+                self.honesty._state_options(self.text, "**`partial-wired`**", "**`wired`**"),
+            )
+
+    def test_adding_an_extra_undecided_option_is_caught(self):
+        mutated = self.text.replace(
+            "4. Not now — nothing is recorded; you will be asked again next session\n\n"
+            "**`partial-wired`**",
+            "4. Not now — nothing is recorded; you will be asked again next session\n"
+            "5. Maybe later — think about it and decide next week\n\n"
+            "**`partial-wired`**",
+        )
+        self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
+        with self.assertRaises(AssertionError):
+            self.assertEqual(
+                len(self.honesty._state_options(mutated, "**`undecided`**", "**`partial-wired`**")),
+                len(self.honesty._state_options(self.text, "**`undecided`**", "**`partial-wired`**")),
+            )
+
+    def test_making_the_dry_run_optional_is_caught(self):
+        mutated = self.text.replace("Always dry-run first, show the plan, then run it.",
+                                     "Optionally dry-run first, show the plan, then run it.")
+        self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
+        section = TestSkillHonesty._section(mutated, "## 3. Act on the answer", "## 4. Reversing")
+        normalized = " ".join(section.split())
+        self.assertNotIn("Always dry-run first, show the plan, then run it.", normalized)
+
+    def test_allowing_store_deletion_is_caught(self):
+        mutated = self.text.replace(
+            "1. Keep declined\n2. Wire it after all\n",
+            "1. Keep declined\n2. Wire it after all\n3. Delete the store and start over\n",
+        )
+        self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
+        with self.assertRaises(AssertionError):
+            for start, end in TestSkillHonesty.STATE_MARKERS:
+                for opt in self.honesty._state_options(mutated, start, end):
+                    self.assertIsNone(re.search(r'delete', opt, re.IGNORECASE), opt)
+
+    def test_reintroducing_the_wsl_rule_in_different_words_is_caught(self):
+        mutated = self.text.replace(
+            "**`undecided`** — four options:",
+            "On a Windows mounted drive the default landing spot is under "
+            "$HOME/dev.\n\n**`undecided`** — four options:",
+        )
+        self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
+        with self.assertRaises(AssertionError):
+            for pattern, _label in TestSkillHonesty.FORBIDDEN_PATTERNS:
+                self.assertIsNone(pattern.search(mutated))
+
+    def test_deleting_the_never_delete_rule_is_caught(self):
+        mutated = self.text.replace(
+            "- Never delete a store, ever, regardless of what is asked. Never move one\n"
+            "  either — this skill has no flow that relocates a store (step 4 says why:\n"
+            "  the tooling cannot yet carry a repo's complete wiring forward through a\n"
+            "  relocation without risking it).\n",
+            "",
+        )
+        self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
+        rules = mutated[mutated.index("## 5. Rules"):]
+        with self.assertRaises(AssertionError):
+            self.assertIn("Never delete a store, ever", rules)
+
+    def test_restoring_the_claude_dir_requirement_is_caught(self):
+        mutated = self.text.replace(
+            "## 3. Act on the answer",
+            "An explicit --store REQUIRES an explicit --claude-dir alongside it.\n\n"
+            "## 3. Act on the answer",
+            1,
+        )
+        self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
+        with self.assertRaises(AssertionError):
+            for pattern, _label in TestSkillHonesty.FORBIDDEN_PATTERNS:
+                self.assertIsNone(pattern.search(mutated))
 
 
 if __name__ == "__main__":
