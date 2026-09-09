@@ -52,59 +52,94 @@ wired before the decision registry existed: `decision=none` with
 evidence. Report `decision`/`wiring` plainly when they disagree; never guess
 either one from the presence of a directory.
 
-## 2. Ask, if the state is `undecided` or `partial-wired`
+## 2. Ask — a structured prompt for every state, safe option first
 
-One question, no advocacy. What the human is deciding: whether this repo should
-keep an append-only record of *why* its decisions were made — rulings,
-incidents, rejected alternatives — indexed and surfaced to agents when they
-touch related code. It costs a git repo for the store, five hooks in the
-project's `.claude/settings.local.json` (plus two more, for retrieval and the
-new-file reminder, when a `--code-root` is given), and the habit of writing
+One question, no advocacy: report what each option costs, then stop — never
+argue for one, never read whether this particular repo deserves it. **Invoking
+this skill is never destructive by accident: the first option offered is
+always the one that changes nothing.** Both rules govern every state below,
+not only `undecided`.
+
+Read `state=` from step 1 and ask through the interface's structured multiple-choice
+prompt, never prose. What the human is deciding, underneath
+every state's wording below: whether this repo keeps an append-only record of
+*why* its decisions were made — rulings, incidents, rejected alternatives —
+indexed and surfaced to agents when they touch related code. It costs a git
+repo for the store, hooks wired into the project's `.claude` settings (the
+dry-run's plan lists exactly which, and how many), and the habit of writing
 records.
 
-It earns its keep on a codebase with contested history that outlives one
-person's memory. It is overhead on a scratch repo, a fork you don't own, or
-anything you will delete next week. Say which of those you think this repo is,
-and let them decide.
+**`undecided`** — four options:
+
+1. Yes, with code retrieval — records, plus decisions surfaced before edits
+   under the named code root
+2. Yes, rationale only — records, no code retrieval
+3. No — record the decline; this repo is never asked again
+4. Not now — nothing is recorded; you will be asked again next session
+
+**`partial-wired`** (some but not all write-side hooks already present, no
+recorded decision) — three options:
+
+1. Complete the wiring — nothing has changed yet; finishes what a prior
+   install left half-done
+2. Remove what is there
+3. Not now — leave it half-wired; asked again next session
+
+**`wired`** — first report the state as facts, straight out of step 1's own
+output (`decision`, `wiring`, `decided_at`, `store`, `project`, `settings`),
+then offer:
+
+1. Keep as is — nothing changes
+2. Change where the store lives
+3. Add or remove code retrieval
+4. Stop using MemContinuum here — record the decline (the hooks stay wired
+   until removed by hand; say so)
+
+**`declined`** — two options:
+
+1. Keep declined
+2. Wire it after all
+
+**`not-a-repo` / `no-config`** — no prompt: state the fact and stop. These
+are the only states where a prompt would be theatre.
+
+Act on whichever option the human picks using step 3 below (a fresh
+`undecided` install, or the `partial-wired` repair) or step 4 (every other
+change to an existing answer).
 
 ## 3. Act on the answer
 
 **Yes → initialize.** Two facts are needed and both are the human's call:
 
-- `--project NAME` — the index namespace, also `<NAME>.sqlite`. Must match
-  `[A-Za-z0-9._-]+` (repo-init.sh refuses anything else — it is embedded as
-  an identity marker in every hook command line).
-- `--store DIR` — where the store lives. It must be **its own git repo**, and
-  by default `scripts/repo-init.sh` refuses a location inside another repo's working
-  tree (`--force` overrides); it also refuses an existing git repo at `DIR` that carries
-  none of this tool's markers (this protects against a mistyped `--store`
-  landing store directories in an unrelated repo; adopt an existing store by pointing at
-  one that already has `topics/`/`incidents/`/`concepts/` or a README mentioning
-  MemContinuum). **Naming convention: the folder is called
-  `MemContinuum-Store`** — marked as this tool's, never a
-  generic `memory/` (collides with other memory systems) and never bare
-  `MemContinuum` (reads as the tool itself). Omit `--store` and repo-init
-  applies the convention on its own: `<repo>-MemContinuum-Store` beside the
-  git repo the cwd is in, else `MemContinuum-Store` inside the cwd — except
-  when the checkout is physically on a Windows-mounted drive under WSL, where
-  a store walk costs seconds rather than milliseconds: there the default
-  instead lands on the WSL disk, at `$HOME/dev/<repo>-MemContinuum-Store` (or
-  bare `$HOME/<repo>-MemContinuum-Store` when `$HOME/dev` does not exist),
-  and `repo-init.sh` prints why. Only pass
-  `--store` when the human wants a different place — and when you do, pass
-  `--claude-dir` alongside it (`repo-init.sh` refuses an explicit `--store`
-  with no explicit `--claude-dir` rather than guess which `.claude` its hooks
-  belong in).
+- `--project NAME` — the index namespace, also `<NAME>.sqlite`. Pick whatever
+  name the human wants; if `repo-init.sh` refuses it, its own message names
+  the characters it allows.
+- `--store DIR` — where the store lives. **Naming convention: the folder is
+  called `MemContinuum-Store`** — marked as this tool's, never a generic
+  `memory/` (collides with other memory systems) and never bare
+  `MemContinuum` (reads as the tool itself). `repo-init.sh` does not enforce
+  this name on an explicit `--store` — getting it right is the human's call,
+  not a mistake the tool will catch.
+
+  Omit `--store` and let `repo-init.sh` pick the default. **Always dry-run
+  first, and read the `store :` line — and any `note:` line above it — out
+  of that dry-run's own output, verbatim, to the human.** Never predict,
+  describe, or explain where the default will land, on any platform: the
+  rule that computes it lives in `scripts/mc-registry-lib.sh` and can change
+  without this skill knowing, so the only honest answer is whatever the tool
+  just printed.
 - `--code-root DIR` — repeatable; the code checkout(s) whose edits should
   trigger retrieval. Omit for a rationale-only store.
 
-**If the state was `partial-wired`** (some but not all five write-side hooks
-already present, no recorded decision), a human "yes" is a repair, not a
-fresh install: re-run `scripts/repo-init.sh` with the same `--store`/
-`--project` the repo already has (from step 1's `store=`/`project=` lines) so
-it completes the missing wiring — `memcontinuum-decide.sh wired` refuses
-anything short of `wiring=full` and names the missing hooks. Only after
-`repo-init.sh` reports full wiring does `decide.sh wired` succeed.
+**"Complete the wiring" on a `partial-wired` repo** is a repair, not a fresh
+install: re-run `scripts/repo-init.sh` with the same `--store`/`--project`
+the repo already has (from step 1's `store=`/`project=` lines) so it
+completes the missing wiring, then record it as below.
+
+**"Remove what is there" on a `partial-wired` repo**: no decision was ever
+recorded (`decision=none`), so there is no registry row to touch — just the
+hooks that already exist. Remove them by hand the same way as README.md
+"Uninstall" step 1.
 
 Always dry-run first, show the plan, then run it. **With a `--code-root`,
 never invoke `repo-init.sh` bare and interactive** — you (Claude Code's Bash
@@ -177,25 +212,53 @@ bash "$ENGINE/scripts/memcontinuum-decide.sh" declined --repo REPO
 for the rest of this session and asks again next time. An unrecorded maybe is
 correct here — do not invent a decision to silence a prompt.
 
-## 4. Reversing an earlier answer
+## 4. Reversing or changing an earlier answer
 
 Either direction, at any point in a repo's life:
 
-- declined → wanted: run the `scripts/repo-init.sh` steps above, then
+- declined → wanted ("wire it after all" on a `declined` repo): run the
+  `scripts/repo-init.sh` steps above, then
   `memcontinuum-decide.sh wired --repo REPO ...`.
-- wired → unwanted: `memcontinuum-decide.sh declined --repo REPO` records it,
-  but that only stops the *asking*. The hooks stay wired until they are removed — see
+- wired → unwanted ("stop using MemContinuum here" on a `wired` repo):
+  `memcontinuum-decide.sh declined --repo REPO` records it, but that only
+  stops the *asking*. The hooks stay wired until they are removed — see
   README.md "Uninstall". Tell the human which of the two they want; do not
   delete a store, ever. A store is its own git history, not an installer
   artifact.
+- wired → a different store location ("change where the store lives"): move
+  the store directory yourself — it is a plain git working tree, nothing
+  installer-owned about where it sits — then
+  `repo-init.sh --project NAME --store NEWDIR --claude-dir CLAUDE_DIR
+  --adopt-only` (carry over the `--code-root`/`--langs`/`--never-ext` the
+  repo already has, from step 1's lines) so the hooks point at the new path,
+  then `memcontinuum-decide.sh wired --repo REPO --store NEWDIR
+  --project NAME ...` to update the registry.
+- wired → add code retrieval: the driven `--code-root` flow under "Yes →
+  initialize" above, for the new root, then `memcontinuum-decide.sh wired
+  --repo REPO --code-root DIR ...` naming every code-root the repo should
+  have going forward (`decide.sh` replaces the row's code-roots, it does not
+  union them with what was recorded before).
+- wired → remove code retrieval: there is no flag that drops a `--code-root`
+  from wiring once installed — removing the PreToolUse hook itself is a
+  hand-edit, same as README.md "Uninstall" step 1. Then re-run
+  `memcontinuum-decide.sh wired --repo REPO ...` naming only the code-roots
+  that remain, so the registry matches.
 - never ask in any repo on this machine: `memcontinuum-decide.sh never-ask`;
   undo with `memcontinuum-decide.sh ask-again`.
 
 ## 5. Rules
 
 - Never initialize without an explicit yes in this conversation.
-- Never delete or move an existing store.
+- Never delete a store, ever, regardless of what is asked. Never move one
+  either, except the one flow in step 4 that exists precisely because a
+  human explicitly chose "change where the store lives" — outside that
+  flow, on your own initiative, a store never moves.
 - Never write a decision the human did not give you.
+- One question, no advocacy, governs every prompt in step 2, for every
+  state — never argue for an option, never read whether a repo deserves
+  one.
+- The first option in every prompt in step 2 is always the one that changes
+  nothing: invoking this skill is never destructive by accident.
 - If `state=no-config`, MemContinuum was never bootstrapped on this machine.
   Point at `memcontinuum-setup.sh`; do not run it unasked.
 - When two `status: active` links (in the same topic or across topics)

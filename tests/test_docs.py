@@ -910,5 +910,106 @@ class TestInternalsDocumentsTreeSitterTier(unittest.TestCase):
             )
 
 
+class TestSkillHonesty(unittest.TestCase):
+    """skill-honesty: the memcontinuum skill is an agent's operating manual,
+    not documentation about code -- anything it restates that repo-init.sh /
+    mc-registry-lib.sh already compute (the default store location, its
+    refusals) will drift the moment the code changes, unseen, exactly as it
+    did for nine days before this fix (memory/incidents/
+    machine-layer-drifted-unseen-for-nine-days.md). It must instead point the
+    agent at the dry-run's own printed output. Separately, the consent flow
+    must be a pinned structured prompt for every state the skill can see --
+    not prose, and not silent for `wired`/`declined`/`partial-wired`, which
+    used to leave the agent to improvise (the same defect S2 fixed for
+    `undecided`, in three more states)."""
+
+    # Exact phrases the old SKILL.md used to restate a rule repo-init.sh /
+    # mc-registry-lib.sh computes on its own -- the default store's WSL-disk
+    # rule and its plain-sibling fallback, and --project's character class.
+    # Regrowing any of these means the skill is predicting an answer again
+    # instead of reading it off the tool's own dry-run output.
+    REMOVED_PHRASES = [
+        "Windows-mounted",
+        "$HOME/dev/<repo>-MemContinuum-Store",
+        "beside the git repo the cwd is in",
+        "[A-Za-z0-9._-]+",
+        "earns its keep",
+    ]
+
+    @staticmethod
+    def _section(text, start_marker, end_marker):
+        start = text.index(start_marker)
+        end = text.index(end_marker, start)
+        return text[start:end]
+
+    def test_no_computed_store_rules_restated(self):
+        text = SKILL.read_text()
+        for phrase in self.REMOVED_PHRASES:
+            self.assertNotIn(
+                phrase, text,
+                f"SKILL.md restates a rule repo-init.sh/mc-registry-lib.sh "
+                f"computes ({phrase!r}) -- point at the dry-run's own "
+                "output instead of predicting it"
+            )
+
+    def test_store_location_points_at_the_dry_run_verbatim(self):
+        text = SKILL.read_text()
+        self.assertIn("dry-run", text)
+        self.assertIn("verbatim", text)
+        self.assertIn("`store :` line", text)
+
+    def test_consent_section_names_the_structured_prompt(self):
+        text = SKILL.read_text()
+        section = self._section(text, "## 2. Ask", "## 3. Act on the answer")
+        # Whitespace-normalized: markdown hard-wraps prose at ~80 columns, so
+        # a pinned multi-word phrase can legitimately carry a newline+indent
+        # between two of its words without the sentence having changed.
+        normalized = " ".join(section.split())
+        self.assertIn("structured multiple-choice prompt", normalized)
+        self.assertIn("never prose", normalized)
+
+    def test_undecided_names_all_four_options_in_order(self):
+        text = SKILL.read_text()
+        section = self._section(text, "## 2. Ask", "## 3. Act on the answer")
+        undecided = self._section(section, "**`undecided`**", "**`partial-wired`**")
+        options = [
+            "Yes, with code retrieval",
+            "Yes, rationale only",
+            "No — record the decline; this repo is never asked again",
+            "Not now — nothing is recorded; you will be asked again next session",
+        ]
+        positions = [undecided.index(opt) for opt in options]
+        self.assertEqual(positions, sorted(positions),
+                          "the four undecided options must appear in this exact order")
+
+    def test_partial_wired_declined_wired_each_get_a_prompt_with_safe_option_first(self):
+        # S5: a defect of the same shape as S2's ("one question, no
+        # advocacy" specified for `undecided` alone, leaving every other
+        # state to improvised prose) existed for `wired`, `declined` and
+        # `partial-wired` too. Each must now name its own prompt, and its
+        # first option must be the one that changes nothing.
+        text = SKILL.read_text()
+        section = self._section(text, "## 2. Ask", "## 3. Act on the answer")
+        partial = self._section(section, "**`partial-wired`**", "**`wired`**")
+        wired = self._section(section, "**`wired`**", "**`declined`**")
+        declined = self._section(section, "**`declined`**", "**`not-a-repo`")
+        self.assertIn("1. Complete the wiring", partial)
+        self.assertIn("1. Keep as is — nothing changes", wired)
+        self.assertIn("1. Keep declined", declined)
+
+    def test_first_option_never_changes_anything_is_a_stated_rule(self):
+        text = SKILL.read_text()
+        # "## 5. Rules" is the last section -- slice to end of file rather
+        # than to a following marker that does not exist.
+        rules = text[text.index("## 5. Rules"):]
+        self.assertIn("never destructive by accident", rules)
+
+    def test_not_a_repo_and_no_config_get_no_prompt(self):
+        text = SKILL.read_text()
+        section = self._section(text, "## 2. Ask", "## 3. Act on the answer")
+        tail = section[section.index("**`not-a-repo`"):]
+        self.assertIn("no prompt", tail)
+
+
 if __name__ == "__main__":
     unittest.main()
