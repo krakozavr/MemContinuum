@@ -742,9 +742,13 @@ def print_control(control: dict, runner_names) -> None:
     print("negative control (query/result association broken by a deterministic, "
           "kind-preserving derangement of the query list -- see bench/score.py's "
           "negative_control comment; a MINIMUM-EFFECT FLOOR, not a calibrated "
-          "significance test: a runner must beat its own query-shuffled score by "
-          "more than that shuffled score's sample standard error, printed below "
-          "as `se`, to count as separating):")
+          "significance test: a runner must beat its own query-shuffled score "
+          "by more than the sample SE of its own real-minus-shuffled PAIRED "
+          "DIFFERENCES, printed below as `se`, to count as separating):")
+    print("  catches a STATELESS runner blind to query TEXT that branches on at "
+          "most `kind` -- NOT a runner that persists state across invocations "
+          "and keys on call order; see bench/README.md's \"What this control "
+          "actually claims\".")
     for display in runner_names:
         if display not in control:
             continue
@@ -757,8 +761,10 @@ def print_control(control: dict, runner_names) -> None:
     if control["verdict"] == "inconclusive":
         print()
         print("INCONCLUSIVE: " + ", ".join(control["failed_runners"])
-              + " did not beat their own query-shuffled score by more than that "
-                "score's sample standard error. The query set does not separate a "
+              + " did not beat their own query-shuffled score by more than the "
+                "sample SE of their own paired differences. Within this control's "
+                "narrowed claim (a stateless runner blind to query text, keying "
+                "at most on `kind`), the query set does not separate a "
                 "query-sensitive ranking from a query-blind one for these "
                 "runners, so their numbers say nothing about retrieval quality.")
 
