@@ -54,8 +54,10 @@ either one from the presence of a directory.
 
 ## 2. Ask — a structured prompt for every state, never destructive by accident
 
-One question, no advocacy: report what each option costs, then stop — never
-argue for one, never read whether this particular repo deserves it. **No
+One question, no advocacy: report each option in the words given below it —
+its cost where one is named there, otherwise what it does — then stop; never
+add a cost or a justification of your own, never argue for one, never read
+whether this particular repo deserves it. **No
 option ever deletes a store** (Section 5 makes this absolute, on its own).
 **Where the repo already has a recorded answer (`wired`, `declined`), the
 first option offered always keeps it, unchanged; where it does not, an
@@ -69,8 +71,10 @@ every state's wording below: whether this repo keeps an append-only record of
 *why* its decisions were made — rulings, incidents, rejected alternatives —
 indexed and surfaced to agents when they touch related code. It costs a git
 repo for the store, hooks wired into the project's `.claude` settings (the
-dry-run's plan lists exactly which, and how many), and the habit of writing
-records.
+dry-run's plan names the `code roots :` line for retrieval, and how many
+hook groups merge into each event — not the individual hook script names;
+read the plan's own lines to the human rather than restating them), and the
+habit of writing records.
 
 **`undecided`** — four options:
 
@@ -92,10 +96,23 @@ output (`decision`, `wiring`, `decided_at`, `store`, `project`, `settings`),
 then offer:
 
 1. Keep as is — nothing changes
-2. Change where the store lives
-3. Add or remove code retrieval
-4. Stop using MemContinuum here — record the decline (the hooks stay wired
+2. Stop using MemContinuum here — record the decline (the hooks stay wired
    until removed by hand; say so)
+
+Moving a wired store, or changing its code-root set, is not offered here:
+`repo-init.sh` re-renders each hook GROUP entirely from whatever flags the
+current invocation gives it — it does not read back what is already wired —
+so a driven relocation or code-root change can silently drop hooks or
+registry fields nothing then warns about (see step 4). Until something
+reads back the complete current set for the agent to carry forward, an
+option offering that path would be destructive by accident, which Section 5
+forbids. If the human wants either, say so plainly and point at step 4's
+manual path.
+
+Neither option here repairs broken wiring: `state=wired` also covers
+`decision=wired` with `wiring=partial` (a hand-edited or interrupted
+settings file). "Keep as is" leaves it broken; there is no third option that
+fixes it. Say so plainly if step 1 showed that combination.
 
 **`declined`** — two options:
 
@@ -119,9 +136,8 @@ change to an existing answer).
 - `--store DIR` — where the store lives. **Naming convention: the folder is
   called `MemContinuum-Store`** — marked as this tool's, never a generic
   `memory/` (collides with other memory systems) and never bare
-  `MemContinuum` (reads as the tool itself). `repo-init.sh` does not enforce
-  this name on an explicit `--store` — getting it right is the human's call,
-  not a mistake the tool will catch.
+  `MemContinuum` (reads as the tool itself). Getting it right on an explicit
+  `--store` is the human's call.
 
   Omit `--store` and let `repo-init.sh` pick the default. **Always dry-run
   first, and read the `store :` line — and any `note:` line above it — out
@@ -134,9 +150,20 @@ change to an existing answer).
   trigger retrieval. Omit for a rationale-only store.
 
 **"Complete the wiring" on a `partial-wired` repo** is a repair, not a fresh
-install: re-run `scripts/repo-init.sh` with the same `--store`/`--project`
-the repo already has (from step 1's `store=`/`project=` lines) so it
-completes the missing wiring, then record it as below.
+install — but ONLY when this repo has no existing code retrieval: check
+`<claude-dir>/settings.local.json` (and `settings.json`) yourself for a
+`PreToolUse` entry naming `pre-edit-chain.sh`. If neither file has one,
+re-run `scripts/repo-init.sh` with the same `--store`/`--project` the repo
+already has (from step 1's `store=`/`project=` lines) so it completes the
+missing wiring, then record it as below. If either file DOES have one,
+re-running `repo-init.sh` bare would re-render the `PreToolUse` group from
+scratch and drop that code-root wiring silently — the same failure mode
+step 4 describes for a `wired` repo. Do not run it: tell the human this
+repo's `PreToolUse` wiring can't be safely repaired by re-running the
+installer today, and the options are hand-adding just the missing
+always-wired hook entries (README.md "Uninstall" step 1's list, in
+reverse), or re-driving the full "Yes, with code retrieval" census flow
+naming every code-root that should exist.
 
 **"Remove what is there" on a `partial-wired` repo**: no decision was ever
 recorded (`decision=none`), so there is no registry row to touch — just the
@@ -195,10 +222,10 @@ cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME --dry-run
 cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME
 ```
 
-Then record it. `--repo REPO` is REQUIRED here: `wired`, `declined`, and
-`forget` all silence or unsilence a specific repo permanently, and there is
-no safe default for that -- name the repo, don't rely on whatever directory
-the shell happens to be sitting in:
+Then record it. Always pass `--repo REPO` explicitly: `wired`, `declined`,
+and `forget` all silence or unsilence a specific repo permanently, and there
+is no safe default for that -- name the repo, don't rely on whatever
+directory the shell happens to be sitting in:
 
 ```bash
 bash "$ENGINE/scripts/memcontinuum-decide.sh" wired --repo REPO --store DIR --project NAME
@@ -227,25 +254,21 @@ Either direction, at any point in a repo's life:
   README.md "Uninstall". Tell the human which of the two they want; do not
   delete a store, ever. A store is its own git history, not an installer
   artifact.
-- wired → a different store location ("change where the store lives"): move
-  the store directory yourself — it is a plain git working tree, nothing
-  installer-owned about where it sits — then
-  `repo-init.sh --project NAME --store NEWDIR --claude-dir CLAUDE_DIR
-  --adopt-only` (carry over the `--code-root`/`--langs`/`--never-ext` the
-  repo already has, from step 1's lines) so the hooks point at the new path,
-  then `memcontinuum-decide.sh wired --repo REPO --store NEWDIR
-  --project NAME ...` to update the registry.
-- wired → add code retrieval: the driven `--code-root` flow under "Yes →
-  initialize" above, for the new root, then `memcontinuum-decide.sh wired
-  --repo REPO --code-root DIR ...` naming every code-root the repo should
-  have going forward (`decide.sh` replaces the row's code-roots, it does not
-  union them with what was recorded before).
-- wired → remove code retrieval: there is no flag that drops a `--code-root`
-  from wiring once installed — removing that code-root's own hook entries
-  (the dry-run's plan lists them) is a hand-edit, same as README.md
-  "Uninstall" step 1. Then re-run
-  `memcontinuum-decide.sh wired --repo REPO ...` naming only the code-roots
-  that remain, so the registry matches.
+- wired → a different store location, or a different code-root set: **not
+  offered by this skill.** `scripts/repo-init.sh` re-renders each hook
+  GROUP entirely from whatever `--code-root`/`--langs`/`--never-ext` flags
+  the current invocation gives it — it never reads back what a prior run
+  already wired — and `scripts/memcontinuum-state.sh` does not print the
+  existing `code-roots`/`langs` either, so there is no source an agent can
+  read the complete current set from. Passing only the new or changed root
+  silently drops the others from both the hooks and (via
+  `memcontinuum-decide.sh`, which also replaces rather than unions when
+  called this way) the registry, while `wiring=` goes on reading `full`.
+  Tell the human this isn't automated yet. The only safe path today: follow
+  README.md "Uninstall" completely (hooks, skill, rules file, store git
+  hooks — leave the store's own content alone), then run a fresh "Yes, with
+  code retrieval" install naming every code-root the repo should end up
+  with, at the new location if one is moving.
 - never ask in any repo on this machine: `memcontinuum-decide.sh never-ask`;
   undo with `memcontinuum-decide.sh ask-again`.
 
@@ -253,9 +276,9 @@ Either direction, at any point in a repo's life:
 
 - Never initialize without an explicit yes in this conversation.
 - Never delete a store, ever, regardless of what is asked. Never move one
-  either, except the one flow in step 4 that exists precisely because a
-  human explicitly chose "change where the store lives" — outside that
-  flow, on your own initiative, a store never moves.
+  either — this skill has no flow that relocates a store (step 4 says why:
+  the tooling cannot yet carry a repo's complete wiring forward through a
+  relocation without risking it).
 - Never write a decision the human did not give you.
 - One question, no advocacy, governs every prompt in step 2, for every
   state — never argue for an option, never read whether a repo deserves
