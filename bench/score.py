@@ -432,18 +432,59 @@ def run_all(queries: list[dict], corpus: Path, runner_specs: list[str], limit: i
 # paired differences," nothing more. (Fix round 2 considered replacing this
 # with a real permutation test over many kind-preserving derangements
 # instead -- cheap, since it only re-scores the already-cached `ranked`
-# output rather than re-running any runner. It was NOT adopted: built and
-# checked against the one-hit-runner case below, it does not actually fail
-# that case either -- when another query in the same kind group happens to
-# share the one-hit runner's lone correct expect (this corpus has such
-# pairs, e.g. path-01/path-20), a permutation test correctly and honestly
-# reports that single hit as distinguishable from chance, because under
-# that specific null model it genuinely is: no relabeling among that
-# derangement family ever reproduces it by luck. The one-hit-runner
-# complaint below is a SMALL-SAMPLE EFFECT-SIZE problem, not a defect in
-# how the null is built -- a fancier null does not fix it, so the simpler,
-# cheaper, already-narrowly-scoped calibration was kept instead of adding
-# permutation-test machinery that would not have changed this outcome.)
+# output rather than re-running any runner. It was NOT adopted, but fix
+# round 3 (a THIRD external re-gate, both reviewers independently, same
+# finding) established that the reason written here for not adopting it
+# was FALSE and has been rewritten.
+#
+# The false claim was that a permutation test "does not fail" (lets pass)
+# a one-hit runner whenever some other same-kind query shares its lone
+# correct expect. Both reviewers computed actual numbers for the REAL
+# corpus's path-01, whose one-hit answer (CON-301) is shared by exactly
+# one other path query (path-20, out of the other 19): Codex computed the
+# EXACT derangement-tail probability, 1/19 = 0.05263 -- just ABOVE the
+# conventional 5% threshold, i.e. a strict permutation test does NOT call
+# this one-hit runner significant. Grok built a 2000-draw kind-preserving
+# permutation test on the SAME scenario and got an estimate of p = 0.0465
+# -- just BELOW that threshold. These are not two different findings about
+# two different runners: they are an exact value and a 2000-draw Monte
+# Carlo estimate of the SAME probability, straddling 0.05 because the true
+# value (0.0526) sits close enough to the threshold that finite-sample
+# noise moves the verdict across it (a 2000-draw binomial estimate of a
+# probability near 0.05 has a standard error of about 0.005 -- a
+# from-scratch simulation run for this fix round landed at 0.0505, also on
+# the other side from Codex's exact value, confirming this is sampling
+# noise, not a second scenario). Separately, Grok also computed a truly
+# DIFFERENT, synthetic scenario -- a one-hit runner whose lone correct
+# expect is UNIQUE within a 57-query kind group, nothing else able to
+# match it by chance -- and got p=0 there (maximally significant). Both of
+# Grok's numbers agree on the DIRECTION the removed text had backwards: a
+# SHARED expect (path-01/path-20, p near 0.05) makes a one-hit runner's
+# result LESS significant than a UNIQUE one (p=0), not more -- the removed
+# text treated "another query shares the expect" as the reason the hit
+# would look significant, when sharing is what makes the coincidence MORE
+# plausible, not less.
+#
+# The true reason a permutation test is not used here: it and this floor
+# answer DIFFERENT questions, and the path-01 straddle above is the
+# demonstration, not a caveat. A permutation test asks "is this observed
+# gain distinguishable from what this one derangement family produces by
+# chance" -- and for this corpus's own one-hit path-01 case, that question
+# does not have a stable answer: the exact probability sits close enough
+# to the conventional 5% line that a real permutation-test IMPLEMENTATION
+# (necessarily a finite number of draws, since the kind-preserving
+# derangement space is too large to enumerate exhaustively for the
+# `question` group) can land on either side of the line depending on
+# nothing but its own random draws. This floor instead asks "is the
+# observed gain bigger than the smallest effect this design can even
+# express, one correct guess out of n" -- a question whose answer does not
+# depend on a coin-flip-close significance threshold or on how many
+# queries happen to share the one id a one-hit runner guessed. A runner
+# that hardcodes a single id and gets nothing else right is not evidence
+# of real retrieval merely because that id happens to be rare in its kind
+# group; preferring the effect-size floor over a significance test is what
+# keeps the verdict from depending on that corpus accident, or on a
+# permutation test's own sampling noise.)
 #
 # Fix round 2 also corrected an arithmetic error in the calibration itself
 # (MAJOR, both reviewers): the previous code used `statistics.pstdev`
@@ -542,7 +583,10 @@ def negative_control(report: dict, queries: list[dict]) -> dict:
     """{runner: {"real_mrr", "shuffled_mrr", "gain", "spread", "se",
     "returns_nothing", "is_exempt_baseline", "separates"}} plus "verdict":
     "ok" | "inconclusive", naming the runners that failed. See the module
-    comment above for the derangement and the calibrated threshold; see
+    comment above for the derangement and the non-calibrated effect-size
+    floor (NOT a "calibrated threshold" -- see the module comment's
+    "Calibration:" paragraph for why that word is deliberately avoided);
+    see
     `run_all`'s `is_canonical_null_baseline` for the one exemption, bound to
     the resolved runner script path, never to `display`."""
     expect_by_id = {q["id"]: q["expect"] for q in queries}
