@@ -346,6 +346,45 @@ def run_all(queries: list[dict], corpus: Path, runner_specs: list[str], limit: i
 # that is blind to the query" in full generality. bench/README.md states
 # this narrowed claim too.
 #
+# Narrower still (fix round 3, a THIRD external re-gate, both reviewers
+# independently): this control assumes a STATELESS runner -- one whose
+# output for a given (kind, query) is a pure function of that invocation
+# alone. Both reviewers built a runner that reads neither `--query` nor
+# `--kind` at all: it persists an invocation counter across subprocess
+# calls (a file under its own scratch state) and keys its answer on that
+# ordinal position instead. `run_all` invokes every query in one FIXED
+# sequence (this file's own `queries.jsonl` order) on every run, and this
+# corpus's `path` expects happen to line up with part of that numbering
+# (`path-01` through `path-03`, plus several later ones) purely by
+# authoring coincidence. Grok's WEAKER variant, `order_seq.py`, exploits
+# ONLY that coincidence -- it has NO knowledge of the actual answer key at
+# all, it just prints the mechanically guessed id `TOP-{101+n}` for call
+# number n -- and still scored real MRR 0.14, gain +0.14, exit 0: this is
+# the more alarming case, since it needs nothing but a numbering
+# convention to beat the control. Both reviewers also built a STRONGER
+# variant that additionally bakes the actual published answer sequence in
+# by ordinal position (Grok's `order_key.py`, and Codex's equivalent):
+# real MRR 1.00, gain +0.98 -- near-perfect, since it does not depend on
+# any authoring coincidence at all. Neither reviewer proposes closing
+# this: the runner contract (`run_query`'s CLI
+# interface) never requires statelessness, and no derangement of ALREADY-
+# COMPUTED per-query output can distinguish "this output came from reading
+# the query" from "this output came from a counter," because the leak is
+# in HOW the output was produced, not in the (kind, query) -> output
+# mapping the derangement inspects. A per-run random invocation order was
+# considered and rejected: either it uses a fixed seed, in which case the
+# exact schedule is as public and hardcodable as today's fixed order (the
+# same problem, moved), or it uses a true per-run random order, which
+# breaks this control's own no-RNG/reproducibility requirement (see
+# "Calibration" below) for a defense that only raises the cost of the
+# same attack, not closes it -- a stateful runner can persist per-query-id
+# state instead of per-ordinal-position state just as easily. The honest
+# claim, stated here and in bench/README.md and in `print_control`'s
+# output: this control catches a STATELESS runner blind to query TEXT
+# that keys on `kind` (or an equivalent partition) -- a runner that
+# persists state across invocations and keys on call order is outside
+# what this design can catch.
+#
 # The derangement: one rotation per kind group (not one rotation over the
 # whole list), each by an offset COPRIME with that group's own size --
 # `_coprime_offset_near_half` -- rather than always using half the group's

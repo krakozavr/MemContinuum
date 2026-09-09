@@ -405,16 +405,43 @@ query set is easy enough that a runner ignoring the query entirely scores as
 well as the real one, the metric is measuring the corpus rather than the
 retrieval, and the headline figure is noise.
 
-**What this control actually claims (narrowed, fix round 2).** It catches a
-runner that ignores the query TEXT and, at most, branches on `kind` — the one
-other channel `score.py` hands a runner separately from the query text (see
-"Runner interface" above: `--kind` and `--query` are both passed). It is
-**not** a general proof that "any query-blind runner fails" — a runner that
-reads the query text and branches on some OTHER signal uncorrelated with
-`kind` is not provably caught by this design. `kind` is the one channel
-targeted because it is the one this benchmark's own CLI contract hands a
-runner outside the query text, and it is the one two independent external
-reviewers demonstrated a working exploit against.
+**What this control actually claims (narrowed, fix round 2 and 3).** It
+catches a **stateless** runner that ignores the query TEXT and, at most,
+branches on `kind` — the one other channel `score.py` hands a runner
+separately from the query text (see "Runner interface" above: `--kind` and
+`--query` are both passed). It is **not** a general proof that "any
+query-blind runner fails" — a runner that reads the query text and branches
+on some OTHER signal uncorrelated with `kind` is not provably caught by this
+design. `kind` is the one channel targeted because it is the one this
+benchmark's own CLI contract hands a runner outside the query text, and it is
+the one two independent external reviewers demonstrated a working exploit
+against.
+
+It also assumes the runner is **stateless**: a runner that persists state
+across invocations (a counter file, say) and keys its answer on which
+ordinal call it is — not on `--kind` or `--query` at all — is outside what
+this design can catch, because `score.py` invokes every query in one FIXED
+sequence on every run, and this corpus's `path` expects happen to line up
+with part of that numbering by authoring coincidence. Both external
+reviewers independently built such a runner (fix round 3), in two
+strengths: the WEAKER one has no knowledge of the actual answer key
+at all — it just prints the mechanically guessed id `TOP-{101+n}` for
+call number n — and still scored gain +0.14 purely from that numbering
+coincidence, which is the more alarming case since it needs nothing but a
+convention to beat the control; the STRONGER one additionally bakes the
+real published answer sequence in by ordinal position and scored gain
++0.98, near-perfect, since it no longer depends on any coincidence at
+all. Both `exit 0`. Neither reviewer proposes closing this, and this fix
+round did not either: no derangement of
+already-computed per-query output can tell "this output came from reading
+the query" apart from "this output came from a counter," since the leak is
+in *how* the output was produced, not in the (kind, query) → output mapping
+the derangement inspects. A per-run randomized invocation order was
+considered and rejected — a fixed seed is as publicly hardcodable as
+today's fixed order, and a true per-run random order breaks this control's
+own no-RNG/reproducibility design (see "What it does now" below) for a
+defense a stateful runner defeats just as easily by keying on query id
+instead of ordinal position.
 
 **Fix-round history.** The first version of this control reversed each
 runner's own ranked output and rescored it against the SAME query's expect.
