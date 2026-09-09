@@ -223,3 +223,32 @@ Real machine layer (`~/.claude/settings.json`,
 `~/.memcontinuum/decisions.tsv`) hashed unchanged before/after; zero
 matches for the scratch probe's key in the real `decisions.tsv`. Scratch
 directory removed after the probe.
+
+## Follow-up (advisor review, commit `7caecec`)
+
+A pre-completion advisor pass on this report caught two followability
+defects in the C1/C3 template, neither of which the verification probe
+above had exercised (every probe command happened to pass `--claude-dir`
+explicitly already):
+
+- `repo-init.sh --help` is explicit that an EXPLICIT `--store` with no
+  `--claude-dir` is a hard error. Step 4's command template omitted
+  `--claude-dir` entirely. Fixed: added it to the template, and named
+  where a human finds it (step 1's own `settings=` line's directory).
+- The C3 branch (repairing a `partial-wired` repo that already has
+  retrieval) pointed at step 4's path and stopped there; step 4 ends at
+  "dry-run first, per step 3" and never mentions recording the decision --
+  correct for an already-`wired` repo (step 4's usual case) but wrong for
+  `partial-wired`, which starts at `decision=none`. Fixed: both the C3
+  branch and step 4 now say to record the result, matching step 3's "Yes
+  -> initialize" flow.
+
+Also corrected "mv/git mv it first" to plain "mv" -- the store is its own
+git repository, not something `git mv` from the code repo's working tree
+would touch.
+
+Re-ran `tests.test_docs` only (75 tests, OK, skipped=2) -- the widened
+`FORBIDDEN_PATTERNS` entries from C4 do not false-positive on `--claude-dir`
+written as a plain flag in the corrected template. The full suite and
+bash-3.2 harness were not re-run for this follow-up: it changes SKILL.md
+prose only, covered entirely by `tests.test_docs`.
