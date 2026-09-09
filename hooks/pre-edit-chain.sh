@@ -166,11 +166,17 @@ finish() {
     elapsed=$(( now - START_TS ))
     # The wall clock can step BACKWARDS mid-run (an NTP correction, a VM
     # resume, a manual set), which made this field negative and produced
-    # `elapsed=-2s` in a real CI run. Nothing downstream expects a sign:
-    # memidx's stats parser reads this as a duration and takes medians and
-    # p95 over it, so one negative sample skews the timing surface the
-    # watchdog budget is judged against. A clock that went backwards means
-    # the true elapsed is unknowable, and 0 is the honest floor.
+    # `elapsed=-2s` in a real CI run. Fix-round correction (Codex 6, Grok
+    # 6): the ORIGINAL comment here claimed memidx's stats parser takes
+    # medians/p95 over this value -- verified false by grepping every
+    # non-comment `elapsed` in memidx.py: `_hook_log_line_kind` only checks
+    # for the SUBSTRING " elapsed=" to classify a hook.log line into the
+    # "pre-edit" bucket, and never parses the number at all. The one real
+    # consumer of the number's SHAPE is tests/test_hooks.py's own
+    # `elapsed=\d+s` regex assertion, which a leading `-` cannot match --
+    # that is the actual flake this fixes. Nothing downstream expects a
+    # sign either way; a clock that went backwards means the true elapsed
+    # is unknowable, and 0 is the honest floor.
     [ "$elapsed" -lt 0 ] && elapsed=0
     extra_part=""
     [ -n "$extra" ] && extra_part=" $extra"

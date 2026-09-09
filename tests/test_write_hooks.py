@@ -555,6 +555,48 @@ class TestLedgerPostEdit(HookTestBase):
         result = subprocess.run([MC_BASH, "-n", str(LEDGER_HOOK)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_backward_clock_never_produces_a_negative_elapsed(self):
+        """Fix round (Codex 6 / Grok 6 / Grok 15): the same elapsed-clamp
+        flake hooks/pre-edit-chain.sh's own finish() had -- a fake `date
+        +%s` that steps BACKWARDS between START_TS and finish()'s own `now`
+        reproduces the real CI flake (a negative elapsed) deterministically,
+        no reliance on an actual NTP correction firing mid-run. Every
+        `date +%s` call after the first one returns the SAME stepped-back
+        value here (not just the second), so this is robust regardless of
+        how many such calls this script makes before finish() (it makes
+        three: START_TS, MC_NOW, and finish()'s own `now`)."""
+        marker = Path(self.td) / "date-called-once"
+        real_date = shutil.which("date") or "/bin/date"
+        fake_bin = Path(self.td) / "fakebin"
+        fake_bin.mkdir()
+        fake_date = fake_bin / "date"
+        fake_date.write_text(
+            "#!/usr/bin/env bash\n"
+            'if [ "$1" = "+%s" ]; then\n'
+            f'    if [ -e "{marker}" ]; then\n'
+            '        echo 1000000100\n'
+            '    else\n'
+            f'        : > "{marker}"\n'
+            '        echo 1000000200\n'
+            '    fi\n'
+            '    exit 0\n'
+            'fi\n'
+            f'exec "{real_date}" "$@"\n'
+        )
+        fake_date.chmod(0o755)
+        session_id = "s-ledger-elapsed-clamp"
+        fpath = str(self.code_root / "src" / "mapped.py")
+        payload = self.post_tool_use_payload(session_id, fpath)
+        env = self.base_env(PATH=f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}")
+        proc, _ = run_script(LEDGER_HOOK, payload, env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (self.home / "hook.log").read_text()
+        matching = [l for l in log_text.splitlines() if "ledger outcome=" in l]
+        self.assertTrue(matching, log_text)
+        for line in matching:
+            self.assertRegex(line, r"elapsed=\d+s", line)
+            self.assertNotIn("elapsed=-", line)
+
     def test_silent_always(self):
         session_id = "s-ledger-silent"
         payload = self.post_tool_use_payload(session_id, str(self.code_root / "src" / "mapped.py"))

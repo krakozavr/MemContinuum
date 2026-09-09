@@ -1412,6 +1412,44 @@ class TestPreEditChainTopicsLogging(unittest.TestCase):
             line,
         )
 
+    def test_backward_clock_never_produces_a_negative_elapsed(self):
+        """Fix round (Codex 6 / Grok 6): a fake `date +%s` that steps
+        BACKWARDS between START_TS and finish()'s own `now` reproduces the
+        real CI flake (a negative elapsed) deterministically, no reliance
+        on an actual NTP correction firing mid-run. Every `date +%s` call
+        after the first one here returns the SAME stepped-back value (not
+        just the second), so this is robust regardless of how many such
+        calls this script makes before finish()."""
+        project = "elapsed-clamp"
+        home = self._build_home(project, ["TOP-9001"])
+        marker = Path(self.tmp) / "date-called-once"
+        real_date = shutil.which("date") or "/bin/date"
+        fake_bin = Path(self.tmp) / "fakebin"
+        fake_bin.mkdir()
+        fake_date = fake_bin / "date"
+        fake_date.write_text(
+            "#!/usr/bin/env bash\n"
+            'if [ "$1" = "+%s" ]; then\n'
+            f'    if [ -e "{marker}" ]; then\n'
+            '        echo 1000000100\n'
+            '    else\n'
+            f'        : > "{marker}"\n'
+            '        echo 1000000200\n'
+            '    fi\n'
+            '    exit 0\n'
+            'fi\n'
+            f'exec "{real_date}" "$@"\n'
+        )
+        fake_date.chmod(0o755)
+        proc, _elapsed = self._run(
+            home, project,
+            PATH=f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        line = self._last_outcome_line(home)
+        self.assertRegex(line, r"elapsed=\d+s", line)
+        self.assertNotIn("elapsed=-", line)
+
     def test_two_topics_logged_sorted_comma_separated(self):
         project = "topics-two"
         # deliberately out of sorted order on disk
