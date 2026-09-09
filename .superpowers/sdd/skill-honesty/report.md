@@ -1,6 +1,6 @@
 # skill-honesty — report (in progress)
 
-Worktree: `/home/krakozavr/dev/memcontinuum-skill`, branch `skill-honesty`, off `main` at `b1d6ac5`.
+Worktree: `~/dev/memcontinuum-skill`, branch `skill-honesty`, off `main` at `b1d6ac5`.
 `fixtures/records` symlinked in from the primary checkout (untracked by design — gitignore pattern
 `fixtures/records/` only matches a real directory, a symlink shows as untracked; never `git add -A`
 here, only explicit paths).
