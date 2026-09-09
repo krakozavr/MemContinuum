@@ -71,10 +71,10 @@ every state's wording below: whether this repo keeps an append-only record of
 *why* its decisions were made — rulings, incidents, rejected alternatives —
 indexed and surfaced to agents when they touch related code. It costs a git
 repo for the store, hooks wired into the project's `.claude` settings (the
-dry-run's plan names the `code roots :` line for retrieval, and how many
-hook groups merge into each event — not the individual hook script names;
-read the plan's own lines to the human rather than restating them), and the
-habit of writing records.
+dry-run's plan prints a `code root   :` line per root for retrieval, and how
+many hook groups merge into each event — not the individual hook script
+names; read the plan's own lines to the human rather than restating them),
+and the habit of writing records.
 
 **`undecided`** — four options:
 
@@ -99,14 +99,20 @@ then offer:
 2. Stop using MemContinuum here — record the decline (the hooks stay wired
    until removed by hand; say so)
 
-Moving a wired store, or changing its code-root set, is not offered here:
-there is no safe automated path for either today (see step 4). If the human
-wants either, say so plainly and point at step 4's manual path.
+Moving a wired store, or changing its code-root set, is not offered as a
+prompt option here: this skill has no read-back of the repo's current
+complete parameter set, so it will not guess at what a re-run should ask
+for. The underlying tool can still do both, safely — see step 4 for the
+supported path (`repo-init.sh --adopt-only` with the complete desired set)
+and how a human finds their current one. If the human wants either, say so
+plainly and point at step 4.
 
 Neither option here repairs broken wiring: `state=wired` also covers
 `decision=wired` with `wiring=partial` (a hand-edited or interrupted
-settings file). "Keep as is" leaves it broken; there is no third option that
-fixes it. Say so plainly if step 1 showed that combination.
+settings file). "Keep as is" leaves it broken; there is no third PROMPT
+option that fixes it, but it is not stranded — step 4's same complete-set
+`repo-init.sh --adopt-only` path repairs it too. Say so plainly if step 1
+showed that combination, and point at step 4.
 
 **`declined`** — two options:
 
@@ -150,11 +156,15 @@ install — but ONLY when this repo has no existing code retrieval: check
 re-run `scripts/repo-init.sh` with the same `--store`/`--project` the repo
 already has (from step 1's `store=`/`project=` lines) so it completes the
 missing wiring, then record it as below. If either file DOES have one, do
-not run it: there is no safe automated repair for that case today. Tell the
-human so, and offer hand-adding just the missing always-wired hook entries
-(README.md "Uninstall" step 1's list, in reverse), or re-driving the full
-"Yes, with code retrieval" census flow naming every code-root that should
-exist.
+not run the bare repair: omitting the existing `--code-root`/`--langs`
+flags would erase retrieval instead of completing the wiring, and this
+skill will not reconstruct that flag set for you. This is not stranded,
+though — read the current `--code-root`/`--langs` values straight off the
+existing `PreToolUse` command lines in `settings.local.json` (they carry
+`MEMCONTINUUM_CODE_ROOTS=`/`MEMCONTINUUM_LANG_EXTS=` verbatim), then take
+step 4's complete-set `repo-init.sh --adopt-only` path naming every root
+and language you found there — it completes the missing hooks without
+dropping retrieval.
 
 **"Remove what is there" on a `partial-wired` repo**: no decision was ever
 recorded (`decision=none`), so there is no registry row to touch — just the
@@ -245,13 +255,24 @@ Either direction, at any point in a repo's life:
   README.md "Uninstall". Tell the human which of the two they want; do not
   delete a store, ever. A store is its own git history, not an installer
   artifact.
-- wired → a different store location, or a different code-root set: **not
-  offered by this skill; there is no safe automated path for either today.**
-  Tell the human so. The only safe path: follow README.md "Uninstall"
-  completely (hooks, skill, rules file, store git hooks — leave the store's
-  own content alone), then run a fresh "Yes, with code retrieval" install
-  naming every code-root the repo should end up with, at the new location
-  if one is moving.
+- wired → a different store location, or a different code-root set: **this
+  skill does not drive it** — it has no read-back it can trust for the
+  repo's complete current parameter set, and handing `repo-init.sh` an
+  incomplete one silently drops existing wiring (the exact failure mode the
+  removed relocation/add-retrieval options hit). The product itself
+  supports both changes: `repo-init.sh` always replaces prior wiring with
+  the invocation's COMPLETE set, and `--adopt-only` wires an EXISTING
+  store without creating one — including a store already relocated by hand
+  (`mv`/`git mv` it first, then point `--store` at the new path). The
+  honest, human-directed path: read the repo's current `--project`/`--store`
+  off step 1's own `project=`/`store=` lines, and its current code roots and
+  languages off the `MEMCONTINUUM_CODE_ROOTS=`/`MEMCONTINUUM_LANG_EXTS=`
+  values already in `<claude-dir>/settings.local.json`'s `PreToolUse`
+  command lines, then re-run `bash "$ENGINE/scripts/repo-init.sh"
+  --adopt-only --store DIR --project NAME --code-root ... --langs ...`
+  naming that complete set plus whichever root or store path is changing —
+  dry-run first, per step 3. This is a deliberate command run at the
+  human's direction, not a step 2 prompt option.
 - never ask in any repo on this machine: `memcontinuum-decide.sh never-ask`;
   undo with `memcontinuum-decide.sh ask-again`.
 
@@ -259,7 +280,9 @@ Either direction, at any point in a repo's life:
 
 - Never initialize without an explicit yes in this conversation.
 - Never delete a store, ever, regardless of what is asked. Never move one
-  either — this skill has no flow that relocates a store.
+  on your own judgment either — step 4's relocation path is a deliberate,
+  human-directed command, never something this skill decides or automates
+  by itself.
 - Never write a decision the human did not give you.
 - One question, no advocacy, governs every prompt in step 2, for every
   state — never argue for an option, never read whether a repo deserves
