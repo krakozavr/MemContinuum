@@ -164,7 +164,7 @@ existing `PreToolUse` command lines in `settings.local.json` (they carry
 `MEMCONTINUUM_CODE_ROOTS=`/`MEMCONTINUUM_LANG_EXTS=` verbatim), then take
 step 4's complete-set `repo-init.sh --adopt-only` path naming every root
 and language you found there — it completes the missing hooks without
-dropping retrieval.
+dropping retrieval. Then record it as below.
 
 **"Remove what is there" on a `partial-wired` repo**: no decision was ever
 recorded (`decision=none`), so there is no registry row to touch — just the
@@ -263,16 +263,18 @@ Either direction, at any point in a repo's life:
   supports both changes: `repo-init.sh` always replaces prior wiring with
   the invocation's COMPLETE set, and `--adopt-only` wires an EXISTING
   store without creating one — including a store already relocated by hand
-  (`mv`/`git mv` it first, then point `--store` at the new path). The
-  honest, human-directed path: read the repo's current `--project`/`--store`
-  off step 1's own `project=`/`store=` lines, and its current code roots and
-  languages off the `MEMCONTINUUM_CODE_ROOTS=`/`MEMCONTINUUM_LANG_EXTS=`
-  values already in `<claude-dir>/settings.local.json`'s `PreToolUse`
-  command lines, then re-run `bash "$ENGINE/scripts/repo-init.sh"
-  --adopt-only --store DIR --project NAME --code-root ... --langs ...`
-  naming that complete set plus whichever root or store path is changing —
-  dry-run first, per step 3. This is a deliberate command run at the
-  human's direction, not a step 2 prompt option.
+  (the store is its own git repo; `mv` it first, then point `--store` at
+  the new path). The honest, human-directed path: read the repo's current
+  `--project`/`--store` off step 1's own `project=`/`store=` lines, its
+  `--claude-dir` off step 1's `settings=` line (the directory containing
+  that `settings.local.json`), and its current code roots and languages off
+  the `MEMCONTINUUM_CODE_ROOTS=`/`MEMCONTINUUM_LANG_EXTS=` values already in
+  that file's `PreToolUse` command lines, then re-run
+  `bash "$ENGINE/scripts/repo-init.sh" --adopt-only --store DIR
+  --claude-dir DIR --project NAME --code-root ... --langs ...` naming that
+  complete set plus whichever root or store path is changing — dry-run
+  first, per step 3. Record the result as step 3 does. This is a deliberate
+  command run at the human's direction, not a step 2 prompt option.
 - never ask in any repo on this machine: `memcontinuum-decide.sh never-ask`;
   undo with `memcontinuum-decide.sh ask-again`.
 
