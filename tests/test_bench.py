@@ -218,19 +218,19 @@ class TestRunnerInterface(unittest.TestCase):
             ("path", "src/storage/dedup/store.py"),
             ("question", "why does the dedup store key chunks by content hash"),
         ):
-            proc = _run_runner(RUNNERS_DIR / "keyword.py", kind, query)
+            proc = _run_runner(RUNNERS_DIR / "keyword_baseline.py", kind, query)
             self.assertEqual(proc.returncode, 0, proc.stderr)
             lines = [ln for ln in proc.stdout.splitlines()]
             self.assertTrue(all(ln.strip() == ln and ln for ln in lines), lines)
             self.assertEqual(len(lines), len(set(lines)), "keyword runner must not repeat an id")
 
     def test_keyword_empty_query_is_empty_not_a_crash(self):
-        proc = _run_runner(RUNNERS_DIR / "keyword.py", "question", "   ")
+        proc = _run_runner(RUNNERS_DIR / "keyword_baseline.py", "question", "   ")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), "")
 
     def test_keyword_respects_limit(self):
-        argv = [sys.executable, str(RUNNERS_DIR / "keyword.py"), "--corpus", str(CORPUS),
+        argv = [sys.executable, str(RUNNERS_DIR / "keyword_baseline.py"), "--corpus", str(CORPUS),
                 "--kind", "question", "--query", "the a of and to", "--limit", "2"]
         env = dict(os.environ)
         env["PYTHONPATH"] = ""
@@ -240,7 +240,7 @@ class TestRunnerInterface(unittest.TestCase):
         self.assertLessEqual(len(lines), 2)
 
     def test_bad_corpus_dir_is_a_clean_nonzero_exit_not_a_traceback(self):
-        for script in ("nomemory.py", "keyword.py"):
+        for script in ("nomemory.py", "keyword_baseline.py"):
             proc = _run_runner(RUNNERS_DIR / script, "path", "x.py", corpus=Path("/no/such/dir"))
             if script == "nomemory.py":
                 continue  # nomemory never reads --corpus at all
@@ -456,3 +456,30 @@ class TestParaphraseIndependence(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRunnersDoNotShadowStdlib(unittest.TestCase):
+    """A runner is executed as a script, so its own directory is first on
+    sys.path. A runner named after a standard-library module therefore
+    shadows it for every import the interpreter makes while starting --
+    `collections` imports `keyword`, so `bench/runners/keyword.py` broke
+    every runner on CI with a circular-import AttributeError while passing
+    locally. Names are the whole defence; this test is the guard."""
+
+    def test_no_runner_filename_shadows_a_stdlib_module(self):
+        import importlib.util
+        offenders = []
+        for script in sorted(RUNNERS_DIR.glob("*.py")):
+            name = script.stem
+            if name.startswith("_"):
+                continue
+            try:
+                spec = importlib.util.find_spec(name)
+            except (ImportError, ValueError):
+                spec = None
+            if spec is None:
+                continue
+            origin = spec.origin or ""
+            if origin == "built-in" or "lib/python" in origin.replace("\\", "/"):
+                offenders.append(f"{script.name} shadows stdlib {name!r} ({origin})")
+        self.assertEqual(offenders, [], "; ".join(offenders))

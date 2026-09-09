@@ -92,7 +92,13 @@ def resolve_runner(spec: str) -> tuple[str, Path, str | None]:
             script = (REPO_ROOT / script).resolve()
         display = script.stem
     else:
-        script = RUNNERS_DIR / f"{name}.py"
+        # The canonical name "keyword" maps to keyword_baseline.py: a runner
+        # is executed as a script, so its own directory is first on sys.path,
+        # and a file named keyword.py shadows the stdlib module `collections`
+        # imports during interpreter startup -- which broke every runner on CI
+        # while passing locally. The user-facing name stays "keyword".
+        filename = "keyword_baseline" if name == "keyword" else name
+        script = RUNNERS_DIR / f"{filename}.py"
         display = name
     if not script.is_file():
         raise FileNotFoundError(f"runner script not found: {script} (from spec {spec!r})")
