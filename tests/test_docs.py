@@ -1010,7 +1010,11 @@ class TestSkillHonesty(unittest.TestCase):
         against this list's output fails on a dropped, added, reordered, OR
         reworded option -- not just a phrase substring, which is what let
         every one of the reviewers' option mutations slip past the
-        original version of this class."""
+        original version of this class. The printed NUMBER itself is also
+        checked here, not just discarded (brief B2: pin "numbering" too) --
+        a renumbering with no reorder (e.g. "1. Keep as is" / "3. Stop
+        using...") would pass a text-and-order-only check, so each item's
+        digit must equal its 1-based position or this raises immediately."""
         items = []
         current = None
         for line in section.splitlines():
@@ -1018,6 +1022,10 @@ class TestSkillHonesty(unittest.TestCase):
             if m:
                 if current is not None:
                     items.append(current)
+                expected = len(items) + 1
+                assert int(m.group(1)) == expected, (
+                    f"option numbered {m.group(1)!r} where {expected} was expected: {m.group(2)!r}"
+                )
                 current = m.group(2).strip()
             elif current is not None:
                 stripped = line.strip()
@@ -1259,9 +1267,7 @@ class TestSkillHonestyMutations(unittest.TestCase):
     def test_deleting_the_never_delete_rule_is_caught(self):
         mutated = self.text.replace(
             "- Never delete a store, ever, regardless of what is asked. Never move one\n"
-            "  either — this skill has no flow that relocates a store (step 4 says why:\n"
-            "  the tooling cannot yet carry a repo's complete wiring forward through a\n"
-            "  relocation without risking it).\n",
+            "  either — this skill has no flow that relocates a store.\n",
             "",
         )
         self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
