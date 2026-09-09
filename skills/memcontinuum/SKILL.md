@@ -42,7 +42,7 @@ what the repo's `.claude` settings actually contain right now, plus
 `missing=<basenames>` when partial) as two SEPARATE facts: a hand-edited
 settings file or an interrupted install can leave them disagreeing. It also
 prints a combined `state=` line -- `wired`, `declined`, `partial-wired` (no
-recorded decision, and only SOME of the five hooks are present --
+recorded decision, and only SOME of the always-wired hooks are present --
 SessionStart's detector DOES ask here, same as `undecided`: a half-wired
 repo with no recorded decision is still an open question, not a settled
 one), `undecided`, `not-a-repo`, or `no-config` -- plus the repo key, store
@@ -52,13 +52,16 @@ wired before the decision registry existed: `decision=none` with
 evidence. Report `decision`/`wiring` plainly when they disagree; never guess
 either one from the presence of a directory.
 
-## 2. Ask — a structured prompt for every state, safe option first
+## 2. Ask — a structured prompt for every state, never destructive by accident
 
 One question, no advocacy: report what each option costs, then stop — never
-argue for one, never read whether this particular repo deserves it. **Invoking
-this skill is never destructive by accident: the first option offered is
-always the one that changes nothing.** Both rules govern every state below,
-not only `undecided`.
+argue for one, never read whether this particular repo deserves it. **No
+option ever deletes a store** (Section 5 makes this absolute, on its own).
+**Where the repo already has a recorded answer (`wired`, `declined`), the
+first option offered always keeps it, unchanged; where it does not, an
+option that changes nothing — `Not now` — is always present, and it always
+records nothing.** All three rules govern every state below, not only
+`undecided`.
 
 Read `state=` from step 1 and ask through the interface's structured multiple-choice
 prompt, never prose. What the human is deciding, underneath
@@ -80,8 +83,7 @@ records.
 **`partial-wired`** (some but not all write-side hooks already present, no
 recorded decision) — three options:
 
-1. Complete the wiring — nothing has changed yet; finishes what a prior
-   install left half-done
+1. Complete the wiring — finishes what a prior install left half-done
 2. Remove what is there
 3. Not now — leave it half-wired; asked again next session
 
@@ -239,8 +241,9 @@ Either direction, at any point in a repo's life:
   have going forward (`decide.sh` replaces the row's code-roots, it does not
   union them with what was recorded before).
 - wired → remove code retrieval: there is no flag that drops a `--code-root`
-  from wiring once installed — removing the PreToolUse hook itself is a
-  hand-edit, same as README.md "Uninstall" step 1. Then re-run
+  from wiring once installed — removing that code-root's own hook entries
+  (the dry-run's plan lists them) is a hand-edit, same as README.md
+  "Uninstall" step 1. Then re-run
   `memcontinuum-decide.sh wired --repo REPO ...` naming only the code-roots
   that remain, so the registry matches.
 - never ask in any repo on this machine: `memcontinuum-decide.sh never-ask`;
@@ -257,8 +260,9 @@ Either direction, at any point in a repo's life:
 - One question, no advocacy, governs every prompt in step 2, for every
   state — never argue for an option, never read whether a repo deserves
   one.
-- The first option in every prompt in step 2 is always the one that changes
-  nothing: invoking this skill is never destructive by accident.
+- Every prompt in step 2 is never destructive by accident: on a repo with a
+  recorded answer, its first option always keeps that answer; on a repo
+  with none, `Not now` is always offered and always records nothing.
 - If `state=no-config`, MemContinuum was never bootstrapped on this machine.
   Point at `memcontinuum-setup.sh`; do not run it unasked.
 - When two `status: active` links (in the same topic or across topics)

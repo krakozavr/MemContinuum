@@ -1,4 +1,4 @@
-# skill-honesty — report (in progress)
+# skill-honesty — report
 
 Worktree: `~/dev/memcontinuum-skill`, branch `skill-honesty`, off `main` at `b1d6ac5`.
 `fixtures/records` symlinked in from the primary checkout (untracked by design — gitignore pattern
@@ -21,10 +21,14 @@ Deleted, each replaced with either nothing or a pointer at the tool's own output
 1. **`--project` character class** (`[A-Za-z0-9._-]+`, literal regex copied from
    `scripts/repo-init.sh:653`) — deleted. `repo-init.sh`'s own refusal message names the allowed
    characters when it fires; nothing before running needs this literal.
-2. **Store-must-be-its-own-git-repo / nested-repo refusal / foreign-repo-markers refusal** — the
-   refusal's *existence* is kept (one line: it's real context a human choosing a custom `--store`
-   benefits from), but the *mechanism* (which markers `mc_is_marked_store` checks, the `--force`
-   detail) is dropped — the refusal message names its own fix.
+2. **Store-must-be-its-own-git-repo / nested-repo refusal / foreign-repo-markers refusal** —
+   deleted entirely (SKILL.md's `--store DIR` bullet now says only the naming convention and the
+   dry-run-verbatim instruction, nothing about this refusal at all). Each of these refusals names
+   its own fix when it fires (`--force`, or "point --store at a location that does not exist yet,
+   or at an existing MemContinuum store"), and the dry-run reaches every one of them, so there is
+   nothing here an agent needs before running that it cannot get from the tool's own output.
+   (An earlier draft of this report said the refusal's *existence* was kept as one line — that was
+   wrong; corrected after a review pass caught it.)
 3. **The default store location algorithm** (sibling rule, WSL-disk redirect, exact paths
    `$HOME/dev/<repo>-MemContinuum-Store` / `$HOME/<repo>-MemContinuum-Store`, "prints why") —
    deleted entirely. This is the exact paragraph INC-0117 was about. Replaced with: always dry-run
@@ -58,10 +62,14 @@ Kept, with reasons:
 4. **The `[ -t 0 ]` / no-tty driven-flow guidance** — kept (unchanged). This is operational hazard
    knowledge (the Bash tool has no tty) that changes which command sequence the agent runs, not a
    restated computed value.
-5. Trimmed but not deleted: "five hooks" language softened to "hooks wired into the project's
-   `.claude` settings (the dry-run's plan lists exactly which, and how many)" — removes a count that
-   `scripts/mc-registry-lib.sh` owns (`the five ALWAYS-wired write-side hooks`) from a place where
-   the dry-run's plan already prints the same information.
+5. Trimmed but not deleted, in two places (found on the first pass and a third on review): "five
+   hooks" softened to "hooks wired into the project's `.claude` settings (the dry-run's plan lists
+   exactly which, and how many)" in Section 2's cost paragraph, and Section 1's "only SOME of the
+   five hooks are present" softened to "only SOME of the always-wired hooks are present" — both
+   remove a count `scripts/mc-registry-lib.sh` owns (`the five ALWAYS-wired write-side hooks`) from
+   places where the number is either printed live by the dry-run or never printed by
+   `memcontinuum-state.sh --help` at all (only its header comments say "five" — text an agent
+   running the command never sees).
 
 ### S2 — consent prompt pinned (owner-corrected mid-task)
 
@@ -99,7 +107,11 @@ existing tool behaviour (nothing invented):
   **no automated flag** (verified: `repo-init.sh`'s `--record-decision` unions code-roots, "never
   dropped" — there is no remove path), so it's a hand-edit per README "Uninstall" step 1, then
   `decide.sh wired` re-run naming only the code-roots that remain (verified `memcontinuum-decide.sh`
-  rewrites-then-appends the row — replace, not union, unlike `--record-decision`'s own union).
+  rewrites-then-appends the row — replace, not union, unlike `--record-decision`'s own union). Text
+  says "that code-root's hook entries," not "the PreToolUse hook" (singular) — a `--code-root`
+  actually wires TWO PreToolUse hooks (`pre-edit-chain.sh` for retrieval, `newfile-nudge.sh` for the
+  new-file reminder; verified in `scripts/repo-init.sh`), and the dry-run's plan is what actually
+  names them, so the skill should not itself claim a specific count or list.
 
 Also resolved a self-contradiction the new "change where the store lives" flow created against the
 existing absolute rule "Never delete or move an existing store": narrowed it in Section 5 to exempt
@@ -107,13 +119,26 @@ only that one human-chosen flow, matching the pattern the other absolute rules a
 initialize *without an explicit yes*").
 
 Section 5 gained two explicit rules: "one question, no advocacy" now stated as governing every
-state (not just `undecided`), and "the first option is always the one that changes nothing" as its
-own rule.
+state (not just `undecided`), and a corrected statement of the safety invariant (below).
 
-### S3 — tests (`tests/test_docs.py`, class `TestSkillHonesty`, 7 tests)
+**A judgment call, found in a review pass and corrected before this task counted as done:** the
+coordinator's S5 message stated the invariant as "the FIRST option is always the safe no-change
+one," but its own worked example for `partial-wired` puts "Complete the wiring" (which writes
+hooks) first, and the owner's S2 correction fixes `undecided`'s order as "Yes, with code retrieval"
+first (an install) -- both outrank the general "always" as written. The literal "first option is
+always safe" claim is false for `undecided` and `partial-wired`; only `wired` and `declined`
+(states with an existing recorded answer) actually satisfy it. Resolution: kept every explicit
+option order exactly as specified (owner-verbatim for `undecided`, coordinator-specified for the
+other three), and rewrote the invariant itself to what is actually true everywhere: no option ever
+deletes a store (absolute, on its own), and where a repo already has a recorded answer the first
+option always keeps it -- where it doesn't, `Not now` is always present and always records nothing.
+This is stated in both Section 2's preamble and Section 5 (`skills/memcontinuum/SKILL.md` lines
+55-64 and ~262-264).
+
+### S3 — tests (`tests/test_docs.py`, class `TestSkillHonesty`, 8 tests)
 
 Added to the existing `tests/test_docs.py` (the doctrine-pinning home per its own docstring),
-following the module's established style (see `TestDocsRound7`). All 7 pass; slicing is done
+following the module's established style (see `TestDocsRound7`). All 8 pass; slicing is done
 between `## 2. Ask` / `## 3. Act on the answer` markers specifically to avoid the vacuous-test trap
 the module itself calls out (`test_schema_incidents_section_names_every_field_actually_used`'s
 comment) — an unsliced `assertIn` for e.g. "No —" would pass on unedited text since Section 3
@@ -128,9 +153,11 @@ already contains "No → record the decline".
   across a line).
 - `test_undecided_names_all_four_options_in_order` — asserts all 4 options present and strictly
   ordered.
-- `test_partial_wired_declined_wired_each_get_a_prompt_with_safe_option_first` — asserts each
-  state's first option text.
-- `test_first_option_never_changes_anything_is_a_stated_rule` — asserts Section 5 states the
+- `test_partial_wired_declined_wired_each_get_a_prompt` — asserts each state names its own prompt
+  and options, in the order specified.
+- `test_wired_and_declined_first_option_keeps_the_recorded_answer` — asserts the actual invariant
+  (below), not the looser "first option is always safe" the coordinator's message first stated.
+- `test_no_option_ever_deletes_a_store_is_a_stated_rule` — asserts Section 5 states the corrected
   invariant.
 - `test_not_a_repo_and_no_config_get_no_prompt` — asserts explicit "no prompt" language.
 
@@ -139,7 +166,7 @@ any of the five removed phrases or `earns its keep`/`MemContinuum-Store` pins on
 specifically** — all hits found are `test_repo_init.py`'s own tests of `repo-init.sh`'s stdout, not
 of the skill file, so no second edit was needed in this commit.
 
-Full `tests/test_docs.py`: 59 tests, 57 passed, 2 skipped (both pre-existing, environment-caused:
+Full `tests/test_docs.py`: 60 tests, 58 passed, 2 skipped (both pre-existing, environment-caused:
 no `.claude/skills/*/SKILL.md` render target in this worktree, no `memory/incidents` copy — this
 engine repo's own gitignored store, not part of the task).
 

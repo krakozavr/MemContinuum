@@ -982,27 +982,43 @@ class TestSkillHonesty(unittest.TestCase):
         self.assertEqual(positions, sorted(positions),
                           "the four undecided options must appear in this exact order")
 
-    def test_partial_wired_declined_wired_each_get_a_prompt_with_safe_option_first(self):
+    def test_partial_wired_declined_wired_each_get_a_prompt(self):
         # S5: a defect of the same shape as S2's ("one question, no
         # advocacy" specified for `undecided` alone, leaving every other
         # state to improvised prose) existed for `wired`, `declined` and
-        # `partial-wired` too. Each must now name its own prompt, and its
-        # first option must be the one that changes nothing.
+        # `partial-wired` too. Each must now name its own prompt.
         text = SKILL.read_text()
         section = self._section(text, "## 2. Ask", "## 3. Act on the answer")
         partial = self._section(section, "**`partial-wired`**", "**`wired`**")
         wired = self._section(section, "**`wired`**", "**`declined`**")
         declined = self._section(section, "**`declined`**", "**`not-a-repo`")
         self.assertIn("1. Complete the wiring", partial)
+        self.assertIn("2. Remove what is there", partial)
+        self.assertIn("3. Not now", partial)
         self.assertIn("1. Keep as is — nothing changes", wired)
         self.assertIn("1. Keep declined", declined)
 
-    def test_first_option_never_changes_anything_is_a_stated_rule(self):
+    def test_wired_and_declined_first_option_keeps_the_recorded_answer(self):
+        # The true invariant (corrected mid-task: the coordinator's own
+        # spec for `partial-wired` puts "Complete the wiring" -- not a
+        # no-change option -- first, so "the first option is ALWAYS the
+        # safe one" was never accurate for every state). What actually
+        # holds everywhere: a repo with a recorded answer (`wired`,
+        # `declined`) always offers that answer, unchanged, as option 1.
+        text = SKILL.read_text()
+        section = self._section(text, "## 2. Ask", "## 3. Act on the answer")
+        wired = self._section(section, "**`wired`**", "**`declined`**")
+        declined = self._section(section, "**`declined`**", "**`not-a-repo`")
+        self.assertIn("1. Keep as is — nothing changes", wired)
+        self.assertIn("1. Keep declined", declined)
+
+    def test_no_option_ever_deletes_a_store_is_a_stated_rule(self):
         text = SKILL.read_text()
         # "## 5. Rules" is the last section -- slice to end of file rather
         # than to a following marker that does not exist.
         rules = text[text.index("## 5. Rules"):]
         self.assertIn("never destructive by accident", rules)
+        self.assertIn("recorded answer", rules)
 
     def test_not_a_repo_and_no_config_get_no_prompt(self):
         text = SKILL.read_text()
