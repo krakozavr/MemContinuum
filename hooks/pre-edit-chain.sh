@@ -164,6 +164,14 @@ finish() {
     local now elapsed extra_part
     now=$(date +%s 2>/dev/null || echo "$START_TS")
     elapsed=$(( now - START_TS ))
+    # The wall clock can step BACKWARDS mid-run (an NTP correction, a VM
+    # resume, a manual set), which made this field negative and produced
+    # `elapsed=-2s` in a real CI run. Nothing downstream expects a sign:
+    # memidx's stats parser reads this as a duration and takes medians and
+    # p95 over it, so one negative sample skews the timing surface the
+    # watchdog budget is judged against. A clock that went backwards means
+    # the true elapsed is unknowable, and 0 is the honest floor.
+    [ "$elapsed" -lt 0 ] && elapsed=0
     extra_part=""
     [ -n "$extra" ] && extra_part=" $extra"
     log "$(date -Iseconds 2>/dev/null || date) outcome=$outcome elapsed=${elapsed}s${extra_part} project=${PROJECT:-} file=${FILE_PATH:-}"
