@@ -444,7 +444,14 @@ def run_all(queries: list[dict], corpus: Path, runner_specs: list[str], limit: i
 # one other path query (path-20, out of the other 19): Codex computed the
 # EXACT derangement-tail probability, 1/19 = 0.05263 -- just ABOVE the
 # conventional 5% threshold, i.e. a strict permutation test does NOT call
-# this one-hit runner significant. Grok built a 2000-draw kind-preserving
+# this one-hit runner significant. Codex also computed the SAME runner's
+# other two correct ids: TOP-101 (also expected by path-02, so shared by 2
+# of the other 19) gives 2/19 = 0.10526, and including the identity
+# permutation (not excluded from a literal reading of "derangement family")
+# raises these to 3/20 = 0.15 and 2/20 = 0.10 -- the SAME one-hit path-01
+# runner's p-value swings from 0.053 to 0.105 to 0.15 depending on nothing
+# but which of its three correct ids it happens to return, all of them
+# comfortably on the "not significant" side. Grok built a 2000-draw kind-preserving
 # permutation test on the SAME scenario and got an estimate of p = 0.0465
 # -- just BELOW that threshold. These are not two different findings about
 # two different runners: they are an exact value and a 2000-draw Monte
@@ -471,11 +478,13 @@ def run_all(queries: list[dict], corpus: Path, runner_specs: list[str], limit: i
 # gain distinguishable from what this one derangement family produces by
 # chance" -- and for this corpus's own one-hit path-01 case, that question
 # does not have a stable answer: the exact probability sits close enough
-# to the conventional 5% line that a real permutation-test IMPLEMENTATION
-# (necessarily a finite number of draws, since the kind-preserving
-# derangement space is too large to enumerate exhaustively for the
-# `question` group) can land on either side of the line depending on
-# nothing but its own random draws. This floor instead asks "is the
+# to the conventional 5% line that a GENERAL-PURPOSE permutation-test
+# implementation -- one that must handle arbitrary runner output rather
+# than derive a closed form for one specific runner shape the way Codex
+# did above, so in practice a finite number of sampled draws, since the
+# kind-preserving derangement space is too large to enumerate exhaustively
+# for the `question` group -- can land on either side of the line
+# depending on nothing but its own random draws. This floor instead asks "is the
 # observed gain bigger than the smallest effect this design can even
 # express, one correct guess out of n" -- a question whose answer does not
 # depend on a coin-flip-close significance threshold or on how many
