@@ -24,8 +24,18 @@ handful of nonzero terms on a corpus this size):
 Tokenization: lowercase, `[a-z0-9]+` runs (roughly SQLite FTS5's own
 unicode61 tokenizer for ASCII text) -- no stemming, no stopword removal.
 Not removing stopwords is deliberate: a real "grep-shaped" baseline
-doesn't know which words are noise either, and it costs this baseline
-nothing on this corpus (idf already down-weights common terms).
+doesn't know which words are noise either. This is NOT free on this
+corpus, and the rationale stops at "deliberate," not "costless": idf
+down-weights common terms per OCCURRENCE, but does nothing about raw
+COUNT, and this scorer has no document-length normalization (see
+bench/README.md's "Honest limitations" -- the para-01 disclosure), so a
+longer or more repetitively-worded record can still win on accumulated
+stopword counts alone. Measured: para-01 (bench/queries.jsonl), after
+every leaked content word was removed, still ranks its target TOP-107
+first with zero content-word contribution -- every point of that score
+comes from "the"/"a"/"is"/"and" and similar words this file's own
+paraphrase-independence check (tests/test_bench.py) deliberately treats
+as noise but this scorer does not.
 
 The search text for one record is the ENTIRE raw markdown file --
 frontmatter (including `code_refs:` paths, ids, ruling/rationale prose)

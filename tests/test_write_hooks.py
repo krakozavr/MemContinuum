@@ -590,12 +590,24 @@ class TestLedgerPostEdit(HookTestBase):
         env = self.base_env(PATH=f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}")
         proc, _ = run_script(LEDGER_HOOK, payload, env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        # Grok 4 (fix round 2, external re-gate): prove the fake `date` was
+        # actually invoked (see the matching comment in test_hooks.py's own
+        # copy of this test) -- otherwise a fast real run passes the two
+        # checks below for an unrelated reason and the backward step was
+        # never exercised.
+        self.assertTrue(marker.exists(),
+                         "fake date was never called a second time -- the backward-clock "
+                         "scenario was not exercised, this test proves nothing")
         log_text = (self.home / "hook.log").read_text()
         matching = [l for l in log_text.splitlines() if "ledger outcome=" in l]
         self.assertTrue(matching, log_text)
         for line in matching:
             self.assertRegex(line, r"elapsed=\d+s", line)
             self.assertNotIn("elapsed=-", line)
+            # 1000000100 - 1000000200 = -100 unclamped; a genuine clamp
+            # shows exactly 0, not merely "some non-negative number" (which
+            # a fast real run would also produce with no fake date at all).
+            self.assertRegex(line, r"elapsed=0s", line)
 
     def test_silent_always(self):
         session_id = "s-ledger-silent"
