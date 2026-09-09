@@ -4,7 +4,7 @@ Brief: `.superpowers/sdd/skill-honesty/fix-brief-2.md`. Read `codex-regate.md`
 (BLOCK) and `grok-regate.md` (MERGE AFTER FIXES) in full first; both agree on
 the substance.
 
-Worktree: `/home/krakozavr/dev/memcontinuum-skill`, branch `skill-honesty`,
+Worktree: `~/dev/memcontinuum-skill`, branch `skill-honesty`,
 starting tip `511c6fe`.
 
 ## Commits
@@ -188,8 +188,8 @@ scratch dir; `memcontinuum-setup.sh` was never run -- `MEMCONTINUUM_HOME`'s
 Final `memcontinuum-state.sh` output:
 
 ```
-engine=/home/krakozavr/dev/memcontinuum-skill
-python=/home/krakozavr/dev/mem-venv/bin/python
+engine=~/dev/memcontinuum-skill
+python=~/dev/mem-venv/bin/python
 global_ask=on
 repo=<scratch>/repoA
 key=<scratch>/repoA
