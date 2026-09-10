@@ -4075,6 +4075,16 @@ class TestUpdaterCoversEveryRenderedArtifact(unittest.TestCase):
     next time repo-init.sh grows a new rendered file; a snapshot of what it
     actually wrote cannot go stale that way.
 
+    Two install shapes are snapshotted, each its own test method sharing
+    `_check_coverage` below: rationale-only, and --code-root. This is
+    itself a fix (round-2 gate finding G2): a single rationale-only
+    snapshot could not see an artifact repo-init.sh renders ONLY for a
+    --code-root install -- Grok's gate proved this by patching repo-init.sh
+    to write a file gated on `${#CODE_ROOTS_ABS[@]} -gt 0` and showing the
+    then-single-shape test still passed. Two shapes is not "every shape";
+    a hypothetical THIRD install flag that gates its own artifact would
+    still be invisible until a matching third snapshot is added.
+
     What this canNOT catch (stated plainly, since a fully mechanical
     derivation of "every artifact, and where it is properly accounted for"
     is not possible): the mapping from a discovered path to the cell/line
@@ -4104,6 +4114,11 @@ class TestUpdaterCoversEveryRenderedArtifact(unittest.TestCase):
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
         self.store = str(Path(self.tmp) / "store")
         self.claude_dir = str(Path(self.repo) / ".claude")
+        # Only used by the --code-root shape (G2 below); the rationale-only
+        # shape ignores it.
+        self.code_root = str(Path(self.tmp) / "code")
+        os.makedirs(self.code_root, exist_ok=True)
+        (Path(self.code_root) / "x.py").write_text("print(1)\n")
 
     def _snapshot(self):
         """Every non-directory path under STORE/CLAUDE_DIR repo-init.sh
@@ -4197,22 +4212,33 @@ class TestUpdaterCoversEveryRenderedArtifact(unittest.TestCase):
         return (f"no mapping at all for {label}:{rel} -- a NEW artifact "
                 "type, or a NEW LOCATION for a known one, repo-init.sh grew")
 
-    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
-    def test_every_rendered_artifact_is_accounted_for(self):
+    def _check_coverage(self, project, code_root=None):
+        """Shared body for both install shapes below (G2 fix): drives a
+        real repo-init.sh run, snapshots what it created, and asserts every
+        created path is accounted for in memcontinuum-update.sh's health
+        output. `code_root=None` is the rationale-only shape; a path
+        enables the --code-root shape (same repo-init.sh/decide.sh flags a
+        real --code-root install uses elsewhere in this file)."""
         before = self._snapshot()
-        proc = run(INSTALL_SH, [
-            "--project", "cov", "--store", self.store, "--claude-dir", self.claude_dir,
+        install_args = [
+            "--project", project, "--store", self.store, "--claude-dir", self.claude_dir,
             "--non-interactive",
-        ], self.home)
+        ]
+        decide_args = [
+            "wired", "--repo", self.repo, "--store", self.store, "--project", project,
+            "--claude-dir", self.claude_dir,
+        ]
+        if code_root is not None:
+            install_args += ["--code-root", code_root, "--langs", "python"]
+            decide_args += ["--code-root", code_root, "--langs", "python"]
+
+        proc = run(INSTALL_SH, install_args, self.home)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         after = self._snapshot()
         created = after - before
         self.assertTrue(created, "repo-init.sh created nothing -- this test's own snapshot is broken")
 
-        proc = run(DECIDE_SH, [
-            "wired", "--repo", self.repo, "--store", self.store, "--project", "cov",
-            "--claude-dir", self.claude_dir,
-        ], self.home)
+        proc = run(DECIDE_SH, decide_args, self.home)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
         proc = run(UPDATE_SH, [], self.home)
@@ -4231,6 +4257,21 @@ class TestUpdaterCoversEveryRenderedArtifact(unittest.TestCase):
             "teach _unaccounted_for above once memcontinuum-update.sh "
             f"actually reports them:\n  " + "\n  ".join(unaccounted),
         )
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_every_rendered_artifact_is_accounted_for(self):
+        self._check_coverage("cov")
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_every_rendered_artifact_is_accounted_for_with_code_root(self):
+        """G2 (round-2 gate finding): the rationale-only shape above never
+        passes --code-root, so an artifact repo-init.sh renders ONLY for a
+        --code-root install was invisible to this test -- Grok's gate
+        proved it by patching repo-init.sh to write a file gated on
+        `${#CODE_ROOTS_ABS[@]} -gt 0` and showing the shape-blind coverage
+        test still passed. This method snapshots a --code-root install
+        too, closing that hole."""
+        self._check_coverage("cov-cr", code_root=self.code_root)
 
 
 class TestHelp(unittest.TestCase):
