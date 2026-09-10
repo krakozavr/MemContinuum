@@ -1092,7 +1092,7 @@ class TestSkillHonesty(unittest.TestCase):
             "Yes, with code retrieval — records, plus decisions surfaced before edits under the named code root",
             "Yes, rationale only — records, no code retrieval",
             "No — record the decline; this repo is never asked again",
-            "Not now — nothing is recorded; you will be asked again next session",
+            "Not now — nothing is recorded; run `/memcontinuum` again to decide",
         ])
 
     def test_partial_wired_names_all_three_options_exactly(self):
@@ -1100,7 +1100,7 @@ class TestSkillHonesty(unittest.TestCase):
         self.assertEqual(options, [
             "Complete the wiring — finishes what a prior install left half-done",
             "Remove what is there",
-            "Not now — leave it half-wired; asked again next session",
+            "Not now — leave it half-wired; run `/memcontinuum` again to decide",
         ])
 
     def test_wired_names_both_options_exactly(self):
@@ -1254,19 +1254,19 @@ class TestSkillHonestyMutations(unittest.TestCase):
         mutated = self.text.replace(
             "1. Complete the wiring — finishes what a prior install left half-done\n"
             "2. Remove what is there\n"
-            "3. Not now — leave it half-wired; asked again next session\n",
+            "3. Not now — leave it half-wired; run `/memcontinuum` again to decide\n",
             "1. Remove what is there\n"
             "2. Complete the wiring — finishes what a prior install left half-done\n"
-            "3. Not now — leave it half-wired; asked again next session\n",
+            "3. Not now — leave it half-wired; run `/memcontinuum` again to decide\n",
         )
         self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
         self._assert_production_test_catches(mutated, "test_partial_wired_names_all_three_options_exactly")
 
     def test_adding_an_extra_undecided_option_is_caught(self):
         mutated = self.text.replace(
-            "4. Not now — nothing is recorded; you will be asked again next session\n\n"
+            "4. Not now — nothing is recorded; run `/memcontinuum` again to decide\n\n"
             "**`partial-wired`**",
-            "4. Not now — nothing is recorded; you will be asked again next session\n"
+            "4. Not now — nothing is recorded; run `/memcontinuum` again to decide\n"
             "5. Maybe later — think about it and decide next week\n\n"
             "**`partial-wired`**",
         )
@@ -1355,12 +1355,21 @@ class TestConsentIsManualNotAutomatic(unittest.TestCase):
     as advisory, never as something that reaches the human without the
     human (or an unreliable assistant) acting on it.
 
+    The same retired promise also sat in section 2 of
+    skills/memcontinuum/SKILL.md itself -- the pinned structured-prompt
+    "Not now" option, in the single most user-visible place in the
+    product, said the human "will be asked again next session". Fixed
+    alongside the README (the option text now points at re-running
+    `/memcontinuum`, TestSkillHonesty above pins the corrected list); this
+    class additionally pins the retired phrasing as absent from the whole
+    skill file, not just from step 3's prose.
+
     These tests pin the retired phrasing's absence and the replacement's
     substance for a specific reason: a PUBLIC_DOCS-wide keyword scan for
     "asked" would also trip on skills/memcontinuum/SKILL.md's own pinned
     structured-prompt options (settled design, tested by TestSkillHonesty
-    above -- e.g. "you will be asked again next session" is the human-
-    facing option text of a LIVE dialogue the human just triggered by
+    above -- e.g. "this repo is never asked again", the `declined` option,
+    is a true statement about a LIVE dialogue the human just triggered by
     running the skill, not an unprompted claim) and on docs/INTERNALS.md's
     accurate internal description of the detector's own hook-state
     machine (`undecided` | `asks, once` names what the hook EMITS to
@@ -1457,12 +1466,13 @@ class TestConsentIsManualNotAutomatic(unittest.TestCase):
 
     def test_skill_not_now_paragraph_no_longer_promises_a_bare_re_ask(self):
         # This sentence sits in "## 3. Act on the answer", explanatory prose
-        # around the pinned option list in "## 2. Ask" (section 2 itself is
-        # settled design -- TestSkillHonesty pins its exact option text,
-        # "you will be asked again next session" included, and this test
-        # must not touch that). This paragraph is not pinned there and
-        # carried the same false promise in the assistant's own follow-up
-        # explanation, so it gets the same correction as the README.
+        # around the pinned option list in "## 2. Ask" (section 2's own
+        # option text carried the same false promise and got the matching
+        # fix -- see test_skill_section_2_no_longer_promises_a_bare_re_ask
+        # below and TestSkillHonesty's pinned option lists above). This
+        # paragraph is not pinned there and carried the same false promise
+        # in the assistant's own follow-up explanation, so it gets the same
+        # correction as the README.
         text = SKILL.read_text()
         section = self._between(
             text, '**"Not now" → record nothing.**', "## 4. Reversing",
@@ -1474,6 +1484,23 @@ class TestConsentIsManualNotAutomatic(unittest.TestCase):
             normalized,
         )
         self.assertIn("no guarantee it reaches the human unless", normalized)
+
+    def test_skill_section_2_no_longer_promises_a_bare_re_ask(self):
+        # TOP-0110 L3: section 2's pinned "Not now" option (the single most
+        # user-visible place in the product -- a numbered choice the human
+        # sees live) used to say the human "will be asked again next
+        # session" / "asked again next session", in both the `undecided`
+        # and `partial-wired` states. That is the same retired promise as
+        # the README's old "You get asked once" -- nothing compels an
+        # assistant to raise the SessionStart detector's advisory nudge, so
+        # no document may promise a bare re-ask. Pinned absent from the
+        # WHOLE file (not just step 3's prose, which the test above
+        # covers), so a regression in either state's option text is caught
+        # here even if TestSkillHonesty's exact-list pins above are ever
+        # loosened.
+        text = SKILL.read_text()
+        self.assertNotIn("you will be asked again next session", text)
+        self.assertNotIn("asked again next session", text)
 
 
 if __name__ == "__main__":

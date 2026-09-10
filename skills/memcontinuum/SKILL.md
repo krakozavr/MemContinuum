@@ -87,14 +87,14 @@ and the habit of writing records.
    under the named code root
 2. Yes, rationale only — records, no code retrieval
 3. No — record the decline; this repo is never asked again
-4. Not now — nothing is recorded; you will be asked again next session
+4. Not now — nothing is recorded; run `/memcontinuum` again to decide
 
 **`partial-wired`** (some but not all write-side hooks already present, no
 recorded decision) — three options:
 
 1. Complete the wiring — finishes what a prior install left half-done
 2. Remove what is there
-3. Not now — leave it half-wired; asked again next session
+3. Not now — leave it half-wired; run `/memcontinuum` again to decide
 
 **`wired`** — first report the state as facts, straight out of step 1's own
 output (`decision`, `wiring`, `decided_at` — present only when a registry row
