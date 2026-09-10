@@ -38,9 +38,18 @@ For each query we compute, per runner:
 - **MRR** — `1 / rank of the first expected id` anywhere in the runner's
   output (not capped at any k). Zero if no expected id was returned at all.
 
-`bench/score.py` reports these per `kind` (`path`, `question`), a
-`paraphrase` slice (queries whose id starts with `para-` — see below), and
-`overall`.
+`bench/score.py` reports these per `kind` (`path`, `question`), three
+disjoint sub-slices of `question` by id prefix — `paraphrase` (`para-`, see
+below), `exact-term` (`et-`, an error message/file name/symbol/flag/quoted
+phrase a keyword search should nail — see "The exact-term queries" below),
+`plain` (`kw-`, ordinary keyword-shaped developer questions, see "The
+paraphrase queries" below) — and `overall`. `overall` and `question` are
+each the union of every query of that shape, `exact-term` included: they
+moved slightly easier when the 12 `et-` queries were added (fix round: was
+45 queries with no `et-` slice; the exact-term R@1/MRR are near-ceiling by
+construction, since that is the point of the slice), which is exactly why
+the sliced numbers exist — read `paraphrase` as the hard number and
+`overall`/`question` as a blend, not the other way around.
 
 ## How to run it
 
@@ -53,8 +62,20 @@ PYTHONPATH= "$MEMCONTINUUM_PYTHON" bench/score.py
 `score.py` (no fastembed/PyYAML needed for `score.py`, `nomemory`, or
 `keyword` — only the `memcontinuum` runner's own subprocess call into
 `memidx.py` needs `$MEMCONTINUUM_PYTHON`, and it reads that variable
-itself). `--json` gets the same result as machine-readable JSON instead of
-a table. `--runner NAME[:mode]` (repeatable) selects a subset; see "Runner
+itself). `--json` gets the same result as a machine-readable envelope
+instead of a table: `{"runners": {<display name>: {"overall", "path",
+"question", "paraphrase", "exact-term", "plain", "errors"}}, "negative_
+control": {<display name>: {"real_mrr", "shuffled_mrr", "gain", "spread",
+"se", "returns_nothing", "is_exempt_baseline", "separates"}, "verdict",
+"failed_runners"}}` — pinned by `tests/test_bench.py::TestJSONOutputShape`
+so a future change to this shape is a deliberate, visible diff, not a
+silent break. (Fix round: `negative_control`'s own per-runner keys changed
+again this pass — `reversed_mrr`/`min_gain` are gone, `shuffled_mrr`/
+`spread`/`is_exempt_baseline` are new. Fix round 2: `se` is new — the
+`spread` field is the raw sample standard deviation of the per-query paired
+differences; `se` is what the pass/fail decision actually compares `gain`
+against (`spread / sqrt(n)`) — see "The negative control" below.)
+`--runner NAME[:mode]` (repeatable) selects a subset; see "Runner
 interface" below for what `NAME` can be. Everything runs strictly
 sequentially — several `memcontinuum:*` runner invocations share one
 on-disk SQLite index (see below), and concurrent writers to one SQLite file
@@ -104,7 +125,7 @@ for its own sake:
   superseded link's own row, so a query about the *old* choice is only
   answerable at all through what the *current* link says about it. A query
   that needed `--status any` to be answerable would be testing
-  `memidx.py`'s CLI, not the corpus, so none of the 45 queries need it.
+  `memidx.py`'s CLI, not the corpus, so none of the 57 queries need it.
 - **Concept boundaries that pull in topics no direct `code_refs` would
   find.** `CON-303` ("Upload Pipeline") is governed by both `TOP-110`
   (retry, this file's own `code_refs`) and `TOP-113` (streaming, a
@@ -150,7 +171,7 @@ running `memidx.py` at all.
 
 ### The paraphrase queries
 
-11 of the 25 `question` queries (id prefix `para-`, exceeding the 10
+11 of the 37 `question` queries (id prefix `para-`, exceeding the 10
 required) share **zero word-level vocabulary** with their target record's
 own indexed text: lowercase, `[a-z0-9]+`-tokenized, common-English-stopword
 -removed, no stemming, checked against the target's title + body + (for a
@@ -178,9 +199,27 @@ The 14 `kw-` queries are ordinary keyword-shaped developer questions
 keyword search is *supposed* to do well on, kept in the same file so the
 paraphrase slice's difficulty is visible by contrast, not assumed.
 
+### The exact-term queries
+
+The 12 `et-` queries each quote (or near-quote) a specific error
+message/file name/symbol/flag/figure/proper noun that appears verbatim in
+exactly one record's own indexed text (`et-05`'s `256MB`, `et-08`'s
+`Credential Manager`, `et-11`'s near-verbatim quote of an incident's own
+title — see each query's own `notes` for its literal phrase and source
+line). This is the case a keyword search is expected to nail outright
+(`tests/test_bench.py`'s corpus-lint and expect-id checks cover this
+slice like any other, and a floor on its own count keeps it from silently
+shrinking away, but there is no dedicated mechanical check that a claimed
+exact phrase is actually present in the target's text — verified by hand,
+once, against the corpus, when each query was written; see "Honest
+limitations"). Folded into `overall`/`question` for backward
+compatibility with the pre-`et-` query set (see "What is measured" above)
+— read the `exact-term` row in isolation to compare it against
+`paraphrase`, not against `overall`.
+
 ### `notes`
 
-Every one of the 45 queries' `notes` field states which record(s) are
+Every one of the 57 queries' `notes` field states which record(s) are
 expected and why, in terms of what is actually in the corpus (a
 `code_refs` entry, a concept's `governed_by`, shared or absent vocabulary)
 — never "because the tool returns this," which would make the key a
@@ -255,6 +294,16 @@ shell has exported (`--db` overrides this explicitly if a caller wants a
 fixed path). `PYTHONPATH` is cleared for every `memidx.py` subprocess call
 it makes.
 
+This system-temp cache is deliberate residue, not an oversight (Codex 8):
+its whole point is to survive between runs (`bench/runners/memcontinuum.py`
+reuses it instead of reindexing from scratch on every single-query
+subprocess call this file makes), and its path is keyed off a hash of the
+corpus's own resolved path, so a different `--corpus` never collides with
+it. It lives under `tempfile.gettempdir()`, never under `MEMCONTINUUM_HOME`
+or any real store, and it holds nothing but a rebuild of this file's own
+public, synthetic corpus — safe to delete by hand at any time; the next
+run just rebuilds it.
+
 For `kind: path`, it flattens `for-path --json`'s match structure exactly
 as described in "The path-kind answer key" above: top-level topic/concept
 ids plus, for each matched concept, its nested `governed_by` topic ids,
@@ -280,6 +329,18 @@ PYTHONPATH= "$MEMCONTINUUM_PYTHON" python -m unittest tests.test_bench -v
 
 ## Honest limitations
 
+- **A custom `--queries` file with fewer than 2 queries of some `kind` makes
+  the negative control traceback, uncaught, instead of running.** The
+  kind-preserving derangement (see "The negative control") needs at least 2
+  queries per kind group to build a same-kind pairing; `score.py --private`
+  guards this itself (its query set is a single kind, `question`, and it
+  checks `len(queries) >= 2` before calling the control), but `score.py`'s
+  main path does not. Not a live problem for this file's own 57-query set
+  (20 `path`, 37 `question`, nowhere near the boundary) — documented as a
+  known limit of a custom query set, not fixed, because the right behavior
+  (skip the lone-kind query? skip the whole control? skip just that kind?)
+  is a design decision for whoever hits it with a real query set, not one
+  worth guessing at in the abstract.
 - **The corpus is synthetic.** "Driftwood" does not exist. A real
   project's decisions are messier — inconsistent authoring, real
   disagreement between rulings, records nobody had time to write well.
@@ -290,11 +351,36 @@ PYTHONPATH= "$MEMCONTINUUM_PYTHON" python -m unittest tests.test_bench -v
   independence check) but not against a second reviewer's independent
   read. A key that is wrong in a way its own author cannot see is not
   caught by that author re-checking their own work.
-- **32 records and 45 queries is small.** Recall@k on a corpus this size
+- **32 records and 57 queries is small.** Recall@k on a corpus this size
   moves by more than one query's worth of luck; treat single-decimal
   differences between runners as noise and multi-decimal differences (the
   paraphrase-slice gap between `keyword` and `memcontinuum:vector`, for
   instance) as the signal worth trusting.
+- **The `keyword` baseline's TF-IDF has no document-length normalization,
+  so a paraphrase query can be vocabulary-independent by this file's own
+  definition (zero *content* words shared, stopwords removed) and still
+  rank the target first for `keyword`.** Found during the fix round that
+  closed Grok 8: after removing every leaked content word from `para-01`,
+  `keyword` still ranked its target (`TOP-107`) first, dominated by raw
+  counts of "the"/"a"/"is"/"and" and similar words this file's own
+  independence check deliberately excludes (that is what "stopword" means
+  here) but `bench/runners/keyword_baseline.py`'s scorer does not — a
+  longer or more repetitively-worded record accumulates more of these
+  regardless of query content, with no length normalization (BM25-style or
+  cosine) to correct for it. `para-06` (a similarly two-link topic,
+  `TOP-116`) does NOT show the same effect, so this is not simply "every
+  long record wins" — it was not chased further than the one probe that
+  found it. Not fixed here: changing `keyword_baseline.py`'s scoring
+  formula moves every keyword number in every slice this file and both
+  external gates already cite, which is a design decision for its own
+  review, not a drive-by edit inside a query-wording fix.
+- **The exact-term slice's literal phrases are hand-verified, not
+  mechanically checked.** `tests/test_bench.py` floors the slice's own
+  count (Grok 13) but does not assert that each query's claimed quoted
+  phrase actually appears in its target's text — that check was done once,
+  by hand, against the corpus, when each `et-` query was written (see "The
+  exact-term queries" above), and could in principle rot silently on a
+  future corpus edit.
 - **A system we did not run is named as not run, never compared from its
   documentation.** No hosted or third-party retrieval system has a runner
   here yet; adding one is exactly the "drop in a script" path described
@@ -311,3 +397,147 @@ PYTHONPATH= "$MEMCONTINUUM_PYTHON" python -m unittest tests.test_bench -v
   ("which function implements X") than the decision-memory retrieval this
   harness measures ("which ruling governs X"). Nothing here runs against
   it, and nothing here claims to.
+
+## The negative control
+
+A benchmark can report a flattering number while separating nothing. If the
+query set is easy enough that a runner ignoring the query entirely scores as
+well as the real one, the metric is measuring the corpus rather than the
+retrieval, and the headline figure is noise.
+
+**What this control actually claims (narrowed, fix rounds 2-4).** It
+catches a **stateless, deterministic** runner whose output is **fixed
+within each `kind`** — one that ignores the query TEXT and, at most,
+branches on `kind` — the one other channel `score.py` hands a runner
+separately from the query text (see "Runner interface" above: `--kind` and
+`--query` are both passed). It is **not** a general proof that "any
+query-blind runner fails" — a runner that reads the query text and branches
+on some OTHER signal uncorrelated with `kind` is not provably caught by this
+design. `kind` is the one channel targeted because it is the one this
+benchmark's own CLI contract hands a runner outside the query text, and it is
+the one two independent external reviewers demonstrated a working exploit
+against.
+
+It also assumes the runner is **stateless**: a runner that persists state
+across invocations (a counter file, say) and keys its answer on which
+ordinal call it is — not on `--kind` or `--query` at all — is outside what
+this design can catch, because `score.py` invokes every query in one FIXED
+sequence on every run, and this corpus's `path` expects happen to line up
+with part of that numbering by authoring coincidence. Both external
+reviewers independently built such a runner (fix round 3), in two
+strengths: the WEAKER one has no knowledge of the actual answer key
+at all — it just prints the mechanically guessed id `TOP-{101+n}` for
+call number n — and still scored gain +0.14 purely from that numbering
+coincidence, which is the more alarming case since it needs nothing but a
+convention to beat the control; the STRONGER one additionally bakes the
+real published answer sequence in by ordinal position and scored gain
++0.98, near-perfect, since it no longer depends on any coincidence at
+all. Both `exit 0`. Neither reviewer proposes closing this, and this fix
+round did not either: no derangement of
+already-computed per-query output can tell "this output came from reading
+the query" apart from "this output came from a counter," since the leak is
+in *how* the output was produced, not in the (kind, query) → output mapping
+the derangement inspects. A per-run randomized invocation order was
+considered and rejected — a fixed seed is as publicly hardcodable as
+today's fixed order, and a true per-run random order breaks this control's
+own no-RNG/reproducibility design (see "What it does now" below) for a
+defense a stateful runner defeats just as easily by keying on query id
+instead of ordinal position.
+
+It further assumes the runner is **deterministic**: "stateless" alone is
+not enough, because a runner can persist nothing between calls and still
+vary its own output at random from one invocation to the next. Codex
+(fix round 4, a FOURTH external re-gate) built exactly this: a runner
+that reads none of its five CLI arguments — not `--query`, `--kind`,
+`--limit`, `--corpus`, or `--mode` — and persists no state of any kind,
+yet independently samples ten ids at random from this corpus's own 32
+real ids on every call. Its real-vs-shuffled gain is pure sampling noise
+around zero rather than the algebraic zero a fixed or kind-branching
+runner gets, and because this control is a MINIMUM-EFFECT FLOOR at a
+1×SE margin, not a calibrated significance test, noise alone clears that
+margin often enough to matter: on Codex's own runs it **passed on the
+fifth attempt** — gain 0.0456 against se 0.0361, exit 0. So the claim
+that this control catches any stateless runner is **false**; the honest
+claim is narrower still: it catches a stateless, deterministic runner
+whose output is fixed within each `kind`. A runner that persists nothing
+but rolls dice on every call is outside what this design can catch, and
+that it can pass by chance is an admitted limit, not a closed hole — no
+derangement of already-computed output can distinguish "this came from
+reading the query" from "this came from a die roll," for the same reason
+it cannot distinguish a counter. This runner is kept as a fixture
+(`_RANDOM_SAMPLING_RUNNER` in `tests/test_bench.py`,
+`TestRandomSamplingRunnerIsOutsideTheClaim`), which demonstrates across
+many seeds that this shape both passes and fails — the test does not,
+and must not, assert that it always fails.
+
+**Fix-round history.** The first version of this control reversed each
+runner's own ranked output and rescored it against the SAME query's expect.
+Two external reviews (Codex, Grok) independently proved that tests ranking
+*order*, not query-sensitivity: a query-blind runner that returns the
+identical list for every query passed (reversing a fixed list can still look
+query-sensitive if the corpus rewards that fixed order on average), and
+reversing a length-1 list or a match-set whose order is not a ranking at all
+(this file's own `path` kind) is a no-op — MRR cannot change, so all 20 `path`
+queries were structurally invisible to it regardless of the runner.
+
+The replacement severed the QUERY-TO-RESULT association: each query's
+already-computed ranked output is rescored against a *different* query's
+expected answer, the pairing fixed by a single deterministic derangement (no
+fixed point) of the WHOLE query id list. A SECOND external re-gate (again two
+independent reviewers, same finding) showed this still leaked: `path` and
+`question` queries have systematically different expect distributions (path
+expects skew toward `CON-*` ids; some question expects are `INC-*` ids), so
+that single derangement paired a `path` query with a `question` query about
+70% of the time, and a runner that never reads `--query` — a fixed
+concept-id list for `path`, a fixed incident-id list otherwise — beat its own
+shuffled twin and passed.
+
+**What it does now.** The derangement is **kind-preserving**: one rotation
+per `kind` group (`path` queries only ever pair with other `path` queries,
+`question` with `question`), each by an offset coprime with that group's own
+size so the rotation is a single cycle rather than several short ones — see
+`bench/score.py`'s `negative_control` module comment for the full derivation,
+including the algebraic proof that a runner whose output depends only on
+`kind` scores EXACTLY zero gain under this design, why a length-1/match-set
+result participates, and why re-running each runner on deranged
+(kind, query-text) pairs instead (considered, per an external reviewer's
+suggestion) was rejected — for a deterministic runner it is the identical
+test at twice the cost, not a stronger one.
+
+The threshold is a **minimum-effect floor, not a calibrated significance
+test** — this is also narrowed from an earlier claim, in the same fix round.
+The mean paired difference between each query's real and shuffled score must
+exceed that difference's own SAMPLE standard error (Bessel-corrected, not
+population — using population SD previously let a runner correct on exactly
+one query, empty everywhere else, always pass, for any query-set size; see
+the module comment for the exact algebraic reason) across the query set. This
+is not a full permutation test (one fixed derangement is not a null
+distribution, and its paired differences are not independent draws in the
+rigorous sense) and does not claim to be one — the printed `se` value and the
+`--json` field of the same name are exactly the quantity the pass/fail line
+compares against, not a different "spread" number a reader could mistake for
+it.
+
+A runner that returns nothing is excluded from the verdict, rather than
+counted as a failure, **only** when its resolved runner script is the
+repository's own canonical `bench/runners/nomemory.py` (bound to the
+resolved script PATH, never to a runner spec's display name — a
+user-controlled path spec's display is `script.stem`, and fix round 2 closed
+an exploit where an impostor script merely NAMED `nomemory.py` anywhere was
+exempted) AND it has zero errors AND it covered every query — anything else
+that returns nothing, or has any error at all, makes that runner's own
+result inconclusive rather than excused.
+
+If any runner fails, the harness prints **INCONCLUSIVE**, names the runners,
+and says the numbers say nothing about retrieval quality — and (fix round 1)
+`score.py`'s own exit code is nonzero on that verdict too (was: always `0`,
+silently unnoticed by any caller checking only the exit code). That verdict
+is in `--json` too, under `negative_control`. A published number without an
+`ok` verdict beside it should not be believed. `score.py --private` computes
+and prints this control too, on nothing but the aggregate numbers already
+safe to print there — the same "every run" promise this section makes, minus
+a query count under 2 per kind (a derangement needs at least two queries of
+the same kind), which it states and skips cleanly instead of crashing.
+
+Idea taken from klypix-mcp, whose benchmark runs unlocked writers as a negative
+control and declares itself inconclusive if they lose nothing.

@@ -1412,6 +1412,64 @@ class TestPreEditChainTopicsLogging(unittest.TestCase):
             line,
         )
 
+    def test_backward_clock_never_produces_a_negative_elapsed(self):
+        """Fix round (Codex 6 / Grok 6): a fake `date +%s` that steps
+        BACKWARDS between START_TS and finish()'s own `now` reproduces the
+        real CI flake (a negative elapsed) deterministically, no reliance
+        on an actual NTP correction firing mid-run. Every `date +%s` call
+        after the first one here returns the SAME stepped-back value (not
+        just the second), so this is robust regardless of how many such
+        calls this script makes before finish()."""
+        project = "elapsed-clamp"
+        home = self._build_home(project, ["TOP-9001"])
+        marker = Path(self.tmp) / "date-called-once"
+        real_date = shutil.which("date") or "/bin/date"
+        fake_bin = Path(self.tmp) / "fakebin"
+        fake_bin.mkdir()
+        fake_date = fake_bin / "date"
+        fake_date.write_text(
+            "#!/usr/bin/env bash\n"
+            'if [ "$1" = "+%s" ]; then\n'
+            f'    if [ -e "{marker}" ]; then\n'
+            '        echo 1000000100\n'
+            '    else\n'
+            f'        : > "{marker}"\n'
+            '        echo 1000000200\n'
+            '    fi\n'
+            '    exit 0\n'
+            'fi\n'
+            f'exec "{real_date}" "$@"\n'
+        )
+        fake_date.chmod(0o755)
+        proc, _elapsed = self._run(
+            home, project,
+            PATH=f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        # Grok 4 (fix round 2, external re-gate): the two assertions below
+        # this one used to be the ONLY assertions, and both would also pass
+        # on a genuinely fast real clock that never went through the fake
+        # `date` at all (a sub-second real run also logs "elapsed=0s" and
+        # never contains "elapsed=-") -- so a silent failure of the PATH
+        # override (the hook calling `date` by an absolute path, say) would
+        # give a false pass instead of a loud one. The marker proves the
+        # fake `date +%s` was actually invoked at least twice (once to
+        # create it and return START_TS, once more -- after it exists -- to
+        # return the stepped-back value finish() sees), i.e. that the
+        # backward step was genuinely exercised, not just that the hook
+        # happened to run quickly.
+        self.assertTrue(marker.exists(),
+                         "fake date was never called a second time -- the backward-clock "
+                         "scenario was not exercised, this test proves nothing")
+        line = self._last_outcome_line(home)
+        self.assertRegex(line, r"elapsed=\d+s", line)
+        self.assertNotIn("elapsed=-", line)
+        # And the clamp's own arithmetic: 1000000100 - 1000000200 = -100
+        # unclamped, so a genuine clamp must show exactly 0, not merely
+        # "some non-negative number" (which a fast real run would also
+        # produce, coincidentally, even with no fake date involved at all).
+        self.assertRegex(line, r"elapsed=0s", line)
+
     def test_two_topics_logged_sorted_comma_separated(self):
         project = "topics-two"
         # deliberately out of sorted order on disk

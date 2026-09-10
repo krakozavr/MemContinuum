@@ -180,6 +180,13 @@ finish() {
     local now elapsed
     now=$(date +%s 2>/dev/null || echo "$START_TS")
     elapsed=$(( now - START_TS ))
+    # Same clamp as hooks/pre-edit-chain.sh's own finish() (fix round,
+    # Grok 15): the wall clock can step BACKWARDS mid-run (NTP correction,
+    # VM resume, manual set), and nothing downstream expects a sign on
+    # this field. Landed in the same commit as pre-edit-chain.sh's clamp
+    # rather than separately, since it is the identical flake in the
+    # identical shape of finish() function.
+    [ "$elapsed" -lt 0 ] && elapsed=0
     mc_log "ledger outcome=$outcome elapsed=${elapsed}s session=${SESSION_ID:-} file=${FILE_PATH:-}"
     exit 0
 }

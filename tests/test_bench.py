@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import random
 import re
 import subprocess
 import sys
@@ -98,6 +99,16 @@ class TestQueriesShapeAndExpectIds(unittest.TestCase):
         self.assertGreaterEqual(len(queries), 30)
         para = [q for q in queries if q["id"].startswith("para-")]
         self.assertGreaterEqual(len(para), 10)
+
+    def test_at_least_10_exact_term_queries(self):
+        """Grok 13: the et- slice had no floor -- it could silently vanish
+        (or shrink to nothing meaningful) without failing the suite. This
+        does not check that each query's claimed phrase is actually
+        present in its target (that is still verified by hand -- see
+        bench/README.md's "The exact-term queries"), only that the slice
+        itself cannot quietly disappear."""
+        et = [q for q in load_queries() if q["id"].startswith("et-")]
+        self.assertGreaterEqual(len(et), 10)
 
     def test_both_kinds_present(self):
         kinds = {q["kind"] for q in load_queries()}
@@ -191,6 +202,47 @@ class TestScorerMetrics(unittest.TestCase):
         self.assertEqual(agg["n"], 0)
         self.assertEqual(agg["recall@1"], 0.0)
         self.assertEqual(agg["mrr"], 0.0)
+
+
+# ---------------------------------------------------------------------------
+# 3b. --json's envelope shape (Codex 9): {"runners", "negative_control"},
+#     an untested breaking change vs. main's old flat-dict-of-runner-names
+#     shape when this was introduced -- pinned here so a future change to
+#     it is a deliberate, visible diff, not a silent break.
+# ---------------------------------------------------------------------------
+
+class TestJSONOutputShape(unittest.TestCase):
+    def test_json_envelope_is_runners_and_negative_control(self):
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = score.main(["--json", "--runner", "nomemory", "--runner", "keyword"])
+        payload = json.loads(buf.getvalue())
+        self.assertEqual(set(payload.keys()), {"runners", "negative_control"})
+        self.assertEqual(set(payload["runners"].keys()), {"nomemory", "keyword"})
+        for slices in payload["runners"].values():
+            self.assertEqual(
+                set(slices.keys()),
+                {"overall", "path", "question", "paraphrase", "exact-term", "plain", "errors"},
+            )
+        nc = payload["negative_control"]
+        self.assertEqual(set(nc.keys()) - {"nomemory", "keyword"}, {"verdict", "failed_runners"})
+        for runner_result in (nc["nomemory"], nc["keyword"]):
+            self.assertEqual(
+                set(runner_result.keys()),
+                {"real_mrr", "shuffled_mrr", "gain", "spread", "se", "returns_nothing",
+                 "is_exempt_baseline", "separates"},
+            )
+        # nomemory (declared, empty, zero errors, full coverage) always
+        # separates by exemption; the real corpus + keyword always
+        # separates too (TestNegativeControl's own live-corpus test covers
+        # this properly) -- both true here means the run is "ok", so this
+        # doubles as a check that --json's exit code matches its own
+        # printed verdict (M3).
+        self.assertEqual(nc["verdict"], "ok")
+        self.assertEqual(rc, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -407,6 +459,20 @@ def _indexed_text_for(record_id: str, topics: dict, incidents: dict) -> str:
     return " ".join([fm.get("title", ""), body])
 
 
+def _record_paths_by_id() -> dict[str, Path]:
+    """record id -> the markdown file it lives in, for the stricter
+    full-raw-file independence check below (keyword_baseline.py's own
+    search surface, not memidx's narrower indexed-text subset)."""
+    out: dict[str, Path] = {}
+    for f in memidx.walk_markdown(CORPUS):
+        result = memidx.parse_record(f)
+        if not result.valid:
+            continue
+        rid = str(result.frontmatter.get("id") or f.stem)
+        out[rid] = f
+    return out
+
+
 def _load_topics_and_incidents_with_body() -> tuple[dict, dict]:
     topics: dict[str, tuple] = {}
     incidents: dict[str, tuple] = {}
@@ -439,6 +505,34 @@ class TestParaphraseIndependence(unittest.TestCase):
                 f"indexed text -- this is no longer a genuine paraphrase",
             )
 
+    def test_paraphrase_queries_share_no_vocabulary_with_the_full_raw_record(self):
+        """Fix round (Grok 8, MAJOR/must-fix in that gate): the check above
+        matches what memidx.py/memcontinuum actually index and search, but
+        bench/README.md's `keyword` baseline searches the ENTIRE raw
+        markdown file -- frontmatter, `alternatives`, `evidence`, `tags`,
+        even a superseded link's own text. A query can pass the
+        indexed-text check above and still leak through a field that check
+        never reads: para-01 did, before this fix round -- 'behave' and
+        'version' leaked via TOP-107's `alternatives.rejected_because` and
+        its superseded L1 link's own ruling text, and keyword ranked
+        TOP-107 first (MRR 1.0) for what was supposed to be the hard case.
+        This is the stricter check against that whole surface, so a future
+        corpus edit that reintroduces a full-file leak fails the suite the
+        same way the indexed-text-only leak used to slip through."""
+        paths = _record_paths_by_id()
+        para = [q for q in load_queries() if q["id"].startswith("para-")]
+        for q in para:
+            target = q["expect"][0]
+            raw = paths[target].read_text(encoding="utf-8")
+            overlap = _tokens(q["query"]) & _tokens(raw)
+            self.assertEqual(
+                overlap, set(),
+                f"{q['id']} -> {target}: shares vocabulary {sorted(overlap)} with its target's "
+                f"FULL RAW FILE (not just its indexed text) -- keyword_baseline.py searches "
+                f"this whole surface, so this leak can inflate keyword's score on what should "
+                f"be the hard case",
+            )
+
     def test_kw_queries_are_not_accidentally_zero_overlap(self):
         """Sanity check on the *other* half of the question set: the kw-
         queries are supposed to have real overlap (that's what makes them
@@ -452,10 +546,6 @@ class TestParaphraseIndependence(unittest.TestCase):
             indexed = _indexed_text_for(target, topics, incidents)
             overlap = _tokens(q["query"]) & _tokens(indexed)
             self.assertNotEqual(overlap, set(), f"{q['id']} -> {target}: expected some shared vocabulary")
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestRunnersDoNotShadowStdlib(unittest.TestCase):
@@ -483,3 +573,561 @@ class TestRunnersDoNotShadowStdlib(unittest.TestCase):
             if origin == "built-in" or "lib/python" in origin.replace("\\", "/"):
                 offenders.append(f"{script.name} shadows stdlib {name!r} ({origin})")
         self.assertEqual(offenders, [], "; ".join(offenders))
+
+
+class TestNegativeControl(unittest.TestCase):
+    """A benchmark can report a flattering number while separating nothing.
+    Fix round (external review, two independent gates): the ORIGINAL control
+    reversed each runner's own ranked output and rescored it against the
+    SAME query's expect. That tested ranking order, not query-sensitivity --
+    a query-blind fixed-list runner passed (reversing a fixed list still
+    looks query-sensitive on average), and a length-1 or match-set result
+    (this corpus's own `path` kind) could never change under reversal at
+    all, so 20 of 57 queries were invisible to it. The control now severs
+    the QUERY-TO-RESULT association instead: each query's own ranked output
+    is rescored against a DIFFERENT query's expect (a fixed, deterministic
+    derangement of the query id list -- see bench/score.py's negative_control
+    module comment for the full derivation, including why the fixed-ranker
+    case below produces an EXACT zero gain, not an approximate one).
+
+    Fix round 2 (a SECOND external re-gate, two independent reviewers, same
+    residual hole): that single corpus-wide derangement mixed `path` and
+    `question` ids, and this corpus's two kinds have systematically
+    different expect distributions -- a runner that never reads `--query`
+    and branches only on `--kind` passed. The derangement is now
+    kind-preserving (one rotation per kind group, see
+    `TestKindPreservingDerangementClosesTheKindLeak` below for the live
+    counterexamples), and the exemption below is bound to
+    `is_canonical_null_baseline`, a flag `run_all` sets from the RESOLVED
+    SCRIPT PATH -- never from `display`, which is user-controlled for a
+    path-spec runner (`script.stem`). Tests below that construct a `rep`
+    dict directly (bypassing `run_all`) must set this flag explicitly; it
+    defaults to `False`, matching a runner `run_all` never vouched for."""
+
+    def _report(self, ranked_by_qid, expect_by_qid, display="r", is_canonical_null_baseline=False):
+        per_query = {}
+        for qid, ranked in ranked_by_qid.items():
+            m = score.evaluate_query(expect_by_qid[qid], ranked)
+            m["ranked"] = ranked
+            per_query[qid] = m
+        return {display: {
+            "per_query": per_query,
+            "errors": {},
+            "is_canonical_null_baseline": is_canonical_null_baseline,
+        }}
+
+    def _queries(self, expect_by_qid, kind="question"):
+        return [{"id": q, "kind": kind, "query": "q", "expect": e}
+                for q, e in expect_by_qid.items()]
+
+    def test_a_good_ranking_separates_from_its_shuffle(self):
+        expect = {"q1": ["a"], "q2": ["b"], "q3": ["c"], "q4": ["d"]}
+        ranked = {"q1": ["a", "x", "y"], "q2": ["b", "x", "y"],
+                  "q3": ["c", "x", "y"], "q4": ["d", "x", "y"]}
+        rep = self._report(ranked, expect)
+        c = score.negative_control(rep, self._queries(expect))
+        self.assertEqual(c["verdict"], "ok", c)
+        self.assertTrue(c["r"]["separates"])
+        self.assertAlmostEqual(c["r"]["real_mrr"], 1.0)
+        self.assertAlmostEqual(c["r"]["shuffled_mrr"], 0.0)
+        self.assertGreater(c["r"]["gain"], 0)
+
+    def test_a_query_blind_fixed_ranker_gets_exactly_zero_gain_and_fails(self):
+        """Codex's counterexample against the OLD (reversal) control: a
+        runner that returns the identical list for every query, ignoring
+        the query entirely, used to pass with gain +0.4583. Here the same
+        shape of runner gets EXACTLY zero gain (proven algebraically in
+        bench/score.py, not just empirically low) and fails."""
+        expect = {"q1": ["a"], "q2": ["b"], "q3": ["c"], "q4": ["d"]}
+        fixed_list = ["a", "b", "c", "d"]  # returned for every query, unchanged
+        ranked = {qid: fixed_list for qid in expect}
+        rep = self._report(ranked, expect, display="fixed")
+        c = score.negative_control(rep, self._queries(expect))
+        self.assertAlmostEqual(c["fixed"]["gain"], 0.0, places=9)
+        self.assertFalse(c["fixed"]["separates"])
+        self.assertEqual(c["verdict"], "inconclusive")
+        self.assertIn("fixed", c["failed_runners"])
+
+    def test_a_perfect_ranker_passes_and_path_kind_length_one_results_participate(self):
+        """The OLD control could never move a length-1 (or match-set)
+        result at all -- this benchmark's own `path` queries were
+        structurally invisible to it. Here a perfect `path`-shaped runner
+        (one exact id per query, the for-path match-set shape) shows a real
+        gain, proving path-kind queries now participate."""
+        expect = {"p1": ["A"], "p2": ["B"], "p3": ["C"], "p4": ["D"]}
+        ranked = {"p1": ["A"], "p2": ["B"], "p3": ["C"], "p4": ["D"]}
+        rep = self._report(ranked, expect, display="path-perfect")
+        c = score.negative_control(rep, self._queries(expect, kind="path"))
+        self.assertEqual(c["verdict"], "ok", c)
+        self.assertTrue(c["path-perfect"]["separates"])
+        self.assertAlmostEqual(c["path-perfect"]["real_mrr"], 1.0)
+        self.assertGreater(c["path-perfect"]["gain"], 0,
+                            "a length-1 path-kind result must be able to show a nonzero "
+                            "gain now -- reversal could never move it at all")
+
+    def test_a_query_set_that_cannot_tell_them_apart_is_inconclusive(self):
+        # every runner scores identically against every query's own expect
+        # AND against its derangement partner's expect (all four expects
+        # are found at the same rank in every ranked list) -- nothing
+        # distinguishes a real run from a shuffled one.
+        expect = {"q1": ["x"], "q2": ["x"], "q3": ["x"], "q4": ["x"]}
+        ranked = {qid: ["x", "y"] for qid in expect}
+        rep = self._report(ranked, expect)
+        c = score.negative_control(rep, self._queries(expect))
+        self.assertEqual(c["verdict"], "inconclusive")
+        self.assertIn("r", c["failed_runners"])
+        self.assertFalse(c["r"]["separates"])
+
+    def test_all_erroring_runner_is_inconclusive_not_excused(self):
+        """B2: all(...) over an empty per_query used to be vacuously True,
+        so a runner that errors on every query was reported `ok`."""
+        expect = {"q1": ["a"], "q2": ["b"]}
+        rep = {"broken": {"per_query": {}, "errors": {"q1": "boom", "q2": "boom"}}}
+        c = score.negative_control(rep, self._queries(expect))
+        self.assertFalse(c["broken"]["separates"])
+        self.assertEqual(c["verdict"], "inconclusive")
+        self.assertIn("broken", c["failed_runners"])
+
+    def test_silently_empty_undeclared_runner_is_inconclusive_not_excused(self):
+        """B2: only the runner run_all flagged as the canonical null baseline
+        (`is_canonical_null_baseline`, from the resolved script path -- see
+        `score.NULL_BASELINE_SCRIPT`) may return nothing and still pass."""
+        expect = {"q1": ["a"], "q2": ["b"]}
+        rep = self._report({"q1": [], "q2": []}, expect, display="mystery-empty")
+        c = score.negative_control(rep, self._queries(expect))
+        self.assertTrue(c["mystery-empty"]["returns_nothing"])
+        self.assertFalse(c["mystery-empty"]["is_exempt_baseline"])
+        self.assertFalse(c["mystery-empty"]["separates"])
+        self.assertEqual(c["verdict"], "inconclusive")
+
+    def test_the_real_nomemory_baseline_is_still_ok(self):
+        """B2 red test: the one runner actually entitled to the exemption
+        (canonical script path, empty by design, zero errors, full
+        coverage) still passes."""
+        expect = {"q1": ["a"], "q2": ["b"]}
+        rep = self._report({"q1": [], "q2": []}, expect, display="nomemory",
+                            is_canonical_null_baseline=True)
+        c = score.negative_control(rep, self._queries(expect))
+        self.assertTrue(c["nomemory"]["returns_nothing"])
+        self.assertTrue(c["nomemory"]["is_exempt_baseline"])
+        self.assertTrue(c["nomemory"]["separates"])
+        self.assertEqual(c["verdict"], "ok")
+
+    def test_declared_baseline_with_errors_is_not_exempt(self):
+        """Being the canonical baseline SCRIPT is not the whole exemption --
+        it must also have zero errors and full query coverage (Grok's
+        'footgun for any other caller' concern, made explicit rather than
+        implicit). `is_canonical_null_baseline` is True here (this IS the
+        real nomemory.py, per run_all's own resolved-path check), yet the
+        run still fails the exemption because it errored on q2."""
+        expect = {"q1": ["a"], "q2": ["b"]}
+        m = score.evaluate_query(expect["q1"], [])
+        m["ranked"] = []
+        rep = {"nomemory": {
+            "per_query": {"q1": m}, "errors": {"q2": "boom"},
+            "is_canonical_null_baseline": True,
+        }}
+        c = score.negative_control(rep, self._queries(expect))
+        self.assertFalse(c["nomemory"]["separates"])
+        self.assertEqual(c["verdict"], "inconclusive")
+
+    def test_display_name_alone_no_longer_grants_the_exemption(self):
+        """R2 (fix round 2, external re-gate, two independent reviewers):
+        `display` is `script.stem` for a path-spec runner, entirely
+        user-controlled. Naming an impostor script "nomemory.py" used to be
+        enough to be exempted; here the display string IS "nomemory" but
+        `is_canonical_null_baseline` is (correctly) unset, because nothing
+        vouched for this being the real script -- exemption must not
+        trigger."""
+        expect = {"q1": ["a"], "q2": ["b"]}
+        rep = self._report({"q1": [], "q2": []}, expect, display="nomemory")
+        c = score.negative_control(rep, self._queries(expect))
+        self.assertTrue(c["nomemory"]["returns_nothing"])
+        self.assertFalse(c["nomemory"]["is_exempt_baseline"])
+        self.assertFalse(c["nomemory"]["separates"])
+        self.assertEqual(c["verdict"], "inconclusive")
+
+    def test_unknown_query_id_fails_closed_with_a_clear_message(self):
+        """Grok 10: a report carrying a qid absent from the query set used
+        to KeyError deep inside the derangement lookup. Now it raises a
+        clear, specific error instead."""
+        expect = {"q1": ["a"], "q2": ["b"]}
+        rep = self._report({"q1": ["a"], "not-a-real-query": ["a"]},
+                            {"q1": ["a"], "not-a-real-query": ["a"]})
+        with self.assertRaises(ValueError) as ctx:
+            score.negative_control(rep, self._queries(expect))
+        self.assertIn("not-a-real-query", str(ctx.exception))
+
+    def test_the_live_corpus_separates_for_the_keyword_baseline(self):
+        # the real thing, not a fixture: if this ever goes inconclusive the
+        # query set has decayed and every published number is suspect.
+        queries = score.load_queries(QUERIES_PATH)
+        rep = score.run_all(queries, CORPUS, ["keyword"], 10)
+        c = score.negative_control(rep, queries)
+        self.assertEqual(c["verdict"], "ok", c)
+
+
+# ---------------------------------------------------------------------------
+# Fix round 2 (external re-gate, two independent reviewers): both built a
+# WORKING runner script and ran it through the live bench/score.py to defeat
+# the control that shipped after fix round 1. Kept here as regression
+# fixtures, run through the real bench/score.py pipeline (run_all + the live
+# 57-query corpus), not just against a small in-memory report, so a future
+# change to the derangement or the exemption is caught the same way the
+# reviewers caught the original hole.
+# ---------------------------------------------------------------------------
+
+_KIND_BRANCHING_RUNNER = '''#!/usr/bin/env python
+"""Never reads --query at all: a fixed corpus-class ranking keyed only on
+--kind. This is the exact shape both re-gate reviewers independently built
+against fix round 1's corpus-wide derangement."""
+import argparse, sys
+
+CON = ["CON-301", "CON-302", "CON-303", "CON-304"]
+INC = ["INC-201", "INC-202", "INC-203", "INC-204", "INC-205", "INC-206"]
+
+def main(argv=None):
+    p = argparse.ArgumentParser()
+    p.add_argument("--corpus", required=True)
+    p.add_argument("--kind", required=True)
+    p.add_argument("--query", required=True)
+    p.add_argument("--limit", type=int, default=10)
+    p.add_argument("--mode", default=None)
+    args = p.parse_args(argv)
+    out = CON if args.kind == "path" else INC
+    print("\\n".join(out))
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+# Codex's own counterexample from the re-gate (a distinct shape from
+# Grok's above, kept as its own fixture per the brief's literal ask to keep
+# BOTH reviewers' scripts): "a runner returning the same corpus-class
+# ranking for every path (CON, then TOP, then INC) and another fixed
+# ranking for every question (INC, then TOP, then CON)" -- still never
+# reads --query, but interleaves all three id classes instead of only two.
+_CODEX_KIND_SPLIT_RUNNER = '''#!/usr/bin/env python
+"""Codex's re-gate counterexample: a fixed corpus-class ranking per kind,
+covering all three id classes (CON/TOP/INC), never reading --query."""
+import argparse, sys
+
+CON = ["CON-301", "CON-302", "CON-303", "CON-304"]
+TOP = ["TOP-101", "TOP-102", "TOP-103", "TOP-104", "TOP-105", "TOP-106",
+       "TOP-107", "TOP-108", "TOP-109", "TOP-110", "TOP-111", "TOP-112",
+       "TOP-113", "TOP-114", "TOP-115", "TOP-116", "TOP-117", "TOP-118",
+       "TOP-119", "TOP-120", "TOP-121", "TOP-122"]
+INC = ["INC-201", "INC-202", "INC-203", "INC-204", "INC-205", "INC-206"]
+
+def main(argv=None):
+    p = argparse.ArgumentParser()
+    p.add_argument("--corpus", required=True)
+    p.add_argument("--kind", required=True)
+    p.add_argument("--query", required=True)
+    p.add_argument("--limit", type=int, default=10)
+    p.add_argument("--mode", default=None)
+    args = p.parse_args(argv)
+    out = (CON + TOP + INC) if args.kind == "path" else (INC + TOP + CON)
+    print("\\n".join(out[:args.limit] if args.limit else out))
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+
+class TestKindPreservingDerangementClosesTheKindLeak(unittest.TestCase):
+    """R1 (fix round 2, Codex 1 BLOCKING / Grok 1 MAJOR on re-gate): the
+    runner receives `--kind` separately from `--query` (see `run_query`),
+    and fix round 1's derangement rotated the WHOLE 57-query id list,
+    pairing `path` queries with `question` queries (and vice versa) about
+    70% of the time. Because this corpus's two kinds have systematically
+    different expect distributions (path expects skew toward CON-* ids;
+    some question expects are INC-* ids), a runner that ignores the query
+    text and returns a fixed concept list for `path` / a fixed incident
+    list otherwise beat its own shuffled twin and passed (real gate:
+    Codex measured +0.0839; Grok's own script scored similarly and exited
+    0). The derangement is now kind-preserving (see
+    `_kind_preserving_derangement`): this exact runner, run through the
+    real `bench/score.py` pipeline against the live corpus, must now score
+    EXACTLY zero gain and fail."""
+
+    def test_the_kind_branching_counterexample_now_scores_exactly_zero_gain(self):
+        queries = score.load_queries(QUERIES_PATH)
+        with tempfile.TemporaryDirectory() as td:
+            script = Path(td) / "con_inc.py"
+            script.write_text(_KIND_BRANCHING_RUNNER, encoding="utf-8")
+            script.chmod(0o755)
+            rep = score.run_all(queries, CORPUS, [str(script)], 10)
+            c = score.negative_control(rep, queries)
+        display = "con_inc"
+        self.assertIn(display, c)
+        self.assertAlmostEqual(c[display]["gain"], 0.0, places=9,
+                                msg="a runner that only ever reads --kind must score "
+                                    "EXACTLY zero gain under a kind-preserving derangement")
+        self.assertFalse(c[display]["separates"])
+        self.assertEqual(c["verdict"], "inconclusive")
+        self.assertIn(display, c["failed_runners"])
+
+    def test_codexs_own_kind_split_counterexample_also_scores_exactly_zero_gain(self):
+        """Codex's counterexample is a distinct shape from Grok's above (all
+        three id classes, interleaved differently per kind) -- kept as its
+        own fixture rather than assuming one proof stands for both, per the
+        brief's explicit ask to keep both reviewers' scripts."""
+        queries = score.load_queries(QUERIES_PATH)
+        with tempfile.TemporaryDirectory() as td:
+            script = Path(td) / "codex_kindsplit.py"
+            script.write_text(_CODEX_KIND_SPLIT_RUNNER, encoding="utf-8")
+            script.chmod(0o755)
+            rep = score.run_all(queries, CORPUS, [str(script)], 10)
+            c = score.negative_control(rep, queries)
+        display = "codex_kindsplit"
+        self.assertIn(display, c)
+        self.assertAlmostEqual(c[display]["gain"], 0.0, places=9,
+                                msg="a runner that only ever reads --kind must score "
+                                    "EXACTLY zero gain under a kind-preserving derangement")
+        self.assertFalse(c[display]["separates"])
+        self.assertEqual(c["verdict"], "inconclusive")
+        self.assertIn(display, c["failed_runners"])
+
+    def test_real_runners_still_separate_under_the_kind_preserving_derangement(self):
+        # The fix must not have narrowed the control so far that a runner
+        # that genuinely reads the query now fails it.
+        queries = score.load_queries(QUERIES_PATH)
+        rep = score.run_all(queries, CORPUS, ["keyword"], 10)
+        c = score.negative_control(rep, queries)
+        self.assertEqual(c["verdict"], "ok", c)
+        self.assertGreater(c["keyword"]["gain"], 0)
+
+
+class TestBaselineExemptionBoundToScriptPath(unittest.TestCase):
+    """R2 (fix round 2, Codex 2 BLOCKING / Grok 5 NIT on re-gate): the
+    exemption used to check `display`, which is `script.stem` for a
+    path-spec runner -- entirely user-controlled. An empty impostor script
+    saved as `.../nomemory.py` anywhere was exempted; the identical file
+    saved as `empty.py` correctly failed. `run_all` now sets
+    `is_canonical_null_baseline` from the RESOLVED SCRIPT PATH, compared
+    against `bench/runners/nomemory.py` itself -- these tests exercise
+    `run_all`, not a hand-built `rep`, so they prove the binding actually
+    happens where the spoof was demonstrated, not just in negative_control's
+    own logic."""
+
+    def test_the_real_nomemory_spec_is_flagged_canonical(self):
+        queries = score.load_queries(QUERIES_PATH)[:2]
+        rep = score.run_all(queries, CORPUS, ["nomemory"], 10)
+        self.assertTrue(rep["nomemory"]["is_canonical_null_baseline"])
+        c = score.negative_control(rep, queries)
+        self.assertTrue(c["nomemory"]["is_exempt_baseline"])
+        self.assertEqual(c["verdict"], "ok")
+
+    def test_an_impostor_script_named_nomemory_py_is_not_flagged_canonical(self):
+        queries = score.load_queries(QUERIES_PATH)[:2]
+        with tempfile.TemporaryDirectory() as td:
+            # Byte-for-byte the same empty-output behavior as the real
+            # nomemory.py, saved under the SAME basename, at a DIFFERENT
+            # path -- this is exactly what the re-gate report ran.
+            script = Path(td) / "nomemory.py"
+            script.write_text(RUNNERS_DIR.joinpath("nomemory.py").read_text(encoding="utf-8"),
+                               encoding="utf-8")
+            script.chmod(0o755)
+            rep = score.run_all(queries, CORPUS, [str(script)], 10)
+            self.assertFalse(rep["nomemory"]["is_canonical_null_baseline"])
+            c = score.negative_control(rep, queries)
+        self.assertFalse(c["nomemory"]["is_exempt_baseline"])
+        self.assertFalse(c["nomemory"]["separates"])
+        self.assertEqual(c["verdict"], "inconclusive")
+
+
+class TestSampleStandardErrorReplacesPopulation(unittest.TestCase):
+    """R3 (fix round 2, Codex 3 MAJOR / Grok 2 MAJOR on re-gate): using
+    `statistics.pstdev` (population) instead of `statistics.stdev` (sample)
+    made a runner correct on exactly ONE query, empty on every other one,
+    ALWAYS pass -- for a single 1.0 among (n-1) zeros, mean > population_se
+    reduces algebraically to sqrt(n) > sqrt(n-1), true for every n. The
+    sample-SD version makes that an EXACT algebraic tie (mean == sample_se
+    == 1/n) -- but floating point does not reliably preserve an exact
+    algebraic tie (gain and se are each the end of a DIFFERENT chain of
+    roundings: a plain mean vs. a Bessel-corrected variance's square root
+    divided by sqrt(n)). Swept across n = 2..1000 with `gain > se` alone (no
+    tie guard), the raw comparison lands on the PASSING side at 149 of
+    those 999 values, starting at n = 5, 10, 20, 40, 51, 58, ... (fix round
+    3, re-gate: the prior version of this docstring said only "{5, 10, 20}"
+    and this test sampled ten hand-picked n and compared already-rounded
+    gain/se rather than reproducing that count -- Grok's re-gate actually
+    drove the raw, unrounded comparison and found the fuller set. This test
+    does not itself re-derive that 149-of-999 count (it checks the guarded
+    `separates` decision, not the raw pre-guard comparison); it sweeps that
+    whole n = 2..1000 range, exactly, not a sample of it, so every n Grok
+    found on the passing side is actually exercised here, guard included).
+    `negative_control` now requires the gain to clear se by more than a
+    `math.isclose` tolerance, not just be numerically greater; this test
+    sweeps EVERY n from 2 to 1000 inclusive to prove the tie fails on ALL
+    of them now, not just the corpus's own n=57 or the ten values a sample
+    would have picked. This is a floor-arithmetic fix, not a claim that
+    every one-hit-shaped runner now fails -- see bench/score.py's
+    negative_control module comment for why a real single correct answer
+    nobody else could reproduce by chance can still legitimately separate."""
+
+    def test_one_hit_among_many_empties_is_a_tie_not_a_pass_at_every_n_from_2_to_1000(self):
+        for n in range(2, 1001):
+            with self.subTest(n=n):
+                expect = {f"q{i}": [f"ans{i}"] for i in range(n)}
+                ranked = {f"q{i}": (["ans0"] if i == 0 else []) for i in range(n)}
+                rep = TestNegativeControl()._report(ranked, expect, display="one-hit")
+                c = score.negative_control(rep, TestNegativeControl()._queries(expect))
+                # gain and se are each rounded (for display) from a DIFFERENT
+                # chain of floating-point roundings -- see this class's
+                # docstring -- so their rounded values can differ by a unit
+                # in the last printed place (observed at n=160: 0.0063 vs
+                # 0.0062, both from the same exact 1/160) without that being
+                # a defect; places=3 tolerates that display noise while
+                # still failing if gain and se were not close to the same
+                # algebraic quantity. The real assertion of correctness is
+                # `separates` below, computed from the RAW (unrounded)
+                # gain/se plus the `math.isclose` tie guard, not from these
+                # rounded display values.
+                self.assertAlmostEqual(c["one-hit"]["gain"], c["one-hit"]["se"], places=3,
+                                        msg=f"n={n}: gain and se should be an algebraic tie (1/n)")
+                self.assertFalse(c["one-hit"]["separates"], f"n={n}: a tie must not pass")
+
+
+# ---------------------------------------------------------------------------
+# Fix round 4 (a FOURTH external re-gate, Codex 1 MAJOR): "stateless" alone
+# was still false. Codex built a runner that persists NOTHING between calls
+# (no counter file, no state of any kind) and reads NONE of its five CLI
+# arguments -- not --query, --kind, --limit, --corpus, or --mode -- yet
+# independently samples ten ids at random, drawn from this corpus's own 32
+# real ids, on every invocation. Live: it PASSED on the fifth attempt, gain
+# 0.0456 against se 0.0361, exit 0. Kept here in two forms: the actual
+# runner script, run once through the real bench/score.py pipeline (proves
+# it is a legal, argument-parsing runner that writes no state file), and an
+# in-process seeded simulation across many independent "runs" that shows --
+# honestly, not by asserting a fixed gain -- that this shape both PASSES
+# and FAILS negative_control depending on nothing but its own dice. This is
+# deliberately the one class in this file that does NOT assert its runner
+# always fails: the point of fix round 4 is that this design admits it
+# cannot guarantee catching it. See bench/score.py's negative_control
+# comment ("Fix round 4") and bench/README.md's "What this control
+# actually claims" for the corrected wording: "stateless, deterministic,
+# with output fixed within each kind".
+# ---------------------------------------------------------------------------
+
+_RANDOM_SAMPLE_POOL = [
+    "CON-301", "CON-302", "CON-303", "CON-304",
+    "INC-201", "INC-202", "INC-203", "INC-204", "INC-205", "INC-206",
+    "TOP-101", "TOP-102", "TOP-103", "TOP-104", "TOP-105", "TOP-106",
+    "TOP-107", "TOP-108", "TOP-109", "TOP-110", "TOP-111", "TOP-112",
+    "TOP-113", "TOP-114", "TOP-115", "TOP-116", "TOP-117", "TOP-118",
+    "TOP-119", "TOP-120", "TOP-121", "TOP-122",
+]  # bench/corpus/**/*.md's real `id:` frontmatter, all 32 of them.
+
+_RANDOM_SAMPLING_RUNNER = '''#!/usr/bin/env python
+"""Codex's fix-round-4 counterexample: persists no state of any kind
+between invocations and reads none of its five CLI arguments -- not
+--query, --kind, --limit, --corpus, or --mode -- yet independently
+samples ten ids at random, from this corpus's own real ids, on every
+call. Stateless under the fix-round-3 wording; NOT deterministic, which
+is a different (and still uncaught) failure mode -- see bench/score.py's
+negative_control comment ("Fix round 4") and bench/README.md's "What
+this control actually claims"."""
+import argparse
+import random
+import sys
+
+# Hardcoded because this runner reads no --corpus arg to discover the
+# real ids at runtime -- knowing the corpus's id space in advance is
+# exactly what an author of a gaming runner would do.
+POOL = {pool!r}
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--corpus", required=True)
+    p.add_argument("--kind", required=True)
+    p.add_argument("--query", required=True)
+    p.add_argument("--limit", type=int, default=10)
+    p.add_argument("--mode", default=None)
+    p.parse_args(argv)  # parsed and IGNORED -- none of these five drive the output
+    print("\\n".join(random.sample(POOL, 10)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''.format(pool=_RANDOM_SAMPLE_POOL)
+
+
+class TestRandomSamplingRunnerIsOutsideTheClaim(unittest.TestCase):
+    """Fix round 4 (Codex 1 MAJOR): the narrowed claim said "stateless";
+    Codex proved that word alone is false by building a runner that IS
+    stateless (nothing persists across calls) but is NOT deterministic
+    (its own output for the identical call varies), and it passed a live
+    bench/score.py run on its fifth attempt. The fix is not a mechanism
+    change -- see bench/score.py and bench/README.md -- it is admitting
+    this class in the claim's own wording rather than denying it."""
+
+    def test_the_script_is_a_legal_runner_and_persists_no_state(self):
+        """Runs the ACTUAL fixture script (not a hand-built rep) through
+        the real bench/score.py pipeline once, over the live 57-query
+        corpus: proves it is argument-parsing-compliant (no errors),
+        returns exactly 10 ids drawn from the real corpus per query, and
+        writes no file anywhere in its own directory -- "persists
+        nothing" is checked here, not assumed."""
+        queries = score.load_queries(QUERIES_PATH)
+        with tempfile.TemporaryDirectory() as td:
+            script = Path(td) / "random_sample.py"
+            script.write_text(_RANDOM_SAMPLING_RUNNER, encoding="utf-8")
+            script.chmod(0o755)
+            before = sorted(p.name for p in Path(td).iterdir())
+            rep = score.run_all(queries, CORPUS, [str(script)], 10)
+            after = sorted(p.name for p in Path(td).iterdir())
+        self.assertEqual(before, after, "the runner must not have written any state file")
+        display = "random_sample"
+        self.assertIn(display, rep)
+        self.assertEqual(rep[display]["errors"], {}, rep[display]["errors"])
+        pool = set(_RANDOM_SAMPLE_POOL)
+        for qid, m in rep[display]["per_query"].items():
+            self.assertEqual(len(m["ranked"]), 10, qid)
+            self.assertTrue(set(m["ranked"]) <= pool, (qid, m["ranked"]))
+
+    def test_across_many_seeded_runs_it_both_passes_and_fails(self):
+        """Simulates many independent "runs" of bench/score.py against
+        this runner: each seed stands for one full invocation (a fresh,
+        independently-seeded random stream, matching how a real subprocess
+        gets a fresh OS-seeded `random` module every time it starts), with
+        one independent random draw of 10 ids per query -- exactly what
+        the live script above does, minus the cost of actually spawning
+        57 subprocesses x N seeds.
+
+        This test must NOT assert this runner always fails -- that would
+        just restate the false "stateless" claim in test form. It asserts
+        BOTH outcomes are reachable, which is what "can still pass"
+        (final-round-brief.md, PART A) requires being proven, not denied."""
+        queries = score.load_queries(QUERIES_PATH)
+        outcomes = []
+        for seed in range(50):
+            rng = random.Random(seed)
+            per_query = {}
+            for q in queries:
+                ranked = rng.sample(_RANDOM_SAMPLE_POOL, 10)
+                m = score.evaluate_query(q["expect"], ranked)
+                m["ranked"] = ranked
+                per_query[q["id"]] = m
+            rep = {"random_sample": {"per_query": per_query, "errors": {},
+                                      "is_canonical_null_baseline": False}}
+            c = score.negative_control(rep, queries)
+            outcomes.append(c["random_sample"]["separates"])
+        self.assertTrue(any(outcomes),
+                         "across 50 seeded runs this stateless-but-random runner never "
+                         "passed -- if this starts failing, the floor's false-pass rate "
+                         "for this class has changed and bench/README.md's admission "
+                         "needs re-checking, not deleting")
+        self.assertFalse(all(outcomes),
+                          "across 50 seeded runs this runner always passed -- that would "
+                          "mean the floor no longer distinguishes it from noise at all, "
+                          "a different (worse) problem than the one this test documents")
+
+
+if __name__ == "__main__":
+    unittest.main()
