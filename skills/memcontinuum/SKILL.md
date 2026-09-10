@@ -92,7 +92,10 @@ recorded decision) — three options:
 3. Not now — leave it half-wired; asked again next session
 
 **`wired`** — first report the state as facts, straight out of step 1's own
-output (`decision`, `wiring`, `decided_at`, `store`, `project`, `settings`),
+output (`decision`, `wiring`, `decided_at` — present only when a registry row
+exists; a repo whose `wired` reading comes purely from `decision=none` +
+`wiring=full` has none, and step 1's output omits it there, not a blank
+value — `store`, `project`, `settings`),
 then offer:
 
 1. Keep as is — nothing changes
@@ -154,17 +157,19 @@ install — but ONLY when this repo has no existing code retrieval: check
 `<claude-dir>/settings.local.json` (and `settings.json`) yourself for a
 `PreToolUse` entry naming `pre-edit-chain.sh`. If neither file has one,
 re-run `scripts/repo-init.sh` with the same `--store`/`--project` the repo
-already has (from step 1's `store=`/`project=` lines) so it completes the
-missing wiring, then record it as below. If either file DOES have one, do
-not run the bare repair: omitting the existing `--code-root`/`--langs`
-flags would erase retrieval instead of completing the wiring, and this
-skill will not reconstruct that flag set for you. This is not stranded,
-though — read the current `--code-root`/`--langs` values straight off the
-existing `PreToolUse` command lines in `settings.local.json` (they carry
-`MEMCONTINUUM_CODE_ROOTS=`/`MEMCONTINUUM_LANG_EXTS=` verbatim), then take
-step 4's complete-set `repo-init.sh --adopt-only` path naming every root
-and language you found there — it completes the missing hooks without
-dropping retrieval. Then record it as below.
+already has (from step 1's `store=`/`project=` lines) plus
+`--record-decision`, so it completes the missing wiring and records it in
+one step. If either file DOES have one, do
+not run the bare repair: omitting the existing `--code-root`/`--langs`/
+`--never-ext` flags would erase or clear part of the existing wiring
+instead of completing it, and this skill will not reconstruct that flag
+set for you from memory. This is not stranded, though: step 4's "wired →
+a different store location, or a different code-root set" bullet gives
+the verified recovery route for every field of that complete set —
+including the one field, language NAMES, that cannot be read back
+verbatim, and what to do about that honestly — and the same
+`repo-init.sh --adopt-only` path, with `--record-decision` added, completes
+the missing hooks and records it, without dropping retrieval.
 
 **"Remove what is there" on a `partial-wired` repo**: no decision was ever
 recorded (`decision=none`), so there is no registry row to touch — just the
@@ -209,10 +214,10 @@ path below. Run the driven flow instead:
    ```bash
    # human chose specific languages, or "enable all detected":
    cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME --code-root DIR --langs "chosen,langs" --dry-run
-   cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME --code-root DIR --langs "chosen,langs"
+   cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME --code-root DIR --langs "chosen,langs" --record-decision
    # -- or, for "skip":
    cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME --code-root DIR --non-interactive --dry-run
-   cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME --code-root DIR --non-interactive
+   cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME --code-root DIR --non-interactive --record-decision
    ```
 
 For a rationale-only install (no `--code-root` at all), there is nothing to
@@ -220,16 +225,40 @@ census or ask about — the bare two-line dry-run-then-run form is fine:
 
 ```bash
 cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME --dry-run
-cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME
+cd REPO && bash "$ENGINE/scripts/repo-init.sh" --project NAME --record-decision
 ```
 
-Then record it. Always pass `--repo REPO` explicitly: `wired`, `declined`,
-and `forget` all silence or unsilence a specific repo permanently, and there
-is no safe default for that -- name the repo, don't rely on whatever
-directory the shell happens to be sitting in:
+`--record-decision` (real run only — a no-op under `--dry-run`) records
+`wired` the same way running `memcontinuum-decide.sh wired` by hand would
+(store, project, and claude-dir all included) — **and**, because it goes
+through the same shared builder `repo-init.sh` uses internally
+(`mc_build_wiring_args`, `scripts/mc-registry-lib.sh`), it also records
+this install's `--code-root`/`--langs`/`--never-ext` into the registry
+note as `code-roots=`/`langs=`/`never=`. Step 4 depends on that note to
+recover this repo's complete parameter set later without asking the human
+to remember it — this is exactly the case `--record-decision`'s own help
+text asks for: "from a driven flow where a human has already said yes."
+When a row already exists for this repo, its recorded claude-dirs/code-
+roots are unioned with this install's, never dropped. Use it on every
+real (non-dry-run) `repo-init.sh` run this skill drives — including the
+bare `partial-wired` repair re-run above and step 4's repair and
+reconfiguration paths below — not only a fresh install.
+
+**Recording `wired` for a repo that is ALREADY fully wired** (step 1 showed
+`decision=none`, `wiring=full` — wired before the decision registry
+existed, nothing to install or change) is the one case that legitimately
+records without running `repo-init.sh` at all: there is no registry row
+yet, so step 4's registry-first recovery has nothing to read, and no
+install is needed since the wiring is already there. Recover
+`--code-root`/`--never-ext` from the rendered hooks the same way step 4's
+fallback does (`MEMCONTINUUM_CODE_ROOTS` off a write-side line,
+`MEMCONTINUUM_NEVER_EXTS` off a `newfile-nudge.sh` line, both filtered by
+`MEMCONTINUUM_PROJECT`); `--langs` has the same honest gap step 4
+describes — ask the human if it is not already known. Pass everything
+found:
 
 ```bash
-bash "$ENGINE/scripts/memcontinuum-decide.sh" wired --repo REPO --store DIR --project NAME
+bash "$ENGINE/scripts/memcontinuum-decide.sh" wired --repo REPO --store DIR --project NAME --code-root ... --langs ... --never-ext ...
 ```
 
 **No → record the decline.** One command, and this repo is never asked again:
@@ -246,9 +275,15 @@ correct here — do not invent a decision to silence a prompt.
 
 Either direction, at any point in a repo's life:
 
-- declined → wanted ("wire it after all" on a `declined` repo): run the
-  `scripts/repo-init.sh` steps above, then
-  `memcontinuum-decide.sh wired --repo REPO ...`.
+- declined → wanted ("wire it after all" on a `declined` repo): **first**
+  `bash "$ENGINE/scripts/memcontinuum-decide.sh" forget --repo REPO` —
+  verified live: `--record-decision` REFUSES to record over a `declined`
+  row ("Only an undecided repo may be recorded as wired by the
+  installer"), installs the wiring anyway, then leaves the row exactly as
+  `declined` with no `code-roots=`/`langs=` recorded — the same failure
+  this whole round exists to fix, reintroduced on this one path if
+  skipped. Once forgotten, run the `scripts/repo-init.sh` steps above
+  (with `--record-decision`) exactly as for a fresh `undecided` install.
 - wired → unwanted ("stop using MemContinuum here" on a `wired` repo):
   `memcontinuum-decide.sh declined --repo REPO` records it, but that only
   stops the *asking*. The hooks stay wired until they are removed — see
@@ -264,17 +299,132 @@ Either direction, at any point in a repo's life:
   the invocation's COMPLETE set, and `--adopt-only` wires an EXISTING
   store without creating one — including a store already relocated by hand
   (the store is its own git repo; `mv` it first, then point `--store` at
-  the new path). The honest, human-directed path: read the repo's current
-  `--project`/`--store` off step 1's own `project=`/`store=` lines, its
-  `--claude-dir` off step 1's `settings=` line (the directory containing
-  that `settings.local.json`), and its current code roots and languages off
-  the `MEMCONTINUUM_CODE_ROOTS=`/`MEMCONTINUUM_LANG_EXTS=` values already in
-  that file's `PreToolUse` command lines, then re-run
+  the new path). The honest, human-directed path — every field below was
+  checked against a live install's actual `settings.local.json` and
+  registry row, not assumed from the template or library that produce
+  them:
+
+  - `--project` / `--store` / `--claude-dir`: off step 1's own
+    `project=` / `store=` / `settings=` lines (the last names the
+    directory holding `settings.local.json`).
+  - `--code-root` / `--langs` / `--never-ext`: **first check the registry
+    row** — `$MEMCONTINUUM_HOME/decisions.tsv`, keyed by step 1's own
+    `key=` line. When this repo was recorded with `--record-decision`
+    (step 3 now always uses it), the row's note carries `code-roots=`,
+    `langs=`, and `never=` verbatim, semicolon-joined. Read them with the
+    SAME shared library the installer itself uses — never a hand-rolled
+    parse of the TSV or the note:
+    ```bash
+    source "$ENGINE/scripts/mc-registry-lib.sh"
+    if mc_registry_lookup "${MEMCONTINUUM_HOME:-$HOME/.memcontinuum}/decisions.tsv" "KEY"; then
+        mc_note_field "$MC_LOOKUP_NOTE" "code-roots"; ROOTS_SEMI="$MC_NOTE_FIELD"
+        mc_note_field "$MC_LOOKUP_NOTE" "langs";      LANGS_SEMI="$MC_NOTE_FIELD"
+        mc_note_field "$MC_LOOKUP_NOTE" "never";      NEVER_SEMI="$MC_NOTE_FIELD"
+        mc_build_wiring_args "$ROOTS_SEMI" "$(printf '%s' "$LANGS_SEMI" | tr ';' ',')" \
+                              "$(printf '%s' "$NEVER_SEMI" | tr ';' ',')"
+        # ${MC_BUILT_ARGS[@]} is now the exact --code-root/--langs/--never-ext
+        # tail for the re-run below -- verified live: a --langs python
+        # --record-decision install round-trips through this to
+        # `--code-root DIR --langs python`.
+    fi
+    ```
+    An EMPTY field here is ambiguous by construction (`mc_note_field`
+    returns "" both for "recorded as empty" and "never recorded") — do
+    not read an empty `LANGS_SEMI` as "no languages wired" without also
+    checking `wiring=full` and a real `newfile-nudge.sh` line in
+    `settings.local.json`; if one exists, the row predates
+    `--record-decision` and the field is unknown, not empty.
+
+    **These fields can also OVERSTATE the current set, never understate
+    it.** `--record-decision` (and `memcontinuum-decide.sh` called by
+    hand) UNIONS a new install's code-roots/langs/never into whatever the
+    row already had — verified live: recording `python` then later
+    `python,javascript` after dropping the python-only root left the row
+    reading `langs=python;javascript` even though only `javascript` was
+    still actually wired. The registry note is reliable for recovering a
+    set you are ADDING to or leaving unchanged (relocating the store,
+    adding a root); it is NOT reliable evidence of what survived a
+    REMOVAL. After removing a root or a language, treat the RENDERED
+    hooks (`MEMCONTINUUM_CODE_ROOTS`/`MEMCONTINUUM_LANG_EXTS` in
+    `settings.local.json`, per the fallback below) as the one source of
+    truth for what is wired right now, and the registry note only as a
+    hint about what USED to be there.
+  - **If the row lacks these fields** (recorded before this round, or by
+    hand): `--code-root` can still be recovered independently — read
+    `MEMCONTINUUM_CODE_ROOTS`, a JSON array naming every root already
+    resolved, off any ONE write-side hook line (`PostToolUse`,
+    `SessionStart`, `SessionEnd`, `UserPromptSubmit`, or `PreCompact`;
+    **not** the two `PreToolUse` `pre-edit-chain.sh` lines, which carry
+    `MEMCONTINUUM_ROOT` and `MEMCONTINUUM_STRIP_PREFIX`, never a
+    code-root token). `--never-ext` likewise — read
+    `MEMCONTINUUM_NEVER_EXTS` off any `PreToolUse` line naming
+    `newfile-nudge.sh` (identical on every root's copy of it) and turn
+    each glob back into a bare extension (`*.cs` → `.cs`).
+  - **`--langs` is the one field that has no other reliable recovery
+    route today, and saying otherwise is what made this recipe fail
+    before this round.** The rendered hooks hold only
+    `MEMCONTINUUM_LANG_EXTS`, EXTENSION GLOBS (e.g. `'*.py'`), not
+    language names — feeding that straight to `--langs` fails outright
+    (`ERROR: --langs names an unknown language: *.py`, exit 11).
+    Inverting a glob set back to names correctly (handling a partial
+    match, an unknown extension, or two languages that could both
+    explain the same glob set) is real logic that already exists —
+    `mc_update_recover_from_settings` in `scripts/memcontinuum-update.sh`
+    — but it is that script's own internal migration helper, not a
+    public interface: the whole file runs its top-level CLI the moment
+    it is sourced, so calling just that one function safely is not
+    possible today, and `memcontinuum-update.sh --repo REPO` on its own
+    reports only a migration verdict (`ok`, `migrate-needs-langs`, …),
+    never the recovered names themselves. **When the registry lacks
+    `langs=`, this skill has no supported way to recover the language
+    set — say so plainly and ask the human to state it again**, rather
+    than guessing from step 3's `code-census` (that reports what
+    languages are PRESENT in the tree right now, a different question
+    from what was WIRED, since files can have been added or removed
+    since the original install) or reimplementing the updater's own
+    inversion by hand.
+  - **A `.claude` directory can be shared by more than one project** —
+    every hook line above also carries `MEMCONTINUUM_PROJECT=<name>` in
+    the same command string, and two projects' entries use the identical
+    seven basenames. Before reading anything off a matched line, confirm
+    it also carries `MEMCONTINUUM_PROJECT=` followed by THIS repo's own
+    project (step 1's `project=` line) — matching on basename alone can
+    read another project's roots, extensions, or never-list instead of
+    this one's.
+
+  Then re-run naming that complete set plus whichever root, language, or
+  never-ext is changing, with `--record-decision` so the registry stays
+  complete for next time:
   `bash "$ENGINE/scripts/repo-init.sh" --adopt-only --store DIR
-  --claude-dir DIR --project NAME --code-root ... --langs ...` naming that
-  complete set plus whichever root or store path is changing — dry-run
-  first, per step 3. Record the result as step 3 does. This is a deliberate
-  command run at the human's direction, not a step 2 prompt option.
+  --claude-dir DIR --project NAME --code-root ... --langs ...
+  --never-ext ... --record-decision` — dry-run first, per step 3 (drop
+  `--record-decision` on the dry-run line; it is a no-op there but the
+  dry-run preview should still mirror the real command otherwise). This
+  is a deliberate command run at the human's direction, not a step 2
+  prompt option.
+
+  **If the new `--langs` set drops a language the project had before**
+  (removing the only root that used it, say), this re-run's own
+  code-reindex step fails on purpose (verified live: `--lang javascript
+  drops python from the project's stored language set python,javascript;
+  ... pass a superset, or --full to change it for every root`, exit
+  nonzero) — `repo-init.sh` has no `--full` passthrough of its own. The
+  hook wiring is still updated correctly at this point; only the code
+  index is left stale. Finish it with one direct call, same code-root,
+  project, and new language set, adding `--full`:
+  `PYTHONPATH= "$PY" "$ENGINE/memidx.py" code-reindex --code-root DIR
+  --project NAME --lang "chosen,langs" --full` (`$PY` as step 3 resolves
+  it). Re-running `repo-init.sh` again afterward is not required for the
+  wiring or the index. It will not fix the registry either way: verified
+  live, a SECOND `--record-decision` run (now exiting 0, since the index
+  is already fixed) still left `langs=python;javascript` in the row —
+  `--record-decision` unions, so once a language has been recorded it
+  stays in the note permanently, whether or not it is still wired (see
+  the union caveat under step 4's registry recovery). There is no
+  supported command that removes a field from a registry row's note
+  short of `memcontinuum-decide.sh forget --repo REPO` (which drops the
+  WHOLE row, decision included) and recording it again. Say so plainly
+  if it matters here; do not claim the registry now reads correctly.
 - never ask in any repo on this machine: `memcontinuum-decide.sh never-ask`;
   undo with `memcontinuum-decide.sh ask-again`.
 

@@ -529,11 +529,24 @@ answers survive a reinstall.
 Project level, by hand:
 
 1. Remove this tool's hook entries from the project's `settings.local.json` —
-   identified by these script basenames in their `"command"` fields, safe to
-   hand-delete — or restore `settings.local.json.bak-memcontinuum`:
+   identified by these script basenames in their `"command"` fields:
    `pre-edit-chain.sh newfile-nudge.sh ledger-post-edit.sh
    precompact-persist.sh sessionstart-remind.sh userprompt-remind.sh
    sessionend-stamp.sh`
+
+   **Basename alone is not safe to hand-delete when this `.claude`
+   directory is shared by more than one project** — every project's
+   entries use these same seven basenames, so a basename-only deletion
+   also removes the OTHER project's wiring, the exact failure
+   `repo-init.sh`'s own project-aware merge exists to prevent. Every entry
+   also carries `MEMCONTINUUM_PROJECT=<name>` in the same `"command"`
+   string; delete only the lines that match BOTH the basename and this
+   repo's own project name. For the same reason, restoring
+   `settings.local.json.bak-memcontinuum` is only safe when this
+   `.claude` directory holds exactly one project: the backup is a
+   snapshot of the WHOLE file taken just before the most recent install
+   into it, by any project, so restoring it can also revert another
+   project's wiring made since.
 2. Delete `<claude-dir>/skills/memory-search/`.
 3. Delete `<claude-dir>/rules/memcontinuum.md`.
 4. Delete `<store>/.git/hooks/post-commit` and `<store>/.git/hooks/pre-commit`
