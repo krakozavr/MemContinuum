@@ -1014,18 +1014,32 @@ class TestSkillHonesty(unittest.TestCase):
         blank-separated from their own item, but ARE separated from
         whatever prose follows the list (e.g. `wired`'s "Moving a wired
         store..." paragraph after its two options) -- the first blank line
-        ends the list, and nothing after it is captured, however many
-        digits it contains. Pinning len()+order+text in one assertEqual
-        against this list's output fails on a dropped, added, reordered, OR
-        reworded option -- not just a phrase substring, which is what let
-        every one of the reviewers' option mutations slip past the
-        original version of this class. The printed NUMBER itself is also
-        checked here, not just discarded (brief B2: pin "numbering" too) --
-        a renumbering with no reorder (e.g. "1. Keep as is" / "3. Stop
-        using...") would pass a text-and-order-only check, so each item's
-        digit must equal its 1-based position or this raises immediately."""
+        ends the LIST (nothing after it is collected as an option's text).
+        Pinning len()+order+text in one assertEqual against this list's
+        output fails on a dropped, added, reordered, OR reworded option --
+        not just a phrase substring, which is what let every one of the
+        reviewers' option mutations slip past the original version of this
+        class. The printed NUMBER itself is also checked here, not just
+        discarded (brief B2: pin "numbering" too) -- a renumbering with no
+        reorder (e.g. "1. Keep as is" / "3. Stop using...") would pass a
+        text-and-order-only check, so each item's digit must equal its
+        1-based position or this raises immediately.
+
+        Fix round (Grok gate finding 3): the list ending on a blank line
+        used to mean nothing past it was even LOOKED at -- a numbered item
+        re-appearing there still got caught (it re-enters the counted
+        sequence below and trips the len()/numbering checks), but an
+        UNNUMBERED bullet (`- Maybe later -- ...`) slipped through
+        completely silent, because a plain `-`/`*` line never matched the
+        numbered-option regex and, once the list had closed, nothing else
+        was watching for it either. Once the list closes, this now also
+        watches for bullet-shaped stray content (`- `/`* ` at the start of
+        a line) and raises immediately if it sees one -- ordinary prose
+        after the list (no leading bullet marker) still passes through
+        uncaptured, same as before."""
         items = []
         current = None
+        list_closed = False
         for line in section.splitlines():
             m = re.match(r'^\s*(\d+)\.\s+(.*)$', line)
             if m:
@@ -1036,13 +1050,21 @@ class TestSkillHonesty(unittest.TestCase):
                     f"option numbered {m.group(1)!r} where {expected} was expected: {m.group(2)!r}"
                 )
                 current = m.group(2).strip()
-            elif current is not None:
+                continue
+            if current is not None:
                 stripped = line.strip()
                 if stripped == "":
                     items.append(current)
                     current = None
+                    list_closed = True
                 else:
                     current += " " + stripped
+                continue
+            if list_closed and re.match(r'^\s*[-*]\s+\S', line):
+                raise AssertionError(
+                    "option-shaped bullet content after this state's "
+                    f"option list already closed on a blank line: {line.strip()!r}"
+                )
         if current is not None:
             items.append(current)
         return items
@@ -1268,6 +1290,24 @@ class TestSkillHonestyMutations(unittest.TestCase):
             "**`partial-wired`**",
             "4. Not now — nothing is recorded; run `/memcontinuum` again to decide\n"
             "5. Maybe later — think about it and decide next week\n\n"
+            "**`partial-wired`**",
+        )
+        self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
+        self._assert_production_test_catches(mutated, "test_undecided_names_all_four_options_exactly")
+
+    def test_adding_an_unnumbered_bullet_after_undecided_options_is_caught(self):
+        # Grok gate finding 3: a numbered "5." after the closing blank line
+        # was already caught (see test_adding_an_extra_undecided_option_is_
+        # caught above -- it re-enters the counted sequence and trips the
+        # len()/numbering checks), but an UNNUMBERED bullet in the same
+        # position slipped past every test in this file: _options() never
+        # captured, or even watched, anything once the list's closing blank
+        # line had gone by. Reproduces the reviewer's exact defeat.
+        mutated = self.text.replace(
+            "4. Not now — nothing is recorded; run `/memcontinuum` again to decide\n\n"
+            "**`partial-wired`**",
+            "4. Not now — nothing is recorded; run `/memcontinuum` again to decide\n\n"
+            "- Maybe later — think about it and I will wire it for you\n\n"
             "**`partial-wired`**",
         )
         self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
