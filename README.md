@@ -547,8 +547,15 @@ Project level, by hand:
    snapshot of the WHOLE file taken just before the most recent install
    into it, by any project, so restoring it can also revert another
    project's wiring made since.
-2. Delete `<claude-dir>/skills/memory-search/`.
-3. Delete `<claude-dir>/rules/memcontinuum.md`.
+2. Delete `<claude-dir>/skills/memory-search/` — **only if this `.claude`
+   directory holds no other wired project.** Like the hook entries above,
+   this copy is shared: every project wired into the same directory reads
+   the same skill, so deleting it while another project is still wired
+   removes that project's skill too. It carries no project marker, so
+   there is nothing to filter on — check the remaining hook entries for a
+   `MEMCONTINUUM_PROJECT=` naming any other project first.
+3. Delete `<claude-dir>/rules/memcontinuum.md` — same condition, same
+   reason: one shared copy, no project marker.
 4. Delete `<store>/.git/hooks/post-commit` and `<store>/.git/hooks/pre-commit`
    (or wherever `--store-hooks-dir` pointed them).
 5. Delete `~/.memcontinuum/<project>.sqlite`, and
