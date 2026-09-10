@@ -16,6 +16,7 @@ import inspect
 import io
 import json
 import os
+import re
 import shutil
 import signal
 import sqlite3
@@ -6278,6 +6279,46 @@ class TestNewFileNudgeHook(unittest.TestCase):
                     f"in the nudge: {ctx!r}",
                 )
 
+    def test_compound_excludes_hook_guard_matches_registry_exactly(self):
+        """Merge-review nit on newlang-nudge: the behavioral test just
+        below this one only loops over chunkers.COMPOUND_EXCLUDES, so it
+        catches an ADDITION to the registry with no matching hook arm (a
+        new compound extension would wrongly nudge/imply-wire a language
+        chunkers will never classify it as) but not a REMOVAL -- if an
+        entry is dropped from COMPOUND_EXCLUDES without touching the
+        hook's static case arm, nothing there notices, and the hook goes
+        on silently suppressing an extension lang_for_path has started
+        classifying again. That is one-way drift detection dressed up as
+        two-way. This test parses the hook's actual guarded set straight
+        out of its case arm (the `*.ext | ...) finish
+        "not-indexed-extension"` line in hooks/newfile-nudge.sh -- not a
+        second hardcoded copy of the current extensions, which would
+        just relocate the same staleness risk) and asserts SET EQUALITY
+        against chunkers.COMPOUND_EXCLUDES, so either direction of drift
+        fails here, and the failure message names which side (hook or
+        registry) the odd-one-out extension is missing from."""
+        hook_text = NEWFILE_NUDGE_HOOK.read_text()
+        m = re.search(
+            r'^\s*((?:\*\.[^\s|)]+\s*\|\s*)*\*\.[^\s|)]+)\)\s*finish "not-indexed-extension"',
+            hook_text,
+            re.MULTILINE,
+        )
+        self.assertIsNotNone(
+            m, "hooks/newfile-nudge.sh: no `*.ext | ...) finish \"not-indexed-extension\"` "
+            "case arm found -- has the compound-extension guard been rewritten?"
+        )
+        guarded = {part.strip().lstrip("*") for part in m.group(1).split("|")}
+        registry = set(chunkers.COMPOUND_EXCLUDES)
+        added_to_registry = sorted(registry - guarded)
+        removed_from_registry = sorted(guarded - registry)
+        self.assertEqual(
+            guarded, registry,
+            "hooks/newfile-nudge.sh's guarded set and chunkers.COMPOUND_EXCLUDES "
+            f"drifted apart -- in COMPOUND_EXCLUDES but not guarded by the hook: "
+            f"{added_to_registry}; guarded by the hook but no longer in "
+            f"COMPOUND_EXCLUDES: {removed_from_registry}",
+        )
+
     def test_compound_excluded_extensions_never_nudge_or_wire(self):
         """Reviewer re-raise (round 2): chunkers.COMPOUND_EXCLUDES
         (chunkers/__init__.py) means a file like foo.d.ts is NEVER
@@ -6291,10 +6332,13 @@ class TestNewFileNudgeHook(unittest.TestCase):
         plain per-language extension tuples with no compound-extension
         awareness -- a bash `*.ts` case pattern matches `foo.d.ts` just
         as readily as `thing.ts`. Registry-driven against the real
-        chunkers.COMPOUND_EXCLUDES set (not a hardcoded list here) so a
-        new/changed compound entry cannot drift silently, mirroring
+        chunkers.COMPOUND_EXCLUDES set (not a hardcoded list here), so
+        this exercises real hook behavior for every extension the
+        registry currently names; test_compound_excludes_hook_guard_matches_registry_exactly
+        just above is what actually guarantees the two sets cannot drift
+        apart in either direction. Mirrors
         test_language_name_matches_the_engine_registry_for_every_known_language
-        just above."""
+        higher up."""
         for compound in sorted(chunkers.COMPOUND_EXCLUDES):
             host_ext = os.path.splitext(compound)[1]  # ".d.ts" -> ".ts"
 

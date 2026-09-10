@@ -428,10 +428,15 @@ fi
 # chunkers.COMPOUND_EXCLUDES verbatim (not a new policy) and is checked
 # here, ahead of BOTH the wired-reminder and the known-but-unwired-nudge
 # branches below, so neither can name/imply a language for a file the
-# engine will never classify as that language. tests/test_write_hooks.py's
-# own registry-driven test runs the real hook against the real
-# chunkers.COMPOUND_EXCLUDES set, so a new/changed entry there cannot
-# drift silently the way INC-0117's stale copy did for LANGUAGE_TABLE.
+# engine will never classify as that language.
+# tests/test_write_hooks.py's test_compound_excludes_hook_guard_matches_registry_exactly
+# parses this exact case arm and asserts it is SET-EQUAL to
+# chunkers.COMPOUND_EXCLUDES: an entry added to the registry with no
+# matching arm here fails that test, and so does an entry removed from
+# the registry that this arm still guards -- either way the failure
+# names the drifted extension and which side (hook or registry) it is
+# missing from, rather than drifting silently the way INC-0117's stale
+# copy did for LANGUAGE_TABLE.
 case "$FILE_PATH" in
     *.blade.php | *.d.ts | *.min.js) finish "not-indexed-extension" ;;
 esac
