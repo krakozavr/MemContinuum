@@ -35,6 +35,7 @@ DESIGN = TOOLS_DIR / "docs" / "DESIGN.md"
 SKILL = TOOLS_DIR / "skills" / "memcontinuum" / "SKILL.md"
 SEARCH_SKILL = TOOLS_DIR / "skills" / "memory-search" / "SKILL.md"
 INSTALL_HOOKS = TOOLS_DIR / "hooks" / "install-hooks.md"
+NEWFILE_NUDGE_HOOK = TOOLS_DIR / "hooks" / "newfile-nudge.sh"
 STORE_README_TMPL = TOOLS_DIR / "templates" / "store-README.md.tmpl"
 RULES_TEMPLATE = TOOLS_DIR / "templates" / "memcontinuum-rules.md"
 SCHEMA = TOOLS_DIR / "docs" / "SCHEMA.md"
@@ -1678,6 +1679,16 @@ PROMISE_TO_BE_ASKED_PATTERNS = [
 # one of these substrings' own span in the whitespace-normalized text --
 # proximity is not enough, so a real violation typed next to an allowed
 # phrase still fails.
+#
+# hooks/newfile-nudge.sh (added alongside the README/SKILL scan below,
+# same ruling): checked directly, not assumed -- as of the newlang-nudge
+# branch's own option-3 text ("stays unwired until decided", no "you" at
+# all) and every other ask/prompt/remind/offer occurrence in the file
+# (comments describing what the HOOK does, third person, e.g. "reminds
+# the agent", "this tool asks"), the PROMISE_TO_BE_ASKED_PATTERNS scan
+# produces ZERO hits against it -- nothing to allowlist today. Left empty
+# rather than pre-populated with a guess; a real future hit gets a named,
+# commented entry here, the same as any doc's.
 ALLOWED_ASK_PROMISE_SUBSTRINGS = [
     # README's "Day to day": present tense, describing what /memcontinuum
     # itself does WHILE the human is running it. A human asked BY the
@@ -1716,26 +1727,37 @@ def _ask_promise_offenders(path):
 class TestNoRephrasedAskPromise(unittest.TestCase):
     """Semantic companion to TestConsentIsManualNotAutomatic's exact-phrase
     pins -- see PROMISE_TO_BE_ASKED_PATTERNS above for what this catches
-    and its disclosed limit. Scans README.md and skills/memcontinuum/
-    SKILL.md, the two user-facing docs that carried the retired promise
-    (TOP-0110 L3): the README describes the product to the human who reads
-    it, and the skill's own pinned structured-prompt options are the single
-    most user-visible place in the product, a numbered choice the human
-    sees live. Reads the bare module globals README/SKILL at call time
-    (not a pre-bound list), same as TestSkillHonesty's methods, so
-    TestNoRephrasedAskPromiseMutations below can point either one at a
+    and its disclosed limit. Scans README.md, skills/memcontinuum/
+    SKILL.md, and hooks/newfile-nudge.sh -- the docs and the one hook that
+    carried the retired promise (TOP-0110 L3): the README describes the
+    product to the human who reads it, the skill's own pinned
+    structured-prompt options are the single most user-visible place in
+    the product, a numbered choice the human sees live, and
+    newfile-nudge.sh's own three-option decision point (newlang-nudge)
+    used to make the identical promise in its option 3 ("asked again next
+    session") before this branch retired it -- same defect, same vocabulary
+    fix, so it gets the same scan. newfile-nudge.sh is shell, not prose --
+    option text, comments, and log strings all sit in the same file -- so
+    a hit here is expected to need ALLOWED_ASK_PROMISE_SUBSTRINGS
+    entries over time the way README/SKILL already do; checked directly
+    (not assumed) that today's file produces none. Reads the bare module
+    globals README/SKILL/NEWFILE_NUDGE_HOOK at call time (not a pre-bound
+    list), same as TestSkillHonesty's methods, so
+    TestNoRephrasedAskPromiseMutations below can point any of them at a
     mutated temp file and prove this method reacts to it for real."""
 
     def test_no_user_facing_text_promises_you_will_be_asked(self):
         offenders = []
-        for doc in (README, SKILL):
+        for doc in (README, SKILL, NEWFILE_NUDGE_HOOK):
             offenders.extend(_ask_promise_offenders(doc))
         self.assertEqual(
             offenders, [],
             "user-facing text promises a human will be asked/prompted/"
-            "reminded/offered (TOP-0110 L3): the SessionStart detector's "
-            "ask reaches only the assistant, never the human directly, "
-            f"so nothing here may promise otherwise: {offenders}",
+            "reminded/offered (TOP-0110 L3): both the SessionStart "
+            "detector's ask and newfile-nudge.sh's own decision point "
+            "reach only the assistant, through additionalContext, never "
+            f"the human directly, so nothing here may promise otherwise: "
+            f"{offenders}",
         )
 
 
@@ -1744,20 +1766,25 @@ class TestNoRephrasedAskPromiseMutations(unittest.TestCase):
     -- against the REAL production test method, not a second hand-written
     copy of its logic (the same house rule fix round 3 established for
     TestSkillHonestyMutations above). Reproduces Grok gate finding 2's two
-    exact defeats verbatim: both slipped past every exact-phrase pin in
-    TestConsentIsManualNotAutomatic when the gate first found them."""
+    exact defeats verbatim (both slipped past every exact-phrase pin in
+    TestConsentIsManualNotAutomatic when the gate first found them), plus
+    a third for newfile-nudge.sh's own option 3 (newlang-nudge, TOP-0110
+    L3): rephrasing "nothing is recorded; stays unwired until decided"
+    back into the same retired promise ("you'll be asked again next
+    session") must fail the suite too, not just the exact-string absence
+    check in tests/test_write_hooks.py."""
 
     @staticmethod
     @contextlib.contextmanager
     def _mutated_doc(varname, mutated_text):
-        """Point the module-level global named `varname` ("README" or
-        "SKILL") at a temp file holding `mutated_text` for the duration of
-        the `with` block, then restore it -- generalizes
-        TestSkillHonestyMutations._mutated_skill (which only ever swaps
-        SKILL) so this class can reproduce a defeat planted in either doc
-        TestNoRephrasedAskPromise scans; that test's method resolves
-        README/SKILL from this module's globals at call time, so this
-        reaches it."""
+        """Point the module-level global named `varname` ("README",
+        "SKILL", or "NEWFILE_NUDGE_HOOK") at a temp file holding
+        `mutated_text` for the duration of the `with` block, then restore
+        it -- generalizes TestSkillHonestyMutations._mutated_skill (which
+        only ever swaps SKILL) so this class can reproduce a defeat
+        planted in any doc or hook TestNoRephrasedAskPromise scans; that
+        test's method resolves README/SKILL/NEWFILE_NUDGE_HOOK from this
+        module's globals at call time, so this reaches it."""
         module = sys.modules[__name__]
         real_path = getattr(module, varname)
         fd, tmp_name = tempfile.mkstemp(suffix=".md")
@@ -1814,6 +1841,23 @@ class TestNoRephrasedAskPromiseMutations(unittest.TestCase):
         )
         self.assertNotEqual(mutated, text, "fixture stale: nothing matched")
         self._assert_guard_catches("SKILL", mutated)
+
+    def test_newfile_nudge_hook_option_three_rephrase_defeat_is_caught(self):
+        # TOP-0110 L3: newfile-nudge.sh's own option 3 reworded back into
+        # the identical retired promise this branch just fixed it away
+        # from ("Piece 2" of this same pass) -- the guard extended to
+        # this file in "Piece 3" must catch it, not just the exact-string
+        # absence assertions pinned in tests/test_write_hooks.py.
+        original = "3. Not now — nothing is recorded; stays unwired until decided"
+        text = NEWFILE_NUDGE_HOOK.read_text()
+        self.assertIn(original, text, "fixture stale: option text not found")
+        mutated = text.replace(
+            original,
+            "3. Not now — you'll be asked again next session",
+            1,
+        )
+        self.assertNotEqual(mutated, text, "fixture stale: nothing matched")
+        self._assert_guard_catches("NEWFILE_NUDGE_HOOK", mutated)
 
 
 if __name__ == "__main__":
