@@ -283,9 +283,10 @@
 #   non-zero, with the table still printed and the reason on stderr.
 #   The one exception is `no-wiring`: a claude-dir with none of this
 #   project's hook lines at all is a broken or never-finished INSTALL, which
-#   is the memcontinuum skill's repair path (a human is asked), not this
-#   command's. A `wired` row is never a licence to wire anything. It is
-#   reported and left alone, and it does not make this command fail.
+#   is the memcontinuum skill's repair path -- run `/memcontinuum` to finish
+#   it, not this command's. A `wired` row is never a licence to wire
+#   anything. It is reported and left alone, and it does not make this
+#   command fail.
 #   --add-lang/--never-ext exit non-zero on bad usage, same as
 #   memcontinuum-decide.sh.
 # --MC-USAGE-END--
