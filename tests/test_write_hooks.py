@@ -5917,6 +5917,11 @@ class TestNewFileNudgeHook(unittest.TestCase):
         self.assertIn("never mention", opt2.lower())
         self.assertIn(".ts", opt2)
         self.assertIn("recorded permanently", opt2.lower())
+        # Names the actual mechanism (the brief: "the decline path names
+        # the real mechanism") -- a stable flag name, not a restated
+        # computed procedure, same class as "repo-init.sh" already named
+        # in option 1.
+        self.assertIn("--never-ext", opt2)
         self.assertIn("one command", opt2.lower())
         self.assertIn("full re-run", opt2.lower())
 
@@ -6165,6 +6170,13 @@ class TestNewFileNudgeHook(unittest.TestCase):
         self.assertEqual(proc.stdout.strip(), "", proc.stdout)
         log_text = (self.home / "hook.log").read_text()
         self.assertIn("nudge=build-failed", log_text)
+        # Non-vacuous, same shape as test_g_wired_path_gains_no_subprocess:
+        # a build failure that never reaches the mark step must not create
+        # sessions/ at all -- the build step itself never touches it.
+        self.assertFalse(
+            (self.home / "sessions").exists(),
+            "a build failure must never reach the per-session mark step",
+        )
         # The old mark-then-emit order would have left "typescript" in
         # nudged_langs here even though nothing was ever shown --
         # build-then-mark must not.

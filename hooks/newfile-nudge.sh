@@ -8,7 +8,9 @@
 # NOT exist yet (and isn't a symlink), sits under a configured code root,
 # and has an indexed source extension -- and injects one line pointing at
 # the same check memory-search's SKILL.md already asks for, at the one
-# moment it's most likely to be skipped.
+# moment it's most likely to be skipped. (A different, KNOWN-but-not-WIRED
+# extension gets a different, multi-line decision point instead -- see
+# MEMCONTINUUM_KNOWN_EXTS in the Env section below, not this one line.)
 #
 # Deliberately separate from pre-edit-chain.sh, and deliberately minimal:
 # no vector, no index read, no memidx.py call of any kind (unlike every
@@ -469,7 +471,7 @@ if ! _ext_matches "$FILE_PATH" "$WIRED_EXTS"; then
         LANG_MESSAGE="New file type: ${LANG_NAME} is supported by this engine but not wired for this project."
         LANG_MESSAGE="${LANG_MESSAGE}
 1. Wire it now — re-run repo-init.sh with the complete current parameter set plus ${LANG_NAME}, not a one-flag add; see the memcontinuum skill for the procedure
-2. Never mention ${LANG_EXTS} here (every ${LANG_NAME} extension) — recorded permanently: one command when this project already records its wiring, otherwise the same full re-run as option 1 with these added to the never-list; see the memcontinuum skill for which applies
+2. Never mention ${LANG_EXTS} here (every ${LANG_NAME} extension) — recorded permanently via --never-ext: one command when this project already records its wiring, otherwise the same full re-run as option 1 with these added to the never-list; see the memcontinuum skill for which applies
 3. Not now — nothing recorded; asked again next session"
 
         # N3 fix round (Grok 2, LOW): build the JSON envelope BEFORE the
