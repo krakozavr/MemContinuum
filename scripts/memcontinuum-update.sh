@@ -44,10 +44,12 @@
 #                  what that narrows). Every OTHER rendered artifact this
 #                  command does not put in a column of its own (STORE's
 #                  README.md/.gitignore/tree -- write-once, never
-#                  re-rendered, so there is no current/stale question that
-#                  means anything for them) is still named, every walk, in a
-#                  `not-checked: ...` line beneath the table -- never simply
-#                  absent.
+#                  re-rendered by this command) is still named, every walk,
+#                  in a `not-checked: ...` line beneath the table -- never
+#                  simply absent. "not-checked" is honest about what it
+#                  says: these are not looked at, not that they cannot go
+#                  stale (a README's baked python/engine/code-root recipe
+#                  can, and a user pasting a stale one would care).
 #     action       ok | stale | store-mismatch | store-form-stale |
 #                  store-form-updated | rules-stale | rules-missing |
 #                  rules-foreign | skill-foreign | migrate |
@@ -1921,10 +1923,16 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
     # write-if-absent (steps 1-2 of that script) and never touched again by
     # any later re-render, by design -- an "adopt an existing store" install
     # must not clobber hand-authored provenance notes in a README a human
-    # already edited. There is no fingerprint stamp on them and no
-    # "current/stale" question that means anything for a file this command
-    # will never rewrite, so "not checked" is the honest and complete
-    # answer, not a gap -- named here so the coverage test
+    # already edited. There is no fingerprint stamp on them, and this
+    # command never re-renders them to find out -- so "not-checked" is the
+    # honest and complete answer, not a gap. NOT because their content
+    # "structurally cannot vary" (round-2 gate finding G5 disproved that:
+    # mutating the README's baked python path, editing .gitignore, and
+    # deleting an inbox/ dir all left this footer unchanged -- a user
+    # pasting a stale recipe from that README would care). The honest
+    # reason is narrower: this command deliberately never looks, because
+    # looking would mean re-rendering a file it must not silently
+    # overwrite. Named here so the coverage test
     # (tests/test_update.py TestUpdaterCoversEveryRenderedArtifact) can
     # confirm every artifact repo-init.sh renders is accounted for
     # somewhere in this output, one way or another, and never simply absent.
