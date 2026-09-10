@@ -1615,6 +1615,67 @@ class TestConsentIsManualNotAutomatic(unittest.TestCase):
         self.assertNotIn("you will be asked again next session", text)
         self.assertNotIn("asked again next session", text)
 
+    def test_setup_sh_no_longer_carries_the_retired_third_person_promises(self):
+        # TOP-0110 L3, installer-closing-honesty branch, Grok gate finding
+        # 1: memcontinuum-setup.sh holds the LAST thing a user reads after
+        # installing (the "=== done ===" epilogue) and the --help header
+        # (usage() prints the top comment block verbatim) -- the file this
+        # whole episode's original sweep missed. TestNoRephrasedAskPromise
+        # below now scans this file too, but by its own disclosed limits
+        # cannot see either retired string here (verified by planting
+        # both: the header's "will" and "ask you" sit four words apart,
+        # past the guard's two-filler-word window; the epilogue was third
+        # person throughout, no "you" recipient at all -- zero regex hits
+        # either way). The cheap literal pin belongs BESIDE the semantic
+        # guard, not instead of it -- same shape as the README/SKILL pins
+        # above.
+        text = SETUP_SH.read_text()
+        self.assertNotIn(
+            "will prompt the assistant to ask you", text,
+            "the retired closing epilogue promised the assistant would "
+            "ask you once -- see TOP-0110 L3",
+        )
+        self.assertNotIn(
+            "the human is asked about", text,
+            "the retired --help header described the memcontinuum skill "
+            "this way -- see TOP-0110 L3",
+        )
+
+    def test_setup_sh_epilogue_names_memcontinuum_as_the_way_to_decide(self):
+        # Positive companion to the pin above: the rewritten "=== done ==="
+        # epilogue actually says what TOP-0110 L3 requires, not just that
+        # the old text is gone.
+        text = SETUP_SH.read_text()
+        self.assertIn(
+            "Run /memcontinuum inside a repository to decide for it.",
+            text,
+        )
+        self.assertIn("advisory only, and it may never reach you.", text)
+
+    def test_setup_sh_help_header_states_the_detector_is_advisory_only(self):
+        # Runs the real --help (usage() prints the top comment block
+        # verbatim, via sed) rather than reading source lines directly --
+        # the sentence spans three separate `#`-prefixed comment lines, so
+        # this is checked against what a person actually sees.
+        proc = subprocess.run(
+            ["bash", str(SETUP_SH), "--help"],
+            cwd=str(TOOLS_DIR), capture_output=True, text=True,
+            env=dict(os.environ, PYTHONPATH=""),
+        )
+        self.assertEqual(
+            proc.returncode, 0, f"--help must exit 0: {proc.stderr[:400]}",
+        )
+        normalized = " ".join(proc.stdout.split())
+        self.assertIn(
+            "the SessionStart detector flags an undecided repo to the "
+            "assistant, advisory only",
+            normalized,
+        )
+        self.assertIn(
+            "/memcontinuum is the supported way to actually decide",
+            normalized,
+        )
+
 
 # Apostrophe as either a straight quote or a curly one -- a rephrase is just
 # as likely to introduce "you’ll" as "you'll", and nothing else in this
