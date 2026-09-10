@@ -1538,6 +1538,30 @@ class TestConsentIsManualNotAutomatic(unittest.TestCase):
             normalized,
         )
 
+    def test_readme_day_to_day_does_not_overclaim_not_now_is_recorded(self):
+        # TOP-0110 L3, Grok gate finding 3: "Whatever you answer through
+        # /memcontinuum is recorded permanently ... and can be changed
+        # again" was FALSE for "Not now" -- skills/memcontinuum/SKILL.md's
+        # own "Not now" option records nothing (section 2's option list,
+        # section 3's "'Not now' -> record nothing" heading). Only a
+        # yes-or-no answer is recorded and reversible; the paragraph now
+        # says so and names the carve-out rather than claiming universal
+        # coverage.
+        text = README.read_text()
+        section = text[text.index("## Day to day"):text.index("**`/memcontinuum` any time.**")]
+        normalized = " ".join(section.split())
+        self.assertNotIn("Whatever you answer", normalized)
+        self.assertIn(
+            "A yes-or-no answer through `/memcontinuum` is recorded "
+            "permanently",
+            normalized,
+        )
+        self.assertIn(
+            'answering "Not now" instead records nothing and leaves the '
+            "repo undecided",
+            normalized,
+        )
+
     def test_readme_install_section_names_the_manual_step_as_required(self):
         text = README.read_text()
         section = self._between(text, "### Once per repository", "```bash")
@@ -1652,6 +1676,30 @@ class TestConsentIsManualNotAutomatic(unittest.TestCase):
             text,
         )
         self.assertIn("advisory only, and it may never reach you.", text)
+
+    def test_setup_sh_epilogue_does_not_overclaim_not_now_is_recorded(self):
+        # TOP-0110 L3, Grok gate finding 3: the epilogue said "Whatever you
+        # answer through the skill is recorded and reversible" -- FALSE for
+        # "Not now" (skills/memcontinuum/SKILL.md's own "Not now" option
+        # records nothing). Corrected to name the yes-or-no case
+        # specifically and the "not now" carve-out, matching the README's
+        # own fix for the identical overclaim.
+        text = SETUP_SH.read_text()
+        self.assertNotIn(
+            "Whatever you answer through the skill is recorded and "
+            "reversible",
+            text,
+        )
+        self.assertIn(
+            "A yes-or-no answer through the skill is recorded and "
+            "reversible",
+            text,
+        )
+        self.assertIn(
+            "answering not now records nothing and leaves the repo "
+            "undecided",
+            text,
+        )
 
     def test_setup_sh_help_header_states_the_detector_is_advisory_only(self):
         # Runs the real --help (usage() prints the top comment block
@@ -2025,8 +2073,8 @@ class TestNoRephrasedAskPromiseMutations(unittest.TestCase):
         # must fail the suite through this file, not just be absent from
         # a pin (this class pins setup.sh's exact wording nowhere else).
         marker = (
-            "Whatever you answer through the skill is recorded and "
-            "reversible."
+            "answering not now records nothing and leaves the repo "
+            "undecided."
         )
         text = SETUP_SH.read_text()
         self.assertIn(marker, text, "fixture stale: closing text not found")
