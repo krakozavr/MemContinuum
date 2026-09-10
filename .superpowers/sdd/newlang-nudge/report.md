@@ -134,8 +134,14 @@ after all work:
 - `settings.json`: `827bc4282756645d5b0bff480dd47ae0359cb43bc00b29595607b21d3358b82` — unchanged.
 - `config.sh`: `a60b47a02c61f107747113411c558fd3f36d4329aba6a34ac04ec1a898ff76b4` — unchanged.
 
-The primary checkout (`/home/krakozavr/dev/memcontinuum`) was never written
-to — all code/doc/test/report changes live on this branch's own worktree.
+The primary checkout (`/home/krakozavr/dev/memcontinuum`) received no code,
+test, or doc changes and no git state change of any kind — the one write
+there is a `cp` of this finished report to the already-gitignored
+`.superpowers/sdd/newlang-nudge/report.md` (confirmed via `git -C
+/home/krakozavr/dev/memcontinuum status --short`: still shows only the
+pre-existing `?? .claude/` line, nothing new). All actual code/doc/test/
+report changes are committed on this branch's own worktree; see "Report
+location" below for why both copies exist.
 `fixtures/records` stayed untouched and was never `git add`'d (worktree
 private-symlink caveat — explicit `git add <path>` was used throughout,
 never `git add -A`).
@@ -179,12 +185,16 @@ never `git add -A`).
    `*` pattern. The currently-live parallel `installer-honesty` worktree
    keeps its own `report.md` force-added and committed inside its own
    worktree/branch (verified: `git log --oneline -- .superpowers/sdd/installer-honesty/report.md`
-   shows a real commit there). I followed that same live precedent — this
-   report is force-added and committed on the `newlang-nudge` branch, not
-   written into the primary checkout — since the brief's "except your
-   report" clause is ambiguous and the primary checkout is explicitly the
-   thing not to be touched. Flagging this explicitly in case the intended
-   convention was actually a live copy in the primary checkout instead.
+   shows a real commit there). The brief's "except your report" clause
+   names exactly one thing the primary checkout may still receive, and
+   that precedent shows a committed copy is *also* expected — both are
+   satisfiable at once: this report is force-added and committed on the
+   `newlang-nudge` branch (the authoritative, versioned copy), AND `cp`'d
+   to `/home/krakozavr/dev/memcontinuum/.superpowers/sdd/newlang-nudge/report.md`
+   so a coordinator looking where the brief pointed finds it too. That
+   second copy is a plain filesystem write to an already-gitignored path,
+   not a git operation — `git -C /home/krakozavr/dev/memcontinuum status
+   --short` shows no new untracked/modified entry from it.
 
 ## Trailer note
 The brief (line 7) specifies `Claude Opus 5 (1M context)`. The session's own
