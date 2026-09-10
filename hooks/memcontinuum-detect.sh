@@ -7,6 +7,14 @@
 # not write down a consent it did not collect. Both of those belong to the
 # `memcontinuum` skill, which runs only after a human answers.
 #
+# EXPERIMENTAL, not a guaranteed path to the human: the additionalContext
+# text this hook emits (see the printf near the bottom) reaches only the
+# ASSISTANT, never the human directly, and nothing compels an assistant to
+# surface it. Observed, not assumed: across two real sessions it never
+# actually reached the owner. Future agents: do NOT promote this hook, in
+# the README or any user-facing doc, as a way users get asked -- the
+# supported path is a human running /memcontinuum.
+#
 # Deliberately unlike every other hook in this directory:
 #
 #   * No python, no memlib.sh, no watchdog. This fires on EVERY session start
@@ -178,5 +186,9 @@ detect_log "undecided key=$KEY wiring=$MC_WIRING"
 # act. The assistant asks the human; the `memcontinuum` skill records whatever
 # they answer. No path or URL is interpolated into this string -- it is a
 # fixed ASCII literal, so it needs no JSON escaping.
+#
+# Reminder (see the top-of-file note): this string reaches the ASSISTANT
+# only, never the human directly -- do not write or approve documentation
+# that describes this as how a user gets asked.
 printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"MemContinuum is installed on this machine but no decision has been recorded for this repository: it is neither wired nor declined. Ask the user, once and plainly, whether this repo should keep a decision store (MemContinuum). Do not run anything before they answer. On any answer -- yes or no -- invoke the memcontinuum skill, which is what initializes the repo or records the decline so this is never asked again. If they want to think about it, say nothing further this session."}}'
 exit 0

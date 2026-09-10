@@ -36,6 +36,9 @@ SKILL = TOOLS_DIR / "skills" / "memcontinuum" / "SKILL.md"
 SEARCH_SKILL = TOOLS_DIR / "skills" / "memory-search" / "SKILL.md"
 INSTALL_HOOKS = TOOLS_DIR / "hooks" / "install-hooks.md"
 NEWFILE_NUDGE_HOOK = TOOLS_DIR / "hooks" / "newfile-nudge.sh"
+SETUP_SH = TOOLS_DIR / "memcontinuum-setup.sh"
+DECIDE_SH = TOOLS_DIR / "scripts" / "memcontinuum-decide.sh"
+UPDATE_SH = TOOLS_DIR / "scripts" / "memcontinuum-update.sh"
 STORE_README_TMPL = TOOLS_DIR / "templates" / "store-README.md.tmpl"
 RULES_TEMPLATE = TOOLS_DIR / "templates" / "memcontinuum-rules.md"
 SCHEMA = TOOLS_DIR / "docs" / "SCHEMA.md"
@@ -1535,6 +1538,30 @@ class TestConsentIsManualNotAutomatic(unittest.TestCase):
             normalized,
         )
 
+    def test_readme_day_to_day_does_not_overclaim_not_now_is_recorded(self):
+        # TOP-0110 L3, Grok gate finding 3: "Whatever you answer through
+        # /memcontinuum is recorded permanently ... and can be changed
+        # again" was FALSE for "Not now" -- skills/memcontinuum/SKILL.md's
+        # own "Not now" option records nothing (section 2's option list,
+        # section 3's "'Not now' -> record nothing" heading). Only a
+        # yes-or-no answer is recorded and reversible; the paragraph now
+        # says so and names the carve-out rather than claiming universal
+        # coverage.
+        text = README.read_text()
+        section = text[text.index("## Day to day"):text.index("**`/memcontinuum` any time.**")]
+        normalized = " ".join(section.split())
+        self.assertNotIn("Whatever you answer", normalized)
+        self.assertIn(
+            "A yes-or-no answer through `/memcontinuum` is recorded "
+            "permanently",
+            normalized,
+        )
+        self.assertIn(
+            'answering "Not now" instead records nothing and leaves the '
+            "repo undecided",
+            normalized,
+        )
+
     def test_readme_install_section_names_the_manual_step_as_required(self):
         text = README.read_text()
         section = self._between(text, "### Once per repository", "```bash")
@@ -1613,6 +1640,91 @@ class TestConsentIsManualNotAutomatic(unittest.TestCase):
         self.assertNotIn("you will be asked again next session", text)
         self.assertNotIn("asked again next session", text)
 
+    def test_setup_sh_no_longer_carries_the_retired_third_person_promises(self):
+        # TOP-0110 L3, installer-closing-honesty branch, Grok gate finding
+        # 1: memcontinuum-setup.sh holds the LAST thing a user reads after
+        # installing (the "=== done ===" epilogue) and the --help header
+        # (usage() prints the top comment block verbatim) -- the file this
+        # whole episode's original sweep missed. TestNoRephrasedAskPromise
+        # below now scans this file too, but by its own disclosed limits
+        # cannot see either retired string here (verified by planting
+        # both: the header's "will" and "ask you" sit four words apart,
+        # past the guard's two-filler-word window; the epilogue was third
+        # person throughout, no "you" recipient at all -- zero regex hits
+        # either way). The cheap literal pin belongs BESIDE the semantic
+        # guard, not instead of it -- same shape as the README/SKILL pins
+        # above.
+        text = SETUP_SH.read_text()
+        self.assertNotIn(
+            "will prompt the assistant to ask you", text,
+            "the retired closing epilogue promised the assistant would "
+            "ask you once -- see TOP-0110 L3",
+        )
+        self.assertNotIn(
+            "the human is asked about", text,
+            "the retired --help header described the memcontinuum skill "
+            "this way -- see TOP-0110 L3",
+        )
+
+    def test_setup_sh_epilogue_names_memcontinuum_as_the_way_to_decide(self):
+        # Positive companion to the pin above: the rewritten "=== done ==="
+        # epilogue actually says what TOP-0110 L3 requires, not just that
+        # the old text is gone.
+        text = SETUP_SH.read_text()
+        self.assertIn(
+            "Run /memcontinuum inside a repository to decide for it.",
+            text,
+        )
+        self.assertIn("advisory only, and it may never reach you.", text)
+
+    def test_setup_sh_epilogue_does_not_overclaim_not_now_is_recorded(self):
+        # TOP-0110 L3, Grok gate finding 3: the epilogue said "Whatever you
+        # answer through the skill is recorded and reversible" -- FALSE for
+        # "Not now" (skills/memcontinuum/SKILL.md's own "Not now" option
+        # records nothing). Corrected to name the yes-or-no case
+        # specifically and the "not now" carve-out, matching the README's
+        # own fix for the identical overclaim.
+        text = SETUP_SH.read_text()
+        self.assertNotIn(
+            "Whatever you answer through the skill is recorded and "
+            "reversible",
+            text,
+        )
+        self.assertIn(
+            "A yes-or-no answer through the skill is recorded and "
+            "reversible",
+            text,
+        )
+        self.assertIn(
+            "answering not now records nothing and leaves the repo "
+            "undecided",
+            text,
+        )
+
+    def test_setup_sh_help_header_states_the_detector_is_advisory_only(self):
+        # Runs the real --help (usage() prints the top comment block
+        # verbatim, via sed) rather than reading source lines directly --
+        # the sentence spans three separate `#`-prefixed comment lines, so
+        # this is checked against what a person actually sees.
+        proc = subprocess.run(
+            ["bash", str(SETUP_SH), "--help"],
+            cwd=str(TOOLS_DIR), capture_output=True, text=True,
+            env=dict(os.environ, PYTHONPATH=""),
+        )
+        self.assertEqual(
+            proc.returncode, 0, f"--help must exit 0: {proc.stderr[:400]}",
+        )
+        normalized = " ".join(proc.stdout.split())
+        self.assertIn(
+            "the SessionStart detector flags an undecided repo to the "
+            "assistant, advisory only",
+            normalized,
+        )
+        self.assertIn(
+            "/memcontinuum is the supported way to actually decide",
+            normalized,
+        )
+
 
 # Apostrophe as either a straight quote or a curly one -- a rephrase is just
 # as likely to introduce "you’ll" as "you'll", and nothing else in this
@@ -1689,6 +1801,50 @@ PROMISE_TO_BE_ASKED_PATTERNS = [
 # produces ZERO hits against it -- nothing to allowlist today. Left empty
 # rather than pre-populated with a guess; a real future hit gets a named,
 # commented entry here, the same as any doc's.
+#
+# memcontinuum-setup.sh (TOP-0110 L3, installer-closing-honesty branch):
+# this file holds the LAST thing a user reads after installing -- the one
+# place this whole episode's sweep missed -- so it is added here too.
+# Checked directly, not assumed: the rewritten "=== done ===" epilogue
+# ("Run /memcontinuum inside a repository to decide for it ... it may
+# never reach you. Whatever you answer through the skill is recorded and
+# reversible.") never puts "you" next to ask/prompt/remind/offer at all,
+# and the file's `-h`/`--help` header (usage() prints the top comment
+# block verbatim) and every other say/comment line were checked the same
+# way -- ZERO hits today, nothing to allowlist. Disclosed, not just
+# assumed: the OLD epilogue this branch replaced ("...will prompt the
+# assistant to ask you once whether...") also produced ZERO hits against
+# this same scan -- "will" and "ask you" sit four words apart across "the
+# assistant to", past the two-filler-word window PROMISE_TO_BE_ASKED_
+# PATTERNS allows between a modal and its verb (TOP-0129 L2 documents the
+# guard's other known gap, third-person phrasing with no "you" recipient
+# at all; this is a second, distinct gap in the same shape-not-meaning
+# design -- a real promise whose modal and verb are separated by an
+# intervening clause). This scan would NOT have caught the defect this
+# branch fixes had it run before the fix; only the exact-phrase pins this
+# class's own docstring describes, or a reviewer, catch that shape.
+#
+# scripts/memcontinuum-decide.sh: its two runtime "asked" echoes
+# (`declined` -> "this repo will not be asked again", `forget` -> "the
+# SessionStart detector will emit its ask again") are third person
+# throughout -- no "you" -- so, same as TOP-0129 L2 describes, this scan
+# does not and cannot evaluate them; checked directly and confirmed ZERO
+# regex hits today regardless, nothing to allowlist.
+#
+# scripts/memcontinuum-update.sh (Grok gate finding 2, installer-closing-
+# honesty branch): its --help header carried the same third-person shape
+# as setup.sh's retired header ("...is the memcontinuum skill's repair
+# path (a human is asked), not this command's"), fixed alongside setup.sh
+# to name `/memcontinuum` as the way the install gets finished rather than
+# an event that happens on its own, and added to this scan since it was
+# never on any scan before. That fixed sentence, and the rest of the
+# file's say/comment lines, produce ZERO regex hits today -- checked
+# directly, not assumed. A second occurrence of the identical retired
+# words sits at line ~1223, but as a code comment past the file's own
+# `--MC-USAGE-END--` marker (confirmed: usage() only ever prints lines
+# 2 through that marker) it is never printed by `--help` or seen by a
+# user, so it is left alone on purpose, same as this doctrine's own
+# top-of-file rule that code comments are not in scope.
 ALLOWED_ASK_PROMISE_SUBSTRINGS = [
     # README's "Day to day": present tense, describing what /memcontinuum
     # itself does WHILE the human is running it. A human asked BY the
@@ -1728,36 +1884,68 @@ class TestNoRephrasedAskPromise(unittest.TestCase):
     """Semantic companion to TestConsentIsManualNotAutomatic's exact-phrase
     pins -- see PROMISE_TO_BE_ASKED_PATTERNS above for what this catches
     and its disclosed limit. Scans README.md, skills/memcontinuum/
-    SKILL.md, and hooks/newfile-nudge.sh -- the docs and the one hook that
-    carried the retired promise (TOP-0110 L3): the README describes the
-    product to the human who reads it, the skill's own pinned
-    structured-prompt options are the single most user-visible place in
-    the product, a numbered choice the human sees live, and
-    newfile-nudge.sh's own three-option decision point (newlang-nudge)
-    used to make the identical promise in its option 3 ("asked again next
-    session") before this branch retired it -- same defect, same vocabulary
-    fix, so it gets the same scan. newfile-nudge.sh is shell, not prose --
-    option text, comments, and log strings all sit in the same file -- so
-    a hit here is expected to need ALLOWED_ASK_PROMISE_SUBSTRINGS
-    entries over time the way README/SKILL already do; checked directly
-    (not assumed) that today's file produces none. Reads the bare module
-    globals README/SKILL/NEWFILE_NUDGE_HOOK at call time (not a pre-bound
+    SKILL.md, hooks/newfile-nudge.sh, memcontinuum-setup.sh,
+    scripts/memcontinuum-decide.sh, and scripts/memcontinuum-update.sh --
+    the docs, the one hook, and the three installer scripts this episode's
+    fix touched (TOP-0110 L3): the
+    README describes the product to the human who reads it, the skill's
+    own pinned structured-prompt
+    options are the single most user-visible place in the product, a
+    numbered choice the human sees live, newfile-nudge.sh's own
+    three-option decision point (newlang-nudge) used to make the
+    identical promise in its option 3 ("asked again next session") before
+    that branch retired it, and memcontinuum-setup.sh holds the LAST
+    thing a user reads after installing -- the "=== done ===" epilogue --
+    which is exactly what this whole episode's original sweep missed:
+    every other document got the fix, this file did not get scanned at
+    all. scripts/memcontinuum-decide.sh's runtime text was corrected on
+    the consent branch but was likewise never added to any scan, so it
+    is added here alongside setup.sh even though (see
+    ALLOWED_ASK_PROMISE_SUBSTRINGS above) its two "asked" echoes are
+    third person and this class cannot evaluate them -- TOP-0129 L2's
+    disclosed limit, not a gap fixed here.
+    scripts/memcontinuum-update.sh (Grok gate finding 2,
+    installer-closing-honesty branch) carried the identical third-person
+    shape in its own --help header and was never on any scan either; its
+    fixed header is added here too, same treatment as the other five. All
+    six are shell or prose
+    with user-facing text (option lists, say/echo lines, comments a
+    `--help` prints) -- a hit here is expected to need
+    ALLOWED_ASK_PROMISE_SUBSTRINGS entries over time the way README/SKILL
+    already do; checked directly (not assumed) that today's six files
+    produce none. Reads the bare module globals README/SKILL/
+    NEWFILE_NUDGE_HOOK/SETUP_SH/DECIDE_SH/UPDATE_SH at call time (not a
+    pre-bound
     list), same as TestSkillHonesty's methods, so
     TestNoRephrasedAskPromiseMutations below can point any of them at a
-    mutated temp file and prove this method reacts to it for real."""
+    mutated temp file and prove this method reacts to it for real.
+
+    Disclosed, not just claimed: this scan is shape-anchored on "you" as
+    the recipient (TOP-0129 L2), so it does NOT cover a third-person
+    promise, and separately (found while extending it to setup.sh) it
+    does not reliably cover a "you"-recipient promise either when an
+    intervening clause pushes the modal ("will") and the ask/prompt/
+    remind/offer verb more than two words apart -- memcontinuum-setup.sh's
+    OWN retired closing text ("...will prompt the assistant to ask you
+    once whether...") is a real example that produced zero hits against
+    this exact scan. Neither gap is fixed by this change; both are why
+    the exact-phrase pins elsewhere, and a reviewer's eye, still matter
+    alongside this class."""
 
     def test_no_user_facing_text_promises_you_will_be_asked(self):
         offenders = []
-        for doc in (README, SKILL, NEWFILE_NUDGE_HOOK):
+        for doc in (
+            README, SKILL, NEWFILE_NUDGE_HOOK, SETUP_SH, DECIDE_SH,
+            UPDATE_SH,
+        ):
             offenders.extend(_ask_promise_offenders(doc))
         self.assertEqual(
             offenders, [],
             "user-facing text promises a human will be asked/prompted/"
-            "reminded/offered (TOP-0110 L3): both the SessionStart "
-            "detector's ask and newfile-nudge.sh's own decision point "
-            "reach only the assistant, through additionalContext, never "
-            f"the human directly, so nothing here may promise otherwise: "
-            f"{offenders}",
+            "reminded/offered (TOP-0110 L3): the SessionStart detector's "
+            "ask reaches only the assistant, through additionalContext, "
+            "never the human directly, so nothing here may promise "
+            f"otherwise: {offenders}",
         )
 
 
@@ -1767,24 +1955,41 @@ class TestNoRephrasedAskPromiseMutations(unittest.TestCase):
     copy of its logic (the same house rule fix round 3 established for
     TestSkillHonestyMutations above). Reproduces Grok gate finding 2's two
     exact defeats verbatim (both slipped past every exact-phrase pin in
-    TestConsentIsManualNotAutomatic when the gate first found them), plus
-    a third for newfile-nudge.sh's own option 3 (newlang-nudge, TOP-0110
+    TestConsentIsManualNotAutomatic when the gate first found them), a
+    third for newfile-nudge.sh's own option 3 (newlang-nudge, TOP-0110
     L3): rephrasing "nothing is recorded; stays unwired until decided"
     back into the same retired promise ("you'll be asked again next
     session") must fail the suite too, not just the exact-string absence
-    check in tests/test_write_hooks.py."""
+    check in tests/test_write_hooks.py. A fourth and fifth do the same
+    for the two files added to the scan on the installer-closing-honesty
+    branch (TOP-0110 L3): memcontinuum-setup.sh (rephrasing its own
+    closing epilogue, which this class pins nowhere else) and
+    scripts/memcontinuum-decide.sh (an inserted "you"-shaped promise,
+    since that file's own real "asked"/"ask" text is third person and
+    outside what TestNoRephrasedAskPromise can evaluate -- TOP-0129 L2 --
+    so a rephrase-of-existing-text defeat is not available there; this
+    proves the scan still reaches the file rather than silently skipping
+    it). A sixth does the same for scripts/memcontinuum-update.sh (added
+    to the scan for the same gate's finding 2): an inserted "you"-shaped
+    promise, for the identical reason as decide.sh -- update.sh's own
+    real "asked" text (its --help header, fixed alongside setup.sh's, and
+    the untouched code comment past --MC-USAGE-END-- at line ~1223) is
+    third person throughout, outside what this class can evaluate."""
 
     @staticmethod
     @contextlib.contextmanager
     def _mutated_doc(varname, mutated_text):
         """Point the module-level global named `varname` ("README",
-        "SKILL", or "NEWFILE_NUDGE_HOOK") at a temp file holding
-        `mutated_text` for the duration of the `with` block, then restore
-        it -- generalizes TestSkillHonestyMutations._mutated_skill (which
-        only ever swaps SKILL) so this class can reproduce a defeat
-        planted in any doc or hook TestNoRephrasedAskPromise scans; that
-        test's method resolves README/SKILL/NEWFILE_NUDGE_HOOK from this
-        module's globals at call time, so this reaches it."""
+        "SKILL", "NEWFILE_NUDGE_HOOK", "SETUP_SH", "DECIDE_SH", or
+        "UPDATE_SH") at a
+        temp file holding `mutated_text` for the duration of the `with`
+        block, then restore it -- generalizes
+        TestSkillHonestyMutations._mutated_skill (which only ever swaps
+        SKILL) so this class can reproduce a defeat planted in any doc,
+        hook, or script TestNoRephrasedAskPromise scans; that test's
+        method resolves README/SKILL/NEWFILE_NUDGE_HOOK/SETUP_SH/
+        DECIDE_SH/UPDATE_SH from this module's globals at call time, so
+        this reaches it."""
         module = sys.modules[__name__]
         real_path = getattr(module, varname)
         fd, tmp_name = tempfile.mkstemp(suffix=".md")
@@ -1858,6 +2063,67 @@ class TestNoRephrasedAskPromiseMutations(unittest.TestCase):
         )
         self.assertNotEqual(mutated, text, "fixture stale: nothing matched")
         self._assert_guard_catches("NEWFILE_NUDGE_HOOK", mutated)
+
+    def test_setup_sh_closing_rephrase_defeat_is_caught(self):
+        # TOP-0110 L3, installer-closing-honesty branch: memcontinuum-
+        # setup.sh's own "=== done ===" epilogue is the file this whole
+        # episode's original sweep missed -- the one that holds the LAST
+        # thing a user reads after installing. Rewording the fixed
+        # closing text back into a close rephrase of the retired promise
+        # must fail the suite through this file, not just be absent from
+        # a pin (this class pins setup.sh's exact wording nowhere else).
+        marker = (
+            "answering not now records nothing and leaves the repo "
+            "undecided."
+        )
+        text = SETUP_SH.read_text()
+        self.assertIn(marker, text, "fixture stale: closing text not found")
+        mutated = text.replace(
+            marker,
+            "You'll be asked again next session if you don't decide now.",
+            1,
+        )
+        self.assertNotEqual(mutated, text, "fixture stale: nothing matched")
+        self._assert_guard_catches("SETUP_SH", mutated)
+
+    def test_decide_sh_insertion_defeat_is_caught(self):
+        # scripts/memcontinuum-decide.sh's own real "asked"/"ask" text
+        # ("this repo will not be asked again", "will emit its ask
+        # again") is third person throughout, with no "you" recipient --
+        # outside what TestNoRephrasedAskPromise can evaluate (TOP-0129
+        # L2, see the class docstring above), so no rephrase-of-existing-
+        # text defeat exists here the way it does for the other four
+        # files. This proves the scan still actually REACHES the file
+        # (added to the loop, not silently skipped) by inserting a
+        # "you"-shaped promise the pattern IS designed to catch.
+        text = DECIDE_SH.read_text()
+        marker = "set -u"
+        self.assertIn(marker, text, "fixture stale: marker not found")
+        mutated = text.replace(
+            marker, marker + "\n# you will be asked again next session\n", 1
+        )
+        self.assertNotEqual(mutated, text, "fixture stale: nothing matched")
+        self._assert_guard_catches("DECIDE_SH", mutated)
+
+    def test_update_sh_insertion_defeat_is_caught(self):
+        # scripts/memcontinuum-update.sh (Grok gate finding 2,
+        # installer-closing-honesty branch): its --help header, like
+        # decide.sh's runtime text, is third person throughout ("...is
+        # the memcontinuum skill's repair path...", no "you" recipient)
+        # even after the fix -- outside what TestNoRephrasedAskPromise
+        # can evaluate, TOP-0129 L2 -- so, same as decide.sh above, no
+        # rephrase-of-existing-text defeat exists here. This proves the
+        # scan still actually REACHES the file (added to the loop, not
+        # silently skipped) by inserting a "you"-shaped promise the
+        # pattern IS designed to catch.
+        text = UPDATE_SH.read_text()
+        marker = "set -u"
+        self.assertIn(marker, text, "fixture stale: marker not found")
+        mutated = text.replace(
+            marker, marker + "\n# you will be asked again next session\n", 1
+        )
+        self.assertNotEqual(mutated, text, "fixture stale: nothing matched")
+        self._assert_guard_catches("UPDATE_SH", mutated)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # memcontinuum-setup.sh -- MemContinuum machine setup. Run ONCE per machine, from this
 # checkout. Everything after this is per-repository and goes through the
-# `memcontinuum` skill, which the human is asked about rather than expected to
-# remember.
+# `memcontinuum` skill: the SessionStart detector flags an undecided repo
+# to the assistant, advisory only -- /memcontinuum is the supported way to
+# actually decide.
 #
 # The split, because it is the thing people get wrong:
 #
@@ -490,9 +491,11 @@ if [ "$DRY_RUN" -eq 1 ]; then
     say "(--dry-run: nothing was written)"
     exit 0
 fi
-say "From now on, every session that starts in a git repo with no recorded"
-say "answer will prompt the assistant to ask you once whether that repo should"
-say "keep a decision store. Answer either way and it is remembered."
+say "Run /memcontinuum inside a repository to decide for it. An undecided"
+say "repo also makes the SessionStart detector emit a note into the"
+say "assistant's context -- advisory only, and it may never reach you."
+say "A yes-or-no answer through the skill is recorded and reversible;"
+say "answering not now records nothing and leaves the repo undecided."
 say ""
 say "  status of the repo you are in:  scripts/memcontinuum-state.sh"
 say "  never ask me anywhere:          scripts/memcontinuum-decide.sh never-ask"

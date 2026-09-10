@@ -341,9 +341,10 @@ SessionStart detector that classifies an un-set-up repository and hands the
 assistant one line of context asking it to put the question to you — but that
 channel is advisory: it reaches the assistant, not you, and nothing here can
 compel an assistant to raise it. Treat it as a bonus, never as the path; if a
-session never asks, that is the expected case, not a bug. Whatever you answer
+session never asks, that is the expected case, not a bug. A yes-or-no answer
 through `/memcontinuum` is recorded permanently in the machine's decision
-registry and can be changed again at any time through the same skill.
+registry and can be changed again at any time through the same skill;
+answering "Not now" instead records nothing and leaves the repo undecided.
 
 **`/memcontinuum` any time.** The skill is how you check, enable, disable, or
 reverse the decision for a repository, whenever you want, without waiting to be
