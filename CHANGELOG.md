@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.2.0rc5] — 2026-09-10
 
 ### Decision index
 - `pre-edit-chain.sh` now names which topics a matched edit actually
@@ -19,6 +19,85 @@
   reads both so a `--days` window spanning a rotation still sees the
   rotated-out side, and data older than the previous rotation is gone by
   design.
+
+### Hooks
+- A supported language that appears unwired is now a decision point put to
+  the human, not a log-only notice: the new-file hook offers a numbered
+  choice -- wire it now, or never mention this extension again, the second
+  answer recorded permanently through the existing `--never-ext` mechanism
+  rather than a second one.
+- Fixed: the new-file hook used to offer to wire a language for a file the
+  code index refuses to index in the first place -- a `.d.ts`, `.blade.php`,
+  or `.min.js` file matched the hook's plain extension glob even though the
+  chunker excludes exactly those compound extensions outright, so wiring
+  the named language would never have caused the file to be indexed.
+  Harmless while the hook only logged an outcome; a wrong question once
+  that outcome became a decision point placed in front of a human.
+
+### Install and update
+- The updater now reports the machine layer (the user-level skill copy and
+  the detector hook `memcontinuum-setup.sh` installed) by default instead
+  of only under a flag -- evaluated only on request, it let a user-level
+  skill copy drift for nine days while every routine run printed "ok" for
+  the layers it did check. `--machine` is kept, now an accepted no-op;
+  `--no-machine` is the new opt-out, for a caller that cannot afford the
+  extra line or must never shell out to `memcontinuum-setup.sh`. Every
+  artifact the installer renders is now accounted for in the health table:
+  the store's two git hook wrappers (`post-commit`, `pre-commit`) gained
+  their own column, and the store's `README.md`, `.gitignore`, and
+  directory tree -- write-once files this command never re-renders -- are
+  named in a `not-checked:` footer line beneath the table instead of being
+  silently absent from it. A test derives the full artifact list from a
+  real install's own before/after filesystem diff, so a newly rendered
+  artifact the health table never mentions now fails the suite.
+- Fixed: the README's manual `--uninstall` steps used to identify hook
+  entries and a shared skill/rules copy by basename alone -- safe only when
+  one project's wiring lives in a `<claude-dir>`, and wrong the moment a
+  second project shares it, since every project's entries use the same
+  basenames. The steps now filter hook removal on the project name each
+  entry's own command string carries, and warn before deleting a shared
+  skill or rules copy another wired project still reads.
+
+### Documentation
+- Manual wiring -- running the `memcontinuum` skill -- is now documented as
+  the official, supported way to set up a repository. The SessionStart
+  detector that flags an undecided repo speaks only through a channel the
+  assistant sees, never the human directly, and nothing compels an
+  assistant to surface it, so the documentation no longer promises a user
+  will be asked. The detector itself is unchanged and stays in place, now
+  carrying a comment at its own source saying it must not be promoted, in
+  any user-facing doc, as a way users get asked.
+- Corrected documentation claims that no longer matched behavior: the
+  installer's closing message and `--help` text, the updater's `--help`
+  text, the claim that "whatever you answer is recorded" (untrue of
+  declining to answer, which records nothing and leaves the repo
+  undecided), the README's lookup-latency figure (now a dated sample --
+  105 logged lookups across two projects, zero or one second on the log's
+  own resolution, the deadline never firing in that window -- naming store
+  location as what actually governs the number, with the slow case, a
+  store on a Windows drive, already the installer's default to move off
+  of), and a related headroom figure in `docs/INTERNALS.md` that had
+  compared hook.log rows from before a store's own move off a Windows
+  drive against where it lives today -- withdrawn rather than restated as
+  some other multiplier.
+
+### Benchmark
+- A first retrieval benchmark now lives under `bench/`: a synthetic corpus,
+  a query set, and three runners -- this project, a keyword baseline, and a
+  no-memory control -- behind one scoring interface. It is additive only;
+  no engine file changed to produce it.
+- A negative control makes the benchmark's own numbers checkable: every
+  runner is also scored against a deterministic, kind-preserving shuffle of
+  the query list, and must beat that shuffled twin by more than the run's
+  own sampling noise, or the run prints inconclusive and names the runners
+  rather than a flattering number. What it catches is exactly what is
+  claimed -- a runner that is stateless and blind to the query text -- and
+  it does not catch a runner that persists state across calls; the code,
+  the README, and the printed output all say so.
+- Evaluation data is still accumulating everywhere in this release: the
+  benchmark's own numbers, and the real-machine figures corrected above,
+  are all early, short-window reads. Treat them as provisional and expect
+  revisions as more runs land.
 
 ## [0.2.0rc4] — 2026-09-07
 
