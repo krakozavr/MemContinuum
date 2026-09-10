@@ -46,7 +46,7 @@ wired one level up, into `~/.claude/settings.json`, by `memcontinuum-setup.sh`.
 | `sessionend-stamp.sh` | `SessionEnd` | stamps session end into state |
 | `post-commit-reindex.sh` | store's git `post-commit` | a bounded content-only reindex after every commit; spawns a background embed-worker when vectors are left behind |
 | `pre-commit-append-only.sh` | store's git `pre-commit` | runs `memlint.py --against-ref HEAD --staged`; BLOCKS the commit on an append-only violation (a recorded link's body edited, or a link removed, deleted, or renamed — its three lifecycle fields may each move forward once); fails open (lets the commit through) on an unborn HEAD, a missing python, its own cwd not being the store, or any engine failure |
-| `memcontinuum-detect.sh` | `SessionStart`, user level | classifies an un-initialized repo and asks once; no python, no watchdog, no logging by default |
+| `memcontinuum-detect.sh` | `SessionStart`, user level | classifies an un-initialized repo and emits its ask into the assistant's context once; no python, no watchdog, no logging by default |
 
 **Fail-open is the contract, not a fallback — with one deliberate exception.**
 No hook may block an edit or a commit — not on a missing python, not on a
@@ -321,9 +321,9 @@ line in exactly one of five states:
 | `opted-out` | — | — | silent (`$MEMCONTINUUM_HOME/no-ask` exists) |
 | `decided` | yes (`wired` or `declined`) | any | silent — the recorded answer is authoritative regardless of current wiring |
 | `wired-full-no-row` | none | `full` | silent — an install predating the registry reads as already wired |
-| `undecided` | none | `partial` or `none` | asks, once |
+| `undecided` | none | `partial` or `none` | emits, once |
 
-`partial` wiring asks rather than staying silent: a half-wired repo is the
+`partial` wiring emits rather than staying silent: a half-wired repo is the
 repair path, and silence there would leave it with no route back to health.
 `memcontinuum-state.sh` reports decision and wiring as two separate facts
 (`decision=` / `wiring=`, plus a combined `state=` line) because a
@@ -537,8 +537,8 @@ room than a help line.
 The key is the `origin` remote URL when there is one and the working tree's
 absolute path otherwise. Remote-keyed on purpose: a path key evaporates the
 moment a repo moves on disk, and a settled decision then looks unmade. On a
-path-key miss after a move the repo reads as `undecided` and is asked once
-more — re-ask, never assume.
+path-key miss after a move the repo reads as `undecided` and the detector
+emits its ask once more — re-emit, never assume.
 
 A decline stops the asking, not an existing installation. Nothing in this system
 ever deletes a store: a store is its own git history, not an installer artifact.

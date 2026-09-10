@@ -228,11 +228,19 @@ wheels and the tree-sitter runtime
 (below). A python you point it at with `--python` is not —
 that command reports what is missing there instead of installing into it.
 
-This step is what makes an un-initialized repository *noticeable*: the
-user-level detector runs at every session start, in every repo on the machine,
-and is the only piece of this tool that does.
+This step is what makes an un-initialized repository *noticeable to the
+assistant*: the user-level detector runs at every session start, in every
+repo on the machine, and is the only piece of this tool that does. Noticing
+is not the same as asking you — that channel reaches the assistant, never
+you directly — so the step below (`/memcontinuum`, run once per repository)
+is the one a human actually relies on.
 
 ### Once per repository
+
+Run `/memcontinuum` inside the repository — that is the required step, and
+the skill drives everything below for you from the answer you give it. The
+flags are documented here because that is exactly what the skill runs; read
+this section to know what it is doing.
 
 ```bash
 bash scripts/repo-init.sh --project NAME [--store DIR] [--code-root DIR ...]
@@ -325,12 +333,17 @@ either re-run unwiring the other.
 
 ## Day to day
 
-**You get asked once.** Open a repository that has never been set up, and at
-session start the detector puts one question to you: should this repo keep a
-decision store? Answer yes and it is initialized; answer no and this repo is
-never asked again; say "not now" and nothing is recorded — you will be asked
-next session. A repo that was half-installed is asked too: that is the repair
-path, not a settled decision.
+**Setup is manual, on purpose.** A repository does not start keeping a
+decision store on its own: run `/memcontinuum` inside it, once — that is the
+supported way to decide, whether the repo has never been set up, is
+half-installed, or already has an answer you want to change. There is also a
+SessionStart detector that classifies an un-set-up repository and hands the
+assistant one line of context asking it to put the question to you — but that
+channel is advisory: it reaches the assistant, not you, and nothing here can
+compel an assistant to raise it. Treat it as a bonus, never as the path; if a
+session never asks, that is the expected case, not a bug. Whatever you answer
+through `/memcontinuum` is recorded permanently in the machine's decision
+registry and can be changed again at any time through the same skill.
 
 **`/memcontinuum` any time.** The skill is how you check, enable, disable, or
 reverse the decision for a repository, whenever you want, without waiting to be

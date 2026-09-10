@@ -1014,18 +1014,32 @@ class TestSkillHonesty(unittest.TestCase):
         blank-separated from their own item, but ARE separated from
         whatever prose follows the list (e.g. `wired`'s "Moving a wired
         store..." paragraph after its two options) -- the first blank line
-        ends the list, and nothing after it is captured, however many
-        digits it contains. Pinning len()+order+text in one assertEqual
-        against this list's output fails on a dropped, added, reordered, OR
-        reworded option -- not just a phrase substring, which is what let
-        every one of the reviewers' option mutations slip past the
-        original version of this class. The printed NUMBER itself is also
-        checked here, not just discarded (brief B2: pin "numbering" too) --
-        a renumbering with no reorder (e.g. "1. Keep as is" / "3. Stop
-        using...") would pass a text-and-order-only check, so each item's
-        digit must equal its 1-based position or this raises immediately."""
+        ends the LIST (nothing after it is collected as an option's text).
+        Pinning len()+order+text in one assertEqual against this list's
+        output fails on a dropped, added, reordered, OR reworded option --
+        not just a phrase substring, which is what let every one of the
+        reviewers' option mutations slip past the original version of this
+        class. The printed NUMBER itself is also checked here, not just
+        discarded (brief B2: pin "numbering" too) -- a renumbering with no
+        reorder (e.g. "1. Keep as is" / "3. Stop using...") would pass a
+        text-and-order-only check, so each item's digit must equal its
+        1-based position or this raises immediately.
+
+        Fix round (Grok gate finding 3): the list ending on a blank line
+        used to mean nothing past it was even LOOKED at -- a numbered item
+        re-appearing there still got caught (it re-enters the counted
+        sequence below and trips the len()/numbering checks), but an
+        UNNUMBERED bullet (`- Maybe later -- ...`) slipped through
+        completely silent, because a plain `-`/`*` line never matched the
+        numbered-option regex and, once the list had closed, nothing else
+        was watching for it either. Once the list closes, this now also
+        watches for bullet-shaped stray content (`- `/`* ` at the start of
+        a line) and raises immediately if it sees one -- ordinary prose
+        after the list (no leading bullet marker) still passes through
+        uncaptured, same as before."""
         items = []
         current = None
+        list_closed = False
         for line in section.splitlines():
             m = re.match(r'^\s*(\d+)\.\s+(.*)$', line)
             if m:
@@ -1036,13 +1050,21 @@ class TestSkillHonesty(unittest.TestCase):
                     f"option numbered {m.group(1)!r} where {expected} was expected: {m.group(2)!r}"
                 )
                 current = m.group(2).strip()
-            elif current is not None:
+                continue
+            if current is not None:
                 stripped = line.strip()
                 if stripped == "":
                     items.append(current)
                     current = None
+                    list_closed = True
                 else:
                     current += " " + stripped
+                continue
+            if list_closed and re.match(r'^\s*[-*]\s+\S', line):
+                raise AssertionError(
+                    "option-shaped bullet content after this state's "
+                    f"option list already closed on a blank line: {line.strip()!r}"
+                )
         if current is not None:
             items.append(current)
         return items
@@ -1092,7 +1114,7 @@ class TestSkillHonesty(unittest.TestCase):
             "Yes, with code retrieval — records, plus decisions surfaced before edits under the named code root",
             "Yes, rationale only — records, no code retrieval",
             "No — record the decline; this repo is never asked again",
-            "Not now — nothing is recorded; you will be asked again next session",
+            "Not now — nothing is recorded; run `/memcontinuum` again to decide",
         ])
 
     def test_partial_wired_names_all_three_options_exactly(self):
@@ -1100,7 +1122,7 @@ class TestSkillHonesty(unittest.TestCase):
         self.assertEqual(options, [
             "Complete the wiring — finishes what a prior install left half-done",
             "Remove what is there",
-            "Not now — leave it half-wired; asked again next session",
+            "Not now — leave it half-wired; run `/memcontinuum` again to decide",
         ])
 
     def test_wired_names_both_options_exactly(self):
@@ -1254,20 +1276,38 @@ class TestSkillHonestyMutations(unittest.TestCase):
         mutated = self.text.replace(
             "1. Complete the wiring — finishes what a prior install left half-done\n"
             "2. Remove what is there\n"
-            "3. Not now — leave it half-wired; asked again next session\n",
+            "3. Not now — leave it half-wired; run `/memcontinuum` again to decide\n",
             "1. Remove what is there\n"
             "2. Complete the wiring — finishes what a prior install left half-done\n"
-            "3. Not now — leave it half-wired; asked again next session\n",
+            "3. Not now — leave it half-wired; run `/memcontinuum` again to decide\n",
         )
         self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
         self._assert_production_test_catches(mutated, "test_partial_wired_names_all_three_options_exactly")
 
     def test_adding_an_extra_undecided_option_is_caught(self):
         mutated = self.text.replace(
-            "4. Not now — nothing is recorded; you will be asked again next session\n\n"
+            "4. Not now — nothing is recorded; run `/memcontinuum` again to decide\n\n"
             "**`partial-wired`**",
-            "4. Not now — nothing is recorded; you will be asked again next session\n"
+            "4. Not now — nothing is recorded; run `/memcontinuum` again to decide\n"
             "5. Maybe later — think about it and decide next week\n\n"
+            "**`partial-wired`**",
+        )
+        self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
+        self._assert_production_test_catches(mutated, "test_undecided_names_all_four_options_exactly")
+
+    def test_adding_an_unnumbered_bullet_after_undecided_options_is_caught(self):
+        # Grok gate finding 3: a numbered "5." after the closing blank line
+        # was already caught (see test_adding_an_extra_undecided_option_is_
+        # caught above -- it re-enters the counted sequence and trips the
+        # len()/numbering checks), but an UNNUMBERED bullet in the same
+        # position slipped past every test in this file: _options() never
+        # captured, or even watched, anything once the list's closing blank
+        # line had gone by. Reproduces the reviewer's exact defeat.
+        mutated = self.text.replace(
+            "4. Not now — nothing is recorded; run `/memcontinuum` again to decide\n\n"
+            "**`partial-wired`**",
+            "4. Not now — nothing is recorded; run `/memcontinuum` again to decide\n\n"
+            "- Maybe later — think about it and I will wire it for you\n\n"
             "**`partial-wired`**",
         )
         self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
@@ -1341,6 +1381,382 @@ class TestSkillHonestyMutations(unittest.TestCase):
         )
         self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
         self._assert_production_test_catches(mutated, "test_no_computed_rule_restated_in_different_wording")
+
+
+class TestConsentIsManualNotAutomatic(unittest.TestCase):
+    """TOP-0110 L3: manual wiring (running `/memcontinuum` in a repository)
+    is the ONLY official way to set up a repo. The SessionStart detector
+    speaks through `hookSpecificOutput.additionalContext`, delivered to the
+    ASSISTANT, never to the human -- nothing can compel an assistant to
+    surface it. Across two observed sessions the owner was never asked;
+    both times he reached the setup dialogue only by invoking the skill
+    himself. The README used to promise "You get asked once", which is
+    exactly the claim this ruling forbids: a doc may describe the detector
+    as advisory, never as something that reaches the human without the
+    human (or an unreliable assistant) acting on it.
+
+    The same retired promise also sat in section 2 of
+    skills/memcontinuum/SKILL.md itself -- the pinned structured-prompt
+    "Not now" option, in the single most user-visible place in the
+    product, said the human "will be asked again next session". Fixed
+    alongside the README (the option text now points at re-running
+    `/memcontinuum`, TestSkillHonesty above pins the corrected list); this
+    class additionally pins the retired phrasing as absent from the whole
+    skill file, not just from step 3's prose.
+
+    These tests pin the retired phrasing's absence and the replacement's
+    substance for a specific reason: a PUBLIC_DOCS-wide keyword scan for
+    "asked" would also trip on skills/memcontinuum/SKILL.md's own pinned
+    structured-prompt options (settled design, tested by TestSkillHonesty
+    above -- e.g. "this repo is never asked again", the `declined` option,
+    is a true statement about a LIVE dialogue the human just triggered by
+    running the skill, not an unprompted claim) and on docs/INTERNALS.md's
+    accurate internal description of the detector's own hook-state
+    machine (`undecided` | `emits, once` names what the hook puts into
+    additionalContext, not a promise about who sees it). Exact-phrase
+    pins, not a blanket regex, are what THIS class checks -- and Grok's
+    gate proved their limit: a REPHRASED promise ("You will be asked once
+    at session start whether this repo should keep a decision store.",
+    "you'll be prompted next time you open this repo") slipped past every
+    pin here while restating exactly the claim this ruling forbids.
+    TestNoRephrasedAskPromise below is the semantic guard that catches a
+    rephrase by its SHAPE -- a human named, by "you", as the recipient of
+    ask/prompt/remind/offer, in a future or habitual construction --
+    rather than one fixed wording; it runs alongside these pins, not
+    instead of them. It is not a full semantic diff either: a promise
+    with no "you" as the recipient (a bare passive "the repo will be
+    asked again", or third person throughout) is outside what either
+    guard catches by shape and still depends on the exact pins above, or
+    a reviewer's eye, to be caught.
+    """
+
+    @staticmethod
+    def _between(text, start_marker, end_marker):
+        start = text.index(start_marker)
+        end = text.index(end_marker, start)
+        return text[start:end]
+
+    def test_readme_no_longer_claims_you_get_asked_once(self):
+        text = README.read_text()
+        self.assertNotIn("You get asked once", text)
+        self.assertNotIn("the detector puts one question to you", text)
+
+    def test_readme_day_to_day_leads_with_manual_invocation(self):
+        text = README.read_text()
+        section = text[text.index("## Day to day"):text.index("**`/memcontinuum` any time.**")]
+        normalized = " ".join(section.split())
+        self.assertIn(
+            "run `/memcontinuum` inside it, once — that is the supported "
+            "way to decide",
+            normalized,
+        )
+
+    def test_readme_day_to_day_states_the_detector_is_advisory_only(self):
+        text = README.read_text()
+        section = text[text.index("## Day to day"):text.index("**`/memcontinuum` any time.**")]
+        normalized = " ".join(section.split())
+        self.assertIn(
+            "that channel is advisory: it reaches the assistant, not you, "
+            "and nothing here can compel an assistant to raise it",
+            normalized,
+        )
+        self.assertIn(
+            "if a session never asks, that is the expected case, not a bug",
+            normalized,
+        )
+
+    def test_readme_day_to_day_keeps_the_registry_and_reversal_substance(self):
+        # The one part of the old paragraph that was TRUE and had to survive
+        # the rewrite: an answer is recorded permanently and reversible.
+        text = README.read_text()
+        section = text[text.index("## Day to day"):text.index("**`/memcontinuum` any time.**")]
+        normalized = " ".join(section.split())
+        self.assertIn(
+            "recorded permanently in the machine's decision registry and "
+            "can be changed again at any time through the same skill",
+            normalized,
+        )
+
+    def test_readme_install_section_names_the_manual_step_as_required(self):
+        text = README.read_text()
+        section = self._between(text, "### Once per repository", "```bash")
+        normalized = " ".join(section.split())
+        self.assertIn(
+            "Run `/memcontinuum` inside the repository — that is the "
+            "required step",
+            normalized,
+        )
+
+    def test_readme_noticeable_paragraph_does_not_imply_the_human_is_asked(self):
+        text = README.read_text()
+        self.assertNotIn(
+            "makes an un-initialized repository *noticeable*:", text,
+            "the old phrasing read as a promise to the human -- it must "
+            "name the assistant as the audience instead",
+        )
+        section = self._between(
+            text, "This step is what makes an un-initialized repository",
+            "### Once per repository",
+        )
+        normalized = " ".join(section.split())
+        self.assertIn("noticeable to the assistant", normalized)
+        self.assertIn("Noticing is not the same as asking you", normalized)
+
+    def test_skill_frontmatter_names_itself_the_official_manual_entry_point(self):
+        text = SKILL.read_text()
+        frontmatter = text.split("---", 2)[1]
+        self.assertIn("official, manual way", frontmatter)
+
+    def test_skill_opening_states_the_detector_is_advisory_only(self):
+        text = SKILL.read_text()
+        section = text[:text.index("## 1. Read the current state")]
+        normalized = " ".join(section.split())
+        self.assertIn(
+            "that channel is advisory only — it reaches the assistant, "
+            "never the human directly",
+            normalized,
+        )
+
+    def test_skill_not_now_paragraph_no_longer_promises_a_bare_re_ask(self):
+        # This sentence sits in "## 3. Act on the answer", explanatory prose
+        # around the pinned option list in "## 2. Ask" (section 2's own
+        # option text carried the same false promise and got the matching
+        # fix -- see test_skill_section_2_no_longer_promises_a_bare_re_ask
+        # below and TestSkillHonesty's pinned option lists above). This
+        # paragraph is not pinned there and carried the same false promise
+        # in the assistant's own follow-up explanation, so it gets the same
+        # correction as the README.
+        text = SKILL.read_text()
+        section = self._between(
+            text, '**"Not now" → record nothing.**', "## 4. Reversing",
+        )
+        normalized = " ".join(section.split())
+        self.assertNotIn(
+            "the detector stays quiet for the rest of this session and "
+            "asks again next time",
+            normalized,
+        )
+        self.assertIn("no guarantee it reaches the human unless", normalized)
+
+    def test_skill_section_2_no_longer_promises_a_bare_re_ask(self):
+        # TOP-0110 L3: section 2's pinned "Not now" option (the single most
+        # user-visible place in the product -- a numbered choice the human
+        # sees live) used to say the human "will be asked again next
+        # session" / "asked again next session", in both the `undecided`
+        # and `partial-wired` states. That is the same retired promise as
+        # the README's old "You get asked once" -- nothing compels an
+        # assistant to raise the SessionStart detector's advisory nudge, so
+        # no document may promise a bare re-ask. Pinned absent from the
+        # WHOLE file (not just step 3's prose, which the test above
+        # covers), so a regression in either state's option text is caught
+        # here even if TestSkillHonesty's exact-list pins above are ever
+        # loosened.
+        text = SKILL.read_text()
+        self.assertNotIn("you will be asked again next session", text)
+        self.assertNotIn("asked again next session", text)
+
+
+# Apostrophe as either a straight quote or a curly one -- a rephrase is just
+# as likely to introduce "you’ll" as "you'll", and nothing else in this
+# codebase's prose currently uses the curly form (checked: zero hits in
+# README.md / SKILL.md), so accepting both costs nothing today and closes a
+# free mutation tomorrow.
+_APOSTROPHE = r"[\'’]"
+
+# TOP-0110 L3, Grok gate finding 2: the exact-phrase pins in
+# TestConsentIsManualNotAutomatic catch verbatim restoration of a retired
+# promise, but not a REPHRASED one -- the gate proved this by inserting
+# "You will be asked once at session start whether this repo should keep a
+# decision store." next to the README's new Day-to-day paragraph, and by
+# rewording section 2's "Not now" option to "you'll be prompted next time
+# you open this repo": both passed every exact-phrase pin (the second was
+# only caught by TestSkillHonesty's exact option-list pin, a different
+# guard for a different reason). These patterns catch the SHAPE of a
+# promise instead of one fixed wording: a human named as the RECIPIENT of
+# ask/prompt/remind/offer -- second person "you"/"you'll"/"you're", as
+# either the subject of a passive ("you('ll) be asked", "you're prompted",
+# "you get reminded") or the object of an active future/habitual verb
+# ("will ask you", "reminds you") -- because the ruling this guards is
+# precise: no user-facing text may promise a human will be asked, prompted,
+# or reminded without acting themselves. A run of up to two filler words is
+# allowed between the modal and the participle ("you'll always be asked",
+# "will then remind you") so a hedge word doesn't buy an escape.
+#
+# Known, disclosed limit (not a claim of full semantic coverage): this is
+# "you"-anchored by design, so a promise with no second-person recipient --
+# a bare passive ("the repo will be asked again") or third person
+# throughout -- is NOT caught here. That shape is still covered, when it
+# matches, by the exact-phrase pins in TestConsentIsManualNotAutomatic and
+# TestSkillHonesty's pinned option lists; a novel third-person rephrase of
+# neither pinned string is caught by nothing here and needs a reviewer.
+PROMISE_TO_BE_ASKED_PATTERNS = [
+    # "you will (then) be asked" / "you'll (always) get prompted"
+    re.compile(
+        r"\byou(?:" + _APOSTROPHE + r"ll|\s+will)\s+(?:\w+\s+){0,2}"
+        r"(?:be\s+|get\s+)?(?:asked|prompted|reminded|offered)\b",
+        re.IGNORECASE,
+    ),
+    # "you are (always) asked" / "you're prompted" / "you get reminded" --
+    # present-tense habitual passive, no "will"/"'ll" needed
+    re.compile(
+        r"\byou(?:" + _APOSTROPHE + r"re|\s+are|\s+get)\s+(?:\w+\s+){0,2}"
+        r"(?:asked|prompted|reminded|offered)\b",
+        re.IGNORECASE,
+    ),
+    # "will (then) ask you" / "'ll prompt you" -- future active, human as
+    # the object
+    re.compile(
+        r"\b(?:will|" + _APOSTROPHE + r"ll)\s+(?:\w+\s+){0,2}"
+        r"(?:ask|prompt|remind|offer)s?\s+you\b",
+        re.IGNORECASE,
+    ),
+    # "asks you" / "prompts you" / "reminds you" / "offers you" -- bare
+    # present-tense habitual active, human as the object
+    re.compile(r"\b(?:asks|prompts|reminds|offers)\s+you\b", re.IGNORECASE),
+]
+
+# Small, explicit allowlist: exact substrings this scan would otherwise
+# flag, kept out only because each names why it is accurate under the
+# ruling. A hit is excused ONLY when the matched span sits entirely INSIDE
+# one of these substrings' own span in the whitespace-normalized text --
+# proximity is not enough, so a real violation typed next to an allowed
+# phrase still fails.
+ALLOWED_ASK_PROMISE_SUBSTRINGS = [
+    # README's "Day to day": present tense, describing what /memcontinuum
+    # itself does WHILE the human is running it. A human asked BY the
+    # skill they just invoked is the one true "asks you" this system has
+    # (TOP-0110 L3) -- not an unprompted claim about some future session.
+    "asks you the one question if there is one to ask",
+]
+
+
+def _ask_promise_offenders(path):
+    """Every PROMISE_TO_BE_ASKED_PATTERNS hit in `path`, whitespace-
+    normalized first (markdown hard-wraps prose, so a promise like "you
+    will be asked" can legitimately carry a newline+indent between its own
+    words) and not covered by ALLOWED_ASK_PROMISE_SUBSTRINGS."""
+    normalized = " ".join(path.read_text().split())
+    allowed_spans = []
+    for phrase in ALLOWED_ASK_PROMISE_SUBSTRINGS:
+        start = 0
+        while True:
+            idx = normalized.find(phrase, start)
+            if idx == -1:
+                break
+            allowed_spans.append((idx, idx + len(phrase)))
+            start = idx + 1
+    offenders = []
+    for pattern in PROMISE_TO_BE_ASKED_PATTERNS:
+        for m in pattern.finditer(normalized):
+            if any(a_start <= m.start() and m.end() <= a_end
+                   for a_start, a_end in allowed_spans):
+                continue
+            snippet = normalized[max(0, m.start() - 30):m.end() + 30]
+            offenders.append(f"{path.name}: ...{snippet}...")
+    return offenders
+
+
+class TestNoRephrasedAskPromise(unittest.TestCase):
+    """Semantic companion to TestConsentIsManualNotAutomatic's exact-phrase
+    pins -- see PROMISE_TO_BE_ASKED_PATTERNS above for what this catches
+    and its disclosed limit. Scans README.md and skills/memcontinuum/
+    SKILL.md, the two user-facing docs that carried the retired promise
+    (TOP-0110 L3): the README describes the product to the human who reads
+    it, and the skill's own pinned structured-prompt options are the single
+    most user-visible place in the product, a numbered choice the human
+    sees live. Reads the bare module globals README/SKILL at call time
+    (not a pre-bound list), same as TestSkillHonesty's methods, so
+    TestNoRephrasedAskPromiseMutations below can point either one at a
+    mutated temp file and prove this method reacts to it for real."""
+
+    def test_no_user_facing_text_promises_you_will_be_asked(self):
+        offenders = []
+        for doc in (README, SKILL):
+            offenders.extend(_ask_promise_offenders(doc))
+        self.assertEqual(
+            offenders, [],
+            "user-facing text promises a human will be asked/prompted/"
+            "reminded/offered (TOP-0110 L3): the SessionStart detector's "
+            "ask reaches only the assistant, never the human directly, "
+            f"so nothing here may promise otherwise: {offenders}",
+        )
+
+
+class TestNoRephrasedAskPromiseMutations(unittest.TestCase):
+    """Proves TestNoRephrasedAskPromise actually catches what it claims to
+    -- against the REAL production test method, not a second hand-written
+    copy of its logic (the same house rule fix round 3 established for
+    TestSkillHonestyMutations above). Reproduces Grok gate finding 2's two
+    exact defeats verbatim: both slipped past every exact-phrase pin in
+    TestConsentIsManualNotAutomatic when the gate first found them."""
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _mutated_doc(varname, mutated_text):
+        """Point the module-level global named `varname` ("README" or
+        "SKILL") at a temp file holding `mutated_text` for the duration of
+        the `with` block, then restore it -- generalizes
+        TestSkillHonestyMutations._mutated_skill (which only ever swaps
+        SKILL) so this class can reproduce a defeat planted in either doc
+        TestNoRephrasedAskPromise scans; that test's method resolves
+        README/SKILL from this module's globals at call time, so this
+        reaches it."""
+        module = sys.modules[__name__]
+        real_path = getattr(module, varname)
+        fd, tmp_name = tempfile.mkstemp(suffix=".md")
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(mutated_text)
+            setattr(module, varname, tmp_path)
+            yield
+        finally:
+            setattr(module, varname, real_path)
+            tmp_path.unlink(missing_ok=True)
+
+    def _assert_guard_catches(self, varname, mutated_text):
+        with self._mutated_doc(varname, mutated_text):
+            test = TestNoRephrasedAskPromise(
+                "test_no_user_facing_text_promises_you_will_be_asked"
+            )
+            with self.assertRaises(
+                AssertionError,
+                msg="TestNoRephrasedAskPromise did not fail against the "
+                    "mutation",
+            ):
+                test.test_no_user_facing_text_promises_you_will_be_asked()
+
+    def test_readme_insertion_defeat_is_caught(self):
+        # Grok gate finding 2, defeat 1: inserted next to the README's new
+        # Day-to-day paragraph.
+        text = README.read_text()
+        marker = "**`/memcontinuum` any time.**"
+        self.assertIn(marker, text, "fixture stale: marker not found")
+        mutated = text.replace(
+            marker,
+            "You will be asked once at session start whether this repo "
+            "should keep a decision store.\n\n" + marker,
+            1,
+        )
+        self.assertNotEqual(mutated, text, "fixture stale: nothing matched")
+        self._assert_guard_catches("README", mutated)
+
+    def test_skill_section_2_rephrase_defeat_is_caught(self):
+        # Grok gate finding 2, defeat 2: section 2's "Not now" option
+        # reworded to keep the same false promise in different words.
+        original = (
+            "4. Not now — nothing is recorded; run `/memcontinuum` again "
+            "to decide"
+        )
+        text = SKILL.read_text()
+        self.assertIn(original, text, "fixture stale: option text not found")
+        mutated = text.replace(
+            original,
+            "4. Not now — you'll be prompted next time you open this repo",
+            1,
+        )
+        self.assertNotEqual(mutated, text, "fixture stale: nothing matched")
+        self._assert_guard_catches("SKILL", mutated)
 
 
 if __name__ == "__main__":

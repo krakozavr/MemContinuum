@@ -5,8 +5,9 @@
 #                               [--langs LIST] [--never-ext LIST]
 #
 # Record a human's answer about one repository, so the SessionStart detector
-# never asks again. Called by the `memcontinuum` skill AFTER a human has
-# answered -- never by a hook, and never to guess.
+# never emits its ask into the assistant's context again. Called by the
+# `memcontinuum` skill AFTER a human has answered -- never by a hook, and
+# never to guess.
 #
 #   wired      they said yes AND the hooks are actually wired -- refused when
 #              settings under the repo's .claude (or every --claude-dir given)
@@ -292,5 +293,5 @@ mc_registry_rewrite_row "$DECISIONS" "$KEY" "$NEW_LINE" || { echo "failed to wri
 case "$ACTION" in
     wired)    echo "recorded: $KEY uses MemContinuum${NOTE:+ ($NOTE)}" ;;
     declined) echo "recorded: $KEY declined -- this repo will not be asked again" ;;
-    forget)   echo "recorded: $KEY forgotten -- it will be asked about again" ;;
+    forget)   echo "recorded: $KEY forgotten -- the SessionStart detector will emit its ask again" ;;
 esac
