@@ -88,11 +88,17 @@
 #                            repo-init.sh's existing --never-ext mechanism
 #                            (this hook already honours
 #                            MEMCONTINUUM_NEVER_EXTS above; nothing new is
-#                            built here), (3) not now -- nothing recorded,
-#                            asked again next session. Neither option is
-#                            restated as a literal command here (INC-0117:
-#                            a restated computed procedure is a copy that
-#                            can drift) -- both point at "the memcontinuum
+#                            built here), (3) not now -- nothing is
+#                            recorded, stays unwired until decided
+#                            (TOP-0110 L3: this hook's own emission reaches
+#                            the assistant's additionalContext, not the
+#                            human directly, so it may not promise a
+#                            future re-ask either -- same vocabulary as
+#                            the SessionStart detector's consent flow).
+#                            Neither option is restated as a literal
+#                            command here (INC-0117: a restated computed
+#                            procedure is a copy that can drift) -- both
+#                            point at "the memcontinuum
 #                            skill", whose section 6 is where an agent
 #                            acting on the human's answer finds what to
 #                            actually run. Gated silent (no message, no
@@ -503,7 +509,7 @@ if ! _ext_matches "$FILE_PATH" "$WIRED_EXTS"; then
         LANG_MESSAGE="${LANG_MESSAGE}
 1. Wire it now — re-run repo-init.sh with the complete current parameter set plus ${LANG_NAME}, not a one-flag add; see the memcontinuum skill for the procedure
 2. Never mention ${LANG_EXTS} here (every ${LANG_NAME} extension) — recorded permanently via --never-ext: one command when this project already records its wiring, otherwise the same full re-run as option 1 with these added to the never-list; see the memcontinuum skill for which applies
-3. Not now — nothing recorded; asked again next session"
+3. Not now — nothing is recorded; stays unwired until decided"
 
         # N3 fix round (Grok 2, LOW): build the JSON envelope BEFORE the
         # per-session mark, not after. Building it is the one step that

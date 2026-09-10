@@ -5926,12 +5926,19 @@ class TestNewFileNudgeHook(unittest.TestCase):
         self.assertIn("one command", opt2.lower())
         self.assertIn("full re-run", opt2.lower())
 
-        # Option 3: not now -- nothing recorded, asked again next session
-        # (matches the per-session dedupe this hook already builds).
+        # Option 3: not now -- nothing is recorded, stays unwired until
+        # decided. TOP-0110 L3: this hook's decision point reaches the
+        # assistant through additionalContext, never the human directly,
+        # so -- same as the SessionStart consent flow's "Not now" options
+        # -- it may not promise a future re-ask ("asked again next
+        # session"), even though the per-session dedupe this hook already
+        # builds does mean a NEW session gets a fresh chance to show it.
         self.assertTrue(opt3.startswith("3. "), ctx)
         self.assertIn("not now", opt3.lower())
-        self.assertIn("nothing recorded", opt3.lower())
-        self.assertIn("next session", opt3.lower())
+        self.assertIn("nothing is recorded", opt3.lower())
+        self.assertIn("unwired", opt3.lower())
+        self.assertNotIn("asked again", opt3.lower())
+        self.assertNotIn("next session", opt3.lower())
 
         # N1: point at the skill that documents the re-wiring/decline
         # procedures; never restate either procedure itself (INC-0117: a
