@@ -453,3 +453,53 @@ Either direction, at any point in a repo's life:
   naming the other as the reason); two conflicting owner-level rulings go
   back to the owner, and the owner's answer is recorded as a new
   `owner-verbatim` link, not inferred.
+
+## 6. The new-file nudge's language offer
+
+`hooks/newfile-nudge.sh` (newlang-nudge) can present its own three-option
+decision point directly in a `Write` hook's additionalContext,
+when a new file's extension is one this engine supports but the project has
+not wired: **wire it now**, **never mention it here again**, or **not now**.
+This is a different question than step 2's ("does this repo keep a store at
+all") and the human answers it right there, in that turn — act on whichever
+option they pick using this step, not step 3.
+
+1. **Wire it now** — this is the SAME reconfiguration step 4 already covers
+   for adding a language to an already-wired repo: recover the complete
+   current parameter set (step 4's registry-first recovery, or its
+   rendered-hooks fallback when the registry lacks it), add the new
+   language to `--langs`, and re-run `repo-init.sh --adopt-only ...
+   --record-decision` exactly as step 4 describes. Follow step 4's own
+   text; nothing here restates it.
+
+2. **Never mention it again** — the decline is per EXTENSION
+   (`--never-ext`/`MEMCONTINUUM_NEVER_EXTS`, which this hook already
+   honours before any other gate), not per language: a language with more
+   than one known extension (javascript: `.js`/`.jsx`/`.mjs`/`.cjs`) needs
+   every one of them named to actually go silent — the nudge's own option 2
+   text names them all. Recording it costs one of two different things, and
+   only this repo's registry row says which: read
+   `$MEMCONTINUUM_HOME/decisions.tsv` (step 1's own `key=` line) via
+   `mc_registry_lookup`, the same way step 4's registry-first recovery
+   already does.
+   - The row already records this repo's claude-dirs AND code-roots
+     (current-format, a `--record-decision` install) — one command:
+     `scripts/memcontinuum-update.sh --never-ext .EXT[,.EXT...] --repo REPO`
+     (dry-run first to preview; it is additive — a never-list already on
+     the row is never dropped, only extended).
+   - The row lacks claude-dirs (refuses, naming the `--apply --repo REPO
+     --claude-dir DIR [...]` migration to run first), lacks code-roots
+     (refuses `no-code-root:` — repo-init ignores `--langs`/`--never-ext`
+     with no code-root to wire them into), or there is no row at all,
+     including `decision=none` with `wiring=full` (wired before the
+     registry existed) — refuses `no-wired-row:` — `memcontinuum-update.sh`
+     refuses outright in every one of these rather than guessing at a
+     claude-dir. There is no one-command path here: recover the complete
+     current parameter set the way step 4 does, add the extension(s) to
+     `--never-ext`, and re-run the SAME full `repo-init.sh --adopt-only ...
+     --record-decision` command option 1 uses — not a shortcut, and never
+     implied as one to the human.
+
+3. **Not now** — nothing is recorded. The hook's own per-session dedupe
+   (never permanent — see its own comment) means it asks again next
+   session on its own; no action here changes that.

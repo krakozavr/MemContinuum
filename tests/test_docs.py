@@ -1343,5 +1343,62 @@ class TestSkillHonestyMutations(unittest.TestCase):
         self._assert_production_test_catches(mutated, "test_no_computed_rule_restated_in_different_wording")
 
 
+class TestNewlangDecisionPointDocumented(unittest.TestCase):
+    """N1 (owner ruling, TOP-0128): skills/memcontinuum/SKILL.md must
+    document what an agent actually runs for each of the newfile-nudge
+    hook's three answers -- section 6, added this fix round. This class
+    pins the section's presence and its most load-bearing facts (the
+    tiered --never-ext cost is the whole point of N1's honesty
+    requirement); TestSkillHonesty's own FORBIDDEN_PATTERNS/REMOVED_PHRASES
+    scans already cover this section too since they scan the whole file,
+    not just step 2 -- not duplicated here."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = SKILL.read_text()
+
+    def _section(self, start_marker, end_marker=None):
+        start = self.text.index(start_marker)
+        end = self.text.index(end_marker, start) if end_marker else len(self.text)
+        return self.text[start:end]
+
+    def _normalized_section(self, start_marker, end_marker=None):
+        # Markdown hard-wraps prose, so a pinned multi-word phrase can
+        # legitimately carry a newline+indent between two of its words
+        # without the sentence having changed -- same normalization
+        # TestSkillHonesty uses for its own multi-line phrase checks.
+        return " ".join(self._section(start_marker, end_marker).split())
+
+    def test_section_six_exists_and_names_the_three_options(self):
+        section = self._section("## 6. The new-file nudge's language offer")
+        for label in ("Wire it now", "Never mention it again", "Not now"):
+            self.assertIn(label, section, section)
+
+    def test_option_one_points_at_step_four_without_restating_it(self):
+        section = self._normalized_section("## 6. The new-file nudge's language offer")
+        self.assertIn("step 4", section)
+        # Never restate the actual re-run flags here (INC-0117) -- step 4
+        # is the one place that names them.
+        for restated_flag in ("--claude-dir DIR --project", "--record-decision ("):
+            self.assertNotIn(restated_flag, section)
+
+    def test_option_two_names_the_tiered_never_ext_cost_honestly(self):
+        section = self._normalized_section("## 6. The new-file nudge's language offer")
+        self.assertIn("--never-ext", section)
+        self.assertIn("memcontinuum-update.sh", section)
+        self.assertIn("one command", section)
+        # The conditional nature is the whole point -- must not read as
+        # unconditionally one command.
+        self.assertIn("no one-command path", section)
+        self.assertIn("no-code-root:", section)
+        self.assertIn("no-wired-row:", section)
+
+    def test_option_three_records_nothing(self):
+        section = self._normalized_section("## 6. The new-file nudge's language offer")
+        idx = section.index("3. **Not now**")
+        tail = section[idx:]
+        self.assertIn("nothing is recorded", tail)
+
+
 if __name__ == "__main__":
     unittest.main()
