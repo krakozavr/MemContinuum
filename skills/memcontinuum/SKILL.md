@@ -508,6 +508,8 @@ option they pick using this step, not step 3.
      --record-decision` command option 1 uses — not a shortcut, and never
      implied as one to the human.
 
-3. **Not now** — nothing is recorded. The hook's own per-session dedupe
-   (never permanent — see its own comment) means it asks again next
-   session on its own; no action here changes that.
+3. **Not now** — nothing is recorded; the language stays unwired until
+   decided. The hook's own per-session dedupe (never permanent — see its
+   own comment) means a later session's next matching write re-emits this
+   same decision point into the assistant's own context, the same as the
+   SessionStart detector above — not a promise that a human is re-asked.
