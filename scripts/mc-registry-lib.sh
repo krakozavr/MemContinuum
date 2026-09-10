@@ -979,6 +979,149 @@ mc_skill_copy_is_ours() {
     sed -n "1,${MC_SKILL_FM_END}p" "$dest" | grep -Fqx -- "$marker"
 }
 
+# mc_installer_wrapper_shape HOOKPATH HOOKS_DIR SCRIPT
+#
+# True (rc 0) only when HOOKPATH is EXACTLY the shape
+# scripts/repo-init.sh's install_store_hook_wrapper generates for SCRIPT
+# (found under HOOKS_DIR): five lines, no more and no fewer -- a shebang, the
+# three MEMCONTINUUM_* exports (values may be stale from an earlier install
+# with a different store/project/python -- only the KEYS are checked, so a
+# stale-but-ours wrapper still reads as ours), and an exec line naming
+# HOOKS_DIR/SCRIPT verbatim.
+#
+# Moved here (I2, updater-coverage workstream) from a private function of
+# the same shape inside scripts/repo-init.sh so scripts/memcontinuum-update.sh
+# can ask the identical "is this ours" question for its own store-hooks
+# health column -- the same reasoning mc_skill_copy_is_ours above already
+# follows: the installer's own refusal and the walker's own report must
+# agree, by construction, on what "ours" means, rather than each carrying a
+# separate copy of the check that can drift apart. repo-init.sh calls this
+# with its own $HOOKS_DIR; nothing else about its behavior changed.
+mc_installer_wrapper_shape() {
+    local hookpath="$1" hooks_dir="$2" script="$3"
+    local expected_exec line n=0
+    local -a lines=()
+    expected_exec="exec bash $(printf '%q' "$hooks_dir/$script")"
+    while IFS= read -r line || [ -n "$line" ]; do
+        lines[$n]="$line"
+        n=$((n + 1))
+    done < "$hookpath"
+    [ "$n" -eq 5 ] || return 1
+    [ "${lines[0]}" = "#!/usr/bin/env bash" ] || return 1
+    case "${lines[1]}" in
+        "export MEMCONTINUUM_ROOT="*) ;;
+        *) return 1 ;;
+    esac
+    case "${lines[2]}" in
+        "export MEMCONTINUUM_PROJECT="*) ;;
+        *) return 1 ;;
+    esac
+    case "${lines[3]}" in
+        "export MEMCONTINUUM_PYTHON="*) ;;
+        *) return 1 ;;
+    esac
+    [ "${lines[4]}" = "$expected_exec" ] || return 1
+    return 0
+}
+
+# mc_store_hook_wrapper_state HOOKPATH HOOKS_DIR SCRIPT STORE PROJECT PYTHON_BIN
+#
+# Sets MC_STORE_HOOK_STATE to one of missing/foreign/stale/ok for the store
+# git hook wrapper at HOOKPATH (STORE's post-commit or pre-commit). There is
+# no render stamp on these wrappers the way there is on a hook line, the
+# rules file or the skill copy -- they are three raw values (MEMCONTINUUM_
+# ROOT/PROJECT/PYTHON), not a template with a fingerprint comment -- so
+# currency can only be judged by re-deriving the exact bytes
+# scripts/repo-init.sh's install_store_hook_wrapper would write right now for
+# these STORE/PROJECT/PYTHON_BIN and comparing byte-for-byte. "ok" only on an
+# exact match; a shape match (mc_installer_wrapper_shape -- ours, by
+# construction the same identity repo-init.sh's own refusal uses) with
+# different bytes is "stale"; no shape match at all is "foreign"; no file at
+# all is "missing".
+mc_store_hook_wrapper_state() {
+    local hookpath="$1" hooks_dir="$2" script="$3" store="$4" project="$5" python_bin="$6"
+    local expected
+    if [ ! -f "$hookpath" ]; then
+        MC_STORE_HOOK_STATE="missing"
+        return 0
+    fi
+    if ! mc_installer_wrapper_shape "$hookpath" "$hooks_dir" "$script"; then
+        MC_STORE_HOOK_STATE="foreign"
+        return 0
+    fi
+    expected="$(
+        printf '#!/usr/bin/env bash\n'
+        printf 'export MEMCONTINUUM_ROOT=%s\n' "$(printf '%q' "$store")"
+        printf 'export MEMCONTINUUM_PROJECT=%s\n' "$(printf '%q' "$project")"
+        printf 'export MEMCONTINUUM_PYTHON=%s\n' "$(printf '%q' "$python_bin")"
+        printf 'exec bash %s\n' "$(printf '%q' "$hooks_dir/$script")"
+    )"
+    if [ "$expected" = "$(cat "$hookpath")" ]; then
+        MC_STORE_HOOK_STATE="ok"
+    else
+        MC_STORE_HOOK_STATE="stale"
+    fi
+    return 0
+}
+
+# mc_store_hooks_dir STORE
+#
+# Resolves the git hooks directory git actually consults for commits made in
+# STORE (`git -C STORE rev-parse --git-path hooks`, the same resolver
+# scripts/repo-init.sh's own git_hooks_dir_for uses), refusing (return 1)
+# when that resolves OUTSIDE STORE's own `--git-common-dir` -- a shared or
+# global core.hooksPath, the exact condition scripts/repo-init.sh itself
+# refuses to install a wrapper into (the append-only guard must never run
+# for repositories other than its own store). Sets MC_STORE_HOOKS_DIR on
+# success; MC_STORE_HOOKS_DIR_WHY (never STORE_HOOKS_DIR) on failure -- STORE
+# is not a git repository at all, or the resolved dir is outside it. A
+# caller that cannot resolve this dir has no path to check the wrappers
+# against at all, which is exactly scripts/memcontinuum-update.sh's
+# store-hooks "not-checked" case: honestly saying it cannot look, rather
+# than guessing or silently reporting nothing.
+#
+# Deliberately a fresh, independent resolution rather than repo-init.sh's
+# own git_hooks_dir_for moved here: that function's callers also carry
+# install-specific status bookkeeping (POST_COMMIT_STATUS/skipped-foreign
+# messages) this read-only lookup has no business touching, and the git
+# calls themselves are the entire function -- the same "deliberately
+# duplicated, not sourced" reasoning scripts/memcontinuum-update.sh's own
+# mc_update_resolve_python already documents for repo-init.sh's
+# resolve_python().
+mc_store_hooks_dir() {
+    local store="$1" raw resolved store_git_dir
+    MC_STORE_HOOKS_DIR=""
+    MC_STORE_HOOKS_DIR_WHY=""
+    raw="$(git -C "$store" rev-parse --git-path hooks 2>/dev/null)" || {
+        MC_STORE_HOOKS_DIR_WHY="not a git repository"
+        return 1
+    }
+    case "$raw" in
+        /*) resolved="$raw" ;;
+        *) resolved="$store/$raw" ;;
+    esac
+    store_git_dir="$(git -C "$store" rev-parse --git-common-dir 2>/dev/null)" || {
+        MC_STORE_HOOKS_DIR_WHY="could not resolve the store's git directory"
+        return 1
+    }
+    case "$store_git_dir" in
+        /*) ;;
+        *) store_git_dir="$store/$store_git_dir" ;;
+    esac
+    resolved="$(mc_physical "$resolved")"
+    store_git_dir="$(mc_physical "$store_git_dir")"
+    case "$resolved" in
+        "$store_git_dir"/*)
+            MC_STORE_HOOKS_DIR="$resolved"
+            return 0
+            ;;
+        *)
+            MC_STORE_HOOKS_DIR_WHY="core.hooksPath resolves outside the store's own .git ($resolved is outside $store_git_dir)"
+            return 1
+            ;;
+    esac
+}
+
 # mc_render_fingerprint SCOPE ENGINE_ROOT   (SCOPE: repo | machine)
 #
 # The stamp every rendered artifact carries: 12 hex characters of a sha256

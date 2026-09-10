@@ -204,10 +204,15 @@ class UpdateTestBase(unittest.TestCase):
         return Path(self.claude_dir, "settings.local.json").read_text()
 
     def table_rows(self, out):
-        lines = [l for l in out.splitlines() if l.strip()]
+        # "\t" in l excludes the trailing "machine: ..." line (reported by
+        # default since INC-0117/I1) and any other prose line the walk
+        # prints -- every real table row is genuinely tab-separated, and
+        # nothing else in this command's output is.
+        lines = [l for l in out.splitlines() if l.strip() and "\t" in l]
         self.assertTrue(lines, out)
         header = lines[0].split("\t")
-        self.assertEqual(header, ["repo", "claude-dir", "stamped", "engine", "store-match", "rules", "skill", "action"])
+        self.assertEqual(header, ["repo", "claude-dir", "stamped", "engine", "store-match",
+                                   "rules", "skill", "store-hooks", "action"])
         return [dict(zip(header, l.split("\t"))) for l in lines[1:]]
 
 
@@ -910,6 +915,18 @@ class TestAddLangAndNeverExt(UpdateTestBase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("no wired row", proc.stdout + proc.stderr)
 
+    def test_machine_and_no_machine_are_both_refused_in_targeted_mode(self):
+        """Targeted mode (--add-lang/--never-ext) acts on one repo's row and
+        never touches the machine layer -- typing either explicit flag here
+        would be silently dropped without this refusal (I1: MACHINE now
+        defaults to 1, so the refusal must key on whether the flag was
+        actually TYPED, not on MACHINE's own default-derived value)."""
+        for flag in ("--machine", "--no-machine"):
+            proc = run(UPDATE_SH, ["--add-lang", "swift", "--repo", self.repo, flag], self.home)
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn(flag, proc.stdout + proc.stderr)
+            self.assertIn("not accepted in targeted mode", proc.stdout + proc.stderr)
+
     def test_add_lang_refuses_via_repo_init_when_the_skill_copy_is_foreign(self):
         """Ruling 52: --add-lang/--never-ext call repo-init.sh directly,
         never through process_claude_dir/apply_claude_dir's own
@@ -955,16 +972,166 @@ class TestAddLangTreeSitter(UpdateTestBase):
         self.assertEqual([r[0] for r in chunks], ["f"])
 
 
+class TestStoreHooksColumn(UpdateTestBase):
+    """I2: the store-hooks column (ok/stale/missing/foreign/not-checked) for
+    STORE's git post-commit/pre-commit wrappers. Informational only -- does
+    not feed `action` or get fixed by `--apply` on its own (see
+    mc_update_store_hooks_state's comment in scripts/memcontinuum-update.sh);
+    each test here confirms only what the COLUMN reads, not any re-render."""
+
+    def _post_commit(self):
+        return Path(self.store, ".git", "hooks", "post-commit")
+
+    def _rows(self):
+        proc = run(UPDATE_SH, [], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return self.table_rows(proc.stdout)
+
+    def test_a_fresh_install_reads_ok(self):
+        self.assertEqual(self._rows()[0]["store-hooks"], "ok")
+
+    def test_a_hand_edited_wrapper_reads_stale(self):
+        """Same shape (ours), different bytes -- exactly the "python moved,
+        nothing about the wiring went stale" gap this column exists to
+        surface (see the class docstring: --apply does not fix this on its
+        own unless something else already triggers a re-render)."""
+        post = self._post_commit()
+        text = post.read_text()
+        text = re.sub(r"^export MEMCONTINUUM_PYTHON=.*$",
+                       "export MEMCONTINUUM_PYTHON='/some/other/python'",
+                       text, flags=re.M)
+        post.write_text(text)
+        self.assertEqual(self._rows()[0]["store-hooks"], "stale")
+
+    def test_a_deleted_wrapper_reads_missing(self):
+        self._post_commit().unlink()
+        self.assertEqual(self._rows()[0]["store-hooks"], "missing")
+
+    def test_a_hand_authored_wrapper_reads_foreign(self):
+        self._post_commit().write_text("#!/usr/bin/env bash\necho not ours\n")
+        self.assertEqual(self._rows()[0]["store-hooks"], "foreign")
+
+    def test_a_missing_store_reads_not_checked(self):
+        shutil.rmtree(self.store)
+        rows = self._rows()
+        self.assertEqual(rows[0]["action"], "store-missing")
+        self.assertEqual(rows[0]["store-hooks"], "not-checked")
+
+    def test_a_shared_core_hooks_path_reads_not_checked(self):
+        """The one location scripts/repo-init.sh itself refuses to install a
+        wrapper into (git resolves the store's hooks dir OUTSIDE its own
+        .git) -- this column has no safe location to inspect either, so it
+        says so rather than guessing."""
+        shared_hooks = Path(self.tmp) / "shared-hooks"
+        shared_hooks.mkdir()
+        subprocess.run(["git", "-C", self.store, "config", "--local",
+                        "core.hooksPath", str(shared_hooks)], check=True)
+        self.assertEqual(self._rows()[0]["store-hooks"], "not-checked")
+
+
 class TestMachineFlag(UpdateTestBase):
-    def test_machine_flag_refreshes_the_machine_layer_and_off_by_default(self):
+    """I1 (INC-0117): the machine layer is reported by DEFAULT now -- nobody
+    has to remember to pass --machine for the health output to say anything
+    about it. --machine is kept as an accepted, harmless compatibility
+    no-op; --no-machine is the new (rare) opt-out."""
+
+    def _machine_line(self, out):
+        for line in out.splitlines():
+            if line.startswith("machine:"):
+                return line
+        self.fail("no machine: line in output:\n" + out)
+
+    def _run_setup(self):
+        """The real memcontinuum-setup.sh, fully sandboxed (HOME=self.home,
+        same as `run()` above) -- writes only under self.home/.claude and
+        self.home/.memcontinuum, never the real machine."""
+        args = ["--no-model-warm"]
+        if VENV_PYTHON:
+            args += ["--python", VENV_PYTHON]
+        return run(SETUP_SH, args, self.home)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_a_plain_run_prints_a_machine_line_when_current_and_when_stale(self):
+        # Stale: setUp never ran memcontinuum-setup.sh, so this sandbox's
+        # machine layer does not exist yet -- stamp "none" against a real
+        # engine fingerprint can never match.
+        proc = run(UPDATE_SH, [], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertTrue(self._machine_line(proc.stdout).endswith("-- stale"),
+                         proc.stdout)
+
+        # Current: install it for real, then the same plain run reads ok.
+        setup_proc = self._run_setup()
+        self.assertEqual(setup_proc.returncode, 0, setup_proc.stdout + setup_proc.stderr)
+        proc2 = run(UPDATE_SH, [], self.home)
+        self.assertEqual(proc2.returncode, 0, proc2.stdout + proc2.stderr)
+        self.assertTrue(self._machine_line(proc2.stdout).endswith("-- ok"),
+                         proc2.stdout)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_the_machine_line_names_the_skill_copys_own_state_informationally(self):
+        """INC-0117 was exactly this artifact drifting while nothing checked
+        it directly -- only inferred through the detector hook's stamp. Also
+        proves "informational": the skill goes stale while the overall
+        verdict stays `ok` (a stamp-only re-render never touches the skill
+        copy's bytes)."""
+        setup_proc = self._run_setup()
+        self.assertEqual(setup_proc.returncode, 0, setup_proc.stdout + setup_proc.stderr)
+        proc = run(UPDATE_SH, [], self.home)
+        line = self._machine_line(proc.stdout)
+        self.assertIn("skill ok", line, line)
+
+        skill_copy = Path(self.home, ".claude", "skills", "memcontinuum", "SKILL.md")
+        skill_copy.write_text(skill_copy.read_text() + "\nhand-edited\n")
+        proc2 = run(UPDATE_SH, [], self.home)
+        line2 = self._machine_line(proc2.stdout)
+        self.assertIn("skill stale", line2, line2)
+        self.assertTrue(line2.endswith("-- ok"), line2)
+
+    def test_apply_alone_refreshes_a_stale_machine_layer_with_no_flag_needed(self):
         proc = run(UPDATE_SH, ["--apply"], self.home)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertNotIn("refreshing machine layer", proc.stdout)
-
-        proc2 = run(UPDATE_SH, ["--apply", "--machine"], self.home)
-        self.assertEqual(proc2.returncode, 0, proc2.stdout + proc2.stderr)
-        self.assertIn("refreshing machine layer", proc2.stdout)
+        self.assertIn("refreshing machine layer", proc.stdout)
         self.assertTrue(Path(self.home, ".memcontinuum", "config.sh").is_file())
+
+    def test_machine_flag_is_still_accepted_and_still_refreshes(self):
+        """Compatibility: a caller that already types --machine keeps
+        working identically -- the flag is a no-op now, not a removal."""
+        proc = run(UPDATE_SH, ["--apply", "--machine"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("refreshing machine layer", proc.stdout)
+        self.assertTrue(Path(self.home, ".memcontinuum", "config.sh").is_file())
+
+    def test_no_machine_suppresses_both_the_report_and_the_refresh(self):
+        proc = run(UPDATE_SH, ["--no-machine"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("machine:", proc.stdout)
+
+        proc2 = run(UPDATE_SH, ["--apply", "--no-machine"], self.home)
+        self.assertEqual(proc2.returncode, 0, proc2.stdout + proc2.stderr)
+        self.assertNotIn("refreshing machine layer", proc2.stdout)
+        self.assertNotIn("machine:", proc2.stdout)
+        self.assertFalse(Path(self.home, ".memcontinuum", "config.sh").is_file(),
+                          "--no-machine must never run memcontinuum-setup.sh")
+
+    def test_machine_and_no_machine_together_is_refused(self):
+        proc = run(UPDATE_SH, ["--machine", "--no-machine"], self.home)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("contradictory", proc.stderr)
+        self.assertFalse(Path(self.home, ".memcontinuum", "config.sh").is_file())
+
+    def test_a_plain_run_writes_nothing_under_home(self):
+        """The other half of I1's contract: reporting the machine layer by
+        default must never itself write -- only --apply may."""
+        before = {p: (p.is_dir(), None if p.is_dir() else p.stat().st_mtime_ns)
+                  for p in Path(self.home).rglob("*")}
+        proc = run(UPDATE_SH, [], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        after = {p: (p.is_dir(), None if p.is_dir() else p.stat().st_mtime_ns)
+                 for p in Path(self.home).rglob("*")}
+        self.assertEqual(before, after,
+                          "a plain (read-only) run must not create, remove, "
+                          "or modify anything under HOME")
 
 
 class TestMachineDependencyReconciliation(UpdateTestBase):
@@ -1744,7 +1911,7 @@ class TestMigrationNeverGuessesTheClaudeDirSet(unittest.TestCase):
         self.assertIn("--claude-dir", combined)
 
     def assertTableProposes(self, proc):
-        lines = [l for l in proc.stdout.splitlines() if l.strip()]
+        lines = [l for l in proc.stdout.splitlines() if l.strip() and "\t" in l]
         header = lines[0].split("\t")
         return [dict(zip(header, l.split("\t"))) for l in lines[1:]]
 
@@ -2045,7 +2212,7 @@ class TestPathsWithSpaces(unittest.TestCase):
 
         proc = run(UPDATE_SH, [], self.home)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        lines = [l for l in proc.stdout.splitlines() if l.strip()]
+        lines = [l for l in proc.stdout.splitlines() if l.strip() and "\t" in l]
         rows = [dict(zip(lines[0].split("\t"), l.split("\t"))) for l in lines[1:]]
         self.assertEqual(len(rows), 1, proc.stdout)
         self.assertEqual(rows[0]["claude-dir"], self.claude_dir, proc.stdout)
@@ -2147,7 +2314,7 @@ class TestRulesMarkerComesFromTheTemplate(unittest.TestCase):
                     "--claude-dir", claude_dir], home)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         proc = run(engine / "scripts" / "memcontinuum-update.sh", [], home)
-        lines = [l for l in proc.stdout.splitlines() if l.strip()]
+        lines = [l for l in proc.stdout.splitlines() if l.strip() and "\t" in l]
         rows = [dict(zip(lines[0].split("\t"), l.split("\t"))) for l in lines[1:]]
         self.assertEqual(rows[0]["rules"], "ok", proc.stdout)
         self.assertNotEqual(rows[0]["rules"], "foreign", proc.stdout)
@@ -2206,7 +2373,7 @@ class TestSkillMarkerComesFromTheTemplate(unittest.TestCase):
                     "--claude-dir", claude_dir], home)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         proc = run(engine / "scripts" / "memcontinuum-update.sh", [], home)
-        lines = [l for l in proc.stdout.splitlines() if l.strip()]
+        lines = [l for l in proc.stdout.splitlines() if l.strip() and "\t" in l]
         rows = [dict(zip(lines[0].split("\t"), l.split("\t"))) for l in lines[1:]]
         self.assertEqual(rows[0]["skill"], "ok", proc.stdout)
         self.assertNotEqual(rows[0]["skill"], "foreign", proc.stdout)
@@ -2429,7 +2596,7 @@ class TestRenderFingerprint(unittest.TestCase):
 
         def action():
             p = run(self.engine / "scripts" / "memcontinuum-update.sh", [], home)
-            lines = [l for l in p.stdout.splitlines() if l.strip()]
+            lines = [l for l in p.stdout.splitlines() if l.strip() and "\t" in l]
             rows = [dict(zip(lines[0].split("\t"), l.split("\t"))) for l in lines[1:]]
             return rows[0]["action"], p.stdout
 
@@ -3201,7 +3368,7 @@ class TestAnUnknownFingerprintNeverComparesEqual(unittest.TestCase):
 
         engine = self._crippled_engine()
         proc = run(engine / "scripts" / "memcontinuum-update.sh", [], self.home)
-        lines_out = [l for l in proc.stdout.splitlines() if l.strip()]
+        lines_out = [l for l in proc.stdout.splitlines() if l.strip() and "\t" in l]
         header = lines_out[0].split("\t")
         row = dict(zip(header, lines_out[1].split("\t")))
         self.assertEqual(row["engine"], "unknown", proc.stdout)
@@ -3894,11 +4061,159 @@ class TestAnEmptyClaudeDirIsNotASilentNoOp(UpdateTestBase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
 
+class TestUpdaterCoversEveryRenderedArtifact(unittest.TestCase):
+    """I2 (updater-coverage workstream, generalizing INC-0107): every
+    artifact scripts/repo-init.sh renders or installs into a project must
+    show up in memcontinuum-update.sh's health output as current, stale, or
+    explicitly not-checked -- never simply absent, because absence and
+    health read identically to a human scanning the table.
+
+    This derives the artifact list BEHAVIORALLY -- a real repo-init.sh run's
+    own before/after filesystem diff under STORE and CLAUDE_DIR -- rather
+    than from a hand-copied list living in this file. A hand-copied constant
+    is exactly the kind of thing that silently stops matching reality the
+    next time repo-init.sh grows a new rendered file; a snapshot of what it
+    actually wrote cannot go stale that way.
+
+    What this canNOT catch (stated plainly, since a fully mechanical
+    derivation of "every artifact, and where it is properly accounted for"
+    is not possible): the mapping from a discovered path to the cell/line
+    that is supposed to account for it is still hand-maintained, in
+    `_unaccounted_for` below, and matched on the FULL relative path (never
+    just a basename -- a basename-only match would wave through a SECOND
+    settings.local.json, rules file, skill copy, or wrapper rendered at some
+    OTHER location on the strength of the ordinary one's column, which is
+    exactly "repo-init.sh grows a new rendered artifact" in disguise). A new
+    artifact at a path this test does not recognize fails LOUDLY, by
+    design -- naming the exact path nobody taught this test about -- but
+    making the failure go away still needs a human to (a) add a mapping
+    entry AND (b) confirm memcontinuum-update.sh's own output genuinely
+    reports that artifact (current/stale/not-checked), not merely teach this
+    test to stop complaining. What IS mechanical: whether the mapped
+    cell/line for an artifact that already has one is actually present in
+    THIS run's real health output is checked for real, not assumed. What
+    this still does NOT do: re-verify that an already-mapped artifact's
+    column is CORRECT (only that the mechanism exists) -- that correctness
+    is what the rest of this file's dedicated per-column tests are for.
+    """
+
+    def setUp(self):
+        self.tmp = tmpdir("memcontinuum-coverage-test-")
+        self.home = str(Path(self.tmp) / "home")
+        os.makedirs(self.home, exist_ok=True)
+        self.repo = git_repo(str(Path(self.tmp) / "repo"))
+        self.store = str(Path(self.tmp) / "store")
+        self.claude_dir = str(Path(self.repo) / ".claude")
+
+    def _snapshot(self):
+        """Every non-directory path under STORE/CLAUDE_DIR repo-init.sh
+        could plausibly have written, as (root_label, relative_path) pairs.
+        `.git/**` is excluded (git's own plumbing, not repo-init.sh's doing)
+        EXCEPT the two wrapper files repo-init.sh itself writes there
+        (`.git/hooks/post-commit`/`pre-commit`) -- kept explicitly, since
+        those two are exactly the artifacts this task added coverage for.
+        `*.bak-memcontinuum` backups and the skill's stamping temp file are
+        excluded too -- preservation copies and a mid-write scratch file,
+        neither a rendered artifact in its own right."""
+        found = set()
+        for label, root in (("store", self.store), ("claude", self.claude_dir)):
+            rp = Path(root)
+            if not rp.is_dir():
+                continue
+            for p in rp.rglob("*"):
+                if p.is_dir():
+                    continue
+                rel = p.relative_to(rp)
+                parts = rel.parts
+                if ".git" in parts:
+                    if (len(parts) == 3 and parts[0] == ".git" and parts[1] == "hooks"
+                            and parts[2] in ("post-commit", "pre-commit")):
+                        found.add((label, str(rel)))
+                    continue
+                name = rel.name
+                if name.endswith(".bak-memcontinuum") or "tmp-memcontinuum-stamp" in name:
+                    continue
+                found.add((label, str(rel)))
+        return found
+
+    def _unaccounted_for(self, label, rel, store, claude_dir, health_output):
+        """None if (label, rel) -- the FULL relative path, not just its
+        basename (see the class docstring for why that distinction matters)
+        -- is accounted for somewhere in `health_output`; else a reason
+        string. The hand-maintained half of this test."""
+        header = health_output.split("\n", 1)[0]
+        footer = next((l for l in health_output.splitlines()
+                       if l.startswith("not-checked:")), "")
+        rules_rel = str(Path("rules") / "memcontinuum.md")
+        skill_rel = str(Path("skills") / "memory-search" / "SKILL.md")
+        post_rel = str(Path(".git") / "hooks" / "post-commit")
+        pre_rel = str(Path(".git") / "hooks" / "pre-commit")
+
+        if (label, rel) in {("claude", "settings.local.json"),
+                            ("claude", rules_rel), ("claude", skill_rel)}:
+            # The table's own stamped/engine, rules, and skill columns --
+            # their existence (the header always carries these names) and
+            # correctness are exhaustively covered elsewhere in this file;
+            # this test's job is only "is there a mechanism at all", which
+            # there manifestly is for exactly these three known paths.
+            return None
+        if (label, rel) in {("store", post_rel), ("store", pre_rel)}:
+            return None if "store-hooks" in header else \
+                "store-hooks column missing from the header"
+        if (label, rel) in {("store", "README.md"), ("store", ".gitignore")}:
+            full = str(Path(store) / rel)
+            return (None if full in footer else
+                    f"{full} not named in the not-checked footer")
+        if label == "store" and Path(rel).name == ".gitkeep":
+            parent = str(Path(rel).parent)  # e.g. "topics" or "inbox/codex"
+            if store in footer and parent in footer:
+                return None
+            return f"store tree entry {rel} not named in the not-checked footer"
+        return (f"no mapping at all for {label}:{rel} -- a NEW artifact "
+                "type, or a NEW LOCATION for a known one, repo-init.sh grew")
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_every_rendered_artifact_is_accounted_for(self):
+        before = self._snapshot()
+        proc = run(INSTALL_SH, [
+            "--project", "cov", "--store", self.store, "--claude-dir", self.claude_dir,
+            "--non-interactive",
+        ], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        after = self._snapshot()
+        created = after - before
+        self.assertTrue(created, "repo-init.sh created nothing -- this test's own snapshot is broken")
+
+        proc = run(DECIDE_SH, [
+            "wired", "--repo", self.repo, "--store", self.store, "--project", "cov",
+            "--claude-dir", self.claude_dir,
+        ], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+        proc = run(UPDATE_SH, [], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        health_output = proc.stdout
+
+        unaccounted = []
+        for label, rel in sorted(created):
+            reason = self._unaccounted_for(label, rel, self.store, self.claude_dir, health_output)
+            if reason is not None:
+                unaccounted.append(reason)
+        self.assertFalse(
+            unaccounted,
+            "repo-init.sh created artifact(s) memcontinuum-update.sh's health "
+            "output does not account for -- add a cell/line for each, and "
+            "teach _unaccounted_for above once memcontinuum-update.sh "
+            f"actually reports them:\n  " + "\n  ".join(unaccounted),
+        )
+
+
 class TestHelp(unittest.TestCase):
     def test_help_exits_zero_and_documents_the_flags(self):
         proc = subprocess.run([MC_BASH, str(UPDATE_SH), "--help"], capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        for token in ("--dry-run", "--apply", "--machine", "--add-lang", "--never-ext", "--repo"):
+        for token in ("--dry-run", "--apply", "--machine", "--no-machine",
+                      "--add-lang", "--never-ext", "--repo"):
             self.assertIn(token, proc.stdout, token)
 
     def test_bash_n(self):
