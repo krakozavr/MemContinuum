@@ -410,6 +410,32 @@ if [ -n "$NEVER_EXTS" ] && _ext_matches "$FILE_PATH" "$NEVER_EXTS"; then
     finish "never-extension"
 fi
 
+# newlang-nudge (reviewer re-raise, round 2): chunkers.COMPOUND_EXCLUDES
+# (chunkers/__init__.py) means a file like foo.d.ts is NEVER typescript --
+# chunkers.lang_for_path checks COMPOUND_EXCLUDES FIRST, unconditionally,
+# before it ever consults LANGUAGE_TABLE, and wiring typescript does not
+# change that: lang_for_source_file (memidx.py), "the single resolution
+# rule the whole code-index side shares", calls lang_for_path first too.
+# WIRED_EXTS/KNOWN_EXTS above are rendered straight from
+# chunkers.known_extensions()/wired_extensions() -- plain per-language
+# extension tuples with no compound-extension awareness at all -- so the
+# glob `*.ts` (a real, rendered pattern) matches `foo.d.ts` just as
+# readily as `thing.ts`; a shell case pattern has no notion of "compound".
+# Left unchecked this would (a) nudge "wire typescript" for a file wiring
+# typescript will never actually cause to be indexed, and (b), symmetrically,
+# tell the user a .min.js/.blade.php write is safely covered by an
+# already-wired javascript/php -- equally false, same root cause. Mirrors
+# chunkers.COMPOUND_EXCLUDES verbatim (not a new policy) and is checked
+# here, ahead of BOTH the wired-reminder and the known-but-unwired-nudge
+# branches below, so neither can name/imply a language for a file the
+# engine will never classify as that language. tests/test_write_hooks.py's
+# own registry-driven test runs the real hook against the real
+# chunkers.COMPOUND_EXCLUDES set, so a new/changed entry there cannot
+# drift silently the way INC-0117's stale copy did for LANGUAGE_TABLE.
+case "$FILE_PATH" in
+    *.blade.php | *.d.ts | *.min.js) finish "not-indexed-extension" ;;
+esac
+
 if ! _ext_matches "$FILE_PATH" "$WIRED_EXTS"; then
     if _ext_matches "$FILE_PATH" "$KNOWN_EXTS"; then
         # newlang-nudge: the DETECTION outcome below is unchanged from

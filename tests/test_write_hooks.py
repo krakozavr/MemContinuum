@@ -6278,6 +6278,70 @@ class TestNewFileNudgeHook(unittest.TestCase):
                     f"in the nudge: {ctx!r}",
                 )
 
+    def test_compound_excluded_extensions_never_nudge_or_wire(self):
+        """Reviewer re-raise (round 2): chunkers.COMPOUND_EXCLUDES
+        (chunkers/__init__.py) means a file like foo.d.ts is NEVER
+        typescript -- chunkers.lang_for_path checks COMPOUND_EXCLUDES
+        FIRST, unconditionally, before it ever consults LANGUAGE_TABLE,
+        and wiring typescript does not change that (verified directly:
+        memidx.lang_for_source_file, "the single resolution rule the
+        whole code-index side shares", calls chunkers.lang_for_path
+        first). The hook's own WIRED_EXTS/KNOWN_EXTS globs are rendered
+        straight from chunkers.known_extensions()/wired_extensions(),
+        plain per-language extension tuples with no compound-extension
+        awareness -- a bash `*.ts` case pattern matches `foo.d.ts` just
+        as readily as `thing.ts`. Registry-driven against the real
+        chunkers.COMPOUND_EXCLUDES set (not a hardcoded list here) so a
+        new/changed compound entry cannot drift silently, mirroring
+        test_language_name_matches_the_engine_registry_for_every_known_language
+        just above."""
+        for compound in sorted(chunkers.COMPOUND_EXCLUDES):
+            host_ext = os.path.splitext(compound)[1]  # ".d.ts" -> ".ts"
+
+            # (a) the host extension KNOWN but not WIRED: must stay
+            # silent -- never the language-available-not-wired nudge,
+            # which would otherwise name a language wiring won't help.
+            env_known = self.base_env(
+                MEMCONTINUUM_LANG_EXTS="*.py",
+                MEMCONTINUUM_KNOWN_EXTS=f"*.py *{host_ext}",
+            )
+            target_known = self.code_root / f"probe-known-{compound.replace('.', '_')}{compound}"
+            proc_known, _elapsed = run_script(
+                NEWFILE_NUDGE_HOOK,
+                self.payload_for(str(target_known), session_id=f"s-compound-known-{compound}"),
+                env_known,
+            )
+            self.assertEqual(proc_known.returncode, 0, proc_known.stderr)
+            self.assertEqual(proc_known.stdout.strip(), "", f"{compound}: {proc_known.stdout}")
+            log_text = (self.home / "hook.log").read_text()
+            self.assertIn(
+                "outcome=not-indexed-extension", log_text,
+                f"{compound}: {log_text}",
+            )
+            self.assertNotIn(
+                "outcome=language-available-not-wired", log_text,
+                f"{compound}: {log_text}",
+            )
+
+            # (b) the host extension WIRED: must also stay silent --
+            # never the plain "New source file under" reminder, which
+            # would falsely claim code-search covers this file.
+            (self.home / "hook.log").unlink()
+            env_wired = self.base_env(MEMCONTINUUM_LANG_EXTS=f"*{host_ext}")
+            target_wired = self.code_root / f"probe-wired-{compound.replace('.', '_')}{compound}"
+            proc_wired, _elapsed2 = run_script(
+                NEWFILE_NUDGE_HOOK,
+                self.payload_for(str(target_wired), session_id=f"s-compound-wired-{compound}"),
+                env_wired,
+            )
+            self.assertEqual(proc_wired.returncode, 0, proc_wired.stderr)
+            self.assertEqual(proc_wired.stdout.strip(), "", f"{compound}: {proc_wired.stdout}")
+            log_text2 = (self.home / "hook.log").read_text()
+            self.assertIn(
+                "outcome=not-indexed-extension", log_text2,
+                f"{compound}: {log_text2}",
+            )
+
 
 class TestF2AutoCallers(unittest.TestCase):
     """F2 (coordinator ruling 69): the --auto callers -- unmapped's
