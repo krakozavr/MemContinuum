@@ -48,14 +48,14 @@ what the repo's `.claude` settings actually contain right now, plus
 settings file or an interrupted install can leave them disagreeing. It also
 prints a combined `state=` line -- `wired`, `declined`, `partial-wired` (no
 recorded decision, and only SOME of the always-wired hooks are present --
-SessionStart's detector DOES ask here, same as `undecided`: a half-wired
-repo with no recorded decision is still an open question, not a settled
-one), `undecided`, `not-a-repo`, or `no-config` -- plus the repo key, store
-path and project name where they apply. `wired` also covers an install
-wired before the decision registry existed: `decision=none` with
-`wiring=full` reads as already wired, since the wiring itself is the
-evidence. Report `decision`/`wiring` plainly when they disagree; never guess
-either one from the presence of a directory.
+SessionStart's detector emits its ask into the assistant's context here too,
+same as `undecided`: a half-wired repo with no recorded decision is still an
+open question, not a settled one), `undecided`, `not-a-repo`, or `no-config`
+-- plus the repo key, store path and project name where they apply. `wired`
+also covers an install wired before the decision registry existed:
+`decision=none` with `wiring=full` reads as already wired, since the wiring
+itself is the evidence. Report `decision`/`wiring` plainly when they
+disagree; never guess either one from the presence of a directory.
 
 ## 2. Ask — a structured prompt for every state, never destructive by accident
 
