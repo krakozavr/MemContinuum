@@ -25,10 +25,15 @@ Contents: [hooks](#hooks-and-the-fail-open-contract) ·
 ## Hooks and the fail-open contract
 
 Ten hook scripts live under `hooks/`, alongside three shared libraries
-(`memlib.sh`, sourced by the five write-side hooks; `mc-watchdog.sh`; and
+(`memlib.sh`, sourced unconditionally by the five write-side hooks; `mc-watchdog.sh`; and
 `mc-path-lib.sh`, one pure side-effect-free function -- symlink-safe
 containment -- sourced by `memlib.sh` and directly by `newfile-nudge.sh`,
-which needs it but deliberately does not source `memlib.sh` itself).
+which needs it unconditionally but deliberately does not source `memlib.sh`
+for that. `newfile-nudge.sh` does lazily source `memlib.sh` on its own rare
+known-but-unwired-language branch (newlang-nudge), to reuse
+`mc_state_file_for`/`mc_update_state_json` for that nudge's per-session
+dedupe -- never on the common already-wired path, which still pays nothing
+extra).
 Seven of the ten are wired into a project's
 `.claude/settings.local.json` by `scripts/repo-init.sh`; `post-commit-reindex.sh`
 and `pre-commit-append-only.sh` are invoked from the store's own git
@@ -38,7 +43,7 @@ wired one level up, into `~/.claude/settings.json`, by `memcontinuum-setup.sh`.
 | script | event | does |
 |---|---|---|
 | `pre-edit-chain.sh` | `PreToolUse` (Edit/Write, filtered to `--code-root`) | `for-path` lookup on the file being edited; injects matching chains as `additionalContext` |
-| `newfile-nudge.sh` | `PreToolUse` (Write only, filtered to `--code-root`) | fires only when the write target does not exist yet and its extension is wired for this project; injects one reminder to search the code index first |
+| `newfile-nudge.sh` | `PreToolUse` (Write only, filtered to `--code-root`) | fires only when the write target does not exist yet and its extension is wired for this project; injects one reminder to search the code index first. Separately (newlang-nudge): when the extension is one the engine supports but this project never wired, injects a structured, numbered decision point (wire it / decline it permanently via `--never-ext` / not now) naming the language -- deduped once per language per session. The log-only DETECTION outcome (`outcome=language-available-not-wired`) still fires on every occurrence regardless of `--code-root`, unchanged and pre-existing; the VISIBLE decision point is gated on the SAME `--code-root` containment as the wired-file reminder |
 | `ledger-post-edit.sh` | `PostToolUse` (every tool; no settings-level matcher) | a bash-only prefilter exits before the watchdog for read-only built-ins (`Read`, `Grep`, ...); `Edit`/`Write`/`MultiEdit`/`NotebookEdit` ledger the tool's own file path (`source: tool`); `Bash` and any tool this hook has no dedicated branch for fall through to a shell-diff (`git status`) tree comparison against a per-root baseline (`source: shell-diff`); an unrecognized or missing `tool_name` additionally logs `outcome=unsupported-mutation-surface` |
 | `precompact-persist.sh` | `PreCompact` | persists session state before context is compacted away |
 | `sessionstart-remind.sh` | `SessionStart` | on `startup`/`resume`/`clear`, initializes session state only (captures the code/store roots' git HEAD, prunes state older than 24h; `clear` resets the session's counters and pending nudges but carries the edit ledger over, `resume` keeps everything); only on `source: compact` does it inject what `precompact-persist.sh` left pending |
