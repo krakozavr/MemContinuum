@@ -27,13 +27,13 @@ README = TOOLS_DIR / "README.md"
 
 
 class TestReleaseHygiene(unittest.TestCase):
-    def test_pyproject_version_is_0_2_0rc4(self):
+    def test_pyproject_version_is_0_2_0rc5(self):
         text = PYPROJECT.read_text()
-        self.assertIn('version = "0.2.0rc4"', text)
+        self.assertIn('version = "0.2.0rc5"', text)
 
     def test_changelog_exists_and_mentions_the_version(self):
         self.assertTrue(CHANGELOG.exists())
-        self.assertIn("0.2.0rc4", CHANGELOG.read_text())
+        self.assertIn("0.2.0rc5", CHANGELOG.read_text())
 
     def test_pyproject_python_floor_is_3_12(self):
         text = PYPROJECT.read_text()

@@ -709,11 +709,13 @@ class TestReadmeLookupLatencyClaim(unittest.TestCase):
 class TestInternalsDocumentsPreEditTopicsLogging(unittest.TestCase):
     """eval-topic-logging: a matched hook.log line now names which topic
     ids were injected -- INTERNALS' "Logging, per hook" section must say so,
-    name the cap, and say why (retrieval quality can be graded later), and
-    CHANGELOG.md must record the change under a new Unreleased heading
-    without touching the already-released rc4 section. No real `TOP-nnnn`-
-    shaped store record id may appear in either (public-docs doctrine) --
-    `TOP-nnnn` is the placeholder used instead."""
+    name the cap, and say why (retrieval quality can be graded later).
+    CHANGELOG.md recorded the change under a new Unreleased heading without
+    touching the already-released rc4 section; that heading is now the
+    released 0.2.0rc5 section, still above rc4 and still untouched from
+    there down. No real `TOP-nnnn`-shaped store record id may appear in
+    either (public-docs doctrine) -- `TOP-nnnn` is the placeholder used
+    instead."""
 
     def test_internals_documents_the_topics_field_and_its_cap(self):
         text = INTERNALS.read_text()
@@ -727,21 +729,21 @@ class TestInternalsDocumentsPreEditTopicsLogging(unittest.TestCase):
         snippet = text[max(0, idx - 200):idx + 400]
         self.assertIn("TOP-nnnn", snippet)
 
-    def test_changelog_has_an_unreleased_heading_above_rc4(self):
+    def test_changelog_has_an_rc5_heading_above_rc4(self):
         text = CHANGELOG.read_text()
-        self.assertIn("## [Unreleased]", text)
-        unreleased_idx = text.index("## [Unreleased]")
+        self.assertIn("## [0.2.0rc5]", text)
+        rc5_idx = text.index("## [0.2.0rc5]")
         rc4_idx = text.index("## [0.2.0rc4]")
         self.assertLess(
-            unreleased_idx, rc4_idx,
-            "Unreleased must sit above the already-released rc4 section",
+            rc5_idx, rc4_idx,
+            "0.2.0rc5 must sit above the already-released rc4 section",
         )
 
-    def test_changelog_unreleased_section_mentions_topics_logging(self):
+    def test_changelog_rc5_section_mentions_topics_logging(self):
         text = CHANGELOG.read_text()
-        unreleased_idx = text.index("## [Unreleased]")
+        rc5_idx = text.index("## [0.2.0rc5]")
         rc4_idx = text.index("## [0.2.0rc4]")
-        section = text[unreleased_idx:rc4_idx]
+        section = text[rc5_idx:rc4_idx]
         self.assertIn("topics=", section)
 
     def test_internals_documents_rotation_env_var_and_two_file_policy(self):
@@ -756,11 +758,11 @@ class TestInternalsDocumentsPreEditTopicsLogging(unittest.TestCase):
         self.assertIn("stats", snippet.lower())
         self.assertRegex(snippet, r"gone|lost|discarded")
 
-    def test_changelog_unreleased_section_mentions_rotation(self):
+    def test_changelog_rc5_section_mentions_rotation(self):
         text = CHANGELOG.read_text()
-        unreleased_idx = text.index("## [Unreleased]")
+        rc5_idx = text.index("## [0.2.0rc5]")
         rc4_idx = text.index("## [0.2.0rc4]")
-        section = text[unreleased_idx:rc4_idx]
+        section = text[rc5_idx:rc4_idx]
         self.assertIn("hook.log.1", section)
 
     def test_rc4_section_untouched(self):
