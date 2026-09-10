@@ -620,6 +620,60 @@ class TestInternalsDocumentsPreEditChainWatchdog(unittest.TestCase):
         self.assertRegex(text, r"not\s+established")
         self.assertIn("watchdog-killed", text)
 
+    def test_the_10x_headroom_figure_is_not_left_standing_as_the_whole_story(self):
+        """Claims-audit item: the 34-sample controlled measurement above is
+        real and stays -- but a read of an actual machine's hook.log shows
+        real per-project variance the controlled run never saw, including
+        the inner watchdog firing outright. The lab figure must not be the
+        only thing this section says about how long a lookup actually takes
+        on a real machine."""
+        text = INTERNALS.read_text()
+        idx = text.index("roughly 10x headroom")
+        section = text[idx:idx + 900]
+        self.assertIn("hook.log", section)
+        self.assertIn("watchdog itself having fired", section)
+        self.assertRegex(section, r"2x")
+
+
+class TestReadmeLookupLatencyClaim(unittest.TestCase):
+    """Claims-audit item: the pre-edit lookup paragraph used to name the
+    same 34-sample controlled figure (see
+    TestInternalsDocumentsPreEditChainWatchdog) as what "a real lookup
+    measures", full stop. A real machine's hook.log shows that number
+    holding for some projects and not others -- a distribution, not a
+    constant a static string can usefully pin. This class holds two
+    things a test CAN check without depending on a fresh hook.log read of
+    its own: the retired absolute claim never comes back, and the
+    replacement still names the watchdog deadline and admits real lookups
+    are not uniformly fast. It deliberately does NOT try to pin a number
+    -- "some real lookups run close to a second" is not a fact a string
+    match can verify, only a hook.log read can, and that read is a
+    one-time claims-audit finding, not a repeatable test fixture.
+    """
+
+    def test_no_longer_claims_the_lab_figure_as_what_every_lookup_measures(self):
+        # \s+ (not a literal space) between words: README.md hard-wraps its
+        # prose, so this exact phrase spans a line break in the source
+        # ("...of a\nsecond...") -- a literal-space match would silently
+        # never fire, before or after a fix, which defeats the whole point
+        # of this test.
+        text = README.read_text()
+        self.assertNotRegex(
+            text, r"measures\s+in\s+the\s+low\s+tenths\s+of\s+a\s+second",
+            "README must not present a single controlled-measurement "
+            "figure as what a real lookup measures -- production "
+            "hook.log data varies sharply by which project's store is "
+            "asking.",
+        )
+
+    def test_deadline_sentence_still_names_the_watchdog_and_admits_a_slow_tail(self):
+        text = README.read_text()
+        idx = text.index("watchdog deadline")
+        section = text[max(0, idx - 20):idx + 320]
+        self.assertIn("2-second", section)
+        self.assertIn("project", section)
+        self.assertIn("deadline itself", section)
+
 
 class TestInternalsDocumentsPreEditTopicsLogging(unittest.TestCase):
     """eval-topic-logging: a matched hook.log line now names which topic

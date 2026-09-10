@@ -58,8 +58,11 @@ effort is to notice it afterwards, from a tree diff, and record it in the
 edit ledger, never to block the change over it — though one committed away
 in the same breath, or made under a path git ignores, is not seen at all.
 That lookup runs under a
-2-second watchdog deadline — a real lookup measures in the low tenths of a
-second, comfortably under it; a stale-but-present index is not one of the
+2-second watchdog deadline — a real lookup usually takes a fraction of a
+second, but not always: it depends on which project's store is being
+asked, and some stores run closer to a full second and occasionally past
+it (the deadline itself fires on well under one percent of all lookups); a
+stale-but-present index is not one of the
 fail-open cases: it still answers from whatever it has, which is why keeping
 it current (`reindex`, or just committing the store) is worth doing. Nothing
 in this tool can stop you from working.
