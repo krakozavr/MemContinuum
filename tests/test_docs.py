@@ -620,6 +620,91 @@ class TestInternalsDocumentsPreEditChainWatchdog(unittest.TestCase):
         self.assertRegex(text, r"not\s+established")
         self.assertIn("watchdog-killed", text)
 
+    def test_stale_2x_headroom_claim_is_gone_and_not_replaced_by_a_new_number(self):
+        """Claims-audit correction (dated-rows fix): the paragraph this
+        section used to carry -- "headroom nearer 2x than 10x on the
+        busiest real store" -- read a hook.log window from before that
+        store's own move off a Windows drive, then compared it against
+        where the store lives *today*. That is a comparison of two
+        different configurations, not a production measurement, and it
+        does not get corrected into some other multiplier: it is
+        withdrawn. The 34-sample controlled figure is real and stays; a
+        pointer to read a store's own current hook.log (not a number
+        pinned here) replaces the retired claim."""
+        text = INTERNALS.read_text()
+        self.assertIn("roughly 10x headroom", text)
+        self.assertNotIn("nearer 2x than 10x", text)
+        self.assertNotRegex(text, r"headroom\s+nearer\s+2x")
+        self.assertNotIn("0.84", text)
+        self.assertNotIn("7.3%", text)
+        idx = text.index("roughly 10x headroom")
+        section = text[idx:idx + 1300]
+        self.assertIn("hook.log", section)
+        self.assertIn("README", section)
+        self.assertIn("withdrawn", section)
+
+
+class TestReadmeLookupLatencyClaim(unittest.TestCase):
+    """Claims-audit item, corrected a second time (dated-rows fix): the
+    pre-edit lookup paragraph first named a single controlled figure as
+    what "a real lookup measures", full stop -- then, in a first fix
+    round, replaced it with unattributed real-machine variance ("some
+    stores run closer to a full second") built from a hook.log read that
+    never checked row dates against a store migration that happened
+    since. Both retired phrasings must never come back. The current
+    paragraph instead names a dated sample size, says plainly that store
+    location (not the lookup itself) sets the number, names the Windows-
+    drive case as fixed, and flags the figures as an early, short window
+    that gets refreshed next release -- this class pins those elements,
+    sample size included. The sample size is pinned exactly (not a
+    tolerance) on purpose: it must move in lockstep with the README the
+    next time these figures are refreshed, not silently drift out of
+    sync with it.
+    """
+
+    def test_no_longer_claims_the_lab_figure_as_what_every_lookup_measures(self):
+        # \s+ (not a literal space) between words: README.md hard-wraps its
+        # prose, so this exact phrase spans a line break in the source
+        # ("...of a\nsecond...") -- a literal-space match would silently
+        # never fire, before or after a fix, which defeats the whole point
+        # of this test.
+        text = README.read_text()
+        self.assertNotRegex(
+            text, r"measures\s+in\s+the\s+low\s+tenths\s+of\s+a\s+second",
+            "README must not present a single controlled-measurement "
+            "figure as what a real lookup measures -- production "
+            "hook.log data varies sharply by which project's store is "
+            "asking.",
+        )
+        # The first-round fix's own unattributed-variance phrasing must not
+        # return either: it read hook.log rows spanning a store migration
+        # without checking their dates against it.
+        self.assertNotRegex(
+            text, r"some\s+stores\s+run\s+closer\s+to\s+a\s+full\s+second",
+            "README must not restate the undated real-machine-variance "
+            "claim -- that reading mixed pre-migration and post-migration "
+            "rows for the same store.",
+        )
+
+    def test_deadline_sentence_names_sample_size_and_what_governs_it(self):
+        text = README.read_text()
+        idx = text.index("watchdog deadline")
+        section = text[max(0, idx - 20):idx + 900]
+        self.assertIn("2-second", section)
+        self.assertIn("project", section)
+        self.assertIn("deadline itself", section)
+        # Sample size behind the figure, dated by construction (it is read
+        # fresh, not carried over from before the store migration).
+        self.assertRegex(section, r"\b105\b")
+        # What governs the number -- store location, not the lookup itself
+        # -- and that the slow case (a Windows drive) is already fixed.
+        self.assertIn("Windows drive", section)
+        self.assertIn("installer", section)
+        # The limited-window caveat: these are early figures, not a
+        # settled constant.
+        self.assertIn("short window", section)
+        self.assertIn("refreshed", section)
+
 
 class TestInternalsDocumentsPreEditTopicsLogging(unittest.TestCase):
     """eval-topic-logging: a matched hook.log line now names which topic

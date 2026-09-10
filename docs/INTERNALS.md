@@ -1195,6 +1195,20 @@ own per-hook `timeout` field defaults to 600 seconds when unset
 rendered `"timeout": 5` is a backstop against a hung watchdog itself, not the
 mechanism meant to fire — the inner 2-second budget above is.
 
+That headroom is what the controlled measurement above found, not a
+guarantee about every store this hook ever runs against — a real store's
+actual behavior depends on where it lives, and a reading of one machine's
+`hook.log` taken before a slow store had been moved off a Windows drive
+mixed that store's old, misconfigured timings in with its current,
+native-disk ones; that comparison has been withdrawn as invalid, not
+corrected into a new multiplier. The 2-second budget still holds
+regardless (fail-open means a fired watchdog costs one citation, never a
+blocked edit), and the 34-sample figure above is still an accurate
+description of the controlled run that set it. What production lookups
+actually look like on a given store is best read fresh from that store's
+own `hook.log`, dated after its own last known move — see the README's
+lookup paragraph for the current reading.
+
 Unlike the five write-side hooks, whose timeout costs at most a lost
 reminder, `pre-edit-chain.sh`'s timeout carries an asymmetric cost: it costs
 the one citation this tool exists to put in front of the model before the
