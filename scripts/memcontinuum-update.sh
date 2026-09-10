@@ -686,16 +686,27 @@ mc_update_skill_state() {
 # append-only guard is not installed at all; stale is the ordinary
 # re-render-and-it's-fixed case.
 #
-# Deliberately informational only -- unlike rules/skill, this state does NOT
-# feed the `action` column or --apply's re-render decision. repo-init.sh
-# already regenerates (or correctly skips) both wrappers unconditionally on
-# every real install it performs, so whenever --apply re-renders a
-# claude-dir for any OTHER reason (stale hook lines, missing rules, ...) a
-# stale store-hooks state is fixed as a side effect. The one case this does
-# NOT reach -- everything else already `ok` while a machine-level python
-# change alone made the wrapper's embedded python path stale -- is a real,
-# narrow gap this report names rather than silently leaving unfixed and
-# unmentioned; see the report for this task.
+# Deliberately informational only -- unlike rules/skill, NONE of
+# stale/missing/foreign here feeds the `action` column or --apply's
+# re-render decision (round-2 gate finding G4: an earlier version of this
+# comment named only the stale/python-drift case below, but missing and
+# foreign ride the identical action=ok / --apply-is-a-no-op path and are
+# the same trade at a wider blast radius). repo-init.sh already regenerates
+# (or correctly skips) both wrappers unconditionally on every real install
+# it performs, so whenever --apply re-renders a claude-dir for any OTHER
+# reason (stale hook lines, missing rules, ...) a stale store-hooks state
+# is fixed as a side effect. --apply does NOT reach, ever, on its own:
+#   - stale, when everything else is already `ok` and only a machine-level
+#     python change made the wrapper's embedded python path stale;
+#   - missing, when the append-only guard was never installed (deleted, or
+#     a pre-this-feature store) -- --apply leaves it missing, exactly as
+#     it leaves a missing rules file alone until something else triggers a
+#     re-render;
+#   - foreign, a hand-authored wrapper -- --apply leaves it in place, same
+#     as a foreign rules file or skill copy.
+# All three are named here rather than silently left unfixed and
+# unmentioned; pinned by tests/test_update.py TestStoreHooksColumn
+# .test_missing_and_foreign_leave_action_ok_and_apply_is_a_no_op.
 mc_update_store_hooks_state() {
     MC_STORE_HOOKS_STATE="not-checked"
     mc_is_marked_store "$STORE" || return 0

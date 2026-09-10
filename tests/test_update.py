@@ -1028,6 +1028,44 @@ class TestStoreHooksColumn(UpdateTestBase):
                         "core.hooksPath", str(shared_hooks)], check=True)
         self.assertEqual(self._rows()[0]["store-hooks"], "not-checked")
 
+    def test_missing_and_foreign_leave_action_ok_and_apply_is_a_no_op(self):
+        """G4 (round-2 gate, Grok 4 -- accepted as a reasonable trade, not
+        forced into `action`): mc_update_store_hooks_state's own comment
+        names only "python moved underneath, nothing else drifted" as the
+        gap store-hooks stays informational for. `missing` (the
+        append-only guard never installed) and `foreign` (a hand-authored
+        wrapper) ride the exact same action=ok / --apply-is-a-no-op path
+        and were not named there -- this pins both so the trade cannot
+        widen silently. --no-machine here only keeps a fresh/absent
+        machine layer from adding its own refresh noise to this repo-row
+        assertion; it does not change the store-hooks behaviour under
+        test (TestMachineFlag covers --machine/--no-machine on their own
+        terms)."""
+        for make_state, expected_state in (
+            (lambda: self._post_commit().unlink(), "missing"),
+            (lambda: self._post_commit().write_text("#!/usr/bin/env bash\necho not ours\n"),
+             "foreign"),
+        ):
+            with self.subTest(expected_state):
+                make_state()
+                rows = self._rows()
+                self.assertEqual(rows[0]["store-hooks"], expected_state, rows)
+                self.assertEqual(rows[0]["action"], "ok", rows)
+
+                before = (self._post_commit().read_bytes()
+                          if self._post_commit().exists() else None)
+                proc = run(UPDATE_SH, ["--apply", "--no-machine"], self.home)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                after = (self._post_commit().read_bytes()
+                         if self._post_commit().exists() else None)
+                self.assertEqual(before, after,
+                                  "--apply must not touch a missing/foreign wrapper "
+                                  "on its own -- store-hooks is informational only")
+
+                rows2 = self.table_rows(proc.stdout)
+                self.assertEqual(rows2[0]["store-hooks"], expected_state, proc.stdout)
+                self.assertEqual(rows2[0]["action"], "ok", proc.stdout)
+
 
 class TestMachineFlag(UpdateTestBase):
     """I1 (INC-0117): the machine layer is reported by DEFAULT now -- nobody
