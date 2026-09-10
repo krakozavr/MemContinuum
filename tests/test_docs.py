@@ -36,6 +36,8 @@ SKILL = TOOLS_DIR / "skills" / "memcontinuum" / "SKILL.md"
 SEARCH_SKILL = TOOLS_DIR / "skills" / "memory-search" / "SKILL.md"
 INSTALL_HOOKS = TOOLS_DIR / "hooks" / "install-hooks.md"
 NEWFILE_NUDGE_HOOK = TOOLS_DIR / "hooks" / "newfile-nudge.sh"
+SETUP_SH = TOOLS_DIR / "memcontinuum-setup.sh"
+DECIDE_SH = TOOLS_DIR / "scripts" / "memcontinuum-decide.sh"
 STORE_README_TMPL = TOOLS_DIR / "templates" / "store-README.md.tmpl"
 RULES_TEMPLATE = TOOLS_DIR / "templates" / "memcontinuum-rules.md"
 SCHEMA = TOOLS_DIR / "docs" / "SCHEMA.md"
@@ -1689,6 +1691,35 @@ PROMISE_TO_BE_ASKED_PATTERNS = [
 # produces ZERO hits against it -- nothing to allowlist today. Left empty
 # rather than pre-populated with a guess; a real future hit gets a named,
 # commented entry here, the same as any doc's.
+#
+# memcontinuum-setup.sh (TOP-0110 L3, installer-closing-honesty branch):
+# this file holds the LAST thing a user reads after installing -- the one
+# place this whole episode's sweep missed -- so it is added here too.
+# Checked directly, not assumed: the rewritten "=== done ===" epilogue
+# ("Run /memcontinuum inside a repository to decide for it ... it may
+# never reach you. Whatever you answer through the skill is recorded and
+# reversible.") never puts "you" next to ask/prompt/remind/offer at all,
+# and the file's `-h`/`--help` header (usage() prints the top comment
+# block verbatim) and every other say/comment line were checked the same
+# way -- ZERO hits today, nothing to allowlist. Disclosed, not just
+# assumed: the OLD epilogue this branch replaced ("...will prompt the
+# assistant to ask you once whether...") also produced ZERO hits against
+# this same scan -- "will" and "ask you" sit four words apart across "the
+# assistant to", past the two-filler-word window PROMISE_TO_BE_ASKED_
+# PATTERNS allows between a modal and its verb (TOP-0129 L2 documents the
+# guard's other known gap, third-person phrasing with no "you" recipient
+# at all; this is a second, distinct gap in the same shape-not-meaning
+# design -- a real promise whose modal and verb are separated by an
+# intervening clause). This scan would NOT have caught the defect this
+# branch fixes had it run before the fix; only the exact-phrase pins this
+# class's own docstring describes, or a reviewer, catch that shape.
+#
+# scripts/memcontinuum-decide.sh: its two runtime "asked" echoes
+# (`declined` -> "this repo will not be asked again", `forget` -> "the
+# SessionStart detector will emit its ask again") are third person
+# throughout -- no "you" -- so, same as TOP-0129 L2 describes, this scan
+# does not and cannot evaluate them; checked directly and confirmed ZERO
+# regex hits today regardless, nothing to allowlist.
 ALLOWED_ASK_PROMISE_SUBSTRINGS = [
     # README's "Day to day": present tense, describing what /memcontinuum
     # itself does WHILE the human is running it. A human asked BY the
@@ -1728,36 +1759,58 @@ class TestNoRephrasedAskPromise(unittest.TestCase):
     """Semantic companion to TestConsentIsManualNotAutomatic's exact-phrase
     pins -- see PROMISE_TO_BE_ASKED_PATTERNS above for what this catches
     and its disclosed limit. Scans README.md, skills/memcontinuum/
-    SKILL.md, and hooks/newfile-nudge.sh -- the docs and the one hook that
-    carried the retired promise (TOP-0110 L3): the README describes the
-    product to the human who reads it, the skill's own pinned
-    structured-prompt options are the single most user-visible place in
-    the product, a numbered choice the human sees live, and
-    newfile-nudge.sh's own three-option decision point (newlang-nudge)
-    used to make the identical promise in its option 3 ("asked again next
-    session") before this branch retired it -- same defect, same vocabulary
-    fix, so it gets the same scan. newfile-nudge.sh is shell, not prose --
-    option text, comments, and log strings all sit in the same file -- so
-    a hit here is expected to need ALLOWED_ASK_PROMISE_SUBSTRINGS
-    entries over time the way README/SKILL already do; checked directly
-    (not assumed) that today's file produces none. Reads the bare module
-    globals README/SKILL/NEWFILE_NUDGE_HOOK at call time (not a pre-bound
+    SKILL.md, hooks/newfile-nudge.sh, memcontinuum-setup.sh, and
+    scripts/memcontinuum-decide.sh -- the docs, the one hook, and the two
+    installer scripts this episode's fix touched (TOP-0110 L3): the
+    README describes the product to the human who reads it, the skill's
+    own pinned structured-prompt
+    options are the single most user-visible place in the product, a
+    numbered choice the human sees live, newfile-nudge.sh's own
+    three-option decision point (newlang-nudge) used to make the
+    identical promise in its option 3 ("asked again next session") before
+    that branch retired it, and memcontinuum-setup.sh holds the LAST
+    thing a user reads after installing -- the "=== done ===" epilogue --
+    which is exactly what this whole episode's original sweep missed:
+    every other document got the fix, this file did not get scanned at
+    all. scripts/memcontinuum-decide.sh's runtime text was corrected on
+    the consent branch but was likewise never added to any scan, so it
+    is added here alongside setup.sh even though (see
+    ALLOWED_ASK_PROMISE_SUBSTRINGS above) its two "asked" echoes are
+    third person and this class cannot evaluate them -- TOP-0129 L2's
+    disclosed limit, not a gap fixed here. All five are shell or prose
+    with user-facing text (option lists, say/echo lines, comments a
+    `--help` prints) -- a hit here is expected to need
+    ALLOWED_ASK_PROMISE_SUBSTRINGS entries over time the way README/SKILL
+    already do; checked directly (not assumed) that today's five files
+    produce none. Reads the bare module globals README/SKILL/
+    NEWFILE_NUDGE_HOOK/SETUP_SH/DECIDE_SH at call time (not a pre-bound
     list), same as TestSkillHonesty's methods, so
     TestNoRephrasedAskPromiseMutations below can point any of them at a
-    mutated temp file and prove this method reacts to it for real."""
+    mutated temp file and prove this method reacts to it for real.
+
+    Disclosed, not just claimed: this scan is shape-anchored on "you" as
+    the recipient (TOP-0129 L2), so it does NOT cover a third-person
+    promise, and separately (found while extending it to setup.sh) it
+    does not reliably cover a "you"-recipient promise either when an
+    intervening clause pushes the modal ("will") and the ask/prompt/
+    remind/offer verb more than two words apart -- memcontinuum-setup.sh's
+    OWN retired closing text ("...will prompt the assistant to ask you
+    once whether...") is a real example that produced zero hits against
+    this exact scan. Neither gap is fixed by this change; both are why
+    the exact-phrase pins elsewhere, and a reviewer's eye, still matter
+    alongside this class."""
 
     def test_no_user_facing_text_promises_you_will_be_asked(self):
         offenders = []
-        for doc in (README, SKILL, NEWFILE_NUDGE_HOOK):
+        for doc in (README, SKILL, NEWFILE_NUDGE_HOOK, SETUP_SH, DECIDE_SH):
             offenders.extend(_ask_promise_offenders(doc))
         self.assertEqual(
             offenders, [],
             "user-facing text promises a human will be asked/prompted/"
-            "reminded/offered (TOP-0110 L3): both the SessionStart "
-            "detector's ask and newfile-nudge.sh's own decision point "
-            "reach only the assistant, through additionalContext, never "
-            f"the human directly, so nothing here may promise otherwise: "
-            f"{offenders}",
+            "reminded/offered (TOP-0110 L3): the SessionStart detector's "
+            "ask reaches only the assistant, through additionalContext, "
+            "never the human directly, so nothing here may promise "
+            f"otherwise: {offenders}",
         )
 
 
@@ -1767,24 +1820,35 @@ class TestNoRephrasedAskPromiseMutations(unittest.TestCase):
     copy of its logic (the same house rule fix round 3 established for
     TestSkillHonestyMutations above). Reproduces Grok gate finding 2's two
     exact defeats verbatim (both slipped past every exact-phrase pin in
-    TestConsentIsManualNotAutomatic when the gate first found them), plus
-    a third for newfile-nudge.sh's own option 3 (newlang-nudge, TOP-0110
+    TestConsentIsManualNotAutomatic when the gate first found them), a
+    third for newfile-nudge.sh's own option 3 (newlang-nudge, TOP-0110
     L3): rephrasing "nothing is recorded; stays unwired until decided"
     back into the same retired promise ("you'll be asked again next
     session") must fail the suite too, not just the exact-string absence
-    check in tests/test_write_hooks.py."""
+    check in tests/test_write_hooks.py. A fourth and fifth do the same
+    for the two files added to the scan on the installer-closing-honesty
+    branch (TOP-0110 L3): memcontinuum-setup.sh (rephrasing its own
+    closing epilogue, which this class pins nowhere else) and
+    scripts/memcontinuum-decide.sh (an inserted "you"-shaped promise,
+    since that file's own real "asked"/"ask" text is third person and
+    outside what TestNoRephrasedAskPromise can evaluate -- TOP-0129 L2 --
+    so a rephrase-of-existing-text defeat is not available there; this
+    proves the scan still reaches the file rather than silently skipping
+    it)."""
 
     @staticmethod
     @contextlib.contextmanager
     def _mutated_doc(varname, mutated_text):
         """Point the module-level global named `varname` ("README",
-        "SKILL", or "NEWFILE_NUDGE_HOOK") at a temp file holding
-        `mutated_text` for the duration of the `with` block, then restore
-        it -- generalizes TestSkillHonestyMutations._mutated_skill (which
-        only ever swaps SKILL) so this class can reproduce a defeat
-        planted in any doc or hook TestNoRephrasedAskPromise scans; that
-        test's method resolves README/SKILL/NEWFILE_NUDGE_HOOK from this
-        module's globals at call time, so this reaches it."""
+        "SKILL", "NEWFILE_NUDGE_HOOK", "SETUP_SH", or "DECIDE_SH") at a
+        temp file holding `mutated_text` for the duration of the `with`
+        block, then restore it -- generalizes
+        TestSkillHonestyMutations._mutated_skill (which only ever swaps
+        SKILL) so this class can reproduce a defeat planted in any doc,
+        hook, or script TestNoRephrasedAskPromise scans; that test's
+        method resolves README/SKILL/NEWFILE_NUDGE_HOOK/SETUP_SH/
+        DECIDE_SH from this module's globals at call time, so this
+        reaches it."""
         module = sys.modules[__name__]
         real_path = getattr(module, varname)
         fd, tmp_name = tempfile.mkstemp(suffix=".md")
@@ -1858,6 +1922,47 @@ class TestNoRephrasedAskPromiseMutations(unittest.TestCase):
         )
         self.assertNotEqual(mutated, text, "fixture stale: nothing matched")
         self._assert_guard_catches("NEWFILE_NUDGE_HOOK", mutated)
+
+    def test_setup_sh_closing_rephrase_defeat_is_caught(self):
+        # TOP-0110 L3, installer-closing-honesty branch: memcontinuum-
+        # setup.sh's own "=== done ===" epilogue is the file this whole
+        # episode's original sweep missed -- the one that holds the LAST
+        # thing a user reads after installing. Rewording the fixed
+        # closing text back into a close rephrase of the retired promise
+        # must fail the suite through this file, not just be absent from
+        # a pin (this class pins setup.sh's exact wording nowhere else).
+        marker = (
+            "Whatever you answer through the skill is recorded and "
+            "reversible."
+        )
+        text = SETUP_SH.read_text()
+        self.assertIn(marker, text, "fixture stale: closing text not found")
+        mutated = text.replace(
+            marker,
+            "You'll be asked again next session if you don't decide now.",
+            1,
+        )
+        self.assertNotEqual(mutated, text, "fixture stale: nothing matched")
+        self._assert_guard_catches("SETUP_SH", mutated)
+
+    def test_decide_sh_insertion_defeat_is_caught(self):
+        # scripts/memcontinuum-decide.sh's own real "asked"/"ask" text
+        # ("this repo will not be asked again", "will emit its ask
+        # again") is third person throughout, with no "you" recipient --
+        # outside what TestNoRephrasedAskPromise can evaluate (TOP-0129
+        # L2, see the class docstring above), so no rephrase-of-existing-
+        # text defeat exists here the way it does for the other four
+        # files. This proves the scan still actually REACHES the file
+        # (added to the loop, not silently skipped) by inserting a
+        # "you"-shaped promise the pattern IS designed to catch.
+        text = DECIDE_SH.read_text()
+        marker = "set -u"
+        self.assertIn(marker, text, "fixture stale: marker not found")
+        mutated = text.replace(
+            marker, marker + "\n# you will be asked again next session\n", 1
+        )
+        self.assertNotEqual(mutated, text, "fixture stale: nothing matched")
+        self._assert_guard_catches("DECIDE_SH", mutated)
 
 
 if __name__ == "__main__":
