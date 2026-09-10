@@ -360,41 +360,13 @@ git_hooks_dir_for() {
 # and ".sh" suffix, so the two log messages cannot drift out of sync by
 # hand either.
 
-# _installer_wrapper_shape HOOKPATH SCRIPT -- true (rc 0) only when
-# HOOKPATH is EXACTLY the shape install_store_hook_wrapper itself
-# generates: five lines, no more and no fewer -- a shebang, the three
-# MEMCONTINUUM_* exports (values may be stale from an earlier install with
-# a different STORE/PROJECT/PYTHON_BIN -- only the KEYS are checked so a
-# stale-but-ours wrapper is still recognized and regenerated), and an exec
-# line naming $HOOKS_DIR/SCRIPT verbatim (byte-for-byte -- that line never
-# varies run to run for a given SCRIPT, since $HOOKS_DIR is this checkout's
-# own fixed hooks directory).
-_installer_wrapper_shape() {
-    local hookpath="$1" script="$2"
-    local expected_exec line n=0
-    local -a lines=()
-    expected_exec="exec bash $(printf '%q' "$HOOKS_DIR/$script")"
-    while IFS= read -r line || [ -n "$line" ]; do
-        lines[$n]="$line"
-        n=$((n + 1))
-    done < "$hookpath"
-    [ "$n" -eq 5 ] || return 1
-    [ "${lines[0]}" = "#!/usr/bin/env bash" ] || return 1
-    case "${lines[1]}" in
-        "export MEMCONTINUUM_ROOT="*) ;;
-        *) return 1 ;;
-    esac
-    case "${lines[2]}" in
-        "export MEMCONTINUUM_PROJECT="*) ;;
-        *) return 1 ;;
-    esac
-    case "${lines[3]}" in
-        "export MEMCONTINUUM_PYTHON="*) ;;
-        *) return 1 ;;
-    esac
-    [ "${lines[4]}" = "$expected_exec" ] || return 1
-    return 0
-}
+# Shared with scripts/memcontinuum-update.sh's own store-hooks health column
+# (I2, updater-coverage workstream): mc_installer_wrapper_shape, in
+# scripts/mc-registry-lib.sh (sourced at the top of this file) -- see that
+# function's own comment for the shape it checks and why it moved out of
+# this file. Kept as a local alias so every call site below reads the same
+# as before the move; only the definition itself relocated.
+_installer_wrapper_shape() { mc_installer_wrapper_shape "$1" "$HOOKS_DIR" "$2"; }
 
 install_store_hook_wrapper() {
     local name="$1" script="$2"

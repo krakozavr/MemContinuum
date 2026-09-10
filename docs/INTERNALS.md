@@ -640,11 +640,14 @@ that adding, removing or renaming one counts as a change.
 | both | `scripts/mc_settings_merge.py` | lands the rendered blocks, per repo and machine-wide alike |
 
 Who uses which: `repo-init.sh` stamps with `repo`; `memcontinuum-update.sh`
-compares each registry row against `repo` and, under `--machine`, the
-`~/.claude` detector entry against `machine`; `memcontinuum-state.sh`'s
-per-repo hint uses `repo`. `memcontinuum-setup.sh` renders
-`MEMCONTINUUM_RENDERED=<machine fingerprint>` onto the one hook line it
-installs — that is what `--machine` reads back.
+compares each registry row against `repo` and, by default now, the
+detector entry in the claude-dir `memcontinuum-setup.sh` recorded (usually
+`~/.claude`) against `machine` — `--machine` is an accepted no-op and
+`--no-machine` is the opt-out that skips this comparison entirely, not the
+other way around; `memcontinuum-state.sh`'s per-repo hint uses `repo`.
+`memcontinuum-setup.sh` renders `MEMCONTINUUM_RENDERED=<machine
+fingerprint>` onto the one hook line it installs — that is what this
+machine-layer comparison reads back.
 
 `hooks/*.sh` are deliberately **not** inputs in either scope: they are
 executed by path, so pulling updates them live. That includes
@@ -679,14 +682,16 @@ copy of the check. A copy that already carries that identity is overwritten
 on every re-run regardless of its stamp, same as the rules file.
 
 `scripts/memcontinuum-update.sh` walks every `wired` row and, for each
-claude-dir the row lists, compares four things against the engine right now:
+claude-dir the row lists, compares five things against the engine right now:
 the stamp on that claude-dir's rendered hook lines, the row's own `store=`
 against the rendered `MEMCONTINUUM_ROOT` on those same lines (a stamp match
 alone cannot catch a store renamed under the same engine version), the rules
-file's identity marker + stamp, and the installed `memory-search` skill
-copy's identity + stamp. It prints one table row per
+file's identity marker + stamp, the installed `memory-search` skill
+copy's identity + stamp, and the STORE's git post-commit/pre-commit wrapper
+state (`store-hooks`: ok/stale/missing/foreign/not-checked, informational
+only — see `mc_update_store_hooks_state`'s own comment). It prints one table row per
 (row, claude-dir): `repo | claude-dir | stamped | engine | store-match |
-rules | skill | action`, action being one of `ok`, `stale`, `store-mismatch`,
+rules | skill | store-hooks | action`, action being one of `ok`, `stale`, `store-mismatch`,
 `store-form-stale`, `store-form-updated`,
 `rules-missing`, `rules-stale`, `rules-foreign`, `skill-foreign`, `migrate`,
 `migrate-needs-claude-dirs`, `migrate-needs-langs`,
@@ -719,7 +724,58 @@ skill loader, so its identity is instead "the frontmatter contains the
 `repo-init.sh`'s own refusal (above) against that same runtime-read marker,
 rather than each hardcoding its own copy of the check or the marker text —
 and its stamp sits right after the frontmatter's *closing* `---` rather than
-at a fixed line number. A missing or stale skill copy reports as the same generic `stale`
+at a fixed line number.
+
+The `store-hooks` column covers the store's git
+`post-commit`/`pre-commit` wrappers — the only artifacts `repo-init.sh`
+renders into a project that carry no stamp of their own (they are three raw
+values, not a template): `ok`/`stale`/`missing`/`foreign` per wrapper, the
+column showing the worse of the two (`foreign` > `missing` > `stale` >
+`ok`), currency judged by re-deriving the exact bytes `repo-init.sh` would
+write now for the row's `store`/`project`/resolved python and comparing
+byte-for-byte. `not-checked` when the store is gone, git resolves its hooks
+directory outside its own `.git` (a shared `core.hooksPath` —
+`repo-init.sh` itself refuses to install a wrapper there), or no python can
+be resolved to build the comparison against. It is informational only:
+unlike `rules`/`skill` it does not feed the `action` column or `--apply`'s
+re-render decision — `repo-init.sh` already regenerates or correctly skips
+both wrappers unconditionally on every install it performs, so a stale or
+missing `store-hooks` gets fixed as a side effect whenever `--apply`
+re-renders a claude-dir for any other reason; `foreign` never does,
+since `repo-init.sh` refuses to overwrite a hand-authored wrapper even
+then. None of the three moves the `action` column, so the gap this
+narrows rather than closes is wider than just python drift: a row that
+is otherwise fully `ok` stays `store-hooks: stale` (only the machine's
+resolved python changed underneath it), `missing` (the wrapper was
+deleted, or predates this feature), or `foreign` (hand-authored) until
+something else triggers a re-render (or the row is re-rendered by hand).
+
+Beneath the table, a `not-checked: ...` line names every OTHER artifact
+`repo-init.sh` renders into a project that has no column of its own — the
+store's `README.md`, `.gitignore`, and its tree (`topics`/`incidents`/
+`investigations`/`concepts`/`sources`/`inbox/*`, each `.gitkeep`-marked).
+None of these are ever re-rendered over an existing file, so nothing here
+ever looks at their current content to judge it stale — not because their
+content structurally cannot vary, but because looking would mean
+overwriting something this command must not silently clobber (an "adopt
+an existing store" install must not clobber a hand-authored README).
+README.md and .gitignore are the clean case: each is skipped outright
+once it exists, so a hand edit rides through every later re-render
+untouched. The tree is narrower: `mkdir -p`/`touch .gitkeep` run
+unconditionally rather than behind an existence check, so an entry that
+is still there is equally left alone, but one that was deleted is
+silently recreated (empty, `.gitkeep`-only) the next time any re-render
+touches that claude-dir — not because anything inspected it, only because
+nothing ever looked to notice it was gone. `not-checked` is the honest
+and complete answer for all of them either way, printed every walk
+rather than left to read as silence. A dedicated coverage test
+(`tests/test_update.py`
+`TestUpdaterCoversEveryRenderedArtifact`) derives the artifact list from a
+real `repo-init.sh` run's own before/after filesystem diff, not from a
+hand-copied list, so a new rendered artifact this table does not account
+for fails that test rather than silently reading as health.
+
+A missing or stale skill copy reports as the same generic `stale`
 action the hook-stamp check already uses (not a `skill-missing`/`skill-stale`
 action of its own, unlike the rules file) — it is the same kind of drift, not
 a new question. A *foreign* skill copy reports `skill-foreign` and is refused
@@ -990,9 +1046,17 @@ Four refusals come before any of that, in this order:
   at one would wire it from scratch — the one thing this command never does.
   Checked for every dir before any of them is touched.
 
-`--machine` reports the machine layer as one extra line
-(`machine: DIR rendered by X, engine at Y -- ok|stale`), comparing the
-`machine` fingerprint against the stamp on that dir's detector entry. *Which*
+The machine layer is reported as one extra line
+(`machine: DIR rendered by X, engine at Y, skill S, config C -- ok|stale`),
+comparing the `machine` fingerprint against the stamp on that dir's detector
+entry. `S` and `C` are informational only — a direct byte-for-byte check of
+the machine-level skill copy (`ok`/`stale`/`missing`/`not-checked` when the
+engine's own copy cannot be read) and whether `config.sh` exists
+(`present`/`missing`) — neither feeds the `ok|stale` verdict or `--apply`'s
+refresh decision, both of which stay keyed on the detector hook's own stamp
+alone; they exist because the skill copy carries no stamp of its own; only
+the hook line does, so without this it is inferred from a sibling artifact
+rather than checked directly. *Which*
 claude-dir is a fact only `memcontinuum-setup.sh` knows — it takes
 `--claude-dir` and defaults to `~/.claude` — so it records the answer in
 `config.sh` as `MEMCONTINUUM_MACHINE_CLAUDE_DIR`, and this reads it back
@@ -1001,9 +1065,14 @@ existed). Assuming `~/.claude` reported a real install elsewhere as absent,
 and `--apply` would then have rendered a *second* machine layer at the
 default path while the stale one stayed stale. With `--apply` it re-runs
 `memcontinuum-setup.sh --claude-dir DIR`, but only when the comparison says
-`stale`. Off by default, since most drift is per-repo — and a missing
-registry no longer skips it, because a machine can perfectly well have its
-own layer installed before any repository is wired.
+`stale`. Reported by default now — a health check that only answers for the
+layer it was asked about reads as "everything is current" to whoever runs
+it, and that is exactly how a stale machine-level skill copy went unnoticed
+for days. `--machine` is kept as an accepted no-op for anything that already
+types it; `--no-machine` is the opt-out for the rare caller that wants the
+repo rows alone. A missing registry does not skip the machine report either,
+because a machine can perfectly well have its own layer installed before any
+repository is wired.
 
 Immediately after a refresh that SUCCEEDED (never on an already-`ok` layer,
 never on its own outside a refresh, and never after a refresh that failed —
@@ -1476,9 +1545,11 @@ product's subcommand for decision-vs-code drift — a different question, a
 different answer, and the name users already know it by — so the installed-vs-pinned
 condition carries its own word rather than a second meaning for that one.
 
-`memcontinuum-update.sh --apply --machine` runs this check on EVERY `--apply
---machine` run, warns by name about any row missing, and warns separately about
-any row off its pins. The report sits outside the staleness gate that decides
+`memcontinuum-update.sh --apply` runs this check on EVERY `--apply` run (the
+machine layer is reported and, when stale, refreshed by default — `--machine`
+is no longer required for this), warns by name about any row missing, and
+warns separately about any row off its pins. The report sits outside the
+staleness gate that decides
 whether the machine layer is re-rendered and the lockfile reinstalled: a
 pin mismatch is a runtime-install condition — someone pip-installs a newer
 grammar into the venv and nothing about the wiring goes stale — so gating the
