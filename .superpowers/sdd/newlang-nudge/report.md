@@ -6,6 +6,11 @@ Status: **done**. Branch `newlang-nudge`, worktree `/home/krakozavr/dev/memconti
 - `9d12367` docs(report): start the newlang-nudge report with orientation notes
 - `1ba816b` feat(hooks): newfile-nudge tells the user when a supported language is unwired
 - `1afbb81` docs(internals): newfile-nudge.sh now lazily sources memlib.sh on one branch
+- `83970c6` fix(test): the language-table consistency test must probe every extension
+  (advisor-caught: the test only exercised `row["extensions"][0]`, so
+  javascript's other three extensions (.jsx/.mjs/.cjs) were never actually
+  checked against the hook's case table, though the hook's own comment
+  claimed full coverage. Fixed to loop every extension.)
 
 Only `hooks/newfile-nudge.sh`, `tests/test_write_hooks.py`, `docs/INTERNALS.md`,
 and this report were touched. `git diff main -- scripts/memcontinuum-update.sh
@@ -91,9 +96,14 @@ to before except that its JSON-building code moved into a shared
 `_emit_additional_context` function (still the exact same python
 invocation it always made).
 
-Under `MC_BASH=bash-3.2.57` the same wired-path p95 was ~86-90ms both
-before informally observed and after (bash 3.2's own interpreter overhead,
-unrelated to this change — not a regression this task introduced).
+Under `MC_BASH=$HOME/.cache/bash32/bin/bash` (real bash 3.2.57), measured
+the same way (detach to `a49112c`, run
+`TestNewFileNudgeHook.test_p95_latency_over_20_runs` alone, switch back):
+- **Before** (main tip `a49112c`): 87.7ms (min 54.0, max 88.2)
+- **After** (this branch): 86.7ms (min 53.4, max 88.4)
+
+Also no regression under bash 3.2 (the higher absolute numbers vs. native
+bash are bash 3.2's own interpreter overhead, unrelated to this change).
 
 ## Verification run
 - `tests.test_write_hooks.TestNewFileNudgeHook` (36 tests): native OK, `MC_BASH` OK.
@@ -148,7 +158,22 @@ never `git add -A`).
    `memlib.sh` itself (shared by five other hooks already); not touched or
    fixed here, since fixing it is a `memlib.sh`-wide question well outside
    this task's brief.
-3. **Report location**: `.superpowers/sdd/newlang-nudge/` does not exist in
+3. **`nudge=build-failed` marks the language told even though it was never
+   shown**: `mc_update_state_json` appends the language to `nudged_langs`
+   and commits that write BEFORE `_emit_additional_context` runs. If the
+   JSON-envelope build fails on that one occurrence (the same `$PY`
+   interpreter that just succeeded on the locked state-file transform
+   would have to then fail on a trivial `json.dumps` call -- near-zero
+   probability in practice), the session is left marked "already told"
+   for a language it was never actually shown, and every later occurrence
+   that session silently suppresses. Fixing it means splitting "decide
+   whether to show" from "commit the decision" in the shared transform
+   (only record `nudged_langs` after a successful emit) -- not done here,
+   since it is an extremely low-probability path and doing it right also
+   touches the shared `_emit_additional_context`/`mc_update_state_json`
+   sequencing the wired path uses too; flagging rather than reaching for
+   a fix under this task's scope.
+4. **Report location**: `.superpowers/sdd/newlang-nudge/` does not exist in
    this worktree's git history (main has never merged this task's
    directory) and is entirely gitignored by `.superpowers/sdd/.gitignore`'s
    `*` pattern. The currently-live parallel `installer-honesty` worktree
