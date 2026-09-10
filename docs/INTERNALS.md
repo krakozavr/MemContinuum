@@ -640,11 +640,14 @@ that adding, removing or renaming one counts as a change.
 | both | `scripts/mc_settings_merge.py` | lands the rendered blocks, per repo and machine-wide alike |
 
 Who uses which: `repo-init.sh` stamps with `repo`; `memcontinuum-update.sh`
-compares each registry row against `repo` and, under `--machine`, the
-`~/.claude` detector entry against `machine`; `memcontinuum-state.sh`'s
-per-repo hint uses `repo`. `memcontinuum-setup.sh` renders
-`MEMCONTINUUM_RENDERED=<machine fingerprint>` onto the one hook line it
-installs — that is what `--machine` reads back.
+compares each registry row against `repo` and, by default now, the
+detector entry in the claude-dir `memcontinuum-setup.sh` recorded (usually
+`~/.claude`) against `machine` — `--machine` is an accepted no-op and
+`--no-machine` is the opt-out that skips this comparison entirely, not the
+other way around; `memcontinuum-state.sh`'s per-repo hint uses `repo`.
+`memcontinuum-setup.sh` renders `MEMCONTINUUM_RENDERED=<machine
+fingerprint>` onto the one hook line it installs — that is what this
+machine-layer comparison reads back.
 
 `hooks/*.sh` are deliberately **not** inputs in either scope: they are
 executed by path, so pulling updates them live. That includes
@@ -679,12 +682,14 @@ copy of the check. A copy that already carries that identity is overwritten
 on every re-run regardless of its stamp, same as the rules file.
 
 `scripts/memcontinuum-update.sh` walks every `wired` row and, for each
-claude-dir the row lists, compares four things against the engine right now:
+claude-dir the row lists, compares five things against the engine right now:
 the stamp on that claude-dir's rendered hook lines, the row's own `store=`
 against the rendered `MEMCONTINUUM_ROOT` on those same lines (a stamp match
 alone cannot catch a store renamed under the same engine version), the rules
-file's identity marker + stamp, and the installed `memory-search` skill
-copy's identity + stamp. It prints one table row per
+file's identity marker + stamp, the installed `memory-search` skill
+copy's identity + stamp, and the STORE's git post-commit/pre-commit wrapper
+state (`store-hooks`: ok/stale/missing/foreign/not-checked, informational
+only — see `mc_update_store_hooks_state`'s own comment). It prints one table row per
 (row, claude-dir): `repo | claude-dir | stamped | engine | store-match |
 rules | skill | store-hooks | action`, action being one of `ok`, `stale`, `store-mismatch`,
 `store-form-stale`, `store-form-updated`,
