@@ -448,9 +448,11 @@ every repository reading as current, and changing a template flips exactly the
 repositories that need re-rendering.
 
 The machine-wide pieces (the detector, the skill in your own user-level Claude
-directory) are tracked the same way but separately, under `--machine`: a
-change there is reported where the one command that fixes it applies, rather
-than as drift in every repository you have ever wired. Setup records which
+directory) are tracked the same way but separately, and reported by default
+alongside the table (`--no-machine` opts out for the rare caller that wants
+the repo rows alone): a change there is reported where the one command that
+fixes it applies, rather than as drift in every repository you have ever
+wired. Setup records which
 directory it installed those into, so if you gave it `--claude-dir`, that is
 the one reported and refreshed — never a second copy at the default path.
 
