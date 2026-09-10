@@ -405,8 +405,9 @@ query set is easy enough that a runner ignoring the query entirely scores as
 well as the real one, the metric is measuring the corpus rather than the
 retrieval, and the headline figure is noise.
 
-**What this control actually claims (narrowed, fix round 2 and 3).** It
-catches a **stateless** runner that ignores the query TEXT and, at most,
+**What this control actually claims (narrowed, fix rounds 2-4).** It
+catches a **stateless, deterministic** runner whose output is **fixed
+within each `kind`** — one that ignores the query TEXT and, at most,
 branches on `kind` — the one other channel `score.py` hands a runner
 separately from the query text (see "Runner interface" above: `--kind` and
 `--query` are both passed). It is **not** a general proof that "any
@@ -442,6 +443,32 @@ today's fixed order, and a true per-run random order breaks this control's
 own no-RNG/reproducibility design (see "What it does now" below) for a
 defense a stateful runner defeats just as easily by keying on query id
 instead of ordinal position.
+
+It further assumes the runner is **deterministic**: "stateless" alone is
+not enough, because a runner can persist nothing between calls and still
+vary its own output at random from one invocation to the next. Codex
+(fix round 4, a FOURTH external re-gate) built exactly this: a runner
+that reads none of its five CLI arguments — not `--query`, `--kind`,
+`--limit`, `--corpus`, or `--mode` — and persists no state of any kind,
+yet independently samples ten ids at random from this corpus's own 32
+real ids on every call. Its real-vs-shuffled gain is pure sampling noise
+around zero rather than the algebraic zero a fixed or kind-branching
+runner gets, and because this control is a MINIMUM-EFFECT FLOOR at a
+1×SE margin, not a calibrated significance test, noise alone clears that
+margin often enough to matter: on Codex's own runs it **passed on the
+fifth attempt** — gain 0.0456 against se 0.0361, exit 0. So the claim
+that this control catches any stateless runner is **false**; the honest
+claim is narrower still: it catches a stateless, deterministic runner
+whose output is fixed within each `kind`. A runner that persists nothing
+but rolls dice on every call is outside what this design can catch, and
+that it can pass by chance is an admitted limit, not a closed hole — no
+derangement of already-computed output can distinguish "this came from
+reading the query" from "this came from a die roll," for the same reason
+it cannot distinguish a counter. This runner is kept as a fixture
+(`_RANDOM_SAMPLING_RUNNER` in `tests/test_bench.py`,
+`TestRandomSamplingRunnerIsOutsideTheClaim`), which demonstrates across
+many seeds that this shape both passes and fails — the test does not,
+and must not, assert that it always fails.
 
 **Fix-round history.** The first version of this control reversed each
 runner's own ranked output and rescored it against the SAME query's expect.

@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import random
 import re
 import subprocess
 import sys
@@ -989,6 +990,143 @@ class TestSampleStandardErrorReplacesPopulation(unittest.TestCase):
                 self.assertAlmostEqual(c["one-hit"]["gain"], c["one-hit"]["se"], places=3,
                                         msg=f"n={n}: gain and se should be an algebraic tie (1/n)")
                 self.assertFalse(c["one-hit"]["separates"], f"n={n}: a tie must not pass")
+
+
+# ---------------------------------------------------------------------------
+# Fix round 4 (a FOURTH external re-gate, Codex 1 MAJOR): "stateless" alone
+# was still false. Codex built a runner that persists NOTHING between calls
+# (no counter file, no state of any kind) and reads NONE of its five CLI
+# arguments -- not --query, --kind, --limit, --corpus, or --mode -- yet
+# independently samples ten ids at random, drawn from this corpus's own 32
+# real ids, on every invocation. Live: it PASSED on the fifth attempt, gain
+# 0.0456 against se 0.0361, exit 0. Kept here in two forms: the actual
+# runner script, run once through the real bench/score.py pipeline (proves
+# it is a legal, argument-parsing runner that writes no state file), and an
+# in-process seeded simulation across many independent "runs" that shows --
+# honestly, not by asserting a fixed gain -- that this shape both PASSES
+# and FAILS negative_control depending on nothing but its own dice. This is
+# deliberately the one class in this file that does NOT assert its runner
+# always fails: the point of fix round 4 is that this design admits it
+# cannot guarantee catching it. See bench/score.py's negative_control
+# comment ("Fix round 4") and bench/README.md's "What this control
+# actually claims" for the corrected wording: "stateless, deterministic,
+# with output fixed within each kind".
+# ---------------------------------------------------------------------------
+
+_RANDOM_SAMPLE_POOL = [
+    "CON-301", "CON-302", "CON-303", "CON-304",
+    "INC-201", "INC-202", "INC-203", "INC-204", "INC-205", "INC-206",
+    "TOP-101", "TOP-102", "TOP-103", "TOP-104", "TOP-105", "TOP-106",
+    "TOP-107", "TOP-108", "TOP-109", "TOP-110", "TOP-111", "TOP-112",
+    "TOP-113", "TOP-114", "TOP-115", "TOP-116", "TOP-117", "TOP-118",
+    "TOP-119", "TOP-120", "TOP-121", "TOP-122",
+]  # bench/corpus/**/*.md's real `id:` frontmatter, all 32 of them.
+
+_RANDOM_SAMPLING_RUNNER = '''#!/usr/bin/env python
+"""Codex's fix-round-4 counterexample: persists no state of any kind
+between invocations and reads none of its five CLI arguments -- not
+--query, --kind, --limit, --corpus, or --mode -- yet independently
+samples ten ids at random, from this corpus's own real ids, on every
+call. Stateless under the fix-round-3 wording; NOT deterministic, which
+is a different (and still uncaught) failure mode -- see bench/score.py's
+negative_control comment ("Fix round 4") and bench/README.md's "What
+this control actually claims"."""
+import argparse
+import random
+import sys
+
+# Hardcoded because this runner reads no --corpus arg to discover the
+# real ids at runtime -- knowing the corpus's id space in advance is
+# exactly what an author of a gaming runner would do.
+POOL = {pool!r}
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--corpus", required=True)
+    p.add_argument("--kind", required=True)
+    p.add_argument("--query", required=True)
+    p.add_argument("--limit", type=int, default=10)
+    p.add_argument("--mode", default=None)
+    p.parse_args(argv)  # parsed and IGNORED -- none of these five drive the output
+    print("\\n".join(random.sample(POOL, 10)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''.format(pool=_RANDOM_SAMPLE_POOL)
+
+
+class TestRandomSamplingRunnerIsOutsideTheClaim(unittest.TestCase):
+    """Fix round 4 (Codex 1 MAJOR): the narrowed claim said "stateless";
+    Codex proved that word alone is false by building a runner that IS
+    stateless (nothing persists across calls) but is NOT deterministic
+    (its own output for the identical call varies), and it passed a live
+    bench/score.py run on its fifth attempt. The fix is not a mechanism
+    change -- see bench/score.py and bench/README.md -- it is admitting
+    this class in the claim's own wording rather than denying it."""
+
+    def test_the_script_is_a_legal_runner_and_persists_no_state(self):
+        """Runs the ACTUAL fixture script (not a hand-built rep) through
+        the real bench/score.py pipeline once, over the live 57-query
+        corpus: proves it is argument-parsing-compliant (no errors),
+        returns exactly 10 ids drawn from the real corpus per query, and
+        writes no file anywhere in its own directory -- "persists
+        nothing" is checked here, not assumed."""
+        queries = score.load_queries(QUERIES_PATH)
+        with tempfile.TemporaryDirectory() as td:
+            script = Path(td) / "random_sample.py"
+            script.write_text(_RANDOM_SAMPLING_RUNNER, encoding="utf-8")
+            script.chmod(0o755)
+            before = sorted(p.name for p in Path(td).iterdir())
+            rep = score.run_all(queries, CORPUS, [str(script)], 10)
+            after = sorted(p.name for p in Path(td).iterdir())
+        self.assertEqual(before, after, "the runner must not have written any state file")
+        display = "random_sample"
+        self.assertIn(display, rep)
+        self.assertEqual(rep[display]["errors"], {}, rep[display]["errors"])
+        pool = set(_RANDOM_SAMPLE_POOL)
+        for qid, m in rep[display]["per_query"].items():
+            self.assertEqual(len(m["ranked"]), 10, qid)
+            self.assertTrue(set(m["ranked"]) <= pool, (qid, m["ranked"]))
+
+    def test_across_many_seeded_runs_it_both_passes_and_fails(self):
+        """Simulates many independent "runs" of bench/score.py against
+        this runner: each seed stands for one full invocation (a fresh,
+        independently-seeded random stream, matching how a real subprocess
+        gets a fresh OS-seeded `random` module every time it starts), with
+        one independent random draw of 10 ids per query -- exactly what
+        the live script above does, minus the cost of actually spawning
+        57 subprocesses x N seeds.
+
+        This test must NOT assert this runner always fails -- that would
+        just restate the false "stateless" claim in test form. It asserts
+        BOTH outcomes are reachable, which is what "can still pass"
+        (final-round-brief.md, PART A) requires being proven, not denied."""
+        queries = score.load_queries(QUERIES_PATH)
+        outcomes = []
+        for seed in range(50):
+            rng = random.Random(seed)
+            per_query = {}
+            for q in queries:
+                ranked = rng.sample(_RANDOM_SAMPLE_POOL, 10)
+                m = score.evaluate_query(q["expect"], ranked)
+                m["ranked"] = ranked
+                per_query[q["id"]] = m
+            rep = {"random_sample": {"per_query": per_query, "errors": {},
+                                      "is_canonical_null_baseline": False}}
+            c = score.negative_control(rep, queries)
+            outcomes.append(c["random_sample"]["separates"])
+        self.assertTrue(any(outcomes),
+                         "across 50 seeded runs this stateless-but-random runner never "
+                         "passed -- if this starts failing, the floor's false-pass rate "
+                         "for this class has changed and bench/README.md's admission "
+                         "needs re-checking, not deleting")
+        self.assertFalse(all(outcomes),
+                          "across 50 seeded runs this runner always passed -- that would "
+                          "mean the floor no longer distinguishes it from noise at all, "
+                          "a different (worse) problem than the one this test documents")
 
 
 if __name__ == "__main__":

@@ -347,9 +347,13 @@ def run_all(queries: list[dict], corpus: Path, runner_specs: list[str], limit: i
 # this narrowed claim too.
 #
 # Narrower still (fix round 3, a THIRD external re-gate, both reviewers
-# independently): this control assumes a STATELESS runner -- one whose
-# output for a given (kind, query) is a pure function of that invocation
-# alone. Both reviewers built a runner that reads neither `--query` nor
+# independently): this control assumes a STATELESS, DETERMINISTIC runner
+# -- one whose output for a given (kind, query) is the SAME every time,
+# not merely computed fresh from scratch each call. ("Stateless" alone is
+# not enough: a runner can persist nothing at all between calls and still
+# vary its own output from one invocation to the next by rolling dice --
+# that is a DIFFERENT failure mode from the stateful one below; see fix
+# round 4 further down.) Both reviewers built a runner that reads neither `--query` nor
 # `--kind` at all: it persists an invocation counter across subprocess
 # calls (a file under its own scratch state) and keys its answer on that
 # ordinal position instead. `run_all` invokes every query in one FIXED
@@ -380,10 +384,40 @@ def run_all(queries: list[dict], corpus: Path, runner_specs: list[str], limit: i
 # same attack, not closes it -- a stateful runner can persist per-query-id
 # state instead of per-ordinal-position state just as easily. The honest
 # claim, stated here and in bench/README.md and in `print_control`'s
-# output: this control catches a STATELESS runner blind to query TEXT
-# that keys on `kind` (or an equivalent partition) -- a runner that
-# persists state across invocations and keys on call order is outside
-# what this design can catch.
+# output: this control catches a STATELESS, DETERMINISTIC runner blind to
+# query TEXT whose output is FIXED WITHIN EACH KIND (or an equivalent
+# partition) -- a runner that persists state across invocations and keys
+# on call order, OR one that varies its own output at random from one
+# invocation to the next, is outside what this design can catch.
+#
+# Fix round 4 (a FOURTH external re-gate, Codex): "stateless" alone was
+# still too broad, because it does not require the output to be
+# deterministic. Codex built a runner that persists nothing at all (no
+# counter file, no state of any kind survives between calls) and reads
+# NONE of its five CLI arguments -- not `--query`, `--kind`, `--limit`,
+# `--corpus`, or `--mode` -- yet independently samples ten ids at random,
+# drawn from this corpus's own 32 real ids, on every invocation. This
+# runner is stateless under the fix-round-3 wording (nothing persists
+# between calls) but not deterministic (two calls with identical
+# arguments can return different output), so its real-vs-shuffled `gain`
+# is pure sampling noise centered near zero, not the algebraic zero a
+# fixed or kind-branching runner gets. Because this floor is a
+# MINIMUM-EFFECT FLOOR at a 1x-SE margin, not a calibrated significance
+# test (see "Calibration" below), noise alone clears that margin often
+# enough to matter in practice: on Codex's own runs it PASSED on the
+# fifth attempt, gain 0.0456 against se 0.0361, exit 0. This is not a bug
+# in the derangement -- there is no fixed `(kind, query) -> output`
+# mapping for the derangement to inspect, because the SAME invocation can
+# produce different output on different calls -- it is a limit of the
+# claim's own wording, now corrected to "stateless, deterministic, with
+# output fixed within each kind": a runner whose output for a given
+# `kind` is not a fixed function of that `kind` is outside what this
+# design can catch, and building one that clears the floor by chance is
+# an admitted, unresolved possibility, not a denied one. Kept as
+# `_RANDOM_SAMPLING_RUNNER` in tests/test_bench.py
+# (TestRandomSamplingRunnerIsOutsideTheClaim), which demonstrates
+# in-process, across many seeds, that this shape both passes and fails --
+# it does not, and must not, assert that it always fails.
 #
 # The derangement: one rotation per kind group (not one rotation over the
 # whole list), each by an offset COPRIME with that group's own size --
@@ -758,10 +792,11 @@ def print_control(control: dict, runner_names) -> None:
           "significance test: a runner must beat its own query-shuffled score "
           "by more than the sample SE of its own real-minus-shuffled PAIRED "
           "DIFFERENCES, printed below as `se`, to count as separating):")
-    print("  catches a STATELESS runner blind to query TEXT that branches on at "
-          "most `kind` -- NOT a runner that persists state across invocations "
-          "and keys on call order; see bench/README.md's \"What this control "
-          "actually claims\".")
+    print("  catches a STATELESS, DETERMINISTIC runner blind to query TEXT "
+          "whose output is fixed within each `kind` -- NOT a runner that "
+          "persists state across invocations and keys on call order, or one "
+          "that varies its own output at random from call to call; see "
+          "bench/README.md's \"What this control actually claims\".")
     for display in runner_names:
         if display not in control:
             continue
@@ -776,10 +811,11 @@ def print_control(control: dict, runner_names) -> None:
         print("INCONCLUSIVE: " + ", ".join(control["failed_runners"])
               + " did not beat their own query-shuffled score by more than the "
                 "sample SE of their own paired differences. Within this control's "
-                "narrowed claim (a stateless runner blind to query text, keying "
-                "at most on `kind`), the query set does not separate a "
-                "query-sensitive ranking from a query-blind one for these "
-                "runners, so their numbers say nothing about retrieval quality.")
+                "narrowed claim (a stateless, deterministic runner blind to query "
+                "text, with output fixed within each `kind`), the query set does "
+                "not separate a query-sensitive ranking from a query-blind one "
+                "for these runners, so their numbers say nothing about retrieval "
+                "quality.")
 
 
 # ---------------------------------------------------------------------------
