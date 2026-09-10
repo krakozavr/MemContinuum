@@ -14,6 +14,7 @@ a public-facing doc. These are the two mechanical halves of that rule:
 2. docs/INTERNALS.md exists and the README links it exactly where a maintainer
    would look for it.
 """
+import contextlib
 import os
 import re
 import subprocess
@@ -908,6 +909,438 @@ class TestInternalsDocumentsTreeSitterTier(unittest.TestCase):
                 lang, text,
                 f"docs/INTERNALS.md never names the {lang!r} LANGUAGE_TABLE row",
             )
+
+
+class TestSkillHonesty(unittest.TestCase):
+    """skill-honesty: the memcontinuum skill is an agent's operating manual,
+    not documentation about code -- anything it restates that repo-init.sh /
+    mc-registry-lib.sh already compute (the default store location, its
+    refusals) will drift the moment the code changes, unseen, exactly as it
+    did for nine days before this fix (memory/incidents/
+    machine-layer-drifted-unseen-for-nine-days.md). It must instead point the
+    agent at the dry-run's own printed output. Separately, the consent flow
+    must be a pinned structured prompt for every state the skill can see --
+    not prose, and not silent for `wired`/`declined`/`partial-wired`, which
+    used to leave the agent to improvise (the same defect S2 fixed for
+    `undecided`, in three more states).
+
+    Fix round 2 (skill-honesty gate): both reviewers mutated a copy of
+    SKILL.md -- dropping options, reordering them, making the dry-run
+    optional, allowing store deletion, reintroducing a removed computed
+    rule under different wording -- and the ORIGINAL version of this class
+    caught none of it, because it only checked isolated substrings.
+    `_options()` below now pins each state's COMPLETE option list (text,
+    order, and count in one `assertEqual`, so a drop/add/reorder/reword all
+    fail), FORBIDDEN_PATTERNS below catches a removed rule regrown in
+    different words (not just its exact historical phrase), and
+    TestSkillHonestyMutations re-applies the reviewers' own mutations,
+    in-memory, against these tests to prove each one now fails.
+
+    What this class cannot catch, by construction: a computed rule restated
+    in wording that matches none of FORBIDDEN_PATTERNS (the pattern list is
+    finite, not a semantic diff against the tool's own source); a
+    dropped/altered SENTENCE inside an option's pinned text that some other
+    assertion doesn't happen to cover; and anything about behavior once an
+    agent leaves the page -- these tests read SKILL.md as text, they never
+    run it.
+    """
+
+    # Exact phrases the old SKILL.md used to restate a rule repo-init.sh /
+    # mc-registry-lib.sh computes on its own -- the default store's WSL-disk
+    # rule and its plain-sibling fallback, and --project's character class.
+    # Regrowing any of these means the skill is predicting an answer again
+    # instead of reading it off the tool's own dry-run output.
+    REMOVED_PHRASES = [
+        "Windows-mounted",
+        "$HOME/dev/<repo>-MemContinuum-Store",
+        "beside the git repo the cwd is in",
+        "[A-Za-z0-9._-]+",
+        "earns its keep",
+        "does not enforce this name",
+        "is REQUIRED here",
+        "except the one flow in step 4",
+    ]
+
+    # Same removed rules, but matched as PATTERNS rather than one exact
+    # historical phrase -- a reviewer mutation reintroduced the WSL rule as
+    # "Windows mounted" (no hyphen) and "$HOME/dev" (no full suffix),
+    # neither of which REMOVED_PHRASES above would catch.
+    FORBIDDEN_PATTERNS = [
+        (re.compile(r'windows[\s-]?mounted', re.IGNORECASE),
+         "the Windows-mounted-drive default-location rule repo-init.sh computes"),
+        (re.compile(r'\$HOME/dev\b'),
+         "the WSL default store location repo-init.sh computes"),
+        (re.compile(
+            r'--store\b.{0,80}(?:requires?|must\s+(?:be\s+)?(?:paired|accompanied)|needs?)'
+            r'\b.{0,80}--claude-dir',
+            re.IGNORECASE | re.DOTALL,
+         ),
+         "the --store/--claude-dir pairing repo-init.sh already enforces and reports"),
+        (re.compile(r'inside an existing git repo', re.IGNORECASE),
+         "the nested-repo refusal message repo-init.sh already prints"),
+        # Widened from a literal "five hooks" (regate round 2, Grok N6): a
+        # mutation reworded this as "five write-side hooks" and slipped
+        # through the exact two-word phrase. Up to two words may sit between
+        # the count and "hooks" now.
+        (re.compile(r'\bfive\b(?:\s+\S+){0,2}\s+hooks\b', re.IGNORECASE),
+         "a hardcoded hook count (the write-side count is a fact of the templates, not this prose)"),
+    ]
+
+    STATE_MARKERS = [
+        ("**`undecided`**", "**`partial-wired`**"),
+        ("**`partial-wired`**", "**`wired`**"),
+        ("**`wired`**", "**`declined`**"),
+        ("**`declined`**", "**`not-a-repo`"),
+    ]
+
+    @staticmethod
+    def _section(text, start_marker, end_marker):
+        start = text.index(start_marker)
+        end = text.index(end_marker, start)
+        return text[start:end]
+
+    @classmethod
+    def _ask_section(cls, text):
+        return cls._section(text, "## 2. Ask", "## 3. Act on the answer")
+
+    @staticmethod
+    def _options(section):
+        """Every top-level numbered option ("N. ...") in one state's prompt
+        section, in document order, each whitespace-normalized across its
+        own continuation lines (markdown hard-wraps prose, so a pinned
+        option can legitimately carry a newline+indent that isn't a wording
+        change). Line-based, not a single normalize-then-regex pass over
+        the whole section: a numbered list's continuation lines are never
+        blank-separated from their own item, but ARE separated from
+        whatever prose follows the list (e.g. `wired`'s "Moving a wired
+        store..." paragraph after its two options) -- the first blank line
+        ends the list, and nothing after it is captured, however many
+        digits it contains. Pinning len()+order+text in one assertEqual
+        against this list's output fails on a dropped, added, reordered, OR
+        reworded option -- not just a phrase substring, which is what let
+        every one of the reviewers' option mutations slip past the
+        original version of this class. The printed NUMBER itself is also
+        checked here, not just discarded (brief B2: pin "numbering" too) --
+        a renumbering with no reorder (e.g. "1. Keep as is" / "3. Stop
+        using...") would pass a text-and-order-only check, so each item's
+        digit must equal its 1-based position or this raises immediately."""
+        items = []
+        current = None
+        for line in section.splitlines():
+            m = re.match(r'^\s*(\d+)\.\s+(.*)$', line)
+            if m:
+                if current is not None:
+                    items.append(current)
+                expected = len(items) + 1
+                assert int(m.group(1)) == expected, (
+                    f"option numbered {m.group(1)!r} where {expected} was expected: {m.group(2)!r}"
+                )
+                current = m.group(2).strip()
+            elif current is not None:
+                stripped = line.strip()
+                if stripped == "":
+                    items.append(current)
+                    current = None
+                else:
+                    current += " " + stripped
+        if current is not None:
+            items.append(current)
+        return items
+
+    @classmethod
+    def _state_options(cls, text, start_marker, end_marker):
+        return cls._options(cls._section(cls._ask_section(text), start_marker, end_marker))
+
+    def test_no_computed_store_rules_restated(self):
+        text = SKILL.read_text()
+        for phrase in self.REMOVED_PHRASES:
+            self.assertNotIn(
+                phrase, text,
+                f"SKILL.md restates a rule repo-init.sh/mc-registry-lib.sh "
+                f"computes ({phrase!r}) -- point at the dry-run's own "
+                "output instead of predicting it"
+            )
+
+    def test_no_computed_rule_restated_in_different_wording(self):
+        text = SKILL.read_text()
+        for pattern, label in self.FORBIDDEN_PATTERNS:
+            match = pattern.search(text)
+            self.assertIsNone(
+                match, f"SKILL.md restates {label}, using wording "
+                f"REMOVED_PHRASES does not pin ({match.group(0) if match else ''!r})"
+            )
+
+    def test_store_location_points_at_the_dry_run_verbatim(self):
+        text = SKILL.read_text()
+        self.assertIn("dry-run", text)
+        self.assertIn("verbatim", text)
+        self.assertIn("`store :` line", text)
+
+    def test_consent_section_names_the_structured_prompt(self):
+        text = SKILL.read_text()
+        section = self._ask_section(text)
+        # Whitespace-normalized: markdown hard-wraps prose at ~80 columns, so
+        # a pinned multi-word phrase can legitimately carry a newline+indent
+        # between two of its words without the sentence having changed.
+        normalized = " ".join(section.split())
+        self.assertIn("structured multiple-choice prompt", normalized)
+        self.assertIn("never prose", normalized)
+
+    def test_undecided_names_all_four_options_exactly(self):
+        options = self._state_options(SKILL.read_text(), "**`undecided`**", "**`partial-wired`**")
+        self.assertEqual(options, [
+            "Yes, with code retrieval — records, plus decisions surfaced before edits under the named code root",
+            "Yes, rationale only — records, no code retrieval",
+            "No — record the decline; this repo is never asked again",
+            "Not now — nothing is recorded; you will be asked again next session",
+        ])
+
+    def test_partial_wired_names_all_three_options_exactly(self):
+        options = self._state_options(SKILL.read_text(), "**`partial-wired`**", "**`wired`**")
+        self.assertEqual(options, [
+            "Complete the wiring — finishes what a prior install left half-done",
+            "Remove what is there",
+            "Not now — leave it half-wired; asked again next session",
+        ])
+
+    def test_wired_names_both_options_exactly(self):
+        # Fix round 2 (B1): "Change where the store lives" and "Add or
+        # remove code retrieval" were dropped -- repo-init.sh re-renders a
+        # hook group entirely from the current invocation's own flags with
+        # no way to read back what was already wired, so either option was
+        # a data-loss trap (see step 4 and memory/incidents/ for the
+        # reproduction). Only the two options the tooling can do safely
+        # remain.
+        options = self._state_options(SKILL.read_text(), "**`wired`**", "**`declined`**")
+        self.assertEqual(options, [
+            "Keep as is — nothing changes",
+            "Stop using MemContinuum here — record the decline (the hooks stay wired until removed by hand; say so)",
+        ])
+
+    def test_declined_names_both_options_exactly(self):
+        options = self._state_options(SKILL.read_text(), "**`declined`**", "**`not-a-repo`")
+        self.assertEqual(options, [
+            "Keep declined",
+            "Wire it after all",
+        ])
+
+    def test_wired_and_declined_first_option_keeps_the_recorded_answer(self):
+        # The true invariant (corrected mid-task: the coordinator's own
+        # spec for `partial-wired` puts "Complete the wiring" -- not a
+        # no-change option -- first, so "the first option is ALWAYS the
+        # safe one" was never accurate for every state). What actually
+        # holds everywhere: a repo with a recorded answer (`wired`,
+        # `declined`) always offers that answer, unchanged, as option 1.
+        text = SKILL.read_text()
+        wired = self._state_options(text, "**`wired`**", "**`declined`**")
+        declined = self._state_options(text, "**`declined`**", "**`not-a-repo`")
+        self.assertEqual(wired[0], "Keep as is — nothing changes")
+        self.assertEqual(declined[0], "Keep declined")
+
+    def test_no_option_ever_reads_as_deleting_a_store(self):
+        # Behavior-level guard rather than a phrase: scan every option's
+        # own text, in every state, for anything that reads as destroying
+        # the store -- catches a NEW destructive option added anywhere,
+        # regardless of the words it uses.
+        text = SKILL.read_text()
+        destructive = re.compile(r'delete|destroy|\bwipe\b|rm -rf', re.IGNORECASE)
+        for start, end in self.STATE_MARKERS:
+            for opt in self._state_options(text, start, end):
+                self.assertIsNone(
+                    destructive.search(opt),
+                    f"an option in {start} reads as deleting the store: {opt!r}"
+                )
+
+    def test_no_option_ever_deletes_a_store_is_a_stated_rule(self):
+        text = SKILL.read_text()
+        # "## 5. Rules" is the last section -- slice to end of file rather
+        # than to a following marker that does not exist.
+        rules = text[text.index("## 5. Rules"):]
+        self.assertIn("Never delete a store, ever", rules)
+        self.assertIn("never destructive by accident", rules)
+        self.assertIn("recorded answer", rules)
+
+    def test_dry_run_is_never_optional(self):
+        # Pins the canonical dry-run paragraphs, whitespace-normalized,
+        # rather than a loose substring -- "make the dry-run optional" was
+        # one of the reviewers' mutations and the word "Always" is exactly
+        # what such a mutation would drop or hedge.
+        text = SKILL.read_text()
+        section = self._section(text, "## 3. Act on the answer", "## 4. Reversing")
+        normalized = " ".join(section.split())
+        self.assertIn(
+            "**Always dry-run first, and read the `store :` line — and any "
+            "`note:` line above it — out of that dry-run's own output, "
+            "verbatim, to the human.**",
+            normalized,
+        )
+        self.assertIn("Always dry-run first, show the plan, then run it.", normalized)
+
+    def test_not_a_repo_and_no_config_get_no_prompt(self):
+        text = SKILL.read_text()
+        section = self._ask_section(text)
+        tail = section[section.index("**`not-a-repo`"):]
+        self.assertIn("no prompt", tail)
+
+
+class TestSkillHonestyMutations(unittest.TestCase):
+    """Proves the pinned tests above actually catch what they claim to --
+    against the REAL production assertions, not a second, independently
+    written check that merely replicates what the guard is supposed to do.
+
+    Fix round 3 (skill-honesty re-gate, Codex 5 / Grok 5): the previous
+    version of this class re-implemented each assertion inline (comparing
+    `_state_options()` output, or re-scanning FORBIDDEN_PATTERNS, by hand)
+    instead of calling the `TestSkillHonesty` method it claimed to be
+    proving. Codex demonstrated the gap by replacing every production
+    honesty test with a no-op in memory and reran this class: all eight
+    still passed. That made this class fixture coverage, not proof.
+
+    Every test below now uses `_mutated_skill()` to point the shared module
+    global `SKILL` at a temp file holding the mutated text, then calls the
+    actual bound `TestSkillHonesty` test method by name -- the same method
+    that runs in the real suite, reading `SKILL.read_text()` itself. If a
+    future edit ever weakens or deletes the underlying production
+    assertion, the corresponding test here fails too, because there is no
+    second copy of the logic left to keep passing on its own.
+
+    A mutation whose regex/replace finds nothing to change is a stale
+    fixture, not a passing test -- guarded by assertNotEqual against the
+    unmutated text first."""
+
+    def setUp(self):
+        self.text = SKILL.read_text()
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _mutated_skill(mutated_text):
+        """Point the module-level SKILL global at a temp file holding
+        `mutated_text` for the duration of the `with` block, then restore
+        it. Test methods on TestSkillHonesty reference the bare module
+        global `SKILL` (resolved at call time, not bound to `self`), so
+        this makes their own `SKILL.read_text()` read the mutation."""
+        global SKILL
+        real_skill = SKILL
+        fd, tmp_name = tempfile.mkstemp(suffix=".md")
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(mutated_text)
+            SKILL = tmp_path
+            yield
+        finally:
+            SKILL = real_skill
+            tmp_path.unlink(missing_ok=True)
+
+    def _assert_production_test_catches(self, mutated_text, test_name):
+        with self._mutated_skill(mutated_text):
+            with self.assertRaises(
+                AssertionError,
+                msg=f"TestSkillHonesty.{test_name} did not fail against the mutation",
+            ):
+                getattr(TestSkillHonesty(test_name), test_name)()
+
+    def test_dropping_a_wired_option_is_caught(self):
+        mutated = self.text.replace(
+            "1. Keep as is — nothing changes\n"
+            "2. Stop using MemContinuum here — record the decline (the hooks stay wired\n"
+            "   until removed by hand; say so)\n",
+            "1. Keep as is — nothing changes\n",
+        )
+        self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
+        self._assert_production_test_catches(mutated, "test_wired_names_both_options_exactly")
+
+    def test_reordering_partial_wired_options_is_caught(self):
+        mutated = self.text.replace(
+            "1. Complete the wiring — finishes what a prior install left half-done\n"
+            "2. Remove what is there\n"
+            "3. Not now — leave it half-wired; asked again next session\n",
+            "1. Remove what is there\n"
+            "2. Complete the wiring — finishes what a prior install left half-done\n"
+            "3. Not now — leave it half-wired; asked again next session\n",
+        )
+        self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
+        self._assert_production_test_catches(mutated, "test_partial_wired_names_all_three_options_exactly")
+
+    def test_adding_an_extra_undecided_option_is_caught(self):
+        mutated = self.text.replace(
+            "4. Not now — nothing is recorded; you will be asked again next session\n\n"
+            "**`partial-wired`**",
+            "4. Not now — nothing is recorded; you will be asked again next session\n"
+            "5. Maybe later — think about it and decide next week\n\n"
+            "**`partial-wired`**",
+        )
+        self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
+        self._assert_production_test_catches(mutated, "test_undecided_names_all_four_options_exactly")
+
+    def test_making_the_dry_run_optional_is_caught(self):
+        mutated = self.text.replace("Always dry-run first, show the plan, then run it.",
+                                     "Optionally dry-run first, show the plan, then run it.")
+        self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
+        self._assert_production_test_catches(mutated, "test_dry_run_is_never_optional")
+
+    def test_allowing_store_deletion_is_caught(self):
+        mutated = self.text.replace(
+            "1. Keep declined\n2. Wire it after all\n",
+            "1. Keep declined\n2. Wire it after all\n3. Delete the store and start over\n",
+        )
+        self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
+        self._assert_production_test_catches(mutated, "test_no_option_ever_reads_as_deleting_a_store")
+
+    def test_reintroducing_the_wsl_rule_in_different_words_is_caught(self):
+        mutated = self.text.replace(
+            "**`undecided`** — four options:",
+            "On a Windows mounted drive the default landing spot is under "
+            "$HOME/dev.\n\n**`undecided`** — four options:",
+        )
+        self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
+        self._assert_production_test_catches(mutated, "test_no_computed_rule_restated_in_different_wording")
+
+    def test_deleting_the_never_delete_rule_is_caught(self):
+        mutated = self.text.replace(
+            "- Never delete a store, ever, regardless of what is asked. Never move one\n"
+            "  on your own judgment either — step 4's relocation path is a deliberate,\n"
+            "  human-directed command, never something this skill decides or automates\n"
+            "  by itself.\n",
+            "",
+        )
+        self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
+        self._assert_production_test_catches(mutated, "test_no_option_ever_deletes_a_store_is_a_stated_rule")
+
+    def test_restoring_the_claude_dir_requirement_is_caught(self):
+        mutated = self.text.replace(
+            "## 3. Act on the answer",
+            "An explicit --store REQUIRES an explicit --claude-dir alongside it.\n\n"
+            "## 3. Act on the answer",
+            1,
+        )
+        self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
+        self._assert_production_test_catches(mutated, "test_no_computed_rule_restated_in_different_wording")
+
+    def test_widened_hook_count_rewording_is_caught(self):
+        # Regate round 2, Grok N6: "five write-side hooks" slipped past the
+        # old literal "five hooks" FORBIDDEN_PATTERNS entry. Proves the
+        # widened pattern (see FORBIDDEN_PATTERNS above) now catches it via
+        # the real production test, not just a standalone regex check.
+        mutated = self.text.replace(
+            "## 5. Rules",
+            "This wiring always installs five write-side hooks.\n\n## 5. Rules",
+            1,
+        )
+        self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
+        self._assert_production_test_catches(mutated, "test_no_computed_rule_restated_in_different_wording")
+
+    def test_rewording_the_store_claude_dir_pairing_without_requires_is_caught(self):
+        # Regate round 2, Grok N1: "--store must be paired with --claude-dir"
+        # (no "requires") slipped past the old requires?-only pattern.
+        mutated = self.text.replace(
+            "## 3. Act on the answer",
+            "An explicit --store must be paired with an explicit --claude-dir.\n\n"
+            "## 3. Act on the answer",
+            1,
+        )
+        self.assertNotEqual(mutated, self.text, "fixture stale: nothing matched")
+        self._assert_production_test_catches(mutated, "test_no_computed_rule_restated_in_different_wording")
 
 
 if __name__ == "__main__":

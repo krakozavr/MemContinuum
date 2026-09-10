@@ -528,11 +528,37 @@ answers survive a reinstall.
 
 Project level, by hand:
 
-1. Remove this tool's hook entries from the project's `settings.local.json` — or
-   restore `settings.local.json.bak-memcontinuum`.
-2. Delete `<claude-dir>/skills/memory-search/`.
-3. Delete `<store>/.git/hooks/post-commit`.
-4. Delete `~/.memcontinuum/<project>.sqlite`, and
+1. Remove this tool's hook entries from the project's `settings.local.json` —
+   identified by these script basenames in their `"command"` fields:
+   `pre-edit-chain.sh newfile-nudge.sh ledger-post-edit.sh
+   precompact-persist.sh sessionstart-remind.sh userprompt-remind.sh
+   sessionend-stamp.sh`
+
+   **Basename alone is not safe to hand-delete when this `.claude`
+   directory is shared by more than one project** — every project's
+   entries use these same seven basenames, so a basename-only deletion
+   also removes the OTHER project's wiring, the exact failure
+   `repo-init.sh`'s own project-aware merge exists to prevent. Every entry
+   also carries `MEMCONTINUUM_PROJECT=<name>` in the same `"command"`
+   string; delete only the lines that match BOTH the basename and this
+   repo's own project name. For the same reason, restoring
+   `settings.local.json.bak-memcontinuum` is only safe when this
+   `.claude` directory holds exactly one project: the backup is a
+   snapshot of the WHOLE file taken just before the most recent install
+   into it, by any project, so restoring it can also revert another
+   project's wiring made since.
+2. Delete `<claude-dir>/skills/memory-search/` — **only if this `.claude`
+   directory holds no other wired project.** Like the hook entries above,
+   this copy is shared: every project wired into the same directory reads
+   the same skill, so deleting it while another project is still wired
+   removes that project's skill too. It carries no project marker, so
+   there is nothing to filter on — check the remaining hook entries for a
+   `MEMCONTINUUM_PROJECT=` naming any other project first.
+3. Delete `<claude-dir>/rules/memcontinuum.md` — same condition, same
+   reason: one shared copy, no project marker.
+4. Delete `<store>/.git/hooks/post-commit` and `<store>/.git/hooks/pre-commit`
+   (or wherever `--store-hooks-dir` pointed them).
+5. Delete `~/.memcontinuum/<project>.sqlite`, and
    `~/.memcontinuum/<project>-code.sqlite` if `code-reindex` was ever run, and
    `~/.memcontinuum/<project>.embed-pending`, `<project>.embed.lock` and
    `<project>.embed.log` if the post-commit hook's embed-worker ever ran, and
