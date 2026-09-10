@@ -61,6 +61,30 @@
 #                            of the plain not-indexed-extension. Unset ->
 #                            falls back to MEMCONTINUUM_LANG_EXTS (no
 #                            language-available-not-wired distinction).
+#                            newlang-nudge (N1/N2): this case ALSO surfaces
+#                            a one-line user-visible nudge -- naming the
+#                            language, saying this project has not wired
+#                            it, and pointing at the memcontinuum skill for
+#                            the (unrestated) re-wiring procedure -- unless
+#                            WIRED_EXTS is empty (language-less wiring,
+#                            Ruling 6 above: there is no complete wired set
+#                            to name yet, so nagging about every known
+#                            extension would be noise, not help). Deduped
+#                            once per language per SESSION, never
+#                            permanently, via the same per-session state
+#                            file every other write-side hook already
+#                            shares (mc_state_file_for/mc_update_state_json,
+#                            hooks/memlib.sh) -- reused rather than a new
+#                            persistence layer because it is already
+#                            session-scoped (no cleanup story needed) and a
+#                            permanent "already told you" marker would mean
+#                            a user who missed the line once never hears it
+#                            again. memlib.sh is sourced LAZILY, only once
+#                            this branch is already committed to (a brand
+#                            new file in a known-but-unwired language,
+#                            inherently rare) -- the common already-wired
+#                            path below never pays for it, and never gains
+#                            a subprocess it didn't have before.
 #   MEMCONTINUUM_NEVER_EXTS  space-separated glob list of extensions the
 #                            human answered "never" to at install time.
 #                            Checked BEFORE the wired gate: a match
@@ -112,8 +136,13 @@ mkdir -p "$MEMCONTINUUM_HOME" 2>/dev/null || true
 # by project; matches memlib.sh's MC_PROJECT / pre-edit-chain.sh's own PROJECT
 # resolution -- MEMCONTINUUM_PROJECT, else basename(MEMCONTINUUM_ROOT), else
 # "default"). This hook resolves its own copy of PY/LOG/PROJECT rather than
-# sourcing memlib.sh for them -- it never sources memlib.sh at all (see
-# hooks/mc-path-lib.sh below for the one function it does need).
+# sourcing memlib.sh for them on the common path -- see hooks/mc-path-lib.sh
+# below for the one function it needs unconditionally. newlang-nudge (N1):
+# the one exception is the known-but-not-wired-language branch further
+# down, which lazily sources memlib.sh (only once it is already on that
+# rare branch) to reuse mc_state_file_for/mc_update_state_json for the
+# nudge's per-session dedupe -- never on this common path, so the cost
+# described above is unchanged for every already-wired write.
 PROJECT="${MEMCONTINUUM_PROJECT:-}"
 if [ -z "$PROJECT" ]; then
     if [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
@@ -131,9 +160,46 @@ log() {
 }
 
 finish() {
-    # $1 = one-word outcome for the log line; everything after stays 0.
-    log "$(date -Iseconds 2>/dev/null || date) newfile-nudge outcome=$1 project=${PROJECT:-} file=${FILE_PATH:-}"
+    # $1 = one-word outcome for the log line; $2 = optional extra
+    # "key=value" token (sessionstart-remind.sh's own finish() established
+    # this convention first -- mirrored here, not invented, for
+    # newlang-nudge's nudge=shown/nudge=suppressed field). Placed between
+    # outcome= and the trailing project=/file= fields, never after: file=
+    # is last on purpose (a path can contain spaces), and appending
+    # anything past it would land inside what a reader takes for the path.
+    local extra="${2:-}"
+    if [ -n "$extra" ]; then
+        log "$(date -Iseconds 2>/dev/null || date) newfile-nudge outcome=$1 $extra project=${PROJECT:-} file=${FILE_PATH:-}"
+    else
+        log "$(date -Iseconds 2>/dev/null || date) newfile-nudge outcome=$1 project=${PROJECT:-} file=${FILE_PATH:-}"
+    fi
     exit 0
+}
+
+# _emit_additional_context MESSAGE -- builds and prints the
+# hookSpecificOutput/additionalContext JSON envelope both of this hook's
+# nudges need (the wired-file reminder further down, and newlang-nudge's
+# known-but-unwired-language nudge) -- one JSON-building implementation,
+# not two. Prints the JSON and returns 0 on success; prints nothing and
+# returns 1 on failure, leaving the caller to pick which outcome to log.
+_emit_additional_context() {
+    export HOOK_MESSAGE="$1"
+    local output_json
+    output_json="$(PYTHONPATH= "$PY" -c '
+import json, os
+
+print(json.dumps({
+    "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "additionalContext": os.environ["HOOK_MESSAGE"],
+    }
+}))
+' 2>>"$LOG")"
+    if [ -z "$output_json" ]; then
+        return 1
+    fi
+    printf '%s\n' "$output_json"
+    return 0
 }
 
 # --- read + parse the payload -------------------------------------------
@@ -198,6 +264,51 @@ _ext_matches() {  # $1=path  $2=space-separated glob list
     set +f
     return 1
 }
+
+# _lang_name_for -- newlang-nudge (N1): a human-readable language name for
+# the nudge's "name the language" requirement, e.g. ".ts" -> "typescript".
+# Deliberately a bash `case` table, not a memidx.py/chunkers call: this
+# hook never calls memidx.py for real work (see the file header), and this
+# branch is already the rare one -- but a python subprocess just to look
+# up a display name is still one more thing to fail, and this hook's own
+# design principle is to stay simple enough to reason about without one.
+# Mirrors chunkers.LANGUAGE_TABLE (chunkers/__init__.py) row-for-row, since
+# the extension is not always a substring of the language name (.ts is
+# "typescript", .rs is "rust", four JS extensions are all "javascript") --
+# tests/test_write_hooks.py::
+# test_language_name_matches_the_engine_registry_for_every_known_language
+# runs the real hook against every LANGUAGE_TABLE row and fails the moment
+# a new row (or a new extension on an existing row) has no arm here, so
+# this table cannot drift unnoticed the way INC-0117's copy did. An
+# extension with no arm (this engine version's KNOWN_EXTS should never
+# produce one, but render-time env is not proof) falls back to the raw
+# extension text -- correct but unhelpfully terse is better than wrong.
+_lang_name_for() {  # $1=path  $2=space-separated glob list (KNOWN_EXTS)
+    set -f
+    for _pat in $2; do
+        case "$1" in
+            $_pat)
+                set +f
+                case "$_pat" in
+                    "*.swift") printf 'swift' ;;
+                    "*.py") printf 'python' ;;
+                    "*.js"|"*.jsx"|"*.mjs"|"*.cjs") printf 'javascript' ;;
+                    "*.ts") printf 'typescript' ;;
+                    "*.tsx") printf 'tsx' ;;
+                    "*.java") printf 'java' ;;
+                    "*.php") printf 'php' ;;
+                    "*.rs") printf 'rust' ;;
+                    "*.lua") printf 'lua' ;;
+                    *) printf '%s' "${_pat#\*.}" ;;
+                esac
+                return 0
+                ;;
+        esac
+    done
+    set +f
+    printf '%s' "${1##*.}"
+    return 1
+}
 WIRED_EXTS="${MEMCONTINUUM_LANG_EXTS-*.swift}"
 KNOWN_EXTS="${MEMCONTINUUM_KNOWN_EXTS:-$WIRED_EXTS}"
 
@@ -218,7 +329,93 @@ fi
 
 if ! _ext_matches "$FILE_PATH" "$WIRED_EXTS"; then
     if _ext_matches "$FILE_PATH" "$KNOWN_EXTS"; then
-        finish "language-available-not-wired"   # logged outcome; future: user-visible nudge text
+        # newlang-nudge (N1/N2): the DETECTION outcome below is unchanged
+        # from before this feature existed (literal string pinned by
+        # memidx.py's stats and tests/test_stats.py) -- it still fires on
+        # every single occurrence, dup or not. Whether the visible nudge
+        # actually SHOWS is a separate question, answered below and
+        # recorded in the extra nudge= field, never by changing this
+        # outcome literal.
+        #
+        # Language-less wiring (WIRED_EXTS explicitly empty, Ruling 6): a
+        # project that has deliberately wired NO language has no complete
+        # wired set to name in the message at all, and every known
+        # extension would otherwise nag on every single write -- silent,
+        # exactly as before this feature, same as any other unwired
+        # extension.
+        if [ -z "$WIRED_EXTS" ]; then
+            finish "language-available-not-wired"
+        fi
+
+        LANG_NAME="$(_lang_name_for "$FILE_PATH" "$KNOWN_EXTS")"
+
+        # Dedupe: once per language per SESSION (coordinator's decision),
+        # not once per project forever -- reusing mc_state_file_for's
+        # existing per-session state file (hooks/memlib.sh), never a new
+        # persistence layer. It is already session-scoped, so there is no
+        # cleanup story to invent; a PERMANENT "already told you" marker
+        # would mean a user who missed the line once never hears it
+        # again; one line per language per session is self-limiting while
+        # still reminding someone who has not acted. session_id is parsed
+        # from $PAYLOAD here, lazily -- nowhere else in this hook needs
+        # it, and this whole branch only runs for a brand-new file in a
+        # known-but-unwired language, inherently rare.
+        SESSION_ID=""
+        if [ -n "$PAYLOAD" ]; then
+            if command -v jq >/dev/null 2>&1; then
+                SESSION_ID="$(printf '%s' "$PAYLOAD" | jq -r '.session_id // empty' 2>/dev/null)"
+            else
+                SESSION_ID="$(printf '%s' "$PAYLOAD" | "$PY" -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+print(d.get("session_id", "") or "")
+' 2>/dev/null)"
+            fi
+        fi
+
+        NUDGE_DECISION="shown"
+        if [ -n "$SESSION_ID" ]; then
+            # shellcheck source=memlib.sh
+            source "$SCRIPT_DIR/memlib.sh"
+            STATE_FILE="$(mc_state_file_for "$PROJECT" "$SESSION_ID")"
+            export MC_NUDGE_LANG="$LANG_NAME"
+            mc_update_state_json "$STATE_FILE" '
+import os
+
+lang = os.environ.get("MC_NUDGE_LANG", "")
+langs = state.setdefault("nudged_langs", [])
+if lang in langs:
+    sys.exit(3)
+langs.append(lang)
+print(json.dumps(state))
+' >>"$MC_LOG" 2>&1
+            MC_UPDATE_RC=$?
+            # 3 = the transform's own "already told this session" signal
+            # (never a state write, matches nothing that was printed).
+            # Any OTHER non-zero code is a lock failure (97/98, mapped to
+            # 1 by mc_update_state_json itself, already logged under its
+            # own outcome=lock-timeout/lock-open-failed line) -- fail
+            # OPEN toward SHOWING the nudge rather than silently losing
+            # the one thing this feature exists to do; an occasional
+            # extra line under lock contention is a minor annoyance, a
+            # silently-never-told user is the bug being fixed.
+            if [ "$MC_UPDATE_RC" -eq 3 ]; then
+                NUDGE_DECISION="suppressed"
+            fi
+        fi
+
+        if [ "$NUDGE_DECISION" = "suppressed" ]; then
+            finish "language-available-not-wired" "nudge=suppressed"
+        fi
+
+        LANG_MESSAGE="New file type: ${LANG_NAME} is supported by this engine but not wired for this project — wiring it means re-running repo-init.sh with the complete current parameter set plus ${LANG_NAME}, not a one-flag add; see the memcontinuum skill for the procedure."
+        if ! _emit_additional_context "$LANG_MESSAGE"; then
+            finish "language-available-not-wired" "nudge=build-failed"
+        fi
+        finish "language-available-not-wired" "nudge=shown"
     fi
     finish "not-indexed-extension"
 fi

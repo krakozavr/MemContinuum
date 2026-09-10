@@ -31,6 +31,7 @@ from types import SimpleNamespace
 TOOLS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(TOOLS_DIR))
 
+import chunkers  # noqa: E402
 import memidx  # noqa: E402
 
 # This machine's venv python is never hardcoded in tracked test code -- set
@@ -5472,9 +5473,9 @@ class TestNewFileNudgeHook(unittest.TestCase):
         env.update(overrides)
         return env
 
-    def payload_for(self, file_path: str):
+    def payload_for(self, file_path: str, session_id: str = "s-newfile-nudge"):
         return json.dumps({
-            "session_id": "s-newfile-nudge",
+            "session_id": session_id,
             "hook_event_name": "PreToolUse",
             "tool_name": "Write",
             "cwd": str(self.code_root),
@@ -5663,9 +5664,13 @@ class TestNewFileNudgeHook(unittest.TestCase):
 
     def test_known_but_not_wired_extension_logs_language_available_not_wired(self):
         """Only *.swift is wired; KNOWN includes *.py -- a new .py file
-        must stay silent on stdout (never nudged for an unwired language)
-        but log outcome=language-available-not-wired, not the plain
-        not-indexed-extension."""
+        must now ALSO surface a one-line user-visible nudge naming
+        "python" (newlang-nudge N1/N2), on top of the outcome this test
+        pinned before the feature existed. Still logs
+        outcome=language-available-not-wired, not the plain
+        not-indexed-extension -- that outcome literal is unchanged
+        (memidx.py stats / tests/test_stats.py pin it); only the stdout
+        behavior and the log line's extra `nudge=` field are new."""
         target = self.code_root / "new_thing.py"
         env = self.base_env(
             MEMCONTINUUM_LANG_EXTS="*.swift",
@@ -5673,9 +5678,13 @@ class TestNewFileNudgeHook(unittest.TestCase):
         )
         proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.strip(), "", proc.stdout)
+        data = json.loads(proc.stdout)
+        ctx = data["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("python", ctx.lower())
+        self.assertEqual(len(ctx.splitlines()), 1, ctx)
         log_text = (self.home / "hook.log").read_text()
         self.assertIn("outcome=language-available-not-wired", log_text)
+        self.assertIn("nudge=shown", log_text)
         self.assertNotIn("outcome=not-indexed-extension", log_text)
 
     def test_unknown_extension_logs_not_indexed_extension(self):
@@ -5849,6 +5858,192 @@ class TestNewFileNudgeHook(unittest.TestCase):
         proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("New source file under", proc.stdout, proc.stdout)
+
+    # --- newlang-nudge N1/N2: the user-visible new-language nudge --------
+    #
+    # Letters (a)-(g) below match .superpowers/sdd/newlang-nudge/brief.md's
+    # own red-test list verbatim, so a reviewer can check this class
+    # against that list line for line.
+
+    def python_wired_known_ts_env(self, **overrides):
+        """A python-wired project where the engine also supports
+        typescript (KNOWN) but this project never wired it (not in
+        WIRED) -- the brief's own scenario for (a)-(d)."""
+        env = self.base_env(
+            MEMCONTINUUM_LANG_EXTS="*.py",
+            MEMCONTINUUM_KNOWN_EXTS="*.py *.ts",
+        )
+        env.update(overrides)
+        return env
+
+    def test_a_new_language_nudges_once_naming_it(self):
+        """(a) a new .ts file in a python-wired project -> the nudge
+        fires once, naming typescript."""
+        target = self.code_root / "thing.ts"
+        proc, _elapsed = run_script(
+            NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), self.python_wired_known_ts_env()
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = json.loads(proc.stdout)
+        ctx = data["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("typescript", ctx.lower())
+        self.assertIn("not wired", ctx.lower())
+        # N2: honest about cost -- must name the COMPLETE parameter set,
+        # never read as automatic or a one-flag change.
+        self.assertIn("complete", ctx.lower())
+        # N1: point at the skill that documents the re-wiring procedure;
+        # never restate the procedure itself (INC-0117: a restated
+        # computed rule/procedure is a copy that can drift out from under
+        # the code/skill that actually owns it).
+        self.assertIn("memcontinuum skill", ctx.lower())
+        for restated_flag in ("--adopt-only", "--record-decision", "--code-root", "--langs", "--project"):
+            self.assertNotIn(restated_flag, ctx)
+        self.assertEqual(len(ctx.splitlines()), 1, ctx)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=language-available-not-wired", log_text)
+        self.assertIn("nudge=shown", log_text)
+
+    def test_b_second_file_same_language_same_session_is_suppressed(self):
+        """(b) a second new .ts file in the SAME session -> no second
+        nudge on stdout, and the log distinguishes the suppression from
+        the first, shown occurrence."""
+        env = self.python_wired_known_ts_env()
+        first = self.code_root / "first.ts"
+        second = self.code_root / "second.ts"
+        proc1, _ = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(first)), env)
+        self.assertEqual(proc1.returncode, 0, proc1.stderr)
+        self.assertNotEqual(proc1.stdout.strip(), "", "first occurrence must nudge")
+
+        proc2, _ = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(second)), env)
+        self.assertEqual(proc2.returncode, 0, proc2.stderr)
+        self.assertEqual(proc2.stdout.strip(), "", proc2.stdout)
+
+        log_text = (self.home / "hook.log").read_text()
+        lines = [l for l in log_text.splitlines() if "language-available-not-wired" in l]
+        self.assertEqual(len(lines), 2, log_text)
+        self.assertIn("nudge=shown", lines[0])
+        self.assertIn("nudge=suppressed", lines[1])
+
+    def test_c_new_session_nudges_again(self):
+        """(c) the SAME language, a NEW session_id -> fires again.
+        Dedupe is per session, not permanent: coordinator's ruling (see
+        the hook's own comment) is that a permanent "already told you"
+        marker means a user who missed the line once never hears it
+        again."""
+        env = self.python_wired_known_ts_env()
+        first = self.code_root / "first.ts"
+        run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(first), session_id="s-session-one"), env)
+
+        second = self.code_root / "second.ts"
+        proc2, _ = run_script(
+            NEWFILE_NUDGE_HOOK,
+            self.payload_for(str(second), session_id="s-session-two"),
+            env,
+        )
+        self.assertEqual(proc2.returncode, 0, proc2.stderr)
+        data = json.loads(proc2.stdout)
+        ctx = data["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("typescript", ctx.lower())
+        log_text = (self.home / "hook.log").read_text()
+        shown = [l for l in log_text.splitlines() if "nudge=shown" in l]
+        self.assertEqual(len(shown), 2, log_text)
+
+    def test_d_wired_extension_in_same_project_is_unaffected(self):
+        """(d) a .py file in that same python-wired project -> unchanged
+        behaviour: today's plain "New source file under" message, no
+        new-language line, no nudge= field, no language-available-not-
+        wired outcome at all."""
+        target = self.code_root / "thing.py"
+        proc, _elapsed = run_script(
+            NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), self.python_wired_known_ts_env()
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = json.loads(proc.stdout)
+        ctx = data["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("New source file under", ctx)
+        self.assertNotIn("typescript", ctx.lower())
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=nudged", log_text)
+        self.assertNotIn("language-available-not-wired", log_text)
+        self.assertNotIn("nudge=", log_text)
+
+    def test_e_unsupported_extension_stays_silent(self):
+        """(e) an extension the engine does not support at all (not in
+        WIRED or KNOWN) -> silent, exactly as today."""
+        target = self.code_root / "thing.zzz"
+        proc, _elapsed = run_script(
+            NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), self.python_wired_known_ts_env()
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "", proc.stdout)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=not-indexed-extension", log_text)
+        self.assertNotIn("nudge=", log_text)
+
+    def test_f_language_less_wiring_stays_unchanged(self):
+        """(f) language-less wiring (MEMCONTINUUM_LANG_EXTS explicitly
+        empty, Ruling 6) -> unchanged: no nudge for ANY known extension,
+        even though every write there is technically "known but not
+        wired" -- there is no complete wired set to name at all, so the
+        nudge is gated on WIRED_EXTS being non-empty (see the hook's own
+        comment). Same scenario
+        test_explicit_empty_lang_exts_with_known_exts_logs_language_available_not_wired
+        already pins for the outcome literal; this test pins that the
+        NEW stdout/log behavior stays equally silent."""
+        env = self.base_env(
+            MEMCONTINUUM_LANG_EXTS="",
+            MEMCONTINUUM_KNOWN_EXTS="*.py *.ts",
+        )
+        target = self.code_root / "thing.ts"
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "", proc.stdout)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=language-available-not-wired", log_text)
+        self.assertNotIn("nudge=shown", log_text)
+
+    def test_g_wired_path_gains_no_subprocess(self):
+        """(g) latency on the wired-extension path is unchanged. Timing
+        alone is noisy, so this is a structural proxy: a wired-extension
+        write must never create the sessions/ state directory
+        mc_update_state_json manages, proving the new dedupe machinery
+        (memlib.sh, the state-file read/lock/write) never even runs on
+        this path. See test_p95_latency_over_20_runs for the timing
+        number itself (reported before/after in the task report)."""
+        target = self.code_root / "Sources" / "NewThing.swift"
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("New source file under", proc.stdout)
+        self.assertFalse(
+            (self.home / "sessions").exists(),
+            "a wired-extension write must not touch per-session state at all",
+        )
+
+    def test_language_name_matches_the_engine_registry_for_every_known_language(self):
+        """Every chunkers.LANGUAGE_TABLE row's language name must be what
+        the hook actually names when that row's first extension is KNOWN
+        but not WIRED -- exercised through the real hook subprocess (no
+        source-text matching), so a new LANGUAGE_TABLE row with no
+        matching arm in the hook's own extension->name table fails HERE,
+        loudly, rather than drifting silently the way INC-0117's stale
+        copy did for nine days."""
+        for lang, row in chunkers.LANGUAGE_TABLE.items():
+            ext = row["extensions"][0]
+            known = " ".join("*" + e for e in row["extensions"])
+            env = self.base_env(
+                MEMCONTINUUM_LANG_EXTS="*.__never_wired__",
+                MEMCONTINUUM_KNOWN_EXTS=f"*.__never_wired__ {known}",
+            )
+            target = self.code_root / f"probe{ext}"
+            proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            data = json.loads(proc.stdout or "{}")
+            ctx = data.get("hookSpecificOutput", {}).get("additionalContext", "")
+            self.assertIn(
+                lang, ctx.lower(),
+                f"extension {ext!r} (LANGUAGE_TABLE row {lang!r}) is not named "
+                f"in the nudge: {ctx!r}",
+            )
 
 
 class TestF2AutoCallers(unittest.TestCase):
