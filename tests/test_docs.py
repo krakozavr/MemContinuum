@@ -1343,5 +1343,138 @@ class TestSkillHonestyMutations(unittest.TestCase):
         self._assert_production_test_catches(mutated, "test_no_computed_rule_restated_in_different_wording")
 
 
+class TestConsentIsManualNotAutomatic(unittest.TestCase):
+    """TOP-0110 L3: manual wiring (running `/memcontinuum` in a repository)
+    is the ONLY official way to set up a repo. The SessionStart detector
+    speaks through `hookSpecificOutput.additionalContext`, delivered to the
+    ASSISTANT, never to the human -- nothing can compel an assistant to
+    surface it. Across two observed sessions the owner was never asked;
+    both times he reached the setup dialogue only by invoking the skill
+    himself. The README used to promise "You get asked once", which is
+    exactly the claim this ruling forbids: a doc may describe the detector
+    as advisory, never as something that reaches the human without the
+    human (or an unreliable assistant) acting on it.
+
+    These tests pin the retired phrasing's absence and the replacement's
+    substance for a specific reason: a PUBLIC_DOCS-wide keyword scan for
+    "asked" would also trip on skills/memcontinuum/SKILL.md's own pinned
+    structured-prompt options (settled design, tested by TestSkillHonesty
+    above -- e.g. "you will be asked again next session" is the human-
+    facing option text of a LIVE dialogue the human just triggered by
+    running the skill, not an unprompted claim) and on docs/INTERNALS.md's
+    accurate internal description of the detector's own hook-state
+    machine (`undecided` | `asks, once` names what the hook EMITS to
+    additionalContext, not a promise about who sees it). Specific pins,
+    not a blanket regex, are what this class checks.
+    """
+
+    @staticmethod
+    def _between(text, start_marker, end_marker):
+        start = text.index(start_marker)
+        end = text.index(end_marker, start)
+        return text[start:end]
+
+    def test_readme_no_longer_claims_you_get_asked_once(self):
+        text = README.read_text()
+        self.assertNotIn("You get asked once", text)
+        self.assertNotIn("the detector puts one question to you", text)
+
+    def test_readme_day_to_day_leads_with_manual_invocation(self):
+        text = README.read_text()
+        section = text[text.index("## Day to day"):text.index("**`/memcontinuum` any time.**")]
+        normalized = " ".join(section.split())
+        self.assertIn(
+            "run `/memcontinuum` inside it, once — that is the supported "
+            "way to decide",
+            normalized,
+        )
+
+    def test_readme_day_to_day_states_the_detector_is_advisory_only(self):
+        text = README.read_text()
+        section = text[text.index("## Day to day"):text.index("**`/memcontinuum` any time.**")]
+        normalized = " ".join(section.split())
+        self.assertIn(
+            "that channel is advisory: it reaches the assistant, not you, "
+            "and nothing here can compel an assistant to raise it",
+            normalized,
+        )
+        self.assertIn(
+            "if a session never asks, that is the expected case, not a bug",
+            normalized,
+        )
+
+    def test_readme_day_to_day_keeps_the_registry_and_reversal_substance(self):
+        # The one part of the old paragraph that was TRUE and had to survive
+        # the rewrite: an answer is recorded permanently and reversible.
+        text = README.read_text()
+        section = text[text.index("## Day to day"):text.index("**`/memcontinuum` any time.**")]
+        normalized = " ".join(section.split())
+        self.assertIn(
+            "recorded permanently in the machine's decision registry and "
+            "can be changed again at any time through the same skill",
+            normalized,
+        )
+
+    def test_readme_install_section_names_the_manual_step_as_required(self):
+        text = README.read_text()
+        section = self._between(text, "### Once per repository", "```bash")
+        normalized = " ".join(section.split())
+        self.assertIn(
+            "Run `/memcontinuum` inside the repository — that is the "
+            "required step",
+            normalized,
+        )
+
+    def test_readme_noticeable_paragraph_does_not_imply_the_human_is_asked(self):
+        text = README.read_text()
+        self.assertNotIn(
+            "makes an un-initialized repository *noticeable*:", text,
+            "the old phrasing read as a promise to the human -- it must "
+            "name the assistant as the audience instead",
+        )
+        section = self._between(
+            text, "This step is what makes an un-initialized repository",
+            "### Once per repository",
+        )
+        normalized = " ".join(section.split())
+        self.assertIn("noticeable to the assistant", normalized)
+        self.assertIn("Noticing is not the same as asking you", normalized)
+
+    def test_skill_frontmatter_names_itself_the_official_manual_entry_point(self):
+        text = SKILL.read_text()
+        frontmatter = text.split("---", 2)[1]
+        self.assertIn("official, manual way", frontmatter)
+
+    def test_skill_opening_states_the_detector_is_advisory_only(self):
+        text = SKILL.read_text()
+        section = text[:text.index("## 1. Read the current state")]
+        normalized = " ".join(section.split())
+        self.assertIn(
+            "that channel is advisory only — it reaches the assistant, "
+            "never the human directly",
+            normalized,
+        )
+
+    def test_skill_not_now_paragraph_no_longer_promises_a_bare_re_ask(self):
+        # This sentence sits in "## 3. Act on the answer", explanatory prose
+        # around the pinned option list in "## 2. Ask" (section 2 itself is
+        # settled design -- TestSkillHonesty pins its exact option text,
+        # "you will be asked again next session" included, and this test
+        # must not touch that). This paragraph is not pinned there and
+        # carried the same false promise in the assistant's own follow-up
+        # explanation, so it gets the same correction as the README.
+        text = SKILL.read_text()
+        section = self._between(
+            text, '**"Not now" → record nothing.**', "## 4. Reversing",
+        )
+        normalized = " ".join(section.split())
+        self.assertNotIn(
+            "the detector stays quiet for the rest of this session and "
+            "asks again next time",
+            normalized,
+        )
+        self.assertIn("no guarantee it reaches the human unless", normalized)
+
+
 if __name__ == "__main__":
     unittest.main()
