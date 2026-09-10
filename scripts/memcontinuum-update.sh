@@ -15,7 +15,7 @@
 # compares what was rendered there against the engine checkout right now.
 #
 # No flags (or --dry-run, the default): prints a table and writes nothing.
-#   repo | claude-dir | stamped | engine | store-match | rules | skill | action
+#   repo | claude-dir | stamped | engine | store-match | rules | skill | store-hooks | action
 #     repo         the registry row's key (an origin remote URL, or a path)
 #     claude-dir   one claude-dir this row lists (or recovers -- see below)
 #     stamped      the MEMCONTINUUM_RENDERED value on this claude-dir's
@@ -31,6 +31,25 @@
 #     skill        ok/stale/missing/foreign -- <claude-dir>/skills/
 #                  memory-search/SKILL.md's own identity (a `name:
 #                  memory-search` frontmatter line) and stamp
+#     store-hooks  ok/stale/missing/foreign/not-checked -- the WORSE of
+#                  STORE's git post-commit and pre-commit wrapper states
+#                  (no render stamp of their own, so judged by re-deriving
+#                  the exact bytes repo-init.sh would write now and comparing
+#                  byte-for-byte); not-checked when the store is gone, git
+#                  resolves its hooks dir outside its own .git (a shared
+#                  core.hooksPath), or no python can be resolved to check
+#                  against. Informational only -- unlike rules/skill, it does
+#                  not feed `action` or --apply's decision (see
+#                  mc_update_store_hooks_state's own comment for why, and
+#                  what that narrows). Every OTHER rendered artifact this
+#                  command does not put in a column of its own (STORE's
+#                  README.md/.gitignore/tree -- write-once, never
+#                  re-rendered by this command) is still named, every walk,
+#                  in a `not-checked: ...` line beneath the table -- never
+#                  simply absent. "not-checked" is honest about what it
+#                  says: these are not looked at, not that they cannot go
+#                  stale (a README's baked python/engine/code-root recipe
+#                  can, and a user pasting a stale one would care).
 #     action       ok | stale | store-mismatch | store-form-stale |
 #                  store-form-updated | rules-stale | rules-missing |
 #                  rules-foreign | skill-foreign | migrate |
@@ -72,17 +91,41 @@
 # --repo PATH
 #            narrows the walk to that one repository's row. Required
 #            alongside the migration options below (they describe ONE row).
-# --machine  also report the MACHINE layer -- the detector hook and skill
-#            copy in the user-level claude-dir memcontinuum-setup.sh
-#            installed into (it records which one; ~/.claude is only the
-#            fallback), which no per-repo install touches. The reported line
-#            names that directory. It is compared against its own
-#            fingerprint, over its own inputs (memcontinuum-setup.sh, the
-#            machine-level skill, the settings merge), so an edit to any of
-#            those shows up HERE and not as drift in every repository -- and a
-#            template change shows up in the rows and not here. With --apply,
-#            re-runs memcontinuum-setup.sh, but only when it is actually
-#            stale. Off by default -- most drift is per-repo.
+# --machine  ALWAYS reported now, by default -- this flag is accepted for
+#            compatibility (scripts that already pass it keep working) and
+#            does nothing beyond what already happens. Reports the MACHINE
+#            layer -- the detector hook and skill copy in the user-level
+#            claude-dir memcontinuum-setup.sh installed into (it records
+#            which one; ~/.claude is only the fallback), which no per-repo
+#            install touches. The reported line names that directory. It is
+#            compared against its own fingerprint, over its own inputs
+#            (memcontinuum-setup.sh, the machine-level skill, the settings
+#            merge), so an edit to any of those shows up HERE and not as
+#            drift in every repository -- and a template change shows up in
+#            the rows and not here. With --apply, re-runs
+#            memcontinuum-setup.sh, but only when it is actually stale.
+#            --machine makes no difference here -- it is a no-op either way
+#            (see above). --no-machine does: it skips the machine layer,
+#            and this refresh along with it, entirely (see --no-machine
+#            below).
+#
+#            This used to be off by default: a health check that answers
+#            only for the layer it was asked about reads as "everything is
+#            current" to the person running it, and real drift in the
+#            machine-level skill went unreported for days because nobody
+#            ever passed --machine. A silent, healthy-looking gap is worse
+#            than one extra line most runs do not need, so this now always
+#            prints (and --apply always fixes a stale one).
+# --no-machine
+#            the opt-out, for the rare caller that wants the repo rows alone
+#            (e.g. a script that greps the table and cannot afford an extra
+#            non-tabular line, or a run that must never shell out to
+#            memcontinuum-setup.sh). Skips the machine layer entirely --
+#            no report line, no refresh under --apply. Combining --machine
+#            and --no-machine is refused, the same as --apply/--dry-run:
+#            they are opposites, and "whichever came last" would mean the
+#            same pair of flags reports or skips depending only on typing
+#            order.
 #
 #            Right after a stale refresh, --apply --machine also reconciles
 #            the pinned tree-sitter grammar wheels and the tree-sitter runtime:
@@ -108,12 +151,12 @@
 # reported success, and it did something else.
 #
 #   walk        no --repo. Every wired row.
-#               --dry-run --apply --machine
+#               --dry-run --apply --machine --no-machine
 #   targeted    --add-lang / --never-ext (with --repo). One row's language
 #               and never-extension lists, additively, and nothing else.
 #               --dry-run --repo --add-lang --never-ext
 #   repo        --repo, without --add-lang/--never-ext. One row.
-#               --dry-run --apply --machine --repo --claude-dir
+#               --dry-run --apply --machine --no-machine --repo --claude-dir
 #
 # In `repo` mode the remaining flags depend on the ROW, not on the command
 # line, so they are settled when the row is read:
@@ -255,6 +298,12 @@ REPO_INIT="$SCRIPT_DIR/repo-init.sh"
 DECIDE="$SCRIPT_DIR/memcontinuum-decide.sh"
 SETUP="$ENGINE_ROOT/memcontinuum-setup.sh"
 MEMIDX="$ENGINE_ROOT/memidx.py"
+# Where scripts/repo-init.sh's install_store_hook_wrapper points its exec
+# line at -- needed here too, for the store-hooks health column's own
+# byte-for-byte expected-content check (mc_store_hook_wrapper_state,
+# scripts/mc-registry-lib.sh) to reconstruct exactly what repo-init.sh would
+# write right now.
+HOOKS_DIR="$ENGINE_ROOT/hooks"
 
 # The bash that is running THIS script, for the scripts it shells out to.
 # `bash` off PATH would silently hop interpreters mid-command -- which is
@@ -312,7 +361,17 @@ APPLY=0
 # key off APPLY's default the walk mode uses.
 DRY_RUN_EXPLICIT=0
 APPLY_EXPLICIT=0
-MACHINE=0
+# Default ON since INC-0117 (a health check that only answers for the layer
+# it was asked about reads as "everything is current" for the layer it was
+# not). --machine is kept, accepted and harmless, for compatibility;
+# --no-machine is the new opt-out. MACHINE_EXPLICIT/NO_MACHINE_EXPLICIT track
+# which one (if either) was actually TYPED, distinct from MACHINE's own
+# default-derived value -- the targeted mode's refusal below, and the
+# contradiction check right after arg parsing, both need to know that a human
+# asked for one of these, not that the default happens to be 1.
+MACHINE=1
+MACHINE_EXPLICIT=0
+NO_MACHINE_EXPLICIT=0
 ADD_LANG=""
 NEVER_EXT=""
 LANGS_FLAG=""
@@ -348,7 +407,8 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run) APPLY=0; DRY_RUN_EXPLICIT=1; shift ;;
         --apply) APPLY=1; APPLY_EXPLICIT=1; shift ;;
-        --machine) MACHINE=1; shift ;;
+        --machine) MACHINE=1; MACHINE_EXPLICIT=1; shift ;;
+        --no-machine) MACHINE=0; NO_MACHINE_EXPLICIT=1; shift ;;
         --add-lang) take_value "$@"; ADD_LANG="$2"; shift 2 ;;
         --never-ext) take_value "$@"; NEVER_EXT="$2"; shift 2 ;;
         --langs) take_value "$@"; LANGS_FLAG="$2"; shift 2 ;;
@@ -368,6 +428,15 @@ done
 # writes.
 if [ "$APPLY_EXPLICIT" -eq 1 ] && [ "$DRY_RUN_EXPLICIT" -eq 1 ]; then
     echo "--apply and --dry-run are contradictory: one writes, the other only reports. Give exactly one (--dry-run is the default when neither is given)." >&2
+    echo "Nothing was read and nothing was written." >&2
+    exit 2
+fi
+
+# Same reasoning, same shape, for --machine/--no-machine: opposites, and
+# "whichever came last" would mean the same pair of flags reports or skips
+# the machine layer depending only on typing order.
+if [ "$MACHINE_EXPLICIT" -eq 1 ] && [ "$NO_MACHINE_EXPLICIT" -eq 1 ]; then
+    echo "--machine and --no-machine are contradictory: one reports the machine layer, the other skips it. Give at most one (the machine layer is reported by default when neither is given)." >&2
     echo "Nothing was read and nothing was written." >&2
     exit 2
 fi
@@ -474,7 +543,12 @@ else
     [ "${#OVERRIDE_CODE_ROOTS[@]}" -eq 0 ] || refuse_flag targeted --code-root "$TARGETED_WHY"
     [ -z "$LANGS_FLAG" ] || refuse_flag targeted --langs "$TARGETED_WHY (--add-lang is how this mode names a language.)"
     [ "$SET_NEVER_GIVEN" -eq 0 ] || refuse_flag targeted --set-never-ext "--set-never-ext supplies the WHOLE never-list for a legacy row's migration (--apply --repo PATH --claude-dir DIR --set-never-ext LIST). To add one extension to a row that already records its parameters, use --never-ext."
-    [ "$MACHINE" -eq 0 ] || refuse_flag targeted --machine "this mode acts on one repository's row. The machine layer is a separate layer with its own command: $0 --apply --machine."
+    # MACHINE defaults to 1 now (reported by default in walk/repo mode), so
+    # the refusal below keys on MACHINE_EXPLICIT/NO_MACHINE_EXPLICIT -- whether
+    # one of these was actually TYPED -- never on MACHINE's own value, or this
+    # would refuse targeted mode unconditionally.
+    [ "$MACHINE_EXPLICIT" -eq 0 ] || refuse_flag targeted --machine "this mode acts on one repository's row. The machine layer is a separate layer with its own command: $0 --apply --machine (or a plain $0, which now reports it by default)."
+    [ "$NO_MACHINE_EXPLICIT" -eq 0 ] || refuse_flag targeted --no-machine "this mode never reports or touches the machine layer -- there is nothing here for --no-machine to opt out of."
 fi
 
 # --- python resolution (only needed for legacy-row lang recovery below) ---
@@ -583,6 +657,77 @@ mc_update_skill_state() {
     fi
     mc_update_artifact_state "$dest" "$is_foreign" "$stamp_line"
     MC_SKILL_STATE="$MC_ARTIFACT_STATE"
+    return 0
+}
+
+# mc_update_store_hooks_state -- sets MC_STORE_HOOKS_STATE, a combined
+# ok/stale/missing/foreign/not-checked verdict for STORE's git post-commit
+# and pre-commit wrappers (scripts/repo-init.sh install_store_hook_wrapper's
+# two rendered artifacts -- the only artifacts it installs that carry no
+# render stamp of their own; see mc_store_hook_wrapper_state's own comment
+# in scripts/mc-registry-lib.sh for why currency has to be judged by
+# re-deriving the exact expected bytes instead). Globals in: STORE, PROJECT.
+#
+# "not-checked" (never a guess) when:
+#   - the store itself does not exist (mc_is_marked_store) -- nothing to
+#     check the wrappers of;
+#   - git resolves the store's hooks directory OUTSIDE its own .git (a
+#     shared/global core.hooksPath) -- the exact condition repo-init.sh
+#     itself refuses to install a wrapper into, so this command has no
+#     location it may safely inspect either;
+#   - no python can be resolved (mc_update_resolve_python) -- the expected
+#     wrapper content names a python path, and this table does not guess at
+#     one it cannot confirm repo-init.sh would actually use.
+#
+# Combined as the WORST of the two wrappers' individual states -- one column,
+# not two, for the same "keep the table readable" reason rules/skill already
+# stay single columns -- ranked foreign > missing > stale > ok: a foreign
+# wrapper is a human decision repo-init.sh will never make for you (it skips
+# and reports, same as a foreign rules file or skill copy); missing means the
+# append-only guard is not installed at all; stale is the ordinary
+# re-render-and-it's-fixed case.
+#
+# Deliberately informational only -- unlike rules/skill, NONE of
+# stale/missing/foreign here feeds the `action` column or --apply's
+# re-render decision (round-2 gate finding G4: an earlier version of this
+# comment named only the stale/python-drift case below, but missing and
+# foreign ride the identical action=ok / --apply-is-a-no-op path and are
+# the same trade at a wider blast radius). repo-init.sh already regenerates
+# (or correctly skips) both wrappers unconditionally on every real install
+# it performs, so whenever --apply re-renders a claude-dir for any OTHER
+# reason (stale hook lines, missing rules, ...) a stale store-hooks state
+# is fixed as a side effect. --apply does NOT reach, ever, on its own:
+#   - stale, when everything else is already `ok` and only a machine-level
+#     python change made the wrapper's embedded python path stale;
+#   - missing, when the append-only guard was never installed (deleted, or
+#     a pre-this-feature store) -- --apply leaves it missing on its own;
+#     unlike a missing rules file, which independently produces
+#     `rules-missing` and gets repaired immediately, nothing here notices
+#     until some OTHER problem forces a re-render anyway;
+#   - foreign, a hand-authored wrapper -- --apply leaves it in place, same
+#     as a foreign rules file or skill copy.
+# All three are named here rather than silently left unfixed and
+# unmentioned; pinned by tests/test_update.py TestStoreHooksColumn
+# .test_missing_and_foreign_leave_action_ok_and_apply_is_a_no_op.
+mc_update_store_hooks_state() {
+    MC_STORE_HOOKS_STATE="not-checked"
+    mc_is_marked_store "$STORE" || return 0
+    mc_store_hooks_dir "$STORE" || return 0
+    local py
+    py="$(mc_update_resolve_python)" || return 0
+    local post pre
+    mc_store_hook_wrapper_state "$MC_STORE_HOOKS_DIR/post-commit" "$HOOKS_DIR" \
+        "post-commit-reindex.sh" "$STORE" "$PROJECT" "$py"
+    post="$MC_STORE_HOOK_STATE"
+    mc_store_hook_wrapper_state "$MC_STORE_HOOKS_DIR/pre-commit" "$HOOKS_DIR" \
+        "pre-commit-append-only.sh" "$STORE" "$PROJECT" "$py"
+    pre="$MC_STORE_HOOK_STATE"
+    case "$post $pre" in
+        *foreign*) MC_STORE_HOOKS_STATE="foreign" ;;
+        *missing*) MC_STORE_HOOKS_STATE="missing" ;;
+        *stale*)   MC_STORE_HOOKS_STATE="stale" ;;
+        *)         MC_STORE_HOOKS_STATE="ok" ;;
+    esac
     return 0
 }
 
@@ -922,12 +1067,19 @@ mc_note_replace_field() {
 
 TABLE_HEADER_PRINTED=0
 print_row() {
-    # print_row REPO CLAUDE_DIR STAMPED STORE_MATCH RULES SKILL ACTION
+    # print_row REPO CLAUDE_DIR STAMPED STORE_MATCH RULES SKILL STORE_HOOKS ACTION
+    #
+    # store-hooks (I2, updater-coverage workstream): ok/stale/missing/
+    # foreign/not-checked for STORE's git post-commit and pre-commit
+    # wrappers -- see mc_update_store_hooks_state's own comment. One more
+    # column, deliberately not two (one per wrapper): the table is what a
+    # human scans, and rules/skill already establish the one-column-per-
+    # artifact-class precedent this follows rather than doubling.
     if [ "$TABLE_HEADER_PRINTED" -eq 0 ]; then
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "repo" "claude-dir" "stamped" "engine" "store-match" "rules" "skill" "action"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "repo" "claude-dir" "stamped" "engine" "store-match" "rules" "skill" "store-hooks" "action"
         TABLE_HEADER_PRINTED=1
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$ENGINE_SHA" "$4" "$5" "$6" "$7"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$ENGINE_SHA" "$4" "$5" "$6" "$7" "$8"
 }
 
 # --- process_claude_dir: the per-(row, claude-dir) walk + optional apply ---
@@ -985,6 +1137,7 @@ process_claude_dir() {
 
     mc_update_rules_state "$claude_dir"
     mc_update_skill_state "$claude_dir"
+    mc_update_store_hooks_state
 
     # store-missing outranks everything, INCLUDING a clean stamp and a
     # store= that still matches what is rendered. A rendered
@@ -1053,7 +1206,7 @@ process_claude_dir() {
         action="ok"
     fi
 
-    print_row "$KEY" "$claude_dir" "$stamp" "$store_match" "$MC_RULES_STATE" "$MC_SKILL_STATE" "$action"
+    print_row "$KEY" "$claude_dir" "$stamp" "$store_match" "$MC_RULES_STATE" "$MC_SKILL_STATE" "$MC_STORE_HOOKS_STATE" "$action"
 
     # store-form-stale only ever fires with APPLY=0 (see above) -- the
     # hint's remedy is always "re-run with --apply", literally, never
@@ -1504,7 +1657,7 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
     NEVER_COMMA="$(printf '%s' "$NEVER_SEMI" | tr ';' ',')"
 
     if [ -z "$PROJECT" ]; then
-        print_row "$KEY" "(unknown)" "none" "unknown" "unknown" "unknown" "unrecoverable"
+        print_row "$KEY" "(unknown)" "none" "unknown" "unknown" "unknown" "unknown" "unrecoverable"
         echo "  no project= recorded for $KEY -- re-run memcontinuum-decide.sh wired --repo ... --store ... --project ... to fix" >&2
         # Work left undone is work left undone: --apply promised to end with
         # every walked row correct, and this one was never even resolved to a
@@ -1544,7 +1697,7 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
             case "$KEY" in
                 /*) CLAUDE_DIRS_SEMI="$KEY/.claude" ;;
                 *)
-                    print_row "$KEY" "(unknown)" "none" "unknown" "unknown" "unknown" "unrecoverable"
+                    print_row "$KEY" "(unknown)" "none" "unknown" "unknown" "unknown" "unknown" "unrecoverable"
                     echo "  legacy row, no claude-dirs recorded, and the key is a remote URL (not a path) -- this row's claude-dir cannot be recovered automatically. Fix: memcontinuum-decide.sh wired --repo PATH --store $STORE --project $PROJECT --claude-dir DIR [--code-root DIR ...] [--langs LIST]" >&2
                     [ "$APPLY" -eq 1 ] && WALK_RC=1
                     continue
@@ -1764,6 +1917,29 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
         process_claude_dir "$CLAUDE_DIR"
     done
 
+    # Named explicitly, once per row -- never silently: scripts/repo-init.sh
+    # also renders $STORE/README.md, $STORE/.gitignore and the store tree
+    # (topics/incidents/investigations/concepts/sources/inbox/*), all
+    # write-if-absent (steps 1-2 of that script) and never touched again by
+    # any later re-render, by design -- an "adopt an existing store" install
+    # must not clobber hand-authored provenance notes in a README a human
+    # already edited. There is no fingerprint stamp on them, and this
+    # command never re-renders them to find out -- so "not-checked" is the
+    # honest and complete answer, not a gap. NOT because their content
+    # "structurally cannot vary" (round-2 gate finding G5 disproved that:
+    # mutating the README's baked python path, editing .gitignore, and
+    # deleting an inbox/ dir all left this footer unchanged -- a user
+    # pasting a stale recipe from that README would care). The honest
+    # reason is narrower: this command deliberately never looks, because
+    # looking would mean re-rendering a file it must not silently
+    # overwrite. Named here so the coverage test
+    # (tests/test_update.py TestUpdaterCoversEveryRenderedArtifact) can
+    # confirm every artifact repo-init.sh renders is accounted for
+    # somewhere in this output, one way or another, and never simply absent.
+    if mc_is_marked_store "$STORE"; then
+        echo "not-checked: $STORE/README.md $STORE/.gitignore (left alone once written, so a hand edit rides through untouched) and $STORE (tree: topics incidents investigations concepts sources inbox/codex inbox/grok inbox/audit) (recreated if deleted, never inspected) -- none of these are ever re-rendered over a file that already exists"
+    fi
+
     if [ "$LEGACY" -eq 1 ] && [ "$APPLY" -eq 1 ] && [ "$LEGACY_ACTION" = "migrate" ] \
            && [ "$MIGRATE_DIRS_WALKED" -gt 0 ] \
            && [ "$MIGRATE_DIRS_RENDERED" -eq "$MIGRATE_DIRS_WALKED" ]; then
@@ -1845,8 +2021,47 @@ if [ "$MACHINE" -eq 1 ]; then
     else
         MACHINE_ACTION="stale"
     fi
+
+    # The detector hook's own stamp (above) is memcontinuum-setup.sh's ONE
+    # rendered artifact that carries a fingerprint; the machine-level skill
+    # copy it also installs carries no stamp of its own at all (unlike the
+    # per-repo skill/rules files) -- INC-0117 was exactly this copy drifting
+    # while nothing checked it directly, only ever inferred through the hook
+    # line's stamp (true only because setup.sh happens to write both in the
+    # same run, sequentially -- an inference, not a check). Compared here
+    # byte-for-byte against this engine's own copy instead: setup.sh writes
+    # it verbatim (a plain `cp`, no template substitution), so byte equality
+    # is the exact and complete answer, needing no stamp. Purely informational
+    # -- it does not feed MACHINE_ACTION or --apply's refresh decision below,
+    # both of which stay keyed on the hook stamp alone; --apply's
+    # memcontinuum-setup.sh re-run already rewrites this file unconditionally
+    # whenever it runs at all, and a stamp-current, byte-stale skill copy
+    # would need its own separate diagnosis this table does not attempt.
+    MACHINE_SKILL_STATE="not-checked"
+    if [ -f "$ENGINE_ROOT/skills/memcontinuum/SKILL.md" ]; then
+        if [ -f "$MACHINE_CLAUDE_DIR/skills/memcontinuum/SKILL.md" ]; then
+            if cmp -s "$ENGINE_ROOT/skills/memcontinuum/SKILL.md" \
+                      "$MACHINE_CLAUDE_DIR/skills/memcontinuum/SKILL.md"; then
+                MACHINE_SKILL_STATE="ok"
+            else
+                MACHINE_SKILL_STATE="stale"
+            fi
+        else
+            MACHINE_SKILL_STATE="missing"
+        fi
+    fi
+
+    # config.sh: not rendered from a template (memcontinuum-setup.sh writes
+    # its own values straight out), so "current/stale" does not apply -- only
+    # "is it there at all", which is what every python/store resolution in
+    # this whole engine depends on existing. Reported for the same reason as
+    # the skill copy above: naming what was NOT independently checked, rather
+    # than folding it silently into the hook-stamp verdict.
+    MACHINE_CONFIG_STATE="missing"
+    [ -f "$MEMCONTINUUM_HOME/config.sh" ] && MACHINE_CONFIG_STATE="present"
+
     echo
-    echo "machine: $MACHINE_CLAUDE_DIR rendered by $MACHINE_STAMP, engine at $MACHINE_ENGINE -- $MACHINE_ACTION"
+    echo "machine: $MACHINE_CLAUDE_DIR rendered by $MACHINE_STAMP, engine at $MACHINE_ENGINE, skill $MACHINE_SKILL_STATE, config $MACHINE_CONFIG_STATE -- $MACHINE_ACTION"
 
     if [ "$APPLY" -eq 1 ]; then
         REFRESH_OK=0

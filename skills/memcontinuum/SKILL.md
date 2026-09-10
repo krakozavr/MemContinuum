@@ -1,16 +1,21 @@
 ---
 name: memcontinuum
-description: Use when deciding whether a repository should keep a MemContinuum decision store, when the SessionStart detector reports an undecided repo, or when someone asks to enable, disable, or check MemContinuum for a project. Records the human's answer so it is never asked again, and can reverse an earlier answer at any time.
+description: The official, manual way to set up MemContinuum for a repository — run this once per repo to decide whether it keeps a decision store. Also use when the SessionStart detector reports an undecided repo, or when someone asks to enable, disable, or check MemContinuum for a project. Records the human's answer so it is never asked again, and can reverse an earlier answer at any time.
 ---
 
 # MemContinuum — per-repository decision
 
 MemContinuum is installed once per machine (`memcontinuum-setup.sh`). Whether any given
 repository *keeps a decision store* is a separate, per-repo choice, and it is
-the human's to make. This skill is the only thing that records that choice.
+the human's to make. Running this skill, once per repository, is the
+official way that choice gets made — not something that happens around the
+human. This skill is the only thing that records that choice.
 
 **A hook may report the state. Only this skill, after a human has answered,
-writes a decision down.** If you were triggered by the SessionStart detector
+writes a decision down.** A SessionStart detector also classifies a repo and
+can hand this trigger to the assistant, but that channel is advisory only —
+it reaches the assistant, never the human directly, and nothing compels an
+assistant to act on it. If you were triggered by the SessionStart detector
 and the human has not actually answered yet, stop and ask them first.
 
 ## 1. Read the current state before saying anything
@@ -43,14 +48,14 @@ what the repo's `.claude` settings actually contain right now, plus
 settings file or an interrupted install can leave them disagreeing. It also
 prints a combined `state=` line -- `wired`, `declined`, `partial-wired` (no
 recorded decision, and only SOME of the always-wired hooks are present --
-SessionStart's detector DOES ask here, same as `undecided`: a half-wired
-repo with no recorded decision is still an open question, not a settled
-one), `undecided`, `not-a-repo`, or `no-config` -- plus the repo key, store
-path and project name where they apply. `wired` also covers an install
-wired before the decision registry existed: `decision=none` with
-`wiring=full` reads as already wired, since the wiring itself is the
-evidence. Report `decision`/`wiring` plainly when they disagree; never guess
-either one from the presence of a directory.
+SessionStart's detector emits its ask into the assistant's context here too,
+same as `undecided`: a half-wired repo with no recorded decision is still an
+open question, not a settled one), `undecided`, `not-a-repo`, or `no-config`
+-- plus the repo key, store path and project name where they apply. `wired`
+also covers an install wired before the decision registry existed:
+`decision=none` with `wiring=full` reads as already wired, since the wiring
+itself is the evidence. Report `decision`/`wiring` plainly when they
+disagree; never guess either one from the presence of a directory.
 
 ## 2. Ask — a structured prompt for every state, never destructive by accident
 
@@ -82,14 +87,14 @@ and the habit of writing records.
    under the named code root
 2. Yes, rationale only — records, no code retrieval
 3. No — record the decline; this repo is never asked again
-4. Not now — nothing is recorded; you will be asked again next session
+4. Not now — nothing is recorded; run `/memcontinuum` again to decide
 
 **`partial-wired`** (some but not all write-side hooks already present, no
 recorded decision) — three options:
 
 1. Complete the wiring — finishes what a prior install left half-done
 2. Remove what is there
-3. Not now — leave it half-wired; asked again next session
+3. Not now — leave it half-wired; run `/memcontinuum` again to decide
 
 **`wired`** — first report the state as facts, straight out of step 1's own
 output (`decision`, `wiring`, `decided_at` — present only when a registry row
@@ -268,8 +273,11 @@ bash "$ENGINE/scripts/memcontinuum-decide.sh" declined --repo REPO
 ```
 
 **"Not now" → record nothing.** Say so and move on; the detector stays quiet
-for the rest of this session and asks again next time. An unrecorded maybe is
-correct here — do not invent a decision to silence a prompt.
+for the rest of this session and reads this repo as undecided again at the
+next one — the same advisory nudge to the assistant as before, with no
+guarantee it reaches the human unless `/memcontinuum` is run again. An
+unrecorded maybe is correct here — do not invent a decision to silence a
+prompt.
 
 ## 4. Reversing or changing an earlier answer
 
