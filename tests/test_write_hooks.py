@@ -5664,9 +5664,9 @@ class TestNewFileNudgeHook(unittest.TestCase):
 
     def test_known_but_not_wired_extension_logs_language_available_not_wired(self):
         """Only *.swift is wired; KNOWN includes *.py -- a new .py file
-        must now ALSO surface a one-line user-visible nudge naming
-        "python" (newlang-nudge N1/N2), on top of the outcome this test
-        pinned before the feature existed. Still logs
+        must now ALSO surface a structured, numbered decision-point nudge
+        naming "python" (newlang-nudge N1), on top of the outcome this
+        test pinned before the feature existed. Still logs
         outcome=language-available-not-wired, not the plain
         not-indexed-extension -- that outcome literal is unchanged
         (memidx.py stats / tests/test_stats.py pin it); only the stdout
@@ -5681,7 +5681,14 @@ class TestNewFileNudgeHook(unittest.TestCase):
         data = json.loads(proc.stdout)
         ctx = data["hookSpecificOutput"]["additionalContext"]
         self.assertIn("python", ctx.lower())
-        self.assertEqual(len(ctx.splitlines()), 1, ctx)
+        # N1 (owner ruling, TOP-0128): a structured numbered-choice
+        # prompt, not a one-line notice -- three options, one per line
+        # after the header line.
+        lines = ctx.splitlines()
+        self.assertEqual(len(lines), 4, ctx)
+        self.assertTrue(lines[1].startswith("1. "), ctx)
+        self.assertTrue(lines[2].startswith("2. "), ctx)
+        self.assertTrue(lines[3].startswith("3. "), ctx)
         log_text = (self.home / "hook.log").read_text()
         self.assertIn("outcome=language-available-not-wired", log_text)
         self.assertIn("nudge=shown", log_text)
@@ -5878,7 +5885,9 @@ class TestNewFileNudgeHook(unittest.TestCase):
 
     def test_a_new_language_nudges_once_naming_it(self):
         """(a) a new .ts file in a python-wired project -> the nudge
-        fires once, naming typescript."""
+        fires once, naming typescript, as a structured three-option
+        decision point (N1, owner ruling TOP-0128) -- not a one-line
+        notice with no way to answer."""
         target = self.code_root / "thing.ts"
         proc, _elapsed = run_script(
             NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), self.python_wired_known_ts_env()
@@ -5888,20 +5897,65 @@ class TestNewFileNudgeHook(unittest.TestCase):
         ctx = data["hookSpecificOutput"]["additionalContext"]
         self.assertIn("typescript", ctx.lower())
         self.assertIn("not wired", ctx.lower())
-        # N2: honest about cost -- must name the COMPLETE parameter set,
-        # never read as automatic or a one-flag change.
-        self.assertIn("complete", ctx.lower())
-        # N1: point at the skill that documents the re-wiring procedure;
-        # never restate the procedure itself (INC-0117: a restated
-        # computed rule/procedure is a copy that can drift out from under
-        # the code/skill that actually owns it).
+        lines = ctx.splitlines()
+        self.assertEqual(len(lines), 4, ctx)
+        header, opt1, opt2, opt3 = lines
+
+        # Option 1: wire it now. Honest about cost -- names the COMPLETE
+        # parameter set, never read as automatic or a one-flag change
+        # (N2 of the original brief).
+        self.assertTrue(opt1.startswith("1. "), ctx)
+        self.assertIn("wire it", opt1.lower())
+        self.assertIn("complete", opt1.lower())
+
+        # Option 2: the permanent decline, via the mechanism that already
+        # exists (--never-ext / MEMCONTINUUM_NEVER_EXTS) -- named per
+        # EXTENSION (.ts), not just the language, and honest that its
+        # cost is conditional (one command, or the same full re-run as
+        # option 1) rather than implying it is always one command.
+        self.assertTrue(opt2.startswith("2. "), ctx)
+        self.assertIn("never mention", opt2.lower())
+        self.assertIn(".ts", opt2)
+        self.assertIn("recorded permanently", opt2.lower())
+        self.assertIn("one command", opt2.lower())
+        self.assertIn("full re-run", opt2.lower())
+
+        # Option 3: not now -- nothing recorded, asked again next session
+        # (matches the per-session dedupe this hook already builds).
+        self.assertTrue(opt3.startswith("3. "), ctx)
+        self.assertIn("not now", opt3.lower())
+        self.assertIn("nothing recorded", opt3.lower())
+        self.assertIn("next session", opt3.lower())
+
+        # N1: point at the skill that documents the re-wiring/decline
+        # procedures; never restate either procedure itself (INC-0117: a
+        # restated computed rule/procedure is a copy that can drift out
+        # from under the code/skill that actually owns it).
         self.assertIn("memcontinuum skill", ctx.lower())
         for restated_flag in ("--adopt-only", "--record-decision", "--code-root", "--langs", "--project"):
             self.assertNotIn(restated_flag, ctx)
-        self.assertEqual(len(ctx.splitlines()), 1, ctx)
         log_text = (self.home / "hook.log").read_text()
         self.assertIn("outcome=language-available-not-wired", log_text)
         self.assertIn("nudge=shown", log_text)
+
+    def test_a2_multi_extension_language_lists_every_extension(self):
+        """javascript covers four extensions (.js/.jsx/.mjs/.cjs) --
+        option 2's decline mechanism (--never-ext) is per-extension, so
+        naming just the one that triggered this nudge would silently
+        leave the other three still nagging. All four must be named."""
+        env = self.base_env(
+            MEMCONTINUUM_LANG_EXTS="*.py",
+            MEMCONTINUUM_KNOWN_EXTS="*.py *.js *.jsx *.mjs *.cjs",
+        )
+        target = self.code_root / "thing.js"
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = json.loads(proc.stdout)
+        ctx = data["hookSpecificOutput"]["additionalContext"]
+        opt2 = ctx.splitlines()[2]
+        self.assertTrue(opt2.startswith("2. "), ctx)
+        for ext in (".js", ".jsx", ".mjs", ".cjs"):
+            self.assertIn(ext, opt2, opt2)
 
     def test_b_second_file_same_language_same_session_is_suppressed(self):
         """(b) a second new .ts file in the SAME session -> no second
@@ -6018,6 +6072,130 @@ class TestNewFileNudgeHook(unittest.TestCase):
             (self.home / "sessions").exists(),
             "a wired-extension write must not touch per-session state at all",
         )
+
+    # --- N2 fix round: containment gates the VISIBLE nudge too -----------
+
+    def test_h_outside_code_root_known_unwired_stays_silent(self):
+        """N2 (Grok 1, LOW): a known-but-unwired-language write OUTSIDE the
+        code root must stay silent, the same as a wired extension does on
+        the same path (test_silent_for_a_path_outside_the_code_root) --
+        before this fix the two disagreed. The log-only DETECTION outcome
+        still fires (unchanged, pre-existing, not scoped to the code
+        root); only the visible nudge and the per-session dedupe state
+        are gated."""
+        outside = Path(self.td) / "outside" / "thing.ts"
+        proc, _elapsed = run_script(
+            NEWFILE_NUDGE_HOOK, self.payload_for(str(outside)), self.python_wired_known_ts_env()
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "", proc.stdout)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=language-available-not-wired", log_text)
+        self.assertIn("nudge=outside-code-root", log_text)
+        self.assertNotIn("nudge=shown", log_text)
+        self.assertFalse(
+            (self.home / "sessions").exists(),
+            "an out-of-root write must not consume the session's dedupe slot",
+        )
+
+    def test_i_dot_dot_traversal_known_unwired_stays_silent(self):
+        """N2: the same `<code_root>/../outside/x.ts` traversal shape
+        test_silent_for_a_dot_dot_traversal_path already pins for the
+        wired path must also stay silent for a known-but-unwired
+        extension -- mc_path_under_root rejects the literal `..` segment
+        regardless of which branch calls it."""
+        outside_sibling = Path(self.td) / "outside"
+        outside_sibling.mkdir()
+        traversal = f"{self.code_root}/../outside/thing.ts"
+        proc, _elapsed = run_script(
+            NEWFILE_NUDGE_HOOK, self.payload_for(traversal), self.python_wired_known_ts_env()
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "", proc.stdout)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("nudge=outside-code-root", log_text)
+
+    def test_j_no_code_root_configured_known_unwired_stays_silent(self):
+        """N2: symmetric with the wired path's own
+        test_silent_with_no_code_root_configured -- no MEMCONTINUUM_CODE_ROOT
+        at all means there is no containment to prove, so the newlang
+        nudge (like the wired-file reminder) must stay silent rather than
+        show unconditionally."""
+        env = self.python_wired_known_ts_env()
+        del env["MEMCONTINUUM_CODE_ROOT"]
+        target = self.code_root / "thing.ts"
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "", proc.stdout)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("nudge=outside-code-root", log_text)
+
+    # --- N3 fix round: build before mark, so a build failure never -------
+    # --- marks a language as told when nothing was actually shown --------
+
+    def _python_that_fails_only_the_json_build(self):
+        """A MEMCONTINUUM_PYTHON replacement that transparently forwards
+        every call to the real venv python (same technique as
+        _memidx_argv_shim elsewhere in this file) EXCEPT one whose `-c`
+        body contains the JSON envelope's own marker string -- that one
+        call fails outright, simulating _build_additional_context's
+        python step breaking (or being cut off by the watchdog mid-
+        build) without touching payload/session-id parsing, which this
+        hook's own known-but-unwired branch also runs through $PY."""
+        shim = Path(self.td) / "fails-only-json-build.sh"
+        shim.write_text(
+            "#!/usr/bin/env bash\n"
+            "for a in \"$@\"; do\n"
+            "  case \"$a\" in\n"
+            "    *hookSpecificOutput*) exit 1 ;;\n"
+            "  esac\n"
+            "done\n"
+            f'exec "{VENV_PYTHON}" "$@"\n'
+        )
+        shim.chmod(0o755)
+        return shim
+
+    @unittest.skipUnless(VENV_PYTHON, "needs a real venv python to forward to")
+    def test_k_build_failure_logs_build_failed_and_never_marks(self):
+        shim = self._python_that_fails_only_the_json_build()
+        env = self.python_wired_known_ts_env(MEMCONTINUUM_PYTHON=str(shim))
+        target = self.code_root / "first.ts"
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "", proc.stdout)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("nudge=build-failed", log_text)
+        # The old mark-then-emit order would have left "typescript" in
+        # nudged_langs here even though nothing was ever shown --
+        # build-then-mark must not.
+        state_file = self.home / "sessions" / "default" / "s-newfile-nudge.json"
+        if state_file.exists():
+            state = json.loads(state_file.read_text())
+            self.assertNotIn("typescript", state.get("nudged_langs", []), state)
+
+    @unittest.skipUnless(VENV_PYTHON, "needs a real venv python to forward to")
+    def test_l_build_failure_does_not_lose_the_nudge_a_retry_still_shows(self):
+        """The real proof N3 fixes something, not just that nothing is
+        marked: the SAME language, SAME session, retried with a working
+        python after a build failure must still show -- the old
+        mark-then-emit order would have suppressed this retry."""
+        shim = self._python_that_fails_only_the_json_build()
+        failing_env = self.python_wired_known_ts_env(MEMCONTINUUM_PYTHON=str(shim))
+        first = self.code_root / "first.ts"
+        proc1, _ = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(first)), failing_env)
+        self.assertEqual(proc1.returncode, 0, proc1.stderr)
+        self.assertEqual(proc1.stdout.strip(), "", proc1.stdout)
+
+        working_env = self.python_wired_known_ts_env()  # real VENV_PYTHON
+        second = self.code_root / "second.ts"
+        proc2, _ = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(second)), working_env)
+        self.assertEqual(proc2.returncode, 0, proc2.stderr)
+        data = json.loads(proc2.stdout)
+        ctx = data["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("typescript", ctx.lower())
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("nudge=build-failed", log_text)
+        self.assertIn("nudge=shown", log_text)
 
     def test_language_name_matches_the_engine_registry_for_every_known_language(self):
         """Every chunkers.LANGUAGE_TABLE row's language name must be what

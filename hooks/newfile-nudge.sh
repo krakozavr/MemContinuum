@@ -20,10 +20,19 @@
 #
 # Contract:
 #   - reads the PreToolUse JSON payload on stdin, extracts tool_input.file_path
-#   - fires ONLY when: the path does not exist AND is not a symlink (a
-#     broken symlink is `! -e` but IS `-L` -- must stay silent, not be
-#     treated as new), is under MEMCONTINUUM_CODE_ROOT, and ends in an
-#     indexed source extension
+#   - a VISIBLE nudge (this hook's stdout/additionalContext) fires ONLY
+#     when: the path does not exist AND is not a symlink (a broken
+#     symlink is `! -e` but IS `-L` -- must stay silent, not be treated
+#     as new), is under MEMCONTINUUM_CODE_ROOT, and ends in a source
+#     extension this engine knows about -- WIRED for the retrieval
+#     reminder, KNOWN-but-not-WIRED for the newlang-nudge decision point
+#     (N2 fix round: both nudges share this same containment gate now;
+#     before this round the newlang nudge's visible text ignored
+#     containment even though its header always claimed the hook fires
+#     only under the code root). The log-only DETECTION outcome
+#     (outcome=language-available-not-wired) is NOT gated on containment
+#     -- unchanged, pre-existing behavior memidx.py stats already counts
+#     regardless of code root; only the VISIBLE nudge text is new here.
 #   - any other case, or any failure -> exit 0, no stdout (never blocks
 #     the write)
 #   - always runs under hooks/mc-watchdog.sh's shared wall-clock watchdog
@@ -32,7 +41,11 @@
 #     mechanism, not a second bespoke timeout story for the one hook that
 #     happens to be fast
 #   - logs exactly one outcome line per invocation to
-#     $MEMCONTINUUM_HOME/hook.log; never writes anything else, anywhere
+#     $MEMCONTINUUM_HOME/hook.log. The known-but-unwired-language branch
+#     also reads/writes its own per-session dedupe state file under
+#     $MEMCONTINUUM_HOME/sessions/<project>/<session>.json (see
+#     MEMCONTINUUM_KNOWN_EXTS below) -- no other write, anywhere, ever;
+#     in particular never under the code root or the store.
 #
 # Env:
 #   MEMCONTINUUM_CODE_ROOT   the code root this hook watches for new files.
@@ -61,16 +74,36 @@
 #                            of the plain not-indexed-extension. Unset ->
 #                            falls back to MEMCONTINUUM_LANG_EXTS (no
 #                            language-available-not-wired distinction).
-#                            newlang-nudge (N1/N2): this case ALSO surfaces
-#                            a one-line user-visible nudge -- naming the
-#                            language, saying this project has not wired
-#                            it, and pointing at the memcontinuum skill for
-#                            the (unrestated) re-wiring procedure -- unless
-#                            WIRED_EXTS is empty (language-less wiring,
-#                            Ruling 6 above: there is no complete wired set
-#                            to name yet, so nagging about every known
-#                            extension would be noise, not help). Deduped
-#                            once per language per SESSION, never
+#                            newlang-nudge (N1 fix round, TOP-0128): this
+#                            case ALSO surfaces a structured, numbered
+#                            DECISION POINT -- not a one-line notice with
+#                            no way to answer -- naming the language and
+#                            offering exactly the shape
+#                            skills/memcontinuum/SKILL.md section 2 uses
+#                            for every other human decision this tool
+#                            asks: (1) wire it now, (2) never mention it
+#                            here again -- recorded permanently through
+#                            repo-init.sh's existing --never-ext mechanism
+#                            (this hook already honours
+#                            MEMCONTINUUM_NEVER_EXTS above; nothing new is
+#                            built here), (3) not now -- nothing recorded,
+#                            asked again next session. Neither option is
+#                            restated as a literal command here (INC-0117:
+#                            a restated computed procedure is a copy that
+#                            can drift) -- both point at "the memcontinuum
+#                            skill", whose section 6 is where an agent
+#                            acting on the human's answer finds what to
+#                            actually run. Gated silent (no message, no
+#                            state touched) when WIRED_EXTS is empty
+#                            (language-less wiring, Ruling 6 above: there
+#                            is no complete wired set to name yet, so
+#                            nagging about every known extension would be
+#                            noise, not help) or when the write is not
+#                            under MEMCONTINUUM_CODE_ROOT (N2 fix round --
+#                            same containment gate the wired-file reminder
+#                            already used; the log-only DETECTION outcome
+#                            still fires either way, see the file header).
+#                            Deduped once per language per SESSION, never
 #                            permanently, via the same per-session state
 #                            file every other write-side hook already
 #                            shares (mc_state_file_for/mc_update_state_json,
@@ -79,9 +112,17 @@
 #                            session-scoped (no cleanup story needed) and a
 #                            permanent "already told you" marker would mean
 #                            a user who missed the line once never hears it
-#                            again. memlib.sh is sourced LAZILY, only once
-#                            this branch is already committed to (a brand
-#                            new file in a known-but-unwired language,
+#                            again. The per-session mark only happens AFTER
+#                            the message's JSON envelope has already been
+#                            built successfully (N3 fix round: mark-then-
+#                            build could lose a nudge to a build failure or
+#                            a watchdog kill mid-build, leaving the
+#                            language marked as told while nothing was
+#                            ever shown -- build-then-mark cannot lose one
+#                            that way, since a failed build never marks).
+#                            memlib.sh is sourced LAZILY, only once this
+#                            branch is already committed to (a brand new
+#                            file in a known-but-unwired language,
 #                            inherently rare) -- the common already-wired
 #                            path below never pays for it, and never gains
 #                            a subprocess it didn't have before.
@@ -176,13 +217,24 @@ finish() {
     exit 0
 }
 
-# _emit_additional_context MESSAGE -- builds and prints the
-# hookSpecificOutput/additionalContext JSON envelope both of this hook's
-# nudges need (the wired-file reminder further down, and newlang-nudge's
-# known-but-unwired-language nudge) -- one JSON-building implementation,
-# not two. Prints the JSON and returns 0 on success; prints nothing and
-# returns 1 on failure, leaving the caller to pick which outcome to log.
-_emit_additional_context() {
+# _build_additional_context MESSAGE -- builds the hookSpecificOutput/
+# additionalContext JSON envelope both of this hook's nudges need (the
+# wired-file reminder further down, and newlang-nudge's known-but-
+# unwired-language nudge) -- one JSON-building implementation, not two
+# (N3/NIT3 fix round: this comment used to claim that already while the
+# wired path still ran its own separate inline copy -- both now actually
+# call this).
+#
+# Named "build", not "emit": it prints the JSON to ITS OWN stdout and
+# returns 0 on success, prints nothing and returns 1 on failure -- but it
+# never writes to the hook's real stdout itself. The caller captures this
+# function's output via command substitution and decides separately
+# whether/when to printf it for real. newlang-nudge's build-then-mark-
+# then-print ordering (N3 fix round) depends on this: the JSON has to be
+# built and validated BEFORE the per-session dedupe mark, so a build
+# failure (or a watchdog kill mid-build) never marks a language as told
+# when nothing was actually shown.
+_build_additional_context() {
     export HOOK_MESSAGE="$1"
     local output_json
     output_json="$(PYTHONPATH= "$PY" -c '
@@ -265,17 +317,17 @@ _ext_matches() {  # $1=path  $2=space-separated glob list
     return 1
 }
 
-# _lang_name_for -- newlang-nudge (N1): a human-readable language name for
-# the nudge's "name the language" requirement, e.g. ".ts" -> "typescript".
+# _case_name_for_pattern -- newlang-nudge: maps ONE known extension glob
+# (e.g. "*.ts") to its engine language name (e.g. "typescript").
 # Deliberately a bash `case` table, not a memidx.py/chunkers call: this
-# hook never calls memidx.py for real work (see the file header), and this
-# branch is already the rare one -- but a python subprocess just to look
-# up a display name is still one more thing to fail, and this hook's own
-# design principle is to stay simple enough to reason about without one.
-# Mirrors chunkers.LANGUAGE_TABLE (chunkers/__init__.py) row-for-row, since
-# the extension is not always a substring of the language name (.ts is
-# "typescript", .rs is "rust", four JS extensions are all "javascript") --
-# tests/test_write_hooks.py::
+# hook never calls memidx.py for real work (see the file header), and the
+# branches that need this are already the rare ones -- but a python
+# subprocess just to look up a display name is still one more thing to
+# fail, and this hook's own design principle is to stay simple enough to
+# reason about without one. Mirrors chunkers.LANGUAGE_TABLE
+# (chunkers/__init__.py) row-for-row, since the extension is not always a
+# substring of the language name (.ts is "typescript", .rs is "rust",
+# four JS extensions are all "javascript") -- tests/test_write_hooks.py::
 # test_language_name_matches_the_engine_registry_for_every_known_language
 # runs the real hook against every LANGUAGE_TABLE row and fails the moment
 # a new row (or a new extension on an existing row) has no arm here, so
@@ -283,24 +335,33 @@ _ext_matches() {  # $1=path  $2=space-separated glob list
 # extension with no arm (this engine version's KNOWN_EXTS should never
 # produce one, but render-time env is not proof) falls back to the raw
 # extension text -- correct but unhelpfully terse is better than wrong.
+#
+# The ONE table both _lang_name_for (path -> name) and _lang_exts_for
+# (name -> every known extension mapping to it, N1 fix round) build on,
+# so the extension<->name mapping is never duplicated between "what do I
+# call this file" and "what do I need to list to decline this language".
+_case_name_for_pattern() {  # $1=one glob (e.g. "*.ts")
+    case "$1" in
+        "*.swift") printf 'swift' ;;
+        "*.py") printf 'python' ;;
+        "*.js"|"*.jsx"|"*.mjs"|"*.cjs") printf 'javascript' ;;
+        "*.ts") printf 'typescript' ;;
+        "*.tsx") printf 'tsx' ;;
+        "*.java") printf 'java' ;;
+        "*.php") printf 'php' ;;
+        "*.rs") printf 'rust' ;;
+        "*.lua") printf 'lua' ;;
+        *) printf '%s' "${1#\*.}" ;;
+    esac
+}
+
 _lang_name_for() {  # $1=path  $2=space-separated glob list (KNOWN_EXTS)
     set -f
     for _pat in $2; do
         case "$1" in
             $_pat)
                 set +f
-                case "$_pat" in
-                    "*.swift") printf 'swift' ;;
-                    "*.py") printf 'python' ;;
-                    "*.js"|"*.jsx"|"*.mjs"|"*.cjs") printf 'javascript' ;;
-                    "*.ts") printf 'typescript' ;;
-                    "*.tsx") printf 'tsx' ;;
-                    "*.java") printf 'java' ;;
-                    "*.php") printf 'php' ;;
-                    "*.rs") printf 'rust' ;;
-                    "*.lua") printf 'lua' ;;
-                    *) printf '%s' "${_pat#\*.}" ;;
-                esac
+                _case_name_for_pattern "$_pat"
                 return 0
                 ;;
         esac
@@ -308,6 +369,26 @@ _lang_name_for() {  # $1=path  $2=space-separated glob list (KNOWN_EXTS)
     set +f
     printf '%s' "${1##*.}"
     return 1
+}
+
+# _lang_exts_for LANG KNOWN_EXTS -- newlang-nudge decline option (N1 fix
+# round): every extension among KNOWN_EXTS (bare ".ext" form, comma-
+# joined) whose engine name is LANG. --never-ext (repo-init.sh /
+# memcontinuum-update.sh) takes EXTENSIONS, not language names, and a
+# multi-extension language (javascript: .js/.jsx/.mjs/.cjs) needs every
+# one of them named to actually go silent for that language -- the
+# decline option has to say so, not just name the one extension that
+# happened to trigger this particular nudge.
+_lang_exts_for() {  # $1=lang name  $2=space-separated glob list
+    local _out=""
+    set -f
+    for _pat in $2; do
+        if [ "$(_case_name_for_pattern "$_pat")" = "$1" ]; then
+            _out="${_out:+$_out,}${_pat#\*}"
+        fi
+    done
+    set +f
+    printf '%s' "$_out"
 }
 WIRED_EXTS="${MEMCONTINUUM_LANG_EXTS-*.swift}"
 KNOWN_EXTS="${MEMCONTINUUM_KNOWN_EXTS:-$WIRED_EXTS}"
@@ -329,13 +410,14 @@ fi
 
 if ! _ext_matches "$FILE_PATH" "$WIRED_EXTS"; then
     if _ext_matches "$FILE_PATH" "$KNOWN_EXTS"; then
-        # newlang-nudge (N1/N2): the DETECTION outcome below is unchanged
-        # from before this feature existed (literal string pinned by
+        # newlang-nudge: the DETECTION outcome below is unchanged from
+        # before this feature existed (literal string pinned by
         # memidx.py's stats and tests/test_stats.py) -- it still fires on
-        # every single occurrence, dup or not. Whether the visible nudge
-        # actually SHOWS is a separate question, answered below and
-        # recorded in the extra nudge= field, never by changing this
-        # outcome literal.
+        # every single occurrence, dup or not, regardless of code-root
+        # containment. Whether the VISIBLE decision point actually shows
+        # is a separate question, gated below (language-less wiring,
+        # then containment, then per-session dedupe) and recorded in the
+        # extra nudge= field, never by changing this outcome literal.
         #
         # Language-less wiring (WIRED_EXTS explicitly empty, Ruling 6): a
         # project that has deliberately wired NO language has no complete
@@ -347,7 +429,65 @@ if ! _ext_matches "$FILE_PATH" "$WIRED_EXTS"; then
             finish "language-available-not-wired"
         fi
 
+        # N2 fix round (Grok 1, LOW): a write outside the code root (or a
+        # code_root/../outside traversal) used to still show the visible
+        # nudge even though a wired extension on the same path stays
+        # silent -- the two disagreed, and the file header's own
+        # "fires only under the code root" contract was wrong for this
+        # branch. Checked here, before any dedupe state is touched and
+        # before the message is even built, so an out-of-root write costs
+        # nothing beyond this one check and never consumes the session's
+        # one "shown" slot for a language that may get a real, in-root
+        # occurrence later. Collapses every mc_path_under_root failure
+        # mode (traversal, unresolvable root, no existing ancestor,
+        # symlink escape) into one nudge= value -- this branch only needs
+        # yes/no, not why, the same precedent ledger-post-edit.sh already
+        # set for its own out-of-scope outcome.
+        CODE_ROOT="${MEMCONTINUUM_CODE_ROOT:-}"
+        if [ -z "$CODE_ROOT" ]; then
+            finish "language-available-not-wired" "nudge=outside-code-root"
+        fi
+        # shellcheck source=mc-path-lib.sh
+        source "$SCRIPT_DIR/mc-path-lib.sh"
+        if ! mc_path_under_root "$FILE_PATH" "$CODE_ROOT"; then
+            finish "language-available-not-wired" "nudge=outside-code-root"
+        fi
+
         LANG_NAME="$(_lang_name_for "$FILE_PATH" "$KNOWN_EXTS")"
+        LANG_EXTS="$(_lang_exts_for "$LANG_NAME" "$KNOWN_EXTS")"
+
+        # N1 (owner ruling, TOP-0128): the notice becomes a DECISION
+        # POINT -- a structured numbered-choice prompt, the same shape
+        # skills/memcontinuum/SKILL.md section 2 uses for every other
+        # human decision this tool asks, not a one-line notice with no
+        # way to answer. Neither option restates the wiring procedure's
+        # actual flags (INC-0117: a restated computed procedure is a copy
+        # that can drift) -- both point at "the memcontinuum skill" by
+        # name; section 6 there is where an agent acting on the answer
+        # finds what to actually run, including which of option 2's two
+        # possible costs applies to this repo.
+        LANG_MESSAGE="New file type: ${LANG_NAME} is supported by this engine but not wired for this project."
+        LANG_MESSAGE="${LANG_MESSAGE}
+1. Wire it now — re-run repo-init.sh with the complete current parameter set plus ${LANG_NAME}, not a one-flag add; see the memcontinuum skill for the procedure
+2. Never mention ${LANG_EXTS} here (every ${LANG_NAME} extension) — recorded permanently: one command when this project already records its wiring, otherwise the same full re-run as option 1 with these added to the never-list; see the memcontinuum skill for which applies
+3. Not now — nothing recorded; asked again next session"
+
+        # N3 fix round (Grok 2, LOW): build the JSON envelope BEFORE the
+        # per-session mark, not after. Building it is the one step that
+        # can fail (a broken PY) or get cut short (a watchdog kill
+        # mid-build) -- doing it first means either of those leaves
+        # nothing marked, so the next occurrence in this session retries
+        # instead of being silently suppressed by a mark nothing was ever
+        # shown for. The mark step right after this is still the SAME
+        # atomic check-and-append mc_update_state_json call as before --
+        # the concurrent-first-hits guarantee (one shown, the rest
+        # suppressed under lock) is unchanged, since every concurrent
+        # loser still discards its own already-built JSON the instant its
+        # own mark attempt comes back "already told" (rc=3, below).
+        BUILT_JSON="$(_build_additional_context "$LANG_MESSAGE")"
+        if [ -z "$BUILT_JSON" ]; then
+            finish "language-available-not-wired" "nudge=build-failed"
+        fi
 
         # Dedupe: once per language per SESSION (coordinator's decision),
         # not once per project forever -- reusing mc_state_file_for's
@@ -411,10 +551,7 @@ print(json.dumps(state))
             finish "language-available-not-wired" "nudge=suppressed"
         fi
 
-        LANG_MESSAGE="New file type: ${LANG_NAME} is supported by this engine but not wired for this project — wiring it means re-running repo-init.sh with the complete current parameter set plus ${LANG_NAME}, not a one-flag add; see the memcontinuum skill for the procedure."
-        if ! _emit_additional_context "$LANG_MESSAGE"; then
-            finish "language-available-not-wired" "nudge=build-failed"
-        fi
+        printf '%s\n' "$BUILT_JSON"
         finish "language-available-not-wired" "nudge=shown"
     fi
     finish "not-indexed-extension"
@@ -455,18 +592,11 @@ esac
 
 MESSAGE="New source file under ${CODE_ROOT} — confirm the code index is initialized and not stale, then run code-search; name relevant hits or say none."
 
-export HOOK_MESSAGE="$MESSAGE"
-OUTPUT_JSON="$(PYTHONPATH= "$PY" -c '
-import json, os
-
-print(json.dumps({
-    "hookSpecificOutput": {
-        "hookEventName": "PreToolUse",
-        "additionalContext": os.environ["HOOK_MESSAGE"],
-    }
-}))
-' 2>>"$LOG")"
-
+# NIT 3 fix round (Grok, duplicate JSON envelope): this used to keep its
+# own inline copy of the JSON-building python instead of calling
+# _build_additional_context, even though that helper's own comment
+# already claimed "one JSON-building implementation, not two." Now true.
+OUTPUT_JSON="$(_build_additional_context "$MESSAGE")"
 if [ -z "$OUTPUT_JSON" ]; then
     finish "output-build-failed"
 fi
