@@ -4140,7 +4140,22 @@ class TestUpdaterCoversEveryRenderedArtifact(unittest.TestCase):
         """None if (label, rel) -- the FULL relative path, not just its
         basename (see the class docstring for why that distinction matters)
         -- is accounted for somewhere in `health_output`; else a reason
-        string. The hand-maintained half of this test."""
+        string. The hand-maintained half of this test.
+
+        The `.gitkeep` branch below matches its full relative parent dir
+        as an EXACT token against the footer's own "(tree: ...)" list, not
+        a substring -- a hole this test used to have (round-2 gate finding
+        G1): `parent in footer` waved through `inbox/.gitkeep` (matching
+        `inbox` inside the listed `inbox/codex`), `concept/.gitkeep`
+        (inside `concepts`), a store-root `.gitkeep` (`.` inside any
+        footer text with a period in it, e.g. `README.md`), and even a
+        `topics`-to-`topic` rename in repo-init.sh's STORE_DIRS (`topic`
+        inside the still-unrenamed `topics`). What exact-token matching
+        still cannot catch: the footer's tree list is a literal typed
+        into memcontinuum-update.sh, not read from repo-init.sh's
+        STORE_DIRS at runtime, and this test only checks created-→named,
+        never named-→created -- a token this literal still lists for a
+        directory repo-init.sh has stopped creating would go unnoticed."""
         header = health_output.split("\n", 1)[0]
         footer = next((l for l in health_output.splitlines()
                        if l.startswith("not-checked:")), "")
@@ -4166,7 +4181,17 @@ class TestUpdaterCoversEveryRenderedArtifact(unittest.TestCase):
                     f"{full} not named in the not-checked footer")
         if label == "store" and Path(rel).name == ".gitkeep":
             parent = str(Path(rel).parent)  # e.g. "topics" or "inbox/codex"
-            if store in footer and parent in footer:
+            # Exact token match against the footer's own "(tree: a b c)"
+            # list, never a substring check: `parent in footer` used to
+            # match "inbox" against "inbox/codex", "concept" against
+            # "concepts", and -- worst of all -- "." (Path(rel).parent for
+            # a store-ROOT .gitkeep) against literally any footer text
+            # containing a period, e.g. "README.md". A bare "." is excluded
+            # explicitly; it is never a real tree entry and must never
+            # count as a hit on its own.
+            tree_match = re.search(r"\(tree: (.*?)\)", footer)
+            tree_tokens = tree_match.group(1).split() if tree_match else []
+            if store in footer and parent != "." and parent in tree_tokens:
                 return None
             return f"store tree entry {rel} not named in the not-checked footer"
         return (f"no mapping at all for {label}:{rel} -- a NEW artifact "
