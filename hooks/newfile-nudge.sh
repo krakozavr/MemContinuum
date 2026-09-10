@@ -528,10 +528,23 @@ print(d.get("session_id", "") or "")
 import os
 
 lang = os.environ.get("MC_NUDGE_LANG", "")
-langs = state.setdefault("nudged_langs", [])
+langs = state.get("nudged_langs")
+# A JSON list is the only shape production ever writes here (this same
+# transform, a few lines below). Anything else -- corrupted or
+# hand-edited state, e.g. a bare string -- must NOT feed `in`: on a str,
+# `in` is a SUBSTRING test, so {"nudged_langs": "typescript"} would
+# silently suppress the "typescript" nudge (and "typescriptfoo" would
+# suppress it too). Treat a malformed field the same way the caller
+# above already treats a wholly garbage state file (state reset, not a
+# second fail-open path): reset just this field to an empty list and
+# keep going, so the nudge still fires and the next write leaves
+# nudged_langs well-formed.
+if not isinstance(langs, list) or not all(isinstance(x, str) for x in langs):
+    langs = []
 if lang in langs:
     sys.exit(3)
 langs.append(lang)
+state["nudged_langs"] = langs
 print(json.dumps(state))
 ' >>"$MC_LOG" 2>&1
             MC_UPDATE_RC=$?

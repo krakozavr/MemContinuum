@@ -6209,6 +6209,39 @@ class TestNewFileNudgeHook(unittest.TestCase):
         self.assertIn("nudge=build-failed", log_text)
         self.assertIn("nudge=shown", log_text)
 
+    def test_m_string_valued_nudged_langs_does_not_suppress_and_self_heals(self):
+        """Reviewer finding: nudged_langs is only ever WRITTEN as a JSON
+        list (this same transform), but a hand-written or corrupted state
+        file could hold a bare string instead -- e.g.
+        {"nudged_langs": "typescript"}. Python's `in` on a str is a
+        substring test, so `"typescript" in "typescript"` is True and the
+        dedupe check would silently suppress the very nudge the string
+        never actually recorded (worse: "typescriptfoo" would suppress
+        "typescript" too, on substring alone). The membership test must
+        require an actual list of strings; anything else is treated the
+        same way a wholly garbage state file already is (reset, fail
+        OPEN toward showing) -- never a second suppression path."""
+        state_file = self.home / "sessions" / "default" / "s-newfile-nudge.json"
+        state_file.parent.mkdir(parents=True)
+        state_file.write_text(json.dumps({"nudged_langs": "typescript"}))
+
+        target = self.code_root / "thing.ts"
+        proc, _elapsed = run_script(
+            NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), self.python_wired_known_ts_env()
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = json.loads(proc.stdout)
+        ctx = data["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("typescript", ctx.lower())
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("nudge=shown", log_text)
+        self.assertNotIn("nudge=suppressed", log_text)
+
+        # The state file must now be rewritten to a well-formed list --
+        # self-healed, not left corrupted for the next write to trip over.
+        healed = json.loads(state_file.read_text())
+        self.assertEqual(healed.get("nudged_langs"), ["typescript"], healed)
+
     def test_language_name_matches_the_engine_registry_for_every_known_language(self):
         """Every chunkers.LANGUAGE_TABLE row's language name must be what
         the hook actually names for EVERY ONE of that row's extensions
