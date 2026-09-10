@@ -739,21 +739,35 @@ directory outside its own `.git` (a shared `core.hooksPath` —
 be resolved to build the comparison against. It is informational only:
 unlike `rules`/`skill` it does not feed the `action` column or `--apply`'s
 re-render decision — `repo-init.sh` already regenerates or correctly skips
-both wrappers unconditionally on every install it performs, so a stale
-`store-hooks` gets fixed as a side effect whenever `--apply` re-renders a
-claude-dir for any other reason. The one gap this narrows rather than
-closes: a row that is otherwise fully `ok` while only the machine's
-resolved python changed underneath it stays `store-hooks: stale` until
+both wrappers unconditionally on every install it performs, so a stale or
+missing `store-hooks` gets fixed as a side effect whenever `--apply`
+re-renders a claude-dir for any other reason; `foreign` never does,
+since `repo-init.sh` refuses to overwrite a hand-authored wrapper even
+then. None of the three moves the `action` column, so the gap this
+narrows rather than closes is wider than just python drift: a row that
+is otherwise fully `ok` stays `store-hooks: stale` (only the machine's
+resolved python changed underneath it), `missing` (the wrapper was
+deleted, or predates this feature), or `foreign` (hand-authored) until
 something else triggers a re-render (or the row is re-rendered by hand).
 
 Beneath the table, a `not-checked: ...` line names every OTHER artifact
 `repo-init.sh` renders into a project that has no column of its own — the
 store's `README.md`, `.gitignore`, and its tree (`topics`/`incidents`/
 `investigations`/`concepts`/`sources`/`inbox/*`, each `.gitkeep`-marked).
-These are write-if-absent and never touched again by any later re-render
-(an "adopt an existing store" install must not clobber a hand-authored
-README), so there is no current/stale question that means anything for
-them — `not-checked` is the honest and complete answer, printed every walk
+None of these are ever re-rendered over an existing file, so nothing here
+ever looks at their current content to judge it stale — not because their
+content structurally cannot vary, but because looking would mean
+overwriting something this command must not silently clobber (an "adopt
+an existing store" install must not clobber a hand-authored README).
+README.md and .gitignore are the clean case: each is skipped outright
+once it exists, so a hand edit rides through every later re-render
+untouched. The tree is narrower: `mkdir -p`/`touch .gitkeep` run
+unconditionally rather than behind an existence check, so an entry that
+is still there is equally left alone, but one that was deleted is
+silently recreated (empty, `.gitkeep`-only) the next time any re-render
+touches that claude-dir — not because anything inspected it, only because
+nothing ever looked to notice it was gone. `not-checked` is the honest
+and complete answer for all of them either way, printed every walk
 rather than left to read as silence. A dedicated coverage test
 (`tests/test_update.py`
 `TestUpdaterCoversEveryRenderedArtifact`) derives the artifact list from a

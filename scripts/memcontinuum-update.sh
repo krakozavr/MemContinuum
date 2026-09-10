@@ -700,9 +700,10 @@ mc_update_skill_state() {
 #   - stale, when everything else is already `ok` and only a machine-level
 #     python change made the wrapper's embedded python path stale;
 #   - missing, when the append-only guard was never installed (deleted, or
-#     a pre-this-feature store) -- --apply leaves it missing, exactly as
-#     it leaves a missing rules file alone until something else triggers a
-#     re-render;
+#     a pre-this-feature store) -- --apply leaves it missing on its own;
+#     unlike a missing rules file, which independently produces
+#     `rules-missing` and gets repaired immediately, nothing here notices
+#     until some OTHER problem forces a re-render anyway;
 #   - foreign, a hand-authored wrapper -- --apply leaves it in place, same
 #     as a foreign rules file or skill copy.
 # All three are named here rather than silently left unfixed and
@@ -1936,7 +1937,7 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
     # confirm every artifact repo-init.sh renders is accounted for
     # somewhere in this output, one way or another, and never simply absent.
     if mc_is_marked_store "$STORE"; then
-        echo "not-checked: $STORE/README.md $STORE/.gitignore $STORE (tree: topics incidents investigations concepts sources inbox/codex inbox/grok inbox/audit) -- written once at install, never re-rendered"
+        echo "not-checked: $STORE/README.md $STORE/.gitignore (left alone once written, so a hand edit rides through untouched) and $STORE (tree: topics incidents investigations concepts sources inbox/codex inbox/grok inbox/audit) (recreated if deleted, never inspected) -- none of these are ever re-rendered over a file that already exists"
     fi
 
     if [ "$LEGACY" -eq 1 ] && [ "$APPLY" -eq 1 ] && [ "$LEGACY_ACTION" = "migrate" ] \
