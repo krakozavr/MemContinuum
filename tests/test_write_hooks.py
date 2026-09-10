@@ -6021,29 +6021,39 @@ class TestNewFileNudgeHook(unittest.TestCase):
 
     def test_language_name_matches_the_engine_registry_for_every_known_language(self):
         """Every chunkers.LANGUAGE_TABLE row's language name must be what
-        the hook actually names when that row's first extension is KNOWN
-        but not WIRED -- exercised through the real hook subprocess (no
+        the hook actually names for EVERY ONE of that row's extensions
+        (not just the first -- javascript alone has four) when KNOWN but
+        not WIRED -- exercised through the real hook subprocess (no
         source-text matching), so a new LANGUAGE_TABLE row with no
         matching arm in the hook's own extension->name table fails HERE,
         loudly, rather than drifting silently the way INC-0117's stale
         copy did for nine days."""
         for lang, row in chunkers.LANGUAGE_TABLE.items():
-            ext = row["extensions"][0]
             known = " ".join("*" + e for e in row["extensions"])
             env = self.base_env(
                 MEMCONTINUUM_LANG_EXTS="*.__never_wired__",
                 MEMCONTINUUM_KNOWN_EXTS=f"*.__never_wired__ {known}",
             )
-            target = self.code_root / f"probe{ext}"
-            proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env)
-            self.assertEqual(proc.returncode, 0, proc.stderr)
-            data = json.loads(proc.stdout or "{}")
-            ctx = data.get("hookSpecificOutput", {}).get("additionalContext", "")
-            self.assertIn(
-                lang, ctx.lower(),
-                f"extension {ext!r} (LANGUAGE_TABLE row {lang!r}) is not named "
-                f"in the nudge: {ctx!r}",
-            )
+            # Every extension on the row, not just the first -- javascript
+            # alone has four (.js/.jsx/.mjs/.cjs) and the hook's own case
+            # table has to name all of them "javascript". Each probe gets
+            # its own session_id so the per-session dedupe (tested
+            # separately above) never suppresses a later probe in this loop.
+            for i, ext in enumerate(row["extensions"]):
+                target = self.code_root / f"probe-{lang}-{i}{ext}"
+                proc, _elapsed = run_script(
+                    NEWFILE_NUDGE_HOOK,
+                    self.payload_for(str(target), session_id=f"s-lang-table-{lang}-{i}"),
+                    env,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                data = json.loads(proc.stdout or "{}")
+                ctx = data.get("hookSpecificOutput", {}).get("additionalContext", "")
+                self.assertIn(
+                    lang, ctx.lower(),
+                    f"extension {ext!r} (LANGUAGE_TABLE row {lang!r}) is not named "
+                    f"in the nudge: {ctx!r}",
+                )
 
 
 class TestF2AutoCallers(unittest.TestCase):
