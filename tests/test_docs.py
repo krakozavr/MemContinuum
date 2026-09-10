@@ -1412,9 +1412,22 @@ class TestConsentIsManualNotAutomatic(unittest.TestCase):
     is a true statement about a LIVE dialogue the human just triggered by
     running the skill, not an unprompted claim) and on docs/INTERNALS.md's
     accurate internal description of the detector's own hook-state
-    machine (`undecided` | `asks, once` names what the hook EMITS to
-    additionalContext, not a promise about who sees it). Specific pins,
-    not a blanket regex, are what this class checks.
+    machine (`undecided` | `emits, once` names what the hook puts into
+    additionalContext, not a promise about who sees it). Exact-phrase
+    pins, not a blanket regex, are what THIS class checks -- and Grok's
+    gate proved their limit: a REPHRASED promise ("You will be asked once
+    at session start whether this repo should keep a decision store.",
+    "you'll be prompted next time you open this repo") slipped past every
+    pin here while restating exactly the claim this ruling forbids.
+    TestNoRephrasedAskPromise below is the semantic guard that catches a
+    rephrase by its SHAPE -- a human named, by "you", as the recipient of
+    ask/prompt/remind/offer, in a future or habitual construction --
+    rather than one fixed wording; it runs alongside these pins, not
+    instead of them. It is not a full semantic diff either: a promise
+    with no "you" as the recipient (a bare passive "the repo will be
+    asked again", or third person throughout) is outside what either
+    guard catches by shape and still depends on the exact pins above, or
+    a reviewer's eye, to be caught.
     """
 
     @staticmethod
@@ -1541,6 +1554,209 @@ class TestConsentIsManualNotAutomatic(unittest.TestCase):
         text = SKILL.read_text()
         self.assertNotIn("you will be asked again next session", text)
         self.assertNotIn("asked again next session", text)
+
+
+# Apostrophe as either a straight quote or a curly one -- a rephrase is just
+# as likely to introduce "you’ll" as "you'll", and nothing else in this
+# codebase's prose currently uses the curly form (checked: zero hits in
+# README.md / SKILL.md), so accepting both costs nothing today and closes a
+# free mutation tomorrow.
+_APOSTROPHE = r"[\'’]"
+
+# TOP-0110 L3, Grok gate finding 2: the exact-phrase pins in
+# TestConsentIsManualNotAutomatic catch verbatim restoration of a retired
+# promise, but not a REPHRASED one -- the gate proved this by inserting
+# "You will be asked once at session start whether this repo should keep a
+# decision store." next to the README's new Day-to-day paragraph, and by
+# rewording section 2's "Not now" option to "you'll be prompted next time
+# you open this repo": both passed every exact-phrase pin (the second was
+# only caught by TestSkillHonesty's exact option-list pin, a different
+# guard for a different reason). These patterns catch the SHAPE of a
+# promise instead of one fixed wording: a human named as the RECIPIENT of
+# ask/prompt/remind/offer -- second person "you"/"you'll"/"you're", as
+# either the subject of a passive ("you('ll) be asked", "you're prompted",
+# "you get reminded") or the object of an active future/habitual verb
+# ("will ask you", "reminds you") -- because the ruling this guards is
+# precise: no user-facing text may promise a human will be asked, prompted,
+# or reminded without acting themselves. A run of up to two filler words is
+# allowed between the modal and the participle ("you'll always be asked",
+# "will then remind you") so a hedge word doesn't buy an escape.
+#
+# Known, disclosed limit (not a claim of full semantic coverage): this is
+# "you"-anchored by design, so a promise with no second-person recipient --
+# a bare passive ("the repo will be asked again") or third person
+# throughout -- is NOT caught here. That shape is still covered, when it
+# matches, by the exact-phrase pins in TestConsentIsManualNotAutomatic and
+# TestSkillHonesty's pinned option lists; a novel third-person rephrase of
+# neither pinned string is caught by nothing here and needs a reviewer.
+PROMISE_TO_BE_ASKED_PATTERNS = [
+    # "you will (then) be asked" / "you'll (always) get prompted"
+    re.compile(
+        r"\byou(?:" + _APOSTROPHE + r"ll|\s+will)\s+(?:\w+\s+){0,2}"
+        r"(?:be\s+|get\s+)?(?:asked|prompted|reminded|offered)\b",
+        re.IGNORECASE,
+    ),
+    # "you are (always) asked" / "you're prompted" / "you get reminded" --
+    # present-tense habitual passive, no "will"/"'ll" needed
+    re.compile(
+        r"\byou(?:" + _APOSTROPHE + r"re|\s+are|\s+get)\s+(?:\w+\s+){0,2}"
+        r"(?:asked|prompted|reminded|offered)\b",
+        re.IGNORECASE,
+    ),
+    # "will (then) ask you" / "'ll prompt you" -- future active, human as
+    # the object
+    re.compile(
+        r"\b(?:will|" + _APOSTROPHE + r"ll)\s+(?:\w+\s+){0,2}"
+        r"(?:ask|prompt|remind|offer)s?\s+you\b",
+        re.IGNORECASE,
+    ),
+    # "asks you" / "prompts you" / "reminds you" / "offers you" -- bare
+    # present-tense habitual active, human as the object
+    re.compile(r"\b(?:asks|prompts|reminds|offers)\s+you\b", re.IGNORECASE),
+]
+
+# Small, explicit allowlist: exact substrings this scan would otherwise
+# flag, kept out only because each names why it is accurate under the
+# ruling. A hit is excused ONLY when the matched span sits entirely INSIDE
+# one of these substrings' own span in the whitespace-normalized text --
+# proximity is not enough, so a real violation typed next to an allowed
+# phrase still fails.
+ALLOWED_ASK_PROMISE_SUBSTRINGS = [
+    # README's "Day to day": present tense, describing what /memcontinuum
+    # itself does WHILE the human is running it. A human asked BY the
+    # skill they just invoked is the one true "asks you" this system has
+    # (TOP-0110 L3) -- not an unprompted claim about some future session.
+    "asks you the one question if there is one to ask",
+]
+
+
+def _ask_promise_offenders(path):
+    """Every PROMISE_TO_BE_ASKED_PATTERNS hit in `path`, whitespace-
+    normalized first (markdown hard-wraps prose, so a promise like "you
+    will be asked" can legitimately carry a newline+indent between its own
+    words) and not covered by ALLOWED_ASK_PROMISE_SUBSTRINGS."""
+    normalized = " ".join(path.read_text().split())
+    allowed_spans = []
+    for phrase in ALLOWED_ASK_PROMISE_SUBSTRINGS:
+        start = 0
+        while True:
+            idx = normalized.find(phrase, start)
+            if idx == -1:
+                break
+            allowed_spans.append((idx, idx + len(phrase)))
+            start = idx + 1
+    offenders = []
+    for pattern in PROMISE_TO_BE_ASKED_PATTERNS:
+        for m in pattern.finditer(normalized):
+            if any(a_start <= m.start() and m.end() <= a_end
+                   for a_start, a_end in allowed_spans):
+                continue
+            snippet = normalized[max(0, m.start() - 30):m.end() + 30]
+            offenders.append(f"{path.name}: ...{snippet}...")
+    return offenders
+
+
+class TestNoRephrasedAskPromise(unittest.TestCase):
+    """Semantic companion to TestConsentIsManualNotAutomatic's exact-phrase
+    pins -- see PROMISE_TO_BE_ASKED_PATTERNS above for what this catches
+    and its disclosed limit. Scans README.md and skills/memcontinuum/
+    SKILL.md, the two user-facing docs that carried the retired promise
+    (TOP-0110 L3): the README describes the product to the human who reads
+    it, and the skill's own pinned structured-prompt options are the single
+    most user-visible place in the product, a numbered choice the human
+    sees live. Reads the bare module globals README/SKILL at call time
+    (not a pre-bound list), same as TestSkillHonesty's methods, so
+    TestNoRephrasedAskPromiseMutations below can point either one at a
+    mutated temp file and prove this method reacts to it for real."""
+
+    def test_no_user_facing_text_promises_you_will_be_asked(self):
+        offenders = []
+        for doc in (README, SKILL):
+            offenders.extend(_ask_promise_offenders(doc))
+        self.assertEqual(
+            offenders, [],
+            "user-facing text promises a human will be asked/prompted/"
+            "reminded/offered (TOP-0110 L3): the SessionStart detector's "
+            "ask reaches only the assistant, never the human directly, "
+            f"so nothing here may promise otherwise: {offenders}",
+        )
+
+
+class TestNoRephrasedAskPromiseMutations(unittest.TestCase):
+    """Proves TestNoRephrasedAskPromise actually catches what it claims to
+    -- against the REAL production test method, not a second hand-written
+    copy of its logic (the same house rule fix round 3 established for
+    TestSkillHonestyMutations above). Reproduces Grok gate finding 2's two
+    exact defeats verbatim: both slipped past every exact-phrase pin in
+    TestConsentIsManualNotAutomatic when the gate first found them."""
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _mutated_doc(varname, mutated_text):
+        """Point the module-level global named `varname` ("README" or
+        "SKILL") at a temp file holding `mutated_text` for the duration of
+        the `with` block, then restore it -- generalizes
+        TestSkillHonestyMutations._mutated_skill (which only ever swaps
+        SKILL) so this class can reproduce a defeat planted in either doc
+        TestNoRephrasedAskPromise scans; that test's method resolves
+        README/SKILL from this module's globals at call time, so this
+        reaches it."""
+        module = sys.modules[__name__]
+        real_path = getattr(module, varname)
+        fd, tmp_name = tempfile.mkstemp(suffix=".md")
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(mutated_text)
+            setattr(module, varname, tmp_path)
+            yield
+        finally:
+            setattr(module, varname, real_path)
+            tmp_path.unlink(missing_ok=True)
+
+    def _assert_guard_catches(self, varname, mutated_text):
+        with self._mutated_doc(varname, mutated_text):
+            test = TestNoRephrasedAskPromise(
+                "test_no_user_facing_text_promises_you_will_be_asked"
+            )
+            with self.assertRaises(
+                AssertionError,
+                msg="TestNoRephrasedAskPromise did not fail against the "
+                    "mutation",
+            ):
+                test.test_no_user_facing_text_promises_you_will_be_asked()
+
+    def test_readme_insertion_defeat_is_caught(self):
+        # Grok gate finding 2, defeat 1: inserted next to the README's new
+        # Day-to-day paragraph.
+        text = README.read_text()
+        marker = "**`/memcontinuum` any time.**"
+        self.assertIn(marker, text, "fixture stale: marker not found")
+        mutated = text.replace(
+            marker,
+            "You will be asked once at session start whether this repo "
+            "should keep a decision store.\n\n" + marker,
+            1,
+        )
+        self.assertNotEqual(mutated, text, "fixture stale: nothing matched")
+        self._assert_guard_catches("README", mutated)
+
+    def test_skill_section_2_rephrase_defeat_is_caught(self):
+        # Grok gate finding 2, defeat 2: section 2's "Not now" option
+        # reworded to keep the same false promise in different words.
+        original = (
+            "4. Not now — nothing is recorded; run `/memcontinuum` again "
+            "to decide"
+        )
+        text = SKILL.read_text()
+        self.assertIn(original, text, "fixture stale: option text not found")
+        mutated = text.replace(
+            original,
+            "4. Not now — you'll be prompted next time you open this repo",
+            1,
+        )
+        self.assertNotEqual(mutated, text, "fixture stale: nothing matched")
+        self._assert_guard_catches("SKILL", mutated)
 
 
 if __name__ == "__main__":
