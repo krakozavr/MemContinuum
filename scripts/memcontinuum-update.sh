@@ -101,8 +101,12 @@
 #            merge), so an edit to any of those shows up HERE and not as
 #            drift in every repository -- and a template change shows up in
 #            the rows and not here. With --apply, re-runs
-#            memcontinuum-setup.sh, but only when it is actually stale --
-#            true whether or not --machine/--no-machine was typed.
+#            memcontinuum-setup.sh, but only when it is actually stale.
+#            --machine makes no difference here -- it is a no-op either way
+#            (see above). --no-machine does: it skips the machine layer,
+#            and this refresh along with it, entirely (see --no-machine
+#            below). Verified: `--apply --no-machine` on a stale layer
+#            neither runs setup.sh nor writes config.sh.
 #
 #            This used to be off by default: a health check that answers
 #            only for the layer it was asked about reads as "everything is
