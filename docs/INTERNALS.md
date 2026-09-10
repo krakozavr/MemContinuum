@@ -1196,17 +1196,18 @@ rendered `"timeout": 5` is a backstop against a hung watchdog itself, not the
 mechanism meant to fire — the inner 2-second budget above is.
 
 That headroom is what the controlled measurement above found, not a
-guarantee about every store this hook ever runs against. A read of a real
-machine's `hook.log` (matched/no-match lines, not the watchdog-kill lines
-themselves, which carry no timing) tells a wider story: outcomes vary
-sharply by project, and on the busiest real store logged there the mean
-lookup runs close to a full second — headroom nearer 2x than 10x — with the
-inner watchdog itself having fired outright a handful of times across the
-logged window, on that one store only. The 2-second budget still holds
-(fail-open means a fired watchdog costs one citation, never a blocked
-edit), and the 34-sample figure above is still an accurate description of
-the controlled run that set it; it is just not the number a busy real
-store actually sees.
+guarantee about every store this hook ever runs against — a real store's
+actual behavior depends on where it lives, and a reading of one machine's
+`hook.log` taken before a slow store had been moved off a Windows drive
+mixed that store's old, misconfigured timings in with its current,
+native-disk ones; that comparison has been withdrawn as invalid, not
+corrected into a new multiplier. The 2-second budget still holds
+regardless (fail-open means a fired watchdog costs one citation, never a
+blocked edit), and the 34-sample figure above is still an accurate
+description of the controlled run that set it. What production lookups
+actually look like on a given store is best read fresh from that store's
+own `hook.log`, dated after its own last known move — see the README's
+lookup paragraph for the current reading.
 
 Unlike the five write-side hooks, whose timeout costs at most a lost
 reminder, `pre-edit-chain.sh`'s timeout carries an asymmetric cost: it costs

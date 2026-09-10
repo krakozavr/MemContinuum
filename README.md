@@ -58,10 +58,16 @@ effort is to notice it afterwards, from a tree diff, and record it in the
 edit ledger, never to block the change over it — though one committed away
 in the same breath, or made under a path git ignores, is not seen at all.
 That lookup runs under a
-2-second watchdog deadline — a real lookup usually takes a fraction of a
-second, but not always: it depends on which project's store is being
-asked, and some stores run closer to a full second and occasionally past
-it (the deadline itself fires on well under one percent of all lookups); a
+2-second watchdog deadline — on the current configuration, the freshest
+lookups logged (105 of them, across two projects) land at zero or one
+second on the log's own whole-second resolution, none reaching two, and
+the deadline itself has not fired once in that window. What sets the
+number is where the store lives, not the lookup itself: a store on a
+Windows drive was the slow case this deadline exists for, the one store
+that was still there has since moved onto the machine's own disk, and
+the installer already steers a checkout on a Windows drive there by
+default (see below). These are early figures from a short window and
+will be refreshed next release as more accumulates; a
 stale-but-present index is not one of the
 fail-open cases: it still answers from whatever it has, which is why keeping
 it current (`reindex`, or just committing the store) is worth doing. Nothing
