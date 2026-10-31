@@ -62,6 +62,9 @@ Before adding a new function, type, or file to a codebase this project indexes, 
 memidx.py code-search "INTENT PHRASE" --project PROJECT --mode hybrid --json
 ```
 
+`code-search` returns code only by default; add `--tests` for test code or `--all` for both. Each
+code hit carries `tested_by` (up to three test chunks that name its symbol) and a `role`.
+
 Phrase the query as the intent ("write a debug PNG", "embed a view in a scroll box", "hash
 a file's contents"), not as a symbol name — the index is built to match on that. A hit whose
 `concept_id` is set means a decision record governs that code; check it (`memidx.py why <path>`)

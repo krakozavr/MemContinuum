@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- `code-search` now separates code from tests. A chunk's role is worked out at query time from its path and language (`tests/`, `test_*.py`, `*Tests.swift`, `*.spec.ts`, `src/test`, and so on), so there is no reindex. By default only code is returned; `--tests` returns tests only and `--all` returns both with tests marked `[test]`. Each code hit also gets a `tested by:` line (JSON: `tested_by`) naming up to three test chunks whose name, signature or doc mentions its symbol. JSON hits gain `role`, and the envelope gains `role_filter`; existing keys are unchanged.
+
 - Code-search hybrid ranking now fuses with RRF constant k=30 instead of 60 (provisional: on the 45 graded intent queries top-10 hits rose from 20 to 23 of 35 with no loss; it is re-measured at the next relevance re-check). The store search keeps k=60.
 - A code root you removed from a repo's wiring no longer comes back. The code
   index remembered every root it had ever indexed, and the new background

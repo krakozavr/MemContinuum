@@ -2503,6 +2503,32 @@ exit (an integrity failure on some root) prints `heal did not complete
 report stands and the search still answers from whatever was already
 indexed.
 
+**Code versus test (role).** `chunkers.chunk_role(rel_path, lang)` returns
+`"code"` or `"test"` from a root-relative path and the language alone. The
+conventions are data: each `LANGUAGE_TABLE` row's `test_markers` (directory
+names, directory globs such as swift's `*Tests`, multi-part directory
+substrings such as java's `src/test`, and basename globs), matched
+case-sensitively against the directory parts and the basename only, never the
+code root's own name (same root-relative discipline as
+`path_is_skipped_for_lang`). It is computed at query time: no schema column, no
+reindex, and `chunker_version` does not read `test_markers`, so adding or
+editing a marker invalidates nothing. `cmd_code_search` runs both channels and
+the fusion unchanged, then filters by role while it builds hits in rank order
+and stops at `--limit`: default `code`, `--tests` for tests only, `--all` for
+both (mutually exclusive); the exact-symbol-first path of `code_hits_fts` is
+filtered the same way. The reason for filtering rather than re-ranking: a
+measurement on this repo's own index found most chunks (about 86 percent) are
+test chunks, but that did not make tests outrank code, so the change is scoped to
+what the caller sees. `code_tested_by` gives each code hit up to three test
+chunks (distinct paths) found by one FTS query on the hit's symbol over at most
+50 rows, role-filtered in Python through the same `chunk_role`; symbols under 4
+characters or `main`/`init`/`test`/`setUp` get no lookup. The code index stores
+names, signatures and doc comments, not bodies, so a test is found only when its
+name, signature or doc mentions the symbol. JSON hits gain `role` and, for code
+hits, `tested_by` (a list of `{path, qualified_name}`); the envelope gains
+`role_filter`; text output prints `[test]` on test hits and an indented
+`tested by:` line.
+
 **Multi-root output.** `code-search --json` wraps hits in an envelope:
 `state`; `code_root`/`indexed_at`/`head_sha`, naming the first recorded root
 alphabetically (`indexed_at` here is that root's `last_indexed_at`, renamed

@@ -430,7 +430,7 @@ maintenance commands (`code-search`, `code-reindex`, `embed-worker`, `code-embed
 ```bash
 memidx.py why <symbol-or-path> --project NAME --code-root DIR                    # why is this here?
 memidx.py search "<question>" --project NAME --status active                     # search the decisions
-memidx.py code-search "<what it does>" --project NAME                            # find existing code
+memidx.py code-search "<what it does>" --project NAME                            # find existing code (--tests / --all for test code)
 memidx.py for-path <file> --project NAME                                         # what governs this file?
 memidx.py chain <topic-id> --project NAME                                        # one question's full history
 memidx.py standing --project NAME [--root STORE] [--json]                        # what's standing, printed by hand
@@ -465,7 +465,14 @@ index at once (the post-commit hook's own bounded, content-only pass), so
 `reindex` by hand is only for edits you have not committed yet; vectors
 follow in the background (a detached embed-worker the same hook spawns,
 coalescing repeated commits into one pass), and `stats`/`check --json` show
-the backlog (`embedding_backlog`) while it catches up. A
+the backlog (`embedding_backlog`) while it catches up. `code-search`
+returns code by default: a chunk counts as a test when its path and language say
+so (`tests/`, `test_*.py`, `*Tests.swift`, `*.spec.ts` and the like), and those are
+left out unless you pass `--tests` (tests only) or `--all` (both, tests marked
+`[test]`). Each code hit also carries a `tested by:` line naming up to three test
+chunks whose name, signature or doc comment mentions its symbol (`--json`:
+`role`, `tested_by`, and `role_filter` at the top). The role is worked out at
+query time, so there is no reindex. A
 project can have several code roots — `code-search` says whether a root's
 index is proven current, metadata-checked, stale, or incomplete, rather than
 returning an empty list that reads like "nothing found", and `--verify-content`
