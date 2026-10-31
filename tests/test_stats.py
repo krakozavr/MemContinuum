@@ -1020,6 +1020,30 @@ class TestStatsPrecompactBucket(StatsTestBase):
         self.assertEqual(pc["outcomes"]["index-degraded"], 1)
 
 
+class TestStatsToleratesTheCwdToken(StatsTestBase):
+    """INC-0130: hook.log lines now carry cwd=<path> (a path may hold spaces);
+    `stats` must count them exactly as the same lines without it."""
+
+    def test_cwd_bearing_lines_are_counted_like_plain_ones(self):
+        plain = [
+            f"{ts(1)} precompact outcome=index-degraded reason=internal-error session=s1 project=demo",
+            f"{ts(1)} sessionstart outcome=init session=s1 source=startup project=demo",
+        ]
+        with_cwd = [
+            f"{ts(1)} precompact outcome=index-degraded reason=internal-error session=s1 cwd=/mnt/d/My Work/proj project=demo",
+            f"{ts(1)} sessionstart outcome=init session=s1 source=startup cwd=/mnt/d/My Work/proj project=demo",
+        ]
+        self.write_log(plain)
+        rc, base = run_stats_json(home=str(self.home), project="demo")
+        self.assertEqual(rc, 0)
+        self.write_log(with_cwd)
+        rc, out = run_stats_json(home=str(self.home), project="demo")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["precompact"], base["precompact"])
+        self.assertEqual(out["sessions_seen"], 1)
+        self.assertEqual(out["sessions_seen"], base["sessions_seen"])
+
+
 class TestStatsPreCommitBucket(StatsTestBase):
     """Grok re-gate NIT 4 (whole-branch NIT-2, carried over from fix wave
     1): hooks/pre-commit-append-only.sh writes `pre-commit-append-only:

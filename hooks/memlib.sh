@@ -144,6 +144,17 @@ mc_log() {
     printf '%s %s project=%s\n' "$(date -Iseconds 2>/dev/null || date)" "$1" "$MC_PROJECT" >>"$MC_LOG" 2>/dev/null || true
 }
 
+# mc_cwd_token CWD -- prints the `cwd=<path>` hook.log token: the path as
+# given with control characters stripped (it cannot split the line), `cwd=-`
+# when empty. memidx.py's _clean_log_path and hooks/code-refresh.sh print the
+# same token for the lines they compose (INC-0130: which directory did this
+# session run from).
+mc_cwd_token() {
+    local c
+    c="$(printf '%s' "${1:-}" | tr -d '[:cntrl:]')"
+    printf 'cwd=%s' "${c:--}"
+}
+
 # mc_rotate_orphans_oldest_first -- lists every hook.log.rotating.* file
 # next to $MC_LOG, oldest mtime first. Portable across GNU and BSD/macOS
 # without arrays or a GNU-only/BSD-only reversal tool: `ls -t` sorts

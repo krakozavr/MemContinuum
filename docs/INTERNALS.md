@@ -499,9 +499,14 @@ that shape: nothing was compared). `memidx.py stats` reports these under a
 every other hook kind — these lines carry no `outcome=` field of their own
 and are never folded into `user_prompts`.
 `code-refresh.sh` writes
-`code-refresh outcome=<refreshed|skip|failed> reason=… project=… roots=… unrecorded=… changed=… removed=… healed=… dropped=… elapsed=…s event=<Stop|SessionStart> session=… embed=<spawned|clean|off [reason=no-wired-roots]|failed reason=<marker|log|spawn>|unknown>`
+`code-refresh outcome=<refreshed|skip|failed> reason=… project=… roots=… unrecorded=… changed=… removed=… healed=… dropped=… elapsed=…s event=<Stop|SessionStart> session=… cwd=<path|-> embed=<spawned|clean|off [reason=no-wired-roots]|failed reason=<marker|log|spawn>|unknown>`
 (plus `marker=write-failed` and `detail=…` when they apply); the line is produced by
 `memidx.py code-refresh` and logged by the hook, and `memidx.py stats` files it under `other`.
+`cwd=<path>` (hook payload `cwd`, printed as given with control characters stripped, `-` when absent)
+rides on the `sessionstart` and `code-refresh` lines so a session's working directory can be read off the
+log; without it nobody could tell which claude directory a session ran from. `sessionstart` puts it
+after `source=` (before the trailing `project=`), `code-refresh` after `session=`; a path with spaces is split on whitespace, which the
+`memidx.py stats` `key=value` scan tolerates (pinned by a test).
 `memcontinuum-detect.sh` writes nothing at all unless
 `$MEMCONTINUUM_DETECT_LOG` is set — it runs in every repo on the machine, so its
 default is silence.

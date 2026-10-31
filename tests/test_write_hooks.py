@@ -2400,6 +2400,22 @@ class TestSessionStartRemind(HookTestBase):
         for line in matching:
             self.assertIn(f"project={self.project}", line, line)
 
+    def test_log_line_carries_the_session_cwd(self):
+        """INC-0130: the session's working directory is on every sessionstart
+        outcome line; a payload without one prints cwd=-."""
+        run_script(SESSIONSTART_HOOK, self.session_start_payload("s-start-cwd", "startup"), self.base_env())
+        no_cwd = json.dumps({"session_id": "s-start-nocwd", "hook_event_name": "SessionStart",
+                             "source": "startup"})
+        run_script(SESSIONSTART_HOOK, no_cwd, self.base_env())
+        lines = [l for l in (self.home / "hook.log").read_text().splitlines() if "sessionstart outcome=" in l]
+        with_cwd = [l for l in lines if "session=s-start-cwd" in l]
+        without = [l for l in lines if "session=s-start-nocwd" in l]
+        self.assertTrue(with_cwd and without, lines)
+        for line in with_cwd:
+            self.assertIn(f" cwd={self.code_root} ", line)
+        for line in without:
+            self.assertIn(" cwd=- ", line)
+
     def test_resume_does_not_reset_existing_start_shas(self):
         session_id = "s-start-resume"
         run_script(SESSIONSTART_HOOK, self.session_start_payload(session_id, "startup"), self.base_env())
@@ -6878,6 +6894,38 @@ class TestCodeRefreshHook(HookTestBase):
         for bad in ("abc", "0", "0.0", "-3", "1.2.3", ""):
             line, _ = self.run_hook("Stop", env=self.refresh_env(MEMCONTINUUM_CODE_REFRESH_BUDGET=bad))
             self.assertIn("outcome=skip reason=current", line, bad)
+
+    def test_log_line_carries_the_session_cwd(self):
+        """INC-0130: which directory did this session run from. The worker's
+        line (memidx.py) and the shell-composed skip line both carry cwd=."""
+        self.build_code_index()
+        line, _ = self.run_hook("Stop")
+        self.assertIn(f" cwd={self.code_root} ", line + " ")
+        env = self.refresh_env(MEMCONTINUUM_PROJECT="../victim")
+        line, _ = self.run_hook("Stop", env=env)
+        self.assertIn("outcome=skip reason=bad-project", line)
+        self.assertTrue(line.endswith(f" cwd={self.code_root}"), line)
+
+    def test_log_line_without_a_cwd_prints_a_dash(self):
+        self.build_code_index()
+        no_cwd = json.dumps({"session_id": "s-refresh", "hook_event_name": "Stop"})
+        line, _ = self.run_hook("Stop", payload=no_cwd)
+        self.assertIn(" cwd=- ", line + " ")
+        line, _ = self.run_hook("Stop", payload=no_cwd, env=self.refresh_env(MEMCONTINUUM_PROJECT="../victim"))
+        self.assertTrue(line.endswith(" cwd=-"), line)
+
+    def test_cwd_control_characters_cannot_split_the_log_line(self):
+        self.build_code_index()
+        hostile = json.dumps({"session_id": "s-refresh", "hook_event_name": "Stop",
+                              "cwd": "/x/y\nforged outcome=refreshed\tz"})
+        line, _ = self.run_hook("Stop", payload=hostile)
+        self.assertIn(" cwd=/x/yforged outcome=refreshed", line)
+        line, _ = self.run_hook("Stop", payload=hostile, env=self.refresh_env(MEMCONTINUUM_PROJECT="../victim"))
+        # The shell-composed line reads the RAW payload prefix, where the
+        # control characters are still the two-character JSON escapes: no real
+        # control character, so nothing to split the line (run_hook already
+        # asserts exactly one new line).
+        self.assertIn(" cwd=/x/y", line)
 
     def test_unsafe_project_name_builds_no_path(self):
         env = self.refresh_env(MEMCONTINUUM_PROJECT="../victim")
