@@ -315,7 +315,8 @@ Store`); when even that name is already taken, the installer refuses and
 asks for an explicit `--store` rather than guess a third name.
 
 `--code-root DIR` (repeatable) is the code checkout
-whose edits should trigger retrieval; omit it entirely for a rationale-only
+the index, the new-file nudge and the ledger cover; retrieval before an edit
+follows the git toplevel of each code root (the root itself when git cannot say); omit it entirely for a rationale-only
 install, and the two edit-time hooks are simply not wired. `--python PATH`
 names the python to run the engine with, and `--bootstrap-venv [DIR]` creates
 one and installs `requirements.txt` into it if you have not set the machine up

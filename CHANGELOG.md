@@ -14,8 +14,9 @@
   not inside a git work tree (or git cannot say), `repo-init.sh` falls back
   to the root itself and prints a `note: retrieval root for ...` line saying
   worktrees outside it get no retrieval. `repo-init.sh` is a fingerprint
-  input, so every wired row shows as behind until `memcontinuum-update.sh
-  --apply` re-renders it, even rows whose rendering does not change.
+  input, so every wired row shows as `stale` until `memcontinuum-update.sh
+  --apply` re-renders it, even where the filters and prefix are unchanged
+  (the embedded render stamp moves).
 
 ## [0.4.0] — 2026-10-31
 

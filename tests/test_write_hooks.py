@@ -1581,7 +1581,13 @@ class TestLedgerNarrowRootWorktreeRemap(HookTestBase):
         fake = fake_dir / "git"
         fake.write_text(
             "#!/bin/sh\n"
-            'case "$*" in *"rev-parse --show-toplevel") exit 1 ;; esac\n'
+            f'root={shlex.quote(str(self.root))}\n'
+            'dir=""; prev=""\n'
+            'for a in "$@"; do\n'
+            '  [ "$prev" = "-C" ] && dir="$a"\n'
+            '  prev="$a"\n'
+            'done\n'
+            'case "$*" in *"rev-parse --show-toplevel") [ "$dir" = "$root" ] && exit 1 ;; esac\n'
             f"exec {shlex.quote(real_git)} \"$@\"\n"
         )
         fake.chmod(0o755)

@@ -3009,8 +3009,10 @@ for the root that matches (bounded by the number of
 configured roots, typically one or a few) — no longer "a single `git
 rev-parse`" as this section previously (incorrectly) claimed for every case.
 
-This closes the gap in each hook's own logic; it does not change which paths
-the harness LAUNCHES either hook for at all. `pre-edit-chain.sh`'s
+This closes the gap in each hook's own logic. Which paths the harness LAUNCHES
+a hook for is set by the settings-level filters; with repository-wide
+retrieval filters it widens (an edit in an in-root worktree now launches the
+chain even when the code root is narrower than the checkout). `pre-edit-chain.sh`'s
 settings-level `"if"` filter is still a literal path glob, rendered per
 *retrieval root* (`templates/code-root-filter-pair.json.tmpl`): the git toplevel
 of each `--code-root`, or the root itself outside git, de-duplicated — so a code

@@ -76,7 +76,7 @@ every state's wording below: whether this repo keeps an append-only record of
 *why* its decisions were made — rulings, incidents, rejected alternatives —
 indexed and surfaced to agents when they touch related code. It costs a git
 repo for the store, hooks wired into the project's `.claude` settings (the
-dry-run's plan prints a `code root   :` line per root for retrieval, and how
+dry-run's plan prints a `code root   :` line per root, and how
 many hook groups merge into each event — not the individual hook script
 names; read the plan's own lines to the human rather than restating them),
 and the habit of writing records.
@@ -154,8 +154,8 @@ change to an existing answer).
   rule that computes it lives in `scripts/mc-registry-lib.sh` and can change
   without this skill knowing, so the only honest answer is whatever the tool
   just printed.
-- `--code-root DIR` — repeatable; the code checkout(s) whose edits should
-  trigger retrieval. Omit for a rationale-only store.
+- `--code-root DIR` — repeatable; the code checkout(s) scoping the index,
+  new-file nudge and ledger; edit retrieval follows each root's git toplevel. Omit for a rationale-only store.
 
 **"Complete the wiring" on a `partial-wired` repo** is a repair, not a fresh
 install — but ONLY when this repo has no existing code retrieval: check

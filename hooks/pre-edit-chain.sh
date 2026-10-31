@@ -550,8 +550,9 @@ done
 # on every miss regardless of what the fallback later does, still pays
 # nothing extra. repo-init.sh
 # renders the STRIP_PREFIX as the colon-joined RETRIEVAL roots (the git
-# toplevel of each code root, templates/code-root-filter-pair.json.tmpl),
-# the same list every pair's settings.json "if" filter is scoped to, so this
+# toplevel of each code root): the identical colon-joined list on every
+# pair, while each pair's settings.json "if" names ONE retrieval root from
+# that list (templates/code-root-filter-pair.json.tmpl), so this
 # is a faithful reading of "the configured roots this invocation knows
 # about", not a looser/lossier stand-in for mc_code_roots. A hand-wired STRIP_PREFIX that
 # is not really a repo root can never produce a false remap either way --
