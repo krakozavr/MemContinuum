@@ -1284,6 +1284,29 @@ class TestLedgerPostEditWorktreeGap(HookTestBase):
         # every pre-existing (non-worktree) ledger test already asserts.
         self.assertIn(fpath, [e["path"] for e in state.get("ledger", [])])
 
+    def _git_free_root(self):
+        """A fresh directory none of whose ancestors (itself included) holds a
+        `.git` entry -- the precondition of the bash-only gate in
+        mc_remap_worktree_path. Tries the usual temp roots in turn; skips the
+        test when this machine has none, rather than asserting on a path the
+        gate would legitimately probe with git."""
+        def clean(d):
+            probe = Path(d)
+            while True:
+                if os.path.lexists(probe / ".git"):
+                    return False
+                if probe == probe.parent:
+                    return True
+                probe = probe.parent
+        for base in (tempfile.gettempdir(), "/dev/shm", "/var/tmp", str(Path.home())):
+            if not os.path.isdir(base) or not os.access(base, os.W_OK) or not clean(base):
+                continue
+            root = Path(tempfile.mkdtemp(prefix="mc-no-git-", dir=base))
+            self.addCleanup(shutil.rmtree, str(root), True)
+            if clean(root):
+                return root
+        self.skipTest("no writable temp root without a .git ancestor on this machine")
+
     def test_outside_scope_edit_pays_no_git_call(self):
         """A path outside every root and not in any git repo at all (the
         vast majority of real out-of-scope edits) must also cost nothing:
@@ -1297,7 +1320,12 @@ class TestLedgerPostEditWorktreeGap(HookTestBase):
         fake_git.chmod(0o755)
 
         session_id = "s-ledger-wt-nogit-outside"
-        fpath = "/tmp/somewhere/else/not-in-any-repo.py"
+        # The gate walks every ancestor of the edited path up to "/" looking
+        # for a `.git` entry, so a path under /tmp is only "in no repo" while
+        # no stray /tmp/.git exists (something on a dev machine recreates an
+        # empty one, INC-0130 follow-up). Build the path under a root whose
+        # whole ancestor chain is verified .git-free instead of assuming it.
+        fpath = str(self._git_free_root() / "somewhere" / "else" / "not-in-any-repo.py")
         payload = self.post_tool_use_payload(session_id, fpath)
         env = self._env(PATH=f"{fake_git_dir}:{os.environ.get('PATH', '')}")
         proc, _ = run_script(LEDGER_HOOK, payload, env)
