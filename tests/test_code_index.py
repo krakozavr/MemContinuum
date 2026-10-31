@@ -7090,5 +7090,141 @@ class TestEmbedWorkerFixRound5(unittest.TestCase):
             self.assertTrue(self._claim(marker).is_dir())
             self.assertIn("claimed-not-regular", log.read_text())
 
+
+class TestChunkRole(unittest.TestCase):
+    """TOP-0137 L7 step 6: chunkers.chunk_role(rel_path, lang), derived from
+    root-relative path and language only."""
+
+    CASES = {
+        "python": (["tests/a.py", "pkg/test/b.py", "test_x.py", "pkg/x_test.py", "pkg/conftest.py"],
+                   ["src/x.py", "pkg/testing/x.py", "pkg/contest.py", "pkg/tests_helper.py"]),
+        "swift": (["Tests/A.swift", "MMDCoreTests/A.swift", "Sources/FooTests.swift", "Sources/FooTest.swift"],
+                  ["Sources/Foo.swift", "tests/Foo.swift", "Sources/Tests.swift.bak.swift"]),
+        "javascript": (["__tests__/a.js", "src/tests/a.js", "src/test/a.js", "src/a.test.js", "src/a.spec.jsx"],
+                       ["src/a.js", "src/testing/a.js", "src/contest.js"]),
+        "typescript": (["__tests__/a.ts", "src/a.test.ts", "src/a.spec.ts"], ["src/a.ts"]),
+        "tsx": (["src/a.test.tsx", "tests/a.tsx"], ["src/a.tsx"]),
+        "lua": (["spec/a.lua", "tests/a.lua", "test/a.lua", "a_spec.lua", "x/a_test.lua"],
+                ["src/a.lua", "src/spec_helper.lua"]),
+        "java": (["src/test/java/A.java", "mod/src/test/A.java", "src/main/ATest.java", "src/main/ATests.java"],
+                 ["src/main/java/A.java", "src/testing/A.java", "src/tests/A.java"]),
+        "rust": (["tests/a.rs", "src/a_test.rs"], ["src/a.rs", "src/test/a.rs"]),
+        "php": (["tests/A.php", "test/A.php", "src/ATest.php"], ["src/A.php", "src/Tester.php"]),
+    }
+
+    def test_every_language_has_positive_and_negative_paths(self):
+        self.assertEqual(set(self.CASES) | {"javascript"}, set(chunkers.LANGUAGE_TABLE))
+        for lang, (tests, code) in self.CASES.items():
+            for path in tests:
+                self.assertEqual(chunkers.chunk_role(path, lang), "test", (lang, path))
+            for path in code:
+                self.assertEqual(chunkers.chunk_role(path, lang), "code", (lang, path))
+
+    def test_code_root_name_is_never_consulted(self):
+        # the path is root-relative; the root's own name is not part of it
+        self.assertEqual(chunkers.chunk_role("src/x.py", "python"), "code")
+        self.assertEqual(chunkers.chunk_role("Sources/Foo.swift", "swift"), "code")
+        self.assertEqual(chunkers.chunk_role("x.py", "python"), "code")
+
+    def test_basename_is_not_matched_as_a_directory(self):
+        self.assertEqual(chunkers.chunk_role("pkg/tests", "python"), "code")
+        self.assertEqual(chunkers.chunk_role("pkg/Tests", "swift"), "code")
+
+    def test_unknown_language_is_code(self):
+        self.assertEqual(chunkers.chunk_role("tests/a.zz", "zz"), "code")
+        self.assertEqual(chunkers.chunk_role("tests/a.py", None), "code")
+
+    def test_case_is_significant(self):
+        self.assertEqual(chunkers.chunk_role("Tests/a.py", "python"), "code")
+        self.assertEqual(chunkers.chunk_role("tests/A.swift", "swift"), "code")
+
+
+class TestCodeSearchRoles(unittest.TestCase):
+    """TOP-0137 L7 step 6: default code-only, --tests, --all, role and
+    tested_by on hits."""
+
+    def _build(self, td):
+        root = Path(td) / "code"
+        (root / "src").mkdir(parents=True)
+        (root / "tests").mkdir()
+        (root / "src" / "mod.py").write_text(
+            "def widget_builder(x):\n    return x + 1\n\n\ndef main():\n    return widget_builder(1)\n")
+        (root / "tests" / "test_mod.py").write_text(
+            "from src.mod import widget_builder\n\n\nclass TestWidget:\n"
+            "    def test_widget_builder(self):\n        \"\"\"Covers widget_builder.\"\"\"\n        assert widget_builder(1) == 2\n")
+        db = Path(td) / "code.sqlite"
+        code_reindex(root, db, lang="python")
+        return db
+
+    def _search(self, db, query, **kw):
+        import contextlib
+        import io
+        import json as _json
+        buf = io.StringIO()
+        base = dict(db=str(db), query=query, mode="fts", limit=10, json=True, no_heal=True)
+        base.update(kw)
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {"MEMCONTINUUM_HOME": home}):
+            with contextlib.redirect_stdout(buf):
+                rc = memidx.cmd_code_search(ns(**base))
+        self.assertEqual(rc, 0)
+        return buf.getvalue() if not base["json"] else _json.loads(buf.getvalue())
+
+    def test_default_returns_code_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = self._search(self._build(td), "widget_builder")
+            self.assertEqual(out["role_filter"], "code")
+            self.assertTrue(out["results"])
+            self.assertTrue(all(h["role"] == "code" for h in out["results"]), out["results"])
+
+    def test_tests_flag_returns_tests_only_and_all_returns_both(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = self._build(td)
+            tests = self._search(db, "widget_builder", role_filter="tests")
+            self.assertEqual(tests["role_filter"], "tests")
+            self.assertTrue(tests["results"])
+            self.assertTrue(all(h["role"] == "test" and "tested_by" not in h for h in tests["results"]))
+            both = self._search(db, "widget_builder", role_filter="all")
+            self.assertEqual({h["role"] for h in both["results"]}, {"code", "test"})
+
+    def test_limit_applies_after_the_filter(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = self._build(td)
+            out = self._search(db, "widget_builder", limit=1)
+            self.assertEqual(len(out["results"]), 1)
+            self.assertEqual(out["results"][0]["role"], "code")
+
+    def test_code_hit_names_its_tests(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = self._build(td)
+            out = self._search(db, "widget_builder")
+            hit = [h for h in out["results"] if h["qualified_name"] == "widget_builder"][0]
+            self.assertEqual([t["path"] for t in hit["tested_by"]], ["tests/test_mod.py"])
+            self.assertIn("test_widget_builder", hit["tested_by"][0]["qualified_name"])
+            # `main` is on the too-common list: no lookup at all
+            main = [h for h in self._search(db, "main")["results"]
+                    if h["qualified_name"] == "main"]
+            for h in main:
+                self.assertEqual(h["tested_by"], [])
+
+    def test_text_output_marks_tests_and_prints_tested_by(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = self._build(td)
+            text = self._search(db, "widget_builder", json=False, role_filter="all")
+            self.assertIn("[test]", text)
+            self.assertIn("    tested by: tests/test_mod.py::", text)
+            plain = self._search(db, "widget_builder", json=False)
+            self.assertNotIn("[test]", plain)
+
+    def test_code_tested_by_skips_short_and_common_symbols(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = self._build(td)
+            conn = memidx.open_code_db(db)
+            try:
+                for sym in ("abc", "main", "setUp", "init", "test"):
+                    self.assertEqual(memidx.code_tested_by(conn, memidx.DEFAULT_PROJECT, sym), [], sym)
+                self.assertTrue(memidx.code_tested_by(conn, memidx.DEFAULT_PROJECT, "widget_builder"))
+            finally:
+                conn.close()
+
 if __name__ == "__main__":
     unittest.main()

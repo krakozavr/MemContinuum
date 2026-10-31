@@ -7,6 +7,7 @@ module exists (Tasks 2/4 add the Swift and Python backends). Exclusivity
 there is no API to register a second backend for an existing language.
 """
 
+import fnmatch
 import hashlib
 import importlib
 import os
@@ -38,6 +39,7 @@ UNIVERSAL_SKIP_DIRS = frozenset({
 LANGUAGE_TABLE = {
     "swift": {"backend": "native", "module": "chunkers.swift",
               "extensions": (".swift",), "shebangs": (), "impl_version": "3",
+              "test_markers": {"dirs": frozenset({"Tests"}), "dir_globs": ("*Tests",), "dir_substrings": (), "files": ("*Tests.swift", "*Test.swift")},
               "skip_dirs": frozenset({"Tests", "Resources"})},
     "python": {"backend": "native", "module": "chunkers.python_ast",
                "extensions": (".py",), "shebangs": ("python", "python3"),
@@ -56,12 +58,14 @@ LANGUAGE_TABLE = {
                # -sensitive parse behind it, so its source fingerprint plus
                # impl_version already covers it.
                "interpreter_sensitive": True,
+               "test_markers": {"dirs": frozenset({"test", "tests"}), "dir_globs": (), "dir_substrings": (), "files": ("test_*.py", "*_test.py", "conftest.py")},
                "skip_dirs": frozenset({"build", "dist"})},
     "javascript": {"backend": "tree-sitter", "module": "chunkers.treesitter",
                     "grammar_module": "tree_sitter_javascript", "language_fn": "language",
                     "runtime_pin": "0.26.0", "grammar_pin": "0.25.0",
                     "query_file": "javascript.scm", "impl_version": "1",
                     "extensions": (".js", ".jsx", ".mjs", ".cjs"), "shebangs": ("node",),
+                    "test_markers": {"dirs": frozenset({"test", "__tests__", "tests"}), "dir_globs": (), "dir_substrings": (), "files": ("*.test.*", "*.spec.*")},
                     "skip_dirs": frozenset({"build", "dist"}),
                     "containers": {"class_declaration": "name"},
                     "method_if_ancestor_in": frozenset(), "max_bytes": None},
@@ -70,6 +74,7 @@ LANGUAGE_TABLE = {
                     "runtime_pin": "0.26.0", "grammar_pin": "0.23.2",
                     "query_file": "typescript.scm", "impl_version": "1",
                     "extensions": (".ts",), "shebangs": (),
+                    "test_markers": {"dirs": frozenset({"test", "__tests__", "tests"}), "dir_globs": (), "dir_substrings": (), "files": ("*.test.*", "*.spec.*")},
                     "skip_dirs": frozenset({"build", "dist"}),
                     # `namespace M {}` is an internal_module and `module M {}`
                     # a module; both declare a scope a reference spells, so
@@ -93,6 +98,7 @@ LANGUAGE_TABLE = {
             "runtime_pin": "0.26.0", "grammar_pin": "0.23.2",
             "query_file": "typescript.scm", "impl_version": "1",
             "extensions": (".tsx",), "shebangs": (),
+            "test_markers": {"dirs": frozenset({"test", "__tests__", "tests"}), "dir_globs": (), "dir_substrings": (), "files": ("*.test.*", "*.spec.*")},
             "skip_dirs": frozenset({"build", "dist"}),
             # Same two namespace spellings (and the same string-named
             # `declare module "x" {}` exclusion) as the typescript row above,
@@ -115,6 +121,7 @@ LANGUAGE_TABLE = {
              # no other field in the payload can express.
              "query_file": "java.scm", "impl_version": "2",
              "extensions": (".java",), "shebangs": (),
+             "test_markers": {"dirs": frozenset(), "dir_globs": (), "dir_substrings": ("src/test",), "files": ("*Test.java", "*Tests.java")},
              "skip_dirs": frozenset({"target", "build", "dist"}),
              "containers": {"class_declaration": "name", "interface_declaration": "name",
                              "enum_declaration": "name", "record_declaration": "name"},
@@ -125,6 +132,7 @@ LANGUAGE_TABLE = {
             "runtime_pin": "0.26.0", "grammar_pin": "0.24.1",
             "query_file": "php.scm", "impl_version": "1",
             "extensions": (".php",), "shebangs": (),
+            "test_markers": {"dirs": frozenset({"test", "tests"}), "dir_globs": (), "dir_substrings": (), "files": ("*Test.php",)},
             "skip_dirs": frozenset(),
             "containers": {"class_declaration": "name", "trait_declaration": "name",
                             "enum_declaration": "name"},
@@ -141,6 +149,7 @@ LANGUAGE_TABLE = {
              "runtime_pin": "0.26.0", "grammar_pin": "0.24.2",
              "query_file": "rust.scm", "impl_version": "1",
              "extensions": (".rs",), "shebangs": (),
+             "test_markers": {"dirs": frozenset({"tests"}), "dir_globs": (), "dir_substrings": (), "files": ("*_test.rs",)},
              "skip_dirs": frozenset({"target"}),
              "containers": {"impl_item": "SELF_TYPE", "trait_item": "name", "mod_item": "name"},
              "method_if_ancestor_in": frozenset({"impl_item", "trait_item"}), "max_bytes": None,
@@ -161,6 +170,7 @@ LANGUAGE_TABLE = {
             "runtime_pin": "0.26.0", "grammar_pin": "0.5.0",
             "query_file": "lua.scm", "impl_version": "1",
             "extensions": (".lua",), "shebangs": ("lua",),
+            "test_markers": {"dirs": frozenset({"spec", "test", "tests"}), "dir_globs": (), "dir_substrings": (), "files": ("*_spec.lua", "*_test.lua")},
             "skip_dirs": frozenset(),
             "containers": {},
             "method_if_ancestor_in": frozenset(), "max_bytes": None},
@@ -541,3 +551,38 @@ def path_is_skipped_for_lang(rel_parts, lang):
     if not skip:
         return False
     return any(part in skip for part in rel_parts[:-1])
+
+
+def chunk_role(rel_path, lang):
+    """"test" or "code": the role of a file (and so of every chunk in it),
+    derived from its root-relative path and its language alone -- no body,
+    no schema column, nothing stored.
+
+    The conventions live in each LANGUAGE_TABLE row's "test_markers"
+    (directory names, directory globs, directory substrings spanning
+    several parts such as java's `src/test`, and basename globs), matched
+    case-sensitively (swift's `Tests` is not python's `tests`). `rel_path`
+    must be ROOT-relative, like `path_is_skipped_for_lang`'s parts: the
+    code root's own name is never consulted, so a root that is itself
+    called `tests` does not turn its whole tree into tests. Only DIRECTORY
+    parts are matched against the directory rules, the basename only
+    against the file rules. A language with no row, or a row with no
+    markers, is always "code" (fail open)."""
+    marks = LANGUAGE_TABLE.get(lang, {}).get("test_markers")
+    if not marks:
+        return "code"
+    parts = [p for p in os.fspath(rel_path).replace("\\", "/").split("/") if p]
+    if not parts:
+        return "code"
+    dirs, base = parts[:-1], parts[-1]
+    if any(d in marks["dirs"] for d in dirs):
+        return "test"
+    if any(fnmatch.fnmatchcase(d, g) for d in dirs for g in marks["dir_globs"]):
+        return "test"
+    if marks["dir_substrings"]:
+        joined = "/" + "/".join(dirs) + "/"
+        if any("/" + sub + "/" in joined for sub in marks["dir_substrings"]):
+            return "test"
+    if any(fnmatch.fnmatchcase(base, g) for g in marks["files"]):
+        return "test"
+    return "code"
