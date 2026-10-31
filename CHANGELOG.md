@@ -2,147 +2,47 @@
 
 ## [0.4.0] — 2026-10-31
 
-### Installer and updater
-- `memcontinuum-update.sh` now notices a claude directory it was never told
-  about. It scans the project list Claude Code keeps in `~/.claude.json`
-  (override `MEMCONTINUUM_CLAUDE_JSON`), reads each project's
-  `.claude/settings.local.json` (or `settings.json`), and prints an
-  `unrecorded-claude-dir` row for every directory that carries a wired
-  project's hooks but is not on that project's registry row, with the
-  `memcontinuum-decide.sh wired ...` command that records it (complete when a
-  local checkout of the row's remote is known here, otherwise marked
-  INCOMPLETE with `--repo` left to fill in); a directory whose project has no
-  row at all is told to wire it or remove the hooks. The scan records nothing
-  (its one temporary file is removed) and never changes the exit status;
-  under `--apply` it runs last, after the registry is rewritten. What
-  prompted it: a second claude directory had been missing from a row for
-  days, so every update rendered the other one and reported ok.
+### Code index
 
-### Hooks
-- `sessionstart` and `code-refresh` lines in `hook.log` carry `cwd=<token>`,
-  the session's working directory percent-encoded as one whitespace-free
-  token, so the directory a session ran from can be read off the log and a
-  path containing `project=` can no longer re-attribute a line in `stats`.
-
-### Store
-- Every store commit can now write a verified `git bundle` backup of the
-  store: set `memcontinuum-setup.sh --backup-dir DIR [--backup-keep N]` and
-  the post-commit hook keeps the newest N bundles per store in `DIR/<project>/`
-  with a manifest line each. `memcontinuum-update.sh` shows the setting on the
-  machine line and each store's state (off, none, current, behind,
-  unreadable, unknown) in a new `backup` column. The bundle is never written
-  outside `DIR` (project names `.` and `..` are refused, a symlinked project
-  folder pointing elsewhere is refused), the bundle just written is never
-  pruned, a `--backup-keep` such as `00` or `08` is rejected or normalised
-  instead of being read as octal, and a half-written file left by a killed
-  hook (`<name>.part.<pid>`) is swept by a later run once it is older than twice
-  the hook budget (60 s by default), so a live overlapping hook's file is left alone.
-- The post-commit hook now runs the commit checks again, so a store commit
-  made with `git commit --no-verify` that would have been refused prints a
-  warning, is logged, and is named at the next session start until a clean
-  commit follows. An engine crash (or a lint that prints nothing) never clears
-  that warning; a warning left by another store with the same project name is
-  neither cleared nor overwritten (the second store's own finding is then only
-  printed and logged, `marker=foreign`); and without the watchdog python
-  neither the re-lint nor the backup runs. A project name that could leave
-  its folder (`..`, a slash, a newline) makes the hook skip both the re-lint
-  marker and the backup; a bad backup directory skips only the backup, the
-  re-lint still runs. Every file the hook creates (bundle part, marker temp)
-  is created exclusively (the bundle is written through the exclusive open itself) and never through a planted symlink, and a bundle or
-  marker path that is a symlink or a directory is refused instead of being
-  moved into.
+- Re-run `memcontinuum-update.sh --apply` to add automatic refresh to existing projects with a code root. The new `code-refresh.sh` hook updates changed and deleted files on `Stop`, using the same incremental text pass as `code-search`, without embeddings. On `SessionStart` it only checks for changes: file stats, a content hash on drift, and git HEAD, as `code-search` does. A behind index gets a `<project>.code-stale` marker, reported in one line at the next session start; the first turn end repairs it.
+- Refresh failures stay visible. A killed hook leaves `refreshing`; failed passes, exceptions, and refusals above `MEMCONTINUUM_CODE_REFRESH_LIMIT` (default 500) leave their reason. The hook prints nothing, always exits 0, and writes one `hook.log` line per run. Its watchdog allows 8 s on `Stop` (`MEMCONTINUUM_CODE_REFRESH_BUDGET`) and 2 s on `SessionStart`. It never creates an index; never-indexed roots are only counted. A lock prevents simultaneous refreshes or a refresh overlapping a `code-search` heal; search skips its heal with a one-line notice. No git hook is installed in code repositories: commits during a session are caught at turn end, others at session start.
+- Code embeddings now fill in automatically. Previously, installation ran `code-reindex` with `--no-embed` and nothing followed, leaving every code index with zero vectors and `code-search` text-only in every mode. The installer now starts `code-embed-worker` after indexing. `code-refresh.sh` also starts it on `Stop` and `SessionStart` when vectors are missing, so existing indexes begin filling when you next open or finish a session. It runs detached, one worker at a time, using the store's `embed-worker` marker, lock and log pattern. Committing 128-vector batches preserves progress if it is killed.
+- Embedding status reflects actual coverage after each pass: `embedding_mode` is `none`, `partial` or `full`; `code-reindex` reports `N chunk(s) awaiting embedding`; `code-search` counts missing vectors and still finds those chunks by text. The `code-refresh` line in `hook.log` reports `embed=spawned|clean|off`. A text-only Stop refresh leaves a previously full index `partial` until the worker catches up. Set `MEMCONTINUUM_EMBED_WORKER=0` to disable the worker.
+- CPU embedding is about 8x faster: roughly 40 ms per chunk instead of 0.3-0.4 s, or 2.5 minutes instead of 22 for 3,300 chunks. The engine uses the plain float32 ONNX version of `BAAI/bge-small-en-v1.5`; fastembed's default quantised build limits its main matrix multiply to one core. Vectors match the old ones (cosine 1.0000 on real chunks), but a new model fingerprint triggers a one-time background re-embed. Both store records and code chunks count as awaiting embedding until then. The first embed downloads about 133 MB; CI's model cache key is now `v2`.
+- Removed code roots stay removed. Previously, remembered whole-repo roots could survive beside narrower replacements, duplicating every symbol when the worker or heal processed both. `code-embed-worker` now requires repeatable `--root DIR`; the installer and refresh hook pass wired roots, and both worker and heal skip unnamed roots. `code-refresh.sh` drops them on `Stop` (`dropped=<n>` in `hook.log`) but only marks them on `SessionStart` (`stale-root=<n>`). Relative or unresolvable wired roots, or wiring that names no recorded root, disable dropping (`detail=stale-check-skipped:...`). The worker's text pass refuses roots no longer recorded.
+- Indexing now respects `.gitignore`. In git work trees, `git ls-files` supplies tracked and untracked files, excluding ignored files. Outside a work tree, or without git, indexing keeps the directory walk and reports that on stderr. The next refresh removes previously indexed ignored content, such as a corpus under `docs/` or build output. The language census uses the same files.
+- `heal_code_index` names its caller, can return messages instead of printing them, and explains skipped heals: over the limit, failure, or a held lock.
 
 ### Code search
-- `code-search` now separates code from tests. A chunk's role is worked out at query time from its path and language (`tests/`, `test_*.py`, `*Tests.swift`, `*.spec.ts`, `src/test`, and so on), so there is no reindex. By default only code is returned; `--tests` returns tests only and `--all` returns both with tests marked `[test]`. Each code hit also gets a `tested by:` line (JSON: `tested_by`) naming up to three test chunks whose qualified name, signature, doc or indexed body excerpt names its symbol. The flags select among chunks already indexed; Swift test directories named `Tests` are still pruned unless wired as their own code root. JSON hits gain `role`, and the envelope gains `role_filter`; existing keys are unchanged.
-- Code-search hybrid ranking now fuses with RRF constant k=30 instead of 60 (provisional: on the 45 graded intent queries top-10 hits rose from 20 to 23 of 35 with no loss; it is re-measured at the next relevance re-check). The store search keeps k=60.
+
+- `code-search` returns code by default; `--tests` returns only tests, and `--all` includes both, marking tests `[test]`. No reindex is needed: paths and language determine roles at query time (`tests/`, `test_*.py`, `*Tests.swift`, `*.spec.ts`, `src/test`, and similar patterns). These flags only select indexed chunks; Swift `Tests` directories remain pruned unless wired as separate code roots.
+- Code hits gain `tested by:` (JSON: `tested_by`), naming up to three test chunks whose qualified name, signature, doc or indexed body excerpt names the symbol. JSON hits also gain `role`, and the envelope gains `role_filter`; existing keys stay unchanged.
+- Hybrid code ranking uses RRF k=30 instead of 60. This is provisional: across 45 graded intent queries, top-10 hits rose from 20 to 23 of 35 with no loss. It will be measured again at the next relevance check. Store search keeps k=60.
 
 ### Search ranking
-- Vector search scores faster. The cosine scoring that both `search` and
-  `code-search` share now runs as one numpy matrix product when numpy is
-  installed (it is, wherever embeddings work), about ten times faster on a
-  3,400-chunk code index; without numpy it uses the previous per-row loop.
-  Rankings and scores are unchanged.
 
-### Code index
-- A code root you removed from a repo's wiring no longer comes back. The code
-  index remembered every root it had ever indexed, and the new background
-  worker (and the heal) processed all of them, so an old whole-repo root sat
-  beside a new narrower one and every symbol appeared twice. `code-embed-worker`
-  now requires `--root DIR` (repeatable; the installer and the refresh hook pass
-  the wired roots) and skips any recorded root not named; the heal skips them
-  too; `code-refresh.sh` drops them on `Stop` (`dropped=<n>` in `hook.log`) and
-  only marks them on `SessionStart` (`stale-root=<n>`). A relative or unresolvable wired root, or a wiring that names no recorded root, disables the
-  drop (`detail=stale-check-skipped:...`), and the worker's text pass refuses a
-  root that is no longer recorded.
-- Code embeddings now get built, in the background. Until now every code index
-  had zero vectors: the first `code-reindex` at install is `--no-embed` to keep
-  the install fast, and nothing ever filled them in afterwards, so `code-search`
-  was text-only in every mode. A new `code-embed-worker` (detached, one at a time,
-  same marker/lock/log pattern as the store's `embed-worker`) now does it. The
-  installer starts it after the first index, and `code-refresh.sh` starts it on
-  `Stop` and `SessionStart` whenever chunks lack a vector, so an existing index
-  fills itself the first time you open or finish a session after upgrading;
-  `embed=spawned|clean|off` in the `code-refresh` `hook.log` line says
-  which. Vectors are committed in batches of 128, so a killed worker keeps its
-  progress. `embedding_mode` is now `none`, `partial` or `full`, recomputed from
-  what is really embedded after every pass; the `code-reindex` summary ends with
-  `N chunk(s) awaiting embedding`, and `code-search` says how many chunks have no
-  vector yet (and still finds them by text). The Stop-time refresh stays
-  text-only, so a refresh of a fully embedded index reads `partial` until the
-  worker catches up; set `MEMCONTINUUM_EMBED_WORKER=0` to disable the worker.
-- Embedding is about 8 times faster on CPU. The engine now loads the plain
-  float32 ONNX file of the same model (`BAAI/bge-small-en-v1.5`) instead of
-  the quantised build fastembed picks by default, whose main matrix multiply
-  does not use more than one core: roughly 40 ms instead of 0.3-0.4 s per
-  chunk, so a 3,300-chunk index takes about 2.5 minutes instead of 22. The
-  vectors are the same (cosine 1.0000 against the old ones on real chunks), but
-  the index records a new model fingerprint, so after upgrading the background
-  workers re-embed existing vectors once (store records and code chunks both
-  count as awaiting embedding until then). The first embed downloads about
-  133 MB of model files; CI's model cache key moved to `v2`.
-- The code index now refreshes itself. A new `code-refresh.sh` hook, wired on
-  `Stop` and `SessionStart` for any project with a code root, checks the index
-  with the same staleness test `code-search` uses (file stat signals, a content
-  hash on drift, the git HEAD trigger). At the end of a turn it re-indexes what
-  changed, including files deleted since, in the same incremental text pass
-  `code-search` already makes; embeddings are not part of it. At session start
-  it only checks and, if the index is behind, writes
-  `<project>.code-stale`, which the next session start names in one line (the
-  first turn end repairs it). The marker is honest about failure: `refreshing`
-  stays behind if the hook is killed mid-run, and a failed pass, a pass refused
-  by the heal limit (`MEMCONTINUUM_CODE_REFRESH_LIMIT`, default 500) or an
-  exception records its reason there. The hook prints nothing, always exits 0,
-  logs one `hook.log` line per run, runs under the watchdog (8 s on `Stop`,
-  `MEMCONTINUUM_CODE_REFRESH_BUDGET`; 2 s on `SessionStart`) and never creates a
-  code index: a root that was never indexed is only counted. A lock keeps two
-  refreshes, or a refresh and a `code-search` heal, from writing one index at
-  once; the search skips its heal with a one-line notice instead. No git hook is
-  installed in your code repositories: a commit made during a session is caught
-  at the next turn end, one made outside any session at the next session start.
-  Re-run `memcontinuum-update.sh --apply` to wire it into existing projects.
-- The code index no longer reads files your `.gitignore` excludes. Inside a git
-  work tree the walk now takes the file list from `git ls-files` (tracked plus
-  untracked, minus ignored); outside one, or without git, it walks the
-  directory as before and says so on stderr. Ignored content an earlier walk
-  had indexed (a cloned corpus under `docs/`, build output) is dropped by the
-  next refresh. The language census counts the same files.
-- `heal_code_index` now names its caller in its messages, can hand them back
-  instead of printing, and reports why it did not heal (over the limit, a
-  failure, or a held lock).
+- Vector scoring in `search` and `code-search` is about 10x faster on a 3,400-chunk code index, with unchanged rankings and scores. With numpy installed—as it is wherever embeddings work—cosine scoring uses one matrix product. Without numpy, it keeps the previous per-row loop.
+
+### Store
+
+- Store commits can now create verified `git bundle` backups. Configure `memcontinuum-setup.sh --backup-dir DIR [--backup-keep N]`; the post-commit hook keeps the newest N bundles per store in `DIR/<project>/`, each with a manifest line. `memcontinuum-update.sh` shows the setting on the machine line and a `backup` column: off, none, current, behind, unreadable or unknown.
+- Backups never leave `DIR`: project names `.` and `..`, and project-folder symlinks pointing elsewhere, are refused. The newest bundle is never pruned. `--backup-keep` values such as `00` or `08` are rejected or normalised, never read as octal. Later runs remove abandoned `<name>.part.<pid>` files only after twice the hook budget (60 s by default), leaving a live overlapping hook's file alone.
+- Bypassed commit checks now leave a warning. The post-commit hook rechecks store commits, including `git commit --no-verify`; a commit that would have been refused is printed, logged and reported at session start until a clean commit follows. An engine crash or silent lint never clears the warning. Another store's warning under the same project name is neither cleared nor overwritten; the second store's finding is only printed and logged (`marker=foreign`).
+- Without watchdog python, neither re-lint nor backup runs. Unsafe project names (`..`, a slash or newline) skip both the re-lint marker and backup; a bad backup directory skips only backup, leaving re-lint running. Bundle parts and marker temps use exclusive creation, never planted symlinks; bundle writes use that exclusive open itself. Bundle or marker destinations that are symlinks or directories are refused.
+
+### Installer and updater
+
+- `memcontinuum-update.sh` now reports hook directories missing from the registry. A second claude directory had gone unrecorded for days while updates refreshed the other directory and reported success.
+- The scan reads Claude Code's project list in `~/.claude.json` (override: `MEMCONTINUUM_CLAUDE_JSON`) and each project's `.claude/settings.local.json` or `settings.json`. An `unrecorded-claude-dir` row identifies each directory carrying a wired project's hooks but absent from its registry row. It supplies `memcontinuum-decide.sh wired ...` to record it: complete when a local checkout of the row's remote is known, otherwise INCOMPLETE with `--repo` to fill in. Projects with no row are told to wire the directory or remove its hooks.
+- The scan records nothing, removes its one temporary file, and never changes exit status. With `--apply`, it runs last, after the registry rewrite.
+
+### Hooks
+
+- `sessionstart` and `code-refresh` lines in `hook.log` now identify the session's working directory as `cwd=<token>`, percent-encoded into one whitespace-free token. You can read the directory from the log, and paths containing `project=` can no longer make `stats` attribute a line to another project.
 
 ### Known issue
-- Known issue: the pre-edit decision retrieval is filtered by the same roots the
-  code index is wired with. A repository wired with code roots narrower than its
-  checkout (`Sources` and `Tests`, say) gets no retrieval for an edit outside
-  those roots, including a worktree checked out inside the repository. The
-  ledger hook has no path filter, so it still runs: a worktree edit in such a
-  repository is recorded, but under a path built from the first wired root plus
-  the file's path within the checkout, which is wrong when the root is narrower
-  than the checkout (`Sources/Sources/Foo.swift`); an edit outside those roots
-  and outside the store that is not in a worktree is logged as out of scope and
-  not recorded. The next release renders the retrieval filter for the
-  repository, keeps the roots for the index only, and remaps worktree paths
-  against the checkout.
+
+Pre-edit decision retrieval follows the code-index roots: wiring only `Sources` and `Tests`, for example, leaves edits elsewhere without retrieval, including edits in a worktree inside the repository. The ledger hook has no path filter, so worktree edits are still recorded, but it incorrectly combines the first wired root with the checkout-relative path—for example, `Sources/Sources/Foo.swift`. Non-worktree edits outside both the wired roots and the store are logged as out of scope and not recorded. The next release renders the retrieval filter for the whole repository, keeps code roots for indexing only, and remaps worktree paths against the checkout.
 
 ## [0.3.0] — 2026-10-15
 
