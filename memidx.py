@@ -7908,6 +7908,42 @@ def code_hits_fts(conn: sqlite3.Connection, query: str, project: str, limit: int
     return exact + [i for i in ids if i not in exact_set]
 
 
+# TOP-0137 L7 step 6: symbol names too common to look tests up by (compared
+# lowercased). Together with the 4-character floor in `code_tested_by`.
+_TESTED_BY_SKIP_SYMBOLS = frozenset({"main", "init", "__init__", "test", "setup"})
+_TESTED_BY_FTS_ROWS = 50
+_TESTED_BY_MAX = 3
+
+
+def code_tested_by(conn: sqlite3.Connection, project: str, symbol: str) -> list[dict]:
+    """Up to 3 test chunks of `project` whose indexed text names `symbol`:
+    one FTS query over the first 50 matches (bm25 order), keeping those
+    `chunkers.chunk_role` calls "test", one per distinct path. Query-time
+    only -- the role is derived from path and language, nothing is stored.
+    A symbol shorter than 4 characters or in `_TESTED_BY_SKIP_SYMBOLS` gets
+    no lookup (too noisy)."""
+    if len(symbol) < 4 or symbol.lower() in _TESTED_BY_SKIP_SYMBOLS:
+        return []
+    rows = conn.execute(
+        """SELECT chunks.path AS path, chunks.lang AS lang,
+                  chunks.qualified_name AS qualified_name
+           FROM fts JOIN chunks ON chunks.id = fts.rowid
+           WHERE fts MATCH ? AND chunks.project=?
+           ORDER BY bm25(fts) LIMIT ?""",
+        (fts_escape(symbol), project, _TESTED_BY_FTS_ROWS),
+    ).fetchall()
+    found: list[dict] = []
+    seen: set = set()
+    for r in rows:
+        if r["path"] in seen or chunkers.chunk_role(r["path"], r["lang"]) != "test":
+            continue
+        seen.add(r["path"])
+        found.append({"path": r["path"], "qualified_name": r["qualified_name"]})
+        if len(found) >= _TESTED_BY_MAX:
+            break
+    return found
+
+
 def code_hits_vector(conn: sqlite3.Connection, query: str, project: str, *, model=None, stats: dict | None = None):
     """Ruling 80: same EmbeddingUnavailableError contract as vector_ranked
     -- cmd_code_search catches this ONE specific type to fall back to
@@ -9253,7 +9289,10 @@ def cmd_code_search(args) -> int:
             file=sys.stderr,
         )
 
-    results = results[: args.limit]
+    # TOP-0137 L7 step 6: the role filter runs AFTER retrieval (both channels
+    # and the fusion above are unchanged), then the cut to --limit happens in
+    # the hit loop below, over the candidates in rank order.
+    role_filter = getattr(args, "role_filter", None) or "code"
 
     # Finding 3: concept attachment must always read the DECISION
     # (markdown) db, never the CODE db that --db selects for this command.
@@ -9290,8 +9329,15 @@ def cmd_code_search(args) -> int:
 
     out = []
     for chunk_id, score in results:
+        if len(out) >= args.limit:
+            break
         row = conn.execute("SELECT * FROM chunks WHERE id=?", (chunk_id,)).fetchone()
         if row is None:
+            continue
+        role = chunkers.chunk_role(row["path"], row["lang"])
+        if role_filter == "code" and role != "code":
+            continue
+        if role_filter == "tests" and role != "test":
             continue
         hit_root = row["code_root"]
         hit = {
@@ -9302,7 +9348,10 @@ def cmd_code_search(args) -> int:
             "kind": row["kind"],
             "signature": row["signature"],
             "score": score,
+            "role": role,
         }
+        if role == "code":
+            hit["tested_by"] = code_tested_by(conn, args.project, row["symbol"])
         # Task 6: concept attachment is root-checked -- a hit whose
         # relative path no longer exists under the root it was indexed
         # from must never attach a concept keyed on that path alone. This
@@ -9351,6 +9400,7 @@ def cmd_code_search(args) -> int:
             # present (None on a project never embedded) -- independent of
             # mode, so a caller can see it without a mismatch happening.
             "embedding_fingerprint": stored_code_fp,
+            "role_filter": role_filter,
             "results": out,
         }
         if embed_state:   # item 4 (ruling 80) / design R4: this call's own vector-channel outcome
@@ -9368,7 +9418,11 @@ def cmd_code_search(args) -> int:
         for h in out:
             extra = f"  [{h['concept_id']}]" if "concept_id" in h else ""
             loc = f"{h['code_root']}/{h['path']}:{h['line']}" if multi_root else f"{h['path']}:{h['line']}"
-            print(f"{h['score']:.4f}  {loc}  {h['qualified_name']}  {h['signature']}{extra}")
+            mark = "  [test]" if h["role"] == "test" and role_filter != "code" else ""
+            print(f"{h['score']:.4f}  {loc}  {h['qualified_name']}  {h['signature']}{extra}{mark}")
+            if h.get("tested_by"):
+                names = ", ".join(f"{t['path']}::{t['qualified_name']}" for t in h["tested_by"])
+                print(f"    tested by: {names}")
     return 0
 
 
@@ -10919,6 +10973,16 @@ def main(argv=None) -> int:
     p_code_search.add_argument("--mode", choices=["fts", "vector", "hybrid"], default="hybrid")
     p_code_search.add_argument("--limit", type=int, default=10)
     p_code_search.add_argument("--json", action="store_true")
+    role_group = p_code_search.add_mutually_exclusive_group()
+    role_group.add_argument(
+        "--tests", dest="role_filter", action="store_const", const="tests",
+        help="return test code only (default: code only; a chunk's role comes from its path "
+             "and language, nothing stored)",
+    )
+    role_group.add_argument(
+        "--all", dest="role_filter", action="store_const", const="all",
+        help="return code and tests together; test hits are marked [test]",
+    )
     p_code_search.add_argument(
         "--decision-db", default=None,
         help="override the DECISION (markdown) index db path used for concept "
