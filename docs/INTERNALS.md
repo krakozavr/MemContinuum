@@ -1595,9 +1595,11 @@ settings source directory rather than at the filesystem root, so
 `Edit(/abs/path/**)` silently matches nothing. Every rendered filter therefore
 doubles it. `hooks/install-hooks.md` documents the wiring each hook receives.
 
-Each `--code-root` gets its own correctly-scoped entry in both PreToolUse
-hooks: `pre-edit-chain.sh` an `Edit`/`Write` pair, `newfile-nudge.sh` a `Write`
-entry with `MEMCONTINUUM_CODE_ROOT` set to that specific directory. The five
+`newfile-nudge.sh` gets a `Write` entry per `--code-root`, with
+`MEMCONTINUUM_CODE_ROOT` set to that specific directory; `pre-edit-chain.sh`
+gets an `Edit`/`Write` pair per *retrieval root* (the git toplevel of each
+`--code-root`, or the root itself outside git, de-duplicated), each carrying the
+colon-joined retrieval roots as `MEMCONTINUUM_STRIP_PREFIX`. The five
 write-side hooks receive every configured code root: `MEMCONTINUUM_CODE_ROOT`
 carries the first (kept, for a reader that only ever looks at one root) and
 `MEMCONTINUUM_CODE_ROOTS` carries the complete JSON list of physical paths.
@@ -3002,7 +3004,8 @@ worktree on its ancestor chain, or not in any git checkout whatsoever — still
 never spawns git (the bash-only `.git`-entry / `mc_nested_worktree_gitfile`
 gates rule it out first). A worktree edit that DOES need remapping pays one
 `git rev-parse` to resolve the edited file's own identity, plus one more per
-configured root while searching for the match (bounded by the number of
+configured root while searching for the match, plus one `--show-toplevel` call
+for the root that matches (bounded by the number of
 configured roots, typically one or a few) — no longer "a single `git
 rev-parse`" as this section previously (incorrectly) claimed for every case.
 
@@ -3020,11 +3023,11 @@ so a worktree edit under a narrow root is recorded at its real path (or ends
 SIBLING of the wired root never reaches the script at all under the current
 settings rendering, so it gets **ledger coverage only** (`ledger-post-edit.sh`
 has no such filter — design R6, "fires for EVERY tool" — and covers it).
-A worktree checked out **INSIDE** the wired root (e.g. `<root>/.worktrees/x`)
+A worktree checked out **INSIDE** the wired repository (e.g. `<repo>/.worktrees/x`)
 DOES reach `pre-edit-chain.sh` and gets full **retrieval and ledger**
 coverage — this is the layout this fix actually closes end-to-end. A project
 that wants retrieval for its own worktrees should therefore keep them inside
-the code root (e.g. `<root>/.worktrees/`, gitignored by that project) rather
+the repository (e.g. `<repo>/.worktrees/`, gitignored by that project) rather
 than as siblings; widening the settings-level glob to also launch
 `pre-edit-chain.sh` for a sibling worktree is a separate, not-yet-done
 follow-up.

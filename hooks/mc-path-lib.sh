@@ -290,6 +290,8 @@ mc_nested_worktree_gitfile() {
 #   1  worktree-unwired  -- confirmed a linked worktree; no ROOT matched
 #   2  worktree-unresolved -- confirmed (or suspected, via a `.git` entry)
 #      to be repo-related but git itself failed or a resolution step did
+#      (including a root whose common-dir matched but whose own toplevel
+#      could not be resolved, when no later root remaps)
 #   3  not applicable -- FILE_PATH is malformed/relative, no `.git` entry
 #      exists on its ancestor chain at all, or this ancestor is an
 #      ordinary (non-worktree) checkout -- caller's existing outcome is
@@ -300,7 +302,7 @@ mc_remap_worktree_path() {
     local cd_out common_raw toplevel_raw common_real toplevel_real
     local ancestor_real tail physical_file_path relative
     local root root_slash root_common_raw root_common_real remapped
-    local root_top_raw root_top_real
+    local root_top_raw root_top_real matched_unresolved=0
 
     case "$file_path" in
         /*) ;;
@@ -400,10 +402,16 @@ EOF
             # narrower than its checkout (e.g. <repo>/Sources) would
             # otherwise yield <repo>/Sources/Sources/Foo.swift. When the
             # root is its own toplevel the result is unchanged.
+            # The identity already matched, so a failure to resolve the
+            # toplevel is "unresolved" (return 2), never "unwired": remember
+            # it, keep scanning later roots, and report it only if none remaps.
             root_top_raw="$(unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR; git -C "$root_slash" rev-parse --show-toplevel 2>/dev/null)"
-            [ -n "$root_top_raw" ] || continue
-            root_top_real="$(cd "$root_top_raw" 2>/dev/null && pwd -P)"
-            [ -n "$root_top_real" ] || continue
+            root_top_real=""
+            [ -n "$root_top_raw" ] && root_top_real="$(cd "$root_top_raw" 2>/dev/null && pwd -P)"
+            if [ -z "$root_top_real" ]; then
+                matched_unresolved=1
+                continue
+            fi
             remapped="${root_top_real}/${relative}"
             printf '%s\n' "$remapped"
             return 0
@@ -412,6 +420,7 @@ EOF
 $roots
 EOF
 
+    [ "$matched_unresolved" -eq 1 ] && return 2
     return 1
 }
 

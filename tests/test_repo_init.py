@@ -1216,6 +1216,35 @@ class TestRetrievalRootFollowsRepository(unittest.TestCase):
         finally:
             shutil.rmtree(home, ignore_errors=True)
 
+    def test_root_outside_git_prints_the_fallback_note(self):
+        home = sandbox_home()
+        try:
+            root = Path(home) / "plain" / "src"
+            root.mkdir(parents=True)
+            args = ["--project", "narrow", "--store", str(Path(home) / "store"),
+                    "--claude-dir", str(Path(home) / ".claude"), "--code-root", str(root)]
+            proc = run_install(args, home)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn(
+                f"note: retrieval root for {root}: git toplevel not found (not a work tree), "
+                "using the root itself -- worktrees outside it get no retrieval",
+                proc.stdout,
+            )
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_root_inside_git_prints_no_fallback_note(self):
+        home = sandbox_home()
+        try:
+            repo = self._repo(home)
+            args = ["--project", "narrow", "--store", str(Path(home) / "store"),
+                    "--claude-dir", str(Path(home) / ".claude"), "--code-root", str(repo / "Sources")]
+            proc = run_install(args, home)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertNotIn("retrieval root for", proc.stdout)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
     def test_roots_in_two_repos_join_strip_prefixes_in_first_appearance_order(self):
         home = sandbox_home()
         try:

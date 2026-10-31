@@ -10,8 +10,12 @@
   edits in in-root worktrees from retrieval; code roots scope only the index,
   the new-file nudge and the ledger. A worktree edit under a narrow root is
   recorded at its real path (a repository-level file there ends
-  `out-of-scope`) instead of being remapped under the root. Re-run
-  `memcontinuum-update.sh --apply` to re-render wired projects.
+  `out-of-scope`) instead of being remapped under the root. When a root is
+  not inside a git work tree (or git cannot say), `repo-init.sh` falls back
+  to the root itself and prints a `note: retrieval root for ...` line saying
+  worktrees outside it get no retrieval. `repo-init.sh` is a fingerprint
+  input, so every wired row shows as behind until `memcontinuum-update.sh
+  --apply` re-renders it, even rows whose rendering does not change.
 
 ## [0.4.0] — 2026-10-31
 

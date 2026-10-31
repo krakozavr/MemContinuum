@@ -1409,15 +1409,32 @@ if code_roots:
     def retrieval_root(cr):
         env = {k: v for k, v in os.environ.items()
                if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")}
+        top = ""
+        reason = ""
         try:
             out = subprocess.run(
                 ["git", "-C", cr, "rev-parse", "--show-toplevel"],
                 capture_output=True, text=True, env=env, timeout=10,
             )
-            top = out.stdout.strip() if out.returncode == 0 else ""
-        except (OSError, subprocess.SubprocessError):
-            top = ""
-        return os.path.realpath(top) if top else cr.rstrip("/")
+            err_lines = out.stderr.strip().splitlines()
+            err = err_lines[0] if err_lines else ""
+            if out.returncode == 0 and out.stdout.strip():
+                top = out.stdout.strip()
+            elif "not a git repository" in err:
+                reason = "not a work tree"
+            else:
+                reason = "rc %d" % out.returncode
+                if err:
+                    reason += ": " + err
+        except FileNotFoundError:
+            reason = "git missing"
+        except (OSError, subprocess.SubprocessError) as e:
+            reason = "git failed: %s" % e
+        if top:
+            return os.path.realpath(top)
+        print("note: retrieval root for %s: git toplevel not found (%s), using the root itself "
+              "-- worktrees outside it get no retrieval" % (cr.rstrip("/"), reason))
+        return cr.rstrip("/")
 
     retrieval_roots = []
     for cr in code_roots:

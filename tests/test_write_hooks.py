@@ -1553,11 +1553,48 @@ class TestLedgerNarrowRootWorktreeRemap(HookTestBase):
             ("README.md", self.repo.resolve(), self.repo.resolve() / "README.md"),
         ):
             proc = subprocess.run(
-                ["bash", "-c", script, "x", str(self.wt / rel), str(root)],
+                [MC_BASH, "-c", script, "x", str(self.wt / rel), str(root)],
                 capture_output=True, text=True,
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertEqual(proc.stdout.strip(), str(want))
+
+    def test_worktree_physically_beneath_the_narrow_root_is_recorded_at_real_path(self):
+        """The ledger's MC_WAS_UNDER_ROOT=1 branch: the worktree sits inside
+        the wired root itself (<repo>/Sources/.worktrees/x)."""
+        inner = self.root / ".worktrees" / "x"
+        subprocess.run(
+            ["git", "worktree", "add", "-q", "-b", "wt-inner", str(inner)],
+            cwd=self.repo, check=True,
+        )
+        session_id = "s-narrow-inner"
+        payload = self.post_tool_use_payload(session_id, str(inner / "Sources" / "Foo.swift"))
+        proc, _ = run_script(LEDGER_HOOK, payload, self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        paths = [e["path"] for e in self.load_state(session_id)["ledger"]]
+        self.assertEqual(paths, [str(self.repo.resolve() / "Sources" / "Foo.swift")])
+
+    def test_matched_root_whose_toplevel_cannot_be_resolved_is_unresolved_not_unwired(self):
+        real_git = shutil.which("git")
+        fake_dir = Path(self.td) / "fake-git-toplevel-fails"
+        fake_dir.mkdir()
+        fake = fake_dir / "git"
+        fake.write_text(
+            "#!/bin/sh\n"
+            'case "$*" in *"rev-parse --show-toplevel") exit 1 ;; esac\n'
+            f"exec {shlex.quote(real_git)} \"$@\"\n"
+        )
+        fake.chmod(0o755)
+        script = (
+            f'. {shlex.quote(str(HOOKS_DIR / "mc-path-lib.sh"))}; '
+            'mc_remap_worktree_path "$1" "$2"; echo "rc=$?"'
+        )
+        env = dict(os.environ, PATH=f"{fake_dir}:{os.environ.get('PATH', '')}")
+        proc = subprocess.run(
+            [MC_BASH, "-c", script, "x", str(self.wt / "Sources" / "Foo.swift"), str(self.root)],
+            capture_output=True, text=True, env=env,
+        )
+        self.assertEqual(proc.stdout.strip(), "rc=2", proc.stderr)
 
 
 class TestMutationSurface(HookTestBase):
