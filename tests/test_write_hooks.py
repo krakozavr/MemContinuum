@@ -27,6 +27,7 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -2412,9 +2413,27 @@ class TestSessionStartRemind(HookTestBase):
         without = [l for l in lines if "session=s-start-nocwd" in l]
         self.assertTrue(with_cwd and without, lines)
         for line in with_cwd:
-            self.assertIn(f" cwd={self.code_root} ", line)
+            self.assertIn(f" {memidx._log_path_token(self.code_root).join(['cwd=', ' '])}", line)
         for line in without:
             self.assertIn(" cwd=- ", line)
+
+    def test_hostile_cwd_logs_as_one_token_in_both_languages(self):
+        """INC-0130 gate round 1 (MAJOR): spaces and `=` in a cwd must not
+        forge fields. The sessionstart line (bash encoder) carries ONE
+        cwd= token that decodes back to the path, and project= stays last."""
+        hostile = "/x project=other session=fake"
+        payload = json.dumps({"session_id": "s-start-host", "hook_event_name": "SessionStart",
+                              "source": "startup", "cwd": hostile})
+        run_script(SESSIONSTART_HOOK, payload, self.base_env())
+        lines = [l for l in (self.home / "hook.log").read_text().splitlines() if "session=s-start-host" in l]
+        self.assertTrue(lines)
+        for line in lines:
+            toks = line.split(" ")
+            cwd_toks = [t for t in toks if t.startswith("cwd=")]
+            self.assertEqual(len(cwd_toks), 1, line)
+            self.assertEqual(urllib.parse.unquote(cwd_toks[0][4:]), hostile)
+            self.assertEqual([t for t in toks if t.startswith("project=")], [f"project={self.project}"], line)
+            self.assertEqual([t for t in toks if t.startswith("session=")], ["session=s-start-host"], line)
 
     def test_resume_does_not_reset_existing_start_shas(self):
         session_id = "s-start-resume"
@@ -6900,11 +6919,13 @@ class TestCodeRefreshHook(HookTestBase):
         line (memidx.py) and the shell-composed skip line both carry cwd=."""
         self.build_code_index()
         line, _ = self.run_hook("Stop")
-        self.assertIn(f" cwd={self.code_root} ", line + " ")
+        self.assertIn(f" cwd={memidx._log_path_token(self.code_root)} ", line + " ")
         env = self.refresh_env(MEMCONTINUUM_PROJECT="../victim")
         line, _ = self.run_hook("Stop", env=env)
         self.assertIn("outcome=skip reason=bad-project", line)
-        self.assertTrue(line.endswith(f" cwd={self.code_root}"), line)
+        # Only memidx.py decodes the payload as JSON; the shell never parses
+        # a JSON string, so its own lines print cwd=-.
+        self.assertTrue(line.endswith(" cwd=-"), line)
 
     def test_log_line_without_a_cwd_prints_a_dash(self):
         self.build_code_index()
@@ -6914,18 +6935,26 @@ class TestCodeRefreshHook(HookTestBase):
         line, _ = self.run_hook("Stop", payload=no_cwd, env=self.refresh_env(MEMCONTINUUM_PROJECT="../victim"))
         self.assertTrue(line.endswith(" cwd=-"), line)
 
-    def test_cwd_control_characters_cannot_split_the_log_line(self):
+    def test_cwd_control_characters_and_fields_cannot_split_or_forge_the_log_line(self):
         self.build_code_index()
-        hostile = json.dumps({"session_id": "s-refresh", "hook_event_name": "Stop",
-                              "cwd": "/x/y\nforged outcome=refreshed\tz"})
+        raw = "/x/y\nforged outcome=refreshed\tz project=other session=fake"
+        hostile = json.dumps({"session_id": "s-refresh", "hook_event_name": "Stop", "cwd": raw})
         line, _ = self.run_hook("Stop", payload=hostile)
-        self.assertIn(" cwd=/x/yforged outcome=refreshed", line)
+        toks = line.split(" ")
+        cwd_toks = [t for t in toks if t.startswith("cwd=")]
+        self.assertEqual(len(cwd_toks), 1, line)
+        self.assertEqual(urllib.parse.unquote(cwd_toks[0][4:]), raw)
+        self.assertEqual([t for t in toks if t.startswith("project=")], [f"project={self.project}"], line)
+        self.assertEqual([t for t in toks if t.startswith("session=")], ["session=s-refresh"], line)
         line, _ = self.run_hook("Stop", payload=hostile, env=self.refresh_env(MEMCONTINUUM_PROJECT="../victim"))
-        # The shell-composed line reads the RAW payload prefix, where the
-        # control characters are still the two-character JSON escapes: no real
-        # control character, so nothing to split the line (run_hook already
-        # asserts exactly one new line).
-        self.assertIn(" cwd=/x/y", line)
+        self.assertTrue(line.endswith(" cwd=-"), line)
+
+    def test_a_cwd_with_an_escaped_quote_is_not_mangled_by_the_shell(self):
+        self.build_code_index()
+        raw = '/x/a"b'
+        payload = json.dumps({"session_id": "s-refresh", "hook_event_name": "Stop", "cwd": raw})
+        line, _ = self.run_hook("Stop", payload=payload)
+        self.assertIn(f" cwd={memidx._log_path_token(raw)} ", line + " ")
 
     def test_unsafe_project_name_builds_no_path(self):
         env = self.refresh_env(MEMCONTINUUM_PROJECT="../victim")
@@ -10057,6 +10086,41 @@ class TestF2AutoCallers(unittest.TestCase):
         line = next(l for l in text.splitlines() if "REINDEX_CMD=" in l and "code-reindex" not in l)
         self.assertIn("--no-embed", line)
         self.assertNotIn("--auto", line)
+
+
+class TestCwdTokenEncodersAgree(unittest.TestCase):
+    """INC-0130 gate round 1: hooks/memlib.sh mc_cwd_token and
+    memidx._log_path_token are the same encoder; one input, identical output."""
+
+    CASES = [
+        "/x project=other session=fake",
+        '/q"uo\\te\'s/back\\slash/100%/tab\there',
+        "/mnt/d/Мой проект/\u00e9\u4e2d",
+        "/plain/safe_path-1.2~x:y!z",
+        "/" + "a" * 300 + "\u00e9" * 150,
+        "",
+    ]
+
+    def _bash(self, path):
+        proc = subprocess.run(
+            [MC_BASH, "-c", f'source {shlex.quote(str(MEMLIB))} 2>/dev/null; mc_cwd_token "$1"', "x", path],
+            capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout
+
+    def test_bash_and_python_tokens_agree_and_round_trip(self):
+        for path in self.CASES:
+            with self.subTest(path=path[:40]):
+                tok = self._bash(path)
+                self.assertEqual(tok, "cwd=" + memidx._log_path_token(path))
+                self.assertNotRegex(tok[4:], r"[\s=\"\\]")
+                if len(path.encode()) <= 512:
+                    self.assertEqual(urllib.parse.unquote(tok[4:]) if path else tok[4:], path or "-")
+
+    def test_a_control_character_is_encoded_not_dropped(self):
+        self.assertEqual(self._bash("/a\x01b\nc"), "cwd=/a%01b%0Ac")
+        self.assertEqual(memidx._log_path_token("/a\x01b\nc"), "/a%01b%0Ac")
 
 
 if __name__ == "__main__":

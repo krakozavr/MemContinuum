@@ -1044,6 +1044,27 @@ class TestStatsToleratesTheCwdToken(StatsTestBase):
         self.assertEqual(out["sessions_seen"], base["sessions_seen"])
 
 
+class TestStatsHostileCwdCannotReattribute(StatsTestBase):
+    """INC-0130 gate round 1 (MAJOR): a cwd holding `project=other session=fake`
+    is percent-encoded into one token, so stats attributes the line to the
+    REAL project and session."""
+
+    def test_the_encoded_cwd_keeps_project_and_session(self):
+        tok = memidx._log_path_token("/x project=other session=fake")
+        self.assertNotRegex(tok, r"[\s=]")
+        self.write_log([
+            f"{ts(1)} sessionstart outcome=init session=real source=startup cwd={tok} project=demo",
+            f"{ts(1)} code-refresh outcome=skip reason=current project=demo roots=1 unrecorded=0 changed=0 "
+            f"removed=0 healed=0 dropped=0 elapsed=0.1s event=Stop session=real cwd={tok} embed=clean",
+        ])
+        rc, out = run_stats_json(home=str(self.home), project="demo")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["sessions_seen"], 1)
+        rc, other = run_stats_json(home=str(self.home), project="other")
+        self.assertEqual(rc, 0)
+        self.assertEqual(other["sessions_seen"], 0)
+
+
 class TestStatsPreCommitBucket(StatsTestBase):
     """Grok re-gate NIT 4 (whole-branch NIT-2, carried over from fix wave
     1): hooks/pre-commit-append-only.sh writes `pre-commit-append-only:

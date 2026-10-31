@@ -31,7 +31,7 @@
 #
 # hook.log: <ts> code-refresh outcome=<refreshed|skip|failed> reason=...
 #   project=P roots=N unrecorded=N changed=N removed=N healed=N dropped=N elapsed=Xs
-#   event=E session=S cwd=<session working directory|-> embed=<spawned|clean|off|failed|unknown>
+#   event=E session=S cwd=<percent-encoded session working directory|-> (shell-composed skip/failed lines: always -) embed=<spawned|clean|off|failed|unknown>
 #   [marker=write-failed] [detail=...]
 # embed= is the background embedding worker's state (TOP-0137 L2 step 5):
 # on BOTH events, whenever the index has chunks awaiting a vector,
@@ -100,26 +100,11 @@ case "$MC_PREFIX" in
         ;;
 esac
 
-# The session's working directory rides in the same payload prefix; the lines
-# THIS script composes (skips) print it, and memidx.py code-refresh prints it
-# on the lines it composes (it reads the same payload from the pipe). Printed
-# as given, control characters stripped, `-` when the payload has none.
-MC_CWD=""
-case "$MC_PREFIX" in
-    *'"cwd"'*)
-        MC_CWD="${MC_PREFIX#*\"cwd\"}"
-        MC_CWD="${MC_CWD#*:}"
-        case "$MC_CWD" in
-            " "*) MC_CWD="${MC_CWD# }" ;;
-        esac
-        case "$MC_CWD" in
-            \"*) MC_CWD="${MC_CWD#\"}"; MC_CWD="${MC_CWD%%\"*}"; MC_CWD="${MC_CWD//\\\\/\\}" ;;
-            *) MC_CWD="" ;;
-        esac
-        ;;
-esac
-MC_CWD="$(printf '%s' "$MC_CWD" | tr -d '[:cntrl:]')"
-[ -n "$MC_CWD" ] || MC_CWD="-"
+# The session's working directory (`cwd=`): only memidx.py decodes the payload
+# as JSON, so only the lines IT composes carry the percent-encoded path
+# (_log_path_token). The shell never parses JSON strings: the skip/failed lines
+# composed below print `cwd=-` (INC-0130).
+MC_CWD="-"
 
 # shellcheck source=mc-watchdog.sh
 source "${MC_WATCHDOG_LIB_PATH:-$SCRIPT_DIR/mc-watchdog.sh}" 2>/dev/null

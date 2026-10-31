@@ -144,15 +144,29 @@ mc_log() {
     printf '%s %s project=%s\n' "$(date -Iseconds 2>/dev/null || date)" "$1" "$MC_PROJECT" >>"$MC_LOG" 2>/dev/null || true
 }
 
-# mc_cwd_token CWD -- prints the `cwd=<path>` hook.log token: the path as
-# given with control characters stripped (it cannot split the line), `cwd=-`
-# when empty. memidx.py's _clean_log_path and hooks/code-refresh.sh print the
-# same token for the lines they compose (INC-0130: which directory did this
-# session run from).
+# mc_cwd_token CWD -- prints the `cwd=<token>` hook.log field (INC-0130): the
+# first 512 BYTES of CWD percent-encoded, keeping only [A-Za-z0-9/._~:!-]
+# (every other byte, `%` and control characters included, becomes %XX in
+# uppercase hex), `cwd=-` when empty. One whitespace-free, `=`-free token, so a
+# path can neither forge a `key=value` field nor split the line. memidx.py's
+# _log_path_token is the same encoder in Python (a test runs both on one
+# input). Byte-wise under LC_ALL=C; bash 3.2-safe (no ${var@Q}, no assoc arrays); `& 255` undoes 3.2's sign-extended high bytes.
 mc_cwd_token() {
-    local c
-    c="$(printf '%s' "${1:-}" | tr -d '[:cntrl:]')"
-    printf 'cwd=%s' "${c:--}"
+    local s="${1:-}" out="" i n c v h had_lc="${LC_ALL+x}" old_lc="${LC_ALL-}"
+    LC_ALL=C
+    s="${s:0:512}"
+    n=${#s}
+    i=0
+    while [ "$i" -lt "$n" ]; do
+        c="${s:$i:1}"
+        case "$c" in
+            [A-Za-z0-9/._~:!-]) out="$out$c" ;;
+            *) printf -v v '%d' "'$c"; printf -v h '%%%02X' $((v & 255)); out="$out$h" ;;
+        esac
+        i=$((i + 1))
+    done
+    if [ -n "$had_lc" ]; then LC_ALL="$old_lc"; else unset LC_ALL; fi
+    printf 'cwd=%s' "${out:--}"
 }
 
 # mc_rotate_orphans_oldest_first -- lists every hook.log.rotating.* file

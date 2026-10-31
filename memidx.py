@@ -32,7 +32,7 @@ import subprocess
 import sys
 import time
 import traceback
-import unicodedata
+import urllib.parse
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -8543,12 +8543,15 @@ def _clean_log_token(raw, limit: int = 64) -> str:
     return token or "unknown"
 
 
-def _clean_log_path(raw, limit: int = 512) -> str:
-    """A payload path as hook.log prints it: as given, control characters
-    stripped (so it cannot split the line), `-` when absent or empty -- the
-    shell hooks print the same `cwd=` token (INC-0130)."""
-    text = "".join(ch for ch in str(raw or "") if unicodedata.category(ch) != "Cc")[:limit]
-    return text or "-"
+def _log_path_token(raw, limit: int = 512) -> str:
+    """A payload path as ONE hook.log token (INC-0130): the first `limit`
+    BYTES (UTF-8) percent-encoded, keeping only `[A-Za-z0-9/._~:!-]` -- so no
+    space, `=`, quote, backslash, `%` or control character can survive to
+    forge a `key=value` field or split the line -- and `-` when absent or
+    empty. hooks/memlib.sh `mc_cwd_token` is the same encoder in bash (a test
+    runs both on one input); decode with urllib.parse.unquote."""
+    data = str(raw or "").encode("utf-8", "surrogateescape")[:limit]
+    return urllib.parse.quote_from_bytes(data, safe="/._~:!-") or "-"
 
 
 def _write_code_stale_marker(marker: Path, reason: str, roots: int) -> bool:
@@ -8712,7 +8715,7 @@ def cmd_code_refresh(args) -> int:
         payload = _hook_payload_fields(sys.stdin.read(1 << 20))
         event = _clean_log_token(payload.get("hook_event_name"))
         session = _clean_log_token(payload.get("session_id"))
-        cwd = _clean_log_path(payload.get("cwd"))
+        cwd = _log_path_token(payload.get("cwd"))
         db_path = resolve_code_db_path(args)
         marker = db_path.parent / f"{project}.code-stale"
         _refresh_code_index(args, project, db_path, marker, event == "Stop", res, extra)
