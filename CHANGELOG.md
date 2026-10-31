@@ -135,11 +135,14 @@
   the code index is wired with. A repository wired with code roots narrower
   than its checkout (`Sources` and `Tests`, say) gets no retrieval for an edit
   outside those roots, including a worktree checked out inside the
-  repository. The ledger hook still runs: a worktree edit whose file lies
-  under a root in the main checkout is recorded, an edit outside the roots
-  altogether is logged as out of scope, and nothing already recorded is
-  touched. The next release renders the retrieval filter for the repository
-  and keeps the roots for the index only.
+  repository. The ledger hook has no path filter, so it still runs: a
+  worktree edit in such a repository is recorded, but under a path built from
+  the first wired root plus the file's path within the checkout, which is
+  wrong when the root is narrower than the checkout (`Sources/Sources/Foo.swift`);
+  an edit outside every root that is not in a worktree is logged as out of
+  scope and not recorded. The next release renders the retrieval filter for
+  the repository, keeps the roots for the index only, and remaps worktree
+  paths against the checkout.
 
 ## [0.3.0] — 2026-10-15
 
