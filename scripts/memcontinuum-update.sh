@@ -1850,23 +1850,43 @@ mc_update_index_rebuild() {
     done < "$DECISIONS"
 }
 
-# mc_update_cell TEXT -- TEXT with every Unicode control character (category
-# Cc: C0, DEL and the C1 range such as U+0085) shown as `?`, so a displayed
-# table cell can never add a column or a row. `tr [:cntrl:]` is byte-wise and
-# leaves UTF-8 C1 controls intact, so one small python -I call does it
-# (MC_CELL_PY, set by the scan); bytes that are not UTF-8 pass through
-# unchanged. Also replaced: every code point that splits lines for python's
-# splitlines() (U+0085, U+2028, U+2029, FS/GS/RS...). Without python the scan never runs, so the tr fallback is unused.
-MC_CELL_PY=""
+# mc_update_cell TEXT -- sets MC_CELL to a placeholder token for TEXT, not to
+# TEXT. Every displayed field of the unrecorded-dir scan goes through here;
+# the scan's output is written to a file with the tokens in it, and
+# mc_update_cells_flush then replaces every token, in ONE python -I call per
+# scan, with its text with every Unicode control character (category Cc: C0,
+# DEL and the C1 range such as U+0085) shown as `?`, so a displayed table
+# cell can never add a column or a row. (`tr [:cntrl:]` is byte-wise and
+# leaves UTF-8 C1 controls intact; a python start per cell cost a cold start
+# per displayed field.) Bytes that are not UTF-8 pass through unchanged. Also
+# replaced: every code point that splits lines for python's splitlines()
+# (U+0085, U+2028, U+2029, FS/GS/RS...). Called in the current shell, never in
+# $(...), because it appends to MC_CELLS.
+MC_CELL=""
+MC_CELLS=()
 mc_update_cell() {
-    if [ -z "$MC_CELL_PY" ]; then
-        printf '%s' "$1" | tr '[:cntrl:]' '?'
-        return
+    MC_CELL=$'\001'"${#MC_CELLS[@]}"$'\002'
+    MC_CELLS[${#MC_CELLS[@]}]="$1"
+}
+
+# mc_update_cells_flush PY FILE -- prints FILE with every cell token replaced
+# by its sanitised text. One python start for the whole scan; without cells
+# (or if python fails) FILE is printed as it is (tokens are control bytes,
+# harmless to a terminal, and no raw cell text is ever printed).
+mc_update_cells_flush() {
+    if [ "${#MC_CELLS[@]}" -eq 0 ]; then
+        cat "$2"
+        return 0
     fi
-    printf '%s' "$1" | PYTHONPATH= "$MC_CELL_PY" -I -c '
-import sys, unicodedata
-t = sys.stdin.buffer.read().decode("utf-8", "surrogateescape")
-sys.stdout.buffer.write("".join("?" if unicodedata.category(c) in ("Cc", "Zl", "Zp") or len(("a" + c + "a").splitlines()) != 1 else c for c in t).encode("utf-8", "surrogateescape"))'
+    printf '%s\0' "${MC_CELLS[@]}" | PYTHONPATH= "$1" -I -c '
+import re, sys, unicodedata
+cells = sys.stdin.buffer.read().split(b"\0")[:-1]
+def clean(b):
+    t = b.decode("utf-8", "surrogateescape")
+    return "".join("?" if unicodedata.category(c) in ("Cc", "Zl", "Zp") or len(("a" + c + "a").splitlines()) != 1 else c for c in t).encode("utf-8", "surrogateescape")
+with open(sys.argv[1], "rb") as f:
+    data = f.read()
+sys.stdout.buffer.write(re.sub(rb"\x01([0-9]+)\x02", lambda m: clean(cells[int(m.group(1))]), data))' "$2" || cat "$2"
 }
 
 # mc_update_same_dir A B -- 0 when A and B are the same directory: equal
@@ -1903,7 +1923,7 @@ mc_update_checkout_for_row() {
     MC_ROW_CHECKOUT="$found"
 }
 
-mc_update_unrecorded_scan() {
+mc_update_unrecorded_scan_body() {
     local cj="${MEMCONTINUUM_CLAUDE_JSON:-$HOME/.claude.json}" py pdir cdir cdir_show
     local settings line all proj stamps stamp nstamps rec seen_ok=0 unreadable=0 hit_file
     local rproj rkey rstore rdirs rcr rlangs rnever rd d hit recorded
@@ -1913,7 +1933,6 @@ mc_update_unrecorded_scan() {
         echo "claude-json: unreadable, unrecorded-dir scan skipped"
         return 0
     fi
-    MC_CELL_PY="$py"
     # Record protocol, NUL-delimited: `#...` records are notices/status, every
     # other record is an accepted project directory (absolute, no control
     # character), so a path with a newline or tab can never be mis-split.
@@ -1933,8 +1952,9 @@ mc_update_unrecorded_scan() {
             # oversized file is a notice and the end of this directory's
             # scan: falling through to the next file would let a huge
             # settings.local.json hide behind a small settings.json.
-            if [ -n "$(find "$settings" -maxdepth 0 -size +"$MC_SCAN_MAX_SETTINGS_BYTES"c 2>/dev/null)" ]; then
-                echo "claude-json: $(mc_update_cell "$settings") is larger than 1 MiB, not read"
+            if [ -n "$(find -L "$settings" -maxdepth 0 -size +"$MC_SCAN_MAX_SETTINGS_BYTES"c 2>/dev/null)" ]; then
+                mc_update_cell "$settings"
+                echo "claude-json: $MC_CELL is larger than 1 MiB, not read"
                 break
             fi
             hit_file=""
@@ -1951,7 +1971,6 @@ mc_update_unrecorded_scan() {
             [ -z "$hit_file" ] || break
         done
         [ -n "$all" ] || continue
-        cdir_show="$(mc_update_cell "$cdir")"
         while IFS= read -r proj || [ -n "$proj" ]; do
             [ -n "$proj" ] || continue
             stamps="$(printf '%s' "$all" | while IFS="$MC_US" read -r hit stamp; do
@@ -1959,8 +1978,6 @@ mc_update_unrecorded_scan() {
                       done | sort -u)"
             nstamps="$(printf '%s\n' "$stamps" | grep -c .)"
             if [ "$nstamps" -gt 1 ]; then stamp="mixed"; else stamp="$stamps"; fi
-            stamp="$(mc_update_cell "$stamp")"
-            proj_show="$(mc_update_cell "$proj")"
             recorded=0
             mkey=""
             while IFS="$MC_US" read -r rproj rkey rstore rdirs rcr rlangs rnever || [ -n "$rproj" ]; do
@@ -1975,8 +1992,12 @@ mc_update_unrecorded_scan() {
                 done
             done <<<"$ROW_INDEX"
             [ "$recorded" -eq 0 ] || continue
+            # Cells are tokenised only for what is printed below.
+            mc_update_cell "$cdir"; cdir_show="$MC_CELL"
+            mc_update_cell "$stamp"; stamp="$MC_CELL"
+            mc_update_cell "$proj"; proj_show="$MC_CELL"
             if [ -n "$mkey" ]; then
-                key_show="$(mc_update_cell "$mkey")"
+                mc_update_cell "$mkey"; key_show="$MC_CELL"
                 print_row "$key_show" "$cdir_show" "$stamp" "unknown" "unknown" "unknown" "unknown" "unknown" "unrecorded-claude-dir"
                 decide_q="$(printf '%q' "$DECIDE")"
                 mc_update_checkout_for_row "$mkey" "$mdirs"
@@ -1984,7 +2005,7 @@ mc_update_unrecorded_scan() {
                     repo_arg="$(printf '%q' "$MC_ROW_CHECKOUT")"
                     cmd="$decide_q wired --repo $repo_arg"
                 else
-                    cmd="$decide_q wired --repo <FILL IN: local checkout of $key_show>"
+                    cmd="$decide_q wired --repo FILL-IN-LOCAL-CHECKOUT-OF-${key_show}-HERE"
                 fi
                 cmd="$cmd --store $(printf '%q' "$mstore") --project $(printf '%q' "$proj")"
                 mc_split_semi "$mdirs"
@@ -2046,6 +2067,20 @@ for key in good:
     if [ "$unreadable" -eq 1 ] || [ "$seen_ok" -eq 0 ]; then
         echo "claude-json: unreadable, unrecorded-dir scan skipped"
     fi
+    return 0
+}
+
+# The scan prints tokens for its cells into a file (the function runs in this
+# shell: print_row's header state must survive); the file is then printed once
+# with the cells sanitised -- two python starts per scan in all.
+mc_update_unrecorded_scan() {
+    local py out
+    py="$(mc_update_resolve_python)" || py=""
+    out="$(mktemp "${TMPDIR:-/tmp}/mc-scan.XXXXXX")" || { mc_update_unrecorded_scan_body; return 0; }
+    MC_CELLS=()
+    mc_update_unrecorded_scan_body > "$out"
+    mc_update_cells_flush "$py" "$out"
+    rm -f "$out"
     return 0
 }
 

@@ -4724,7 +4724,7 @@ class TestUnrecordedClaudeDirIsReported(UpdateTestBase):
         proc = self._walk(self._claude_json(second))
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("INCOMPLETE", proc.stdout)
-        self.assertIn(f"--repo <FILL IN: local checkout of {url}>", proc.stdout)
+        self.assertIn(f"--repo FILL-IN-LOCAL-CHECKOUT-OF-{url}-HERE", proc.stdout)
 
     def test_control_character_keys_are_skipped_and_counted(self):
         second = self._second_dir("second", self.settings_text())
@@ -4787,13 +4787,21 @@ class TestUnrecordedClaudeDirIsReported(UpdateTestBase):
         self.assertEqual(len(rows), 1, proc.stdout)
         self.assertNotIn("orphan", proc.stdout)
 
+    def _bash_q(self, text):
+        """The target bash's own `printf %q` of TEXT (never modelled by hand)."""
+        return subprocess.run([MC_BASH, "-c", 'printf %q "$1"', "_", text],
+                              capture_output=True, text=True, check=True).stdout
+
     def test_the_remedy_quotes_the_engine_path_when_it_has_a_space(self):
         """INC-0130 re-gate polish: $DECIDE itself is %q-quoted, in both the
-        runnable and the INCOMPLETE remedy."""
-        link = Path(self.tmp) / "eng dir"
+        runnable and the INCOMPLETE remedy. The expected string comes from the
+        target bash's own printf %q, for a path holding a space, !, $, a
+        quote and a backslash."""
+        link = Path(self.tmp) / "eng dir!$'x\\y"
         link.symlink_to(Path(UPDATE_SH).parent.parent, target_is_directory=True)
         script = str(link / "scripts" / "memcontinuum-update.sh")
-        quoted = str(link / "scripts" / "memcontinuum-decide.sh").replace(" ", "\\ ")  # printf %q form
+        quoted = self._bash_q(str(link / "scripts" / "memcontinuum-decide.sh"))
+        self.assertNotEqual(quoted, str(link / "scripts" / "memcontinuum-decide.sh"))
         second = self._second_dir("second", self.settings_text())
         for incomplete in (False, True):
             if incomplete:
@@ -4843,6 +4851,54 @@ class TestUnrecordedClaudeDirIsReported(UpdateTestBase):
         self.assertIn("larger than 1 MiB, not read", proc.stdout)
         self.assertEqual(self._unrecorded(proc.stdout), [], proc.stdout)
 
+    def test_a_settings_file_of_exactly_1_mib_is_read(self):
+        """The cap is `find -size +1048576c`: strictly greater, so exactly
+        1 MiB is still read (beside the over-cap test above)."""
+        text = self.settings_text() + "\n"
+        text += " " * (1048576 - len(text.encode("utf-8")))
+        self.assertEqual(len(text.encode("utf-8")), 1048576)
+        second = self._second_dir("second", text)
+        proc = self._walk(self._claude_json(second))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("larger than 1 MiB", proc.stdout)
+        self.assertEqual(len(self._unrecorded(proc.stdout)), 1, proc.stdout)
+
+    def test_the_scan_starts_python_a_bounded_number_of_times(self):
+        """INC-0130 confirmation round 3: the cell sanitiser used to start
+        python once per displayed field (1,500+ starts on a 500-directory
+        scan). 50 unrecorded directories (one with a non-ASCII name) must cost
+        at most 3 python starts in all."""
+        log = Path(self.tmp) / "py-starts.log"
+        wrapper = Path(self.tmp) / "py-wrapper"
+        wrapper.write_text(f'#!/bin/sh\necho start >> "{log}"\nexec "{VENV_PYTHON}" "$@"\n')
+        wrapper.chmod(0o755)
+        dirs = [self._second_dir(f"d{i:02d}", self.settings_text()) for i in range(49)]
+        dirs.append(self._second_dir("d\u00e9x", self.settings_text()))
+        proc = subprocess.run(
+            [MC_BASH, str(UPDATE_SH), "--no-machine"], capture_output=True, text=True,
+            env=clean_env(self.home, {"MEMCONTINUUM_CLAUDE_JSON": self._claude_json(*dirs),
+                                      "MEMCONTINUUM_PYTHON": str(wrapper)}),
+            timeout=300, cwd=self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(len(self._unrecorded(proc.stdout)), 50, proc.stdout)
+        self.assertIn("d\u00e9x", proc.stdout)
+        starts = len(log.read_text().splitlines()) if log.exists() else 0
+        self.assertGreaterEqual(starts, 1)
+        self.assertLessEqual(starts, 3, f"{starts} python starts for a 50-directory scan")
+
+    def test_a_symlink_to_an_oversized_settings_file_is_noticed_not_read(self):
+        """The size cap applies to the symlink's target (find -L)."""
+        second = self._second_dir("second", "x")
+        big = Path(self.tmp) / "big-settings.json"
+        big.write_text(self.settings_text() + "\n" + " " * (1024 * 1024 + 10))
+        link = Path(second) / ".claude" / "settings.local.json"
+        link.unlink()
+        link.symlink_to(big)
+        proc = self._walk(self._claude_json(second))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("larger than 1 MiB, not read", proc.stdout)
+        self.assertEqual(self._unrecorded(proc.stdout), [], proc.stdout)
+
     def test_the_incomplete_marker_shows_the_sanitised_key(self):
         url = self._remote_key(with_remote=False)
         reg = decisions_tsv(self.home)
@@ -4851,11 +4907,11 @@ class TestUnrecordedClaudeDirIsReported(UpdateTestBase):
         proc = self._walk(self._claude_json(second))
         self.assertIn("INCOMPLETE", proc.stdout)
         self.assertNotIn("\r", proc.stdout)
-        self.assertIn(f"local checkout of {url}?>x>", proc.stdout)
+        self.assertIn(f"FILL-IN-LOCAL-CHECKOUT-OF-{url}?>x-HERE", proc.stdout)
 
     def test_the_remedy_quotes_bang_and_space_paths_copy_paste_safe(self):
-        second = self._second_dir("!_WORK_! dir", self.settings_text())
+        second = self._second_dir("!_WORK_! d$ir'q\\b", self.settings_text())
         proc = self._walk(self._claude_json(second))
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        quoted = f"{self.tmp}/\\!_WORK_\\!\\ dir/.claude"
+        quoted = self._bash_q(f"{second}/.claude")
         self.assertIn(f"--claude-dir {quoted} ", proc.stdout + " ")
