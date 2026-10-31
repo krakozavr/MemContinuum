@@ -7098,7 +7098,7 @@ class TestChunkRole(unittest.TestCase):
     CASES = {
         "python": (["tests/a.py", "pkg/test/b.py", "test_x.py", "pkg/x_test.py", "pkg/conftest.py"],
                    ["src/x.py", "pkg/testing/x.py", "pkg/contest.py", "pkg/tests_helper.py"]),
-        "swift": (["Tests/A.swift", "MMDCoreTests/A.swift", "Sources/FooTests.swift", "Sources/FooTest.swift"],
+        "swift": (["Tests/A.swift", "AppCoreTests/A.swift", "Sources/FooTests.swift", "Sources/FooTest.swift"],
                   ["Sources/Foo.swift", "tests/Foo.swift", "Sources/Tests.swift.bak.swift"]),
         "javascript": (["__tests__/a.js", "src/tests/a.js", "src/test/a.js", "src/a.test.js", "src/a.spec.jsx"],
                        ["src/a.js", "src/testing/a.js", "src/contest.js"]),
