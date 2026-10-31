@@ -8,17 +8,23 @@
   (override `MEMCONTINUUM_CLAUDE_JSON`), reads each project's
   `.claude/settings.local.json` (or `settings.json`), and prints an
   `unrecorded-claude-dir` row for every directory that carries a wired
-  project's hooks but is not on that project's registry row, with the exact
-  `memcontinuum-decide.sh wired ...` command that records it; a directory
-  whose project has no row at all is told to wire it or remove the hooks. The
-  scan writes nothing and never changes the exit status; under `--apply` it
-  runs last, after the registry is rewritten. What prompted it: a second
-  claude directory had been missing from a row for days, so every update
-  rendered the other one and reported ok.
+  project's hooks but is not on that project's registry row, with the
+  `memcontinuum-decide.sh wired ...` command that records it (complete when a
+  local checkout of the row's remote is known here, otherwise marked
+  INCOMPLETE with `--repo` left to fill in); a directory whose project has no
+  row at all is told to wire it or remove the hooks. The scan records nothing
+  (its one temporary file is removed) and never changes the exit status;
+  under `--apply` it runs last, after the registry is rewritten. What
+  prompted it: a second claude directory had been missing from a row for
+  days, so every update rendered the other one and reported ok.
+
+### Hooks
 - `sessionstart` and `code-refresh` lines in `hook.log` carry `cwd=<token>`,
   the session's working directory percent-encoded as one whitespace-free
-  token, so `stats` can say which directory a session ran from and a path
-  containing `project=` can no longer re-attribute a line.
+  token, so the directory a session ran from can be read off the log and a
+  path containing `project=` can no longer re-attribute a line in `stats`.
+
+### Store
 - Every store commit can now write a verified `git bundle` backup of the
   store: set `memcontinuum-setup.sh --backup-dir DIR [--backup-keep N]` and
   the post-commit hook keeps the newest N bundles per store in `DIR/<project>/`
@@ -49,6 +55,8 @@
 ### Code search
 - `code-search` now separates code from tests. A chunk's role is worked out at query time from its path and language (`tests/`, `test_*.py`, `*Tests.swift`, `*.spec.ts`, `src/test`, and so on), so there is no reindex. By default only code is returned; `--tests` returns tests only and `--all` returns both with tests marked `[test]`. Each code hit also gets a `tested by:` line (JSON: `tested_by`) naming up to three test chunks whose qualified name, signature, doc or indexed body excerpt names its symbol. The flags select among chunks already indexed; Swift test directories named `Tests` are still pruned unless wired as their own code root. JSON hits gain `role`, and the envelope gains `role_filter`; existing keys are unchanged.
 - Code-search hybrid ranking now fuses with RRF constant k=30 instead of 60 (provisional: on the 45 graded intent queries top-10 hits rose from 20 to 23 of 35 with no loss; it is re-measured at the next relevance re-check). The store search keeps k=60.
+
+### Search ranking
 - Vector search scores faster. The cosine scoring that both `search` and
   `code-search` share now runs as one numpy matrix product when numpy is
   installed (it is, wherever embeddings work), about ten times faster on a
@@ -127,8 +135,11 @@
   the code index is wired with. A repository wired with code roots narrower
   than its checkout (`Sources` and `Tests`, say) gets no retrieval for an edit
   outside those roots, including a worktree checked out inside the
-  repository; the ledger still records the edit. The next release renders the
-  retrieval filter for the repository and keeps the roots for the index only.
+  repository. The ledger hook still runs: a worktree edit whose file lies
+  under a root in the main checkout is recorded, an edit outside the roots
+  altogether is logged as out of scope, and nothing already recorded is
+  touched. The next release renders the retrieval filter for the repository
+  and keeps the roots for the index only.
 
 ## [0.3.0] — 2026-10-15
 
