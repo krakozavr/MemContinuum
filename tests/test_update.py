@@ -2167,6 +2167,24 @@ class TestMigrationNeverGuessesTheClaudeDirSet(unittest.TestCase):
         self.assertEqual([r["action"] for r in rows], ["ok", "ok"], again.stdout)
 
     @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_apply_that_records_a_second_claude_dir_leaves_the_final_scan_empty(self):
+        """INC-0130 gate round 1 (F4): the unrecorded-dir scan runs on the
+        registry AS IT IS AFTER --apply, not as it was read before the
+        migration recorded claude_b."""
+        cj = Path(self.tmp) / "fake-claude.json"
+        cj.write_text(json.dumps({"projects": {self.repo: {}, str(Path(self.claude_b).parent): {}}}))
+        proc = subprocess.run(
+            [MC_BASH, str(UPDATE_SH), "--no-machine", "--apply", "--repo", self.repo,
+             "--claude-dir", self.claude_a, "--claude-dir", self.claude_b],
+            capture_output=True, text=True, env=clean_env(self.home, {"MEMCONTINUUM_CLAUDE_JSON": str(cj)}),
+            timeout=120, cwd=self.home,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        note = decisions_tsv(self.home).read_text().splitlines()[-1]
+        self.assertIn(f"claude-dirs={self.claude_a};{self.claude_b}", note, note)
+        self.assertNotIn("unrecorded-claude-dir", proc.stdout)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
     def test_a_named_claude_dir_that_carries_no_wiring_is_refused(self):
         """The migration RECORDS what is already installed. It never wires a
         directory from scratch -- that is the skill's job, with a human."""
@@ -4673,3 +4691,105 @@ class TestUnrecordedClaudeDirIsReported(UpdateTestBase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn(skipped, proc.stdout)
         self.assertEqual(self.table_rows(proc.stdout)[0]["action"], "ok")
+
+    # --- gate round 1 (INC-0130): F3 remedy, F5 hostile keys, F6 identity, F7 bounds ---
+
+    def _remote_key(self, url="https://example.test/org/repo.git", with_remote=True):
+        """Re-key the registry row from the repo path to a remote URL (the
+        shape decide.sh writes when the repo has an origin)."""
+        if with_remote:
+            subprocess.run(["git", "remote", "add", "origin", url], cwd=self.repo, check=True)
+        reg = decisions_tsv(self.home)
+        text = reg.read_text()
+        self.assertIn(self.repo + "\t", text)
+        reg.write_text(text.replace(self.repo + "\t", url + "\t", 1))
+        return url
+
+    def test_a_remote_keyed_row_gets_a_runnable_repo_from_the_recorded_checkout(self):
+        url = self._remote_key()
+        second = self._second_dir("second", self.settings_text())
+        proc = self._walk(self._claude_json(second))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f"wired --repo {self.repo} --store {self.store}", proc.stdout)
+        self.assertNotIn("INCOMPLETE", proc.stdout)
+        self.assertNotIn("FILL IN", proc.stdout)
+        # --repo narrowing hands the validated checkout over too
+        proc = self._walk(self._claude_json(second), ["--repo", self.repo])
+        self.assertIn(f"wired --repo {self.repo} --store {self.store}", proc.stdout)
+        self.assertNotIn(url + " --store", proc.stdout)
+
+    def test_a_remote_keyed_row_with_no_known_checkout_is_marked_incomplete(self):
+        url = self._remote_key(with_remote=False)
+        second = self._second_dir("second", self.settings_text())
+        proc = self._walk(self._claude_json(second))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("INCOMPLETE", proc.stdout)
+        self.assertIn(f"--repo <FILL IN: local checkout of {url}>", proc.stdout)
+
+    def test_control_character_keys_are_skipped_and_counted(self):
+        second = self._second_dir("second", self.settings_text())
+        cj = Path(self.tmp) / "hostile.json"
+        cj.write_text(json.dumps({"projects": {
+            second: {}, second + "\nx": {}, second + "\tx": {}, second + "\u0000suffix": {}, second + "\rx": {}}}))
+        proc = self._walk(str(cj))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("claude-json: 4 project key(s) skipped: control characters", proc.stdout)
+        rows = self._unrecorded(proc.stdout)
+        self.assertEqual([r["claude-dir"] for r in rows], [f"{second}/.claude"], proc.stdout)
+
+    def test_a_project_path_with_spaces_is_scanned(self):
+        second = self._second_dir("has some spaces", self.settings_text())
+        proc = self._walk(self._claude_json(second))
+        rows = self._unrecorded(proc.stdout)
+        self.assertEqual([r["claude-dir"] for r in rows], [f"{second}/.claude"], proc.stdout)
+
+    def test_a_symlink_or_trailing_slash_spelling_of_the_recorded_dir_is_not_reported(self):
+        link = Path(self.tmp) / "repo-link"
+        link.symlink_to(self.repo, target_is_directory=True)
+        proc = self._walk(self._claude_json(str(link), self.repo + "/"))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("unrecorded-claude-dir", proc.stdout)
+
+    def _many_keys(self, prefix, n, real):
+        keys = {f"{prefix}/k{i:04d}": {} for i in range(n)}
+        keys[real] = {}
+        path = Path(self.tmp) / "many.json"
+        path.write_text(json.dumps({"projects": keys}))
+        return str(path)
+
+    def test_only_the_first_500_sorted_keys_are_scanned_and_the_rest_noticed(self):
+        second = self._second_dir("second", self.settings_text())
+        # 599 fake keys sorted AFTER the real one: it is inside the first 500.
+        proc = self._walk(self._many_keys("/zzz-none", 599, second))
+        self.assertIn("claude-json: 100 project key(s) beyond the first 500 not scanned", proc.stdout)
+        self.assertEqual(len(self._unrecorded(proc.stdout)), 1, proc.stdout)
+        # 599 fake keys sorted BEFORE it: the real one is cut off, so unreported.
+        proc = self._walk(self._many_keys("/0-none", 599, second))
+        self.assertIn("claude-json: 100 project key(s) beyond the first 500 not scanned", proc.stdout)
+        self.assertEqual(self._unrecorded(proc.stdout) if "\t" in proc.stdout else [], [], proc.stdout)
+
+    def test_an_oversized_claude_json_is_not_read(self):
+        big = Path(self.tmp) / "big.json"
+        with open(big, "w") as f:
+            f.write('{"projects": {}, "pad": "')
+            f.write("x" * (8 * 1024 * 1024 + 10))
+            f.write('"}')
+        proc = self._walk(str(big))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("claude-json: larger than 8 MiB, unrecorded-dir scan skipped", proc.stdout)
+
+    def test_only_the_first_settings_file_carrying_the_hooks_is_followed(self):
+        other = self.settings_text().replace("MEMCONTINUUM_PROJECT=proj", "MEMCONTINUUM_PROJECT=orphan")
+        second = self._second_dir("second", self.settings_text())
+        (Path(second) / ".claude" / "settings.json").write_text(other)
+        proc = self._walk(self._claude_json(second))
+        rows = self._unrecorded(proc.stdout)
+        self.assertEqual(len(rows), 1, proc.stdout)
+        self.assertNotIn("orphan", proc.stdout)
+
+    def test_the_remedy_quotes_bang_and_space_paths_copy_paste_safe(self):
+        second = self._second_dir("!_WORK_! dir", self.settings_text())
+        proc = self._walk(self._claude_json(second))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        quoted = f"{self.tmp}/\\!_WORK_\\!\\ dir/.claude"
+        self.assertIn(f"--claude-dir {quoted} ", proc.stdout + " ")
