@@ -1499,6 +1499,67 @@ class TestLedgerPostEditWorktreeGap(HookTestBase):
         self.assertIn("outcome=out-of-scope", self._last_outcome_line(log_text))
 
 
+class TestLedgerNarrowRootWorktreeRemap(HookTestBase):
+    """A wired code root narrower than its checkout (<repo>/Sources): a
+    worktree edit maps onto the checkout's toplevel, never onto the root, so
+    the recorded path is the real file or nothing."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo = Path(self.td) / "narrow-repo"
+        _write(self.repo / "Sources" / "Foo.swift", "// foo\n")
+        _write(self.repo / "README.md", "readme\n")
+        git_init(self.repo)
+        self.wt = self.repo / ".worktrees" / "x"
+        subprocess.run(
+            ["git", "worktree", "add", "-q", "-b", "wt-narrow", str(self.wt)],
+            cwd=self.repo, check=True,
+        )
+        self.root = (self.repo / "Sources").resolve()
+
+    def _env(self):
+        return self.base_env(
+            MEMCONTINUUM_CODE_ROOT=str(self.root),
+            MEMCONTINUUM_CODE_ROOTS=json.dumps([str(self.root)]),
+        )
+
+    def test_worktree_edit_under_narrow_root_is_recorded_at_real_path(self):
+        session_id = "s-narrow-code"
+        payload = self.post_tool_use_payload(session_id, str(self.wt / "Sources" / "Foo.swift"))
+        proc, _ = run_script(LEDGER_HOOK, payload, self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        paths = [e["path"] for e in self.load_state(session_id)["ledger"]]
+        self.assertEqual(paths, [str(self.repo.resolve() / "Sources" / "Foo.swift")])
+
+    def test_worktree_file_outside_narrow_root_is_out_of_scope(self):
+        session_id = "s-narrow-readme"
+        payload = self.post_tool_use_payload(session_id, str(self.wt / "README.md"))
+        proc, _ = run_script(LEDGER_HOOK, payload, self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        state = self.load_state(session_id)
+        self.assertEqual(state.get("ledger", []), [])
+        log_text = (self.home / "hook.log").read_text()
+        last = [l for l in log_text.splitlines() if "ledger outcome=" in l][-1]
+        self.assertIn("outcome=out-of-scope", last)
+
+    def test_remap_prints_checkout_toplevel_path(self):
+        script = (
+            f'. {shlex.quote(str(HOOKS_DIR / "mc-path-lib.sh"))}; '
+            'mc_remap_worktree_path "$1" "$2"'
+        )
+        for rel, root, want in (
+            ("Sources/Foo.swift", self.root, self.repo.resolve() / "Sources" / "Foo.swift"),
+            ("README.md", self.root, self.repo.resolve() / "README.md"),
+            ("README.md", self.repo.resolve(), self.repo.resolve() / "README.md"),
+        ):
+            proc = subprocess.run(
+                ["bash", "-c", script, "x", str(self.wt / rel), str(root)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.strip(), str(want))
+
+
 class TestMutationSurface(HookTestBase):
     """The PostToolUse group carries no settings-level matcher any more (see
     tests.test_repo_init for the rendering pin) -- ledger-post-edit.sh fires

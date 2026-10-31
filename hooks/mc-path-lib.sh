@@ -192,8 +192,8 @@ mc_nested_worktree_gitfile() {
 # builds it from MEMCONTINUUM_STRIP_PREFIX -- stripped of a trailing slash --
 # for pre-edit-chain.sh, which deliberately does not source memlib.sh/
 # mc_code_roots to avoid that file's mkdir/config.sh cost on every
-# already-a-miss lookup; repo-init.sh renders exactly one STRIP_PREFIX
-# entry, = the one code root that invocation is scoped to, per
+# already-a-miss lookup; repo-init.sh renders the STRIP_PREFIX entries
+# = the retrieval roots (the git toplevel of each code root), per
 # CODE_ROOT_FILTERS in templates/code-root-filter-pair.json.tmpl -- a
 # hand-wired STRIP_PREFIX that happens not to equal any real repo root
 # only ever makes this root's OWN common-dir resolution fail below, i.e.
@@ -274,8 +274,11 @@ mc_nested_worktree_gitfile() {
 #      FILE_PATH's already-resolved common-dir, by exact string identity
 #      first and `-ef` filesystem identity as a fallback (never a
 #      prefix/glob test -- see the STRIP_PREFIX note above for why this
-#      can only fail closed). First match: print "$ROOT/$relative" and
-#      return 0. No ROOT matches at all: this worktree's main repo was
+#      can only fail closed). First match: print
+#      "<toplevel of ROOT's own checkout>/$relative" and return 0 (for a
+#      ROOT that is its own toplevel, "$ROOT/$relative"; a ROOT narrower
+#      than its checkout maps to the checkout, so the caller's root test
+#      then decides whether the real file is in scope). No ROOT matches at all: this worktree's main repo was
 #      never wired as a code root here -- return 1 (worktree-unwired) --
 #      the correctness condition the caller must not skip (docs/internal
 #      handoff item 1): remapping onto an UNWIRED repo's records would be
@@ -297,6 +300,7 @@ mc_remap_worktree_path() {
     local cd_out common_raw toplevel_raw common_real toplevel_real
     local ancestor_real tail physical_file_path relative
     local root root_slash root_common_raw root_common_real remapped
+    local root_top_raw root_top_real
 
     case "$file_path" in
         /*) ;;
@@ -389,7 +393,18 @@ EOF
         # differently-cased spellings of the SAME directory could in
         # principle still diverge as strings after resolution.
         if [ "$root_common_real" = "$common_real" ] || [ "$root_common_real" -ef "$common_real" ]; then
-            remapped="${root_slash}/${relative}"
+            # The remap target is the toplevel of the checkout that
+            # CONTAINS this root, never the root itself: `relative` is
+            # relative to the worktree's toplevel, so it only names the
+            # right file under the matching checkout's toplevel. A root
+            # narrower than its checkout (e.g. <repo>/Sources) would
+            # otherwise yield <repo>/Sources/Sources/Foo.swift. When the
+            # root is its own toplevel the result is unchanged.
+            root_top_raw="$(unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR; git -C "$root_slash" rev-parse --show-toplevel 2>/dev/null)"
+            [ -n "$root_top_raw" ] || continue
+            root_top_real="$(cd "$root_top_raw" 2>/dev/null && pwd -P)"
+            [ -n "$root_top_real" ] || continue
+            remapped="${root_top_real}/${relative}"
             printf '%s\n' "$remapped"
             return 0
         fi
