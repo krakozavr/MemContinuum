@@ -314,8 +314,8 @@ parent directory disambiguates it instead (`<parent>-<repo>-MemContinuum-
 Store`); when even that name is already taken, the installer refuses and
 asks for an explicit `--store` rather than guess a third name.
 
-`--code-root DIR` (repeatable) is the code checkout
-the index, the new-file nudge and the ledger cover; retrieval before an edit
+`--code-root DIR` (repeatable) is a code checkout that scopes
+the index, the new-file nudge and the ledger; retrieval before an edit
 follows the git toplevel of each code root (the root itself when git cannot say); omit it entirely for a rationale-only
 install, and the two edit-time hooks are simply not wired. `--python PATH`
 names the python to run the engine with, and `--bootstrap-venv [DIR]` creates
