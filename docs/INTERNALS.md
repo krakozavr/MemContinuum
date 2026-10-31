@@ -1126,7 +1126,7 @@ rules | skill | store-hooks | action`, action being one of `ok`, `stale`, `store
 `rules-missing`, `rules-stale`, `rules-foreign`, `skill-foreign`, `migrate`,
 `migrate-needs-claude-dirs`, `migrate-needs-langs`,
 `migrate-needs-never-exts`, `migrate-dirs-disagree`, `store-missing`,
-`no-wiring`, or
+`no-wiring`, `unrecorded-claude-dir`, or
 `unrecoverable`. `store-form-stale` is the reporting walk's answer when the
 row's `store=` names the same store the wiring renders, written in an
 unresolved (symlinked) string form: nothing is mismatched, so the remedy it
@@ -1341,6 +1341,19 @@ Actions that are deliberately never auto-applied:
   skill's repair path (an undecided/broken install), not this command's — a
   `wired` row is never a license to *wire* anything; it only ever re-renders
   wiring that is already there.
+
+- **`unrecorded-claude-dir`** — reported after the table (last, under `--apply`),
+  never applied. Claude Code lists every directory it has opened under
+  `projects` in `~/.claude.json` (`MEMCONTINUUM_CLAUDE_JSON` overrides the path);
+  when `<dir>/.claude/settings.local.json` or `settings.json` there carries a hook
+  line with `MEMCONTINUUM_PROJECT=<P>` (read with `mc_command_env_value`, the
+  walk's own reader) and the `<P>` row does not list that directory, the row
+  prints the rendered stamp and the exact `memcontinuum-decide.sh wired` command
+  that would record it. A project with no wired row is told to wire it or remove
+  the hooks. The command re-renders nothing and the exit status is unchanged; an
+  unreadable `~/.claude.json` prints one `claude-json: unreadable` line and
+  skips the scan. Origin: a session home that was never on the row kept
+  five-day-old hooks while every walk said `ok`.
 
 A row written before this registry format existed (no `claude-dirs=` in its
 note) is an **old-format row**: its single claude-dir is recovered as `<repo>/.claude`

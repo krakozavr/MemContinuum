@@ -66,7 +66,22 @@
 #                  rules-foreign | skill-foreign | migrate |
 #                  migrate-needs-claude-dirs | migrate-needs-langs |
 #                  migrate-needs-never-exts | migrate-dirs-disagree |
-#                  store-missing | no-wiring | unrecoverable
+#                  store-missing | no-wiring | unrecoverable |
+#                  unrecorded-claude-dir
+#
+#                  unrecorded-claude-dir (reported, never applied): Claude
+#                  Code lists every project directory it has opened in
+#                  ~/.claude.json (MEMCONTINUUM_CLAUDE_JSON overrides the
+#                  path). A <dir>/.claude settings file there whose hook line
+#                  carries MEMCONTINUUM_PROJECT=<P>, for a directory the P
+#                  row does not record, gets one row after the table (after
+#                  everything else under --apply) with the rendered stamp and
+#                  the memcontinuum-decide.sh command that would record it;
+#                  a project with no wired row is told to wire it or remove
+#                  the hooks. Consent to record lives in that command: this
+#                  one re-renders nothing here, and the exit status is
+#                  unchanged. An unreadable ~/.claude.json prints
+#                  `claude-json: unreadable, unrecorded-dir scan skipped`.
 #
 #                  store-form-stale (reporting walk): the row's store= names
 #                  the same store the wiring renders, written in an
@@ -1760,6 +1775,108 @@ backup_state_for() {
     mc_backup_state "$1" "$2"
 }
 
+# --- unrecorded claude-dir scan (INC-0130, TOP-0137 L7) ---------------------
+#
+# A project's sessions may start from a claude directory its registry row
+# never recorded (a second session home), and the walk above only ever
+# renders the recorded ones -- so an unrecorded directory keeps stale hooks
+# while every row reads `ok`. Claude Code lists every project directory it
+# has opened under "projects" in ~/.claude.json (MEMCONTINUUM_CLAUDE_JSON
+# overrides the path, for tests); for each, a settings file whose hook line
+# carries MEMCONTINUUM_PROJECT=<P> is MemContinuum wiring. Reported only --
+# consent to record a directory lives in memcontinuum-decide.sh.
+#
+# ROW_INDEX: one line per walked row, fields joined by US (a non-whitespace
+# IFS keeps empty fields): project, key, store, claude-dirs, code-roots,
+# langs, never. Reads settings through mc_command_env_value, the same reader
+# the walk uses.
+MC_US=$'\037'
+ROW_INDEX=""
+
+mc_update_unrecorded_scan() {
+    local cj="${MEMCONTINUUM_CLAUDE_JSON:-$HOME/.claude.json}" py keys pdir cdir cphys
+    local settings line all proj stamps stamp nstamps
+    local rproj rkey rstore rdirs rcr rlangs rnever rd d hit recorded
+    local mkey mstore mdirs mcr mlangs mnever cmd
+    py="$(mc_update_resolve_python)" || py=""
+    keys=""
+    if [ -f "$cj" ] && [ -n "$py" ]; then
+        keys="$(PYTHONPATH= "$py" -I -c '
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    data = json.load(f)
+projects = data["projects"]
+if not isinstance(projects, dict):
+    raise SystemExit(1)
+for key in projects:
+    if isinstance(key, str) and key.startswith("/") and "\n" not in key:
+        print(key)
+' "$cj" 2>/dev/null)" || keys="__unreadable__"
+    else
+        keys="__unreadable__"
+    fi
+    if [ "$keys" = "__unreadable__" ]; then
+        echo "claude-json: unreadable, unrecorded-dir scan skipped"
+        return 0
+    fi
+    while IFS= read -r pdir || [ -n "$pdir" ]; do
+        [ -n "$pdir" ] || continue
+        cdir="$pdir/.claude"
+        all=""
+        for settings in "$cdir/settings.local.json" "$cdir/settings.json"; do
+            [ -f "$settings" ] || continue
+            while IFS= read -r line || [ -n "$line" ]; do
+                case "$line" in *"MEMCONTINUUM_PROJECT="*) ;; *) continue ;; esac
+                mc_command_env_value "$line" "MEMCONTINUUM_PROJECT"
+                proj="$MC_ENV_VALUE"
+                [ -n "$proj" ] || continue
+                mc_command_env_value "$line" "MEMCONTINUUM_RENDERED"
+                stamp="${MC_ENV_VALUE:-none}"
+                all="${all}${proj}${MC_US}${stamp}"$'\n'
+            done < <(grep '"command"' "$settings" 2>/dev/null)
+        done
+        [ -n "$all" ] || continue
+        cphys="$(mc_physical "$cdir")"
+        while IFS= read -r proj || [ -n "$proj" ]; do
+            [ -n "$proj" ] || continue
+            stamps="$(printf '%s' "$all" | while IFS="$MC_US" read -r hit stamp; do
+                          [ "$hit" = "$proj" ] && printf '%s\n' "$stamp"
+                      done | sort -u)"
+            nstamps="$(printf '%s\n' "$stamps" | grep -c .)"
+            if [ "$nstamps" -gt 1 ]; then stamp="mixed"; else stamp="$stamps"; fi
+            recorded=0
+            mkey=""
+            while IFS="$MC_US" read -r rproj rkey rstore rdirs rcr rlangs rnever || [ -n "$rproj" ]; do
+                [ "$rproj" = "$proj" ] || continue
+                if [ -z "$mkey" ]; then
+                    mkey="$rkey"; mstore="$rstore"; mdirs="$rdirs"
+                    mcr="$rcr"; mlangs="$rlangs"; mnever="$rnever"
+                fi
+                mc_split_semi "$rdirs"
+                for rd in ${MC_SPLIT[@]+"${MC_SPLIT[@]}"}; do
+                    [ "$(mc_physical "$rd")" = "$cphys" ] && recorded=1
+                done
+            done <<<"$ROW_INDEX"
+            [ "$recorded" -eq 0 ] || continue
+            if [ -n "$mkey" ]; then
+                print_row "$mkey" "$cdir" "$stamp" "unknown" "unknown" "unknown" "unknown" "unknown" "unrecorded-claude-dir"
+                cmd="$DECIDE wired --repo"
+                case "$mkey" in /*) cmd="$cmd $(printf '%q' "$mkey")" ;; *) cmd="$cmd <repo path>" ;; esac
+                cmd="$cmd --store $(printf '%q' "$mstore") --project $(printf '%q' "$proj")"
+                mc_split_semi "$mdirs"
+                for rd in ${MC_SPLIT[@]+"${MC_SPLIT[@]}"}; do cmd="$cmd --claude-dir $(printf '%q' "$rd")"; done
+                cmd="$cmd --claude-dir $(printf '%q' "$cdir")"
+                mc_build_wiring_args "$mcr" "$mlangs" "$mnever"
+                for d in ${MC_BUILT_ARGS[@]+"${MC_BUILT_ARGS[@]}"}; do cmd="$cmd $(printf '%q' "$d")"; done
+                echo "  $cdir carries $proj's hooks but is not recorded on $mkey. To record it (the updater will then keep it current): $cmd"
+            elif [ -z "$ONLY_KEY" ]; then
+                print_row "(no row for $proj)" "$cdir" "$stamp" "unknown" "unknown" "unknown" "unknown" "unknown" "unrecorded-claude-dir"
+                echo "  $cdir carries $proj's hooks but no wired registry row names project $proj -- wire it (memcontinuum-decide.sh wired ...) or remove the hooks."
+            fi
+        done < <(printf '%s' "$all" | while IFS="$MC_US" read -r proj stamp; do printf '%s\n' "$proj"; done | sort -u)
+    done <<<"$keys"
+}
+
 while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
     case "$RAW_LINE" in \#*|"") continue ;; esac
     KEY="${RAW_LINE%%"$MC_TAB"*}"
@@ -1789,6 +1906,15 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
         [ "$APPLY" -eq 1 ] && WALK_RC=1
         continue
     fi
+
+    # Row index for the unrecorded claude-dir scan: the dirs AS RECORDED
+    # (before any --claude-dir narrowing below); a legacy row's proposal is
+    # its own path key's .claude.
+    IDX_DIRS="$CLAUDE_DIRS_SEMI"
+    if [ -z "$IDX_DIRS" ]; then
+        case "$KEY" in /*) IDX_DIRS="$KEY/.claude" ;; esac
+    fi
+    ROW_INDEX="${ROW_INDEX}${PROJECT}${MC_US}${KEY}${MC_US}${STORE}${MC_US}${IDX_DIRS}${MC_US}${CODE_ROOTS_SEMI}${MC_US}${LANGS_COMMA}${MC_US}${NEVER_COMMA}"$'\n'
 
     # Fix-round MAJOR (both reviewers): once per project row (never once
     # per claude-dir -- a project with two claude-dirs must not print this
@@ -2108,6 +2234,11 @@ if [ -n "$MIGRATE_HINTS" ]; then
     printf '%s\n' "$MIGRATE_HINTS" >&2
 fi
 
+# Reporting walk: the unrecorded claude-dirs follow the table. --apply
+# prints them last instead (see the end of this script), so they are the
+# final thing on screen.
+[ "$APPLY" -eq 1 ] || mc_update_unrecorded_scan
+
 # --- the machine layer, compared against its OWN fingerprint ---------------
 #
 # Separate from every row above, because it is a separate layer: the detector
@@ -2321,5 +2452,9 @@ print(",".join(sorted(mismatched)))
         # --- end Task 9 dependency reconciliation -----------------------------
     fi
 fi
+
+# --apply: after the apply output and the machine layer, so the report is the
+# last thing on screen. Informational -- never changes WALK_RC.
+[ "$APPLY" -eq 1 ] && mc_update_unrecorded_scan
 
 exit "$WALK_RC"

@@ -4586,3 +4586,90 @@ class TestHelp(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestUnrecordedClaudeDirIsReported(UpdateTestBase):
+    """INC-0130 / TOP-0137 L7: a claude directory Claude Code has opened that
+    carries this project's hooks but is not on the registry row used to be
+    invisible -- every walk rendered the recorded directory and said ok."""
+
+    def _walk(self, claude_json, args=()):
+        extra = {}
+        if claude_json is not None:
+            extra["MEMCONTINUUM_CLAUDE_JSON"] = claude_json
+        return subprocess.run(
+            [MC_BASH, str(UPDATE_SH), "--no-machine"] + list(args),
+            capture_output=True, text=True, env=clean_env(self.home, extra),
+            timeout=120, cwd=self.home,
+        )
+
+    def _claude_json(self, *project_dirs):
+        path = str(Path(self.tmp) / "fake-claude.json")
+        Path(path).write_text(json.dumps({"projects": {d: {} for d in project_dirs}}))
+        return path
+
+    def _second_dir(self, name, settings_text):
+        proj_dir = Path(self.tmp) / name
+        (proj_dir / ".claude").mkdir(parents=True)
+        (proj_dir / ".claude" / "settings.local.json").write_text(settings_text)
+        return str(proj_dir)
+
+    def _unrecorded(self, out):
+        return [r for r in self.table_rows(out) if r["action"] == "unrecorded-claude-dir"]
+
+    def test_a_dir_carrying_this_projects_hooks_off_the_row_is_reported_with_the_decide_remedy(self):
+        second = self._second_dir("second", self.settings_text())
+        proc = self._walk(self._claude_json(second))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        rows = self._unrecorded(proc.stdout)
+        self.assertEqual(len(rows), 1, proc.stdout)
+        self.assertEqual(rows[0]["claude-dir"], f"{second}/.claude")
+        self.assertEqual(rows[0]["repo"], self.repo)
+        self.assertEqual(rows[0]["stamped"], engine_sha())
+        remedy = (f"wired --repo {self.repo} --store {self.store} --project proj "
+                  f"--claude-dir {self.claude_dir} --claude-dir {second}/.claude "
+                  f"--code-root {self.code_root} --langs python --never-ext .cs")
+        self.assertIn(remedy, proc.stdout)
+
+    def test_the_updater_does_not_record_or_render_the_unrecorded_dir(self):
+        second = self._second_dir("second", self.settings_text())
+        before = (Path(second) / ".claude" / "settings.local.json").read_text()
+        registry = decisions_tsv(self.home).read_text()
+        proc = self._walk(self._claude_json(second), ["--apply"])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual((Path(second) / ".claude" / "settings.local.json").read_text(), before)
+        self.assertEqual(decisions_tsv(self.home).read_text(), registry)
+        # --apply prints the unrecorded report after the apply output.
+        last_two = proc.stdout.rstrip().splitlines()[-2:]
+        self.assertIn("unrecorded-claude-dir", last_two[0], proc.stdout)
+        self.assertIn("To record it", last_two[1], proc.stdout)
+
+    def test_the_recorded_dir_is_not_reported(self):
+        proc = self._walk(self._claude_json(self.repo))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("unrecorded-claude-dir", proc.stdout)
+
+    def test_another_projects_hooks_with_no_row_are_reported_wire_or_remove(self):
+        other = self.settings_text().replace("MEMCONTINUUM_PROJECT=proj", "MEMCONTINUUM_PROJECT=orphan")
+        self.assertNotEqual(other, self.settings_text())
+        second = self._second_dir("orphan-home", other)
+        proc = self._walk(self._claude_json(second))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        rows = self._unrecorded(proc.stdout)
+        self.assertEqual(len(rows), 1, proc.stdout)
+        self.assertEqual(rows[0]["claude-dir"], f"{second}/.claude")
+        self.assertIn("orphan", rows[0]["repo"])
+        self.assertIn("wire it", proc.stdout)
+        self.assertIn("remove the hooks", proc.stdout)
+
+    def test_a_missing_or_garbage_claude_json_skips_the_scan_and_keeps_the_exit_code(self):
+        skipped = "claude-json: unreadable, unrecorded-dir scan skipped"
+        proc = self._walk(str(Path(self.tmp) / "does-not-exist.json"))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(skipped, proc.stdout)
+        garbage = Path(self.tmp) / "garbage.json"
+        garbage.write_text("{not json")
+        proc = self._walk(str(garbage))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(skipped, proc.stdout)
+        self.assertEqual(self.table_rows(proc.stdout)[0]["action"], "ok")
