@@ -66,7 +66,32 @@
 #                  rules-foreign | skill-foreign | migrate |
 #                  migrate-needs-claude-dirs | migrate-needs-langs |
 #                  migrate-needs-never-exts | migrate-dirs-disagree |
-#                  store-missing | no-wiring | unrecoverable
+#                  store-missing | no-wiring | unrecoverable |
+#                  unrecorded-claude-dir
+#
+#                  unrecorded-claude-dir (reported, never applied): Claude
+#                  Code lists every project directory it has opened in
+#                  ~/.claude.json (MEMCONTINUUM_CLAUDE_JSON overrides the
+#                  path). A <dir>/.claude settings file there whose hook line
+#                  carries MEMCONTINUUM_PROJECT=<P>, for a directory the P
+#                  row does not record, gets one row after the table (after
+#                  everything else under --apply) with the rendered stamp and
+#                  the memcontinuum-decide.sh command that would record it;
+#                  a project with no wired row is told to wire it or remove
+#                  the hooks. Consent to record lives in that command: this
+#                  one re-renders nothing here, and the exit status is
+#                  unchanged. An unreadable ~/.claude.json prints
+#                  `claude-json: unreadable, unrecorded-dir scan skipped`.
+#                  The remedy's --repo is the checkout the updater can vouch
+#                  for (a path key; the --repo it validated; or the parent of
+#                  a recorded claude-dir whose git key equals the row's); with
+#                  none, the line says INCOMPLETE and --repo is a FILL IN
+#                  placeholder. --apply scans the registry as rewritten.
+#                  Bounds: >8 MiB ~/.claude.json skipped, 500 sorted keys,
+#                  keys with control characters skipped and counted, one
+#                  settings file per directory (notices start `claude-json:`).
+#                  A directory counts as recorded when it is the same
+#                  directory (physical spelling or bash -ef).
 #
 #                  store-form-stale (reporting walk): the row's store= names
 #                  the same store the wiring renders, written in an
@@ -1737,6 +1762,7 @@ MIGRATE_HINTS=""
 # makes the per-row migration overrides (--claude-dir/--langs/--never-ext)
 # unambiguous. Without it, every wired row is walked.
 ONLY_KEY=""
+ONLY_REPO=""
 if [ -n "$TARGET_REPO" ]; then
     if ! mc_repo_key "$TARGET_REPO"; then
         echo "not a git repository: $TARGET_REPO" >&2
@@ -1746,6 +1772,7 @@ if [ -n "$TARGET_REPO" ]; then
     # be an answer, not an empty table.
     require_wired_row "$MC_REPO_KEY" "$MC_REPO"
     ONLY_KEY="$MC_REPO_KEY"
+    ONLY_REPO="$MC_REPO"
 fi
 
 # backup_state_for STORE PROJECT -- sets MC_BACKUP_STATE for the `backup`
@@ -1758,6 +1785,318 @@ backup_state_for() {
         MC_BACKUP_SETTINGS_DONE=1
     fi
     mc_backup_state "$1" "$2"
+}
+
+# --- unrecorded claude-dir scan (INC-0130, TOP-0137 L7) ---------------------
+#
+# A project's sessions may start from a claude directory its registry row
+# never recorded (a second session home), and the walk above only ever
+# renders the recorded ones -- so an unrecorded directory keeps stale hooks
+# while every row reads `ok`. Claude Code lists every project directory it
+# has opened under "projects" in ~/.claude.json (MEMCONTINUUM_CLAUDE_JSON
+# overrides the path, for tests); for each, a settings file whose hook line
+# carries MEMCONTINUUM_PROJECT=<P> is MemContinuum wiring. Reported only --
+# consent to record a directory lives in memcontinuum-decide.sh.
+#
+# Bounds (gate round 1): ~/.claude.json over 8 MiB is not read; at most 500
+# project keys (sorted) are scanned; a key holding a control character (NUL,
+# newline, tab, ...) is never scanned; of a directory's two settings files
+# the first that carries a MemContinuum hook line is the one followed
+# (settings.local.json, then settings.json), and neither is read past 1 MiB.
+#
+# ROW_INDEX: one line per walked row, fields joined by US (a non-whitespace
+# IFS keeps empty fields): project, key, store, claude-dirs, code-roots,
+# langs, never. Reads settings through mc_command_env_value, the same reader
+# the walk uses. It is built twice: during the walk, and again from the
+# registry file after --apply has rewritten it (mc_update_index_rebuild), so
+# the final scan sees the rows as they now are.
+MC_US=$'\037'
+ROW_INDEX=""
+MC_SCAN_MAX_KEYS=500
+MC_SCAN_MAX_JSON_BYTES=$((8 * 1024 * 1024))
+MC_SCAN_MAX_SETTINGS_BYTES=$((1024 * 1024))
+
+# mc_update_index_add PROJECT KEY STORE CLAUDE_DIRS_SEMI CODE_ROOTS_SEMI LANGS_COMMA NEVER_COMMA
+# A legacy row (no claude-dirs) proposes its own path key's .claude.
+mc_update_index_add() {
+    local dirs="$4"
+    if [ -z "$dirs" ]; then
+        case "$2" in /*) dirs="$2/.claude" ;; esac
+    fi
+    ROW_INDEX="${ROW_INDEX}${1}${MC_US}${2}${MC_US}${3}${MC_US}${dirs}${MC_US}${5}${MC_US}${6}${MC_US}${7}"$'\n'
+}
+
+# mc_update_index_rebuild -- ROW_INDEX from the registry file as it is NOW
+# (same row selection as the walk: wired rows with a project, --repo narrowing).
+mc_update_index_rebuild() {
+    local raw key rest dec when note proj store dirs cr langs never
+    ROW_INDEX=""
+    [ -f "$DECISIONS" ] || return 0
+    while IFS= read -r raw || [ -n "$raw" ]; do
+        case "$raw" in \#*|"") continue ;; esac
+        key="${raw%%"$MC_TAB"*}"
+        rest="${raw#*"$MC_TAB"}"
+        IFS="$MC_TAB" read -r dec when note <<<"$rest"
+        [ "$dec" = "wired" ] || continue
+        if [ -n "$ONLY_KEY" ] && [ "$key" != "$ONLY_KEY" ]; then continue; fi
+        mc_note_field "$note" "project"; proj="$MC_NOTE_FIELD"
+        [ -n "$proj" ] || continue
+        mc_note_field "$note" "store"; store="$MC_NOTE_FIELD"
+        mc_note_field "$note" "claude-dirs"; dirs="$MC_NOTE_FIELD"
+        mc_note_field "$note" "code-roots"; cr="$MC_NOTE_FIELD"
+        mc_note_field "$note" "langs"; langs="$MC_NOTE_FIELD"
+        mc_note_field "$note" "never"; never="$MC_NOTE_FIELD"
+        mc_update_index_add "$proj" "$key" "$store" "$dirs" "$cr" "$(printf '%s' "$langs" | tr ';' ',')" "$(printf '%s' "$never" | tr ';' ',')"
+    done < "$DECISIONS"
+}
+
+# mc_update_cell TEXT -- sets MC_CELL to a placeholder token for TEXT, not to
+# TEXT. Every displayed field of the unrecorded-dir scan goes through here;
+# the scan's output is written to a file with the tokens in it, and
+# mc_update_cells_flush then replaces every token, in ONE python -I call per
+# scan, with its text with every Unicode control character (category Cc: C0,
+# DEL and the C1 range such as U+0085) shown as `?`, so a displayed table
+# cell can never add a column or a row. (`tr [:cntrl:]` is byte-wise and
+# leaves UTF-8 C1 controls intact; a python start per cell cost a cold start
+# per displayed field.) Bytes that are not UTF-8 pass through unchanged. Also
+# replaced: every code point that splits lines for python's splitlines()
+# (U+0085, U+2028, U+2029, FS/GS/RS...). Called in the current shell, never in
+# $(...), because it appends to MC_CELLS.
+MC_CELL=""
+MC_CELLS=()
+mc_update_cell() {
+    MC_CELL=$'\001'"${#MC_CELLS[@]}"$'\002'
+    MC_CELLS[${#MC_CELLS[@]}]="$1"
+}
+
+# mc_update_cells_flush PY FILE -- prints FILE with every cell token replaced
+# by its sanitised text. One python start for the whole scan; without cells
+# FILE is printed as it is. If python fails, NOTHING is printed and the status
+# is 1 (the caller prints a skip notice): the tokenised buffer holds SOH/STX
+# placeholders inside table rows and remedy commands, which no one can copy.
+# MEMCONTINUUM_TEST_FAIL_CELL_FLUSH=1 forces that failure (test hook).
+mc_update_cells_flush() {
+    if [ "${#MC_CELLS[@]}" -eq 0 ]; then
+        cat "$2"
+        return 0
+    fi
+    [ -z "${MEMCONTINUUM_TEST_FAIL_CELL_FLUSH:-}" ] || return 1
+    printf '%s\0' "${MC_CELLS[@]}" | PYTHONPATH= "$1" -I -c '
+import re, sys, unicodedata
+cells = sys.stdin.buffer.read().split(b"\0")[:-1]
+def clean(b):
+    t = b.decode("utf-8", "surrogateescape")
+    return "".join("?" if unicodedata.category(c) in ("Cc", "Zl", "Zp") or len(("a" + c + "a").splitlines()) != 1 else c for c in t).encode("utf-8", "surrogateescape")
+with open(sys.argv[1], "rb") as f:
+    data = f.read()
+sys.stdout.buffer.write(re.sub(rb"\x01([0-9]+)\x02", lambda m: clean(cells[int(m.group(1))]), data))' "$2"
+}
+
+# mc_update_same_dir A B -- 0 when A and B are the same directory: equal
+# physical spelling, or (both exist) the same device+inode (bash -ef), which
+# also covers a bind-mount alias that no spelling comparison can see.
+mc_update_same_dir() {
+    [ "$(mc_physical "$1")" = "$(mc_physical "$2")" ] && return 0
+    [ -d "$1" ] && [ -d "$2" ] && [ "$1" -ef "$2" ] && return 0
+    return 1
+}
+
+# mc_update_checkout_for_row KEY CLAUDE_DIRS_SEMI -- sets MC_ROW_CHECKOUT to a
+# local checkout path the updater can vouch for, else "". A path key is its own
+# checkout. For a remote-URL key: the --repo checkout this run validated
+# (ONLY_REPO) when the key matches, else the git toplevel of the parent of a
+# recorded claude-dir whose mc_repo_key (the same key mapping the registry was
+# written with) equals KEY. Saves and restores MC_REPO / MC_REPO_KEY.
+mc_update_checkout_for_row() {
+    local key="$1" d parent found="" save_repo="${MC_REPO:-}" save_key="${MC_REPO_KEY:-}"
+    MC_ROW_CHECKOUT=""
+    case "$key" in /*) MC_ROW_CHECKOUT="$key"; return 0 ;; esac
+    if [ -n "$ONLY_REPO" ] && [ "$ONLY_KEY" = "$key" ]; then
+        MC_ROW_CHECKOUT="$ONLY_REPO"; return 0
+    fi
+    mc_split_semi "$2"
+    for d in ${MC_SPLIT[@]+"${MC_SPLIT[@]}"}; do
+        parent="$(dirname "$d")"
+        [ -d "$parent" ] || continue
+        if mc_repo_key "$parent" && [ "$MC_REPO_KEY" = "$key" ]; then
+            found="$MC_REPO"; break
+        fi
+    done
+    MC_REPO="$save_repo"; MC_REPO_KEY="$save_key"
+    MC_ROW_CHECKOUT="$found"
+}
+
+mc_update_unrecorded_scan_body() {
+    local cj="${MEMCONTINUUM_CLAUDE_JSON:-$HOME/.claude.json}" py pdir cdir cdir_show
+    local settings line all proj stamps stamp nstamps rec seen_ok=0 unreadable=0 hit_file
+    local rproj rkey rstore rdirs rcr rlangs rnever rd d hit recorded
+    local mkey mstore mdirs mcr mlangs mnever cmd repo_arg proj_show key_show decide_q
+    py="$(mc_update_resolve_python)" || py=""
+    if [ ! -f "$cj" ] || [ -z "$py" ]; then
+        echo "claude-json: unreadable, unrecorded-dir scan skipped"
+        return 0
+    fi
+    # Record protocol, NUL-delimited: `#...` records are notices/status, every
+    # other record is an accepted project directory (absolute, no control
+    # character), so a path with a newline or tab can never be mis-split.
+    while IFS= read -r -d '' rec; do
+        case "$rec" in
+            "#ok") seen_ok=1; continue ;;
+            "#unreadable") unreadable=1; break ;;
+            "#notice "*) echo "claude-json: ${rec#"#notice "}"; continue ;;
+        esac
+        pdir="$rec"
+        [ -n "$pdir" ] || continue
+        cdir="$pdir/.claude"
+        all=""
+        for settings in "$cdir/settings.local.json" "$cdir/settings.json"; do
+            [ -f "$settings" ] || continue
+            # Size from metadata (find -size), never by reading the file. An
+            # oversized file is a notice and the end of this directory's
+            # scan: falling through to the next file would let a huge
+            # settings.local.json hide behind a small settings.json.
+            if [ -n "$(find -L "$settings" -maxdepth 0 -size +"$MC_SCAN_MAX_SETTINGS_BYTES"c 2>/dev/null)" ]; then
+                mc_update_cell "$settings"
+                echo "claude-json: $MC_CELL is larger than 1 MiB, not read"
+                break
+            fi
+            hit_file=""
+            while IFS= read -r line || [ -n "$line" ]; do
+                case "$line" in *"MEMCONTINUUM_PROJECT="*) ;; *) continue ;; esac
+                mc_command_env_value "$line" "MEMCONTINUUM_PROJECT"
+                proj="$MC_ENV_VALUE"
+                [ -n "$proj" ] || continue
+                mc_command_env_value "$line" "MEMCONTINUUM_RENDERED"
+                stamp="${MC_ENV_VALUE:-none}"
+                all="${all}${proj}${MC_US}${stamp}"$'\n'
+                hit_file=1
+            done < <(grep '"command"' "$settings" 2>/dev/null)
+            [ -z "$hit_file" ] || break
+        done
+        [ -n "$all" ] || continue
+        while IFS= read -r proj || [ -n "$proj" ]; do
+            [ -n "$proj" ] || continue
+            stamps="$(printf '%s' "$all" | while IFS="$MC_US" read -r hit stamp; do
+                          [ "$hit" = "$proj" ] && printf '%s\n' "$stamp"
+                      done | sort -u)"
+            nstamps="$(printf '%s\n' "$stamps" | grep -c .)"
+            if [ "$nstamps" -gt 1 ]; then stamp="mixed"; else stamp="$stamps"; fi
+            recorded=0
+            mkey=""
+            while IFS="$MC_US" read -r rproj rkey rstore rdirs rcr rlangs rnever || [ -n "$rproj" ]; do
+                [ "$rproj" = "$proj" ] || continue
+                if [ -z "$mkey" ]; then
+                    mkey="$rkey"; mstore="$rstore"; mdirs="$rdirs"
+                    mcr="$rcr"; mlangs="$rlangs"; mnever="$rnever"
+                fi
+                mc_split_semi "$rdirs"
+                for rd in ${MC_SPLIT[@]+"${MC_SPLIT[@]}"}; do
+                    mc_update_same_dir "$rd" "$cdir" && recorded=1
+                done
+            done <<<"$ROW_INDEX"
+            [ "$recorded" -eq 0 ] || continue
+            # Cells are tokenised only for what is printed below.
+            mc_update_cell "$cdir"; cdir_show="$MC_CELL"
+            mc_update_cell "$stamp"; stamp="$MC_CELL"
+            mc_update_cell "$proj"; proj_show="$MC_CELL"
+            if [ -n "$mkey" ]; then
+                mc_update_cell "$mkey"; key_show="$MC_CELL"
+                print_row "$key_show" "$cdir_show" "$stamp" "unknown" "unknown" "unknown" "unknown" "unknown" "unrecorded-claude-dir"
+                decide_q="$(printf '%q' "$DECIDE")"
+                mc_update_checkout_for_row "$mkey" "$mdirs"
+                if [ -n "$MC_ROW_CHECKOUT" ]; then
+                    repo_arg="$(printf '%q' "$MC_ROW_CHECKOUT")"
+                    cmd="$decide_q wired --repo $repo_arg"
+                else
+                    cmd="$decide_q wired --repo FILL-IN-LOCAL-CHECKOUT-OF-${key_show}-HERE"
+                fi
+                cmd="$cmd --store $(printf '%q' "$mstore") --project $(printf '%q' "$proj")"
+                mc_split_semi "$mdirs"
+                for rd in ${MC_SPLIT[@]+"${MC_SPLIT[@]}"}; do cmd="$cmd --claude-dir $(printf '%q' "$rd")"; done
+                cmd="$cmd --claude-dir $(printf '%q' "$cdir")"
+                mc_build_wiring_args "$mcr" "$mlangs" "$mnever"
+                for d in ${MC_BUILT_ARGS[@]+"${MC_BUILT_ARGS[@]}"}; do cmd="$cmd $(printf '%q' "$d")"; done
+                if [ -n "$MC_ROW_CHECKOUT" ]; then
+                    echo "  $cdir_show carries $proj_show's hooks but is not recorded on $key_show. To record it (the updater will then keep it current): $cmd"
+                else
+                    echo "  INCOMPLETE -- $cdir_show carries $proj_show's hooks but is not recorded on $key_show, and no local checkout of that remote is known here (fill in --repo before running): $cmd"
+                fi
+            elif [ -z "$ONLY_KEY" ]; then
+                print_row "(no row for $proj_show)" "$cdir_show" "$stamp" "unknown" "unknown" "unknown" "unknown" "unknown" "unrecorded-claude-dir"
+                echo "  $cdir_show carries $proj_show's hooks but no wired registry row names project $proj_show -- wire it (memcontinuum-decide.sh wired ...) or remove the hooks."
+            fi
+        done < <(printf '%s' "$all" | while IFS="$MC_US" read -r proj stamp; do printf '%s\n' "$proj"; done | sort -u)
+    done < <(PYTHONPATH= "$py" -I -c '
+import json, os, sys, unicodedata
+MAXB, MAXK = int(sys.argv[2]), int(sys.argv[3])
+out = sys.stdout.buffer
+def rec(text):
+    out.write(text.encode("utf-8", "surrogateescape") + b"\0")
+try:
+    if os.path.getsize(sys.argv[1]) > MAXB:
+        rec("#ok"); rec("#notice larger than %d MiB, unrecorded-dir scan skipped" % (MAXB >> 20)); raise SystemExit(0)
+    with open(sys.argv[1], encoding="utf-8") as f:
+        data = json.load(f)
+    projects = data["projects"]
+    if not isinstance(projects, dict):
+        raise ValueError
+except SystemExit:
+    raise
+except Exception:
+    rec("#unreadable"); raise SystemExit(0)
+rec("#ok")
+good, bad = [], 0
+for key in projects:
+    if not (isinstance(key, str) and key.startswith("/")):
+        continue
+    if any(unicodedata.category(c) == "Cc" for c in key) or len(key.splitlines()) != 1:
+        bad += 1
+        continue
+    try:
+        key.encode("utf-8", "surrogateescape")
+    except UnicodeEncodeError:
+        bad += 1
+        continue
+    good.append(key)
+if bad:
+    rec("#notice %d project key(s) skipped: control characters" % bad)
+good.sort()
+if len(good) > MAXK:
+    rec("#notice %d project key(s) beyond the first %d not scanned" % (len(good) - MAXK, MAXK))
+    good = good[:MAXK]
+for key in good:
+    rec(key)
+' "$cj" "$MC_SCAN_MAX_JSON_BYTES" "$MC_SCAN_MAX_KEYS" 2>/dev/null)
+    if [ "$unreadable" -eq 1 ] || [ "$seen_ok" -eq 0 ]; then
+        echo "claude-json: unreadable, unrecorded-dir scan skipped"
+    fi
+    return 0
+}
+
+# The scan prints tokens for its cells into a file (the function runs in this
+# shell: print_row's header state must survive); the file is then printed once
+# with the cells sanitised -- two python starts per scan in all.
+mc_update_unrecorded_scan() {
+    local py out
+    py="$(mc_update_resolve_python)" || py=""
+    out="$(mktemp "${TMPDIR:-/tmp}/mc-scan.XXXXXX" 2>/dev/null)" || {
+        echo "claude-json: unrecorded-dir scan skipped (mktemp failed)"
+        return 0
+    }
+    MC_CELLS=()
+    mc_update_unrecorded_scan_body > "$out"
+    # The flush prints nothing when it fails, so a failure is a single notice.
+    # Its output is captured first: a python that dies half-way must not leave
+    # a partial table behind the notice.
+    local flushed
+    if flushed="$(mc_update_cells_flush "$py" "$out" && printf x)"; then
+        flushed="${flushed%x}"
+        printf '%s' "$flushed"
+    else
+        echo "claude-json: unrecorded-dir scan skipped (cell sanitiser failed)"
+    fi
+    rm -f "$out"
+    return 0
 }
 
 while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
@@ -1789,6 +2128,11 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
         [ "$APPLY" -eq 1 ] && WALK_RC=1
         continue
     fi
+
+    # Row index for the unrecorded claude-dir scan: the dirs AS RECORDED
+    # (before any --claude-dir narrowing below). Rebuilt from the registry
+    # after --apply.
+    mc_update_index_add "$PROJECT" "$KEY" "$STORE" "$CLAUDE_DIRS_SEMI" "$CODE_ROOTS_SEMI" "$LANGS_COMMA" "$NEVER_COMMA"
 
     # Fix-round MAJOR (both reviewers): once per project row (never once
     # per claude-dir -- a project with two claude-dirs must not print this
@@ -2108,6 +2452,11 @@ if [ -n "$MIGRATE_HINTS" ]; then
     printf '%s\n' "$MIGRATE_HINTS" >&2
 fi
 
+# Reporting walk: the unrecorded claude-dirs follow the table. --apply
+# prints them last instead (see the end of this script), so they are the
+# final thing on screen.
+[ "$APPLY" -eq 1 ] || mc_update_unrecorded_scan
+
 # --- the machine layer, compared against its OWN fingerprint ---------------
 #
 # Separate from every row above, because it is a separate layer: the detector
@@ -2320,6 +2669,13 @@ print(",".join(sorted(mismatched)))
         fi
         # --- end Task 9 dependency reconciliation -----------------------------
     fi
+fi
+
+# --apply: after the apply output and the machine layer, so the report is the
+# last thing on screen. Informational -- never changes WALK_RC.
+if [ "$APPLY" -eq 1 ]; then
+    mc_update_index_rebuild
+    mc_update_unrecorded_scan
 fi
 
 exit "$WALK_RC"

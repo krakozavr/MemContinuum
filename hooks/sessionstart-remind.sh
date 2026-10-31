@@ -140,12 +140,16 @@ fi
 # shellcheck source=memlib.sh
 source "$SCRIPT_DIR/memlib.sh"
 
+# hook.log grammar: sessionstart outcome=<o> [extra...] session=S source=SRC
+# cwd=<session working directory|-> project=P  (cwd: the payload's `cwd`,
+# control characters stripped by mc_cwd_token; `-` when absent -- INC-0130).
 finish() {
-    local extra="${2:-}"
+    local extra="${2:-}" cwd_tok
+    cwd_tok="$(mc_cwd_token "${CWD:-}")"
     if [ -n "$extra" ]; then
-        mc_log "sessionstart outcome=$1 $extra session=${SESSION_ID:-} source=${SOURCE:-}"
+        mc_log "sessionstart outcome=$1 $extra session=${SESSION_ID:-} source=${SOURCE:-} $cwd_tok"
     else
-        mc_log "sessionstart outcome=$1 session=${SESSION_ID:-} source=${SOURCE:-}"
+        mc_log "sessionstart outcome=$1 session=${SESSION_ID:-} source=${SOURCE:-} $cwd_tok"
     fi
     exit 0
 }
@@ -153,7 +157,7 @@ finish() {
 PAYLOAD="$(cat)"
 [ -z "$PAYLOAD" ] && finish "empty-payload"
 
-eval "$(mc_extract_fields "$PAYLOAD" session_id source)" 2>/dev/null
+eval "$(mc_extract_fields "$PAYLOAD" session_id source cwd)" 2>/dev/null
 [ -z "${SESSION_ID:-}" ] && finish "no-session-id"
 
 STATE_FILE="$(mc_state_file_for "$MC_PROJECT" "$SESSION_ID")"

@@ -499,9 +499,18 @@ that shape: nothing was compared). `memidx.py stats` reports these under a
 every other hook kind — these lines carry no `outcome=` field of their own
 and are never folded into `user_prompts`.
 `code-refresh.sh` writes
-`code-refresh outcome=<refreshed|skip|failed> reason=… project=… roots=… unrecorded=… changed=… removed=… healed=… dropped=… elapsed=…s event=<Stop|SessionStart> session=… embed=<spawned|clean|off [reason=no-wired-roots]|failed reason=<marker|log|spawn>|unknown>`
+`code-refresh outcome=<refreshed|skip|failed> reason=… project=… roots=… unrecorded=… changed=… removed=… healed=… dropped=… elapsed=…s event=<Stop|SessionStart> session=… cwd=<encoded path|-> embed=<spawned|clean|off [reason=no-wired-roots]|failed reason=<marker|log|spawn>|unknown>`
 (plus `marker=write-failed` and `detail=…` when they apply); the line is produced by
 `memidx.py code-refresh` and logged by the hook, and `memidx.py stats` files it under `other`.
+`cwd=<token>` (the hook payload `cwd`, `-` when absent) rides on the `sessionstart` and `code-refresh` lines so a
+session's working directory can be read off the log; without it nobody could tell which claude directory a session
+ran from. The token is the first 512 bytes of the path percent-encoded, keeping only `[A-Za-z0-9/._~:!-]` (every
+other byte, `%` and control characters included, is `%XX` in uppercase hex), so it is one whitespace-free, `=`-free
+word: a path such as `/x project=other` cannot forge a field. There is one encoder per language with identical
+output (`memidx.py` `_log_path_token`, `hooks/memlib.sh` `mc_cwd_token`; a test runs both); decode with
+`urllib.parse.unquote_to_bytes` (lossless; `unquote` to text turns invalid UTF-8 -- a 512-byte cut inside a multi-byte character, raw high bytes -- into U+FFFD). `sessionstart` puts it after `source=` (before the trailing `project=`), `code-refresh`
+after `session=`. Only `memidx.py` decodes the payload as JSON: the shell-composed `code-refresh` skip/failed
+lines (bad-project, no-watchdog, no-python, no-result) print `cwd=-`.
 `memcontinuum-detect.sh` writes nothing at all unless
 `$MEMCONTINUUM_DETECT_LOG` is set — it runs in every repo on the machine, so its
 default is silence.
@@ -1126,7 +1135,7 @@ rules | skill | store-hooks | action`, action being one of `ok`, `stale`, `store
 `rules-missing`, `rules-stale`, `rules-foreign`, `skill-foreign`, `migrate`,
 `migrate-needs-claude-dirs`, `migrate-needs-langs`,
 `migrate-needs-never-exts`, `migrate-dirs-disagree`, `store-missing`,
-`no-wiring`, or
+`no-wiring`, `unrecorded-claude-dir`, or
 `unrecoverable`. `store-form-stale` is the reporting walk's answer when the
 row's `store=` names the same store the wiring renders, written in an
 unresolved (symlinked) string form: nothing is mismatched, so the remedy it
@@ -1341,6 +1350,19 @@ Actions that are deliberately never auto-applied:
   skill's repair path (an undecided/broken install), not this command's — a
   `wired` row is never a license to *wire* anything; it only ever re-renders
   wiring that is already there.
+
+- **`unrecorded-claude-dir`** — reported after the table (last, under `--apply`),
+  never applied. Claude Code lists every directory it has opened under
+  `projects` in `~/.claude.json` (`MEMCONTINUUM_CLAUDE_JSON` overrides the path);
+  when `<dir>/.claude/settings.local.json` or `settings.json` there carries a hook
+  line with `MEMCONTINUUM_PROJECT=<P>` (read with `mc_command_env_value`, the
+  walk's own reader) and the `<P>` row does not list that directory, the row
+  prints the rendered stamp and the exact `memcontinuum-decide.sh wired` command
+  that would record it. A project with no wired row is told to wire it or remove
+  the hooks. The command re-renders nothing and the exit status is unchanged; an
+  unreadable `~/.claude.json` prints one `claude-json: unreadable` line and
+  skips the scan. Origin: a session home that was never on the row kept
+  five-day-old hooks while every walk said `ok`.
 
 A row written before this registry format existed (no `claude-dirs=` in its
 note) is an **old-format row**: its single claude-dir is recovered as `<repo>/.claude`

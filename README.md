@@ -537,6 +537,11 @@ deleted, the row is reported `store-missing` and skipped, because re-running
 the installer against a missing store would seed a new, empty one in its
 place.
 
+If Claude Code has opened a directory whose `.claude` carries this project's
+hooks but which the row does not record, the table ends with an
+`unrecorded-claude-dir` row and the `memcontinuum-decide.sh wired` command that
+would record it; the updater reports it and changes nothing.
+
 Two things it will not decide for you. **A project's set of claude-dirs is
 named by a person, never discovered.** A project can have more than one (a
 session-home `.claude` beside a bare checkout, say), and nothing on disk says

@@ -32,6 +32,7 @@ import subprocess
 import sys
 import time
 import traceback
+import urllib.parse
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -8540,11 +8541,16 @@ _HOOK_FIELD_RE = {
 }
 
 
+# `cwd` is a path: backslashes (Windows) and escaped quotes are legal in it, so
+# it gets its own pattern and is decoded, unlike the two plain tokens above.
+_HOOK_CWD_RE = re.compile(r'"cwd"\s*:\s*"((?:[^"\\]|\\.)*)"')
+
+
 def _hook_payload_fields(text: str) -> dict:
-    """`hook_event_name` / `session_id` from the hook payload on stdin. The
+    """`hook_event_name` / `session_id` / `cwd` from the hook payload on stdin. The
     shell hands over a bounded PREFIX of the payload, which may cut the JSON
     short: a complete document is parsed, a truncated one is scanned for the
-    two string fields (both sit in the first few hundred bytes)."""
+    string fields (all sit in the first few hundred bytes)."""
     try:
         data = json.loads(text or "{}")
     except ValueError:
@@ -8556,6 +8562,12 @@ def _hook_payload_fields(text: str) -> dict:
         m = rx.search(text or "")
         if m:
             out[key] = m.group(1)
+    m = _HOOK_CWD_RE.search(text or "")
+    if m:
+        try:
+            out["cwd"] = json.loads('"' + m.group(1) + '"')
+        except ValueError:
+            out["cwd"] = m.group(1)
     return out
 
 
@@ -8565,6 +8577,29 @@ def _clean_log_token(raw, limit: int = 64) -> str:
     key=value pair."""
     token = re.sub(r"[^A-Za-z0-9._-]", "", str(raw or ""))[:limit]
     return token or "unknown"
+
+
+def _log_path_token(raw, limit: int = 512) -> str:
+    """A payload path as ONE hook.log token (INC-0130): the first `limit`
+    BYTES (UTF-8) percent-encoded, keeping only `[A-Za-z0-9/._~:!-]` -- so no
+    space, `=`, quote, backslash, `%` or control character can survive to
+    forge a `key=value` field or split the line -- and `-` when absent or
+    empty. hooks/memlib.sh `mc_cwd_token` is the same encoder in bash (a test
+    runs both on one input). Decode losslessly with
+    urllib.parse.unquote_to_bytes; `unquote` to text replaces invalid UTF-8
+    (a cut inside a multi-byte character, raw high bytes) with U+FFFD."""
+    text = str(raw or "")
+    try:
+        data = text.encode("utf-8", "surrogateescape")
+    except UnicodeEncodeError:
+        # A lone surrogate other than U+DC80..U+DCFF (JSON "\ud800"): keep
+        # surrogateescape for the raw-byte range so high bytes stay one %XX,
+        # and encode any other lone surrogate as its 3 surrogatepass bytes.
+        data = b"".join(
+            c.encode("utf-8", "surrogateescape" if "\udc80" <= c <= "\udcff" else "surrogatepass")
+            for c in text)
+    data = data[:limit]
+    return urllib.parse.quote_from_bytes(data, safe="/._~:!-") or "-"
 
 
 def _write_code_stale_marker(marker: Path, reason: str, roots: int) -> bool:
@@ -8687,10 +8722,10 @@ def _env_code_roots() -> list:
 def cmd_code_refresh(args) -> int:
     """hooks/code-refresh.sh's worker: the code index's freshness pass.
 
-    Reads the hook JSON on stdin (`hook_event_name`, `session_id`), prints
+    Reads the hook JSON on stdin (`hook_event_name`, `session_id`, `cwd`), prints
     EXACTLY ONE line to stdout -- `outcome=<refreshed|skip|failed>
     reason=... project=P roots=N unrecorded=N changed=N removed=N healed=N
-    elapsed=Xs event=E session=S [marker=write-failed] [detail=...]` -- which
+    elapsed=Xs event=E session=S cwd=PATH|- [marker=write-failed] [detail=...]` -- which
     the hook shell prefixes with a timestamp and appends to hook.log. Never
     raises, always returns 0.
 
@@ -8718,7 +8753,7 @@ def cmd_code_refresh(args) -> int:
     res = {"outcome": "failed", "reason": "crash", "roots": 0, "unrecorded": 0, "changed": 0,
            "removed": 0, "healed": 0, "dropped": 0, "embed": "unknown"}
     extra = []
-    event, session = "unknown", "unknown"
+    event, session, cwd = "unknown", "unknown", "-"
     try:
         budget = _watchdog_budget()
         if budget:
@@ -8728,6 +8763,7 @@ def cmd_code_refresh(args) -> int:
         payload = _hook_payload_fields(sys.stdin.read(1 << 20))
         event = _clean_log_token(payload.get("hook_event_name"))
         session = _clean_log_token(payload.get("session_id"))
+        cwd = _log_path_token(payload.get("cwd"))
         db_path = resolve_code_db_path(args)
         marker = db_path.parent / f"{project}.code-stale"
         _refresh_code_index(args, project, db_path, marker, event == "Stop", res, extra)
@@ -8739,7 +8775,7 @@ def cmd_code_refresh(args) -> int:
         f"outcome={res['outcome']} reason={res['reason']} project={project} roots={res['roots']} "
         f"unrecorded={res['unrecorded']} changed={res['changed']} removed={res['removed']} "
         f"healed={res['healed']} dropped={res['dropped']} elapsed={elapsed:.1f}s event={event} session={session} "
-        f"embed={res['embed']}"
+        f"cwd={cwd} embed={res['embed']}"
     )
     for item in extra:
         line += " " + " ".join(str(item).split())[:300]
