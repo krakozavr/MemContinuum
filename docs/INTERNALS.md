@@ -2522,9 +2522,14 @@ test chunks, but that did not make tests outrank code, so the change is scoped t
 what the caller sees. `code_tested_by` gives each code hit up to three test
 chunks (distinct paths) found by one FTS query on the hit's symbol over at most
 50 rows, role-filtered in Python through the same `chunk_role`; symbols under 4
-characters or `main`/`init`/`test`/`setUp` get no lookup. The code index stores
-names, signatures and doc comments, not bodies, so a test is found only when its
-name, signature or doc mentions the symbol. JSON hits gain `role` and, for code
+characters or `main`/`init`/`__init__`/`test`/`setUp` get no lookup. "Tested
+by" matches a test chunk whose qualified name, signature, doc or indexed body
+excerpt (the first 25 lines of each chunk body, stored in the FTS `body` column)
+names the symbol. `--tests`/`--all` select among chunks already indexed; Swift's
+`skip_dirs` still prunes directories named `Tests` and `Resources` under a code
+root, so a Swift project's test files reach the index only when a `Tests`
+directory is wired as its own code root (its own name is never consulted by the
+skip rule). JSON hits gain `role` and, for code
 hits, `tested_by` (a list of `{path, qualified_name}`); the envelope gains
 `role_filter`; text output prints `[test]` on test hits and an indented
 `tested by:` line.

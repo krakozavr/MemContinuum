@@ -7910,7 +7910,7 @@ def code_hits_fts(conn: sqlite3.Connection, query: str, project: str, limit: int
 
 # TOP-0137 L7 step 6: symbol names too common to look tests up by (compared
 # lowercased). Together with the 4-character floor in `code_tested_by`.
-_TESTED_BY_SKIP_SYMBOLS = frozenset({"main", "init", "test", "setup"})
+_TESTED_BY_SKIP_SYMBOLS = frozenset({"main", "init", "__init__", "test", "setup"})
 _TESTED_BY_FTS_ROWS = 50
 _TESTED_BY_MAX = 3
 

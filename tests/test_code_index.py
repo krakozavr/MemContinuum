@@ -7102,14 +7102,14 @@ class TestChunkRole(unittest.TestCase):
                   ["Sources/Foo.swift", "tests/Foo.swift", "Sources/Tests.swift.bak.swift"]),
         "javascript": (["__tests__/a.js", "src/tests/a.js", "src/test/a.js", "src/a.test.js", "src/a.spec.jsx"],
                        ["src/a.js", "src/testing/a.js", "src/contest.js"]),
-        "typescript": (["__tests__/a.ts", "src/a.test.ts", "src/a.spec.ts"], ["src/a.ts"]),
+        "typescript": (["__tests__/a.ts", "src/a.test.ts", "src/a.spec.ts", "src/user_spec.ts"], ["src/a.ts"]),
         "tsx": (["src/a.test.tsx", "tests/a.tsx"], ["src/a.tsx"]),
         "lua": (["spec/a.lua", "tests/a.lua", "test/a.lua", "a_spec.lua", "x/a_test.lua"],
                 ["src/a.lua", "src/spec_helper.lua"]),
         "java": (["src/test/java/A.java", "mod/src/test/A.java", "src/main/ATest.java", "src/main/ATests.java"],
                  ["src/main/java/A.java", "src/testing/A.java", "src/tests/A.java"]),
-        "rust": (["tests/a.rs", "src/a_test.rs"], ["src/a.rs", "src/test/a.rs"]),
-        "php": (["tests/A.php", "test/A.php", "src/ATest.php"], ["src/A.php", "src/Tester.php"]),
+        "rust": (["tests/a.rs", "src/a_test.rs", "tests.rs", "src/foo/tests.rs"], ["src/a.rs", "src/test/a.rs", "src/contests.rs"]),
+        "php": (["tests/A.php", "test/A.php", "src/ATest.php", "src/ATests.php"], ["src/A.php", "src/Tester.php"]),
     }
 
     def test_every_language_has_positive_and_negative_paths(self):
@@ -7192,6 +7192,10 @@ class TestCodeSearchRoles(unittest.TestCase):
             out = self._search(db, "widget_builder", limit=1)
             self.assertEqual(len(out["results"]), 1)
             self.assertEqual(out["results"][0]["role"], "code")
+            # the filter runs before the cut: --tests --limit 1 still finds a test hit
+            only = self._search(db, "widget_builder", role_filter="tests", limit=1)
+            self.assertEqual(len(only["results"]), 1)
+            self.assertEqual(only["results"][0]["role"], "test")
 
     def test_code_hit_names_its_tests(self):
         with tempfile.TemporaryDirectory() as td:
@@ -7220,7 +7224,7 @@ class TestCodeSearchRoles(unittest.TestCase):
             db = self._build(td)
             conn = memidx.open_code_db(db)
             try:
-                for sym in ("abc", "main", "setUp", "init", "test"):
+                for sym in ("abc", "main", "setUp", "init", "__init__", "test"):
                     self.assertEqual(memidx.code_tested_by(conn, memidx.DEFAULT_PROJECT, sym), [], sym)
                 self.assertTrue(memidx.code_tested_by(conn, memidx.DEFAULT_PROJECT, "widget_builder"))
             finally:

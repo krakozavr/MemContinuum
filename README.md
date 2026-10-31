@@ -470,9 +470,12 @@ returns code by default: a chunk counts as a test when its path and language say
 so (`tests/`, `test_*.py`, `*Tests.swift`, `*.spec.ts` and the like), and those are
 left out unless you pass `--tests` (tests only) or `--all` (both, tests marked
 `[test]`). Each code hit also carries a `tested by:` line naming up to three test
-chunks whose name, signature or doc comment mentions its symbol (`--json`:
+chunks whose qualified name, signature, doc comment or indexed body excerpt names its symbol (`--json`:
 `role`, `tested_by`, and `role_filter` at the top). The role is worked out at
-query time, so there is no reindex. A
+query time, so there is no reindex. The flags select among chunks already
+indexed: Swift's skip rule still prunes directories named `Tests` and
+`Resources` under a code root, so Swift test files reach the index only when a
+`Tests` directory is wired as its own code root. A
 project can have several code roots — `code-search` says whether a root's
 index is proven current, metadata-checked, stale, or incomplete, rather than
 returning an empty list that reads like "nothing found", and `--verify-content`

@@ -37,6 +37,12 @@ UNIVERSAL_SKIP_DIRS = frozenset({
 })
 
 LANGUAGE_TABLE = {
+    # test_markers only classify chunks that are ALREADY indexed (they drive
+    # code-search --tests/--all). Swift's skip_dirs below still prunes
+    # directories named `Tests` and `Resources` under a code root, so a Swift
+    # project's test files reach the index only when a `Tests` directory is
+    # wired as its own code root (its own name is never consulted by the skip
+    # rule).
     "swift": {"backend": "native", "module": "chunkers.swift",
               "extensions": (".swift",), "shebangs": (), "impl_version": "3",
               "test_markers": {"dirs": frozenset({"Tests"}), "dir_globs": ("*Tests",), "dir_substrings": (), "files": ("*Tests.swift", "*Test.swift")},
@@ -65,7 +71,7 @@ LANGUAGE_TABLE = {
                     "runtime_pin": "0.26.0", "grammar_pin": "0.25.0",
                     "query_file": "javascript.scm", "impl_version": "1",
                     "extensions": (".js", ".jsx", ".mjs", ".cjs"), "shebangs": ("node",),
-                    "test_markers": {"dirs": frozenset({"test", "__tests__", "tests"}), "dir_globs": (), "dir_substrings": (), "files": ("*.test.*", "*.spec.*")},
+                    "test_markers": {"dirs": frozenset({"test", "__tests__", "tests"}), "dir_globs": (), "dir_substrings": (), "files": ("*.test.*", "*.spec.*", "*_spec.*")},
                     "skip_dirs": frozenset({"build", "dist"}),
                     "containers": {"class_declaration": "name"},
                     "method_if_ancestor_in": frozenset(), "max_bytes": None},
@@ -74,7 +80,7 @@ LANGUAGE_TABLE = {
                     "runtime_pin": "0.26.0", "grammar_pin": "0.23.2",
                     "query_file": "typescript.scm", "impl_version": "1",
                     "extensions": (".ts",), "shebangs": (),
-                    "test_markers": {"dirs": frozenset({"test", "__tests__", "tests"}), "dir_globs": (), "dir_substrings": (), "files": ("*.test.*", "*.spec.*")},
+                    "test_markers": {"dirs": frozenset({"test", "__tests__", "tests"}), "dir_globs": (), "dir_substrings": (), "files": ("*.test.*", "*.spec.*", "*_spec.*")},
                     "skip_dirs": frozenset({"build", "dist"}),
                     # `namespace M {}` is an internal_module and `module M {}`
                     # a module; both declare a scope a reference spells, so
@@ -98,7 +104,7 @@ LANGUAGE_TABLE = {
             "runtime_pin": "0.26.0", "grammar_pin": "0.23.2",
             "query_file": "typescript.scm", "impl_version": "1",
             "extensions": (".tsx",), "shebangs": (),
-            "test_markers": {"dirs": frozenset({"test", "__tests__", "tests"}), "dir_globs": (), "dir_substrings": (), "files": ("*.test.*", "*.spec.*")},
+            "test_markers": {"dirs": frozenset({"test", "__tests__", "tests"}), "dir_globs": (), "dir_substrings": (), "files": ("*.test.*", "*.spec.*", "*_spec.*")},
             "skip_dirs": frozenset({"build", "dist"}),
             # Same two namespace spellings (and the same string-named
             # `declare module "x" {}` exclusion) as the typescript row above,
@@ -132,7 +138,7 @@ LANGUAGE_TABLE = {
             "runtime_pin": "0.26.0", "grammar_pin": "0.24.1",
             "query_file": "php.scm", "impl_version": "1",
             "extensions": (".php",), "shebangs": (),
-            "test_markers": {"dirs": frozenset({"test", "tests"}), "dir_globs": (), "dir_substrings": (), "files": ("*Test.php",)},
+            "test_markers": {"dirs": frozenset({"test", "tests"}), "dir_globs": (), "dir_substrings": (), "files": ("*Test.php", "*Tests.php")},
             "skip_dirs": frozenset(),
             "containers": {"class_declaration": "name", "trait_declaration": "name",
                             "enum_declaration": "name"},
@@ -149,7 +155,7 @@ LANGUAGE_TABLE = {
              "runtime_pin": "0.26.0", "grammar_pin": "0.24.2",
              "query_file": "rust.scm", "impl_version": "1",
              "extensions": (".rs",), "shebangs": (),
-             "test_markers": {"dirs": frozenset({"tests"}), "dir_globs": (), "dir_substrings": (), "files": ("*_test.rs",)},
+             "test_markers": {"dirs": frozenset({"tests"}), "dir_globs": (), "dir_substrings": (), "files": ("*_test.rs", "tests.rs")},
              "skip_dirs": frozenset({"target"}),
              "containers": {"impl_item": "SELF_TYPE", "trait_item": "name", "mod_item": "name"},
              "method_if_ancestor_in": frozenset({"impl_item", "trait_item"}), "max_bytes": None,
