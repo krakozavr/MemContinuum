@@ -508,7 +508,7 @@ ran from. The token is the first 512 bytes of the path percent-encoded, keeping 
 other byte, `%` and control characters included, is `%XX` in uppercase hex), so it is one whitespace-free, `=`-free
 word: a path such as `/x project=other` cannot forge a field. There is one encoder per language with identical
 output (`memidx.py` `_log_path_token`, `hooks/memlib.sh` `mc_cwd_token`; a test runs both); decode with
-`urllib.parse.unquote`. `sessionstart` puts it after `source=` (before the trailing `project=`), `code-refresh`
+`urllib.parse.unquote_to_bytes` (lossless; `unquote` to text turns invalid UTF-8 -- a 512-byte cut inside a multi-byte character, raw high bytes -- into U+FFFD). `sessionstart` puts it after `source=` (before the trailing `project=`), `code-refresh`
 after `session=`. Only `memidx.py` decodes the payload as JSON: the shell-composed `code-refresh` skip/failed
 lines (bad-project, no-watchdog, no-python, no-result) print `cwd=-`.
 `memcontinuum-detect.sh` writes nothing at all unless

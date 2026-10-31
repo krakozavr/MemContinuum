@@ -1850,10 +1850,23 @@ mc_update_index_rebuild() {
     done < "$DECISIONS"
 }
 
-# mc_update_cell TEXT -- TEXT with every control character shown as `?`, so a
-# displayed table cell can never add a column or a row.
+# mc_update_cell TEXT -- TEXT with every Unicode control character (category
+# Cc: C0, DEL and the C1 range such as U+0085) shown as `?`, so a displayed
+# table cell can never add a column or a row. `tr [:cntrl:]` is byte-wise and
+# leaves UTF-8 C1 controls intact, so one small python -I call does it
+# (MC_CELL_PY, set by the scan); bytes that are not UTF-8 pass through
+# unchanged. Also replaced: every code point that splits lines for python's
+# splitlines() (U+0085, U+2028, U+2029, FS/GS/RS...). Without python the scan never runs, so the tr fallback is unused.
+MC_CELL_PY=""
 mc_update_cell() {
-    printf '%s' "$1" | tr '[:cntrl:]' '?'
+    if [ -z "$MC_CELL_PY" ]; then
+        printf '%s' "$1" | tr '[:cntrl:]' '?'
+        return
+    fi
+    printf '%s' "$1" | PYTHONPATH= "$MC_CELL_PY" -I -c '
+import sys, unicodedata
+t = sys.stdin.buffer.read().decode("utf-8", "surrogateescape")
+sys.stdout.buffer.write("".join("?" if unicodedata.category(c) in ("Cc", "Zl", "Zp") or len(("a" + c + "a").splitlines()) != 1 else c for c in t).encode("utf-8", "surrogateescape"))'
 }
 
 # mc_update_same_dir A B -- 0 when A and B are the same directory: equal
@@ -1894,12 +1907,13 @@ mc_update_unrecorded_scan() {
     local cj="${MEMCONTINUUM_CLAUDE_JSON:-$HOME/.claude.json}" py pdir cdir cdir_show
     local settings line all proj stamps stamp nstamps rec seen_ok=0 unreadable=0 hit_file
     local rproj rkey rstore rdirs rcr rlangs rnever rd d hit recorded
-    local mkey mstore mdirs mcr mlangs mnever cmd repo_arg proj_show key_show
+    local mkey mstore mdirs mcr mlangs mnever cmd repo_arg proj_show key_show decide_q
     py="$(mc_update_resolve_python)" || py=""
     if [ ! -f "$cj" ] || [ -z "$py" ]; then
         echo "claude-json: unreadable, unrecorded-dir scan skipped"
         return 0
     fi
+    MC_CELL_PY="$py"
     # Record protocol, NUL-delimited: `#...` records are notices/status, every
     # other record is an accepted project directory (absolute, no control
     # character), so a path with a newline or tab can never be mis-split.
@@ -1915,7 +1929,14 @@ mc_update_unrecorded_scan() {
         all=""
         for settings in "$cdir/settings.local.json" "$cdir/settings.json"; do
             [ -f "$settings" ] || continue
-            [ "$(wc -c <"$settings" 2>/dev/null || echo 0)" -le "$MC_SCAN_MAX_SETTINGS_BYTES" ] || continue
+            # Size from metadata (find -size), never by reading the file. An
+            # oversized file is a notice and the end of this directory's
+            # scan: falling through to the next file would let a huge
+            # settings.local.json hide behind a small settings.json.
+            if [ -n "$(find "$settings" -maxdepth 0 -size +"$MC_SCAN_MAX_SETTINGS_BYTES"c 2>/dev/null)" ]; then
+                echo "claude-json: $(mc_update_cell "$settings") is larger than 1 MiB, not read"
+                break
+            fi
             hit_file=""
             while IFS= read -r line || [ -n "$line" ]; do
                 case "$line" in *"MEMCONTINUUM_PROJECT="*) ;; *) continue ;; esac
@@ -1957,12 +1978,13 @@ mc_update_unrecorded_scan() {
             if [ -n "$mkey" ]; then
                 key_show="$(mc_update_cell "$mkey")"
                 print_row "$key_show" "$cdir_show" "$stamp" "unknown" "unknown" "unknown" "unknown" "unknown" "unrecorded-claude-dir"
+                decide_q="$(printf '%q' "$DECIDE")"
                 mc_update_checkout_for_row "$mkey" "$mdirs"
                 if [ -n "$MC_ROW_CHECKOUT" ]; then
                     repo_arg="$(printf '%q' "$MC_ROW_CHECKOUT")"
-                    cmd="$DECIDE wired --repo $repo_arg"
+                    cmd="$decide_q wired --repo $repo_arg"
                 else
-                    cmd="$DECIDE wired --repo <FILL IN: local checkout of $mkey>"
+                    cmd="$decide_q wired --repo <FILL IN: local checkout of $key_show>"
                 fi
                 cmd="$cmd --store $(printf '%q' "$mstore") --project $(printf '%q' "$proj")"
                 mc_split_semi "$mdirs"
@@ -2003,7 +2025,7 @@ good, bad = [], 0
 for key in projects:
     if not (isinstance(key, str) and key.startswith("/")):
         continue
-    if any(unicodedata.category(c) == "Cc" for c in key):
+    if any(unicodedata.category(c) == "Cc" for c in key) or len(key.splitlines()) != 1:
         bad += 1
         continue
     try:

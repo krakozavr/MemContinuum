@@ -8549,8 +8549,20 @@ def _log_path_token(raw, limit: int = 512) -> str:
     space, `=`, quote, backslash, `%` or control character can survive to
     forge a `key=value` field or split the line -- and `-` when absent or
     empty. hooks/memlib.sh `mc_cwd_token` is the same encoder in bash (a test
-    runs both on one input); decode with urllib.parse.unquote."""
-    data = str(raw or "").encode("utf-8", "surrogateescape")[:limit]
+    runs both on one input). Decode losslessly with
+    urllib.parse.unquote_to_bytes; `unquote` to text replaces invalid UTF-8
+    (a cut inside a multi-byte character, raw high bytes) with U+FFFD."""
+    text = str(raw or "")
+    try:
+        data = text.encode("utf-8", "surrogateescape")
+    except UnicodeEncodeError:
+        # A lone surrogate other than U+DC80..U+DCFF (JSON "\ud800"): keep
+        # surrogateescape for the raw-byte range so high bytes stay one %XX,
+        # and encode any other lone surrogate as its 3 surrogatepass bytes.
+        data = b"".join(
+            c.encode("utf-8", "surrogateescape" if "\udc80" <= c <= "\udcff" else "surrogatepass")
+            for c in text)
+    data = data[:limit]
     return urllib.parse.quote_from_bytes(data, safe="/._~:!-") or "-"
 
 

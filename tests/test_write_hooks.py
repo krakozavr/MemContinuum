@@ -6935,6 +6935,18 @@ class TestCodeRefreshHook(HookTestBase):
         line, _ = self.run_hook("Stop", payload=no_cwd, env=self.refresh_env(MEMCONTINUUM_PROJECT="../victim"))
         self.assertTrue(line.endswith(" cwd=-"), line)
 
+    def test_cwd_with_a_lone_surrogate_logs_a_token_not_a_crash(self):
+        """INC-0130 re-gate polish: JSON "\\ud800" is a lone surrogate that
+        surrogateescape cannot encode; the refresh must not log
+        crash-UnicodeEncodeError."""
+        self.build_code_index()
+        payload = json.dumps({"session_id": "s-refresh", "hook_event_name": "Stop", "cwd": "/x/\ud800/y"})
+        line, _ = self.run_hook("Stop", payload=payload)
+        self.assertNotIn("crash", line)
+        cwd_toks = [t for t in line.split(" ") if t.startswith("cwd=")]
+        self.assertEqual(cwd_toks, ["cwd=/x/%ED%A0%80/y"], line)
+        self.assertEqual(memidx._log_path_token("/a\udc80\ud800"), "/a%80%ED%A0%80")
+
     def test_cwd_control_characters_and_fields_cannot_split_or_forge_the_log_line(self):
         self.build_code_index()
         raw = "/x/y\nforged outcome=refreshed\tz project=other session=fake"

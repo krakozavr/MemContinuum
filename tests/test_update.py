@@ -4787,6 +4787,72 @@ class TestUnrecordedClaudeDirIsReported(UpdateTestBase):
         self.assertEqual(len(rows), 1, proc.stdout)
         self.assertNotIn("orphan", proc.stdout)
 
+    def test_the_remedy_quotes_the_engine_path_when_it_has_a_space(self):
+        """INC-0130 re-gate polish: $DECIDE itself is %q-quoted, in both the
+        runnable and the INCOMPLETE remedy."""
+        link = Path(self.tmp) / "eng dir"
+        link.symlink_to(Path(UPDATE_SH).parent.parent, target_is_directory=True)
+        script = str(link / "scripts" / "memcontinuum-update.sh")
+        quoted = str(link / "scripts" / "memcontinuum-decide.sh").replace(" ", "\\ ")  # printf %q form
+        second = self._second_dir("second", self.settings_text())
+        for incomplete in (False, True):
+            if incomplete:
+                self._remote_key(with_remote=False)
+            proc = subprocess.run(
+                [MC_BASH, script, "--no-machine"], capture_output=True, text=True,
+                env=clean_env(self.home, {"MEMCONTINUUM_CLAUDE_JSON": self._claude_json(second)}),
+                timeout=120, cwd=self.home)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn(f": {quoted} wired --repo ", proc.stdout, proc.stdout)
+            self.assertEqual("INCOMPLETE" in proc.stdout, incomplete, proc.stdout)
+
+    def test_a_unicode_c1_control_in_a_project_name_is_one_row_with_a_question_mark(self):
+        """INC-0130 re-gate polish: U+0085 (NEL) survives `tr [:cntrl:]`."""
+        other = self.settings_text().replace("MEMCONTINUUM_PROJECT=proj", "MEMCONTINUUM_PROJECT=orphan\u0085forged")
+        self.assertNotEqual(other, self.settings_text())
+        second = self._second_dir("second", other)
+        proc = self._walk(self._claude_json(second))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("\u0085", proc.stdout)
+        rows = self._unrecorded(proc.stdout)
+        self.assertEqual(len(rows), 1, proc.stdout)
+        self.assertIn("orphan?forged", rows[0]["repo"])
+
+    def test_line_splitting_code_points_are_neither_scanned_as_keys_nor_shown(self):
+        """INC-0130 re-gate: U+2028/U+2029/U+0085 are not category Cc but split
+        lines for python's splitlines()."""
+        second = self._second_dir("second", self.settings_text())
+        cj = Path(self.tmp) / "ls.json"
+        cj.write_text(json.dumps({"projects": {second: {}, second + "\u2028x": {}, second + "\u2029x": {}}}))
+        proc = self._walk(str(cj))
+        self.assertIn("claude-json: 2 project key(s) skipped: control characters", proc.stdout)
+        other = self.settings_text().replace("MEMCONTINUUM_PROJECT=proj", "MEMCONTINUUM_PROJECT=orphan\u2028forged")
+        second2 = self._second_dir("second2", other)
+        proc = self._walk(self._claude_json(second2))
+        for ch in ("\u2028", "\u2029", "\u0085"):
+            self.assertNotIn(ch, proc.stdout)
+        rows = self._unrecorded(proc.stdout)
+        self.assertEqual(len(rows), 1, proc.stdout)
+        self.assertIn("orphan?forged", rows[0]["repo"])
+
+    def test_an_oversized_settings_local_json_is_noticed_and_settings_json_is_not_a_fallback(self):
+        second = self._second_dir("second", "x" * (1024 * 1024 + 10))
+        (Path(second) / ".claude" / "settings.json").write_text(self.settings_text())
+        proc = self._walk(self._claude_json(second))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("larger than 1 MiB, not read", proc.stdout)
+        self.assertEqual(self._unrecorded(proc.stdout), [], proc.stdout)
+
+    def test_the_incomplete_marker_shows_the_sanitised_key(self):
+        url = self._remote_key(with_remote=False)
+        reg = decisions_tsv(self.home)
+        reg.write_text(reg.read_text().replace(url + "\t", url + "\r>x\t", 1))
+        second = self._second_dir("second", self.settings_text())
+        proc = self._walk(self._claude_json(second))
+        self.assertIn("INCOMPLETE", proc.stdout)
+        self.assertNotIn("\r", proc.stdout)
+        self.assertIn(f"local checkout of {url}?>x>", proc.stdout)
+
     def test_the_remedy_quotes_bang_and_space_paths_copy_paste_safe(self):
         second = self._second_dir("!_WORK_! dir", self.settings_text())
         proc = self._walk(self._claude_json(second))
