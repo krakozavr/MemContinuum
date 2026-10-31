@@ -1227,6 +1227,7 @@ MC_INSTALL_RENDERED="$RENDERED_SHA" \
 import json
 import os
 import shlex
+import subprocess
 import sys
 
 project = os.environ["MC_INSTALL_PROJECT"]
@@ -1397,12 +1398,39 @@ if code_roots:
 
 # --- pre-edit block (only if there is at least one code root) ---
 if code_roots:
+    # INC-0131: decision retrieval follows the REPOSITORY, not the code-index
+    # roots. A code root may be narrower than its checkout (Sources, Tests);
+    # the pre-edit filter and the strip prefix must still cover the whole
+    # checkout, or an edit in an in-root worktree matches no glob. The
+    # retrieval root of a code root is the git toplevel of that root
+    # (realpath'd like the roots themselves), or the root itself when it is
+    # not inside a git work tree / git is unavailable. De-duplicated, in
+    # first-appearance order. The newfile-nudge pairs below stay per code root.
+    def retrieval_root(cr):
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")}
+        try:
+            out = subprocess.run(
+                ["git", "-C", cr, "rev-parse", "--show-toplevel"],
+                capture_output=True, text=True, env=env, timeout=10,
+            )
+            top = out.stdout.strip() if out.returncode == 0 else ""
+        except (OSError, subprocess.SubprocessError):
+            top = ""
+        return os.path.realpath(top) if top else cr.rstrip("/")
+
+    retrieval_roots = []
+    for cr in code_roots:
+        rr = retrieval_root(cr).rstrip("/")
+        if rr and rr not in retrieval_roots:
+            retrieval_roots.append(rr)
+    strip_prefix = ":".join(rr + "/" for rr in retrieval_roots)
+
     pair_tmpl = read_tmpl("code-root-filter-pair.json.tmpl")
     pairs = []
-    for cr in code_roots:
-        strip_prefix = cr.rstrip("/") + "/"
+    for rr in retrieval_roots:
         pairs.append(render(pair_tmpl, {
-            "CODE_ROOT": esc_json(cr.rstrip("/")),
+            "CODE_ROOT": esc_json(rr),
             "STORE": esc_cmd(store),
             "PROJECT": esc_cmd(project),
             "STRIP_PREFIX": esc_cmd(strip_prefix),

@@ -1150,6 +1150,88 @@ class TestIdempotentDropToZeroCodeRoots(unittest.TestCase):
 
 
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestRetrievalRootFollowsRepository(unittest.TestCase):
+    """Decision retrieval follows the repository, code roots scope only the
+    index: the pre-edit pair and STRIP_PREFIX are rendered per retrieval root
+    (git toplevel of each code root, or the root itself outside git), the
+    newfile-nudge pairs stay per code root."""
+
+    def _install(self, home, code_roots):
+        args = ["--project", "narrow", "--store", str(Path(home) / "store"),
+                "--claude-dir", str(Path(home) / ".claude")]
+        for cr in code_roots:
+            args += ["--code-root", cr]
+        proc = run_install(args, home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        data = json.loads((Path(home) / ".claude" / "settings.local.json").read_text())
+        items = [h for g in data["hooks"]["PreToolUse"] for h in g.get("hooks", [])]
+        pre = [h for h in items if "pre-edit-chain.sh" in h["command"]]
+        nudge = [h for h in items if "newfile-nudge.sh" in h["command"]]
+        return pre, nudge
+
+    def _repo(self, home, name="repo"):
+        repo = Path(home) / name
+        (repo / "Sources").mkdir(parents=True)
+        (repo / "Tests").mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        return repo
+
+    def test_subdirectory_root_renders_one_pair_for_the_toplevel(self):
+        home = sandbox_home()
+        try:
+            repo = self._repo(home)
+            pre, nudge = self._install(home, [str(repo / "Sources")])
+            self.assertEqual(sorted(h["if"] for h in pre),
+                             sorted([f"Edit(/{repo}/**)", f"Write(/{repo}/**)"]))
+            for h in pre:
+                self.assertIn(f"MEMCONTINUUM_STRIP_PREFIX={repo}/ ", h["command"])
+            self.assertEqual([h["if"] for h in nudge], [f"Write(/{repo}/Sources/**)"])
+            self.assertIn(f"MEMCONTINUUM_CODE_ROOT={repo}/Sources", nudge[0]["command"])
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_two_subdirectories_of_one_repo_give_one_pre_edit_pair(self):
+        home = sandbox_home()
+        try:
+            repo = self._repo(home)
+            pre, nudge = self._install(home, [str(repo / "Sources"), str(repo / "Tests")])
+            self.assertEqual(len(pre), 2, pre)
+            self.assertEqual(sorted(h["if"] for h in pre),
+                             sorted([f"Edit(/{repo}/**)", f"Write(/{repo}/**)"]))
+            self.assertEqual(sorted(h["if"] for h in nudge),
+                             sorted([f"Write(/{repo}/Sources/**)", f"Write(/{repo}/Tests/**)"]))
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_root_outside_git_keeps_its_own_path(self):
+        home = sandbox_home()
+        try:
+            root = Path(home) / "plain" / "src"
+            root.mkdir(parents=True)
+            pre, _ = self._install(home, [str(root)])
+            self.assertEqual(sorted(h["if"] for h in pre),
+                             sorted([f"Edit(/{root}/**)", f"Write(/{root}/**)"]))
+            for h in pre:
+                self.assertIn(f"MEMCONTINUUM_STRIP_PREFIX={root}/ ", h["command"])
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_roots_in_two_repos_join_strip_prefixes_in_first_appearance_order(self):
+        home = sandbox_home()
+        try:
+            a = self._repo(home, "repo-a")
+            b = self._repo(home, "repo-b")
+            pre, _ = self._install(home, [str(b / "Sources"), str(a / "Sources"), str(b / "Tests")])
+            self.assertEqual(len(pre), 4, pre)
+            self.assertEqual([h["if"] for h in pre][::2],
+                             [f"Edit(/{b}/**)", f"Edit(/{a}/**)"])
+            for h in pre:
+                self.assertIn(f"MEMCONTINUUM_STRIP_PREFIX={b}/:{a}/ ", h["command"])
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
 class TestMultipleCodeRoots(unittest.TestCase):
     def test_two_code_roots_render_pretooluse_items_for_both_hooks(self):
         home = sandbox_home()
@@ -1186,11 +1268,11 @@ class TestMultipleCodeRoots(unittest.TestCase):
                 f"Edit(/{root_a}/**)", f"Write(/{root_a}/**)",
                 f"Edit(/{root_b}/**)", f"Write(/{root_b}/**)",
             ]))
+            # Retrieval roots (INC-0131): both roots sit outside git, so each
+            # is its own retrieval root, and every pair carries the whole
+            # colon-joined list (the chain splits it on `:`).
             for h in pre_edit_items:
-                if root_a in h["if"]:
-                    self.assertIn(f"MEMCONTINUUM_STRIP_PREFIX={root_a}/", h["command"])
-                else:
-                    self.assertIn(f"MEMCONTINUUM_STRIP_PREFIX={root_b}/", h["command"])
+                self.assertIn(f"MEMCONTINUUM_STRIP_PREFIX={root_a}/:{root_b}/ ", h["command"])
 
             nudge_ifs = sorted(h["if"] for h in nudge_items)
             self.assertEqual(nudge_ifs, sorted([f"Write(/{root_a}/**)", f"Write(/{root_b}/**)"]))
