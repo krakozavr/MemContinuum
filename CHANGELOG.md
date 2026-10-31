@@ -1,5 +1,18 @@
 # Changelog
 
+## [Unreleased]
+
+### Hooks
+- Decision retrieval now follows the repository, not the code-index roots.
+  `repo-init.sh` renders the pre-edit filter and `MEMCONTINUUM_STRIP_PREFIX`
+  for the git toplevel of each `--code-root` (the root itself outside git),
+  so a root narrower than the checkout (`Sources`, `Tests`) no longer hides
+  edits in in-root worktrees from retrieval; code roots scope only the index,
+  the new-file nudge and the ledger. A worktree edit under a narrow root is
+  recorded at its real path (a repository-level file there ends
+  `out-of-scope`) instead of being remapped under the root. Re-run
+  `memcontinuum-update.sh --apply` to re-render wired projects.
+
 ## [0.4.0] — 2026-10-31
 
 ### Installer and updater

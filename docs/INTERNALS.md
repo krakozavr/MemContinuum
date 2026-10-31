@@ -43,7 +43,7 @@ wired one level up, into `~/.claude/settings.json`, by `memcontinuum-setup.sh`.
 
 | script | event | does |
 |---|---|---|
-| `pre-edit-chain.sh` | `PreToolUse` (Edit/Write, filtered to `--code-root`) | `for-path` lookup on the file being edited; injects matching chains as `additionalContext`. On a genuine miss, runs the search fallback (see below) on the path's own words |
+| `pre-edit-chain.sh` | `PreToolUse` (Edit/Write, filtered to the repository each `--code-root` sits in) | `for-path` lookup on the file being edited; injects matching chains as `additionalContext`. On a genuine miss, runs the search fallback (see below) on the path's own words |
 | `newfile-nudge.sh` | `PreToolUse` (Write only, filtered to `--code-root`) | fires only when the write target does not exist yet and its extension is wired for this project; injects one reminder to search the code index first, plus the search fallback (see below) appended to that same reminder. Separately (newlang-nudge): when the extension is one the engine supports but this project never wired, injects a structured, numbered decision point (wire it / decline it permanently via `--never-ext` / not now) naming the language -- deduped once per language per session. The log-only DETECTION outcome (`outcome=language-available-not-wired`) still fires on every occurrence regardless of `--code-root`, unchanged and pre-existing; the VISIBLE decision point is gated on the SAME `--code-root` containment as the wired-file reminder |
 | `ledger-post-edit.sh` | `PostToolUse` (every tool; no settings-level matcher) | a bash-only prefilter exits before the watchdog for read-only built-ins (`Read`, `Grep`, ...); `Edit`/`Write`/`MultiEdit`/`NotebookEdit` ledger the tool's own file path (`source: tool`); `Bash` and any tool this hook has no dedicated branch for fall through to a shell-diff (`git status`) tree comparison against a per-root baseline (`source: shell-diff`); an unrecognized or missing `tool_name` additionally logs `outcome=unsupported-mutation-surface` |
 | `precompact-persist.sh` | `PreCompact` | persists session state before context is compacted away |
@@ -3008,8 +3008,15 @@ rev-parse`" as this section previously (incorrectly) claimed for every case.
 
 This closes the gap in each hook's own logic; it does not change which paths
 the harness LAUNCHES either hook for at all. `pre-edit-chain.sh`'s
-settings-level `"if"` filter is still a literal, per-code-root path glob
-(`templates/code-root-filter-pair.json.tmpl`): a worktree checked out as a
+settings-level `"if"` filter is still a literal path glob, rendered per
+*retrieval root* (`templates/code-root-filter-pair.json.tmpl`): the git toplevel
+of each `--code-root`, or the root itself outside git, de-duplicated — so a code
+root narrower than its checkout (`<repo>/Sources`) still has the whole checkout
+under the glob and `MEMCONTINUUM_STRIP_PREFIX` is the colon-joined retrieval
+roots. Code roots scope only the index, the new-file nudge and the ledger. The
+worktree remap returns the path under the matching root's own checkout toplevel,
+so a worktree edit under a narrow root is recorded at its real path (or ends
+`out-of-scope`). A worktree checked out as a
 SIBLING of the wired root never reaches the script at all under the current
 settings rendering, so it gets **ledger coverage only** (`ledger-post-edit.sh`
 has no such filter — design R6, "fires for EVERY tool" — and covers it).

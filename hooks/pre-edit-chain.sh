@@ -45,7 +45,9 @@
 # This closes the gap in THIS SCRIPT's own logic; it cannot make the harness
 # LAUNCH the script for a file outside every "if" glob repo-init.sh renders
 # (templates/code-root-filter-pair.json.tmpl scopes each invocation's "if"
-# to one literal code-root path) -- a worktree checked out as a SIBLING of
+# to one literal RETRIEVAL-root path: the git toplevel of each --code-root,
+# or the root itself outside git; code roots narrower than the checkout
+# scope only the index) -- a worktree checked out as a SIBLING of
 # the wired root never reaches this script at all under current wiring, so
 # it gets NO retrieval here (ledger-post-edit.sh, which has no such filter,
 # still ledgers it -- see that hook's own header). One checked out INSIDE
