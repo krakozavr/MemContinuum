@@ -1871,13 +1871,16 @@ mc_update_cell() {
 
 # mc_update_cells_flush PY FILE -- prints FILE with every cell token replaced
 # by its sanitised text. One python start for the whole scan; without cells
-# (or if python fails) FILE is printed as it is (tokens are control bytes,
-# harmless to a terminal, and no raw cell text is ever printed).
+# FILE is printed as it is. If python fails, NOTHING is printed and the status
+# is 1 (the caller prints a skip notice): the tokenised buffer holds SOH/STX
+# placeholders inside table rows and remedy commands, which no one can copy.
+# MEMCONTINUUM_TEST_FAIL_CELL_FLUSH=1 forces that failure (test hook).
 mc_update_cells_flush() {
     if [ "${#MC_CELLS[@]}" -eq 0 ]; then
         cat "$2"
         return 0
     fi
+    [ -z "${MEMCONTINUUM_TEST_FAIL_CELL_FLUSH:-}" ] || return 1
     printf '%s\0' "${MC_CELLS[@]}" | PYTHONPATH= "$1" -I -c '
 import re, sys, unicodedata
 cells = sys.stdin.buffer.read().split(b"\0")[:-1]
@@ -1886,7 +1889,7 @@ def clean(b):
     return "".join("?" if unicodedata.category(c) in ("Cc", "Zl", "Zp") or len(("a" + c + "a").splitlines()) != 1 else c for c in t).encode("utf-8", "surrogateescape")
 with open(sys.argv[1], "rb") as f:
     data = f.read()
-sys.stdout.buffer.write(re.sub(rb"\x01([0-9]+)\x02", lambda m: clean(cells[int(m.group(1))]), data))' "$2" || cat "$2"
+sys.stdout.buffer.write(re.sub(rb"\x01([0-9]+)\x02", lambda m: clean(cells[int(m.group(1))]), data))' "$2"
 }
 
 # mc_update_same_dir A B -- 0 when A and B are the same directory: equal
@@ -2076,10 +2079,22 @@ for key in good:
 mc_update_unrecorded_scan() {
     local py out
     py="$(mc_update_resolve_python)" || py=""
-    out="$(mktemp "${TMPDIR:-/tmp}/mc-scan.XXXXXX")" || { mc_update_unrecorded_scan_body; return 0; }
+    out="$(mktemp "${TMPDIR:-/tmp}/mc-scan.XXXXXX" 2>/dev/null)" || {
+        echo "claude-json: unrecorded-dir scan skipped (mktemp failed)"
+        return 0
+    }
     MC_CELLS=()
     mc_update_unrecorded_scan_body > "$out"
-    mc_update_cells_flush "$py" "$out"
+    # The flush prints nothing when it fails, so a failure is a single notice.
+    # Its output is captured first: a python that dies half-way must not leave
+    # a partial table behind the notice.
+    local flushed
+    if flushed="$(mc_update_cells_flush "$py" "$out" && printf x)"; then
+        flushed="${flushed%x}"
+        printf '%s' "$flushed"
+    else
+        echo "claude-json: unrecorded-dir scan skipped (cell sanitiser failed)"
+    fi
     rm -f "$out"
     return 0
 }

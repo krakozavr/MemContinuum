@@ -4886,6 +4886,38 @@ class TestUnrecordedClaudeDirIsReported(UpdateTestBase):
         self.assertGreaterEqual(starts, 1)
         self.assertLessEqual(starts, 3, f"{starts} python starts for a 50-directory scan")
 
+    def _scan_with_env(self, extra):
+        second = str(Path(self.tmp) / "second")
+        if not Path(second).exists():
+            self._second_dir("second", self.settings_text())
+        env = clean_env(self.home, {"MEMCONTINUUM_CLAUDE_JSON": self._claude_json(second), **extra})
+        return subprocess.run([MC_BASH, str(UPDATE_SH), "--no-machine"], capture_output=True,
+                              env=env, timeout=300, cwd=self.home)
+
+    def test_a_failed_mktemp_prints_one_skip_notice_and_no_cell_tokens(self):
+        """INC-0130 final confirmation: with no temp file the scan prints a
+        single notice, never its tokenised buffer (SOH/STX placeholders)."""
+        blocker = Path(self.tmp) / "not-a-dir"
+        blocker.write_text("x")
+        proc = self._scan_with_env({"TMPDIR": str(blocker)})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(b"claude-json: unrecorded-dir scan skipped (mktemp failed)\n", proc.stdout)
+        self.assertNotIn(b"\x01", proc.stdout)
+        self.assertNotIn(b"\x02", proc.stdout)
+        self.assertNotIn(b"unrecorded-claude-dir", proc.stdout)
+
+    def test_a_failed_cell_flush_prints_one_skip_notice_and_no_cell_tokens(self):
+        """The enumeration python succeeds; only the sanitiser flush is forced
+        to fail (MEMCONTINUUM_TEST_FAIL_CELL_FLUSH=1, honoured only when set)."""
+        proc = self._scan_with_env({"MEMCONTINUUM_TEST_FAIL_CELL_FLUSH": "1"})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(b"claude-json: unrecorded-dir scan skipped (cell sanitiser failed)\n", proc.stdout)
+        self.assertNotIn(b"\x01", proc.stdout)
+        self.assertNotIn(b"\x02", proc.stdout)
+        self.assertNotIn(b"unrecorded-claude-dir", proc.stdout)
+        ok = self._scan_with_env({})
+        self.assertIn(b"unrecorded-claude-dir", ok.stdout)
+
     def test_a_symlink_to_an_oversized_settings_file_is_noticed_not_read(self):
         """The size cap applies to the symlink's target (find -L)."""
         second = self._second_dir("second", "x")
