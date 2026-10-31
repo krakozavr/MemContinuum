@@ -1,52 +1,24 @@
 # Changelog
 
-## [Unreleased]
+## [0.4.0] — 2026-10-31
 
-- `code-search` now separates code from tests. A chunk's role is worked out at query time from its path and language (`tests/`, `test_*.py`, `*Tests.swift`, `*.spec.ts`, `src/test`, and so on), so there is no reindex. By default only code is returned; `--tests` returns tests only and `--all` returns both with tests marked `[test]`. Each code hit also gets a `tested by:` line (JSON: `tested_by`) naming up to three test chunks whose qualified name, signature, doc or indexed body excerpt names its symbol. The flags select among chunks already indexed; Swift test directories named `Tests` are still pruned unless wired as their own code root. JSON hits gain `role`, and the envelope gains `role_filter`; existing keys are unchanged.
-
-- Code-search hybrid ranking now fuses with RRF constant k=30 instead of 60 (provisional: on the 45 graded intent queries top-10 hits rose from 20 to 23 of 35 with no loss; it is re-measured at the next relevance re-check). The store search keeps k=60.
-- A code root you removed from a repo's wiring no longer comes back. The code
-  index remembered every root it had ever indexed, and the new background
-  worker (and the heal) processed all of them, so an old whole-repo root sat
-  beside a new narrower one and every symbol appeared twice. `code-embed-worker`
-  now requires `--root DIR` (repeatable; the installer and the refresh hook pass
-  the wired roots) and skips any recorded root not named; the heal skips them
-  too; `code-refresh.sh` drops them on `Stop` (`dropped=<n>` in `hook.log`) and
-  only marks them on `SessionStart` (`stale-root=<n>`). A relative or unresolvable wired root, or a wiring that names no recorded root, disables the
-  drop (`detail=stale-check-skipped:...`), and the worker's text pass refuses a
-  root that is no longer recorded.
-- Vector search scores faster. The cosine scoring that both `search` and
-  `code-search` share now runs as one numpy matrix product when numpy is
-  installed (it is, wherever embeddings work), about ten times faster on a
-  3,400-chunk code index; without numpy it uses the previous per-row loop.
-  Rankings and scores are unchanged.
-- Code embeddings now get built, in the background. Until now every code index
-  had zero vectors: the first `code-reindex` at install is `--no-embed` to keep
-  the install fast, and nothing ever filled them in afterwards, so `code-search`
-  was text-only in every mode. A new `code-embed-worker` (detached, one at a time,
-  same marker/lock/log pattern as the store's `embed-worker`) now does it. The
-  installer starts it after the first index, and `code-refresh.sh` starts it on
-  `Stop` and `SessionStart` whenever chunks lack a vector, so an existing index
-  fills itself the first time you open or finish a session after upgrading;
-  `embed=spawned|clean|off` in the `code-refresh` `hook.log` line says
-  which. Vectors are committed in batches of 128, so a killed worker keeps its
-  progress. `embedding_mode` is now `none`, `partial` or `full`, recomputed from
-  what is really embedded after every pass; the `code-reindex` summary ends with
-  `N chunk(s) awaiting embedding`, and `code-search` says how many chunks have no
-  vector yet (and still finds them by text). The Stop-time refresh stays
-  text-only, so a refresh of a fully embedded index reads `partial` until the
-  worker catches up; set `MEMCONTINUUM_EMBED_WORKER=0` to disable the worker.
-- Embedding is about 8 times faster on CPU. The engine now loads the plain
-  float32 ONNX file of the same model (`BAAI/bge-small-en-v1.5`) instead of
-  the quantised build fastembed picks by default, whose main matrix multiply
-  does not use more than one core: roughly 40 ms instead of 0.3-0.4 s per
-  chunk, so a 3,300-chunk index takes about 2.5 minutes instead of 22. The
-  vectors are the same (cosine 1.0000 against the old ones on real chunks), but
-  the index records a new model fingerprint, so after upgrading the background
-  workers re-embed existing vectors once (store records and code chunks both
-  count as awaiting embedding until then). The first embed downloads about
-  133 MB of model files; CI's model cache key moved to `v2`.
-
+### Installer and updater
+- `memcontinuum-update.sh` now notices a claude directory it was never told
+  about. It scans the project list Claude Code keeps in `~/.claude.json`
+  (override `MEMCONTINUUM_CLAUDE_JSON`), reads each project's
+  `.claude/settings.local.json` (or `settings.json`), and prints an
+  `unrecorded-claude-dir` row for every directory that carries a wired
+  project's hooks but is not on that project's registry row, with the exact
+  `memcontinuum-decide.sh wired ...` command that records it; a directory
+  whose project has no row at all is told to wire it or remove the hooks. The
+  scan writes nothing and never changes the exit status; under `--apply` it
+  runs last, after the registry is rewritten. What prompted it: a second
+  claude directory had been missing from a row for days, so every update
+  rendered the other one and reported ok.
+- `sessionstart` and `code-refresh` lines in `hook.log` carry `cwd=<token>`,
+  the session's working directory percent-encoded as one whitespace-free
+  token, so `stats` can say which directory a session ran from and a path
+  containing `project=` can no longer re-attribute a line.
 - Every store commit can now write a verified `git bundle` backup of the
   store: set `memcontinuum-setup.sh --backup-dir DIR [--backup-keep N]` and
   the post-commit hook keeps the newest N bundles per store in `DIR/<project>/`
@@ -74,6 +46,52 @@
   marker path that is a symlink or a directory is refused instead of being
   moved into.
 
+### Code search
+- `code-search` now separates code from tests. A chunk's role is worked out at query time from its path and language (`tests/`, `test_*.py`, `*Tests.swift`, `*.spec.ts`, `src/test`, and so on), so there is no reindex. By default only code is returned; `--tests` returns tests only and `--all` returns both with tests marked `[test]`. Each code hit also gets a `tested by:` line (JSON: `tested_by`) naming up to three test chunks whose qualified name, signature, doc or indexed body excerpt names its symbol. The flags select among chunks already indexed; Swift test directories named `Tests` are still pruned unless wired as their own code root. JSON hits gain `role`, and the envelope gains `role_filter`; existing keys are unchanged.
+- Code-search hybrid ranking now fuses with RRF constant k=30 instead of 60 (provisional: on the 45 graded intent queries top-10 hits rose from 20 to 23 of 35 with no loss; it is re-measured at the next relevance re-check). The store search keeps k=60.
+- Vector search scores faster. The cosine scoring that both `search` and
+  `code-search` share now runs as one numpy matrix product when numpy is
+  installed (it is, wherever embeddings work), about ten times faster on a
+  3,400-chunk code index; without numpy it uses the previous per-row loop.
+  Rankings and scores are unchanged.
+
+### Code index
+- A code root you removed from a repo's wiring no longer comes back. The code
+  index remembered every root it had ever indexed, and the new background
+  worker (and the heal) processed all of them, so an old whole-repo root sat
+  beside a new narrower one and every symbol appeared twice. `code-embed-worker`
+  now requires `--root DIR` (repeatable; the installer and the refresh hook pass
+  the wired roots) and skips any recorded root not named; the heal skips them
+  too; `code-refresh.sh` drops them on `Stop` (`dropped=<n>` in `hook.log`) and
+  only marks them on `SessionStart` (`stale-root=<n>`). A relative or unresolvable wired root, or a wiring that names no recorded root, disables the
+  drop (`detail=stale-check-skipped:...`), and the worker's text pass refuses a
+  root that is no longer recorded.
+- Code embeddings now get built, in the background. Until now every code index
+  had zero vectors: the first `code-reindex` at install is `--no-embed` to keep
+  the install fast, and nothing ever filled them in afterwards, so `code-search`
+  was text-only in every mode. A new `code-embed-worker` (detached, one at a time,
+  same marker/lock/log pattern as the store's `embed-worker`) now does it. The
+  installer starts it after the first index, and `code-refresh.sh` starts it on
+  `Stop` and `SessionStart` whenever chunks lack a vector, so an existing index
+  fills itself the first time you open or finish a session after upgrading;
+  `embed=spawned|clean|off` in the `code-refresh` `hook.log` line says
+  which. Vectors are committed in batches of 128, so a killed worker keeps its
+  progress. `embedding_mode` is now `none`, `partial` or `full`, recomputed from
+  what is really embedded after every pass; the `code-reindex` summary ends with
+  `N chunk(s) awaiting embedding`, and `code-search` says how many chunks have no
+  vector yet (and still finds them by text). The Stop-time refresh stays
+  text-only, so a refresh of a fully embedded index reads `partial` until the
+  worker catches up; set `MEMCONTINUUM_EMBED_WORKER=0` to disable the worker.
+- Embedding is about 8 times faster on CPU. The engine now loads the plain
+  float32 ONNX file of the same model (`BAAI/bge-small-en-v1.5`) instead of
+  the quantised build fastembed picks by default, whose main matrix multiply
+  does not use more than one core: roughly 40 ms instead of 0.3-0.4 s per
+  chunk, so a 3,300-chunk index takes about 2.5 minutes instead of 22. The
+  vectors are the same (cosine 1.0000 against the old ones on real chunks), but
+  the index records a new model fingerprint, so after upgrading the background
+  workers re-embed existing vectors once (store records and code chunks both
+  count as awaiting embedding until then). The first embed downloads about
+  133 MB of model files; CI's model cache key moved to `v2`.
 - The code index now refreshes itself. A new `code-refresh.sh` hook, wired on
   `Stop` and `SessionStart` for any project with a code root, checks the index
   with the same staleness test `code-search` uses (file stat signals, a content
@@ -103,6 +121,14 @@
 - `heal_code_index` now names its caller in its messages, can hand them back
   instead of printing, and reports why it did not heal (over the limit, a
   failure, or a held lock).
+
+### Known issue
+- Known issue: the pre-edit decision retrieval is filtered by the same roots
+  the code index is wired with. A repository wired with code roots narrower
+  than its checkout (`Sources` and `Tests`, say) gets no retrieval for an edit
+  outside those roots, including a worktree checked out inside the
+  repository; the ledger still records the edit. The next release renders the
+  retrieval filter for the repository and keeps the roots for the index only.
 
 ## [0.3.0] — 2026-10-15
 
