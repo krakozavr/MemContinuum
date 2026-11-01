@@ -14,7 +14,8 @@ never into the tool repo itself — the tool stays project-agnostic; the env
 values below are what make one instance of it specific to a project.
 
 Rendered from `templates/pre-edit-hook.json.tmpl` + one
-`templates/code-root-filter-pair.json.tmpl` pair per `--code-root`, merged
+`templates/code-root-filter-pair.json.tmpl` pair per *retrieval root* (the git toplevel of each
+`--code-root`, or the root itself outside git; de-duplicated), merged
 into the target `hooks.PreToolUse` array:
 
 ```json
@@ -26,14 +27,14 @@ into the target `hooks.PreToolUse` array:
         "hooks": [
           {
             "type": "command",
-            "if": "Edit(/<code-root>/**)",
-            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_STRIP_PREFIX=<code-root>/ MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/pre-edit-chain.sh",
+            "if": "Edit(/<retrieval-root>/**)",
+            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_STRIP_PREFIX=<retrieval-roots> MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/pre-edit-chain.sh",
             "timeout": 5
           },
           {
             "type": "command",
-            "if": "Write(/<code-root>/**)",
-            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_STRIP_PREFIX=<code-root>/ MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/pre-edit-chain.sh",
+            "if": "Write(/<retrieval-root>/**)",
+            "command": "MEMCONTINUUM_ROOT=<store> MEMCONTINUUM_PROJECT=<project> MEMCONTINUUM_STRIP_PREFIX=<retrieval-roots> MEMCONTINUUM_PYTHON=<python> bash <this-repo>/hooks/pre-edit-chain.sh",
             "timeout": 5
           }
         ]
@@ -44,6 +45,11 @@ into the target `hooks.PreToolUse` array:
 ```
 
 Notes:
+- Hand-wiring: one Edit/Write pair per retrieval root; `<retrieval-roots>` is the colon-joined list
+  of all retrieval roots, each with a trailing slash, on every pair. A code root narrower than its
+  repository (`<repo>/Sources`) still wires the whole repository here: a worktree inside the
+  repository is in scope for retrieval, a sibling of the repository never reaches the hook and
+  stays ledger-only.
 - `MEMCONTINUUM_STRIP_PREFIX` is required whenever a topic's `code_refs` are written relative to a
   checkout that the edited file's absolute path doesn't share a `cwd` with (a real `PreToolUse`
   payload's `file_path` is always absolute, while `code_refs` are written repo-relative) — see the
@@ -62,7 +68,7 @@ Notes:
   the outer one, still returns a real `additionalContext` explaining that retrieval timed out.
 - `if` filter paths use Claude Code's permission-rule syntax, where a single leading slash
   anchors at the settings source, not the filesystem root (docs: `Edit(//Users/alice/file)` =
-  absolute `/Users/alice/file`). `<code-root>` above is always an absolute path (already starting
+  absolute `/Users/alice/file`). `<retrieval-root>` above is always an absolute path (already starting
   with `/`), so the rendered pattern needs a SECOND leading slash — `Edit(//home/…/**)` — to match
   anything at all. With only one leading slash the hook never fires in a real session, so
   `code-root-filter-pair.json.tmpl` and `newfile-nudge-filter-pair.json.tmpl` compose `if` as

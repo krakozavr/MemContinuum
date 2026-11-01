@@ -45,7 +45,9 @@
 # This closes the gap in THIS SCRIPT's own logic; it cannot make the harness
 # LAUNCH the script for a file outside every "if" glob repo-init.sh renders
 # (templates/code-root-filter-pair.json.tmpl scopes each invocation's "if"
-# to one literal code-root path) -- a worktree checked out as a SIBLING of
+# to one literal RETRIEVAL-root path: the git toplevel of each --code-root,
+# or the root itself outside git; code roots narrower than the checkout
+# scope only the index) -- a worktree checked out as a SIBLING of
 # the wired root never reaches this script at all under current wiring, so
 # it gets NO retrieval here (ledger-post-edit.sh, which has no such filter,
 # still ledgers it -- see that hook's own header). One checked out INSIDE
@@ -56,7 +58,7 @@
 # BLOCKER finding): the in-root worktree case is what that round-2 fix
 # actually closes; round 1 only wired the machinery for it. A project that
 # wants retrieval for its own worktrees should therefore keep them INSIDE
-# the code root (e.g. `<root>/.worktrees/`, gitignored by that project) --
+# the repository (e.g. `<repo>/.worktrees/`, gitignored by that project) --
 # a sibling worktree stays ledger-only until the settings-rendering
 # follow-up (see this task's own report) widens the "if" glob itself.
 #
@@ -547,11 +549,12 @@ done
 # hit) -- see that branch's own comment. This worktree-gap block, reached
 # on every miss regardless of what the fallback later does, still pays
 # nothing extra. repo-init.sh
-# renders exactly ONE STRIP_PREFIX entry per invocation (= the single code
-# root that invocation's settings.json "if" filter is already scoped to,
-# templates/code-root-filter-pair.json.tmpl), so this is a faithful reading
-# of "the configured roots this invocation knows about", not a
-# looser/lossier stand-in for mc_code_roots. A hand-wired STRIP_PREFIX that
+# renders the STRIP_PREFIX as the colon-joined RETRIEVAL roots (the git
+# toplevel of each code root): the identical colon-joined list on every
+# pair, while each pair's settings.json "if" names ONE retrieval root from
+# that list (templates/code-root-filter-pair.json.tmpl), so this
+# is a faithful reading of "the configured roots this invocation knows
+# about", not a looser/lossier stand-in for mc_code_roots. A hand-wired STRIP_PREFIX that
 # is not really a repo root can never produce a false remap either way --
 # mc_remap_worktree_path's own match test is exact common-dir identity,
 # never a prefix/substring test (see its header in hooks/mc-path-lib.sh)

@@ -43,7 +43,7 @@ wired one level up, into `~/.claude/settings.json`, by `memcontinuum-setup.sh`.
 
 | script | event | does |
 |---|---|---|
-| `pre-edit-chain.sh` | `PreToolUse` (Edit/Write, filtered to `--code-root`) | `for-path` lookup on the file being edited; injects matching chains as `additionalContext`. On a genuine miss, runs the search fallback (see below) on the path's own words |
+| `pre-edit-chain.sh` | `PreToolUse` (Edit/Write, filtered to the repository each `--code-root` sits in, or to the root itself outside git) | `for-path` lookup on the file being edited; injects matching chains as `additionalContext`. On a genuine miss, runs the search fallback (see below) on the path's own words |
 | `newfile-nudge.sh` | `PreToolUse` (Write only, filtered to `--code-root`) | fires only when the write target does not exist yet and its extension is wired for this project; injects one reminder to search the code index first, plus the search fallback (see below) appended to that same reminder. Separately (newlang-nudge): when the extension is one the engine supports but this project never wired, injects a structured, numbered decision point (wire it / decline it permanently via `--never-ext` / not now) naming the language -- deduped once per language per session. The log-only DETECTION outcome (`outcome=language-available-not-wired`) still fires on every occurrence regardless of `--code-root`, unchanged and pre-existing; the VISIBLE decision point is gated on the SAME `--code-root` containment as the wired-file reminder |
 | `ledger-post-edit.sh` | `PostToolUse` (every tool; no settings-level matcher) | a bash-only prefilter exits before the watchdog for read-only built-ins (`Read`, `Grep`, ...); `Edit`/`Write`/`MultiEdit`/`NotebookEdit` ledger the tool's own file path (`source: tool`); `Bash` and any tool this hook has no dedicated branch for fall through to a shell-diff (`git status`) tree comparison against a per-root baseline (`source: shell-diff`); an unrecognized or missing `tool_name` additionally logs `outcome=unsupported-mutation-surface` |
 | `precompact-persist.sh` | `PreCompact` | persists session state before context is compacted away |
@@ -1595,9 +1595,11 @@ settings source directory rather than at the filesystem root, so
 `Edit(/abs/path/**)` silently matches nothing. Every rendered filter therefore
 doubles it. `hooks/install-hooks.md` documents the wiring each hook receives.
 
-Each `--code-root` gets its own correctly-scoped entry in both PreToolUse
-hooks: `pre-edit-chain.sh` an `Edit`/`Write` pair, `newfile-nudge.sh` a `Write`
-entry with `MEMCONTINUUM_CODE_ROOT` set to that specific directory. The five
+`newfile-nudge.sh` gets a `Write` entry per `--code-root`, with
+`MEMCONTINUUM_CODE_ROOT` set to that specific directory; `pre-edit-chain.sh`
+gets an `Edit`/`Write` pair per *retrieval root* (the git toplevel of each
+`--code-root`, or the root itself outside git, de-duplicated), each carrying the
+colon-joined retrieval roots as `MEMCONTINUUM_STRIP_PREFIX`. The five
 write-side hooks receive every configured code root: `MEMCONTINUUM_CODE_ROOT`
 carries the first (kept, for a reader that only ever looks at one root) and
 `MEMCONTINUUM_CODE_ROOTS` carries the complete JSON list of physical paths.
@@ -3002,22 +3004,32 @@ worktree on its ancestor chain, or not in any git checkout whatsoever — still
 never spawns git (the bash-only `.git`-entry / `mc_nested_worktree_gitfile`
 gates rule it out first). A worktree edit that DOES need remapping pays one
 `git rev-parse` to resolve the edited file's own identity, plus one more per
-configured root while searching for the match (bounded by the number of
+configured root while searching for the match, plus one `--show-toplevel` call
+for the root that matches (bounded by the number of
 configured roots, typically one or a few) — no longer "a single `git
 rev-parse`" as this section previously (incorrectly) claimed for every case.
 
-This closes the gap in each hook's own logic; it does not change which paths
-the harness LAUNCHES either hook for at all. `pre-edit-chain.sh`'s
-settings-level `"if"` filter is still a literal, per-code-root path glob
-(`templates/code-root-filter-pair.json.tmpl`): a worktree checked out as a
+This closes the gap in each hook's own logic. Which paths the harness LAUNCHES
+a hook for is set by the settings-level filters; with repository-wide
+retrieval filters it widens (an edit in an in-root worktree now launches the
+chain even when the code root is narrower than the checkout). `pre-edit-chain.sh`'s
+settings-level `"if"` filter is still a literal path glob, rendered per
+*retrieval root* (`templates/code-root-filter-pair.json.tmpl`): the git toplevel
+of each `--code-root`, or the root itself outside git, de-duplicated — so a code
+root narrower than its checkout (`<repo>/Sources`) still has the whole checkout
+under the glob and `MEMCONTINUUM_STRIP_PREFIX` is the colon-joined retrieval
+roots. Code roots scope only the index, the new-file nudge and the ledger. The
+worktree remap returns the path under the matching root's own checkout toplevel,
+so a worktree edit under a narrow root is recorded at its real path (or ends
+`out-of-scope`). A worktree checked out as a
 SIBLING of the wired root never reaches the script at all under the current
 settings rendering, so it gets **ledger coverage only** (`ledger-post-edit.sh`
 has no such filter — design R6, "fires for EVERY tool" — and covers it).
-A worktree checked out **INSIDE** the wired root (e.g. `<root>/.worktrees/x`)
+A worktree checked out **INSIDE** the wired repository (e.g. `<repo>/.worktrees/x`)
 DOES reach `pre-edit-chain.sh` and gets full **retrieval and ledger**
 coverage — this is the layout this fix actually closes end-to-end. A project
 that wants retrieval for its own worktrees should therefore keep them inside
-the code root (e.g. `<root>/.worktrees/`, gitignored by that project) rather
+the repository (e.g. `<repo>/.worktrees/`, gitignored by that project) rather
 than as siblings; widening the settings-level glob to also launch
 `pre-edit-chain.sh` for a sibling worktree is a separate, not-yet-done
 follow-up.

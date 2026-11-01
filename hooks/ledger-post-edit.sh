@@ -657,9 +657,11 @@ if [ "$MC_TRY_REMAP" -eq 1 ]; then
             # Re-run the SAME symlink-safe containment loop, against the
             # remapped (main-checkout) path this time, so root selection
             # (longest match) stays exactly the rule the loop above
-            # already uses -- mc_remap_worktree_path only ever returns a
-            # path that sits under some configured root's OWN toplevel, so
-            # this is guaranteed to match at least that root. Reset first
+            # already uses -- mc_remap_worktree_path returns a path under the
+            # TOPLEVEL of the matching root's own checkout, which for a root
+            # narrower than its checkout (<repo>/Sources) is wider than the
+            # root: the re-check may match nothing (a worktree README.md),
+            # and the edit then ends out-of-scope below. Reset first
             # (rather than only ever setting) so the in-root case's
             # PRE-remap match (against the raw, worktree-relative
             # FILE_PATH) is fully replaced by the post-remap one, never
