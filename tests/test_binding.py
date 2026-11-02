@@ -589,6 +589,25 @@ class TestProposeBindings(SessionCase):
         self.assertEqual(rc, 0, err)
         self.assertNotIn("TOP-9001", out)
 
+    def test_stale_index_is_refreshed_before_the_direct_match_exclusion(self):
+        self.add_topic("a", plain_topic("TOP-9001", ["src/other.py"], "Alpha"))
+        self.reindex()
+        # the on-disk store now binds the path; the index has not seen it
+        self.add_topic("a", plain_topic("TOP-9001", ["src/foo.py"], "Alpha"))
+        self.session("s1", [self.ledger_row("src/foo.py")], [self.fallback("src/foo.py", "TOP-9001")])
+        rc, out, err = self.propose()
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("TOP-9001", out)
+
+    def test_removed_binding_no_longer_suppresses_a_proposal(self):
+        self.add_topic("a", plain_topic("TOP-9001", ["src/foo.py"], "Alpha"))
+        self.reindex()
+        self.add_topic("a", plain_topic("TOP-9001", ["src/other.py"], "Alpha"))
+        self.session("s1", [self.ledger_row("src/foo.py")], [self.fallback("src/foo.py", "TOP-9001")])
+        rc, out, err = self.propose()
+        self.assertEqual(rc, 0, err)
+        self.assertIn("TOP-9001  src/foo.py", out)
+
     def test_non_code_and_rootless_ledger_rows_are_never_proposed(self):
         self.add_topic("a", plain_topic("TOP-9001", ["src/other.py"]))
         self.reindex()

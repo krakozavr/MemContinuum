@@ -12043,6 +12043,21 @@ def cmd_propose_bindings(args) -> int:
     )
     db_path = resolve_db_path(args)
 
+    def unmapped_report(paths):
+        ns = argparse.Namespace(root=str(root), project=args.project, db=args.db, paths=paths,
+                                code_root=[str(r) for r in code_roots], json=True)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            cmd_unmapped(ns)
+        try:
+            return json.loads(buf.getvalue())
+        except ValueError:
+            return None
+
+    # Coverage before exclusion: bring a stale decision index current (cmd_unmapped's
+    # own self-heal, run on no paths) BEFORE the direct-match exclusion reads it.
+    unmapped_report([])
+
     conn = None
     if decision_index_state(db_path, args.project, root=root) not in ("missing", "uninitialized"):
         conn = open_db_noncreating(db_path, project=args.project)
@@ -12055,17 +12070,6 @@ def cmd_propose_bindings(args) -> int:
             r["id"] == topic_id
             for cand in candidates for r in topic_matches_for_path(conn, args.project, cand)
         )
-
-    def unmapped_report(paths):
-        ns = argparse.Namespace(root=str(root), project=args.project, db=args.db, paths=paths,
-                                code_root=[str(r) for r in code_roots], json=True)
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
-            cmd_unmapped(ns)
-        try:
-            return json.loads(buf.getvalue())
-        except ValueError:
-            return None
 
     try:
         lines = proposal_lines(state, topic_is_bound, unmapped_report)
