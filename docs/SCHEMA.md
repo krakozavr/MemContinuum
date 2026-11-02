@@ -50,6 +50,47 @@ so the supersession and the pointer update land in the same commit. `memidx.py s
 the whole store's standing links, ordered and capped (§7); `sessionstart-remind.sh` delivers that
 projection at the start of a session, unprompted, before any edit.
 
+### Anchors — what a code reference pointed at when it was bound
+
+A topic may carry an `anchors:` key, written before `links:`. One list item records the SHA-256
+of the code a `code_refs` entry named at the moment the binding was captured, so a later delivery
+can say whether that code has changed **since capture**.
+
+```yaml
+anchors:
+  - ref: "memidx.py#for_path_chain_lines"   # exact code_refs string of this topic
+    link: L3                                 # a link id that exists in links
+    algo: sha256
+    digest: "<64 lowercase hex>"             # SHA-256 of the file bytes (span: file) or of the
+                                             # inclusive start..end line bytes of the one chunk (span: symbol)
+    span: symbol                             # file | symbol
+    captured: bind                           # ruling | bind | backfill
+    captured_at: 2026-11-02
+    code_head: "6228be7"                     # short commit of the code root at capture, or unavailable
+    worktree: clean                          # clean | dirty | unknown (the file's git status at capture)
+    chunker_version: "..."                   # symbol rows only
+```
+
+`captured` says how trustworthy the baseline is: `ruling` (captured in the same commit as the
+link), `bind` (captured when the reference was bound to an existing ruling) or `backfill` (captured
+later from ledgered history, never the bytes at the original ruling). Only a single file or a
+`path#symbol` reference is anchorable; a prefix or a glob has no single byte span and is reported
+"not checked". A `path#symbol` reference whose symbol has no chunk at capture is captured as
+`span: file`; one that matches two or more chunks gets no row ("symbol ambiguous").
+
+`memlint.py` errors on: a `ref` not present verbatim in the topic's `code_refs`; a `link` not in
+`links`; `algo` other than `sha256`; a `digest` that is not 64 lowercase hex characters; an unknown
+`span`, `captured` or `worktree`; a row for a prefix or glob reference; two rows for the same
+`(ref, link)`; `span: symbol` without `chunker_version`; a row without `captured_at`
+(`ref`, `link`, `captured` and `captured_at` together identify a row, so all four are required).
+
+**Anchor rows are append-only**, like links: under `--against-ref`, a row present at `REF`
+(identified by `ref`, `link`, `captured`, `captured_at`) must survive with the same fields and the
+same raw bytes; new rows are free. A recorded row whose identity cannot be built is an error, not
+skipped. One baseline exists per `(ref, link)` in this release — a new
+baseline is a new link. The wording of every delivered line is capture-relative ("anchor changed
+since capture"), and it never changes a link's status or authority.
+
 ## 3. Link (one ruling) — fields, and authority PER FIELD
 
 ```yaml

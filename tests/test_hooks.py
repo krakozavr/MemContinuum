@@ -5,9 +5,11 @@ of its logic -- because the thing under test is the script's environment
 handling (the PYTHONPATH trap, env-driven project/root resolution, fail-open
 behavior) as much as its output shape.
 """
+import contextlib
 import fcntl
 import glob
 import hashlib
+import io
 import json
 import os
 import re
@@ -925,6 +927,184 @@ class TestQueryLib(unittest.TestCase):
         rel = self._source_path(remapped, "/some/unrelated/dir", "/repo-a/")
         self.assertEqual(rel, "src/core/scan/unbound.py")
         self.assertEqual(self._tokens(rel), "scan unbound")
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestPreEditChainAnchors(unittest.TestCase):
+    """0.5.0 PR 2: the hook passes the file being edited as --live-file, and a
+    bound reference whose code changed since capture says so right after the
+    topic header. End to end through hooks/pre-edit-chain.sh."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-hook-anchor-test-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = Path(self.tmp) / "repo"
+        (self.repo / "src").mkdir(parents=True)
+        self.store = Path(self.tmp) / "store"
+        (self.store / "topics").mkdir(parents=True)
+        self.home = Path(self.tmp) / "home"
+        self.home.mkdir()
+        self.project = "hookanchor"
+        (self.repo / "src" / "foo.py").write_text("def alpha():\n    return 1\n")
+        (self.store / "topics" / "a.md").write_text(
+            "---\ntype: topic\nid: TOP-9500\ntitle: Anchored\narea: testing\ncurrent: L1\n"
+            "tags: []\ncode_refs: [src/foo.py]\n"
+            "links:\n  - link: L1\n    date: '2026-01-01'\n    status: active\n    kind: adopted\n"
+            "    ruling: {text: bound ruling, authority: owner-ratified, source: s}\n"
+            "---\n\nBody.\n"
+        )
+        self.db = self.home / f"{self.project}.sqlite"
+
+    def _bind_and_index(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = memidx.main(["bind", "TOP-9500", "src/foo.py", "--root", str(self.store),
+                              "--code-root", str(self.repo)])
+        self.assertEqual(rc, 0)
+        memidx.cmd_reindex(SimpleNamespace(root=str(self.store), project=self.project,
+                                           db=str(self.db), full=True, no_embed=True))
+
+    def _run(self):
+        payload = json.dumps({
+            "hook_event_name": "PreToolUse", "tool_name": "Edit", "cwd": "/elsewhere",
+            "tool_input": {"file_path": str(self.repo / "src" / "foo.py")},
+        })
+        env = clean_env(
+            MEMCONTINUUM_HOME=str(self.home), MEMCONTINUUM_PROJECT=self.project,
+            MEMCONTINUUM_PYTHON=VENV_PYTHON, MEMCONTINUUM_STRIP_PREFIX=f"{self.repo}/",
+            MEMCONTINUUM_ROOT=str(self.store),
+        )
+        proc, _elapsed = run_hook(payload, env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+
+    def test_changed_code_is_announced_after_the_header(self):
+        self._bind_and_index()
+        (self.repo / "src" / "foo.py").write_text("def alpha():\n    return 2\n")
+        ctx = self._run()
+        lines = ctx.splitlines()
+        at = next(i for i, ln in enumerate(lines) if ln.startswith("TOP-9500 Anchored"))
+        self.assertEqual(lines[at + 1], "Anchor changed since capture (bind): src/foo.py")
+        self.assertIn("bound ruling", ctx)
+
+    def test_unchanged_code_adds_no_anchor_line(self):
+        self._bind_and_index()
+        self.assertNotIn("Anchor ", self._run())
+
+    def test_unanchored_reference_says_never_captured(self):
+        memidx.cmd_reindex(SimpleNamespace(root=str(self.store), project=self.project,
+                                           db=str(self.db), full=True, no_embed=True))
+        self.assertIn("Anchor never captured: src/foo.py.", self._run())
+
+    def test_a_slow_code_index_never_costs_the_ruling_chain(self):
+        # gate round 3: _db blocks for 1.5 s; the thread-bounded anchor work
+        # gives up at 0.3 s, so the 2 s watchdog never fires and the chain stays.
+        (self.store / "topics" / "a.md").write_text(
+            "---\ntype: topic\nid: TOP-9500\ntitle: Anchored\narea: testing\ncurrent: L1\n"
+            "tags: []\ncode_refs:\n  - src/foo.py#alpha\n"
+            "links:\n  - link: L1\n    date: '2026-01-01'\n    status: active\n    kind: adopted\n"
+            "    ruling: {text: bound ruling, authority: owner-ratified, source: s}\n"
+            "---\n\nBody.\n"
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = memidx.main(["bind", "TOP-9500", "src/foo.py#alpha", "--root", str(self.store),
+                              "--code-root", str(self.repo)])
+        self.assertEqual(rc, 0)
+        memidx.cmd_reindex(SimpleNamespace(root=str(self.store), project=self.project,
+                                           db=str(self.db), full=True, no_embed=True))
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = memidx.main(["code-reindex", "--code-root", str(self.repo), "--project", self.project,
+                              "--db", str(self.home / f"{self.project}-code.sqlite"),
+                              "--lang", "python", "--no-embed"])
+        self.assertEqual(rc, 0)
+        wrapper = memidx_wrapper_python(
+            self.tmp, "slowdb.sh",
+            "import time\n"
+            "_real = memidx.AnchorChecker._db\n"
+            "def _slow(self):\n"
+            "    time.sleep(1.5)\n"
+            "    return _real(self)\n"
+            "memidx.AnchorChecker._db = _slow")
+        payload = json.dumps({
+            "hook_event_name": "PreToolUse", "tool_name": "Edit", "cwd": "/elsewhere",
+            "tool_input": {"file_path": str(self.repo / "src" / "foo.py")},
+        })
+        env = clean_env(
+            MEMCONTINUUM_HOME=str(self.home), MEMCONTINUUM_PROJECT=self.project,
+            MEMCONTINUUM_PYTHON=str(wrapper), MEMCONTINUUM_STRIP_PREFIX=f"{self.repo}/",
+            MEMCONTINUUM_ROOT=str(self.store),
+        )
+        proc, elapsed = run_hook(payload, env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+        print(f"[round3 hook, slow _db 1.5s -> hook finished in {elapsed:.3f}s]")
+        self.assertIn("bound ruling", ctx)
+        self.assertIn("check budget exhausted", ctx)
+        self.assertNotIn("timed out", ctx)
+
+
+    # -- matcher-derived layouts: the in-root worktree the settings filter admits --
+
+    def _filter_admits(self, tool, file_path):
+        """Whether the rendered `if` filter of code-root-filter-pair.json.tmpl for
+        `tool` admits `file_path` under the code root `self.repo` -- derived from
+        the template itself, not restated here. The filter shape is
+        `Tool(/<root>/**)`: a path-prefix glob."""
+        text = (TOOLS_DIR / "templates" / "code-root-filter-pair.json.tmpl").read_text()
+        text = text.replace("{{CODE_ROOT}}", str(self.repo).lstrip("/"))
+        for m in re.finditer(r'"if":\s*"(\w+)\((/[^)]*)/\*\*\)"', text):
+            if m.group(1) == tool:
+                return file_path.startswith(m.group(2) + "/")
+        self.fail(f"no {tool} filter in the template")
+
+    def _git_repo_with_in_root_worktree(self):
+        for cmd in (["git", "init", "-q"], ["git", "config", "user.email", "t@t.local"],
+                    ["git", "config", "user.name", "t"]):
+            subprocess.run(cmd, cwd=self.repo, check=True)
+        (self.repo / ".gitignore").write_text(".worktrees/\n")
+        subprocess.run(["git", "add", "-A"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=self.repo, check=True)
+        wt = self.repo / ".worktrees" / "feat"
+        subprocess.run(["git", "worktree", "add", "-q", "-b", "wt-anchor", str(wt)],
+                       cwd=self.repo, check=True)
+        return wt
+
+    def _run_on(self, file_path, cwd):
+        payload = json.dumps({
+            "hook_event_name": "PreToolUse", "tool_name": "Edit", "cwd": str(cwd),
+            "tool_input": {"file_path": str(file_path)},
+        })
+        env = clean_env(
+            MEMCONTINUUM_HOME=str(self.home), MEMCONTINUUM_PROJECT=self.project,
+            MEMCONTINUUM_PYTHON=VENV_PYTHON, MEMCONTINUUM_STRIP_PREFIX=f"{self.repo}/",
+            MEMCONTINUUM_ROOT=str(self.store),
+        )
+        proc, _elapsed = run_hook(payload, env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+
+    def test_in_root_worktree_compares_the_worktrees_bytes_not_the_main_checkouts(self):
+        wt = self._git_repo_with_in_root_worktree()
+        wt_file = wt / "src" / "foo.py"
+        for tool in ("Edit", "Write"):
+            self.assertTrue(self._filter_admits(tool, str(wt_file)),
+                            f"the {tool} filter must admit an in-root worktree path")
+        self._bind_and_index()                 # anchor = the main checkout's bytes
+        captured = (self.repo / "src" / "foo.py").read_text()
+        self.assertEqual(wt_file.read_text(), captured)
+
+        # case 1: main edited, worktree still holds the captured bytes -> matched, silent
+        (self.repo / "src" / "foo.py").write_text("def alpha():\n    return 'main differs'\n")
+        ctx = self._run_on(wt_file, self.repo)
+        self.assertIn("TOP-9500", ctx)
+        self.assertNotIn("Anchor ", ctx)
+
+        # case 2: main back to the captured bytes, worktree edited -> changed
+        (self.repo / "src" / "foo.py").write_text(captured)
+        wt_file.write_text("def alpha():\n    return 'worktree differs'\n")
+        ctx = self._run_on(wt_file, self.repo)
+        lines = ctx.splitlines()
+        at = next(i for i, ln in enumerate(lines) if ln.startswith("TOP-9500 Anchored"))
+        self.assertEqual(lines[at + 1], "Anchor changed since capture (bind): src/foo.py")
 
 
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
@@ -2171,6 +2351,69 @@ _SKIP_NO_ORACLE_COMMIT = (
 )
 
 
+# 0.5.0 PR 2: the current hook passes --live-file, so a matched topic gains one
+# "Anchor ..." annotation line the frozen pre-round-5 oracle never prints. That
+# line is the one other intended difference between the two outputs, and the
+# normaliser removes ONLY it: a line that starts with one of the exact header
+# texts AND sits immediately after a topic header line. Any other line -- a
+# ruling continuation that merely begins "Anchor ..." included -- must survive.
+ANCHOR_HEADER_TEXTS = (
+    "Anchor changed since capture (",
+    "Anchor missing: ",
+    "Anchor never captured: ",
+    "Anchor not checked: ",
+)
+_TOPIC_HEADER_LINE_RE = re.compile(r"^\S+ .* \u2014 current: ")
+
+
+def strip_anchor_annotations(stdout_text):
+    """`stdout_text` (a hook's JSON stdout) with annotation lines removed from
+    `additionalContext`, re-serialised; non-JSON text is returned unchanged."""
+    try:
+        doc = json.loads(stdout_text)
+        ctx = doc["hookSpecificOutput"]["additionalContext"]
+    except (ValueError, KeyError, TypeError):
+        return stdout_text
+    kept, prev = [], ""
+    for line in ctx.split("\n"):
+        # `prev` is the preceding ORIGINAL input line, removed or not, so only
+        # the one line right after a topic header can ever be stripped.
+        strip = line.startswith(ANCHOR_HEADER_TEXTS) and _TOPIC_HEADER_LINE_RE.match(prev)
+        prev = line
+        if strip:
+            continue
+        kept.append(line)
+    doc["hookSpecificOutput"]["additionalContext"] = "\n".join(kept)
+    return json.dumps(doc, sort_keys=True, ensure_ascii=False)
+
+
+class TestOracleNormaliserIsNarrow(unittest.TestCase):
+    HEADER = "TOP-9500 Anchored \u2014 current: L1 (active, owner-ratified)"
+
+    def _doc(self, *lines):
+        return json.dumps({"hookSpecificOutput": {"additionalContext": "\n".join(lines)}})
+
+    def test_annotation_after_a_topic_header_is_removed(self):
+        with_note = self._doc("intro", self.HEADER, "Anchor changed since capture (bind): src/foo.py", "  L1 rule")
+        without = self._doc("intro", self.HEADER, "  L1 rule")
+        self.assertEqual(strip_anchor_annotations(with_note), strip_anchor_annotations(without))
+
+    def test_a_ruling_continuation_beginning_anchor_survives(self):
+        text = self._doc("intro", self.HEADER, "Anchor do not delete this rule", "  L1 rule")
+        self.assertIn("Anchor do not delete this rule", strip_anchor_annotations(text))
+
+    def test_only_the_one_line_after_the_header_is_stripped(self):
+        text = self._doc("intro", self.HEADER, "Anchor changed since capture (bind): src/foo.py",
+                         "Anchor missing: ruling continuation", "  L1 rule")
+        out = strip_anchor_annotations(text)
+        self.assertIn("Anchor missing: ruling continuation", out)
+        self.assertNotIn("since capture", out)
+
+    def test_a_header_text_not_right_after_a_topic_header_survives(self):
+        text = self._doc("intro", "Anchor missing: src/foo.py (file gone).", self.HEADER)
+        self.assertIn("Anchor missing: src/foo.py", strip_anchor_annotations(text))
+
+
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
 @unittest.skipUnless(_ORACLE_COMMIT_AVAILABLE, _SKIP_NO_ORACLE_COMMIT)
 class TestPreEditChainOracleParity(unittest.TestCase):
@@ -2205,6 +2448,7 @@ class TestPreEditChainOracleParity(unittest.TestCase):
 
     def _assert_stdout_matches_except_topic_count(self, new_stdout, oracle_stdout):
         def _normalized(text):
+            text = strip_anchor_annotations(text)
             return self._TOPIC_COUNT_HEADER_RE.sub(
                 "Decision-chain memory: N topic(s) reference this file.", text
             )

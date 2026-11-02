@@ -30,6 +30,7 @@ import shlex
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import urllib.parse
@@ -349,7 +350,7 @@ FALLBACK_SCALAR_FIELDS = {
 FALLBACK_COMPLEX_FIELDS = {
     "links", "code_refs", "tags", "edges", "assumptions", "invariant",
     "metadata", "ruling", "rationale", "alternatives", "evidence",
-    "implemented_by", "tested_by", "governed_by", "involved_in",
+    "implemented_by", "tested_by", "governed_by", "involved_in", "anchors",
 }
 
 
@@ -490,6 +491,10 @@ def validate_record_shape(fm: dict) -> list:
 
     if not _shape_ok_mapping(fm.get("metadata")):
         diagnostics.append(("metadata", "metadata must be a mapping"))
+
+    anchors = fm.get("anchors")
+    if anchors and (not isinstance(anchors, list) or any(not isinstance(a, dict) for a in anchors)):
+        diagnostics.append(("anchors", "anchors must be a list of mappings"))
 
     links = fm.get("links")
     if links:
@@ -1401,7 +1406,7 @@ def _classify_index_state(
     return "current"
 
 
-def open_db_readonly(db_path: Path) -> sqlite3.Connection | None:
+def open_db_readonly(db_path: Path, timeout: float = 5.0, check_same_thread: bool = True) -> sqlite3.Connection | None:
     """SQLite URI mode=ro: opens an EXISTING file strictly read-only --
     unlike open_db_noncreating's mode=rw, this NEVER runs
     `_run_decision_migration_guards` (which can ALTER a table, CREATE
@@ -1414,7 +1419,8 @@ def open_db_readonly(db_path: Path) -> sqlite3.Connection | None:
     OperationalError opening it, e.g. a locked/corrupt file) -- same
     degrade-to-named-refusal shape as open_db_noncreating."""
     try:
-        conn = sqlite3.connect(f"file:{quote(db_path.as_posix())}?mode=ro", uri=True)
+        conn = sqlite3.connect(f"file:{quote(db_path.as_posix())}?mode=ro", uri=True, timeout=timeout,
+                               check_same_thread=check_same_thread)
     except sqlite3.OperationalError:
         return None
     conn.row_factory = sqlite3.Row
@@ -4225,6 +4231,492 @@ def fragment_matches_symbol(frag: str, symbol: str, qualified_name: str) -> bool
     return frag == symbol or frag == qualified_name or qualified_name.endswith("." + frag)
 
 
+# ---------------------------------------------------------------------------
+# anchors (0.5.0 PR 2): the `anchors:` frontmatter key records the SHA-256 of
+# the code a code_refs entry named when the binding was captured; delivery
+# later compares the live bytes against it. The vocabulary and the pure
+# helpers live here, beside code_ref_matches, so memlint, the capture
+# commands and the three delivery routes share one definition.
+# ---------------------------------------------------------------------------
+
+ANCHOR_ALGO = "sha256"
+ANCHOR_SPANS = ("file", "symbol")
+ANCHOR_CAPTURE_KINDS = ("ruling", "bind", "backfill")
+ANCHOR_WORKTREE_STATES = ("clean", "dirty", "unknown")
+ANCHOR_DIGEST_RE = re.compile(r"[0-9a-f]{64}")  # use .fullmatch()
+_CODE_REF_GLOB_CHARS = ("*", "?", "[")
+
+
+def sha256_hex(data: bytes) -> str:
+    """The one SHA-256-of-bytes helper of the anchor feature: the same
+    digest hooks/ledger-post-edit.sh stores as `content_sha256` and
+    `file_sha.sha256` holds, so capture and delivery never disagree on it."""
+    return hashlib.sha256(data).hexdigest()
+
+
+def code_ref_split(code_ref: str) -> tuple:
+    """`(path, fragment_or_None)` of a code_refs entry; the path keeps its
+    spelling except that trailing slashes are dropped."""
+    path, sep, frag = str(code_ref).partition("#")
+    return path.rstrip("/"), (frag if sep else None)
+
+
+def code_ref_is_anchorable(code_ref: str) -> bool:
+    """True iff a code_refs entry names ONE file (optionally `#symbol`) --
+    not a prefix (trailing slash) and not a glob. Prefix and glob entries
+    are "not checked" by definition: there is no single byte span to
+    anchor. A directory written without a trailing slash cannot be told
+    apart from a file without touching the disk; `bind` checks the disk."""
+    ref = str(code_ref)
+    if not code_ref_is_named(ref):
+        return False
+    raw_path = ref.split("#", 1)[0]
+    if raw_path.endswith("/"):
+        return False
+    return not any(ch in raw_path for ch in _CODE_REF_GLOB_CHARS)
+
+
+def code_ref_matches_exact(file_path: str, code_ref: str) -> bool:
+    """The exact-path counterpart of code_ref_matches, for anchor rows:
+    True iff `code_ref` is anchorable and its path part IS `file_path`
+    (no prefix containment, no glob). code_ref_matches keeps its own
+    looser rule untouched."""
+    if not code_ref_is_anchorable(code_ref):
+        return False
+    return code_ref_split(code_ref)[0] == str(file_path).rstrip("/")
+
+
+def anchor_rows(fm: dict) -> list:
+    """The well-formed (mapping) rows of a record's `anchors:` list; [] for
+    an absent or wrongly shaped key (validate_record_shape reports that)."""
+    rows = fm.get("anchors")
+    if not isinstance(rows, list):
+        return []
+    return [r for r in rows if isinstance(r, dict)]
+
+
+def anchor_row_key(row: dict) -> tuple:
+    """One baseline per `(ref, link)` in this release."""
+    return (str(row.get("ref")), str(row.get("link")))
+
+
+# ---------------------------------------------------------------------------
+# anchors: delivery -- one status computation, three routes render from it
+# ---------------------------------------------------------------------------
+#
+# READ-ONLY and CHUNKER-FREE by construction: nothing below imports a chunker,
+# calls open_code_db / code_index_report / validate_chunk_result, or writes
+# anywhere. Live bytes come from the caller (the hook's file, or a code root);
+# a symbol span is looked up in the code index opened `?mode=ro` and trusted
+# only when file_sha.sha256 equals the live file's hash. Capture (above, in
+# the bind block) is the only anchor code allowed to run a chunker.
+
+ANCHOR_BUDGET_SECONDS = 0.3
+ANCHOR_MAX_FILE_BYTES = 8 * 1024 * 1024  # a larger live file is never read under a budget
+ANCHOR_STATUS_PRIORITY = ("changed", "missing", "never", "not_checked")
+ANCHOR_MISSING_REASONS = (
+    "file gone", "symbol absent", "symbol ambiguous", "snapshot unavailable",
+    "index stale", "check budget exhausted",
+)
+
+
+def anchor_pick_row(rows: list, ref: str, current_link: str | None) -> dict | None:
+    """The anchor row delivery compares for `ref`: the one for the topic's
+    current link when present, else the newest (last) row for that ref."""
+    mine = [r for r in rows if str(r.get("ref")) == ref]
+    for row in mine:
+        if current_link is not None and str(row.get("link")) == current_link:
+            return row
+    return mine[-1] if mine else None
+
+
+class AnchorFileTooLarge(Exception):
+    """A live file over ANCHOR_MAX_FILE_BYTES: reported as budget-exhausted
+    without reading it."""
+
+
+def _run_anchor_worker(deadline: float, work) -> bool:
+    """Run `work()` in ONE daemon thread and wait for it at most until
+    `deadline` (a time.monotonic() value). True = it finished in time; False =
+    the caller stops waiting and the thread is left to wind down (the SQLite
+    progress handler aborts a running query once the deadline has passed)."""
+    thread = threading.Thread(target=work, name="anchor-worker", daemon=True)
+    thread.start()
+    thread.join(max(0.0, deadline - time.monotonic()))
+    return not thread.is_alive()
+
+
+class AnchorChecker:
+    """Compares anchor rows against live bytes. `live_bytes(ref_path)` returns
+    the live file's bytes or None; `is_dir(ref_path)` (optional) says a path
+    is a directory. `code_db` is the code index path, opened `?mode=ro` on
+    first use only. `deadline` is a `time.monotonic()` value."""
+
+    def __init__(self, project: str, live_bytes, code_db=None, deadline=None, is_dir=None):
+        self.project = project
+        self.live_bytes = live_bytes
+        self.code_db = Path(code_db) if code_db else None
+        self.deadline = deadline
+        self.is_dir = is_dir or (lambda _p: False)
+        self._conn = None
+        self._tried = False
+
+    def _deadline_passed(self) -> bool:
+        """The ONE budget test: asked before every file read, hash, SQL query
+        and topic-file parse of the anchor work, so the budget bounds the work
+        and not just its start."""
+        return self.deadline is not None and time.monotonic() > self.deadline
+
+    def _db(self):
+        if not self._tried:
+            self._tried = True
+            if self.code_db is not None and self.code_db.exists():
+                # a blocked open waits at most the smaller of 0.2 s and what is left
+                wait = 0.2
+                if self.deadline is not None:
+                    wait = max(0.001, min(wait, self.deadline - time.monotonic()))
+                self._conn = open_db_readonly(self.code_db, timeout=wait, check_same_thread=False)
+                if self._conn is not None and self.deadline is not None:
+                    # a running query is interrupted once the budget is spent
+                    # (sqlite raises OperationalError "interrupted")
+                    self._conn.set_progress_handler(
+                        lambda: 1 if self._deadline_passed() else 0, 1000)
+        return self._conn
+
+    def close(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except sqlite3.Error:
+                pass
+            self._conn = None
+
+    def check(self, row: dict) -> tuple:
+        """`_check` with the clock consulted on EVERY exception exit: past the
+        deadline an error (an interrupted query, an oversize file) is the
+        exhausted verdict, never another reason."""
+        exhausted = ("missing", "check budget exhausted")
+        try:
+            verdict = self._check(row)
+        except AnchorFileTooLarge:
+            return exhausted
+        except Exception:
+            if self._deadline_passed():
+                return exhausted
+            raise
+        if verdict[1] == "snapshot unavailable" and self._deadline_passed():
+            return exhausted
+        return verdict
+
+    def _check(self, row: dict) -> tuple:
+        """`("ok" | "changed" | "missing", reason)` for one anchor row. The
+        deadline is asked before AND after every expensive step (file read,
+        hash, code-index open, each SQL query); a verdict is returned only when
+        the clock has not passed the deadline after the step that produced it."""
+        exhausted = ("missing", "check budget exhausted")
+        if self._deadline_passed():
+            return exhausted
+        ref_path, frag = code_ref_split(str(row.get("ref")))
+        data = self.live_bytes(ref_path)
+        if self._deadline_passed():
+            return exhausted
+        if data is None:
+            return "missing", "file gone"
+        if row.get("span") != "symbol" or frag is None:
+            same = sha256_hex(data) == str(row.get("digest"))
+            if self._deadline_passed():
+                return exhausted
+            return ("ok" if same else "changed"), ""
+        conn = self._db()
+        if self._deadline_passed():
+            return exhausted
+        if conn is None:
+            return "missing", "snapshot unavailable"
+        live_sha = sha256_hex(data)
+        if self._deadline_passed():
+            return exhausted
+        try:
+            shas = conn.execute(
+                "SELECT code_root, sha256 FROM file_sha WHERE project=? AND path=?",
+                (self.project, ref_path)).fetchall()
+            if self._deadline_passed():
+                return exhausted
+            if not shas:
+                return "missing", "snapshot unavailable"
+            roots = [r["code_root"] for r in shas if r["sha256"] == live_sha]
+            if not roots:
+                return "missing", "index stale"
+            marks = ",".join("?" * len(roots))
+            chunks = conn.execute(
+                f"SELECT symbol, qualified_name, start_line, end_line FROM chunks "
+                f"WHERE project=? AND path=? AND code_root IN ({marks})",
+                (self.project, ref_path, *roots)).fetchall()
+        except sqlite3.Error:
+            if self._deadline_passed():
+                return exhausted
+            return "missing", "snapshot unavailable"
+        if self._deadline_passed():
+            return exhausted
+        ranges = sorted({
+            (c["start_line"], c["end_line"]) for c in chunks
+            if fragment_matches_symbol(frag, c["symbol"], c["qualified_name"])
+        })
+        if not ranges:
+            return "missing", "symbol absent"
+        if len(ranges) > 1:
+            return "missing", "symbol ambiguous"
+        same = sha256_hex(anchor_span_bytes(data, *ranges[0])) == str(row.get("digest"))
+        if self._deadline_passed():
+            return exhausted
+        return ("ok" if same else "changed"), ""
+
+
+def anchor_statuses(fm: dict, refs: list, checker: AnchorChecker, exact_path: str | None = None) -> list:
+    """Status of each of `refs` (strings from the topic's code_refs) as dicts
+    `{ref, kind, detail, row}` with kind in changed / missing / never /
+    not_checked; a ref whose live bytes match its anchor yields nothing
+    (silence). A prefix, a glob, a directory, or -- when `exact_path` is given
+    (the pre-edit route) -- a ref naming a different file than the one being
+    edited, is "not checked"."""
+    rows = anchor_rows(fm)
+    current = _topic_current_link(fm)
+    out = []
+    for ref in refs:
+        ref_path = code_ref_split(ref)[0]
+        if (not code_ref_is_anchorable(ref)
+                or (exact_path is not None and not code_ref_matches_exact(exact_path, ref))):
+            out.append({"ref": ref, "kind": "not_checked", "detail": "", "row": None})
+            continue
+        row = anchor_pick_row(rows, ref, current)
+        if row is None:
+            if checker._deadline_passed():
+                # after exhaustion an unanchored ref is not labelled "never"
+                out.append({"ref": ref, "kind": "missing", "detail": "check budget exhausted", "row": None})
+                continue
+            kind = "not_checked" if checker.is_dir(ref_path) else "never"
+            out.append({"ref": ref, "kind": kind, "detail": "", "row": None})
+            continue
+        verdict, reason = checker.check(row)
+        if verdict == "changed":
+            out.append({"ref": ref, "kind": "changed", "detail": str(row.get("captured")), "row": row})
+        elif verdict == "missing":
+            out.append({"ref": ref, "kind": "missing", "detail": reason, "row": row})
+    return out
+
+
+def anchor_header_line(statuses: list) -> str | None:
+    """The one annotation line for a topic: the highest-priority status
+    (changed, missing, never captured, not checked), one ref named, `(+N
+    more)` for the other refs of the same status. None = silence."""
+    for kind in ANCHOR_STATUS_PRIORITY:
+        same = [s for s in statuses if s["kind"] == kind]
+        if not same:
+            continue
+        first, more = same[0], len(same) - 1
+        tail = f" (+{more} more)" if more else ""
+        if kind == "changed":
+            line = f"Anchor changed since capture ({first['detail']}): {first['ref']}{tail}"
+        elif kind == "missing":
+            line = f"Anchor missing: {first['ref']} ({first['detail']}){tail}."
+        elif kind == "never":
+            line = f"Anchor never captured: {first['ref']}{tail}."
+        else:
+            line = f"Anchor not checked: {first['ref']} is a prefix or glob{tail}."
+        row = first["row"]
+        if row is not None and row.get("captured") == "backfill":
+            line += f" Captured at backfill {row.get('captured_at')}; original ruling bytes unknown."
+        return line
+    return None
+
+
+def _live_bytes_from_roots(code_roots: list, max_bytes=None):
+    """`live_bytes(ref_path)` over a list of code roots (first hit wins). With
+    `max_bytes`, a larger file raises AnchorFileTooLarge before any read."""
+    def live(ref_path):
+        for root in code_roots:
+            try:
+                if max_bytes is not None and (Path(root) / ref_path).stat().st_size > max_bytes:
+                    raise AnchorFileTooLarge(ref_path)
+                return (Path(root) / ref_path).read_bytes()
+            except OSError:
+                continue
+        return None
+    return live
+
+
+def anchor_checker_for_roots(project: str, code_roots: list, code_db=None, deadline=None) -> AnchorChecker:
+    """The standing / context-pack checker: live bytes from `code_roots`."""
+    return AnchorChecker(
+        project,
+        # no deadline = the pack route: unbounded by design (reproducible bytes), so no size cap either
+        _live_bytes_from_roots(code_roots, ANCHOR_MAX_FILE_BYTES if deadline is not None else None),
+        code_db=code_db, deadline=deadline,
+        is_dir=lambda p: any((Path(r) / p).is_dir() for r in code_roots),
+    )
+
+
+def for_path_anchor_notes(matches, candidate: str, live_file: str, project: str, code_db=None) -> dict:
+    """`{topic id: annotation line}` for the topics matching `candidate`,
+    compared against `live_file`'s bytes (the file being edited). Only a ref
+    whose path IS the candidate is compared; a prefix/glob that matched is
+    "not checked". Bounded by ANCHOR_BUDGET_SECONDS."""
+    deadline = time.monotonic() + ANCHOR_BUDGET_SECONDS
+    cache: list = []
+
+    def live(ref_path):
+        if ref_path != candidate:
+            return None
+        if not cache:
+            try:
+                if Path(live_file).stat().st_size > ANCHOR_MAX_FILE_BYTES:
+                    raise AnchorFileTooLarge(live_file)
+                cache.append(Path(live_file).read_bytes())
+            except OSError:
+                cache.append(None)
+        return cache[0]
+
+    checker = AnchorChecker(project, live, code_db=code_db, deadline=deadline)
+    exhausted_line = anchor_header_line([
+        {"ref": candidate, "kind": "missing", "detail": "check budget exhausted", "row": None}])
+    done: dict = {}   # topic id -> line or None; a topic is entered only when COMPLETE
+    failure: list = []
+
+    def work():
+        try:
+            for row in matches:
+                if checker._deadline_passed():
+                    # the topic is not even parsed: name the file that could not be checked
+                    done[row["id"]] = exhausted_line
+                    continue
+                fm = parse_record(Path(row["path"])).frontmatter
+                if checker._deadline_passed():
+                    # the parse itself crossed the budget: no verdict from it is accepted
+                    done[row["id"]] = exhausted_line
+                    continue
+                refs = [str(r) for r in fm.get("code_refs") or [] if code_ref_matches(candidate, str(r))]
+                statuses = anchor_statuses(fm, refs, checker, exact_path=candidate)
+                if any(st["kind"] == "missing" and st["detail"] == "check budget exhausted"
+                       for st in statuses):
+                    # a ref ran out of budget: no partial statuses, only the exhausted header
+                    done[row["id"]] = exhausted_line
+                else:
+                    done[row["id"]] = anchor_header_line(statuses)
+        except Exception as exc:  # re-raised below so the caller fails open as before
+            failure.append(exc)
+        finally:
+            checker.close()
+
+    finished = _run_anchor_worker(deadline, work)
+    if failure and finished:
+        raise failure[0]
+    notes = {}
+    for row in matches:
+        line = done[row["id"]] if row["id"] in done else exhausted_line
+        if line:
+            notes[row["id"]] = line
+    return notes
+
+
+def topic_anchor_statuses(fm: dict, checker: AnchorChecker) -> list:
+    """Statuses of ALL of a topic's code_refs (the standing and context-pack
+    routes have no single edited file, unlike the pre-edit route)."""
+    return anchor_statuses(fm, [str(r) for r in fm.get("code_refs") or []], checker)
+
+
+def standing_anchor_summary(conn, project: str, topic_ids: list, code_roots: list, code_db=None) -> dict:
+    """Counts over the references of the topics that carry standing links:
+    `{changed, missing, never, not_checked}` (references, not topics), or
+    `{"skipped": "no-root"}` without any code root -- the live bytes come from
+    the code roots, and a standing line that guessed would be worse than none.
+    Bounded by ANCHOR_BUDGET_SECONDS; read-only and chunker-free."""
+    if not code_roots:
+        return {"skipped": "no-root"}
+    counts = {"changed": 0, "missing": 0, "never": 0, "not_checked": 0}
+    deadline = time.monotonic() + ANCHOR_BUDGET_SECONDS
+    checker = anchor_checker_for_roots(project, code_roots, code_db=code_db, deadline=deadline)
+    # The whole per-topic loop -- the decision-index SELECT, the parse, the file
+    # reads and the code-index queries -- runs in ONE daemon worker joined for
+    # what is left of the budget. The worker reads the decision index through
+    # its OWN read-only connection (check_same_thread=False, progress handler),
+    # opened on the file the caller's connection is attached to.
+    try:
+        main_file = conn.execute("PRAGMA database_list").fetchone()[2]
+    except Exception:
+        main_file = ""
+    done: dict = {}   # topic id -> list of status kinds, or None = unchecked; entered only when COMPLETE
+    failure: list = []
+
+    def work():
+        dconn = None
+        try:
+            dconn = open_db_readonly(
+                Path(main_file), timeout=max(0.001, min(0.2, deadline - time.monotonic())),
+                check_same_thread=False) if main_file else None
+            if dconn is None:
+                # never borrow the caller's connection from this thread: every topic is unchecked
+                for tid in topic_ids:
+                    done[tid] = None
+                return
+            dconn.set_progress_handler(lambda: 1 if checker._deadline_passed() else 0, 1000)
+            lookup = dconn
+            for tid in topic_ids:
+                if checker._deadline_passed():
+                    done[tid] = None
+                    continue
+                row = lookup.execute(
+                    "SELECT path FROM records WHERE project=? AND type='topic' AND id=?",
+                    (project, tid)).fetchone()
+                if checker._deadline_passed():
+                    done[tid] = None
+                    continue
+                if row is None:
+                    done[tid] = []
+                    continue
+                fm = parse_record(Path(row["path"])).frontmatter
+                if checker._deadline_passed():
+                    done[tid] = None
+                    continue
+                statuses = topic_anchor_statuses(fm, checker)
+                if any(st["kind"] == "missing" and st["detail"] == "check budget exhausted"
+                       for st in statuses):
+                    done[tid] = None     # exhausted after it started: unchecked, never missing
+                else:
+                    done[tid] = [st["kind"] for st in statuses]
+        except Exception as exc:  # re-raised below so the caller fails open as before
+            if checker._deadline_passed():
+                return                # an interrupted lookup: the topics stay unreported
+            failure.append(exc)
+        finally:
+            if dconn is not None:
+                try:
+                    dconn.close()
+                except sqlite3.Error:
+                    pass
+            checker.close()
+
+    finished = _run_anchor_worker(deadline, work)
+    if failure and finished:
+        raise failure[0]
+    for tid in topic_ids:
+        kinds = done.get(tid)
+        if kinds is None:
+            counts["unchecked"] = counts.get("unchecked", 0) + 1
+        else:
+            for kind in kinds:
+                counts[kind] += 1
+    return counts
+
+
+def standing_anchor_line(summary: dict) -> str:
+    """The ONE summary line sessionstart-remind.sh appends after the digest:
+    changed, else missing, else never captured; "not checked" is omitted."""
+    for key, text in (("changed", "Anchor changed since capture"), ("missing", "Anchor missing"),
+                      ("never", "Anchor never captured")):
+        if summary.get(key):
+            return f"{text}: {summary[key]}."
+    return ""
+
+
 _GENERIC_UNCHECKABLE_REMEDY = (
     "run backend-preflight, and check whether this file itself can be read"
 )
@@ -4437,7 +4929,7 @@ def topic_chain_json(conn, topic_row) -> dict:
     )
 
 
-def topic_chain_lines(conn, topic_row) -> list:
+def topic_chain_lines(conn, topic_row, annotation: str | None = None) -> list:
     """The plain-text chain-view lines for one topic row -- factored out of
     print_topic_chain so `for-path`'s own renderer (for_path_chain_lines,
     below) can build the exact same text without printing it (round 5: one
@@ -4446,11 +4938,16 @@ def topic_chain_lines(conn, topic_row) -> list:
     link_rows = conn.execute(
         "SELECT * FROM links WHERE topic_path=? ORDER BY seq ASC", (topic_row["path"],)
     ).fetchall()
-    return chain_lines(
+    lines = chain_lines(
         topic_row, link_rows,
         edges_for_topic(conn, topic_row["path"]),
         assumptions_for_topic(conn, topic_row["path"]),
     )
+    if annotation:
+        # PR 2 anchors: one line right after the header, before the links; it
+        # is never a ruling, status or authority line.
+        lines.insert(1, annotation)
+    return lines
 
 
 def _lines_cost(lines) -> int:
@@ -4637,16 +5134,18 @@ def resolve_path_governance(conn, project: str, file_path: str) -> tuple:
     return matches, pairs
 
 
-def for_path_chain_lines(conn, project: str, matches, concept_pairs) -> list:
+def for_path_chain_lines(conn, project: str, matches, concept_pairs, anchor_notes: dict | None = None) -> list:
     """`for-path`'s plain-text rendering, shared by its own non-JSON CLI
     mode and by `--json --with-chain-text` (round 5): one function, one
     text, whichever mode asks for it -- no duplicated formatting.
-    `concept_pairs` is resolve_path_governance's second element."""
+    `concept_pairs` is resolve_path_governance's second element.
+    `anchor_notes` ({topic id: line}, from for_path_anchor_notes) adds the
+    anchor annotation right after each matched topic's header."""
     lines = []
     if not matches and not concept_pairs:
         lines.append("no topics reference this path")
     for row in matches:
-        lines.extend(topic_chain_lines(conn, row))
+        lines.extend(topic_chain_lines(conn, row, (anchor_notes or {}).get(row["id"])))
     for crow, governed in concept_pairs:
         lines.append(f"{crow['id']} {crow['title']} — {crow['owner_boundary']}")
         for trow in governed:
@@ -4693,6 +5192,20 @@ def cmd_for_path(args) -> int:
         if state in ("upgrade-required", "stale", "quarantined"):
             _decision_warn("for-path", args, state, conn=conn)
         matches, concept_pairs = resolve_path_governance(conn, args.project, args.file_path)
+        anchor_notes = {}
+        if getattr(args, "live_file", None) and matches:
+            # Fail open: a hook-facing reader never turns an anchor-check
+            # problem into a missing ruling.
+            try:
+                anchor_notes = for_path_anchor_notes(
+                    matches, args.file_path, args.live_file, args.project,
+                    code_db=resolve_code_db_path(argparse.Namespace(
+                        db=getattr(args, "code_db", None), project=args.project)),
+                )
+            except Exception:
+                if DEBUG:
+                    raise
+                anchor_notes = {}
 
         if args.json:
             out = [topic_chain_json(conn, row) for row in matches]
@@ -4712,7 +5225,7 @@ def cmd_for_path(args) -> int:
                     payload["state"] = state
                 payload["results"] = out
                 payload["chain_text"] = "\n".join(
-                    for_path_chain_lines(conn, args.project, matches, concept_pairs)
+                    for_path_chain_lines(conn, args.project, matches, concept_pairs, anchor_notes)
                 )
                 print(json.dumps(payload, indent=2))
             elif state_worth_naming:
@@ -4720,7 +5233,7 @@ def cmd_for_path(args) -> int:
             else:
                 print(json.dumps(out, indent=2))
         else:
-            for line in for_path_chain_lines(conn, args.project, matches, concept_pairs):
+            for line in for_path_chain_lines(conn, args.project, matches, concept_pairs, anchor_notes):
                 print(line)
         conn.close()
         return 0
@@ -6125,8 +6638,22 @@ def cmd_standing(args) -> int:
             print(json.dumps({"state": "missing", "links": 0, "lines": []}, indent=2))
         return 1
 
+    anchor_summary = None
     try:
         entries = standing_entries(conn, args.project)
+        if args.json:
+            # Fail open: an anchor problem never costs the digest.
+            try:
+                anchor_summary = standing_anchor_summary(
+                    conn, args.project, sorted({e[0] for e in entries}),
+                    _code_roots_arg(getattr(args, "code_root", None)),
+                    code_db=resolve_code_db_path(argparse.Namespace(
+                        db=getattr(args, "code_db", None), project=args.project)),
+                )
+            except Exception:
+                if DEBUG:
+                    raise
+                anchor_summary = {"skipped": "error"}
     finally:
         conn.close()
 
@@ -6156,6 +6683,15 @@ def cmd_standing(args) -> int:
             "bytes": digest_bytes,
             "lines": lines,
         }
+        if anchor_summary is not None:
+            anchor_line = standing_anchor_line(anchor_summary)
+            # The summary is the first thing dropped when the cap bites: the
+            # digest itself is never shortened to make room for it.
+            if anchor_line and len((digest_text + "\n" + anchor_line).encode("utf-8")) > STANDING_CAP_BYTES:
+                anchor_line = ""
+                anchor_summary = dict(anchor_summary, dropped="cap")
+            payload["anchor_summary"] = anchor_summary
+            payload["anchor_line"] = anchor_line
         print(json.dumps(payload, indent=2))
     else:
         print(digest_text)
@@ -6280,7 +6816,8 @@ def _pack_topic_variants(conn, topic_row) -> list:
 
 
 def build_context_pack(conn, project: str, files: list, topic_ids: list, query: str | None,
-                       store: str, state: str, max_bytes: int) -> dict:
+                       store: str, state: str, max_bytes: int,
+                       anchor_roots: list | None = None, code_db=None) -> dict:
     """Assemble the pack (see cmd_context_pack). Returns the JSON envelope
     minus the hash fields -- {text, topics, omitted, standing_omitted} -- or
     {"error": msg} when even the fixed part exceeds `max_bytes`. Pure over
@@ -6379,6 +6916,8 @@ def build_context_pack(conn, project: str, files: list, topic_ids: list, query: 
                 break
         else:
             break   # whole topics from the tail: this and every later one is omitted
+    if anchor_roots:
+        sel = _pack_add_anchor_lines(conn, project, sel, render, size, max_bytes, anchor_roots, code_db)
     text = render(sel)
     topics = [{"id": tid, "via": list(v)} for tid, v in standing_via.items()]
     by_id = {t["id"]: t for t in topics}
@@ -6392,6 +6931,52 @@ def build_context_pack(conn, project: str, files: list, topic_ids: list, query: 
     shown_ids = {id(c) for c, _ in sel}
     return {"text": text, "topics": topics, "standing_omitted": standing_omitted,
             "omitted": [c["id"] for c in ranked if id(c) not in shown_ids]}
+
+
+def _pack_add_anchor_lines(conn, project: str, sel: list, render, size, max_bytes: int,
+                           anchor_roots: list, code_db) -> list:
+    """Add one anchor line above each selected topic's chain (after its
+    `[record file: ...]` line), but only as the cap allows and never at a
+    topic's expense: topics were already chosen without them. Every topic is
+    annotated, then annotations are removed in the cut order -- not checked,
+    never captured, missing, changed -- one at a time until the pack fits, so under a tight
+    cap "not checked" goes first and "changed" last. The line is never a
+    ruling, status or authority line; its bytes are inside the pack hash. No deadline: a pack must be reproducible byte for
+    byte, so the same files give the same pack. Read-only and chunker-free."""
+    checker = anchor_checker_for_roots(project, anchor_roots, code_db=code_db)
+    notes: dict = {}
+    try:
+        for c, _lines in sel:
+            try:
+                fm = parse_record(Path(c["row"]["path"])).frontmatter
+                statuses = topic_anchor_statuses(fm, checker)
+            except (OSError, sqlite3.Error):
+                continue
+            line = anchor_header_line(statuses)
+            if line:
+                kind = next(k for k in ANCHOR_STATUS_PRIORITY if any(s["kind"] == k for s in statuses))
+                notes[id(c)] = (kind, line)
+    finally:
+        checker.close()
+    # Literal cut order: annotate EVERY selected topic, then remove annotations
+    # kind by kind -- not checked, never captured, missing, changed -- until the
+    # pack fits. Chains stay exactly as selected; a long `changed` line is never
+    # dropped in favour of a shorter, lower-priority one.
+    annotated = [
+        (c, [lines[0], notes[id(c)][1]] + lines[1:]) if id(c) in notes else (c, lines)
+        for c, lines in sel
+    ]
+    # One annotation at a time (lowest-ranked topic first within a priority),
+    # capacity re-checked after each removal, so room for one of two changed
+    # annotations keeps one.
+    for cut in reversed(ANCHOR_STATUS_PRIORITY):
+        for i in range(len(annotated) - 1, -1, -1):
+            if size(render(annotated)) <= max_bytes:
+                return annotated
+            c, lines = annotated[i]
+            if id(c) in notes and notes[id(c)][0] == cut:
+                annotated[i] = (c, lines[:1] + lines[2:])
+    return annotated
 
 
 def _pack_refusal(args, rc: int, message: str, **extra) -> int:
@@ -6448,6 +7033,9 @@ def cmd_context_pack(args) -> int:
         built = build_context_pack(
             conn, args.project, files, list(getattr(args, "topic", None) or []),
             getattr(args, "query", None), store, state, max_bytes,
+            anchor_roots=_code_roots_arg(getattr(args, "code_root", None)),
+            code_db=resolve_code_db_path(argparse.Namespace(
+                db=getattr(args, "code_db", None), project=args.project)),
         )
     except (sqlite3.OperationalError, IndexError):
         # A legacy schema the read-only open cannot read (a missing column).
@@ -11097,6 +11685,700 @@ def cmd_stats(args) -> int:
 
 
 # ---------------------------------------------------------------------------
+# anchors: capture (bind) -- the engine's first writer of a canonical record
+# ---------------------------------------------------------------------------
+#
+# D11/D12 mechanics, mandatory: every edit is a LINE INSERT into the topic
+# file's raw text, never a YAML dump (a dump reformats the frozen link bytes).
+# Writers never commit -- the orchestrator commits the store. Delivery never
+# reaches this code: it is capture-side only (it may run a chunker).
+
+
+def _anchor_today() -> str:
+    """`captured_at` for a new row (a seam the tests replace)."""
+    return datetime.now().date().isoformat()
+
+
+def _topic_file_for_id(root: Path, topic_id: str) -> Path | None:
+    """The store file whose frontmatter `id` is `topic_id`, under topics/."""
+    topics_dir = Path(root) / "topics"
+    if not topics_dir.is_dir():
+        return None
+    # walk_markdown resolves its root, so it yields realpath spellings
+    # (macOS /private/var); hand the caller back its OWN spelling of the root
+    # (INC-0132 family), as the indexer stores `records.path`.
+    walked_root = Path(root).resolve()
+
+    def own_spelling(found: Path) -> Path:
+        try:
+            return Path(root) / found.relative_to(walked_root)
+        except ValueError:
+            return found
+
+    pattern = re.compile(r"^id:\s*['\"]?" + re.escape(topic_id) + r"['\"]?\s*$", re.M)
+    undecodable = None
+    for path in walk_markdown(topics_dir):
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            continue
+        # lenient on purpose: an undecodable file must still be FOUND so the
+        # writer can refuse it by name instead of reporting "no topic" -- but
+        # only when no VALID file carries the id (a valid duplicate wins, in
+        # whatever order the walk meets them)
+        try:
+            head = raw.decode("utf-8")
+            valid = True
+        except UnicodeDecodeError:
+            head = raw.decode("utf-8", errors="replace")
+            valid = False
+        if pattern.search(head.split("\n---", 1)[0]):
+            if valid:
+                return own_spelling(path)
+            if undecodable is None:
+                undecodable = own_spelling(path)
+    return undecodable
+
+
+def anchor_span_bytes(data: bytes, start_line: int, end_line: int) -> bytes:
+    """The inclusive 1-based `start_line..end_line` byte span of a chunk --
+    never the FTS body (25 lines) and never the embed slice. The ONE
+    slicing rule: capture and delivery both call it, so they cannot
+    disagree about which bytes a symbol anchor covers."""
+    lines = data.splitlines(keepends=True)
+    return b"".join(lines[max(start_line - 1, 0):end_line])
+
+
+def _anchor_code_ref_file(ref_path: str, code_roots: list) -> tuple:
+    """`(root, abs_path)` of the first code root holding `ref_path`, or
+    `(None, None)`."""
+    for root in code_roots:
+        candidate = Path(root) / ref_path
+        if candidate.is_file():
+            return Path(root), candidate
+    return None, None
+
+
+def capture_anchor_row(ref: str, link_id: str, code_roots: list, captured: str) -> tuple:
+    """Hash what `ref` names NOW and build one anchor row. Returns
+    `(row, None)` or `(None, (rc, message))`: rc 2 = not anchorable (prefix,
+    glob, a directory), rc 1 = could not capture (file missing, symbol
+    ambiguous, chunker unavailable). The one capture routine behind `bind`
+    and `anchor-backfill`; the only anchor code that may call a chunker."""
+    if not code_ref_is_anchorable(ref):
+        return None, (2, f"not anchorable: {ref!r} is a prefix or glob")
+    ref_path, frag = code_ref_split(ref)
+    for root in code_roots:
+        if (Path(root) / ref_path).is_dir():
+            return None, (2, f"not anchorable: {ref!r} names a directory")
+    root, abs_path = _anchor_code_ref_file(ref_path, code_roots)
+    if abs_path is None:
+        return None, (1, f"file not found under the code root(s): {ref_path}")
+    try:
+        data = abs_path.read_bytes()
+    except OSError as exc:
+        return None, (1, f"cannot read {ref_path}: {exc.strerror or exc}")
+
+    span, digest, chunker_version = "file", sha256_hex(data), None
+    if frag is not None:
+        lang = chunkers.lang_for_path(ref_path)
+        if lang is not None:
+            try:
+                result = chunkers.get_chunker(lang).chunk_file(
+                    data.decode("utf-8", errors="replace"), ref_path
+                )
+                validate_chunk_result(result, ref_path)
+            except Exception as exc:
+                return None, (1, f"cannot resolve symbol {frag!r}: chunker unavailable or failed "
+                                 f"({type(exc).__name__}: {exc})")
+            ranges = sorted({
+                (c["start_line"], c["end_line"]) for c in result.chunks
+                if fragment_matches_symbol(frag, c["symbol"], c["qualified_name"])
+            })
+            if len(ranges) > 1:
+                return None, (1, f"symbol ambiguous: {frag!r} matches {len(ranges)} chunks in {ref_path}")
+            if ranges:
+                span = "symbol"
+                digest = sha256_hex(anchor_span_bytes(data, *ranges[0]))
+                chunker_version = chunkers.chunker_version(lang)
+
+    deadline = time.monotonic() + 2.0
+    head = _git_call_budgeted(root, ["rev-parse", "--short", "HEAD"], deadline)
+    status = _git_call_budgeted(root, ["status", "--porcelain", "--", ref_path], deadline)
+    row = {
+        "ref": ref,
+        "link": link_id,
+        "algo": ANCHOR_ALGO,
+        "digest": digest,
+        "span": span,
+        "captured": captured,
+        "captured_at": _anchor_today(),
+        "code_head": head.strip() if head and head.strip() else "unavailable",
+        "worktree": "unknown" if status is None else ("dirty" if status.strip() else "clean"),
+    }
+    if chunker_version:
+        row["chunker_version"] = chunker_version
+    return row, None
+
+
+def _split_lines_keep(text: str) -> list:
+    """Lines of `text` split on `\\n` ONLY, each keeping its terminator
+    (`str.splitlines` also splits on form feeds, U+2028 and friends, which would
+    shift line indexes and could not be re-joined to a different convention)."""
+    return re.findall(r"[^\n]*\n|[^\n]+", text)
+
+
+def _newline_of(text: str) -> str:
+    """The file's newline convention: that of its first line ending
+    (`\\r\\n` or `\\n`)."""
+    i = text.find("\n")
+    return "\r\n" if i > 0 and text[i - 1] == "\r" else "\n"
+
+
+def read_record_bytes_strict(path: Path) -> str:
+    """The file's text decoded as strict UTF-8 with NO newline translation, so
+    writing `text.encode("utf-8")` back reproduces every untouched byte.
+    Raises UnicodeDecodeError on invalid UTF-8."""
+    return Path(path).read_bytes().decode("utf-8", errors="strict")
+
+
+def _fm_line_bounds(lines: list) -> tuple:
+    """`(first, end)` index range of the frontmatter body lines (between the
+    `---` fences) in a file's `splitlines(keepends=True)`; (0, 0) when none."""
+    if not lines or not lines[0].startswith("---"):
+        return 0, 0
+    for i in range(1, len(lines)):
+        if lines[i].rstrip("\r\n") == "---":
+            return 1, i
+    return 0, 0
+
+
+def _top_key_index(lines: list, first: int, end: int, key: str) -> int | None:
+    """Index of the top-level `key:` line (any value after the colon)."""
+    pat = re.compile(r"^" + re.escape(key) + r":(\s|$)")
+    for i in range(first, end):
+        if pat.match(lines[i]):
+            return i
+    return None
+
+
+def _block_last_line(lines: list, key_idx: int, end: int, include_trailing: bool = False) -> int:
+    """Index of the last line belonging to the block under the top-level key
+    at `key_idx`: following lines that are indented, indentless `- ` list
+    items, blank or comments. Trailing blanks and comments are not counted
+    unless `include_trailing`, which returns the last line before the next
+    top-level content -- the span memlint's freeze attributes to the block's
+    last item, so an append after it stays an append."""
+    last = key_idx
+    stop = end
+    for i in range(key_idx + 1, end):
+        raw = lines[i].rstrip("\r\n")
+        if raw.strip() == "" or raw.lstrip().startswith("#"):
+            continue
+        if raw.startswith(" ") or raw.startswith("- "):
+            last = i
+            continue
+        stop = i
+        break
+    return max(last, stop - 1) if include_trailing else last
+
+
+def _block_item_indent(lines: list, key_idx: int, last: int) -> str:
+    for i in range(key_idx + 1, last + 1):
+        raw = lines[i].rstrip("\r\n")
+        stripped = raw.lstrip(" ")
+        if stripped.startswith("- "):
+            return raw[: len(raw) - len(stripped)]
+    return "  "
+
+
+def _yaml_quote(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def render_anchor_item(row: dict, indent: str = "  ") -> list:
+    """The text lines of one `anchors:` list item, in the schema's field
+    order. Strings that YAML could re-type (digest, code_head, ref) are
+    double-quoted; `captured_at` stays a bare date."""
+    quoted = {"ref", "digest", "code_head", "chunker_version"}
+    order = ("ref", "link", "algo", "digest", "span", "captured", "captured_at",
+             "code_head", "worktree", "chunker_version")
+    out = []
+    for n, key in enumerate([k for k in order if k in row]):
+        value = str(row[key])
+        value = _yaml_quote(value) if key in quoted else value
+        lead = f"{indent}- " if n == 0 else f"{indent}  "
+        out.append(f"{lead}{key}: {value}")
+    return out
+
+
+def insert_anchor_row(text: str, row: dict) -> str:
+    """`text` (a topic file) with one anchor item added: appended at the end
+    of an existing `anchors:` block, else a new block placed immediately
+    before the `links:` line. Pure line insertion -- every other byte of the
+    file is untouched. Raises ValueError when the structure does not allow a
+    safe insert."""
+    nl = _newline_of(text)
+    lines = _split_lines_keep(text)
+    first, end = _fm_line_bounds(lines)
+    if end == 0:
+        raise ValueError("no frontmatter block")
+    anchors_idx = _top_key_index(lines, first, end, "anchors")
+    if anchors_idx is not None:
+        value = lines[anchors_idx].split(":", 1)[1].strip()
+        if value == "[]":
+            lines[anchors_idx] = f"anchors:{nl}"
+        elif value != "":
+            raise ValueError("`anchors:` is not a block list; refusing to edit it")
+        last = _block_last_line(lines, anchors_idx, end, include_trailing=True)
+        item = render_anchor_item(row, _block_item_indent(lines, anchors_idx, last))
+        pos = last + 1
+        if not lines[last].endswith("\n"):
+            lines[last] += nl
+        lines[pos:pos] = [ln + nl for ln in item]
+    else:
+        links_idx = _top_key_index(lines, first, end, "links")
+        if links_idx is None:
+            raise ValueError("no `links:` key to place `anchors:` before")
+        item = render_anchor_item(row)
+        lines[links_idx:links_idx] = [f"anchors:{nl}"] + [ln + nl for ln in item]
+    return "".join(lines)
+
+
+def insert_code_ref(text: str, ref: str) -> str:
+    """`text` with `ref` added to `code_refs:` (a no-op when an identical
+    entry exists): `code_refs: []` becomes a block with the one entry, a
+    block gains one `  - ref` line at its end, an absent key is created
+    before `anchors:`/`links:`. A non-empty flow list is refused."""
+    nl = _newline_of(text)
+    lines = _split_lines_keep(text)
+    first, end = _fm_line_bounds(lines)
+    if end == 0:
+        raise ValueError("no frontmatter block")
+    entry_text = _yaml_quote(ref)  # always a double-quoted scalar: `yes`, `on`, `null`, `1.0`, `a#b` stay strings
+    idx = _top_key_index(lines, first, end, "code_refs")
+    if idx is None:
+        anchor_idx = _top_key_index(lines, first, end, "anchors")
+        if anchor_idx is None:
+            anchor_idx = _top_key_index(lines, first, end, "links")
+        if anchor_idx is None:
+            raise ValueError("no `links:` key to place `code_refs:` before")
+        lines[anchor_idx:anchor_idx] = [f"code_refs:{nl}", f"  - {entry_text}{nl}"]
+        return "".join(lines)
+    rest = lines[idx].split(":", 1)[1].strip()
+    if rest in ("", "[]", "null", "~") and _block_last_line(lines, idx, end) == idx:
+        lines[idx] = f"code_refs:{nl}"
+        lines.insert(idx + 1, f"  - {entry_text}{nl}")
+        return "".join(lines)
+    if rest not in ("", "null", "~"):
+        raise ValueError("`code_refs:` is a non-empty flow list; refusing to edit it")
+    last = _block_last_line(lines, idx, end)
+    indent = _block_item_indent(lines, idx, last)
+    if not lines[last].endswith("\n"):
+        lines[last] += nl
+    lines.insert(last + 1, f"{indent}- {entry_text}{nl}")
+    return "".join(lines)
+
+
+def _unified_diff(old: str, new: str, label: str) -> str:
+    import difflib
+    return "".join(difflib.unified_diff(
+        _split_lines_keep(old), _split_lines_keep(new),
+        fromfile=f"a/{label}", tofile=f"b/{label}",
+    ))
+
+
+def _topic_current_link(fm: dict) -> str | None:
+    """The topic's current active link id: `current:` when set, else the
+    newest active link."""
+    if fm.get("current"):
+        return str(fm["current"])
+    link = newest_active_link(fm.get("links") or [])
+    return str(link.get("link")) if link else None
+
+
+def apply_topic_edit(path: Path, old_text: str, new_text: str, dry_run: bool, store_root: Path) -> None:
+    """Print the exact diff; write it unless `dry_run`. Never commits."""
+    try:
+        label = str(path.relative_to(store_root))
+    except ValueError:
+        label = str(path)
+    sys.stdout.write(_unified_diff(old_text, new_text, label))
+    if dry_run:
+        print("dry-run: nothing written")
+        return
+    Path(path).write_bytes(new_text.encode("utf-8"))
+
+
+def parse_record_raw(text: str, path):
+    """`parse_record_text` over text that may carry CRLF endings (the
+    byte-preserving writers keep them; the parser reads LF)."""
+    return parse_record_text(text.replace("\r\n", "\n"), path)
+
+
+def bound_edit_problem(new_text: str, path, ref: str, link_id: str, expect_refs: list) -> str | None:
+    """Why a topic edit must not be written, else None: the new text must
+    parse, its `code_refs` must be exactly `expect_refs` (so the inserted ref
+    parses back to the string that was bound -- no YAML re-typing) and its
+    anchor row for `(ref, link_id)` must carry that same ref string."""
+    check = parse_record_raw(new_text, path)
+    if not check.valid:
+        return "the edit would not parse cleanly"
+    fm = check.frontmatter
+    if list(fm.get("code_refs") or []) != list(expect_refs):
+        return f"the edit would not round-trip the reference {ref!r} as a string"
+    rows = [r for r in anchor_rows(fm) if anchor_row_key(r) == (ref, link_id)]
+    if len(rows) != 1 or rows[0].get("ref") != ref:
+        return f"the edit would not round-trip the anchor row for {ref!r}"
+    return None
+
+
+def cmd_bind(args) -> int:
+    """`memidx.py bind TOP-xxxx REF --root STORE --project NAME [--code-root DIR ...]
+    [--captured ruling|bind] [--dry-run]` -- add REF to the topic's
+    `code_refs` when absent and one anchor row for the topic's current
+    active link, hashing the file's bytes now (a symbol ref: the one
+    chunk's inclusive line span). rc 2: not anchorable (prefix/glob/dir);
+    rc 1: topic or file missing, symbol ambiguous, other failure."""
+    root = Path(args.root).resolve()
+    ref = args.ref
+    if not code_ref_is_anchorable(ref):
+        print(f"bind: not anchorable: {ref!r} is a prefix or glob", file=sys.stderr)
+        return 2
+    path = _topic_file_for_id(root, args.topic)
+    if path is None:
+        print(f"bind: no topic {args.topic!r} under {args.root}/topics", file=sys.stderr)
+        return 1
+    try:
+        old_text = read_record_bytes_strict(path)
+    except UnicodeDecodeError as exc:
+        print(f"bind: {path.name} is not valid UTF-8 ({exc}); nothing written", file=sys.stderr)
+        return 1
+    result = parse_record_raw(old_text, path)
+    if not result.valid:
+        print(f"bind: {path.name} does not parse cleanly: "
+              f"{'; '.join(m for _f, m in result.diagnostics)}", file=sys.stderr)
+        return 1
+    fm = result.frontmatter
+    link_id = _topic_current_link(fm)
+    if link_id is None:
+        print(f"bind: {args.topic} has no active link to anchor", file=sys.stderr)
+        return 1
+    key = (ref, link_id)
+    if any(anchor_row_key(r) == key for r in anchor_rows(fm)):
+        print(f"bind: {args.topic} already has an anchor for ({ref}, {link_id}); "
+              "one baseline per key -- a new baseline is a new link")
+        return 0
+    code_roots = _code_roots_arg(args.code_root) or [Path.cwd().resolve()]
+    row, failure = capture_anchor_row(ref, link_id, code_roots, args.captured)
+    if row is None:
+        rc, message = failure
+        print(f"bind: {message}", file=sys.stderr)
+        return rc
+    try:
+        new_text = old_text
+        if ref not in [str(r) for r in fm.get("code_refs") or []]:
+            new_text = insert_code_ref(new_text, ref)
+        new_text = insert_anchor_row(new_text, row)
+    except ValueError as exc:
+        print(f"bind: {exc}", file=sys.stderr)
+        return 1
+    refs_now = [r for r in fm.get("code_refs") or []]
+    expect = refs_now if ref in [str(r) for r in refs_now] else refs_now + [ref]
+    problem = bound_edit_problem(new_text, path, ref, link_id, expect)
+    if problem:
+        print(f"bind: {problem}; nothing written", file=sys.stderr)
+        return 1
+    apply_topic_edit(path, old_text, new_text, args.dry_run, root)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# anchors: proposals from the session ledger (propose-bindings)
+# ---------------------------------------------------------------------------
+#
+# Reads a session file ($MEMCONTINUUM_HOME/sessions/<project>/<id>.json, the
+# state hooks/ledger-post-edit.sh and hooks/mc-fallback-lib.sh write) and
+# PRINTS suggestions. Nothing here appends a reference: only `bind`, run by
+# a person or the orchestrator, writes a canonical record (D12). No hook
+# calls this command.
+
+
+def memcontinuum_home() -> Path:
+    return Path(os.environ.get("MEMCONTINUUM_HOME", str(Path.home() / ".memcontinuum")))
+
+
+def sessions_dir_for(project: str, override: str | None = None) -> Path:
+    return Path(override).expanduser() if override else memcontinuum_home() / "sessions" / project
+
+
+def read_session_state(path: Path) -> dict | None:
+    """The parsed session file, or None when it is unreadable or half
+    written (a live session is mid-write; that is skipped, never an error)."""
+    try:
+        state = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def iter_session_files(sessions_dir: Path):
+    """Every `*.json` session file in `sessions_dir`, sorted; `.json.lock`
+    siblings and anything else are not session files."""
+    try:
+        names = sorted(os.listdir(sessions_dir))
+    except OSError:
+        return
+    for name in names:
+        if name.endswith(".json"):
+            yield Path(sessions_dir) / name
+
+
+def path_join_key(p) -> str:
+    """The comparison spelling of a path for joins: `os.path.realpath`, or
+    `normpath` when realpath fails. Both sides of a join go through it, so a
+    ledger path in /var spelling meets a code root resolved to /private/var
+    (INC-0132 family); it is a KEY only -- never printed, stored or returned."""
+    try:
+        return os.path.realpath(str(p))
+    except (OSError, ValueError):
+        return os.path.normpath(str(p))
+
+
+def ledger_code_rows(state: dict) -> list:
+    """Ledger rows that name edited CODE: `kind == "code"` with a non-empty
+    `root` and an absolute `path`. Each is `{path, root, rel, content_sha256,
+    seen_at}` with `path` normalised and `rel` its path under `root`; rows
+    that sit outside their own root (compared by `path_join_key`) are dropped."""
+    out = []
+    for row in state.get("ledger") or []:
+        if not isinstance(row, dict) or row.get("kind") != "code" or not row.get("root"):
+            continue
+        path = os.path.normpath(str(row.get("path") or ""))
+        root = os.path.normpath(str(row["root"]))
+        if not os.path.isabs(path):
+            continue
+        # "under its root" is decided on the join keys of BOTH sides: a tool-edit
+        # row carries the tool's spelling of `path` while `root` is the configured
+        # (realpath) code root, and a symlinked checkout spells them differently
+        key_path, key_root = path_join_key(path), path_join_key(root)
+        if not key_path.startswith(key_root.rstrip(os.sep) + os.sep):
+            continue
+        out.append({
+            "path": path, "root": root, "rel": os.path.relpath(key_path, key_root),
+            # an in-root worktree edit: `path` is the REMAPPED main-checkout path, the
+            # fallback recorded the tool's real path, kept as `worktree_path`
+            "match_path": os.path.normpath(str(row.get("worktree_path") or "")) if row.get("worktree_path") else path,
+            "content_sha256": str(row.get("content_sha256") or ""),
+            "seen_at": str(row.get("seen_at") or ""),
+        })
+    return out
+
+
+def proposal_lines(state: dict, topic_is_bound, unmapped_report) -> list:
+    """The proposal text for one session state. `topic_is_bound(topic_id,
+    abs_path, root)` says whether that topic already matches the path
+    directly; `unmapped_report(abs_paths)` returns `cmd_unmapped`'s result
+    dict (or None). Section one is the only part that may become a
+    `code_refs` line."""
+    rows = ledger_code_rows(state)
+    by_path = {path_join_key(r["match_path"]): r for r in rows}
+    fallbacks = [f for f in state.get("search_fallbacks") or [] if isinstance(f, dict)]
+    lines = ["Binding proposals -- this session's search fallbacks joined to its edit ledger "
+             "(last 20 fallbacks only; suggestions, nothing is bound until `memidx.py bind` runs):"]
+    named: set = set()
+    proposed = 0
+    for fb in fallbacks:
+        row = by_path.get(path_join_key(fb.get("file") or ""))
+        if row is None or not fb.get("id"):
+            continue
+        if topic_is_bound(str(fb["id"]), row["path"], row["root"]):
+            continue
+        named.add(row["path"])
+        proposed += 1
+        lines.append(
+            f"{fb['id']}  {row['rel']}  {row['content_sha256'][:12]}  {row['seen_at']}  "
+            f"{fb.get('hook') or ''}".rstrip()
+        )
+        if fb.get("title"):
+            lines.append(f"    {fb['title']}")
+    if not proposed:
+        lines.append("(none)")
+    lines.append("")
+    lines.append("Filing hints, not bindings:")
+    candidates = [r["path"] for r in rows if r["path"] not in named]
+    report = unmapped_report(candidates) if candidates else {"coverage_status": "ok", "by_path": {}}
+    if not report or report.get("coverage_status") != "ok":
+        lines.append("coverage: unknown")
+        return lines
+    hints = [r for r in rows if r["path"] not in named
+             and (report.get("by_path") or {}).get(r["path"]) == "unmapped"]
+    if not hints:
+        lines.append("(none)")
+    for r in hints:
+        lines.append(f"{r['rel']}  {r['content_sha256'][:12]}  {r['seen_at']}")
+    return lines
+
+
+def cmd_propose_bindings(args) -> int:
+    """`memidx.py propose-bindings --session ID --root STORE --project NAME
+    [--code-root DIR ...] [--write-inbox] [--sessions-dir DIR]` -- prints
+    the proposal; `--write-inbox` also writes
+    `inbox/proposals/<date>-<session>.md` under the store (D12: an inbox
+    drop, never a canonical record)."""
+    root = Path(args.root).resolve()
+    session_file = sessions_dir_for(args.project, args.sessions_dir) / f"{args.session}.json"
+    state = read_session_state(session_file)
+    if state is None:
+        print(f"propose-bindings: no readable session file {session_file}", file=sys.stderr)
+        return 1
+    code_roots = _code_roots_arg(args.code_root) or _code_roots_arg(
+        sorted({r["root"] for r in ledger_code_rows(state)})
+    )
+    db_path = resolve_db_path(args)
+
+    def unmapped_report(paths):
+        ns = argparse.Namespace(root=str(root), project=args.project, db=args.db, paths=paths,
+                                code_root=[str(r) for r in code_roots], json=True)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            cmd_unmapped(ns)
+        try:
+            return json.loads(buf.getvalue())
+        except ValueError:
+            return None
+
+    # Coverage before exclusion: bring a stale decision index current (cmd_unmapped's
+    # own self-heal, run on no paths) BEFORE the direct-match exclusion reads it.
+    unmapped_report([])
+
+    conn = None
+    if decision_index_state(db_path, args.project, root=root) not in ("missing", "uninitialized"):
+        conn = open_db_noncreating(db_path, project=args.project)
+
+    def topic_is_bound(topic_id, abs_path, row_root):
+        if conn is None:
+            return False
+        candidates = _unmapped_path_candidates(abs_path, _code_roots_arg([row_root]) or code_roots)
+        return any(
+            r["id"] == topic_id
+            for cand in candidates for r in topic_matches_for_path(conn, args.project, cand)
+        )
+
+    try:
+        lines = proposal_lines(state, topic_is_bound, unmapped_report)
+    finally:
+        if conn is not None:
+            conn.close()
+    text = "\n".join(lines) + "\n"
+    print(text, end="")
+    if args.write_inbox:
+        # the caller's spelling of --root: this path is printed
+        out = Path(args.root) / "inbox" / "proposals" / f"{_anchor_today()}-{args.session}.md"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text, encoding="utf-8")
+        print(f"wrote {out}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# anchors: backfill -- late baselines for references bound before anchors existed
+# ---------------------------------------------------------------------------
+
+
+def ledgered_code_paths(sessions_dir: Path) -> tuple:
+    """`(paths, roots, skipped)` over EVERY session file in `sessions_dir`
+    (no date cutoff -- the ledger decides scope): the set of
+    edited code paths in `path_join_key` spelling (join keys, not for
+    display), the set of code roots those rows name, and the file names
+    skipped because they were unreadable or half written (a live session)."""
+    paths: set = set()
+    roots: set = set()
+    skipped: list = []
+    for session_file in iter_session_files(sessions_dir):
+        state = read_session_state(session_file)
+        if state is None:
+            skipped.append(session_file.name)
+            continue
+        for row in ledger_code_rows(state):
+            paths.add(path_join_key(row["path"]))
+            roots.add(row["root"])
+    return paths, roots, skipped
+
+
+def cmd_anchor_backfill(args) -> int:
+    """`memidx.py anchor-backfill --root STORE --project NAME [--sessions-dir DIR]
+    [--code-root DIR ...] [--dry-run]` -- for every topic `code_refs` entry
+    (a file or `path#symbol`; prefixes and globs are never anchored) whose
+    file appears in any ledger row and that has no anchor row for
+    `(ref, current link)`, capture one NOW with `captured: backfill`. The
+    hash is of the file as it is at accept time -- never the ledger's digest,
+    and never presented as the bytes at the original ruling. Idempotent."""
+    root = Path(args.root).resolve()
+    paths, ledger_roots, skipped = ledgered_code_paths(sessions_dir_for(args.project, args.sessions_dir))
+    for name in skipped:
+        print(f"anchor-backfill: skipped unreadable session file {name} (half written?)", file=sys.stderr)
+    code_roots = _code_roots_arg(args.code_root) or _code_roots_arg(sorted(ledger_roots))
+    total = 0
+    rc = 0
+    for topic_path in walk_markdown(root / "topics"):
+        try:
+            old_text = read_record_bytes_strict(topic_path)
+        except UnicodeDecodeError as exc:
+            print(f"anchor-backfill: {topic_path.name} is not valid UTF-8 ({exc}); skipped, nothing written",
+                  file=sys.stderr)
+            rc = 1
+            continue
+        result = parse_record_raw(old_text, topic_path)
+        fm = result.frontmatter
+        if not result.valid or fm.get("type") != "topic":
+            continue
+        link_id = _topic_current_link(fm)
+        if link_id is None:
+            continue
+        have = {anchor_row_key(r) for r in anchor_rows(fm)}
+        new_text, added, added_rows, notes = old_text, [], [], []
+        for ref in [str(r) for r in fm.get("code_refs") or []]:
+            if not code_ref_is_anchorable(ref) or (ref, link_id) in have:
+                continue
+            ref_path = code_ref_split(ref)[0]
+            if not any(path_join_key(Path(r) / ref_path) in paths for r in code_roots):
+                continue
+            row, failure = capture_anchor_row(ref, link_id, code_roots, "backfill")
+            if row is None:
+                notes.append(f"  skipped {ref}: {failure[1]}")
+                continue
+            try:
+                new_text = insert_anchor_row(new_text, row)
+            except ValueError as exc:
+                notes.append(f"  skipped {ref}: {exc}")
+                continue
+            have.add((ref, link_id))
+            added.append(ref)
+            added_rows.append(row)
+        if added:
+            refs_now = list(fm.get("code_refs") or [])
+            problem = next(filter(None, (
+                bound_edit_problem(new_text, topic_path, r["ref"], link_id, refs_now)
+                for r in added_rows)), None)
+            if problem:
+                print(f"anchor-backfill: {topic_path.name}: {problem}; skipped, nothing written",
+                      file=sys.stderr)
+                rc = 1
+                continue
+        if added or notes:
+            print(f"{fm.get('id') or topic_path.stem}: {len(added)} anchor(s) captured as backfill"
+                  + (f" ({', '.join(added)})" if added else ""))
+            for note in notes:
+                print(note)
+        if added:
+            total += len(added)
+            apply_topic_edit(topic_path, old_text, new_text, args.dry_run, root)
+    print(f"anchor-backfill: {total} anchor(s) {'would be ' if args.dry_run else ''}captured")
+    return rc
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -11259,6 +12541,17 @@ def main(argv=None) -> int:
              "\"...\"} (a caller like a pre-edit hook needs only one for-path "
              "call per candidate, not a second call for the human-readable text)",
     )
+    p_forpath.add_argument(
+        "--live-file", dest="live_file", default=None, metavar="ABS",
+        help="the file being edited (absolute path): when given, each matched topic's anchors "
+             "are compared against its bytes and one annotation line is added after the "
+             "topic header; omitted, for-path's output is unchanged",
+    )
+    p_forpath.add_argument(
+        "--code-db", dest="code_db", default=None,
+        help="code index path for symbol anchors (default $MEMCONTINUUM_HOME/<project>-code.sqlite); "
+             "opened read-only",
+    )
     p_forpath.set_defaults(func=cmd_for_path)
 
     p_check = sub.add_parser("check")
@@ -11287,6 +12580,45 @@ def main(argv=None) -> int:
     )
     p_drift.set_defaults(func=cmd_drift)
 
+    p_bind = sub.add_parser(
+        "bind",
+        help="bind a code reference to a topic's current ruling and capture its anchor "
+             "(SHA-256 of the bytes now); a line insert into the topic file, never committed",
+    )
+    add_common_args(p_bind, need_root=True)
+    p_bind.add_argument("topic", metavar="TOP-xxxx")
+    p_bind.add_argument("ref", metavar="REF", help="a file path or path#symbol (no prefix/glob)")
+    p_bind.add_argument("--code-root", dest="code_root", action="append", default=None)
+    p_bind.add_argument("--captured", choices=("ruling", "bind"), default="bind")
+    p_bind.add_argument("--dry-run", action="store_true", help="print the exact diff, write nothing")
+    p_bind.set_defaults(func=cmd_bind)
+
+    p_propose = sub.add_parser(
+        "propose-bindings",
+        help="print this session's search fallbacks joined to its edit ledger as binding "
+             "suggestions (never writes a reference; --write-inbox drops the text in the inbox)",
+    )
+    add_common_args(p_propose, need_root=True)
+    p_propose.add_argument("--session", required=True, help="session id (the <id>.json under sessions/<project>/)")
+    p_propose.add_argument("--code-root", dest="code_root", action="append", default=None)
+    p_propose.add_argument("--sessions-dir", dest="sessions_dir", default=None,
+                           help="override $MEMCONTINUUM_HOME/sessions/<project>")
+    p_propose.add_argument("--write-inbox", action="store_true",
+                           help="also write inbox/proposals/<date>-<session>.md under --root")
+    p_propose.set_defaults(func=cmd_propose_bindings)
+
+    p_backfill = sub.add_parser(
+        "anchor-backfill",
+        help="give already-bound files an anchor, hashed now and labelled `backfill` "
+             "(never the bytes at the original ruling); a line insert, never committed",
+    )
+    add_common_args(p_backfill, need_root=True)
+    p_backfill.add_argument("--code-root", dest="code_root", action="append", default=None)
+    p_backfill.add_argument("--sessions-dir", dest="sessions_dir", default=None,
+                            help="override $MEMCONTINUUM_HOME/sessions/<project>")
+    p_backfill.add_argument("--dry-run", action="store_true", help="print the exact diff, write nothing")
+    p_backfill.set_defaults(func=cmd_anchor_backfill)
+
     p_unmapped = sub.add_parser("unmapped")
     add_common_args(p_unmapped, need_root=True)
     p_unmapped.add_argument("paths", nargs="+", metavar="PATH")
@@ -11305,6 +12637,16 @@ def main(argv=None) -> int:
     )
     add_common_args(p_standing, optional_root=True)
     p_standing.add_argument("--json", action="store_true")
+    p_standing.add_argument(
+        "--code-root", dest="code_root", action="append", default=None,
+        help="with --json: a code root whose files the topics' anchors are compared against "
+             "(repeatable); without any, the anchor summary is skipped",
+    )
+    p_standing.add_argument(
+        "--code-db", dest="code_db", default=None,
+        help="code index path for symbol anchors (default $MEMCONTINUUM_HOME/<project>-code.sqlite); "
+             "opened read-only",
+    )
     p_standing.set_defaults(func=cmd_standing)
 
     p_pack = sub.add_parser(
@@ -11328,6 +12670,17 @@ def main(argv=None) -> int:
                         help="recorded blind-review mode: open no index, print only the "
                              "fixed notice and its pack hash")
     p_pack.add_argument("--json", action="store_true")
+    p_pack.add_argument(
+        "--code-root", dest="code_root", action="append", default=None,
+        help="a code root whose files the topics' anchors are compared against (repeatable): "
+             "adds one anchor line above each included topic's chain, inside the pack hash; "
+             "without any, the pack has no anchor lines",
+    )
+    p_pack.add_argument(
+        "--code-db", dest="code_db", default=None,
+        help="code index path for symbol anchors (default $MEMCONTINUUM_HOME/<project>-code.sqlite); "
+             "opened read-only",
+    )
     p_pack.set_defaults(func=cmd_context_pack)
 
     p_code_reindex = sub.add_parser(

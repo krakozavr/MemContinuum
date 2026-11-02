@@ -40,6 +40,11 @@ from pathlib import Path
 import chunkers
 
 from memidx import (
+    ANCHOR_ALGO,
+    ANCHOR_CAPTURE_KINDS,
+    ANCHOR_DIGEST_RE,
+    ANCHOR_SPANS,
+    ANCHOR_WORKTREE_STATES,
     AUTHORITIES,
     CANONICAL_ID_PREFIXES,
     CANONICAL_TYPES,
@@ -53,6 +58,9 @@ from memidx import (
     STATUSES,
     ParseResult,
     _uncheckable_remedy,
+    anchor_row_key,
+    anchor_rows,
+    code_ref_is_anchorable,
     code_ref_is_named,
     code_ref_matches,
     fragment_declaration_status,
@@ -61,7 +69,7 @@ from memidx import (
     lang_for_source_file,
     newest_active_link,
     parse_record,
-    parse_record_text,
+    parse_record_raw,
     standing_digest_text,
     standing_line,
     standing_sort_key,
@@ -138,6 +146,71 @@ def _new_link_errors(prefix: str, link: dict) -> list[str]:
         if text and str(text).strip(" \t\r\n\"')]}").endswith("?"):
             out.append(f"{prefix}: owner-verbatim text is a question, not a ruling")
     return out
+
+
+def _anchor_duplicate_keys(rows: list) -> list:
+    """The `(ref, link)` keys that more than one anchor row carries (one
+    baseline per key in this release). Shared by the plain lint and the
+    --against-ref freeze so the rule is written once."""
+    seen: set = set()
+    dup: list = []
+    for row in rows:
+        key = anchor_row_key(row)
+        if key in seen and key not in dup:
+            dup.append(key)
+        seen.add(key)
+    return dup
+
+
+def _anchor_errors(path, fm: dict, topic_link_ids: set) -> list[str]:
+    """Validation of a topic's `anchors:` rows (docs/SCHEMA.md, "Anchors")."""
+    rows = anchor_rows(fm)
+    if not rows:
+        return []
+    errors: list[str] = []
+    code_refs = {str(r) for r in fm.get("code_refs") or []}
+    for i, row in enumerate(rows):
+        ref = row.get("ref")
+        prefix = f"{path}: anchors[{i}] ({ref!r})"
+        if ref is None or str(ref) not in code_refs:
+            errors.append(f"{prefix}: ref is not present verbatim in this topic's code_refs")
+        elif not code_ref_is_anchorable(str(ref)):
+            errors.append(
+                f"{prefix}: ref is a prefix or glob -- those are 'not checked' by definition "
+                "and never carry an anchor row"
+            )
+        link = row.get("link")
+        if link is None or str(link) not in topic_link_ids:
+            errors.append(f"{prefix}: link {link!r} is not a link in this topic")
+        if row.get("algo") != ANCHOR_ALGO:
+            errors.append(f"{prefix}: algo {row.get('algo')!r} must be {ANCHOR_ALGO!r}")
+        digest = row.get("digest")
+        if not isinstance(digest, str) or not ANCHOR_DIGEST_RE.fullmatch(digest):
+            errors.append(f"{prefix}: digest must be 64 lowercase hex characters")
+        span = row.get("span")
+        if span not in ANCHOR_SPANS:
+            errors.append(f"{prefix}: unknown span {span!r} (must be one of {list(ANCHOR_SPANS)})")
+        captured = row.get("captured")
+        if captured not in ANCHOR_CAPTURE_KINDS:
+            errors.append(
+                f"{prefix}: unknown captured {captured!r} (must be one of {list(ANCHOR_CAPTURE_KINDS)})"
+            )
+        worktree = row.get("worktree")
+        if worktree not in ANCHOR_WORKTREE_STATES:
+            errors.append(
+                f"{prefix}: unknown worktree {worktree!r} (must be one of {list(ANCHOR_WORKTREE_STATES)})"
+            )
+        if span == "symbol" and not row.get("chunker_version"):
+            errors.append(f"{prefix}: span: symbol requires chunker_version")
+        captured_at = row.get("captured_at")
+        if captured_at is None or isinstance(captured_at, (dict, list)) or str(captured_at).strip() == "":
+            errors.append(f"{prefix}: captured_at is required (part of the row's identity)")
+    for ref, link in _anchor_duplicate_keys(rows):
+        errors.append(
+            f"{path}: anchors: more than one row for ({ref!r}, {link!r}) -- one baseline per "
+            "key in this release; a new baseline is a new link"
+        )
+    return errors
 
 
 def lint_topic(
@@ -320,6 +393,8 @@ def lint_topic(
                 f"{path}: topic {topic_id!r} code_refs entry {ref_str!r} is empty or "
                 "fragment-only -- a code_ref must name a path"
             )
+
+    errors.extend(_anchor_errors(path, fm, topic_link_ids))
 
     # TOP-0132 L2: `standing:` names which of THIS topic's own links are
     # true of the whole project, always -- never derived, never a per-link
@@ -1985,7 +2060,9 @@ def _parse_git_blob(data: bytes | None, label) -> ParseResult:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         return ParseResult({}, "", [("file", "not UTF-8")], valid=False, fallback=False)
-    return parse_record_text(text, label)
+    # CRLF-tolerant parse: the parser reads LF, the raw-span walker (below)
+    # keeps the original bytes (TOP-0137 L12, gate round 2 item 1).
+    return parse_record_raw(text, label)
 
 
 _KIND_BY_ID_PREFIX = {
@@ -2221,7 +2298,9 @@ def _leading_spaces(line: str) -> int:
     return len(line) - len(line.lstrip(" "))
 
 
-def _link_raw_spans(text: str, parsed_links: list) -> dict[str, str] | None:
+def _link_raw_spans(
+    text: str, parsed_links: list, key: str = "links", ident=None
+) -> dict[str, str] | None:
     """Maps link id -> the EXACT raw text (original line endings, no
     re-serialization) of that link's list-item span in `text`, a full
     record file's decoded content -- from its `- link: ...`-bearing line
@@ -2239,6 +2318,14 @@ def _link_raw_spans(text: str, parsed_links: list) -> dict[str, str] | None:
     (MAJOR, both reviewers): either used to bail the WHOLE FILE to a NOTE,
     permanently turning the byte layer off for every link in it, on a
     perfectly valid YAML shape.
+
+    `key` (default "links") names the top-level frontmatter key whose list
+    is walked and `ident` (default: the item's `link` field) maps one
+    parsed item to its identity string, or None when it has none -- the
+    PR 2 `anchors:` freeze reuses this walker with key="anchors" and an
+    identity over (ref, link, captured, captured_at) instead of a second
+    copy of the structural scan. The default arguments keep the old
+    behaviour byte-for-byte.
 
     Returns None -- "cannot safely say", never "unchanged" -- whenever the
     structure will not support that positional zip with confidence:
@@ -2276,7 +2363,7 @@ def _link_raw_spans(text: str, parsed_links: list) -> dict[str, str] | None:
         return None
     end_idx = None
     for i in range(1, len(lines)):
-        if lines[i].rstrip("\n") == "---":
+        if lines[i].rstrip("\r\n") == "---":
             end_idx = i
             break
     if end_idx is None:
@@ -2291,7 +2378,7 @@ def _link_raw_spans(text: str, parsed_links: list) -> dict[str, str] | None:
         # `.rstrip()` catches trailing whitespace too, and still refuses a
         # flow-style `links: [...]` (that line does not become bare
         # "links:" after stripping), which stays a documented bail-out.
-        if line.rstrip() == "links:":
+        if line.rstrip() == f"{key}:":
             links_idx = i
             break
     if links_idx is None:
@@ -2317,7 +2404,7 @@ def _link_raw_spans(text: str, parsed_links: list) -> dict[str, str] | None:
     first = None
     for i in range(links_idx + 1, len(fm_lines)):
         line = fm_lines[i]
-        if line.strip("\n") == "" or _is_comment_only(line):
+        if line.strip("\r\n") == "" or _is_comment_only(line):
             continue
         first = i
         break
@@ -2332,7 +2419,7 @@ def _link_raw_spans(text: str, parsed_links: list) -> dict[str, str] | None:
     block_end = len(fm_lines)
     for i in range(links_idx + 1, len(fm_lines)):
         line = fm_lines[i]
-        if line.strip("\n") == "" or _is_comment_only(line):
+        if line.strip("\r\n") == "" or _is_comment_only(line):
             continue
         ls = _leading_spaces(line)
         if ls < indent:
@@ -2358,14 +2445,20 @@ def _link_raw_spans(text: str, parsed_links: list) -> dict[str, str] | None:
     if len(spans_by_index) != len(parsed_links):
         return None
 
+    if ident is None:
+        def ident(link):
+            lid = link.get("link")
+            if lid is None or isinstance(lid, (dict, list)):
+                return None
+            return str(lid)
+
     spans: dict[str, str] = {}
     for link, span in zip(parsed_links, spans_by_index):
         if not isinstance(link, dict):
             return None
-        lid = link.get("link")
-        if lid is None or isinstance(lid, (dict, list)):
+        lid_key = ident(link)
+        if lid_key is None:
             return None
-        lid_key = str(lid)
         if lid_key in spans:
             return None
         spans[lid_key] = span
@@ -2399,6 +2492,97 @@ def _added_links_errors(full_path: Path, links: list, old_ids: set) -> list[str]
             continue
         errs.extend(_new_link_errors(f"{full_path}:{lid}", l))
     return errs
+
+
+def _decode_or_none(blob):
+    try:
+        return blob.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _anchor_ident(row) -> str | None:
+    """Identity of an anchor row for the freeze: (ref, link, captured,
+    captured_at). None when any part is missing or not a scalar."""
+    if not isinstance(row, dict):
+        return None
+    parts = [row.get(k) for k in ("ref", "link", "captured", "captured_at")]
+    if any(p is None or isinstance(p, (dict, list)) for p in parts):
+        return None
+    return "\x00".join(str(p) for p in parts)
+
+
+def _anchor_freeze_errors(full_path, old_text, old_rows: list, new_text, new_rows: list,
+                          notes: list[str]) -> list[str]:
+    """The append-only rule for `anchors:` rows: a row recorded at REF must
+    survive with the same parsed fields AND the same raw bytes; new rows are
+    free; a second row for an existing (ref, link) key is an error. Raw
+    spans come from the same walker the links freeze uses (`_link_raw_spans`
+    with key="anchors")."""
+    errors: list[str] = []
+    for ref, link in _anchor_duplicate_keys(new_rows):
+        errors.append(
+            f"{full_path}: anchors: more than one row for ({ref!r}, {link!r}) -- one baseline per "
+            "key in this release; a new baseline is a new link"
+        )
+    if not old_rows:
+        return errors
+    old_spans = (
+        _link_raw_spans(old_text, old_rows, key="anchors", ident=_anchor_ident)
+        if old_text is not None else None
+    )
+    new_spans = (
+        _link_raw_spans(new_text, new_rows, key="anchors", ident=_anchor_ident)
+        if new_text is not None else None
+    )
+    if old_spans is None:
+        notes.append(
+            f"{full_path}: could not verify recorded anchors' raw text at REF "
+            "(structural extraction inconclusive); anchors compared by parsed fields only"
+        )
+    # multiplicity kept: a pair of identical rows at REF reduced to one is a removal
+    new_by_ident: dict[str, list] = {}
+    for row in new_rows:
+        ident = _anchor_ident(row)
+        if ident is not None:
+            new_by_ident.setdefault(ident, []).append(row)
+    taken: dict[str, int] = {}
+    for row in old_rows:
+        ident = _anchor_ident(row)
+        name = f"{full_path}: anchor ({row.get('ref')!r}, {row.get('link')!r})"
+        if ident is None:
+            errors.append(
+                f"{name}: recorded row lacks an identity component (ref, link, captured, "
+                "captured_at) and cannot be verified; refusing to skip it (append-only)"
+            )
+            continue
+        n = taken.get(ident, 0)
+        taken[ident] = n + 1
+        candidates = new_by_ident.get(ident, [])
+        new_row = candidates[n] if n < len(candidates) else None
+        if new_row is None:
+            errors.append(
+                f"{name}: row removed or changed after being recorded (append-only; "
+                "an anchor is a capture, never edited -- add a new link for a new baseline)"
+            )
+        elif new_row != row:
+            errors.append(
+                f"{name}: row changed after being recorded (append-only; an anchor is a "
+                "capture, never edited)"
+            )
+        elif old_spans is not None and ident in old_spans:
+            new_span = new_spans.get(ident) if new_spans is not None else None
+            if new_span is None:
+                errors.append(
+                    f"{name}: row's span could not be extracted on the new side; treated as "
+                    "changed (append-only; a recorded anchor must stay byte-verifiable)"
+                )
+            elif _link_bytes_changed(old_spans[ident], new_span):
+                errors.append(
+                    f"{name}: row reformatted, not appended (append-only; raw text changed "
+                    "after being recorded while its parsed fields did not)"
+                )
+    return errors
 
 
 def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], int, list[str]]:
@@ -2532,6 +2716,12 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
                     # link ids, so every link in the new blob is new.
                     errors.extend(_added_links_errors(
                         full_path, new_result.frontmatter.get("links") or [], set()))
+                    # Anchor rows recorded at REF stay frozen on this branch too:
+                    # a repair of the links is not a licence to rewrite a capture.
+                    errors.extend(_anchor_freeze_errors(
+                        full_path, _decode_or_none(old_blob), anchor_rows(old_result.frontmatter),
+                        _decode_or_none(new_blob), anchor_rows(new_result.frontmatter), notes,
+                    ))
                     continue
                 # Both sides unparseable: still fail closed (test_j: malformed
                 # -> malformed is still refused), reported from the OLD side's
@@ -2679,6 +2869,11 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
                         "while its parsed fields did not -- add a new link "
                         "instead of regenerating the file)"
                     )
+
+        errors.extend(_anchor_freeze_errors(
+            full_path, old_text, anchor_rows(old_result.frontmatter),
+            new_text, anchor_rows(new_result.frontmatter), notes,
+        ))
 
     return errors, changed, notes
 

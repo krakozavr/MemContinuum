@@ -2,6 +2,40 @@
 
 ## [Unreleased]
 
+### Binding
+- Topics gain an `anchors:` frontmatter key: the SHA-256 of the code a
+  `code_refs` entry named when the binding was captured, with the capture kind
+  (`ruling`, `bind`, `backfill`), date, commit and worktree state. `memlint.py`
+  validates the rows and `--against-ref` freezes them like links. New
+  `memidx.py bind TOP-xxxx REF` adds the reference and its anchor by inserting
+  lines into the topic file (`--dry-run` prints the exact diff; nothing is
+  committed for you).
+- New `memidx.py propose-bindings --session ID` prints, from a session's
+  search fallbacks and edit ledger, which edited files a topic may want to
+  bind, plus separately labelled filing hints for unmapped files; it never
+  writes a reference (`--write-inbox` drops the text in the store's inbox).
+- New `memidx.py anchor-backfill` captures a late baseline for references that
+  were bound before anchors existed, hashing the file as it is now and
+  labelling the row `backfill` (`--dry-run` prints the diff first). Rerunning
+  it changes nothing.
+- The pre-edit hook now says when a bound file or symbol changed since its
+  anchor was captured: one line after the topic header (`Anchor changed since
+  capture (bind): src/foo.py`), or `Anchor missing` / `Anchor never captured` /
+  `Anchor not checked` when the check could not be made. It compares the file
+  being edited, reads the code index read-only, takes at most 300 ms, and
+  never alters a ruling's status or authority.
+- The session-start standing digest is followed by one summary line when a
+  topic with standing links has a bound file or symbol that changed since
+  capture (`Anchor changed since capture: N.`; else `Anchor missing: N.`, else
+  `Anchor never captured: N.`). It needs a configured code root, is dropped
+  before any standing line when the size cap bites, and never alters the
+  digest or its hash.
+- `memidx.py context-pack --code-root DIR` adds one anchor line above each
+  included topic's chain (changed, missing, never captured or not checked),
+  inside the pack hash; under a tight size cap the least important lines go
+  first and no topic is dropped to make room for one. Without `--code-root`
+  the pack is unchanged.
+
 ### Retrieval
 - New `memidx.py context-pack FILE... [--topic ID] [--query WORDS] [--blind]`
   prints one paste-ready block of decision records for a brief to an external

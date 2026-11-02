@@ -3088,6 +3088,173 @@ Body.
         self.assertNotIn("--apply repairs it", ctx)
 
 
+class TestSessionStartStandingAnchorLine(HookTestBase):
+    """0.5.0 PR 2: sessionstart-remind.sh appends ONE anchor summary line
+    after the standing digest (computed by `memidx.py standing --json`), from
+    the configured code roots; the digest text and its hash are untouched."""
+
+    STANDING_ANCHORED_TOPIC = """---
+type: topic
+id: TOP-9600
+title: A standing decision with a bound file
+area: testing
+current: L1
+standing: [L1]
+code_refs:
+  - src/mapped.py
+links:
+  - link: L1
+    date: 2026-01-01
+    status: active
+    kind: adopted
+    ruling:
+      text: "this ruling stands for the whole project"
+      authority: owner-verbatim
+      source: "test"
+    recorded_by: agent
+    recorded_at: 2026-01-01
+---
+
+Body.
+"""
+
+    def _install(self, bind=False):
+        _write(self.store_root / "topics" / "testing" / "anchored.md", self.STANDING_ANCHORED_TOPIC)
+        if bind:
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = memidx.main(["bind", "TOP-9600", "src/mapped.py", "--root", str(self.store_root),
+                                  "--code-root", str(self.code_root)])
+            self.assertEqual(rc, 0)
+        with contextlib.redirect_stdout(io.StringIO()):
+            reindex(self.store_root, self.home / f"{self.project}.sqlite", project=self.project)
+
+    def _start(self, session_id, source="startup", **env_over):
+        proc, _ = run_script(SESSIONSTART_HOOK, self.session_start_payload(session_id, source),
+                             self.base_env(**env_over))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"] if proc.stdout.strip() else ""
+        log = (self.home / "hook.log").read_text()
+        return ctx, [l for l in log.splitlines() if "sessionstart outcome=" in l][-1]
+
+    def test_changed_anchor_adds_one_line_after_the_digest(self):
+        self._install(bind=True)
+        (self.code_root / "src" / "mapped.py").write_text("# mapped, edited\n")
+        ctx, log = self._start("s-anchor-changed")
+        lines = ctx.splitlines()
+        self.assertEqual(lines[-1], "Anchor changed since capture: 1.")
+        self.assertIn("this ruling stands for the whole project", ctx)
+        self.assertEqual(sum(1 for l in lines if l.startswith("Anchor ")), 1)
+        self.assertIn("anchors=changed=1", log)
+
+    def test_unchanged_anchor_adds_no_line(self):
+        self._install(bind=True)
+        ctx, log = self._start("s-anchor-clean")
+        self.assertNotIn("Anchor ", ctx)
+        self.assertIn("anchors=clean", log)
+
+    def _budgetless_python(self):
+        """A python wrapper that runs memidx.py with a spent anchor budget
+        (everything else passes through to the venv python unchanged)."""
+        runner = Path(self.td) / "budgetless_runner.py"
+        runner.write_text(
+            "import os, sys\n"
+            "script = sys.argv[1]\n"
+            "sys.path.insert(0, os.path.dirname(script))\n"
+            "import memidx\n"
+            "memidx.ANCHOR_BUDGET_SECONDS = -1.0\n"
+            "sys.exit(memidx.main(sys.argv[2:]))\n")
+        wrapper = Path(self.td) / "budgetless-python.sh"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            'case "$1" in\n'
+            f'  */memidx.py) exec "{VENV_PYTHON}" "{runner}" "$@" ;;\n'
+            f'  *) exec "{VENV_PYTHON}" "$@" ;;\n'
+            "esac\n")
+        wrapper.chmod(0o755)
+        return str(wrapper)
+
+    def test_exhausted_standing_check_is_not_logged_clean(self):
+        self._install(bind=True)
+        ctx, log = self._start("s-anchor-unchecked", MEMCONTINUUM_PYTHON=self._budgetless_python())
+        self.assertIn("anchors=unchecked=1", log)
+        self.assertNotIn("anchors=clean", log)
+
+    def test_dropped_line_keeps_the_counts_in_the_log_token(self):
+        # a legal digest near the 4800-byte cap: the anchor line no longer fits
+        cap = memidx.STANDING_CAP_BYTES
+        n = 1
+        while True:
+            line = memidx.standing_line("TOP-9600", "L1", "owner-verbatim", "x" * n)
+            size = len(memidx.standing_digest_text([line]).encode())
+            if size > cap - 10:
+                break
+            n += 1
+        self.assertLessEqual(size, cap)
+        topic = self.STANDING_ANCHORED_TOPIC.replace("this ruling stands for the whole project", "x" * n)
+        _write(self.store_root / "topics" / "testing" / "anchored.md", topic)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = memidx.main(["bind", "TOP-9600", "src/mapped.py", "--root", str(self.store_root),
+                              "--code-root", str(self.code_root)])
+        self.assertEqual(rc, 0)
+        with contextlib.redirect_stdout(io.StringIO()):
+            reindex(self.store_root, self.home / f"{self.project}.sqlite", project=self.project)
+        (self.code_root / "src" / "mapped.py").write_text("# mapped, edited\n")
+        ctx, log = self._start("s-anchor-dropped-cap")
+        self.assertNotIn("Anchor changed", ctx)
+        self.assertIn("anchors=dropped-cap,changed=1", log)
+        self.assertNotIn("anchors=dropped-cap ", log + " ")
+
+    def test_token_keeps_counts_beside_skipped_and_dropped(self):
+        # the token builder is one inline python in the hook; drive it with summaries
+        script = (HOOKS_DIR / "sessionstart-remind.sh").read_text()
+        start = script.index("_asum = obj.get(\"anchor_summary\")")
+        end = script.index("    try:\n        with open(sys.argv[3]")
+        body = script[start:end]
+        import textwrap
+        for summ, want in (
+            ({"skipped": "no-root"}, "skipped-no-root"),
+            ({"skipped": "error", "unchecked": 2}, "skipped-error,unchecked=2"),
+            ({"dropped": "cap", "changed": 1, "unchecked": 2}, "dropped-cap,changed=1,unchecked=2"),
+            ({"dropped": "cap"}, "dropped-cap"),
+            ({"unchecked": 3}, "unchecked=3"),
+            ({}, "clean"),
+        ):
+            ns = {"obj": {"anchor_summary": summ}}
+            exec(textwrap.dedent("    " + body), ns)
+            self.assertEqual(ns["_token"], want, summ)
+
+    def test_never_captured_is_the_fallback_line(self):
+        self._install(bind=False)
+        ctx, _log = self._start("s-anchor-never")
+        self.assertEqual(ctx.splitlines()[-1], "Anchor never captured: 1.")
+
+    def test_no_code_root_means_no_line_and_a_skip_log_token(self):
+        self._install(bind=True)
+        env = self.base_env()
+        env.pop("MEMCONTINUUM_CODE_ROOT", None)
+        proc, _ = run_script(SESSIONSTART_HOOK, self.session_start_payload("s-anchor-noroot"), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertNotIn("Anchor ", ctx)
+        log = (self.home / "hook.log").read_text()
+        self.assertIn("anchors=skipped-no-root", [l for l in log.splitlines() if "sessionstart outcome=" in l][-1])
+
+    def test_compact_reinjects_digest_and_line(self):
+        self._install(bind=True)
+        (self.code_root / "src" / "mapped.py").write_text("# edited\n")
+        self._start("s-anchor-compact")
+        ctx, _log = self._start("s-anchor-compact", source="compact")
+        self.assertEqual(ctx.splitlines()[-1], "Anchor changed since capture: 1.")
+
+    def test_dedup_resume_injects_nothing_so_no_line_either(self):
+        self._install(bind=True)
+        (self.code_root / "src" / "mapped.py").write_text("# edited\n")
+        self._start("s-anchor-dedup")
+        proc, _ = run_script(SESSIONSTART_HOOK, self.session_start_payload("s-anchor-dedup", "resume"),
+                             self.base_env())
+        self.assertEqual(proc.stdout.strip(), "")
+
+
 class TestSessionStartHookLogRotation(HookTestBase):
     """eval-topic-logging section 5 (owner-approved add-on): rotation runs
     from sessionstart-remind.sh, once per session, at the startup/resume/

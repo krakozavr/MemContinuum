@@ -206,6 +206,32 @@ STANDING_HASH=""
 STANDING_LINKS=0
 STANDING_BYTES=0
 STANDING_IDS_CSV=""
+# 0.5.0 PR 2 (anchors): ONE summary line after the digest ("Anchor changed
+# since capture: N." / "Anchor missing: N." / "Anchor never captured: N."),
+# produced by `memidx.py standing --json` itself (anchor_line, already
+# cap-checked: the digest is never shortened to make room for it), and a
+# log token. Without any code root the engine skips the summary and the token
+# is "skipped-no-root". Read-only; the digest text and its hash are untouched.
+STANDING_ANCHOR_LINE=""
+STANDING_ANCHOR_TOKEN=""
+
+# mc_standing_with_anchor TEXT -- TEXT plus the anchor line, if there is one.
+mc_standing_with_anchor() {
+    if [ -n "$STANDING_ANCHOR_LINE" ]; then
+        printf '%s\n%s' "$1" "$STANDING_ANCHOR_LINE"
+    else
+        printf '%s' "$1"
+    fi
+}
+
+# mc_standing_log_token BASE -- BASE plus " anchors=<token>" when there is one.
+mc_standing_log_token() {
+    if [ -n "$STANDING_ANCHOR_TOKEN" ]; then
+        printf '%s anchors=%s' "$1" "$STANDING_ANCHOR_TOKEN"
+    else
+        printf '%s' "$1"
+    fi
+}
 
 mc_compute_standing() {
     STANDING_STATUS="skipped-unavailable"
@@ -214,17 +240,25 @@ mc_compute_standing() {
     STANDING_LINKS=0
     STANDING_BYTES=0
     STANDING_IDS_CSV=""
+    STANDING_ANCHOR_LINE=""
+    STANDING_ANCHOR_TOKEN=""
 
-    local args
+    local args cr_text cr
     args=(standing --project "$MC_PROJECT" --db "$MC_DB_PATH")
     [ -n "${MEMCONTINUUM_ROOT:-}" ] && args+=(--root "$MEMCONTINUUM_ROOT")
+    # Live files for the anchor summary come from the configured code roots.
+    cr_text="$(mc_code_roots)"
+    while IFS= read -r cr; do
+        [ -n "$cr" ] && args+=(--code-root "$cr")
+    done <<<"$cr_text"
 
     local json_out
     json_out="$(env PYTHONPATH= "$MC_PY" "$MC_MEMIDX" "${args[@]}" --json 2>>"$MC_LOG")"
 
-    local meta_tmp text_tmp
+    local meta_tmp text_tmp anchor_tmp
     meta_tmp="$(mktemp 2>/dev/null)" || return
     text_tmp="$(mktemp 2>/dev/null)" || { rm -f "$meta_tmp"; return; }
+    anchor_tmp="$(mktemp 2>/dev/null)" || { rm -f "$meta_tmp" "$text_tmp"; return; }
     env PYTHONPATH= "$MC_PY" -c '
 import json, sys
 
@@ -260,32 +294,63 @@ if "hash" in obj:
         if _tid and _tid not in _seen_ids:
             _seen_ids.append(_tid)
     ids_csv = ",".join(_seen_ids) if _seen_ids else "-"
-    print("ok - %d %s %d %s" % (obj.get("links", 0), obj.get("hash", "-"), obj.get("bytes", 0), ids_csv))
+    # Anchor summary (0.5.0 PR 2): the engine renders the line; this only
+    # carries it to a file and names a log token (no spaces, "-" when none).
+    _asum = obj.get("anchor_summary")
+    _token = "-"
+    if isinstance(_asum, dict):
+        # The count list: the highest positive count, or every positive count plus
+        # unchecked when the budget never reached a topic (never "clean" then).
+        _counts = ""
+        for _k in ("changed", "missing", "never"):
+            if _asum.get(_k):
+                _counts = "%s=%d" % (_k, _asum[_k])
+                break
+        if _asum.get("unchecked"):
+            _parts = ["%s=%d" % (k, _asum[k]) for k in ("changed", "missing", "never") if _asum.get(k)]
+            _parts.append("unchecked=%d" % _asum["unchecked"])
+            _counts = ",".join(_parts)
+        # A skip or a cap-dropped line is named AND keeps the counts (gate round 3).
+        _lead = ""
+        if _asum.get("skipped"):
+            _lead = "skipped-%s" % _asum["skipped"]
+        elif _asum.get("dropped"):
+            _lead = "dropped-%s" % _asum["dropped"]
+        _token = ",".join(x for x in (_lead, _counts) if x) or "clean"
+    try:
+        with open(sys.argv[3], "w") as f:
+            f.write(str(obj.get("anchor_line") or ""))
+    except OSError:
+        pass
+    print("ok - %d %s %d %s %s" % (obj.get("links", 0), obj.get("hash", "-"), obj.get("bytes", 0), ids_csv, _token))
 elif "reason" in obj:
     # Fix-round MINOR (Grok): the over-cap envelope carries "reason":
     # "over-cap" and no "state" at all -- falling into the generic
     # obj.get("state", "unknown") branch below used to report this as
     # `standing=skipped-unknown`, losing the one piece of information
     # (the store is over its own cap) an operator most needs to see.
-    print("refused %s 0 - 0 -" % obj.get("reason", "unknown"))
+    print("refused %s 0 - 0 - -" % obj.get("reason", "unknown"))
 else:
-    print("refused %s 0 - 0 -" % obj.get("state", "unknown"))
-' "$json_out" "$text_tmp" >"$meta_tmp" 2>>"$MC_LOG"
+    print("refused %s 0 - 0 - -" % obj.get("state", "unknown"))
+' "$json_out" "$text_tmp" "$anchor_tmp" >"$meta_tmp" 2>>"$MC_LOG"
 
-    local kind rstate links hash nbytes ids
-    read -r kind rstate links hash nbytes ids <"$meta_tmp" 2>/dev/null
+    local kind rstate links hash nbytes ids atoken
+    read -r kind rstate links hash nbytes ids atoken <"$meta_tmp" 2>/dev/null
     rm -f "$meta_tmp" 2>/dev/null
 
     if [ "${kind:-}" != "ok" ]; then
         STANDING_STATUS="skipped-${rstate:-unknown}"
-        rm -f "$text_tmp" 2>/dev/null
+        rm -f "$text_tmp" "$anchor_tmp" 2>/dev/null
         return
     fi
     if [ "${links:-0}" = "0" ]; then
         STANDING_STATUS="empty"
-        rm -f "$text_tmp" 2>/dev/null
+        rm -f "$text_tmp" "$anchor_tmp" 2>/dev/null
         return
     fi
+    STANDING_ANCHOR_LINE="$(cat "$anchor_tmp" 2>/dev/null)"
+    [ -n "${atoken:-}" ] && [ "$atoken" != "-" ] && STANDING_ANCHOR_TOKEN="$atoken"
+    rm -f "$anchor_tmp" 2>/dev/null
 
     STANDING_TEXT="$(cat "$text_tmp" 2>/dev/null)"
     rm -f "$text_tmp" 2>/dev/null
@@ -609,8 +674,8 @@ print(json.dumps(state))
             fi
             rm -f "${STANDING_VERDICT_TMP:-}" 2>/dev/null
             if [ "$STANDING_VERDICT" = "inject" ]; then
-                STANDING_CTX="$STANDING_TEXT"
-                STANDING_LOG_TOKEN="injected links=$STANDING_LINKS bytes=$STANDING_BYTES hash=$STANDING_HASH"
+                STANDING_CTX="$(mc_standing_with_anchor "$STANDING_TEXT")"
+                STANDING_LOG_TOKEN="$(mc_standing_log_token "injected links=$STANDING_LINKS bytes=$STANDING_BYTES hash=$STANDING_HASH")"
             else
                 STANDING_LOG_TOKEN="dedup"
             fi
@@ -669,8 +734,8 @@ print(json.dumps(state))
         HAD_STATE_FILE=0
         [ -f "$STATE_FILE" ] && HAD_STATE_FILE=1
         if [ "$STANDING_STATUS" = "ready" ]; then
-            STANDING_CTX="$STANDING_TEXT"
-            STANDING_LOG_TOKEN="injected links=$STANDING_LINKS bytes=$STANDING_BYTES hash=$STANDING_HASH"
+            STANDING_CTX="$(mc_standing_with_anchor "$STANDING_TEXT")"
+            STANDING_LOG_TOKEN="$(mc_standing_log_token "injected links=$STANDING_LINKS bytes=$STANDING_BYTES hash=$STANDING_HASH")"
             # Persist unconditionally, even when no state file exists yet
             # -- the OLD `[ -f "$STATE_FILE" ]` guard here meant a compact
             # with no prior state injected but could never STORE the
