@@ -3578,6 +3578,41 @@ original ruling. A second run finds every key present and changes nothing. It
 prints a per-topic summary and the exact diff; the orchestrator reviews and
 commits.
 
+**Delivery.** Three routes render the same status, computed by one function
+(`anchor_statuses` over an `AnchorChecker`, rendered by `anchor_header_line`).
+Delivery is **read-only and chunker-free by construction**: it never calls a
+chunker, `validate_chunk_result`, `open_code_db` or `code_index_report`, and
+never writes. Live bytes come from the caller; a `path#symbol` span is looked
+up in the code index opened `?mode=ro` and trusted only when
+`file_sha.sha256` equals the live file's SHA-256, else "index stale". Anchors
+are read from the topic file (`records.path` is absolute), not from the index,
+so there is no index table and no schema bump.
+
+Per reference, the verdict is one of: changed (live bytes differ from the
+row), missing (`file gone`, `symbol absent`, `symbol ambiguous`, `snapshot
+unavailable`, `index stale`, `check budget exhausted` — a check was
+attempted and could not conclude), never captured (an eligible file or
+`path#symbol` reference with no row), not checked (a prefix, a glob, a
+directory), or silence (the row matched). The header names one reference, the
+highest-priority verdict (changed, missing, never captured, not checked), and
+`(+N more)` for the other references with the same verdict; a row captured as
+`backfill` adds `Captured at backfill YYYY-MM-DD; original ruling bytes
+unknown.` Texts: `Anchor changed since capture (<ruling|bind|backfill>):
+<ref>`, `Anchor missing: <ref> (<reason>).`, `Anchor never captured: <ref>.`,
+`Anchor not checked: <ref> is a prefix or glob.` The line never changes a
+link's status or authority, and when a reference has several rows the one for
+the topic's current link is compared.
+
+*Pre-edit (`for-path --live-file ABS`).* `hooks/pre-edit-chain.sh` passes the
+file being edited; only a reference whose path **is** the queried candidate is
+compared (a prefix or glob that matched is "not checked"). The line is
+inserted by `topic_chain_lines` right after the topic header, before the
+links, so the plain text and `--json --with-chain-text` stay identical. The
+anchor work is bounded by `ANCHOR_BUDGET_SECONDS` (300 ms, monotonic) for the
+whole call; once spent, remaining checks say `check budget exhausted` and the
+ruling is delivered anyway. Without `--live-file`, `for-path` is unchanged.
+Any exception in the anchor work is swallowed (fail open).
+
 ## Context packs
 
 Hooks never fire on a read-only review, and a reviewer's snapshot is a clone

@@ -4298,6 +4298,221 @@ def anchor_row_key(row: dict) -> tuple:
     return (str(row.get("ref")), str(row.get("link")))
 
 
+# ---------------------------------------------------------------------------
+# anchors: delivery -- one status computation, three routes render from it
+# ---------------------------------------------------------------------------
+#
+# READ-ONLY and CHUNKER-FREE by construction: nothing below imports a chunker,
+# calls open_code_db / code_index_report / validate_chunk_result, or writes
+# anywhere. Live bytes come from the caller (the hook's file, or a code root);
+# a symbol span is looked up in the code index opened `?mode=ro` and trusted
+# only when file_sha.sha256 equals the live file's hash. Capture (above, in
+# the bind block) is the only anchor code allowed to run a chunker.
+
+ANCHOR_BUDGET_SECONDS = 0.3
+ANCHOR_STATUS_PRIORITY = ("changed", "missing", "never", "not_checked")
+ANCHOR_MISSING_REASONS = (
+    "file gone", "symbol absent", "symbol ambiguous", "snapshot unavailable",
+    "index stale", "check budget exhausted",
+)
+
+
+def anchor_pick_row(rows: list, ref: str, current_link: str | None) -> dict | None:
+    """The anchor row delivery compares for `ref`: the one for the topic's
+    current link when present, else the newest (last) row for that ref."""
+    mine = [r for r in rows if str(r.get("ref")) == ref]
+    for row in mine:
+        if current_link is not None and str(row.get("link")) == current_link:
+            return row
+    return mine[-1] if mine else None
+
+
+class AnchorChecker:
+    """Compares anchor rows against live bytes. `live_bytes(ref_path)` returns
+    the live file's bytes or None; `is_dir(ref_path)` (optional) says a path
+    is a directory. `code_db` is the code index path, opened `?mode=ro` on
+    first use only. `deadline` is a `time.monotonic()` value."""
+
+    def __init__(self, project: str, live_bytes, code_db=None, deadline=None, is_dir=None):
+        self.project = project
+        self.live_bytes = live_bytes
+        self.code_db = Path(code_db) if code_db else None
+        self.deadline = deadline
+        self.is_dir = is_dir or (lambda _p: False)
+        self._conn = None
+        self._tried = False
+
+    def expired(self) -> bool:
+        return self.deadline is not None and time.monotonic() > self.deadline
+
+    def _db(self):
+        if not self._tried:
+            self._tried = True
+            try:
+                if self.code_db is not None and self.code_db.exists():
+                    self._conn = sqlite3.connect(
+                        f"file:{quote(str(self.code_db))}?mode=ro", uri=True, timeout=0.2)
+                    self._conn.row_factory = sqlite3.Row
+            except sqlite3.Error:
+                self._conn = None
+        return self._conn
+
+    def close(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except sqlite3.Error:
+                pass
+            self._conn = None
+
+    def check(self, row: dict) -> tuple:
+        """`("ok" | "changed" | "missing", reason)` for one anchor row."""
+        if self.expired():
+            return "missing", "check budget exhausted"
+        ref_path, frag = code_ref_split(str(row.get("ref")))
+        data = self.live_bytes(ref_path)
+        if data is None:
+            return "missing", "file gone"
+        if row.get("span") != "symbol" or frag is None:
+            return ("ok" if sha256_hex(data) == str(row.get("digest")) else "changed"), ""
+        conn = self._db()
+        if conn is None:
+            return "missing", "snapshot unavailable"
+        live_sha = sha256_hex(data)
+        try:
+            shas = conn.execute(
+                "SELECT code_root, sha256 FROM file_sha WHERE project=? AND path=?",
+                (self.project, ref_path)).fetchall()
+            if not shas:
+                return "missing", "snapshot unavailable"
+            roots = [r["code_root"] for r in shas if r["sha256"] == live_sha]
+            if not roots:
+                return "missing", "index stale"
+            marks = ",".join("?" * len(roots))
+            chunks = conn.execute(
+                f"SELECT symbol, qualified_name, start_line, end_line FROM chunks "
+                f"WHERE project=? AND path=? AND code_root IN ({marks})",
+                (self.project, ref_path, *roots)).fetchall()
+        except sqlite3.Error:
+            return "missing", "snapshot unavailable"
+        ranges = sorted({
+            (c["start_line"], c["end_line"]) for c in chunks
+            if fragment_matches_symbol(frag, c["symbol"], c["qualified_name"])
+        })
+        if not ranges:
+            return "missing", "symbol absent"
+        if len(ranges) > 1:
+            return "missing", "symbol ambiguous"
+        same = sha256_hex(anchor_span_bytes(data, *ranges[0])) == str(row.get("digest"))
+        return ("ok" if same else "changed"), ""
+
+
+def anchor_statuses(fm: dict, refs: list, checker: AnchorChecker, exact_path: str | None = None) -> list:
+    """Status of each of `refs` (strings from the topic's code_refs) as dicts
+    `{ref, kind, detail, row}` with kind in changed / missing / never /
+    not_checked; a ref whose live bytes match its anchor yields nothing
+    (silence). A prefix, a glob, a directory, or -- when `exact_path` is given
+    (the pre-edit route) -- a ref naming a different file than the one being
+    edited, is "not checked"."""
+    rows = anchor_rows(fm)
+    current = _topic_current_link(fm)
+    out = []
+    for ref in refs:
+        ref_path = code_ref_split(ref)[0]
+        if (not code_ref_is_anchorable(ref)
+                or (exact_path is not None and ref_path != exact_path)):
+            out.append({"ref": ref, "kind": "not_checked", "detail": "", "row": None})
+            continue
+        row = anchor_pick_row(rows, ref, current)
+        if row is None:
+            kind = "not_checked" if checker.is_dir(ref_path) else "never"
+            out.append({"ref": ref, "kind": kind, "detail": "", "row": None})
+            continue
+        verdict, reason = checker.check(row)
+        if verdict == "changed":
+            out.append({"ref": ref, "kind": "changed", "detail": str(row.get("captured")), "row": row})
+        elif verdict == "missing":
+            out.append({"ref": ref, "kind": "missing", "detail": reason, "row": row})
+    return out
+
+
+def anchor_header_line(statuses: list) -> str | None:
+    """The one annotation line for a topic: the highest-priority status
+    (changed, missing, never captured, not checked), one ref named, `(+N
+    more)` for the other refs of the same status. None = silence."""
+    for kind in ANCHOR_STATUS_PRIORITY:
+        same = [s for s in statuses if s["kind"] == kind]
+        if not same:
+            continue
+        first, more = same[0], len(same) - 1
+        tail = f" (+{more} more)" if more else ""
+        if kind == "changed":
+            line = f"Anchor changed since capture ({first['detail']}): {first['ref']}{tail}"
+        elif kind == "missing":
+            line = f"Anchor missing: {first['ref']} ({first['detail']}){tail}."
+        elif kind == "never":
+            line = f"Anchor never captured: {first['ref']}{tail}."
+        else:
+            line = f"Anchor not checked: {first['ref']} is a prefix or glob{tail}."
+        row = first["row"]
+        if row is not None and row.get("captured") == "backfill":
+            line += f" Captured at backfill {row.get('captured_at')}; original ruling bytes unknown."
+        return line
+    return None
+
+
+def _live_bytes_from_roots(code_roots: list):
+    """`live_bytes(ref_path)` over a list of code roots (first hit wins)."""
+    def live(ref_path):
+        for root in code_roots:
+            try:
+                return (Path(root) / ref_path).read_bytes()
+            except OSError:
+                continue
+        return None
+    return live
+
+
+def anchor_checker_for_roots(project: str, code_roots: list, code_db=None, deadline=None) -> AnchorChecker:
+    """The standing / context-pack checker: live bytes from `code_roots`."""
+    return AnchorChecker(
+        project, _live_bytes_from_roots(code_roots), code_db=code_db, deadline=deadline,
+        is_dir=lambda p: any((Path(r) / p).is_dir() for r in code_roots),
+    )
+
+
+def for_path_anchor_notes(matches, candidate: str, live_file: str, project: str, code_db=None) -> dict:
+    """`{topic id: annotation line}` for the topics matching `candidate`,
+    compared against `live_file`'s bytes (the file being edited). Only a ref
+    whose path IS the candidate is compared; a prefix/glob that matched is
+    "not checked". Bounded by ANCHOR_BUDGET_SECONDS."""
+    deadline = time.monotonic() + ANCHOR_BUDGET_SECONDS
+    cache: list = []
+
+    def live(ref_path):
+        if ref_path != candidate:
+            return None
+        if not cache:
+            try:
+                cache.append(Path(live_file).read_bytes())
+            except OSError:
+                cache.append(None)
+        return cache[0]
+
+    checker = AnchorChecker(project, live, code_db=code_db, deadline=deadline)
+    notes = {}
+    try:
+        for row in matches:
+            fm = parse_record(Path(row["path"])).frontmatter
+            refs = [str(r) for r in fm.get("code_refs") or [] if code_ref_matches(candidate, str(r))]
+            line = anchor_header_line(anchor_statuses(fm, refs, checker, exact_path=candidate))
+            if line:
+                notes[row["id"]] = line
+    finally:
+        checker.close()
+    return notes
+
+
 _GENERIC_UNCHECKABLE_REMEDY = (
     "run backend-preflight, and check whether this file itself can be read"
 )
@@ -4510,7 +4725,7 @@ def topic_chain_json(conn, topic_row) -> dict:
     )
 
 
-def topic_chain_lines(conn, topic_row) -> list:
+def topic_chain_lines(conn, topic_row, annotation: str | None = None) -> list:
     """The plain-text chain-view lines for one topic row -- factored out of
     print_topic_chain so `for-path`'s own renderer (for_path_chain_lines,
     below) can build the exact same text without printing it (round 5: one
@@ -4519,11 +4734,16 @@ def topic_chain_lines(conn, topic_row) -> list:
     link_rows = conn.execute(
         "SELECT * FROM links WHERE topic_path=? ORDER BY seq ASC", (topic_row["path"],)
     ).fetchall()
-    return chain_lines(
+    lines = chain_lines(
         topic_row, link_rows,
         edges_for_topic(conn, topic_row["path"]),
         assumptions_for_topic(conn, topic_row["path"]),
     )
+    if annotation:
+        # PR 2 anchors: one line right after the header, before the links; it
+        # is never a ruling, status or authority line.
+        lines.insert(1, annotation)
+    return lines
 
 
 def _lines_cost(lines) -> int:
@@ -4710,16 +4930,18 @@ def resolve_path_governance(conn, project: str, file_path: str) -> tuple:
     return matches, pairs
 
 
-def for_path_chain_lines(conn, project: str, matches, concept_pairs) -> list:
+def for_path_chain_lines(conn, project: str, matches, concept_pairs, anchor_notes: dict | None = None) -> list:
     """`for-path`'s plain-text rendering, shared by its own non-JSON CLI
     mode and by `--json --with-chain-text` (round 5): one function, one
     text, whichever mode asks for it -- no duplicated formatting.
-    `concept_pairs` is resolve_path_governance's second element."""
+    `concept_pairs` is resolve_path_governance's second element.
+    `anchor_notes` ({topic id: line}, from for_path_anchor_notes) adds the
+    anchor annotation right after each matched topic's header."""
     lines = []
     if not matches and not concept_pairs:
         lines.append("no topics reference this path")
     for row in matches:
-        lines.extend(topic_chain_lines(conn, row))
+        lines.extend(topic_chain_lines(conn, row, (anchor_notes or {}).get(row["id"])))
     for crow, governed in concept_pairs:
         lines.append(f"{crow['id']} {crow['title']} — {crow['owner_boundary']}")
         for trow in governed:
@@ -4766,6 +4988,20 @@ def cmd_for_path(args) -> int:
         if state in ("upgrade-required", "stale", "quarantined"):
             _decision_warn("for-path", args, state, conn=conn)
         matches, concept_pairs = resolve_path_governance(conn, args.project, args.file_path)
+        anchor_notes = {}
+        if getattr(args, "live_file", None) and matches:
+            # Fail open: a hook-facing reader never turns an anchor-check
+            # problem into a missing ruling.
+            try:
+                anchor_notes = for_path_anchor_notes(
+                    matches, args.file_path, args.live_file, args.project,
+                    code_db=resolve_code_db_path(argparse.Namespace(
+                        db=getattr(args, "code_db", None), project=args.project)),
+                )
+            except Exception:
+                if DEBUG:
+                    raise
+                anchor_notes = {}
 
         if args.json:
             out = [topic_chain_json(conn, row) for row in matches]
@@ -4785,7 +5021,7 @@ def cmd_for_path(args) -> int:
                     payload["state"] = state
                 payload["results"] = out
                 payload["chain_text"] = "\n".join(
-                    for_path_chain_lines(conn, args.project, matches, concept_pairs)
+                    for_path_chain_lines(conn, args.project, matches, concept_pairs, anchor_notes)
                 )
                 print(json.dumps(payload, indent=2))
             elif state_worth_naming:
@@ -4793,7 +5029,7 @@ def cmd_for_path(args) -> int:
             else:
                 print(json.dumps(out, indent=2))
         else:
-            for line in for_path_chain_lines(conn, args.project, matches, concept_pairs):
+            for line in for_path_chain_lines(conn, args.project, matches, concept_pairs, anchor_notes):
                 print(line)
         conn.close()
         return 0
@@ -11907,6 +12143,17 @@ def main(argv=None) -> int:
              "wraps a bare-list answer as {\"results\": [...], \"chain_text\": "
              "\"...\"} (a caller like a pre-edit hook needs only one for-path "
              "call per candidate, not a second call for the human-readable text)",
+    )
+    p_forpath.add_argument(
+        "--live-file", dest="live_file", default=None, metavar="ABS",
+        help="the file being edited (absolute path): when given, each matched topic's anchors "
+             "are compared against its bytes and one annotation line is added after the "
+             "topic header; omitted, for-path's output is unchanged",
+    )
+    p_forpath.add_argument(
+        "--code-db", dest="code_db", default=None,
+        help="code index path for symbol anchors (default $MEMCONTINUUM_HOME/<project>-code.sqlite); "
+             "opened read-only",
     )
     p_forpath.set_defaults(func=cmd_for_path)
 

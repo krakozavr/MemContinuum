@@ -371,6 +371,10 @@ try_candidate() {
     local candidate="$1"
     FORPATH_ARGS=(for-path "$candidate" --project "$PROJECT" --db "$DB_PATH")
     [ -n "${MEMCONTINUUM_ROOT:-}" ] && FORPATH_ARGS+=(--root "$MEMCONTINUUM_ROOT")
+    # Anchors (0.5.0 PR 2): the file being edited, so for-path can say when a
+    # bound reference's code changed since its capture. Read-only; the engine
+    # bounds the comparison to 300 ms and fails open.
+    FORPATH_ARGS+=(--live-file "$FILE_PATH")
     FORPATH_ARGS+=(--json --with-chain-text)
     RESULT_JSON="$(PYTHONPATH= "$PY" "$MEMIDX" "${FORPATH_ARGS[@]}" 2>>"$LOG")"
     RC=$?

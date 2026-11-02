@@ -18,6 +18,12 @@
   were bound before anchors existed, hashing the file as it is now and
   labelling the row `backfill` (`--dry-run` prints the diff first). Rerunning
   it changes nothing.
+- The pre-edit hook now says when a bound file or symbol changed since its
+  anchor was captured: one line after the topic header (`Anchor changed since
+  capture (bind): src/foo.py`), or `Anchor missing` / `Anchor never captured` /
+  `Anchor not checked` when the check could not be made. It compares the file
+  being edited, reads the code index read-only, takes at most 300 ms, and
+  never alters a ruling's status or authority.
 
 ### Retrieval
 - New `memidx.py context-pack FILE... [--topic ID] [--query WORDS] [--blind]`

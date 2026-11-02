@@ -5,9 +5,11 @@ of its logic -- because the thing under test is the script's environment
 handling (the PYTHONPATH trap, env-driven project/root resolution, fail-open
 behavior) as much as its output shape.
 """
+import contextlib
 import fcntl
 import glob
 import hashlib
+import io
 import json
 import os
 import re
@@ -925,6 +927,73 @@ class TestQueryLib(unittest.TestCase):
         rel = self._source_path(remapped, "/some/unrelated/dir", "/repo-a/")
         self.assertEqual(rel, "src/core/scan/unbound.py")
         self.assertEqual(self._tokens(rel), "scan unbound")
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestPreEditChainAnchors(unittest.TestCase):
+    """0.5.0 PR 2: the hook passes the file being edited as --live-file, and a
+    bound reference whose code changed since capture says so right after the
+    topic header. End to end through hooks/pre-edit-chain.sh."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-hook-anchor-test-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = Path(self.tmp) / "repo"
+        (self.repo / "src").mkdir(parents=True)
+        self.store = Path(self.tmp) / "store"
+        (self.store / "topics").mkdir(parents=True)
+        self.home = Path(self.tmp) / "home"
+        self.home.mkdir()
+        self.project = "hookanchor"
+        (self.repo / "src" / "foo.py").write_text("def alpha():\n    return 1\n")
+        (self.store / "topics" / "a.md").write_text(
+            "---\ntype: topic\nid: TOP-9500\ntitle: Anchored\narea: testing\ncurrent: L1\n"
+            "tags: []\ncode_refs: [src/foo.py]\n"
+            "links:\n  - link: L1\n    date: '2026-01-01'\n    status: active\n    kind: adopted\n"
+            "    ruling: {text: bound ruling, authority: owner-ratified, source: s}\n"
+            "---\n\nBody.\n"
+        )
+        self.db = self.home / f"{self.project}.sqlite"
+
+    def _bind_and_index(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = memidx.main(["bind", "TOP-9500", "src/foo.py", "--root", str(self.store),
+                              "--code-root", str(self.repo)])
+        self.assertEqual(rc, 0)
+        memidx.cmd_reindex(SimpleNamespace(root=str(self.store), project=self.project,
+                                           db=str(self.db), full=True, no_embed=True))
+
+    def _run(self):
+        payload = json.dumps({
+            "hook_event_name": "PreToolUse", "tool_name": "Edit", "cwd": "/elsewhere",
+            "tool_input": {"file_path": str(self.repo / "src" / "foo.py")},
+        })
+        env = clean_env(
+            MEMCONTINUUM_HOME=str(self.home), MEMCONTINUUM_PROJECT=self.project,
+            MEMCONTINUUM_PYTHON=VENV_PYTHON, MEMCONTINUUM_STRIP_PREFIX=f"{self.repo}/",
+            MEMCONTINUUM_ROOT=str(self.store),
+        )
+        proc, _elapsed = run_hook(payload, env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+
+    def test_changed_code_is_announced_after_the_header(self):
+        self._bind_and_index()
+        (self.repo / "src" / "foo.py").write_text("def alpha():\n    return 2\n")
+        ctx = self._run()
+        lines = ctx.splitlines()
+        at = next(i for i, ln in enumerate(lines) if ln.startswith("TOP-9500 Anchored"))
+        self.assertEqual(lines[at + 1], "Anchor changed since capture (bind): src/foo.py")
+        self.assertIn("bound ruling", ctx)
+
+    def test_unchanged_code_adds_no_anchor_line(self):
+        self._bind_and_index()
+        self.assertNotIn("Anchor ", self._run())
+
+    def test_unanchored_reference_says_never_captured(self):
+        memidx.cmd_reindex(SimpleNamespace(root=str(self.store), project=self.project,
+                                           db=str(self.db), full=True, no_embed=True))
+        self.assertIn("Anchor never captured: src/foo.py.", self._run())
 
 
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
@@ -2203,8 +2272,16 @@ class TestPreEditChainOracleParity(unittest.TestCase):
         r"Decision-chain memory: \d+ topic\(s\) reference this file\."
     )
 
+    # 0.5.0 PR 2: the current hook passes --live-file, so a matched topic
+    # gains one "Anchor ..." annotation line (a JSON-escaped `\nAnchor ...`
+    # inside additionalContext) the frozen oracle never prints. Those lines
+    # are the one other intended difference; they are normalised away so
+    # every other byte still has to match.
+    _ANCHOR_LINE_RE = re.compile(r'\\nAnchor [^"\\]*')
+
     def _assert_stdout_matches_except_topic_count(self, new_stdout, oracle_stdout):
         def _normalized(text):
+            text = self._ANCHOR_LINE_RE.sub("", text)
             return self._TOPIC_COUNT_HEADER_RE.sub(
                 "Decision-chain memory: N topic(s) reference this file.", text
             )

@@ -695,6 +695,237 @@ class TestAnchorBackfill(SessionCase):
         self.assertEqual(sorted(r["ref"] for r in self.rows()), ["src/a.py", "src/b.py"])
 
 
+class DeliveryCase(SessionCase):
+    """For-path delivery fixtures: real bind -> mutate the code -> for-path."""
+
+    def setUp(self):
+        super().setUp()
+        self.codedb = self.td / "p-code.sqlite"
+
+    def bind(self, ref, tid="TOP-9001", *extra):
+        rc, out, err = run_memidx(["bind", tid, ref, "--root", str(self.store),
+                                   "--code-root", str(self.code), *extra])
+        self.assertEqual(rc, 0, err)
+
+    def code_reindex(self):
+        rc, out, err = run_memidx(["code-reindex", "--code-root", str(self.code), "--project", "p",
+                                   "--db", str(self.codedb), "--lang", "python", "--no-embed"])
+        self.assertEqual(rc, 0, err)
+
+    def for_path(self, cand, live=None, *extra, json_text=False, with_live=True):
+        live = live if live is not None else str(self.code / cand)
+        args = ["for-path", cand, "--project", "p", "--db", str(self.db), "--root", str(self.store)]
+        if with_live:
+            args += ["--live-file", live, "--code-db", str(self.codedb)]
+        args += list(extra)
+        if json_text:
+            args += ["--json", "--with-chain-text"]
+        rc, out, err = run_memidx(args)
+        self.assertEqual(rc, 0, err)
+        return out
+
+    def lines(self, out):
+        return out.splitlines()
+
+    def anchor_lines(self, out):
+        return [ln for ln in self.lines(out) if ln.startswith("Anchor ")]
+
+
+class TestForPathAnchorDelivery(DeliveryCase):
+    def start(self, refs=("src/foo.py",), src=PY_SRC):
+        self.add_topic("a", plain_topic("TOP-9001", ["src/other.py"], "Alpha"))
+        self.code_file("src/foo.py", src)
+        for ref in refs:
+            self.bind(ref)
+        self.reindex()
+
+    def test_unchanged_is_silent(self):
+        self.start()
+        self.assertEqual(self.anchor_lines(self.for_path("src/foo.py")), [])
+
+    def test_changed_file_names_the_capture_kind_right_after_the_header(self):
+        self.start()
+        self.code_file("src/foo.py", PY_SRC + "# edit\n")
+        self.reindex()
+        out = self.for_path("src/foo.py")
+        lines = self.lines(out)
+        self.assertTrue(lines[0].startswith("TOP-9001 Alpha"))
+        self.assertEqual(lines[1], "Anchor changed since capture (bind): src/foo.py")
+        self.assertTrue(lines[2].lstrip().startswith("L1"), lines[:3])
+
+    def test_status_and_authority_strings_are_unchanged_by_the_annotation(self):
+        self.start()
+        plain = self.for_path("src/foo.py", with_live=False)
+        self.code_file("src/foo.py", "different\n")
+        annotated = self.for_path("src/foo.py")
+        self.assertEqual([ln for ln in annotated.splitlines() if not ln.startswith("Anchor ")],
+                         plain.splitlines())
+
+    def test_json_chain_text_is_the_same_text_as_plain_mode(self):
+        self.start()
+        self.code_file("src/foo.py", "different\n")
+        plain = self.for_path("src/foo.py")
+        env = json.loads(self.for_path("src/foo.py", json_text=True))
+        self.assertEqual(env["chain_text"], plain.rstrip("\n"))
+        self.assertIn("Anchor changed since capture", env["chain_text"])
+
+    def test_without_live_file_nothing_changes(self):
+        self.start()
+        self.code_file("src/foo.py", "different\n")
+        self.assertEqual(self.anchor_lines(self.for_path("src/foo.py", with_live=False)), [])
+
+    def test_missing_file_gone(self):
+        self.start()
+        out = self.for_path("src/foo.py", live=str(self.code / "src" / "gone.py"))
+        self.assertIn("Anchor missing: src/foo.py (file gone).", out)
+
+    def test_never_captured(self):
+        self.add_topic("a", plain_topic("TOP-9001", ["src/foo.py"], "Alpha"))
+        self.code_file("src/foo.py", PY_SRC)
+        self.reindex()
+        self.assertEqual(self.anchor_lines(self.for_path("src/foo.py")),
+                         ["Anchor never captured: src/foo.py."])
+
+    def test_prefix_and_glob_refs_are_not_checked(self):
+        for ref, text in (("src/", "Anchor not checked: src/ is a prefix or glob."),
+                          ("src/*.py", "Anchor not checked: src/*.py is a prefix or glob.")):
+            with self.subTest(ref=ref):
+                (self.store / "topics" / "a.md").write_text(plain_topic("TOP-9001", [ref], "Alpha"))
+                self.code_file("src/foo.py", PY_SRC)
+                self.reindex()
+                self.assertEqual(self.anchor_lines(self.for_path("src/foo.py")), [text])
+
+    def test_priority_changed_beats_never_and_more_counts_same_status_refs(self):
+        self.add_topic("a", plain_topic(
+            "TOP-9001", ["src/foo.py", "src/foo.py#beta", "src/foo.py#alpha", "src/foo.py#nope2"], "Alpha"))
+        self.code_file("src/foo.py", PY_SRC)
+        self.bind("src/foo.py")
+        self.bind("src/foo.py#beta")
+        self.code_file("src/foo.py", PY_SRC + "# edit\n")
+        self.reindex()
+        # the file row changed; the #beta row would be missing (no code index) and
+        # two refs were never captured -- changed outranks both
+        out = self.for_path("src/foo.py")
+        lines = self.anchor_lines(out)
+        self.assertEqual(lines, ["Anchor changed since capture (bind): src/foo.py"])
+        self.code_file("src/foo.py", PY_SRC)   # file row now matches again; #beta needs the index
+        out = self.for_path("src/foo.py")
+        self.assertEqual(self.anchor_lines(out),
+                         ["Anchor missing: src/foo.py#beta (snapshot unavailable)."])
+
+    def test_more_suffix_counts_other_refs_of_the_same_status(self):
+        self.add_topic("a", plain_topic("TOP-9001", ["src/foo.py", "src/foo.py#zzz"], "Alpha"))
+        self.code_file("src/foo.py", PY_SRC)
+        self.bind("src/foo.py")
+        self.bind("src/foo.py#zzz")        # zero matches -> captured as a file-span row
+        self.code_file("src/foo.py", "changed\n")
+        self.reindex()
+        self.assertEqual(self.anchor_lines(self.for_path("src/foo.py")),
+                         ["Anchor changed since capture (bind): src/foo.py (+1 more)"])
+
+    def test_backfill_rows_add_the_late_capture_sentence(self):
+        self.add_topic("a", plain_topic("TOP-9001", ["src/foo.py"], "Alpha"))
+        self.code_file("src/foo.py", PY_SRC)
+        self.session("s1", [self.ledger_row("src/foo.py")])
+        rc, out, err = run_memidx(["anchor-backfill", "--root", str(self.store), "--project", "p",
+                                   "--sessions-dir", str(self.sessions), "--code-root", str(self.code)])
+        self.assertEqual(rc, 0, err)
+        self.code_file("src/foo.py", "changed\n")
+        self.reindex()
+        self.assertEqual(
+            self.anchor_lines(self.for_path("src/foo.py")),
+            ["Anchor changed since capture (backfill): src/foo.py Captured at backfill 2026-11-02; "
+             "original ruling bytes unknown."])
+
+    def test_budget_exhausted_still_delivers_the_ruling(self):
+        self.start()
+        with mock.patch.object(memidx, "ANCHOR_BUDGET_SECONDS", -1.0):
+            out = self.for_path("src/foo.py")
+        self.assertIn("Anchor missing: src/foo.py (check budget exhausted).", out)
+        self.assertIn("a ruling", out)
+
+
+class TestForPathSymbolAnchors(DeliveryCase):
+    def start(self):
+        self.add_topic("a", plain_topic("TOP-9001", ["src/other.py"], "Alpha"))
+        self.code_file("src/foo.py", PY_SRC)
+        self.bind("src/foo.py#beta")
+        self.reindex()
+        self.code_reindex()
+
+    def test_unchanged_symbol_is_silent(self):
+        self.start()
+        self.assertEqual(self.anchor_lines(self.for_path("src/foo.py")), [])
+
+    def test_changed_symbol_body(self):
+        self.start()
+        self.code_file("src/foo.py", PY_SRC.replace("x = 2", "x = 3"))
+        self.code_reindex()
+        self.assertEqual(self.anchor_lines(self.for_path("src/foo.py")),
+                         ["Anchor changed since capture (bind): src/foo.py#beta"])
+
+    def test_edit_elsewhere_in_the_file_leaves_the_symbol_anchor_silent(self):
+        self.start()
+        self.code_file("src/foo.py", PY_SRC.replace("return 1", "return 11"))
+        self.code_reindex()
+        self.assertEqual(self.anchor_lines(self.for_path("src/foo.py")), [])
+
+    def test_symbol_absent(self):
+        self.start()
+        self.code_file("src/foo.py", "def alpha():\n    return 1\n")
+        self.code_reindex()
+        self.assertEqual(self.anchor_lines(self.for_path("src/foo.py")),
+                         ["Anchor missing: src/foo.py#beta (symbol absent)."])
+
+    def test_symbol_ambiguous(self):
+        self.start()
+        self.code_file("src/foo.py", PY_AMBIGUOUS + "\ndef beta():\n    return 1\n\nclass C:\n    def beta(self):\n        return 2\n")
+        self.code_reindex()
+        self.assertEqual(self.anchor_lines(self.for_path("src/foo.py")),
+                         ["Anchor missing: src/foo.py#beta (symbol ambiguous)."])
+
+    def test_snapshot_unavailable_without_a_code_index(self):
+        self.start()
+        self.codedb.unlink()
+        self.assertEqual(self.anchor_lines(self.for_path("src/foo.py")),
+                         ["Anchor missing: src/foo.py#beta (snapshot unavailable)."])
+
+    def test_index_stale_when_the_file_moved_after_indexing(self):
+        self.start()
+        self.code_file("src/foo.py", PY_SRC + "\n# moved on, index not refreshed\n")
+        self.assertEqual(self.anchor_lines(self.for_path("src/foo.py")),
+                         ["Anchor missing: src/foo.py#beta (index stale)."])
+
+    def test_delivery_is_read_only_and_chunker_free(self):
+        self.start()
+        self.code_file("src/foo.py", PY_SRC.replace("x = 2", "x = 3"))
+        self.code_reindex()
+        before = {p.name: p.read_bytes() for p in self.td.glob("p-code.sqlite*")}
+        opened = []
+        real_connect = memidx.sqlite3.connect
+
+        def spy(target, *a, **kw):
+            opened.append(str(target))
+            return real_connect(target, *a, **kw)
+
+        def boom(*a, **kw):
+            raise AssertionError("delivery touched a chunker / writable code index")
+
+        with mock.patch.object(memidx.sqlite3, "connect", spy), \
+                mock.patch.object(memidx.chunkers, "get_chunker", boom), \
+                mock.patch.object(memidx, "validate_chunk_result", boom), \
+                mock.patch.object(memidx, "open_code_db", boom), \
+                mock.patch.object(memidx, "code_index_report", boom):
+            out = self.for_path("src/foo.py")
+        self.assertIn("Anchor changed since capture", out)
+        code_opens = [o for o in opened if "p-code.sqlite" in o]
+        self.assertTrue(code_opens)
+        for target in code_opens:
+            self.assertTrue(target.startswith("file:") and "mode=ro" in target, target)
+        after = {p.name: p.read_bytes() for p in self.td.glob("p-code.sqlite*")}
+        self.assertEqual(before, after)
+
+
 class TestLinkRawSpansUnchanged(unittest.TestCase):
     def test_default_key_walks_links(self):
         text = topic_text([good_row()])
