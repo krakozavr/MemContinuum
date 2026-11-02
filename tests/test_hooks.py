@@ -996,6 +996,71 @@ class TestPreEditChainAnchors(unittest.TestCase):
         self.assertIn("Anchor never captured: src/foo.py.", self._run())
 
 
+    # -- matcher-derived layouts: the in-root worktree the settings filter admits --
+
+    def _filter_admits(self, tool, file_path):
+        """Whether the rendered `if` filter of code-root-filter-pair.json.tmpl for
+        `tool` admits `file_path` under the code root `self.repo` -- derived from
+        the template itself, not restated here. The filter shape is
+        `Tool(/<root>/**)`: a path-prefix glob."""
+        text = (TOOLS_DIR / "templates" / "code-root-filter-pair.json.tmpl").read_text()
+        text = text.replace("{{CODE_ROOT}}", str(self.repo).lstrip("/"))
+        for m in re.finditer(r'"if":\s*"(\w+)\((/[^)]*)/\*\*\)"', text):
+            if m.group(1) == tool:
+                return file_path.startswith(m.group(2) + "/")
+        self.fail(f"no {tool} filter in the template")
+
+    def _git_repo_with_in_root_worktree(self):
+        for cmd in (["git", "init", "-q"], ["git", "config", "user.email", "t@t.local"],
+                    ["git", "config", "user.name", "t"]):
+            subprocess.run(cmd, cwd=self.repo, check=True)
+        (self.repo / ".gitignore").write_text(".worktrees/\n")
+        subprocess.run(["git", "add", "-A"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=self.repo, check=True)
+        wt = self.repo / ".worktrees" / "feat"
+        subprocess.run(["git", "worktree", "add", "-q", "-b", "wt-anchor", str(wt)],
+                       cwd=self.repo, check=True)
+        return wt
+
+    def _run_on(self, file_path, cwd):
+        payload = json.dumps({
+            "hook_event_name": "PreToolUse", "tool_name": "Edit", "cwd": str(cwd),
+            "tool_input": {"file_path": str(file_path)},
+        })
+        env = clean_env(
+            MEMCONTINUUM_HOME=str(self.home), MEMCONTINUUM_PROJECT=self.project,
+            MEMCONTINUUM_PYTHON=VENV_PYTHON, MEMCONTINUUM_STRIP_PREFIX=f"{self.repo}/",
+            MEMCONTINUUM_ROOT=str(self.store),
+        )
+        proc, _elapsed = run_hook(payload, env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+
+    def test_in_root_worktree_compares_the_worktrees_bytes_not_the_main_checkouts(self):
+        wt = self._git_repo_with_in_root_worktree()
+        wt_file = wt / "src" / "foo.py"
+        for tool in ("Edit", "Write"):
+            self.assertTrue(self._filter_admits(tool, str(wt_file)),
+                            f"the {tool} filter must admit an in-root worktree path")
+        self._bind_and_index()                 # anchor = the main checkout's bytes
+        captured = (self.repo / "src" / "foo.py").read_text()
+        self.assertEqual(wt_file.read_text(), captured)
+
+        # case 1: main edited, worktree still holds the captured bytes -> matched, silent
+        (self.repo / "src" / "foo.py").write_text("def alpha():\n    return 'main differs'\n")
+        ctx = self._run_on(wt_file, self.repo)
+        self.assertIn("TOP-9500", ctx)
+        self.assertNotIn("Anchor ", ctx)
+
+        # case 2: main back to the captured bytes, worktree edited -> changed
+        (self.repo / "src" / "foo.py").write_text(captured)
+        wt_file.write_text("def alpha():\n    return 'worktree differs'\n")
+        ctx = self._run_on(wt_file, self.repo)
+        lines = ctx.splitlines()
+        at = next(i for i, ln in enumerate(lines) if ln.startswith("TOP-9500 Anchored"))
+        self.assertEqual(lines[at + 1], "Anchor changed since capture (bind): src/foo.py")
+
+
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
 class TestPreEditChainWorktreeGap(unittest.TestCase):
     """Worktree gap fix (docs/internal/SESSION-HANDOFF-releases-0.3-to-0.6.md
