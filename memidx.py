@@ -4427,7 +4427,7 @@ def anchor_statuses(fm: dict, refs: list, checker: AnchorChecker, exact_path: st
     for ref in refs:
         ref_path = code_ref_split(ref)[0]
         if (not code_ref_is_anchorable(ref)
-                or (exact_path is not None and ref_path != exact_path)):
+                or (exact_path is not None and not code_ref_matches_exact(exact_path, ref))):
             out.append({"ref": ref, "kind": "not_checked", "detail": "", "row": None})
             continue
         row = anchor_pick_row(rows, ref, current)
