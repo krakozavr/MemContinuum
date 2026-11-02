@@ -1787,6 +1787,51 @@ class TestGateRound3WallClock(DeliveryCase):
             st = memidx.anchor_statuses(row_fm, ["src/foo.py"], checker)
         self.assertEqual([(x["kind"], x["detail"]) for x in st], [("missing", "check budget exhausted")])
 
+    def test_for_path_two_refs_second_hash_exhausts_gives_only_the_exhausted_header(self):
+        self.add_topic("a", plain_topic("TOP-9001", ["src/other.py"], "Alpha"))
+        self.code_file("src/foo.py", PY_SRC)
+        self.bind("src/foo.py")
+        self.bind("src/foo.py#beta")
+        self.reindex()
+        self.code_reindex()
+        self.code_file("src/foo.py", PY_SRC.replace("x = 2", "x = 3"))
+        self.code_reindex()
+        now = {"t": 0.0}
+        real = memidx.sha256_hex
+        calls = []
+
+        def crossing(b):
+            out = real(b)
+            calls.append(1)
+            if len(calls) == 2:       # the second ref's first hash
+                now["t"] = 100.0
+            return out
+
+        with mock.patch.object(memidx.time, "monotonic", lambda: now["t"]), \
+                mock.patch.object(memidx, "sha256_hex", crossing):
+            out = self.for_path("src/foo.py")
+        self.assertEqual(self.anchor_lines(out), ["Anchor missing: src/foo.py (check budget exhausted)."])
+        self.assertNotIn("Anchor changed", out)
+
+    def test_standing_without_a_worker_connection_counts_every_topic_unchecked(self):
+        self._bound_standing()
+        conn = memidx.open_db_noncreating(self.db, project="p")
+        real = memidx.open_db_readonly
+
+        def failing(path, *a, **k):
+            if Path(path) == self.db:
+                return None
+            return real(path, *a, **k)
+
+        try:
+            with mock.patch.object(memidx, "open_db_readonly", failing):
+                summary = memidx.standing_anchor_summary(
+                    conn, "p", ["TOP-9900"], [self.code], code_db=self.codedb)
+        finally:
+            conn.close()
+        self.assertEqual(summary.get("unchecked"), 1, summary)
+        self.assertNotIn("skipped", summary)
+
     def test_a_file_over_8_mib_is_exhausted_without_a_read(self):
         self.add_topic("a", plain_topic("TOP-9001", ["src/other.py"], "Alpha"))
         live = self.code_file("src/foo.py", PY_SRC)

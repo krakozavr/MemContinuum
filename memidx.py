@@ -4594,8 +4594,13 @@ def for_path_anchor_notes(matches, candidate: str, live_file: str, project: str,
                     done[row["id"]] = exhausted_line
                     continue
                 refs = [str(r) for r in fm.get("code_refs") or [] if code_ref_matches(candidate, str(r))]
-                done[row["id"]] = anchor_header_line(
-                    anchor_statuses(fm, refs, checker, exact_path=candidate))
+                statuses = anchor_statuses(fm, refs, checker, exact_path=candidate)
+                if any(st["kind"] == "missing" and st["detail"] == "check budget exhausted"
+                       for st in statuses):
+                    # a ref ran out of budget: no partial statuses, only the exhausted header
+                    done[row["id"]] = exhausted_line
+                else:
+                    done[row["id"]] = anchor_header_line(statuses)
         except Exception as exc:  # re-raised below so the caller fails open as before
             failure.append(exc)
         finally:
@@ -4647,9 +4652,13 @@ def standing_anchor_summary(conn, project: str, topic_ids: list, code_roots: lis
             dconn = open_db_readonly(
                 Path(main_file), timeout=max(0.001, min(0.2, deadline - time.monotonic())),
                 check_same_thread=False) if main_file else None
-            if dconn is not None:
-                dconn.set_progress_handler(lambda: 1 if checker._deadline_passed() else 0, 1000)
-            lookup = dconn if dconn is not None else conn
+            if dconn is None:
+                # never borrow the caller's connection from this thread: every topic is unchecked
+                for tid in topic_ids:
+                    done[tid] = None
+                return
+            dconn.set_progress_handler(lambda: 1 if checker._deadline_passed() else 0, 1000)
+            lookup = dconn
             for tid in topic_ids:
                 if checker._deadline_passed():
                     done[tid] = None
