@@ -1481,3 +1481,104 @@ class TestGateRound2Crlf(unittest.TestCase):
         self.assertIn("anchor", out)
         self.assertIn("reformatted", out)
         self.assertIn("L1", out)
+
+
+class TestGateRound2Deadline(DeliveryCase):
+    """Item 2: the budget is checked before AND after every expensive step and
+    a verdict is accepted only if the clock has not passed after the step."""
+
+    def _clocked(self, now, hashed):
+        real = memidx.sha256_hex
+
+        def counting(data):
+            hashed.append(1)
+            return real(data)
+        return counting
+
+    def test_crossing_after_the_code_index_open_never_hashes(self):
+        row = {"ref": "src/foo.py#beta", "span": "symbol", "digest": "x" * 64}
+        now, hashed = {"t": 0.0}, []
+        checker = memidx.AnchorChecker("p", lambda _p: PY_SRC.encode(), code_db=self.codedb,
+                                       deadline=50.0)
+
+        def db():
+            now["t"] = 100.0
+            return object()
+
+        with mock.patch.object(memidx.time, "monotonic", lambda: now["t"]), \
+                mock.patch.object(memidx, "sha256_hex", self._clocked(now, hashed)), \
+                mock.patch.object(checker, "_db", db):
+            self.assertEqual(checker.check(row), ("missing", "check budget exhausted"))
+        self.assertEqual(hashed, [])
+
+    def test_crossing_on_the_final_file_hash_is_exhausted_not_ok(self):
+        data = b"hello\n"
+        row = {"ref": "src/foo.py", "span": "file", "digest": hashlib.sha256(data).hexdigest()}
+        now = {"t": 0.0}
+        real = memidx.sha256_hex
+
+        def slow_hash(b):
+            out = real(b)
+            now["t"] = 100.0       # the hash itself blew the budget
+            return out
+
+        checker = memidx.AnchorChecker("p", lambda _p: data, deadline=50.0)
+        with mock.patch.object(memidx.time, "monotonic", lambda: now["t"]), \
+                mock.patch.object(memidx, "sha256_hex", slow_hash):
+            self.assertEqual(checker.check(row), ("missing", "check budget exhausted"))
+        now["t"] = 0.0
+        with mock.patch.object(memidx.time, "monotonic", lambda: now["t"]):
+            self.assertEqual(checker.check(row), ("ok", ""))
+
+    def test_crossing_on_the_final_symbol_hash_is_exhausted(self):
+        self.add_topic("a", plain_topic("TOP-9001", ["src/other.py"], "Alpha"))
+        self.code_file("src/foo.py", PY_SRC)
+        self.bind("src/foo.py#beta")
+        self.reindex()
+        self.code_reindex()
+        topic = memidx.parse_record(next((self.store / "topics").glob("*.md"))).frontmatter
+        row = memidx.anchor_rows(topic)[0]
+        now = {"t": 0.0}
+        real = memidx.sha256_hex
+        calls = []
+
+        def slow_hash(b):
+            out = real(b)
+            calls.append(1)
+            if len(calls) == 2:      # the span hash (the first is the whole file)
+                now["t"] = 100.0
+            return out
+
+        data = (self.code / "src/foo.py").read_bytes()
+        checker = memidx.AnchorChecker("p", lambda _p: data, code_db=self.codedb, deadline=50.0)
+        with mock.patch.object(memidx.time, "monotonic", lambda: now["t"]), \
+                mock.patch.object(memidx, "sha256_hex", slow_hash):
+            self.assertEqual(checker.check(row), ("missing", "check budget exhausted"))
+        checker.close()
+        self.assertEqual(len(calls), 2)
+
+    def test_standing_crossing_after_the_sql_lookup_counts_the_topic_unchecked(self):
+        self.add_topic("a", plain_topic("TOP-9001", ["src/foo.py"], "Alpha"))
+        self.code_file("src/foo.py", PY_SRC)
+        self.reindex()
+        conn = memidx.open_db_noncreating(self.db, project="p")
+        now = {"t": 0.0}
+        parsed = []
+
+        class Proxy:
+            def execute(self_inner, *a, **k):
+                out = conn.execute(*a, **k)
+                now["t"] = 100.0
+                return out
+
+        real_parse = memidx.parse_record
+        try:
+            with mock.patch.object(memidx.time, "monotonic", lambda: now["t"]), \
+                    mock.patch.object(memidx, "parse_record",
+                                      lambda p: parsed.append(p) or real_parse(p)):
+                summary = memidx.standing_anchor_summary(Proxy(), "p", ["TOP-9001"], [self.code])
+        finally:
+            conn.close()
+        self.assertEqual(summary.get("unchecked"), 1)
+        self.assertEqual(parsed, [])
+        self.assertEqual(summary["never"], 0)

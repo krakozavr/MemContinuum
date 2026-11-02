@@ -4352,7 +4352,11 @@ class AnchorChecker:
         if not self._tried:
             self._tried = True
             if self.code_db is not None and self.code_db.exists():
-                self._conn = open_db_readonly(self.code_db, timeout=0.2)
+                # a blocked open waits at most the smaller of 0.2 s and what is left
+                wait = 0.2
+                if self.deadline is not None:
+                    wait = max(0.001, min(wait, self.deadline - time.monotonic()))
+                self._conn = open_db_readonly(self.code_db, timeout=wait)
         return self._conn
 
     def close(self) -> None:
@@ -4364,19 +4368,27 @@ class AnchorChecker:
             self._conn = None
 
     def check(self, row: dict) -> tuple:
-        """`("ok" | "changed" | "missing", reason)` for one anchor row."""
+        """`("ok" | "changed" | "missing", reason)` for one anchor row. The
+        deadline is asked before AND after every expensive step (file read,
+        hash, code-index open, each SQL query); a verdict is returned only when
+        the clock has not passed the deadline after the step that produced it."""
         exhausted = ("missing", "check budget exhausted")
         if self._deadline_passed():
             return exhausted
         ref_path, frag = code_ref_split(str(row.get("ref")))
         data = self.live_bytes(ref_path)
-        if data is None:
-            return "missing", "file gone"
         if self._deadline_passed():
             return exhausted
+        if data is None:
+            return "missing", "file gone"
         if row.get("span") != "symbol" or frag is None:
-            return ("ok" if sha256_hex(data) == str(row.get("digest")) else "changed"), ""
+            same = sha256_hex(data) == str(row.get("digest"))
+            if self._deadline_passed():
+                return exhausted
+            return ("ok" if same else "changed"), ""
         conn = self._db()
+        if self._deadline_passed():
+            return exhausted
         if conn is None:
             return "missing", "snapshot unavailable"
         live_sha = sha256_hex(data)
@@ -4386,13 +4398,13 @@ class AnchorChecker:
             shas = conn.execute(
                 "SELECT code_root, sha256 FROM file_sha WHERE project=? AND path=?",
                 (self.project, ref_path)).fetchall()
+            if self._deadline_passed():
+                return exhausted
             if not shas:
                 return "missing", "snapshot unavailable"
             roots = [r["code_root"] for r in shas if r["sha256"] == live_sha]
             if not roots:
                 return "missing", "index stale"
-            if self._deadline_passed():
-                return exhausted
             marks = ",".join("?" * len(roots))
             chunks = conn.execute(
                 f"SELECT symbol, qualified_name, start_line, end_line FROM chunks "
@@ -4400,6 +4412,8 @@ class AnchorChecker:
                 (self.project, ref_path, *roots)).fetchall()
         except sqlite3.Error:
             return "missing", "snapshot unavailable"
+        if self._deadline_passed():
+            return exhausted
         ranges = sorted({
             (c["start_line"], c["end_line"]) for c in chunks
             if fragment_matches_symbol(frag, c["symbol"], c["qualified_name"])
@@ -4408,9 +4422,9 @@ class AnchorChecker:
             return "missing", "symbol absent"
         if len(ranges) > 1:
             return "missing", "symbol ambiguous"
+        same = sha256_hex(anchor_span_bytes(data, *ranges[0])) == str(row.get("digest"))
         if self._deadline_passed():
             return exhausted
-        same = sha256_hex(anchor_span_bytes(data, *ranges[0])) == str(row.get("digest"))
         return ("ok" if same else "changed"), ""
 
 
@@ -4516,6 +4530,11 @@ def for_path_anchor_notes(matches, candidate: str, live_file: str, project: str,
                     {"ref": candidate, "kind": "missing", "detail": "check budget exhausted", "row": None}])
                 continue
             fm = parse_record(Path(row["path"])).frontmatter
+            if checker._deadline_passed():
+                # the parse itself crossed the budget: no verdict from it is accepted
+                notes[row["id"]] = anchor_header_line([
+                    {"ref": candidate, "kind": "missing", "detail": "check budget exhausted", "row": None}])
+                continue
             refs = [str(r) for r in fm.get("code_refs") or [] if code_ref_matches(candidate, str(r))]
             line = anchor_header_line(anchor_statuses(fm, refs, checker, exact_path=candidate))
             if line:
@@ -4550,9 +4569,16 @@ def standing_anchor_summary(conn, project: str, topic_ids: list, code_roots: lis
             row = conn.execute(
                 "SELECT path FROM records WHERE project=? AND type='topic' AND id=?",
                 (project, tid)).fetchone()
+            if checker._deadline_passed():
+                # the SQL lookup crossed the budget: the topic is not read
+                counts["unchecked"] = counts.get("unchecked", 0) + 1
+                continue
             if row is None:
                 continue
             fm = parse_record(Path(row["path"])).frontmatter
+            if checker._deadline_passed():
+                counts["unchecked"] = counts.get("unchecked", 0) + 1
+                continue
             for status in topic_anchor_statuses(fm, checker):
                 counts[status["kind"]] += 1
     finally:
