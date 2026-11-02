@@ -81,11 +81,13 @@ later from ledgered history, never the bytes at the original ruling). Only a sin
 `memlint.py` errors on: a `ref` not present verbatim in the topic's `code_refs`; a `link` not in
 `links`; `algo` other than `sha256`; a `digest` that is not 64 lowercase hex characters; an unknown
 `span`, `captured` or `worktree`; a row for a prefix or glob reference; two rows for the same
-`(ref, link)`; `span: symbol` without `chunker_version`.
+`(ref, link)`; `span: symbol` without `chunker_version`; a row without `captured_at`
+(`ref`, `link`, `captured` and `captured_at` together identify a row, so all four are required).
 
 **Anchor rows are append-only**, like links: under `--against-ref`, a row present at `REF`
 (identified by `ref`, `link`, `captured`, `captured_at`) must survive with the same fields and the
-same raw bytes; new rows are free. One baseline exists per `(ref, link)` in this release — a new
+same raw bytes; new rows are free. A recorded row whose identity cannot be built is an error, not
+skipped. One baseline exists per `(ref, link)` in this release — a new
 baseline is a new link. The wording of every delivered line is capture-relative ("anchor changed
 since capture"), and it never changes a link's status or authority.
 

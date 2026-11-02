@@ -3527,7 +3527,10 @@ and delivery share; never the search body, never the embedding slice).
 (`_link_raw_spans` with `key="anchors"` and an identity over `ref`, `link`,
 `captured`, `captured_at`): an existing row whose parsed fields or raw bytes
 changed, or that disappeared, is an error naming the row; new rows are free;
-a second row for an existing `(ref, link)` is an error. Anchors are append-only
+a second row for an existing `(ref, link)` is an error. Every identity
+component (`ref`, `link`, `captured`, `captured_at`) is required on every row
+(memlint's plain lint reports a missing one), and the freeze refuses — never
+skips — a recorded row whose identity cannot be built. Anchors are append-only
 for the same reason links are — a baseline that can be rewritten proves
 nothing.
 
@@ -3537,7 +3540,17 @@ first writer of a canonical record. Every edit is a **line insertion into the
 file's raw text, never a YAML dump** (`insert_code_ref`, `insert_anchor_row`):
 `code_refs: []` becomes a block with the one entry, a block gains one line at
 its end, `anchors:` is created immediately before `links:` or gains one item
-at the end of its block, and the link bytes are never touched. `--dry-run`
+after the end of its block — after any trailing blank or comment lines, the
+span the freeze attributes to the block's last item, so an append stays an
+append. The writers are **byte-preserving**: the file is read as bytes and
+decoded as strict UTF-8 (invalid bytes: rc 1, a message, nothing written), the
+newline convention (LF or CRLF) is detected from the file and used for the
+inserted lines, and the bytes are written back, so nothing outside the
+inserted lines changes — the link bytes and any trailing whitespace included.
+The inserted `code_refs` entry and the anchor's `ref:` are always
+double-quoted scalars (a file named `yes`, `on`, `null` or `1.0` stays a
+string), and before writing the result is parsed and must hold exactly the
+string that was bound (`bound_edit_problem`); otherwise nothing is written. `--dry-run`
 prints the exact diff and writes nothing; the writer never commits — the
 orchestrator commits the store, and `memlint.py --against-ref HEAD` is the
 acceptance check. The anchor is taken for the topic's `current` link; a second
@@ -3555,13 +3568,18 @@ that may run a chunker (`capture_anchor_row`).
 hook calls it and nothing it prints is a binding. Section one joins the
 session's `search_fallbacks` entries (file, id, title, hook; the hook keeps
 only the last 20, and the header says so) to the ledger row with the same
-absolute path and prints `TOP-xxxx  <path under the ledger row's root>
+absolute path (the row's `worktree_path` when it has one — an in-root
+worktree edit's real path — else its `path`) and prints `TOP-xxxx  <path under the ledger row's root>
 <content_sha256[:12]>  <seen_at>  <hook>`; ledger rows without a `root`
 (non-code kinds) are never proposed, and a topic that already matches the path
 directly (`topic_matches_for_path`) is left out. Section two, headed
 `Filing hints, not bindings:`, lists ledgered code paths that `cmd_unmapped`
 reports unmapped and section one did not name; when its `coverage_status` is
-not `ok` the section says `coverage: unknown` and nothing else. `--write-inbox`
+not `ok` the section says `coverage: unknown` and nothing else. Before the
+direct-match exclusion is computed the command establishes the decision
+index's current state the way `unmapped` does (`cmd_unmapped`, run on no
+paths), so **this manual command may reindex a stale decision index**
+(`reindex --no-embed`); hooks never call it. `--write-inbox`
 also writes `inbox/proposals/<date>-<session>.md` under the store (an inbox
 drop, never a canonical record).
 
@@ -3574,8 +3592,10 @@ ledger row of any session file under `sessions/<project>/` (no date cutoff;
 that has no anchor row for `(ref, current link)`, it captures one now with
 `captured: backfill`. The digest is taken from the file as it is at that
 moment — never copied from the ledger, and never presented as the bytes at the
-original ruling. A second run finds every key present and changes nothing. It
-prints a per-topic summary and the exact diff; the orchestrator reviews and
+original ruling. A second run finds every key present and changes nothing.
+Like `bind` it reads strict UTF-8 bytes, keeps the file's newline convention,
+and validates the edit (it must parse and round-trip every reference) before
+it counts, prints or writes a capture. It prints a per-topic summary and the exact diff; the orchestrator reviews and
 commits.
 
 **Delivery.** Three routes render the same status, computed by one function
@@ -3609,8 +3629,13 @@ compared (a prefix or glob that matched is "not checked"). The line is
 inserted by `topic_chain_lines` right after the topic header, before the
 links, so the plain text and `--json --with-chain-text` stay identical. The
 anchor work is bounded by `ANCHOR_BUDGET_SECONDS` (300 ms, monotonic) for the
-whole call; once spent, remaining checks say `check budget exhausted` and the
-ruling is delivered anyway. Without `--live-file`, `for-path` is unchanged.
+whole call. The deadline is tested by one helper
+(`AnchorChecker._deadline_passed`) before every file read, hash, SQL query and
+topic-file parse of the anchor work, so the budget bounds the work and not just
+its start; once spent, the remaining checks say `check budget exhausted` (a
+topic not yet parsed is named by the edited file) and the ruling is delivered
+anyway. The standing route uses the same helper and counts the topics it could
+not reach as `unchecked` in `anchor_summary`. Without `--live-file`, `for-path` is unchanged.
 Any exception in the anchor work is swallowed (fail open).
 
 *Standing (`standing --json`, `sessionstart-remind.sh`).* `standing --json`
@@ -3630,10 +3655,11 @@ injects nothing, so no line either. Plain `standing` output never changes.
 *Context pack (`context-pack --code-root DIR`).* With a code root, each
 included topic gets one anchor line directly above its chain (after the
 `[record file: ...]` line), computed over all of the topic's `code_refs`.
-Topics are selected under the cap exactly as without anchors; lines are then
-added only while the pack still fits, in the opposite order of the cut:
-changed first, then missing, then never captured, and "not checked" last — so
-under a tight cap "not checked" goes first and "changed" last, and a line
+Topics are selected under the cap exactly as without anchors; every selected
+topic is then annotated and annotations are removed in the literal cut order —
+not checked, never captured, missing, changed — until the pack fits, so under
+a tight cap "not checked" goes first and "changed" last, a long higher-priority
+line is never dropped in favour of a shorter lower-priority one, and a line
 never costs a topic its place. The line is never a ruling, status or authority
 line, its bytes are inside the pack hash, and there is no time budget (the
 same files give the same pack, byte for byte). Without any `--code-root` the
