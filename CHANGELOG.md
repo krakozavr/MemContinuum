@@ -11,6 +11,9 @@
   a `pack sha256=... bytes=...` line over the text above it, so a gate
   record can cite exactly what was sent; `--blind` prints only a fixed
   notice and opens no index. Read-only; no hook or search behaviour changes.
+- The rendered rules file now tells every wired repository to open reviewer
+  and agent briefs with the `context-pack` output; `--apply`
+  re-renders it because the template is a render input.
 
 ### Hooks
 - Decision retrieval now follows the repository, not the code-index roots.

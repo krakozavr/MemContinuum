@@ -23,5 +23,10 @@ the store (committing reindexes it). Constraint and hold links may be mirrored
 by a `decision: TOP-xxxx Ln` comment at the bound symbol; memlint checks both
 ways. Name the decision in commit messages too (`TOP-xxxx Ln`).
 
+A brief for a reviewer or a dispatched agent opens with the decision records, not a
+summary of them: paste the output of `memidx.py context-pack --project {{PROJECT}} <files the brief touches>`
+(engine README, "context pack") at its top; the closing `pack sha256` line names what
+the reader saw.
+
 A coverage or look-back nudge is an ACTION ITEM, not a notice: answer it with
 records or an explicit "none".
