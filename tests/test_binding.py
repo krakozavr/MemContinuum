@@ -290,6 +290,25 @@ class TestAnchorFreeze(unittest.TestCase):
             self.assertEqual(rc, 1, out)
             self.assertIn("reformatted, not appended", out)
 
+    def test_repaired_ref_blob_still_freezes_its_anchor_rows(self):
+        """REF blob invalid with no recoverable links (a repair branch): the
+        anchor rows it recorded must not be rewritten under cover of a note."""
+        with tempfile.TemporaryDirectory() as td:
+            root = git_store(td)
+            old = topic_text([good_row()]).replace("tags: []", "tags: not-a-list", 1)
+            old = old.split("links:")[0] + "links: []\n---\n\nBody.\n"
+            (root / "topics" / "foo.md").write_text(old)
+            commit_all(root)
+            old_result = memidx.parse_record_text(old, "x")
+            self.assertFalse(old_result.valid)
+            (root / "topics" / "foo.md").write_text(topic_text([good_row(digest=f'"{DIGEST2}"')]))
+            rc, out = run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("anchor ('src/foo.py', 'L1')", out)
+            (root / "topics" / "foo.md").write_text(topic_text([good_row()]))
+            rc, out = run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 0, out)
+
     def test_second_row_for_existing_key_errors(self):
         with tempfile.TemporaryDirectory() as td:
             root = self._base(td)

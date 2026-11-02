@@ -2492,6 +2492,13 @@ def _added_links_errors(full_path: Path, links: list, old_ids: set) -> list[str]
     return errs
 
 
+def _decode_or_none(blob):
+    try:
+        return blob.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
 def _anchor_ident(row) -> str | None:
     """Identity of an anchor row for the freeze: (ref, link, captured,
     captured_at). None when any part is missing or not a scalar."""
@@ -2702,6 +2709,12 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
                     # link ids, so every link in the new blob is new.
                     errors.extend(_added_links_errors(
                         full_path, new_result.frontmatter.get("links") or [], set()))
+                    # Anchor rows recorded at REF stay frozen on this branch too:
+                    # a repair of the links is not a licence to rewrite a capture.
+                    errors.extend(_anchor_freeze_errors(
+                        full_path, _decode_or_none(old_blob), anchor_rows(old_result.frontmatter),
+                        _decode_or_none(new_blob), anchor_rows(new_result.frontmatter), notes,
+                    ))
                     continue
                 # Both sides unparseable: still fail closed (test_j: malformed
                 # -> malformed is still refused), reported from the OLD side's
