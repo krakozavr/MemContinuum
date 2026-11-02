@@ -1204,6 +1204,25 @@ class TestContextPackAnchors(DeliveryCase):
         tight = self.pack("src/x.py", "src/y.py", cap=base_bytes)
         self.assertNotIn("Anchor ", tight)
 
+    def test_two_changed_annotations_with_room_for_one_keep_one(self):
+        self.add_topic("x", plain_topic("TOP-9701", ["src/x.py"], "Changed one"))
+        self.add_topic("z", plain_topic("TOP-9703", ["src/z.py"], "Changed two"))
+        for name in ("x", "z"):
+            self.code_file(f"src/{name}.py", f"{name}\n")
+        self.bind("src/x.py", "TOP-9701")
+        self.bind("src/z.py", "TOP-9703")
+        for name in ("x", "z"):
+            self.code_file(f"src/{name}.py", f"{name} edited\n")
+        self.reindex()
+        base = self.pack("src/x.py", "src/z.py", roots=False)
+        base_bytes = len(base.rsplit("pack sha256=", 1)[0].encode())
+        one_line = len("Anchor changed since capture (bind): src/x.py\n".encode())
+        out = self.pack("src/x.py", "src/z.py", cap=base_bytes + one_line)
+        kept = [ln for ln in out.splitlines() if ln.startswith("Anchor changed")]
+        self.assertEqual(len(kept), 1, out)
+        self.assertIn("TOP-9701 Changed one", out)
+        self.assertIn("TOP-9703 Changed two", out)
+
     def test_cut_order_never_keeps_a_lower_priority_line_the_higher_one_could_not_fit(self):
         """Sol's probe: the changed line is the long one; a cap with room for the short
         never-captured line only must not admit it -- never captured is cut BEFORE

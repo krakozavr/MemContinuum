@@ -6818,7 +6818,7 @@ def _pack_add_anchor_lines(conn, project: str, sel: list, render, size, max_byte
     `[record file: ...]` line), but only as the cap allows and never at a
     topic's expense: topics were already chosen without them. Every topic is
     annotated, then annotations are removed in the cut order -- not checked,
-    never captured, missing, changed -- until the pack fits, so under a tight
+    never captured, missing, changed -- one at a time until the pack fits, so under a tight
     cap "not checked" goes first and "changed" last. The line is never a
     ruling, status or authority line; its bytes are inside the pack hash. No deadline: a pack must be reproducible byte for
     byte, so the same files give the same pack. Read-only and chunker-free."""
@@ -6845,13 +6845,16 @@ def _pack_add_anchor_lines(conn, project: str, sel: list, render, size, max_byte
         (c, [lines[0], notes[id(c)][1]] + lines[1:]) if id(c) in notes else (c, lines)
         for c, lines in sel
     ]
+    # One annotation at a time (lowest-ranked topic first within a priority),
+    # capacity re-checked after each removal, so room for one of two changed
+    # annotations keeps one.
     for cut in reversed(ANCHOR_STATUS_PRIORITY):
-        if size(render(annotated)) <= max_bytes:
-            break
-        annotated = [
-            (c, lines[:1] + lines[2:]) if id(c) in notes and notes[id(c)][0] == cut else (c, lines)
-            for c, lines in annotated
-        ]
+        for i in range(len(annotated) - 1, -1, -1):
+            if size(render(annotated)) <= max_bytes:
+                return annotated
+            c, lines = annotated[i]
+            if id(c) in notes and notes[id(c)][0] == cut:
+                annotated[i] = (c, lines[:1] + lines[2:])
     return annotated
 
 
