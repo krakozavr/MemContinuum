@@ -46,9 +46,12 @@ class TestRoutingRuleTemplate(unittest.TestCase):
         # Cap moved 26 -> 27: task A2-3 (TOP-0122 L1 rule 2a) adds one more
         # sentence to the SAME paragraph -- name the decision in commit
         # messages too -- again a net +1-line addition, not a new block.
+        # Cap moved 27 -> 32: TOP-0135 L2 adds the context-pack paragraph (briefs
+        # open with the records) as its own block after the command served a
+        # real gate (PR #44).
         text = TEMPLATE.read_text()
         lines = text.splitlines()
-        self.assertLessEqual(len(lines), 27, f"template is {len(lines)} lines, want <= 27")
+        self.assertLessEqual(len(lines), 32, f"template is {len(lines)} lines, want <= 32")
 
     def test_names_the_record_shapes_and_auto_memory_distinction(self):
         text = TEMPLATE.read_text()
