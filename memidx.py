@@ -11704,6 +11704,17 @@ def _topic_file_for_id(root: Path, topic_id: str) -> Path | None:
     topics_dir = Path(root) / "topics"
     if not topics_dir.is_dir():
         return None
+    # walk_markdown resolves its root, so it yields realpath spellings
+    # (macOS /private/var); hand the caller back its OWN spelling of the root
+    # (INC-0132 family), as the indexer stores `records.path`.
+    walked_root = Path(root).resolve()
+
+    def own_spelling(found: Path) -> Path:
+        try:
+            return Path(root) / found.relative_to(walked_root)
+        except ValueError:
+            return found
+
     pattern = re.compile(r"^id:\s*['\"]?" + re.escape(topic_id) + r"['\"]?\s*$", re.M)
     undecodable = None
     for path in walk_markdown(topics_dir):
@@ -11723,9 +11734,9 @@ def _topic_file_for_id(root: Path, topic_id: str) -> Path | None:
             valid = False
         if pattern.search(head.split("\n---", 1)[0]):
             if valid:
-                return path
+                return own_spelling(path)
             if undecodable is None:
-                undecodable = path
+                undecodable = own_spelling(path)
     return undecodable
 
 
