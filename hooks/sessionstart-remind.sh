@@ -301,8 +301,6 @@ if "hash" in obj:
     if isinstance(_asum, dict):
         if _asum.get("skipped"):
             _token = "skipped-%s" % _asum["skipped"]
-        elif _asum.get("dropped"):
-            _token = "dropped-%s" % _asum["dropped"]
         elif _asum.get("changed"):
             _token = "changed=%d" % _asum["changed"]
         elif _asum.get("missing"):
@@ -313,10 +311,13 @@ if "hash" in obj:
             _token = "clean"
         # Topics the budget never reached are not "clean": say so, keeping any
         # positive counts (gate round 2: an exhausted standing check was logged clean).
-        if _asum.get("unchecked") and not (_asum.get("skipped") or _asum.get("dropped")):
+        if _asum.get("unchecked") and not _asum.get("skipped"):
             _parts = ["%s=%d" % (k, _asum[k]) for k in ("changed", "missing", "never") if _asum.get(k)]
             _parts.append("unchecked=%d" % _asum["unchecked"])
             _token = ",".join(_parts)
+        # The line was dropped by the cap: say so AND keep the counts (gate round 3).
+        if _asum.get("dropped") and not _asum.get("skipped"):
+            _token = "dropped-%s" % _asum["dropped"] + ("" if _token == "clean" else "," + _token)
     try:
         with open(sys.argv[3], "w") as f:
             f.write(str(obj.get("anchor_line") or ""))

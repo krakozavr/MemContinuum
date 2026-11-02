@@ -3670,7 +3670,7 @@ untouched; when digest plus line would exceed the cap the line is dropped
 every configured code root, appends the engine's line verbatim, and logs
 `anchors=<token>` (`changed=N`, `missing=N`, `never=N`, `clean`,
 `skipped-no-root`; when `anchor_summary.unchecked` is nonzero the token ends
-with `unchecked=N` after any positive counts, e.g. `changed=1,unchecked=2`, and is never `clean`) on the `standing=injected` entry. A deduplicated resume
+with `unchecked=N` after any positive counts, e.g. `changed=1,unchecked=2`, and is never `clean`; when the cap dropped the line the token is `dropped-cap` followed by the same count list, e.g. `dropped-cap,changed=1,unchecked=2`, bare `dropped-cap` only when every count is zero) on the `standing=injected` entry. A deduplicated resume
 injects nothing, so no line either. Plain `standing` output never changes.
 
 *Context pack (`context-pack --code-root DIR`).* With a code root, each

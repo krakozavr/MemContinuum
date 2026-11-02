@@ -3179,6 +3179,31 @@ Body.
         self.assertIn("anchors=unchecked=1", log)
         self.assertNotIn("anchors=clean", log)
 
+    def test_dropped_line_keeps_the_counts_in_the_log_token(self):
+        # a legal digest near the 4800-byte cap: the anchor line no longer fits
+        cap = memidx.STANDING_CAP_BYTES
+        n = 1
+        while True:
+            line = memidx.standing_line("TOP-9600", "L1", "owner-verbatim", "x" * n)
+            size = len(memidx.standing_digest_text([line]).encode())
+            if size > cap - 10:
+                break
+            n += 1
+        self.assertLessEqual(size, cap)
+        topic = self.STANDING_ANCHORED_TOPIC.replace("this ruling stands for the whole project", "x" * n)
+        _write(self.store_root / "topics" / "testing" / "anchored.md", topic)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = memidx.main(["bind", "TOP-9600", "src/mapped.py", "--root", str(self.store_root),
+                              "--code-root", str(self.code_root)])
+        self.assertEqual(rc, 0)
+        with contextlib.redirect_stdout(io.StringIO()):
+            reindex(self.store_root, self.home / f"{self.project}.sqlite", project=self.project)
+        (self.code_root / "src" / "mapped.py").write_text("# mapped, edited\n")
+        ctx, log = self._start("s-anchor-dropped-cap")
+        self.assertNotIn("Anchor changed", ctx)
+        self.assertIn("anchors=dropped-cap,changed=1", log)
+        self.assertNotIn("anchors=dropped-cap ", log + " ")
+
     def test_never_captured_is_the_fallback_line(self):
         self._install(bind=False)
         ctx, _log = self._start("s-anchor-never")
