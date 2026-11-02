@@ -1295,6 +1295,19 @@ class TestGateRound1ByteWriters(SessionCase):
         self.assertNotRegex(after, rb"(?<!\r)\n")
         self.assertIn(b"kind: adopted   \r\n", after)
 
+    def test_backfill_claims_no_capture_when_validation_fails(self):
+        raw = plain_topic("TOP-9001", ["src/foo.py"]).encode()
+        (self.store / "topics" / "a.md").write_bytes(raw)
+        self.code_file("src/foo.py", PY_SRC)
+        self.session("s1", [self.ledger_row("src/foo.py")])
+        with mock.patch.object(memidx, "bound_edit_problem", return_value="the edit would not parse cleanly"):
+            rc, out, err = run_memidx(["anchor-backfill", "--root", str(self.store), "--project", "p",
+                                       "--sessions-dir", str(self.sessions), "--code-root", str(self.code)])
+        self.assertEqual(rc, 1)
+        self.assertNotIn("captured as backfill", out)
+        self.assertIn("0 anchor(s) captured", out)
+        self.assertEqual((self.store / "topics" / "a.md").read_bytes(), raw)
+
     def test_bind_refuses_invalid_utf8(self):
         raw = plain_topic("TOP-9001", []).encode() + b"\xff\xfe tail\n"
         (self.store / "topics" / "a.md").write_bytes(raw)

@@ -12154,6 +12154,16 @@ def cmd_anchor_backfill(args) -> int:
             have.add((ref, link_id))
             added.append(ref)
             added_rows.append(row)
+        if added:
+            refs_now = list(fm.get("code_refs") or [])
+            problem = next(filter(None, (
+                bound_edit_problem(new_text, topic_path, r["ref"], link_id, refs_now)
+                for r in added_rows)), None)
+            if problem:
+                print(f"anchor-backfill: {topic_path.name}: {problem}; skipped, nothing written",
+                      file=sys.stderr)
+                rc = 1
+                continue
         if added or notes:
             print(f"{fm.get('id') or topic_path.stem}: {len(added)} anchor(s) captured as backfill"
                   + (f" ({', '.join(added)})" if added else ""))
@@ -12161,14 +12171,6 @@ def cmd_anchor_backfill(args) -> int:
                 print(note)
         if added:
             total += len(added)
-            refs_now = list(fm.get("code_refs") or [])
-            problem = next(filter(None, (
-                bound_edit_problem(new_text, topic_path, r["ref"], link_id, refs_now)
-                for r in added_rows)), None)
-            if problem:
-                print(f"anchor-backfill: {topic_path.name}: {problem}; skipped", file=sys.stderr)
-                rc = 1
-                continue
             apply_topic_edit(topic_path, old_text, new_text, args.dry_run, root)
     print(f"anchor-backfill: {total} anchor(s) {'would be ' if args.dry_run else ''}captured")
     return rc
