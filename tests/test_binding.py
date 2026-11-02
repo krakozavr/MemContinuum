@@ -1939,3 +1939,54 @@ class TestGateRound2LookupSymlinkedTmp(SymlinkedTmpMixin, TestGateRound2Lookup):
 
 class TestGateRound3WallClockSymlinkedTmp(SymlinkedTmpMixin, TestGateRound3WallClock):
     pass
+
+
+class TestLedgerRowSpelling(SessionCase):
+    """A tool-edit ledger row's `path` and its `root` may be spelled differently
+    (tool spelling vs the configured realpath root); the row must survive."""
+
+    def spellings(self):
+        link, real = str(self.code), os.path.realpath(self.code)
+        return (("path-link-root-real", link, real), ("path-real-root-link", real, link))
+
+    def rows_for(self, path_root, rel="src/foo.py"):
+        _label, path_spelling, root_spelling = path_root
+        row = self.ledger_row(rel)
+        row["path"] = path_spelling + "/" + rel
+        row["root"] = root_spelling
+        return row
+
+    def test_backfill_keeps_rows_whose_path_and_root_are_spelled_differently(self):
+        for spelling in self.spellings():
+            with self.subTest(spelling[0]):
+                for f in (self.store / "topics").glob("*.md"):
+                    f.unlink()
+                self.add_topic("a", plain_topic("TOP-9001", ["src/foo.py"]))
+                self.code_file("src/foo.py", PY_SRC)
+                self.session("s1", [self.rows_for(spelling)])
+                rc, out, err = run_memidx(["anchor-backfill", "--root", str(self.store), "--project", "p",
+                                           "--sessions-dir", str(self.sessions), "--dry-run"])
+                self.assertEqual(rc, 0, err)
+                self.assertIn("1 anchor(s) would be captured", out)
+
+    def test_propose_bindings_keeps_rows_whose_path_and_root_are_spelled_differently(self):
+        for spelling in self.spellings():
+            with self.subTest(spelling[0]):
+                self.add_topic("a", plain_topic("TOP-9001", ["src/other.py"], "Alpha"))
+                self.code_file("src/foo.py", PY_SRC)
+                self.reindex()
+                row = self.rows_for(spelling)
+                self.session("s1", [row], [{"file": row["path"], "id": "TOP-9001", "title": "Alpha",
+                                            "hook": "pre-edit-chain"}])
+                rc, out, err = self.propose()
+                self.assertEqual(rc, 0, err)
+                self.assertIn("TOP-9001  src/foo.py", out)
+
+    def test_rel_is_root_relative_for_a_mixed_spelling_row(self):
+        for spelling in self.spellings():
+            rows = memidx.ledger_code_rows({"ledger": [self.rows_for(spelling)]})
+            self.assertEqual([r["rel"] for r in rows], ["src/foo.py"], spelling[0])
+
+
+class TestLedgerRowSpellingSymlinkedTmp(SymlinkedTmpMixin, TestLedgerRowSpelling):
+    pass

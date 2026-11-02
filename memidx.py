@@ -12149,17 +12149,23 @@ def ledger_code_rows(state: dict) -> list:
     """Ledger rows that name edited CODE: `kind == "code"` with a non-empty
     `root` and an absolute `path`. Each is `{path, root, rel, content_sha256,
     seen_at}` with `path` normalised and `rel` its path under `root`; rows
-    that sit outside their own root are dropped."""
+    that sit outside their own root (compared by `path_join_key`) are dropped."""
     out = []
     for row in state.get("ledger") or []:
         if not isinstance(row, dict) or row.get("kind") != "code" or not row.get("root"):
             continue
         path = os.path.normpath(str(row.get("path") or ""))
         root = os.path.normpath(str(row["root"]))
-        if not os.path.isabs(path) or not path.startswith(root.rstrip(os.sep) + os.sep):
+        if not os.path.isabs(path):
+            continue
+        # "under its root" is decided on the join keys of BOTH sides: a tool-edit
+        # row carries the tool's spelling of `path` while `root` is the configured
+        # (realpath) code root, and a symlinked checkout spells them differently
+        key_path, key_root = path_join_key(path), path_join_key(root)
+        if not key_path.startswith(key_root.rstrip(os.sep) + os.sep):
             continue
         out.append({
-            "path": path, "root": root, "rel": os.path.relpath(path, root),
+            "path": path, "root": root, "rel": os.path.relpath(key_path, key_root),
             # an in-root worktree edit: `path` is the REMAPPED main-checkout path, the
             # fallback recorded the tool's real path, kept as `worktree_path`
             "match_path": os.path.normpath(str(row.get("worktree_path") or "")) if row.get("worktree_path") else path,
