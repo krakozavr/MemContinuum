@@ -4241,7 +4241,7 @@ ANCHOR_ALGO = "sha256"
 ANCHOR_SPANS = ("file", "symbol")
 ANCHOR_CAPTURE_KINDS = ("ruling", "bind", "backfill")
 ANCHOR_WORKTREE_STATES = ("clean", "dirty", "unknown")
-ANCHOR_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+ANCHOR_DIGEST_RE = re.compile(r"[0-9a-f]{64}")  # use .fullmatch()
 _CODE_REF_GLOB_CHARS = ("*", "?", "[")
 
 
@@ -11538,8 +11538,10 @@ def _topic_file_for_id(root: Path, topic_id: str) -> Path | None:
     pattern = re.compile(r"^id:\s*['\"]?" + re.escape(topic_id) + r"['\"]?\s*$", re.M)
     for path in walk_markdown(topics_dir):
         try:
-            head = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
+            # lenient on purpose: an undecodable file must still be FOUND so
+            # the writer can refuse it by name instead of reporting "no topic"
+            head = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
             continue
         if pattern.search(head.split("\n---", 1)[0]):
             return path
@@ -11627,6 +11629,27 @@ def capture_anchor_row(ref: str, link_id: str, code_roots: list, captured: str) 
     return row, None
 
 
+def _split_lines_keep(text: str) -> list:
+    """Lines of `text` split on `\\n` ONLY, each keeping its terminator
+    (`str.splitlines` also splits on form feeds, U+2028 and friends, which would
+    shift line indexes and could not be re-joined to a different convention)."""
+    return re.findall(r"[^\n]*\n|[^\n]+", text)
+
+
+def _newline_of(text: str) -> str:
+    """The file's newline convention: that of its first line ending
+    (`\\r\\n` or `\\n`)."""
+    i = text.find("\n")
+    return "\r\n" if i > 0 and text[i - 1] == "\r" else "\n"
+
+
+def read_record_bytes_strict(path: Path) -> str:
+    """The file's text decoded as strict UTF-8 with NO newline translation, so
+    writing `text.encode("utf-8")` back reproduces every untouched byte.
+    Raises UnicodeDecodeError on invalid UTF-8."""
+    return Path(path).read_bytes().decode("utf-8", errors="strict")
+
+
 def _fm_line_bounds(lines: list) -> tuple:
     """`(first, end)` index range of the frontmatter body lines (between the
     `---` fences) in a file's `splitlines(keepends=True)`; (0, 0) when none."""
@@ -11647,11 +11670,15 @@ def _top_key_index(lines: list, first: int, end: int, key: str) -> int | None:
     return None
 
 
-def _block_last_line(lines: list, key_idx: int, end: int) -> int:
+def _block_last_line(lines: list, key_idx: int, end: int, include_trailing: bool = False) -> int:
     """Index of the last line belonging to the block under the top-level key
     at `key_idx`: following lines that are indented, indentless `- ` list
-    items, blank or comments; trailing blanks are not counted."""
+    items, blank or comments. Trailing blanks and comments are not counted
+    unless `include_trailing`, which returns the last line before the next
+    top-level content -- the span memlint's freeze attributes to the block's
+    last item, so an append after it stays an append."""
     last = key_idx
+    stop = end
     for i in range(key_idx + 1, end):
         raw = lines[i].rstrip("\r\n")
         if raw.strip() == "" or raw.lstrip().startswith("#"):
@@ -11659,8 +11686,9 @@ def _block_last_line(lines: list, key_idx: int, end: int) -> int:
         if raw.startswith(" ") or raw.startswith("- "):
             last = i
             continue
+        stop = i
         break
-    return last
+    return max(last, stop - 1) if include_trailing else last
 
 
 def _block_item_indent(lines: list, key_idx: int, last: int) -> str:
@@ -11698,8 +11726,8 @@ def insert_anchor_row(text: str, row: dict) -> str:
     before the `links:` line. Pure line insertion -- every other byte of the
     file is untouched. Raises ValueError when the structure does not allow a
     safe insert."""
-    nl = "\r\n" if "\r\n" in text else "\n"
-    lines = text.splitlines(keepends=True)
+    nl = _newline_of(text)
+    lines = _split_lines_keep(text)
     first, end = _fm_line_bounds(lines)
     if end == 0:
         raise ValueError("no frontmatter block")
@@ -11710,7 +11738,7 @@ def insert_anchor_row(text: str, row: dict) -> str:
             lines[anchors_idx] = f"anchors:{nl}"
         elif value != "":
             raise ValueError("`anchors:` is not a block list; refusing to edit it")
-        last = _block_last_line(lines, anchors_idx, end)
+        last = _block_last_line(lines, anchors_idx, end, include_trailing=True)
         item = render_anchor_item(row, _block_item_indent(lines, anchors_idx, last))
         pos = last + 1
         if not lines[last].endswith("\n"):
@@ -11730,12 +11758,12 @@ def insert_code_ref(text: str, ref: str) -> str:
     entry exists): `code_refs: []` becomes a block with the one entry, a
     block gains one `  - ref` line at its end, an absent key is created
     before `anchors:`/`links:`. A non-empty flow list is refused."""
-    nl = "\r\n" if "\r\n" in text else "\n"
-    lines = text.splitlines(keepends=True)
+    nl = _newline_of(text)
+    lines = _split_lines_keep(text)
     first, end = _fm_line_bounds(lines)
     if end == 0:
         raise ValueError("no frontmatter block")
-    entry_text = _yaml_quote(ref) if re.search(r"""[:'"\[\]{},&*!|>%@`]|\s#|^[\s#-]|\s$""", ref) else ref
+    entry_text = _yaml_quote(ref)  # always a double-quoted scalar: `yes`, `on`, `null`, `1.0`, `a#b` stay strings
     idx = _top_key_index(lines, first, end, "code_refs")
     if idx is None:
         anchor_idx = _top_key_index(lines, first, end, "anchors")
@@ -11763,7 +11791,7 @@ def insert_code_ref(text: str, ref: str) -> str:
 def _unified_diff(old: str, new: str, label: str) -> str:
     import difflib
     return "".join(difflib.unified_diff(
-        old.splitlines(keepends=True), new.splitlines(keepends=True),
+        _split_lines_keep(old), _split_lines_keep(new),
         fromfile=f"a/{label}", tofile=f"b/{label}",
     ))
 
@@ -11787,8 +11815,30 @@ def apply_topic_edit(path: Path, old_text: str, new_text: str, dry_run: bool, st
     if dry_run:
         print("dry-run: nothing written")
         return
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        f.write(new_text)
+    Path(path).write_bytes(new_text.encode("utf-8"))
+
+
+def parse_record_raw(text: str, path):
+    """`parse_record_text` over text that may carry CRLF endings (the
+    byte-preserving writers keep them; the parser reads LF)."""
+    return parse_record_text(text.replace("\r\n", "\n"), path)
+
+
+def bound_edit_problem(new_text: str, path, ref: str, link_id: str, expect_refs: list) -> str | None:
+    """Why a topic edit must not be written, else None: the new text must
+    parse, its `code_refs` must be exactly `expect_refs` (so the inserted ref
+    parses back to the string that was bound -- no YAML re-typing) and its
+    anchor row for `(ref, link_id)` must carry that same ref string."""
+    check = parse_record_raw(new_text, path)
+    if not check.valid:
+        return "the edit would not parse cleanly"
+    fm = check.frontmatter
+    if list(fm.get("code_refs") or []) != list(expect_refs):
+        return f"the edit would not round-trip the reference {ref!r} as a string"
+    rows = [r for r in anchor_rows(fm) if anchor_row_key(r) == (ref, link_id)]
+    if len(rows) != 1 or rows[0].get("ref") != ref:
+        return f"the edit would not round-trip the anchor row for {ref!r}"
+    return None
 
 
 def cmd_bind(args) -> int:
@@ -11807,8 +11857,12 @@ def cmd_bind(args) -> int:
     if path is None:
         print(f"bind: no topic {args.topic!r} under {root}/topics", file=sys.stderr)
         return 1
-    old_text = path.read_text(encoding="utf-8", errors="strict")
-    result = parse_record_text(old_text, path)
+    try:
+        old_text = read_record_bytes_strict(path)
+    except UnicodeDecodeError as exc:
+        print(f"bind: {path.name} is not valid UTF-8 ({exc}); nothing written", file=sys.stderr)
+        return 1
+    result = parse_record_raw(old_text, path)
     if not result.valid:
         print(f"bind: {path.name} does not parse cleanly: "
               f"{'; '.join(m for _f, m in result.diagnostics)}", file=sys.stderr)
@@ -11837,9 +11891,11 @@ def cmd_bind(args) -> int:
     except ValueError as exc:
         print(f"bind: {exc}", file=sys.stderr)
         return 1
-    check = parse_record_text(new_text, path)
-    if not check.valid:
-        print("bind: the edit would not parse cleanly; nothing written", file=sys.stderr)
+    refs_now = [r for r in fm.get("code_refs") or []]
+    expect = refs_now if ref in [str(r) for r in refs_now] else refs_now + [ref]
+    problem = bound_edit_problem(new_text, path, ref, link_id, expect)
+    if problem:
+        print(f"bind: {problem}; nothing written", file=sys.stderr)
         return 1
     apply_topic_edit(path, old_text, new_text, args.dry_run, root)
     return 0
@@ -12047,9 +12103,16 @@ def cmd_anchor_backfill(args) -> int:
         print(f"anchor-backfill: skipped unreadable session file {name} (half written?)", file=sys.stderr)
     code_roots = _code_roots_arg(args.code_root) or _code_roots_arg(sorted(ledger_roots))
     total = 0
+    rc = 0
     for topic_path in walk_markdown(root / "topics"):
-        old_text = topic_path.read_text(encoding="utf-8", errors="replace")
-        result = parse_record_text(old_text, topic_path)
+        try:
+            old_text = read_record_bytes_strict(topic_path)
+        except UnicodeDecodeError as exc:
+            print(f"anchor-backfill: {topic_path.name} is not valid UTF-8 ({exc}); skipped, nothing written",
+                  file=sys.stderr)
+            rc = 1
+            continue
+        result = parse_record_raw(old_text, topic_path)
         fm = result.frontmatter
         if not result.valid or fm.get("type") != "topic":
             continue
@@ -12057,7 +12120,7 @@ def cmd_anchor_backfill(args) -> int:
         if link_id is None:
             continue
         have = {anchor_row_key(r) for r in anchor_rows(fm)}
-        new_text, added, notes = old_text, [], []
+        new_text, added, added_rows, notes = old_text, [], [], []
         for ref in [str(r) for r in fm.get("code_refs") or []]:
             if not code_ref_is_anchorable(ref) or (ref, link_id) in have:
                 continue
@@ -12075,6 +12138,7 @@ def cmd_anchor_backfill(args) -> int:
                 continue
             have.add((ref, link_id))
             added.append(ref)
+            added_rows.append(row)
         if added or notes:
             print(f"{fm.get('id') or topic_path.stem}: {len(added)} anchor(s) captured as backfill"
                   + (f" ({', '.join(added)})" if added else ""))
@@ -12082,13 +12146,17 @@ def cmd_anchor_backfill(args) -> int:
                 print(note)
         if added:
             total += len(added)
-            if not parse_record_text(new_text, topic_path).valid:
-                print(f"anchor-backfill: the edit to {topic_path.name} would not parse; skipped",
-                      file=sys.stderr)
+            refs_now = list(fm.get("code_refs") or [])
+            problem = next(filter(None, (
+                bound_edit_problem(new_text, topic_path, r["ref"], link_id, refs_now)
+                for r in added_rows)), None)
+            if problem:
+                print(f"anchor-backfill: {topic_path.name}: {problem}; skipped", file=sys.stderr)
+                rc = 1
                 continue
             apply_topic_edit(topic_path, old_text, new_text, args.dry_run, root)
     print(f"anchor-backfill: {total} anchor(s) {'would be ' if args.dry_run else ''}captured")
-    return 0
+    return rc
 
 
 # ---------------------------------------------------------------------------

@@ -185,7 +185,7 @@ def _anchor_errors(path, fm: dict, topic_link_ids: set) -> list[str]:
         if row.get("algo") != ANCHOR_ALGO:
             errors.append(f"{prefix}: algo {row.get('algo')!r} must be {ANCHOR_ALGO!r}")
         digest = row.get("digest")
-        if not isinstance(digest, str) or not ANCHOR_DIGEST_RE.match(digest):
+        if not isinstance(digest, str) or not ANCHOR_DIGEST_RE.fullmatch(digest):
             errors.append(f"{prefix}: digest must be 64 lowercase hex characters")
         span = row.get("span")
         if span not in ANCHOR_SPANS:
@@ -202,6 +202,9 @@ def _anchor_errors(path, fm: dict, topic_link_ids: set) -> list[str]:
             )
         if span == "symbol" and not row.get("chunker_version"):
             errors.append(f"{prefix}: span: symbol requires chunker_version")
+        captured_at = row.get("captured_at")
+        if captured_at is None or isinstance(captured_at, (dict, list)) or str(captured_at).strip() == "":
+            errors.append(f"{prefix}: captured_at is required (part of the row's identity)")
     for ref, link in _anchor_duplicate_keys(rows):
         errors.append(
             f"{path}: anchors: more than one row for ({ref!r}, {link!r}) -- one baseline per "
@@ -2537,6 +2540,10 @@ def _anchor_freeze_errors(full_path, old_text, old_rows: list, new_text, new_row
         ident = _anchor_ident(row)
         name = f"{full_path}: anchor ({row.get('ref')!r}, {row.get('link')!r})"
         if ident is None:
+            errors.append(
+                f"{name}: recorded row lacks an identity component (ref, link, captured, "
+                "captured_at) and cannot be verified; refusing to skip it (append-only)"
+            )
             continue
         new_row = new_by_ident.get(ident)
         if new_row is None:

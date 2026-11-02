@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -378,13 +379,13 @@ class TestBind(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         after = self.topic()
         self.assertNotIn("code_refs: []", after)
-        self.assertIn("code_refs:\n  - src/foo.py\n", after)
+        self.assertIn('code_refs:\n  - "src/foo.py"\n', after)
 
     def test_existing_identical_code_ref_is_left_alone(self):
         self.put_topic(topic_text(code_refs=("src/foo.py",)))
         rc, out, err = self.bind("src/foo.py")
         self.assertEqual(rc, 0, err)
-        self.assertEqual(self.topic().count("- src/foo.py"), 1)
+        self.assertEqual(self.topic().count("src/foo.py"), 1 + self.topic().count("ref: "))
 
     def test_second_bind_for_same_key_is_a_noop(self):
         self.put_topic(topic_text())
@@ -1114,6 +1115,165 @@ class TestContextPackAnchors(DeliveryCase):
                 mock.patch.object(memidx, "open_code_db", boom):
             out = self.pack("src/foo.py")
         self.assertIn("Anchor changed since capture (bind): src/foo.py#beta", out)
+
+
+def only_insertions(testcase, before: bytes, after: bytes):
+    """Every line of `before` survives byte-for-byte and in order in
+    `after`; `after` differs by inserted lines only."""
+    import difflib
+    a = re.findall(rb"[^\n]*\n|[^\n]+", before)
+    b = re.findall(rb"[^\n]*\n|[^\n]+", after)
+    ops = difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes()
+    bad = [op for op in ops if op[0] not in ("equal", "insert")]
+    testcase.assertEqual(bad, [], f"existing bytes changed: {bad}")
+
+
+class TestGateRound1Lint(unittest.TestCase):
+    def test_captured_at_is_required(self):
+        row = good_row()
+        del row["captured_at"]
+        errors, _ = lint_text(topic_text([row]))
+        self.assertTrue(any("captured_at is required" in e for e in errors), errors)
+
+    def test_baseline_without_captured_at_cannot_change_digest(self):
+        row = good_row()
+        del row["captured_at"]
+        with tempfile.TemporaryDirectory() as td:
+            root = git_store(td)
+            (root / "topics" / "foo.md").write_text(topic_text([row]))
+            commit_all(root)
+            changed = good_row(digest=f'"{DIGEST2}"')
+            del changed["captured_at"]
+            (root / "topics" / "foo.md").write_text(topic_text([changed]))
+            rc, out = run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("lacks an identity component", out)
+            self.assertIn("anchor ('src/foo.py', 'L1')", out)
+
+    def test_digest_with_trailing_newline_is_rejected(self):
+        errors, _ = lint_text(topic_text([good_row(digest=f'"{DIGEST}\\n"')]))
+        self.assertTrue(any("digest must be 64" in e for e in errors), errors)
+
+
+class TestGateRound1Append(unittest.TestCase):
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.code = make_code_root(self._td.name, {"src/foo.py": PY_SRC, "src/bar.py": "b\n"})
+        self.store = git_store(Path(self._td.name) / "store")
+        patcher = mock.patch.object(memidx, "_anchor_today", return_value="2026-11-02")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _append_after(self, between):
+        block = anchor_block([good_row(ref="src/foo.py")]) + between
+        (self.store / "topics" / "foo.md").write_text(
+            topic_text(anchors_text=block, code_refs=("src/foo.py",)))
+        commit_all(self.store)
+        rc, out, err = run_memidx(["bind", "TOP-1", "src/bar.py", "--root", str(self.store),
+                                   "--code-root", str(self.code)])
+        self.assertEqual(rc, 0, err)
+        rc, lint = run_memlint(["--against-ref", "HEAD", str(self.store)])
+        self.assertEqual(rc, 0, lint)
+        text = (self.store / "topics" / "foo.md").read_text()
+        self.assertLess(text.index("ref: \"src/bar.py\""), text.index("links:"))
+        errors, _ = memlint.lint_root(self.store)
+        self.assertEqual(errors, [], errors)
+
+    def test_blank_line_between_last_anchor_and_links(self):
+        self._append_after("\n")
+
+    def test_comment_line_between_last_anchor_and_links(self):
+        self._append_after("# a note about the anchors\n")
+
+    def test_blank_and_comment_lines(self):
+        self._append_after("\n# note\n\n")
+
+
+class TestGateRound1ByteWriters(SessionCase):
+    def _crlf_topic(self, name, refs):
+        text = plain_topic("TOP-9001", refs).replace("kind: adopted\n", "kind: adopted   \n")
+        raw = text.replace("\n", "\r\n").encode()
+        (self.store / "topics" / f"{name}.md").write_bytes(raw)
+        return raw
+
+    def test_bind_preserves_crlf_and_trailing_whitespace(self):
+        before = self._crlf_topic("a", ["src/other.py"])
+        self.code_file("src/foo.py", PY_SRC)
+        rc, out, err = run_memidx(["bind", "TOP-9001", "src/foo.py", "--root", str(self.store),
+                                   "--code-root", str(self.code)])
+        self.assertEqual(rc, 0, err)
+        after = (self.store / "topics" / "a.md").read_bytes()
+        only_insertions(self, before, after)
+        self.assertNotRegex(after, rb"(?<!\r)\n")
+        self.assertIn(b"kind: adopted   \r\n", after)
+        self.assertIn(b'ref: "src/foo.py"\r\n', after)
+
+    def test_backfill_preserves_crlf_and_trailing_whitespace(self):
+        before = self._crlf_topic("a", ["src/foo.py"])
+        self.code_file("src/foo.py", PY_SRC)
+        self.session("s1", [self.ledger_row("src/foo.py")])
+        rc, out, err = run_memidx(["anchor-backfill", "--root", str(self.store), "--project", "p",
+                                   "--sessions-dir", str(self.sessions), "--code-root", str(self.code)])
+        self.assertEqual(rc, 0, err)
+        after = (self.store / "topics" / "a.md").read_bytes()
+        self.assertNotEqual(after, before)
+        only_insertions(self, before, after)
+        self.assertNotRegex(after, rb"(?<!\r)\n")
+        self.assertIn(b"kind: adopted   \r\n", after)
+
+    def test_bind_refuses_invalid_utf8(self):
+        raw = plain_topic("TOP-9001", []).encode() + b"\xff\xfe tail\n"
+        (self.store / "topics" / "a.md").write_bytes(raw)
+        self.code_file("src/foo.py", PY_SRC)
+        rc, out, err = run_memidx(["bind", "TOP-9001", "src/foo.py", "--root", str(self.store),
+                                   "--code-root", str(self.code)])
+        self.assertEqual(rc, 1)
+        self.assertIn("not valid UTF-8", err)
+        self.assertEqual((self.store / "topics" / "a.md").read_bytes(), raw)
+
+    def test_backfill_refuses_invalid_utf8(self):
+        raw = plain_topic("TOP-9001", ["src/foo.py"]).encode() + b"\xff\xfe tail\n"
+        (self.store / "topics" / "a.md").write_bytes(raw)
+        self.code_file("src/foo.py", PY_SRC)
+        self.session("s1", [self.ledger_row("src/foo.py")])
+        rc, out, err = run_memidx(["anchor-backfill", "--root", str(self.store), "--project", "p",
+                                   "--sessions-dir", str(self.sessions), "--code-root", str(self.code)])
+        self.assertEqual(rc, 1)
+        self.assertIn("not valid UTF-8", err)
+        self.assertEqual((self.store / "topics" / "a.md").read_bytes(), raw)
+
+
+class TestGateRound1QuotedRefs(SessionCase):
+    def test_yaml_typed_names_bind_and_lint_clean(self):
+        for name in ("yes", "on", "null", "1.0"):
+            with self.subTest(name=name):
+                (self.store / "topics" / "a.md").write_text(plain_topic("TOP-9001", []))
+                self.code_file(name, "content of %s\n" % name)
+                rc, out, err = run_memidx(["bind", "TOP-9001", name, "--root", str(self.store),
+                                           "--code-root", str(self.code)])
+                self.assertEqual(rc, 0, err)
+                fm = memidx.parse_record_text((self.store / "topics" / "a.md").read_text(), "x").frontmatter
+                self.assertEqual(fm["code_refs"], [name])
+                self.assertEqual(fm["anchors"][0]["ref"], name)
+                errors, _ = memlint.lint_root(self.store)
+                self.assertEqual(errors, [], errors)
+
+    def test_symbol_ref_with_hash_binds_and_lints_clean(self):
+        (self.store / "topics" / "a.md").write_text(plain_topic("TOP-9001", []))
+        self.code_file("src/foo.py", PY_SRC)
+        rc, out, err = run_memidx(["bind", "TOP-9001", "src/foo.py#beta", "--root", str(self.store),
+                                   "--code-root", str(self.code)])
+        self.assertEqual(rc, 0, err)
+        fm = memidx.parse_record_text((self.store / "topics" / "a.md").read_text(), "x").frontmatter
+        self.assertEqual(fm["code_refs"], ["src/foo.py#beta"])
+        errors, _ = memlint.lint_root(self.store)
+        self.assertEqual(errors, [], errors)
+
+    def test_round_trip_check_refuses_a_retyped_reference(self):
+        text = plain_topic("TOP-9001", []).replace("code_refs: []", "code_refs:\n  - yes")
+        problem = memidx.bound_edit_problem(text, "x.md", "yes", "L1", ["yes"])
+        self.assertIn("round-trip", problem or "")
 
 
 class TestLinkRawSpansUnchanged(unittest.TestCase):
