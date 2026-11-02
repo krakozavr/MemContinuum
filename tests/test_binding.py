@@ -1028,6 +1028,94 @@ class TestStandingAnchorSummary(DeliveryCase):
                          + out["anchor_summary"]["never"], 0)
 
 
+class TestContextPackAnchors(DeliveryCase):
+    def pack(self, *args, roots=True, cap=None):
+        argv = ["context-pack", *args, "--project", "p", "--db", str(self.db), "--root", str(self.store),
+                "--code-db", str(self.codedb)]
+        if roots:
+            argv += ["--code-root", str(self.code)]
+        if cap:
+            argv += ["--max-bytes", str(cap)]
+        rc, out, err = run_memidx(argv)
+        self.assertEqual(rc, 0, err)
+        return out
+
+    def two_topics(self):
+        self.add_topic("x", plain_topic("TOP-9701", ["src/x.py"], "Changed one"))
+        self.add_topic("y", plain_topic("TOP-9702", ["src/y.py"], "Never one"))
+        self.code_file("src/x.py", "x\n")
+        self.code_file("src/y.py", "y\n")
+        self.bind("src/x.py", "TOP-9701")
+        self.code_file("src/x.py", "x edited\n")
+        self.reindex()
+
+    def test_line_sits_between_the_record_file_line_and_the_chain_header(self):
+        self.two_topics()
+        lines = self.pack("src/x.py", "src/y.py").splitlines()
+        i = next(n for n, l in enumerate(lines) if l.startswith("TOP-9701 Changed one"))
+        self.assertEqual(lines[i - 1], "Anchor changed since capture (bind): src/x.py")
+        self.assertTrue(lines[i - 2].startswith("[record file:"))
+        j = next(n for n, l in enumerate(lines) if l.startswith("TOP-9702 Never one"))
+        self.assertEqual(lines[j - 1], "Anchor never captured: src/y.py.")
+
+    def test_no_code_root_leaves_the_pack_exactly_as_before(self):
+        self.two_topics()
+        plain = self.pack("src/x.py", "src/y.py", roots=False)
+        self.assertNotIn("Anchor ", plain)
+
+    def test_everything_else_in_the_pack_is_unchanged(self):
+        self.two_topics()
+        plain = self.pack("src/x.py", "src/y.py", roots=False).splitlines()
+        annotated = self.pack("src/x.py", "src/y.py").splitlines()
+        stripped = [l for l in annotated if not l.startswith("Anchor ")]
+        # only the hash line (it covers the extra bytes) differs
+        self.assertEqual(stripped[:-1], plain[:-1])
+        self.assertNotEqual(stripped[-1], plain[-1])
+
+    def test_annotation_bytes_are_inside_the_hash_and_reproducible(self):
+        self.two_topics()
+        first = self.pack("src/x.py", "src/y.py")
+        self.assertEqual(self.pack("src/x.py", "src/y.py"), first)
+        text, _, last = first.rstrip("\n").rpartition("\n")
+        self.assertEqual(last, memidx.pack_hash_line(text + "\n")[2])
+        self.code_file("src/x.py", "x edited again\n")
+        changed_line = self.pack("src/x.py", "src/y.py").splitlines()[-1]
+        self.assertEqual(changed_line, last)   # still "changed": same bytes, same hash
+        self.code_file("src/x.py", "x\n")      # back to the captured bytes -> the line disappears
+        self.assertNotEqual(self.pack("src/x.py", "src/y.py").splitlines()[-1], last)
+
+    def test_cut_order_drops_never_captured_before_changed_and_never_a_topic(self):
+        self.two_topics()
+        base = self.pack("src/x.py", "src/y.py", roots=False)
+        base_bytes = len(base.rsplit("pack sha256=", 1)[0].encode())
+        changed_cost = len(("Anchor changed since capture (bind): src/x.py\n").encode())
+        out = self.pack("src/x.py", "src/y.py", cap=base_bytes + changed_cost)
+        self.assertIn("Anchor changed since capture (bind): src/x.py", out)
+        self.assertNotIn("Anchor never captured", out)
+        self.assertIn("TOP-9702 Never one", out)       # no topic was lost to make room
+        self.assertNotIn("omitted by the size cap", out)
+        tight = self.pack("src/x.py", "src/y.py", cap=base_bytes)
+        self.assertNotIn("Anchor ", tight)
+
+    def test_pack_is_read_only_and_chunker_free(self):
+        self.add_topic("a", plain_topic("TOP-9703", ["src/foo.py"], "Sym"))
+        self.code_file("src/foo.py", PY_SRC)
+        self.bind("src/foo.py#beta", "TOP-9703")
+        self.reindex()
+        self.code_reindex()
+        self.code_file("src/foo.py", PY_SRC.replace("x = 2", "x = 9"))
+        self.code_reindex()
+
+        def boom(*a, **kw):
+            raise AssertionError("context-pack touched a chunker / writable code index")
+
+        with mock.patch.object(memidx.chunkers, "get_chunker", boom), \
+                mock.patch.object(memidx, "validate_chunk_result", boom), \
+                mock.patch.object(memidx, "open_code_db", boom):
+            out = self.pack("src/foo.py")
+        self.assertIn("Anchor changed since capture (bind): src/foo.py#beta", out)
+
+
 class TestLinkRawSpansUnchanged(unittest.TestCase):
     def test_default_key_walks_links(self):
         text = topic_text([good_row()])

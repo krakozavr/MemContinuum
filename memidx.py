@@ -6654,7 +6654,8 @@ def _pack_topic_variants(conn, topic_row) -> list:
 
 
 def build_context_pack(conn, project: str, files: list, topic_ids: list, query: str | None,
-                       store: str, state: str, max_bytes: int) -> dict:
+                       store: str, state: str, max_bytes: int,
+                       anchor_roots: list | None = None, code_db=None) -> dict:
     """Assemble the pack (see cmd_context_pack). Returns the JSON envelope
     minus the hash fields -- {text, topics, omitted, standing_omitted} -- or
     {"error": msg} when even the fixed part exceeds `max_bytes`. Pure over
@@ -6753,6 +6754,8 @@ def build_context_pack(conn, project: str, files: list, topic_ids: list, query: 
                 break
         else:
             break   # whole topics from the tail: this and every later one is omitted
+    if anchor_roots:
+        sel = _pack_add_anchor_lines(conn, project, sel, render, size, max_bytes, anchor_roots, code_db)
     text = render(sel)
     topics = [{"id": tid, "via": list(v)} for tid, v in standing_via.items()]
     by_id = {t["id"]: t for t in topics}
@@ -6766,6 +6769,45 @@ def build_context_pack(conn, project: str, files: list, topic_ids: list, query: 
     shown_ids = {id(c) for c, _ in sel}
     return {"text": text, "topics": topics, "standing_omitted": standing_omitted,
             "omitted": [c["id"] for c in ranked if id(c) not in shown_ids]}
+
+
+def _pack_add_anchor_lines(conn, project: str, sel: list, render, size, max_bytes: int,
+                           anchor_roots: list, code_db) -> list:
+    """Add one anchor line above each selected topic's chain (after its
+    `[record file: ...]` line), but only as the cap allows and never at a
+    topic's expense: topics were already chosen without them, and a line is
+    added only while the pack still fits. Lines go in the opposite order of
+    the cut: changed first, then missing, never captured, and last "not
+    checked" -- so under a tight cap "not checked" is cut first, "changed"
+    last. The line is never a ruling, status or authority line; its bytes are
+    inside the pack hash. No deadline: a pack must be reproducible byte for
+    byte, so the same files give the same pack. Read-only and chunker-free."""
+    checker = anchor_checker_for_roots(project, anchor_roots, code_db=code_db)
+    notes: dict = {}
+    try:
+        for c, _lines in sel:
+            try:
+                fm = parse_record(Path(c["row"]["path"])).frontmatter
+                statuses = topic_anchor_statuses(fm, checker)
+            except (OSError, sqlite3.Error):
+                continue
+            line = anchor_header_line(statuses)
+            if line:
+                kind = next(k for k in ANCHOR_STATUS_PRIORITY if any(s["kind"] == k for s in statuses))
+                notes[id(c)] = (kind, line)
+    finally:
+        checker.close()
+    sel = list(sel)
+    for kind in ANCHOR_STATUS_PRIORITY:
+        for i, (c, lines) in enumerate(sel):
+            note = notes.get(id(c))
+            if note is None or note[0] != kind:
+                continue
+            trial = list(sel)
+            trial[i] = (c, [lines[0], note[1]] + lines[1:])
+            if size(render(trial)) <= max_bytes:
+                sel = trial
+    return sel
 
 
 def _pack_refusal(args, rc: int, message: str, **extra) -> int:
@@ -6822,6 +6864,9 @@ def cmd_context_pack(args) -> int:
         built = build_context_pack(
             conn, args.project, files, list(getattr(args, "topic", None) or []),
             getattr(args, "query", None), store, state, max_bytes,
+            anchor_roots=_code_roots_arg(getattr(args, "code_root", None)),
+            code_db=resolve_code_db_path(argparse.Namespace(
+                db=getattr(args, "code_db", None), project=args.project)),
         )
     except (sqlite3.OperationalError, IndexError):
         # A legacy schema the read-only open cannot read (a missing column).
@@ -12338,6 +12383,17 @@ def main(argv=None) -> int:
                         help="recorded blind-review mode: open no index, print only the "
                              "fixed notice and its pack hash")
     p_pack.add_argument("--json", action="store_true")
+    p_pack.add_argument(
+        "--code-root", dest="code_root", action="append", default=None,
+        help="a code root whose files the topics' anchors are compared against (repeatable): "
+             "adds one anchor line above each included topic's chain, inside the pack hash; "
+             "without any, the pack has no anchor lines",
+    )
+    p_pack.add_argument(
+        "--code-db", dest="code_db", default=None,
+        help="code index path for symbol anchors (default $MEMCONTINUUM_HOME/<project>-code.sqlite); "
+             "opened read-only",
+    )
     p_pack.set_defaults(func=cmd_context_pack)
 
     p_code_reindex = sub.add_parser(

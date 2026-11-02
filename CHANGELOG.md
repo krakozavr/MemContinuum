@@ -30,6 +30,11 @@
   `Anchor never captured: N.`). It needs a configured code root, is dropped
   before any standing line when the size cap bites, and never alters the
   digest or its hash.
+- `memidx.py context-pack --code-root DIR` adds one anchor line above each
+  included topic's chain (changed, missing, never captured or not checked),
+  inside the pack hash; under a tight size cap the least important lines go
+  first and no topic is dropped to make room for one. Without `--code-root`
+  the pack is unchanged.
 
 ### Retrieval
 - New `memidx.py context-pack FILE... [--topic ID] [--query WORDS] [--blind]`

@@ -3627,6 +3627,19 @@ every configured code root, appends the engine's line verbatim, and logs
 `skipped-no-root`) on the `standing=injected` entry. A deduplicated resume
 injects nothing, so no line either. Plain `standing` output never changes.
 
+*Context pack (`context-pack --code-root DIR`).* With a code root, each
+included topic gets one anchor line directly above its chain (after the
+`[record file: ...]` line), computed over all of the topic's `code_refs`.
+Topics are selected under the cap exactly as without anchors; lines are then
+added only while the pack still fits, in the opposite order of the cut:
+changed first, then missing, then never captured, and "not checked" last — so
+under a tight cap "not checked" goes first and "changed" last, and a line
+never costs a topic its place. The line is never a ruling, status or authority
+line, its bytes are inside the pack hash, and there is no time budget (the
+same files give the same pack, byte for byte). Without any `--code-root` the
+pack has no anchor lines and is unchanged. Read-only and chunker-free like the
+other routes.
+
 ## Context packs
 
 Hooks never fire on a read-only review, and a reviewer's snapshot is a clone
