@@ -266,7 +266,37 @@ class TestContextPackFixRound1(PackCase):
         self.reindex()
         out = self.pack("src/a.py")
         self.assertIn(f'"{long_text}"', out)
+        self.assertIn("[... 1 older link(s) omitted]", out)
         self.assertEqual(self.pack_json("src/a.py")["omitted"], [])
+
+    def test_very_long_current_chain_with_one_older_link_still_names_the_dropped_history(self):
+        long_text = "BEGIN " + "clause; " * 700 + "END-OF-RULING"
+        self.assertGreater(len(long_text), 5500)
+        self.add("a", multi_link_topic("TOP-8010", "Huge", ["src/a.py"], long_text, ["OLDER-HISTORY " * 20]))
+        self.reindex()
+        j = self.pack_json("src/a.py")
+        self.assertIn(f'"{long_text}"', j["text"])
+        self.assertIn("[... 1 older link(s) omitted]", j["text"])
+        self.assertNotIn("OLDER-HISTORY", j["text"])
+        self.assertEqual(j["omitted"], [])
+        # current link fits but current + marker does not: the whole topic goes, and is named
+        marker_free = j["bytes"] - len("  [... 1 older link(s) omitted]\n")
+        k = self.pack_json("src/a.py", "--max-bytes", str(marker_free + 5))
+        self.assertEqual(k["omitted"], ["TOP-8010"])
+        self.assertNotIn("END-OF-RULING", k["text"])
+        self.assertLessEqual(k["bytes"], marker_free + 5)
+
+    def test_blind_obeys_max_bytes(self):
+        for bad in ("1", "0", "-5"):
+            rc, out, err = self.run_cmd("context-pack", "--blind", "--max-bytes", bad)
+            self.assertEqual(rc, 2, bad)
+            self.assertEqual(out, "")
+        need = len(memidx.CONTEXT_PACK_BLIND_TEXT.encode("utf-8"))
+        rc, out, _ = self.run_cmd("context-pack", "--blind", "--max-bytes", str(need - 1))
+        self.assertEqual(rc, 2)
+        rc, out, _ = self.run_cmd("context-pack", "--blind", "--max-bytes", str(need), "--json")
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out)["bytes"], need)
 
     def test_current_ruling_that_does_not_fit_the_pack_omits_the_whole_topic(self):
         long_text = "BEGIN " + "clause; " * 400 + "END-OF-RULING"

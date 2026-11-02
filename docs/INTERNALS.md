@@ -3520,7 +3520,8 @@ standing digest, byte-identical to what `standing` prints (the same
 digest is over the store-wide cap it is replaced by a one-line notice and the
 JSON envelope lists those topics in `standing_omitted`). Then the topics bound
 to each FILE, each once with the files that bind it listed; the `--topic`
-topics; and at most two FTS neighbours for `--query`, labelled a guess (same
+topics (displayed after the bound block; named-first below governs selection
+under the cap, not display order); and at most two FTS neighbours for `--query`, labelled a guess (same
 filter and ranking as `search --mode fts --decisions-only`; no vector path).
 Binding uses `resolve_path_governance`, the resolution `for-path` renders
 from: `code_refs` matches plus the topics governing a concept that claims the
@@ -3528,10 +3529,14 @@ file. A topic that is both named and bound is shown once, under "Named
 explicitly".
 
 **What a topic costs.** A topic's fixed cost is its header line plus its
-current link rendered in full; the current ruling is never shortened. The
-2000-byte per-topic budget pays only for older links on top of that fixed
-cost, and under a tight pack older links are shed first (with an "older
-link(s) omitted" marker) before the topic itself is dropped.
+current link rendered in full, plus the "older link(s) omitted" marker when it
+has older links; the current ruling is never shortened and history is never
+dropped silently. A topic is rendered with a budget of 2000 bytes or its
+fixed cost, whichever is larger: older links are kept newest-first only while
+they fit inside that budget, so a topic whose current link alone exceeds 2000
+bytes carries no older links, only the marker. Under a tight pack the topic
+falls back to exactly its fixed cost; if even that does not fit, the topic is
+omitted whole and named.
 
 **Cap and ordering.** `--max-bytes` (default 12000) is a hard cap on the pack
 text, the bytes above the final line, omission line included. Explicitly

@@ -6249,13 +6249,18 @@ def _pack_search_topic_rows(conn, project: str, query: str, skip_paths: set) -> 
 
 def _pack_topic_variants(conn, topic_row) -> list:
     """Chain-line renderings of one topic, fullest first. The topic's FIXED
-    cost is its header line plus its current link rendered IN FULL; the
-    2000-byte budget (CONTEXT_PACK_TOPIC_CHAIN_BYTES) pays only for OLDER
-    links on top of that. So the budget handed to topic_chain_lines_capped is
-    never below the fixed cost, which keeps its truncation branch (the one
-    that cuts a ruling mid-text) unreachable. The second variant keeps only
-    the fixed part plus the 'older link(s) omitted' marker, for a pack tight
-    enough that the older links do not fit."""
+    cost is its header line plus its current link rendered IN FULL; that is
+    never shortened. When the topic has older links, the "[... N older
+    link(s) omitted]" marker is part of the fixed cost too, so no variant
+    can drop history silently. Budget policy: the fullest variant is
+    rendered with max(CONTEXT_PACK_TOPIC_CHAIN_BYTES, fixed cost) -- older
+    links are kept newest-first only while they fit inside it, so a topic
+    whose current link alone exceeds 2000 bytes gets no older links but its
+    marker. The second variant is exactly the fixed cost, for a pack too
+    tight for the first. Because every budget is at least the fixed cost,
+    topic_chain_lines_capped's truncation branch is unreachable. A topic
+    whose fixed cost does not fit the pack is omitted whole and named by the
+    caller."""
     link_rows = conn.execute(
         "SELECT * FROM links WHERE topic_path=? ORDER BY seq ASC", (topic_row["path"],)
     ).fetchall()
@@ -6263,11 +6268,12 @@ def _pack_topic_variants(conn, topic_row) -> list:
     fixed = len(_chain_header_line(topic_row, cur).encode("utf-8"))
     if cur is not None:
         fixed += _lines_cost(_chain_link_lines(topic_row, cur, edges_for_topic(conn, topic_row["path"])))
+    if len(link_rows) > 1:
+        fixed += _lines_cost([f"  [... {len(link_rows) - 1} older link(s) omitted]"])
     full = topic_chain_lines_capped(conn, topic_row, max(CONTEXT_PACK_TOPIC_CHAIN_BYTES, fixed))
     variants = [full]
     if len(link_rows) > 1:
-        marker_cost = _lines_cost([f"  [... {len(link_rows) - 1} older link(s) omitted]"])
-        minimal = topic_chain_lines_capped(conn, topic_row, fixed + marker_cost)
+        minimal = topic_chain_lines_capped(conn, topic_row, fixed)
         if minimal != full:
             variants.append(minimal)
     return variants
@@ -6401,16 +6407,23 @@ def cmd_context_pack(args) -> int:
     [--blind] [--max-bytes N] [--json]` -- one paste-ready block of decision
     records for an external reviewer's or dispatched agent's brief (TOP-0135).
     Read-only throughout (open_db_readonly): standing digest (byte-identical
-    to `standing`), then --topic topics, topics bound to FILE..., and a
-    labelled FTS guess for --query. Whole topics are dropped from the tail
-    under --max-bytes and named; the cap is hard (text above the last line,
+    to `standing`), topics bound to FILE..., --topic topics, and a labelled
+    FTS guess for --query, in that displayed order. Selection under the cap
+    runs named first, then bound, then search; whole topics are dropped from
+    that tail under --max-bytes and named; the cap is hard (text above the last line,
     omission line included). The last line is `pack sha256=<hex> bytes=<N>`
     over those exact bytes. --blind opens no index and prints only the fixed
     notice. Exit codes: 0 pack; 1 index missing, uninitialized or unreadable;
     2 usage (non-positive or too-small --max-bytes, unknown store root)."""
     as_json = bool(getattr(args, "json", False))
+    max_bytes = getattr(args, "max_bytes", CONTEXT_PACK_DEFAULT_MAX_BYTES)
+    if max_bytes is None or max_bytes <= 0:
+        return _pack_refusal(args, 2, f"max-bytes must be a positive number of bytes (got {max_bytes})")
     if getattr(args, "blind", False):
         text = CONTEXT_PACK_BLIND_TEXT
+        need = len(text.encode("utf-8"))
+        if need > max_bytes:
+            return _pack_refusal(args, 2, f"max-bytes {max_bytes} too small: fixed part needs {need} bytes")
         sha, nbytes, line = pack_hash_line(text)
         if as_json:
             print(json.dumps({"sha256": sha, "bytes": nbytes, "blind": True, "text": text,
@@ -6419,9 +6432,6 @@ def cmd_context_pack(args) -> int:
         else:
             print(text + line)
         return 0
-    max_bytes = getattr(args, "max_bytes", CONTEXT_PACK_DEFAULT_MAX_BYTES)
-    if max_bytes is None or max_bytes <= 0:
-        return _pack_refusal(args, 2, f"max-bytes must be a positive number of bytes (got {max_bytes})")
     root = Path(args.root).resolve() if getattr(args, "root", None) else None
     store = str(root) if root else os.environ.get("MEMCONTINUUM_ROOT")
     if not store:
