@@ -17,6 +17,13 @@
   input, so every wired row shows as `stale` until `memcontinuum-update.sh
   --apply` re-renders it, even where the filters and prefix are unchanged
   (the embedded render stamp moves).
+- The worktree remap prints its main-checkout path in the configured root's
+  spelling again. On macOS a temp or home directory behind a symlink
+  (`/var` -> `/private/var`) made the remapped path real-path spelled, so it
+  no longer matched `MEMCONTINUUM_STRIP_PREFIX` or the hook's cwd and the
+  fallback search was queried on the whole machine path. Where the root's
+  configured tail differs from its real tail (a symlink inside the
+  repository) the real-path spelling is still printed.
 
 ## [0.4.0] — 2026-10-31
 

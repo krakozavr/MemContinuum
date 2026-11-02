@@ -3020,7 +3020,8 @@ root narrower than its checkout (`<repo>/Sources`) still has the whole checkout
 under the glob and `MEMCONTINUUM_STRIP_PREFIX` is the colon-joined retrieval
 roots. Code roots scope only the index, the new-file nudge and the ledger. The
 worktree remap returns the path under the matching root's own checkout toplevel,
-so a worktree edit under a narrow root is recorded at its real path (or ends
+spelled the way the configured root is spelled (a symlinked ancestor such as
+macOS's `/var` is kept, so callers can still strip the configured prefix), so a worktree edit under a narrow root is recorded at its real path (or ends
 `out-of-scope`). A worktree checked out as a
 SIBLING of the wired root never reaches the script at all under the current
 settings rendering, so it gets **ledger coverage only** (`ledger-post-edit.sh`
