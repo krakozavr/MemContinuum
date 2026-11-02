@@ -2330,10 +2330,13 @@ def strip_anchor_annotations(stdout_text):
         return stdout_text
     kept, prev = [], ""
     for line in ctx.split("\n"):
-        if line.startswith(ANCHOR_HEADER_TEXTS) and _TOPIC_HEADER_LINE_RE.match(prev):
+        # `prev` is the preceding ORIGINAL input line, removed or not, so only
+        # the one line right after a topic header can ever be stripped.
+        strip = line.startswith(ANCHOR_HEADER_TEXTS) and _TOPIC_HEADER_LINE_RE.match(prev)
+        prev = line
+        if strip:
             continue
         kept.append(line)
-        prev = line
     doc["hookSpecificOutput"]["additionalContext"] = "\n".join(kept)
     return json.dumps(doc, sort_keys=True, ensure_ascii=False)
 
@@ -2352,6 +2355,13 @@ class TestOracleNormaliserIsNarrow(unittest.TestCase):
     def test_a_ruling_continuation_beginning_anchor_survives(self):
         text = self._doc("intro", self.HEADER, "Anchor do not delete this rule", "  L1 rule")
         self.assertIn("Anchor do not delete this rule", strip_anchor_annotations(text))
+
+    def test_only_the_one_line_after_the_header_is_stripped(self):
+        text = self._doc("intro", self.HEADER, "Anchor changed since capture (bind): src/foo.py",
+                         "Anchor missing: ruling continuation", "  L1 rule")
+        out = strip_anchor_annotations(text)
+        self.assertIn("Anchor missing: ruling continuation", out)
+        self.assertNotIn("since capture", out)
 
     def test_a_header_text_not_right_after_a_topic_header_survives(self):
         text = self._doc("intro", "Anchor missing: src/foo.py (file gone).", self.HEADER)
