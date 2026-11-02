@@ -2756,7 +2756,7 @@ id:
 | a valid forward `status` move (with `superseded_by` added when the new status is `superseded`), `promoted_by` added, alone on the link; new links; changes to `current`, `title`, `tags`, `code_refs`, or the body text | free |
 | a link present at `REF` has its PARSED fields unchanged but its RAW TEXT SPAN changed (a YAML dumper re-render: different quoting, key order, wrapping, or a whitespace-only edit, with identical parsed content) | error, `<path>:<link>: link reformatted, not appended` — the field-level comparison above never fires for these (every field is equal), so the span is compared byte-for-byte separately; a span that cannot be safely attributed to its link on the `REF` side (structural extraction inconclusive — see below) skips this comparison with a NOTE, never an error — the field-level rules above still apply |
 | the same, but the span cannot be attributed on the NEW side (structural extraction inconclusive there instead) while the `REF` side extracted fine | error, `<path>:<link>: link's span could not be extracted on the new side; treated as changed` — a deliberately different message from the row above: this is a proven extraction FAILURE treated as a change (fail closed), never a claim that the bytes were actually compared and found to differ |
-| an `anchors:` row present at `REF` is missing now, has a changed parsed field, or has the same fields in different raw text; or two rows now carry one `(ref, link)` | error naming the row, `<path>: anchor (<ref>, <link>): row changed after being recorded` / `row reformatted, not appended` / `more than one row` — the same raw-span walker as the links row above, keyed by `anchors:` and by `(ref, link, captured, captured_at)`; new rows are free |
+| an `anchors:` row present at `REF` is missing now, has a changed parsed field, or has the same fields in different raw text; or two rows now carry one `(ref, link)` | error naming the row, `<path>: anchor (<ref>, <link>): row changed after being recorded` / `row reformatted, not appended` / `more than one row` — the same raw-span walker as the links row above, keyed by `anchors:` and by `(ref, link, captured, captured_at)`; new rows are free; row multiplicity at `REF` is kept, so a duplicated pair reduced to one row errors as removed |
 | a new link (present now, absent at `REF`) sorts BELOW some link that already existed at `REF`, in the new file's own link order | error, `<path>:<link>: link inserted out of order` — every new link must sort above every `REF`-side link, newest-first; reordering AMONG `REF`-side links themselves is not separately checked |
 | the `REF`-side blob failed full validation (a shape error, or a duplicate link id) but its `links` field itself still recovers at least one usable entry | not a repair — those recovered links (a duplicate id keeps its FIRST occurrence, file order) are still compared against the new side by every rule above, exactly as if the REF blob had parsed cleanly, with a note naming the REF-side diagnostic that made the blob invalid |
 | the `REF`-side blob never parsed at all (or parsed but recovered no usable `links`), and the new blob now parses cleanly | a note, not an error (`repaired — the blob at REF could not be safely parsed …`) — nothing here was ever recorded link history to freeze, so fixing it is a repair, never an append-only violation. `anchors:` rows are NOT part of that repair: any anchor rows the REF blob still yields stay frozen on this branch too (a changed or removed row errors with the same "row removed or changed" wording as the ordinary path) |
@@ -3545,7 +3545,10 @@ span the freeze attributes to the block's last item, so an append stays an
 append. The writers are **byte-preserving**: the file is read as bytes and
 decoded as strict UTF-8 (invalid bytes: rc 1, a message, nothing written), the
 newline convention (LF or CRLF) is detected from the file and used for the
-inserted lines, and the bytes are written back, so nothing outside the
+inserted lines (`memlint --against-ref` reads a CRLF record through the same
+`parse_record_raw` and its raw-span walker accepts `\r\n` line ends, so a CRLF
+record freezes on its original bytes and a CRLF to LF rewrite errors on every
+frozen span), and the bytes are written back, so nothing outside the
 inserted lines changes — the link bytes and any trailing whitespace included.
 The inserted `code_refs` entry and the anchor's `ref:` are always
 double-quoted scalars (a file named `yes`, `on`, `null` or `1.0` stays a
@@ -3630,11 +3633,13 @@ inserted by `topic_chain_lines` right after the topic header, before the
 links, so the plain text and `--json --with-chain-text` stay identical. The
 anchor work is bounded by `ANCHOR_BUDGET_SECONDS` (300 ms, monotonic) for the
 whole call. The deadline is tested by one helper
-(`AnchorChecker._deadline_passed`) before every file read, hash, SQL query and
-topic-file parse of the anchor work, so the budget bounds the work and not just
-its start; once spent, the remaining checks say `check budget exhausted` (a
+(`AnchorChecker._deadline_passed`) before AND after every file read, hash,
+code-index open, SQL query and topic-file parse of the anchor work, and a
+verdict is accepted only if the deadline had not passed after the step that
+produced it (a final hash that crosses the deadline is `check budget exhausted`,
+never `ok`); a blocked index open waits at most what is left of the budget. Once spent, the remaining checks say `check budget exhausted` (a
 topic not yet parsed is named by the edited file) and the ruling is delivered
-anyway. The standing route uses the same helper and counts the topics it could
+anyway. The standing route uses the same helper (after the SQL lookup and after each topic parse too) and counts the topics it could
 not reach as `unchecked` in `anchor_summary`. Without `--live-file`, `for-path` is unchanged.
 Any exception in the anchor work is swallowed (fail open).
 
@@ -3649,15 +3654,17 @@ untouched; when digest plus line would exceed the cap the line is dropped
 (`anchor_summary.dropped = "cap"`) before any standing line is. The hook passes
 every configured code root, appends the engine's line verbatim, and logs
 `anchors=<token>` (`changed=N`, `missing=N`, `never=N`, `clean`,
-`skipped-no-root`) on the `standing=injected` entry. A deduplicated resume
+`skipped-no-root`; when `anchor_summary.unchecked` is nonzero the token ends
+with `unchecked=N` after any positive counts, e.g. `changed=1,unchecked=2`, and is never `clean`) on the `standing=injected` entry. A deduplicated resume
 injects nothing, so no line either. Plain `standing` output never changes.
 
 *Context pack (`context-pack --code-root DIR`).* With a code root, each
 included topic gets one anchor line directly above its chain (after the
 `[record file: ...]` line), computed over all of the topic's `code_refs`.
 Topics are selected under the cap exactly as without anchors; every selected
-topic is then annotated and annotations are removed in the literal cut order —
-not checked, never captured, missing, changed — until the pack fits, so under
+topic is then annotated and annotations are removed one at a time (capacity re-checked after
+each removal, lowest-ranked topic first within a priority) in the literal cut
+order — not checked, never captured, missing, changed — until the pack fits, so under
 a tight cap "not checked" goes first and "changed" last, a long higher-priority
 line is never dropped in favour of a shorter lower-priority one, and a line
 never costs a topic its place. The line is never a ruling, status or authority
