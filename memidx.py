@@ -11972,6 +11972,9 @@ def ledger_code_rows(state: dict) -> list:
             continue
         out.append({
             "path": path, "root": root, "rel": os.path.relpath(path, root),
+            # an in-root worktree edit: `path` is the REMAPPED main-checkout path, the
+            # fallback recorded the tool's real path, kept as `worktree_path`
+            "match_path": os.path.normpath(str(row.get("worktree_path") or "")) if row.get("worktree_path") else path,
             "content_sha256": str(row.get("content_sha256") or ""),
             "seen_at": str(row.get("seen_at") or ""),
         })
@@ -11985,7 +11988,7 @@ def proposal_lines(state: dict, topic_is_bound, unmapped_report) -> list:
     dict (or None). Section one is the only part that may become a
     `code_refs` line."""
     rows = ledger_code_rows(state)
-    by_path = {r["path"]: r for r in rows}
+    by_path = {r["match_path"]: r for r in rows}
     fallbacks = [f for f in state.get("search_fallbacks") or [] if isinstance(f, dict)]
     lines = ["Binding proposals -- this session's search fallbacks joined to its edit ledger "
              "(last 20 fallbacks only; suggestions, nothing is bound until `memidx.py bind` runs):"]

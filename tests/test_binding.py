@@ -567,6 +567,20 @@ class TestProposeBindings(SessionCase):
         self.assertIn("TOP-9001  src/foo.py  " + "ab" * 6 + "  2026-11-02T10:00:00Z  pre-edit-chain", out)
         self.assertIn("    Alpha title", out)
 
+    def test_worktree_edit_joins_on_worktree_path_and_proposes_the_main_relpath(self):
+        self.add_topic("a", plain_topic("TOP-9001", ["src/other.py"], "Alpha"))
+        self.reindex()
+        self.code_file("src/foo.py", "x\n")
+        wt_path = str(self.code / ".worktrees" / "w1" / "src" / "foo.py")
+        row = self.ledger_row("src/foo.py", "ab" * 32)
+        row["worktree_path"] = wt_path
+        self.assertNotEqual(row["path"], wt_path)
+        fb = {"file": wt_path, "id": "TOP-9001", "title": "Alpha title", "hook": "pre-edit-chain"}
+        self.session("s1", [row], [fb])
+        rc, out, err = self.propose()
+        self.assertEqual(rc, 0, err)
+        self.assertIn("TOP-9001  src/foo.py  " + "ab" * 6, out)
+
     def test_topic_that_already_matches_the_path_is_not_proposed(self):
         self.add_topic("a", plain_topic("TOP-9001", ["src/foo.py"]))
         self.reindex()
