@@ -299,25 +299,24 @@ if "hash" in obj:
     _asum = obj.get("anchor_summary")
     _token = "-"
     if isinstance(_asum, dict):
-        if _asum.get("skipped"):
-            _token = "skipped-%s" % _asum["skipped"]
-        elif _asum.get("changed"):
-            _token = "changed=%d" % _asum["changed"]
-        elif _asum.get("missing"):
-            _token = "missing=%d" % _asum["missing"]
-        elif _asum.get("never"):
-            _token = "never=%d" % _asum["never"]
-        else:
-            _token = "clean"
-        # Topics the budget never reached are not "clean": say so, keeping any
-        # positive counts (gate round 2: an exhausted standing check was logged clean).
-        if _asum.get("unchecked") and not _asum.get("skipped"):
+        # The count list: the highest positive count, or every positive count plus
+        # unchecked when the budget never reached a topic (never "clean" then).
+        _counts = ""
+        for _k in ("changed", "missing", "never"):
+            if _asum.get(_k):
+                _counts = "%s=%d" % (_k, _asum[_k])
+                break
+        if _asum.get("unchecked"):
             _parts = ["%s=%d" % (k, _asum[k]) for k in ("changed", "missing", "never") if _asum.get(k)]
             _parts.append("unchecked=%d" % _asum["unchecked"])
-            _token = ",".join(_parts)
-        # The line was dropped by the cap: say so AND keep the counts (gate round 3).
-        if _asum.get("dropped") and not _asum.get("skipped"):
-            _token = "dropped-%s" % _asum["dropped"] + ("" if _token == "clean" else "," + _token)
+            _counts = ",".join(_parts)
+        # A skip or a cap-dropped line is named AND keeps the counts (gate round 3).
+        _lead = ""
+        if _asum.get("skipped"):
+            _lead = "skipped-%s" % _asum["skipped"]
+        elif _asum.get("dropped"):
+            _lead = "dropped-%s" % _asum["dropped"]
+        _token = ",".join(x for x in (_lead, _counts) if x) or "clean"
     try:
         with open(sys.argv[3], "w") as f:
             f.write(str(obj.get("anchor_line") or ""))

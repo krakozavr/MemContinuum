@@ -1746,6 +1746,47 @@ class TestGateRound3WallClock(DeliveryCase):
                 mock.patch.object(checker, "_db", lambda: Conn()):
             self.assertEqual(checker.check(row), ("missing", "check budget exhausted"))
 
+    def test_standing_budget_miss_after_start_is_unchecked_never_missing_or_never(self):
+        t1 = TestStandingAnchorSummary.standing_topic(None, refs=("src/foo.py", "src/unbound.py"))
+        t2 = t1.replace("TOP-9900", "TOP-9901")
+        self.add_topic("s1", t1)
+        self.add_topic("s2", t2)
+        self.code_file("src/foo.py", PY_SRC)
+        self.code_file("src/unbound.py", PY_SRC)
+        self.bind("src/foo.py", "TOP-9900")
+        self.bind("src/foo.py", "TOP-9901")
+        self.reindex()
+        conn = memidx.open_db_noncreating(self.db, project="p")
+        now = {"t": 0.0}
+        real = memidx.sha256_hex
+        hashed = []
+
+        def crossing(b):
+            out = real(b)
+            if not hashed:
+                now["t"] = 100.0       # the very first hash crosses the deadline
+            hashed.append(1)
+            return out
+
+        try:
+            with mock.patch.object(memidx.time, "monotonic", lambda: now["t"]), \
+                    mock.patch.object(memidx, "sha256_hex", crossing):
+                summary = memidx.standing_anchor_summary(
+                    conn, "p", ["TOP-9900", "TOP-9901"], [self.code])
+        finally:
+            conn.close()
+        self.assertEqual(summary.get("unchecked"), 2, summary)
+        self.assertEqual(summary["missing"], 0)
+        self.assertEqual(summary["never"], 0)
+
+    def test_for_path_unanchored_ref_after_exhaustion_is_not_never(self):
+        row_fm = {"code_refs": ["src/foo.py"]}
+        now = {"t": 100.0}
+        checker = memidx.AnchorChecker("p", lambda _p: b"x", deadline=50.0)
+        with mock.patch.object(memidx.time, "monotonic", lambda: now["t"]):
+            st = memidx.anchor_statuses(row_fm, ["src/foo.py"], checker)
+        self.assertEqual([(x["kind"], x["detail"]) for x in st], [("missing", "check budget exhausted")])
+
     def test_a_file_over_8_mib_is_exhausted_without_a_read(self):
         self.add_topic("a", plain_topic("TOP-9001", ["src/other.py"], "Alpha"))
         live = self.code_file("src/foo.py", PY_SRC)

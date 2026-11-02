@@ -3204,6 +3204,25 @@ Body.
         self.assertIn("anchors=dropped-cap,changed=1", log)
         self.assertNotIn("anchors=dropped-cap ", log + " ")
 
+    def test_token_keeps_counts_beside_skipped_and_dropped(self):
+        # the token builder is one inline python in the hook; drive it with summaries
+        script = (HOOKS_DIR / "sessionstart-remind.sh").read_text()
+        start = script.index("_asum = obj.get(\"anchor_summary\")")
+        end = script.index("    try:\n        with open(sys.argv[3]")
+        body = script[start:end]
+        import textwrap
+        for summ, want in (
+            ({"skipped": "no-root"}, "skipped-no-root"),
+            ({"skipped": "error", "unchecked": 2}, "skipped-error,unchecked=2"),
+            ({"dropped": "cap", "changed": 1, "unchecked": 2}, "dropped-cap,changed=1,unchecked=2"),
+            ({"dropped": "cap"}, "dropped-cap"),
+            ({"unchecked": 3}, "unchecked=3"),
+            ({}, "clean"),
+        ):
+            ns = {"obj": {"anchor_summary": summ}}
+            exec(textwrap.dedent("    " + body), ns)
+            self.assertEqual(ns["_token"], want, summ)
+
     def test_never_captured_is_the_fallback_line(self):
         self._install(bind=False)
         ctx, _log = self._start("s-anchor-never")

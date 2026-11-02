@@ -3651,8 +3651,11 @@ topic-file parse) stays as the cheap common-case path; the thread is the
 guarantee. A verdict is accepted only if the deadline had not passed after the
 step that produced it (a final hash that crosses the deadline is `check budget
 exhausted`, never `ok`); a blocked index open waits at most what is left of the
-budget. The standing route's decision-index path lookups stay on the calling
-thread (that connection is not shared). The context-pack route stays
+budget. The standing route's worker also owns the per-topic decision-index `SELECT`
+(through its own read-only connection with the same progress handler); a topic
+whose check ends exhausted after it started, and an unanchored ref reached
+after the deadline, are `unchecked` (standing) or exhausted (for-path), never
+`missing` or `never`. The context-pack route stays
 synchronous and unbounded by design (no deadline, no size cap), so the same
 files give the same pack bytes. Any exception in the anchor work is swallowed
 (fail open). Without `--live-file`, `for-path` is unchanged.
@@ -3670,7 +3673,7 @@ untouched; when digest plus line would exceed the cap the line is dropped
 every configured code root, appends the engine's line verbatim, and logs
 `anchors=<token>` (`changed=N`, `missing=N`, `never=N`, `clean`,
 `skipped-no-root`; when `anchor_summary.unchecked` is nonzero the token ends
-with `unchecked=N` after any positive counts, e.g. `changed=1,unchecked=2`, and is never `clean`; when the cap dropped the line the token is `dropped-cap` followed by the same count list, e.g. `dropped-cap,changed=1,unchecked=2`, bare `dropped-cap` only when every count is zero) on the `standing=injected` entry. A deduplicated resume
+with `unchecked=N` after any positive counts, e.g. `changed=1,unchecked=2`, and is never `clean`; when the cap dropped the line, or the summary is `skipped-*`, the token is `dropped-cap` / `skipped-<why>` followed by the same count list, e.g. `dropped-cap,changed=1,unchecked=2`, bare only when every count is zero) on the `standing=injected` entry. A deduplicated resume
 injects nothing, so no line either. Plain `standing` output never changes.
 
 *Context pack (`context-pack --code-root DIR`).* With a code root, each

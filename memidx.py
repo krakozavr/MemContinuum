@@ -4489,6 +4489,10 @@ def anchor_statuses(fm: dict, refs: list, checker: AnchorChecker, exact_path: st
             continue
         row = anchor_pick_row(rows, ref, current)
         if row is None:
+            if checker._deadline_passed():
+                # after exhaustion an unanchored ref is not labelled "never"
+                out.append({"ref": ref, "kind": "missing", "detail": "check budget exhausted", "row": None})
+                continue
             kind = "not_checked" if checker.is_dir(ref_path) else "never"
             out.append({"ref": ref, "kind": kind, "detail": "", "row": None})
             continue
@@ -4625,35 +4629,60 @@ def standing_anchor_summary(conn, project: str, topic_ids: list, code_roots: lis
     counts = {"changed": 0, "missing": 0, "never": 0, "not_checked": 0}
     deadline = time.monotonic() + ANCHOR_BUDGET_SECONDS
     checker = anchor_checker_for_roots(project, code_roots, code_db=code_db, deadline=deadline)
-    # The decision-index lookups stay on this thread (the connection is not
-    # shareable); the file reads, parses and code-index queries run in ONE
-    # daemon worker joined for what is left of the budget.
-    paths = {}
-    for tid in topic_ids:
-        row = conn.execute(
-            "SELECT path FROM records WHERE project=? AND type='topic' AND id=?",
-            (project, tid)).fetchone()
-        paths[tid] = None if row is None else row["path"]
+    # The whole per-topic loop -- the decision-index SELECT, the parse, the file
+    # reads and the code-index queries -- runs in ONE daemon worker joined for
+    # what is left of the budget. The worker reads the decision index through
+    # its OWN read-only connection (check_same_thread=False, progress handler),
+    # opened on the file the caller's connection is attached to.
+    try:
+        main_file = conn.execute("PRAGMA database_list").fetchone()[2]
+    except Exception:
+        main_file = ""
     done: dict = {}   # topic id -> list of status kinds, or None = unchecked; entered only when COMPLETE
     failure: list = []
 
     def work():
+        dconn = None
         try:
+            dconn = open_db_readonly(
+                Path(main_file), timeout=max(0.001, min(0.2, deadline - time.monotonic())),
+                check_same_thread=False) if main_file else None
+            if dconn is not None:
+                dconn.set_progress_handler(lambda: 1 if checker._deadline_passed() else 0, 1000)
+            lookup = dconn if dconn is not None else conn
             for tid in topic_ids:
                 if checker._deadline_passed():
                     done[tid] = None
                     continue
-                if paths[tid] is None:
-                    done[tid] = []
-                    continue
-                fm = parse_record(Path(paths[tid])).frontmatter
+                row = lookup.execute(
+                    "SELECT path FROM records WHERE project=? AND type='topic' AND id=?",
+                    (project, tid)).fetchone()
                 if checker._deadline_passed():
                     done[tid] = None
                     continue
-                done[tid] = [st["kind"] for st in topic_anchor_statuses(fm, checker)]
+                if row is None:
+                    done[tid] = []
+                    continue
+                fm = parse_record(Path(row["path"])).frontmatter
+                if checker._deadline_passed():
+                    done[tid] = None
+                    continue
+                statuses = topic_anchor_statuses(fm, checker)
+                if any(st["kind"] == "missing" and st["detail"] == "check budget exhausted"
+                       for st in statuses):
+                    done[tid] = None     # exhausted after it started: unchecked, never missing
+                else:
+                    done[tid] = [st["kind"] for st in statuses]
         except Exception as exc:  # re-raised below so the caller fails open as before
+            if checker._deadline_passed():
+                return                # an interrupted lookup: the topics stay unreported
             failure.append(exc)
         finally:
+            if dconn is not None:
+                try:
+                    dconn.close()
+                except sqlite3.Error:
+                    pass
             checker.close()
 
     finished = _run_anchor_worker(deadline, work)
