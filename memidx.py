@@ -12134,6 +12134,17 @@ def iter_session_files(sessions_dir: Path):
             yield Path(sessions_dir) / name
 
 
+def path_join_key(p) -> str:
+    """The comparison spelling of a path for joins: `os.path.realpath`, or
+    `normpath` when realpath fails. Both sides of a join go through it, so a
+    ledger path in /var spelling meets a code root resolved to /private/var
+    (INC-0132 family); it is a KEY only -- never printed, stored or returned."""
+    try:
+        return os.path.realpath(str(p))
+    except (OSError, ValueError):
+        return os.path.normpath(str(p))
+
+
 def ledger_code_rows(state: dict) -> list:
     """Ledger rows that name edited CODE: `kind == "code"` with a non-empty
     `root` and an absolute `path`. Each is `{path, root, rel, content_sha256,
@@ -12165,14 +12176,14 @@ def proposal_lines(state: dict, topic_is_bound, unmapped_report) -> list:
     dict (or None). Section one is the only part that may become a
     `code_refs` line."""
     rows = ledger_code_rows(state)
-    by_path = {r["match_path"]: r for r in rows}
+    by_path = {path_join_key(r["match_path"]): r for r in rows}
     fallbacks = [f for f in state.get("search_fallbacks") or [] if isinstance(f, dict)]
     lines = ["Binding proposals -- this session's search fallbacks joined to its edit ledger "
              "(last 20 fallbacks only; suggestions, nothing is bound until `memidx.py bind` runs):"]
     named: set = set()
     proposed = 0
     for fb in fallbacks:
-        row = by_path.get(os.path.normpath(str(fb.get("file") or "")))
+        row = by_path.get(path_join_key(fb.get("file") or ""))
         if row is None or not fb.get("id"):
             continue
         if topic_is_bound(str(fb["id"]), row["path"], row["root"]):
@@ -12270,10 +12281,10 @@ def cmd_propose_bindings(args) -> int:
 
 def ledgered_code_paths(sessions_dir: Path) -> tuple:
     """`(paths, roots, skipped)` over EVERY session file in `sessions_dir`
-    (no date cutoff -- the ledger decides scope): the set of normalised
-    absolute edited code paths, the set of code roots those rows name, and
-    the file names skipped because they were unreadable or half written (a
-    live session)."""
+    (no date cutoff -- the ledger decides scope): the set of
+    edited code paths in `path_join_key` spelling (join keys, not for
+    display), the set of code roots those rows name, and the file names
+    skipped because they were unreadable or half written (a live session)."""
     paths: set = set()
     roots: set = set()
     skipped: list = []
@@ -12283,7 +12294,7 @@ def ledgered_code_paths(sessions_dir: Path) -> tuple:
             skipped.append(session_file.name)
             continue
         for row in ledger_code_rows(state):
-            paths.add(row["path"])
+            paths.add(path_join_key(row["path"]))
             roots.add(row["root"])
     return paths, roots, skipped
 
@@ -12324,7 +12335,7 @@ def cmd_anchor_backfill(args) -> int:
             if not code_ref_is_anchorable(ref) or (ref, link_id) in have:
                 continue
             ref_path = code_ref_split(ref)[0]
-            if not any(os.path.normpath(str(Path(r) / ref_path)) in paths for r in code_roots):
+            if not any(path_join_key(Path(r) / ref_path) in paths for r in code_roots):
                 continue
             row, failure = capture_anchor_row(ref, link_id, code_roots, "backfill")
             if row is None:
