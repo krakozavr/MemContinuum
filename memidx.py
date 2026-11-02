@@ -30,6 +30,7 @@ import shlex
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import urllib.parse
@@ -1405,7 +1406,7 @@ def _classify_index_state(
     return "current"
 
 
-def open_db_readonly(db_path: Path, timeout: float = 5.0) -> sqlite3.Connection | None:
+def open_db_readonly(db_path: Path, timeout: float = 5.0, check_same_thread: bool = True) -> sqlite3.Connection | None:
     """SQLite URI mode=ro: opens an EXISTING file strictly read-only --
     unlike open_db_noncreating's mode=rw, this NEVER runs
     `_run_decision_migration_guards` (which can ALTER a table, CREATE
@@ -1418,7 +1419,8 @@ def open_db_readonly(db_path: Path, timeout: float = 5.0) -> sqlite3.Connection 
     OperationalError opening it, e.g. a locked/corrupt file) -- same
     degrade-to-named-refusal shape as open_db_noncreating."""
     try:
-        conn = sqlite3.connect(f"file:{quote(db_path.as_posix())}?mode=ro", uri=True, timeout=timeout)
+        conn = sqlite3.connect(f"file:{quote(db_path.as_posix())}?mode=ro", uri=True, timeout=timeout,
+                               check_same_thread=check_same_thread)
     except sqlite3.OperationalError:
         return None
     conn.row_factory = sqlite3.Row
@@ -4310,6 +4312,7 @@ def anchor_row_key(row: dict) -> tuple:
 # the bind block) is the only anchor code allowed to run a chunker.
 
 ANCHOR_BUDGET_SECONDS = 0.3
+ANCHOR_MAX_FILE_BYTES = 8 * 1024 * 1024  # a larger live file is never read under a budget
 ANCHOR_STATUS_PRIORITY = ("changed", "missing", "never", "not_checked")
 ANCHOR_MISSING_REASONS = (
     "file gone", "symbol absent", "symbol ambiguous", "snapshot unavailable",
@@ -4325,6 +4328,22 @@ def anchor_pick_row(rows: list, ref: str, current_link: str | None) -> dict | No
         if current_link is not None and str(row.get("link")) == current_link:
             return row
     return mine[-1] if mine else None
+
+
+class AnchorFileTooLarge(Exception):
+    """A live file over ANCHOR_MAX_FILE_BYTES: reported as budget-exhausted
+    without reading it."""
+
+
+def _run_anchor_worker(deadline: float, work) -> bool:
+    """Run `work()` in ONE daemon thread and wait for it at most until
+    `deadline` (a time.monotonic() value). True = it finished in time; False =
+    the caller stops waiting and the thread is left to wind down (the SQLite
+    progress handler aborts a running query once the deadline has passed)."""
+    thread = threading.Thread(target=work, name="anchor-worker", daemon=True)
+    thread.start()
+    thread.join(max(0.0, deadline - time.monotonic()))
+    return not thread.is_alive()
 
 
 class AnchorChecker:
@@ -4356,7 +4375,12 @@ class AnchorChecker:
                 wait = 0.2
                 if self.deadline is not None:
                     wait = max(0.001, min(wait, self.deadline - time.monotonic()))
-                self._conn = open_db_readonly(self.code_db, timeout=wait)
+                self._conn = open_db_readonly(self.code_db, timeout=wait, check_same_thread=False)
+                if self._conn is not None and self.deadline is not None:
+                    # a running query is interrupted once the budget is spent
+                    # (sqlite raises OperationalError "interrupted")
+                    self._conn.set_progress_handler(
+                        lambda: 1 if self._deadline_passed() else 0, 1000)
         return self._conn
 
     def close(self) -> None:
@@ -4368,6 +4392,23 @@ class AnchorChecker:
             self._conn = None
 
     def check(self, row: dict) -> tuple:
+        """`_check` with the clock consulted on EVERY exception exit: past the
+        deadline an error (an interrupted query, an oversize file) is the
+        exhausted verdict, never another reason."""
+        exhausted = ("missing", "check budget exhausted")
+        try:
+            verdict = self._check(row)
+        except AnchorFileTooLarge:
+            return exhausted
+        except Exception:
+            if self._deadline_passed():
+                return exhausted
+            raise
+        if verdict[1] == "snapshot unavailable" and self._deadline_passed():
+            return exhausted
+        return verdict
+
+    def _check(self, row: dict) -> tuple:
         """`("ok" | "changed" | "missing", reason)` for one anchor row. The
         deadline is asked before AND after every expensive step (file read,
         hash, code-index open, each SQL query); a verdict is returned only when
@@ -4411,6 +4452,8 @@ class AnchorChecker:
                 f"WHERE project=? AND path=? AND code_root IN ({marks})",
                 (self.project, ref_path, *roots)).fetchall()
         except sqlite3.Error:
+            if self._deadline_passed():
+                return exhausted
             return "missing", "snapshot unavailable"
         if self._deadline_passed():
             return exhausted
@@ -4482,11 +4525,14 @@ def anchor_header_line(statuses: list) -> str | None:
     return None
 
 
-def _live_bytes_from_roots(code_roots: list):
-    """`live_bytes(ref_path)` over a list of code roots (first hit wins)."""
+def _live_bytes_from_roots(code_roots: list, max_bytes=None):
+    """`live_bytes(ref_path)` over a list of code roots (first hit wins). With
+    `max_bytes`, a larger file raises AnchorFileTooLarge before any read."""
     def live(ref_path):
         for root in code_roots:
             try:
+                if max_bytes is not None and (Path(root) / ref_path).stat().st_size > max_bytes:
+                    raise AnchorFileTooLarge(ref_path)
                 return (Path(root) / ref_path).read_bytes()
             except OSError:
                 continue
@@ -4497,7 +4543,10 @@ def _live_bytes_from_roots(code_roots: list):
 def anchor_checker_for_roots(project: str, code_roots: list, code_db=None, deadline=None) -> AnchorChecker:
     """The standing / context-pack checker: live bytes from `code_roots`."""
     return AnchorChecker(
-        project, _live_bytes_from_roots(code_roots), code_db=code_db, deadline=deadline,
+        project,
+        # no deadline = the pack route: unbounded by design (reproducible bytes), so no size cap either
+        _live_bytes_from_roots(code_roots, ANCHOR_MAX_FILE_BYTES if deadline is not None else None),
+        code_db=code_db, deadline=deadline,
         is_dir=lambda p: any((Path(r) / p).is_dir() for r in code_roots),
     )
 
@@ -4515,32 +4564,47 @@ def for_path_anchor_notes(matches, candidate: str, live_file: str, project: str,
             return None
         if not cache:
             try:
+                if Path(live_file).stat().st_size > ANCHOR_MAX_FILE_BYTES:
+                    raise AnchorFileTooLarge(live_file)
                 cache.append(Path(live_file).read_bytes())
             except OSError:
                 cache.append(None)
         return cache[0]
 
     checker = AnchorChecker(project, live, code_db=code_db, deadline=deadline)
+    exhausted_line = anchor_header_line([
+        {"ref": candidate, "kind": "missing", "detail": "check budget exhausted", "row": None}])
+    done: dict = {}   # topic id -> line or None; a topic is entered only when COMPLETE
+    failure: list = []
+
+    def work():
+        try:
+            for row in matches:
+                if checker._deadline_passed():
+                    # the topic is not even parsed: name the file that could not be checked
+                    done[row["id"]] = exhausted_line
+                    continue
+                fm = parse_record(Path(row["path"])).frontmatter
+                if checker._deadline_passed():
+                    # the parse itself crossed the budget: no verdict from it is accepted
+                    done[row["id"]] = exhausted_line
+                    continue
+                refs = [str(r) for r in fm.get("code_refs") or [] if code_ref_matches(candidate, str(r))]
+                done[row["id"]] = anchor_header_line(
+                    anchor_statuses(fm, refs, checker, exact_path=candidate))
+        except Exception as exc:  # re-raised below so the caller fails open as before
+            failure.append(exc)
+        finally:
+            checker.close()
+
+    finished = _run_anchor_worker(deadline, work)
+    if failure and finished:
+        raise failure[0]
     notes = {}
-    try:
-        for row in matches:
-            if checker._deadline_passed():
-                # the topic is not even parsed: name the file that could not be checked
-                notes[row["id"]] = anchor_header_line([
-                    {"ref": candidate, "kind": "missing", "detail": "check budget exhausted", "row": None}])
-                continue
-            fm = parse_record(Path(row["path"])).frontmatter
-            if checker._deadline_passed():
-                # the parse itself crossed the budget: no verdict from it is accepted
-                notes[row["id"]] = anchor_header_line([
-                    {"ref": candidate, "kind": "missing", "detail": "check budget exhausted", "row": None}])
-                continue
-            refs = [str(r) for r in fm.get("code_refs") or [] if code_ref_matches(candidate, str(r))]
-            line = anchor_header_line(anchor_statuses(fm, refs, checker, exact_path=candidate))
-            if line:
-                notes[row["id"]] = line
-    finally:
-        checker.close()
+    for row in matches:
+        line = done[row["id"]] if row["id"] in done else exhausted_line
+        if line:
+            notes[row["id"]] = line
     return notes
 
 
@@ -4559,30 +4623,49 @@ def standing_anchor_summary(conn, project: str, topic_ids: list, code_roots: lis
     if not code_roots:
         return {"skipped": "no-root"}
     counts = {"changed": 0, "missing": 0, "never": 0, "not_checked": 0}
-    checker = anchor_checker_for_roots(
-        project, code_roots, code_db=code_db, deadline=time.monotonic() + ANCHOR_BUDGET_SECONDS)
-    try:
-        for tid in topic_ids:
-            if checker._deadline_passed():
-                counts["unchecked"] = counts.get("unchecked", 0) + 1
-                continue
-            row = conn.execute(
-                "SELECT path FROM records WHERE project=? AND type='topic' AND id=?",
-                (project, tid)).fetchone()
-            if checker._deadline_passed():
-                # the SQL lookup crossed the budget: the topic is not read
-                counts["unchecked"] = counts.get("unchecked", 0) + 1
-                continue
-            if row is None:
-                continue
-            fm = parse_record(Path(row["path"])).frontmatter
-            if checker._deadline_passed():
-                counts["unchecked"] = counts.get("unchecked", 0) + 1
-                continue
-            for status in topic_anchor_statuses(fm, checker):
-                counts[status["kind"]] += 1
-    finally:
-        checker.close()
+    deadline = time.monotonic() + ANCHOR_BUDGET_SECONDS
+    checker = anchor_checker_for_roots(project, code_roots, code_db=code_db, deadline=deadline)
+    # The decision-index lookups stay on this thread (the connection is not
+    # shareable); the file reads, parses and code-index queries run in ONE
+    # daemon worker joined for what is left of the budget.
+    paths = {}
+    for tid in topic_ids:
+        row = conn.execute(
+            "SELECT path FROM records WHERE project=? AND type='topic' AND id=?",
+            (project, tid)).fetchone()
+        paths[tid] = None if row is None else row["path"]
+    done: dict = {}   # topic id -> list of status kinds, or None = unchecked; entered only when COMPLETE
+    failure: list = []
+
+    def work():
+        try:
+            for tid in topic_ids:
+                if checker._deadline_passed():
+                    done[tid] = None
+                    continue
+                if paths[tid] is None:
+                    done[tid] = []
+                    continue
+                fm = parse_record(Path(paths[tid])).frontmatter
+                if checker._deadline_passed():
+                    done[tid] = None
+                    continue
+                done[tid] = [st["kind"] for st in topic_anchor_statuses(fm, checker)]
+        except Exception as exc:  # re-raised below so the caller fails open as before
+            failure.append(exc)
+        finally:
+            checker.close()
+
+    finished = _run_anchor_worker(deadline, work)
+    if failure and finished:
+        raise failure[0]
+    for tid in topic_ids:
+        kinds = done.get(tid)
+        if kinds is None:
+            counts["unchecked"] = counts.get("unchecked", 0) + 1
+        else:
+            for kind in kinds:
+                counts[kind] += 1
     return counts
 
 

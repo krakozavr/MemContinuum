@@ -995,6 +995,52 @@ class TestPreEditChainAnchors(unittest.TestCase):
                                            db=str(self.db), full=True, no_embed=True))
         self.assertIn("Anchor never captured: src/foo.py.", self._run())
 
+    def test_a_slow_code_index_never_costs_the_ruling_chain(self):
+        # gate round 3: _db blocks for 1.5 s; the thread-bounded anchor work
+        # gives up at 0.3 s, so the 2 s watchdog never fires and the chain stays.
+        (self.store / "topics" / "a.md").write_text(
+            "---\ntype: topic\nid: TOP-9500\ntitle: Anchored\narea: testing\ncurrent: L1\n"
+            "tags: []\ncode_refs:\n  - src/foo.py#alpha\n"
+            "links:\n  - link: L1\n    date: '2026-01-01'\n    status: active\n    kind: adopted\n"
+            "    ruling: {text: bound ruling, authority: owner-ratified, source: s}\n"
+            "---\n\nBody.\n"
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = memidx.main(["bind", "TOP-9500", "src/foo.py#alpha", "--root", str(self.store),
+                              "--code-root", str(self.repo)])
+        self.assertEqual(rc, 0)
+        memidx.cmd_reindex(SimpleNamespace(root=str(self.store), project=self.project,
+                                           db=str(self.db), full=True, no_embed=True))
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = memidx.main(["code-reindex", "--code-root", str(self.repo), "--project", self.project,
+                              "--db", str(self.home / f"{self.project}-code.sqlite"),
+                              "--lang", "python", "--no-embed"])
+        self.assertEqual(rc, 0)
+        wrapper = memidx_wrapper_python(
+            self.tmp, "slowdb.sh",
+            "import time\n"
+            "_real = memidx.AnchorChecker._db\n"
+            "def _slow(self):\n"
+            "    time.sleep(1.5)\n"
+            "    return _real(self)\n"
+            "memidx.AnchorChecker._db = _slow")
+        payload = json.dumps({
+            "hook_event_name": "PreToolUse", "tool_name": "Edit", "cwd": "/elsewhere",
+            "tool_input": {"file_path": str(self.repo / "src" / "foo.py")},
+        })
+        env = clean_env(
+            MEMCONTINUUM_HOME=str(self.home), MEMCONTINUUM_PROJECT=self.project,
+            MEMCONTINUUM_PYTHON=str(wrapper), MEMCONTINUUM_STRIP_PREFIX=f"{self.repo}/",
+            MEMCONTINUUM_ROOT=str(self.store),
+        )
+        proc, elapsed = run_hook(payload, env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+        print(f"[round3 hook, slow _db 1.5s -> hook finished in {elapsed:.3f}s]")
+        self.assertIn("bound ruling", ctx)
+        self.assertIn("check budget exhausted", ctx)
+        self.assertNotIn("timed out", ctx)
+
 
     # -- matcher-derived layouts: the in-root worktree the settings filter admits --
 

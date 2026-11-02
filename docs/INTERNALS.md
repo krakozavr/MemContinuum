@@ -3632,15 +3632,30 @@ compared (a prefix or glob that matched is "not checked"). The line is
 inserted by `topic_chain_lines` right after the topic header, before the
 links, so the plain text and `--json --with-chain-text` stay identical. The
 anchor work is bounded by `ANCHOR_BUDGET_SECONDS` (300 ms, monotonic) for the
-whole call. The deadline is tested by one helper
-(`AnchorChecker._deadline_passed`) before AND after every file read, hash,
-code-index open, SQL query and topic-file parse of the anchor work, and a
-verdict is accepted only if the deadline had not passed after the step that
-produced it (a final hash that crosses the deadline is `check budget exhausted`,
-never `ok`); a blocked index open waits at most what is left of the budget. Once spent, the remaining checks say `check budget exhausted` (a
-topic not yet parsed is named by the edited file) and the ruling is delivered
-anyway. The standing route uses the same helper (after the SQL lookup and after each topic parse too) and counts the topics it could
-not reach as `unchecked` in `anchor_summary`. Without `--live-file`, `for-path` is unchanged.
+whole call, and the bound is a wall-clock one: the per-call work (for-path: every
+matched topic; standing: every standing topic's parse and checks) runs in ONE
+daemon worker thread (`_run_anchor_worker`) that the caller joins for what is
+left of the budget, then returns without waiting for it. A topic the worker has
+not completed by then gets the exhausted verdict (for-path: `Anchor missing:
+<ref> (check budget exhausted).`; standing: counted `unchecked`); partial
+per-topic results are never used, and a worker that finished in time gives the
+same output as before. The worker's read-only code-index connection is opened
+`check_same_thread=False` with a SQLite progress handler (every 1000 VM steps)
+that aborts a running query once the deadline has passed, and every exception
+exit of `AnchorChecker.check` asks the clock before choosing a reason (past the
+deadline: `check budget exhausted`, never `snapshot unavailable`). A live file
+over `ANCHOR_MAX_FILE_BYTES` (8 MiB) is reported `check budget exhausted`
+without being read. The between-step test (`AnchorChecker._deadline_passed`,
+asked before AND after every file read, hash, code-index open, SQL query and
+topic-file parse) stays as the cheap common-case path; the thread is the
+guarantee. A verdict is accepted only if the deadline had not passed after the
+step that produced it (a final hash that crosses the deadline is `check budget
+exhausted`, never `ok`); a blocked index open waits at most what is left of the
+budget. The standing route's decision-index path lookups stay on the calling
+thread (that connection is not shared). The context-pack route stays
+synchronous and unbounded by design (no deadline, no size cap), so the same
+files give the same pack bytes. Any exception in the anchor work is swallowed
+(fail open). Without `--live-file`, `for-path` is unchanged.
 Any exception in the anchor work is swallowed (fail open).
 
 *Standing (`standing --json`, `sessionstart-remind.sh`).* `standing --json`

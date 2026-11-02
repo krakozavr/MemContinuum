@@ -10,6 +10,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -1601,6 +1602,176 @@ class TestGateRound2Deadline(DeliveryCase):
         self.assertEqual(summary.get("unchecked"), 1)
         self.assertEqual(parsed, [])
         self.assertEqual(summary["never"], 0)
+
+
+class TestGateRound3WallClock(DeliveryCase):
+    """A thread bound, not just clock checks between steps: a step that blocks
+    (a slow query, a huge read) cannot hold the call past the budget."""
+
+    SLACK = 0.3
+
+    def _bound_standing(self):
+        self.add_topic("s", TestStandingAnchorSummary.standing_topic(None, refs=("src/foo.py#beta",)))
+        self.code_file("src/foo.py", PY_SRC)
+        self.bind("src/foo.py#beta", "TOP-9900")
+        self.reindex()
+        self.code_reindex()
+
+    def _bound(self, symbol=True):
+        self.add_topic("a", plain_topic("TOP-9001", ["src/other.py"], "Alpha"))
+        self.code_file("src/foo.py", PY_SRC)
+        self.bind("src/foo.py#beta" if symbol else "src/foo.py")
+        self.reindex()
+        self.code_reindex()
+
+    @staticmethod
+    def _slow_db(seconds):
+        real = memidx.AnchorChecker._db
+
+        def slow(self_inner):
+            time.sleep(seconds)
+            return real(self_inner)
+        return slow
+
+    def test_for_path_returns_within_budget_when_the_index_is_slow(self):
+        self._bound()
+        with mock.patch.object(memidx.AnchorChecker, "_db", self._slow_db(1.5)):
+            start = time.monotonic()
+            out = self.for_path("src/foo.py")
+            elapsed = time.monotonic() - start
+        print(f"[round3 for-path slow _db 1.5s -> returned in {elapsed:.3f}s]")
+        self.assertLess(elapsed, memidx.ANCHOR_BUDGET_SECONDS + self.SLACK + 0.5)
+        self.assertLess(elapsed, 1.4)
+        self.assertEqual(self.anchor_lines(out), ["Anchor missing: src/foo.py (check budget exhausted)."])
+        self.assertIn("a ruling", out)
+        self.assertTrue(out.splitlines()[0].startswith("TOP-9001 Alpha"))
+
+    def test_standing_counts_unchecked_when_the_index_is_slow(self):
+        self._bound_standing()
+        conn = memidx.open_db_noncreating(self.db, project="p")
+        try:
+            with mock.patch.object(memidx.AnchorChecker, "_db", self._slow_db(1.5)):
+                start = time.monotonic()
+                summary = memidx.standing_anchor_summary(
+                    conn, "p", ["TOP-9900"], [self.code], code_db=self.codedb)
+                elapsed = time.monotonic() - start
+        finally:
+            conn.close()
+        print(f"[round3 standing slow _db 1.5s -> returned in {elapsed:.3f}s]")
+        self.assertLess(elapsed, 1.4)
+        self.assertEqual(summary.get("unchecked"), 1)
+
+    def test_standing_digest_is_intact_when_the_index_is_slow(self):
+        self._bound_standing()
+        with mock.patch.object(memidx.AnchorChecker, "_db", self._slow_db(1.5)):
+            start = time.monotonic()
+            rc, out, err = run_memidx(["standing", "--project", "p", "--db", str(self.db), "--json",
+                                       "--root", str(self.store),
+                                       "--code-root", str(self.code), "--code-db", str(self.codedb)])
+            elapsed = time.monotonic() - start
+        self.assertEqual(rc, 0, err)
+        self.assertLess(elapsed, 1.4)
+        obj = json.loads(out)
+        self.assertEqual(obj["anchor_summary"].get("unchecked"), 1)
+        self.assertEqual(obj["links"], 1)
+        self.assertIn("stands", json.dumps(obj))
+
+    def test_a_running_query_is_interrupted_and_reads_as_exhausted(self):
+        row = {"ref": "src/foo.py#beta", "span": "symbol", "digest": "x" * 64}
+        self.code_file("src/foo.py", PY_SRC)
+        self.add_topic("a", plain_topic("TOP-9001", ["src/other.py"], "Alpha"))
+        self.bind("src/foo.py#beta")
+        self.reindex()
+        self.code_reindex()
+        checker = memidx.AnchorChecker("p", lambda _p: PY_SRC.encode(), code_db=self.codedb,
+                                       deadline=time.monotonic() + 0.2)
+        spin = ("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 500000000) "
+                "SELECT count(*) FROM c")
+        real_db = checker._db
+
+        def db():
+            conn = real_db()
+            real_exec = conn.execute
+
+            class Wrapped:
+                def execute(self_w, sql, *a, **k):
+                    return real_exec(spin)
+            return Wrapped()
+
+        start = time.monotonic()
+        with mock.patch.object(checker, "_db", db):
+            verdict = checker.check(row)
+        elapsed = time.monotonic() - start
+        checker.close()
+        print(f"[round3 spinning query, 0.2s deadline -> interrupted after {elapsed:.3f}s]")
+        self.assertEqual(verdict, ("missing", "check budget exhausted"))
+        self.assertLess(elapsed, 1.5)
+
+    def test_an_exception_after_the_deadline_is_exhausted(self):
+        row = {"ref": "src/foo.py#beta", "span": "symbol", "digest": "x" * 64}
+        now = {"t": 0.0}
+        checker = memidx.AnchorChecker("p", lambda _p: PY_SRC.encode(), deadline=50.0)
+
+        def db():
+            now["t"] = 100.0
+            raise RuntimeError("boom")
+
+        with mock.patch.object(memidx.time, "monotonic", lambda: now["t"]), \
+                mock.patch.object(checker, "_db", db):
+            self.assertEqual(checker.check(row), ("missing", "check budget exhausted"))
+        now["t"] = 0.0
+
+        def db_in_time():
+            raise RuntimeError("boom")
+
+        with mock.patch.object(memidx.time, "monotonic", lambda: now["t"]), \
+                mock.patch.object(checker, "_db", db_in_time):
+            with self.assertRaises(RuntimeError):
+                checker.check(row)
+
+    def test_a_sql_error_after_the_deadline_is_exhausted_not_snapshot_unavailable(self):
+        row = {"ref": "src/foo.py#beta", "span": "symbol", "digest": "x" * 64}
+        now = {"t": 0.0}
+        checker = memidx.AnchorChecker("p", lambda _p: PY_SRC.encode(), deadline=50.0)
+
+        class Conn:
+            def execute(self_c, *a, **k):
+                now["t"] = 49.0
+                import sqlite3
+                now["t"] = 100.0
+                raise sqlite3.OperationalError("interrupted")
+
+        # the clock is read before the verdict is chosen; the first checks run at t=0
+        with mock.patch.object(memidx.time, "monotonic", lambda: now["t"]), \
+                mock.patch.object(checker, "_db", lambda: Conn()):
+            self.assertEqual(checker.check(row), ("missing", "check budget exhausted"))
+
+    def test_a_file_over_8_mib_is_exhausted_without_a_read(self):
+        self.add_topic("a", plain_topic("TOP-9001", ["src/other.py"], "Alpha"))
+        live = self.code_file("src/foo.py", PY_SRC)
+        self.bind("src/foo.py")
+        self.reindex()
+        with open(live, "ab") as f:
+            f.truncate(memidx.ANCHOR_MAX_FILE_BYTES + 1)
+        reads = []
+        real_read = Path.read_bytes
+
+        def spy(path):
+            reads.append(str(path))
+            return real_read(path)
+
+        with mock.patch.object(Path, "read_bytes", spy):
+            out = self.for_path("src/foo.py")
+        self.assertEqual(self.anchor_lines(out), ["Anchor missing: src/foo.py (check budget exhausted)."])
+        self.assertNotIn(live, reads)
+        self.assertIn("a ruling", out)
+
+    def test_a_worker_finishing_in_time_changes_nothing(self):
+        self._bound()
+        (self.code / "src/foo.py").write_text(PY_SRC.replace("x = 2", "x = 3"))
+        self.code_reindex()
+        out = self.for_path("src/foo.py")
+        self.assertEqual(self.anchor_lines(out), ["Anchor changed since capture (bind): src/foo.py#beta"])
 
 
 class TestGateRound2Lookup(SessionCase):
