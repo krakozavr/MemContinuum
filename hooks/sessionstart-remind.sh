@@ -311,6 +311,12 @@ if "hash" in obj:
             _token = "never=%d" % _asum["never"]
         else:
             _token = "clean"
+        # Topics the budget never reached are not "clean": say so, keeping any
+        # positive counts (gate round 2: an exhausted standing check was logged clean).
+        if _asum.get("unchecked") and not (_asum.get("skipped") or _asum.get("dropped")):
+            _parts = ["%s=%d" % (k, _asum[k]) for k in ("changed", "missing", "never") if _asum.get(k)]
+            _parts.append("unchecked=%d" % _asum["unchecked"])
+            _token = ",".join(_parts)
     try:
         with open(sys.argv[3], "w") as f:
             f.write(str(obj.get("anchor_line") or ""))

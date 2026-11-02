@@ -3152,6 +3152,33 @@ Body.
         self.assertNotIn("Anchor ", ctx)
         self.assertIn("anchors=clean", log)
 
+    def _budgetless_python(self):
+        """A python wrapper that runs memidx.py with a spent anchor budget
+        (everything else passes through to the venv python unchanged)."""
+        runner = Path(self.td) / "budgetless_runner.py"
+        runner.write_text(
+            "import os, sys\n"
+            "script = sys.argv[1]\n"
+            "sys.path.insert(0, os.path.dirname(script))\n"
+            "import memidx\n"
+            "memidx.ANCHOR_BUDGET_SECONDS = -1.0\n"
+            "sys.exit(memidx.main(sys.argv[2:]))\n")
+        wrapper = Path(self.td) / "budgetless-python.sh"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            'case "$1" in\n'
+            f'  */memidx.py) exec "{VENV_PYTHON}" "{runner}" "$@" ;;\n'
+            f'  *) exec "{VENV_PYTHON}" "$@" ;;\n'
+            "esac\n")
+        wrapper.chmod(0o755)
+        return str(wrapper)
+
+    def test_exhausted_standing_check_is_not_logged_clean(self):
+        self._install(bind=True)
+        ctx, log = self._start("s-anchor-unchecked", MEMCONTINUUM_PYTHON=self._budgetless_python())
+        self.assertIn("anchors=unchecked=1", log)
+        self.assertNotIn("anchors=clean", log)
+
     def test_never_captured_is_the_fallback_line(self):
         self._install(bind=False)
         ctx, _log = self._start("s-anchor-never")
