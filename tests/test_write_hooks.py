@@ -9114,6 +9114,23 @@ class TestNewFileNudgeHook(unittest.TestCase):
         for noise in ("worktrees", "wt-x", "code", "home", "memcontinuum", "tmp", "newfile"):
             self.assertNotIn(noise, fb_q.split("+"))
 
+    def test_fallback_query_with_a_code_root_behind_a_symlinked_tempdir(self):
+        """macOS shape on any OS: the code root, its worktree and the hook
+        cwd are spelled through `<td>/link -> <td>/real` (like /var ->
+        /private/var). The remap must return the CONFIGURED spelling so the
+        query is the file's own words, not the whole machine path."""
+        os.makedirs(Path(self.td) / "real" / "code")
+        os.symlink("real", Path(self.td) / "link")
+        self.code_root = Path(self.td) / "link" / "code"
+        self._git_code_root_with_worktree()
+        outside = Path(self.td) / "link" / "launch-dir"
+        outside.mkdir()
+        target = self.code_root / ".worktrees" / "x" / "Sources" / "Foo" / "BarBaz.swift"
+        fb_q = self._fb_q(target, outside)
+        self.assertEqual(fb_q, "foo+bar+baz")
+        for noise in ("real", "link", "private", "tmp"):
+            self.assertNotIn(noise, fb_q.split("+"))
+
     def test_fallback_query_strips_the_code_root_for_a_plain_file_with_cwd_outside(self):
         """Same cwd-outside layout, no worktree: the code root is the
         configured root (the nudge's settings entry carries no STRIP_PREFIX),

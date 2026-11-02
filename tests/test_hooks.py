@@ -936,9 +936,20 @@ class TestPreEditChainWorktreeGap(unittest.TestCase):
     repo_b is a second, real git repo that is never wired at all -- its own
     worktree must never be remapped onto repo_a's records."""
 
+    # True in the symlinked subclass below: the whole fixture (repos, worktrees,
+    # configured roots, STRIP_PREFIX, hook CWD) is then spelled through
+    # `<tmp>/link -> <tmp>/real`, reproducing macOS's /var -> /private/var
+    # tempdir on a Linux runner.
+    SYMLINKED_TMP = False
+
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-hook-worktree-test-")
-        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        outer = tempfile.mkdtemp(prefix="memcontinuum-hook-worktree-test-")
+        self.addCleanup(shutil.rmtree, outer, ignore_errors=True)
+        self.tmp = outer
+        if self.SYMLINKED_TMP:
+            os.makedirs(os.path.join(outer, "real"))
+            os.symlink("real", os.path.join(outer, "link"))
+            self.tmp = os.path.join(outer, "link")
 
         self.memtool_home = str(Path(self.tmp) / "memcontinuum-home")
         os.makedirs(self.memtool_home, exist_ok=True)
@@ -1302,6 +1313,104 @@ class TestPreEditChainWorktreeGap(unittest.TestCase):
         self.assertEqual(q_match.group(1), "scan+unbound")
         self.assertNotIn("worktrees", q_match.group(1))
         self.assertNotIn("wt-in-root", q_match.group(1))
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestPreEditChainWorktreeGapSymlinkedTmp(TestPreEditChainWorktreeGap):
+    """Same class, every test re-run with the fixture under a symlinked temp
+    dir (macOS: /var -> /private/var). The remap must hand callers a path in
+    the CONFIGURED root's spelling; a realpath spelling matches no
+    STRIP_PREFIX / cwd / root and the fallback query degrades to the whole
+    machine path."""
+
+    SYMLINKED_TMP = True
+
+    def test_fixture_really_is_behind_a_symlink(self):
+        self.assertNotEqual(os.path.realpath(self.tmp), self.tmp)
+
+    def test_in_root_worktree_miss_query_has_no_machine_path_tokens(self):
+        in_root_wt = self.repo_a / ".worktrees" / "feat"
+        subprocess.run(
+            ["git", "worktree", "add", "-q", "-b", "wt-in-root", str(in_root_wt)],
+            cwd=self.repo_a, check=True,
+        )
+        miss_path = in_root_wt / "src" / "core" / "scan" / "scan_unbound.py"
+        miss_path.parent.mkdir(parents=True, exist_ok=True)
+        miss_path.write_text("# unbound\n")
+        proc, _ = run_hook(
+            self._payload(str(miss_path), cwd=str(self.repo_a)),
+            self._env(MEMCONTINUUM_FALLBACK_MODE="fts"),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        q_match = re.search(r"\bq=(\S*)", self._last_outcome_line(log_text))
+        self.assertIsNotNone(q_match, log_text)
+        self.assertEqual(q_match.group(1), "scan+unbound")
+        for token in ("real", "link", "private", "tmp"):
+            self.assertNotIn(token, q_match.group(1).split("+"))
+
+
+class TestRemapWorktreePathSpelling(unittest.TestCase):
+    """Direct bash unit tests of mc_remap_worktree_path's output spelling."""
+
+    def setUp(self):
+        outer = tempfile.mkdtemp(prefix="memcontinuum-remap-spelling-")
+        self.addCleanup(shutil.rmtree, outer, ignore_errors=True)
+        os.makedirs(os.path.join(outer, "real"))
+        os.symlink("real", os.path.join(outer, "link"))
+        self.link = os.path.join(outer, "link")
+        self.real = os.path.join(outer, "real")
+        self.env = clean_env()
+
+    def _git(self, *args, cwd):
+        subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, env=dict(
+            self.env, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+            GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t"))
+
+    def _repo(self, path, wt):
+        os.makedirs(os.path.join(path, "src"))
+        Path(path, "src", "a.py").write_text("# a\n")
+        self._git("init", "-q", cwd=path)
+        self._git("add", "-A", cwd=path)
+        self._git("commit", "-q", "-m", "init", cwd=path)
+        self._git("worktree", "add", "-q", "-b", "wt", wt, cwd=path)
+
+    def _remap(self, file_path, roots):
+        lib = Path(__file__).resolve().parent.parent / "hooks" / "mc-path-lib.sh"
+        proc = subprocess.run(
+            [MC_BASH, "-c",
+             'source "$1"; mc_remap_worktree_path "$2" "$3"; echo "rc=$?" >&2',
+             "bash", str(lib), file_path, roots],
+            capture_output=True, text=True, env=self.env,
+        )
+        rc = int(re.search(r"rc=(\d+)", proc.stderr).group(1))
+        return rc, proc.stdout.strip()
+
+    def test_output_keeps_the_configured_root_spelling(self):
+        repo, wt = os.path.join(self.link, "repo"), os.path.join(self.link, "repo-wt")
+        self._repo(repo, wt)
+        rc, out = self._remap(os.path.join(wt, "src", "a.py"), repo)
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, os.path.join(repo, "src", "a.py"))
+        self.assertTrue(out.startswith(self.link + "/"), out)
+
+    def test_narrow_root_maps_to_checkout_toplevel_in_configured_spelling(self):
+        repo, wt = os.path.join(self.link, "repo"), os.path.join(self.link, "repo-wt")
+        self._repo(repo, wt)
+        rc, out = self._remap(os.path.join(wt, "src", "a.py"), os.path.join(repo, "src"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, os.path.join(repo, "src", "a.py"))
+
+    def test_in_repo_symlink_in_root_tail_falls_back_to_realpath_spelling(self):
+        # The configured root reaches the repo through a symlink INSIDE the
+        # checkout, so its tail differs from the real tail and the subtraction
+        # does not hold: the realpath spelling is returned, rc 0.
+        repo, wt = os.path.join(self.real, "repo"), os.path.join(self.real, "repo-wt")
+        self._repo(repo, wt)
+        os.symlink("src", os.path.join(repo, "srclink"))
+        rc, out = self._remap(os.path.join(wt, "src", "a.py"), os.path.join(repo, "srclink"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, os.path.join(os.path.realpath(repo), "src", "a.py"))
 
 
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)

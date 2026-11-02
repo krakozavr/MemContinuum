@@ -278,7 +278,13 @@ mc_nested_worktree_gitfile() {
 #      "<toplevel of ROOT's own checkout>/$relative" and return 0 (for a
 #      ROOT that is its own toplevel, "$ROOT/$relative"; a ROOT narrower
 #      than its checkout maps to the checkout, so the caller's root test
-#      then decides whether the real file is in scope). No ROOT matches at all: this worktree's main repo was
+#      then decides whether the real file is in scope). The toplevel is
+#      spelled the way the CONFIGURED ROOT is spelled (symlinked ancestors
+#      kept, e.g. macOS /var/... rather than /private/var/...), because
+#      callers strip configured-root text from this path; realpaths are
+#      used for the identity comparison only. When the root's configured
+#      tail differs from its real tail (a symlink inside the repo) the
+#      realpath spelling is printed instead. No ROOT matches at all: this worktree's main repo was
 #      never wired as a code root here -- return 1 (worktree-unwired) --
 #      the correctness condition the caller must not skip (docs/internal
 #      handoff item 1): remapping onto an UNWIRED repo's records would be
@@ -303,6 +309,7 @@ mc_remap_worktree_path() {
     local ancestor_real tail physical_file_path relative
     local root root_slash root_common_raw root_common_real remapped
     local root_top_raw root_top_real matched_unresolved=0
+    local root_real suffix top_spelled
 
     case "$file_path" in
         /*) ;;
@@ -412,7 +419,33 @@ EOF
                 matched_unresolved=1
                 continue
             fi
-            remapped="${root_top_real}/${relative}"
+            # Print the toplevel in the CONFIGURED root's spelling, not
+            # `pwd -P`'s: callers strip MEMCONTINUUM_STRIP_PREFIX / cwd /
+            # root text from this path, and those carry the configured
+            # spelling (macOS: /var/... configured, /private/var/... real).
+            # Realpaths above stay for identity comparison only. Same
+            # literal `${var#"$prefix"}` removal as mc_path_under_root.
+            root_real="$(cd "$root_slash" 2>/dev/null && pwd -P)"
+            top_spelled=""
+            suffix="${root_real#"$root_top_real"}"
+            if [ -n "$root_real" ] && [ "$suffix" != "$root_real" ] \
+                && { [ -z "$suffix" ] || [ "${suffix#/}" != "$suffix" ]; }; then
+                if [ -z "$suffix" ]; then
+                    top_spelled="$root_slash"
+                else
+                    top_spelled="${root_slash%"$suffix"}"
+                    [ "$top_spelled" != "$root_slash" ] || top_spelled=""
+                fi
+                # Never guess: the candidate must resolve to the real toplevel.
+                if [ -n "$top_spelled" ] \
+                    && [ "$(cd "$top_spelled" 2>/dev/null && pwd -P)" != "$root_top_real" ]; then
+                    top_spelled=""
+                fi
+            fi
+            # A configured tail that differs from the real tail (a symlink
+            # inside the repo) cannot be subtracted: realpath spelling.
+            [ -n "$top_spelled" ] || top_spelled="$root_top_real"
+            remapped="${top_spelled}/${relative}"
             printf '%s\n' "$remapped"
             return 0
         fi
