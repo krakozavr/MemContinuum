@@ -3503,6 +3503,55 @@ not this hook.
 Loaded is not applied — this raises the odds a standing ruling is honored, it
 is not a guarantee.
 
+## Context packs
+
+Hooks never fire on a read-only review, and a reviewer's snapshot is a clone
+of the code repo, not of the store, so an external reviewer or a dispatched
+agent sees only its brief. `memidx.py context-pack FILE... [--topic ID]
+[--query WORDS] [--max-bytes N] [--blind] [--json]` builds the block that
+carries the records there, verbatim.
+
+**Contents, in order.** A fixed header paragraph naming the store path and
+how to read each authority: `owner-verbatim` and `owner-ratified` rulings
+bind, `reviewer-finding` and `code-derived` records are reported facts,
+`agent-inference` records are inference to weigh. An `Index state:` line.
+The standing digest, byte-identical to what `standing` prints (it comes from
+the same `standing_entries` projection and `standing_digest_text`
+rendering). Then the topics bound to each FILE (the `for-path` resolution:
+`code_refs` matches, plus topics governing a concept that claims the file),
+each once with the files that bind it listed; then `--topic` topics; then at
+most two FTS neighbours for `--query`, labelled a guess (same filter and
+ranking as `search --mode fts --decisions-only`). Chains are rendered with
+`topic_chain_lines_capped` at 2000 bytes per topic, the current link in full.
+
+**Cap and ordering.** `--max-bytes` (default 12000) bounds the pack text, the
+bytes above the final line. Bound and named topics are ranked by authority
+(`owner-verbatim`, `owner-ratified`, then the rest), then by how many of the
+brief's files they bind, then id; search neighbours rank last. The tail is
+dropped in whole topics, never mid-record, and the omission line names them.
+The header, state line and standing digest are never dropped: a cap smaller
+than those still emits them and omits every topic.
+
+**Hash and determinism.** The last line is `pack sha256=<hex> bytes=<N>`,
+computed over the exact UTF-8 bytes of the text above it. The same store
+state and arguments give the same bytes: no timestamps, a fixed per-topic
+budget independent of environment variables, and no dependence on file order
+beyond the order the files are given. `--json` returns `sha256`, `bytes`,
+`blind`, `text` (without the hash line), `topics` (`id` and `via`: the files,
+`standing`, `named` or `search`), `omitted` and `state`.
+
+**Index state.** Reads go through the read-only opener, so nothing is
+written. Unlike `standing`, which refuses on anything but `current`, a pack
+is still emitted on `stale`, `quarantined` and `upgrade-required` (naming the
+state), because a reviewer sent in blind by an out-of-date index is worse
+than one given records with a caveat; a schema the read-only open cannot
+read, `missing` and `uninitialized` exit 1 with a one-line reason. Pass
+`--root STORE` to let `stale` be detected.
+
+**Blind mode.** `--blind` opens no index and prints only a fixed notice that
+no decision records were supplied, plus its hash line, so a blind review is
+recorded as such and carries nothing memory-shaped.
+
 ## CLI semantics
 
 `--help` on each subcommand is the flag reference. The semantics worth writing

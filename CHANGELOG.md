@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Retrieval
+- New `memidx.py context-pack FILE... [--topic ID] [--query WORDS] [--blind]`
+  prints one paste-ready block of decision records for a brief to an external
+  reviewer or a dispatched agent: the standing digest, then the chains of
+  every topic bound to the named files, each with its authority and store
+  path, under a size cap that drops whole topics and names them. It ends in
+  a `pack sha256=... bytes=...` line over the text above it, so a gate
+  record can cite exactly what was sent; `--blind` prints only a fixed
+  notice and opens no index. Read-only; no hook or search behaviour changes.
+
 ### Hooks
 - Decision retrieval now follows the repository, not the code-index roots.
   `repo-init.sh` renders the pre-edit filter and `MEMCONTINUUM_STRIP_PREFIX`
