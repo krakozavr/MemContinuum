@@ -1405,7 +1405,7 @@ def _classify_index_state(
     return "current"
 
 
-def open_db_readonly(db_path: Path) -> sqlite3.Connection | None:
+def open_db_readonly(db_path: Path, timeout: float = 5.0) -> sqlite3.Connection | None:
     """SQLite URI mode=ro: opens an EXISTING file strictly read-only --
     unlike open_db_noncreating's mode=rw, this NEVER runs
     `_run_decision_migration_guards` (which can ALTER a table, CREATE
@@ -1418,7 +1418,7 @@ def open_db_readonly(db_path: Path) -> sqlite3.Connection | None:
     OperationalError opening it, e.g. a locked/corrupt file) -- same
     degrade-to-named-refusal shape as open_db_noncreating."""
     try:
-        conn = sqlite3.connect(f"file:{quote(db_path.as_posix())}?mode=ro", uri=True)
+        conn = sqlite3.connect(f"file:{quote(db_path.as_posix())}?mode=ro", uri=True, timeout=timeout)
     except sqlite3.OperationalError:
         return None
     conn.row_factory = sqlite3.Row
@@ -4351,13 +4351,8 @@ class AnchorChecker:
     def _db(self):
         if not self._tried:
             self._tried = True
-            try:
-                if self.code_db is not None and self.code_db.exists():
-                    self._conn = sqlite3.connect(
-                        f"file:{quote(str(self.code_db))}?mode=ro", uri=True, timeout=0.2)
-                    self._conn.row_factory = sqlite3.Row
-            except sqlite3.Error:
-                self._conn = None
+            if self.code_db is not None and self.code_db.exists():
+                self._conn = open_db_readonly(self.code_db, timeout=0.2)
         return self._conn
 
     def close(self) -> None:
