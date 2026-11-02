@@ -1204,6 +1204,20 @@ class TestContextPackAnchors(DeliveryCase):
         tight = self.pack("src/x.py", "src/y.py", cap=base_bytes)
         self.assertNotIn("Anchor ", tight)
 
+    def test_cut_order_never_keeps_a_lower_priority_line_the_higher_one_could_not_fit(self):
+        """Sol's probe: the changed line is the long one; a cap with room for the short
+        never-captured line only must not admit it -- never captured is cut BEFORE
+        changed, so nothing is annotated."""
+        self.two_topics()
+        base = self.pack("src/x.py", "src/y.py", roots=False)
+        base_bytes = len(base.rsplit("pack sha256=", 1)[0].encode())
+        never_cost = len("Anchor never captured: src/y.py.\n".encode())
+        changed_cost = len("Anchor changed since capture (bind): src/x.py\n".encode())
+        self.assertLess(never_cost, changed_cost)
+        out = self.pack("src/x.py", "src/y.py", cap=base_bytes + never_cost)
+        self.assertNotIn("Anchor ", out)
+        self.assertIn("TOP-9702 Never one", out)
+
     def test_pack_is_read_only_and_chunker_free(self):
         self.add_topic("a", plain_topic("TOP-9703", ["src/foo.py"], "Sym"))
         self.code_file("src/foo.py", PY_SRC)

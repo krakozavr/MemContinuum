@@ -6790,12 +6790,11 @@ def _pack_add_anchor_lines(conn, project: str, sel: list, render, size, max_byte
                            anchor_roots: list, code_db) -> list:
     """Add one anchor line above each selected topic's chain (after its
     `[record file: ...]` line), but only as the cap allows and never at a
-    topic's expense: topics were already chosen without them, and a line is
-    added only while the pack still fits. Lines go in the opposite order of
-    the cut: changed first, then missing, never captured, and last "not
-    checked" -- so under a tight cap "not checked" is cut first, "changed"
-    last. The line is never a ruling, status or authority line; its bytes are
-    inside the pack hash. No deadline: a pack must be reproducible byte for
+    topic's expense: topics were already chosen without them. Every topic is
+    annotated, then annotations are removed in the cut order -- not checked,
+    never captured, missing, changed -- until the pack fits, so under a tight
+    cap "not checked" goes first and "changed" last. The line is never a
+    ruling, status or authority line; its bytes are inside the pack hash. No deadline: a pack must be reproducible byte for
     byte, so the same files give the same pack. Read-only and chunker-free."""
     checker = anchor_checker_for_roots(project, anchor_roots, code_db=code_db)
     notes: dict = {}
@@ -6812,17 +6811,22 @@ def _pack_add_anchor_lines(conn, project: str, sel: list, render, size, max_byte
                 notes[id(c)] = (kind, line)
     finally:
         checker.close()
-    sel = list(sel)
-    for kind in ANCHOR_STATUS_PRIORITY:
-        for i, (c, lines) in enumerate(sel):
-            note = notes.get(id(c))
-            if note is None or note[0] != kind:
-                continue
-            trial = list(sel)
-            trial[i] = (c, [lines[0], note[1]] + lines[1:])
-            if size(render(trial)) <= max_bytes:
-                sel = trial
-    return sel
+    # Literal cut order: annotate EVERY selected topic, then remove annotations
+    # kind by kind -- not checked, never captured, missing, changed -- until the
+    # pack fits. Chains stay exactly as selected; a long `changed` line is never
+    # dropped in favour of a shorter, lower-priority one.
+    annotated = [
+        (c, [lines[0], notes[id(c)][1]] + lines[1:]) if id(c) in notes else (c, lines)
+        for c, lines in sel
+    ]
+    for cut in reversed(ANCHOR_STATUS_PRIORITY):
+        if size(render(annotated)) <= max_bytes:
+            break
+        annotated = [
+            (c, lines[:1] + lines[2:]) if id(c) in notes and notes[id(c)][0] == cut else (c, lines)
+            for c, lines in annotated
+        ]
+    return annotated
 
 
 def _pack_refusal(args, rc: int, message: str, **extra) -> int:
