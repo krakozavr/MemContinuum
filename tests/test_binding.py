@@ -846,6 +846,60 @@ class TestForPathAnchorDelivery(DeliveryCase):
         self.assertIn("a ruling", out)
 
 
+class TestAnchorBudgetBoundsTheWork(DeliveryCase):
+    """The deadline is checked before every read, hash, query and parse, so a
+    clock that crosses it AFTER work began still ends in the exhausted header."""
+
+    def test_clock_crosses_after_the_first_file_read(self):
+        self.add_topic("a", plain_topic("TOP-9001", ["src/other.py"], "Alpha"))
+        live = self.code_file("src/foo.py", PY_SRC)
+        self.bind("src/foo.py")
+        self.reindex()
+        now = {"t": 0.0}
+        real_read = Path.read_bytes
+
+        def read_bytes(path):
+            data = real_read(path)
+            if str(path) == live:
+                now["t"] = 100.0       # the read itself blew the 300 ms budget
+            return data
+
+        with mock.patch.object(memidx.time, "monotonic", lambda: now["t"]), \
+                mock.patch.object(Path, "read_bytes", read_bytes):
+            out = self.for_path("src/foo.py")
+        self.assertEqual(self.anchor_lines(out), ["Anchor missing: src/foo.py (check budget exhausted)."])
+        self.assertIn("a ruling", out)
+        self.assertTrue(out.splitlines()[0].startswith("TOP-9001 Alpha"))
+
+    def test_clock_crosses_between_opening_the_code_index_and_querying_it(self):
+        row = {"ref": "src/foo.py#beta", "span": "symbol", "digest": "x" * 64}
+        now = {"t": 0.0}
+        checker = memidx.AnchorChecker("p", lambda _p: PY_SRC.encode(), code_db=self.codedb,
+                                       deadline=50.0)
+        conn = object()
+
+        def db():
+            now["t"] = 100.0
+            return conn
+
+        with mock.patch.object(memidx.time, "monotonic", lambda: now["t"]), \
+                mock.patch.object(checker, "_db", db):
+            self.assertEqual(checker.check(row), ("missing", "check budget exhausted"))
+
+    def test_standing_counts_topics_left_unchecked(self):
+        self.add_topic("a", plain_topic("TOP-9001", ["src/foo.py"], "Alpha"))
+        self.code_file("src/foo.py", PY_SRC)
+        self.reindex()
+        conn = memidx.open_db_noncreating(self.db, project="p")
+        try:
+            with mock.patch.object(memidx, "ANCHOR_BUDGET_SECONDS", -1.0):
+                summary = memidx.standing_anchor_summary(conn, "p", ["TOP-9001"], [self.code])
+        finally:
+            conn.close()
+        self.assertEqual(summary.get("unchecked"), 1)
+        self.assertEqual(summary["never"], 0)
+
+
 class TestForPathSymbolAnchors(DeliveryCase):
     def start(self):
         self.add_topic("a", plain_topic("TOP-9001", ["src/other.py"], "Alpha"))
