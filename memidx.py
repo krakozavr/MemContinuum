@@ -11584,16 +11584,28 @@ def _topic_file_for_id(root: Path, topic_id: str) -> Path | None:
     if not topics_dir.is_dir():
         return None
     pattern = re.compile(r"^id:\s*['\"]?" + re.escape(topic_id) + r"['\"]?\s*$", re.M)
+    undecodable = None
     for path in walk_markdown(topics_dir):
         try:
-            # lenient on purpose: an undecodable file must still be FOUND so
-            # the writer can refuse it by name instead of reporting "no topic"
-            head = path.read_text(encoding="utf-8", errors="replace")
+            raw = path.read_bytes()
         except OSError:
             continue
+        # lenient on purpose: an undecodable file must still be FOUND so the
+        # writer can refuse it by name instead of reporting "no topic" -- but
+        # only when no VALID file carries the id (a valid duplicate wins, in
+        # whatever order the walk meets them)
+        try:
+            head = raw.decode("utf-8")
+            valid = True
+        except UnicodeDecodeError:
+            head = raw.decode("utf-8", errors="replace")
+            valid = False
         if pattern.search(head.split("\n---", 1)[0]):
-            return path
-    return None
+            if valid:
+                return path
+            if undecodable is None:
+                undecodable = path
+    return undecodable
 
 
 def anchor_span_bytes(data: bytes, start_line: int, end_line: int) -> bytes:

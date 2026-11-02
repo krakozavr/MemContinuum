@@ -1601,3 +1601,26 @@ class TestGateRound2Deadline(DeliveryCase):
         self.assertEqual(summary.get("unchecked"), 1)
         self.assertEqual(parsed, [])
         self.assertEqual(summary["never"], 0)
+
+
+class TestGateRound2Lookup(SessionCase):
+    def test_valid_duplicate_wins_over_an_undecodable_one_in_either_order(self):
+        for bad, good in (("a", "b"), ("b", "a")):
+            with self.subTest(bad=bad):
+                for f in (self.store / "topics").glob("*.md"):
+                    f.unlink()
+                bad_raw = plain_topic("TOP-9001", []).encode() + b"\xff\xfe tail\n"
+                (self.store / "topics" / f"{bad}.md").write_bytes(bad_raw)
+                (self.store / "topics" / f"{good}.md").write_bytes(
+                    plain_topic("TOP-9001", ["src/other.py"]).encode())
+                self.assertEqual(memidx._topic_file_for_id(self.store, "TOP-9001"),
+                                 self.store / "topics" / f"{good}.md")
+                self.code_file("src/foo.py", PY_SRC)
+                rc, out, err = run_memidx(["bind", "TOP-9001", "src/foo.py", "--root", str(self.store),
+                                           "--code-root", str(self.code)])
+                self.assertEqual(rc, 0, err)
+                self.assertEqual((self.store / "topics" / f"{bad}.md").read_bytes(), bad_raw)
+
+    def test_only_an_undecodable_file_is_still_found_by_name(self):
+        (self.store / "topics" / "a.md").write_bytes(plain_topic("TOP-9001", []).encode() + b"\xff")
+        self.assertEqual(memidx._topic_file_for_id(self.store, "TOP-9001"), self.store / "topics" / "a.md")
