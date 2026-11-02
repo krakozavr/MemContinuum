@@ -3565,6 +3565,19 @@ not `ok` the section says `coverage: unknown` and nothing else. `--write-inbox`
 also writes `inbox/proposals/<date>-<session>.md` under the store (an inbox
 drop, never a canonical record).
 
+**`anchor-backfill`.** `memidx.py anchor-backfill --root STORE --project NAME
+[--sessions-dir DIR] [--code-root DIR ...] [--dry-run]` gives references bound
+before anchors existed a baseline. For every topic `code_refs` entry that is a
+file or `path#symbol` (never a prefix or glob), whose file appears in any
+ledger row of any session file under `sessions/<project>/` (no date cutoff;
+`.lock` siblings skipped, half-written live sessions skipped with a note), and
+that has no anchor row for `(ref, current link)`, it captures one now with
+`captured: backfill`. The digest is taken from the file as it is at that
+moment — never copied from the ledger, and never presented as the bytes at the
+original ruling. A second run finds every key present and changes nothing. It
+prints a per-topic summary and the exact diff; the orchestrator reviews and
+commits.
+
 ## Context packs
 
 Hooks never fire on a read-only review, and a reviewer's snapshot is a clone

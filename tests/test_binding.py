@@ -613,6 +613,88 @@ class TestProposeBindings(SessionCase):
         self.assertEqual(rc, 1)
 
 
+class TestAnchorBackfill(SessionCase):
+    def backfill(self, *extra):
+        return run_memidx(["anchor-backfill", "--root", str(self.store), "--project", "p",
+                           "--sessions-dir", str(self.sessions), "--code-root", str(self.code), *extra])
+
+    def topic_file(self):
+        return self.store / "topics" / "a.md"
+
+    def setup_topic(self):
+        self.add_topic("a", plain_topic(
+            "TOP-9001", ["src/foo.py", "src/sub/", "src/*.py", "src/untouched.py", "src/foo.py#beta"]))
+        self.code_file("src/foo.py", PY_SRC)
+        self.code_file("src/untouched.py", "u\n")
+        self.session("s1", [self.ledger_row("src/foo.py", "c" * 64)])
+
+    def rows(self):
+        fm = memidx.parse_record_text(self.topic_file().read_text(), "x").frontmatter
+        return fm.get("anchors") or []
+
+    def test_captures_labelled_backfill_from_the_file_not_the_ledger(self):
+        self.setup_topic()
+        rc, out, err = self.backfill()
+        self.assertEqual(rc, 0, err)
+        by_ref = {r["ref"]: r for r in self.rows()}
+        self.assertEqual(sorted(by_ref), ["src/foo.py", "src/foo.py#beta"])
+        file_row = by_ref["src/foo.py"]
+        self.assertEqual(file_row["captured"], "backfill")
+        self.assertEqual(file_row["digest"], sha(PY_SRC.encode()))
+        self.assertNotEqual(file_row["digest"], "c" * 64)
+        self.assertEqual(file_row["link"], "L1")
+        self.assertEqual(file_row["code_head"], "unavailable")
+        self.assertEqual(file_row["worktree"], "unknown")
+        self.assertEqual(by_ref["src/foo.py#beta"]["span"], "symbol")
+        errors, _ = memlint.lint_root(self.store)
+        self.assertEqual(errors, [], errors)
+
+    def test_prefix_glob_and_unledgered_refs_get_no_row(self):
+        self.setup_topic()
+        self.assertEqual(self.backfill()[0], 0)
+        refs = {r["ref"] for r in self.rows()}
+        self.assertNotIn("src/sub/", refs)
+        self.assertNotIn("src/*.py", refs)
+        self.assertNotIn("src/untouched.py", refs)
+
+    def test_idempotent_second_run_changes_nothing(self):
+        self.setup_topic()
+        self.assertEqual(self.backfill()[0], 0)
+        once = self.topic_file().read_bytes()
+        rc, out, err = self.backfill()
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.topic_file().read_bytes(), once)
+        self.assertIn("0 anchor(s) captured", out)
+
+    def test_dry_run_prints_the_diff_and_writes_nothing(self):
+        self.setup_topic()
+        before = self.topic_file().read_bytes()
+        rc, out, err = self.backfill("--dry-run")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.topic_file().read_bytes(), before)
+        self.assertIn("+    captured: backfill", out)
+        self.assertIn("would be captured", out)
+
+    def test_lock_siblings_and_half_written_sessions_are_tolerated(self):
+        self.setup_topic()
+        (self.sessions / "live.json").write_text('{"ledger": [')
+        (self.sessions / "live.json.lock").write_text("")
+        rc, out, err = self.backfill()
+        self.assertEqual(rc, 0, err)
+        self.assertIn("live.json", err)
+        self.assertNotIn("live.json.lock", err)
+        self.assertEqual(len(self.rows()), 2)
+
+    def test_every_session_file_counts(self):
+        self.add_topic("a", plain_topic("TOP-9001", ["src/a.py", "src/b.py"]))
+        self.code_file("src/a.py", "a\n")
+        self.code_file("src/b.py", "b\n")
+        self.session("s1", [self.ledger_row("src/a.py")])
+        self.session("s2", [self.ledger_row("src/b.py")])
+        self.assertEqual(self.backfill()[0], 0)
+        self.assertEqual(sorted(r["ref"] for r in self.rows()), ["src/a.py", "src/b.py"])
+
+
 class TestLinkRawSpansUnchanged(unittest.TestCase):
     def test_default_key_walks_links(self):
         text = topic_text([good_row()])

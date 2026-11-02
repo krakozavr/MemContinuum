@@ -11663,6 +11663,89 @@ def cmd_propose_bindings(args) -> int:
 
 
 # ---------------------------------------------------------------------------
+# anchors: backfill -- late baselines for references bound before anchors existed
+# ---------------------------------------------------------------------------
+
+
+def ledgered_code_paths(sessions_dir: Path) -> tuple:
+    """`(paths, roots, skipped)` over EVERY session file in `sessions_dir`
+    (no date cutoff -- the ledger decides scope): the set of normalised
+    absolute edited code paths, the set of code roots those rows name, and
+    the file names skipped because they were unreadable or half written (a
+    live session)."""
+    paths: set = set()
+    roots: set = set()
+    skipped: list = []
+    for session_file in iter_session_files(sessions_dir):
+        state = read_session_state(session_file)
+        if state is None:
+            skipped.append(session_file.name)
+            continue
+        for row in ledger_code_rows(state):
+            paths.add(row["path"])
+            roots.add(row["root"])
+    return paths, roots, skipped
+
+
+def cmd_anchor_backfill(args) -> int:
+    """`memidx.py anchor-backfill --root STORE --project NAME [--sessions-dir DIR]
+    [--code-root DIR ...] [--dry-run]` -- for every topic `code_refs` entry
+    (a file or `path#symbol`; prefixes and globs are never anchored) whose
+    file appears in any ledger row and that has no anchor row for
+    `(ref, current link)`, capture one NOW with `captured: backfill`. The
+    hash is of the file as it is at accept time -- never the ledger's digest,
+    and never presented as the bytes at the original ruling. Idempotent."""
+    root = Path(args.root).resolve()
+    paths, ledger_roots, skipped = ledgered_code_paths(sessions_dir_for(args.project, args.sessions_dir))
+    for name in skipped:
+        print(f"anchor-backfill: skipped unreadable session file {name} (half written?)", file=sys.stderr)
+    code_roots = _code_roots_arg(args.code_root) or _code_roots_arg(sorted(ledger_roots))
+    total = 0
+    for topic_path in walk_markdown(root / "topics"):
+        old_text = topic_path.read_text(encoding="utf-8", errors="replace")
+        result = parse_record_text(old_text, topic_path)
+        fm = result.frontmatter
+        if not result.valid or fm.get("type") != "topic":
+            continue
+        link_id = _topic_current_link(fm)
+        if link_id is None:
+            continue
+        have = {anchor_row_key(r) for r in anchor_rows(fm)}
+        new_text, added, notes = old_text, [], []
+        for ref in [str(r) for r in fm.get("code_refs") or []]:
+            if not code_ref_is_anchorable(ref) or (ref, link_id) in have:
+                continue
+            ref_path = code_ref_split(ref)[0]
+            if not any(os.path.normpath(str(Path(r) / ref_path)) in paths for r in code_roots):
+                continue
+            row, failure = capture_anchor_row(ref, link_id, code_roots, "backfill")
+            if row is None:
+                notes.append(f"  skipped {ref}: {failure[1]}")
+                continue
+            try:
+                new_text = insert_anchor_row(new_text, row)
+            except ValueError as exc:
+                notes.append(f"  skipped {ref}: {exc}")
+                continue
+            have.add((ref, link_id))
+            added.append(ref)
+        if added or notes:
+            print(f"{fm.get('id') or topic_path.stem}: {len(added)} anchor(s) captured as backfill"
+                  + (f" ({', '.join(added)})" if added else ""))
+            for note in notes:
+                print(note)
+        if added:
+            total += len(added)
+            if not parse_record_text(new_text, topic_path).valid:
+                print(f"anchor-backfill: the edit to {topic_path.name} would not parse; skipped",
+                      file=sys.stderr)
+                continue
+            apply_topic_edit(topic_path, old_text, new_text, args.dry_run, root)
+    print(f"anchor-backfill: {total} anchor(s) {'would be ' if args.dry_run else ''}captured")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -11879,6 +11962,18 @@ def main(argv=None) -> int:
     p_propose.add_argument("--write-inbox", action="store_true",
                            help="also write inbox/proposals/<date>-<session>.md under --root")
     p_propose.set_defaults(func=cmd_propose_bindings)
+
+    p_backfill = sub.add_parser(
+        "anchor-backfill",
+        help="give already-bound files an anchor, hashed now and labelled `backfill` "
+             "(never the bytes at the original ruling); a line insert, never committed",
+    )
+    add_common_args(p_backfill, need_root=True)
+    p_backfill.add_argument("--code-root", dest="code_root", action="append", default=None)
+    p_backfill.add_argument("--sessions-dir", dest="sessions_dir", default=None,
+                            help="override $MEMCONTINUUM_HOME/sessions/<project>")
+    p_backfill.add_argument("--dry-run", action="store_true", help="print the exact diff, write nothing")
+    p_backfill.set_defaults(func=cmd_anchor_backfill)
 
     p_unmapped = sub.add_parser("unmapped")
     add_common_args(p_unmapped, need_root=True)

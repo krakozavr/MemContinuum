@@ -14,6 +14,10 @@
   search fallbacks and edit ledger, which edited files a topic may want to
   bind, plus separately labelled filing hints for unmapped files; it never
   writes a reference (`--write-inbox` drops the text in the store's inbox).
+- New `memidx.py anchor-backfill` captures a late baseline for references that
+  were bound before anchors existed, hashing the file as it is now and
+  labelling the row `backfill` (`--dry-run` prints the diff first). Rerunning
+  it changes nothing.
 
 ### Retrieval
 - New `memidx.py context-pack FILE... [--topic ID] [--query WORDS] [--blind]`
