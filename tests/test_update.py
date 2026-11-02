@@ -2843,6 +2843,9 @@ class TestRenderFingerprint(unittest.TestCase):
                    ["--project", "fp", "--store", store, "--claude-dir", claude_dir,
                     "--non-interactive"], home)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        rendered = (Path(claude_dir) / "rules" / "memcontinuum.md").read_text()
+        self.assertIn("context-pack --project fp ", rendered)
+        self.assertNotIn("{{", rendered)
         proc = run(self.engine / "scripts" / "memcontinuum-decide.sh",
                    ["wired", "--repo", repo, "--store", store, "--project", "fp",
                     "--claude-dir", claude_dir], home)

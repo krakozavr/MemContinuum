@@ -24,7 +24,7 @@ by a `decision: TOP-xxxx Ln` comment at the bound symbol; memlint checks both
 ways. Name the decision in commit messages too (`TOP-xxxx Ln`).
 
 A brief for a reviewer or a dispatched agent opens with the decision records, not a
-summary of them: paste the output of `memidx.py context-pack <files the brief touches>`
+summary of them: paste the output of `memidx.py context-pack --project {{PROJECT}} <files the brief touches>`
 (engine README, "context pack") at its top; the closing `pack sha256` line names what
 the reader saw.
 

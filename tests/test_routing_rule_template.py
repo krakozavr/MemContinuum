@@ -36,6 +36,10 @@ class TestRoutingRuleTemplate(unittest.TestCase):
         text = TEMPLATE.read_text()
         self.assertEqual(text.count("{{STORE}}"), 1)
 
+    def test_project_placeholder_present_exactly_once(self):
+        text = TEMPLATE.read_text()
+        self.assertEqual(text.count("{{PROJECT}}"), 1)
+
     def test_short(self):
         # Cap moved 25 -> 26: task A2-2 (TOP-0122 L1 rule 2b) adds one
         # sentence documenting the decision-marker convention (constraint/
