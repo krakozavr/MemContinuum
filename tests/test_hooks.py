@@ -2240,6 +2240,59 @@ _SKIP_NO_ORACLE_COMMIT = (
 )
 
 
+# 0.5.0 PR 2: the current hook passes --live-file, so a matched topic gains one
+# "Anchor ..." annotation line the frozen pre-round-5 oracle never prints. That
+# line is the one other intended difference between the two outputs, and the
+# normaliser removes ONLY it: a line that starts with one of the exact header
+# texts AND sits immediately after a topic header line. Any other line -- a
+# ruling continuation that merely begins "Anchor ..." included -- must survive.
+ANCHOR_HEADER_TEXTS = (
+    "Anchor changed since capture (",
+    "Anchor missing: ",
+    "Anchor never captured: ",
+    "Anchor not checked: ",
+)
+_TOPIC_HEADER_LINE_RE = re.compile(r"^\S+ .* \u2014 current: ")
+
+
+def strip_anchor_annotations(stdout_text):
+    """`stdout_text` (a hook's JSON stdout) with annotation lines removed from
+    `additionalContext`, re-serialised; non-JSON text is returned unchanged."""
+    try:
+        doc = json.loads(stdout_text)
+        ctx = doc["hookSpecificOutput"]["additionalContext"]
+    except (ValueError, KeyError, TypeError):
+        return stdout_text
+    kept, prev = [], ""
+    for line in ctx.split("\n"):
+        if line.startswith(ANCHOR_HEADER_TEXTS) and _TOPIC_HEADER_LINE_RE.match(prev):
+            continue
+        kept.append(line)
+        prev = line
+    doc["hookSpecificOutput"]["additionalContext"] = "\n".join(kept)
+    return json.dumps(doc, sort_keys=True, ensure_ascii=False)
+
+
+class TestOracleNormaliserIsNarrow(unittest.TestCase):
+    HEADER = "TOP-9500 Anchored \u2014 current: L1 (active, owner-ratified)"
+
+    def _doc(self, *lines):
+        return json.dumps({"hookSpecificOutput": {"additionalContext": "\n".join(lines)}})
+
+    def test_annotation_after_a_topic_header_is_removed(self):
+        with_note = self._doc("intro", self.HEADER, "Anchor changed since capture (bind): src/foo.py", "  L1 rule")
+        without = self._doc("intro", self.HEADER, "  L1 rule")
+        self.assertEqual(strip_anchor_annotations(with_note), strip_anchor_annotations(without))
+
+    def test_a_ruling_continuation_beginning_anchor_survives(self):
+        text = self._doc("intro", self.HEADER, "Anchor do not delete this rule", "  L1 rule")
+        self.assertIn("Anchor do not delete this rule", strip_anchor_annotations(text))
+
+    def test_a_header_text_not_right_after_a_topic_header_survives(self):
+        text = self._doc("intro", "Anchor missing: src/foo.py (file gone).", self.HEADER)
+        self.assertIn("Anchor missing: src/foo.py", strip_anchor_annotations(text))
+
+
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
 @unittest.skipUnless(_ORACLE_COMMIT_AVAILABLE, _SKIP_NO_ORACLE_COMMIT)
 class TestPreEditChainOracleParity(unittest.TestCase):
@@ -2272,16 +2325,9 @@ class TestPreEditChainOracleParity(unittest.TestCase):
         r"Decision-chain memory: \d+ topic\(s\) reference this file\."
     )
 
-    # 0.5.0 PR 2: the current hook passes --live-file, so a matched topic
-    # gains one "Anchor ..." annotation line (a JSON-escaped `\nAnchor ...`
-    # inside additionalContext) the frozen oracle never prints. Those lines
-    # are the one other intended difference; they are normalised away so
-    # every other byte still has to match.
-    _ANCHOR_LINE_RE = re.compile(r'\\nAnchor [^"\\]*')
-
     def _assert_stdout_matches_except_topic_count(self, new_stdout, oracle_stdout):
         def _normalized(text):
-            text = self._ANCHOR_LINE_RE.sub("", text)
+            text = strip_anchor_annotations(text)
             return self._TOPIC_COUNT_HEADER_RE.sub(
                 "Decision-chain memory: N topic(s) reference this file.", text
             )
