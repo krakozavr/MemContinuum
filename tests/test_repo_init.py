@@ -509,6 +509,8 @@ class TestFreshInstall(unittest.TestCase):
         self.assertEqual(lines[1], f"<!-- memcontinuum-rendered: {self._engine_sha()} -->")
         self.assertIn(f"MemContinuum store ({self.store})", text)
         self.assertNotIn("{{STORE}}", text)
+        self.assertIn("context-pack --project widgetco ", text)
+        self.assertNotIn("{{", text)
 
 
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)

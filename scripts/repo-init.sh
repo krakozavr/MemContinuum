@@ -1553,8 +1553,8 @@ MERGE_RC=$?
 # Rendered on EVERY install (fresh or re-run), not write-if-absent like the
 # store README above -- this file's whole point is to always name the
 # CURRENT store, and repo-init is its only writer (the identity-marker
-# refusal above already ruled out clobbering anything foreign). {{STORE}}
-# is the template's one placeholder; the stamp line goes right after the
+# refusal above already ruled out clobbering anything foreign). {{STORE}} and
+# {{PROJECT}} are the template's two placeholders; the stamp line goes right after the
 # identity-marker first line so a `head -1` identity check (above, and any
 # future one) keeps matching a stamped file.
 
@@ -1563,6 +1563,7 @@ if [ "$DRY_RUN" -eq 0 ]; then
     mkdir -p "$CLAUDE_DIR/rules" || fail "could not create $CLAUDE_DIR/rules"
     RULES_TMPL="$(cat "$TEMPLATES_DIR/memcontinuum-rules.md")"
     RULES_TMPL="${RULES_TMPL//\{\{STORE\}\}/$STORE}"
+    RULES_TMPL="${RULES_TMPL//\{\{PROJECT\}\}/$PROJECT}"
     RULES_FIRST_LINE="${RULES_TMPL%%$'\n'*}"
     RULES_REST="${RULES_TMPL#*$'\n'}"
     {

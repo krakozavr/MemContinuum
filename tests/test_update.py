@@ -2843,6 +2843,9 @@ class TestRenderFingerprint(unittest.TestCase):
                    ["--project", "fp", "--store", store, "--claude-dir", claude_dir,
                     "--non-interactive"], home)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        rendered = (Path(claude_dir) / "rules" / "memcontinuum.md").read_text()
+        self.assertIn("context-pack --project fp ", rendered)
+        self.assertNotIn("{{", rendered)
         proc = run(self.engine / "scripts" / "memcontinuum-decide.sh",
                    ["wired", "--repo", repo, "--store", store, "--project", "fp",
                     "--claude-dir", claude_dir], home)
@@ -2865,6 +2868,15 @@ class TestRenderFingerprint(unittest.TestCase):
         tmpl.write_text(tmpl.read_text() + "\nA new paragraph.\n")
         act, out = action()
         self.assertEqual(act, "stale", "a template change must flip the repo stale\n" + out)
+
+        # --apply re-renders through repo-init with the project recovered from
+        # the registry: the rendered file must name it and carry the template change.
+        proc = run(self.engine / "scripts" / "memcontinuum-update.sh", ["--apply"], home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        rerendered = (Path(claude_dir) / "rules" / "memcontinuum.md").read_text()
+        self.assertIn("A new paragraph.", rerendered)
+        self.assertIn("context-pack --project fp ", rerendered)
+        self.assertNotIn("{{", rerendered)
 
 
 class TestMachineLayerIsComparedSeparately(unittest.TestCase):
