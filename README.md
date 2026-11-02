@@ -433,6 +433,7 @@ memidx.py why <symbol-or-path> --project NAME --code-root DIR                   
 memidx.py search "<question>" --project NAME --status active                     # search the decisions
 memidx.py code-search "<what it does>" --project NAME                            # find existing code (--tests / --all for test code)
 memidx.py for-path <file> --project NAME                                         # what governs this file?
+memidx.py context-pack <file>... --project NAME [--topic ID] [--query WORDS] [--blind]  # decision records to paste at the top of a reviewer or agent brief
 memidx.py chain <topic-id> --project NAME                                        # one question's full history
 memidx.py standing --project NAME [--root STORE] [--json]                        # what's standing, printed by hand
 memidx.py drift --code-root DIR --project NAME                                   # has the code grown a bypass?
