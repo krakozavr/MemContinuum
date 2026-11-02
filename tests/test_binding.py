@@ -499,12 +499,22 @@ def plain_topic(tid, code_refs, title="T"):
 
 
 class SessionCase(unittest.TestCase):
-    """A tmp store + indexed db, a code root and a sessions dir."""
+    """A tmp store + indexed db, a code root and a sessions dir.
+
+    `SYMLINKED_TMP` re-runs a class with every path in the `link` spelling of
+    a symlinked temp dir (macOS: /var -> /private/var, INC-0132 family): code
+    that returns, joins or compares a realpath-spelled path fails on Linux."""
+
+    SYMLINKED_TMP = False
 
     def setUp(self):
         self._td = tempfile.TemporaryDirectory()
         self.addCleanup(self._td.cleanup)
         self.td = Path(self._td.name)
+        if self.SYMLINKED_TMP:
+            (self.td / "real").mkdir()
+            os.symlink("real", self.td / "link")
+            self.td = self.td / "link"
         self.store = self.td / "store"
         (self.store / "topics").mkdir(parents=True)
         self.code = self.td / "code"
@@ -1819,7 +1829,9 @@ class TestGateRound3WallClock(DeliveryCase):
         real = memidx.open_db_readonly
 
         def failing(path, *a, **k):
-            if Path(path) == self.db:
+            # the worker reopens the path SQLite reports, which may be the
+            # realpath spelling of the caller's (macOS /var -> /private/var)
+            if os.path.realpath(path) == os.path.realpath(self.db):
                 return None
             return real(path, *a, **k)
 
@@ -1894,3 +1906,36 @@ class TestGateRound2DuplicateRowsAtRef(unittest.TestCase):
             self.assertEqual(rc, 1, out)
             self.assertIn("row removed or changed after being recorded", out)
             self.assertIn("anchor ('src/foo.py', 'L1')", out)
+
+
+class SymlinkedTmpMixin:
+    """Every inherited test runs with the fixture under a symlinked temp dir."""
+
+    SYMLINKED_TMP = True
+
+    def test_fixture_really_is_behind_a_symlink(self):
+        self.assertNotEqual(os.path.realpath(self.td), str(self.td))
+
+
+class TestAnchorBackfillSymlinkedTmp(SymlinkedTmpMixin, TestAnchorBackfill):
+    pass
+
+
+class TestProposeBindingsSymlinkedTmp(SymlinkedTmpMixin, TestProposeBindings):
+    pass
+
+
+class TestForPathAnchorDeliverySymlinkedTmp(SymlinkedTmpMixin, TestForPathAnchorDelivery):
+    pass
+
+
+class TestGateRound1ByteWritersSymlinkedTmp(SymlinkedTmpMixin, TestGateRound1ByteWriters):
+    pass
+
+
+class TestGateRound2LookupSymlinkedTmp(SymlinkedTmpMixin, TestGateRound2Lookup):
+    pass
+
+
+class TestGateRound3WallClockSymlinkedTmp(SymlinkedTmpMixin, TestGateRound3WallClock):
+    pass
