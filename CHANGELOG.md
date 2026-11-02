@@ -24,6 +24,12 @@
   `Anchor not checked` when the check could not be made. It compares the file
   being edited, reads the code index read-only, takes at most 300 ms, and
   never alters a ruling's status or authority.
+- The session-start standing digest is followed by one summary line when a
+  topic with standing links has a bound file or symbol that changed since
+  capture (`Anchor changed since capture: N.`; else `Anchor missing: N.`, else
+  `Anchor never captured: N.`). It needs a configured code root, is dropped
+  before any standing line when the size cap bites, and never alters the
+  digest or its hash.
 
 ### Retrieval
 - New `memidx.py context-pack FILE... [--topic ID] [--query WORDS] [--blind]`

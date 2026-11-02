@@ -926,6 +926,108 @@ class TestForPathSymbolAnchors(DeliveryCase):
         self.assertEqual(before, after)
 
 
+class TestStandingAnchorSummary(DeliveryCase):
+    """`standing --json` carries anchor_summary / anchor_line; the digest text,
+    its hash and the 4800-byte refusal are untouched."""
+
+    def standing_topic(self, text="stands", refs=("src/foo.py",)):
+        refs_block = "".join(f"  - {r}\n" for r in refs)
+        return (
+            "---\ntype: topic\nid: TOP-9900\ntitle: Standing\narea: testing\ncurrent: L1\n"
+            "standing: [L1]\ntags: []\n"
+            f"code_refs:\n{refs_block}"
+            "links:\n  - link: L1\n    date: '2026-01-01'\n    status: active\n    kind: adopted\n"
+            f"    ruling: {{text: {json.dumps(text)}, authority: owner-verbatim, source: s}}\n"
+            "---\n\nBody.\n"
+        )
+
+    def standing(self, *extra, roots=True):
+        args = ["standing", "--project", "p", "--db", str(self.db), "--root", str(self.store),
+                "--code-db", str(self.codedb), "--json"]
+        if roots:
+            args += ["--code-root", str(self.code)]
+        rc, out, err = run_memidx(args + list(extra))
+        self.assertEqual(rc, 0, err)
+        return json.loads(out)
+
+    def setup_store(self, topic_text):
+        self.add_topic("s", topic_text)
+        self.code_file("src/foo.py", PY_SRC)
+        self.reindex()
+
+    def test_counts_and_line_for_each_status(self):
+        self.setup_store(self.standing_topic(refs=("src/foo.py", "src/", "src/gone.py")))
+        out = self.standing()
+        self.assertEqual(out["anchor_summary"], {"changed": 0, "missing": 0, "never": 2, "not_checked": 1})
+        self.assertEqual(out["anchor_line"], "Anchor never captured: 2.")
+        self.bind("src/foo.py", "TOP-9900")
+        self.reindex()
+        self.code_file("src/foo.py", "edited\n")
+        out = self.standing()
+        self.assertEqual(out["anchor_summary"]["changed"], 1)
+        self.assertEqual(out["anchor_line"], "Anchor changed since capture: 1.")
+
+    def test_missing_outranks_never(self):
+        self.setup_store(self.standing_topic(refs=("src/foo.py", "src/bar.py")))
+        self.bind("src/foo.py", "TOP-9900")
+        self.reindex()
+        (self.code / "src" / "foo.py").unlink()
+        out = self.standing()
+        self.assertEqual(out["anchor_line"], "Anchor missing: 1.")
+
+    def test_no_code_root_skips_the_summary(self):
+        self.setup_store(self.standing_topic())
+        out = self.standing(roots=False)
+        self.assertEqual(out["anchor_summary"], {"skipped": "no-root"})
+        self.assertEqual(out["anchor_line"], "")
+
+    def test_digest_and_hash_are_the_same_with_and_without_roots(self):
+        self.setup_store(self.standing_topic())
+        with_roots, without = self.standing(), self.standing(roots=False)
+        for key in ("hash", "links", "bytes", "lines"):
+            self.assertEqual(with_roots[key], without[key])
+
+    def test_plain_output_is_untouched(self):
+        self.setup_store(self.standing_topic())
+        rc, out, err = run_memidx(["standing", "--project", "p", "--db", str(self.db),
+                                   "--root", str(self.store), "--code-root", str(self.code)])
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("Anchor", out)
+
+    def test_the_line_is_dropped_before_the_digest_when_the_cap_bites(self):
+        cap = memidx.STANDING_CAP_BYTES
+        n = 1
+        while True:
+            line = memidx.standing_line("TOP-9900", "L1", "owner-verbatim", "x" * n)
+            size = len(memidx.standing_digest_text([line]).encode())
+            if size > cap - 10:
+                break
+            n += 1
+        self.assertLessEqual(size, cap)
+        self.setup_store(self.standing_topic(text="x" * n))
+        out = self.standing()
+        self.assertEqual(out["bytes"], size)
+        self.assertEqual(out["anchor_line"], "")
+        self.assertEqual(out["anchor_summary"].get("dropped"), "cap")
+        self.assertEqual(len(out["lines"]), 1)
+
+    def test_standing_is_read_only_and_chunker_free(self):
+        self.setup_store(self.standing_topic(refs=("src/foo.py#beta",)))
+        self.bind("src/foo.py#beta", "TOP-9900")
+        self.reindex()
+        self.code_reindex()
+
+        def boom(*a, **kw):
+            raise AssertionError("standing touched a chunker / writable code index")
+
+        with mock.patch.object(memidx.chunkers, "get_chunker", boom), \
+                mock.patch.object(memidx, "validate_chunk_result", boom), \
+                mock.patch.object(memidx, "open_code_db", boom):
+            out = self.standing()
+        self.assertEqual(out["anchor_summary"]["changed"] + out["anchor_summary"]["missing"]
+                         + out["anchor_summary"]["never"], 0)
+
+
 class TestLinkRawSpansUnchanged(unittest.TestCase):
     def test_default_key_walks_links(self):
         text = topic_text([good_row()])

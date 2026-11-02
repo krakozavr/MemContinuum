@@ -3088,6 +3088,102 @@ Body.
         self.assertNotIn("--apply repairs it", ctx)
 
 
+class TestSessionStartStandingAnchorLine(HookTestBase):
+    """0.5.0 PR 2: sessionstart-remind.sh appends ONE anchor summary line
+    after the standing digest (computed by `memidx.py standing --json`), from
+    the configured code roots; the digest text and its hash are untouched."""
+
+    STANDING_ANCHORED_TOPIC = """---
+type: topic
+id: TOP-9600
+title: A standing decision with a bound file
+area: testing
+current: L1
+standing: [L1]
+code_refs:
+  - src/mapped.py
+links:
+  - link: L1
+    date: 2026-01-01
+    status: active
+    kind: adopted
+    ruling:
+      text: "this ruling stands for the whole project"
+      authority: owner-verbatim
+      source: "test"
+    recorded_by: agent
+    recorded_at: 2026-01-01
+---
+
+Body.
+"""
+
+    def _install(self, bind=False):
+        _write(self.store_root / "topics" / "testing" / "anchored.md", self.STANDING_ANCHORED_TOPIC)
+        if bind:
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = memidx.main(["bind", "TOP-9600", "src/mapped.py", "--root", str(self.store_root),
+                                  "--code-root", str(self.code_root)])
+            self.assertEqual(rc, 0)
+        with contextlib.redirect_stdout(io.StringIO()):
+            reindex(self.store_root, self.home / f"{self.project}.sqlite", project=self.project)
+
+    def _start(self, session_id, source="startup", **env_over):
+        proc, _ = run_script(SESSIONSTART_HOOK, self.session_start_payload(session_id, source),
+                             self.base_env(**env_over))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"] if proc.stdout.strip() else ""
+        log = (self.home / "hook.log").read_text()
+        return ctx, [l for l in log.splitlines() if "sessionstart outcome=" in l][-1]
+
+    def test_changed_anchor_adds_one_line_after_the_digest(self):
+        self._install(bind=True)
+        (self.code_root / "src" / "mapped.py").write_text("# mapped, edited\n")
+        ctx, log = self._start("s-anchor-changed")
+        lines = ctx.splitlines()
+        self.assertEqual(lines[-1], "Anchor changed since capture: 1.")
+        self.assertIn("this ruling stands for the whole project", ctx)
+        self.assertEqual(sum(1 for l in lines if l.startswith("Anchor ")), 1)
+        self.assertIn("anchors=changed=1", log)
+
+    def test_unchanged_anchor_adds_no_line(self):
+        self._install(bind=True)
+        ctx, log = self._start("s-anchor-clean")
+        self.assertNotIn("Anchor ", ctx)
+        self.assertIn("anchors=clean", log)
+
+    def test_never_captured_is_the_fallback_line(self):
+        self._install(bind=False)
+        ctx, _log = self._start("s-anchor-never")
+        self.assertEqual(ctx.splitlines()[-1], "Anchor never captured: 1.")
+
+    def test_no_code_root_means_no_line_and_a_skip_log_token(self):
+        self._install(bind=True)
+        env = self.base_env()
+        env.pop("MEMCONTINUUM_CODE_ROOT", None)
+        proc, _ = run_script(SESSIONSTART_HOOK, self.session_start_payload("s-anchor-noroot"), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertNotIn("Anchor ", ctx)
+        log = (self.home / "hook.log").read_text()
+        self.assertIn("anchors=skipped-no-root", [l for l in log.splitlines() if "sessionstart outcome=" in l][-1])
+
+    def test_compact_reinjects_digest_and_line(self):
+        self._install(bind=True)
+        (self.code_root / "src" / "mapped.py").write_text("# edited\n")
+        self._start("s-anchor-compact")
+        ctx, _log = self._start("s-anchor-compact", source="compact")
+        self.assertEqual(ctx.splitlines()[-1], "Anchor changed since capture: 1.")
+
+    def test_dedup_resume_injects_nothing_so_no_line_either(self):
+        self._install(bind=True)
+        (self.code_root / "src" / "mapped.py").write_text("# edited\n")
+        self._start("s-anchor-dedup")
+        proc, _ = run_script(SESSIONSTART_HOOK, self.session_start_payload("s-anchor-dedup", "resume"),
+                             self.base_env())
+        self.assertEqual(proc.stdout.strip(), "")
+
+
 class TestSessionStartHookLogRotation(HookTestBase):
     """eval-topic-logging section 5 (owner-approved add-on): rotation runs
     from sessionstart-remind.sh, once per session, at the startup/resume/

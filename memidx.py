@@ -4513,6 +4513,48 @@ def for_path_anchor_notes(matches, candidate: str, live_file: str, project: str,
     return notes
 
 
+def topic_anchor_statuses(fm: dict, checker: AnchorChecker) -> list:
+    """Statuses of ALL of a topic's code_refs (the standing and context-pack
+    routes have no single edited file, unlike the pre-edit route)."""
+    return anchor_statuses(fm, [str(r) for r in fm.get("code_refs") or []], checker)
+
+
+def standing_anchor_summary(conn, project: str, topic_ids: list, code_roots: list, code_db=None) -> dict:
+    """Counts over the references of the topics that carry standing links:
+    `{changed, missing, never, not_checked}` (references, not topics), or
+    `{"skipped": "no-root"}` without any code root -- the live bytes come from
+    the code roots, and a standing line that guessed would be worse than none.
+    Bounded by ANCHOR_BUDGET_SECONDS; read-only and chunker-free."""
+    if not code_roots:
+        return {"skipped": "no-root"}
+    counts = {"changed": 0, "missing": 0, "never": 0, "not_checked": 0}
+    checker = anchor_checker_for_roots(
+        project, code_roots, code_db=code_db, deadline=time.monotonic() + ANCHOR_BUDGET_SECONDS)
+    try:
+        for tid in topic_ids:
+            row = conn.execute(
+                "SELECT path FROM records WHERE project=? AND type='topic' AND id=?",
+                (project, tid)).fetchone()
+            if row is None:
+                continue
+            fm = parse_record(Path(row["path"])).frontmatter
+            for status in topic_anchor_statuses(fm, checker):
+                counts[status["kind"]] += 1
+    finally:
+        checker.close()
+    return counts
+
+
+def standing_anchor_line(summary: dict) -> str:
+    """The ONE summary line sessionstart-remind.sh appends after the digest:
+    changed, else missing, else never captured; "not checked" is omitted."""
+    for key, text in (("changed", "Anchor changed since capture"), ("missing", "Anchor missing"),
+                      ("never", "Anchor never captured")):
+        if summary.get(key):
+            return f"{text}: {summary[key]}."
+    return ""
+
+
 _GENERIC_UNCHECKABLE_REMEDY = (
     "run backend-preflight, and check whether this file itself can be read"
 )
@@ -6434,8 +6476,22 @@ def cmd_standing(args) -> int:
             print(json.dumps({"state": "missing", "links": 0, "lines": []}, indent=2))
         return 1
 
+    anchor_summary = None
     try:
         entries = standing_entries(conn, args.project)
+        if args.json:
+            # Fail open: an anchor problem never costs the digest.
+            try:
+                anchor_summary = standing_anchor_summary(
+                    conn, args.project, sorted({e[0] for e in entries}),
+                    _code_roots_arg(getattr(args, "code_root", None)),
+                    code_db=resolve_code_db_path(argparse.Namespace(
+                        db=getattr(args, "code_db", None), project=args.project)),
+                )
+            except Exception:
+                if DEBUG:
+                    raise
+                anchor_summary = {"skipped": "error"}
     finally:
         conn.close()
 
@@ -6465,6 +6521,15 @@ def cmd_standing(args) -> int:
             "bytes": digest_bytes,
             "lines": lines,
         }
+        if anchor_summary is not None:
+            anchor_line = standing_anchor_line(anchor_summary)
+            # The summary is the first thing dropped when the cap bites: the
+            # digest itself is never shortened to make room for it.
+            if anchor_line and len((digest_text + "\n" + anchor_line).encode("utf-8")) > STANDING_CAP_BYTES:
+                anchor_line = ""
+                anchor_summary = dict(anchor_summary, dropped="cap")
+            payload["anchor_summary"] = anchor_summary
+            payload["anchor_line"] = anchor_line
         print(json.dumps(payload, indent=2))
     else:
         print(digest_text)
@@ -12240,6 +12305,16 @@ def main(argv=None) -> int:
     )
     add_common_args(p_standing, optional_root=True)
     p_standing.add_argument("--json", action="store_true")
+    p_standing.add_argument(
+        "--code-root", dest="code_root", action="append", default=None,
+        help="with --json: a code root whose files the topics' anchors are compared against "
+             "(repeatable); without any, the anchor summary is skipped",
+    )
+    p_standing.add_argument(
+        "--code-db", dest="code_db", default=None,
+        help="code index path for symbol anchors (default $MEMCONTINUUM_HOME/<project>-code.sqlite); "
+             "opened read-only",
+    )
     p_standing.set_defaults(func=cmd_standing)
 
     p_pack = sub.add_parser(

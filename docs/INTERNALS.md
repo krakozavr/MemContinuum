@@ -3613,6 +3613,20 @@ whole call; once spent, remaining checks say `check budget exhausted` and the
 ruling is delivered anyway. Without `--live-file`, `for-path` is unchanged.
 Any exception in the anchor work is swallowed (fail open).
 
+*Standing (`standing --json`, `sessionstart-remind.sh`).* `standing --json`
+gains `anchor_summary` — counts of references over the topics that carry
+standing links (`changed`, `missing`, `never`, `not_checked`), or
+`{"skipped": "no-root"}` when no `--code-root` was given — and `anchor_line`,
+the one line the hook appends after the digest: `Anchor changed since capture:
+N.`, else `Anchor missing: N.`, else `Anchor never captured: N.` ("not
+checked" is omitted). The digest text, its hash and the 4800-byte refusal are
+untouched; when digest plus line would exceed the cap the line is dropped
+(`anchor_summary.dropped = "cap"`) before any standing line is. The hook passes
+every configured code root, appends the engine's line verbatim, and logs
+`anchors=<token>` (`changed=N`, `missing=N`, `never=N`, `clean`,
+`skipped-no-root`) on the `standing=injected` entry. A deduplicated resume
+injects nothing, so no line either. Plain `standing` output never changes.
+
 ## Context packs
 
 Hooks never fire on a read-only review, and a reviewer's snapshot is a clone
