@@ -435,6 +435,7 @@ memidx.py code-search "<what it does>" --project NAME                           
 memidx.py for-path <file> --project NAME                                         # what governs this file?
 memidx.py context-pack <file>... --project NAME [--topic ID] [--query WORDS] [--blind]  # decision records to paste at the top of a reviewer or agent brief
 memidx.py chain <topic-id> --project NAME                                        # one question's full history
+memidx.py bind <topic-id> <path[#symbol]> --root STORE --project NAME [--code-root DIR]  # bind a file or symbol to a topic's ruling and record its anchor (--dry-run first)
 memidx.py standing --project NAME [--root STORE] [--json]                        # what's standing, printed by hand
 memidx.py drift --code-root DIR --project NAME                                   # has the code grown a bypass?
 memidx.py reindex --root STORE --project NAME                                    # after editing the store by hand

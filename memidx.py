@@ -11170,6 +11170,336 @@ def cmd_stats(args) -> int:
 
 
 # ---------------------------------------------------------------------------
+# anchors: capture (bind) -- the engine's first writer of a canonical record
+# ---------------------------------------------------------------------------
+#
+# D11/D12 mechanics, mandatory: every edit is a LINE INSERT into the topic
+# file's raw text, never a YAML dump (a dump reformats the frozen link bytes).
+# Writers never commit -- the orchestrator commits the store. Delivery never
+# reaches this code: it is capture-side only (it may run a chunker).
+
+
+def _anchor_today() -> str:
+    """`captured_at` for a new row (a seam the tests replace)."""
+    return datetime.now().date().isoformat()
+
+
+def _topic_file_for_id(root: Path, topic_id: str) -> Path | None:
+    """The store file whose frontmatter `id` is `topic_id`, under topics/."""
+    topics_dir = Path(root) / "topics"
+    if not topics_dir.is_dir():
+        return None
+    pattern = re.compile(r"^id:\s*['\"]?" + re.escape(topic_id) + r"['\"]?\s*$", re.M)
+    for path in walk_markdown(topics_dir):
+        try:
+            head = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if pattern.search(head.split("\n---", 1)[0]):
+            return path
+    return None
+
+
+def anchor_span_bytes(data: bytes, start_line: int, end_line: int) -> bytes:
+    """The inclusive 1-based `start_line..end_line` byte span of a chunk --
+    never the FTS body (25 lines) and never the embed slice. The ONE
+    slicing rule: capture and delivery both call it, so they cannot
+    disagree about which bytes a symbol anchor covers."""
+    lines = data.splitlines(keepends=True)
+    return b"".join(lines[max(start_line - 1, 0):end_line])
+
+
+def _anchor_code_ref_file(ref_path: str, code_roots: list) -> tuple:
+    """`(root, abs_path)` of the first code root holding `ref_path`, or
+    `(None, None)`."""
+    for root in code_roots:
+        candidate = Path(root) / ref_path
+        if candidate.is_file():
+            return Path(root), candidate
+    return None, None
+
+
+def capture_anchor_row(ref: str, link_id: str, code_roots: list, captured: str) -> tuple:
+    """Hash what `ref` names NOW and build one anchor row. Returns
+    `(row, None)` or `(None, (rc, message))`: rc 2 = not anchorable (prefix,
+    glob, a directory), rc 1 = could not capture (file missing, symbol
+    ambiguous, chunker unavailable). The one capture routine behind `bind`
+    and `anchor-backfill`; the only anchor code that may call a chunker."""
+    if not code_ref_is_anchorable(ref):
+        return None, (2, f"not anchorable: {ref!r} is a prefix or glob")
+    ref_path, frag = code_ref_split(ref)
+    for root in code_roots:
+        if (Path(root) / ref_path).is_dir():
+            return None, (2, f"not anchorable: {ref!r} names a directory")
+    root, abs_path = _anchor_code_ref_file(ref_path, code_roots)
+    if abs_path is None:
+        return None, (1, f"file not found under the code root(s): {ref_path}")
+    try:
+        data = abs_path.read_bytes()
+    except OSError as exc:
+        return None, (1, f"cannot read {ref_path}: {exc.strerror or exc}")
+
+    span, digest, chunker_version = "file", sha256_hex(data), None
+    if frag is not None:
+        lang = chunkers.lang_for_path(ref_path)
+        if lang is not None:
+            try:
+                result = chunkers.get_chunker(lang).chunk_file(
+                    data.decode("utf-8", errors="replace"), ref_path
+                )
+                validate_chunk_result(result, ref_path)
+            except Exception as exc:
+                return None, (1, f"cannot resolve symbol {frag!r}: chunker unavailable or failed "
+                                 f"({type(exc).__name__}: {exc})")
+            ranges = sorted({
+                (c["start_line"], c["end_line"]) for c in result.chunks
+                if fragment_matches_symbol(frag, c["symbol"], c["qualified_name"])
+            })
+            if len(ranges) > 1:
+                return None, (1, f"symbol ambiguous: {frag!r} matches {len(ranges)} chunks in {ref_path}")
+            if ranges:
+                span = "symbol"
+                digest = sha256_hex(anchor_span_bytes(data, *ranges[0]))
+                chunker_version = chunkers.chunker_version(lang)
+
+    deadline = time.monotonic() + 2.0
+    head = _git_call_budgeted(root, ["rev-parse", "--short", "HEAD"], deadline)
+    status = _git_call_budgeted(root, ["status", "--porcelain", "--", ref_path], deadline)
+    row = {
+        "ref": ref,
+        "link": link_id,
+        "algo": ANCHOR_ALGO,
+        "digest": digest,
+        "span": span,
+        "captured": captured,
+        "captured_at": _anchor_today(),
+        "code_head": head.strip() if head and head.strip() else "unavailable",
+        "worktree": "unknown" if status is None else ("dirty" if status.strip() else "clean"),
+    }
+    if chunker_version:
+        row["chunker_version"] = chunker_version
+    return row, None
+
+
+def _fm_line_bounds(lines: list) -> tuple:
+    """`(first, end)` index range of the frontmatter body lines (between the
+    `---` fences) in a file's `splitlines(keepends=True)`; (0, 0) when none."""
+    if not lines or not lines[0].startswith("---"):
+        return 0, 0
+    for i in range(1, len(lines)):
+        if lines[i].rstrip("\r\n") == "---":
+            return 1, i
+    return 0, 0
+
+
+def _top_key_index(lines: list, first: int, end: int, key: str) -> int | None:
+    """Index of the top-level `key:` line (any value after the colon)."""
+    pat = re.compile(r"^" + re.escape(key) + r":(\s|$)")
+    for i in range(first, end):
+        if pat.match(lines[i]):
+            return i
+    return None
+
+
+def _block_last_line(lines: list, key_idx: int, end: int) -> int:
+    """Index of the last line belonging to the block under the top-level key
+    at `key_idx`: following lines that are indented, indentless `- ` list
+    items, blank or comments; trailing blanks are not counted."""
+    last = key_idx
+    for i in range(key_idx + 1, end):
+        raw = lines[i].rstrip("\r\n")
+        if raw.strip() == "" or raw.lstrip().startswith("#"):
+            continue
+        if raw.startswith(" ") or raw.startswith("- "):
+            last = i
+            continue
+        break
+    return last
+
+
+def _block_item_indent(lines: list, key_idx: int, last: int) -> str:
+    for i in range(key_idx + 1, last + 1):
+        raw = lines[i].rstrip("\r\n")
+        stripped = raw.lstrip(" ")
+        if stripped.startswith("- "):
+            return raw[: len(raw) - len(stripped)]
+    return "  "
+
+
+def _yaml_quote(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def render_anchor_item(row: dict, indent: str = "  ") -> list:
+    """The text lines of one `anchors:` list item, in the schema's field
+    order. Strings that YAML could re-type (digest, code_head, ref) are
+    double-quoted; `captured_at` stays a bare date."""
+    quoted = {"ref", "digest", "code_head", "chunker_version"}
+    order = ("ref", "link", "algo", "digest", "span", "captured", "captured_at",
+             "code_head", "worktree", "chunker_version")
+    out = []
+    for n, key in enumerate([k for k in order if k in row]):
+        value = str(row[key])
+        value = _yaml_quote(value) if key in quoted else value
+        lead = f"{indent}- " if n == 0 else f"{indent}  "
+        out.append(f"{lead}{key}: {value}")
+    return out
+
+
+def insert_anchor_row(text: str, row: dict) -> str:
+    """`text` (a topic file) with one anchor item added: appended at the end
+    of an existing `anchors:` block, else a new block placed immediately
+    before the `links:` line. Pure line insertion -- every other byte of the
+    file is untouched. Raises ValueError when the structure does not allow a
+    safe insert."""
+    nl = "\r\n" if "\r\n" in text else "\n"
+    lines = text.splitlines(keepends=True)
+    first, end = _fm_line_bounds(lines)
+    if end == 0:
+        raise ValueError("no frontmatter block")
+    anchors_idx = _top_key_index(lines, first, end, "anchors")
+    if anchors_idx is not None:
+        value = lines[anchors_idx].split(":", 1)[1].strip()
+        if value == "[]":
+            lines[anchors_idx] = f"anchors:{nl}"
+        elif value != "":
+            raise ValueError("`anchors:` is not a block list; refusing to edit it")
+        last = _block_last_line(lines, anchors_idx, end)
+        item = render_anchor_item(row, _block_item_indent(lines, anchors_idx, last))
+        pos = last + 1
+        if not lines[last].endswith("\n"):
+            lines[last] += nl
+        lines[pos:pos] = [ln + nl for ln in item]
+    else:
+        links_idx = _top_key_index(lines, first, end, "links")
+        if links_idx is None:
+            raise ValueError("no `links:` key to place `anchors:` before")
+        item = render_anchor_item(row)
+        lines[links_idx:links_idx] = [f"anchors:{nl}"] + [ln + nl for ln in item]
+    return "".join(lines)
+
+
+def insert_code_ref(text: str, ref: str) -> str:
+    """`text` with `ref` added to `code_refs:` (a no-op when an identical
+    entry exists): `code_refs: []` becomes a block with the one entry, a
+    block gains one `  - ref` line at its end, an absent key is created
+    before `anchors:`/`links:`. A non-empty flow list is refused."""
+    nl = "\r\n" if "\r\n" in text else "\n"
+    lines = text.splitlines(keepends=True)
+    first, end = _fm_line_bounds(lines)
+    if end == 0:
+        raise ValueError("no frontmatter block")
+    entry_text = _yaml_quote(ref) if re.search(r"""[:'"\[\]{},&*!|>%@`]|\s#|^[\s#-]|\s$""", ref) else ref
+    idx = _top_key_index(lines, first, end, "code_refs")
+    if idx is None:
+        anchor_idx = _top_key_index(lines, first, end, "anchors")
+        if anchor_idx is None:
+            anchor_idx = _top_key_index(lines, first, end, "links")
+        if anchor_idx is None:
+            raise ValueError("no `links:` key to place `code_refs:` before")
+        lines[anchor_idx:anchor_idx] = [f"code_refs:{nl}", f"  - {entry_text}{nl}"]
+        return "".join(lines)
+    rest = lines[idx].split(":", 1)[1].strip()
+    if rest in ("", "[]", "null", "~") and _block_last_line(lines, idx, end) == idx:
+        lines[idx] = f"code_refs:{nl}"
+        lines.insert(idx + 1, f"  - {entry_text}{nl}")
+        return "".join(lines)
+    if rest not in ("", "null", "~"):
+        raise ValueError("`code_refs:` is a non-empty flow list; refusing to edit it")
+    last = _block_last_line(lines, idx, end)
+    indent = _block_item_indent(lines, idx, last)
+    if not lines[last].endswith("\n"):
+        lines[last] += nl
+    lines.insert(last + 1, f"{indent}- {entry_text}{nl}")
+    return "".join(lines)
+
+
+def _unified_diff(old: str, new: str, label: str) -> str:
+    import difflib
+    return "".join(difflib.unified_diff(
+        old.splitlines(keepends=True), new.splitlines(keepends=True),
+        fromfile=f"a/{label}", tofile=f"b/{label}",
+    ))
+
+
+def _topic_current_link(fm: dict) -> str | None:
+    """The topic's current active link id: `current:` when set, else the
+    newest active link."""
+    if fm.get("current"):
+        return str(fm["current"])
+    link = newest_active_link(fm.get("links") or [])
+    return str(link.get("link")) if link else None
+
+
+def apply_topic_edit(path: Path, old_text: str, new_text: str, dry_run: bool, store_root: Path) -> None:
+    """Print the exact diff; write it unless `dry_run`. Never commits."""
+    try:
+        label = str(path.relative_to(store_root))
+    except ValueError:
+        label = str(path)
+    sys.stdout.write(_unified_diff(old_text, new_text, label))
+    if dry_run:
+        print("dry-run: nothing written")
+        return
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(new_text)
+
+
+def cmd_bind(args) -> int:
+    """`memidx.py bind TOP-xxxx REF --root STORE --project NAME [--code-root DIR ...]
+    [--captured ruling|bind] [--dry-run]` -- add REF to the topic's
+    `code_refs` when absent and one anchor row for the topic's current
+    active link, hashing the file's bytes now (a symbol ref: the one
+    chunk's inclusive line span). rc 2: not anchorable (prefix/glob/dir);
+    rc 1: topic or file missing, symbol ambiguous, other failure."""
+    root = Path(args.root).resolve()
+    ref = args.ref
+    if not code_ref_is_anchorable(ref):
+        print(f"bind: not anchorable: {ref!r} is a prefix or glob", file=sys.stderr)
+        return 2
+    path = _topic_file_for_id(root, args.topic)
+    if path is None:
+        print(f"bind: no topic {args.topic!r} under {root}/topics", file=sys.stderr)
+        return 1
+    old_text = path.read_text(encoding="utf-8", errors="strict")
+    result = parse_record_text(old_text, path)
+    if not result.valid:
+        print(f"bind: {path.name} does not parse cleanly: "
+              f"{'; '.join(m for _f, m in result.diagnostics)}", file=sys.stderr)
+        return 1
+    fm = result.frontmatter
+    link_id = _topic_current_link(fm)
+    if link_id is None:
+        print(f"bind: {args.topic} has no active link to anchor", file=sys.stderr)
+        return 1
+    key = (ref, link_id)
+    if any(anchor_row_key(r) == key for r in anchor_rows(fm)):
+        print(f"bind: {args.topic} already has an anchor for ({ref}, {link_id}); "
+              "one baseline per key -- a new baseline is a new link")
+        return 0
+    code_roots = _code_roots_arg(args.code_root) or [Path.cwd().resolve()]
+    row, failure = capture_anchor_row(ref, link_id, code_roots, args.captured)
+    if row is None:
+        rc, message = failure
+        print(f"bind: {message}", file=sys.stderr)
+        return rc
+    try:
+        new_text = old_text
+        if ref not in [str(r) for r in fm.get("code_refs") or []]:
+            new_text = insert_code_ref(new_text, ref)
+        new_text = insert_anchor_row(new_text, row)
+    except ValueError as exc:
+        print(f"bind: {exc}", file=sys.stderr)
+        return 1
+    check = parse_record_text(new_text, path)
+    if not check.valid:
+        print("bind: the edit would not parse cleanly; nothing written", file=sys.stderr)
+        return 1
+    apply_topic_edit(path, old_text, new_text, args.dry_run, root)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -11359,6 +11689,19 @@ def main(argv=None) -> int:
              "HOLD 'may block', at the caller's discretion)",
     )
     p_drift.set_defaults(func=cmd_drift)
+
+    p_bind = sub.add_parser(
+        "bind",
+        help="bind a code reference to a topic's current ruling and capture its anchor "
+             "(SHA-256 of the bytes now); a line insert into the topic file, never committed",
+    )
+    add_common_args(p_bind, need_root=True)
+    p_bind.add_argument("topic", metavar="TOP-xxxx")
+    p_bind.add_argument("ref", metavar="REF", help="a file path or path#symbol (no prefix/glob)")
+    p_bind.add_argument("--code-root", dest="code_root", action="append", default=None)
+    p_bind.add_argument("--captured", choices=("ruling", "bind"), default="bind")
+    p_bind.add_argument("--dry-run", action="store_true", help="print the exact diff, write nothing")
+    p_bind.set_defaults(func=cmd_bind)
 
     p_unmapped = sub.add_parser("unmapped")
     add_common_args(p_unmapped, need_root=True)

@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Binding
+- Topics gain an `anchors:` frontmatter key: the SHA-256 of the code a
+  `code_refs` entry named when the binding was captured, with the capture kind
+  (`ruling`, `bind`, `backfill`), date, commit and worktree state. `memlint.py`
+  validates the rows and `--against-ref` freezes them like links. New
+  `memidx.py bind TOP-xxxx REF` adds the reference and its anchor by inserting
+  lines into the topic file (`--dry-run` prints the exact diff; nothing is
+  committed for you).
+
 ### Retrieval
 - New `memidx.py context-pack FILE... [--topic ID] [--query WORDS] [--blind]`
   prints one paste-ready block of decision records for a brief to an external

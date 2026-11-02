@@ -2756,6 +2756,7 @@ id:
 | a valid forward `status` move (with `superseded_by` added when the new status is `superseded`), `promoted_by` added, alone on the link; new links; changes to `current`, `title`, `tags`, `code_refs`, or the body text | free |
 | a link present at `REF` has its PARSED fields unchanged but its RAW TEXT SPAN changed (a YAML dumper re-render: different quoting, key order, wrapping, or a whitespace-only edit, with identical parsed content) | error, `<path>:<link>: link reformatted, not appended` — the field-level comparison above never fires for these (every field is equal), so the span is compared byte-for-byte separately; a span that cannot be safely attributed to its link on the `REF` side (structural extraction inconclusive — see below) skips this comparison with a NOTE, never an error — the field-level rules above still apply |
 | the same, but the span cannot be attributed on the NEW side (structural extraction inconclusive there instead) while the `REF` side extracted fine | error, `<path>:<link>: link's span could not be extracted on the new side; treated as changed` — a deliberately different message from the row above: this is a proven extraction FAILURE treated as a change (fail closed), never a claim that the bytes were actually compared and found to differ |
+| an `anchors:` row present at `REF` is missing now, has a changed parsed field, or has the same fields in different raw text; or two rows now carry one `(ref, link)` | error naming the row, `<path>: anchor (<ref>, <link>): row changed after being recorded` / `row reformatted, not appended` / `more than one row` — the same raw-span walker as the links row above, keyed by `anchors:` and by `(ref, link, captured, captured_at)`; new rows are free |
 | a new link (present now, absent at `REF`) sorts BELOW some link that already existed at `REF`, in the new file's own link order | error, `<path>:<link>: link inserted out of order` — every new link must sort above every `REF`-side link, newest-first; reordering AMONG `REF`-side links themselves is not separately checked |
 | the `REF`-side blob failed full validation (a shape error, or a duplicate link id) but its `links` field itself still recovers at least one usable entry | not a repair — those recovered links (a duplicate id keeps its FIRST occurrence, file order) are still compared against the new side by every rule above, exactly as if the REF blob had parsed cleanly, with a note naming the REF-side diagnostic that made the blob invalid |
 | the `REF`-side blob never parsed at all (or parsed but recovered no usable `links`), and the new blob now parses cleanly | a note, not an error (`repaired — the blob at REF could not be safely parsed …`) — nothing here was ever recorded link history to freeze, so fixing it is a repair, never an append-only violation |
@@ -3505,6 +3506,48 @@ not this hook.
 
 Loaded is not applied — this raises the odds a standing ruling is honored, it
 is not a guarantee.
+
+## Binding and anchors
+
+A `code_refs` entry says which code a topic governs. An **anchor** says what
+that code looked like when the reference was bound, so a later delivery can
+say whether it changed *since capture*. The schema is in `docs/SCHEMA.md`
+("Anchors"); this section is the mechanics.
+
+**Where anchors live.** In an `anchors:` frontmatter key on the topic, placed
+before `links:`, one item per `(ref, link)`. Delivery reads them from the
+topic file (the index row's `records.path` is absolute), so there is no index
+table and no schema bump. The bytes hashed are SHA-256 of the file as it is on
+disk — the digest the post-edit ledger already records as `content_sha256` —
+and for a `path#symbol` reference of the inclusive `start_line..end_line`
+bytes of the one chunk (`anchor_span_bytes`, the single slicing rule capture
+and delivery share; never the search body, never the embedding slice).
+
+**Freeze.** `check_append_only` runs the same raw-span walker the links use
+(`_link_raw_spans` with `key="anchors"` and an identity over `ref`, `link`,
+`captured`, `captured_at`): an existing row whose parsed fields or raw bytes
+changed, or that disappeared, is an error naming the row; new rows are free;
+a second row for an existing `(ref, link)` is an error. Anchors are append-only
+for the same reason links are — a baseline that can be rewritten proves
+nothing.
+
+**`bind`.** `memidx.py bind TOP-xxxx REF --root STORE --project NAME
+[--code-root DIR ...] [--captured ruling|bind] [--dry-run]` is the engine's
+first writer of a canonical record. Every edit is a **line insertion into the
+file's raw text, never a YAML dump** (`insert_code_ref`, `insert_anchor_row`):
+`code_refs: []` becomes a block with the one entry, a block gains one line at
+its end, `anchors:` is created immediately before `links:` or gains one item
+at the end of its block, and the link bytes are never touched. `--dry-run`
+prints the exact diff and writes nothing; the writer never commits — the
+orchestrator commits the store, and `memlint.py --against-ref HEAD` is the
+acceptance check. The anchor is taken for the topic's `current` link; a second
+`bind` for the same `(ref, link)` is a no-op. A reference to a prefix, a glob
+or a directory exits 2 ("not anchorable"); a `path#symbol` with two or more
+matching chunks writes nothing and says "symbol ambiguous"; with zero matches
+it is captured as a file-span row. `code_head` is `git rev-parse --short HEAD`
+in the code root and `worktree` is the file's `git status --porcelain`
+(`clean`/`dirty`, or `unknown` outside git). Capture is the only anchor code
+that may run a chunker (`capture_anchor_row`).
 
 ## Context packs
 

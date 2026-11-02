@@ -2,6 +2,7 @@
 append-only freeze (memlint), the capture commands, and the delivery routes.
 Every fixture builds its own throwaway store, code root and session files."""
 import contextlib
+import hashlib
 import io
 import os
 import subprocess
@@ -9,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 TOOLS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(TOOLS_DIR))
@@ -83,6 +85,7 @@ def git(args, cwd):
 
 def git_store(td):
     root = Path(td)
+    root.mkdir(parents=True, exist_ok=True)
     git(["init", "-q", str(root)], root)
     git(["config", "user.email", "t@example.com"], root)
     git(["config", "user.name", "T"], root)
@@ -108,6 +111,59 @@ def lint_text(text):
         (root / "topics").mkdir()
         (root / "topics" / "foo.md").write_text(text)
         return memlint.lint_root(root)
+
+
+def run_memidx(args):
+    """memidx.main(args) in-process; returns (rc, stdout, stderr)."""
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = memidx.main(args)
+    return rc, out.getvalue(), err.getvalue()
+
+
+def sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+PY_SRC = (
+    "def alpha():\n"
+    "    return 1\n"
+    "\n"
+    "\n"
+    "def beta():\n"
+    "    x = 2\n"
+    "    return x\n"
+)
+
+PY_AMBIGUOUS = (
+    "class A:\n"
+    "    def run(self):\n"
+    "        return 1\n"
+    "\n"
+    "class B:\n"
+    "    def run(self):\n"
+    "        return 2\n"
+)
+
+
+def make_code_root(td, files):
+    """A throwaway git repo holding `files` ({relpath: text}), committed."""
+    root = Path(td) / "code"
+    root.mkdir()
+    git(["init", "-q", str(root)], root)
+    git(["config", "user.email", "t@example.com"], root)
+    git(["config", "user.name", "T"], root)
+    for rel, text in files.items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_bytes(text.encode())
+    git(["add", "-A"], root)
+    git(["commit", "-q", "-m", "code"], root)
+    return root
+
+
+def link_spans(text):
+    fm = memidx.parse_record_text(text, "x").frontmatter
+    return memlint._link_raw_spans(text, fm["links"])
 
 
 class TestAnchorSchemaLint(unittest.TestCase):
@@ -240,6 +296,171 @@ class TestAnchorFreeze(unittest.TestCase):
             rc, out = run_memlint(["--against-ref", "HEAD", str(root)])
             self.assertEqual(rc, 1, out)
             self.assertIn("more than one row", out)
+
+
+class TestBind(unittest.TestCase):
+    TODAY = "2026-11-02"
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.td = self._td.name
+        self.code = make_code_root(self.td, {"src/foo.py": PY_SRC, "src/amb.py": PY_AMBIGUOUS,
+                                             "src/data.txt": "hello\n"})
+        self.store = git_store(Path(self.td) / "store")
+        patcher = mock.patch.object(memidx, "_anchor_today", return_value=self.TODAY)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def put_topic(self, text):
+        (self.store / "topics" / "foo.md").write_text(text)
+        commit_all(self.store)
+
+    def topic(self):
+        return (self.store / "topics" / "foo.md").read_text()
+
+    def bind(self, ref, *extra):
+        return run_memidx(["bind", "TOP-1", ref, "--root", str(self.store),
+                           "--code-root", str(self.code), *extra])
+
+    def test_dry_run_prints_diff_and_writes_nothing(self):
+        self.put_topic(topic_text(code_refs=()))
+        before = self.topic()
+        rc, out, err = self.bind("src/foo.py", "--dry-run")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.topic(), before)
+        self.assertIn("+anchors:", out)
+        self.assertIn(f'+    digest: "{sha(PY_SRC.encode())}"', out)
+        self.assertIn("dry-run: nothing written", out)
+
+    def test_write_places_anchors_before_links_and_keeps_link_bytes(self):
+        self.put_topic(topic_text())
+        before = self.topic()
+        spans_before = link_spans(before)
+        rc, out, err = self.bind("src/foo.py")
+        self.assertEqual(rc, 0, err)
+        after = self.topic()
+        self.assertLess(after.index("anchors:"), after.index("links:"))
+        self.assertEqual(link_spans(after), spans_before)
+        fm = memidx.parse_record_text(after, "x").frontmatter
+        row = fm["anchors"][0]
+        self.assertEqual(row["ref"], "src/foo.py")
+        self.assertEqual(row["link"], "L1")
+        self.assertEqual(row["span"], "file")
+        self.assertEqual(row["captured"], "bind")
+        self.assertEqual(row["digest"], sha(PY_SRC.encode()))
+        self.assertEqual(str(row["captured_at"]), self.TODAY)
+        self.assertEqual(row["worktree"], "clean")
+        self.assertRegex(row["code_head"], r"^[0-9a-f]{7,}$")
+        rc, lint = run_memlint(["--against-ref", "HEAD", str(self.store)])
+        self.assertEqual(rc, 0, lint)
+        errors, _ = memlint.lint_root(self.store)
+        self.assertEqual(errors, [], errors)
+
+    def test_appends_to_an_existing_anchors_block(self):
+        first = good_row(ref="src/data.txt")
+        self.put_topic(topic_text([first], code_refs=("src/data.txt",)))
+        rc, out, err = self.bind("src/foo.py")
+        self.assertEqual(rc, 0, err)
+        after = self.topic()
+        self.assertEqual(after.count("anchors:"), 1)
+        fm = memidx.parse_record_text(after, "x").frontmatter
+        self.assertEqual([r["ref"] for r in fm["anchors"]], ["src/data.txt", "src/foo.py"])
+        self.assertEqual(fm["code_refs"], ["src/data.txt", "src/foo.py"])
+        rc, lint = run_memlint(["--against-ref", "HEAD", str(self.store)])
+        self.assertEqual(rc, 0, lint)
+
+    def test_empty_inline_code_refs_becomes_a_block(self):
+        self.put_topic(topic_text(code_refs=()))
+        self.assertIn("code_refs: []", self.topic())
+        rc, out, err = self.bind("src/foo.py")
+        self.assertEqual(rc, 0, err)
+        after = self.topic()
+        self.assertNotIn("code_refs: []", after)
+        self.assertIn("code_refs:\n  - src/foo.py\n", after)
+
+    def test_existing_identical_code_ref_is_left_alone(self):
+        self.put_topic(topic_text(code_refs=("src/foo.py",)))
+        rc, out, err = self.bind("src/foo.py")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.topic().count("- src/foo.py"), 1)
+
+    def test_second_bind_for_same_key_is_a_noop(self):
+        self.put_topic(topic_text())
+        self.assertEqual(self.bind("src/foo.py")[0], 0)
+        once = self.topic()
+        rc, out, err = self.bind("src/foo.py")
+        self.assertEqual(rc, 0)
+        self.assertIn("already has an anchor", out)
+        self.assertEqual(self.topic(), once)
+
+    def test_symbol_one_match_hashes_the_inclusive_span(self):
+        self.put_topic(topic_text())
+        rc, out, err = self.bind("src/foo.py#beta")
+        self.assertEqual(rc, 0, err)
+        fm = memidx.parse_record_text(self.topic(), "x").frontmatter
+        row = fm["anchors"][0]
+        self.assertEqual(row["span"], "symbol")
+        self.assertTrue(row["chunker_version"])
+        beta = "def beta():\n    x = 2\n    return x\n"
+        self.assertEqual(row["digest"], sha(beta.encode()))
+        errors, _ = memlint.lint_root(self.store)
+        self.assertEqual(errors, [], errors)
+
+    def test_symbol_zero_matches_is_captured_as_file_span(self):
+        self.put_topic(topic_text())
+        rc, out, err = self.bind("src/foo.py#nope")
+        self.assertEqual(rc, 0, err)
+        row = memidx.parse_record_text(self.topic(), "x").frontmatter["anchors"][0]
+        self.assertEqual(row["span"], "file")
+        self.assertEqual(row["digest"], sha(PY_SRC.encode()))
+        self.assertEqual(row["ref"], "src/foo.py#nope")
+
+    def test_symbol_two_matches_writes_nothing_and_says_ambiguous(self):
+        self.put_topic(topic_text())
+        before = self.topic()
+        rc, out, err = self.bind("src/amb.py#run")
+        self.assertEqual(rc, 1)
+        self.assertIn("symbol ambiguous", err)
+        self.assertEqual(self.topic(), before)
+
+    def test_prefix_and_glob_are_not_anchorable_rc_2(self):
+        self.put_topic(topic_text())
+        before = self.topic()
+        for ref in ("src/", "src/*.py"):
+            with self.subTest(ref=ref):
+                rc, out, err = self.bind(ref)
+                self.assertEqual(rc, 2)
+                self.assertIn("not anchorable", err)
+        self.assertEqual(self.topic(), before)
+
+    def test_directory_without_slash_is_rc_2(self):
+        self.put_topic(topic_text())
+        rc, out, err = self.bind("src")
+        self.assertEqual(rc, 2, err)
+
+    def test_dirty_worktree_is_recorded(self):
+        self.put_topic(topic_text())
+        (self.code / "src" / "data.txt").write_text("changed\n")
+        self.assertEqual(self.bind("src/data.txt")[0], 0)
+        row = memidx.parse_record_text(self.topic(), "x").frontmatter["anchors"][0]
+        self.assertEqual(row["worktree"], "dirty")
+        self.assertEqual(row["digest"], sha(b"changed\n"))
+
+    def test_captured_ruling_label(self):
+        self.put_topic(topic_text())
+        self.assertEqual(self.bind("src/foo.py", "--captured", "ruling")[0], 0)
+        row = memidx.parse_record_text(self.topic(), "x").frontmatter["anchors"][0]
+        self.assertEqual(row["captured"], "ruling")
+
+    def test_unknown_topic_and_missing_file_are_rc_1(self):
+        self.put_topic(topic_text())
+        rc, out, err = run_memidx(["bind", "TOP-99", "src/foo.py", "--root", str(self.store),
+                                   "--code-root", str(self.code)])
+        self.assertEqual(rc, 1)
+        rc, out, err = self.bind("src/missing.py")
+        self.assertEqual(rc, 1)
+        self.assertIn("file not found", err)
 
 
 class TestLinkRawSpansUnchanged(unittest.TestCase):
