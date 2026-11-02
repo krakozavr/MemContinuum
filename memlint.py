@@ -2540,11 +2540,13 @@ def _anchor_freeze_errors(full_path, old_text, old_rows: list, new_text, new_row
             f"{full_path}: could not verify recorded anchors' raw text at REF "
             "(structural extraction inconclusive); anchors compared by parsed fields only"
         )
-    new_by_ident = {}
+    # multiplicity kept: a pair of identical rows at REF reduced to one is a removal
+    new_by_ident: dict[str, list] = {}
     for row in new_rows:
         ident = _anchor_ident(row)
         if ident is not None:
-            new_by_ident[ident] = row
+            new_by_ident.setdefault(ident, []).append(row)
+    taken: dict[str, int] = {}
     for row in old_rows:
         ident = _anchor_ident(row)
         name = f"{full_path}: anchor ({row.get('ref')!r}, {row.get('link')!r})"
@@ -2554,7 +2556,10 @@ def _anchor_freeze_errors(full_path, old_text, old_rows: list, new_text, new_row
                 "captured_at) and cannot be verified; refusing to skip it (append-only)"
             )
             continue
-        new_row = new_by_ident.get(ident)
+        n = taken.get(ident, 0)
+        taken[ident] = n + 1
+        candidates = new_by_ident.get(ident, [])
+        new_row = candidates[n] if n < len(candidates) else None
         if new_row is None:
             errors.append(
                 f"{name}: row removed or changed after being recorded (append-only; "

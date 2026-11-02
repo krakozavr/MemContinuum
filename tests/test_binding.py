@@ -1624,3 +1624,16 @@ class TestGateRound2Lookup(SessionCase):
     def test_only_an_undecodable_file_is_still_found_by_name(self):
         (self.store / "topics" / "a.md").write_bytes(plain_topic("TOP-9001", []).encode() + b"\xff")
         self.assertEqual(memidx._topic_file_for_id(self.store, "TOP-9001"), self.store / "topics" / "a.md")
+
+
+class TestGateRound2DuplicateRowsAtRef(unittest.TestCase):
+    def test_a_duplicate_pair_at_ref_reduced_to_one_row_errors_as_removed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = git_store(td)
+            (root / "topics" / "foo.md").write_text(topic_text([good_row(), good_row()]))
+            commit_all(root)
+            (root / "topics" / "foo.md").write_text(topic_text([good_row()]))
+            rc, out = run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("row removed or changed after being recorded", out)
+            self.assertIn("anchor ('src/foo.py', 'L1')", out)
