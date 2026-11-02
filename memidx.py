@@ -349,7 +349,7 @@ FALLBACK_SCALAR_FIELDS = {
 FALLBACK_COMPLEX_FIELDS = {
     "links", "code_refs", "tags", "edges", "assumptions", "invariant",
     "metadata", "ruling", "rationale", "alternatives", "evidence",
-    "implemented_by", "tested_by", "governed_by", "involved_in",
+    "implemented_by", "tested_by", "governed_by", "involved_in", "anchors",
 }
 
 
@@ -490,6 +490,10 @@ def validate_record_shape(fm: dict) -> list:
 
     if not _shape_ok_mapping(fm.get("metadata")):
         diagnostics.append(("metadata", "metadata must be a mapping"))
+
+    anchors = fm.get("anchors")
+    if anchors and (not isinstance(anchors, list) or any(not isinstance(a, dict) for a in anchors)):
+        diagnostics.append(("anchors", "anchors must be a list of mappings"))
 
     links = fm.get("links")
     if links:
@@ -4223,6 +4227,75 @@ def fragment_matches_symbol(frag: str, symbol: str, qualified_name: str) -> bool
     validates identically on both surfaces (reviewer finding: they used to
     disagree -- attachment accepted it, lint rejected it)."""
     return frag == symbol or frag == qualified_name or qualified_name.endswith("." + frag)
+
+
+# ---------------------------------------------------------------------------
+# anchors (0.5.0 PR 2): the `anchors:` frontmatter key records the SHA-256 of
+# the code a code_refs entry named when the binding was captured; delivery
+# later compares the live bytes against it. The vocabulary and the pure
+# helpers live here, beside code_ref_matches, so memlint, the capture
+# commands and the three delivery routes share one definition.
+# ---------------------------------------------------------------------------
+
+ANCHOR_ALGO = "sha256"
+ANCHOR_SPANS = ("file", "symbol")
+ANCHOR_CAPTURE_KINDS = ("ruling", "bind", "backfill")
+ANCHOR_WORKTREE_STATES = ("clean", "dirty", "unknown")
+ANCHOR_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+_CODE_REF_GLOB_CHARS = ("*", "?", "[")
+
+
+def sha256_hex(data: bytes) -> str:
+    """The one SHA-256-of-bytes helper of the anchor feature: the same
+    digest hooks/ledger-post-edit.sh stores as `content_sha256` and
+    `file_sha.sha256` holds, so capture and delivery never disagree on it."""
+    return hashlib.sha256(data).hexdigest()
+
+
+def code_ref_split(code_ref: str) -> tuple:
+    """`(path, fragment_or_None)` of a code_refs entry; the path keeps its
+    spelling except that trailing slashes are dropped."""
+    path, sep, frag = str(code_ref).partition("#")
+    return path.rstrip("/"), (frag if sep else None)
+
+
+def code_ref_is_anchorable(code_ref: str) -> bool:
+    """True iff a code_refs entry names ONE file (optionally `#symbol`) --
+    not a prefix (trailing slash) and not a glob. Prefix and glob entries
+    are "not checked" by definition: there is no single byte span to
+    anchor. A directory written without a trailing slash cannot be told
+    apart from a file without touching the disk; `bind` checks the disk."""
+    ref = str(code_ref)
+    if not code_ref_is_named(ref):
+        return False
+    raw_path = ref.split("#", 1)[0]
+    if raw_path.endswith("/"):
+        return False
+    return not any(ch in raw_path for ch in _CODE_REF_GLOB_CHARS)
+
+
+def code_ref_matches_exact(file_path: str, code_ref: str) -> bool:
+    """The exact-path counterpart of code_ref_matches, for anchor rows:
+    True iff `code_ref` is anchorable and its path part IS `file_path`
+    (no prefix containment, no glob). code_ref_matches keeps its own
+    looser rule untouched."""
+    if not code_ref_is_anchorable(code_ref):
+        return False
+    return code_ref_split(code_ref)[0] == str(file_path).rstrip("/")
+
+
+def anchor_rows(fm: dict) -> list:
+    """The well-formed (mapping) rows of a record's `anchors:` list; [] for
+    an absent or wrongly shaped key (validate_record_shape reports that)."""
+    rows = fm.get("anchors")
+    if not isinstance(rows, list):
+        return []
+    return [r for r in rows if isinstance(r, dict)]
+
+
+def anchor_row_key(row: dict) -> tuple:
+    """One baseline per `(ref, link)` in this release."""
+    return (str(row.get("ref")), str(row.get("link")))
 
 
 _GENERIC_UNCHECKABLE_REMEDY = (
