@@ -3638,7 +3638,9 @@ daemon worker thread (`_run_anchor_worker`) that the caller joins for what is
 left of the budget, then returns without waiting for it. A topic the worker has
 not completed by then gets the exhausted verdict (for-path: `Anchor missing:
 <ref> (check budget exhausted).`; standing: counted `unchecked`); partial
-per-topic results are never used, and a worker that finished in time gives the
+per-topic results are never used (a topic one of whose references ends exhausted
+shows only the exhausted header for-path, and counts once as `unchecked` in
+standing, whatever its other references found), and a worker that finished in time gives the
 same output as before. The worker's read-only code-index connection is opened
 `check_same_thread=False` with a SQLite progress handler (every 1000 VM steps)
 that aborts a running query once the deadline has passed, and every exception
@@ -3650,15 +3652,18 @@ asked before AND after every file read, hash, code-index open, SQL query and
 topic-file parse) stays as the cheap common-case path; the thread is the
 guarantee. A verdict is accepted only if the deadline had not passed after the
 step that produced it (a final hash that crosses the deadline is `check budget
-exhausted`, never `ok`); a blocked index open waits at most what is left of the
-budget. The standing route's worker also owns the per-topic decision-index `SELECT`
-(through its own read-only connection with the same progress handler); a topic
+exhausted`, never `ok`). SQLite's busy timeout on the code-index open is set to
+the remaining budget, but it is not the deadline: the progress handler and the
+worker join are. The standing route's worker also owns the per-topic decision-index `SELECT`
+(through its own read-only connection with the same progress handler; if that
+connection cannot be opened the caller's connection is never borrowed from the
+thread, every topic is counted `unchecked`, the token is `unchecked=N` and the
+digest is kept); a topic
 whose check ends exhausted after it started, and an unanchored ref reached
 after the deadline, are `unchecked` (standing) or exhausted (for-path), never
 `missing` or `never`. The context-pack route stays
 synchronous and unbounded by design (no deadline, no size cap), so the same
-files give the same pack bytes. Any exception in the anchor work is swallowed
-(fail open). Without `--live-file`, `for-path` is unchanged.
+files give the same pack bytes. Without `--live-file`, `for-path` is unchanged.
 Any exception in the anchor work is swallowed (fail open).
 
 *Standing (`standing --json`, `sessionstart-remind.sh`).* `standing --json`
