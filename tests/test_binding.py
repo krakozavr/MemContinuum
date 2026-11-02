@@ -4,6 +4,7 @@ Every fixture builds its own throwaway store, code root and session files."""
 import contextlib
 import hashlib
 import io
+import json
 import os
 import subprocess
 import sys
@@ -461,6 +462,155 @@ class TestBind(unittest.TestCase):
         rc, out, err = self.bind("src/missing.py")
         self.assertEqual(rc, 1)
         self.assertIn("file not found", err)
+
+
+def plain_topic(tid, code_refs, title="T"):
+    refs = "".join(f"  - {r}\n" for r in code_refs)
+    refs_block = f"code_refs:\n{refs}" if code_refs else "code_refs: []\n"
+    return (
+        "---\ntype: topic\n"
+        f"id: {tid}\ntitle: {title}\narea: testing\ncurrent: L1\ntags: []\n"
+        f"{refs_block}"
+        "links:\n  - link: L1\n    date: '2026-01-01'\n    status: active\n    kind: adopted\n"
+        "    ruling: {text: a ruling, authority: owner-ratified, source: s}\n"
+        "---\n\nBody.\n"
+    )
+
+
+class SessionCase(unittest.TestCase):
+    """A tmp store + indexed db, a code root and a sessions dir."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.td = Path(self._td.name)
+        self.store = self.td / "store"
+        (self.store / "topics").mkdir(parents=True)
+        self.code = self.td / "code"
+        (self.code / "src").mkdir(parents=True)
+        self.sessions = self.td / "sessions"
+        self.sessions.mkdir()
+        self.db = self.td / "idx.sqlite"
+        self.home = self.td / "home"
+        self.home.mkdir()
+        for patcher in (mock.patch.object(memidx, "_anchor_today", return_value="2026-11-02"),
+                        mock.patch.dict(os.environ, {"MEMCONTINUUM_HOME": str(self.home)})):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def add_topic(self, name, text):
+        (self.store / "topics" / f"{name}.md").write_text(text, encoding="utf-8")
+
+    def reindex(self):
+        rc, out, err = run_memidx(["reindex", "--root", str(self.store), "--project", "p",
+                                   "--db", str(self.db), "--no-embed"])
+        self.assertEqual(rc, 0, err)
+
+    def code_file(self, rel, text):
+        path = self.code / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(text.encode())
+        return str(path)
+
+    def session(self, sid, ledger=(), fallbacks=(), lock=True):
+        state = {"session_id": sid, "ledger": list(ledger), "search_fallbacks": list(fallbacks)}
+        (self.sessions / f"{sid}.json").write_text(json.dumps(state))
+        if lock:
+            (self.sessions / f"{sid}.json.lock").write_text("")
+
+    def ledger_row(self, rel, sha_hex="c" * 64, kind="code", root=None, seen_at="2026-11-02T10:00:00Z"):
+        root = str(self.code) if root is None and kind == "code" else (root or "")
+        return {"path": str(self.code / rel), "kind": kind, "content_sha256": sha_hex,
+                "seen_at": seen_at, "root": root, "source": "tool"}
+
+    def fallback(self, rel, tid, title="Some title", hook="pre-edit-chain"):
+        return {"file": str(self.code / rel), "id": tid, "title": title, "hook": hook}
+
+    def propose(self, sid="s1", *extra, db=True):
+        args = ["propose-bindings", "--session", sid, "--root", str(self.store), "--project", "p",
+                "--sessions-dir", str(self.sessions), "--code-root", str(self.code), *extra]
+        if db:
+            args += ["--db", str(self.db)]
+        return run_memidx(args)
+
+
+class TestProposeBindings(SessionCase):
+    def test_section_one_joins_fallback_to_ledger_row(self):
+        self.add_topic("a", plain_topic("TOP-9001", ["src/other.py"], "Alpha"))
+        self.reindex()
+        self.code_file("src/foo.py", "x\n")
+        self.session("s1", [self.ledger_row("src/foo.py", "ab" * 32)],
+                     [self.fallback("src/foo.py", "TOP-9001", "Alpha title")])
+        rc, out, err = self.propose()
+        self.assertEqual(rc, 0, err)
+        self.assertIn("last 20 fallbacks only", out)
+        self.assertIn("TOP-9001  src/foo.py  " + "ab" * 6 + "  2026-11-02T10:00:00Z  pre-edit-chain", out)
+        self.assertIn("    Alpha title", out)
+
+    def test_topic_that_already_matches_the_path_is_not_proposed(self):
+        self.add_topic("a", plain_topic("TOP-9001", ["src/foo.py"]))
+        self.reindex()
+        self.session("s1", [self.ledger_row("src/foo.py")], [self.fallback("src/foo.py", "TOP-9001")])
+        rc, out, err = self.propose()
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("TOP-9001", out)
+
+    def test_non_code_and_rootless_ledger_rows_are_never_proposed(self):
+        self.add_topic("a", plain_topic("TOP-9001", ["src/other.py"]))
+        self.reindex()
+        self.session("s1", [self.ledger_row("src/foo.py", kind="store")],
+                     [self.fallback("src/foo.py", "TOP-9001")])
+        rc, out, err = self.propose()
+        self.assertNotIn("TOP-9001", out)
+
+    def test_section_two_lists_unmapped_ledgered_code_paths_not_named_above(self):
+        self.add_topic("a", plain_topic("TOP-9001", ["src/mapped.py"]))
+        self.reindex()
+        self.session("s1",
+                     [self.ledger_row("src/foo.py"), self.ledger_row("src/mapped.py"),
+                      self.ledger_row("src/hint.py", "d" * 64)],
+                     [self.fallback("src/foo.py", "TOP-9001")])
+        rc, out, err = self.propose()
+        self.assertEqual(rc, 0, err)
+        head, _, hints = out.partition("Filing hints, not bindings:")
+        self.assertIn("src/foo.py", head)
+        self.assertIn("src/hint.py  " + "d" * 12, hints)
+        self.assertNotIn("src/mapped.py", hints)
+        self.assertNotIn("src/foo.py", hints)
+
+    def test_coverage_not_ok_prints_unknown_and_never_unmapped(self):
+        self.session("s1", [self.ledger_row("src/hint.py")], [])
+        rc, out, err = self.propose(db=False)   # no index at the default home -> not "ok"
+        self.assertEqual(rc, 0, err)
+        tail = out.partition("Filing hints, not bindings:")[2]
+        self.assertEqual(tail.strip(), "coverage: unknown")
+        self.assertNotIn("src/hint.py", out)
+
+    def test_write_inbox_writes_the_same_text(self):
+        self.add_topic("a", plain_topic("TOP-9001", ["src/other.py"]))
+        self.reindex()
+        self.session("s1", [self.ledger_row("src/foo.py")], [self.fallback("src/foo.py", "TOP-9001")])
+        rc, out, err = self.propose("s1", "--write-inbox")
+        self.assertEqual(rc, 0, err)
+        written = self.store / "inbox" / "proposals" / "2026-11-02-s1.md"
+        self.assertTrue(written.is_file())
+        self.assertIn("TOP-9001  src/foo.py", written.read_text())
+        self.assertEqual(sorted(p.name for p in (self.store / "topics").iterdir()), ["a.md"])
+
+    def test_without_write_inbox_nothing_is_written(self):
+        self.add_topic("a", plain_topic("TOP-9001", ["src/other.py"]))
+        self.reindex()
+        self.session("s1", [self.ledger_row("src/foo.py")], [self.fallback("src/foo.py", "TOP-9001")])
+        self.assertEqual(self.propose()[0], 0)
+        self.assertFalse((self.store / "inbox").exists())
+
+    def test_unreadable_or_missing_session_is_rc_1(self):
+        self.reindex()
+        rc, out, err = self.propose("nope")
+        self.assertEqual(rc, 1)
+        (self.sessions / "half.json").write_text('{"ledger": [')
+        rc, out, err = self.propose("half")
+        self.assertEqual(rc, 1)
 
 
 class TestLinkRawSpansUnchanged(unittest.TestCase):

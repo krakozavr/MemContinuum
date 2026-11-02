@@ -11500,6 +11500,169 @@ def cmd_bind(args) -> int:
 
 
 # ---------------------------------------------------------------------------
+# anchors: proposals from the session ledger (propose-bindings)
+# ---------------------------------------------------------------------------
+#
+# Reads a session file ($MEMCONTINUUM_HOME/sessions/<project>/<id>.json, the
+# state hooks/ledger-post-edit.sh and hooks/mc-fallback-lib.sh write) and
+# PRINTS suggestions. Nothing here appends a reference: only `bind`, run by
+# a person or the orchestrator, writes a canonical record (D12). No hook
+# calls this command.
+
+
+def memcontinuum_home() -> Path:
+    return Path(os.environ.get("MEMCONTINUUM_HOME", str(Path.home() / ".memcontinuum")))
+
+
+def sessions_dir_for(project: str, override: str | None = None) -> Path:
+    return Path(override).expanduser() if override else memcontinuum_home() / "sessions" / project
+
+
+def read_session_state(path: Path) -> dict | None:
+    """The parsed session file, or None when it is unreadable or half
+    written (a live session is mid-write; that is skipped, never an error)."""
+    try:
+        state = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def iter_session_files(sessions_dir: Path):
+    """Every `*.json` session file in `sessions_dir`, sorted; `.json.lock`
+    siblings and anything else are not session files."""
+    try:
+        names = sorted(os.listdir(sessions_dir))
+    except OSError:
+        return
+    for name in names:
+        if name.endswith(".json"):
+            yield Path(sessions_dir) / name
+
+
+def ledger_code_rows(state: dict) -> list:
+    """Ledger rows that name edited CODE: `kind == "code"` with a non-empty
+    `root` and an absolute `path`. Each is `{path, root, rel, content_sha256,
+    seen_at}` with `path` normalised and `rel` its path under `root`; rows
+    that sit outside their own root are dropped."""
+    out = []
+    for row in state.get("ledger") or []:
+        if not isinstance(row, dict) or row.get("kind") != "code" or not row.get("root"):
+            continue
+        path = os.path.normpath(str(row.get("path") or ""))
+        root = os.path.normpath(str(row["root"]))
+        if not os.path.isabs(path) or not path.startswith(root.rstrip(os.sep) + os.sep):
+            continue
+        out.append({
+            "path": path, "root": root, "rel": os.path.relpath(path, root),
+            "content_sha256": str(row.get("content_sha256") or ""),
+            "seen_at": str(row.get("seen_at") or ""),
+        })
+    return out
+
+
+def proposal_lines(state: dict, topic_is_bound, unmapped_report) -> list:
+    """The proposal text for one session state. `topic_is_bound(topic_id,
+    abs_path, root)` says whether that topic already matches the path
+    directly; `unmapped_report(abs_paths)` returns `cmd_unmapped`'s result
+    dict (or None). Section one is the only part that may become a
+    `code_refs` line."""
+    rows = ledger_code_rows(state)
+    by_path = {r["path"]: r for r in rows}
+    fallbacks = [f for f in state.get("search_fallbacks") or [] if isinstance(f, dict)]
+    lines = ["Binding proposals -- this session's search fallbacks joined to its edit ledger "
+             "(last 20 fallbacks only; suggestions, nothing is bound until `memidx.py bind` runs):"]
+    named: set = set()
+    proposed = 0
+    for fb in fallbacks:
+        row = by_path.get(os.path.normpath(str(fb.get("file") or "")))
+        if row is None or not fb.get("id"):
+            continue
+        if topic_is_bound(str(fb["id"]), row["path"], row["root"]):
+            continue
+        named.add(row["path"])
+        proposed += 1
+        lines.append(
+            f"{fb['id']}  {row['rel']}  {row['content_sha256'][:12]}  {row['seen_at']}  "
+            f"{fb.get('hook') or ''}".rstrip()
+        )
+        if fb.get("title"):
+            lines.append(f"    {fb['title']}")
+    if not proposed:
+        lines.append("(none)")
+    lines.append("")
+    lines.append("Filing hints, not bindings:")
+    candidates = [r["path"] for r in rows if r["path"] not in named]
+    report = unmapped_report(candidates) if candidates else {"coverage_status": "ok", "by_path": {}}
+    if not report or report.get("coverage_status") != "ok":
+        lines.append("coverage: unknown")
+        return lines
+    hints = [r for r in rows if r["path"] not in named
+             and (report.get("by_path") or {}).get(r["path"]) == "unmapped"]
+    if not hints:
+        lines.append("(none)")
+    for r in hints:
+        lines.append(f"{r['rel']}  {r['content_sha256'][:12]}  {r['seen_at']}")
+    return lines
+
+
+def cmd_propose_bindings(args) -> int:
+    """`memidx.py propose-bindings --session ID --root STORE --project NAME
+    [--code-root DIR ...] [--write-inbox] [--sessions-dir DIR]` -- prints
+    the proposal; `--write-inbox` also writes
+    `inbox/proposals/<date>-<session>.md` under the store (D12: an inbox
+    drop, never a canonical record)."""
+    root = Path(args.root).resolve()
+    session_file = sessions_dir_for(args.project, args.sessions_dir) / f"{args.session}.json"
+    state = read_session_state(session_file)
+    if state is None:
+        print(f"propose-bindings: no readable session file {session_file}", file=sys.stderr)
+        return 1
+    code_roots = _code_roots_arg(args.code_root) or _code_roots_arg(
+        sorted({r["root"] for r in ledger_code_rows(state)})
+    )
+    db_path = resolve_db_path(args)
+
+    conn = None
+    if decision_index_state(db_path, args.project, root=root) not in ("missing", "uninitialized"):
+        conn = open_db_noncreating(db_path, project=args.project)
+
+    def topic_is_bound(topic_id, abs_path, row_root):
+        if conn is None:
+            return False
+        candidates = _unmapped_path_candidates(abs_path, _code_roots_arg([row_root]) or code_roots)
+        return any(
+            r["id"] == topic_id
+            for cand in candidates for r in topic_matches_for_path(conn, args.project, cand)
+        )
+
+    def unmapped_report(paths):
+        ns = argparse.Namespace(root=str(root), project=args.project, db=args.db, paths=paths,
+                                code_root=[str(r) for r in code_roots], json=True)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            cmd_unmapped(ns)
+        try:
+            return json.loads(buf.getvalue())
+        except ValueError:
+            return None
+
+    try:
+        lines = proposal_lines(state, topic_is_bound, unmapped_report)
+    finally:
+        if conn is not None:
+            conn.close()
+    text = "\n".join(lines) + "\n"
+    print(text, end="")
+    if args.write_inbox:
+        out = root / "inbox" / "proposals" / f"{_anchor_today()}-{args.session}.md"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text, encoding="utf-8")
+        print(f"wrote {out}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -11702,6 +11865,20 @@ def main(argv=None) -> int:
     p_bind.add_argument("--captured", choices=("ruling", "bind"), default="bind")
     p_bind.add_argument("--dry-run", action="store_true", help="print the exact diff, write nothing")
     p_bind.set_defaults(func=cmd_bind)
+
+    p_propose = sub.add_parser(
+        "propose-bindings",
+        help="print this session's search fallbacks joined to its edit ledger as binding "
+             "suggestions (never writes a reference; --write-inbox drops the text in the inbox)",
+    )
+    add_common_args(p_propose, need_root=True)
+    p_propose.add_argument("--session", required=True, help="session id (the <id>.json under sessions/<project>/)")
+    p_propose.add_argument("--code-root", dest="code_root", action="append", default=None)
+    p_propose.add_argument("--sessions-dir", dest="sessions_dir", default=None,
+                           help="override $MEMCONTINUUM_HOME/sessions/<project>")
+    p_propose.add_argument("--write-inbox", action="store_true",
+                           help="also write inbox/proposals/<date>-<session>.md under --root")
+    p_propose.set_defaults(func=cmd_propose_bindings)
 
     p_unmapped = sub.add_parser("unmapped")
     add_common_args(p_unmapped, need_root=True)

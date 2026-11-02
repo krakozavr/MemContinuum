@@ -10,6 +10,10 @@
   `memidx.py bind TOP-xxxx REF` adds the reference and its anchor by inserting
   lines into the topic file (`--dry-run` prints the exact diff; nothing is
   committed for you).
+- New `memidx.py propose-bindings --session ID` prints, from a session's
+  search fallbacks and edit ledger, which edited files a topic may want to
+  bind, plus separately labelled filing hints for unmapped files; it never
+  writes a reference (`--write-inbox` drops the text in the store's inbox).
 
 ### Retrieval
 - New `memidx.py context-pack FILE... [--topic ID] [--query WORDS] [--blind]`

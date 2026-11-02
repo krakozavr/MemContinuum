@@ -3549,6 +3549,22 @@ in the code root and `worktree` is the file's `git status --porcelain`
 (`clean`/`dirty`, or `unknown` outside git). Capture is the only anchor code
 that may run a chunker (`capture_anchor_row`).
 
+**`propose-bindings`.** `memidx.py propose-bindings --session ID --root STORE
+--project NAME [--code-root DIR ...] [--write-inbox]` reads one session file
+(`$MEMCONTINUUM_HOME/sessions/<project>/<ID>.json`) and prints suggestions; no
+hook calls it and nothing it prints is a binding. Section one joins the
+session's `search_fallbacks` entries (file, id, title, hook; the hook keeps
+only the last 20, and the header says so) to the ledger row with the same
+absolute path and prints `TOP-xxxx  <path under the ledger row's root>
+<content_sha256[:12]>  <seen_at>  <hook>`; ledger rows without a `root`
+(non-code kinds) are never proposed, and a topic that already matches the path
+directly (`topic_matches_for_path`) is left out. Section two, headed
+`Filing hints, not bindings:`, lists ledgered code paths that `cmd_unmapped`
+reports unmapped and section one did not name; when its `coverage_status` is
+not `ok` the section says `coverage: unknown` and nothing else. `--write-inbox`
+also writes `inbox/proposals/<date>-<session>.md` under the store (an inbox
+drop, never a canonical record).
+
 ## Context packs
 
 Hooks never fire on a read-only review, and a reviewer's snapshot is a clone
