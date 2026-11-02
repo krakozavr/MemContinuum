@@ -12047,7 +12047,7 @@ def cmd_bind(args) -> int:
         return 2
     path = _topic_file_for_id(root, args.topic)
     if path is None:
-        print(f"bind: no topic {args.topic!r} under {root}/topics", file=sys.stderr)
+        print(f"bind: no topic {args.topic!r} under {args.root}/topics", file=sys.stderr)
         return 1
     try:
         old_text = read_record_bytes_strict(path)
@@ -12267,7 +12267,8 @@ def cmd_propose_bindings(args) -> int:
     text = "\n".join(lines) + "\n"
     print(text, end="")
     if args.write_inbox:
-        out = root / "inbox" / "proposals" / f"{_anchor_today()}-{args.session}.md"
+        # the caller's spelling of --root: this path is printed
+        out = Path(args.root) / "inbox" / "proposals" / f"{_anchor_today()}-{args.session}.md"
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(text, encoding="utf-8")
         print(f"wrote {out}")
