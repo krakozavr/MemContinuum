@@ -1430,3 +1430,54 @@ class TestLinkRawSpansUnchanged(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGateRound2Crlf(unittest.TestCase):
+    """Item 1: a CRLF record at REF is freezable (links and anchors), judged on
+    the original bytes; an LF twin behaves the same."""
+
+    def _text(self, rows, crlf):
+        text = topic_text(rows)
+        return text.replace("\n", "\r\n") if crlf else text
+
+    def _run(self, crlf, new_text_fn):
+        with tempfile.TemporaryDirectory() as td:
+            root = git_store(td)
+            path = root / "topics" / "foo.md"
+            path.write_bytes(self._text([good_row()], crlf).encode())
+            commit_all(root)
+            path.write_bytes(new_text_fn(crlf).encode())
+            return run_memlint(["--against-ref", "HEAD", str(root)])
+
+    def test_unchanged_history_passes_with_no_note(self):
+        for crlf in (True, False):
+            rc, out = self._run(crlf, lambda c: self._text([good_row()], c))
+            self.assertEqual(rc, 0, out)
+            self.assertNotIn("NOTE", out)
+
+    def test_appended_row_passes(self):
+        for crlf in (True, False):
+            rc, out = self._run(crlf, lambda c: self._text(
+                [good_row(), good_row(ref="src/bar.py", captured_at="2026-11-03")], c))
+            self.assertEqual(rc, 0, out)
+            self.assertNotIn("NOTE", out)
+
+    def test_changed_digest_errors(self):
+        for crlf in (True, False):
+            rc, out = self._run(crlf, lambda c: self._text([good_row(digest=f'"{DIGEST2}"')], c))
+            self.assertEqual(rc, 1, (crlf, out))
+            self.assertIn("anchor ('src/foo.py', 'L1')", out)
+
+    def test_deleted_anchor_row_errors(self):
+        for crlf in (True, False):
+            rc, out = self._run(crlf, lambda c: self._text([], c))
+            self.assertEqual(rc, 1, (crlf, out))
+            self.assertIn("anchor ('src/foo.py', 'L1')", out)
+
+    def test_crlf_to_lf_rewrite_errors_on_every_frozen_span(self):
+        rc, out = self._run(True, lambda c: self._text([good_row()], False))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("anchor ('src/foo.py', 'L1')", out)
+        self.assertIn("anchor", out)
+        self.assertIn("reformatted", out)
+        self.assertIn("L1", out)

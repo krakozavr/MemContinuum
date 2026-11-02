@@ -69,7 +69,7 @@ from memidx import (
     lang_for_source_file,
     newest_active_link,
     parse_record,
-    parse_record_text,
+    parse_record_raw,
     standing_digest_text,
     standing_line,
     standing_sort_key,
@@ -2060,7 +2060,9 @@ def _parse_git_blob(data: bytes | None, label) -> ParseResult:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         return ParseResult({}, "", [("file", "not UTF-8")], valid=False, fallback=False)
-    return parse_record_text(text, label)
+    # CRLF-tolerant parse: the parser reads LF, the raw-span walker (below)
+    # keeps the original bytes (TOP-0137 L12, gate round 2 item 1).
+    return parse_record_raw(text, label)
 
 
 _KIND_BY_ID_PREFIX = {
@@ -2361,7 +2363,7 @@ def _link_raw_spans(
         return None
     end_idx = None
     for i in range(1, len(lines)):
-        if lines[i].rstrip("\n") == "---":
+        if lines[i].rstrip("\r\n") == "---":
             end_idx = i
             break
     if end_idx is None:
@@ -2402,7 +2404,7 @@ def _link_raw_spans(
     first = None
     for i in range(links_idx + 1, len(fm_lines)):
         line = fm_lines[i]
-        if line.strip("\n") == "" or _is_comment_only(line):
+        if line.strip("\r\n") == "" or _is_comment_only(line):
             continue
         first = i
         break
@@ -2417,7 +2419,7 @@ def _link_raw_spans(
     block_end = len(fm_lines)
     for i in range(links_idx + 1, len(fm_lines)):
         line = fm_lines[i]
-        if line.strip("\n") == "" or _is_comment_only(line):
+        if line.strip("\r\n") == "" or _is_comment_only(line):
             continue
         ls = _leading_spaces(line)
         if ls < indent:
