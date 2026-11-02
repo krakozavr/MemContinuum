@@ -3601,57 +3601,12 @@ def _resolve_search_status(status: list[str]) -> tuple[list[str], bool]:
     return status, False
 
 
-def cmd_search(args) -> int:
-    db_path = resolve_db_path(args)
-    # Final-fix-wave item 2: --root is optional (add_common_args's
-    # optional_root=True) -- omitted, root stays None and this reader can
-    # never see "stale", exactly as before; given, it's resolved and
-    # passed through so an on-disk-drifted store is surfaced, not silently
-    # answered as "current".
-    root = Path(args.root).resolve() if getattr(args, "root", None) else None
-    read_only = bool(getattr(args, "read_only", False))
-    # MAJOR fix-round item a: --read-only (the search fallback's own
-    # caller, hooks/pre-edit-chain.sh + hooks/newfile-nudge.sh) never opens
-    # the index through open_db_noncreating -- that mode=rw open silently
-    # ALTERs/CREATEs/INSERTs on a legacy schema (see _run_decision_migration_
-    # guards). A read-only caller gets decision_index_state_readonly/
-    # open_db_readonly instead (mode=ro, no guard ever runs); the two
-    # helpers share the SAME classification body (_classify_index_state)
-    # as the rw path above, so this branch changes ONLY which connection
-    # mode is used, never the state vocabulary a caller has to understand.
-    if read_only:
-        state = decision_index_state_readonly(db_path, args.project, root=root)
-    else:
-        state = decision_index_state(db_path, args.project, root=root)
-    if state in ("missing", "uninitialized"):
-        return _decision_reply("search", args, state)
-    if read_only and state == "upgrade-required":
-        # A read-only caller refuses by name instead of silently opening
-        # rw and migrating a legacy schema just to answer a guess -- the
-        # ONE state a genuinely read-only open cannot paper over (see
-        # decision_index_state_readonly's own docstring). Non-read-only
-        # callers keep the pre-existing behavior below (open rw, warn,
-        # migrate-on-open, search anyway -- ruling 68).
-        print(
-            f"search: the decision index needs migration for project {args.project!r} "
-            "and --read-only refuses to write it -- run `reindex --root <path>` first",
-            file=sys.stderr,
-        )
-        if getattr(args, "json", False):
-            print(json.dumps(
-                {"state": "upgrade-required", "reason": "index-needs-migration", "results": []},
-                indent=2,
-            ))
-        return 1
-    if read_only:
-        conn = open_db_readonly(db_path)
-    else:
-        conn = open_db_noncreating(db_path, project=args.project)
-    if conn is None:
-        return _decision_reply("search", args, "missing")
-    if state in ("upgrade-required", "stale", "quarantined"):
-        _decision_warn("search", args, state, conn=conn)
-
+def _search_filter_clause(args) -> tuple[str, list]:
+    """The WHERE clause and parameters `search` applies before ranking: the
+    default-active status rule, the --decisions-only type set, and the
+    inbox exclusion. Extracted unchanged from cmd_search so `context-pack`
+    (its --query block) filters exactly as `search` does -- one
+    implementation, not two."""
     # F5/F7 (ruling 71): status/type/area/topic/authority filtering now
     # lives INSIDE fts_ranked/vector_ranked themselves, before their own
     # cap and before RRF fusion -- no more Python-side `allowed` set
@@ -3743,6 +3698,61 @@ def cmd_search(args) -> int:
         )
         extra_where = f"({extra_where}) AND {inbox_clause}" if extra_where else inbox_clause
         extra_params = extra_params + [args.project]
+    return extra_where, extra_params
+
+
+def cmd_search(args) -> int:
+    db_path = resolve_db_path(args)
+    # Final-fix-wave item 2: --root is optional (add_common_args's
+    # optional_root=True) -- omitted, root stays None and this reader can
+    # never see "stale", exactly as before; given, it's resolved and
+    # passed through so an on-disk-drifted store is surfaced, not silently
+    # answered as "current".
+    root = Path(args.root).resolve() if getattr(args, "root", None) else None
+    read_only = bool(getattr(args, "read_only", False))
+    # MAJOR fix-round item a: --read-only (the search fallback's own
+    # caller, hooks/pre-edit-chain.sh + hooks/newfile-nudge.sh) never opens
+    # the index through open_db_noncreating -- that mode=rw open silently
+    # ALTERs/CREATEs/INSERTs on a legacy schema (see _run_decision_migration_
+    # guards). A read-only caller gets decision_index_state_readonly/
+    # open_db_readonly instead (mode=ro, no guard ever runs); the two
+    # helpers share the SAME classification body (_classify_index_state)
+    # as the rw path above, so this branch changes ONLY which connection
+    # mode is used, never the state vocabulary a caller has to understand.
+    if read_only:
+        state = decision_index_state_readonly(db_path, args.project, root=root)
+    else:
+        state = decision_index_state(db_path, args.project, root=root)
+    if state in ("missing", "uninitialized"):
+        return _decision_reply("search", args, state)
+    if read_only and state == "upgrade-required":
+        # A read-only caller refuses by name instead of silently opening
+        # rw and migrating a legacy schema just to answer a guess -- the
+        # ONE state a genuinely read-only open cannot paper over (see
+        # decision_index_state_readonly's own docstring). Non-read-only
+        # callers keep the pre-existing behavior below (open rw, warn,
+        # migrate-on-open, search anyway -- ruling 68).
+        print(
+            f"search: the decision index needs migration for project {args.project!r} "
+            "and --read-only refuses to write it -- run `reindex --root <path>` first",
+            file=sys.stderr,
+        )
+        if getattr(args, "json", False):
+            print(json.dumps(
+                {"state": "upgrade-required", "reason": "index-needs-migration", "results": []},
+                indent=2,
+            ))
+        return 1
+    if read_only:
+        conn = open_db_readonly(db_path)
+    else:
+        conn = open_db_noncreating(db_path, project=args.project)
+    if conn is None:
+        return _decision_reply("search", args, "missing")
+    if state in ("upgrade-required", "stale", "quarantined"):
+        _decision_warn("search", args, state, conn=conn)
+
+    extra_where, extra_params = _search_filter_clause(args)
     results, contributing, embed_info = _search_hits(conn, args, extra_where, extra_params)
     embed_state = embed_info.get("state")
     if embed_state == "unavailable":
@@ -5977,6 +5987,46 @@ def _decision_vector_index_state(conn: sqlite3.Connection, project: str) -> str:
     return "partial"
 
 
+def standing_entries(conn, project: str) -> list:
+    """The eligible standing pointers of `project`, sorted: one
+    `(topic_id, link_id, authority, ruling_text)` tuple per pointer that
+    exists in its topic, is `status: active`, and carries a
+    CONSTRAINT_AUTHORITIES authority (the eligibility gate documented on
+    cmd_standing). Extracted from cmd_standing unchanged so `context-pack`
+    projects the digest from the SAME code; the caller owns the
+    connection and the cap check."""
+    entries = []
+    topic_rows = conn.execute(
+        "SELECT path, id, standing FROM records WHERE project=? AND type='topic'",
+        (project,),
+    ).fetchall()
+    for row in topic_rows:
+        try:
+            standing_ids = json.loads(row["standing"] or "[]")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(standing_ids, list) or not standing_ids:
+            continue
+        topic_id = row["id"]
+        for lid in standing_ids:
+            lid = str(lid)
+            link_row = conn.execute(
+                "SELECT status, ruling_authority, ruling_text FROM links "
+                "WHERE project=? AND topic_path=? AND link=?",
+                (project, row["path"], lid),
+            ).fetchone()
+            if link_row is None:
+                continue
+            if link_row["status"] != "active":
+                continue
+            if link_row["ruling_authority"] not in CONSTRAINT_AUTHORITIES:
+                continue
+            entries.append((topic_id, lid, link_row["ruling_authority"], link_row["ruling_text"] or ""))
+
+    entries.sort(key=standing_sort_key)
+    return entries
+
+
 def cmd_standing(args) -> int:
     """`memidx.py standing --project P [--root DIR] [--json]` -- TOP-0132
     L1/L2's citation-only projection of every topic's own `standing:`
@@ -6058,38 +6108,11 @@ def cmd_standing(args) -> int:
             print(json.dumps({"state": "missing", "links": 0, "lines": []}, indent=2))
         return 1
 
-    entries = []
     try:
-        topic_rows = conn.execute(
-            "SELECT path, id, standing FROM records WHERE project=? AND type='topic'",
-            (args.project,),
-        ).fetchall()
-        for row in topic_rows:
-            try:
-                standing_ids = json.loads(row["standing"] or "[]")
-            except (TypeError, ValueError):
-                continue
-            if not isinstance(standing_ids, list) or not standing_ids:
-                continue
-            topic_id = row["id"]
-            for lid in standing_ids:
-                lid = str(lid)
-                link_row = conn.execute(
-                    "SELECT status, ruling_authority, ruling_text FROM links "
-                    "WHERE project=? AND topic_path=? AND link=?",
-                    (args.project, row["path"], lid),
-                ).fetchone()
-                if link_row is None:
-                    continue
-                if link_row["status"] != "active":
-                    continue
-                if link_row["ruling_authority"] not in CONSTRAINT_AUTHORITIES:
-                    continue
-                entries.append((topic_id, lid, link_row["ruling_authority"], link_row["ruling_text"] or ""))
+        entries = standing_entries(conn, args.project)
     finally:
         conn.close()
 
-    entries.sort(key=standing_sort_key)
     lines = [standing_line(tid, lid, auth, text) for tid, lid, auth, text in entries]
     digest_text = standing_digest_text(lines)
     digest_bytes = len(digest_text.encode("utf-8"))
@@ -6119,6 +6142,235 @@ def cmd_standing(args) -> int:
         print(json.dumps(payload, indent=2))
     else:
         print(digest_text)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# context-pack: decision records for an agent brief (TOP-0135)
+# ---------------------------------------------------------------------------
+
+CONTEXT_PACK_DEFAULT_MAX_BYTES = 12000
+# Per-topic chain budget (fixed, not the env-tunable fallback default, so
+# the same store and arguments always yield the same bytes).
+CONTEXT_PACK_TOPIC_CHAIN_BYTES = 2000
+CONTEXT_PACK_SEARCH_LIMIT = 2
+CONTEXT_PACK_BLIND_TEXT = (
+    "Blind review: no decision records were supplied (recorded blind-review mode).\n"
+)
+# Authority-aware: only the two CONSTRAINT_AUTHORITIES bind; the rest are
+# labelled facts or inference. One paragraph, no record ids.
+CONTEXT_PACK_HEADER = (
+    "Decision records for this brief -- verbatim from the MemContinuum store ({store}).\n"
+    "Each record carries its authority. owner-verbatim and owner-ratified rulings bind:\n"
+    "never flag code for following one; challenge one only by naming a concrete defect in\n"
+    "the ruling itself. reviewer-finding and code-derived records are reported facts.\n"
+    "agent-inference records are labelled inference: weigh them, do not treat them as rulings.\n"
+)
+_PACK_AUTHORITY_RANK = {"owner-verbatim": 0, "owner-ratified": 1}
+
+
+def pack_hash_line(text: str) -> tuple[str, int, str]:
+    """`(sha256_hex, byte_count, "pack sha256=<hex> bytes=<N>")` over the
+    exact UTF-8 bytes of `text` -- the pack as printed above its last line."""
+    raw = text.encode("utf-8")
+    sha = hashlib.sha256(raw).hexdigest()
+    return sha, len(raw), f"pack sha256={sha} bytes={len(raw)}"
+
+
+def bound_topic_rows_for_path(conn, project: str, file_path: str) -> list:
+    """Every topic row bound to a repo-relative `file_path`: topics whose
+    code_refs match it (topic_matches_for_path) followed by topics governing
+    a concept that claims it (concept_matches_for_path + governed_topic_rows)
+    -- the same two resolutions `for-path` renders, as rows, deduped."""
+    rows = list(topic_matches_for_path(conn, project, file_path))
+    seen = {r["path"] for r in rows}
+    for crow in concept_matches_for_path(conn, project, file_path):
+        for trow in governed_topic_rows(conn, project, crow):
+            if trow["path"] not in seen:
+                seen.add(trow["path"])
+                rows.append(trow)
+    return rows
+
+
+def _pack_topic_authority_rank(conn, topic_row) -> int:
+    link_rows = conn.execute(
+        "SELECT * FROM links WHERE topic_path=? ORDER BY seq ASC", (topic_row["path"],)
+    ).fetchall()
+    cur = _chain_current_link(link_rows)
+    auth = (cur["ruling_authority"] or cur["rationale_authority"]) if cur is not None else None
+    return _PACK_AUTHORITY_RANK.get(auth, 2)
+
+
+def _pack_search_topic_rows(conn, project: str, query: str, skip_paths: set) -> list:
+    """The nearest topics by FTS for `--query`: the SAME ranking and filter
+    `search --mode fts --decisions-only` uses (_search_filter_clause +
+    _search_hits), mapped to parent topics, deduped, minus `skip_paths`."""
+    sargs = argparse.Namespace(
+        project=project, query=query, mode="fts", status=[], type=["topic", "link"],
+        decisions_only=True, area=None, topic=None, authority=None, include_inbox=False,
+    )
+    where, params = _search_filter_clause(sargs)
+    try:
+        hits, _, _ = _search_hits(conn, sargs, where, params)
+    except sqlite3.OperationalError:
+        return []
+    out, seen = [], set(skip_paths)
+    for path, _score in hits:
+        row = record_row_by_path(conn, path)
+        if row is None:
+            continue
+        trow = record_row_by_path(conn, row["link_topic_path"] or row["path"])
+        if trow is None or trow["type"] != "topic" or trow["path"] in seen:
+            continue
+        seen.add(trow["path"])
+        out.append(trow)
+        if len(out) >= CONTEXT_PACK_SEARCH_LIMIT:
+            break
+    return out
+
+
+def build_context_pack(conn, project: str, files: list, topic_ids: list, query: str | None,
+                       store: str, state: str, max_bytes: int) -> dict:
+    """Assemble the pack (see cmd_context_pack). Returns the JSON envelope
+    minus the hash fields: {text, topics, omitted}. Pure over `conn`."""
+    # Standing block: the very projection `standing` prints.
+    entries = standing_entries(conn, project)
+    lines = [standing_line(tid, lid, auth, text) for tid, lid, auth, text in entries]
+    digest = standing_digest_text(lines)
+    if len(lines) > STANDING_CAP_LINKS or len(digest.encode("utf-8")) > STANDING_CAP_BYTES:
+        digest = ("Standing decisions: not included -- the digest exceeds the store-wide cap "
+                  "(run `standing` for details).")
+    standing_via: dict = {}
+    for tid, _lid, _auth, _text in entries:
+        standing_via.setdefault(tid, ["standing"])
+
+    # Candidates: bound + named (ranked), then search (tail).
+    cands: dict = {}   # topic path -> dict(row, files, named)
+    for f in files:
+        for trow in bound_topic_rows_for_path(conn, project, f):
+            c = cands.setdefault(trow["path"], {"row": trow, "files": [], "named": False})
+            c["files"].append(f)
+    missing_named = []
+    for tid in topic_ids:
+        trow = find_topic_row(conn, project, tid)
+        if trow is None:
+            missing_named.append(tid)
+            continue
+        c = cands.setdefault(trow["path"], {"row": trow, "files": [], "named": False})
+        c["named"] = True
+    ranked = sorted(
+        cands.values(),
+        key=lambda c: (_pack_topic_authority_rank(conn, c["row"]), -len(c["files"]), c["row"]["id"]),
+    )
+    for c in ranked:
+        c["kind"] = "bound" if c["files"] else "named"
+        c["id"] = c["row"]["id"]
+    if query:
+        for trow in _pack_search_topic_rows(conn, project, query, set(cands)):
+            ranked.append({"row": trow, "files": [], "named": False, "kind": "search",
+                           "id": trow["id"]})
+    for c in ranked:
+        meta = f"[record file: {c['row']['path']}"
+        if c["files"]:
+            meta += f"; bound to: {', '.join(c['files'])}"
+        meta += "]"
+        c["lines"] = [meta] + topic_chain_lines_capped(
+            conn, c["row"], CONTEXT_PACK_TOPIC_CHAIN_BYTES)
+
+    def render(k: int) -> str:
+        sel = ranked[:k]
+        out = [CONTEXT_PACK_HEADER.format(store=store).rstrip("\n"), f"Index state: {state}", "", digest]
+        if files:
+            out += ["", "Bound to the files in this brief:"]
+            bound_all = [c for c in ranked if c["kind"] == "bound"]
+            bound_sel = [c for c in sel if c["kind"] == "bound"]
+            if not bound_all:
+                out.append("  none of these files has a bound topic")
+            elif not bound_sel:
+                out.append("  (all omitted by the size cap -- see below)")
+            for c in bound_sel:
+                out += c["lines"]
+        if topic_ids:
+            out += ["", "Named explicitly:"]
+            for c in (c for c in sel if c["kind"] == "named"):
+                out += c["lines"]
+            out += [f"{tid}: not found in the index" for tid in missing_named]
+        if query:
+            out += ["", "Nearest by search -- may be unrelated (a guess, not bound to these files):"]
+            srch = [c for c in sel if c["kind"] == "search"]
+            if not any(c["kind"] == "search" for c in ranked):
+                out.append("  none beyond the records above")
+            for c in srch:
+                out += c["lines"]
+        omitted = [c["id"] for c in ranked[k:]]
+        if omitted:
+            out += ["", f"[{len(omitted)} topic(s) omitted by the size cap: {', '.join(omitted)}]"]
+        return "\n".join(out) + "\n"
+
+    k = len(ranked)
+    while k > 0 and len(render(k).encode("utf-8")) > max_bytes:
+        k -= 1
+    text = render(k)
+    topics = [{"id": tid, "via": list(v)} for tid, v in standing_via.items()]
+    by_id = {t["id"]: t for t in topics}
+    for c in ranked[:k]:
+        via = list(c["files"]) + (["named"] if c["named"] else []) + (["search"] if c["kind"] == "search" else [])
+        if c["id"] in by_id:
+            by_id[c["id"]]["via"].extend(via)
+        else:
+            by_id[c["id"]] = {"id": c["id"], "via": via}
+            topics.append(by_id[c["id"]])
+    return {"text": text, "topics": topics, "omitted": [c["id"] for c in ranked[k:]]}
+
+
+def cmd_context_pack(args) -> int:
+    """`memidx.py context-pack [FILE...] [--topic TOP-xxxx ...] [--query WORDS]
+    [--blind] [--max-bytes N] [--json]` -- one paste-ready block of decision
+    records for an external reviewer's or dispatched agent's brief (TOP-0135).
+    Read-only throughout (open_db_readonly): standing digest (byte-identical
+    to `standing`), then topics bound to FILE..., then --topic, then a
+    labelled FTS guess for --query. Whole topics are dropped from the tail
+    under --max-bytes and named; the cap covers the pack text above the last
+    line, which is `pack sha256=<hex> bytes=<N>` over those exact bytes.
+    --blind opens no index and prints only the fixed blind-review notice."""
+    as_json = bool(getattr(args, "json", False))
+    if getattr(args, "blind", False):
+        text = CONTEXT_PACK_BLIND_TEXT
+        sha, nbytes, line = pack_hash_line(text)
+        if as_json:
+            print(json.dumps({"sha256": sha, "bytes": nbytes, "blind": True, "text": text,
+                              "topics": [], "omitted": [], "state": "blind"}, indent=2))
+        else:
+            print(text + line)
+        return 0
+    db_path = resolve_db_path(args)
+    root = Path(args.root).resolve() if getattr(args, "root", None) else None
+    state = decision_index_state_readonly(db_path, args.project, root=root)
+    if state in ("missing", "uninitialized"):
+        return _decision_reply("context-pack", args, state)
+    conn = open_db_readonly(db_path)
+    if conn is None:
+        return _decision_reply("context-pack", args, "missing")
+    store = str(root) if root else (os.environ.get("MEMCONTINUUM_ROOT") or "<store root not configured>")
+    files = list(dict.fromkeys(getattr(args, "files", None) or []))
+    try:
+        built = build_context_pack(
+            conn, args.project, files, list(getattr(args, "topic", None) or []),
+            getattr(args, "query", None), store, state,
+            getattr(args, "max_bytes", None) or CONTEXT_PACK_DEFAULT_MAX_BYTES,
+        )
+    except (sqlite3.OperationalError, IndexError):
+        # A legacy schema a read-only open cannot paper over.
+        return _decision_reply("context-pack", args, "upgrade-required")
+    finally:
+        conn.close()
+    sha, nbytes, line = pack_hash_line(built["text"])
+    if as_json:
+        print(json.dumps({"sha256": sha, "bytes": nbytes, "blind": False, "text": built["text"],
+                          "topics": built["topics"], "omitted": built["omitted"], "state": state},
+                         indent=2))
+    else:
+        print(built["text"] + line)
     return 0
 
 
@@ -10960,6 +11212,29 @@ def main(argv=None) -> int:
     add_common_args(p_standing, optional_root=True)
     p_standing.add_argument("--json", action="store_true")
     p_standing.set_defaults(func=cmd_standing)
+
+    p_pack = sub.add_parser(
+        "context-pack",
+        help="paste-ready decision records for a reviewer/agent brief: the "
+             "standing digest plus the chains bound to FILE..., read-only, "
+             "capped by whole topics, ending in a pack sha256 line",
+    )
+    add_common_args(p_pack, optional_root=True)
+    p_pack.add_argument("files", nargs="*", metavar="FILE",
+                        help="repo-relative paths the brief touches")
+    p_pack.add_argument("--topic", action="append", default=[], metavar="TOP-xxxx",
+                        help="also include this topic's chain (repeatable)")
+    p_pack.add_argument("--query", default=None,
+                        help="add up to 2 nearest topics by FTS search, labelled as a guess")
+    p_pack.add_argument("--max-bytes", dest="max_bytes", type=int,
+                        default=CONTEXT_PACK_DEFAULT_MAX_BYTES,
+                        help="cap (UTF-8 bytes) on the pack text; whole topics are omitted "
+                             "from the tail and named (default %(default)s)")
+    p_pack.add_argument("--blind", action="store_true",
+                        help="recorded blind-review mode: open no index, print only the "
+                             "fixed notice and its pack hash")
+    p_pack.add_argument("--json", action="store_true")
+    p_pack.set_defaults(func=cmd_context_pack)
 
     p_code_reindex = sub.add_parser(
         "code-reindex",
