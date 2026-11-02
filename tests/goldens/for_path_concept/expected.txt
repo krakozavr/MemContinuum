@@ -1,0 +1,5 @@
+TOP-9801 Direct — current: L1 (active, owner-verbatim)
+  L1 2026-01-01 adopted   "direct ruling" (owner-verbatim)
+CON-9801 Service concept — the service boundary
+TOP-9802 Governing — current: L1 (active, owner-ratified)
+  L1 2026-01-01 adopted   "governed ruling" (owner-ratified)

@@ -3511,26 +3511,38 @@ agent sees only its brief. `memidx.py context-pack FILE... [--topic ID]
 [--query WORDS] [--max-bytes N] [--blind] [--json]` builds the block that
 carries the records there, verbatim.
 
-**Contents, in order.** A fixed header paragraph naming the store path and
-how to read each authority: `owner-verbatim` and `owner-ratified` rulings
-bind, `reviewer-finding` and `code-derived` records are reported facts,
-`agent-inference` records are inference to weigh. An `Index state:` line.
-The standing digest, byte-identical to what `standing` prints (it comes from
-the same `standing_entries` projection and `standing_digest_text`
-rendering). Then the topics bound to each FILE (the `for-path` resolution:
-`code_refs` matches, plus topics governing a concept that claims the file),
-each once with the files that bind it listed; then `--topic` topics; then at
-most two FTS neighbours for `--query`, labelled a guess (same filter and
-ranking as `search --mode fts --decisions-only`). Chains are rendered with
-`topic_chain_lines_capped` at 2000 bytes per topic, the current link in full.
+**Contents.** A fixed header paragraph naming the store path and how to read
+each authority: `owner-verbatim` and `owner-ratified` rulings bind,
+`reviewer-finding` and `code-derived` records are reported facts,
+`agent-inference` records are inference to weigh. An `Index state:` line. The
+standing digest, byte-identical to what `standing` prints (the same
+`standing_entries` projection and `standing_digest_text` rendering; if the
+digest is over the store-wide cap it is replaced by a one-line notice and the
+JSON envelope lists those topics in `standing_omitted`). Then the topics bound
+to each FILE, each once with the files that bind it listed; the `--topic`
+topics; and at most two FTS neighbours for `--query`, labelled a guess (same
+filter and ranking as `search --mode fts --decisions-only`; no vector path).
+Binding uses `resolve_path_governance`, the resolution `for-path` renders
+from: `code_refs` matches plus the topics governing a concept that claims the
+file. A topic that is both named and bound is shown once, under "Named
+explicitly".
 
-**Cap and ordering.** `--max-bytes` (default 12000) bounds the pack text, the
-bytes above the final line. Bound and named topics are ranked by authority
-(`owner-verbatim`, `owner-ratified`, then the rest), then by how many of the
-brief's files they bind, then id; search neighbours rank last. The tail is
-dropped in whole topics, never mid-record, and the omission line names them.
-The header, state line and standing digest are never dropped: a cap smaller
-than those still emits them and omits every topic.
+**What a topic costs.** A topic's fixed cost is its header line plus its
+current link rendered in full; the current ruling is never shortened. The
+2000-byte per-topic budget pays only for older links on top of that fixed
+cost, and under a tight pack older links are shed first (with an "older
+link(s) omitted" marker) before the topic itself is dropped.
+
+**Cap and ordering.** `--max-bytes` (default 12000) is a hard cap on the pack
+text, the bytes above the final line, omission line included. Explicitly
+named topics rank first (authority, then id), then bound topics (authority,
+then how many of the brief's files they bind, then id), then search
+neighbours. Whole topics are dropped from the tail, never mid-record, and the
+omission line names them. When even the fixed part (header, state line,
+standing block, block labels, the omission line naming every candidate) is
+larger than the cap, nothing is printed and the command exits 2 with
+`max-bytes N too small: fixed part needs M bytes`; a non-positive value also
+exits 2.
 
 **Hash and determinism.** The last line is `pack sha256=<hex> bytes=<N>`,
 computed over the exact UTF-8 bytes of the text above it. The same store
@@ -3538,19 +3550,27 @@ state and arguments give the same bytes: no timestamps, a fixed per-topic
 budget independent of environment variables, and no dependence on file order
 beyond the order the files are given. `--json` returns `sha256`, `bytes`,
 `blind`, `text` (without the hash line), `topics` (`id` and `via`: the files,
-`standing`, `named` or `search`), `omitted` and `state`.
+`standing`, `named` or `search`, only for content actually delivered),
+`omitted`, `standing_omitted` and `state`.
+
+**Store path and exit codes.** The store path comes from `--root`, else
+`MEMCONTINUUM_ROOT`; with neither the command exits 2 (`store root unknown:
+pass --root or set MEMCONTINUUM_ROOT`) rather than print a placeholder. Exit
+1 means the index is missing, uninitialized or unreadable; exit 2 is a usage
+error; everything else emits a pack.
 
 **Index state.** Reads go through the read-only opener, so nothing is
 written. Unlike `standing`, which refuses on anything but `current`, a pack
 is still emitted on `stale`, `quarantined` and `upgrade-required` (naming the
-state), because a reviewer sent in blind by an out-of-date index is worse
-than one given records with a caveat; a schema the read-only open cannot
-read, `missing` and `uninitialized` exit 1 with a one-line reason. Pass
-`--root STORE` to let `stale` be detected.
+state), because a reviewer sent in blind by an out-of-date index is worse than
+one given records with a caveat. Only an older schema the read-only open
+cannot query at all exits 1 (`upgrade-required: index unreadable, run
+reindex`). Pass `--root STORE` to let `stale` be detected.
 
-**Blind mode.** `--blind` opens no index and prints only a fixed notice that
-no decision records were supplied, plus its hash line, so a blind review is
-recorded as such and carries nothing memory-shaped.
+**Blind mode.** `--blind` opens no index, needs no store root, and prints
+only a fixed notice that no decision records were supplied, plus its hash
+line, so a blind review is recorded as such and carries nothing
+memory-shaped.
 
 ## CLI semantics
 

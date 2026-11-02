@@ -1,0 +1,83 @@
+{
+  "results": [
+    {
+      "id": "TOP-9801",
+      "title": "Direct",
+      "current": "L1",
+      "links": [
+        {
+          "topic_path": "@ROOT@/topics/d.md",
+          "topic_id": "TOP-9801",
+          "project": "default",
+          "link": "L1",
+          "seq": 0,
+          "date": "2026-01-01",
+          "status": "active",
+          "kind": "adopted",
+          "reverses": null,
+          "reason_for_change": null,
+          "ruling_text": "direct ruling",
+          "ruling_authority": "owner-verbatim",
+          "ruling_source": "s",
+          "rationale_text": null,
+          "rationale_authority": null,
+          "superseded_by": null,
+          "revisit_if": "[]",
+          "recorded_by": "agent",
+          "recorded_at": "2026-01-01",
+          "invariant": null,
+          "evidence": null,
+          "edges": [],
+          "assumptions": []
+        }
+      ],
+      "broken_assumptions": []
+    },
+    {
+      "id": "CON-9801",
+      "kind": "concept",
+      "title": "Service concept",
+      "owner_boundary": "the service boundary",
+      "implemented_by": [
+        "src/svc.py"
+      ],
+      "tested_by": [],
+      "governed_by": [
+        {
+          "id": "TOP-9802",
+          "title": "Governing",
+          "current": "L1",
+          "links": [
+            {
+              "topic_path": "@ROOT@/topics/g.md",
+              "topic_id": "TOP-9802",
+              "project": "default",
+              "link": "L1",
+              "seq": 0,
+              "date": "2026-01-01",
+              "status": "active",
+              "kind": "adopted",
+              "reverses": null,
+              "reason_for_change": null,
+              "ruling_text": "governed ruling",
+              "ruling_authority": "owner-ratified",
+              "ruling_source": "s",
+              "rationale_text": null,
+              "rationale_authority": null,
+              "superseded_by": null,
+              "revisit_if": "[]",
+              "recorded_by": "agent",
+              "recorded_at": "2026-01-01",
+              "invariant": null,
+              "evidence": null,
+              "edges": [],
+              "assumptions": []
+            }
+          ],
+          "broken_assumptions": []
+        }
+      ]
+    }
+  ],
+  "chain_text": "TOP-9801 Direct \u2014 current: L1 (active, owner-verbatim)\n  L1 2026-01-01 adopted   \"direct ruling\" (owner-verbatim)\nCON-9801 Service concept \u2014 the service boundary\nTOP-9802 Governing \u2014 current: L1 (active, owner-ratified)\n  L1 2026-01-01 adopted   \"governed ruling\" (owner-ratified)"
+}

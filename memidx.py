@@ -4622,23 +4622,41 @@ def print_topic_chain(conn, topic_row) -> None:
         print(line)
 
 
-def for_path_chain_lines(conn, project: str, matches, concept_matches) -> list:
+def resolve_path_governance(conn, project: str, file_path: str) -> tuple:
+    """What governs `file_path`: `(topic_rows, [(concept_row, [governed
+    topic rows])])` -- the topics whose code_refs match it, and each concept
+    claiming it with the topics that concept is governed_by. The one
+    resolution `for-path` (text and JSON) and `context-pack` all render from;
+    the concept/governed association is preserved because `for-path` prints
+    it."""
+    matches = topic_matches_for_path(conn, project, file_path)
+    pairs = [
+        (crow, governed_topic_rows(conn, project, crow))
+        for crow in concept_matches_for_path(conn, project, file_path)
+    ]
+    return matches, pairs
+
+
+def for_path_chain_lines(conn, project: str, matches, concept_pairs) -> list:
     """`for-path`'s plain-text rendering, shared by its own non-JSON CLI
     mode and by `--json --with-chain-text` (round 5): one function, one
-    text, whichever mode asks for it -- no duplicated formatting."""
+    text, whichever mode asks for it -- no duplicated formatting.
+    `concept_pairs` is resolve_path_governance's second element."""
     lines = []
-    if not matches and not concept_matches:
+    if not matches and not concept_pairs:
         lines.append("no topics reference this path")
     for row in matches:
         lines.extend(topic_chain_lines(conn, row))
-    for crow in concept_matches:
+    for crow, governed in concept_pairs:
         lines.append(f"{crow['id']} {crow['title']} — {crow['owner_boundary']}")
-        for trow in governed_topic_rows(conn, project, crow):
+        for trow in governed:
             lines.extend(topic_chain_lines(conn, trow))
     return lines
 
 
-def concept_json(conn, project: str, concept_row) -> dict:
+def concept_json(conn, project: str, concept_row, governed_rows=None) -> dict:
+    if governed_rows is None:
+        governed_rows = governed_topic_rows(conn, project, concept_row)
     return {
         "id": concept_row["id"],
         "kind": "concept",
@@ -4647,7 +4665,7 @@ def concept_json(conn, project: str, concept_row) -> dict:
         "implemented_by": json.loads(concept_row["implemented_by"] or "[]"),
         "tested_by": json.loads(concept_row["tested_by"] or "[]"),
         "governed_by": [
-            topic_chain_json(conn, t) for t in governed_topic_rows(conn, project, concept_row)
+            topic_chain_json(conn, t) for t in governed_rows
         ],
     }
 
@@ -4674,12 +4692,11 @@ def cmd_for_path(args) -> int:
             return _for_path_missing_reply(args, "missing")
         if state in ("upgrade-required", "stale", "quarantined"):
             _decision_warn("for-path", args, state, conn=conn)
-        matches = topic_matches_for_path(conn, args.project, args.file_path)
-        concept_matches = concept_matches_for_path(conn, args.project, args.file_path)
+        matches, concept_pairs = resolve_path_governance(conn, args.project, args.file_path)
 
         if args.json:
             out = [topic_chain_json(conn, row) for row in matches]
-            out.extend(concept_json(conn, args.project, crow) for crow in concept_matches)
+            out.extend(concept_json(conn, args.project, crow, governed) for crow, governed in concept_pairs)
             # Item 2: --json carries state when opted into --root and the
             # state is worth naming -- see cmd_search's identical gate.
             state_worth_naming = root is not None and state in ("upgrade-required", "stale", "quarantined")
@@ -4695,7 +4712,7 @@ def cmd_for_path(args) -> int:
                     payload["state"] = state
                 payload["results"] = out
                 payload["chain_text"] = "\n".join(
-                    for_path_chain_lines(conn, args.project, matches, concept_matches)
+                    for_path_chain_lines(conn, args.project, matches, concept_pairs)
                 )
                 print(json.dumps(payload, indent=2))
             elif state_worth_naming:
@@ -4703,7 +4720,7 @@ def cmd_for_path(args) -> int:
             else:
                 print(json.dumps(out, indent=2))
         else:
-            for line in for_path_chain_lines(conn, args.project, matches, concept_matches):
+            for line in for_path_chain_lines(conn, args.project, matches, concept_pairs):
                 print(line)
         conn.close()
         return 0
@@ -6177,15 +6194,16 @@ def pack_hash_line(text: str) -> tuple[str, int, str]:
     return sha, len(raw), f"pack sha256={sha} bytes={len(raw)}"
 
 
-def bound_topic_rows_for_path(conn, project: str, file_path: str) -> list:
-    """Every topic row bound to a repo-relative `file_path`: topics whose
-    code_refs match it (topic_matches_for_path) followed by topics governing
-    a concept that claims it (concept_matches_for_path + governed_topic_rows)
-    -- the same two resolutions `for-path` renders, as rows, deduped."""
-    rows = list(topic_matches_for_path(conn, project, file_path))
+def bound_topic_rows(conn, project: str, file_path: str) -> list:
+    """Every topic row bound to a repo-relative `file_path`, deduped: the
+    direct matches, then the topics governing a concept that claims it --
+    flattened from resolve_path_governance, the one resolution `for-path`
+    renders from too."""
+    matches, pairs = resolve_path_governance(conn, project, file_path)
+    rows = list(matches)
     seen = {r["path"] for r in rows}
-    for crow in concept_matches_for_path(conn, project, file_path):
-        for trow in governed_topic_rows(conn, project, crow):
+    for _crow, governed in pairs:
+        for trow in governed:
             if trow["path"] not in seen:
                 seen.add(trow["path"])
                 rows.append(trow)
@@ -6229,25 +6247,55 @@ def _pack_search_topic_rows(conn, project: str, query: str, skip_paths: set) -> 
     return out
 
 
+def _pack_topic_variants(conn, topic_row) -> list:
+    """Chain-line renderings of one topic, fullest first. The topic's FIXED
+    cost is its header line plus its current link rendered IN FULL; the
+    2000-byte budget (CONTEXT_PACK_TOPIC_CHAIN_BYTES) pays only for OLDER
+    links on top of that. So the budget handed to topic_chain_lines_capped is
+    never below the fixed cost, which keeps its truncation branch (the one
+    that cuts a ruling mid-text) unreachable. The second variant keeps only
+    the fixed part plus the 'older link(s) omitted' marker, for a pack tight
+    enough that the older links do not fit."""
+    link_rows = conn.execute(
+        "SELECT * FROM links WHERE topic_path=? ORDER BY seq ASC", (topic_row["path"],)
+    ).fetchall()
+    cur = _chain_current_link(link_rows)
+    fixed = len(_chain_header_line(topic_row, cur).encode("utf-8"))
+    if cur is not None:
+        fixed += _lines_cost(_chain_link_lines(topic_row, cur, edges_for_topic(conn, topic_row["path"])))
+    full = topic_chain_lines_capped(conn, topic_row, max(CONTEXT_PACK_TOPIC_CHAIN_BYTES, fixed))
+    variants = [full]
+    if len(link_rows) > 1:
+        marker_cost = _lines_cost([f"  [... {len(link_rows) - 1} older link(s) omitted]"])
+        minimal = topic_chain_lines_capped(conn, topic_row, fixed + marker_cost)
+        if minimal != full:
+            variants.append(minimal)
+    return variants
+
+
 def build_context_pack(conn, project: str, files: list, topic_ids: list, query: str | None,
                        store: str, state: str, max_bytes: int) -> dict:
     """Assemble the pack (see cmd_context_pack). Returns the JSON envelope
-    minus the hash fields: {text, topics, omitted}. Pure over `conn`."""
+    minus the hash fields -- {text, topics, omitted, standing_omitted} -- or
+    {"error": msg} when even the fixed part exceeds `max_bytes`. Pure over
+    `conn`; `max_bytes` is a hard cap on the returned text."""
     # Standing block: the very projection `standing` prints.
     entries = standing_entries(conn, project)
     lines = [standing_line(tid, lid, auth, text) for tid, lid, auth, text in entries]
     digest = standing_digest_text(lines)
+    standing_via: dict = {}
+    standing_omitted: list = []
     if len(lines) > STANDING_CAP_LINKS or len(digest.encode("utf-8")) > STANDING_CAP_BYTES:
         digest = ("Standing decisions: not included -- the digest exceeds the store-wide cap "
                   "(run `standing` for details).")
-    standing_via: dict = {}
-    for tid, _lid, _auth, _text in entries:
-        standing_via.setdefault(tid, ["standing"])
+        standing_omitted = list(dict.fromkeys(tid for tid, _l, _a, _t in entries))
+    else:
+        for tid, _lid, _auth, _text in entries:
+            standing_via.setdefault(tid, ["standing"])
 
-    # Candidates: bound + named (ranked), then search (tail).
     cands: dict = {}   # topic path -> dict(row, files, named)
     for f in files:
-        for trow in bound_topic_rows_for_path(conn, project, f):
+        for trow in bound_topic_rows(conn, project, f):
             c = cands.setdefault(trow["path"], {"row": trow, "files": [], "named": False})
             c["files"].append(f)
     missing_named = []
@@ -6258,13 +6306,15 @@ def build_context_pack(conn, project: str, files: list, topic_ids: list, query: 
             continue
         c = cands.setdefault(trow["path"], {"row": trow, "files": [], "named": False})
         c["named"] = True
-    ranked = sorted(
-        cands.values(),
-        key=lambda c: (_pack_topic_authority_rank(conn, c["row"]), -len(c["files"]), c["row"]["id"]),
-    )
-    for c in ranked:
-        c["kind"] = "bound" if c["files"] else "named"
+    for c in cands.values():
+        c["rank"] = _pack_topic_authority_rank(conn, c["row"])
         c["id"] = c["row"]["id"]
+        c["kind"] = "named" if c["named"] else "bound"
+    # Explicitly named topics first (authority, id), then bound ones
+    # (authority, file count, id), then search neighbours: the cap eats the tail.
+    ranked = sorted((c for c in cands.values() if c["named"]), key=lambda c: (c["rank"], c["id"]))
+    ranked += sorted((c for c in cands.values() if not c["named"]),
+                     key=lambda c: (c["rank"], -len(c["files"]), c["id"]))
     if query:
         for trow in _pack_search_topic_rows(conn, project, query, set(cands)):
             ranked.append({"row": trow, "files": [], "named": False, "kind": "search",
@@ -6274,53 +6324,76 @@ def build_context_pack(conn, project: str, files: list, topic_ids: list, query: 
         if c["files"]:
             meta += f"; bound to: {', '.join(c['files'])}"
         meta += "]"
-        c["lines"] = [meta] + topic_chain_lines_capped(
-            conn, c["row"], CONTEXT_PACK_TOPIC_CHAIN_BYTES)
+        c["variants"] = [[meta] + v for v in _pack_topic_variants(conn, c["row"])]
 
-    def render(k: int) -> str:
-        sel = ranked[:k]
+    def render(sel: list) -> str:
+        """`sel`: [(candidate, lines)] in rank order; every other candidate
+        is named in the omission line."""
+        shown = {id(c) for c, _ in sel}
         out = [CONTEXT_PACK_HEADER.format(store=store).rstrip("\n"), f"Index state: {state}", "", digest]
         if files:
             out += ["", "Bound to the files in this brief:"]
-            bound_all = [c for c in ranked if c["kind"] == "bound"]
-            bound_sel = [c for c in sel if c["kind"] == "bound"]
-            if not bound_all:
-                out.append("  none of these files has a bound topic")
-            elif not bound_sel:
+            if not any(c["kind"] == "bound" for c in ranked):
+                out.append("  (shown under Named explicitly)" if any(c["files"] for c in ranked)
+                           else "  none of these files has a bound topic")
+            elif not any(c["kind"] == "bound" for c, _ in sel):
                 out.append("  (all omitted by the size cap -- see below)")
-            for c in bound_sel:
-                out += c["lines"]
+            for c, ls in sel:
+                if c["kind"] == "bound":
+                    out += ls
         if topic_ids:
             out += ["", "Named explicitly:"]
-            for c in (c for c in sel if c["kind"] == "named"):
-                out += c["lines"]
+            for c, ls in sel:
+                if c["kind"] == "named":
+                    out += ls
             out += [f"{tid}: not found in the index" for tid in missing_named]
         if query:
             out += ["", "Nearest by search -- may be unrelated (a guess, not bound to these files):"]
-            srch = [c for c in sel if c["kind"] == "search"]
             if not any(c["kind"] == "search" for c in ranked):
                 out.append("  none beyond the records above")
-            for c in srch:
-                out += c["lines"]
-        omitted = [c["id"] for c in ranked[k:]]
+            for c, ls in sel:
+                if c["kind"] == "search":
+                    out += ls
+        omitted = [c["id"] for c in ranked if id(c) not in shown]
         if omitted:
             out += ["", f"[{len(omitted)} topic(s) omitted by the size cap: {', '.join(omitted)}]"]
         return "\n".join(out) + "\n"
 
-    k = len(ranked)
-    while k > 0 and len(render(k).encode("utf-8")) > max_bytes:
-        k -= 1
-    text = render(k)
+    def size(text: str) -> int:
+        return len(text.encode("utf-8"))
+
+    fixed_size = size(render([]))
+    if fixed_size > max_bytes:
+        return {"error": f"max-bytes {max_bytes} too small: fixed part needs {fixed_size} bytes"}
+    sel: list = []
+    for c in ranked:
+        for lines_variant in c["variants"]:
+            if size(render(sel + [(c, lines_variant)])) <= max_bytes:
+                sel.append((c, lines_variant))
+                break
+        else:
+            break   # whole topics from the tail: this and every later one is omitted
+    text = render(sel)
     topics = [{"id": tid, "via": list(v)} for tid, v in standing_via.items()]
     by_id = {t["id"]: t for t in topics}
-    for c in ranked[:k]:
+    for c, _ls in sel:
         via = list(c["files"]) + (["named"] if c["named"] else []) + (["search"] if c["kind"] == "search" else [])
         if c["id"] in by_id:
             by_id[c["id"]]["via"].extend(via)
         else:
             by_id[c["id"]] = {"id": c["id"], "via": via}
             topics.append(by_id[c["id"]])
-    return {"text": text, "topics": topics, "omitted": [c["id"] for c in ranked[k:]]}
+    shown_ids = {id(c) for c, _ in sel}
+    return {"text": text, "topics": topics, "standing_omitted": standing_omitted,
+            "omitted": [c["id"] for c in ranked if id(c) not in shown_ids]}
+
+
+def _pack_refusal(args, rc: int, message: str, **extra) -> int:
+    """One stderr line (and, under --json, a JSON error object), no pack."""
+    print(f"context-pack: {message}", file=sys.stderr)
+    if getattr(args, "json", False):
+        print(json.dumps({"error": message, **extra}, indent=2))
+    return rc
 
 
 def cmd_context_pack(args) -> int:
@@ -6328,46 +6401,57 @@ def cmd_context_pack(args) -> int:
     [--blind] [--max-bytes N] [--json]` -- one paste-ready block of decision
     records for an external reviewer's or dispatched agent's brief (TOP-0135).
     Read-only throughout (open_db_readonly): standing digest (byte-identical
-    to `standing`), then topics bound to FILE..., then --topic, then a
+    to `standing`), then --topic topics, topics bound to FILE..., and a
     labelled FTS guess for --query. Whole topics are dropped from the tail
-    under --max-bytes and named; the cap covers the pack text above the last
-    line, which is `pack sha256=<hex> bytes=<N>` over those exact bytes.
-    --blind opens no index and prints only the fixed blind-review notice."""
+    under --max-bytes and named; the cap is hard (text above the last line,
+    omission line included). The last line is `pack sha256=<hex> bytes=<N>`
+    over those exact bytes. --blind opens no index and prints only the fixed
+    notice. Exit codes: 0 pack; 1 index missing, uninitialized or unreadable;
+    2 usage (non-positive or too-small --max-bytes, unknown store root)."""
     as_json = bool(getattr(args, "json", False))
     if getattr(args, "blind", False):
         text = CONTEXT_PACK_BLIND_TEXT
         sha, nbytes, line = pack_hash_line(text)
         if as_json:
             print(json.dumps({"sha256": sha, "bytes": nbytes, "blind": True, "text": text,
-                              "topics": [], "omitted": [], "state": "blind"}, indent=2))
+                              "topics": [], "omitted": [], "standing_omitted": [],
+                              "state": "blind"}, indent=2))
         else:
             print(text + line)
         return 0
-    db_path = resolve_db_path(args)
+    max_bytes = getattr(args, "max_bytes", CONTEXT_PACK_DEFAULT_MAX_BYTES)
+    if max_bytes is None or max_bytes <= 0:
+        return _pack_refusal(args, 2, f"max-bytes must be a positive number of bytes (got {max_bytes})")
     root = Path(args.root).resolve() if getattr(args, "root", None) else None
+    store = str(root) if root else os.environ.get("MEMCONTINUUM_ROOT")
+    if not store:
+        return _pack_refusal(args, 2, "store root unknown: pass --root or set MEMCONTINUUM_ROOT")
+    db_path = resolve_db_path(args)
     state = decision_index_state_readonly(db_path, args.project, root=root)
     if state in ("missing", "uninitialized"):
         return _decision_reply("context-pack", args, state)
     conn = open_db_readonly(db_path)
     if conn is None:
         return _decision_reply("context-pack", args, "missing")
-    store = str(root) if root else (os.environ.get("MEMCONTINUUM_ROOT") or "<store root not configured>")
     files = list(dict.fromkeys(getattr(args, "files", None) or []))
     try:
         built = build_context_pack(
             conn, args.project, files, list(getattr(args, "topic", None) or []),
-            getattr(args, "query", None), store, state,
-            getattr(args, "max_bytes", None) or CONTEXT_PACK_DEFAULT_MAX_BYTES,
+            getattr(args, "query", None), store, state, max_bytes,
         )
     except (sqlite3.OperationalError, IndexError):
-        # A legacy schema a read-only open cannot paper over.
-        return _decision_reply("context-pack", args, "upgrade-required")
+        # A legacy schema the read-only open cannot read (a missing column).
+        return _pack_refusal(args, 1, "upgrade-required: index unreadable, run reindex",
+                             state="upgrade-required")
     finally:
         conn.close()
+    if "error" in built:
+        return _pack_refusal(args, 2, built["error"])
     sha, nbytes, line = pack_hash_line(built["text"])
     if as_json:
         print(json.dumps({"sha256": sha, "bytes": nbytes, "blind": False, "text": built["text"],
-                          "topics": built["topics"], "omitted": built["omitted"], "state": state},
+                          "topics": built["topics"], "omitted": built["omitted"],
+                          "standing_omitted": built["standing_omitted"], "state": state},
                          indent=2))
     else:
         print(built["text"] + line)
