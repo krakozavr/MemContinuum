@@ -35,7 +35,7 @@ import time
 import traceback
 import urllib.parse
 from collections import Counter
-from datetime import datetime, timedelta, timezone
+from datetime import date as _date, datetime, timedelta, timezone
 from pathlib import Path
 from stat import S_ISREG
 from urllib.parse import quote
@@ -12221,7 +12221,7 @@ def _now() -> datetime:
 
 def _flow_list_parts(rest: str):
     """`(inner, tail)` of a one-line flow list `[a, b]  # note`, else None."""
-    m = re.fullmatch(r"\[(.*)\](\s*#.*)?", rest)
+    m = re.fullmatch(r"\[([^\[\]]*)\](\s*#.*)?", rest)
     return (m.group(1), m.group(2) or "") if m else None
 
 
@@ -12320,8 +12320,10 @@ def cmd_mark_standing(args) -> int:
         if not value.strip():
             print(f"mark-standing: {name} must not be empty", file=sys.stderr)
             return 1
-        if len(value.splitlines()) != 1:
-            print(f"mark-standing: {name} must be a single line", file=sys.stderr)
+        parts = value.splitlines()
+        if len(parts) != 1 or parts[0] != value:
+            print(f"mark-standing: {name} must be a single line (no leading or trailing "
+                  "line break)", file=sys.stderr)
             return 1
     path = _topic_file_for_id(root, args.topic)
     if path is None:
@@ -12381,8 +12383,16 @@ def cmd_mark_standing(args) -> int:
         if not rows or standing_mark_ident(rows[0]) != ident or sum(
                 1 for r in rows if standing_mark_ident(r) == ident) != 1:
             return "the edit would not put the new row first, once"
-        if any(str(rows[0].get(k)) != str(row[k]) for k in STANDING_MARK_FIELDS):
-            return "the edit would not round-trip the new row's fields as written"
+        # YAML must read every field back as the string written (`True`, `123`,
+        # `2026-11-03` would be retyped); only `date` is a date, equal to recorded_at's
+        for k in STANDING_MARK_FIELDS:
+            got = rows[0].get(k)
+            if k == "date":
+                if not (isinstance(got, _date) and not isinstance(got, datetime)
+                        and got.isoformat() == recorded_at[:10]):
+                    return "the edit would not round-trip the new row's date as written"
+            elif not (isinstance(got, str) and got == row[k]):
+                return "the edit would not round-trip the new row's fields as written"
         if rows[1:] != old_rows:
             return "the edit would not leave the earlier rows unchanged"
         return None

@@ -236,6 +236,11 @@ class TestMarksPlainLint(ErrCase):
                               marks=marks_block(mark_yaml("L3"), mark_yaml("L2", action="remove", recorded_at="2026-11-02T08:00:00-05:00")))
         self.assertEqual(errors, [], errors)
 
+    def test_recorded_by_must_be_a_string(self):
+        errors, _ = self.lint(standing="standing: [L2, L3]\n",
+                              marks=marks_block(mark_yaml("L3", by="true")))
+        self.assertError(errors, "recorded_by True is not a string")
+
     def test_duplicate_identity(self):
         errors, _ = self.lint(marks=marks_block(mark_yaml(), mark_yaml(why="again")))
         self.assertError(errors, "duplicate row")
@@ -443,6 +448,15 @@ class TestMarkStandingCommand(MarkCase):
                 self.assertEqual(rc, 1, err)
                 self.assertEqual(self.read(), text)
 
+    def test_trailing_and_leading_line_breaks_are_refused(self):
+        text = self.write(topic_text(standing="standing: [L2]\n"))
+        for value in ("because\n", "because\r", "because\r\n", "\nbecause", "\r\nbecause"):
+            for flag in ("why", "source"):
+                with self.subTest(value=value, flag=flag):
+                    rc, _o, err = self.mark("L3", "--add", **{flag: value})
+                    self.assertEqual(rc, 1, err)
+                    self.assertEqual(self.read(), text)
+
     def test_agent_authority_is_not_accepted(self):
         with self.assertRaises(SystemExit):
             with contextlib.redirect_stderr(io.StringIO()):
@@ -469,6 +483,41 @@ class TestMarkStandingCommand(MarkCase):
         rc, _o, err = self.mark("L3", "--add", extra=("--recorded-by", "yes"))
         self.assertEqual(rc, 1, err)
         self.assertEqual(self.read(), text)
+
+    def test_recorded_by_values_yaml_would_retype_are_refused(self):
+        text = self.write(topic_text(standing="standing: [L2]\n"))
+        for value in ("True", "False", "123", "2026-11-03", "yes", "01"):
+            with self.subTest(value=value):
+                rc, _o, err = self.mark("L3", "--add", extra=("--recorded-by", value))
+                self.assertEqual(rc, 1, err)
+                self.assertEqual(self.read(), text)
+
+    def test_marks_follow_standing_even_when_links_come_first(self):
+        # documented behaviour: the block goes immediately after `standing:`, so a file whose
+        # `links:` precedes `standing:` keeps every link byte where it was
+        base = topic_text(standing="")
+        text = self.write(base.replace("---\n\nBody.\n", "standing: [L2]\n---\n\nBody.\n"))
+        self.assertLess(text.index("\nlinks:"), text.index("standing: [L2]"))
+        rc, _o, err = self.mark("L3", "--add")
+        self.assertEqual(rc, 0, err)
+        new = self.read()
+        lines = new.splitlines()
+        self.assertEqual(lines[lines.index("standing: [L2, L3]") + 1], "standing_marks:")
+        self.assertIn(DEFAULT_LINKS[0] + DEFAULT_LINKS[1], new)
+        self.assertLintClean()
+
+    def test_flow_list_with_brackets_in_its_trailing_comment(self):
+        self.write(topic_text(standing="standing: [L2] # keep [owner]\n"))
+        rc, _o, err = self.mark("L3", "--add")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("\nstanding: [L2, L3] # keep [owner]\n", self.read())
+        rc, _o, err = self.mark("L2", "--remove")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("\nstanding: [L3] # keep [owner]\n", self.read())
+        rc, _o, err = self.mark("L3", "--remove")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("\nstanding: [] # keep [owner]\n", self.read())
+        self.assertLintClean()
 
     def test_every_write_reparses_with_earlier_bytes_untouched(self):
         original = self.write(topic_text(standing="standing: [L2]\n", marks=marks_block(mark_yaml("L2", recorded_at="2026-11-01T08:00:00-05:00"))))
@@ -703,10 +752,13 @@ class TestLinkOrderAndCurrent(GuardCase):
         with mock.patch.object(memlint, "_link_order_errors", return_value=[]):
             self.assertClean(base_text(links=swapped, current="L2"))
 
-    def test_new_links_may_sit_between_old_ones_in_order(self):
-        # in-order interleave is a different rule's business (inserted out of order)
+    def test_a_new_link_between_old_ones_is_refused_by_the_newest_first_rule_not_g3(self):
+        # the old ids keep their relative order, so g3 is silent; the older newest-first
+        # check is what refuses a new id sitting below an old one
         rc, out = self.guard(base_text(links=(G_LINKS[0], link_yaml("L9"), G_LINKS[1], G_LINKS[2])))
+        self.assertEqual(rc, 1, out)
         self.assertNotIn("links reordered", out)
+        self.assertIn("L9: link inserted out of order", out)
 
     def test_bare_current_flip_refused(self):
         out = self.assertRefused(base_text(current="L2"), "current: 'L2' does not match the newest active link",
@@ -784,6 +836,84 @@ class TestAddedTopics(GuardCase):
         self.assertEqual(rc, 0, out)
 
 
+REF_TAGS_BAD_NO_LINKS = (
+    "---\ntype: topic\nid: TOP-9100\ntitle: Marks fixture\narea: memory\ncurrent: L2\n"
+    "tags: not-a-list\nstanding: [L2]\n" + marks_block(M2) + "links: []\n---\n\nBody.\n"
+)
+
+
+class TestRepairShapes(GuardCase):
+    """F1: REF shapes whose links are unrecoverable still get g1-g4 unless the
+    standing set itself is unknown (fallback parse)."""
+
+    def test_shape_invalid_ref_with_no_links_still_pairs_new_standing(self):
+        ref = topic_text(standing="standing: []\n", links=(), current=None).replace(
+            "tags: []", "tags: not-a-list")
+        self.assertFalse(memidx.parse_record_text(ref, "x").valid)
+        self.store(ref)
+        self.assertRefused(topic_text(), "standing changed for L2 (add) with no matching standing_marks row")
+
+    def test_shape_invalid_ref_with_marks_pairs_a_second_id(self):
+        self.store(REF_TAGS_BAD_NO_LINKS)
+        self.assertRefused(base_text(standing="standing: [L2, L3]\n"),
+                           "standing changed for L3 (add) with no matching standing_marks row")
+
+    def test_shape_invalid_ref_tags_only_repair_stays_clean(self):
+        self.store(REF_TAGS_BAD_NO_LINKS)
+        rc, out = self.guard(base_text())
+        self.assertEqual(rc, 0, out)
+
+    def test_shape_invalid_ref_matched_add_is_clean(self):
+        self.store(REF_TAGS_BAD_NO_LINKS)
+        self.assertClean(base_text(standing="standing: [L2, L3]\n", marks=marks_block(NEW3, M2)))
+
+    def test_fallback_ref_cannot_pair_and_says_so(self):
+        ref = base_text().replace("title: Marks fixture", "title: Marks: fixture")
+        self.assertTrue(memidx.parse_record_text(ref, "x").fallback)
+        self.store(ref)
+        rc, out = self.guard(base_text(standing="standing: [L2, L3]\n"))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("standing membership at HEAD unrecoverable (fallback parse); pairing not checked", out)
+        self.assertIn("foo.md", out)
+
+    def test_fallback_ref_still_applies_the_row_rules_to_new_rows(self):
+        ref = base_text().replace("title: Marks fixture", "title: Marks: fixture")
+        self.store(ref)
+        self.assertRefused(base_text(standing="standing: [L2, L3]\n",
+                                     marks=marks_block(mark_yaml("L3", authority="agent-inference"), M2)),
+                           "authority 'agent-inference' must be one of")
+
+
+class TestStagedRules(GuardCase):
+    """F2: the plain-mode row and pointer rules run on the staged blob in the guard."""
+
+    def test_agent_inference_row_refused_in_the_staged_blob(self):
+        self.store(base_text(marks=""))
+        self.assertRefused(base_text(standing="standing: [L2, L3]\n",
+                                     marks=marks_block(mark_yaml("L3", authority="agent-inference"))),
+                           "authority 'agent-inference' must be one of")
+
+    def test_duplicate_standing_ids_refused_in_the_staged_blob(self):
+        self.assertRefused(base_text(standing="standing: [L2, L2]\n"), "standing lists 'L2' more than once")
+
+    def test_ineligible_pointer_refused_in_the_staged_blob(self):
+        self.assertRefused(base_text(standing="standing: [L2, L1]\n",
+                                     marks=marks_block(mark_yaml("L1"), M2)),
+                           "standing link 'L1' is 'historical', not active")
+
+    def test_added_file_with_current_not_the_head_refused(self):
+        self.store()
+        TestAddedTopics.assertRefusedNew(self, base_text(tid="TOP-9200", current="L2",
+                                                         marks=marks_block(mark_yaml("L2", recorded_at=STAMP))),
+                                         "current: 'L2' does not match the newest active link")
+
+    def test_added_file_with_agent_inference_row_refused(self):
+        self.store()
+        TestAddedTopics.assertRefusedNew(self, base_text(
+            tid="TOP-9200", marks=marks_block(mark_yaml("L2", authority="agent-inference"))),
+            "authority 'agent-inference' must be one of")
+
+
 def _symlinked(cls):
     return type(f"{cls.__name__}SymlinkedTmp", (SymlinkedTmpMixin, cls), {})
 
@@ -792,6 +922,8 @@ TestStandingPairingSymlinkedTmp = _symlinked(TestStandingPairing)
 TestMarksFreezeSymlinkedTmp = _symlinked(TestMarksFreeze)
 TestLinkOrderAndCurrentSymlinkedTmp = _symlinked(TestLinkOrderAndCurrent)
 TestAddedTopicsSymlinkedTmp = _symlinked(TestAddedTopics)
+TestRepairShapesSymlinkedTmp = _symlinked(TestRepairShapes)
+TestStagedRulesSymlinkedTmp = _symlinked(TestStagedRules)
 
 
 
@@ -943,6 +1075,10 @@ class TestStandingMarksThroughTheHook(TmpCase):
         # and the committed state is the next REF: a later bare removal is blocked again
         path.write_text(path.read_text().replace("standing: [L2, L3]", "standing: [L2]"))
         self.assertEqual(self.run_hook().returncode, 1)
+
+
+class TestStandingMarksThroughTheHookSymlinkedTmp(SymlinkedTmpMixin, TestStandingMarksThroughTheHook):
+    pass
 
 
 if __name__ == "__main__":

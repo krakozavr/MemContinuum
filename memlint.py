@@ -264,6 +264,9 @@ def _standing_marks_errors(path, fm: dict, topic_link_ids: set) -> list[str]:
             errors.append(f"{prefix}: authority {row.get('authority')!r} must be one of "
                           f"{sorted(CONSTRAINT_AUTHORITIES)} (an agent-inference mark would put a "
                           "constraint in every session start)")
+        if "recorded_by" not in missing and not isinstance(row.get("recorded_by"), str):
+            errors.append(f"{prefix}: recorded_by {row.get('recorded_by')!r} is not a string "
+                          "(YAML read it as another type; quote it)")
         why = row.get("why")
         if isinstance(why, str) and ("\n" in why or "\r" in why):
             errors.append(f"{prefix}: why must be a single line (no CR/LF)")
@@ -278,6 +281,34 @@ def _standing_marks_errors(path, fm: dict, topic_link_ids: set) -> list[str]:
                 errors.append(f"{prefix}: duplicate row -- (link, action, recorded_at) identifies a row once")
             seen.add(ident)
     return errors
+
+
+def _standing_pointer_errors(path, fm: dict, topic_links_by_id: dict) -> list[str]:
+    """Duplicate ids in `standing:` and the eligibility of every pointer
+    (memidx.standing_link_problems). One definition for the plain-mode
+    `lint_topic` and for the staged blob in `check_append_only` (TOP-0137 L14:
+    the hook lints the worktree, so the staged side needs the same rules)."""
+    errors: list[str] = []
+    standing_seen: set = set()
+    for lid in fm.get("standing") or []:
+        lid_str = str(lid)
+        if lid_str in standing_seen:
+            errors.append(f"{path}: standing lists {lid_str!r} more than once")
+            continue
+        standing_seen.add(lid_str)
+        errors.extend(
+            f"{path}: {problem}"
+            for problem in standing_link_problems(lid_str, topic_links_by_id.get(lid_str))
+        )
+    return errors
+
+
+def _staged_standing_errors(path, fm: dict, links: list) -> list[str]:
+    """The plain-mode `standing:` / `standing_marks:` rules, run on the blob
+    that is about to be committed (rows' fields and authority, duplicate and
+    ineligible pointers)."""
+    by_id = {str(l.get("link")): l for l in links if l.get("link")}
+    return _standing_pointer_errors(path, fm, by_id) + _standing_marks_errors(path, fm, set(by_id))
 
 
 def lint_topic(
@@ -478,17 +509,7 @@ def lint_topic(
     # in a standing ruling.text is rejected here; every other Unicode line
     # separator or tab is collapsed to one space by `standing_line` at
     # projection time -- defence in depth, not a lint error.)
-    standing_seen: set = set()
-    for lid in fm.get("standing") or []:
-        lid_str = str(lid)
-        if lid_str in standing_seen:
-            errors.append(f"{path}: standing lists {lid_str!r} more than once")
-            continue
-        standing_seen.add(lid_str)
-        errors.extend(
-            f"{path}: {problem}"
-            for problem in standing_link_problems(lid_str, topic_links_by_id.get(lid_str))
-        )
+    errors.extend(_standing_pointer_errors(path, fm, topic_links_by_id))
 
     errors.extend(_standing_marks_errors(path, fm, topic_link_ids))
 
@@ -2735,7 +2756,7 @@ def _standing_pairing_errors(full_path, old_ids: set, new_ids: set, new_pairs: l
 
 def _link_order_errors(full_path, old_links: list, new_links: list) -> list[str]:
     """g3: the link ids recorded at REF keep their relative file order in the
-    new blob (new ids may sit between them) -- the chain head is the first
+    new blob (new ids go on top: a new id between old ones is refused by the older newest-first check) -- the chain head is the first
     active link in file order, so a reorder is a silent re-ruling."""
     old_order = []
     for l in old_links:
@@ -2855,6 +2876,10 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
                     errors.extend(_standing_pairing_errors(
                         full_path, set(), set(standing_ids(added.frontmatter)),
                         [(str(r.get("link")), str(r.get("action"))) for r in added_rows]))
+                    # ... and the plain-mode rules on the STAGED blob (the hook lints only the
+                    # worktree copy, INC-0127): rows, pointers, `current:` == head
+                    errors.extend(_staged_standing_errors(full_path, added.frontmatter, links))
+                    errors.extend(_current_discipline_errors(full_path, {}, [], added.frontmatter, links))
                 errors.extend(_added_links_errors(full_path, links, set()))
             continue
 
@@ -2904,7 +2929,10 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
         repair_note = None
         if not old_result.valid:
             old_links = _recovered_old_links(old_result.frontmatter)
-            if old_links is None:
+            if old_links is None and (old_result.fallback or not old_result.frontmatter):
+                # Shapes (ii)/(iii) of TOP-0137 L14 F1: the lenient fallback parse (or no
+                # mapping at all) -- `standing` is not among the fallback fields, so the
+                # old membership is unknown and cannot be paired.
                 if new_result.valid:
                     # Grok M2 / whole-branch-review MODERATE-1: the REF-side
                     # blob never parsed -- it recorded no link history at all
@@ -2919,6 +2947,10 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
                         f"parsed ({old_reasons}); the new blob parses cleanly, so there is "
                         "no recorded link history here to protect"
                     )
+                    notes.append(
+                        f"{full_path}: standing membership at {ref} unrecoverable "
+                        "(fallback parse); pairing not checked"
+                    )
                     # Re-gate (Grok BLOCK on 90f3960): nothing to freeze,
                     # but every link in the repaired blob is NEW -- judge them.
                     # old_links is None here: REF recorded no recoverable
@@ -2931,12 +2963,14 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
                         full_path, _decode_or_none(old_blob), anchor_rows(old_result.frontmatter),
                         _decode_or_none(new_blob), anchor_rows(new_result.frontmatter), notes,
                     ))
-                    # ... and so do the standing marks (g1 only: REF recorded no usable
-                    # link or `standing:` history, so there is nothing to pair against)
+                    # ... and so do the standing marks (g1), and every row and pointer of the
+                    # new blob meets the plain-mode rules (pairing cannot run: see the note)
                     errors.extend(_standing_marks_freeze_errors(
                         full_path, _decode_or_none(old_blob), standing_mark_rows(old_result.frontmatter),
                         _decode_or_none(new_blob), standing_mark_rows(new_result.frontmatter),
                     ))
+                    errors.extend(_staged_standing_errors(
+                        full_path, new_result.frontmatter, new_result.frontmatter.get("links") or []))
                     continue
                 # Both sides unparseable: still fail closed (test_j: malformed
                 # -> malformed is still refused), reported from the OLD side's
@@ -2944,23 +2978,34 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
                 for field, message in old_result.diagnostics:
                     errors.append(f"{full_path}: {field}: {message} (at {ref})")
                 continue
-            # Grok re-gate MAJOR 1: the REF blob failed full validation but
-            # its `links` were still recovered (see _recovered_old_links) --
-            # there IS recorded link history here, so the repair/skip path
-            # above must not apply. Fall through to the ordinary comparison
-            # below using the recovered links instead.
-            old_reasons = "; ".join(message for _field, message in old_result.diagnostics)
-            raw_links = old_result.frontmatter.get("links")
-            dup_note = (
-                " (a duplicate link id was recovered as its first occurrence)"
-                if isinstance(raw_links, list) and len(raw_links) != len(old_links)
-                else ""
-            )
-            repair_note = (
-                f"{full_path}: the blob at {ref} could not be safely parsed "
-                f"({old_reasons}){dup_note}, but its links were recovered and are "
-                "still compared against the current blob for append-only violations"
-            )
+            if old_links is None:
+                # Shape (i): a parsed mapping whose links are absent/empty/id-less. Its
+                # `standing`, marks and `current` are on the dict: full g1-g4, no old links.
+                old_links = []
+                old_reasons = "; ".join(message for _field, message in old_result.diagnostics)
+                repair_note = (
+                    f"{full_path}: the blob at {ref} could not be safely parsed ({old_reasons}) and "
+                    "recorded no usable links; its standing, standing_marks and current are still "
+                    "compared against the current blob"
+                )
+            else:
+                # Grok re-gate MAJOR 1: the REF blob failed full validation but
+                # its `links` were still recovered (see _recovered_old_links) --
+                # there IS recorded link history here, so the repair/skip path
+                # above must not apply. Fall through to the ordinary comparison
+                # below using the recovered links instead.
+                old_reasons = "; ".join(message for _field, message in old_result.diagnostics)
+                raw_links = old_result.frontmatter.get("links")
+                dup_note = (
+                    " (a duplicate link id was recovered as its first occurrence)"
+                    if isinstance(raw_links, list) and len(raw_links) != len(old_links)
+                    else ""
+                )
+                repair_note = (
+                    f"{full_path}: the blob at {ref} could not be safely parsed "
+                    f"({old_reasons}){dup_note}, but its links were recovered and are "
+                    "still compared against the current blob for append-only violations"
+                )
         else:
             old_links = old_result.frontmatter.get("links") or []
 
@@ -3098,6 +3143,7 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
             full_path, old_result.frontmatter, old_text, new_result.frontmatter, new_text))
         errors.extend(_current_discipline_errors(
             full_path, old_result.frontmatter, old_links, new_result.frontmatter, new_links_full))
+        errors.extend(_staged_standing_errors(full_path, new_result.frontmatter, new_links_full))
 
     return errors, changed, notes
 
@@ -3220,9 +3266,11 @@ Append-only history mode (a second, independent check -- given
                      must be unchanged; its three lifecycle fields --
                      status, superseded_by, promoted_by -- may each move
                      forward once. A link removed, or a topic file deleted
-                     or renamed, is an error. New links, and changes to
-                     current/title/tags/code_refs/standing/the body text outside a
-                     link, are free. A REF that never parsed is repaired
+                     or renamed, is an error. New links (above every recorded
+                     one), and changes to title/tags/code_refs/the body text
+                     outside a link, are free; a `standing:` change needs its
+                     `standing_marks:` rows, link order is frozen, and `current`
+                     moves only with the newest active link. A REF that never parsed is repaired
                      (a note, not an error) when the new side now parses
                      cleanly -- there is no recorded link history to
                      freeze on a blob that was never validly a record.

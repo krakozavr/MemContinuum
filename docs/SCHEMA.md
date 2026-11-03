@@ -55,7 +55,7 @@ projection at the start of a session, unprompted, before any edit.
 ### Standing marks — the audit of `standing:` membership changes
 
 Every change to `standing:` leaves a dated, attributed row in `standing_marks:`, a block list written
-immediately after `standing:` (before `anchors:` and `links:`), newest row first. A row is **not a
+immediately after `standing:` (which by convention precedes `anchors:` and `links:`), newest row first. A row is **not a
 ruling**, the newest row is **not `current`**, and a `remove` row does **not** mean the link is
 inactive: it records only who changed the list, when, and on whose word. Rows are never delivered —
 not in the standing digest, not in a chain, a context pack or a pre-edit line — and never indexed;
@@ -361,7 +361,7 @@ pre-commit hook reads):
   topic needs one `add` row per `standing:` id; rows beside an empty `standing:` are orphans; a new
   topic with no `standing:` stays free.
 - *Link order is frozen (g3).* The link ids present at `REF` must keep their relative order in the
-  new blob (new links may be interleaved, by convention on top): `<path>: links reordered (L2 before
+  new blob (new links go on top; the older newest-first check refuses one placed between old ids): `<path>: links reordered (L2 before
   L3; the chain head is first-active-in-file-order)`. The chain head is the first active link in file
   order, so a reorder is a silent re-ruling; no per-link byte check sees one.
 - *`current:` moves with the head (g4).* A written `current:` must name the newest active link of the
