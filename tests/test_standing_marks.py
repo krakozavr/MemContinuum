@@ -495,5 +495,304 @@ class TestMarkStandingCommandSymlinkedTmp(SymlinkedTmpMixin, TestMarkStandingCom
     pass
 
 
+
+# ---------------------------------------------------------------------------
+# the guard: REF vs working tree AND REF vs staged blob
+# ---------------------------------------------------------------------------
+
+M2 = mark_yaml("L2", recorded_at="2026-11-01T08:00:00-05:00", why="first mark")
+M3 = mark_yaml("L3", recorded_at="2026-11-02T08:00:00-05:00", why="second mark")
+NEW3 = mark_yaml("L3", action="add", recorded_at=STAMP)
+
+# head L3 active, L2 active, L1 historical; the topic stands on L2
+G_LINKS = (link_yaml("L3", text="third"), link_yaml("L2", text="second"),
+           link_yaml("L1", status="historical", text="first"))
+
+
+def base_text(**kw):
+    kw.setdefault("standing", "standing: [L2]\n")
+    kw.setdefault("marks", marks_block(M2))
+    kw.setdefault("links", G_LINKS)
+    kw.setdefault("current", "L3")
+    return topic_text(**kw)
+
+
+class GuardCase(ErrCase, TmpCase):
+    """`guard(new_text)` runs the REF-vs-worktree and REF-vs-staged checks and
+    asserts they agree (the store hook reads the staged blob)."""
+
+    def setUp(self):
+        super().setUp()
+        self.root = None
+
+    def store(self, text=None):
+        self.stores = getattr(self, "stores", 0) + 1
+        self.root = git_store(self.tmp / f"store{self.stores}")
+        (self.root / "topics" / "foo.md").write_text(text if text is not None else base_text())
+        commit_all(self.root)
+        return self.root
+
+    def guard(self, new_text, rel="foo.md"):
+        if self.root is None:
+            self.store()
+        target = self.root / "topics" / rel
+        target.write_text(new_text)
+        rc_wt, out_wt = run_memlint(["--against-ref", "HEAD", str(self.root)])
+        git(["add", "-A"], self.root)
+        rc_st, out_st = run_memlint(["--against-ref", "HEAD", "--staged", str(self.root)])
+        self.assertEqual(rc_wt, rc_st, f"worktree vs staged disagree:\n{out_wt}\n{out_st}")
+        git(["reset", "-q"], self.root)
+        return rc_wt, out_wt
+
+    def assertClean(self, new_text):
+        rc, out = self.guard(new_text)
+        self.assertEqual(rc, 0, out)
+
+    def assertRefused(self, new_text, *needles):
+        rc, out = self.guard(new_text)
+        self.assertEqual(rc, 1, out)
+        for n in needles:
+            self.assertIn(n, out)
+        return out
+
+
+class TestStandingPairing(GuardCase):
+    def test_unchanged_file_is_clean(self):
+        self.store()
+        self.assertClean(base_text())
+
+    def test_bare_add_refused(self):
+        out = self.assertRefused(base_text(standing="standing: [L2, L3]\n"),
+                                 "standing changed for L3 (add) with no matching standing_marks row")
+
+    def test_bare_remove_refused(self):
+        self.assertRefused(base_text(standing="standing: []\n"),
+                           "standing changed for L2 (remove) with no matching standing_marks row")
+
+    def test_matched_add_passes(self):
+        self.assertClean(base_text(standing="standing: [L2, L3]\n", marks=marks_block(NEW3, M2)))
+
+    def test_matched_remove_passes(self):
+        gone = mark_yaml("L2", action="remove", recorded_at=STAMP)
+        self.assertClean(base_text(standing="standing: []\n", marks=marks_block(gone, M2)))
+
+    def test_supersession_pair_with_pointer_and_current_move_passes(self):
+        self.store(base_text(standing="standing: [L3]\n", marks=marks_block(M3)))
+        links = (
+            link_yaml("L4", text="fourth"),
+            link_yaml("L3", status="superseded", text="third", extra="").replace(
+                "    status: superseded\n", "    status: superseded\n    superseded_by: L4\n"),
+            link_yaml("L2", text="second"),
+            link_yaml("L1", status="historical", text="first"),
+        )
+        # both calls happen before ONE commit: {remove L3, add L4}
+        rows = (mark_yaml("L4", action="add", recorded_at="2026-11-03T09:12:42-05:00"),
+                mark_yaml("L3", action="remove", recorded_at=STAMP), M3)
+        self.assertClean(base_text(standing="standing: [L4]\n", marks=marks_block(*rows),
+                                   links=links, current="L4"))
+        # without the remove row the pointer drop is bare
+        self.assertRefused(base_text(standing="standing: [L4]\n", marks=marks_block(rows[0], M3),
+                                     links=links, current="L4"),
+                           "standing changed for L3 (remove) with no matching")
+
+    def test_orphan_row_refused(self):
+        self.assertRefused(base_text(marks=marks_block(NEW3, M2)),
+                           "orphan standing mark (L3, add): standing: did not change that way")
+
+    def test_duplicate_row_in_one_commit_refused(self):
+        again = mark_yaml("L3", action="add", recorded_at="2026-11-03T09:12:42-05:00")
+        self.assertRefused(base_text(standing="standing: [L2, L3]\n", marks=marks_block(again, NEW3, M2)),
+                           "duplicate standing mark for (L3, add) in one commit")
+
+    def test_net_empty_churn_is_two_orphans(self):
+        add_back = mark_yaml("L2", action="add", recorded_at="2026-11-03T09:12:42-05:00")
+        out = self.assertRefused(base_text(marks=marks_block(
+            add_back, mark_yaml("L2", action="remove", recorded_at=STAMP), M2)),
+            "orphan standing mark (L2, remove)", "orphan standing mark (L2, add)")
+
+    def test_reorder_with_same_set_needs_no_row(self):
+        self.store(base_text(standing="standing: [L2, L3]\n", marks=marks_block(M3, M2)))
+        self.assertClean(base_text(standing="standing: [L3, L2]\n", marks=marks_block(M3, M2)))
+
+    def test_flow_to_block_conversion_with_same_set_needs_no_row(self):
+        self.assertClean(base_text(standing="standing:\n  - L2\n"))
+
+    def test_first_marks_block_on_a_grandfathered_topic(self):
+        self.store(base_text(marks=""))
+        self.assertClean(base_text(standing="standing: [L2, L3]\n", marks=marks_block(NEW3)))
+        self.assertRefused(base_text(standing="standing: [L2, L3]\n", marks=""),
+                           "standing changed for L3 (add)")
+
+    def test_grandfathered_topic_unrelated_edit_is_clean(self):
+        self.store(base_text(marks=""))
+        links = (link_yaml("L4", text="fourth"),) + G_LINKS
+        self.assertClean(base_text(marks="", links=links, current="L4"))
+
+    def test_duplicate_standing_ids_do_not_hide_a_change(self):
+        self.assertRefused(base_text(standing="standing: [L2, L3, L3]\n"),
+                           "standing changed for L3 (add)")
+
+
+class TestMarksFreeze(GuardCase):
+    def test_edited_row_refused(self):
+        out = self.assertRefused(base_text(marks=marks_block(M2.replace("first mark", "EDITED"))),
+                                 "standing mark (L2, add, 2026-11-01T08:00:00-05:00)",
+                                 "row changed after being recorded")
+
+    def test_reformatted_row_refused(self):
+        self.assertRefused(base_text(marks=marks_block(M2.replace('why: "first mark"', "why: 'first mark'"))),
+                           "row reformatted, not appended")
+
+    def test_removed_row_refused(self):
+        self.assertRefused(base_text(marks=""), "row removed after being recorded")
+
+    def test_new_row_below_old_rows_refused(self):
+        self.store(base_text(standing="standing: [L2, L3]\n", marks=marks_block(M3, M2)))
+        newer = mark_yaml("L2", action="remove", recorded_at=STAMP)
+        self.assertRefused(base_text(standing="standing: [L3]\n", marks=marks_block(M3, M2, newer)),
+                           "marks not prepended")
+
+    def test_recorded_rows_swapped_refused(self):
+        self.store(base_text(standing="standing: [L2, L3]\n", marks=marks_block(M3, M2)))
+        self.assertRefused(base_text(standing="standing: [L2, L3]\n", marks=marks_block(M2, M3)),
+                           "recorded rows reordered")
+
+    def test_a_marks_block_the_walker_cannot_read_is_an_error_not_a_note(self):
+        flow = ("standing_marks: [{link: L3, action: add, date: 2026-11-03, "
+                f"recorded_at: \"{STAMP}\", recorded_by: t, authority: owner-ratified, "
+                "source: \"s\", why: \"w\"}]\n")
+        self.assertRefused(base_text(standing="standing: [L2, L3]\n", marks=flow),
+                           "could not extract the rows' raw text")
+        # ... and a recorded block that stops being readable
+        self.store(base_text())
+        self.assertRefused(base_text(marks=flow.replace("L3", "L2").replace(STAMP, "2026-11-01T08:00:00-05:00")),
+                           "could not extract")
+
+    def test_crlf_marks_block_round_trips(self):
+        self.store(base_text().replace("\n", "\r\n"))
+        new = base_text(standing="standing: [L2, L3]\n", marks=marks_block(NEW3, M2)).replace("\n", "\r\n")
+        self.assertClean(new)
+        # a mixed-ending rewrite of a recorded row is a reformat
+        bad = new.replace('why: "first mark"\r\n', 'why: "first mark"\n')
+        self.assertRefused(bad, "row reformatted, not appended")
+
+    def test_repair_branch_still_freezes_the_rows(self):
+        root = git_store(self.tmp / "repair")
+        self.root = root
+        broken = base_text().replace("tags: []", "tags: not-a-list", 1)
+        broken = broken.split("links:")[0] + "links: []\n---\n\nBody.\n"
+        (root / "topics" / "foo.md").write_text(broken)
+        commit_all(root)
+        self.assertFalse(memidx.parse_record_text(broken, "x").valid)
+        self.assertRefused(base_text(marks=marks_block(M2.replace("first mark", "EDITED"))),
+                           "row changed after being recorded")
+        self.assertClean(base_text())
+
+
+class TestLinkOrderAndCurrent(GuardCase):
+    def test_links_reordered_refused_and_nothing_else_fires(self):
+        # swap L2 and L3 bytes verbatim: every per-link span is intact
+        swapped = (G_LINKS[1], G_LINKS[0], G_LINKS[2])
+        out = self.assertRefused(base_text(links=swapped, current="L2"),
+                                 "links reordered (L2 before L3; the chain head is first-active-in-file-order)")
+        for old_message in ("link reformatted", "changed after being recorded", "inserted out of order"):
+            self.assertNotIn(old_message, out)
+
+    def test_links_reorder_check_is_what_catches_it(self):
+        swapped = (G_LINKS[1], G_LINKS[0], G_LINKS[2])
+        with mock.patch.object(memlint, "_link_order_errors", return_value=[]):
+            self.assertClean(base_text(links=swapped, current="L2"))
+
+    def test_new_links_may_sit_between_old_ones_in_order(self):
+        # in-order interleave is a different rule's business (inserted out of order)
+        rc, out = self.guard(base_text(links=(G_LINKS[0], link_yaml("L9"), G_LINKS[1], G_LINKS[2])))
+        self.assertNotIn("links reordered", out)
+
+    def test_bare_current_flip_refused(self):
+        out = self.assertRefused(base_text(current="L2"), "current: 'L2' does not match the newest active link",
+                                 "current changed L3 -> L2 without a change of the newest active link")
+
+    def test_current_with_a_new_active_link_passes(self):
+        links = (link_yaml("L4", text="fourth"),) + G_LINKS
+        self.assertClean(base_text(links=links, current="L4"))
+
+    def test_new_active_link_without_moving_current_refused(self):
+        links = (link_yaml("L4", text="fourth"),) + G_LINKS
+        self.assertRefused(base_text(links=links, current="L3"), "current: 'L3' does not match")
+
+    def test_provisional_link_never_licenses_a_current_move(self):
+        links = (link_yaml("L4", status="provisional", auth="agent-inference"),) + G_LINKS
+        self.assertRefused(base_text(links=links, current="L4"), "current: 'L4' does not match")
+        self.assertClean(base_text(links=links, current="L3"))
+
+    def test_repair_of_an_existing_disagreement_passes(self):
+        self.store(base_text(current="L2"))   # REF already disagreed: current L2, head L3
+        self.assertClean(base_text(current="L3"))
+
+    def test_historical_move_exposing_an_older_active_link_passes(self):
+        gone = link_yaml("L3", status="historical", text="third")
+        self.assertClean(base_text(links=(gone, G_LINKS[1], G_LINKS[2]), current="L2"))
+
+    def test_absent_current_with_unchanged_head_passes(self):
+        self.store(base_text(current=None))
+        self.assertClean(base_text(current=None, marks=marks_block(M2, M3)).replace(
+            marks_block(M2, M3), marks_block(M2)))
+
+    def test_removing_current_with_head_unchanged_refused(self):
+        self.assertRefused(base_text(current=None), "current changed L3 -> None without a change")
+
+    def test_adding_current_to_a_topic_that_lacked_one_passes(self):
+        self.store(base_text(current=None))
+        self.assertClean(base_text(current="L3"))
+
+
+class TestAddedTopics(GuardCase):
+    def test_new_topic_with_standing_and_no_rows_refused(self):
+        self.store()
+        out = self.assertRefusedNew(base_text(tid="TOP-9200", marks=""), "standing changed for L2 (add)")
+
+    def assertRefusedNew(self, text, *needles):
+        (self.root / "topics" / "bar.md").write_text(text)
+        git(["add", "-A"], self.root)
+        rc, out = run_memlint(["--against-ref", "HEAD", "--staged", str(self.root)])
+        git(["reset", "-q"], self.root)
+        (self.root / "topics" / "bar.md").unlink()
+        self.assertEqual(rc, 1, out)
+        for n in needles:
+            self.assertIn(n, out)
+        return out
+
+    def test_new_topic_with_matching_rows_passes(self):
+        self.store()
+        text = base_text(tid="TOP-9200", marks=marks_block(mark_yaml("L2", recorded_at=STAMP)))
+        (self.root / "topics" / "bar.md").write_text(text)
+        git(["add", "-A"], self.root)
+        rc, out = run_memlint(["--against-ref", "HEAD", "--staged", str(self.root)])
+        self.assertEqual(rc, 0, out)
+
+    def test_new_topic_with_rows_and_empty_standing_has_orphans(self):
+        self.store()
+        self.assertRefusedNew(base_text(tid="TOP-9200", standing="standing: []\n",
+                                        marks=marks_block(mark_yaml("L2", recorded_at=STAMP))),
+                              "orphan standing mark (L2, add)")
+
+    def test_new_topic_without_standing_is_free(self):
+        self.store()
+        (self.root / "topics" / "bar.md").write_text(base_text(tid="TOP-9200", standing="", marks=""))
+        git(["add", "-A"], self.root)
+        rc, out = run_memlint(["--against-ref", "HEAD", "--staged", str(self.root)])
+        self.assertEqual(rc, 0, out)
+
+
+def _symlinked(cls):
+    return type(f"{cls.__name__}SymlinkedTmp", (SymlinkedTmpMixin, cls), {})
+
+
+TestStandingPairingSymlinkedTmp = _symlinked(TestStandingPairing)
+TestMarksFreezeSymlinkedTmp = _symlinked(TestMarksFreeze)
+TestLinkOrderAndCurrentSymlinkedTmp = _symlinked(TestLinkOrderAndCurrent)
+TestAddedTopicsSymlinkedTmp = _symlinked(TestAddedTopics)
+
+
 if __name__ == "__main__":
     unittest.main()

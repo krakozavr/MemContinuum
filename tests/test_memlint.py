@@ -1132,6 +1132,9 @@ class TestMemlintAgainstRef(unittest.TestCase):
                 "    status: active\n    kind: adopted\n    ruling:\n      text: \"second ruling\"",
                 "    status: superseded\n    superseded_by: L1\n    kind: adopted\n    ruling:\n      text: \"second ruling\"",
             )
+            # no active link is left, so `current:` goes with it (TOP-0137 L14 g4: a
+            # written `current:` must name the newest active link of the staged file)
+            text = text.replace("current: L2\n", "", 1)
             self.assertNotEqual(text, TOPIC_L1_L2, "fixture edit must actually change the text")
             (root / "topics" / "foo.md").write_text(text)
             rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
