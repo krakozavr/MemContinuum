@@ -351,6 +351,7 @@ FALLBACK_COMPLEX_FIELDS = {
     "links", "code_refs", "tags", "edges", "assumptions", "invariant",
     "metadata", "ruling", "rationale", "alternatives", "evidence",
     "implemented_by", "tested_by", "governed_by", "involved_in", "anchors",
+    "standing_marks",
 }
 
 
@@ -492,9 +493,10 @@ def validate_record_shape(fm: dict) -> list:
     if not _shape_ok_mapping(fm.get("metadata")):
         diagnostics.append(("metadata", "metadata must be a mapping"))
 
-    anchors = fm.get("anchors")
-    if anchors and (not isinstance(anchors, list) or any(not isinstance(a, dict) for a in anchors)):
-        diagnostics.append(("anchors", "anchors must be a list of mappings"))
+    for key in ("anchors", "standing_marks"):
+        rows = fm.get(key)
+        if rows and (not isinstance(rows, list) or any(not isinstance(a, dict) for a in rows)):
+            diagnostics.append((key, f"{key} must be a list of mappings"))
 
     links = fm.get("links")
     if links:
@@ -4286,13 +4288,19 @@ def code_ref_matches_exact(file_path: str, code_ref: str) -> bool:
     return code_ref_split(code_ref)[0] == str(file_path).rstrip("/")
 
 
-def anchor_rows(fm: dict) -> list:
-    """The well-formed (mapping) rows of a record's `anchors:` list; [] for
-    an absent or wrongly shaped key (validate_record_shape reports that)."""
-    rows = fm.get("anchors")
+def _mapping_rows(fm: dict, key: str) -> list:
+    """The well-formed (mapping) rows of a record's top-level `key:` list; []
+    for an absent or wrongly shaped key (validate_record_shape reports that).
+    The one reader behind `anchors:` and `standing_marks:`."""
+    rows = fm.get(key)
     if not isinstance(rows, list):
         return []
     return [r for r in rows if isinstance(r, dict)]
+
+
+def anchor_rows(fm: dict) -> list:
+    """The well-formed (mapping) rows of a record's `anchors:` list."""
+    return _mapping_rows(fm, "anchors")
 
 
 def anchor_row_key(row: dict) -> tuple:
@@ -11896,13 +11904,17 @@ def _yaml_quote(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-def render_anchor_item(row: dict, indent: str = "  ") -> list:
-    """The text lines of one `anchors:` list item, in the schema's field
-    order. Strings that YAML could re-type (digest, code_head, ref) are
-    double-quoted; `captured_at` stays a bare date."""
-    quoted = {"ref", "digest", "code_head", "chunker_version"}
-    order = ("ref", "link", "algo", "digest", "span", "captured", "captured_at",
-             "code_head", "worktree", "chunker_version")
+ANCHOR_FIELD_ORDER = ("ref", "link", "algo", "digest", "span", "captured", "captured_at",
+                      "code_head", "worktree", "chunker_version")
+ANCHOR_QUOTED_FIELDS = frozenset({"ref", "digest", "code_head", "chunker_version"})
+
+
+def render_anchor_item(row: dict, indent: str = "  ", order: tuple = ANCHOR_FIELD_ORDER,
+                       quoted=ANCHOR_QUOTED_FIELDS) -> list:
+    """The text lines of one block-list item, fields in `order` (default: the
+    `anchors:` schema's). Strings that YAML could re-type are the `quoted`
+    set (anchors: digest, code_head, ref; `captured_at` stays a bare date);
+    `standing_marks:` rows pass their own order and set."""
     out = []
     for n, key in enumerate([k for k in order if k in row]):
         value = str(row[key])
@@ -11912,37 +11924,60 @@ def render_anchor_item(row: dict, indent: str = "  ") -> list:
     return out
 
 
+def _insert_block_row(text: str, key: str, row: dict, order: tuple, quoted, prepend: bool,
+                      create_at) -> str:
+    """`text` (a topic file) with one `row` added to the top-level block list
+    `key:` -- appended at the end of an existing block (`prepend` False) or
+    placed first under the key line (`prepend` True, newest-first lists); an
+    absent key is created at the index `create_at(lines, first, end)` returns.
+    Pure line insertion -- every other byte of the file is untouched. Raises
+    ValueError when the structure does not allow a safe insert."""
+    nl = _newline_of(text)
+    lines = _split_lines_keep(text)
+    first, end = _fm_line_bounds(lines)
+    if end == 0:
+        raise ValueError("no frontmatter block")
+    key_idx = _top_key_index(lines, first, end, key)
+    if key_idx is not None:
+        value = lines[key_idx].split(":", 1)[1].strip()
+        if value == "[]":
+            lines[key_idx] = f"{key}:{nl}"
+        elif value != "":
+            raise ValueError(f"`{key}:` is not a block list; refusing to edit it")
+        last = _block_last_line(lines, key_idx, end, include_trailing=not prepend)
+        item = render_anchor_item(row, _block_item_indent(lines, key_idx, last), order, quoted)
+        if prepend:
+            pos = key_idx + 1
+        else:
+            pos = last + 1
+            if not lines[last].endswith("\n"):
+                lines[last] += nl
+        lines[pos:pos] = [ln + nl for ln in item]
+    else:
+        at = create_at(lines, first, end)
+        item = render_anchor_item(row, "  ", order, quoted)
+        lines[at:at] = [f"{key}:{nl}"] + [ln + nl for ln in item]
+    return "".join(lines)
+
+
+def _before_links_key(placed: str):
+    """`create_at` for a key that sits immediately before `links:`."""
+    def create_at(lines: list, first: int, end: int) -> int:
+        links_idx = _top_key_index(lines, first, end, "links")
+        if links_idx is None:
+            raise ValueError(f"no `links:` key to place `{placed}:` before")
+        return links_idx
+    return create_at
+
+
 def insert_anchor_row(text: str, row: dict) -> str:
     """`text` (a topic file) with one anchor item added: appended at the end
     of an existing `anchors:` block, else a new block placed immediately
     before the `links:` line. Pure line insertion -- every other byte of the
     file is untouched. Raises ValueError when the structure does not allow a
     safe insert."""
-    nl = _newline_of(text)
-    lines = _split_lines_keep(text)
-    first, end = _fm_line_bounds(lines)
-    if end == 0:
-        raise ValueError("no frontmatter block")
-    anchors_idx = _top_key_index(lines, first, end, "anchors")
-    if anchors_idx is not None:
-        value = lines[anchors_idx].split(":", 1)[1].strip()
-        if value == "[]":
-            lines[anchors_idx] = f"anchors:{nl}"
-        elif value != "":
-            raise ValueError("`anchors:` is not a block list; refusing to edit it")
-        last = _block_last_line(lines, anchors_idx, end, include_trailing=True)
-        item = render_anchor_item(row, _block_item_indent(lines, anchors_idx, last))
-        pos = last + 1
-        if not lines[last].endswith("\n"):
-            lines[last] += nl
-        lines[pos:pos] = [ln + nl for ln in item]
-    else:
-        links_idx = _top_key_index(lines, first, end, "links")
-        if links_idx is None:
-            raise ValueError("no `links:` key to place `anchors:` before")
-        item = render_anchor_item(row)
-        lines[links_idx:links_idx] = [f"anchors:{nl}"] + [ln + nl for ln in item]
-    return "".join(lines)
+    return _insert_block_row(text, "anchors", row, ANCHOR_FIELD_ORDER, ANCHOR_QUOTED_FIELDS,
+                             False, _before_links_key("anchors"))
 
 
 def insert_code_ref(text: str, ref: str) -> str:
@@ -12016,21 +12051,28 @@ def parse_record_raw(text: str, path):
     return parse_record_text(text.replace("\r\n", "\n"), path)
 
 
-def bound_edit_problem(new_text: str, path, ref: str, link_id: str, expect_refs: list) -> str | None:
+def edit_roundtrip_problem(new_text: str, path, check) -> str | None:
     """Why a topic edit must not be written, else None: the new text must
-    parse, its `code_refs` must be exactly `expect_refs` (so the inserted ref
-    parses back to the string that was bound -- no YAML re-typing) and its
-    anchor row for `(ref, link_id)` must carry that same ref string."""
-    check = parse_record_raw(new_text, path)
-    if not check.valid:
+    parse cleanly and `check(frontmatter)` (the caller's own round-trip test
+    of what it inserted -- no YAML re-typing) must find nothing wrong."""
+    parsed = parse_record_raw(new_text, path)
+    if not parsed.valid:
         return "the edit would not parse cleanly"
-    fm = check.frontmatter
-    if list(fm.get("code_refs") or []) != list(expect_refs):
-        return f"the edit would not round-trip the reference {ref!r} as a string"
-    rows = [r for r in anchor_rows(fm) if anchor_row_key(r) == (ref, link_id)]
-    if len(rows) != 1 or rows[0].get("ref") != ref:
-        return f"the edit would not round-trip the anchor row for {ref!r}"
-    return None
+    return check(parsed.frontmatter)
+
+
+def bound_edit_problem(new_text: str, path, ref: str, link_id: str, expect_refs: list) -> str | None:
+    """`edit_roundtrip_problem` for `bind`: the `code_refs` must be exactly
+    `expect_refs` (so the inserted ref parses back to the string that was
+    bound) and the anchor row for `(ref, link_id)` must carry that same ref."""
+    def check(fm: dict) -> str | None:
+        if list(fm.get("code_refs") or []) != list(expect_refs):
+            return f"the edit would not round-trip the reference {ref!r} as a string"
+        rows = [r for r in anchor_rows(fm) if anchor_row_key(r) == (ref, link_id)]
+        if len(rows) != 1 or rows[0].get("ref") != ref:
+            return f"the edit would not round-trip the anchor row for {ref!r}"
+        return None
+    return edit_roundtrip_problem(new_text, path, check)
 
 
 def cmd_bind(args) -> int:
