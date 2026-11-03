@@ -538,6 +538,27 @@ class TestMarkStandingCommand(MarkCase):
                         self.assertEqual(rc, 0, err)
                         self.assertIn(f"standing: []{tail}\n", self.read())
 
+    def test_quotes_inside_plain_scalars_are_literal(self):
+        for line in ("[O'Reilly, L2]", '[a"b, L2]'):
+            with self.subTest(line=line):
+                self.assertEqual(memidx._flow_list_parts(line)[0][-1], "L2")
+        # and end to end: an edit keeps the plain scalar and its quote verbatim
+        self.write(topic_text(standing="standing: [L2, O'Reilly]\n"))
+        self.assertIn("[L2, O'Reilly, L3]", memidx.edit_standing_line(self.read(), "L3", True))
+
+    def test_flow_list_helper_edge_cases(self):
+        parts = memidx._flow_list_parts
+        self.assertIsNone(parts("[L2,\n L3]"))
+        self.assertIsNone(parts("[L2,\r L3]"))
+        self.assertIsNone(parts('["abc, L2]'))
+        self.assertIsNone(parts("['abc, L2]"))
+        self.assertIsNone(parts('["a"b]'))
+        self.assertIsNone(parts("[[L2]]"))
+        self.assertEqual(parts('["a]b", L2] # c [x]'), (['"a]b"', "L2"], " # c [x]"))
+        self.assertEqual(parts("[O'Reilly, L2]"), (["O'Reilly", "L2"], ""))
+        self.assertEqual(parts('[a"b, L2]'), (['a"b', "L2"], ""))
+        self.assertEqual(parts("[]#c"), ([], "#c"))
+
     def test_flow_list_spellings_that_worked_before_still_work(self):
         for line, want in (("standing: [] # c", "standing: [L3] # c"), ("standing: []#c", "standing: [L3]#c"),
                            ("standing: [ L2 ]", "standing: [L2, L3]"), ("standing: [ L2 , L4 ]", "standing: [L2, L4, L3]")):
