@@ -35,7 +35,7 @@ import time
 import traceback
 import urllib.parse
 from collections import Counter
-from datetime import datetime, timedelta, timezone
+from datetime import date as _date, datetime, timedelta, timezone
 from pathlib import Path
 from stat import S_ISREG
 from urllib.parse import quote
@@ -351,6 +351,7 @@ FALLBACK_COMPLEX_FIELDS = {
     "links", "code_refs", "tags", "edges", "assumptions", "invariant",
     "metadata", "ruling", "rationale", "alternatives", "evidence",
     "implemented_by", "tested_by", "governed_by", "involved_in", "anchors",
+    "standing_marks",
 }
 
 
@@ -492,9 +493,10 @@ def validate_record_shape(fm: dict) -> list:
     if not _shape_ok_mapping(fm.get("metadata")):
         diagnostics.append(("metadata", "metadata must be a mapping"))
 
-    anchors = fm.get("anchors")
-    if anchors and (not isinstance(anchors, list) or any(not isinstance(a, dict) for a in anchors)):
-        diagnostics.append(("anchors", "anchors must be a list of mappings"))
+    for key in ("anchors", "standing_marks"):
+        rows = fm.get(key)
+        if rows and (not isinstance(rows, list) or any(not isinstance(a, dict) for a in rows)):
+            diagnostics.append((key, f"{key} must be a list of mappings"))
 
     links = fm.get("links")
     if links:
@@ -4286,13 +4288,19 @@ def code_ref_matches_exact(file_path: str, code_ref: str) -> bool:
     return code_ref_split(code_ref)[0] == str(file_path).rstrip("/")
 
 
-def anchor_rows(fm: dict) -> list:
-    """The well-formed (mapping) rows of a record's `anchors:` list; [] for
-    an absent or wrongly shaped key (validate_record_shape reports that)."""
-    rows = fm.get("anchors")
+def _mapping_rows(fm: dict, key: str) -> list:
+    """The well-formed (mapping) rows of a record's top-level `key:` list; []
+    for an absent or wrongly shaped key (validate_record_shape reports that).
+    The one reader behind `anchors:` and `standing_marks:`."""
+    rows = fm.get(key)
     if not isinstance(rows, list):
         return []
     return [r for r in rows if isinstance(r, dict)]
+
+
+def anchor_rows(fm: dict) -> list:
+    """The well-formed (mapping) rows of a record's `anchors:` list."""
+    return _mapping_rows(fm, "anchors")
 
 
 def anchor_row_key(row: dict) -> tuple:
@@ -6515,6 +6523,74 @@ def _decision_vector_index_state(conn: sqlite3.Connection, project: str) -> str:
     if fresh == total:
         return "full"
     return "partial"
+
+
+# TOP-0137 L14: `standing_marks:` -- the frozen audit of `standing:` membership
+# changes, on the same topic. Rows are never delivered, never indexed, never in
+# the digest; only memlint (plain rules + the --against-ref guard) and
+# `mark-standing` read or write them.
+STANDING_MARK_FIELDS = ("link", "action", "date", "recorded_at", "recorded_by", "authority",
+                        "source", "why")
+STANDING_MARK_QUOTED_FIELDS = frozenset({"recorded_at", "source", "why"})
+STANDING_MARK_ACTIONS = ("add", "remove")
+
+
+def standing_mark_rows(fm: dict) -> list:
+    """The well-formed (mapping) rows of a topic's `standing_marks:` list."""
+    return _mapping_rows(fm, "standing_marks")
+
+
+def standing_mark_ident(row) -> tuple | None:
+    """Identity of a mark row: `(link, action, recorded_at)` as strings, None
+    when any part is missing or not a scalar."""
+    if not isinstance(row, dict):
+        return None
+    parts = [row.get(k) for k in ("link", "action", "recorded_at")]
+    if any(p is None or isinstance(p, (dict, list)) or str(p).strip() == "" for p in parts):
+        return None
+    return tuple(str(p) for p in parts)
+
+
+def standing_ids(fm: dict) -> list:
+    """A topic's `standing:` pointers as strings, in written order; [] for an
+    absent or wrongly shaped value (a lenient-fallback parse can leave a bare
+    string there)."""
+    value = fm.get("standing")
+    return [str(x) for x in value] if isinstance(value, list) else []
+
+
+def standing_link_problems(link_id: str, link: dict | None) -> list:
+    """Why `link_id` cannot be a `standing:` pointer of a topic whose link with
+    that id is `link` (None: no such link) -- an empty list means eligible.
+    Messages carry no path prefix. The one definition behind memlint's
+    standing-pointer errors and `mark-standing --add`."""
+    if link is None:
+        return [f"standing points at {link_id!r} which is not a link in this topic"]
+    problems = []
+    link_status = link.get("status")
+    if link_status != "active":
+        problems.append(
+            f"standing link {link_id!r} is {link_status!r}, not active -- "
+            "a superseded/declined/historical/provisional link cannot be standing "
+            "(supersede or amend it, and update or drop the pointer, in the same commit)"
+        )
+    link_ruling = link.get("ruling") or {}
+    link_auth = link_ruling.get("authority")
+    if link_auth not in CONSTRAINT_AUTHORITIES:
+        problems.append(
+            f"standing link {link_id!r} has ruling.authority {link_auth!r} -- "
+            f"must be one of {sorted(CONSTRAINT_AUTHORITIES)} (the declared CONSTRAINT "
+            "gate this v0 digest uses, TOP-0132 L2)"
+        )
+    link_text = link_ruling.get("text")
+    if link_text and ("\n" in str(link_text) or "\r" in str(link_text)):
+        problems.append(
+            f"standing link {link_id!r} ruling.text contains a CR or LF -- "
+            "a standing ruling's text must be a single line (flatten it); other line/"
+            "paragraph separators (U+2028, U+2029, NEL, tab) are collapsed to one space "
+            "at projection time and are not rejected here, only a raw CR/LF is"
+        )
+    return problems
 
 
 def standing_entries(conn, project: str) -> list:
@@ -11896,13 +11972,17 @@ def _yaml_quote(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-def render_anchor_item(row: dict, indent: str = "  ") -> list:
-    """The text lines of one `anchors:` list item, in the schema's field
-    order. Strings that YAML could re-type (digest, code_head, ref) are
-    double-quoted; `captured_at` stays a bare date."""
-    quoted = {"ref", "digest", "code_head", "chunker_version"}
-    order = ("ref", "link", "algo", "digest", "span", "captured", "captured_at",
-             "code_head", "worktree", "chunker_version")
+ANCHOR_FIELD_ORDER = ("ref", "link", "algo", "digest", "span", "captured", "captured_at",
+                      "code_head", "worktree", "chunker_version")
+ANCHOR_QUOTED_FIELDS = frozenset({"ref", "digest", "code_head", "chunker_version"})
+
+
+def render_anchor_item(row: dict, indent: str = "  ", order: tuple = ANCHOR_FIELD_ORDER,
+                       quoted=ANCHOR_QUOTED_FIELDS) -> list:
+    """The text lines of one block-list item, fields in `order` (default: the
+    `anchors:` schema's). Strings that YAML could re-type are the `quoted`
+    set (anchors: digest, code_head, ref; `captured_at` stays a bare date);
+    `standing_marks:` rows pass their own order and set."""
     out = []
     for n, key in enumerate([k for k in order if k in row]):
         value = str(row[key])
@@ -11912,37 +11992,60 @@ def render_anchor_item(row: dict, indent: str = "  ") -> list:
     return out
 
 
+def _insert_block_row(text: str, key: str, row: dict, order: tuple, quoted, prepend: bool,
+                      create_at) -> str:
+    """`text` (a topic file) with one `row` added to the top-level block list
+    `key:` -- appended at the end of an existing block (`prepend` False) or
+    placed first under the key line (`prepend` True, newest-first lists); an
+    absent key is created at the index `create_at(lines, first, end)` returns.
+    Pure line insertion -- every other byte of the file is untouched. Raises
+    ValueError when the structure does not allow a safe insert."""
+    nl = _newline_of(text)
+    lines = _split_lines_keep(text)
+    first, end = _fm_line_bounds(lines)
+    if end == 0:
+        raise ValueError("no frontmatter block")
+    key_idx = _top_key_index(lines, first, end, key)
+    if key_idx is not None:
+        value = lines[key_idx].split(":", 1)[1].strip()
+        if value == "[]":
+            lines[key_idx] = f"{key}:{nl}"
+        elif value != "":
+            raise ValueError(f"`{key}:` is not a block list; refusing to edit it")
+        last = _block_last_line(lines, key_idx, end, include_trailing=not prepend)
+        item = render_anchor_item(row, _block_item_indent(lines, key_idx, last), order, quoted)
+        if prepend:
+            pos = key_idx + 1
+        else:
+            pos = last + 1
+            if not lines[last].endswith("\n"):
+                lines[last] += nl
+        lines[pos:pos] = [ln + nl for ln in item]
+    else:
+        at = create_at(lines, first, end)
+        item = render_anchor_item(row, "  ", order, quoted)
+        lines[at:at] = [f"{key}:{nl}"] + [ln + nl for ln in item]
+    return "".join(lines)
+
+
+def _before_links_key(placed: str):
+    """`create_at` for a key that sits immediately before `links:`."""
+    def create_at(lines: list, first: int, end: int) -> int:
+        links_idx = _top_key_index(lines, first, end, "links")
+        if links_idx is None:
+            raise ValueError(f"no `links:` key to place `{placed}:` before")
+        return links_idx
+    return create_at
+
+
 def insert_anchor_row(text: str, row: dict) -> str:
     """`text` (a topic file) with one anchor item added: appended at the end
     of an existing `anchors:` block, else a new block placed immediately
     before the `links:` line. Pure line insertion -- every other byte of the
     file is untouched. Raises ValueError when the structure does not allow a
     safe insert."""
-    nl = _newline_of(text)
-    lines = _split_lines_keep(text)
-    first, end = _fm_line_bounds(lines)
-    if end == 0:
-        raise ValueError("no frontmatter block")
-    anchors_idx = _top_key_index(lines, first, end, "anchors")
-    if anchors_idx is not None:
-        value = lines[anchors_idx].split(":", 1)[1].strip()
-        if value == "[]":
-            lines[anchors_idx] = f"anchors:{nl}"
-        elif value != "":
-            raise ValueError("`anchors:` is not a block list; refusing to edit it")
-        last = _block_last_line(lines, anchors_idx, end, include_trailing=True)
-        item = render_anchor_item(row, _block_item_indent(lines, anchors_idx, last))
-        pos = last + 1
-        if not lines[last].endswith("\n"):
-            lines[last] += nl
-        lines[pos:pos] = [ln + nl for ln in item]
-    else:
-        links_idx = _top_key_index(lines, first, end, "links")
-        if links_idx is None:
-            raise ValueError("no `links:` key to place `anchors:` before")
-        item = render_anchor_item(row)
-        lines[links_idx:links_idx] = [f"anchors:{nl}"] + [ln + nl for ln in item]
-    return "".join(lines)
+    return _insert_block_row(text, "anchors", row, ANCHOR_FIELD_ORDER, ANCHOR_QUOTED_FIELDS,
+                             False, _before_links_key("anchors"))
 
 
 def insert_code_ref(text: str, ref: str) -> str:
@@ -12016,21 +12119,28 @@ def parse_record_raw(text: str, path):
     return parse_record_text(text.replace("\r\n", "\n"), path)
 
 
-def bound_edit_problem(new_text: str, path, ref: str, link_id: str, expect_refs: list) -> str | None:
+def edit_roundtrip_problem(new_text: str, path, check) -> str | None:
     """Why a topic edit must not be written, else None: the new text must
-    parse, its `code_refs` must be exactly `expect_refs` (so the inserted ref
-    parses back to the string that was bound -- no YAML re-typing) and its
-    anchor row for `(ref, link_id)` must carry that same ref string."""
-    check = parse_record_raw(new_text, path)
-    if not check.valid:
+    parse cleanly and `check(frontmatter)` (the caller's own round-trip test
+    of what it inserted -- no YAML re-typing) must find nothing wrong."""
+    parsed = parse_record_raw(new_text, path)
+    if not parsed.valid:
         return "the edit would not parse cleanly"
-    fm = check.frontmatter
-    if list(fm.get("code_refs") or []) != list(expect_refs):
-        return f"the edit would not round-trip the reference {ref!r} as a string"
-    rows = [r for r in anchor_rows(fm) if anchor_row_key(r) == (ref, link_id)]
-    if len(rows) != 1 or rows[0].get("ref") != ref:
-        return f"the edit would not round-trip the anchor row for {ref!r}"
-    return None
+    return check(parsed.frontmatter)
+
+
+def bound_edit_problem(new_text: str, path, ref: str, link_id: str, expect_refs: list) -> str | None:
+    """`edit_roundtrip_problem` for `bind`: the `code_refs` must be exactly
+    `expect_refs` (so the inserted ref parses back to the string that was
+    bound) and the anchor row for `(ref, link_id)` must carry that same ref."""
+    def check(fm: dict) -> str | None:
+        if list(fm.get("code_refs") or []) != list(expect_refs):
+            return f"the edit would not round-trip the reference {ref!r} as a string"
+        rows = [r for r in anchor_rows(fm) if anchor_row_key(r) == (ref, link_id)]
+        if len(rows) != 1 or rows[0].get("ref") != ref:
+            return f"the edit would not round-trip the anchor row for {ref!r}"
+        return None
+    return edit_roundtrip_problem(new_text, path, check)
 
 
 def cmd_bind(args) -> int:
@@ -12088,6 +12198,254 @@ def cmd_bind(args) -> int:
     problem = bound_edit_problem(new_text, path, ref, link_id, expect)
     if problem:
         print(f"bind: {problem}; nothing written", file=sys.stderr)
+        return 1
+    apply_topic_edit(path, old_text, new_text, args.dry_run, root)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# standing_marks: `mark-standing` (TOP-0137 L14)
+# ---------------------------------------------------------------------------
+#
+# The one narrow writer for a topic's `standing:` membership. It edits the
+# `standing:` line IN PLACE and prepends one row to `standing_marks:` -- both
+# line insertions (a YAML dumper would reformat every frozen link). memlint's
+# --against-ref guard (check_append_only) is the other half: a `standing:`
+# change without its matching row is refused at commit.
+
+
+def _now() -> datetime:
+    """The local time, aware, whole seconds (a seam the tests replace)."""
+    return datetime.now().astimezone().replace(microsecond=0)
+
+
+def _flow_list_parts(rest: str):
+    """`(items, tail)` of a one-line flow list `[a, b]  # note`, else None: the
+    ONE tokenizer for these lists. It walks the body once; a quote opens a
+    quoted scalar only as the first non-space character of an item (YAML
+    plain-scalar semantics -- `O'Reilly` and `a"b` are plain), a quoted scalar
+    ends at its closing quote (backslash escapes in double quotes) and may hold
+    `,` `]` `#`; the list closes at the matching `]` and the tail must be empty
+    or a `#` comment. `items` are the stripped raw item texts, empties dropped.
+    A newline, a nested `[`, an unterminated quote or text after a quoted
+    scalar make it None."""
+    if "\n" in rest or "\r" in rest or not rest.startswith("["):
+        return None
+    items: list = []
+    i, n = 1, len(rest)
+    while True:
+        while i < n and rest[i] == " ":
+            i += 1
+        if i >= n:
+            return None
+        if rest[i] == "]":
+            break
+        start = i
+        if rest[i] in "'\"":
+            quote = rest[i]
+            i += 1
+            while i < n and (rest[i] != quote or rest[i:i + 2] == "''" and quote == "'"):
+                # `\x` in double quotes and `''` in single quotes are escapes: stay inside
+                i += 2 if (quote == '"' and rest[i] == "\\") or rest[i] == quote else 1
+            if i >= n:
+                return None
+            i += 1
+            end = i
+            while i < n and rest[i] == " ":
+                i += 1
+            if i >= n or rest[i] not in ",]":
+                return None
+        else:
+            while i < n and rest[i] not in ",]":
+                if rest[i] == "[":
+                    return None
+                i += 1
+            if i >= n:
+                return None
+            end = i
+        item = rest[start:end].strip()
+        if item:
+            items.append(item)
+        if rest[i] == ",":
+            i += 1
+    tail = rest[i + 1:]
+    return (items, tail) if re.fullmatch(r"(\s*#.*)?", tail) else None
+
+
+def _scalar_token(token: str) -> str:
+    return token.strip().strip("'\"")
+
+
+def edit_standing_line(text: str, link_id: str, add: bool) -> str:
+    """`text` with `link_id` added to (appended) or removed from the topic's
+    `standing:` list, editing that list in place: a flow list stays a flow list
+    and a block list a block list (converting would reformat history); removing
+    the last id leaves `standing: []`; an absent key is created as
+    `standing: [Ln]` before `standing_marks:`/`anchors:`/`links:`. Raises
+    ValueError when the structure does not allow a safe edit."""
+    nl = _newline_of(text)
+    lines = _split_lines_keep(text)
+    first, end = _fm_line_bounds(lines)
+    if end == 0:
+        raise ValueError("no frontmatter block")
+    idx = _top_key_index(lines, first, end, "standing")
+    if idx is None:
+        if not add:
+            return text
+        found = [i for i in (_top_key_index(lines, first, end, k)
+                             for k in ("standing_marks", "anchors", "links")) if i is not None]
+        if not found:
+            raise ValueError("no `links:` key to place `standing:` before")
+        lines.insert(min(found), f"standing: [{link_id}]{nl}")
+        return "".join(lines)
+    rest = lines[idx].rstrip("\r\n").split(":", 1)[1].strip()
+    flow = _flow_list_parts(rest)
+    block_last = _block_last_line(lines, idx, end)
+    if flow is not None:
+        tokens, tail = flow
+        if add:
+            tokens.append(link_id)
+        else:
+            tokens = [t for t in tokens if _scalar_token(t) != link_id]
+        lines[idx] = f"standing: [{', '.join(tokens)}]{tail}{nl}"
+        return "".join(lines)
+    if rest in ("", "null", "~") and block_last == idx:
+        if add:
+            lines[idx] = f"standing: [{link_id}]{nl}"
+        return "".join(lines)
+    if rest != "":
+        raise ValueError("`standing:` is neither a flow list nor a block list; refusing to edit it")
+    if add:
+        indent = _block_item_indent(lines, idx, block_last)
+        if not lines[block_last].endswith("\n"):
+            lines[block_last] += nl
+        lines.insert(block_last + 1, f"{indent}- {link_id}{nl}")
+        return "".join(lines)
+    items = [i for i in range(idx + 1, block_last + 1)
+             if lines[i].lstrip().startswith("- ")]
+    drop = [i for i in items
+            if _scalar_token(re.sub(r"\s+#.*$", "", lines[i].strip()[2:])) == link_id]
+    if not drop:
+        return text
+    del lines[drop[0]]
+    if len(items) == 1:
+        lines[idx] = f"standing: []{nl}"
+    return "".join(lines)
+
+
+def _after_standing_key(lines: list, first: int, end: int) -> int:
+    """`create_at` for `standing_marks:`: right after the `standing:` block."""
+    idx = _top_key_index(lines, first, end, "standing")
+    if idx is None:
+        raise ValueError("no `standing:` key to place `standing_marks:` after")
+    last = _block_last_line(lines, idx, end)
+    if not lines[last].endswith("\n"):
+        lines[last] += _newline_of("".join(lines))
+    return last + 1
+
+
+def insert_standing_mark(text: str, row: dict) -> str:
+    """`text` with one `standing_marks:` row PREPENDED (newest first), the key
+    created right after `standing:` when absent."""
+    return _insert_block_row(text, "standing_marks", row, STANDING_MARK_FIELDS,
+                             STANDING_MARK_QUOTED_FIELDS, True, _after_standing_key)
+
+
+def cmd_mark_standing(args) -> int:
+    """`memidx.py mark-standing TOP-xxxx Ln (--add | --remove) --authority A
+    --source TEXT --why TEXT --root STORE [--recorded-by NAME] [--dry-run]` --
+    change the topic's `standing:` list by one link and prepend the matching
+    `standing_marks:` row, as line insertions; print the diff, never commit.
+    One call, one row. rc 1: refused (unknown topic, ineligible link, bad
+    text, file does not parse, edit would not round-trip)."""
+    root = Path(args.root).resolve()
+    link_id = args.link
+    add = bool(args.add)
+    why, source = args.why, args.source
+    for name, value in (("--why", why), ("--source", source)):
+        if not value.strip():
+            print(f"mark-standing: {name} must not be empty", file=sys.stderr)
+            return 1
+        parts = value.splitlines()
+        if len(parts) != 1 or parts[0] != value:
+            print(f"mark-standing: {name} must be a single line (no leading or trailing "
+                  "line break)", file=sys.stderr)
+            return 1
+    path = _topic_file_for_id(root, args.topic)
+    if path is None:
+        print(f"mark-standing: no topic {args.topic!r} under {args.root}/topics", file=sys.stderr)
+        return 1
+    try:
+        old_text = read_record_bytes_strict(path)
+    except UnicodeDecodeError as exc:
+        print(f"mark-standing: {path.name} is not valid UTF-8 ({exc}); nothing written", file=sys.stderr)
+        return 1
+    result = parse_record_raw(old_text, path)
+    if not result.valid:
+        print(f"mark-standing: {path.name} does not parse cleanly: "
+              f"{'; '.join(m for _f, m in result.diagnostics)}", file=sys.stderr)
+        return 1
+    fm = result.frontmatter
+    before = standing_ids(fm)
+    if add and link_id in before:
+        print(f"mark-standing: {args.topic} {link_id} is already standing; nothing written")
+        return 0
+    if not add and link_id not in before:
+        print(f"mark-standing: {args.topic} {link_id} is not standing; nothing written")
+        return 0
+    if add:
+        by_id = {str(l.get("link")): l for l in fm.get("links") or [] if isinstance(l, dict)}
+        problems = standing_link_problems(link_id, by_id.get(link_id))
+        if problems:
+            for problem in problems:
+                print(f"mark-standing: {problem}", file=sys.stderr)
+            print("mark-standing: nothing written", file=sys.stderr)
+            return 1
+    stamp = _now()
+    recorded_at = stamp.isoformat(timespec="seconds")
+    row = {
+        "link": link_id,
+        "action": "add" if add else "remove",
+        "date": recorded_at[:10],
+        "recorded_at": recorded_at,
+        "recorded_by": args.recorded_by or os.environ.get("MEMCONTINUUM_RECORDED_BY") or "memidx",
+        "authority": args.authority,
+        "source": source,
+        "why": why,
+    }
+    expect = before + [link_id] if add else [i for i in before if i != link_id]
+    old_rows = standing_mark_rows(fm)
+    try:
+        new_text = insert_standing_mark(edit_standing_line(old_text, link_id, add), row)
+    except ValueError as exc:
+        print(f"mark-standing: {exc}", file=sys.stderr)
+        return 1
+    ident = standing_mark_ident(row)
+
+    def roundtrips(new_fm: dict) -> str | None:
+        if standing_ids(new_fm) != expect:
+            return f"the edit would not round-trip the standing list as {expect}"
+        rows = standing_mark_rows(new_fm)
+        if not rows or standing_mark_ident(rows[0]) != ident or sum(
+                1 for r in rows if standing_mark_ident(r) == ident) != 1:
+            return "the edit would not put the new row first, once"
+        # YAML must read every field back as the string written (`True`, `123`,
+        # `2026-11-03` would be retyped); only `date` is a date, equal to recorded_at's
+        for k in STANDING_MARK_FIELDS:
+            got = rows[0].get(k)
+            if k == "date":
+                if not (isinstance(got, _date) and not isinstance(got, datetime)
+                        and got.isoformat() == recorded_at[:10]):
+                    return "the edit would not round-trip the new row's date as written"
+            elif not (isinstance(got, str) and got == row[k]):
+                return "the edit would not round-trip the new row's fields as written"
+        if rows[1:] != old_rows:
+            return "the edit would not leave the earlier rows unchanged"
+        return None
+
+    problem = edit_roundtrip_problem(new_text, path, roundtrips)
+    if problem:
+        print(f"mark-standing: {problem}; nothing written", file=sys.stderr)
         return 1
     apply_topic_edit(path, old_text, new_text, args.dry_run, root)
     return 0
@@ -12592,6 +12950,27 @@ def main(argv=None) -> int:
     p_bind.add_argument("--captured", choices=("ruling", "bind"), default="bind")
     p_bind.add_argument("--dry-run", action="store_true", help="print the exact diff, write nothing")
     p_bind.set_defaults(func=cmd_bind)
+
+    p_mark = sub.add_parser(
+        "mark-standing",
+        help="add or remove one link in a topic's `standing:` list and prepend the matching "
+             "`standing_marks:` row (the audit the store pre-commit guard requires); line "
+             "insertions into the topic file, never committed",
+    )
+    add_common_args(p_mark, need_root=True)
+    p_mark.add_argument("topic", metavar="TOP-xxxx")
+    p_mark.add_argument("link", metavar="Ln")
+    mark_action = p_mark.add_mutually_exclusive_group(required=True)
+    mark_action.add_argument("--add", action="store_true", help="make the link standing")
+    mark_action.add_argument("--remove", action="store_true", help="stop the link being standing")
+    p_mark.add_argument("--authority", required=True, choices=sorted(CONSTRAINT_AUTHORITIES),
+                        help="the authority of the ruling that approved this change")
+    p_mark.add_argument("--source", required=True, help="where the approval is recorded (one line)")
+    p_mark.add_argument("--why", required=True, help="one sentence, no line breaks")
+    p_mark.add_argument("--recorded-by", dest="recorded_by", default=None,
+                        help="default: $MEMCONTINUUM_RECORDED_BY, else 'memidx'")
+    p_mark.add_argument("--dry-run", action="store_true", help="print the exact diff, write nothing")
+    p_mark.set_defaults(func=cmd_mark_standing)
 
     p_propose = sub.add_parser(
         "propose-bindings",

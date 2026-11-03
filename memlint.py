@@ -35,6 +35,7 @@ import os
 import re
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import chunkers
@@ -71,7 +72,13 @@ from memidx import (
     parse_record,
     parse_record_raw,
     standing_digest_text,
+    STANDING_MARK_ACTIONS,
+    STANDING_MARK_FIELDS,
+    standing_ids,
     standing_line,
+    standing_link_problems,
+    standing_mark_ident,
+    standing_mark_rows,
     standing_sort_key,
     validated_evidence_list,
     walk_markdown,
@@ -211,6 +218,97 @@ def _anchor_errors(path, fm: dict, topic_link_ids: set) -> list[str]:
             "key in this release; a new baseline is a new link"
         )
     return errors
+
+
+_MARK_RECORDED_AT_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})")
+
+
+def _mark_time_problems(row: dict) -> list[str]:
+    """`recorded_at` must be ISO-8601 with an offset and `date` its date part
+    as written (the row's own offset, never converted)."""
+    recorded_at = row.get("recorded_at")
+    if not isinstance(recorded_at, str) or not _MARK_RECORDED_AT_RE.fullmatch(recorded_at):
+        return ["recorded_at must be a quoted ISO-8601 timestamp with an offset "
+                "(2026-11-03T09:12:41-05:00)"]
+    try:
+        datetime.fromisoformat(recorded_at)
+    except ValueError:
+        return ["recorded_at is not a valid ISO-8601 timestamp"]
+    if str(row.get("date")) != recorded_at[:10]:
+        return [f"date {str(row.get('date'))!r} is not the date part of recorded_at ({recorded_at[:10]!r})"]
+    return []
+
+
+def _standing_marks_errors(path, fm: dict, topic_link_ids: set) -> list[str]:
+    """Validation of a topic's `standing_marks:` rows (docs/SCHEMA.md, "Standing
+    marks"). Rows are NEVER required: a topic marked before this block existed
+    carries none and is clean (TOP-0136 L1)."""
+    rows = standing_mark_rows(fm)
+    errors: list[str] = []
+    seen: set = set()
+    for i, row in enumerate(rows):
+        prefix = (f"{path}: standing_marks[{i}] ({row.get('link')!r}, {row.get('action')!r}, "
+                  f"{row.get('recorded_at')!r})")
+        missing = [f for f in STANDING_MARK_FIELDS
+                   if row.get(f) is None or isinstance(row.get(f), (dict, list))
+                   or str(row.get(f)).strip() == ""]
+        unknown = [str(k) for k in row if k not in STANDING_MARK_FIELDS]
+        if missing:
+            errors.append(f"{prefix}: missing field(s) {missing}")
+        if unknown:
+            errors.append(f"{prefix}: unknown field(s) {unknown}")
+        if "action" not in missing and row.get("action") not in STANDING_MARK_ACTIONS:
+            errors.append(f"{prefix}: action {row.get('action')!r} must be one of "
+                          f"{list(STANDING_MARK_ACTIONS)}")
+        if "authority" not in missing and row.get("authority") not in CONSTRAINT_AUTHORITIES:
+            errors.append(f"{prefix}: authority {row.get('authority')!r} must be one of "
+                          f"{sorted(CONSTRAINT_AUTHORITIES)} (an agent-inference mark would put a "
+                          "constraint in every session start)")
+        if "recorded_by" not in missing and not isinstance(row.get("recorded_by"), str):
+            errors.append(f"{prefix}: recorded_by {row.get('recorded_by')!r} is not a string "
+                          "(YAML read it as another type; quote it)")
+        why = row.get("why")
+        if isinstance(why, str) and ("\n" in why or "\r" in why):
+            errors.append(f"{prefix}: why must be a single line (no CR/LF)")
+        if "recorded_at" not in missing:
+            errors.extend(f"{prefix}: {p}" for p in _mark_time_problems(row))
+        link = row.get("link")
+        if link is not None and str(link) not in topic_link_ids:
+            errors.append(f"{prefix}: link {link!r} is not a link in this topic")
+        ident = standing_mark_ident(row)
+        if ident is not None:
+            if ident in seen:
+                errors.append(f"{prefix}: duplicate row -- (link, action, recorded_at) identifies a row once")
+            seen.add(ident)
+    return errors
+
+
+def _standing_pointer_errors(path, fm: dict, topic_links_by_id: dict) -> list[str]:
+    """Duplicate ids in `standing:` and the eligibility of every pointer
+    (memidx.standing_link_problems). One definition for the plain-mode
+    `lint_topic` and for the staged blob in `check_append_only` (TOP-0137 L14:
+    the hook lints the worktree, so the staged side needs the same rules)."""
+    errors: list[str] = []
+    standing_seen: set = set()
+    for lid in fm.get("standing") or []:
+        lid_str = str(lid)
+        if lid_str in standing_seen:
+            errors.append(f"{path}: standing lists {lid_str!r} more than once")
+            continue
+        standing_seen.add(lid_str)
+        errors.extend(
+            f"{path}: {problem}"
+            for problem in standing_link_problems(lid_str, topic_links_by_id.get(lid_str))
+        )
+    return errors
+
+
+def _staged_standing_errors(path, fm: dict, links: list) -> list[str]:
+    """The plain-mode `standing:` / `standing_marks:` rules, run on the blob
+    that is about to be committed (rows' fields and authority, duplicate and
+    ineligible pointers)."""
+    by_id = {str(l.get("link")): l for l in links if l.get("link")}
+    return _standing_pointer_errors(path, fm, by_id) + _standing_marks_errors(path, fm, set(by_id))
 
 
 def lint_topic(
@@ -406,54 +504,14 @@ def lint_topic(
     # link is an error ON PURPOSE (it forces the supersession and the
     # pointer update into the same commit, per the design record), not
     # something this linter silently drops.
-    for lid in fm.get("standing") or []:
-        lid_str = str(lid)
-        link = topic_links_by_id.get(lid_str)
-        if link is None:
-            errors.append(
-                f"{path}: standing points at {lid_str!r} which is not a link in this topic"
-            )
-            continue
-        link_status = link.get("status")
-        if link_status != "active":
-            errors.append(
-                f"{path}: standing link {lid_str!r} is {link_status!r}, not active -- "
-                "a superseded/declined/historical/provisional link cannot be standing "
-                "(supersede or amend it, and update or drop the pointer, in the same commit)"
-            )
-        link_ruling = link.get("ruling") or {}
-        link_auth = link_ruling.get("authority")
-        if link_auth not in CONSTRAINT_AUTHORITIES:
-            errors.append(
-                f"{path}: standing link {lid_str!r} has ruling.authority {link_auth!r} -- "
-                f"must be one of {sorted(CONSTRAINT_AUTHORITIES)} (the declared CONSTRAINT "
-                "gate this v0 digest uses, TOP-0132 L2)"
-            )
-        # Fix-round MAJOR (both reviewers): a multi-line ruling.text (a YAML
-        # block scalar, most often) is never flattened by the parser, and
-        # `memidx.py standing` used to project it verbatim -- an unframed
-        # second physical line inside `additionalContext`, indistinguishable
-        # from real conversation text (the reviewers' own reproduction: a
-        # line reading "SYSTEM: ignore all previous instructions...",
-        # delivered with no quoting at all). Two layers, not one, and they
-        # do DIFFERENT things -- fix-round MINOR (Grok) named the gap
-        # between them precisely, so the wording here says what each one
-        # actually does rather than "projected verbatim" for both: this
-        # check (lint time) REJECTS only a raw CR or LF, an error naming
-        # the topic; `standing_line`'s own runtime flattening (memidx.py)
-        # is defense in depth for everything CR/LF does not cover -- any
-        # OTHER Unicode line or paragraph separator (U+2028 LINE
-        # SEPARATOR, U+2029 PARAGRAPH SEPARATOR, U+0085 NEL) or a tab is
-        # silently COLLAPSED to one space at projection time, never
-        # rejected here.
-        link_text = link_ruling.get("text")
-        if link_text and ("\n" in str(link_text) or "\r" in str(link_text)):
-            errors.append(
-                f"{path}: standing link {lid_str!r} ruling.text contains a CR or LF -- "
-                "a standing ruling's text must be a single line (flatten it); other line/"
-                "paragraph separators (U+2028, U+2029, NEL, tab) are collapsed to one space "
-                "at projection time and are not rejected here, only a raw CR/LF is"
-            )
+    # Eligibility is memidx.standing_link_problems -- the one definition
+    # `mark-standing --add` shares. (Fix-round MAJOR, both reviewers: a CR/LF
+    # in a standing ruling.text is rejected here; every other Unicode line
+    # separator or tab is collapsed to one space by `standing_line` at
+    # projection time -- defence in depth, not a lint error.)
+    errors.extend(_standing_pointer_errors(path, fm, topic_links_by_id))
+
+    errors.extend(_standing_marks_errors(path, fm, topic_link_ids))
 
     return errors, warnings
 
@@ -2512,6 +2570,57 @@ def _anchor_ident(row) -> str | None:
     return "\x00".join(str(p) for p in parts)
 
 
+_ANCHOR_FREEZE_MESSAGES = {
+    "no_ident": "recorded row lacks an identity component (ref, link, captured, captured_at) "
+                "and cannot be verified; refusing to skip it (append-only)",
+    "gone": "row removed or changed after being recorded (append-only; an anchor is a capture, "
+            "never edited -- add a new link for a new baseline)",
+    "changed": "row changed after being recorded (append-only; an anchor is a capture, never edited)",
+    "no_span": "row's span could not be extracted on the new side; treated as changed "
+               "(append-only; a recorded anchor must stay byte-verifiable)",
+    "reformatted": "row reformatted, not appended (append-only; raw text changed after being "
+                   "recorded while its parsed fields did not)",
+}
+
+
+def _frozen_rows_errors(old_rows: list, new_rows: list, ident, name, old_spans, new_spans,
+                        messages: dict) -> list[str]:
+    """The shared append-only loop for a frozen row list (`anchors:`,
+    `standing_marks:`): every row recorded at REF must survive with the same
+    parsed fields AND the same raw bytes (`old_spans`/`new_spans` are
+    `_link_raw_spans` maps keyed by `ident(row)`, or None when unavailable).
+    `name(row)` prefixes each message; `messages` supplies the wording."""
+    errors: list[str] = []
+    # multiplicity kept: a pair of identical rows at REF reduced to one is a removal
+    new_by_ident: dict[str, list] = {}
+    for row in new_rows:
+        key = ident(row)
+        if key is not None:
+            new_by_ident.setdefault(key, []).append(row)
+    taken: dict[str, int] = {}
+    for row in old_rows:
+        key = ident(row)
+        label = name(row)
+        if key is None:
+            errors.append(f"{label}: {messages['no_ident']}")
+            continue
+        n = taken.get(key, 0)
+        taken[key] = n + 1
+        candidates = new_by_ident.get(key, [])
+        new_row = candidates[n] if n < len(candidates) else None
+        if new_row is None:
+            errors.append(f"{label}: {messages['gone']}")
+        elif new_row != row:
+            errors.append(f"{label}: {messages['changed']}")
+        elif old_spans is not None and key in old_spans:
+            new_span = new_spans.get(key) if new_spans is not None else None
+            if new_span is None:
+                errors.append(f"{label}: {messages['no_span']}")
+            elif _link_bytes_changed(old_spans[key], new_span):
+                errors.append(f"{label}: {messages['reformatted']}")
+    return errors
+
+
 def _anchor_freeze_errors(full_path, old_text, old_rows: list, new_text, new_rows: list,
                           notes: list[str]) -> list[str]:
     """The append-only rule for `anchors:` rows: a row recorded at REF must
@@ -2540,48 +2649,171 @@ def _anchor_freeze_errors(full_path, old_text, old_rows: list, new_text, new_row
             f"{full_path}: could not verify recorded anchors' raw text at REF "
             "(structural extraction inconclusive); anchors compared by parsed fields only"
         )
-    # multiplicity kept: a pair of identical rows at REF reduced to one is a removal
-    new_by_ident: dict[str, list] = {}
-    for row in new_rows:
-        ident = _anchor_ident(row)
-        if ident is not None:
-            new_by_ident.setdefault(ident, []).append(row)
-    taken: dict[str, int] = {}
-    for row in old_rows:
-        ident = _anchor_ident(row)
-        name = f"{full_path}: anchor ({row.get('ref')!r}, {row.get('link')!r})"
-        if ident is None:
-            errors.append(
-                f"{name}: recorded row lacks an identity component (ref, link, captured, "
-                "captured_at) and cannot be verified; refusing to skip it (append-only)"
-            )
-            continue
-        n = taken.get(ident, 0)
-        taken[ident] = n + 1
-        candidates = new_by_ident.get(ident, [])
-        new_row = candidates[n] if n < len(candidates) else None
-        if new_row is None:
-            errors.append(
-                f"{name}: row removed or changed after being recorded (append-only; "
-                "an anchor is a capture, never edited -- add a new link for a new baseline)"
-            )
-        elif new_row != row:
-            errors.append(
-                f"{name}: row changed after being recorded (append-only; an anchor is a "
-                "capture, never edited)"
-            )
-        elif old_spans is not None and ident in old_spans:
-            new_span = new_spans.get(ident) if new_spans is not None else None
-            if new_span is None:
-                errors.append(
-                    f"{name}: row's span could not be extracted on the new side; treated as "
-                    "changed (append-only; a recorded anchor must stay byte-verifiable)"
-                )
-            elif _link_bytes_changed(old_spans[ident], new_span):
-                errors.append(
-                    f"{name}: row reformatted, not appended (append-only; raw text changed "
-                    "after being recorded while its parsed fields did not)"
-                )
+    errors.extend(_frozen_rows_errors(
+        old_rows, new_rows, _anchor_ident,
+        lambda row: f"{full_path}: anchor ({row.get('ref')!r}, {row.get('link')!r})",
+        old_spans, new_spans, _ANCHOR_FREEZE_MESSAGES,
+    ))
+    return errors
+
+
+# ---------------------------------------------------------------------------
+# TOP-0137 L14: `standing:` / `current:` / link order under the guard. The rules
+# (SCHEMA section 7, g1-g4) judge the REF blob against the staged one; nothing
+# here reads the index or the code. Rows of `standing_marks:` are an audit,
+# never delivered; this is the only place that makes them mandatory.
+# ---------------------------------------------------------------------------
+
+
+def _mark_span_ident(row) -> str | None:
+    """`standing_mark_ident` as the string key `_link_raw_spans` maps by."""
+    ident = standing_mark_ident(row)
+    return "\x00".join(ident) if ident is not None else None
+
+
+_MARK_FREEZE_MESSAGES = {
+    "no_ident": "recorded row lacks an identity component (link, action, recorded_at) and "
+                "cannot be verified; refusing to skip it (append-only)",
+    "gone": "row removed after being recorded (append-only; a standing mark is never deleted)",
+    "changed": "row changed after being recorded (append-only; a standing mark is never edited)",
+    "no_span": "row's span could not be extracted on the new side; treated as changed "
+               "(append-only; a recorded standing mark must stay byte-verifiable)",
+    "reformatted": "row reformatted, not appended (append-only; raw text changed after being "
+                   "recorded while its parsed fields did not)",
+}
+
+
+def _standing_marks_freeze_errors(full_path, old_text, old_rows: list, new_text, new_rows: list) -> list[str]:
+    """g1: every `standing_marks:` row recorded at REF survives with the same
+    parsed fields and the same raw bytes, in the same relative order, and every
+    new row sits ABOVE every old one (newest first). Unlike anchors, a span
+    walker that cannot account for an existing OR a new block is an ERROR, not
+    a note -- otherwise the block's first commit would get parsed-field
+    protection only."""
+    errors: list[str] = []
+    old_spans = (
+        _link_raw_spans(old_text, old_rows, key="standing_marks", ident=_mark_span_ident)
+        if old_rows and old_text is not None else None
+    )
+    new_spans = (
+        _link_raw_spans(new_text, new_rows, key="standing_marks", ident=_mark_span_ident)
+        if new_rows and new_text is not None else None
+    )
+    if old_rows and old_spans is None:
+        errors.append(
+            f"{full_path}: standing_marks: could not verify the recorded rows' raw text at REF "
+            "(structural extraction inconclusive); refusing to treat them as unchanged"
+        )
+    if new_rows and new_spans is None:
+        errors.append(
+            f"{full_path}: standing_marks: could not extract the rows' raw text from the new "
+            "block (structural extraction inconclusive); refusing to treat it as appended"
+        )
+
+    def name(row):
+        return (f"{full_path}: standing mark ({row.get('link')}, {row.get('action')}, "
+                f"{row.get('recorded_at')})")
+
+    errors.extend(_frozen_rows_errors(old_rows, new_rows, _mark_span_ident, name,
+                                      old_spans, new_spans, _MARK_FREEZE_MESSAGES))
+    old_keys = [k for k in (_mark_span_ident(r) for r in old_rows) if k is not None]
+    old_set = set(old_keys)
+    new_keys = [_mark_span_ident(r) for r in new_rows]
+    survivors = [k for k in new_keys if k in old_set]
+    if survivors != [k for k in old_keys if k in set(new_keys)]:
+        errors.append(f"{full_path}: standing_marks: recorded rows reordered (append-only; "
+                      "rows keep the order they were recorded in, newest first)")
+    seen_old = False
+    for k in new_keys:
+        if k in old_set:
+            seen_old = True
+        elif seen_old:
+            errors.append(f"{full_path}: standing_marks: marks not prepended (a new row must sit "
+                          "above every recorded row, newest first)")
+            break
+    return errors
+
+
+def _standing_pairing_errors(full_path, old_ids: set, new_ids: set, new_pairs: list) -> list[str]:
+    """g2: the multiset of `(id, action)` the `standing:` change REQUIRES must
+    equal the multiset of `(link, action)` of the rows added in this commit."""
+    required = [(i, "add") for i in sorted(new_ids - old_ids)] + \
+               [(i, "remove") for i in sorted(old_ids - new_ids)]
+    errors: list[str] = []
+    for pair in required:
+        n = new_pairs.count(pair)
+        if n == 0:
+            errors.append(f"{full_path}: standing changed for {pair[0]} ({pair[1]}) with no "
+                          "matching standing_marks row")
+        elif n > 1:
+            errors.append(f"{full_path}: duplicate standing mark for ({pair[0]}, {pair[1]}) in one commit")
+    for pair in new_pairs:
+        if pair not in required:
+            errors.append(f"{full_path}: orphan standing mark ({pair[0]}, {pair[1]}): standing: "
+                          "did not change that way")
+    return errors
+
+
+def _link_order_errors(full_path, old_links: list, new_links: list) -> list[str]:
+    """g3: the link ids recorded at REF keep their relative file order in the
+    new blob (new ids go on top: a new id between old ones is refused by the older newest-first check) -- the chain head is the first
+    active link in file order, so a reorder is a silent re-ruling."""
+    old_order = []
+    for l in old_links:
+        lid = l.get("link")
+        if lid is not None and str(lid) not in old_order:
+            old_order.append(str(lid))
+    pos = {lid: i for i, lid in enumerate(old_order)}
+    kept = [str(l.get("link")) for l in new_links if l.get("link") is not None and str(l.get("link")) in pos]
+    for x, y in zip(kept, kept[1:]):
+        if pos[x] > pos[y]:
+            return [f"{full_path}: links reordered ({x} before {y}; the chain head is "
+                    "first-active-in-file-order)"]
+    return []
+
+
+def _head_id(links: list) -> str | None:
+    head = newest_active_link(links)
+    return str(head.get("link")) if head is not None and head.get("link") is not None else None
+
+
+def _staged_head_errors(full_path, new_fm: dict, new_links: list) -> list[str]:
+    """The half of g4 that needs no REF: a written `current:` must name the
+    newest active link of the staged blob."""
+    cur_new = None if new_fm.get("current") is None else str(new_fm["current"])
+    head_new = _head_id(new_links)
+    if cur_new is not None and cur_new != head_new:
+        return [f"{full_path}: current: {cur_new!r} does not match the newest active link "
+                f"of the staged file -- should be {head_new!r}"]
+    return []
+
+
+def _current_discipline_errors(full_path, old_fm: dict, old_links: list, new_fm: dict, new_links: list) -> list[str]:
+    """g4: a written `current:` must name the newest active link of the STAGED
+    blob (SCHEMA section 7, now judged on what is about to be committed), and
+    it may only move when the newest active link moved -- or when it repairs a
+    disagreement that already existed at REF."""
+    cur_old = None if old_fm.get("current") is None else str(old_fm["current"])
+    cur_new = None if new_fm.get("current") is None else str(new_fm["current"])
+    head_old, head_new = _head_id(old_links), _head_id(new_links)
+    errors: list[str] = _staged_head_errors(full_path, new_fm, new_links)
+    if cur_new != cur_old:
+        repair = cur_old != head_old and cur_new == head_new and head_new == head_old
+        if head_new == head_old and not repair:
+            errors.append(f"{full_path}: current changed {cur_old} -> {cur_new} without a change "
+                          "of the newest active link")
+    return errors
+
+
+def _standing_guard_errors(full_path, old_fm: dict, old_text, new_fm: dict, new_text) -> list[str]:
+    """g1 + g2 for one topic present at both sides."""
+    old_rows, new_rows = standing_mark_rows(old_fm), standing_mark_rows(new_fm)
+    errors = _standing_marks_freeze_errors(full_path, old_text, old_rows, new_text, new_rows)
+    old_set = {k for k in (_mark_span_ident(r) for r in old_rows) if k is not None}
+    new_pairs = [(str(r.get("link")), str(r.get("action"))) for r in new_rows
+                 if _mark_span_ident(r) not in old_set]
+    errors.extend(_standing_pairing_errors(
+        full_path, set(standing_ids(old_fm)), set(standing_ids(new_fm)), new_pairs))
     return errors
 
 
@@ -2646,6 +2878,16 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
                     links = _recovered_old_links(added.frontmatter) or []
                 else:
                     links = added.frontmatter.get("links") or []
+                    # g2 for a brand-new topic: every id in `standing:` needs its `add`
+                    # row, and rows with an empty `standing:` are orphans
+                    added_rows = standing_mark_rows(added.frontmatter)
+                    errors.extend(_standing_pairing_errors(
+                        full_path, set(), set(standing_ids(added.frontmatter)),
+                        [(str(r.get("link")), str(r.get("action"))) for r in added_rows]))
+                    # ... and the plain-mode rules on the STAGED blob (the hook lints only the
+                    # worktree copy, INC-0127): rows, pointers, `current:` == head
+                    errors.extend(_staged_standing_errors(full_path, added.frontmatter, links))
+                    errors.extend(_staged_head_errors(full_path, added.frontmatter, links))
                 errors.extend(_added_links_errors(full_path, links, set()))
             continue
 
@@ -2695,7 +2937,10 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
         repair_note = None
         if not old_result.valid:
             old_links = _recovered_old_links(old_result.frontmatter)
-            if old_links is None:
+            if old_links is None and (old_result.fallback or not old_result.frontmatter):
+                # Shapes (ii)/(iii) of TOP-0137 L14 F1: the lenient fallback parse (or no
+                # mapping at all) -- `standing` is not among the fallback fields, so the
+                # old membership is unknown and cannot be paired.
                 if new_result.valid:
                     # Grok M2 / whole-branch-review MODERATE-1: the REF-side
                     # blob never parsed -- it recorded no link history at all
@@ -2710,6 +2955,10 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
                         f"parsed ({old_reasons}); the new blob parses cleanly, so there is "
                         "no recorded link history here to protect"
                     )
+                    notes.append(
+                        f"{full_path}: standing membership at {ref} unrecoverable "
+                        "(fallback parse); pairing not checked"
+                    )
                     # Re-gate (Grok BLOCK on 90f3960): nothing to freeze,
                     # but every link in the repaired blob is NEW -- judge them.
                     # old_links is None here: REF recorded no recoverable
@@ -2722,6 +2971,16 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
                         full_path, _decode_or_none(old_blob), anchor_rows(old_result.frontmatter),
                         _decode_or_none(new_blob), anchor_rows(new_result.frontmatter), notes,
                     ))
+                    # ... and so do the standing marks (g1), and every row and pointer of the
+                    # new blob meets the plain-mode rules (pairing cannot run: see the note)
+                    errors.extend(_standing_marks_freeze_errors(
+                        full_path, _decode_or_none(old_blob), standing_mark_rows(old_result.frontmatter),
+                        _decode_or_none(new_blob), standing_mark_rows(new_result.frontmatter),
+                    ))
+                    errors.extend(_staged_standing_errors(
+                        full_path, new_result.frontmatter, new_result.frontmatter.get("links") or []))
+                    errors.extend(_staged_head_errors(
+                        full_path, new_result.frontmatter, new_result.frontmatter.get("links") or []))
                     continue
                 # Both sides unparseable: still fail closed (test_j: malformed
                 # -> malformed is still refused), reported from the OLD side's
@@ -2729,23 +2988,34 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
                 for field, message in old_result.diagnostics:
                     errors.append(f"{full_path}: {field}: {message} (at {ref})")
                 continue
-            # Grok re-gate MAJOR 1: the REF blob failed full validation but
-            # its `links` were still recovered (see _recovered_old_links) --
-            # there IS recorded link history here, so the repair/skip path
-            # above must not apply. Fall through to the ordinary comparison
-            # below using the recovered links instead.
-            old_reasons = "; ".join(message for _field, message in old_result.diagnostics)
-            raw_links = old_result.frontmatter.get("links")
-            dup_note = (
-                " (a duplicate link id was recovered as its first occurrence)"
-                if isinstance(raw_links, list) and len(raw_links) != len(old_links)
-                else ""
-            )
-            repair_note = (
-                f"{full_path}: the blob at {ref} could not be safely parsed "
-                f"({old_reasons}){dup_note}, but its links were recovered and are "
-                "still compared against the current blob for append-only violations"
-            )
+            if old_links is None:
+                # Shape (i): a parsed mapping whose links are absent/empty/id-less. Its
+                # `standing`, marks and `current` are on the dict: full g1-g4, no old links.
+                old_links = []
+                old_reasons = "; ".join(message for _field, message in old_result.diagnostics)
+                repair_note = (
+                    f"{full_path}: the blob at {ref} could not be safely parsed ({old_reasons}) and "
+                    "recorded no usable links; its standing, standing_marks and current are still "
+                    "compared against the current blob"
+                )
+            else:
+                # Grok re-gate MAJOR 1: the REF blob failed full validation but
+                # its `links` were still recovered (see _recovered_old_links) --
+                # there IS recorded link history here, so the repair/skip path
+                # above must not apply. Fall through to the ordinary comparison
+                # below using the recovered links instead.
+                old_reasons = "; ".join(message for _field, message in old_result.diagnostics)
+                raw_links = old_result.frontmatter.get("links")
+                dup_note = (
+                    " (a duplicate link id was recovered as its first occurrence)"
+                    if isinstance(raw_links, list) and len(raw_links) != len(old_links)
+                    else ""
+                )
+                repair_note = (
+                    f"{full_path}: the blob at {ref} could not be safely parsed "
+                    f"({old_reasons}){dup_note}, but its links were recovered and are "
+                    "still compared against the current blob for append-only violations"
+                )
         else:
             old_links = old_result.frontmatter.get("links") or []
 
@@ -2870,10 +3140,20 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
                         "instead of regenerating the file)"
                     )
 
+        errors.extend(_link_order_errors(full_path, old_links, new_links_full))
+
         errors.extend(_anchor_freeze_errors(
             full_path, old_text, anchor_rows(old_result.frontmatter),
             new_text, anchor_rows(new_result.frontmatter), notes,
         ))
+
+        # TOP-0137 L14: `standing:` changes need their marks (g1, g2) and `current:`
+        # moves only with the newest active link (g4)
+        errors.extend(_standing_guard_errors(
+            full_path, old_result.frontmatter, old_text, new_result.frontmatter, new_text))
+        errors.extend(_current_discipline_errors(
+            full_path, old_result.frontmatter, old_links, new_result.frontmatter, new_links_full))
+        errors.extend(_staged_standing_errors(full_path, new_result.frontmatter, new_links_full))
 
     return errors, changed, notes
 
@@ -2996,9 +3276,11 @@ Append-only history mode (a second, independent check -- given
                      must be unchanged; its three lifecycle fields --
                      status, superseded_by, promoted_by -- may each move
                      forward once. A link removed, or a topic file deleted
-                     or renamed, is an error. New links, and changes to
-                     current/title/tags/code_refs/standing/the body text outside a
-                     link, are free. A REF that never parsed is repaired
+                     or renamed, is an error. New links (above every recorded
+                     one), and changes to title/tags/code_refs/the body text
+                     outside a link, are free; a `standing:` change needs its
+                     `standing_marks:` rows, link order is frozen, and `current`
+                     moves only with the newest active link. A REF that never parsed is repaired
                      (a note, not an error) when the new side now parses
                      cleanly -- there is no recorded link history to
                      freeze on a blob that was never validly a record.

@@ -36,6 +36,22 @@
   first and no topic is dropped to make room for one. Without `--code-root`
   the pack is unchanged.
 
+### Standing
+- A topic's `standing:` list is now under the store's pre-commit guard. Every
+  change to it leaves a dated, attributed row in a new frozen `standing_marks:`
+  block on the same topic (who, when, on whose word; owner authority only).
+  Rows are an audit: they are never delivered, never indexed and add nothing
+  to the standing digest. `memlint.py --against-ref` refuses a commit whose
+  `standing:` change has no matching new row, whose new rows match no change,
+  or that touches a recorded row; it also refuses a reordering of existing
+  links, and a `current:` that moves without the newest active link moving.
+  Topics marked before this change have no rows and are not flagged.
+- New `memidx.py mark-standing TOP-xxxx Ln --add|--remove --authority ...
+  --source ... --why ...` makes the change and writes the row by inserting
+  lines into the topic file (`--dry-run` prints the exact diff; nothing is
+  committed for you).
+- `memlint.py` now reports a `standing:` list that names the same link twice.
+
 ### Retrieval
 - New `memidx.py context-pack FILE... [--topic ID] [--query WORDS] [--blind]`
   prints one paste-ready block of decision records for a brief to an external

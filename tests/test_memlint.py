@@ -1132,6 +1132,9 @@ class TestMemlintAgainstRef(unittest.TestCase):
                 "    status: active\n    kind: adopted\n    ruling:\n      text: \"second ruling\"",
                 "    status: superseded\n    superseded_by: L1\n    kind: adopted\n    ruling:\n      text: \"second ruling\"",
             )
+            # no active link is left, so `current:` goes with it (TOP-0137 L14 g4: a
+            # written `current:` must name the newest active link of the staged file)
+            text = text.replace("current: L2\n", "", 1)
             self.assertNotEqual(text, TOPIC_L1_L2, "fixture edit must actually change the text")
             (root / "topics" / "foo.md").write_text(text)
             rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
@@ -2926,8 +2929,10 @@ class TestStandingGateMutation(unittest.TestCase):
             test.debug()
 
     def test_widening_the_authority_gate_defeats_the_agent_inference_case(self):
+        # the eligibility gate lives in memidx.standing_link_problems (shared
+        # with `mark-standing --add`); memlint calls it
         with mock.patch.object(
-            memlint, "CONSTRAINT_AUTHORITIES",
+            memidx, "CONSTRAINT_AUTHORITIES",
             {"owner-verbatim", "owner-ratified", "agent-inference"},
         ):
             self._assert_defeated("test_pointer_to_agent_inference_link_is_an_error")
