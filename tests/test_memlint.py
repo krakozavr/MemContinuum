@@ -2926,8 +2926,10 @@ class TestStandingGateMutation(unittest.TestCase):
             test.debug()
 
     def test_widening_the_authority_gate_defeats_the_agent_inference_case(self):
+        # the eligibility gate lives in memidx.standing_link_problems (shared
+        # with `mark-standing --add`); memlint calls it
         with mock.patch.object(
-            memlint, "CONSTRAINT_AUTHORITIES",
+            memidx, "CONSTRAINT_AUTHORITIES",
             {"owner-verbatim", "owner-ratified", "agent-inference"},
         ):
             self._assert_defeated("test_pointer_to_agent_inference_link_is_an_error")

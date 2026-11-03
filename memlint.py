@@ -35,6 +35,7 @@ import os
 import re
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import chunkers
@@ -71,7 +72,13 @@ from memidx import (
     parse_record,
     parse_record_raw,
     standing_digest_text,
+    STANDING_MARK_ACTIONS,
+    STANDING_MARK_FIELDS,
+    standing_ids,
     standing_line,
+    standing_link_problems,
+    standing_mark_ident,
+    standing_mark_rows,
     standing_sort_key,
     validated_evidence_list,
     walk_markdown,
@@ -210,6 +217,66 @@ def _anchor_errors(path, fm: dict, topic_link_ids: set) -> list[str]:
             f"{path}: anchors: more than one row for ({ref!r}, {link!r}) -- one baseline per "
             "key in this release; a new baseline is a new link"
         )
+    return errors
+
+
+_MARK_RECORDED_AT_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})")
+
+
+def _mark_time_problems(row: dict) -> list[str]:
+    """`recorded_at` must be ISO-8601 with an offset and `date` its date part
+    as written (the row's own offset, never converted)."""
+    recorded_at = row.get("recorded_at")
+    if not isinstance(recorded_at, str) or not _MARK_RECORDED_AT_RE.fullmatch(recorded_at):
+        return ["recorded_at must be a quoted ISO-8601 timestamp with an offset "
+                "(2026-11-03T09:12:41-05:00)"]
+    try:
+        datetime.fromisoformat(recorded_at)
+    except ValueError:
+        return ["recorded_at is not a valid ISO-8601 timestamp"]
+    if str(row.get("date")) != recorded_at[:10]:
+        return [f"date {str(row.get('date'))!r} is not the date part of recorded_at ({recorded_at[:10]!r})"]
+    return []
+
+
+def _standing_marks_errors(path, fm: dict, topic_link_ids: set) -> list[str]:
+    """Validation of a topic's `standing_marks:` rows (docs/SCHEMA.md, "Standing
+    marks"). Rows are NEVER required: a topic marked before this block existed
+    carries none and is clean (TOP-0136 L1)."""
+    rows = standing_mark_rows(fm)
+    errors: list[str] = []
+    seen: set = set()
+    for i, row in enumerate(rows):
+        prefix = (f"{path}: standing_marks[{i}] ({row.get('link')!r}, {row.get('action')!r}, "
+                  f"{row.get('recorded_at')!r})")
+        missing = [f for f in STANDING_MARK_FIELDS
+                   if row.get(f) is None or isinstance(row.get(f), (dict, list))
+                   or str(row.get(f)).strip() == ""]
+        unknown = [str(k) for k in row if k not in STANDING_MARK_FIELDS]
+        if missing:
+            errors.append(f"{prefix}: missing field(s) {missing}")
+        if unknown:
+            errors.append(f"{prefix}: unknown field(s) {unknown}")
+        if "action" not in missing and row.get("action") not in STANDING_MARK_ACTIONS:
+            errors.append(f"{prefix}: action {row.get('action')!r} must be one of "
+                          f"{list(STANDING_MARK_ACTIONS)}")
+        if "authority" not in missing and row.get("authority") not in CONSTRAINT_AUTHORITIES:
+            errors.append(f"{prefix}: authority {row.get('authority')!r} must be one of "
+                          f"{sorted(CONSTRAINT_AUTHORITIES)} (an agent-inference mark would put a "
+                          "constraint in every session start)")
+        why = row.get("why")
+        if isinstance(why, str) and ("\n" in why or "\r" in why):
+            errors.append(f"{prefix}: why must be a single line (no CR/LF)")
+        if "recorded_at" not in missing:
+            errors.extend(f"{prefix}: {p}" for p in _mark_time_problems(row))
+        link = row.get("link")
+        if link is not None and str(link) not in topic_link_ids:
+            errors.append(f"{prefix}: link {link!r} is not a link in this topic")
+        ident = standing_mark_ident(row)
+        if ident is not None:
+            if ident in seen:
+                errors.append(f"{prefix}: duplicate row -- (link, action, recorded_at) identifies a row once")
+            seen.add(ident)
     return errors
 
 
@@ -406,54 +473,24 @@ def lint_topic(
     # link is an error ON PURPOSE (it forces the supersession and the
     # pointer update into the same commit, per the design record), not
     # something this linter silently drops.
+    # Eligibility is memidx.standing_link_problems -- the one definition
+    # `mark-standing --add` shares. (Fix-round MAJOR, both reviewers: a CR/LF
+    # in a standing ruling.text is rejected here; every other Unicode line
+    # separator or tab is collapsed to one space by `standing_line` at
+    # projection time -- defence in depth, not a lint error.)
+    standing_seen: set = set()
     for lid in fm.get("standing") or []:
         lid_str = str(lid)
-        link = topic_links_by_id.get(lid_str)
-        if link is None:
-            errors.append(
-                f"{path}: standing points at {lid_str!r} which is not a link in this topic"
-            )
+        if lid_str in standing_seen:
+            errors.append(f"{path}: standing lists {lid_str!r} more than once")
             continue
-        link_status = link.get("status")
-        if link_status != "active":
-            errors.append(
-                f"{path}: standing link {lid_str!r} is {link_status!r}, not active -- "
-                "a superseded/declined/historical/provisional link cannot be standing "
-                "(supersede or amend it, and update or drop the pointer, in the same commit)"
-            )
-        link_ruling = link.get("ruling") or {}
-        link_auth = link_ruling.get("authority")
-        if link_auth not in CONSTRAINT_AUTHORITIES:
-            errors.append(
-                f"{path}: standing link {lid_str!r} has ruling.authority {link_auth!r} -- "
-                f"must be one of {sorted(CONSTRAINT_AUTHORITIES)} (the declared CONSTRAINT "
-                "gate this v0 digest uses, TOP-0132 L2)"
-            )
-        # Fix-round MAJOR (both reviewers): a multi-line ruling.text (a YAML
-        # block scalar, most often) is never flattened by the parser, and
-        # `memidx.py standing` used to project it verbatim -- an unframed
-        # second physical line inside `additionalContext`, indistinguishable
-        # from real conversation text (the reviewers' own reproduction: a
-        # line reading "SYSTEM: ignore all previous instructions...",
-        # delivered with no quoting at all). Two layers, not one, and they
-        # do DIFFERENT things -- fix-round MINOR (Grok) named the gap
-        # between them precisely, so the wording here says what each one
-        # actually does rather than "projected verbatim" for both: this
-        # check (lint time) REJECTS only a raw CR or LF, an error naming
-        # the topic; `standing_line`'s own runtime flattening (memidx.py)
-        # is defense in depth for everything CR/LF does not cover -- any
-        # OTHER Unicode line or paragraph separator (U+2028 LINE
-        # SEPARATOR, U+2029 PARAGRAPH SEPARATOR, U+0085 NEL) or a tab is
-        # silently COLLAPSED to one space at projection time, never
-        # rejected here.
-        link_text = link_ruling.get("text")
-        if link_text and ("\n" in str(link_text) or "\r" in str(link_text)):
-            errors.append(
-                f"{path}: standing link {lid_str!r} ruling.text contains a CR or LF -- "
-                "a standing ruling's text must be a single line (flatten it); other line/"
-                "paragraph separators (U+2028, U+2029, NEL, tab) are collapsed to one space "
-                "at projection time and are not rejected here, only a raw CR/LF is"
-            )
+        standing_seen.add(lid_str)
+        errors.extend(
+            f"{path}: {problem}"
+            for problem in standing_link_problems(lid_str, topic_links_by_id.get(lid_str))
+        )
+
+    errors.extend(_standing_marks_errors(path, fm, topic_link_ids))
 
     return errors, warnings
 

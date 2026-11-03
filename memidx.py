@@ -6525,6 +6525,74 @@ def _decision_vector_index_state(conn: sqlite3.Connection, project: str) -> str:
     return "partial"
 
 
+# TOP-0137 L14: `standing_marks:` -- the frozen audit of `standing:` membership
+# changes, on the same topic. Rows are never delivered, never indexed, never in
+# the digest; only memlint (plain rules + the --against-ref guard) and
+# `mark-standing` read or write them.
+STANDING_MARK_FIELDS = ("link", "action", "date", "recorded_at", "recorded_by", "authority",
+                        "source", "why")
+STANDING_MARK_QUOTED_FIELDS = frozenset({"recorded_at", "source", "why"})
+STANDING_MARK_ACTIONS = ("add", "remove")
+
+
+def standing_mark_rows(fm: dict) -> list:
+    """The well-formed (mapping) rows of a topic's `standing_marks:` list."""
+    return _mapping_rows(fm, "standing_marks")
+
+
+def standing_mark_ident(row) -> tuple | None:
+    """Identity of a mark row: `(link, action, recorded_at)` as strings, None
+    when any part is missing or not a scalar."""
+    if not isinstance(row, dict):
+        return None
+    parts = [row.get(k) for k in ("link", "action", "recorded_at")]
+    if any(p is None or isinstance(p, (dict, list)) or str(p).strip() == "" for p in parts):
+        return None
+    return tuple(str(p) for p in parts)
+
+
+def standing_ids(fm: dict) -> list:
+    """A topic's `standing:` pointers as strings, in written order; [] for an
+    absent or wrongly shaped value (a lenient-fallback parse can leave a bare
+    string there)."""
+    value = fm.get("standing")
+    return [str(x) for x in value] if isinstance(value, list) else []
+
+
+def standing_link_problems(link_id: str, link: dict | None) -> list:
+    """Why `link_id` cannot be a `standing:` pointer of a topic whose link with
+    that id is `link` (None: no such link) -- an empty list means eligible.
+    Messages carry no path prefix. The one definition behind memlint's
+    standing-pointer errors and `mark-standing --add`."""
+    if link is None:
+        return [f"standing points at {link_id!r} which is not a link in this topic"]
+    problems = []
+    link_status = link.get("status")
+    if link_status != "active":
+        problems.append(
+            f"standing link {link_id!r} is {link_status!r}, not active -- "
+            "a superseded/declined/historical/provisional link cannot be standing "
+            "(supersede or amend it, and update or drop the pointer, in the same commit)"
+        )
+    link_ruling = link.get("ruling") or {}
+    link_auth = link_ruling.get("authority")
+    if link_auth not in CONSTRAINT_AUTHORITIES:
+        problems.append(
+            f"standing link {link_id!r} has ruling.authority {link_auth!r} -- "
+            f"must be one of {sorted(CONSTRAINT_AUTHORITIES)} (the declared CONSTRAINT "
+            "gate this v0 digest uses, TOP-0132 L2)"
+        )
+    link_text = link_ruling.get("text")
+    if link_text and ("\n" in str(link_text) or "\r" in str(link_text)):
+        problems.append(
+            f"standing link {link_id!r} ruling.text contains a CR or LF -- "
+            "a standing ruling's text must be a single line (flatten it); other line/"
+            "paragraph separators (U+2028, U+2029, NEL, tab) are collapsed to one space "
+            "at projection time and are not rejected here, only a raw CR/LF is"
+        )
+    return problems
+
+
 def standing_entries(conn, project: str) -> list:
     """The eligible standing pointers of `project`, sorted: one
     `(topic_id, link_id, authority, ruling_text)` tuple per pointer that
@@ -12136,6 +12204,198 @@ def cmd_bind(args) -> int:
 
 
 # ---------------------------------------------------------------------------
+# standing_marks: `mark-standing` (TOP-0137 L14)
+# ---------------------------------------------------------------------------
+#
+# The one narrow writer for a topic's `standing:` membership. It edits the
+# `standing:` line IN PLACE and prepends one row to `standing_marks:` -- both
+# line insertions (a YAML dumper would reformat every frozen link). memlint's
+# --against-ref guard (check_append_only) is the other half: a `standing:`
+# change without its matching row is refused at commit.
+
+
+def _now() -> datetime:
+    """The local time, aware, whole seconds (a seam the tests replace)."""
+    return datetime.now().astimezone().replace(microsecond=0)
+
+
+def _flow_list_parts(rest: str):
+    """`(inner, tail)` of a one-line flow list `[a, b]  # note`, else None."""
+    m = re.fullmatch(r"\[(.*)\](\s*#.*)?", rest)
+    return (m.group(1), m.group(2) or "") if m else None
+
+
+def _scalar_token(token: str) -> str:
+    return token.strip().strip("'\"")
+
+
+def edit_standing_line(text: str, link_id: str, add: bool) -> str:
+    """`text` with `link_id` added to (appended) or removed from the topic's
+    `standing:` list, editing that list in place: a flow list stays a flow list
+    and a block list a block list (converting would reformat history); removing
+    the last id leaves `standing: []`; an absent key is created as
+    `standing: [Ln]` before `standing_marks:`/`anchors:`/`links:`. Raises
+    ValueError when the structure does not allow a safe edit."""
+    nl = _newline_of(text)
+    lines = _split_lines_keep(text)
+    first, end = _fm_line_bounds(lines)
+    if end == 0:
+        raise ValueError("no frontmatter block")
+    idx = _top_key_index(lines, first, end, "standing")
+    if idx is None:
+        if not add:
+            return text
+        found = [i for i in (_top_key_index(lines, first, end, k)
+                             for k in ("standing_marks", "anchors", "links")) if i is not None]
+        if not found:
+            raise ValueError("no `links:` key to place `standing:` before")
+        lines.insert(min(found), f"standing: [{link_id}]{nl}")
+        return "".join(lines)
+    rest = lines[idx].rstrip("\r\n").split(":", 1)[1].strip()
+    flow = _flow_list_parts(rest)
+    block_last = _block_last_line(lines, idx, end)
+    if flow is not None:
+        inner, tail = flow
+        tokens = [t for t in (x.strip() for x in inner.split(",")) if t]
+        if add:
+            tokens.append(link_id)
+        else:
+            tokens = [t for t in tokens if _scalar_token(t) != link_id]
+        lines[idx] = f"standing: [{', '.join(tokens)}]{tail}{nl}"
+        return "".join(lines)
+    if rest in ("", "null", "~") and block_last == idx:
+        if add:
+            lines[idx] = f"standing: [{link_id}]{nl}"
+        return "".join(lines)
+    if rest != "":
+        raise ValueError("`standing:` is neither a flow list nor a block list; refusing to edit it")
+    if add:
+        indent = _block_item_indent(lines, idx, block_last)
+        if not lines[block_last].endswith("\n"):
+            lines[block_last] += nl
+        lines.insert(block_last + 1, f"{indent}- {link_id}{nl}")
+        return "".join(lines)
+    items = [i for i in range(idx + 1, block_last + 1)
+             if lines[i].lstrip().startswith("- ")]
+    drop = [i for i in items
+            if _scalar_token(re.sub(r"\s+#.*$", "", lines[i].strip()[2:])) == link_id]
+    if not drop:
+        return text
+    del lines[drop[0]]
+    if len(items) == 1:
+        lines[idx] = f"standing: []{nl}"
+    return "".join(lines)
+
+
+def _after_standing_key(lines: list, first: int, end: int) -> int:
+    """`create_at` for `standing_marks:`: right after the `standing:` block."""
+    idx = _top_key_index(lines, first, end, "standing")
+    if idx is None:
+        raise ValueError("no `standing:` key to place `standing_marks:` after")
+    last = _block_last_line(lines, idx, end)
+    if not lines[last].endswith("\n"):
+        lines[last] += _newline_of("".join(lines))
+    return last + 1
+
+
+def insert_standing_mark(text: str, row: dict) -> str:
+    """`text` with one `standing_marks:` row PREPENDED (newest first), the key
+    created right after `standing:` when absent."""
+    return _insert_block_row(text, "standing_marks", row, STANDING_MARK_FIELDS,
+                             STANDING_MARK_QUOTED_FIELDS, True, _after_standing_key)
+
+
+def cmd_mark_standing(args) -> int:
+    """`memidx.py mark-standing TOP-xxxx Ln (--add | --remove) --authority A
+    --source TEXT --why TEXT --root STORE [--recorded-by NAME] [--dry-run]` --
+    change the topic's `standing:` list by one link and prepend the matching
+    `standing_marks:` row, as line insertions; print the diff, never commit.
+    One call, one row. rc 1: refused (unknown topic, ineligible link, bad
+    text, file does not parse, edit would not round-trip)."""
+    root = Path(args.root).resolve()
+    link_id = args.link
+    add = bool(args.add)
+    why, source = args.why, args.source
+    for name, value in (("--why", why), ("--source", source)):
+        if not value.strip():
+            print(f"mark-standing: {name} must not be empty", file=sys.stderr)
+            return 1
+        if len(value.splitlines()) != 1:
+            print(f"mark-standing: {name} must be a single line", file=sys.stderr)
+            return 1
+    path = _topic_file_for_id(root, args.topic)
+    if path is None:
+        print(f"mark-standing: no topic {args.topic!r} under {args.root}/topics", file=sys.stderr)
+        return 1
+    try:
+        old_text = read_record_bytes_strict(path)
+    except UnicodeDecodeError as exc:
+        print(f"mark-standing: {path.name} is not valid UTF-8 ({exc}); nothing written", file=sys.stderr)
+        return 1
+    result = parse_record_raw(old_text, path)
+    if not result.valid:
+        print(f"mark-standing: {path.name} does not parse cleanly: "
+              f"{'; '.join(m for _f, m in result.diagnostics)}", file=sys.stderr)
+        return 1
+    fm = result.frontmatter
+    before = standing_ids(fm)
+    if add and link_id in before:
+        print(f"mark-standing: {args.topic} {link_id} is already standing; nothing written")
+        return 0
+    if not add and link_id not in before:
+        print(f"mark-standing: {args.topic} {link_id} is not standing; nothing written")
+        return 0
+    if add:
+        by_id = {str(l.get("link")): l for l in fm.get("links") or [] if isinstance(l, dict)}
+        problems = standing_link_problems(link_id, by_id.get(link_id))
+        if problems:
+            for problem in problems:
+                print(f"mark-standing: {problem}", file=sys.stderr)
+            print("mark-standing: nothing written", file=sys.stderr)
+            return 1
+    stamp = _now()
+    recorded_at = stamp.isoformat(timespec="seconds")
+    row = {
+        "link": link_id,
+        "action": "add" if add else "remove",
+        "date": recorded_at[:10],
+        "recorded_at": recorded_at,
+        "recorded_by": args.recorded_by or os.environ.get("MEMCONTINUUM_RECORDED_BY") or "memidx",
+        "authority": args.authority,
+        "source": source,
+        "why": why,
+    }
+    expect = before + [link_id] if add else [i for i in before if i != link_id]
+    old_rows = standing_mark_rows(fm)
+    try:
+        new_text = insert_standing_mark(edit_standing_line(old_text, link_id, add), row)
+    except ValueError as exc:
+        print(f"mark-standing: {exc}", file=sys.stderr)
+        return 1
+    ident = standing_mark_ident(row)
+
+    def roundtrips(new_fm: dict) -> str | None:
+        if standing_ids(new_fm) != expect:
+            return f"the edit would not round-trip the standing list as {expect}"
+        rows = standing_mark_rows(new_fm)
+        if not rows or standing_mark_ident(rows[0]) != ident or sum(
+                1 for r in rows if standing_mark_ident(r) == ident) != 1:
+            return "the edit would not put the new row first, once"
+        if any(str(rows[0].get(k)) != str(row[k]) for k in STANDING_MARK_FIELDS):
+            return "the edit would not round-trip the new row's fields as written"
+        if rows[1:] != old_rows:
+            return "the edit would not leave the earlier rows unchanged"
+        return None
+
+    problem = edit_roundtrip_problem(new_text, path, roundtrips)
+    if problem:
+        print(f"mark-standing: {problem}; nothing written", file=sys.stderr)
+        return 1
+    apply_topic_edit(path, old_text, new_text, args.dry_run, root)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # anchors: proposals from the session ledger (propose-bindings)
 # ---------------------------------------------------------------------------
 #
@@ -12634,6 +12894,27 @@ def main(argv=None) -> int:
     p_bind.add_argument("--captured", choices=("ruling", "bind"), default="bind")
     p_bind.add_argument("--dry-run", action="store_true", help="print the exact diff, write nothing")
     p_bind.set_defaults(func=cmd_bind)
+
+    p_mark = sub.add_parser(
+        "mark-standing",
+        help="add or remove one link in a topic's `standing:` list and prepend the matching "
+             "`standing_marks:` row (the audit the store pre-commit guard requires); line "
+             "insertions into the topic file, never committed",
+    )
+    add_common_args(p_mark, need_root=True)
+    p_mark.add_argument("topic", metavar="TOP-xxxx")
+    p_mark.add_argument("link", metavar="Ln")
+    mark_action = p_mark.add_mutually_exclusive_group(required=True)
+    mark_action.add_argument("--add", action="store_true", help="make the link standing")
+    mark_action.add_argument("--remove", action="store_true", help="stop the link being standing")
+    p_mark.add_argument("--authority", required=True, choices=sorted(CONSTRAINT_AUTHORITIES),
+                        help="the authority of the ruling that approved this change")
+    p_mark.add_argument("--source", required=True, help="where the approval is recorded (one line)")
+    p_mark.add_argument("--why", required=True, help="one sentence, no line breaks")
+    p_mark.add_argument("--recorded-by", dest="recorded_by", default=None,
+                        help="default: $MEMCONTINUUM_RECORDED_BY, else 'memidx'")
+    p_mark.add_argument("--dry-run", action="store_true", help="print the exact diff, write nothing")
+    p_mark.set_defaults(func=cmd_mark_standing)
 
     p_propose = sub.add_parser(
         "propose-bindings",
