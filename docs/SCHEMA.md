@@ -376,7 +376,7 @@ pre-commit hook reads):
   pointers, and, for an added topic, `current:` equal to its newest active link. When `REF` parsed
   to a mapping whose links are unrecoverable, `standing:`, marks and `current:` are still compared;
   when `REF` was only readable through the lenient fallback parse the old membership is unknown, so
-  pairing is skipped with the note `standing membership at REF unrecoverable (fallback parse);
+  pairing is skipped (the staged `current:` check still runs) with the note `standing membership at REF unrecoverable (fallback parse);
   pairing not checked`.
 
 Grandfathering (a stricter check judges only what is written after it): a topic marked before this

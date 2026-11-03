@@ -12220,9 +12220,54 @@ def _now() -> datetime:
 
 
 def _flow_list_parts(rest: str):
-    """`(inner, tail)` of a one-line flow list `[a, b]  # note`, else None."""
-    m = re.fullmatch(r"\[([^\[\]]*)\](\s*#.*)?", rest)
-    return (m.group(1), m.group(2) or "") if m else None
+    """`(inner, tail)` of a one-line flow list `[a, b]  # note`, else None. The
+    list closes at the `]` matching the opening `[`, skipping quoted scalars
+    (a `]` or `#` inside quotes is data); no nesting is legal here."""
+    if not rest.startswith("["):
+        return None
+    quote = None
+    i = 1
+    while i < len(rest):
+        c = rest[i]
+        if quote:
+            if quote == '"' and c == "\\":
+                i += 1
+            elif c == quote:
+                quote = None
+        elif c in "'\"":
+            quote = c
+        elif c == "[":
+            return None
+        elif c == "]":
+            tail = rest[i + 1:]
+            return (rest[1:i], tail) if re.fullmatch(r"(\s*#.*)?", tail) else None
+        i += 1
+    return None
+
+
+def _split_flow_items(inner: str) -> list:
+    """The comma-separated items of a flow list body, commas inside quotes kept."""
+    items, cur, quote, i = [], "", None, 0
+    while i < len(inner):
+        c = inner[i]
+        if quote:
+            cur += c
+            if quote == '"' and c == "\\" and i + 1 < len(inner):
+                i += 1
+                cur += inner[i]
+            elif c == quote:
+                quote = None
+        elif c in "'\"":
+            quote = c
+            cur += c
+        elif c == ",":
+            items.append(cur)
+            cur = ""
+        else:
+            cur += c
+        i += 1
+    items.append(cur)
+    return [t for t in (x.strip() for x in items) if t]
 
 
 def _scalar_token(token: str) -> str:
@@ -12256,7 +12301,7 @@ def edit_standing_line(text: str, link_id: str, add: bool) -> str:
     block_last = _block_last_line(lines, idx, end)
     if flow is not None:
         inner, tail = flow
-        tokens = [t for t in (x.strip() for x in inner.split(",")) if t]
+        tokens = _split_flow_items(inner)
         if add:
             tokens.append(link_id)
         else:

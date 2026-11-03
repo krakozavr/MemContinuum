@@ -519,6 +519,34 @@ class TestMarkStandingCommand(MarkCase):
         self.assertIn("\nstanding: [] # keep [owner]\n", self.read())
         self.assertLintClean()
 
+    def test_quoted_brackets_and_hashes_in_a_flow_list(self):
+        cases = (('standing: ["L]2"] # keep [owner]', "L]2"), ('standing: ["a]b"]', "a]b"),
+                 ('standing: ["a#b"] # keep [owner]', "a#b"), ('standing: ["a, b"]', "a, b"))
+        for line, ident in cases:
+            for add in (True, False):
+                with self.subTest(line=line, add=add):
+                    tail = line[line.index("]", line.rindex('"')) + 1:]
+                    if add:
+                        self.write(topic_text(standing=line + "\n"))
+                        rc, _o, err = self.mark("L3", "--add")
+                        self.assertEqual(rc, 0, err)
+                        self.assertIn(f'standing: ["{ident}", L3]{tail}\n', self.read())
+                    else:
+                        links = DEFAULT_LINKS + (link_yaml(ident, text="odd"),)
+                        self.write(topic_text(standing=line + "\n", links=links))
+                        rc, _o, err = self.mark(ident, "--remove")
+                        self.assertEqual(rc, 0, err)
+                        self.assertIn(f"standing: []{tail}\n", self.read())
+
+    def test_flow_list_spellings_that_worked_before_still_work(self):
+        for line, want in (("standing: [] # c", "standing: [L3] # c"), ("standing: []#c", "standing: [L3]#c"),
+                           ("standing: [ L2 ]", "standing: [L2, L3]"), ("standing: [ L2 , L4 ]", "standing: [L2, L4, L3]")):
+            with self.subTest(line=line):
+                self.write(topic_text(standing=line + "\n"))
+                rc, _o, err = self.mark("L3", "--add")
+                self.assertEqual(rc, 0, err)
+                self.assertIn("\n" + want + "\n", self.read())
+
     def test_every_write_reparses_with_earlier_bytes_untouched(self):
         original = self.write(topic_text(standing="standing: [L2]\n", marks=marks_block(mark_yaml("L2", recorded_at="2026-11-01T08:00:00-05:00"))))
         self.mark("L3", "--add")
@@ -875,6 +903,29 @@ class TestRepairShapes(GuardCase):
         self.assertEqual(rc, 0, out)
         self.assertIn("standing membership at HEAD unrecoverable (fallback parse); pairing not checked", out)
         self.assertIn("foo.md", out)
+
+    def test_fallback_ref_still_checks_staged_current_against_the_head(self):
+        ref = base_text().replace("title: Marks fixture", "title: Marks: fixture")
+        self.store(ref)
+        self.assertRefused(base_text(current="L2"), "current: 'L2' does not match the newest active link")
+        rc, out = self.guard(base_text())
+        self.assertEqual(rc, 0, out)
+        self.assertIn("pairing not checked", out)
+
+    def test_literal_empty_links_ref_tags_repair_is_clean_with_the_note(self):
+        ref = ("---\ntype: topic\nid: TOP-9100\ntitle: Marks fixture\narea: memory\n"
+               "tags: not-a-list\nstanding: []\nlinks: []\n---\n\nBody.\n")
+        self.store(ref)
+        rc, out = self.guard(ref.replace("tags: not-a-list", "tags: []"))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("recorded no usable links", out)
+
+    def test_literal_empty_links_with_a_dangling_current_is_refused(self):
+        ref = ("---\ntype: topic\nid: TOP-9100\ntitle: Marks fixture\narea: memory\ncurrent: L2\n"
+               "tags: not-a-list\nstanding: []\nlinks: []\n---\n\nBody.\n")
+        self.store(ref)
+        self.assertRefused(ref.replace("tags: not-a-list", "tags: []"),
+                           "current: 'L2' does not match the newest active link")
 
     def test_fallback_ref_still_applies_the_row_rules_to_new_rows(self):
         ref = base_text().replace("title: Marks fixture", "title: Marks: fixture")

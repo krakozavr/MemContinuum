@@ -2777,6 +2777,17 @@ def _head_id(links: list) -> str | None:
     return str(head.get("link")) if head is not None and head.get("link") is not None else None
 
 
+def _staged_head_errors(full_path, new_fm: dict, new_links: list) -> list[str]:
+    """The half of g4 that needs no REF: a written `current:` must name the
+    newest active link of the staged blob."""
+    cur_new = None if new_fm.get("current") is None else str(new_fm["current"])
+    head_new = _head_id(new_links)
+    if cur_new is not None and cur_new != head_new:
+        return [f"{full_path}: current: {cur_new!r} does not match the newest active link "
+                f"of the staged file -- should be {head_new!r}"]
+    return []
+
+
 def _current_discipline_errors(full_path, old_fm: dict, old_links: list, new_fm: dict, new_links: list) -> list[str]:
     """g4: a written `current:` must name the newest active link of the STAGED
     blob (SCHEMA section 7, now judged on what is about to be committed), and
@@ -2785,10 +2796,7 @@ def _current_discipline_errors(full_path, old_fm: dict, old_links: list, new_fm:
     cur_old = None if old_fm.get("current") is None else str(old_fm["current"])
     cur_new = None if new_fm.get("current") is None else str(new_fm["current"])
     head_old, head_new = _head_id(old_links), _head_id(new_links)
-    errors: list[str] = []
-    if cur_new is not None and cur_new != head_new:
-        errors.append(f"{full_path}: current: {cur_new!r} does not match the newest active link "
-                      f"of the staged file -- should be {head_new!r}")
+    errors: list[str] = _staged_head_errors(full_path, new_fm, new_links)
     if cur_new != cur_old:
         repair = cur_old != head_old and cur_new == head_new and head_new == head_old
         if head_new == head_old and not repair:
@@ -2879,7 +2887,7 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
                     # ... and the plain-mode rules on the STAGED blob (the hook lints only the
                     # worktree copy, INC-0127): rows, pointers, `current:` == head
                     errors.extend(_staged_standing_errors(full_path, added.frontmatter, links))
-                    errors.extend(_current_discipline_errors(full_path, {}, [], added.frontmatter, links))
+                    errors.extend(_staged_head_errors(full_path, added.frontmatter, links))
                 errors.extend(_added_links_errors(full_path, links, set()))
             continue
 
@@ -2970,6 +2978,8 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
                         _decode_or_none(new_blob), standing_mark_rows(new_result.frontmatter),
                     ))
                     errors.extend(_staged_standing_errors(
+                        full_path, new_result.frontmatter, new_result.frontmatter.get("links") or []))
+                    errors.extend(_staged_head_errors(
                         full_path, new_result.frontmatter, new_result.frontmatter.get("links") or []))
                     continue
                 # Both sides unparseable: still fail closed (test_j: malformed
