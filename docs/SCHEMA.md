@@ -370,6 +370,14 @@ pre-commit hook reads):
   that already existed at `REF`. A new `provisional` link does not change the head, so it never
   licenses a `current` change; removing `current:` while the head is unchanged is refused, adding one
   to a topic that lacked it is a repair.
+- *The plain-mode rules run on the staged blob too.* The store hook lints only the working tree, so
+  for every modified or added topic the guard itself applies the `standing_marks:` row rules
+  (including owner-only `authority`), the duplicate-id and eligibility rules for `standing:`
+  pointers, and, for an added topic, `current:` equal to its newest active link. When `REF` parsed
+  to a mapping whose links are unrecoverable, `standing:`, marks and `current:` are still compared;
+  when `REF` was only readable through the lenient fallback parse the old membership is unknown, so
+  pairing is skipped with the note `standing membership at REF unrecoverable (fallback parse);
+  pairing not checked`.
 
 Grandfathering (a stricter check judges only what is written after it): a topic marked before this
 block existed has no rows and produces no error and no warning — rows are required only for a
