@@ -546,8 +546,21 @@ class TestMarkStandingCommand(MarkCase):
         self.write(topic_text(standing="standing: [L2, O'Reilly]\n"))
         self.assertIn("[L2, O'Reilly, L3]", memidx.edit_standing_line(self.read(), "L3", True))
 
+    def test_escaped_apostrophes_in_single_quoted_items_end_to_end(self):
+        for token in ("'O''Reilly'", "'a''b'"):
+            with self.subTest(token=token):
+                self.write(topic_text(standing=f"standing: [{token}, L2]\n"))
+                rc, _o, err = self.mark("L3", "--add")
+                self.assertEqual(rc, 0, err)
+                self.assertIn(f"\nstanding: [{token}, L2, L3]\n", self.read())
+                rc, _o, err = self.mark("L2", "--remove")
+                self.assertEqual(rc, 0, err)
+                self.assertIn(f"\nstanding: [{token}, L3]\n", self.read())
+
     def test_flow_list_helper_edge_cases(self):
         parts = memidx._flow_list_parts
+        self.assertEqual(parts("['a''']"), (["'a'''"], ""))
+        self.assertIsNone(parts("['a'']"))
         self.assertIsNone(parts("[L2,\n L3]"))
         self.assertIsNone(parts("[L2,\r L3]"))
         self.assertIsNone(parts('["abc, L2]'))

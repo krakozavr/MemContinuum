@@ -12244,8 +12244,9 @@ def _flow_list_parts(rest: str):
         if rest[i] in "'\"":
             quote = rest[i]
             i += 1
-            while i < n and rest[i] != quote:
-                i += 2 if quote == '"' and rest[i] == "\\" else 1
+            while i < n and (rest[i] != quote or rest[i:i + 2] == "''" and quote == "'"):
+                # `\x` in double quotes and `''` in single quotes are escapes: stay inside
+                i += 2 if (quote == '"' and rest[i] == "\\") or rest[i] == quote else 1
             if i >= n:
                 return None
             i += 1
