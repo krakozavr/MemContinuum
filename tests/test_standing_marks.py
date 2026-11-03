@@ -794,5 +794,156 @@ TestLinkOrderAndCurrentSymlinkedTmp = _symlinked(TestLinkOrderAndCurrent)
 TestAddedTopicsSymlinkedTmp = _symlinked(TestAddedTopics)
 
 
+
+# ---------------------------------------------------------------------------
+# marks are never delivered (TOP-0137 L14 point 1)
+# ---------------------------------------------------------------------------
+
+SENTINEL_WHY = "SENTINEL-why-7c41e9"
+SENTINEL_SOURCE = "SENTINEL-source-2b86d0"
+SENTINEL_STAMP = "2031-05-06T07:08:09-05:00"
+
+
+def delivery_topic(with_marks):
+    marks = marks_block(mark_yaml("L1", recorded_at=SENTINEL_STAMP, source=SENTINEL_SOURCE,
+                                  why=SENTINEL_WHY, by="SENTINEL-by-55aa")) if with_marks else ""
+    return (
+        "---\ntype: topic\nid: TOP-9101\ntitle: Delivery fixture\narea: testing\ncurrent: L1\n"
+        "tags: []\ncode_refs:\n  - src/x.py\nstanding: [L1]\n"
+        f"{marks}"
+        "links:\n  - link: L1\n    date: '2026-01-01'\n    status: active\n    kind: adopted\n"
+        "    ruling: {text: a standing ruling, authority: owner-ratified, source: s}\n"
+        "---\n\nBody.\n"
+    )
+
+
+class TestMarksAreNeverDelivered(TmpCase):
+    def setUp(self):
+        super().setUp()
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        patcher = mock.patch.dict(os.environ, {"MEMCONTINUUM_HOME": str(self.home)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def routes(self, with_marks):
+        tag = "m" if with_marks else "n"
+        store = self.tmp / f"store-{tag}"
+        (store / "topics").mkdir(parents=True)
+        (store / "topics" / "a.md").write_text(delivery_topic(with_marks), encoding="utf-8")
+        db = self.tmp / f"idx-{tag}.sqlite"
+        rc, _o, err = run_memidx(["reindex", "--root", str(store), "--project", "p", "--db", str(db), "--no-embed"])
+        self.assertEqual(rc, 0, err)
+        base = ["--project", "p", "--db", str(db), "--root", str(store)]
+        calls = {
+            "for-path": ["for-path", "src/x.py", *base, "--json", "--with-chain-text"],
+            "context-pack": ["context-pack", "src/x.py", *base],
+            "context-pack --json": ["context-pack", "src/x.py", *base, "--json"],
+            "context-pack --topic": ["context-pack", "--topic", "TOP-9101", *base],
+            "standing": ["standing", *base],
+            "standing --json": ["standing", *base, "--json"],
+            "chain": ["chain", "TOP-9101", *base],
+            "chain --json": ["chain", "TOP-9101", *base, "--json"],
+            "search": ["search", "standing ruling", *base],
+        }
+        out = {}
+        for name, argv in calls.items():
+            rc, stdout, stderr = run_memidx(argv)
+            self.assertEqual(rc, 0, f"{name}: {stderr}")
+            out[name] = stdout
+        return out
+
+    def test_no_route_carries_a_mark(self):
+        marked = self.routes(True)
+        for name, text in marked.items():
+            with self.subTest(route=name):
+                self.assertTrue(text.strip(), "the route printed nothing, so the check proves nothing")
+                for needle in ("standing_marks", SENTINEL_WHY, SENTINEL_SOURCE, SENTINEL_STAMP,
+                               "SENTINEL-by-55aa"):   # (links carry their own recorded_at column: not a needle)
+                    self.assertNotIn(needle, text)
+
+    def test_the_digest_is_the_same_with_and_without_rows(self):
+        marked, plain = self.routes(True), self.routes(False)
+        self.assertIn("TOP-9101 L1", marked["standing"])
+        for name in ("standing", "standing --json", "chain", "chain --json"):
+            with self.subTest(route=name):
+                a, b = marked[name], plain[name]
+                if name.startswith("standing"):
+                    # the digest carries its own byte count and hash; strip store-path noise
+                    self.assertEqual(a.replace(str(self.tmp / "store-m"), "S"),
+                                     b.replace(str(self.tmp / "store-n"), "S"))
+
+    def test_the_index_has_no_column_for_marks(self):
+        self.routes(True)
+        import sqlite3
+        conn = sqlite3.connect(f"file:{self.tmp / 'idx-m.sqlite'}?mode=ro", uri=True)
+        try:
+            parts = []
+            tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+            for table in tables:
+                try:
+                    parts.extend(str(r) for r in conn.execute(f'SELECT * FROM "{table}"'))
+                except Exception:  # virtual tables whose module is not loaded
+                    continue
+            dump = "\n".join(parts)
+        finally:
+            conn.close()
+        self.assertNotIn(SENTINEL_WHY, dump)
+        self.assertNotIn(SENTINEL_STAMP, dump)
+
+
+# ---------------------------------------------------------------------------
+# end to end through hooks/pre-commit-append-only.sh
+# ---------------------------------------------------------------------------
+
+@unittest.skipUnless(VENV_PYTHON, "set $MEMCONTINUUM_PYTHON to a venv python with PyYAML (see README.md)")
+class TestStandingMarksThroughTheHook(TmpCase):
+    def setUp(self):
+        super().setUp()
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        self.store = git_store(self.tmp / "store")
+        (self.store / "topics" / "foo.md").write_text(base_text(marks=""))
+        commit_all(self.store)
+        patcher = mock.patch.object(memidx, "_now", return_value=NOW)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_hook(self):
+        env = dict(os.environ)
+        env.pop("PYTHONPATH", None)
+        for k in list(env):
+            if k.startswith("MEMCONTINUUM_"):
+                del env[k]
+        env.update(HOME=str(self.tmp), MEMCONTINUUM_HOME=str(self.home), MEMCONTINUUM_ROOT=str(self.store),
+                   MEMCONTINUUM_PROJECT="marks-proj", MEMCONTINUUM_PYTHON=VENV_PYTHON)
+        git(["add", "-A"], self.store)
+        return subprocess.run([MC_BASH, str(PRE_COMMIT_HOOK)], capture_output=True, text=True,
+                              env=env, timeout=30, cwd=str(self.store))
+
+    def test_a_bare_standing_edit_is_blocked_and_the_command_edit_commits(self):
+        path = self.store / "topics" / "foo.md"
+        original = path.read_text()
+        path.write_text(original.replace("standing: [L2]", "standing: [L2, L3]"))
+        proc = self.run_hook()
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("standing changed for L3 (add) with no matching standing_marks row", proc.stderr)
+        self.assertIn("pre-commit-append-only: rc=1", (self.home / "hook.log").read_text())
+
+        git(["reset", "-q", "--hard"], self.store)
+        self.assertEqual(path.read_text(), original)
+        rc, _o, err = run_memidx(["mark-standing", "TOP-9100", "L3", "--add", "--authority", "owner-ratified",
+                                  "--source", "owner message", "--why", "needed at every start",
+                                  "--root", str(self.store)])
+        self.assertEqual(rc, 0, err)
+        proc = self.run_hook()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("pre-commit-append-only: rc=0", (self.home / "hook.log").read_text().splitlines()[-1])
+        git(["commit", "-q", "--no-verify", "-m", "mark"], self.store)
+        # and the committed state is the next REF: a later bare removal is blocked again
+        path.write_text(path.read_text().replace("standing: [L2, L3]", "standing: [L2]"))
+        self.assertEqual(self.run_hook().returncode, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
