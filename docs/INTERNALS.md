@@ -2644,6 +2644,8 @@ Topic-chain rules:
 | a `standing:` entry's link is not `status: active` | error — even a valid successor does not clear it; the supersession and the pointer's own update/removal must land in the same commit |
 | a `standing:` entry's link's `ruling.authority` is not `owner-verbatim`/`owner-ratified` | error |
 | a `standing:` entry's link's `ruling.text` contains a raw CR or LF (a YAML block scalar, most often) | error — flatten it to one line. Any OTHER line/paragraph separator (U+2028, U+2029, NEL, a tab) is not an error here — `standing_line` collapses it to one space at projection time |
+| a `standing:` list names the same link id twice | error |
+| a `standing_marks:` row is malformed: not a mapping, a field missing or unknown, `action` not `add`/`remove`, `authority` not `owner-verbatim`/`owner-ratified`, empty `source`/`why`, a CR/LF in `why`, `recorded_at` not ISO-8601 with an offset, `date` not its date part, `link` not a link of this topic, or a repeated `(link, action, recorded_at)` | error naming the row (`_standing_marks_errors`); rows are never required, so a topic without any is clean (grandfathering: a stricter check judges only what is written after it) |
 | the store-wide `standing:` set (every topic's pointers together, in the projection's own order) exceeds 24 links or 4,800 bytes (UTF-8) of the complete digest (header, every line, and the newlines joining them) | error (corpus-wide; names every topic whose pointer sits past whichever line is crossed first) |
 
 Concept-record rules (`type: concept` files). `--code-root` is repeatable —
@@ -2757,7 +2759,11 @@ id:
 | a link present at `REF` has its PARSED fields unchanged but its RAW TEXT SPAN changed (a YAML dumper re-render: different quoting, key order, wrapping, or a whitespace-only edit, with identical parsed content) | error, `<path>:<link>: link reformatted, not appended` — the field-level comparison above never fires for these (every field is equal), so the span is compared byte-for-byte separately; a span that cannot be safely attributed to its link on the `REF` side (structural extraction inconclusive — see below) skips this comparison with a NOTE, never an error — the field-level rules above still apply |
 | the same, but the span cannot be attributed on the NEW side (structural extraction inconclusive there instead) while the `REF` side extracted fine | error, `<path>:<link>: link's span could not be extracted on the new side; treated as changed` — a deliberately different message from the row above: this is a proven extraction FAILURE treated as a change (fail closed), never a claim that the bytes were actually compared and found to differ |
 | an `anchors:` row present at `REF` is missing now, has a changed parsed field, or has the same fields in different raw text; or two rows now carry one `(ref, link)` | error naming the row, `<path>: anchor (<ref>, <link>): row changed after being recorded` / `row reformatted, not appended` / `more than one row` — the same raw-span walker as the links row above, keyed by `anchors:` and by `(ref, link, captured, captured_at)`; new rows are free; row multiplicity at `REF` is kept, so a duplicated pair reduced to one row errors as removed |
-| a new link (present now, absent at `REF`) sorts BELOW some link that already existed at `REF`, in the new file's own link order | error, `<path>:<link>: link inserted out of order` — every new link must sort above every `REF`-side link, newest-first; reordering AMONG `REF`-side links themselves is not separately checked |
+| a new link (present now, absent at `REF`) sorts BELOW some link that already existed at `REF`, in the new file's own link order | error, `<path>:<link>: link inserted out of order` — every new link must sort above every `REF`-side link, newest-first |
+| the link ids present at `REF` appear in a different relative order now (g3, `_link_order_errors`) | error, `<path>: links reordered (L2 before L3; the chain head is first-active-in-file-order)` — every per-link span can be intact while the chain head moves |
+| a `standing_marks:` row present at `REF` is missing now, has a changed parsed field, has the same fields in different raw text, or the rows are reordered or a new row sits below an old one (g1, `_standing_marks_freeze_errors`) | error, `<path>: standing mark (<link>, <action>, <recorded_at>): row changed after being recorded` / `row removed after being recorded` / `row reformatted, not appended`, `marks not prepended`, `recorded rows reordered` — the same raw-span walker as links and anchors (`key="standing_marks"`, identity `(link, action, recorded_at)`) through the shared `_frozen_rows_errors`; unlike anchors, a block the walker cannot account for at `REF` or in the new blob is an error, not a note; also run when `REF` never parsed |
+| the `standing:` set changed without exactly one matching new row per added/removed id (g2, `_standing_pairing_errors`) | error, `standing changed for L4 (add) with no matching standing_marks row` / `orphan standing mark (L4, add): standing: did not change that way` / `duplicate standing mark for (L4, add) in one commit`; a remove+add of one id with the set unchanged is two orphans; a reorder with the same set is free; a brand-new topic is paired against an empty `REF` set |
+| `current:` names a link other than the staged blob's newest active link, or changes (including removal) without a change of the newest active link and without repairing a disagreement already present at `REF` (g4, `_current_discipline_errors`) | error, `<path>: current: 'L2' does not match the newest active link of the staged file -- should be 'L3'` / `<path>: current changed L3 -> L2 without a change of the newest active link` |
 | the `REF`-side blob failed full validation (a shape error, or a duplicate link id) but its `links` field itself still recovers at least one usable entry | not a repair — those recovered links (a duplicate id keeps its FIRST occurrence, file order) are still compared against the new side by every rule above, exactly as if the REF blob had parsed cleanly, with a note naming the REF-side diagnostic that made the blob invalid |
 | the `REF`-side blob never parsed at all (or parsed but recovered no usable `links`), and the new blob now parses cleanly | a note, not an error (`repaired — the blob at REF could not be safely parsed …`) — nothing here was ever recorded link history to freeze, so fixing it is a repair, never an append-only violation. `anchors:` rows are NOT part of that repair: any anchor rows the REF blob still yields stay frozen on this branch too (a changed or removed row errors with the same "row removed or changed" wording as the ordinary path) |
 | frontmatter that does not parse on the new side, or on both sides | error, the typed-parse diagnostic — never a traceback |
@@ -3496,6 +3502,19 @@ and injects a digest leaves the store's git status clean and its index
 untouched — including against a generation-behind index, which the
 read-only opener above makes structural, not merely tested-for.
 
+**Marks.** Every change to a topic's `standing:` list leaves a row in its
+`standing_marks:` block (SCHEMA §2 "Standing marks"). Marks are an audit,
+nothing more: no delivery route reads them, `build_record` never picks them up
+(the index has no column for them, so `CURRENT_INDEX_GENERATION` is untouched),
+and `standing_entries` / `standing_digest_text` see only the `standing:` list —
+a marked topic's digest is byte-for-byte the digest of the same topic without
+rows. The pairing and freeze rules live in `check_append_only` (see "Append-only
+history" above); the one writer is `memidx.py mark-standing`, which edits the
+`standing:` line in place and prepends one row through the same line-insertion
+helper `bind` uses (`_insert_block_row`, with `prepend` where anchors append),
+re-parses the new text and checks it round-trips before writing, prints the
+diff, and never commits.
+
 **Subagents.** Whether Claude Code fires `SessionStart` for a subagent
 session at all is not established one way or the other by anything in this
 engine; this hook makes no claim either way and adds no `fork`-specific
@@ -3775,6 +3794,20 @@ memory-shaped.
 `--help` on each subcommand is the flag reference. The semantics worth writing
 down:
 
+- **`mark-standing TOP-xxxx Ln (--add | --remove) --authority A --source TEXT
+  --why TEXT --root STORE [--recorded-by NAME] [--dry-run]`** — the one writer
+  of a topic's `standing:` membership and its `standing_marks:` audit. `--add`
+  requires the link to be eligible exactly as `memlint.py` judges a `standing:`
+  pointer (`standing_link_problems`); an already-standing add or an absent
+  remove prints a message, writes nothing and exits 0. The `standing:` line is
+  edited in place (flow stays flow, block stays block, `standing: []` when the
+  last id goes, an absent key is created before `standing_marks:`/`anchors:`/
+  `links:`); one row is prepended; `recorded_at` is the local time to the
+  second and `recorded_by` defaults to `$MEMCONTINUUM_RECORDED_BY`, else
+  `memidx`. `--why` and `--source` are one line each. The edit is re-parsed
+  and must round-trip (the new `standing` list, the new row first and once,
+  every earlier row unchanged) before the file is written; nothing is
+  committed. A supersession is two calls before one commit.
 - **`search`** — `--mode fts` and `--mode vector` never both run; `hybrid` (the
   default) runs both and fuses ranks with RRF, unless FTS's own top-1 pick's
   content-term coverage of the query is below `FTS_STEP_ASIDE_COVERAGE`

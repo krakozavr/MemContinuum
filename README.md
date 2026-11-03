@@ -438,6 +438,7 @@ memidx.py propose-bindings --session ID --root STORE --project NAME [--write-inb
 memidx.py anchor-backfill --root STORE --project NAME [--code-root DIR] [--dry-run]       # give already-bound files an anchor, labelled as captured late
 memidx.py chain <topic-id> --project NAME                                        # one question's full history
 memidx.py bind <topic-id> <path[#symbol]> --root STORE --project NAME [--code-root DIR]  # bind a file or symbol to a topic's ruling and record its anchor (--dry-run first)
+memidx.py mark-standing <topic-id> <Ln> --add|--remove --authority A --source TEXT --why TEXT --root STORE  # change what a topic keeps standing and record who changed it (--dry-run first)
 memidx.py standing --project NAME [--root STORE] [--json]                        # what's standing, printed by hand
 memidx.py drift --code-root DIR --project NAME                                   # has the code grown a bypass?
 memidx.py reindex --root STORE --project NAME                                    # after editing the store by hand

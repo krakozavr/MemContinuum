@@ -31,6 +31,8 @@ code_refs:                  # the decision→code link — three forms, freely m
   - src/core/scan/scan_plan.py#hidden_count   # PATH#SYMBOL — a qualified symbol name as the chunkers report it
 tags: []
 standing: [L4]               # optional — this topic's OWN link ids that are true of the whole project, always (§7)
+standing_marks:              # optional — the audit of changes to `standing:` (see "Standing marks" below)
+  - {link: L4, action: add, ...}
 ```
 
 A prefix and a glob keep serving retrieval exactly as before — `for-path`/`unmapped` match either
@@ -49,6 +51,37 @@ every pointed link to exist in this topic, be `status: active`, and carry `rulin
 so the supersession and the pointer update land in the same commit. `memidx.py standing` projects
 the whole store's standing links, ordered and capped (§7); `sessionstart-remind.sh` delivers that
 projection at the start of a session, unprompted, before any edit.
+
+### Standing marks — the audit of `standing:` membership changes
+
+Every change to `standing:` leaves a dated, attributed row in `standing_marks:`, a block list written
+immediately after `standing:` (before `anchors:` and `links:`), newest row first. A row is **not a
+ruling**, the newest row is **not `current`**, and a `remove` row does **not** mean the link is
+inactive: it records only who changed the list, when, and on whose word. Rows are never delivered —
+not in the standing digest, not in a chain, a context pack or a pre-edit line — and never indexed;
+they are the trace a reader finds with `cat`.
+
+```yaml
+standing: [L1, L4]
+standing_marks:
+  - link: L4
+    action: add                       # add | remove
+    date: 2026-11-03                  # the date part of recorded_at as written (its own offset)
+    recorded_at: "2026-11-03T09:12:41-05:00"   # ISO-8601 with offset, seconds; quoted
+    recorded_by: claude-fable-5-1
+    authority: owner-ratified         # owner-verbatim | owner-ratified ONLY
+    source: "owner message 2026-11-03 09:10 EST, session_..."
+    why: "one sentence, no CR/LF"
+```
+
+A row is identified by `(link, action, recorded_at)`; repeated transitions (add, remove, add again)
+are legitimate, each its own row. `authority` is limited to the two owner authorities because a
+standing link reaches every session start of every project. `memidx.py mark-standing` is the one
+writer (`memidx.py mark-standing TOP-xxxx Ln --add|--remove --authority A --source TEXT --why TEXT
+--root STORE [--dry-run]`): it edits the `standing:` line in place (a flow list stays a flow list, a
+block list a block list, `standing: []` when the last id goes), prepends one row, prints the diff and
+commits nothing. One call is one row; a supersession is two calls — `--remove` the old link,
+`--add` its successor — before one commit.
 
 ### Anchors — what a code reference pointed at when it was bound
 
@@ -234,6 +267,14 @@ copied inline.
   line. Any OTHER line/paragraph separator (U+2028 LINE SEPARATOR, U+2029 PARAGRAPH SEPARATOR,
   U+0085 NEL, a tab) is not an error here — `memidx.py standing` collapses it to one space at
   projection time, so it still reaches an agent's context as a single physical line
+- a `standing:` list naming the same link id twice → error
+- a `standing_marks:` row (never required — a topic marked before the block existed has none and is
+  clean, §7's grandfathering rule) that is not a mapping, lacks one of the eight fields, carries an
+  unknown field, has an `action` other than `add`/`remove`, an `authority` other than
+  `owner-verbatim`/`owner-ratified`, an empty `source` or `why`, a `why` containing CR or LF, a
+  `recorded_at` that is not an ISO-8601 timestamp with an offset, a `date` that is not its date part
+  as written, a `link` that is not a link id of this topic (a superseded link stays valid — old rows
+  are history), or the same `(link, action, recorded_at)` as another row → error naming the row
 - the store-wide `standing:` set — every topic's pointers, together — exceeding 24 links or 4,800
   bytes (UTF-8) of the complete digest `memidx.py standing` would emit (header, every line, and the
   newlines joining them), whichever line is crossed first → error, naming every topic whose pointer
@@ -268,8 +309,8 @@ coupling: §5 step 3's promotion procedure appends a new link and adds
 own status; it is immutable once set, exactly like `superseded_by`. A
 lifecycle move must be the only change on the link; bundled with any body
 edit, both get their own error. A link removed, or a topic file deleted or
-renamed, is an error naming the path. New links, and changes to `current`,
-`title`, `tags`, `code_refs`, `standing`, or the body text, are free. A store's own git
+renamed, is an error naming the path. New links, and changes to `title`, `tags`, `code_refs`, or the
+body text, are free; `standing`, `current` and link order are guarded as below. A store's own git
 `pre-commit` hook (`hooks/pre-commit-append-only.sh`, wired by
 `scripts/repo-init.sh` the same way `post-commit-reindex.sh` is) runs this on
 every commit and blocks the ones that fail it; the same check can run again in
@@ -298,8 +339,43 @@ Newest-first order is enforced too, narrowly: every link new at `REF`+now
 must sort, in the new file, above every link that already existed at `REF`
 — a new link inserted BETWEEN two recorded ones (rather than above all of
 them) is refused as `<path>:<link>: link inserted out of order`, even
-though the old links' own bytes stay untouched. Reordering AMONG links that
-already existed at `REF` is not separately checked.
+though the old links' own bytes stay untouched.
+
+**`standing:`, `current:` and link order are under the guard too**. For a topic
+present at `REF` and now (all judged on the staged blob under `--staged`, which is what the store's
+pre-commit hook reads):
+
+- *Marks are frozen (g1).* Every `standing_marks:` row at `REF` must survive with the same parsed
+  fields and the same raw bytes, in the same relative order, with every new row above every old one
+  (newest first): `<path>: standing mark (<link>, <action>, <recorded_at>): row changed after being
+  recorded` / `row reformatted, not appended` / `row removed after being recorded`, and `marks not
+  prepended` / `recorded rows reordered`. Unlike anchors, a marks block whose raw rows cannot be
+  extracted — at `REF` or in the new blob — is an error, never a note; the check also runs when `REF`
+  never parsed (the repair path).
+- *A `standing:` change is paired with its rows (g2).* With `old_set` and `new_set` the id sets of
+  `standing:` at `REF` and now, the commit must add exactly one `add` row per id in `new_set - old_set`
+  and one `remove` row per id in `old_set - new_set`, no more: `standing changed for L4 (add) with no
+  matching standing_marks row`, `orphan standing mark (L4, add): standing: did not change that way`,
+  `duplicate standing mark for (L4, add) in one commit`. A remove plus an add of the same id with the
+  set unchanged is two orphans. Reordering `standing:` with the same set needs no row. A brand-new
+  topic needs one `add` row per `standing:` id; rows beside an empty `standing:` are orphans; a new
+  topic with no `standing:` stays free.
+- *Link order is frozen (g3).* The link ids present at `REF` must keep their relative order in the
+  new blob (new links may be interleaved, by convention on top): `<path>: links reordered (L2 before
+  L3; the chain head is first-active-in-file-order)`. The chain head is the first active link in file
+  order, so a reorder is a silent re-ruling; no per-link byte check sees one.
+- *`current:` moves with the head (g4).* A written `current:` must name the newest active link of the
+  staged blob, and it may change only when the newest active link changed (a new link, a
+  supersession, a `historical` move exposing an older active link) or when it repairs a disagreement
+  that already existed at `REF`. A new `provisional` link does not change the head, so it never
+  licenses a `current` change; removing `current:` while the head is unchanged is refused, adding one
+  to a topic that lacked it is a repair.
+
+Grandfathering (a stricter check judges only what is written after it): a topic marked before this
+block existed has no rows and produces no error and no warning — rows are required only for a
+`standing:` change made from now on. The boundary: this guard covers `standing`, `current` and link
+order only; a change of `type` or `project` can still drop a topic from the standing digest and is
+not guarded.
 
 ### Cited commits and paths are verified, not merely written
 
