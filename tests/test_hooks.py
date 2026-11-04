@@ -4098,13 +4098,16 @@ class TestPostCommitRelintAndBackup(unittest.TestCase):
     def test_directory_at_final_bundle_name_is_refused(self):
         sub = self.backup / self.PROJECT
         sub.mkdir()
-        for n in self._minute_names():
+        # Compute the names once: a second call can straddle a minute rollover
+        # and name a directory that was never created.
+        names = self._minute_names()
+        for n in names:
             (sub / n).mkdir()
         proc = self._good_commit(self._env(MEMCONTINUUM_BACKUP_DIR=str(self.backup)))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("backup=failed:dest", self._last_postcommit_line())
         self.assertEqual(list(sub.glob("*.part*")), [])
-        for n in self._minute_names():
+        for n in names:
             self.assertEqual(list((sub / n).iterdir()), [])
 
     def test_bundle_to_stdout_form_is_cloneable(self):
