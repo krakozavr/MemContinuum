@@ -3840,7 +3840,11 @@ down:
   last id goes, an absent key is created before `standing_marks:`/`anchors:`/
   `links:`); one row is prepended; `recorded_at` is the local time to the
   second and `recorded_by` defaults to `$MEMCONTINUUM_RECORDED_BY`, else
-  `memidx`. `--why` and `--source` are one line each. The edit is re-parsed
+  `memidx`. `--remove` matches an item by the value YAML reads from it
+  (`_scalar_token`: `''` in a single-quoted item is `'`, backslash escapes in a
+  double-quoted one are decoded, a plain item is its text), so `'it''s'` and
+  `"a\"b"` are removable by `it's` and `a"b`; the remaining items are kept
+  byte for byte. `--why` and `--source` are one line each. The edit is re-parsed
   and must round-trip (the new `standing` list, the new row first and once,
   every earlier row unchanged) before the file is written; nothing is
   committed. A supersession is two calls before one commit.

@@ -557,6 +557,40 @@ class TestMarkStandingCommand(MarkCase):
                 self.assertEqual(rc, 0, err)
                 self.assertIn(f"\nstanding: [{token}, L3]\n", self.read())
 
+    def test_scalar_token_reads_a_token_as_yaml_does(self):
+        import yaml
+        for token in ("L2", "'L2'", '"L2"', "'it''s'", "'a''b''c'", "''''", r'"a\"b"', r'"a\\b"',
+                      r'"a\nb"', r'"a\tb"', r'"\x41é"', "O'Reilly", 'a"b', r"'a\nb'", '" x "'):
+            with self.subTest(token=token):
+                self.assertEqual(memidx._scalar_token(token), yaml.safe_load(token), token)
+        # an escape it does not know fails closed (token as written)
+        self.assertEqual(memidx._scalar_token(r'"a\qb"'), r'"a\qb"')
+
+    def test_remove_a_single_quoted_id_with_an_escaped_apostrophe(self):
+        links = DEFAULT_LINKS + (link_yaml("it's", text="odd"),)
+        self.write(topic_text(standing="standing: ['it''s', L2]\n", links=links))
+        rc, _o, err = self.mark("it's", "--remove")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("\nstanding: [L2]\n", self.read())
+        fm = memidx.parse_record_raw(self.read(), Path("t.md")).frontmatter
+        self.assertEqual(memidx.standing_ids(fm), ["L2"])
+
+    def test_remove_a_double_quoted_id_with_an_escaped_quote(self):
+        links = DEFAULT_LINKS + (link_yaml('a"b', text="odd"),)
+        self.write(topic_text(standing='standing: ["a\\"b", L2]\n', links=links))
+        rc, _o, err = self.mark('a"b', "--remove")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("\nstanding: [L2]\n", self.read())
+
+    def test_plain_ids_are_unchanged_and_adding_keeps_escaped_tokens_byte_for_byte(self):
+        self.write(topic_text(standing='standing: [\'it\'\'s\', "a\\"b", L2]\n'))
+        rc, _o, err = self.mark("L3", "--add")
+        self.assertEqual(rc, 0, err)
+        self.assertIn('\nstanding: [\'it\'\'s\', "a\\"b", L2, L3]\n', self.read())
+        rc, _o, err = self.mark("L2", "--remove")
+        self.assertEqual(rc, 0, err)
+        self.assertIn('\nstanding: [\'it\'\'s\', "a\\"b", L3]\n', self.read())
+
     def test_flow_list_helper_edge_cases(self):
         parts = memidx._flow_list_parts
         self.assertEqual(parts("['a''']"), (["'a'''"], ""))

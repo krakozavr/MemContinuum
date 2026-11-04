@@ -3,6 +3,9 @@
 ## [Unreleased]
 
 ### Hygiene
+- `memidx.py mark-standing --remove` now finds a `standing:` item written with
+  YAML quoting (`'it''s'`, `"a\"b"`) by the id it stands for, instead of
+  refusing; other items in the list are left exactly as written.
 - `memlint.py --code-root` no longer reports a `decision: TOP-... Ln` example
   that a Markdown file shows inside a fenced block or an inline code span
   (docs/SCHEMA.md did); markers in a Markdown file's prose are still checked.

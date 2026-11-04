@@ -12347,8 +12347,48 @@ def _flow_list_parts(rest: str):
     return (items, tail) if re.fullmatch(r"(\s*#.*)?", tail) else None
 
 
+# PyYAML's single-character escapes inside a double-quoted scalar (yaml/reader
+# ESCAPE_REPLACEMENTS), plus the hex forms and their widths.
+_YAML_DQ_ESCAPES = {
+    "0": "\0", "a": "\a", "b": "\b", "t": "\t", "\t": "\t", "n": "\n", "v": "\v",
+    "f": "\f", "r": "\r", "e": "\x1b", " ": " ", '"': '"', "/": "/", "\\": "\\",
+    "N": "\x85", "_": "\xa0", "L": "\u2028", "P": "\u2029",
+}
+_YAML_DQ_HEX = {"x": 2, "u": 4, "U": 8}
+
+
 def _scalar_token(token: str) -> str:
-    return token.strip().strip("'\"")
+    """The value of one flow/block list item as YAML reads it: a single-quoted
+    scalar has its `''` read as `'`; a double-quoted one has its backslash
+    escapes decoded (`\\"`, `\\\\`, `\\n`, `\\t`, ... as PyYAML does); anything else
+    is the stripped plain text. An escape it does not know leaves the token
+    as written, so a comparison against a link id fails closed."""
+    t = token.strip()
+    if len(t) >= 2 and t[0] == t[-1] == "'":
+        return t[1:-1].replace("''", "'")
+    if len(t) >= 2 and t[0] == t[-1] == '"':
+        body, out, i = t[1:-1], [], 0
+        while i < len(body):
+            c = body[i]
+            if c != "\\":
+                out.append(c)
+                i += 1
+                continue
+            esc = body[i + 1:i + 2]
+            if esc in _YAML_DQ_ESCAPES:
+                out.append(_YAML_DQ_ESCAPES[esc])
+                i += 2
+            elif esc in _YAML_DQ_HEX:
+                width = _YAML_DQ_HEX[esc]
+                digits = body[i + 2:i + 2 + width]
+                if len(digits) != width or not re.fullmatch(r"[0-9A-Fa-f]+", digits):
+                    return t
+                out.append(chr(int(digits, 16)))
+                i += 2 + width
+            else:
+                return t
+        return "".join(out)
+    return t
 
 
 def edit_standing_line(text: str, link_id: str, add: bool) -> str:
