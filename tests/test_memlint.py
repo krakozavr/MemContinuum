@@ -2326,6 +2326,47 @@ class TestMemlintDecisionMarkers(unittest.TestCase):
             warnings,
         )
 
+    # Built from two literals so this file never carries a marker of its own
+    # (memlint --code-root . would read it as one).
+    _H_MARK = "decision: TOP-0047 " + "L99"
+
+    # TOP-0137 L15 (h): a Markdown file shows markers as EXAMPLES in fences
+    # and code spans; only its prose is a real marker site.
+    def _md_marker_errors(self, md_text):
+        topic = _marker_topic("TOP-0047", ["src/deploy.sh", "docs/GUIDE.md"], _CONSTRAINT_LINK_L1)
+        code = {"src/deploy.sh": "echo hello\n", "docs/GUIDE.md": md_text}
+        errors, _warnings = self._lint({"t.md": topic}, code)
+        return [e for e in errors if "GUIDE.md" in e]
+
+    def test_h_fenced_marker_in_markdown_is_ignored(self):
+        for fence in ("```", "~~~", "````python", "```python"):
+            closer = fence[:3] if len(fence) == 3 else fence.rstrip("python")
+            md = f"Intro\n\n{fence}\n# {self._H_MARK}\n{closer}\n\nAfter.\n"
+            self.assertEqual(self._md_marker_errors(md), [], fence)
+
+    def test_h_marker_in_markdown_prose_is_still_reported(self):
+        md = f"Intro\n\n```\nquoted\n```\n\n# {self._H_MARK}\n"
+        errs = self._md_marker_errors(md)
+        self.assertTrue(any("L99" in e and "no such link" in e and ":7" in e for e in errs), errs)
+
+    def test_h_unterminated_fence_runs_to_end_of_file(self):
+        md = f"Intro\n\n```\n# {self._H_MARK}\nmore\n"
+        self.assertEqual(self._md_marker_errors(md), [])
+
+    def test_h_marker_inside_a_backtick_span_is_ignored(self):
+        md = f"Write `{self._H_MARK}` at the symbol.\n"
+        self.assertEqual(self._md_marker_errors(md), [])
+
+    def test_h_non_markdown_file_is_still_scanned_line_by_line(self):
+        topic = _marker_topic("TOP-0047", ["src/deploy.sh"], _CONSTRAINT_LINK_L1)
+        code = {"src/deploy.sh": f"```\n# {self._H_MARK}\n```\n"}
+        errors, _warnings = self._lint({"t.md": topic}, code)
+        self.assertTrue(any("L99" in e and "no such link" in e for e in errors), errors)
+
+    def test_h_markdown_prose_lines_helper_keeps_file_line_numbers(self):
+        got = list(memlint._markdown_prose_lines("a\n```\nb\n```\nc `x` d\n"))
+        self.assertEqual(got, [(1, "a"), (5, "c     d")])
+
     def test_codex13_scan_never_opens_an_unreferenced_file(self):
         """Codex 13: the marker scan must open only files at least one
         topic's code_refs names -- a probe observed an unrelated file

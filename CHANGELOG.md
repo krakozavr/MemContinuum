@@ -3,6 +3,9 @@
 ## [Unreleased]
 
 ### Hygiene
+- `memlint.py --code-root` no longer reports a `decision: TOP-... Ln` example
+  that a Markdown file shows inside a fenced block or an inline code span
+  (docs/SCHEMA.md did); markers in a Markdown file's prose are still checked.
 - Every pre-edit line in `hook.log` now carries `session=` (`-` when the hook
   payload had none), and a line that delivered topics also carries `exposure=`,
   a short stable name for that delivery (session, file and topics) that later
