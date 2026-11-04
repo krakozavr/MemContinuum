@@ -3,6 +3,10 @@
 ## [Unreleased]
 
 ### Hygiene
+- `memidx.py code-search` now appends one line to `hook.log`
+  (`code-search outcome=ok|no-hits|error hits=N q=... project=...`), and
+  `memidx.py stats` reports the calls in a `code_search` block. A logging
+  failure never changes the search's output or exit code.
 - Internal cleanup in `memidx.py`: every place that resolved `MEMCONTINUUM_HOME`
   now calls the one `memcontinuum_home()` helper, and the plain
   SHA-256-of-bytes calls use the one `sha256_hex()`. No behaviour change.

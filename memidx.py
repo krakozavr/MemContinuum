@@ -9622,6 +9622,29 @@ def _log_path_token(raw, limit: int = 512) -> str:
     return urllib.parse.quote_from_bytes(data, safe="/._~:!-") or "-"
 
 
+def append_hook_log_line(keyword: str, fields: dict, log_dir: Path | None = None) -> None:
+    """Append ONE `<ISO ts with offset> <keyword> k=v ...` line to hook.log --
+    the Python twin of memlib.sh `mc_log` for a command that runs outside any
+    shell hook (code-search is called by agents directly). The timestamp has
+    the shape `date -Iseconds` gives. Values go through `_clean_log_token`
+    (no space, no `=`, so none can split the line or forge a field); the
+    caller passes `project` LAST (`_hook_log_fields` relies on it). `log_dir`
+    defaults to `memcontinuum_home()`. Fail-open: any error writes nothing
+    and raises nothing, and a missing directory is never created. Rotation
+    is shell-only (mc_rotate_hook_log): the next shell hook rotates."""
+    try:
+        base = Path(log_dir) if log_dir is not None else memcontinuum_home()
+        if not base.is_dir():
+            return
+        ts = datetime.now().astimezone().isoformat(timespec="seconds")
+        body = " ".join(f"{k}={_clean_log_token(str(v))}" for k, v in fields.items())
+        line = f"{ts} {keyword} {body}\n"
+        with open(base / "hook.log", "a", encoding="utf-8") as fh:
+            fh.write(line)
+    except Exception:
+        return
+
+
 def _write_code_stale_marker(marker: Path, reason: str, roots: int) -> bool:
     """Publish `<project>.code-stale` (`reason=<r> since=<iso> roots=<n>`).
     Write-safety: a per-process temp name beside the destination, created
@@ -10165,6 +10188,36 @@ CODE_RRF_K = 30
 
 
 def cmd_code_search(args) -> int:
+    """Run the search, then append one `code-search` line to hook.log (beside
+    the code db -- `memcontinuum_home()` unless --db points elsewhere) so
+    `stats` can count agent-driven searches. A logging failure never changes
+    the exit code or stdout."""
+    log: dict = {}
+    try:
+        rc = _cmd_code_search(args, log)
+    except BaseException:
+        _log_code_search(args, log)
+        raise
+    _log_code_search(args, log)
+    return rc
+
+
+def _log_code_search(args, log: dict) -> None:
+    try:
+        hits = log.get("hits")
+        outcome = "error" if hits is None else ("ok" if hits else "no-hits")
+        append_hook_log_line(
+            "code-search",
+            {"outcome": outcome, "hits": hits or 0,
+             "q": _clean_log_token(str(getattr(args, "query", "") or "")[:40]),
+             "project": getattr(args, "project", None)},
+            log_dir=resolve_code_db_path(args).parent,
+        )
+    except Exception:
+        return
+
+
+def _cmd_code_search(args, log: dict) -> int:
     db_path = resolve_code_db_path(args)
     # Fix-wave item 9: a db written by a newer engine must never crash
     # code-search -- fail open with the refusal's own message and no
@@ -10431,6 +10484,7 @@ def cmd_code_search(args) -> int:
     if md_conn is not None:
         md_conn.close()
     conn.close()
+    log["hits"] = len(out)
 
     if args.json:
         # Finding 1 + Anatomy M2a Task 4: state + full per-root provenance
@@ -10501,6 +10555,8 @@ def cmd_code_search(args) -> int:
 #   <ts> sessionend outcome=X session=S project=P
 #   <ts> precompact outcome=X session=S project=P
 #   <ts> newfile-nudge outcome=X project=P file=...
+#   <ts> code-search outcome=ok|no-hits|error hits=N q=TOKEN project=P  (the
+#        one Python-written line, append_hook_log_line, from `code-search`)
 #   <ts> outcome=matched elapsed=Ns project=P file=...      (pre-edit-chain.sh --
 #        no hook-type keyword; own independent logger, distinguished below)
 #   payload_keys=... project=P                               (no timestamp --
@@ -10536,7 +10592,7 @@ def cmd_code_search(args) -> int:
 # every deployment's cold-start window, not a real signal).
 _HOOK_LOG_KEYWORDS = (
     "userprompt", "ledger", "sessionstart", "sessionend", "precompact",
-    "newfile-nudge",
+    "newfile-nudge", "code-search",
 )
 UNKNOWN_STATS_PROJECT = "(unknown)"
 
@@ -10732,7 +10788,7 @@ def _hook_log_line_kind(rest: str) -> str:
 # never saw (never a KeyError, never a silent `.get(..., {})` fallback).
 _STATS_KINDS = (
     "userprompt", "ledger", "pre-edit", "newfile-nudge",
-    "sessionstart", "sessionend", "precompact", "pre-commit", "other",
+    "sessionstart", "sessionend", "precompact", "pre-commit", "code-search", "other",
 )
 
 
@@ -11397,6 +11453,7 @@ def _stats_report(
     # These lines carry no `outcome=` field and route through their own
     # "pre-commit" kind, never "userprompt", so they can never inflate
     # `user_prompts` above.
+    cs = outcomes["code-search"]
     pcm = outcomes["pre-commit"]
     pcm_pass = pcm.get("pass", 0)
     pcm_refused = pcm.get("refused", 0)
@@ -11511,6 +11568,12 @@ def _stats_report(
             "index_quarantined": pc_index_quarantined,
             "index_degraded": pc_index_degraded,
             "outcomes": dict(pc),
+        },
+        "code_search": {
+            "ok": cs.get("ok", 0),
+            "no_hits": cs.get("no-hits", 0),
+            "error": cs.get("error", 0),
+            "outcomes": dict(cs),
         },
         "pre_commit": {
             "pass": pcm_pass,
@@ -11693,6 +11756,9 @@ def cmd_stats(args) -> int:
         pcm = result["pre_commit"]
         print(f"pre-commit (store append-only guard): pass={pcm['pass']} "
               f"refused={pcm['refused']} skipped={pcm['skipped']}")
+        csr = result["code_search"]
+        print(f"code-search (agent calls): ok={csr['ok']} no-hits={csr['no_hits']} "
+              f"error={csr['error']}")
         fb = result["fallback"]
         p50_txt = "n/a" if fb["ms_p50"] is None else f"{fb['ms_p50']}ms"
         p95_txt = "n/a" if fb["ms_p95"] is None else f"{fb['ms_p95']}ms"

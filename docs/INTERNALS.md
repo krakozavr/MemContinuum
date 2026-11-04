@@ -536,6 +536,20 @@ many distinct topic ids were ever injected in the window), and `top_topics`
 (the top 5 by injection count, ties broken by id) — a `+N` cap marker is
 never counted as a topic.
 
+**code-search's hook.log line.** `memidx.py code-search` is run by agents
+directly, not by a hook, so Python writes its line (`append_hook_log_line`):
+`<ISO ts with offset> code-search outcome=<ok|no-hits|error> hits=<n> q=<token>
+project=<p>`. `ok` is at least one hit, `no-hits` a finished search with none,
+`error` a search that did not finish (uninitialized or too-new code index, or an
+exception). `q` is the first 40 characters of the query reduced to
+`[A-Za-z0-9._-]` (so no space, `=` or newline can forge a field), `project=` is
+last. The line goes beside the code database (`$MEMCONTINUUM_HOME` unless
+`--db` points elsewhere), only when that directory already exists, and any
+failure to write it is swallowed: the command's exit code and stdout never
+change. Rotation is shell-only (`mc_rotate_hook_log`); this Python append
+bypasses it and the next shell hook rotates. `memidx.py stats` counts these
+lines as their own kind under a `code_search` block (`ok`, `no_hits`, `error`).
+
 **hook.log rotation.** Nothing truncates or prunes hook.log on its own —
 `mc_prune_old_state` only ever clears session-state JSON — so an
 unrotated hook.log grows without bound (~177 KB/day on a real machine),
