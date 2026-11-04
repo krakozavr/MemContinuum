@@ -542,9 +542,10 @@ directly, not by a hook, so Python writes its line (`append_hook_log_line`):
 project=<p>`. `ok` is at least one hit, `no-hits` a finished search with none,
 `error` a search that did not finish (uninitialized or too-new code index, or an
 exception). `q` is the first 40 characters of the query reduced to
-`[A-Za-z0-9._-]` (so no space, `=` or newline can forge a field), `project=` is
-last. The line goes beside the code database (`$MEMCONTINUUM_HOME` unless
-`--db` points elsewhere), only when that directory already exists, and any
+`[A-Za-z0-9._-]` (so no space, `=` or newline can forge a field; `-` when
+nothing survives), `project=` is last. The line always goes to
+`$MEMCONTINUUM_HOME/hook.log` (default `~/.memcontinuum`), even when `--db`
+points elsewhere, so `stats` sees it; only when that directory already exists, and any
 failure to write it is swallowed: the command's exit code and stdout never
 change. Rotation is shell-only (`mc_rotate_hook_log`); this Python append
 bypasses it and the next shell hook rotates. `memidx.py stats` counts these

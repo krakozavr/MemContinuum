@@ -100,6 +100,31 @@ class CodeSearchLogTest(unittest.TestCase):
         self.assertEqual((rc1, out1), (rc2, out2))
         self.assertTrue(self.log.is_dir())
 
+    def test_empty_query_logs_dash_not_unknown(self):
+        self.search(query="")
+        self.search(query="!!! ???")
+        for line in self.lines():
+            self.assertRegex(line, r" q=- project=demo$")
+            self.assertNotIn("q=unknown", line)
+
+    def test_db_elsewhere_still_logs_to_home_and_stats_counts_it(self):
+        other = Path(self.td.name) / "elsewhere"
+        other.mkdir()
+        db = other / "x.sqlite"
+        rc = memidx.cmd_code_reindex(SimpleNamespace(
+            code_root=str(self.root), db=str(db), project="demo", no_embed=True,
+            full=False, lang="python", drop_root=None))
+        self.assertEqual(rc, 0)
+        self.search(db=str(db))
+        self.assertFalse((other / "hook.log").exists())
+        self.assertEqual(len(self.lines()), 1)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            memidx.cmd_stats(SimpleNamespace(
+                project="demo", days=1, home=str(self.home), store=None,
+                json=True, now=None))
+        self.assertEqual(json.loads(out.getvalue())["code_search"]["ok"], 1)
+
     def test_appender_never_creates_a_missing_directory(self):
         missing = self.home / "nope"
         memidx.append_hook_log_line("code-search", {"outcome": "ok"}, log_dir=missing)

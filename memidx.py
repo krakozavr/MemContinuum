@@ -10188,9 +10188,9 @@ CODE_RRF_K = 30
 
 
 def cmd_code_search(args) -> int:
-    """Run the search, then append one `code-search` line to hook.log (beside
-    the code db -- `memcontinuum_home()` unless --db points elsewhere) so
-    `stats` can count agent-driven searches. A logging failure never changes
+    """Run the search, then append one `code-search` line to
+    `memcontinuum_home()/hook.log` (wherever --db points, so `stats` reads it)
+    so `stats` can count agent-driven searches. A logging failure never changes
     the exit code or stdout."""
     log: dict = {}
     try:
@@ -10209,9 +10209,9 @@ def _log_code_search(args, log: dict) -> None:
         append_hook_log_line(
             "code-search",
             {"outcome": outcome, "hits": hits or 0,
-             "q": _clean_log_token(str(getattr(args, "query", "") or "")[:40]),
+             "q": re.sub(r"[^A-Za-z0-9._-]", "",
+                         str(getattr(args, "query", "") or "")[:40]) or "-",
              "project": getattr(args, "project", None)},
-            log_dir=resolve_code_db_path(args).parent,
         )
     except Exception:
         return
