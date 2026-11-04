@@ -2344,6 +2344,25 @@ class TestMemlintDecisionMarkers(unittest.TestCase):
             md = f"Intro\n\n{fence}\n# {self._H_MARK}\n{closer}\n\nAfter.\n"
             self.assertEqual(self._md_marker_errors(md), [], fence)
 
+    def test_h_non_closers_keep_the_fence_open(self):
+        """A fence closes only on the same character, at least as long, with
+        no info string. Each case: a would-be closer, then a marker that must
+        stay fenced (ignored); an unterminated fence runs to EOF."""
+        cases = [
+            ("````", "```"),          # shorter closer does not close
+            ("```", "~~~"),          # other character does not close
+            ("~~~", "```"),
+            ("```", "```python"),    # closer with an info string is not a closer
+        ]
+        for opener, bad in cases:
+            md = f"Intro\n\n{opener}\n{bad}\n# {self._H_MARK}\nend\n"
+            self.assertEqual(self._md_marker_errors(md), [], (opener, bad))
+            # ...and the real closer does close: the marker after it is prose.
+            real = opener
+            md = f"Intro\n\n{opener}\n{bad}\n{real}\n# {self._H_MARK}\n"
+            errs = self._md_marker_errors(md)
+            self.assertTrue(any("L99" in e and ":6" in e for e in errs), (opener, bad, errs))
+
     def test_h_marker_in_markdown_prose_is_still_reported(self):
         md = f"Intro\n\n```\nquoted\n```\n\n# {self._H_MARK}\n"
         errs = self._md_marker_errors(md)
