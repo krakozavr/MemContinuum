@@ -71,6 +71,16 @@ DEFAULT_PROJECT = "default"
 # index files; defaults to ~/.memcontinuum. A per-call --db always wins over both
 # (see resolve_db_path, which reads the environment variable fresh on every
 # call so tests can override it per-case).
+
+
+def memcontinuum_home() -> Path:
+    """The base directory for index files, hook.log and sessions: the
+    MEMCONTINUUM_HOME environment variable read fresh on every call (tests
+    override it per case), else ~/.memcontinuum. The one place that default
+    lives; a per-call --db or --home override is resolved by the caller."""
+    return Path(os.environ.get("MEMCONTINUUM_HOME", str(Path.home() / ".memcontinuum")))
+
+
 # TOP-0137 L2 step 5: the model is the SAME BAAI/bge-small-en-v1.5 (CLS
 # pooling, L2-normalised, 384 dims) but loaded from its plain fp32 ONNX
 # (`onnx/model.onnx` in the HF repo) instead of the quantised build that
@@ -141,7 +151,7 @@ def _debug_log(exc: BaseException, context: str, db_path: Path | str | None = No
         if db_path is not None:
             log_dir = Path(db_path).parent
         else:
-            log_dir = Path(os.environ.get("MEMCONTINUUM_HOME", str(Path.home() / ".memcontinuum")))
+            log_dir = memcontinuum_home()
         if not log_dir.is_dir():
             return
         ts = datetime.now(timezone.utc).isoformat()
@@ -1156,7 +1166,7 @@ def link_record_key(topic_path: str, link_id: str) -> str:
     in a real filename, so that scheme is not collision-proof). A hashed,
     prefixed token can never collide with anything walk_markdown yields
     (no real path is a 64-hex-char token prefixed "link:")."""
-    digest = hashlib.sha256(f"{topic_path}\x00{link_id}".encode()).hexdigest()
+    digest = sha256_hex(f"{topic_path}\x00{link_id}".encode())
     return f"link:{digest}"
 
 
@@ -1316,7 +1326,7 @@ def open_db_noncreating(db_path: Path, project: str) -> sqlite3.Connection | Non
 def resolve_db_path(args) -> Path:
     if getattr(args, "db", None):
         return Path(args.db).expanduser().resolve()
-    base = Path(os.environ.get("MEMCONTINUUM_HOME", str(Path.home() / ".memcontinuum")))
+    base = memcontinuum_home()
     return base / f"{args.project}.sqlite"
 
 
@@ -2007,7 +2017,7 @@ def cmd_reindex(args) -> int:
                 [("file", f"unreadable: {msg}")],
             ))
             continue
-        sha = hashlib.sha256(data).hexdigest()
+        sha = sha256_hex(data)
         prev = existing.get(path_str)
         sha_unchanged = prev is not None and not content_full and prev[0] == sha
         needs_backfill = (not no_embed) and sha_unchanged and embedded_shas.get(path_str) != sha
@@ -5502,7 +5512,7 @@ def _resolve_symbol_via_code_index(code_root: Path, symbol: str, project: str) -
     opening (and thus without rebuilding) the db at all. The next
     code-search still finds it stale and heals it normally."""
     code_db_path = (
-        Path(os.environ.get("MEMCONTINUUM_HOME", str(Path.home() / ".memcontinuum")))
+        memcontinuum_home()
         / f"{project}-code.sqlite"
     )
     if not code_db_path.exists():
@@ -6103,7 +6113,7 @@ def _decision_content_compare(
             stat = f.stat()
             if verify_content:
                 try:
-                    current_sha = hashlib.sha256(f.read_bytes()).hexdigest()
+                    current_sha = sha256_hex(f.read_bytes())
                 except OSError:
                     changed.append(path_str)
                     if stop_at_first_mismatch:
@@ -6123,7 +6133,7 @@ def _decision_content_compare(
         if qentry is not None:
             stored_sha, diagnostics_json = qentry
             try:
-                current_sha = hashlib.sha256(f.read_bytes()).hexdigest()
+                current_sha = sha256_hex(f.read_bytes())
             except OSError:
                 current_sha = stored_sha   # still unreadable -- can't re-verify, stays accounted
             if current_sha != stored_sha:
@@ -6752,7 +6762,7 @@ def cmd_standing(args) -> int:
         return 1
 
     if args.json:
-        h = hashlib.sha256(digest_text.encode("utf-8")).hexdigest()[:16]
+        h = sha256_hex(digest_text.encode("utf-8"))[:16]
         payload = {
             "hash": h,
             "links": len(lines),
@@ -6802,7 +6812,7 @@ def pack_hash_line(text: str) -> tuple[str, int, str]:
     """`(sha256_hex, byte_count, "pack sha256=<hex> bytes=<N>")` over the
     exact UTF-8 bytes of `text` -- the pack as printed above its last line."""
     raw = text.encode("utf-8")
-    sha = hashlib.sha256(raw).hexdigest()
+    sha = sha256_hex(raw)
     return sha, len(raw), f"pack sha256={sha} bytes={len(raw)}"
 
 
@@ -7370,7 +7380,7 @@ def resolve_code_db_path(args) -> Path:
     "<project>.sqlite" (checked by TestCodeIndexIsolation)."""
     if getattr(args, "db", None):
         return Path(args.db).expanduser().resolve()
-    base = Path(os.environ.get("MEMCONTINUUM_HOME", str(Path.home() / ".memcontinuum")))
+    base = memcontinuum_home()
     return base / f"{args.project}-code.sqlite"
 
 
@@ -8328,7 +8338,7 @@ def cmd_code_reindex(args) -> int:
                 prev_sha, prev_cv = (prev[0], prev[1]) if prev is not None else (None, None)
 
             data = f.read_bytes()
-            sha = hashlib.sha256(data).hexdigest()
+            sha = sha256_hex(data)
             if prev_sha == sha and prev_cv == cv and not args.full:
                 unchanged_files += 1
                 # Finding 2 (staleness): the file's content (and thus its
@@ -9106,7 +9116,7 @@ def _root_report(
         if not signals_differ:
             continue
         try:
-            if hashlib.sha256(f.read_bytes()).hexdigest() != prev["sha256"]:
+            if sha256_hex(f.read_bytes()) != prev["sha256"]:
                 rep["changed"] += 1
                 changed_rels.add(rel)
             else:
@@ -9183,7 +9193,7 @@ def _root_report(
                         continue  # not-indexed: the retry rule owns it, same as the stat pass
                     gf = root / rel
                     try:
-                        current_sha = hashlib.sha256(gf.read_bytes()).hexdigest()
+                        current_sha = sha256_hex(gf.read_bytes())
                     except OSError:
                         rep["changed"] += 1
                         changed_rels.add(rel)
@@ -10352,7 +10362,7 @@ def cmd_code_search(args) -> int:
     if decision_db_arg:
         md_db_path = Path(decision_db_arg).expanduser().resolve()
     else:
-        md_base = Path(os.environ.get("MEMCONTINUUM_HOME", str(Path.home() / ".memcontinuum")))
+        md_base = memcontinuum_home()
         md_db_path = md_base / f"{args.project}.sqlite"
     # F1 (ruling 68): the decision-attach lookup is a decision-index READER
     # (Codex named it explicitly) -- open_db_noncreating replaces the
@@ -11570,9 +11580,7 @@ def cmd_stats(args) -> int:
     # never a traceback/exit 1 from what is supposed to be the tool that
     # catches silent failures.
     try:
-        home = Path(args.home).expanduser() if args.home else Path(
-            os.environ.get("MEMCONTINUUM_HOME", str(Path.home() / ".memcontinuum"))
-        )
+        home = Path(args.home).expanduser() if args.home else memcontinuum_home()
         log_path = home / "hook.log"
 
         if args.now:
@@ -12460,10 +12468,6 @@ def cmd_mark_standing(args) -> int:
 # PRINTS suggestions. Nothing here appends a reference: only `bind`, run by
 # a person or the orchestrator, writes a canonical record (D12). No hook
 # calls this command.
-
-
-def memcontinuum_home() -> Path:
-    return Path(os.environ.get("MEMCONTINUUM_HOME", str(Path.home() / ".memcontinuum")))
 
 
 def sessions_dir_for(project: str, override: str | None = None) -> Path:

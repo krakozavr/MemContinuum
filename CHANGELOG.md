@@ -3,6 +3,9 @@
 ## [Unreleased]
 
 ### Hygiene
+- Internal cleanup in `memidx.py`: every place that resolved `MEMCONTINUUM_HOME`
+  now calls the one `memcontinuum_home()` helper, and the plain
+  SHA-256-of-bytes calls use the one `sha256_hex()`. No behaviour change.
 - The rendered rules template now carries the duplication rule: a brief for a
   dispatched agent says to find the existing implementation and name it, a gate
   prompt asks whether the change duplicated anything, and both answers go in the
