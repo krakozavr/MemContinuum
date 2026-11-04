@@ -350,8 +350,9 @@ pre-commit hook reads):
   (newest first): `<path>: standing mark (<link>, <action>, <recorded_at>): row changed after being
   recorded` / `row reformatted, not appended` / `row removed after being recorded`, and `marks not
   prepended` / `recorded rows reordered`. Unlike anchors, a marks block whose raw rows cannot be
-  extracted — at `REF` or in the new blob — is an error, never a note; the check also runs when `REF`
-  never parsed (the repair path).
+  extracted — at `REF` or in the new blob — is an error, never a note; on the repair path (`REF`
+  never parsed, or parsed only through the lenient fallback) the same comparison runs but the old side
+  is empty, so it cannot catch a removed block (see the known limit below).
 - *A `standing:` change is paired with its rows (g2).* With `old_set` and `new_set` the id sets of
   `standing:` at `REF` and now, the commit must add exactly one `add` row per id in `new_set - old_set`
   and one `remove` row per id in `old_set - new_set`, no more: `standing changed for L4 (add) with no
@@ -384,6 +385,15 @@ block existed has no rows and produces no error and no warning — rows are requ
 `standing:` change made from now on. The boundary: this guard covers `standing`, `current` and link
 order only; a change of `type` or `project` can still drop a topic from the standing digest and is
 not guarded.
+
+**Known limit: a repaired record is not guarded for links, anchors or standing marks.** When the
+blob at `REF` could not be parsed cleanly (it never parsed as a mapping, or only through the lenient
+fallback parse) and the new blob parses cleanly, the guard reports a `repaired` note and treats the
+edit as a repair. The lenient parse never recovers `links`, `anchors` or `standing_marks` (they are
+complex fields), so the old side of every comparison is empty: a removed link, a removed `anchors:`
+block and a removed `standing_marks:` block all pass with only the note. The new blob's own rules
+still run (every link in it is judged as new, `standing:` and `current:` are checked, and its marks
+rows meet the plain-mode rules).
 
 ### Cited commits and paths are verified, not merely written
 

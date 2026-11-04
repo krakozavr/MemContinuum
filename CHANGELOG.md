@@ -3,6 +3,10 @@
 ## [Unreleased]
 
 ### Hygiene
+- Docs only: SCHEMA and INTERNALS now state the append-only guard's known limit.
+  When the earlier version of a record could not be parsed cleanly and the new
+  one can, the edit counts as a repair, and a removed link, `anchors:` block or
+  `standing_marks:` block is not caught (only a note is printed).
 - `memidx.py mark-standing --remove` now finds a `standing:` item written with
   YAML quoting (`'it''s'`, `"a\"b"`) by the id it stands for, instead of
   refusing; other items in the list are left exactly as written.
