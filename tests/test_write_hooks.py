@@ -3377,12 +3377,19 @@ class TestSessionStartCompactLookback(HookTestBase):
         self.seed_ledger(session_id, [])
         self.patch_state(session_id, pending=base)
 
+    def _run_hook(self, payload):
+        """Real sessionstart-remind.sh with a generous watchdog budget: these
+        tests pin cooldown/look-back semantics, not timing, and under CI load
+        the default 2 s budget kills the hook (empty stdout, outcome=
+        watchdog-killed). The one timing test below keeps the default."""
+        return run_script(
+            SESSIONSTART_HOOK, payload, self.base_env(MC_WATCHDOG_BUDGET="20"), timeout=25.0
+        )
+
     def test_no_coverage_thin_ge3_fires_lookback(self):
         session_id = "s-compact-lb-fires"
         self._seed_pending(session_id, user_turn_count=5, last_growth_turn=2)
-        proc, _ = run_script(
-            SESSIONSTART_HOOK, self.session_start_payload(session_id, "compact"), self.base_env()
-        )
+        proc, _ = self._run_hook(self.session_start_payload(session_id, "compact"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         out = json.loads(proc.stdout)
         ctx = out["hookSpecificOutput"]["additionalContext"]
@@ -3407,9 +3414,7 @@ class TestSessionStartCompactLookback(HookTestBase):
     def test_thin_lt3_is_silent(self):
         session_id = "s-compact-lb-thin2"
         self._seed_pending(session_id, user_turn_count=5, last_growth_turn=3)
-        proc, _ = run_script(
-            SESSIONSTART_HOOK, self.session_start_payload(session_id, "compact"), self.base_env()
-        )
+        proc, _ = self._run_hook(self.session_start_payload(session_id, "compact"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), "")
         # a silent (non-firing) compact must not touch inject bookkeeping --
@@ -3424,9 +3429,7 @@ class TestSessionStartCompactLookback(HookTestBase):
         # a hook without the look-back twin at all).
         session_id2 = "s-compact-lb-thin3-boundary"
         self._seed_pending(session_id2, user_turn_count=6, last_growth_turn=3)
-        proc2, _ = run_script(
-            SESSIONSTART_HOOK, self.session_start_payload(session_id2, "compact"), self.base_env()
-        )
+        proc2, _ = self._run_hook(self.session_start_payload(session_id2, "compact"))
         self.assertIn("Look-back signal", proc2.stdout)
 
     def test_coverage_evidence_wins_over_lookback(self):
@@ -3437,9 +3440,7 @@ class TestSessionStartCompactLookback(HookTestBase):
             user_turn_count=10,
             last_growth_turn=0,
         )
-        proc, _ = run_script(
-            SESSIONSTART_HOOK, self.session_start_payload(session_id, "compact"), self.base_env()
-        )
+        proc, _ = self._run_hook(self.session_start_payload(session_id, "compact"))
         out = json.loads(proc.stdout)
         ctx = out["hookSpecificOutput"]["additionalContext"]
         self.assertIn("Coverage signal", ctx)
@@ -3452,9 +3453,7 @@ class TestSessionStartCompactLookback(HookTestBase):
         session_id = "s-compact-lb-nocooldown"
         self._seed_pending(session_id, user_turn_count=6, last_growth_turn=2)
         self.patch_state(session_id, last_inject_turn=6, last_inject_ts=time.time())
-        proc, _ = run_script(
-            SESSIONSTART_HOOK, self.session_start_payload(session_id, "compact"), self.base_env()
-        )
+        proc, _ = self._run_hook(self.session_start_payload(session_id, "compact"))
         out = json.loads(proc.stdout)
         ctx = out["hookSpecificOutput"]["additionalContext"]
         self.assertIn("Look-back signal", ctx)
@@ -3463,9 +3462,7 @@ class TestSessionStartCompactLookback(HookTestBase):
         session_id = "s-compact-lb-stamps"
         before = time.time()
         self._seed_pending(session_id, user_turn_count=8, last_growth_turn=1)
-        proc, _ = run_script(
-            SESSIONSTART_HOOK, self.session_start_payload(session_id, "compact"), self.base_env()
-        )
+        proc, _ = self._run_hook(self.session_start_payload(session_id, "compact"))
         self.assertIn("Look-back signal", proc.stdout)
         state = self.load_state(session_id)
         self.assertEqual(state.get("last_inject_turn"), 8)
@@ -3475,15 +3472,15 @@ class TestSessionStartCompactLookback(HookTestBase):
         session_id = "s-compact-lb-oneshot"
         self._seed_pending(session_id, user_turn_count=5, last_growth_turn=0)
         payload = self.session_start_payload(session_id, "compact")
-        proc1, _ = run_script(SESSIONSTART_HOOK, payload, self.base_env())
+        proc1, _ = self._run_hook(payload)
         self.assertIn("Look-back signal", proc1.stdout)
-        proc2, _ = run_script(SESSIONSTART_HOOK, payload, self.base_env())
+        proc2, _ = self._run_hook(payload)
         self.assertEqual(proc2.stdout.strip(), "")
 
     def test_store_byte_identical(self):
         session_id = "s-compact-lb-bytesafe"
         self._seed_pending(session_id, user_turn_count=5, last_growth_turn=0)
-        run_script(SESSIONSTART_HOOK, self.session_start_payload(session_id, "compact"), self.base_env())
+        self._run_hook(self.session_start_payload(session_id, "compact"))
         self.assertTrue(git_is_clean(self.store_root))
 
     def test_completes_under_poisoned_pythonpath(self):
@@ -3510,9 +3507,7 @@ class TestSessionStartCompactLookback(HookTestBase):
         session_id = "s-compact-lb-stampstime"
         before = time.time()
         self._seed_pending(session_id, user_turn_count=5, last_growth_turn=0)
-        proc, _ = run_script(
-            SESSIONSTART_HOOK, self.session_start_payload(session_id, "compact"), self.base_env()
-        )
+        proc, _ = self._run_hook(self.session_start_payload(session_id, "compact"))
         self.assertIn("Look-back signal", proc.stdout)
         state = self.load_state(session_id)
         self.assertGreaterEqual(state.get("last_inject_time", 0), before)
@@ -3522,9 +3517,7 @@ class TestSessionStartCompactLookback(HookTestBase):
         never logged for the compact twin either."""
         session_id = "s-compact-lb-logcount"
         self._seed_pending(session_id, user_turn_count=5, last_growth_turn=0)
-        proc, _ = run_script(
-            SESSIONSTART_HOOK, self.session_start_payload(session_id, "compact"), self.base_env()
-        )
+        proc, _ = self._run_hook(self.session_start_payload(session_id, "compact"))
         self.assertIn("Look-back signal", proc.stdout)
         log_text = (self.home / "hook.log").read_text()
         matches = [l for l in log_text.splitlines() if "compact-lookback" in l]
