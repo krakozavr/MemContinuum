@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Hygiene
+- The rendered rules template now carries the duplication rule: a brief for a
+  dispatched agent says to find the existing implementation and name it, a gate
+  prompt asks whether the change duplicated anything, and both answers go in the
+  gate record. Wired repositories pick it up on the next updater run.
+
 ### Binding
 - Topics gain an `anchors:` frontmatter key: the SHA-256 of the code a
   `code_refs` entry named when the binding was captured, with the capture kind
