@@ -3,6 +3,9 @@
 ## [Unreleased]
 
 ### Hygiene
+- Docs only: SCHEMA no longer says a `project` change can drop a topic from the
+  standing digest. The project is set when the index is built, not read from the
+  file, so only a change of `type` can.
 - Docs only: SCHEMA and INTERNALS now state the append-only guard's known limit.
   When the earlier version of a record could not be parsed cleanly and the new
   one can, the edit counts as a repair, and a removed link, `anchors:` block or

@@ -383,8 +383,8 @@ pre-commit hook reads):
 Grandfathering (a stricter check judges only what is written after it): a topic marked before this
 block existed has no rows and produces no error and no warning — rows are required only for a
 `standing:` change made from now on. The boundary: this guard covers `standing`, `current` and link
-order only; a change of `type` or `project` can still drop a topic from the standing digest and is
-not guarded.
+order only; a change of `type` can still drop a topic from the standing digest and is not guarded
+(`project` comes from the command argument at index time, never from the file).
 
 **Known limit: a repaired record is not guarded for links, anchors or standing marks.** When the
 blob at `REF` could not be parsed cleanly (it never parsed as a mapping, or only through the lenient
