@@ -1255,11 +1255,9 @@ fi
 
 # search-fallback look-back mention (TOP-0133 L1): reads STATE, never
 # hook.log, and never re-searches. hook.log's own pre-edit-chain.sh
-# `search-fallback` lines carry no `session=` field at all (finish()'s
-# own fixed field list has none -- see that hook's own header; unrelated
-# to whether it sources memlib.sh, which it now DOES lazily, ONLY on the
-# already-rare hit branch, purely to WRITE this same state), so hook.log
-# alone cannot be scoped to THIS session; STATE_FILE already IS this
+# `search-fallback` lines carry `session=` now (finish() puts it on every
+# pre-edit line, `-` when the payload had none), but this block still reads
+# STATE rather than scanning hook.log: STATE_FILE already IS this
 # session's own file (mc_state_file_for, loaded once above), and both
 # fallback-emitting hooks (pre-edit-chain.sh, newfile-nudge.sh) already
 # append every hit they show to its `search_fallbacks` list, titled, the

@@ -3,6 +3,10 @@
 ## [Unreleased]
 
 ### Hygiene
+- Every pre-edit line in `hook.log` now carries `session=` (`-` when the hook
+  payload had none), and a line that delivered topics also carries `exposure=`,
+  a short stable name for that delivery (session, file and topics) that later
+  lines can point back to.
 - `memidx.py code-search` now appends one line to `hook.log`
   (`code-search outcome=ok|no-hits|error hits=N q=... project=...`), and
   `memidx.py stats` reports the calls in a `code_search` block. A logging

@@ -2839,8 +2839,8 @@ class TestPreEditChainTopicsLogging(unittest.TestCase):
     names WHICH topic ids were actually injected (`topics=<comma-separated,
     sorted ids>`), turning a matched edit into a gradeable eval sample (which
     decisions were shown, not just that something matched). Field order is
-    `elapsed=Ns topics=... project=P file=F` -- topics= sits between
-    elapsed= and project=, so project=/file= keep their existing position for
+    `elapsed=Ns session=S exposure=H topics=... project=P file=F` -- topics=
+    sits before project=, so project=/file= keep their existing position for
     memidx.py's own parser. Capped at 10 ids (`,+N` beyond that) so a
     pathological multi-topic file can't blow up hook.log with one line."""
 
@@ -2913,9 +2913,96 @@ class TestPreEditChainTopicsLogging(unittest.TestCase):
         line = self._last_outcome_line(home)
         self.assertIn("outcome=matched", line)
         self.assertRegex(
-            line, r"elapsed=\d+s topics=TOP-9001 project=\S+ file=",
+            line,
+            r"elapsed=\d+s session=\S+ exposure=[0-9a-f]{12} topics=TOP-9001 project=\S+ file=",
             line,
         )
+
+    def _session_payload(self, session_id, file_path="/fake/repo/src/core/scan/scan_plan.py"):
+        return json.dumps({
+            "hook_event_name": "PreToolUse", "tool_name": "Edit", "session_id": session_id,
+            "cwd": "/some/other/unrelated/dir",
+            "tool_input": {"file_path": file_path},
+        })
+
+    @staticmethod
+    def _exposure(session, file_path, ids):
+        import hashlib
+        return hashlib.sha256(f"{session}\n{file_path}\n{ids}\n".encode("utf-8")).hexdigest()[:12]
+
+    def test_session_and_exposure_fields_follow_the_definition(self):
+        project = "exposure-def"
+        home = self._build_home(project, ["TOP-9001", "TOP-9002"])
+        proc, _ = self._run(home, project, self._session_payload("sess-A"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        line = self._last_outcome_line(home)
+        want = self._exposure("sess-A", "/fake/repo/src/core/scan/scan_plan.py", "TOP-9001,TOP-9002")
+        self.assertIn(f"session=sess-A exposure={want} topics=TOP-9001,TOP-9002 project=", line)
+
+    def test_same_session_file_topics_same_exposure_other_topics_other_exposure(self):
+        ids = {}
+        for name, topics in (("one", ["TOP-9001"]), ("two", ["TOP-9001"]), ("three", ["TOP-9001", "TOP-9002"])):
+            project = f"exposure-{name}"
+            home = self._build_home(project, topics)
+            proc, _ = self._run(home, project, self._session_payload("sess-A"))
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            ids[name] = re.search(r"exposure=([0-9a-f]{12})", self._last_outcome_line(home)).group(1)
+        self.assertEqual(ids["one"], ids["two"])
+        self.assertNotEqual(ids["one"], ids["three"])
+        # a different session names a different exposure for the same delivery
+        project = "exposure-other-session"
+        home = self._build_home(project, ["TOP-9001"])
+        self._run(home, project, self._session_payload("sess-B"))
+        other = re.search(r"exposure=([0-9a-f]{12})", self._last_outcome_line(home)).group(1)
+        self.assertNotEqual(ids["one"], other)
+
+    def test_payload_without_session_id_logs_a_dash(self):
+        project = "session-dash"
+        home = self._build_home(project, ["TOP-9001"])
+        proc, _ = self._run(home, project)   # _matching_payload carries no session_id
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        line = self._last_outcome_line(home)
+        self.assertIn(" session=- ", line)
+        want = self._exposure("-", "/fake/repo/src/core/scan/scan_plan.py", "TOP-9001")
+        self.assertIn(f"exposure={want}", line)
+
+    def test_hostile_session_id_cannot_forge_a_field(self):
+        project = "session-hostile"
+        home = self._build_home(project, ["TOP-9001"])
+        self._run(home, project, self._session_payload("a b project=evil\tx"))
+        line = self._last_outcome_line(home)
+        self.assertEqual(line.count("project="), 1, line)
+        self.assertIn(" session=abprojectevilx ", line)
+
+    def test_no_topics_line_has_session_but_no_exposure(self):
+        project = "session-no-topics"
+        home = self._build_home(project, ["TOP-9001"])
+        payload = json.dumps({
+            "hook_event_name": "PreToolUse", "tool_name": "Edit", "session_id": "sess-A",
+            "cwd": "/nowhere", "tool_input": {"file_path": "/nowhere/near/anything.py"},
+        })
+        self._run(home, project, payload)
+        line = self._last_outcome_line(home)
+        self.assertRegex(line, r"outcome=\S+ elapsed=\d+s session=sess-A .*project=")
+        self.assertNotIn("exposure=", line)
+        self.assertNotIn("topics=", line)
+
+    def test_stats_still_parses_the_new_line(self):
+        project = "session-stats"
+        home = self._build_home(project, ["TOP-9001"])
+        self._run(home, project, self._session_payload("sess-A"))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = memidx.cmd_stats(type("A", (), dict(
+                project=project, days=1, home=str(home), store=None, json=True, now=None))())
+        self.assertEqual(rc, 0)
+        data = json.loads(buf.getvalue())
+        self.assertEqual(data["pre_edit"]["matched"], 1)
+        self.assertEqual(data["pre_edit"]["topics_named"], 1)
+        self.assertEqual(data["unknown_lines"], 0)
+        fields = memidx._hook_log_fields(self._last_outcome_line(home).split(" ", 1)[1])
+        self.assertEqual(fields["project"], project)
+        self.assertEqual(fields["session"], "sess-A")
 
     def test_backward_clock_never_produces_a_negative_elapsed(self):
         """Fix round (Codex 6 / Grok 6): a fake `date +%s` that steps

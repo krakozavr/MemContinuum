@@ -10557,7 +10557,8 @@ def _cmd_code_search(args, log: dict) -> int:
 #   <ts> newfile-nudge outcome=X project=P file=...
 #   <ts> code-search outcome=ok|no-hits|error hits=N q=TOKEN project=P  (the
 #        one Python-written line, append_hook_log_line, from `code-search`)
-#   <ts> outcome=matched elapsed=Ns project=P file=...      (pre-edit-chain.sh --
+#   <ts> outcome=matched elapsed=Ns session=S [exposure=H] [topics=..] project=P file=...
+#        (pre-edit-chain.sh --
 #        no hook-type keyword; own independent logger, distinguished below)
 #   payload_keys=... project=P                               (no timestamp --
 #        a KNOWN timestamp-less shape, counted separately, see

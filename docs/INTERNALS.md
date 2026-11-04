@@ -242,9 +242,9 @@ prompt, unaffected by the prompt-query channel's own amendment to ruling B,
 see "Prompt-derived queries" below) and never
 re-searching: each entry renders as `search surfaced <title> (<id>) for
 <file>`, capped at 8 (the same cap coverage's own `unmapped[:8]` fact line
-uses) — `pre-edit-chain.sh`'s own hook.log lines carry no `session=` field
-at all (`finish()`'s own fixed field list has none), so this state write is
-the ONLY place a title is recoverable per session; the write itself is
+uses) — `pre-edit-chain.sh`'s hook.log lines carry `session=` but never a
+title (`ids=` is bare topic ids), so this state write is the ONLY place a
+title is recoverable per session; the write itself is
 sourced and paid for lazily, only on this already-rare branch, THROUGH A
 SHORT (0.25s, not the shared `mc_update_state_json`'s own 2.0s default)
 lock deadline of its own — this write runs after the search subprocess
@@ -517,9 +517,9 @@ default is silence.
 
 **pre-edit-chain.sh's `topics=` field.** A `matched` or `index-stale-served`
 line also names which topic ids were actually injected, not just that
-something matched: `outcome=matched elapsed=1s topics=TOP-nnnn,TOP-nnnn
-project=P file=F` — sorted, comma-separated, sitting between `elapsed=` and
-`project=` so `project=`/`file=` keep their existing trailing position (the
+something matched: `outcome=matched elapsed=1s session=S exposure=H
+topics=TOP-nnnn,TOP-nnnn project=P file=F` — sorted, comma-separated, sitting
+before `project=` (after `session=`/`exposure=`, below) so `project=`/`file=` keep their existing trailing position (the
 one thing `memidx.py stats`'s own line parser structurally relies on). This
 exists so a later grading pass can check WHICH decisions a matched edit
 actually saw, turning a matched edit into a gradeable sample: file, decisions
@@ -549,6 +549,24 @@ failure to write it is swallowed: the command's exit code and stdout never
 change. Rotation is shell-only (`mc_rotate_hook_log`); this Python append
 bypasses it and the next shell hook rotates. `memidx.py stats` counts these
 lines as their own kind under a `code_search` block (`ok`, `no_hits`, `error`).
+
+**pre-edit-chain.sh's `session=` and `exposure=` fields.** Every pre-edit
+line now has the shape `outcome=<o> elapsed=<n>s session=<id|-> [exposure=<H>]
+[topics=<ids>] [other extras] project=<p> file=<f>`. `session=` is the payload's
+`session_id` reduced to `[A-Za-z0-9._-]` (a hostile id cannot split the line or
+forge a field), parsed once with `file_path` and `cwd` at the top of the run and
+reused by the search-fallback state write; it is `-` when the payload carried
+none, never omitted, never empty. `exposure=` is a stable name for "this
+delivery of these topics for this file in this session": the first 12 hex
+characters of the SHA-256 over the UTF-8 string
+`"<session id>\n<FILE_PATH as logged>\n<comma-joined MATCHED_TOPIC_IDS in the
+order logged>\n"` (the session id as logged, so `-` when absent). It is emitted
+exactly when `topics=` is and omitted otherwise, so a later line (ledger,
+turn-end, a filing command) can refer to the delivery. The hash is one
+`$MEMCONTINUUM_PYTHON -c` call inside `finish()` on the matched path only; if
+python cannot run, the field is omitted and the line is otherwise unchanged.
+Nothing may follow `file=` (`memidx.py` reads `project=` from before it), and
+`stats` still classifies the line by its leading `outcome=` and ` elapsed=`.
 
 **hook.log rotation.** Nothing truncates or prunes hook.log on its own —
 `mc_prune_old_state` only ever clears session-state JSON — so an
