@@ -46,25 +46,24 @@
 # worktree, but its main repo isn't a configured root) and
 # `worktree-unresolved` (git itself could not settle the question).
 #
-# This closes the gap in THIS SCRIPT's own logic; it cannot make the harness
-# LAUNCH the script for a file outside every "if" glob repo-init.sh renders
-# (templates/code-root-filter-pair.json.tmpl scopes each invocation's "if"
-# to one literal RETRIEVAL-root path: the git toplevel of each --code-root,
-# or the root itself outside git; code roots narrower than the checkout
-# scope only the index) -- a worktree checked out as a SIBLING of
-# the wired root never reaches this script at all under current wiring, so
-# it gets NO retrieval here (ledger-post-edit.sh, which has no such filter,
-# still ledgers it -- see that hook's own header). One checked out INSIDE
-# the wired root (e.g. `<root>/.worktrees/x`) DOES reach this script, and
-# gets full retrieval -- round 1 of this fix claimed this case was "closed
-# end-to-end" while its own callers still silently skipped the remap for
-# ANY FILE_PATH already physically under a configured root (Grok's round-2
-# BLOCKER finding): the in-root worktree case is what that round-2 fix
-# actually closes; round 1 only wired the machinery for it. A project that
-# wants retrieval for its own worktrees should therefore keep them INSIDE
-# the repository (e.g. `<repo>/.worktrees/`, gitignored by that project) --
-# a sibling worktree stays ledger-only until the settings-rendering
-# follow-up (see this task's own report) widens the "if" glob itself.
+# Which paths the harness LAUNCHES this script for is set by the "if" globs
+# repo-init.sh renders (templates/code-root-filter-pair.json.tmpl): one pair
+# per RETRIEVAL root (the git toplevel of each --code-root, or the root
+# itself outside git; code roots narrower than the checkout scope only the
+# index) AND one pair per retrieval root's PARENT directory (TOP-0137 L16),
+# unless that parent is `/` or the user's home. So a worktree checked out
+# as a SIBLING of the wired root (`git worktree add ../x`) reaches this
+# script and gets the same retrieval as the main checkout, as does one
+# checked out INSIDE the root (e.g. `<root>/.worktrees/x`); only a worktree
+# further away than the root's parent is ledger-only (ledger-post-edit.sh
+# has no such filter and still ledgers it -- see that hook's own header).
+# The wider glob also launches this script for every other edit under the
+# parent, so a path under NO configured root is decided before any query
+# (see "off-root refusal" below): a worktree of a wired root continues as an
+# edit in the main checkout; everything else ends with no search --
+# `worktree-unwired`, `worktree-unresolved`, or `outside-roots` (an ordinary
+# other repository or directory). In-root paths take the flow below
+# unchanged.
 #
 # Env:
 #   MEMCONTINUUM_ROOT     store markdown root; used to derive a default
@@ -673,10 +672,11 @@ done
 # Round 2 fix (Grok BLOCKER): a FILE_PATH already physically under one of
 # these roots used to skip this whole block outright -- wrong for a
 # worktree checked out INSIDE the root (e.g. `<root>/.worktrees/feat/`),
-# the ONLY worktree location the settings-level "if" glob
-# (templates/code-root-filter-pair.json.tmpl) ever lets THIS SCRIPT be
-# invoked for at all (a sibling worktree's Edit never matches that glob,
-# so it never reaches this script -- see this file's own header). Fixed:
+# the worktree location the settings-level "if" glob
+# (templates/code-root-filter-pair.json.tmpl) lets THIS SCRIPT be
+# invoked for with the root pair alone (a SIBLING worktree is admitted by
+# the parent-directory pair and settled by the off-root refusal above --
+# see this file's own header). Fixed:
 # still zero extra `git` calls for the ordinary in-root case (no nested
 # worktree at all -- by far the common shape of an in-root miss), via
 # mc_nested_worktree_gitfile's bash-only ancestor walk; mc_remap_worktree_path's

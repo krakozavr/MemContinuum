@@ -82,8 +82,8 @@ like every other hook.
 deliver a decision NOT bound to the file being edited, and it had never
 once been invoked in this project's recorded history. So the hook calls
 it: on `pre-edit-chain.sh`'s own genuine-miss branch (never on a match,
-never on `worktree-unwired`/`worktree-unresolved`, both of which already
-end the run first), and on `newfile-nudge.sh`'s wired-new-file reminder,
+never on `worktree-unwired`/`worktree-unresolved`/`outside-roots`, which
+all end the run first), and on `newfile-nudge.sh`'s wired-new-file reminder,
 `memidx.py search --read-only --hydrate` is queried on the edited path's
 OWN words, and the nearest decisions (if any) are handed to the agent
 labelled as a guess, never as a match. Both hooks skip this entirely for a
@@ -222,7 +222,7 @@ otherwise break the "exactly one line per invocation" contract).
 reading it — `git status --short` on a fixture store stays clean and the
 index file's sha256 is unchanged across repeated fallback-only runs (proven
 even against a schema behind the current generation, which the ordinary rw
-path WOULD migrate on open — see `--read-only` above). Since TOP-0137 L13 the
+path WOULD migrate on open — see `--read-only` above). The
 earlier `for-path` lookup of the same hook run is read-only too
 (`decision_index_state_readonly` + `open_db_readonly`), so nothing in the
 pre-edit route writes the decision index: an index that needs migration ends
@@ -3062,24 +3062,38 @@ settings-level `"if"` filter is still a literal path glob, rendered per
 of each `--code-root`, or the root itself outside git, de-duplicated — so a code
 root narrower than its checkout (`<repo>/Sources`) still has the whole checkout
 under the glob and `MEMCONTINUUM_STRIP_PREFIX` is the colon-joined retrieval
-roots. Code roots scope only the index, the new-file nudge and the ledger. The
+roots. Each retrieval root's PARENT directory gets the same pair
+(skipped, with a note, when the parent is `/` or the user's home directory;
+de-duplicated across roots) — a launch filter only, the strip prefix does not
+grow. Code roots scope only the index, the new-file nudge and the ledger. The
 worktree remap returns the path under the matching root's own checkout toplevel,
 spelled the way the configured root is spelled (a symlinked ancestor such as
 macOS's `/var` is kept, so callers can still strip the configured prefix) when
 the reconstruction validates by round-trip; otherwise (for example a symlink
 inside the repository) the resolved (realpath) toplevel spelling is returned), so a worktree edit under a narrow root is recorded at its real path (or ends
 `out-of-scope`). A worktree checked out as a
-SIBLING of the wired root never reaches the script at all under the current
-settings rendering, so it gets **ledger coverage only** (`ledger-post-edit.sh`
-has no such filter — design R6, "fires for EVERY tool" — and covers it).
-A worktree checked out **INSIDE** the wired repository (e.g. `<repo>/.worktrees/x`)
-DOES reach `pre-edit-chain.sh` and gets full **retrieval and ledger**
-coverage — this is the layout this fix actually closes end-to-end. A project
-that wants retrieval for its own worktrees should therefore keep them inside
-the repository (e.g. `<repo>/.worktrees/`, gitignored by that project) rather
-than as siblings; widening the settings-level glob to also launch
-`pre-edit-chain.sh` for a sibling worktree is a separate, not-yet-done
-follow-up.
+SIBLING of the wired root (`git worktree add ../x`) is admitted by the
+parent-directory pair, remapped to the main checkout and gets full **retrieval
+and ledger** coverage, as does one checked out **INSIDE** the wired repository
+(e.g. `<repo>/.worktrees/x`). A worktree checked out anywhere else (further
+from the root than its parent) never reaches `pre-edit-chain.sh` and gets
+**ledger coverage only** (`ledger-post-edit.sh` has no such filter — design R6,
+"fires for EVERY tool" — and covers it).
+
+**The off-root refusal.** The wider glob launches the hook for every edit under
+a root's parent, not only for worktrees. A `FILE_PATH` under none of the
+`MEMCONTINUUM_STRIP_PREFIX` roots (absolute path, strip prefix set; an in-root
+path is recognised by a textual prefix test first and never reaches this
+block) is therefore settled before any `for-path` query, in bash only:
+`mc_remap_worktree_gated` rc 0 (a worktree of a wired root) continues as an
+edit in the main checkout — `matched` or the ordinary miss path, with `file=`
+in the log line still naming the real worktree path; rc 1 ends as
+`worktree-unwired`, rc 2 as `worktree-unresolved`, and rc 3 (an ordinary other
+repository or directory) as the new `outside-roots` outcome. Each refusal is
+fail-open (exit 0, no stdout) and runs no search: a path whose repository does
+not resolve to a wired root must never read this project's store. Measured
+cost of an `outside-roots` run: about 89 ms p95 over 20 runs, the whole hook
+including the watchdog launcher (no `memidx.py` process).
 
 **A positive match off a non-`current` index stays usable; a negative claim
 does not.** `upgrade-required`, `stale`, and `quarantined` all warn and

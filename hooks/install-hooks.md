@@ -15,7 +15,8 @@ values below are what make one instance of it specific to a project.
 
 Rendered from `templates/pre-edit-hook.json.tmpl` + one
 `templates/code-root-filter-pair.json.tmpl` pair per *retrieval root* (the git toplevel of each
-`--code-root`, or the root itself outside git; de-duplicated), merged
+`--code-root`, or the root itself outside git; de-duplicated) and one more pair per root's
+*parent directory* (skipped when the parent is `/` or the home directory; de-duplicated), merged
 into the target `hooks.PreToolUse` array:
 
 ```json
@@ -48,8 +49,13 @@ Notes:
 - Hand-wiring: one Edit/Write pair per retrieval root; `<retrieval-roots>` is the colon-joined list
   of all retrieval roots, each with a trailing slash, on every pair. A code root narrower than its
   repository (`<repo>/Sources`) still wires the whole repository here: a worktree inside the
-  repository is in scope for retrieval, a sibling of the repository never reaches the hook and
-  stays ledger-only.
+  repository is in scope for retrieval, and so is a worktree checked out next to it
+  (`git worktree add ../x`), because each root's parent directory gets the same pair (omit the
+  parent pair and a sibling worktree stays ledger-only). The parent pair is a launch filter only:
+  `MEMCONTINUUM_STRIP_PREFIX` stays the retrieval roots. A path under the parent but under no root
+  is declined without a search (`outside-roots`; `worktree-unwired` / `worktree-unresolved` for a
+  worktree of an unwired repository / one git cannot settle). A worktree anywhere else than inside
+  the repository or beside it never reaches the hook and stays ledger-only.
 - `MEMCONTINUUM_STRIP_PREFIX` is required whenever a topic's `code_refs` are written relative to a
   checkout that the edited file's absolute path doesn't share a `cwd` with (a real `PreToolUse`
   payload's `file_path` is always absolute, while `code_refs` are written repo-relative) — see the

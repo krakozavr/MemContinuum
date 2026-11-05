@@ -472,7 +472,9 @@ EOF
 #   0  remapped -- stdout is the main-checkout-equivalent absolute path
 #   1  worktree-unwired    (FILE_PATH is NOT under any root)
 #   2  worktree-unresolved (FILE_PATH is NOT under any root)
-#   3  not applicable (ordinary file, or in-root with nothing to remap)
+#   3  not applicable (ordinary file, or in-root with nothing to remap);
+#      for a FILE_PATH under no root, hooks/pre-edit-chain.sh ends this in
+#      its `outside-roots` outcome (TOP-0137 L16)
 mc_remap_worktree_gated() {
     local file_path="$1" roots="$2" root in_root="" out rc
     while IFS= read -r root; do
