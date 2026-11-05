@@ -1906,7 +1906,7 @@ def _store_to_code_check(
 
 
 _MD_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
-_MD_CODE_SPAN_RE = re.compile(r"(`+)(?:(?!\1).)+?\1")
+_MD_CODE_SPAN_RE = re.compile(r"(?<!`)(`+)(?:(?!\1).)+?\1(?!`)")
 
 
 def _markdown_prose_lines(text: str):
@@ -1914,7 +1914,10 @@ def _markdown_prose_lines(text: str):
     fenced block (``` or ~~~, any info string; closed by a fence of the same
     character at least as long, an unterminated one runs to EOF) are skipped,
     and inline code spans are blanked so a marker quoted as an example in a
-    document is never read as a real one. Line numbers stay those of the file."""
+    document is never read as a real one (a span opens and closes on a whole
+    backtick run of the same length, as in CommonMark). Known limits: escaped
+    backticks and spans crossing a line break are not modelled. Line numbers
+    stay those of the file."""
     fence_char = ""
     fence_len = 0
     for lineno, line in enumerate(text.splitlines(), start=1):

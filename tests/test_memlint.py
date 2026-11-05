@@ -2376,6 +2376,15 @@ class TestMemlintDecisionMarkers(unittest.TestCase):
         md = f"Write `{self._H_MARK}` at the symbol.\n"
         self.assertEqual(self._md_marker_errors(md), [])
 
+    def test_h_unequal_backtick_runs_are_not_a_code_span(self):
+        for md in (f"Write ``{self._H_MARK}` here.\n", f"Write `{self._H_MARK}`` here.\n"):
+            errs = self._md_marker_errors(md)
+            self.assertTrue(any("L99" in e and "no such link" in e for e in errs), (md, errs))
+
+    def test_h_equal_backtick_runs_mask_the_span(self):
+        for md in (f"Write ``{self._H_MARK}`` here.\n", f"Write ``a`b {self._H_MARK}`` here.\n"):
+            self.assertEqual(self._md_marker_errors(md), [], md)
+
     def test_h_non_markdown_file_is_still_scanned_line_by_line(self):
         topic = _marker_topic("TOP-0047", ["src/deploy.sh"], _CONSTRAINT_LINK_L1)
         code = {"src/deploy.sh": f"```\n# {self._H_MARK}\n```\n"}
