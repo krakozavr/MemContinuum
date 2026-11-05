@@ -1427,31 +1427,94 @@ class TestPreEditChainWorktreeGap(unittest.TestCase):
         log_text = (Path(self.memtool_home) / "hook.log").read_text()
         self.assertIn("outcome=worktree-unresolved", self._last_outcome_line(log_text))
 
-    def test_ordinary_checkout_of_unwired_repo_outcome_unchanged(self):
-        """Requirement 5: a plain (non-worktree) checkout of a repo that
-        was never wired must keep today's plain no-match-BRANCH outcome
-        (now the search-fallback channel, TOP-0133 L1 -- `no-match` itself
-        no longer `finish`es this branch, see pre-edit-chain.sh), never a
-        new worktree-* one -- this is repo_b's OWN main checkout, not
-        repo_b_wt. Search-fallback (TOP-0133 L1): this path's own query
-        words include this TEST RUN's tmpdir name (no STRIP_PREFIX/cwd
-        strips repo_b's path, so the raw absolute path is tokenized -- see
-        mc-query-lib.sh's own fallback-to-raw-path rule), which can
-        legitimately hit SCHEMA_FIXTURE_ROOT's own content (it mentions
-        this engine by name) -- so stdout is no longer pinned empty; only
-        the OUTCOME's kind is, deliberately widened to both fallback
-        outcomes rather than one exact string."""
+    def test_ordinary_checkout_of_unwired_repo_is_outside_roots_and_never_searched(self):
+        """TOP-0137 L16: a plain (non-worktree) checkout of a repo that was
+        never wired -- repo_b's OWN main checkout, not repo_b_wt -- sits
+        under the retrieval roots' parent directory (the wider glob admits
+        it) but under none of the roots. It ends in the new
+        `outside-roots` outcome, fail-open and silent, and the search
+        fallback never runs: an unresolved repository must not read this
+        project's store (formerly this path fell through to the fallback)."""
         main_path = str(self.repo_b / "src" / "other.py")
         proc, _ = run_hook(self._payload(main_path), self._env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
         log_text = (Path(self.memtool_home) / "hook.log").read_text()
         outcome_line = self._last_outcome_line(log_text)
-        self.assertNotIn("outcome=worktree-unwired", outcome_line)
-        self.assertNotIn("outcome=worktree-unresolved", outcome_line)
+        self.assertIn("outcome=outside-roots ", outcome_line)
+        self.assertIn(f"file={main_path}", outcome_line)
+        self.assertNotIn("outcome=worktree-", outcome_line)
+        self.assertNotIn("search-fallback", log_text)
+
+    def test_directory_outside_any_repository_is_outside_roots(self):
+        plain = Path(self.tmp) / "plain-dir"
+        plain.mkdir()
+        target = plain / "notes.py"
+        target.write_text("x = 1\n")
+        proc, _ = run_hook(self._payload(str(target)), self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        self.assertIn("outcome=outside-roots ", self._last_outcome_line(log_text))
+        self.assertNotIn("search-fallback", log_text)
+
+    def test_sibling_worktree_matches_the_main_chain_and_logs_the_real_path(self):
+        """B3 happy path: a worktree checked out NEXT TO the wired repo
+        (`git worktree add ../x`) is admitted by the parent-directory glob,
+        remapped to the main checkout, and answered exactly like an edit in
+        the main checkout -- while the log line's file= names the REAL
+        (worktree) path."""
+        main_path = str(self.repo_a / "src" / "core" / "scan" / "scan_plan.py")
+        wt_path = str(self.repo_a_wt / "src" / "core" / "scan" / "scan_plan.py")
+        main_proc, _ = run_hook(self._payload(main_path), self._env())
+        wt_proc, _ = run_hook(self._payload(wt_path), self._env())
+        self.assertEqual(wt_proc.returncode, 0, wt_proc.stderr)
+        main_ctx = json.loads(main_proc.stdout)["hookSpecificOutput"]["additionalContext"]
+        wt_ctx = json.loads(wt_proc.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("TOP-0042", wt_ctx)
+        self.assertEqual(wt_ctx, main_ctx, "a sibling worktree gets the same chain as the main checkout")
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        line = self._last_outcome_line(log_text)
+        self.assertIn("outcome=matched ", line)
+        self.assertTrue(line.rstrip().endswith(f"file={wt_path}"), line)
+
+    def test_sibling_worktree_miss_takes_the_normal_miss_path_not_outside_roots(self):
+        wt_path = str(self.repo_a_wt / "src" / "core" / "scan" / "no_such_binding_here.py")
+        proc, _ = run_hook(self._payload(wt_path), self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        line = self._last_outcome_line(log_text)
         self.assertTrue(
-            "outcome=search-fallback " in outcome_line or "outcome=search-fallback-empty " in outcome_line,
-            outcome_line,
+            "outcome=search-fallback " in line or "outcome=search-fallback-empty " in line, line)
+        self.assertNotIn("outside-roots", log_text)
+
+    def test_stats_counts_outside_roots(self):
+        run_hook(self._payload(str(self.repo_b / "src" / "other.py")), self._env())
+        result = subprocess.run(
+            [VENV_PYTHON, str(TOOLS_DIR / "memidx.py"), "stats",
+             "--home", self.memtool_home, "--project", self.project, "--json"],
+            capture_output=True, text=True, env=clean_env(),
         )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        outcomes = json.loads(result.stdout).get("pre_edit", {}).get("outcomes", {})
+        self.assertIn("outside-roots", outcomes)
+
+    def test_outside_roots_p95_latency_over_20_runs(self):
+        """B2: the wider glob puts every edit under a root's parent through
+        this script, so the off-root refusal must stay cheap (one bash start
+        plus the remap check, no for-path/python query). Reports the number
+        and asserts only a generous outer bound."""
+        target = str(self.repo_b / "src" / "other.py")
+        samples = []
+        for _ in range(20):
+            proc, elapsed = run_hook(self._payload(target), self._env())
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            samples.append(elapsed)
+        samples.sort()
+        p95 = samples[int(len(samples) * 0.95) - 1]
+        print(f"\npre-edit-chain.sh outside-roots p95 latency over 20 runs: {p95 * 1000:.1f}ms "
+              f"(min {samples[0]*1000:.1f}ms, max {samples[-1]*1000:.1f}ms)")
+        self.assertLess(p95, 1.5, f"p95 {p95:.3f}s far exceeds a generous 1.5s outer bound")
 
     def test_in_root_worktree_miss_logs_a_clean_query_no_worktree_or_branch_tokens(self):
         """TESTS item (coordinator fix round): an in-root worktree MISS
@@ -3143,7 +3206,15 @@ class TestPreEditChainTopicsLogging(unittest.TestCase):
         holds."""
         project = "topics-none"
         home = self._build_home(project, ["TOP-9001"])
-        proc, _elapsed = self._run(home, project, payload=self._nonmatching_payload())
+        # Under the configured root (STRIP_PREFIX=/fake/repo/): a path under
+        # NO root is refused earlier as outside-roots (TOP-0137 L16) and
+        # never reaches the fallback this test is about.
+        in_root_miss = json.dumps({
+            "hook_event_name": "PreToolUse", "tool_name": "Edit",
+            "cwd": "/fake/repo",
+            "tool_input": {"file_path": "/fake/repo/near/anything.py"},
+        })
+        proc, _elapsed = self._run(home, project, payload=in_root_miss)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         line = self._last_outcome_line(home)
         self.assertIn("outcome=search-fallback-empty", line)

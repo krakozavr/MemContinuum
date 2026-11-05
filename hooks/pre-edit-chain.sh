@@ -577,6 +577,69 @@ for field in (matched, state, topic_count, topics_field, chain_text):
     return 1
 }
 
+# --- off-root refusal (TOP-0137 L16) -------------------------------------
+# The settings-level "if" globs also cover each retrieval root's PARENT
+# directory (scripts/repo-init.sh), so a sibling worktree
+# (`git worktree add ../x`) reaches this script -- and so does ANY other edit
+# under that parent. A path under none of the configured roots is therefore
+# decided HERE, before any for-path query (it cannot match a code_ref anyway,
+# and the wider glob must cost one bash start plus the remap, no python):
+#   mc_remap_worktree_gated rc 0 -> a worktree of a wired root: the remapped
+#                                   main-checkout path is queried below, as
+#                                   if the edit happened in the main checkout
+#   rc 1 -> worktree-unwired      a worktree of an unwired repository
+#   rc 2 -> worktree-unresolved   git could not settle it
+#   rc 3 -> outside-roots         an ordinary other repository or directory
+# Every refusal ends the run with no search: a path whose repository does
+# not resolve to a wired root never reads this project's store. The block is
+# skipped for an in-root path (textual prefix test first, so the common case
+# sources nothing), a relative path, and an unset STRIP_PREFIX -- all of
+# which keep the flow below byte-for-byte.
+WT_PRE_DONE=0
+WT_REMAPPED=""
+WT_REMAP_RC=3
+WT_ROOTS=""
+declare -a WT_ROOT_ARR=()
+if [ -n "${MEMCONTINUUM_STRIP_PREFIX:-}" ] && [ "${FILE_PATH#/}" != "$FILE_PATH" ]; then
+    OFFROOT_TEXTUAL_IN_ROOT=0
+    IFS=':' read -r -a OFFROOT_PREFIXES <<<"$MEMCONTINUUM_STRIP_PREFIX"
+    for prefix in "${OFFROOT_PREFIXES[@]}"; do
+        [ -z "$prefix" ] && continue
+        if [ "${FILE_PATH#"$prefix"}" != "$FILE_PATH" ]; then
+            OFFROOT_TEXTUAL_IN_ROOT=1
+            break
+        fi
+    done
+    if [ "$OFFROOT_TEXTUAL_IN_ROOT" -eq 0 ]; then
+        # shellcheck source=mc-path-lib.sh
+        source "$SCRIPT_DIR/mc-path-lib.sh"
+        WT_ROOTS="$(mc_strip_prefix_roots "$MEMCONTINUUM_STRIP_PREFIX")"
+        while IFS= read -r wt_root; do
+            [ -n "$wt_root" ] && WT_ROOT_ARR+=("$wt_root")
+        done <<EOF3
+$WT_ROOTS
+EOF3
+        OFFROOT_IN_ROOT=0
+        for wt_root in ${WT_ROOT_ARR[@]+"${WT_ROOT_ARR[@]}"}; do
+            if mc_path_under_root "$FILE_PATH" "$wt_root"; then
+                OFFROOT_IN_ROOT=1
+                break
+            fi
+        done
+        if [ -n "$WT_ROOTS" ] && [ "$OFFROOT_IN_ROOT" -eq 0 ]; then
+            WT_REMAPPED="$(mc_remap_worktree_gated "$FILE_PATH" "$WT_ROOTS")"
+            WT_REMAP_RC=$?
+            WT_PRE_DONE=1
+            case $WT_REMAP_RC in
+                0) ;;
+                1) finish "worktree-unwired" ;;
+                2) finish "worktree-unresolved" ;;
+                *) finish "outside-roots" ;;
+            esac
+        fi
+    fi
+fi
+
 for candidate in "${CANDIDATES[@]}"; do
     try_candidate "$candidate" && break
 done
@@ -622,15 +685,17 @@ done
 # walk actually finds a nested `.git` FILE between FILE_PATH and the
 # matching root.
 if [ -z "$MATCHED_CANDIDATE" ] && [ "$ANY_QUERY_SUCCEEDED" -eq 1 ] && [ -n "${MEMCONTINUUM_STRIP_PREFIX:-}" ]; then
-    # shellcheck source=mc-path-lib.sh
-    source "$SCRIPT_DIR/mc-path-lib.sh"
-    WT_ROOTS="$(mc_strip_prefix_roots "$MEMCONTINUUM_STRIP_PREFIX")"
-    declare -a WT_ROOT_ARR=()
-    while IFS= read -r wt_root; do
-        [ -n "$wt_root" ] && WT_ROOT_ARR+=("$wt_root")
-    done <<EOF2
+    if [ "$WT_PRE_DONE" -eq 0 ]; then
+        # shellcheck source=mc-path-lib.sh
+        source "$SCRIPT_DIR/mc-path-lib.sh"
+        WT_ROOTS="$(mc_strip_prefix_roots "$MEMCONTINUUM_STRIP_PREFIX")"
+        WT_ROOT_ARR=()
+        while IFS= read -r wt_root; do
+            [ -n "$wt_root" ] && WT_ROOT_ARR+=("$wt_root")
+        done <<EOF2
 $WT_ROOTS
 EOF2
+    fi
 
     if [ -n "$WT_ROOTS" ]; then
         # An in-root path with no nested worktree, or whose nested gitfile
@@ -639,8 +704,12 @@ EOF2
         # decision bound to it" miss.
         # The in-root gate and the remap itself live in mc_remap_worktree_gated
         # (hooks/mc-path-lib.sh), shared with hooks/newfile-nudge.sh.
-        WT_REMAPPED="$(mc_remap_worktree_gated "$FILE_PATH" "$WT_ROOTS")"
-        WT_REMAP_RC=$?
+        # An off-root path was already remapped by the off-root refusal
+        # block above (WT_PRE_DONE=1): reuse that answer, no second pass.
+        if [ "$WT_PRE_DONE" -eq 0 ]; then
+            WT_REMAPPED="$(mc_remap_worktree_gated "$FILE_PATH" "$WT_ROOTS")"
+            WT_REMAP_RC=$?
+        fi
         case $WT_REMAP_RC in
             0)
                 # Feed the remapped (main-checkout) path through the
