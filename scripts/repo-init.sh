@@ -1443,9 +1443,38 @@ if code_roots:
             retrieval_roots.append(rr)
     strip_prefix = ":".join(rr + "/" for rr in retrieval_roots)
 
+    # TOP-0137 L16: a worktree checked out as a SIBLING of the wired repo
+    # (`git worktree add ../x`) sits outside every retrieval root, so a glob on
+    # the roots alone never launches the hook for it. Each root's PARENT
+    # directory gets the same pair (the parent is a launch filter only --
+    # strip_prefix above stays the retrieval roots); pre-edit-chain.sh
+    # declines anything under the parent that is not a wired root or a
+    # worktree of one (outcome=outside-roots / worktree-unwired /
+    # worktree-unresolved), without searching. Skipped when the parent is the
+    # filesystem root or the user's home directory: a glob that wide would
+    # launch the hook for every edit under it. De-duplicated across roots
+    # and against the root globs themselves.
+    home_dirs = set()
+    for h in (os.environ.get("HOME", ""), os.path.expanduser("~")):
+        if h:
+            home_dirs.add(h.rstrip("/"))
+            home_dirs.add(os.path.realpath(h).rstrip("/"))
+    filter_roots = []
+    for rr in retrieval_roots:
+        if rr not in filter_roots:
+            filter_roots.append(rr)
+        parent = os.path.dirname(rr).rstrip("/")
+        if not parent or parent in home_dirs:
+            print("note: pre-edit filter for %s is not widened to its parent directory (%s): "
+                  "worktrees checked out next to it get no retrieval"
+                  % (rr, parent or "/"))
+            continue
+        if parent not in filter_roots and parent not in retrieval_roots:
+            filter_roots.append(parent)
+
     pair_tmpl = read_tmpl("code-root-filter-pair.json.tmpl")
     pairs = []
-    for rr in retrieval_roots:
+    for rr in filter_roots:
         pairs.append(render(pair_tmpl, {
             "CODE_ROOT": esc_json(rr),
             "STORE": esc_cmd(store),
