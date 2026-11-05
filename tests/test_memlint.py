@@ -2385,6 +2385,17 @@ class TestMemlintDecisionMarkers(unittest.TestCase):
         for md in (f"Write ``{self._H_MARK}`` here.\n", f"Write ``a`b {self._H_MARK}`` here.\n"):
             self.assertEqual(self._md_marker_errors(md), [], md)
 
+    def test_h_opener_run_longer_than_any_closer_is_literal(self):
+        # Sol round 4: the 3-run must not backtrack to a 2-run opener.
+        md = f"Write ```{self._H_MARK}`` here.\n"
+        errs = self._md_marker_errors(md)
+        self.assertTrue(any("L99" in e and "no such link" in e for e in errs), errs)
+
+    def test_h_longer_inner_run_stays_inside_a_single_backtick_span(self):
+        # Sol round 4: a 2-run inside a 1-run span is content, not a closer.
+        md = f"`a``{self._H_MARK}`\n"
+        self.assertEqual(self._md_marker_errors(md), [], md)
+
     def test_h_non_markdown_file_is_still_scanned_line_by_line(self):
         topic = _marker_topic("TOP-0047", ["src/deploy.sh"], _CONSTRAINT_LINK_L1)
         code = {"src/deploy.sh": f"```\n# {self._H_MARK}\n```\n"}

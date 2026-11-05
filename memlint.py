@@ -1906,7 +1906,29 @@ def _store_to_code_check(
 
 
 _MD_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
-_MD_CODE_SPAN_RE = re.compile(r"(?<!`)(`+)(?:(?!\1).)+?\1(?!`)")
+_BACKTICK_RUN_RE = re.compile(r"`+")
+
+
+def _blank_code_spans(line: str) -> str:
+    """Return `line` with inline code spans blanked (same length, spaces).
+    CommonMark rule, scanning backtick RUNS left to right: a run of length N
+    opens a span that closes at the next run of exactly N; runs of other
+    lengths are content. An opener with no matching closer is literal text
+    and scanning resumes after it. Escapes and multi-line spans: not modelled."""
+    runs = list(_BACKTICK_RUN_RE.finditer(line))
+    out = list(line)
+    i = 0
+    while i < len(runs):
+        n = len(runs[i].group(0))
+        j = next((k for k in range(i + 1, len(runs))
+                  if len(runs[k].group(0)) == n), None)
+        if j is None:
+            i += 1
+            continue
+        start, end = runs[i].start(), runs[j].end()
+        out[start:end] = " " * (end - start)
+        i = j + 1
+    return "".join(out)
 
 
 def _markdown_prose_lines(text: str):
@@ -1930,7 +1952,7 @@ def _markdown_prose_lines(text: str):
         if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
             fence_char, fence_len = m.group(1)[0], len(m.group(1))
             continue
-        yield lineno, _MD_CODE_SPAN_RE.sub(lambda sp: " " * len(sp.group(0)), line)
+        yield lineno, _blank_code_spans(line)
 
 
 def lint_markers(root: Path, code_roots: list[Path]) -> tuple[list[str], list[str]]:
