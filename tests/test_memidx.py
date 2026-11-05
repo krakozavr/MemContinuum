@@ -1712,25 +1712,43 @@ class TestF1DecisionIndexState(unittest.TestCase):
         """TOP-0137 L13 tripwire: on a current index, neither
         open_db_noncreating nor _run_decision_migration_guards nor
         enforce_project_isolation may be called from for-path's reachable
-        code -- a regression back to the rw opener raises here."""
+        code -- a regression back to the rw opener raises here. Invoked the
+        way hooks/pre-edit-chain.sh's try_candidate does (--root <store>
+        and --live-file <path>) on a path the fixture actually binds
+        (src/core/alpha.py), so chain rendering and the anchor comparison
+        are reached; the positive match proves they ran. An unbound path is
+        the second assertion."""
         def boom(*a, **kw):
             raise AssertionError("for-path reached a writing opener")
 
         with tempfile.TemporaryDirectory() as td:
+            root = FIXTURES_COPY_OF("schema_filters", td)
             db = Path(td) / "idx.sqlite"
-            reindex(FIXTURES / "schema_filters", db, no_embed=True)
+            reindex(root, db, no_embed=True)
+            live = Path(td) / "alpha.py"
+            live.write_text("def thing():\n    return 1\n")
             sha_before = hashlib.sha256(db.read_bytes()).hexdigest()
-            for as_json in (True, False):
-                with self.subTest(json=as_json):
-                    buf_out, buf_err = io.StringIO(), io.StringIO()
-                    with mock.patch.object(memidx, "open_db_noncreating", side_effect=boom), \
-                         mock.patch.object(memidx, "_run_decision_migration_guards", side_effect=boom), \
-                         mock.patch.object(memidx, "enforce_project_isolation", side_effect=boom), \
-                         contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
-                        rc = memidx.cmd_for_path(ns(project=memidx.DEFAULT_PROJECT, db=str(db),
-                                                     file_path="src/x.py", json=as_json,
-                                                     with_chain_text=as_json))
-                    self.assertEqual(rc, 0, buf_err.getvalue())
+            for path, bound in (("src/core/alpha.py", True), ("src/x.py", False)):
+                for as_json in (True, False):
+                    with self.subTest(path=path, json=as_json):
+                        buf_out, buf_err = io.StringIO(), io.StringIO()
+                        with mock.patch.object(memidx, "open_db_noncreating", side_effect=boom), \
+                             mock.patch.object(memidx, "_run_decision_migration_guards", side_effect=boom), \
+                             mock.patch.object(memidx, "enforce_project_isolation", side_effect=boom), \
+                             contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                            rc = memidx.cmd_for_path(ns(project=memidx.DEFAULT_PROJECT, db=str(db),
+                                                         root=str(root), live_file=str(live),
+                                                         file_path=path, json=as_json,
+                                                         with_chain_text=as_json))
+                        self.assertEqual(rc, 0, buf_err.getvalue())
+                        if bound:
+                            self.assertTrue(json.loads(buf_out.getvalue())["results"] if as_json
+                                            else buf_out.getvalue().strip(),
+                                            "the bound path must match")
+                            # The anchor comparison ran (the fixture ref has no capture).
+                            self.assertIn("Anchor never captured", buf_out.getvalue())
+                        elif as_json:
+                            self.assertEqual(json.loads(buf_out.getvalue())["results"], [])
             self.assertEqual(sha_before, hashlib.sha256(db.read_bytes()).hexdigest())
 
     def test_unmapped_coverage_status_per_state(self):

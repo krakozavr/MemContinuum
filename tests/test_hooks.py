@@ -2024,21 +2024,15 @@ class TestPreEditChainSearchFallback(unittest.TestCase):
         self.assertEqual(search_calls, [], "a match must never invoke `search`")
 
     def test_no_write_path_store_and_index_untouched(self):
-        """Item 7, scope corrected (re-gate round 3, MAJOR 2): the fixture
-        index here is ALREADY current/stamped (setUp's own cmd_reindex),
-        so the sha staying unchanged across 50 runs proves the FALLBACK
-        SEARCH itself adds no write -- it does NOT prove the whole hook
-        run never writes the index. The same hook's own earlier `for-path`
-        lookup (unchanged by this feature) still opens the index the
-        ordinary rw way and CAN migrate/stamp a schema behind the current
-        generation before the fallback ever runs -- see
-        test_search_read_only_refuses_legacy_schema_without_writing in
-        tests/test_memidx.py for that direct, isolated proof, and
-        test_for_path_miss_still_migrates_before_the_fallback_runs below
-        for the same claim exercised through this actual hook. 50 fallback
-        runs against a fixture store that is a git repo -- `git status
-        --short` stays empty and the index file's sha256 is unchanged.
-        The one write this hook makes (session state, see
+        """Item 7, scope corrected: the fixture index here is ALREADY
+        current/stamped (setUp's own cmd_reindex), so the sha staying
+        unchanged across 50 runs proves the FALLBACK SEARCH adds no write on
+        a current index. (The hook's own `for-path` lookup opens the index
+        read-only and refuses one that needs migration -- TOP-0137 L13;
+        that is pinned in tests/test_memidx.py, not here.) 50 fallback runs
+        against a fixture store that is a git repo -- `git status --short`
+        stays empty and the index file's sha256 is unchanged. The one write
+        this hook makes (session state, see
         test_miss_with_hit_label_and_chain_never_snippet) lives under
         MEMCONTINUUM_HOME/sessions/, never under the store or the index."""
         for cmd in (
