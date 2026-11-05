@@ -1554,6 +1554,24 @@ def _for_path_missing_reply(args, state: str) -> int:
     return 3
 
 
+def _for_path_migration_reply(args) -> int:
+    """for-path's refusal on an `upgrade-required` decision index (TOP-0137
+    L13): the pre-edit route never writes the index, and the migration
+    guards are what would have to run -- so it exits 5 with one stderr line
+    (the wording family of `cmd_search --read-only`'s refusal) and, under
+    --json, the same object with or without --with-chain-text. stdout stays
+    empty in plain mode: a refusal is not "no topics reference this path"."""
+    print(
+        "for-path: the decision index needs migration (state=upgrade-required) -- "
+        "read-only route refuses to write it; run `reindex --root <path>`",
+        file=sys.stderr,
+    )
+    if getattr(args, "json", False):
+        print(json.dumps({"state": "upgrade-required", "reason": "index-needs-migration",
+                          "candidates": []}, indent=2))
+    return 5
+
+
 def delete_record_rows(conn: sqlite3.Connection, path: str, *, keep_embedding: bool = False) -> None:
     """F5: a topic's own link rows (records.link_topic_path == path) cascade
     with it -- select their paths first, then delete fts/embeddings/records
@@ -5193,7 +5211,9 @@ def cmd_for_path(args) -> int:
     including the TOCTOU race where the file vanishes between the state
     check and the open below); 4 = index-error (a schema the read-only
     queries below cannot read -- ruling 65's belt-and-suspenders catch);
-    upgrade-required/current/stale/quarantined all proceed normally; a positive match
+    5 = upgrade-required (TOP-0137 L13): the index needs a migration and
+    this route never writes, so it refuses -- `reindex --root <path>`
+    migrates. current/stale/quarantined proceed normally; a positive match
     off a non-current index stays usable.
 
     Read-only by construction (TOP-0137 L13): the state check and the
@@ -5206,13 +5226,15 @@ def cmd_for_path(args) -> int:
     state = decision_index_state_readonly(db_path, args.project, root=root)
     if state in ("missing", "uninitialized"):
         return _for_path_missing_reply(args, state)
+    if state == "upgrade-required":
+        return _for_path_migration_reply(args)
     try:
         conn = open_db_readonly(db_path)
         if conn is None:
             # TOCTOU: the file vanished between the state check above and
             # this open -- the same outcome as "missing" was just found.
             return _for_path_missing_reply(args, "missing")
-        if state in ("upgrade-required", "stale", "quarantined"):
+        if state in ("stale", "quarantined"):
             _decision_warn("for-path", args, state, conn=conn)
         matches, concept_pairs = resolve_path_governance(conn, args.project, args.file_path)
         anchor_notes = {}
@@ -5235,7 +5257,7 @@ def cmd_for_path(args) -> int:
             out.extend(concept_json(conn, args.project, crow, governed) for crow, governed in concept_pairs)
             # Item 2: --json carries state when opted into --root and the
             # state is worth naming -- see cmd_search's identical gate.
-            state_worth_naming = root is not None and state in ("upgrade-required", "stale", "quarantined")
+            state_worth_naming = root is not None and state in ("stale", "quarantined")
             # Round 5: --with-chain-text folds the plain-text chain view
             # (for_path_chain_lines -- the exact text non-JSON mode prints)
             # into the JSON envelope itself, so a caller (hooks/pre-edit-
@@ -5280,7 +5302,7 @@ def cmd_for_path(args) -> int:
         # only matters to a direct CLI/JSON consumer asking for the flag.
         if args.json:
             if getattr(args, "with_chain_text", False):
-                state_worth_naming = root is not None and state in ("upgrade-required", "stale", "quarantined")
+                state_worth_naming = root is not None and state in ("stale", "quarantined")
                 payload = {}
                 if state_worth_naming:
                     payload["state"] = state
