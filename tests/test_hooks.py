@@ -3002,6 +3002,8 @@ class TestPreEditChainTopicsLogging(unittest.TestCase):
         call, NUL-separated; a mis-redirected read once left all three empty
         (outcome=no-file-path) and nothing noticed. Same payload, both paths:
         identical session= and file= (a space and a non-ASCII character)."""
+        if shutil.which("jq") is None:
+            self.skipTest("jq not on PATH: the parity check needs both decoders")
         project = "session-nojq"
         home = self._build_home(project, ["TOP-9001"])
         path = "/fake/repo/src/dir with space/\u00e9t\u00e9.py"
