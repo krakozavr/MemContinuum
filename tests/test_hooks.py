@@ -786,14 +786,7 @@ class TestPreEditChainRootAndStaleWarning(unittest.TestCase):
         one `for-path` invocation total, no ambiguity about which call it
         is."""
         argv_log = Path(self.tmp) / "argv.jsonl"
-        wrapper = memidx_wrapper_python(
-            self.tmp, "argv-recorder",
-            f'ARGV_LOG = "{argv_log}"\n'
-            'import json\n'
-            'with open(ARGV_LOG, "a") as _f:\n'
-            '    _f.write(json.dumps(sys.argv[1:]))\n'
-            '    _f.write(chr(10))\n',
-        )
+        wrapper = argv_log_python(self.tmp, "argv-recorder", argv_log)
         payload = json.dumps(
             {
                 "hook_event_name": "PreToolUse",
@@ -2004,14 +1997,7 @@ class TestPreEditChainSearchFallback(unittest.TestCase):
         memidx.cmd_reindex(args)
 
         argv_log = Path(self.tmp) / "argv.jsonl"
-        wrapper = memidx_wrapper_python(
-            self.tmp, "argv-recorder",
-            f'ARGV_LOG = "{argv_log}"\n'
-            'import json\n'
-            'with open(ARGV_LOG, "a") as _f:\n'
-            '    _f.write(json.dumps(sys.argv[1:]))\n'
-            '    _f.write(chr(10))\n',
-        )
+        wrapper = argv_log_python(self.tmp, "argv-recorder", argv_log)
         target = str(self.repo / "src" / "matched.py")
         env = self._env(MEMCONTINUUM_PYTHON=str(wrapper))
         proc, _ = run_hook(self._payload(target), env)
