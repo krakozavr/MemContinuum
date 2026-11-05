@@ -28,5 +28,9 @@ summary of them: paste the output of `memidx.py context-pack --project {{PROJECT
 (engine README, "context pack") at its top; the closing `pack sha256` line names what
 the reader saw.
 
+A brief for a dispatched agent says "find the existing implementation and name it
+(code-search first)"; a gate prompt asks "did this duplicate anything?"; both
+answers go in the gate record.
+
 A coverage or look-back nudge is an ACTION ITEM, not a notice: answer it with
 records or an explicit "none".

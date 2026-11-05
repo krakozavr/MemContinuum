@@ -6553,5 +6553,24 @@ class TestScoreRowsByCosineNumpy(unittest.TestCase):
         self.assertEqual(got, memidx._score_rows_by_cosine_loop(rows, q, "id"))
 
 
+class TestMemcontinuumHome(unittest.TestCase):
+    """TOP-0137 L15 (i): the one MEMCONTINUUM_HOME resolver."""
+
+    def test_honours_env_var(self):
+        with mock.patch.dict(os.environ, {"MEMCONTINUUM_HOME": "/tmp/mc-home-probe"}):
+            self.assertEqual(memidx.memcontinuum_home(), Path("/tmp/mc-home-probe"))
+
+    def test_default_is_dot_memcontinuum_in_home(self):
+        env = {k: v for k, v in os.environ.items() if k != "MEMCONTINUUM_HOME"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(memidx.memcontinuum_home(), Path.home() / ".memcontinuum")
+
+    def test_db_path_resolvers_follow_it(self):
+        args = SimpleNamespace(db=None, project="p")
+        with mock.patch.dict(os.environ, {"MEMCONTINUUM_HOME": "/tmp/mc-home-probe"}):
+            self.assertEqual(memidx.resolve_db_path(args), Path("/tmp/mc-home-probe/p.sqlite"))
+            self.assertEqual(memidx.resolve_code_db_path(args), Path("/tmp/mc-home-probe/p-code.sqlite"))
+
+
 if __name__ == "__main__":
     unittest.main()

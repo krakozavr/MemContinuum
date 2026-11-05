@@ -53,9 +53,17 @@ class TestRoutingRuleTemplate(unittest.TestCase):
         # Cap moved 27 -> 32: TOP-0135 L2 adds the context-pack paragraph (briefs
         # open with the records) as its own block after the command served a
         # real gate (PR #44).
+        # Cap moved 32 -> 36: TOP-0137 L15 adds the C3 sentence (find the
+        # existing implementation and name it; ask "did this duplicate
+        # anything?") as its own block after the context-pack paragraph.
         text = TEMPLATE.read_text()
         lines = text.splitlines()
-        self.assertLessEqual(len(lines), 32, f"template is {len(lines)} lines, want <= 32")
+        self.assertLessEqual(len(lines), 36, f"template is {len(lines)} lines, want <= 36")
+
+    def test_names_the_c3_rule(self):
+        text = TEMPLATE.read_text()
+        self.assertIn("find the existing implementation and name it", text)
+        self.assertIn("did this duplicate anything?", text)
 
     def test_names_the_record_shapes_and_auto_memory_distinction(self):
         text = TEMPLATE.read_text()

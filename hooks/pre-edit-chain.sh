@@ -204,15 +204,29 @@ fi
 # portable substitute, matching BSD date (no `%N`) same as GNU date.
 START_TS=$(date +%s 2>/dev/null || echo 0)
 
+# Payload session id: SESSION_ID is the raw value (state-file key), SESSION_ID_LOG
+# the same reduced to [A-Za-z0-9._-] for the hook.log line (a hostile id can
+# neither split the line nor forge a key=value field); empty means "-" there.
+SESSION_ID=""
+SESSION_ID_LOG=""
+
 log() {
     # never let logging itself fail the hook
     printf '%s\n' "$1" >>"$LOG" 2>/dev/null || true
 }
 
 finish() {
+    # hook.log line grammar (memidx.py _hook_log_fields reads project= from
+    # before " file=", so nothing may ever follow file=):
+    #   <ts> outcome=<o> elapsed=<n>s session=<id|-> [exposure=<12 hex>]
+    #        [topics=<ids>] [other extras] project=<p> file=<f>
+    # session= is on every line (`-` when the payload had none). exposure= is
+    # the first 12 hex of sha256 over "<session>\n<file>\n<topics>\n" (the
+    # logged values, UTF-8), a stable name for "this delivery of these topics
+    # for this file in this session"; present exactly when topics= is.
     # $1 = one-word outcome for the log line; $2 = optional extra
-    # "key=value" text spliced in between elapsed= and project= (eval-
-    # topic-logging: the only caller today is the matched/index-stale-
+    # "key=value" text spliced in between session=/exposure= and project=
+    # (eval-topic-logging: the only caller today is the matched/index-stale-
     # served path, passing "topics=<ids>" -- see MATCHED_TOPIC_IDS below).
     # project=/file= keep their existing trailing position and order no
     # matter what $2 is, so memidx.py's own parser (which locates the
@@ -239,7 +253,23 @@ finish() {
     [ "$elapsed" -lt 0 ] && elapsed=0
     extra_part=""
     [ -n "$extra" ] && extra_part=" $extra"
-    log "$(date -Iseconds 2>/dev/null || date) outcome=$outcome elapsed=${elapsed}s${extra_part} project=${PROJECT:-} file=${FILE_PATH:-}"
+    # session= on EVERY line (`-` when the payload carried none); exposure=
+    # only when this line names delivered topics (a `topics=` extra), exactly
+    # when topics= itself appears. A failed hash (no usable python) just
+    # omits the field -- logging never fails the hook.
+    local exposure_part=""
+    case "$extra" in
+        topics=*)
+            local exposure_hex
+            exposure_hex="$(printf '%s\n%s\n%s\n' "${SESSION_ID_LOG:--}" "${FILE_PATH:-}" "${MATCHED_TOPIC_IDS:-}" \
+                | "$PY" -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:12])' 2>/dev/null)"
+            case "$exposure_hex" in
+                [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+                    exposure_part=" exposure=$exposure_hex" ;;
+            esac
+            ;;
+    esac
+    log "$(date -Iseconds 2>/dev/null || date) outcome=$outcome elapsed=${elapsed}s session=${SESSION_ID_LOG:--}${exposure_part}${extra_part} project=${PROJECT:-} file=${FILE_PATH:-}"
     exit 0
 }
 
@@ -250,26 +280,28 @@ FILE_PATH=""
 CWD=""
 if [ -n "$PAYLOAD" ]; then
     if command -v jq >/dev/null 2>&1; then
+        # jq stays three calls: ~2 ms each, so folding them buys nothing.
         FILE_PATH="$(printf '%s' "$PAYLOAD" | jq -r '.tool_input.file_path // empty' 2>/dev/null)"
         CWD="$(printf '%s' "$PAYLOAD" | jq -r '.cwd // empty' 2>/dev/null)"
+        SESSION_ID="$(printf '%s' "$PAYLOAD" | jq -r '.session_id // empty' 2>/dev/null)"
     else
-        FILE_PATH="$(printf '%s' "$PAYLOAD" | "$PY" -c '
+        # One interpreter start for all three values, NUL-separated so a
+        # newline inside a path survives; a malformed payload prints nothing.
+        { IFS= read -r -d '' FILE_PATH && IFS= read -r -d '' CWD && IFS= read -r -d '' SESSION_ID; } < <(
+            printf '%s' "$PAYLOAD" | "$PY" -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
+    ti = d.get("tool_input")
+    ti = ti if isinstance(ti, dict) else {}
+    vals = (ti.get("file_path", "") or "", d.get("cwd", "") or "", d.get("session_id", "") or "")
+    out = b"".join(str(v).encode("utf-8", "surrogateescape") + b"\0" for v in vals)
 except Exception:
     sys.exit(1)
-print(d.get("tool_input", {}).get("file_path", "") or "")
-' 2>/dev/null)"
-        CWD="$(printf '%s' "$PAYLOAD" | "$PY" -c '
-import json, sys
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    sys.exit(1)
-print(d.get("cwd", "") or "")
-' 2>/dev/null)"
+sys.stdout.buffer.write(out)
+' 2>/dev/null) || true
     fi
+    SESSION_ID_LOG="$(printf '%s' "$SESSION_ID" | tr -cd 'A-Za-z0-9._-' 2>/dev/null)"
 fi
 
 if [ -z "$FILE_PATH" ]; then
@@ -816,21 +848,7 @@ if [ -z "$MATCHED_CANDIDATE" ]; then
     # exact scope of that claim). A session_id this hook cannot resolve
     # (missing from the payload, or memlib.sh unreachable) just skips the
     # state write -- $FB_TEXT is printed either way.
-    SESSION_ID=""
-    if [ -n "$PAYLOAD" ]; then
-        if command -v jq >/dev/null 2>&1; then
-            SESSION_ID="$(printf '%s' "$PAYLOAD" | jq -r '.session_id // empty' 2>/dev/null)"
-        else
-            SESSION_ID="$(printf '%s' "$PAYLOAD" | "$PY" -c '
-import json, sys
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    sys.exit(1)
-print(d.get("session_id", "") or "")
-' 2>/dev/null)"
-        fi
-    fi
+    # SESSION_ID was parsed with FILE_PATH/CWD (one decode on the python path), at the top.
     FB_STATE_PART=""
     if [ -n "$SESSION_ID" ] && [ -n "${FB_HITS_FOR_STATE:-}" ]; then
         # shellcheck source=memlib.sh

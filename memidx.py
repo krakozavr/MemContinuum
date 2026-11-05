@@ -71,6 +71,16 @@ DEFAULT_PROJECT = "default"
 # index files; defaults to ~/.memcontinuum. A per-call --db always wins over both
 # (see resolve_db_path, which reads the environment variable fresh on every
 # call so tests can override it per-case).
+
+
+def memcontinuum_home() -> Path:
+    """The base directory for index files, hook.log and sessions: the
+    MEMCONTINUUM_HOME environment variable read fresh on every call (tests
+    override it per case), else ~/.memcontinuum. The one place that default
+    lives; a per-call --db or --home override is resolved by the caller."""
+    return Path(os.environ.get("MEMCONTINUUM_HOME", str(Path.home() / ".memcontinuum")))
+
+
 # TOP-0137 L2 step 5: the model is the SAME BAAI/bge-small-en-v1.5 (CLS
 # pooling, L2-normalised, 384 dims) but loaded from its plain fp32 ONNX
 # (`onnx/model.onnx` in the HF repo) instead of the quantised build that
@@ -141,7 +151,7 @@ def _debug_log(exc: BaseException, context: str, db_path: Path | str | None = No
         if db_path is not None:
             log_dir = Path(db_path).parent
         else:
-            log_dir = Path(os.environ.get("MEMCONTINUUM_HOME", str(Path.home() / ".memcontinuum")))
+            log_dir = memcontinuum_home()
         if not log_dir.is_dir():
             return
         ts = datetime.now(timezone.utc).isoformat()
@@ -1156,7 +1166,7 @@ def link_record_key(topic_path: str, link_id: str) -> str:
     in a real filename, so that scheme is not collision-proof). A hashed,
     prefixed token can never collide with anything walk_markdown yields
     (no real path is a 64-hex-char token prefixed "link:")."""
-    digest = hashlib.sha256(f"{topic_path}\x00{link_id}".encode()).hexdigest()
+    digest = sha256_hex(f"{topic_path}\x00{link_id}".encode())
     return f"link:{digest}"
 
 
@@ -1316,7 +1326,7 @@ def open_db_noncreating(db_path: Path, project: str) -> sqlite3.Connection | Non
 def resolve_db_path(args) -> Path:
     if getattr(args, "db", None):
         return Path(args.db).expanduser().resolve()
-    base = Path(os.environ.get("MEMCONTINUUM_HOME", str(Path.home() / ".memcontinuum")))
+    base = memcontinuum_home()
     return base / f"{args.project}.sqlite"
 
 
@@ -2007,7 +2017,7 @@ def cmd_reindex(args) -> int:
                 [("file", f"unreadable: {msg}")],
             ))
             continue
-        sha = hashlib.sha256(data).hexdigest()
+        sha = sha256_hex(data)
         prev = existing.get(path_str)
         sha_unchanged = prev is not None and not content_full and prev[0] == sha
         needs_backfill = (not no_embed) and sha_unchanged and embedded_shas.get(path_str) != sha
@@ -5502,7 +5512,7 @@ def _resolve_symbol_via_code_index(code_root: Path, symbol: str, project: str) -
     opening (and thus without rebuilding) the db at all. The next
     code-search still finds it stale and heals it normally."""
     code_db_path = (
-        Path(os.environ.get("MEMCONTINUUM_HOME", str(Path.home() / ".memcontinuum")))
+        memcontinuum_home()
         / f"{project}-code.sqlite"
     )
     if not code_db_path.exists():
@@ -6103,7 +6113,7 @@ def _decision_content_compare(
             stat = f.stat()
             if verify_content:
                 try:
-                    current_sha = hashlib.sha256(f.read_bytes()).hexdigest()
+                    current_sha = sha256_hex(f.read_bytes())
                 except OSError:
                     changed.append(path_str)
                     if stop_at_first_mismatch:
@@ -6123,7 +6133,7 @@ def _decision_content_compare(
         if qentry is not None:
             stored_sha, diagnostics_json = qentry
             try:
-                current_sha = hashlib.sha256(f.read_bytes()).hexdigest()
+                current_sha = sha256_hex(f.read_bytes())
             except OSError:
                 current_sha = stored_sha   # still unreadable -- can't re-verify, stays accounted
             if current_sha != stored_sha:
@@ -6752,7 +6762,7 @@ def cmd_standing(args) -> int:
         return 1
 
     if args.json:
-        h = hashlib.sha256(digest_text.encode("utf-8")).hexdigest()[:16]
+        h = sha256_hex(digest_text.encode("utf-8"))[:16]
         payload = {
             "hash": h,
             "links": len(lines),
@@ -6802,7 +6812,7 @@ def pack_hash_line(text: str) -> tuple[str, int, str]:
     """`(sha256_hex, byte_count, "pack sha256=<hex> bytes=<N>")` over the
     exact UTF-8 bytes of `text` -- the pack as printed above its last line."""
     raw = text.encode("utf-8")
-    sha = hashlib.sha256(raw).hexdigest()
+    sha = sha256_hex(raw)
     return sha, len(raw), f"pack sha256={sha} bytes={len(raw)}"
 
 
@@ -7370,7 +7380,7 @@ def resolve_code_db_path(args) -> Path:
     "<project>.sqlite" (checked by TestCodeIndexIsolation)."""
     if getattr(args, "db", None):
         return Path(args.db).expanduser().resolve()
-    base = Path(os.environ.get("MEMCONTINUUM_HOME", str(Path.home() / ".memcontinuum")))
+    base = memcontinuum_home()
     return base / f"{args.project}-code.sqlite"
 
 
@@ -8328,7 +8338,7 @@ def cmd_code_reindex(args) -> int:
                 prev_sha, prev_cv = (prev[0], prev[1]) if prev is not None else (None, None)
 
             data = f.read_bytes()
-            sha = hashlib.sha256(data).hexdigest()
+            sha = sha256_hex(data)
             if prev_sha == sha and prev_cv == cv and not args.full:
                 unchanged_files += 1
                 # Finding 2 (staleness): the file's content (and thus its
@@ -9106,7 +9116,7 @@ def _root_report(
         if not signals_differ:
             continue
         try:
-            if hashlib.sha256(f.read_bytes()).hexdigest() != prev["sha256"]:
+            if sha256_hex(f.read_bytes()) != prev["sha256"]:
                 rep["changed"] += 1
                 changed_rels.add(rel)
             else:
@@ -9183,7 +9193,7 @@ def _root_report(
                         continue  # not-indexed: the retry rule owns it, same as the stat pass
                     gf = root / rel
                     try:
-                        current_sha = hashlib.sha256(gf.read_bytes()).hexdigest()
+                        current_sha = sha256_hex(gf.read_bytes())
                     except OSError:
                         rep["changed"] += 1
                         changed_rels.add(rel)
@@ -9581,12 +9591,15 @@ def _hook_payload_fields(text: str) -> dict:
     return out
 
 
-def _clean_log_token(raw, limit: int = 64) -> str:
+def _clean_log_token(raw, limit: int | None = 64, empty: str = "unknown") -> str:
     """A payload value reduced to a hook.log-safe token: [A-Za-z0-9._-]
     only, so a hostile session_id can neither split the line nor forge a
-    key=value pair."""
-    token = re.sub(r"[^A-Za-z0-9._-]", "", str(raw or ""))[:limit]
-    return token or "unknown"
+    key=value pair. `limit=None` means no length cap (a project name keeps
+    its identity); `empty` is what an all-filtered value becomes."""
+    token = re.sub(r"[^A-Za-z0-9._-]", "", str(raw or ""))
+    if limit is not None:
+        token = token[:limit]
+    return token or empty
 
 
 def _log_path_token(raw, limit: int = 512) -> str:
@@ -9610,6 +9623,34 @@ def _log_path_token(raw, limit: int = 512) -> str:
             for c in text)
     data = data[:limit]
     return urllib.parse.quote_from_bytes(data, safe="/._~:!-") or "-"
+
+
+def append_hook_log_line(keyword: str, fields: dict, log_dir: Path | None = None) -> None:
+    """Append ONE `<ISO ts with offset> <keyword> k=v ...` line to hook.log --
+    the Python twin of memlib.sh `mc_log` for a command that runs outside any
+    shell hook (code-search is called by agents directly). The timestamp has
+    the shape `date -Iseconds` gives. Values go through `_clean_log_token`
+    (no space, no `=`, so none can split the line or forge a field; all
+    capped at 64 chars except `project`, which is kept whole); the
+    caller passes `project` LAST (`_hook_log_fields` relies on it). `log_dir`
+    defaults to `memcontinuum_home()`. Fail-open: any error writes nothing
+    and raises nothing, and a missing directory is never created. Rotation
+    is shell-only (mc_rotate_hook_log): the next shell hook rotates."""
+    try:
+        base = Path(log_dir) if log_dir is not None else memcontinuum_home()
+        if not base.is_dir():
+            return
+        ts = datetime.now().astimezone().isoformat(timespec="seconds")
+        # `project` keeps its full name: a 64-char cap would merge distinct
+        # long project names in `stats` (repo-init.sh accepts longer ones).
+        body = " ".join(
+            f"{k}={_clean_log_token(str(v), limit=None if k == 'project' else 64)}"
+            for k, v in fields.items())
+        line = f"{ts} {keyword} {body}\n"
+        with open(base / "hook.log", "a", encoding="utf-8") as fh:
+            fh.write(line)
+    except Exception:
+        return
 
 
 def _write_code_stale_marker(marker: Path, reason: str, roots: int) -> bool:
@@ -10155,6 +10196,35 @@ CODE_RRF_K = 30
 
 
 def cmd_code_search(args) -> int:
+    """Run the search, then append one `code-search` line to
+    `memcontinuum_home()/hook.log` (wherever --db points, so `stats` reads it)
+    so `stats` can count agent-driven searches. A logging failure never changes
+    the exit code or stdout."""
+    log: dict = {}
+    try:
+        rc = _cmd_code_search(args, log)
+    except BaseException:
+        _log_code_search(args, log)
+        raise
+    _log_code_search(args, log)
+    return rc
+
+
+def _log_code_search(args, log: dict) -> None:
+    try:
+        hits = log.get("hits")
+        outcome = "error" if hits is None else ("ok" if hits else "no-hits")
+        append_hook_log_line(
+            "code-search",
+            {"outcome": outcome, "hits": hits or 0,
+             "q": _clean_log_token(str(getattr(args, "query", "") or "")[:40], empty="-"),
+             "project": getattr(args, "project", None)},
+        )
+    except Exception:
+        return
+
+
+def _cmd_code_search(args, log: dict) -> int:
     db_path = resolve_code_db_path(args)
     # Fix-wave item 9: a db written by a newer engine must never crash
     # code-search -- fail open with the refusal's own message and no
@@ -10352,7 +10422,7 @@ def cmd_code_search(args) -> int:
     if decision_db_arg:
         md_db_path = Path(decision_db_arg).expanduser().resolve()
     else:
-        md_base = Path(os.environ.get("MEMCONTINUUM_HOME", str(Path.home() / ".memcontinuum")))
+        md_base = memcontinuum_home()
         md_db_path = md_base / f"{args.project}.sqlite"
     # F1 (ruling 68): the decision-attach lookup is a decision-index READER
     # (Codex named it explicitly) -- open_db_noncreating replaces the
@@ -10421,6 +10491,7 @@ def cmd_code_search(args) -> int:
     if md_conn is not None:
         md_conn.close()
     conn.close()
+    log["hits"] = len(out)
 
     if args.json:
         # Finding 1 + Anatomy M2a Task 4: state + full per-root provenance
@@ -10491,7 +10562,10 @@ def cmd_code_search(args) -> int:
 #   <ts> sessionend outcome=X session=S project=P
 #   <ts> precompact outcome=X session=S project=P
 #   <ts> newfile-nudge outcome=X project=P file=...
-#   <ts> outcome=matched elapsed=Ns project=P file=...      (pre-edit-chain.sh --
+#   <ts> code-search outcome=ok|no-hits|error hits=N q=TOKEN project=P  (the
+#        one Python-written line, append_hook_log_line, from `code-search`)
+#   <ts> outcome=matched elapsed=Ns session=S [exposure=H] [topics=..] project=P file=...
+#        (pre-edit-chain.sh --
 #        no hook-type keyword; own independent logger, distinguished below)
 #   payload_keys=... project=P                               (no timestamp --
 #        a KNOWN timestamp-less shape, counted separately, see
@@ -10526,7 +10600,7 @@ def cmd_code_search(args) -> int:
 # every deployment's cold-start window, not a real signal).
 _HOOK_LOG_KEYWORDS = (
     "userprompt", "ledger", "sessionstart", "sessionend", "precompact",
-    "newfile-nudge",
+    "newfile-nudge", "code-search",
 )
 UNKNOWN_STATS_PROJECT = "(unknown)"
 
@@ -10722,7 +10796,7 @@ def _hook_log_line_kind(rest: str) -> str:
 # never saw (never a KeyError, never a silent `.get(..., {})` fallback).
 _STATS_KINDS = (
     "userprompt", "ledger", "pre-edit", "newfile-nudge",
-    "sessionstart", "sessionend", "precompact", "pre-commit", "other",
+    "sessionstart", "sessionend", "precompact", "pre-commit", "code-search", "other",
 )
 
 
@@ -11387,6 +11461,7 @@ def _stats_report(
     # These lines carry no `outcome=` field and route through their own
     # "pre-commit" kind, never "userprompt", so they can never inflate
     # `user_prompts` above.
+    cs = outcomes["code-search"]
     pcm = outcomes["pre-commit"]
     pcm_pass = pcm.get("pass", 0)
     pcm_refused = pcm.get("refused", 0)
@@ -11502,6 +11577,12 @@ def _stats_report(
             "index_degraded": pc_index_degraded,
             "outcomes": dict(pc),
         },
+        "code_search": {
+            "ok": cs.get("ok", 0),
+            "no_hits": cs.get("no-hits", 0),
+            "error": cs.get("error", 0),
+            "outcomes": dict(cs),
+        },
         "pre_commit": {
             "pass": pcm_pass,
             "refused": pcm_refused,
@@ -11570,9 +11651,7 @@ def cmd_stats(args) -> int:
     # never a traceback/exit 1 from what is supposed to be the tool that
     # catches silent failures.
     try:
-        home = Path(args.home).expanduser() if args.home else Path(
-            os.environ.get("MEMCONTINUUM_HOME", str(Path.home() / ".memcontinuum"))
-        )
+        home = Path(args.home).expanduser() if args.home else memcontinuum_home()
         log_path = home / "hook.log"
 
         if args.now:
@@ -11685,6 +11764,9 @@ def cmd_stats(args) -> int:
         pcm = result["pre_commit"]
         print(f"pre-commit (store append-only guard): pass={pcm['pass']} "
               f"refused={pcm['refused']} skipped={pcm['skipped']}")
+        csr = result["code_search"]
+        print(f"code-search (agent calls): ok={csr['ok']} no-hits={csr['no_hits']} "
+              f"error={csr['error']}")
         fb = result["fallback"]
         p50_txt = "n/a" if fb["ms_p50"] is None else f"{fb['ms_p50']}ms"
         p95_txt = "n/a" if fb["ms_p95"] is None else f"{fb['ms_p95']}ms"
@@ -12272,8 +12354,48 @@ def _flow_list_parts(rest: str):
     return (items, tail) if re.fullmatch(r"(\s*#.*)?", tail) else None
 
 
+# PyYAML's single-character escapes inside a double-quoted scalar (yaml/reader
+# ESCAPE_REPLACEMENTS), plus the hex forms and their widths.
+_YAML_DQ_ESCAPES = {
+    "0": "\0", "a": "\a", "b": "\b", "t": "\t", "\t": "\t", "n": "\n", "v": "\v",
+    "f": "\f", "r": "\r", "e": "\x1b", " ": " ", '"': '"', "/": "/", "\\": "\\",
+    "N": "\x85", "_": "\xa0", "L": "\u2028", "P": "\u2029",
+}
+_YAML_DQ_HEX = {"x": 2, "u": 4, "U": 8}
+
+
 def _scalar_token(token: str) -> str:
-    return token.strip().strip("'\"")
+    """The value of one flow/block list item as YAML reads it: a single-quoted
+    scalar has its `''` read as `'`; a double-quoted one has its backslash
+    escapes decoded (`\\"`, `\\\\`, `\\n`, `\\t`, ... as PyYAML does); anything else
+    is the stripped plain text. An escape it does not know leaves the token
+    as written, so a comparison against a link id fails closed."""
+    t = token.strip()
+    if len(t) >= 2 and t[0] == t[-1] == "'":
+        return t[1:-1].replace("''", "'")
+    if len(t) >= 2 and t[0] == t[-1] == '"':
+        body, out, i = t[1:-1], [], 0
+        while i < len(body):
+            c = body[i]
+            if c != "\\":
+                out.append(c)
+                i += 1
+                continue
+            esc = body[i + 1:i + 2]
+            if esc in _YAML_DQ_ESCAPES:
+                out.append(_YAML_DQ_ESCAPES[esc])
+                i += 2
+            elif esc in _YAML_DQ_HEX:
+                width = _YAML_DQ_HEX[esc]
+                digits = body[i + 2:i + 2 + width]
+                if len(digits) != width or not re.fullmatch(r"[0-9A-Fa-f]+", digits):
+                    return t
+                out.append(chr(int(digits, 16)))
+                i += 2 + width
+            else:
+                return t
+        return "".join(out)
+    return t
 
 
 def edit_standing_line(text: str, link_id: str, add: bool) -> str:
@@ -12460,10 +12582,6 @@ def cmd_mark_standing(args) -> int:
 # PRINTS suggestions. Nothing here appends a reference: only `bind`, run by
 # a person or the orchestrator, writes a canonical record (D12). No hook
 # calls this command.
-
-
-def memcontinuum_home() -> Path:
-    return Path(os.environ.get("MEMCONTINUUM_HOME", str(Path.home() / ".memcontinuum")))
 
 
 def sessions_dir_for(project: str, override: str | None = None) -> Path:

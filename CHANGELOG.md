@@ -2,6 +2,36 @@
 
 ## [Unreleased]
 
+### Hygiene
+- Docs only: SCHEMA no longer says a `project` change can drop a topic from the
+  standing digest. The project is set when the index is built, not read from the
+  file, so only a change of `type` can.
+- Docs only: SCHEMA and INTERNALS now state the append-only guard's known limit.
+  When the earlier version of a record could not be parsed cleanly and the new
+  one can, the edit counts as a repair, and a removed link, `anchors:` block or
+  `standing_marks:` block is not caught (only a note is printed).
+- `memidx.py mark-standing --remove` now finds a `standing:` item written with
+  YAML quoting (`'it''s'`, `"a\"b"`) by the id it stands for, instead of
+  refusing; other items in the list are left exactly as written.
+- `memlint.py --code-root` no longer reports a `decision: TOP-... Ln` example
+  that a Markdown file shows inside a fenced block or an inline code span
+  (docs/SCHEMA.md did); markers in a Markdown file's prose are still checked.
+- Every pre-edit line in `hook.log` now carries `session=` (`-` when the hook
+  payload had none), and a line that delivered topics also carries `exposure=`,
+  a short stable name for that delivery (session, file and topics) that later
+  lines can point back to.
+- `memidx.py code-search` now appends one line to `hook.log`
+  (`code-search outcome=ok|no-hits|error hits=N q=... project=...`), and
+  `memidx.py stats` reports the calls in a `code_search` block. A logging
+  failure never changes the search's output or exit code.
+- Internal cleanup in `memidx.py`: every place that resolved `MEMCONTINUUM_HOME`
+  now calls the one `memcontinuum_home()` helper, and the plain
+  SHA-256-of-bytes calls use the one `sha256_hex()`. No behaviour change.
+- The rendered rules template now carries the duplication rule: a brief for a
+  dispatched agent says to find the existing implementation and name it, a gate
+  prompt asks whether the change duplicated anything, and both answers go in the
+  gate record. Wired repositories pick it up on the next updater run.
+
 ### Binding
 - Topics gain an `anchors:` frontmatter key: the SHA-256 of the code a
   `code_refs` entry named when the binding was captured, with the capture kind

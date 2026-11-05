@@ -242,9 +242,9 @@ prompt, unaffected by the prompt-query channel's own amendment to ruling B,
 see "Prompt-derived queries" below) and never
 re-searching: each entry renders as `search surfaced <title> (<id>) for
 <file>`, capped at 8 (the same cap coverage's own `unmapped[:8]` fact line
-uses) — `pre-edit-chain.sh`'s own hook.log lines carry no `session=` field
-at all (`finish()`'s own fixed field list has none), so this state write is
-the ONLY place a title is recoverable per session; the write itself is
+uses) — `pre-edit-chain.sh`'s hook.log lines carry `session=` but never a
+title (`ids=` is bare topic ids), so this state write is the ONLY place a
+title is recoverable per session; the write itself is
 sourced and paid for lazily, only on this already-rare branch, THROUGH A
 SHORT (0.25s, not the shared `mc_update_state_json`'s own 2.0s default)
 lock deadline of its own — this write runs after the search subprocess
@@ -517,9 +517,9 @@ default is silence.
 
 **pre-edit-chain.sh's `topics=` field.** A `matched` or `index-stale-served`
 line also names which topic ids were actually injected, not just that
-something matched: `outcome=matched elapsed=1s topics=TOP-nnnn,TOP-nnnn
-project=P file=F` — sorted, comma-separated, sitting between `elapsed=` and
-`project=` so `project=`/`file=` keep their existing trailing position (the
+something matched: `outcome=matched elapsed=1s session=S exposure=H
+topics=TOP-nnnn,TOP-nnnn project=P file=F` — sorted, comma-separated, sitting
+before `project=` (after `session=`/`exposure=`, below) so `project=`/`file=` keep their existing trailing position (the
 one thing `memidx.py stats`'s own line parser structurally relies on). This
 exists so a later grading pass can check WHICH decisions a matched edit
 actually saw, turning a matched edit into a gradeable sample: file, decisions
@@ -535,6 +535,39 @@ written before this field existed simply has none, and still parses.
 many distinct topic ids were ever injected in the window), and `top_topics`
 (the top 5 by injection count, ties broken by id) — a `+N` cap marker is
 never counted as a topic.
+
+**code-search's hook.log line.** `memidx.py code-search` is run by agents
+directly, not by a hook, so Python writes its line (`append_hook_log_line`):
+`<ISO ts with offset> code-search outcome=<ok|no-hits|error> hits=<n> q=<token>
+project=<p>`. `ok` is at least one hit, `no-hits` a finished search with none,
+`error` a search that did not finish (uninitialized or too-new code index, or an
+exception). `q` is the first 40 characters of the query reduced to
+`[A-Za-z0-9._-]` (so no space, `=` or newline can forge a field; `-` when
+nothing survives), `project=` is last. The line always goes to
+`$MEMCONTINUUM_HOME/hook.log` (default `~/.memcontinuum`), even when `--db`
+points elsewhere, so `stats` sees it; only when that directory already exists, and any
+failure to write it is swallowed: the command's exit code and stdout never
+change. Rotation is shell-only (`mc_rotate_hook_log`); this Python append
+bypasses it and the next shell hook rotates. `memidx.py stats` counts these
+lines as their own kind under a `code_search` block (`ok`, `no_hits`, `error`).
+
+**pre-edit-chain.sh's `session=` and `exposure=` fields.** Every pre-edit
+line now has the shape `outcome=<o> elapsed=<n>s session=<id|-> [exposure=<H>]
+[topics=<ids>] [other extras] project=<p> file=<f>`. `session=` is the payload's
+`session_id` reduced to `[A-Za-z0-9._-]` (a hostile id cannot split the line or
+forge a field), parsed once with `file_path` and `cwd` at the top of the run and
+reused by the search-fallback state write; it is `-` when the payload carried
+none, never omitted, never empty. `exposure=` is a stable name for "this
+delivery of these topics for this file in this session": the first 12 hex
+characters of the SHA-256 over the UTF-8 string
+`"<session id>\n<FILE_PATH as logged>\n<comma-joined MATCHED_TOPIC_IDS in the
+order logged>\n"` (the session id as logged, so `-` when absent). It is emitted
+exactly when `topics=` is and omitted otherwise, so a later line (ledger,
+turn-end, a filing command) can refer to the delivery. The hash is one
+`$MEMCONTINUUM_PYTHON -c` call inside `finish()` on the matched path only; if
+python cannot run, the field is omitted and the line is otherwise unchanged.
+Nothing may follow `file=` (`memidx.py` reads `project=` from before it), and
+`stats` still classifies the line by its leading `outcome=` and ` elapsed=`.
 
 **hook.log rotation.** Nothing truncates or prunes hook.log on its own —
 `mc_prune_old_state` only ever clears session-state JSON — so an
@@ -2695,7 +2728,7 @@ scan never opens a file nothing references, even to check whether it is binary.
 | an active CONSTRAINT/HOLD link's `path#symbol` ref finds no marker at that symbol | warning |
 | an active CONSTRAINT/HOLD link's `path#symbol` ref names a symbol the chunker proves absent | error (the ref itself is dangling) |
 | a file in scope whose backend cannot run here (a missing optional grammar wheel, or a genuine chunking failure) | warning (names the reason), never an error |
-| a file in scope whose language has no chunker at all | not a failure — scanned for a `decision:` marker by plain regex alone (no chunk-derived window); silent when it holds none. When it does, checked against every marker→store rule above that needs no symbol location (topic/link exist, active, CONSTRAINT/HOLD, code_refs name the file — the code_ref's own `#symbol` fragment, if any, is stripped before this comparison, so it counts exactly like a bare path or glob); a violation there is still the matching error, and clean is ONE warning that the marker cannot be attributed to a symbol — never the old blanket per-file warning fired regardless of whether the file held a marker at all |
+| a file in scope whose language has no chunker at all | not a failure — scanned for a `decision:` marker by plain regex alone (no chunk-derived window); silent when it holds none. A Markdown file (`.md`/`.markdown`) is scanned by its prose only (`_markdown_prose_lines`): lines inside a fenced block (``` or ~~~, any info string, closed by a fence of the same character at least as long; an unterminated fence runs to the end of the file) and text inside inline backtick spans are skipped, so a marker shown as an example in docs/SCHEMA.md is not a marker. When it does, checked against every marker→store rule above that needs no symbol location (topic/link exist, active, CONSTRAINT/HOLD, code_refs name the file — the code_ref's own `#symbol` fragment, if any, is stripped before this comparison, so it counts exactly like a bare path or glob); a violation there is still the matching error, and clean is ONE warning that the marker cannot be attributed to a symbol — never the old blanket per-file warning fired regardless of whether the file held a marker at all |
 | a `path#symbol` naming a container type (class/struct/enum/…) the chunker reports no definition line for | warning (uncheckable, not "no marker") |
 
 Cited-commit / file:line citation rules (`--code-root`; SCHEMA §7 "Cited
@@ -2761,7 +2794,7 @@ id:
 | an `anchors:` row present at `REF` is missing now, has a changed parsed field, or has the same fields in different raw text; or two rows now carry one `(ref, link)` | error naming the row, `<path>: anchor (<ref>, <link>): row changed after being recorded` / `row reformatted, not appended` / `more than one row` — the same raw-span walker as the links row above, keyed by `anchors:` and by `(ref, link, captured, captured_at)`; new rows are free; row multiplicity at `REF` is kept, so a duplicated pair reduced to one row errors as removed |
 | a new link (present now, absent at `REF`) sorts BELOW some link that already existed at `REF`, in the new file's own link order | error, `<path>:<link>: link inserted out of order` — every new link must sort above every `REF`-side link, newest-first |
 | the link ids present at `REF` appear in a different relative order now (g3, `_link_order_errors`) | error, `<path>: links reordered (L2 before L3; the chain head is first-active-in-file-order)` — every per-link span can be intact while the chain head moves |
-| a `standing_marks:` row present at `REF` is missing now, has a changed parsed field, has the same fields in different raw text, or the rows are reordered or a new row sits below an old one (g1, `_standing_marks_freeze_errors`) | error, `<path>: standing mark (<link>, <action>, <recorded_at>): row changed after being recorded` / `row removed after being recorded` / `row reformatted, not appended`, `marks not prepended`, `recorded rows reordered` — the same raw-span walker as links and anchors (`key="standing_marks"`, identity `(link, action, recorded_at)`) through the shared `_frozen_rows_errors`; unlike anchors, a block the walker cannot account for at `REF` or in the new blob is an error, not a note; also run when `REF` never parsed |
+| a `standing_marks:` row present at `REF` is missing now, has a changed parsed field, has the same fields in different raw text, or the rows are reordered or a new row sits below an old one (g1, `_standing_marks_freeze_errors`) | error, `<path>: standing mark (<link>, <action>, <recorded_at>): row changed after being recorded` / `row removed after being recorded` / `row reformatted, not appended`, `marks not prepended`, `recorded rows reordered` — the same raw-span walker as links and anchors (`key="standing_marks"`, identity `(link, action, recorded_at)`) through the shared `_frozen_rows_errors`; unlike anchors, a block the walker cannot account for at `REF` or in the new blob is an error, not a note; on the repair path (`REF` never parsed, or only through the lenient fallback) it runs against EMPTY old rows, because `standing_marks` is in `FALLBACK_COMPLEX_FIELDS` and is never recovered there, so a removed block passes with only the note — see the known limit in SCHEMA §7 |
 | the `standing:` set changed without exactly one matching new row per added/removed id (g2, `_standing_pairing_errors`) | error, `standing changed for L4 (add) with no matching standing_marks row` / `orphan standing mark (L4, add): standing: did not change that way` / `duplicate standing mark for (L4, add) in one commit`; a remove+add of one id with the set unchanged is two orphans; a reorder with the same set is free; a brand-new topic is paired against an empty `REF` set |
 | `current:` names a link other than the staged blob's newest active link, or changes (including removal) without a change of the newest active link and without repairing a disagreement already present at `REF` (g4, `_current_discipline_errors`) | error, `<path>: current: 'L2' does not match the newest active link of the staged file -- should be 'L3'` / `<path>: current changed L3 -> L2 without a change of the newest active link` |
 | the new (staged) blob of a modified or added topic carries a malformed `standing_marks:` row (missing or unknown field, bad `action`, `authority` not `owner-verbatim`/`owner-ratified`, empty `source`/`why`, CR/LF in `why`, a non-string `recorded_by`, bad `recorded_at`/`date`, a `link` not in the topic, a repeated identity), a repeated id in `standing:`, or a `standing:` pointer that is not an eligible link (`_staged_standing_errors`, built on `_standing_marks_errors` and `_standing_pointer_errors`, the same functions `lint_topic` calls) | error naming the row or pointer, judged on the staged blob under `--staged` — the pre-commit hook lints only the worktree copy, so an agent-inference row staged and then edited in the worktree is still refused |
@@ -2769,7 +2802,7 @@ id:
 | the `REF`-side blob failed validation but parsed to a mapping whose `links` are absent, empty or id-less (shape (i)) | not a repair: full g1–g4 against that mapping's own `standing`, `standing_marks` and `current`, with no old links (every link is new); a note says so |
 | the `REF`-side blob parsed only through the lenient YAML fallback (or to no mapping) and the new blob parses cleanly (shapes (ii)/(iii)) | the repair note above, plus the note `standing membership at REF unrecoverable (fallback parse); pairing not checked`; g1, the row and pointer rules and `current:` equal to the staged newest active link (`_staged_head_errors`) still run on the new blob; only pairing cannot |
 | the `REF`-side blob failed full validation (a shape error, or a duplicate link id) but its `links` field itself still recovers at least one usable entry | not a repair — those recovered links (a duplicate id keeps its FIRST occurrence, file order) are still compared against the new side by every rule above, exactly as if the REF blob had parsed cleanly, with a note naming the REF-side diagnostic that made the blob invalid |
-| the `REF`-side blob never parsed as a mapping, or parsed only through the lenient YAML fallback (shapes (ii)/(iii) above), and the new blob now parses cleanly | a note, not an error (`repaired — the blob at REF could not be safely parsed …`) — nothing here was ever recorded link history to freeze, so fixing it is a repair, never an append-only violation. `anchors:` rows are NOT part of that repair: any anchor rows the REF blob still yields stay frozen on this branch too (a changed or removed row errors with the same "row removed or changed" wording as the ordinary path) |
+| the `REF`-side blob never parsed as a mapping, or parsed only through the lenient YAML fallback (shapes (ii)/(iii) above), and the new blob now parses cleanly | a note, not an error (`repaired — the blob at REF could not be safely parsed …`) — nothing here was ever recorded link history to freeze, so fixing it is a repair, never an append-only violation. Known limit: `links`, `anchors` and `standing_marks` are in `FALLBACK_COMPLEX_FIELDS` (`memidx.py`) and are never recovered by the lenient parse, so on this branch the anchors and marks freezes (`_anchor_freeze_errors`, `_standing_marks_freeze_errors`) compare against EMPTY old rows and are vacuous: a removed link, a removed `anchors:` block or a removed `standing_marks:` block passes with only the note. The new blob's own rules (added links judged as new, `standing:`/`current:` checks, plain-mode marks rules) still run |
 | frontmatter that does not parse on the new side, or on both sides | error, the typed-parse diagnostic — never a traceback |
 | a record whose recoverable kind is not topic-like (`type: incident`/`investigation`/`concept` with no `links:`) | out of scope for this check entirely — there is no recorded link history to protect, so neither an error nor a note |
 | `--code-root` given together with `--against-ref` | exit 2 — append-only mode never uses a code root, and the flag is rejected rather than silently ignored |
@@ -3808,7 +3841,11 @@ down:
   last id goes, an absent key is created before `standing_marks:`/`anchors:`/
   `links:`); one row is prepended; `recorded_at` is the local time to the
   second and `recorded_by` defaults to `$MEMCONTINUUM_RECORDED_BY`, else
-  `memidx`. `--why` and `--source` are one line each. The edit is re-parsed
+  `memidx`. `--remove` matches an item by the value YAML reads from it
+  (`_scalar_token`: `''` in a single-quoted item is `'`, backslash escapes in a
+  double-quoted one are decoded, a plain item is its text), so `'it''s'` and
+  `"a\"b"` are removable by `it's` and `a"b`; the remaining items are kept
+  byte for byte. `--why` and `--source` are one line each. The edit is re-parsed
   and must round-trip (the new `standing` list, the new row first and once,
   every earlier row unchanged) before the file is written; nothing is
   committed. A supersession is two calls before one commit.

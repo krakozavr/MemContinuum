@@ -1905,6 +1905,56 @@ def _store_to_code_check(
     return errors, warnings
 
 
+_MD_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+_BACKTICK_RUN_RE = re.compile(r"`+")
+
+
+def _blank_code_spans(line: str) -> str:
+    """Return `line` with inline code spans blanked (same length, spaces).
+    CommonMark rule, scanning backtick RUNS left to right: a run of length N
+    opens a span that closes at the next run of exactly N; runs of other
+    lengths are content. An opener with no matching closer is literal text
+    and scanning resumes after it. Escapes and multi-line spans: not modelled."""
+    runs = list(_BACKTICK_RUN_RE.finditer(line))
+    out = list(line)
+    i = 0
+    while i < len(runs):
+        n = len(runs[i].group(0))
+        j = next((k for k in range(i + 1, len(runs))
+                  if len(runs[k].group(0)) == n), None)
+        if j is None:
+            i += 1
+            continue
+        start, end = runs[i].start(), runs[j].end()
+        out[start:end] = " " * (end - start)
+        i = j + 1
+    return "".join(out)
+
+
+def _markdown_prose_lines(text: str):
+    """Yield (lineno, line) for the prose of a Markdown file: lines inside a
+    fenced block (``` or ~~~, any info string; closed by a fence of the same
+    character at least as long, an unterminated one runs to EOF) are skipped,
+    and inline code spans are blanked so a marker quoted as an example in a
+    document is never read as a real one (a span opens and closes on a whole
+    backtick run of the same length, as in CommonMark). Known limits: escaped
+    backticks and spans crossing a line break are not modelled. Line numbers
+    stay those of the file."""
+    fence_char = ""
+    fence_len = 0
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        m = _MD_FENCE_RE.match(line)
+        if fence_char:
+            if m and m.group(1)[0] == fence_char and len(m.group(1)) >= fence_len \
+                    and not m.group(2).strip():
+                fence_char, fence_len = "", 0
+            continue
+        if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
+            fence_char, fence_len = m.group(1)[0], len(m.group(1))
+            continue
+        yield lineno, _blank_code_spans(line)
+
+
 def lint_markers(root: Path, code_roots: list[Path]) -> tuple[list[str], list[str]]:
     """Task A2-2 (TOP-0122 L1 rule 2b): constraint/hold decision markers
     verified both ways -- see the module comment above this section for
@@ -1955,7 +2005,14 @@ def lint_markers(root: Path, code_roots: list[Path]) -> tuple[list[str], list[st
                 # exception) still falls through to the ordinary
                 # uncheckable-file warning below -- that IS a genuine gap
                 # worth naming, unlike a language that was never wired.
-                for lineno, line in enumerate(text.splitlines(), start=1):
+                # A Markdown file documents markers in fenced blocks and
+                # code spans as EXAMPLES (docs/SCHEMA.md); only its prose
+                # is scanned (_markdown_prose_lines).
+                if full.suffix.lower() in (".md", ".markdown"):
+                    scan_lines = _markdown_prose_lines(text)
+                else:
+                    scan_lines = enumerate(text.splitlines(), start=1)
+                for lineno, line in scan_lines:
                     m = _DECISION_MARKER_RE.search(line)
                     if not m:
                         continue
