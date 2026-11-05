@@ -2953,8 +2953,10 @@ The decision index (`<project>.sqlite`) carries the same provenance discipline
 | `quarantined` | current generation, not `stale` (a `root`-taking reader's own drift check passed or was not asked for), and `index_errors` holds at least one row for this project (one or more records could not be safely indexed — see "Tolerant parsing and quarantine" above); needs no `root` — a plain table lookup | proceed, warn on stderr naming the skipped-record count; `unmapped` refuses the negative claim (below) |
 | `current` | stamped, current generation, no drift, no quarantined record | proceed silently |
 
-**One reader refuses instead of warning: `standing` (see [standing decisions](#standing-decisions)).**
-Every table row above says "proceed, warn on stderr" for `upgrade-required`/`stale`/`quarantined` --
+**One reader refuses instead of warning: `standing` (see [standing decisions](#standing-decisions));
+`for-path` additionally refuses `upgrade-required` with exit 5 (read-only route, above).**
+Every table row above says "proceed, warn on stderr" for `upgrade-required`/`stale`/`quarantined`
+(except `for-path` on `upgrade-required`, which exits 5) --
 a positive match off a degraded index is still real evidence for a reader that is ANSWERING a
 question the caller asked. `standing` is not answering a question; it is asserting, unprompted,
 that a ruling still holds -- so it refuses on every state but `current`, `missing` and

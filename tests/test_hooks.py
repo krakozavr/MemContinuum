@@ -1574,8 +1574,10 @@ class TestPreEditChainWorktreeGap(unittest.TestCase):
     def test_outside_roots_p95_latency_over_20_runs(self):
         """B2: the wider glob puts every edit under a root's parent through
         this script, so the off-root refusal must stay cheap (one bash start
-        plus the remap check, no for-path/python query). Reports the number
-        and asserts only a generous outer bound."""
+        plus the remap check, no for-path/python query). Each of the 20 runs
+        asserts the `outside-roots` refusal outcome, empty stdout and zero
+        memidx.py invocations in the argv log; the latency is reported and
+        held to a generous outer bound."""
         target = str(self.repo_b / "src" / "other.py")
         argv_log = Path(self.tmp) / "p95-argv.jsonl"
         wrapper = argv_log_python(self.tmp, "p95-argv-recorder", argv_log)
