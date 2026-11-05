@@ -313,7 +313,78 @@ fi
 
 # PROJECT is already resolved above (moved ahead of the no-python check).
 
+# --- off-root refusal (TOP-0137 L16) -------------------------------------
+# The settings-level "if" globs also cover each retrieval root's PARENT
+# directory (scripts/repo-init.sh), so a sibling worktree
+# (`git worktree add ../x`) reaches this script -- and so does ANY other edit
+# under that parent. A path under none of the configured roots is therefore
+# decided HERE, before any for-path query (it cannot match a code_ref anyway,
+# and the wider glob must cost one bash start plus the remap, no python):
+#   mc_remap_worktree_gated rc 0 -> a worktree of a wired root: QUERY_PATH
+#                                   becomes the remapped main-checkout path
+#                                   and is the ONLY path queried below (no
+#                                   raw worktree form, absolute or cwd-/
+#                                   prefix-relative, ever reaches for-path --
+#                                   a cwd-relative raw form can be bound to
+#                                   ANOTHER record), as if the edit happened
+#                                   in the main checkout
+#   rc 1 -> worktree-unwired      a worktree of an unwired repository
+#   rc 2 -> worktree-unresolved   git could not settle it
+#   rc 3 -> outside-roots         an ordinary other repository or directory
+# Every refusal ends the run with no search: a path whose repository does
+# not resolve to a wired root never reads this project's store. The block is
+# skipped for an in-root path (textual prefix test first, so the common case
+# sources nothing), a relative path, and an unset STRIP_PREFIX -- all of
+# which keep the flow below byte-for-byte.
+QUERY_PATH="$FILE_PATH"
+WT_PRE_DONE=0
+WT_REMAPPED=""
+WT_REMAP_RC=3
+WT_ROOTS=""
+declare -a WT_ROOT_ARR=()
+if [ -n "${MEMCONTINUUM_STRIP_PREFIX:-}" ] && [ "${FILE_PATH#/}" != "$FILE_PATH" ]; then
+    OFFROOT_TEXTUAL_IN_ROOT=0
+    IFS=':' read -r -a OFFROOT_PREFIXES <<<"$MEMCONTINUUM_STRIP_PREFIX"
+    for prefix in "${OFFROOT_PREFIXES[@]}"; do
+        [ -z "$prefix" ] && continue
+        if [ "${FILE_PATH#"$prefix"}" != "$FILE_PATH" ]; then
+            OFFROOT_TEXTUAL_IN_ROOT=1
+            break
+        fi
+    done
+    if [ "$OFFROOT_TEXTUAL_IN_ROOT" -eq 0 ]; then
+        # shellcheck source=mc-path-lib.sh
+        source "$SCRIPT_DIR/mc-path-lib.sh"
+        WT_ROOTS="$(mc_strip_prefix_roots "$MEMCONTINUUM_STRIP_PREFIX")"
+        while IFS= read -r wt_root; do
+            [ -n "$wt_root" ] && WT_ROOT_ARR+=("$wt_root")
+        done <<EOF3
+$WT_ROOTS
+EOF3
+        OFFROOT_IN_ROOT=0
+        for wt_root in ${WT_ROOT_ARR[@]+"${WT_ROOT_ARR[@]}"}; do
+            if mc_path_under_root "$FILE_PATH" "$wt_root"; then
+                OFFROOT_IN_ROOT=1
+                break
+            fi
+        done
+        if [ -n "$WT_ROOTS" ] && [ "$OFFROOT_IN_ROOT" -eq 0 ]; then
+            WT_REMAPPED="$(mc_remap_worktree_gated "$FILE_PATH" "$WT_ROOTS")"
+            WT_REMAP_RC=$?
+            WT_PRE_DONE=1
+            case $WT_REMAP_RC in
+                0) QUERY_PATH="$WT_REMAPPED" ;;
+                1) finish "worktree-unwired" ;;
+                2) finish "worktree-unresolved" ;;
+                *) finish "outside-roots" ;;
+            esac
+        fi
+    fi
+fi
+
 # --- build candidate paths to try against for-path -------------------------
+# Every form derives from QUERY_PATH (FILE_PATH, or the remapped main-checkout
+# path for a sibling worktree -- see the off-root refusal block above).
 declare -a CANDIDATES=()
 add_candidate() {
     local c="$1"
@@ -324,18 +395,18 @@ add_candidate() {
     CANDIDATES+=("$c")
 }
 
-add_candidate "$FILE_PATH"
+add_candidate "$QUERY_PATH"
 
-if [ -n "$CWD" ] && [ "${FILE_PATH#"$CWD"/}" != "$FILE_PATH" ]; then
-    add_candidate "${FILE_PATH#"$CWD"/}"
+if [ -n "$CWD" ] && [ "${QUERY_PATH#"$CWD"/}" != "$QUERY_PATH" ]; then
+    add_candidate "${QUERY_PATH#"$CWD"/}"
 fi
 
 if [ -n "${MEMCONTINUUM_STRIP_PREFIX:-}" ]; then
     IFS=':' read -r -a PREFIXES <<<"$MEMCONTINUUM_STRIP_PREFIX"
     for prefix in "${PREFIXES[@]}"; do
         [ -z "$prefix" ] && continue
-        if [ "${FILE_PATH#"$prefix"}" != "$FILE_PATH" ]; then
-            add_candidate "${FILE_PATH#"$prefix"}"
+        if [ "${QUERY_PATH#"$prefix"}" != "$QUERY_PATH" ]; then
+            add_candidate "${QUERY_PATH#"$prefix"}"
         fi
     done
 fi
@@ -576,69 +647,6 @@ for field in (matched, state, topic_count, topics_field, chain_text):
     return 1
 }
 
-# --- off-root refusal (TOP-0137 L16) -------------------------------------
-# The settings-level "if" globs also cover each retrieval root's PARENT
-# directory (scripts/repo-init.sh), so a sibling worktree
-# (`git worktree add ../x`) reaches this script -- and so does ANY other edit
-# under that parent. A path under none of the configured roots is therefore
-# decided HERE, before any for-path query (it cannot match a code_ref anyway,
-# and the wider glob must cost one bash start plus the remap, no python):
-#   mc_remap_worktree_gated rc 0 -> a worktree of a wired root: the remapped
-#                                   main-checkout path is queried below, as
-#                                   if the edit happened in the main checkout
-#   rc 1 -> worktree-unwired      a worktree of an unwired repository
-#   rc 2 -> worktree-unresolved   git could not settle it
-#   rc 3 -> outside-roots         an ordinary other repository or directory
-# Every refusal ends the run with no search: a path whose repository does
-# not resolve to a wired root never reads this project's store. The block is
-# skipped for an in-root path (textual prefix test first, so the common case
-# sources nothing), a relative path, and an unset STRIP_PREFIX -- all of
-# which keep the flow below byte-for-byte.
-WT_PRE_DONE=0
-WT_REMAPPED=""
-WT_REMAP_RC=3
-WT_ROOTS=""
-declare -a WT_ROOT_ARR=()
-if [ -n "${MEMCONTINUUM_STRIP_PREFIX:-}" ] && [ "${FILE_PATH#/}" != "$FILE_PATH" ]; then
-    OFFROOT_TEXTUAL_IN_ROOT=0
-    IFS=':' read -r -a OFFROOT_PREFIXES <<<"$MEMCONTINUUM_STRIP_PREFIX"
-    for prefix in "${OFFROOT_PREFIXES[@]}"; do
-        [ -z "$prefix" ] && continue
-        if [ "${FILE_PATH#"$prefix"}" != "$FILE_PATH" ]; then
-            OFFROOT_TEXTUAL_IN_ROOT=1
-            break
-        fi
-    done
-    if [ "$OFFROOT_TEXTUAL_IN_ROOT" -eq 0 ]; then
-        # shellcheck source=mc-path-lib.sh
-        source "$SCRIPT_DIR/mc-path-lib.sh"
-        WT_ROOTS="$(mc_strip_prefix_roots "$MEMCONTINUUM_STRIP_PREFIX")"
-        while IFS= read -r wt_root; do
-            [ -n "$wt_root" ] && WT_ROOT_ARR+=("$wt_root")
-        done <<EOF3
-$WT_ROOTS
-EOF3
-        OFFROOT_IN_ROOT=0
-        for wt_root in ${WT_ROOT_ARR[@]+"${WT_ROOT_ARR[@]}"}; do
-            if mc_path_under_root "$FILE_PATH" "$wt_root"; then
-                OFFROOT_IN_ROOT=1
-                break
-            fi
-        done
-        if [ -n "$WT_ROOTS" ] && [ "$OFFROOT_IN_ROOT" -eq 0 ]; then
-            WT_REMAPPED="$(mc_remap_worktree_gated "$FILE_PATH" "$WT_ROOTS")"
-            WT_REMAP_RC=$?
-            WT_PRE_DONE=1
-            case $WT_REMAP_RC in
-                0) ;;
-                1) finish "worktree-unwired" ;;
-                2) finish "worktree-unresolved" ;;
-                *) finish "outside-roots" ;;
-            esac
-        fi
-    fi
-fi
-
 for candidate in "${CANDIDATES[@]}"; do
     try_candidate "$candidate" && break
 done
@@ -684,7 +692,7 @@ done
 # configured root while it searches for a match -- are paid only when that
 # walk actually finds a nested `.git` FILE between FILE_PATH and the
 # matching root.
-if [ -z "$MATCHED_CANDIDATE" ] && [ "$ANY_QUERY_SUCCEEDED" -eq 1 ] && [ -n "${MEMCONTINUUM_STRIP_PREFIX:-}" ]; then
+if [ "$WT_PRE_DONE" -eq 0 ] && [ -z "$MATCHED_CANDIDATE" ] && [ "$ANY_QUERY_SUCCEEDED" -eq 1 ] && [ -n "${MEMCONTINUUM_STRIP_PREFIX:-}" ]; then
     if [ "$WT_PRE_DONE" -eq 0 ]; then
         # shellcheck source=mc-path-lib.sh
         source "$SCRIPT_DIR/mc-path-lib.sh"

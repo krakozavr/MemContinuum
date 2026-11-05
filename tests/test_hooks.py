@@ -132,6 +132,21 @@ def memidx_wrapper_python(target_dir, name: str, body: str, real_py: str = ""):
     return wrapper
 
 
+def argv_log_python(target_dir, name: str, log_path):
+    """memidx_wrapper_python with the one body every argv-observing test
+    wants: append each script-path invocation's argv (`sys.argv[1:]`) to
+    `log_path` as one JSON list per line. Not a second impersonator -- it
+    only fixes the `body` argument."""
+    return memidx_wrapper_python(
+        target_dir, name,
+        f'ARGV_LOG = "{log_path}"\n'
+        'import json\n'
+        'with open(ARGV_LOG, "a") as _f:\n'
+        '    _f.write(json.dumps(sys.argv[1:]))\n'
+        '    _f.write(chr(10))\n',
+    )
+
+
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
 class TestPreEditChainHook(unittest.TestCase):
     @classmethod
@@ -1478,6 +1493,64 @@ class TestPreEditChainWorktreeGap(unittest.TestCase):
         self.assertIn("outcome=matched ", line)
         self.assertTrue(line.rstrip().endswith(f"file={wt_path}"), line)
 
+    def test_sibling_edit_never_queries_the_raw_worktree_forms(self):
+        """F1 (Sol round 1): wired root `<parent>/repo-a`, sibling worktree
+        `<parent>/repo-a-wt`, hook cwd = `<parent>`. TOP-A is bound to
+        `src/x.py`, TOP-B to `repo-a-wt/src/x.py` -- exactly the cwd-relative
+        form of the RAW sibling path. The main edit answers A; the sibling
+        edit must answer A too, never B: a remapped sibling path is the ONLY
+        path queried. The argv log proves the raw path and its cwd-relative
+        form are never handed to memidx and each remapped form is, once."""
+        store = Path(self.tmp) / "xstore"
+        for top, ref in (("TOP-0901", "src/x.py"), ("TOP-0902", "repo-a-wt/src/x.py")):
+            d = store / "topics" / "x"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / f"{top.lower()}.md").write_text(
+                "---\ntype: topic\n"
+                f"id: {top}\ntitle: bound to {ref}\narea: x/y\nproject: default\ncurrent: L1\n"
+                f"code_refs:\n  - {ref}#sym\ntags: [x]\nlinks:\n"
+                "  - link: L1\n    date: 2024-04-15\n    status: active\n    kind: adopted\n"
+                "    ruling:\n      text: \"the ruling of " + top + "\"\n      authority: agent-inference\n"
+                "    evidence: []\n    recorded_by: agent\n    recorded_at: 2024-04-15\n---\n"
+            )
+        project = "hookxsib"
+        memidx.cmd_reindex(type("Args", (), dict(
+            root=str(store), project=project,
+            db=str(Path(self.memtool_home) / f"{project}.sqlite"),
+            full=True, no_embed=True))())
+        for repo in (self.repo_a, self.repo_a_wt):
+            (repo / "src").mkdir(exist_ok=True)
+            (repo / "src" / "x.py").write_text("# x\n")
+
+        argv_log = Path(self.tmp) / "sib-argv.jsonl"
+        wrapper = argv_log_python(self.tmp, "sib-argv-recorder", argv_log)
+        env = self._env(MEMCONTINUUM_PROJECT=project, MEMCONTINUUM_PYTHON=str(wrapper))
+        cwd = str(self.tmp)
+        main_path = str(self.repo_a / "src" / "x.py")
+        wt_path = str(self.repo_a_wt / "src" / "x.py")
+
+        main_proc, _ = run_hook(self._payload(main_path, cwd=cwd), env)
+        main_ctx = json.loads(main_proc.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("TOP-0901", main_ctx)
+        argv_log.unlink()
+
+        wt_proc, _ = run_hook(self._payload(wt_path, cwd=cwd), env)
+        self.assertEqual(wt_proc.returncode, 0, wt_proc.stderr)
+        wt_ctx = json.loads(wt_proc.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("TOP-0901", wt_ctx)
+        self.assertNotIn("TOP-0902", wt_ctx, "the sibling edit was answered with another record's decision")
+        queried = [c[1] for c in
+                   (json.loads(l) for l in argv_log.read_text().splitlines() if l.strip())
+                   if c and c[0] == "for-path"]
+        self.assertNotIn(wt_path, queried)
+        self.assertNotIn("repo-a-wt/src/x.py", queried)
+        # The remapped absolute form is tried first and matches nothing;
+        # the cwd-relative form `repo-a/src/x.py` and the strip-prefix form
+        # `src/x.py` follow -- each exactly once, no raw form anywhere.
+        self.assertEqual(queried, [main_path, "repo-a/src/x.py", "src/x.py"])
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        self.assertTrue(self._last_outcome_line(log_text).rstrip().endswith(f"file={wt_path}"))
+
     def test_sibling_worktree_miss_takes_the_normal_miss_path_not_outside_roots(self):
         wt_path = str(self.repo_a_wt / "src" / "core" / "scan" / "no_such_binding_here.py")
         proc, _ = run_hook(self._payload(wt_path), self._env())
@@ -1487,6 +1560,12 @@ class TestPreEditChainWorktreeGap(unittest.TestCase):
         self.assertTrue(
             "outcome=search-fallback " in line or "outcome=search-fallback-empty " in line, line)
         self.assertNotIn("outside-roots", log_text)
+        # The fallback's query words come from the REMAPPED path (the twin of
+        # the in-root worktree miss test): never the worktree directory name
+        # or its branch.
+        q_match = re.search(r"\bq=(\S*)", line)
+        self.assertIsNotNone(q_match, line)
+        self.assertEqual(q_match.group(1), "scan+such+binding+here")
 
     def test_stats_counts_outside_roots(self):
         run_hook(self._payload(str(self.repo_b / "src" / "other.py")), self._env())
