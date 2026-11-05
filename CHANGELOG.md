@@ -117,6 +117,14 @@
   fallback search was queried on the whole machine path. Where the root's
   configured tail differs from its real tail (a symlink inside the
   repository) the real-path spelling is still printed.
+- The pre-edit lookup can no longer modify the decision index; an outdated
+  index now gets a one-line refusal until the next store commit reindexes it.
+  The hook logs it as `outcome=index-needs-migration` and, as always, never
+  blocks the edit.
+  Technical: `memidx.py for-path` opens the index `mode=ro` (no migration
+  guard, no project stamp) and exits 5 with `{"state": "upgrade-required",
+  "reason": "index-needs-migration"}` on an `upgrade-required` index;
+  `pre-edit-chain.sh` maps rc 5 to that outcome with no search fallback.
 
 ## [0.4.0] — 2026-10-31
 

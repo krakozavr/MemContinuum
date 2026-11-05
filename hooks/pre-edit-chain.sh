@@ -16,6 +16,10 @@
 # Contract (docs/DESIGN.md SS3.1, SS8):
 #   - reads the PreToolUse JSON payload on stdin, extracts tool_input.file_path
 #   - no match / any failure  -> exit 0, no stdout (never blocks the edit)
+#   - the decision index needs a migration (for-path exit 5, TOP-0137 L13:
+#     this route opens the index read-only and never writes it) -> exit 0,
+#     no stdout, outcome=index-needs-migration; the store's next commit
+#     (hooks/post-commit-reindex.sh) or `memidx.py reindex --root` migrates
 #   - match                   -> one JSON object on stdout:
 #         {"hookSpecificOutput":{"hookEventName":"PreToolUse",
 #                                  "additionalContext":"..."}}

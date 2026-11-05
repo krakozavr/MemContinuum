@@ -222,12 +222,11 @@ otherwise break the "exactly one line per invocation" contract).
 reading it — `git status --short` on a fixture store stays clean and the
 index file's sha256 is unchanged across repeated fallback-only runs (proven
 even against a schema behind the current generation, which the ordinary rw
-path WOULD migrate on open — see `--read-only` above). This is narrower
-than "the whole hook run never writes the index" — on a MISS, the same
-hook run's own EARLIER `for-path` lookup (unchanged
-by this feature, and correctly so: a match must keep seeing a migrated,
-current schema) still opens the index the ordinary rw way and can migrate/
-stamp it exactly as it always has, before the fallback ever gets a turn.
+path WOULD migrate on open — see `--read-only` above). Since TOP-0137 L13 the
+earlier `for-path` lookup of the same hook run is read-only too
+(`decision_index_state_readonly` + `open_db_readonly`), so nothing in the
+pre-edit route writes the decision index: an index that needs migration ends
+the run as `index-needs-migration` before the fallback is reached.
 The one state write EITHER
 hook makes is titling: on a hit, each surfaced (id, title) pair is
 appended to the current session's own state file (the same
@@ -2949,7 +2948,7 @@ The decision index (`<project>.sqlite`) carries the same provenance discipline
 |---|---|---|
 | `missing` | no db file at that path | refuse (no query attempted) |
 | `uninitialized` | file exists, has a `db_meta` row for this project, but no `last_reindexed_at` stamp and no `records` rows | refuse (no query attempted) |
-| `upgrade-required` | no `last_reindexed_at` stamp but `records` rows already exist (an older engine's db), or the stamped `index_generation` is behind the engine's current one | proceed, warn on stderr |
+| `upgrade-required` | no `last_reindexed_at` stamp but `records` rows already exist (an older engine's db), or the stamped `index_generation` is behind the engine's current one | proceed, warn on stderr (`for-path` refuses with exit 5: it is read-only and the index needs a migration) |
 | `stale` | current generation, stamped, but the store's on-disk drift comparison finds added/changed/removed files — only computed when a `root` is given. For the five metadata-only readers (`search`/`chain`/`for-path`/`why`/`drift`, given `--root`) this is a plain mtime/size comparison against what `reindex` last recorded — **metadata moved, content unverified**. For `check` and `unmapped` it is content-PROVEN: every walked record with a stored row is hashed and compared to `records.sha256`, so a same-size, same-`mtime_ns` rewrite a metadata comparison alone would miss is still caught (a sha match whose metadata moved is bookkeeping-refreshed in place, not drift) | proceed, warn on stderr |
 | `quarantined` | current generation, not `stale` (a `root`-taking reader's own drift check passed or was not asked for), and `index_errors` holds at least one row for this project (one or more records could not be safely indexed — see "Tolerant parsing and quarantine" above); needs no `root` — a plain table lookup | proceed, warn on stderr naming the skipped-record count; `unmapped` refuses the negative claim (below) |
 | `current` | stamped, current generation, no drift, no quarantined record | proceed silently |
@@ -2977,8 +2976,9 @@ same-size, same-`mtime_ns` content rewrite reads `current` off `search
 --root` and every other reader until the next `check` or `unmapped` call
 proves otherwise.
 
-Every reader opens the file with `open_db_noncreating` — a genuinely
-non-creating SQLite URI (`mode=rw`) — never `open_db`'s create-on-connect path,
+Every reader except `for-path`, `search --read-only` and `standing` opens the
+file with `open_db_noncreating` — a genuinely non-creating SQLite URI
+(`mode=rw`) — never `open_db`'s create-on-connect path,
 which closes a TOCTOU window a plain `exists()` check followed by `connect()`
 still had (the file could be created by a race between the two calls). `root`
 is REQUIRED on `reindex`, `check`, and `unmapped` (they walk the store's own
@@ -3101,11 +3101,22 @@ directly by `pre-edit-chain.sh`): `0` success, `2` is argparse's own reserved
 usage-error code (untouched), `3` is `missing`/`uninitialized` — collapsed,
 since neither has a positive match worth attempting, and it also covers the
 TOCTOU race where the file vanishes between the state check and the open —
-and `4` is `index-error`, a belt-and-suspenders catch for a
-`sqlite3.OperationalError`/`IndexError` that a migration guard should already
-have prevented but didn't (a raw query naming a column that no longer exists,
-or a `sqlite3.Row` access on a renamed column). `upgrade-required`/`stale`/
-`current` all proceed to exit `0` normally. Every other reader (`search`,
+`4` is `index-error`, a belt-and-suspenders catch for a
+`sqlite3.OperationalError`/`IndexError` the read-only queries could not
+survive (a raw query naming a column that no longer exists, or a
+`sqlite3.Row` access on a renamed column), and `5` is `upgrade-required`:
+`for-path` opens the decision index strictly read-only (`mode=ro`, no
+migration guard ever runs), so an index that needs migration is refused, not
+migrated — one stderr line (`for-path: the decision index needs migration
+(state=upgrade-required) -- read-only route refuses to write it; run
+\`reindex --root <path>\``) and, under `--json` (with or without
+`--with-chain-text`), `{"state": "upgrade-required", "reason":
+"index-needs-migration", "candidates": []}`. `pre-edit-chain.sh` ends that run
+as `index-needs-migration` (fail-open, no search fallback — the fallback's
+`search --read-only` would refuse the same state). The index is migrated on the
+store's own write path: the next store commit's `post-commit-reindex.sh`, or a
+manual `reindex --root`. (`reindex` and `code-reindex` use `5` for their own integrity-failure
+meaning; this paragraph describes for-path's contract only.) `stale`/`quarantined`/`current` proceed to exit `0` normally. Every other reader (`search`,
 `chain`, `drift`, `check`) shares one `_decision_reply` refusal on
 `missing`/`uninitialized` (exit `1`, `--json` still emits a real `{"state":
 ..., "results": []}` envelope on stdout so a caller piping stdout still learns
