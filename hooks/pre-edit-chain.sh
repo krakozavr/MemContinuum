@@ -412,16 +412,23 @@ try_candidate() {
     RC=$?
     # F1 (ruling 68): for-path's own exit codes -- 3 = missing/uninitialized
     # (the same outcome name the pre-loop [ ! -f "$DB_PATH" ] check above
-    # already uses), 4 = index-error (a schema a migration guard should
-    # already have fixed but didn't). Both get their own named outcome
-    # instead of falling into the generic RC != 0 -> continue -> eventual
-    # "query-failed"/"no-match" below, which would hide which candidate (if
-    # any) actually had a usable index.
+    # already uses), 4 = index-error (a schema the read-only queries could
+    # not read), 5 = upgrade-required (TOP-0137 L13: for-path opens the
+    # decision index read-only and refuses an index that needs migration).
+    # Each gets its own named outcome instead of falling into the generic
+    # RC != 0 -> continue -> eventual "query-failed"/"no-match" below,
+    # which would hide which candidate (if any) actually had a usable
+    # index. rc 5 ends the run with no search fallback: the fallback's
+    # `search --read-only` refuses the same state, so it would only add a
+    # second, redundant outcome line.
     if [ $RC -eq 3 ]; then
         finish "index-missing"
     fi
     if [ $RC -eq 4 ]; then
         finish "index-error"
+    fi
+    if [ $RC -eq 5 ]; then
+        finish "index-needs-migration"
     fi
     if [ $RC -ne 0 ]; then
         return 1
@@ -712,7 +719,12 @@ if [ -z "$MATCHED_CANDIDATE" ]; then
     # this channel reads the index to answer a guess, never writes to it --
     # a legacy/unmigrated schema is refused by name (state=upgrade-required,
     # reason=index-needs-migration) instead of being silently migrated on
-    # open, which the pre-fix-round `open_db_noncreating` path did. `--root`
+    # open. Nothing in this pre-edit route writes the decision index any
+    # more (TOP-0137 L13): for-path above is read-only too, so an index
+    # that needs migration is only ever migrated on the store's own write
+    # path -- hooks/post-commit-reindex.sh after the next store commit, or
+    # a manual `memidx.py reindex --root <store>` (cmd_reindex opens the
+    # db with open_db, which runs the migration guards). `--root`
     # is now passed WHEN KNOWN (MAJOR item b: staleness must be visible,
     # not swallowed) -- the old "never --root, it'd be noise" comment
     # covered a real concern (index-stale-served already reports staleness
