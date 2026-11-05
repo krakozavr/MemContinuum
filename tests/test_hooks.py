@@ -2974,20 +2974,26 @@ class TestPreEditChainTopicsLogging(unittest.TestCase):
         self.assertEqual(line.count("project="), 1, line)
         self.assertIn(" session=abprojectevilx ", line)
 
+    # External commands hooks/pre-edit-chain.sh, memlib.sh, mc-fallback-lib.sh,
+    # mc-watchdog.sh, mc-path-lib.sh and mc-query-lib.sh invoke (found by grepping
+    # their non-comment lines; printf/source/etc. are bash builtins; `bash` is what
+    # run_hook execs by name through the child PATH). `jq` is
+    # deliberately absent -- its absence is the point of the no-jq path.
+    _HOOK_EXTERNALS = (
+        "awk", "bash", "basename", "cat", "date", "dirname", "env", "git", "ls", "mkdir",
+        "mv", "python", "python3", "rm", "sed", "tr", "touch", "wc",
+    )
+
     def _path_without_jq(self) -> str:
-        """A PATH of one temp dir holding a symlink to every executable the
-        real PATH offers except `jq`, so the hook takes its python decode."""
+        """A PATH of one temp dir holding symlinks to just the external
+        commands the hook calls (not the ~7700 executables on a WSL PATH), so
+        the hook takes its python decode and stays fast."""
         binlib = Path(self.tmp) / "bin-without-jq"
         binlib.mkdir()
-        for d in os.environ.get("PATH", "").split(os.pathsep):
-            try:
-                entries = list(Path(d).iterdir())
-            except OSError:
-                continue
-            for e in entries:
-                if e.name != "jq" and not (binlib / e.name).exists() \
-                        and e.is_file() and os.access(e, os.X_OK):
-                    (binlib / e.name).symlink_to(e)
+        for name in self._HOOK_EXTERNALS:
+            found = shutil.which(name)
+            if found:
+                (binlib / name).symlink_to(found)
         self.assertFalse((binlib / "jq").exists())
         return str(binlib)
 
@@ -3005,8 +3011,16 @@ class TestPreEditChainTopicsLogging(unittest.TestCase):
             "tool_input": {"file_path": path},
         })
         fields = {}
+        # Generous watchdog budget and subprocess timeout: this test pins decode
+        # parity, not latency, so a loaded machine must not kill the hook.
         for label, overrides in (("jq", {}), ("nojq", {"PATH": self._path_without_jq()})):
-            proc, _ = self._run(home, project, payload, **overrides)
+            env_extra = dict(overrides, MC_WATCHDOG_BUDGET="20")
+            env = clean_env(
+                MEMCONTINUUM_HOME=str(home), MEMCONTINUUM_PROJECT=project,
+                MEMCONTINUUM_PYTHON=VENV_PYTHON, MEMCONTINUUM_STRIP_PREFIX="/fake/repo/",
+                **env_extra,
+            )
+            proc, _ = run_hook(payload, env, timeout=25.0)
             self.assertEqual(proc.returncode, 0, proc.stderr)
             line = self._last_outcome_line(home)
             self.assertNotIn("outcome=no-file-path", line, (label, line))
