@@ -13,28 +13,34 @@ Before an edit, MemContinuum now says when a bound file or symbol differs from
 the baseline captured when the binding was made. The same note can appear at
 session start and in reviewer context packs. Missing, never-captured and
 unchecked baselines are labelled as such. A warning never changes a decision's
-status or authority.
+status or authority. When the size cap bites, the session-start summary line is
+dropped before any standing line, and in a context pack the least important
+anchor lines go first and no topic is dropped to make room.
 
-    Technical: `anchors:` stores the captured hashes; session start needs a configured code root, and context packs include anchor lines when given `--code-root DIR`.
+    Technical: `anchors:` stores the captured hashes; `memlint.py` validates the `anchors:` rows and `--against-ref` freezes them like links; session start needs a configured code root, and context packs include anchor lines when given `--code-root DIR`.
 
 ### Connect decisions to code with a reviewed change
 
 You can now capture a code baseline at the moment you add a reference to a
-decision. A proposal command suggests, from a session's edits, which files a
-topic may want to bind, and leaves it to you to review and apply. References
-bound before baselines existed can receive one too, labelled as captured now.
+decision. A proposal command reads a session's search fallbacks and edit ledger,
+suggests which edited files a topic may want to bind, and lists separately
+labelled filing hints for unmapped files; it leaves it to you to review and
+apply. References bound before baselines existed can receive one too, labelled
+as captured now, and rerunning that backfill changes nothing.
 
     Technical: `memidx.py bind TOP-xxxx REF` and `anchor-backfill` support `--dry-run`, and nothing is committed for you; `propose-bindings --session ID` prints suggestions, with optional `--write-inbox`.
 
 ### Know who changed the standing decisions
 
 Adding or removing a standing decision now records who changed it, when, on
-whose word and why. The store's commit guard refuses a change without a
-matching record, an edit to a recorded row, and a reordering of existing links.
+whose word and why. The rows are written on owner authority only. The store's
+commit guard refuses a change without a matching record, new rows that match no
+change, an edit to a recorded row, a reordering of existing links, and a
+`current:` that moves without the newest active link moving.
 The rows are never delivered or indexed and add nothing to the session digest.
 The linter also reports a standing list that names the same link twice.
 
-    Technical: `memidx.py mark-standing TOP-xxxx Ln --add|--remove --authority ... --source ... --why ...` updates `standing:` and the frozen `standing_marks:` rows; `memlint.py --against-ref` checks the change.
+    Technical: `memidx.py mark-standing TOP-xxxx Ln --add|--remove --authority ... --source ... --why ...` updates `standing:` and the frozen `standing_marks:` rows, supports `--dry-run`, and commits nothing for you; `memlint.py --against-ref` checks the change.
 
 ### Give reviewers and agents the actual decisions
 
@@ -50,11 +56,15 @@ tell reviewer and agent briefs to open with this pack.
 
 Indexing only a subdirectory no longer limits decision lookup to that
 subdirectory, so edits in worktrees inside the checkout still retrieve their
-decisions while the code index keeps its configured scope. A worktree edit
-under a narrow root is now recorded at its real path. Lookups that were missed
-on macOS when a configured directory is reached through a symlink now work.
+decisions while the code index keeps its configured scope. Code roots now
+scope only the index, the new-file nudge and the edit ledger. A worktree edit
+under a narrow root is now recorded at its real path. On macOS, a temporary or
+home directory behind a symlink no longer sends the fallback search the whole
+machine path, because the remapped path is printed in the configured root's
+spelling again; where a symlink sits inside the repository, the real-path
+spelling is still printed.
 
-    Technical: `repo-init.sh` renders the pre-edit filter and `MEMCONTINUUM_STRIP_PREFIX` for the Git toplevel of each `--code-root`, falling back to the root itself with a `note: retrieval root for ...` line when Git cannot say.
+    Technical: `repo-init.sh` renders the pre-edit filter and `MEMCONTINUUM_STRIP_PREFIX` for the Git toplevel of each `--code-root`, falling back to the root itself with a `note: retrieval root for ...` line when Git cannot say; the macOS case is `/var` -> `/private/var`.
 
 ### Look up decisions from a sibling worktree, and never write the index before an edit
 
@@ -87,7 +97,7 @@ fenced block or an inline code span of a Markdown file. `mark-standing --remove`
 now finds a `standing:` item written with YAML quoting. The documentation now
 states the append-only guard's known limit: when the earlier version of a
 record could not be parsed and the new one can, the edit counts as a repair, and
-a removed link, `anchors:` block or `standing_marks:` block is not caught. The
+a removed link, `anchors:` block or `standing_marks:` block is not caught; only a note is printed. The
 schema reference no longer says a `project` change can drop a topic from the
 standing digest; only a change of `type` can. An internal cleanup in
 `memidx.py` changes no behaviour.
