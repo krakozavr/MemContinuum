@@ -280,34 +280,26 @@ FILE_PATH=""
 CWD=""
 if [ -n "$PAYLOAD" ]; then
     if command -v jq >/dev/null 2>&1; then
+        # jq stays three calls: ~2 ms each, so folding them buys nothing.
         FILE_PATH="$(printf '%s' "$PAYLOAD" | jq -r '.tool_input.file_path // empty' 2>/dev/null)"
         CWD="$(printf '%s' "$PAYLOAD" | jq -r '.cwd // empty' 2>/dev/null)"
         SESSION_ID="$(printf '%s' "$PAYLOAD" | jq -r '.session_id // empty' 2>/dev/null)"
     else
-        FILE_PATH="$(printf '%s' "$PAYLOAD" | "$PY" -c '
+        # One interpreter start for all three values, NUL-separated so a
+        # newline inside a path survives; a malformed payload prints nothing.
+        { IFS= read -r -d '' FILE_PATH && IFS= read -r -d '' CWD && IFS= read -r -d '' SESSION_ID; } < <(
+            printf '%s' "$PAYLOAD" | "$PY" -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
+    ti = d.get("tool_input")
+    ti = ti if isinstance(ti, dict) else {}
+    vals = (ti.get("file_path", "") or "", d.get("cwd", "") or "", d.get("session_id", "") or "")
+    out = b"".join(str(v).encode("utf-8", "surrogateescape") + b"\0" for v in vals)
 except Exception:
     sys.exit(1)
-print(d.get("tool_input", {}).get("file_path", "") or "")
-' 2>/dev/null)"
-        CWD="$(printf '%s' "$PAYLOAD" | "$PY" -c '
-import json, sys
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    sys.exit(1)
-print(d.get("cwd", "") or "")
-' 2>/dev/null)"
-        SESSION_ID="$(printf '%s' "$PAYLOAD" | "$PY" -c '
-import json, sys
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    sys.exit(1)
-print(d.get("session_id", "") or "")
-' 2>/dev/null)"
+sys.stdout.buffer.write(out)
+' 2>/dev/null) || true
     fi
     SESSION_ID_LOG="$(printf '%s' "$SESSION_ID" | tr -cd 'A-Za-z0-9._-' 2>/dev/null)"
 fi
@@ -856,7 +848,7 @@ if [ -z "$MATCHED_CANDIDATE" ]; then
     # exact scope of that claim). A session_id this hook cannot resolve
     # (missing from the payload, or memlib.sh unreachable) just skips the
     # state write -- $FB_TEXT is printed either way.
-    # SESSION_ID was parsed once, with FILE_PATH/CWD, at the top.
+    # SESSION_ID was parsed with FILE_PATH/CWD (one decode on the python path), at the top.
     FB_STATE_PART=""
     if [ -n "$SESSION_ID" ] && [ -n "${FB_HITS_FOR_STATE:-}" ]; then
         # shellcheck source=memlib.sh
