@@ -100,6 +100,22 @@ class CodeSearchLogTest(unittest.TestCase):
         self.assertEqual((rc1, out1), (rc2, out2))
         self.assertTrue(self.log.is_dir())
 
+    def test_long_project_name_is_logged_whole_and_counted(self):
+        name = "p" * 65
+        rc = memidx.cmd_code_reindex(SimpleNamespace(
+            code_root=str(self.root), db=None, project=name, no_embed=True,
+            full=False, lang="python", drop_root=None))
+        self.assertEqual(rc, 0)
+        rc, _ = self.search(project=name)
+        self.assertEqual(rc, 0)
+        self.assertTrue(self.lines()[-1].endswith(f" project={name}"), self.lines())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            memidx.cmd_stats(SimpleNamespace(
+                project=name, days=1, home=str(self.home), store=None,
+                json=True, now=None))
+        self.assertEqual(json.loads(out.getvalue())["code_search"]["ok"], 1)
+
     def test_empty_query_logs_dash_not_unknown(self):
         self.search(query="")
         self.search(query="!!! ???")

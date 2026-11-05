@@ -9591,12 +9591,15 @@ def _hook_payload_fields(text: str) -> dict:
     return out
 
 
-def _clean_log_token(raw, limit: int = 64) -> str:
+def _clean_log_token(raw, limit: int | None = 64, empty: str = "unknown") -> str:
     """A payload value reduced to a hook.log-safe token: [A-Za-z0-9._-]
     only, so a hostile session_id can neither split the line nor forge a
-    key=value pair."""
-    token = re.sub(r"[^A-Za-z0-9._-]", "", str(raw or ""))[:limit]
-    return token or "unknown"
+    key=value pair. `limit=None` means no length cap (a project name keeps
+    its identity); `empty` is what an all-filtered value becomes."""
+    token = re.sub(r"[^A-Za-z0-9._-]", "", str(raw or ""))
+    if limit is not None:
+        token = token[:limit]
+    return token or empty
 
 
 def _log_path_token(raw, limit: int = 512) -> str:
@@ -9627,7 +9630,8 @@ def append_hook_log_line(keyword: str, fields: dict, log_dir: Path | None = None
     the Python twin of memlib.sh `mc_log` for a command that runs outside any
     shell hook (code-search is called by agents directly). The timestamp has
     the shape `date -Iseconds` gives. Values go through `_clean_log_token`
-    (no space, no `=`, so none can split the line or forge a field); the
+    (no space, no `=`, so none can split the line or forge a field; all
+    capped at 64 chars except `project`, which is kept whole); the
     caller passes `project` LAST (`_hook_log_fields` relies on it). `log_dir`
     defaults to `memcontinuum_home()`. Fail-open: any error writes nothing
     and raises nothing, and a missing directory is never created. Rotation
@@ -9637,7 +9641,11 @@ def append_hook_log_line(keyword: str, fields: dict, log_dir: Path | None = None
         if not base.is_dir():
             return
         ts = datetime.now().astimezone().isoformat(timespec="seconds")
-        body = " ".join(f"{k}={_clean_log_token(str(v))}" for k, v in fields.items())
+        # `project` keeps its full name: a 64-char cap would merge distinct
+        # long project names in `stats` (repo-init.sh accepts longer ones).
+        body = " ".join(
+            f"{k}={_clean_log_token(str(v), limit=None if k == 'project' else 64)}"
+            for k, v in fields.items())
         line = f"{ts} {keyword} {body}\n"
         with open(base / "hook.log", "a", encoding="utf-8") as fh:
             fh.write(line)
