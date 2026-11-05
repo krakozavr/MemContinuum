@@ -1584,10 +1584,22 @@ class TestPreEditChainWorktreeGap(unittest.TestCase):
         plus the remap check, no for-path/python query). Reports the number
         and asserts only a generous outer bound."""
         target = str(self.repo_b / "src" / "other.py")
+        argv_log = Path(self.tmp) / "p95-argv.jsonl"
+        wrapper = argv_log_python(self.tmp, "p95-argv-recorder", argv_log)
+        env = self._env(MEMCONTINUUM_PYTHON=str(wrapper))
         samples = []
         for _ in range(20):
-            proc, elapsed = run_hook(self._payload(target), self._env())
+            proc, elapsed = run_hook(self._payload(target), env)
             self.assertEqual(proc.returncode, 0, proc.stderr)
+            # Prove the refusal, not just the speed: silent, the
+            # outside-roots outcome, and no memidx.py script invocation (the
+            # watchdog launcher's `-c` call passes through the wrapper
+            # unlogged).
+            self.assertEqual(proc.stdout.strip(), "")
+            log_text = (Path(self.memtool_home) / "hook.log").read_text()
+            self.assertIn("outcome=outside-roots ", self._last_outcome_line(log_text))
+            self.assertFalse(argv_log.exists() and argv_log.read_text().strip(),
+                             "memidx.py must not be invoked for an off-root path")
             samples.append(elapsed)
         samples.sort()
         p95 = samples[int(len(samples) * 0.95) - 1]
