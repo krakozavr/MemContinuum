@@ -1644,8 +1644,9 @@ class TestF1DecisionIndexState(unittest.TestCase):
 
     def test_for_path_upgrade_required_refuses_with_rc5_and_writes_nothing(self):
         """TOP-0137 L13: for-path never migrates. An upgrade-required
-        index (rc 5) gets one stderr line and the named JSON object --
-        identical with and without --with-chain-text -- and the db file
+        index (rc 5) gets one stderr line and the named JSON envelope
+        (`results: []`, plus an empty `chain_text` under --with-chain-text,
+        the shape of the missing-index reply) and the db file
         is byte-for-byte unchanged. Control: the ordinary rw open on the
         same file does write (the fixture discriminates)."""
         for with_chain_text in (False, True):
@@ -1658,9 +1659,11 @@ class TestF1DecisionIndexState(unittest.TestCase):
                                                      file_path="src/x.py", json=True,
                                                      with_chain_text=with_chain_text))
                     self.assertEqual(rc, 5)
-                    self.assertEqual(json.loads(buf_out.getvalue()), {
-                        "state": "upgrade-required", "reason": "index-needs-migration", "candidates": [],
-                    })
+                    expected = {"state": "upgrade-required", "reason": "index-needs-migration",
+                                "results": []}
+                    if with_chain_text:
+                        expected["chain_text"] = ""
+                    self.assertEqual(json.loads(buf_out.getvalue()), expected)
                     self.assertEqual(
                         buf_err.getvalue().strip(),
                         "for-path: the decision index needs migration (state=upgrade-required) -- "

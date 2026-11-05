@@ -3124,9 +3124,10 @@ survive (a raw query naming a column that no longer exists, or a
 migration guard ever runs), so an index that needs migration is refused, not
 migrated — one stderr line (`for-path: the decision index needs migration
 (state=upgrade-required) -- read-only route refuses to write it; run
-\`reindex --root <path>\``) and, under `--json` (with or without
-`--with-chain-text`), `{"state": "upgrade-required", "reason":
-"index-needs-migration", "candidates": []}`. `pre-edit-chain.sh` ends that run
+\`reindex --root <path>\``) and, under `--json`, `{"state":
+"upgrade-required", "reason": "index-needs-migration", "results": []}` (plus
+`"chain_text": ""` under `--with-chain-text`, the shape of the missing-index
+reply). `pre-edit-chain.sh` ends that run
 as `index-needs-migration` (fail-open, no search fallback — the fallback's
 `search --read-only` would refuse the same state). The index is migrated on the
 store's own write path: the next store commit's `post-commit-reindex.sh`, or a

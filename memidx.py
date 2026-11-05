@@ -1559,7 +1559,8 @@ def _for_path_migration_reply(args) -> int:
     L13): the pre-edit route never writes the index, and the migration
     guards are what would have to run -- so it exits 5 with one stderr line
     (the wording family of `cmd_search --read-only`'s refusal) and, under
-    --json, the same object with or without --with-chain-text. stdout stays
+    --json, the `_for_path_missing_reply` envelope shape (`results: []`, plus
+    an empty `chain_text` under --with-chain-text). stdout stays
     empty in plain mode: a refusal is not "no topics reference this path"."""
     print(
         "for-path: the decision index needs migration (state=upgrade-required) -- "
@@ -1567,8 +1568,13 @@ def _for_path_migration_reply(args) -> int:
         file=sys.stderr,
     )
     if getattr(args, "json", False):
-        print(json.dumps({"state": "upgrade-required", "reason": "index-needs-migration",
-                          "candidates": []}, indent=2))
+        # Same envelope as `_for_path_missing_reply` (results, plus an empty
+        # chain_text under --with-chain-text): the whole for-path refusal
+        # family shares one shape.
+        payload = {"state": "upgrade-required", "reason": "index-needs-migration", "results": []}
+        if getattr(args, "with_chain_text", False):
+            payload["chain_text"] = ""
+        print(json.dumps(payload, indent=2))
     return 5
 
 
