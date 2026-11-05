@@ -1211,10 +1211,170 @@ class TestRetrievalRootFollowsRepository(unittest.TestCase):
             root = Path(home) / "plain" / "src"
             root.mkdir(parents=True)
             pre, _ = self._install(home, [str(root)])
+            # TOP-0137 L16: the root's parent directory is a launch filter
+            # too (it is not under $HOME-the-sandbox's own directory here).
+            parent = root.parent
             self.assertEqual(sorted(h["if"] for h in pre),
-                             sorted([f"Edit(/{root}/**)", f"Write(/{root}/**)"]))
+                             sorted([f"Edit(/{root}/**)", f"Write(/{root}/**)",
+                                     f"Edit(/{parent}/**)", f"Write(/{parent}/**)"]))
+            # The parent is a launch filter only: the strip prefix stays the
+            # retrieval root.
             for h in pre:
                 self.assertIn(f"MEMCONTINUUM_STRIP_PREFIX={root}/ ", h["command"])
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_parent_directory_pair_renders_with_double_leading_slash_and_same_command(self):
+        """TOP-0137 L16 (B1): each retrieval root's parent gets an Edit and a
+        Write pair carrying the same command as the root pair, with the `//`
+        absolute-path syntax (a single slash anchors at the settings source
+        and would match nothing); the new-file nudge pairs are NOT widened."""
+        home = sandbox_home()
+        try:
+            repo = self._repo(home, "work/repo")
+            pre, nudge = self._install(home, [str(repo / "Sources")])
+            work = repo.parent
+            ifs = sorted(h["if"] for h in pre)
+            self.assertEqual(ifs, sorted([f"Edit(/{repo}/**)", f"Write(/{repo}/**)",
+                                          f"Edit(/{work}/**)", f"Write(/{work}/**)"]))
+            for h in pre:
+                self.assertTrue(h["if"].split("(", 1)[1].startswith("//"), h["if"])
+            by_if = {h["if"]: h["command"] for h in pre}
+            self.assertEqual(by_if[f"Edit(/{work}/**)"], by_if[f"Edit(/{repo}/**)"])
+            self.assertEqual(by_if[f"Write(/{work}/**)"], by_if[f"Write(/{repo}/**)"])
+            self.assertIn(f"MEMCONTINUUM_STRIP_PREFIX={repo}/ ", by_if[f"Edit(/{work}/**)"])
+            self.assertEqual([h["if"] for h in nudge], [f"Write(/{repo}/Sources/**)"])
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_parent_pair_is_skipped_for_the_home_directory_with_a_note(self):
+        home = sandbox_home()
+        try:
+            repo = self._repo(home)          # parent == $HOME of the sandbox
+            args = ["--project", "narrow", "--store", str(Path(home) / "store"),
+                    "--claude-dir", str(Path(home) / ".claude"), "--code-root", str(repo / "Sources")]
+            proc = run_install(args, home)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            data = json.loads((Path(home) / ".claude" / "settings.local.json").read_text())
+            pre = [h for g in data["hooks"]["PreToolUse"] for h in g.get("hooks", [])
+                   if "pre-edit-chain.sh" in h["command"]]
+            self.assertEqual(sorted(h["if"] for h in pre),
+                             sorted([f"Edit(/{repo}/**)", f"Write(/{repo}/**)"]))
+            self.assertIn(f"note: pre-edit filter for {repo} is not widened to its parent directory "
+                          f"({home})", proc.stdout)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_parent_pair_is_skipped_for_a_root_directly_under_slash(self):
+        """A parent of `/` is never rendered. The root itself cannot be made
+        under `/` in a sandbox, so this drives the renderer's rule with a
+        retrieval root whose parent is `/` through a fake git toplevel."""
+        home = sandbox_home()
+        try:
+            fakebin = Path(home) / "fakebin"
+            fakebin.mkdir()
+            root = Path(home) / "code"
+            root.mkdir()
+            git = fakebin / "git"
+            git.write_text(
+                '#!/bin/sh\nif [ "$2" = "%s" ] && [ "$3" = "rev-parse" ]; then echo /topdir; exit 0; fi\n'
+                'exec /usr/bin/git "$@"\n' % root)
+            git.chmod(0o755)
+            args = ["--project", "narrow", "--store", str(Path(home) / "store"),
+                    "--claude-dir", str(Path(home) / ".claude"), "--code-root", str(root)]
+            proc = run_install(args, home, extra_env={"PATH": f"{fakebin}:{os.environ['PATH']}"})
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            data = json.loads((Path(home) / ".claude" / "settings.local.json").read_text())
+            pre = [h for g in data["hooks"]["PreToolUse"] for h in g.get("hooks", [])
+                   if "pre-edit-chain.sh" in h["command"]]
+            self.assertEqual(sorted(h["if"] for h in pre),
+                             sorted(["Edit(//topdir/**)", "Write(//topdir/**)"]))
+            self.assertIn("is not widened to its parent directory (/)", proc.stdout)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_shared_parent_is_rendered_once_and_a_root_that_is_a_parent_is_not_doubled(self):
+        home = sandbox_home()
+        try:
+            a = self._repo(home, "work/repo-a")
+            b = self._repo(home, "work/repo-b")
+            pre, _ = self._install(home, [str(a / "Sources"), str(b / "Sources")])
+            work = a.parent
+            ifs = sorted(h["if"] for h in pre)
+            self.assertEqual(ifs, sorted([
+                f"Edit(/{a}/**)", f"Write(/{a}/**)", f"Edit(/{b}/**)", f"Write(/{b}/**)",
+                f"Edit(/{work}/**)", f"Write(/{work}/**)",
+            ]))
+            self.assertEqual(len(ifs), len(set(ifs)), ifs)
+            for h in pre:
+                self.assertIn(f"MEMCONTINUUM_STRIP_PREFIX={a}/:{b}/ ", h["command"])
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_rendered_globs_admit_a_sibling_worktree_but_not_a_path_outside_the_parent(self):
+        """B3: the rendered Edit/Write globs, read as `//`-anchored path
+        prefixes, admit a worktree checked out next to the repo, and still
+        reject a path outside both the repo and its parent."""
+        home = sandbox_home()
+        try:
+            repo = self._repo(home, "work/repo")
+            pre, _ = self._install(home, [str(repo / "Sources")])
+
+            def admits(tool, path):
+                for h in pre:
+                    m = re.match(r"^(\w+)\(/(/.*)/\*\*\)$", h["if"])
+                    if m and m.group(1) == tool and path.startswith(m.group(2) + "/"):
+                        return True
+                return False
+
+            sibling = str(repo.parent / "repo-wt" / "Sources" / "x.swift")
+            elsewhere = str(Path(home) / "elsewhere" / "x.swift")
+            for tool in ("Edit", "Write"):
+                self.assertTrue(admits(tool, str(repo / "Sources" / "x.swift")))
+                self.assertTrue(admits(tool, sibling), f"{tool}: sibling worktree must be admitted")
+                self.assertFalse(admits(tool, elsewhere), f"{tool}: outside the parent must not be admitted")
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_rerun_with_another_root_replaces_the_parent_pairs(self):
+        """The parent pairs follow their root: a re-run that drops the root
+        (down to no --code-root at all) leaves no PreToolUse entry behind,
+        and one that moves to a root under another parent swaps the parent
+        pair too."""
+        home = sandbox_home()
+        try:
+            a = self._repo(home, "work-a/repo")
+            b = self._repo(home, "work-b/repo")
+            store = str(Path(home) / "store")
+            claude_dir = str(Path(home) / ".claude")
+            settings = Path(home) / ".claude" / "settings.local.json"
+            self._install(home, [str(a / "Sources")])
+            pre_a = [h["if"] for g in json.loads(settings.read_text())["hooks"]["PreToolUse"]
+                     for h in g.get("hooks", []) if "pre-edit-chain.sh" in h["command"]]
+            self.assertIn(f"Edit(/{a.parent}/**)", pre_a)
+
+            pre_b, _ = self._install(home, [str(b / "Sources")])
+            ifs_b = [h["if"] for h in pre_b]
+            self.assertIn(f"Edit(/{b.parent}/**)", ifs_b)
+            self.assertNotIn(f"Edit(/{a.parent}/**)", ifs_b)
+            self.assertNotIn(f"Edit(/{a}/**)", ifs_b)
+
+            proc = run_install(["--project", "narrow", "--store", store, "--claude-dir", claude_dir], home)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertNotIn("PreToolUse", json.loads(settings.read_text()).get("hooks", {}))
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_every_rendered_pre_edit_if_filter_has_double_leading_slash_including_the_parent(self):
+        home = sandbox_home()
+        try:
+            repo = self._repo(home, "work/repo")
+            self._install(home, [str(repo / "Sources")])
+            data = json.loads((Path(home) / ".claude" / "settings.local.json").read_text())
+            ifs = [h["if"] for g in data["hooks"]["PreToolUse"] for h in g.get("hooks", []) if "if" in h]
+            self.assertGreaterEqual(len(ifs), 5, ifs)
+            for cond in ifs:
+                self.assertRegex(cond, r"^(Edit|Write)\(//[^/]", cond)
         finally:
             shutil.rmtree(home, ignore_errors=True)
 

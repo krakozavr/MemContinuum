@@ -132,6 +132,21 @@ def memidx_wrapper_python(target_dir, name: str, body: str, real_py: str = ""):
     return wrapper
 
 
+def argv_log_python(target_dir, name: str, log_path):
+    """memidx_wrapper_python with the one body every argv-observing test
+    wants: append each script-path invocation's argv (`sys.argv[1:]`) to
+    `log_path` as one JSON list per line. Not a second impersonator -- it
+    only fixes the `body` argument."""
+    return memidx_wrapper_python(
+        target_dir, name,
+        f'ARGV_LOG = "{log_path}"\n'
+        'import json\n'
+        'with open(ARGV_LOG, "a") as _f:\n'
+        '    _f.write(json.dumps(sys.argv[1:]))\n'
+        '    _f.write(chr(10))\n',
+    )
+
+
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
 class TestPreEditChainHook(unittest.TestCase):
     @classmethod
@@ -771,14 +786,7 @@ class TestPreEditChainRootAndStaleWarning(unittest.TestCase):
         one `for-path` invocation total, no ambiguity about which call it
         is."""
         argv_log = Path(self.tmp) / "argv.jsonl"
-        wrapper = memidx_wrapper_python(
-            self.tmp, "argv-recorder",
-            f'ARGV_LOG = "{argv_log}"\n'
-            'import json\n'
-            'with open(ARGV_LOG, "a") as _f:\n'
-            '    _f.write(json.dumps(sys.argv[1:]))\n'
-            '    _f.write(chr(10))\n',
-        )
+        wrapper = argv_log_python(self.tmp, "argv-recorder", argv_log)
         payload = json.dumps(
             {
                 "hook_event_name": "PreToolUse",
@@ -1427,31 +1435,172 @@ class TestPreEditChainWorktreeGap(unittest.TestCase):
         log_text = (Path(self.memtool_home) / "hook.log").read_text()
         self.assertIn("outcome=worktree-unresolved", self._last_outcome_line(log_text))
 
-    def test_ordinary_checkout_of_unwired_repo_outcome_unchanged(self):
-        """Requirement 5: a plain (non-worktree) checkout of a repo that
-        was never wired must keep today's plain no-match-BRANCH outcome
-        (now the search-fallback channel, TOP-0133 L1 -- `no-match` itself
-        no longer `finish`es this branch, see pre-edit-chain.sh), never a
-        new worktree-* one -- this is repo_b's OWN main checkout, not
-        repo_b_wt. Search-fallback (TOP-0133 L1): this path's own query
-        words include this TEST RUN's tmpdir name (no STRIP_PREFIX/cwd
-        strips repo_b's path, so the raw absolute path is tokenized -- see
-        mc-query-lib.sh's own fallback-to-raw-path rule), which can
-        legitimately hit SCHEMA_FIXTURE_ROOT's own content (it mentions
-        this engine by name) -- so stdout is no longer pinned empty; only
-        the OUTCOME's kind is, deliberately widened to both fallback
-        outcomes rather than one exact string."""
+    def test_ordinary_checkout_of_unwired_repo_is_outside_roots_and_never_searched(self):
+        """TOP-0137 L16: a plain (non-worktree) checkout of a repo that was
+        never wired -- repo_b's OWN main checkout, not repo_b_wt -- sits
+        under the retrieval roots' parent directory (the wider glob admits
+        it) but under none of the roots. It ends in the new
+        `outside-roots` outcome, fail-open and silent, and the search
+        fallback never runs: an unresolved repository must not read this
+        project's store (formerly this path fell through to the fallback)."""
         main_path = str(self.repo_b / "src" / "other.py")
         proc, _ = run_hook(self._payload(main_path), self._env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
         log_text = (Path(self.memtool_home) / "hook.log").read_text()
         outcome_line = self._last_outcome_line(log_text)
-        self.assertNotIn("outcome=worktree-unwired", outcome_line)
-        self.assertNotIn("outcome=worktree-unresolved", outcome_line)
+        self.assertIn("outcome=outside-roots ", outcome_line)
+        self.assertIn(f"file={main_path}", outcome_line)
+        self.assertNotIn("outcome=worktree-", outcome_line)
+        self.assertNotIn("search-fallback", log_text)
+
+    def test_directory_outside_any_repository_is_outside_roots(self):
+        plain = Path(self.tmp) / "plain-dir"
+        plain.mkdir()
+        target = plain / "notes.py"
+        target.write_text("x = 1\n")
+        proc, _ = run_hook(self._payload(str(target)), self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        self.assertIn("outcome=outside-roots ", self._last_outcome_line(log_text))
+        self.assertNotIn("search-fallback", log_text)
+
+    def test_sibling_worktree_matches_the_main_chain_and_logs_the_real_path(self):
+        """B3 happy path: a worktree checked out NEXT TO the wired repo
+        (`git worktree add ../x`) is admitted by the parent-directory glob,
+        remapped to the main checkout, and answered exactly like an edit in
+        the main checkout -- while the log line's file= names the REAL
+        (worktree) path."""
+        main_path = str(self.repo_a / "src" / "core" / "scan" / "scan_plan.py")
+        wt_path = str(self.repo_a_wt / "src" / "core" / "scan" / "scan_plan.py")
+        main_proc, _ = run_hook(self._payload(main_path), self._env())
+        wt_proc, _ = run_hook(self._payload(wt_path), self._env())
+        self.assertEqual(wt_proc.returncode, 0, wt_proc.stderr)
+        main_ctx = json.loads(main_proc.stdout)["hookSpecificOutput"]["additionalContext"]
+        wt_ctx = json.loads(wt_proc.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("TOP-0042", wt_ctx)
+        self.assertEqual(wt_ctx, main_ctx, "a sibling worktree gets the same chain as the main checkout")
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        line = self._last_outcome_line(log_text)
+        self.assertIn("outcome=matched ", line)
+        self.assertTrue(line.rstrip().endswith(f"file={wt_path}"), line)
+
+    def test_sibling_edit_never_queries_the_raw_worktree_forms(self):
+        """F1 (Sol round 1): wired root `<parent>/repo-a`, sibling worktree
+        `<parent>/repo-a-wt`, hook cwd = `<parent>`. TOP-A is bound to
+        `src/x.py`, TOP-B to `repo-a-wt/src/x.py` -- exactly the cwd-relative
+        form of the RAW sibling path. The main edit answers A; the sibling
+        edit must answer A too, never B: a remapped sibling path is the ONLY
+        path queried. The argv log proves the raw path and its cwd-relative
+        form are never handed to memidx and each remapped form is, once."""
+        store = Path(self.tmp) / "xstore"
+        for top, ref in (("TOP-0901", "src/x.py"), ("TOP-0902", "repo-a-wt/src/x.py")):
+            d = store / "topics" / "x"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / f"{top.lower()}.md").write_text(
+                "---\ntype: topic\n"
+                f"id: {top}\ntitle: bound to {ref}\narea: x/y\nproject: default\ncurrent: L1\n"
+                f"code_refs:\n  - {ref}#sym\ntags: [x]\nlinks:\n"
+                "  - link: L1\n    date: 2024-04-15\n    status: active\n    kind: adopted\n"
+                "    ruling:\n      text: \"the ruling of " + top + "\"\n      authority: agent-inference\n"
+                "    evidence: []\n    recorded_by: agent\n    recorded_at: 2024-04-15\n---\n"
+            )
+        project = "hookxsib"
+        memidx.cmd_reindex(type("Args", (), dict(
+            root=str(store), project=project,
+            db=str(Path(self.memtool_home) / f"{project}.sqlite"),
+            full=True, no_embed=True))())
+        for repo in (self.repo_a, self.repo_a_wt):
+            (repo / "src").mkdir(exist_ok=True)
+            (repo / "src" / "x.py").write_text("# x\n")
+
+        argv_log = Path(self.tmp) / "sib-argv.jsonl"
+        wrapper = argv_log_python(self.tmp, "sib-argv-recorder", argv_log)
+        env = self._env(MEMCONTINUUM_PROJECT=project, MEMCONTINUUM_PYTHON=str(wrapper))
+        cwd = str(self.tmp)
+        main_path = str(self.repo_a / "src" / "x.py")
+        wt_path = str(self.repo_a_wt / "src" / "x.py")
+
+        main_proc, _ = run_hook(self._payload(main_path, cwd=cwd), env)
+        main_ctx = json.loads(main_proc.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("TOP-0901", main_ctx)
+        argv_log.unlink()
+
+        wt_proc, _ = run_hook(self._payload(wt_path, cwd=cwd), env)
+        self.assertEqual(wt_proc.returncode, 0, wt_proc.stderr)
+        wt_ctx = json.loads(wt_proc.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("TOP-0901", wt_ctx)
+        self.assertNotIn("TOP-0902", wt_ctx, "the sibling edit was answered with another record's decision")
+        queried = [c[1] for c in
+                   (json.loads(l) for l in argv_log.read_text().splitlines() if l.strip())
+                   if c and c[0] == "for-path"]
+        self.assertNotIn(wt_path, queried)
+        self.assertNotIn("repo-a-wt/src/x.py", queried)
+        # The remapped absolute form is tried first and matches nothing;
+        # the cwd-relative form `repo-a/src/x.py` and the strip-prefix form
+        # `src/x.py` follow -- each exactly once, no raw form anywhere.
+        self.assertEqual(queried, [main_path, "repo-a/src/x.py", "src/x.py"])
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        self.assertTrue(self._last_outcome_line(log_text).rstrip().endswith(f"file={wt_path}"))
+
+    def test_sibling_worktree_miss_takes_the_normal_miss_path_not_outside_roots(self):
+        wt_path = str(self.repo_a_wt / "src" / "core" / "scan" / "no_such_binding_here.py")
+        proc, _ = run_hook(self._payload(wt_path), self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        line = self._last_outcome_line(log_text)
         self.assertTrue(
-            "outcome=search-fallback " in outcome_line or "outcome=search-fallback-empty " in outcome_line,
-            outcome_line,
+            "outcome=search-fallback " in line or "outcome=search-fallback-empty " in line, line)
+        self.assertNotIn("outside-roots", log_text)
+        # The fallback's query words come from the REMAPPED path (the twin of
+        # the in-root worktree miss test): never the worktree directory name
+        # or its branch.
+        q_match = re.search(r"\bq=(\S*)", line)
+        self.assertIsNotNone(q_match, line)
+        self.assertEqual(q_match.group(1), "scan+such+binding+here")
+
+    def test_stats_counts_outside_roots(self):
+        run_hook(self._payload(str(self.repo_b / "src" / "other.py")), self._env())
+        result = subprocess.run(
+            [VENV_PYTHON, str(TOOLS_DIR / "memidx.py"), "stats",
+             "--home", self.memtool_home, "--project", self.project, "--json"],
+            capture_output=True, text=True, env=clean_env(),
         )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        outcomes = json.loads(result.stdout).get("pre_edit", {}).get("outcomes", {})
+        self.assertIn("outside-roots", outcomes)
+
+    def test_outside_roots_p95_latency_over_20_runs(self):
+        """B2: the wider glob puts every edit under a root's parent through
+        this script, so the off-root refusal must stay cheap (one bash start
+        plus the remap check, no for-path/python query). Each of the 20 runs
+        asserts the `outside-roots` refusal outcome, empty stdout and zero
+        memidx.py invocations in the argv log; the latency is reported and
+        held to a generous outer bound."""
+        target = str(self.repo_b / "src" / "other.py")
+        argv_log = Path(self.tmp) / "p95-argv.jsonl"
+        wrapper = argv_log_python(self.tmp, "p95-argv-recorder", argv_log)
+        env = self._env(MEMCONTINUUM_PYTHON=str(wrapper))
+        samples = []
+        for _ in range(20):
+            proc, elapsed = run_hook(self._payload(target), env)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            # Prove the refusal, not just the speed: silent, the
+            # outside-roots outcome, and no memidx.py script invocation (the
+            # watchdog launcher's `-c` call passes through the wrapper
+            # unlogged).
+            self.assertEqual(proc.stdout.strip(), "")
+            log_text = (Path(self.memtool_home) / "hook.log").read_text()
+            self.assertIn("outcome=outside-roots ", self._last_outcome_line(log_text))
+            self.assertFalse(argv_log.exists() and argv_log.read_text().strip(),
+                             "memidx.py must not be invoked for an off-root path")
+            samples.append(elapsed)
+        samples.sort()
+        p95 = samples[int(len(samples) * 0.95) - 1]
+        print(f"\npre-edit-chain.sh outside-roots p95 latency over 20 runs: {p95 * 1000:.1f}ms "
+              f"(min {samples[0]*1000:.1f}ms, max {samples[-1]*1000:.1f}ms)")
+        self.assertLess(p95, 1.5, f"p95 {p95:.3f}s far exceeds a generous 1.5s outer bound")
 
     def test_in_root_worktree_miss_logs_a_clean_query_no_worktree_or_branch_tokens(self):
         """TESTS item (coordinator fix round): an in-root worktree MISS
@@ -1850,14 +1999,7 @@ class TestPreEditChainSearchFallback(unittest.TestCase):
         memidx.cmd_reindex(args)
 
         argv_log = Path(self.tmp) / "argv.jsonl"
-        wrapper = memidx_wrapper_python(
-            self.tmp, "argv-recorder",
-            f'ARGV_LOG = "{argv_log}"\n'
-            'import json\n'
-            'with open(ARGV_LOG, "a") as _f:\n'
-            '    _f.write(json.dumps(sys.argv[1:]))\n'
-            '    _f.write(chr(10))\n',
-        )
+        wrapper = argv_log_python(self.tmp, "argv-recorder", argv_log)
         target = str(self.repo / "src" / "matched.py")
         env = self._env(MEMCONTINUUM_PYTHON=str(wrapper))
         proc, _ = run_hook(self._payload(target), env)
@@ -1870,21 +2012,15 @@ class TestPreEditChainSearchFallback(unittest.TestCase):
         self.assertEqual(search_calls, [], "a match must never invoke `search`")
 
     def test_no_write_path_store_and_index_untouched(self):
-        """Item 7, scope corrected (re-gate round 3, MAJOR 2): the fixture
-        index here is ALREADY current/stamped (setUp's own cmd_reindex),
-        so the sha staying unchanged across 50 runs proves the FALLBACK
-        SEARCH itself adds no write -- it does NOT prove the whole hook
-        run never writes the index. The same hook's own earlier `for-path`
-        lookup (unchanged by this feature) still opens the index the
-        ordinary rw way and CAN migrate/stamp a schema behind the current
-        generation before the fallback ever runs -- see
-        test_search_read_only_refuses_legacy_schema_without_writing in
-        tests/test_memidx.py for that direct, isolated proof, and
-        test_for_path_miss_still_migrates_before_the_fallback_runs below
-        for the same claim exercised through this actual hook. 50 fallback
-        runs against a fixture store that is a git repo -- `git status
-        --short` stays empty and the index file's sha256 is unchanged.
-        The one write this hook makes (session state, see
+        """Item 7, scope corrected: the fixture index here is ALREADY
+        current/stamped (setUp's own cmd_reindex), so the sha staying
+        unchanged across 50 runs proves the FALLBACK SEARCH adds no write on
+        a current index. (The hook's own `for-path` lookup opens the index
+        read-only and refuses one that needs migration -- TOP-0137 L13;
+        that is pinned in tests/test_memidx.py, not here.) 50 fallback runs
+        against a fixture store that is a git repo -- `git status --short`
+        stays empty and the index file's sha256 is unchanged. The one write
+        this hook makes (session state, see
         test_miss_with_hit_label_and_chain_never_snippet) lives under
         MEMCONTINUUM_HOME/sessions/, never under the store or the index."""
         for cmd in (
@@ -1913,19 +2049,14 @@ class TestPreEditChainSearchFallback(unittest.TestCase):
         )
         self.assertEqual(status.stdout.strip(), "", "the store must never be written by the fallback")
 
-    def test_for_path_miss_still_migrates_before_the_fallback_runs(self):
-        """Re-gate round 3, MAJOR 2, exercised end to end through the real
-        hook (not just memidx.py directly): a schema behind the current
-        generation, ALSO missing its db_meta project stamp, gets that
-        stamp written by this SAME hook run's own earlier `for-path`
-        lookup (unchanged, pre-existing, correct behavior -- a match must
-        keep seeing a migrated schema) -- the sha genuinely changes --
-        while the fallback's own `--read-only` search, reached moments
-        later in the SAME run, still correctly refuses with reason=
-        index-needs-migration (the project-stamp guard and the
-        generation-number stamp are different db_meta keys; only a real
-        `reindex` bumps the latter, so for-path's own migration guards
-        never silently paper over a stale generation number)."""
+    def test_for_path_on_an_outdated_index_refuses_and_never_writes(self):
+        """TOP-0137 L13, exercised end to end through the real hook: a
+        schema behind the current generation (and missing its db_meta
+        project stamp) used to be migrated/stamped by for-path's own rw
+        open. The pre-edit route is read-only now: the db sha does NOT
+        change, the run is fail-open (exit 0, empty stdout), and the log
+        carries ONE outcome line -- `index-needs-migration` -- with no
+        search-fallback line (the fallback would refuse the same state)."""
         db_path = Path(self.memtool_home) / f"{self.project}.sqlite"
         conn = sqlite3.connect(str(db_path))
         conn.execute("UPDATE db_meta SET value='1' WHERE key='index_generation'")
@@ -1940,17 +2071,26 @@ class TestPreEditChainSearchFallback(unittest.TestCase):
         self.assertEqual(proc.stdout.strip(), "")
 
         sha_after = hashlib.sha256(db_path.read_bytes()).hexdigest()
-        self.assertNotEqual(sha_before, sha_after, "for-path's own rw open must still stamp the project row")
+        self.assertEqual(sha_before, sha_after, "the pre-edit route must never write the index")
 
         conn = sqlite3.connect(str(db_path))
         row = conn.execute("SELECT value FROM db_meta WHERE key='project'").fetchone()
         conn.close()
-        self.assertEqual(row[0], self.project)
+        self.assertIsNone(row, "for-path must not re-stamp the project row")
 
         log_text = (Path(self.memtool_home) / "hook.log").read_text()
         line = self._last_outcome_line(log_text)
-        self.assertIn("outcome=search-fallback-empty", line)
-        self.assertIn("reason=index-needs-migration", line)
+        self.assertIn("outcome=index-needs-migration", line)
+        self.assertNotIn("search-fallback", log_text)
+
+        result = subprocess.run(
+            [VENV_PYTHON, str(TOOLS_DIR / "memidx.py"), "stats",
+             "--home", self.memtool_home, "--project", self.project, "--json"],
+            capture_output=True, text=True, env=clean_env(),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        outcomes = json.loads(result.stdout).get("pre_edit", {}).get("outcomes", {})
+        self.assertIn("index-needs-migration", outcomes)
 
     @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
     def test_search_crash_names_search_failed_rc_not_no_hits(self):
@@ -3139,7 +3279,15 @@ class TestPreEditChainTopicsLogging(unittest.TestCase):
         holds."""
         project = "topics-none"
         home = self._build_home(project, ["TOP-9001"])
-        proc, _elapsed = self._run(home, project, payload=self._nonmatching_payload())
+        # Under the configured root (STRIP_PREFIX=/fake/repo/): a path under
+        # NO root is refused earlier as outside-roots (TOP-0137 L16) and
+        # never reaches the fallback this test is about.
+        in_root_miss = json.dumps({
+            "hook_event_name": "PreToolUse", "tool_name": "Edit",
+            "cwd": "/fake/repo",
+            "tool_input": {"file_path": "/fake/repo/near/anything.py"},
+        })
+        proc, _elapsed = self._run(home, project, payload=in_root_miss)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         line = self._last_outcome_line(home)
         self.assertIn("outcome=search-fallback-empty", line)

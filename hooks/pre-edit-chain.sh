@@ -16,6 +16,10 @@
 # Contract (docs/DESIGN.md SS3.1, SS8):
 #   - reads the PreToolUse JSON payload on stdin, extracts tool_input.file_path
 #   - no match / any failure  -> exit 0, no stdout (never blocks the edit)
+#   - the decision index needs a migration (for-path exit 5, TOP-0137 L13:
+#     this route opens the index read-only and never writes it) -> exit 0,
+#     no stdout, outcome=index-needs-migration; the store's next commit
+#     (hooks/post-commit-reindex.sh) or `memidx.py reindex --root` migrates
 #   - match                   -> one JSON object on stdout:
 #         {"hookSpecificOutput":{"hookEventName":"PreToolUse",
 #                                  "additionalContext":"..."}}
@@ -42,25 +46,24 @@
 # worktree, but its main repo isn't a configured root) and
 # `worktree-unresolved` (git itself could not settle the question).
 #
-# This closes the gap in THIS SCRIPT's own logic; it cannot make the harness
-# LAUNCH the script for a file outside every "if" glob repo-init.sh renders
-# (templates/code-root-filter-pair.json.tmpl scopes each invocation's "if"
-# to one literal RETRIEVAL-root path: the git toplevel of each --code-root,
-# or the root itself outside git; code roots narrower than the checkout
-# scope only the index) -- a worktree checked out as a SIBLING of
-# the wired root never reaches this script at all under current wiring, so
-# it gets NO retrieval here (ledger-post-edit.sh, which has no such filter,
-# still ledgers it -- see that hook's own header). One checked out INSIDE
-# the wired root (e.g. `<root>/.worktrees/x`) DOES reach this script, and
-# gets full retrieval -- round 1 of this fix claimed this case was "closed
-# end-to-end" while its own callers still silently skipped the remap for
-# ANY FILE_PATH already physically under a configured root (Grok's round-2
-# BLOCKER finding): the in-root worktree case is what that round-2 fix
-# actually closes; round 1 only wired the machinery for it. A project that
-# wants retrieval for its own worktrees should therefore keep them INSIDE
-# the repository (e.g. `<repo>/.worktrees/`, gitignored by that project) --
-# a sibling worktree stays ledger-only until the settings-rendering
-# follow-up (see this task's own report) widens the "if" glob itself.
+# Which paths the harness LAUNCHES this script for is set by the "if" globs
+# repo-init.sh renders (templates/code-root-filter-pair.json.tmpl): one pair
+# per RETRIEVAL root (the git toplevel of each --code-root, or the root
+# itself outside git; code roots narrower than the checkout scope only the
+# index) AND one pair per retrieval root's PARENT directory (TOP-0137 L16),
+# unless that parent is `/` or the user's home. So a worktree checked out
+# as a SIBLING of the wired root (`git worktree add ../x`) reaches this
+# script and gets the same retrieval as the main checkout, as does one
+# checked out INSIDE the root (e.g. `<root>/.worktrees/x`); only a worktree
+# further away than the root's parent is ledger-only (ledger-post-edit.sh
+# has no such filter and still ledgers it -- see that hook's own header).
+# The wider glob also launches this script for every other edit under the
+# parent, so a path under NO configured root is decided before any query
+# (see "off-root refusal" below): a worktree of a wired root continues as an
+# edit in the main checkout; everything else ends with no search --
+# `worktree-unwired`, `worktree-unresolved`, or `outside-roots` (an ordinary
+# other repository or directory). In-root paths take the flow below
+# unchanged.
 #
 # Env:
 #   MEMCONTINUUM_ROOT     store markdown root; used to derive a default
@@ -310,7 +313,78 @@ fi
 
 # PROJECT is already resolved above (moved ahead of the no-python check).
 
+# --- off-root refusal (TOP-0137 L16) -------------------------------------
+# The settings-level "if" globs also cover each retrieval root's PARENT
+# directory (scripts/repo-init.sh), so a sibling worktree
+# (`git worktree add ../x`) reaches this script -- and so does ANY other edit
+# under that parent. A path under none of the configured roots is therefore
+# decided HERE, before any for-path query (it cannot match a code_ref anyway,
+# and the wider glob must cost one bash start plus the remap, no python):
+#   mc_remap_worktree_gated rc 0 -> a worktree of a wired root: QUERY_PATH
+#                                   becomes the remapped main-checkout path
+#                                   and is the ONLY path queried below (no
+#                                   raw worktree form, absolute or cwd-/
+#                                   prefix-relative, ever reaches for-path --
+#                                   a cwd-relative raw form can be bound to
+#                                   ANOTHER record), as if the edit happened
+#                                   in the main checkout
+#   rc 1 -> worktree-unwired      a worktree of an unwired repository
+#   rc 2 -> worktree-unresolved   git could not settle it
+#   rc 3 -> outside-roots         an ordinary other repository or directory
+# Every refusal ends the run with no search: a path whose repository does
+# not resolve to a wired root never reads this project's store. The block is
+# skipped for an in-root path (textual prefix test first, so the common case
+# sources nothing), a relative path, and an unset STRIP_PREFIX -- all of
+# which keep the flow below byte-for-byte.
+QUERY_PATH="$FILE_PATH"
+WT_PRE_DONE=0
+WT_REMAPPED=""
+WT_REMAP_RC=3
+WT_ROOTS=""
+declare -a WT_ROOT_ARR=()
+if [ -n "${MEMCONTINUUM_STRIP_PREFIX:-}" ] && [ "${FILE_PATH#/}" != "$FILE_PATH" ]; then
+    OFFROOT_TEXTUAL_IN_ROOT=0
+    IFS=':' read -r -a OFFROOT_PREFIXES <<<"$MEMCONTINUUM_STRIP_PREFIX"
+    for prefix in "${OFFROOT_PREFIXES[@]}"; do
+        [ -z "$prefix" ] && continue
+        if [ "${FILE_PATH#"$prefix"}" != "$FILE_PATH" ]; then
+            OFFROOT_TEXTUAL_IN_ROOT=1
+            break
+        fi
+    done
+    if [ "$OFFROOT_TEXTUAL_IN_ROOT" -eq 0 ]; then
+        # shellcheck source=mc-path-lib.sh
+        source "$SCRIPT_DIR/mc-path-lib.sh"
+        WT_ROOTS="$(mc_strip_prefix_roots "$MEMCONTINUUM_STRIP_PREFIX")"
+        while IFS= read -r wt_root; do
+            [ -n "$wt_root" ] && WT_ROOT_ARR+=("$wt_root")
+        done <<EOF3
+$WT_ROOTS
+EOF3
+        OFFROOT_IN_ROOT=0
+        for wt_root in ${WT_ROOT_ARR[@]+"${WT_ROOT_ARR[@]}"}; do
+            if mc_path_under_root "$FILE_PATH" "$wt_root"; then
+                OFFROOT_IN_ROOT=1
+                break
+            fi
+        done
+        if [ -n "$WT_ROOTS" ] && [ "$OFFROOT_IN_ROOT" -eq 0 ]; then
+            WT_REMAPPED="$(mc_remap_worktree_gated "$FILE_PATH" "$WT_ROOTS")"
+            WT_REMAP_RC=$?
+            WT_PRE_DONE=1
+            case $WT_REMAP_RC in
+                0) QUERY_PATH="$WT_REMAPPED" ;;
+                1) finish "worktree-unwired" ;;
+                2) finish "worktree-unresolved" ;;
+                *) finish "outside-roots" ;;
+            esac
+        fi
+    fi
+fi
+
 # --- build candidate paths to try against for-path -------------------------
+# Every form derives from QUERY_PATH (FILE_PATH, or the remapped main-checkout
+# path for a sibling worktree -- see the off-root refusal block above).
 declare -a CANDIDATES=()
 add_candidate() {
     local c="$1"
@@ -321,18 +395,18 @@ add_candidate() {
     CANDIDATES+=("$c")
 }
 
-add_candidate "$FILE_PATH"
+add_candidate "$QUERY_PATH"
 
-if [ -n "$CWD" ] && [ "${FILE_PATH#"$CWD"/}" != "$FILE_PATH" ]; then
-    add_candidate "${FILE_PATH#"$CWD"/}"
+if [ -n "$CWD" ] && [ "${QUERY_PATH#"$CWD"/}" != "$QUERY_PATH" ]; then
+    add_candidate "${QUERY_PATH#"$CWD"/}"
 fi
 
 if [ -n "${MEMCONTINUUM_STRIP_PREFIX:-}" ]; then
     IFS=':' read -r -a PREFIXES <<<"$MEMCONTINUUM_STRIP_PREFIX"
     for prefix in "${PREFIXES[@]}"; do
         [ -z "$prefix" ] && continue
-        if [ "${FILE_PATH#"$prefix"}" != "$FILE_PATH" ]; then
-            add_candidate "${FILE_PATH#"$prefix"}"
+        if [ "${QUERY_PATH#"$prefix"}" != "$QUERY_PATH" ]; then
+            add_candidate "${QUERY_PATH#"$prefix"}"
         fi
     done
 fi
@@ -412,16 +486,23 @@ try_candidate() {
     RC=$?
     # F1 (ruling 68): for-path's own exit codes -- 3 = missing/uninitialized
     # (the same outcome name the pre-loop [ ! -f "$DB_PATH" ] check above
-    # already uses), 4 = index-error (a schema a migration guard should
-    # already have fixed but didn't). Both get their own named outcome
-    # instead of falling into the generic RC != 0 -> continue -> eventual
-    # "query-failed"/"no-match" below, which would hide which candidate (if
-    # any) actually had a usable index.
+    # already uses), 4 = index-error (a schema the read-only queries could
+    # not read), 5 = upgrade-required (TOP-0137 L13: for-path opens the
+    # decision index read-only and refuses an index that needs migration).
+    # Each gets its own named outcome instead of falling into the generic
+    # RC != 0 -> continue -> eventual "query-failed"/"no-match" below,
+    # which would hide which candidate (if any) actually had a usable
+    # index. rc 5 ends the run with no search fallback: the fallback's
+    # `search --read-only` refuses the same state, so it would only add a
+    # second, redundant outcome line.
     if [ $RC -eq 3 ]; then
         finish "index-missing"
     fi
     if [ $RC -eq 4 ]; then
         finish "index-error"
+    fi
+    if [ $RC -eq 5 ]; then
+        finish "index-needs-migration"
     fi
     if [ $RC -ne 0 ]; then
         return 1
@@ -599,10 +680,11 @@ done
 # Round 2 fix (Grok BLOCKER): a FILE_PATH already physically under one of
 # these roots used to skip this whole block outright -- wrong for a
 # worktree checked out INSIDE the root (e.g. `<root>/.worktrees/feat/`),
-# the ONLY worktree location the settings-level "if" glob
-# (templates/code-root-filter-pair.json.tmpl) ever lets THIS SCRIPT be
-# invoked for at all (a sibling worktree's Edit never matches that glob,
-# so it never reaches this script -- see this file's own header). Fixed:
+# the worktree location the settings-level "if" glob
+# (templates/code-root-filter-pair.json.tmpl) lets THIS SCRIPT be
+# invoked for with the root pair alone (a SIBLING worktree is admitted by
+# the parent-directory pair and settled by the off-root refusal above --
+# see this file's own header). Fixed:
 # still zero extra `git` calls for the ordinary in-root case (no nested
 # worktree at all -- by far the common shape of an in-root miss), via
 # mc_nested_worktree_gitfile's bash-only ancestor walk; mc_remap_worktree_path's
@@ -610,16 +692,18 @@ done
 # configured root while it searches for a match -- are paid only when that
 # walk actually finds a nested `.git` FILE between FILE_PATH and the
 # matching root.
-if [ -z "$MATCHED_CANDIDATE" ] && [ "$ANY_QUERY_SUCCEEDED" -eq 1 ] && [ -n "${MEMCONTINUUM_STRIP_PREFIX:-}" ]; then
-    # shellcheck source=mc-path-lib.sh
-    source "$SCRIPT_DIR/mc-path-lib.sh"
-    WT_ROOTS="$(mc_strip_prefix_roots "$MEMCONTINUUM_STRIP_PREFIX")"
-    declare -a WT_ROOT_ARR=()
-    while IFS= read -r wt_root; do
-        [ -n "$wt_root" ] && WT_ROOT_ARR+=("$wt_root")
-    done <<EOF2
+if [ "$WT_PRE_DONE" -eq 0 ] && [ -z "$MATCHED_CANDIDATE" ] && [ "$ANY_QUERY_SUCCEEDED" -eq 1 ] && [ -n "${MEMCONTINUUM_STRIP_PREFIX:-}" ]; then
+    if [ "$WT_PRE_DONE" -eq 0 ]; then
+        # shellcheck source=mc-path-lib.sh
+        source "$SCRIPT_DIR/mc-path-lib.sh"
+        WT_ROOTS="$(mc_strip_prefix_roots "$MEMCONTINUUM_STRIP_PREFIX")"
+        WT_ROOT_ARR=()
+        while IFS= read -r wt_root; do
+            [ -n "$wt_root" ] && WT_ROOT_ARR+=("$wt_root")
+        done <<EOF2
 $WT_ROOTS
 EOF2
+    fi
 
     if [ -n "$WT_ROOTS" ]; then
         # An in-root path with no nested worktree, or whose nested gitfile
@@ -628,8 +712,12 @@ EOF2
         # decision bound to it" miss.
         # The in-root gate and the remap itself live in mc_remap_worktree_gated
         # (hooks/mc-path-lib.sh), shared with hooks/newfile-nudge.sh.
-        WT_REMAPPED="$(mc_remap_worktree_gated "$FILE_PATH" "$WT_ROOTS")"
-        WT_REMAP_RC=$?
+        # An off-root path was already remapped by the off-root refusal
+        # block above (WT_PRE_DONE=1): reuse that answer, no second pass.
+        if [ "$WT_PRE_DONE" -eq 0 ]; then
+            WT_REMAPPED="$(mc_remap_worktree_gated "$FILE_PATH" "$WT_ROOTS")"
+            WT_REMAP_RC=$?
+        fi
         case $WT_REMAP_RC in
             0)
                 # Feed the remapped (main-checkout) path through the
@@ -712,7 +800,12 @@ if [ -z "$MATCHED_CANDIDATE" ]; then
     # this channel reads the index to answer a guess, never writes to it --
     # a legacy/unmigrated schema is refused by name (state=upgrade-required,
     # reason=index-needs-migration) instead of being silently migrated on
-    # open, which the pre-fix-round `open_db_noncreating` path did. `--root`
+    # open. Nothing in this pre-edit route writes the decision index any
+    # more (TOP-0137 L13): for-path above is read-only too, so an index
+    # that needs migration is only ever migrated on the store's own write
+    # path -- hooks/post-commit-reindex.sh after the next store commit, or
+    # a manual `memidx.py reindex --root <store>` (cmd_reindex opens the
+    # db with open_db, which runs the migration guards). `--root`
     # is now passed WHEN KNOWN (MAJOR item b: staleness must be visible,
     # not swallowed) -- the old "never --root, it'd be noise" comment
     # covered a real concern (index-stale-served already reports staleness

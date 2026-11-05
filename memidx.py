@@ -1554,6 +1554,30 @@ def _for_path_missing_reply(args, state: str) -> int:
     return 3
 
 
+def _for_path_migration_reply(args) -> int:
+    """for-path's refusal on an `upgrade-required` decision index (TOP-0137
+    L13): the pre-edit route never writes the index, and the migration
+    guards are what would have to run -- so it exits 5 with one stderr line
+    (the wording family of `cmd_search --read-only`'s refusal) and, under
+    --json, the `_for_path_missing_reply` envelope shape (`results: []`, plus
+    an empty `chain_text` under --with-chain-text). stdout stays
+    empty in plain mode: a refusal is not "no topics reference this path"."""
+    print(
+        "for-path: the decision index needs migration (state=upgrade-required) -- "
+        "read-only route refuses to write it; run `reindex --root <path>`",
+        file=sys.stderr,
+    )
+    if getattr(args, "json", False):
+        # Same envelope as `_for_path_missing_reply` (results, plus an empty
+        # chain_text under --with-chain-text): the whole for-path refusal
+        # family shares one shape.
+        payload = {"state": "upgrade-required", "reason": "index-needs-migration", "results": []}
+        if getattr(args, "with_chain_text", False):
+            payload["chain_text"] = ""
+        print(json.dumps(payload, indent=2))
+    return 5
+
+
 def delete_record_rows(conn: sqlite3.Connection, path: str, *, keep_embedding: bool = False) -> None:
     """F5: a topic's own link rows (records.link_topic_path == path) cascade
     with it -- select their paths first, then delete fts/embeddings/records
@@ -5191,23 +5215,32 @@ def cmd_for_path(args) -> int:
     """F1 (ruling 68): 2 stays argparse's own reserved usage-error code; 3 =
     missing/uninitialized (collapsed -- no positive match worth attempting,
     including the TOCTOU race where the file vanishes between the state
-    check and the open below); 4 = index-error (a schema a migration guard
-    should already have fixed but didn't -- ruling 65's belt-and-suspenders
-    catch). upgrade-required/current/stale/quarantined all proceed normally;
-    a positive match off a non-current index stays usable."""
+    check and the open below); 4 = index-error (a schema the read-only
+    queries below cannot read -- ruling 65's belt-and-suspenders catch);
+    5 = upgrade-required (TOP-0137 L13): the index needs a migration and
+    this route never writes, so it refuses -- `reindex --root <path>`
+    migrates. current/stale/quarantined proceed normally; a positive match
+    off a non-current index stays usable.
+
+    Read-only by construction (TOP-0137 L13): the state check and the
+    query connection both go through open_db_readonly (SQLite mode=ro,
+    no migration guard ever runs), so this route writes zero bytes to the
+    decision index."""
     db_path = resolve_db_path(args)
     # Final-fix-wave item 2: see cmd_search's identical comment.
     root = Path(args.root).resolve() if getattr(args, "root", None) else None
-    state = decision_index_state(db_path, args.project, root=root)
+    state = decision_index_state_readonly(db_path, args.project, root=root)
     if state in ("missing", "uninitialized"):
         return _for_path_missing_reply(args, state)
+    if state == "upgrade-required":
+        return _for_path_migration_reply(args)
     try:
-        conn = open_db_noncreating(db_path, project=args.project)
+        conn = open_db_readonly(db_path)
         if conn is None:
             # TOCTOU: the file vanished between the state check above and
             # this open -- the same outcome as "missing" was just found.
             return _for_path_missing_reply(args, "missing")
-        if state in ("upgrade-required", "stale", "quarantined"):
+        if state in ("stale", "quarantined"):
             _decision_warn("for-path", args, state, conn=conn)
         matches, concept_pairs = resolve_path_governance(conn, args.project, args.file_path)
         anchor_notes = {}
@@ -5230,7 +5263,7 @@ def cmd_for_path(args) -> int:
             out.extend(concept_json(conn, args.project, crow, governed) for crow, governed in concept_pairs)
             # Item 2: --json carries state when opted into --root and the
             # state is worth naming -- see cmd_search's identical gate.
-            state_worth_naming = root is not None and state in ("upgrade-required", "stale", "quarantined")
+            state_worth_naming = root is not None and state in ("stale", "quarantined")
             # Round 5: --with-chain-text folds the plain-text chain view
             # (for_path_chain_lines -- the exact text non-JSON mode prints)
             # into the JSON envelope itself, so a caller (hooks/pre-edit-
@@ -5275,7 +5308,7 @@ def cmd_for_path(args) -> int:
         # only matters to a direct CLI/JSON consumer asking for the flag.
         if args.json:
             if getattr(args, "with_chain_text", False):
-                state_worth_naming = root is not None and state in ("upgrade-required", "stale", "quarantined")
+                state_worth_naming = root is not None and state in ("stale", "quarantined")
                 payload = {}
                 if state_worth_naming:
                     payload["state"] = state
@@ -6662,10 +6695,11 @@ def cmd_standing(args) -> int:
     open can never write a byte, so this refusal is not merely a courtesy:
     it is the only way this command keeps that guarantee.
 
-    Unlike every other reader here (search/chain/for-path/why/drift), which
-    proceed with a stderr warning on `upgrade-required`/`stale`/
-    `quarantined` (ruling 68: "a positive match off a degraded index is
-    still real evidence"), `standing` refuses on EVERY state but `current`
+    Unlike every other reader here (search/chain/why/drift), which proceed
+    with a stderr warning on `upgrade-required`/`stale`/`quarantined`
+    (ruling 68: "a positive match off a degraded index is still real
+    evidence"; `for-path` is the one exception, refusing `upgrade-required`
+    with exit 5 because it is read-only, TOP-0137 L13), `standing` refuses on EVERY state but `current`
     -- `missing`, `uninitialized`, `upgrade-required` (behind OR ahead of
     this engine's own generation -- see `_classify_index_state`'s ping-pong
     guard), `stale`, and `quarantined` alike. A stale STANDING digest risks

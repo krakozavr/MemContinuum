@@ -117,6 +117,27 @@
   fallback search was queried on the whole machine path. Where the root's
   configured tail differs from its real tail (a symlink inside the
   repository) the real-path spelling is still printed.
+- The pre-edit lookup can no longer modify the decision index; an outdated
+  index now gets a one-line refusal until the next store commit reindexes it.
+  The hook logs it as `outcome=index-needs-migration` and, as always, never
+  blocks the edit.
+  Technical: `memidx.py for-path` opens the index `mode=ro` (no migration
+  guard, no project stamp) and exits 5 with `{"state": "upgrade-required",
+  "reason": "index-needs-migration"}` on an `upgrade-required` index;
+  `pre-edit-chain.sh` maps rc 5 to that outcome with no search fallback.
+- A worktree checked out next to the repository (`git worktree add ../x`) now
+  gets the same decision lookup as the main checkout, and an edit under the
+  repository's parent folder that belongs to no wired project is declined
+  without a search (logged as `outcome=outside-roots`). Run
+  `memcontinuum-update.sh --apply` to re-render the wiring; the parent folder
+  is not watched when it is `/` or your home directory (the installer prints a
+  note).
+  Technical: `repo-init.sh` renders the pre-edit filter pair for each
+  retrieval root's parent directory too (`Edit(//<parent>/**)`, same command;
+  `MEMCONTINUUM_STRIP_PREFIX` unchanged); `pre-edit-chain.sh` settles a path
+  under no root before any `for-path` query with `mc_remap_worktree_gated`:
+  remapped worktree continues, otherwise `worktree-unwired`,
+  `worktree-unresolved` or the new `outside-roots`, never a search.
 
 ## [0.4.0] — 2026-10-31
 
