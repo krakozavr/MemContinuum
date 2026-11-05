@@ -1311,6 +1311,60 @@ class TestRetrievalRootFollowsRepository(unittest.TestCase):
         finally:
             shutil.rmtree(home, ignore_errors=True)
 
+    def test_rendered_globs_admit_a_sibling_worktree_but_not_a_path_outside_the_parent(self):
+        """B3: the rendered Edit/Write globs, read as `//`-anchored path
+        prefixes, admit a worktree checked out next to the repo, and still
+        reject a path outside both the repo and its parent."""
+        home = sandbox_home()
+        try:
+            repo = self._repo(home, "work/repo")
+            pre, _ = self._install(home, [str(repo / "Sources")])
+
+            def admits(tool, path):
+                for h in pre:
+                    m = re.match(r"^(\w+)\(/(/.*)/\*\*\)$", h["if"])
+                    if m and m.group(1) == tool and path.startswith(m.group(2) + "/"):
+                        return True
+                return False
+
+            sibling = str(repo.parent / "repo-wt" / "Sources" / "x.swift")
+            elsewhere = str(Path(home) / "elsewhere" / "x.swift")
+            for tool in ("Edit", "Write"):
+                self.assertTrue(admits(tool, str(repo / "Sources" / "x.swift")))
+                self.assertTrue(admits(tool, sibling), f"{tool}: sibling worktree must be admitted")
+                self.assertFalse(admits(tool, elsewhere), f"{tool}: outside the parent must not be admitted")
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_rerun_with_another_root_replaces_the_parent_pairs(self):
+        """The parent pairs follow their root: a re-run that drops the root
+        (down to no --code-root at all) leaves no PreToolUse entry behind,
+        and one that moves to a root under another parent swaps the parent
+        pair too."""
+        home = sandbox_home()
+        try:
+            a = self._repo(home, "work-a/repo")
+            b = self._repo(home, "work-b/repo")
+            store = str(Path(home) / "store")
+            claude_dir = str(Path(home) / ".claude")
+            settings = Path(home) / ".claude" / "settings.local.json"
+            self._install(home, [str(a / "Sources")])
+            pre_a = [h["if"] for g in json.loads(settings.read_text())["hooks"]["PreToolUse"]
+                     for h in g.get("hooks", []) if "pre-edit-chain.sh" in h["command"]]
+            self.assertIn(f"Edit(/{a.parent}/**)", pre_a)
+
+            pre_b, _ = self._install(home, [str(b / "Sources")])
+            ifs_b = [h["if"] for h in pre_b]
+            self.assertIn(f"Edit(/{b.parent}/**)", ifs_b)
+            self.assertNotIn(f"Edit(/{a.parent}/**)", ifs_b)
+            self.assertNotIn(f"Edit(/{a}/**)", ifs_b)
+
+            proc = run_install(["--project", "narrow", "--store", store, "--claude-dir", claude_dir], home)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertNotIn("PreToolUse", json.loads(settings.read_text()).get("hooks", {}))
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
     def test_every_rendered_pre_edit_if_filter_has_double_leading_slash_including_the_parent(self):
         home = sandbox_home()
         try:
