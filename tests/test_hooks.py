@@ -2974,6 +2974,48 @@ class TestPreEditChainTopicsLogging(unittest.TestCase):
         self.assertEqual(line.count("project="), 1, line)
         self.assertIn(" session=abprojectevilx ", line)
 
+    def _path_without_jq(self) -> str:
+        """A PATH of one temp dir holding a symlink to every executable the
+        real PATH offers except `jq`, so the hook takes its python decode."""
+        binlib = Path(self.tmp) / "bin-without-jq"
+        binlib.mkdir()
+        for d in os.environ.get("PATH", "").split(os.pathsep):
+            try:
+                entries = list(Path(d).iterdir())
+            except OSError:
+                continue
+            for e in entries:
+                if e.name != "jq" and not (binlib / e.name).exists() \
+                        and e.is_file() and os.access(e, os.X_OK):
+                    (binlib / e.name).symlink_to(e)
+        self.assertFalse((binlib / "jq").exists())
+        return str(binlib)
+
+    def test_payload_fields_decode_identically_with_and_without_jq(self):
+        """The no-jq path decodes file_path, cwd and session_id in ONE python
+        call, NUL-separated; a mis-redirected read once left all three empty
+        (outcome=no-file-path) and nothing noticed. Same payload, both paths:
+        identical session= and file= (a space and a non-ASCII character)."""
+        project = "session-nojq"
+        home = self._build_home(project, ["TOP-9001"])
+        path = "/fake/repo/src/dir with space/\u00e9t\u00e9.py"
+        payload = json.dumps({
+            "hook_event_name": "PreToolUse", "tool_name": "Edit",
+            "session_id": "sess-nojq", "cwd": "/some/cwd",
+            "tool_input": {"file_path": path},
+        })
+        fields = {}
+        for label, overrides in (("jq", {}), ("nojq", {"PATH": self._path_without_jq()})):
+            proc, _ = self._run(home, project, payload, **overrides)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            line = self._last_outcome_line(home)
+            self.assertNotIn("outcome=no-file-path", line, (label, line))
+            self.assertNotRegex(line, r"outcome=\S*error", (label, line))
+            self.assertIn(" session=sess-nojq ", line, (label, line))
+            self.assertTrue(line.endswith(f" file={path}"), (label, line))
+            fields[label] = (re.search(r" session=\S+ ", line).group(0), line.split(" file=", 1)[1])
+        self.assertEqual(fields["jq"], fields["nojq"])
+
     def test_no_topics_line_has_session_but_no_exposure(self):
         project = "session-no-topics"
         home = self._build_home(project, ["TOP-9001"])
