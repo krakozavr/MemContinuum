@@ -127,12 +127,12 @@ Failed or interrupted refreshes remain visible; automatic refresh never creates 
 Indexing respects `.gitignore`, and refresh removes previously indexed ignored content and roots no longer configured.
 Re-run the updater to add the refresh hooks to existing projects.
 
-    Technical: Run `memcontinuum-update.sh --apply`; `MEMCONTINUUM_CODE_REFRESH_LIMIT` defaults to 500 files, and `.code-stale` records refresh problems.
+    Technical: Run `memcontinuum-update.sh --apply`; `MEMCONTINUUM_CODE_REFRESH_LIMIT` defaults to 500 files, `MEMCONTINUUM_CODE_REFRESH_BUDGET` allows 8 s on `Stop` and 2 s on `SessionStart`, and `.code-stale` records refresh problems.
 
 ### Fill in embeddings automatically
 
 Missing code embeddings now fill in after installation and when a session starts or ends.
-Text search remains available during catch-up, and an interrupted worker keeps its completed progress.
+Text search remains available during catch-up, and an interrupted worker keeps its completed progress. The refresh at the end of a turn is text-only, so a fully embedded index reads `partial` until the worker catches up.
 CPU embedding is about eight times faster, while vector scoring is about ten times faster with unchanged scores and rankings.
 The model change triggers a one-time background re-embed of store records and code chunks; the first embedding download is about 133 MB.
 
@@ -154,16 +154,16 @@ Backups refuse paths that escape the backup directory and refuse unsafe destinat
 A commit that bypasses checks is checked again afterward, with a warning that remains visible at session start until a clean commit follows.
 Without watchdog Python, neither the backup nor the after-commit check runs.
 
-    Technical: Configure `memcontinuum-setup.sh --backup-dir DIR [--backup-keep N]`; unsafe project names skip both checks and backups, while an invalid backup directory skips backups only.
+    Technical: Configure `memcontinuum-setup.sh --backup-dir DIR [--backup-keep N]`; the updater's `backup` column states off, none, current, behind, unreadable or unknown; unsafe project names skip both checks and backups, while an invalid backup directory skips backups only.
 
 ### Find hook directories missing from the registry
 
 The updater now reports directories that contain a project's hooks but are absent from its registry entry.
-It supplies a command to record the missing directory, or asks you to wire the project or remove its hooks when no project entry exists.
+It supplies a command to record the missing directory (marked incomplete, with the repository left for you to fill in, when no local checkout of the remote is known), or asks you to wire the project or remove its hooks when no project entry exists.
 This scan reports findings without recording them or changing the updater's exit status.
 Session-start and refresh logs also identify the working directory without allowing path text to confuse project statistics.
 
-    Technical: `unrecorded-claude-dir` rows supply `memcontinuum-decide.sh wired ...`; `MEMCONTINUUM_CLAUDE_JSON` overrides the project list; logs use percent-encoded `cwd=` values.
+    Technical: `unrecorded-claude-dir` rows supply `memcontinuum-decide.sh wired ...`, marked INCOMPLETE with `--repo` when no local checkout is known; `MEMCONTINUUM_CLAUDE_JSON` overrides the project list; logs use percent-encoded `cwd=` values.
 
 ### Known limitation: lookup follows the indexed directories
 
@@ -184,9 +184,9 @@ binding, while stronger store checks protect recorded history.
 Topics can now name owner-authority decisions that apply throughout the project, and sessions receive their own wording as citations.
 An unchanged digest is not repeated on resume, but is delivered again after a clear or compaction.
 The set is limited to 24 links or 4,800 bytes; invalid entries and oversized sets are refused.
-After upgrading, reindex each project's store: until then, session start reports that the digest was skipped.
+After upgrading, reindex each project's store: until then, session start reports that the digest was skipped, and the updater reports every wired store whose index is behind as needing an upgrade.
 
-    Technical: Use `standing:` and `memidx.py standing`; index generation moves from 5 to 6; run `memidx.py reindex --root STORE --project NAME` or `memcontinuum-update.sh --apply`; newer-generation indexes are reported and left untouched.
+    Technical: Use `standing:` and `memidx.py standing [--root DIR] [--json]`, which opens the index read-only, refuses when the index is not current (including one written by a newer engine), and refuses rather than truncating when the set is over the cap; index generation moves from 5 to 6; run `memidx.py reindex --root STORE --project NAME` or `memcontinuum-update.sh --apply` (the updater reports `index: upgrade-required` until then); newer-generation indexes are reported and left untouched.
 
 ### Get a possible decision when no binding exists
 
@@ -195,7 +195,7 @@ Results are labelled “may be unrelated,” create no binding, and include boun
 New files receive the same lookup, using their remapped project path inside worktrees.
 The lookup reads the index without migrating it, refuses incompatible schemas, and skips files inside the store.
 
-    Technical: `MEMCONTINUUM_FALLBACK_MAX_BYTES` defaults to 2000 per hit; `MEMCONTINUUM_FALLBACK_MODE` selects `hybrid`, `vector`, or `fts`; the second-hit RRF floor defaults to `0.0314`, with `0` disabling it.
+    Technical: `memidx.py search` gains `--read-only`, `--hydrate`, `--hydrate-max-bytes` and `--decisions-only`; `MEMCONTINUUM_FALLBACK_MAX_BYTES` defaults to 2000 per hit; `MEMCONTINUUM_FALLBACK_MODE` selects `hybrid`, `vector`, or `fts`; the second-hit RRF floor `MEMCONTINUUM_FALLBACK_SECOND_FLOOR` defaults to `0.0314`, with `0` disabling it.
 
 ### Search from your prompt when you opt in
 
@@ -267,9 +267,9 @@ Matched pre-edit log lines now name the topics they injected (`topics=`), so a m
 
 ## [0.2.0rc4] — 2026-09-07
 
-Append-only history is now enforced when the store is committed: recorded link bodies are frozen, a status may move forward only once from active or provisional to a closed status, and a removed link or a deleted or renamed topic file is refused. The decision index skips symlinks in the store, quarantines a malformed record instead of crashing, hashes every record so a same-size rewrite shows up as a change, and tags every vector with the model that made it, falling back to text search when vectors do not match. The code index judges freshness from more file signals, can prove it on request, and rebuilds once on a schema change, keeping roots and languages but losing embeddings. Hooks now cover every configured code root, the store's post-commit reindex no longer waits for embeddings, the edit ledger catches changes made from the shell, and a commit that names no decision gets one nudge. Search now defaults to active or status-free records and leaves inbox drafts out, new WSL installs default to a store on the native disk with name conflicts disambiguated or refused, and the documentation states that automatic lookup covers only the Edit and Write tools.
+Append-only history is now enforced when the store is committed: recorded link bodies are frozen, a status may move forward only once from active or provisional to a closed status, and a removed link or a deleted or renamed topic file is refused. The decision index skips symlinks in the store, quarantines a malformed record instead of crashing, hashes every record so a same-size rewrite shows up as a change, and tags every vector with the model that made it, falling back to text search when vectors do not match. The code index judges freshness from more file signals, can prove it on request, and rebuilds once on a schema change, keeping roots and languages but losing embeddings. Hooks now cover every configured code root, the store's post-commit reindex no longer waits for embeddings, the edit ledger catches changes made from the shell, and one line is added when a configured code root's HEAD moves to a commit that names no decision and the session edited at least one file under that root that no topic covers; a commit whose edits are all covered gets no line. The linter now checks decision markers under a code root against the store. Search now defaults to active or status-free records and leaves inbox drafts out, new WSL installs default to a store on the native disk with name conflicts disambiguated or refused, and the documentation states that automatic lookup covers only the Edit and Write tools.
 
-    Technical: `memlint.py --against-ref REF [--staged] ROOT` runs as the store's `pre-commit` hook and `--no-verify` bypasses it locally; `--status any` and `--include-inbox` widen search; `code-search --verify-content` proves freshness; `--db` also moves companion logs and worker files beside the database; run `memcontinuum-update.sh --apply` for multiple-root hook coverage; an explicit `--store` wins, and a store-name conflict can exit 17.
+    Technical: `memlint.py --against-ref REF [--staged] ROOT` runs as the store's `pre-commit` hook and `--no-verify` bypasses it locally; `--status any` and `--include-inbox` widen search; `code-search --verify-content` proves freshness; `--db` also moves companion logs and worker files beside the database; run `memcontinuum-update.sh --apply` for multiple-root hook coverage; an explicit `--store` wins, and a store-name conflict can exit 17; a `decision:` marker under `--code-root` must name an active constraint or hold by exact `path#symbol` or it is an error, a missing marker on such a link is a warning, and a symbol absent from the file is an error; `--debug` re-raises instead of degrading, for local debugging; `for-path --with-chain-text` folds the chain text into the JSON answer.
 
 ## [0.2.0rc3] — 2026-09-04
 
@@ -285,7 +285,7 @@ The installer and the decide script now record a project's paths in physical for
 
 ## [0.2.0rc1] — unreleased
 
-Code indexing gained several code roots per project, per-file provenance status, a preflight report, a one-shot heal on search, and a linter that checks a reference against every root. A missing decision index is never created by a read, an embedding reindex backfills vectors that no longer match their record, and a stale vector is excluded from ranking until then. Authority tiers and invariants are now enforced, a code reference matches by path segment, an empty reference matches nothing, and individual links are retrievable on their own. The pre-edit hook now has a time bound and answers that retrieval did not complete rather than staying silent. Search-recipe and schema documentation was corrected, and continuous integration, a dependency lockfile and this changelog start here.
+Code indexing gained several code roots per project, per-file provenance status, a preflight report, a one-shot heal on search, and a linter that checks a reference against every root. Every read now names a missing decision index instead of answering "no decisions" from an empty store; an embedding reindex backfills vectors that no longer match their record, and a stale vector is excluded from ranking until then. Authority tiers and invariants are now enforced, a code reference matches by path segment, an empty reference matches nothing, and individual links are retrievable on their own. The pre-edit hook now has a time bound and answers that retrieval did not complete rather than staying silent. Search-recipe and schema documentation was corrected, and continuous integration, a dependency lockfile and this changelog start here.
 
     Technical: per-file status is `ok`, `partial`, `failed` or `not-indexed`; an invariant blocks only when owner-confirmed or backed by validated evidence; an empty or fragment-only reference is a linter error.
 
