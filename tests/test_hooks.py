@@ -1913,19 +1913,14 @@ class TestPreEditChainSearchFallback(unittest.TestCase):
         )
         self.assertEqual(status.stdout.strip(), "", "the store must never be written by the fallback")
 
-    def test_for_path_miss_still_migrates_before_the_fallback_runs(self):
-        """Re-gate round 3, MAJOR 2, exercised end to end through the real
-        hook (not just memidx.py directly): a schema behind the current
-        generation, ALSO missing its db_meta project stamp, gets that
-        stamp written by this SAME hook run's own earlier `for-path`
-        lookup (unchanged, pre-existing, correct behavior -- a match must
-        keep seeing a migrated schema) -- the sha genuinely changes --
-        while the fallback's own `--read-only` search, reached moments
-        later in the SAME run, still correctly refuses with reason=
-        index-needs-migration (the project-stamp guard and the
-        generation-number stamp are different db_meta keys; only a real
-        `reindex` bumps the latter, so for-path's own migration guards
-        never silently paper over a stale generation number)."""
+    def test_for_path_on_an_outdated_index_refuses_and_never_writes(self):
+        """TOP-0137 L13, exercised end to end through the real hook: a
+        schema behind the current generation (and missing its db_meta
+        project stamp) used to be migrated/stamped by for-path's own rw
+        open. The pre-edit route is read-only now: the db sha does NOT
+        change, the run is fail-open (exit 0, empty stdout), and the log
+        carries ONE outcome line -- `index-needs-migration` -- with no
+        search-fallback line (the fallback would refuse the same state)."""
         db_path = Path(self.memtool_home) / f"{self.project}.sqlite"
         conn = sqlite3.connect(str(db_path))
         conn.execute("UPDATE db_meta SET value='1' WHERE key='index_generation'")
@@ -1940,17 +1935,26 @@ class TestPreEditChainSearchFallback(unittest.TestCase):
         self.assertEqual(proc.stdout.strip(), "")
 
         sha_after = hashlib.sha256(db_path.read_bytes()).hexdigest()
-        self.assertNotEqual(sha_before, sha_after, "for-path's own rw open must still stamp the project row")
+        self.assertEqual(sha_before, sha_after, "the pre-edit route must never write the index")
 
         conn = sqlite3.connect(str(db_path))
         row = conn.execute("SELECT value FROM db_meta WHERE key='project'").fetchone()
         conn.close()
-        self.assertEqual(row[0], self.project)
+        self.assertIsNone(row, "for-path must not re-stamp the project row")
 
         log_text = (Path(self.memtool_home) / "hook.log").read_text()
         line = self._last_outcome_line(log_text)
-        self.assertIn("outcome=search-fallback-empty", line)
-        self.assertIn("reason=index-needs-migration", line)
+        self.assertIn("outcome=index-needs-migration", line)
+        self.assertNotIn("search-fallback", log_text)
+
+        result = subprocess.run(
+            [VENV_PYTHON, str(TOOLS_DIR / "memidx.py"), "stats",
+             "--home", self.memtool_home, "--project", self.project, "--json"],
+            capture_output=True, text=True, env=clean_env(),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        outcomes = json.loads(result.stdout).get("pre_edit", {}).get("outcomes", {})
+        self.assertIn("index-needs-migration", outcomes)
 
     @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
     def test_search_crash_names_search_failed_rc_not_no_hits(self):

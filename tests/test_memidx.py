@@ -1631,6 +1631,108 @@ class TestF1DecisionIndexState(unittest.TestCase):
                 json.loads(buf.getvalue()), {"state": "stale", "results": [], "chain_text": ""}
             )
 
+    def _legacy_for_path_db(self, td):
+        """A decision index the ordinary rw opener WOULD migrate (the
+        `index_errors` table dropped), plus its content hash."""
+        db = Path(td) / "legacy.sqlite"
+        reindex(FIXTURES / "schema_filters", db, no_embed=True)
+        conn = sqlite3.connect(str(db))
+        conn.execute("DROP TABLE index_errors")
+        conn.commit()
+        conn.close()
+        return db, hashlib.sha256(db.read_bytes()).hexdigest()
+
+    def test_for_path_upgrade_required_refuses_with_rc5_and_writes_nothing(self):
+        """TOP-0137 L13: for-path never migrates. An upgrade-required
+        index (rc 5) gets one stderr line and the named JSON object --
+        identical with and without --with-chain-text -- and the db file
+        is byte-for-byte unchanged. Control: the ordinary rw open on the
+        same file does write (the fixture discriminates)."""
+        for with_chain_text in (False, True):
+            with self.subTest(with_chain_text=with_chain_text), tempfile.TemporaryDirectory() as td:
+                db, sha_before = self._legacy_for_path_db(td)
+                for _ in range(3):
+                    buf_out, buf_err = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                        rc = memidx.cmd_for_path(ns(project=memidx.DEFAULT_PROJECT, db=str(db),
+                                                     file_path="src/x.py", json=True,
+                                                     with_chain_text=with_chain_text))
+                    self.assertEqual(rc, 5)
+                    self.assertEqual(json.loads(buf_out.getvalue()), {
+                        "state": "upgrade-required", "reason": "index-needs-migration", "candidates": [],
+                    })
+                    self.assertEqual(
+                        buf_err.getvalue().strip(),
+                        "for-path: the decision index needs migration (state=upgrade-required) -- "
+                        "read-only route refuses to write it; run `reindex --root <path>`",
+                    )
+                self.assertEqual(sha_before, hashlib.sha256(db.read_bytes()).hexdigest(),
+                                 "for-path must never migrate the index")
+                conn = memidx.open_db_noncreating(db, project=memidx.DEFAULT_PROJECT)
+                conn.close()
+                self.assertNotEqual(sha_before, hashlib.sha256(db.read_bytes()).hexdigest(),
+                                    "control: the rw opener must write on this fixture")
+
+    def test_for_path_upgrade_required_plain_mode_prints_nothing_on_stdout(self):
+        with tempfile.TemporaryDirectory() as td:
+            db, sha_before = self._legacy_for_path_db(td)
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = memidx.cmd_for_path(ns(project=memidx.DEFAULT_PROJECT, db=str(db),
+                                             file_path="src/x.py", json=False))
+            self.assertEqual(rc, 5)
+            self.assertEqual(buf_out.getvalue(), "")
+            self.assertIn("needs migration (state=upgrade-required)", buf_err.getvalue())
+            self.assertEqual(sha_before, hashlib.sha256(db.read_bytes()).hexdigest())
+
+    def test_for_path_stale_root_is_still_served_with_state(self):
+        """`stale` keeps proceeding: rc 0 and the named state in the
+        --json --with-chain-text object, exactly as before the read-only
+        opener -- and the db is not written."""
+        with tempfile.TemporaryDirectory() as td:
+            root = FIXTURES_COPY_OF("schema_filters", td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+            (root / "new-topic.md").write_text(
+                "---\ntype: topic\nid: TOP-NEW\ntitle: New\nlinks: []\n---\nBody.\n"
+            )
+            sha_before = hashlib.sha256(db.read_bytes()).hexdigest()
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = memidx.cmd_for_path(ns(project=memidx.DEFAULT_PROJECT, db=str(db), root=str(root),
+                                             file_path="src/x.py", json=True, with_chain_text=True))
+            self.assertEqual(rc, 0)
+            payload = json.loads(buf_out.getvalue())
+            self.assertEqual(payload["state"], "stale")
+            self.assertIn("results", payload)
+            self.assertIn("index is stale", buf_err.getvalue())
+            self.assertEqual(sha_before, hashlib.sha256(db.read_bytes()).hexdigest())
+
+    def test_for_path_never_reaches_the_rw_opener_or_the_migration_guards(self):
+        """TOP-0137 L13 tripwire: on a current index, neither
+        open_db_noncreating nor _run_decision_migration_guards nor
+        enforce_project_isolation may be called from for-path's reachable
+        code -- a regression back to the rw opener raises here."""
+        def boom(*a, **kw):
+            raise AssertionError("for-path reached a writing opener")
+
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "idx.sqlite"
+            reindex(FIXTURES / "schema_filters", db, no_embed=True)
+            sha_before = hashlib.sha256(db.read_bytes()).hexdigest()
+            for as_json in (True, False):
+                with self.subTest(json=as_json):
+                    buf_out, buf_err = io.StringIO(), io.StringIO()
+                    with mock.patch.object(memidx, "open_db_noncreating", side_effect=boom), \
+                         mock.patch.object(memidx, "_run_decision_migration_guards", side_effect=boom), \
+                         mock.patch.object(memidx, "enforce_project_isolation", side_effect=boom), \
+                         contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                        rc = memidx.cmd_for_path(ns(project=memidx.DEFAULT_PROJECT, db=str(db),
+                                                     file_path="src/x.py", json=as_json,
+                                                     with_chain_text=as_json))
+                    self.assertEqual(rc, 0, buf_err.getvalue())
+            self.assertEqual(sha_before, hashlib.sha256(db.read_bytes()).hexdigest())
+
     def test_unmapped_coverage_status_per_state(self):
         cases = {
             "missing": (lambda db, root: None, "uninitialized", 1),
