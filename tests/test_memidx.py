@@ -1520,17 +1520,17 @@ class TestF1DecisionIndexState(unittest.TestCase):
 
     def test_for_path_index_error_fails_open_exits_4(self):
         # A hook-facing reader must fail open on a sqlite3.OperationalError
-        # even after decision_index_state already confirmed a usable state
+        # even after decision_index_state_readonly already confirmed a usable state
         # -- the corrupted/broken schema is only discovered on the query
         # this function makes AFTER that check. A call-count side effect on
-        # open_db_noncreating avoids needing to know cmd_for_path's exact
-        # SQL: the first call (inside decision_index_state) is real and
+        # open_db_readonly avoids needing to know cmd_for_path's exact
+        # SQL: the first call (inside decision_index_state_readonly) is real and
         # succeeds; every call after that returns a connection whose
         # execute() always raises.
         with tempfile.TemporaryDirectory() as td:
             db = Path(td) / "idx.sqlite"
             reindex(FIXTURES / "schema_filters", db, no_embed=True)
-            real_open = memidx.open_db_noncreating
+            real_open = memidx.open_db_readonly
             calls = {"n": 0}
 
             class _BrokenConn:
@@ -1545,7 +1545,7 @@ class TestF1DecisionIndexState(unittest.TestCase):
                 return real_open(*a, **kw) if calls["n"] == 1 else _BrokenConn()
 
             buf = io.StringIO()
-            with mock.patch.object(memidx, "open_db_noncreating", side_effect=flaky_open), \
+            with mock.patch.object(memidx, "open_db_readonly", side_effect=flaky_open), \
                  contextlib.redirect_stdout(buf):
                 rc = memidx.cmd_for_path(ns(project=memidx.DEFAULT_PROJECT, db=str(db),
                                              file_path="src/x.py", json=True))
@@ -1564,7 +1564,7 @@ class TestF1DecisionIndexState(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             db = Path(td) / "idx.sqlite"
             reindex(FIXTURES / "schema_filters", db, no_embed=True)
-            real_open = memidx.open_db_noncreating
+            real_open = memidx.open_db_readonly
             calls = {"n": 0}
 
             class _BrokenConn:
@@ -1579,7 +1579,7 @@ class TestF1DecisionIndexState(unittest.TestCase):
                 return real_open(*a, **kw) if calls["n"] == 1 else _BrokenConn()
 
             buf = io.StringIO()
-            with mock.patch.object(memidx, "open_db_noncreating", side_effect=flaky_open), \
+            with mock.patch.object(memidx, "open_db_readonly", side_effect=flaky_open), \
                  contextlib.redirect_stdout(buf):
                 rc = memidx.cmd_for_path(ns(project=memidx.DEFAULT_PROJECT, db=str(db),
                                              file_path="src/x.py", json=True,
@@ -1606,7 +1606,7 @@ class TestF1DecisionIndexState(unittest.TestCase):
                 memidx.decision_index_state(db, memidx.DEFAULT_PROJECT, root=root), "stale"
             )
 
-            real_open = memidx.open_db_noncreating
+            real_open = memidx.open_db_readonly
             calls = {"n": 0}
 
             class _BrokenConn:
@@ -1621,7 +1621,7 @@ class TestF1DecisionIndexState(unittest.TestCase):
                 return real_open(*a, **kw) if calls["n"] == 1 else _BrokenConn()
 
             buf = io.StringIO()
-            with mock.patch.object(memidx, "open_db_noncreating", side_effect=flaky_open), \
+            with mock.patch.object(memidx, "open_db_readonly", side_effect=flaky_open), \
                  contextlib.redirect_stdout(buf):
                 rc = memidx.cmd_for_path(ns(project=memidx.DEFAULT_PROJECT, db=str(db), root=str(root),
                                              file_path="src/x.py", json=True,

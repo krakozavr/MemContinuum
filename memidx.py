@@ -5191,18 +5191,23 @@ def cmd_for_path(args) -> int:
     """F1 (ruling 68): 2 stays argparse's own reserved usage-error code; 3 =
     missing/uninitialized (collapsed -- no positive match worth attempting,
     including the TOCTOU race where the file vanishes between the state
-    check and the open below); 4 = index-error (a schema a migration guard
-    should already have fixed but didn't -- ruling 65's belt-and-suspenders
-    catch). upgrade-required/current/stale/quarantined all proceed normally;
-    a positive match off a non-current index stays usable."""
+    check and the open below); 4 = index-error (a schema the read-only
+    queries below cannot read -- ruling 65's belt-and-suspenders catch);
+    upgrade-required/current/stale/quarantined all proceed normally; a positive match
+    off a non-current index stays usable.
+
+    Read-only by construction (TOP-0137 L13): the state check and the
+    query connection both go through open_db_readonly (SQLite mode=ro,
+    no migration guard ever runs), so this route writes zero bytes to the
+    decision index."""
     db_path = resolve_db_path(args)
     # Final-fix-wave item 2: see cmd_search's identical comment.
     root = Path(args.root).resolve() if getattr(args, "root", None) else None
-    state = decision_index_state(db_path, args.project, root=root)
+    state = decision_index_state_readonly(db_path, args.project, root=root)
     if state in ("missing", "uninitialized"):
         return _for_path_missing_reply(args, state)
     try:
-        conn = open_db_noncreating(db_path, project=args.project)
+        conn = open_db_readonly(db_path)
         if conn is None:
             # TOCTOU: the file vanished between the state check above and
             # this open -- the same outcome as "missing" was just found.
