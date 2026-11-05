@@ -6012,8 +6012,9 @@ class TestStandingCommand(unittest.TestCase):
             self.assertEqual(json.loads(out)["state"], "uninitialized")
 
     def test_upgrade_required_index_refuses(self):
-        """Unlike search/chain/for-path/why/drift (which proceed with a
-        warning on upgrade-required/stale/quarantined), `standing` refuses
+        """Unlike search/chain/why/drift (which proceed with a warning on
+        upgrade-required/stale/quarantined; for-path refuses upgrade-required
+        with exit 5), `standing` refuses
         on every one of them -- this is the one deliberate deviation from
         ruling 68's "a positive match off a degraded index is still real
         evidence" default."""

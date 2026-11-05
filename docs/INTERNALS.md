@@ -3096,9 +3096,10 @@ cost of an `outside-roots` run: about 89 ms p95 over 20 runs, the whole hook
 including the watchdog launcher (no `memidx.py` process).
 
 **A positive match off a non-`current` index stays usable; a negative claim
-does not.** `upgrade-required`, `stale`, and `quarantined` all warn and
-proceed — a hit found there is real evidence, not withheld just because the
-index is not perfectly fresh or is skipping some other, unrelated malformed
+does not.** `stale` and `quarantined` warn and proceed, and
+`upgrade-required` proceeds for every reader except `for-path`, which refuses
+with exit 5 (it is a read-only route) — a hit found there is real evidence,
+not withheld just because the index is not perfectly fresh or is skipping some other, unrelated malformed
 record. What must never be trusted off anything but `current` is the
 *absence* of a match: `unmapped`'s `coverage_status` collapses
 `missing`/`uninitialized` to `"uninitialized"`, `upgrade-required` to its own

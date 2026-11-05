@@ -6689,10 +6689,11 @@ def cmd_standing(args) -> int:
     open can never write a byte, so this refusal is not merely a courtesy:
     it is the only way this command keeps that guarantee.
 
-    Unlike every other reader here (search/chain/for-path/why/drift), which
-    proceed with a stderr warning on `upgrade-required`/`stale`/
-    `quarantined` (ruling 68: "a positive match off a degraded index is
-    still real evidence"), `standing` refuses on EVERY state but `current`
+    Unlike every other reader here (search/chain/why/drift), which proceed
+    with a stderr warning on `upgrade-required`/`stale`/`quarantined`
+    (ruling 68: "a positive match off a degraded index is still real
+    evidence"; `for-path` is the one exception, refusing `upgrade-required`
+    with exit 5 because it is read-only, TOP-0137 L13), `standing` refuses on EVERY state but `current`
     -- `missing`, `uninitialized`, `upgrade-required` (behind OR ahead of
     this engine's own generation -- see `_classify_index_state`'s ping-pong
     guard), `stale`, and `quarantined` alike. A stale STANDING digest risks
