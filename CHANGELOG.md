@@ -1,143 +1,108 @@
 # Changelog
 
-## [Unreleased]
+## [0.5.0] — 2026-11-05
 
-### Hygiene
-- Docs only: SCHEMA no longer says a `project` change can drop a topic from the
-  standing digest. The project is set when the index is built, not read from the
-  file, so only a change of `type` can.
-- Docs only: SCHEMA and INTERNALS now state the append-only guard's known limit.
-  When the earlier version of a record could not be parsed cleanly and the new
-  one can, the edit counts as a repair, and a removed link, `anchors:` block or
-  `standing_marks:` block is not caught (only a note is printed).
-- `memidx.py mark-standing --remove` now finds a `standing:` item written with
-  YAML quoting (`'it''s'`, `"a\"b"`) by the id it stands for, instead of
-  refusing; other items in the list are left exactly as written.
-- `memlint.py --code-root` no longer reports a `decision: TOP-... Ln` example
-  that a Markdown file shows inside a fenced block or an inline code span
-  (docs/SCHEMA.md did); markers in a Markdown file's prose are still checked.
-- Every pre-edit line in `hook.log` now carries `session=` (`-` when the hook
-  payload had none), and a line that delivered topics also carries `exposure=`,
-  a short stable name for that delivery (session, file and topics) that later
-  lines can point back to.
-- `memidx.py code-search` now appends one line to `hook.log`
-  (`code-search outcome=ok|no-hits|error hits=N q=... project=...`), and
-  `memidx.py stats` reports the calls in a `code_search` block. A logging
-  failure never changes the search's output or exit code.
-- Internal cleanup in `memidx.py`: every place that resolved `MEMCONTINUUM_HOME`
-  now calls the one `memcontinuum_home()` helper, and the plain
-  SHA-256-of-bytes calls use the one `sha256_hex()`. No behaviour change.
-- The rendered rules template now carries the duplication rule: a brief for a
-  dispatched agent says to find the existing implementation and name it, a gate
-  prompt asks whether the change duplicated anything, and both answers go in the
-  gate record. Wired repositories pick it up on the next updater run.
+MemContinuum now tells you when code has changed since a decision was bound to
+it. Changes to the standing decisions delivered at every session start must
+leave an audit record. Reviewers and agents can be handed the decision records
+themselves, each with its authority.
 
-### Binding
-- Topics gain an `anchors:` frontmatter key: the SHA-256 of the code a
-  `code_refs` entry named when the binding was captured, with the capture kind
-  (`ruling`, `bind`, `backfill`), date, commit and worktree state. `memlint.py`
-  validates the rows and `--against-ref` freezes them like links. New
-  `memidx.py bind TOP-xxxx REF` adds the reference and its anchor by inserting
-  lines into the topic file (`--dry-run` prints the exact diff; nothing is
-  committed for you).
-- New `memidx.py propose-bindings --session ID` prints, from a session's
-  search fallbacks and edit ledger, which edited files a topic may want to
-  bind, plus separately labelled filing hints for unmapped files; it never
-  writes a reference (`--write-inbox` drops the text in the store's inbox).
-- New `memidx.py anchor-backfill` captures a late baseline for references that
-  were bound before anchors existed, hashing the file as it is now and
-  labelling the row `backfill` (`--dry-run` prints the diff first). Rerunning
-  it changes nothing.
-- The pre-edit hook now says when a bound file or symbol changed since its
-  anchor was captured: one line after the topic header (`Anchor changed since
-  capture (bind): src/foo.py`), or `Anchor missing` / `Anchor never captured` /
-  `Anchor not checked` when the check could not be made. It compares the file
-  being edited, reads the code index read-only, takes at most 300 ms, and
-  never alters a ruling's status or authority.
-- The session-start standing digest is followed by one summary line when a
-  topic with standing links has a bound file or symbol that changed since
-  capture (`Anchor changed since capture: N.`; else `Anchor missing: N.`, else
-  `Anchor never captured: N.`). It needs a configured code root, is dropped
-  before any standing line when the size cap bites, and never alters the
-  digest or its hash.
-- `memidx.py context-pack --code-root DIR` adds one anchor line above each
-  included topic's chain (changed, missing, never captured or not checked),
-  inside the pack hash; under a tight size cap the least important lines go
-  first and no topic is dropped to make room for one. Without `--code-root`
-  the pack is unchanged.
+### See when code has changed beneath a decision
 
-### Standing
-- A topic's `standing:` list is now under the store's pre-commit guard. Every
-  change to it leaves a dated, attributed row in a new frozen `standing_marks:`
-  block on the same topic (who, when, on whose word; owner authority only).
-  Rows are an audit: they are never delivered, never indexed and add nothing
-  to the standing digest. `memlint.py --against-ref` refuses a commit whose
-  `standing:` change has no matching new row, whose new rows match no change,
-  or that touches a recorded row; it also refuses a reordering of existing
-  links, and a `current:` that moves without the newest active link moving.
-  Topics marked before this change have no rows and are not flagged.
-- New `memidx.py mark-standing TOP-xxxx Ln --add|--remove --authority ...
-  --source ... --why ...` makes the change and writes the row by inserting
-  lines into the topic file (`--dry-run` prints the exact diff; nothing is
-  committed for you).
-- `memlint.py` now reports a `standing:` list that names the same link twice.
+Before an edit, MemContinuum now says when a bound file or symbol differs from
+the baseline captured when the binding was made. The same note can appear at
+session start and in reviewer context packs. Missing, never-captured and
+unchecked baselines are labelled as such. A warning never changes a decision's
+status or authority.
 
-### Retrieval
-- New `memidx.py context-pack FILE... [--topic ID] [--query WORDS] [--blind]`
-  prints one paste-ready block of decision records for a brief to an external
-  reviewer or a dispatched agent: the standing digest, then the chains of
-  every topic bound to the named files, each with its authority and store
-  path, under a size cap that drops whole topics and names them. It ends in
-  a `pack sha256=... bytes=...` line over the text above it, so a gate
-  record can cite exactly what was sent; `--blind` prints only a fixed
-  notice and opens no index. Read-only; no hook or search behaviour changes.
-- The rendered rules file now tells every wired repository to open reviewer
-  and agent briefs with the `context-pack` output; `--apply`
-  re-renders it because the template is a render input.
+    Technical: `anchors:` stores the captured hashes; session start needs a configured code root, and context packs include anchor lines when given `--code-root DIR`.
 
-### Hooks
-- Decision retrieval now follows the repository, not the code-index roots.
-  `repo-init.sh` renders the pre-edit filter and `MEMCONTINUUM_STRIP_PREFIX`
-  for the git toplevel of each `--code-root` (the root itself outside git),
-  so a root narrower than the checkout (`Sources`, `Tests`) no longer hides
-  edits in in-root worktrees from retrieval; code roots scope only the index,
-  the new-file nudge and the ledger. A worktree edit under a narrow root is
-  recorded at its real path (a repository-level file there ends
-  `out-of-scope`) instead of being remapped under the root. When a root is
-  not inside a git work tree (or git cannot say), `repo-init.sh` falls back
-  to the root itself and prints a `note: retrieval root for ...` line saying
-  worktrees outside it get no retrieval. `repo-init.sh` is a fingerprint
-  input, so every wired row shows as `stale` until `memcontinuum-update.sh
-  --apply` re-renders it, even where the filters and prefix are unchanged
-  (the embedded render stamp moves).
-- The worktree remap prints its main-checkout path in the configured root's
-  spelling again. On macOS a temp or home directory behind a symlink
-  (`/var` -> `/private/var`) made the remapped path real-path spelled, so it
-  no longer matched `MEMCONTINUUM_STRIP_PREFIX` or the hook's cwd and the
-  fallback search was queried on the whole machine path. Where the root's
-  configured tail differs from its real tail (a symlink inside the
-  repository) the real-path spelling is still printed.
-- The pre-edit lookup can no longer modify the decision index; an outdated
-  index now gets a one-line refusal until the next store commit reindexes it.
-  The hook logs it as `outcome=index-needs-migration` and, as always, never
-  blocks the edit.
-  Technical: `memidx.py for-path` opens the index `mode=ro` (no migration
-  guard, no project stamp) and exits 5 with `{"state": "upgrade-required",
-  "reason": "index-needs-migration"}` on an `upgrade-required` index;
-  `pre-edit-chain.sh` maps rc 5 to that outcome with no search fallback.
-- A worktree checked out next to the repository (`git worktree add ../x`) now
-  gets the same decision lookup as the main checkout, and an edit under the
-  repository's parent folder that belongs to no wired project is declined
-  without a search (logged as `outcome=outside-roots`). Run
-  `memcontinuum-update.sh --apply` to re-render the wiring; the parent folder
-  is not watched when it is `/` or your home directory (the installer prints a
-  note).
-  Technical: `repo-init.sh` renders the pre-edit filter pair for each
-  retrieval root's parent directory too (`Edit(//<parent>/**)`, same command;
-  `MEMCONTINUUM_STRIP_PREFIX` unchanged); `pre-edit-chain.sh` settles a path
-  under no root before any `for-path` query with `mc_remap_worktree_gated`:
-  remapped worktree continues, otherwise `worktree-unwired`,
-  `worktree-unresolved` or the new `outside-roots`, never a search.
+### Connect decisions to code with a reviewed change
+
+You can now capture a code baseline at the moment you add a reference to a
+decision. A proposal command suggests, from a session's edits, which files a
+topic may want to bind, and leaves it to you to review and apply. References
+bound before baselines existed can receive one too, labelled as captured now.
+
+    Technical: `memidx.py bind TOP-xxxx REF` and `anchor-backfill` support `--dry-run`, and nothing is committed for you; `propose-bindings --session ID` prints suggestions, with optional `--write-inbox`.
+
+### Know who changed the standing decisions
+
+Adding or removing a standing decision now records who changed it, when, on
+whose word and why. The store's commit guard refuses a change without a
+matching record, an edit to a recorded row, and a reordering of existing links.
+The rows are never delivered or indexed and add nothing to the session digest.
+The linter also reports a standing list that names the same link twice.
+
+    Technical: `memidx.py mark-standing TOP-xxxx Ln --add|--remove --authority ... --source ... --why ...` updates `standing:` and the frozen `standing_marks:` rows; `memlint.py --against-ref` checks the change.
+
+### Give reviewers and agents the actual decisions
+
+A new command prints one paste-ready block holding the standing decisions and
+the decision chains bound to the files being reviewed, each with its authority
+and store path. If the size limit leaves a topic out, the pack names it, and a
+fingerprint identifies exactly what was sent. The rendered repository rules now
+tell reviewer and agent briefs to open with this pack.
+
+    Technical: `memidx.py context-pack FILE... [--topic ID] [--query WORDS]` ends with a SHA-256 `pack sha256=` line; `--blind` prints a fixed notice and opens no index.
+
+### Keep decision lookup working across the checkout
+
+Indexing only a subdirectory no longer limits decision lookup to that
+subdirectory, so edits in worktrees inside the checkout still retrieve their
+decisions while the code index keeps its configured scope. A worktree edit
+under a narrow root is now recorded at its real path. Lookups that were missed
+on macOS when a configured directory is reached through a symlink now work.
+
+    Technical: `repo-init.sh` renders the pre-edit filter and `MEMCONTINUUM_STRIP_PREFIX` for the Git toplevel of each `--code-root`, falling back to the root itself with a `note: retrieval root for ...` line when Git cannot say.
+
+### Look up decisions from a sibling worktree, and never write the index before an edit
+
+Decision lookup before an edit can no longer modify the index: an outdated
+index gets a one-line refusal until the next store commit reindexes it, and the
+edit is never blocked. A worktree checked out next to the repository
+(`git worktree add ../x`) now gets the same lookup as the main checkout, and an
+edit under the repository's parent folder that belongs to no wired project is
+declined without a search. The parent folder is not watched when it is `/` or
+your home directory; the installer prints a note.
+
+    Technical: `memidx.py for-path` opens the index read-only and exits 5 on `upgrade-required` (logged `index-needs-migration`); `repo-init.sh` renders the pre-edit pair for each retrieval root's parent; outcomes `worktree-unwired`, `worktree-unresolved` and `outside-roots` never run a search.
+
+### See which session received which decisions
+
+Every pre-edit line in the usage log now names its session, and a line that
+delivered topics also carries a short stable name for that delivery, so later
+lines can point back to it. Code searches now leave a log line too and appear
+in the statistics; a logging failure never changes a search's result. The
+rendered rules file also gains a duplication rule: a brief tells a dispatched
+agent to find and name the existing implementation, and a gate asks whether the
+change duplicated anything.
+
+    Technical: `hook.log` pre-edit lines gain `session=` (`-` when none) and `exposure=`; `memidx.py code-search` appends `code-search outcome=ok|no-hits|error hits=N q=... project=...`, reported in the `code_search` block of `memidx.py stats`.
+
+### Small fixes
+
+`memlint.py --code-root` no longer reports a marker example shown inside a
+fenced block or an inline code span of a Markdown file. `mark-standing --remove`
+now finds a `standing:` item written with YAML quoting. The documentation now
+states the append-only guard's known limit: when the earlier version of a
+record could not be parsed and the new one can, the edit counts as a repair, and
+a removed link, `anchors:` block or `standing_marks:` block is not caught. The
+schema reference no longer says a `project` change can drop a topic from the
+standing digest; only a change of `type` can. An internal cleanup in
+`memidx.py` changes no behaviour.
+
+    Technical: markers in a Markdown file's prose are still checked; `mark-standing --remove` leaves other list items exactly as written.
+
+### Notes for upgraders
+
+Run `memcontinuum-update.sh --apply` once. It re-renders the wiring (the
+retrieval root and the parent-folder filters) and the rules file, and wired
+repositories show as stale until then. Topics marked as standing before this
+release have no historical mark rows and are not flagged for that absence, so
+no backfill is needed.
+
+    Technical: Run `memcontinuum-update.sh --apply`; existing standing marks need no backfill.
 
 ## [0.4.0] — 2026-10-31
 
