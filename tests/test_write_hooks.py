@@ -2098,6 +2098,20 @@ class TestMutationSurface(HookTestBase):
             self.assertIn("worktrees=0", line)
             self.assertIn("timeouts=0", line)
 
+    def test_overshooting_budget_after_baseline_still_writes_state(self):
+        session_id = "s-wt-budget"
+        wt = self._add_worktree(Path(self.td) / "code-wt-budget", "wt-budget")
+        env = self._worktree_env()
+        run_script(LEDGER_HOOK, self.bash_payload(session_id), env)  # baselines
+        for i in range(6):
+            _write(wt / "src" / ("f%d.py" % i), "# %d\n" % i)
+        tiny = dict(env, MEMCONTINUUM_SHELL_DIFF_BUDGET="0.001")
+        proc, _ = run_script(LEDGER_HOOK, self.bash_payload(session_id), tiny)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(self.state_file(session_id).exists())
+        m = re.search(r" timeouts=(\d+) ", self._summary_lines()[-1])
+        self.assertGreaterEqual(int(m.group(1)), 1)
+
     def test_summary_line_ends_with_worktrees_and_session(self):
         session_id = "s-summary-fields"
         run_script(LEDGER_HOOK, self.bash_payload(session_id), self.base_env())

@@ -543,6 +543,15 @@ def scan_tree(scan_dir, kind, record_root, remap):
         shell_baseline[scan_dir] = root_baseline
 
     for p in dirty:
+        if time.monotonic() - start_all > total_budget:
+            # INC-0134 round 1: hashing after the baseline is budgeted too,
+            # or a long worktree scan outlives the watchdog and loses the
+            # state write (and the root rows of this call). Rows appended so
+            # far stay; the rest is re-compared next call (the (path, sha)
+            # dedupe keeps appended rows from repeating).
+            ctr["timeouts"] += 1
+            timed_out.add(scan_dir)
+            return
         full = os.path.normpath(os.path.join(scan_dir, p))
         # INC-0134: a linked-worktree scan files the row under the
         # root-equivalent path (what unmapped / for-path consume) and keeps
