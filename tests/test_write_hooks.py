@@ -2033,8 +2033,8 @@ class TestMutationSurface(HookTestBase):
         )
         log = (self.home / "hook.log").read_text()
         self.assertIn(
-            "ledger outcome=appended kind=code source=shell-diff file=%s worktree=%s"
-            % (main_path, wt),
+            "ledger outcome=appended kind=code source=shell-diff worktree=%s file=%s"
+            % (wt, main_path),
             log,
         )
         summary = self._summary_lines()[-1]

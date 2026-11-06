@@ -588,9 +588,11 @@ def scan_tree(scan_dir, kind, record_root, remap):
         ctr["appended"] += 1
         state["last_growth_turn"] = state.get("user_turn_count", 0)
         state["last_growth_ts"] = now
+        # worktree= goes BEFORE file=: everything after file= is the path.
         log_line(
-            "ledger outcome=appended kind=" + kind + " source=shell-diff file=" + row_path
+            "ledger outcome=appended kind=" + kind + " source=shell-diff"
             + ((" worktree=" + scan_dir) if remap else "")
+            + " file=" + row_path
         )
 
 
