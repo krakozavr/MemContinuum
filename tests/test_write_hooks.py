@@ -2080,7 +2080,15 @@ class TestMutationSurface(HookTestBase):
     def test_pruned_worktree_is_skipped(self):
         session_id = "s-wt-pruned"
         wt = self._add_worktree(Path(self.td) / "code-wt-gone", "wt-gone")
-        shutil.rmtree(wt)
+        # Keep the directory, delete its .git file: git then reports the
+        # worktree as prunable while os.path.isdir still says yes.
+        (wt / ".git").unlink()
+        listing = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"], cwd=self.code_root,
+            capture_output=True, text=True, check=True,
+        ).stdout
+        self.assertIn("prunable", listing)
+        self.assertTrue(wt.is_dir())
         env = self._worktree_env()
         for _ in range(2):
             proc, _ = run_script(LEDGER_HOOK, self.bash_payload(session_id), env)
@@ -2145,6 +2153,23 @@ class TestMutationSurface(HookTestBase):
         self.assertEqual(lines[0].split(" project=")[-1], "hooktest")
         self.assertEqual(lines[0].count(" project="), 1)
         self.assertIn("%20project%3Dother", lines[0])
+
+    def test_readded_worktree_path_starts_from_a_fresh_baseline(self):
+        session_id = "s-wt-readd"
+        path = Path(self.td) / "code-wt-readd"
+        wt = self._add_worktree(path, "wt-readd1")
+        env = self._worktree_env()
+        run_script(LEDGER_HOOK, self.bash_payload(session_id), env)  # baselines
+        subprocess.run(["git", "worktree", "remove", "--force", str(wt)], cwd=self.code_root, check=True)
+        run_script(LEDGER_HOOK, self.bash_payload(session_id), env)  # key dropped
+        wt = self._add_worktree(path, "wt-readd2")
+        _write(wt / "src" / "mapped.py", "# different content on first sight\n")
+        run_script(LEDGER_HOOK, self.bash_payload(session_id), env)
+        self.assertIn("appended=0", self._summary_lines()[-1])
+        self.assertEqual(self.load_state(session_id).get("ledger", []), [])
+        _write(wt / "src" / "mapped.py", "# edited after the fresh baseline\n")
+        run_script(LEDGER_HOOK, self.bash_payload(session_id), env)
+        self.assertIn("appended=1", self._summary_lines()[-1])
 
     def test_summary_line_ends_with_worktrees_and_session(self):
         session_id = "s-summary-fields"

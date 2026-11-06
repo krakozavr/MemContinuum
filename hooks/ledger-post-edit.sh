@@ -628,17 +628,21 @@ for root, kind in roots:
 worktrees_scanned = 0
 worktrees_over_cap = 0
 configured_real = set(r for r, _k in roots)
+seen_wts = set()
+enum_ok = True
 for root, kind in roots:
     if kind != "code" or not os.path.exists(os.path.join(root, ".git")):
         continue
     if root in timed_out:
         # The root own status already ran out of budget (already counted);
         # do not spend a second wait on its worktree listing.
+        enum_ok = False
         continue
     try:
         remaining = total_budget - (time.monotonic() - start_all)
         if remaining <= 0:
             ctr["timeouts"] += 1
+            enum_ok = False
             continue
         # Main-checkout rule (round 1 S2): git-dir and git-common-dir name
         # the same directory. The first worktree stanza is NOT compared with
@@ -652,6 +656,7 @@ for root, kind in roots:
         gd_lines = gd.stdout.splitlines()
         if gd.returncode != 0 or len(gd_lines) < 2:
             ctr["timeouts"] += 1
+            enum_ok = False
             continue
         if (os.path.realpath(os.path.join(root, gd_lines[0]))
                 != os.path.realpath(os.path.join(root, gd_lines[1]))):
@@ -661,6 +666,7 @@ for root, kind in roots:
         remaining = total_budget - (time.monotonic() - start_all)
         if remaining <= 0:
             ctr["timeouts"] += 1
+            enum_ok = False
             continue
         listing = subprocess.run(
             ["git", "--no-optional-locks", "-C", root, "worktree", "list", "--porcelain"],
@@ -669,6 +675,7 @@ for root, kind in roots:
         )
         if listing.returncode != 0:
             ctr["timeouts"] += 1
+            enum_ok = False
             continue
         stanzas = []
         for block in listing.stdout.split("\n\n"):
@@ -682,11 +689,13 @@ for root, kind in roots:
             if wt_path:
                 stanzas.append((os.path.realpath(wt_path), skip))
         if not stanzas:
+            enum_ok = False
             continue
         found = sorted(
             wt for wt, skip in stanzas[1:]
             if not skip and wt != root and wt not in configured_real and os.path.isdir(wt)
         )
+        seen_wts.update(found)
         worktrees_over_cap += max(0, len(found) - 8)
         for wt in found[:8]:
             if total_budget - (time.monotonic() - start_all) <= 0:
@@ -696,6 +705,15 @@ for root, kind in roots:
             scan_tree(wt, kind, root, True)
     except Exception:
         ctr["timeouts"] += 1
+        enum_ok = False
+
+# INC-0134 round 1 G3: drop the baseline of a worktree that no longer exists
+# (removed or pruned), so a worktree re-added at the same path starts from a
+# fresh baseline. Only when every code root was enumerated this call.
+if enum_ok:
+    for _key in list(shell_baseline):
+        if _key not in configured_real and _key not in seen_wts:
+            del shell_baseline[_key]
 
 state["session_id"] = session_id or state.get("session_id")
 state["project"] = project or state.get("project")
