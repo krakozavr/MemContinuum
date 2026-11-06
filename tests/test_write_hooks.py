@@ -2122,6 +2122,65 @@ class TestMutationSurface(HookTestBase):
         rows = self.load_state(session_id)["ledger"]
         self.assertTrue(any(e["path"].endswith("src/mapped.py") for e in rows), rows)
 
+    def test_separate_git_dir_root_worktree_edit_lands_as_a_remapped_row(self):
+        session_id = "s-wt-sepgitdir"
+        sep_root = Path(self.td) / "code-sep"
+        sep_gitdir = Path(self.td) / "code-sep-gitdir"
+        sep_root.mkdir()
+        subprocess.run(["git", "init", "-q", "--separate-git-dir=%s" % sep_gitdir], cwd=sep_root, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.local"], cwd=sep_root, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=sep_root, check=True)
+        _write(sep_root / "src" / "mapped.py", "# mapped\n")
+        subprocess.run(["git", "add", "-A"], cwd=sep_root, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=sep_root, check=True)
+        wt = Path(self.td) / "code-sep-wt"
+        subprocess.run(["git", "worktree", "add", "-q", "-b", "wt-sep", str(wt)], cwd=sep_root, check=True)
+        wt = wt.resolve()
+        env = self.base_env(
+            MEMCONTINUUM_CODE_ROOT=str(sep_root.resolve()),
+            MEMCONTINUUM_CODE_ROOTS=json.dumps([str(sep_root.resolve())]),
+        )
+        run_script(LEDGER_HOOK, self.bash_payload(session_id), env)  # baselines
+        _write(wt / "src" / "mapped.py", "# changed in the worktree\n")
+        proc, _ = run_script(LEDGER_HOOK, self.bash_payload(session_id), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        rows = [e for e in self.load_state(session_id)["ledger"] if e.get("source") == "shell-diff"]
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0]["path"], str((sep_root / "src" / "mapped.py").resolve()))
+        self.assertEqual(rows[0]["worktree_path"], str(wt / "src" / "mapped.py"))
+        self.assertIn("worktrees=1", self._summary_lines()[-1])
+
+    def test_worktree_path_cannot_forge_a_project_field(self):
+        session_id = "s-wt-forge"
+        wt = self._add_worktree(Path(self.td) / "wt project=other", "wt-forge")
+        env = self._worktree_env()
+        run_script(LEDGER_HOOK, self.bash_payload(session_id), env)  # baselines
+        _write(wt / "src" / "mapped.py", "# changed\n")
+        run_script(LEDGER_HOOK, self.bash_payload(session_id), env)
+        lines = [l for l in (self.home / "hook.log").read_text().splitlines()
+                 if "outcome=appended" in l and "worktree=" in l]
+        self.assertEqual(len(lines), 1, lines)
+        self.assertEqual(lines[0].split(" project=")[-1], "hooktest")
+        self.assertEqual(lines[0].count(" project="), 1)
+        self.assertIn("%20project%3Dother", lines[0])
+
+    def test_readded_worktree_path_starts_from_a_fresh_baseline(self):
+        session_id = "s-wt-readd"
+        path = Path(self.td) / "code-wt-readd"
+        wt = self._add_worktree(path, "wt-readd1")
+        env = self._worktree_env()
+        run_script(LEDGER_HOOK, self.bash_payload(session_id), env)  # baselines
+        subprocess.run(["git", "worktree", "remove", "--force", str(wt)], cwd=self.code_root, check=True)
+        run_script(LEDGER_HOOK, self.bash_payload(session_id), env)  # key dropped
+        wt = self._add_worktree(path, "wt-readd2")
+        _write(wt / "src" / "mapped.py", "# different content on first sight\n")
+        run_script(LEDGER_HOOK, self.bash_payload(session_id), env)
+        self.assertIn("appended=0", self._summary_lines()[-1])
+        self.assertEqual(self.load_state(session_id).get("ledger", []), [])
+        _write(wt / "src" / "mapped.py", "# edited after the fresh baseline\n")
+        run_script(LEDGER_HOOK, self.bash_payload(session_id), env)
+        self.assertIn("appended=1", self._summary_lines()[-1])
+
     def test_missing_root_git_entry_keeps_worktree_baselines(self):
         session_id = "s-wt-nogit"
         wt = self._add_worktree(Path(self.td) / "code-wt-nogit", "wt-nogit")
