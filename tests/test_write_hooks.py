@@ -2105,7 +2105,7 @@ class TestMutationSurface(HookTestBase):
         # does with base_env(MC_WATCHDOG_BUDGET="20")): the tight call reads
         # one 512 MiB file in full (~1 s) and must not meet the 2 s SIGKILL.
         env = dict(self._worktree_env(), MC_WATCHDOG_BUDGET="20")
-        run_script(LEDGER_HOOK, self.bash_payload(session_id), env)  # baselines
+        run_script(LEDGER_HOOK, self.bash_payload(session_id), env, timeout=25)  # baselines
         state_file = self.state_file(session_id)
         # Wide margins on both sides of a 0.2 s budget, no clock hook. The
         # small tracked edit sorts FIRST among the dirty paths ("src/..." <
@@ -2115,14 +2115,16 @@ class TestMutationSurface(HookTestBase):
         # one 512 MiB file is 0.854 s, so a false timeouts=0 would need the
         # first three files hashed inside 0.2 s (7.5 GiB/s); the git
         # preamble is ~10 ms against the 0.2 s budget. The slow-side
-        # ceiling is no longer the 2 s watchdog (raised to 20 s above).
+        # ceilings are the watchdog (20 s) and the subprocess timeout
+        # (25 s), so a runner must be ~20x slower than the 1.04 s measured
+        # here to trip either.
         _write(wt / "src" / "mapped.py", "# small edit\n")
         for i in range(4):
             with open(wt / ("zz_big%d.bin" % i), "wb") as fh:
                 fh.truncate(512 * 1024 * 1024)
         mtime_before = state_file.stat().st_mtime_ns
         tight = dict(env, MEMCONTINUUM_SHELL_DIFF_BUDGET="0.2")
-        proc, _ = run_script(LEDGER_HOOK, self.bash_payload(session_id), tight)
+        proc, _ = run_script(LEDGER_HOOK, self.bash_payload(session_id), tight, timeout=25)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertGreater(state_file.stat().st_mtime_ns, mtime_before)
         summary = self._summary_lines()[-1]
