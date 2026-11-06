@@ -27,16 +27,21 @@ README = TOOLS_DIR / "README.md"
 
 
 class TestReleaseHygiene(unittest.TestCase):
-    def test_pyproject_version_is_0_4_0(self):
+    def test_pyproject_version_is_0_5_0(self):
         text = PYPROJECT.read_text()
-        self.assertIn('version = "0.4.0"', text)
+        self.assertIn('version = "0.5.0"', text)
 
     def test_changelog_exists_and_mentions_the_version(self):
-        # "0.4.0" alone could match a pre-release heading or prose elsewhere
+        # "0.5.0" alone could match a pre-release heading or prose elsewhere
         # -- assert the exact released heading instead, or this proves
-        # nothing about the 0.4.0 section actually existing.
+        # nothing about the 0.5.0 section actually existing.
         self.assertTrue(CHANGELOG.exists())
-        self.assertIn("## [0.4.0] —", CHANGELOG.read_text())
+        text = CHANGELOG.read_text()
+        self.assertIn("## [0.5.0] —", text)
+        self.assertLess(
+            text.index("## [0.5.0] —"), text.index("## [0.4.0] —"),
+            "0.5.0 must sit above the already-released 0.4.0 section",
+        )
 
     def test_pyproject_python_floor_is_3_12(self):
         text = PYPROJECT.read_text()
