@@ -359,6 +359,18 @@ session_id = os.environ.get("MC_SESSION_ID") or ""
 log_path = os.environ.get("MC_LOG_PATH") or ""
 
 
+def log_token(value):
+    # Python twin of mc_cwd_token (hooks/memlib.sh) and memidx.py
+    # _log_path_token (bash cannot be called from here): first 512 BYTES,
+    # keep only [A-Za-z0-9/._~:!-], every other byte as %XX uppercase hex,
+    # so a path can neither forge a key=value field nor split the line.
+    keep = set(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789/._~:!-")
+    out = []
+    for b in os.fsencode(value)[:512]:
+        out.append(chr(b) if b in keep else "%%%02X" % b)
+    return "".join(out) or "-"
+
+
 def log_line(text):
     if not log_path:
         return
@@ -600,7 +612,7 @@ def scan_tree(scan_dir, kind, record_root, remap):
         # worktree= goes BEFORE file=: everything after file= is the path.
         log_line(
             "ledger outcome=appended kind=" + kind + " source=shell-diff"
-            + ((" worktree=" + scan_dir) if remap else "")
+            + ((" worktree=" + log_token(scan_dir)) if remap else "")
             + " file=" + row_path
         )
 

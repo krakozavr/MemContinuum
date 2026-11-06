@@ -2140,6 +2140,20 @@ class TestMutationSurface(HookTestBase):
         self.assertEqual(rows[0]["worktree_path"], str(wt / "src" / "mapped.py"))
         self.assertIn("worktrees=1", self._summary_lines()[-1])
 
+    def test_worktree_path_cannot_forge_a_project_field(self):
+        session_id = "s-wt-forge"
+        wt = self._add_worktree(Path(self.td) / "wt project=other", "wt-forge")
+        env = self._worktree_env()
+        run_script(LEDGER_HOOK, self.bash_payload(session_id), env)  # baselines
+        _write(wt / "src" / "mapped.py", "# changed\n")
+        run_script(LEDGER_HOOK, self.bash_payload(session_id), env)
+        lines = [l for l in (self.home / "hook.log").read_text().splitlines()
+                 if "outcome=appended" in l and "worktree=" in l]
+        self.assertEqual(len(lines), 1, lines)
+        self.assertEqual(lines[0].split(" project=")[-1], "hooktest")
+        self.assertEqual(lines[0].count(" project="), 1)
+        self.assertIn("%20project%3Dother", lines[0])
+
     def test_summary_line_ends_with_worktrees_and_session(self):
         session_id = "s-summary-fields"
         run_script(LEDGER_HOOK, self.bash_payload(session_id), self.base_env())
