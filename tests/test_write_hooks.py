@@ -2101,17 +2101,21 @@ class TestMutationSurface(HookTestBase):
     def test_overshooting_budget_after_baseline_still_writes_state(self):
         session_id = "s-wt-budget"
         wt = self._add_worktree(Path(self.td) / "code-wt-budget", "wt-budget")
-        env = self._worktree_env()
+        # Generous watchdog budget in both calls (as the SessionStart test
+        # does with base_env(MC_WATCHDOG_BUDGET="20")): the tight call reads
+        # one 512 MiB file in full (~1 s) and must not meet the 2 s SIGKILL.
+        env = dict(self._worktree_env(), MC_WATCHDOG_BUDGET="20")
         run_script(LEDGER_HOOK, self.bash_payload(session_id), env)  # baselines
         state_file = self.state_file(session_id)
-        # Wide margins on both sides of a 0.2 s budget, no clock hook: the
-        # small tracked edit sorts FIRST among the dirty paths ("src/..."
-        # < "zz_..."), so it is hashed long before the deadline; the four
-        # sparse 512 MiB untracked files (hashing them all takes ~1.8 s here,
-        # about 9x the budget; sparse so they cost no disk) sort after it,
-        # so the deadline is crossed before the last one starts on any
-        # runner up to ~9x slower than this machine, and the hashing-loop
-        # check (not the status check) is what trips.
+        # Wide margins on both sides of a 0.2 s budget, no clock hook. The
+        # small tracked edit sorts FIRST among the dirty paths ("src/..." <
+        # "zz_..."), so it is hashed long before the deadline. The four
+        # sparse 512 MiB untracked files cost no disk; hashing all takes
+        # ~1.8 s here (~9x the budget). Measured margins: a cold sha256 of
+        # one 512 MiB file is 0.854 s, so a false timeouts=0 would need the
+        # first three files hashed inside 0.2 s (7.5 GiB/s); the git
+        # preamble is ~10 ms against the 0.2 s budget. The slow-side
+        # ceiling is no longer the 2 s watchdog (raised to 20 s above).
         _write(wt / "src" / "mapped.py", "# small edit\n")
         for i in range(4):
             with open(wt / ("zz_big%d.bin" % i), "wb") as fh:
