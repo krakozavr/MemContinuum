@@ -1856,12 +1856,32 @@ class TestMutationSurface(HookTestBase):
 
     def test_shell_diff_git_status_calls_leave_the_tree_exactly_as_found(self):
         session_id = "s-mutation-readonly-git"
+        wt = Path(self.td) / "code-wt-ro"
+        subprocess.run(
+            ["git", "worktree", "add", "-q", "-b", "wt-ro", str(wt)],
+            cwd=self.code_root, check=True,
+        )
         run_script(LEDGER_HOOK, self.bash_payload(session_id), self.base_env())  # baseline
+        wt_before = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=wt, capture_output=True, text=True, check=True,
+        ).stdout
+        def _snapshot():
+            # INC-0134: the worktree scan's two new git calls must not write
+            # the worktree index or the repo either (--no-optional-locks).
+            out = []
+            for d in (self.code_root / ".git", self.code_root / ".git" / "worktrees"):
+                for f in sorted(d.rglob("*")):
+                    if f.is_file():
+                        st = f.stat()
+                        out.append((str(f), st.st_size, st.st_mtime_ns))
+            return out
         before = subprocess.run(
             ["git", "status", "--porcelain"], cwd=self.code_root,
             capture_output=True, text=True, check=True,
         ).stdout
+        snap_before = _snapshot()
         proc, _ = run_script(LEDGER_HOOK, self.bash_payload(session_id), self.base_env())
+        snap_after = _snapshot()
         self.assertEqual(proc.returncode, 0, proc.stderr)
         after = subprocess.run(
             ["git", "status", "--porcelain"], cwd=self.code_root,
@@ -1872,6 +1892,11 @@ class TestMutationSurface(HookTestBase):
             "the hook's own git status calls must never change what a "
             "subsequent git status in that root reports",
         )
+        wt_after = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=wt, capture_output=True, text=True, check=True,
+        ).stdout
+        self.assertEqual(wt_before, wt_after)
+        self.assertEqual(snap_before, snap_after, "the hook wrote under the git dirs")
 
     # -- 6: create, rename, delete --------------------------------------------
 
@@ -1953,6 +1978,9 @@ class TestMutationSurface(HookTestBase):
         self.assertEqual(proc1.returncode, 0, proc1.stderr)
         log1 = (self.home / "hook.log").read_text()
         self.assertIn("outcome=shell-diff appended=0 roots=2 timeouts=0 non-git=0", log1)
+        # INC-0134: a root that is itself a linked worktree of an unwired
+        # main repo enumerates nothing.
+        self.assertIn("worktrees=0", log1)
 
         target = worktree / "src" / "mapped.py"
         _write(target, "# mapped, changed inside the worktree\n")
@@ -1965,6 +1993,119 @@ class TestMutationSurface(HookTestBase):
         # above -- `target` here is built from the unresolved `worktree`,
         # while the row's path comes back through the realpath'd root.
         self.assertEqual(rows[0]["path"], str(target.resolve()))
+
+    # -- INC-0134 / TOP-0137 L20: the shell-diff also scans linked worktrees
+    # of each code root, mapping rows back onto the root ---------------------
+
+    def _summary_lines(self):
+        log = (self.home / "hook.log").read_text()
+        return [l for l in log.splitlines() if "ledger outcome=shell-diff " in l]
+
+    def _worktree_env(self):
+        return self.base_env(
+            MEMCONTINUUM_CODE_ROOT=str(self.code_root.resolve()),
+            MEMCONTINUUM_CODE_ROOTS=json.dumps([str(self.code_root.resolve())]),
+        )
+
+    def _add_worktree(self, path, branch):
+        subprocess.run(
+            ["git", "worktree", "add", "-q", "-b", branch, str(path)],
+            cwd=self.code_root, check=True,
+        )
+        return Path(path).resolve()
+
+    def _assert_remapped_worktree_row(self, session_id, wt):
+        env = self._worktree_env()
+        run_script(LEDGER_HOOK, self.bash_payload(session_id), env)  # baselines
+        target = wt / "src" / "mapped.py"
+        _write(target, "# mapped, changed ONLY in the worktree\n")
+        proc, _ = run_script(LEDGER_HOOK, self.bash_payload(session_id), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        rows = [e for e in self.load_state(session_id)["ledger"] if e.get("source") == "shell-diff"]
+        self.assertEqual(len(rows), 1, rows)
+        main_path = str((self.code_root / "src" / "mapped.py").resolve())
+        self.assertEqual(rows[0]["path"], main_path)
+        self.assertEqual(rows[0]["worktree_path"], str(target))
+        self.assertEqual(rows[0]["root"], str(self.code_root.resolve()))
+        self.assertEqual(rows[0]["kind"], "code")
+        self.assertEqual(
+            rows[0]["content_sha256"], hashlib.sha256(target.read_bytes()).hexdigest()
+        )
+        log = (self.home / "hook.log").read_text()
+        self.assertIn(
+            "ledger outcome=appended kind=code source=shell-diff file=%s worktree=%s"
+            % (main_path, wt),
+            log,
+        )
+        summary = self._summary_lines()[-1]
+        self.assertIn("appended=1", summary)
+        self.assertIn("worktrees=1", summary)
+        return rows
+
+    def test_sibling_worktree_edit_lands_as_a_remapped_row(self):
+        wt = self._add_worktree(Path(self.td) / "code-wt-sib", "wt-sib")
+        self._assert_remapped_worktree_row("s-wt-sibling", wt)
+
+    def test_nested_worktree_edit_lands_as_a_remapped_row(self):
+        wt = self._add_worktree(self.code_root / ".worktrees" / "feat", "wt-nested")
+        rows = self._assert_remapped_worktree_row("s-wt-nested", wt)
+        root = str(self.code_root.resolve())
+        for e in self.load_state("s-wt-nested")["ledger"]:
+            self.assertFalse(e["path"].endswith(".worktrees"), e)
+            self.assertFalse(e["path"].startswith(root + "/.worktrees/"), e)
+
+    def test_same_file_changed_in_main_and_worktree_gives_two_rows(self):
+        session_id = "s-wt-two-rows"
+        wt = self._add_worktree(Path(self.td) / "code-wt-two", "wt-two")
+        env = self._worktree_env()
+        run_script(LEDGER_HOOK, self.bash_payload(session_id), env)  # baselines
+        _write(self.code_root / "src" / "mapped.py", "# changed in main\n")
+        _write(wt / "src" / "mapped.py", "# changed in the worktree\n")
+        proc, _ = run_script(LEDGER_HOOK, self.bash_payload(session_id), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        rows = [e for e in self.load_state(session_id)["ledger"] if e.get("source") == "shell-diff"]
+        self.assertEqual(len(rows), 2, rows)
+        self.assertEqual({e["path"] for e in rows}, {str((self.code_root / "src" / "mapped.py").resolve())})
+        self.assertEqual(sum(1 for e in rows if "worktree_path" in e), 1)
+        self.assertEqual(len({e["content_sha256"] for e in rows}), 2)
+
+    def test_worktree_created_after_the_baseline_gets_its_own_baseline(self):
+        session_id = "s-wt-late"
+        env = self._worktree_env()
+        run_script(LEDGER_HOOK, self.bash_payload(session_id), env)  # root baseline
+        wt = self._add_worktree(Path(self.td) / "code-wt-late", "wt-late")
+        _write(wt / "src" / "mapped.py", "# edited before the worktree was ever seen\n")
+        proc, _ = run_script(LEDGER_HOOK, self.bash_payload(session_id), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.load_state(session_id).get("ledger", []), [])
+        self.assertIn("worktrees=1", self._summary_lines()[-1])
+        _write(wt / "src" / "mapped.py", "# edited again\n")
+        run_script(LEDGER_HOOK, self.bash_payload(session_id), env)
+        rows = self.load_state(session_id)["ledger"]
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0]["worktree_path"], str(wt / "src" / "mapped.py"))
+
+    def test_pruned_worktree_is_skipped(self):
+        session_id = "s-wt-pruned"
+        wt = self._add_worktree(Path(self.td) / "code-wt-gone", "wt-gone")
+        shutil.rmtree(wt)
+        env = self._worktree_env()
+        for _ in range(2):
+            proc, _ = run_script(LEDGER_HOOK, self.bash_payload(session_id), env)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.load_state(session_id).get("ledger", []), [])
+        for line in self._summary_lines():
+            self.assertIn("worktrees=0", line)
+            self.assertIn("timeouts=0", line)
+
+    def test_summary_line_ends_with_worktrees_and_session(self):
+        session_id = "s-summary-fields"
+        run_script(LEDGER_HOOK, self.bash_payload(session_id), self.base_env())
+        line = self._summary_lines()[-1]
+        self.assertIn("appended=0 roots=2 timeouts=0 non-git=0", line)
+        self.assertRegex(
+            line, r" baseline-too-large=0 worktrees=0 session=s-summary-fields project=hooktest$"
+        )
 
     # -- 9: a slow root times out and is counted; the other root still works -
 

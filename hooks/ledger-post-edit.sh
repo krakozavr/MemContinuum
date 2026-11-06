@@ -397,6 +397,7 @@ except Exception:
     per_root_budget = 0.8
 
 start_all = time.monotonic()
+timed_out = set()
 ctr = {"appended": 0, "timeouts": 0, "non_git": 0, "baseline_too_large": 0}
 # The two git calls the worktree scan adds run with the repo-pinning
 # variables cleared (same reason as the round-2 fix in mc_remap_worktree_path).
@@ -432,6 +433,7 @@ def scan_tree(scan_dir, kind, record_root, remap):
     remaining = total_budget - (time.monotonic() - start_all)
     if remaining <= 0:
         ctr["timeouts"] += 1
+        timed_out.add(scan_dir)
         return
 
     try:
@@ -443,9 +445,11 @@ def scan_tree(scan_dir, kind, record_root, remap):
         )
     except (subprocess.TimeoutExpired, OSError):
         ctr["timeouts"] += 1
+        timed_out.add(scan_dir)
         return
     if result.returncode != 0:
         ctr["timeouts"] += 1
+        timed_out.add(scan_dir)
         return
 
     entries = result.stdout.split("\x00")
@@ -603,6 +607,10 @@ worktrees_over_cap = 0
 configured_real = set(r for r, _k in roots)
 for root, kind in roots:
     if kind != "code" or not os.path.exists(os.path.join(root, ".git")):
+        continue
+    if root in timed_out:
+        # The root own status already ran out of budget (already counted);
+        # do not spend a second wait on its worktree listing.
         continue
     try:
         remaining = total_budget - (time.monotonic() - start_all)
