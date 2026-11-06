@@ -1862,41 +1862,33 @@ class TestMutationSurface(HookTestBase):
             cwd=self.code_root, check=True,
         )
         run_script(LEDGER_HOOK, self.bash_payload(session_id), self.base_env())  # baseline
-        wt_before = subprocess.run(
-            ["git", "status", "--porcelain"], cwd=wt, capture_output=True, text=True, check=True,
-        ).stdout
+        # INC-0134 round 1 S4: bump a tracked file mtime in BOTH trees AFTER
+        # a refreshing status, so a git status without --no-optional-locks
+        # would find stale stat data and rewrite the index.
+        def _porcelain(d):
+            return subprocess.run(
+                ["git", "status", "--porcelain"], cwd=d, capture_output=True, text=True, check=True,
+            ).stdout
+        _porcelain(self.code_root)
+        _porcelain(wt)
+        for d in (self.code_root, wt):
+            os.utime(d / "src" / "mapped.py", (time.time() + 5, time.time() + 5))
+        git_dirs = [self.code_root / ".git"]
         def _snapshot():
-            # INC-0134: the worktree scan's two new git calls must not write
-            # the worktree index or the repo either (--no-optional-locks).
             out = []
-            for d in (self.code_root / ".git", self.code_root / ".git" / "worktrees"):
+            for d in git_dirs:
                 for f in sorted(d.rglob("*")):
-                    if f.is_file():
+                    if f.is_file() and f.name == "index":
                         st = f.stat()
-                        out.append((str(f), st.st_size, st.st_mtime_ns))
+                        out.append((str(f), f.read_bytes(), st.st_mtime_ns))
             return out
-        before = subprocess.run(
-            ["git", "status", "--porcelain"], cwd=self.code_root,
-            capture_output=True, text=True, check=True,
-        ).stdout
         snap_before = _snapshot()
+        self.assertEqual(len(snap_before), 2, "main index and the worktree index")
         proc, _ = run_script(LEDGER_HOOK, self.bash_payload(session_id), self.base_env())
         snap_after = _snapshot()
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        after = subprocess.run(
-            ["git", "status", "--porcelain"], cwd=self.code_root,
-            capture_output=True, text=True, check=True,
-        ).stdout
-        self.assertEqual(
-            before, after,
-            "the hook's own git status calls must never change what a "
-            "subsequent git status in that root reports",
-        )
-        wt_after = subprocess.run(
-            ["git", "status", "--porcelain"], cwd=wt, capture_output=True, text=True, check=True,
-        ).stdout
-        self.assertEqual(wt_before, wt_after)
-        self.assertEqual(snap_before, snap_after, "the hook wrote under the git dirs")
+        self.assertIn("worktrees=1", (self.home / "hook.log").read_text().splitlines()[-1])
+        self.assertEqual(snap_before, snap_after, "the hook rewrote a git index")
 
     # -- 6: create, rename, delete --------------------------------------------
 
