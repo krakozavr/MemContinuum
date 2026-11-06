@@ -628,6 +628,28 @@ for root, kind in roots:
         if remaining <= 0:
             ctr["timeouts"] += 1
             continue
+        # Main-checkout rule (round 1 S2): git-dir and git-common-dir name
+        # the same directory. The first worktree stanza is NOT compared with
+        # root: for a separate-git-dir root git prints the git dir there.
+        gd = subprocess.run(
+            ["git", "--no-optional-locks", "-C", root, "rev-parse", "--git-dir",
+             "--git-common-dir"],
+            capture_output=True, text=True, timeout=min(per_root_budget, remaining),
+            env=git_env,
+        )
+        gd_lines = gd.stdout.splitlines()
+        if gd.returncode != 0 or len(gd_lines) < 2:
+            ctr["timeouts"] += 1
+            continue
+        if (os.path.realpath(os.path.join(root, gd_lines[0]))
+                != os.path.realpath(os.path.join(root, gd_lines[1]))):
+            # root is itself a linked worktree of an unwired main repo:
+            # enumerate nothing (the Edit route calls this worktree-unwired).
+            continue
+        remaining = total_budget - (time.monotonic() - start_all)
+        if remaining <= 0:
+            ctr["timeouts"] += 1
+            continue
         listing = subprocess.run(
             ["git", "--no-optional-locks", "-C", root, "worktree", "list", "--porcelain"],
             capture_output=True, text=True, timeout=min(per_root_budget, remaining),
@@ -647,9 +669,7 @@ for root, kind in roots:
                     skip = True
             if wt_path:
                 stanzas.append((os.path.realpath(wt_path), skip))
-        if not stanzas or stanzas[0][0] != root:
-            # root is itself a linked worktree of an unwired main repo:
-            # enumerate nothing (the Edit route calls this worktree-unwired).
+        if not stanzas:
             continue
         found = sorted(
             wt for wt, skip in stanzas[1:]

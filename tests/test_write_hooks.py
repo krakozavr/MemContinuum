@@ -2112,6 +2112,34 @@ class TestMutationSurface(HookTestBase):
         m = re.search(r" timeouts=(\d+) ", self._summary_lines()[-1])
         self.assertGreaterEqual(int(m.group(1)), 1)
 
+    def test_separate_git_dir_root_worktree_edit_lands_as_a_remapped_row(self):
+        session_id = "s-wt-sepgitdir"
+        sep_root = Path(self.td) / "code-sep"
+        sep_gitdir = Path(self.td) / "code-sep-gitdir"
+        sep_root.mkdir()
+        subprocess.run(["git", "init", "-q", "--separate-git-dir=%s" % sep_gitdir], cwd=sep_root, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.local"], cwd=sep_root, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=sep_root, check=True)
+        _write(sep_root / "src" / "mapped.py", "# mapped\n")
+        subprocess.run(["git", "add", "-A"], cwd=sep_root, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=sep_root, check=True)
+        wt = Path(self.td) / "code-sep-wt"
+        subprocess.run(["git", "worktree", "add", "-q", "-b", "wt-sep", str(wt)], cwd=sep_root, check=True)
+        wt = wt.resolve()
+        env = self.base_env(
+            MEMCONTINUUM_CODE_ROOT=str(sep_root.resolve()),
+            MEMCONTINUUM_CODE_ROOTS=json.dumps([str(sep_root.resolve())]),
+        )
+        run_script(LEDGER_HOOK, self.bash_payload(session_id), env)  # baselines
+        _write(wt / "src" / "mapped.py", "# changed in the worktree\n")
+        proc, _ = run_script(LEDGER_HOOK, self.bash_payload(session_id), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        rows = [e for e in self.load_state(session_id)["ledger"] if e.get("source") == "shell-diff"]
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0]["path"], str((sep_root / "src" / "mapped.py").resolve()))
+        self.assertEqual(rows[0]["worktree_path"], str(wt / "src" / "mapped.py"))
+        self.assertIn("worktrees=1", self._summary_lines()[-1])
+
     def test_summary_line_ends_with_worktrees_and_session(self):
         session_id = "s-summary-fields"
         run_script(LEDGER_HOOK, self.bash_payload(session_id), self.base_env())
