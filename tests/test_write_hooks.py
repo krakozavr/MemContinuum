@@ -2104,15 +2104,20 @@ class TestMutationSurface(HookTestBase):
         env = self._worktree_env()
         run_script(LEDGER_HOOK, self.bash_payload(session_id), env)  # baselines
         state_file = self.state_file(session_id)
-        # The small tracked edit sorts first and is hashed before the big
-        # untracked files, whose hashing overshoots the tiny budget, so the
-        # hashing-loop check (not the status check) is what trips.
+        # Wide margins on both sides of a 0.2 s budget, no clock hook: the
+        # small tracked edit sorts FIRST among the dirty paths ("src/..."
+        # < "zz_..."), so it is hashed long before the deadline; the four
+        # sparse 512 MiB untracked files (hashing them all takes ~1.8 s here,
+        # about 9x the budget; sparse so they cost no disk) sort after it,
+        # so the deadline is crossed before the last one starts on any
+        # runner up to ~9x slower than this machine, and the hashing-loop
+        # check (not the status check) is what trips.
         _write(wt / "src" / "mapped.py", "# small edit\n")
-        for i in range(3):
+        for i in range(4):
             with open(wt / ("zz_big%d.bin" % i), "wb") as fh:
-                fh.write(b"\0" * (32 * 1024 * 1024))
+                fh.truncate(512 * 1024 * 1024)
         mtime_before = state_file.stat().st_mtime_ns
-        tight = dict(env, MEMCONTINUUM_SHELL_DIFF_BUDGET="0.05")
+        tight = dict(env, MEMCONTINUUM_SHELL_DIFF_BUDGET="0.2")
         proc, _ = run_script(LEDGER_HOOK, self.bash_payload(session_id), tight)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertGreater(state_file.stat().st_mtime_ns, mtime_before)
