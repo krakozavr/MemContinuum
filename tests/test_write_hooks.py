@@ -2171,6 +2171,25 @@ class TestMutationSurface(HookTestBase):
         run_script(LEDGER_HOOK, self.bash_payload(session_id), env)
         self.assertIn("appended=1", self._summary_lines()[-1])
 
+    def test_missing_root_git_entry_keeps_worktree_baselines(self):
+        session_id = "s-wt-nogit"
+        wt = self._add_worktree(Path(self.td) / "code-wt-nogit", "wt-nogit")
+        env = self._worktree_env()
+        run_script(LEDGER_HOOK, self.bash_payload(session_id), env)  # baselines
+        self.assertIn(str(wt), self.load_state(session_id)["shell_baseline"])
+        gitdir = self.code_root / ".git"
+        moved = self.code_root / ".git-away"
+        gitdir.rename(moved)
+        try:
+            proc, _ = run_script(LEDGER_HOOK, self.bash_payload(session_id), env)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+        finally:
+            moved.rename(gitdir)
+        self.assertIn(str(wt), self.load_state(session_id)["shell_baseline"])
+        _write(wt / "src" / "mapped.py", "# edited after the git entry returned\n")
+        run_script(LEDGER_HOOK, self.bash_payload(session_id), env)
+        self.assertIn("appended=1", self._summary_lines()[-1])
+
     def test_summary_line_ends_with_worktrees_and_session(self):
         session_id = "s-summary-fields"
         run_script(LEDGER_HOOK, self.bash_payload(session_id), self.base_env())

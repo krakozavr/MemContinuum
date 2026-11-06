@@ -631,7 +631,12 @@ configured_real = set(r for r, _k in roots)
 seen_wts = set()
 enum_ok = True
 for root, kind in roots:
-    if kind != "code" or not os.path.exists(os.path.join(root, ".git")):
+    if kind != "code":
+        continue
+    if not os.path.exists(os.path.join(root, ".git")):
+        # Not enumerated: the baselines of its worktrees must survive the
+        # stale-key pruning below (R2-1).
+        enum_ok = False
         continue
     if root in timed_out:
         # The root own status already ran out of budget (already counted);
