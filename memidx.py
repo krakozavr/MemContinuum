@@ -13007,7 +13007,13 @@ def _filing_validate_args(args, command: str) -> None:
 
 
 def _filing_commit_citations_problem(texts: list, code_roots: list) -> str | None:
-    """A `commit <hash>`/`merge <hash>` citation that no code root resolves."""
+    """A `commit <hash>`/`merge <hash>` citation that no code root resolves.
+    Thin wrapper over memlint's `_extract_commit_citations`/`_commit_resolves`;
+    `_citation_errors` is not reused because it takes a link's `source` and
+    `evidence` (not the ruling text), skips every non-git code root, downgrades
+    an unresolved hash to a warning unless `strict` -- which would also make an
+    unresolved file:line an error -- and adds subject checks this refusal does
+    not claim."""
     if not code_roots:
         return None
     import memlint
