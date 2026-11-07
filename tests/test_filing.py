@@ -1468,6 +1468,28 @@ class TestGateRound7(FilingCase):
             self.assertEqual(rc, 0, err)
             self.assertGreaterEqual(spy.call_count, 1)
 
+    def test_dry_run_skips_proposals_when_the_index_state_cannot_be_read(self):
+        import sqlite3
+        sessions = self.home / "sessions" / "p"
+        sessions.mkdir(parents=True)
+        (sessions / f"{SID}.json").write_text(json.dumps({"ledger": [], "search_fallbacks": []}))
+        real_state = memidx.decision_index_state
+
+        def locked_for_proposals(*a, **kw):
+            # only the proposal section's content-verifying probe sees the lock
+            if kw.get("verify_content"):
+                raise sqlite3.OperationalError("database is locked")
+            return real_state(*a, **kw)
+
+        with mock.patch.object(memidx, "decision_index_state", side_effect=locked_for_proposals), \
+                mock.patch.object(memidx, "cmd_reindex") as spy:
+            before = sha(self.topic)
+            rc, out, err = self.append("--session", SID, "--dry-run")
+            self.assertEqual(rc, 0, err)
+            self.assertEqual(spy.call_count, 0)
+            self.assertIn("proposals: skipped under --dry-run (index state unknown: OperationalError)", out)
+            self.assertEqual(sha(self.topic), before)
+
     def test_the_standing_suggestion_quotes_a_store_root_with_a_space(self):
         spaced = self.tmp / "my store"
         self.store.rename(spaced)

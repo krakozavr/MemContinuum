@@ -13412,8 +13412,10 @@ def _filing_proposals(args, root: Path) -> None:
         try:
             stale = decision_index_state(resolve_db_path(args), args.project, root=root,
                                          verify_content=True) == "stale"
-        except Exception:
-            stale = False
+        except Exception as exc:
+            # fail closed: an unreadable index state must not let the proposal read reindex
+            print(f"proposals: skipped under --dry-run (index state unknown: {type(exc).__name__})")
+            return
         if stale:
             print("proposals: skipped under --dry-run (index stale)")
             return
