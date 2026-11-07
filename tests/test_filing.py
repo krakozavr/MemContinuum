@@ -3,6 +3,9 @@ insertion proven by memlint's append-only guard, authority derived from the
 session transcript, advisory dedupe, retrieval check, one log receipt. Every
 fixture builds its own throwaway git store."""
 import contextlib
+import shlex
+import shutil
+import stat
 import hashlib
 import io
 import json
@@ -884,27 +887,21 @@ class TestGateRound2(FilingCase):
 
     def test_append_keeps_the_file_mode_and_fsyncs_the_directory(self):
         os.chmod(self.topic, 0o640)
-        opened = []
-        real_open = os.open
-
-        def spy(path, flags, *a, **k):
-            fd = real_open(path, flags, *a, **k)
-            if os.path.isdir(path):
-                opened.append(fd)
-            return fd
-
         real_fsync = os.fsync
-        synced = []
+        dirs_synced = []  # (st_mode, st_ino) of each fsynced descriptor, read AT CALL TIME
 
         def fsync_spy(fd):
-            synced.append(fd)
+            st = os.fstat(fd)
+            if stat.S_ISDIR(st.st_mode):
+                dirs_synced.append(st.st_ino)
             return real_fsync(fd)
 
-        with mock.patch.object(os, "open", side_effect=spy), mock.patch.object(os, "fsync", side_effect=fsync_spy):
+        with mock.patch.object(os, "fsync", side_effect=fsync_spy):
             rc, _o, err = self.append()
         self.assertEqual(rc, 0, err)
         self.assertEqual(self.topic.stat().st_mode & 0o7777, 0o640)
-        self.assertTrue(set(opened) & set(synced), "the parent directory was not fsynced")
+        self.assertIn(self.topic.parent.stat().st_ino, dirs_synced,
+                      "the parent directory was not fsynced")
 
     # --- R2-4: a positive `restored` -------------------------------------------------
 
@@ -994,14 +991,14 @@ class TestGateRound3(FilingCase):
                 before = (sha(bad), sha(good))
                 rc, _o, err = self.append()
                 self.assertEqual(rc, 1, err)
-                self.assertIn("claimed by 2 files", err)
+                self.assertIn("carried by 2 files", err)
                 self.assertIn(str(bad.resolve()), err)
                 self.assertIn(str(good.resolve()), err)
                 self.assertIn("reason=ambiguous-topic", self.log_lines()[-1])
                 rc, _o, err = self.run_cmd("promote", "TOP-9100", "L1", "--session", SID,
                                            "--yes-message", YES_UUID)
                 self.assertEqual(rc, 1, err)
-                self.assertIn("claimed by 2 files", err)
+                self.assertIn("carried by 2 files", err)
                 self.assertEqual((sha(bad), sha(good)), before)
 
     def test_two_valid_claimants_still_refuse_naming_both(self):
@@ -1047,6 +1044,88 @@ class TestGateRound3(FilingCase):
         self.assertIn("reason=topic-id-mismatch", last)
         self.assertIn("retrieval=skipped", last)
         self.assertEqual(sha(self.topic), before)
+
+
+    # --- R3-2: the remedy commands are shell-quoted ------------------------------------
+
+    def _failing_undo(self, written):
+        real = memidx._atomic_write_bytes
+
+        def first_ok_then_fail(path, data, exclusive=False):
+            if written:
+                raise OSError("disk gone")
+            written.append(data)
+            real(path, data, exclusive)
+        return mock.patch.object(memidx, "_atomic_write_bytes", side_effect=first_ok_then_fail)
+
+    def test_remedy_commands_quote_a_store_path_with_a_space_and_a_dollar(self):
+        odd = self.tmp / "my $store"
+        shutil.copytree(self.store, odd)
+        odd = odd.resolve()
+        topic = odd / "topics" / "memory" / "widget.md"
+        guard = mock.patch.object(memlint, "check_append_only",
+                                  return_value=([f"{topic}: link L1 body changed"], 1, []))
+        with guard, self._failing_undo([]):
+            rc, _o, err = run_memidx(["append", "TOP-9100", "--ruling", "r", "--root", str(odd),
+                                      "--project", "p", "--db", str(self.db)])
+        self.assertEqual(rc, 1, err)
+        self.assertIn(f"git -C {shlex.quote(str(odd))} checkout -- topics/memory/widget.md", err)
+        self.assertIn("'", shlex.quote(str(odd)))
+        self.assertNotIn(f"git -C {odd} ", err)
+
+    def test_remedy_for_a_store_outside_any_git_work_tree_names_no_git_command(self):
+        plain = self.tmp / "plain store"
+        (plain / "topics" / "memory").mkdir(parents=True)
+        topic = plain / "topics" / "memory" / "widget.md"
+        topic.write_text(TOPIC)
+        with self._failing_undo([]):
+            rc, _o, err = run_memidx(["append", "TOP-9100", "--ruling", "r", "--root", str(plain),
+                                      "--project", "p", "--db", str(self.db)])
+        self.assertEqual(rc, 1, err)
+        self.assertIn("REJECTED EDIT REMAINS ON DISK", err)
+        self.assertIn(str(topic.resolve()), err)
+        self.assertNotIn("git -C", err)
+        self.assertIn("not inside a git work tree", err)
+
+    # --- R3-3: a failed reservation cleanup is reported -------------------------------
+
+    def test_reservation_close_failure_then_unlink_failure_reports_the_empty_file(self):
+        directory = self.store / "topics" / "memory"
+        target = directory / "closing.md"
+        real_close, real_open, real_unlink = os.close, os.open, os.unlink
+        reserved, closed, unlinked = [], [], []
+
+        def open_spy(path, flags, *a, **k):
+            fd = real_open(path, flags, *a, **k)
+            if flags & os.O_EXCL:
+                reserved.append(fd)
+            return fd
+
+        def close_once_fails(fd):
+            real_close(fd)
+            if reserved and fd == reserved[0] and not closed:
+                closed.append(fd)
+                raise OSError("close failed")
+
+        def unlink_once_fails(path, *a, **k):
+            if not unlinked and Path(path) == target:
+                unlinked.append(path)
+                raise OSError("unlink refused")
+            return real_unlink(path, *a, **k)
+
+        with mock.patch.object(os, "open", side_effect=open_spy), \
+                mock.patch.object(os, "close", side_effect=close_once_fails), \
+                mock.patch.object(os, "unlink", side_effect=unlink_once_fails):
+            rc, _o, err = self.run_cmd("record", "--title", "Closing", "--area", "memory", "--slug", "closing",
+                                       "--ruling", "r")
+        self.assertEqual(rc, 1, err)
+        self.assertTrue(target.exists())
+        self.assertEqual(target.stat().st_size, 0)
+        self.assertIn("REJECTED EDIT REMAINS ON DISK", err)
+        self.assertIn("reservation left on disk", err)
+        self.assertIn(f"rm {target.resolve()}", err)
+        self.assertNotIn("nothing written", err)
+        self.assertIn("rollback=failed", self.log_lines()[-1])
 
 
 if __name__ == "__main__":

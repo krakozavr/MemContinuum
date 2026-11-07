@@ -12281,6 +12281,15 @@ def _topic_current_link(fm: dict) -> str | None:
     return str(link.get("link")) if link else None
 
 
+class ReservationLeftError(OSError):
+    """The exclusive reservation of a new file could not be removed after a
+    failed write: an empty file remains at `path` (`.reserved_path`)."""
+
+    def __init__(self, reserved_path: str, message: str):
+        super().__init__(message)
+        self.reserved_path = reserved_path
+
+
 def _atomic_write_bytes(path: Path, data: bytes, exclusive: bool = False) -> None:
     """Write `data` to `path` so a crash or I/O error never leaves a short file:
     a temp file in the SAME directory, flushed and fsynced, then `os.replace`d
@@ -12320,7 +12329,7 @@ def _atomic_write_bytes(path: Path, data: bytes, exclusive: bool = False) -> Non
             os.chmod(tmp_name, mode)
         os.replace(tmp_name, str(path))
         tmp_name = None
-    except BaseException:
+    except BaseException as exc:
         if tmp_name:
             try:
                 os.unlink(tmp_name)
@@ -12329,8 +12338,13 @@ def _atomic_write_bytes(path: Path, data: bytes, exclusive: bool = False) -> Non
         if exclusive:
             try:
                 os.unlink(str(path))
-            except OSError:
+            except FileNotFoundError:
                 pass
+            except OSError as unlink_exc:
+                if isinstance(exc, Exception):
+                    raise ReservationLeftError(
+                        str(path), f"reservation left on disk: {path} (write failed: {exc}; "
+                                   f"cleanup failed: {unlink_exc})") from exc
         raise
     try:
         dir_fd = os.open(str(path.parent), os.O_RDONLY)
@@ -13246,6 +13260,17 @@ def _filing_ruling(args, ctx: dict, code_roots: list, strict: bool) -> dict:
             "source": args.source or ""}
 
 
+def _inside_git_work_tree(root: Path) -> bool:
+    """True when `root` is inside a git work tree (so a `git checkout` remedy
+    can work there)."""
+    try:
+        done = subprocess.run(["git", "-C", str(root), "rev-parse", "--is-inside-work-tree"],
+                              capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.returncode == 0 and done.stdout.strip() == "true"
+
+
 def _filing_guard_or_undo(root: Path, path: Path, rel: str, old_text: str | None) -> None:
     """Run the append-only guard on the file just written; on a guard error or
     when the guard cannot run (`guard-unavailable`) undo the write -- the
@@ -13268,9 +13293,12 @@ def _filing_guard_or_undo(root: Path, path: Path, rel: str, old_text: str | None
             _atomic_write_bytes(path, old_text.encode("utf-8"))
     except OSError as exc:
         if old_text is None:
-            remedy = f"remove it with: rm {path}"
+            remedy = f"remove it with: rm {shlex.quote(str(path))}"
+        elif _inside_git_work_tree(root):
+            remedy = f"restore it with: git -C {shlex.quote(str(root))} checkout -- {shlex.quote(rel)}"
         else:
-            remedy = f"restore it with: git -C {root} checkout -- {rel}"
+            remedy = ("the store root is not inside a git work tree, so there is no checkout to restore "
+                      "from; put back the original text of this file from your own backup")
         raise FilingRefusal(token, f"{why}; could NOT undo the write ({exc})",
                             on_disk="rejected", remedy=remedy, path_on_disk=str(path))
     raise FilingRefusal(token, f"{why}; write undone")
@@ -13295,6 +13323,10 @@ def _finish_write(command: str, args, ctx: dict, root: Path, path: Path, rel: st
                 _atomic_write_bytes(path, new_text.encode("utf-8"), exclusive=True)
             except FileExistsError:
                 raise FilingRefusal("path-exists", f"{rel} already exists")
+            except ReservationLeftError as exc:
+                raise FilingRefusal("io-error", f"cannot write {rel}: {exc}", on_disk="rejected",
+                                    remedy=f"remove it with: rm {shlex.quote(exc.reserved_path)}",
+                                    path_on_disk=exc.reserved_path)
             except OSError as exc:
                 raise FilingRefusal("io-error", f"cannot write {rel}: {exc}")
     else:
@@ -13357,7 +13389,7 @@ def _load_topic(root: Path, topic_id: str, command: str) -> tuple:
     if not claimants:
         raise FilingRefusal("unknown-topic", f"no topic {topic_id!r} under {root}/topics")
     if len(claimants) > 1:
-        raise FilingRefusal("ambiguous-topic", f"topic id {topic_id} is claimed by {len(claimants)} files: "
+        raise FilingRefusal("ambiguous-topic", f"topic id {topic_id} is carried by {len(claimants)} files: "
                             + ", ".join(str(p) for p in claimants))
     path = claimants[0]
     if "topics" not in path.relative_to(root).parts[:1]:
