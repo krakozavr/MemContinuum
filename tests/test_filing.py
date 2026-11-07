@@ -1144,8 +1144,10 @@ class TestGateRound4(FilingCase):
 
     def test_the_lenient_reader_returns_the_bare_id_of_a_commented_malformed_file(self):
         bad = self.malformed()
+        # round 5 R5-1: no lenient id reading exists; the file is a raw claimant
+        # (its id line holds the id as a whole token), never an id value
         self.assertIsNone(memidx._record_id_of(bad))
-        self.assertEqual(memidx._record_id_of(bad, lenient=True), "TOP-9100")
+        self.assertEqual(memidx._id_claim(bad, "TOP-9100"), "raw")
 
     def test_a_malformed_commented_id_twin_of_a_valid_topic_refuses_append_and_promote(self):
         bad = self.malformed()
@@ -1195,6 +1197,118 @@ class TestGateRound4(FilingCase):
         self.assertNotIn("Traceback", err)
         self.assertIn("reason=outside-store", self.log_lines()[-1])
         self.assertEqual(sha(outside / "memory" / "widget.md"), before)
+
+
+class TestGateRound5(FilingCase):
+    """Gate round 5 (TOP-0137 L23): one fail-closed lookup rule. A file that
+    parses strictly matches only by its exact parsed id; a file that does not
+    is a raw claimant when its `id:` line holds the id as a whole token, and a
+    raw claimant is never a write target."""
+
+    BROKEN_TITLE = 'title: "unclosed'
+
+    def broken(self, id_line, rel="topics/memory/broken.md", topic_id="TOP-9100", body_extra=""):
+        text = TOPIC.replace("id: TOP-9100", id_line).replace(
+            "title: Filing fixture topic about widget caching", self.BROKEN_TITLE)
+        path = self.store / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        self.commit("broken")
+        self.head0 = self.head()
+        return path
+
+    def test_a_quoted_id_with_a_trailing_comment_in_a_malformed_file_is_an_ambiguous_twin(self):
+        for label, line in (("double", 'id: "TOP-9100" # comment'), ("single", "id: 'TOP-9100' # comment")):
+            with self.subTest(label):
+                bad = self.broken(line)
+                before = (sha(bad), sha(self.topic))
+                self.assertEqual(memidx._id_claim(bad, "TOP-9100"), "raw")
+                rc, _o, err = self.append()
+                self.assertEqual(rc, 1, err)
+                self.assertIn("reason=ambiguous-topic", self.log_lines()[-1])
+                self.assertIn(str(bad.resolve()), err)
+                rc, _o, err = self.run_cmd("promote", "TOP-9100", "L1", "--session", SID,
+                                           "--yes-message", YES_UUID)
+                self.assertEqual(rc, 1, err)
+                self.assertIn("reason=ambiguous-topic", self.log_lines()[-1])
+                self.assertEqual((sha(bad), sha(self.topic)), before)
+                bad.unlink()
+
+    def test_a_valid_file_whose_id_contains_a_hash_is_never_a_match_for_the_text_before_it(self):
+        for label, line in (("double", 'id: "TOP-9100 # literal"'), ("single", "id: 'TOP-9100 # literal'")):
+            with self.subTest(label):
+                self.topic.write_text(TOPIC.replace("id: TOP-9100", line))
+                self.commit("literal hash id " + label)
+                self.head0 = self.head()
+                before = sha(self.topic)
+                self.assertEqual(memidx.parse_record_raw(self.topic.read_text(), "x").frontmatter["id"],
+                                 "TOP-9100 # literal")
+                rc, _o, err = self.append()
+                self.assertEqual(rc, 1, err)
+                self.assertIn("reason=unknown-topic", self.log_lines()[-1])
+                self.assertIsNone(memidx._topic_file_for_id(self.store, "TOP-9100"))
+                rc, _o, err = run_memidx(["bind", "TOP-9100", "src/foo.py", "--root", str(self.store),
+                                          "--code-root", str(self.tmp)])
+                self.assertEqual(rc, 1, err)
+                self.assertIn("no topic 'TOP-9100'", err)
+                rc, _o, err = run_memidx(["mark-standing", "TOP-9100", "L1", "--add", "--authority", "owner-ratified",
+                                          "--source", "s", "--why", "w", "--root", str(self.store)])
+                self.assertEqual(rc, 1, err)
+                self.assertIn("no topic 'TOP-9100'", err)
+                self.assertEqual(sha(self.topic), before)
+
+    def test_a_multi_document_raw_value_counts_as_a_raw_claimant_beside_a_valid_twin(self):
+        bad = self.store / "topics" / "memory" / "multi.md"
+        bad.write_text("---\nid: TOP-9100 # x\n---\nother\n---\nmore\n")
+        self.commit("multi")
+        self.head0 = self.head()
+        self.assertIsNotNone(memidx._id_claim(bad, "TOP-9100"))
+        before = (sha(bad), sha(self.topic))
+        rc, _o, err = self.append()
+        self.assertEqual(rc, 1, err)
+        self.assertIn("reason=ambiguous-topic", self.log_lines()[-1])
+        self.assertIn(str(bad.resolve()), err)
+        self.assertEqual((sha(bad), sha(self.topic)), before)
+
+    def test_the_raw_claimant_needs_the_whole_token(self):
+        for line in ("id: TOP-91000", "id: TOP-9100x", "id: xTOP-9100", "id: TOP-910"):
+            with self.subTest(line):
+                bad = self.broken(line)
+                self.assertIsNone(memidx._id_claim(bad, "TOP-9100"))
+                bad.unlink()
+
+    def test_a_lone_raw_claimant_is_found_by_bind_and_mark_standing_and_refused_on_parse(self):
+        self.topic.unlink()
+        bad = self.broken('id: "TOP-9100" # c')
+        self.assertEqual(memidx._topic_file_for_id(self.store, "TOP-9100"), self.store / "topics" / "memory" / "broken.md")
+        before = sha(bad)
+        rc, _o, err = run_memidx(["bind", "TOP-9100", "src/foo.py", "--root", str(self.store),
+                                  "--code-root", str(self.tmp)])
+        self.assertEqual(rc, 1, err)
+        self.assertIn("does not parse", err)
+        self.assertEqual(sha(bad), before)
+
+    def test_two_raw_claimants_and_no_strict_one_are_not_found_by_name(self):
+        self.topic.unlink()
+        self.broken('id: "TOP-9100" # c')
+        self.broken("id: 'TOP-9100' # c", rel="topics/memory/broken2.md")
+        self.assertIsNone(memidx._topic_file_for_id(self.store, "TOP-9100"))
+
+    def test_a_valid_file_wins_over_raw_claimants_for_bind_lookup(self):
+        self.broken('id: "TOP-9100" # c')
+        self.assertEqual(memidx._topic_file_for_id(self.store, "TOP-9100"), self.topic)
+
+    def test_a_malformed_quoted_comment_id_is_held_by_allocation_and_record_id(self):
+        bad = self.broken('id: "TOP-9700 # not a comment"', topic_id="TOP-9700")
+        before = sha(bad)
+        rc, _o, err = self.run_cmd("record", "--title", "Collides", "--area", "memory", "--ruling", "r",
+                                   "--id", "TOP-9700")
+        self.assertEqual(rc, 1, err)
+        self.assertIn("reason=id-exists", self.log_lines()[-1])
+        rc, out, err = self.run_cmd("record", "--title", "Allocated", "--area", "memory", "--ruling", "r")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("TOP-9701", out + err)
+        self.assertEqual(sha(bad), before)
 
 
 if __name__ == "__main__":

@@ -11892,67 +11892,90 @@ def _anchor_today() -> str:
     return datetime.now().date().isoformat()
 
 
-def _lenient_id_text(rid) -> str | None:
-    """The id text of a LENIENT read. The parser's lenient fallback returns the
-    raw value (`TOP-9 # note`, `'TOP-9'`), so normalise it the way YAML would
-    read the `id:` line; when YAML cannot, drop a trailing ` #` comment and
-    the quotes. Lookup/allocation only (TOP-0137 L23, gate round 4 R4-1)."""
-    if rid is None:
-        return None
-    text = str(rid)
+def _raw_id_text(path: Path) -> str | None:
+    """The text of every top-level `id:` line in the raw frontmatter of `path`
+    (the text between the opening fence and the first `\\n---` after it),
+    joined by newlines; None when the file is unreadable, has no frontmatter
+    fence, or has no such line. Undecodable bytes are replaced. Used only to
+    NAME a file that does not parse strictly -- it is never an id value."""
     try:
-        one = yaml.safe_load("id: " + text)
-    except yaml.YAMLError:
-        one = None
-    if isinstance(one, dict) and isinstance(one.get("id"), str):
-        out = one["id"]
-    else:
-        out = text.split(" #", 1)[0].strip().strip("'\"")
-    return out.strip() or None
+        text = Path(path).read_bytes().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    if not text.startswith("---"):
+        return None
+    nl = text.find("\n")
+    if nl < 0:
+        return None
+    rest = text[nl + 1:]
+    if rest.startswith("---"):
+        return None
+    block = rest.split("\n---", 1)[0]
+    lines = [line[3:] for line in block.splitlines() if line.startswith("id:")]
+    return "\n".join(lines) if lines else None
 
 
-def _record_id_of(path: Path, lenient: bool = False, unparsed: list | None = None) -> str | None:
+def _id_token_re(topic_id: str):
+    return re.compile(r"(?<![A-Za-z0-9_-])" + re.escape(topic_id) + r"(?![A-Za-z0-9_-])")
+
+
+def _id_claim(path: Path, topic_id: str) -> str | None:
+    """How `path` relates to `topic_id` (TOP-0137 L23, gate round 5 R5-1), one
+    fail-closed rule for filing, `bind` and `mark-standing`:
+    "strict" -- the file decodes, parses without the lenient fallback and its
+    parsed `id` equals `topic_id` exactly (the only kind that is ever a write
+    target); "raw" -- the file does NOT parse strictly (invalid, undecodable,
+    fallback-parsed, or no frontmatter id) and its raw top-level `id:` line
+    holds `topic_id` as a whole token (it exists only to be refused); else None.
+    A file that parses strictly with a DIFFERENT id is never a match, whatever
+    its id line looks like."""
+    try:
+        raw = Path(path).read_bytes()
+    except OSError:
+        return None
+    parsed_id = None
+    try:
+        result = parse_record_raw(raw.decode("utf-8"), path)
+        if result.valid and not result.fallback:
+            parsed_id = result.frontmatter.get("id")
+            if parsed_id is not None and str(parsed_id):
+                return "strict" if str(parsed_id) == topic_id else None
+    except UnicodeDecodeError:
+        pass
+    id_text = _raw_id_text(path)
+    if id_text is not None and _id_token_re(topic_id).search(id_text):
+        return "raw"
+    return None
+
+
+def _record_id_of(path: Path, unparsed: list | None = None) -> str | None:
     """The parsed frontmatter `id` of a store file, read with the engine's own
     record parser (so `id: TOP-1 # note` and quoted spellings count), or None
-    when the file is unreadable, not UTF-8, or does not parse. `lenient`
-    (lookup only) still reports the id of a file that is not UTF-8 (decoded with
-    replacement) or whose frontmatter only parses leniently, so a flawed topic
-    can be FOUND and refused by name.
-    The one id reader for `_store_ids` and `_topic_file_for_id`. When
+    when the file is unreadable, not UTF-8, or does not parse strictly. When
     `unparsed` (a list) is given, a file that could not be read or parsed (as
-    opposed to one that simply carries no id) appends its path to it."""
+    opposed to one that simply carries no id) appends its path to it. Used by
+    `_store_ids`; lookup by name goes through `_id_claim`."""
     def fail():
         if unparsed is not None:
             unparsed.append(path)
         return None
     try:
-        raw = Path(path).read_bytes()
-    except OSError:
+        text = Path(path).read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError):
         return fail()
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        if not lenient:
-            return fail()
-        text = raw.decode("utf-8", errors="replace")
     result = parse_record_raw(text, path)
-    if not result.valid and not lenient:
+    if not result.valid or result.fallback:
         return fail()
     rid = result.frontmatter.get("id")
-    if lenient and not rid:
-        # last resort for a file the parser cannot read at all (an unterminated
-        # block): the top-level `id:` line. Lookup-by-name only.
-        for line in text.split("\n---", 1)[0].splitlines():
-            if line.startswith("id:"):
-                rid = line[3:]
-                break
-    if lenient:
-        return _lenient_id_text(rid)
     return str(rid) if rid else None
 
 
 def _topic_file_for_id(root: Path, topic_id: str) -> Path | None:
-    """The store file whose frontmatter `id` is `topic_id`, under topics/."""
+    """The store file for `topic_id` under topics/ (bind, mark-standing): the
+    ONE file that matches strictly (`_id_claim`), even when raw claimants of
+    the same id exist; with no strict match, the one raw claimant (so the
+    caller refuses it on parse/decode); otherwise None (no match, or more
+    than one strict match or more than one raw claimant -- fail closed)."""
     topics_dir = Path(root) / "topics"
     if not topics_dir.is_dir():
         return None
@@ -11967,25 +11990,25 @@ def _topic_file_for_id(root: Path, topic_id: str) -> Path | None:
         except ValueError:
             return found
 
-    undecodable = None
+    strict, raw = [], []
     for path in walk_markdown(topics_dir):
-        # lenient on purpose: an undecodable file must still be FOUND so the
-        # writer can refuse it by name instead of reporting "no topic" -- but
-        # only when no VALID file carries the id (a valid duplicate wins, in
-        # whatever order the walk meets them)
-        if _record_id_of(path) == topic_id:
-            return own_spelling(path)
-        if undecodable is None and _record_id_of(path, lenient=True) == topic_id:
-            undecodable = own_spelling(path)
-    return undecodable
+        kind = _id_claim(path, topic_id)
+        if kind == "strict":
+            strict.append(own_spelling(path))
+        elif kind == "raw":
+            raw.append(own_spelling(path))
+    if len(strict) == 1:
+        return strict[0]
+    if not strict and len(raw) == 1:
+        return raw[0]
+    return None
 
 
 def _topic_claimants(root: Path, topic_id: str) -> list:
-    """Every file under `topics/` AND `inbox/` that claims `topic_id` -- read
-    leniently (an undecodable or unparsable file still counts), so a flawed
-    claimant is named instead of hidden. Filing lookup only: it finds files to
-    refuse by name; `_load_topic` writes only a single claimant that parses
-    strictly with exactly this id (TOP-0137 L23, gate round 3 R3-1/R3-5)."""
+    """`[(path, kind)]` sorted by path, over every file under `topics/` AND
+    `inbox/` that claims `topic_id` by `_id_claim` ("strict" or "raw"). Filing
+    lookup only: it finds files to refuse by name; `_load_topic` writes only a
+    single strict claimant under topics/ (TOP-0137 L23, gate round 5 R5-1)."""
     found = []
     walked_root = Path(root).resolve()
     for sub in ("topics", "inbox"):
@@ -11993,11 +12016,12 @@ def _topic_claimants(root: Path, topic_id: str) -> list:
         if not base.is_dir():
             continue
         for path in walk_markdown(base):
-            if _record_id_of(path, lenient=True) == topic_id:
+            kind = _id_claim(path, topic_id)
+            if kind:
                 try:
-                    found.append(Path(root) / path.relative_to(walked_root))
+                    found.append((Path(root) / path.relative_to(walked_root), kind))
                 except ValueError:
-                    found.append(path)
+                    found.append((path, kind))
     return sorted(found)
 
 
@@ -12439,7 +12463,7 @@ def cmd_bind(args) -> int:
         print(f"bind: {path.name} is not valid UTF-8 ({exc}); nothing written", file=sys.stderr)
         return 1
     result = parse_record_raw(old_text, path)
-    if not result.valid:
+    if not result.valid or result.fallback:
         print(f"bind: {path.name} does not parse cleanly: "
               f"{'; '.join(m for _f, m in result.diagnostics)}", file=sys.stderr)
         return 1
@@ -12695,7 +12719,7 @@ def cmd_mark_standing(args) -> int:
         print(f"mark-standing: {path.name} is not valid UTF-8 ({exc}); nothing written", file=sys.stderr)
         return 1
     result = parse_record_raw(old_text, path)
-    if not result.valid:
+    if not result.valid or result.fallback:
         print(f"mark-standing: {path.name} does not parse cleanly: "
               f"{'; '.join(m for _f, m in result.diagnostics)}", file=sys.stderr)
         return 1
@@ -13045,21 +13069,24 @@ def _store_ids(root: Path) -> dict:
     parsed frontmatter `id` of each markdown file, read with the engine's own
     record parser (the same source of truth as memlint's duplicate-id check in
     `lint_root`, which lints the whole store and so cannot be called here). A
-    file that does not parse is skipped with a stderr note."""
+    file that does not parse strictly still HOLDS every canonical `TOP-<n>`
+    token on its raw top-level `id:` line (over-inclusive on purpose: it only
+    skips numbers, and `record --id X` refuses while an unparseable file names
+    X); a file with nothing to count is skipped with a stderr note."""
     out: dict = {}
     for path in walk_markdown(root):
         unparsed: list = []
         rid = _record_id_of(path, unparsed=unparsed)
-        if unparsed:
-            # a malformed file still HOLDS its id: count it (allocation must
-            # not re-issue it; --id must collide), skip only an unreadable one
-            rid = _record_id_of(path, lenient=True)
-            if not rid:
-                print(f"filing: skipped {path} while collecting ids (unreadable, not UTF-8, "
-                      f"or does not parse)", file=sys.stderr)
-                continue
         if rid:
             out.setdefault(rid, []).append(path)
+            continue
+        raw = _raw_id_text(path) if (unparsed or rid is None) else None
+        tokens = sorted(set(re.findall(r"(?<![A-Za-z0-9_-])TOP-\d+(?![A-Za-z0-9_-])", raw or "")))
+        for token in tokens:
+            out.setdefault(token, []).append(path)
+        if unparsed and not tokens:
+            print(f"filing: skipped {path} while collecting ids (unreadable, not UTF-8, "
+                  f"or does not parse)", file=sys.stderr)
     return out
 
 
@@ -13409,7 +13436,7 @@ def _load_topic(root: Path, topic_id: str, command: str) -> tuple:
     claimants = _topic_claimants(root, topic_id)
     if not claimants:
         raise FilingRefusal("unknown-topic", f"no topic {topic_id!r} under {root}/topics")
-    for path in claimants:
+    for path, _kind in claimants:
         try:
             path.relative_to(root)
         except ValueError:
@@ -13417,16 +13444,16 @@ def _load_topic(root: Path, topic_id: str, command: str) -> tuple:
                                 f"{root} (a symlinked topics/ or inbox/?)")
     if len(claimants) > 1:
         raise FilingRefusal("ambiguous-topic", f"topic id {topic_id} is carried by {len(claimants)} files: "
-                            + ", ".join(str(p) for p in claimants))
-    path = claimants[0]
-    if "topics" not in path.relative_to(root).parts[:1]:
+                            + ", ".join(str(p) for p, _k in claimants))
+    path, kind = claimants[0]
+    if kind == "strict" and "topics" not in path.relative_to(root).parts[:1]:
         raise FilingRefusal("unknown-topic", f"{topic_id} is claimed only by {path}, which is not under topics/")
     try:
         old_text = read_record_bytes_strict(path)
     except UnicodeDecodeError as exc:
         raise FilingRefusal("not-utf8", f"{path.name} is not valid UTF-8 ({exc})")
     result = parse_record_raw(old_text, path)
-    if not result.valid:
+    if not result.valid or result.fallback:
         raise FilingRefusal("parse", f"{path.name} does not parse cleanly: "
                             + "; ".join(m for _f, m in result.diagnostics))
     if str(result.frontmatter.get("id")) != topic_id:
