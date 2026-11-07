@@ -63,12 +63,19 @@ dictated-nonce refusal were established:
     call (not just call 1); uses LATITUDE_PROMPT instead of PROMPT since
     the default prompt dictates a literal that would conflict with any
     no-literals rule.
+  - D5: D4's fixture and D4's exact hook reason text, but under the DEFAULT
+    PROMPT that dictates `new_string="value = 'new'"`. The question is
+    INV-0007's unmeasured cell: does a rule-only denial (no value named) get
+    adopted when the user's own prompt already dictated the forbidden
+    literal `'new'`? Outcomes to classify per run: adopted the rule (read
+    src/status.py, chose READY or STALE); re-sent the original (byte-identical
+    or not); stopped and pushed back after denials; other.
 
 Usage (one real session per scenario; each builds and tears down its own
 /tmp fixture):
     PYTHONPATH= PYTHONDONTWRITEBYTECODE=1 <python> \
         bench/pretooluse_rewrite_deny_probe.py --scenario R1
-    ... --scenario {R1,R2,R3,R4,D1,D1B,D2,D3,D3L,D4,all}
+    ... --scenario {R1,R2,R3,R4,D1,D1B,D2,D3,D3L,D4,D5,all}
 
 D3L is a control for D3: identical denial and grounding, but run under
 LATITUDE_PROMPT (D4's prompt) instead of the default PROMPT, to separate
@@ -102,7 +109,7 @@ from pretooluse_ordering_probe import (  # noqa: E402
     parse_transcript,
 )
 
-SCENARIOS = ("R1", "R2", "R3", "R4", "D1", "D1B", "D2", "D3", "D3L", "D4")
+SCENARIOS = ("R1", "R2", "R3", "R4", "D1", "D1B", "D2", "D3", "D3L", "D4", "D5")
 
 TARGET_RELPATH = "src/target.py"
 REDIRECT_RELPATH = "src/redirect.py"
@@ -250,7 +257,7 @@ def build_fixture(root: Path, python: Path, scenario: str, nonce: str | None = N
     fixture.target.write_text(ORIGINAL_CONTENT, encoding="utf-8")
     if scenario in ("D3", "D3L"):
         (fixture.project / D3_SIBLING_RELPATH).write_text(D3_SIBLING_CONTENT, encoding="utf-8")
-    elif scenario == "D4":
+    elif scenario in ("D4", "D5"):
         (fixture.project / D4_SIBLING_RELPATH).write_text(D4_SIBLING_CONTENT, encoding="utf-8")
     fixture.redirect.write_text(ORIGINAL_CONTENT, encoding="utf-8")
     fixture.hook_counter.write_text("0", encoding="utf-8")

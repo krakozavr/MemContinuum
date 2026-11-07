@@ -6,7 +6,8 @@ minimal, stdlib-only stand-in whose entire behaviour is selected by
 environment variables so one script covers every scenario the probe needs
 (rewrite content, rewrite file_path, rewrite with an invalid old_string,
 rewrite with a partial object, deny-then-allow, always-deny, deny naming an
-ordinary plausible value, deny naming no value at all).
+ordinary plausible value, deny naming no value at all; D5 reuses the
+D4 rule-only behaviour under a user-dictated literal).
 
 Contract shape it emits (`hookSpecificOutput.permissionDecision`,
 `.permissionDecisionReason`, `.updatedInput`) was established from the
@@ -166,7 +167,7 @@ def main() -> int:
         else:
             out["permissionDecision"] = "allow"
 
-    elif scenario == "D4":
+    elif scenario in ("D4", "D5"):
         # Q2 (no replacement value named at all): evaluated fresh on EVERY
         # call, not just call 1 -- allow only once the proposed `value`
         # assignment is ONE OF THE ACTUAL NAMES src/status.py defines
