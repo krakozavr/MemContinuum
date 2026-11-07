@@ -1259,10 +1259,12 @@ class TestGateRound5(FilingCase):
 
     def test_a_multi_document_raw_value_counts_as_a_raw_claimant_beside_a_valid_twin(self):
         bad = self.store / "topics" / "memory" / "multi.md"
-        bad.write_text("---\nid: TOP-9100 # x\n---\nother\n---\nmore\n")
+        bad.write_text('---\nid: TOP-9100 # x\ntitle: "unclosed\n---\nother\n---\nmore\n')
         self.commit("multi")
         self.head0 = self.head()
-        self.assertIsNotNone(memidx._id_claim(bad, "TOP-9100"))
+        self.assertFalse(memidx.parse_record_raw(bad.read_text(), bad).valid
+                         and not memidx.parse_record_raw(bad.read_text(), bad).fallback)
+        self.assertEqual(memidx._id_claim(bad, "TOP-9100"), "raw")
         before = (sha(bad), sha(self.topic))
         rc, _o, err = self.append()
         self.assertEqual(rc, 1, err)
@@ -1329,6 +1331,111 @@ class TestGateRound5(FilingCase):
         self.assertEqual(rc, 1, err)
         self.assertIn("reason=outside-store", self.log_lines()[-1])
         self.assertEqual(sorted(str(p.relative_to(outside)) for p in outside.rglob("*")), listing)
+
+
+class TestGateRound6(FilingCase):
+    """Gate round 6 (TOP-0137 L23): every writer verifies the file through
+    `_verified_topic_record` (containment + strict parse + exact parsed id)
+    before any write; the raw-claimant scan is over-inclusive."""
+
+    def bind(self):
+        (self.tmp / "src").mkdir(exist_ok=True)
+        (self.tmp / "src" / "foo.py").write_text("x = 1\n")
+        return run_memidx(["bind", "TOP-9100", "src/foo.py", "--root", str(self.store),
+                           "--code-root", str(self.tmp)])
+
+    def mark(self):
+        return run_memidx(["mark-standing", "TOP-9100", "L2", "--add", "--authority", "owner-ratified",
+                           "--source", "s", "--why", "w", "--root", str(self.store)])
+
+    def put(self, text, rel="topics/memory/widget.md"):
+        path = self.store / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        self.commit("fixture")
+        self.head0 = self.head()
+        return path
+
+    def assert_both_refuse(self, path, needle):
+        before = sha(path)
+        for label, run in (("bind", self.bind), ("mark-standing", self.mark)):
+            rc, _o, err = run()
+            self.assertEqual(rc, 1, f"{label}: {err}")
+            self.assertIn(needle, err, label)
+            self.assertNotIn("Traceback", err)
+            self.assertEqual(sha(path), before, label)
+
+    def test_a_valid_file_with_a_null_or_empty_parsed_id_is_refused_by_bind_and_mark_standing(self):
+        for label, line in (("comment", "id: # TOP-9100"), ("empty", 'id: "" # TOP-9100'),
+                            ("null", "id: null # TOP-9100")):
+            with self.subTest(label):
+                path = self.put(TOPIC.replace("id: TOP-9100", line))
+                result = memidx.parse_record_raw(path.read_text(), path)
+                self.assertTrue(result.valid and not result.fallback)
+                self.assertIn(result.frontmatter.get("id"), (None, ""))
+                self.assertEqual(memidx._id_claim(path, "TOP-9100"), "raw")
+                self.assert_both_refuse(path, "carries id none")
+                rc, _o, err = self.append()
+                self.assertEqual(rc, 1, err)
+                self.assertIn("reason=topic-id-mismatch", self.log_lines()[-1])
+
+    def test_a_column_zero_id_line_inside_a_quoted_scalar_is_not_a_write_target(self):
+        text = TOPIC.replace("id: TOP-9100\n", "").replace(
+            "title: Filing fixture topic about widget caching",
+            'title: "first line\nid: TOP-9100\nlast line"')
+        path = self.put(text)
+        result = memidx.parse_record_raw(path.read_text(), path)
+        self.assertTrue(result.valid and not result.fallback)
+        self.assertIsNone(result.frontmatter.get("id"))
+        self.assertEqual(memidx._id_claim(path, "TOP-9100"), "raw")
+        self.assert_both_refuse(path, "carries id none")
+
+    def test_a_strict_matching_file_still_binds_and_marks_standing(self):
+        rc, _o, err = self.bind()
+        self.assertEqual(rc, 0, err)
+        self.assertIn("src/foo.py", self.topic.read_text())
+        rc, _o, err = self.mark()
+        self.assertEqual(rc, 0, err)
+        self.assertIn("standing", self.topic.read_text())
+
+    def test_a_fence_with_a_trailing_space_does_not_hide_a_raw_claimant(self):
+        bad = self.put('---\ntype: topic\ntitle: "unclosed\n--- \nid: TOP-9100\n---\nbody\n',
+                       rel="topics/memory/fence.md")
+        self.assertEqual(memidx._id_claim(bad, "TOP-9100"), "raw")
+        before = (sha(bad), sha(self.topic))
+        rc, _o, err = self.append()
+        self.assertEqual(rc, 1, err)
+        self.assertIn("reason=ambiguous-topic", self.log_lines()[-1])
+        rc, _o, err = self.run_cmd("promote", "TOP-9100", "L1", "--session", SID, "--yes-message", YES_UUID)
+        self.assertEqual(rc, 1, err)
+        self.assertIn("reason=ambiguous-topic", self.log_lines()[-1])
+        self.assertEqual((sha(bad), sha(self.topic)), before)
+        self.topic.unlink()
+        self.commit("lone")
+        self.head0 = self.head()
+        self.assert_both_refuse(bad, "does not parse cleanly")
+
+    def test_bind_and_mark_standing_refuse_a_symlinked_topics_directory_outside_the_store(self):
+        outside = self.tmp / "elsewhere"
+        shutil.move(str(self.store / "topics"), str(outside))
+        (self.store / "topics").symlink_to(outside)
+        self.commit("symlinked topics")
+        self.head0 = self.head()
+        target = outside / "memory" / "widget.md"
+        self.assert_both_refuse(target, "outside the store")
+
+    def test_a_spaced_or_indented_id_line_in_an_unparseable_file_is_a_raw_claimant(self):
+        for label, line in (("space-before-colon", "id : TOP-9100"), ("two-space-indent", "  id: TOP-9100")):
+            with self.subTest(label):
+                bad = self.put('---\ntype: topic\n' + line + '\ntitle: "unclosed\n---\nbody\n',
+                               rel="topics/memory/spaced.md")
+                self.assertEqual(memidx._id_claim(bad, "TOP-9100"), "raw")
+                before = (sha(bad), sha(self.topic))
+                rc, _o, err = self.append()
+                self.assertEqual(rc, 1, err)
+                self.assertIn("reason=ambiguous-topic", self.log_lines()[-1])
+                self.assertEqual((sha(bad), sha(self.topic)), before)
+                bad.unlink()
 
 
 if __name__ == "__main__":

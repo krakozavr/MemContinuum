@@ -11892,27 +11892,28 @@ def _anchor_today() -> str:
     return datetime.now().date().isoformat()
 
 
+_RAW_ID_LINE_RE = re.compile(r"^[ \t]{0,2}id[ \t]*:(.*)$")
+
+
 def _raw_id_text(path: Path) -> str | None:
-    """The text of every top-level `id:` line in the raw frontmatter of `path`
-    (the text between the opening fence and the first `\\n---` after it),
-    joined by newlines; None when the file is unreadable, has no frontmatter
-    fence, or has no such line. Undecodable bytes are replaced. Used only to
-    NAME a file that does not parse strictly -- it is never an id value."""
+    """The remainder of EVERY line of `path` (the whole file, not only the
+    frontmatter) that looks like a top-level `id:` line -- up to two spaces of
+    indent, optional space before the colon -- joined by newlines; None when
+    the file is unreadable or has no such line. Over-inclusive by design
+    (TOP-0137 L23, gate round 6 R6-3/R6-5): an extra raw claimant on a
+    malformed file can only produce a refusal, never a write. Undecodable
+    bytes are replaced. Used only to NAME a file that does not parse strictly
+    -- it is never an id value."""
     try:
         text = Path(path).read_bytes().decode("utf-8", errors="replace")
     except OSError:
         return None
-    if not text.startswith("---"):
-        return None
-    nl = text.find("\n")
-    if nl < 0:
-        return None
-    rest = text[nl + 1:]
-    if rest.startswith("---"):
-        return None
-    block = rest.split("\n---", 1)[0]
-    lines = [line[3:] for line in block.splitlines() if line.startswith("id:")]
-    return "\n".join(lines) if lines else None
+    found = []
+    for line in text.splitlines():
+        m = _RAW_ID_LINE_RE.match(line)
+        if m:
+            found.append(m.group(1))
+    return "\n".join(found) if found else None
 
 
 def _id_token_re(topic_id: str):
@@ -12457,17 +12458,10 @@ def cmd_bind(args) -> int:
     if path is None:
         print(f"bind: no topic {args.topic!r} under {args.root}/topics", file=sys.stderr)
         return 1
-    try:
-        old_text = read_record_bytes_strict(path)
-    except UnicodeDecodeError as exc:
-        print(f"bind: {path.name} is not valid UTF-8 ({exc}); nothing written", file=sys.stderr)
+    old_text, fm, reason = _verified_topic_record(root, args.topic, path)
+    if reason:
+        print(f"bind: {reason[1]}; nothing written", file=sys.stderr)
         return 1
-    result = parse_record_raw(old_text, path)
-    if not result.valid or result.fallback:
-        print(f"bind: {path.name} does not parse cleanly: "
-              f"{'; '.join(m for _f, m in result.diagnostics)}", file=sys.stderr)
-        return 1
-    fm = result.frontmatter
     link_id = _topic_current_link(fm)
     if link_id is None:
         print(f"bind: {args.topic} has no active link to anchor", file=sys.stderr)
@@ -12713,17 +12707,10 @@ def cmd_mark_standing(args) -> int:
     if path is None:
         print(f"mark-standing: no topic {args.topic!r} under {args.root}/topics", file=sys.stderr)
         return 1
-    try:
-        old_text = read_record_bytes_strict(path)
-    except UnicodeDecodeError as exc:
-        print(f"mark-standing: {path.name} is not valid UTF-8 ({exc}); nothing written", file=sys.stderr)
+    old_text, fm, reason = _verified_topic_record(root, args.topic, path)
+    if reason:
+        print(f"mark-standing: {reason[1]}; nothing written", file=sys.stderr)
         return 1
-    result = parse_record_raw(old_text, path)
-    if not result.valid or result.fallback:
-        print(f"mark-standing: {path.name} does not parse cleanly: "
-              f"{'; '.join(m for _f, m in result.diagnostics)}", file=sys.stderr)
-        return 1
-    fm = result.frontmatter
     before = standing_ids(fm)
     if add and link_id in before:
         print(f"mark-standing: {args.topic} {link_id} is already standing; nothing written")
@@ -13432,34 +13419,52 @@ def _code_roots_for_filing(args) -> list:
     return _code_roots_arg(args.code_root)
 
 
+def _verified_topic_record(root: Path, topic_id: str, path: Path) -> tuple:
+    """The ONE write-target check for `append`/`promote` (`_load_topic`), `bind`
+    and `mark-standing` (TOP-0137 L23, gate round 6 R6-1/R6-4): `path` must
+    (a) resolve inside the resolved store `root`, separator-bounded, and
+    (b) decode as UTF-8, parse strictly (valid, not fallback) and carry a
+    parsed `id` equal to `topic_id`. Returns `(text, frontmatter, None)` or
+    `(None, None, (token, message))` -- the refusal token and a one-line
+    message; the caller refuses before any write."""
+    real_root = os.path.realpath(root)
+    real_path = os.path.realpath(path)
+    if not real_path.startswith(real_root.rstrip(os.sep) + os.sep):
+        return None, None, ("outside-store", f"{topic_id} is claimed by {path}, which resolves to {real_path}, "
+                            f"outside the store {root} (a symlinked topics/ or inbox/?)")
+    try:
+        text = read_record_bytes_strict(path)
+    except UnicodeDecodeError as exc:
+        return None, None, ("not-utf8", f"{Path(path).name} is not valid UTF-8 ({exc})")
+    result = parse_record_raw(text, path)
+    if not result.valid or result.fallback:
+        return None, None, ("parse", f"{Path(path).name} does not parse cleanly: "
+                            + "; ".join(m for _f, m in result.diagnostics))
+    parsed = result.frontmatter.get("id")
+    if str(parsed) != topic_id:
+        return None, None, ("topic-id-mismatch", f"no topic with id {topic_id} (the file {path} carries id "
+                            f"{parsed if parsed not in (None, '') else 'none'})")
+    return text, result.frontmatter, None
+
+
 def _load_topic(root: Path, topic_id: str, command: str) -> tuple:
     claimants = _topic_claimants(root, topic_id)
     if not claimants:
         raise FilingRefusal("unknown-topic", f"no topic {topic_id!r} under {root}/topics")
-    for path, _kind in claimants:
-        try:
-            path.relative_to(root)
-        except ValueError:
-            raise FilingRefusal("outside-store", f"{topic_id} is claimed by {path}, which is outside the store "
-                                f"{root} (a symlinked topics/ or inbox/?)")
     if len(claimants) > 1:
         raise FilingRefusal("ambiguous-topic", f"topic id {topic_id} is carried by {len(claimants)} files: "
                             + ", ".join(str(p) for p, _k in claimants))
     path, kind = claimants[0]
-    if kind == "strict" and "topics" not in path.relative_to(root).parts[:1]:
-        raise FilingRefusal("unknown-topic", f"{topic_id} is claimed only by {path}, which is not under topics/")
     try:
-        old_text = read_record_bytes_strict(path)
-    except UnicodeDecodeError as exc:
-        raise FilingRefusal("not-utf8", f"{path.name} is not valid UTF-8 ({exc})")
-    result = parse_record_raw(old_text, path)
-    if not result.valid or result.fallback:
-        raise FilingRefusal("parse", f"{path.name} does not parse cleanly: "
-                            + "; ".join(m for _f, m in result.diagnostics))
-    if str(result.frontmatter.get("id")) != topic_id:
-        raise FilingRefusal("topic-id-mismatch", f"{path.name} claims {topic_id} but its parsed id is "
-                            f"{result.frontmatter.get('id')!r}")
-    return path, old_text, result.frontmatter
+        top = path.relative_to(root).parts[:1]
+    except ValueError:
+        top = ("topics",)  # outside the store: _verified_topic_record refuses it
+    if kind == "strict" and "topics" not in top:
+        raise FilingRefusal("unknown-topic", f"{topic_id} is claimed only by {path}, which is not under topics/")
+    old_text, fm, reason = _verified_topic_record(root, topic_id, path)
+    if reason:
+        raise FilingRefusal(*reason)
+    return path, old_text, fm
 
 
 def _check_links_target(fm: dict, args) -> list:
