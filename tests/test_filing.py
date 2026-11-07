@@ -1310,6 +1310,26 @@ class TestGateRound5(FilingCase):
         self.assertIn("TOP-9701", out + err)
         self.assertEqual(sha(bad), before)
 
+    def test_a_record_through_a_topics_symlink_outside_the_store_creates_nothing(self):
+        outside = self.tmp / "elsewhere"
+        shutil.move(str(self.store / "topics"), str(outside))
+        (self.store / "topics").symlink_to(outside)
+        self.commit("symlinked topics")
+        self.head0 = self.head()
+        listing = sorted(str(p.relative_to(outside)) for p in outside.rglob("*"))
+        rc, out, err = self.run_cmd("record", "--title", "Escapes", "--area", "newarea", "--ruling", "r",
+                                    "--id", "TOP-9800")
+        self.assertEqual(rc, 1, err)
+        self.assertNotIn("Traceback", err)
+        self.assertIn("reason=outside-store", self.log_lines()[-1])
+        self.assertEqual(sorted(str(p.relative_to(outside)) for p in outside.rglob("*")), listing)
+        self.assertFalse((outside / "newarea").exists())
+        rc, out, err = self.run_cmd("record", "--title", "Escapes", "--area", "memory", "--ruling", "r",
+                                    "--id", "TOP-9801", "--dry-run")
+        self.assertEqual(rc, 1, err)
+        self.assertIn("reason=outside-store", self.log_lines()[-1])
+        self.assertEqual(sorted(str(p.relative_to(outside)) for p in outside.rglob("*")), listing)
+
 
 if __name__ == "__main__":
     unittest.main()

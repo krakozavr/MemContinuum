@@ -13585,6 +13585,13 @@ def _record_impl(args, ctx: dict) -> int:
     if not re.match(r"^[a-z0-9][a-z0-9-]*$", slug):
         raise FilingRefusal("usage", "--slug must be lower-case letters, digits and hyphens")
     path = root / "topics" / args.area / f"{slug}.md"
+    # the destination must resolve inside the store BEFORE anything is reserved
+    # (a symlinked topics/ or area/ would otherwise create the file elsewhere)
+    real_root = os.path.realpath(root)
+    real_parent = os.path.realpath(path.parent)
+    if real_parent != real_root and not real_parent.startswith(real_root.rstrip(os.sep) + os.sep):
+        raise FilingRefusal("outside-store", f"{path.relative_to(root)} would be created at {real_parent}, "
+                            f"outside the store {root} (a symlinked topics/ or area?)")
     if path.exists():
         raise FilingRefusal("path-exists", f"{path.relative_to(root)} already exists")
     ctx["topic"] = topic_id

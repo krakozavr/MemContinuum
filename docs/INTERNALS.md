@@ -3904,6 +3904,7 @@ lenient id text is ever reconstructed, so a valid file whose id is
 token on an unparseable file's `id:` line, so `record --id X` refuses and
 automatic allocation skips X while such a file names it, until a human fixes the
 file (fail closed).
+`record` also refuses `outside-store`, before any reservation, when the destination's resolved parent is not inside the store (a symlinked `topics/` or area); allocation ignores symlinked trees by design (`walk_markdown` skips them as outside the store).
 
 **Authority is derived.** `--authority owner-verbatim|owner-ratified` is
 refused. With `--session` and `--owner-message UUID --quote TEXT`, the quote
