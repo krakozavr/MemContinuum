@@ -3896,9 +3896,14 @@ commits.
 **One fail-closed topic lookup** (`_id_claim`; filing, `bind` and `mark-standing`
 alike). A file that decodes and parses strictly matches only by its exact parsed
 `id`; a file that does not (invalid, undecodable, lenient-fallback, or no id) is a
-raw claimant when its raw top-level `id:` line holds the requested id as a whole
-token, and a raw claimant is never a write target: it counts toward
-`ambiguous-topic` and, alone, is refused by the parse or decode refusal. No
+raw claimant when any line of the file (the raw scan reads every line, not only the
+frontmatter; up to two spaces of indent, Unicode spaces allowed) is an `id:` line
+holding the requested id as a whole token, and a raw claimant is never a write
+target. `append` and `promote` count it toward `ambiguous-topic` and refuse;
+`bind` and `mark-standing` still write the single strict topics file even while a
+raw twin or an inbox copy names the id (the pre-existing binding contract,
+`tests/test_binding.py`), and refuse a raw claimant only when it is the sole
+match, with the parse or decode refusal. No
 lenient id text is ever reconstructed, so a valid file whose id is
 `"TOP-9100 # literal"` is not TOP-9100. Allocation counts every canonical `TOP-n`
 token on an unparseable file's `id:` line, so `record --id X` refuses and
