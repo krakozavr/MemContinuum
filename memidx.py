@@ -11892,7 +11892,7 @@ def _anchor_today() -> str:
     return datetime.now().date().isoformat()
 
 
-_RAW_ID_LINE_RE = re.compile(r"^[ \t]{0,2}id[ \t]*:(.*)$")
+_RAW_ID_LINE_RE = re.compile(r"^\s{0,2}id\s*:(.*)$")
 
 
 def _raw_id_text(path: Path) -> str | None:

@@ -1481,6 +1481,23 @@ class TestGateRound7(FilingCase):
         self.assertEqual(shlex.split(line)[-1], str(spaced.resolve()))
         self.assertIn("--source '<where the owner said it>'", line)
 
+    def test_a_unicode_spaced_id_line_in_an_unparseable_file_is_a_raw_claimant(self):
+        for label, sp in (("nbsp", "\u00a0"), ("em-space", "\u2003")):
+            with self.subTest(label):
+                bad = self.store / "topics" / "memory" / "uni.md"
+                bad.write_text('---\ntype: topic\nid' + sp + ': TOP-9100\ntitle: "unclosed\n---\nbody\n')
+                self.commit("fixture")
+                self.head0 = self.head()
+                self.assertEqual(memidx._id_claim(bad, "TOP-9100"), "raw")
+                before = (sha(bad), sha(self.topic))
+                rc, _o, err = self.append()
+                self.assertEqual(rc, 1, err)
+                self.assertIn("reason=ambiguous-topic", self.log_lines()[-1])
+                self.assertEqual((sha(bad), sha(self.topic)), before)
+                bad.unlink()
+                self.commit("cleanup")
+                self.head0 = self.head()
+
 
 if __name__ == "__main__":
     unittest.main()
