@@ -841,6 +841,19 @@ class TestGateRound2(FilingCase):
         self.assertIn("nothing written", err)
         self.assertNotIn("rollback", self.log_lines()[-1])
 
+    # --- R2-2: lookup and allocation read ids the same way ---------------------------
+
+    def test_a_topic_whose_id_line_has_a_comment_is_found_by_append(self):
+        text = TOPIC.replace("id: TOP-9100\n", "id: TOP-9500 # commented\n")
+        self.assertIn("TOP-9500 # commented", text)
+        self.topic.write_text(text)
+        self.commit("commented id")
+        self.head0 = self.head()
+        rc, _o, err = self.append(topic="TOP-9500")
+        self.assertEqual(rc, 0, err)
+        links = self.parsed_links(self.topic.read_text())
+        self.assertEqual(len(links), 3)
+
 
 if __name__ == "__main__":
     unittest.main()

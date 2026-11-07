@@ -11892,6 +11892,49 @@ def _anchor_today() -> str:
     return datetime.now().date().isoformat()
 
 
+def _record_id_of(path: Path, lenient: bool = False, unparsed: list | None = None) -> str | None:
+    """The parsed frontmatter `id` of a store file, read with the engine's own
+    record parser (so `id: TOP-1 # note` and quoted spellings count), or None
+    when the file is unreadable, not UTF-8, or does not parse. `lenient`
+    (lookup only) still reports the id of a file that is not UTF-8 (decoded with
+    replacement) or whose frontmatter only parses leniently, so a flawed topic
+    can be FOUND and refused by name.
+    The one id reader for `_store_ids` and `_topic_file_for_id`. When
+    `unparsed` (a list) is given, a file that could not be read or parsed (as
+    opposed to one that simply carries no id) appends its path to it."""
+    def fail():
+        if unparsed is not None:
+            unparsed.append(path)
+        return None
+    try:
+        raw = Path(path).read_bytes()
+    except OSError:
+        return fail()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        if not lenient:
+            return fail()
+        text = raw.decode("utf-8", errors="replace")
+    result = parse_record_raw(text, path)
+    if not result.valid and not lenient:
+        return fail()
+    rid = result.frontmatter.get("id")
+    if not rid and lenient:
+        # last resort for a file the parser cannot read at all (an unterminated
+        # block): the top-level `id:` line, its VALUE parsed by YAML so a
+        # trailing comment or quotes still count. Lookup-by-name only.
+        for line in text.split("\n---", 1)[0].splitlines():
+            if line.startswith("id:"):
+                try:
+                    one = yaml.safe_load(line)
+                except yaml.YAMLError:
+                    break
+                rid = one.get("id") if isinstance(one, dict) else None
+                break
+    return str(rid) if rid else None
+
+
 def _topic_file_for_id(root: Path, topic_id: str) -> Path | None:
     """The store file whose frontmatter `id` is `topic_id`, under topics/."""
     topics_dir = Path(root) / "topics"
@@ -11908,28 +11951,16 @@ def _topic_file_for_id(root: Path, topic_id: str) -> Path | None:
         except ValueError:
             return found
 
-    pattern = re.compile(r"^id:\s*['\"]?" + re.escape(topic_id) + r"['\"]?\s*$", re.M)
     undecodable = None
     for path in walk_markdown(topics_dir):
-        try:
-            raw = path.read_bytes()
-        except OSError:
-            continue
         # lenient on purpose: an undecodable file must still be FOUND so the
         # writer can refuse it by name instead of reporting "no topic" -- but
         # only when no VALID file carries the id (a valid duplicate wins, in
         # whatever order the walk meets them)
-        try:
-            head = raw.decode("utf-8")
-            valid = True
-        except UnicodeDecodeError:
-            head = raw.decode("utf-8", errors="replace")
-            valid = False
-        if pattern.search(head.split("\n---", 1)[0]):
-            if valid:
-                return own_spelling(path)
-            if undecodable is None:
-                undecodable = own_spelling(path)
+        if _record_id_of(path) == topic_id:
+            return own_spelling(path)
+        if undecodable is None and _record_id_of(path, lenient=True) == topic_id:
+            undecodable = own_spelling(path)
     return undecodable
 
 
@@ -12946,18 +12977,13 @@ def _store_ids(root: Path) -> dict:
     file that does not parse is skipped with a stderr note."""
     out: dict = {}
     for path in walk_markdown(root):
-        try:
-            text = read_record_bytes_strict(path)
-        except (OSError, UnicodeDecodeError):
-            print(f"filing: skipped {path} while collecting ids (unreadable or not UTF-8)", file=sys.stderr)
-            continue
-        result = parse_record_raw(text, path)
-        if not result.valid:
-            print(f"filing: skipped {path} while collecting ids (does not parse)", file=sys.stderr)
-            continue
-        rid = result.frontmatter.get("id")
-        if rid:
-            out.setdefault(str(rid), []).append(path)
+        unparsed: list = []
+        rid = _record_id_of(path, unparsed=unparsed)
+        if unparsed:
+            print(f"filing: skipped {path} while collecting ids (unreadable, not UTF-8, "
+                  f"or does not parse)", file=sys.stderr)
+        elif rid:
+            out.setdefault(rid, []).append(path)
     return out
 
 
