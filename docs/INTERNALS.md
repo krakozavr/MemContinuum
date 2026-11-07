@@ -3876,7 +3876,9 @@ plus the new-link checks `--against-ref` applies. The write itself is atomic
 (`_atomic_write_bytes`: a temp file in the same directory, fsync,
 `os.replace`; a new topic first reserves its path with `O_CREAT|O_EXCL`), so an
 I/O error leaves the original bytes (or no file) and is a refusal
-(`io-error`), as is a mid-write failure in `bind` and `mark-standing`, which
+(`io-error`) -- except that a failed unlink of a new topic's reservation leaves a
+zero-byte file plus the rejected-edit banner, and the next `record` of that slug
+then refuses `path-exists` until the file is removed -- as is a mid-write failure in `bind` and `mark-standing`, which
 share the write. After the write, an existing topic is checked by
 `check_append_only` against `HEAD` for that file; an error, or a guard that
 cannot run at all (`guard-unavailable`), puts the original bytes back and
