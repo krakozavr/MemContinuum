@@ -528,7 +528,18 @@ class TestDedupeRetrievalStanding(FilingCase):
         self.assertTrue((self.store / "topics" / "memory" / "gadget-cache-invalidation-policy.md").exists())
 
     def test_retrieval_miss_warns_and_require_retrieve_gives_rc3(self):
-        with mock.patch.object(memidx, "filing_search_hits", return_value=[]):
+        """The miss is real: `filing_search_hits` runs unmocked and the post-write
+        title search (the `search` argv without --hydrate) comes back empty
+        through `main`."""
+        real_main = memidx.main
+
+        def main_with_empty_title_search(argv=None):
+            if argv and argv[0] == "search" and "--hydrate" not in argv:
+                print("[]")
+                return 0
+            return real_main(argv)
+
+        with mock.patch.object(memidx, "main", main_with_empty_title_search):
             rc, _o, err = self.append()
             self.assertEqual(rc, 0)
             self.assertIn("WARNING: retrieval check missed (title search did not return TOP-9100)", err)
@@ -717,6 +728,70 @@ class TestGateRound1(FilingCase):
         self.assertIn("transcripts match session", err)
         self.assertIn("reason=ambiguous-transcript", self.log_lines()[-1])
         self.assertEqual(sha(self.topic), before)
+
+    # --- R1-8: refusals and behaviours the first round left untested ------------------
+
+    def _refused_unchanged(self, path, argv, needle=None):
+        before = sha(path)
+        rc, _o, err = self.run_cmd(*argv)
+        self.assertEqual(rc, 1, err)
+        if needle:
+            self.assertIn(needle, err)
+        self.assertEqual(sha(path), before)
+        return err
+
+    def test_malformed_frontmatter_is_refused(self):
+        bad = self.store / "topics" / "memory" / "broken.md"
+        bad.write_text("---\ntype: topic\nid: TOP-9120\ntitle: Broken\nlinks:\n  - link: L1\n")
+        self._refused_unchanged(bad, ["append", "TOP-9120", "--ruling", "x"], "does not parse")
+
+    def test_missing_links_key_is_refused(self):
+        nolinks = self.store / "topics" / "memory" / "nolinks.md"
+        nolinks.write_text("---\ntype: topic\nid: TOP-9121\ntitle: No links\narea: memory\n---\n\nB\n")
+        self._refused_unchanged(nolinks, ["append", "TOP-9121", "--ruling", "x"], "links")
+
+    def test_two_links_with_the_same_id_are_refused(self):
+        dup = self.store / "topics" / "memory" / "duplink.md"
+        dup.write_text(TOPIC.replace("TOP-9100", "TOP-9122").replace(
+            "  - link: L1\n", "  - link: L2\n", 1).replace("    reverses: L1\n", "", 1)
+            .replace("    reason_for_change: changed-context\n", "", 1))
+        self.assertEqual(dup.read_text().count("link: L2"), 2)
+        self._refused_unchanged(dup, ["append", "TOP-9122", "--ruling", "x"], "duplicate link id")
+
+    def test_forced_roundtrip_failure_is_refused(self):
+        before = sha(self.topic)
+        with mock.patch.object(memidx, "edit_roundtrip_problem", return_value="forced mismatch"):
+            rc, _o, err = self.append()
+        self.assertEqual(rc, 1, err)
+        self.assertIn("forced mismatch", err)
+        self.assertEqual(sha(self.topic), before)
+        self.assertIn("reason=roundtrip", self.log_lines()[-1])
+
+    def test_declined_newest_link_leaves_current_unchanged(self):
+        rc, _o, err = self.append("--status", "declined", "--kind", "declined")
+        self.assertEqual(rc, 0, err)
+        text = self.topic.read_text()
+        self.assertIn("current: L2", text)
+        self.assertEqual(self.parsed_links(text)[0]["status"], "declined")
+        self.assertEqual(run_memlint(["--against-ref", "HEAD", str(self.store)])[0], 0)
+
+    def test_provisional_owner_tier_link_prints_no_standing_suggestion(self):
+        self.write_transcript()
+        rc, out, err = self.append("--session", SID, "--yes-message", YES_UUID, "--status", "provisional")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.parsed_links(self.topic.read_text())[0]["ruling"]["authority"], "owner-ratified")
+        self.assertNotIn("mark-standing", out)
+
+    def test_exactly_one_receipt_line_per_run(self):
+        counts = [len(self.log_lines())]
+        for argv in (("append", "TOP-9100", "--ruling", "ok"),               # written
+                     ("append", "TOP-9100", "--ruling", "dry", "--dry-run"),  # dry-run
+                     ("append", "TOP-0000", "--ruling", "x")):               # refused
+            self.run_cmd(*argv)
+            counts.append(len(self.log_lines()))
+        self.assertEqual([b - a for a, b in zip(counts, counts[1:])], [1, 1, 1])
+        self.assertEqual([l.split("outcome=")[1].split()[0] for l in self.log_lines()],
+                         ["written", "dry-run", "refused"])
 
 
 if __name__ == "__main__":
