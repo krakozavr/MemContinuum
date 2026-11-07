@@ -18,7 +18,7 @@ validation-error strings (binary at
 for the exact citations), not from external docs.
 
 Every invocation is logged to $PROBE_LOG (one JSON line per call, with a
-1-based call counter persisted in $PROBE_COUNTER) BEFORE this script forms
+1-based call counter persisted in $PROBE_COUNTER) BEFORE this script emits
 its response -- that log is independent evidence of what the CLI actually
 sent as tool_input on each call, cross-checked against the transcript's own
 recorded tool_use.input rather than trusting either source alone.
