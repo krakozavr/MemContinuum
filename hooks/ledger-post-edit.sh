@@ -47,6 +47,19 @@
 # worktree of the STORE repo is out of scope for this fix -- the code
 # index/coverage is what the gap is about; store-root worktrees are a
 # separate, unrequested problem.
+# The shell-diff worktree gap (INC-0134, TOP-0137 L20): on this harness
+# agents edit through Bash, and `git status` in a configured root never
+# lists what changed inside a linked worktree (a nested `<root>/.worktrees/x`
+# shows as one untracked directory, a sibling not at all), so a whole
+# release was built without one ledger row. After the configured roots, the
+# shell-diff branch now also runs `git worktree list --porcelain` in each
+# code root that is a main checkout (never for a root that is itself a
+# linked worktree of an unwired repo) and scans up to 8 of its linked
+# worktrees through the SAME scan function, each with its own baseline keyed
+# by the worktree path. A change lands as a row under the root-equivalent
+# path/root with the real file as `worktree_path`, as the Edit route's remap
+# does. The same two budgets govern it; the summary line gains
+# `worktrees=N` and `session=<id>` at its end.
 # Never prints anything (PostToolUse additionalContext exists but this hook
 # never uses it -- it is pure evidence-gathering, not a reminder point --
 # docs/DESIGN.md ruling A/E). Runs identically inside a subagent
@@ -346,6 +359,18 @@ session_id = os.environ.get("MC_SESSION_ID") or ""
 log_path = os.environ.get("MC_LOG_PATH") or ""
 
 
+def log_token(value):
+    # Python twin of mc_cwd_token (hooks/memlib.sh) and memidx.py
+    # _log_path_token (bash cannot be called from here): first 512 BYTES,
+    # keep only [A-Za-z0-9/._~:!-], every other byte as %XX uppercase hex,
+    # so a path can neither forge a key=value field nor split the line.
+    keep = set(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789/._~:!-")
+    out = []
+    for b in os.fsencode(value)[:512]:
+        out.append(chr(b) if b in keep else "%%%02X" % b)
+    return "".join(out) or "-"
+
+
 def log_line(text):
     if not log_path:
         return
@@ -384,10 +409,13 @@ except Exception:
     per_root_budget = 0.8
 
 start_all = time.monotonic()
-appended = 0
-timeouts = 0
-non_git = 0
-baseline_too_large = 0
+timed_out = set()
+ctr = {"appended": 0, "timeouts": 0, "non_git": 0, "baseline_too_large": 0}
+# The two git calls the worktree scan adds run with the repo-pinning
+# variables cleared (same reason as the round-2 fix in mc_remap_worktree_path).
+git_env = dict(os.environ)
+for _k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"):
+    git_env.pop(_k, None)
 
 shell_baseline = state.get("shell_baseline")
 if not isinstance(shell_baseline, dict):
@@ -399,34 +427,42 @@ existing_pairs = set()
 for _e in ledger:
     existing_pairs.add((_e.get("path"), _e.get("content_sha256")))
 
-for root, kind in roots:
+def scan_tree(scan_dir, kind, record_root, remap):
+    # One code path for a configured root (scan_dir == record_root, remap
+    # False) and for a linked worktree of a code root (scan_dir is the
+    # worktree, record_root the main checkout, remap True -- INC-0134). The
+    # baseline is keyed by scan_dir, so a worktree gets its own.
     # os.path.exists, not isdir: a git WORKTREE has a ".git" FILE (a
     # "gitdir: <path>" pointer), not a directory -- mc_git_head elsewhere
     # in this codebase already delegates repo-ness entirely to git itself
     # (git -C dir rev-parse HEAD) for exactly this reason; this check only
     # needs to rule out "no .git entry at all" before spending a
     # subprocess on it.
-    if not os.path.exists(os.path.join(root, ".git")):
-        non_git += 1
-        continue
+    if not os.path.exists(os.path.join(scan_dir, ".git")):
+        ctr["non_git"] += 1
+        return
 
     remaining = total_budget - (time.monotonic() - start_all)
     if remaining <= 0:
-        timeouts += 1
-        continue
+        ctr["timeouts"] += 1
+        timed_out.add(scan_dir)
+        return
 
     try:
         result = subprocess.run(
-            ["git", "--no-optional-locks", "-C", root, "status", "--porcelain", "-z",
+            ["git", "--no-optional-locks", "-C", scan_dir, "status", "--porcelain", "-z",
              "--untracked-files=all"],
             capture_output=True, text=True, timeout=min(per_root_budget, remaining),
+            env=git_env,
         )
     except (subprocess.TimeoutExpired, OSError):
-        timeouts += 1
-        continue
+        ctr["timeouts"] += 1
+        timed_out.add(scan_dir)
+        return
     if result.returncode != 0:
-        timeouts += 1
-        continue
+        ctr["timeouts"] += 1
+        timed_out.add(scan_dir)
+        return
 
     entries = result.stdout.split("\x00")
     if entries and entries[-1] == "":
@@ -458,13 +494,13 @@ for root, kind in roots:
                     path_status.setdefault(old_path, xy)
     dirty = sorted(set(dirty))
 
-    if root not in shell_baseline:
+    if scan_dir not in shell_baseline:
         # First successful status for this root (or a retry after an
         # earlier timeout, which never touched shell_baseline at all):
         # establish the baseline, append nothing yet.
         if len(dirty) > 500:
-            shell_baseline[root] = None
-            baseline_too_large += 1
+            shell_baseline[scan_dir] = None
+            ctr["baseline_too_large"] += 1
         else:
             baseline_map = {}
             budget_hit = False
@@ -477,7 +513,7 @@ for root, kind in roots:
                     # silently comparing against an incomplete map.
                     budget_hit = True
                     break
-                full = os.path.normpath(os.path.join(root, p))
+                full = os.path.normpath(os.path.join(scan_dir, p))
                 # Fix wave 1, G3 (Grok MINOR 5 / whole-branch-review LOW-2
                 # / task-8-review LOW-3): `git status` on an OUTER root
                 # collapses a nested git repository to one directory
@@ -503,23 +539,37 @@ for root, kind in roots:
                     continue
                 baseline_map[p] = sha_of(full)
             if budget_hit:
-                timeouts += 1
-                continue
-            shell_baseline[root] = baseline_map
-        continue
+                ctr["timeouts"] += 1
+                return
+            shell_baseline[scan_dir] = baseline_map
+        return
 
-    root_baseline = shell_baseline[root]
+    root_baseline = shell_baseline[scan_dir]
     if root_baseline is None:
         # A permanently-too-large root: skipped every call, never retried
         # (unlike a timeout, which leaves no baseline key at all).
-        baseline_too_large += 1
-        continue
+        ctr["baseline_too_large"] += 1
+        return
     if not isinstance(root_baseline, dict):
         root_baseline = {}
-        shell_baseline[root] = root_baseline
+        shell_baseline[scan_dir] = root_baseline
 
     for p in dirty:
-        full = os.path.normpath(os.path.join(root, p))
+        if time.monotonic() - start_all > total_budget:
+            # INC-0134 round 1: hashing after the baseline is budgeted too,
+            # or a long worktree scan outlives the watchdog and loses the
+            # state write (and the root rows of this call). Rows appended so
+            # far stay; the rest is re-compared next call (the (path, sha)
+            # dedupe keeps appended rows from repeating).
+            ctr["timeouts"] += 1
+            timed_out.add(scan_dir)
+            return
+        full = os.path.normpath(os.path.join(scan_dir, p))
+        # INC-0134: a linked-worktree scan files the row under the
+        # root-equivalent path (what unmapped / for-path consume) and keeps
+        # the real file as worktree_path, like the Edit route; the content
+        # hash below is always read from the real file (full).
+        row_path = os.path.normpath(os.path.join(record_root, p)) if remap else full
         # Fix wave 1, G3: same directory guard as the baseline loop above
         # -- a nested git repo created AFTER the baseline is a directory
         # entry here too, and must never be hashed or ledgered. Codex
@@ -541,31 +591,146 @@ for root, kind in roots:
             sha = sha_of(full)
         if root_baseline.get(p) == sha:
             continue
-        pair = (full, sha)
+        pair = (row_path, sha)
         if pair in existing_pairs:
             continue
-        ledger.append({
-            "path": full,
+        row = {
+            "path": row_path,
             "kind": kind,
             "content_sha256": sha,
             "seen_at": now,
-            "root": root if kind == "code" else "",
+            "root": record_root if kind == "code" else "",
             "source": "shell-diff",
-        })
+        }
+        if remap:
+            row["worktree_path"] = full
+        ledger.append(row)
         existing_pairs.add(pair)
-        appended += 1
+        ctr["appended"] += 1
         state["last_growth_turn"] = state.get("user_turn_count", 0)
         state["last_growth_ts"] = now
-        log_line("ledger outcome=appended kind=" + kind + " source=shell-diff file=" + full)
+        # worktree= goes BEFORE file=: everything after file= is the path.
+        log_line(
+            "ledger outcome=appended kind=" + kind + " source=shell-diff"
+            + ((" worktree=" + log_token(scan_dir)) if remap else "")
+            + " file=" + row_path
+        )
+
+
+for root, kind in roots:
+    scan_tree(root, kind, root, False)
+
+# INC-0134 / TOP-0137 L20: after every configured root has had its budget,
+# also scan the linked worktrees of each code root that is a main checkout.
+# Discovery is by `git worktree list` (the payload cwd cannot name the
+# directory a `cd ../wt && ...` command ran in). Any failure here counts as
+# a timeout and never stops the state write.
+worktrees_scanned = 0
+worktrees_over_cap = 0
+configured_real = set(r for r, _k in roots)
+seen_wts = set()
+enum_ok = True
+for root, kind in roots:
+    if kind != "code":
+        continue
+    if not os.path.exists(os.path.join(root, ".git")):
+        # Not enumerated: the baselines of its worktrees must survive the
+        # stale-key pruning below (R2-1).
+        enum_ok = False
+        continue
+    if root in timed_out:
+        # The root own status already ran out of budget (already counted);
+        # do not spend a second wait on its worktree listing.
+        enum_ok = False
+        continue
+    try:
+        remaining = total_budget - (time.monotonic() - start_all)
+        if remaining <= 0:
+            ctr["timeouts"] += 1
+            enum_ok = False
+            continue
+        # Main-checkout rule (round 1 S2): git-dir and git-common-dir name
+        # the same directory. The first worktree stanza is NOT compared with
+        # root: for a separate-git-dir root git prints the git dir there.
+        gd = subprocess.run(
+            ["git", "--no-optional-locks", "-C", root, "rev-parse", "--git-dir",
+             "--git-common-dir"],
+            capture_output=True, text=True, timeout=min(per_root_budget, remaining),
+            env=git_env,
+        )
+        gd_lines = gd.stdout.splitlines()
+        if gd.returncode != 0 or len(gd_lines) < 2:
+            ctr["timeouts"] += 1
+            enum_ok = False
+            continue
+        if (os.path.realpath(os.path.join(root, gd_lines[0]))
+                != os.path.realpath(os.path.join(root, gd_lines[1]))):
+            # root is itself a linked worktree of an unwired main repo:
+            # enumerate nothing (the Edit route calls this worktree-unwired).
+            continue
+        remaining = total_budget - (time.monotonic() - start_all)
+        if remaining <= 0:
+            ctr["timeouts"] += 1
+            enum_ok = False
+            continue
+        listing = subprocess.run(
+            ["git", "--no-optional-locks", "-C", root, "worktree", "list", "--porcelain"],
+            capture_output=True, text=True, timeout=min(per_root_budget, remaining),
+            env=git_env,
+        )
+        if listing.returncode != 0:
+            ctr["timeouts"] += 1
+            enum_ok = False
+            continue
+        stanzas = []
+        for block in listing.stdout.split("\n\n"):
+            wt_path = ""
+            skip = False
+            for ln in block.splitlines():
+                if ln.startswith("worktree "):
+                    wt_path = ln[len("worktree "):]
+                elif ln == "bare" or ln == "prunable" or ln.startswith("prunable "):
+                    skip = True
+            if wt_path:
+                stanzas.append((os.path.realpath(wt_path), skip))
+        if not stanzas:
+            enum_ok = False
+            continue
+        found = sorted(
+            wt for wt, skip in stanzas[1:]
+            if not skip and wt != root and wt not in configured_real and os.path.isdir(wt)
+        )
+        seen_wts.update(found)
+        worktrees_over_cap += max(0, len(found) - 8)
+        for wt in found[:8]:
+            if total_budget - (time.monotonic() - start_all) <= 0:
+                ctr["timeouts"] += 1
+                continue
+            worktrees_scanned += 1
+            scan_tree(wt, kind, root, True)
+    except Exception:
+        ctr["timeouts"] += 1
+        enum_ok = False
+
+# INC-0134 round 1 G3: drop the baseline of a worktree that no longer exists
+# (removed or pruned), so a worktree re-added at the same path starts from a
+# fresh baseline. Only when every code root was enumerated this call.
+if enum_ok:
+    for _key in list(shell_baseline):
+        if _key not in configured_real and _key not in seen_wts:
+            del shell_baseline[_key]
 
 state["session_id"] = session_id or state.get("session_id")
 state["project"] = project or state.get("project")
 _mc_bootstrap_state(state)
 
 log_line(
-    "ledger outcome=shell-diff appended=" + str(appended) + " roots=" + str(len(roots))
-    + " timeouts=" + str(timeouts) + " non-git=" + str(non_git)
-    + " baseline-too-large=" + str(baseline_too_large)
+    "ledger outcome=shell-diff appended=" + str(ctr["appended"]) + " roots=" + str(len(roots))
+    + " timeouts=" + str(ctr["timeouts"]) + " non-git=" + str(ctr["non_git"])
+    + " baseline-too-large=" + str(ctr["baseline_too_large"])
+    + " worktrees=" + str(worktrees_scanned)
+    + ((" worktrees-over-cap=" + str(worktrees_over_cap)) if worktrees_over_cap else "")
+    + " session=" + session_id
 )
 
 print(json.dumps(state))
