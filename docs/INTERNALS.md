@@ -3905,7 +3905,7 @@ raw twin or an inbox copy names the id (the pre-existing binding contract,
 `tests/test_binding.py`), and refuse a raw claimant only when it is the sole
 match, with the parse or decode refusal. No
 lenient id text is ever reconstructed, so a valid file whose id is
-`"TOP-9100 # literal"` is not TOP-9100. Allocation counts every canonical `TOP-n`
+the quoted string `ID # literal` is not a match for `ID`. Allocation counts every canonical id
 token on an unparseable file's `id:` line, so `record --id X` refuses and
 automatic allocation skips X while such a file names it, until a human fixes the
 file (fail closed).
