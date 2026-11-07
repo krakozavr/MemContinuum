@@ -12890,17 +12890,24 @@ def derive_owner_tier(args, code_roots: list) -> dict | None:
 
 def _store_ids(root: Path) -> dict:
     """`{id: [paths]}` over every record in the store (not only topics/): the
-    frontmatter `id:` of each markdown file."""
+    parsed frontmatter `id` of each markdown file, read with the engine's own
+    record parser (the same source of truth as memlint's duplicate-id check in
+    `lint_root`, which lints the whole store and so cannot be called here). A
+    file that does not parse is skipped with a stderr note."""
     out: dict = {}
-    pat = re.compile(r"^id:\s*['\"]?([^'\"\s]+)['\"]?\s*$", re.M)
     for path in walk_markdown(root):
         try:
-            head = path.read_bytes().decode("utf-8", errors="replace")
-        except OSError:
+            text = read_record_bytes_strict(path)
+        except (OSError, UnicodeDecodeError):
+            print(f"filing: skipped {path} while collecting ids (unreadable or not UTF-8)", file=sys.stderr)
             continue
-        m = pat.search(head.split("\n---", 1)[0])
-        if m:
-            out.setdefault(m.group(1), []).append(path)
+        result = parse_record_raw(text, path)
+        if not result.valid:
+            print(f"filing: skipped {path} while collecting ids (does not parse)", file=sys.stderr)
+            continue
+        rid = result.frontmatter.get("id")
+        if rid:
+            out.setdefault(str(rid), []).append(path)
     return out
 
 

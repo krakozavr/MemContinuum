@@ -583,5 +583,24 @@ class TestLogReceipt(FilingCase):
         self.assertTrue(self.log_lines()[-1].rstrip().endswith("project=p") or "project=p" in self.log_lines()[-1])
 
 
+class TestGateRound1(FilingCase):
+    """Gate round 1 fixes (R1-1..R1-8)."""
+
+    def test_id_with_trailing_comment_is_seen_by_the_id_collector(self):
+        """R1-1: `id: TOP-9500 # comment` is valid YAML the old regex missed."""
+        inbox = self.store / "inbox"
+        inbox.mkdir()
+        (inbox / "drop.md").write_text("---\nid: TOP-9500 # a comment\n---\n\nnote\n")
+        rc, _o, err = self.run_cmd("record", "--title", "Collides", "--area", "memory",
+                                   "--ruling", "r", "--id", "TOP-9500")
+        self.assertEqual(rc, 1, err)
+        self.assertIn("already carried", err)
+        self.assertFalse((self.store / "topics" / "memory" / "collides.md").exists())
+        rc, _o, err = self.run_cmd("record", "--title", "Allocated", "--area", "memory", "--ruling", "r")
+        self.assertEqual(rc, 0, err)
+        fm = memidx.parse_record_raw((self.store / "topics" / "memory" / "allocated.md").read_text(), "x").frontmatter
+        self.assertEqual(fm["id"], "TOP-9501")
+
+
 if __name__ == "__main__":
     unittest.main()
