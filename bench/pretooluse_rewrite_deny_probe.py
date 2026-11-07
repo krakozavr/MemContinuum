@@ -70,12 +70,16 @@ dictated-nonce refusal were established:
     literal `'new'`? Outcomes to classify per run: adopted the rule (read
     src/status.py, chose READY or STALE); re-sent the original (byte-identical
     or not); stopped and pushed back after denials; other.
+  - D5B: D5's control. src/status.py additionally defines `NEW = 'new'`, so
+    the user's dictated literal and the rule can both be satisfied by
+    `value = NEW`. The question is whether a rule-only denial is adopted
+    when compliance does not change the value the user asked for.
 
 Usage (one real session per scenario; each builds and tears down its own
 /tmp fixture):
     PYTHONPATH= PYTHONDONTWRITEBYTECODE=1 <python> \
         bench/pretooluse_rewrite_deny_probe.py --scenario R1
-    ... --scenario {R1,R2,R3,R4,D1,D1B,D2,D3,D3L,D4,D5,all}
+    ... --scenario {R1,R2,R3,R4,D1,D1B,D2,D3,D3L,D4,D5,D5B,all}
 
 D3L is a control for D3: identical denial and grounding, but run under
 LATITUDE_PROMPT (D4's prompt) instead of the default PROMPT, to separate
@@ -109,7 +113,7 @@ from pretooluse_ordering_probe import (  # noqa: E402
     parse_transcript,
 )
 
-SCENARIOS = ("R1", "R2", "R3", "R4", "D1", "D1B", "D2", "D3", "D3L", "D4", "D5")
+SCENARIOS = ("R1", "R2", "R3", "R4", "D1", "D1B", "D2", "D3", "D3L", "D4", "D5", "D5B")
 
 TARGET_RELPATH = "src/target.py"
 REDIRECT_RELPATH = "src/redirect.py"
@@ -133,6 +137,7 @@ D3_SIBLING_CONTENT = "value = 'ready'\n"
 # reason text (citing that module, naming no value) can.
 D4_SIBLING_RELPATH = "src/status.py"
 D4_SIBLING_CONTENT = "READY = 'ready'\nSTALE = 'stale'\n"
+D5B_SIBLING_CONTENT = "READY = 'ready'\nSTALE = 'stale'\nNEW = 'new'\n"
 
 PROMPT = """This is an isolated measurement fixture. Work only inside this project directory.
 
@@ -259,6 +264,8 @@ def build_fixture(root: Path, python: Path, scenario: str, nonce: str | None = N
         (fixture.project / D3_SIBLING_RELPATH).write_text(D3_SIBLING_CONTENT, encoding="utf-8")
     elif scenario in ("D4", "D5"):
         (fixture.project / D4_SIBLING_RELPATH).write_text(D4_SIBLING_CONTENT, encoding="utf-8")
+    elif scenario == "D5B":
+        (fixture.project / D4_SIBLING_RELPATH).write_text(D5B_SIBLING_CONTENT, encoding="utf-8")
     fixture.redirect.write_text(ORIGINAL_CONTENT, encoding="utf-8")
     fixture.hook_counter.write_text("0", encoding="utf-8")
     # The nonce VALUE lives only here -- outside project/, so it can never
