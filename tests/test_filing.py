@@ -1183,6 +1183,19 @@ class TestGateRound4(FilingCase):
         self.assertEqual(rc, 1, err)
         self.assertIn("reason=id-exists", self.log_lines()[-1])
 
+    def test_a_symlinked_topics_directory_outside_the_store_is_refused_outside_store(self):
+        outside = self.tmp / "elsewhere"
+        shutil.move(str(self.store / "topics"), str(outside))
+        (self.store / "topics").symlink_to(outside)
+        self.commit("symlinked topics")
+        self.head0 = self.head()
+        before = sha(outside / "memory" / "widget.md")
+        rc, _o, err = self.append()
+        self.assertEqual(rc, 1, err)
+        self.assertNotIn("Traceback", err)
+        self.assertIn("reason=outside-store", self.log_lines()[-1])
+        self.assertEqual(sha(outside / "memory" / "widget.md"), before)
+
 
 if __name__ == "__main__":
     unittest.main()

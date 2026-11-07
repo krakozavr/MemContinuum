@@ -13409,6 +13409,12 @@ def _load_topic(root: Path, topic_id: str, command: str) -> tuple:
     claimants = _topic_claimants(root, topic_id)
     if not claimants:
         raise FilingRefusal("unknown-topic", f"no topic {topic_id!r} under {root}/topics")
+    for path in claimants:
+        try:
+            path.relative_to(root)
+        except ValueError:
+            raise FilingRefusal("outside-store", f"{topic_id} is claimed by {path}, which is outside the store "
+                                f"{root} (a symlinked topics/ or inbox/?)")
     if len(claimants) > 1:
         raise FilingRefusal("ambiguous-topic", f"topic id {topic_id} is carried by {len(claimants)} files: "
                             + ", ".join(str(p) for p in claimants))
