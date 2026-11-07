@@ -906,6 +906,65 @@ class TestGateRound2(FilingCase):
         self.assertEqual(self.topic.stat().st_mode & 0o7777, 0o640)
         self.assertTrue(set(opened) & set(synced), "the parent directory was not fsynced")
 
+    # --- R2-4: a positive `restored` -------------------------------------------------
+
+    def test_restored_against_a_superseded_target_is_accepted(self):
+        sup = self.store / "topics" / "memory" / "sup.md"
+        sup.write_text("""---
+type: topic
+id: TOP-9130
+title: Superseded fixture
+area: memory
+project: p
+current: L2
+code_refs: []
+tags: [fixture]
+links:
+  - link: L2
+    date: 2026-11-01
+    status: active
+    kind: amended
+    reverses: L1
+    reason_for_change: changed-context
+    ruling:
+      text: "the replacement ruling"
+      authority: agent-inference
+      source: s
+    recorded_by: fable
+    recorded_at: 2026-11-01
+  - link: L1
+    date: 2026-10-01
+    status: superseded
+    superseded_by: L2
+    kind: adopted
+    ruling:
+      text: "the original ruling"
+      authority: agent-inference
+      source: s
+    recorded_by: fable
+    recorded_at: 2026-10-01
+---
+
+Body.
+""")
+        self.commit("superseded fixture")
+        self.head0 = self.head()
+        before = sup.read_text()
+        rc, _o, err = self.run_cmd("append", "TOP-9130", "--ruling", "back to the original", "--kind", "restored",
+                                   "--reverses", "L1", "--reason-for-change", "changed-context")
+        self.assertEqual(rc, 0, err)
+        after = sup.read_text()
+        links = self.parsed_links(after)
+        self.assertEqual(len(links), 3)
+        self.assertEqual(links[0]["kind"], "restored")
+        old_spans, new_spans = self.spans(before), self.spans(after)
+        for lid, span in old_spans.items():
+            self.assertEqual(new_spans[lid], span)
+        rc, text = run_memlint(["--against-ref", "HEAD", str(self.store)])
+        self.assertEqual(rc, 0, text)
+        rc, text = run_memlint([str(self.store)])
+        self.assertEqual(rc, 0, text)
+
 
 if __name__ == "__main__":
     unittest.main()
