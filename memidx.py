@@ -13405,6 +13405,17 @@ def _filing_proposals(args, root: Path) -> None:
     the diff. Never binds -- only `bind` writes `code_refs` (D12)."""
     if not args.session:
         return
+    if getattr(args, "dry_run", False):
+        # --dry-run runs no reindex (DESIGN section 1; TOP-0137 L23, gate round 7 R7-1):
+        # the proposal's coverage read self-heals a stale index, so skip it then.
+        try:
+            stale = decision_index_state(resolve_db_path(args), args.project, root=root,
+                                         verify_content=True) == "stale"
+        except Exception:
+            stale = False
+        if stale:
+            print("proposals: skipped under --dry-run (index stale)")
+            return
     ns = argparse.Namespace(root=str(root), project=args.project, db=args.db, session=args.session,
                             code_root=args.code_root, sessions_dir=args.sessions_dir)
     try:

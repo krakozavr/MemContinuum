@@ -1438,5 +1438,36 @@ class TestGateRound6(FilingCase):
                 bad.unlink()
 
 
+class TestGateRound7(FilingCase):
+    """Gate round 7 (TOP-0137 L23): --dry-run never reindexes through the
+    proposal section; the standing suggestion is shell-quoted; Unicode spaces
+    in a raw id line still make a claimant."""
+
+    def test_dry_run_with_a_session_never_reindexes_a_stale_index(self):
+        rc, _o, err = run_memidx(["reindex", "--root", str(self.store), "--project", "p",
+                                  "--db", str(self.db), "--no-embed"])
+        self.assertEqual(rc, 0, err)
+        self.topic.write_text(self.topic.read_text() + "\nA late body edit.\n")
+        self.commit("stale the index")
+        self.head0 = self.head()
+        sessions = self.home / "sessions" / "p"
+        sessions.mkdir(parents=True)
+        (sessions / f"{SID}.json").write_text(json.dumps({"ledger": [], "search_fallbacks": []}))
+        self.assertEqual(memidx.decision_index_state(self.db, "p", root=self.store.resolve(),
+                                                     verify_content=True), "stale")
+        real = memidx.cmd_reindex
+        with mock.patch.object(memidx, "cmd_reindex", wraps=real) as spy:
+            before = (sha(self.topic), sha(self.db))
+            rc, out, err = self.append("--session", SID, "--dry-run")
+            self.assertEqual(rc, 0, err)
+            self.assertEqual(spy.call_count, 0)
+            self.assertIn("proposals: skipped under --dry-run (index stale)", out)
+            self.assertEqual((sha(self.topic), sha(self.db)), before)
+            # control: the same stale state without --dry-run does reindex
+            rc, _o, err = self.append("--session", SID)
+            self.assertEqual(rc, 0, err)
+            self.assertGreaterEqual(spy.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
