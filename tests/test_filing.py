@@ -1468,6 +1468,19 @@ class TestGateRound7(FilingCase):
             self.assertEqual(rc, 0, err)
             self.assertGreaterEqual(spy.call_count, 1)
 
+    def test_the_standing_suggestion_quotes_a_store_root_with_a_space(self):
+        spaced = self.tmp / "my store"
+        self.store.rename(spaced)
+        self.store = spaced
+        self.topic = spaced / "topics" / "memory" / "widget.md"
+        self.write_transcript()
+        rc, out, err = self.append("--session", SID, "--yes-message", YES_UUID)
+        self.assertEqual(rc, 0, err)
+        line = [l for l in out.splitlines() if l.startswith("standing candidate:")][0]
+        self.assertIn("--root " + shlex.quote(str(spaced.resolve())), line)
+        self.assertEqual(shlex.split(line)[-1], str(spaced.resolve()))
+        self.assertIn("--source '<where the owner said it>'", line)
+
 
 if __name__ == "__main__":
     unittest.main()

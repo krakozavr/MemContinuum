@@ -13394,9 +13394,10 @@ def _finish_write(command: str, args, ctx: dict, root: Path, path: Path, rel: st
         if args.require_retrieve:
             rc = 3
     if not standing_link_problems(link["link"], link):
-        print(f"standing candidate: memidx.py mark-standing {topic_id} {link['link']} --add "
-              f"--authority {link['ruling']['authority']} --source \"<where the owner said it>\" "
-              f"--why \"<why it is true of the whole project>\" --root {root}")
+        print(f"standing candidate: memidx.py mark-standing {shlex.quote(str(topic_id))} {shlex.quote(str(link['link']))} --add "
+              f"--authority {shlex.quote(str(link['ruling']['authority']))} "
+              f"--source {shlex.quote('<where the owner said it>')} "
+              f"--why {shlex.quote('<why it is true of the whole project>')} --root {shlex.quote(str(root))}")
     return rc
 
 
