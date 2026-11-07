@@ -3855,6 +3855,53 @@ only a fixed notice that no decision records were supplied, plus its hash
 line, so a blind review is recorded as such and carries nothing
 memory-shaped.
 
+## Filing
+
+`record`, `append` and `promote` are three entry points to one writer.
+
+**The write is line insertion.** The new link is rendered alone by
+`render_link_item` (SCHEMA section 3 field order, the store's indentation,
+strings through `_yaml_quote`, `date`/`recorded_at` bare) and placed first under
+`links:` by `_splice_block_item`, the same splice `bind` and `mark-standing`
+use for their rows. `current:` is edited in place by `edit_current_line`, only
+when the newest active link changes; `promote` adds one `promoted_by:` line to
+the old link by `insert_promoted_by`, locating it with memlint's
+`_link_raw_spans` and never re-rendering it. A new topic is written from a
+template, never a YAML dumper. Before the file is written the result
+must parse back to the intended link with every earlier link unchanged
+(`edit_roundtrip_problem`), lint without a new error, and pass the new-link
+checks `--against-ref` applies; after it is written `check_append_only` runs
+against `HEAD` for that file and a failure restores the original bytes. The
+command prints the unified diff and a suggested commit message, and never
+commits.
+
+**Authority is derived.** `--authority owner-verbatim|owner-ratified` is
+refused. With `--session` and `--owner-message UUID --quote TEXT`, the quote
+must be an exact substring (no whitespace collapse, case folding or
+normalisation) of a human message in
+`~/.claude/projects/*/<session>.jsonl` (`$MEMCONTINUUM_TRANSCRIPTS_DIR`
+overrides the directory): `type == "user"`, no `isMeta`, string content. With
+`--yes-message UUID` the uuid must be such a message; its text is not read. When
+several transcripts carry the session id, the one whose first human line's
+`cwd` lies under a `--code-root` wins; otherwise the command refuses. If the
+transcript cannot establish the tier, `append`/`record` file an
+`agent-inference` link with a warning and `source: transcript unavailable:
+<reason>`; `promote` refuses. The message text is never logged.
+
+**Around the write.** Before the diff: an advisory FTS search on the title
+(`--status any --decisions-only`, three hits, each with its capped chain; for
+`record` a `suggestion: append <id> instead of record`). After a write: a
+no-embed reindex and a title search; a miss is a warning (rc 3 under
+`--require-retrieve`). When the new link could be standing the exact
+`mark-standing` command is printed; the filing command never marks anything.
+`--session` also prints the read-only binding proposals (`session_proposal_lines`,
+shared with `propose-bindings`). Each run appends one `filing` line to hook.log
+(outcome, ids, authority, derived, dedupe_top, retrieval, project; a refusal adds
+`reason`).
+
+A `kind: reversed` link needs its target already superseded (memlint's rule), so
+supersede the old link by hand in the same commit first; `amended` needs nothing.
+
 ## CLI semantics
 
 `--help` on each subcommand is the flag reference. The semantics worth writing

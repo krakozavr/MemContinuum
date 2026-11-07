@@ -439,6 +439,9 @@ memidx.py anchor-backfill --root STORE --project NAME [--code-root DIR] [--dry-r
 memidx.py chain <topic-id> --project NAME                                        # one question's full history
 memidx.py bind <topic-id> <path[#symbol]> --root STORE --project NAME [--code-root DIR]  # bind a file or symbol to a topic's ruling and record its anchor (--dry-run first)
 memidx.py mark-standing <topic-id> <Ln> --add|--remove --authority A --source TEXT --why TEXT --root STORE  # change what a topic keeps standing and record who changed it (--dry-run first)
+memidx.py record --title T --area A --ruling TEXT --root STORE --project NAME [--session ID --owner-message UUID --quote TEXT]  # file a new topic with its first link; prints the diff, never commits (--dry-run first)
+memidx.py append <topic-id> --ruling TEXT --root STORE --project NAME [--session ID --yes-message UUID]  # file a new link under an existing topic; authority comes from the session transcript, never typed
+memidx.py promote <topic-id> <Ln> --session ID --yes-message UUID|--owner-message UUID --quote TEXT --root STORE --project NAME  # promote an inference to an owner-tier link (SCHEMA section 5)
 memidx.py standing --project NAME [--root STORE] [--json]                        # what's standing, printed by hand
 memidx.py drift --code-root DIR --project NAME                                   # has the code grown a bypass?
 memidx.py reindex --root STORE --project NAME                                    # after editing the store by hand

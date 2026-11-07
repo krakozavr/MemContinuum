@@ -1,5 +1,28 @@
 # Changelog
 
+## [Unreleased]
+
+### File a decision with one command
+
+`record`, `append` and `promote` now write store records for you. `record`
+starts a new topic, `append` adds a link to an existing one, and `promote` turns
+an agent's inference into a ruling the owner affirmed. Each prints the exact
+change and leaves the commit to you, so the commit message can name the
+decision. Existing links are never rewritten: the command only adds lines, and
+the same check that guards the store at commit time is run on the result before
+it reports success.
+
+The authority of a new owner-tier link is read from the session transcript, not
+typed: the owner's quote must appear word for word in a message the owner wrote,
+or the owner's yes-message must exist. When the transcript cannot confirm it,
+the link is filed as an agent inference with a warning, and `promote` refuses.
+Before writing, the command shows the three nearest existing decisions so you
+can append instead of starting a duplicate, and afterwards it checks the new
+record can be found by its title and prints the `mark-standing` command if the
+new link could be standing.
+
+    Technical: `memidx.py record|append|promote`; one splice (`_splice_block_item`) shared with the anchor and standing-mark writers; `--session` with `--owner-message UUID --quote TEXT` (owner-verbatim, exact substring) or `--yes-message UUID` (owner-ratified); `$MEMCONTINUUM_TRANSCRIPTS_DIR` overrides the transcript directory; one `filing` line per run in hook.log carries outcome and ids only, never text.
+
 ## [0.5.0] — 2026-11-05
 
 MemContinuum now tells you when code has changed since a decision was bound to
