@@ -191,6 +191,11 @@ class FilingCase(unittest.TestCase):
     def spans(self, text):
         return memlint._link_raw_spans(text, self.parsed_links(text))
 
+    def _guard_error(self, rel):
+        full = str(self.store.resolve() / rel)
+        return mock.patch.object(memlint, "check_append_only",
+                                 return_value=([f"{full}: link L1 body changed"], 1, []))
+
     def log_lines(self):
         p = self.home / "hook.log"
         return [l for l in p.read_text().splitlines() if " filing " in l] if p.exists() else []
@@ -637,11 +642,6 @@ class TestGateRound1(FilingCase):
 
     # --- R1-3: the guard is a proof, or the filing is refused ------------------------
 
-    def _guard_error(self, rel):
-        full = str(self.store.resolve() / rel)
-        return mock.patch.object(memlint, "check_append_only",
-                                 return_value=([f"{full}: link L1 body changed"], 1, []))
-
     def test_guard_error_undoes_an_append_a_promote_and_a_record(self):
         for argv, rel in ((["append", "TOP-9100", "--ruling", "x"], "topics/memory/widget.md"),):
             before = sha(self.topic)
@@ -792,6 +792,54 @@ class TestGateRound1(FilingCase):
         self.assertEqual([b - a for a, b in zip(counts, counts[1:])], [1, 1, 1])
         self.assertEqual([l.split("outcome=")[1].split()[0] for l in self.log_lines()],
                          ["written", "dry-run", "refused"])
+
+
+class TestGateRound2(FilingCase):
+    """Gate round 2 (TOP-0137 L23)."""
+
+    # --- R2-1: a failed rollback is reported as such ---------------------------------
+
+    def test_failed_undo_of_an_append_reports_the_rejected_edit_on_disk(self):
+        before = sha(self.topic)
+        real = memidx._atomic_write_bytes
+        written = []
+
+        def first_ok_then_fail(path, data, exclusive=False):
+            if written:
+                raise OSError("disk gone")
+            written.append(data)
+            real(path, data, exclusive)
+
+        with self._guard_error("topics/memory/widget.md"), \
+                mock.patch.object(memidx, "_atomic_write_bytes", side_effect=first_ok_then_fail):
+            rc, _o, err = self.append()
+        self.assertEqual(rc, 1, err)
+        self.assertEqual(len(written), 1)
+        self.assertNotEqual(sha(self.topic), before)
+        self.assertEqual(self.topic.read_bytes(), written[0])  # the whole rejected text
+        self.assertIn("REJECTED EDIT REMAINS ON DISK", err)
+        self.assertNotIn("nothing written", err)
+        self.assertIn(str(self.topic), err)
+        self.assertIn(f"git -C {self.store.resolve()} checkout -- topics/memory/widget.md", err)
+        self.assertIn("reason=guard rollback=failed", self.log_lines()[-1])
+
+    def test_failed_unlink_of_a_new_topic_names_rm(self):
+        new = self.store / "topics" / "memory" / "stuck.md"
+        with self._guard_error("topics/memory/stuck.md"), \
+                mock.patch.object(Path, "unlink", side_effect=OSError("busy")):
+            rc, _o, err = self.run_cmd("record", "--title", "Stuck", "--area", "memory", "--ruling", "r")
+        self.assertEqual(rc, 1, err)
+        self.assertTrue(new.exists())
+        self.assertIn("REJECTED EDIT REMAINS ON DISK", err)
+        self.assertIn(f"rm {new.resolve()}", err)
+        self.assertIn("reason=guard rollback=failed", self.log_lines()[-1])
+
+    def test_a_successful_undo_has_no_rollback_field(self):
+        with self._guard_error("topics/memory/widget.md"):
+            rc, _o, err = self.append()
+        self.assertEqual(rc, 1, err)
+        self.assertIn("nothing written", err)
+        self.assertNotIn("rollback", self.log_lines()[-1])
 
 
 if __name__ == "__main__":

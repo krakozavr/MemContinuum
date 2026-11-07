@@ -12687,10 +12687,17 @@ _TOPIC_ID_RE = re.compile(r"^TOP-(\d+)$")
 class FilingRefusal(Exception):
     """A refusal: nothing was written. `token` is the log-safe reason."""
 
-    def __init__(self, token: str, message: str):
+    def __init__(self, token: str, message: str, on_disk: str | None = None,
+                 remedy: str = "", path_on_disk: str = ""):
         super().__init__(message)
         self.token = token
         self.message = message
+        # `None`: nothing of the rejected edit is on disk. `"rejected"`: the
+        # undo itself failed, so the rejected text remains; `remedy` is the
+        # operator's command to clear it.
+        self.on_disk = on_disk
+        self.remedy = remedy
+        self.path_on_disk = path_on_disk
 
 
 def _bare_or_quoted(value, pattern=_BARE_NAME_RE) -> str:
@@ -13192,10 +13199,14 @@ def _filing_guard_or_undo(root: Path, path: Path, rel: str, old_text: str | None
             path.unlink()
         else:
             _atomic_write_bytes(path, old_text.encode("utf-8"))
-        undone = "write undone"
     except OSError as exc:
-        undone = f"could NOT undo the write ({exc})"
-    raise FilingRefusal(token, f"{why}; {undone}")
+        if old_text is None:
+            remedy = f"remove it with: rm {path}"
+        else:
+            remedy = f"restore it with: git -C {root} checkout -- {rel}"
+        raise FilingRefusal(token, f"{why}; could NOT undo the write ({exc})",
+                            on_disk="rejected", remedy=remedy, path_on_disk=str(path))
+    raise FilingRefusal(token, f"{why}; write undone")
 
 
 def _finish_write(command: str, args, ctx: dict, root: Path, path: Path, rel: str,
@@ -13338,13 +13349,20 @@ def run_filing(command: str, args, impl) -> int:
     try:
         rc = impl(args, ctx)
     except FilingRefusal as exc:
-        print(f"{command}: {exc.message}; nothing written", file=sys.stderr)
+        if exc.on_disk == "rejected":
+            print(f"{command}: {exc.message}", file=sys.stderr)
+            print(f"REJECTED EDIT REMAINS ON DISK: {exc.path_on_disk} -- {exc.remedy}", file=sys.stderr)
+            ctx["rollback"] = "failed"
+        else:
+            print(f"{command}: {exc.message}; nothing written", file=sys.stderr)
         ctx["reason"] = exc.token
         rc = 1
     fields = {k: ctx[k] for k in ("outcome", "topic", "link", "authority", "derived",
                                   "dedupe_top", "retrieval")}
     if "reason" in ctx:
         fields["reason"] = ctx["reason"]
+    if "rollback" in ctx:
+        fields["rollback"] = ctx["rollback"]
     fields["project"] = args.project
     append_hook_log_line("filing", fields)
     return rc

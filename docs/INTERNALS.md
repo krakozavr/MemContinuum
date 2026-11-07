@@ -3880,7 +3880,10 @@ I/O error leaves the original bytes (or no file) and is a refusal
 share the write. After the write, an existing topic is checked by
 `check_append_only` against `HEAD` for that file; an error, or a guard that
 cannot run at all (`guard-unavailable`), puts the original bytes back and
-refuses. A new topic is untracked, and `check_append_only` reads `git diff
+refuses; the restore is itself atomic, so the file is either the old text or
+the whole rejected text, never a mix, and when the restore fails the command
+prints `REJECTED EDIT REMAINS ON DISK: <path> -- <remedy>` on stderr instead
+of "nothing written" and the receipt carries `rollback=failed`. A new topic is untracked, and `check_append_only` reads `git diff
 HEAD`, which does not list untracked files: for `record` the guard only proves
 that the store can run the comparison (otherwise `record` refuses and removes
 the file), and the proof of the new file is the full lint plus the new-link
