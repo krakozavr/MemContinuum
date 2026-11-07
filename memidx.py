@@ -12856,9 +12856,9 @@ def read_transcript_humans(path: Path) -> dict:
             if (d.get("type") == "user" and not d.get("isMeta") and isinstance(uid, str)
                     and isinstance(msg, dict) and msg.get("role") == "user"
                     and isinstance(msg.get("content"), str)):
+                if not humans and d.get("cwd"):
+                    cwd = str(d["cwd"])  # the FIRST human line's cwd only
                 humans[uid] = (msg["content"], str(d.get("timestamp") or ""))
-                if cwd is None and d.get("cwd"):
-                    cwd = str(d["cwd"])
     return {"humans": humans, "all": every, "cwd": cwd}
 
 

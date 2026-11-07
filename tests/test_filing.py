@@ -696,6 +696,28 @@ class TestGateRound1(FilingCase):
         rc, _o, err = self.run_cmd("append", "TOP-9111", "--ruling", "x")
         self.assertEqual(rc, 0, err)
 
+    # --- R1-5: the tie-break reads the FIRST human line's cwd -------------------------
+
+    def test_first_human_line_without_cwd_cannot_win_the_tie_break(self):
+        work = self.tmp / "work"
+        (work / "p").mkdir(parents=True)
+        for name, cwd in (("proj", "/elsewhere/q"), ("other", "/elsewhere/r")):
+            self.write_transcript(name, cwd=cwd)
+        # in "proj" the first human line has no cwd; a later one lies under the code root
+        lines = [
+            {"type": "user", "uuid": "cccccccc-0000-0000-0000-000000000001", "sessionId": SID,
+             "timestamp": "2026-11-07T20:00:00.000Z", "message": {"role": "user", "content": "first"}},
+            {"type": "user", "uuid": YES_UUID, "sessionId": SID, "cwd": str(work / "p"),
+             "timestamp": "2026-11-07T20:03:00.000Z", "message": {"role": "user", "content": "ok"}},
+        ]
+        (self.transcripts / "proj" / f"{SID}.jsonl").write_text("\n".join(json.dumps(x) for x in lines) + "\n")
+        before = sha(self.topic)
+        rc, _o, err = self.append("--session", SID, "--yes-message", YES_UUID, "--code-root", str(work / "p"))
+        self.assertEqual(rc, 1, err)
+        self.assertIn("transcripts match session", err)
+        self.assertIn("reason=ambiguous-transcript", self.log_lines()[-1])
+        self.assertEqual(sha(self.topic), before)
+
 
 if __name__ == "__main__":
     unittest.main()
