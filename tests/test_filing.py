@@ -854,6 +854,58 @@ class TestGateRound2(FilingCase):
         links = self.parsed_links(self.topic.read_text())
         self.assertEqual(len(links), 3)
 
+    # --- R2-3: the exclusive reservation is cleaned up on every failure --------------
+
+    def test_reservation_close_failure_leaves_no_file(self):
+        directory = self.store / "topics" / "memory"
+        listing = sorted(os.listdir(directory))
+        real_close, real_open = os.close, os.open
+        reserved, calls = [], []
+
+        def open_spy(path, flags, *a, **k):
+            fd = real_open(path, flags, *a, **k)
+            if flags & os.O_EXCL:
+                reserved.append(fd)
+            return fd
+
+        def close_once_fails(fd):
+            real_close(fd)
+            if reserved and fd == reserved[0] and not calls:
+                calls.append(fd)
+                raise OSError("close failed")
+
+        with mock.patch.object(os, "open", side_effect=open_spy), \
+                mock.patch.object(os, "close", side_effect=close_once_fails):
+            rc, _o, err = self.run_cmd("record", "--title", "Closing", "--area", "memory", "--ruling", "r")
+        self.assertEqual(rc, 1, err)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(sorted(os.listdir(directory)), listing)
+        self.assertIn("reason=io-error", self.log_lines()[-1])
+
+    def test_append_keeps_the_file_mode_and_fsyncs_the_directory(self):
+        os.chmod(self.topic, 0o640)
+        opened = []
+        real_open = os.open
+
+        def spy(path, flags, *a, **k):
+            fd = real_open(path, flags, *a, **k)
+            if os.path.isdir(path):
+                opened.append(fd)
+            return fd
+
+        real_fsync = os.fsync
+        synced = []
+
+        def fsync_spy(fd):
+            synced.append(fd)
+            return real_fsync(fd)
+
+        with mock.patch.object(os, "open", side_effect=spy), mock.patch.object(os, "fsync", side_effect=fsync_spy):
+            rc, _o, err = self.append()
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.topic.stat().st_mode & 0o7777, 0o640)
+        self.assertTrue(set(opened) & set(synced), "the parent directory was not fsynced")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12263,17 +12263,29 @@ def _topic_current_link(fm: dict) -> str | None:
 def _atomic_write_bytes(path: Path, data: bytes, exclusive: bool = False) -> None:
     """Write `data` to `path` so a crash or I/O error never leaves a short file:
     a temp file in the SAME directory, flushed and fsynced, then `os.replace`d
-    onto the target. `exclusive` (a new file): the target is first created with
-    O_CREAT|O_EXCL as the reservation -- FileExistsError when it is taken -- and
-    removed again if the write fails. For an existing file the original bytes are
-    what remain on disk after any failure. Raises OSError on I/O failure."""
+    onto the target, then the parent directory fsynced so the rename survives
+    power loss (a failure of that last step is ignored). `exclusive` (a new
+    file): the target is first created with O_CREAT|O_EXCL as the reservation --
+    FileExistsError when it is taken, which never unlinks the winner -- and
+    removed again if anything after it fails. For an existing file the original
+    bytes are what remain on disk after any failure, and its permission bits are
+    kept (also mode 0, for symmetry: a 000 file cannot be read by the writer, so
+    in practice it is never reached). Raises OSError on I/O failure.
+
+    Known window: a kill between the reservation and the `os.replace` leaves a
+    zero-byte file at the target; the next `record` refuses with `path-exists`
+    and the operator removes the file."""
     path = Path(path)
     if exclusive:
-        os.close(os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666))
+        # FileExistsError for a taken path propagates from here, outside the
+        # cleanup below, so the winner's file is never unlinked
+        fd0 = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
     else:
         path = Path(os.path.realpath(path))  # replace the file a symlink points at, not the link
     tmp_name = None
     try:
+        if exclusive:
+            os.close(fd0)
         try:
             mode = path.stat().st_mode & 0o7777
         except OSError:
@@ -12283,7 +12295,7 @@ def _atomic_write_bytes(path: Path, data: bytes, exclusive: bool = False) -> Non
             fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
-        if mode is not None and mode != 0:
+        if mode is not None:
             os.chmod(tmp_name, mode)
         os.replace(tmp_name, str(path))
         tmp_name = None
@@ -12299,6 +12311,14 @@ def _atomic_write_bytes(path: Path, data: bytes, exclusive: bool = False) -> Non
             except OSError:
                 pass
         raise
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
 
 
 def apply_topic_edit(path: Path, old_text: str, new_text: str, dry_run: bool, store_root: Path) -> None:
