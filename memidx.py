@@ -12229,8 +12229,51 @@ def _topic_current_link(fm: dict) -> str | None:
     return str(link.get("link")) if link else None
 
 
+def _atomic_write_bytes(path: Path, data: bytes, exclusive: bool = False) -> None:
+    """Write `data` to `path` so a crash or I/O error never leaves a short file:
+    a temp file in the SAME directory, flushed and fsynced, then `os.replace`d
+    onto the target. `exclusive` (a new file): the target is first created with
+    O_CREAT|O_EXCL as the reservation -- FileExistsError when it is taken -- and
+    removed again if the write fails. For an existing file the original bytes are
+    what remain on disk after any failure. Raises OSError on I/O failure."""
+    path = Path(path)
+    if exclusive:
+        os.close(os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666))
+    else:
+        path = Path(os.path.realpath(path))  # replace the file a symlink points at, not the link
+    tmp_name = None
+    try:
+        try:
+            mode = path.stat().st_mode & 0o7777
+        except OSError:
+            mode = None
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        if mode is not None and mode != 0:
+            os.chmod(tmp_name, mode)
+        os.replace(tmp_name, str(path))
+        tmp_name = None
+    except BaseException:
+        if tmp_name:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+        if exclusive:
+            try:
+                os.unlink(str(path))
+            except OSError:
+                pass
+        raise
+
+
 def apply_topic_edit(path: Path, old_text: str, new_text: str, dry_run: bool, store_root: Path) -> None:
-    """Print the exact diff; write it unless `dry_run`. Never commits."""
+    """Print the exact diff; write it unless `dry_run` (atomically, see
+    `_atomic_write_bytes`; `bind` and `mark-standing` share this write). Never
+    commits."""
     try:
         label = str(path.relative_to(store_root))
     except ValueError:
@@ -12239,7 +12282,7 @@ def apply_topic_edit(path: Path, old_text: str, new_text: str, dry_run: bool, st
     if dry_run:
         print("dry-run: nothing written")
         return
-    Path(path).write_bytes(new_text.encode("utf-8"))
+    _atomic_write_bytes(path, new_text.encode("utf-8"))
 
 
 def parse_record_raw(text: str, path):
@@ -12987,26 +13030,26 @@ def _lint_errors_for(rel: str, text: str, ids_dir: Path | None = None) -> list:
     return [e.replace(os.path.realpath(td), "<store>").replace(td, "<store>") for e in errors]
 
 
-def _filing_lint_problem(rel: str, old_text: str | None, new_text: str, new_link: dict) -> str | None:
-    """Refuse on a schema error the edit introduces, or on the new-link checks
+def _filing_lint_problem(rel: str, new_text: str, new_link: dict) -> str | None:
+    """Refuse on ANY schema error in the result file (a file that already fails
+    the store's own pre-commit lint must not accept a filing: TOP-0136
+    grandfathers only inside memlint, as warnings), plus the new-link checks
     (unknown kind, question-form owner-verbatim) memlint applies under
     --against-ref."""
     import memlint
-    before = set(_lint_errors_for(rel, old_text)) if old_text is not None else set()
-    fresh = [e for e in _lint_errors_for(rel, new_text) if e not in before]
-    fresh += memlint._new_link_errors(f"<store>/{rel}:{new_link['link']}", new_link)
-    return "; ".join(fresh) if fresh else None
+    problems = _lint_errors_for(rel, new_text)
+    problems += memlint._new_link_errors(f"<store>/{rel}:{new_link['link']}", new_link)
+    return "; ".join(problems) if problems else None
 
 
 def _filing_guard_errors(root: Path, path: Path) -> list:
-    """memlint's append-only guard against HEAD, in process, for the one file
-    just written. [] when the store is not a git repo with a HEAD (nothing to
-    compare to); the real proof is `memlint.py --against-ref HEAD`."""
+    """memlint's append-only guard against HEAD, in process, errors naming the
+    one file just written. Raises memlint.GitError when the comparison cannot
+    run (not a git repo, no HEAD, git failed): that is no proof, so the caller
+    refuses. `check_append_only` reads `git diff HEAD`, which lists tracked
+    files only -- a brand-new untracked topic is invisible to it."""
     import memlint
-    try:
-        errors, _changed, _notes = memlint.check_append_only(root, "HEAD", False)
-    except memlint.GitError:
-        return []
+    errors, _changed, _notes = memlint.check_append_only(root, "HEAD", False)
     return [e for e in errors if e.startswith(str(path))]
 
 
@@ -13123,13 +13166,39 @@ def _filing_ruling(args, ctx: dict, code_roots: list, strict: bool) -> dict:
             "source": args.source or ""}
 
 
+def _filing_guard_or_undo(root: Path, path: Path, rel: str, old_text: str | None) -> None:
+    """Run the append-only guard on the file just written; on a guard error or
+    when the guard cannot run (`guard-unavailable`) undo the write -- the
+    original bytes back for an existing topic, the file removed for a new one --
+    and refuse. For a new (untracked) topic the guard sees nothing; its proof is
+    the lint and new-link checks run before the write."""
+    import memlint
+    try:
+        errors = _filing_guard_errors(root, path)
+        token, why = "guard", "append-only guard failed: " + "; ".join(errors)
+    except memlint.GitError as exc:
+        errors = [str(exc)]
+        token, why = "guard-unavailable", f"the append-only guard cannot run ({exc})"
+    if not errors:
+        return
+    try:
+        if old_text is None:
+            path.unlink()
+        else:
+            _atomic_write_bytes(path, old_text.encode("utf-8"))
+        undone = "write undone"
+    except OSError as exc:
+        undone = f"could NOT undo the write ({exc})"
+    raise FilingRefusal(token, f"{why}; {undone}")
+
+
 def _finish_write(command: str, args, ctx: dict, root: Path, path: Path, rel: str,
                   old_text: str | None, new_text: str, topic_id: str, link: dict,
                   title: str) -> int:
     """Shared tail: round-trip proof is the caller's; here the lint, the diff,
     the write, the in-process guard, then retrieval check, standing prompt,
     proposals and the receipt."""
-    problem = _filing_lint_problem(rel, old_text, new_text, link)
+    problem = _filing_lint_problem(rel, new_text, link)
     if problem:
         raise FilingRefusal("lint", f"the result would not lint clean: {problem}")
     if old_text is None:
@@ -13137,19 +13206,20 @@ def _finish_write(command: str, args, ctx: dict, root: Path, path: Path, rel: st
         if args.dry_run:
             print("dry-run: nothing written")
         else:
-            path.parent.mkdir(parents=True, exist_ok=True)
             try:
-                with open(path, "xb") as fh:
-                    fh.write(new_text.encode("utf-8"))
+                path.parent.mkdir(parents=True, exist_ok=True)
+                _atomic_write_bytes(path, new_text.encode("utf-8"), exclusive=True)
             except FileExistsError:
                 raise FilingRefusal("path-exists", f"{rel} already exists")
+            except OSError as exc:
+                raise FilingRefusal("io-error", f"cannot write {rel}: {exc}")
     else:
-        apply_topic_edit(path, old_text, new_text, args.dry_run, root)
-        if not args.dry_run:
-            errors = _filing_guard_errors(root, path)
-            if errors:
-                path.write_bytes(old_text.encode("utf-8"))
-                raise FilingRefusal("guard", "append-only guard failed, file restored: " + "; ".join(errors))
+        try:
+            apply_topic_edit(path, old_text, new_text, args.dry_run, root)
+        except OSError as exc:
+            raise FilingRefusal("io-error", f"cannot write {rel}: {exc}")
+    if not args.dry_run:
+        _filing_guard_or_undo(root, path, rel, old_text)
     short = re.sub(r"\s+", " ", link["ruling"]["text"])[:60]
     message = f"{topic_id} {link['link']}: {short}"
     print(f"{command}: {'would write' if args.dry_run else 'wrote'} {topic_id} {link['link']} "

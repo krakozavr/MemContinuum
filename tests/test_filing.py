@@ -601,6 +601,101 @@ class TestGateRound1(FilingCase):
         fm = memidx.parse_record_raw((self.store / "topics" / "memory" / "allocated.md").read_text(), "x").frontmatter
         self.assertEqual(fm["id"], "TOP-9501")
 
+    # --- R1-2: atomic writes, I/O errors are refusals --------------------------------
+
+    def test_io_error_on_append_is_a_refusal_and_leaves_the_file_alone(self):
+        before = sha(self.topic)
+        listing = sorted(os.listdir(self.topic.parent))
+        with mock.patch.object(os, "replace", side_effect=OSError("disk full")):
+            rc, _o, err = self.append()
+        self.assertEqual(rc, 1, err)
+        self.assertIn("cannot write", err)
+        self.assertEqual(sha(self.topic), before)
+        self.assertEqual(sorted(os.listdir(self.topic.parent)), listing)  # no temp file left
+        self.assertIn("reason=io-error", self.log_lines()[-1])
+
+    def test_io_error_on_record_leaves_no_file_and_no_temp(self):
+        directory = self.store / "topics" / "memory"
+        listing = sorted(os.listdir(directory))
+        with mock.patch.object(os, "replace", side_effect=OSError("disk full")):
+            rc, _o, err = self.run_cmd("record", "--title", "Doomed", "--area", "memory", "--ruling", "r")
+        self.assertEqual(rc, 1, err)
+        self.assertIn("cannot write", err)
+        self.assertEqual(sorted(os.listdir(directory)), listing)
+        self.assertIn("reason=io-error", self.log_lines()[-1])
+
+    # --- R1-3: the guard is a proof, or the filing is refused ------------------------
+
+    def _guard_error(self, rel):
+        full = str(self.store.resolve() / rel)
+        return mock.patch.object(memlint, "check_append_only",
+                                 return_value=([f"{full}: link L1 body changed"], 1, []))
+
+    def test_guard_error_undoes_an_append_a_promote_and_a_record(self):
+        for argv, rel in ((["append", "TOP-9100", "--ruling", "x"], "topics/memory/widget.md"),):
+            before = sha(self.topic)
+            with self._guard_error(rel):
+                rc, _o, err = self.run_cmd(*argv)
+            self.assertEqual(rc, 1, err)
+            self.assertIn("append-only guard failed", err)
+            self.assertEqual(sha(self.topic), before)
+        self.write_transcript()
+        before = sha(self.prov)
+        with self._guard_error("topics/memory/prov.md"):
+            rc, _o, err = self.run_cmd("promote", "TOP-9101", "L1", "--session", SID, "--yes-message", YES_UUID)
+        self.assertEqual(rc, 1, err)
+        self.assertEqual(sha(self.prov), before)
+        new = self.store / "topics" / "memory" / "guarded.md"
+        with self._guard_error("topics/memory/guarded.md"):
+            rc, _o, err = self.run_cmd("record", "--title", "Guarded", "--area", "memory", "--ruling", "r")
+        self.assertEqual(rc, 1, err)
+        self.assertFalse(new.exists())
+        self.assertIn("reason=guard", self.log_lines()[-1])
+
+    def test_guard_that_cannot_run_is_a_refusal_not_a_pass(self):
+        before = sha(self.topic)
+        with mock.patch.object(memlint, "check_append_only", side_effect=memlint.GitError("no HEAD")):
+            rc, _o, err = self.append()
+        self.assertEqual(rc, 1, err)
+        self.assertIn("cannot run", err)
+        self.assertEqual(sha(self.topic), before)
+        self.assertIn("reason=guard-unavailable", self.log_lines()[-1])
+        with mock.patch.object(memlint, "check_append_only", side_effect=memlint.GitError("no HEAD")):
+            rc, _o, err = self.run_cmd("record", "--title", "Unproven", "--area", "memory", "--ruling", "r")
+        self.assertEqual(rc, 1, err)
+        self.assertFalse((self.store / "topics" / "memory" / "unproven.md").exists())
+
+    def test_guard_does_not_see_an_untracked_new_topic(self):
+        """Verified finding: `check_append_only` reads `git diff HEAD`, so an
+        untracked brand-new topic yields no error even when it is malformed --
+        the new-topic proof is the lint + new-link checks, not the guard."""
+        (self.store / "topics" / "memory" / "untracked.md").write_text("---\ntype: topic\nid: TOP-9300\n---\n")
+        errors, changed, _notes = memlint.check_append_only(self.store, "HEAD", False)
+        self.assertEqual((errors, changed), ([], 0))
+
+    # --- R1-4: no error-set subtraction ----------------------------------------------
+
+    def test_a_topic_that_already_fails_lint_accepts_no_filing(self):
+        bad = self.store / "topics" / "memory" / "bad.md"
+        bad.write_text(PROVISIONAL_TOPIC.replace("TOP-9101", "TOP-9110").replace(
+            "status: provisional", "status: bogus"))
+        self.commit("bad topic")
+        self.head0 = self.head()
+        before = sha(bad)
+        rc, _o, err = self.run_cmd("append", "TOP-9110", "--ruling", "x")
+        self.assertEqual(rc, 1, err)
+        self.assertIn("unknown status", err)
+        self.assertEqual(sha(bad), before)
+
+    def test_an_old_link_that_only_warns_under_a_grandfathered_check_still_accepts_a_filing(self):
+        old = self.store / "topics" / "memory" / "oldkind.md"
+        old.write_text(PROVISIONAL_TOPIC.replace("TOP-9101", "TOP-9111").replace("kind: adopted", "kind: weird"))
+        self.commit("old kind")
+        self.head0 = self.head()
+        self.assertEqual(memlint.lint_root(self.store)[0], [])  # control: a warning in plain mode
+        rc, _o, err = self.run_cmd("append", "TOP-9111", "--ruling", "x")
+        self.assertEqual(rc, 0, err)
+
 
 if __name__ == "__main__":
     unittest.main()

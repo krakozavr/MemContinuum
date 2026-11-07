@@ -3869,9 +3869,22 @@ the old link by `insert_promoted_by`, locating it with memlint's
 `_link_raw_spans` and never re-rendering it. A new topic is written from a
 template, never a YAML dumper. Before the file is written the result
 must parse back to the intended link with every earlier link unchanged
-(`edit_roundtrip_problem`), lint without a new error, and pass the new-link
-checks `--against-ref` applies; after it is written `check_append_only` runs
-against `HEAD` for that file and a failure restores the original bytes. The
+(`edit_roundtrip_problem`), and the whole result file must lint with NO error
+(memlint's own grandfathering already makes a stricter check on an old link a
+warning, so a file that fails the store's pre-commit lint accepts no filing)
+plus the new-link checks `--against-ref` applies. The write itself is atomic
+(`_atomic_write_bytes`: a temp file in the same directory, fsync,
+`os.replace`; a new topic first reserves its path with `O_CREAT|O_EXCL`), so an
+I/O error leaves the original bytes (or no file) and is a refusal
+(`io-error`), as is a mid-write failure in `bind` and `mark-standing`, which
+share the write. After the write, an existing topic is checked by
+`check_append_only` against `HEAD` for that file; an error, or a guard that
+cannot run at all (`guard-unavailable`), puts the original bytes back and
+refuses. A new topic is untracked, and `check_append_only` reads `git diff
+HEAD`, which does not list untracked files: for `record` the guard only proves
+that the store can run the comparison (otherwise `record` refuses and removes
+the file), and the proof of the new file is the full lint plus the new-link
+checks run before the write. The
 command prints the unified diff and a suggested commit message, and never
 commits.
 
@@ -3899,8 +3912,9 @@ shared with `propose-bindings`). Each run appends one `filing` line to hook.log
 (outcome, ids, authority, derived, dedupe_top, retrieval, project; a refusal adds
 `reason`).
 
-A `kind: reversed` link needs its target already superseded (memlint's rule), so
-supersede the old link by hand in the same commit first; `amended` needs nothing.
+A `kind: reversed` link is refused (by memlint's rule) while its target is still
+`active` or `provisional`, so supersede the old link by hand in the same commit
+first; `restored` and `amended` carry no such rule.
 
 ## CLI semantics
 
