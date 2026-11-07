@@ -18,10 +18,10 @@ Claude Code auto-memory (~/.claude/projects/…/memory/):
 
 Never both; never copy content across layers.
 
-How to write a store record: docs/SCHEMA.md in the engine; lint it, then commit
-the store (committing reindexes it). Constraint and hold links may be mirrored
-by a `decision: TOP-xxxx Ln` comment at the bound symbol; memlint checks both
-ways. Name the decision in commit messages too (`TOP-xxxx Ln`).
+How to write a store record: `memidx.py record|append|promote` (shape: docs/SCHEMA.md in
+the engine); it prints the diff, you commit the store (committing reindexes it). Constraint and
+hold links may be mirrored by a `decision: TOP-xxxx Ln` comment at the bound symbol;
+memlint checks both ways. Name the decision in commit messages too (`TOP-xxxx Ln`).
 
 A brief for a reviewer or a dispatched agent opens with the decision records, not a
 summary of them: paste the output of `memidx.py context-pack --project {{PROJECT}} <files the brief touches>`

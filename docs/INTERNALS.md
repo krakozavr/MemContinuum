@@ -3855,6 +3855,90 @@ only a fixed notice that no decision records were supplied, plus its hash
 line, so a blind review is recorded as such and carries nothing
 memory-shaped.
 
+## Filing
+
+`record`, `append` and `promote` are three entry points to one writer.
+
+**The write is line insertion.** The new link is rendered alone by
+`render_link_item` (SCHEMA section 3 field order, the store's indentation,
+strings through `_yaml_quote`, `date`/`recorded_at` bare) and placed first under
+`links:` by `_splice_block_item`, the same splice `bind` and `mark-standing`
+use for their rows. `current:` is edited in place by `edit_current_line`, only
+when the newest active link changes; `promote` adds one `promoted_by:` line to
+the old link by `insert_promoted_by`, locating it with memlint's
+`_link_raw_spans` and never re-rendering it. A new topic is written from a
+template, never a YAML dumper. Before the file is written the result
+must parse back to the intended link with every earlier link unchanged
+(`edit_roundtrip_problem`), and the whole result file must lint with NO error
+(memlint's own grandfathering already makes a stricter check on an old link a
+warning, so a file that fails the store's pre-commit lint accepts no filing)
+plus the new-link checks `--against-ref` applies. The write itself is atomic
+(`_atomic_write_bytes`: a temp file in the same directory, fsync,
+`os.replace`; a new topic first reserves its path with `O_CREAT|O_EXCL`), so an
+I/O error leaves the original bytes (or no file) and is a refusal
+(`io-error`) -- except that a failed unlink of a new topic's reservation leaves a
+zero-byte file plus the rejected-edit banner, and the next `record` of that slug
+then refuses `path-exists` until the file is removed -- as is a mid-write failure in `bind` and `mark-standing`, which
+share the write. After the write, an existing topic is checked by
+`check_append_only` against `HEAD` for that file; an error, or a guard that
+cannot run at all (`guard-unavailable`), puts the original bytes back and
+refuses; the restore is itself atomic, so the file is either the old text or
+the whole rejected text, never a mix, and when the restore fails the command
+prints `REJECTED EDIT REMAINS ON DISK: <path> -- <remedy>` on stderr instead
+of "nothing written" and the receipt carries `rollback=failed`. A new topic is untracked, and `check_append_only` reads `git diff
+HEAD`, which does not list untracked files: for `record` the guard only proves
+that the store can run the comparison (otherwise `record` refuses and removes
+the file), and the proof of the new file is the full lint plus the new-link
+checks run before the write. The
+command prints the unified diff and a suggested commit message, and never
+commits.
+
+**One fail-closed topic lookup** (`_id_claim`; filing, `bind` and `mark-standing`
+alike). A file that decodes and parses strictly matches only by its exact parsed
+`id`; a file that does not (invalid, undecodable, lenient-fallback, or no id) is a
+raw claimant when any line of the file (the raw scan reads every line, not only the
+frontmatter; up to two spaces of indent, Unicode spaces allowed) is an `id:` line
+holding the requested id as a whole token, and a raw claimant is never a write
+target. `append` and `promote` count it toward `ambiguous-topic` and refuse;
+`bind` and `mark-standing` still write the single strict topics file even while a
+raw twin or an inbox copy names the id (the pre-existing binding contract,
+`tests/test_binding.py`), and refuse a raw claimant only when it is the sole
+match, with the parse or decode refusal. No
+lenient id text is ever reconstructed, so a valid file whose id is
+`"TOP-9100 # literal"` is not TOP-9100. Allocation counts every canonical `TOP-n`
+token on an unparseable file's `id:` line, so `record --id X` refuses and
+automatic allocation skips X while such a file names it, until a human fixes the
+file (fail closed).
+`record` also refuses `outside-store`, before any reservation, when the destination's resolved parent is not inside the store (a symlinked `topics/` or area); allocation ignores symlinked trees by design (`walk_markdown` skips them as outside the store).
+
+**Authority is derived.** `--authority owner-verbatim|owner-ratified` is
+refused. With `--session` and `--owner-message UUID --quote TEXT`, the quote
+must be an exact substring (no whitespace collapse, case folding or
+normalisation) of a human message in
+`~/.claude/projects/*/<session>.jsonl` (`$MEMCONTINUUM_TRANSCRIPTS_DIR`
+overrides the directory): `type == "user"`, no `isMeta`, string content. With
+`--yes-message UUID` the uuid must be such a message; its text is not read. When
+several transcripts carry the session id, the one whose first human line's
+`cwd` lies under a `--code-root` wins; otherwise the command refuses. If the
+transcript cannot establish the tier, `append`/`record` file an
+`agent-inference` link with a warning and `source: transcript unavailable:
+<reason>`; `promote` refuses. The message text is never logged.
+
+**Around the write.** Before the diff: an advisory FTS search on the title
+(`--status any --decisions-only`, three hits, each with its capped chain; for
+`record` a `suggestion: append <id> instead of record`). After a write: a
+no-embed reindex and a title search; a miss is a warning (rc 3 under
+`--require-retrieve`). When the new link could be standing the exact
+`mark-standing` command is printed; the filing command never marks anything.
+`--session` also prints the read-only binding proposals (`session_proposal_lines`,
+shared with `propose-bindings`). Each run appends one `filing` line to hook.log
+(outcome, ids, authority, derived, dedupe_top, retrieval, project; a refusal adds
+`reason`).
+
+A `kind: reversed` link is refused (by memlint's rule) while its target is still
+`active` or `provisional`, so supersede the old link by hand in the same commit
+first; `restored` and `amended` carry no such rule.
+
 ## CLI semantics
 
 `--help` on each subcommand is the flag reference. The semantics worth writing

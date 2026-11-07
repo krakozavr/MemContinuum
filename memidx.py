@@ -30,6 +30,7 @@ import shlex
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -11891,8 +11892,91 @@ def _anchor_today() -> str:
     return datetime.now().date().isoformat()
 
 
+_RAW_ID_LINE_RE = re.compile(r"^\s{0,2}id\s*:(.*)$")
+
+
+def _raw_id_text(path: Path) -> str | None:
+    """The remainder of EVERY line of `path` (the whole file, not only the
+    frontmatter) that looks like a top-level `id:` line -- up to two spaces of
+    indent, optional space before the colon -- joined by newlines; None when
+    the file is unreadable or has no such line. Over-inclusive by design
+    (TOP-0137 L23, gate round 6 R6-3/R6-5): an extra raw claimant on a
+    malformed file can only produce a refusal, never a write. Undecodable
+    bytes are replaced. Used only to NAME a file that does not parse strictly
+    -- it is never an id value."""
+    try:
+        text = Path(path).read_bytes().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    found = []
+    for line in text.splitlines():
+        m = _RAW_ID_LINE_RE.match(line)
+        if m:
+            found.append(m.group(1))
+    return "\n".join(found) if found else None
+
+
+def _id_token_re(topic_id: str):
+    return re.compile(r"(?<![A-Za-z0-9_-])" + re.escape(topic_id) + r"(?![A-Za-z0-9_-])")
+
+
+def _id_claim(path: Path, topic_id: str) -> str | None:
+    """How `path` relates to `topic_id` (TOP-0137 L23, gate round 5 R5-1), one
+    fail-closed rule for filing, `bind` and `mark-standing`:
+    "strict" -- the file decodes, parses without the lenient fallback and its
+    parsed `id` equals `topic_id` exactly (the only kind that is ever a write
+    target); "raw" -- the file does NOT parse strictly (invalid, undecodable,
+    fallback-parsed, or no frontmatter id) and its raw top-level `id:` line
+    holds `topic_id` as a whole token (it exists only to be refused); else None.
+    A file that parses strictly with a DIFFERENT id is never a match, whatever
+    its id line looks like."""
+    try:
+        raw = Path(path).read_bytes()
+    except OSError:
+        return None
+    parsed_id = None
+    try:
+        result = parse_record_raw(raw.decode("utf-8"), path)
+        if result.valid and not result.fallback:
+            parsed_id = result.frontmatter.get("id")
+            if parsed_id is not None and str(parsed_id):
+                return "strict" if str(parsed_id) == topic_id else None
+    except UnicodeDecodeError:
+        pass
+    id_text = _raw_id_text(path)
+    if id_text is not None and _id_token_re(topic_id).search(id_text):
+        return "raw"
+    return None
+
+
+def _record_id_of(path: Path, unparsed: list | None = None) -> str | None:
+    """The parsed frontmatter `id` of a store file, read with the engine's own
+    record parser (so `id: TOP-1 # note` and quoted spellings count), or None
+    when the file is unreadable, not UTF-8, or does not parse strictly. When
+    `unparsed` (a list) is given, a file that could not be read or parsed (as
+    opposed to one that simply carries no id) appends its path to it. Used by
+    `_store_ids`; lookup by name goes through `_id_claim`."""
+    def fail():
+        if unparsed is not None:
+            unparsed.append(path)
+        return None
+    try:
+        text = Path(path).read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return fail()
+    result = parse_record_raw(text, path)
+    if not result.valid or result.fallback:
+        return fail()
+    rid = result.frontmatter.get("id")
+    return str(rid) if rid else None
+
+
 def _topic_file_for_id(root: Path, topic_id: str) -> Path | None:
-    """The store file whose frontmatter `id` is `topic_id`, under topics/."""
+    """The store file for `topic_id` under topics/ (bind, mark-standing): the
+    ONE file that matches strictly (`_id_claim`), even when raw claimants of
+    the same id exist; with no strict match, the one raw claimant (so the
+    caller refuses it on parse/decode); otherwise None (no match, or more
+    than one strict match or more than one raw claimant -- fail closed)."""
     topics_dir = Path(root) / "topics"
     if not topics_dir.is_dir():
         return None
@@ -11907,29 +11991,39 @@ def _topic_file_for_id(root: Path, topic_id: str) -> Path | None:
         except ValueError:
             return found
 
-    pattern = re.compile(r"^id:\s*['\"]?" + re.escape(topic_id) + r"['\"]?\s*$", re.M)
-    undecodable = None
+    strict, raw = [], []
     for path in walk_markdown(topics_dir):
-        try:
-            raw = path.read_bytes()
-        except OSError:
+        kind = _id_claim(path, topic_id)
+        if kind == "strict":
+            strict.append(own_spelling(path))
+        elif kind == "raw":
+            raw.append(own_spelling(path))
+    if len(strict) == 1:
+        return strict[0]
+    if not strict and len(raw) == 1:
+        return raw[0]
+    return None
+
+
+def _topic_claimants(root: Path, topic_id: str) -> list:
+    """`[(path, kind)]` sorted by path, over every file under `topics/` AND
+    `inbox/` that claims `topic_id` by `_id_claim` ("strict" or "raw"). Filing
+    lookup only: it finds files to refuse by name; `_load_topic` writes only a
+    single strict claimant under topics/ (TOP-0137 L23, gate round 5 R5-1)."""
+    found = []
+    walked_root = Path(root).resolve()
+    for sub in ("topics", "inbox"):
+        base = Path(root) / sub
+        if not base.is_dir():
             continue
-        # lenient on purpose: an undecodable file must still be FOUND so the
-        # writer can refuse it by name instead of reporting "no topic" -- but
-        # only when no VALID file carries the id (a valid duplicate wins, in
-        # whatever order the walk meets them)
-        try:
-            head = raw.decode("utf-8")
-            valid = True
-        except UnicodeDecodeError:
-            head = raw.decode("utf-8", errors="replace")
-            valid = False
-        if pattern.search(head.split("\n---", 1)[0]):
-            if valid:
-                return own_spelling(path)
-            if undecodable is None:
-                undecodable = own_spelling(path)
-    return undecodable
+        for path in walk_markdown(base):
+            kind = _id_claim(path, topic_id)
+            if kind:
+                try:
+                    found.append((Path(root) / path.relative_to(walked_root), kind))
+                except ValueError:
+                    found.append((path, kind))
+    return sorted(found)
 
 
 def anchor_span_bytes(data: bytes, start_line: int, end_line: int) -> bytes:
@@ -12108,14 +12202,16 @@ def render_anchor_item(row: dict, indent: str = "  ", order: tuple = ANCHOR_FIEL
     return out
 
 
-def _insert_block_row(text: str, key: str, row: dict, order: tuple, quoted, prepend: bool,
-                      create_at) -> str:
-    """`text` (a topic file) with one `row` added to the top-level block list
-    `key:` -- appended at the end of an existing block (`prepend` False) or
-    placed first under the key line (`prepend` True, newest-first lists); an
-    absent key is created at the index `create_at(lines, first, end)` returns.
-    Pure line insertion -- every other byte of the file is untouched. Raises
-    ValueError when the structure does not allow a safe insert."""
+def _splice_block_item(text: str, key: str, render, prepend: bool, create_at=None) -> str:
+    """`text` (a topic file) with one block-list item added to the top-level
+    list `key:` -- appended at the end of an existing block (`prepend` False)
+    or placed first under the key line (`prepend` True, newest-first lists);
+    an absent key is created at the index `create_at(lines, first, end)`
+    returns. `render(indent)` gives the item's lines (no line endings) for the
+    block's own item indent. Pure line insertion -- every other byte of the
+    file is untouched. The ONE splice behind the anchors/standing_marks rows
+    and the filing command's links. Raises ValueError when the structure does
+    not allow a safe insert."""
     nl = _newline_of(text)
     lines = _split_lines_keep(text)
     first, end = _fm_line_bounds(lines)
@@ -12129,7 +12225,7 @@ def _insert_block_row(text: str, key: str, row: dict, order: tuple, quoted, prep
         elif value != "":
             raise ValueError(f"`{key}:` is not a block list; refusing to edit it")
         last = _block_last_line(lines, key_idx, end, include_trailing=not prepend)
-        item = render_anchor_item(row, _block_item_indent(lines, key_idx, last), order, quoted)
+        item = render(_block_item_indent(lines, key_idx, last))
         if prepend:
             pos = key_idx + 1
         else:
@@ -12138,10 +12234,20 @@ def _insert_block_row(text: str, key: str, row: dict, order: tuple, quoted, prep
                 lines[last] += nl
         lines[pos:pos] = [ln + nl for ln in item]
     else:
+        if create_at is None:
+            raise ValueError(f"no `{key}:` key to add an item to")
         at = create_at(lines, first, end)
-        item = render_anchor_item(row, "  ", order, quoted)
+        item = render("  ")
         lines[at:at] = [f"{key}:{nl}"] + [ln + nl for ln in item]
     return "".join(lines)
+
+
+def _insert_block_row(text: str, key: str, row: dict, order: tuple, quoted, prepend: bool,
+                      create_at) -> str:
+    """`text` with one flat `row` (anchors / standing_marks) spliced into the
+    block list `key:` by `_splice_block_item`."""
+    return _splice_block_item(
+        text, key, lambda indent: render_anchor_item(row, indent, order, quoted), prepend, create_at)
 
 
 def _before_links_key(placed: str):
@@ -12216,8 +12322,85 @@ def _topic_current_link(fm: dict) -> str | None:
     return str(link.get("link")) if link else None
 
 
+class ReservationLeftError(OSError):
+    """The exclusive reservation of a new file could not be removed after a
+    failed write: an empty file remains at `path` (`.reserved_path`)."""
+
+    def __init__(self, reserved_path: str, message: str):
+        super().__init__(message)
+        self.reserved_path = reserved_path
+
+
+def _atomic_write_bytes(path: Path, data: bytes, exclusive: bool = False) -> None:
+    """Write `data` to `path` so a crash or I/O error never leaves a short file:
+    a temp file in the SAME directory, flushed and fsynced, then `os.replace`d
+    onto the target, then the parent directory fsynced so the rename survives
+    power loss (a failure of that last step is ignored). `exclusive` (a new
+    file): the target is first created with O_CREAT|O_EXCL as the reservation --
+    FileExistsError when it is taken, which never unlinks the winner -- and
+    removed again if anything after it fails. For an existing file the original
+    bytes are what remain on disk after any failure, and its permission bits are
+    kept (also mode 0, for symmetry: a 000 file cannot be read by the writer, so
+    in practice it is never reached). Raises OSError on I/O failure.
+
+    Known window: a kill between the reservation and the `os.replace` leaves a
+    zero-byte file at the target; the next `record` refuses with `path-exists`
+    and the operator removes the file."""
+    path = Path(path)
+    if exclusive:
+        # FileExistsError for a taken path propagates from here, outside the
+        # cleanup below, so the winner's file is never unlinked
+        fd0 = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+    else:
+        path = Path(os.path.realpath(path))  # replace the file a symlink points at, not the link
+    tmp_name = None
+    try:
+        if exclusive:
+            os.close(fd0)
+        try:
+            mode = path.stat().st_mode & 0o7777
+        except OSError:
+            mode = None
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        if mode is not None:
+            os.chmod(tmp_name, mode)
+        os.replace(tmp_name, str(path))
+        tmp_name = None
+    except BaseException as exc:
+        if tmp_name:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+        if exclusive:
+            try:
+                os.unlink(str(path))
+            except FileNotFoundError:
+                pass
+            except OSError as unlink_exc:
+                if isinstance(exc, Exception):
+                    raise ReservationLeftError(
+                        str(path), f"reservation left on disk: {path} (write failed: {exc}; "
+                                   f"cleanup failed: {unlink_exc})") from exc
+        raise
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
+
+
 def apply_topic_edit(path: Path, old_text: str, new_text: str, dry_run: bool, store_root: Path) -> None:
-    """Print the exact diff; write it unless `dry_run`. Never commits."""
+    """Print the exact diff; write it unless `dry_run` (atomically, see
+    `_atomic_write_bytes`; `bind` and `mark-standing` share this write). Never
+    commits."""
     try:
         label = str(path.relative_to(store_root))
     except ValueError:
@@ -12226,7 +12409,7 @@ def apply_topic_edit(path: Path, old_text: str, new_text: str, dry_run: bool, st
     if dry_run:
         print("dry-run: nothing written")
         return
-    Path(path).write_bytes(new_text.encode("utf-8"))
+    _atomic_write_bytes(path, new_text.encode("utf-8"))
 
 
 def parse_record_raw(text: str, path):
@@ -12275,17 +12458,10 @@ def cmd_bind(args) -> int:
     if path is None:
         print(f"bind: no topic {args.topic!r} under {args.root}/topics", file=sys.stderr)
         return 1
-    try:
-        old_text = read_record_bytes_strict(path)
-    except UnicodeDecodeError as exc:
-        print(f"bind: {path.name} is not valid UTF-8 ({exc}); nothing written", file=sys.stderr)
+    old_text, fm, reason = _verified_topic_record(root, args.topic, path)
+    if reason:
+        print(f"bind: {reason[1]}; nothing written", file=sys.stderr)
         return 1
-    result = parse_record_raw(old_text, path)
-    if not result.valid:
-        print(f"bind: {path.name} does not parse cleanly: "
-              f"{'; '.join(m for _f, m in result.diagnostics)}", file=sys.stderr)
-        return 1
-    fm = result.frontmatter
     link_id = _topic_current_link(fm)
     if link_id is None:
         print(f"bind: {args.topic} has no active link to anchor", file=sys.stderr)
@@ -12531,17 +12707,10 @@ def cmd_mark_standing(args) -> int:
     if path is None:
         print(f"mark-standing: no topic {args.topic!r} under {args.root}/topics", file=sys.stderr)
         return 1
-    try:
-        old_text = read_record_bytes_strict(path)
-    except UnicodeDecodeError as exc:
-        print(f"mark-standing: {path.name} is not valid UTF-8 ({exc}); nothing written", file=sys.stderr)
+    old_text, fm, reason = _verified_topic_record(root, args.topic, path)
+    if reason:
+        print(f"mark-standing: {reason[1]}; nothing written", file=sys.stderr)
         return 1
-    result = parse_record_raw(old_text, path)
-    if not result.valid:
-        print(f"mark-standing: {path.name} does not parse cleanly: "
-              f"{'; '.join(m for _f, m in result.diagnostics)}", file=sys.stderr)
-        return 1
-    fm = result.frontmatter
     before = standing_ids(fm)
     if add and link_id in before:
         print(f"mark-standing: {args.topic} {link_id} is already standing; nothing written")
@@ -12605,6 +12774,965 @@ def cmd_mark_standing(args) -> int:
         return 1
     apply_topic_edit(path, old_text, new_text, args.dry_run, root)
     return 0
+
+
+# ---------------------------------------------------------------------------
+# the filing command: `record`, `append`, `promote` (TOP-0137 L23)
+# ---------------------------------------------------------------------------
+#
+# One writer for new links. The write is pure line insertion (INC-0124): the
+# new link is rendered alone by `render_link_item` and spliced under `links:`
+# by `_splice_block_item`; the only edits to existing text are the in-place
+# `current:` scalar and, for `promote`, one `promoted_by:` line. No YAML dumper
+# ever touches existing content. memlint's append-only guard is the proof,
+# run in process before the command reports success. The command never
+# commits (TOP-0122 L1) and never writes `standing:` (mark-standing's job).
+
+FILING_TYPED_AUTHORITIES = ("agent-inference", "reviewer-finding", "code-derived")
+FILING_STATUSES = ("active", "provisional", "declined")
+_BARE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
+_BARE_AREA_RE = re.compile(r"^[a-z][a-z0-9_-]*(/[a-z][a-z0-9_-]*)*$")
+_YAML_RESERVED_WORDS = frozenset({"y", "n", "yes", "no", "on", "off", "true", "false", "null"})
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_TOPIC_ID_RE = re.compile(r"^TOP-(\d+)$")
+
+
+class FilingRefusal(Exception):
+    """A refusal: nothing was written. `token` is the log-safe reason."""
+
+    def __init__(self, token: str, message: str, on_disk: str | None = None,
+                 remedy: str = "", path_on_disk: str = ""):
+        super().__init__(message)
+        self.token = token
+        self.message = message
+        # `None`: nothing of the rejected edit is on disk. `"rejected"`: the
+        # undo itself failed, so the rejected text remains; `remedy` is the
+        # operator's command to clear it.
+        self.on_disk = on_disk
+        self.remedy = remedy
+        self.path_on_disk = path_on_disk
+
+
+def _bare_or_quoted(value, pattern=_BARE_NAME_RE) -> str:
+    """A scalar written bare when it matches `pattern` and YAML cannot retype
+    it (`yes`, `null`, ...), else through `_yaml_quote`."""
+    s = str(value)
+    return s if pattern.match(s) and s.lower() not in _YAML_RESERVED_WORDS else _yaml_quote(s)
+
+
+def render_link_item(link: dict, indent: str = "  ") -> list:
+    """The lines (no line endings) of ONE link block-list item, in SCHEMA
+    section 3 field order, with the store's indentation (`indent` is the
+    item marker's column: `  - link: L7`, fields at +2, nested keys at +4,
+    nested list items at +6). Strings YAML could retype or that hold `:`/`#`
+    go through `_yaml_quote`; `date` and `recorded_at` are bare dates. Only
+    the NEW link is ever rendered -- existing links are never re-rendered."""
+    rel: list = [f"link: {link['link']}", f"date: {link['date']}", f"status: {link['status']}",
+                 f"kind: {link['kind']}"]
+    if link.get("reverses"):
+        rel.append(f"reverses: {link['reverses']}")
+    if link.get("reason_for_change"):
+        rel.append(f"reason_for_change: {_bare_or_quoted(link['reason_for_change'])}")
+    ruling = link["ruling"]
+    rel.append("ruling:")
+    rel.append(f"  text: {_yaml_quote(ruling['text'])}")
+    rel.append(f"  authority: {ruling['authority']}")
+    if ruling.get("source"):
+        rel.append(f"  source: {_yaml_quote(ruling['source'])}")
+    rationale = link.get("rationale")
+    if rationale:
+        rel.append("rationale:")
+        rel.append(f"  text: {_yaml_quote(rationale['text'])}")
+        rel.append(f"  authority: {rationale['authority']}")
+    if link.get("alternatives"):
+        rel.append("alternatives:")
+        for alt in link["alternatives"]:
+            rel.append(f"  - {{option: {_yaml_quote(alt['option'])}, "
+                       f"rejected_because: {_yaml_quote(alt['rejected_because'])}, "
+                       f"authority: {alt['authority']}}}")
+    for key in ("evidence", "revisit_if"):
+        if link.get(key):
+            rel.append(f"{key}:")
+            rel.extend(f"  - {_yaml_quote(item)}" for item in link[key])
+    rel.append(f"recorded_by: {_bare_or_quoted(link['recorded_by'])}")
+    rel.append(f"recorded_at: {link['recorded_at']}")
+    return [f"{indent}- {rel[0]}"] + [f"{indent}  {ln}" for ln in rel[1:]]
+
+
+def link_expected_dict(link: dict) -> dict:
+    """What YAML must parse `render_link_item(link)` back to: the link's
+    fields as written, `date`/`recorded_at` as dates (the round-trip target
+    of `edit_roundtrip_problem`)."""
+    out: dict = {}
+    for key in ("link", "date", "status", "kind", "reverses", "reason_for_change", "ruling",
+                "rationale", "alternatives", "evidence", "revisit_if", "recorded_by",
+                "recorded_at"):
+        if link.get(key):
+            out[key] = copy.deepcopy(link[key])
+    for key in ("date", "recorded_at"):
+        out[key] = _date.fromisoformat(out[key])
+    for key in ("ruling", "rationale"):
+        if key in out:
+            out[key] = {k: v for k, v in out[key].items() if v}
+    return out
+
+
+def splice_new_link(text: str, link: dict) -> str:
+    """`text` with the new link placed first under `links:` -- the newest-first
+    convention -- by the shared splice. A flow `links: []` is refused."""
+    lines = _split_lines_keep(text)
+    first, end = _fm_line_bounds(lines)
+    idx = _top_key_index(lines, first, end, "links") if end else None
+    if idx is None:
+        raise ValueError("no `links:` key; nothing to append to")
+    if lines[idx].split(":", 1)[1].strip() != "":
+        raise ValueError("`links:` is not a block list; refusing to edit it")
+    return _splice_block_item(text, "links", lambda indent: render_link_item(link, indent), True)
+
+
+def edit_current_line(text: str, new_id: str) -> str:
+    """`text` with the top-level `current:` scalar replaced by `new_id`, in
+    place (a trailing comment survives); unchanged when the key is absent.
+    Sibling of `edit_standing_line`."""
+    lines = _split_lines_keep(text)
+    first, end = _fm_line_bounds(lines)
+    idx = _top_key_index(lines, first, end, "current") if end else None
+    if idx is None:
+        return text
+    m = re.match(r"^(current:[ \t]*)([^\s#]*)(.*?)(\r?\n?)$", lines[idx], re.S)
+    if not m:
+        raise ValueError("`current:` is not a plain scalar; refusing to edit it")
+    lines[idx] = f"{m.group(1)}{new_id}{m.group(3)}{m.group(4)}"
+    return "".join(lines)
+
+
+def insert_promoted_by(text: str, link_id: str, new_id: str) -> str:
+    """`text` with ONE line `promoted_by: <new_id>` inserted into link
+    `link_id` right after its `status:` line. The link is located by the
+    positional walk memlint's `_link_raw_spans` uses (never a regex on ids) and
+    its span is NOT re-rendered: one line is added to it, nothing else moves."""
+    import memlint
+    parsed = parse_record_raw(text, "<promote>")
+    links = parsed.frontmatter.get("links") if parsed.valid else None
+    if not isinstance(links, list):
+        raise ValueError("the topic's links do not parse")
+    spans = memlint._link_raw_spans(text, links)
+    if spans is None or link_id not in spans:
+        raise ValueError(f"cannot locate the raw span of {link_id}")
+    span = spans[link_id]
+    if text.count(span) != 1:
+        raise ValueError(f"the raw span of {link_id} is not unique in the file")
+    nl = _newline_of(text)
+    span_lines = _split_lines_keep(span)
+    marker = re.match(r"^(\s*)- ", span_lines[0])
+    if not marker:
+        raise ValueError(f"the raw span of {link_id} does not start at an item marker")
+    field_indent = " " * (len(marker.group(1)) + 2)
+    for i, ln in enumerate(span_lines):
+        if re.match(r"^" + field_indent + r"status:(\s|$)", ln):
+            if not ln.endswith("\n"):
+                span_lines[i] = ln + nl
+            span_lines.insert(i + 1, f"{field_indent}promoted_by: {new_id}{nl}")
+            new_span = "".join(span_lines)
+            at = text.index(span)
+            return text[:at] + new_span + text[at + len(span):]
+    raise ValueError(f"{link_id} has no `status:` line at its field column")
+
+
+# --- reading the owner's side of the session: authority is derived, never typed ----------
+
+class _DerivationUnavailable(Exception):
+    pass
+
+
+def transcripts_dir() -> Path:
+    """Where session transcripts live; `MEMCONTINUUM_TRANSCRIPTS_DIR` overrides
+    `~/.claude/projects` (tests)."""
+    env = os.environ.get("MEMCONTINUUM_TRANSCRIPTS_DIR")
+    return Path(env) if env else Path.home() / ".claude" / "projects"
+
+
+def read_transcript_humans(path: Path) -> dict:
+    """`{"humans": {uuid: (content, timestamp)}, "all": {uuid, ...}, "cwd": first
+    human line's cwd}` of one transcript jsonl. A human message is a line with
+    `type == "user"`, no `isMeta`, `message.role == "user"` and a STRING
+    `message.content` -- tool results (list content) and meta lines are not.
+    Nothing here is logged or persisted (TOP-0133 L2)."""
+    humans: dict = {}
+    every: set = set()
+    cwd = None
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            try:
+                d = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(d, dict):
+                continue
+            uid = d.get("uuid")
+            if isinstance(uid, str):
+                every.add(uid)
+            msg = d.get("message")
+            if (d.get("type") == "user" and not d.get("isMeta") and isinstance(uid, str)
+                    and isinstance(msg, dict) and msg.get("role") == "user"
+                    and isinstance(msg.get("content"), str)):
+                if not humans and d.get("cwd"):
+                    cwd = str(d["cwd"])  # the FIRST human line's cwd only
+                humans[uid] = (msg["content"], str(d.get("timestamp") or ""))
+    return {"humans": humans, "all": every, "cwd": cwd}
+
+
+def find_session_transcript(session_id: str, code_roots: list) -> Path:
+    """The one transcript file for `session_id`. Several matches: the one whose
+    first human line's `cwd` lies under a code root; still ambiguous raises
+    FilingRefusal naming the candidates. None found: _DerivationUnavailable."""
+    if not _SESSION_ID_RE.match(session_id):
+        raise _DerivationUnavailable("session id is not a plain identifier")
+    base = transcripts_dir()
+    found = sorted(base.glob(f"*/{session_id}.jsonl")) if base.is_dir() else []
+    if not found:
+        raise _DerivationUnavailable("no transcript file for the session")
+    if len(found) == 1:
+        return found[0]
+    roots = [path_join_key(r) for r in code_roots]
+    preferred = []
+    for cand in found:
+        try:
+            cwd = read_transcript_humans(cand)["cwd"]
+        except OSError:
+            continue
+        key = path_join_key(cwd) if cwd else ""
+        if key and any(key == r or key.startswith(r.rstrip(os.sep) + os.sep) for r in roots):
+            preferred.append(cand)
+    if len(preferred) == 1:
+        return preferred[0]
+    raise FilingRefusal(
+        "ambiguous-transcript",
+        f"{len(found)} transcripts match session {session_id}; pass --code-root to pick one: "
+        + ", ".join(str(c) for c in found))
+
+
+def derive_owner_tier(args, code_roots: list) -> dict | None:
+    """The owner-tier ruling fields derived from the session transcript, or None
+    when no derivation input was given. `{"authority", "text", "source"}` on
+    success; raises _DerivationUnavailable (reason: a fixed phrase, never message
+    text) when the transcript cannot establish it. Verbatim: `--quote` must be
+    an exact substring of the human message -- no whitespace collapse, case
+    folding or normalisation. Ratified: the uuid must be a human message; what it
+    says is not parsed."""
+    owner_uuid = getattr(args, "owner_message", None)
+    yes_uuid = getattr(args, "yes_message", None)
+    if not owner_uuid and not yes_uuid:
+        return None
+    path = find_session_transcript(args.session, code_roots)
+    try:
+        data = read_transcript_humans(path)
+    except OSError:
+        raise _DerivationUnavailable("the transcript cannot be read")
+    uid = owner_uuid or yes_uuid
+    if uid not in data["humans"]:
+        raise _DerivationUnavailable(
+            "the uuid is not a human message" if uid in data["all"]
+            else "the uuid is not in the session transcript")
+    content, stamp = data["humans"][uid]
+    extra = f"; {args.source}" if getattr(args, "source", None) else ""
+    if owner_uuid:
+        quote_text = args.quote if getattr(args, "quote", None) is not None else args.ruling
+        if not quote_text or not quote_text.strip():
+            raise FilingRefusal("usage", "--quote must not be empty")
+        if quote_text not in content:
+            raise _DerivationUnavailable("the quote is not an exact substring of the message")
+        return {"authority": "owner-verbatim", "text": quote_text,
+                "source": f"owner message {uid}, session {args.session}, {stamp}{extra}"}
+    shown = args.shown_text if getattr(args, "shown_text", None) is not None else args.ruling
+    return {"authority": "owner-ratified", "text": shown,
+            "source": f"owner yes-message {uid}, session {args.session}, {stamp}{extra}"}
+
+
+# --- the filing flow --------------------------------------------------------------------
+
+def _store_ids(root: Path) -> dict:
+    """`{id: [paths]}` over every record in the store (not only topics/): the
+    parsed frontmatter `id` of each markdown file, read with the engine's own
+    record parser (the same source of truth as memlint's duplicate-id check in
+    `lint_root`, which lints the whole store and so cannot be called here). A
+    file that does not parse strictly still HOLDS every canonical `TOP-<n>`
+    token on its raw top-level `id:` line (over-inclusive on purpose: it only
+    skips numbers, and `record --id X` refuses while an unparseable file names
+    X); a file with nothing to count is skipped with a stderr note."""
+    out: dict = {}
+    for path in walk_markdown(root):
+        unparsed: list = []
+        rid = _record_id_of(path, unparsed=unparsed)
+        if rid:
+            out.setdefault(rid, []).append(path)
+            continue
+        raw = _raw_id_text(path) if (unparsed or rid is None) else None
+        tokens = sorted(set(re.findall(r"(?<![A-Za-z0-9_-])TOP-\d+(?![A-Za-z0-9_-])", raw or "")))
+        for token in tokens:
+            out.setdefault(token, []).append(path)
+        if unparsed and not tokens:
+            print(f"filing: skipped {path} while collecting ids (unreadable, not UTF-8, "
+                  f"or does not parse)", file=sys.stderr)
+    return out
+
+
+def _filing_link_id(links: list) -> str:
+    nums = [int(m.group(1)) for l in links if isinstance(l, dict)
+            for m in [re.match(r"^L(\d+)$", str(l.get("link")))] if m]
+    return f"L{max(nums, default=0) + 1}"
+
+
+def _single_line_check(name: str, value) -> None:
+    if value is None:
+        return
+    if not str(value).strip():
+        raise FilingRefusal("usage", f"{name} must not be empty")
+
+
+def _filing_validate_args(args, command: str) -> None:
+    """Argument refusals that need no store."""
+    if command != "promote":
+        _single_line_check("--ruling", args.ruling)
+        if args.authority in ("owner-verbatim", "owner-ratified"):
+            raise FilingRefusal(
+                "typed-owner-tier",
+                f"--authority {args.authority} is derived from the session transcript "
+                "(--session with --owner-message or --yes-message), never typed")
+        if args.kind not in KINDS:
+            raise FilingRefusal("usage", f"--kind must be one of {sorted(KINDS)}")
+        if args.status not in FILING_STATUSES:
+            raise FilingRefusal("usage", f"--status must be one of {list(FILING_STATUSES)}")
+        if bool(args.reverses) != bool(args.reason_for_change):
+            raise FilingRefusal("usage", "--reverses and --reason-for-change go together")
+        if args.kind in ("reversed", "restored") and not args.reverses:
+            raise FilingRefusal("usage", f"--kind {args.kind} requires --reverses and --reason-for-change")
+        for alt in args.alternative or []:
+            parts = [p.strip() for p in alt.split(" || ")]
+            if len(parts) != 2 or not all(parts):
+                raise FilingRefusal("usage", "--alternative must be 'OPTION || REJECTED_BECAUSE'")
+    owner_uuid, yes_uuid = args.owner_message, args.yes_message
+    if owner_uuid and yes_uuid:
+        raise FilingRefusal("usage", "--owner-message and --yes-message are exclusive")
+    if (owner_uuid or yes_uuid) and not args.session:
+        raise FilingRefusal("usage", "--owner-message/--yes-message need --session")
+    if (owner_uuid or yes_uuid) and getattr(args, "authority", None):
+        raise FilingRefusal("usage", "--authority cannot be combined with a derivation input")
+    if args.quote is not None and not owner_uuid:
+        raise FilingRefusal("usage", "--quote needs --owner-message")
+    if args.shown_text is not None and not yes_uuid:
+        raise FilingRefusal("usage", "--shown-text needs --yes-message")
+    if command == "promote":
+        if not (owner_uuid or yes_uuid):
+            raise FilingRefusal("no-owner-tier", "promote needs --owner-message (with --quote) or --yes-message")
+        if owner_uuid and args.quote is None:
+            raise FilingRefusal("usage", "promote --owner-message needs --quote")
+
+
+def _filing_commit_citations_problem(texts: list, code_roots: list) -> str | None:
+    """A `commit <hash>`/`merge <hash>` citation that no code root resolves.
+    Thin wrapper over memlint's `_extract_commit_citations`/`_commit_resolves`;
+    `_citation_errors` is not reused because it takes a link's `source` and
+    `evidence` (not the ruling text), skips every non-git code root, downgrades
+    an unresolved hash to a warning unless `strict` -- which would also make an
+    unresolved file:line an error -- and adds subject checks this refusal does
+    not claim."""
+    if not code_roots:
+        return None
+    import memlint
+    for text in texts:
+        for cite in memlint._extract_commit_citations(text or ""):
+            if not any(memlint._commit_resolves(Path(r), cite["hash"]) for r in code_roots):
+                return f"commit {cite['hash']} does not resolve under any --code-root"
+    return None
+
+
+def _lint_errors_for(rel: str, text: str, ids_dir: Path | None = None) -> list:
+    """memlint's schema errors for one record's text, in a throwaway store
+    holding only that file (paths normalised, so old and new compare)."""
+    import memlint
+    with tempfile.TemporaryDirectory() as td:
+        target = Path(td) / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(text.encode("utf-8"))
+        errors, _warnings = memlint.lint_root(Path(td))
+    return [e.replace(os.path.realpath(td), "<store>").replace(td, "<store>") for e in errors]
+
+
+def _filing_lint_problem(rel: str, new_text: str, new_link: dict) -> str | None:
+    """Refuse on ANY schema error in the result file (a file that already fails
+    the store's own pre-commit lint must not accept a filing: TOP-0136
+    grandfathers only inside memlint, as warnings), plus the new-link checks
+    (unknown kind, question-form owner-verbatim) memlint applies under
+    --against-ref."""
+    import memlint
+    problems = _lint_errors_for(rel, new_text)
+    problems += memlint._new_link_errors(f"<store>/{rel}:{new_link['link']}", new_link)
+    return "; ".join(problems) if problems else None
+
+
+def _filing_guard_errors(root: Path, path: Path) -> list:
+    """memlint's append-only guard against HEAD, in process, errors naming the
+    one file just written. Raises memlint.GitError when the comparison cannot
+    run (not a git repo, no HEAD, git failed): that is no proof, so the caller
+    refuses. `check_append_only` reads `git diff HEAD`, which lists tracked
+    files only -- a brand-new untracked topic is invisible to it."""
+    import memlint
+    errors, _changed, _notes = memlint.check_append_only(root, "HEAD", False)
+    return [e for e in errors if e.startswith(str(path))]
+
+
+def _capture_main(argv: list) -> tuple:
+    """`(rc, stdout, stderr)` of an in-process `main(argv)` -- the filing
+    command reuses `search` and `reindex` through their own parsers."""
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = main(argv)
+    return rc, out.getvalue(), err.getvalue()
+
+
+def _filing_db_args(args) -> list:
+    return ["--db", args.db] if getattr(args, "db", None) else []
+
+
+def filing_search_hits(args, root: Path, query: str, limit: int, hydrate: bool) -> list | None:
+    """Hits of an FTS `cmd_search` (status any, decisions only) over the title,
+    or None when the index cannot answer."""
+    argv = ["search", query, "--mode", "fts", "--status", "any", "--decisions-only",
+            "--limit", str(limit), "--json", "--project", args.project, "--root", str(root)]
+    if hydrate:
+        argv.append("--hydrate")
+    rc, out, _err = _capture_main(argv + _filing_db_args(args))
+    if rc != 0:
+        return None
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return None
+    if isinstance(data, dict):
+        data = data.get("results")
+    return data if isinstance(data, list) else None
+
+
+def _hit_topic_id(hit: dict) -> str:
+    return str(hit.get("topic") or hit.get("id") or "").split("/")[0]
+
+
+def print_dedupe(args, root: Path, query: str, command: str) -> str:
+    """Advisory duplicate check: the three nearest decisions, each with its
+    capped chain. Never refuses (TOP-0112 L12). Returns the top hit's topic id
+    or 'none'."""
+    hits = filing_search_hits(args, root, query, 3, True)
+    if hits is None:
+        print("dedupe: the decision index is unavailable (run reindex); no neighbours shown")
+        return "none"
+    if not hits:
+        print("dedupe: no existing decision matches the title")
+        return "none"
+    print("dedupe: nearest existing decisions (advisory)")
+    for hit in hits:
+        line = f"  {_hit_topic_id(hit)}  {hit.get('path')}  {hit.get('title')}  score={hit.get('score'):.4f}"
+        if hit.get("matched_link_id"):
+            line += (f"  matched {hit['matched_link_id']} status={hit.get('link_status')} "
+                     f"authority={hit.get('link_authority')}")
+        print(line)
+        for chain_line in str(hit.get("chain_text") or "").splitlines():
+            print(f"      {chain_line}")
+    top = _hit_topic_id(hits[0])
+    if command == "record":
+        print(f"suggestion: append {top} instead of record")
+    return top or "none"
+
+
+def _build_link(args, link_id: str, ruling: dict, rationale_text: str | None,
+                rationale_authority: str = "agent-inference") -> dict:
+    stamp = _now()
+    link = {
+        "link": link_id, "date": stamp.date().isoformat(), "status": args.status,
+        "kind": args.kind, "ruling": ruling,
+        "recorded_by": args.recorded_by or os.environ.get("MEMCONTINUUM_RECORDED_BY") or "memidx",
+        "recorded_at": stamp.date().isoformat(),
+    }
+    if getattr(args, "reverses", None):
+        link["reverses"] = args.reverses
+        link["reason_for_change"] = args.reason_for_change
+    if rationale_text:
+        link["rationale"] = {"text": rationale_text, "authority": rationale_authority}
+    alts = []
+    for alt in getattr(args, "alternative", None) or []:
+        option, why = [p.strip() for p in alt.split(" || ")]
+        alts.append({"option": option, "rejected_because": why, "authority": "agent-inference"})
+    if alts:
+        link["alternatives"] = alts
+    for key, attr in (("evidence", "evidence"), ("revisit_if", "revisit_if")):
+        if getattr(args, attr, None):
+            link[key] = list(getattr(args, attr))
+    return link
+
+
+def _filing_ruling(args, ctx: dict, code_roots: list, strict: bool) -> dict:
+    """The new link's `ruling` mapping: derived when a derivation input is given
+    and the transcript confirms it, else `agent-inference` (or the typed
+    reviewer-finding/code-derived) with a warning naming why. `strict`
+    (promote): a failed derivation refuses instead."""
+    try:
+        derived = derive_owner_tier(args, code_roots)
+    except _DerivationUnavailable as exc:
+        reason = str(exc)
+        if strict:
+            raise FilingRefusal("derivation-failed", f"cannot derive an owner tier: {reason}")
+        print(f"WARNING: authority not derived ({reason}); filing as agent-inference", file=sys.stderr)
+        ctx["derived"] = "unavailable"
+        source = f"transcript unavailable: {reason}"
+        if args.source:
+            source += f"; {args.source}"
+        return {"text": args.ruling, "authority": "agent-inference", "source": source}
+    if derived is not None:
+        ctx["derived"] = "yes"
+        return derived
+    ctx["derived"] = "no"
+    return {"text": args.ruling, "authority": args.authority or "agent-inference",
+            "source": args.source or ""}
+
+
+def _inside_git_work_tree(root: Path) -> bool:
+    """True when `root` is inside a git work tree (so a `git checkout` remedy
+    can work there)."""
+    try:
+        done = subprocess.run(["git", "-C", str(root), "rev-parse", "--is-inside-work-tree"],
+                              capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.returncode == 0 and done.stdout.strip() == "true"
+
+
+def _filing_guard_or_undo(root: Path, path: Path, rel: str, old_text: str | None) -> None:
+    """Run the append-only guard on the file just written; on a guard error or
+    when the guard cannot run (`guard-unavailable`) undo the write -- the
+    original bytes back for an existing topic, the file removed for a new one --
+    and refuse. For a new (untracked) topic the guard sees nothing; its proof is
+    the lint and new-link checks run before the write."""
+    import memlint
+    try:
+        errors = _filing_guard_errors(root, path)
+        token, why = "guard", "append-only guard failed: " + "; ".join(errors)
+    except memlint.GitError as exc:
+        errors = [str(exc)]
+        token, why = "guard-unavailable", f"the append-only guard cannot run ({exc})"
+    if not errors:
+        return
+    try:
+        if old_text is None:
+            path.unlink()
+        else:
+            _atomic_write_bytes(path, old_text.encode("utf-8"))
+    except OSError as exc:
+        if old_text is None:
+            remedy = f"remove it with: rm {shlex.quote(str(path))}"
+        elif _inside_git_work_tree(root):
+            remedy = f"restore it with: git -C {shlex.quote(str(root))} checkout -- {shlex.quote(rel)}"
+        else:
+            remedy = ("the store root is not inside a git work tree, so there is no checkout to restore "
+                      "from; put back the original text of this file from your own backup")
+        raise FilingRefusal(token, f"{why}; could NOT undo the write ({exc})",
+                            on_disk="rejected", remedy=remedy, path_on_disk=str(path))
+    raise FilingRefusal(token, f"{why}; write undone")
+
+
+def _finish_write(command: str, args, ctx: dict, root: Path, path: Path, rel: str,
+                  old_text: str | None, new_text: str, topic_id: str, link: dict,
+                  title: str) -> int:
+    """Shared tail: round-trip proof is the caller's; here the lint, the diff,
+    the write, the in-process guard, then retrieval check, standing prompt,
+    proposals and the receipt."""
+    problem = _filing_lint_problem(rel, new_text, link)
+    if problem:
+        raise FilingRefusal("lint", f"the result would not lint clean: {problem}")
+    if old_text is None:
+        sys.stdout.write(_unified_diff("", new_text, rel))
+        if args.dry_run:
+            print("dry-run: nothing written")
+        else:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                _atomic_write_bytes(path, new_text.encode("utf-8"), exclusive=True)
+            except FileExistsError:
+                raise FilingRefusal("path-exists", f"{rel} already exists")
+            except ReservationLeftError as exc:
+                raise FilingRefusal("io-error", f"cannot write {rel}: {exc}", on_disk="rejected",
+                                    remedy=f"remove it with: rm {shlex.quote(exc.reserved_path)}",
+                                    path_on_disk=exc.reserved_path)
+            except OSError as exc:
+                raise FilingRefusal("io-error", f"cannot write {rel}: {exc}")
+    else:
+        try:
+            apply_topic_edit(path, old_text, new_text, args.dry_run, root)
+        except OSError as exc:
+            raise FilingRefusal("io-error", f"cannot write {rel}: {exc}")
+    if not args.dry_run:
+        _filing_guard_or_undo(root, path, rel, old_text)
+    short = re.sub(r"\s+", " ", link["ruling"]["text"])[:60]
+    message = f"{topic_id} {link['link']}: {short}"
+    print(f"{command}: {'would write' if args.dry_run else 'wrote'} {topic_id} {link['link']} "
+          f"({link['ruling']['authority']}) -> {rel}", file=sys.stderr)
+    print(f"suggested commit message: {message}")
+    ctx.update(topic=topic_id, link=link["link"], authority=link["ruling"]["authority"])
+    if args.dry_run:
+        ctx["outcome"] = "dry-run"
+        return 0
+    ctx["outcome"] = "written"
+    rc = 0
+    reindex_rc, _o, _e = _capture_main(
+        ["reindex", "--root", str(root), "--project", args.project, "--auto", "--no-embed"]
+        + _filing_db_args(args))
+    hits = filing_search_hits(args, root, title, 5, False) if reindex_rc == 0 else None
+    if hits is not None and any(_hit_topic_id(h) == topic_id for h in hits):
+        ctx["retrieval"] = "hit"
+    else:
+        ctx["retrieval"] = "miss"
+        print(f"WARNING: retrieval check missed (title search did not return {topic_id})", file=sys.stderr)
+        if args.require_retrieve:
+            rc = 3
+    if not standing_link_problems(link["link"], link):
+        print(f"standing candidate: memidx.py mark-standing {shlex.quote(str(topic_id))} {shlex.quote(str(link['link']))} --add "
+              f"--authority {shlex.quote(str(link['ruling']['authority']))} "
+              f"--source {shlex.quote('<where the owner said it>')} "
+              f"--why {shlex.quote('<why it is true of the whole project>')} --root {shlex.quote(str(root))}")
+    return rc
+
+
+def _filing_proposals(args, root: Path) -> None:
+    """With `--session`: the read-only binding proposal section, printed after
+    the diff. Never binds -- only `bind` writes `code_refs` (D12)."""
+    if not args.session:
+        return
+    if getattr(args, "dry_run", False):
+        # --dry-run runs no reindex (DESIGN section 1; TOP-0137 L23, gate round 7 R7-1):
+        # the proposal's coverage read self-heals a stale index, so skip it then.
+        try:
+            stale = decision_index_state(resolve_db_path(args), args.project, root=root,
+                                         verify_content=True) == "stale"
+        except Exception as exc:
+            # fail closed: an unreadable index state must not let the proposal read reindex
+            print(f"proposals: skipped under --dry-run (index state unknown: {type(exc).__name__})")
+            return
+        if stale:
+            print("proposals: skipped under --dry-run (index stale)")
+            return
+    ns = argparse.Namespace(root=str(root), project=args.project, db=args.db, session=args.session,
+                            code_root=args.code_root, sessions_dir=args.sessions_dir)
+    try:
+        lines = session_proposal_lines(ns)
+    except Exception:
+        lines = None
+    if lines:
+        print("\n".join(lines))
+
+
+def _code_roots_for_filing(args) -> list:
+    return _code_roots_arg(args.code_root)
+
+
+def _verified_topic_record(root: Path, topic_id: str, path: Path) -> tuple:
+    """The ONE write-target check for `append`/`promote` (`_load_topic`), `bind`
+    and `mark-standing` (TOP-0137 L23, gate round 6 R6-1/R6-4): `path` must
+    (a) resolve inside the resolved store `root`, separator-bounded, and
+    (b) decode as UTF-8, parse strictly (valid, not fallback) and carry a
+    parsed `id` equal to `topic_id`. Returns `(text, frontmatter, None)` or
+    `(None, None, (token, message))` -- the refusal token and a one-line
+    message; the caller refuses before any write."""
+    real_root = os.path.realpath(root)
+    real_path = os.path.realpath(path)
+    if not real_path.startswith(real_root.rstrip(os.sep) + os.sep):
+        return None, None, ("outside-store", f"{topic_id} is claimed by {path}, which resolves to {real_path}, "
+                            f"outside the store {root} (a symlinked topics/ or inbox/?)")
+    try:
+        text = read_record_bytes_strict(path)
+    except UnicodeDecodeError as exc:
+        return None, None, ("not-utf8", f"{Path(path).name} is not valid UTF-8 ({exc})")
+    result = parse_record_raw(text, path)
+    if not result.valid or result.fallback:
+        return None, None, ("parse", f"{Path(path).name} does not parse cleanly: "
+                            + "; ".join(m for _f, m in result.diagnostics))
+    parsed = result.frontmatter.get("id")
+    if str(parsed) != topic_id:
+        return None, None, ("topic-id-mismatch", f"no topic with id {topic_id} (the file {path} carries id "
+                            f"{parsed if parsed not in (None, '') else 'none'})")
+    return text, result.frontmatter, None
+
+
+def _load_topic(root: Path, topic_id: str, command: str) -> tuple:
+    claimants = _topic_claimants(root, topic_id)
+    if not claimants:
+        raise FilingRefusal("unknown-topic", f"no topic {topic_id!r} under {root}/topics")
+    if len(claimants) > 1:
+        raise FilingRefusal("ambiguous-topic", f"topic id {topic_id} is carried by {len(claimants)} files: "
+                            + ", ".join(str(p) for p, _k in claimants))
+    path, kind = claimants[0]
+    try:
+        top = path.relative_to(root).parts[:1]
+    except ValueError:
+        top = ("topics",)  # outside the store: _verified_topic_record refuses it
+    if kind == "strict" and "topics" not in top:
+        raise FilingRefusal("unknown-topic", f"{topic_id} is claimed only by {path}, which is not under topics/")
+    old_text, fm, reason = _verified_topic_record(root, topic_id, path)
+    if reason:
+        raise FilingRefusal(*reason)
+    return path, old_text, fm
+
+
+def _check_links_target(fm: dict, args) -> list:
+    links = fm.get("links")
+    if not isinstance(links, list) or not all(isinstance(l, dict) for l in links):
+        raise FilingRefusal("links-shape", "`links:` is not a list of mappings")
+    return links
+
+
+def _roundtrip_check(links_before: list, intended: dict, promoted: tuple | None = None):
+    """The `edit_roundtrip_problem` callback: the first parsed link equals the
+    intended dict, every earlier link is unchanged (a promoted one gains only
+    `promoted_by`)."""
+    def check(fm: dict) -> str | None:
+        got = fm.get("links")
+        if not isinstance(got, list) or not got:
+            return "the edit would not keep the links list"
+        if got[0] != intended:
+            return "the edit would not round-trip the new link as written"
+        expect = copy.deepcopy(links_before)
+        if promoted:
+            for l in expect:
+                if str(l.get("link")) == promoted[0]:
+                    l["promoted_by"] = promoted[1]
+        if got[1:] != expect:
+            return "the edit would not leave the earlier links unchanged"
+        return None
+    return check
+
+
+def _filing_current(fm: dict, text: str, new_link: dict, links_before: list) -> str:
+    """`text` with `current:` moved to the new link when it becomes the newest
+    active link; a provisional or declined link leaves it alone."""
+    before = newest_active_link(links_before)
+    after = newest_active_link([new_link] + links_before)
+    if after is not None and (before is None or str(before.get("link")) != str(after.get("link"))):
+        return edit_current_line(text, str(after["link"]))
+    return text
+
+
+def run_filing(command: str, args, impl) -> int:
+    """Run one filing subcommand: refusals print, log and return 1; the one
+    receipt line goes to hook.log, with no ruling, quote or prompt text."""
+    ctx = {"outcome": "refused", "topic": "none", "link": "none", "authority": "none",
+           "derived": "no", "dedupe_top": "none", "retrieval": "skipped"}
+    try:
+        rc = impl(args, ctx)
+    except FilingRefusal as exc:
+        if exc.on_disk == "rejected":
+            print(f"{command}: {exc.message}", file=sys.stderr)
+            print(f"REJECTED EDIT REMAINS ON DISK: {exc.path_on_disk} -- {exc.remedy}", file=sys.stderr)
+            ctx["rollback"] = "failed"
+        else:
+            print(f"{command}: {exc.message}; nothing written", file=sys.stderr)
+        ctx["reason"] = exc.token
+        rc = 1
+    fields = {k: ctx[k] for k in ("outcome", "topic", "link", "authority", "derived",
+                                  "dedupe_top", "retrieval")}
+    if "reason" in ctx:
+        fields["reason"] = ctx["reason"]
+    if "rollback" in ctx:
+        fields["rollback"] = ctx["rollback"]
+    fields["project"] = args.project
+    append_hook_log_line("filing", fields)
+    return rc
+
+
+def _append_impl(args, ctx: dict) -> int:
+    root = Path(args.root).resolve()
+    _filing_validate_args(args, "append")
+    code_roots = _code_roots_for_filing(args)
+    path, old_text, fm = _load_topic(root, args.topic, "append")
+    links = _check_links_target(fm, args)
+    if any(str(l.get("link")) == _filing_link_id(links) for l in links):
+        raise FilingRefusal("duplicate-link", "the next link id already exists")
+    if args.reverses and not any(str(l.get("link")) == args.reverses for l in links):
+        raise FilingRefusal("no-such-link", f"--reverses {args.reverses} names no link of {args.topic}")
+    ctx["topic"] = args.topic
+    ruling = _filing_ruling(args, ctx, code_roots, strict=False)
+    link = _build_link(args, _filing_link_id(links), ruling, args.rationale)
+    problem = _filing_commit_citations_problem(
+        [ruling["text"], args.rationale or ""] + list(args.evidence or []), code_roots)
+    if problem:
+        raise FilingRefusal("unresolved-commit", problem)
+    try:
+        new_text = _filing_current(fm, splice_new_link(old_text, link), link, links)
+    except ValueError as exc:
+        raise FilingRefusal("structure", str(exc))
+    bad = edit_roundtrip_problem(new_text, path, _roundtrip_check(links, link_expected_dict(link)))
+    if bad:
+        raise FilingRefusal("roundtrip", bad)
+    ctx["dedupe_top"] = print_dedupe(args, root, str(fm.get("title") or args.topic), "append")
+    rel = str(path.relative_to(root))
+    rc = _finish_write("append", args, ctx, root, path, rel, old_text, new_text, args.topic, link,
+                       str(fm.get("title") or args.topic))
+    _filing_proposals(args, root)
+    return rc
+
+
+def _slugify(title: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+    return slug[:60].strip("-")
+
+
+def _record_impl(args, ctx: dict) -> int:
+    root = Path(args.root).resolve()
+    _filing_validate_args(args, "record")
+    code_roots = _code_roots_for_filing(args)
+    _single_line_check("--title", args.title)
+    if not _BARE_AREA_RE.match(args.area or ""):
+        raise FilingRefusal("usage", "--area must be a lower-case path like 'memory' or 'processing/x'")
+    ids = _store_ids(root)
+    if args.id:
+        if not _TOPIC_ID_RE.match(args.id):
+            raise FilingRefusal("usage", "--id must look like TOP-0138")
+        topic_id = args.id
+        if topic_id in ids:
+            raise FilingRefusal("id-exists", f"{topic_id} is already carried by {ids[topic_id][0].name}")
+    else:
+        nums = [int(m.group(1)) for i in ids for m in [_TOPIC_ID_RE.match(i)] if m]
+        topic_id = f"TOP-{max(nums, default=0) + 1:04d}"
+    slug = args.slug or _slugify(args.title)
+    if not re.match(r"^[a-z0-9][a-z0-9-]*$", slug):
+        raise FilingRefusal("usage", "--slug must be lower-case letters, digits and hyphens")
+    path = root / "topics" / args.area / f"{slug}.md"
+    # the destination must resolve inside the store BEFORE anything is reserved
+    # (a symlinked topics/ or area/ would otherwise create the file elsewhere)
+    real_root = os.path.realpath(root)
+    real_parent = os.path.realpath(path.parent)
+    if real_parent != real_root and not real_parent.startswith(real_root.rstrip(os.sep) + os.sep):
+        raise FilingRefusal("outside-store", f"{path.relative_to(root)} would be created at {real_parent}, "
+                            f"outside the store {root} (a symlinked topics/ or area?)")
+    if path.exists():
+        raise FilingRefusal("path-exists", f"{path.relative_to(root)} already exists")
+    ctx["topic"] = topic_id
+    ruling = _filing_ruling(args, ctx, code_roots, strict=False)
+    link = _build_link(args, "L1", ruling, args.rationale)
+    problem = _filing_commit_citations_problem(
+        [ruling["text"], args.rationale or ""] + list(args.evidence or []), code_roots)
+    if problem:
+        raise FilingRefusal("unresolved-commit", problem)
+    tags = [t.strip() for t in (args.tags or "").split(",") if t.strip()]
+    head = ["---", "type: topic", f"id: {topic_id}", f"title: {_yaml_quote(args.title)}",
+            f"area: {args.area}", f"project: {_bare_or_quoted(args.project)}"]
+    if link["status"] == "active":
+        head.append("current: L1")
+    head.append("code_refs: []")
+    head.append("tags: [" + ", ".join(_bare_or_quoted(t) for t in tags) + "]")
+    head.append("links:")
+    body = (args.question or args.title).strip()
+    new_text = "\n".join(head + render_link_item(link, "  ") + ["---", "", body, ""])
+    parsed = parse_record_raw(new_text, path)
+    fm = parsed.frontmatter if parsed.valid else {}
+    if (not parsed.valid or fm.get("links") != [link_expected_dict(link)] or fm.get("id") != topic_id
+            or fm.get("title") != args.title or fm.get("area") != args.area
+            or list(fm.get("tags") or []) != tags):
+        raise FilingRefusal("roundtrip", "the new topic would not round-trip as written")
+    dedupe_query = args.title + (f" {args.question}" if args.question else "")
+    ctx["dedupe_top"] = print_dedupe(args, root, dedupe_query, "record")
+    rc = _finish_write("record", args, ctx, root, path, str(path.relative_to(root)), None, new_text,
+                       topic_id, link, args.title)
+    _filing_proposals(args, root)
+    return rc
+
+
+def _promote_impl(args, ctx: dict) -> int:
+    root = Path(args.root).resolve()
+    _filing_validate_args(args, "promote")
+    code_roots = _code_roots_for_filing(args)
+    path, old_text, fm = _load_topic(root, args.topic, "promote")
+    links = _check_links_target(fm, args)
+    old = next((l for l in links if str(l.get("link")) == args.link), None)
+    ctx["topic"] = args.topic
+    if old is None:
+        raise FilingRefusal("no-such-link", f"{args.topic} has no link {args.link}")
+    old_ruling = old.get("ruling") or {}
+    if old.get("promoted_by"):
+        raise FilingRefusal("already-promoted", f"{args.link} already carries promoted_by {old['promoted_by']}")
+    if old_ruling.get("authority") != "agent-inference" or old.get("status") != "provisional":
+        raise FilingRefusal(
+            "not-promotable",
+            f"{args.link} is {old.get('status')!r}/{old_ruling.get('authority')!r}; "
+            "SCHEMA section 5 promotes an agent-inference / provisional link")
+    if args.yes_message and args.shown_text is None:
+        args.shown_text = str(old_ruling.get("text") or "")
+    args.ruling = None
+    ruling = _filing_ruling(args, ctx, code_roots, strict=True)
+    old_rationale = (old.get("rationale") or {}).get("text")
+    args.kind, args.status, args.reverses, args.reason_for_change = "adopted", "active", None, None
+    args.alternative, args.evidence, args.revisit_if = [], [], []
+    link = _build_link(args, _filing_link_id(links), ruling, old_rationale)
+    problem = _filing_commit_citations_problem([ruling["text"], old_rationale or ""], code_roots)
+    if problem:
+        raise FilingRefusal("unresolved-commit", problem)
+    try:
+        marked = insert_promoted_by(old_text, args.link, link["link"])
+        new_text = _filing_current(fm, splice_new_link(marked, link), link, links)
+    except ValueError as exc:
+        raise FilingRefusal("structure", str(exc))
+    bad = edit_roundtrip_problem(
+        new_text, path, _roundtrip_check(links, link_expected_dict(link), (args.link, link["link"])))
+    if bad:
+        raise FilingRefusal("roundtrip", bad)
+    ctx["dedupe_top"] = print_dedupe(args, root, str(fm.get("title") or args.topic), "promote")
+    rc = _finish_write("promote", args, ctx, root, path, str(path.relative_to(root)), old_text,
+                       new_text, args.topic, link, str(fm.get("title") or args.topic))
+    _filing_proposals(args, root)
+    return rc
+
+
+def cmd_append(args) -> int:
+    """`memidx.py append TOP-xxxx --ruling TEXT ... --root STORE --project NAME`
+    -- a new link spliced under `links:`; prints the diff, never commits."""
+    return run_filing("append", args, _append_impl)
+
+
+def cmd_record(args) -> int:
+    """`memidx.py record --title T --area A --ruling TEXT ... --root STORE` -- a
+    new topic file from the template, link L1; prints the diff, never commits."""
+    return run_filing("record", args, _record_impl)
+
+
+def cmd_promote(args) -> int:
+    """`memidx.py promote TOP-xxxx Ln --session ID (--yes-message UUID |
+    --owner-message UUID --quote TEXT) ...` -- SCHEMA section 5 as one command."""
+    return run_filing("promote", args, _promote_impl)
+
+
+def add_filing_link_args(p: argparse.ArgumentParser, with_ruling: bool = True) -> None:
+    add_common_args(p, need_root=True)
+    p.add_argument("--code-root", action="append", default=None)
+    p.add_argument("--sessions-dir", default=None)
+    if with_ruling:
+        p.add_argument("--ruling", required=True)
+        p.add_argument("--rationale", default=None)
+        p.add_argument("--kind", default="adopted")
+        p.add_argument("--status", default="active")
+        p.add_argument("--reverses", default=None)
+        p.add_argument("--reason-for-change", dest="reason_for_change", default=None)
+        p.add_argument("--alternative", action="append", default=None)
+        p.add_argument("--evidence", action="append", default=None)
+        p.add_argument("--revisit-if", dest="revisit_if", action="append", default=None)
+        p.add_argument("--authority", default=None,
+                       help="reviewer-finding | code-derived (default agent-inference); the owner "
+                            "tiers are derived from --session, never typed")
+    p.add_argument("--source", default=None)
+    p.add_argument("--recorded-by", dest="recorded_by", default=None)
+    p.add_argument("--session", default=None)
+    p.add_argument("--owner-message", dest="owner_message", default=None)
+    p.add_argument("--quote", default=None)
+    p.add_argument("--yes-message", dest="yes_message", default=None)
+    p.add_argument("--shown-text", dest="shown_text", default=None)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--require-retrieve", action="store_true")
 
 
 # ---------------------------------------------------------------------------
@@ -12730,18 +13858,16 @@ def proposal_lines(state: dict, topic_is_bound, unmapped_report) -> list:
     return lines
 
 
-def cmd_propose_bindings(args) -> int:
-    """`memidx.py propose-bindings --session ID --root STORE --project NAME
-    [--code-root DIR ...] [--write-inbox] [--sessions-dir DIR]` -- prints
-    the proposal; `--write-inbox` also writes
-    `inbox/proposals/<date>-<session>.md` under the store (D12: an inbox
-    drop, never a canonical record)."""
+def session_proposal_lines(args) -> list | None:
+    """The proposal lines (`proposal_lines`) for `args.session` under
+    `args.root`/`args.project`, or None when the session file is unreadable.
+    The one assembly behind `propose-bindings` and the filing command's
+    read-only proposal section: it only reads, never binds."""
     root = Path(args.root).resolve()
     session_file = sessions_dir_for(args.project, args.sessions_dir) / f"{args.session}.json"
     state = read_session_state(session_file)
     if state is None:
-        print(f"propose-bindings: no readable session file {session_file}", file=sys.stderr)
-        return 1
+        return None
     code_roots = _code_roots_arg(args.code_root) or _code_roots_arg(
         sorted({r["root"] for r in ledger_code_rows(state)})
     )
@@ -12780,6 +13906,20 @@ def cmd_propose_bindings(args) -> int:
     finally:
         if conn is not None:
             conn.close()
+    return lines
+
+
+def cmd_propose_bindings(args) -> int:
+    """`memidx.py propose-bindings --session ID --root STORE --project NAME
+    [--code-root DIR ...] [--write-inbox] [--sessions-dir DIR]` -- prints
+    the proposal; `--write-inbox` also writes
+    `inbox/proposals/<date>-<session>.md` under the store (D12: an inbox
+    drop, never a canonical record)."""
+    session_file = sessions_dir_for(args.project, args.sessions_dir) / f"{args.session}.json"
+    lines = session_proposal_lines(args)
+    if lines is None:
+        print(f"propose-bindings: no readable session file {session_file}", file=sys.stderr)
+        return 1
     text = "\n".join(lines) + "\n"
     print(text, end="")
     if args.write_inbox:
@@ -13089,6 +14229,30 @@ def main(argv=None) -> int:
              "HOLD 'may block', at the caller's discretion)",
     )
     p_drift.set_defaults(func=cmd_drift)
+
+    p_append = sub.add_parser(
+        "append", help="file a new link under an existing topic (pure line insertion; never commits)")
+    p_append.add_argument("topic")
+    add_filing_link_args(p_append)
+    p_append.set_defaults(func=cmd_append)
+
+    p_record = sub.add_parser(
+        "record", help="file a new topic with its first link (never commits)")
+    p_record.add_argument("--title", required=True)
+    p_record.add_argument("--area", required=True)
+    p_record.add_argument("--id", default=None)
+    p_record.add_argument("--slug", default=None)
+    p_record.add_argument("--tags", default=None)
+    p_record.add_argument("--question", default=None)
+    add_filing_link_args(p_record)
+    p_record.set_defaults(func=cmd_record)
+
+    p_promote = sub.add_parser(
+        "promote", help="promote an agent-inference/provisional link to an owner tier (SCHEMA section 5)")
+    p_promote.add_argument("topic")
+    p_promote.add_argument("link")
+    add_filing_link_args(p_promote, with_ruling=False)
+    p_promote.set_defaults(func=cmd_promote)
 
     p_bind = sub.add_parser(
         "bind",

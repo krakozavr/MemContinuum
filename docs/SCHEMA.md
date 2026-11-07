@@ -226,6 +226,11 @@ is recorded as a new `owner-verbatim` link (`TOP-xxxx Ln`), never inferred on th
 5. Only the owner promotes. Reviewers propose in an inbox; an agent writes;
    nobody else.
 
+`memidx.py promote TOP-xxxx Ln --session ID (--yes-message UUID | --owner-message UUID --quote TEXT)`
+performs steps 1-3: it refuses a link that is not `agent-inference` / `provisional`, appends the
+new owner-tier link, and inserts the one `promoted_by:` line into the old one. It reads the
+owner's message from the session transcript and refuses when it cannot establish it.
+
 ## 6. The compressed chain view (what `memidx.py chain` shows)
 
 One line per link, newest first:
