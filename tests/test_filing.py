@@ -1128,5 +1128,61 @@ class TestGateRound3(FilingCase):
         self.assertIn("rollback=failed", self.log_lines()[-1])
 
 
+class TestGateRound4(FilingCase):
+    """Gate round 4 (TOP-0137 L23)."""
+
+    MALFORMED = TOPIC.replace("id: TOP-9100", "id: TOP-9100 # comment").replace(
+        "title: Filing fixture topic about widget caching", 'title: "unclosed')
+
+    def malformed(self, rel="topics/memory/broken.md", text=None):
+        path = self.store / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text if text is not None else self.MALFORMED)
+        self.commit("malformed")
+        self.head0 = self.head()
+        return path
+
+    def test_the_lenient_reader_returns_the_bare_id_of_a_commented_malformed_file(self):
+        bad = self.malformed()
+        self.assertIsNone(memidx._record_id_of(bad))
+        self.assertEqual(memidx._record_id_of(bad, lenient=True), "TOP-9100")
+
+    def test_a_malformed_commented_id_twin_of_a_valid_topic_refuses_append_and_promote(self):
+        bad = self.malformed()
+        before = (sha(bad), sha(self.topic))
+        rc, _o, err = self.append()
+        self.assertEqual(rc, 1, err)
+        self.assertIn("reason=ambiguous-topic", self.log_lines()[-1])
+        self.assertIn(str(bad.resolve()), err)
+        self.assertIn(str(self.topic.resolve()), err)
+        rc, _o, err = self.run_cmd("promote", "TOP-9100", "L1", "--session", SID, "--yes-message", YES_UUID)
+        self.assertEqual(rc, 1, err)
+        self.assertIn("reason=ambiguous-topic", self.log_lines()[-1])
+        self.assertIn(str(bad.resolve()), err)
+        self.assertIn(str(self.topic.resolve()), err)
+        self.assertEqual((sha(bad), sha(self.topic)), before)
+
+    def test_the_same_malformed_file_alone_is_found_and_refused_by_the_parse_refusal(self):
+        bad = self.malformed(text=self.MALFORMED.replace("TOP-9100", "TOP-9200"))
+        before = sha(bad)
+        rc, _o, err = self.append(topic="TOP-9200")
+        self.assertEqual(rc, 1, err)
+        self.assertIn("reason=parse", self.log_lines()[-1])
+        self.assertNotIn("unknown-topic", self.log_lines()[-1])
+        self.assertEqual(sha(bad), before)
+
+    def test_record_without_id_never_re_issues_an_id_a_malformed_file_holds(self):
+        bad = self.malformed(text=self.MALFORMED.replace("TOP-9100", "TOP-9600"))
+        before = sha(bad)
+        rc, out, err = self.run_cmd("record", "--title", "Allocated", "--area", "memory", "--ruling", "r")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("TOP-9601", out + err)
+        self.assertEqual(sha(bad), before)
+        rc, _o, err = self.run_cmd("record", "--title", "Collides", "--area", "memory", "--ruling", "r",
+                                   "--id", "TOP-9600")
+        self.assertEqual(rc, 1, err)
+        self.assertIn("reason=id-exists", self.log_lines()[-1])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -11892,6 +11892,25 @@ def _anchor_today() -> str:
     return datetime.now().date().isoformat()
 
 
+def _lenient_id_text(rid) -> str | None:
+    """The id text of a LENIENT read. The parser's lenient fallback returns the
+    raw value (`TOP-9 # note`, `'TOP-9'`), so normalise it the way YAML would
+    read the `id:` line; when YAML cannot, drop a trailing ` #` comment and
+    the quotes. Lookup/allocation only (TOP-0137 L23, gate round 4 R4-1)."""
+    if rid is None:
+        return None
+    text = str(rid)
+    try:
+        one = yaml.safe_load("id: " + text)
+    except yaml.YAMLError:
+        one = None
+    if isinstance(one, dict) and isinstance(one.get("id"), str):
+        out = one["id"]
+    else:
+        out = text.split(" #", 1)[0].strip().strip("'\"")
+    return out.strip() or None
+
+
 def _record_id_of(path: Path, lenient: bool = False, unparsed: list | None = None) -> str | None:
     """The parsed frontmatter `id` of a store file, read with the engine's own
     record parser (so `id: TOP-1 # note` and quoted spellings count), or None
@@ -11920,18 +11939,15 @@ def _record_id_of(path: Path, lenient: bool = False, unparsed: list | None = Non
     if not result.valid and not lenient:
         return fail()
     rid = result.frontmatter.get("id")
-    if not rid and lenient:
+    if lenient and not rid:
         # last resort for a file the parser cannot read at all (an unterminated
-        # block): the top-level `id:` line, its VALUE parsed by YAML so a
-        # trailing comment or quotes still count. Lookup-by-name only.
+        # block): the top-level `id:` line. Lookup-by-name only.
         for line in text.split("\n---", 1)[0].splitlines():
             if line.startswith("id:"):
-                try:
-                    one = yaml.safe_load(line)
-                except yaml.YAMLError:
-                    break
-                rid = one.get("id") if isinstance(one, dict) else None
+                rid = line[3:]
                 break
+    if lenient:
+        return _lenient_id_text(rid)
     return str(rid) if rid else None
 
 
@@ -13035,9 +13051,14 @@ def _store_ids(root: Path) -> dict:
         unparsed: list = []
         rid = _record_id_of(path, unparsed=unparsed)
         if unparsed:
-            print(f"filing: skipped {path} while collecting ids (unreadable, not UTF-8, "
-                  f"or does not parse)", file=sys.stderr)
-        elif rid:
+            # a malformed file still HOLDS its id: count it (allocation must
+            # not re-issue it; --id must collide), skip only an unreadable one
+            rid = _record_id_of(path, lenient=True)
+            if not rid:
+                print(f"filing: skipped {path} while collecting ids (unreadable, not UTF-8, "
+                      f"or does not parse)", file=sys.stderr)
+                continue
+        if rid:
             out.setdefault(rid, []).append(path)
     return out
 
