@@ -11964,6 +11964,27 @@ def _topic_file_for_id(root: Path, topic_id: str) -> Path | None:
     return undecodable
 
 
+def _topic_claimants(root: Path, topic_id: str) -> list:
+    """Every file under `topics/` AND `inbox/` that claims `topic_id` -- read
+    leniently (an undecodable or unparsable file still counts), so a flawed
+    claimant is named instead of hidden. Filing lookup only: it finds files to
+    refuse by name; `_load_topic` writes only a single claimant that parses
+    strictly with exactly this id (TOP-0137 L23, gate round 3 R3-1/R3-5)."""
+    found = []
+    walked_root = Path(root).resolve()
+    for sub in ("topics", "inbox"):
+        base = Path(root) / sub
+        if not base.is_dir():
+            continue
+        for path in walk_markdown(base):
+            if _record_id_of(path, lenient=True) == topic_id:
+                try:
+                    found.append(Path(root) / path.relative_to(walked_root))
+                except ValueError:
+                    found.append(path)
+    return sorted(found)
+
+
 def anchor_span_bytes(data: bytes, start_line: int, end_line: int) -> bytes:
     """The inclusive 1-based `start_line..end_line` byte span of a chunk --
     never the FTS body (25 lines) and never the embed slice. The ONE
@@ -13332,12 +13353,15 @@ def _code_roots_for_filing(args) -> list:
 
 
 def _load_topic(root: Path, topic_id: str, command: str) -> tuple:
-    path = _topic_file_for_id(root, topic_id)
-    if path is None:
+    claimants = _topic_claimants(root, topic_id)
+    if not claimants:
         raise FilingRefusal("unknown-topic", f"no topic {topic_id!r} under {root}/topics")
-    owners = [p for p in _store_ids(root).get(topic_id, []) if "topics" in p.relative_to(root).parts[:1]]
-    if len(owners) > 1:
-        raise FilingRefusal("ambiguous-topic", f"topic id {topic_id} is carried by {len(owners)} files")
+    if len(claimants) > 1:
+        raise FilingRefusal("ambiguous-topic", f"topic id {topic_id} is claimed by {len(claimants)} files: "
+                            + ", ".join(str(p) for p in claimants))
+    path = claimants[0]
+    if "topics" not in path.relative_to(root).parts[:1]:
+        raise FilingRefusal("unknown-topic", f"{topic_id} is claimed only by {path}, which is not under topics/")
     try:
         old_text = read_record_bytes_strict(path)
     except UnicodeDecodeError as exc:
@@ -13346,6 +13370,9 @@ def _load_topic(root: Path, topic_id: str, command: str) -> tuple:
     if not result.valid:
         raise FilingRefusal("parse", f"{path.name} does not parse cleanly: "
                             + "; ".join(m for _f, m in result.diagnostics))
+    if str(result.frontmatter.get("id")) != topic_id:
+        raise FilingRefusal("topic-id-mismatch", f"{path.name} claims {topic_id} but its parsed id is "
+                            f"{result.frontmatter.get('id')!r}")
     return path, old_text, result.frontmatter
 
 

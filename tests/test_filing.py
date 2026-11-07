@@ -966,5 +966,88 @@ Body.
         self.assertEqual(rc, 0, text)
 
 
+class TestGateRound3(FilingCase):
+    """Gate round 3 (TOP-0137 L23)."""
+
+    # --- R3-1 / R3-5: one lookup rule -------------------------------------------------
+
+    def twin(self, rel="topics/memory/twin.md", bad=False, text=None):
+        path = self.store / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        raw = (text if text is not None else TOPIC).encode()
+        path.write_bytes(raw + (b"\xff\xfe tail\n" if bad else b""))
+        self.commit("twin")
+        self.head0 = self.head()
+        return path
+
+    def test_a_valid_and_a_lenient_claimant_of_one_id_refuse_append_and_promote(self):
+        for bad_name, good_name in (("a", "z"), ("z", "a")):
+            with self.subTest(bad=bad_name):
+                for f in (self.store / "topics" / "memory").glob("*.md"):
+                    f.unlink()
+                bad = self.store / "topics" / "memory" / f"{bad_name}.md"
+                good = self.store / "topics" / "memory" / f"{good_name}.md"
+                bad.write_bytes(TOPIC.encode() + b"\xff\xfe tail\n")
+                good.write_text(TOPIC)
+                self.commit("pair")
+                self.head0 = self.head()
+                before = (sha(bad), sha(good))
+                rc, _o, err = self.append()
+                self.assertEqual(rc, 1, err)
+                self.assertIn("claimed by 2 files", err)
+                self.assertIn(str(bad.resolve()), err)
+                self.assertIn(str(good.resolve()), err)
+                self.assertIn("reason=ambiguous-topic", self.log_lines()[-1])
+                rc, _o, err = self.run_cmd("promote", "TOP-9100", "L1", "--session", SID,
+                                           "--yes-message", YES_UUID)
+                self.assertEqual(rc, 1, err)
+                self.assertIn("claimed by 2 files", err)
+                self.assertEqual((sha(bad), sha(good)), before)
+
+    def test_two_valid_claimants_still_refuse_naming_both(self):
+        twin = self.twin()
+        before = (sha(self.topic), sha(twin))
+        rc, _o, err = self.append()
+        self.assertEqual(rc, 1, err)
+        self.assertIn(str(self.topic.resolve()), err)
+        self.assertIn(str(twin.resolve()), err)
+        self.assertEqual((sha(self.topic), sha(twin)), before)
+
+    def test_an_inbox_record_with_a_topics_id_refuses_append_naming_the_inbox_path(self):
+        inbox = self.twin(rel="inbox/stray.md")
+        before = (sha(self.topic), sha(inbox))
+        rc, _o, err = self.append()
+        self.assertEqual(rc, 1, err)
+        self.assertIn("ambiguous", self.log_lines()[-1])
+        self.assertIn(str(inbox.resolve()), err)
+        self.assertEqual((sha(self.topic), sha(inbox)), before)
+
+    def test_a_lone_inbox_claimant_is_never_a_write_target(self):
+        self.topic.unlink()
+        inbox = self.twin(rel="inbox/stray.md")
+        before = sha(inbox)
+        rc, _o, err = self.append()
+        self.assertEqual(rc, 1, err)
+        self.assertIn("reason=unknown-topic", self.log_lines()[-1])
+        self.assertEqual(sha(inbox), before)
+
+    def test_a_duplicate_id_key_is_refused_by_the_mismatch_and_nothing_is_written(self):
+        text = TOPIC.replace("id: TOP-9100\n", "id: TOP-9300\n", 1).replace(
+            "title: Filing fixture", "id:\ntitle: Filing fixture", 1)  # last key wins: parsed id null
+        self.assertEqual(text.count("\nid:"), 2)
+        self.topic.write_text(text)
+        self.commit("dup id key")
+        self.head0 = self.head()
+        before = sha(self.topic)
+        rc, _o, err = self.append(topic="TOP-9300")
+        self.assertEqual(rc, 1, err)
+        self.assertIn("nothing written", err)
+        last = self.log_lines()[-1]
+        self.assertIn("outcome=refused", last)
+        self.assertIn("reason=topic-id-mismatch", last)
+        self.assertIn("retrieval=skipped", last)
+        self.assertEqual(sha(self.topic), before)
+
+
 if __name__ == "__main__":
     unittest.main()
