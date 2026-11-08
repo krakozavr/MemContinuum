@@ -3325,14 +3325,11 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
         # any branch below can `continue` past it (a repair, an invalid new side). A REF side
         # that parsed strictly keeps its `type` frozen whether or not the record was
         # schema-valid; a fallback-parsed one only when the recovered value, minus a trailing
-        # ` #...` comment, is a known record type (`topic # comment` is not a type change when
-        # the repair of that record also rewrites the line; the repair path governs it).
+        # ` #...` comment, is a known record type. The NEW side is compared exactly as parsed (no comment
+        # strip: a quoted `"topic # x"` is a different value from `topic`).
         old_type_fm = _frozen_type_frontmatter(old_result)
         if old_type_fm is not None:
-            new_type_fm = new_result.frontmatter
-            if new_result.fallback and isinstance(new_type_fm, dict) and isinstance(new_type_fm.get("type"), str):
-                new_type_fm = dict(new_type_fm, type=re.sub(r"\s+#.*$", "", new_type_fm["type"]).strip())
-            errors.extend(_type_change_errors(full_path, old_type_fm, new_type_fm))
+            errors.extend(_type_change_errors(full_path, old_type_fm, new_result.frontmatter))
 
         repair_note = None
         if not old_result.valid:

@@ -282,6 +282,18 @@ class TestTypeFrozen(GuardCase):
         fixed = broken.replace("title: bad: title", 'title: "bad: title"')
         self.assertClean(fixed.replace("type: banana # note", "type: topic"))
 
+    def test_a_new_side_quoted_hash_value_is_not_stripped_into_the_old_type(self):
+        # gate round 3 R3-1: REF fallback with recovered `topic`; NEW still fallback-parsed with
+        # `type: "topic # actual value"` -- no strip may turn that into `topic`
+        broken = self._bad_title(ttext(["src/a.py"]))
+        self.assertTrue(memidx.parse_record_text(broken, "x").fallback)
+        self.store(broken)
+        # no canonical marker left (no id, links, or bare `type: topic`): a tolerated fallback note
+        new = '---\ntype: "topic # actual value"\ntitle: bad: title\n---\n\nBody.\n'
+        res = memidx.parse_record_text(new, "x")
+        self.assertTrue(res.fallback and res.valid, res)
+        self.assertRefused(new, "type changed 'topic' -> 'topic # actual value'")
+
     def test_a_strict_type_change_is_still_refused_with_a_comment_free_ref(self):
         base = ttext(["src/a.py"])
         self.assertTrue(memidx.parse_record_text(base, "x").valid)
