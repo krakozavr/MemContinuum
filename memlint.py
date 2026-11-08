@@ -175,6 +175,10 @@ def _anchor_duplicate_keys(rows: list) -> list:
     return dup
 
 
+_ANCHOR_PREFIX_GLOB_MESSAGE = ("ref is a prefix or glob -- those are 'not checked' by definition "
+                               "and never carry an anchor row")
+
+
 def _anchor_errors(path, fm: dict, topic_link_ids: set) -> list[str]:
     """Validation of a topic's `anchors:` rows (docs/SCHEMA.md, "Anchors")."""
     rows = anchor_rows(fm)
@@ -185,6 +189,10 @@ def _anchor_errors(path, fm: dict, topic_link_ids: set) -> list[str]:
     for i, row in enumerate(rows):
         ref = row.get("ref")
         prefix = f"{path}: anchors[{i}] ({ref!r})"
+        # the prefix/glob prohibition comes FIRST and holds whatever the ref's membership: the
+        # unbound exemption below only lifts "ref must be in code_refs", nothing else
+        if ref is not None and not code_ref_is_anchorable(str(ref)):
+            errors.append(f"{prefix}: {_ANCHOR_PREFIX_GLOB_MESSAGE}")
         if ref is not None and str(ref) not in code_refs and ref_latest_action(fm, str(ref)) == "remove":
             # unbound: the newest `ref_marks:` row for this ref is a `remove`, so the frozen
             # capture stays as history (a later `add` re-arms the requirement)
@@ -192,11 +200,6 @@ def _anchor_errors(path, fm: dict, topic_link_ids: set) -> list[str]:
         elif ref is None or str(ref) not in code_refs:
             errors.append(f"{prefix}: ref is not present verbatim in this topic's code_refs "
                           "(or unbound by a newest `remove` row in ref_marks)")
-        elif not code_ref_is_anchorable(str(ref)):
-            errors.append(
-                f"{prefix}: ref is a prefix or glob -- those are 'not checked' by definition "
-                "and never carry an anchor row"
-            )
         link = row.get("link")
         if link is None or str(link) not in topic_link_ids:
             errors.append(f"{prefix}: link {link!r} is not a link in this topic")
@@ -2945,6 +2948,13 @@ def _anchor_freeze_errors(full_path, old_text, old_rows: list, new_text, new_row
             f"{full_path}: anchors: more than one row for ({ref!r}, {link!r}) -- one baseline per "
             "key in this release; a new baseline is a new link"
         )
+    # a row NEW since REF is judged for the one rule that does not depend on the code or the
+    # links: a prefix or glob ref never carries an anchor row, unbound or not (R10-3)
+    old_idents = {i for i in (_anchor_ident(r) for r in old_rows) if i is not None}
+    for row in new_rows:
+        ref = row.get("ref") if isinstance(row, dict) else None
+        if ref is not None and _anchor_ident(row) not in old_idents and not code_ref_is_anchorable(str(ref)):
+            errors.append(f"{full_path}: anchor ({ref!r}, {row.get('link')!r}): {_ANCHOR_PREFIX_GLOB_MESSAGE}")
     if not old_rows:
         return errors
     old_spans = (

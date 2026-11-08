@@ -161,7 +161,7 @@ later from ledgered history, never the bytes at the original ruling). Only a sin
 `ref_marks:` row for that ref is a `remove` — an unbound reference keeps its frozen capture as
 history, and a later `add` row re-arms the requirement); a `link` not in
 `links`; `algo` other than `sha256`; a `digest` that is not 64 lowercase hex characters; an unknown
-`span`, `captured` or `worktree`; a row for a prefix or glob reference; two rows for the same
+`span`, `captured` or `worktree`; a row for a prefix or glob reference (even one whose ref is unbound; `--against-ref` refuses a new one too); two rows for the same
 `(ref, link)`; `span: symbol` without `chunker_version`; a row without `captured_at`
 (`ref`, `link`, `captured` and `captured_at` together identify a row, so all four are required).
 

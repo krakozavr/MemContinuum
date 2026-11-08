@@ -786,6 +786,20 @@ class TestRefMarksPlainLint(ErrCase):
         errors, _ = lint_text(self.anchor_topic((), rmark("src/foo.py", "remove", LATER), rmark("src/foo.py")))
         self.assertEqual(errors, [], errors)
 
+    def test_a_prefix_anchor_row_is_an_error_even_when_its_ref_is_unbound(self):
+        # gate round 10 R10-3 (Sol MINOR): the unbound exemption only lifts "ref must be in code_refs"
+        text = binding_topic([good_row(ref="src/")], code_refs=(), marks_text="ref_marks:\n" + rmark("src/", "remove", LATER)
+                             + rmark("src/"))
+        errors, _ = lint_text(text)
+        self.assertError(errors, "anchors[0]", "ref is a prefix or glob")
+        self.assertFalse(any("not present verbatim" in e for e in errors), errors)
+
+    def test_a_glob_anchor_row_is_an_error_when_its_ref_is_unbound(self):
+        text = binding_topic([good_row(ref="src/*.py")], code_refs=(), marks_text="ref_marks:\n" + rmark("src/*.py", "remove", LATER)
+                             + rmark("src/*.py"))
+        errors, _ = lint_text(text)
+        self.assertError(errors, "anchors[0]", "ref is a prefix or glob")
+
     def test_a_later_add_rearms_the_requirement(self):
         marks = (rmark("src/foo.py", "add", "2026-11-05T09:12:41-05:00"), rmark("src/foo.py", "remove", LATER))
         errors, _ = lint_text(self.anchor_topic((), *marks))
@@ -976,6 +990,21 @@ class TestUnbind(BindCase):
         self.assertTrue(any("not present verbatim in this topic's code_refs" in e for e in errors), errors)
         rc, out = run_memlint(["--against-ref", "HEAD", str(self.store)])
         self.assertEqual(rc, 1, out)
+
+    def test_a_fabricated_prefix_anchor_row_beside_a_remove_row_is_refused_by_lint_and_the_guard(self):
+        # gate round 10 R10-3: removing `src/` with its row must not also admit a prefix anchor row
+        self.put(binding_topic(code_refs=("src/", "src/other.py")))
+        self.assertEqual(self.unbind("src/")[0], 0)
+        commit_all(self.store)
+        self.assertGuardsClean()
+        text = self.text()
+        self.assertNotIn("anchors:", text)
+        self.path.write_text(text.replace("links:\n", anchor_block([good_row(ref="src/")]) + "links:\n", 1))
+        errors, _ = memlint.lint_root(self.store)
+        self.assertTrue(any("ref is a prefix or glob" in e for e in errors), errors)
+        rc, out = run_memlint(["--against-ref", "HEAD", str(self.store)])
+        self.assertEqual(rc, 1, out)
+        self.assertIn("ref is a prefix or glob", out)
 
     def test_for_path_stops_matching_the_unbound_path(self):
         db = self.tmp / "idx.sqlite"
