@@ -12,7 +12,7 @@ sys.path.insert(0, str(TOOLS_DIR))
 
 import memidx  # noqa: E402
 import memlint  # noqa: E402
-from tests.test_filing import FilingCase, run_memidx, run_memlint, sha  # noqa: E402
+from tests.test_filing import SID, YES_UUID, FilingCase, run_memidx, run_memlint, sha  # noqa: E402
 
 
 def render_topic(tid, title, links, current=None):
@@ -205,10 +205,43 @@ class TestFilingAppend(DeclinedCase):
         self.assertEqual(rc, 0, err)
 
     def test_promote_runs_the_check(self):
-        rc, out, err = self.run_cmd("promote", "TOP-9101", "L1", "--session",
-                                    "11111111-2222-3333-4444-555555555555")
-        # whatever promote decides about the transcript, the lookup ran
-        self.assertEqual(len(self.lookup_lines()) or 1, 1)
+        """A real promote path (transcript fixture, --yes-message): the provisional
+        link's text equals a rejection on its own topic -> refused, bytes unchanged,
+        exactly one declined-lookup receipt with outcome=flagged."""
+        (self.store / "topics" / "memory" / "promote-reject.md").write_text(render_topic(
+            "TOP-9400", "Promote rejection fixture", [
+                L(2, "provisional", "adopted", "adopt the vendor lock in"),
+                L(1, "declined", "declined", "adopt the vendor lock in", why="too costly")], None))
+        self.commit("promote fixture")
+        self.head0 = self.head()
+        self.write_transcript()
+        path = self.topic_path("promote-reject")
+        before = sha(path)
+        rc, _out, err = self.run_cmd("promote", "TOP-9400", "L2", "--session", SID, "--yes-message", YES_UUID)
+        self.assertEqual(rc, 1, err)
+        self.assertIn("re-adopts the option rejected at TOP-9400 L1", err)
+        self.assertIn("reason=re-adopts-rejection", self.log_lines()[-1])
+        self.assertEqual(sha(path), before)
+        lines = self.lookup_lines()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("outcome=flagged", lines[0])
+
+    def test_promote_without_a_matching_rejection_passes_with_a_bypass_receipt(self):
+        """Control for the promote test above: the same path, nothing to re-adopt."""
+        self.write_transcript()
+        rc, _out, err = self.run_cmd("promote", "TOP-9101", "L1", "--session", SID, "--yes-message", YES_UUID)
+        self.assertEqual(rc, 0, err)
+        lines = self.lookup_lines()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("outcome=bypass", lines[0])
+        self.head0 = self.head()
+
+    def test_a_provisional_re_adoption_is_flagged(self):
+        rc, _out, err = self.run_cmd("append", "TOP-9200", "--ruling", "adopt the vendor lock in",
+                                     "--status", "provisional")
+        self.assertEqual(rc, 1)
+        self.assertIn("re-adopts the option rejected at TOP-9200 L1", err)
+
 
 
 class TestFilingRecord(DeclinedCase):
@@ -307,6 +340,13 @@ class TestMemlintRule(DeclinedCase):
         self.assertIn("re-adopts a rejected option recorded at TOP-9200 L1", text)
         self.assertIn("grandfathered", text)
 
+    def test_a_restored_kind_without_reverses_is_flagged(self):
+        self.hand_append("declined-link", self.NEW_LINK.format(
+            n=2, text=json.dumps("adopt the vendor lock in")).replace("kind: adopted", "kind: restored"))
+        rc, text = run_memlint(["--against-ref", "HEAD", str(self.store)])
+        self.assertEqual(rc, 1, text)
+        self.assertIn("declined-link.md:L2: re-adopts a rejected option recorded at TOP-9200 L1", text)
+
     def test_a_paraphrase_is_clean(self):
         self.hand_append("declined-link", self.NEW_LINK.format(n=2, text=json.dumps("adopt the vendor lock in?")))
         rc, text = run_memlint(["--against-ref", "HEAD", str(self.store)])
@@ -341,6 +381,130 @@ class TestMemlintRule(DeclinedCase):
             "TOP-9300", "Fresh topic", [L(1, "active", "adopted", "retry politely")], "L1"))
         rc, text = run_memlint(["--against-ref", "HEAD", str(self.store)])
         self.assertNotIn("re-adopts", text)
+
+    RESTORE_LINK = (
+        "  - link: L3\n    date: 2026-11-07\n    status: active\n    kind: restored\n    reverses: L1\n"
+        "    reason_for_change: changed-context\n    ruling:\n      text: restored it\n"
+        "      authority: agent-inference\n      source: s\n    recorded_by: fable\n    recorded_at: 2026-11-07\n")
+
+    def test_staged_reads_other_topics_from_the_index_not_the_working_tree(self):
+        from tests.test_filing import git
+        (self.store / "topics" / "memory" / "fresh.md").write_text(render_topic(
+            "TOP-9300", "Fresh topic", [L(1, "active", "adopted", "never retry")], "L1"))
+        git(["add", "topics/memory/fresh.md"], self.store)
+        # an UNSTAGED restoration of the rejection, on the other topic's working file only
+        self.hand_append("two-rejections", self.RESTORE_LINK)
+        rc, text = run_memlint(["--against-ref", "HEAD", "--staged", str(self.store)])
+        self.assertEqual(rc, 1, text)
+        self.assertIn("fresh.md:L1: re-adopts a rejected option recorded at TOP-9205 L1", text)
+        # stage the restoration too: the commit really restores it, so the check is clean
+        git(["add", "topics/memory/two-rejections.md"], self.store)
+        rc, text = run_memlint(["--against-ref", "HEAD", "--staged", str(self.store)])
+        self.assertNotIn("re-adopts", text)
+
+    def test_staged_ignores_an_unstaged_rejection_that_is_not_in_the_commit(self):
+        from tests.test_filing import git
+        (self.store / "topics" / "memory" / "fresh.md").write_text(render_topic(
+            "TOP-9300", "Fresh topic", [L(1, "active", "adopted", "retry politely")], "L1"))
+        git(["add", "topics/memory/fresh.md"], self.store)
+        self.hand_append("two-rejections", self.NEW_LINK.format(n=3, text=json.dumps("x")).replace(
+            "kind: adopted", "kind: declined").replace("status: active", "status: declined").replace(
+            "text: \"x\"", "text: retry politely"))
+        rc, text = run_memlint(["--against-ref", "HEAD", "--staged", str(self.store)])
+        self.assertNotIn("re-adopts", text)
+
+    def test_plain_lint_warns_about_a_cross_topic_offender(self):
+        (self.store / "topics" / "memory" / "offender.md").write_text(render_topic(
+            "TOP-9301", "Offender topic", [L(1, "active", "adopted", "never retry")], "L1"))
+        self.commit("existing cross-topic offender")
+        self.head0 = self.head()
+        rc, text = run_memlint([str(self.store)])
+        self.assertEqual(rc, 0, text)
+        self.assertIn("offender.md:L1: re-adopts a rejected option recorded at TOP-9205 L1", text)
+        self.assertIn("grandfathered", text)
+        self.assertEqual(text.count("offender.md:L1: re-adopts"), 1, text)
+        rc, text = run_memlint(["--against-ref", "HEAD", str(self.store)])
+        self.assertEqual(rc, 0, text)
+        self.assertNotIn("re-adopts", text)
+
+    def test_a_crlf_topic_rejection_is_seen_by_record_and_by_the_commit_check(self):
+        from tests.test_filing import git
+        crlf = render_topic("TOP-9302", "Crlf topic", [L(1, "declined", "declined", "crlf rejected thing",
+                                                         why="no")]).replace("\n", "\r\n")
+        (self.store / "topics" / "memory" / "crlf.md").write_bytes(crlf.encode("utf-8"))
+        self.commit("crlf topic")
+        self.head0 = self.head()
+        rc, _out, err = self.run_cmd("record", "--title", "Unrelated title", "--area", "memory",
+                                     "--ruling", "crlf rejected thing")
+        self.assertEqual(rc, 1)
+        self.assertIn("rejected at TOP-9302 L1", err)
+        (self.store / "topics" / "memory" / "fresh.md").write_text(render_topic(
+            "TOP-9300", "Fresh topic", [L(1, "active", "adopted", "crlf rejected thing")], "L1"))
+        git(["add", "-A"], self.store)
+        rc, text = run_memlint(["--against-ref", "HEAD", str(self.store)])
+        self.assertEqual(rc, 1, text)
+        self.assertIn("fresh.md:L1: re-adopts a rejected option recorded at TOP-9302 L1", text)
+
+
+class GizmoCase(FilingCase):
+    """Many rejection-bearing topics sharing a title word (receipt and cap tests)."""
+
+    def make_topics(self, count, rows_each, same_sentence=None):
+        for i in range(count):
+            links = [L(1, "declined", "declined", same_sentence or f"gizmo option {i} row 0", why="no")]
+            for r in range(1, rows_each):
+                links.append(L(r + 1, "declined", "declined", f"gizmo option {i} row {r}", why="no"))
+            (self.store / "topics" / "memory" / f"gizmo-{i}.md").write_text(render_topic(
+                f"TOP-95{i:02d}", f"Gizmo cache policy {i}", list(reversed(links))))
+        self.commit("gizmos")
+        self.head0 = self.head()
+        rc, _o, err = run_memidx(["reindex", "--root", str(self.store), "--project", "p",
+                                  "--db", str(self.db), "--no-embed"])
+        self.assertEqual(rc, 0, err)
+
+    def lookup(self):
+        lines = [l for l in (self.home / "hook.log").read_text().splitlines() if " declined-lookup " in l]
+        self.assertEqual(len(lines), 1, lines)
+        return lines[0], dict(t.split("=", 1) for t in lines[0].split()[2:])
+
+
+class TestShowCaps(GizmoCase):
+    def test_three_topics_and_ten_rows_oldest_first(self):
+        self.make_topics(4, 4)  # four rejection-bearing topics (dedupe shows three), sixteen rows
+        rc, out, err = self.run_cmd("record", "--title", "Gizmo cache policy", "--area", "memory",
+                                    "--ruling", "something unrelated")
+        self.assertEqual(rc, 0, err)
+        rows = [l for l in out.splitlines() if l.startswith("  rejected on")]
+        self.assertEqual(len(rows), 10, out)
+        self.assertEqual(len({l.split()[2] for l in rows}), 3, rows)
+        for tid in {l.split()[2] for l in rows}:
+            mine = [l for l in rows if l.split()[2] == tid]
+            self.assertEqual([l.split("(")[1].split(")")[0] for l in mine], sorted(
+                (l.split("(")[1].split(")")[0] for l in mine), key=lambda x: int(x[1:])))
+        _line, f = self.lookup()
+        self.assertEqual(f["shown"], "10")
+        self.assertEqual(len(f["ids"].split("_")), 3)
+
+
+class TestReceiptIdsCap(GizmoCase):
+    def test_nine_flagged_topics_name_three_and_count_nine(self):
+        self.make_topics(9, 1, same_sentence="gizmo shared rejected sentence")
+        rc, _out, _err = self.run_cmd("record", "--title", "Gizmo cache policy", "--area", "memory",
+                                      "--ruling", "gizmo shared rejected sentence")
+        self.assertEqual(rc, 1)
+        line, f = self.lookup()
+        self.assertEqual(f["outcome"], "flagged")
+        self.assertEqual(len(f["ids"].split("_")), 3, f)
+        self.assertTrue(all(t.startswith("TOP-95") and len(t) == 8 for t in f["ids"].split("_")), f)
+        self.assertEqual(f["ids_total"], "9")
+        self.assertLessEqual(len(f["ids"]), 64)
+        self.assertEqual(line.split()[-1], "project=p")
+
+    def test_three_or_fewer_topics_carry_no_total(self):
+        self.make_topics(3, 1, same_sentence="gizmo shared rejected sentence")
+        self.run_cmd("record", "--title", "Gizmo cache policy", "--area", "memory", "--ruling", "other words")
+        _line, f = self.lookup()
+        self.assertNotIn("ids_total", f)
 
 
 if __name__ == "__main__":
