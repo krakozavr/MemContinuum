@@ -12349,6 +12349,23 @@ def insert_code_ref(text: str, ref: str) -> str:
     return "".join(lines)
 
 
+def _delete_block_item(lines: list, key_idx: int, last: int, key: str, value: str, nl: str) -> bool:
+    """Delete, in place, the FIRST block item (`- value`, trailing comment and
+    quotes ignored) of the `key:` block spanning `key_idx`..`last` whose scalar
+    equals `value`; deleting the only item leaves `key: []`. Every other line is
+    kept. False (nothing changed) when no item matches. The one deletion
+    algorithm of `remove_code_ref` and `edit_standing_line`."""
+    items = [i for i in range(key_idx + 1, last + 1) if lines[i].lstrip().startswith("- ")]
+    drop = [i for i in items
+            if _scalar_token(re.sub(r"\s+#.*$", "", lines[i].strip()[2:])) == value]
+    if not drop:
+        return False
+    del lines[drop[0]]
+    if len(items) == 1:
+        lines[key_idx] = f"{key}: []{nl}"
+    return True
+
+
 def remove_code_ref(text: str, ref: str) -> str:
     """`text` with the one `code_refs:` block item equal to `ref` deleted (the
     sibling of `insert_code_ref`, as `edit_standing_line` deletes a block item):
@@ -12367,14 +12384,8 @@ def remove_code_ref(text: str, ref: str) -> str:
         raise ValueError("`code_refs:` is a flow list; refusing to edit it" if rest != "[]"
                          else "`code_refs:` is empty")
     last = _block_last_line(lines, idx, end)
-    items = [i for i in range(idx + 1, last + 1) if lines[i].lstrip().startswith("- ")]
-    drop = [i for i in items
-            if _scalar_token(re.sub(r"\s+#.*$", "", lines[i].strip()[2:])) == ref]
-    if not drop:
+    if not _delete_block_item(lines, idx, last, "code_refs", ref, nl):
         raise ValueError(f"{ref!r} is not an item of `code_refs:`")
-    del lines[drop[0]]
-    if len(items) == 1:
-        lines[idx] = f"code_refs: []{nl}"
     return "".join(lines)
 
 
@@ -12918,15 +12929,7 @@ def edit_standing_line(text: str, link_id: str, add: bool) -> str:
             lines[block_last] += nl
         lines.insert(block_last + 1, f"{indent}- {link_id}{nl}")
         return "".join(lines)
-    items = [i for i in range(idx + 1, block_last + 1)
-             if lines[i].lstrip().startswith("- ")]
-    drop = [i for i in items
-            if _scalar_token(re.sub(r"\s+#.*$", "", lines[i].strip()[2:])) == link_id]
-    if not drop:
-        return text
-    del lines[drop[0]]
-    if len(items) == 1:
-        lines[idx] = f"standing: []{nl}"
+    _delete_block_item(lines, idx, block_last, "standing", link_id, nl)
     return "".join(lines)
 
 

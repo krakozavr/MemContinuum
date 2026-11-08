@@ -266,6 +266,37 @@ class TestTypeFrozen(GuardCase):
 
 
 # ---------------------------------------------------------------------------
+# one block-item deletion shared by unbind and mark-standing
+# ---------------------------------------------------------------------------
+
+class TestSharedBlockItemDelete(unittest.TestCase):
+    def test_the_helper_deletes_the_first_match_and_ignores_comments_and_quotes(self):
+        lines = ["code_refs:\n", '  - "src/a.py"  # why\n', "  - src/b.py\n", "  - src/a.py\n", "x: 1\n"]
+        self.assertTrue(memidx._delete_block_item(lines, 0, 3, "code_refs", "src/a.py", "\n"))
+        self.assertEqual(lines, ["code_refs:\n", "  - src/b.py\n", "  - src/a.py\n", "x: 1\n"])
+
+    def test_the_helper_leaves_an_empty_list_for_the_last_item_and_reports_a_miss(self):
+        lines = ["standing:\n", "  - L2\n", "x: 1\n"]
+        self.assertFalse(memidx._delete_block_item(lines, 0, 1, "standing", "L9", "\n"))
+        self.assertEqual(lines, ["standing:\n", "  - L2\n", "x: 1\n"])
+        self.assertTrue(memidx._delete_block_item(lines, 0, 1, "standing", "L2", "\n"))
+        self.assertEqual(lines, ["standing: []\n", "x: 1\n"])
+
+    def test_remove_code_ref_and_edit_standing_line_both_go_through_it(self):
+        text = "---\ntype: topic\ncode_refs:\n  - src/a.py\nstanding:\n  - L2\n  - L3\nlinks: []\n---\nB\n"
+        real = memidx._delete_block_item
+        with mock.patch.object(memidx, "_delete_block_item", wraps=real) as spy:
+            out = memidx.remove_code_ref(text, "src/a.py")
+            self.assertEqual(spy.call_count, 1)
+            self.assertIn("code_refs: []\n", out)
+            out2 = memidx.edit_standing_line(text, "L3", add=False)
+            self.assertEqual(spy.call_count, 2)
+            self.assertNotIn("L3", out2)
+            self.assertEqual(memidx.edit_standing_line(text, "L9", add=False), text)
+        with self.assertRaises(ValueError):
+            memidx.remove_code_ref(text, "src/zzz.py")
+
+# ---------------------------------------------------------------------------
 # plain lint: the rows and the anchor rule
 # ---------------------------------------------------------------------------
 
