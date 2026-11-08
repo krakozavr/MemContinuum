@@ -92,24 +92,30 @@ except ValueError:
 def _slow_root_factor():
     # A code root on a Windows mount (WSL drvfs, a path under /mnt/) pays a
     # network round trip per filesystem call, so the hooks' own work is
-    # slower there for reasons that are not a hang. The configured roots
-    # are MEMCONTINUUM_CODE_ROOTS (a JSON list) or, failing that,
-    # MEMCONTINUUM_CODE_ROOT. Fixed budgets (SessionEnd's harness cap)
-    # opt out with MC_WATCHDOG_BUDGET_FIXED=1. Anything unparseable means
+    # slower there for reasons that are not a hang. Fixed budgets
+    # (SessionEnd's harness cap) opt out with MC_WATCHDOG_BUDGET_FIXED=1. Anything unparseable means
     # "not a slow root": the factor is only ever a widening, never a risk.
     if os.environ.get("MC_WATCHDOG_BUDGET_FIXED") == "1":
         return 1.0
+    # The roots rule is memidx._env_code_roots_raw (python) and
+    # hooks/memlib.sh mc_code_roots (bash); this launcher runs before either
+    # can be imported or sourced, so it repeats it here with the SAME
+    # semantics: a non-empty MEMCONTINUUM_CODE_ROOTS is authoritative (a
+    # malformed value, a non-list or an empty list means NO roots -- it does
+    # not fall back to MEMCONTINUUM_CODE_ROOT; non-string and empty elements
+    # are dropped); only an unset/empty one falls back to the single
+    # MEMCONTINUUM_CODE_ROOT. tests.test_write_hooks pins the equivalence.
     roots = []
-    raw = os.environ.get("MEMCONTINUUM_CODE_ROOTS")
+    raw = os.environ.get("MEMCONTINUUM_CODE_ROOTS", "")
     if raw:
         try:
             import json
             parsed = json.loads(raw)
-            if isinstance(parsed, list):
-                roots = [r for r in parsed if isinstance(r, str)]
         except Exception:
-            roots = []
-    if not roots and os.environ.get("MEMCONTINUUM_CODE_ROOT"):
+            parsed = []
+        if isinstance(parsed, list):
+            roots = [r for r in parsed if isinstance(r, str) and r]
+    elif os.environ.get("MEMCONTINUUM_CODE_ROOT"):
         roots = [os.environ["MEMCONTINUUM_CODE_ROOT"]]
     if not any(r.startswith("/mnt/") for r in roots):
         return 1.0
