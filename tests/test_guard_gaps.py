@@ -1413,6 +1413,146 @@ class TestDeliveredRecordCannotBecomeASymlink(GuardCase):
         self.assertClean(self.SHAPES["typeless"].replace("Body.", "Body edited."))
 
 
+class TestSymlinkOrGitlinkAtRefDeliveredNothing(GuardCase):
+    """gate round 17 R17-1 (Sol MINOR, Grok NIT): a symlink (120000) or gitlink (160000) at REF
+    delivered nothing to the index, so the guard has no delivered record to protect at that path. A
+    regular file replacing it is judged as an ADDED file; a deletion, a retarget or a gitlink left in
+    place is not judged. A regular delivered record replaced by a symlink or a gitlink is still refused."""
+    REL = "topics/x.md"
+    MSG = "record replaced by a symlink or gitlink"
+
+    @staticmethod
+    def clean(tid):
+        return topic_text(tid=tid, standing="standing: []\n")
+
+    def _base(self, kind):
+        """A store whose REF holds topics/foo.md plus topics/x.md as `kind`: symlink, gitlink or file."""
+        self.store()
+        root, path = self.root, self.root / self.REL
+        if kind == "symlink":
+            os.symlink("missing-target.md", path)
+            commit_all(root)
+        elif kind == "gitlink":
+            sha = git(["rev-parse", "HEAD"], root).stdout.strip()
+            git(["update-index", "--add", "--cacheinfo", f"160000,{sha},{self.REL}"], root)
+            git(["commit", "-q", "-m", "gitlink"], root)
+            self.assertEqual(git(["ls-tree", "HEAD", "--", self.REL], root).stdout.split(" ", 1)[0], "160000")
+        else:
+            path.write_text(self.clean("TOP-9102"))
+            commit_all(root)
+        return root, path
+
+    def _run(self, change, staged_change=None):
+        """Apply `change()` to the worktree and run the worktree guard; then stage everything (or apply
+        `staged_change`) and run the staged guard; reset. Returns (rc_wt, out_wt, rc_st, out_st)."""
+        change()
+        rc_wt, out_wt = run_memlint(["--against-ref", "HEAD", str(self.root)])
+        if staged_change is not None:
+            staged_change()
+        else:
+            git(["add", "-A"], self.root)
+        rc_st, out_st = run_memlint(["--against-ref", "HEAD", "--staged", str(self.root)])
+        git(["reset", "-q"], self.root)
+        return rc_wt, out_wt, rc_st, out_st
+
+    def _replace_with_file(self, path, text):
+        def go():
+            if path.is_symlink() or path.exists():
+                path.unlink()
+            path.write_text(text)
+        return go
+
+    def test_a_gitlink_at_ref_replaced_by_a_regular_topic_is_clean(self):
+        _root, path = self._base("gitlink")
+        rc_wt, out_wt, rc_st, out_st = self._run(self._replace_with_file(path, self.clean("TOP-9103")))
+        self.assertEqual((rc_wt, rc_st), (0, 0), f"{out_wt}\n{out_st}")
+
+    def test_the_regular_file_replacing_a_gitlink_is_judged_as_an_added_file(self):
+        _root, path = self._base("gitlink")
+        rc_wt, out_wt, rc_st, out_st = self._run(self._replace_with_file(path, topic_text(tid="TOP-9101")))
+        self.assertEqual((rc_wt, rc_st), (1, 1), f"{out_wt}\n{out_st}")
+        # its default `standing: [L2]` has no `add` row: a brand-new topic is judged on every link and mark
+        self.assertIn("standing changed for L2 (add)", out_wt)
+        self.assertIn("standing changed for L2 (add)", out_st)
+        self.assertNotIn(self.MSG, out_wt + out_st)
+        self.assertNotIn("type changed", out_wt + out_st)
+
+    def test_a_symlink_at_ref_replaced_by_a_regular_topic_is_clean(self):
+        _root, path = self._base("symlink")
+        rc_wt, out_wt, rc_st, out_st = self._run(self._replace_with_file(path, self.clean("TOP-9104")))
+        self.assertEqual((rc_wt, rc_st), (0, 0), f"{out_wt}\n{out_st}")
+
+    def test_a_symlink_at_ref_retargeted_to_a_missing_target_is_clean(self):
+        _root, path = self._base("symlink")
+
+        def retarget():
+            path.unlink()
+            os.symlink("another-missing.md", path)
+        rc_wt, out_wt, rc_st, out_st = self._run(retarget)
+        self.assertEqual((rc_wt, rc_st), (0, 0), f"{out_wt}\n{out_st}")
+        self.assertNotIn("deleted", out_wt + out_st)
+
+    def test_a_symlink_at_ref_whose_target_text_looks_like_a_topic_is_clean_when_retargeted(self):
+        self.store()
+        root, path = self.root, self.root / self.REL
+        os.symlink(self.clean("TOP-9105"), path)
+        commit_all(root)
+
+        def retarget():
+            path.unlink()
+            os.symlink("elsewhere", path)
+        rc_wt, out_wt, rc_st, out_st = self._run(retarget)
+        self.assertEqual((rc_wt, rc_st), (0, 0), f"{out_wt}\n{out_st}")
+
+    def test_a_symlink_at_ref_deleted_is_clean(self):
+        _root, path = self._base("symlink")
+        rc_wt, out_wt, rc_st, out_st = self._run(path.unlink)
+        self.assertEqual((rc_wt, rc_st), (0, 0), f"{out_wt}\n{out_st}")
+        self.assertNotIn("deleted", out_wt + out_st)
+
+    def test_a_gitlink_at_ref_deleted_is_clean(self):
+        _root, path = self._base("gitlink")
+        rc_wt, out_wt, rc_st, out_st = self._run(
+            lambda: None, lambda: git(["rm", "-q", "--cached", self.REL], self.root))
+        self.assertEqual((rc_wt, rc_st), (0, 0), f"{out_wt}\n{out_st}")
+
+    def test_a_regular_delivered_topic_replaced_by_a_symlink_is_still_refused(self):
+        _root, path = self._base("file")
+        text = path.read_text()
+
+        def to_symlink():
+            path.unlink()
+            os.symlink(text, path)
+
+        def stage_symlink():
+            blob = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=str(self.root),
+                                  input=text.encode(), capture_output=True, check=True).stdout.decode().strip()
+            git(["update-index", "--cacheinfo", f"120000,{blob},{self.REL}"], self.root)
+        rc_wt, out_wt, rc_st, out_st = self._run(to_symlink, stage_symlink)
+        self.assertEqual((rc_wt, rc_st), (1, 1), f"{out_wt}\n{out_st}")
+        self.assertIn(self.MSG, out_wt)
+        self.assertIn(self.MSG, out_st)
+
+    def test_a_regular_delivered_topic_replaced_by_a_gitlink_is_refused(self):
+        _root, path = self._base("file")
+        sha = git(["rev-parse", "HEAD"], self.root).stdout.strip()
+
+        def to_gitlink():
+            path.unlink()
+            path.mkdir()  # a submodule checkout is a directory on the worktree
+        rc_wt, out_wt, rc_st, out_st = self._run(
+            to_gitlink, lambda: git(["update-index", "--cacheinfo", f"160000,{sha},{self.REL}"], self.root))
+        self.assertEqual((rc_st), 1, f"{out_wt}\n{out_st}")
+        self.assertIn(self.MSG, out_st)
+        # the worktree side sees a directory the index (still the regular file) does not record as a gitlink
+        # until it is staged, so only the staged guard is the delivery gate here
+        git(["update-index", "--cacheinfo", f"160000,{sha},{self.REL}"], self.root)
+        rc_wt, out_wt = run_memlint(["--against-ref", "HEAD", str(self.root)])
+        git(["reset", "-q"], self.root)
+        self.assertEqual(rc_wt, 1, out_wt)
+        self.assertIn(self.MSG, out_wt)
+
+
 class TestSharedBlockItemDelete(unittest.TestCase):
     def test_the_helper_deletes_the_first_match_and_ignores_comments_and_quotes(self):
         lines = ["code_refs:\n", '  - "src/a.py"  # why\n', "  - src/b.py\n", "  - src/a.py\n", "x: 1\n"]

@@ -3248,6 +3248,19 @@ def _quarantine_errors(full_path, new_result) -> list[str]:
     return [f"{full_path}: record leaves delivery: the new side would be quarantined ({first})"]
 
 
+def _new_side_nonregular(toplevel: Path, full_path: Path, relpath: str, staged: bool) -> bool:
+    """True when the NEW side of `relpath` is a symlink (`120000`) or a gitlink (`160000`): the
+    index mode in staged mode; the worktree path otherwise (a symlink, or a directory the index
+    records as a gitlink). The index reads neither."""
+    if staged:
+        return _git_mode(toplevel, ["ls-files", "-s", "-z"], relpath) in ("120000", "160000")
+    if full_path.is_symlink():
+        return True
+    if full_path.is_file():
+        return False
+    return _git_mode(toplevel, ["ls-files", "-s", "-z"], relpath) == "160000"
+
+
 def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], int, list[str]]:
     """Returns (errors, changed, notes) -- `changed` is the number of
     topic files the diff actually concerned (topic-relevant at REF),
@@ -3283,12 +3296,20 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
     for status, relpath in entries:
         path_in_root = relpath[len(prefix):] if prefix and relpath.startswith(prefix) else relpath
         full_path = root / path_in_root
-        type_changed = status == "T"
-        if type_changed:
-            # Type change (symlink/gitlink <-> regular file): the path exists
-            # on both sides, so it is judged exactly like a modification
-            # (R16-1: a REPLACEMENT BY A SYMLINK of a delivered record is judged below).
+        if status == "T":
+            # Type change (symlink/gitlink <-> regular file): the path exists on both sides, so it
+            # is judged like a modification. Whether the NEW side is a symlink or gitlink is decided
+            # from its actual mode below (R16-1), never from the bare `T`.
             status = "M"
+
+        # R17-1 (gate round 17): a REF entry that was a symlink (120000) or gitlink (160000)
+        # delivered nothing to the index, so there is no delivered record at this path to protect.
+        # It is judged as an ADDED file when the NEW side is a regular file (every link on it is
+        # new), and not judged at all when the NEW side is deleted or still a symlink/gitlink.
+        if status != "A" and _git_mode(toplevel, ["ls-tree", "-z", ref], relpath) in ("120000", "160000"):
+            if status == "D" or _new_side_nonregular(toplevel, full_path, relpath, staged):
+                continue
+            status = "A"
 
         if status == "A":
             # Nothing existed at REF for this path -- no history to
@@ -3350,23 +3371,15 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
         # R16-1 (gate round 16): the index never reads a symlink (reindex skips it), so a delivered
         # record replaced by one drops its for-path and digest entries. Decided from the git TYPE
         # (diff status `T`, the index mode in staged mode, the worktree path otherwise), never from
-        # the symlink's blob -- its target text may equal the old Markdown. The REF side must be a
-        # regular file (a symlink at REF delivered nothing); an added symlink is free (above).
-        new_symlink = False
-        if status != "D":
-            if staged:
-                new_symlink = _git_mode(toplevel, ["ls-files", "-s", "-z"], relpath) == "120000"
-            else:
-                new_symlink = full_path.is_symlink()
-            new_symlink = new_symlink or type_changed
-            if new_symlink and _git_mode(toplevel, ["ls-tree", "-z", ref], relpath) == "120000":
-                new_symlink = False
+        # the symlink's blob -- its target text may equal the old Markdown. A symlink or gitlink at REF
+        # delivered nothing and never reaches here (R17-1, above); an added symlink is free.
+        new_symlink = status != "D" and _new_side_nonregular(toplevel, full_path, relpath, staged)
         if new_symlink:
             if _is_topic_like(old_result) or _frozen_type(root, full_path, old_result) is not None:
                 changed += 1
                 errors.append(
-                    f"{full_path}: record replaced by a symlink (the index does not read symlinks; "
-                    "a delivered record cannot become one)")
+                    f"{full_path}: record replaced by a symlink or gitlink (the index does not read "
+                    "either; a delivered record cannot become one)")
             continue
         if status != "D":
             new_blob = _git_show(toplevel, f":{relpath}") if staged else _read_worktree(root / path_in_root)
