@@ -91,6 +91,29 @@ def marks_block(*rows):
     return "standing_marks:\n" + "".join(rows)
 
 
+MARK_SID = "11111111-2222-3333-4444-555555555555"
+MARK_YES = "aaaaaaaa-0000-0000-0000-000000000002"
+MARK_OWNER = "aaaaaaaa-0000-0000-0000-000000000001"
+MARK_OWNER_TEXT = "Yes, make that rule standing for every session."
+MARK_FLAGS = ("--session", MARK_SID, "--yes-message", MARK_YES)
+
+
+def write_mark_transcript(base, sid=MARK_SID):
+    """A one-session transcript (an owner message and a yes-message) under
+    `base/proj/<sid>.jsonl`; the caller points MEMCONTINUUM_TRANSCRIPTS_DIR at `base`."""
+    lines = [
+        {"type": "user", "uuid": MARK_OWNER, "sessionId": sid, "cwd": "/work/p",
+         "timestamp": "2026-11-03T14:00:00.000Z",
+         "message": {"role": "user", "content": MARK_OWNER_TEXT}},
+        {"type": "user", "uuid": MARK_YES, "sessionId": sid, "cwd": "/work/p",
+         "timestamp": "2026-11-03T14:01:00.000Z",
+         "message": {"role": "user", "content": "ok, agreed."}},
+    ]
+    d = Path(base) / "proj"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{sid}.jsonl").write_text("\n".join(json.dumps(x) for x in lines) + "\n")
+
+
 def git(args, cwd):
     return subprocess.run(["git"] + list(args), cwd=str(cwd), capture_output=True, text=True, check=True)
 
@@ -272,6 +295,8 @@ class MarkCase(TmpCase):
         env.start()
         self.addCleanup(env.stop)
         os.environ.pop("MEMCONTINUUM_RECORDED_BY", None)
+        write_mark_transcript(self.tmp / "transcripts")
+        os.environ["MEMCONTINUUM_TRANSCRIPTS_DIR"] = str(self.tmp / "transcripts")
 
     def write(self, text):
         self.path.write_bytes(text.encode("utf-8"))
@@ -280,10 +305,11 @@ class MarkCase(TmpCase):
     def read(self):
         return self.path.read_bytes().decode("utf-8")
 
-    def mark(self, link, *flags, authority="owner-ratified", source="owner said so",
-             why="because", topic="TOP-9100", extra=()):
-        return run_memidx(["mark-standing", topic, link, *flags, "--authority", authority,
-                           "--source", source, "--why", why, "--root", str(self.store), *extra])
+    def mark(self, link, *flags, source=None, why="because", topic="TOP-9100", extra=(),
+             derive=MARK_FLAGS):
+        src = ("--source", source) if source is not None else ()
+        return run_memidx(["mark-standing", topic, link, *flags, *derive, *src,
+                           "--why", why, "--root", str(self.store), *extra])
 
     def parsed(self):
         return memidx.parse_record_raw(self.read(), self.path).frontmatter
@@ -457,10 +483,57 @@ class TestMarkStandingCommand(MarkCase):
                     self.assertEqual(rc, 1, err)
                     self.assertEqual(self.read(), text)
 
-    def test_agent_authority_is_not_accepted(self):
-        with self.assertRaises(SystemExit):
-            with contextlib.redirect_stderr(io.StringIO()):
-                self.mark("L3", "--add", authority="agent-inference")
+    def test_a_typed_authority_is_not_accepted(self):
+        text = self.write(topic_text(standing="standing: [L2]\n"))
+        for value in ("agent-inference", "owner-ratified"):
+            with self.subTest(value=value):
+                with self.assertRaises(SystemExit):
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        self.mark("L3", "--add", extra=("--authority", value))
+                self.assertEqual(self.read(), text)
+
+    def test_ratified_row_carries_the_derived_source_and_no_text(self):
+        self.write(topic_text(standing="standing: [L2]\n"))
+        rc, out, err = self.mark("L3", "--add", source="extra note")
+        self.assertEqual(rc, 0, err)
+        row = memidx.standing_mark_rows(self.parsed())[0]
+        self.assertEqual(row["authority"], "owner-ratified")
+        self.assertEqual(row["source"], f"owner yes-message {MARK_YES}, session {MARK_SID}, "
+                                        "2026-11-03T14:01:00.000Z; extra note")
+        self.assertNotIn("agreed", self.read())
+        self.assertLintClean()
+
+    def test_verbatim_row_derives_from_the_owner_message_and_never_stores_the_quote(self):
+        self.write(topic_text(standing="standing: [L2]\n"))
+        rc, _o, err = self.mark("L3", "--add", derive=("--session", MARK_SID, "--owner-message", MARK_OWNER,
+                                                       "--quote", "make that rule standing"))
+        self.assertEqual(rc, 0, err)
+        row = memidx.standing_mark_rows(self.parsed())[0]
+        self.assertEqual(row["authority"], "owner-verbatim")
+        self.assertTrue(row["source"].startswith(f"owner message {MARK_OWNER}, session {MARK_SID}"))
+        self.assertNotIn("make that rule standing", self.read())
+        self.assertLintClean()
+
+    def test_refusals_leave_the_file_untouched(self):
+        text = self.write(topic_text(standing="standing: [L2]\n"))
+        cases = {
+            "wrong quote": dict(derive=("--session", MARK_SID, "--owner-message", MARK_OWNER,
+                                        "--quote", "make that rule standing!")),
+            "verbatim without a quote": dict(derive=("--session", MARK_SID, "--owner-message", MARK_OWNER)),
+            "no derivation at all": dict(derive=()),
+            "message without a session": dict(derive=("--yes-message", MARK_YES)),
+            "unknown uuid": dict(derive=("--session", MARK_SID, "--yes-message", "no-such-uuid")),
+            "unknown session (transcript unavailable)": dict(
+                derive=("--session", "99999999-0000-0000-0000-000000000000", "--yes-message", MARK_YES)),
+            "both messages": dict(derive=(*MARK_FLAGS, "--owner-message", MARK_OWNER, "--quote", "x")),
+            "quote with a yes-message": dict(derive=(*MARK_FLAGS, "--quote", "x")),
+        }
+        for label, kw in cases.items():
+            with self.subTest(label):
+                rc, _o, err = self.mark("L3", "--add", **kw)
+                self.assertEqual(rc, 1, err)
+                self.assertIn("nothing written", err)
+                self.assertEqual(self.read(), text)
 
     def test_unknown_topic_and_unparseable_file(self):
         self.write(topic_text())
@@ -629,8 +702,8 @@ class TestMarkStandingCommand(MarkCase):
         root = git_store(self.tmp / "gs")
         (root / "topics" / "foo.md").write_text(topic_text(standing="standing: [L2]\n"))
         commit_all(root)
-        rc, _o, err = run_memidx(["mark-standing", "TOP-9100", "L3", "--add", "--authority", "owner-ratified",
-                                  "--source", "s", "--why", "w", "--root", str(root)])
+        rc, _o, err = run_memidx(["mark-standing", "TOP-9100", "L3", "--add", *MARK_FLAGS,
+                                  "--why", "w", "--root", str(root)])
         self.assertEqual(rc, 0, err)
         rc, out = run_memlint(["--against-ref", "HEAD", str(root)])
         self.assertEqual(rc, 0, out)
@@ -1159,6 +1232,10 @@ class TestStandingMarksThroughTheHook(TmpCase):
         patcher = mock.patch.object(memidx, "_now", return_value=NOW)
         patcher.start()
         self.addCleanup(patcher.stop)
+        write_mark_transcript(self.tmp / "transcripts")
+        env = mock.patch.dict(os.environ, {"MEMCONTINUUM_TRANSCRIPTS_DIR": str(self.tmp / "transcripts")})
+        env.start()
+        self.addCleanup(env.stop)
 
     def run_hook(self):
         env = dict(os.environ)
@@ -1183,9 +1260,8 @@ class TestStandingMarksThroughTheHook(TmpCase):
 
         git(["reset", "-q", "--hard"], self.store)
         self.assertEqual(path.read_text(), original)
-        rc, _o, err = run_memidx(["mark-standing", "TOP-9100", "L3", "--add", "--authority", "owner-ratified",
-                                  "--source", "owner message", "--why", "needed at every start",
-                                  "--root", str(self.store)])
+        rc, _o, err = run_memidx(["mark-standing", "TOP-9100", "L3", "--add", *MARK_FLAGS,
+                                  "--why", "needed at every start", "--root", str(self.store)])
         self.assertEqual(rc, 0, err)
         proc = self.run_hook()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
