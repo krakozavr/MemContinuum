@@ -923,21 +923,21 @@ print(json.dumps(state))
     }
     if [ "${#CODE_PATHS[@]}" -gt 0 ] && [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
         UC_CALLED=1
+        # A reusable cache is removed from the session file BEFORE the first
+        # call (the merge below reads the snapshot taken at decision time, not
+        # the file): the first call is the one that can heal the index, and a
+        # kill anywhere between it and the write-back must leave NO cache for a
+        # later prompt to reuse. It is republished after a good classification.
+        if [ "$UC_REUSE" = "1" ]; then _uc_drop_cache; fi
         if [ "${#NEW_PATHS[@]}" -gt 0 ]; then _uc_call "${NEW_PATHS[@]}"; else _uc_call; fi
         # The call healed a stale index: the verdicts reused from earlier
         # prompts were made against the index as it was BEFORE the rebuild
         # (an unmapped may have just become bound), so every path is
-        # reclassified against the healed one.
-        # The pre-heal cache is dropped under the lock BEFORE the re-call
-        # (and again if the re-call answers nothing): a kill or a failure in
-        # between must never leave verdicts of the old index for a later
-        # prompt to reuse against a now-current index.
+        # reclassified against the healed one. The cache is already gone (above).
         if [ "$UC_HEALED" = "true" ] && [ "$UC_REUSE" = "1" ]; then
             UC_REUSE=0
             NEW_PATHS=("${CODE_PATHS[@]}")
-            _uc_drop_cache
             _uc_call "${NEW_PATHS[@]}"
-            if [ -z "$UC_RAW" ]; then _uc_drop_cache; fi
         fi
         if [ -n "$UC_RAW" ]; then
             UNMAPPED_JSON="$UC_RAW"
