@@ -260,8 +260,9 @@ copied inline.
   alternative, the link that recorded it) in `reverses`. The comparison is the whitespace-normalised
   string and nothing else, so a paraphrase is not flagged. Checked against the link's own topic and,
   for a brand-new topic file, every other topic. Enforced for new links only: an error under
-  `--against-ref` for links absent at REF; a warning in plain mode (own topic only), so links
-  recorded before the check do not block commits
+  `--against-ref` for links absent at REF; a warning in plain mode (on the link's own topic and,
+  once the whole store is read, across topics; old links are tolerated), so links recorded before the check do
+  not block commits; `--against-ref` errors for new links
 - `status: superseded` without `superseded_by` → error
 - `reverses:` without `reason_for_change` → error
 - a `kind: reversed` link whose `reverses:` target's `status` is still `active` or `provisional` →

@@ -352,8 +352,10 @@ def lint_topic(
             for e in _new_link_errors(prefix, link)
         )
         # Declined-rulings rule (DESIGN-declined-check): same severity split.
-        # Plain mode judges the topic's own rejections only; the cross-topic
-        # case (a brand-new topic) is an --against-ref error.
+        # This loop judges the link's own topic only; plain mode ALSO warns
+        # across topics, in the grandfathered cross-topic pass in lint_root
+        # after the whole store is read (do not drop it: a brand-new topic's
+        # re-adoption is an --against-ref error, a warning in plain mode).
         topic_id = str(fm.get("id") or Path(str(path)).stem)
         warnings.extend(
             f"{readoption_message(prefix, topic_id, row)} "
