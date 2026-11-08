@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -1282,6 +1283,108 @@ class TestDeliveredTopicCannotBeDeleted(GuardCase):
         commit_all(root)
         rc, out_wt, out_st = self._both(lambda: (root / "concepts" / "x.md").unlink())
         self.assertEqual(rc, 0, f"{out_wt}\n{out_st}")
+
+
+class TestDeliveredRecordCannotBecomeASymlink(GuardCase):
+    """gate round 16 R16-1 (Sol MAJOR): the index skips symlinks, so replacing a delivered record by
+    one drops its for-path and digest entries. The guard decides from the git type (diff status `T`, the
+    index mode `120000`, a symlink on the worktree path) and never parses the symlink's blob as content,
+    even when the target text equals the old Markdown. An ADDED symlink stays free."""
+    SHAPES = dict(TestRefMarksRowsValidatedOnEveryRecord.SHAPES)
+    MSG = "record replaced by a symlink"
+
+    def _both(self, rel, target, root=None):
+        """Replace `rel` by a symlink whose target text is `target`: the worktree guard sees a real
+        symlink; the staged guard sees an index entry of mode 120000 (the worktree file is put back, so
+        only the index differs). Returns (rc_wt, out_wt, rc_st, out_st)."""
+        root = root or self.root
+        path = root / rel
+        original = path.read_bytes() if path.exists() and not path.is_symlink() else None
+        path.unlink()
+        os.symlink(target, path)
+        rc_wt, out_wt = run_memlint(["--against-ref", "HEAD", str(root)])
+        path.unlink()
+        if original is not None:
+            path.write_bytes(original)
+        blob = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=str(root),
+                              input=target.encode(), capture_output=True, check=True).stdout.decode().strip()
+        git(["update-index", "--cacheinfo", f"120000,{blob},{rel}"], root)
+        self.assertEqual(self._mode_in(root, rel), "120000")
+        rc_st, out_st = run_memlint(["--against-ref", "HEAD", "--staged", str(root)])
+        git(["reset", "-q"], root)
+        return rc_wt, out_wt, rc_st, out_st
+
+    @staticmethod
+    def _mode_in(root, rel):
+        return git(["ls-files", "-s", "--", rel], root).stdout.split(" ", 1)[0]
+
+    def test_a_delivered_record_replaced_by_a_symlink_is_refused_on_both_paths(self):
+        # Sol's fixture: the symlink target text IS the old Markdown, so a content comparison sees no change
+        for name, text in self.SHAPES.items():
+            with self.subTest(name):
+                self.store(text)
+                rc_wt, out_wt, rc_st, out_st = self._both("topics/foo.md", text)
+                self.assertEqual((rc_wt, rc_st), (1, 1), f"{out_wt}\n{out_st}")
+                self.assertIn(self.MSG, out_wt)
+                self.assertIn(self.MSG, out_st)
+
+    def test_a_topic_with_a_link_chain_replaced_by_a_symlink_is_refused(self):
+        self.store()
+        text = (self.root / "topics" / "foo.md").read_text()
+        rc_wt, out_wt, rc_st, out_st = self._both("topics/foo.md", text)
+        self.assertEqual((rc_wt, rc_st), (1, 1), f"{out_wt}\n{out_st}")
+        self.assertIn(self.MSG, out_wt)
+        self.assertIn(self.MSG, out_st)
+
+    def test_a_delivered_incident_replaced_by_a_symlink_is_refused(self):
+        root = git_store(self.tmp / "inc_store")
+        self.root = root
+        (root / "incidents").mkdir(exist_ok=True)
+        text = "---\ntype: incident\nid: INC-9500\ntitle: x\n---\n\nBody.\n"
+        (root / "incidents" / "x.md").write_text(text)
+        commit_all(root)
+        rc_wt, out_wt, rc_st, out_st = self._both("incidents/x.md", "elsewhere.md")
+        self.assertEqual((rc_wt, rc_st), (1, 1), f"{out_wt}\n{out_st}")
+        self.assertIn(self.MSG, out_wt)
+        self.assertIn(self.MSG, out_st)
+
+    def test_the_symlink_blob_is_never_parsed_as_content(self):
+        # a target that is not Markdown at all gives the same single error, not a parse error
+        self.store(self.SHAPES["typeless"])
+        rc_wt, out_wt, rc_st, out_st = self._both("topics/foo.md", "../elsewhere.md")
+        self.assertEqual((rc_wt, rc_st), (1, 1), f"{out_wt}\n{out_st}")
+        for out in (out_wt, out_st):
+            self.assertIn(self.MSG, out)
+            self.assertNotIn("type changed", out)
+
+    def test_a_symlink_replacing_a_non_delivered_note_is_not_an_error(self):
+        # an `inbox/` note is delivered with a non-canonical type: nothing to lose, nothing else fires
+        root = git_store(self.tmp / "inbox_store")
+        self.root = root
+        (root / "inbox").mkdir()
+        (root / "inbox" / "n.md").write_text("---\ntitle: a note\n---\n\nBody.\n")
+        commit_all(root)
+        rc_wt, out_wt, rc_st, out_st = self._both("inbox/n.md", "elsewhere.md")
+        self.assertEqual((rc_wt, rc_st), (0, 0), f"{out_wt}\n{out_st}")
+        self.assertNotIn(self.MSG, out_wt + out_st)
+
+    def test_an_added_symlink_is_free(self):
+        self.store()
+        for staged in (False, True):
+            with self.subTest(staged=staged):
+                path = self.root / "topics" / "new.md"
+                os.symlink("foo.md", path)
+                if staged:
+                    git(["add", "topics/new.md"], self.root)
+                    self.assertEqual(self._mode_in(self.root, "topics/new.md"), "120000")
+                rc, out = run_memlint(["--against-ref", "HEAD"] + (["--staged"] if staged else []) + [str(self.root)])
+                git(["reset", "-q"], self.root)
+                path.unlink()
+                self.assertEqual(rc, 0, out)
+
+    def test_a_regular_edit_is_still_judged_as_content(self):
+        self.store(self.SHAPES["typeless"])
+        self.assertClean(self.SHAPES["typeless"].replace("Body.", "Body edited."))
 
 
 class TestSharedBlockItemDelete(unittest.TestCase):

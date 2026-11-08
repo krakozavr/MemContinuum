@@ -2390,6 +2390,15 @@ def _git_show(cwd: Path, spec: str) -> bytes | None:
     return proc.stdout
 
 
+def _git_mode(toplevel: Path, args: list[str], relpath: str) -> str | None:
+    """The git file mode (`100644`, `120000` ...) of `relpath` in the index (`ls-files -s`) or at a
+    tree (`ls-tree <ref>`); None when the path is absent there."""
+    proc = _run_git(args + ["--", relpath], toplevel)
+    if proc.returncode != 0 or not proc.stdout:
+        return None
+    return proc.stdout.split(b" ", 1)[0].decode("ascii", "replace")
+
+
 def _read_worktree(path: Path) -> bytes | None:
     try:
         return path.read_bytes()
@@ -3274,9 +3283,11 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
     for status, relpath in entries:
         path_in_root = relpath[len(prefix):] if prefix and relpath.startswith(prefix) else relpath
         full_path = root / path_in_root
-        if status == "T":
+        type_changed = status == "T"
+        if type_changed:
             # Type change (symlink/gitlink <-> regular file): the path exists
-            # on both sides, so it is judged exactly like a modification.
+            # on both sides, so it is judged exactly like a modification
+            # (R16-1: a REPLACEMENT BY A SYMLINK of a delivered record is judged below).
             status = "M"
 
         if status == "A":
@@ -3336,6 +3347,27 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
         new_blob = None
         new_result = None
         frozen = None
+        # R16-1 (gate round 16): the index never reads a symlink (reindex skips it), so a delivered
+        # record replaced by one drops its for-path and digest entries. Decided from the git TYPE
+        # (diff status `T`, the index mode in staged mode, the worktree path otherwise), never from
+        # the symlink's blob -- its target text may equal the old Markdown. The REF side must be a
+        # regular file (a symlink at REF delivered nothing); an added symlink is free (above).
+        new_symlink = False
+        if status != "D":
+            if staged:
+                new_symlink = _git_mode(toplevel, ["ls-files", "-s", "-z"], relpath) == "120000"
+            else:
+                new_symlink = full_path.is_symlink()
+            new_symlink = new_symlink or type_changed
+            if new_symlink and _git_mode(toplevel, ["ls-tree", "-z", ref], relpath) == "120000":
+                new_symlink = False
+        if new_symlink:
+            if _is_topic_like(old_result) or _frozen_type(root, full_path, old_result) is not None:
+                changed += 1
+                errors.append(
+                    f"{full_path}: record replaced by a symlink (the index does not read symlinks; "
+                    "a delivered record cannot become one)")
+            continue
         if status != "D":
             new_blob = _git_show(toplevel, f":{relpath}") if staged else _read_worktree(root / path_in_root)
             if new_blob is not None:
