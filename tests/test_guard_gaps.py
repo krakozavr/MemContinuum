@@ -432,7 +432,7 @@ class TestTypeFrozen(GuardCase):
         self.assertIsNone(self._frozen(res))
         memo = memidx.parse_record_text(self.MEMO_REF, "x")
         self.assertTrue(memo.fallback, memo)
-        self.assertEqual(self._frozen(memo), "memo")
+        self.assertIsNone(self._frozen(memo))   # `memo` is not canonical: exempt (round 12 amendment)
         strict = memidx.parse_record_text(ttext(["src/a.py"]), "x")
         self.assertFalse(strict.fallback)
         self.assertEqual(self._frozen(strict), "topic")
@@ -453,13 +453,15 @@ class TestTypeFrozen(GuardCase):
         self.assertClean(fixed)
         self.assertClean(fixed.replace("type: topic # comment", "type: topic"))
 
-    def test_a_memo_note_with_no_links_and_no_id_is_frozen_as_its_stored_type(self):
-        # round 12 R12-1 (was: free to change type): the index STORED this tolerated fallback note as `memo`
+    def test_a_memo_note_with_no_links_and_no_id_has_a_non_canonical_stored_type_that_is_exempt_and_its_repair_is_free(self):
+        # round 12 amendment: the index stored `memo`, which no delivery route reads (for-path, digest and search
+        # filter on the canonical types), so nothing is frozen and any repair, including entering as a topic, is free
         self._assert_quarantined(self.MEMO_REF, want=False)
         self.store(self.MEMO_REF)
         fixed = self.MEMO_REF.replace("title: bad: title", 'title: "bad: title"')
         self.assertClean(fixed)
-        self.assertRefused(fixed.replace("type: memo", "type: investigation"), "type changed 'memo' -> 'investigation'")
+        self.assertClean(fixed.replace("type: memo", "type: investigation"))
+        self.assertClean(fixed.replace("type: memo", "type: topic"))
 
     # gate round 10 R10-1 (Sol MAJOR): a STRICT REF with no `type:` is not exempt -- its kind is frozen too
     def _typeless(self, text=None):
@@ -505,10 +507,9 @@ class TestTypeFrozen(GuardCase):
         self.assertEqual(self._frozen(memidx.parse_record_text(self._typeless(), "x")), "topic")
         self.assertIsNone(self._frozen(memidx.parse_record_text(self._bad_title(ttext(["src/a.py"])), "x")))
         self.assertIsNone(self._frozen(memidx.parse_record_text(self.LINKS_REF, "x")))
-        self.assertEqual(self._frozen(memidx.parse_record_text(self.MEMO_REF, "x")), "memo")
+        self.assertIsNone(self._frozen(memidx.parse_record_text(self.MEMO_REF, "x")))
         inbox = Path("/store") / "inbox" / "n.md"
-        self.assertEqual(memlint._frozen_type(Path("/store"), inbox, memidx.parse_record_text(ttext(["src/a.py"]), "x")),
-                         "inbox")
+        self.assertIsNone(memlint._frozen_type(Path("/store"), inbox, memidx.parse_record_text(ttext(["src/a.py"]), "x")))   # `inbox` is not canonical
 
     # gate round 10 R10-2 (Sol MAJOR, Grok MINOR): the fallback key scan used for `top_level_keys` sees quoted
     # and indented keys; it over-includes (a `links:` in a scalar, a nested one) -- the ruled fail-closed direction
@@ -610,16 +611,14 @@ class TestTypeFrozen(GuardCase):
         self.assertClean(fixed.replace("type: banana # note", ""))
         self.assertClean(fixed.replace("type: banana # note", "type: incident"))
 
-    def test_a_garbled_type_note_with_no_id_and_no_links_is_frozen_as_its_stored_type(self):
-        # round 12 R12-1 (was "exempt"): not canonical -> the index STORED it as `banana # note`, so that is the
-        # frozen type; strict YAML reads the comment away, so even a title-only repair changes the delivered type
+    def test_a_garbled_type_note_with_no_id_and_no_links_has_a_non_canonical_stored_type_that_is_exempt_and_its_repair_is_free(self):
+        # round 12 amendment (was "frozen as its stored type"): `banana # note` is not canonical, so it is exempt
         ref = "---\ntype: banana # note\ntitle: bad: title\n---\n\nBody.\n"
         self._assert_quarantined(ref, want=False)
         self.store(ref)
         fixed = self._title_repaired(ref)
-        self.assertRefused(fixed, "type changed 'banana # note' -> 'banana'")
-        self.assertRefused(fixed.replace("type: banana # note", "type: investigation"),
-                           "type changed 'banana # note' -> 'investigation'")
+        self.assertClean(fixed)
+        self.assertClean(fixed.replace("type: banana # note", "type: investigation"))
         self.assertClean(ref)
 
     def test_a_quarantined_no_space_hash_after_a_quoted_canonical_type_may_declare_any_type(self):
@@ -904,7 +903,7 @@ class TestDeliveredTypeFrozen(GuardCase):
         (self.root / "inbox" / "n.md").write_text(text)
         return run_memlint(["--against-ref", "HEAD", str(self.root)])
 
-    def test_a_stored_inbox_memo_keeps_inbox_through_a_title_repair(self):
+    def test_a_stored_inbox_memo_is_exempt_and_its_title_repair_is_clean(self):
         # Sol R12 MAJOR (R12-2): the index delivers every file under inbox/ as `inbox` whatever its `type:`; the freeze
         # is `infer_type`, so a title repair (and even a `type:` edit) leaves it `inbox` and is clean. On c58a569 the
         # kind rule froze `topic` for an inbox note with a `links` key and refused the repair.
@@ -912,7 +911,7 @@ class TestDeliveredTypeFrozen(GuardCase):
         res = memidx.parse_record_text(ref, "x")
         self.assertTrue(res.fallback, res)
         self.assertFalse(memidx.record_is_quarantined(res), res)
-        self.assertEqual(memlint._frozen_type(Path("/s"), Path("/s/inbox/n.md"), res), "inbox")
+        self.assertIsNone(memlint._frozen_type(Path("/s"), Path("/s/inbox/n.md"), res))   # `inbox` is not canonical: exempt
         self._inbox_store(ref)
         fixed = ref.replace("title: bad: title", 'title: "bad: title"')
         rc, out = self._inbox_guard(fixed)
@@ -974,16 +973,15 @@ class TestDeliveredTypeFrozen(GuardCase):
         fixed = ref.replace("title: bad: title", 'title: "bad: title"')
         self.assertClean(fixed.replace("type: banana # note", "type: topic"))
 
-    def test_a_garbled_note_with_code_refs_and_no_canonical_marker_is_stored_and_frozen(self):
-        # the other half of Grok R12 MINOR 2, pinned as coded: with no id/links/canonical type the garbled note is NOT
-        # quarantined (the index stored `banana # note`), so repairing it to `type: topic` is a change of the stored
-        # type and is refused; the rule exempts quarantined records only
+    def test_a_garbled_note_with_code_refs_and_no_canonical_marker_may_enter_for_path_on_repair(self):
+        # Grok R12 MINOR 2, round 12 amendment: not quarantined, but its stored `banana # note` is not canonical, hence
+        # delivered by no route (for-path 0); repairing it to `type: topic` puts its code_refs into for-path. Entering
+        # delivery is free, like an added file (documented in INTERNALS)
         ref = self.GARBLED_WITH_REFS.format(ident="")
         self.assertFalse(memidx.record_is_quarantined(memidx.parse_record_text(ref, "x")))
         self.store(ref)
         fixed = ref.replace("title: bad: title", 'title: "bad: title"')
-        self.assertRefused(fixed.replace("type: banana # note", "type: topic"),
-                           "type changed 'banana # note' -> 'topic'")
+        self.assertClean(fixed.replace("type: banana # note", "type: topic"))
 
     def test_a_fallback_record_that_never_had_a_type_is_clean_when_repaired_without_one(self):
         # Grok R11 MINOR: no `explicit` flag, no `type removed`; a typeless NEW infers by directory

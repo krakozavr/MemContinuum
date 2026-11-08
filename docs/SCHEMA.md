@@ -437,14 +437,14 @@ pre-commit hook reads):
   Existing membership needs no rows.
 - *`type` is frozen (delivered records only).* The frozen type is what the index delivered at the compared
   revision (`infer_type`: an inbox directory, then an explicit `type:`, then `metadata.type`, then the
-  record's directory); a record the index quarantined there is exempt; a change is any difference in that
-  delivered type: `type changed 'topic' -> 'investigation' after being recorded`. A typeless record under
-  `topics/` is frozen as `topic` and may stay typeless or declare `topic`; it cannot gain `type: incident`
-  or `metadata.type`, and a record that is really an incident but sits under `topics/` must stay a topic or
-  be MOVED (a move is a deletion plus an addition under `--no-renames`, governed by the deletion rule). A
-  record quarantined at `REF` (a malformed canonical-looking record, for example one with a `TOP-` id) delivered
-  nothing, so its repair is a record entering delivery, like an added file, and may declare any type. A file
-  added after `REF` is free. Plain lint is unchanged.
+  record's directory) when that is a canonical record type; a quarantined record or a non-canonical delivered
+  type is exempt; a change is any difference in that delivered type: `type changed 'topic' -> 'investigation'
+  after being recorded`. Leaving delivery (canonical to anything) is refused; entering it (a quarantined
+  record, or a note stored under a non-canonical word such as `memo`, `inbox` or a garbled one, repaired to a
+  canonical type) is free, like an added file. A typeless record under `topics/` is frozen as `topic` and may
+  stay typeless or declare `topic`; it cannot gain `type: incident` or `metadata.type`, and a record that is
+  really an incident but sits under `topics/` must stay a topic or be MOVED (a move is a deletion plus an
+  addition under `--no-renames`, governed by the deletion rule). Plain lint is unchanged.
 - *Link order is frozen (g3).* The link ids present at `REF` must keep their relative order in the
   new blob (new links go on top; the older newest-first check refuses one placed between old ids): `<path>: links reordered (L2 before
   L3; the chain head is first-active-in-file-order)`. The chain head is the first active link in file

@@ -3197,13 +3197,15 @@ def _delivered_type(root, path, fm) -> str | None:
 
 def _frozen_type(root, path, result) -> str | None:
     """The type frozen for a record that existed at REF: what the index DELIVERED there,
-    `infer_type(root, path, fm)`. A record the index QUARANTINED at REF (`record_is_quarantined`,
-    the reindex predicate) delivered nothing, so a repair that brings it into delivery is a
-    record entering delivery like an added file, and it is exempt (None); so is a record
-    `infer_type` cannot read (`_delivered_type`)."""
+    `infer_type(root, path, fm)`, when that is a canonical record type (for-path, the standing
+    digest and record search filter on the canonical types). Exempt (None): a record the index
+    QUARANTINED at REF (`record_is_quarantined`, the reindex predicate), and one whose delivered
+    type is not canonical (`inbox`, `memo`, a garbled word, or `_delivered_type` None). Their
+    repair is a record ENTERING delivery, like an added file."""
     if record_is_quarantined(result):
         return None
-    return _delivered_type(root, path, result.frontmatter)
+    delivered = _delivered_type(root, path, result.frontmatter)
+    return delivered if delivered in CANONICAL_TYPES else None
 
 
 def _type_change_errors(root, full_path, frozen: str, new_fm: dict) -> list[str]:
