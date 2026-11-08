@@ -429,6 +429,44 @@ class TestTypeFrozen(GuardCase):
         fixed = self.MEMO_REF.replace("title: bad: title", 'title: "bad: title"')
         self.assertClean(fixed.replace("type: memo", "type: investigation"))
 
+    # gate round 10 R10-2 (Sol MAJOR, Grok MINOR): the fallback key scan used for `top_level_keys` sees quoted
+    # and indented keys; it over-includes (a `links:` in a scalar, a nested one) -- the ruled fail-closed direction
+    LINKS_BLOCK = "  - link: L1\n    date: 2026-01-01\n    decision: x\n"
+
+    def _links_guard(self, ref, links_present=True):
+        res = memidx.parse_record_text(ref, "x")
+        self.assertTrue(res.fallback, res)
+        self.assertEqual("links" in res.top_level_keys, links_present, res.top_level_keys)
+        self.store(ref)
+        fixed = ref.replace("title: bad: title", 'title: "bad: title"')
+        self.assertRefused(fixed.replace("type: topic # c", "type: incident"), "type changed 'topic' -> 'incident'")
+        self.assertClean(fixed.replace("type: topic # c", "type: topic"))
+
+    def test_a_double_quoted_links_key_counts_as_links_present(self):
+        self._links_guard('---\ntype: topic # c\ntitle: bad: title\n"links":\n' + self.LINKS_BLOCK + "---\n\nBody.\n")
+
+    def test_a_single_quoted_links_key_counts_as_links_present(self):
+        self._links_guard("---\ntype: topic # c\ntitle: bad: title\n'links':\n" + self.LINKS_BLOCK + "---\n\nBody.\n")
+
+    def test_a_uniformly_indented_mapping_counts_as_links_present(self):
+        ref = ("---\n  type: topic # c\n  title: bad: title\n  links:\n"
+               + "".join("  " + ln + "\n" for ln in self.LINKS_BLOCK.splitlines()) + "---\n\nBody.\n")
+        self._links_guard(ref)
+
+    def test_a_nested_links_key_counts_as_links_present(self):
+        self._links_guard("---\ntype: topic # c\ntitle: bad: title\nmeta:\n  links: x\n---\n\nBody.\n")
+
+    def test_a_links_line_inside_a_multi_line_scalar_freezes_a_memo_as_topic(self):
+        # documented fail-closed over-inclusion: the repair of this memo must declare `type: topic`
+        memo = '---\ntype: memo\ntitle: "unclosed\nlinks: []\n---\n\nBody.\n'
+        res = memidx.parse_record_text(memo, "x")
+        self.assertTrue(res.fallback, res)
+        self.assertIn("links", res.top_level_keys)
+        self.store(memo)
+        fixed = memo.replace('title: "unclosed', 'title: "closed"')
+        self.assertRefused(fixed, "type changed 'topic' -> 'memo'")
+        self.assertClean(fixed.replace("type: memo", "type: topic"))
+
     # gate round 8 R8-1 (Sol MAJOR/MINOR, Grok): spellings of a canonical type that the fallback
     # garbles all freeze through the id prefix (or the links list), never through a string reading.
     # (A cleanly quoted `type: "topic"` is recovered as the token `topic`, which freezes it directly; the id
