@@ -294,7 +294,7 @@ class TestTypeFrozen(GuardCase):
         self.assertTrue(res.fallback and res.valid, res)
         self.assertRefused(new, "type changed 'topic' -> 'topic # actual value'")
 
-    # gate round 4 R4-1: the frozen REF value is the PAIR {raw recovered, bare token}
+    # gate round 4 R4-1 / round 6 R6-1: the frozen REF value is the bare token alone; the NEW decoded type must equal it
     ODD_REF = '---\ntype: "topic # actual value"\ntitle: bad: title\n---\n\nBody.\n'
 
     def _odd_ref(self):
