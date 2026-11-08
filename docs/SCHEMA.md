@@ -435,16 +435,20 @@ pre-commit hook reads):
   (src/b.py, add): code_refs: did not change that way`, `duplicate reference mark for (src/b.py, add)
   in one commit`, and the frozen-row messages with `reference mark (<ref>, <action>, <recorded_at>)`.
   Existing membership needs no rows.
-- *`type` is frozen.* A `type:` recorded at `REF` may not change or be dropped, on every record that
-  existed at `REF` with a recorded type, topic or not (an incident or concept included):
-  `type changed 'topic' -> 'investigation' after being recorded`. A file added after `REF` is free, and
-  so is a record with no recoverable kind at `REF` (no `type`, no `TOP-`/`INC-`/`INV-`/`CON-` id and no `links:` list, strict or malformed). A strict `REF` needs the same parsed `type`; a strict `REF` with no `type:` freezes its KIND (id prefix, else a `links:` list as `topic`): it may stay typeless or declare exactly that kind, and any other declared type is `type changed '<kind>' -> '<new>'`. A `REF` side
-  that parsed only through the lenient fallback freezes the engine's own kind reading of it (an explicit
-  canonical `type:`, else the id prefix `TOP-`/`INC-`/`INV-`/`CON-`, else a top-level `links:` key as `topic`): the
-  repaired record must declare exactly that kind (`type: topic`), so an odd spelling (`"topic # x"`) is
-  normalised by the repair, not kept. A fallback `REF` with no recoverable kind (no usable `type:`, no
-  `TOP-`/`INC-`/`INV-`/`CON-` id and no `links:` key) is exempt; a malformed `REF` with no `type:` but such an id or a
-  `links:` list still has a kind and is frozen. Plain lint is unchanged.
+- *`type` is frozen.* What the index delivers as a record's type may not change on any record that
+  existed at `REF`, topic or not: `type changed 'topic' -> 'investigation' after being recorded`. The
+  frozen value is the engine's own answer, `infer_type` (an inbox directory, then an explicit `type:`,
+  then `metadata.type`, then the record's directory); the comparison is that answer on the `REF` blob
+  against the same answer on the new blob, as strings. So a typeless record under `topics/` is frozen as
+  `topic` and may stay typeless or declare `topic`; it cannot gain `type: incident` or `metadata.type`,
+  and a record that is really an incident but sits under `topics/` must stay a topic or be MOVED (a
+  move is a deletion plus an addition under `--no-renames`, governed by the deletion rule). Dropping
+  `type:` is no separate case: the new blob infers by directory like any other. One adjustment: a `REF`
+  side that parsed only through the lenient fallback and whose `infer_type` answer is not a canonical
+  type (the recovered `type` is garbled) freezes the record's kind instead (the id prefix
+  `TOP-`/`INC-`/`INV-`/`CON-`, else a top-level `links:` key as `topic`), and the repaired record must
+  declare exactly that kind; a fallback `REF` with no recoverable kind is exempt. A file added after
+  `REF` is free. Plain lint is unchanged.
 - *Link order is frozen (g3).* The link ids present at `REF` must keep their relative order in the
   new blob (new links go on top; the older newest-first check refuses one placed between old ids): `<path>: links reordered (L2 before
   L3; the chain head is first-active-in-file-order)`. The chain head is the first active link in file

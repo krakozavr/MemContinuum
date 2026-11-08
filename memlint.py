@@ -49,6 +49,7 @@ from memidx import (
     AUTHORITIES,
     CANONICAL_ID_PREFIXES,
     CANONICAL_TYPES,
+    infer_type,
     CONSTRAINT_AUTHORITIES,
     EDGE_RELS,
     HOLD_ELIGIBLE_AUTHORITIES,
@@ -3169,58 +3170,50 @@ def _standing_guard_errors(full_path, old_fm: dict, old_text, new_fm: dict, new_
     return errors
 
 
-def _frozen_type_frontmatter(result) -> tuple[dict, bool, bool] | None:
-    """(the frontmatter of a REF-side parse with its `type:` made comparable, whether the
-    parse was the lenient fallback, whether the REF declared a type itself), or None when
-    the record has no kind to freeze. The unified rule: the frozen value is (a) the
-    explicit `type` -- a strict parse: the parsed value, trusted valid or not; a lenient
-    fallback: the engine's kind `_record_kind(fm)` (the fallback recovers `type` as raw
-    text), else (b) the record's KIND from `_record_kind(fm)` (id prefix, then a `links`
-    list; for a fallback parse `links` presence comes from `result.top_level_keys`, the
-    fallback dict never carries it). A strict typeless record with a kind therefore
-    freezes that kind too (explicit False: it may stay typeless or declare exactly the
-    kind). No recoverable kind -> None (exempt)."""
-    fm = result.frontmatter
+def _delivered_type(root, path, fm) -> str | None:
+    """What the index would store as this record's `type`: the engine's own `infer_type`
+    (inbox directory, explicit `type`, `metadata.type`, then the record's directory). None when
+    the frontmatter is not a mapping the engine can read."""
     if not isinstance(fm, dict):
         return None
-    if not result.fallback:
-        if fm.get("type") is not None:
-            return fm, False, True
-        kind = _record_kind(fm)
-        return (dict(fm, type=kind), False, False) if kind is not None else None
+    try:
+        return infer_type(root, path, fm)
+    except (AttributeError, TypeError):
+        return None
+
+
+def _frozen_type(root, path, result) -> str | None:
+    """The type frozen for a record that existed at REF: what the index DELIVERED,
+    `infer_type(root, path, fm)`. One adjustment for a FALLBACK-parsed REF: when that answer is
+    not a canonical type (the lenient fallback recovers `type` as raw text, so a garbled one
+    comes back as a non-type), the record's KIND from `_record_kind(fm)` (explicit canonical
+    type, id prefix, a `links` list -- for a fallback parse `links` presence comes from
+    `result.top_level_keys`, the fallback dict never carries it) is frozen instead; None (no
+    recoverable kind) -> the record is exempt."""
+    fm = result.frontmatter
+    delivered = _delivered_type(root, path, fm)
+    if delivered is None:
+        return None
+    if not result.fallback or delivered in CANONICAL_TYPES:
+        return delivered
     kind = _record_kind(fm)
     if kind is None and "links" in result.top_level_keys:
         kind = "topic"
-    if kind is None:
-        return None
-    return dict(fm, type=kind), True, True
+    return kind
 
 
-def _type_change_errors(full_path, old_fm: dict, new_fm: dict, fallback: bool = False,
-                        explicit: bool = True) -> list[str]:
-    """A record's frozen `type` decides which index type it carries, and `for-path` and the
-    standing digest read only `type: topic`. `old_fm["type"]` is the frozen value (see
-    `_frozen_type_frontmatter`; None -> nothing to freeze). When the REF declared the type
-    (`explicit`), a new side with no `type` (a missing key, a null, an empty frontmatter)
-    has removed it: an error, `type removed`. When the REF declared none and the value is
-    only its kind (`explicit` False), the new side may stay typeless; any DECLARED type
-    must still equal the kind. Unchanged is the NEW DECODED type equal to the frozen value
-    as a string: for a strict REF the parsed value, for a fallback REF (`fallback` True)
-    the kind `_record_kind` reads, so the repaired record must declare that kind itself. No
-    other NEW-side normalisation."""
-    old_type = old_fm.get("type")
-    if old_type is None:
+def _type_change_errors(root, full_path, frozen: str, new_fm: dict, fallback: bool = False) -> list[str]:
+    """A record's `type` decides which index type it carries, and `for-path` and the standing
+    digest read only `type: topic`. Unchanged iff the NEW side's `infer_type` (on the parsed NEW
+    frontmatter, strict or fallback) equals the frozen string (`_frozen_type`); otherwise
+    `type changed '<old>' -> '<new>'`, with the "must declare" hint when the REF was a fallback
+    parse. No other normalisation, no separate "removed" case: a typeless NEW infers by
+    directory and compares like any other."""
+    new_type = _delivered_type(root, full_path, new_fm)
+    if new_type == frozen:
         return []
-    new_type = new_fm.get("type")
-    if new_type is None:
-        if not explicit:
-            return []
-        return [f"{full_path}: type removed (frozen {old_type!r}): type changed {old_type!r} -> None "
-                "after being recorded (append-only; `type` decides what the record is delivered as)"]
-    if str(new_type) == str(old_type):
-        return []
-    hint = f" (a repair of a malformed record must declare type: {old_type})" if fallback else ""
-    return [f"{full_path}: type changed {old_type!r} -> {new_type!r} after being recorded "
+    hint = f" (a repair of a malformed record must declare type: {frozen})" if fallback else ""
+    return [f"{full_path}: type changed {frozen!r} -> {new_type!r} after being recorded "
             f"(append-only; `type` decides what the record is delivered as){hint}"]
 
 
@@ -3309,25 +3302,23 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
 
         old_blob = _git_show(toplevel, f"{ref}:{relpath}")
         old_result = _parse_git_blob(old_blob, f"{relpath} (at {ref})")
-        # `type` is frozen for EVERY record that existed at REF with a recorded type (a topic,
-        # an incident, a concept, ...); judged first, before the classification exit below and
-        # before any branch that can `continue` past it (a repair, an invalid new side). A REF
-        # side that parsed strictly keeps its `type` frozen whether or not the record was
-        # schema-valid (a strict one with no `type` freezes its kind: id prefix, else links);
-        # a fallback-parsed one freezes the kind `_record_kind` reads from it
-        # (explicit canonical type, else id prefix, else links), exempt when it reads None. The
-        # NEW record's DECODED type must equal that kind; a strict REF compares
-        # `str(new) == str(old)`. The NEW side is never normalised.
+        # `type` is frozen for EVERY record that existed at REF (a topic, an incident, a
+        # concept, a typeless one ...); judged first, before the classification exit below and
+        # before any branch that can `continue` past it (a repair, an invalid new side). The
+        # frozen value is what the index DELIVERED: `infer_type(root, path, fm)` on the REF side
+        # (a garbled fallback REF: its kind, exempt when none), compared with `infer_type` on the
+        # NEW side; `root` is the store root and `full_path` the record's path under it, on the
+        # worktree, staged and (via `path_in_root`) prefixed-root paths alike.
         new_blob = None
         new_result = None
         if status != "D":
             new_blob = _git_show(toplevel, f":{relpath}") if staged else _read_worktree(root / path_in_root)
             if new_blob is not None:
                 new_result = _parse_git_blob(new_blob, path_in_root)
-                frozen = _frozen_type_frontmatter(old_result)
+                frozen = _frozen_type(root, full_path, old_result)
                 if frozen is not None:
                     errors.extend(_type_change_errors(
-                        full_path, frozen[0], new_result.frontmatter, frozen[1], frozen[2]))
+                        root, full_path, frozen, new_result.frontmatter, old_result.fallback))
 
         if not _is_topic_like(old_result):
             # Re-gate (Grok): a path that was not topic-like at REF (an
