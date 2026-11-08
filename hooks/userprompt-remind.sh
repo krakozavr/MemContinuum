@@ -837,7 +837,8 @@ with open(sys.argv[1]) as f:
 # They are reusable only at the store HEAD they were made at AND while the
 # store worktree is clean; a missing, malformed, other-HEAD or dirty-store
 # cache means every path is new. A path whose latest ledger edit (seen_at)
-# is newer than its verdict (classified_at) is new too: a re-edit, a
+# is not older than the whole second of its verdict (classified_at; seen_at
+# may be a whole second from an older hook version) is new too: a re-edit, a
 # symlink swap or a replace reclassifies that path alone. T: is the moment
 # this classification starts (recorded as the verdict time of every path
 # classified now, so an edit landing during the call is still newer).
@@ -858,7 +859,7 @@ print("R:" + ("1" if reuse else "0"))
 print("T:" + repr(time.time()))
 for p in d.get("code_paths", []):
     print("P:" + p)
-    if p not in verdicts or num(seen.get(p)) > num(stamps.get(p)):
+    if p not in verdicts or num(seen.get(p)) >= int(num(stamps.get(p))):
         print("N:" + p)
 ' "$DECIDE_TMP" "$CUR_STORE_SHA" "$STORE_DIRTY" 2>>"$MC_LOG")
 

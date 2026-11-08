@@ -542,7 +542,10 @@ class HookTestBase(unittest.TestCase):
             path, kind = entry[0], entry[1]
             content = entry[2] if len(entry) > 2 else path
             sha = hashlib.sha256(content.encode()).hexdigest()
-            ledger.append({"path": path, "kind": kind, "content_sha256": sha, "seen_at": time.time()})
+            ledger.append({"path": path, "kind": kind, "content_sha256": sha,
+                           # seeded edits are minutes old: a verdict made now is not older than a
+                           # seen_at in the same wall second (gate round 2 R2-1)
+                           "seen_at": time.time() - 60.0})
         state.setdefault("session_id", session_id)
         state.setdefault("project", self.project)
         state.setdefault("user_turn_count", 0)
@@ -4008,6 +4011,62 @@ class TestUserPromptRemind(HookTestBase):
         calls = self._unmapped_calls(spy)
         self.assertEqual(len(calls), 2, calls)
         self.assertEqual(self._call_paths(calls[1]), [unmapped])
+
+    def _edit_through_ledger_hook(self, session_id, path):
+        proc, _ = run_script(LEDGER_HOOK, self.post_tool_use_payload(session_id, path), self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def _set_verdict_time(self, session_id, path, stamp):
+        state = json.loads(self.state_file(session_id).read_text())
+        state["unmapped_cache"]["classified_at"][path] = stamp
+        self.state_file(session_id).write_text(json.dumps(state))
+
+    def test_an_edit_in_the_same_wall_second_as_the_verdict_is_reclassified(self):
+        """Gate round 2 R2-1, through the real hooks: the ledger hook stamps a
+        fractional seen_at, and a verdict made late in second S (S+.99) does
+        not hide an edit made in that same second."""
+        spy = Path(self.td) / "unmapped-calls.log"
+        env = self._spy_env(spy)
+        session_id = "s-userprompt-incremental-same-second"
+        mapped = str(self.code_root / "src" / "mapped.py")
+        unmapped = str(self.code_root / "src" / "unmapped.py")
+        self._edit_through_ledger_hook(session_id, mapped)
+        self._edit_through_ledger_hook(session_id, unmapped)
+        self._prompt(session_id, env)
+        whole = float(int(time.time()))
+        self._set_verdict_time(session_id, unmapped, whole + 0.99)
+        self._set_verdict_time(session_id, mapped, whole + 0.99)
+        # The edit of `unmapped` lands now: at or after second `whole` (a
+        # rollover to the next second only makes it later still).
+        self._edit_through_ledger_hook(session_id, unmapped)
+        seen = {e["path"]: e["seen_at"] for e in self.load_state(session_id)["ledger"]}
+        self.assertNotEqual(seen[unmapped], float(int(seen[unmapped])), "seen_at is a whole second")
+        self.patch_state(session_id, last_injected_pairs=[])
+        self._prompt(session_id, env)
+        calls = self._unmapped_calls(spy)
+        self.assertEqual(len(calls), 2, calls)
+        self.assertEqual(self._call_paths(calls[1]), [unmapped])
+
+    def test_a_whole_second_seen_at_from_an_older_hook_still_invalidates(self):
+        spy = Path(self.td) / "unmapped-calls.log"
+        env = self._spy_env(spy)
+        session_id = "s-userprompt-incremental-old-row"
+        mapped = str(self.code_root / "src" / "mapped.py")
+        unmapped = str(self.code_root / "src" / "unmapped.py")
+        self.seed_ledger(session_id, [(mapped, "code"), (unmapped, "code")])
+        self._prompt(session_id, env)
+        whole = float(int(time.time()))
+        self._set_verdict_time(session_id, unmapped, whole + 0.75)
+        state = json.loads(self.state_file(session_id).read_text())
+        for e in state["ledger"]:
+            e["seen_at"] = 0.0
+            if e["path"] == unmapped:
+                e["seen_at"] = whole  # an older hook's whole-second stamp
+        self.state_file(session_id).write_text(json.dumps(state))
+        self.patch_state(session_id, last_injected_pairs=[])
+        self._prompt(session_id, env)
+        calls = self._unmapped_calls(spy)
+        self.assertEqual(self._call_paths(calls[1]), [unmapped], calls)
 
     def test_a_non_ok_answer_drops_the_cache(self):
         spy = Path(self.td) / "unmapped-calls.log"

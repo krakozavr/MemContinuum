@@ -290,13 +290,12 @@ esac
 # identical seven-key `state.setdefault(...)` bootstrap verbatim into
 # their own python heredoc -- factored into one snippet here, concatenated
 # into both (bash 3.2-safe `'...'"$VAR"'...'` quoting), so a future new
-# default key is added once, not twice. Codex re-gate NIT 4: the same
-# duplication applied to MC_NOW -- both branches independently exported it
-# from bash and independently re-derived a float `now` from it in python;
-# both pieces now live in exactly one place each (this export, and the
-# `now` assignment inside the shared snippet below), still concatenated
-# into both payloads.
-export MC_NOW="$(date +%s 2>/dev/null || echo 0)"
+# default key is added once, not twice. The same snippet owns `now`: ONE
+# fractional epoch (python time.time(), gate round 2 R2-1) per hook run,
+# stamped as `seen_at` on every row this run writes. It has the resolution
+# of the prompt hook's `classified_at`, so an edit in the same wall second
+# as a classification is still seen as newer (a whole-second bash `date +%s`
+# lost that race); rows written by older versions stay whole seconds.
 MC_STATE_BOOTSTRAP_PY='
 def _mc_bootstrap_state(state):
     state.setdefault("user_turn_count", 0)
@@ -307,10 +306,7 @@ def _mc_bootstrap_state(state):
     state.setdefault("last_growth_turn", 0)
     state.setdefault("lookback_count", 0)
 
-try:
-    now = float(os.environ.get("MC_NOW") or time.time())
-except Exception:
-    now = time.time()
+now = time.time()
 '
 
 if [ "$MC_SOURCE_TAG" = "shell-diff" ]; then
