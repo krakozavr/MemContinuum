@@ -431,6 +431,8 @@ class TestTypeFrozen(GuardCase):
 
     # gate round 8 R8-1 (Sol MAJOR/MINOR, Grok): spellings of a canonical type that the fallback
     # garbles all freeze through the id prefix (or the links list), never through a string reading.
+    # (A cleanly quoted `type: "topic"` is recovered as the token `topic`, which freezes it directly; the id
+    # prefix is what freezes the escaped, tagged and block-scalar spellings the fallback cannot decode.)
     def _kind_refused_and_declared(self, type_line, kind="topic", rid="TOP-0001"):
         ref = self._fallback_ref(type_line, rid=rid)
         fixed = self._title_repaired(ref)
