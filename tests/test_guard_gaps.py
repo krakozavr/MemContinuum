@@ -229,6 +229,31 @@ class TestTypeFrozen(GuardCase):
         self.store(base)
         self.assertRefused(base.replace("type: topic\n", ""), "type changed 'topic' -> None")
 
+    def test_repairing_a_fallback_parsed_record_is_not_a_type_change(self):
+        # REF: `title: bad: title` + `type: topic # comment` only parses through the lenient
+        # fallback (type recovered as the string 'topic # comment'); quoting the title is a repair
+        broken = ttext(["src/a.py"]).replace("type: topic\n", "type: topic # comment\n", 1)
+        lines = broken.split("\n")
+        for i, ln in enumerate(lines):
+            if ln.startswith("title:"):
+                lines[i] = "title: bad: title"
+        broken = "\n".join(lines)
+        res = memidx.parse_record_text(broken, "x")
+        self.assertTrue(res.fallback, res)
+        self.store(broken)
+        self.assertClean(broken.replace("title: bad: title", 'title: "bad: title"'))
+
+    def test_a_strict_type_change_is_still_refused_with_a_comment_free_ref(self):
+        base = ttext(["src/a.py"])
+        self.assertTrue(memidx.parse_record_text(base, "x").valid)
+        self.store(base)
+        self.assertRefused(base.replace("type: topic\n", "type: decision\n"), "type changed")
+
+    def test_the_same_type_value_with_different_quoting_is_clean(self):
+        base = ttext(["src/a.py"])
+        self.store(base)
+        self.assertClean(base.replace("type: topic\n", 'type: "topic"\n'))
+
     def test_an_added_file_is_free_to_have_any_type(self):
         self.store(ttext(["src/a.py"]))
         rc, out = self.guard("---\ntype: incident\nid: INC-9001\ntitle: x\n---\n\nBody.\n", rel="inc.md")

@@ -3162,8 +3162,9 @@ def _standing_guard_errors(full_path, old_fm: dict, old_text, new_fm: dict, new_
 def _type_change_errors(full_path, old_fm: dict, new_fm: dict) -> list[str]:
     """A topic's `type:` recorded at REF is frozen: it decides which index type
     the record carries, and `for-path` and the standing digest read only
-    `type: topic`. A record with no `type` at REF recorded nothing to freeze;
-    a new side that is not a mapping at all is refused elsewhere."""
+    `type: topic`. A record with no `type` at REF recorded nothing to freeze
+    (the caller also skips a REF side that parsed only through the lenient
+    fallback); a new side that is not a mapping at all is refused elsewhere."""
     old_type = old_fm.get("type")
     if old_type is None or not isinstance(new_fm, dict) or not new_fm:
         return []
@@ -3301,8 +3302,12 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
         new_result = _parse_git_blob(new_blob, path_in_root)
 
         # `type` is frozen for a topic-like file that existed at REF; judged here, before
-        # any branch below can `continue` past it (a repair, an invalid new side)
-        errors.extend(_type_change_errors(full_path, old_result.frontmatter, new_result.frontmatter))
+        # any branch below can `continue` past it (a repair, an invalid new side). Only a REF
+        # side that parsed strictly has a trustworthy `type` to freeze: the lenient fallback
+        # recovers `type: topic # comment` as the string `topic # comment`, and repairing that
+        # record must not read as a type change (the repair path below governs it).
+        if old_result.valid and not old_result.fallback:
+            errors.extend(_type_change_errors(full_path, old_result.frontmatter, new_result.frontmatter))
 
         repair_note = None
         if not old_result.valid:
