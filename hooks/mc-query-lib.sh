@@ -67,7 +67,7 @@
 #     of scope for this feature (see docs/INTERNALS.md's own note).
 #
 # mc_now_ms -- millisecond-epoch timestamp, bash-3.2-safe (no
-# $EPOCHREALTIME, added in bash 5.0). `date +%s%3N` (GNU coreutils) prints
+# $EPOCHREALTIME, added in bash 5.0; used directly when present). `date +%s%3N` (GNU coreutils) prints
 # 3 zero-padded fractional digits; BSD/macOS `date` has no `%N` at all and
 # prints the literal characters `3N` back -- probed ONCE per process via
 # MC_QUERY_MS_MODE (empty until the first call) rather than re-probing on
@@ -170,12 +170,22 @@ mc_query_tokens() {
 
 # MC_QUERY_MS_MODE -- "date" | "python", empty until mc_now_ms's first
 # call (per-process probe cache, see the header comment above).
-MC_QUERY_MS_MODE=""
+MC_QUERY_MS_MODE="${MC_QUERY_MS_MODE:-}"
 
-# mc_now_ms [PYTHON_INTERPRETER] -- millisecond-epoch on stdout. See the
-# file header comment for the GNU-%3N-vs-BSD-no-%N probe this caches.
+# mc_now_ms [PYTHON_INTERPRETER] -- millisecond-epoch on stdout, and also in
+# $MC_NOW_MS when called in the current shell (not inside $(...)), so
+# hooks/memlib.sh's elapsed timer reads it with no subshell. bash >= 5 reads
+# $EPOCHREALTIME (no fork at all); older bash uses the probe below. See the
+# file header comment for the GNU-%3N-vs-BSD-no-%N probe this caches. This is
+# the ONE "now" helper in the tree: memlib.sh's mc_elapsed_field is built on it.
 mc_now_ms() {
     local py="${1:-python3}" probe
+    if [ -n "${EPOCHREALTIME:-}" ]; then
+        MC_NOW_MS="${EPOCHREALTIME/[.,]/}"
+        MC_NOW_MS="${MC_NOW_MS%???}"
+        printf '%s\n' "$MC_NOW_MS"
+        return 0
+    fi
     if [ -z "$MC_QUERY_MS_MODE" ]; then
         probe="$(date +%3N 2>/dev/null)"
         case "$probe" in
@@ -184,8 +194,9 @@ mc_now_ms() {
         esac
     fi
     if [ "$MC_QUERY_MS_MODE" = "date" ]; then
-        date +%s%3N 2>/dev/null
+        MC_NOW_MS="$(date +%s%3N 2>/dev/null)"
     else
-        PYTHONPATH= "$py" -c 'import time; print(int(time.time() * 1000))' 2>/dev/null
+        MC_NOW_MS="$(PYTHONPATH= "$py" -c 'import time; print(int(time.time() * 1000))' 2>/dev/null)"
     fi
+    printf '%s\n' "$MC_NOW_MS"
 }

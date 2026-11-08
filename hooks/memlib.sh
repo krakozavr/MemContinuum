@@ -134,26 +134,30 @@ fi
 
 MC_DB_PATH="$MEMCONTINUUM_HOME/$MC_PROJECT.sqlite"
 
-# Script start, in microseconds (bash 5 EPOCHREALTIME; older bash: whole
-# seconds from `date`), for the `elapsed=` field the hooks log on every
-# outcome line. Exported so the ledger's embedded python can use it too.
-if [ -n "${EPOCHREALTIME:-}" ]; then
-    MC_T0_US="${EPOCHREALTIME/[.,]/}"
-else
-    MC_T0_US="$(( $(date +%s 2>/dev/null || echo 0) * 1000000 ))"
+# The ONE "now" helper is mc_now_ms (hooks/mc-query-lib.sh, pure and
+# side-effect-free like mc-path-lib.sh): bash >= 5 reads $EPOCHREALTIME with
+# no fork, older bash probes `date +%s%3N` once and falls back to python.
+# shellcheck source=mc-query-lib.sh
+. "$MC_LIB_DIR/mc-query-lib.sh"
+
+# Script start, in microseconds, for the `elapsed=` field the hooks log on
+# every outcome line. Exported so the ledger's embedded python can use it too.
+# TEST-ONLY override: a preset MC_T0_US is honoured only when
+# MEMCONTINUUM_TEST_CLOCK=1 (the backward-clock tests put the start in the
+# future instead of waiting for a real clock step).
+if [ "${MEMCONTINUUM_TEST_CLOCK:-}" != "1" ] || [ -z "${MC_T0_US:-}" ]; then
+    mc_now_ms "${MC_PY:-python3}" >/dev/null
+    MC_T0_US="$(( ${MC_NOW_MS:-0} * 1000 ))"
 fi
 export MC_T0_US
 
 # mc_elapsed_field -- prints `elapsed=<seconds, one decimal>s`, measured from
-# script start (same shape code-refresh.sh logs).
+# script start (same shape code-refresh.sh logs). Clamped at zero: a wall
+# clock that steps backwards must never print a sign.
 mc_elapsed_field() {
-    local now d
-    if [ -n "${EPOCHREALTIME:-}" ]; then
-        now="${EPOCHREALTIME/[.,]/}"
-    else
-        now="$(( $(date +%s 2>/dev/null || echo 0) * 1000000 ))"
-    fi
-    d=$(( (now - MC_T0_US) / 100000 ))
+    local d
+    mc_now_ms "${MC_PY:-python3}" >/dev/null
+    d=$(( (${MC_NOW_MS:-0} * 1000 - MC_T0_US) / 100000 ))
     [ "$d" -lt 0 ] && d=0
     printf 'elapsed=%d.%ds' $(( d / 10 )) $(( d % 10 ))
 }

@@ -273,14 +273,14 @@ case "${TOOL_NAME:-}" in
         MC_SOURCE_TAG="shell-diff"
         ;;
     "")
-        mc_log "ledger outcome=unsupported-mutation-surface tool=unknown session=${SESSION_ID:-}"
+        mc_log "ledger outcome=unsupported-mutation-surface tool=unknown $(mc_elapsed_field) session=${SESSION_ID:-}"
         MC_SOURCE_TAG="shell-diff"
         ;;
     *)
         # Any other tool name (an MCP tool, a future built-in) -- best
         # effort: named as unsupported AND still caught by the tree diff
         # below if it actually mutated something.
-        mc_log "ledger outcome=unsupported-mutation-surface tool=${TOOL_NAME} session=${SESSION_ID:-}"
+        mc_log "ledger outcome=unsupported-mutation-surface tool=${TOOL_NAME} $(mc_elapsed_field) session=${SESSION_ID:-}"
         MC_SOURCE_TAG="shell-diff"
         ;;
 esac
@@ -359,6 +359,12 @@ def log_token(value):
     for b in os.fsencode(value)[:512]:
         out.append(chr(b) if b in keep else "%%%02X" % b)
     return "".join(out) or "-"
+
+
+def elapsed_field():
+    # Python twin of memlib.sh mc_elapsed_field: seconds since script start
+    # (MC_T0_US, exported by memlib.sh), one decimal, clamped at zero.
+    return "elapsed=%.1fs" % max(0.0, time.time() - float(os.environ.get("MC_T0_US") or 0) / 1e6)
 
 
 def log_line(text):
@@ -601,7 +607,7 @@ def scan_tree(scan_dir, kind, record_root, remap):
         state["last_growth_ts"] = now
         # worktree= goes BEFORE file=: everything after file= is the path.
         log_line(
-            "ledger outcome=appended kind=" + kind + " source=shell-diff"
+            "ledger outcome=appended kind=" + kind + " source=shell-diff " + elapsed_field()
             + ((" worktree=" + log_token(scan_dir)) if remap else "")
             + " file=" + row_path
         )
@@ -717,7 +723,7 @@ _mc_bootstrap_state(state)
 log_line(
     "ledger outcome=shell-diff appended=" + str(ctr["appended"]) + " roots=" + str(len(roots))
     + " timeouts=" + str(ctr["timeouts"]) + " non-git=" + str(ctr["non_git"])
-    + " elapsed=%.1fs" % max(0.0, time.time() - float(os.environ.get("MC_T0_US") or 0) / 1e6)
+    + " " + elapsed_field()
     + " baseline-too-large=" + str(ctr["baseline_too_large"])
     + " worktrees=" + str(worktrees_scanned)
     + ((" worktrees-over-cap=" + str(worktrees_over_cap)) if worktrees_over_cap else "")
