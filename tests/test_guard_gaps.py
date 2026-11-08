@@ -274,7 +274,7 @@ class TestTypeFrozen(GuardCase):
         self.assertRefused(fixed.replace("type: topic\n", "type: incident\n", 1),
                            "type changed 'topic' -> 'incident'")
 
-    def test_a_fallback_ref_with_a_garbage_recovered_type_is_not_frozen(self):
+    def test_a_fallback_ref_with_a_garbage_recovered_type_is_frozen_through_the_id_prefix_and_must_declare_topic(self):
         broken = self._bad_title(ttext(["src/a.py"]), type_line="type: banana # note")
         res = memidx.parse_record_text(broken, "x")
         self.assertTrue(res.fallback, res)
