@@ -1695,11 +1695,11 @@ prompt and ledger hooks log `elapsed=<seconds>s` on every outcome line, so the n
 the log. Two changes keep the work itself small on such a mount: `memidx.py unmapped` resolves each
 distinct directory once per call (a symlinked file or directory still resolves to the same root), and the
 prompt hook keeps its per-path verdicts in the session file (`unmapped_cache`) so a prompt classifies only
-the paths edited since the previous one. The prompt hook always makes one `unmapped` call, with the new
-paths or with none, because that call is also the index-state check and the stale self-heal; cached
+the paths edited since the previous one. Whenever the prompt hook consults the cache it makes one `unmapped` call, with the new
+paths or with none (a prompt that is not a coverage candidate reads no cache and makes no call), because that call is also the index-state check and the stale self-heal; cached
 verdicts are reused only while the store HEAD is unchanged, the store worktree is clean (a bind being filed
 is uncommitted by construction), the call did not heal the index (`healed` in its JSON), and the path was not
-edited again since its verdict (`classified_at` against the ledger `seen_at`). Anything else reclassifies
+edited again since its verdict (the ledger `seen_at` and `classified_at` are both fractional epoch seconds; a path is new when `seen_at >= floor(classified_at)`, so whole-second rows from older hook versions still invalidate). Anything else reclassifies
 every path and rebuilds the cache. A directory listing is only a fast path for names it contains; a name it
 does not contain is checked with `lstat`, because a Unicode-normalising or case-insensitive mount can
 resolve a spelling the listing does not show.

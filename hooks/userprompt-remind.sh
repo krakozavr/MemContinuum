@@ -116,12 +116,15 @@
 # populated around a compaction) -- but only once cooldown+growth already
 # passed, via ONE `memidx.py unmapped` call (self-healing) per such turn. The
 # call carries only the code paths NEW since the previous prompt (or none at
-# all: it is the index-state check and the stale self-heal either way); the
+# all: it is the index-state check and the stale self-heal either way; the
+# contract is "the engine is consulted whenever the cache is": a prompt that
+# is not a coverage candidate reads no cache and makes no call); the
 # verdicts of the other paths come from the session's unmapped_cache, which is
 # reused only while the store HEAD is unchanged, the store worktree is clean
 # (git status --porcelain, untracked included), the call did not heal the
-# index and the path was not edited again since its verdict (classified_at vs
-# the ledger seen_at); otherwise every path is reclassified and the cache
+# index and the path was not edited again since its verdict (the ledger
+# seen_at, fractional epoch seconds like classified_at, is not older than the
+# whole second of classified_at); otherwise every path is reclassified and the cache
 # rebuilt. The classification therefore only runs on turns that were already
 # going to inject something, and costs only what is new.
 #
@@ -871,7 +874,7 @@ for p in d.get("code_paths", []):
     UC_HEALED="false"
     COVERAGE_STATUS=""
     # One engine call: with the paths new since the last prompt, or with none
-    # at all -- it is ALWAYS made, because the call is also the index-state
+    # at all -- it is made whenever the cache is consulted, because the call is also the index-state
     # check and the stale self-heal that every reused verdict depends on.
     # Sets RC, UC_RAW, COVERAGE_STATUS and UC_HEALED; no logging (the caller
     # logs once, for the final answer).
