@@ -33,6 +33,8 @@ tags: []
 standing: [L4]               # optional — this topic's OWN link ids that are true of the whole project, always (§7)
 standing_marks:              # optional — the audit of changes to `standing:` (see "Standing marks" below)
   - {link: L4, action: add, ...}
+ref_marks:                   # optional — the audit of changes to `code_refs:` (see "Reference marks" below)
+  - {ref: src/core/scan/, action: add, ...}
 ```
 
 A prefix and a glob keep serving retrieval exactly as before — `for-path`/`unmapped` match either
@@ -77,11 +79,55 @@ standing_marks:
 A row is identified by `(link, action, recorded_at)`; repeated transitions (add, remove, add again)
 are legitimate, each its own row. `authority` is limited to the two owner authorities because a
 standing link reaches every session start of every project. `memidx.py mark-standing` is the one
-writer (`memidx.py mark-standing TOP-xxxx Ln --add|--remove --authority A --source TEXT --why TEXT
---root STORE [--dry-run]`): it edits the `standing:` line in place (a flow list stays a flow list, a
-block list a block list, `standing: []` when the last id goes), prepends one row, prints the diff and
-commits nothing. One call is one row; a supersession is two calls — `--remove` the old link,
-`--add` its successor — before one commit.
+writer (`memidx.py mark-standing TOP-xxxx Ln --add|--remove --session ID (--yes-message UUID |
+--owner-message UUID --quote TEXT) --why TEXT --root STORE [--source NOTE] [--dry-run]`): it edits
+the `standing:` line in place (a flow list stays a flow list, a block list a block list, `standing: []`
+when the last id goes), prepends one row, prints the diff and commits nothing. One call is one row;
+a supersession is two calls — `--remove` the old link, `--add` its successor — before one commit.
+
+The authority is **derived, never typed**: there is no `--authority` option (it was removed in
+0.6.0; a script that passed it must pass the session flags instead). The command reads the Claude
+Code session transcript the same way the filing commands do: a `--yes-message` uuid must be a human
+message (`owner-ratified`), an `--owner-message` uuid must be a human message that contains `--quote`
+as an exact substring (`owner-verbatim`). Standing needs an owner tier, so a derivation that fails or
+is not given refuses and writes nothing. The row's `source` is the derived source line (message uuid,
+session, timestamp, plus the optional `--source` note); the quote is checked and never stored.
+
+### Reference marks — the audit of `code_refs:` membership changes
+
+`code_refs:` decides which files a topic is delivered for, so a change to it leaves a row in
+`ref_marks:`, a block list written immediately after `code_refs:`, newest row first. Like standing
+marks, rows are never delivered and never indexed.
+
+```yaml
+code_refs:
+  - "src/core/scan/scan_plan.py"
+ref_marks:
+  - ref: "src/core/scan/scan_plan.py"
+    action: add                       # add | remove
+    date: 2026-11-07                  # the date part of recorded_at as written
+    recorded_at: "2026-11-07T09:12:41-05:00"
+    recorded_by: memidx
+    authority: agent-inference        # any of the five; the owner tiers when derived from a session
+    source: "memidx bind"
+    why: "bound by memidx bind"
+```
+
+A row is identified by `(ref, action, recorded_at)`. `memidx.py bind` prepends an `add` row in the
+same edit that inserts a reference, and `memidx.py unbind TOP-xxxx REF` deletes exactly that
+`code_refs` item and prepends a `remove` row; both accept `--why`, `--source`, `--recorded-by` and the
+optional derivation flags of `mark-standing` (without them, or when a derivation fails, the row is
+`agent-inference`; a failed derivation warns). `unbind` touches no anchor — the frozen capture stays
+as history — and may unbind a prefix or a glob. `bind` of a reference whose anchor for the current
+link already exists (an unbound one) **restores** it: the reference and an `add` row come back, no
+second anchor is written (one baseline per `(ref, link)`; a new baseline is a new link).
+
+Under `--against-ref` the membership change must be paired with rows exactly as `standing:` is (g2
+below), on the **set** of `code_refs` entries (prefixes and globs included): one `add` row per entry
+in new-minus-old, one `remove` row per entry in old-minus-new, no more. Reordering the same entries
+needs no row. Rows recorded at `REF` are frozen by fields and bytes. A brand-new topic needs an `add`
+row per `code_refs` entry. Plain lint never requires rows: existing membership needs no historical
+rows, and the first later change needs them even on a topic with no `ref_marks:` yet.
 
 ### Anchors — what a code reference pointed at when it was bound
 
@@ -111,7 +157,9 @@ later from ledgered history, never the bytes at the original ruling). Only a sin
 "not checked". A `path#symbol` reference whose symbol has no chunk at capture is captured as
 `span: file`; one that matches two or more chunks gets no row ("symbol ambiguous").
 
-`memlint.py` errors on: a `ref` not present verbatim in the topic's `code_refs`; a `link` not in
+`memlint.py` errors on: a `ref` not present verbatim in the topic's `code_refs` (unless the NEWEST
+`ref_marks:` row for that ref is a `remove` — an unbound reference keeps its frozen capture as
+history, and a later `add` row re-arms the requirement); a `link` not in
 `links`; `algo` other than `sha256`; a `digest` that is not 64 lowercase hex characters; an unknown
 `span`, `captured` or `worktree`; a row for a prefix or glob reference; two rows for the same
 `(ref, link)`; `span: symbol` without `chunker_version`; a row without `captured_at`
@@ -283,6 +331,11 @@ copied inline.
   U+0085 NEL, a tab) is not an error here — `memidx.py standing` collapses it to one space at
   projection time, so it still reaches an agent's context as a single physical line
 - a `standing:` list naming the same link id twice → error
+- a `ref_marks:` row (never required) that is not a mapping, lacks one of the eight fields, carries
+  an unknown field, has an `action` other than `add`/`remove`, an `authority` outside the five, a
+  `ref` that is not a string or names no path, an empty `source` or `why`, a `why` containing CR or
+  LF, a `recorded_at`/`date` of the wrong shape (as for `standing_marks:`), or the same
+  `(ref, action, recorded_at)` as another row → error naming the row
 - a `standing_marks:` row (never required — a topic marked before the block existed has none and is
   clean, §7's grandfathering rule) that is not a mapping, lacks one of the eight fields, carries an
   unknown field, has an `action` other than `add`/`remove`, an `authority` other than
@@ -376,6 +429,15 @@ pre-commit hook reads):
   set unchanged is two orphans. Reordering `standing:` with the same set needs no row. A brand-new
   topic needs one `add` row per `standing:` id; rows beside an empty `standing:` are orphans; a new
   topic with no `standing:` stays free.
+- *`code_refs:` changes are paired with `ref_marks:` rows, and the rows are frozen.* The same two
+  rules (g1 and g2, one implementation) judge `ref_marks:` against the set of `code_refs` entries:
+  `code_refs changed for src/b.py (add) with no matching ref_marks row`, `orphan reference mark
+  (src/b.py, add): code_refs: did not change that way`, `duplicate reference mark for (src/b.py, add)
+  in one commit`, and the frozen-row messages with `reference mark (<ref>, <action>, <recorded_at>)`.
+  Existing membership needs no rows.
+- *`type` is frozen.* A `type:` recorded at `REF` on a topic-like file (one that has `links:`) may not
+  change or be dropped: `type changed 'topic' -> 'investigation' after being recorded`. A file added
+  after `REF` is free, and so is a record that had no `type` at `REF`; plain lint is unchanged.
 - *Link order is frozen (g3).* The link ids present at `REF` must keep their relative order in the
   new blob (new links go on top; the older newest-first check refuses one placed between old ids): `<path>: links reordered (L2 before
   L3; the chain head is first-active-in-file-order)`. The chain head is the first active link in file
@@ -388,7 +450,7 @@ pre-commit hook reads):
   to a topic that lacked it is a repair.
 - *The plain-mode rules run on the staged blob too.* The store hook lints only the working tree, so
   for every modified or added topic the guard itself applies the `standing_marks:` row rules
-  (including owner-only `authority`), the duplicate-id and eligibility rules for `standing:`
+  (including owner-only `authority`) and the `ref_marks:` row rules, the duplicate-id and eligibility rules for `standing:`
   pointers, and, for an added topic, `current:` equal to its newest active link. When `REF` parsed
   to a mapping whose links are unrecoverable, `standing:`, marks and `current:` are still compared;
   when `REF` was only readable through the lenient fallback parse the old membership is unknown, so
@@ -397,14 +459,16 @@ pre-commit hook reads):
 
 Grandfathering (a stricter check judges only what is written after it): a topic marked before this
 block existed has no rows and produces no error and no warning — rows are required only for a
-`standing:` change made from now on. The boundary: this guard covers `standing`, `current` and link
-order only; a change of `type` can still drop a topic from the standing digest and is not guarded
-(`project` comes from the command argument at index time, never from the file).
+`standing:` or `code_refs:` change made from now on, and a `type` recorded before the freeze is
+frozen from now on. The boundary: this guard covers `standing`, `code_refs`, `type`, `current` and
+link order; `area`, `title` and `tags` are free (`area` filters a search and names the record's
+directory, but decides neither delivery nor the standing digest; `project` comes from the command
+argument at index time, never from the file).
 
 **Known limit: a repaired record is not guarded for links, anchors or standing marks.** When the
 blob at `REF` could not be parsed cleanly (it never parsed as a mapping, or only through the lenient
 fallback parse) and the new blob parses cleanly, the guard reports a `repaired` note and treats the
-edit as a repair. The lenient parse never recovers `links`, `anchors` or `standing_marks` (they are
+edit as a repair. The lenient parse never recovers `links`, `anchors`, `standing_marks` or `ref_marks` (they are
 complex fields), so the old side of every comparison is empty: a removed link, a removed `anchors:`
 block and a removed `standing_marks:` block all pass with only the note. The new blob's own rules
 still run (every link in it is judged as new, `standing:` and `current:` are checked, and its marks

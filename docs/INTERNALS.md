@@ -2787,7 +2787,7 @@ id:
 | a link present at `REF` is missing now | error, `<path>:<link>: link removed after being recorded` |
 | a topic-like record present at `REF` is deleted or renamed | error naming the path and its real kind (`topic`/`incident`/`investigation`/`concept`, or `record` when the kind itself could not be recovered) — `--no-renames` means a rename is a plain delete + a plain add, so one rule covers both |
 | a duplicate link id within one topic on the NEW side | error naming the id, `<path>: duplicate link id '<id>' used <n> times` — the same `memidx.validate_record_shape` diagnostic every consumer shares |
-| a valid forward `status` move (with `superseded_by` added when the new status is `superseded`), `promoted_by` added, alone on the link; new links (above every recorded one); changes to `title`, `tags`, `code_refs`, or the body text | free (`standing`, `current` and link order are guarded by the rows below) |
+| a valid forward `status` move (with `superseded_by` added when the new status is `superseded`), `promoted_by` added, alone on the link; new links (above every recorded one); changes to `title`, `tags`, `area` or the body text | free (`standing`, `code_refs`, `type`, `current` and link order are guarded by the rows below) |
 | a link present at `REF` has its PARSED fields unchanged but its RAW TEXT SPAN changed (a YAML dumper re-render: different quoting, key order, wrapping, or a whitespace-only edit, with identical parsed content) | error, `<path>:<link>: link reformatted, not appended` — the field-level comparison above never fires for these (every field is equal), so the span is compared byte-for-byte separately; a span that cannot be safely attributed to its link on the `REF` side (structural extraction inconclusive — see below) skips this comparison with a NOTE, never an error — the field-level rules above still apply |
 | the same, but the span cannot be attributed on the NEW side (structural extraction inconclusive there instead) while the `REF` side extracted fine | error, `<path>:<link>: link's span could not be extracted on the new side; treated as changed` — a deliberately different message from the row above: this is a proven extraction FAILURE treated as a change (fail closed), never a claim that the bytes were actually compared and found to differ |
 | an `anchors:` row present at `REF` is missing now, has a changed parsed field, or has the same fields in different raw text; or two rows now carry one `(ref, link)` | error naming the row, `<path>: anchor (<ref>, <link>): row changed after being recorded` / `row reformatted, not appended` / `more than one row` — the same raw-span walker as the links row above, keyed by `anchors:` and by `(ref, link, captured, captured_at)`; new rows are free; row multiplicity at `REF` is kept, so a duplicated pair reduced to one row errors as removed |
@@ -2795,13 +2795,15 @@ id:
 | the link ids present at `REF` appear in a different relative order now (g3, `_link_order_errors`) | error, `<path>: links reordered (L2 before L3; the chain head is first-active-in-file-order)` — every per-link span can be intact while the chain head moves |
 | a `standing_marks:` row present at `REF` is missing now, has a changed parsed field, has the same fields in different raw text, or the rows are reordered or a new row sits below an old one (g1, `_standing_marks_freeze_errors`) | error, `<path>: standing mark (<link>, <action>, <recorded_at>): row changed after being recorded` / `row removed after being recorded` / `row reformatted, not appended`, `marks not prepended`, `recorded rows reordered` — the same raw-span walker as links and anchors (`key="standing_marks"`, identity `(link, action, recorded_at)`) through the shared `_frozen_rows_errors`; unlike anchors, a block the walker cannot account for at `REF` or in the new blob is an error, not a note; on the repair path (`REF` never parsed, or only through the lenient fallback) it runs against EMPTY old rows, because `standing_marks` is in `FALLBACK_COMPLEX_FIELDS` and is never recovered there, so a removed block passes with only the note — see the known limit in SCHEMA §7 |
 | the `standing:` set changed without exactly one matching new row per added/removed id (g2, `_standing_pairing_errors`) | error, `standing changed for L4 (add) with no matching standing_marks row` / `orphan standing mark (L4, add): standing: did not change that way` / `duplicate standing mark for (L4, add) in one commit`; a remove+add of one id with the set unchanged is two orphans; a reorder with the same set is free; a brand-new topic is paired against an empty `REF` set |
+| a `ref_marks:` row present at `REF` is missing, changed, reformatted, reordered or a new row sits below an old one; or the SET of `code_refs` entries changed without exactly one matching new row per added/removed entry (`_standing_marks_freeze_errors` and `_standing_pairing_errors` called with `audit=_REF_AUDIT`, through `_standing_guard_errors`) | the same messages as the two `standing` rows above with `reference mark (<ref>, <action>, <recorded_at>)`, `code_refs changed for <ref> (add) with no matching ref_marks row`, `orphan reference mark`, `duplicate reference mark`; prefix and glob entries count; a reorder of the same set is free; existing membership needs no rows (the first later change needs rows even on a topic with no `ref_marks:` yet); a brand-new topic is paired against an empty set; the repair path freezes the rows against empty old rows like `standing_marks` |
+| a topic-like file present at `REF` has a different `type:` now (`_type_change_errors`, judged right after the new blob is parsed, before any branch that can `continue`) | error, `<path>: type changed 'topic' -> 'investigation' after being recorded`; an added file and a record with no `type` at `REF` are free; plain lint is unchanged and nothing is backfilled |
 | `current:` names a link other than the staged blob's newest active link, or changes (including removal) without a change of the newest active link and without repairing a disagreement already present at `REF` (g4, `_current_discipline_errors`) | error, `<path>: current: 'L2' does not match the newest active link of the staged file -- should be 'L3'` / `<path>: current changed L3 -> L2 without a change of the newest active link` |
-| the new (staged) blob of a modified or added topic carries a malformed `standing_marks:` row (missing or unknown field, bad `action`, `authority` not `owner-verbatim`/`owner-ratified`, empty `source`/`why`, CR/LF in `why`, a non-string `recorded_by`, bad `recorded_at`/`date`, a `link` not in the topic, a repeated identity), a repeated id in `standing:`, or a `standing:` pointer that is not an eligible link (`_staged_standing_errors`, built on `_standing_marks_errors` and `_standing_pointer_errors`, the same functions `lint_topic` calls) | error naming the row or pointer, judged on the staged blob under `--staged` — the pre-commit hook lints only the worktree copy, so an agent-inference row staged and then edited in the worktree is still refused |
+| the new (staged) blob of a modified or added topic carries a malformed `standing_marks:` row (missing or unknown field, bad `action`, `authority` not `owner-verbatim`/`owner-ratified`, empty `source`/`why`, CR/LF in `why`, a non-string `recorded_by`, bad `recorded_at`/`date`, a `link` not in the topic, a repeated identity) or `ref_marks:` row (the same checks through the shared `_mark_rows_errors`, with any of the five authorities and a `ref` that names a path), a repeated id in `standing:`, or a `standing:` pointer that is not an eligible link (`_staged_standing_errors`, built on `_standing_marks_errors` and `_standing_pointer_errors`, the same functions `lint_topic` calls) | error naming the row or pointer, judged on the staged blob under `--staged` — the pre-commit hook lints only the worktree copy, so an agent-inference row staged and then edited in the worktree is still refused |
 | an ADDED topic carries a `current:` that is not its newest active link | error, `current: 'L2' does not match the newest active link of the staged file` (`_staged_head_errors`); an added topic is also paired (`standing:` needs one `add` row per id) |
 | the `REF`-side blob failed validation but parsed to a mapping whose `links` are absent, empty or id-less (shape (i)) | not a repair: full g1–g4 against that mapping's own `standing`, `standing_marks` and `current`, with no old links (every link is new); a note says so |
 | the `REF`-side blob parsed only through the lenient YAML fallback (or to no mapping) and the new blob parses cleanly (shapes (ii)/(iii)) | the repair note above, plus the note `standing membership at REF unrecoverable (fallback parse); pairing not checked`; g1, the row and pointer rules and `current:` equal to the staged newest active link (`_staged_head_errors`) still run on the new blob; only pairing cannot |
 | the `REF`-side blob failed full validation (a shape error, or a duplicate link id) but its `links` field itself still recovers at least one usable entry | not a repair — those recovered links (a duplicate id keeps its FIRST occurrence, file order) are still compared against the new side by every rule above, exactly as if the REF blob had parsed cleanly, with a note naming the REF-side diagnostic that made the blob invalid |
-| the `REF`-side blob never parsed as a mapping, or parsed only through the lenient YAML fallback (shapes (ii)/(iii) above), and the new blob now parses cleanly | a note, not an error (`repaired — the blob at REF could not be safely parsed …`) — nothing here was ever recorded link history to freeze, so fixing it is a repair, never an append-only violation. Known limit: `links`, `anchors` and `standing_marks` are in `FALLBACK_COMPLEX_FIELDS` (`memidx.py`) and are never recovered by the lenient parse, so on this branch the anchors and marks freezes (`_anchor_freeze_errors`, `_standing_marks_freeze_errors`) compare against EMPTY old rows and are vacuous: a removed link, a removed `anchors:` block or a removed `standing_marks:` block passes with only the note. The new blob's own rules (added links judged as new, `standing:`/`current:` checks, plain-mode marks rules) still run |
+| the `REF`-side blob never parsed as a mapping, or parsed only through the lenient YAML fallback (shapes (ii)/(iii) above), and the new blob now parses cleanly | a note, not an error (`repaired — the blob at REF could not be safely parsed …`) — nothing here was ever recorded link history to freeze, so fixing it is a repair, never an append-only violation. Known limit: `links`, `anchors`, `standing_marks` and `ref_marks` are in `FALLBACK_COMPLEX_FIELDS` (`memidx.py`) and are never recovered by the lenient parse, so on this branch the anchors and marks freezes (`_anchor_freeze_errors`, `_standing_marks_freeze_errors`) compare against EMPTY old rows and are vacuous: a removed link, a removed `anchors:` block or a removed `standing_marks:`/`ref_marks:` block passes with only the note. The new blob's own rules (added links judged as new, `standing:`/`current:` checks, plain-mode marks rules) still run |
 | frontmatter that does not parse on the new side, or on both sides | error, the typed-parse diagnostic — never a traceback |
 | a record whose recoverable kind is not topic-like (`type: incident`/`investigation`/`concept` with no `links:`) | out of scope for this check entirely — there is no recorded link history to protect, so neither an error nor a note |
 | `--code-root` given together with `--against-ref` | exit 2 — append-only mode never uses a code root, and the flag is rejected rather than silently ignored |
@@ -3650,6 +3652,42 @@ in the code root and `worktree` is the file's `git status --porcelain`
 (`clean`/`dirty`, or `unknown` outside git). Capture is the only anchor code
 that may run a chunker (`capture_anchor_row`).
 
+**Reference marks, `unbind` and the restore.** `code_refs:` decides what a topic
+is delivered for, so a membership change leaves a row in `ref_marks:` (SCHEMA §2
+"Reference marks"), the sibling of `standing_marks:` and judged by the SAME code:
+`_standing_marks_freeze_errors`, `_standing_pairing_errors` and
+`_standing_guard_errors` take an audit spec (`_STANDING_AUDIT`, `_REF_AUDIT`: block
+name, membership field, id field, noun, span identity, row and membership
+readers) and `_mark_rows_errors` is the one plain-mode row validator behind both
+blocks (standing keeps its owner-only authority; a reference accepts all five).
+`bind` prepends one `add` row in the same line-insertion edit that inserts the
+ref (`insert_ref_mark`, `_after_block_key("code_refs", "ref_marks")` places a new
+block); when an anchor for `(ref, current link)` already exists but the ref was
+unbound, `bind` no longer exits 0 — it restores the reference and its row and
+writes no second anchor, so `anchor_row_key` / `anchor_pick_row` /
+`bound_edit_problem` still see exactly one row per `(ref, link)`. `unbind`
+(`cmd_unbind`) deletes exactly that `code_refs` item (`remove_code_ref`, the
+block-item delete beside `insert_code_ref`; a non-empty flow list is refused as
+`insert_code_ref` refuses it) and prepends a `remove` row; it allows a prefix or
+glob and never touches an anchor. Plain lint lets an anchor's ref be absent from
+`code_refs` only when the NEWEST `ref_marks` row for it is a `remove`
+(`ref_latest_action`: rows are append-only, so "ever removed" would excuse a ref
+that went missing again after a re-bind). `for-path` needed no change: it builds
+anchor notes from the current `code_refs` only. `bind`, `unbind` and
+`mark-standing` share `new_audit_row`, `mark_authority` and `audit_row_problem`
+(the round-trip proof).
+
+**Derived authority for rows.** `mark-standing` has no `--authority`: it takes
+`--session` and `--yes-message UUID`, or `--owner-message UUID --quote TEXT`,
+through `derive_mark_tier`, an adapter over `derive_owner_tier` (which reads a
+ruling text: the adapter passes the operation as the shown text for a ratified
+derivation and REQUIRES an explicit quote for a verbatim one). A standing row
+needs an owner tier, so a derivation that fails or is not given refuses
+(`mark_authority(strict=True)`, as `promote` does). `bind` and `unbind` accept the
+same flags optionally and record `agent-inference` without them; a derivation
+that was asked for and failed warns. The row stores `source` only, never the
+quote.
+
 **`propose-bindings`.** `memidx.py propose-bindings --session ID --root STORE
 --project NAME [--code-root DIR ...] [--write-inbox]` reads one session file
 (`$MEMCONTINUUM_HOME/sessions/<project>/<ID>.json`) and prints suggestions; no
@@ -3929,7 +3967,9 @@ transcript cannot establish the tier, `append`/`record` file an
 `record` a `suggestion: append <id> instead of record`). After a write: a
 no-embed reindex and a title search; a miss is a warning (rc 3 under
 `--require-retrieve`). When the new link could be standing the exact
-`mark-standing` command is printed; the filing command never marks anything.
+`mark-standing` command is printed with the session flags of the filing run
+(`--session ID --yes-message UUID`, or `--owner-message UUID --quote <the exact
+words>`); the filing command never marks anything.
 `--session` also prints the read-only binding proposals (`session_proposal_lines`,
 shared with `propose-bindings`). Each run appends one `filing` line to hook.log
 (outcome, ids, authority, derived, dedupe_top, retrieval, project; a refusal adds
@@ -3983,8 +4023,15 @@ first; `restored` and `amended` carry no such rule.
 `--help` on each subcommand is the flag reference. The semantics worth writing
 down:
 
-- **`mark-standing TOP-xxxx Ln (--add | --remove) --authority A --source TEXT
-  --why TEXT --root STORE [--recorded-by NAME] [--dry-run]`** — the one writer
+- **`unbind TOP-xxxx REF --root STORE --project NAME [--why TEXT] [--source NOTE]
+  [--session ID --yes-message UUID | --owner-message UUID --quote TEXT]
+  [--recorded-by NAME] [--dry-run]`** — delete the `code_refs` item REF
+  (verbatim, a prefix or glob included) and prepend its `remove` row; a REF that
+  is not bound prints a message and exits 0 with nothing written. See "Reference
+  marks, `unbind` and the restore".
+- **`mark-standing TOP-xxxx Ln (--add | --remove) --session ID (--yes-message UUID
+  | --owner-message UUID --quote TEXT) --why TEXT --root STORE [--source NOTE]
+  [--code-root DIR] [--recorded-by NAME] [--dry-run]`** — the one writer
   of a topic's `standing:` membership and its `standing_marks:` audit. `--add`
   requires the link to be eligible exactly as `memlint.py` judges a `standing:`
   pointer (`standing_link_problems`); an already-standing add or an absent
@@ -3997,7 +4044,9 @@ down:
   (`_scalar_token`: `''` in a single-quoted item is `'`, backslash escapes in a
   double-quoted one are decoded, a plain item is its text), so `'it''s'` and
   `"a\"b"` are removable by `it's` and `a"b`; the remaining items are kept
-  byte for byte. `--why` and `--source` are one line each. The edit is re-parsed
+  byte for byte. `--why` and `--source` are one line each. The row's authority
+  is derived from the session transcript (no typed `--authority`; removed in
+  0.6.0), and its `source` is the derived source line. The edit is re-parsed
   and must round-trip (the new `standing` list, the new row first and once,
   every earlier row unchanged) before the file is written; nothing is
   committed. A supersession is two calls before one commit.

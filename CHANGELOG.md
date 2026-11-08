@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+### Changes to a topic's code references leave a record
+
+A topic's `code_refs` decide which files its decisions are delivered for, but a
+reference could be added or dropped without a trace. Now every change leaves a
+dated, attributed row in a new `ref_marks:` block, and the store's commit check
+refuses a change to `code_refs` that has no matching row. `bind` writes the row
+itself. The new `unbind` command takes one reference off a topic (a path, a
+`path#symbol`, a prefix or a glob), records a `remove` row and leaves the frozen
+anchor in place as history; binding the same file again restores the reference
+without capturing a second baseline. Existing topics need no rows until their
+next change. A topic's `type` can no longer be changed once recorded.
+
+**Breaking:** `mark-standing` no longer takes `--authority`. The authority of a
+standing change is read from the session transcript like a filed link: pass
+`--session ID` with `--yes-message UUID`, or `--owner-message UUID --quote TEXT`.
+A change that cannot be confirmed from the transcript is refused. The command
+the filing tools print has been updated to match.
+
+    Technical: `ref_marks:` rows `{ref, action, date, recorded_at, recorded_by, authority, source, why}` (SCHEMA "Reference marks"); the guard reuses `_standing_marks_freeze_errors` / `_standing_pairing_errors` / `_standing_guard_errors` through an audit spec, pairing on the SET of `code_refs`; `memidx.py unbind`, `remove_code_ref`, `insert_ref_mark`; an anchor's ref may be absent from `code_refs` when the newest `ref_marks` row for it is a `remove`; `_type_change_errors`; `derive_mark_tier` adapts `derive_owner_tier`; `bind`/`unbind` accept the derivation flags optionally (`agent-inference` without them).
+
 ### A rejected option is refused when it comes back
 
 When you file a link, the command now lists the options the candidate topics
