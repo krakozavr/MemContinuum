@@ -3957,15 +3957,22 @@ after the dedupe block and before the diff. The one refusal (`rc 1`, reason
 never flagged; there is no substring, case-fold or semantic test. Reopening a
 rejection is a link with `reverses` and a `reason_for_change`. The same rule
 runs at commit for hand edits: an error under `--against-ref` for a link absent
-at REF (its own topic; every other topic too for a brand-new file) and a
-warning in plain mode (old links are not re-judged as errors), the same severity split as the two
-kind and question checks. Each filing run that reached the lookup appends one
+at REF (its own topic; every other topic too for a brand-new file, read from
+the index under `--staged` and from the working tree otherwise) and a
+warning in plain mode, for the link's own topic and for every other topic alike
+(old links are not re-judged as errors), the same severity split as the two
+kind and question checks. Any `reverses` exempts a link, whichever link it
+names: the author's claim is the sanctioned reopening and the chain shows it.
+Each filing run that reached the lookup appends one
 `declined-lookup` line to hook.log (outcome `none|shown|flagged|bypass`, a
 16-hex digest of the normalised title and ruling, the store revision, the ids of
-the topics whose rejections were shown or flagged joined with `_`, the count
+at most three topics whose rejections were shown or flagged joined with `_`
+(`ids_total` gives the count when more matched), the count
 shown, project); it never carries a sentence, and it proves a lookup ran, not
-that anyone read it. `bypass` marks an explicit topic id that skipped fuzzy
-retrieval; flagged outranks bypass, bypass outranks shown.
+that anyone read it. A run refused before the lookup (an unknown topic, a parse
+failure) writes no `declined-lookup` line, so `outcome=none` always means a
+completed lookup with nothing to show. `bypass` marks an explicit topic id that
+skipped fuzzy retrieval; flagged outranks bypass, bypass outranks shown.
 
 A `kind: reversed` link is refused (by memlint's rule) while its target is still
 `active` or `provisional`, so supersede the old link by hand in the same commit
