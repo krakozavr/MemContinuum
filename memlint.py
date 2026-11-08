@@ -3661,9 +3661,10 @@ Append-only history mode (a second, independent check -- given
                      status, superseded_by, promoted_by -- may each move
                      forward once. A link removed, or a topic file deleted
                      or renamed, is an error. New links (above every recorded
-                     one), and changes to title/tags/code_refs/the body text
-                     outside a link, are free; a `standing:` change needs its
-                     `standing_marks:` rows, link order is frozen, and `current`
+                     one), and changes to title/tags/the body text
+                     outside a link, are free; a `code_refs` change needs its
+                     `ref_marks:` rows, a recorded topic's `type` is frozen, a
+                     `standing:` change needs its `standing_marks:` rows, link order is frozen, and `current`
                      moves only with the newest active link. A REF that never parsed is repaired
                      (a note, not an error) when the new side now parses
                      cleanly -- there is no recorded link history to

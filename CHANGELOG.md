@@ -20,7 +20,7 @@ standing change is read from the session transcript like a filed link: pass
 A change that cannot be confirmed from the transcript is refused. The command
 the filing tools print has been updated to match.
 
-    Technical: `ref_marks:` rows `{ref, action, date, recorded_at, recorded_by, authority, source, why}` (SCHEMA "Reference marks"); the guard reuses `_standing_marks_freeze_errors` / `_standing_pairing_errors` / `_standing_guard_errors` through an audit spec, pairing on the SET of `code_refs`; `memidx.py unbind`, `remove_code_ref`, `insert_ref_mark`; an anchor's ref may be absent from `code_refs` when the newest `ref_marks` row for it is a `remove`; `_type_change_errors`; `derive_mark_tier` adapts `derive_owner_tier`; `bind`/`unbind` accept the derivation flags optionally (`agent-inference` without them).
+    Technical: `ref_marks:` rows `{ref, action, date, recorded_at, recorded_by, authority, source, why}` (SCHEMA "Reference marks"); the commit check pairs rows with the SET of `code_refs` using the same pairing and freeze rules as `standing_marks:`, so reordering needs no row and prefix and glob references count; `memidx.py unbind TOP-xxxx REF [--why] [--dry-run]`; an anchor's ref may be absent from `code_refs` when the newest `ref_marks` row for it is a `remove`; `memlint.py --against-ref` also refuses a changed `type` on a recorded topic; `mark-standing` reads its authority through the same session derivation as `record`; `bind`/`unbind` accept the derivation flags optionally (`agent-inference` without them).
 
 ### A rejected option is refused when it comes back
 

@@ -377,8 +377,8 @@ coupling: §5 step 3's promotion procedure appends a new link and adds
 own status; it is immutable once set, exactly like `superseded_by`. A
 lifecycle move must be the only change on the link; bundled with any body
 edit, both get their own error. A link removed, or a topic file deleted or
-renamed, is an error naming the path. New links, and changes to `title`, `tags`, `code_refs`, or the
-body text, are free; `standing`, `current` and link order are guarded as below. A store's own git
+renamed, is an error naming the path. New links, and changes to `title`, `tags`, or the
+body text, are free; `code_refs` membership (a `ref_marks:` row per added or removed reference), `type`, `standing`, `current` and link order are guarded as below. A store's own git
 `pre-commit` hook (`hooks/pre-commit-append-only.sh`, wired by
 `scripts/repo-init.sh` the same way `post-commit-reindex.sh` is) runs this on
 every commit and blocks the ones that fail it; the same check can run again in
