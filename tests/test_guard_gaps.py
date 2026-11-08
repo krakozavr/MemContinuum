@@ -713,6 +713,18 @@ class TestUnbind(BindCase):
         self.assertIn("flow list", err)
         self.assertEqual(self.text(), before)
 
+    def test_a_multi_line_quoted_reference_is_not_unbindable_and_nothing_is_written(self):
+        # gate round 3 R3-4: the folded quoted scalar parses to `docs/* # drafts`, but the editor
+        # compares one physical line, so unbind refuses (fail-closed) until it is on one line
+        ref = "docs/* # drafts"
+        self.put(binding_topic(code_refs=('"docs/*\n    # drafts"', "src/other.py")))
+        self.assertEqual(self.fm()["code_refs"], [ref, "src/other.py"])
+        before = self.text()
+        rc, _o, err = self.unbind(ref)
+        self.assertNotEqual(rc, 0)
+        self.assertTrue(err.strip(), err)
+        self.assertEqual(self.text(), before)
+
     def test_dry_run_writes_nothing(self):
         self.bound()
         before = self.text()

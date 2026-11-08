@@ -3670,7 +3670,9 @@ writes no second anchor, so `anchor_row_key` / `anchor_pick_row` /
 `_delete_block_item` with `edit_standing_line`; a non-empty flow list is refused as
 `insert_code_ref` refuses it; a topic that lists the same string twice cannot be
 unbound, because the write deletes one item and the round-trip check, which
-requires every equal entry gone, then refuses it: fail-closed) and prepends a `remove` row; it allows a prefix or
+requires every equal entry gone, then refuses it: fail-closed; likewise a multi-line quoted reference is not
+unbindable, because the editor compares one physical line, so rewrite it on one line first)
+and prepends a `remove` row; it allows a prefix or
 glob and never touches an anchor. Plain lint lets an anchor's ref be absent from
 `code_refs` only when the NEWEST `ref_marks` row for it is a `remove`
 (`ref_latest_action`: rows are append-only, so "ever removed" would excuse a ref
