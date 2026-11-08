@@ -3183,12 +3183,16 @@ def _type_change_errors(full_path, old_fm: dict, new_fm: dict) -> list[str]:
     the record carries, and `for-path` and the standing digest read only
     `type: topic`. A record with no `type` at REF recorded nothing to freeze
     (the caller also skips a REF side whose `type` only the lenient fallback
-    recovered and that is not a known record type); a new side that is not a
-    mapping at all is refused elsewhere."""
+    recovered and that is not a known record type). A new side with no `type`
+    (a missing key, a null, an empty or non-mapping frontmatter) has removed it:
+    an error, `type removed`."""
     old_type = old_fm.get("type")
-    if old_type is None or not isinstance(new_fm, dict) or not new_fm:
+    if old_type is None:
         return []
-    new_type = new_fm.get("type")
+    new_type = new_fm.get("type") if isinstance(new_fm, dict) else None
+    if new_type is None:
+        return [f"{full_path}: type removed (frozen {old_type!r}): type changed {old_type!r} -> None "
+                "after being recorded (append-only; `type` decides what the record is delivered as)"]
     if str(new_type) == str(old_type):
         return []
     return [f"{full_path}: type changed {old_type!r} -> {new_type!r} after being recorded "

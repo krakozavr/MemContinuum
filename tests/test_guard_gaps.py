@@ -294,6 +294,24 @@ class TestTypeFrozen(GuardCase):
         self.assertTrue(res.fallback and res.valid, res)
         self.assertRefused(new, "type changed 'topic' -> 'topic # actual value'")
 
+    def test_an_empty_new_mapping_loses_a_frozen_type(self):
+        # gate round 3 R3-2: the type may not disappear by emptying the frontmatter
+        base = ttext(["src/a.py"])
+        self.store(base)
+        empty = "---\n{}\n---\n\nBody.\n"
+        self.assertEqual(memidx.parse_record_text(empty, "x").frontmatter, {})
+        self.assertRefused(empty, "type removed (frozen 'topic')")
+
+    def test_an_empty_new_mapping_loses_a_fallback_refs_trusted_type(self):
+        broken = self._bad_title(ttext(["src/a.py"]))
+        self.assertTrue(memidx.parse_record_text(broken, "x").fallback)
+        self.store(broken)
+        self.assertRefused("---\n{}\n---\n\nBody.\n", "type removed (frozen 'topic')")
+
+    def test_a_new_side_with_other_keys_but_no_type_is_a_removal_too(self):
+        self.store(ttext(["src/a.py"]))
+        self.assertRefused("---\ntitle: x\n---\n\nBody.\n", "type removed (frozen 'topic')")
+
     def test_a_strict_type_change_is_still_refused_with_a_comment_free_ref(self):
         base = ttext(["src/a.py"])
         self.assertTrue(memidx.parse_record_text(base, "x").valid)
