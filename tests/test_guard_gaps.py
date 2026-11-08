@@ -314,6 +314,13 @@ class TestSharedBlockItemDelete(unittest.TestCase):
         self.assertTrue(memidx._delete_block_item(lines, 0, 3, "code_refs", "src/a.py", "\n"))
         self.assertEqual(lines, ["code_refs:\n", "  - src/b.py\n", "  - src/a.py\n", "x: 1\n"])
 
+    def test_the_helper_reads_a_quoted_item_up_to_its_closing_quote(self):
+        lines = ["code_refs:\n", '  - "docs/* # drafts"  # note\n', "  - 'it''s # x'\n", "x: 1\n"]
+        self.assertFalse(memidx._delete_block_item(lines, 0, 2, "code_refs", "docs/*", "\n"))
+        self.assertTrue(memidx._delete_block_item(lines, 0, 2, "code_refs", "docs/* # drafts", "\n"))
+        self.assertTrue(memidx._delete_block_item(lines, 0, 1, "code_refs", "it's # x", "\n"))
+        self.assertEqual(lines, ["code_refs: []\n", "x: 1\n"])
+
     def test_the_helper_leaves_an_empty_list_for_the_last_item_and_reports_a_miss(self):
         lines = ["standing:\n", "  - L2\n", "x: 1\n"]
         self.assertFalse(memidx._delete_block_item(lines, 0, 1, "standing", "L9", "\n"))
@@ -546,6 +553,20 @@ class TestUnbind(BindCase):
         self.assertEqual(spans_a, spans_b)
         self.assertIn("- ref: \"src/foo.py\"\n    action: remove", self.text())
         self.assertGuardsClean()
+
+    def test_a_quoted_ref_containing_a_space_hash_can_be_unbound(self):
+        # the accepted quoted form `"docs/* # drafts"`: the ` #` is inside the quotes, not a comment
+        ref = "docs/* # drafts"
+        self.put(binding_topic(code_refs=(f'"{ref}"', "src/other.py")))
+        self.assertIn(f'"{ref}"', self.text())
+        self.assertEqual(self.fm()["code_refs"], [ref, "src/other.py"])
+        rc, out, err = self.unbind(ref)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.fm()["code_refs"], ["src/other.py"])
+        rows = memidx.ref_mark_rows(self.fm())
+        self.assertEqual([(r["ref"], r["action"]) for r in rows], [(ref, "remove")])
+        errors, _ = memlint.lint_root(self.store)
+        self.assertEqual(errors, [], errors)
 
     def test_the_anchor_rule_accepts_the_unbound_state_but_not_a_silent_removal(self):
         self.bound()

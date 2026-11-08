@@ -12349,15 +12349,36 @@ def insert_code_ref(text: str, ref: str) -> str:
     return "".join(lines)
 
 
+def _block_item_scalar(item_text: str) -> str:
+    """The scalar of one block item's text (what follows `- `): a quoted scalar
+    is read up to its closing quote, so a ` #` inside the quotes is part of the
+    value and a comment is only what follows the closing quote; a plain scalar
+    loses a trailing ` #...` comment."""
+    t = item_text.strip()
+    if t[:1] in ("'", '"'):
+        q, i = t[0], 1
+        while i < len(t):
+            if q == '"' and t[i] == "\\":
+                i += 2
+                continue
+            if t[i] == q:
+                if q == "'" and t[i + 1:i + 2] == "'":
+                    i += 2
+                    continue
+                return _scalar_token(t[:i + 1])
+            i += 1
+    return _scalar_token(re.sub(r"\s+#.*$", "", t))
+
+
 def _delete_block_item(lines: list, key_idx: int, last: int, key: str, value: str, nl: str) -> bool:
-    """Delete, in place, the FIRST block item (`- value`, trailing comment and
-    quotes ignored) of the `key:` block spanning `key_idx`..`last` whose scalar
-    equals `value`; deleting the only item leaves `key: []`. Every other line is
+    """Delete, in place, the FIRST block item (`- value`; a trailing comment
+    after the value or its closing quote, and the quotes, are ignored) of the
+    `key:` block spanning `key_idx`..`last` whose scalar equals `value`; deleting the only item leaves `key: []`. Every other line is
     kept. False (nothing changed) when no item matches. The one deletion
     algorithm of `remove_code_ref` and `edit_standing_line`."""
     items = [i for i in range(key_idx + 1, last + 1) if lines[i].lstrip().startswith("- ")]
     drop = [i for i in items
-            if _scalar_token(re.sub(r"\s+#.*$", "", lines[i].strip()[2:])) == value]
+            if _block_item_scalar(lines[i].strip()[2:]) == value]
     if not drop:
         return False
     del lines[drop[0]]
