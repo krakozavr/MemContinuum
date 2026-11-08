@@ -13363,7 +13363,8 @@ def _declined_check(command: str, args, ctx: dict, root: Path, topic_id: str, li
     (memlint.readoption_matches, the same comparator the commit-time rule
     uses; memlint._normalize_subject is the only normaliser). Fills
     ctx["declined"] for the one `declined-lookup` receipt, which never carries
-    a sentence (TOP-0133 L2)."""
+    a sentence (TOP-0133 L2). The receipt's `ids` joins with `_`: the one
+    logger (`_clean_log_token`) keeps only [A-Za-z0-9._-]."""
     import memlint
     explicit = command in ("append", "promote")
     if explicit:
@@ -13407,7 +13408,7 @@ def _declined_check(command: str, args, ctx: dict, root: Path, topic_id: str, li
     outcome = "flagged" if flagged else "bypass" if explicit else "shown" if lines else "none"
     ids = list(dict.fromkeys([t for t, _r in flagged] + shown_ids))
     ctx["declined"] = {"outcome": outcome, "proposal_sha256": digest, "store_rev": _store_head_short(root),
-                       "ids": ",".join(ids) if ids else "none", "shown": len(lines)}
+                       "ids": "_".join(ids) if ids else "none", "shown": len(lines)}
     if flagged:
         tid, row = flagged[0]
         ref = memlint.rejection_ref(tid, row)
