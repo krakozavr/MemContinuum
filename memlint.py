@@ -39,7 +39,6 @@ from datetime import datetime
 from pathlib import Path
 
 import chunkers
-import yaml
 
 from memidx import (
     ANCHOR_ALGO,
@@ -3160,49 +3159,22 @@ def _standing_guard_errors(full_path, old_fm: dict, old_text, new_fm: dict, new_
     return errors
 
 
-def _bare_type_token(raw: str) -> str | None:
-    """The canonical record type a fallback-recovered raw `type:` value stands
-    for, or None (exempt: not provably one of CANONICAL_TYPES). Order: DECODE
-    first -- the YAML reader (`yaml.safe_load("type: " + raw)`; only a `str`
-    result counts) gives `topic` for `topic # c` and for `"topic"# note`. The
-    fallback has already stripped the value's outer quote characters, so a
-    value holding a quote character is also tried with that quote put back in
-    front. Only then the plain strip: a trailing ` #...` comment, then quote
-    characters. Whatever is not canonical after both (`topic#x`, a list or
-    mapping, empty quotes) is None."""
-    candidates = [raw] + [q + raw for q in ("'", '"') if q in raw]
-    for cand in candidates:
-        try:
-            decoded = yaml.safe_load("type: " + cand)
-        except yaml.YAMLError:
-            continue
-        value = decoded.get("type") if isinstance(decoded, dict) else None
-        if isinstance(value, str) and value in CANONICAL_TYPES:
-            return value
-    bare = re.sub(r"\s+#.*$", "", raw).strip().strip("'\"").strip()
-    return bare if bare in CANONICAL_TYPES else None
-
-
 def _frozen_type_frontmatter(result) -> tuple[dict, bool] | None:
     """(the frontmatter of a REF-side parse with its `type:` made comparable, whether
-    the parse was the lenient fallback), or None when the recorded `type` cannot be
-    trusted. A strict parse is trusted as it stands, valid or not. A lenient-fallback
-    parse recovers `type` as raw text (`topic # comment` stays whole), so the BARE
-    token is derived: a trailing ` #...` comment stripped, then surrounding and
-    dangling quote characters stripped; it is trusted only when it is one of the
-    engine's own record types (CANONICAL_TYPES, the set `_record_kind` trusts)."""
+    the parse was the lenient fallback), or None when the record has no trustworthy
+    type to freeze. A strict parse is trusted as it stands, valid or not. A
+    lenient-fallback parse recovers `type` as raw text, so the engine's OWN kind
+    reading is frozen instead: `_record_kind(fm)` (an explicit canonical `type`, else
+    the id prefix, else a `links:` list). No recoverable kind -> None (exempt)."""
     fm = result.frontmatter
     if not isinstance(fm, dict):
         return None
     if not result.fallback:
         return fm, False
-    raw = fm.get("type")
-    if not isinstance(raw, str):
+    kind = _record_kind(fm)
+    if kind is None:
         return None
-    bare = _bare_type_token(raw)
-    if bare is None:
-        return None
-    return dict(fm, type=bare), True
+    return dict(fm, type=kind), True
 
 
 def _type_change_errors(full_path, old_fm: dict, new_fm: dict, fallback: bool = False) -> list[str]:
@@ -3215,8 +3187,8 @@ def _type_change_errors(full_path, old_fm: dict, new_fm: dict, fallback: bool = 
     `type removed`. The parser turns any non-mapping document into `{}`, so a
     mapping is the only shape that reaches here. Unchanged is the NEW DECODED
     type equal to `old_fm["type"]` as a string: for a strict REF the parsed
-    value, for a fallback REF (`fallback` True) the bare token, so the repaired
-    record must declare that bare type itself. No other NEW-side normalisation."""
+    value, for a fallback REF (`fallback` True) the kind `_record_kind` reads from
+    it, so the repaired record must declare that kind itself. No other NEW-side normalisation."""
     old_type = old_fm.get("type")
     if old_type is None:
         return []
@@ -3320,9 +3292,9 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
         # an incident, a concept, ...); judged first, before the classification exit below and
         # before any branch that can `continue` past it (a repair, an invalid new side). A REF
         # side that parsed strictly keeps its `type` frozen whether or not the record was
-        # schema-valid; a fallback-parsed one only when the recovered value, minus a trailing
-        # ` #...` comment and quote characters, is a known record type. The NEW record's
-        # DECODED type must then equal that bare token; a strict REF compares
+        # schema-valid; a fallback-parsed one freezes the kind `_record_kind` reads from it
+        # (explicit canonical type, else id prefix, else links), exempt when it reads None. The
+        # NEW record's DECODED type must equal that kind; a strict REF compares
         # `str(new) == str(old)`. The NEW side is never normalised.
         new_blob = None
         new_result = None

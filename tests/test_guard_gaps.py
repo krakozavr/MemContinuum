@@ -294,12 +294,13 @@ class TestTypeFrozen(GuardCase):
         self.assertTrue(res.fallback and res.valid, res)
         self.assertRefused(new, "type changed 'topic' -> 'topic # actual value'")
 
-    # gate round 4 R4-1 / round 6 R6-1: the frozen REF value is the bare token alone; the NEW decoded type must equal it
-    ODD_REF = '---\ntype: "topic # actual value"\ntitle: bad: title\n---\n\nBody.\n'
+    # gate round 4 R4-1 / round 6 R6-1 / round 8 R8-1: the frozen REF value is the engine's kind reading; the NEW decoded type must equal it
+    # (gate round 8 R8-1: the REF carries a TOP- id, so the engine's kind reading is `topic` through the id prefix)
+    ODD_REF = '---\nid: TOP-0001\ntype: "topic # actual value"\ntitle: bad: title\n---\n\nBody.\n'
 
     def _odd_ref(self):
         res = memidx.parse_record_text(self.ODD_REF, "x")
-        self.assertTrue(res.fallback and res.valid, res)
+        self.assertTrue(res.fallback, res)   # (the id makes the record schema-invalid; the type freeze does not care)
         self.assertEqual(res.frontmatter.get("type"), "topic # actual value")
         self.store(self.ODD_REF)
 
@@ -315,7 +316,8 @@ class TestTypeFrozen(GuardCase):
 
     def test_an_odd_ref_type_may_become_its_bare_token(self):
         self._odd_ref()
-        self.assertClean(self.ODD_REF.replace('type: "topic # actual value"', "type: topic"))
+        fixed = self.ODD_REF.replace("title: bad: title", 'title: "bad: title"')
+        self.assertClean(fixed.replace('type: "topic # actual value"', "type: topic"))
 
     def test_an_odd_ref_type_changed_to_another_type_is_refused(self):
         self._odd_ref()
@@ -324,10 +326,10 @@ class TestTypeFrozen(GuardCase):
 
     # gate round 5 R5-1 / round 6 R6-1: a raw fallback spelling is never compared with a decoded
     # strict value; the NEW record's decoded type must equal the bare token (no source-line rule)
-    def _fallback_ref(self, type_line, valid=True):
-        ref = f"---\n{type_line}\ntitle: bad: title\n---\n\nBody.\n"
+    def _fallback_ref(self, type_line, valid=True, rid="TOP-0001"):
+        ref = f"---\nid: {rid}\n{type_line}\ntitle: bad: title\n---\n\nBody.\n"
         res = memidx.parse_record_text(ref, "x")
-        self.assertTrue(res.fallback and (res.valid or not valid), res)
+        self.assertTrue(res.fallback, res)   # (validity is irrelevant to the type freeze; the TOP- id makes it invalid)
         self.store(ref)
         return ref
 
@@ -367,7 +369,7 @@ class TestTypeFrozen(GuardCase):
 
     # gate round 5 R5-2: a quoted type followed by a comment is frozen too
     def test_a_quoted_type_followed_by_a_comment_is_frozen(self):
-        ref = self._fallback_ref('type: "incident" # note')
+        ref = self._fallback_ref('type: "incident" # note', rid="INC-0001")   # round 8: an INC- id, so the kind is incident
         self.assertEqual(memidx.parse_record_text(ref, "x").frontmatter.get("type"), 'incident" # note')
         fixed = self._title_repaired(ref)
         self.assertClean(fixed)
@@ -375,26 +377,74 @@ class TestTypeFrozen(GuardCase):
                            "type changed 'incident' -> 'concept'")
         self.assertClean(fixed.replace('type: "incident" # note', "type: incident"))
 
-    # gate round 7 R7-1: the bare token is DECODED by the YAML reader first, stripped second
-    def test_bare_type_token_table(self):
-        # input is the value the lenient fallback recovers (outer quotes already stripped)
+    # gate round 8 R8-1: the frozen kind of a fallback REF is the engine's own `_record_kind` reading
+    def test_record_kind_table_for_a_fallback_ref(self):
         table = [
-            ("topic", "topic"),
-            ("topic # c", "topic"),                  # plain scalar + comment
-            ("'topic'", "topic"),                    # quotes left in: decoded
-            ('"topic"# note', "topic"),              # no space before #: YAML reads `topic`
-            ('topic"# note', "topic"),               # as the fallback recovers it (leading quote stripped)
-            ('incident"# note', "incident"),
-            ("topic#x", None),                       # YAML scalar `topic#x`: not canonical, exempt
-            ("topic # it''s x", "topic"),             # decoded `topic` (the comment is YAML's)
-            ("'topic # it''s x'", "topic"),          # decoded `topic # it's x` is not canonical; strip -> topic
-            ("", None), ("''", None), ('""', None),  # empty / empty quotes: exempt
-            ("[topic]", None), ("{a: topic}", None),  # a list / mapping is not a str: exempt
-            ("unknown", None),
+            ({"type": "incident"}, "incident"),                          # explicit canonical type wins
+            ({"type": "topic", "id": "INC-0001"}, "topic"),
+            ({"type": 'topic"# note', "id": "TOP-0001"}, "topic"),       # garbled type -> TOP- id
+            ({"type": "to\\u0070ic", "id": "TOP-0001"}, "topic"),
+            ({"type": "topic # c", "id": "INC-0001"}, "incident"),       # garbled type -> INC- id
+            ({"type": "banana", "id": "INV-0001"}, "investigation"),
+            ({"type": "banana", "id": "CON-0001"}, "concept"),
+            ({"type": "banana", "links": [{"link": "x"}]}, "topic"),     # no id, links -> topic
+            ({"type": "banana"}, None),                                  # garbled type, no id, no links
+            ({"type": "banana", "id": "ZZZ-1"}, None),
+            ({}, None),
         ]
-        for raw, want in table:
-            with self.subTest(raw=raw):
-                self.assertEqual(memlint._bare_type_token(raw), want)
+        for fm, want in table:
+            with self.subTest(fm=fm):
+                self.assertEqual(memlint._record_kind(fm), want)
+
+    # gate round 8 R8-1 (Sol MAJOR/MINOR, Grok): spellings of a canonical type that the fallback
+    # garbles all freeze through the id prefix (or the links list), never through a string reading
+    def _kind_refused_and_declared(self, type_line, kind="topic", rid="TOP-0001"):
+        ref = self._fallback_ref(type_line, rid=rid)
+        fixed = self._title_repaired(ref)
+        other = "investigation" if kind != "investigation" else "concept"
+        self.assertRefused(fixed.replace(type_line, f"type: {other}"), f"type changed '{kind}' -> '{other}'")
+        self.assertClean(fixed.replace(type_line, f"type: {kind}"))
+
+    def test_a_double_quoted_canonical_type_is_frozen_through_the_id_prefix(self):
+        self._kind_refused_and_declared('type: "topic"')
+
+    def test_an_escaped_canonical_type_is_frozen_through_the_id_prefix(self):
+        # Sol's round 8 MAJOR: "to\u0070ic" and "\x74opic" decode to `topic`
+        self._kind_refused_and_declared('type: "to\\u0070ic"')
+        self._kind_refused_and_declared('type: "\\x74opic"')
+
+    def test_a_tag_prefixed_canonical_type_is_frozen_through_the_id_prefix(self):
+        self._kind_refused_and_declared('type: !!str "topic"')
+        self._kind_refused_and_declared("type: !!str 'topic'")
+
+    def test_a_block_scalar_canonical_type_is_frozen_through_the_id_prefix(self):
+        self._kind_refused_and_declared("type: >-\n  topic")
+        self._kind_refused_and_declared("type: |\n  topic")
+
+    def test_an_unquoted_quote_comment_type_must_be_declared_topic_by_the_repair(self):
+        # Sol's round 8 MINOR: `topic"# note` is not canonical YAML, but the TOP- id gives kind topic;
+        # a title-only repair keeping that spelling is refused with the normalise message
+        ref = self._fallback_ref('type: topic"# note')
+        fixed = self._title_repaired(ref)
+        self.assertRefused(fixed, "type changed 'topic'", "a repair of a malformed record must declare type: topic")
+        self.assertClean(fixed.replace('type: topic"# note', "type: topic"))
+
+    def test_a_garbled_type_with_an_inc_id_freezes_incident(self):
+        ref = self._fallback_ref("type: banana # note", rid="INC-0001")
+        fixed = self._title_repaired(ref)
+        self.assertRefused(fixed.replace("type: banana # note", "type: topic"),
+                           "type changed 'incident' -> 'topic'", "a repair of a malformed record must declare type: incident")
+        self.assertRefused(fixed.replace("type: banana # note", ""), "type removed (frozen 'incident')")
+        self.assertClean(fixed.replace("type: banana # note", "type: incident"))
+
+    def test_a_garbled_type_with_no_id_and_no_links_is_exempt(self):
+        # kind None: nothing is recoverable, so nothing is frozen (documented exemption)
+        ref = "---\ntype: banana # note\ntitle: bad: title\n---\n\nBody.\n"
+        self.assertEqual(memlint._record_kind(memidx.parse_record_text(ref, "x").frontmatter), None)
+        self.store(ref)
+        fixed = self._title_repaired(ref)
+        self.assertClean(fixed.replace("type: banana # note", "type: investigation"))
+        self.assertClean(fixed.replace("type: banana # note\n", ""))
 
     def test_a_no_space_hash_after_a_quoted_canonical_type_is_frozen(self):
         # Sol's fixture: PyYAML reads `"topic"# note` as `topic`
