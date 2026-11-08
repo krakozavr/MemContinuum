@@ -320,6 +320,58 @@ class TestTypeFrozen(GuardCase):
         self.assertRefused(self.ODD_REF.replace('type: "topic # actual value"', "type: incident"),
                            "type changed 'topic' -> 'incident'")
 
+    # gate round 5 R5-1: a raw fallback spelling is never compared with a decoded strict value;
+    # the unchanged `type:` source line (or the bare token) is what counts
+    def _fallback_ref(self, type_line):
+        ref = f"---\n{type_line}\ntitle: bad: title\n---\n\nBody.\n"
+        res = memidx.parse_record_text(ref, "x")
+        self.assertTrue(res.fallback and res.valid, res)
+        self.store(ref)
+        return ref
+
+    def _title_repaired(self, ref):
+        return ref.replace("title: bad: title", 'title: "bad: title"')
+
+    def test_a_single_quoted_odd_type_with_a_doubled_quote_survives_a_title_repair(self):
+        ref = self._fallback_ref("type: 'topic # it''s x'")
+        fixed = self._title_repaired(ref)
+        self.assertEqual(memidx.parse_record_text(fixed, "x").frontmatter.get("type"), "topic # it's x")
+        self.assertClean(fixed)
+
+    def test_a_double_quoted_odd_type_survives_a_title_repair(self):
+        ref = self._fallback_ref('type: "topic # x"')
+        self.assertClean(self._title_repaired(ref))
+
+    def test_a_double_quoted_odd_type_with_an_escape_survives_a_title_repair(self):
+        ref = self._fallback_ref('type: "topic # \\u0078"')
+        self.assertClean(self._title_repaired(ref))
+
+    def test_an_odd_type_line_with_changed_spacing_survives_a_title_repair(self):
+        ref = self._fallback_ref("type: 'topic # it''s x'")
+        self.assertClean(self._title_repaired(ref).replace("type: 'topic", "type:   'topic"))
+
+    def test_the_odd_single_quoted_ref_may_become_bare_topic_or_is_refused_for_incident(self):
+        ref = self._fallback_ref("type: 'topic # it''s x'")
+        fixed = self._title_repaired(ref)
+        self.assertClean(fixed.replace("type: 'topic # it''s x'", "type: topic"))
+        self.assertRefused(fixed.replace("type: 'topic # it''s x'", "type: incident"),
+                           "type changed 'topic' -> 'incident'")
+
+    def test_an_odd_type_line_respelled_to_a_different_literal_is_refused(self):
+        ref = self._fallback_ref("type: 'topic # it''s x'")
+        self.assertRefused(self._title_repaired(ref).replace("it''s x", "other"),
+                           "type changed 'topic' -> 'topic # other'")
+
+    # gate round 5 R5-2: a quoted type followed by a comment is frozen too
+    def test_a_quoted_type_followed_by_a_comment_is_frozen(self):
+        ref = self._fallback_ref('type: "incident" # note')
+        self.assertEqual(memidx.parse_record_text(ref, "x").frontmatter.get("type"), 'incident" # note')
+        fixed = self._title_repaired(ref)
+        self.assertClean(fixed)
+        self.assertRefused(fixed.replace('type: "incident" # note', "type: concept"),
+                           "type changed 'incident' -> 'concept'")
+        self.assertClean(fixed.replace('type: "incident" # note', "type: incident"))
+
     def test_an_empty_new_mapping_loses_a_frozen_type(self):
         # gate round 3 R3-2: the type may not disappear by emptying the frontmatter
         base = ttext(["src/a.py"])
