@@ -39,6 +39,7 @@ from datetime import datetime
 from pathlib import Path
 
 import chunkers
+import yaml
 
 from memidx import (
     ANCHOR_ALGO,
@@ -3159,6 +3160,29 @@ def _standing_guard_errors(full_path, old_fm: dict, old_text, new_fm: dict, new_
     return errors
 
 
+def _bare_type_token(raw: str) -> str | None:
+    """The canonical record type a fallback-recovered raw `type:` value stands
+    for, or None (exempt: not provably one of CANONICAL_TYPES). Order: DECODE
+    first -- the YAML reader (`yaml.safe_load("type: " + raw)`; only a `str`
+    result counts) gives `topic` for `topic # c` and for `"topic"# note`. The
+    fallback has already stripped the value's outer quote characters, so a
+    value holding a quote character is also tried with that quote put back in
+    front. Only then the plain strip: a trailing ` #...` comment, then quote
+    characters. Whatever is not canonical after both (`topic#x`, a list or
+    mapping, empty quotes) is None."""
+    candidates = [raw] + [q + raw for q in ("'", '"') if q in raw]
+    for cand in candidates:
+        try:
+            decoded = yaml.safe_load("type: " + cand)
+        except yaml.YAMLError:
+            continue
+        value = decoded.get("type") if isinstance(decoded, dict) else None
+        if isinstance(value, str) and value in CANONICAL_TYPES:
+            return value
+    bare = re.sub(r"\s+#.*$", "", raw).strip().strip("'\"").strip()
+    return bare if bare in CANONICAL_TYPES else None
+
+
 def _frozen_type_frontmatter(result) -> tuple[dict, bool] | None:
     """(the frontmatter of a REF-side parse with its `type:` made comparable, whether
     the parse was the lenient fallback), or None when the recorded `type` cannot be
@@ -3175,8 +3199,8 @@ def _frozen_type_frontmatter(result) -> tuple[dict, bool] | None:
     raw = fm.get("type")
     if not isinstance(raw, str):
         return None
-    bare = re.sub(r"\s+#.*$", "", raw).strip().strip("'\"").strip()
-    if bare not in CANONICAL_TYPES:
+    bare = _bare_type_token(raw)
+    if bare is None:
         return None
     return dict(fm, type=bare), True
 

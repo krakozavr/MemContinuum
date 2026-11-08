@@ -375,6 +375,41 @@ class TestTypeFrozen(GuardCase):
                            "type changed 'incident' -> 'concept'")
         self.assertClean(fixed.replace('type: "incident" # note', "type: incident"))
 
+    # gate round 7 R7-1: the bare token is DECODED by the YAML reader first, stripped second
+    def test_bare_type_token_table(self):
+        # input is the value the lenient fallback recovers (outer quotes already stripped)
+        table = [
+            ("topic", "topic"),
+            ("topic # c", "topic"),                  # plain scalar + comment
+            ("'topic'", "topic"),                    # quotes left in: decoded
+            ('"topic"# note', "topic"),              # no space before #: YAML reads `topic`
+            ('topic"# note', "topic"),               # as the fallback recovers it (leading quote stripped)
+            ('incident"# note', "incident"),
+            ("topic#x", None),                       # YAML scalar `topic#x`: not canonical, exempt
+            ("topic # it''s x", "topic"),             # decoded `topic` (the comment is YAML's)
+            ("'topic # it''s x'", "topic"),          # decoded `topic # it's x` is not canonical; strip -> topic
+            ("", None), ("''", None), ('""', None),  # empty / empty quotes: exempt
+            ("[topic]", None), ("{a: topic}", None),  # a list / mapping is not a str: exempt
+            ("unknown", None),
+        ]
+        for raw, want in table:
+            with self.subTest(raw=raw):
+                self.assertEqual(memlint._bare_type_token(raw), want)
+
+    def test_a_no_space_hash_after_a_quoted_canonical_type_is_frozen(self):
+        # Sol's fixture: PyYAML reads `"topic"# note` as `topic`
+        ref = self._fallback_ref('type: "topic"# note')
+        self.assertEqual(memidx.parse_record_text(ref, "x").frontmatter.get("type"), 'topic"# note')
+        fixed = self._title_repaired(ref)
+        self.assertEqual(memidx.parse_record_text(fixed, "x").frontmatter.get("type"), "topic")
+        self.assertClean(fixed)
+        self.assertRefused(fixed.replace('type: "topic"# note', "type: investigation"),
+                           "type changed 'topic' -> 'investigation'")
+
+    def test_a_no_space_hash_repair_keeping_type_topic_is_clean(self):
+        ref = self._fallback_ref('type: "topic"# note')
+        self.assertClean(self._title_repaired(ref).replace('type: "topic"# note', "type: topic"))
+
     # gate round 6 R6-1: the effective key is the YAML-decoded one, never a scanned source line
     def test_a_duplicate_type_key_that_wins_last_is_refused(self):
         ref = self._fallback_ref("type: topic", valid=False)
