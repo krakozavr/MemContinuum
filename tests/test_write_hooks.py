@@ -542,7 +542,8 @@ class HookTestBase(unittest.TestCase):
             path, kind = entry[0], entry[1]
             content = entry[2] if len(entry) > 2 else path
             sha = hashlib.sha256(content.encode()).hexdigest()
-            ledger.append({"path": path, "kind": kind, "content_sha256": sha, "seen_at": time.time()})
+            ledger.append({"path": path, "kind": kind, "content_sha256": sha,
+                           "seen_at": time.time()})
         state.setdefault("session_id", session_id)
         state.setdefault("project", self.project)
         state.setdefault("user_turn_count", 0)
@@ -577,58 +578,95 @@ class TestLedgerPostEdit(HookTestBase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_backward_clock_never_produces_a_negative_elapsed(self):
-        """Fix round (Codex 6 / Grok 6 / Grok 15): the same elapsed-clamp
-        flake hooks/pre-edit-chain.sh's own finish() had -- a fake `date
-        +%s` that steps BACKWARDS between START_TS and finish()'s own `now`
-        reproduces the real CI flake (a negative elapsed) deterministically,
-        no reliance on an actual NTP correction firing mid-run. Every
-        `date +%s` call after the first one returns the SAME stepped-back
-        value here (not just the second), so this is robust regardless of
-        how many such calls this script makes before finish() (it makes
-        three: START_TS, MC_NOW, and finish()'s own `now`)."""
-        marker = Path(self.td) / "date-called-once"
-        real_date = shutil.which("date") or "/bin/date"
-        fake_bin = Path(self.td) / "fakebin"
-        fake_bin.mkdir()
-        fake_date = fake_bin / "date"
-        fake_date.write_text(
-            "#!/usr/bin/env bash\n"
-            'if [ "$1" = "+%s" ]; then\n'
-            f'    if [ -e "{marker}" ]; then\n'
-            '        echo 1000000100\n'
-            '    else\n'
-            f'        : > "{marker}"\n'
-            '        echo 1000000200\n'
-            '    fi\n'
-            '    exit 0\n'
-            'fi\n'
-            f'exec "{real_date}" "$@"\n'
+        """The elapsed field is clamped at zero: a wall clock that steps
+        BACKWARDS between script start and the log line (NTP correction, VM
+        resume) must never print a sign. Deterministic: the recorded start
+        is put 5 s in the future of the clock instead of waiting for a
+        real step."""
+        script = (
+            'source "$1"; mc_now_ms >/dev/null; '
+            'MC_T0_US=$(( MC_NOW_MS * 1000 + 5000000 )); mc_elapsed_field'
         )
-        fake_date.chmod(0o755)
-        session_id = "s-ledger-elapsed-clamp"
-        fpath = str(self.code_root / "src" / "mapped.py")
-        payload = self.post_tool_use_payload(session_id, fpath)
-        env = self.base_env(PATH=f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}")
-        proc, _ = run_script(LEDGER_HOOK, payload, env)
+        proc = subprocess.run(
+            [MC_BASH, "-c", script, "_", str(HOOKS_DIR / "memlib.sh")],
+            capture_output=True, text=True, env=self.base_env(), timeout=10,
+        )
+        self.assertEqual(proc.stdout.strip(), "elapsed=0.0s", proc.stdout + proc.stderr)
+
+    def test_elapsed_field_never_forks_python_on_a_date_without_percent_n(self):
+        """No EPOCHREALTIME and a `date` without %N (macOS bash 3.2): the
+        field falls back to whole seconds from `date +%s`; the interpreter
+        is never spawned (the python path is a spy that would leave a mark)."""
+        spy = Path(self.td) / "python-spawned"
+        fake = Path(self.td) / "fakebin"
+        fake.mkdir()
+        (fake / "date").write_text(
+            '#!/usr/bin/env bash\ncase "$*" in *%3N*) echo 3N;; *) exec /bin/date "$@";; esac\n')
+        (fake / "date").chmod(0o755)
+        # mc_elapsed_field resolves `python3` from PATH (mc_now_ms "" 1), not
+        # from MC_PY: the spy is installed under every interpreter name first
+        # on PATH (gate round 2 R2-3).
+        py = Path(self.td) / "py-spy"
+        py.write_text('#!/usr/bin/env bash\ntouch "' + str(spy) + '"\nexec "' + VENV_PYTHON + '" "$@"\n')
+        py.chmod(0o755)
+        for name in ("python3", "python"):
+            (fake / name).write_text(py.read_text())
+            (fake / name).chmod(0o755)
+        script = ('unset EPOCHREALTIME; source "$1"; MC_PY="$2"; unset EPOCHREALTIME; '
+                  'MC_QUERY_MS_MODE=""; mc_elapsed_field; printf " mode=%s" "$MC_QUERY_MS_MODE"')
+        proc = subprocess.run(
+            [MC_BASH, "-c", script, "_", str(HOOKS_DIR / "memlib.sh"), str(py)],
+            capture_output=True, text=True, timeout=10,
+            env=self.base_env(PATH=str(fake) + os.pathsep + os.environ["PATH"]),
+        )
+        self.assertRegex(proc.stdout, r"^elapsed=\d+\.0s mode=python$", proc.stdout + proc.stderr)
+        self.assertFalse(spy.exists(), "python was spawned for a log field")
+
+    def _future_start_us(self, seconds=5):
+        return str(int((time.time() + seconds) * 1_000_000))
+
+    def test_ledger_hook_clamps_a_backward_clock_on_every_outcome_line(self):
+        """The real hook, not just the helper: memlib.sh honours a preset
+        MC_T0_US only under MEMCONTINUUM_TEST_CLOCK=1; with the start 5 s in
+        the future both the bash (finish) and the Python (shell-diff
+        summary, log_line) producers print elapsed=0.0s."""
+        session_id = "s-ledger-backward-clock"
+        env = self.base_env(MEMCONTINUUM_TEST_CLOCK="1", MC_T0_US=self._future_start_us())
+        proc, _ = run_script(LEDGER_HOOK, self.post_tool_use_payload(
+            session_id, str(self.code_root / "src" / "mapped.py")), env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        # Grok 4 (fix round 2, external re-gate): prove the fake `date` was
-        # actually invoked (see the matching comment in test_hooks.py's own
-        # copy of this test) -- otherwise a fast real run passes the two
-        # checks below for an unrelated reason and the backward step was
-        # never exercised.
-        self.assertTrue(marker.exists(),
-                         "fake date was never called a second time -- the backward-clock "
-                         "scenario was not exercised, this test proves nothing")
-        log_text = (self.home / "hook.log").read_text()
-        matching = [l for l in log_text.splitlines() if "ledger outcome=" in l]
-        self.assertTrue(matching, log_text)
-        for line in matching:
-            self.assertRegex(line, r"elapsed=\d+s", line)
-            self.assertNotIn("elapsed=-", line)
-            # 1000000100 - 1000000200 = -100 unclamped; a genuine clamp
-            # shows exactly 0, not merely "some non-negative number" (which
-            # a fast real run would also produce with no fake date at all).
-            self.assertRegex(line, r"elapsed=0s", line)
+        bash_payload = json.dumps({
+            "session_id": session_id, "hook_event_name": "PostToolUse", "tool_name": "Bash",
+            "cwd": str(self.code_root), "tool_input": {"command": "true"},
+            "tool_response": {"stdout": "", "stderr": "", "interrupted": False},
+        })
+        run_script(LEDGER_HOOK, bash_payload, env)  # shell-diff baseline
+        _write(self.code_root / "src" / "unmapped.py", "# changed by a shell command\n")
+        proc, _ = run_script(LEDGER_HOOK, bash_payload, env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        lines = [l for l in (self.home / "hook.log").read_text().splitlines() if "ledger outcome=" in l]
+        self.assertTrue(any("ledger outcome=appended kind=code source=shell-diff" in l for l in lines), lines)
+        self.assertTrue(any("ledger outcome=shell-diff" in l for l in lines), lines)
+        for line in lines:
+            self.assertIn(" elapsed=0.0s", line, line)
+
+    def test_a_preset_start_is_ignored_without_the_test_clock_flag(self):
+        proc = subprocess.run(
+            [MC_BASH, "-c", 'source "$1"; printf %s "$MC_T0_US"', "_", str(HOOKS_DIR / "memlib.sh")],
+            capture_output=True, text=True,
+            env=self.base_env(MC_T0_US=self._future_start_us(3600)), timeout=10,
+        )
+        self.assertLess(int(proc.stdout), time.time() * 1_000_000 + 1_000_000, proc.stdout)
+
+    def test_ledger_outcome_lines_carry_elapsed_with_one_decimal(self):
+        session_id = "s-ledger-elapsed-field"
+        fpath = str(self.code_root / "src" / "mapped.py")
+        proc, _ = run_script(LEDGER_HOOK, self.post_tool_use_payload(session_id, fpath), self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        lines = [l for l in (self.home / "hook.log").read_text().splitlines() if "ledger outcome=" in l]
+        self.assertTrue(lines)
+        for line in lines:
+            self.assertRegex(line, r"elapsed=\d+\.\ds", line)
 
     def test_silent_always(self):
         session_id = "s-ledger-silent"
@@ -1735,7 +1773,7 @@ class TestMutationSurface(HookTestBase):
         self.assertEqual(rows[0]["kind"], "code")
         self.assertEqual(rows[0]["root"], str(self.code_root.resolve()))
         log2 = (self.home / "hook.log").read_text()
-        self.assertIn("ledger outcome=appended kind=code source=shell-diff file=", log2)
+        self.assertRegex(log2, r"ledger outcome=appended kind=code source=shell-diff elapsed=\d+\.\ds file=")
         self.assertIn("outcome=shell-diff appended=1", log2)
 
         # A second identical payload appends nothing more.
@@ -1814,7 +1852,11 @@ class TestMutationSurface(HookTestBase):
         self.assertNotEqual(rows[child_r]["content_sha256"], "")
 
         log2 = (self.home / "hook.log").read_text()
-        self.assertIn("ledger outcome=appended kind=code source=shell-diff file=" + target_r, log2)
+        self.assertRegex(
+            log2,
+            r"ledger outcome=appended kind=code source=shell-diff elapsed=\d+\.\ds file="
+            + re.escape(target_r),
+        )
 
     # -- codex re-gate MINOR 2, mirror-image case caught at review: the
     # BASELINE loop has its own copy of the G3 directory guard, and it
@@ -2024,10 +2066,10 @@ class TestMutationSurface(HookTestBase):
             rows[0]["content_sha256"], hashlib.sha256(target.read_bytes()).hexdigest()
         )
         log = (self.home / "hook.log").read_text()
-        self.assertIn(
-            "ledger outcome=appended kind=code source=shell-diff worktree=%s file=%s"
-            % (wt, main_path),
+        self.assertRegex(
             log,
+            r"ledger outcome=appended kind=code source=shell-diff elapsed=\d+\.\ds worktree=%s file=%s"
+            % (re.escape(str(wt)), re.escape(str(main_path))),
         )
         summary = self._summary_lines()[-1]
         self.assertIn("appended=1", summary)
@@ -2285,7 +2327,7 @@ class TestMutationSurface(HookTestBase):
         proc, _ = run_script(LEDGER_HOOK, payload, self.base_env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
         log_text = (self.home / "hook.log").read_text()
-        self.assertIn("outcome=unsupported-mutation-surface tool=SomeMcpTool", log_text)
+        self.assertRegex(log_text, r"outcome=unsupported-mutation-surface tool=SomeMcpTool elapsed=\d+\.\ds ")
         state = self.load_state(session_id)
         # Fix round 3: shell-diff rows are filed under the PHYSICAL root.
         rows = [e for e in state["ledger"] if e["path"] == str(target.resolve())]
@@ -2303,7 +2345,7 @@ class TestMutationSurface(HookTestBase):
         proc, _ = run_script(LEDGER_HOOK, payload, self.base_env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
         log_text = (self.home / "hook.log").read_text()
-        self.assertIn("outcome=unsupported-mutation-surface tool=unknown", log_text)
+        self.assertRegex(log_text, r"outcome=unsupported-mutation-surface tool=unknown elapsed=\d+\.\ds ")
         state = self.load_state(session_id)
         # Fix round 3: shell-diff rows are filed under the PHYSICAL root.
         rows = [e for e in state["ledger"] if e["path"] == str(target.resolve())]
@@ -3797,6 +3839,439 @@ class TestUserPromptRemind(HookTestBase):
     # the hook never calls `unmapped` at all, so the assertion would pass
     # or fail for the wrong reason (see test_real_shaped_payload_no_source_
     # no_agent_proceeds above for the same seeding pattern).
+
+    # ---- incremental classification (session cache of verdicts) -------
+
+    def _spy_env(self, spy_log):
+        """An env whose python is a wrapper logging every `memidx.py
+        unmapped` argv (one line per call) before running the real one."""
+        wrapper = Path(self.td) / "py-spy.sh"
+        wrapper.write_text(
+            "#!/usr/bin/env bash\n"
+            'case "${1##*/} ${2:-}" in "memidx.py unmapped") printf "%s\\n" "$*" >> "' + str(spy_log) + '";; esac\n'
+            'exec "' + VENV_PYTHON + '" "$@"\n'
+        )
+        wrapper.chmod(0o755)
+        return self.base_env(MEMCONTINUUM_PYTHON=str(wrapper))
+
+    def _unmapped_calls(self, spy_log):
+        if not spy_log.exists():
+            return []
+        return [l for l in spy_log.read_text().splitlines() if l]
+
+    def _prompt(self, session_id, env):
+        self.patch_state(session_id, last_inject_turn=-999, last_inject_time=0)
+        proc, _ = run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), env, timeout=20.0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc
+
+    def test_only_paths_new_since_the_previous_prompt_are_classified(self):
+        spy = Path(self.td) / "unmapped-calls.log"
+        env = self._spy_env(spy)
+        session_id = "s-userprompt-incremental"
+        mapped = str(self.code_root / "src" / "mapped.py")
+        unmapped = str(self.code_root / "src" / "unmapped.py")
+        self.seed_ledger(session_id, [(mapped, "code"), (unmapped, "code")])
+        first = self._prompt(session_id, env)
+        calls = self._unmapped_calls(spy)
+        self.assertEqual(len(calls), 1, calls)
+        self.assertIn(mapped, calls[0])
+        self.assertIn(unmapped, calls[0])
+        cache = self.load_state(session_id)["unmapped_cache"]
+        self.assertEqual(cache["store_head"], git_head(self.store_root))
+        self.assertEqual(set(cache["verdicts"]), {mapped, unmapped})
+
+        extra = str(self.code_root / "src" / "extra.py")
+        self.seed_ledger(session_id, [(extra, "code")])
+        second = self._prompt(session_id, env)
+        calls = self._unmapped_calls(spy)
+        self.assertEqual(len(calls), 2, calls)
+        self.assertIn(extra, calls[1])
+        self.assertNotIn(mapped, calls[1])
+        self.assertNotIn(unmapped, calls[1])
+        # The reader sees the whole session, not just the new path.
+        self.assertIn("1 edited file(s) with no decision topic: src/unmapped.py;", first.stdout)
+        self.assertIn("2 edited file(s) with no decision topic: src/extra.py, src/unmapped.py;", second.stdout)
+
+    def test_422_cached_paths_and_one_new_edit_pass_one_path(self):
+        spy = Path(self.td) / "unmapped-calls.log"
+        env = self._spy_env(spy)
+        session_id = "s-userprompt-incremental-422"
+        many = [str(self.code_root / "render" / f"f{i:03d}.png") for i in range(422)]
+        self.seed_ledger(session_id, [(p, "code") for p in many])
+        self._prompt(session_id, env)
+        self.assertEqual(len(self.load_state(session_id)["unmapped_cache"]["verdicts"]), 422)
+        new = str(self.code_root / "render" / "new.png")
+        self.seed_ledger(session_id, [(new, "code")])
+        self._prompt(session_id, env)
+        calls = self._unmapped_calls(spy)
+        self.assertEqual(len(calls), 2, calls)
+        self.assertEqual(calls[1].split(" --root ")[0].split(" unmapped ")[1], new)
+
+    def _call_paths(self, call):
+        """The PATH arguments of one spied `memidx.py unmapped` call."""
+        head = call.split(" --root ")[0]
+        return head.split(" unmapped", 1)[1].split()
+
+    def _bump_seen_at(self, session_id, path, delta=5.0):
+        state = json.loads(self.state_file(session_id).read_text())
+        for e in state["ledger"]:
+            if e["path"] == path:
+                e["seen_at"] = time.time() + delta
+        self.state_file(session_id).write_text(json.dumps(state))
+
+    def test_nothing_new_still_calls_unmapped_with_zero_paths(self):
+        """The call is also the index-state check and the stale self-heal, so
+        it happens on every candidate prompt; the verdicts come from the
+        cache and the signal is unchanged."""
+        spy = Path(self.td) / "unmapped-calls.log"
+        env = self._spy_env(spy)
+        session_id = "s-userprompt-incremental-none"
+        unmapped = str(self.code_root / "src" / "unmapped.py")
+        self.seed_ledger(session_id, [(unmapped, "code")])
+        first = self._prompt(session_id, env)
+        # Re-arm coverage candidacy without any new path.
+        self.patch_state(session_id, last_injected_pairs=[])
+        second = self._prompt(session_id, env)
+        calls = self._unmapped_calls(spy)
+        self.assertEqual(len(calls), 2, calls)
+        self.assertEqual(self._call_paths(calls[0]), [unmapped])
+        self.assertEqual(self._call_paths(calls[1]), [], calls[1])
+        self.assertIn("1 edited file(s) with no decision topic: src/unmapped.py", first.stdout)
+        self.assertIn("1 edited file(s) with no decision topic: src/unmapped.py", second.stdout)
+
+    def test_an_uncommitted_untracked_store_file_makes_every_path_new(self):
+        spy = Path(self.td) / "unmapped-calls.log"
+        env = self._spy_env(spy)
+        session_id = "s-userprompt-incremental-dirty"
+        mapped = str(self.code_root / "src" / "mapped.py")
+        unmapped = str(self.code_root / "src" / "unmapped.py")
+        self.seed_ledger(session_id, [(mapped, "code"), (unmapped, "code")])
+        self._prompt(session_id, env)
+        _write(self.store_root / "scratch-note.txt", "untracked\n")
+        self.patch_state(session_id, last_injected_pairs=[])
+        self._prompt(session_id, env)
+        calls = self._unmapped_calls(spy)
+        self.assertEqual(len(calls), 2, calls)
+        self.assertEqual(sorted(self._call_paths(calls[1])), sorted([mapped, unmapped]))
+
+    def test_an_uncommitted_bind_in_a_new_topic_clears_the_cached_gap(self):
+        spy = Path(self.td) / "unmapped-calls.log"
+        env = self._spy_env(spy)
+        session_id = "s-userprompt-incremental-bind"
+        unmapped = str(self.code_root / "src" / "unmapped.py")
+        self.seed_ledger(session_id, [(unmapped, "code")])
+        first = self._prompt(session_id, env)
+        self.assertIn("no decision topic: src/unmapped.py", first.stdout)
+        # The usual filing state: a new topic file, written but not committed.
+        _write(self.store_root / "topics" / "testing" / "bind-unmapped.md",
+               TOPIC_MD.replace("TOP-9001", "TOP-9002").replace("src/mapped.py", "src/unmapped.py"))
+        self.patch_state(session_id, last_injected_pairs=[])
+        second = self._prompt(session_id, env)
+        calls = self._unmapped_calls(spy)
+        self.assertEqual(self._call_paths(calls[1]), [unmapped], calls)
+        self.assertNotIn("no decision topic: src/unmapped.py", second.stdout)
+
+    def test_a_healed_index_reclassifies_every_cached_path(self):
+        """Same store HEAD, clean worktree, but the index went stale (here: a
+        committed topic that was never indexed). The one-path call heals, so
+        the older verdicts are re-asked against the healed index."""
+        spy = Path(self.td) / "unmapped-calls.log"
+        env = self._spy_env(spy)
+        session_id = "s-userprompt-incremental-healed"
+        mapped = str(self.code_root / "src" / "mapped.py")
+        unmapped = str(self.code_root / "src" / "unmapped.py")
+        self.seed_ledger(session_id, [(mapped, "code"), (unmapped, "code")])
+        self._prompt(session_id, env)
+        _write(self.store_root / "topics" / "testing" / "bind-unmapped.md",
+               TOPIC_MD.replace("TOP-9001", "TOP-9002").replace("src/mapped.py", "src/unmapped.py"))
+        subprocess.run(["git", "-C", str(self.store_root), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(self.store_root), "commit", "-q", "-m", "bind"], check=True)
+        # The cache claims to be valid at the new HEAD (it is the index, not
+        # the HEAD, that moved under it).
+        cache = json.loads(self.state_file(session_id).read_text())["unmapped_cache"]
+        cache["store_head"] = git_head(self.store_root)
+        extra = str(self.code_root / "src" / "extra.py")
+        self.seed_ledger(session_id, [(extra, "code")])
+        self.patch_state(session_id, unmapped_cache=cache, last_injected_pairs=[])
+        proc = self._prompt(session_id, env)
+        calls = self._unmapped_calls(spy)
+        self.assertEqual(len(calls), 3, calls)
+        self.assertEqual(self._call_paths(calls[1]), [extra])
+        self.assertEqual(sorted(self._call_paths(calls[2])), sorted([mapped, unmapped, extra]))
+        self.assertNotIn("src/unmapped.py", proc.stdout)
+
+    def test_a_failed_recall_after_a_heal_leaves_no_reusable_cache(self):
+        """Gate round 2 R2-2: the heal happened, then the full re-call died.
+        The pre-heal verdicts must not survive for a later prompt to reuse."""
+        spy = Path(self.td) / "unmapped-calls.log"
+        wrapper = Path(self.td) / "py-die-on-third.sh"
+        wrapper.write_text(
+            "#!/usr/bin/env bash\n"
+            'case "${1##*/} ${2:-}" in "memidx.py unmapped")\n'
+            '  printf "%s\\n" "$*" >> "' + str(spy) + '"\n'
+            '  n=$(( $(wc -l < "' + str(spy) + '") ))\n'
+            '  if [ "$n" = "3" ]; then exit 2; fi;;\n'
+            "esac\n"
+            'exec "' + VENV_PYTHON + '" "$@"\n'
+        )
+        wrapper.chmod(0o755)
+        dying_env = self.base_env(MEMCONTINUUM_PYTHON=str(wrapper))
+        session_id = "s-userprompt-incremental-heal-crash"
+        mapped = str(self.code_root / "src" / "mapped.py")
+        unmapped = str(self.code_root / "src" / "unmapped.py")
+        self.seed_ledger(session_id, [(mapped, "code"), (unmapped, "code")])
+        self._prompt(session_id, dying_env)
+        _write(self.store_root / "topics" / "testing" / "bind-unmapped.md",
+               TOPIC_MD.replace("TOP-9001", "TOP-9002").replace("src/mapped.py", "src/unmapped.py"))
+        subprocess.run(["git", "-C", str(self.store_root), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(self.store_root), "commit", "-q", "-m", "bind"], check=True)
+        cache = json.loads(self.state_file(session_id).read_text())["unmapped_cache"]
+        cache["store_head"] = git_head(self.store_root)
+        extra = str(self.code_root / "src" / "extra.py")
+        self.seed_ledger(session_id, [(extra, "code")])
+        self.patch_state(session_id, unmapped_cache=cache, last_injected_pairs=[])
+        self._prompt(session_id, dying_env)  # call 2 heals, call 3 dies
+        self.assertEqual(len(self._unmapped_calls(spy)), 3)
+        self.assertNotIn("unmapped_cache", self.load_state(session_id))
+        # The next prompt (a healthy engine) reclassifies every path.
+        self.patch_state(session_id, last_injected_pairs=[])
+        proc = self._prompt(session_id, self._spy_env(spy))
+        calls = self._unmapped_calls(spy)
+        self.assertEqual(len(calls), 4, calls)
+        self.assertEqual(sorted(self._call_paths(calls[3])), sorted([mapped, unmapped, extra]))
+        self.assertNotIn("src/unmapped.py", proc.stdout)
+
+    def test_a_kill_after_the_first_call_healed_leaves_no_reusable_cache(self):
+        """Gate round 3 R3-1: the FIRST call is the one that heals. It does its
+        work (the index is rebuilt) and the hook dies before any write-back; the
+        pre-heal cache must already be gone from the session file."""
+        spy = Path(self.td) / "unmapped-calls.log"
+        wrapper = Path(self.td) / "py-heal-then-die-on-second.sh"
+        wrapper.write_text(
+            "#!/usr/bin/env bash\n"
+            'case "${1##*/} ${2:-}" in "memidx.py unmapped")\n'
+            '  printf "%s\\n" "$*" >> "' + str(spy) + '"\n'
+            '  n=$(( $(wc -l < "' + str(spy) + '") ))\n'
+            '  if [ "$n" = "2" ]; then "' + VENV_PYTHON + '" "$@" >/dev/null; exit 2; fi;;\n'
+            "esac\n"
+            'exec "' + VENV_PYTHON + '" "$@"\n'
+        )
+        wrapper.chmod(0o755)
+        dying_env = self.base_env(MEMCONTINUUM_PYTHON=str(wrapper))
+        session_id = "s-userprompt-incremental-first-call-crash"
+        mapped = str(self.code_root / "src" / "mapped.py")
+        unmapped = str(self.code_root / "src" / "unmapped.py")
+        self.seed_ledger(session_id, [(mapped, "code"), (unmapped, "code")])
+        self._prompt(session_id, dying_env)
+        self.assertIn("unmapped_cache", self.load_state(session_id))
+        _write(self.store_root / "topics" / "testing" / "bind-unmapped.md",
+               TOPIC_MD.replace("TOP-9001", "TOP-9002").replace("src/mapped.py", "src/unmapped.py"))
+        subprocess.run(["git", "-C", str(self.store_root), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(self.store_root), "commit", "-q", "-m", "bind"], check=True)
+        cache = json.loads(self.state_file(session_id).read_text())["unmapped_cache"]
+        cache["store_head"] = git_head(self.store_root)
+        self.patch_state(session_id, unmapped_cache=cache, last_injected_pairs=[])
+        self._prompt(session_id, dying_env)  # call 2 heals, then exits 2
+        self.assertEqual(len(self._unmapped_calls(spy)), 2)
+        self.assertNotIn("unmapped_cache", self.load_state(session_id))
+        # The next prompt (a healthy engine) classifies every path.
+        self.patch_state(session_id, last_injected_pairs=[])
+        proc = self._prompt(session_id, self._spy_env(spy))
+        calls = self._unmapped_calls(spy)
+        self.assertEqual(len(calls), 3, calls)
+        self.assertEqual(sorted(self._call_paths(calls[2])), sorted([mapped, unmapped]))
+        self.assertNotIn("src/unmapped.py", proc.stdout)
+
+    def test_a_re_edited_path_is_reclassified_alone(self):
+        spy = Path(self.td) / "unmapped-calls.log"
+        env = self._spy_env(spy)
+        session_id = "s-userprompt-incremental-reedit"
+        mapped = str(self.code_root / "src" / "mapped.py")
+        unmapped = str(self.code_root / "src" / "unmapped.py")
+        self.seed_ledger(session_id, [(mapped, "code"), (unmapped, "code")])
+        self._prompt(session_id, env)
+        self._bump_seen_at(session_id, unmapped)
+        self.patch_state(session_id, last_injected_pairs=[])
+        self._prompt(session_id, env)
+        calls = self._unmapped_calls(spy)
+        self.assertEqual(len(calls), 2, calls)
+        self.assertEqual(self._call_paths(calls[1]), [unmapped])
+
+    def _edit_through_ledger_hook(self, session_id, path, at=None):
+        """`at` pins the ledger's seen_at through the test-only seam
+        (MEMCONTINUUM_TEST_CLOCK=1 + MC_SEEN_NOW, as for MC_T0_US)."""
+        env = self.base_env()
+        if at is not None:
+            env.update(MEMCONTINUUM_TEST_CLOCK="1", MC_SEEN_NOW=repr(at))
+        proc, _ = run_script(LEDGER_HOOK, self.post_tool_use_payload(session_id, path), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def _set_verdict_time(self, session_id, path, stamp):
+        state = json.loads(self.state_file(session_id).read_text())
+        state["unmapped_cache"]["classified_at"][path] = stamp
+        self.state_file(session_id).write_text(json.dumps(state))
+
+    def _reclassified_paths_after_edit_at(self, session_id, unmapped_edit_at):
+        """Verdict of `unmapped` pinned at S+0.25, its edit pinned at the given
+        time through the real ledger hook; returns the paths of the next call."""
+        spy = Path(self.td) / "unmapped-calls.log"
+        env = self._spy_env(spy)
+        mapped = str(self.code_root / "src" / "mapped.py")
+        unmapped = str(self.code_root / "src" / "unmapped.py")
+        self._edit_through_ledger_hook(session_id, mapped)
+        self._edit_through_ledger_hook(session_id, unmapped)
+        self._prompt(session_id, env)
+        whole = float(int(time.time()))
+        self._set_verdict_time(session_id, unmapped, whole + 0.25)
+        self._set_verdict_time(session_id, mapped, whole + 5.0)  # clearly after its own edit
+        self._edit_through_ledger_hook(session_id, unmapped, at=unmapped_edit_at(whole))
+        self.patch_state(session_id, last_injected_pairs=[])
+        self._prompt(session_id, env)
+        calls = self._unmapped_calls(spy)
+        self.assertEqual(len(calls), 2, calls)
+        return self._call_paths(calls[1]), unmapped
+
+    def test_an_edit_in_the_same_wall_second_as_the_verdict_is_reclassified(self):
+        """Gate round 2 R2-1 / round 3 R3-2, through the real hooks: verdict at
+        S+0.25, edit at S+0.75, both clocks pinned -- the fractional seen_at
+        compares strictly and the edit is seen."""
+        session_id = "s-userprompt-incremental-same-second"
+        paths, unmapped = self._reclassified_paths_after_edit_at(session_id, lambda s: s + 0.75)
+        seen = {e["path"]: e["seen_at"] for e in self.load_state(session_id)["ledger"]}
+        self.assertEqual(seen[unmapped], float(int(seen[unmapped])) + 0.75)
+        self.assertEqual(paths, [unmapped])
+
+    def test_an_integral_seen_at_from_the_ledger_hook_costs_one_extra_classification(self):
+        """Gate round 3 R3-2: a ledger stamp that happens to be a whole second
+        (legacy arm, >= floor(classified_at)) reclassifies -- never a miss."""
+        session_id = "s-userprompt-incremental-integral-stamp"
+        paths, unmapped = self._reclassified_paths_after_edit_at(session_id, lambda s: s)
+        seen = {e["path"]: e["seen_at"] for e in self.load_state(session_id)["ledger"]}
+        self.assertEqual(seen[unmapped], float(int(seen[unmapped])))
+        self.assertEqual(paths, [unmapped])
+
+    def test_a_fractional_edit_before_the_verdict_in_the_same_second_is_not_reclassified(self):
+        """Gate round 2 R2-6: edited at S.10, classified at S.25 -- no churn."""
+        spy = Path(self.td) / "unmapped-calls.log"
+        env = self._spy_env(spy)
+        session_id = "s-userprompt-incremental-no-churn"
+        unmapped = str(self.code_root / "src" / "unmapped.py")
+        self._edit_through_ledger_hook(session_id, unmapped)
+        self._prompt(session_id, env)
+        whole = float(int(time.time()))
+        state = json.loads(self.state_file(session_id).read_text())
+        state["ledger"][0]["seen_at"] = whole + 0.10
+        state["unmapped_cache"]["classified_at"][unmapped] = whole + 0.25
+        self.state_file(session_id).write_text(json.dumps(state))
+        self.patch_state(session_id, last_injected_pairs=[])
+        self._prompt(session_id, env)
+        calls = self._unmapped_calls(spy)
+        self.assertEqual(len(calls), 2, calls)
+        self.assertEqual(self._call_paths(calls[1]), [], calls)
+
+    def test_a_whole_second_seen_at_from_an_older_hook_still_invalidates(self):
+        spy = Path(self.td) / "unmapped-calls.log"
+        env = self._spy_env(spy)
+        session_id = "s-userprompt-incremental-old-row"
+        mapped = str(self.code_root / "src" / "mapped.py")
+        unmapped = str(self.code_root / "src" / "unmapped.py")
+        self.seed_ledger(session_id, [(mapped, "code"), (unmapped, "code")])
+        self._prompt(session_id, env)
+        whole = float(int(time.time()))
+        self._set_verdict_time(session_id, unmapped, whole + 0.75)
+        state = json.loads(self.state_file(session_id).read_text())
+        for e in state["ledger"]:
+            e["seen_at"] = 0.0
+            if e["path"] == unmapped:
+                e["seen_at"] = whole  # an older hook's whole-second stamp
+        self.state_file(session_id).write_text(json.dumps(state))
+        self.patch_state(session_id, last_injected_pairs=[])
+        self._prompt(session_id, env)
+        calls = self._unmapped_calls(spy)
+        self.assertEqual(self._call_paths(calls[1]), [unmapped], calls)
+
+    def test_a_non_ok_answer_drops_the_cache(self):
+        spy = Path(self.td) / "unmapped-calls.log"
+        env = self._spy_env(spy)
+        session_id = "s-userprompt-incremental-nonok"
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+        self._prompt(session_id, env)
+        self.assertIn("unmapped_cache", self.load_state(session_id))
+        (self.home / f"{self.project}.sqlite").unlink()
+        self.patch_state(session_id, last_injected_pairs=[])
+        self._prompt(session_id, env)
+        self.assertNotIn("unmapped_cache", self.load_state(session_id))
+        self.assertIn("outcome=index-uninitialized", (self.home / "hook.log").read_text())
+
+    def test_an_answer_that_does_not_account_for_a_fresh_path_drops_the_cache(self):
+        session_id = "s-userprompt-incremental-miss"
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+        self._prompt(session_id, self.base_env())
+        self.assertIn("unmapped_cache", self.load_state(session_id))
+        wrapper = Path(self.td) / "py-mangle.sh"
+        wrapper.write_text(
+            "#!/usr/bin/env bash\n"
+            'if [ "${1##*/} ${2:-}" = "memidx.py unmapped" ]; then\n'
+            '  out="$("' + VENV_PYTHON + '" "$@")"; rc=$?\n'
+            '  printf "%s" "$out" | "' + VENV_PYTHON + '" -c \'import json,sys; d=json.load(sys.stdin); '
+            'd["by_path"]={}; d["unmapped"]=[]; d["mapped_topic"]=[]; d["mapped_concept_only"]=[]; '
+            'print(json.dumps(d))\'\n'
+            "  exit $rc\n"
+            "fi\n"
+            'exec "' + VENV_PYTHON + '" "$@"\n'
+        )
+        wrapper.chmod(0o755)
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "extra.py"), "code")])
+        self.patch_state(session_id, last_injected_pairs=[])
+        self._prompt(session_id, self.base_env(MEMCONTINUUM_PYTHON=str(wrapper)))
+        self.assertNotIn("unmapped_cache", self.load_state(session_id))
+
+    def test_a_store_commit_between_prompts_recomputes_every_path(self):
+        spy = Path(self.td) / "unmapped-calls.log"
+        env = self._spy_env(spy)
+        session_id = "s-userprompt-incremental-commit"
+        mapped = str(self.code_root / "src" / "mapped.py")
+        unmapped = str(self.code_root / "src" / "unmapped.py")
+        self.seed_ledger(session_id, [(mapped, "code"), (unmapped, "code")])
+        self._prompt(session_id, env)
+        subprocess.run(["git", "-C", str(self.store_root), "commit", "-q", "--allow-empty", "-m", "move"], check=True)
+        extra = str(self.code_root / "src" / "extra.py")
+        self.seed_ledger(session_id, [(extra, "code")])
+        self._prompt(session_id, env)
+        calls = self._unmapped_calls(spy)
+        self.assertEqual(len(calls), 2, calls)
+        for p in (mapped, unmapped, extra):
+            self.assertIn(p, calls[1])
+        self.assertEqual(self.load_state(session_id)["unmapped_cache"]["store_head"], git_head(self.store_root))
+
+    def test_a_session_without_the_cache_key_classifies_everything_as_before(self):
+        spy = Path(self.td) / "unmapped-calls.log"
+        env = self._spy_env(spy)
+        session_id = "s-userprompt-incremental-legacy"
+        mapped = str(self.code_root / "src" / "mapped.py")
+        unmapped = str(self.code_root / "src" / "unmapped.py")
+        self.seed_ledger(session_id, [(mapped, "code"), (unmapped, "code")])
+        self.assertNotIn("unmapped_cache", self.load_state(session_id))
+        proc = self._prompt(session_id, env)
+        calls = self._unmapped_calls(spy)
+        self.assertEqual(len(calls), 1, calls)
+        self.assertIn(mapped, calls[0])
+        self.assertIn(unmapped, calls[0])
+        self.assertIn("1 edited file(s) with no decision topic: src/unmapped.py", proc.stdout)
+        # A malformed cache is ignored the same way.
+        self.patch_state(session_id, unmapped_cache="junk", last_injected_pairs=[])
+        self._prompt(session_id, env)
+        self.assertEqual(len(self._unmapped_calls(spy)), 2)
+
+    def test_hook_log_outcome_lines_carry_elapsed(self):
+        session_id = "s-userprompt-elapsed-field"
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+        self._prompt(session_id, self.base_env())
+        lines = [l for l in (self.home / "hook.log").read_text().splitlines() if "userprompt outcome=" in l]
+        self.assertTrue(lines)
+        for line in lines:
+            self.assertRegex(line, r" elapsed=\d+\.\ds( |$)", line)
 
     def test_uninitialized_logs_index_uninitialized(self):
         db = self.home / f"{self.project}.sqlite"
@@ -9191,6 +9666,94 @@ class TestMacOSPortMechanics(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         log_text = (home / "hook.log").read_text()
         self.assertIn("project=wd-proj", log_text, log_text)
+
+    # ---- slow-root factor (Windows-mounted code root) -------------------
+
+    def _kill_line_budget(self, name, **env_over):
+        """Run a never-finishing hook under the launcher with a 0.3 s base
+        budget and return the `budget=` field of the kill line."""
+        launcher_py = subprocess.run(
+            [MC_BASH, "-c", 'source "$1"; printf %s "$MC_WATCHDOG_LAUNCHER_PY"', "_",
+             str(HOOKS_DIR / "mc-watchdog.sh")],
+            capture_output=True, text=True, check=True,
+        ).stdout
+        home = Path(self.td) / f"factor-home-{name}"
+        home.mkdir()
+        fake_hook = Path(self.td) / f"fake-hook-{name}.sh"
+        fake_hook.write_text("#!/usr/bin/env bash\nwhile true; do sleep 0.05; done\n")
+        fake_hook.chmod(0o755)
+        env = clean_env(MEMCONTINUUM_HOME=str(home), MC_WATCHDOG_BUDGET="0.3")
+        for k in ("MEMCONTINUUM_CODE_ROOT", "MEMCONTINUUM_CODE_ROOTS",
+                  "MEMCONTINUUM_WATCHDOG_FACTOR", "MC_WATCHDOG_BUDGET_FIXED"):
+            env.pop(k, None)
+        env.update(env_over)
+        proc = subprocess.run(
+            [VENV_PYTHON, "-c", launcher_py, MC_BASH, str(fake_hook)],
+            capture_output=True, text=True, env=env, timeout=10,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        line = [l for l in (home / "hook.log").read_text().splitlines() if "watchdog-killed" in l][0]
+        fields = dict(f.split("=", 1) for f in line.split()[1:] if "=" in f)
+        return float(fields["budget"])
+
+    def test_slow_root_factor_applies_to_a_mnt_code_root(self):
+        self.assertEqual(self._kill_line_budget(
+            "mnt", MEMCONTINUUM_CODE_ROOTS='["/home/u/a", "/mnt/d/proj"]'), 0.6)
+        self.assertEqual(self._kill_line_budget(
+            "mnt1", MEMCONTINUUM_CODE_ROOT="/mnt/c/proj"), 0.6)
+
+    def test_slow_root_factor_not_applied_to_a_native_root(self):
+        self.assertEqual(self._kill_line_budget(
+            "ext4", MEMCONTINUUM_CODE_ROOTS='["/home/u/a"]'), 0.3)
+        # A malformed list is "not a slow root", never an error.
+        self.assertEqual(self._kill_line_budget(
+            "bad", MEMCONTINUUM_CODE_ROOTS="{not json"), 0.3)
+
+    def test_launcher_roots_fallbacks_match_the_engine_parser(self):
+        """The launcher repeats memidx._env_code_roots_raw (it runs before
+        anything can be imported): an empty list, a malformed value and
+        non-string elements must resolve to the same roots as the engine, so
+        the "is any root under /mnt/" answer is the same too."""
+        cases = {
+            "empty-list-no-fallback": dict(MEMCONTINUUM_CODE_ROOTS="[]", MEMCONTINUUM_CODE_ROOT="/mnt/d/p"),
+            "malformed-no-fallback": dict(MEMCONTINUUM_CODE_ROOTS="{not json", MEMCONTINUUM_CODE_ROOT="/mnt/d/p"),
+            "not-a-list": dict(MEMCONTINUUM_CODE_ROOTS='{"a": "/mnt/d/p"}', MEMCONTINUUM_CODE_ROOT="/mnt/d/p"),
+            "only-non-strings": dict(MEMCONTINUUM_CODE_ROOTS="[5, null, [\"/mnt/d/p\"]]",
+                                     MEMCONTINUUM_CODE_ROOT="/mnt/d/p"),
+            "empty-strings": dict(MEMCONTINUUM_CODE_ROOTS='[""]', MEMCONTINUUM_CODE_ROOT="/mnt/d/p"),
+            "mixed-keeps-strings": dict(MEMCONTINUUM_CODE_ROOTS='["/home/u/a", 5, "/mnt/d/p"]'),
+            "unset-falls-back": dict(MEMCONTINUUM_CODE_ROOT="/mnt/d/p"),
+            "empty-string-falls-back": dict(MEMCONTINUUM_CODE_ROOTS="", MEMCONTINUUM_CODE_ROOT="/mnt/d/p"),
+            "native": dict(MEMCONTINUUM_CODE_ROOT="/home/u/p"),
+        }
+        for name, env_over in cases.items():
+            with self.subTest(name):
+                saved = {k: os.environ.pop(k, None)
+                         for k in ("MEMCONTINUUM_CODE_ROOTS", "MEMCONTINUUM_CODE_ROOT")}
+                try:
+                    os.environ.update(env_over)
+                    engine_slow = any(r.startswith("/mnt/") for r in memidx._env_code_roots_raw())
+                finally:
+                    for k in ("MEMCONTINUUM_CODE_ROOTS", "MEMCONTINUUM_CODE_ROOT"):
+                        os.environ.pop(k, None)
+                    os.environ.update({k: v for k, v in saved.items() if v is not None})
+                budget = self._kill_line_budget("eq-" + name, **env_over)
+                self.assertEqual(budget, 0.6 if engine_slow else 0.3, (name, budget))
+
+    def test_slow_root_factor_not_applied_when_budget_is_fixed(self):
+        self.assertEqual(self._kill_line_budget(
+            "fixed", MEMCONTINUUM_CODE_ROOT="/mnt/d/proj", MC_WATCHDOG_BUDGET_FIXED="1"), 0.3)
+
+    def test_slow_root_factor_override_is_honoured(self):
+        self.assertEqual(self._kill_line_budget(
+            "x3", MEMCONTINUUM_CODE_ROOT="/mnt/d/proj", MEMCONTINUUM_WATCHDOG_FACTOR="3"), 0.9)
+        # Not a positive decimal: back to the default 2.
+        self.assertEqual(self._kill_line_budget(
+            "x0", MEMCONTINUUM_CODE_ROOT="/mnt/d/proj", MEMCONTINUUM_WATCHDOG_FACTOR="0"), 0.6)
+
+    def test_sessionend_stamp_exports_the_fixed_budget_flag(self):
+        text = (HOOKS_DIR / "sessionend-stamp.sh").read_text()
+        self.assertIn("export MC_WATCHDOG_BUDGET_FIXED=1", text)
 
     # ---- coordinator review fix: kill before writing the fallback ------
 

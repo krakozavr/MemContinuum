@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Hooks stop timing out on a Windows-mounted code root
+
+On WSL, a project whose code lives under `/mnt/` (a Windows drive) saw its prompt, edit-ledger and
+refresh hooks killed by the 2-second watchdog, because every file check crosses to the host. Three
+changes. The coverage check no longer re-walks each file's directory chain: a 422-file edit list that took
+7 s now takes about 0.6 s, with identical results. The prompt hook remembers the verdicts it already
+reached in the session and classifies only files edited since the previous prompt; the memory is dropped
+as soon as the store has a new commit or any uncommitted change (a binding being filed counts at once),
+when the index had to be rebuilt, and for any file edited again. And the watchdog gives a hook twice its
+usual time when a configured code root starts with `/mnt/` (the factor 2 is built into the launcher;
+`MEMCONTINUUM_WATCHDOG_FACTOR` in `config.sh` overrides it; the SessionEnd hook keeps its fixed budget). `hook.log` kill lines now
+show the budget that applied, and the prompt and ledger lines show `elapsed=`.
+
+    Technical: `unmapped` resolves a path as its directory (cached per call, one `lstat` per distinct directory, one listing where a directory holds several of the paths) plus a symlink check of the final name; `mc-watchdog.sh` scales `MC_WATCHDOG_BUDGET` for a `/mnt/` root and honours `MC_WATCHDOG_BUDGET_FIXED=1`; session key `unmapped_cache: {store_head, verdicts, displays, classified_at}` is read and written by `userprompt-remind.sh` under the session lock, absent or malformed means "classify everything"; whenever the hook consults the cache it makes one `unmapped` call (zero paths when nothing is new; the block is entered for a coverage candidate or a moved code HEAD, and a prompt outside both reads no cache and makes none; `unmapped` now accepts none and reports `healed`) and reuses cached verdicts only while the store HEAD is unchanged, `git status --porcelain --untracked-files=all` of the store is empty, the call did not heal the index and the file was not edited after its verdict (`seen_at` and `classified_at` are both fractional epoch seconds; a fractional `seen_at` compares strictly `>`, only a whole-second one from an older hook uses `>= floor(classified_at)`); `memlib.sh` gains `mc_elapsed_field`, built on `mc_now_ms` (now in `mc-query-lib.sh`, which `memlib.sh` sources).
+
 ### Changes to a topic's code references leave a record
 
 A topic's `code_refs` decide which files its decisions are delivered for, but a

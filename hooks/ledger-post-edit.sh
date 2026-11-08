@@ -230,21 +230,11 @@ fi
 # shellcheck source=memlib.sh
 source "$SCRIPT_DIR/memlib.sh"
 
-START_TS=$(date +%s 2>/dev/null || echo 0)
-
 finish() {
     local outcome="$1"
-    local now elapsed
-    now=$(date +%s 2>/dev/null || echo "$START_TS")
-    elapsed=$(( now - START_TS ))
-    # Same clamp as hooks/pre-edit-chain.sh's own finish() (fix round,
-    # Grok 15): the wall clock can step BACKWARDS mid-run (NTP correction,
-    # VM resume, manual set), and nothing downstream expects a sign on
-    # this field. Landed in the same commit as pre-edit-chain.sh's clamp
-    # rather than separately, since it is the identical flake in the
-    # identical shape of finish() function.
-    [ "$elapsed" -lt 0 ] && elapsed=0
-    mc_log "ledger outcome=$outcome elapsed=${elapsed}s session=${SESSION_ID:-} file=${FILE_PATH:-}"
+    # elapsed from script start, one decimal (memlib.sh's clamp covers a
+    # wall clock that steps backwards).
+    mc_log "ledger outcome=$outcome $(mc_elapsed_field) session=${SESSION_ID:-} file=${FILE_PATH:-}"
     exit 0
 }
 
@@ -283,14 +273,14 @@ case "${TOOL_NAME:-}" in
         MC_SOURCE_TAG="shell-diff"
         ;;
     "")
-        mc_log "ledger outcome=unsupported-mutation-surface tool=unknown session=${SESSION_ID:-}"
+        mc_log "ledger outcome=unsupported-mutation-surface tool=unknown $(mc_elapsed_field) session=${SESSION_ID:-}"
         MC_SOURCE_TAG="shell-diff"
         ;;
     *)
         # Any other tool name (an MCP tool, a future built-in) -- best
         # effort: named as unsupported AND still caught by the tree diff
         # below if it actually mutated something.
-        mc_log "ledger outcome=unsupported-mutation-surface tool=${TOOL_NAME} session=${SESSION_ID:-}"
+        mc_log "ledger outcome=unsupported-mutation-surface tool=${TOOL_NAME} $(mc_elapsed_field) session=${SESSION_ID:-}"
         MC_SOURCE_TAG="shell-diff"
         ;;
 esac
@@ -300,13 +290,12 @@ esac
 # identical seven-key `state.setdefault(...)` bootstrap verbatim into
 # their own python heredoc -- factored into one snippet here, concatenated
 # into both (bash 3.2-safe `'...'"$VAR"'...'` quoting), so a future new
-# default key is added once, not twice. Codex re-gate NIT 4: the same
-# duplication applied to MC_NOW -- both branches independently exported it
-# from bash and independently re-derived a float `now` from it in python;
-# both pieces now live in exactly one place each (this export, and the
-# `now` assignment inside the shared snippet below), still concatenated
-# into both payloads.
-export MC_NOW="$(date +%s 2>/dev/null || echo 0)"
+# default key is added once, not twice. The same snippet owns `now`: ONE
+# fractional epoch (python time.time(), gate round 2 R2-1) per hook run,
+# stamped as `seen_at` on every row this run writes. It has the resolution
+# of the prompt hook's `classified_at`, so an edit in the same wall second
+# as a classification is still seen as newer (a whole-second bash `date +%s`
+# lost that race); rows written by older versions stay whole seconds.
 MC_STATE_BOOTSTRAP_PY='
 def _mc_bootstrap_state(state):
     state.setdefault("user_turn_count", 0)
@@ -317,10 +306,12 @@ def _mc_bootstrap_state(state):
     state.setdefault("last_growth_turn", 0)
     state.setdefault("lookback_count", 0)
 
-try:
-    now = float(os.environ.get("MC_NOW") or time.time())
-except Exception:
-    now = time.time()
+now = time.time()
+# TEST-ONLY seam, the same flag as memlib.sh MC_T0_US: a preset MC_SEEN_NOW is
+# honoured only under MEMCONTINUUM_TEST_CLOCK=1 (the same-second tests pin the
+# edit time against a pinned verdict time). Never read otherwise.
+if os.environ.get("MEMCONTINUUM_TEST_CLOCK") == "1" and os.environ.get("MC_SEEN_NOW"):
+    now = float(os.environ["MC_SEEN_NOW"])
 '
 
 if [ "$MC_SOURCE_TAG" = "shell-diff" ]; then
@@ -369,6 +360,12 @@ def log_token(value):
     for b in os.fsencode(value)[:512]:
         out.append(chr(b) if b in keep else "%%%02X" % b)
     return "".join(out) or "-"
+
+
+def elapsed_field():
+    # Python twin of memlib.sh mc_elapsed_field: seconds since script start
+    # (MC_T0_US, exported by memlib.sh), one decimal, clamped at zero.
+    return "elapsed=%.1fs" % max(0.0, time.time() - float(os.environ.get("MC_T0_US") or 0) / 1e6)
 
 
 def log_line(text):
@@ -611,7 +608,7 @@ def scan_tree(scan_dir, kind, record_root, remap):
         state["last_growth_ts"] = now
         # worktree= goes BEFORE file=: everything after file= is the path.
         log_line(
-            "ledger outcome=appended kind=" + kind + " source=shell-diff"
+            "ledger outcome=appended kind=" + kind + " source=shell-diff " + elapsed_field()
             + ((" worktree=" + log_token(scan_dir)) if remap else "")
             + " file=" + row_path
         )
@@ -727,6 +724,7 @@ _mc_bootstrap_state(state)
 log_line(
     "ledger outcome=shell-diff appended=" + str(ctr["appended"]) + " roots=" + str(len(roots))
     + " timeouts=" + str(ctr["timeouts"]) + " non-git=" + str(ctr["non_git"])
+    + " " + elapsed_field()
     + " baseline-too-large=" + str(ctr["baseline_too_large"])
     + " worktrees=" + str(worktrees_scanned)
     + ((" worktrees-over-cap=" + str(worktrees_over_cap)) if worktrees_over_cap else "")

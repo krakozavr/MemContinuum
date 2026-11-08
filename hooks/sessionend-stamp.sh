@@ -46,6 +46,8 @@ source "${MC_WATCHDOG_LIB_PATH:-$SCRIPT_DIR/mc-watchdog.sh}" 2>/dev/null
 # header) -- tighter than the shared 2s default, so it must not eat
 # the whole harness window itself.
 export MC_WATCHDOG_BUDGET=1.2
+# Harness cap 1.5 s: the slow-root factor must not widen this one.
+export MC_WATCHDOG_BUDGET_FIXED=1
 if [ -z "${MC_UNDER_TIMEOUT:-}" ]; then
     export MC_UNDER_TIMEOUT=1
     # MC_GUARD_PY is set by mc-watchdog.sh above (F6 fix, round 4: env ->

@@ -77,7 +77,9 @@ import atexit, os, signal, subprocess, sys, time
 from datetime import datetime
 # MC_WATCHDOG_LAUNCHER: runs the real hook script as a child in its own
 # process group and enforces a wall-clock budget (MC_WATCHDOG_BUDGET env,
-# seconds, default 2 -- SessionEnd sets 1.2, its harness budget is 1.5s)
+# seconds, default 2 -- SessionEnd sets 1.2, its harness budget is 1.5s,
+# and fixes it with MC_WATCHDOG_BUDGET_FIXED=1; a /mnt/ code root widens it
+# by MEMCONTINUUM_WATCHDOG_FACTOR, default 2)
 # for the whole run. On expiry, OR if this launcher itself receives
 # SIGTERM/SIGINT, kills the entire child group so no descendant can
 # outlive the deadline, then always exits 0.
@@ -85,6 +87,48 @@ try:
     budget = float(os.environ.get("MC_WATCHDOG_BUDGET") or 2)
 except ValueError:
     budget = 2.0
+
+
+def _slow_root_factor():
+    # A code root on a Windows mount (WSL drvfs, a path under /mnt/) pays a
+    # network round trip per filesystem call, so the hooks' own work is
+    # slower there for reasons that are not a hang. Fixed budgets
+    # (SessionEnd's harness cap) opt out with MC_WATCHDOG_BUDGET_FIXED=1. Anything unparseable means
+    # "not a slow root": the factor is only ever a widening, never a risk.
+    if os.environ.get("MC_WATCHDOG_BUDGET_FIXED") == "1":
+        return 1.0
+    # The roots rule is memidx._env_code_roots_raw (python) and
+    # hooks/memlib.sh mc_code_roots (bash); this launcher runs before either
+    # can be imported or sourced, so it repeats it here with the SAME
+    # semantics: a non-empty MEMCONTINUUM_CODE_ROOTS is authoritative (a
+    # malformed value, a non-list or an empty list means NO roots -- it does
+    # not fall back to MEMCONTINUUM_CODE_ROOT; non-string and empty elements
+    # are dropped); only an unset/empty one falls back to the single
+    # MEMCONTINUUM_CODE_ROOT. tests.test_write_hooks pins the equivalence.
+    roots = []
+    raw = os.environ.get("MEMCONTINUUM_CODE_ROOTS", "")
+    if raw:
+        try:
+            import json
+            parsed = json.loads(raw)
+        except Exception:
+            parsed = []
+        if isinstance(parsed, list):
+            roots = [r for r in parsed if isinstance(r, str) and r]
+    elif os.environ.get("MEMCONTINUUM_CODE_ROOT"):
+        roots = [os.environ["MEMCONTINUUM_CODE_ROOT"]]
+    if not any(r.startswith("/mnt/") for r in roots):
+        return 1.0
+    try:
+        factor = float(os.environ.get("MEMCONTINUUM_WATCHDOG_FACTOR") or 2)
+        if not factor > 0 or factor == float("inf"):
+            factor = 2.0
+    except ValueError:
+        factor = 2.0
+    return factor
+
+
+budget *= _slow_root_factor()
 
 proc = None
 # Finding 6 (LOW, startup signal race): a SIGTERM/SIGINT can land while
@@ -176,7 +220,7 @@ def _log_watchdog_kill():
             except Exception:
                 pass
         with open(os.path.join(home, "hook.log"), "a") as f:
-            f.write(f"{ts} outcome=watchdog-killed hook={hook_name} project={project}{fb_started}\n")
+            f.write(f"{ts} outcome=watchdog-killed hook={hook_name} project={project} budget={budget:g}{fb_started}\n")
     except Exception:
         pass
 
@@ -297,4 +341,6 @@ unset MC_HOME_CONFIG_1
 # again (regate round 2). Export is safe: same value this chain would
 # resolve, just made visible across the re-exec boundary.
 export MEMCONTINUUM_HOME
+# The slow-root factor (config.sh) must reach the launcher's environment.
+if [ -n "${MEMCONTINUUM_WATCHDOG_FACTOR:-}" ]; then export MEMCONTINUUM_WATCHDOG_FACTOR; fi
 MC_GUARD_PY="${MEMCONTINUUM_PYTHON:-$SCRIPT_DIR/../.venv/bin/python}"

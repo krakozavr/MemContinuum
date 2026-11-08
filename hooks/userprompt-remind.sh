@@ -114,9 +114,22 @@
 #
 # Evidence is computed LIVE here (not read from state.pending, which is only
 # populated around a compaction) -- but only once cooldown+growth already
-# passed, via one `memidx.py unmapped` call (self-healing) over the ledger's
-# code-root paths, so the (comparatively expensive) classification only runs
-# on turns that were already going to inject something.
+# passed, via ONE `memidx.py unmapped` call (self-healing) per such turn. The
+# call carries only the code paths NEW since the previous prompt (or none at
+# all: it is the index-state check and the stale self-heal either way; the
+# contract is "the engine is consulted whenever the cache is": the block is
+# entered for a coverage candidate or a moved code HEAD, and a prompt outside
+# both reads no cache and makes no call); the
+# verdicts of the other paths come from the session's unmapped_cache, which is
+# reused only while the store HEAD is unchanged, the store worktree is clean
+# (git status --porcelain, untracked included), the call did not heal the
+# index and the path was not edited again since its verdict (the ledger
+# seen_at, fractional epoch seconds like classified_at, is not newer than the
+# verdict: a fractional seen_at compares strictly `>` classified_at; only a
+# whole-second seen_at from an older hook uses `>= floor(classified_at)`);
+# otherwise every path is reclassified and the cache
+# rebuilt. The classification therefore only runs on turns that were already
+# going to inject something, and costs only what is new.
 #
 # Always exits 0 and prints nothing on any failure (fail-open). This hook
 # makes many SEQUENTIAL python calls with no timeout of their own any more
@@ -339,9 +352,9 @@ print(json.dumps(state))
     fi
     [ -n "$DECIDE_TMP" ] && rm -f "$DECIDE_TMP" 2>/dev/null
     if [ -n "$extra" ]; then
-        mc_log "userprompt outcome=$outcome $extra session=${SESSION_ID:-}"
+        mc_log "userprompt outcome=$outcome $extra session=${SESSION_ID:-} $(mc_elapsed_field)"
     else
-        mc_log "userprompt outcome=$outcome session=${SESSION_ID:-}"
+        mc_log "userprompt outcome=$outcome session=${SESSION_ID:-} $(mc_elapsed_field)"
     fi
     exit 0
 }
@@ -513,6 +526,14 @@ if (not is_dup) or retry:
     code_paths = sorted({
         e["path"] for e in ledger if e.get("kind") == "code" and e.get("path")
     })
+    # Latest edit time per code path, so a cached verdict older than its
+    # path latest edit is not reused (see the classification cache below).
+    code_seen_at = {}
+    for e in ledger:
+        if e.get("kind") == "code" and e.get("path"):
+            t = e.get("seen_at")
+            if isinstance(t, (int, float)) and not isinstance(t, bool):
+                code_seen_at[e["path"]] = max(code_seen_at.get(e["path"], 0), t)
 
     # T-thin look-back candidacy (docs/DESIGN.md):
     # evaluated independently of coverage candidacy -- it must still fire
@@ -541,6 +562,8 @@ if (not is_dup) or retry:
         "now": now,
         "pairs": [list(p) for p in pairs],
         "code_paths": code_paths,
+        "seen_at": code_seen_at,
+        "unmapped_cache": state.get("unmapped_cache"),
         "lookback_eligible": lookback_eligible,
         "since_turn": since_turn,
     })
@@ -646,7 +669,7 @@ if [ "$PQ_ON" = "1" ]; then
     PQ_TERMS_LOGGED="${PROMPT_TERMS:-}"
     PQ_TERMS_LOGGED="${PQ_TERMS_LOGGED// /+}"
     if [ "${RETRY:-0}" = "1" ]; then
-        mc_log "userprompt outcome=prompt-query-empty reason=retry q=$PQ_TERMS_LOGGED session=${SESSION_ID:-}"
+        mc_log "userprompt outcome=prompt-query-empty reason=retry q=$PQ_TERMS_LOGGED session=${SESSION_ID:-} $(mc_elapsed_field)"
     elif [ "${PROMPT_SOURCE:-}" = "machine" ]; then
         # TOP-0133 L3: Claude Code delivers subagent hand-back reports,
         # background-task notifications, and cross-session messages
@@ -655,11 +678,11 @@ if [ "$PQ_ON" = "1" ]; then
         # BEFORE tokenizing it and reports it here as PROMPT_SOURCE --
         # never tokenized, never searched, q= stays empty the same way
         # too-few-terms's own line does.
-        mc_log "userprompt outcome=prompt-query-empty reason=non-user q= session=${SESSION_ID:-}"
+        mc_log "userprompt outcome=prompt-query-empty reason=non-user q= session=${SESSION_ID:-} $(mc_elapsed_field)"
     elif [ -z "${PROMPT_TERMS:-}" ]; then
-        mc_log "userprompt outcome=prompt-query-empty reason=too-few-terms q= session=${SESSION_ID:-}"
+        mc_log "userprompt outcome=prompt-query-empty reason=too-few-terms q= session=${SESSION_ID:-} $(mc_elapsed_field)"
     elif [ -z "${MEMCONTINUUM_ROOT:-}" ]; then
-        mc_log "userprompt outcome=prompt-query-empty reason=store-root-unset q=$PQ_TERMS_LOGGED session=${SESSION_ID:-}"
+        mc_log "userprompt outcome=prompt-query-empty reason=store-root-unset q=$PQ_TERMS_LOGGED session=${SESSION_ID:-} $(mc_elapsed_field)"
     else
         PQ_LIB_OK=1
         # shellcheck source=mc-query-lib.sh
@@ -669,7 +692,7 @@ if [ "$PQ_ON" = "1" ]; then
             source "$SCRIPT_DIR/mc-fallback-lib.sh" 2>/dev/null || PQ_LIB_OK=0
         fi
         if [ "$PQ_LIB_OK" != "1" ]; then
-            mc_log "userprompt outcome=prompt-query-empty reason=lib-missing q=$PQ_TERMS_LOGGED session=${SESSION_ID:-}"
+            mc_log "userprompt outcome=prompt-query-empty reason=lib-missing q=$PQ_TERMS_LOGGED session=${SESSION_ID:-} $(mc_elapsed_field)"
         else
             # ONE process, mirroring pre-edit-chain.sh's own FB_ARGS
             # exactly except `--mode fts` always (never
@@ -713,10 +736,10 @@ if [ "$PQ_ON" = "1" ]; then
 
             if [ -z "$FB_HITS" ] || [ "$FB_HITS" = "0" ]; then
                 [ -z "$FB_REASON" ] && FB_REASON="no-hits"
-                mc_log "userprompt outcome=prompt-query-empty reason=$FB_REASON q=$PQ_TERMS_LOGGED$PQ_MS_PART session=${SESSION_ID:-}"
+                mc_log "userprompt outcome=prompt-query-empty reason=$FB_REASON q=$PQ_TERMS_LOGGED$PQ_MS_PART session=${SESSION_ID:-} $(mc_elapsed_field)"
             else
                 PQ_TEXT="$FB_TEXT"
-                mc_log "userprompt outcome=prompt-query hits=$FB_HITS ids=$FB_IDS q=$PQ_TERMS_LOGGED$PQ_MS_PART session=${SESSION_ID:-}"
+                mc_log "userprompt outcome=prompt-query hits=$FB_HITS ids=$FB_IDS q=$PQ_TERMS_LOGGED$PQ_MS_PART session=${SESSION_ID:-} $(mc_elapsed_field)"
                 # No-write property: the search call above is
                 # --read-only; the ONE state write this channel ever
                 # makes is titling, same as L1 -- FILE_PATH is the
@@ -792,21 +815,81 @@ if [ "${CANDIDATE:-0}" = "1" ] || [ -n "$MOVED_ROOTS" ]; then
     # pipe, which would run the loop in a subshell and drop the assignments)
     # feeding a plain while-read loop is the portable equivalent.
     CODE_PATHS=()
+    NEW_PATHS=()
+    UC_REUSE=0
+    UC_STARTED=""
+    # The store worktree must be CLEAN for a cached verdict to be reused: an
+    # uncommitted bind or a new topics/*.md is the usual filing state, and
+    # waiting for the commit would be too late for the coverage nudge.
+    # Untracked files count (a new topic is untracked until it is added).
+    STORE_DIRTY=0
+    if [ -n "${MEMCONTINUUM_ROOT:-}" ] && [ -n "$CUR_STORE_SHA" ]; then
+        if [ -n "$(git -C "$MEMCONTINUUM_ROOT" status --porcelain --untracked-files=all 2>>"$MC_LOG")" ]; then
+            STORE_DIRTY=1
+        fi
+    fi
     while IFS= read -r p; do
-        CODE_PATHS+=("$p")
+        case "$p" in
+            P:*) CODE_PATHS+=("${p#P:}") ;;
+            N:*) NEW_PATHS+=("${p#N:}") ;;
+            R:*) UC_REUSE="${p#R:}" ;;
+            T:*) UC_STARTED="${p#T:}" ;;
+        esac
     done < <(env PYTHONPATH= "$MC_PY" -c '
-import json, sys
+import json, sys, time
 with open(sys.argv[1]) as f:
     d = json.load(f)
+# The session keeps the verdicts of the previous prompts (unmapped_cache).
+# They are reusable only at the store HEAD they were made at AND while the
+# store worktree is clean; a missing, malformed, other-HEAD or dirty-store
+# cache means every path is new. A path whose latest ledger edit (seen_at)
+# is newer than its verdict (classified_at) is new too: a fractional seen_at
+# compares strictly `>`; only a whole-second one (an older hook version, or a
+# time.time() that happens to be integral) uses `>= floor(classified_at)`: a re-edit, a
+# symlink swap or a replace reclassifies that path alone. T: is the moment
+# this classification starts (recorded as the verdict time of every path
+# classified now, so an edit landing during the call is still newer).
+cache = d.get("unmapped_cache")
+sha, dirty = sys.argv[2], sys.argv[3] == "1"
+verdicts, stamps = {}, {}
+reuse = False
+if sha and not dirty and isinstance(cache, dict) and cache.get("store_head") == sha \
+        and isinstance(cache.get("verdicts"), dict) \
+        and isinstance(cache.get("displays"), dict) \
+        and isinstance(cache.get("classified_at"), dict):
+    verdicts, stamps = cache["verdicts"], cache["classified_at"]
+    reuse = True
+seen = d.get("seen_at") if isinstance(d.get("seen_at"), dict) else {}
+def num(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+print("R:" + ("1" if reuse else "0"))
+print("T:" + repr(time.time()))
 for p in d.get("code_paths", []):
-    print(p)
-' "$DECIDE_TMP" 2>>"$MC_LOG")
+    print("P:" + p)
+    sv, cv = num(seen.get(p)), num(stamps.get(p))
+    # A fractional seen_at (current ledger) compares strictly; a whole-second
+    # one (an older hook version, stored as 1731.0 or 1731) keeps >= floor.
+    newer = sv >= int(cv) if sv == int(sv) else sv > cv
+    if p not in verdicts or newer:
+        print("N:" + p)
+' "$DECIDE_TMP" "$CUR_STORE_SHA" "$STORE_DIRTY" 2>>"$MC_LOG")
 
     # Phase 2 (outside the lock): the real, possibly-heavier classification call.
     UNMAPPED_JSON="{}"
-    if [ "${#CODE_PATHS[@]}" -gt 0 ] && [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
+    UC_CALLED=0
+    UC_RAW=""
+    UC_TMP=""
+    UC_HEALED="false"
+    COVERAGE_STATUS=""
+    # One engine call: with the paths new since the last prompt, or with none
+    # at all -- it is made whenever the cache is consulted, because the call is also the index-state
+    # check and the stale self-heal that every reused verdict depends on.
+    # Sets RC, UC_RAW, COVERAGE_STATUS and UC_HEALED; no logging (the caller
+    # logs once, for the final answer).
+    _uc_call() {
+        local ARGS CR RAW
         ARGS=(unmapped)
-        ARGS+=("${CODE_PATHS[@]}")
+        if [ "$#" -gt 0 ]; then ARGS+=("$@"); fi
         ARGS+=(--root "$MEMCONTINUUM_ROOT" --project "$MC_PROJECT" --db "$MC_DB_PATH" --json)
         while IFS= read -r CR; do
             [ -n "$CR" ] || continue
@@ -814,36 +897,66 @@ for p in d.get("code_paths", []):
         done <<<"$CODE_ROOTS_TEXT"
         RAW="$(env PYTHONPATH= "$MC_PY" "$MC_MEMIDX" "${ARGS[@]}" 2>>"$MC_LOG")"
         RC=$?
-        # F1 (ruling 68): `unmapped` now exits 1 (not just 0) on a genuine
-        # coverage_status still worth reading -- uninitialized/upgrade-
-        # required/index-error all print a real JSON body on stderr-free
-        # stdout, just with an empty unmapped list. Accept RC 0 or 1, then
-        # log a distinct outcome per coverage_status so a still-degraded
-        # index is visible in hook.log, not silently folded into whatever
-        # the existing coverage_status != "ok" branch below already does.
+        UC_RAW=""
+        COVERAGE_STATUS=""
+        UC_HEALED="false"
+        # F1 (ruling 68): `unmapped` exits 1 (not just 0) on a coverage_status
+        # still worth reading -- uninitialized/upgrade-required/index-error
+        # all print a real JSON body with an empty unmapped list. Accept RC 0
+        # or 1.
         if { [ $RC -eq 0 ] || [ $RC -eq 1 ]; } && [ -n "$RAW" ]; then
-            UNMAPPED_JSON="$RAW"
-            COVERAGE_STATUS="$(printf '%s' "$RAW" | env PYTHONPATH= "$MC_PY" -c '
+            UC_RAW="$RAW"
+            { IFS= read -r COVERAGE_STATUS; IFS= read -r UC_HEALED; } < <(printf '%s' "$RAW" | env PYTHONPATH= "$MC_PY" -c '
 import json, sys
 try:
-    print((json.load(sys.stdin) or {}).get("coverage_status", "unknown"))
+    d = json.load(sys.stdin) or {}
+    print(d.get("coverage_status", "unknown"))
+    print("true" if d.get("healed") is True else "false")
 except Exception:
     print("unknown")
-' 2>/dev/null)"
+    print("false")
+' 2>/dev/null)
+        fi
+    }
+    # Drops the session's verdict cache in one short locked write.
+    _uc_drop_cache() {
+        mc_update_state_json "$STATE_FILE" '
+state.pop("unmapped_cache", None)
+print(json.dumps(state))
+' >>"$MC_LOG" 2>&1
+    }
+    if [ "${#CODE_PATHS[@]}" -gt 0 ] && [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
+        UC_CALLED=1
+        # A reusable cache is removed from the session file BEFORE the first
+        # call (the merge below reads the snapshot taken at decision time, not
+        # the file): the first call is the one that can heal the index, and a
+        # kill anywhere between it and the write-back must leave NO cache for a
+        # later prompt to reuse. It is republished after a good classification.
+        if [ "$UC_REUSE" = "1" ]; then _uc_drop_cache; fi
+        if [ "${#NEW_PATHS[@]}" -gt 0 ]; then _uc_call "${NEW_PATHS[@]}"; else _uc_call; fi
+        # The call healed a stale index: the verdicts reused from earlier
+        # prompts were made against the index as it was BEFORE the rebuild
+        # (an unmapped may have just become bound), so every path is
+        # reclassified against the healed one. The cache is already gone (above).
+        if [ "$UC_HEALED" = "true" ] && [ "$UC_REUSE" = "1" ]; then
+            UC_REUSE=0
+            NEW_PATHS=("${CODE_PATHS[@]}")
+            _uc_call "${NEW_PATHS[@]}"
+        fi
+        if [ -n "$UC_RAW" ]; then
+            UNMAPPED_JSON="$UC_RAW"
             case "$COVERAGE_STATUS" in
-                uninitialized)      mc_log "userprompt outcome=index-uninitialized session=${SESSION_ID:-}" ;;
-                upgrade-required)   mc_log "userprompt outcome=index-upgrade-required session=${SESSION_ID:-}" ;;
-                index-error)        mc_log "userprompt outcome=index-error session=${SESSION_ID:-}" ;;
-                quarantined)        mc_log "userprompt outcome=index-quarantined session=${SESSION_ID:-}" ;;
+                uninitialized)      mc_log "userprompt outcome=index-uninitialized session=${SESSION_ID:-} $(mc_elapsed_field)" ;;
+                upgrade-required)   mc_log "userprompt outcome=index-upgrade-required session=${SESSION_ID:-} $(mc_elapsed_field)" ;;
+                index-error)        mc_log "userprompt outcome=index-error session=${SESSION_ID:-} $(mc_elapsed_field)" ;;
+                quarantined)        mc_log "userprompt outcome=index-quarantined session=${SESSION_ID:-} $(mc_elapsed_field)" ;;
             esac
             # Design R7 (audit MC-P2-03, TOP-0123 L7): a typed internal
             # error collapses coverage_status to "unknown" like any other
-            # read failure (no new case arm there -- see 2.3 of the map),
-            # but carries its own `degraded` object naming the reason. One
-            # more hook.log token, same case-arm style as index-error
-            # above, so `stats` can count it separately from a plain
-            # unknown.
-            DEGRADED_REASON="$(printf '%s' "$RAW" | env PYTHONPATH= "$MC_PY" -c '
+            # read failure, but carries its own `degraded` object naming the
+            # reason. One more hook.log token so `stats` can count it
+            # separately from a plain unknown.
+            DEGRADED_REASON="$(printf '%s' "$UC_RAW" | env PYTHONPATH= "$MC_PY" -c '
 import json, sys
 try:
     d = (json.load(sys.stdin) or {}).get("degraded")
@@ -852,8 +965,122 @@ except Exception:
 print(d.get("reason_code", "") if isinstance(d, dict) else "")
 ' 2>/dev/null)"
             if [ -n "$DEGRADED_REASON" ]; then
-                mc_log "userprompt outcome=index-degraded reason=${DEGRADED_REASON} session=${SESSION_ID:-}"
+                mc_log "userprompt outcome=index-degraded reason=${DEGRADED_REASON} session=${SESSION_ID:-} $(mc_elapsed_field)"
             fi
+        fi
+    fi
+
+    # Incremental classification: fold the verdicts of the paths just
+    # classified into the session's cache and rebuild the FULL answer the
+    # rest of this hook reads (the lists, by_path, coverage_status), so the
+    # message is the same whether a path was classified now or earlier. The
+    # cache is replaced only on a coverage_status of "ok" and dropped
+    # otherwise (and when the answer does not account for a fresh path); an
+    # other-HEAD or dirty-store cache, a healed index and a re-edited path
+    # already made their paths new above (UC_REUSE, NEW_PATHS).
+    if [ "${#CODE_PATHS[@]}" -gt 0 ] && [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
+        UC_TMP="$(mktemp 2>/dev/null)" || UC_TMP=""
+        if [ -n "$UC_TMP" ]; then
+            UC_NEW_TEXT=""
+            if [ "${#NEW_PATHS[@]}" -gt 0 ]; then UC_NEW_TEXT="$(printf '%s\n' "${NEW_PATHS[@]}")"; fi
+            UC_MERGED="$(MC_UC_RAW="$UC_RAW" MC_UC_CALLED="$UC_CALLED" MC_UC_OUT="$UC_TMP" \
+                MC_UC_REUSE="$UC_REUSE" MC_UC_STARTED="$UC_STARTED" MC_UC_NEW="$UC_NEW_TEXT" \
+                env PYTHONPATH= "$MC_PY" -c '
+import json, os, sys, time
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+sha = sys.argv[2]
+code_paths = d.get("code_paths", [])
+cache = d.get("unmapped_cache")
+verdicts, displays, stamps = {}, {}, {}
+had_cache = isinstance(cache, dict) and bool(cache)
+new = {p for p in os.environ.get("MC_UC_NEW", "").splitlines() if p}
+if os.environ.get("MC_UC_REUSE") == "1" and had_cache \
+        and isinstance(cache.get("verdicts"), dict) and isinstance(cache.get("displays"), dict) \
+        and isinstance(cache.get("classified_at"), dict):
+    verdicts, displays = dict(cache["verdicts"]), dict(cache["displays"])
+    stamps = dict(cache["classified_at"])
+    for p in new:
+        verdicts.pop(p, None)
+        displays.pop(p, None)
+        stamps.pop(p, None)
+try:
+    started = float(os.environ.get("MC_UC_STARTED") or time.time())
+except ValueError:
+    started = time.time()
+called = os.environ.get("MC_UC_CALLED") == "1"
+raw = None
+if os.environ.get("MC_UC_RAW"):
+    try:
+        raw = json.loads(os.environ["MC_UC_RAW"])
+    except Exception:
+        raw = None
+    if not isinstance(raw, dict):
+        raw = None
+
+
+def drop_cache():
+    # {} in the file removes the stored cache.
+    with open(os.environ["MC_UC_OUT"], "w") as f:
+        f.write(json.dumps({}) if had_cache else "")
+
+
+new_cache = None  # None: leave the stored cache alone
+if called:
+    if raw is None:
+        print("{}")
+        raise SystemExit(0)
+    if raw.get("coverage_status") != "ok":
+        # No coverage claim: the answer is the call own, the cache goes.
+        print(json.dumps(raw))
+        drop_cache()
+        raise SystemExit(0)
+    fresh = [p for p in code_paths if p not in verdicts]
+    queues = {k: list(raw.get(k) or []) for k in ("mapped_topic", "mapped_concept_only", "unmapped")}
+    by = raw.get("by_path") if isinstance(raw.get("by_path"), dict) else {}
+    for p in fresh:
+        st = by.get(p)
+        if st not in queues or not queues[st]:
+            # The answer does not account for this path: no claim, and no
+            # cache either (the next prompt reclassifies everything).
+            print(json.dumps(raw))
+            drop_cache()
+            raise SystemExit(0)
+        verdicts[p] = st
+        displays[p] = queues[st].pop(0)
+        stamps[p] = started
+    new_cache = {"store_head": sha, "verdicts": {p: verdicts[p] for p in code_paths},
+                 "displays": {p: displays[p] for p in code_paths},
+                 "classified_at": {p: stamps[p] for p in code_paths}} if sha else None
+elif not verdicts:
+    print("{}")
+    raise SystemExit(0)
+out = dict(raw) if raw else {}
+out["coverage_status"] = "ok"
+for k in ("mapped_topic", "mapped_concept_only", "unmapped"):
+    out[k] = [displays[p] for p in code_paths if verdicts.get(p) == k]
+out["by_path"] = {p: verdicts[p] for p in code_paths if p in verdicts}
+print(json.dumps(out))
+if new_cache is not None:
+    with open(os.environ["MC_UC_OUT"], "w") as f:
+        f.write(json.dumps(new_cache))
+' "$DECIDE_TMP" "$CUR_STORE_SHA" 2>>"$MC_LOG")"
+            if [ -n "$UC_MERGED" ]; then
+                UNMAPPED_JSON="$UC_MERGED"
+            fi
+            if [ -s "$UC_TMP" ]; then
+                MC_UC_FILE="$UC_TMP" mc_update_state_json "$STATE_FILE" '
+import os
+with open(os.environ["MC_UC_FILE"]) as _f:
+    _c = json.load(_f)
+if _c:
+    state["unmapped_cache"] = _c
+else:
+    state.pop("unmapped_cache", None)
+print(json.dumps(state))
+' >>"$MC_LOG" 2>&1
+            fi
+            rm -f "$UC_TMP" 2>/dev/null
         fi
     fi
 
@@ -1053,7 +1280,7 @@ print(json.dumps(state))
             if [ -s "$NUDGE_TMP" ]; then
                 while IFS=$'\t' read -r NUDGE_SHA NUDGE_ROOT NUDGE_FACT; do
                     [ -n "$NUDGE_SHA" ] || continue
-                    mc_log "userprompt outcome=commit-nudge sha=$NUDGE_SHA root=$NUDGE_ROOT session=${SESSION_ID:-}"
+                    mc_log "userprompt outcome=commit-nudge sha=$NUDGE_SHA root=$NUDGE_ROOT session=${SESSION_ID:-} $(mc_elapsed_field)"
                     if [ -n "$NUDGE_FACT_TEXT" ]; then
                         NUDGE_FACT_TEXT="$NUDGE_FACT_TEXT
 $NUDGE_FACT"

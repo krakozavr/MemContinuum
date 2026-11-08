@@ -1682,6 +1682,28 @@ takes the two fields it needs from it even when the JSON is cut short. The shell
 `MEMCONTINUUM_CODE_REFRESH_BUDGET` once and exports the result as `MC_WATCHDOG_BUDGET`; the
 Python side reads only that.
 
+A code root on a Windows mount is slower for reasons that are not a hang: every filesystem call
+crosses to the host, so the same hook does the same work several times slower. The launcher therefore
+multiplies whatever budget it was given by `MEMCONTINUUM_WATCHDOG_FACTOR` (the default 2 lives in
+the launcher; the installer does not seed it, and a value in `config.sh` overrides it; a positive decimal,
+anything else means 2) when any configured code root starts with
+`/mnt/` (`MEMCONTINUUM_CODE_ROOTS`, a JSON list, else `MEMCONTINUUM_CODE_ROOT`, read exactly as the engine reads
+them: a non-empty list value is authoritative, so a malformed or empty one means no roots); native Linux and macOS
+roots never match. `sessionend-stamp.sh` sets `MC_WATCHDOG_BUDGET_FIXED=1` and is exempt, because its
+1.5 s harness cap cannot stretch. The kill line in `hook.log` carries `budget=<effective seconds>`, and the
+prompt and ledger hooks log `elapsed=<seconds>s` on every outcome line, so the next sizing is read from
+the log. Two changes keep the work itself small on such a mount: `memidx.py unmapped` resolves each
+distinct directory once per call (a symlinked file or directory still resolves to the same root), and the
+prompt hook keeps its per-path verdicts in the session file (`unmapped_cache`) so a prompt classifies only
+the paths edited since the previous one. Whenever the prompt hook consults the cache it makes one `unmapped` call, with the new
+paths or with none (the block is entered for a coverage candidate or a moved code HEAD; a prompt outside both reads no cache and makes no call), because that call is also the index-state check and the stale self-heal; cached
+verdicts are reused only while the store HEAD is unchanged, the store worktree is clean (a bind being filed
+is uncommitted by construction), the call did not heal the index (`healed` in its JSON), and the path was not
+edited again since its verdict (the ledger `seen_at` and `classified_at` are both fractional epoch seconds; a fractional `seen_at` makes a path new when `seen_at > classified_at`; only a whole-second `seen_at` (rows from older hook versions, or an integral `time.time()`) uses `seen_at >= floor(classified_at)`, which costs at most one extra classification and never a miss). Anything else reclassifies
+every path and rebuilds the cache. A directory listing is only a fast path for names it contains; a name it
+does not contain is checked with `lstat`, because a Unicode-normalising or case-insensitive mount can
+resolve a spelling the listing does not show.
+
 `pre-edit-chain.sh`'s own inner budget is confirmed against a real
 measurement of its wired command line across the engine's own store and two
 other real, live projects' stores, one of them hosted entirely on a slow
