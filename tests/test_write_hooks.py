@@ -3997,6 +3997,47 @@ class TestUserPromptRemind(HookTestBase):
         self.assertEqual(sorted(self._call_paths(calls[2])), sorted([mapped, unmapped, extra]))
         self.assertNotIn("src/unmapped.py", proc.stdout)
 
+    def test_a_failed_recall_after_a_heal_leaves_no_reusable_cache(self):
+        """Gate round 2 R2-2: the heal happened, then the full re-call died.
+        The pre-heal verdicts must not survive for a later prompt to reuse."""
+        spy = Path(self.td) / "unmapped-calls.log"
+        wrapper = Path(self.td) / "py-die-on-third.sh"
+        wrapper.write_text(
+            "#!/usr/bin/env bash\n"
+            'case "${1##*/} ${2:-}" in "memidx.py unmapped")\n'
+            '  printf "%s\\n" "$*" >> "' + str(spy) + '"\n'
+            '  n=$(wc -l < "' + str(spy) + '")\n'
+            '  if [ "$n" = "3" ]; then exit 2; fi;;\n'
+            "esac\n"
+            'exec "' + VENV_PYTHON + '" "$@"\n'
+        )
+        wrapper.chmod(0o755)
+        dying_env = self.base_env(MEMCONTINUUM_PYTHON=str(wrapper))
+        session_id = "s-userprompt-incremental-heal-crash"
+        mapped = str(self.code_root / "src" / "mapped.py")
+        unmapped = str(self.code_root / "src" / "unmapped.py")
+        self.seed_ledger(session_id, [(mapped, "code"), (unmapped, "code")])
+        self._prompt(session_id, dying_env)
+        _write(self.store_root / "topics" / "testing" / "bind-unmapped.md",
+               TOPIC_MD.replace("TOP-9001", "TOP-9002").replace("src/mapped.py", "src/unmapped.py"))
+        subprocess.run(["git", "-C", str(self.store_root), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(self.store_root), "commit", "-q", "-m", "bind"], check=True)
+        cache = json.loads(self.state_file(session_id).read_text())["unmapped_cache"]
+        cache["store_head"] = git_head(self.store_root)
+        extra = str(self.code_root / "src" / "extra.py")
+        self.seed_ledger(session_id, [(extra, "code")])
+        self.patch_state(session_id, unmapped_cache=cache, last_injected_pairs=[])
+        self._prompt(session_id, dying_env)  # call 2 heals, call 3 dies
+        self.assertEqual(len(self._unmapped_calls(spy)), 3)
+        self.assertNotIn("unmapped_cache", self.load_state(session_id))
+        # The next prompt (a healthy engine) reclassifies every path.
+        self.patch_state(session_id, last_injected_pairs=[])
+        proc = self._prompt(session_id, self._spy_env(spy))
+        calls = self._unmapped_calls(spy)
+        self.assertEqual(len(calls), 4, calls)
+        self.assertEqual(sorted(self._call_paths(calls[3])), sorted([mapped, unmapped, extra]))
+        self.assertNotIn("src/unmapped.py", proc.stdout)
+
     def test_a_re_edited_path_is_reclassified_alone(self):
         spy = Path(self.td) / "unmapped-calls.log"
         env = self._spy_env(spy)
