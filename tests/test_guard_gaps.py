@@ -1163,6 +1163,61 @@ class TestReferenceAuditCoversEveryDeliveredRecord(GuardCase):
         self.assertRefused(ref.replace(a, ""), "anchor")
 
 
+class TestRefMarksRowsValidatedOnEveryRecord(GuardCase):
+    """gate round 15 R15-1 (Sol MAJOR, Grok MAJOR 1): `ref_marks:` rows are validated by the one row
+    validator for every record that carries the block -- plain lint through the dispatch, the guard on
+    the rows new since REF -- not only for topic-like records. The forged row below lacks provenance
+    and has an invalid timestamp, yet pairs with the removal of `src/a.py`."""
+    SHAPES = {
+        "typeless": TestReferenceAuditCoversEveryDeliveredRecord.NOTE,
+        "links-empty": TestReferenceAuditCoversEveryDeliveredRecord.EMPTY_LINKS,
+        "top-id": TestReferenceAuditCoversEveryDeliveredRecord.TOP_NO_LINKS,
+    }
+    FORGED = '  - ref: "src/a.py"\n    action: remove\n    recorded_at: x\n'
+
+    def _cleared(self, text, rows):
+        return (text.replace("code_refs:\n  - src/a.py\n", "code_refs: []\nref_marks:\n" + rows))
+
+    def test_plain_lint_validates_rows_of_a_record_without_links(self):
+        for name, text in self.SHAPES.items():
+            with self.subTest(name):
+                errors, _ = lint_text(self._cleared(text, self.FORGED))
+                self.assertError(errors, "ref_marks[0]", "missing field(s)")
+                self.assertError(errors, "recorded_at must be a quoted ISO-8601 timestamp")
+                errors, _ = lint_text(self._cleared(text, rmark("src/a.py", "remove")))
+                self.assertEqual(errors, [], errors)
+
+    def test_plain_lint_validates_rows_of_an_incident(self):
+        # one validator for every record that has the block, not only for notes delivered as topics
+        text = "---\ntype: incident\nid: INC-9300\ntitle: x\nref_marks:\n" + self.FORGED + "---\n\nBody.\n"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "incidents").mkdir()
+            (root / "incidents" / "x.md").write_text(text)
+            errors, _ = memlint.lint_root(root)
+        self.assertError(errors, "ref_marks[0]", "missing field(s)")
+
+    def test_the_guard_validates_new_rows_of_a_record_without_links(self):
+        for name, text in self.SHAPES.items():
+            with self.subTest(name):
+                self.store(text)
+                self.assertRefused(self._cleared(text, self.FORGED), "ref_marks[0]", "missing field(s)",
+                                   "recorded_at must be a quoted ISO-8601 timestamp")
+
+    def test_the_guard_accepts_a_well_formed_remove_row(self):
+        for name, text in self.SHAPES.items():
+            with self.subTest(name):
+                self.store(text)
+                self.assertClean(self._cleared(text, rmark("src/a.py", "remove")))
+
+    def test_the_guard_does_not_rejudge_a_row_recorded_at_ref(self):
+        # a malformed row already at REF is frozen by the byte-for-byte freeze, not re-validated
+        text = self.SHAPES["typeless"]
+        ref = text.replace("code_refs:\n  - src/a.py\n", "code_refs:\n  - src/a.py\nref_marks:\n" + self.FORGED.replace("remove", "add"))
+        self.store(ref)
+        self.assertClean(ref.replace("Body.", "Body edited."))
+
+
 class TestSharedBlockItemDelete(unittest.TestCase):
     def test_the_helper_deletes_the_first_match_and_ignores_comments_and_quotes(self):
         lines = ["code_refs:\n", '  - "src/a.py"  # why\n', "  - src/b.py\n", "  - src/a.py\n", "x: 1\n"]

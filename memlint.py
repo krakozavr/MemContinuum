@@ -1371,6 +1371,11 @@ def lint_file(
             errors, more_warnings = lint_topic(path, fm, code_roots, strict_citations)
         else:
             errors, more_warnings = lint_record(path, fm, code_roots, strict_citations)
+        # R15-1 (gate round 15): `for-path` reads `code_refs` of every record the index delivers
+        # as a topic, links or not, and `ref_marks:` is its audit; the one row validator runs for
+        # EVERY record that carries the block (a topic ran it in `lint_topic` already).
+        if not is_topic and "ref_marks" in fm:
+            errors.extend(_ref_marks_errors(path, fm))
     return errors, warnings + more_warnings
 
 
@@ -3369,6 +3374,14 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
             errors.extend(_anchor_freeze_errors(
                 full_path, ref_old_text, anchor_rows(old_result.frontmatter),
                 ref_new_text, new_result.frontmatter, notes))
+            # R15-1: ... and the `ref_marks` rows new since REF meet the same row validator a topic's
+            # staged blob meets (`_staged_standing_errors` -> `_ref_marks_errors`); rows recorded at
+            # REF are frozen above and not re-judged (a pre-existing malformed row is grandfathered)
+            old_idents = {ref_mark_ident(r) for r in ref_mark_rows(old_result.frontmatter)}
+            new_only = [r for r in ref_mark_rows(new_result.frontmatter)
+                        if ref_mark_ident(r) is None or ref_mark_ident(r) not in old_idents]
+            if new_only:
+                errors.extend(_ref_marks_errors(full_path, {"ref_marks": new_only}))
 
         if not _is_topic_like(old_result):
             # Re-gate (Grok): a path that was not topic-like at REF (an
