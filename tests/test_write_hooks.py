@@ -4082,7 +4082,7 @@ class TestUserPromptRemind(HookTestBase):
         self._prompt(session_id, env)
         whole = float(int(time.time()))
         self._set_verdict_time(session_id, unmapped, whole + 0.99)
-        self._set_verdict_time(session_id, mapped, whole + 0.99)
+        self._set_verdict_time(session_id, mapped, whole + 5.0)  # clearly after its own edit
         # The edit of `unmapped` lands now: at or after second `whole` (a
         # rollover to the next second only makes it later still).
         self._edit_through_ledger_hook(session_id, unmapped)
