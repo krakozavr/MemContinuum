@@ -362,7 +362,7 @@ FALLBACK_COMPLEX_FIELDS = {
     "links", "code_refs", "tags", "edges", "assumptions", "invariant",
     "metadata", "ruling", "rationale", "alternatives", "evidence",
     "implemented_by", "tested_by", "governed_by", "involved_in", "anchors",
-    "standing_marks",
+    "standing_marks", "ref_marks",
 }
 
 
@@ -504,7 +504,7 @@ def validate_record_shape(fm: dict) -> list:
     if not _shape_ok_mapping(fm.get("metadata")):
         diagnostics.append(("metadata", "metadata must be a mapping"))
 
-    for key in ("anchors", "standing_marks"):
+    for key in ("anchors", "standing_marks", "ref_marks"):
         rows = fm.get(key)
         if rows and (not isinstance(rows, list) or any(not isinstance(a, dict) for a in rows)):
             diagnostics.append((key, f"{key} must be a list of mappings"))
@@ -6584,15 +6584,59 @@ def standing_mark_rows(fm: dict) -> list:
     return _mapping_rows(fm, "standing_marks")
 
 
-def standing_mark_ident(row) -> tuple | None:
-    """Identity of a mark row: `(link, action, recorded_at)` as strings, None
-    when any part is missing or not a scalar."""
+def _mark_row_ident(row, id_field: str) -> tuple | None:
+    """Identity of an audit row: `(<id_field>, action, recorded_at)` as strings,
+    None when any part is missing or not a scalar. The one definition behind
+    `standing_marks:` (id field `link`) and `ref_marks:` (id field `ref`)."""
     if not isinstance(row, dict):
         return None
-    parts = [row.get(k) for k in ("link", "action", "recorded_at")]
+    parts = [row.get(k) for k in (id_field, "action", "recorded_at")]
     if any(p is None or isinstance(p, (dict, list)) or str(p).strip() == "" for p in parts):
         return None
     return tuple(str(p) for p in parts)
+
+
+def standing_mark_ident(row) -> tuple | None:
+    """Identity of a mark row: `(link, action, recorded_at)` as strings, None
+    when any part is missing or not a scalar."""
+    return _mark_row_ident(row, "link")
+
+
+# `ref_marks:` -- the frozen audit of `code_refs:` membership changes, on the
+# same topic, shaped like `standing_marks:` with `ref` for `link`. Written by
+# `bind` / `unbind`; read by memlint (plain rules, the `anchors:` rule, and the
+# --against-ref guard). Never delivered, never indexed.
+REF_MARK_FIELDS = ("ref", "action", "date", "recorded_at", "recorded_by", "authority",
+                   "source", "why")
+REF_MARK_QUOTED_FIELDS = frozenset({"ref", "recorded_at", "source", "why"})
+REF_MARK_ACTIONS = STANDING_MARK_ACTIONS
+
+
+def ref_mark_rows(fm: dict) -> list:
+    """The well-formed (mapping) rows of a topic's `ref_marks:` list, newest first."""
+    return _mapping_rows(fm, "ref_marks")
+
+
+def ref_mark_ident(row) -> tuple | None:
+    """Identity of a reference-mark row: `(ref, action, recorded_at)`."""
+    return _mark_row_ident(row, "ref")
+
+
+def ref_latest_action(fm: dict, ref: str) -> str | None:
+    """The action of the NEWEST `ref_marks:` row for `ref` (rows are written
+    newest first, so the first match in file order), None when there is none.
+    Rows are append-only: an old `remove` stays after a later `add`, so "was
+    ever removed" is the wrong question -- this is the right one."""
+    for row in ref_mark_rows(fm):
+        if str(row.get("ref")) == ref:
+            return str(row.get("action"))
+    return None
+
+
+def code_ref_set(fm: dict) -> set:
+    """A topic's `code_refs:` as a set of strings (membership is order-free)."""
+    value = fm.get("code_refs")
+    return {str(x) for x in value} if isinstance(value, list) else set()
 
 
 def standing_ids(fm: dict) -> list:

@@ -71,7 +71,13 @@ from memidx import (
     newest_active_link,
     parse_record,
     parse_record_raw,
+    code_ref_set,
+    ref_latest_action,
+    ref_mark_ident,
+    ref_mark_rows,
     standing_digest_text,
+    REF_MARK_ACTIONS,
+    REF_MARK_FIELDS,
     STANDING_MARK_ACTIONS,
     STANDING_MARK_FIELDS,
     standing_ids,
@@ -179,8 +185,13 @@ def _anchor_errors(path, fm: dict, topic_link_ids: set) -> list[str]:
     for i, row in enumerate(rows):
         ref = row.get("ref")
         prefix = f"{path}: anchors[{i}] ({ref!r})"
-        if ref is None or str(ref) not in code_refs:
-            errors.append(f"{prefix}: ref is not present verbatim in this topic's code_refs")
+        if ref is not None and str(ref) not in code_refs and ref_latest_action(fm, str(ref)) == "remove":
+            # unbound: the newest `ref_marks:` row for this ref is a `remove`, so the frozen
+            # capture stays as history (a later `add` re-arms the requirement)
+            pass
+        elif ref is None or str(ref) not in code_refs:
+            errors.append(f"{prefix}: ref is not present verbatim in this topic's code_refs "
+                          "(or unbound by a newest `remove` row in ref_marks)")
         elif not code_ref_is_anchorable(str(ref)):
             errors.append(
                 f"{prefix}: ref is a prefix or glob -- those are 'not checked' by definition "
@@ -239,31 +250,33 @@ def _mark_time_problems(row: dict) -> list[str]:
     return []
 
 
-def _standing_marks_errors(path, fm: dict, topic_link_ids: set) -> list[str]:
-    """Validation of a topic's `standing_marks:` rows (docs/SCHEMA.md, "Standing
-    marks"). Rows are NEVER required: a topic marked before this block existed
-    carries none and is clean (TOP-0136 L1)."""
-    rows = standing_mark_rows(fm)
+def _mark_rows_errors(path, rows: list, block: str, fields, actions, id_field: str, ident_of,
+                      authority_problem, member_problem) -> list[str]:
+    """The shared plain-mode validation of an audit block's rows (`standing_marks:`,
+    `ref_marks:`): required fields present and scalar, no unknown fields, the
+    action, `recorded_by` a string, `why` one line, `recorded_at`/`date` shape,
+    one row per identity. What differs per block is passed in: `authority_problem(
+    value)` and `member_problem(value)` return a message tail or None."""
     errors: list[str] = []
     seen: set = set()
     for i, row in enumerate(rows):
-        prefix = (f"{path}: standing_marks[{i}] ({row.get('link')!r}, {row.get('action')!r}, "
+        prefix = (f"{path}: {block}[{i}] ({row.get(id_field)!r}, {row.get('action')!r}, "
                   f"{row.get('recorded_at')!r})")
-        missing = [f for f in STANDING_MARK_FIELDS
+        missing = [f for f in fields
                    if row.get(f) is None or isinstance(row.get(f), (dict, list))
                    or str(row.get(f)).strip() == ""]
-        unknown = [str(k) for k in row if k not in STANDING_MARK_FIELDS]
+        unknown = [str(k) for k in row if k not in fields]
         if missing:
             errors.append(f"{prefix}: missing field(s) {missing}")
         if unknown:
             errors.append(f"{prefix}: unknown field(s) {unknown}")
-        if "action" not in missing and row.get("action") not in STANDING_MARK_ACTIONS:
+        if "action" not in missing and row.get("action") not in actions:
             errors.append(f"{prefix}: action {row.get('action')!r} must be one of "
-                          f"{list(STANDING_MARK_ACTIONS)}")
-        if "authority" not in missing and row.get("authority") not in CONSTRAINT_AUTHORITIES:
-            errors.append(f"{prefix}: authority {row.get('authority')!r} must be one of "
-                          f"{sorted(CONSTRAINT_AUTHORITIES)} (an agent-inference mark would put a "
-                          "constraint in every session start)")
+                          f"{list(actions)}")
+        if "authority" not in missing:
+            problem = authority_problem(row.get("authority"))
+            if problem:
+                errors.append(f"{prefix}: {problem}")
         if "recorded_by" not in missing and not isinstance(row.get("recorded_by"), str):
             errors.append(f"{prefix}: recorded_by {row.get('recorded_by')!r} is not a string "
                           "(YAML read it as another type; quote it)")
@@ -272,15 +285,56 @@ def _standing_marks_errors(path, fm: dict, topic_link_ids: set) -> list[str]:
             errors.append(f"{prefix}: why must be a single line (no CR/LF)")
         if "recorded_at" not in missing:
             errors.extend(f"{prefix}: {p}" for p in _mark_time_problems(row))
-        link = row.get("link")
-        if link is not None and str(link) not in topic_link_ids:
-            errors.append(f"{prefix}: link {link!r} is not a link in this topic")
-        ident = standing_mark_ident(row)
+        member = row.get(id_field)
+        if member is not None:
+            problem = member_problem(member)
+            if problem:
+                errors.append(f"{prefix}: {problem}")
+        ident = ident_of(row)
         if ident is not None:
             if ident in seen:
-                errors.append(f"{prefix}: duplicate row -- (link, action, recorded_at) identifies a row once")
+                errors.append(f"{prefix}: duplicate row -- ({id_field}, action, recorded_at) "
+                              "identifies a row once")
             seen.add(ident)
     return errors
+
+
+def _standing_marks_errors(path, fm: dict, topic_link_ids: set) -> list[str]:
+    """Validation of a topic's `standing_marks:` rows (docs/SCHEMA.md, "Standing
+    marks"). Rows are NEVER required: a topic marked before this block existed
+    carries none and is clean (TOP-0136 L1)."""
+    def authority_problem(value):
+        if value in CONSTRAINT_AUTHORITIES:
+            return None
+        return (f"authority {value!r} must be one of {sorted(CONSTRAINT_AUTHORITIES)} (an "
+                "agent-inference mark would put a constraint in every session start)")
+
+    def member_problem(link):
+        return None if str(link) in topic_link_ids else f"link {link!r} is not a link in this topic"
+
+    return _mark_rows_errors(path, standing_mark_rows(fm), "standing_marks", STANDING_MARK_FIELDS,
+                             STANDING_MARK_ACTIONS, "link", standing_mark_ident,
+                             authority_problem, member_problem)
+
+
+def _ref_marks_errors(path, fm: dict) -> list[str]:
+    """Validation of a topic's `ref_marks:` rows (docs/SCHEMA.md, "Reference
+    marks"). Narrower than the standing rules: a ref is a path, not a link id,
+    and any of the five authorities is legal (a bind is not a constraint).
+    Rows are NEVER required by the plain lint: a topic whose references predate
+    the block carries none and is clean."""
+    def authority_problem(value):
+        return None if value in AUTHORITIES else (
+            f"authority {value!r} must be one of {sorted(AUTHORITIES)}")
+
+    def member_problem(ref):
+        if not isinstance(ref, str):
+            return f"ref {ref!r} is not a string (YAML read it as another type; quote it)"
+        return None if code_ref_is_named(ref) else f"ref {ref!r} is empty or fragment-only"
+
+    return _mark_rows_errors(path, ref_mark_rows(fm), "ref_marks", REF_MARK_FIELDS,
+                             REF_MARK_ACTIONS, "ref", ref_mark_ident,
+                             authority_problem, member_problem)
 
 
 def _standing_pointer_errors(path, fm: dict, topic_links_by_id: dict) -> list[str]:
@@ -304,11 +358,12 @@ def _standing_pointer_errors(path, fm: dict, topic_links_by_id: dict) -> list[st
 
 
 def _staged_standing_errors(path, fm: dict, links: list) -> list[str]:
-    """The plain-mode `standing:` / `standing_marks:` rules, run on the blob
-    that is about to be committed (rows' fields and authority, duplicate and
-    ineligible pointers)."""
+    """The plain-mode `standing:` / `standing_marks:` / `ref_marks:` rules, run on
+    the blob that is about to be committed (rows' fields and authority, duplicate
+    and ineligible pointers)."""
     by_id = {str(l.get("link")): l for l in links if l.get("link")}
-    return _standing_pointer_errors(path, fm, by_id) + _standing_marks_errors(path, fm, set(by_id))
+    return (_standing_pointer_errors(path, fm, by_id) + _standing_marks_errors(path, fm, set(by_id))
+            + _ref_marks_errors(path, fm))
 
 
 def lint_topic(
@@ -523,6 +578,7 @@ def lint_topic(
     errors.extend(_standing_pointer_errors(path, fm, topic_links_by_id))
 
     errors.extend(_standing_marks_errors(path, fm, topic_link_ids))
+    errors.extend(_ref_marks_errors(path, fm))
 
     return errors, warnings
 
