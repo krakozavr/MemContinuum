@@ -366,14 +366,6 @@ FALLBACK_COMPLEX_FIELDS = {
 }
 
 
-# `top_level_keys` ONLY (the scalar recovery below keeps its column-zero regex): on a MALFORMED
-# record the guard is conservative, so a key at any indentation, quoted or not, counts (the
-# quotes MATCH: "links", 'links' or bare; `links'` is a different, valid key). This
-# over-includes (a `links:` inside a multi-line quoted scalar, a nested `links:`), which freezes
-# the malformed record as a topic -- the ruled fail-closed direction.
-_FALLBACK_ANY_KEY_RE = re.compile(r"""^\s*(["']?)([A-Za-z_][A-Za-z0-9_]*)\1\s*:""")
-
-
 class ParseResult:
     """Typed result of parse_record: `frontmatter`/`body` exactly like the
     old `(dict, str)` pair, plus `diagnostics` (a list of `(field,
@@ -381,17 +373,11 @@ class ParseResult:
     `valid` (False only for a CANONICAL record carrying at least one
     diagnostic, or for any record the file itself could not be read/
     decoded), and `fallback` (True only when the lenient regex recovery
-    path was taken). `top_level_keys` is the set of top-level key names the
-    lenient fallback's line scan saw (including complex fields such as
-    `links` that the fallback never recovers into `frontmatter`); it is
-    filled on the fallback path only and empty on a strict parse, whose
-    `frontmatter` already carries every key."""
+    path was taken)."""
 
-    __slots__ = ("frontmatter", "body", "diagnostics", "valid", "fallback", "top_level_keys")
+    __slots__ = ("frontmatter", "body", "diagnostics", "valid", "fallback")
 
-    def __init__(self, frontmatter: dict, body: str, diagnostics: list, valid: bool, fallback: bool,
-                 top_level_keys: frozenset = frozenset()) -> None:
-        self.top_level_keys = top_level_keys
+    def __init__(self, frontmatter: dict, body: str, diagnostics: list, valid: bool, fallback: bool) -> None:
         self.frontmatter = frontmatter
         self.body = body
         self.diagnostics = diagnostics
@@ -403,6 +389,13 @@ class ParseResult:
             f"ParseResult(frontmatter={self.frontmatter!r}, diagnostics={self.diagnostics!r}, "
             f"valid={self.valid!r}, fallback={self.fallback!r})"
         )
+
+
+def record_is_quarantined(result: "ParseResult") -> bool:
+    """The reindex quarantine predicate: a parsed record the index skips (no row, no type, no
+    for-path or digest membership) because it is canonical-looking yet unusable. `cmd_reindex`
+    and memlint's type freeze both ask this one question."""
+    return not result.valid
 
 
 def is_canonical_frontmatter(fm: dict) -> bool:
@@ -664,12 +657,8 @@ def parse_record_text(text: str, path) -> ParseResult:
         # canonical marker is a bare block-style `links:` key (no id/type)
         # would otherwise never be seen as canonical at all.
         canonical = _raw_frontmatter_is_canonical(fm_text)
-        seen_keys: set = set()
         for line in fm_text.splitlines():
             m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*):\s*(.*)$", line)
-            wide = _FALLBACK_ANY_KEY_RE.match(line)
-            if wide:
-                seen_keys.add(wide.group(2))
             if not m or m.group(1) in fm:
                 continue
             key = m.group(1)
@@ -688,8 +677,7 @@ def parse_record_text(text: str, path) -> ParseResult:
                     diagnostics.append((key, "not recovered from malformed YAML"))
         diagnostics.append(("frontmatter", "malformed YAML frontmatter, using lenient fallback parse"))
         canonical = canonical or is_canonical_frontmatter(fm)
-        return ParseResult(fm, body, diagnostics, valid=not canonical, fallback=True,
-                           top_level_keys=frozenset(seen_keys))
+        return ParseResult(fm, body, diagnostics, valid=not canonical, fallback=True)
 
     diagnostics = validate_record_shape(fm)
     canonical = is_canonical_frontmatter(fm)
@@ -2069,7 +2057,7 @@ def cmd_reindex(args) -> int:
             unchanged += 1
             continue
         result = parse_record(f)
-        if not result.valid:
+        if record_is_quarantined(result):
             quarantined.append((path_str, sha, stat.st_mtime, stat.st_size, result.diagnostics))
             continue
         fm, body = result.frontmatter, result.body

@@ -50,6 +50,7 @@ from memidx import (
     CANONICAL_ID_PREFIXES,
     CANONICAL_TYPES,
     infer_type,
+    record_is_quarantined,
     CONSTRAINT_AUTHORITIES,
     EDGE_RELS,
     HOLD_ELIGIBLE_AUTHORITIES,
@@ -3182,9 +3183,10 @@ def _standing_guard_errors(full_path, old_fm: dict, old_text, new_fm: dict, new_
 
 
 def _delivered_type(root, path, fm) -> str | None:
-    """What the index would store as this record's `type`: the engine's own `infer_type`
-    (inbox directory, explicit `type`, `metadata.type`, then the record's directory). None when
-    the frontmatter is not a mapping the engine can read."""
+    """What the index stores as this record's `type`: the engine's own `infer_type` (inbox
+    directory, explicit `type`, `metadata.type`, then the record's directory). None when the
+    frontmatter is not a mapping or `infer_type` raises (a non-mapping `metadata`): the index
+    cannot build a row for such a record (reindex raises on it), so it delivered no type."""
     if not isinstance(fm, dict):
         return None
     try:
@@ -3194,38 +3196,27 @@ def _delivered_type(root, path, fm) -> str | None:
 
 
 def _frozen_type(root, path, result) -> str | None:
-    """The type frozen for a record that existed at REF: what the index DELIVERED,
-    `infer_type(root, path, fm)`. One adjustment for a FALLBACK-parsed REF: when that answer is
-    not a canonical type (the lenient fallback recovers `type` as raw text, so a garbled one
-    comes back as a non-type), the record's KIND from `_record_kind(fm)` (explicit canonical
-    type, id prefix, a `links` list -- for a fallback parse `links` presence comes from
-    `result.top_level_keys`, the fallback dict never carries it) is frozen instead; None (no
-    recoverable kind) -> the record is exempt."""
-    fm = result.frontmatter
-    delivered = _delivered_type(root, path, fm)
-    if delivered is None:
+    """The type frozen for a record that existed at REF: what the index DELIVERED there,
+    `infer_type(root, path, fm)`. A record the index QUARANTINED at REF (`record_is_quarantined`,
+    the reindex predicate) delivered nothing, so a repair that brings it into delivery is a
+    record entering delivery like an added file, and it is exempt (None); so is a record
+    `infer_type` cannot read (`_delivered_type`)."""
+    if record_is_quarantined(result):
         return None
-    if not result.fallback or delivered in CANONICAL_TYPES:
-        return delivered
-    kind = _record_kind(fm)
-    if kind is None and "links" in result.top_level_keys:
-        kind = "topic"
-    return kind
+    return _delivered_type(root, path, result.frontmatter)
 
 
-def _type_change_errors(root, full_path, frozen: str, new_fm: dict, fallback: bool = False) -> list[str]:
-    """A record's `type` decides which index type it carries, and `for-path` and the standing
-    digest read only `type: topic`. Unchanged iff the NEW side's `infer_type` (on the parsed NEW
-    frontmatter, strict or fallback) equals the frozen string (`_frozen_type`); otherwise
-    `type changed '<old>' -> '<new>'`, with the "must declare" hint when the REF was a fallback
-    parse. No other normalisation, no separate "removed" case: a typeless NEW infers by
-    directory and compares like any other."""
+def _type_change_errors(root, full_path, frozen: str, new_fm: dict) -> list[str]:
+    """A delivered record's `type` decides which index type it carries, and `for-path` and the
+    standing digest read only `type: topic`. Unchanged iff the NEW side's `infer_type` equals
+    the frozen string (`_frozen_type`); otherwise `type changed '<old>' -> '<new>'`. No other
+    normalisation, no separate "removed" case: a typeless NEW infers by directory and compares
+    like any other."""
     new_type = _delivered_type(root, full_path, new_fm)
     if new_type == frozen:
         return []
-    hint = f" (a repair of a malformed record must declare type: {frozen})" if fallback else ""
     return [f"{full_path}: type changed {frozen!r} -> {new_type!r} after being recorded "
-            f"(append-only; `type` decides what the record is delivered as){hint}"]
+            f"(append-only; `type` decides what the record is delivered as)"]
 
 
 def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], int, list[str]]:
@@ -3319,8 +3310,8 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
         # concept, a typeless one ...); judged first, before the classification exit below and
         # before any branch that can `continue` past it (a repair, an invalid new side). The
         # frozen value is what the index DELIVERED: `infer_type(root, path, fm)` on the REF side
-        # (a garbled fallback REF: its kind, exempt when none), compared with `infer_type` on the
-        # NEW side; `root` is the store root and `full_path` the record's path under it, on the
+        # (a REF the index quarantined delivered nothing: exempt), compared with `infer_type` on
+        # the NEW side; `root` is the store root and `full_path` the record's path under it, on the
         # worktree, staged and (via `path_in_root`) prefixed-root paths alike.
         new_blob = None
         new_result = None
@@ -3330,8 +3321,7 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
                 new_result = _parse_git_blob(new_blob, path_in_root)
                 frozen = _frozen_type(root, full_path, old_result)
                 if frozen is not None:
-                    errors.extend(_type_change_errors(
-                        root, full_path, frozen, new_result.frontmatter, old_result.fallback))
+                    errors.extend(_type_change_errors(root, full_path, frozen, new_result.frontmatter))
 
         if not _is_topic_like(old_result):
             # Re-gate (Grok): a path that was not topic-like at REF (an
