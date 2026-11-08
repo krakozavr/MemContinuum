@@ -294,6 +294,32 @@ class TestTypeFrozen(GuardCase):
         self.assertTrue(res.fallback and res.valid, res)
         self.assertRefused(new, "type changed 'topic' -> 'topic # actual value'")
 
+    # gate round 4 R4-1: the frozen REF value is the PAIR {raw recovered, bare token}
+    ODD_REF = '---\ntype: "topic # actual value"\ntitle: bad: title\n---\n\nBody.\n'
+
+    def _odd_ref(self):
+        res = memidx.parse_record_text(self.ODD_REF, "x")
+        self.assertTrue(res.fallback and res.valid, res)
+        self.assertEqual(res.frontmatter.get("type"), "topic # actual value")
+        self.store(self.ODD_REF)
+
+    def test_an_unchanged_odd_type_survives_a_title_only_repair(self):
+        self._odd_ref()
+        self.assertClean(self.ODD_REF.replace("title: bad: title", 'title: "bad: title"'))
+
+    def test_an_unchanged_odd_type_survives_a_body_only_edit(self):
+        self._odd_ref()
+        self.assertClean(self.ODD_REF.replace("Body.", "Body, edited."))
+
+    def test_an_odd_ref_type_may_become_its_bare_token(self):
+        self._odd_ref()
+        self.assertClean(self.ODD_REF.replace('type: "topic # actual value"', "type: topic"))
+
+    def test_an_odd_ref_type_changed_to_another_type_is_refused(self):
+        self._odd_ref()
+        self.assertRefused(self.ODD_REF.replace('type: "topic # actual value"', "type: incident"),
+                           "type changed 'topic' -> 'incident'")
+
     def test_an_empty_new_mapping_loses_a_frozen_type(self):
         # gate round 3 R3-2: the type may not disappear by emptying the frontmatter
         base = ttext(["src/a.py"])
@@ -362,6 +388,7 @@ class TestTypeFrozen(GuardCase):
         note = "---\ntitle: just a note\n---\n\nBody.\n"
         self.store(note)
         self.assertClean(note.replace("title: just a note\n", "title: just a note\ntype: incident\n"))
+
 
 
 # ---------------------------------------------------------------------------

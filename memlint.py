@@ -3159,41 +3159,48 @@ def _standing_guard_errors(full_path, old_fm: dict, old_text, new_fm: dict, new_
     return errors
 
 
-def _frozen_type_frontmatter(result) -> dict | None:
-    """The frontmatter of a REF-side parse with its `type:` made comparable, or
-    None when the recorded `type` cannot be trusted. A strict parse is trusted
-    as it stands, valid or not. A lenient-fallback parse recovers `type` as raw
-    text (`topic # comment` stays whole), so a trailing ` #...` comment is
-    stripped and the value is trusted only when what remains is one of the
-    engine's own record types (CANONICAL_TYPES, the set `_record_kind` trusts)."""
+def _frozen_type_frontmatter(result) -> tuple[dict, frozenset] | None:
+    """(the frontmatter of a REF-side parse with its `type:` made comparable, the
+    set of NEW values that count as that type unchanged), or None when the
+    recorded `type` cannot be trusted. A strict parse is trusted as it stands,
+    valid or not. A lenient-fallback parse recovers `type` as raw text (`topic #
+    comment` stays whole), so a trailing ` #...` comment is stripped for the
+    frozen value, trusted only when what remains is one of the engine's own
+    record types (CANONICAL_TYPES, the set `_record_kind` trusts). The accepted
+    set is the PAIR {raw recovered value, bare token}: a NEW side is never
+    normalised, so a tolerated note that keeps its odd `type: "topic # x"`
+    unchanged equals the raw value, and a plain `topic` equals the bare one."""
     fm = result.frontmatter
     if not isinstance(fm, dict):
         return None
     if not result.fallback:
-        return fm
+        return fm, frozenset({str(fm.get("type"))})
     raw = fm.get("type")
     if not isinstance(raw, str):
         return None
     bare = re.sub(r"\s+#.*$", "", raw).strip()
-    return dict(fm, type=bare) if bare in CANONICAL_TYPES else None
+    return (dict(fm, type=bare), frozenset({raw, bare})) if bare in CANONICAL_TYPES else None
 
 
-def _type_change_errors(full_path, old_fm: dict, new_fm: dict) -> list[str]:
+def _type_change_errors(full_path, old_fm: dict, new_fm: dict, accepted: frozenset | None = None) -> list[str]:
     """A topic's `type:` recorded at REF is frozen: it decides which index type
     the record carries, and `for-path` and the standing digest read only
     `type: topic`. A record with no `type` at REF recorded nothing to freeze
     (the caller also skips a REF side whose `type` only the lenient fallback
     recovered and that is not a known record type). A new side with no `type`
-    (a missing key, a null, an empty or non-mapping frontmatter) has removed it:
-    an error, `type removed`."""
+    (a missing key, a null, an empty frontmatter) has removed it: an error,
+    `type removed`. The parser turns any non-mapping document into `{}`, so a
+    mapping is the only shape that reaches here. `accepted` (from
+    `_frozen_type_frontmatter`) is the set of new values that pass; default
+    just the frozen value."""
     old_type = old_fm.get("type")
     if old_type is None:
         return []
-    new_type = new_fm.get("type") if isinstance(new_fm, dict) else None
+    new_type = new_fm.get("type")
     if new_type is None:
         return [f"{full_path}: type removed (frozen {old_type!r}): type changed {old_type!r} -> None "
                 "after being recorded (append-only; `type` decides what the record is delivered as)"]
-    if str(new_type) == str(old_type):
+    if str(new_type) in (accepted if accepted is not None else {str(old_type)}):
         return []
     return [f"{full_path}: type changed {old_type!r} -> {new_type!r} after being recorded "
             "(append-only; `type` decides what the record is delivered as)"]
@@ -3297,9 +3304,9 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
             new_blob = _git_show(toplevel, f":{relpath}") if staged else _read_worktree(root / path_in_root)
             if new_blob is not None:
                 new_result = _parse_git_blob(new_blob, path_in_root)
-                old_type_fm = _frozen_type_frontmatter(old_result)
-                if old_type_fm is not None:
-                    errors.extend(_type_change_errors(full_path, old_type_fm, new_result.frontmatter))
+                frozen = _frozen_type_frontmatter(old_result)
+                if frozen is not None:
+                    errors.extend(_type_change_errors(full_path, frozen[0], new_result.frontmatter, frozen[1]))
 
         if not _is_topic_like(old_result):
             # Re-gate (Grok): a path that was not topic-like at REF (an
