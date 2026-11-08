@@ -3313,18 +3313,17 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
             # incident, an empty note) may be promoted/edited into one
             # carrying links; every recovered link whose id REF did not
             # already record is new and judged by the grandfathered checks.
-            if status == "M":
-                nb = _git_show(toplevel, f":{relpath}") if staged else _read_worktree(root / path_in_root)
-                if nb is not None:
-                    ref_ids = {
-                        str(l.get("link"))
-                        for l in (_recovered_old_links(old_result.frontmatter) or [])
-                        if l.get("link") is not None
-                    }
-                    errors.extend(_added_links_errors(
-                        full_path,
-                        _recovered_old_links(_parse_git_blob(nb, path_in_root).frontmatter) or [],
-                        ref_ids, fm=_parse_git_blob(nb, path_in_root).frontmatter, ctx=ctx))
+            if status == "M" and new_result is not None:
+                # the NEW blob was read and parsed once above; reuse that parse
+                ref_ids = {
+                    str(l.get("link"))
+                    for l in (_recovered_old_links(old_result.frontmatter) or [])
+                    if l.get("link") is not None
+                }
+                errors.extend(_added_links_errors(
+                    full_path,
+                    _recovered_old_links(new_result.frontmatter) or [],
+                    ref_ids, fm=new_result.frontmatter, ctx=ctx))
             continue
         changed += 1
 

@@ -389,6 +389,24 @@ class TestTypeFrozen(GuardCase):
         self.store(note)
         self.assertClean(note.replace("title: just a note\n", "title: just a note\ntype: incident\n"))
 
+    def test_a_modified_non_topic_record_reads_and_parses_its_new_blob_once(self):
+        # gate round 4 R4-2
+        note = "---\ntitle: x\ntype: incident\nid: INC-9001\n---\n\nBody.\n"
+        self.store(note)
+        (self.root / "topics" / "foo.md").write_text(note.replace("Body.", "Body, edited."))
+        # (the staged run also parses the index blob once for the rejections lint, a separate
+        # pre-existing feature; the worktree run isolates the append-only comparison)
+        seen = []
+        real = memlint._parse_git_blob
+
+        def spy(blob, label):
+            seen.append(label)
+            return real(blob, label)
+
+        with mock.patch.object(memlint, "_parse_git_blob", spy):
+            memlint.check_append_only(self.root, "HEAD", False)
+        new_side = [l for l in seen if isinstance(l, str) and "(at " not in l]
+        self.assertEqual(len(new_side), 1, seen)
 
 
 # ---------------------------------------------------------------------------
