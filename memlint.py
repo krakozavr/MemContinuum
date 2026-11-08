@@ -3165,13 +3165,17 @@ def _frozen_type_frontmatter(result) -> tuple[dict, bool] | None:
     type to freeze. A strict parse is trusted as it stands, valid or not. A
     lenient-fallback parse recovers `type` as raw text, so the engine's OWN kind
     reading is frozen instead: `_record_kind(fm)` (an explicit canonical `type`, else
-    the id prefix, else a `links:` list). No recoverable kind -> None (exempt)."""
+    the id prefix), else `topic` when the fallback scan saw a top-level `links:` key
+    (`result.top_level_keys`: the fallback dict never carries `links`). No recoverable
+    kind -> None (exempt)."""
     fm = result.frontmatter
     if not isinstance(fm, dict):
         return None
     if not result.fallback:
         return fm, False
     kind = _record_kind(fm)
+    if kind is None and "links" in result.top_level_keys:
+        kind = "topic"
     if kind is None:
         return None
     return dict(fm, type=kind), True

@@ -373,11 +373,17 @@ class ParseResult:
     `valid` (False only for a CANONICAL record carrying at least one
     diagnostic, or for any record the file itself could not be read/
     decoded), and `fallback` (True only when the lenient regex recovery
-    path was taken)."""
+    path was taken). `top_level_keys` is the set of top-level key names the
+    lenient fallback's line scan saw (including complex fields such as
+    `links` that the fallback never recovers into `frontmatter`); it is
+    filled on the fallback path only and empty on a strict parse, whose
+    `frontmatter` already carries every key."""
 
-    __slots__ = ("frontmatter", "body", "diagnostics", "valid", "fallback")
+    __slots__ = ("frontmatter", "body", "diagnostics", "valid", "fallback", "top_level_keys")
 
-    def __init__(self, frontmatter: dict, body: str, diagnostics: list, valid: bool, fallback: bool) -> None:
+    def __init__(self, frontmatter: dict, body: str, diagnostics: list, valid: bool, fallback: bool,
+                 top_level_keys: frozenset = frozenset()) -> None:
+        self.top_level_keys = top_level_keys
         self.frontmatter = frontmatter
         self.body = body
         self.diagnostics = diagnostics
@@ -650,8 +656,11 @@ def parse_record_text(text: str, path) -> ParseResult:
         # canonical marker is a bare block-style `links:` key (no id/type)
         # would otherwise never be seen as canonical at all.
         canonical = _raw_frontmatter_is_canonical(fm_text)
+        seen_keys: set = set()
         for line in fm_text.splitlines():
             m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*):\s*(.*)$", line)
+            if m:
+                seen_keys.add(m.group(1))
             if not m or m.group(1) in fm:
                 continue
             key = m.group(1)
@@ -670,7 +679,8 @@ def parse_record_text(text: str, path) -> ParseResult:
                     diagnostics.append((key, "not recovered from malformed YAML"))
         diagnostics.append(("frontmatter", "malformed YAML frontmatter, using lenient fallback parse"))
         canonical = canonical or is_canonical_frontmatter(fm)
-        return ParseResult(fm, body, diagnostics, valid=not canonical, fallback=True)
+        return ParseResult(fm, body, diagnostics, valid=not canonical, fallback=True,
+                           top_level_keys=frozenset(seen_keys))
 
     diagnostics = validate_record_shape(fm)
     canonical = is_canonical_frontmatter(fm)

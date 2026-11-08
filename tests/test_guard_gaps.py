@@ -395,9 +395,42 @@ class TestTypeFrozen(GuardCase):
         for fm, want in table:
             with self.subTest(fm=fm):
                 self.assertEqual(memlint._record_kind(fm), want)
+        # gate round 9 R9-3: the links row from a REAL fallback parse (the fallback dict never carries `links`)
+        res = memidx.parse_record_text(self.LINKS_REF, "x")
+        self.assertTrue(res.fallback, res)
+        self.assertNotIn("links", res.frontmatter)
+        self.assertIn("links", res.top_level_keys)
+        self.assertIsNone(memlint._record_kind(res.frontmatter))
+        self.assertEqual(memlint._frozen_type_frontmatter(res)[0]["type"], "topic")
+        memo = memidx.parse_record_text(self.MEMO_REF, "x")
+        self.assertTrue(memo.fallback, memo)
+        self.assertNotIn("links", memo.top_level_keys)
+        self.assertIsNone(memlint._frozen_type_frontmatter(memo))
+        strict = memidx.parse_record_text(ttext(["src/a.py"]), "x")
+        self.assertFalse(strict.fallback)
+        self.assertEqual(strict.top_level_keys, frozenset())
+
+    # gate round 9 R9-3 (Grok MAJOR): a garbled type, a `links:` list and no id freezes `topic` through the
+    # parser's top_level_keys; a `type: memo` note with no links and no id stays exempt
+    LINKS_REF = ("---\ntype: topic # comment\ntitle: bad: title\nlinks:\n  - link: L1\n    date: 2026-01-01\n"
+                 "    decision: x\n---\n\nBody.\n")
+    MEMO_REF = "---\ntype: memo\ntitle: bad: title\n---\n\nBody.\n"
+
+    def test_a_links_only_fallback_ref_freezes_topic_and_must_declare_it(self):
+        self.store(self.LINKS_REF)
+        fixed = self.LINKS_REF.replace("title: bad: title", 'title: "bad: title"')
+        self.assertRefused(fixed.replace("type: topic # comment", "type: incident"),
+                           "type changed 'topic' -> 'incident'")
+        self.assertClean(fixed)        # strict YAML reads the comment away: `topic` declared
+        self.assertClean(fixed.replace("type: topic # comment", "type: topic"))
+
+    def test_a_memo_note_with_no_links_and_no_id_may_change_type(self):
+        self.store(self.MEMO_REF)
+        fixed = self.MEMO_REF.replace("title: bad: title", 'title: "bad: title"')
+        self.assertClean(fixed.replace("type: memo", "type: investigation"))
 
     # gate round 8 R8-1 (Sol MAJOR/MINOR, Grok): spellings of a canonical type that the fallback
-    # garbles all freeze through the id prefix (or the links list), never through a string reading
+    # garbles all freeze through the id prefix (or the links list), never through a string reading.
     def _kind_refused_and_declared(self, type_line, kind="topic", rid="TOP-0001"):
         ref = self._fallback_ref(type_line, rid=rid)
         fixed = self._title_repaired(ref)

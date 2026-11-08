@@ -438,12 +438,13 @@ pre-commit hook reads):
 - *`type` is frozen.* A `type:` recorded at `REF` may not change or be dropped, on every record that
   existed at `REF` with a recorded type, topic or not (an incident or concept included):
   `type changed 'topic' -> 'investigation' after being recorded`. A file added after `REF` is free, and
-  so is a record that had no `type` at `REF`. A strict `REF` needs the same parsed `type`. A `REF` side
+  so is a record with no recoverable kind at `REF` (a strict `REF` with no `type`, or a malformed one as below). A strict `REF` needs the same parsed `type`. A `REF` side
   that parsed only through the lenient fallback freezes the engine's own kind reading of it (an explicit
-  canonical `type:`, else the id prefix `TOP-`/`INC-`/`INV-`/`CON-`, else a `links:` list as `topic`): the
+  canonical `type:`, else the id prefix `TOP-`/`INC-`/`INV-`/`CON-`, else a top-level `links:` key as `topic`): the
   repaired record must declare exactly that kind (`type: topic`), so an odd spelling (`"topic # x"`) is
-  normalised by the repair, not kept. A fallback `REF` with no recoverable kind is exempt. Plain lint is
-  unchanged.
+  normalised by the repair, not kept. A fallback `REF` with no recoverable kind (no usable `type:`, no
+  `TOP-`/`INC-`/`INV-`/`CON-` id and no `links:` key) is exempt; a malformed `REF` with no `type:` but such an id or a
+  `links:` list still has a kind and is frozen. Plain lint is unchanged.
 - *Link order is frozen (g3).* The link ids present at `REF` must keep their relative order in the
   new blob (new links go on top; the older newest-first check refuses one placed between old ids): `<path>: links reordered (L2 before
   L3; the chain head is first-active-in-file-order)`. The chain head is the first active link in file
