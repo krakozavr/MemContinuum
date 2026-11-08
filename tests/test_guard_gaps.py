@@ -329,9 +329,39 @@ class TestTypeFrozen(GuardCase):
         self.assertEqual(rc, 0, out)
 
     def test_a_non_topic_record_is_not_guarded(self):
-        incident = "---\ntype: incident\nid: INC-9001\ntitle: x\n---\n\nBody.\n"
-        self.store(incident)
-        self.assertClean(incident.replace("type: incident", "type: investigation"))
+        # adjusted in gate round 3 R3-3: a REF record that recorded NO `type` has nothing frozen
+        # (a recorded non-topic type is now frozen too, see the R3-3 tests below)
+        note = "---\nid: INC-9001\ntitle: x\n---\n\nBody.\n"
+        self.store(note)
+        self.assertClean(note.replace("id: INC-9001\n", "id: INC-9001\ntype: investigation\n"))
+
+    def _non_topic_ref(self, kind):
+        base = ttext(["src/a.py"]).replace("type: topic\n", f"type: {kind}\n", 1)
+        broken = base.replace("tags: []\n", "tags: not-a-list\n", 1)
+        res = memidx.parse_record_text(broken, "x")
+        self.assertFalse(res.valid, res)
+        self.assertFalse(res.fallback, res)
+        self.store(broken)
+        return broken
+
+    def test_a_non_topic_ref_with_a_frozen_type_keeps_it_through_a_repair_incident(self):
+        broken = self._non_topic_ref("incident")
+        repaired = broken.replace("tags: not-a-list\n", "tags: []\n", 1)
+        self.assertClean(repaired)
+        self.assertRefused(repaired.replace("type: incident\n", "type: investigation\n", 1),
+                           "type changed 'incident' -> 'investigation'")
+
+    def test_a_non_topic_ref_with_a_frozen_type_keeps_it_through_a_repair_concept(self):
+        broken = self._non_topic_ref("concept")
+        repaired = broken.replace("tags: not-a-list\n", "tags: []\n", 1)
+        self.assertClean(repaired)
+        self.assertRefused(repaired.replace("type: concept\n", "type: investigation\n", 1),
+                           "type changed 'concept' -> 'investigation'")
+
+    def test_a_non_topic_ref_with_no_type_is_free_to_gain_one(self):
+        note = "---\ntitle: just a note\n---\n\nBody.\n"
+        self.store(note)
+        self.assertClean(note.replace("title: just a note\n", "title: just a note\ntype: incident\n"))
 
 
 # ---------------------------------------------------------------------------

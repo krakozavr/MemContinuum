@@ -3284,6 +3284,23 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
 
         old_blob = _git_show(toplevel, f"{ref}:{relpath}")
         old_result = _parse_git_blob(old_blob, f"{relpath} (at {ref})")
+        # `type` is frozen for EVERY record that existed at REF with a recorded type (a topic,
+        # an incident, a concept, ...); judged first, before the classification exit below and
+        # before any branch that can `continue` past it (a repair, an invalid new side). A REF
+        # side that parsed strictly keeps its `type` frozen whether or not the record was
+        # schema-valid; a fallback-parsed one only when the recovered value, minus a trailing
+        # ` #...` comment, is a known record type. The NEW side is compared exactly as parsed
+        # (no comment strip: a quoted `"topic # x"` is a different value from `topic`).
+        new_blob = None
+        new_result = None
+        if status != "D":
+            new_blob = _git_show(toplevel, f":{relpath}") if staged else _read_worktree(root / path_in_root)
+            if new_blob is not None:
+                new_result = _parse_git_blob(new_blob, path_in_root)
+                old_type_fm = _frozen_type_frontmatter(old_result)
+                if old_type_fm is not None:
+                    errors.extend(_type_change_errors(full_path, old_type_fm, new_result.frontmatter))
+
         if not _is_topic_like(old_result):
             # Re-gate (Grok): a path that was not topic-like at REF (an
             # incident, an empty note) may be promoted/edited into one
@@ -3312,10 +3329,6 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
             )
             continue
 
-        if staged:
-            new_blob = _git_show(toplevel, f":{relpath}")
-        else:
-            new_blob = _read_worktree(root / path_in_root)
         if new_blob is None:
             kind = _record_kind_label(old_result)
             errors.append(
@@ -3323,17 +3336,6 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
                 "(append-only; a store never loses history)"
             )
             continue
-        new_result = _parse_git_blob(new_blob, path_in_root)
-
-        # `type` is frozen for a topic-like file that existed at REF; judged here, before
-        # any branch below can `continue` past it (a repair, an invalid new side). A REF side
-        # that parsed strictly keeps its `type` frozen whether or not the record was
-        # schema-valid; a fallback-parsed one only when the recovered value, minus a trailing
-        # ` #...` comment, is a known record type. The NEW side is compared exactly as parsed (no comment
-        # strip: a quoted `"topic # x"` is a different value from `topic`).
-        old_type_fm = _frozen_type_frontmatter(old_result)
-        if old_type_fm is not None:
-            errors.extend(_type_change_errors(full_path, old_type_fm, new_result.frontmatter))
 
         repair_note = None
         if not old_result.valid:
