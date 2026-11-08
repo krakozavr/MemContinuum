@@ -1363,19 +1363,19 @@ def lint_file(
         return errors, []
     warnings = [f"{path}: {field}: {message}" for field, message in result.diagnostics]
     fm, body = result.frontmatter, result.body
-    if fm.get("type") == "concept":
+    is_concept = fm.get("type") == "concept"
+    is_topic = not is_concept and _is_topic_frontmatter(fm)
+    if is_concept:
         errors, more_warnings = lint_concept(path, fm, code_roots or [], body=body, known_topic_ids=known_topic_ids)
+    elif is_topic:
+        errors, more_warnings = lint_topic(path, fm, code_roots, strict_citations)
     else:
-        is_topic = _is_topic_frontmatter(fm)
-        if is_topic:
-            errors, more_warnings = lint_topic(path, fm, code_roots, strict_citations)
-        else:
-            errors, more_warnings = lint_record(path, fm, code_roots, strict_citations)
-        # R15-1 (gate round 15): `for-path` reads `code_refs` of every record the index delivers
-        # as a topic, links or not, and `ref_marks:` is its audit; the one row validator runs for
-        # EVERY record that carries the block (a topic ran it in `lint_topic` already).
-        if not is_topic and "ref_marks" in fm:
-            errors.extend(_ref_marks_errors(path, fm))
+        errors, more_warnings = lint_record(path, fm, code_roots, strict_citations)
+    # R15-1 / R16-2 (gate rounds 15, 16): `for-path` reads `code_refs` of every record the index
+    # delivers as a topic, links or not, and `ref_marks:` is its audit; the one row validator runs
+    # for EVERY record that carries the block, concepts included (a topic ran it in `lint_topic`).
+    if not is_topic and "ref_marks" in fm:
+        errors.extend(_ref_marks_errors(path, fm))
     return errors, warnings + more_warnings
 
 

@@ -1219,6 +1219,32 @@ class TestRefMarksRowsValidatedOnEveryRecord(GuardCase):
         self.assertClean(ref.replace("Body.", "Body edited."))
 
 
+class TestConceptRefMarksPlainLint(unittest.TestCase):
+    """gate round 16 R16-2 (Sol MINOR, Grok NIT): plain lint judges a concept's `ref_marks:` rows with the
+    one row validator, like every other record; a concept without rows is unchanged."""
+    FORGED = TestRefMarksRowsValidatedOnEveryRecord.FORGED
+
+    def _lint(self, extra):
+        text = "---\ntype: concept\ntitle: x\n" + extra + "---\n\nBody.\n"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "concepts").mkdir()
+            (root / "concepts" / "x.md").write_text(text)
+            return memlint.lint_root(root)
+
+    def test_a_concept_with_a_forged_row_is_a_plain_lint_error(self):
+        errors, _ = self._lint("ref_marks:\n" + self.FORGED)
+        self.assertTrue(any("ref_marks[0]" in e and "missing field(s)" in e for e in errors), errors)
+
+    def test_a_concept_with_a_well_formed_row_passes(self):
+        errors, _ = self._lint("ref_marks:\n" + rmark("src/a.py", "remove"))
+        self.assertEqual(errors, [], errors)
+
+    def test_a_concept_without_rows_is_unchanged(self):
+        errors, _ = self._lint("")
+        self.assertEqual(errors, [], errors)
+
+
 class TestDeliveredTopicCannotBeDeleted(GuardCase):
     """gate round 15 R15-2 (Sol MAJOR, Grok MAJOR 2; owner-facing ruling): a record the index delivered
     as a TOPIC cannot be deleted or moved away without an error, chain or not. Records delivered as an
