@@ -9192,6 +9192,63 @@ class TestMacOSPortMechanics(unittest.TestCase):
         log_text = (home / "hook.log").read_text()
         self.assertIn("project=wd-proj", log_text, log_text)
 
+    # ---- slow-root factor (Windows-mounted code root) -------------------
+
+    def _kill_line_budget(self, name, **env_over):
+        """Run a never-finishing hook under the launcher with a 0.3 s base
+        budget and return the `budget=` field of the kill line."""
+        launcher_py = subprocess.run(
+            [MC_BASH, "-c", 'source "$1"; printf %s "$MC_WATCHDOG_LAUNCHER_PY"', "_",
+             str(HOOKS_DIR / "mc-watchdog.sh")],
+            capture_output=True, text=True, check=True,
+        ).stdout
+        home = Path(self.td) / f"factor-home-{name}"
+        home.mkdir()
+        fake_hook = Path(self.td) / f"fake-hook-{name}.sh"
+        fake_hook.write_text("#!/usr/bin/env bash\nwhile true; do sleep 0.05; done\n")
+        fake_hook.chmod(0o755)
+        env = clean_env(MEMCONTINUUM_HOME=str(home), MC_WATCHDOG_BUDGET="0.3")
+        for k in ("MEMCONTINUUM_CODE_ROOT", "MEMCONTINUUM_CODE_ROOTS",
+                  "MEMCONTINUUM_WATCHDOG_FACTOR", "MC_WATCHDOG_BUDGET_FIXED"):
+            env.pop(k, None)
+        env.update(env_over)
+        proc = subprocess.run(
+            [VENV_PYTHON, "-c", launcher_py, MC_BASH, str(fake_hook)],
+            capture_output=True, text=True, env=env, timeout=10,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        line = [l for l in (home / "hook.log").read_text().splitlines() if "watchdog-killed" in l][0]
+        fields = dict(f.split("=", 1) for f in line.split()[1:] if "=" in f)
+        return float(fields["budget"])
+
+    def test_slow_root_factor_applies_to_a_mnt_code_root(self):
+        self.assertEqual(self._kill_line_budget(
+            "mnt", MEMCONTINUUM_CODE_ROOTS='["/home/u/a", "/mnt/d/proj"]'), 0.6)
+        self.assertEqual(self._kill_line_budget(
+            "mnt1", MEMCONTINUUM_CODE_ROOT="/mnt/c/proj"), 0.6)
+
+    def test_slow_root_factor_not_applied_to_a_native_root(self):
+        self.assertEqual(self._kill_line_budget(
+            "ext4", MEMCONTINUUM_CODE_ROOTS='["/home/u/a"]'), 0.3)
+        # A malformed list is "not a slow root", never an error.
+        self.assertEqual(self._kill_line_budget(
+            "bad", MEMCONTINUUM_CODE_ROOTS="{not json"), 0.3)
+
+    def test_slow_root_factor_not_applied_when_budget_is_fixed(self):
+        self.assertEqual(self._kill_line_budget(
+            "fixed", MEMCONTINUUM_CODE_ROOT="/mnt/d/proj", MC_WATCHDOG_BUDGET_FIXED="1"), 0.3)
+
+    def test_slow_root_factor_override_is_honoured(self):
+        self.assertEqual(self._kill_line_budget(
+            "x3", MEMCONTINUUM_CODE_ROOT="/mnt/d/proj", MEMCONTINUUM_WATCHDOG_FACTOR="3"), 0.9)
+        # Not a positive decimal: back to the default 2.
+        self.assertEqual(self._kill_line_budget(
+            "x0", MEMCONTINUUM_CODE_ROOT="/mnt/d/proj", MEMCONTINUUM_WATCHDOG_FACTOR="0"), 0.6)
+
+    def test_sessionend_stamp_exports_the_fixed_budget_flag(self):
+        text = (HOOKS_DIR / "sessionend-stamp.sh").read_text()
+        self.assertIn("export MC_WATCHDOG_BUDGET_FIXED=1", text)
+
     # ---- coordinator review fix: kill before writing the fallback ------
 
     def test_timeout_fallback_write_waits_for_the_child_to_be_reaped(self):
