@@ -13218,7 +13218,7 @@ def _hit_topic_id(hit: dict) -> str:
     return str(hit.get("topic") or hit.get("id") or "").split("/")[0]
 
 
-def print_dedupe(args, root: Path, query: str, command: str) -> str:
+def print_dedupe(args, root: Path, query: str, command: str, ids_out: list | None = None) -> str:
     """Advisory duplicate check: the three nearest decisions, each with its
     capped chain. Never refuses (TOP-0112 L12). Returns the top hit's topic id
     or 'none'."""
@@ -13230,6 +13230,8 @@ def print_dedupe(args, root: Path, query: str, command: str) -> str:
         print("dedupe: no existing decision matches the title")
         return "none"
     print("dedupe: nearest existing decisions (advisory)")
+    if ids_out is not None:
+        ids_out.extend(_hit_topic_id(h) for h in hits)
     for hit in hits:
         line = f"  {_hit_topic_id(hit)}  {hit.get('path')}  {hit.get('title')}  score={hit.get('score'):.4f}"
         if hit.get("matched_link_id"):
@@ -13339,12 +13341,98 @@ def _filing_guard_or_undo(root: Path, path: Path, rel: str, old_text: str | None
     raise FilingRefusal(token, f"{why}; write undone")
 
 
+_DECLINED_SHOW_TOPICS = 3
+_DECLINED_SHOW_ROWS = 10
+
+
+def _store_head_short(root: Path) -> str:
+    try:
+        done = subprocess.run(["git", "-C", str(root), "rev-parse", "--short", "HEAD"],
+                              capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return "none"
+    return done.stdout.strip() if done.returncode == 0 and done.stdout.strip() else "none"
+
+
+def _declined_check(command: str, args, ctx: dict, root: Path, topic_id: str, link: dict,
+                    old_text: str | None, path: Path, title: str) -> None:
+    """Declined rulings on the write path (DESIGN-declined-check). SHOWS every
+    operative rejection of the candidate topics -- the explicit topic for
+    append/promote, the dedupe hits for record -- and REFUSES the one
+    deterministic case: the new link re-adopts a rejected sentence verbatim
+    (memlint.readoption_matches, the same comparator the commit-time rule
+    uses; memlint._normalize_subject is the only normaliser). Fills
+    ctx["declined"] for the one `declined-lookup` receipt, which never carries
+    a sentence (TOP-0133 L2). The receipt's `ids` joins with `_`: the one
+    logger (`_clean_log_token`) keeps only [A-Za-z0-9._-]."""
+    import memlint
+    explicit = command in ("append", "promote")
+    order: list = []
+    if explicit:
+        fm = parse_record_raw(old_text, path).frontmatter
+        groups = [(topic_id, memlint.rejection_rows(fm.get("links") or []))]
+        flagged = [(topic_id, r) for r in memlint.readoption_matches(link, groups[0][1])]
+    else:
+        by_topic: dict = {}
+        store = memlint._store_rejections(root)
+        for tid, row in store:
+            by_topic.setdefault(tid, []).append(row)
+        order = [t for t in dict.fromkeys(ctx.get("dedupe_ids") or []) if t in by_topic]
+        groups = [(t, by_topic[t]) for t in order[:_DECLINED_SHOW_TOPICS]]
+        flagged = [(tid, row) for tid, row in store if memlint.readoption_matches(link, [row], own_topic=False)]
+    show_restored = bool(getattr(args, "show_restored", False))
+    lines: list = []
+    shown_ids: list = []
+    for tid, rows in groups:
+        for row in sorted(rows, key=lambda r: (r["num"], -1 if r["alt"] is None else r["alt"])):
+            if row["restored_by"] is not None and not show_restored:
+                continue
+            if len(lines) >= _DECLINED_SHOW_ROWS:
+                break
+            where = row["link"] + ("" if row["alt"] is None else f" alternative {row['alt'] + 1}")
+            line = (f'rejected on {tid} ({where}): "{memlint._normalize_subject(row["sentence"])}"'
+                    f' -- because: {memlint._normalize_subject(row["reason"]) or "(no reason recorded)"}')
+            if row["restored_by"] is not None:
+                line += f" [restored by {row['restored_by']}]"
+            lines.append(line)
+            if tid not in shown_ids:
+                shown_ids.append(tid)
+    if lines:
+        print("declined: rejected options on the candidate topics (advisory)")
+        for line in lines:
+            print("  " + line)
+    else:
+        print("declined: no operative rejection on the candidate topics")
+    norm = memlint._normalize_subject
+    digest = hashlib.sha256(
+        (norm(title) + "|" + norm(str(link["ruling"]["text"]))).encode("utf-8")).hexdigest()[:16]
+    outcome = "flagged" if flagged else "bypass" if explicit else "shown" if lines else "none"
+    # the receipt names the topics the user saw, in display order, then any flagged topic not shown
+    ids = list(dict.fromkeys(shown_ids + [t for t, _r in flagged]))
+    ctx["declined"] = {"outcome": outcome, "proposal_sha256": digest, "store_rev": _store_head_short(root),
+                       "ids": "_".join(ids[:_DECLINED_SHOW_TOPICS]) if ids else "none", "shown": len(lines)}
+    matched = list(dict.fromkeys([t for t, _r in flagged] + [t for t, _rows in groups] + order))
+    if len(matched) > _DECLINED_SHOW_TOPICS:
+        # the logger caps a value at 64 chars: name the three candidates, count the rest
+        ctx["declined"]["ids_total"] = len(matched)
+    if flagged:
+        tid, row = flagged[0]
+        ref = memlint.rejection_ref(tid, row)
+        raise FilingRefusal(
+            "re-adopts-rejection",
+            f'the new link re-adopts the option rejected at {ref} ("{norm(row["sentence"])}" -- because: '
+            f'{norm(row["reason"]) or "(no reason recorded)"}); to reopen it, append with --reverses '
+            f'{row["link"]} and a --reason-for-change')
+
+
 def _finish_write(command: str, args, ctx: dict, root: Path, path: Path, rel: str,
                   old_text: str | None, new_text: str, topic_id: str, link: dict,
                   title: str) -> int:
     """Shared tail: round-trip proof is the caller's; here the lint, the diff,
     the write, the in-process guard, then retrieval check, standing prompt,
-    proposals and the receipt."""
+    proposals and the receipt. The declined-rulings check comes first: it
+    prints after the dedupe block and before the diff."""
+    _declined_check(command, args, ctx, root, topic_id, link, old_text, path, title)
     problem = _filing_lint_problem(rel, new_text, link)
     if problem:
         raise FilingRefusal("lint", f"the result would not lint clean: {problem}")
@@ -13543,6 +13631,9 @@ def run_filing(command: str, args, impl) -> int:
         fields["rollback"] = ctx["rollback"]
     fields["project"] = args.project
     append_hook_log_line("filing", fields)
+    declined = ctx.get("declined")
+    if declined:
+        append_hook_log_line("declined-lookup", {**declined, "project": args.project})
     return rc
 
 
@@ -13637,7 +13728,8 @@ def _record_impl(args, ctx: dict) -> int:
             or list(fm.get("tags") or []) != tags):
         raise FilingRefusal("roundtrip", "the new topic would not round-trip as written")
     dedupe_query = args.title + (f" {args.question}" if args.question else "")
-    ctx["dedupe_top"] = print_dedupe(args, root, dedupe_query, "record")
+    ctx["dedupe_ids"] = []
+    ctx["dedupe_top"] = print_dedupe(args, root, dedupe_query, "record", ctx["dedupe_ids"])
     rc = _finish_write("record", args, ctx, root, path, str(path.relative_to(root)), None, new_text,
                        topic_id, link, args.title)
     _filing_proposals(args, root)
@@ -13733,6 +13825,8 @@ def add_filing_link_args(p: argparse.ArgumentParser, with_ruling: bool = True) -
     p.add_argument("--shown-text", dest="shown_text", default=None)
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--require-retrieve", action="store_true")
+    p.add_argument("--show-restored", action="store_true",
+                   help="also list rejections a later link restored (declined-rulings check)")
 
 
 # ---------------------------------------------------------------------------

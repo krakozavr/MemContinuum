@@ -3935,6 +3935,45 @@ shared with `propose-bindings`). Each run appends one `filing` line to hook.log
 (outcome, ids, authority, derived, dedupe_top, retrieval, project; a refusal adds
 `reason`).
 
+**Declined rulings on the write path.** The check has one comparator,
+written in memlint and used by both the command and the commit-time rule:
+`rejection_rows` lists what a topic rejected, `rejection_is_operative` says
+whether a later link undid it, `readoption_matches` says whether a new link
+re-adopts it. A rejection is a link with `kind: declined` or `status: declined`
+(its ruling text is the rejected sentence) or an entry of any link's
+`alternatives[]` (its `option`). It stays operative unless a LATER link on the
+same topic is `status: active` and names it in `reverses`; an alternative cannot
+be named alone, so reversing the link that recorded it restores all of that
+link's alternatives, and superseding a link without `reverses` restores nothing.
+`_declined_check` runs first in `_finish_write`, so `--dry-run` runs it too: it
+shows every operative rejection of the candidate topics (the explicit topic for
+`append`/`promote`; the dedupe hits for `record`; at most three topics and ten
+rows, oldest first; rows a later link restored only with `--show-restored`),
+after the dedupe block and before the diff. The one refusal (`rc 1`, reason
+`re-adopts-rejection`) is deterministic: kind `adopted` (or `restored` without
+`reverses`), status `active` or `provisional`, no `reverses`, and
+`memlint._normalize_subject` of the ruling text equal to the rejected sentence
+(for `record`, a rejection on any topic of the store). A paraphrase is shown,
+never flagged; there is no substring, case-fold or semantic test. Reopening a
+rejection is a link with `reverses` and a `reason_for_change`. The same rule
+runs at commit for hand edits: an error under `--against-ref` for a link absent
+at REF (its own topic; every other topic too for a brand-new file, read from
+the index under `--staged` and from the working tree otherwise) and a
+warning in plain mode, for the link's own topic and for every other topic alike
+(old links are not re-judged as errors), the same severity split as the two
+kind and question checks. Any `reverses` exempts a link, whichever link it
+names: the author's claim is the sanctioned reopening and the chain shows it.
+Each filing run that reached the lookup appends one
+`declined-lookup` line to hook.log (outcome `none|shown|flagged|bypass`, a
+16-hex digest of the normalised title and ruling, the store revision, the ids of
+at most three topics whose rejections were shown or flagged joined with `_`
+(`ids_total` gives the count when more matched), the count
+shown, project); it never carries a sentence, and it proves a lookup ran, not
+that anyone read it. A run refused before the lookup (an unknown topic, a parse
+failure) writes no `declined-lookup` line, so `outcome=none` always means a
+completed lookup with nothing to show. `bypass` marks an explicit topic id that
+skipped fuzzy retrieval; flagged outranks bypass, bypass outranks shown.
+
 A `kind: reversed` link is refused (by memlint's rule) while its target is still
 `active` or `provisional`, so supersede the old link by hand in the same commit
 first; `restored` and `amended` carry no such rule.

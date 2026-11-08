@@ -253,6 +253,16 @@ copied inline.
   question is not a ruling (`owner-ratified` is the orchestrator's own paraphrase, not covered).
   Enforced for new links only: an error under `--against-ref` for links absent at REF (every link of
   a new file); a warning in plain mode, so links recorded before the check do not block commits
+- a new link (`kind: adopted`, or `restored` without `reverses`; status `active` or `provisional`; no
+  `reverses`) whose `ruling.text`, after whitespace normalisation, equals a still-operative rejection →
+  error. A rejection is a `kind: declined` / `status: declined` link's text or any link's
+  `alternatives[].option`; it is operative until a later `status: active` link names it (or, for an
+  alternative, the link that recorded it) in `reverses`. The comparison is the whitespace-normalised
+  string and nothing else, so a paraphrase is not flagged. Checked against the link's own topic and,
+  for a brand-new topic file, every other topic. Enforced for new links only: an error under
+  `--against-ref` for links absent at REF; a warning in plain mode (on the link's own topic and,
+  once the whole store is read, across topics; old links are tolerated), so links recorded before the check do
+  not block commits; `--against-ref` errors for new links
 - `status: superseded` without `superseded_by` → error
 - `reverses:` without `reason_for_change` → error
 - a `kind: reversed` link whose `reverses:` target's `status` is still `active` or `provisional` →
