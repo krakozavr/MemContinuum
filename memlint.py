@@ -351,6 +351,15 @@ def lint_topic(
             f"{e} [grandfathered: an error for new links under --against-ref]"
             for e in _new_link_errors(prefix, link)
         )
+        # Declined-rulings rule (DESIGN-declined-check): same severity split.
+        # Plain mode judges the topic's own rejections only; the cross-topic
+        # case (a brand-new topic) is an --against-ref error.
+        topic_id = str(fm.get("id") or Path(str(path)).stem)
+        warnings.extend(
+            f"{readoption_message(prefix, topic_id, row)} "
+            "[grandfathered: an error for new links under --against-ref]"
+            for row in readoption_matches(link, rejection_rows(links), _link_number(link.get("link")))
+        )
 
         ruling = link.get("ruling") or {}
         auth = ruling.get("authority")
@@ -954,6 +963,125 @@ def _normalize_subject(s: str) -> str:
     one thing this check must never do (INC-0124's own lesson: a guard for
     fabrication must not itself cry wolf on a harmless reformat)."""
     return " ".join(s.split())
+
+
+# ---------------------------------------------------------------------------
+# Declined rulings checked on the write path (0.6.0; docs/internal/
+# DESIGN-declined-check.md). ONE comparator, used by the filing command
+# (memidx.py) and by the commit-time rule below: what a topic REJECTED, whether
+# the rejection is still operative, and whether a new link re-adopts it
+# verbatim. The only normaliser is _normalize_subject (whitespace collapse);
+# no substring, case-fold or semantic test (a paraphrase is shown, never
+# flagged).
+# ---------------------------------------------------------------------------
+
+def _link_number(link_id) -> int | None:
+    """The integer of a link id like "L12", or None."""
+    m = re.fullmatch(r"L(\d+)", str(link_id or "").strip())
+    return int(m.group(1)) if m else None
+
+
+def rejection_rows(links: list) -> list[dict]:
+    """Every rejection a topic records: a link with `kind: declined` or
+    `status: declined` (its ruling.text is the rejected sentence) and each
+    `alternatives[].option` of any link. Each row: link, num, alt (index or
+    None), sentence, reason, restored_by (id of the EARLIEST later link that
+    is `status: active` and `reverses` the row's link, else None) and
+    restored_num. An alternative cannot be named alone, so reversing its link
+    restores all of that link's alternatives. Superseding is not restoring."""
+    links = [l for l in links if isinstance(l, dict)]
+    rows: list[dict] = []
+    for l in links:
+        lid, num = str(l.get("link")), _link_number(l.get("link"))
+        if num is None:
+            continue
+        ruling = l.get("ruling") if isinstance(l.get("ruling"), dict) else {}
+        if (l.get("kind") == "declined" or l.get("status") == "declined") and ruling.get("text"):
+            rat = l.get("rationale") if isinstance(l.get("rationale"), dict) else {}
+            rows.append({"link": lid, "num": num, "alt": None, "sentence": str(ruling["text"]),
+                         "reason": str(rat.get("text") or "")})
+        alts = l.get("alternatives")
+        for i, alt in enumerate(alts if isinstance(alts, list) else []):
+            if isinstance(alt, dict) and alt.get("option"):
+                rows.append({"link": lid, "num": num, "alt": i, "sentence": str(alt["option"]),
+                             "reason": str(alt.get("rejected_because") or "")})
+    for row in rows:
+        row["restored_by"], row["restored_num"] = None, None
+        for l in links:
+            n = _link_number(l.get("link"))
+            if (n is not None and n > row["num"] and l.get("status") == "active"
+                    and str(l.get("reverses") or "") == row["link"]
+                    and (row["restored_num"] is None or n < row["restored_num"])):
+                row["restored_by"], row["restored_num"] = str(l.get("link")), n
+    return rows
+
+
+def rejection_is_operative(row: dict, as_of: int | None = None) -> bool:
+    """Operative unless restored; with `as_of` (a link number) a restoration
+    LATER than that link does not count -- the state when that link was written."""
+    if row["restored_num"] is None:
+        return True
+    return as_of is not None and row["restored_num"] > as_of
+
+
+def readoption_matches(link: dict, rows: list[dict], as_of: int | None = None,
+                       own_topic: bool = True) -> list[dict]:
+    """The operative rows `link` re-adopts verbatim (DESIGN section 3):
+    kind `adopted` (or `restored` without `reverses`), status `active` or
+    `provisional`, no `reverses`, and the whitespace-normalised ruling text
+    equal to a rejected sentence. `own_topic`: the rows come from the link's
+    own topic, so only rejections at a LOWER link number than the link count
+    (a link never re-adopts itself)."""
+    if link.get("reverses") or link.get("kind") not in ("adopted", "restored"):
+        return []
+    if link.get("status") not in ("active", "provisional"):
+        return []
+    ruling = link.get("ruling") if isinstance(link.get("ruling"), dict) else {}
+    text = ruling.get("text")
+    if not text:
+        return []
+    want = _normalize_subject(str(text))
+    num = _link_number(link.get("link"))
+    out = []
+    for row in rows:
+        if own_topic and num is not None and row["num"] >= num:
+            continue
+        if not rejection_is_operative(row, as_of if own_topic else None):
+            continue
+        if _normalize_subject(row["sentence"]) == want:
+            out.append(row)
+    return out
+
+
+def rejection_ref(topic_id: str, row: dict) -> str:
+    """`<TOP> <Ln>` or `<TOP> <Ln> alternative <i>` (1-based), as printed."""
+    return f"{topic_id} {row['link']}" + ("" if row["alt"] is None else f" alternative {row['alt'] + 1}")
+
+
+def readoption_message(prefix: str, topic_id: str, row: dict) -> str:
+    return (f"{prefix}: re-adopts a rejected option recorded at {rejection_ref(topic_id, row)} "
+            "without reverses")
+
+
+def _topic_rejection_rows(fm: dict) -> list:
+    links = fm.get("links")
+    if not isinstance(links, list):
+        return []
+    return [(str(fm.get("id") or ""), r) for r in rejection_rows(links)]
+
+
+def _store_rejections(root: Path) -> list:
+    """`(topic_id, row)` for every parseable topic under `root` (worktree
+    reads; a file that does not parse contributes nothing)."""
+    out: list = []
+    for f in sorted(walk_markdown(root)):
+        result = parse_record(f)
+        if not result.valid or not _is_topic_frontmatter(result.frontmatter):
+            continue
+        fm = dict(result.frontmatter)
+        fm["id"] = fm.get("id") or f.stem
+        out.extend(_topic_rejection_rows(fm))
+    return out
 
 
 def _citation_errors(
@@ -2597,15 +2725,33 @@ def _read_added_blob(toplevel: Path, root: Path, relpath: str, path_in_root: str
     return _parse_git_blob(blob, path_in_root)
 
 
-def _added_links_errors(full_path: Path, links: list, old_ids: set) -> list[str]:
+def _added_links_errors(full_path: Path, links: list, old_ids: set,
+                        fm: dict | None = None, ctx: dict | None = None) -> list[str]:
     """Grandfathered-check errors for every link whose id is not in
-    `old_ids` (the ids recorded at REF)."""
+    `old_ids` (the ids recorded at REF): the two kind/question checks and the
+    declined-rulings rule (DESIGN-declined-check). The latter judges a new
+    link against its own topic's rejections; when `old_ids` is empty (a
+    brand-new topic, every link new) also against every OTHER topic in the
+    store, read from the working tree via `ctx` ({"root": store, "cache": {}})."""
     errs: list[str] = []
+    topic_id = str((fm or {}).get("id") or Path(str(full_path)).stem)
+    own_rows = rejection_rows(links)
+    other: list = []
+    if not old_ids and ctx is not None:
+        if "store" not in ctx["cache"]:
+            ctx["cache"]["store"] = _store_rejections(ctx["root"])
+        other = [(tid, r) for tid, r in ctx["cache"]["store"] if tid != topic_id]
     for l in links:
         lid = l.get("link")
         if lid is None or str(lid) in old_ids:
             continue
         errs.extend(_new_link_errors(f"{full_path}:{lid}", l))
+        prefix = f"{full_path}:{lid}"
+        for row in readoption_matches(l, own_rows, _link_number(lid)):
+            errs.append(readoption_message(prefix, topic_id, row))
+        for tid, row in other:
+            if readoption_matches(l, [row], own_topic=False):
+                errs.append(readoption_message(prefix, tid, row))
     return errs
 
 
@@ -2902,6 +3048,7 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
         raise GitError(f"git diff against {ref!r} failed" + (f" ({stderr})" if stderr else ""))
     entries = _parse_name_status_z(raw.stdout)
 
+    ctx = {"root": root, "cache": {}}
     errors: list[str] = []
     notes: list[str] = []
     changed = 0
@@ -2924,7 +3071,8 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
                 # that still carries a recoverable `links:` list is topic
                 # data to memidx; judge its links whatever its `type` says.
                 errors.extend(_added_links_errors(
-                    full_path, _recovered_old_links(added.frontmatter) or [], set()))
+                    full_path, _recovered_old_links(added.frontmatter) or [], set(),
+                    fm=added.frontmatter, ctx=ctx))
             if added is not None and _is_topic_like(added):
                 if not added.valid:
                     # A new topic that fails parse/shape validation must not
@@ -2945,7 +3093,8 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
                     # worktree copy, INC-0127): rows, pointers, `current:` == head
                     errors.extend(_staged_standing_errors(full_path, added.frontmatter, links))
                     errors.extend(_staged_head_errors(full_path, added.frontmatter, links))
-                errors.extend(_added_links_errors(full_path, links, set()))
+                errors.extend(_added_links_errors(
+                    full_path, links, set(), fm=added.frontmatter, ctx=ctx))
             continue
 
         old_blob = _git_show(toplevel, f"{ref}:{relpath}")
@@ -2966,7 +3115,7 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
                     errors.extend(_added_links_errors(
                         full_path,
                         _recovered_old_links(_parse_git_blob(nb, path_in_root).frontmatter) or [],
-                        ref_ids))
+                        ref_ids, fm=_parse_git_blob(nb, path_in_root).frontmatter, ctx=ctx))
             continue
         changed += 1
 
@@ -3021,7 +3170,8 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
                     # old_links is None here: REF recorded no recoverable
                     # link ids, so every link in the new blob is new.
                     errors.extend(_added_links_errors(
-                        full_path, new_result.frontmatter.get("links") or [], set()))
+                        full_path, new_result.frontmatter.get("links") or [], set(),
+                        fm=new_result.frontmatter, ctx=ctx))
                     # Anchor rows recorded at REF stay frozen on this branch too:
                     # a repair of the links is not a licence to rewrite a capture.
                     errors.extend(_anchor_freeze_errors(
@@ -3137,7 +3287,8 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
         # ids themselves, which is a separate, unasked-for check.
         old_ids = {str(l.get("link")) for l in old_links if l.get("link") is not None}
         seen_old_id = False
-        errors.extend(_added_links_errors(full_path, new_links_full, old_ids))
+        errors.extend(_added_links_errors(
+            full_path, new_links_full, old_ids, fm=new_result.frontmatter, ctx=ctx))
         for l in new_links_full:
             nid = l.get("link")
             if nid is None:
