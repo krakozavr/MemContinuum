@@ -146,7 +146,7 @@ MC_DB_PATH="$MEMCONTINUUM_HOME/$MC_PROJECT.sqlite"
 # MEMCONTINUUM_TEST_CLOCK=1 (the backward-clock tests put the start in the
 # future instead of waiting for a real clock step).
 if [ "${MEMCONTINUUM_TEST_CLOCK:-}" != "1" ] || [ -z "${MC_T0_US:-}" ]; then
-    mc_now_ms "${MC_PY:-python3}" >/dev/null
+    mc_now_ms "" 1 >/dev/null
     MC_T0_US="$(( ${MC_NOW_MS:-0} * 1000 ))"
 fi
 export MC_T0_US
@@ -156,7 +156,7 @@ export MC_T0_US
 # clock that steps backwards must never print a sign.
 mc_elapsed_field() {
     local d
-    mc_now_ms "${MC_PY:-python3}" >/dev/null
+    mc_now_ms "" 1 >/dev/null
     d=$(( (${MC_NOW_MS:-0} * 1000 - MC_T0_US) / 100000 ))
     [ "$d" -lt 0 ] && d=0
     printf 'elapsed=%d.%ds' $(( d / 10 )) $(( d % 10 ))

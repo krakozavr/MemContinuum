@@ -592,6 +592,29 @@ class TestLedgerPostEdit(HookTestBase):
         )
         self.assertEqual(proc.stdout.strip(), "elapsed=0.0s", proc.stdout + proc.stderr)
 
+    def test_elapsed_field_never_forks_python_on_a_date_without_percent_n(self):
+        """No EPOCHREALTIME and a `date` without %N (macOS bash 3.2): the
+        field falls back to whole seconds from `date +%s`; the interpreter
+        is never spawned (the python path is a spy that would leave a mark)."""
+        spy = Path(self.td) / "python-spawned"
+        fake = Path(self.td) / "fakebin"
+        fake.mkdir()
+        (fake / "date").write_text(
+            '#!/usr/bin/env bash\ncase "$*" in *%3N*) echo 3N;; *) exec /bin/date "$@";; esac\n')
+        (fake / "date").chmod(0o755)
+        py = Path(self.td) / "py-spy"
+        py.write_text('#!/usr/bin/env bash\ntouch "' + str(spy) + '"\nexec "' + VENV_PYTHON + '" "$@"\n')
+        py.chmod(0o755)
+        script = ('unset EPOCHREALTIME; source "$1"; MC_PY="$2"; unset EPOCHREALTIME; '
+                  'MC_QUERY_MS_MODE=""; mc_elapsed_field; printf " mode=%s" "$MC_QUERY_MS_MODE"')
+        proc = subprocess.run(
+            [MC_BASH, "-c", script, "_", str(HOOKS_DIR / "memlib.sh"), str(py)],
+            capture_output=True, text=True, timeout=10,
+            env=self.base_env(PATH=str(fake) + os.pathsep + os.environ["PATH"]),
+        )
+        self.assertRegex(proc.stdout, r"^elapsed=\d+\.0s mode=python$", proc.stdout + proc.stderr)
+        self.assertFalse(spy.exists(), "python was spawned for a log field")
+
     def _future_start_us(self, seconds=5):
         return str(int((time.time() + seconds) * 1_000_000))
 

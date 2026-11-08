@@ -172,14 +172,18 @@ mc_query_tokens() {
 # call (per-process probe cache, see the header comment above).
 MC_QUERY_MS_MODE="${MC_QUERY_MS_MODE:-}"
 
-# mc_now_ms [PYTHON_INTERPRETER] -- millisecond-epoch on stdout, and also in
+# mc_now_ms [PYTHON_INTERPRETER [NO_PYTHON]] -- millisecond-epoch on stdout, and also in
 # $MC_NOW_MS when called in the current shell (not inside $(...)), so
 # hooks/memlib.sh's elapsed timer reads it with no subshell. bash >= 5 reads
 # $EPOCHREALTIME (no fork at all); older bash uses the probe below. See the
 # file header comment for the GNU-%3N-vs-BSD-no-%N probe this caches. This is
 # the ONE "now" helper in the tree: memlib.sh's mc_elapsed_field is built on it.
+# NO_PYTHON=1 (a log field must never fork an interpreter): where the probe
+# below says `date` has no %N, answer in WHOLE SECONDS from `date +%s` (times
+# 1000) instead of the python fallback. Ladder: EPOCHREALTIME -> date +%3N ->
+# date +%s. Callers that omit it keep the python fallback unchanged.
 mc_now_ms() {
-    local py="${1:-python3}" probe
+    local py="${1:-python3}" nopy="${2:-}" probe
     if [ -n "${EPOCHREALTIME:-}" ]; then
         MC_NOW_MS="${EPOCHREALTIME/[.,]/}"
         MC_NOW_MS="${MC_NOW_MS%???}"
@@ -195,6 +199,8 @@ mc_now_ms() {
     fi
     if [ "$MC_QUERY_MS_MODE" = "date" ]; then
         MC_NOW_MS="$(date +%s%3N 2>/dev/null)"
+    elif [ "$nopy" = "1" ]; then
+        MC_NOW_MS="$(( $(date +%s 2>/dev/null || echo 0) * 1000 ))"
     else
         MC_NOW_MS="$(PYTHONPATH= "$py" -c 'import time; print(int(time.time() * 1000))' 2>/dev/null)"
     fi
