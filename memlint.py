@@ -2982,85 +2982,114 @@ def _mark_span_ident(row) -> str | None:
     return "\x00".join(ident) if ident is not None else None
 
 
-_MARK_FREEZE_MESSAGES = {
-    "no_ident": "recorded row lacks an identity component (link, action, recorded_at) and "
-                "cannot be verified; refusing to skip it (append-only)",
-    "gone": "row removed after being recorded (append-only; a standing mark is never deleted)",
-    "changed": "row changed after being recorded (append-only; a standing mark is never edited)",
-    "no_span": "row's span could not be extracted on the new side; treated as changed "
-               "(append-only; a recorded standing mark must stay byte-verifiable)",
-    "reformatted": "row reformatted, not appended (append-only; raw text changed after being "
-                   "recorded while its parsed fields did not)",
+def _ref_mark_span_ident(row) -> str | None:
+    """`ref_mark_ident` as the string key `_link_raw_spans` maps by."""
+    ident = ref_mark_ident(row)
+    return "\x00".join(ident) if ident is not None else None
+
+
+# The two frozen audit blocks the guard judges with ONE implementation: the
+# `standing:` pointer list (rows keyed by link id) and the `code_refs:` list
+# (rows keyed by ref). `noun` words the messages, `members` reads the membership
+# set the rows must account for, `rows` reads the block.
+_STANDING_AUDIT = {
+    "block": "standing_marks", "field": "standing", "id_field": "link", "noun": "standing mark",
+    "span_ident": _mark_span_ident, "rows": standing_mark_rows,
+    "members": lambda fm: set(standing_ids(fm)),
+}
+_REF_AUDIT = {
+    "block": "ref_marks", "field": "code_refs", "id_field": "ref", "noun": "reference mark",
+    "span_ident": _ref_mark_span_ident, "rows": ref_mark_rows, "members": code_ref_set,
 }
 
 
-def _standing_marks_freeze_errors(full_path, old_text, old_rows: list, new_text, new_rows: list) -> list[str]:
-    """g1: every `standing_marks:` row recorded at REF survives with the same
-    parsed fields and the same raw bytes, in the same relative order, and every
-    new row sits ABOVE every old one (newest first). Unlike anchors, a span
-    walker that cannot account for an existing OR a new block is an ERROR, not
-    a note -- otherwise the block's first commit would get parsed-field
-    protection only."""
+def _mark_freeze_messages(audit: dict) -> dict:
+    id_field, noun = audit["id_field"], audit["noun"]
+    return {
+        "no_ident": f"recorded row lacks an identity component ({id_field}, action, recorded_at) and "
+                    "cannot be verified; refusing to skip it (append-only)",
+        "gone": f"row removed after being recorded (append-only; a {noun} is never deleted)",
+        "changed": f"row changed after being recorded (append-only; a {noun} is never edited)",
+        "no_span": "row's span could not be extracted on the new side; treated as changed "
+                   f"(append-only; a recorded {noun} must stay byte-verifiable)",
+        "reformatted": "row reformatted, not appended (append-only; raw text changed after being "
+                       "recorded while its parsed fields did not)",
+    }
+
+
+def _standing_marks_freeze_errors(full_path, old_text, old_rows: list, new_text, new_rows: list,
+                                  audit: dict = _STANDING_AUDIT) -> list[str]:
+    """g1: every row of the audit block (`standing_marks:` by default, `ref_marks:`
+    with `audit=_REF_AUDIT`) recorded at REF survives with the same parsed
+    fields and the same raw bytes, in the same relative order, and every new row
+    sits ABOVE every old one (newest first). Unlike anchors, a span walker that
+    cannot account for an existing OR a new block is an ERROR, not a note --
+    otherwise the block's first commit would get parsed-field protection only."""
     errors: list[str] = []
+    block, noun, span_ident = audit["block"], audit["noun"], audit["span_ident"]
     old_spans = (
-        _link_raw_spans(old_text, old_rows, key="standing_marks", ident=_mark_span_ident)
+        _link_raw_spans(old_text, old_rows, key=block, ident=span_ident)
         if old_rows and old_text is not None else None
     )
     new_spans = (
-        _link_raw_spans(new_text, new_rows, key="standing_marks", ident=_mark_span_ident)
+        _link_raw_spans(new_text, new_rows, key=block, ident=span_ident)
         if new_rows and new_text is not None else None
     )
     if old_rows and old_spans is None:
         errors.append(
-            f"{full_path}: standing_marks: could not verify the recorded rows' raw text at REF "
+            f"{full_path}: {block}: could not verify the recorded rows' raw text at REF "
             "(structural extraction inconclusive); refusing to treat them as unchanged"
         )
     if new_rows and new_spans is None:
         errors.append(
-            f"{full_path}: standing_marks: could not extract the rows' raw text from the new "
+            f"{full_path}: {block}: could not extract the rows' raw text from the new "
             "block (structural extraction inconclusive); refusing to treat it as appended"
         )
 
     def name(row):
-        return (f"{full_path}: standing mark ({row.get('link')}, {row.get('action')}, "
+        return (f"{full_path}: {noun} ({row.get(audit['id_field'])}, {row.get('action')}, "
                 f"{row.get('recorded_at')})")
 
-    errors.extend(_frozen_rows_errors(old_rows, new_rows, _mark_span_ident, name,
-                                      old_spans, new_spans, _MARK_FREEZE_MESSAGES))
-    old_keys = [k for k in (_mark_span_ident(r) for r in old_rows) if k is not None]
+    errors.extend(_frozen_rows_errors(old_rows, new_rows, span_ident, name,
+                                      old_spans, new_spans, _mark_freeze_messages(audit)))
+    old_keys = [k for k in (span_ident(r) for r in old_rows) if k is not None]
     old_set = set(old_keys)
-    new_keys = [_mark_span_ident(r) for r in new_rows]
+    new_keys = [span_ident(r) for r in new_rows]
     survivors = [k for k in new_keys if k in old_set]
     if survivors != [k for k in old_keys if k in set(new_keys)]:
-        errors.append(f"{full_path}: standing_marks: recorded rows reordered (append-only; "
+        errors.append(f"{full_path}: {block}: recorded rows reordered (append-only; "
                       "rows keep the order they were recorded in, newest first)")
     seen_old = False
     for k in new_keys:
         if k in old_set:
             seen_old = True
         elif seen_old:
-            errors.append(f"{full_path}: standing_marks: marks not prepended (a new row must sit "
+            errors.append(f"{full_path}: {block}: marks not prepended (a new row must sit "
                           "above every recorded row, newest first)")
             break
     return errors
 
 
-def _standing_pairing_errors(full_path, old_ids: set, new_ids: set, new_pairs: list) -> list[str]:
-    """g2: the multiset of `(id, action)` the `standing:` change REQUIRES must
-    equal the multiset of `(link, action)` of the rows added in this commit."""
+def _standing_pairing_errors(full_path, old_ids: set, new_ids: set, new_pairs: list,
+                             audit: dict = _STANDING_AUDIT) -> list[str]:
+    """g2: the multiset of `(id, action)` the membership change REQUIRES (of
+    `standing:` by default, of `code_refs:` with `audit=_REF_AUDIT`) must equal
+    the multiset of `(id, action)` of the rows added in this commit. Membership
+    is a SET: reordering the same entries needs no row."""
     required = [(i, "add") for i in sorted(new_ids - old_ids)] + \
                [(i, "remove") for i in sorted(old_ids - new_ids)]
+    field, block, noun = audit["field"], audit["block"], audit["noun"]
     errors: list[str] = []
     for pair in required:
         n = new_pairs.count(pair)
         if n == 0:
-            errors.append(f"{full_path}: standing changed for {pair[0]} ({pair[1]}) with no "
-                          "matching standing_marks row")
+            errors.append(f"{full_path}: {field} changed for {pair[0]} ({pair[1]}) with no "
+                          f"matching {block} row")
         elif n > 1:
-            errors.append(f"{full_path}: duplicate standing mark for ({pair[0]}, {pair[1]}) in one commit")
+            errors.append(f"{full_path}: duplicate {noun} for ({pair[0]}, {pair[1]}) in one commit")
     for pair in new_pairs:
         if pair not in required:
-            errors.append(f"{full_path}: orphan standing mark ({pair[0]}, {pair[1]}): standing: "
+            errors.append(f"{full_path}: orphan {noun} ({pair[0]}, {pair[1]}): {field}: "
                           "did not change that way")
     return errors
 
@@ -3116,16 +3145,33 @@ def _current_discipline_errors(full_path, old_fm: dict, old_links: list, new_fm:
     return errors
 
 
-def _standing_guard_errors(full_path, old_fm: dict, old_text, new_fm: dict, new_text) -> list[str]:
-    """g1 + g2 for one topic present at both sides."""
-    old_rows, new_rows = standing_mark_rows(old_fm), standing_mark_rows(new_fm)
-    errors = _standing_marks_freeze_errors(full_path, old_text, old_rows, new_text, new_rows)
-    old_set = {k for k in (_mark_span_ident(r) for r in old_rows) if k is not None}
-    new_pairs = [(str(r.get("link")), str(r.get("action"))) for r in new_rows
-                 if _mark_span_ident(r) not in old_set]
+def _standing_guard_errors(full_path, old_fm: dict, old_text, new_fm: dict, new_text,
+                           audit: dict = _STANDING_AUDIT) -> list[str]:
+    """g1 + g2 for one topic present at both sides (the `standing:` audit by
+    default, the `code_refs:` audit with `audit=_REF_AUDIT`)."""
+    old_rows, new_rows = audit["rows"](old_fm), audit["rows"](new_fm)
+    errors = _standing_marks_freeze_errors(full_path, old_text, old_rows, new_text, new_rows, audit)
+    old_set = {k for k in (audit["span_ident"](r) for r in old_rows) if k is not None}
+    new_pairs = [(str(r.get(audit["id_field"])), str(r.get("action"))) for r in new_rows
+                 if audit["span_ident"](r) not in old_set]
     errors.extend(_standing_pairing_errors(
-        full_path, set(standing_ids(old_fm)), set(standing_ids(new_fm)), new_pairs))
+        full_path, audit["members"](old_fm), audit["members"](new_fm), new_pairs, audit))
     return errors
+
+
+def _type_change_errors(full_path, old_fm: dict, new_fm: dict) -> list[str]:
+    """A topic's `type:` recorded at REF is frozen: it decides which index type
+    the record carries, and `for-path` and the standing digest read only
+    `type: topic`. A record with no `type` at REF recorded nothing to freeze;
+    a new side that is not a mapping at all is refused elsewhere."""
+    old_type = old_fm.get("type")
+    if old_type is None or not isinstance(new_fm, dict) or not new_fm:
+        return []
+    new_type = new_fm.get("type")
+    if str(new_type) == str(old_type):
+        return []
+    return [f"{full_path}: type changed {old_type!r} -> {new_type!r} after being recorded "
+            "(append-only; `type` decides what the record is delivered as)"]
 
 
 def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], int, list[str]]:
@@ -3197,6 +3243,12 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
                     errors.extend(_standing_pairing_errors(
                         full_path, set(), set(standing_ids(added.frontmatter)),
                         [(str(r.get("link")), str(r.get("action"))) for r in added_rows]))
+                    # ... and likewise every code_refs entry of a brand-new topic needs its
+                    # `add` row in ref_marks (an existing topic's membership is grandfathered)
+                    errors.extend(_standing_pairing_errors(
+                        full_path, set(), code_ref_set(added.frontmatter),
+                        [(str(r.get("ref")), str(r.get("action")))
+                         for r in ref_mark_rows(added.frontmatter)], _REF_AUDIT))
                     # ... and the plain-mode rules on the STAGED blob (the hook lints only the
                     # worktree copy, INC-0127): rows, pointers, `current:` == head
                     errors.extend(_staged_standing_errors(full_path, added.frontmatter, links))
@@ -3248,6 +3300,10 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
             continue
         new_result = _parse_git_blob(new_blob, path_in_root)
 
+        # `type` is frozen for a topic-like file that existed at REF; judged here, before
+        # any branch below can `continue` past it (a repair, an invalid new side)
+        errors.extend(_type_change_errors(full_path, old_result.frontmatter, new_result.frontmatter))
+
         repair_note = None
         if not old_result.valid:
             old_links = _recovered_old_links(old_result.frontmatter)
@@ -3291,6 +3347,10 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
                     errors.extend(_standing_marks_freeze_errors(
                         full_path, _decode_or_none(old_blob), standing_mark_rows(old_result.frontmatter),
                         _decode_or_none(new_blob), standing_mark_rows(new_result.frontmatter),
+                    ))
+                    errors.extend(_standing_marks_freeze_errors(
+                        full_path, _decode_or_none(old_blob), ref_mark_rows(old_result.frontmatter),
+                        _decode_or_none(new_blob), ref_mark_rows(new_result.frontmatter), _REF_AUDIT,
                     ))
                     errors.extend(_staged_standing_errors(
                         full_path, new_result.frontmatter, new_result.frontmatter.get("links") or []))
@@ -3467,6 +3527,9 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
         # moves only with the newest active link (g4)
         errors.extend(_standing_guard_errors(
             full_path, old_result.frontmatter, old_text, new_result.frontmatter, new_text))
+        # ... and `code_refs:` membership changes need their `ref_marks:` rows the same way
+        errors.extend(_standing_guard_errors(
+            full_path, old_result.frontmatter, old_text, new_result.frontmatter, new_text, _REF_AUDIT))
         errors.extend(_current_discipline_errors(
             full_path, old_result.frontmatter, old_links, new_result.frontmatter, new_links_full))
         errors.extend(_staged_standing_errors(full_path, new_result.frontmatter, new_links_full))
