@@ -439,9 +439,11 @@ pre-commit hook reads):
   existed at `REF` with a recorded type, topic or not (an incident or concept included):
   `type changed 'topic' -> 'investigation' after being recorded`. A file added after `REF` is free, and
   so is a record that had no `type` at `REF`, or whose `REF` side parsed only through the lenient fallback
-  with a recovered `type` that, minus a trailing ` #...` comment, is not a known record type. A fallback
-  `REF` value that keeps its odd text unchanged (`"topic # x"`) passes, and so does its bare token
-  (`topic`); plain lint is unchanged.
+  with a recovered `type` that, minus a trailing ` #...` comment, is not a known record type. A strict `REF` needs
+  the same parsed `type`. A fallback `REF` with a known bare token (the recovered value minus a trailing
+  ` #...` comment and quote characters) needs the repaired record to declare exactly that bare type
+  (`type: topic`): an odd spelling (`"topic # x"`) is normalised by the repair, not kept; plain lint is
+  unchanged.
 - *Link order is frozen (g3).* The link ids present at `REF` must keep their relative order in the
   new blob (new links go on top; the older newest-first check refuses one placed between old ids): `<path>: links reordered (L2 before
   L3; the chain head is first-active-in-file-order)`. The chain head is the first active link in file
