@@ -1,0 +1,585 @@
+"""0.6.0 hygiene PR -- the frontmatter guard gaps (TOP-0137 L26): `code_refs:`
+membership under the guard through the frozen `ref_marks:` rows, `bind`
+writing its row and restoring an unbound ref, `unbind`, `type` frozen, and the
+anchor rule's "unbound" clause. Every fixture builds its own throwaway store."""
+import contextlib
+import io
+import json
+import os
+import sys
+import tempfile
+import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from unittest import mock
+
+TOOLS_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(TOOLS_DIR))
+sys.path.insert(0, str(TOOLS_DIR / "tests"))
+
+import memidx  # noqa: E402
+import memlint  # noqa: E402
+from test_binding import (  # noqa: E402
+    PY_SRC, anchor_block, good_row, make_code_root, ref_mark_text, topic_text as binding_topic,
+)
+from test_standing_marks import (  # noqa: E402
+    MARK_FLAGS, MARK_OWNER, MARK_SID, MARK_YES, ErrCase, GuardCase, TmpCase, commit_all, git,
+    git_store, lint_text, link_yaml, run_memidx, run_memlint, topic_text, write_mark_transcript,
+)
+
+STAMP = "2026-11-03T09:12:41-05:00"
+LATER = "2026-11-04T09:12:41-05:00"
+
+
+def rmark(ref, action="add", recorded_at=STAMP, why="because", authority="agent-inference",
+          source="a test", nl="\n"):
+    return (
+        f"  - ref: \"{ref}\"{nl}"
+        f"    action: {action}{nl}"
+        f"    date: {recorded_at[:10]}{nl}"
+        f"    recorded_at: \"{recorded_at}\"{nl}"
+        f"    recorded_by: tester{nl}"
+        f"    authority: {authority}{nl}"
+        f"    source: \"{source}\"{nl}"
+        f"    why: \"{why}\"{nl}"
+    )
+
+
+def refs_fm(refs, *marks):
+    """`code_refs:` then `ref_marks:` (newest row first) front matter text."""
+    text = "code_refs:\n" + "".join(f"  - \"{r}\"\n" for r in refs) if refs else "code_refs: []\n"
+    if marks:
+        text += "ref_marks:\n" + "".join(marks)
+    return text
+
+
+def ttext(refs, *marks, **kw):
+    kw.setdefault("standing", "standing: [L2]\n")
+    return topic_text(extra_fm=refs_fm(refs, *marks), **kw)
+
+
+# ---------------------------------------------------------------------------
+# the guard: code_refs membership needs its rows
+# ---------------------------------------------------------------------------
+
+class TestRefPairing(GuardCase):
+    def test_unchanged_membership_needs_no_rows(self):
+        base = ttext(["src/a.py"])
+        self.store(base)
+        self.assertClean(base)
+
+    def test_reorder_only_needs_no_row(self):
+        self.store(ttext(["src/a.py", "src/b.py"]))
+        self.assertClean(ttext(["src/b.py", "src/a.py"]))
+
+    def test_add_without_a_row_is_refused(self):
+        self.store(ttext(["src/a.py"]))
+        self.assertRefused(ttext(["src/a.py", "src/b.py"]),
+                           "code_refs changed for src/b.py (add) with no matching ref_marks row")
+
+    def test_the_first_change_on_a_topic_with_no_ref_marks_yet_needs_a_row_and_passes_with_one(self):
+        self.store(ttext(["src/a.py"]))                       # grandfathered: no ref_marks block
+        self.assertClean(ttext(["src/a.py", "src/b.py"], rmark("src/b.py")))
+
+    def test_remove_needs_a_row(self):
+        self.store(ttext(["src/a.py", "src/b.py"]))
+        self.assertRefused(ttext(["src/a.py"]),
+                           "code_refs changed for src/b.py (remove) with no matching ref_marks row")
+        self.assertClean(ttext(["src/a.py"], rmark("src/b.py", "remove")))
+
+    def test_prefix_and_glob_refs_are_audited_too(self):
+        self.store(ttext(["src/a.py", "src/lib/", "src/*.py"]))
+        self.assertRefused(ttext(["src/a.py"]), "src/lib/ (remove)", "src/*.py (remove)")
+        self.assertClean(ttext(["src/a.py"], rmark("src/lib/", "remove", LATER),
+                               rmark("src/*.py", "remove")))
+        self.assertClean(ttext(["src/a.py", "src/lib/", "src/*.py", "docs/"],
+                               rmark("docs/", "add")))
+
+    def test_two_refs_in_one_commit_need_two_rows(self):
+        self.store(ttext(["src/a.py"]))
+        both = ttext(["src/a.py", "src/b.py", "src/c.py"], rmark("src/c.py"), rmark("src/b.py"))
+        self.assertClean(both)
+        self.assertRefused(ttext(["src/a.py", "src/b.py", "src/c.py"], rmark("src/b.py")),
+                           "code_refs changed for src/c.py (add)")
+
+    def test_a_row_for_a_change_that_did_not_happen_is_an_orphan(self):
+        self.store(ttext(["src/a.py"]))
+        self.assertRefused(ttext(["src/a.py"], rmark("src/a.py")), "orphan reference mark (src/a.py, add)")
+        self.assertRefused(ttext(["src/a.py", "src/b.py"], rmark("src/b.py"), rmark("src/zzz.py", "remove")),
+                           "orphan reference mark (src/zzz.py, remove)")
+
+    def test_the_same_change_twice_in_one_commit_is_refused(self):
+        self.store(ttext(["src/a.py"]))
+        self.assertRefused(ttext(["src/a.py", "src/b.py"], rmark("src/b.py", recorded_at=LATER),
+                                 rmark("src/b.py")),
+                           "duplicate reference mark for (src/b.py, add) in one commit")
+
+    def test_remove_and_add_of_the_same_ref_in_one_commit_changes_nothing_so_both_rows_are_orphans(self):
+        self.store(ttext(["src/a.py"]))
+        out = self.assertRefused(ttext(["src/a.py"], rmark("src/a.py", "remove", LATER), rmark("src/a.py")),
+                                 "orphan reference mark (src/a.py, remove)")
+        self.assertIn("orphan reference mark (src/a.py, add)", out)
+
+
+class TestRefMarksFrozen(GuardCase):
+    BASE = ttext(["src/a.py", "src/b.py"], rmark("src/b.py"))
+
+    def test_untouched_rows_pass_and_a_new_row_prepends(self):
+        self.store(self.BASE)
+        self.assertClean(self.BASE)
+        self.assertClean(ttext(["src/a.py"], rmark("src/b.py", "remove", LATER), rmark("src/b.py")))
+
+    def test_a_changed_field_is_refused(self):
+        self.store(self.BASE)
+        self.assertRefused(ttext(["src/a.py", "src/b.py"], rmark("src/b.py", why="EDITED")),
+                           "reference mark (src/b.py, add,", "row changed after being recorded")
+
+    def test_a_reformatted_row_is_refused_by_its_bytes(self):
+        self.store(self.BASE)
+        reformatted = self.BASE.replace('    why: "because"\n', "    why: because\n")
+        self.assertNotEqual(reformatted, self.BASE)
+        self.assertRefused(reformatted, "row reformatted, not appended")
+
+    def test_a_deleted_row_is_refused(self):
+        self.store(self.BASE)
+        self.assertRefused(ttext(["src/a.py", "src/b.py"]), "row removed after being recorded")
+
+    def test_a_row_appended_below_the_recorded_one_is_refused(self):
+        self.store(self.BASE)
+        self.assertRefused(ttext(["src/a.py", "src/b.py", "src/c.py"], rmark("src/b.py"), rmark("src/c.py")),
+                           "marks not prepended")
+
+    def test_untouched_blocks_stay_byte_identical_when_a_row_is_added(self):
+        marks = ("standing_marks:\n  - link: L2\n    action: add\n    date: 2026-11-01\n"
+                 "    recorded_at: \"2026-11-01T08:00:00-05:00\"\n    recorded_by: t\n"
+                 "    authority: owner-ratified\n    source: \"s\"\n    why: \"w\"\n")
+        base = topic_text(standing="standing: [L2]\n", marks=marks, extra_fm=refs_fm(["src/a.py"]))
+        self.store(base)
+        new = topic_text(standing="standing: [L2]\n", marks=marks,
+                         extra_fm=refs_fm(["src/a.py", "src/b.py"], rmark("src/b.py")))
+        self.assertClean(new)
+        old_fm = memidx.parse_record_raw(base, "x").frontmatter
+        new_fm = memidx.parse_record_raw(new, "x").frontmatter
+        self.assertEqual(old_fm["links"], new_fm["links"])
+        self.assertEqual(old_fm["standing_marks"], new_fm["standing_marks"])
+        self.assertEqual(memlint._link_raw_spans(base, old_fm["links"]),
+                         memlint._link_raw_spans(new, new_fm["links"]))
+        self.assertEqual(memlint._link_raw_spans(base, old_fm["standing_marks"], key="standing_marks",
+                                                 ident=memlint._mark_span_ident),
+                         memlint._link_raw_spans(new, new_fm["standing_marks"], key="standing_marks",
+                                                 ident=memlint._mark_span_ident))
+
+    def test_a_crlf_file_is_judged_the_same(self):
+        self.store(self.BASE.replace("\n", "\r\n"))
+        new = ttext(["src/a.py"], rmark("src/b.py", "remove", LATER), rmark("src/b.py")).replace("\n", "\r\n")
+        self.assertClean(new)
+        self.assertRefused(new.replace('why: "because"\r\n', 'why: "because"\n'), "row reformatted")
+
+
+class TestRefMarksOnAddedAndRepairedRecords(GuardCase):
+    def staged_new(self, text):
+        """Stage a brand-new topic (the worktree diff cannot see an untracked file)."""
+        if self.root is None:
+            self.store(ttext(["src/a.py"]))
+        (self.root / "topics" / "bar.md").write_text(text)
+        git(["add", "-A"], self.root)
+        rc, out = run_memlint(["--against-ref", "HEAD", "--staged", str(self.root)])
+        git(["reset", "-q"], self.root)
+        (self.root / "topics" / "bar.md").unlink()
+        return rc, out
+
+    def test_a_brand_new_topic_needs_an_add_row_per_code_ref(self):
+        rc, out = self.staged_new(ttext(["src/x.py"], tid="TOP-9101", standing=""))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("code_refs changed for src/x.py (add) with no matching ref_marks row", out)
+        rc, out = self.staged_new(ttext(["src/x.py"], rmark("src/x.py"), tid="TOP-9101", standing=""))
+        self.assertEqual(rc, 0, out)
+
+    def test_a_bad_row_in_a_staged_new_topic_is_refused(self):
+        rc, out = self.staged_new(ttext(["src/x.py"], rmark("src/x.py", action="toggle"), tid="TOP-9101", standing=""))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("action 'toggle'", out)
+
+    def test_the_repair_branch_still_freezes_the_rows(self):
+        root = git_store(self.tmp / "repair")
+        self.root = root
+        broken = ttext(["src/a.py"], rmark("src/a.py")).replace("tags: []", "tags: not-a-list", 1)
+        broken = broken.split("links:")[0] + "links: []\n---\n\nBody.\n"
+        (root / "topics" / "foo.md").write_text(broken)
+        commit_all(root)
+        self.assertFalse(memidx.parse_record_text(broken, "x").valid)
+        self.assertRefused(ttext(["src/a.py"], rmark("src/a.py", why="EDITED")), "row changed after being recorded")
+        self.assertClean(ttext(["src/a.py"], rmark("src/a.py")))
+
+
+# ---------------------------------------------------------------------------
+# type frozen
+# ---------------------------------------------------------------------------
+
+class TestTypeFrozen(GuardCase):
+    def test_a_type_change_on_a_recorded_topic_is_refused(self):
+        base = ttext(["src/a.py"])
+        self.store(base)
+        self.assertClean(base)
+        self.assertRefused(base.replace("type: topic\n", "type: investigation\n"),
+                           "type changed 'topic' -> 'investigation'")
+
+    def test_dropping_the_type_is_a_change_too(self):
+        base = ttext(["src/a.py"])
+        self.store(base)
+        self.assertRefused(base.replace("type: topic\n", ""), "type changed 'topic' -> None")
+
+    def test_an_added_file_is_free_to_have_any_type(self):
+        self.store(ttext(["src/a.py"]))
+        rc, out = self.guard("---\ntype: incident\nid: INC-9001\ntitle: x\n---\n\nBody.\n", rel="inc.md")
+        self.assertEqual(rc, 0, out)
+
+    def test_a_non_topic_record_is_not_guarded(self):
+        incident = "---\ntype: incident\nid: INC-9001\ntitle: x\n---\n\nBody.\n"
+        self.store(incident)
+        self.assertClean(incident.replace("type: incident", "type: investigation"))
+
+
+# ---------------------------------------------------------------------------
+# plain lint: the rows and the anchor rule
+# ---------------------------------------------------------------------------
+
+class TestRefMarksPlainLint(ErrCase):
+    def lint(self, *marks, refs=("src/a.py",), **kw):
+        return lint_text(ttext(list(refs), *marks, **kw))
+
+    def test_valid_rows_pass_for_every_authority(self):
+        for auth in ("owner-verbatim", "owner-ratified", "agent-inference", "reviewer-finding", "code-derived"):
+            with self.subTest(auth):
+                errors, _ = self.lint(rmark("src/a.py", authority=auth))
+                self.assertEqual(errors, [], errors)
+
+    def test_rows_are_never_required(self):
+        errors, _ = self.lint()
+        self.assertEqual(errors, [], errors)
+
+    def test_shape_errors(self):
+        errors, _ = lint_text(topic_text(extra_fm="ref_marks:\n  - just-a-string\n"))
+        self.assertError(errors, "ref_marks must be a list of mappings")
+        errors, _ = self.lint(rmark("src/a.py", action="toggle"))
+        self.assertError(errors, "action 'toggle'")
+        errors, _ = self.lint(rmark("src/a.py", authority="somebody"))
+        self.assertError(errors, "authority 'somebody'")
+        errors, _ = self.lint(rmark("src/a.py").replace('    why: "because"\n', ""))
+        self.assertError(errors, "ref_marks[0]", "missing field(s)", "why")
+        errors, _ = self.lint(rmark("src/a.py") + "    note: hi\n")
+        self.assertError(errors, "unknown field(s)", "note")
+        errors, _ = self.lint(rmark("src/a.py", why="two\\nlines"))
+        self.assertError(errors, "why must be a single line")
+        errors, _ = self.lint(rmark("src/a.py", recorded_at="yesterday"))
+        self.assertError(errors, "recorded_at")
+        errors, _ = self.lint(rmark("src/a.py"), rmark("src/a.py", why="again"))
+        self.assertError(errors, "duplicate row")
+        errors, _ = self.lint(rmark("#frag"))
+        self.assertError(errors, "fragment-only")
+
+    def anchor_topic(self, refs, *marks):
+        return binding_topic([good_row()], code_refs=refs, marks_text=("ref_marks:\n" + "".join(marks)) if marks else "")
+
+    def test_an_anchor_for_a_ref_not_in_code_refs_is_an_error_without_an_unbind(self):
+        errors, _ = lint_text(self.anchor_topic(()))
+        self.assertError(errors, "anchors[0]", "not present verbatim in this topic's code_refs")
+
+    def test_the_newest_remove_row_excuses_the_missing_ref(self):
+        errors, _ = lint_text(self.anchor_topic((), rmark("src/foo.py", "remove", LATER), rmark("src/foo.py")))
+        self.assertEqual(errors, [], errors)
+
+    def test_a_later_add_rearms_the_requirement(self):
+        marks = (rmark("src/foo.py", "add", "2026-11-05T09:12:41-05:00"), rmark("src/foo.py", "remove", LATER))
+        errors, _ = lint_text(self.anchor_topic((), *marks))
+        self.assertError(errors, "anchors[0]", "not present verbatim")
+        ok, _ = lint_text(self.anchor_topic(("src/foo.py",), *marks))
+        self.assertEqual(ok, [], ok)
+
+
+# ---------------------------------------------------------------------------
+# bind / unbind end to end
+# ---------------------------------------------------------------------------
+
+class BindCase(TmpCase):
+    TODAY = "2026-11-02"
+
+    def setUp(self):
+        super().setUp()
+        self.code = make_code_root(self.tmp, {"src/foo.py": PY_SRC, "src/other.py": "x = 1\n"})
+        self.store = git_store(self.tmp / "store")
+        self.clock = [datetime(2026, 11, 3, 9, 0, 0, tzinfo=timezone(timedelta(hours=-5)))]
+
+        def now():
+            self.clock[0] += timedelta(seconds=1)
+            return self.clock[0]
+
+        for patcher in (mock.patch.object(memidx, "_anchor_today", return_value=self.TODAY),
+                        mock.patch.object(memidx, "_now", side_effect=now),
+                        mock.patch.dict(os.environ, {"MEMCONTINUUM_TRANSCRIPTS_DIR": str(self.tmp / "tr")})):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        os.environ.pop("MEMCONTINUUM_RECORDED_BY", None)
+        self.path = self.store / "topics" / "foo.md"
+
+    def put(self, text):
+        self.path.write_text(text)
+        commit_all(self.store)
+
+    def text(self):
+        return self.path.read_text()
+
+    def fm(self):
+        return memidx.parse_record_raw(self.text(), self.path).frontmatter
+
+    def bind(self, ref="src/foo.py", *extra):
+        return run_memidx(["bind", "TOP-1", ref, "--root", str(self.store), "--code-root", str(self.code), *extra])
+
+    def unbind(self, ref="src/foo.py", *extra):
+        return run_memidx(["unbind", "TOP-1", ref, "--root", str(self.store), *extra])
+
+    def assertGuardsClean(self):
+        errors, _ = memlint.lint_root(self.store)
+        self.assertEqual(errors, [], errors)
+        rc, out = run_memlint(["--against-ref", "HEAD", str(self.store)])
+        self.assertEqual(rc, 0, out)
+        git(["add", "-A"], self.store)
+        rc, out = run_memlint(["--against-ref", "HEAD", "--staged", str(self.store)])
+        self.assertEqual(rc, 0, out)
+        git(["reset", "-q"], self.store)
+
+    def changed_lines(self, sign):
+        diff = git(["diff", "-U0", "HEAD", "--", "topics/foo.md"], self.store).stdout
+        return [ln[1:] for ln in diff.splitlines()
+                if ln.startswith(sign) and not ln.startswith(sign * 3)]
+
+
+class TestBindWritesItsRow(BindCase):
+    def test_a_new_ref_gets_one_add_row_and_one_anchor(self):
+        self.put(binding_topic(code_refs=()))
+        rc, out, err = self.bind()
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.fm()["code_refs"], ["src/foo.py"])
+        rows = memidx.ref_mark_rows(self.fm())
+        self.assertEqual([(r["ref"], r["action"], r["authority"]) for r in rows],
+                         [("src/foo.py", "add", "agent-inference")])
+        self.assertEqual(rows[0]["source"], "memidx bind")
+        self.assertEqual(rows[0]["recorded_by"], "memidx")
+        self.assertEqual(len(memidx.anchor_rows(self.fm())), 1)
+        text = self.text()
+        self.assertLess(text.index("code_refs:"), text.index("ref_marks:"))
+        self.assertLess(text.index("ref_marks:"), text.index("anchors:"))
+        self.assertGuardsClean()
+
+    def test_the_ref_mark_sits_after_an_existing_code_refs_block(self):
+        self.put(binding_topic(code_refs=("src/other.py",)))
+        self.assertEqual(self.bind()[0], 0)
+        text = self.text()
+        self.assertLess(text.index("src/foo.py"), text.index("ref_marks:"))
+        self.assertEqual(self.fm()["code_refs"], ["src/other.py", "src/foo.py"])
+        self.assertGuardsClean()
+
+    def test_a_ref_already_in_code_refs_gets_an_anchor_but_no_row(self):
+        self.put(binding_topic())
+        self.assertEqual(self.bind()[0], 0)
+        self.assertEqual(memidx.ref_mark_rows(self.fm()), [])
+        self.assertEqual(len(memidx.anchor_rows(self.fm())), 1)
+        self.assertGuardsClean()
+
+    def test_a_second_bind_of_a_bound_ref_is_a_noop(self):
+        self.put(binding_topic(code_refs=()))
+        self.bind()
+        before = self.text()
+        commit_all(self.store)
+        rc, out, err = self.bind()
+        self.assertEqual(rc, 0, err)
+        self.assertIn("already has an anchor", out)
+        self.assertEqual(self.text(), before)
+
+    def test_a_derived_owner_tier_is_recorded_when_asked_for(self):
+        write_mark_transcript(self.tmp / "tr")
+        self.put(binding_topic(code_refs=()))
+        rc, _o, err = self.bind("src/foo.py", *MARK_FLAGS, "--why", "the owner approved this binding")
+        self.assertEqual(rc, 0, err)
+        row = memidx.ref_mark_rows(self.fm())[0]
+        self.assertEqual(row["authority"], "owner-ratified")
+        self.assertEqual(row["why"], "the owner approved this binding")
+        self.assertTrue(row["source"].startswith(f"owner yes-message {MARK_YES}, session {MARK_SID}"))
+        self.assertGuardsClean()
+
+    def test_a_failed_derivation_warns_and_records_agent_inference(self):
+        self.put(binding_topic(code_refs=()))
+        rc, _o, err = self.bind("src/foo.py", "--session", MARK_SID, "--yes-message", MARK_YES)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("authority not derived", err)
+        row = memidx.ref_mark_rows(self.fm())[0]
+        self.assertEqual(row["authority"], "agent-inference")
+        self.assertTrue(row["source"].startswith("transcript unavailable:"))
+
+    def test_a_verbatim_flag_pair_that_is_incomplete_refuses(self):
+        self.put(binding_topic(code_refs=()))
+        before = self.text()
+        rc, _o, err = self.bind("src/foo.py", "--session", MARK_SID, "--owner-message", MARK_OWNER)
+        self.assertEqual(rc, 1, err)
+        self.assertEqual(self.text(), before)
+
+
+class TestUnbind(BindCase):
+    def bound(self, refs=("src/other.py",)):
+        self.put(binding_topic(code_refs=refs))
+        self.assertEqual(self.bind()[0], 0)
+        commit_all(self.store)
+
+    def test_unbind_removes_the_item_adds_one_remove_row_and_touches_no_anchor(self):
+        self.bound()
+        anchors_before = memidx.anchor_rows(self.fm())
+        before = self.text()
+        rc, out, err = self.unbind()
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.fm()["code_refs"], ["src/other.py"])
+        rows = memidx.ref_mark_rows(self.fm())
+        self.assertEqual([(r["ref"], r["action"]) for r in rows], [("src/foo.py", "remove"), ("src/foo.py", "add")])
+        self.assertEqual(memidx.anchor_rows(self.fm()), anchors_before)
+        removed = self.changed_lines("-")
+        self.assertEqual([ln.strip() for ln in removed], ['- "src/foo.py"'])
+        added = self.changed_lines("+")
+        self.assertEqual(len(added), 8)  # exactly the new row's eight fields
+        self.assertTrue(all("anchors" not in ln and "digest" not in ln for ln in added))
+        # the anchors block and every link are byte-identical
+        spans_a = memlint._link_raw_spans(before, memidx.parse_record_raw(before, "x").frontmatter["links"])
+        spans_b = memlint._link_raw_spans(self.text(), self.fm()["links"])
+        self.assertEqual(spans_a, spans_b)
+        self.assertIn("- ref: \"src/foo.py\"\n    action: remove", self.text())
+        self.assertGuardsClean()
+
+    def test_the_anchor_rule_accepts_the_unbound_state_but_not_a_silent_removal(self):
+        self.bound()
+        self.assertEqual(self.unbind()[0], 0)
+        errors, _ = memlint.lint_root(self.store)
+        self.assertEqual(errors, [], errors)
+        # a hand edit that drops the ref without a row: plain lint after a re-bind sees it
+        self.bind()
+        text = self.text().replace('  - "src/foo.py"\n', "", 1)
+        self.path.write_text(text)
+        errors, _ = memlint.lint_root(self.store)
+        self.assertTrue(any("not present verbatim in this topic's code_refs" in e for e in errors), errors)
+        rc, out = run_memlint(["--against-ref", "HEAD", str(self.store)])
+        self.assertEqual(rc, 1, out)
+
+    def test_for_path_stops_matching_the_unbound_path(self):
+        db = self.tmp / "idx.sqlite"
+        self.bound(refs=())
+
+        def for_path():
+            rc, _o, err = run_memidx(["reindex", "--root", str(self.store), "--project", "p",
+                                      "--db", str(db), "--no-embed"])
+            self.assertEqual(rc, 0, err)
+            rc, out, err = run_memidx(["for-path", "src/foo.py", "--project", "p", "--db", str(db),
+                                       "--root", str(self.store)])
+            self.assertEqual(rc, 0, err)
+            return out
+
+        self.assertIn("TOP-1", for_path())
+        self.assertEqual(self.unbind()[0], 0)
+        self.assertNotIn("TOP-1", for_path())
+
+    def test_rebind_after_unbind_adds_a_row_and_no_second_anchor(self):
+        self.bound()
+        anchor = memidx.anchor_rows(self.fm())
+        self.assertEqual(self.unbind()[0], 0)
+        commit_all(self.store)
+        rc, out, err = self.bind()
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.fm()["code_refs"], ["src/other.py", "src/foo.py"])
+        self.assertEqual(memidx.anchor_rows(self.fm()), anchor)
+        rows = memidx.ref_mark_rows(self.fm())
+        self.assertEqual([r["action"] for r in rows], ["add", "remove", "add"])
+        self.assertEqual(memidx.ref_latest_action(self.fm(), "src/foo.py"), "add")
+        self.assertGuardsClean()
+        # the requirement is re-armed: the ref cannot go missing silently again
+        self.path.write_text(self.text().replace('  - "src/foo.py"\n', "", 1))
+        errors, _ = memlint.lint_root(self.store)
+        self.assertTrue(any("not present verbatim" in e for e in errors), errors)
+
+    def test_unbinding_the_last_ref_leaves_an_empty_list(self):
+        self.bound(refs=())
+        self.assertEqual(self.unbind()[0], 0)
+        self.assertIn("code_refs: []\n", self.text())
+        self.assertEqual(self.fm()["code_refs"], [])
+        self.assertGuardsClean()
+
+    def test_prefix_and_glob_refs_can_be_unbound(self):
+        self.put(binding_topic(code_refs=("src/lib/", "src/*.py", "src/other.py")))
+        for ref in ("src/lib/", "src/*.py"):
+            with self.subTest(ref):
+                rc, _o, err = self.unbind(ref)
+                self.assertEqual(rc, 0, err)
+        self.assertEqual(self.fm()["code_refs"], ["src/other.py"])
+        self.assertEqual([(r["ref"], r["action"]) for r in memidx.ref_mark_rows(self.fm())],
+                         [("src/*.py", "remove"), ("src/lib/", "remove")])
+        self.assertGuardsClean()
+        rc, _o, err = self.bind("src/lib/")
+        self.assertEqual(rc, 2, err)  # bind still refuses a prefix
+
+    def test_a_ref_that_is_not_bound_is_a_noop(self):
+        self.put(binding_topic())
+        before = self.text()
+        rc, out, err = self.unbind("src/nope.py")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("is not in", out)
+        self.assertEqual(self.text(), before)
+
+    def test_a_non_empty_flow_list_is_refused(self):
+        self.put(binding_topic().replace("code_refs:\n  - src/foo.py\n", "code_refs: [src/foo.py, src/other.py]\n"))
+        before = self.text()
+        rc, _o, err = self.unbind()
+        self.assertEqual(rc, 1)
+        self.assertIn("flow list", err)
+        self.assertEqual(self.text(), before)
+
+    def test_dry_run_writes_nothing(self):
+        self.bound()
+        before = self.text()
+        rc, out, err = self.unbind("src/foo.py", "--dry-run")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("dry-run: nothing written", out)
+        self.assertIn("+    action: remove", out)
+        self.assertEqual(self.text(), before)
+
+    def test_unknown_topic_and_bad_text_are_refused(self):
+        self.bound()
+        before = self.text()
+        self.assertEqual(run_memidx(["unbind", "TOP-9", "src/foo.py", "--root", str(self.store)])[0], 1)
+        self.assertEqual(self.unbind("src/foo.py", "--why", "two\nlines")[0], 1)
+        self.assertEqual(self.text(), before)
+
+    def test_a_derived_owner_tier_is_recorded_for_the_remove_row(self):
+        write_mark_transcript(self.tmp / "tr")
+        self.bound()
+        rc, _o, err = self.unbind("src/foo.py", *MARK_FLAGS, "--why", "no longer relevant")
+        self.assertEqual(rc, 0, err)
+        row = memidx.ref_mark_rows(self.fm())[0]
+        self.assertEqual((row["action"], row["authority"], row["why"]), ("remove", "owner-ratified", "no longer relevant"))
+        self.assertGuardsClean()
+
+
+class TestRemoveCodeRefEditor(unittest.TestCase):
+    def test_removes_only_the_named_item_and_keeps_every_other_byte(self):
+        text = "---\nid: T\ncode_refs:\n  - a.py   # keep\n  - 'b.py'\n  - \"c.py\"\nlinks: []\n---\n"
+        out = memidx.remove_code_ref(text, "b.py")
+        self.assertEqual(out, "---\nid: T\ncode_refs:\n  - a.py   # keep\n  - \"c.py\"\nlinks: []\n---\n")
+        self.assertEqual(memidx.remove_code_ref(out, "a.py"), "---\nid: T\ncode_refs:\n  - \"c.py\"\nlinks: []\n---\n")
+
+    def test_refusals(self):
+        for text, needle in (("---\nid: T\nlinks: []\n---\n", "no `code_refs:`"),
+                             ("---\nid: T\ncode_refs: [a.py]\n---\n", "flow list"),
+                             ("---\nid: T\ncode_refs: []\n---\n", "empty"),
+                             ("---\nid: T\ncode_refs:\n  - a.py\n---\n", "not an item")):
+            with self.subTest(needle):
+                with self.assertRaises(ValueError) as cm:
+                    memidx.remove_code_ref(text, "zzz.py")
+                self.assertIn(needle, str(cm.exception))
+
+
+if __name__ == "__main__":
+    unittest.main()
