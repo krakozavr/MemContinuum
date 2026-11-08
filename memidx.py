@@ -367,10 +367,11 @@ FALLBACK_COMPLEX_FIELDS = {
 
 
 # `top_level_keys` ONLY (the scalar recovery below keeps its column-zero regex): on a MALFORMED
-# record the guard is conservative, so a key at any indentation, quoted or not, counts. This
+# record the guard is conservative, so a key at any indentation, quoted or not, counts (the
+# quotes MATCH: "links", 'links' or bare; `links'` is a different, valid key). This
 # over-includes (a `links:` inside a multi-line quoted scalar, a nested `links:`), which freezes
 # the malformed record as a topic -- the ruled fail-closed direction.
-_FALLBACK_ANY_KEY_RE = re.compile(r"""^\s*["']?([A-Za-z_][A-Za-z0-9_]*)["']?\s*:""")
+_FALLBACK_ANY_KEY_RE = re.compile(r"""^\s*(["']?)([A-Za-z_][A-Za-z0-9_]*)\1\s*:""")
 
 
 class ParseResult:
@@ -668,7 +669,7 @@ def parse_record_text(text: str, path) -> ParseResult:
             m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*):\s*(.*)$", line)
             wide = _FALLBACK_ANY_KEY_RE.match(line)
             if wide:
-                seen_keys.add(wide.group(1))
+                seen_keys.add(wide.group(2))
             if not m or m.group(1) in fm:
                 continue
             key = m.group(1)

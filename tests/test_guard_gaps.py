@@ -519,6 +519,19 @@ class TestTypeFrozen(GuardCase):
         self.assertRefused(fixed, "type changed 'topic' -> 'memo'")
         self.assertClean(fixed.replace("type: memo", "type: topic"))
 
+    # gate round 11 R11-3 (Sol MINOR): the quotes around a scanned key must MATCH
+    def test_mismatched_quotes_around_a_key_do_not_count_as_links(self):
+        for key, want in (("links'", False), ('"links"', True), ("'links'", True), ('"links', False), ("links", True)):
+            with self.subTest(key=key):
+                res = memidx.parse_record_text(f"---\ntype: memo\ntitle: bad: title\n{key}: x\n---\n\nBody.\n", "x")
+                self.assertTrue(res.fallback, res)
+                self.assertEqual("links" in res.top_level_keys, want, res.top_level_keys)
+
+    def test_a_memo_with_a_links_quote_key_is_exempt_so_its_title_repair_is_clean(self):
+        memo = "---\ntype: memo\ntitle: bad: title\nlinks': x\n---\n\nBody.\n"
+        self.store(memo)
+        self.assertClean(memo.replace("title: bad: title", 'title: "bad: title"'))
+
     # gate round 8 R8-1 (Sol MAJOR/MINOR, Grok): spellings of a canonical type that the fallback
     # garbles all freeze through the id prefix (or the links list), never through a string reading.
     # (A cleanly quoted `type: "topic"` is recovered as the token `topic`, which freezes it directly; the id
