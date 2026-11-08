@@ -6333,19 +6333,27 @@ def _unmapped_resolved(raw_path: str, resolver: "_UnmappedResolver | None") -> P
     return resolver.resolve(raw_path) if resolver is not None else Path(raw_path).resolve()
 
 
-def _unmapped_path_candidates(
+def _unmapped_classify_path(
     raw_path: str, code_roots: list[Path], resolver: "_UnmappedResolver | None" = None,
-) -> list[str]:
-    """Candidates to try against the index's (repo-relative) code_refs /
+) -> tuple[list[str], str]:
+    """`(candidates, display)` for one PATH argument, from ONE resolution of
+    the raw path (a missing file pays its final-component lstat once, not
+    once per consumer; gate round 2 R2-4).
+
+    candidates: what to try against the index's (repo-relative) code_refs /
     concept paths: the path as given, and -- when at least one --code-root
     is supplied, the given path is absolute, and it resolves under one of
     them -- that path made relative to the LONGEST (most specific)
     matching root. This is the engine-side fix for the multi-candidate
     workaround documented at the top of hooks/pre-edit-chain.sh (a
     PreToolUse/PostToolUse file_path is always absolute; code_refs are
-    conventionally repo-relative). `resolver` (one per call) makes the
-    resolution cost per directory instead of per path."""
+    conventionally repo-relative).
+    display: the path string reported back -- relative to the LONGEST
+    matching root when resolvable, else the path exactly as given.
+    `resolver` (one per call) makes the resolution cost per directory
+    instead of per path."""
     candidates = [raw_path]
+    display = raw_path
     if code_roots:
         try:
             p = Path(raw_path)
@@ -6354,11 +6362,19 @@ def _unmapped_path_candidates(
                 best = _unmapped_best_root(resolved, code_roots)
                 if best is not None:
                     rel = str(resolved.relative_to(best))
+                    display = rel
                     if rel not in candidates:
                         candidates.append(rel)
         except (OSError, ValueError):
             pass
-    return candidates
+    return candidates, display
+
+
+def _unmapped_path_candidates(
+    raw_path: str, code_roots: list[Path], resolver: "_UnmappedResolver | None" = None,
+) -> list[str]:
+    """The candidates half of `_unmapped_classify_path`."""
+    return _unmapped_classify_path(raw_path, code_roots, resolver)[0]
 
 
 def _unmapped_ref_hit(matcher, conn, project: str, candidates: list[str]) -> bool:
@@ -6404,20 +6420,8 @@ def _unmapped_ref_hit(matcher, conn, project: str, candidates: list[str]) -> boo
 def _unmapped_display_path(
     raw_path: str, code_roots: list[Path], resolver: "_UnmappedResolver | None" = None,
 ) -> str:
-    """The path string reported back for one PATH argument: relative to
-    the LONGEST matching --code-root when resolvable, else the path
-    exactly as given."""
-    if code_roots:
-        try:
-            p = Path(raw_path)
-            if p.is_absolute():
-                resolved = _unmapped_resolved(raw_path, resolver)
-                best = _unmapped_best_root(resolved, code_roots)
-                if best is not None:
-                    return str(resolved.relative_to(best))
-        except (OSError, ValueError):
-            pass
-    return raw_path
+    """The display half of `_unmapped_classify_path`."""
+    return _unmapped_classify_path(raw_path, code_roots, resolver)[1]
 
 
 def cmd_unmapped(args) -> int:
@@ -6543,8 +6547,7 @@ def cmd_unmapped(args) -> int:
                     # (root, relative_path) pair from a lossy string.
                     resolver = _UnmappedResolver(list(args.paths))
                     for raw_path in args.paths:
-                        candidates = _unmapped_path_candidates(raw_path, code_roots, resolver)
-                        display = _unmapped_display_path(raw_path, code_roots, resolver)
+                        candidates, display = _unmapped_classify_path(raw_path, code_roots, resolver)
                         topic_hit = _unmapped_ref_hit(
                             topic_matches_for_path, conn, args.project, candidates,
                         )

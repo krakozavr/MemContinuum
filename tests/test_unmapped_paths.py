@@ -144,6 +144,32 @@ class TestUnmappedResolver(unittest.TestCase):
         )
 
 
+    def test_a_missing_file_is_lstatted_once_by_the_command(self):
+        """Gate round 2 R2-4: candidates and display come from ONE resolution
+        of the raw path, so a listing miss pays one final-component lstat."""
+        import contextlib
+        import io
+        from tests.test_write_hooks import TOPIC_MD, _write, reindex
+        code = self.root / "code"
+        (code / "src").mkdir(parents=True)
+        (code / "src" / "here.py").write_text("x")
+        missing = str(code / "src" / "missing.py")
+        store, db = self.root / "store", self.root / "zp.sqlite"
+        _write(store / "topics" / "testing" / "mapped-topic.md", TOPIC_MD)
+        reindex(store, db, project="zp")
+        real_lstat = os.lstat
+        calls = []
+
+        def counting(p, *a, **k):
+            calls.append(str(p))
+            return real_lstat(p, *a, **k)
+
+        with mock.patch("os.lstat", counting), contextlib.redirect_stdout(io.StringIO()):
+            memidx.main(["unmapped", missing, str(code / "src" / "here.py"), "--root", str(store),
+                         "--project", "zp", "--db", str(db), "--json", "--code-root", str(code)])
+        self.assertEqual([c for c in calls if c == missing], [missing], calls)
+
+
 class TestUnmappedZeroPaths(unittest.TestCase):
     """`unmapped` with no PATH still runs the index-state check and the stale
     self-heal, and reports whether the heal ran (`healed`)."""
