@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Hooks stop timing out on a Windows-mounted code root
+
+On WSL, a project whose code lives under `/mnt/` (a Windows drive) saw its prompt, edit-ledger and
+refresh hooks killed by the 2-second watchdog, because every file check crosses to the host. Three
+changes. The coverage check no longer re-walks each file's directory chain: a 422-file edit list that took
+7 s now takes about 0.6 s, with identical results. The prompt hook remembers the verdicts it already
+reached in the session and classifies only files edited since the previous prompt; the memory is dropped
+when the store has a new commit, so a new binding is never missed for long. And the watchdog gives a hook
+twice its usual time when a configured code root starts with `/mnt/` (`MEMCONTINUUM_WATCHDOG_FACTOR` in
+`config.sh` changes the factor; the SessionEnd hook keeps its fixed budget). `hook.log` kill lines now
+show the budget that applied, and the prompt and ledger lines show `elapsed=`.
+
+    Technical: `unmapped` resolves a path as its directory (cached per call, one `lstat` per distinct directory, one listing where a directory holds several of the paths) plus a symlink check of the final name; `mc-watchdog.sh` scales `MC_WATCHDOG_BUDGET` for a `/mnt/` root and honours `MC_WATCHDOG_BUDGET_FIXED=1`; session key `unmapped_cache: {store_head, verdicts, displays}` is read and written by `userprompt-remind.sh` under the session lock, absent or malformed means "classify everything"; `memlib.sh` gains `mc_elapsed_field`.
+
 ### Changes to a topic's code references leave a record
 
 A topic's `code_refs` decide which files its decisions are delivered for, but a
