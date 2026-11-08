@@ -3344,7 +3344,7 @@ and positions in agreement.
 
 **Tolerant parsing and quarantine.** `parse_record()` returns a typed
 `ParseResult` (`frontmatter`, `body`, `diagnostics` — a list of `(field,
-message)` pairs, `valid`, `fallback`) and never raises: a read failure
+message)` pairs, `valid`, `fallback`, plus `top_level_keys`, the frozenset of key names the lenient fallback's line scan saw, which includes complex fields such as `links` that the fallback never recovers into `frontmatter`, empty on a strict parse) and never raises: a read failure
 (`OSError`/`UnicodeDecodeError`), a malformed or non-mapping frontmatter block,
 and a wrongly-shaped typed field are all diagnostics, never exceptions.
 `parse_frontmatter()` stays as a thin `(dict, str)` wrapper over it for callers

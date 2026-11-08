@@ -281,6 +281,8 @@ class TestTypeFrozen(GuardCase):
         self.store(broken)
         fixed = broken.replace("title: bad: title", 'title: "bad: title"')
         self.assertClean(fixed.replace("type: banana # note", "type: topic"))
+        # gate round 10 R10-5: a different declared type is refused, so an exemption regression goes red
+        self.assertRefused(fixed.replace("type: banana # note", "type: incident"), "type changed 'topic' -> 'incident'")
 
     def test_a_new_side_quoted_hash_value_is_not_stripped_into_the_old_type(self):
         # gate round 3 R3-1: REF fallback with recovered `topic`; NEW still fallback-parsed with
