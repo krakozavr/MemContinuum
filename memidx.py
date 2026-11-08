@@ -13367,6 +13367,7 @@ def _declined_check(command: str, args, ctx: dict, root: Path, topic_id: str, li
     logger (`_clean_log_token`) keeps only [A-Za-z0-9._-]."""
     import memlint
     explicit = command in ("append", "promote")
+    order: list = []
     if explicit:
         fm = parse_record_raw(old_text, path).frontmatter
         groups = [(topic_id, memlint.rejection_rows(fm.get("links") or []))]
@@ -13408,7 +13409,11 @@ def _declined_check(command: str, args, ctx: dict, root: Path, topic_id: str, li
     outcome = "flagged" if flagged else "bypass" if explicit else "shown" if lines else "none"
     ids = list(dict.fromkeys([t for t, _r in flagged] + shown_ids))
     ctx["declined"] = {"outcome": outcome, "proposal_sha256": digest, "store_rev": _store_head_short(root),
-                       "ids": "_".join(ids) if ids else "none", "shown": len(lines)}
+                       "ids": "_".join(ids[:_DECLINED_SHOW_TOPICS]) if ids else "none", "shown": len(lines)}
+    matched = list(dict.fromkeys([t for t, _r in flagged] + [t for t, _rows in groups] + order))
+    if len(matched) > _DECLINED_SHOW_TOPICS:
+        # the logger caps a value at 64 chars: name the three candidates, count the rest
+        ctx["declined"]["ids_total"] = len(matched)
     if flagged:
         tid, row = flagged[0]
         ref = memlint.rejection_ref(tid, row)
