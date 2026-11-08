@@ -457,8 +457,13 @@ class TestTypeFrozen(GuardCase):
 
         with mock.patch.object(memlint, "_parse_git_blob", spy):
             memlint.check_append_only(self.root, "HEAD", False)
-        new_side = [l for l in seen if isinstance(l, str) and "(at " not in l]
-        self.assertEqual(len(new_side), 1, seen)
+        # every call counts whatever its label type; the NEW-side comparison parse is the one
+        # whose label is the store-relative path string, the REF parse says "(at HEAD)"
+        ref_side = [l for l in seen if "(at " in str(l)]
+        new_side = [l for l in seen if "(at " not in str(l)]
+        self.assertEqual(len(ref_side), 1, seen)
+        self.assertEqual(len([l for l in new_side if isinstance(l, str)]), 1, seen)
+        self.assertLessEqual(len(new_side), 2, seen)  # + the pre-existing rejections scan (a Path label)
 
 
 # ---------------------------------------------------------------------------
