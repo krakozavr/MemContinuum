@@ -117,14 +117,17 @@
 # passed, via ONE `memidx.py unmapped` call (self-healing) per such turn. The
 # call carries only the code paths NEW since the previous prompt (or none at
 # all: it is the index-state check and the stale self-heal either way; the
-# contract is "the engine is consulted whenever the cache is": a prompt that
-# is not a coverage candidate reads no cache and makes no call); the
+# contract is "the engine is consulted whenever the cache is": the block is
+# entered for a coverage candidate or a moved code HEAD, and a prompt outside
+# both reads no cache and makes no call); the
 # verdicts of the other paths come from the session's unmapped_cache, which is
 # reused only while the store HEAD is unchanged, the store worktree is clean
 # (git status --porcelain, untracked included), the call did not heal the
 # index and the path was not edited again since its verdict (the ledger
-# seen_at, fractional epoch seconds like classified_at, is not older than the
-# whole second of classified_at); otherwise every path is reclassified and the cache
+# seen_at, fractional epoch seconds like classified_at, is not newer than the
+# verdict: a fractional seen_at compares strictly `>` classified_at; only a
+# whole-second seen_at from an older hook uses `>= floor(classified_at)`);
+# otherwise every path is reclassified and the cache
 # rebuilt. The classification therefore only runs on turns that were already
 # going to inject something, and costs only what is new.
 #
@@ -840,8 +843,9 @@ with open(sys.argv[1]) as f:
 # They are reusable only at the store HEAD they were made at AND while the
 # store worktree is clean; a missing, malformed, other-HEAD or dirty-store
 # cache means every path is new. A path whose latest ledger edit (seen_at)
-# is not older than the whole second of its verdict (classified_at; seen_at
-# may be a whole second from an older hook version) is new too: a re-edit, a
+# is newer than its verdict (classified_at) is new too: a fractional seen_at
+# compares strictly `>`; only a whole-second one (an older hook version, or a
+# time.time() that happens to be integral) uses `>= floor(classified_at)`: a re-edit, a
 # symlink swap or a replace reclassifies that path alone. T: is the moment
 # this classification starts (recorded as the verdict time of every path
 # classified now, so an edit landing during the call is still newer).
