@@ -224,10 +224,11 @@ class TestTypeFrozen(GuardCase):
         self.assertRefused(base.replace("type: topic\n", "type: investigation\n"),
                            "type changed 'topic' -> 'investigation'")
 
-    def test_dropping_the_type_is_a_change_too(self):
+    def test_dropping_the_type_under_topics_infers_topic_and_is_clean(self):
+        # gate round 11 R11-1: `type removed` is gone; a typeless NEW under topics/ infers `topic` (delivery unchanged)
         base = ttext(["src/a.py"])
         self.store(base)
-        self.assertRefused(base.replace("type: topic\n", ""), "type changed 'topic' -> None")
+        self.assertClean(base.replace("type: topic\n", ""))
 
     def test_repairing_a_fallback_parsed_record_is_not_a_type_change(self):
         # REF: `title: bad: title` + `type: topic # comment` only parses through the lenient
@@ -403,11 +404,11 @@ class TestTypeFrozen(GuardCase):
         self.assertNotIn("links", res.frontmatter)
         self.assertIn("links", res.top_level_keys)
         self.assertIsNone(memlint._record_kind(res.frontmatter))
-        self.assertEqual(memlint._frozen_type_frontmatter(res)[0]["type"], "topic")
+        self.assertEqual(self._frozen(res), "topic")
         memo = memidx.parse_record_text(self.MEMO_REF, "x")
         self.assertTrue(memo.fallback, memo)
         self.assertNotIn("links", memo.top_level_keys)
-        self.assertIsNone(memlint._frozen_type_frontmatter(memo))
+        self.assertIsNone(self._frozen(memo))
         strict = memidx.parse_record_text(ttext(["src/a.py"]), "x")
         self.assertFalse(strict.fallback)
         self.assertEqual(strict.top_level_keys, frozenset())
@@ -456,25 +457,29 @@ class TestTypeFrozen(GuardCase):
         self.store(ref)
         self.assertClean(ref)
 
-    def test_a_strict_typeless_record_with_no_id_and_no_links_is_free(self):
+    def test_a_strict_typeless_record_with_no_id_and_no_links_under_topics_is_frozen_as_topic(self):
         ref = "---\ntitle: a note\n---\n\nBody.\n"
         self.assertFalse(memidx.parse_record_text(ref, "x").fallback)
-        self.assertIsNone(memlint._frozen_type_frontmatter(memidx.parse_record_text(ref, "x")))
         self.store(ref)
-        self.assertClean(ref.replace("title:", "type: incident\ntitle:", 1))
+        # gate round 11 R11-1: under topics/ the index delivers it as `topic` (directory inference), so it is frozen
+        self.assertRefused(ref.replace("title:", "type: incident\ntitle:", 1), "type changed 'topic' -> 'incident'")
+        self.assertClean(ref)
+
+    @staticmethod
+    def _frozen(result):
+        root = Path("/store")
+        return memlint._frozen_type(root, root / "topics" / "foo.md", result)
 
     def test_the_unified_rule_table(self):
-        strict_typed = memidx.parse_record_text(ttext(["src/a.py"]), "x")
-        self.assertEqual(memlint._frozen_type_frontmatter(strict_typed)[0]["type"], "topic")
-        self.assertEqual(memlint._frozen_type_frontmatter(strict_typed)[1:], (False, True))
-        strict_typeless = memidx.parse_record_text(self._typeless(), "x")
-        self.assertEqual(memlint._frozen_type_frontmatter(strict_typeless)[0]["type"], "topic")
-        self.assertEqual(memlint._frozen_type_frontmatter(strict_typeless)[1:], (False, False))
-        fb_typed = memidx.parse_record_text(self._bad_title(ttext(["src/a.py"])), "x")
-        self.assertEqual(memlint._frozen_type_frontmatter(fb_typed)[1:], (True, True))
-        fb_kind = memidx.parse_record_text(self.LINKS_REF, "x")
-        self.assertEqual(memlint._frozen_type_frontmatter(fb_kind)[0]["type"], "topic")
-        self.assertIsNone(memlint._frozen_type_frontmatter(memidx.parse_record_text(self.MEMO_REF, "x")))
+        # gate round 11 R11-1: the frozen value is infer_type's answer (fallback + non-canonical: the kind rule)
+        self.assertEqual(self._frozen(memidx.parse_record_text(ttext(["src/a.py"]), "x")), "topic")
+        self.assertEqual(self._frozen(memidx.parse_record_text(self._typeless(), "x")), "topic")
+        self.assertEqual(self._frozen(memidx.parse_record_text(self._bad_title(ttext(["src/a.py"])), "x")), "topic")
+        self.assertEqual(self._frozen(memidx.parse_record_text(self.LINKS_REF, "x")), "topic")
+        self.assertIsNone(self._frozen(memidx.parse_record_text(self.MEMO_REF, "x")))
+        inbox = Path("/store") / "inbox" / "n.md"
+        self.assertEqual(memlint._frozen_type(Path("/store"), inbox, memidx.parse_record_text(ttext(["src/a.py"]), "x")),
+                         "inbox")
 
     # gate round 10 R10-2 (Sol MAJOR, Grok MINOR): the fallback key scan used for `top_level_keys` sees quoted
     # and indented keys; it over-includes (a `links:` in a scalar, a nested one) -- the ruled fail-closed direction
@@ -554,7 +559,8 @@ class TestTypeFrozen(GuardCase):
         fixed = self._title_repaired(ref)
         self.assertRefused(fixed.replace("type: banana # note", "type: topic"),
                            "type changed 'incident' -> 'topic'", "a repair of a malformed record must declare type: incident")
-        self.assertRefused(fixed.replace("type: banana # note", ""), "type removed (frozen 'incident')")
+        # gate round 11 R11-1: a typeless NEW under topics/ infers `topic` -> "type changed", no "type removed"
+        self.assertRefused(fixed.replace("type: banana # note", ""), "type changed 'incident' -> 'topic'")
         self.assertClean(fixed.replace("type: banana # note", "type: incident"))
 
     def test_a_garbled_type_with_no_id_and_no_links_is_exempt(self):
@@ -604,23 +610,28 @@ class TestTypeFrozen(GuardCase):
         self.assertRefused(fixed.replace("type: 'topic # it''s x'", "type: incident"),
                            "type changed 'topic' -> 'incident'")
 
-    def test_an_empty_new_mapping_loses_a_frozen_type(self):
+    def test_an_empty_new_mapping_under_topics_is_not_a_type_change(self):
         # gate round 3 R3-2: the type may not disappear by emptying the frontmatter
         base = ttext(["src/a.py"])
         self.store(base)
         empty = "---\n{}\n---\n\nBody.\n"
         self.assertEqual(memidx.parse_record_text(empty, "x").frontmatter, {})
-        self.assertRefused(empty, "type removed (frozen 'topic')")
+        # gate round 11 R11-1: no `type removed` case; `{}` under topics/ infers `topic`, the links guard refuses the loss
+        out = self.assertRefused(empty, "link removed after being recorded")
+        self.assertNotIn("type changed", out)
 
-    def test_an_empty_new_mapping_loses_a_fallback_refs_trusted_type(self):
+    def test_an_empty_new_mapping_under_topics_keeps_a_fallback_refs_topic(self):
         broken = self._bad_title(ttext(["src/a.py"]))
         self.assertTrue(memidx.parse_record_text(broken, "x").fallback)
         self.store(broken)
-        self.assertRefused("---\n{}\n---\n\nBody.\n", "type removed (frozen 'topic')")
+        # gate round 11 R11-1: `{}` under topics/ infers `topic` = the frozen kind; the repair branch has no
+        # recorded links to protect, so the type guard is clean
+        self.assertClean("---\n{}\n---\n\nBody.\n")
 
-    def test_a_new_side_with_other_keys_but_no_type_is_a_removal_too(self):
+    def test_a_new_side_with_other_keys_but_no_type_is_not_a_type_change(self):
         self.store(ttext(["src/a.py"]))
-        self.assertRefused("---\ntitle: x\n---\n\nBody.\n", "type removed (frozen 'topic')")
+        out = self.assertRefused("---\ntitle: x\n---\n\nBody.\n", "link removed after being recorded")
+        self.assertNotIn("type changed", out)   # gate round 11 R11-1: infers `topic`
 
     def test_a_strict_type_change_is_still_refused_with_a_comment_free_ref(self):
         base = ttext(["src/a.py"])
@@ -643,9 +654,13 @@ class TestTypeFrozen(GuardCase):
         # kind (here the INC- id); it may stay typeless or declare `incident`, nothing else
         note = "---\nid: INC-9001\ntitle: x\n---\n\nBody.\n"
         self.store(note)
+        # amended in gate round 11 R11-1: the record sits under topics/, so the index delivers it as `topic`
+        # (directory inference) and that is what is frozen; declaring `incident` is a delivery change
         self.assertRefused(note.replace("id: INC-9001\n", "id: INC-9001\ntype: investigation\n"),
-                           "type changed 'incident' -> 'investigation'")
-        self.assertClean(note.replace("id: INC-9001\n", "id: INC-9001\ntype: incident\n"))
+                           "type changed 'topic' -> 'investigation'")
+        self.assertRefused(note.replace("id: INC-9001\n", "id: INC-9001\ntype: incident\n"),
+                           "type changed 'topic' -> 'incident'")
+        self.assertClean(note.replace("id: INC-9001\n", "id: INC-9001\ntype: topic\n"))
         self.assertClean(note)
 
     def _non_topic_ref(self, kind):
@@ -671,10 +686,12 @@ class TestTypeFrozen(GuardCase):
         self.assertRefused(repaired.replace("type: concept\n", "type: investigation\n", 1),
                            "type changed 'concept' -> 'investigation'")
 
-    def test_a_non_topic_ref_with_no_type_is_free_to_gain_one(self):
+    def test_a_typeless_note_under_topics_is_frozen_as_topic(self):
+        # amended in gate round 11 R11-1 (was: free to gain a type): directory inference delivers it as `topic`
         note = "---\ntitle: just a note\n---\n\nBody.\n"
         self.store(note)
-        self.assertClean(note.replace("title: just a note\n", "title: just a note\ntype: incident\n"))
+        self.assertRefused(note.replace("title: just a note\n", "title: just a note\ntype: incident\n"),
+                           "type changed 'topic' -> 'incident'")
 
     def test_a_modified_non_topic_record_reads_and_parses_its_new_blob_once(self):
         # gate round 4 R4-2
@@ -699,6 +716,95 @@ class TestTypeFrozen(GuardCase):
         self.assertEqual(len(ref_side), 1, seen)
         self.assertEqual(len([l for l in new_side if isinstance(l, str)]), 1, seen)
         self.assertLessEqual(len(new_side), 2, seen)  # + the pre-existing rejections scan (a Path label)
+
+
+# ---------------------------------------------------------------------------
+# gate round 11 R11-1: the frozen type is what the index delivers (`infer_type`)
+# ---------------------------------------------------------------------------
+
+class TestDeliveredTypeFrozen(GuardCase):
+    def _typeless(self, tid="TOP-9100"):
+        text = ttext(["src/a.py"], tid=tid)
+        out = text.replace("type: topic\n", "", 1)
+        res = memidx.parse_record_text(out, "x")
+        self.assertFalse(res.fallback, res)
+        self.assertIsNone(res.frontmatter.get("type"))
+        return out
+
+    def test_metadata_type_on_a_typeless_topic_is_refused(self):
+        # Sol R11 #1: `metadata.type` is what infer_type reads next
+        ref = self._typeless()
+        self.store(ref)
+        self.assertRefused(ref.replace("tags: []\n", "tags: []\nmetadata:\n  type: incident\n", 1),
+                           "type changed 'topic' -> 'incident'")
+
+    def test_a_metadata_type_change_on_a_typeless_record_is_refused(self):
+        ref = self._typeless().replace("tags: []\n", "tags: []\nmetadata:\n  type: concept\n", 1)
+        self.store(ref)
+        self.assertEqual(memidx.infer_type(Path("/s"), Path("/s/topics/foo.md"),
+                                           memidx.parse_record_text(ref, "x").frontmatter), "concept")
+        self.assertRefused(ref.replace("type: concept", "type: investigation"),
+                           "type changed 'concept' -> 'investigation'")
+
+    def test_a_metadata_type_change_on_a_record_with_an_explicit_type_is_not_a_delivery_change(self):
+        # the explicit `type:` wins in infer_type, so the delivered type is the same and the edit is clean
+        ref = ttext(["src/a.py"]).replace("tags: []\n", "tags: []\nmetadata:\n  type: concept\n", 1)
+        self.store(ref)
+        self.assertClean(ref.replace("type: concept", "type: investigation"))
+
+    def test_a_typeless_inc_record_under_topics_may_not_declare_incident(self):
+        # Sol R11 #2: the index delivered it as `topic` (directory), declaring `incident` drops it from for-path
+        ref = self._typeless(tid="INC-9100")
+        self.store(ref)
+        self.assertRefused(ref.replace("title:", "type: incident\ntitle:", 1), "type changed 'topic' -> 'incident'")
+        self.assertClean(ref.replace("title:", "type: topic\ntitle:", 1))
+        self.assertClean(ref)
+
+    def test_type_false_to_the_string_false_is_refused(self):
+        # Sol R11 #3: YAML false is not a type (infer_type falls through to the directory); "False" is one
+        ref = ttext(["src/a.py"]).replace("type: topic\n", "type: false\n", 1)
+        self.store(ref)
+        self.assertRefused(ref.replace("type: false\n", 'type: "False"\n', 1), "type changed 'topic' -> 'False'")
+        self.assertClean(ref)
+
+    def test_a_typeless_inc_record_under_incidents_may_declare_incident(self):
+        text = self._typeless(tid="INC-9100")
+        root = git_store(self.tmp / "inc")
+        self.root = root
+        (root / "incidents").mkdir()
+        (root / "incidents" / "x.md").write_text(text)
+        commit_all(root)
+        (root / "incidents" / "x.md").write_text(text.replace("title:", "type: incident\ntitle:", 1))
+        rc, out = run_memlint(["--against-ref", "HEAD", str(root)])
+        self.assertEqual(rc, 0, out)
+        (root / "incidents" / "x.md").write_text(text.replace("title:", "type: topic\ntitle:", 1))
+        rc, out = run_memlint(["--against-ref", "HEAD", str(root)])
+        self.assertEqual(rc, 1, out)
+        self.assertIn("type changed 'incident' -> 'topic'", out)
+
+    INDENTED_INC = ("---\n  type: incident\n  id: INC-0001\n  title: bad: title\n  links:\n"
+                    "    - link: L1\n      date: 2026-01-01\n      decision: x\n---\n\nBody.\n")
+
+    def test_a_uniformly_indented_incident_under_topics_is_frozen_as_topic(self):
+        # Grok R11 MAJOR 2: the index delivered it as `topic` (the fallback loses the indented `type`);
+        # the repair that makes it a strict `incident` is a delivery change; the fix is to move the file
+        res = memidx.parse_record_text(self.INDENTED_INC, "x")
+        self.assertTrue(res.fallback, res)
+        self.assertNotIn("type", res.frontmatter)
+        self.store(self.INDENTED_INC)
+        fixed = self.INDENTED_INC.replace("title: bad: title", 'title: "bad: title"')
+        self.assertRefused(fixed, "type changed 'topic' -> 'incident'", "must declare type: topic")
+        self.assertClean(fixed.replace("type: incident", "type: topic"))
+
+    def test_a_fallback_record_that_never_had_a_type_is_clean_when_repaired_without_one(self):
+        # Grok R11 MINOR: no `explicit` flag, no `type removed`; a typeless NEW infers by directory
+        ref = ("---\nid: TOP-0001\ntitle: bad: title\nlinks:\n  - link: L1\n    date: 2026-01-01\n"
+               "    decision: x\n---\n\nBody.\n")
+        res = memidx.parse_record_text(ref, "x")
+        self.assertTrue(res.fallback, res)
+        self.assertNotIn("type", res.frontmatter)
+        self.store(ref)
+        self.assertClean(ref.replace("title: bad: title", 'title: "bad: title"'))
 
 
 # ---------------------------------------------------------------------------
