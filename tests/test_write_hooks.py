@@ -543,9 +543,7 @@ class HookTestBase(unittest.TestCase):
             content = entry[2] if len(entry) > 2 else path
             sha = hashlib.sha256(content.encode()).hexdigest()
             ledger.append({"path": path, "kind": kind, "content_sha256": sha,
-                           # seeded edits are minutes old: a verdict made now is not older than a
-                           # seen_at in the same wall second (gate round 2 R2-1)
-                           "seen_at": time.time() - 60.0})
+                           "seen_at": time.time()})
         state.setdefault("session_id", session_id)
         state.setdefault("project", self.project)
         state.setdefault("user_turn_count", 0)
@@ -4093,6 +4091,25 @@ class TestUserPromptRemind(HookTestBase):
         calls = self._unmapped_calls(spy)
         self.assertEqual(len(calls), 2, calls)
         self.assertEqual(self._call_paths(calls[1]), [unmapped])
+
+    def test_a_fractional_edit_before_the_verdict_in_the_same_second_is_not_reclassified(self):
+        """Gate round 2 R2-6: edited at S.10, classified at S.25 -- no churn."""
+        spy = Path(self.td) / "unmapped-calls.log"
+        env = self._spy_env(spy)
+        session_id = "s-userprompt-incremental-no-churn"
+        unmapped = str(self.code_root / "src" / "unmapped.py")
+        self._edit_through_ledger_hook(session_id, unmapped)
+        self._prompt(session_id, env)
+        whole = float(int(time.time()))
+        state = json.loads(self.state_file(session_id).read_text())
+        state["ledger"][0]["seen_at"] = whole + 0.10
+        state["unmapped_cache"]["classified_at"][unmapped] = whole + 0.25
+        self.state_file(session_id).write_text(json.dumps(state))
+        self.patch_state(session_id, last_injected_pairs=[])
+        self._prompt(session_id, env)
+        calls = self._unmapped_calls(spy)
+        self.assertEqual(len(calls), 2, calls)
+        self.assertEqual(self._call_paths(calls[1]), [], calls)
 
     def test_a_whole_second_seen_at_from_an_older_hook_still_invalidates(self):
         spy = Path(self.td) / "unmapped-calls.log"

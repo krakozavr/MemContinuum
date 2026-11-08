@@ -862,7 +862,11 @@ print("R:" + ("1" if reuse else "0"))
 print("T:" + repr(time.time()))
 for p in d.get("code_paths", []):
     print("P:" + p)
-    if p not in verdicts or num(seen.get(p)) >= int(num(stamps.get(p))):
+    sv, cv = num(seen.get(p)), num(stamps.get(p))
+    # A fractional seen_at (current ledger) compares strictly; a whole-second
+    # one (an older hook version, stored as 1731.0 or 1731) keeps >= floor.
+    newer = sv >= int(cv) if sv == int(sv) else sv > cv
+    if p not in verdicts or newer:
         print("N:" + p)
 ' "$DECIDE_TMP" "$CUR_STORE_SHA" "$STORE_DIRTY" 2>>"$MC_LOG")
 
