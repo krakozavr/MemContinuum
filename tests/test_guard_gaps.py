@@ -303,13 +303,15 @@ class TestTypeFrozen(GuardCase):
         self.assertEqual(res.frontmatter.get("type"), "topic # actual value")
         self.store(self.ODD_REF)
 
-    def test_an_unchanged_odd_type_survives_a_title_only_repair(self):
+    def test_an_unchanged_odd_type_is_refused_with_the_normalise_message_on_a_title_only_repair(self):
         self._odd_ref()
-        self.assertClean(self.ODD_REF.replace("title: bad: title", 'title: "bad: title"'))
+        self.assertRefused(self.ODD_REF.replace("title: bad: title", 'title: "bad: title"'),
+                           "type changed 'topic' -> 'topic # actual value'", "a repair of a malformed record must declare type: topic")
 
-    def test_an_unchanged_odd_type_survives_a_body_only_edit(self):
+    def test_an_unchanged_odd_type_is_refused_with_the_normalise_message_on_a_body_only_edit(self):
         self._odd_ref()
-        self.assertClean(self.ODD_REF.replace("Body.", "Body, edited."))
+        self.assertRefused(self.ODD_REF.replace("Body.", "Body, edited."),
+                           "type changed 'topic' -> 'topic # actual value'", "a repair of a malformed record must declare type: topic")
 
     def test_an_odd_ref_type_may_become_its_bare_token(self):
         self._odd_ref()
@@ -320,35 +322,36 @@ class TestTypeFrozen(GuardCase):
         self.assertRefused(self.ODD_REF.replace('type: "topic # actual value"', "type: incident"),
                            "type changed 'topic' -> 'incident'")
 
-    # gate round 5 R5-1: a raw fallback spelling is never compared with a decoded strict value;
-    # the unchanged `type:` source line (or the bare token) is what counts
-    def _fallback_ref(self, type_line):
+    # gate round 5 R5-1 / round 6 R6-1: a raw fallback spelling is never compared with a decoded
+    # strict value; the NEW record's decoded type must equal the bare token (no source-line rule)
+    def _fallback_ref(self, type_line, valid=True):
         ref = f"---\n{type_line}\ntitle: bad: title\n---\n\nBody.\n"
         res = memidx.parse_record_text(ref, "x")
-        self.assertTrue(res.fallback and res.valid, res)
+        self.assertTrue(res.fallback and (res.valid or not valid), res)
         self.store(ref)
         return ref
 
     def _title_repaired(self, ref):
         return ref.replace("title: bad: title", 'title: "bad: title"')
 
-    def test_a_single_quoted_odd_type_with_a_doubled_quote_survives_a_title_repair(self):
+    def test_a_single_quoted_odd_type_with_a_doubled_quote_is_refused_with_the_normalise_message(self):
         ref = self._fallback_ref("type: 'topic # it''s x'")
         fixed = self._title_repaired(ref)
         self.assertEqual(memidx.parse_record_text(fixed, "x").frontmatter.get("type"), "topic # it's x")
-        self.assertClean(fixed)
+        self.assertRefused(fixed, "type changed 'topic' -> \"topic # it's x\"", "a repair of a malformed record must declare type: topic")
 
-    def test_a_double_quoted_odd_type_survives_a_title_repair(self):
+    def test_a_double_quoted_odd_type_is_refused_with_the_normalise_message(self):
         ref = self._fallback_ref('type: "topic # x"')
-        self.assertClean(self._title_repaired(ref))
+        self.assertRefused(self._title_repaired(ref), "type changed 'topic' -> 'topic # x'", "a repair of a malformed record must declare type: topic")
 
-    def test_a_double_quoted_odd_type_with_an_escape_survives_a_title_repair(self):
+    def test_a_double_quoted_odd_type_with_an_escape_is_refused_with_the_normalise_message(self):
         ref = self._fallback_ref('type: "topic # \\u0078"')
-        self.assertClean(self._title_repaired(ref))
+        self.assertRefused(self._title_repaired(ref), "type changed 'topic' -> 'topic # x'", "a repair of a malformed record must declare type: topic")
 
-    def test_an_odd_type_line_with_changed_spacing_survives_a_title_repair(self):
+    def test_an_odd_type_line_with_changed_spacing_is_refused_with_the_normalise_message(self):
         ref = self._fallback_ref("type: 'topic # it''s x'")
-        self.assertClean(self._title_repaired(ref).replace("type: 'topic", "type:   'topic"))
+        self.assertRefused(self._title_repaired(ref).replace("type: 'topic", "type:   'topic"),
+                           "type changed 'topic' -> \"topic # it's x\"", "a repair of a malformed record must declare type: topic")
 
     def test_the_odd_single_quoted_ref_may_become_bare_topic_or_is_refused_for_incident(self):
         ref = self._fallback_ref("type: 'topic # it''s x'")
@@ -371,6 +374,30 @@ class TestTypeFrozen(GuardCase):
         self.assertRefused(fixed.replace('type: "incident" # note', "type: concept"),
                            "type changed 'incident' -> 'concept'")
         self.assertClean(fixed.replace('type: "incident" # note', "type: incident"))
+
+    # gate round 6 R6-1: the effective key is the YAML-decoded one, never a scanned source line
+    def test_a_duplicate_type_key_that_wins_last_is_refused(self):
+        ref = self._fallback_ref("type: topic", valid=False)
+        fixed = self._title_repaired(ref).replace("type: topic\n", "type: topic\ntype: incident\n", 1)
+        self.assertEqual(memidx.parse_record_text(fixed, "x").frontmatter.get("type"), "incident")
+        self.assertRefused(fixed, "type changed 'topic' -> 'incident'")
+
+    def test_a_block_scalar_decoy_type_line_does_not_hide_a_changed_real_type(self):
+        ref = "---\nnote: |\n  type: topic\ntype: topic\ntitle: bad: title\n---\n\nBody.\n"
+        self.assertTrue(memidx.parse_record_text(ref, "x").fallback)
+        self.store(ref)
+        fixed = self._title_repaired(ref)
+        self.assertClean(fixed)
+        self.assertRefused(fixed.replace("\ntype: topic\ntitle", "\ntype: incident\ntitle"),
+                           "type changed 'topic' -> 'incident'")
+
+    def test_a_nested_meta_type_above_the_real_type_does_not_govern(self):
+        ref = self._fallback_ref("meta:\n  type: unrelated\ntype: 'topic # it''s x'")
+        fixed = self._title_repaired(ref)
+        self.assertRefused(fixed, "type changed 'topic' -> \"topic # it's x\"", "a repair of a malformed record must declare type: topic")
+        self.assertClean(fixed.replace("type: 'topic # it''s x'", "type: topic"))
+        self.assertRefused(fixed.replace("type: 'topic # it''s x'", "type: incident"),
+                           "type changed 'topic' -> 'incident'")
 
     def test_an_empty_new_mapping_loses_a_frozen_type(self):
         # gate round 3 R3-2: the type may not disappear by emptying the frontmatter
