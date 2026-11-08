@@ -339,9 +339,9 @@ print(json.dumps(state))
     fi
     [ -n "$DECIDE_TMP" ] && rm -f "$DECIDE_TMP" 2>/dev/null
     if [ -n "$extra" ]; then
-        mc_log "userprompt outcome=$outcome $extra session=${SESSION_ID:-}"
+        mc_log "userprompt outcome=$outcome $extra session=${SESSION_ID:-} $(mc_elapsed_field)"
     else
-        mc_log "userprompt outcome=$outcome session=${SESSION_ID:-}"
+        mc_log "userprompt outcome=$outcome session=${SESSION_ID:-} $(mc_elapsed_field)"
     fi
     exit 0
 }
@@ -646,7 +646,7 @@ if [ "$PQ_ON" = "1" ]; then
     PQ_TERMS_LOGGED="${PROMPT_TERMS:-}"
     PQ_TERMS_LOGGED="${PQ_TERMS_LOGGED// /+}"
     if [ "${RETRY:-0}" = "1" ]; then
-        mc_log "userprompt outcome=prompt-query-empty reason=retry q=$PQ_TERMS_LOGGED session=${SESSION_ID:-}"
+        mc_log "userprompt outcome=prompt-query-empty reason=retry q=$PQ_TERMS_LOGGED session=${SESSION_ID:-} $(mc_elapsed_field)"
     elif [ "${PROMPT_SOURCE:-}" = "machine" ]; then
         # TOP-0133 L3: Claude Code delivers subagent hand-back reports,
         # background-task notifications, and cross-session messages
@@ -655,11 +655,11 @@ if [ "$PQ_ON" = "1" ]; then
         # BEFORE tokenizing it and reports it here as PROMPT_SOURCE --
         # never tokenized, never searched, q= stays empty the same way
         # too-few-terms's own line does.
-        mc_log "userprompt outcome=prompt-query-empty reason=non-user q= session=${SESSION_ID:-}"
+        mc_log "userprompt outcome=prompt-query-empty reason=non-user q= session=${SESSION_ID:-} $(mc_elapsed_field)"
     elif [ -z "${PROMPT_TERMS:-}" ]; then
-        mc_log "userprompt outcome=prompt-query-empty reason=too-few-terms q= session=${SESSION_ID:-}"
+        mc_log "userprompt outcome=prompt-query-empty reason=too-few-terms q= session=${SESSION_ID:-} $(mc_elapsed_field)"
     elif [ -z "${MEMCONTINUUM_ROOT:-}" ]; then
-        mc_log "userprompt outcome=prompt-query-empty reason=store-root-unset q=$PQ_TERMS_LOGGED session=${SESSION_ID:-}"
+        mc_log "userprompt outcome=prompt-query-empty reason=store-root-unset q=$PQ_TERMS_LOGGED session=${SESSION_ID:-} $(mc_elapsed_field)"
     else
         PQ_LIB_OK=1
         # shellcheck source=mc-query-lib.sh
@@ -669,7 +669,7 @@ if [ "$PQ_ON" = "1" ]; then
             source "$SCRIPT_DIR/mc-fallback-lib.sh" 2>/dev/null || PQ_LIB_OK=0
         fi
         if [ "$PQ_LIB_OK" != "1" ]; then
-            mc_log "userprompt outcome=prompt-query-empty reason=lib-missing q=$PQ_TERMS_LOGGED session=${SESSION_ID:-}"
+            mc_log "userprompt outcome=prompt-query-empty reason=lib-missing q=$PQ_TERMS_LOGGED session=${SESSION_ID:-} $(mc_elapsed_field)"
         else
             # ONE process, mirroring pre-edit-chain.sh's own FB_ARGS
             # exactly except `--mode fts` always (never
@@ -713,10 +713,10 @@ if [ "$PQ_ON" = "1" ]; then
 
             if [ -z "$FB_HITS" ] || [ "$FB_HITS" = "0" ]; then
                 [ -z "$FB_REASON" ] && FB_REASON="no-hits"
-                mc_log "userprompt outcome=prompt-query-empty reason=$FB_REASON q=$PQ_TERMS_LOGGED$PQ_MS_PART session=${SESSION_ID:-}"
+                mc_log "userprompt outcome=prompt-query-empty reason=$FB_REASON q=$PQ_TERMS_LOGGED$PQ_MS_PART session=${SESSION_ID:-} $(mc_elapsed_field)"
             else
                 PQ_TEXT="$FB_TEXT"
-                mc_log "userprompt outcome=prompt-query hits=$FB_HITS ids=$FB_IDS q=$PQ_TERMS_LOGGED$PQ_MS_PART session=${SESSION_ID:-}"
+                mc_log "userprompt outcome=prompt-query hits=$FB_HITS ids=$FB_IDS q=$PQ_TERMS_LOGGED$PQ_MS_PART session=${SESSION_ID:-} $(mc_elapsed_field)"
                 # No-write property: the search call above is
                 # --read-only; the ONE state write this channel ever
                 # makes is titling, same as L1 -- FILE_PATH is the
@@ -831,10 +831,10 @@ except Exception:
     print("unknown")
 ' 2>/dev/null)"
             case "$COVERAGE_STATUS" in
-                uninitialized)      mc_log "userprompt outcome=index-uninitialized session=${SESSION_ID:-}" ;;
-                upgrade-required)   mc_log "userprompt outcome=index-upgrade-required session=${SESSION_ID:-}" ;;
-                index-error)        mc_log "userprompt outcome=index-error session=${SESSION_ID:-}" ;;
-                quarantined)        mc_log "userprompt outcome=index-quarantined session=${SESSION_ID:-}" ;;
+                uninitialized)      mc_log "userprompt outcome=index-uninitialized session=${SESSION_ID:-} $(mc_elapsed_field)" ;;
+                upgrade-required)   mc_log "userprompt outcome=index-upgrade-required session=${SESSION_ID:-} $(mc_elapsed_field)" ;;
+                index-error)        mc_log "userprompt outcome=index-error session=${SESSION_ID:-} $(mc_elapsed_field)" ;;
+                quarantined)        mc_log "userprompt outcome=index-quarantined session=${SESSION_ID:-} $(mc_elapsed_field)" ;;
             esac
             # Design R7 (audit MC-P2-03, TOP-0123 L7): a typed internal
             # error collapses coverage_status to "unknown" like any other
@@ -852,7 +852,7 @@ except Exception:
 print(d.get("reason_code", "") if isinstance(d, dict) else "")
 ' 2>/dev/null)"
             if [ -n "$DEGRADED_REASON" ]; then
-                mc_log "userprompt outcome=index-degraded reason=${DEGRADED_REASON} session=${SESSION_ID:-}"
+                mc_log "userprompt outcome=index-degraded reason=${DEGRADED_REASON} session=${SESSION_ID:-} $(mc_elapsed_field)"
             fi
         fi
     fi
@@ -1053,7 +1053,7 @@ print(json.dumps(state))
             if [ -s "$NUDGE_TMP" ]; then
                 while IFS=$'\t' read -r NUDGE_SHA NUDGE_ROOT NUDGE_FACT; do
                     [ -n "$NUDGE_SHA" ] || continue
-                    mc_log "userprompt outcome=commit-nudge sha=$NUDGE_SHA root=$NUDGE_ROOT session=${SESSION_ID:-}"
+                    mc_log "userprompt outcome=commit-nudge sha=$NUDGE_SHA root=$NUDGE_ROOT session=${SESSION_ID:-} $(mc_elapsed_field)"
                     if [ -n "$NUDGE_FACT_TEXT" ]; then
                         NUDGE_FACT_TEXT="$NUDGE_FACT_TEXT
 $NUDGE_FACT"

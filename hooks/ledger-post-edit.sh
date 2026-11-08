@@ -230,21 +230,11 @@ fi
 # shellcheck source=memlib.sh
 source "$SCRIPT_DIR/memlib.sh"
 
-START_TS=$(date +%s 2>/dev/null || echo 0)
-
 finish() {
     local outcome="$1"
-    local now elapsed
-    now=$(date +%s 2>/dev/null || echo "$START_TS")
-    elapsed=$(( now - START_TS ))
-    # Same clamp as hooks/pre-edit-chain.sh's own finish() (fix round,
-    # Grok 15): the wall clock can step BACKWARDS mid-run (NTP correction,
-    # VM resume, manual set), and nothing downstream expects a sign on
-    # this field. Landed in the same commit as pre-edit-chain.sh's clamp
-    # rather than separately, since it is the identical flake in the
-    # identical shape of finish() function.
-    [ "$elapsed" -lt 0 ] && elapsed=0
-    mc_log "ledger outcome=$outcome elapsed=${elapsed}s session=${SESSION_ID:-} file=${FILE_PATH:-}"
+    # elapsed from script start, one decimal (memlib.sh's clamp covers a
+    # wall clock that steps backwards).
+    mc_log "ledger outcome=$outcome $(mc_elapsed_field) session=${SESSION_ID:-} file=${FILE_PATH:-}"
     exit 0
 }
 
@@ -727,6 +717,7 @@ _mc_bootstrap_state(state)
 log_line(
     "ledger outcome=shell-diff appended=" + str(ctr["appended"]) + " roots=" + str(len(roots))
     + " timeouts=" + str(ctr["timeouts"]) + " non-git=" + str(ctr["non_git"])
+    + " elapsed=%.1fs" % max(0.0, time.time() - float(os.environ.get("MC_T0_US") or 0) / 1e6)
     + " baseline-too-large=" + str(ctr["baseline_too_large"])
     + " worktrees=" + str(worktrees_scanned)
     + ((" worktrees-over-cap=" + str(worktrees_over_cap)) if worktrees_over_cap else "")

@@ -577,58 +577,32 @@ class TestLedgerPostEdit(HookTestBase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_backward_clock_never_produces_a_negative_elapsed(self):
-        """Fix round (Codex 6 / Grok 6 / Grok 15): the same elapsed-clamp
-        flake hooks/pre-edit-chain.sh's own finish() had -- a fake `date
-        +%s` that steps BACKWARDS between START_TS and finish()'s own `now`
-        reproduces the real CI flake (a negative elapsed) deterministically,
-        no reliance on an actual NTP correction firing mid-run. Every
-        `date +%s` call after the first one returns the SAME stepped-back
-        value here (not just the second), so this is robust regardless of
-        how many such calls this script makes before finish() (it makes
-        three: START_TS, MC_NOW, and finish()'s own `now`)."""
-        marker = Path(self.td) / "date-called-once"
-        real_date = shutil.which("date") or "/bin/date"
-        fake_bin = Path(self.td) / "fakebin"
-        fake_bin.mkdir()
-        fake_date = fake_bin / "date"
-        fake_date.write_text(
-            "#!/usr/bin/env bash\n"
-            'if [ "$1" = "+%s" ]; then\n'
-            f'    if [ -e "{marker}" ]; then\n'
-            '        echo 1000000100\n'
-            '    else\n'
-            f'        : > "{marker}"\n'
-            '        echo 1000000200\n'
-            '    fi\n'
-            '    exit 0\n'
-            'fi\n'
-            f'exec "{real_date}" "$@"\n'
+        """The elapsed field is clamped at zero: a wall clock that steps
+        BACKWARDS between script start and the log line (NTP correction, VM
+        resume) must never print a sign. Deterministic: the recorded start
+        is put 5 s in the future of the clock instead of waiting for a
+        real step."""
+        script = (
+            'source "$1"; '
+            'if [ -n "${EPOCHREALTIME:-}" ]; then now="${EPOCHREALTIME/[.,]/}"; '
+            'else now="$(( $(date +%s) * 1000000 ))"; fi; '
+            'MC_T0_US=$(( now + 5000000 )); mc_elapsed_field'
         )
-        fake_date.chmod(0o755)
-        session_id = "s-ledger-elapsed-clamp"
+        proc = subprocess.run(
+            [MC_BASH, "-c", script, "_", str(HOOKS_DIR / "memlib.sh")],
+            capture_output=True, text=True, env=self.base_env(), timeout=10,
+        )
+        self.assertEqual(proc.stdout.strip(), "elapsed=0.0s", proc.stdout + proc.stderr)
+
+    def test_ledger_outcome_lines_carry_elapsed_with_one_decimal(self):
+        session_id = "s-ledger-elapsed-field"
         fpath = str(self.code_root / "src" / "mapped.py")
-        payload = self.post_tool_use_payload(session_id, fpath)
-        env = self.base_env(PATH=f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}")
-        proc, _ = run_script(LEDGER_HOOK, payload, env)
+        proc, _ = run_script(LEDGER_HOOK, self.post_tool_use_payload(session_id, fpath), self.base_env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        # Grok 4 (fix round 2, external re-gate): prove the fake `date` was
-        # actually invoked (see the matching comment in test_hooks.py's own
-        # copy of this test) -- otherwise a fast real run passes the two
-        # checks below for an unrelated reason and the backward step was
-        # never exercised.
-        self.assertTrue(marker.exists(),
-                         "fake date was never called a second time -- the backward-clock "
-                         "scenario was not exercised, this test proves nothing")
-        log_text = (self.home / "hook.log").read_text()
-        matching = [l for l in log_text.splitlines() if "ledger outcome=" in l]
-        self.assertTrue(matching, log_text)
-        for line in matching:
-            self.assertRegex(line, r"elapsed=\d+s", line)
-            self.assertNotIn("elapsed=-", line)
-            # 1000000100 - 1000000200 = -100 unclamped; a genuine clamp
-            # shows exactly 0, not merely "some non-negative number" (which
-            # a fast real run would also produce with no fake date at all).
-            self.assertRegex(line, r"elapsed=0s", line)
+        lines = [l for l in (self.home / "hook.log").read_text().splitlines() if "ledger outcome=" in l]
+        self.assertTrue(lines)
+        for line in lines:
+            self.assertRegex(line, r"elapsed=\d+\.\ds", line)
 
     def test_silent_always(self):
         session_id = "s-ledger-silent"
@@ -3797,6 +3771,15 @@ class TestUserPromptRemind(HookTestBase):
     # the hook never calls `unmapped` at all, so the assertion would pass
     # or fail for the wrong reason (see test_real_shaped_payload_no_source_
     # no_agent_proceeds above for the same seeding pattern).
+
+    def test_hook_log_outcome_lines_carry_elapsed(self):
+        session_id = "s-userprompt-elapsed-field"
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+        self._prompt(session_id, self.base_env())
+        lines = [l for l in (self.home / "hook.log").read_text().splitlines() if "userprompt outcome=" in l]
+        self.assertTrue(lines)
+        for line in lines:
+            self.assertRegex(line, r" elapsed=\d+\.\ds( |$)", line)
 
     def test_uninitialized_logs_index_uninitialized(self):
         db = self.home / f"{self.project}.sqlite"

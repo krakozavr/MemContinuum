@@ -134,6 +134,30 @@ fi
 
 MC_DB_PATH="$MEMCONTINUUM_HOME/$MC_PROJECT.sqlite"
 
+# Script start, in microseconds (bash 5 EPOCHREALTIME; older bash: whole
+# seconds from `date`), for the `elapsed=` field the hooks log on every
+# outcome line. Exported so the ledger's embedded python can use it too.
+if [ -n "${EPOCHREALTIME:-}" ]; then
+    MC_T0_US="${EPOCHREALTIME/[.,]/}"
+else
+    MC_T0_US="$(( $(date +%s 2>/dev/null || echo 0) * 1000000 ))"
+fi
+export MC_T0_US
+
+# mc_elapsed_field -- prints `elapsed=<seconds, one decimal>s`, measured from
+# script start (same shape code-refresh.sh logs).
+mc_elapsed_field() {
+    local now d
+    if [ -n "${EPOCHREALTIME:-}" ]; then
+        now="${EPOCHREALTIME/[.,]/}"
+    else
+        now="$(( $(date +%s 2>/dev/null || echo 0) * 1000000 ))"
+    fi
+    d=$(( (now - MC_T0_US) / 100000 ))
+    [ "$d" -lt 0 ] && d=0
+    printf 'elapsed=%d.%ds' $(( d / 10 )) $(( d % 10 ))
+}
+
 # mc_log MESSAGE -- append one timestamped line to hook.log, with
 # `project=$MC_PROJECT` always appended at the end (liveness metric:
 # memidx.py stats groups hook.log by project; every line from this shared
