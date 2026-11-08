@@ -445,6 +445,20 @@ class TestMemlintRule(DeclinedCase):
         self.assertEqual(rc, 1, text)
         self.assertIn("fresh.md:L1: re-adopts a rejected option recorded at TOP-9302 L1", text)
 
+    def test_a_crlf_topic_rejection_is_seen_by_the_staged_index_check(self):
+        from tests.test_filing import git
+        crlf = render_topic("TOP-9303", "Crlf staged topic", [L(1, "declined", "declined", "crlf staged thing",
+                                                               why="no")]).replace("\n", "\r\n")
+        (self.store / "topics" / "memory" / "crlf-staged.md").write_bytes(crlf.encode("utf-8"))
+        self.commit("crlf staged topic")
+        self.head0 = self.head()
+        (self.store / "topics" / "memory" / "fresh2.md").write_text(render_topic(
+            "TOP-9304", "Fresh staged topic", [L(1, "active", "adopted", "crlf staged thing")], "L1"))
+        git(["add", "-A"], self.store)
+        rc, text = run_memlint(["--against-ref", "HEAD", "--staged", str(self.store)])
+        self.assertEqual(rc, 1, text)
+        self.assertIn("fresh2.md:L1: re-adopts a rejected option recorded at TOP-9303 L1", text)
+
 
 class GizmoCase(FilingCase):
     """Many rejection-bearing topics sharing a title word (receipt and cap tests)."""
@@ -489,10 +503,12 @@ class TestShowCaps(GizmoCase):
 class TestReceiptIdsCap(GizmoCase):
     def test_nine_flagged_topics_name_three_and_count_nine(self):
         self.make_topics(9, 1, same_sentence="gizmo shared rejected sentence")
-        rc, _out, _err = self.run_cmd("record", "--title", "Gizmo cache policy", "--area", "memory",
-                                      "--ruling", "gizmo shared rejected sentence")
+        rc, out, _err = self.run_cmd("record", "--title", "Gizmo cache policy", "--area", "memory",
+                                     "--ruling", "gizmo shared rejected sentence")
         self.assertEqual(rc, 1)
         line, f = self.lookup()
+        shown = list(dict.fromkeys(l.split()[2] for l in out.splitlines() if l.startswith("  rejected on")))
+        self.assertEqual(f["ids"].split("_"), shown[:3], (f, out))
         self.assertEqual(f["outcome"], "flagged")
         self.assertEqual(len(f["ids"].split("_")), 3, f)
         self.assertTrue(all(t.startswith("TOP-95") and len(t) == 8 for t in f["ids"].split("_")), f)
