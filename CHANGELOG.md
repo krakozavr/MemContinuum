@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### A rejected option is refused when it comes back
+
+When you file a link, the command now lists the options the candidate topics
+already rejected (declined links and rejected alternatives that no later link
+restored), with the reason each was rejected. If the new ruling repeats a
+rejected sentence word for word, the command refuses; to reopen a rejection,
+append a link that names it in `reverses` with a reason. The same rule runs at
+commit for links written by hand: an error for new links, a warning for old
+ones. A paraphrase is shown, never refused.
+
+    Technical: one comparator in memlint (`rejection_rows`, `rejection_is_operative`, `readoption_matches`, whitespace normalisation only) used by `_declined_check` in `_finish_write` and by `_added_links_errors` under `--against-ref`; `--show-restored`; one `declined-lookup` line per run in hook.log, never text.
+
 ### File a decision with one command
 
 `record`, `append` and `promote` now write store records for you. `record`
