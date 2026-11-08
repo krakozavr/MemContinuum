@@ -325,7 +325,7 @@ class TestTypeFrozen(GuardCase):
                            "type changed 'topic' -> 'incident'")
 
     # gate round 5 R5-1 / round 6 R6-1: a raw fallback spelling is never compared with a decoded
-    # strict value; the NEW record's decoded type must equal the bare token (no source-line rule)
+    # strict value; the NEW record's decoded type must equal the engine's kind reading (no source-line rule)
     def _fallback_ref(self, type_line, valid=True, rid="TOP-0001"):
         ref = f"---\nid: {rid}\n{type_line}\ntitle: bad: title\n---\n\nBody.\n"
         res = memidx.parse_record_text(ref, "x")

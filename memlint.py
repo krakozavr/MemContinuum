@@ -3181,8 +3181,7 @@ def _type_change_errors(full_path, old_fm: dict, new_fm: dict, fallback: bool = 
     """A topic's `type:` recorded at REF is frozen: it decides which index type
     the record carries, and `for-path` and the standing digest read only
     `type: topic`. A record with no `type` at REF recorded nothing to freeze
-    (the caller also skips a REF side whose `type` only the lenient fallback
-    recovered and that is not a known record type). A new side with no `type`
+    (the caller also skips a fallback REF side whose kind `_record_kind` cannot read). A new side with no `type`
     (a missing key, a null, an empty frontmatter) has removed it: an error,
     `type removed`. The parser turns any non-mapping document into `{}`, so a
     mapping is the only shape that reaches here. Unchanged is the NEW DECODED
