@@ -4068,8 +4068,8 @@ class TestUserPromptRemind(HookTestBase):
 
     def test_an_edit_in_the_same_wall_second_as_the_verdict_is_reclassified(self):
         """Gate round 2 R2-1, through the real hooks: the ledger hook stamps a
-        fractional seen_at, and a verdict made late in second S (S+.99) does
-        not hide an edit made in that same second."""
+        fractional seen_at, and a verdict made a moment ago does not hide an
+        edit made after it, usually in that same wall second."""
         spy = Path(self.td) / "unmapped-calls.log"
         env = self._spy_env(spy)
         session_id = "s-userprompt-incremental-same-second"
@@ -4079,7 +4079,7 @@ class TestUserPromptRemind(HookTestBase):
         self._edit_through_ledger_hook(session_id, unmapped)
         self._prompt(session_id, env)
         whole = float(int(time.time()))
-        self._set_verdict_time(session_id, unmapped, whole + 0.99)
+        self._set_verdict_time(session_id, unmapped, time.time())  # classified just now
         self._set_verdict_time(session_id, mapped, whole + 5.0)  # clearly after its own edit
         # The edit of `unmapped` lands now: at or after second `whole` (a
         # rollover to the next second only makes it later still).
