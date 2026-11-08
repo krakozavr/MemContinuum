@@ -53,7 +53,21 @@ def good_row(**over):
     return row
 
 
-def topic_text(rows=None, code_refs=("src/foo.py",), extra_links="", anchors_text=None):
+def ref_mark_text(ref, action="add", recorded_at="2026-11-03T09:12:41-05:00"):
+    return (
+        "ref_marks:\n"
+        f"  - ref: \"{ref}\"\n"
+        f"    action: {action}\n"
+        f"    date: {recorded_at[:10]}\n"
+        f"    recorded_at: \"{recorded_at}\"\n"
+        "    recorded_by: tester\n"
+        "    authority: agent-inference\n"
+        "    source: \"test\"\n"
+        "    why: \"test\"\n"
+    )
+
+
+def topic_text(rows=None, code_refs=("src/foo.py",), extra_links="", anchors_text=None, marks_text=""):
     refs = "".join(f"  - {r}\n" for r in code_refs)
     refs_block = f"code_refs:\n{refs}" if code_refs else "code_refs: []\n"
     anchors = anchors_text if anchors_text is not None else (anchor_block(rows) if rows else "")
@@ -66,6 +80,7 @@ def topic_text(rows=None, code_refs=("src/foo.py",), extra_links="", anchors_tex
         "current: L1\n"
         "tags: []\n"
         f"{refs_block}"
+        f"{marks_text}"
         f"{anchors}"
         "links:\n"
         f"{extra_links}"
@@ -242,7 +257,8 @@ class TestAnchorFreeze(unittest.TestCase):
             root = self._base(td)
             new_row = good_row(ref="src/bar.py", captured_at="2026-11-03")
             (root / "topics" / "foo.md").write_text(
-                topic_text([good_row(), new_row], code_refs=("src/foo.py", "src/bar.py"))
+                topic_text([good_row(), new_row], code_refs=("src/foo.py", "src/bar.py"),
+                           marks_text=ref_mark_text("src/bar.py"))
             )
             rc, out = run_memlint(["--against-ref", "HEAD", str(root)])
             self.assertEqual(rc, 0, out)
