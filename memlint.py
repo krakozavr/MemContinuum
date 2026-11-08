@@ -3221,6 +3221,19 @@ def _type_change_errors(root, full_path, frozen: str, new_fm: dict) -> list[str]
             f"(append-only; `type` decides what the record is delivered as)"]
 
 
+def _quarantine_errors(full_path, new_result) -> list[str]:
+    """A record the index DELIVERED at REF may not become one the index QUARANTINES: the same
+    shared predicate (`record_is_quarantined`) applied to the NEW parse, so a delivered record
+    cannot leave for-path and the digest by turning schema-invalid. Runs on the index blob in
+    staged mode, which also closes the bypass of the hook's worktree-only schema lint (staging
+    a bad blob while the worktree holds a good one)."""
+    if not record_is_quarantined(new_result):
+        return []
+    diag = new_result.diagnostics[0] if new_result.diagnostics else None
+    first = f"{diag[0]}: {diag[1]}" if diag else "schema-invalid"
+    return [f"{full_path}: record leaves delivery: the new side would be quarantined ({first})"]
+
+
 def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], int, list[str]]:
     """Returns (errors, changed, notes) -- `changed` is the number of
     topic files the diff actually concerned (topic-relevant at REF),
@@ -3324,6 +3337,7 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
                 frozen = _frozen_type(root, full_path, old_result)
                 if frozen is not None:
                     errors.extend(_type_change_errors(root, full_path, frozen, new_result.frontmatter))
+                    errors.extend(_quarantine_errors(full_path, new_result))
 
         if not _is_topic_like(old_result):
             # Re-gate (Grok): a path that was not topic-like at REF (an

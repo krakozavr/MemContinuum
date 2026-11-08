@@ -956,6 +956,48 @@ class TestDeliveredTypeFrozen(GuardCase):
         self.assertClean(ref.replace("metadata: not-a-map\n", "metadata:\n  type: incident\n"))
         self.assertClean(ref.replace("metadata: not-a-map\n", ""))
 
+    # gate round 13 R13-1 (Sol MAJOR): a delivered record may not become quarantined
+    SOL_REF = "---\ntitle: a note\nmetadata: not-a-map\ncode_refs:\n  - src/a.py\n---\n\nBody.\n"
+
+    def test_a_delivered_record_may_not_become_quarantined_by_declaring_a_canonical_type(self):
+        # Sol R13: REF is stored as `topic` (the parser drops the bad `metadata` of a non-canonical note, for-path
+        # sees src/a.py); adding `type: topic` makes NEW canonical-looking, the index quarantines it (for-path 1 -> 0),
+        # yet both inferred types are `topic`. Worktree and staged paths agree (GuardCase.guard runs both)
+        ref = self.SOL_REF
+        self.assertFalse(memidx.record_is_quarantined(memidx.parse_record_text(ref, "x")))
+        self.assertEqual(self._frozen_of(memidx.parse_record_text(ref, "x")), "topic")
+        self.store(ref)
+        new = ref.replace("metadata: not-a-map\n", "type: topic\nmetadata: not-a-map\n")
+        self.assertTrue(memidx.record_is_quarantined(memidx.parse_record_text(new, "x")))
+        out = self.assertRefused(new, "record leaves delivery: the new side would be quarantined (")
+        self.assertNotIn("type changed", out)
+        self.assertIn("metadata must be a mapping", out)
+
+    def test_the_same_edit_that_also_fixes_metadata_is_clean(self):
+        ref = self.SOL_REF
+        self.store(ref)
+        new = ref.replace("metadata: not-a-map\n", "type: topic\n")
+        self.assertFalse(memidx.record_is_quarantined(memidx.parse_record_text(new, "x")))
+        self.assertClean(new)
+
+    def test_a_quarantined_ref_stays_exempt_from_the_new_side_quarantine_rule(self):
+        # entering delivery is free; a still-quarantined NEW of a quarantined REF is no new loss
+        ref = self.SOL_REF.replace("metadata:", "type: topic\nmetadata:", 1)
+        self.assertTrue(memidx.record_is_quarantined(memidx.parse_record_text(ref, "x")))
+        self.store(ref)
+        out = self.assertRefused(ref.replace("Body.", "Body edited."), "metadata must be a mapping")  # the existing invalid-new refusal only
+        self.assertNotIn("record leaves delivery", out)
+        self.assertClean(ref.replace("metadata: not-a-map\n", ""))
+
+    def test_a_type_change_is_reported_before_the_quarantine(self):
+        ref = ttext(["src/a.py"])
+        self.store(ref)
+        out = self.assertRefused(ref.replace("type: topic\n", "type: incident\n", 1), "type changed 'topic' -> 'incident'")
+        self.assertNotIn("record leaves delivery", out)   # NEW is a valid incident
+        both = ref.replace("type: topic\n", "type: incident\nmetadata: not-a-map\n", 1)
+        out = self.assertRefused(both, "type changed 'topic' -> 'incident'", "record leaves delivery")
+        self.assertLess(out.index("type changed"), out.index("record leaves delivery"))
+
     @staticmethod
     def _frozen_of(result):
         root = Path("/store")
