@@ -3330,6 +3330,7 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
         # worktree, staged and (via `path_in_root`) prefixed-root paths alike.
         new_blob = None
         new_result = None
+        frozen = None
         if status != "D":
             new_blob = _git_show(toplevel, f":{relpath}") if staged else _read_worktree(root / path_in_root)
             if new_blob is not None:
@@ -3338,6 +3339,36 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
                 if frozen is not None:
                     errors.extend(_type_change_errors(root, full_path, frozen, new_result.frontmatter))
                     errors.extend(_quarantine_errors(full_path, new_result))
+
+        # R14-1 (gate round 14): the reference audit belongs to the DELIVERED record, not to the
+        # link chain. A record the index delivered at REF with a canonical type (`frozen is not
+        # None`) is on `for-path` through its `code_refs` whether or not it has links, so a typeless
+        # `topics/` note, a `links: []` note or a `TOP-` id with no links gets the same pairing and
+        # `ref_marks` freeze as a topic, BEFORE the topic-like exit below. A topic-like REF reaches
+        # the identical call further down (after its link-history checks), so this runs only for the
+        # records that exit early. The REF side must have parsed strictly: a fallback parse does not
+        # recover `code_refs`, so its old membership is unknown (the repair branch's rule). The NEW side
+        # may be a fallback parse: it drops `code_refs` and `ref_marks`, which is then a removal that no
+        # row can pair. The link-history and standing checks keep their topic-like gate (a record
+        # without links has no chain); the anchor FREEZE also runs here for such a record that carries
+        # anchor rows, on the same condition, since it needs no link history either.
+        if (frozen is not None and status == "M" and new_result is not None and old_result.valid
+                and not _is_topic_like(old_result)):
+            try:
+                ref_old_text = old_blob.decode("utf-8")
+            except UnicodeDecodeError:
+                ref_old_text = None
+            try:
+                ref_new_text = new_blob.decode("utf-8")
+            except UnicodeDecodeError:
+                ref_new_text = None
+            errors.extend(_standing_guard_errors(
+                full_path, old_result.frontmatter, ref_old_text, new_result.frontmatter, ref_new_text,
+                _REF_AUDIT))
+            # ... and the anchor rows recorded at REF stay frozen on such a record too
+            errors.extend(_anchor_freeze_errors(
+                full_path, ref_old_text, anchor_rows(old_result.frontmatter),
+                ref_new_text, new_result.frontmatter, notes))
 
         if not _is_topic_like(old_result):
             # Re-gate (Grok): a path that was not topic-like at REF (an

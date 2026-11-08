@@ -1040,6 +1040,129 @@ class TestDeliveredTypeFrozen(GuardCase):
 # one block-item deletion shared by unbind and mark-standing
 # ---------------------------------------------------------------------------
 
+class TestReferenceAuditCoversEveryDeliveredRecord(GuardCase):
+    """gate round 14 R14-1 (Sol MAJOR, Grok MAJOR 1): the `code_refs` pairing and the `ref_marks`
+    freeze run for every record the index DELIVERED at REF with a canonical type, not only for
+    topic-like ones. A typeless `topics/` note, a `links: []` note and a `TOP-` id with no links are
+    on `for-path` through `code_refs` (stored type `topic`) but have no link chain to freeze."""
+    NOTE = "---\ntitle: a note\ncode_refs:\n  - src/a.py\n---\n\nBody.\n"
+    EMPTY_LINKS = "---\ntitle: a note\nlinks: []\ncode_refs:\n  - src/a.py\n---\n\nBody.\n"
+    TOP_NO_LINKS = "---\nid: TOP-9200\ntitle: a note\ncode_refs:\n  - src/a.py\n---\n\nBody.\n"
+
+    def _delivered_as_topic_without_a_chain(self, text):
+        res = memidx.parse_record_text(text, "x")
+        self.assertTrue(res.valid and not res.fallback, res)
+        self.assertFalse(memlint._is_topic_like(res), "fixture must be a record the link gate skips")
+        self.assertEqual(memlint._frozen_type(Path("/s"), Path("/s/topics/foo.md"), res), "topic")
+
+    def test_the_fixtures_are_delivered_topics_that_the_link_gate_skips(self):
+        for text in (self.NOTE, self.EMPTY_LINKS, self.TOP_NO_LINKS):
+            self._delivered_as_topic_without_a_chain(text)
+
+    def test_clearing_code_refs_of_a_typeless_note_without_a_row_is_refused(self):
+        self.store(self.NOTE)
+        self.assertRefused(self.NOTE.replace("code_refs:\n  - src/a.py\n", "code_refs: []\n"),
+                           "code_refs changed for src/a.py (remove) with no matching ref_marks row")
+
+    def test_dropping_the_code_refs_key_is_refused(self):
+        self.store(self.NOTE)
+        self.assertRefused(self.NOTE.replace("code_refs:\n  - src/a.py\n", ""),
+                           "code_refs changed for src/a.py (remove)")
+
+    def test_clearing_code_refs_with_a_remove_row_is_clean(self):
+        self.store(self.NOTE)
+        self.assertClean("---\ntitle: a note\ncode_refs: []\nref_marks:\n" + rmark("src/a.py", "remove")
+                         + "---\n\nBody.\n")
+
+    def test_replacing_the_frontmatter_with_an_empty_mapping_is_refused(self):
+        self.store(self.NOTE)
+        self.assertRefused("---\n{}\n---\n\nBody.\n", "code_refs changed for src/a.py (remove)")
+
+    def test_gaining_a_ref_with_an_add_row_is_clean_and_without_one_refused(self):
+        self.store(self.NOTE)
+        grown = self.NOTE.replace("  - src/a.py\n", "  - src/a.py\n  - src/b.py\n")
+        self.assertRefused(grown, "code_refs changed for src/b.py (add) with no matching ref_marks row")
+        self.assertClean(grown.replace("---\n\nBody.", "ref_marks:\n" + rmark("src/b.py") + "---\n\nBody."))
+
+    def test_retargeting_a_ref_needs_a_remove_and_an_add_row(self):
+        # Grok variant: src/a.py -> src/z.py
+        self.store(self.NOTE)
+        moved = self.NOTE.replace("src/a.py", "src/z.py")
+        self.assertRefused(moved, "src/a.py (remove)", "src/z.py (add)")
+        self.assertClean(moved.replace("---\n\nBody.", "ref_marks:\n" + rmark("src/z.py", "add", LATER)
+                                       + rmark("src/a.py", "remove") + "---\n\nBody."))
+
+    def test_a_links_empty_list_note_is_audited(self):
+        self.store(self.EMPTY_LINKS)
+        self.assertRefused(self.EMPTY_LINKS.replace("code_refs:\n  - src/a.py\n", "code_refs: []\n"),
+                           "code_refs changed for src/a.py (remove)")
+        self.assertRefused(self.EMPTY_LINKS.replace("src/a.py", "src/z.py"), "src/a.py (remove)")
+
+    def test_a_top_id_without_links_is_audited(self):
+        self.store(self.TOP_NO_LINKS)
+        self.assertRefused(self.TOP_NO_LINKS.replace("code_refs:\n  - src/a.py\n", "code_refs: []\n"),
+                           "code_refs changed for src/a.py (remove)")
+        self.assertRefused("---\n{}\n---\n\nBody.\n", "code_refs changed for src/a.py (remove)")
+        self.assertRefused(self.TOP_NO_LINKS.replace("src/a.py", "src/z.py"), "src/a.py (remove)")
+
+    def test_a_row_frozen_at_ref_cannot_be_edited_on_a_note_without_links(self):
+        ref = ("---\ntitle: a note\ncode_refs:\n  - src/a.py\nref_marks:\n" + rmark("src/a.py")
+               + "---\n\nBody.\n")
+        self.store(ref)
+        self.assertClean(ref)
+        self.assertRefused(ref.replace('why: "because"', 'why: "rewritten"'), "reference mark")
+
+    def test_a_note_edited_to_a_fallback_parse_cannot_drop_its_refs_silently(self):
+        # the NEW side's lenient parse does not recover `code_refs`: a removal no row can pair
+        self.store(self.NOTE)
+        self.assertRefused(self.NOTE.replace("title: a note", "title: bad: title"), "code_refs changed for src/a.py (remove)")
+
+    def test_a_body_only_edit_of_a_note_is_clean(self):
+        self.store(self.NOTE)
+        self.assertClean(self.NOTE.replace("Body.", "Body edited."))
+
+    def test_the_same_audit_runs_on_a_prefixed_store_root_when_staged(self):
+        # the store lives in `mem/` of a larger repository: the staged blob is read by its path in the repo
+        repo = self.tmp / "prefixed"
+        repo.mkdir()
+        git(["init", "-q", str(repo)], repo)
+        git(["config", "user.email", "t@example.com"], repo)
+        git(["config", "user.name", "T"], repo)
+        root = repo / "mem"
+        (root / "topics").mkdir(parents=True)
+        (root / "topics" / "foo.md").write_text(self.NOTE)
+        commit_all(repo)
+        (root / "topics" / "foo.md").write_text(self.NOTE.replace("code_refs:\n  - src/a.py\n", "code_refs: []\n"))
+        rc_wt, out_wt = run_memlint(["--against-ref", "HEAD", str(root)])
+        git(["add", "-A"], repo)
+        rc_st, out_st = run_memlint(["--against-ref", "HEAD", "--staged", str(root)])
+        self.assertEqual((rc_wt, rc_st), (1, 1), f"{out_wt}\n{out_st}")
+        self.assertIn("code_refs changed for src/a.py (remove)", out_wt)
+        self.assertIn("code_refs changed for src/a.py (remove)", out_st)
+        git(["reset", "-q"], repo)
+        (root / "topics" / "foo.md").write_text(
+            "---\ntitle: a note\ncode_refs: []\nref_marks:\n" + rmark("src/a.py", "remove") + "---\n\nBody.\n")
+        git(["add", "-A"], repo)
+        rc_ok, out_ok = run_memlint(["--against-ref", "HEAD", "--staged", str(root)])
+        self.assertEqual(rc_ok, 0, out_ok)
+
+    def test_a_topic_like_record_keeps_its_link_checks_and_gets_the_reference_audit_once(self):
+        ref = ttext(["src/a.py"])
+        self.store(ref)
+        out = self.assertRefused(ttext([]), "code_refs changed for src/a.py (remove)")
+        self.assertEqual(out.count("code_refs changed for src/a.py (remove)"), 1, out)
+
+    def test_anchor_rows_of_a_note_without_links_stay_frozen(self):
+        # gate round 14 R14-1: the anchor freeze runs in the early delivered-record block for a record the
+        # link gate skips; a topic-like record keeps running it on the link path (so each once)
+        a = anchor_block([good_row(ref="src/a.py")])
+        ref = "---\ntitle: a note\ncode_refs:\n  - src/a.py\n" + a + "---\n\nBody.\n"
+        self.store(ref)
+        self.assertClean(ref)
+        self.assertRefused(ref.replace("sha256", "sha1"), "anchor")
+        self.assertRefused(ref.replace(a, ""), "anchor")
+
+
 class TestSharedBlockItemDelete(unittest.TestCase):
     def test_the_helper_deletes_the_first_match_and_ignores_comments_and_quotes(self):
         lines = ["code_refs:\n", '  - "src/a.py"  # why\n', "  - src/b.py\n", "  - src/a.py\n", "x: 1\n"]
