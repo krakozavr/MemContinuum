@@ -3159,44 +3159,52 @@ def _standing_guard_errors(full_path, old_fm: dict, old_text, new_fm: dict, new_
     return errors
 
 
-def _frozen_type_frontmatter(result) -> tuple[dict, bool] | None:
-    """(the frontmatter of a REF-side parse with its `type:` made comparable, whether
-    the parse was the lenient fallback), or None when the record has no trustworthy
-    type to freeze. A strict parse is trusted as it stands, valid or not. A
-    lenient-fallback parse recovers `type` as raw text, so the engine's OWN kind
-    reading is frozen instead: `_record_kind(fm)` (an explicit canonical `type`, else
-    the id prefix), else `topic` when the fallback scan saw a top-level `links:` key
-    (`result.top_level_keys`: the fallback dict never carries `links`). No recoverable
-    kind -> None (exempt)."""
+def _frozen_type_frontmatter(result) -> tuple[dict, bool, bool] | None:
+    """(the frontmatter of a REF-side parse with its `type:` made comparable, whether the
+    parse was the lenient fallback, whether the REF declared a type itself), or None when
+    the record has no kind to freeze. The unified rule: the frozen value is (a) the
+    explicit `type` -- a strict parse: the parsed value, trusted valid or not; a lenient
+    fallback: the engine's kind `_record_kind(fm)` (the fallback recovers `type` as raw
+    text), else (b) the record's KIND from `_record_kind(fm)` (id prefix, then a `links`
+    list; for a fallback parse `links` presence comes from `result.top_level_keys`, the
+    fallback dict never carries it). A strict typeless record with a kind therefore
+    freezes that kind too (explicit False: it may stay typeless or declare exactly the
+    kind). No recoverable kind -> None (exempt)."""
     fm = result.frontmatter
     if not isinstance(fm, dict):
         return None
     if not result.fallback:
-        return fm, False
+        if fm.get("type") is not None:
+            return fm, False, True
+        kind = _record_kind(fm)
+        return (dict(fm, type=kind), False, False) if kind is not None else None
     kind = _record_kind(fm)
     if kind is None and "links" in result.top_level_keys:
         kind = "topic"
     if kind is None:
         return None
-    return dict(fm, type=kind), True
+    return dict(fm, type=kind), True, True
 
 
-def _type_change_errors(full_path, old_fm: dict, new_fm: dict, fallback: bool = False) -> list[str]:
-    """A topic's `type:` recorded at REF is frozen: it decides which index type
-    the record carries, and `for-path` and the standing digest read only
-    `type: topic`. A record with no `type` at REF recorded nothing to freeze
-    (the caller also skips a fallback REF side whose kind `_record_kind` cannot read). A new side with no `type`
-    (a missing key, a null, an empty frontmatter) has removed it: an error,
-    `type removed`. The parser turns any non-mapping document into `{}`, so a
-    mapping is the only shape that reaches here. Unchanged is the NEW DECODED
-    type equal to `old_fm["type"]` as a string: for a strict REF the parsed
-    value, for a fallback REF (`fallback` True) the kind `_record_kind` reads from
-    it, so the repaired record must declare that kind itself. No other NEW-side normalisation."""
+def _type_change_errors(full_path, old_fm: dict, new_fm: dict, fallback: bool = False,
+                        explicit: bool = True) -> list[str]:
+    """A record's frozen `type` decides which index type it carries, and `for-path` and the
+    standing digest read only `type: topic`. `old_fm["type"]` is the frozen value (see
+    `_frozen_type_frontmatter`; None -> nothing to freeze). When the REF declared the type
+    (`explicit`), a new side with no `type` (a missing key, a null, an empty frontmatter)
+    has removed it: an error, `type removed`. When the REF declared none and the value is
+    only its kind (`explicit` False), the new side may stay typeless; any DECLARED type
+    must still equal the kind. Unchanged is the NEW DECODED type equal to the frozen value
+    as a string: for a strict REF the parsed value, for a fallback REF (`fallback` True)
+    the kind `_record_kind` reads, so the repaired record must declare that kind itself. No
+    other NEW-side normalisation."""
     old_type = old_fm.get("type")
     if old_type is None:
         return []
     new_type = new_fm.get("type")
     if new_type is None:
+        if not explicit:
+            return []
         return [f"{full_path}: type removed (frozen {old_type!r}): type changed {old_type!r} -> None "
                 "after being recorded (append-only; `type` decides what the record is delivered as)"]
     if str(new_type) == str(old_type):
@@ -3295,7 +3303,8 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
         # an incident, a concept, ...); judged first, before the classification exit below and
         # before any branch that can `continue` past it (a repair, an invalid new side). A REF
         # side that parsed strictly keeps its `type` frozen whether or not the record was
-        # schema-valid; a fallback-parsed one freezes the kind `_record_kind` reads from it
+        # schema-valid (a strict one with no `type` freezes its kind: id prefix, else links);
+        # a fallback-parsed one freezes the kind `_record_kind` reads from it
         # (explicit canonical type, else id prefix, else links), exempt when it reads None. The
         # NEW record's DECODED type must equal that kind; a strict REF compares
         # `str(new) == str(old)`. The NEW side is never normalised.
@@ -3308,7 +3317,7 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
                 frozen = _frozen_type_frontmatter(old_result)
                 if frozen is not None:
                     errors.extend(_type_change_errors(
-                        full_path, frozen[0], new_result.frontmatter, frozen[1]))
+                        full_path, frozen[0], new_result.frontmatter, frozen[1], frozen[2]))
 
         if not _is_topic_like(old_result):
             # Re-gate (Grok): a path that was not topic-like at REF (an

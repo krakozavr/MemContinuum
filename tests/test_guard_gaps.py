@@ -429,6 +429,51 @@ class TestTypeFrozen(GuardCase):
         fixed = self.MEMO_REF.replace("title: bad: title", 'title: "bad: title"')
         self.assertClean(fixed.replace("type: memo", "type: investigation"))
 
+    # gate round 10 R10-1 (Sol MAJOR): a STRICT REF with no `type:` is not exempt -- its kind is frozen too
+    def _typeless(self, text=None):
+        text = text or ttext(["src/a.py"])
+        out = text.replace("type: topic\n", "", 1)
+        self.assertNotEqual(out, text)
+        res = memidx.parse_record_text(out, "x")
+        self.assertFalse(res.fallback, res)
+        self.assertIsNone(res.frontmatter.get("type"))
+        return out
+
+    def test_a_strict_typeless_topic_may_not_gain_type_incident(self):
+        ref = self._typeless()
+        self.store(ref)
+        self.assertRefused(ref.replace("title:", "type: incident\ntitle:", 1), "type changed 'topic' -> 'incident'")
+
+    def test_a_strict_typeless_topic_may_gain_type_topic(self):
+        ref = self._typeless()
+        self.store(ref)
+        self.assertClean(ref.replace("title:", "type: topic\ntitle:", 1))
+
+    def test_a_strict_typeless_topic_may_stay_typeless(self):
+        ref = self._typeless()
+        self.store(ref)
+        self.assertClean(ref)
+
+    def test_a_strict_typeless_record_with_no_id_and_no_links_is_free(self):
+        ref = "---\ntitle: a note\n---\n\nBody.\n"
+        self.assertFalse(memidx.parse_record_text(ref, "x").fallback)
+        self.assertIsNone(memlint._frozen_type_frontmatter(memidx.parse_record_text(ref, "x")))
+        self.store(ref)
+        self.assertClean(ref.replace("title:", "type: incident\ntitle:", 1))
+
+    def test_the_unified_rule_table(self):
+        strict_typed = memidx.parse_record_text(ttext(["src/a.py"]), "x")
+        self.assertEqual(memlint._frozen_type_frontmatter(strict_typed)[0]["type"], "topic")
+        self.assertEqual(memlint._frozen_type_frontmatter(strict_typed)[1:], (False, True))
+        strict_typeless = memidx.parse_record_text(self._typeless(), "x")
+        self.assertEqual(memlint._frozen_type_frontmatter(strict_typeless)[0]["type"], "topic")
+        self.assertEqual(memlint._frozen_type_frontmatter(strict_typeless)[1:], (False, False))
+        fb_typed = memidx.parse_record_text(self._bad_title(ttext(["src/a.py"])), "x")
+        self.assertEqual(memlint._frozen_type_frontmatter(fb_typed)[1:], (True, True))
+        fb_kind = memidx.parse_record_text(self.LINKS_REF, "x")
+        self.assertEqual(memlint._frozen_type_frontmatter(fb_kind)[0]["type"], "topic")
+        self.assertIsNone(memlint._frozen_type_frontmatter(memidx.parse_record_text(self.MEMO_REF, "x")))
+
     # gate round 10 R10-2 (Sol MAJOR, Grok MINOR): the fallback key scan used for `top_level_keys` sees quoted
     # and indented keys; it over-includes (a `links:` in a scalar, a nested one) -- the ruled fail-closed direction
     LINKS_BLOCK = "  - link: L1\n    date: 2026-01-01\n    decision: x\n"
@@ -592,11 +637,14 @@ class TestTypeFrozen(GuardCase):
         self.assertEqual(rc, 0, out)
 
     def test_a_non_topic_record_is_not_guarded(self):
-        # adjusted in gate round 3 R3-3: a REF record that recorded NO `type` has nothing frozen
-        # (a recorded non-topic type is now frozen too, see the R3-3 tests below)
+        # amended in gate round 10 R10-1: a strict REF with no `type` is no longer exempt when it has a
+        # kind (here the INC- id); it may stay typeless or declare `incident`, nothing else
         note = "---\nid: INC-9001\ntitle: x\n---\n\nBody.\n"
         self.store(note)
-        self.assertClean(note.replace("id: INC-9001\n", "id: INC-9001\ntype: investigation\n"))
+        self.assertRefused(note.replace("id: INC-9001\n", "id: INC-9001\ntype: investigation\n"),
+                           "type changed 'incident' -> 'investigation'")
+        self.assertClean(note.replace("id: INC-9001\n", "id: INC-9001\ntype: incident\n"))
+        self.assertClean(note)
 
     def _non_topic_ref(self, kind):
         base = ttext(["src/a.py"]).replace("type: topic\n", f"type: {kind}\n", 1)

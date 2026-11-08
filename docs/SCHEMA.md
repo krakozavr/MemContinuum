@@ -438,7 +438,7 @@ pre-commit hook reads):
 - *`type` is frozen.* A `type:` recorded at `REF` may not change or be dropped, on every record that
   existed at `REF` with a recorded type, topic or not (an incident or concept included):
   `type changed 'topic' -> 'investigation' after being recorded`. A file added after `REF` is free, and
-  so is a record with no recoverable kind at `REF` (a strict `REF` with no `type`, or a malformed one as below). A strict `REF` needs the same parsed `type`. A `REF` side
+  so is a record with no recoverable kind at `REF` (no `type`, no `TOP-`/`INC-`/`INV-`/`CON-` id and no `links:` list, strict or malformed). A strict `REF` needs the same parsed `type`; a strict `REF` with no `type:` freezes its KIND (id prefix, else a `links:` list as `topic`): it may stay typeless or declare exactly that kind, and any other declared type is `type changed '<kind>' -> '<new>'`. A `REF` side
   that parsed only through the lenient fallback freezes the engine's own kind reading of it (an explicit
   canonical `type:`, else the id prefix `TOP-`/`INC-`/`INV-`/`CON-`, else a top-level `links:` key as `topic`): the
   repaired record must declare exactly that kind (`type: topic`), so an odd spelling (`"topic # x"`) is
