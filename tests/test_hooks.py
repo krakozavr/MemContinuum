@@ -4466,11 +4466,13 @@ class TestPostCommitRelintAndBackup(unittest.TestCase):
         self._assert_flagged(proc, ["schema", "both"])
 
     def test_next_clean_commit_clears_the_marker(self):
-        (self.store / "topics" / "nofence.md").write_text("just prose, no frontmatter\n")
-        _git(["add", "topics/nofence.md"], cwd=self.store)
+        # A quarantined record (fence opened, YAML broken): the lint still errors, but the guard
+        # exempts it from the deletion rule, unlike a prose file that the index delivers as a topic.
+        (self.store / "topics" / "brokenyaml.md").write_text("---\nid: [unclosed\ntype: incident\n---\nprose\n")
+        _git(["add", "topics/brokenyaml.md"], cwd=self.store)
         self._commit("unfenced", no_verify=True)
         self.assertTrue(self._marker().exists())
-        _git(["rm", "-q", "-f", "topics/nofence.md"], cwd=self.store)
+        _git(["rm", "-q", "-f", "topics/brokenyaml.md"], cwd=self.store)
         proc = self._commit("fix: remove the unfenced record")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("relint=ok", self._last_postcommit_line())
@@ -4501,8 +4503,10 @@ class TestPostCommitRelintAndBackup(unittest.TestCase):
         self.assertFalse(self._marker().exists())
 
     def _plant_marker(self):
-        (self.store / "topics" / "nofence.md").write_text("just prose, no frontmatter\n")
-        _git(["add", "topics/nofence.md"], cwd=self.store)
+        # A quarantined record (fence opened, YAML broken): the lint still errors, but the guard
+        # exempts it from the deletion rule, unlike a prose file that the index delivers as a topic.
+        (self.store / "topics" / "brokenyaml.md").write_text("---\nid: [unclosed\ntype: incident\n---\nprose\n")
+        _git(["add", "topics/brokenyaml.md"], cwd=self.store)
         self._commit("unfenced", no_verify=True)
         self.assertTrue(self._marker().exists())
 
@@ -4532,7 +4536,7 @@ class TestPostCommitRelintAndBackup(unittest.TestCase):
         self.assertEqual(lines[0], f"root={self.store.resolve()}")
         foreign = "root=/some/other/store\n" + "".join(l + "\n" for l in lines[1:])
         self._marker().write_text(foreign)
-        _git(["rm", "-q", "-f", "topics/nofence.md"], cwd=self.store)
+        _git(["rm", "-q", "-f", "topics/brokenyaml.md"], cwd=self.store)
         proc = self._commit("fix")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("relint=ok marker=foreign", self._last_postcommit_line())
@@ -4742,7 +4746,7 @@ class TestPostCommitRelintAndBackup(unittest.TestCase):
         self.assertIn("would have been refused", proc.stderr)
         self.assertRegex(self._last_postcommit_line(), r"relint=failed:\w[\w-]* marker=foreign")
         self.assertEqual(self._marker().read_text(), foreign)
-        _git(["rm", "-q", "-f", "topics/nofence.md", "topics/nofence2.md"], cwd=self.store)
+        _git(["rm", "-q", "-f", "topics/brokenyaml.md", "topics/nofence2.md"], cwd=self.store)
         self._commit("fix")
         self.assertEqual(self._marker().read_text(), foreign)
 

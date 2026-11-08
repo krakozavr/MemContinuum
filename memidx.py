@@ -362,7 +362,7 @@ FALLBACK_COMPLEX_FIELDS = {
     "links", "code_refs", "tags", "edges", "assumptions", "invariant",
     "metadata", "ruling", "rationale", "alternatives", "evidence",
     "implemented_by", "tested_by", "governed_by", "involved_in", "anchors",
-    "standing_marks",
+    "standing_marks", "ref_marks",
 }
 
 
@@ -389,6 +389,13 @@ class ParseResult:
             f"ParseResult(frontmatter={self.frontmatter!r}, diagnostics={self.diagnostics!r}, "
             f"valid={self.valid!r}, fallback={self.fallback!r})"
         )
+
+
+def record_is_quarantined(result: "ParseResult") -> bool:
+    """The reindex quarantine predicate: a parsed record the index skips (no row, no type, no
+    for-path or digest membership) because it is canonical-looking yet unusable. `cmd_reindex`
+    and memlint's type freeze both ask this one question."""
+    return not result.valid
 
 
 def is_canonical_frontmatter(fm: dict) -> bool:
@@ -504,7 +511,7 @@ def validate_record_shape(fm: dict) -> list:
     if not _shape_ok_mapping(fm.get("metadata")):
         diagnostics.append(("metadata", "metadata must be a mapping"))
 
-    for key in ("anchors", "standing_marks"):
+    for key in ("anchors", "standing_marks", "ref_marks"):
         rows = fm.get(key)
         if rows and (not isinstance(rows, list) or any(not isinstance(a, dict) for a in rows)):
             diagnostics.append((key, f"{key} must be a list of mappings"))
@@ -2050,7 +2057,7 @@ def cmd_reindex(args) -> int:
             unchanged += 1
             continue
         result = parse_record(f)
-        if not result.valid:
+        if record_is_quarantined(result):
             quarantined.append((path_str, sha, stat.st_mtime, stat.st_size, result.diagnostics))
             continue
         fm, body = result.frontmatter, result.body
@@ -6584,15 +6591,59 @@ def standing_mark_rows(fm: dict) -> list:
     return _mapping_rows(fm, "standing_marks")
 
 
-def standing_mark_ident(row) -> tuple | None:
-    """Identity of a mark row: `(link, action, recorded_at)` as strings, None
-    when any part is missing or not a scalar."""
+def _mark_row_ident(row, id_field: str) -> tuple | None:
+    """Identity of an audit row: `(<id_field>, action, recorded_at)` as strings,
+    None when any part is missing or not a scalar. The one definition behind
+    `standing_marks:` (id field `link`) and `ref_marks:` (id field `ref`)."""
     if not isinstance(row, dict):
         return None
-    parts = [row.get(k) for k in ("link", "action", "recorded_at")]
+    parts = [row.get(k) for k in (id_field, "action", "recorded_at")]
     if any(p is None or isinstance(p, (dict, list)) or str(p).strip() == "" for p in parts):
         return None
     return tuple(str(p) for p in parts)
+
+
+def standing_mark_ident(row) -> tuple | None:
+    """Identity of a mark row: `(link, action, recorded_at)` as strings, None
+    when any part is missing or not a scalar."""
+    return _mark_row_ident(row, "link")
+
+
+# `ref_marks:` -- the frozen audit of `code_refs:` membership changes, on the
+# same topic, shaped like `standing_marks:` with `ref` for `link`. Written by
+# `bind` / `unbind`; read by memlint (plain rules, the `anchors:` rule, and the
+# --against-ref guard). Never delivered, never indexed.
+REF_MARK_FIELDS = ("ref", "action", "date", "recorded_at", "recorded_by", "authority",
+                   "source", "why")
+REF_MARK_QUOTED_FIELDS = frozenset({"ref", "recorded_at", "source", "why"})
+REF_MARK_ACTIONS = STANDING_MARK_ACTIONS
+
+
+def ref_mark_rows(fm: dict) -> list:
+    """The well-formed (mapping) rows of a topic's `ref_marks:` list, newest first."""
+    return _mapping_rows(fm, "ref_marks")
+
+
+def ref_mark_ident(row) -> tuple | None:
+    """Identity of a reference-mark row: `(ref, action, recorded_at)`."""
+    return _mark_row_ident(row, "ref")
+
+
+def ref_latest_action(fm: dict, ref: str) -> str | None:
+    """The action of the NEWEST `ref_marks:` row for `ref` (rows are written
+    newest first, so the first match in file order), None when there is none.
+    Rows are append-only: an old `remove` stays after a later `add`, so "was
+    ever removed" is the wrong question -- this is the right one."""
+    for row in ref_mark_rows(fm):
+        if str(row.get("ref")) == ref:
+            return str(row.get("action"))
+    return None
+
+
+def code_ref_set(fm: dict) -> set:
+    """A topic's `code_refs:` as a set of strings (membership is order-free)."""
+    value = fm.get("code_refs")
+    return {str(x) for x in value} if isinstance(value, list) else set()
 
 
 def standing_ids(fm: dict) -> list:
@@ -12305,6 +12356,67 @@ def insert_code_ref(text: str, ref: str) -> str:
     return "".join(lines)
 
 
+def _block_item_scalar(item_text: str) -> str:
+    """The scalar of one block item's text (what follows `- `): a quoted scalar
+    is read up to its closing quote, so a ` #` inside the quotes is part of the
+    value and a comment is only what follows the closing quote; a plain scalar
+    loses a trailing ` #...` comment."""
+    t = item_text.strip()
+    if t[:1] in ("'", '"'):
+        q, i = t[0], 1
+        while i < len(t):
+            if q == '"' and t[i] == "\\":
+                i += 2
+                continue
+            if t[i] == q:
+                if q == "'" and t[i + 1:i + 2] == "'":
+                    i += 2
+                    continue
+                return _scalar_token(t[:i + 1])
+            i += 1
+    return _scalar_token(re.sub(r"\s+#.*$", "", t))
+
+
+def _delete_block_item(lines: list, key_idx: int, last: int, key: str, value: str, nl: str) -> bool:
+    """Delete, in place, the FIRST block item (`- value`; a trailing comment
+    after the value or its closing quote, and the quotes, are ignored) of the
+    `key:` block spanning `key_idx`..`last` whose scalar equals `value`; deleting the only item leaves `key: []`. Every other line is
+    kept. False (nothing changed) when no item matches. The one deletion
+    algorithm of `remove_code_ref` and `edit_standing_line`."""
+    items = [i for i in range(key_idx + 1, last + 1) if lines[i].lstrip().startswith("- ")]
+    drop = [i for i in items
+            if _block_item_scalar(lines[i].strip()[2:]) == value]
+    if not drop:
+        return False
+    del lines[drop[0]]
+    if len(items) == 1:
+        lines[key_idx] = f"{key}: []{nl}"
+    return True
+
+
+def remove_code_ref(text: str, ref: str) -> str:
+    """`text` with the one `code_refs:` block item equal to `ref` deleted (the
+    sibling of `insert_code_ref`, as `edit_standing_line` deletes a block item):
+    removing the last item leaves `code_refs: []`; every other byte is kept. A
+    non-empty flow list is refused. ValueError when `ref` is not an item."""
+    nl = _newline_of(text)
+    lines = _split_lines_keep(text)
+    first, end = _fm_line_bounds(lines)
+    if end == 0:
+        raise ValueError("no frontmatter block")
+    idx = _top_key_index(lines, first, end, "code_refs")
+    if idx is None:
+        raise ValueError("no `code_refs:` key")
+    rest = lines[idx].rstrip("\r\n").split(":", 1)[1].strip()
+    if rest not in ("", "null", "~"):
+        raise ValueError("`code_refs:` is a flow list; refusing to edit it" if rest != "[]"
+                         else "`code_refs:` is empty")
+    last = _block_last_line(lines, idx, end)
+    if not _delete_block_item(lines, idx, last, "code_refs", ref, nl):
+        raise ValueError(f"{ref!r} is not an item of `code_refs:`")
+    return "".join(lines)
+
+
 def _unified_diff(old: str, new: str, label: str) -> str:
     import difflib
     return "".join(difflib.unified_diff(
@@ -12428,32 +12540,150 @@ def edit_roundtrip_problem(new_text: str, path, check) -> str | None:
     return check(parsed.frontmatter)
 
 
-def bound_edit_problem(new_text: str, path, ref: str, link_id: str, expect_refs: list) -> str | None:
+def audit_row_problem(fm: dict, key: str, ident_of, fields, row: dict, old_rows: list) -> str | None:
+    """Why a freshly prepended audit row (`standing_marks:` / `ref_marks:`) did
+    not round-trip, else None: it must be first, once, YAML must read every
+    field back as the string written (`True`, `123`, `2026-11-03` would be
+    retyped; only `date` is a date, equal to recorded_at's) and the earlier rows
+    must be unchanged. The one check behind `mark-standing`, `bind` and `unbind`."""
+    rows = _mapping_rows(fm, key)
+    ident = ident_of(row)
+    if not rows or ident_of(rows[0]) != ident or sum(1 for r in rows if ident_of(r) == ident) != 1:
+        return "the edit would not put the new row first, once"
+    for k in fields:
+        got = rows[0].get(k)
+        if k == "date":
+            if not (isinstance(got, _date) and not isinstance(got, datetime)
+                    and got.isoformat() == row["recorded_at"][:10]):
+                return "the edit would not round-trip the new row's date as written"
+        elif not (isinstance(got, str) and got == row[k]):
+            return "the edit would not round-trip the new row's fields as written"
+    if rows[1:] != old_rows:
+        return "the edit would not leave the earlier rows unchanged"
+    return None
+
+
+def bound_edit_problem(new_text: str, path, ref: str, link_id: str, expect_refs: list,
+                       mark_row: dict | None = None, old_marks: list | None = None) -> str | None:
     """`edit_roundtrip_problem` for `bind`: the `code_refs` must be exactly
     `expect_refs` (so the inserted ref parses back to the string that was
-    bound) and the anchor row for `(ref, link_id)` must carry that same ref."""
+    bound), the anchor row for `(ref, link_id)` must be exactly one (a restore adds
+    none) and carry that same ref, and a `mark_row` (the
+    `ref_marks:` row of an inserted ref) must round-trip."""
     def check(fm: dict) -> str | None:
         if list(fm.get("code_refs") or []) != list(expect_refs):
             return f"the edit would not round-trip the reference {ref!r} as a string"
         rows = [r for r in anchor_rows(fm) if anchor_row_key(r) == (ref, link_id)]
-        if len(rows) != 1 or rows[0].get("ref") != ref:
+        if len(rows) != 1 or any(r.get("ref") != ref for r in rows):
             return f"the edit would not round-trip the anchor row for {ref!r}"
+        if mark_row is not None:
+            return audit_row_problem(fm, "ref_marks", ref_mark_ident, REF_MARK_FIELDS,
+                                     mark_row, old_marks or [])
         return None
     return edit_roundtrip_problem(new_text, path, check)
 
 
+def new_audit_row(id_field: str, member: str, action: str, authority: str, source: str,
+                  why: str, recorded_by) -> dict:
+    """One audit row (`standing_marks:` with id field `link`, `ref_marks:` with
+    `ref`) stamped now: `date` is the date part of `recorded_at` as written."""
+    recorded_at = _now().isoformat(timespec="seconds")
+    return {
+        id_field: member,
+        "action": action,
+        "date": recorded_at[:10],
+        "recorded_at": recorded_at,
+        "recorded_by": recorded_by or os.environ.get("MEMCONTINUUM_RECORDED_BY") or "memidx",
+        "authority": authority,
+        "source": source,
+        "why": why,
+    }
+
+
+def _audit_text_problem(args) -> str | None:
+    """Why `--why` / `--source` cannot go into a row (empty or more than one
+    line), else None."""
+    for name, value in (("--why", getattr(args, "why", None)), ("--source", getattr(args, "source", None))):
+        if value is None:
+            continue
+        if not value.strip():
+            return f"{name} must not be empty"
+        parts = value.splitlines()
+        if len(parts) != 1 or parts[0] != value:
+            return f"{name} must be a single line (no leading or trailing line break)"
+    return None
+
+
+def derive_mark_tier(args, code_roots: list, description: str) -> dict | None:
+    """The adapter over `derive_owner_tier` for an audit row. `derive_owner_tier`
+    was written for a ruling and defaults a missing quote / shown text to
+    `args.ruling`; a row has no ruling, so here a verbatim derivation REQUIRES an
+    explicit `--quote`, a ratified one passes `description` (the operation, for
+    example `mark-standing TOP-1 L3 --add`) as the shown text, and the quote text
+    never reaches the row (the caller stores `source` only, TOP-0133 L2). None
+    when no derivation input was given."""
+    owner_uuid, yes_uuid = args.owner_message, args.yes_message
+    if not owner_uuid and not yes_uuid:
+        if args.quote is not None or args.session:
+            raise FilingRefusal("usage", "--session and --quote need --owner-message or --yes-message")
+        return None
+    if owner_uuid and yes_uuid:
+        raise FilingRefusal("usage", "--owner-message and --yes-message are exclusive")
+    if not args.session:
+        raise FilingRefusal("usage", "--owner-message/--yes-message need --session")
+    if owner_uuid and args.quote is None:
+        raise FilingRefusal("usage", "--owner-message needs --quote (the exact words, checked against the message)")
+    if yes_uuid and args.quote is not None:
+        raise FilingRefusal("usage", "--quote goes with --owner-message; a yes-message is derived without one")
+    ns = argparse.Namespace(session=args.session, owner_message=owner_uuid, yes_message=yes_uuid,
+                            quote=args.quote, source=args.source, ruling=description,
+                            shown_text=description)
+    return derive_owner_tier(ns, code_roots)
+
+
+def mark_authority(command: str, args, code_roots: list, description: str, strict: bool) -> tuple:
+    """`(authority, source)` of an audit row. Derived from the session when a
+    derivation input is given; `strict` (`mark-standing`: a standing row needs an
+    owner tier) refuses when nothing derives, otherwise (`bind`, `unbind`) the row
+    is `agent-inference` -- with a warning when a derivation was asked for and
+    failed. Raises FilingRefusal."""
+    try:
+        derived = derive_mark_tier(args, code_roots, description)
+    except _DerivationUnavailable as exc:
+        if strict:
+            raise FilingRefusal("derivation-failed", f"cannot derive an owner tier: {exc}")
+        print(f"WARNING: authority not derived ({exc}); recording as agent-inference", file=sys.stderr)
+        source = f"transcript unavailable: {exc}" + (f"; {args.source}" if args.source else "")
+        return "agent-inference", source
+    if derived is None:
+        if strict:
+            raise FilingRefusal(
+                "usage", "an owner tier is derived from the session: pass --session with --yes-message, "
+                         "or --owner-message with --quote")
+        return "agent-inference", args.source or f"memidx {command}"
+    return derived["authority"], derived["source"]
+
+
 def cmd_bind(args) -> int:
     """`memidx.py bind TOP-xxxx REF --root STORE --project NAME [--code-root DIR ...]
-    [--captured ruling|bind] [--dry-run]` -- add REF to the topic's
-    `code_refs` when absent and one anchor row for the topic's current
-    active link, hashing the file's bytes now (a symbol ref: the one
-    chunk's inclusive line span). rc 2: not anchorable (prefix/glob/dir);
-    rc 1: topic or file missing, symbol ambiguous, other failure."""
+    [--captured ruling|bind] [--why TEXT] [--session ID --yes-message UUID |
+    --owner-message UUID --quote TEXT] [--dry-run]` -- add REF to the topic's
+    `code_refs` when absent (with its `ref_marks:` `add` row) and one anchor row
+    for the topic's current active link, hashing the file's bytes now (a symbol
+    ref: the one chunk's inclusive line span). A ref that was unbound but whose
+    anchor for the current link still exists is RESTORED: the reference and its
+    row come back, no new anchor is captured (one baseline per (ref, link); a new
+    baseline is a new link). rc 2: not anchorable (prefix/glob/dir); rc 1: topic
+    or file missing, symbol ambiguous, other failure."""
     root = Path(args.root).resolve()
     ref = args.ref
     if not code_ref_is_anchorable(ref):
         print(f"bind: not anchorable: {ref!r} is a prefix or glob", file=sys.stderr)
         return 2
+    problem = _audit_text_problem(args)
+    if problem:
+        print(f"bind: {problem}", file=sys.stderr)
+        return 1
     path = _topic_file_for_id(root, args.topic)
     if path is None:
         print(f"bind: no topic {args.topic!r} under {args.root}/topics", file=sys.stderr)
@@ -12467,29 +12697,103 @@ def cmd_bind(args) -> int:
         print(f"bind: {args.topic} has no active link to anchor", file=sys.stderr)
         return 1
     key = (ref, link_id)
-    if any(anchor_row_key(r) == key for r in anchor_rows(fm)):
+    refs_now = [r for r in fm.get("code_refs") or []]
+    in_refs = ref in [str(r) for r in refs_now]
+    has_anchor = any(anchor_row_key(r) == key for r in anchor_rows(fm))
+    if has_anchor and in_refs:
         print(f"bind: {args.topic} already has an anchor for ({ref}, {link_id}); "
               "one baseline per key -- a new baseline is a new link")
         return 0
     code_roots = _code_roots_arg(args.code_root) or [Path.cwd().resolve()]
-    row, failure = capture_anchor_row(ref, link_id, code_roots, args.captured)
-    if row is None:
-        rc, message = failure
-        print(f"bind: {message}", file=sys.stderr)
-        return rc
+    row = None
+    if not has_anchor:
+        row, failure = capture_anchor_row(ref, link_id, code_roots, args.captured)
+        if row is None:
+            rc, message = failure
+            print(f"bind: {message}", file=sys.stderr)
+            return rc
+    mark = None
+    if not in_refs:
+        try:
+            authority, source = mark_authority(
+                "bind", args, code_roots, f"bind {args.topic} {ref}", strict=False)
+        except FilingRefusal as exc:
+            print(f"bind: {exc.message}; nothing written", file=sys.stderr)
+            return 1
+        mark = new_audit_row("ref", ref, "add", authority, source,
+                             args.why or ("restored by memidx bind" if has_anchor else "bound by memidx bind"),
+                             args.recorded_by)
     try:
         new_text = old_text
-        if ref not in [str(r) for r in fm.get("code_refs") or []]:
-            new_text = insert_code_ref(new_text, ref)
-        new_text = insert_anchor_row(new_text, row)
+        if mark is not None:
+            new_text = insert_ref_mark(insert_code_ref(new_text, ref), mark)
+        if row is not None:
+            new_text = insert_anchor_row(new_text, row)
     except ValueError as exc:
         print(f"bind: {exc}", file=sys.stderr)
         return 1
-    refs_now = [r for r in fm.get("code_refs") or []]
-    expect = refs_now if ref in [str(r) for r in refs_now] else refs_now + [ref]
-    problem = bound_edit_problem(new_text, path, ref, link_id, expect)
+    expect = refs_now if in_refs else refs_now + [ref]
+    problem = bound_edit_problem(new_text, path, ref, link_id, expect, mark, ref_mark_rows(fm))
     if problem:
         print(f"bind: {problem}; nothing written", file=sys.stderr)
+        return 1
+    apply_topic_edit(path, old_text, new_text, args.dry_run, root)
+    return 0
+
+
+def cmd_unbind(args) -> int:
+    """`memidx.py unbind TOP-xxxx REF --root STORE --project NAME [--why TEXT]
+    [--session ID --yes-message UUID | --owner-message UUID --quote TEXT]
+    [--dry-run]` -- delete exactly the `code_refs` item REF and prepend the
+    `ref_marks:` `remove` row, as line edits; no anchor is touched (the frozen
+    capture stays as history; `bind` restores the reference). A prefix or glob
+    reference may be unbound. rc 1: refused (unknown topic, a non-empty flow
+    list, the edit would not round-trip); rc 0 with a note when REF is not bound."""
+    root = Path(args.root).resolve()
+    ref = args.ref
+    problem = _audit_text_problem(args)
+    if problem:
+        print(f"unbind: {problem}", file=sys.stderr)
+        return 1
+    path = _topic_file_for_id(root, args.topic)
+    if path is None:
+        print(f"unbind: no topic {args.topic!r} under {args.root}/topics", file=sys.stderr)
+        return 1
+    old_text, fm, reason = _verified_topic_record(root, args.topic, path)
+    if reason:
+        print(f"unbind: {reason[1]}; nothing written", file=sys.stderr)
+        return 1
+    refs_now = [r for r in fm.get("code_refs") or []]
+    if ref not in [str(r) for r in refs_now]:
+        print(f"unbind: {ref!r} is not in {args.topic}'s code_refs; nothing written")
+        return 0
+    code_roots = _code_roots_arg(args.code_root) or [Path.cwd().resolve()]
+    try:
+        authority, source = mark_authority(
+            "unbind", args, code_roots, f"unbind {args.topic} {ref}", strict=False)
+    except FilingRefusal as exc:
+        print(f"unbind: {exc.message}; nothing written", file=sys.stderr)
+        return 1
+    mark = new_audit_row("ref", ref, "remove", authority, source,
+                         args.why or "unbound by memidx unbind", args.recorded_by)
+    try:
+        new_text = insert_ref_mark(remove_code_ref(old_text, ref), mark)
+    except ValueError as exc:
+        print(f"unbind: {exc}", file=sys.stderr)
+        return 1
+    expect = [r for r in refs_now if str(r) != ref]
+    old_anchors, old_marks = anchor_rows(fm), ref_mark_rows(fm)
+
+    def check(new_fm: dict) -> str | None:
+        if list(new_fm.get("code_refs") or []) != expect:
+            return f"the edit would not leave the code_refs as {expect}"
+        if anchor_rows(new_fm) != old_anchors:
+            return "the edit would touch an anchor row"
+        return audit_row_problem(new_fm, "ref_marks", ref_mark_ident, REF_MARK_FIELDS, mark, old_marks)
+
+    problem = edit_roundtrip_problem(new_text, path, check)
+    if problem:
+        print(f"unbind: {problem}; nothing written", file=sys.stderr)
         return 1
     apply_topic_edit(path, old_text, new_text, args.dry_run, root)
     return 0
@@ -12653,56 +12957,59 @@ def edit_standing_line(text: str, link_id: str, add: bool) -> str:
             lines[block_last] += nl
         lines.insert(block_last + 1, f"{indent}- {link_id}{nl}")
         return "".join(lines)
-    items = [i for i in range(idx + 1, block_last + 1)
-             if lines[i].lstrip().startswith("- ")]
-    drop = [i for i in items
-            if _scalar_token(re.sub(r"\s+#.*$", "", lines[i].strip()[2:])) == link_id]
-    if not drop:
-        return text
-    del lines[drop[0]]
-    if len(items) == 1:
-        lines[idx] = f"standing: []{nl}"
+    _delete_block_item(lines, idx, block_last, "standing", link_id, nl)
     return "".join(lines)
 
 
-def _after_standing_key(lines: list, first: int, end: int) -> int:
-    """`create_at` for `standing_marks:`: right after the `standing:` block."""
-    idx = _top_key_index(lines, first, end, "standing")
-    if idx is None:
-        raise ValueError("no `standing:` key to place `standing_marks:` after")
-    last = _block_last_line(lines, idx, end)
-    if not lines[last].endswith("\n"):
-        lines[last] += _newline_of("".join(lines))
-    return last + 1
+def _after_block_key(anchor_key: str, placed: str):
+    """`create_at` for a key that sits right after the `anchor_key:` block
+    (`standing_marks:` after `standing:`, `ref_marks:` after `code_refs:`)."""
+    def create_at(lines: list, first: int, end: int) -> int:
+        idx = _top_key_index(lines, first, end, anchor_key)
+        if idx is None:
+            raise ValueError(f"no `{anchor_key}:` key to place `{placed}:` after")
+        last = _block_last_line(lines, idx, end)
+        if not lines[last].endswith("\n"):
+            lines[last] += _newline_of("".join(lines))
+        return last + 1
+    return create_at
 
 
 def insert_standing_mark(text: str, row: dict) -> str:
     """`text` with one `standing_marks:` row PREPENDED (newest first), the key
     created right after `standing:` when absent."""
     return _insert_block_row(text, "standing_marks", row, STANDING_MARK_FIELDS,
-                             STANDING_MARK_QUOTED_FIELDS, True, _after_standing_key)
+                             STANDING_MARK_QUOTED_FIELDS, True,
+                             _after_block_key("standing", "standing_marks"))
+
+
+def insert_ref_mark(text: str, row: dict) -> str:
+    """`text` with one `ref_marks:` row PREPENDED (newest first), the key
+    created right after `code_refs:` when absent."""
+    return _insert_block_row(text, "ref_marks", row, REF_MARK_FIELDS,
+                             REF_MARK_QUOTED_FIELDS, True,
+                             _after_block_key("code_refs", "ref_marks"))
 
 
 def cmd_mark_standing(args) -> int:
-    """`memidx.py mark-standing TOP-xxxx Ln (--add | --remove) --authority A
-    --source TEXT --why TEXT --root STORE [--recorded-by NAME] [--dry-run]` --
+    """`memidx.py mark-standing TOP-xxxx Ln (--add | --remove) --session ID
+    (--yes-message UUID | --owner-message UUID --quote TEXT) --why TEXT --root STORE
+    [--source NOTE] [--code-root DIR ...] [--recorded-by NAME] [--dry-run]` --
     change the topic's `standing:` list by one link and prepend the matching
     `standing_marks:` row, as line insertions; print the diff, never commit.
-    One call, one row. rc 1: refused (unknown topic, ineligible link, bad
-    text, file does not parse, edit would not round-trip)."""
+    The row's authority is DERIVED from the session transcript (never typed): a
+    standing row needs an owner tier, so a derivation that fails or is not
+    given REFUSES. One call, one row. rc 1: refused (unknown topic, ineligible
+    link, bad text, no derivable owner tier, file does not parse, edit would not
+    round-trip)."""
     root = Path(args.root).resolve()
     link_id = args.link
     add = bool(args.add)
-    why, source = args.why, args.source
-    for name, value in (("--why", why), ("--source", source)):
-        if not value.strip():
-            print(f"mark-standing: {name} must not be empty", file=sys.stderr)
-            return 1
-        parts = value.splitlines()
-        if len(parts) != 1 or parts[0] != value:
-            print(f"mark-standing: {name} must be a single line (no leading or trailing "
-                  "line break)", file=sys.stderr)
-            return 1
+    why = args.why
+    problem = _audit_text_problem(args)
+    if problem:
+        print(f"mark-standing: {problem}", file=sys.stderr)
+        return 1
     path = _topic_file_for_id(root, args.topic)
     if path is None:
         print(f"mark-standing: no topic {args.topic!r} under {args.root}/topics", file=sys.stderr)
@@ -12726,18 +13033,16 @@ def cmd_mark_standing(args) -> int:
                 print(f"mark-standing: {problem}", file=sys.stderr)
             print("mark-standing: nothing written", file=sys.stderr)
             return 1
-    stamp = _now()
-    recorded_at = stamp.isoformat(timespec="seconds")
-    row = {
-        "link": link_id,
-        "action": "add" if add else "remove",
-        "date": recorded_at[:10],
-        "recorded_at": recorded_at,
-        "recorded_by": args.recorded_by or os.environ.get("MEMCONTINUUM_RECORDED_BY") or "memidx",
-        "authority": args.authority,
-        "source": source,
-        "why": why,
-    }
+    code_roots = _code_roots_arg(args.code_root)
+    action = "add" if add else "remove"
+    try:
+        authority, source = mark_authority(
+            "mark-standing", args, code_roots,
+            f"mark-standing {args.topic} {link_id} --{action}", strict=True)
+    except FilingRefusal as exc:
+        print(f"mark-standing: {exc.message}; nothing written", file=sys.stderr)
+        return 1
+    row = new_audit_row("link", link_id, action, authority, source, why, args.recorded_by)
     expect = before + [link_id] if add else [i for i in before if i != link_id]
     old_rows = standing_mark_rows(fm)
     try:
@@ -12745,28 +13050,12 @@ def cmd_mark_standing(args) -> int:
     except ValueError as exc:
         print(f"mark-standing: {exc}", file=sys.stderr)
         return 1
-    ident = standing_mark_ident(row)
 
     def roundtrips(new_fm: dict) -> str | None:
         if standing_ids(new_fm) != expect:
             return f"the edit would not round-trip the standing list as {expect}"
-        rows = standing_mark_rows(new_fm)
-        if not rows or standing_mark_ident(rows[0]) != ident or sum(
-                1 for r in rows if standing_mark_ident(r) == ident) != 1:
-            return "the edit would not put the new row first, once"
-        # YAML must read every field back as the string written (`True`, `123`,
-        # `2026-11-03` would be retyped); only `date` is a date, equal to recorded_at's
-        for k in STANDING_MARK_FIELDS:
-            got = rows[0].get(k)
-            if k == "date":
-                if not (isinstance(got, _date) and not isinstance(got, datetime)
-                        and got.isoformat() == recorded_at[:10]):
-                    return "the edit would not round-trip the new row's date as written"
-            elif not (isinstance(got, str) and got == row[k]):
-                return "the edit would not round-trip the new row's fields as written"
-        if rows[1:] != old_rows:
-            return "the edit would not leave the earlier rows unchanged"
-        return None
+        return audit_row_problem(new_fm, "standing_marks", standing_mark_ident,
+                                 STANDING_MARK_FIELDS, row, old_rows)
 
     problem = edit_roundtrip_problem(new_text, path, roundtrips)
     if problem:
@@ -13482,9 +13771,19 @@ def _finish_write(command: str, args, ctx: dict, root: Path, path: Path, rel: st
         if args.require_retrieve:
             rc = 3
     if not standing_link_problems(link["link"], link):
+        # the authority is derived from the same session message again, never typed
+        if args.owner_message:
+            derive = (f"--session {shlex.quote(str(args.session))} "
+                      f"--owner-message {shlex.quote(str(args.owner_message))} "
+                      f"--quote {shlex.quote('<the exact words, as in the message>')}")
+        elif args.yes_message:
+            derive = (f"--session {shlex.quote(str(args.session))} "
+                      f"--yes-message {shlex.quote(str(args.yes_message))}")
+        else:
+            derive = ("--session <session> (--yes-message <uuid> | --owner-message <uuid> "
+                      "--quote <the exact words>)")
         print(f"standing candidate: memidx.py mark-standing {shlex.quote(str(topic_id))} {shlex.quote(str(link['link']))} --add "
-              f"--authority {shlex.quote(str(link['ruling']['authority']))} "
-              f"--source {shlex.quote('<where the owner said it>')} "
+              f"{derive} "
               f"--why {shlex.quote('<why it is true of the whole project>')} --root {shlex.quote(str(root))}")
     return rc
 
@@ -13797,6 +14096,24 @@ def cmd_promote(args) -> int:
     """`memidx.py promote TOP-xxxx Ln --session ID (--yes-message UUID |
     --owner-message UUID --quote TEXT) ...` -- SCHEMA section 5 as one command."""
     return run_filing("promote", args, _promote_impl)
+
+
+def add_mark_args(p: argparse.ArgumentParser, why_required: bool) -> None:
+    """The flags every audit-row writer (`mark-standing`, `bind`, `unbind`)
+    shares: the row's text and the session the authority is DERIVED from (there
+    is no typed `--authority`)."""
+    p.add_argument("--why", required=why_required, default=None, help="one sentence, no line breaks")
+    p.add_argument("--source", default=None,
+                   help="an optional one-line note appended to the derived source")
+    p.add_argument("--session", default=None, help="the session id whose transcript derives the authority")
+    p.add_argument("--yes-message", dest="yes_message", default=None,
+                   help="uuid of the owner's yes-message (owner-ratified)")
+    p.add_argument("--owner-message", dest="owner_message", default=None,
+                   help="uuid of the owner's own message (owner-verbatim; needs --quote)")
+    p.add_argument("--quote", default=None,
+                   help="the exact words inside that message; checked, never stored in the row")
+    p.add_argument("--recorded-by", dest="recorded_by", default=None,
+                   help="default: $MEMCONTINUUM_RECORDED_BY, else 'memidx'")
 
 
 def add_filing_link_args(p: argparse.ArgumentParser, with_ruling: bool = True) -> None:
@@ -14358,8 +14675,24 @@ def main(argv=None) -> int:
     p_bind.add_argument("ref", metavar="REF", help="a file path or path#symbol (no prefix/glob)")
     p_bind.add_argument("--code-root", dest="code_root", action="append", default=None)
     p_bind.add_argument("--captured", choices=("ruling", "bind"), default="bind")
+    add_mark_args(p_bind, why_required=False)
     p_bind.add_argument("--dry-run", action="store_true", help="print the exact diff, write nothing")
     p_bind.set_defaults(func=cmd_bind)
+
+    p_unbind = sub.add_parser(
+        "unbind",
+        help="remove one code reference from a topic's `code_refs` and prepend the `ref_marks:` "
+             "`remove` row; the anchor is kept as history, `bind` restores the reference; a line "
+             "edit into the topic file, never committed",
+    )
+    add_common_args(p_unbind, need_root=True)
+    p_unbind.add_argument("topic", metavar="TOP-xxxx")
+    p_unbind.add_argument("ref", metavar="REF", help="the code_refs entry, verbatim (a prefix or glob is allowed)")
+    p_unbind.add_argument("--code-root", dest="code_root", action="append", default=None,
+                          help="only to pick the session transcript (see --session)")
+    add_mark_args(p_unbind, why_required=False)
+    p_unbind.add_argument("--dry-run", action="store_true", help="print the exact diff, write nothing")
+    p_unbind.set_defaults(func=cmd_unbind)
 
     p_mark = sub.add_parser(
         "mark-standing",
@@ -14373,12 +14706,9 @@ def main(argv=None) -> int:
     mark_action = p_mark.add_mutually_exclusive_group(required=True)
     mark_action.add_argument("--add", action="store_true", help="make the link standing")
     mark_action.add_argument("--remove", action="store_true", help="stop the link being standing")
-    p_mark.add_argument("--authority", required=True, choices=sorted(CONSTRAINT_AUTHORITIES),
-                        help="the authority of the ruling that approved this change")
-    p_mark.add_argument("--source", required=True, help="where the approval is recorded (one line)")
-    p_mark.add_argument("--why", required=True, help="one sentence, no line breaks")
-    p_mark.add_argument("--recorded-by", dest="recorded_by", default=None,
-                        help="default: $MEMCONTINUUM_RECORDED_BY, else 'memidx'")
+    p_mark.add_argument("--code-root", dest="code_root", action="append", default=None,
+                        help="only to pick the session transcript (see --session)")
+    add_mark_args(p_mark, why_required=True)
     p_mark.add_argument("--dry-run", action="store_true", help="print the exact diff, write nothing")
     p_mark.set_defaults(func=cmd_mark_standing)
 

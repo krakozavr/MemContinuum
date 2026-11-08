@@ -570,7 +570,8 @@ class TestDedupeRetrievalStanding(FilingCase):
         self.write_transcript()
         rc, out, err = self.append("--session", SID, "--yes-message", YES_UUID)
         self.assertEqual(rc, 0, err)
-        self.assertIn("memidx.py mark-standing TOP-9100 L4 --add --authority owner-ratified", out)
+        self.assertIn(f"memidx.py mark-standing TOP-9100 L4 --add --session {SID} --yes-message {YES_UUID} --why", out)
+        self.assertNotIn("--authority", out.split("standing candidate:")[1])
         self.assertNotIn("standing:", self.topic.read_text())  # never written by the filing command
 
     def test_session_prints_the_read_only_proposal_section(self):
@@ -1251,8 +1252,8 @@ class TestGateRound5(FilingCase):
                                           "--code-root", str(self.tmp)])
                 self.assertEqual(rc, 1, err)
                 self.assertIn("no topic 'TOP-9100'", err)
-                rc, _o, err = run_memidx(["mark-standing", "TOP-9100", "L1", "--add", "--authority", "owner-ratified",
-                                          "--source", "s", "--why", "w", "--root", str(self.store)])
+                rc, _o, err = run_memidx(["mark-standing", "TOP-9100", "L1", "--add", "--session", SID,
+                                          "--yes-message", YES_UUID, "--why", "w", "--root", str(self.store)])
                 self.assertEqual(rc, 1, err)
                 self.assertIn("no topic 'TOP-9100'", err)
                 self.assertEqual(sha(self.topic), before)
@@ -1345,8 +1346,8 @@ class TestGateRound6(FilingCase):
                            "--code-root", str(self.tmp)])
 
     def mark(self):
-        return run_memidx(["mark-standing", "TOP-9100", "L2", "--add", "--authority", "owner-ratified",
-                           "--source", "s", "--why", "w", "--root", str(self.store)])
+        return run_memidx(["mark-standing", "TOP-9100", "L2", "--add", "--session", SID,
+                           "--yes-message", YES_UUID, "--why", "w", "--root", str(self.store)])
 
     def put(self, text, rel="topics/memory/widget.md"):
         path = self.store / rel
@@ -1394,6 +1395,7 @@ class TestGateRound6(FilingCase):
         rc, _o, err = self.bind()
         self.assertEqual(rc, 0, err)
         self.assertIn("src/foo.py", self.topic.read_text())
+        self.write_transcript()
         rc, _o, err = self.mark()
         self.assertEqual(rc, 0, err)
         self.assertIn("standing", self.topic.read_text())
@@ -1501,7 +1503,8 @@ class TestGateRound7(FilingCase):
         line = [l for l in out.splitlines() if l.startswith("standing candidate:")][0]
         self.assertIn("--root " + shlex.quote(str(spaced.resolve())), line)
         self.assertEqual(shlex.split(line)[-1], str(spaced.resolve()))
-        self.assertIn("--source '<where the owner said it>'", line)
+        self.assertIn(f"--session {SID} --yes-message {YES_UUID}", line)
+        self.assertNotIn("--source", line)
 
     def test_a_unicode_spaced_id_line_in_an_unparseable_file_is_a_raw_claimant(self):
         for label, sp in (("nbsp", "\u00a0"), ("em-space", "\u2003")):

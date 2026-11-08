@@ -49,6 +49,8 @@ from memidx import (
     AUTHORITIES,
     CANONICAL_ID_PREFIXES,
     CANONICAL_TYPES,
+    infer_type,
+    record_is_quarantined,
     CONSTRAINT_AUTHORITIES,
     EDGE_RELS,
     HOLD_ELIGIBLE_AUTHORITIES,
@@ -71,7 +73,13 @@ from memidx import (
     newest_active_link,
     parse_record,
     parse_record_raw,
+    code_ref_set,
+    ref_latest_action,
+    ref_mark_ident,
+    ref_mark_rows,
     standing_digest_text,
+    REF_MARK_ACTIONS,
+    REF_MARK_FIELDS,
     STANDING_MARK_ACTIONS,
     STANDING_MARK_FIELDS,
     standing_ids,
@@ -169,23 +177,43 @@ def _anchor_duplicate_keys(rows: list) -> list:
     return dup
 
 
-def _anchor_errors(path, fm: dict, topic_link_ids: set) -> list[str]:
-    """Validation of a topic's `anchors:` rows (docs/SCHEMA.md, "Anchors")."""
+_ANCHOR_PREFIX_GLOB_MESSAGE = ("ref is a prefix or glob -- those are 'not checked' by definition "
+                               "and never carry an anchor row")
+
+
+def _topic_link_ids(fm: dict) -> set:
+    """The ids of a topic's links (the set the anchor and mark rows must name)."""
+    links = fm.get("links")
+    return {str(l.get("link")) for l in links if isinstance(l, dict) and l.get("link")} \
+        if isinstance(links, list) else set()
+
+
+def _anchor_errors(path, fm: dict, topic_link_ids: set, skip_idents: set | None = None) -> list[str]:
+    """Validation of a topic's `anchors:` rows (docs/SCHEMA.md, "Anchors"). `skip_idents`: under
+    `--against-ref`, the identities (`_anchor_ident`) of rows recorded at REF -- those are
+    grandfathered (freeze-only) and not judged here; the (ref, link) duplicate check is the
+    freeze's own then (`skip_idents` not None)."""
     rows = anchor_rows(fm)
     if not rows:
         return []
     errors: list[str] = []
     code_refs = {str(r) for r in fm.get("code_refs") or []}
     for i, row in enumerate(rows):
+        if skip_idents is not None and _anchor_ident(row) in skip_idents:
+            continue
         ref = row.get("ref")
         prefix = f"{path}: anchors[{i}] ({ref!r})"
-        if ref is None or str(ref) not in code_refs:
-            errors.append(f"{prefix}: ref is not present verbatim in this topic's code_refs")
-        elif not code_ref_is_anchorable(str(ref)):
-            errors.append(
-                f"{prefix}: ref is a prefix or glob -- those are 'not checked' by definition "
-                "and never carry an anchor row"
-            )
+        # the prefix/glob prohibition comes FIRST and holds whatever the ref's membership: the
+        # unbound exemption below only lifts "ref must be in code_refs", nothing else
+        if ref is not None and not code_ref_is_anchorable(str(ref)):
+            errors.append(f"{prefix}: {_ANCHOR_PREFIX_GLOB_MESSAGE}")
+        if ref is not None and str(ref) not in code_refs and ref_latest_action(fm, str(ref)) == "remove":
+            # unbound: the newest `ref_marks:` row for this ref is a `remove`, so the frozen
+            # capture stays as history (a later `add` re-arms the requirement)
+            pass
+        elif ref is None or str(ref) not in code_refs:
+            errors.append(f"{prefix}: ref is not present verbatim in this topic's code_refs "
+                          "(or unbound by a newest `remove` row in ref_marks)")
         link = row.get("link")
         if link is None or str(link) not in topic_link_ids:
             errors.append(f"{prefix}: link {link!r} is not a link in this topic")
@@ -212,11 +240,12 @@ def _anchor_errors(path, fm: dict, topic_link_ids: set) -> list[str]:
         captured_at = row.get("captured_at")
         if captured_at is None or isinstance(captured_at, (dict, list)) or str(captured_at).strip() == "":
             errors.append(f"{prefix}: captured_at is required (part of the row's identity)")
-    for ref, link in _anchor_duplicate_keys(rows):
-        errors.append(
-            f"{path}: anchors: more than one row for ({ref!r}, {link!r}) -- one baseline per "
-            "key in this release; a new baseline is a new link"
-        )
+    if skip_idents is None:
+        for ref, link in _anchor_duplicate_keys(rows):
+            errors.append(
+                f"{path}: anchors: more than one row for ({ref!r}, {link!r}) -- one baseline per "
+                "key in this release; a new baseline is a new link"
+            )
     return errors
 
 
@@ -239,31 +268,33 @@ def _mark_time_problems(row: dict) -> list[str]:
     return []
 
 
-def _standing_marks_errors(path, fm: dict, topic_link_ids: set) -> list[str]:
-    """Validation of a topic's `standing_marks:` rows (docs/SCHEMA.md, "Standing
-    marks"). Rows are NEVER required: a topic marked before this block existed
-    carries none and is clean (TOP-0136 L1)."""
-    rows = standing_mark_rows(fm)
+def _mark_rows_errors(path, rows: list, block: str, fields, actions, id_field: str, ident_of,
+                      authority_problem, member_problem) -> list[str]:
+    """The shared plain-mode validation of an audit block's rows (`standing_marks:`,
+    `ref_marks:`): required fields present and scalar, no unknown fields, the
+    action, `recorded_by` a string, `why` one line, `recorded_at`/`date` shape,
+    one row per identity. What differs per block is passed in: `authority_problem(
+    value)` and `member_problem(value)` return a message tail or None."""
     errors: list[str] = []
     seen: set = set()
     for i, row in enumerate(rows):
-        prefix = (f"{path}: standing_marks[{i}] ({row.get('link')!r}, {row.get('action')!r}, "
+        prefix = (f"{path}: {block}[{i}] ({row.get(id_field)!r}, {row.get('action')!r}, "
                   f"{row.get('recorded_at')!r})")
-        missing = [f for f in STANDING_MARK_FIELDS
+        missing = [f for f in fields
                    if row.get(f) is None or isinstance(row.get(f), (dict, list))
                    or str(row.get(f)).strip() == ""]
-        unknown = [str(k) for k in row if k not in STANDING_MARK_FIELDS]
+        unknown = [str(k) for k in row if k not in fields]
         if missing:
             errors.append(f"{prefix}: missing field(s) {missing}")
         if unknown:
             errors.append(f"{prefix}: unknown field(s) {unknown}")
-        if "action" not in missing and row.get("action") not in STANDING_MARK_ACTIONS:
+        if "action" not in missing and row.get("action") not in actions:
             errors.append(f"{prefix}: action {row.get('action')!r} must be one of "
-                          f"{list(STANDING_MARK_ACTIONS)}")
-        if "authority" not in missing and row.get("authority") not in CONSTRAINT_AUTHORITIES:
-            errors.append(f"{prefix}: authority {row.get('authority')!r} must be one of "
-                          f"{sorted(CONSTRAINT_AUTHORITIES)} (an agent-inference mark would put a "
-                          "constraint in every session start)")
+                          f"{list(actions)}")
+        if "authority" not in missing:
+            problem = authority_problem(row.get("authority"))
+            if problem:
+                errors.append(f"{prefix}: {problem}")
         if "recorded_by" not in missing and not isinstance(row.get("recorded_by"), str):
             errors.append(f"{prefix}: recorded_by {row.get('recorded_by')!r} is not a string "
                           "(YAML read it as another type; quote it)")
@@ -272,15 +303,56 @@ def _standing_marks_errors(path, fm: dict, topic_link_ids: set) -> list[str]:
             errors.append(f"{prefix}: why must be a single line (no CR/LF)")
         if "recorded_at" not in missing:
             errors.extend(f"{prefix}: {p}" for p in _mark_time_problems(row))
-        link = row.get("link")
-        if link is not None and str(link) not in topic_link_ids:
-            errors.append(f"{prefix}: link {link!r} is not a link in this topic")
-        ident = standing_mark_ident(row)
+        member = row.get(id_field)
+        if member is not None:
+            problem = member_problem(member)
+            if problem:
+                errors.append(f"{prefix}: {problem}")
+        ident = ident_of(row)
         if ident is not None:
             if ident in seen:
-                errors.append(f"{prefix}: duplicate row -- (link, action, recorded_at) identifies a row once")
+                errors.append(f"{prefix}: duplicate row -- ({id_field}, action, recorded_at) "
+                              "identifies a row once")
             seen.add(ident)
     return errors
+
+
+def _standing_marks_errors(path, fm: dict, topic_link_ids: set) -> list[str]:
+    """Validation of a topic's `standing_marks:` rows (docs/SCHEMA.md, "Standing
+    marks"). Rows are NEVER required: a topic marked before this block existed
+    carries none and is clean (TOP-0136 L1)."""
+    def authority_problem(value):
+        if value in CONSTRAINT_AUTHORITIES:
+            return None
+        return (f"authority {value!r} must be one of {sorted(CONSTRAINT_AUTHORITIES)} (an "
+                "agent-inference mark would put a constraint in every session start)")
+
+    def member_problem(link):
+        return None if str(link) in topic_link_ids else f"link {link!r} is not a link in this topic"
+
+    return _mark_rows_errors(path, standing_mark_rows(fm), "standing_marks", STANDING_MARK_FIELDS,
+                             STANDING_MARK_ACTIONS, "link", standing_mark_ident,
+                             authority_problem, member_problem)
+
+
+def _ref_marks_errors(path, fm: dict) -> list[str]:
+    """Validation of a topic's `ref_marks:` rows (docs/SCHEMA.md, "Reference
+    marks"). Narrower than the standing rules: a ref is a path, not a link id,
+    and any of the five authorities is legal (a bind is not a constraint).
+    Rows are NEVER required by the plain lint: a topic whose references predate
+    the block carries none and is clean."""
+    def authority_problem(value):
+        return None if value in AUTHORITIES else (
+            f"authority {value!r} must be one of {sorted(AUTHORITIES)}")
+
+    def member_problem(ref):
+        if not isinstance(ref, str):
+            return f"ref {ref!r} is not a string (YAML read it as another type; quote it)"
+        return None if code_ref_is_named(ref) else f"ref {ref!r} is empty or fragment-only"
+
+    return _mark_rows_errors(path, ref_mark_rows(fm), "ref_marks", REF_MARK_FIELDS,
+                             REF_MARK_ACTIONS, "ref", ref_mark_ident,
+                             authority_problem, member_problem)
 
 
 def _standing_pointer_errors(path, fm: dict, topic_links_by_id: dict) -> list[str]:
@@ -304,11 +376,12 @@ def _standing_pointer_errors(path, fm: dict, topic_links_by_id: dict) -> list[st
 
 
 def _staged_standing_errors(path, fm: dict, links: list) -> list[str]:
-    """The plain-mode `standing:` / `standing_marks:` rules, run on the blob
-    that is about to be committed (rows' fields and authority, duplicate and
-    ineligible pointers)."""
+    """The plain-mode `standing:` / `standing_marks:` / `ref_marks:` rules, run on
+    the blob that is about to be committed (rows' fields and authority, duplicate
+    and ineligible pointers)."""
     by_id = {str(l.get("link")): l for l in links if l.get("link")}
-    return _standing_pointer_errors(path, fm, by_id) + _standing_marks_errors(path, fm, set(by_id))
+    return (_standing_pointer_errors(path, fm, by_id) + _standing_marks_errors(path, fm, set(by_id))
+            + _ref_marks_errors(path, fm))
 
 
 def lint_topic(
@@ -449,7 +522,7 @@ def lint_topic(
     # caught three different ways with three different blast radii. See
     # lint_file's own `ERROR: <path>: links: duplicate link id ...` line,
     # which fires from that same diagnostic.
-    topic_link_ids = {str(l.get("link")) for l in links if l.get("link")}
+    topic_link_ids = _topic_link_ids(fm)
     topic_links_by_id = {str(l.get("link")): l for l in links if l.get("link")}
     for link in links:
         rev = link.get("reverses")
@@ -523,6 +596,7 @@ def lint_topic(
     errors.extend(_standing_pointer_errors(path, fm, topic_links_by_id))
 
     errors.extend(_standing_marks_errors(path, fm, topic_link_ids))
+    errors.extend(_ref_marks_errors(path, fm))
 
     return errors, warnings
 
@@ -1289,14 +1363,19 @@ def lint_file(
         return errors, []
     warnings = [f"{path}: {field}: {message}" for field, message in result.diagnostics]
     fm, body = result.frontmatter, result.body
-    if fm.get("type") == "concept":
+    is_concept = fm.get("type") == "concept"
+    is_topic = not is_concept and _is_topic_frontmatter(fm)
+    if is_concept:
         errors, more_warnings = lint_concept(path, fm, code_roots or [], body=body, known_topic_ids=known_topic_ids)
+    elif is_topic:
+        errors, more_warnings = lint_topic(path, fm, code_roots, strict_citations)
     else:
-        is_topic = _is_topic_frontmatter(fm)
-        if is_topic:
-            errors, more_warnings = lint_topic(path, fm, code_roots, strict_citations)
-        else:
-            errors, more_warnings = lint_record(path, fm, code_roots, strict_citations)
+        errors, more_warnings = lint_record(path, fm, code_roots, strict_citations)
+    # R15-1 / R16-2 (gate rounds 15, 16): `for-path` reads `code_refs` of every record the index
+    # delivers as a topic, links or not, and `ref_marks:` is its audit; the one row validator runs
+    # for EVERY record that carries the block, concepts included (a topic ran it in `lint_topic`).
+    if not is_topic and "ref_marks" in fm:
+        errors.extend(_ref_marks_errors(path, fm))
     return errors, warnings + more_warnings
 
 
@@ -2311,6 +2390,15 @@ def _git_show(cwd: Path, spec: str) -> bytes | None:
     return proc.stdout
 
 
+def _git_mode(toplevel: Path, args: list[str], relpath: str) -> str | None:
+    """The git file mode (`100644`, `120000` ...) of `relpath` in the index (`ls-files -s`) or at a
+    tree (`ls-tree <ref>`); None when the path is absent there."""
+    proc = _run_git(args + ["--", relpath], toplevel)
+    if proc.returncode != 0 or not proc.stdout:
+        return None
+    return proc.stdout.split(b" ", 1)[0].decode("ascii", "replace")
+
+
 def _read_worktree(path: Path) -> bytes | None:
     try:
         return path.read_bytes()
@@ -2876,19 +2964,24 @@ def _frozen_rows_errors(old_rows: list, new_rows: list, ident, name, old_spans, 
     return errors
 
 
-def _anchor_freeze_errors(full_path, old_text, old_rows: list, new_text, new_rows: list,
+def _anchor_freeze_errors(full_path, old_text, old_rows: list, new_text, new_fm: dict,
                           notes: list[str]) -> list[str]:
     """The append-only rule for `anchors:` rows: a row recorded at REF must
     survive with the same parsed fields AND the same raw bytes; new rows are
     free; a second row for an existing (ref, link) key is an error. Raw
     spans come from the same walker the links freeze uses (`_link_raw_spans`
-    with key="anchors")."""
+    with key="anchors"). A row whose identity is NEW since REF meets the COMPLETE plain-lint
+    validator (`_anchor_errors`: prefix/glob, membership, link, digest, algo, span, ...); rows
+    recorded at REF stay freeze-only (grandfathered)."""
+    new_rows = anchor_rows(new_fm)
     errors: list[str] = []
     for ref, link in _anchor_duplicate_keys(new_rows):
         errors.append(
             f"{full_path}: anchors: more than one row for ({ref!r}, {link!r}) -- one baseline per "
             "key in this release; a new baseline is a new link"
         )
+    old_idents = {i for i in (_anchor_ident(r) for r in old_rows) if i is not None}
+    errors.extend(_anchor_errors(full_path, new_fm, _topic_link_ids(new_fm), skip_idents=old_idents))
     if not old_rows:
         return errors
     old_spans = (
@@ -2926,85 +3019,114 @@ def _mark_span_ident(row) -> str | None:
     return "\x00".join(ident) if ident is not None else None
 
 
-_MARK_FREEZE_MESSAGES = {
-    "no_ident": "recorded row lacks an identity component (link, action, recorded_at) and "
-                "cannot be verified; refusing to skip it (append-only)",
-    "gone": "row removed after being recorded (append-only; a standing mark is never deleted)",
-    "changed": "row changed after being recorded (append-only; a standing mark is never edited)",
-    "no_span": "row's span could not be extracted on the new side; treated as changed "
-               "(append-only; a recorded standing mark must stay byte-verifiable)",
-    "reformatted": "row reformatted, not appended (append-only; raw text changed after being "
-                   "recorded while its parsed fields did not)",
+def _ref_mark_span_ident(row) -> str | None:
+    """`ref_mark_ident` as the string key `_link_raw_spans` maps by."""
+    ident = ref_mark_ident(row)
+    return "\x00".join(ident) if ident is not None else None
+
+
+# The two frozen audit blocks the guard judges with ONE implementation: the
+# `standing:` pointer list (rows keyed by link id) and the `code_refs:` list
+# (rows keyed by ref). `noun` words the messages, `members` reads the membership
+# set the rows must account for, `rows` reads the block.
+_STANDING_AUDIT = {
+    "block": "standing_marks", "field": "standing", "id_field": "link", "noun": "standing mark",
+    "span_ident": _mark_span_ident, "rows": standing_mark_rows,
+    "members": lambda fm: set(standing_ids(fm)),
+}
+_REF_AUDIT = {
+    "block": "ref_marks", "field": "code_refs", "id_field": "ref", "noun": "reference mark",
+    "span_ident": _ref_mark_span_ident, "rows": ref_mark_rows, "members": code_ref_set,
 }
 
 
-def _standing_marks_freeze_errors(full_path, old_text, old_rows: list, new_text, new_rows: list) -> list[str]:
-    """g1: every `standing_marks:` row recorded at REF survives with the same
-    parsed fields and the same raw bytes, in the same relative order, and every
-    new row sits ABOVE every old one (newest first). Unlike anchors, a span
-    walker that cannot account for an existing OR a new block is an ERROR, not
-    a note -- otherwise the block's first commit would get parsed-field
-    protection only."""
+def _mark_freeze_messages(audit: dict) -> dict:
+    id_field, noun = audit["id_field"], audit["noun"]
+    return {
+        "no_ident": f"recorded row lacks an identity component ({id_field}, action, recorded_at) and "
+                    "cannot be verified; refusing to skip it (append-only)",
+        "gone": f"row removed after being recorded (append-only; a {noun} is never deleted)",
+        "changed": f"row changed after being recorded (append-only; a {noun} is never edited)",
+        "no_span": "row's span could not be extracted on the new side; treated as changed "
+                   f"(append-only; a recorded {noun} must stay byte-verifiable)",
+        "reformatted": "row reformatted, not appended (append-only; raw text changed after being "
+                       "recorded while its parsed fields did not)",
+    }
+
+
+def _standing_marks_freeze_errors(full_path, old_text, old_rows: list, new_text, new_rows: list,
+                                  audit: dict = _STANDING_AUDIT) -> list[str]:
+    """g1: every row of the audit block (`standing_marks:` by default, `ref_marks:`
+    with `audit=_REF_AUDIT`) recorded at REF survives with the same parsed
+    fields and the same raw bytes, in the same relative order, and every new row
+    sits ABOVE every old one (newest first). Unlike anchors, a span walker that
+    cannot account for an existing OR a new block is an ERROR, not a note --
+    otherwise the block's first commit would get parsed-field protection only."""
     errors: list[str] = []
+    block, noun, span_ident = audit["block"], audit["noun"], audit["span_ident"]
     old_spans = (
-        _link_raw_spans(old_text, old_rows, key="standing_marks", ident=_mark_span_ident)
+        _link_raw_spans(old_text, old_rows, key=block, ident=span_ident)
         if old_rows and old_text is not None else None
     )
     new_spans = (
-        _link_raw_spans(new_text, new_rows, key="standing_marks", ident=_mark_span_ident)
+        _link_raw_spans(new_text, new_rows, key=block, ident=span_ident)
         if new_rows and new_text is not None else None
     )
     if old_rows and old_spans is None:
         errors.append(
-            f"{full_path}: standing_marks: could not verify the recorded rows' raw text at REF "
+            f"{full_path}: {block}: could not verify the recorded rows' raw text at REF "
             "(structural extraction inconclusive); refusing to treat them as unchanged"
         )
     if new_rows and new_spans is None:
         errors.append(
-            f"{full_path}: standing_marks: could not extract the rows' raw text from the new "
+            f"{full_path}: {block}: could not extract the rows' raw text from the new "
             "block (structural extraction inconclusive); refusing to treat it as appended"
         )
 
     def name(row):
-        return (f"{full_path}: standing mark ({row.get('link')}, {row.get('action')}, "
+        return (f"{full_path}: {noun} ({row.get(audit['id_field'])}, {row.get('action')}, "
                 f"{row.get('recorded_at')})")
 
-    errors.extend(_frozen_rows_errors(old_rows, new_rows, _mark_span_ident, name,
-                                      old_spans, new_spans, _MARK_FREEZE_MESSAGES))
-    old_keys = [k for k in (_mark_span_ident(r) for r in old_rows) if k is not None]
+    errors.extend(_frozen_rows_errors(old_rows, new_rows, span_ident, name,
+                                      old_spans, new_spans, _mark_freeze_messages(audit)))
+    old_keys = [k for k in (span_ident(r) for r in old_rows) if k is not None]
     old_set = set(old_keys)
-    new_keys = [_mark_span_ident(r) for r in new_rows]
+    new_keys = [span_ident(r) for r in new_rows]
     survivors = [k for k in new_keys if k in old_set]
     if survivors != [k for k in old_keys if k in set(new_keys)]:
-        errors.append(f"{full_path}: standing_marks: recorded rows reordered (append-only; "
+        errors.append(f"{full_path}: {block}: recorded rows reordered (append-only; "
                       "rows keep the order they were recorded in, newest first)")
     seen_old = False
     for k in new_keys:
         if k in old_set:
             seen_old = True
         elif seen_old:
-            errors.append(f"{full_path}: standing_marks: marks not prepended (a new row must sit "
+            errors.append(f"{full_path}: {block}: marks not prepended (a new row must sit "
                           "above every recorded row, newest first)")
             break
     return errors
 
 
-def _standing_pairing_errors(full_path, old_ids: set, new_ids: set, new_pairs: list) -> list[str]:
-    """g2: the multiset of `(id, action)` the `standing:` change REQUIRES must
-    equal the multiset of `(link, action)` of the rows added in this commit."""
+def _standing_pairing_errors(full_path, old_ids: set, new_ids: set, new_pairs: list,
+                             audit: dict = _STANDING_AUDIT) -> list[str]:
+    """g2: the multiset of `(id, action)` the membership change REQUIRES (of
+    `standing:` by default, of `code_refs:` with `audit=_REF_AUDIT`) must equal
+    the multiset of `(id, action)` of the rows added in this commit. Membership
+    is a SET: reordering the same entries needs no row."""
     required = [(i, "add") for i in sorted(new_ids - old_ids)] + \
                [(i, "remove") for i in sorted(old_ids - new_ids)]
+    field, block, noun = audit["field"], audit["block"], audit["noun"]
     errors: list[str] = []
     for pair in required:
         n = new_pairs.count(pair)
         if n == 0:
-            errors.append(f"{full_path}: standing changed for {pair[0]} ({pair[1]}) with no "
-                          "matching standing_marks row")
+            errors.append(f"{full_path}: {field} changed for {pair[0]} ({pair[1]}) with no "
+                          f"matching {block} row")
         elif n > 1:
-            errors.append(f"{full_path}: duplicate standing mark for ({pair[0]}, {pair[1]}) in one commit")
+            errors.append(f"{full_path}: duplicate {noun} for ({pair[0]}, {pair[1]}) in one commit")
     for pair in new_pairs:
         if pair not in required:
-            errors.append(f"{full_path}: orphan standing mark ({pair[0]}, {pair[1]}): standing: "
+            errors.append(f"{full_path}: orphan {noun} ({pair[0]}, {pair[1]}): {field}: "
                           "did not change that way")
     return errors
 
@@ -3060,16 +3182,83 @@ def _current_discipline_errors(full_path, old_fm: dict, old_links: list, new_fm:
     return errors
 
 
-def _standing_guard_errors(full_path, old_fm: dict, old_text, new_fm: dict, new_text) -> list[str]:
-    """g1 + g2 for one topic present at both sides."""
-    old_rows, new_rows = standing_mark_rows(old_fm), standing_mark_rows(new_fm)
-    errors = _standing_marks_freeze_errors(full_path, old_text, old_rows, new_text, new_rows)
-    old_set = {k for k in (_mark_span_ident(r) for r in old_rows) if k is not None}
-    new_pairs = [(str(r.get("link")), str(r.get("action"))) for r in new_rows
-                 if _mark_span_ident(r) not in old_set]
+def _standing_guard_errors(full_path, old_fm: dict, old_text, new_fm: dict, new_text,
+                           audit: dict = _STANDING_AUDIT) -> list[str]:
+    """g1 + g2 for one topic present at both sides (the `standing:` audit by
+    default, the `code_refs:` audit with `audit=_REF_AUDIT`)."""
+    old_rows, new_rows = audit["rows"](old_fm), audit["rows"](new_fm)
+    errors = _standing_marks_freeze_errors(full_path, old_text, old_rows, new_text, new_rows, audit)
+    old_set = {k for k in (audit["span_ident"](r) for r in old_rows) if k is not None}
+    new_pairs = [(str(r.get(audit["id_field"])), str(r.get("action"))) for r in new_rows
+                 if audit["span_ident"](r) not in old_set]
     errors.extend(_standing_pairing_errors(
-        full_path, set(standing_ids(old_fm)), set(standing_ids(new_fm)), new_pairs))
+        full_path, audit["members"](old_fm), audit["members"](new_fm), new_pairs, audit))
     return errors
+
+
+def _delivered_type(root, path, fm) -> str | None:
+    """What the index stores as this record's `type`: the engine's own `infer_type` (inbox
+    directory, explicit `type`, `metadata.type`, then the record's directory). None when the
+    frontmatter is not a mapping or `infer_type` raises (a non-mapping `metadata`): the index
+    cannot build a row for such a record (reindex raises on it), so it delivered no type."""
+    if not isinstance(fm, dict):
+        return None
+    try:
+        return infer_type(root, path, fm)
+    except (AttributeError, TypeError):
+        return None
+
+
+def _frozen_type(root, path, result) -> str | None:
+    """The type frozen for a record that existed at REF: what the index DELIVERED there,
+    `infer_type(root, path, fm)`, when that is a canonical record type (for-path, the standing
+    digest and record search filter on the canonical types). Exempt (None): a record the index
+    QUARANTINED at REF (`record_is_quarantined`, the reindex predicate), and one whose delivered
+    type is not canonical (`inbox`, `memo`, a garbled word, or `_delivered_type` None). Their
+    repair is a record ENTERING delivery, like an added file."""
+    if record_is_quarantined(result):
+        return None
+    delivered = _delivered_type(root, path, result.frontmatter)
+    return delivered if delivered in CANONICAL_TYPES else None
+
+
+def _type_change_errors(root, full_path, frozen: str, new_fm: dict) -> list[str]:
+    """A delivered record's `type` decides which index type it carries, and `for-path` and the
+    standing digest read only `type: topic`. Unchanged iff the NEW side's `infer_type` equals
+    the frozen string (`_frozen_type`); otherwise `type changed '<old>' -> '<new>'`. No other
+    normalisation, no separate "removed" case: a typeless NEW infers by directory and compares
+    like any other."""
+    new_type = _delivered_type(root, full_path, new_fm)
+    if new_type == frozen:
+        return []
+    return [f"{full_path}: type changed {frozen!r} -> {new_type!r} after being recorded "
+            f"(append-only; `type` decides what the record is delivered as)"]
+
+
+def _quarantine_errors(full_path, new_result) -> list[str]:
+    """A record the index DELIVERED at REF may not become one the index QUARANTINES: the same
+    shared predicate (`record_is_quarantined`) applied to the NEW parse, so a delivered record
+    cannot leave for-path and the digest by turning schema-invalid. Runs on the index blob in
+    staged mode, which also closes the bypass of the hook's worktree-only schema lint (staging
+    a bad blob while the worktree holds a good one)."""
+    if not record_is_quarantined(new_result):
+        return []
+    diag = new_result.diagnostics[0] if new_result.diagnostics else None
+    first = f"{diag[0]}: {diag[1]}" if diag else "schema-invalid"
+    return [f"{full_path}: record leaves delivery: the new side would be quarantined ({first})"]
+
+
+def _new_side_nonregular(toplevel: Path, full_path: Path, relpath: str, staged: bool) -> bool:
+    """True when the NEW side of `relpath` is a symlink (`120000`) or a gitlink (`160000`): the
+    index mode in staged mode; the worktree path otherwise (a symlink, or a directory the index
+    records as a gitlink). The index reads neither."""
+    if staged:
+        return _git_mode(toplevel, ["ls-files", "-s", "-z"], relpath) in ("120000", "160000")
+    if full_path.is_symlink():
+        return True
+    if full_path.is_file():
+        return False
+    return _git_mode(toplevel, ["ls-files", "-s", "-z"], relpath) == "160000"
 
 
 def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], int, list[str]]:
@@ -3108,9 +3297,19 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
         path_in_root = relpath[len(prefix):] if prefix and relpath.startswith(prefix) else relpath
         full_path = root / path_in_root
         if status == "T":
-            # Type change (symlink/gitlink <-> regular file): the path exists
-            # on both sides, so it is judged exactly like a modification.
+            # Type change (symlink/gitlink <-> regular file): the path exists on both sides, so it
+            # is judged like a modification. Whether the NEW side is a symlink or gitlink is decided
+            # from its actual mode below (R16-1), never from the bare `T`.
             status = "M"
+
+        # R17-1 (gate round 17): a REF entry that was a symlink (120000) or gitlink (160000)
+        # delivered nothing to the index, so there is no delivered record at this path to protect.
+        # It is judged as an ADDED file when the NEW side is a regular file (every link on it is
+        # new), and not judged at all when the NEW side is deleted or still a symlink/gitlink.
+        if status != "A" and _git_mode(toplevel, ["ls-tree", "-z", ref], relpath) in ("120000", "160000"):
+            if status == "D" or _new_side_nonregular(toplevel, full_path, relpath, staged):
+                continue
+            status = "A"
 
         if status == "A":
             # Nothing existed at REF for this path -- no history to
@@ -3141,56 +3340,137 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
                     errors.extend(_standing_pairing_errors(
                         full_path, set(), set(standing_ids(added.frontmatter)),
                         [(str(r.get("link")), str(r.get("action"))) for r in added_rows]))
+                    # ... and likewise every code_refs entry of a brand-new topic needs its
+                    # `add` row in ref_marks (an existing topic's membership is grandfathered)
+                    errors.extend(_standing_pairing_errors(
+                        full_path, set(), code_ref_set(added.frontmatter),
+                        [(str(r.get("ref")), str(r.get("action")))
+                         for r in ref_mark_rows(added.frontmatter)], _REF_AUDIT))
                     # ... and the plain-mode rules on the STAGED blob (the hook lints only the
                     # worktree copy, INC-0127): rows, pointers, `current:` == head
                     errors.extend(_staged_standing_errors(full_path, added.frontmatter, links))
                     errors.extend(_staged_head_errors(full_path, added.frontmatter, links))
+                    # ... and every anchor row of the new file meets the complete anchor validator
+                    errors.extend(_anchor_errors(full_path, added.frontmatter, _topic_link_ids(added.frontmatter)))
                 errors.extend(_added_links_errors(
                     full_path, links, set(), fm=added.frontmatter, ctx=ctx))
             continue
 
         old_blob = _git_show(toplevel, f"{ref}:{relpath}")
         old_result = _parse_git_blob(old_blob, f"{relpath} (at {ref})")
-        if not _is_topic_like(old_result):
+        # `type` is frozen for EVERY record that existed at REF (a topic, an incident, a
+        # concept, a typeless one ...); judged first, before the classification exit below and
+        # before any branch that can `continue` past it (a repair, an invalid new side). The
+        # frozen value is what the index DELIVERED: `infer_type(root, path, fm)` on the REF side
+        # (a REF the index quarantined delivered nothing: exempt), compared with `infer_type` on
+        # the NEW side; `root` is the store root and `full_path` the record's path under it, on the
+        # worktree, staged and (via `path_in_root`) prefixed-root paths alike.
+        new_blob = None
+        new_result = None
+        frozen = None
+        # R16-1 (gate round 16): the index never reads a symlink (reindex skips it), so a delivered
+        # record replaced by one drops its for-path and digest entries. Decided from the git TYPE
+        # (diff status `T`, the index mode in staged mode, the worktree path otherwise), never from
+        # the symlink's blob -- its target text may equal the old Markdown. A symlink or gitlink at REF
+        # delivered nothing and never reaches here (R17-1, above); an added symlink is free.
+        new_symlink = status != "D" and _new_side_nonregular(toplevel, full_path, relpath, staged)
+        if new_symlink:
+            if _is_topic_like(old_result) or _frozen_type(root, full_path, old_result) is not None:
+                changed += 1
+                errors.append(
+                    f"{full_path}: record replaced by a symlink or gitlink (the index does not read "
+                    "either; a delivered record cannot become one)")
+            continue
+        if status != "D":
+            new_blob = _git_show(toplevel, f":{relpath}") if staged else _read_worktree(root / path_in_root)
+            if new_blob is not None:
+                new_result = _parse_git_blob(new_blob, path_in_root)
+                frozen = _frozen_type(root, full_path, old_result)
+                if frozen is not None:
+                    errors.extend(_type_change_errors(root, full_path, frozen, new_result.frontmatter))
+                    errors.extend(_quarantine_errors(full_path, new_result))
+
+        # R14-1 (gate round 14): the reference audit belongs to the DELIVERED record, not to the
+        # link chain. A record the index delivered at REF with a canonical type (`frozen is not
+        # None`) is on `for-path` through its `code_refs` whether or not it has links, so a typeless
+        # `topics/` note, a `links: []` note or a `TOP-` id with no links gets the same pairing and
+        # `ref_marks` freeze as a topic, BEFORE the topic-like exit below. A topic-like REF reaches
+        # the identical call further down (after its link-history checks), so this runs only for the
+        # records that exit early. The REF side must have parsed strictly: a fallback parse does not
+        # recover `code_refs`, so its old membership is unknown (the repair branch's rule). The NEW side
+        # may be a fallback parse: it drops `code_refs` and `ref_marks`, which is then a removal that no
+        # row can pair. The link-history and standing checks keep their topic-like gate (a record
+        # without links has no chain); the anchor FREEZE also runs here for such a record that carries
+        # anchor rows, on the same condition, since it needs no link history either.
+        if (frozen is not None and status == "M" and new_result is not None and old_result.valid
+                and not _is_topic_like(old_result)):
+            try:
+                ref_old_text = old_blob.decode("utf-8")
+            except UnicodeDecodeError:
+                ref_old_text = None
+            try:
+                ref_new_text = new_blob.decode("utf-8")
+            except UnicodeDecodeError:
+                ref_new_text = None
+            errors.extend(_standing_guard_errors(
+                full_path, old_result.frontmatter, ref_old_text, new_result.frontmatter, ref_new_text,
+                _REF_AUDIT))
+            # ... and the anchor rows recorded at REF stay frozen on such a record too
+            errors.extend(_anchor_freeze_errors(
+                full_path, ref_old_text, anchor_rows(old_result.frontmatter),
+                ref_new_text, new_result.frontmatter, notes))
+            # R15-1: ... and the `ref_marks` rows new since REF meet the same row validator a topic's
+            # staged blob meets (`_staged_standing_errors` -> `_ref_marks_errors`); rows recorded at
+            # REF are frozen above and not re-judged (a pre-existing malformed row is grandfathered)
+            old_idents = {ref_mark_ident(r) for r in ref_mark_rows(old_result.frontmatter)}
+            new_only = [r for r in ref_mark_rows(new_result.frontmatter)
+                        if ref_mark_ident(r) is None or ref_mark_ident(r) not in old_idents]
+            if new_only:
+                errors.extend(_ref_marks_errors(full_path, {"ref_marks": new_only}))
+
+        # R15-2 (gate round 15): the deletion rule protects a record the index DELIVERED as a topic
+        # (frozen type `topic`) as well as a topic-like one: a typeless `topics/` note, a `links: []`
+        # note or a `TOP-` id with no links is on `for-path` through `code_refs`, and deleting it (a
+        # move is a deletion plus an added file) would drop that hit with no error and no row. Records
+        # delivered as an incident, investigation or concept keep the pre-existing policy (deletable).
+        delivered_topic_gone = (
+            (status == "D" or new_blob is None)
+            and _frozen_type(root, full_path, old_result) == "topic")
+
+        if not _is_topic_like(old_result) and not delivered_topic_gone:
             # Re-gate (Grok): a path that was not topic-like at REF (an
             # incident, an empty note) may be promoted/edited into one
             # carrying links; every recovered link whose id REF did not
             # already record is new and judged by the grandfathered checks.
-            if status == "M":
-                nb = _git_show(toplevel, f":{relpath}") if staged else _read_worktree(root / path_in_root)
-                if nb is not None:
-                    ref_ids = {
-                        str(l.get("link"))
-                        for l in (_recovered_old_links(old_result.frontmatter) or [])
-                        if l.get("link") is not None
-                    }
-                    errors.extend(_added_links_errors(
-                        full_path,
-                        _recovered_old_links(_parse_git_blob(nb, path_in_root).frontmatter) or [],
-                        ref_ids, fm=_parse_git_blob(nb, path_in_root).frontmatter, ctx=ctx))
+            if status == "M" and new_result is not None:
+                # the NEW blob was read and parsed once above; reuse that parse
+                ref_ids = {
+                    str(l.get("link"))
+                    for l in (_recovered_old_links(old_result.frontmatter) or [])
+                    if l.get("link") is not None
+                }
+                errors.extend(_added_links_errors(
+                    full_path,
+                    _recovered_old_links(new_result.frontmatter) or [],
+                    ref_ids, fm=new_result.frontmatter, ctx=ctx))
             continue
         changed += 1
 
         if status == "D":
-            kind = _record_kind_label(old_result)
+            kind = "topic" if delivered_topic_gone else _record_kind_label(old_result)
             errors.append(
                 f"{full_path}: {kind} file deleted or renamed after being recorded "
                 "(append-only; a store never loses history)"
             )
             continue
 
-        if staged:
-            new_blob = _git_show(toplevel, f":{relpath}")
-        else:
-            new_blob = _read_worktree(root / path_in_root)
         if new_blob is None:
-            kind = _record_kind_label(old_result)
+            kind = "topic" if delivered_topic_gone else _record_kind_label(old_result)
             errors.append(
                 f"{full_path}: {kind} file deleted or renamed after being recorded "
                 "(append-only; a store never loses history)"
             )
             continue
-        new_result = _parse_git_blob(new_blob, path_in_root)
 
         repair_note = None
         if not old_result.valid:
@@ -3228,13 +3508,17 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
                     # a repair of the links is not a licence to rewrite a capture.
                     errors.extend(_anchor_freeze_errors(
                         full_path, _decode_or_none(old_blob), anchor_rows(old_result.frontmatter),
-                        _decode_or_none(new_blob), anchor_rows(new_result.frontmatter), notes,
+                        _decode_or_none(new_blob), new_result.frontmatter, notes,
                     ))
                     # ... and so do the standing marks (g1), and every row and pointer of the
                     # new blob meets the plain-mode rules (pairing cannot run: see the note)
                     errors.extend(_standing_marks_freeze_errors(
                         full_path, _decode_or_none(old_blob), standing_mark_rows(old_result.frontmatter),
                         _decode_or_none(new_blob), standing_mark_rows(new_result.frontmatter),
+                    ))
+                    errors.extend(_standing_marks_freeze_errors(
+                        full_path, _decode_or_none(old_blob), ref_mark_rows(old_result.frontmatter),
+                        _decode_or_none(new_blob), ref_mark_rows(new_result.frontmatter), _REF_AUDIT,
                     ))
                     errors.extend(_staged_standing_errors(
                         full_path, new_result.frontmatter, new_result.frontmatter.get("links") or []))
@@ -3404,13 +3688,16 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
 
         errors.extend(_anchor_freeze_errors(
             full_path, old_text, anchor_rows(old_result.frontmatter),
-            new_text, anchor_rows(new_result.frontmatter), notes,
+            new_text, new_result.frontmatter, notes,
         ))
 
         # TOP-0137 L14: `standing:` changes need their marks (g1, g2) and `current:`
         # moves only with the newest active link (g4)
         errors.extend(_standing_guard_errors(
             full_path, old_result.frontmatter, old_text, new_result.frontmatter, new_text))
+        # ... and `code_refs:` membership changes need their `ref_marks:` rows the same way
+        errors.extend(_standing_guard_errors(
+            full_path, old_result.frontmatter, old_text, new_result.frontmatter, new_text, _REF_AUDIT))
         errors.extend(_current_discipline_errors(
             full_path, old_result.frontmatter, old_links, new_result.frontmatter, new_links_full))
         errors.extend(_staged_standing_errors(full_path, new_result.frontmatter, new_links_full))
@@ -3537,9 +3824,10 @@ Append-only history mode (a second, independent check -- given
                      status, superseded_by, promoted_by -- may each move
                      forward once. A link removed, or a topic file deleted
                      or renamed, is an error. New links (above every recorded
-                     one), and changes to title/tags/code_refs/the body text
-                     outside a link, are free; a `standing:` change needs its
-                     `standing_marks:` rows, link order is frozen, and `current`
+                     one), and changes to title/tags/the body text
+                     outside a link, are free; a `code_refs` change needs its
+                     `ref_marks:` rows, a recorded topic's `type` is frozen, a
+                     `standing:` change needs its `standing_marks:` rows, link order is frozen, and `current`
                      moves only with the newest active link. A REF that never parsed is repaired
                      (a note, not an error) when the new side now parses
                      cleanly -- there is no recorded link history to

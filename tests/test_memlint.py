@@ -1302,7 +1302,6 @@ class TestMemlintAgainstRef(unittest.TestCase):
                 TOPIC_L1_L2
                 .replace("title: Test topic", "title: Renamed title")
                 .replace("tags: []", "tags: [a, b]")
-                .replace("area: memory\n", "area: memory\ncode_refs:\n  - src/x.py\n")
                 .replace("Body.\n", "New body text entirely.\n")
             )
             (root / "topics" / "foo.md").write_text(text)
@@ -1632,9 +1631,9 @@ class TestMemlintAgainstRef(unittest.TestCase):
             self.assertIn(":L1:", out)
             self.assertIn(":L2:", out)
 
-    def test_p_title_code_refs_tags_change_with_byte_identical_links_is_clean(self):
-        """Acceptance 3 / SCHEMA section 7: `title`, `tags`, and `code_refs`
-        are explicitly free, even under the new byte rule -- they sit
+    def test_p_title_and_tags_change_with_byte_identical_links_is_clean(self):
+        """Acceptance 3 / SCHEMA section 7: `title` and `tags` are free
+        (`code_refs` is audited by `ref_marks:` since 0.6.0), even under the new byte rule -- they sit
         OUTSIDE any link's span (before `links:` in file order), so
         changing them must never trip the reformat check on links whose
         own bytes are untouched."""
@@ -1642,7 +1641,7 @@ class TestMemlintAgainstRef(unittest.TestCase):
             root = self._base_store(td)
             text = (
                 TOPIC_L1_L2.replace("title: Test topic\n", "title: Renamed test topic\n")
-                .replace("tags: []\n", "tags: [memcontinuum]\ncode_refs:\n  - memlint.py\n")
+                .replace("tags: []\n", "tags: [memcontinuum]\n")
             )
             self.assertNotEqual(text, TOPIC_L1_L2, "fixture stale: nothing matched")
             (root / "topics" / "foo.md").write_text(text)
