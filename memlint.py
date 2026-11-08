@@ -180,14 +180,26 @@ _ANCHOR_PREFIX_GLOB_MESSAGE = ("ref is a prefix or glob -- those are 'not checke
                                "and never carry an anchor row")
 
 
-def _anchor_errors(path, fm: dict, topic_link_ids: set) -> list[str]:
-    """Validation of a topic's `anchors:` rows (docs/SCHEMA.md, "Anchors")."""
+def _topic_link_ids(fm: dict) -> set:
+    """The ids of a topic's links (the set the anchor and mark rows must name)."""
+    links = fm.get("links")
+    return {str(l.get("link")) for l in links if isinstance(l, dict) and l.get("link")} \
+        if isinstance(links, list) else set()
+
+
+def _anchor_errors(path, fm: dict, topic_link_ids: set, skip_idents: set | None = None) -> list[str]:
+    """Validation of a topic's `anchors:` rows (docs/SCHEMA.md, "Anchors"). `skip_idents`: under
+    `--against-ref`, the identities (`_anchor_ident`) of rows recorded at REF -- those are
+    grandfathered (freeze-only) and not judged here; the (ref, link) duplicate check is the
+    freeze's own then (`skip_idents` not None)."""
     rows = anchor_rows(fm)
     if not rows:
         return []
     errors: list[str] = []
     code_refs = {str(r) for r in fm.get("code_refs") or []}
     for i, row in enumerate(rows):
+        if skip_idents is not None and _anchor_ident(row) in skip_idents:
+            continue
         ref = row.get("ref")
         prefix = f"{path}: anchors[{i}] ({ref!r})"
         # the prefix/glob prohibition comes FIRST and holds whatever the ref's membership: the
@@ -227,11 +239,12 @@ def _anchor_errors(path, fm: dict, topic_link_ids: set) -> list[str]:
         captured_at = row.get("captured_at")
         if captured_at is None or isinstance(captured_at, (dict, list)) or str(captured_at).strip() == "":
             errors.append(f"{prefix}: captured_at is required (part of the row's identity)")
-    for ref, link in _anchor_duplicate_keys(rows):
-        errors.append(
-            f"{path}: anchors: more than one row for ({ref!r}, {link!r}) -- one baseline per "
-            "key in this release; a new baseline is a new link"
-        )
+    if skip_idents is None:
+        for ref, link in _anchor_duplicate_keys(rows):
+            errors.append(
+                f"{path}: anchors: more than one row for ({ref!r}, {link!r}) -- one baseline per "
+                "key in this release; a new baseline is a new link"
+            )
     return errors
 
 
@@ -508,7 +521,7 @@ def lint_topic(
     # caught three different ways with three different blast radii. See
     # lint_file's own `ERROR: <path>: links: duplicate link id ...` line,
     # which fires from that same diagnostic.
-    topic_link_ids = {str(l.get("link")) for l in links if l.get("link")}
+    topic_link_ids = _topic_link_ids(fm)
     topic_links_by_id = {str(l.get("link")): l for l in links if l.get("link")}
     for link in links:
         rev = link.get("reverses")
@@ -2936,26 +2949,24 @@ def _frozen_rows_errors(old_rows: list, new_rows: list, ident, name, old_spans, 
     return errors
 
 
-def _anchor_freeze_errors(full_path, old_text, old_rows: list, new_text, new_rows: list,
+def _anchor_freeze_errors(full_path, old_text, old_rows: list, new_text, new_fm: dict,
                           notes: list[str]) -> list[str]:
     """The append-only rule for `anchors:` rows: a row recorded at REF must
     survive with the same parsed fields AND the same raw bytes; new rows are
     free; a second row for an existing (ref, link) key is an error. Raw
     spans come from the same walker the links freeze uses (`_link_raw_spans`
-    with key="anchors")."""
+    with key="anchors"). A row whose identity is NEW since REF meets the COMPLETE plain-lint
+    validator (`_anchor_errors`: prefix/glob, membership, link, digest, algo, span, ...); rows
+    recorded at REF stay freeze-only (grandfathered)."""
+    new_rows = anchor_rows(new_fm)
     errors: list[str] = []
     for ref, link in _anchor_duplicate_keys(new_rows):
         errors.append(
             f"{full_path}: anchors: more than one row for ({ref!r}, {link!r}) -- one baseline per "
             "key in this release; a new baseline is a new link"
         )
-    # a row NEW since REF is judged for the one rule that does not depend on the code or the
-    # links: a prefix or glob ref never carries an anchor row, unbound or not (R10-3)
     old_idents = {i for i in (_anchor_ident(r) for r in old_rows) if i is not None}
-    for row in new_rows:
-        ref = row.get("ref") if isinstance(row, dict) else None
-        if ref is not None and _anchor_ident(row) not in old_idents and not code_ref_is_anchorable(str(ref)):
-            errors.append(f"{full_path}: anchor ({ref!r}, {row.get('link')!r}): {_ANCHOR_PREFIX_GLOB_MESSAGE}")
+    errors.extend(_anchor_errors(full_path, new_fm, _topic_link_ids(new_fm), skip_idents=old_idents))
     if not old_rows:
         return errors
     old_spans = (
@@ -3296,6 +3307,8 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
                     # worktree copy, INC-0127): rows, pointers, `current:` == head
                     errors.extend(_staged_standing_errors(full_path, added.frontmatter, links))
                     errors.extend(_staged_head_errors(full_path, added.frontmatter, links))
+                    # ... and every anchor row of the new file meets the complete anchor validator
+                    errors.extend(_anchor_errors(full_path, added.frontmatter, _topic_link_ids(added.frontmatter)))
                 errors.extend(_added_links_errors(
                     full_path, links, set(), fm=added.frontmatter, ctx=ctx))
             continue
@@ -3391,7 +3404,7 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
                     # a repair of the links is not a licence to rewrite a capture.
                     errors.extend(_anchor_freeze_errors(
                         full_path, _decode_or_none(old_blob), anchor_rows(old_result.frontmatter),
-                        _decode_or_none(new_blob), anchor_rows(new_result.frontmatter), notes,
+                        _decode_or_none(new_blob), new_result.frontmatter, notes,
                     ))
                     # ... and so do the standing marks (g1), and every row and pointer of the
                     # new blob meets the plain-mode rules (pairing cannot run: see the note)
@@ -3571,7 +3584,7 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
 
         errors.extend(_anchor_freeze_errors(
             full_path, old_text, anchor_rows(old_result.frontmatter),
-            new_text, anchor_rows(new_result.frontmatter), notes,
+            new_text, new_result.frontmatter, notes,
         ))
 
         # TOP-0137 L14: `standing:` changes need their marks (g1, g2) and `current:`

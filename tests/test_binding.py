@@ -1483,7 +1483,9 @@ class TestGateRound2Crlf(unittest.TestCase):
     the original bytes; an LF twin behaves the same."""
 
     def _text(self, rows, crlf):
-        text = topic_text(rows)
+        # gate round 11 R11-2: a row added since REF meets the complete anchor validator, so the
+        # appended row's ref (src/bar.py) must be in code_refs on BOTH sides
+        text = topic_text(rows, code_refs=("src/foo.py", "src/bar.py"))
         return text.replace("\n", "\r\n") if crlf else text
 
     def _run(self, crlf, new_text_fn):

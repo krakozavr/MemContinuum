@@ -719,6 +719,49 @@ class TestTypeFrozen(GuardCase):
 
 
 # ---------------------------------------------------------------------------
+# gate round 11 R11-2: rows new since REF meet the complete anchor validator
+# ---------------------------------------------------------------------------
+
+class TestNewAnchorRowsMeetTheFullValidator(GuardCase):
+    def test_an_added_topic_with_a_prefix_anchor_is_refused(self):
+        self.store(ttext(["src/a.py"]))
+        text = binding_topic([good_row(ref="src/")], code_refs=("src/",),
+                             marks_text="ref_marks:\n" + rmark("src/"))
+        (self.root / "topics" / "bar.md").write_text(text)
+        git(["add", "-A"], self.root)
+        rc, out = run_memlint(["--against-ref", "HEAD", "--staged", str(self.root)])
+        self.assertEqual(rc, 1, out)
+        self.assertIn(memlint._ANCHOR_PREFIX_GLOB_MESSAGE, out)
+
+    def test_an_added_topic_with_a_bad_digest_anchor_is_refused_on_the_worktree_and_staged_paths(self):
+        self.store(ttext(["src/a.py"]))
+        text = binding_topic([good_row(digest='"abc"')],
+                             marks_text="ref_marks:\n" + rmark("src/foo.py"))
+        (self.root / "topics" / "bar.md").write_text(text)
+        git(["add", "-A"], self.root)
+        rc, out = run_memlint(["--against-ref", "HEAD", "--staged", str(self.root)])
+        self.assertEqual(rc, 1, out)
+        self.assertIn("digest must be 64 lowercase hex characters", out)
+
+    def test_a_modified_topic_whose_new_row_has_a_bad_digest_is_refused(self):
+        refs = ("src/foo.py", "src/bar.py")
+        self.store(binding_topic([good_row()], code_refs=refs))
+        self.assertRefused(binding_topic([good_row(ref="src/bar.py", digest='"abc"'), good_row()], code_refs=refs),
+                           "digest must be 64 lowercase hex characters")
+        self.assertRefused(binding_topic([good_row(ref="src/bar.py", link="L9"), good_row()], code_refs=refs),
+                           "link 'L9' is not a link in this topic")
+        self.assertRefused(binding_topic([good_row(ref="src/nowhere.py"), good_row()], code_refs=refs),
+                           "ref is not present verbatim in this topic's code_refs")
+        self.assertClean(binding_topic([good_row(ref="src/bar.py"), good_row()], code_refs=refs))
+
+    def test_a_grandfathered_row_is_freeze_only_even_when_it_would_fail_plain_lint(self):
+        refs = ("src/foo.py",)
+        old = binding_topic([good_row(digest='"abc"')], code_refs=refs)
+        self.store(old)
+        self.assertClean(old.replace("Body.", "Body, edited."))
+
+
+# ---------------------------------------------------------------------------
 # gate round 11 R11-1: the frozen type is what the index delivers (`infer_type`)
 # ---------------------------------------------------------------------------
 
