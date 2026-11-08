@@ -1108,7 +1108,7 @@ class TestGateRound3(FilingCase):
                 raise OSError("close failed")
 
         def unlink_once_fails(path, *a, **k):
-            if not unlinked and Path(path) == target:
+            if not unlinked and Path(path).resolve() == target.resolve():
                 unlinked.append(path)
                 raise OSError("unlink refused")
             return real_unlink(path, *a, **k)
