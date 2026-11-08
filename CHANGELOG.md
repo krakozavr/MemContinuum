@@ -12,7 +12,7 @@ itself. The new `unbind` command takes one reference off a topic (a path, a
 `path#symbol`, a prefix or a glob), records a `remove` row and leaves the frozen
 anchor in place as history; binding the same file again restores the reference
 without capturing a second baseline. Existing topics need no rows until their
-next change. A topic's `type` can no longer be changed once recorded.
+next change. A delivered record's `type` can no longer be changed once recorded (a quarantined or non-canonical record may be repaired freely, and a delivered record may not become quarantined).
 
 **Breaking:** `mark-standing` no longer takes `--authority`. The authority of a
 standing change is read from the session transcript like a filed link: pass

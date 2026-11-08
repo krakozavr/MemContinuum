@@ -437,15 +437,15 @@ class TestTypeFrozen(GuardCase):
         self.assertFalse(strict.fallback)
         self.assertEqual(self._frozen(strict), "topic")
 
-    # gate round 9 R9-3 (Grok MAJOR): a garbled type, a `links:` list and no id freezes `topic` through the
-    # parser's top_level_keys; a `type: memo` note with no links and no id stays exempt
+    # gate round 9 R9-3 (Grok MAJOR), as amended in round 12: a garbled type with a `links:` list is quarantined
+    # by the index, so it is exempt; a `type: memo` note with no links and no id is a stored note, also exempt
     LINKS_REF = ("---\ntype: topic # comment\ntitle: bad: title\nlinks:\n  - link: L1\n    date: 2026-01-01\n"
                  "    decision: x\n---\n\nBody.\n")
     MEMO_REF = "---\ntype: memo\ntitle: bad: title\n---\n\nBody.\n"
 
     def test_a_quarantined_links_fallback_ref_may_declare_any_type(self):
-        # round 12 R12-1 (was: frozen `topic` through top_level_keys, "must declare it"): `type: topic # comment`
-        # is canonical to the raw scan, so the index quarantined the REF
+        # round 12 R12-1 (was: frozen `topic`, "must declare it"): `type: topic # comment` is canonical to the
+        # raw scan, so the index quarantined the REF
         self._assert_quarantined(self.LINKS_REF)
         self.store(self.LINKS_REF)
         fixed = self.LINKS_REF.replace("title: bad: title", 'title: "bad: title"')
@@ -511,12 +511,12 @@ class TestTypeFrozen(GuardCase):
         inbox = Path("/store") / "inbox" / "n.md"
         self.assertIsNone(memlint._frozen_type(Path("/store"), inbox, memidx.parse_record_text(ttext(["src/a.py"]), "x")))   # `inbox` is not canonical
 
-    # gate round 10 R10-2 (Sol MAJOR, Grok MINOR): the fallback key scan used for `top_level_keys` sees quoted
-    # and indented keys; it over-includes (a `links:` in a scalar, a nested one) -- the ruled fail-closed direction
+    # gate round 10 R10-2 (Sol MAJOR, Grok MINOR): the fallback key scan sees quoted and indented keys; it
+    # over-includes (a `links:` in a scalar, a nested one), and such a REF is quarantined, so any repair is free
     LINKS_BLOCK = "  - link: L1\n    date: 2026-01-01\n    decision: x\n"
 
     def _links_guard(self, ref):
-        # round 12 R12-1 (was a top_level_keys scan, then "must declare topic"): every one of these REFs carries
+        # round 12 R12-1 (was "must declare topic"): every one of these REFs carries
         # `type: topic # c`, canonical to the raw scan, so the index quarantined it and any repair is free
         res = memidx.parse_record_text(ref, "x")
         self.assertTrue(res.fallback, res)
@@ -554,7 +554,7 @@ class TestTypeFrozen(GuardCase):
 
     # gate round 11 R11-3 (Sol MINOR): the quotes around a scanned key must MATCH
     def test_mismatched_quotes_around_a_key_do_not_make_the_ref_canonical(self):
-        # round 12 R12-1 (was the top_level_keys table): only a bare column-zero `links:` makes the memo canonical
+        # round 12 R12-1: only a bare column-zero `links:` makes the memo canonical
         # (quarantined, any repair free); every other spelling is a stored `memo` note, frozen as such
         for key, quarantined in (("links'", False), ('"links"', False), ("'links'", False), ('"links', False), ("links", True)):
             with self.subTest(key=key):

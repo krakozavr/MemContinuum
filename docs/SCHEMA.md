@@ -442,9 +442,10 @@ pre-commit hook reads):
   after being recorded`. Leaving delivery (canonical to anything) is refused; entering it (a quarantined
   record, or a note stored under a non-canonical word such as `memo`, `inbox` or a garbled one, repaired to a
   canonical type) is free, like an added file. A typeless record under `topics/` is frozen as `topic` and may
-  stay typeless or declare `topic`; it cannot gain `type: incident` or `metadata.type`, and a record that is
-  really an incident but sits under `topics/` must stay a topic or be MOVED (a move is a deletion plus an
-  addition under `--no-renames`, governed by the deletion rule). A delivered record may not become quarantined: a new side the index would quarantine (schema-invalid) is `record leaves delivery: the new side would be quarantined (<first schema error>)`, on the worktree and staged paths. Plain lint is unchanged.
+  stay typeless or declare `topic`; it cannot gain `type: incident` or `metadata.type`. The delivered type is
+  frozen whatever it is: a valid `type: incident` under `topics/` is frozen as `incident` (declaring `topic`
+  is `type changed 'incident' -> 'topic'`), and a move to another directory is a deletion plus an addition
+  under `--no-renames`, governed by the deletion rule. A delivered record may not become quarantined: a new side the index would quarantine (schema-invalid) is `record leaves delivery: the new side would be quarantined (<first schema error>)`, on the worktree and staged paths. Plain lint is unchanged.
 - *Link order is frozen (g3).* The link ids present at `REF` must keep their relative order in the
   new blob (new links go on top; the older newest-first check refuses one placed between old ids): `<path>: links reordered (L2 before
   L3; the chain head is first-active-in-file-order)`. The chain head is the first active link in file
