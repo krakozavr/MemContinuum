@@ -38,6 +38,7 @@ import urllib.parse
 from collections import Counter
 from datetime import date as _date, datetime, timedelta, timezone
 from pathlib import Path
+from stat import S_ISLNK
 from stat import S_ISREG
 from urllib.parse import quote
 
@@ -6250,7 +6251,91 @@ def _unmapped_best_root(resolved_path: Path, code_roots: list[Path]) -> Path | N
     return best
 
 
-def _unmapped_path_candidates(raw_path: str, code_roots: list[Path]) -> list[str]:
+class _UnmappedResolver:
+    """Resolves absolute paths like `Path.resolve()` but walks each
+    DIRECTORY once per call: on a Windows-mounted tree every `lstat` is a
+    network-filesystem round trip (~0.8 ms), and a per-path `realpath`
+    repeated the whole component walk for every path (422 paths: 7+ s).
+    A directory is resolved from its already-resolved parent plus one
+    `lstat` of its own name; a path is its resolved directory plus the
+    final name checked against a symlink (one `lstat`, or, once a
+    directory holds several paths, one listing of that directory). A
+    symlinked directory or file component is followed with the real `realpath`, so the answer is the same as
+    `Path.resolve()`; a path containing `..` skips the cache entirely
+    (it must be resolved physically)."""
+
+    def __init__(self, paths: "list[str] | None" = None) -> None:
+        # Files per (as-given) directory across the whole call: a directory
+        # holding two or more of the paths is listed once instead of
+        # lstat-ed per file.
+        self._shared: set[str] = set()
+        seen: set[str] = set()
+        for raw in paths or ():
+            d = os.path.dirname(raw)
+            (self._shared if d in seen else seen).add(d)
+        self._dirs: dict[str, str] = {}
+        # resolved directory -> {entry name: is a symlink}; None when the
+        # directory cannot be listed. One listing answers "is this final
+        # component a symlink" for every path in the directory.
+        self._listings: dict[str, dict[str, bool] | None] = {}
+        self._folded: dict[str, set[str]] = {}
+
+    def _is_link(self, parent: str, full: str, bulk: bool) -> bool:
+        listing = self._listings.get(parent, False)
+        if listing is False and bulk:
+            try:
+                with os.scandir(parent) as it:
+                    listing = {e.name: e.is_symlink() for e in it}
+            except OSError:
+                listing = None
+            self._listings[parent] = listing
+        name = os.path.basename(full)
+        if listing is not None and listing is not False:
+            if name in listing:
+                return listing[name]
+            folded = self._folded.get(parent)
+            if folded is None:
+                folded = self._folded[parent] = {k.casefold() for k in listing}
+            if name.casefold() not in folded:
+                return False  # absent from the directory: nothing to follow
+        # No listing yet, or a name differing only in case (a
+        # case-insensitive mount): ask the filesystem directly.
+        try:
+            return S_ISLNK(os.lstat(full).st_mode)
+        except OSError:
+            return False
+
+    def _resolve_dir(self, d: str) -> str:
+        hit = self._dirs.get(d)
+        if hit is not None:
+            return hit
+        parent = os.path.dirname(d)
+        if parent == d:
+            out = d
+        else:
+            out = self._join_final(self._resolve_dir(parent), os.path.basename(d), False)
+        self._dirs[d] = out
+        return out
+
+    def _join_final(self, parent: str, name: str, bulk: bool) -> str:
+        full = os.path.join(parent, name)
+        return os.path.realpath(full) if self._is_link(parent, full, bulk) else full
+
+    def resolve(self, raw_path: str) -> Path:
+        p = Path(raw_path)
+        if ".." in p.parts or not p.name:
+            return p.resolve()
+        d = str(p.parent)
+        return Path(self._join_final(self._resolve_dir(d), p.name, d in self._shared))
+
+
+def _unmapped_resolved(raw_path: str, resolver: "_UnmappedResolver | None") -> Path:
+    return resolver.resolve(raw_path) if resolver is not None else Path(raw_path).resolve()
+
+
+def _unmapped_path_candidates(
+    raw_path: str, code_roots: list[Path], resolver: "_UnmappedResolver | None" = None,
+) -> list[str]:
     """Candidates to try against the index's (repo-relative) code_refs /
     concept paths: the path as given, and -- when at least one --code-root
     is supplied, the given path is absolute, and it resolves under one of
@@ -6258,13 +6343,14 @@ def _unmapped_path_candidates(raw_path: str, code_roots: list[Path]) -> list[str
     matching root. This is the engine-side fix for the multi-candidate
     workaround documented at the top of hooks/pre-edit-chain.sh (a
     PreToolUse/PostToolUse file_path is always absolute; code_refs are
-    conventionally repo-relative)."""
+    conventionally repo-relative). `resolver` (one per call) makes the
+    resolution cost per directory instead of per path."""
     candidates = [raw_path]
     if code_roots:
         try:
             p = Path(raw_path)
             if p.is_absolute():
-                resolved = p.resolve()
+                resolved = _unmapped_resolved(raw_path, resolver)
                 best = _unmapped_best_root(resolved, code_roots)
                 if best is not None:
                     rel = str(resolved.relative_to(best))
@@ -6315,7 +6401,9 @@ def _unmapped_ref_hit(matcher, conn, project: str, candidates: list[str]) -> boo
     return matcher(conn, project, candidates[1])
 
 
-def _unmapped_display_path(raw_path: str, code_roots: list[Path]) -> str:
+def _unmapped_display_path(
+    raw_path: str, code_roots: list[Path], resolver: "_UnmappedResolver | None" = None,
+) -> str:
     """The path string reported back for one PATH argument: relative to
     the LONGEST matching --code-root when resolvable, else the path
     exactly as given."""
@@ -6323,7 +6411,7 @@ def _unmapped_display_path(raw_path: str, code_roots: list[Path]) -> str:
         try:
             p = Path(raw_path)
             if p.is_absolute():
-                resolved = p.resolve()
+                resolved = _unmapped_resolved(raw_path, resolver)
                 best = _unmapped_best_root(resolved, code_roots)
                 if best is not None:
                     return str(resolved.relative_to(best))
@@ -6451,9 +6539,10 @@ def cmd_unmapped(args) -> int:
                     # has on hand, sidestepping the display-string collision
                     # entirely rather than trying to reconstruct a safe
                     # (root, relative_path) pair from a lossy string.
+                    resolver = _UnmappedResolver(list(args.paths))
                     for raw_path in args.paths:
-                        candidates = _unmapped_path_candidates(raw_path, code_roots)
-                        display = _unmapped_display_path(raw_path, code_roots)
+                        candidates = _unmapped_path_candidates(raw_path, code_roots, resolver)
+                        display = _unmapped_display_path(raw_path, code_roots, resolver)
                         topic_hit = _unmapped_ref_hit(
                             topic_matches_for_path, conn, args.project, candidates,
                         )
