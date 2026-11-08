@@ -444,7 +444,7 @@ pre-commit hook reads):
   canonical type) is free, like an added file. A typeless record under `topics/` is frozen as `topic` and may
   stay typeless or declare `topic`; it cannot gain `type: incident` or `metadata.type`, and a record that is
   really an incident but sits under `topics/` must stay a topic or be MOVED (a move is a deletion plus an
-  addition under `--no-renames`, governed by the deletion rule). Plain lint is unchanged.
+  addition under `--no-renames`, governed by the deletion rule). A delivered record may not become quarantined: a new side the index would quarantine (schema-invalid) is `record leaves delivery: the new side would be quarantined (<first schema error>)`, on the worktree and staged paths. Plain lint is unchanged.
 - *Link order is frozen (g3).* The link ids present at `REF` must keep their relative order in the
   new blob (new links go on top; the older newest-first check refuses one placed between old ids): `<path>: links reordered (L2 before
   L3; the chain head is first-active-in-file-order)`. The chain head is the first active link in file
