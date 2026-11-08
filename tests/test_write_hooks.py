@@ -3772,6 +3772,125 @@ class TestUserPromptRemind(HookTestBase):
     # or fail for the wrong reason (see test_real_shaped_payload_no_source_
     # no_agent_proceeds above for the same seeding pattern).
 
+    # ---- incremental classification (session cache of verdicts) -------
+
+    def _spy_env(self, spy_log):
+        """An env whose python is a wrapper logging every `memidx.py
+        unmapped` argv (one line per call) before running the real one."""
+        wrapper = Path(self.td) / "py-spy.sh"
+        wrapper.write_text(
+            "#!/usr/bin/env bash\n"
+            'case "${1##*/} ${2:-}" in "memidx.py unmapped") printf "%s\\n" "$*" >> "' + str(spy_log) + '";; esac\n'
+            'exec "' + VENV_PYTHON + '" "$@"\n'
+        )
+        wrapper.chmod(0o755)
+        return self.base_env(MEMCONTINUUM_PYTHON=str(wrapper))
+
+    def _unmapped_calls(self, spy_log):
+        if not spy_log.exists():
+            return []
+        return [l for l in spy_log.read_text().splitlines() if l]
+
+    def _prompt(self, session_id, env):
+        self.patch_state(session_id, last_inject_turn=-999, last_inject_time=0)
+        proc, _ = run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), env, timeout=20.0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc
+
+    def test_only_paths_new_since_the_previous_prompt_are_classified(self):
+        spy = Path(self.td) / "unmapped-calls.log"
+        env = self._spy_env(spy)
+        session_id = "s-userprompt-incremental"
+        mapped = str(self.code_root / "src" / "mapped.py")
+        unmapped = str(self.code_root / "src" / "unmapped.py")
+        self.seed_ledger(session_id, [(mapped, "code"), (unmapped, "code")])
+        first = self._prompt(session_id, env)
+        calls = self._unmapped_calls(spy)
+        self.assertEqual(len(calls), 1, calls)
+        self.assertIn(mapped, calls[0])
+        self.assertIn(unmapped, calls[0])
+        cache = self.load_state(session_id)["unmapped_cache"]
+        self.assertEqual(cache["store_head"], git_head(self.store_root))
+        self.assertEqual(set(cache["verdicts"]), {mapped, unmapped})
+
+        extra = str(self.code_root / "src" / "extra.py")
+        self.seed_ledger(session_id, [(extra, "code")])
+        second = self._prompt(session_id, env)
+        calls = self._unmapped_calls(spy)
+        self.assertEqual(len(calls), 2, calls)
+        self.assertIn(extra, calls[1])
+        self.assertNotIn(mapped, calls[1])
+        self.assertNotIn(unmapped, calls[1])
+        # The reader sees the whole session, not just the new path.
+        self.assertIn("1 edited file(s) with no decision topic: src/unmapped.py;", first.stdout)
+        self.assertIn("2 edited file(s) with no decision topic: src/extra.py, src/unmapped.py;", second.stdout)
+
+    def test_422_cached_paths_and_one_new_edit_pass_one_path(self):
+        spy = Path(self.td) / "unmapped-calls.log"
+        env = self._spy_env(spy)
+        session_id = "s-userprompt-incremental-422"
+        many = [str(self.code_root / "render" / f"f{i:03d}.png") for i in range(422)]
+        self.seed_ledger(session_id, [(p, "code") for p in many])
+        self._prompt(session_id, env)
+        self.assertEqual(len(self.load_state(session_id)["unmapped_cache"]["verdicts"]), 422)
+        new = str(self.code_root / "render" / "new.png")
+        self.seed_ledger(session_id, [(new, "code")])
+        self._prompt(session_id, env)
+        calls = self._unmapped_calls(spy)
+        self.assertEqual(len(calls), 2, calls)
+        self.assertEqual(calls[1].split(" --root ")[0].split(" unmapped ")[1], new)
+
+    def test_nothing_new_makes_no_unmapped_call_and_the_signal_is_unchanged(self):
+        spy = Path(self.td) / "unmapped-calls.log"
+        env = self._spy_env(spy)
+        session_id = "s-userprompt-incremental-none"
+        unmapped = str(self.code_root / "src" / "unmapped.py")
+        self.seed_ledger(session_id, [(unmapped, "code")])
+        first = self._prompt(session_id, env)
+        # Re-arm coverage candidacy without any new path.
+        self.patch_state(session_id, last_injected_pairs=[])
+        second = self._prompt(session_id, env)
+        self.assertEqual(len(self._unmapped_calls(spy)), 1)
+        self.assertIn("1 edited file(s) with no decision topic: src/unmapped.py", first.stdout)
+        self.assertIn("1 edited file(s) with no decision topic: src/unmapped.py", second.stdout)
+
+    def test_a_store_commit_between_prompts_recomputes_every_path(self):
+        spy = Path(self.td) / "unmapped-calls.log"
+        env = self._spy_env(spy)
+        session_id = "s-userprompt-incremental-commit"
+        mapped = str(self.code_root / "src" / "mapped.py")
+        unmapped = str(self.code_root / "src" / "unmapped.py")
+        self.seed_ledger(session_id, [(mapped, "code"), (unmapped, "code")])
+        self._prompt(session_id, env)
+        subprocess.run(["git", "-C", str(self.store_root), "commit", "-q", "--allow-empty", "-m", "move"], check=True)
+        extra = str(self.code_root / "src" / "extra.py")
+        self.seed_ledger(session_id, [(extra, "code")])
+        self._prompt(session_id, env)
+        calls = self._unmapped_calls(spy)
+        self.assertEqual(len(calls), 2, calls)
+        for p in (mapped, unmapped, extra):
+            self.assertIn(p, calls[1])
+        self.assertEqual(self.load_state(session_id)["unmapped_cache"]["store_head"], git_head(self.store_root))
+
+    def test_a_session_without_the_cache_key_classifies_everything_as_before(self):
+        spy = Path(self.td) / "unmapped-calls.log"
+        env = self._spy_env(spy)
+        session_id = "s-userprompt-incremental-legacy"
+        mapped = str(self.code_root / "src" / "mapped.py")
+        unmapped = str(self.code_root / "src" / "unmapped.py")
+        self.seed_ledger(session_id, [(mapped, "code"), (unmapped, "code")])
+        self.assertNotIn("unmapped_cache", self.load_state(session_id))
+        proc = self._prompt(session_id, env)
+        calls = self._unmapped_calls(spy)
+        self.assertEqual(len(calls), 1, calls)
+        self.assertIn(mapped, calls[0])
+        self.assertIn(unmapped, calls[0])
+        self.assertIn("1 edited file(s) with no decision topic: src/unmapped.py", proc.stdout)
+        # A malformed cache is ignored the same way.
+        self.patch_state(session_id, unmapped_cache="junk", last_injected_pairs=[])
+        self._prompt(session_id, env)
+        self.assertEqual(len(self._unmapped_calls(spy)), 2)
+
     def test_hook_log_outcome_lines_carry_elapsed(self):
         session_id = "s-userprompt-elapsed-field"
         self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])

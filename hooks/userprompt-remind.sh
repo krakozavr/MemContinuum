@@ -541,6 +541,7 @@ if (not is_dup) or retry:
         "now": now,
         "pairs": [list(p) for p in pairs],
         "code_paths": code_paths,
+        "unmapped_cache": state.get("unmapped_cache"),
         "lookback_eligible": lookback_eligible,
         "since_turn": since_turn,
     })
@@ -792,21 +793,42 @@ if [ "${CANDIDATE:-0}" = "1" ] || [ -n "$MOVED_ROOTS" ]; then
     # pipe, which would run the loop in a subshell and drop the assignments)
     # feeding a plain while-read loop is the portable equivalent.
     CODE_PATHS=()
+    NEW_PATHS=()
     while IFS= read -r p; do
-        CODE_PATHS+=("$p")
+        case "$p" in
+            P:*) CODE_PATHS+=("${p#P:}") ;;
+            N:*) NEW_PATHS+=("${p#N:}") ;;
+        esac
     done < <(env PYTHONPATH= "$MC_PY" -c '
 import json, sys
 with open(sys.argv[1]) as f:
     d = json.load(f)
+# The session keeps the verdicts of the previous prompts (unmapped_cache),
+# valid only for the store HEAD they were made at: only the paths not in a
+# valid cache need the engine call. A missing, malformed or other-HEAD cache
+# means every path is new.
+cache = d.get("unmapped_cache")
+sha = sys.argv[2]
+verdicts = {}
+if sha and isinstance(cache, dict) and cache.get("store_head") == sha \
+        and isinstance(cache.get("verdicts"), dict) \
+        and isinstance(cache.get("displays"), dict):
+    verdicts = cache["verdicts"]
 for p in d.get("code_paths", []):
-    print(p)
-' "$DECIDE_TMP" 2>>"$MC_LOG")
+    print("P:" + p)
+    if p not in verdicts:
+        print("N:" + p)
+' "$DECIDE_TMP" "$CUR_STORE_SHA" 2>>"$MC_LOG")
 
     # Phase 2 (outside the lock): the real, possibly-heavier classification call.
     UNMAPPED_JSON="{}"
-    if [ "${#CODE_PATHS[@]}" -gt 0 ] && [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
+    UC_CALLED=0
+    UC_RAW=""
+    UC_TMP=""
+    if [ "${#CODE_PATHS[@]}" -gt 0 ] && [ -n "${MEMCONTINUUM_ROOT:-}" ] && [ "${#NEW_PATHS[@]}" -gt 0 ]; then
+        UC_CALLED=1
         ARGS=(unmapped)
-        ARGS+=("${CODE_PATHS[@]}")
+        ARGS+=("${NEW_PATHS[@]}")
         ARGS+=(--root "$MEMCONTINUUM_ROOT" --project "$MC_PROJECT" --db "$MC_DB_PATH" --json)
         while IFS= read -r CR; do
             [ -n "$CR" ] || continue
@@ -823,6 +845,7 @@ for p in d.get("code_paths", []):
         # the existing coverage_status != "ok" branch below already does.
         if { [ $RC -eq 0 ] || [ $RC -eq 1 ]; } && [ -n "$RAW" ]; then
             UNMAPPED_JSON="$RAW"
+            UC_RAW="$RAW"
             COVERAGE_STATUS="$(printf '%s' "$RAW" | env PYTHONPATH= "$MC_PY" -c '
 import json, sys
 try:
@@ -854,6 +877,96 @@ print(d.get("reason_code", "") if isinstance(d, dict) else "")
             if [ -n "$DEGRADED_REASON" ]; then
                 mc_log "userprompt outcome=index-degraded reason=${DEGRADED_REASON} session=${SESSION_ID:-} $(mc_elapsed_field)"
             fi
+        fi
+    fi
+
+    # Incremental classification: fold the verdicts of the paths just
+    # classified into the session's cache and rebuild the FULL answer the
+    # rest of this hook reads (the lists, by_path, coverage_status), so the
+    # message is the same whether a path was classified now or earlier. The
+    # cache is replaced only on a coverage_status of "ok" and dropped
+    # otherwise; a store HEAD that differs from the cached one already made
+    # every path new above.
+    if [ "${#CODE_PATHS[@]}" -gt 0 ] && [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
+        UC_TMP="$(mktemp 2>/dev/null)" || UC_TMP=""
+        if [ -n "$UC_TMP" ]; then
+            UC_MERGED="$(MC_UC_RAW="$UC_RAW" MC_UC_CALLED="$UC_CALLED" MC_UC_OUT="$UC_TMP" \
+                env PYTHONPATH= "$MC_PY" -c '
+import json, os, sys
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+sha = sys.argv[2]
+code_paths = d.get("code_paths", [])
+cache = d.get("unmapped_cache")
+verdicts, displays = {}, {}
+had_cache = isinstance(cache, dict)
+if sha and had_cache and cache.get("store_head") == sha \
+        and isinstance(cache.get("verdicts"), dict) and isinstance(cache.get("displays"), dict):
+    verdicts, displays = dict(cache["verdicts"]), dict(cache["displays"])
+called = os.environ.get("MC_UC_CALLED") == "1"
+raw = None
+if os.environ.get("MC_UC_RAW"):
+    try:
+        raw = json.loads(os.environ["MC_UC_RAW"])
+    except Exception:
+        raw = None
+    if not isinstance(raw, dict):
+        raw = None
+new_cache = None  # None: leave the stored cache alone; {}: drop it
+if called:
+    if raw is None:
+        print("{}")
+        raise SystemExit(0)
+    if raw.get("coverage_status") != "ok":
+        # No coverage claim: the answer is the call own, the cache goes.
+        print(json.dumps(raw))
+        if had_cache:
+            new_cache = {}
+        with open(os.environ["MC_UC_OUT"], "w") as f:
+            f.write(json.dumps(new_cache) if new_cache is not None else "")
+        raise SystemExit(0)
+    fresh = [p for p in code_paths if p not in verdicts]
+    queues = {k: list(raw.get(k) or []) for k in ("mapped_topic", "mapped_concept_only", "unmapped")}
+    by = raw.get("by_path") if isinstance(raw.get("by_path"), dict) else {}
+    for p in fresh:
+        st = by.get(p)
+        if st not in queues or not queues[st]:
+            # The answer does not account for this path: no claim.
+            print(json.dumps(raw))
+            raise SystemExit(0)
+        verdicts[p] = st
+        displays[p] = queues[st].pop(0)
+    new_cache = {"store_head": sha, "verdicts": {p: verdicts[p] for p in code_paths},
+                 "displays": {p: displays[p] for p in code_paths}} if sha else None
+elif not verdicts:
+    print("{}")
+    raise SystemExit(0)
+out = dict(raw) if raw else {}
+out["coverage_status"] = "ok"
+for k in ("mapped_topic", "mapped_concept_only", "unmapped"):
+    out[k] = [displays[p] for p in code_paths if verdicts.get(p) == k]
+out["by_path"] = {p: verdicts[p] for p in code_paths if p in verdicts}
+print(json.dumps(out))
+if new_cache is not None:
+    with open(os.environ["MC_UC_OUT"], "w") as f:
+        f.write(json.dumps(new_cache))
+' "$DECIDE_TMP" "$CUR_STORE_SHA" 2>>"$MC_LOG")"
+            if [ -n "$UC_MERGED" ]; then
+                UNMAPPED_JSON="$UC_MERGED"
+            fi
+            if [ -s "$UC_TMP" ]; then
+                MC_UC_FILE="$UC_TMP" mc_update_state_json "$STATE_FILE" '
+import os
+with open(os.environ["MC_UC_FILE"]) as _f:
+    _c = json.load(_f)
+if _c:
+    state["unmapped_cache"] = _c
+else:
+    state.pop("unmapped_cache", None)
+print(json.dumps(state))
+' >>"$MC_LOG" 2>&1
+            fi
+            rm -f "$UC_TMP" 2>/dev/null
         fi
     fi
 
