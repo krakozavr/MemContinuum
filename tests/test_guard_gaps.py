@@ -243,6 +243,45 @@ class TestTypeFrozen(GuardCase):
         self.store(broken)
         self.assertClean(broken.replace("title: bad: title", 'title: "bad: title"'))
 
+    @staticmethod
+    def _bad_title(text, type_line=None):
+        lines = text.split("\n")
+        for i, ln in enumerate(lines):
+            if ln.startswith("title:"):
+                lines[i] = "title: bad: title"
+            if type_line and ln == "type: topic":
+                lines[i] = type_line
+        return "\n".join(lines)
+
+    def test_a_schema_invalid_but_strict_ref_keeps_its_type_frozen(self):
+        # REF: valid YAML, `type: topic`, `tags: not-a-list` -> valid=False, fallback=False
+        broken = ttext(["src/a.py"]).replace("tags: []\n", "tags: not-a-list\n", 1)
+        res = memidx.parse_record_text(broken, "x")
+        self.assertFalse(res.valid, res)
+        self.assertFalse(res.fallback, res)
+        self.store(broken)
+        repaired = broken.replace("tags: not-a-list\n", "tags: []\n", 1)
+        self.assertClean(repaired)
+        self.assertRefused(repaired.replace("type: topic\n", "type: incident\n", 1),
+                           "type changed 'topic' -> 'incident'")
+
+    def test_a_fallback_ref_with_a_clean_known_type_keeps_it_frozen(self):
+        broken = self._bad_title(ttext(["src/a.py"]))
+        self.assertTrue(memidx.parse_record_text(broken, "x").fallback)
+        self.store(broken)
+        fixed = broken.replace("title: bad: title", 'title: "bad: title"')
+        self.assertClean(fixed)
+        self.assertRefused(fixed.replace("type: topic\n", "type: incident\n", 1),
+                           "type changed 'topic' -> 'incident'")
+
+    def test_a_fallback_ref_with_a_garbage_recovered_type_is_not_frozen(self):
+        broken = self._bad_title(ttext(["src/a.py"]), type_line="type: banana # note")
+        res = memidx.parse_record_text(broken, "x")
+        self.assertTrue(res.fallback, res)
+        self.store(broken)
+        fixed = broken.replace("title: bad: title", 'title: "bad: title"')
+        self.assertClean(fixed.replace("type: banana # note", "type: topic"))
+
     def test_a_strict_type_change_is_still_refused_with_a_comment_free_ref(self):
         base = ttext(["src/a.py"])
         self.assertTrue(memidx.parse_record_text(base, "x").valid)
