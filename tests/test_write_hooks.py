@@ -4098,8 +4098,13 @@ class TestUserPromptRemind(HookTestBase):
         self.assertEqual(len(calls), 2, calls)
         self.assertEqual(self._call_paths(calls[1]), [unmapped])
 
-    def _edit_through_ledger_hook(self, session_id, path):
-        proc, _ = run_script(LEDGER_HOOK, self.post_tool_use_payload(session_id, path), self.base_env())
+    def _edit_through_ledger_hook(self, session_id, path, at=None):
+        """`at` pins the ledger's seen_at through the test-only seam
+        (MEMCONTINUUM_TEST_CLOCK=1 + MC_SEEN_NOW, as for MC_T0_US)."""
+        env = self.base_env()
+        if at is not None:
+            env.update(MEMCONTINUUM_TEST_CLOCK="1", MC_SEEN_NOW=repr(at))
+        proc, _ = run_script(LEDGER_HOOK, self.post_tool_use_payload(session_id, path), env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
     def _set_verdict_time(self, session_id, path, stamp):
@@ -4107,31 +4112,44 @@ class TestUserPromptRemind(HookTestBase):
         state["unmapped_cache"]["classified_at"][path] = stamp
         self.state_file(session_id).write_text(json.dumps(state))
 
-    def test_an_edit_in_the_same_wall_second_as_the_verdict_is_reclassified(self):
-        """Gate round 2 R2-1, through the real hooks: the ledger hook stamps a
-        fractional seen_at, and a verdict made a moment ago does not hide an
-        edit made after it, usually in that same wall second."""
+    def _reclassified_paths_after_edit_at(self, session_id, unmapped_edit_at):
+        """Verdict of `unmapped` pinned at S+0.25, its edit pinned at the given
+        time through the real ledger hook; returns the paths of the next call."""
         spy = Path(self.td) / "unmapped-calls.log"
         env = self._spy_env(spy)
-        session_id = "s-userprompt-incremental-same-second"
         mapped = str(self.code_root / "src" / "mapped.py")
         unmapped = str(self.code_root / "src" / "unmapped.py")
         self._edit_through_ledger_hook(session_id, mapped)
         self._edit_through_ledger_hook(session_id, unmapped)
         self._prompt(session_id, env)
         whole = float(int(time.time()))
-        self._set_verdict_time(session_id, unmapped, time.time())  # classified just now
+        self._set_verdict_time(session_id, unmapped, whole + 0.25)
         self._set_verdict_time(session_id, mapped, whole + 5.0)  # clearly after its own edit
-        # The edit of `unmapped` lands now: at or after second `whole` (a
-        # rollover to the next second only makes it later still).
-        self._edit_through_ledger_hook(session_id, unmapped)
-        seen = {e["path"]: e["seen_at"] for e in self.load_state(session_id)["ledger"]}
-        self.assertNotEqual(seen[unmapped], float(int(seen[unmapped])), "seen_at is a whole second")
+        self._edit_through_ledger_hook(session_id, unmapped, at=unmapped_edit_at(whole))
         self.patch_state(session_id, last_injected_pairs=[])
         self._prompt(session_id, env)
         calls = self._unmapped_calls(spy)
         self.assertEqual(len(calls), 2, calls)
-        self.assertEqual(self._call_paths(calls[1]), [unmapped])
+        return self._call_paths(calls[1]), unmapped
+
+    def test_an_edit_in_the_same_wall_second_as_the_verdict_is_reclassified(self):
+        """Gate round 2 R2-1 / round 3 R3-2, through the real hooks: verdict at
+        S+0.25, edit at S+0.75, both clocks pinned -- the fractional seen_at
+        compares strictly and the edit is seen."""
+        session_id = "s-userprompt-incremental-same-second"
+        paths, unmapped = self._reclassified_paths_after_edit_at(session_id, lambda s: s + 0.75)
+        seen = {e["path"]: e["seen_at"] for e in self.load_state(session_id)["ledger"]}
+        self.assertEqual(seen[unmapped], float(int(seen[unmapped])) + 0.75)
+        self.assertEqual(paths, [unmapped])
+
+    def test_an_integral_seen_at_from_the_ledger_hook_costs_one_extra_classification(self):
+        """Gate round 3 R3-2: a ledger stamp that happens to be a whole second
+        (legacy arm, >= floor(classified_at)) reclassifies -- never a miss."""
+        session_id = "s-userprompt-incremental-integral-stamp"
+        paths, unmapped = self._reclassified_paths_after_edit_at(session_id, lambda s: s)
+        seen = {e["path"]: e["seen_at"] for e in self.load_state(session_id)["ledger"]}
+        self.assertEqual(seen[unmapped], float(int(seen[unmapped])))
+        self.assertEqual(paths, [unmapped])
 
     def test_a_fractional_edit_before_the_verdict_in_the_same_second_is_not_reclassified(self):
         """Gate round 2 R2-6: edited at S.10, classified at S.25 -- no churn."""

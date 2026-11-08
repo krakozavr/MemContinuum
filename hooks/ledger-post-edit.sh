@@ -307,6 +307,11 @@ def _mc_bootstrap_state(state):
     state.setdefault("lookback_count", 0)
 
 now = time.time()
+# TEST-ONLY seam, the same flag as memlib.sh MC_T0_US: a preset MC_SEEN_NOW is
+# honoured only under MEMCONTINUUM_TEST_CLOCK=1 (the same-second tests pin the
+# edit time against a pinned verdict time). Never read otherwise.
+if os.environ.get("MEMCONTINUUM_TEST_CLOCK") == "1" and os.environ.get("MC_SEEN_NOW"):
+    now = float(os.environ["MC_SEEN_NOW"])
 '
 
 if [ "$MC_SOURCE_TAG" = "shell-diff" ]; then
