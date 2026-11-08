@@ -217,6 +217,14 @@ class TestRefMarksOnAddedAndRepairedRecords(GuardCase):
 # ---------------------------------------------------------------------------
 
 class TestTypeFrozen(GuardCase):
+    # gate round 12 R12-1: the freeze protects DELIVERED records only. A REF the index QUARANTINED
+    # (`memidx.record_is_quarantined`, the reindex predicate) delivered nothing, so any repair of it
+    # is a record entering delivery and is free; a stored REF (strict or a tolerated fallback note) is
+    # frozen to `infer_type`.
+    def _assert_quarantined(self, text, want=True):
+        res = memidx.parse_record_text(text, "x")
+        self.assertEqual(memidx.record_is_quarantined(res), want, res)
+
     def test_a_type_change_on_a_recorded_topic_is_refused(self):
         base = ttext(["src/a.py"])
         self.store(base)
@@ -254,48 +262,57 @@ class TestTypeFrozen(GuardCase):
                 lines[i] = type_line
         return "\n".join(lines)
 
-    def test_a_schema_invalid_but_strict_ref_keeps_its_type_frozen(self):
-        # REF: valid YAML, `type: topic`, `tags: not-a-list` -> valid=False, fallback=False
+    def test_a_schema_invalid_but_strict_ref_is_quarantined_so_its_repair_may_declare_any_type(self):
+        # REF: valid YAML, `type: topic`, `tags: not-a-list` -> valid=False, fallback=False: the index quarantined it
+        # (round 12 R12-1: was "keeps its type frozen")
         broken = ttext(["src/a.py"]).replace("tags: []\n", "tags: not-a-list\n", 1)
         res = memidx.parse_record_text(broken, "x")
         self.assertFalse(res.valid, res)
         self.assertFalse(res.fallback, res)
+        self._assert_quarantined(broken)
         self.store(broken)
         repaired = broken.replace("tags: not-a-list\n", "tags: []\n", 1)
         self.assertClean(repaired)
-        self.assertRefused(repaired.replace("type: topic\n", "type: incident\n", 1),
-                           "type changed 'topic' -> 'incident'")
+        self.assertClean(repaired.replace("type: topic\n", "type: incident\n", 1))
 
-    def test_a_fallback_ref_with_a_clean_known_type_keeps_it_frozen(self):
+    def test_a_quarantined_fallback_ref_with_a_clean_known_type_may_declare_another_type(self):
+        # round 12 R12-1 (was "keeps it frozen"): the TOP- id makes the fallback REF canonical, so it is quarantined
         broken = self._bad_title(ttext(["src/a.py"]))
         self.assertTrue(memidx.parse_record_text(broken, "x").fallback)
+        self._assert_quarantined(broken)
         self.store(broken)
         fixed = broken.replace("title: bad: title", 'title: "bad: title"')
         self.assertClean(fixed)
-        self.assertRefused(fixed.replace("type: topic\n", "type: incident\n", 1),
-                           "type changed 'topic' -> 'incident'")
+        self.assertClean(fixed.replace("type: topic\n", "type: incident\n", 1))
 
-    def test_a_fallback_ref_with_a_garbage_recovered_type_is_frozen_through_the_id_prefix_and_must_declare_topic(self):
+    def test_a_quarantined_fallback_ref_with_a_garbage_recovered_type_may_declare_any_type(self):
+        # round 12 R12-1 (was "frozen through the id prefix and must declare topic"; the "must declare" hint is gone)
         broken = self._bad_title(ttext(["src/a.py"]), type_line="type: banana # note")
         res = memidx.parse_record_text(broken, "x")
         self.assertTrue(res.fallback, res)
+        self._assert_quarantined(broken)
         self.store(broken)
         fixed = broken.replace("title: bad: title", 'title: "bad: title"')
         self.assertClean(fixed.replace("type: banana # note", "type: topic"))
-        # gate round 10 R10-5: a different declared type is refused, so an exemption regression goes red
-        self.assertRefused(fixed.replace("type: banana # note", "type: incident"), "type changed 'topic' -> 'incident'")
+        self.assertClean(fixed.replace("type: banana # note", "type: incident"))
 
     def test_a_new_side_quoted_hash_value_is_not_stripped_into_the_old_type(self):
-        # gate round 3 R3-1: REF fallback with recovered `topic`; NEW still fallback-parsed with
+        # gate round 3 R3-1: a STORED strict REF (`topic`); NEW is fallback-parsed with
         # `type: "topic # actual value"` -- no strip may turn that into `topic`
-        broken = self._bad_title(ttext(["src/a.py"]))
-        self.assertTrue(memidx.parse_record_text(broken, "x").fallback)
-        self.store(broken)
+        self.store(ttext(["src/a.py"]))
         # no canonical marker left (no id, links, or bare `type: topic`): a tolerated fallback note
         new = '---\ntype: "topic # actual value"\ntitle: bad: title\n---\n\nBody.\n'
         res = memidx.parse_record_text(new, "x")
         self.assertTrue(res.fallback and res.valid, res)
         self.assertRefused(new, "type changed 'topic' -> 'topic # actual value'")
+
+    def test_a_quarantined_ref_exempts_a_new_side_quoted_hash_value(self):
+        # round 12 R12-1 (was the same fixture over a fallback REF frozen to `topic`): the REF was quarantined
+        broken = self._bad_title(ttext(["src/a.py"]))
+        self._assert_quarantined(broken)
+        self.store(broken)
+        new = '---\ntype: "topic # actual value"\ntitle: bad: title\n---\n\nBody.\n'
+        self.assertClean(new)
 
     # gate round 4 R4-1 / round 6 R6-1 / round 8 R8-1: the frozen REF value is the engine's kind reading; the NEW decoded type must equal it
     # (gate round 8 R8-1: the REF carries a TOP- id, so the engine's kind reading is `topic` through the id prefix)
@@ -307,81 +324,89 @@ class TestTypeFrozen(GuardCase):
         self.assertEqual(res.frontmatter.get("type"), "topic # actual value")
         self.store(self.ODD_REF)
 
-    def test_an_unchanged_odd_type_is_refused_with_the_normalise_message_on_a_title_only_repair(self):
+    def test_a_quarantined_odd_type_ref_is_clean_on_a_title_only_repair(self):
+        # round 12 R12-1 (was refused with the normalise message): the TOP- id makes the REF canonical -> quarantined
         self._odd_ref()
-        self.assertRefused(self.ODD_REF.replace("title: bad: title", 'title: "bad: title"'),
-                           "type changed 'topic' -> 'topic # actual value'", "a repair of a malformed record must declare type: topic")
+        self.assertClean(self.ODD_REF.replace("title: bad: title", 'title: "bad: title"'))
 
-    def test_an_unchanged_odd_type_is_refused_with_the_normalise_message_on_a_body_only_edit(self):
+    def test_a_quarantined_odd_type_ref_body_only_edit_is_refused_as_still_malformed_not_as_a_type_change(self):
+        # round 12 R12-1 (was refused with the normalise message): the type freeze is silent; the edit is refused
+        # only because the record is still malformed
         self._odd_ref()
-        self.assertRefused(self.ODD_REF.replace("Body.", "Body, edited."),
-                           "type changed 'topic' -> 'topic # actual value'", "a repair of a malformed record must declare type: topic")
+        out = self.assertRefused(self.ODD_REF.replace("Body.", "Body, edited."), "malformed YAML frontmatter")
+        self.assertNotIn("type changed", out)
 
     def test_an_odd_ref_type_may_become_its_bare_token(self):
         self._odd_ref()
         fixed = self.ODD_REF.replace("title: bad: title", 'title: "bad: title"')
         self.assertClean(fixed.replace('type: "topic # actual value"', "type: topic"))
 
-    def test_an_odd_ref_type_changed_to_another_type_is_refused(self):
+    def test_a_quarantined_odd_ref_type_changed_to_another_type_is_clean(self):
+        # round 12 R12-1 (was refused 'topic' -> 'incident'): the record enters delivery as `incident`
         self._odd_ref()
-        self.assertRefused(self.ODD_REF.replace('type: "topic # actual value"', "type: incident"),
-                           "type changed 'topic' -> 'incident'")
+        fixed = self.ODD_REF.replace("title: bad: title", 'title: "bad: title"')
+        self.assertClean(fixed.replace('type: "topic # actual value"', "type: incident"))
 
     # gate round 5 R5-1 / round 6 R6-1: a raw fallback spelling is never compared with a decoded
     # strict value; the NEW record's decoded type must equal the engine's kind reading (no source-line rule)
     def _fallback_ref(self, type_line, valid=True, rid="TOP-0001"):
         ref = f"---\nid: {rid}\n{type_line}\ntitle: bad: title\n---\n\nBody.\n"
         res = memidx.parse_record_text(ref, "x")
-        self.assertTrue(res.fallback, res)   # (validity is irrelevant to the type freeze; the TOP- id makes it invalid)
+        self.assertTrue(res.fallback, res)
+        self._assert_quarantined(ref)   # the TOP-/INC- id makes it canonical, hence quarantined (round 12 R12-1)
         self.store(ref)
         return ref
 
     def _title_repaired(self, ref):
         return ref.replace("title: bad: title", 'title: "bad: title"')
 
-    def test_a_single_quoted_odd_type_with_a_doubled_quote_is_refused_with_the_normalise_message(self):
+    def test_a_quarantined_single_quoted_odd_type_with_a_doubled_quote_is_clean(self):
+        # round 12 R12-1 (was refused with the normalise message)
         ref = self._fallback_ref("type: 'topic # it''s x'")
         fixed = self._title_repaired(ref)
         self.assertEqual(memidx.parse_record_text(fixed, "x").frontmatter.get("type"), "topic # it's x")
-        self.assertRefused(fixed, "type changed 'topic' -> \"topic # it's x\"", "a repair of a malformed record must declare type: topic")
+        self.assertClean(fixed)
 
-    def test_a_double_quoted_odd_type_is_refused_with_the_normalise_message(self):
+    def test_a_quarantined_double_quoted_odd_type_is_clean(self):
+        # round 12 R12-1 (was refused with the normalise message)
         ref = self._fallback_ref('type: "topic # x"')
-        self.assertRefused(self._title_repaired(ref), "type changed 'topic' -> 'topic # x'", "a repair of a malformed record must declare type: topic")
+        self.assertClean(self._title_repaired(ref))
 
-    def test_a_double_quoted_odd_type_with_an_escape_is_refused_with_the_normalise_message(self):
+    def test_a_quarantined_double_quoted_odd_type_with_an_escape_is_clean(self):
+        # round 12 R12-1 (was refused with the normalise message)
         ref = self._fallback_ref('type: "topic # \\u0078"')
-        self.assertRefused(self._title_repaired(ref), "type changed 'topic' -> 'topic # x'", "a repair of a malformed record must declare type: topic")
+        self.assertClean(self._title_repaired(ref))
 
-    def test_an_odd_type_line_with_changed_spacing_is_refused_with_the_normalise_message(self):
+    def test_a_quarantined_odd_type_line_with_changed_spacing_is_clean(self):
+        # round 12 R12-1 (was refused with the normalise message)
         ref = self._fallback_ref("type: 'topic # it''s x'")
-        self.assertRefused(self._title_repaired(ref).replace("type: 'topic", "type:   'topic"),
-                           "type changed 'topic' -> \"topic # it's x\"", "a repair of a malformed record must declare type: topic")
+        self.assertClean(self._title_repaired(ref).replace("type: 'topic", "type:   'topic"))
 
-    def test_the_odd_single_quoted_ref_may_become_bare_topic_or_is_refused_for_incident(self):
+    def test_a_quarantined_odd_single_quoted_ref_may_become_bare_topic_or_incident(self):
+        # round 12 R12-1 (was: topic clean, incident refused)
         ref = self._fallback_ref("type: 'topic # it''s x'")
         fixed = self._title_repaired(ref)
         self.assertClean(fixed.replace("type: 'topic # it''s x'", "type: topic"))
-        self.assertRefused(fixed.replace("type: 'topic # it''s x'", "type: incident"),
-                           "type changed 'topic' -> 'incident'")
+        self.assertClean(fixed.replace("type: 'topic # it''s x'", "type: incident"))
 
-    def test_an_odd_type_line_respelled_to_a_different_literal_is_refused(self):
+    def test_a_quarantined_odd_type_line_respelled_to_a_different_literal_is_clean(self):
+        # round 12 R12-1 (was refused 'topic' -> 'topic # other')
         ref = self._fallback_ref("type: 'topic # it''s x'")
-        self.assertRefused(self._title_repaired(ref).replace("it''s x", "other"),
-                           "type changed 'topic' -> 'topic # other'")
+        self.assertClean(self._title_repaired(ref).replace("it''s x", "other"))
 
     # gate round 5 R5-2: a quoted type followed by a comment is frozen too
-    def test_a_quoted_type_followed_by_a_comment_is_frozen(self):
-        ref = self._fallback_ref('type: "incident" # note', rid="INC-0001")   # round 8: an INC- id, so the kind is incident
+    def test_a_quarantined_quoted_type_followed_by_a_comment_may_declare_any_type(self):
+        # round 12 R12-1 (was frozen to 'incident' through the INC- id)
+        ref = self._fallback_ref('type: "incident" # note', rid="INC-0001")
         self.assertEqual(memidx.parse_record_text(ref, "x").frontmatter.get("type"), 'incident" # note')
         fixed = self._title_repaired(ref)
         self.assertClean(fixed)
-        self.assertRefused(fixed.replace('type: "incident" # note', "type: concept"),
-                           "type changed 'incident' -> 'concept'")
+        self.assertClean(fixed.replace('type: "incident" # note', "type: concept"))
         self.assertClean(fixed.replace('type: "incident" # note', "type: incident"))
 
     # gate round 8 R8-1: the frozen kind of a fallback REF is the engine's own `_record_kind` reading
     def test_record_kind_table_for_a_fallback_ref(self):
+        # `_record_kind` still serves the deletion messages (check_append_only); the type freeze no longer uses it
         table = [
             ({"type": "incident"}, "incident"),                          # explicit canonical type wins
             ({"type": "topic", "id": "INC-0001"}, "topic"),
@@ -398,20 +423,19 @@ class TestTypeFrozen(GuardCase):
         for fm, want in table:
             with self.subTest(fm=fm):
                 self.assertEqual(memlint._record_kind(fm), want)
-        # gate round 9 R9-3: the links row from a REAL fallback parse (the fallback dict never carries `links`)
+        # round 12 R12-1: the freeze reads the index's decision instead: a quarantined fallback REF is exempt, a
+        # tolerated fallback note keeps its stored type, a strict record its inferred one
         res = memidx.parse_record_text(self.LINKS_REF, "x")
         self.assertTrue(res.fallback, res)
         self.assertNotIn("links", res.frontmatter)
-        self.assertIn("links", res.top_level_keys)
-        self.assertIsNone(memlint._record_kind(res.frontmatter))
-        self.assertEqual(self._frozen(res), "topic")
+        self._assert_quarantined(self.LINKS_REF)
+        self.assertIsNone(self._frozen(res))
         memo = memidx.parse_record_text(self.MEMO_REF, "x")
         self.assertTrue(memo.fallback, memo)
-        self.assertNotIn("links", memo.top_level_keys)
-        self.assertIsNone(self._frozen(memo))
+        self.assertEqual(self._frozen(memo), "memo")
         strict = memidx.parse_record_text(ttext(["src/a.py"]), "x")
         self.assertFalse(strict.fallback)
-        self.assertEqual(strict.top_level_keys, frozenset())
+        self.assertEqual(self._frozen(strict), "topic")
 
     # gate round 9 R9-3 (Grok MAJOR): a garbled type, a `links:` list and no id freezes `topic` through the
     # parser's top_level_keys; a `type: memo` note with no links and no id stays exempt
@@ -419,18 +443,23 @@ class TestTypeFrozen(GuardCase):
                  "    decision: x\n---\n\nBody.\n")
     MEMO_REF = "---\ntype: memo\ntitle: bad: title\n---\n\nBody.\n"
 
-    def test_a_links_only_fallback_ref_freezes_topic_and_must_declare_it(self):
+    def test_a_quarantined_links_fallback_ref_may_declare_any_type(self):
+        # round 12 R12-1 (was: frozen `topic` through top_level_keys, "must declare it"): `type: topic # comment`
+        # is canonical to the raw scan, so the index quarantined the REF
+        self._assert_quarantined(self.LINKS_REF)
         self.store(self.LINKS_REF)
         fixed = self.LINKS_REF.replace("title: bad: title", 'title: "bad: title"')
-        self.assertRefused(fixed.replace("type: topic # comment", "type: incident"),
-                           "type changed 'topic' -> 'incident'")
-        self.assertClean(fixed)        # strict YAML reads the comment away: `topic` declared
+        self.assertClean(fixed.replace("type: topic # comment", "type: incident"))
+        self.assertClean(fixed)
         self.assertClean(fixed.replace("type: topic # comment", "type: topic"))
 
-    def test_a_memo_note_with_no_links_and_no_id_may_change_type(self):
+    def test_a_memo_note_with_no_links_and_no_id_is_frozen_as_its_stored_type(self):
+        # round 12 R12-1 (was: free to change type): the index STORED this tolerated fallback note as `memo`
+        self._assert_quarantined(self.MEMO_REF, want=False)
         self.store(self.MEMO_REF)
         fixed = self.MEMO_REF.replace("title: bad: title", 'title: "bad: title"')
-        self.assertClean(fixed.replace("type: memo", "type: investigation"))
+        self.assertClean(fixed)
+        self.assertRefused(fixed.replace("type: memo", "type: investigation"), "type changed 'memo' -> 'investigation'")
 
     # gate round 10 R10-1 (Sol MAJOR): a STRICT REF with no `type:` is not exempt -- its kind is frozen too
     def _typeless(self, text=None):
@@ -471,12 +500,12 @@ class TestTypeFrozen(GuardCase):
         return memlint._frozen_type(root, root / "topics" / "foo.md", result)
 
     def test_the_unified_rule_table(self):
-        # gate round 11 R11-1: the frozen value is infer_type's answer (fallback + non-canonical: the kind rule)
+        # round 12 R12-1: the frozen value is infer_type's answer for a stored record, None for a quarantined one
         self.assertEqual(self._frozen(memidx.parse_record_text(ttext(["src/a.py"]), "x")), "topic")
         self.assertEqual(self._frozen(memidx.parse_record_text(self._typeless(), "x")), "topic")
-        self.assertEqual(self._frozen(memidx.parse_record_text(self._bad_title(ttext(["src/a.py"])), "x")), "topic")
-        self.assertEqual(self._frozen(memidx.parse_record_text(self.LINKS_REF, "x")), "topic")
-        self.assertIsNone(self._frozen(memidx.parse_record_text(self.MEMO_REF, "x")))
+        self.assertIsNone(self._frozen(memidx.parse_record_text(self._bad_title(ttext(["src/a.py"])), "x")))
+        self.assertIsNone(self._frozen(memidx.parse_record_text(self.LINKS_REF, "x")))
+        self.assertEqual(self._frozen(memidx.parse_record_text(self.MEMO_REF, "x")), "memo")
         inbox = Path("/store") / "inbox" / "n.md"
         self.assertEqual(memlint._frozen_type(Path("/store"), inbox, memidx.parse_record_text(ttext(["src/a.py"]), "x")),
                          "inbox")
@@ -485,47 +514,53 @@ class TestTypeFrozen(GuardCase):
     # and indented keys; it over-includes (a `links:` in a scalar, a nested one) -- the ruled fail-closed direction
     LINKS_BLOCK = "  - link: L1\n    date: 2026-01-01\n    decision: x\n"
 
-    def _links_guard(self, ref, links_present=True):
+    def _links_guard(self, ref):
+        # round 12 R12-1 (was a top_level_keys scan, then "must declare topic"): every one of these REFs carries
+        # `type: topic # c`, canonical to the raw scan, so the index quarantined it and any repair is free
         res = memidx.parse_record_text(ref, "x")
         self.assertTrue(res.fallback, res)
-        self.assertEqual("links" in res.top_level_keys, links_present, res.top_level_keys)
+        self._assert_quarantined(ref)
         self.store(ref)
         fixed = ref.replace("title: bad: title", 'title: "bad: title"')
-        self.assertRefused(fixed.replace("type: topic # c", "type: incident"), "type changed 'topic' -> 'incident'")
+        self.assertClean(fixed.replace("type: topic # c", "type: incident"))
         self.assertClean(fixed.replace("type: topic # c", "type: topic"))
 
-    def test_a_double_quoted_links_key_counts_as_links_present(self):
+    def test_a_quarantined_ref_with_a_double_quoted_links_key_may_declare_any_type(self):
         self._links_guard('---\ntype: topic # c\ntitle: bad: title\n"links":\n' + self.LINKS_BLOCK + "---\n\nBody.\n")
 
-    def test_a_single_quoted_links_key_counts_as_links_present(self):
+    def test_a_quarantined_ref_with_a_single_quoted_links_key_may_declare_any_type(self):
         self._links_guard("---\ntype: topic # c\ntitle: bad: title\n'links':\n" + self.LINKS_BLOCK + "---\n\nBody.\n")
 
-    def test_a_uniformly_indented_mapping_counts_as_links_present(self):
+    def test_a_quarantined_uniformly_indented_ref_may_declare_any_type(self):
         ref = ("---\n  type: topic # c\n  title: bad: title\n  links:\n"
                + "".join("  " + ln + "\n" for ln in self.LINKS_BLOCK.splitlines()) + "---\n\nBody.\n")
         self._links_guard(ref)
 
-    def test_a_nested_links_key_counts_as_links_present(self):
+    def test_a_quarantined_ref_with_a_nested_links_key_may_declare_any_type(self):
         self._links_guard("---\ntype: topic # c\ntitle: bad: title\nmeta:\n  links: x\n---\n\nBody.\n")
 
-    def test_a_links_line_inside_a_multi_line_scalar_freezes_a_memo_as_topic(self):
-        # documented fail-closed over-inclusion: the repair of this memo must declare `type: topic`
+    def test_a_memo_with_a_links_line_inside_a_multi_line_scalar_is_quarantined_so_any_repair_is_free(self):
+        # round 12 R12-1 (was: frozen `topic` by the fail-closed key scan): the raw scan's column-zero `links:` makes
+        # the REF canonical, so the index quarantined it and the repair is a record entering delivery
         memo = '---\ntype: memo\ntitle: "unclosed\nlinks: []\n---\n\nBody.\n'
         res = memidx.parse_record_text(memo, "x")
         self.assertTrue(res.fallback, res)
-        self.assertIn("links", res.top_level_keys)
+        self._assert_quarantined(memo)
         self.store(memo)
         fixed = memo.replace('title: "unclosed', 'title: "closed"')
-        self.assertRefused(fixed, "type changed 'topic' -> 'memo'")
+        self.assertClean(fixed)
         self.assertClean(fixed.replace("type: memo", "type: topic"))
 
     # gate round 11 R11-3 (Sol MINOR): the quotes around a scanned key must MATCH
-    def test_mismatched_quotes_around_a_key_do_not_count_as_links(self):
-        for key, want in (("links'", False), ('"links"', True), ("'links'", True), ('"links', False), ("links", True)):
+    def test_mismatched_quotes_around_a_key_do_not_make_the_ref_canonical(self):
+        # round 12 R12-1 (was the top_level_keys table): only a bare column-zero `links:` makes the memo canonical
+        # (quarantined, any repair free); every other spelling is a stored `memo` note, frozen as such
+        for key, quarantined in (("links'", False), ('"links"', False), ("'links'", False), ('"links', False), ("links", True)):
             with self.subTest(key=key):
-                res = memidx.parse_record_text(f"---\ntype: memo\ntitle: bad: title\n{key}: x\n---\n\nBody.\n", "x")
+                ref = f"---\ntype: memo\ntitle: bad: title\n{key}: x\n---\n\nBody.\n"
+                res = memidx.parse_record_text(ref, "x")
                 self.assertTrue(res.fallback, res)
-                self.assertEqual("links" in res.top_level_keys, want, res.top_level_keys)
+                self.assertEqual(memidx.record_is_quarantined(res), quarantined, res)
 
     def test_a_memo_with_a_links_quote_key_is_exempt_so_its_title_repair_is_clean(self):
         memo = "---\ntype: memo\ntitle: bad: title\nlinks': x\n---\n\nBody.\n"
@@ -537,91 +572,94 @@ class TestTypeFrozen(GuardCase):
     # (A cleanly quoted `type: "topic"` is recovered as the token `topic`, which freezes it directly; the id
     # prefix is what freezes the escaped, tagged and block-scalar spellings the fallback cannot decode.)
     def _kind_refused_and_declared(self, type_line, kind="topic", rid="TOP-0001"):
+        # round 12 R12-1 (was: other type refused, kind clean): the REF is quarantined, so both are clean
         ref = self._fallback_ref(type_line, rid=rid)
         fixed = self._title_repaired(ref)
         other = "investigation" if kind != "investigation" else "concept"
-        self.assertRefused(fixed.replace(type_line, f"type: {other}"), f"type changed '{kind}' -> '{other}'")
+        self.assertClean(fixed.replace(type_line, f"type: {other}"))
         self.assertClean(fixed.replace(type_line, f"type: {kind}"))
 
-    def test_a_double_quoted_canonical_type_is_frozen_through_the_id_prefix(self):
+    def test_a_quarantined_double_quoted_canonical_type_may_declare_any_type(self):
         self._kind_refused_and_declared('type: "topic"')
 
-    def test_an_escaped_canonical_type_is_frozen_through_the_id_prefix(self):
+    def test_a_quarantined_escaped_canonical_type_may_declare_any_type(self):
         # Sol's round 8 MAJOR: "to\u0070ic" and "\x74opic" decode to `topic`
         self._kind_refused_and_declared('type: "to\\u0070ic"')
         self._kind_refused_and_declared('type: "\\x74opic"')
 
-    def test_a_tag_prefixed_canonical_type_is_frozen_through_the_id_prefix(self):
+    def test_a_quarantined_tag_prefixed_canonical_type_may_declare_any_type(self):
         self._kind_refused_and_declared('type: !!str "topic"')
         self._kind_refused_and_declared("type: !!str 'topic'")
 
-    def test_a_block_scalar_canonical_type_is_frozen_through_the_id_prefix(self):
+    def test_a_quarantined_block_scalar_canonical_type_may_declare_any_type(self):
         self._kind_refused_and_declared("type: >-\n  topic")
         self._kind_refused_and_declared("type: |\n  topic")
 
-    def test_an_unquoted_quote_comment_type_must_be_declared_topic_by_the_repair(self):
-        # Sol's round 8 MINOR: `topic"# note` is not canonical YAML, but the TOP- id gives kind topic;
-        # a title-only repair keeping that spelling is refused with the normalise message
+    def test_a_quarantined_unquoted_quote_comment_type_is_clean_on_a_title_repair(self):
+        # round 12 R12-1 (was refused with the normalise message): the TOP- id makes the REF canonical
         ref = self._fallback_ref('type: topic"# note')
         fixed = self._title_repaired(ref)
-        self.assertRefused(fixed, "type changed 'topic'", "a repair of a malformed record must declare type: topic")
+        self.assertClean(fixed)
         self.assertClean(fixed.replace('type: topic"# note', "type: topic"))
 
-    def test_a_garbled_type_with_an_inc_id_freezes_incident(self):
+    def test_a_quarantined_garbled_type_with_an_inc_id_may_declare_any_type(self):
+        # round 12 R12-1 (was frozen `incident`, "must declare type: incident"); a typeless repair is clean too
         ref = self._fallback_ref("type: banana # note", rid="INC-0001")
         fixed = self._title_repaired(ref)
-        self.assertRefused(fixed.replace("type: banana # note", "type: topic"),
-                           "type changed 'incident' -> 'topic'", "a repair of a malformed record must declare type: incident")
-        # gate round 11 R11-1: a typeless NEW under topics/ infers `topic` -> "type changed", no "type removed"
-        self.assertRefused(fixed.replace("type: banana # note", ""), "type changed 'incident' -> 'topic'")
+        self.assertClean(fixed.replace("type: banana # note", "type: topic"))
+        self.assertClean(fixed.replace("type: banana # note", ""))
         self.assertClean(fixed.replace("type: banana # note", "type: incident"))
 
-    def test_a_garbled_type_with_no_id_and_no_links_is_exempt(self):
-        # kind None: nothing is recoverable, so nothing is frozen (documented exemption)
+    def test_a_garbled_type_note_with_no_id_and_no_links_is_frozen_as_its_stored_type(self):
+        # round 12 R12-1 (was "exempt"): not canonical -> the index STORED it as `banana # note`, so that is the
+        # frozen type; strict YAML reads the comment away, so even a title-only repair changes the delivered type
         ref = "---\ntype: banana # note\ntitle: bad: title\n---\n\nBody.\n"
-        self.assertEqual(memlint._record_kind(memidx.parse_record_text(ref, "x").frontmatter), None)
+        self._assert_quarantined(ref, want=False)
         self.store(ref)
         fixed = self._title_repaired(ref)
-        self.assertClean(fixed.replace("type: banana # note", "type: investigation"))
-        self.assertClean(fixed.replace("type: banana # note\n", ""))
+        self.assertRefused(fixed, "type changed 'banana # note' -> 'banana'")
+        self.assertRefused(fixed.replace("type: banana # note", "type: investigation"),
+                           "type changed 'banana # note' -> 'investigation'")
+        self.assertClean(ref)
 
-    def test_a_no_space_hash_after_a_quoted_canonical_type_is_frozen(self):
-        # Sol's fixture: PyYAML reads `"topic"# note` as `topic`
+    def test_a_quarantined_no_space_hash_after_a_quoted_canonical_type_may_declare_any_type(self):
+        # round 12 R12-1 (was frozen 'topic'): PyYAML reads `"topic"# note` as `topic`; the REF was quarantined
         ref = self._fallback_ref('type: "topic"# note')
         self.assertEqual(memidx.parse_record_text(ref, "x").frontmatter.get("type"), 'topic"# note')
         fixed = self._title_repaired(ref)
         self.assertEqual(memidx.parse_record_text(fixed, "x").frontmatter.get("type"), "topic")
         self.assertClean(fixed)
-        self.assertRefused(fixed.replace('type: "topic"# note', "type: investigation"),
-                           "type changed 'topic' -> 'investigation'")
+        self.assertClean(fixed.replace('type: "topic"# note', "type: investigation"))
 
     def test_a_no_space_hash_repair_keeping_type_topic_is_clean(self):
         ref = self._fallback_ref('type: "topic"# note')
         self.assertClean(self._title_repaired(ref).replace('type: "topic"# note', "type: topic"))
 
     # gate round 6 R6-1: the effective key is the YAML-decoded one, never a scanned source line
-    def test_a_duplicate_type_key_that_wins_last_is_refused(self):
+    def test_a_duplicate_type_key_that_wins_last_is_clean_for_a_quarantined_ref(self):
+        # round 12 R12-1 (was refused 'topic' -> 'incident'): the REF was quarantined; the record enters as `incident`
         ref = self._fallback_ref("type: topic", valid=False)
         fixed = self._title_repaired(ref).replace("type: topic\n", "type: topic\ntype: incident\n", 1)
         self.assertEqual(memidx.parse_record_text(fixed, "x").frontmatter.get("type"), "incident")
-        self.assertRefused(fixed, "type changed 'topic' -> 'incident'")
+        self.assertClean(fixed)
 
-    def test_a_block_scalar_decoy_type_line_does_not_hide_a_changed_real_type(self):
+    def test_a_block_scalar_decoy_type_line_ref_is_quarantined_so_a_real_type_change_is_free(self):
+        # round 12 R12-1 (was refused 'topic' -> 'incident'): the column-zero `type: topic` makes the REF canonical
         ref = "---\nnote: |\n  type: topic\ntype: topic\ntitle: bad: title\n---\n\nBody.\n"
         self.assertTrue(memidx.parse_record_text(ref, "x").fallback)
+        self._assert_quarantined(ref)
         self.store(ref)
         fixed = self._title_repaired(ref)
         self.assertClean(fixed)
-        self.assertRefused(fixed.replace("\ntype: topic\ntitle", "\ntype: incident\ntitle"),
-                           "type changed 'topic' -> 'incident'")
+        self.assertClean(fixed.replace("\ntype: topic\ntitle", "\ntype: incident\ntitle"))
 
-    def test_a_nested_meta_type_above_the_real_type_does_not_govern(self):
+    def test_a_quarantined_ref_with_a_nested_meta_type_may_declare_any_type(self):
+        # round 12 R12-1 (was frozen `topic`, "must declare"): the TOP- id makes the REF canonical -> quarantined
         ref = self._fallback_ref("meta:\n  type: unrelated\ntype: 'topic # it''s x'")
         fixed = self._title_repaired(ref)
-        self.assertRefused(fixed, "type changed 'topic' -> \"topic # it's x\"", "a repair of a malformed record must declare type: topic")
+        self.assertClean(fixed)
         self.assertClean(fixed.replace("type: 'topic # it''s x'", "type: topic"))
-        self.assertRefused(fixed.replace("type: 'topic # it''s x'", "type: incident"),
-                           "type changed 'topic' -> 'incident'")
+        self.assertClean(fixed.replace("type: 'topic # it''s x'", "type: incident"))
 
     def test_an_empty_new_mapping_under_topics_is_not_a_type_change(self):
         # gate round 3 R3-2: the type may not disappear by emptying the frontmatter
@@ -685,19 +723,19 @@ class TestTypeFrozen(GuardCase):
         self.store(broken)
         return broken
 
-    def test_a_non_topic_ref_with_a_frozen_type_keeps_it_through_a_repair_incident(self):
+    def test_a_quarantined_incident_ref_may_declare_another_type_on_repair(self):
+        # round 12 R12-1 (was refused 'incident' -> 'investigation'): schema-invalid strict -> quarantined
         broken = self._non_topic_ref("incident")
         repaired = broken.replace("tags: not-a-list\n", "tags: []\n", 1)
         self.assertClean(repaired)
-        self.assertRefused(repaired.replace("type: incident\n", "type: investigation\n", 1),
-                           "type changed 'incident' -> 'investigation'")
+        self.assertClean(repaired.replace("type: incident\n", "type: investigation\n", 1))
 
-    def test_a_non_topic_ref_with_a_frozen_type_keeps_it_through_a_repair_concept(self):
+    def test_a_quarantined_concept_ref_may_declare_another_type_on_repair(self):
+        # round 12 R12-1 (was refused 'concept' -> 'investigation')
         broken = self._non_topic_ref("concept")
         repaired = broken.replace("tags: not-a-list\n", "tags: []\n", 1)
         self.assertClean(repaired)
-        self.assertRefused(repaired.replace("type: concept\n", "type: investigation\n", 1),
-                           "type changed 'concept' -> 'investigation'")
+        self.assertClean(repaired.replace("type: concept\n", "type: investigation\n", 1))
 
     def test_a_typeless_note_under_topics_is_frozen_as_topic(self):
         # amended in gate round 11 R11-1 (was: free to gain a type): directory inference delivers it as `topic`
@@ -841,16 +879,111 @@ class TestDeliveredTypeFrozen(GuardCase):
     INDENTED_INC = ("---\n  type: incident\n  id: INC-0001\n  title: bad: title\n  links:\n"
                     "    - link: L1\n      date: 2026-01-01\n      decision: x\n---\n\nBody.\n")
 
-    def test_a_uniformly_indented_incident_under_topics_is_frozen_as_topic(self):
-        # Grok R11 MAJOR 2: the index delivered it as `topic` (the fallback loses the indented `type`);
-        # the repair that makes it a strict `incident` is a delivery change; the fix is to move the file
+    def test_a_quarantined_uniformly_indented_incident_under_topics_is_repaired_to_incident_or_topic(self):
+        # Grok R12 MAJOR 2 (was: frozen `topic`, "must declare type: topic"): the index quarantined it (for-path 0,
+        # digest 0), so either repair is a record entering delivery; the misfiling is a human matter
         res = memidx.parse_record_text(self.INDENTED_INC, "x")
         self.assertTrue(res.fallback, res)
         self.assertNotIn("type", res.frontmatter)
+        self.assertTrue(memidx.record_is_quarantined(res), res)
         self.store(self.INDENTED_INC)
         fixed = self.INDENTED_INC.replace("title: bad: title", 'title: "bad: title"')
-        self.assertRefused(fixed, "type changed 'topic' -> 'incident'", "must declare type: topic")
+        self.assertClean(fixed)
         self.assertClean(fixed.replace("type: incident", "type: topic"))
+
+    # gate round 12 R12-1 / R12-2: fixtures for the "delivered records only" rule
+    def _inbox_store(self, text):
+        root = git_store(self.tmp / "inbox_store")
+        self.root = root
+        (root / "inbox").mkdir()
+        (root / "inbox" / "n.md").write_text(text)
+        commit_all(root)
+        return root
+
+    def _inbox_guard(self, text):
+        (self.root / "inbox" / "n.md").write_text(text)
+        return run_memlint(["--against-ref", "HEAD", str(self.root)])
+
+    def test_a_stored_inbox_memo_keeps_inbox_through_a_title_repair(self):
+        # Sol R12 MAJOR (R12-2): the index delivers every file under inbox/ as `inbox` whatever its `type:`; the freeze
+        # is `infer_type`, so a title repair (and even a `type:` edit) leaves it `inbox` and is clean. On c58a569 the
+        # kind rule froze `topic` for an inbox note with a `links` key and refused the repair.
+        ref = "---\ntype: memo\ntitle: bad: title\nmeta:\n  links: x\n---\n\nBody.\n"
+        res = memidx.parse_record_text(ref, "x")
+        self.assertTrue(res.fallback, res)
+        self.assertFalse(memidx.record_is_quarantined(res), res)
+        self.assertEqual(memlint._frozen_type(Path("/s"), Path("/s/inbox/n.md"), res), "inbox")
+        self._inbox_store(ref)
+        fixed = ref.replace("title: bad: title", 'title: "bad: title"')
+        rc, out = self._inbox_guard(fixed)
+        self.assertEqual(rc, 0, out)
+        rc, out = self._inbox_guard(fixed.replace("type: memo", "type: incident"))
+        self.assertEqual(rc, 0, out)
+
+    def test_a_quarantined_inbox_memo_with_a_links_key_has_a_clean_title_repair(self):
+        # Sol R12 MAJOR (R12-2), the exact shape: `type: memo` with a column-zero `links:` is canonical to the raw scan,
+        # so the index quarantined it; the repair enters delivery as `inbox`
+        ref = "---\ntype: memo\ntitle: bad: title\nlinks:\n  - link: L1\n    date: 2026-01-01\n    decision: x\n---\n\nBody.\n"
+        res = memidx.parse_record_text(ref, "x")
+        self.assertTrue(memidx.record_is_quarantined(res), res)
+        self._inbox_store(ref)
+        rc, out = self._inbox_guard(ref.replace("title: bad: title", 'title: "bad: title"'))
+        self.assertEqual(rc, 0, out)
+
+    def test_a_note_with_a_non_mapping_metadata_is_stored_by_directory_and_stays_frozen(self):
+        # R12-1 (infer_type-raises mirror, Grok MINOR 1): the parser DROPS a note's wrongly-shaped `metadata` before
+        # the index calls `infer_type`, so the index stored `topic` (directory); a later `metadata.type: incident`
+        # is a real delivery change and is refused
+        ref = "---\ntitle: a note\nmetadata: not-a-map\n---\n\nBody.\n"
+        res = memidx.parse_record_text(ref, "x")
+        self.assertTrue(res.valid, res)
+        self.assertNotIn("metadata", res.frontmatter)
+        self.assertEqual(self._frozen_of(res), "topic")
+        self.store(ref)
+        self.assertRefused(ref.replace("metadata: not-a-map\n", "metadata:\n  type: incident\n"),
+                           "type changed 'topic' -> 'incident'")
+        self.assertClean(ref.replace("metadata: not-a-map\n", ""))
+
+    def test_a_canonical_record_with_a_non_mapping_metadata_is_quarantined_so_a_metadata_type_repair_is_clean(self):
+        # R12-1 (infer_type-raises mirror): the parser keeps a CANONICAL record's bad `metadata` and quarantines it, so
+        # the index never calls `infer_type` on it (which would raise) and stored no type: exempt, like any quarantined REF
+        ref = self._typeless().replace("tags: []\n", "tags: []\nmetadata: not-a-map\n", 1)
+        res = memidx.parse_record_text(ref, "x")
+        self.assertTrue(memidx.record_is_quarantined(res), res)
+        with self.assertRaises(AttributeError):
+            memidx.infer_type(Path("/s"), Path("/s/topics/foo.md"), res.frontmatter)
+        self.assertIsNone(self._frozen_of(res))
+        self.store(ref)
+        self.assertClean(ref.replace("metadata: not-a-map\n", "metadata:\n  type: incident\n"))
+        self.assertClean(ref.replace("metadata: not-a-map\n", ""))
+
+    @staticmethod
+    def _frozen_of(result):
+        root = Path("/store")
+        return memlint._frozen_type(root, root / "topics" / "foo.md", result)
+
+    GARBLED_WITH_REFS = ("---\n{ident}type: banana # note\ntitle: bad: title\ncode_refs:\n  - src/a.py\n---\n\nBody.\n")
+
+    def test_a_quarantined_garbled_record_with_code_refs_may_enter_delivery_as_a_topic_on_repair(self):
+        # Grok R12 MINOR 2 (R12-1): the TOP- id makes the garbled REF canonical, so the index quarantined it (no type,
+        # for-path 0); declaring `type: topic` on repair puts its code_refs into for-path. Allowed by the rule: the
+        # record ENTERS delivery exactly like an added file (documented in INTERNALS)
+        ref = self.GARBLED_WITH_REFS.format(ident="id: TOP-0001\n")
+        self.assertTrue(memidx.record_is_quarantined(memidx.parse_record_text(ref, "x")))
+        self.store(ref)
+        fixed = ref.replace("title: bad: title", 'title: "bad: title"')
+        self.assertClean(fixed.replace("type: banana # note", "type: topic"))
+
+    def test_a_garbled_note_with_code_refs_and_no_canonical_marker_is_stored_and_frozen(self):
+        # the other half of Grok R12 MINOR 2, pinned as coded: with no id/links/canonical type the garbled note is NOT
+        # quarantined (the index stored `banana # note`), so repairing it to `type: topic` is a change of the stored
+        # type and is refused; the rule exempts quarantined records only
+        ref = self.GARBLED_WITH_REFS.format(ident="")
+        self.assertFalse(memidx.record_is_quarantined(memidx.parse_record_text(ref, "x")))
+        self.store(ref)
+        fixed = ref.replace("title: bad: title", 'title: "bad: title"')
+        self.assertRefused(fixed.replace("type: banana # note", "type: topic"),
+                           "type changed 'banana # note' -> 'topic'")
 
     def test_a_fallback_record_that_never_had_a_type_is_clean_when_repaired_without_one(self):
         # Grok R11 MINOR: no `explicit` flag, no `type removed`; a typeless NEW infers by directory
