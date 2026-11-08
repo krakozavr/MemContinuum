@@ -1453,6 +1453,7 @@ def lint_root(
     id_owners: dict[str, list[Path]] = {}
     stem_owners: dict[str, list[Path]] = {}
     fence_errors: list[str] = []
+    topics: list = []  # (file, topic id, links, rejection rows) for the cross-topic declined warnings
     for f in sorted(walk_markdown(root)):
         # INC-0127: independent of parse validity -- a fence problem is
         # exactly what leaves parse_record reporting "valid, empty, no
@@ -1469,6 +1470,8 @@ def lint_root(
         if is_topic:
             tid = fm.get("id") or f.stem
             known_topic_ids.add(str(tid))
+            if isinstance(fm.get("links"), list):
+                topics.append((f, str(tid), fm["links"], rejection_rows(fm["links"])))
         rid = fm.get("id")
         if rid:
             id_owners.setdefault(str(rid), []).append(f)
@@ -1489,6 +1492,21 @@ def lint_root(
         )
         all_errors.extend(errors)
         all_warnings.extend(warnings)
+    # Declined-rulings rule, cross-topic half (DESIGN-declined-check section 1):
+    # lint_topic judged each link against its own topic; here against every
+    # OTHER topic's operative rejections. Warnings: history is grandfathered
+    # (the error form is --against-ref, for links new relative to REF).
+    for i, (f, tid, links, _rows) in enumerate(topics):
+        others = [r for j, t in enumerate(topics) if j != i and t[1] != tid for r in t[3]]
+        owners = {id(r): t[1] for j, t in enumerate(topics) if j != i and t[1] != tid for r in t[3]}
+        for link in links:
+            if not isinstance(link, dict):
+                continue
+            where = f"{f}:{link.get('link', '?')}"
+            for row in readoption_matches(link, others, own_topic=False):
+                all_warnings.append(
+                    f"{readoption_message(where, owners[id(row)], row)} "
+                    "[grandfathered: an error for new links under --against-ref]")
     all_errors.extend(_duplicate_claim_errors(root))
     all_errors.extend(_standing_cap_errors(root))
     if code_roots:
