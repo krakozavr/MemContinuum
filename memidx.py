@@ -13407,7 +13407,8 @@ def _declined_check(command: str, args, ctx: dict, root: Path, topic_id: str, li
     digest = hashlib.sha256(
         (norm(title) + "|" + norm(str(link["ruling"]["text"]))).encode("utf-8")).hexdigest()[:16]
     outcome = "flagged" if flagged else "bypass" if explicit else "shown" if lines else "none"
-    ids = list(dict.fromkeys([t for t, _r in flagged] + shown_ids))
+    # the receipt names the topics the user saw, in display order, then any flagged topic not shown
+    ids = list(dict.fromkeys(shown_ids + [t for t, _r in flagged]))
     ctx["declined"] = {"outcome": outcome, "proposal_sha256": digest, "store_rev": _store_head_short(root),
                        "ids": "_".join(ids[:_DECLINED_SHOW_TOPICS]) if ids else "none", "shown": len(lines)}
     matched = list(dict.fromkeys([t for t, _r in flagged] + [t for t, _rows in groups] + order))
