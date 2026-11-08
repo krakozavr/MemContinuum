@@ -4010,7 +4010,7 @@ class TestUserPromptRemind(HookTestBase):
             "#!/usr/bin/env bash\n"
             'case "${1##*/} ${2:-}" in "memidx.py unmapped")\n'
             '  printf "%s\\n" "$*" >> "' + str(spy) + '"\n'
-            '  n=$(wc -l < "' + str(spy) + '")\n'
+            '  n=$(( $(wc -l < "' + str(spy) + '") ))\n'
             '  if [ "$n" = "3" ]; then exit 2; fi;;\n'
             "esac\n"
             'exec "' + VENV_PYTHON + '" "$@"\n'
@@ -4052,7 +4052,7 @@ class TestUserPromptRemind(HookTestBase):
             "#!/usr/bin/env bash\n"
             'case "${1##*/} ${2:-}" in "memidx.py unmapped")\n'
             '  printf "%s\\n" "$*" >> "' + str(spy) + '"\n'
-            '  n=$(wc -l < "' + str(spy) + '")\n'
+            '  n=$(( $(wc -l < "' + str(spy) + '") ))\n'
             '  if [ "$n" = "2" ]; then "' + VENV_PYTHON + '" "$@" >/dev/null; exit 2; fi;;\n'
             "esac\n"
             'exec "' + VENV_PYTHON + '" "$@"\n'
