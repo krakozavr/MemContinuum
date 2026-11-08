@@ -114,9 +114,16 @@
 #
 # Evidence is computed LIVE here (not read from state.pending, which is only
 # populated around a compaction) -- but only once cooldown+growth already
-# passed, via one `memidx.py unmapped` call (self-healing) over the ledger's
-# code-root paths, so the (comparatively expensive) classification only runs
-# on turns that were already going to inject something.
+# passed, via ONE `memidx.py unmapped` call (self-healing) per such turn. The
+# call carries only the code paths NEW since the previous prompt (or none at
+# all: it is the index-state check and the stale self-heal either way); the
+# verdicts of the other paths come from the session's unmapped_cache, which is
+# reused only while the store HEAD is unchanged, the store worktree is clean
+# (git status --porcelain, untracked included), the call did not heal the
+# index and the path was not edited again since its verdict (classified_at vs
+# the ledger seen_at); otherwise every path is reclassified and the cache
+# rebuilt. The classification therefore only runs on turns that were already
+# going to inject something, and costs only what is new.
 #
 # Always exits 0 and prints nothing on any failure (fail-open). This hook
 # makes many SEQUENTIAL python calls with no timeout of their own any more
@@ -513,6 +520,14 @@ if (not is_dup) or retry:
     code_paths = sorted({
         e["path"] for e in ledger if e.get("kind") == "code" and e.get("path")
     })
+    # Latest edit time per code path, so a cached verdict older than its
+    # path latest edit is not reused (see the classification cache below).
+    code_seen_at = {}
+    for e in ledger:
+        if e.get("kind") == "code" and e.get("path"):
+            t = e.get("seen_at")
+            if isinstance(t, (int, float)) and not isinstance(t, bool):
+                code_seen_at[e["path"]] = max(code_seen_at.get(e["path"], 0), t)
 
     # T-thin look-back candidacy (docs/DESIGN.md):
     # evaluated independently of coverage candidacy -- it must still fire
@@ -541,6 +556,7 @@ if (not is_dup) or retry:
         "now": now,
         "pairs": [list(p) for p in pairs],
         "code_paths": code_paths,
+        "seen_at": code_seen_at,
         "unmapped_cache": state.get("unmapped_cache"),
         "lookback_eligible": lookback_eligible,
         "since_turn": since_turn,
@@ -794,41 +810,74 @@ if [ "${CANDIDATE:-0}" = "1" ] || [ -n "$MOVED_ROOTS" ]; then
     # feeding a plain while-read loop is the portable equivalent.
     CODE_PATHS=()
     NEW_PATHS=()
+    UC_REUSE=0
+    UC_STARTED=""
+    # The store worktree must be CLEAN for a cached verdict to be reused: an
+    # uncommitted bind or a new topics/*.md is the usual filing state, and
+    # waiting for the commit would be too late for the coverage nudge.
+    # Untracked files count (a new topic is untracked until it is added).
+    STORE_DIRTY=0
+    if [ -n "${MEMCONTINUUM_ROOT:-}" ] && [ -n "$CUR_STORE_SHA" ]; then
+        if [ -n "$(git -C "$MEMCONTINUUM_ROOT" status --porcelain --untracked-files=all 2>>"$MC_LOG")" ]; then
+            STORE_DIRTY=1
+        fi
+    fi
     while IFS= read -r p; do
         case "$p" in
             P:*) CODE_PATHS+=("${p#P:}") ;;
             N:*) NEW_PATHS+=("${p#N:}") ;;
+            R:*) UC_REUSE="${p#R:}" ;;
+            T:*) UC_STARTED="${p#T:}" ;;
         esac
     done < <(env PYTHONPATH= "$MC_PY" -c '
-import json, sys
+import json, sys, time
 with open(sys.argv[1]) as f:
     d = json.load(f)
-# The session keeps the verdicts of the previous prompts (unmapped_cache),
-# valid only for the store HEAD they were made at: only the paths not in a
-# valid cache need the engine call. A missing, malformed or other-HEAD cache
-# means every path is new.
+# The session keeps the verdicts of the previous prompts (unmapped_cache).
+# They are reusable only at the store HEAD they were made at AND while the
+# store worktree is clean; a missing, malformed, other-HEAD or dirty-store
+# cache means every path is new. A path whose latest ledger edit (seen_at)
+# is newer than its verdict (classified_at) is new too: a re-edit, a
+# symlink swap or a replace reclassifies that path alone. T: is the moment
+# this classification starts (recorded as the verdict time of every path
+# classified now, so an edit landing during the call is still newer).
 cache = d.get("unmapped_cache")
-sha = sys.argv[2]
-verdicts = {}
-if sha and isinstance(cache, dict) and cache.get("store_head") == sha \
+sha, dirty = sys.argv[2], sys.argv[3] == "1"
+verdicts, stamps = {}, {}
+reuse = False
+if sha and not dirty and isinstance(cache, dict) and cache.get("store_head") == sha \
         and isinstance(cache.get("verdicts"), dict) \
-        and isinstance(cache.get("displays"), dict):
-    verdicts = cache["verdicts"]
+        and isinstance(cache.get("displays"), dict) \
+        and isinstance(cache.get("classified_at"), dict):
+    verdicts, stamps = cache["verdicts"], cache["classified_at"]
+    reuse = True
+seen = d.get("seen_at") if isinstance(d.get("seen_at"), dict) else {}
+def num(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+print("R:" + ("1" if reuse else "0"))
+print("T:" + repr(time.time()))
 for p in d.get("code_paths", []):
     print("P:" + p)
-    if p not in verdicts:
+    if p not in verdicts or num(seen.get(p)) > num(stamps.get(p)):
         print("N:" + p)
-' "$DECIDE_TMP" "$CUR_STORE_SHA" 2>>"$MC_LOG")
+' "$DECIDE_TMP" "$CUR_STORE_SHA" "$STORE_DIRTY" 2>>"$MC_LOG")
 
     # Phase 2 (outside the lock): the real, possibly-heavier classification call.
     UNMAPPED_JSON="{}"
     UC_CALLED=0
     UC_RAW=""
     UC_TMP=""
-    if [ "${#CODE_PATHS[@]}" -gt 0 ] && [ -n "${MEMCONTINUUM_ROOT:-}" ] && [ "${#NEW_PATHS[@]}" -gt 0 ]; then
-        UC_CALLED=1
+    UC_HEALED="false"
+    COVERAGE_STATUS=""
+    # One engine call: with the paths new since the last prompt, or with none
+    # at all -- it is ALWAYS made, because the call is also the index-state
+    # check and the stale self-heal that every reused verdict depends on.
+    # Sets RC, UC_RAW, COVERAGE_STATUS and UC_HEALED; no logging (the caller
+    # logs once, for the final answer).
+    _uc_call() {
+        local ARGS CR RAW
         ARGS=(unmapped)
-        ARGS+=("${NEW_PATHS[@]}")
+        if [ "$#" -gt 0 ]; then ARGS+=("$@"); fi
         ARGS+=(--root "$MEMCONTINUUM_ROOT" --project "$MC_PROJECT" --db "$MC_DB_PATH" --json)
         while IFS= read -r CR; do
             [ -n "$CR" ] || continue
@@ -836,23 +885,41 @@ for p in d.get("code_paths", []):
         done <<<"$CODE_ROOTS_TEXT"
         RAW="$(env PYTHONPATH= "$MC_PY" "$MC_MEMIDX" "${ARGS[@]}" 2>>"$MC_LOG")"
         RC=$?
-        # F1 (ruling 68): `unmapped` now exits 1 (not just 0) on a genuine
-        # coverage_status still worth reading -- uninitialized/upgrade-
-        # required/index-error all print a real JSON body on stderr-free
-        # stdout, just with an empty unmapped list. Accept RC 0 or 1, then
-        # log a distinct outcome per coverage_status so a still-degraded
-        # index is visible in hook.log, not silently folded into whatever
-        # the existing coverage_status != "ok" branch below already does.
+        UC_RAW=""
+        COVERAGE_STATUS=""
+        UC_HEALED="false"
+        # F1 (ruling 68): `unmapped` exits 1 (not just 0) on a coverage_status
+        # still worth reading -- uninitialized/upgrade-required/index-error
+        # all print a real JSON body with an empty unmapped list. Accept RC 0
+        # or 1.
         if { [ $RC -eq 0 ] || [ $RC -eq 1 ]; } && [ -n "$RAW" ]; then
-            UNMAPPED_JSON="$RAW"
             UC_RAW="$RAW"
-            COVERAGE_STATUS="$(printf '%s' "$RAW" | env PYTHONPATH= "$MC_PY" -c '
+            { IFS= read -r COVERAGE_STATUS; IFS= read -r UC_HEALED; } < <(printf '%s' "$RAW" | env PYTHONPATH= "$MC_PY" -c '
 import json, sys
 try:
-    print((json.load(sys.stdin) or {}).get("coverage_status", "unknown"))
+    d = json.load(sys.stdin) or {}
+    print(d.get("coverage_status", "unknown"))
+    print("true" if d.get("healed") is True else "false")
 except Exception:
     print("unknown")
-' 2>/dev/null)"
+    print("false")
+' 2>/dev/null)
+        fi
+    }
+    if [ "${#CODE_PATHS[@]}" -gt 0 ] && [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
+        UC_CALLED=1
+        if [ "${#NEW_PATHS[@]}" -gt 0 ]; then _uc_call "${NEW_PATHS[@]}"; else _uc_call; fi
+        # The call healed a stale index: the verdicts reused from earlier
+        # prompts were made against the index as it was BEFORE the rebuild
+        # (an unmapped may have just become bound), so every path is
+        # reclassified against the healed one.
+        if [ "$UC_HEALED" = "true" ] && [ "$UC_REUSE" = "1" ]; then
+            UC_REUSE=0
+            NEW_PATHS=("${CODE_PATHS[@]}")
+            _uc_call "${NEW_PATHS[@]}"
+        fi
+        if [ -n "$UC_RAW" ]; then
+            UNMAPPED_JSON="$UC_RAW"
             case "$COVERAGE_STATUS" in
                 uninitialized)      mc_log "userprompt outcome=index-uninitialized session=${SESSION_ID:-} $(mc_elapsed_field)" ;;
                 upgrade-required)   mc_log "userprompt outcome=index-upgrade-required session=${SESSION_ID:-} $(mc_elapsed_field)" ;;
@@ -861,12 +928,10 @@ except Exception:
             esac
             # Design R7 (audit MC-P2-03, TOP-0123 L7): a typed internal
             # error collapses coverage_status to "unknown" like any other
-            # read failure (no new case arm there -- see 2.3 of the map),
-            # but carries its own `degraded` object naming the reason. One
-            # more hook.log token, same case-arm style as index-error
-            # above, so `stats` can count it separately from a plain
-            # unknown.
-            DEGRADED_REASON="$(printf '%s' "$RAW" | env PYTHONPATH= "$MC_PY" -c '
+            # read failure, but carries its own `degraded` object naming the
+            # reason. One more hook.log token so `stats` can count it
+            # separately from a plain unknown.
+            DEGRADED_REASON="$(printf '%s' "$UC_RAW" | env PYTHONPATH= "$MC_PY" -c '
 import json, sys
 try:
     d = (json.load(sys.stdin) or {}).get("degraded")
@@ -885,24 +950,39 @@ print(d.get("reason_code", "") if isinstance(d, dict) else "")
     # rest of this hook reads (the lists, by_path, coverage_status), so the
     # message is the same whether a path was classified now or earlier. The
     # cache is replaced only on a coverage_status of "ok" and dropped
-    # otherwise; a store HEAD that differs from the cached one already made
-    # every path new above.
+    # otherwise (and when the answer does not account for a fresh path); an
+    # other-HEAD or dirty-store cache, a healed index and a re-edited path
+    # already made their paths new above (UC_REUSE, NEW_PATHS).
     if [ "${#CODE_PATHS[@]}" -gt 0 ] && [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
         UC_TMP="$(mktemp 2>/dev/null)" || UC_TMP=""
         if [ -n "$UC_TMP" ]; then
+            UC_NEW_TEXT=""
+            if [ "${#NEW_PATHS[@]}" -gt 0 ]; then UC_NEW_TEXT="$(printf '%s\n' "${NEW_PATHS[@]}")"; fi
             UC_MERGED="$(MC_UC_RAW="$UC_RAW" MC_UC_CALLED="$UC_CALLED" MC_UC_OUT="$UC_TMP" \
+                MC_UC_REUSE="$UC_REUSE" MC_UC_STARTED="$UC_STARTED" MC_UC_NEW="$UC_NEW_TEXT" \
                 env PYTHONPATH= "$MC_PY" -c '
-import json, os, sys
+import json, os, sys, time
 with open(sys.argv[1]) as f:
     d = json.load(f)
 sha = sys.argv[2]
 code_paths = d.get("code_paths", [])
 cache = d.get("unmapped_cache")
-verdicts, displays = {}, {}
-had_cache = isinstance(cache, dict)
-if sha and had_cache and cache.get("store_head") == sha \
-        and isinstance(cache.get("verdicts"), dict) and isinstance(cache.get("displays"), dict):
+verdicts, displays, stamps = {}, {}, {}
+had_cache = isinstance(cache, dict) and bool(cache)
+new = {p for p in os.environ.get("MC_UC_NEW", "").splitlines() if p}
+if os.environ.get("MC_UC_REUSE") == "1" and had_cache \
+        and isinstance(cache.get("verdicts"), dict) and isinstance(cache.get("displays"), dict) \
+        and isinstance(cache.get("classified_at"), dict):
     verdicts, displays = dict(cache["verdicts"]), dict(cache["displays"])
+    stamps = dict(cache["classified_at"])
+    for p in new:
+        verdicts.pop(p, None)
+        displays.pop(p, None)
+        stamps.pop(p, None)
+try:
+    started = float(os.environ.get("MC_UC_STARTED") or time.time())
+except ValueError:
+    started = time.time()
 called = os.environ.get("MC_UC_CALLED") == "1"
 raw = None
 if os.environ.get("MC_UC_RAW"):
@@ -912,7 +992,15 @@ if os.environ.get("MC_UC_RAW"):
         raw = None
     if not isinstance(raw, dict):
         raw = None
-new_cache = None  # None: leave the stored cache alone; {}: drop it
+
+
+def drop_cache():
+    # {} in the file removes the stored cache.
+    with open(os.environ["MC_UC_OUT"], "w") as f:
+        f.write(json.dumps({}) if had_cache else "")
+
+
+new_cache = None  # None: leave the stored cache alone
 if called:
     if raw is None:
         print("{}")
@@ -920,10 +1008,7 @@ if called:
     if raw.get("coverage_status") != "ok":
         # No coverage claim: the answer is the call own, the cache goes.
         print(json.dumps(raw))
-        if had_cache:
-            new_cache = {}
-        with open(os.environ["MC_UC_OUT"], "w") as f:
-            f.write(json.dumps(new_cache) if new_cache is not None else "")
+        drop_cache()
         raise SystemExit(0)
     fresh = [p for p in code_paths if p not in verdicts]
     queues = {k: list(raw.get(k) or []) for k in ("mapped_topic", "mapped_concept_only", "unmapped")}
@@ -931,13 +1016,17 @@ if called:
     for p in fresh:
         st = by.get(p)
         if st not in queues or not queues[st]:
-            # The answer does not account for this path: no claim.
+            # The answer does not account for this path: no claim, and no
+            # cache either (the next prompt reclassifies everything).
             print(json.dumps(raw))
+            drop_cache()
             raise SystemExit(0)
         verdicts[p] = st
         displays[p] = queues[st].pop(0)
+        stamps[p] = started
     new_cache = {"store_head": sha, "verdicts": {p: verdicts[p] for p in code_paths},
-                 "displays": {p: displays[p] for p in code_paths}} if sha else None
+                 "displays": {p: displays[p] for p in code_paths},
+                 "classified_at": {p: stamps[p] for p in code_paths}} if sha else None
 elif not verdicts:
     print("{}")
     raise SystemExit(0)
