@@ -1070,17 +1070,48 @@ def _topic_rejection_rows(fm: dict) -> list:
     return [(str(fm.get("id") or ""), r) for r in rejection_rows(links)]
 
 
-def _store_rejections(root: Path) -> list:
-    """`(topic_id, row)` for every parseable topic under `root` (worktree
-    reads; a file that does not parse contributes nothing)."""
-    out: list = []
-    for f in sorted(walk_markdown(root)):
-        result = parse_record(f)
-        if not result.valid or not _is_topic_frontmatter(result.frontmatter):
+def _rejections_of_parsed(result, stem: str) -> list:
+    """`(topic_id, row)` for one parsed record (nothing unless it is a valid topic)."""
+    if not result.valid or not _is_topic_frontmatter(result.frontmatter):
+        return []
+    fm = dict(result.frontmatter)
+    fm["id"] = fm.get("id") or stem
+    return _topic_rejection_rows(fm)
+
+
+def _staged_md_blobs(toplevel: Path, root_prefix: str):
+    """`(path_in_index, blob)` for every regular `.md` file the INDEX holds
+    under the store (symlinks, dot-directories and node_modules skipped, as
+    walk_markdown does for the working tree). Unmerged stages collapse to one."""
+    proc = _run_git(["ls-files", "-s", "-z", "--", root_prefix.rstrip("/") or "."], toplevel)
+    if proc.returncode != 0:
+        return
+    seen: set = set()
+    for rec in proc.stdout.split(b"\x00"):
+        meta, _tab, raw = rec.partition(b"\t")
+        if not raw or meta.split(b" ")[0] == b"120000":
             continue
-        fm = dict(result.frontmatter)
-        fm["id"] = fm.get("id") or f.stem
-        out.extend(_topic_rejection_rows(fm))
+        rel = raw.decode("utf-8", "surrogateescape")
+        parts = rel[len(root_prefix):].split("/") if root_prefix and rel.startswith(root_prefix) else rel.split("/")
+        if rel in seen or not rel.endswith(".md") or any(x.startswith(".") or x == "node_modules" for x in parts):
+            continue
+        seen.add(rel)
+        yield rel, _git_show(toplevel, f":{rel}")
+
+
+def _store_rejections(root: Path, staged: tuple | None = None) -> list:
+    """`(topic_id, row)` for every parseable topic of the store. One reader
+    for both sources, `_parse_git_blob` (CRLF-tolerant, the filing flow's
+    parse): the working tree by default, or -- `staged=(toplevel, root_prefix)`
+    -- the INDEX (the pre-commit hook's contract), never the working tree. A
+    file that does not parse contributes nothing."""
+    out: list = []
+    if staged is not None:
+        for rel, blob in _staged_md_blobs(*staged):
+            out.extend(_rejections_of_parsed(_parse_git_blob(blob, rel), Path(rel).stem))
+        return out
+    for f in sorted(walk_markdown(root)):
+        out.extend(_rejections_of_parsed(_parse_git_blob(_read_worktree(f), f), f.stem))
     return out
 
 
@@ -2750,14 +2781,15 @@ def _added_links_errors(full_path: Path, links: list, old_ids: set,
     declined-rulings rule (DESIGN-declined-check). The latter judges a new
     link against its own topic's rejections; when `old_ids` is empty (a
     brand-new topic, every link new) also against every OTHER topic in the
-    store, read from the working tree via `ctx` ({"root": store, "cache": {}})."""
+    store, read via `ctx` ({"root": store, "cache": {}, "staged": (toplevel,
+    prefix) under --staged}): from the INDEX when staged, else the working tree."""
     errs: list[str] = []
     topic_id = str((fm or {}).get("id") or Path(str(full_path)).stem)
     own_rows = rejection_rows(links)
     other: list = []
     if not old_ids and ctx is not None:
         if "store" not in ctx["cache"]:
-            ctx["cache"]["store"] = _store_rejections(ctx["root"])
+            ctx["cache"]["store"] = _store_rejections(ctx["root"], ctx.get("staged"))
         other = [(tid, r) for tid, r in ctx["cache"]["store"] if tid != topic_id]
     for l in links:
         lid = l.get("link")
@@ -3066,7 +3098,7 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
         raise GitError(f"git diff against {ref!r} failed" + (f" ({stderr})" if stderr else ""))
     entries = _parse_name_status_z(raw.stdout)
 
-    ctx = {"root": root, "cache": {}}
+    ctx = {"root": root, "cache": {}, "staged": (toplevel, prefix) if staged else None}
     errors: list[str] = []
     notes: list[str] = []
     changed = 0
