@@ -1218,6 +1218,72 @@ class TestRefMarksRowsValidatedOnEveryRecord(GuardCase):
         self.assertClean(ref.replace("Body.", "Body edited."))
 
 
+class TestDeliveredTopicCannotBeDeleted(GuardCase):
+    """gate round 15 R15-2 (Sol MAJOR, Grok MAJOR 2; owner-facing ruling): a record the index delivered
+    as a TOPIC cannot be deleted or moved away without an error, chain or not. Records delivered as an
+    incident, investigation or concept keep the pre-existing deletion policy."""
+    SHAPES = TestRefMarksRowsValidatedOnEveryRecord.SHAPES
+    GONE = "topic file deleted or renamed after being recorded"
+
+    def _both(self, mutate):
+        """Run `mutate()` then the worktree and the staged guard; return (rc, out) after asserting they agree."""
+        mutate()
+        rc_wt, out_wt = run_memlint(["--against-ref", "HEAD", str(self.root)])
+        git(["add", "-A"], self.root)
+        rc_st, out_st = run_memlint(["--against-ref", "HEAD", "--staged", str(self.root)])
+        git(["reset", "-q"], self.root)
+        self.assertEqual(rc_wt, rc_st, f"worktree vs staged disagree:\n{out_wt}\n{out_st}")
+        return rc_wt, out_wt, out_st
+
+    def test_deleting_a_delivered_note_is_refused_on_both_paths(self):
+        for name, text in self.SHAPES.items():
+            with self.subTest(name):
+                self.store(text)
+                rc, out_wt, out_st = self._both(lambda: (self.root / "topics" / "foo.md").unlink())
+                self.assertEqual(rc, 1, out_wt)
+                self.assertIn(self.GONE, out_wt)
+                self.assertIn(self.GONE, out_st)
+
+    def test_moving_a_delivered_note_to_inbox_is_refused(self):
+        # a move is a deletion plus an added file; the added file is free, the deletion half errors
+        for name, text in self.SHAPES.items():
+            with self.subTest(name):
+                self.store(text)
+
+                def move():
+                    (self.root / "inbox").mkdir(exist_ok=True)
+                    (self.root / "topics" / "foo.md").rename(self.root / "inbox" / "foo.md")
+                rc, out_wt, out_st = self._both(move)
+                self.assertEqual(rc, 1, out_wt)
+                self.assertIn(self.GONE, out_wt)
+                self.assertIn(self.GONE, out_st)
+
+    def test_renaming_a_delivered_note_within_topics_is_refused(self):
+        self.store(self.SHAPES["typeless"])
+        rc, out_wt, _ = self._both(lambda: (self.root / "topics" / "foo.md").rename(self.root / "topics" / "bar.md"))
+        self.assertEqual(rc, 1, out_wt)
+        self.assertIn(self.GONE, out_wt)
+
+    def test_a_delivered_incident_stays_deletable(self):
+        root = git_store(self.tmp / "inc_store")
+        self.root = root
+        (root / "incidents").mkdir(exist_ok=True)
+        (root / "incidents" / "x.md").write_text(
+            "---\ntype: incident\nid: INC-9400\ntitle: x\ncode_refs:\n  - src/a.py\n---\n\nBody.\n")
+        commit_all(root)
+        rc, out_wt, out_st = self._both(lambda: (root / "incidents" / "x.md").unlink())
+        self.assertEqual(rc, 0, f"{out_wt}\n{out_st}")
+
+    def test_a_delivered_concept_stays_deletable(self):
+        root = git_store(self.tmp / "concept_store")
+        self.root = root
+        (root / "concepts").mkdir(exist_ok=True)
+        (root / "concepts" / "x.md").write_text("---\ntype: concept\ntitle: x\n---\n\nBody.\n")
+        commit_all(root)
+        rc, out_wt, out_st = self._both(lambda: (root / "concepts" / "x.md").unlink())
+        self.assertEqual(rc, 0, f"{out_wt}\n{out_st}")
+
+
 class TestSharedBlockItemDelete(unittest.TestCase):
     def test_the_helper_deletes_the_first_match_and_ignores_comments_and_quotes(self):
         lines = ["code_refs:\n", '  - "src/a.py"  # why\n', "  - src/b.py\n", "  - src/a.py\n", "x: 1\n"]

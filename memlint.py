@@ -3383,7 +3383,16 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
             if new_only:
                 errors.extend(_ref_marks_errors(full_path, {"ref_marks": new_only}))
 
-        if not _is_topic_like(old_result):
+        # R15-2 (gate round 15): the deletion rule protects a record the index DELIVERED as a topic
+        # (frozen type `topic`) as well as a topic-like one: a typeless `topics/` note, a `links: []`
+        # note or a `TOP-` id with no links is on `for-path` through `code_refs`, and deleting it (a
+        # move is a deletion plus an added file) would drop that hit with no error and no row. Records
+        # delivered as an incident, investigation or concept keep the pre-existing policy (deletable).
+        delivered_topic_gone = (
+            (status == "D" or new_blob is None)
+            and _frozen_type(root, full_path, old_result) == "topic")
+
+        if not _is_topic_like(old_result) and not delivered_topic_gone:
             # Re-gate (Grok): a path that was not topic-like at REF (an
             # incident, an empty note) may be promoted/edited into one
             # carrying links; every recovered link whose id REF did not
@@ -3403,7 +3412,7 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
         changed += 1
 
         if status == "D":
-            kind = _record_kind_label(old_result)
+            kind = "topic" if delivered_topic_gone else _record_kind_label(old_result)
             errors.append(
                 f"{full_path}: {kind} file deleted or renamed after being recorded "
                 "(append-only; a store never loses history)"
@@ -3411,7 +3420,7 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
             continue
 
         if new_blob is None:
-            kind = _record_kind_label(old_result)
+            kind = "topic" if delivered_topic_gone else _record_kind_label(old_result)
             errors.append(
                 f"{full_path}: {kind} file deleted or renamed after being recorded "
                 "(append-only; a store never loses history)"
