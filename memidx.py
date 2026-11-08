@@ -6259,10 +6259,13 @@ class _UnmappedResolver:
     A directory is resolved from its already-resolved parent plus one
     `lstat` of its own name; a path is its resolved directory plus the
     final name checked against a symlink (one `lstat`, or, once a
-    directory holds several paths, one listing of that directory). A
+    directory holds several paths, one listing of that directory used as a
+    fast path for names it contains -- a name it does not contain is asked
+    of the filesystem with `lstat`, never assumed absent). A
     symlinked directory or file component is followed with the real `realpath`, so the answer is the same as
     `Path.resolve()`; a path containing `..` skips the cache entirely
-    (it must be resolved physically)."""
+    (it must be resolved physically), and so does a leading `//` anchor
+    (it has its own meaning on some systems)."""
 
     def __init__(self, paths: "list[str] | None" = None) -> None:
         # Files per (as-given) directory across the whole call: a directory
@@ -6278,7 +6281,6 @@ class _UnmappedResolver:
         # directory cannot be listed. One listing answers "is this final
         # component a symlink" for every path in the directory.
         self._listings: dict[str, dict[str, bool] | None] = {}
-        self._folded: dict[str, set[str]] = {}
 
     def _is_link(self, parent: str, full: str, bulk: bool) -> bool:
         listing = self._listings.get(parent, False)
@@ -6290,16 +6292,14 @@ class _UnmappedResolver:
                 listing = None
             self._listings[parent] = listing
         name = os.path.basename(full)
-        if listing is not None and listing is not False:
-            if name in listing:
-                return listing[name]
-            folded = self._folded.get(parent)
-            if folded is None:
-                folded = self._folded[parent] = {k.casefold() for k in listing}
-            if name.casefold() not in folded:
-                return False  # absent from the directory: nothing to follow
-        # No listing yet, or a name differing only in case (a
-        # case-insensitive mount): ask the filesystem directly.
+        # The listing is a fast path for HITS only: an exact-name entry
+        # answers the symlink question from its DirEntry. Any miss -- exact
+        # or case-folded -- asks the filesystem about the full path: a
+        # case-insensitive or normalisation-insensitive mount (APFS, drvfs)
+        # can resolve a name the listing spells differently (composed vs
+        # decomposed), so "not in the listing" is never proof of absence.
+        if listing is not None and listing is not False and name in listing:
+            return listing[name]
         try:
             return S_ISLNK(os.lstat(full).st_mode)
         except OSError:
@@ -6323,7 +6323,7 @@ class _UnmappedResolver:
 
     def resolve(self, raw_path: str) -> Path:
         p = Path(raw_path)
-        if ".." in p.parts or not p.name:
+        if ".." in p.parts or not p.name or raw_path.startswith("//"):
             return p.resolve()
         d = str(p.parent)
         return Path(self._join_final(self._resolve_dir(d), p.name, d in self._shared))
@@ -6465,6 +6465,7 @@ def cmd_unmapped(args) -> int:
     unmapped: list[str] = []
     by_path: dict[str, str] = {}
     degraded: dict | None = None
+    healed = False
     conn: sqlite3.Connection | None = None
     try:
         # Design R3 (audit MC-P1-02): unmapped's is a NEGATIVE claim
@@ -6488,6 +6489,7 @@ def cmd_unmapped(args) -> int:
                 coverage_status = "uninitialized"
             else:
                 if state == "stale":
+                    healed = True
                     reindex_ns = argparse.Namespace(
                         root=str(root), project=args.project, db=str(db_path), full=False,
                         no_embed=True, auto=True,
@@ -6610,6 +6612,10 @@ def cmd_unmapped(args) -> int:
         # whenever no path was actually classified this call (every branch
         # above that resets the three lists to [] resets this to {} too).
         "by_path": by_path,
+        # Whether the stale self-heal ran in THIS call: a caller holding
+        # earlier verdicts must treat them as unchecked against the index
+        # that was just rebuilt (the prompt hook reclassifies everything).
+        "healed": healed,
     }
     if degraded is not None:
         result["degraded"] = degraded
@@ -14829,7 +14835,11 @@ def main(argv=None) -> int:
 
     p_unmapped = sub.add_parser("unmapped")
     add_common_args(p_unmapped, need_root=True)
-    p_unmapped.add_argument("paths", nargs="+", metavar="PATH")
+    # Zero paths is legal: the call still runs the index-state check and the
+    # stale self-heal and prints the usual JSON with empty lists (the prompt
+    # hook always calls it, so it never reuses a verdict off an unchecked
+    # index).
+    p_unmapped.add_argument("paths", nargs="*", metavar="PATH")
     # Design R5 (audit MC-P1-05, TOP-0123 L5): repeatable -- one call now
     # serves every configured code root (never given -> None; one or more
     # times -> a list, via argparse's own action="append" semantics).
