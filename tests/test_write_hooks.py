@@ -605,9 +605,15 @@ class TestLedgerPostEdit(HookTestBase):
         (fake / "date").write_text(
             '#!/usr/bin/env bash\ncase "$*" in *%3N*) echo 3N;; *) exec /bin/date "$@";; esac\n')
         (fake / "date").chmod(0o755)
+        # mc_elapsed_field resolves `python3` from PATH (mc_now_ms "" 1), not
+        # from MC_PY: the spy is installed under every interpreter name first
+        # on PATH (gate round 2 R2-3).
         py = Path(self.td) / "py-spy"
         py.write_text('#!/usr/bin/env bash\ntouch "' + str(spy) + '"\nexec "' + VENV_PYTHON + '" "$@"\n')
         py.chmod(0o755)
+        for name in ("python3", "python"):
+            (fake / name).write_text(py.read_text())
+            (fake / name).chmod(0o755)
         script = ('unset EPOCHREALTIME; source "$1"; MC_PY="$2"; unset EPOCHREALTIME; '
                   'MC_QUERY_MS_MODE=""; mc_elapsed_field; printf " mode=%s" "$MC_QUERY_MS_MODE"')
         proc = subprocess.run(
