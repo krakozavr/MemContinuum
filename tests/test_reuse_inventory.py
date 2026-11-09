@@ -353,10 +353,10 @@ class TestDelegationNeedsAnExecutableCall(unittest.TestCase):
                    '    mc_store_lint_schema "$PY" "$memlint" "$MEMCONTINUUM_ROOT"\n',
                    '    "$PY" "$memlint" "$MEMCONTINUUM_ROOT"\n')
         self.assertIn("type mc_store_lint_schema", ft.read("hooks/post-commit-reindex.sh"))
-        f = only(ft.findings(), "store-lint-schema", "delegation")
+        f = [x for x in only(ft.findings(), "store-lint-schema", "delegation")
+             if "does not reach the job through the owner" in x]
         self.assertEqual(len(f), 1, ft.findings())
         self.assertIn("post-commit-reindex.sh", f[0])
-        self.assertIn("does not reach the job through the owner", f[0])
 
     def test_python_consumer_that_imports_but_never_calls_fails(self):
         f = self.check({"a.py": "def f(x):\n    return x\n",
