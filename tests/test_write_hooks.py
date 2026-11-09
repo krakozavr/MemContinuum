@@ -7456,6 +7456,11 @@ class TestUserPromptCommitNudge(HookTestBase):
 # ---------------------------------------------------------------------------
 
 
+# SessionEnd fixes its own watchdog budget (hooks/sessionend-stamp.sh:
+# MC_WATCHDOG_BUDGET=1.2 with MC_WATCHDOG_BUDGET_FIXED=1).
+SESSIONEND_BUDGET = 1.2
+
+
 class TestSessionEndStamp(HookTestBase):
     def test_bash_syntax_valid(self):
         result = subprocess.run([MC_BASH, "-n", str(SESSIONEND_HOOK)], capture_output=True, text=True)
@@ -7470,7 +7475,7 @@ class TestSessionEndStamp(HookTestBase):
         proc, elapsed = run_script(SESSIONEND_HOOK, self.session_end_payload(session_id), self.base_env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), "")
-        self.assertLess(elapsed, 1.5)
+        self.assert_hook_logged_within_budget(elapsed, budget=SESSIONEND_BUDGET)
 
         after = self.load_state(session_id)
         self.assertIn("ended_at", after)
@@ -7509,7 +7514,17 @@ class TestSessionEndStamp(HookTestBase):
             SESSIONEND_HOOK, self.session_end_payload(session_id), self.poisoned_base_env()
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertLess(elapsed, 1.5)
+        self.assert_hook_logged_within_budget(elapsed, budget=SESSIONEND_BUDGET)
+
+    def test_log_line_carries_elapsed(self):
+        """TOP-0137 L32: the SessionEnd line carries `elapsed=` like the prompt
+        and ledger hooks, on the stamped path and an early-exit path alike."""
+        run_script(SESSIONEND_HOOK, self.session_end_payload("s-end-elapsed"), self.base_env())
+        run_script(SESSIONEND_HOOK, "", self.base_env())
+        lines = [l for l in (self.home / "hook.log").read_text().splitlines() if "sessionend outcome=" in l]
+        self.assertEqual(len(lines), 2, lines)
+        for line in lines:
+            self.assertRegex(line, r"\belapsed=\d+\.\ds\b", line)
 
     def test_watchdog_budget_reduced_to_1_2s(self):
         """Finding 1: SessionEnd's own harness budget is 1.5s (this

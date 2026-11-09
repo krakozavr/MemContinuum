@@ -62,7 +62,7 @@ fi
 source "$SCRIPT_DIR/memlib.sh"
 
 finish() {
-    mc_log "sessionend outcome=$1 session=${SESSION_ID:-}"
+    mc_log "sessionend outcome=$1 session=${SESSION_ID:-} $(mc_elapsed_field)"
     exit 0
 }
 
