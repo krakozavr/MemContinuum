@@ -4205,7 +4205,7 @@ down:
 - **`unmapped PATH...`** — classifies each path as `mapped_topic`,
   `mapped_concept_only`, `unmapped` or `ignored` without walking the code tree.
   `ignored` is a path that would otherwise be `unmapped`, lies under a code
-  root and is ignored by that root's git (one `git check-ignore -z --stdin` per
+  root and is ignored by that root's git (one `git --no-optional-locks check-ignore -z --stdin` per
   root, root-relative paths): it leaves the
   `unmapped` list and count, is listed under `ignored` in the JSON (and printed
   as `ignored: N`) and is `"ignored"` in `by_path`. A tracked file that matches an
