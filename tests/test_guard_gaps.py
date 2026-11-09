@@ -792,6 +792,28 @@ class TestNonScalarTypeUnderAgainstRef(GuardCase):
         self.store(self._listy())
         self.assertClean(ttext([]))
 
+    # R1-2: a REF valid under the OLD rules (type: topic, an ignored non-string metadata.type) was
+    # delivered as `topic`; the string rule now quarantines it, which must not release its freeze.
+    @staticmethod
+    def _bad_metadata(text):
+        return text.replace("tags: []\n", "tags: []\nmetadata:\n  type: [x]\n", 1)
+
+    def test_a_ref_quarantined_only_by_the_new_metadata_type_rule_keeps_its_type_frozen(self):
+        ref = self._bad_metadata(ttext([]))
+        res = memidx.parse_record_text(ref, "x")
+        self.assertTrue(memidx.record_is_quarantined(res), res)
+        self.store(ref)
+        self.assertRefused(ttext([]).replace("type: topic\n", "type: incident\n", 1),
+                           "type changed 'topic' -> 'incident'")
+
+    def test_repairing_that_metadata_alone_is_clean(self):
+        self.store(self._bad_metadata(ttext([])))
+        self.assertClean(ttext([]))
+
+    def test_a_list_type_at_ref_is_quarantined_at_ref_so_its_repair_may_declare_any_type(self):
+        self.store(self._listy())
+        self.assertClean(ttext([]).replace("type: topic\n", "type: incident\n", 1))
+
     def test_deleting_a_non_topic_record_that_carried_a_list_type_delivered_nothing_and_is_clean(self):
         # an incident-like record (INC- id, no links): quarantined at REF, deletable like any non-topic
         text = "---\nid: INC-9103\ntype: [incident, weird]\ntitle: Odd\n---\n\nBody.\n"

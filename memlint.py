@@ -3218,7 +3218,8 @@ def _frozen_type(root, path, result) -> str | None:
     QUARANTINED at REF (`record_is_quarantined`, the reindex predicate), and one whose delivered
     type is not canonical (`inbox`, `memo`, a garbled word, or `_delivered_type` None). Their
     repair is a record ENTERING delivery, like an added file."""
-    if record_is_quarantined(result):
+    # R1-2: the REF side is judged as the OLD index delivered it (see record_is_quarantined)
+    if record_is_quarantined(result, as_delivered_before_type_rule=True):
         return None
     delivered = _delivered_type(root, path, result.frontmatter)
     return delivered if delivered in CANONICAL_TYPES else None

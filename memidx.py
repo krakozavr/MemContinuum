@@ -392,11 +392,25 @@ class ParseResult:
         )
 
 
-def record_is_quarantined(result: "ParseResult") -> bool:
+def record_is_quarantined(result: "ParseResult", *, as_delivered_before_type_rule: bool = False) -> bool:
     """The reindex quarantine predicate: a parsed record the index skips (no row, no type, no
     for-path or digest membership) because it is canonical-looking yet unusable. `cmd_reindex`
-    and memlint's type freeze both ask this one question."""
-    return not result.valid
+    and memlint's type freeze both ask this one question.
+
+    `as_delivered_before_type_rule` (TOP-0137 L29, gate round 1 R1-2): judge a REF-side parse as
+    the index delivered it BEFORE the string-type rule existed. Such a record carried `type: topic`
+    with an ignored, non-string `metadata.type`, was valid and was delivered as `topic`; the new
+    rule quarantines it, which must not release its type freeze. So a result whose ONLY
+    diagnostics are the two type-shape ones and whose own `type` is a string (or absent/null: the
+    directory decides) counts as delivered. A non-string `type` itself is not forgiven: the old
+    index delivered its repr, a string no store holds (six-store scan), so it stays quarantined."""
+    if result.valid:
+        return False
+    if (as_delivered_before_type_rule and result.diagnostics
+            and all(d in (TYPE_SHAPE_DIAGNOSTIC, METADATA_TYPE_SHAPE_DIAGNOSTIC) for d in result.diagnostics)
+            and (result.frontmatter.get("type") is None or isinstance(result.frontmatter.get("type"), str))):
+        return False
+    return True
 
 
 def is_canonical_frontmatter(fm: dict) -> bool:
