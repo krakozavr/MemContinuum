@@ -1908,8 +1908,10 @@ class TestUnbind(BindCase):
         self.assertEqual([(r["ref"], r["action"]) for r in memidx.ref_mark_rows(self.fm())],
                          [("src/*.py", "remove"), ("src/lib/", "remove")])
         self.assertGuardsClean()
-        rc, _o, err = self.bind("src/lib/")
-        self.assertEqual(rc, 2, err)  # bind still refuses a prefix
+        rc, out, err = self.bind("src/*.py")  # a glob is bound again, without an anchor (TOP-0137 L29)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("bound without an anchor", out)
+        self.assertFalse(self.fm().get("anchors"))
 
     def test_a_ref_that_is_not_bound_is_a_noop(self):
         self.put(binding_topic())

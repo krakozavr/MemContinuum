@@ -854,6 +854,33 @@ class TestMalformedRecordDiagnostics(unittest.TestCase):
                     rc = memlint.main([str(root)])
                     self.assertEqual(rc, 1)
 
+    def test_non_scalar_type_is_an_error_naming_the_file(self):
+        """TOP-0137 L29: `type` (and `metadata.type`) names one record type; a list or
+        mapping used to lint clean and index as its repr."""
+        cases = [
+            ("type_list", "type: [topic, weird]\n", "type: type must be a scalar string"),
+            ("type_mapping", "type: {a: b}\n", "type: type must be a scalar string"),
+            ("metadata_type_list", "type: topic\nmetadata:\n  type: [x, y]\n",
+             "metadata: metadata.type must be a scalar string"),
+        ]
+        for name, fm_body, needle in cases:
+            with self.subTest(case=name):
+                with tempfile.TemporaryDirectory() as td:
+                    root = Path(td)
+                    _write(root / "topics" / "bad.md", f"---\nid: TOP-9210\n{fm_body}title: Bad\n---\nBody.\n")
+                    errors, _warnings = memlint.lint_root(root)
+                    self.assertTrue(any("bad.md" in e and needle in e for e in errors), errors)
+                    self.assertEqual(memlint.main([str(root)]), 1)
+
+    def test_scalar_type_stays_clean_and_a_note_with_a_list_type_only_warns(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _write(root / "topics" / "ok.md", "---\nid: TOP-9211\ntype: topic\ntitle: Ok\n---\nBody.\n")
+            _write(root / "notes" / "note.md", "---\ntitle: my note\ntype: [a, b]\n---\nBody.\n")
+            errors, warnings = memlint.lint_root(root)
+            self.assertEqual(errors, [], errors)
+            self.assertTrue(any("type: not a scalar string; ignored" in w for w in warnings), warnings)
+
     def test_link_with_no_id_is_an_error_naming_links_link(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

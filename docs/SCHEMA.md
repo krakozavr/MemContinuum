@@ -121,6 +121,9 @@ optional derivation flags of `mark-standing` (without them, or when a derivation
 as history — and may unbind a prefix or a glob. `bind` of a reference whose anchor for the current
 link already exists (an unbound one) **restores** it: the reference and an `add` row come back, no
 second anchor is written (one baseline per `(ref, link)`; a new baseline is a new link).
+`bind` also accepts a prefix (`src/core/`, an existing directory) or a glob (`src/app/*.py`): it
+adds the entry and its `add` row exactly as for a file and writes no anchor row (there is no byte
+span to hash), so a prefix or glob is bound and unbound with the same two commands.
 
 Under `--against-ref` the membership change must be paired with rows exactly as `standing:` is (g2
 below), on the **set** of `code_refs` entries (prefixes and globs included): one `add` row per entry
@@ -262,7 +265,11 @@ is recorded as a new `owner-verbatim` link (`TOP-xxxx Ln`), never inferred on th
 
 ## 5. Promotion — how an inference becomes a ruling
 
-1. The record exists as `agent-inference` / `provisional`.
+1. The record exists as an `agent-inference` link that still stands (status `active` or
+   `provisional`), or as a `reviewer-finding` or `code-derived` link of either status: the
+   owner may ratify a reviewer's or a derivation's wording as well. An owner tier, a terminal
+   status (`superseded`, `historical`, `declined`) and a link that already carries
+   `promoted_by` are never promotable.
 2. The owner is shown the **exact text**; they affirm *that text* (or supply
    their own).
 3. A **new link** is appended: `authority: owner-ratified` (or
@@ -275,7 +282,7 @@ is recorded as a new `owner-verbatim` link (`TOP-xxxx Ln`), never inferred on th
    nobody else.
 
 `memidx.py promote TOP-xxxx Ln --session ID (--yes-message UUID | --owner-message UUID --quote TEXT)`
-performs steps 1-3: it refuses a link that is not `agent-inference` / `provisional`, appends the
+performs steps 1-3: it refuses a link that step 1 does not allow, appends the
 new owner-tier link, and inserts the one `promoted_by:` line into the old one. It reads the
 owner's message from the session transcript and refuses when it cannot establish it.
 

@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -462,14 +463,71 @@ class TestBind(unittest.TestCase):
         self.assertIn("symbol ambiguous", err)
         self.assertEqual(self.topic(), before)
 
-    def test_prefix_and_glob_are_not_anchorable_rc_2(self):
+    def check_unanchored_bind(self, ref):
+        self.put_topic(topic_text())
+        rc, out, err = self.bind(ref)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("bound without an anchor", out)
+        fm = memidx.parse_record_text(self.topic(), "x").frontmatter
+        self.assertEqual(fm["code_refs"], ["src/foo.py", ref])
+        self.assertEqual([(m["ref"], m["action"]) for m in fm["ref_marks"]], [(ref, "add")])
+        self.assertFalse(fm.get("anchors"))
+        errors, _ = memlint.lint_root(self.store)
+        self.assertEqual(errors, [], errors)
+        rc, lint = run_memlint(["--against-ref", "HEAD", str(self.store)])
+        self.assertEqual(rc, 0, lint)
+        self.assertEqual(self.bind(ref)[0], 0)
+        self.assertIn("already bound", self.bind(ref)[1])
+
+    def test_prefix_is_bound_without_an_anchor(self):
+        self.check_unanchored_bind("src/")
+
+    def test_glob_is_bound_without_an_anchor(self):
+        self.check_unanchored_bind("src/*.py")
+
+    def test_prefix_dry_run_prints_the_diff_and_writes_nothing(self):
         self.put_topic(topic_text())
         before = self.topic()
-        for ref in ("src/", "src/*.py"):
+        rc, out, err = self.bind("src/", "--dry-run")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.topic(), before)
+        self.assertIn("+  - ", out)
+        self.assertIn("dry-run: nothing written", out)
+
+    def test_unbound_prefix_is_restored_by_bind(self):
+        self.put_topic(topic_text())
+        base = memidx._now()
+        steps = iter(base + timedelta(minutes=i) for i in range(1, 4))
+        with mock.patch.object(memidx, "_now", side_effect=lambda: next(steps)):
+            self.assertEqual(self.bind("src/")[0], 0)
+            commit_all(self.store)
+            rc, out, err = run_memidx(["unbind", "TOP-1", "src/", "--root", str(self.store)])
+            self.assertEqual(rc, 0, err)
+            commit_all(self.store)
+            rc, out, err = self.bind("src/")
+        self.assertEqual(rc, 0, err)
+        fm = memidx.parse_record_text(self.topic(), "x").frontmatter
+        self.assertIn("src/", fm["code_refs"])
+        self.assertEqual([m["action"] for m in fm["ref_marks"]], ["add", "remove", "add"])
+        self.assertFalse(fm.get("anchors"))
+        rc, lint = run_memlint(["--against-ref", "HEAD", str(self.store)])
+        self.assertEqual(rc, 0, lint)
+        errors, _ = memlint.lint_root(self.store)
+        self.assertEqual(errors, [], errors)
+
+    def test_prefix_without_slash_or_naming_no_directory_is_refused(self):
+        self.put_topic(topic_text())
+        before = self.topic()
+        for ref, needle in (("nodir/", "no existing directory"),
+                            ("src/foo.py/", "no existing directory"),
+                            ("src/*.py#beta", "no #symbol fragment")):
             with self.subTest(ref=ref):
                 rc, out, err = self.bind(ref)
-                self.assertEqual(rc, 2)
-                self.assertIn("not anchorable", err)
+                self.assertEqual(rc, 1, err)
+                self.assertIn(needle, err)
+        rc, out, err = self.bind("src")
+        self.assertEqual(rc, 2)
+        self.assertIn("directory", err)
         self.assertEqual(self.topic(), before)
 
     def test_directory_without_slash_is_rc_2(self):

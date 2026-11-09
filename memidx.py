@@ -405,7 +405,8 @@ def is_canonical_frontmatter(fm: dict) -> bool:
         return True
     if isinstance(fm.get("links"), list):
         return True
-    if fm.get("type") in CANONICAL_TYPES:
+    rtype = fm.get("type")
+    if isinstance(rtype, str) and rtype in CANONICAL_TYPES:
         return True
     return False
 
@@ -511,6 +512,16 @@ def validate_record_shape(fm: dict) -> list:
 
     if not _shape_ok_mapping(fm.get("metadata")):
         diagnostics.append(("metadata", "metadata must be a mapping"))
+
+    # TOP-0137 L29: `type` (and `metadata.type`) names ONE record type. A list or
+    # mapping used to reindex as its repr (`"['topic', 'weird']"`) and lint clean;
+    # now it is a shape error, so lint and the index agree (a canonical record is
+    # quarantined, a note drops the field with a warning).
+    if isinstance(fm.get("type"), (list, dict)):
+        diagnostics.append(("type", "type must be a scalar string"))
+    meta = fm.get("metadata")
+    if isinstance(meta, dict) and isinstance(meta.get("type"), (list, dict)):
+        diagnostics.append(("metadata", "metadata.type must be a scalar string"))
 
     for key in ("anchors", "standing_marks", "ref_marks"):
         rows = fm.get(key)
@@ -4329,6 +4340,28 @@ def code_ref_matches_exact(file_path: str, code_ref: str) -> bool:
     if not code_ref_is_anchorable(code_ref):
         return False
     return code_ref_split(code_ref)[0] == str(file_path).rstrip("/")
+
+
+def unanchored_ref_problem(code_ref: str, code_roots: list) -> str | None:
+    """Why a code_refs entry that `code_ref_is_anchorable` rejects cannot be
+    bound without an anchor, else None (TOP-0137 L29). A prefix must end with
+    `/` and name an existing directory under a code root; a glob must carry
+    one of `*?[` (the rule `code_ref_matches` applies: segment containment for
+    a directory, fnmatch for a pattern). Neither takes a `#symbol` fragment:
+    there is no byte span to name."""
+    ref = str(code_ref)
+    if not code_ref_is_named(ref):
+        return f"{ref!r} names no path"
+    raw_path, sep, _frag = ref.partition("#")
+    if sep:
+        return f"{ref!r}: a prefix or glob takes no #symbol fragment"
+    if any(ch in raw_path for ch in _CODE_REF_GLOB_CHARS):
+        return None
+    if not raw_path.endswith("/"):
+        return f"{ref!r} is not a prefix (a prefix ends with '/') or a glob"
+    if not any((Path(r) / raw_path.rstrip("/")).is_dir() for r in code_roots):
+        return f"prefix {ref!r} names no existing directory under the code root(s)"
+    return None
 
 
 def _mapping_rows(fm: dict, key: str) -> list:
@@ -12205,7 +12238,7 @@ def capture_anchor_row(ref: str, link_id: str, code_roots: list, captured: str) 
     ref_path, frag = code_ref_split(ref)
     for root in code_roots:
         if (Path(root) / ref_path).is_dir():
-            return None, (2, f"not anchorable: {ref!r} names a directory")
+            return None, (2, f"not anchorable: {ref!r} names a directory (a prefix is written with a trailing slash)")
     root, abs_path = _anchor_code_ref_file(ref_path, code_roots)
     if abs_path is None:
         return None, (1, f"file not found under the code root(s): {ref_path}")
@@ -12662,17 +12695,22 @@ def audit_row_problem(fm: dict, key: str, ident_of, fields, row: dict, old_rows:
 
 
 def bound_edit_problem(new_text: str, path, ref: str, link_id: str, expect_refs: list,
-                       mark_row: dict | None = None, old_marks: list | None = None) -> str | None:
+                       mark_row: dict | None = None, old_marks: list | None = None,
+                       anchored: bool = True) -> str | None:
     """`edit_roundtrip_problem` for `bind`: the `code_refs` must be exactly
     `expect_refs` (so the inserted ref parses back to the string that was
     bound), the anchor row for `(ref, link_id)` must be exactly one (a restore adds
     none) and carry that same ref, and a `mark_row` (the
-    `ref_marks:` row of an inserted ref) must round-trip."""
+    `ref_marks:` row of an inserted ref) must round-trip. `anchored=False` (a
+    prefix or glob) inverts the anchor rule: no anchor row may name `ref`."""
     def check(fm: dict) -> str | None:
         if list(fm.get("code_refs") or []) != list(expect_refs):
             return f"the edit would not round-trip the reference {ref!r} as a string"
         rows = [r for r in anchor_rows(fm) if anchor_row_key(r) == (ref, link_id)]
-        if len(rows) != 1 or any(r.get("ref") != ref for r in rows):
+        if not anchored:
+            if any(r.get("ref") == ref for r in anchor_rows(fm)):
+                return f"the edit would anchor the prefix or glob {ref!r}"
+        elif len(rows) != 1 or any(r.get("ref") != ref for r in rows):
             return f"the edit would not round-trip the anchor row for {ref!r}"
         if mark_row is not None:
             return audit_row_problem(fm, "ref_marks", ref_mark_ident, REF_MARK_FIELDS,
@@ -12771,13 +12809,22 @@ def cmd_bind(args) -> int:
     ref: the one chunk's inclusive line span). A ref that was unbound but whose
     anchor for the current link still exists is RESTORED: the reference and its
     row come back, no new anchor is captured (one baseline per (ref, link); a new
-    baseline is a new link). rc 2: not anchorable (prefix/glob/dir); rc 1: topic
-    or file missing, symbol ambiguous, other failure."""
+    baseline is a new link). A prefix (`src/core/`, an existing directory under
+    a code root) or a glob (`src/app/*.py`) is bound WITHOUT an anchor -- it has
+    no byte span: the entry and its `ref_marks:` `add` row go in, no anchor row
+    is written (TOP-0137 L29; `unanchored_ref_problem` is the check, the
+    matching rule stays `code_ref_matches`). rc 2: a directory named without its
+    trailing slash; rc 1: topic or file missing, a prefix naming no directory,
+    symbol ambiguous, other failure."""
     root = Path(args.root).resolve()
     ref = args.ref
-    if not code_ref_is_anchorable(ref):
-        print(f"bind: not anchorable: {ref!r} is a prefix or glob", file=sys.stderr)
-        return 2
+    code_roots = _code_roots_arg(args.code_root) or [Path.cwd().resolve()]
+    anchored = code_ref_is_anchorable(ref)
+    if not anchored:
+        problem = unanchored_ref_problem(ref, code_roots)
+        if problem:
+            print(f"bind: {problem}; nothing written", file=sys.stderr)
+            return 1
     problem = _audit_text_problem(args)
     if problem:
         print(f"bind: {problem}", file=sys.stderr)
@@ -12797,20 +12844,25 @@ def cmd_bind(args) -> int:
     key = (ref, link_id)
     refs_now = [r for r in fm.get("code_refs") or []]
     in_refs = ref in [str(r) for r in refs_now]
-    has_anchor = any(anchor_row_key(r) == key for r in anchor_rows(fm))
+    has_anchor = anchored and any(anchor_row_key(r) == key for r in anchor_rows(fm))
+    if in_refs and not anchored:
+        print(f"bind: {ref} is already bound to {args.topic} (a prefix or glob carries no anchor); "
+              "nothing written")
+        return 0
     if has_anchor and in_refs:
         print(f"bind: {args.topic} already has an anchor for ({ref}, {link_id}); "
               "one baseline per key -- a new baseline is a new link")
         return 0
-    code_roots = _code_roots_arg(args.code_root) or [Path.cwd().resolve()]
     row = None
-    if not has_anchor:
+    if anchored and not has_anchor:
         row, failure = capture_anchor_row(ref, link_id, code_roots, args.captured)
         if row is None:
             rc, message = failure
             print(f"bind: {message}", file=sys.stderr)
             return rc
     mark = None
+    restored = (not anchored) and any(
+        str(m.get("ref")) == ref for m in ref_mark_rows(fm))
     if not in_refs:
         try:
             authority, source = mark_authority(
@@ -12819,7 +12871,7 @@ def cmd_bind(args) -> int:
             print(f"bind: {exc.message}; nothing written", file=sys.stderr)
             return 1
         mark = new_audit_row("ref", ref, "add", authority, source,
-                             args.why or ("restored by memidx bind" if has_anchor else "bound by memidx bind"),
+                             args.why or ("restored by memidx bind" if has_anchor or restored else "bound by memidx bind"),
                              args.recorded_by)
     try:
         new_text = old_text
@@ -12831,11 +12883,14 @@ def cmd_bind(args) -> int:
         print(f"bind: {exc}", file=sys.stderr)
         return 1
     expect = refs_now if in_refs else refs_now + [ref]
-    problem = bound_edit_problem(new_text, path, ref, link_id, expect, mark, ref_mark_rows(fm))
+    problem = bound_edit_problem(new_text, path, ref, link_id, expect, mark, ref_mark_rows(fm),
+                                 anchored=anchored)
     if problem:
         print(f"bind: {problem}; nothing written", file=sys.stderr)
         return 1
     apply_topic_edit(path, old_text, new_text, args.dry_run, root)
+    if not anchored and not args.dry_run:
+        print(f"bind: {ref} is bound without an anchor (a prefix or glob has no byte span)")
     return 0
 
 
@@ -13198,6 +13253,35 @@ class FilingRefusal(Exception):
         self.on_disk = on_disk
         self.remedy = remedy
         self.path_on_disk = path_on_disk
+
+
+def path_exists_refusal(path: Path, rel: str) -> FilingRefusal:
+    """The `path-exists` refusal of `record` (TOP-0137 L29), written once for
+    both sites that raise it. When the file already there parses as a record
+    with an id, the message names that topic and the command that adds to it,
+    so the agent has somewhere to go; when it does not parse, the old text
+    stays, with the reservation remedy for a zero-byte file."""
+    try:
+        parsed = parse_record(Path(path))
+        rid, title = parsed.frontmatter.get("id"), parsed.frontmatter.get("title")
+        known = parsed.valid and isinstance(rid, str) and bool(rid.strip())
+    except Exception:
+        known = False
+    if known:
+        return FilingRefusal(
+            "path-exists",
+            f'{rel} already exists ({rid} "{title}"); add to it with: '
+            f"memidx.py append {rid} --ruling ...")
+    try:
+        empty = Path(path).stat().st_size == 0
+    except OSError:
+        empty = False
+    if empty:
+        return FilingRefusal(
+            "path-exists",
+            f"{rel} already exists (a zero-byte reservation left by an interrupted record); "
+            f"remove it with: rm {shlex.quote(str(path))}")
+    return FilingRefusal("path-exists", f"{rel} already exists (not a parseable record)")
 
 
 def _bare_or_quoted(value, pattern=_BARE_NAME_RE) -> str:
@@ -13832,7 +13916,7 @@ def _finish_write(command: str, args, ctx: dict, root: Path, path: Path, rel: st
                 path.parent.mkdir(parents=True, exist_ok=True)
                 _atomic_write_bytes(path, new_text.encode("utf-8"), exclusive=True)
             except FileExistsError:
-                raise FilingRefusal("path-exists", f"{rel} already exists")
+                raise path_exists_refusal(path, rel)
             except ReservationLeftError as exc:
                 raise FilingRefusal("io-error", f"cannot write {rel}: {exc}", on_disk="rejected",
                                     remedy=f"remove it with: rm {shlex.quote(exc.reserved_path)}",
@@ -14100,7 +14184,7 @@ def _record_impl(args, ctx: dict) -> int:
         raise FilingRefusal("outside-store", f"{path.relative_to(root)} would be created at {real_parent}, "
                             f"outside the store {root} (a symlinked topics/ or area?)")
     if path.exists():
-        raise FilingRefusal("path-exists", f"{path.relative_to(root)} already exists")
+        raise path_exists_refusal(path, str(path.relative_to(root)))
     ctx["topic"] = topic_id
     ruling = _filing_ruling(args, ctx, code_roots, strict=False)
     link = _build_link(args, "L1", ruling, args.rationale)
@@ -14133,6 +14217,20 @@ def _record_impl(args, ctx: dict) -> int:
     return rc
 
 
+PROMOTABLE_STATUSES = ("active", "provisional")
+PROMOTABLE_AUTHORITIES = ("agent-inference", "reviewer-finding", "code-derived")
+
+
+def promotable_link(authority, status) -> bool:
+    """SCHEMA section 5 step 1, the one place the rule is written (TOP-0137
+    L29): the owner may ratify an `agent-inference`, `reviewer-finding` or
+    `code-derived` link that still stands (`active` or `provisional`). An owner
+    tier is already a ruling and a terminal status (`superseded`,
+    `historical`, `declined`) is history; a link already carrying
+    `promoted_by` is refused by the caller before this is asked."""
+    return authority in PROMOTABLE_AUTHORITIES and status in PROMOTABLE_STATUSES
+
+
 def _promote_impl(args, ctx: dict) -> int:
     root = Path(args.root).resolve()
     _filing_validate_args(args, "promote")
@@ -14146,11 +14244,13 @@ def _promote_impl(args, ctx: dict) -> int:
     old_ruling = old.get("ruling") or {}
     if old.get("promoted_by"):
         raise FilingRefusal("already-promoted", f"{args.link} already carries promoted_by {old['promoted_by']}")
-    if old_ruling.get("authority") != "agent-inference" or old.get("status") != "provisional":
+    if not promotable_link(old_ruling.get("authority"), old.get("status")):
         raise FilingRefusal(
             "not-promotable",
             f"{args.link} is {old.get('status')!r}/{old_ruling.get('authority')!r}; "
-            "SCHEMA section 5 promotes an agent-inference / provisional link")
+            "SCHEMA section 5 promotes an agent-inference link (active or provisional) or a "
+            "reviewer-finding / code-derived link (either status); an owner tier or a "
+            "superseded/historical/declined link cannot be promoted")
     if args.yes_message and args.shown_text is None:
         args.shown_text = str(old_ruling.get("text") or "")
     args.ruling = None
@@ -14770,7 +14870,7 @@ def main(argv=None) -> int:
     )
     add_common_args(p_bind, need_root=True)
     p_bind.add_argument("topic", metavar="TOP-xxxx")
-    p_bind.add_argument("ref", metavar="REF", help="a file path or path#symbol (no prefix/glob)")
+    p_bind.add_argument("ref", metavar="REF", help="a file path or path#symbol (anchored), or a prefix (src/dir/) or glob (src/*.py), bound without an anchor")
     p_bind.add_argument("--code-root", dest="code_root", action="append", default=None)
     p_bind.add_argument("--captured", choices=("ruling", "bind"), default="bind")
     add_mark_args(p_bind, why_required=False)

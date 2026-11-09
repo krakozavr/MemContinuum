@@ -4141,6 +4141,9 @@ class TestMalformedRecordQuarantine(unittest.TestCase):
                 "id: TOP-9105\ntype: topic\nlinks:\n  - not-a-mapping\n  - 42\n",
                 "links[0]",
             ),
+            ("type_list", "id: TOP-9106\ntype: [topic, weird]\n", "type"),
+            ("type_mapping", "id: TOP-9107\ntype: {a: b}\n", "type"),
+            ("metadata_type_list", "id: TOP-9108\ntype: topic\nmetadata:\n  type: [x]\n", "metadata"),
         ]
         for name, fm_body, expected_field in cases:
             with self.subTest(case=name):
@@ -4158,6 +4161,21 @@ class TestMalformedRecordQuarantine(unittest.TestCase):
                     diagnostics = json.loads(rows[0]["diagnostics"])
                     fields = [d[0] for d in diagnostics]
                     self.assertIn(expected_field, fields, diagnostics)
+
+    def test_scalar_type_is_indexed_unchanged(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            _write_record(root / "topics" / "ok.md", "---\nid: TOP-9109\ntype: topic\ntitle: Ok\n---\nBody.\n")
+            db = Path(td) / "idx.sqlite"
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(reindex(root, db, no_embed=True), 0)
+            conn = sqlite3.connect(str(db))
+            try:
+                self.assertEqual(conn.execute("SELECT type FROM records WHERE id='TOP-9109'").fetchall(),
+                                 [("topic",)])
+            finally:
+                conn.close()
+            self.assertEqual(self._index_errors_rows(db), [])
 
     # -- scenario 3: a link with no `link:` id -- must quarantine, not IntegrityError
 

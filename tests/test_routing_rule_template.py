@@ -56,9 +56,17 @@ class TestRoutingRuleTemplate(unittest.TestCase):
         # Cap moved 32 -> 36: TOP-0137 L15 adds the C3 sentence (find the
         # existing implementation and name it; ask "did this duplicate
         # anything?") as its own block after the context-pack paragraph.
+        # Cap moved 36 -> 40: TOP-0137 L29 adds the "a decision must still be
+        # true tomorrow" paragraph (session state is not a ruling) as its own
+        # block after the store-section bullets.
         text = TEMPLATE.read_text()
         lines = text.splitlines()
-        self.assertLessEqual(len(lines), 36, f"template is {len(lines)} lines, want <= 36")
+        self.assertLessEqual(len(lines), 40, f"template is {len(lines)} lines, want <= 40")
+
+    def test_names_the_still_true_tomorrow_rule(self):
+        text = TEMPLATE.read_text()
+        self.assertIn("A decision must still be true tomorrow.", text)
+        self.assertIn("session state, not a ruling", text)
 
     def test_names_the_c3_rule(self):
         text = TEMPLATE.read_text()

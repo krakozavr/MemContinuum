@@ -2674,7 +2674,7 @@ run (see "Tolerant parsing and quarantine" above for the full mechanism):
 | rule | severity |
 |---|---|
 | frontmatter does not parse (unreadable file, not UTF-8, unterminated block, malformed YAML on a canonical record) | error, naming the file and the failure |
-| a typed field is the wrong shape (`links` not a list of mappings, a link missing its `link` id, `ruling`/`rationale`/`invariant` not a mapping, `tags`/`code_refs`/… not a list of scalars) on a canonical record | error, naming the field |
+| a typed field is the wrong shape (`links` not a list of mappings, a link missing its `link` id, `ruling`/`rationale`/`invariant` not a mapping, `tags`/`code_refs`/… not a list of scalars, `type` or `metadata.type` a list or mapping instead of one scalar string) on a canonical record | error, naming the field |
 
 A note's own parse diagnostics (malformed YAML recovered leniently, an
 unterminated frontmatter block) are warnings instead — a note has no chain
@@ -3666,8 +3666,15 @@ string that was bound (`bound_edit_problem`); otherwise nothing is written. `--d
 prints the exact diff and writes nothing; the writer never commits — the
 orchestrator commits the store, and `memlint.py --against-ref HEAD` is the
 acceptance check. The anchor is taken for the topic's `current` link; a second
-`bind` for the same `(ref, link)` is a no-op. A reference to a prefix, a glob
-or a directory exits 2 ("not anchorable"); a `path#symbol` with two or more
+`bind` for the same `(ref, link)` is a no-op. A prefix (`src/core/`, a trailing
+slash and an existing directory under a code root) or a glob (`src/app/*.py`) has
+no byte span, so `bind` adds it to `code_refs` with its `add` row and writes NO
+anchor row (`unanchored_ref_problem` is the check; `bound_edit_problem(...,
+anchored=False)` requires that no anchor row names the ref; the matching rule stays
+`code_ref_matches`) and says so in one line; an unbound prefix or glob is restored
+the same way. A prefix naming no directory, or a `#symbol` on a prefix or glob, is
+refused with rc 1, and a directory written without its trailing slash exits 2
+("not anchorable"); a `path#symbol` with two or more
 matching chunks writes nothing and says "symbol ambiguous"; with zero matches
 it is captured as a file-span row. `code_head` is `git rev-parse --short HEAD`
 in the code root and `worktree` is the file's `git status --porcelain`
@@ -3923,6 +3930,11 @@ memory-shaped.
 
 `record`, `append` and `promote` are three entry points to one writer.
 
+`promote` accepts the links SCHEMA section 5 lists (`promotable_link`): authority
+`agent-inference`, `reviewer-finding` or `code-derived`, status `active` or
+`provisional`. An owner tier, a terminal status (`superseded`, `historical`,
+`declined`) or a link that already carries `promoted_by` is refused.
+
 **The write is line insertion.** The new link is rendered alone by
 `render_link_item` (SCHEMA section 3 field order, the store's indentation,
 strings through `_yaml_quote`, `date`/`recorded_at` bare) and placed first under
@@ -3942,7 +3954,7 @@ plus the new-link checks `--against-ref` applies. The write itself is atomic
 I/O error leaves the original bytes (or no file) and is a refusal
 (`io-error`) -- except that a failed unlink of a new topic's reservation leaves a
 zero-byte file plus the rejected-edit banner, and the next `record` of that slug
-then refuses `path-exists` until the file is removed -- as is a mid-write failure in `bind` and `mark-standing`, which
+then refuses `path-exists` until the file is removed (`path_exists_refusal`: when the file there parses as a record with an id, the refusal names it and the `append` command to add to it; a zero-byte file gets the `rm` remedy; any other unparseable file keeps the plain text) -- as is a mid-write failure in `bind` and `mark-standing`, which
 share the write. After the write, an existing topic is checked by
 `check_append_only` against `HEAD` for that file; an error, or a guard that
 cannot run at all (`guard-unavailable`), puts the original bytes back and

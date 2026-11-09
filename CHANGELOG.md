@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Filing tools stop sending agents into dead ends
+
+Four small gaps in the tools that file and bind decisions. `bind` now accepts a directory prefix
+(`src/core/`) or a glob (`src/app/*.py`) as a topic's code reference, the two shapes the schema
+always allowed: it records the reference and its dated row, writes no anchor (there is no single
+file to fingerprint) and says so. `promote` can ratify an inference that is still active, not only
+a provisional one, and a reviewer's finding or a derivation too; a superseded link, an owner's own
+words or a link already promoted stay refused. When `record` finds its file already there, it now
+names the existing topic and the `append` command to add to it, instead of a bare refusal. And the
+linter rejects a `type:` written as a list or a mapping, which used to pass and was indexed as the
+list's text. The rules file that repo setup renders into each project also gains one sentence:
+a decision must still be true tomorrow, so approvals, progress notes and status lines are session
+state and stay out of the store; repos pick it up at their next update.
+
+    Technical: `bind` of a non-anchorable ref calls `unanchored_ref_problem` (trailing-slash prefix naming an existing directory under a code root, or a glob character; no `#symbol`), inserts the entry and its `ref_marks` `add` row, writes no anchor row (`bound_edit_problem(anchored=False)` requires none) and exits 0; a directory without its slash still exits 2; `promotable_link` allows authority `agent-inference`/`reviewer-finding`/`code-derived` with status `active`/`provisional`; `path_exists_refusal` serves both `path-exists` sites; `validate_record_shape` reports a list or mapping `type` and `metadata.type` (a canonical record is quarantined, a note drops the field with a warning) and `is_canonical_frontmatter` no longer hashes a list `type`; `templates/memcontinuum-rules.md` changed, so rendered rules files read `rules-stale` until `memcontinuum-update.sh --apply`.
+
 ### Hooks stop timing out on a Windows-mounted code root
 
 On WSL, a project whose code lives under `/mnt/` (a Windows drive) saw its prompt, edit-ledger and
