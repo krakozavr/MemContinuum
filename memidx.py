@@ -13085,14 +13085,19 @@ class _UndoScope:
         if not self._held:
             raise RuntimeError("the receipt stack is changed only under the topic lock")
 
-    def _unlink(self, path: Path) -> None:
+    def _unlink(self, path: Path, strict: bool = False) -> None:
+        """Remove one receipt file. The automatic prunes (a crash leftover, a
+        committed receipt, an unreadable file) suppress a failure: a stale file
+        is re-examined and dropped by the next command. The explicit
+        `undo-binding --discard` is `strict`: a failure refuses."""
         self._require_lock()
         if self.dry:
             return
         try:
             os.unlink(path)
-        except OSError:
-            pass
+        except OSError as exc:
+            if strict:
+                raise TopicEditRefused(f"could not drop the receipt {path}: {exc}; nothing written") from exc
 
     def prune_invalid(self) -> None:
         """Remove the files the last `stack()` scan found unreadable (under the lock)."""
@@ -13100,11 +13105,11 @@ class _UndoScope:
             self._unlink(path)
         self.invalid = []
 
-    def drop(self, receipt: "_Receipt") -> None:
-        """Remove one receipt (under the lock)."""
+    def drop(self, receipt: "_Receipt", strict: bool = False) -> None:
+        """Remove one receipt (under the lock); `strict` reports a failed deletion."""
         self._require_lock()
         self._dropped.add(receipt.seq)
-        self._unlink(receipt.path)
+        self._unlink(receipt.path, strict)
 
     @contextlib.contextmanager
     def locked(self):
@@ -13731,7 +13736,7 @@ def _discard_latest_receipt(scope: "_UndoScope", args) -> int:
             if args.dry_run:
                 print(f"undo-binding: would drop {what}; nothing written")
                 return 0
-            scope.drop(top)
+            scope.drop(top, strict=True)
     except TopicEditRefused as exc:
         print(f"undo-binding: {exc}", file=sys.stderr)
         return 1

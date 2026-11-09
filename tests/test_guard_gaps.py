@@ -3107,6 +3107,26 @@ class TestUndoReceipts(BindCase):
         self.assertIn("no undo receipts", err)
         self.assertEqual(self.raw(), before)
 
+    def test_discard_reports_a_deletion_failure(self):
+        before = self.head_state(refs=())
+        self.assertEqual(self.bind()[0], 0)
+        after = self.raw()
+        real = os.unlink
+
+        def failing(path, *a, **kw):
+            if str(path).endswith(".json"):
+                raise PermissionError(13, "Permission denied", str(path))
+            return real(path, *a, **kw)
+
+        with mock.patch.object(memidx.os, "unlink", side_effect=failing):
+            rc, out, err = run_memidx(["undo-binding", "TOP-1", "--discard", "--root", str(self.store)])
+        self.assertEqual(rc, 1, (out, err))
+        self.assertIn("undo-binding: could not drop the receipt ", err)
+        self.assertIn("Permission denied", err)
+        self.assertTrue(err.rstrip().endswith("; nothing written"), err)
+        self.assertNotIn("dropped", out)
+        self.assertEqual((self.raw(), len(self.receipts())), (after, 1))
+
     def test_discard_drops_only_the_latest_receipt(self):
         before = self.head_state(refs=())
         self.assertEqual(self.bind("src/other.py")[0], 0)
