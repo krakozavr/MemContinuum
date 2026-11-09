@@ -2431,7 +2431,7 @@ def _parse_name_status_z(raw: bytes) -> list[tuple[str, str]]:
     return entries
 
 
-def _parse_git_blob(data: bytes | None, label) -> ParseResult:
+def _parse_git_blob(data: bytes | None, label, *, as_delivered: bool = False) -> ParseResult:
     """The typed-parse entry point for git-blob content (a path that does
     not exist at this side becomes an empty, non-canonical ParseResult --
     "no record here", never an error of its own; a missing path is judged
@@ -2444,7 +2444,7 @@ def _parse_git_blob(data: bytes | None, label) -> ParseResult:
         return ParseResult({}, "", [("file", "not UTF-8")], valid=False, fallback=False)
     # CRLF-tolerant parse: the parser reads LF, the raw-span walker (below)
     # keeps the original bytes (TOP-0137 L12, gate round 2 item 1).
-    return parse_record_raw(text, label)
+    return parse_record_raw(text, label, as_delivered=as_delivered)
 
 
 _KIND_BY_ID_PREFIX = {
@@ -3218,8 +3218,8 @@ def _frozen_type(root, path, result) -> str | None:
     QUARANTINED at REF (`record_is_quarantined`, the reindex predicate), and one whose delivered
     type is not canonical (`inbox`, `memo`, a garbled word, or `_delivered_type` None). Their
     repair is a record ENTERING delivery, like an added file."""
-    # R1-2: the REF side is judged as the OLD index delivered it (see record_is_quarantined)
-    if record_is_quarantined(result, as_delivered_before_type_rule=True):
+    # `result` is the as-delivered REF parse (R2-1): no type-shape quarantine, nothing sanitised
+    if record_is_quarantined(result):
         return None
     delivered = _delivered_type(root, path, result.frontmatter)
     return delivered if delivered in CANONICAL_TYPES else None
@@ -3360,7 +3360,9 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
             continue
 
         old_blob = _git_show(toplevel, f"{ref}:{relpath}")
-        old_result = _parse_git_blob(old_blob, f"{relpath} (at {ref})")
+        # R2-1: the REF side is read ONCE, as the index delivered it at REF (see parse_record_text
+        # `as_delivered`); every REF-side check below reads this result
+        old_result = _parse_git_blob(old_blob, f"{relpath} (at {ref})", as_delivered=True)
         # `type` is frozen for EVERY record that existed at REF (a topic, an incident, a
         # concept, a typeless one ...); judged first, before the classification exit below and
         # before any branch that can `continue` past it (a repair, an invalid new side). The

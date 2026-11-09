@@ -454,6 +454,14 @@ pre-commit hook reads):
   frozen whatever it is: a valid `type: incident` under `topics/` is frozen as `incident` (declaring `topic`
   is `type changed 'incident' -> 'topic'`), and a move to another directory is a deletion plus an addition
   under `--no-renames`, governed by the deletion rule. A delivered record may not become quarantined: a new side the index would quarantine (schema-invalid) is `record leaves delivery: the new side would be quarantined (<first schema error>)`, on the worktree and staged paths. Plain lint is unchanged.
+  The `REF` side is read ONCE, with the rules in force when it was delivered, for every check of the guard
+  (type freeze, links, `code_refs` / `ref_marks` pairing, anchors, standing marks, topic classification): a
+  validation rule that tightens later (the string-type rule: `type` and `metadata.type` must be strings) never
+  releases the history of a record the older index accepted, so a record whose only fault is such a rule is
+  still judged at `REF` as the valid record it was, with its malformed fields as the index then read them (a
+  note's `type: 42` was the non-canonical type `"42"`, freezing nothing). The new rule applies to the NEW side
+  only. One carve-out: a canonical record whose own `type` is a truthy non-string delivered a repr string
+  nobody can keep, so its repair to a scalar type is free (its links, `code_refs` rows and anchors stay frozen).
 - *Link order is frozen (g3).* The link ids present at `REF` must keep their relative order in the
   new blob (new links go on top; the older newest-first check refuses one placed between old ids): `<path>: links reordered (L2 before
   L3; the chain head is first-active-in-file-order)`. The chain head is the first active link in file

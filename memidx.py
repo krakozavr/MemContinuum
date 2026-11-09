@@ -398,27 +398,13 @@ class ParseResult:
         )
 
 
-def record_is_quarantined(result: "ParseResult", *, as_delivered_before_type_rule: bool = False) -> bool:
+def record_is_quarantined(result: "ParseResult") -> bool:
     """The reindex quarantine predicate: a parsed record the index skips (no row, no type, no
     for-path or digest membership) because it is canonical-looking yet unusable. `cmd_reindex`
-    and memlint's type freeze both ask this one question.
-
-    `as_delivered_before_type_rule` (TOP-0137 L29, gate round 1 R1-2): judge a REF-side parse as
-    the index delivered it BEFORE the string-type rule existed. Such a record carried `type: topic`
-    with an ignored, non-string `metadata.type`, was valid and was delivered as `topic`; the new
-    rule quarantines it, which must not release its type freeze. So a result whose ONLY
-    diagnostics are the two type-shape ones and whose own `type` is a string (or absent/null: the
-    directory decides) counts as delivered. A FALSY non-string `type` (`false`, `0`, `[]`, `{}`) is
-    the same: `infer_type` skipped it and the old index delivered the directory default. A truthy
-    non-string `type` is not forgiven: the old index delivered its repr, a string no store holds
-    (five-store scan), so it stays quarantined."""
-    if result.valid:
-        return False
-    if (as_delivered_before_type_rule and result.diagnostics
-            and all(d in (TYPE_SHAPE_DIAGNOSTIC, METADATA_TYPE_SHAPE_DIAGNOSTIC) for d in result.diagnostics)
-            and (not result.frontmatter.get("type") or isinstance(result.frontmatter.get("type"), str))):
-        return False
-    return True
+    and memlint's type freeze both ask this one question. (memlint's REF side hands it a
+    `parse_record_text(..., as_delivered=True)` result, so the question is asked with the
+    rules in force when the REF was delivered.)"""
+    return not result.valid
 
 
 def is_canonical_frontmatter(fm: dict) -> bool:
@@ -629,7 +615,7 @@ def parse_record(path: Path) -> ParseResult:
     return parse_record_text(text, path)
 
 
-def parse_record_text(text: str, path) -> ParseResult:
+def parse_record_text(text: str, path, *, as_delivered: bool = False) -> ParseResult:
     """Text-based twin of `parse_record` -- everything past the file read
     itself. `path` is used only for string labeling in the diagnostics and
     warnings below (every use is an f-string), never opened, stat'd, or
@@ -637,7 +623,14 @@ def parse_record_text(text: str, path) -> ParseResult:
     Path (memlint `--against-ref` handing this a git-blob's content under a
     store-relative label, e.g. "topics/foo.md (at HEAD)") may pass any
     object with a useful `__str__`. Behavior is otherwise identical to the
-    tail of the old single `parse_record` function this was split from."""
+    tail of the old single `parse_record` function this was split from.
+
+    `as_delivered` (TOP-0137 L29, gate round 2 R2-1/R2-2): parse a memlint `--against-ref` REF
+    blob with the rules in force BEFORE the string-type rule (generation 6). The two type-shape
+    diagnostics are not raised, so a record rejected only by them is valid, and a NOTE's
+    malformed `type` / `metadata.type` is neither warned about nor dropped: `infer_type` then
+    sees the frontmatter the old index saw (`type: 42` -> `"42"`, a list -> its repr). Every
+    other rule is unchanged. The one parse behind every REF-side read of the guard."""
     if not text.startswith("---"):
         return ParseResult({}, text, [], valid=True, fallback=False)
     lines = text.splitlines(keepends=True)
@@ -722,6 +715,8 @@ def parse_record_text(text: str, path) -> ParseResult:
         return ParseResult(fm, body, diagnostics, valid=not canonical, fallback=True)
 
     diagnostics = validate_record_shape(fm)
+    if as_delivered:
+        diagnostics = [d for d in diagnostics if d not in (TYPE_SHAPE_DIAGNOSTIC, METADATA_TYPE_SHAPE_DIAGNOSTIC)]
     canonical = is_canonical_frontmatter(fm)
     if not canonical and diagnostics:
         diagnostics = _drop_note_shape_violations(path, fm, diagnostics)
@@ -12799,10 +12794,10 @@ def apply_topic_edit(path: Path, old_text: str, new_text: str, dry_run: bool, st
     _atomic_write_bytes(path, new_text.encode("utf-8"))
 
 
-def parse_record_raw(text: str, path):
+def parse_record_raw(text: str, path, *, as_delivered: bool = False):
     """`parse_record_text` over text that may carry CRLF endings (the
     byte-preserving writers keep them; the parser reads LF)."""
-    return parse_record_text(text.replace("\r\n", "\n"), path)
+    return parse_record_text(text.replace("\r\n", "\n"), path, as_delivered=as_delivered)
 
 
 def edit_roundtrip_problem(new_text: str, path, check) -> str | None:
