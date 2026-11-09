@@ -357,7 +357,7 @@ copied inline.
 - frontmatter that does not parse (unreadable, not UTF-8, unterminated, malformed YAML on a
   canonical record), or a typed field in the wrong shape (`links` not a list of mappings, a link
   missing its `link` id, `ruling`/`rationale`/`invariant` not a mapping, a list field carrying a
-  non-scalar) → error naming the file/field; the same on a note (no schema id/links/type) → warning
+  non-scalar, `type` or `metadata.type` present and not a string) → error naming the file/field; the same on a note (no schema id/links/type) → warning
 - a file under `topics/`, `incidents/`, or `investigations/` whose first line is not exactly `---`,
   or whose frontmatter block has no closing `---` → error naming the file and the missing fence —
   directory membership decides this, independent of whether the raw text otherwise looks canonical;

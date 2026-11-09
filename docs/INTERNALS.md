@@ -2674,7 +2674,7 @@ run (see "Tolerant parsing and quarantine" above for the full mechanism):
 | rule | severity |
 |---|---|
 | frontmatter does not parse (unreadable file, not UTF-8, unterminated block, malformed YAML on a canonical record) | error, naming the file and the failure |
-| a typed field is the wrong shape (`links` not a list of mappings, a link missing its `link` id, `ruling`/`rationale`/`invariant` not a mapping, `tags`/`code_refs`/… not a list of scalars, `type` or `metadata.type` a list or mapping instead of one scalar string) on a canonical record | error, naming the field |
+| a typed field is the wrong shape (`links` not a list of mappings, a link missing its `link` id, `ruling`/`rationale`/`invariant` not a mapping, `tags`/`code_refs`/… not a list of scalars, `type` or `metadata.type` present and not a string: a list, mapping, number, boolean, date or set; null and absent stay legal) on a canonical record | error, naming the field |
 
 A note's own parse diagnostics (malformed YAML recovered leniently, an
 unterminated frontmatter block) are warnings instead — a note has no chain

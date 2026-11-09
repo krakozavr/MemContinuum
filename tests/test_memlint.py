@@ -872,6 +872,31 @@ class TestMalformedRecordDiagnostics(unittest.TestCase):
                     self.assertTrue(any("bad.md" in e and needle in e for e in errors), errors)
                     self.assertEqual(memlint.main([str(root)]), 1)
 
+    def test_a_non_string_scalar_or_set_type_is_the_same_error(self):
+        """Gate round 1 R1-5: the rule is "a string", so an int, bool, date or `!!set` is
+        refused for `type` and for `metadata.type`; null and absent stay legal."""
+        values = ["42", "true", "2026-01-01", "!!set {topic: null}"]
+        for value in values:
+            for name, fm_body, needle in (
+                ("type", f"type: {value}\n", "type: type must be a scalar string"),
+                ("metadata.type", f"type: topic\nmetadata:\n  type: {value}\n",
+                 "metadata: metadata.type must be a scalar string"),
+            ):
+                with self.subTest(field=name, value=value):
+                    with tempfile.TemporaryDirectory() as td:
+                        root = Path(td)
+                        _write(root / "topics" / "bad.md",
+                               f"---\nid: TOP-9212\n{fm_body}title: Bad\n---\nBody.\n")
+                        errors, _warnings = memlint.lint_root(root)
+                        self.assertTrue(any("bad.md" in e and needle in e for e in errors), errors)
+        for fm_body in ("type:\n", "type: ~\n", "type: topic\nmetadata:\n  type:\n", ""):
+            with self.subTest(clean=fm_body):
+                with tempfile.TemporaryDirectory() as td:
+                    root = Path(td)
+                    _write(root / "topics" / "ok.md", f"---\nid: TOP-9213\n{fm_body}title: Ok\n---\nBody.\n")
+                    errors, _warnings = memlint.lint_root(root)
+                    self.assertEqual(errors, [], errors)
+
     def test_scalar_type_stays_clean_and_a_note_with_a_list_type_only_warns(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

@@ -4144,6 +4144,15 @@ class TestMalformedRecordQuarantine(unittest.TestCase):
             ("type_list", "id: TOP-9106\ntype: [topic, weird]\n", "type"),
             ("type_mapping", "id: TOP-9107\ntype: {a: b}\n", "type"),
             ("metadata_type_list", "id: TOP-9108\ntype: topic\nmetadata:\n  type: [x]\n", "metadata"),
+            # gate round 1 R1-5: the rule is "a string"
+            ("type_int", "id: TOP-9110\ntype: 42\n", "type"),
+            ("type_bool", "id: TOP-9111\ntype: true\n", "type"),
+            ("type_date", "id: TOP-9112\ntype: 2026-01-01\n", "type"),
+            ("type_set", "id: TOP-9113\ntype: !!set {topic: null}\n", "type"),
+            ("metadata_type_int", "id: TOP-9114\ntype: topic\nmetadata:\n  type: 42\n", "metadata"),
+            ("metadata_type_bool", "id: TOP-9115\ntype: topic\nmetadata:\n  type: true\n", "metadata"),
+            ("metadata_type_date", "id: TOP-9116\ntype: topic\nmetadata:\n  type: 2026-01-01\n", "metadata"),
+            ("metadata_type_set", "id: TOP-9117\ntype: topic\nmetadata:\n  type: !!set {x: null}\n", "metadata"),
         ]
         for name, fm_body, expected_field in cases:
             with self.subTest(case=name):

@@ -495,6 +495,12 @@ def _shape_ok_mapping(val) -> bool:
     return not val or isinstance(val, dict)
 
 
+# The two type-shape diagnostics validate_record_shape adds (TOP-0137 L29). memlint's type
+# freeze recognises them by value to classify a REF record as the OLD index delivered it.
+TYPE_SHAPE_DIAGNOSTIC = ("type", "type must be a scalar string")
+METADATA_TYPE_SHAPE_DIAGNOSTIC = ("metadata", "metadata.type must be a scalar string")
+
+
 def validate_record_shape(fm: dict) -> list:
     """Design R2 rule 5: every rule is "this type, OR absent/null/empty".
     Runs on frontmatter that already parsed as a YAML mapping (never on
@@ -513,15 +519,17 @@ def validate_record_shape(fm: dict) -> list:
     if not _shape_ok_mapping(fm.get("metadata")):
         diagnostics.append(("metadata", "metadata must be a mapping"))
 
-    # TOP-0137 L29: `type` (and `metadata.type`) names ONE record type. A list or
-    # mapping used to reindex as its repr (`"['topic', 'weird']"`) and lint clean;
-    # now it is a shape error, so lint and the index agree (a canonical record is
-    # quarantined, a note drops the field with a warning).
-    if isinstance(fm.get("type"), (list, dict)):
-        diagnostics.append(("type", "type must be a scalar string"))
+    # TOP-0137 L29: `type` (and `metadata.type`) names ONE record type, a string. A list
+    # or mapping used to reindex as its repr (`"['topic', 'weird']"`) and lint clean; an
+    # int, bool, date or set stringified into an index type the same way (gate round 1,
+    # R1-5). Absent or null stays legal (the directory decides). Now it is a shape error,
+    # so lint and the index agree (a canonical record is quarantined, a note drops the
+    # field with a warning).
+    if fm.get("type") is not None and not isinstance(fm.get("type"), str):
+        diagnostics.append(TYPE_SHAPE_DIAGNOSTIC)
     meta = fm.get("metadata")
-    if isinstance(meta, dict) and isinstance(meta.get("type"), (list, dict)):
-        diagnostics.append(("metadata", "metadata.type must be a scalar string"))
+    if isinstance(meta, dict) and meta.get("type") is not None and not isinstance(meta.get("type"), str):
+        diagnostics.append(METADATA_TYPE_SHAPE_DIAGNOSTIC)
 
     for key in ("anchors", "standing_marks", "ref_marks"):
         rows = fm.get(key)
