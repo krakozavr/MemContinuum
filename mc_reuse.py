@@ -342,10 +342,15 @@ def scan_tree(root, scan_roots, exclusions) -> Scan:
 # -- python ------------------------------------------------------------------
 
 def _strip_docstring(node):
-    body = getattr(node, "body", None)
-    if (body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
-            and isinstance(body[0].value.value, str)):
-        node.body = body[1:] or [ast.Pass()]
+    """`node` with the docstring of EVERY module, class and function inside it
+    removed (nested ones too): prose is not executable text for a guard."""
+    for n in ast.walk(node):
+        if not isinstance(n, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        body = n.body
+        if (body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)):
+            n.body = body[1:] or [ast.Pass()]
     return node
 
 
@@ -439,10 +444,7 @@ def _scan_python(scan, rel, text, line_offset, embedded, prefix):
         else:
             residual.append(st)
     if residual:
-        mod = ast.Module(body=copy.deepcopy(residual), type_ignores=[])
-        if (mod.body and isinstance(mod.body[0], ast.Expr) and isinstance(mod.body[0].value, ast.Constant)
-                and isinstance(mod.body[0].value.value, str)):
-            mod.body = mod.body[1:]
+        mod = _strip_docstring(ast.Module(body=copy.deepcopy(residual), type_ignores=[]))
         try:
             rtext = ast.unparse(mod)
         except Exception:

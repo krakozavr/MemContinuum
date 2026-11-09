@@ -414,6 +414,19 @@ class TestPositiveControls(unittest.TestCase):
         ft.write("lintdoc.py", '"""Mentions --against-ref and Coverage signal in a docstring only."""\n')
         self.assertEqual(ft.findings(), [])
 
+    def test_nested_docstrings_are_not_executable_text(self):
+        ft = FixtureTree(self)
+        ft.write("nested_doc.py",
+                 'def outer(x):\n    """Outer prose."""\n\n    def inner(y):\n'
+                 '        """Coverage signal is explained here; edited file(s) with no decision topic."""\n'
+                 '        return y\n\n    class Helper:\n        """rejected alternative from this session"""\n\n'
+                 '        def m(self):\n            """Coverage signal again."""\n            return 1\n'
+                 '    return inner(x)\n')
+        self.assertEqual(ft.findings(), [])
+        # a string that is not a docstring still counts
+        ft.write("nested_doc.py", 'def outer(x):\n    def inner(y):\n        return "Coverage signal"\n    return inner\n')
+        self.assertEqual(len(only(ft.findings(), "coverage-fact-sentence", "token_owner")), 1, ft.findings())
+
     def test_against_ref_outside_hooks_is_legitimate(self):
         ft = FixtureTree(self)
         ft.write("scripts/adapter.sh",
@@ -762,6 +775,10 @@ class TestScanner(unittest.TestCase):
         d = ast.parse("def h(p, q=1):\n    r = p - q\n    return len(r)\n").body[0]
         e = ast.parse("def h(p, q=1):\n    r = p + q\n    return str(r)\n").body[0]
         self.assertEqual(mc_reuse.py_fingerprint(a), mc_reuse.py_fingerprint(b))
+        nested = ast.parse('def g(p, q=1):\n    def k():\n        """inner prose"""\n        return 1\n'
+                           '    r = p + q\n    return len(r)\n').body[0]
+        plain = ast.parse("def g(p, q=1):\n    def k():\n        return 1\n    r = p + q\n    return len(r)\n").body[0]
+        self.assertEqual(mc_reuse.py_fingerprint(nested), mc_reuse.py_fingerprint(plain))
         for other in (c, d, e):
             self.assertNotEqual(mc_reuse.py_fingerprint(a), mc_reuse.py_fingerprint(other))
 
