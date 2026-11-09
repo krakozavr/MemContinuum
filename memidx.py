@@ -13030,10 +13030,19 @@ class _UndoScope:
         except ValueError:
             self.rel = Path(topic_path).as_posix()
         # receipts exist only in a git WORK TREE (a bare repository or a plain directory gets none)
-        found = (_git_run(self.store, ["rev-parse", "--git-path", "memcontinuum/receipts"])
-                 if _inside_git_work_tree(self.store, _git_env()) else None)
-        out = found[1].strip() if found and found[0] == 0 else ""
-        self.rec_dir = (self.store / out) if out else None
+        # (git's answer must be one of three: only a VERIFIED non-work-tree edits without a receipt)
+        self.setup_problem: str | None = None
+        self.rec_dir = None
+        state = _work_tree_state(self.store, _git_env())
+        if state is None:
+            self.setup_problem = _unavailable_problem(self.rel, ("work-tree detection", None))
+        elif state == "yes":
+            found = _git_run(self.store, ["rev-parse", "--git-path", "memcontinuum/receipts"])
+            out = found[1].strip() if found and found[0] == 0 else ""
+            if out:
+                self.rec_dir = self.store / out
+            else:
+                self.setup_problem = _unavailable_problem(self.rel, ("receipt directory lookup", None))
         digest = hashlib.sha256(str(self.store).encode("utf-8")).hexdigest()[:10]
         self.key = re.sub(r"[^A-Za-z0-9._-]", "_", topic_id) + "-" + digest
 
@@ -13110,6 +13119,8 @@ class _UndoScope:
         without receipts (and under `--dry-run`, which changes nothing)."""
         if self._held:
             raise RuntimeError("the topic lock is not re-entrant")
+        if self.setup_problem:
+            raise TopicEditRefused(self.setup_problem)
         if not self.enabled or self.dry:
             self._held = True
             try:
@@ -14533,16 +14544,34 @@ def _filing_ruling(args, ctx: dict, code_roots: list, strict: bool) -> dict:
             "source": args.source or ""}
 
 
-def _inside_git_work_tree(root: Path, env: dict | None = None) -> bool:
-    """True when `root` is inside a git work tree (so a `git checkout` remedy
-    can work there); a bare repository is not. `env` replaces the ambient
-    environment for the call (the undo receipts pass `_git_env()`)."""
+def _work_tree_state(root: Path, env: dict | None = None) -> str | None:
+    """Three results for "is `root` inside a git work tree": "yes" (git exits 0
+    and prints `true`), "no" (verified: git exits 0 and prints `false` -- a bare
+    repository -- or exits 128, not a repository, or git is not installed and no
+    `.git` entry exists at or above `root`) or None -- unavailable (a timeout,
+    any other exit, empty output, git missing where a `.git` entry exists). `env`
+    replaces the ambient environment (the undo receipts pass `_git_env()`)."""
     try:
         done = subprocess.run(["git", "-C", str(root), "rev-parse", "--is-inside-work-tree"],
                               capture_output=True, text=True, timeout=30, env=env)
+    except FileNotFoundError:
+        here = Path(os.path.realpath(root))
+        has_git = any((d / ".git").exists() for d in (here, *here.parents))
+        return None if has_git else "no"
     except (OSError, subprocess.SubprocessError):
-        return False
-    return done.returncode == 0 and done.stdout.strip() == "true"
+        return None
+    answer = done.stdout.strip()
+    if done.returncode == 0 and answer in ("true", "false"):
+        return "yes" if answer == "true" else "no"
+    return "no" if done.returncode == 128 else None
+
+
+def _inside_git_work_tree(root: Path, env: dict | None = None) -> bool:
+    """True when `root` is inside a git work tree (so a `git checkout` remedy
+    can work there); a bare repository is not. Every other outcome, an
+    unavailable answer included, is False: only the undo receipts need the
+    difference (`_work_tree_state`)."""
+    return _work_tree_state(root, env) == "yes"
 
 
 def _filing_guard_or_undo(root: Path, path: Path, rel: str, old_text: str | None) -> None:

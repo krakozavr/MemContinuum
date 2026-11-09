@@ -2903,6 +2903,85 @@ class TestUndoReceipts(BindCase):
         self.assertEqual(list((other / ".git").glob("memcontinuum*")), [])
         self.assertGuardsClean()
 
+    # ---- gate round 2 (TOP-0137 L39) -------------------------------------------------------
+
+    def _patch_run(self, match, result):
+        """subprocess.run in memidx behaves as before except for the git call whose argv contains
+        `match`, which raises/returns `result`."""
+        real = subprocess.run
+
+        def fake(argv, *a, **kw):
+            if match in argv:
+                if isinstance(result, BaseException):
+                    raise result
+                return subprocess.CompletedProcess(argv, result[0], result[1], "")
+            return real(argv, *a, **kw)
+
+        return mock.patch.object(memidx.subprocess, "run", side_effect=fake)
+
+    def test_work_tree_detection_has_three_results(self):
+        probe = "--is-inside-work-tree"
+        self.assertEqual(memidx._work_tree_state(self.store), "yes")
+        plain = self.tmp / "plain-detect"
+        plain.mkdir()
+        self.assertEqual(memidx._work_tree_state(plain), "no")  # git itself answers 128
+        for name, result, expect in (
+                ("false", (0, "false\n"), "no"),
+                ("exit 128", (128, ""), "no"),
+                ("exit 1", (1, ""), None),
+                ("empty output", (0, ""), None),
+                ("garbage", (0, "maybe\n"), None),
+                ("timeout", subprocess.TimeoutExpired(["git"], 30), None),
+        ):
+            with self.subTest(name), self._patch_run(probe, result):
+                self.assertEqual(memidx._work_tree_state(self.store), expect)
+        with self._patch_run(probe, FileNotFoundError(2, "git")):
+            self.assertEqual(memidx._work_tree_state(plain), "no")  # git missing, no .git entry
+            self.assertIsNone(memidx._work_tree_state(self.store))  # git missing where a .git entry exists
+
+    def test_an_unanswered_work_tree_probe_refuses_and_writes_nothing(self):
+        before = self.head_state(refs=())
+        with self._patch_run("--is-inside-work-tree", subprocess.TimeoutExpired(["git"], 30)):
+            rc, out, err = self.bind()
+        self.assertEqual(rc, 1, (out, err))
+        self.assertIn("git state unavailable for topics/foo.md (work-tree detection); nothing written", err)
+        self.assertEqual((self.raw(), self.receipts()), (before, []))
+        self.assertEqual(self.bind()[0], 0)  # git answers again: an ordinary, receipted bind
+        after = self.raw()
+        self.assertEqual(len(self.receipts()), 1)
+        with self._patch_run("--is-inside-work-tree", (1, "")):
+            rc, out, err = self.unbind()
+        self.assertEqual(rc, 1, (out, err))
+        self.assertIn("(work-tree detection)", err)
+        self.assertEqual((self.raw(), len(self.receipts())), (after, 1))
+        self.assertUndone(self.unbind(), before)
+
+    def test_a_failed_receipt_path_lookup_inside_a_work_tree_refuses(self):
+        before = self.head_state(refs=())
+        real = memidx._git_run
+
+        def lookup_fails(store, args, data=None):
+            return None if "--git-path" in args else real(store, args, data)
+
+        with mock.patch.object(memidx, "_git_run", side_effect=lookup_fails):
+            rc, out, err = self.bind()
+        self.assertEqual(rc, 1, (out, err))
+        self.assertIn("(receipt directory lookup); nothing written", err)
+        self.assertEqual((self.raw(), self.receipts()), (before, []))
+
+    def test_a_verified_non_work_tree_keeps_the_ordinary_path_even_without_git(self):
+        store = self.tmp / "plain-nogit"
+        (store / "topics").mkdir(parents=True)
+        topic = store / "topics" / "foo.md"
+        topic.write_text(binding_topic(code_refs=("src/other.py",)))
+        run = lambda *a: run_memidx([*a, "--root", str(store)])  # noqa: E731
+        with self._patch_run("--is-inside-work-tree", FileNotFoundError(2, "git")):
+            self.assertEqual(run("bind", "TOP-1", "src/foo.py", "--code-root", str(self.code))[0], 0)
+            rc, out, err = run("unbind", "TOP-1", "src/foo.py")
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("undo:", out)
+        self.assertIn("remove", topic.read_text())
+
     def test_a_linked_worktree_keeps_its_own_receipts(self):
         self.head_state(refs=())
         git(["worktree", "add", "-q", str(self.tmp / "wt")], self.store)
