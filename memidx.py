@@ -13596,12 +13596,13 @@ def cmd_unbind(args) -> int:
     """`memidx.py unbind TOP-xxxx REF --root STORE --project NAME [--why TEXT]
     [--session ID --yes-message UUID | --owner-message UUID --quote TEXT]
     [--dry-run]` -- delete exactly the `code_refs` item REF and prepend the
-    `ref_marks:` `remove` row, as line edits; no anchor is touched (the frozen
-    capture stays as history; `bind` restores the reference). A prefix or glob
+    `ref_marks:` `remove` row, as line edits; an ordinary unbind touches no anchor
+    (the frozen capture stays as history; `bind` restores the reference). A prefix or glob
     reference may be unbound. rc 1: refused (unknown topic, a non-empty flow
     list, the edit would not round-trip); rc 0 with a note when REF is not bound.
     Right after an uncommitted `bind` of the same REF it instead restores the exact
-    earlier bytes from the undo receipt (`undo_plan`)."""
+    earlier bytes from the undo receipt (`undo_plan`), which also removes an anchor
+    that `bind` had introduced."""
     root = Path(args.root).resolve()
     ref = args.ref
     problem = _audit_text_problem(args)

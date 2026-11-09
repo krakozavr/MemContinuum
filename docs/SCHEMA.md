@@ -117,8 +117,9 @@ A row is identified by `(ref, action, recorded_at)`. `memidx.py bind` prepends a
 same edit that inserts a reference, and `memidx.py unbind TOP-xxxx REF` deletes exactly that
 `code_refs` item and prepends a `remove` row; both accept `--why`, `--source`, `--recorded-by` and the
 optional derivation flags of `mark-standing` (without them, or when a derivation fails, the row is
-`agent-inference`; a failed derivation warns). `unbind` touches no anchor — the frozen capture stays
-as history — and may unbind a prefix or a glob. `bind` of a reference whose anchor for the current
+`agent-inference`; a failed derivation warns). An ordinary `unbind` touches no anchor — the frozen capture stays
+as history (the exact undo of an uncommitted `bind` restores the earlier bytes, which also removes an
+anchor that `bind` had introduced) — and may unbind a prefix or a glob. `bind` of a reference whose anchor for the current
 link already exists (an unbound one) **restores** it: the reference and an `add` row come back, no
 second anchor is written (one baseline per `(ref, link)`; a new baseline is a new link).
 `bind` also accepts a prefix (`src/core/`, an existing directory) or a glob (`src/app/*.py`); either is

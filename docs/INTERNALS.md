@@ -3713,7 +3713,9 @@ unbound, because the write deletes one item and the round-trip check, which
 requires every equal entry gone, then refuses it: fail-closed; likewise a multi-line quoted reference is not
 unbindable, because the editor compares one physical line, so rewrite it on one line first)
 and prepends a `remove` row; it allows a prefix or
-glob and never touches an anchor. Plain lint lets an anchor's ref be absent from
+glob and an ordinary unbind never touches an anchor (the exact undo of an uncommitted
+`bind`, below, restores the earlier bytes and so removes an anchor that `bind` had
+introduced). Plain lint lets an anchor's ref be absent from
 `code_refs` only when the NEWEST `ref_marks` row for it is a `remove`
 (`ref_latest_action`: rows are append-only, so "ever removed" would excuse a ref
 that went missing again after a re-bind). That exemption lifts only the membership requirement: the prefix/glob prohibition (`_ANCHOR_PREFIX_GLOB_MESSAGE`) is checked first for every anchor row, unbound or not, and `--against-ref` runs the COMPLETE `_anchor_errors` set (prefix/glob, membership, link, algo, digest, span, captured, worktree, `chunker_version`, `captured_at`) on every anchor row whose identity is new since `REF` (`_anchor_freeze_errors` passes the REF identities as `skip_idents`, so old rows stay freeze-only and the duplicate-key check is not reported twice) and on every row of an added topic, so removing `src/` cannot be paired with a fabricated prefix anchor row and a new row cannot carry an invalid digest. `for-path` needed no change: it builds
