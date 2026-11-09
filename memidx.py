@@ -14261,17 +14261,18 @@ def _record_impl(args, ctx: dict) -> int:
 
 
 PROMOTABLE_STATUSES = ("active", "provisional")
-PROMOTABLE_AUTHORITIES = ("agent-inference", "reviewer-finding", "code-derived")
 
 
 def promotable_link(authority, status) -> bool:
     """SCHEMA section 5 step 1, the one place the rule is written (TOP-0137
     L29): the owner may ratify an `agent-inference`, `reviewer-finding` or
-    `code-derived` link that still stands (`active` or `provisional`). An owner
+    `code-derived` link that still stands (`active` or `provisional`); those are
+    exactly the typed non-owner tiers the filing commands write
+    (`FILING_TYPED_AUTHORITIES`, one vocabulary). An owner
     tier is already a ruling and a terminal status (`superseded`,
     `historical`, `declined`) is history; a link already carrying
     `promoted_by` is refused by the caller before this is asked."""
-    return authority in PROMOTABLE_AUTHORITIES and status in PROMOTABLE_STATUSES
+    return authority in FILING_TYPED_AUTHORITIES and status in PROMOTABLE_STATUSES
 
 
 def _promote_impl(args, ctx: dict) -> int:
