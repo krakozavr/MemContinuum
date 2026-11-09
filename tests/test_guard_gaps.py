@@ -1971,10 +1971,17 @@ class TestUnbind(BindCase):
         self.assertEqual([(r["ref"], r["action"]) for r in memidx.ref_mark_rows(self.fm())],
                          [("src/*.py", "remove"), ("src/lib/", "remove")])
         self.assertGuardsClean()
+        # gate round 1 R1-6: commit the removal first. An unbind and a bind of the same entry with no
+        # commit between them leave a `remove` and an `add` row for a membership that did not change
+        # against HEAD, which the guard refuses as orphan rows.
+        commit_all(self.store)
         rc, out, err = self.bind("src/*.py")  # a glob is bound again, without an anchor (TOP-0137 L29)
         self.assertEqual(rc, 0, err)
         self.assertIn("bound without an anchor", out)
         self.assertFalse(self.fm().get("anchors"))
+        self.assertEqual([(r["ref"], r["action"]) for r in memidx.ref_mark_rows(self.fm())][0],
+                         ("src/*.py", "add"))
+        self.assertGuardsClean()
 
     def test_a_ref_that_is_not_bound_is_a_noop(self):
         self.put(binding_topic())
