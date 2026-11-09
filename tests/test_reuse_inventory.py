@@ -599,10 +599,21 @@ class TestPositiveControls(unittest.TestCase):
             self.assertNotIn("structural rewrite", text, r["id"])
             self.assertNotIn("inside a double-quoted -c payload are not seen", text, r["id"])
         rows = {r["id"]: r for r in inv["rows"]}
+        sentence = (r"(?:Not recognised: |is not recognised; )a copy whose normalised body differs by one token "
+                    r"\(a literal, an added statement, reordered locals\) escapes; a rewrite under another name "
+                    r"needs a human")
+        for r in inv["rows"]:
+            if any(g["method"] == "exact_copy" for g in r["guards"]):
+                self.assertRegex(r["coverage_limit"], sentence, r["id"])
+                self.assertNotIn("guard misses a copy", r["coverage_limit"], r["id"])
         for rid in ("coverage-fact-sentence", "coverage-question-sentence"):
             self.assertIn("non-Python heredoc", rows[rid]["coverage_limit"])
             self.assertIn("double-quoted -c payload", rows[rid]["coverage_limit"])
             self.assertIn("is seen", rows[rid]["coverage_limit"])
+        for rid in ("store-lint-schema", "store-lint-append-only", "shell-millisecond-clock"):
+            for miss in ("`xargs`", "`find -exec`", "`sudo`", "`env`", "`timeout`", "`coproc`", "`command -p`",
+                         "passed to another by name", "nested inside `$((...))`", "one quoted word"):
+                self.assertIn(miss, rows[rid]["coverage_limit"], (rid, miss))
         self.assertIn("inlined lint call that keeps the probe is caught", rows["store-lint-schema"]["coverage_limit"])
         self.assertIn("whole-second", rows["shell-millisecond-clock"]["coverage_limit"])
 
@@ -969,9 +980,10 @@ class TestScanner(unittest.TestCase):
         self.assertEqual(s.problems, [])
 
     def test_unterminated_heredoc_does_not_stop_later_payloads_from_being_scanned(self):
-        s = self.scan({"h.sh": "cat <<'NEVER'\ndata\n"})
+        s = self.scan({"h.sh": "cat <<'NEVER'\ndata\n\"$MC_PY\" - <<'EOF'\ndef later():\n    pass\nEOF\n"})
         self.assertEqual(len(s.problems), 1)
         self.assertIn("h.sh:1:", s.problems[0])
+        self.assertEqual([d.name for d in s.defs if d.embedded], ["later"])
 
     def test_quoted_heredoc_opener_and_quoted_interpreter_text_are_not_scan_problems(self):
         s = self.scan({"q.sh": '#!/usr/bin/env bash\necho "<<EOF"\necho "python3 -c \'not python !\'"\n'
