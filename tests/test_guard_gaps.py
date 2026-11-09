@@ -2138,6 +2138,382 @@ class TestUnbind(BindCase):
         self.assertGuardsClean()
 
 
+class TestUndoReceipts(BindCase):
+    """TOP-0137 L34: `bind`/`unbind` record an exact undo receipt; the opposite
+    command restores the pre-command bytes while the topic, HEAD and the staged
+    entry are what the receipt recorded, and refuses (writing nothing) otherwise."""
+
+    def rec_dir(self, store=None):
+        out = git(["rev-parse", "--path-format=absolute", "--git-path", "memcontinuum/receipts"],
+                  store or self.store).stdout.strip()
+        return Path(out)
+
+    def receipts(self):
+        d = self.rec_dir()
+        return sorted(p.name for p in d.glob("*.json")) if d.is_dir() else []
+
+    def raw(self):
+        return self.path.read_bytes()
+
+    def head_state(self, refs=("src/other.py",)):
+        """A committed topic with `refs` bound (the guard-clean starting fixture)."""
+        self.put(binding_topic(code_refs=refs))
+        return self.raw()
+
+    def bound_head(self):
+        self.put(binding_topic(code_refs=("src/other.py",)))
+        self.assertEqual(self.bind()[0], 0)
+        commit_all(self.store)
+        return self.raw()
+
+    def assertUndone(self, result, before, clean=True):
+        rc, out, err = result
+        self.assertEqual(rc, 0, err)
+        self.assertIn("undo: restored TOP-1 to its state before the uncommitted", out)
+        self.assertEqual(self.raw(), before)
+        if clean:
+            self.assertGuardsClean()
+
+    def assertRefused(self, result, snippet):
+        rc, out, err = result
+        self.assertEqual(rc, 1, (out, err))
+        self.assertIn(snippet, err)
+        self.assertIn("nothing written", err)
+
+    def test_bind_then_unbind_restores_the_exact_bytes(self):
+        before = self.head_state(refs=())
+        self.assertEqual(self.bind()[0], 0)
+        self.assertNotEqual(self.raw(), before)
+        self.assertEqual(len(self.receipts()), 1)
+        self.assertUndone(self.unbind(), before)
+        self.assertEqual(self.receipts(), [])
+        self.assertNotIn("anchors:", self.text())
+
+    def test_unbind_then_bind_restores_the_exact_bytes(self):
+        before = self.bound_head()
+        self.assertEqual(self.unbind()[0], 0)
+        self.assertUndone(self.bind(), before)
+        self.assertEqual(self.receipts(), [])
+
+    def test_repeated_cycles_return_to_the_start_each_time(self):
+        before = self.head_state(refs=())
+        for _ in range(3):
+            self.assertEqual(self.bind()[0], 0)
+            self.assertUndone(self.unbind(), before)
+            self.assertEqual(self.receipts(), [])
+        before = self.bound_head()
+        for _ in range(3):
+            self.assertEqual(self.unbind()[0], 0)
+            self.assertUndone(self.bind(), before)
+            self.assertEqual(self.receipts(), [])
+
+    def test_the_same_second_makes_no_difference(self):
+        before = self.head_state(refs=())
+        fixed = datetime(2026, 11, 3, 9, 0, 0, tzinfo=timezone(timedelta(hours=-5)))
+        with mock.patch.object(memidx, "_now", return_value=fixed):
+            self.assertEqual(self.bind()[0], 0)
+            self.assertUndone(self.unbind(), before)
+
+    def test_a_new_topic_in_a_store_with_a_valid_head(self):
+        (self.store / "notes.txt").write_text("x\n")
+        commit_all(self.store)
+        self.path.write_text(binding_topic(code_refs=()))  # never committed
+        before = self.raw()
+        self.assertEqual(self.bind()[0], 0)
+        self.assertUndone(self.unbind(), before)
+        self.assertEqual(self.bind("src/*.py")[0], 0)
+        self.assertUndone(self.unbind("src/*.py"), before)
+
+    def test_quoted_and_crlf_ids_still_undo_to_the_exact_bytes(self):
+        for name, mutate in (
+                ("double-quoted", lambda t: t.replace("id: TOP-1", 'id: "TOP-1"')),
+                ("single-quoted", lambda t: t.replace("id: TOP-1", "id: 'TOP-1'  # note")),
+                ("crlf", lambda t: t.replace("\n", "\r\n")),
+        ):
+            with self.subTest(name):
+                self.path.write_bytes(mutate(binding_topic(code_refs=())).encode())
+                commit_all(self.store)
+                before = self.raw()
+                self.assertEqual(self.bind()[0], 0)
+                self.assertUndone(self.unbind(), before, clean=False)
+                self.assertEqual(self.receipts(), [])
+
+    def test_a_renamed_topic_is_refused_not_treated_as_new(self):
+        self.bound_head()
+        self.assertEqual(self.unbind()[0], 0)
+        git(["mv", "topics/foo.md", "topics/bar.md"], self.store)
+        moved = self.store / "topics" / "bar.md"
+        before = moved.read_bytes()
+        self.assertRefused(self.bind(), "the topic moved from topics/foo.md to topics/bar.md")
+        self.assertEqual(moved.read_bytes(), before)
+
+    def test_a_restored_anchor_is_in_b_and_survives(self):
+        # HEAD: foo unbound with its frozen anchor; bind RESTORES it (captures nothing)
+        self.bound_head()
+        self.assertEqual(self.unbind()[0], 0)
+        commit_all(self.store)
+        before = self.raw()
+        self.assertEqual(self.bind()[0], 0)
+        self.assertEqual(len(memidx.anchor_rows(self.fm())), 1)
+        self.assertUndone(self.unbind(), before)
+        self.assertEqual(len(memidx.anchor_rows(self.fm())), 1)
+
+    def test_an_unrelated_pending_anchor_survives_a_nested_undo(self):
+        before = self.head_state(refs=())
+        self.assertEqual(self.bind("src/other.py")[0], 0)  # pending, uncommitted
+        mid = self.raw()
+        self.assertEqual(self.bind("src/foo.py")[0], 0)
+        self.assertUndone(self.unbind("src/foo.py"), mid)
+        self.assertEqual([r["ref"] for r in memidx.anchor_rows(self.fm())], ["src/other.py"])
+        self.assertUndone(self.unbind("src/other.py"), before)
+        self.assertEqual(self.receipts(), [])
+
+    def test_a_committed_anchor_with_an_edited_field_survives(self):
+        self.bound_head()
+        edited = self.text().replace('worktree: clean', 'worktree: dirty', 1)
+        self.assertNotEqual(edited, self.text())
+        self.path.write_text(edited)
+        before = self.raw()
+        self.assertEqual(self.unbind()[0], 0)
+        self.assertUndone(self.bind(), before, clean=False)
+        self.assertIn("worktree: dirty", self.text())
+
+    def test_a_trailing_comment_is_in_b(self):
+        self.put(binding_topic(code_refs=()).replace("---\n\nBody.", "# a trailing comment\n---\n\nBody.", 1))
+        before = self.raw()
+        self.assertEqual(self.bind()[0], 0)
+        self.assertUndone(self.unbind(), before)
+        self.assertIn(b"# a trailing comment\n", self.raw())
+
+    def test_a_ruling_appended_between_is_refused_with_the_recovery_options(self):
+        before = self.head_state(refs=())
+        self.assertEqual(self.bind()[0], 0)
+        after = self.raw()
+        text = self.text().replace("current: L1", "current: L2").replace(
+            "links:\n", "links:\n" + link_yaml("L2", text="a newer ruling"), 1)
+        self.path.write_text(text)
+        changed = self.raw()
+        rc, out, err = self.unbind()
+        self.assertEqual(rc, 1, err)
+        self.assertIn("the topic changed after the uncommitted bind of src/foo.py", err)
+        self.assertIn("commit first, then unbind", err)
+        self.assertIn("git restore --source=HEAD --worktree -- topics/foo.md", err)
+        self.assertIn("add row for src/foo.py", err)  # the pending row is named
+        self.assertEqual(self.raw(), changed)
+        self.assertNotEqual(changed, after)
+        # the explicit command refuses the same way
+        rc, out, err = run_memidx(["undo-binding", "TOP-1", "--root", str(self.store)])
+        self.assertEqual(rc, 1, err)
+        self.assertEqual(self.raw(), changed)
+        self.assertNotEqual(changed, before)
+
+    def test_a_commit_between_drops_the_receipt_and_the_ordinary_unbind_proceeds(self):
+        self.head_state(refs=())
+        self.assertEqual(self.bind()[0], 0)
+        commit_all(self.store)
+        rc, out, err = self.unbind()
+        self.assertEqual(rc, 0, err)
+        self.assertIn("is now committed history", out)
+        self.assertNotIn("undo:", out)
+        self.assertEqual([(r["ref"], r["action"]) for r in memidx.ref_mark_rows(self.fm())],
+                         [("src/foo.py", "remove"), ("src/foo.py", "add")])
+        self.assertGuardsClean()
+        self.assertEqual(self.receipts(), [self.receipts()[0]])  # only the new unbind's receipt
+        self.assertEqual(len(self.receipts()), 1)
+
+    def test_staging_after_the_command_is_refused_and_unstaging_allows_the_undo(self):
+        before = self.head_state(refs=())
+        self.assertEqual(self.bind()[0], 0)
+        git(["add", "topics/foo.md"], self.store)
+        changed = self.raw()
+        rc, out, err = self.unbind()
+        self.assertEqual(rc, 1, err)
+        self.assertIn("staged entry of topics/foo.md changed after the uncommitted bind", err)
+        self.assertIn("git restore --staged -- topics/foo.md", err)
+        self.assertIn("nothing was rewritten", err)
+        self.assertEqual(self.raw(), changed)
+        git(["restore", "--staged", "--", "topics/foo.md"], self.store)
+        self.assertUndone(self.unbind(), before)
+
+    def test_receipts_survive_a_process_restart(self):
+        before = self.head_state(refs=())
+        env = dict(os.environ, PYTHONPATH="", MEMCONTINUUM_TRANSCRIPTS_DIR=str(self.tmp / "tr"))
+        base = [sys.executable, str(TOOLS_DIR / "memidx.py")]
+        done = subprocess.run(base + ["bind", "TOP-1", "src/foo.py", "--root", str(self.store),
+                                      "--code-root", str(self.code)],
+                              capture_output=True, text=True, env=env)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertNotEqual(self.raw(), before)
+        done = subprocess.run(base + ["unbind", "TOP-1", "src/foo.py", "--root", str(self.store)],
+                              capture_output=True, text=True, env=env)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("undo: restored TOP-1", done.stdout)
+        self.assertEqual(self.raw(), before)
+
+    def test_a_receipt_whose_topic_write_never_happened_is_dropped(self):
+        before = self.head_state(refs=())
+        real = memidx._atomic_write_bytes
+
+        def crash_on_topic(path, data, exclusive=False):
+            if Path(path).name == "foo.md":
+                raise OSError("simulated crash after the receipt")
+            return real(path, data, exclusive)
+
+        with mock.patch.object(memidx, "_atomic_write_bytes", side_effect=crash_on_topic):
+            with self.assertRaises(OSError):
+                self.bind()
+        self.assertEqual(self.raw(), before)
+        self.assertEqual(len(self.receipts()), 1)  # the orphan receipt is on disk
+        rc, out, err = self.unbind()  # the opposite command: orphan dropped, ref not bound
+        self.assertEqual(rc, 0, err)
+        self.assertIn("is not in", out)
+        self.assertNotIn("undo:", out)
+        self.assertEqual(self.receipts(), [])
+        self.assertEqual(self.raw(), before)
+        # and an orphan under a retried bind is dropped before the fresh receipt is written
+        with mock.patch.object(memidx, "_atomic_write_bytes", side_effect=crash_on_topic):
+            with self.assertRaises(OSError):
+                self.bind()
+        self.assertEqual(self.bind()[0], 0)
+        self.assertEqual(len(self.receipts()), 1)  # the orphan was pruned; only the fresh receipt remains
+        self.assertUndone(self.unbind(), before)
+
+    def test_competing_writers_the_loser_sees_the_changed_image(self):
+        before = self.head_state(refs=())
+        real = memidx.bound_edit_problem
+        winner = {}
+
+        def race(*a, **kw):
+            if not winner:  # the competing bind runs to completion inside the loser's read-to-write window
+                winner["rc"] = None
+                winner["rc"] = self.bind("src/other.py")[0]
+            return real(*a, **kw)
+
+        with mock.patch.object(memidx, "bound_edit_problem", side_effect=race):
+            rc, out, err = self.bind("src/foo.py")
+        self.assertEqual(winner["rc"], 0)
+        self.assertEqual(rc, 1, err)
+        self.assertIn("the topic changed while this command ran; nothing written", err)
+        self.assertEqual(self.fm()["code_refs"], ["src/other.py"])
+        # the winner's receipt is intact and undoes exactly the winner
+        self.assertUndone(self.unbind("src/other.py"), before)
+
+    def test_a_held_lock_refuses_without_writing(self):
+        before = self.head_state(refs=())
+        scope = memidx._UndoScope(self.store, self.path, "TOP-1")
+        self.rec_dir().mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(self.rec_dir() / (scope.key + ".lock")), os.O_CREAT | os.O_RDWR)
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            with mock.patch.object(memidx, "_LOCK_WAIT_SECONDS", 0.2):
+                rc, out, err = self.bind()
+        finally:
+            os.close(fd)
+        self.assertEqual(rc, 1)
+        self.assertIn("holds the topic's receipt lock", err)
+        self.assertEqual(self.raw(), before)
+
+    def test_dry_run_leaves_no_receipt_and_undo_dry_run_keeps_it(self):
+        before = self.head_state(refs=())
+        rc, out, err = self.bind("src/foo.py", "--dry-run")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.receipts(), [])
+        self.assertEqual(self.raw(), before)
+        self.assertEqual(self.bind()[0], 0)
+        after = self.raw()
+        rc, out, err = self.unbind("src/foo.py", "--dry-run")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("dry-run: nothing written", out)
+        self.assertEqual(self.raw(), after)
+        self.assertEqual(len(self.receipts()), 1)
+        self.assertUndone(self.unbind(), before)
+
+    def test_undo_binding_lists_and_undoes(self):
+        before = self.head_state(refs=())
+        rc, out, err = run_memidx(["undo-binding", "TOP-1", "--list", "--root", str(self.store)])
+        self.assertEqual((rc, "no undo receipts" in out), (0, True), err)
+        rc, out, err = run_memidx(["undo-binding", "TOP-1", "--root", str(self.store)])
+        self.assertEqual(rc, 1)
+        self.assertIn("no undo receipt applies", err)
+        self.assertEqual(self.bind("src/other.py")[0], 0)
+        self.assertEqual(self.bind("src/foo.py")[0], 0)
+        rc, out, err = run_memidx(["undo-binding", "TOP-1", "--list", "--root", str(self.store)])
+        self.assertEqual(rc, 0, err)
+        lines = out.strip().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(lines[0].startswith("#2 bind src/foo.py"), lines)
+        self.assertTrue(lines[1].startswith("#1 bind src/other.py"), lines)
+        self.assertEqual(len(self.receipts()), 2)  # --list changes nothing
+        for _ in range(2):
+            rc, out, err = run_memidx(["undo-binding", "TOP-1", "--root", str(self.store)])
+            self.assertEqual(rc, 0, err)
+            self.assertIn("undo: restored TOP-1", out)
+        self.assertEqual(self.raw(), before)
+        self.assertEqual(self.receipts(), [])
+        self.assertGuardsClean()
+
+    def test_a_different_reference_or_the_same_direction_is_the_ordinary_path(self):
+        before = self.head_state(refs=("src/other.py",))
+        self.assertEqual(self.bind("src/foo.py")[0], 0)
+        rc, out, err = self.unbind("src/other.py")  # latest receipt is another ref: ordinary
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("undo:", out)
+        self.assertEqual(len(self.receipts()), 2)
+        # reverse order through the explicit command
+        for _ in range(2):
+            self.assertEqual(run_memidx(["undo-binding", "TOP-1", "--root", str(self.store)])[0], 0)
+        self.assertEqual(self.raw(), before)
+
+    def test_a_malformed_or_legacy_receipt_authorises_nothing(self):
+        before = self.bound_head()
+        scope = memidx._UndoScope(self.store, self.path, "TOP-1")
+        d = self.rec_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{scope.key}.00000001.json").write_text("{not json")
+        (d / f"{scope.key}.00000002.json").write_text(json.dumps({"v": 0, "command": "bind"}))
+        rc, out, err = self.unbind()
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("undo:", out)
+        self.assertNotEqual(self.raw(), before)
+        self.assertGuardsClean()
+
+    def test_receipts_are_outside_the_store_tree_and_the_working_tree_stays_clean(self):
+        self.head_state(refs=())
+        self.assertEqual(self.bind()[0], 0)
+        status = git(["status", "--porcelain", "--untracked-files=all"], self.store).stdout
+        self.assertEqual(status.split(), ["M", "topics/foo.md"])
+        self.assertIn(".git", self.rec_dir().parts)
+
+    def test_a_store_outside_git_has_no_receipts_and_behaves_as_before(self):
+        store = self.tmp / "plain"
+        (store / "topics").mkdir(parents=True)
+        topic = store / "topics" / "foo.md"
+        topic.write_text(binding_topic(code_refs=("src/other.py",)))
+        run = lambda *a: run_memidx([*a, "--root", str(store)])  # noqa: E731
+        self.assertEqual(run("bind", "TOP-1", "src/foo.py", "--code-root", str(self.code))[0], 0)
+        rc, out, err = run("unbind", "TOP-1", "src/foo.py")
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("undo:", out)
+        self.assertIn("remove", topic.read_text())
+
+    def test_a_linked_worktree_keeps_its_own_receipts(self):
+        self.head_state(refs=())
+        git(["worktree", "add", "-q", str(self.tmp / "wt")], self.store)
+        wt = self.tmp / "wt"
+        before = (wt / "topics" / "foo.md").read_bytes()
+        run = lambda *a: run_memidx([*a, "--root", str(wt)])  # noqa: E731
+        self.assertEqual(run("bind", "TOP-1", "src/foo.py", "--code-root", str(self.code))[0], 0)
+        wt_dir = self.rec_dir(wt)
+        self.assertNotEqual(wt_dir, self.rec_dir())
+        self.assertEqual(len(list(wt_dir.glob("*.json"))), 1)
+        self.assertEqual(self.receipts(), [])
+        rc, out, err = run("unbind", "TOP-1", "src/foo.py")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("undo: restored TOP-1", out)
+        self.assertEqual((wt / "topics" / "foo.md").read_bytes(), before)
+
+
 class TestRemoveCodeRefEditor(unittest.TestCase):
     def test_removes_only_the_named_item_and_keeps_every_other_byte(self):
         text = "---\nid: T\ncode_refs:\n  - a.py   # keep\n  - 'b.py'\n  - \"c.py\"\nlinks: []\n---\n"
