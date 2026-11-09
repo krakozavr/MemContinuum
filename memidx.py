@@ -17,6 +17,7 @@ only by the code paths that actually need vectors, so `for-path`, `chain`,
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import copy
 import fcntl
@@ -12786,10 +12787,270 @@ def _atomic_write_bytes(path: Path, data: bytes, exclusive: bool = False) -> Non
         pass
 
 
-def apply_topic_edit(path: Path, old_text: str, new_text: str, dry_run: bool, store_root: Path) -> None:
+# ---------------------------------------------------------------------------
+# undo receipts for `bind` / `unbind` (TOP-0137 L34)
+# ---------------------------------------------------------------------------
+#
+# A successful `bind` or `unbind` first records a RECEIPT -- the topic's exact
+# bytes before (B) and after (A) the command, the commit boundary and the
+# staged index entry -- in the worktree's git administration area, then writes
+# the topic. The opposite command on the same reference restores B while the
+# topic still equals A and the boundary is unchanged; nothing is inferred from
+# HEAD or from the YAML. Receipts are worktree-local undo state, not store
+# content: they live under `git rev-parse --git-path memcontinuum/receipts`,
+# never in the store tree, so the guard and memlint never see them.
+
+RECEIPT_VERSION = 1
+_UNDO_OF = {"bind": "unbind", "unbind": "bind"}
+_LOCK_WAIT_SECONDS = 10.0
+
+
+class TopicChangedError(Exception):
+    """The topic is not the image the command read (a competing writer, or a
+    receipt that no longer applies): nothing was written."""
+
+
+def _git_text(store: Path, args: list) -> str | None:
+    """stdout of `git -C store ARGS`, None on any failure (best effort, the
+    `_git_head_sha` conventions)."""
+    try:
+        result = subprocess.run(["git", "-C", str(store)] + args, capture_output=True,
+                                text=True, timeout=min(5.0, _git_ls_timeout()))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+class _Receipt:
+    """One parsed receipt file; `None` fields never occur (a malformed file is
+    not a `_Receipt`)."""
+
+    def __init__(self, path: Path, seq: int, data: dict):
+        self.path, self.seq = path, seq
+        self.topic_id, self.rel = data["topic_id"], data["topic_path"]
+        self.head, self.staged = data["head"], data["staged"]
+        self.command, self.ref, self.mark = data["command"], data["ref"], data["mark"]
+        self.before = base64.b64decode(data["before"], validate=True)
+        self.after = base64.b64decode(data["after"], validate=True)
+        self.written_at = data["written_at"]
+
+    def row(self) -> str:
+        """The pending row this receipt's command produced, for messages."""
+        if self.mark:
+            return f"{self.mark['action']} row for {self.mark['ref']} ({self.mark['recorded_at']})"
+        return f"{self.command} of {self.ref} (no mark row)"
+
+
+def _parse_receipt(path: Path, seq: int) -> "_Receipt | None":
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        str_keys = ("topic_id", "topic_path", "head", "command", "ref", "before", "after", "written_at")
+        if (not isinstance(data, dict) or data.get("v") != RECEIPT_VERSION
+                or any(not isinstance(data.get(k), str) for k in str_keys)
+                or data["command"] not in _UNDO_OF
+                or not (data.get("staged") is None or isinstance(data["staged"], str))
+                or not (data.get("mark") is None or (
+                    isinstance(data["mark"], dict)
+                    and all(isinstance(data["mark"].get(k), str) for k in ("ref", "action", "recorded_at"))))):
+            return None
+        return _Receipt(path, seq, data)
+    except (OSError, ValueError, KeyError, UnicodeDecodeError):
+        return None
+
+
+class _UndoScope:
+    """The receipt stack of ONE topic in ONE worktree: `rec_dir` is None when
+    the store is not inside a git worktree (no receipts then: the ordinary,
+    receipt-less path). `dry` makes every mutation a no-op."""
+
+    def __init__(self, store_root: Path, topic_path: Path, topic_id: str, dry: bool = False):
+        self.store = Path(os.path.realpath(store_root))
+        self.topic_id = topic_id
+        self.dry = dry
+        self._dropped: set = set()  # receipts dropped by this command (also under dry-run)
+        try:
+            self.rel = Path(os.path.realpath(topic_path)).relative_to(self.store).as_posix()
+        except ValueError:
+            self.rel = Path(topic_path).as_posix()
+        out = _git_text(self.store, ["rev-parse", "--git-path", "memcontinuum/receipts"])
+        self.rec_dir = (self.store / out.strip()) if out and out.strip() else None
+        digest = hashlib.sha256(str(self.store).encode("utf-8")).hexdigest()[:10]
+        self.key = re.sub(r"[^A-Za-z0-9._-]", "_", topic_id) + "-" + digest
+
+    @property
+    def enabled(self) -> bool:
+        return self.rec_dir is not None
+
+    def head(self) -> str:
+        return _git_head_sha(self.store) or "unborn"
+
+    def staged(self) -> str | None:
+        """The topic's index entry (`mode sha stage`, path left out), None when
+        it has none."""
+        out = _git_text(self.store, ["ls-files", "-s", "-z", "--", self.rel])
+        if out is None:
+            return "unavailable"
+        entries = sorted(e.split("\t", 1)[0] for e in out.split("\0") if e)
+        return ";".join(entries) or None
+
+    def stack(self) -> list:
+        """The valid receipts, oldest first; a malformed or legacy file
+        authorises nothing and is removed."""
+        if not self.enabled:
+            return []
+        found = []
+        try:
+            names = os.listdir(self.rec_dir)
+        except OSError:
+            return []
+        prefix = self.key + "."
+        for name in names:
+            if not (name.startswith(prefix) and name.endswith(".json")):
+                continue
+            digits = name[len(prefix):-len(".json")]
+            if not digits.isdigit():
+                continue
+            if int(digits) in self._dropped:
+                continue
+            parsed = _parse_receipt(self.rec_dir / name, int(digits))
+            if parsed is None:
+                self._unlink(self.rec_dir / name)
+            else:
+                found.append(parsed)
+        return sorted(found, key=lambda r: r.seq)
+
+    def _unlink(self, path: Path) -> None:
+        if self.dry:
+            return
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+    def drop(self, receipt: "_Receipt") -> None:
+        self._dropped.add(receipt.seq)
+        self._unlink(receipt.path)
+
+    @contextlib.contextmanager
+    def locked(self):
+        """The per-topic lock file next to the stack (`flock`, the code base's
+        lock pattern, waited for up to `_LOCK_WAIT_SECONDS`). A no-op without
+        receipts: the caller's re-read still happens."""
+        if not self.enabled:
+            yield
+            return
+        os.makedirs(self.rec_dir, exist_ok=True)
+        fd = os.open(str(self.rec_dir / (self.key + ".lock")), os.O_CREAT | os.O_RDWR, 0o666)
+        try:
+            deadline = time.monotonic() + _LOCK_WAIT_SECONDS
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TopicChangedError("another memidx command holds the topic's receipt lock")
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def record(self, command: str, ref: str, mark: dict | None, before: bytes, after: bytes) -> bool:
+        """Write one durable receipt (fsynced file, fsynced directory) on top
+        of the stack; call it under `locked()`, BEFORE the topic write. False
+        when the receipt could not be written (the edit then goes ahead
+        without an undo)."""
+        if not self.enabled:
+            return False
+        stack = self.stack()
+        seq = (stack[-1].seq + 1) if stack else 1
+        data = {
+            "v": RECEIPT_VERSION, "store": str(self.store), "topic_id": self.topic_id,
+            "topic_path": self.rel, "head": self.head(), "staged": self.staged(),
+            "before": base64.b64encode(before).decode("ascii"),
+            "after": base64.b64encode(after).decode("ascii"),
+            "command": command, "ref": ref,
+            "mark": ({k: mark[k] for k in ("ref", "action", "recorded_at")} if mark else None),
+            "written_at": datetime.now().astimezone().isoformat(timespec="seconds"),  # not _now(): a receipt must not consume a test clock
+        }
+        try:
+            _atomic_write_bytes(self.rec_dir / f"{self.key}.{seq:08d}.json",
+                                json.dumps(data, sort_keys=True).encode("utf-8"))
+        except OSError as exc:
+            print(f"warning: no undo receipt written ({exc}); the edit goes ahead without one",
+                  file=sys.stderr)
+            return False
+        return True
+
+
+def undo_plan(scope: "_UndoScope", current: bytes, command: str | None, ref: str | None) -> tuple:
+    """`(kind, receipt, message, notes)`. kind: "none" (no receipt applies: the
+    ordinary path), "refuse" (message names the pending row and the ways out;
+    nothing is written) or "undo" (restore `receipt.before`). `command`/`ref`
+    None is the explicit `undo-binding`: the latest receipt, whatever it was.
+    Receipts of committed history (HEAD moved) and receipts whose topic write
+    never happened (the topic still equals B) are dropped on the way. Nothing
+    is inferred: a receipt applies only while the topic equals its A, the
+    boundary and the staged entry are the recorded ones."""
+    notes: list = []
+    if not scope.enabled:
+        return "none", None, None, notes
+    head = scope.head()
+    while True:
+        stack = scope.stack()
+        if not stack:
+            return "none", None, None, notes
+        top = stack[-1]
+        matches = command is None or (top.command == _UNDO_OF[command] and top.ref == ref)
+        if top.head != head:
+            scope.drop(top)
+            if matches:
+                notes.append(f"the uncommitted {top.command} of {top.ref} is now committed history "
+                             "(HEAD moved); its undo receipt is dropped")
+            continue
+        if top.rel == scope.rel and current == top.before and top.before != top.after:
+            scope.drop(top)  # the topic write never happened (a crash after the receipt)
+            continue
+        break
+    if not matches:
+        return "none", None, None, notes
+    reverse = _UNDO_OF[top.command]
+    topic = scope.rel
+    if top.rel != scope.rel:
+        return "refuse", top, (
+            f"the topic moved from {top.rel} to {scope.rel} after the uncommitted {top.command} of "
+            f"{top.ref}; commit first, then {reverse}, or move it back (pending: {top.row()})"), notes
+    if current != top.after:
+        return "refuse", top, (
+            f"the topic changed after the uncommitted {top.command} of {top.ref}; commit first, then "
+            f"{reverse}, or restore the file with `git restore --source=HEAD --worktree -- {topic}` "
+            f"if it carries no other pending edit (pending: {top.row()})"), notes
+    staged = scope.staged()
+    if staged != top.staged:
+        return "refuse", top, (
+            f"the staged entry of {topic} changed after the uncommitted {top.command} of {top.ref} "
+            f"(index now: {staged or 'absent'}; at the {top.command}: {top.staged or 'absent'}); "
+            f"nothing was rewritten -- `git restore --staged -- {topic}` or commit first "
+            f"(pending: {top.row()})"), notes
+    return "undo", top, None, notes
+
+
+def apply_topic_edit(path: Path, old_text: str, new_text: str, dry_run: bool, store_root: Path,
+                     *, scope: "_UndoScope | None" = None, command: str | None = None,
+                     ref: str | None = None, mark: dict | None = None,
+                     undo: "_Receipt | None" = None) -> None:
     """Print the exact diff; write it unless `dry_run` (atomically, see
-    `_atomic_write_bytes`; `bind` and `mark-standing` share this write). Never
-    commits."""
+    `_atomic_write_bytes`; `bind`, `unbind` and `mark-standing` share this
+    write). Never commits.
+
+    With `scope` (`bind`/`unbind`): the write is serialized by the topic's
+    receipt lock and the file is re-read under it -- anything but `old_text`
+    raises `TopicChangedError` and nothing is written. A fresh edit records its
+    receipt (`command`, `ref`, `mark`) durably first; with `undo` the write
+    restores that receipt's B and the receipt is dropped afterwards."""
     try:
         label = str(path.relative_to(store_root))
     except ValueError:
@@ -12798,7 +13059,46 @@ def apply_topic_edit(path: Path, old_text: str, new_text: str, dry_run: bool, st
     if dry_run:
         print("dry-run: nothing written")
         return
-    _atomic_write_bytes(path, new_text.encode("utf-8"))
+    new_bytes = new_text.encode("utf-8")
+    if scope is None:
+        _atomic_write_bytes(path, new_bytes)
+        return
+    old_bytes = old_text.encode("utf-8")
+    with scope.locked():
+        if Path(path).read_bytes() != old_bytes:
+            raise TopicChangedError("the topic changed while this command ran")
+        if undo is not None:
+            if not undo.path.exists() or scope.head() != undo.head or scope.staged() != undo.staged:
+                raise TopicChangedError("the undo receipt no longer applies")
+            _atomic_write_bytes(path, new_bytes)
+            scope.drop(undo)
+        else:
+            scope.record(command, ref, mark, old_bytes, new_bytes)
+            _atomic_write_bytes(path, new_bytes)
+
+
+def _try_undo(scope: "_UndoScope", cmd: str, args, root: Path, path: Path, old_text: str,
+              command: str | None, ref: str | None) -> int | None:
+    """The shared front of `bind`, `unbind` and `undo-binding`: the exit code
+    when an undo ran or was refused, else None (the ordinary path)."""
+    kind, receipt, message, notes = undo_plan(scope, old_text.encode("utf-8"), command, ref)
+    for note in notes:
+        print(f"{cmd}: {note}")
+    if kind == "none":
+        return None
+    if kind == "refuse":
+        print(f"{cmd}: {message}; nothing written", file=sys.stderr)
+        return 1
+    try:
+        apply_topic_edit(path, old_text, receipt.before.decode("utf-8"), args.dry_run, root,
+                         scope=scope, undo=receipt)
+    except TopicChangedError as exc:
+        print(f"{cmd}: {exc}; nothing written", file=sys.stderr)
+        return 1
+    if not args.dry_run:
+        print(f"undo: restored {args.topic} to its state before the uncommitted "
+              f"{receipt.command} of {receipt.ref}")
+    return 0
 
 
 def parse_record_raw(text: str, path, *, as_delivered: bool = False):
@@ -12984,6 +13284,10 @@ def cmd_bind(args) -> int:
     if reason:
         print(f"bind: {reason[1]}; nothing written", file=sys.stderr)
         return 1
+    scope = _UndoScope(root, path, args.topic, dry=args.dry_run)
+    undone = _try_undo(scope, "bind", args, root, path, old_text, "bind", ref)
+    if undone is not None:
+        return undone
     link_id = _topic_current_link(fm)
     if link_id is None:
         print(f"bind: {args.topic} has no active link to anchor", file=sys.stderr)
@@ -13035,7 +13339,12 @@ def cmd_bind(args) -> int:
     if problem:
         print(f"bind: {problem}; nothing written", file=sys.stderr)
         return 1
-    apply_topic_edit(path, old_text, new_text, args.dry_run, root)
+    try:
+        apply_topic_edit(path, old_text, new_text, args.dry_run, root,
+                         scope=scope, command="bind", ref=ref, mark=mark)
+    except TopicChangedError as exc:
+        print(f"bind: {exc}; nothing written", file=sys.stderr)
+        return 1
     if not anchored and not args.dry_run:
         print(f"bind: {ref} is bound without an anchor (a prefix or glob has no byte span)")
     return 0
@@ -13063,6 +13372,10 @@ def cmd_unbind(args) -> int:
     if reason:
         print(f"unbind: {reason[1]}; nothing written", file=sys.stderr)
         return 1
+    scope = _UndoScope(root, path, args.topic, dry=args.dry_run)
+    undone = _try_undo(scope, "unbind", args, root, path, old_text, "unbind", ref)
+    if undone is not None:
+        return undone
     refs_now = [r for r in fm.get("code_refs") or []]
     if ref not in [str(r) for r in refs_now]:
         print(f"unbind: {ref!r} is not in {args.topic}'s code_refs; nothing written")
@@ -13095,8 +13408,46 @@ def cmd_unbind(args) -> int:
     if problem:
         print(f"unbind: {problem}; nothing written", file=sys.stderr)
         return 1
-    apply_topic_edit(path, old_text, new_text, args.dry_run, root)
+    try:
+        apply_topic_edit(path, old_text, new_text, args.dry_run, root,
+                         scope=scope, command="unbind", ref=ref, mark=mark)
+    except TopicChangedError as exc:
+        print(f"unbind: {exc}; nothing written", file=sys.stderr)
+        return 1
     return 0
+
+
+def cmd_undo_binding(args) -> int:
+    """`memidx.py undo-binding TOP-xxxx --root STORE [--list] [--dry-run]` --
+    show the topic's undo receipts (`--list`, newest first) or undo the latest
+    one under the conditions `bind`/`unbind` apply automatically (the topic
+    still equals the receipt's after-image, HEAD and the staged entry are the
+    recorded ones). rc 1: nothing to undo, or the receipt no longer applies
+    (nothing written)."""
+    root = Path(args.root).resolve()
+    path = _topic_file_for_id(root, args.topic)
+    if path is None:
+        print(f"undo-binding: no topic {args.topic!r} under {args.root}/topics", file=sys.stderr)
+        return 1
+    old_text, _fm, reason = _verified_topic_record(root, args.topic, path)
+    if reason:
+        print(f"undo-binding: {reason[1]}; nothing written", file=sys.stderr)
+        return 1
+    scope = _UndoScope(root, path, args.topic, dry=args.dry_run or args.list)
+    if args.list:
+        stack = scope.stack()
+        head = scope.head()
+        if not stack:
+            print(f"undo-binding: no undo receipts for {args.topic}")
+        for r in reversed(stack):
+            state = "" if r.head == head else "  [committed history: HEAD moved]"
+            print(f"#{r.seq} {r.command} {r.ref}  head={r.head[:7]}  {r.written_at}  {r.row()}{state}")
+        return 0
+    undone = _try_undo(scope, "undo-binding", args, root, path, old_text, None, None)
+    if undone is None:
+        print(f"undo-binding: no undo receipt applies to {args.topic}; nothing written", file=sys.stderr)
+        return 1
+    return undone
 
 
 # ---------------------------------------------------------------------------
@@ -15039,6 +15390,17 @@ def main(argv=None) -> int:
     add_mark_args(p_unbind, why_required=False)
     p_unbind.add_argument("--dry-run", action="store_true", help="print the exact diff, write nothing")
     p_unbind.set_defaults(func=cmd_unbind)
+
+    p_undo = sub.add_parser(
+        "undo-binding",
+        help="undo the latest uncommitted bind/unbind of a topic from its worktree-local receipt "
+             "(restores the exact earlier bytes), or list the receipts with --list",
+    )
+    add_common_args(p_undo, need_root=True)
+    p_undo.add_argument("topic", metavar="TOP-xxxx")
+    p_undo.add_argument("--list", action="store_true", help="show the receipt stack, newest first; change nothing")
+    p_undo.add_argument("--dry-run", action="store_true", help="print the exact diff, write nothing")
+    p_undo.set_defaults(func=cmd_undo_binding)
 
     p_mark = sub.add_parser(
         "mark-standing",
