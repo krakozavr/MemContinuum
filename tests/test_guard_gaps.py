@@ -2321,6 +2321,106 @@ class TestUndoReceipts(BindCase):
         self.assertEqual(self.receipts(), [self.receipts()[0]])  # only the new unbind's receipt
         self.assertEqual(len(self.receipts()), 1)
 
+    def test_an_unrelated_commit_between_bind_and_unbind_does_not_expire_the_receipt(self):
+        # gate round 1 (Grok 1): HEAD moving is not the topic's committed content changing
+        before = self.head_state(refs=())
+        self.assertEqual(self.bind()[0], 0)
+        (self.store / "notes.txt").write_text("unrelated\n")
+        git(["add", "notes.txt"], self.store)
+        git(["commit", "-q", "-m", "unrelated"], self.store)
+        self.assertUndone(self.unbind(), before)
+        self.assertEqual(self.receipts(), [])
+
+    def test_a_topic_committed_with_the_binding_is_committed_history(self):
+        self.head_state(refs=())
+        self.assertEqual(self.bind()[0], 0)
+        commit_all(self.store)
+        rc, out, err = self.unbind()
+        self.assertEqual(rc, 0, err)
+        self.assertIn("is now committed history (the committed topics/foo.md holds it)", out)
+        self.assertNotIn("undo:", out)
+        self.assertGuardsClean()
+
+    def test_a_partial_commit_of_an_earlier_edit_does_not_make_the_binding_committed(self):
+        # gate round 1 (Sol's counterexample): B carries an uncommitted ruling edit, bind makes A, and
+        # only the ruling edit is committed. HEAD's topic blob changed but does not contain the binding.
+        self.head_state(refs=())
+        edited = self.text().replace("current: L1", "current: L2").replace(
+            "links:\n", "links:\n" + link_yaml("L2", text="a newer ruling"), 1)
+        self.path.write_text(edited)
+        before = self.raw()
+        self.assertEqual(self.bind()[0], 0)
+        after = self.raw()
+        self.path.write_bytes(before)  # the version with the ruling and without the mark
+        git(["add", "topics/foo.md"], self.store)
+        git(["commit", "-q", "-m", "the ruling only"], self.store)
+        self.path.write_bytes(after)
+        rc, out, err = self.unbind()
+        self.assertEqual(rc, 1, (out, err))
+        self.assertIn("the committed topics/foo.md changed after the uncommitted bind of src/foo.py "
+                      "but does not contain it", err)
+        self.assertIn("git restore --source=HEAD --worktree -- topics/foo.md", err)
+        self.assertIn("nothing written", err)
+        self.assertEqual(self.raw(), after)
+        self.assertEqual(len(self.receipts()), 1)
+
+    def test_an_unavailable_git_probe_refuses_without_dropping_or_writing(self):
+        before = self.head_state(refs=())
+        with mock.patch.object(memidx, "_head_state", return_value=None):
+            rc, out, err = self.bind()  # no receipt can be recorded: refused, nothing written
+        self.assertEqual(rc, 1, (out, err))
+        self.assertIn("git state unavailable for topics/foo.md (HEAD or its tree); nothing written", err)
+        self.assertIn("retry, or commit first", err)
+        self.assertEqual((self.raw(), self.receipts()), (before, []))
+        self.assertEqual(self.bind()[0], 0)
+        after = self.raw()
+        for name in ("_head_state", "_staged_state"):
+            with self.subTest(name), mock.patch.object(memidx, name, return_value=None):
+                rc, out, err = self.unbind()
+            self.assertEqual(rc, 1, (out, err))
+            self.assertIn("git state unavailable for topics/foo.md", err)
+            self.assertEqual((self.raw(), len(self.receipts())), (after, 1))
+        with mock.patch.object(memidx, "_blob_oid", return_value=None):
+            rc, out, err = self.unbind()
+        self.assertEqual((rc, len(self.receipts())), (1, 1), err)
+        self.assertIn("(hash-object)", err)
+        self.assertUndone(self.unbind(), before)
+
+    def test_head_probe_results_are_explicit_states(self):
+        run = lambda rc, out="": (rc, out)  # noqa: E731
+        script = {("rev-parse",): run(1), ("symbolic-ref",): run(0, "refs/heads/main\n"),
+                  ("show-ref",): run(1)}
+        with mock.patch.object(memidx, "_git_run", side_effect=lambda store, args, data=None: script[(args[0],)]):
+            self.assertEqual(memidx._head_state(self.store), {"kind": "unborn"})
+            script[("show-ref",)] = run(128)  # a lookup error is not an absence
+            self.assertIsNone(memidx._head_state(self.store))
+            script[("show-ref",)] = run(0)  # the branch exists though HEAD does not resolve
+            self.assertIsNone(memidx._head_state(self.store))
+            script[("symbolic-ref",)] = run(1)  # detached or unreadable
+            self.assertIsNone(memidx._head_state(self.store))
+        self.assertIsNone(memidx._head_state(self.tmp / "no-such-dir"))
+
+    def test_an_unborn_head_undoes_until_the_topic_itself_is_committed(self):
+        self.path.write_text(binding_topic(code_refs=()))  # no commit exists in this store
+        before = self.raw()
+        self.assertEqual(self.bind()[0], 0)
+        rc, out, err = run_memidx(["undo-binding", "TOP-1", "--list", "--root", str(self.store)])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("baseline=unborn", out)
+        self.assertUndone(self.unbind(), before, clean=False)
+        self.assertEqual(self.bind()[0], 0)
+        (self.store / "notes.txt").write_text("the first commit\n")  # an unrelated first commit
+        git(["add", "notes.txt"], self.store)
+        git(["commit", "-q", "-m", "first"], self.store)
+        self.assertUndone(self.unbind(), before, clean=False)
+        self.assertEqual(self.bind()[0], 0)
+        commit_all(self.store)  # now the topic itself is committed, with the binding
+        rc, out, err = self.unbind()
+        self.assertEqual(rc, 0, err)
+        self.assertIn("is now committed history", out)
+        self.assertNotIn("undo:", out)
+        self.assertGuardsClean()
+
     def test_staging_after_the_command_is_refused_and_unstaging_allows_the_undo(self):
         before = self.head_state(refs=())
         self.assertEqual(self.bind()[0], 0)
@@ -2443,6 +2543,7 @@ class TestUndoReceipts(BindCase):
         lines = out.strip().splitlines()
         self.assertEqual(len(lines), 2)
         self.assertTrue(lines[0].startswith("#2 bind src/foo.py"), lines)
+        self.assertIn("baseline=entry ", lines[0])
         self.assertTrue(lines[1].startswith("#1 bind src/other.py"), lines)
         self.assertEqual(len(self.receipts()), 2)  # --list changes nothing
         for _ in range(2):

@@ -12800,25 +12800,121 @@ def _atomic_write_bytes(path: Path, data: bytes, exclusive: bool = False) -> Non
 # content: they live under `git rev-parse --git-path memcontinuum/receipts`,
 # never in the store tree, so the guard and memlint never see them.
 
-RECEIPT_VERSION = 1
+RECEIPT_VERSION = 2
 _UNDO_OF = {"bind": "unbind", "unbind": "bind"}
 _LOCK_WAIT_SECONDS = 10.0
+_FILE_MODES = ("100644", "100755")
 
 
-class TopicChangedError(Exception):
-    """The topic is not the image the command read (a competing writer, or a
-    receipt that no longer applies): nothing was written."""
+class TopicEditRefused(Exception):
+    """A `bind`/`unbind`/`undo-binding` that refuses before writing anything.
+    The message is the complete text printed after the command name and ends
+    with "nothing written"."""
 
 
-def _git_text(store: Path, args: list) -> str | None:
-    """stdout of `git -C store ARGS`, None on any failure (best effort, the
-    `_git_head_sha` conventions)."""
+def _git_run(store: Path, args: list, data: bytes | None = None) -> tuple | None:
+    """`(returncode, stdout)` of `git -C store ARGS` (stdin `data`), or None when
+    git cannot be run or times out. Unlike `_git_call_budgeted`, which folds
+    every non-zero exit into None, the receipt probes need the exit code: a
+    verified absence (an empty listing, an unborn branch) must be told apart
+    from a failure."""
     try:
-        result = subprocess.run(["git", "-C", str(store)] + args, capture_output=True,
-                                text=True, timeout=min(5.0, _git_ls_timeout()))
+        done = subprocess.run(["git", "-C", str(store)] + args, input=data, capture_output=True,
+                              timeout=min(5.0, _git_ls_timeout()))
     except (OSError, subprocess.SubprocessError):
         return None
-    return result.stdout if result.returncode == 0 else None
+    return done.returncode, done.stdout.decode("utf-8", errors="replace")
+
+
+def _head_state(store: Path) -> dict | None:
+    """HEAD as an explicit state: `{"kind": "commit", "oid"}`, `{"kind": "unborn"}`
+    (HEAD does not resolve, it names a branch, and that branch does not exist) or
+    None -- unavailable (timeout, no git, any other failure)."""
+    resolved = _git_run(store, ["rev-parse", "--verify", "--quiet", "HEAD"])
+    if resolved is None:
+        return None
+    if resolved[0] == 0:
+        oid = resolved[1].strip()
+        return {"kind": "commit", "oid": oid} if oid else None
+    named = _git_run(store, ["symbolic-ref", "--quiet", "HEAD"])
+    if named is None or named[0] != 0 or not named[1].strip():
+        return None
+    shown = _git_run(store, ["show-ref", "--verify", "--quiet", named[1].strip()])
+    return {"kind": "unborn"} if shown is not None and shown[0] == 1 else None
+
+
+def _committed_state(store: Path, rel: str) -> dict | None:
+    """The topic's entry in HEAD's tree: `{"kind": "entry", "mode", "oid"}`,
+    `{"kind": "absent"}` (the listing at the resolved commit is empty), `{"kind":
+    "unborn"}` or None (unavailable). HEAD is resolved once and the listing runs
+    against that commit id, not the moving name."""
+    head = _head_state(store)
+    if head is None or head["kind"] == "unborn":
+        return head
+    listing = _git_run(store, ["ls-tree", "-z", head["oid"], "--", rel])
+    if listing is None or listing[0] != 0:
+        return None
+    entries = []
+    for item in (e for e in listing[1].split("\0") if e):
+        meta, _tab, name = item.partition("\t")
+        fields = meta.split()
+        if len(fields) != 3 or name != rel:
+            return None
+        entries.append({"kind": "entry", "mode": fields[0], "oid": fields[2]})
+    if not entries:
+        return {"kind": "absent"}
+    return entries[0] if len(entries) == 1 else None
+
+
+def _staged_state(store: Path, rel: str) -> dict | None:
+    """The topic's index entry: `{"kind": "entry", "mode", "oid", "stage"}`,
+    `{"kind": "absent"}` (an empty listing) or None (unavailable). An unmerged
+    topic reports its first stage-1..3 entry."""
+    listing = _git_run(store, ["ls-files", "-s", "-z", "--", rel])
+    if listing is None or listing[0] != 0:
+        return None
+    entries = []
+    for item in (e for e in listing[1].split("\0") if e):
+        meta, _tab, name = item.partition("\t")
+        fields = meta.split()
+        if len(fields) != 3 or name != rel or not fields[2].isdigit():
+            return None
+        entries.append({"kind": "entry", "mode": fields[0], "oid": fields[1], "stage": int(fields[2])})
+    if not entries:
+        return {"kind": "absent"}
+    unmerged = [e for e in entries if e["stage"] != 0]
+    if unmerged:
+        return unmerged[0]
+    return entries[0] if len(entries) == 1 else None
+
+
+def _blob_oid(store: Path, data: bytes) -> str | None:
+    """The git blob id of `data` exactly as stored (`hash-object --stdin
+    --no-filters`, no `-w`: nothing is written to the object database)."""
+    done = _git_run(store, ["hash-object", "--stdin", "--no-filters"], data)
+    if done is None or done[0] != 0 or not done[1].strip():
+        return None
+    return done[1].strip()
+
+
+def _norm_committed(state: dict | None) -> dict | None:
+    """A verified unborn branch compares as an absent topic, so the first
+    unrelated commit does not expire a receipt."""
+    return {"kind": "absent"} if state == {"kind": "unborn"} else state
+
+
+def _describe_state(state: dict) -> str:
+    return f"blob {state['oid'][:7]}" if state.get("kind") == "entry" else state.get("kind", "?")
+
+
+def _unavailable_problem(rel: str, *probes: tuple) -> str | None:
+    """The refusal text when any `(probe name, result)` came back None
+    (unavailable), else None."""
+    which = [name for name, result in probes if result is None]
+    if not which:
+        return None
+    return (f"git state unavailable for {rel} ({' and '.join(which)}); nothing written -- "
+            "retry, or commit first")
 
 
 class _Receipt:
@@ -12828,7 +12924,7 @@ class _Receipt:
     def __init__(self, path: Path, seq: int, data: dict):
         self.path, self.seq = path, seq
         self.topic_id, self.rel = data["topic_id"], data["topic_path"]
-        self.head, self.staged = data["head"], data["staged"]
+        self.committed, self.staged = data["committed"], data["staged"]
         self.command, self.ref, self.mark = data["command"], data["ref"], data["mark"]
         self.before = base64.b64decode(data["before"], validate=True)
         self.after = base64.b64decode(data["after"], validate=True)
@@ -12841,14 +12937,26 @@ class _Receipt:
         return f"{self.command} of {self.ref} (no mark row)"
 
 
+def _valid_state(state, kinds: tuple) -> bool:
+    """A recorded probe result: one of the explicit states, with its fields."""
+    if not isinstance(state, dict) or state.get("kind") not in kinds:
+        return False
+    if state["kind"] != "entry":
+        return set(state) == {"kind"}
+    fields = {"kind", "mode", "oid"} | ({"stage"} if "stage" in state else set())
+    return (set(state) == fields and isinstance(state["mode"], str) and isinstance(state["oid"], str)
+            and isinstance(state.get("stage", 0), int) and not isinstance(state.get("stage", 0), bool))
+
+
 def _parse_receipt(path: Path, seq: int) -> "_Receipt | None":
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        str_keys = ("topic_id", "topic_path", "head", "command", "ref", "before", "after", "written_at")
+        str_keys = ("topic_id", "topic_path", "command", "ref", "before", "after", "written_at")
         if (not isinstance(data, dict) or data.get("v") != RECEIPT_VERSION
                 or any(not isinstance(data.get(k), str) for k in str_keys)
                 or data["command"] not in _UNDO_OF
-                or not (data.get("staged") is None or isinstance(data["staged"], str))
+                or not _valid_state(data.get("committed"), ("entry", "absent", "unborn"))
+                or not _valid_state(data.get("staged"), ("entry", "absent"))
                 or not (data.get("mark") is None or (
                     isinstance(data["mark"], dict)
                     and all(isinstance(data["mark"].get(k), str) for k in ("ref", "action", "recorded_at"))))):
@@ -12872,8 +12980,9 @@ class _UndoScope:
             self.rel = Path(os.path.realpath(topic_path)).relative_to(self.store).as_posix()
         except ValueError:
             self.rel = Path(topic_path).as_posix()
-        out = _git_text(self.store, ["rev-parse", "--git-path", "memcontinuum/receipts"])
-        self.rec_dir = (self.store / out.strip()) if out and out.strip() else None
+        found = _git_run(self.store, ["rev-parse", "--git-path", "memcontinuum/receipts"])
+        out = found[1].strip() if found and found[0] == 0 else ""
+        self.rec_dir = (self.store / out) if out else None
         digest = hashlib.sha256(str(self.store).encode("utf-8")).hexdigest()[:10]
         self.key = re.sub(r"[^A-Za-z0-9._-]", "_", topic_id) + "-" + digest
 
@@ -12881,17 +12990,11 @@ class _UndoScope:
     def enabled(self) -> bool:
         return self.rec_dir is not None
 
-    def head(self) -> str:
-        return _git_head_sha(self.store) or "unborn"
-
-    def staged(self) -> str | None:
-        """The topic's index entry (`mode sha stage`, path left out), None when
-        it has none."""
-        out = _git_text(self.store, ["ls-files", "-s", "-z", "--", self.rel])
-        if out is None:
-            return "unavailable"
-        entries = sorted(e.split("\t", 1)[0] for e in out.split("\0") if e)
-        return ";".join(entries) or None
+    def baseline(self) -> tuple:
+        """`(committed, staged)`: the topic's entry in HEAD's tree and in the
+        index, each an explicit state dict or None when that probe is
+        unavailable."""
+        return _committed_state(self.store, self.rel), _staged_state(self.store, self.rel)
 
     def stack(self) -> list:
         """The valid receipts, oldest first; a malformed or legacy file
@@ -12949,7 +13052,7 @@ class _UndoScope:
                     break
                 except BlockingIOError:
                     if time.monotonic() >= deadline:
-                        raise TopicChangedError("another memidx command holds the topic's receipt lock")
+                        raise TopicEditRefused("another memidx command holds the topic's receipt lock; nothing written")
                     time.sleep(0.05)
             try:
                 yield
@@ -12960,16 +13063,25 @@ class _UndoScope:
 
     def record(self, command: str, ref: str, mark: dict | None, before: bytes, after: bytes) -> bool:
         """Write one durable receipt (fsynced file, fsynced directory) on top
-        of the stack; call it under `locked()`, BEFORE the topic write. False
-        when the receipt could not be written (the edit then goes ahead
-        without an undo)."""
+        of the stack, with the topic's committed and staged entries as they are
+        now; call it under `locked()`, BEFORE the topic write. Raises
+        `TopicEditRefused` when a git probe is unavailable or the topic is
+        unmerged. False when the receipt could not be written (the edit then
+        goes ahead without an undo)."""
         if not self.enabled:
             return False
+        committed, staged = self.baseline()
+        problem = _unavailable_problem(self.rel, ("HEAD or its tree", committed), ("index", staged))
+        if problem:
+            raise TopicEditRefused(problem)
+        if staged.get("stage", 0) != 0:
+            raise TopicEditRefused(f"{self.rel} is unmerged in the index (stage {staged['stage']}); "
+                                   "nothing written -- resolve the conflict first")
         stack = self.stack()
         seq = (stack[-1].seq + 1) if stack else 1
         data = {
             "v": RECEIPT_VERSION, "store": str(self.store), "topic_id": self.topic_id,
-            "topic_path": self.rel, "head": self.head(), "staged": self.staged(),
+            "topic_path": self.rel, "committed": committed, "staged": staged,
             "before": base64.b64encode(before).decode("ascii"),
             "after": base64.b64encode(after).decode("ascii"),
             "command": command, "ref": ref,
@@ -12991,50 +13103,81 @@ def undo_plan(scope: "_UndoScope", current: bytes, command: str | None, ref: str
     ordinary path), "refuse" (message names the pending row and the ways out;
     nothing is written) or "undo" (restore `receipt.before`). `command`/`ref`
     None is the explicit `undo-binding`: the latest receipt, whatever it was.
-    Receipts of committed history (HEAD moved) and receipts whose topic write
-    never happened (the topic still equals B) are dropped on the way. Nothing
-    is inferred: a receipt applies only while the topic equals its A, the
-    boundary and the staged entry are the recorded ones."""
+    Nothing is inferred and nothing is read from HEAD but the topic's own entry:
+    a receipt applies only while the topic's committed entry is the one recorded
+    (a verified unborn branch counts as absent), the index entry is the recorded
+    one and the topic equals its A. The decision, in order: HEAD holds A -> the
+    action is committed history, the receipt is dropped and the ordinary path
+    runs; the committed entry changed but does not hold A -> refused; the topic
+    or the index differ -> refused; a git probe is unavailable -> refused, the
+    receipt kept. A receipt whose topic write never happened (the topic still
+    equals its B) is dropped on the way."""
     notes: list = []
     if not scope.enabled:
         return "none", None, None, notes
-    head = scope.head()
     while True:
         stack = scope.stack()
         if not stack:
             return "none", None, None, notes
         top = stack[-1]
-        matches = command is None or (top.command == _UNDO_OF[command] and top.ref == ref)
-        if top.head != head:
-            scope.drop(top)
-            if matches:
-                notes.append(f"the uncommitted {top.command} of {top.ref} is now committed history "
-                             "(HEAD moved); its undo receipt is dropped")
-            continue
         if top.rel == scope.rel and current == top.before and top.before != top.after:
             scope.drop(top)  # the topic write never happened (a crash after the receipt)
             continue
         break
-    if not matches:
+    if not (command is None or (top.command == _UNDO_OF[command] and top.ref == ref)):
         return "none", None, None, notes
     reverse = _UNDO_OF[top.command]
     topic = scope.rel
+    action = f"the uncommitted {top.command} of {top.ref}"
     if top.rel != scope.rel:
         return "refuse", top, (
-            f"the topic moved from {top.rel} to {scope.rel} after the uncommitted {top.command} of "
-            f"{top.ref}; commit first, then {reverse}, or move it back (pending: {top.row()})"), notes
+            f"the topic moved from {top.rel} to {topic} after {action}; commit first, then "
+            f"{reverse}, or move it back (pending: {top.row()}); nothing written"), notes
+    committed, staged = scope.baseline()
+    oid_a = _blob_oid(scope.store, top.after)
+    problem = _unavailable_problem(topic, ("HEAD or its tree", committed), ("index", staged),
+                                   ("hash-object", oid_a))
+    if problem:
+        return "refuse", top, problem, notes
+    if committed.get("kind") == "entry" and committed["oid"] == oid_a and committed["mode"] in _FILE_MODES:
+        scope.drop(top)  # HEAD holds A: committed history
+        notes.append(f"{action} is now committed history (the committed {topic} holds it); "
+                     "its undo receipt is dropped")
+        below_after = top.before
+        for older in reversed(stack[:-1]):  # what lies under a committed receipt is committed too
+            if older.rel != top.rel or older.after != below_after:
+                break
+            scope.drop(older)
+            below_after = older.before
+        return "none", None, None, notes
+    if _norm_committed(committed) != _norm_committed(top.committed):
+        oid_now = _blob_oid(scope.store, current)
+        if oid_now is None:
+            return "refuse", top, _unavailable_problem(topic, ("hash-object", oid_now)), notes
+        if committed.get("kind") == "entry" and oid_now == committed["oid"]:
+            scope.drop(top)  # the topic equals HEAD: nothing is pending, the receipt is moot
+            notes.append(f"{action} left nothing uncommitted in {topic}; its undo receipt is dropped")
+            return "none", None, None, notes
+        return "refuse", top, (
+            f"the committed {topic} changed after {action} but does not contain it; commit the pending "
+            f"edit first, then {reverse}, or restore the file with `git restore --source=HEAD "
+            f"--worktree -- {topic}` if it carries no other pending edit (pending: {top.row()}); "
+            "nothing written"), notes
     if current != top.after:
         return "refuse", top, (
-            f"the topic changed after the uncommitted {top.command} of {top.ref}; commit first, then "
+            f"the topic changed after {action}; commit first, then "
             f"{reverse}, or restore the file with `git restore --source=HEAD --worktree -- {topic}` "
-            f"if it carries no other pending edit (pending: {top.row()})"), notes
-    staged = scope.staged()
+            f"if it carries no other pending edit (pending: {top.row()}); nothing written"), notes
+    if staged.get("stage", 0) != 0:
+        return "refuse", top, (
+            f"{topic} is unmerged in the index (stage {staged['stage']}); nothing was rewritten -- "
+            f"resolve the conflict, then {reverse} (pending: {top.row()}); nothing written"), notes
     if staged != top.staged:
         return "refuse", top, (
-            f"the staged entry of {topic} changed after the uncommitted {top.command} of {top.ref} "
-            f"(index now: {staged or 'absent'}; at the {top.command}: {top.staged or 'absent'}); "
+            f"the staged entry of {topic} changed after {action} "
+            f"(index now: {_describe_state(staged)}; at the {top.command}: {_describe_state(top.staged)}); "
             f"nothing was rewritten -- `git restore --staged -- {topic}` or commit first "
-            f"(pending: {top.row()})"), notes
+            f"(pending: {top.row()}); nothing written"), notes
     return "undo", top, None, notes
 
 
@@ -13048,9 +13191,10 @@ def apply_topic_edit(path: Path, old_text: str, new_text: str, dry_run: bool, st
 
     With `scope` (`bind`/`unbind`): the write is serialized by the topic's
     receipt lock and the file is re-read under it -- anything but `old_text`
-    raises `TopicChangedError` and nothing is written. A fresh edit records its
+    raises `TopicEditRefused` and nothing is written. A fresh edit records its
     receipt (`command`, `ref`, `mark`) durably first; with `undo` the write
-    restores that receipt's B and the receipt is dropped afterwards."""
+    restores that receipt's B, once the committed and staged entries are
+    checked again, and the receipt is dropped afterwards."""
     try:
         label = str(path.relative_to(store_root))
     except ValueError:
@@ -13066,10 +13210,15 @@ def apply_topic_edit(path: Path, old_text: str, new_text: str, dry_run: bool, st
     old_bytes = old_text.encode("utf-8")
     with scope.locked():
         if Path(path).read_bytes() != old_bytes:
-            raise TopicChangedError("the topic changed while this command ran")
+            raise TopicEditRefused("the topic changed while this command ran; nothing written")
         if undo is not None:
-            if not undo.path.exists() or scope.head() != undo.head or scope.staged() != undo.staged:
-                raise TopicChangedError("the undo receipt no longer applies")
+            committed, staged = scope.baseline()
+            if (not undo.path.exists()
+                    or _unavailable_problem(scope.rel, ("HEAD or its tree", committed), ("index", staged))
+                    or _norm_committed(committed) != _norm_committed(undo.committed)
+                    or staged != undo.staged):
+                raise TopicEditRefused("the undo receipt no longer applies (the committed or staged entry of "
+                                       f"{scope.rel} changed while this command ran); nothing written")
             _atomic_write_bytes(path, new_bytes)
             scope.drop(undo)
         else:
@@ -13087,13 +13236,13 @@ def _try_undo(scope: "_UndoScope", cmd: str, args, root: Path, path: Path, old_t
     if kind == "none":
         return None
     if kind == "refuse":
-        print(f"{cmd}: {message}; nothing written", file=sys.stderr)
+        print(f"{cmd}: {message}", file=sys.stderr)
         return 1
     try:
         apply_topic_edit(path, old_text, receipt.before.decode("utf-8"), args.dry_run, root,
                          scope=scope, undo=receipt)
-    except TopicChangedError as exc:
-        print(f"{cmd}: {exc}; nothing written", file=sys.stderr)
+    except TopicEditRefused as exc:
+        print(f"{cmd}: {exc}", file=sys.stderr)
         return 1
     if not args.dry_run:
         print(f"undo: restored {args.topic} to its state before the uncommitted "
@@ -13264,8 +13413,8 @@ def cmd_bind(args) -> int:
     or whose resolved directory leaves the code roots (symlinks included), an absolute or
     `..` prefix/glob, symbol ambiguous, other failure. Right after an uncommitted
     `unbind` of the same REF it instead restores the exact earlier bytes from the
-    undo receipt (`undo_plan`), or refuses when the topic, HEAD or the staged entry
-    changed since."""
+    undo receipt (`undo_plan`), or refuses when the topic, its committed entry or the
+    staged entry changed since."""
     root = Path(args.root).resolve()
     ref = args.ref
     code_roots = _code_roots_arg(args.code_root) or [Path.cwd().resolve()]
@@ -13345,8 +13494,8 @@ def cmd_bind(args) -> int:
     try:
         apply_topic_edit(path, old_text, new_text, args.dry_run, root,
                          scope=scope, command="bind", ref=ref, mark=mark)
-    except TopicChangedError as exc:
-        print(f"bind: {exc}; nothing written", file=sys.stderr)
+    except TopicEditRefused as exc:
+        print(f"bind: {exc}", file=sys.stderr)
         return 1
     if not anchored and not args.dry_run:
         print(f"bind: {ref} is bound without an anchor (a prefix or glob has no byte span)")
@@ -13416,8 +13565,8 @@ def cmd_unbind(args) -> int:
     try:
         apply_topic_edit(path, old_text, new_text, args.dry_run, root,
                          scope=scope, command="unbind", ref=ref, mark=mark)
-    except TopicChangedError as exc:
-        print(f"unbind: {exc}; nothing written", file=sys.stderr)
+    except TopicEditRefused as exc:
+        print(f"unbind: {exc}", file=sys.stderr)
         return 1
     return 0
 
@@ -13426,7 +13575,7 @@ def cmd_undo_binding(args) -> int:
     """`memidx.py undo-binding TOP-xxxx --root STORE [--list] [--dry-run]` --
     show the topic's undo receipts (`--list`, newest first) or undo the latest
     one under the conditions `bind`/`unbind` apply automatically (the topic
-    still equals the receipt's after-image, HEAD and the staged entry are the
+    still equals the receipt's after-image, its committed and staged entries are the
     recorded ones). rc 1: nothing to undo, or the receipt no longer applies
     (nothing written)."""
     root = Path(args.root).resolve()
@@ -13441,12 +13590,11 @@ def cmd_undo_binding(args) -> int:
     scope = _UndoScope(root, path, args.topic, dry=args.dry_run or args.list)
     if args.list:
         stack = scope.stack()
-        head = scope.head()
         if not stack:
             print(f"undo-binding: no undo receipts for {args.topic}")
         for r in reversed(stack):
-            state = "" if r.head == head else "  [committed history: HEAD moved]"
-            print(f"#{r.seq} {r.command} {r.ref}  head={r.head[:7]}  {r.written_at}  {r.row()}{state}")
+            base = r.committed["kind"] + (f" {r.committed['oid'][:7]}" if r.committed["kind"] == "entry" else "")
+            print(f"#{r.seq} {r.command} {r.ref}  baseline={base}  {r.written_at}  {r.row()}")
         return 0
     undone = _try_undo(scope, "undo-binding", args, root, path, old_text, None, None)
     if undone is None:

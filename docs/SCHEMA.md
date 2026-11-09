@@ -173,7 +173,8 @@ history, and a later `add` row re-arms the requirement); a `link` not in
 exact bytes before and after the command) under `git rev-parse --git-path memcontinuum/receipts`, outside
 the store tree, so the opposite command can take back an uncommitted edit byte for byte. A receipt is
 never read by `memlint.py`, never committed and never part of a record; the rows and anchors a topic
-carries are the same with or without one.
+carries are the same with or without one. A receipt applies only while the topic's committed content at
+HEAD is what it was when the receipt was written; committing other files changes nothing.
 
 **Anchor rows are append-only**, like links: under `--against-ref`, a row present at `REF`
 (identified by `ref`, `link`, `captured`, `captured_at`) must survive with the same fields and the

@@ -3727,29 +3727,39 @@ anchor-ownership logic. Before it writes, each command records a receipt
 (`_UndoScope.record`) under `git rev-parse --git-path memcontinuum/receipts`
 (per worktree, outside the store tree, so never tracked): one JSON file per receipt,
 `<topic id>-<store hash>.<seq>.json`, a per-topic stack ordered by `seq`. It holds the
-store root, the topic path and id, HEAD (or `unborn`), the staged index entry
-(`git ls-files -s`, mode and blob sha, or absent), the exact bytes before (B) and after
+store root, the topic path and id, the topic's committed entry at HEAD (an
+`entry` with mode and blob id, `absent`, or `unborn` for a branch with no commit), the staged index
+entry (`git ls-files -s`: mode, blob id and stage, or `absent`), the exact bytes before (B) and after
 (A) as base64, the command, the reference and the identity of the mark row produced
 (ref, action, `recorded_at`; none when the command wrote no row). The file is fsynced
 (`_atomic_write_bytes`) before the topic is written. `--dry-run` writes none.
 
 `undo_plan` decides, before any anchor capture or mark generation: the latest receipt
 is the opposite command on the same reference AND the topic path is the recorded one AND
-the topic bytes equal A AND `git rev-parse HEAD` equals the receipt's AND the staged entry
-equals the receipt's -> `apply_topic_edit(undo=...)` restores B through the same atomic
-writer, drops the receipt and prints `undo: restored <topic> to its state before the
-uncommitted <command> of <ref>`. A receipt whose HEAD moved is committed history: it is
-dropped (with a note when it was the one the command would have undone) and the ordinary
-write follows. A receipt whose topic still equals B was written before a crash: dropped. A
-moved topic, a topic that differs from A, or a changed staged entry is refused with the
-pending row named and the ways out (`git restore --source=HEAD --worktree -- <topic>`,
-`git restore --staged -- <topic>`, or commit first); nothing is written. A missing,
-malformed, unknown-version or non-matching receipt means the ordinary path. A receipt authorises
-restoring B only; it never deletes anything that is not in B.
+the topic bytes equal A AND the topic's committed entry at HEAD equals the recorded one
+(a verified unborn branch counts as absent, so an unrelated first commit changes nothing)
+AND the staged entry equals the recorded one -> `apply_topic_edit(undo=...)` restores B
+through the same atomic writer, drops the receipt and prints `undo: restored <topic> to
+its state before the uncommitted <command> of <ref>`. HEAD moving alone decides nothing;
+the receipt looks only at the topic. When the topic's blob at HEAD is the git blob id of A
+(`git hash-object --stdin --no-filters`, nothing stored) the action is committed
+history: the receipt is dropped with a note and the ordinary write follows. When the
+committed entry changed but is not A (an earlier edit was committed without the
+binding) the command refuses and names the pending row; when the topic then equals
+HEAD there is nothing pending and the receipt is dropped. A receipt whose topic still
+equals B was written before a crash: dropped. A moved topic, a topic that differs from
+A, or a changed staged entry is refused with the pending row named and the ways out
+(`git restore --source=HEAD --worktree -- <topic>`, `git restore --staged -- <topic>`,
+or commit first); nothing is written. Every probe returns an explicit state or
+"unavailable" (a timeout, a missing git, any failure that is not a verified absence); an
+unavailable probe, at decision time or when the receipt is recorded, refuses without
+dropping or writing anything. A missing, malformed, unknown-version or non-matching
+receipt means the ordinary path. A receipt authorises restoring B only; it never deletes
+anything that is not in B.
 
 Writers serialize on one `flock`ed lock file per topic next to the stack
 (`_UndoScope.locked`); `apply_topic_edit(scope=...)` re-reads the topic under the lock and
-refuses (`TopicChangedError`, nothing written) unless it still equals the image the command
+refuses (`TopicEditRefused`, nothing written) unless it still equals the image the command
 read. `mark-standing` calls `apply_topic_edit` without a scope and is unchanged. A store
 outside git has no receipts. `undo-binding TOP-xxxx [--list]` shows the stack (newest
 first, nothing changed) or runs the same `undo_plan` / restore for the latest receipt.
