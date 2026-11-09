@@ -2444,6 +2444,24 @@ class TestUndoReceipts(BindCase):
         self.assertNotIn("undo:", out)
         self.assertGuardsClean()
 
+    def test_the_committed_history_note_names_only_the_receipt_that_would_have_been_undone(self):
+        # gate round 1 (Sol 6)
+        self.head_state(refs=())
+        self.assertEqual(self.bind("src/foo.py")[0], 0)
+        self.assertEqual(self.bind("src/other.py")[0], 0)
+        commit_all(self.store)
+        rc, out, err = self.unbind("src/foo.py")  # the latest receipt is for `other`: not eligible
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("committed history", out)
+        commit_all(self.store)
+        # the stack is [bind foo, bind other, unbind foo], all committed now; the eligible receipt is the
+        # latest one and is the only one named, the stale entries beneath it go silently
+        rc, out, err = self.bind("src/foo.py")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out.count("committed history"), 1)
+        self.assertIn("unbind of src/foo.py is now committed history", out)
+        self.assertEqual(len(self.receipts()), 1)  # only this bind's own receipt remains
+
     def test_staging_after_the_command_is_refused_and_unstaging_allows_the_undo(self):
         before = self.head_state(refs=())
         self.assertEqual(self.bind()[0], 0)
