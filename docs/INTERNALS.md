@@ -3752,9 +3752,10 @@ the receipt looks only at the topic. When the topic's blob at HEAD is the git bl
 (`git hash-object --stdin --no-filters`, nothing stored) the action is committed
 history: the receipt is dropped with a note and the ordinary write follows. When the
 committed entry changed but is not A (an earlier edit was committed without the
-binding) the command refuses and names the pending row; when the topic then equals
-HEAD there is nothing pending and the receipt is dropped. A receipt whose topic still
-equals B was written before a crash: dropped. A moved topic, a topic that differs from
+binding) the command refuses and names the pending row. A receipt whose topic still
+equals B was written before a crash: dropped. A latest receipt that is not the one the
+command would undo, but whose A is committed history, is dropped without a note together
+with the receipts beneath it that it contains, so the stack holds uncommitted work only. A moved topic, a topic that differs from
 A, or a changed staged entry is refused with the pending row named and the ways out
 (`git restore --source=HEAD --worktree -- <topic>`, `git restore --staged -- <topic>`,
 or commit first); nothing is written. Every probe returns an explicit state or
@@ -3773,7 +3774,9 @@ receipt, the undo decision, recording and dropping. An undo is one critical sect
 the topic, `undo_plan` on those bytes, restore B, drop the receipt); an ordinary edit takes
 the lock to plan and prune, releases it to capture the anchor and generate the mark, then
 takes it again, re-reads the topic and refuses (`TopicEditRefused`, nothing written) unless
-it still equals the image the command read, records the receipt and replaces the topic. The
+it still equals both the image the command read and the image the undo decision was made on (a
+command that completed between the plan and the parse would make the verdict stale), records the
+receipt and replaces the topic. The
 committed and staged entries and the topic bytes are read once more immediately before an
 undo replaces the file, because the lock does not serialize external git commands. `mark-standing` calls `apply_topic_edit` without a scope and is unchanged. A store
 outside a git work tree (a plain directory, a bare repository) has no receipts, and the receipts' git

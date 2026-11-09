@@ -2492,9 +2492,11 @@ class TestUndoReceipts(BindCase):
         rc, out, err = self.unbind("src/foo.py")  # the latest receipt is for `other`: not eligible
         self.assertEqual(rc, 0, err)
         self.assertNotIn("committed history", out)
+        # `other`'s receipt was committed history and went silently, with the one beneath it: the stack
+        # holds uncommitted work only
+        self.assertEqual(len(self.receipts()), 1)
         commit_all(self.store)
-        # the stack is [bind foo, bind other, unbind foo], all committed now; the eligible receipt is the
-        # latest one and is the only one named, the stale entries beneath it go silently
+        # the stack is [unbind foo], committed now; the eligible receipt is named, once
         rc, out, err = self.bind("src/foo.py")
         self.assertEqual(rc, 0, err)
         self.assertEqual(out.count("committed history"), 1)
@@ -2699,6 +2701,28 @@ class TestUndoReceipts(BindCase):
             self.assertEqual(self.raw(), mid)
         finally:
             d.chmod(0o700)
+
+    def test_a_plan_made_on_one_image_is_not_applied_to_another(self):
+        # the undo verdict ("no receipt applies") was reached on the bytes read under the lock; the command
+        # then parses the file again. If the opposite command completed in between, writing would pair a
+        # restore row with the pending removal: the write must refuse.
+        before = self.bound_head()
+        real = memidx._verified_topic_record
+        nested = {}
+
+        def after_the_plan(*a, **kw):
+            if not nested:
+                nested["rc"] = None
+                nested["rc"] = self.unbind()[0]  # a competing command completes between plan and parse
+            return real(*a, **kw)
+
+        with mock.patch.object(memidx, "_verified_topic_record", side_effect=after_the_plan):
+            rc, out, err = self.bind()
+        self.assertEqual(nested["rc"], 0)
+        self.assertEqual(rc, 1, (out, err))
+        self.assertIn("the topic changed while this command ran; nothing written", err)
+        self.assertEqual(len(self.receipts()), 1)  # the competing unbind's, intact
+        self.assertUndone(self.bind(), before)
 
     def test_a_held_lock_refuses_without_writing(self):
         before = self.head_state(refs=())

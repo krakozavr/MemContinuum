@@ -13022,6 +13022,7 @@ class _UndoScope:
         self.dry = dry
         self._dropped: set = set()  # receipts dropped by this command (also under dry-run)
         self._held = False  # True inside `locked()`: the only place the stack may change
+        self.planned: bytes | None = None  # the topic bytes `_undo_front` ran `undo_plan` on
         self.invalid: list = []  # unreadable receipt files seen by the last `stack()` scan
         self.max_seq = 0  # the highest sequence number on disk at the last scan, valid or not
         try:
@@ -13187,17 +13188,22 @@ def undo_plan(scope: "_UndoScope", current: bytes, command: str | None, ref: str
     Nothing is inferred and nothing is read from HEAD but the topic's own entry:
     a receipt applies only while the topic's committed entry is the one recorded
     (a verified unborn branch counts as absent), the index entry is the recorded
-    one and the topic equals its A. The decision, in order: HEAD holds A -> the
-    action is committed history, the receipt is dropped and the ordinary path
-    runs; the committed entry changed but does not hold A -> refused; the topic
-    or the index differ -> refused; a git probe is unavailable -> refused, the
-    receipt kept. A receipt whose topic write never happened (the topic still
-    equals its B) is dropped on the way."""
+    one and the topic equals its A. The decision for the latest receipt, in
+    order: HEAD holds A -> the action is committed history, the receipt is
+    dropped and the ordinary path runs; the committed entry changed but does not
+    hold A -> refused; the topic or the index differ -> refused; a git probe is
+    unavailable -> refused, the receipt kept. A receipt whose topic write never
+    happened (the topic still equals its B) is dropped on the way, and so is a
+    latest receipt that is not the one this command would undo but whose A is
+    committed history (silently, with everything beneath it that it contains:
+    the stack holds uncommitted work only). Only the first receipt examined can
+    produce a note."""
     notes: list = []
     if not scope.enabled:
         return "none", None, None, notes
     scope.stack()
     scope.prune_invalid()
+    first = True
     while True:
         stack = scope.stack()
         if not stack:
@@ -13206,62 +13212,63 @@ def undo_plan(scope: "_UndoScope", current: bytes, command: str | None, ref: str
         if top.rel == scope.rel and current == top.before and top.before != top.after:
             scope.drop(top)  # the topic write never happened (a crash after the receipt)
             continue
-        break
-    if not (command is None or (top.command == _UNDO_OF[command] and top.ref == ref)):
-        return "none", None, None, notes
-    reverse = _UNDO_OF[top.command]
-    topic = scope.rel
-    action = f"the uncommitted {top.command} of {top.ref}"
-    if top.rel != scope.rel:
-        return "refuse", top, (
-            f"the topic moved from {top.rel} to {topic} after {action}; commit first, then "
-            f"{reverse}, or move it back (pending: {top.row()}); nothing written"), notes
-    committed, staged = scope.baseline()
-    oid_a = _blob_oid(scope.store, top.after)
-    problem = _unavailable_problem(topic, ("HEAD or its tree", committed), ("index", staged),
-                                   ("hash-object", oid_a))
-    if problem:
-        return "refuse", top, problem, notes
-    if committed.get("kind") == "entry" and committed["oid"] == oid_a and committed["mode"] in _FILE_MODES:
-        scope.drop(top)  # HEAD holds A: committed history
-        notes.append(f"{action} is now committed history (the committed {topic} holds it); "
-                     "its undo receipt is dropped")
-        below_after = top.before
-        for older in reversed(stack[:-1]):  # what lies under a committed receipt is committed too
-            if older.rel != top.rel or older.after != below_after:
-                break
-            scope.drop(older)
-            below_after = older.before
-        return "none", None, None, notes
-    if _norm_committed(committed) != _norm_committed(top.committed):
-        oid_now = _blob_oid(scope.store, current)
-        if oid_now is None:
-            return "refuse", top, _unavailable_problem(topic, ("hash-object", oid_now)), notes
-        if committed.get("kind") == "entry" and oid_now == committed["oid"]:
-            scope.drop(top)  # the topic equals HEAD: nothing is pending, the receipt is moot
-            notes.append(f"{action} left nothing uncommitted in {topic}; its undo receipt is dropped")
+        matches = command is None or (top.command == _UNDO_OF[command] and top.ref == ref)
+        reverse = _UNDO_OF[top.command]
+        topic = scope.rel
+        action = f"the uncommitted {top.command} of {top.ref}"
+        if top.rel != scope.rel:
+            if not matches:
+                return "none", None, None, notes
+            return "refuse", top, (
+                f"the topic moved from {top.rel} to {topic} after {action}; commit first, then "
+                f"{reverse}, or move it back (pending: {top.row()}); nothing written"), notes
+        committed, staged = scope.baseline()
+        oid_a = _blob_oid(scope.store, top.after)
+        problem = _unavailable_problem(topic, ("HEAD or its tree", committed), ("index", staged),
+                                       ("hash-object", oid_a))
+        if problem:
+            # a receipt that is not this command's is none of its business: the ordinary path (which
+            # records its own receipt and refuses on an unavailable probe itself) goes on
+            return ("refuse", top, problem, notes) if matches else ("none", None, None, notes)
+        if committed.get("kind") == "entry" and committed["oid"] == oid_a and committed["mode"] in _FILE_MODES:
+            scope.drop(top)  # HEAD holds A: committed history
+            below_after = top.before
+            for older in reversed(stack[:-1]):  # what lies under a committed receipt is committed too
+                if older.rel != top.rel or older.after != below_after:
+                    break
+                scope.drop(older)
+                below_after = older.before
+            if matches:
+                if first:
+                    notes.append(f"{action} is now committed history (the committed {topic} holds it); "
+                                 "its undo receipt is dropped")
+                return "none", None, None, notes
+            first = False
+            continue
+        if not matches:
             return "none", None, None, notes
-        return "refuse", top, (
-            f"the committed {topic} changed after {action} but does not contain it; commit the pending "
-            f"edit first, then {reverse}, or restore the file with `git restore --source=HEAD "
-            f"--worktree -- {topic}` if it carries no other pending edit (pending: {top.row()}); "
-            "nothing written"), notes
-    if current != top.after:
-        return "refuse", top, (
-            f"the topic changed after {action}; commit first, then "
-            f"{reverse}, or restore the file with `git restore --source=HEAD --worktree -- {topic}` "
-            f"if it carries no other pending edit (pending: {top.row()}); nothing written"), notes
-    if staged.get("stage", 0) != 0:
-        return "refuse", top, (
-            f"{topic} is unmerged in the index (stage {staged['stage']}); nothing was rewritten -- "
-            f"resolve the conflict, then {reverse} (pending: {top.row()}); nothing written"), notes
-    if staged != top.staged:
-        return "refuse", top, (
-            f"the staged entry of {topic} changed after {action} "
-            f"(index now: {_describe_state(staged)}; at the {top.command}: {_describe_state(top.staged)}); "
-            f"nothing was rewritten -- `git restore --staged -- {topic}` or commit first "
-            f"(pending: {top.row()}); nothing written"), notes
-    return "undo", top, None, notes
+        if _norm_committed(committed) != _norm_committed(top.committed):
+            return "refuse", top, (
+                f"the committed {topic} changed after {action} but does not contain it; commit the "
+                f"pending edit first, then {reverse}, or restore the file with `git restore "
+                f"--source=HEAD --worktree -- {topic}` if it carries no other pending edit "
+                f"(pending: {top.row()}); nothing written"), notes
+        if current != top.after:
+            return "refuse", top, (
+                f"the topic changed after {action}; commit first, then "
+                f"{reverse}, or restore the file with `git restore --source=HEAD --worktree -- {topic}` "
+                f"if it carries no other pending edit (pending: {top.row()}); nothing written"), notes
+        if staged.get("stage", 0) != 0:
+            return "refuse", top, (
+                f"{topic} is unmerged in the index (stage {staged['stage']}); nothing was rewritten -- "
+                f"resolve the conflict, then {reverse} (pending: {top.row()}); nothing written"), notes
+        if staged != top.staged:
+            return "refuse", top, (
+                f"the staged entry of {topic} changed after {action} "
+                f"(index now: {_describe_state(staged)}; at the {top.command}: {_describe_state(top.staged)}); "
+                f"nothing was rewritten -- `git restore --staged -- {topic}` or commit first "
+                f"(pending: {top.row()}); nothing written"), notes
+        return "undo", top, None, notes
 
 
 def _edit_label(path: Path, store_root: Path) -> str:
@@ -13293,7 +13300,9 @@ def apply_topic_edit(path: Path, old_text: str, new_text: str, dry_run: bool, st
         return
     old_bytes = old_text.encode("utf-8")
     with scope.locked():
-        if Path(path).read_bytes() != old_bytes:
+        # the image the command read, the image `undo_plan` decided on and the file now must all agree:
+        # a command that completed between the plan and the parse would make the verdict stale
+        if Path(path).read_bytes() != old_bytes or (scope.planned is not None and old_bytes != scope.planned):
             raise TopicEditRefused("the topic changed while this command ran; nothing written")
         scope.record(command, ref, mark, old_bytes, new_bytes)
         _atomic_write_bytes(path, new_bytes)
@@ -13335,6 +13344,7 @@ def _undo_front(scope: "_UndoScope", cmd: str, args, root: Path, path: Path,
     try:
         with scope.locked():
             current = Path(path).read_bytes()
+            scope.planned = current
             kind, receipt, message, notes = undo_plan(scope, current, command, ref)
             for note in notes:
                 print(f"{cmd}: {note}")
