@@ -191,7 +191,7 @@ q=<+-joined tokens> fb_ms=<N>`) and `search-fallback-empty`
 `reason=bad-json` / `reason=lib-missing` — `hooks/mc-fallback-lib.sh`
 itself failed to source, plus `fb_ms=<N>` whenever the search subprocess
 actually ran). `fb_ms` is millisecond-resolution wall time of the search
-subprocess call only (`date +%s%3N`, a python `time.time()` fallback where
+subprocess call only (`date +%s%3N`, a perl `Time::HiRes` call, then a python `time.time()` fallback, where
 `%3N` isn't supported) — the same field name on both hooks, present only
 when the subprocess ran, so `no-query`/`store-root` never contribute a
 sample. The query is `+`-joined, not quoted-with-spaces: `memidx.py

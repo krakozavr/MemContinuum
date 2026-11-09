@@ -614,6 +614,9 @@ class TestLedgerPostEdit(HookTestBase):
         (fake / "date").write_text(
             '#!/usr/bin/env bash\ncase "$*" in *%3N*) echo 3N;; *) exec /bin/date "$@";; esac\n')
         (fake / "date").chmod(0o755)
+        # No perl either: the last rung (whole seconds) is under test.
+        (fake / "perl").write_text("#!/bin/sh\nexit 127\n")
+        (fake / "perl").chmod(0o755)
         # mc_elapsed_field resolves `python3` from PATH (mc_now_ms "" 1), not
         # from MC_PY: the spy is installed under every interpreter name first
         # on PATH (gate round 2 R2-3).
@@ -631,6 +634,37 @@ class TestLedgerPostEdit(HookTestBase):
             env=self.base_env(PATH=str(fake) + os.pathsep + os.environ["PATH"]),
         )
         self.assertRegex(proc.stdout, r"^elapsed=\d+\.0s mode=python$", proc.stdout + proc.stderr)
+        self.assertFalse(spy.exists(), "python was spawned for a log field")
+
+    def test_elapsed_field_keeps_milliseconds_across_a_second_boundary_without_date_percent_n(self):
+        """Gate round 1 R1-3: bash 3.2 (no EPOCHREALTIME) with a BSD `date`
+        (no %N) must still time a 20 ms hook that spans a second boundary as
+        0.0s, not 1.0s -- the perl rung supplies milliseconds, no python is
+        spawned. The clock is pinned: a stub perl answers 100.990 s then
+        101.010 s after the probe, and the start is pinned the same way."""
+        spy = Path(self.td) / "python-spawned"
+        fake = Path(self.td) / "fakebin-perl"
+        fake.mkdir()
+        (fake / "date").write_text(
+            '#!/usr/bin/env bash\ncase "$*" in *%3N*) echo 3N;; *) exec /bin/date "$@";; esac\n')
+        (fake / "date").chmod(0o755)
+        counter = Path(self.td) / "perl-calls"
+        (fake / "perl").write_text(
+            "#!/bin/sh\n"
+            f'echo x >> "{counter}"; n=$(wc -l < "{counter}" | tr -d " ")\n'
+            'if [ "$n" = 1 ]; then echo 1700000000990; else echo 1700000001010; fi\n')
+        (fake / "perl").chmod(0o755)
+        for name in ("python3", "python"):
+            (fake / name).write_text('#!/bin/sh\ntouch "' + str(spy) + '"\n')
+            (fake / name).chmod(0o755)
+        script = ('unset EPOCHREALTIME; source "$1"; unset EPOCHREALTIME; MC_QUERY_MS_MODE=""; '
+                  'MC_T0_US=1700000000990000; mc_elapsed_field; printf " mode=%s" "$MC_QUERY_MS_MODE"')
+        proc = subprocess.run(
+            [MC_BASH, "-c", script, "_", str(HOOKS_DIR / "memlib.sh")],
+            capture_output=True, text=True, timeout=10,
+            env=self.base_env(PATH=str(fake) + os.pathsep + os.environ["PATH"]),
+        )
+        self.assertEqual(proc.stdout, "elapsed=0.0s mode=perl", proc.stdout + proc.stderr)
         self.assertFalse(spy.exists(), "python was spawned for a log field")
 
     def _future_start_us(self, seconds=5):

@@ -168,8 +168,8 @@ mc_query_tokens() {
     printf '%s' "$out"
 }
 
-# MC_QUERY_MS_MODE -- "date" | "python", empty until mc_now_ms's first
-# call (per-process probe cache, see the header comment above).
+# MC_QUERY_MS_MODE -- "date" | "perl" | "python", empty until mc_now_ms's
+# first call (per-process probe cache, see the header comment above).
 MC_QUERY_MS_MODE="${MC_QUERY_MS_MODE:-}"
 
 # mc_now_ms [PYTHON_INTERPRETER [NO_PYTHON]] -- millisecond-epoch on stdout, and also in
@@ -178,10 +178,12 @@ MC_QUERY_MS_MODE="${MC_QUERY_MS_MODE:-}"
 # $EPOCHREALTIME (no fork at all); older bash uses the probe below. See the
 # file header comment for the GNU-%3N-vs-BSD-no-%N probe this caches. This is
 # the ONE "now" helper in the tree: memlib.sh's mc_elapsed_field is built on it.
-# NO_PYTHON=1 (a log field must never fork an interpreter): where the probe
-# below says `date` has no %N, answer in WHOLE SECONDS from `date +%s` (times
-# 1000) instead of the python fallback. Ladder: EPOCHREALTIME -> date +%3N ->
-# date +%s. Callers that omit it keep the python fallback unchanged.
+# Ladder: EPOCHREALTIME -> date +%3N -> perl Time::HiRes (ships with macOS,
+# about 4 ms a call; a whole-second clock would log a 20 ms hook that spans
+# a second boundary as elapsed=1.0s) -> python (unless NO_PYTHON=1) -> whole
+# seconds from `date +%s` (times 1000). NO_PYTHON=1 (a log field must never
+# fork an interpreter) skips the python rung only. Callers that omit it keep
+# the python fallback.
 mc_now_ms() {
     local py="${1:-python3}" nopy="${2:-}" probe
     if [ -n "${EPOCHREALTIME:-}" ]; then
@@ -194,11 +196,18 @@ mc_now_ms() {
         probe="$(date +%3N 2>/dev/null)"
         case "$probe" in
             [0-9][0-9][0-9]) MC_QUERY_MS_MODE="date" ;;
-            *) MC_QUERY_MS_MODE="python" ;;
+            *)
+                probe="$(perl -MTime::HiRes=time -e 'printf("%.0f\n", time()*1000)' 2>/dev/null)"
+                case "$probe" in
+                    ""|*[!0-9]*) MC_QUERY_MS_MODE="python" ;;
+                    *) [ "${#probe}" -ge 13 ] && MC_QUERY_MS_MODE="perl" || MC_QUERY_MS_MODE="python" ;;
+                esac ;;
         esac
     fi
     if [ "$MC_QUERY_MS_MODE" = "date" ]; then
         MC_NOW_MS="$(date +%s%3N 2>/dev/null)"
+    elif [ "$MC_QUERY_MS_MODE" = "perl" ]; then
+        MC_NOW_MS="$(perl -MTime::HiRes=time -e 'printf("%.0f\n", time()*1000)' 2>/dev/null)"
     elif [ "$nopy" = "1" ]; then
         MC_NOW_MS="$(( $(date +%s 2>/dev/null || echo 0) * 1000 ))"
     else
