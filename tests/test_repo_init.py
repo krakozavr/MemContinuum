@@ -178,7 +178,7 @@ def copy_engine(dst):
     # whole module) -- same reasoning as the chunkers/ copy below: a
     # copied checkout without it fails ModuleNotFoundError, not a
     # graceful skip.
-    for name in ("memidx.py", "mc_text.py", "memlint.py", "requirements.txt"):
+    for name in ("memidx.py", "mc_text.py", "mc_reuse.py", "memlint.py", "requirements.txt"):
         shutil.copy(TOOLS_DIR / name, dst / name)
     for name in ("hooks", "templates", "skills"):
         shutil.copytree(TOOLS_DIR / name, dst / name)

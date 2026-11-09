@@ -469,6 +469,118 @@ class TestContextPackFixRound1(PackCase):
 GOLDEN = TOOLS_DIR / "tests" / "goldens" / "for_path_concept"
 
 
+def inventory_row(rid, impl_path, pad=""):
+    return {"id": rid, "job": f"job of {rid}" + pad, "policy": "allowed_variants",
+            "implementation": f"{impl_path}#f", "contract": "c", "why_single": "w",
+            "related_paths": [], "variants": [{"symbol": f"{impl_path}#g", "contract": "c", "reason": "r"}],
+            "guards": [], "coverage_limit": "l", "evidence": "e", "test": "tests.test_c7_inventory.TestPositiveControls"}
+
+
+class TestContextPackInventory(PackCase):
+    """C7: the pack appends the reuse-inventory rows of the code repository it
+    is given (--code-root), inside the byte cap and the hash."""
+
+    def code_repo(self, rows):
+        repo = self.td / "code"
+        (repo / "docs").mkdir(parents=True, exist_ok=True)
+        (repo / "docs" / "C7-INVENTORY.json").write_text(json.dumps(
+            {"schema_version": 1, "scan_roots": ["."], "exclusions": ["tests"], "rows": rows}), encoding="utf-8")
+        return repo
+
+    def setUp(self):
+        super().setUp()
+        self.add("a", topic_text("TOP-9501", "Alpha", ["src/a.py"], "alpha ruling"))
+        self.reindex()
+        # --code-root also adds anchor lines, so "no inventory" baselines use a root without one.
+        self.bare = self.td / "bare"
+        self.bare.mkdir()
+
+    def plain(self, *args):
+        return self.pack_json(*args, "--code-root", str(self.bare))
+
+    def test_matching_rows_are_listed_under_the_label_inside_the_hash(self):
+        repo = self.code_repo([inventory_row("row-a", "src/a.py"), inventory_row("row-b", "src/b.py"),
+                               inventory_row("row-other", "src/other.py")])
+        out = self.pack("src/a.py", "src/b.py", "--code-root", str(repo))
+        text = self.text_part(out)
+        self.assertIn("Implementation policy (repository inventory)", text)
+        self.assertIn("[row-a] job of row-a", text)
+        self.assertIn("[row-b] job of row-b", text)
+        self.assertNotIn("row-other", text)
+        self.assertLess(text.index("TOP-9501"), text.index("Implementation policy"))
+        sha, nbytes, line = memidx.pack_hash_line(text)
+        self.assertEqual(out.rstrip("\n").rpartition("\n")[2], line)
+        j = self.pack_json("src/a.py", "src/b.py", "--code-root", str(repo))
+        self.assertEqual(j["inventory"], ["row-a", "row-b"])
+        self.assertEqual(j["inventory_omitted"], [])
+        self.assertEqual(j["sha256"], sha)
+
+    def test_without_a_code_root_or_an_inventory_the_pack_is_unchanged(self):
+        repo = self.code_repo([inventory_row("row-a", "src/a.py")])
+        self.assertNotIn("Implementation policy", self.pack("src/a.py"))      # no --code-root: never injected
+        j = self.plain("src/a.py")                                            # this repo carries none
+        self.assertNotIn("inventory", j)
+        self.assertNotIn("Implementation policy", j["text"])
+        self.assertEqual(self.pack("src/zzz.py", "--code-root", str(repo)).count("Implementation policy"), 0)
+
+    def test_an_unusable_inventory_is_ignored_not_fatal(self):
+        repo = self.td / "code"
+        (repo / "docs").mkdir(parents=True)
+        (repo / "docs" / "C7-INVENTORY.json").write_text("{not json", encoding="utf-8")
+        base = self.plain("src/a.py")
+        j = self.pack_json("src/a.py", "--code-root", str(repo))
+        self.assertEqual(j["text"].replace(str(repo), ""), base["text"].replace(str(self.bare), ""))
+        self.assertNotIn("inventory", j)
+
+    def test_cap_keeps_whole_rows_and_names_the_omitted_ids_inside_the_pack(self):
+        pad = " word" * 120
+        rows = [inventory_row("row-a", "src/a.py", pad), inventory_row("row-b", "src/a.py", pad),
+                inventory_row("row-c", "src/a.py", pad)]
+        repo = self.code_repo(rows)
+        full = self.pack_json("src/a.py", "--code-root", str(repo))
+        self.assertEqual(full["inventory_omitted"], [])
+        one_row = len(memidx.mc_reuse.render_row(rows[0]).encode("utf-8"))
+        cap = full["bytes"] - one_row - 20
+        j = self.pack_json("src/a.py", "--code-root", str(repo), "--max-bytes", str(cap))
+        self.assertLessEqual(j["bytes"], cap)
+        self.assertEqual(j["inventory"] + j["inventory_omitted"], ["row-a", "row-b", "row-c"])
+        self.assertTrue(j["inventory_omitted"])
+        self.assertEqual(j["inventory"], ["row-a", "row-b", "row-c"][:len(j["inventory"])])   # head rows, in order
+        m = re.search(r"\[(\d+) inventory row\(s\) omitted by the size cap: ([^\]]+)\]", j["text"])
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(2).split(", "), j["inventory_omitted"])
+        for rid in j["inventory"]:
+            self.assertIn(f"[{rid}] job of {rid}" + pad, j["text"])           # never cut mid-row
+        for rid in j["inventory_omitted"]:
+            self.assertNotIn(f"[{rid}] job of", j["text"])
+        self.assertEqual(j["sha256"], memidx.pack_hash_line(j["text"])[0])
+
+    def test_when_not_even_the_omission_line_fits_the_ids_go_to_the_envelope_only(self):
+        pad = " word" * 120
+        repo = self.code_repo([inventory_row("row-a", "src/a.py", pad)])
+        plain = self.plain("src/a.py")
+        j = self.pack_json("src/a.py", "--code-root", str(repo), "--max-bytes", str(plain["bytes"]))
+        self.assertLessEqual(j["bytes"], plain["bytes"])
+        self.assertEqual(j["inventory"], [])
+        self.assertEqual(j["inventory_omitted"], ["row-a"])
+        self.assertNotIn("inventory row(s) omitted", j["text"])
+        self.assertEqual(j["text"], plain["text"])
+
+    def test_decision_records_are_never_displaced_by_the_inventory(self):
+        pad = " word" * 400
+        repo = self.code_repo([inventory_row("row-a", "src/a.py", pad)])
+        plain = self.plain("src/a.py")
+        j = self.pack_json("src/a.py", "--code-root", str(repo), "--max-bytes", str(plain["bytes"] + 50))
+        self.assertIn("alpha ruling", j["text"])
+        self.assertEqual(j["omitted"], plain["omitted"])
+
+    def test_the_engines_own_inventory_is_selected_for_its_own_files(self):
+        out = self.pack("hooks/mc_nudge.py", "--code-root", str(TOOLS_DIR))
+        self.assertIn("[coverage-fact-sentence]", out)
+        self.assertIn("[coverage-question-sentence]", out)
+        self.assertNotIn("[join-semicolon-list]", out)
+
+
 class TestForPathConceptSnapshot(PackCase):
     """`for-path` output on a concept-governed path is byte-identical to the
     answer recorded before the shared resolver replaced its own composition."""
