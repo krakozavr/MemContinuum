@@ -2807,6 +2807,36 @@ class TestUndoReceipts(BindCase):
         self.assertNotIn("undo:", out)
         self.assertIn("remove", topic.read_text())
 
+    def test_a_bare_repository_gets_no_receipts(self):
+        bare = self.tmp / "bare.git"
+        git(["init", "-q", "--bare", str(bare)], self.tmp)
+        (bare / "topics").mkdir()
+        topic = bare / "topics" / "foo.md"
+        topic.write_text(binding_topic(code_refs=("src/other.py",)))
+        self.assertFalse(memidx._UndoScope(bare, topic, "TOP-1").enabled)
+        rc, out, err = run_memidx(["bind", "TOP-1", "src/foo.py", "--root", str(bare), "--code-root", str(self.code)])
+        self.assertEqual(rc, 0, err)
+        self.assertFalse((bare / "memcontinuum").exists())
+        rc, out, err = run_memidx(["unbind", "TOP-1", "src/foo.py", "--root", str(bare)])
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("undo:", out)
+
+    def test_ambient_git_variables_cannot_redirect_the_receipt_probes(self):
+        before = self.head_state(refs=())
+        other = git_store(self.tmp / "elsewhere")
+        env = {"GIT_DIR": str(other / ".git"), "GIT_WORK_TREE": str(other),
+               "GIT_INDEX_FILE": str(other / ".git" / "index")}
+        with mock.patch.dict(os.environ, env):
+            self.assertEqual(self.bind()[0], 0)
+        self.assertEqual(len(self.receipts()), 1)  # in THIS store's git directory
+        with mock.patch.dict(os.environ, env):
+            rc, out, err = self.unbind()
+        self.assertEqual(rc, 0, err)
+        self.assertIn("undo: restored", out)
+        self.assertEqual(self.raw(), before)
+        self.assertEqual(list((other / ".git").glob("memcontinuum*")), [])
+        self.assertGuardsClean()
+
     def test_a_linked_worktree_keeps_its_own_receipts(self):
         self.head_state(refs=())
         git(["worktree", "add", "-q", str(self.tmp / "wt")], self.store)

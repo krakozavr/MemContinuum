@@ -12837,6 +12837,17 @@ class TopicEditRefused(Exception):
     with "nothing written"."""
 
 
+def _git_env() -> dict:
+    """The environment for the receipt's git calls: the ambient GIT_DIR,
+    GIT_WORK_TREE, GIT_INDEX_FILE and GIT_COMMON_DIR removed (as the hooks do:
+    they would send the probes to some other repository or index) and paths read
+    literally, never as globs."""
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR")}
+    env["GIT_LITERAL_PATHSPECS"] = "1"
+    return env
+
+
 def _git_run(store: Path, args: list, data: bytes | None = None) -> tuple | None:
     """`(returncode, stdout)` of `git -C store ARGS` (stdin `data`), or None when
     git cannot be run or times out. Unlike `_git_call_budgeted`, which folds
@@ -12845,7 +12856,7 @@ def _git_run(store: Path, args: list, data: bytes | None = None) -> tuple | None
     from a failure."""
     try:
         done = subprocess.run(["git", "-C", str(store)] + args, input=data, capture_output=True,
-                              timeout=min(5.0, _git_ls_timeout()))
+                              timeout=min(5.0, _git_ls_timeout()), env=_git_env())
     except (OSError, subprocess.SubprocessError):
         return None
     return done.returncode, done.stdout.decode("utf-8", errors="replace")
@@ -13017,7 +13028,9 @@ class _UndoScope:
             self.rel = Path(os.path.realpath(topic_path)).relative_to(self.store).as_posix()
         except ValueError:
             self.rel = Path(topic_path).as_posix()
-        found = _git_run(self.store, ["rev-parse", "--git-path", "memcontinuum/receipts"])
+        # receipts exist only in a git WORK TREE (a bare repository or a plain directory gets none)
+        found = (_git_run(self.store, ["rev-parse", "--git-path", "memcontinuum/receipts"])
+                 if _inside_git_work_tree(self.store, _git_env()) else None)
         out = found[1].strip() if found and found[0] == 0 else ""
         self.rec_dir = (self.store / out) if out else None
         digest = hashlib.sha256(str(self.store).encode("utf-8")).hexdigest()[:10]
@@ -14510,12 +14523,13 @@ def _filing_ruling(args, ctx: dict, code_roots: list, strict: bool) -> dict:
             "source": args.source or ""}
 
 
-def _inside_git_work_tree(root: Path) -> bool:
+def _inside_git_work_tree(root: Path, env: dict | None = None) -> bool:
     """True when `root` is inside a git work tree (so a `git checkout` remedy
-    can work there)."""
+    can work there); a bare repository is not. `env` replaces the ambient
+    environment for the call (the undo receipts pass `_git_env()`)."""
     try:
         done = subprocess.run(["git", "-C", str(root), "rev-parse", "--is-inside-work-tree"],
-                              capture_output=True, text=True, timeout=30)
+                              capture_output=True, text=True, timeout=30, env=env)
     except (OSError, subprocess.SubprocessError):
         return False
     return done.returncode == 0 and done.stdout.strip() == "true"

@@ -3776,7 +3776,9 @@ takes it again, re-reads the topic and refuses (`TopicEditRefused`, nothing writ
 it still equals the image the command read, records the receipt and replaces the topic. The
 committed and staged entries and the topic bytes are read once more immediately before an
 undo replaces the file, because the lock does not serialize external git commands. `mark-standing` calls `apply_topic_edit` without a scope and is unchanged. A store
-outside git has no receipts. `undo-binding TOP-xxxx [--list]` shows the stack (newest
+outside a git work tree (a plain directory, a bare repository) has no receipts, and the receipts' git
+calls ignore the ambient `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE` and `GIT_COMMON_DIR`
+(they report the exit code, which `_git_call_budgeted` folds into None; that is why it is not used). `undo-binding TOP-xxxx [--list]` shows the stack (newest
 first, nothing changed) or runs the same `undo_plan` / restore for the latest receipt.
 
 **Derived authority for rows.** `mark-standing` has no `--authority`: it takes
