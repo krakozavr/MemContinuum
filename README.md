@@ -423,6 +423,14 @@ facts and recovery recipes stay in Claude Code's auto-memory, which keeps at
 most a one-line pointer to a store record. Never both; never copy content across
 the two.
 
+**Reusable jobs can be listed too.** A repository can keep `docs/C7-INVENTORY.json`: the jobs its
+code does in exactly one place (a joining helper, a sentence builder, a parser core), who owns each,
+and the checks that reject a second recognisable copy. `python3 mc_reuse.py` checks the list against
+the tree, and `context-pack <files> --code-root DIR` prints the rows for the files a brief touches
+after the decision records, so a dispatched agent reuses the owner instead of writing another. A check
+rejects recognisable copies, not every rewrite; each row says what its check misses
+([docs/INTERNALS.md](docs/INTERNALS.md), "The reuse inventory").
+
 **The commands a person actually types.** The store's own `README.md` lists
 most of these with your paths already filled in — not the code-index or
 maintenance commands (`code-search`, `code-reindex`, `embed-worker`, `code-embed-worker`, `stats`,
@@ -433,7 +441,7 @@ memidx.py why <symbol-or-path> --project NAME --code-root DIR                   
 memidx.py search "<question>" --project NAME --status active                     # search the decisions
 memidx.py code-search "<what it does>" --project NAME                            # find existing code (--tests / --all for test code)
 memidx.py for-path <file> --project NAME                                         # what governs this file?
-memidx.py context-pack <file>... --project NAME [--topic ID] [--query WORDS] [--blind] [--code-root DIR]  # decision records to paste at the top of a reviewer or agent brief (--code-root adds anchor lines)
+memidx.py context-pack <file>... --project NAME [--topic ID] [--query WORDS] [--blind] [--code-root DIR]  # decision records to paste at the top of a reviewer or agent brief (--code-root adds anchor lines and the repository's reuse-inventory rows)
 memidx.py propose-bindings --session ID --root STORE --project NAME [--write-inbox]       # this session's edits that a topic may want to bind (suggestions, never writes a reference)
 memidx.py anchor-backfill --root STORE --project NAME [--code-root DIR] [--dry-run]       # give already-bound files an anchor, labelled as captured late
 memidx.py chain <topic-id> --project NAME                                        # one question's full history

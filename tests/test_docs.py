@@ -122,7 +122,11 @@ FORBIDDEN = [
     # comment's own "M2a: ..." claim is now backed by a real test case
     # (test_forbidden_catches_a_store_record_id_and_a_finding_code_label),
     # not just asserted in prose.
-    ("internal plan/finding-code label", re.compile(r"\b[FDHMWCG]\d+[a-z]?\s*[—:\-]")),
+    # The one exemption: the reuse inventory's own file name, docs/C7-INVENTORY.json,
+    # is a shipped path, not a plan label (it is named in the README, INTERNALS,
+    # CHANGELOG and the routing-rule template).
+    ("internal plan/finding-code label",
+     re.compile(r"\b(?!C7-INVENTORY\.json)[FDHMWCG]\d+[a-z]?\s*[—:\-]")),
 ]
 
 PUBLIC_DOCS = [

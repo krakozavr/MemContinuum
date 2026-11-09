@@ -4022,6 +4022,78 @@ only a fixed notice that no decision records were supplied, plus its hash
 line, so a blind review is recorded as such and carries nothing
 memory-shaped.
 
+## The reuse inventory
+
+`docs/C7-INVENTORY.json` lists the jobs this engine implements once, the owner of
+each, and the deterministic checks that reject a recognisable second
+implementation. `mc_reuse.py` (stdlib only, no production module imported) loads
+it, scans the production tree and runs the checks; `tests/test_c7_inventory.py`
+runs it on every test run, and `memidx.py context-pack ... --code-root DIR`
+prints the rows that match a brief's files. The limit is stated up front: **a test
+can reject recognisable second implementations; it cannot recognise every
+rewritten implementation of the same job.** Each row therefore says what its own
+checks miss.
+
+**A row** is one contract a caller should reuse (a constant can own one). Fields:
+`id` (stable), `job`, `policy`, `implementation` (`path#qualified_symbol`),
+`contract`, `why_single` (what would drift if callers did it again),
+`related_paths` (consumers and relevant patterns, used to pick rows for a brief),
+`variants` (`symbol`, `contract`, `reason`), `guards` (`method` and `params`),
+`coverage_limit`, `evidence` (a plain title or rationale, never a record id), and
+`test` (`tests.<module>.<Class>[.<method>]`, resolved by the checker). `policy` is
+`singleton` (must name at least one guard), `allowed_variants` (a recorded
+deliberate multiplicity: members listed in `variants`, no guard) or `known_debt`
+(a temporary row: every current implementation in `variants`, the intended
+resolution in `why_single`, never guarded and always rendered as "KNOWN DEBT, not
+guarded"). The top level carries `schema_version`, `scan_roots` and
+`exclusions` once, not per row; tests, fixtures, benchmark corpora, documentation,
+the store, caches and vendored code are outside the scan.
+
+**The scan.** Python definitions (functions, methods, nested functions, module
+constants) are read with `ast`. Shell functions are read by a bounded scanner: the
+forms `name() {` and `function name {`, a body ending at the first `}` on its own
+line at the declaration's indentation (or on the declaration line); `name() (` and
+other forms are reported, never guessed at. Comments (whole-line and trailing,
+quote-aware) and heredoc bodies are dropped. Python inside shell is scanned as
+Python: a heredoc fed to an interpreter (`python - <<'EOF'`, `"$MC_PY" - <<'EOF'`)
+and a single-quoted `<interpreter> -c '...'` payload. Not scanned: double-quoted
+`-c "..."` payloads, Python held in a shell variable, extension-less scripts. A
+registered symbol the scanner cannot read fails with a diagnostic naming the
+supported forms; an embedded payload that does not parse and holds a guarded token
+is reported rather than skipped.
+
+**The methods** (only these exist):
+
+| method | rejects | misses |
+|---|---|---|
+| `name_owner` | another definition (function or constant, any language in scope, embedded payloads included) whose simple name matches the owner's name pattern (default: the owner's exact name) | a copy under another name |
+| `exact_copy` | a function whose normalised body equals the owner's: its own name, docstring, locations and consistently renamed local bindings are ignored; literals, attributes, operators, decorators and external dependencies are kept. Shell: comments, indentation, spacing and `local` names are normalised | a structural rewrite; tiny helpers can collide, so enable it per row after checking |
+| `token_owner` | a second unit (an outermost function, a method, or a file's residual code) whose executable text contains the owner's construct; owners are counted, not occurrences, and a stale pattern (the owner no longer holds it) fails too. `paths` narrows the units considered | the construct built from pieces; text in comments or docstrings is deliberately not matched |
+| `delegation` | a named consumer that does not reference the owner (`refs`), or that contains a `forbid` pattern (a direct call that bypasses it) | consumers that are not named |
+| `vocab_owner` | a literal set, tuple or list of strings equal to the owner's vocabulary anywhere else (variants are exempt by name) | a vocabulary built in code, or a different subset |
+
+**Adding a row.** Find the existing implementation first and name it (code-search),
+write the row in the same change that adds or moves the owner, give every guard the
+narrowest pattern that identifies the job, and state in `coverage_limit` what the
+guards cannot see. A deliberate second implementation is a `variants` entry (and, if
+it is a separate pairing worth recording, an `allowed_variants` row), not a loosened
+pattern. Moving an owner, weakening a guard or adding an exception belongs in the
+same reviewed change; the checker names the affected row. `python3 mc_reuse.py`
+runs the whole check from the checkout root and prints the scan time.
+
+**Context pack.** With `--code-root DIR` and files, the rows whose owner file,
+variant file or `related_paths` match a file are rendered after the decision
+records, under "Implementation policy (repository inventory)", inside the byte cap
+and the hash. Decision records and anchor lines take their space first; the rows
+that follow are whole rows from the head of the inventory, the rest named in an
+omission line (always in the JSON envelope as `inventory` / `inventory_omitted`).
+The inventory is read only from the code root given, never from another project;
+a missing or unusable inventory contributes nothing.
+
+**Finding new jobs** is not a test. Which second implementations exist that no
+row lists yet is a measurement a person judges; a confirmed job joins the
+inventory together with its consolidation and a guard that discriminates it.
+
 ## Filing
 
 `record`, `append` and `promote` are three entry points to one writer.
