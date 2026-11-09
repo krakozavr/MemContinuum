@@ -2985,6 +2985,75 @@ class TestUndoReceipts(BindCase):
         self.assertNotIn("undo:", out)
         self.assertIn("remove", topic.read_text())
 
+    def _unrelated_commit_over_a_bind(self, committed_b):
+        """B (committed as-is, or B0 plus an unstaged ruling), bind -> A, then the topic is replaced by
+        unrelated C and C is committed. Returns (B, A, C)."""
+        self.head_state(refs=())
+        if not committed_b:
+            edited = self.text().replace("current: L1", "current: L2").replace(
+                "links:\n", "links:\n" + link_yaml("L2", text="a newer ruling"), 1)
+            self.path.write_text(edited)
+        before = self.raw()
+        self.assertEqual(self.bind()[0], 0)
+        after = self.raw()
+        self.path.write_bytes(after + b"\n<!-- unrelated -->\n")
+        git(["add", "topics/foo.md"], self.store)
+        git(["commit", "-q", "-m", "unrelated content"], self.store)
+        return before, after, self.raw()
+
+    def test_a_clean_tree_does_not_drop_a_receipt_whose_before_image_was_never_committed(self):
+        # gate round 2 (Grok Q1): the receipt is the only copy of the unstaged ruling
+        before, after, other = self._unrelated_commit_over_a_bind(committed_b=False)
+        rc, out, err = self.unbind()
+        self.assertEqual(rc, 1, (out, err))
+        self.assertIn("does not contain it", err)
+        self.assertIn("undo-binding TOP-1 --discard", err)
+        self.assertIn("nothing written", err)
+        self.assertEqual((self.raw(), len(self.receipts())), (other, 1))
+        rc, out, err = run_memidx(["undo-binding", "TOP-1", "--discard", "--dry-run", "--root", str(self.store)])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("would drop the receipt of the uncommitted bind of src/foo.py", out)
+        self.assertEqual(len(self.receipts()), 1)
+        rc, out, err = run_memidx(["undo-binding", "TOP-1", "--discard", "--root", str(self.store)])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("undo-binding: dropped the receipt of the uncommitted bind of src/foo.py (pending: add row for "
+                      "src/foo.py", out)
+        self.assertIn("; nothing written", out)
+        self.assertEqual((self.raw(), self.receipts()), (other, []))
+        rc, out, err = self.unbind()  # now the ordinary path: a remove row, a receipt of its own
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("undo:", out)
+        self.assertEqual([(r["ref"], r["action"]) for r in memidx.ref_mark_rows(self.fm())][0],
+                         ("src/foo.py", "remove"))
+        self.assertEqual(len(self.receipts()), 1)
+
+    def test_a_clean_tree_drops_a_receipt_whose_before_image_is_still_in_a_commit(self):
+        before, after, other = self._unrelated_commit_over_a_bind(committed_b=True)
+        rc, out, err = self.unbind()
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("undo:", out)
+        self.assertNotIn("committed history", out)
+        self.assertIn("remove", self.text())
+        self.assertEqual(len(self.receipts()), 1)  # only the new unbind's receipt
+        self.assertGuardsClean()
+
+    def test_discard_on_an_empty_stack_exits_1(self):
+        before = self.head_state(refs=())
+        rc, out, err = run_memidx(["undo-binding", "TOP-1", "--discard", "--root", str(self.store)])
+        self.assertEqual(rc, 1, (out, err))
+        self.assertIn("no undo receipts", err)
+        self.assertEqual(self.raw(), before)
+
+    def test_discard_drops_only_the_latest_receipt(self):
+        before = self.head_state(refs=())
+        self.assertEqual(self.bind("src/other.py")[0], 0)
+        self.assertEqual(self.bind("src/foo.py")[0], 0)
+        self.assertEqual(len(self.receipts()), 2)
+        mid = self.raw()
+        rc, out, err = run_memidx(["undo-binding", "TOP-1", "--discard", "--root", str(self.store)])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual((self.raw(), len(self.receipts())), (mid, 1))
+
     def test_a_retry_after_a_failed_directory_initialisation_fsyncs_the_whole_chain(self):
         # gate round 2 (Sol 2): directories left by the failed attempt are not skipped
         before = self.head_state(refs=())

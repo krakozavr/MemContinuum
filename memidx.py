@@ -13187,6 +13187,25 @@ class _UndoScope:
                                    "nothing written") from exc
 
 
+def _clean_and_before_committed(scope: "_UndoScope", receipt: "_Receipt", current: bytes,
+                                committed: dict, staged: dict) -> bool:
+    """True when a receipt whose committed baseline has moved on may be dropped
+    without a loss: the topic's bytes and its stage-zero index entry both equal
+    HEAD's entry (compared by raw blob identity), AND the receipt's before-image
+    is the very blob its recorded baseline holds, so that image is still in a
+    commit. A before-image that was never committed (an unstaged edit on top of
+    the baseline) stays in the receipt."""
+    base = receipt.committed
+    if (committed.get("kind") != "entry" or committed["mode"] not in _FILE_MODES
+            or base.get("kind") != "entry"):
+        return False
+    if (staged.get("kind") != "entry" or staged.get("stage") != 0
+            or (staged["mode"], staged["oid"]) != (committed["mode"], committed["oid"])):
+        return False
+    return (_blob_oid(scope.store, current) == committed["oid"]
+            and _blob_oid(scope.store, receipt.before) == base["oid"])
+
+
 def undo_plan(scope: "_UndoScope", current: bytes, command: str | None, ref: str | None) -> tuple:
     """`(kind, receipt, message, notes)`. kind: "none" (no receipt applies: the
     ordinary path), "refuse" (message names the pending row and the ways out;
@@ -13255,11 +13274,15 @@ def undo_plan(scope: "_UndoScope", current: bytes, command: str | None, ref: str
         if not matches:
             return "none", None, None, notes
         if _norm_committed(committed) != _norm_committed(top.committed):
+            if _clean_and_before_committed(scope, top, current, committed, staged):
+                scope.drop(top)  # the tree is clean and B is still in a commit: nothing is lost
+                return "none", None, None, notes
             return "refuse", top, (
                 f"the committed {topic} changed after {action} but does not contain it; commit the "
                 f"pending edit first, then {reverse}, or restore the file with `git restore "
-                f"--source=HEAD --worktree -- {topic}` if it carries no other pending edit "
-                f"(pending: {top.row()}); nothing written"), notes
+                f"--source=HEAD --worktree -- {topic}` if it carries no other pending edit, or "
+                f"`memidx.py undo-binding {scope.topic_id} --discard` to drop the receipt without "
+                f"writing (pending: {top.row()}); nothing written"), notes
         if current != top.after:
             return "refuse", top, (
                 f"the topic changed after {action}; commit first, then "
@@ -13692,9 +13715,34 @@ def cmd_unbind(args) -> int:
     return 0
 
 
+def _discard_latest_receipt(scope: "_UndoScope", args) -> int:
+    """`undo-binding --discard`: under the topic lock drop the latest receipt
+    (nothing else) and write nothing. rc 1 when the stack is empty."""
+    try:
+        with scope.locked():
+            scope.stack()
+            scope.prune_invalid()
+            stack = scope.stack()
+            if not stack:
+                print(f"undo-binding: no undo receipts for {args.topic}; nothing written", file=sys.stderr)
+                return 1
+            top = stack[-1]
+            what = f"the receipt of the uncommitted {top.command} of {top.ref} (pending: {top.row()})"
+            if args.dry_run:
+                print(f"undo-binding: would drop {what}; nothing written")
+                return 0
+            scope.drop(top)
+    except TopicEditRefused as exc:
+        print(f"undo-binding: {exc}", file=sys.stderr)
+        return 1
+    print(f"undo-binding: dropped {what}; nothing written")
+    return 0
+
+
 def cmd_undo_binding(args) -> int:
-    """`memidx.py undo-binding TOP-xxxx --root STORE [--list] [--dry-run]` --
-    show the topic's undo receipts (`--list`, newest first) or undo the latest
+    """`memidx.py undo-binding TOP-xxxx --root STORE [--list|--discard] [--dry-run]` --
+    show the topic's undo receipts (`--list`, newest first), drop the latest one
+    without writing the topic (`--discard`), or undo the latest
     one under the conditions `bind`/`unbind` apply automatically (the topic
     still equals the receipt's after-image, its committed and staged entries are the
     recorded ones). rc 1: nothing to undo, or the receipt no longer applies
@@ -13717,6 +13765,8 @@ def cmd_undo_binding(args) -> int:
             base = r.committed["kind"] + (f" {r.committed['oid'][:7]}" if r.committed["kind"] == "entry" else "")
             print(f"#{r.seq} {r.command} {r.ref}  baseline={base}  {r.written_at}  {r.row()}")
         return 0
+    if args.discard:
+        return _discard_latest_receipt(scope, args)
     undone = _undo_front(scope, "undo-binding", args, root, path, None, None)
     if undone is None:
         print(f"undo-binding: no undo receipt applies to {args.topic}; nothing written", file=sys.stderr)
@@ -15702,7 +15752,10 @@ def main(argv=None) -> int:
     add_common_args(p_undo, need_root=True)
     p_undo.add_argument("topic", metavar="TOP-xxxx")
     p_undo.add_argument("--list", action="store_true", help="show the receipt stack, newest first; change nothing")
-    p_undo.add_argument("--dry-run", action="store_true", help="print the exact diff, write nothing")
+    p_undo.add_argument("--discard", action="store_true",
+                        help="drop the latest receipt without writing the topic (the way out of a refusal "
+                             "that keeps a receipt)")
+    p_undo.add_argument("--dry-run", action="store_true", help="print the exact diff (or the receipt that would be dropped), write nothing")
     p_undo.set_defaults(func=cmd_undo_binding)
 
     p_mark = sub.add_parser(
