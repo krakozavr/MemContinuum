@@ -3675,7 +3675,7 @@ anchored=False)` requires that no anchor row names the ref; the matching rule st
 the same way. A prefix or glob is relative to a code root: an absolute path or
 any `..` segment is refused, and a prefix's directory, with symlinks resolved on both
 sides, must be a code root or lie under one (`unanchored_ref_problem`). A prefix naming no directory,
-one that resolves outside the roots, or a `#symbol` on a prefix or glob, is
+one whose resolved directory leaves the roots (it then counts as naming no existing directory), or a `#symbol` on a prefix or glob, is
 refused with rc 1, and a directory written without its trailing slash exits 2
 ("not anchorable"); a `path#symbol` with two or more
 matching chunks writes nothing and says "symbol ambiguous"; with zero matches

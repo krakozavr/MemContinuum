@@ -2528,9 +2528,9 @@ def _is_topic_like(result: ParseResult) -> bool:
 # link) `superseded`; it is immutable once set, and may never be present
 # when status is not `superseded`. `promoted_by` (ruling 143) may be ADDED
 # once, with no such status coupling -- SCHEMA section 5 step 3: a later
-# owner-ratified link promotes an agent-inference/provisional one by
-# appending a NEW link and adding `promoted_by: L<n>` to the OLD link,
-# whatever its own status; it is immutable once set, exactly like
+# owner-ratified link promotes an agent-inference, reviewer-finding or
+# code-derived one (status active or provisional) by appending a NEW link and
+# adding `promoted_by: L<n>` to the OLD link, whatever its own status; it is immutable once set, exactly like
 # `superseded_by`. `link` (the id) is excluded from the generic body-field
 # diff below for a different reason -- it is the key callers already match
 # old/new links by, so it is definitionally equal and never worth its own

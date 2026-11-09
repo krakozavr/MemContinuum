@@ -759,6 +759,13 @@ def _drop_note_shape_violations(path: Path, fm: dict, diagnostics: list) -> list
     note."""
     kept: list = []
     for field, message in diagnostics:
+        if (field, message) == METADATA_TYPE_SHAPE_DIAGNOSTIC and isinstance(fm.get("metadata"), dict):
+            # Grok round 1: drop only the offending key; sibling `metadata` keys stay.
+            del fm["metadata"]["type"]
+            new_message = "metadata.type: not a scalar string; ignored"
+            print(f"memidx: WARNING: {path}: {new_message}", file=sys.stderr)
+            kept.append((field, new_message))
+            continue
         if "." in field or "[" in field or field not in fm:
             kept.append((field, message))
             continue
@@ -4392,17 +4399,13 @@ def unanchored_ref_problem(code_ref: str, code_roots: list) -> str | None:
         return None
     if not raw_path.endswith("/"):
         return f"{ref!r} is not a prefix (a prefix ends with '/') or a glob"
-    found_dir = False
     for r in code_roots:
         real_root = os.path.realpath(str(r))
         real_dir = os.path.realpath(os.path.join(real_root, raw_path.rstrip("/")))
-        if not os.path.isdir(real_dir):
-            continue
-        found_dir = True
-        if real_dir == real_root or real_dir.startswith(real_root.rstrip(os.sep) + os.sep):
+        # a directory that resolves outside the root (a symlink out) counts as not existing under it
+        if os.path.isdir(real_dir) and (
+                real_dir == real_root or real_dir.startswith(real_root.rstrip(os.sep) + os.sep)):
             return None
-    if found_dir:
-        return f"prefix {ref!r} resolves outside the code root(s) (a symlink leaves the root)"
     return f"prefix {ref!r} names no existing directory under the code root(s)"
 
 
@@ -12857,7 +12860,7 @@ def cmd_bind(args) -> int:
     is written (TOP-0137 L29; `unanchored_ref_problem` is the check, the
     matching rule stays `code_ref_matches`). rc 2: a directory named without its
     trailing slash; rc 1: topic or file missing, a prefix naming no directory
-    or resolving outside the code roots (symlinks included), an absolute or
+    or whose resolved directory leaves the code roots (symlinks included), an absolute or
     `..` prefix/glob, symbol ambiguous, other failure."""
     root = Path(args.root).resolve()
     ref = args.ref

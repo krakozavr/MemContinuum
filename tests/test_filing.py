@@ -473,15 +473,20 @@ class TestPromote(FilingCase):
 
     def test_a_reviewer_finding_or_derivation_promotes(self):
         for authority in ("reviewer-finding", "code-derived"):
-            with self.subTest(authority=authority):
-                self.prov.write_text(PROVISIONAL_TOPIC.replace("authority: agent-inference\n      source: s",
-                                                               f"authority: {authority}\n      source: s"))
-                self.commit(authority)
-                self.head0 = self.head()
-                self.write_transcript()
-                rc, out, err = self.run_cmd("promote", "TOP-9101", "L1", "--session", SID,
-                                            "--yes-message", YES_UUID)
-                self.assertEqual(rc, 0, err)
+            for status in ("provisional", "active"):
+                with self.subTest(authority=authority, status=status):
+                    text = PROVISIONAL_TOPIC.replace("authority: agent-inference\n      source: s",
+                                                     f"authority: {authority}\n      source: s")
+                    if status == "active":
+                        text = text.replace("status: provisional", "status: active").replace(
+                            "links:\n", "current: L1\nlinks:\n", 1)
+                    self.prov.write_text(text)
+                    self.commit(f"{authority} {status}")
+                    self.head0 = self.head()
+                    self.write_transcript()
+                    rc, out, err = self.run_cmd("promote", "TOP-9101", "L1", "--session", SID,
+                                                "--yes-message", YES_UUID)
+                    self.assertEqual(rc, 0, err)
 
     def test_superseded_owner_tier_and_already_promoted_links_are_refused(self):
         self.write_transcript()
@@ -489,7 +494,11 @@ class TestPromote(FilingCase):
         owner = PROVISIONAL_TOPIC.replace("authority: agent-inference\n      source: s",
                                           "authority: owner-verbatim\n      source: s")
         promoted = PROVISIONAL_TOPIC.replace("    kind: adopted\n", "    kind: adopted\n    promoted_by: L2\n")
+        historical = PROVISIONAL_TOPIC.replace("status: provisional", "status: historical")
+        declined = PROVISIONAL_TOPIC.replace("status: provisional", "status: declined")
         for name, text, needle in (("superseded", superseded, "cannot be promoted"),
+                                   ("historical", historical, "cannot be promoted"),
+                                   ("declined", declined, "cannot be promoted"),
                                    ("owner-verbatim", owner, "cannot be promoted"),
                                    ("promoted", promoted, "already carries promoted_by")):
             with self.subTest(case=name):

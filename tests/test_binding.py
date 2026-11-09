@@ -546,7 +546,7 @@ class TestBind(unittest.TestCase):
                 self.assertEqual(rc, 1, (out, err))
                 self.assertEqual(self.topic(), before)
         self.assertIn("relative to a code root", self.bind("/tmp/")[2])
-        self.assertIn("resolves outside", self.bind("src/leak/")[2])
+        self.assertIn("no existing directory", self.bind("src/leak/")[2])
         rc, out, err = self.bind("src/alias/")
         self.assertEqual(rc, 0, err)
         self.assertIn("src/alias/", memidx.parse_record_text(self.topic(), "x").frontmatter["code_refs"])

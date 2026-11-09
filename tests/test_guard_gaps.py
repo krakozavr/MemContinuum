@@ -792,6 +792,24 @@ class TestNonScalarTypeUnderAgainstRef(GuardCase):
         self.store(self._listy())
         self.assertClean(ttext([]))
 
+    def test_staged_bad_types_beside_a_ruling_edit_exit_1_and_report_the_edit(self):
+        """Grok round 1: the crash used to hide the summary, so the pre-commit hook read the
+        run as an engine failure and let the commit through."""
+        root = self.store(ttext([]))
+        for name, bad in (("list.md", "type: [topic, weird]\n"), ("map.md", "type: {a: b}\n")):
+            (root / "topics" / name).write_text(
+                ttext([], tid="TOP-9105" if name == "list.md" else "TOP-9106").replace("type: topic\n", bad, 1))
+        foo = root / "topics" / "foo.md"
+        foo.write_text(foo.read_text().replace('"fourth"', '"fourth, edited"', 1))
+        git(["add", "-A"], root)
+        (root / "topics" / "list.md").unlink()
+        (root / "topics" / "map.md").unlink()
+        rc, out = run_memlint(["--against-ref", "HEAD", "--staged", str(root)])
+        self.assertEqual(rc, 1, out)
+        self.assertNotIn("unexpected failure", out)
+        self.assertIn("type must be a scalar string (added file)", out)
+        self.assertRegex(out, r"changed=[1-9]")
+
     # R1-2: a REF valid under the OLD rules (type: topic, an ignored non-string metadata.type) was
     # delivered as `topic`; the string rule now quarantines it, which must not release its freeze.
     @staticmethod

@@ -906,6 +906,19 @@ class TestMalformedRecordDiagnostics(unittest.TestCase):
             self.assertEqual(errors, [], errors)
             self.assertTrue(any("type: not a scalar string; ignored" in w for w in warnings), warnings)
 
+    def test_a_note_with_a_bad_metadata_type_keeps_its_other_metadata_keys(self):
+        """Grok round 1: only `metadata.type` is dropped on the note path."""
+        text = "---\ntitle: my note\nmetadata:\n  type: [x, y]\n  source: keep-me\n---\nBody.\n"
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "notes" / "note.md"
+            _write(path, text)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                res = memidx.parse_record(path)
+            self.assertTrue(res.valid, res)
+            self.assertEqual(res.frontmatter["metadata"], {"source": "keep-me"})
+            self.assertIn("metadata.type: not a scalar string; ignored", err.getvalue())
+
     def test_link_with_no_id_is_an_error_naming_links_link(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
