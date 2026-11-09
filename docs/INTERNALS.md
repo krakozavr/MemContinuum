@@ -4108,7 +4108,10 @@ JSON envelope always carries `inventory_error`, a list of `{path, reason}`.
 
 **Finding new jobs** is not a test. Which second implementations exist that no
 row lists yet is a measurement a person judges; a confirmed job joins the
-inventory together with its consolidation and a guard that discriminates it.
+inventory together with its consolidation and a guard that discriminates it. The
+discovery protocol -- how duplicates are FOUND, as opposed to how the known ones are
+guarded here -- is a maintainer measurement that lives outside the checker and is
+recorded in the project's design notes, not in this repository.
 
 ## Filing
 
