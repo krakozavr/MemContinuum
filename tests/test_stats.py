@@ -1102,6 +1102,24 @@ class TestStatsPreCommitBucket(StatsTestBase):
         self.assertEqual(pcm["skipped"], 1)
         self.assertEqual(pcm["outcomes"]["skipped:engine-failure"], 1)
 
+    def test_pre_commit_engine_failure_refusal_is_counted_as_refused(self):
+        """TOP-0137 L32: `rc=<n> engine-failure refused` (a guard crash that
+        refused the commit, rc 1 or 2) is a refusal with its own sub-count,
+        never `rc:<n>` and never a plain finding refusal."""
+        lines = [
+            f"{ts(1)} pre-commit-append-only: rc=2 engine-failure refused schema=ok project=demo",
+            f"{ts(1)} pre-commit-append-only: rc=1 engine-failure refused schema=ok project=demo",
+            f"{ts(1)} pre-commit-append-only: rc=1 changed=1 notes=0 schema=ok project=demo",
+        ]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home), project="demo")
+        self.assertEqual(rc, 0)
+        pcm = out["pre_commit"]
+        self.assertEqual(pcm["refused"], 3)
+        self.assertEqual(pcm["refused_engine_failure"], 2)
+        self.assertEqual(pcm["outcomes"]["refused-engine-failure"], 2)
+        self.assertNotIn("rc:2", pcm["outcomes"])
+
 
 class TestStatsFallbackBucket(StatsTestBase):
     """search fallback: `stats` tallies outcome=search-fallback/-empty

@@ -11579,12 +11579,16 @@ def _scan_hook_log(log_path: Path, cutoff: datetime, now: datetime):
             # This producer carries no `outcome=` field at all (see
             # _hook_log_line_kind) -- its own fields are `rc=`/`changed=`
             # on a pass/refusal, or `skipped=<reason>` (sometimes alongside
-            # its own `rc=`, e.g. `skipped=engine-failure rc=2`) on a
-            # fail-open skip. `skipped=` is checked first since a line can
-            # carry both.
+            # its own `rc=`) on a fail-open skip or an operator override
+            # (`skipped=engine-failure override=1 rc=2`). A guard crash that
+            # REFUSED the commit reads `rc=<n> engine-failure refused` (any rc,
+            # TOP-0137 L32) and is counted apart from a finding-based refusal.
+            # `skipped=` is checked first since a line can carry both.
             skip_reason = fields.get("skipped")
             if skip_reason:
                 outcome_key = f"skipped:{skip_reason}"
+            elif " engine-failure refused" in f" {rest}":
+                outcome_key = "refused-engine-failure"
             elif fields.get("rc") == "0":
                 outcome_key = "pass"
             elif fields.get("rc") == "1":
@@ -11820,7 +11824,8 @@ def _stats_report(
     cs = outcomes["code-search"]
     pcm = outcomes["pre-commit"]
     pcm_pass = pcm.get("pass", 0)
-    pcm_refused = pcm.get("refused", 0)
+    pcm_refused_engine = pcm.get("refused-engine-failure", 0)
+    pcm_refused = pcm.get("refused", 0) + pcm_refused_engine
     pcm_skipped = sum(v for k, v in pcm.items() if k.startswith("skipped:"))
 
     # search-fallback (TOP-0133 L1): VIEWS over the fallback_* counters
@@ -11942,6 +11947,7 @@ def _stats_report(
         "pre_commit": {
             "pass": pcm_pass,
             "refused": pcm_refused,
+            "refused_engine_failure": pcm_refused_engine,
             "skipped": pcm_skipped,
             "outcomes": dict(pcm),
         },
@@ -12119,7 +12125,8 @@ def cmd_stats(args) -> int:
               f"index-upgrade-required={pc['index_upgrade_required']}")
         pcm = result["pre_commit"]
         print(f"pre-commit (store append-only guard): pass={pcm['pass']} "
-              f"refused={pcm['refused']} skipped={pcm['skipped']}")
+              f"refused={pcm['refused']} (engine-failure={pcm['refused_engine_failure']}) "
+              f"skipped={pcm['skipped']}")
         csr = result["code_search"]
         print(f"code-search (agent calls): ok={csr['ok']} no-hits={csr['no_hits']} "
               f"error={csr['error']}")

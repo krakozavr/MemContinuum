@@ -62,18 +62,26 @@
 # ABOUT RUNNING THE CHECK failed (skipped=<reason>: MEMCONTINUUM_ROOT
 # unset, the invoking repo is not-the-store (Codex 1 -- this wrapper fired
 # for a commit outside MEMCONTINUUM_ROOT, e.g. a shared core.hooksPath),
-# an unborn HEAD, no python, or EITHER memlint invocation erroring out
-# with no recognizable summary line -- an uncaught exception (a broken
-# $MEMCONTINUUM_PYTHON, e.g. a venv missing a dependency memlint imports)
-# exits 1 exactly like a real finding, so both checks below are trusted
-# only together with their own summary-line marker, never RC alone) --
-# fail-open for infrastructure, fail-closed only for a genuine finding.
+# an unborn HEAD, no python, or the schema pass erroring out with no
+# recognizable summary line). TOP-0137 L32: when the guard CANNOT RUN the
+# hook fails open; when the append-only run STARTED and crashed (RC=2, or
+# any RC without its `changed=` marker -- an uncaught exception exits 1
+# exactly like a real finding, so the check is trusted only together with
+# its summary-line marker, never RC alone) the commit is REFUSED, the
+# engine's output is printed, and the log line reads `rc=<n> engine-failure
+# refused`. MC_STORE_LINT_ALLOW_ENGINE_FAILURE=1 overrides it for one commit
+# (log: `skipped=engine-failure override=1`).
 # `git commit --no-verify` bypasses this hook entirely, same as any git
 # hook; the real guarantee against a rewritten or unfenced history for a
 # store other machines/CI also touch is a protected branch plus this same
 # check run in CI, not this hook alone.
 
 set -u
+# TOP-0137 L32: the override is read from the launching environment HERE, before
+# any `source` (the watchdog library sources config.sh, whose assignments must
+# not be able to enable it); the decision below uses only this private copy.
+MC_PC_OVERRIDE_IN="${MC_STORE_LINT_ALLOW_ENGINE_FAILURE:-}"
+readonly MC_PC_OVERRIDE_IN
 export PYTHONPATH=
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
@@ -187,8 +195,9 @@ esac
 # while the hook keeps working, followed by a second line, previously
 # disagreed with what actually happened.
 
-# The verdict parsing (marker trust: `changed=` must be present, else an
-# engine failure that fails OPEN) lives in hooks/mc-store-lint.sh.
+# The verdict parsing (marker trust: `changed=` must be present, else the run
+# is classified as an engine failure, which refuses the commit below) lives in
+# hooks/mc-store-lint.sh.
 mc_store_lint_append_only "$PY" "$MEMLINT" "$MEMCONTINUUM_ROOT" HEAD
 case "$MC_LINT_APPEND" in
     ok)
@@ -202,7 +211,19 @@ case "$MC_LINT_APPEND" in
         ;;
 esac
 
-# Anything else (RC=2, a crash, no recognizable summary line at all) is an
-# ENGINE failure, not a history edit -- fail open.
-log_line "skipped=engine-failure rc=$MC_LINT_APPEND_RC $SCHEMA_NOTE project=$PROJECT"
-exit 0
+# Anything else (RC=2, a crash, no recognizable summary line at all) means
+# the engine RAN and failed to judge the commit. TOP-0137 L32: that fails
+# CLOSED -- a crash inside the guard must not let a history edit through
+# (PR #60's gate: a TypeError in the guard was classified as an engine
+# failure and the edit passed). The cases where the guard CANNOT RUN (unborn
+# HEAD, no python, cwd not the store, no lint lib, root unset) were already
+# skipped above and stay fail-open. An operator who must commit anyway sets
+# MC_STORE_LINT_ALLOW_ENGINE_FAILURE=1 for that one commit.
+if [ "$MC_PC_OVERRIDE_IN" = "1" ]; then
+    log_line "skipped=engine-failure override=1 rc=$MC_LINT_APPEND_RC $SCHEMA_NOTE project=$PROJECT"
+    exit 0
+fi
+echo "$MC_LINT_APPEND_OUT" >&2
+echo "memcontinuum: the store's append-only check crashed (rc=$MC_LINT_APPEND_RC) and could not judge this commit; refusing it. To commit anyway: MC_STORE_LINT_ALLOW_ENGINE_FAILURE=1 git commit ..." >&2
+log_line "rc=$MC_LINT_APPEND_RC engine-failure refused $SCHEMA_NOTE project=$PROJECT"
+exit 1

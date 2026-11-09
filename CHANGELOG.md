@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Commit guard refuses on a crash; honest latency bars
+
+Three small corrections. The store's commit guard used to let a commit through when the check itself
+crashed, which is how a history edit once slipped past it; now a crash refuses the commit, prints the
+engine's output and names the one-commit override (`MC_STORE_LINT_ALLOW_ENGINE_FAILURE=1`), which is read
+from the launching environment only, never from the sourced `config.sh`, while a guard that simply cannot
+run (no history yet, no Python, wrong folder) still lets the commit through; `memidx.py stats` counts a
+crash refusal as refused and shows it as its own sub-count. The hook latency tests now hold a hook to its
+own watchdog budget rather than a literal second, and the SessionEnd hook's log line carries `elapsed=`
+like the other hooks do, at no measurable cost.
+
+    Technical: `hooks/pre-commit-append-only.sh` on `MC_LINT_APPEND=engine-failure` logs `rc=<n> engine-failure refused`, prints the output plus the override line and exits 1 (override: `skipped=engine-failure override=1`; the unborn-HEAD, no-python, not-the-store, no-lint-lib and root-unset skips are unchanged); the hook reads the override into a readonly `MC_PC_OVERRIDE_IN` before sourcing anything; `memidx.py stats` counts `rc=<n> engine-failure refused` under `refused` and adds `refused_engine_failure`; `assert_hook_logged_under_one_second` becomes `assert_hook_logged_within_budget` (the hook's `elapsed=` against the test env's `MC_WATCHDOG_BUDGET`, default 2 s, or SessionEnd's fixed 1.2 s; 5 s hang guard kept); `sessionend-stamp.sh` appends `$(mc_elapsed_field)` to its line (six runs, 89-94 ms wall before and after).
+
 ### Filing tools stop sending agents into dead ends
 
 Four small gaps in the tools that file and bind decisions. `bind` now accepts a directory prefix

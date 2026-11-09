@@ -3982,7 +3982,7 @@ class TestPreCommitAppendOnlyHook(unittest.TestCase):
         self.assertIn("pre-commit-append-only: schema-rc=1", log_text)
         self.assertIn("project=unfenced-proj", log_text)
 
-    def test_broken_python_crash_is_fail_open_not_a_schema_block(self):
+    def test_broken_python_crash_is_not_a_schema_block_but_refuses_the_commit(self):
         """Re-gate MAJOR: `$MEMCONTINUUM_PYTHON` pointing at an executable
         that CAN be launched but crashes before printing memlint's own
         summary line (the reviewer's own repro -- a venv missing PyYAML,
@@ -3995,7 +3995,9 @@ class TestPreCommitAppendOnlyHook(unittest.TestCase):
         after it, both memlint invocations fail the same way (schema AND
         append-only alike -- the crash has nothing to do with argv), each
         recognized as an engine failure by its own missing summary-line
-        marker, and the commit is let through."""
+        marker. TOP-0137 L32: the schema crash alone stays a skip, but the
+        append-only run STARTED and crashed, so the commit is REFUSED (it
+        used to be let through) and the message names the override."""
         tmp = tempfile.mkdtemp(prefix="memcontinuum-precommit-crash-")
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         home = Path(tmp) / "home"
@@ -4022,12 +4024,130 @@ class TestPreCommitAppendOnlyHook(unittest.TestCase):
         proc = subprocess.run(
             [MC_BASH, str(PRE_COMMIT_HOOK)], capture_output=True, text=True, env=env, timeout=15, cwd=store,
         )
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("MC_STORE_LINT_ALLOW_ENGINE_FAILURE=1 git commit", proc.stderr)
+        self.assertIn("ModuleNotFoundError", proc.stderr)
         log_text = (home / "hook.log").read_text()
         self.assertIn("schema=skipped-engine-failure", log_text)
-        self.assertIn("skipped=engine-failure", log_text)
+        self.assertIn("rc=1 engine-failure refused", log_text)
         self.assertIn("project=crash-proj", log_text)
         self.assertNotIn("schema-rc=1", log_text)
+
+    def _run_with_stub_that_exits_2(self, extra_env=None, config_sh=None):
+        tmp = tempfile.mkdtemp(prefix="memcontinuum-precommit-rc2-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        home = Path(tmp) / "home"
+        home.mkdir()
+        if config_sh is not None:
+            (home / "config.sh").write_text(config_sh)
+        store = _init_topic_store(Path(tmp) / "store")
+        text = _prepend_new_link((store / "topics" / "foo.md").read_text())
+        (store / "topics" / "foo.md").write_text(text)
+        _git(["add", "-A"], cwd=store)
+        fake_py = Path(tmp) / "fake-python-exits-2"
+        fake_py.write_text(
+            "#!/usr/bin/env bash\n"
+            'echo "TypeError: unhashable type: list" >&2\n'
+            "exit 2\n"
+        )
+        fake_py.chmod(0o755)
+        env = clean_env(
+            HOME=str(tmp), MEMCONTINUUM_HOME=str(home), MEMCONTINUUM_ROOT=str(store),
+            MEMCONTINUUM_PROJECT="rc2-proj", MEMCONTINUUM_PYTHON=str(fake_py),
+            **(extra_env or {}),
+        )
+        proc = subprocess.run(
+            [MC_BASH, str(PRE_COMMIT_HOOK)], capture_output=True, text=True, env=env, timeout=15, cwd=store,
+        )
+        return proc, (home / "hook.log").read_text()
+
+    def test_engine_crash_rc2_refuses_the_commit_and_names_the_override(self):
+        """TOP-0137 L32: the engine ran and crashed (rc 2, no `changed=`
+        summary) -- the commit is refused, the engine output is printed,
+        one line names the override."""
+        proc, log_text = self._run_with_stub_that_exits_2()
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("TypeError: unhashable type: list", proc.stderr)
+        self.assertIn("MC_STORE_LINT_ALLOW_ENGINE_FAILURE=1 git commit", proc.stderr)
+        self.assertIn("rc=2 engine-failure refused", log_text)
+
+    def test_engine_crash_with_the_override_lets_the_commit_through(self):
+        proc, log_text = self._run_with_stub_that_exits_2(
+            {"MC_STORE_LINT_ALLOW_ENGINE_FAILURE": "1"})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("skipped=engine-failure override=1", log_text)
+        self.assertNotIn("refused", log_text)
+
+    def test_the_override_set_only_in_config_sh_does_not_let_a_crash_through(self):
+        """TOP-0137 L32 (gate round 1): the override comes from the launching
+        environment only; an assignment in the sourced config.sh (exported or
+        not) is not an operator's decision for this commit."""
+        for line in ("MC_STORE_LINT_ALLOW_ENGINE_FAILURE=1\n",
+                     "export MC_STORE_LINT_ALLOW_ENGINE_FAILURE=1\n"):
+            with self.subTest(config=line):
+                proc, log_text = self._run_with_stub_that_exits_2(config_sh=line)
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertIn("rc=2 engine-failure refused", log_text)
+                self.assertNotIn("override=1", log_text)
+
+    def test_config_sh_cannot_set_or_clear_the_captured_override(self):
+        """TOP-0137 L32 (gate round 2): the captured copy is readonly, so a
+        sourced config.sh assigning it neither enables a bypass nor clears an
+        operator's real override."""
+        proc, log_text = self._run_with_stub_that_exits_2(config_sh="MC_PC_OVERRIDE_IN=1\n")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("rc=2 engine-failure refused", log_text)
+        self.assertNotIn("override=1", log_text)
+        proc, log_text = self._run_with_stub_that_exits_2(
+            {"MC_STORE_LINT_ALLOW_ENGINE_FAILURE": "1"}, config_sh="MC_PC_OVERRIDE_IN=\n")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("skipped=engine-failure override=1", log_text)
+
+    def test_the_override_in_the_environment_wins_over_a_config_sh_without_it(self):
+        proc, log_text = self._run_with_stub_that_exits_2(
+            {"MC_STORE_LINT_ALLOW_ENGINE_FAILURE": "1"}, config_sh="# nothing\n")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("override=1", log_text)
+
+    def test_real_commit_refused_on_engine_crash_then_allowed_with_override(self):
+        tmp = tempfile.mkdtemp(prefix="memcontinuum-precommit-rc2-real-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        home = Path(tmp) / "home"
+        home.mkdir()
+        store = _init_topic_store(Path(tmp) / "store")
+        fake_py = Path(tmp) / "fake-python-exits-2"
+        fake_py.write_text('#!/usr/bin/env bash\necho "boom" >&2\nexit 2\n')
+        fake_py.chmod(0o755)
+        hooks_dir = Path(_git(["rev-parse", "--git-path", "hooks"], cwd=store).stdout.strip())
+        if not hooks_dir.is_absolute():
+            hooks_dir = store / hooks_dir
+        wrapper = hooks_dir / "pre-commit"
+        wrapper.write_text(
+            "#!/usr/bin/env bash\n"
+            f"export MEMCONTINUUM_ROOT={shlex.quote(str(store))}\n"
+            "export MEMCONTINUUM_PROJECT=rc2-real-proj\n"
+            f"export MEMCONTINUUM_PYTHON={shlex.quote(str(fake_py))}\n"
+            f"export MEMCONTINUUM_HOME={shlex.quote(str(home))}\n"
+            f'exec "{MC_BASH}" {shlex.quote(str(PRE_COMMIT_HOOK))}\n'
+        )
+        wrapper.chmod(0o755)
+        env = clean_env(HOME=str(tmp))
+        for k in list(env):
+            if k.startswith("MEMCONTINUUM_"):
+                del env[k]
+        (store / "topics" / "foo.md").write_text(
+            _prepend_new_link((store / "topics" / "foo.md").read_text()))
+        _git(["add", "-A"], cwd=store)
+        head_before = _git(["rev-parse", "HEAD"], cwd=store).stdout.strip()
+        base = ["git", "-c", "user.email=t@example.com", "-c", "user.name=T", "commit", "-q", "-m", "x"]
+        proc = subprocess.run(base, cwd=str(store), capture_output=True, text=True, env=env, timeout=20)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("MC_STORE_LINT_ALLOW_ENGINE_FAILURE=1", proc.stderr)
+        self.assertEqual(head_before, _git(["rev-parse", "HEAD"], cwd=store).stdout.strip())
+        env["MC_STORE_LINT_ALLOW_ENGINE_FAILURE"] = "1"
+        proc = subprocess.run(base, cwd=str(store), capture_output=True, text=True, env=env, timeout=20)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotEqual(head_before, _git(["rev-parse", "HEAD"], cwd=store).stdout.strip())
 
 
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
