@@ -473,17 +473,17 @@ def inventory_row(rid, impl_path, pad=""):
     return {"id": rid, "job": f"job of {rid}" + pad, "policy": "allowed_variants",
             "implementation": f"{impl_path}#f", "contract": "c", "why_single": "w",
             "related_paths": [], "variants": [{"symbol": f"{impl_path}#g", "contract": "c", "reason": "r"}],
-            "guards": [], "coverage_limit": "l", "evidence": "e", "test": "tests.test_c7_inventory.TestPositiveControls"}
+            "guards": [], "coverage_limit": "l", "evidence": "e", "test": "tests.test_reuse_inventory.TestPositiveControls"}
 
 
 class TestContextPackInventory(PackCase):
-    """C7: the pack appends the reuse-inventory rows of the code repository it
+    """The pack appends the reuse-inventory rows of the code repository it
     is given (--code-root), inside the byte cap and the hash."""
 
     def code_repo(self, rows):
         repo = self.td / "code"
         (repo / "docs").mkdir(parents=True, exist_ok=True)
-        (repo / "docs" / "C7-INVENTORY.json").write_text(json.dumps(
+        (repo / "docs" / "REUSE-INVENTORY.json").write_text(json.dumps(
             {"schema_version": 1, "scan_roots": ["."], "exclusions": ["tests"], "rows": rows}), encoding="utf-8")
         return repo
 
@@ -526,7 +526,7 @@ class TestContextPackInventory(PackCase):
     def test_an_unusable_inventory_is_ignored_not_fatal(self):
         repo = self.td / "code"
         (repo / "docs").mkdir(parents=True)
-        (repo / "docs" / "C7-INVENTORY.json").write_text("{not json", encoding="utf-8")
+        (repo / "docs" / "REUSE-INVENTORY.json").write_text("{not json", encoding="utf-8")
         base = self.plain("src/a.py")
         j = self.pack_json("src/a.py", "--code-root", str(repo))
         self.assertEqual(j["text"].replace(str(repo), ""), base["text"].replace(str(self.bare), ""))

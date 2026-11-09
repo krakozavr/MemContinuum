@@ -4,10 +4,10 @@
 
 ### A list of the jobs the code does once, and a check that keeps it so
 
-The engine now carries `docs/C7-INVENTORY.json`: the jobs it implements in exactly one place (the semicolon
+The engine now carries `docs/REUSE-INVENTORY.json`: the jobs it implements in exactly one place (the semicolon
 list join, the two coverage sentences, the filing authorities, the byte-span walker, the millisecond clock,
 the two commit-time lint runs, the record parser), the owner of each, and what a second copy would look
-like. A test (`tests/test_c7_inventory.py`) fails when a recognisable second implementation appears: the
+like. A test (`tests/test_reuse_inventory.py`) fails when a recognisable second implementation appears: the
 same name, a renamed copy of the same body, a second owner of a guarded construct (including inside the
 Python the hooks embed), or a caller that goes around the owner. Deliberate variants (the three chunker
 backends, the two link classifiers, the parser adapters) are recorded with their reason instead of

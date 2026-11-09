@@ -1,4 +1,4 @@
-"""The reuse inventory (docs/C7-INVENTORY.json) and its checker (mc_reuse.py).
+"""The reuse inventory (docs/REUSE-INVENTORY.json) and its checker (mc_reuse.py).
 
 The production tree passes; for every guard method a fixture tree -- a COPY of
 the production tree in a temp dir, never the real one -- with a second
@@ -31,12 +31,12 @@ class FixtureTree:
     @classmethod
     def base(cls):
         if cls._base is None:
-            cls._base = Path(tempfile.mkdtemp(prefix="c7-base-"))
+            cls._base = Path(tempfile.mkdtemp(prefix="reuse-base-"))
             shutil.copytree(TOOLS_DIR, cls._base / "t", ignore=_COPY_IGNORE)
         return cls._base / "t"
 
     def __init__(self, test):
-        self.root = Path(tempfile.mkdtemp(prefix="c7-fixture-")) / "t"
+        self.root = Path(tempfile.mkdtemp(prefix="reuse-fixture-")) / "t"
         test.addCleanup(shutil.rmtree, self.root.parent, True)
         shutil.copytree(self.base(), self.root)
 
@@ -60,10 +60,10 @@ class FixtureTree:
         return mc_reuse.check_inventory(self.root, check_tests=False)
 
     def inventory(self):
-        return json.loads(self.read("docs/C7-INVENTORY.json"))
+        return json.loads(self.read("docs/REUSE-INVENTORY.json"))
 
     def save_inventory(self, inv):
-        self.write("docs/C7-INVENTORY.json", json.dumps(inv))
+        self.write("docs/REUSE-INVENTORY.json", json.dumps(inv))
 
 
 def only(findings, row_id, method=None):
@@ -338,7 +338,7 @@ class TestPositiveControls(unittest.TestCase):
 
 
 def _mini(test, files, inv_mutator=None):
-    root = Path(tempfile.mkdtemp(prefix="c7-mini-"))
+    root = Path(tempfile.mkdtemp(prefix="reuse-mini-"))
     test.addCleanup(shutil.rmtree, root, True)
     for rel, text in files.items():
         p = root / rel
@@ -350,7 +350,7 @@ def _mini(test, files, inv_mutator=None):
 def _row(**over):
     base = {"id": "r1", "job": "j", "policy": "singleton", "implementation": "a.py#f", "contract": "c",
             "why_single": "w", "related_paths": [], "variants": [], "guards": [{"method": "name_owner", "params": {}}],
-            "coverage_limit": "l", "evidence": "e", "test": "tests.test_c7_inventory.TestSchema"}
+            "coverage_limit": "l", "evidence": "e", "test": "tests.test_reuse_inventory.TestSchema"}
     base.update(over)
     return base
 

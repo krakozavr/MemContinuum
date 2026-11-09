@@ -4024,10 +4024,10 @@ memory-shaped.
 
 ## The reuse inventory
 
-`docs/C7-INVENTORY.json` lists the jobs this engine implements once, the owner of
+`docs/REUSE-INVENTORY.json` lists the jobs this engine implements once, the owner of
 each, and the deterministic checks that reject a recognisable second
 implementation. `mc_reuse.py` (stdlib only, no production module imported) loads
-it, scans the production tree and runs the checks; `tests/test_c7_inventory.py`
+it, scans the production tree and runs the checks; `tests/test_reuse_inventory.py`
 runs it on every test run, and `memidx.py context-pack ... --code-root DIR`
 prints the rows that match a brief's files. The limit is stated up front: **a test
 can reject recognisable second implementations; it cannot recognise every

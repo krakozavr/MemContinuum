@@ -7266,7 +7266,7 @@ CONTEXT_PACK_INVENTORY_HEADER = (
 
 
 def pack_inventory_rows(code_roots, files: list) -> list:
-    """The reuse-inventory rows (mc_reuse.py, docs/C7-INVENTORY.json) that
+    """The reuse-inventory rows (mc_reuse.py, docs/REUSE-INVENTORY.json) that
     match `files`, from the code repositories the pack was given with
     --code-root -- selected per repository, never from another project's
     inventory. A root without an inventory, or with an unusable one,

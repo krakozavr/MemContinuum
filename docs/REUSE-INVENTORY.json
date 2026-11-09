@@ -57,8 +57,8 @@
         }
       ],
       "coverage_limit": "Shell only: finds a function named join_semi anywhere in the scan roots and a function whose normalised body equals the owner's (comments, indentation and `local` names ignored). A join written inline in a loop, or under another name with a different shape, is not recognised.",
-      "evidence": "The C7 reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
-      "test": "tests.test_c7_inventory.TestProductionTree"
+      "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
+      "test": "tests.test_reuse_inventory.TestProductionTree"
     },
     {
       "id": "coverage-fact-sentence",
@@ -104,8 +104,8 @@
       ],
       "coverage_limit": "Finds the sentence fragments only as string literals inside executable code (Python units and extracted python payloads); the same words built from pieces, held in a shell variable, or inside a double-quoted -c payload are not seen.",
       "variants": [],
-      "evidence": "The C7 reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
-      "test": "tests.test_c7_inventory.TestProductionTree"
+      "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
+      "test": "tests.test_reuse_inventory.TestProductionTree"
     },
     {
       "id": "coverage-question-sentence",
@@ -145,8 +145,8 @@
       ],
       "coverage_limit": "Same as the fact builder: string literals in executable Python only.",
       "variants": [],
-      "evidence": "The C7 reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
-      "test": "tests.test_c7_inventory.TestProductionTree"
+      "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
+      "test": "tests.test_reuse_inventory.TestProductionTree"
     },
     {
       "id": "filing-typed-authorities",
@@ -183,8 +183,8 @@
         }
       ],
       "coverage_limit": "Finds a literal set, tuple or list of strings equal to the owner's anywhere in the scanned Python (including extracted payloads). A vocabulary built programmatically, or a different subset, is not recognised. The hold-eligibility set is exempted by name; if it is ever made to coincide on purpose it stays a separate role.",
-      "evidence": "The C7 reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
-      "test": "tests.test_c7_inventory.TestProductionTree"
+      "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
+      "test": "tests.test_reuse_inventory.TestProductionTree"
     },
     {
       "id": "hold-eligible-authorities",
@@ -205,9 +205,9 @@
         }
       ],
       "coverage_limit": "No guard: the pair is a recorded exception to the filing-vocabulary row, which exempts it by name.",
-      "test": "tests.test_c7_inventory.TestPositiveControls",
+      "test": "tests.test_reuse_inventory.TestPositiveControls",
       "guards": [],
-      "evidence": "The C7 reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)"
+      "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)"
     },
     {
       "id": "link-raw-spans",
@@ -248,8 +248,8 @@
       ],
       "coverage_limit": "Recognises the name, a renamed copy with the same normalised body, and the named freeze consumers reaching it. A structural rewrite of span extraction under another name, or a consumer not listed here, is not recognised.",
       "variants": [],
-      "evidence": "The C7 reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
-      "test": "tests.test_c7_inventory.TestProductionTree"
+      "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
+      "test": "tests.test_reuse_inventory.TestProductionTree"
     },
     {
       "id": "anchor-identity",
@@ -286,8 +286,8 @@
       ],
       "coverage_limit": "Name pattern, renamed exact copy, and the anchor-freeze consumer reaching it. A differently shaped identity function under another name is not recognised.",
       "variants": [],
-      "evidence": "The C7 reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
-      "test": "tests.test_c7_inventory.TestProductionTree"
+      "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
+      "test": "tests.test_reuse_inventory.TestProductionTree"
     },
     {
       "id": "shell-millisecond-clock",
@@ -337,8 +337,8 @@
       ],
       "coverage_limit": "Shell clocks only: the perl Time::HiRes invocation must stay in the owner, and the three elapsed-timing hooks must call it without a clock of their own. Clocks in other languages are outside this contract.",
       "variants": [],
-      "evidence": "The C7 reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
-      "test": "tests.test_c7_inventory.TestProductionTree"
+      "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
+      "test": "tests.test_reuse_inventory.TestProductionTree"
     },
     {
       "id": "store-lint-schema",
@@ -378,8 +378,8 @@
       ],
       "coverage_limit": "Checks that the two commit hooks call the owner and do not invoke memlint with the lint shape directly. A third hook that runs the lint another way is only caught by the name pattern.",
       "variants": [],
-      "evidence": "The C7 reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
-      "test": "tests.test_c7_inventory.TestProductionTree"
+      "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
+      "test": "tests.test_reuse_inventory.TestProductionTree"
     },
     {
       "id": "store-lint-append-only",
@@ -428,8 +428,8 @@
       ],
       "coverage_limit": "Only the hook-side invocation of the append-only lint is owned; --against-ref in memlint's argument handling, adapters and documentation is legitimate and is not scanned (hooks/ shell only).",
       "variants": [],
-      "evidence": "The C7 reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
-      "test": "tests.test_c7_inventory.TestProductionTree"
+      "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
+      "test": "tests.test_reuse_inventory.TestProductionTree"
     },
     {
       "id": "record-text-parser",
@@ -495,8 +495,8 @@
         }
       ],
       "coverage_limit": "Recognises the name, a renamed exact copy, the adapters delegating, and memlint reaching the parser through them. Unrelated YAML loading elsewhere is deliberately not prohibited.",
-      "evidence": "The C7 reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
-      "test": "tests.test_c7_inventory.TestProductionTree"
+      "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
+      "test": "tests.test_reuse_inventory.TestProductionTree"
     },
     {
       "id": "parser-adapters",
@@ -521,9 +521,9 @@
         }
       ],
       "coverage_limit": "No guard: the singleton row for the parser core exempts and checks them.",
-      "test": "tests.test_c7_inventory.TestPositiveControls",
+      "test": "tests.test_reuse_inventory.TestPositiveControls",
       "guards": [],
-      "evidence": "The C7 reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)"
+      "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)"
     },
     {
       "id": "chunker-declared-symbols",
@@ -556,9 +556,9 @@
         }
       ],
       "coverage_limit": "No guard: the backend families are recorded exceptions. This does not exempt unrelated code anywhere under chunkers/.",
-      "test": "tests.test_c7_inventory.TestPositiveControls",
+      "test": "tests.test_reuse_inventory.TestPositiveControls",
       "guards": [],
-      "evidence": "The C7 reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)"
+      "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)"
     },
     {
       "id": "chunker-chunk-file",
@@ -591,9 +591,9 @@
         }
       ],
       "coverage_limit": "No guard: the backend families are recorded exceptions.",
-      "test": "tests.test_c7_inventory.TestPositiveControls",
+      "test": "tests.test_reuse_inventory.TestPositiveControls",
       "guards": [],
-      "evidence": "The C7 reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)"
+      "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)"
     },
     {
       "id": "chunker-doc-extraction",
@@ -626,9 +626,9 @@
         }
       ],
       "coverage_limit": "No guard: the backend families are recorded exceptions.",
-      "test": "tests.test_c7_inventory.TestPositiveControls",
+      "test": "tests.test_reuse_inventory.TestPositiveControls",
       "guards": [],
-      "evidence": "The C7 reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)"
+      "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)"
     },
     {
       "id": "link-classification",
@@ -649,9 +649,9 @@
         }
       ],
       "coverage_limit": "No guard: do not force one classifier through the other merely to reduce the definition count.",
-      "test": "tests.test_c7_inventory.TestPositiveControls",
+      "test": "tests.test_reuse_inventory.TestPositiveControls",
       "guards": [],
-      "evidence": "The C7 reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)"
+      "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)"
     }
   ]
 }

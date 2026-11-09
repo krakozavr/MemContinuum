@@ -73,7 +73,7 @@ class TestRoutingRuleTemplate(unittest.TestCase):
 
     def test_names_the_reuse_inventory_sentence(self):
         text = TEMPLATE.read_text()
-        self.assertIn("docs/C7-INVENTORY.json", text)
+        self.assertIn("docs/REUSE-INVENTORY.json", text)
         self.assertIn("--code-root <repo>", text)
         self.assertIn("reuses the named owner", text)
 

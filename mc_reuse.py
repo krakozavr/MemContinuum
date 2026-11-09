@@ -1,4 +1,4 @@
-"""mc_reuse.py -- the reuse inventory checker (docs/C7-INVENTORY.json).
+"""mc_reuse.py -- the reuse inventory checker (docs/REUSE-INVENTORY.json).
 
 The inventory names jobs the engine implements ONCE (a joining helper, a
 sentence builder, a parser core) and the deterministic guards that reject a
@@ -47,7 +47,7 @@ METHODS = ("name_owner", "exact_copy", "token_owner", "delegation", "vocab_owner
 ROW_FIELDS = ("id", "job", "policy", "implementation", "contract", "why_single", "related_paths",
               "variants", "guards", "coverage_limit", "evidence", "test")
 TOP_FIELDS = ("schema_version", "scan_roots", "exclusions", "rows")
-INVENTORY_RELPATH = "docs/C7-INVENTORY.json"
+INVENTORY_RELPATH = "docs/REUSE-INVENTORY.json"
 
 _INTERP = r"(?:python[\w.]*|\$\{?\w*PY\w*\}?)"
 _HEREDOC_RE = re.compile(r"(?<!<)<<(?!<)(-?)\s*(['\"]?)([A-Za-z_]\w*)\2")
@@ -1056,7 +1056,7 @@ def load_for_code_root(code_root) -> dict | None:
 
 def main(argv=None) -> int:
     import argparse
-    ap = argparse.ArgumentParser(description="Check docs/C7-INVENTORY.json against the tree.")
+    ap = argparse.ArgumentParser(description="Check docs/REUSE-INVENTORY.json against the tree.")
     ap.add_argument("root", nargs="?", default=".")
     args = ap.parse_args(argv)
     root = Path(args.root)

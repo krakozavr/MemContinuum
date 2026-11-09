@@ -423,7 +423,7 @@ facts and recovery recipes stay in Claude Code's auto-memory, which keeps at
 most a one-line pointer to a store record. Never both; never copy content across
 the two.
 
-**Reusable jobs can be listed too.** A repository can keep `docs/C7-INVENTORY.json`: the jobs its
+**Reusable jobs can be listed too.** A repository can keep `docs/REUSE-INVENTORY.json`: the jobs its
 code does in exactly one place (a joining helper, a sentence builder, a parser core), who owns each,
 and the checks that reject a second recognisable copy. `python3 mc_reuse.py` checks the list against
 the tree, and `context-pack <files> --code-root DIR` prints the rows for the files a brief touches
