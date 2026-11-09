@@ -8,7 +8,7 @@ Typed the wrong reference, or bound and then changed your mind before committing
 command (`unbind` after `bind`, `bind` after `unbind`) on the same reference now puts the topic file back
 exactly as it was before the first command, every byte, anchors and pending edits included, and says so.
 If the file or the staged copy has changed since, or the topic's committed text changed without the
-first command in it, it refuses without writing and names the way out (commit first, or `git restore`);
+first command in it, it refuses without writing and names the way out (commit first, or `git restore`) -- unless the tree is clean and the earlier bytes are still in a commit, in which case the receipt is dropped and the command continues as an ordinary edit; every other changed commit refuses and names `--discard`;
 once the first command is committed it is history and the opposite command is an ordinary new edit, as
 before. Committing some other file in between changes nothing. `memidx.py undo-binding TOP-xxxx [--list]` lists the
 pending undo records or undoes the latest one, and `--discard` drops the latest one without touching the topic when a refusal names it as the way out.
