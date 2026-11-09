@@ -255,7 +255,8 @@ class Unit:
     lineno: int
     end_lineno: int
     text: str
-    refs: frozenset
+    calls: frozenset    # names EXECUTED here: python Call targets, shell command words
+    loads: frozenset    # python value references (Name loads, attributes); shell: = calls
 
 
 @dataclass
@@ -353,19 +354,23 @@ def _unit_text(node) -> str:
         return ast.dump(n)
 
 
-def _refs_of(node) -> frozenset:
-    out = set()
+def _calls_and_loads(node):
+    """`(calls, loads)` of a Python node: the names it CALLS (`f(...)` and
+    `x.f(...)`) and the names it merely loads as values. A bare import is
+    neither."""
+    calls, loads = set(), set()
     for n in ast.walk(node):
-        if isinstance(n, ast.Name):
-            out.add(n.id)
+        if isinstance(n, ast.Call):
+            f = n.func
+            if isinstance(f, ast.Name):
+                calls.add(f.id)
+            elif isinstance(f, ast.Attribute):
+                calls.add(f.attr)
+        elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+            loads.add(n.id)
         elif isinstance(n, ast.Attribute):
-            out.add(n.attr)
-        elif isinstance(n, (ast.Import, ast.ImportFrom)):
-            for a in n.names:
-                out.add(a.name.split(".")[-1])
-                if a.asname:
-                    out.add(a.asname)
-    return frozenset(out)
+            loads.add(n.attr)
+    return frozenset(calls), frozenset(loads)
 
 
 def _scan_python(scan, rel, text, line_offset, embedded, prefix):
@@ -413,9 +418,10 @@ def _scan_python(scan, rel, text, line_offset, embedded, prefix):
     residual = []
 
     def unit_for(node, qual):
+        calls, loads = _calls_and_loads(node)
         scan.units.append(Unit(
             path=rel, qual=prefix + qual, lang="py", lineno=node.lineno + line_offset,
-            end_lineno=node.end_lineno + line_offset, text=_unit_text(node), refs=_refs_of(node)))
+            end_lineno=node.end_lineno + line_offset, text=_unit_text(node), calls=calls, loads=loads))
 
     for st in tree.body:
         if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -437,9 +443,10 @@ def _scan_python(scan, rel, text, line_offset, embedded, prefix):
             rtext = ast.unparse(mod)
         except Exception:
             rtext = ast.dump(mod)
+        rcalls, rloads = _calls_and_loads(ast.Module(body=residual, type_ignores=[]))
         scan.units.append(Unit(path=rel, qual=prefix + "<module>", lang="py", lineno=1 + line_offset,
                                end_lineno=(tree.body[-1].end_lineno if tree.body else 1) + line_offset,
-                               text=rtext, refs=_refs_of(ast.Module(body=residual, type_ignores=[]))))
+                               text=rtext, calls=rcalls, loads=rloads))
 
 
 # -- shell -------------------------------------------------------------------
@@ -598,18 +605,189 @@ def _scan_shell(scan, rel, text):
     covered = set()
     for s, e, name in outer:
         body = "\n".join(masked[s:e + 1])
+        cw = frozenset(_sh_command_words(body))
         scan.units.append(Unit(path=rel, qual=name, lang="sh", lineno=s + 1, end_lineno=e + 1,
-                               text=body, refs=frozenset(_sh_words(body))))
+                               text=body, calls=cw, loads=cw))
         covered.update(range(s, e + 1))
     res = "\n".join(masked[k] for k in range(n) if k not in covered)
+    cw = frozenset(_sh_command_words(res))
     scan.units.append(Unit(path=rel, qual="<script>", lang="sh", lineno=1, end_lineno=n, text=res,
-                           refs=frozenset(_sh_words(res))))
+                           calls=cw, loads=cw))
     for first_line, src in payloads:
         _scan_python(scan, rel, src, first_line - 1, True, f"<embedded L{first_line}>.")
 
 
-def _sh_words(text):
-    return re.findall(r"[A-Za-z_]\w*", text)
+_SH_KEEP_CMD = frozenset({"if", "then", "elif", "else", "while", "until", "do", "time", "exec", "command",
+                          "builtin", "!"})
+_SH_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _sh_command_words(text: str) -> set:
+    """The identifiers that appear in COMMAND position of `text` (shell with
+    comments and heredoc bodies already removed): the first word of a simple
+    command after optional `VAR=value` assignments, and after `$(`, a backtick,
+    `|`, `&&`, `||`, `;`, `&`, a newline, `!`, `{`, `(`, and the keywords
+    if/then/elif/else/while/until/do/time/exec/command/builtin. Words inside
+    single quotes, arguments (of `type`, `declare -f`, `command -v`, `hash`,
+    `unset`, ...) and the name in a `name() {` / `function name {` declaration
+    are not command words. A bounded tokenizer, not a Bash parser."""
+    words = set()
+    n = len(text)
+    i = 0
+    expect = True          # the next word starts a simple command
+    dq = False             # inside double quotes
+    cur_assign = False     # the word being read is a `VAR=value` assignment (expect survives it)
+    skip_name = False      # the previous word was `function`: the next word is a name
+    stack = []             # one entry per open `$(`, `(` or backtick: (kind, saved_dq, saved_expect)
+    boundary = True
+    while i < n:
+        c = text[i]
+        if c == "\\":
+            i += 2
+            continue
+        if dq:
+            if c == '"':
+                dq = False
+            elif text.startswith("$((", i):
+                j = text.find("))", i + 3)
+                i = n if j < 0 else j + 2
+                continue
+            elif text.startswith("$(", i):
+                stack.append(("p", dq, expect if cur_assign else False))
+                dq, expect, cur_assign, boundary = False, True, False, True
+                i += 2
+                continue
+            elif c == "`":
+                if stack and stack[-1][0] == "b":
+                    _, dq, expect = stack.pop()
+                else:
+                    stack.append(("b", dq, expect if cur_assign else False))
+                    dq, expect, cur_assign, boundary = False, True, False, True
+            i += 1
+            continue
+        if c == "'":
+            j = text.find("'", i + 1)
+            i = n if j < 0 else j + 1
+            if not cur_assign:
+                expect = False
+            boundary = False
+            continue
+        if c == '"':
+            dq = True
+            if not cur_assign:
+                expect = False
+            boundary = False
+            i += 1
+            continue
+        if text.startswith("${", i):
+            depth, j = 0, i + 1
+            while j < n:
+                if text[j] == "{":
+                    depth += 1
+                elif text[j] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            i = j + 1
+            if not cur_assign:
+                expect = False
+            boundary = False
+            continue
+        if text.startswith("$((", i):
+            j = text.find("))", i + 3)
+            i = n if j < 0 else j + 2
+            boundary = False
+            continue
+        if text.startswith("$(", i):
+            stack.append(("p", dq, expect if cur_assign else False))
+            expect, cur_assign, boundary = True, False, True
+            i += 2
+            continue
+        if c == "`":
+            if stack and stack[-1][0] == "b":
+                _, dq, expect = stack.pop()
+                boundary = False
+            else:
+                stack.append(("b", dq, expect if cur_assign else False))
+                expect, cur_assign, boundary = True, False, True
+            i += 1
+            continue
+        if c == "(":
+            stack.append(("s", dq, False))
+            expect, cur_assign, boundary = True, False, True
+            i += 1
+            continue
+        if c == ")":
+            if stack:
+                _, dq, expect = stack.pop()
+            else:
+                expect = True      # a case pattern's `)`
+            cur_assign = False
+            boundary = True
+            i += 1
+            continue
+        if c == "\n" or c in ";&|":
+            expect, cur_assign, boundary, skip_name = True, False, True, False
+            i += 1
+            continue
+        if c in " \t":
+            cur_assign = False
+            boundary = True
+            i += 1
+            continue
+        if c in "<>":
+            boundary = True
+            i += 1
+            continue
+        if boundary and c in "{}" and (i + 1 >= n or text[i + 1] in " \t\n;"):
+            expect = c == "{"
+            i += 1
+            continue
+        if boundary and (c == "!" and (i + 1 >= n or text[i + 1] in " \t")):
+            i += 1
+            continue
+        m = _SH_IDENT_RE.match(text, i) if boundary else None
+        if m and expect:
+            word, j = m.group(0), m.end()
+            if j < n and text[j] == "=" and not text.startswith("==", j):
+                cur_assign = True
+                boundary = False
+                i = j + 1
+                continue
+            if j < n and text[j] not in " \t\n;&|()<>`'\"":
+                expect, boundary = False, False     # part of a longer word (a path, a flag)
+                i = j
+                continue
+            k = j
+            while k < n and text[k] in " \t":
+                k += 1
+            decl = text.startswith("(", k) and text[k + 1:].lstrip(" \t").startswith(")")
+            if skip_name:
+                skip_name = False
+                expect = False
+            elif decl:
+                expect = False
+            elif word == "function":
+                skip_name = True
+                expect = False
+            elif word in _SH_KEEP_CMD:
+                if word == "command":
+                    nxt = text[k:k + 3]
+                    if re.match(r"-[vVp]", nxt):
+                        expect = False
+            else:
+                words.add(word)
+                expect = False
+            boundary = False
+            i = j
+            continue
+        if boundary and expect and c not in "\t ":
+            expect = False if c != "!" else expect
+        boundary = False
+        i += 1
+    return words
+
 
 
 # ---------------------------------------------------------------------------
@@ -832,8 +1010,13 @@ def _guard_token_owner(scan, row, owner, params):
 
 
 def _guard_delegation(scan, row, owner, params):
+    """Every named consumer must EXECUTE the owner: a shell command word, a
+    Python call (`f(...)` or `x.f(...)`). A mention (a `type` probe, a bare
+    import, a string) does not count. A constant owner is reached by a value
+    reference (a Name load) instead."""
     refs = set(params.get("refs") or [owner.name])
     forbid = [re.compile(f) for f in params.get("forbid", [])]
+    by_value = owner.kind == "const"
     out = []
     for cons in params["consumers"]:
         path, sym = _split_ref(cons)
@@ -854,10 +1037,12 @@ def _guard_delegation(scan, row, owner, params):
             continue
         reached = set()
         for u in units:
-            reached |= (set(u.refs) & refs)
+            reached |= (set(u.loads if by_value else u.calls) & refs)
         if not reached:
+            how = "reference" if by_value else "call"
             out.append(f"consumer {cons} does not reach the job through the owner {_def_ref(owner)} "
-                       f"(no reference to {', '.join(sorted(refs))})")
+                       f"(no executable {how} of {', '.join(sorted(refs))}; a mention, a `type` probe or an "
+                       "import is not a call)")
         for u in units:
             for f in forbid:
                 m = f.search(u.text)

@@ -262,6 +262,109 @@ class TestGuardsRejectSecondImplementation(unittest.TestCase):
         self.assertTrue(any(f.startswith("anchor-identity: ") and "symbol not found" in f for f in found), found)
 
 
+def _deleg_row(consumers, owner="a.py#f", refs=None, **extra):
+    params = {"consumers": consumers}
+    if refs is not None:
+        params["refs"] = refs
+    params.update(extra)
+    return _row(implementation=owner, guards=[{"method": "delegation", "params": params}])
+
+
+class TestDelegationNeedsAnExecutableCall(unittest.TestCase):
+    """A reference counts where it is executed, not where it is mentioned."""
+
+    def check(self, files, row):
+        root = _mini(self, files)
+        return mc_reuse.check_inventory(root, _inv(row), check_tests=False)
+
+    def test_post_commit_keeping_the_type_probe_but_inlining_the_lint_call_fails(self):
+        ft = FixtureTree(self)
+        ft.replace("hooks/post-commit-reindex.sh",
+                   '    mc_store_lint_schema "$PY" "$memlint" "$MEMCONTINUUM_ROOT"\n',
+                   '    "$PY" "$memlint" "$MEMCONTINUUM_ROOT"\n')
+        self.assertIn("type mc_store_lint_schema", ft.read("hooks/post-commit-reindex.sh"))
+        f = only(ft.findings(), "store-lint-schema", "delegation")
+        self.assertEqual(len(f), 1, ft.findings())
+        self.assertIn("post-commit-reindex.sh", f[0])
+        self.assertIn("does not reach the job through the owner", f[0])
+
+    def test_python_consumer_that_imports_but_never_calls_fails(self):
+        f = self.check({"a.py": "def f(x):\n    return x\n",
+                        "c.py": "from a import f\n\ndef parse(text):\n    return text.split()\n"},
+                       _deleg_row(["c.py"]))
+        self.assertEqual(len(f), 1, f)
+        self.assertIn("no executable call", f[0])
+
+    def test_python_name_loaded_but_not_called_fails_for_a_function_owner(self):
+        f = self.check({"a.py": "def f(x):\n    return x\n",
+                        "c.py": "from a import f\n\nHANDLERS = [f]\n\ndef parse(text):\n    return text\n"},
+                       _deleg_row(["c.py"]))
+        self.assertEqual(len(f), 1, f)
+
+    def test_python_call_and_attribute_call_both_count(self):
+        files = {"a.py": "def f(x):\n    return x\n",
+                 "c.py": "import a\n\ndef parse(t):\n    return a.f(t)\n",
+                 "d.py": "from a import f\n\ndef parse(t):\n    return f(t)\n"}
+        self.assertEqual(self.check(files, _deleg_row(["c.py", "d.py"])), [])
+
+    def test_constant_owner_is_reached_by_a_value_reference(self):
+        files = {"a.py": "K = ('x', 'y')\n", "c.py": "from a import K\n\ndef ok(v):\n    return v in K\n",
+                 "d.py": "from a import K\n\ndef no(v):\n    return v\n"}
+        row = _deleg_row(["c.py"], owner="a.py#K")
+        self.assertEqual(self.check(files, row), [])
+        f = self.check(files, _deleg_row(["d.py"], owner="a.py#K"))
+        self.assertEqual(len(f), 1, f)
+        self.assertIn("no executable reference", f[0])
+
+    def test_shell_calls_through_a_pipe_a_substitution_and_an_assignment_are_clean(self):
+        owner = "a.sh#mc_job"
+        base = {"a.sh": "mc_job() {\n    echo hi\n}\n"}
+        shapes = {
+            "pipe": "echo x | mc_job\n",
+            "subst": 'out="$(mc_job "$1")"\n',
+            "backtick": "out=`mc_job a`\n",
+            "and": "true && mc_job\n",
+            "assign-prefix": "FOO=1 BAR=2 mc_job a\n",
+            "if": "if mc_job; then echo ok; fi\n",
+            "negated": "if ! mc_job; then echo no; fi\n",
+            "brace": "{ mc_job; }\n",
+            "time": "time mc_job\n",
+            "inline-subst": 'echo "got $(mc_job)"\n',
+        }
+        for name, body in shapes.items():
+            files = dict(base, **{"c.sh": "#!/usr/bin/env bash\n" + body})
+            self.assertEqual(self.check(files, _deleg_row(["c.sh"], owner=owner)), [], name)
+
+    def test_shell_mentions_are_not_calls(self):
+        owner = "a.sh#mc_job"
+        base = {"a.sh": "mc_job() {\n    echo hi\n}\n"}
+        shapes = {
+            "commented": "# mc_job\n",
+            "trailing-comment": "echo x # mc_job\n",
+            "type-probe": "type mc_job >/dev/null 2>&1\n",
+            "declare-f": "declare -f mc_job >/dev/null\n",
+            "command-v": "command -v mc_job >/dev/null\n",
+            "hash": "hash mc_job\n",
+            "unset": "unset -f mc_job\n",
+            "single-quoted": "echo 'run mc_job | mc_job'\n",
+            "argument": "echo mc_job\n",
+            "declaration": "mc_job() {\n    echo mine\n}\n",
+        }
+        for name, body in shapes.items():
+            files = dict(base, **{"c.sh": "#!/usr/bin/env bash\n" + body})
+            f = self.check(files, _deleg_row(["c.sh"], owner=owner))
+            self.assertTrue(any("does not reach the job" in x for x in f), (name, f))
+
+    def test_a_commented_out_call_alone_fails_in_the_production_hook(self):
+        ft = FixtureTree(self)
+        ft.replace("hooks/pre-commit-append-only.sh",
+                   'mc_store_lint_schema "$PY" "$MEMLINT" "$MEMCONTINUUM_ROOT"',
+                   '# mc_store_lint_schema "$PY" "$MEMLINT" "$MEMCONTINUUM_ROOT"')
+        f = only(ft.findings(), "store-lint-schema", "delegation")
+        self.assertEqual(len(f), 1, ft.findings())
+        self.assertIn("pre-commit-append-only.sh", f[0])
+
+
 class TestPositiveControls(unittest.TestCase):
     def test_legitimate_wrapper_that_calls_the_owner_stays_green(self):
         ft = FixtureTree(self)
