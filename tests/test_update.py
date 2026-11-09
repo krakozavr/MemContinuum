@@ -90,7 +90,7 @@ def git_repo(path):
     return os.path.realpath(path)
 
 
-def tmpdir(prefix):
+def tmpdir(test, prefix):
     # Resolved, not raw (Ruling 89, symlink-paths fix): repo-init.sh's
     # abspath() now resolves symlinks (os.path.realpath, not
     # os.path.abspath), so every --store/--code-root this file builds
@@ -101,7 +101,12 @@ def tmpdir(prefix):
     # a raw tempfile.mkdtemp() the same way a symlinked git toplevel does.
     # One helper, not a `realpath` sprinkled onto each of this file's
     # ~25 `self.tmp = tempfile.mkdtemp(...)` setUp lines.
-    return os.path.realpath(tempfile.mkdtemp(prefix=prefix))
+    path = os.path.realpath(tempfile.mkdtemp(prefix=prefix))
+    # Removed when the test ends: nothing here reads the directory afterwards
+    # (the embed worker is off in clean_env), and 98 leaked dirs per run
+    # accumulated to 11,501 (9.1 GB) before this registration lived here.
+    test.addCleanup(shutil.rmtree, path, ignore_errors=True)
+    return path
 
 
 def copy_engine_for_machine_layer(dst):
@@ -188,7 +193,7 @@ class UpdateTestBase(unittest.TestCase):
     registry row: claude-dirs=/code-roots=/langs=/never= all present)."""
 
     def setUp(self):
-        self.tmp = tmpdir("memcontinuum-update-test-")
+        self.tmp = tmpdir(self, "memcontinuum-update-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -228,7 +233,7 @@ class UpdateTestBase(unittest.TestCase):
 
 class TestDecideNewFlags(unittest.TestCase):
     def setUp(self):
-        self.tmp = tmpdir("memcontinuum-decide-test-")
+        self.tmp = tmpdir(self, "memcontinuum-decide-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
 
@@ -377,7 +382,7 @@ class TestRecordDecisionFlag(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = tmpdir("memcontinuum-record-decision-test-")
+        self.tmp = tmpdir(self, "memcontinuum-record-decision-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -911,7 +916,7 @@ class TestStoreFormStaleVsMismatch(UpdateTestBase):
 
 class TestLegacyRowMigration(unittest.TestCase):
     def setUp(self):
-        self.tmp = tmpdir("memcontinuum-update-legacy-test-")
+        self.tmp = tmpdir(self, "memcontinuum-update-legacy-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -1191,6 +1196,40 @@ class TestBackupColumn(UpdateTestBase):
         subprocess.run(["git", "-C", self.store, "bundle", "create", str(sub / name), "--all"],
                        check=True, capture_output=True)
 
+    def _commit_in_store(self, message, hooks=True):
+        """A commit in the hooked test store, in the sandboxed env: the store's
+        post-commit hook reindexes into $HOME/.memcontinuum, so a bare
+        subprocess.run here rewrote the LIVE ~/.memcontinuum/proj.sqlite
+        (TOP-0137 L38)."""
+        # hooks=False: with the sandboxed HOME the post-commit hook now reads
+        # this test's config.sh and writes a fresh backup bundle itself,
+        # which would make "behind" unreachable.
+        off = [] if hooks else ["-c", "core.hooksPath=/dev/null"]
+        subprocess.run(["git", "-C", self.store, *off, "-c", "user.email=t@e.com",
+                        "-c", "user.name=T", "commit", "-q", "--allow-empty",
+                        "-m", message],
+                       check=True, capture_output=True, env=clean_env(self.home))
+
+    def test_a_store_commit_never_touches_the_parent_home(self):
+        """Regression (TOP-0137 L38): point the PARENT process's HOME and
+        MEMCONTINUUM_HOME at a throwaway dir, pinning both hook resolution arms;
+        a commit in the hooked store must leave it without a .memcontinuum/ and
+        the sandboxed hook must still have logged."""
+        real_home = tempfile.mkdtemp(prefix="memcontinuum-update-test-realhome-")
+        self.addCleanup(shutil.rmtree, real_home, ignore_errors=True)
+        parent_mc = str(Path(real_home) / ".memcontinuum")
+        for key, value in (("HOME", real_home), ("MEMCONTINUUM_HOME", parent_mc)):
+            old = os.environ.get(key)
+            os.environ[key] = value
+            self.addCleanup(lambda k=key, o=old: os.environ.__setitem__(k, o)
+                            if o is not None else os.environ.pop(k, None))
+        self._commit_in_store("sentinel")
+        self.assertFalse(Path(real_home, ".memcontinuum").exists(),
+                         os.listdir(real_home))
+        hook_log = Path(self.home) / ".memcontinuum" / "hook.log"
+        self.assertTrue(hook_log.exists(), "the sandboxed hook wrote no hook.log")
+        self.assertIn("post-commit-reindex", hook_log.read_text())
+
     def _write_config(self, backup_dir, keep=None):
         cfg = Path(self.home, ".memcontinuum", "config.sh")
         cfg.parent.mkdir(parents=True, exist_ok=True)
@@ -1215,9 +1254,7 @@ class TestBackupColumn(UpdateTestBase):
         self._bundle(backup)
         self.assertEqual(self.table_rows(self._run())[0]["backup"], "current")
 
-        subprocess.run(["git", "-C", self.store, "-c", "user.email=t@e.com", "-c", "user.name=T",
-                        "commit", "-q", "--allow-empty", "-m", "later"],
-                       check=True, capture_output=True)
+        self._commit_in_store("later", hooks=False)
         self.assertEqual(self.table_rows(self._run())[0]["backup"], "behind")
 
         shutil.rmtree(backup)
@@ -1966,7 +2003,7 @@ class TestNeverExtsSurviveARerender(unittest.TestCase):
     from."""
 
     def setUp(self):
-        self.tmp = tmpdir("memcontinuum-update-never-test-")
+        self.tmp = tmpdir(self, "memcontinuum-update-never-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -2114,7 +2151,7 @@ class TestMigrationNeverGuessesTheClaudeDirSet(unittest.TestCase):
     it can see and refuses to write until a human names the whole set."""
 
     def setUp(self):
-        self.tmp = tmpdir("memcontinuum-update-cd-test-")
+        self.tmp = tmpdir(self, "memcontinuum-update-cd-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -2239,7 +2276,7 @@ class TestMigrationNeverInventsALanguageSet(unittest.TestCase):
     indexing for a project that had it on."""
 
     def setUp(self):
-        self.tmp = tmpdir("memcontinuum-update-langs-test-")
+        self.tmp = tmpdir(self, "memcontinuum-update-langs-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -2383,7 +2420,7 @@ class TestRecordDecisionNeverFlipsADeclinedRow(unittest.TestCase):
     the person who declined."""
 
     def setUp(self):
-        self.tmp = tmpdir("memcontinuum-record-declined-test-")
+        self.tmp = tmpdir(self, "memcontinuum-record-declined-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -2430,7 +2467,7 @@ class TestPathsWithSpaces(unittest.TestCase):
     values are percent-encoded on the way in and decoded on the way out."""
 
     def setUp(self):
-        self.tmp = tmpdir("memcontinuum-spaces-test-")
+        self.tmp = tmpdir(self, "memcontinuum-spaces-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "my repo"))
@@ -2641,7 +2678,7 @@ class TestPartiallyRenderedLanguagesAreReported(unittest.TestCase):
     nothing about it."""
 
     def setUp(self):
-        self.tmp = tmpdir("memcontinuum-partial-test-")
+        self.tmp = tmpdir(self, "memcontinuum-partial-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -2727,8 +2764,7 @@ class TestRenderFingerprint(unittest.TestCase):
     false -- every commit to anything marked every repo on the machine stale."""
 
     def setUp(self):
-        self.tmp = tmpdir("memcontinuum-fp-test-")
-        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.tmp = tmpdir(self, "memcontinuum-fp-test-")
         self.engine = Path(self.tmp) / "engine"
         shutil.copytree(TOOLS_DIR, self.engine, symlinks=True,
                         ignore=shutil.ignore_patterns(
@@ -2885,8 +2921,7 @@ class TestMachineLayerIsComparedSeparately(unittest.TestCase):
     applies -- and nowhere else."""
 
     def setUp(self):
-        self.tmp = tmpdir("memcontinuum-machine-test-")
-        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.tmp = tmpdir(self, "memcontinuum-machine-test-")
         self.engine = Path(self.tmp) / "engine"
         shutil.copytree(TOOLS_DIR, self.engine, symlinks=True,
                         ignore=shutil.ignore_patterns(
@@ -2978,7 +3013,7 @@ class TestTargetedModeRequiresRecordedWiring(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = tmpdir("memcontinuum-update-targeted-test-")
+        self.tmp = tmpdir(self, "memcontinuum-update-targeted-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -3051,7 +3086,7 @@ class TestTargetedModeRefusesARowWithNoCodeRoot(unittest.TestCase):
     language set that renders nowhere. Refused before anything is written."""
 
     def setUp(self):
-        self.tmp = tmpdir("memcontinuum-update-nocr-test-")
+        self.tmp = tmpdir(self, "memcontinuum-update-nocr-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -3088,7 +3123,7 @@ class TestMultiDirLegacyMigrationRecoversPerDir(unittest.TestCase):
     with a set it never had."""
 
     def setUp(self):
-        self.tmp = tmpdir("memcontinuum-update-multidir-test-")
+        self.tmp = tmpdir(self, "memcontinuum-update-multidir-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -3213,7 +3248,7 @@ class TestMultiRootWriteSideMigration(unittest.TestCase):
     from)."""
 
     def setUp(self):
-        self.tmp = tmpdir("memcontinuum-update-multiroot-migration-test-")
+        self.tmp = tmpdir(self, "memcontinuum-update-multiroot-migration-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -3550,7 +3585,7 @@ class TestTargetedMultiDirIsAllOrNothing(unittest.TestCase):
     describes neither half."""
 
     def setUp(self):
-        self.tmp = tmpdir("memcontinuum-update-txn-test-")
+        self.tmp = tmpdir(self, "memcontinuum-update-txn-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -3609,8 +3644,7 @@ class TestAnUnknownFingerprintNeverComparesEqual(unittest.TestCase):
     checked. Unknown on either side means `stale`: re-render and find out."""
 
     def setUp(self):
-        self.tmp = tmpdir("memcontinuum-unknown-fp-test-")
-        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.tmp = tmpdir(self, "memcontinuum-unknown-fp-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
 
@@ -3758,7 +3792,7 @@ class TestEveryUnfinishedApplyRowFailsTheWalk(unittest.TestCase):
     exception: that is the skill's repair path, not this command's."""
 
     def setUp(self):
-        self.tmp = tmpdir("memcontinuum-exit-test-")
+        self.tmp = tmpdir(self, "memcontinuum-exit-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -3799,8 +3833,7 @@ class TestMachineClaudeDirIsRecordedAndReused(unittest.TestCase):
     have rendered a SECOND machine layer at the default path."""
 
     def setUp(self):
-        self.tmp = tmpdir("memcontinuum-machine-cd-test-")
-        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.tmp = tmpdir(self, "memcontinuum-machine-cd-test-")
         self.engine = Path(self.tmp) / "engine"
         shutil.copytree(TOOLS_DIR, self.engine, symlinks=True,
                         ignore=shutil.ignore_patterns(
@@ -3877,7 +3910,7 @@ class TestTheRowIsRewrittenOnlyWhenEveryDirRendered(unittest.TestCase):
     every future re-render replays that description."""
 
     def setUp(self):
-        self.tmp = tmpdir("memcontinuum-migrate-skip-test-")
+        self.tmp = tmpdir(self, "memcontinuum-migrate-skip-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -3959,7 +3992,7 @@ class TestThePartialRenderNoteIsOnlyPrintedWhenTrue(unittest.TestCase):
     installed, and names the language that is actually fine as the culprit."""
 
     def setUp(self):
-        self.tmp = tmpdir("memcontinuum-partial-note-test-")
+        self.tmp = tmpdir(self, "memcontinuum-partial-note-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -4016,7 +4049,7 @@ class TestFlagsTheModeDoesNotConsumeAreRefused(unittest.TestCase):
     they wanted, the command reported success, and it did something else."""
 
     def setUp(self):
-        self.tmp = tmpdir("memcontinuum-matrix-test-")
+        self.tmp = tmpdir(self, "memcontinuum-matrix-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -4163,7 +4196,7 @@ class TestDisagreementComparesTheRawRenderedValues(unittest.TestCase):
     replay onto the other silently changes what the other indexes."""
 
     def setUp(self):
-        self.tmp = tmpdir("memcontinuum-rawset-test-")
+        self.tmp = tmpdir(self, "memcontinuum-rawset-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -4242,7 +4275,7 @@ class TestRepoWithoutAWiredRowIsRefused(unittest.TestCase):
     `--repo UNDECIDED --langs python` was neither consumed nor refused."""
 
     def setUp(self):
-        self.tmp = tmpdir("memcontinuum-norow-test-")
+        self.tmp = tmpdir(self, "memcontinuum-norow-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -4322,7 +4355,7 @@ class TestEmptyFlagValuesAndContradictoryModesAreRefused(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = tmpdir("memcontinuum-emptyval-test-")
+        self.tmp = tmpdir(self, "memcontinuum-emptyval-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
@@ -4435,7 +4468,7 @@ class TestUpdaterCoversEveryRenderedArtifact(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = tmpdir("memcontinuum-coverage-test-")
+        self.tmp = tmpdir(self, "memcontinuum-coverage-test-")
         self.home = str(Path(self.tmp) / "home")
         os.makedirs(self.home, exist_ok=True)
         self.repo = git_repo(str(Path(self.tmp) / "repo"))
