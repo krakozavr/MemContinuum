@@ -52,7 +52,7 @@ wired one level up, into `~/.claude/settings.json`, by `memcontinuum-setup.sh`.
 | `sessionend-stamp.sh` | `SessionEnd` | stamps session end into state |
 | `code-refresh.sh` | `Stop` and `SessionStart` (projects with a code root) | keeps the code index fresh: runs the existing preflight (`code_index_report`), and on `Stop` the same incremental text heal `code-search` makes (`heal_code_index`, never embeds; see [code-index freshness](#code-index-freshness)). On both events it starts the detached `code-embed-worker` when chunks await a vector (see [code embeddings](#code-embeddings-the-background-worker)). `SessionStart` preflights only and writes the `<project>.code-stale` marker. Silent on every path; one `hook.log` line per run |
 | `post-commit-reindex.sh` | store's git `post-commit` | a bounded content-only reindex after every commit; spawns a background embed-worker when vectors are left behind |
-| `pre-commit-append-only.sh` | store's git `pre-commit` | runs `memlint.py --against-ref HEAD --staged`; BLOCKS the commit on an append-only violation (a recorded link's body edited, or a link removed, deleted, or renamed — its three lifecycle fields may each move forward once); fails open (lets the commit through) on an unborn HEAD, a missing python, its own cwd not being the store, or any engine failure |
+| `pre-commit-append-only.sh` | store's git `pre-commit` | runs `memlint.py --against-ref HEAD --staged`; BLOCKS the commit on an append-only violation (a recorded link's body edited, or a link removed, deleted, or renamed — its three lifecycle fields may each move forward once); fails open (lets the commit through) only when the guard cannot run: an unborn HEAD, a missing python, or its own cwd not being the store; when the engine ran and crashed (exit 2, or no `changed=` summary) the commit is REFUSED with the engine's output and a line naming the override `MC_STORE_LINT_ALLOW_ENGINE_FAILURE=1 git commit ...` |
 | `memcontinuum-detect.sh` | `SessionStart`, user level | classifies an un-initialized repo and emits its ask into the assistant's context once; no python, no watchdog, no logging by default |
 
 **Fail-open is the contract, not a fallback — with one deliberate exception.**
@@ -73,10 +73,11 @@ in git's own history (an earlier commit, recoverable the same way any commit
 is), but nothing else guarantees a later reader ever compares against that
 earlier commit rather than trusting the rewritten one as current. A refused
 commit, by contrast, costs one message and a `git commit --no-verify` away.
-Every OTHER way this hook can
-fail (no python, an unborn HEAD, memlint erroring out, its own cwd not being
-the store) still fails open exactly
-like every other hook.
+Every way this hook can fail to RUN
+(no python, an unborn HEAD, its own cwd not being the store) still fails open
+exactly like every other hook; an engine that ran and crashed does not: the
+commit is refused until the crash is fixed or the operator sets
+`MC_STORE_LINT_ALLOW_ENGINE_FAILURE=1` for that one commit.
 
 **Search fallback.** `memidx.py search` was the only channel that could
 deliver a decision NOT bound to the file being edited, and it had never
@@ -486,8 +487,11 @@ outside that rule are deliberate: `post-commit-reindex.sh` writes its own
 `post-commit-reindex: rc=… elapsed=… project=… root=… embed=pending|clean|skipped relint=… backup=…`
 line instead, `pre-commit-append-only.sh` writes its own line, one of
 `pre-commit-append-only: rc=1 changed=<n> project=…` (refused the commit),
-`rc=0 changed=<n> project=…` (clean), or `skipped=<reason> project=…` — an
-unborn HEAD, no python, an engine failure, or (fix wave 1 G1) the hook
+`rc=0 changed=<n> project=…` (clean), `rc=<n> engine-failure refused project=…`
+(the engine crashed, commit refused; with `MC_STORE_LINT_ALLOW_ENGINE_FAILURE=1`
+the line is `skipped=engine-failure override=1 rc=<n> project=…` and the commit
+goes through), or `skipped=<reason> project=…` — an
+unborn HEAD, no python, or (fix wave 1 G1) the hook
 running with its cwd outside `MEMCONTINUUM_ROOT` (`skipped=not-the-store` —
 a wrapper invoked from another repository entirely, e.g. through a
 mistakenly shared `core.hooksPath`, must never judge or block THAT
