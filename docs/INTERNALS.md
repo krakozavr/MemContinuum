@@ -3744,7 +3744,7 @@ write follows. A receipt whose topic still equals B was written before a crash: 
 moved topic, a topic that differs from A, or a changed staged entry is refused with the
 pending row named and the ways out (`git restore --source=HEAD --worktree -- <topic>`,
 `git restore --staged -- <topic>`, or commit first); nothing is written. A missing,
-malformed, legacy or non-matching receipt means the ordinary path. A receipt authorises
+malformed, unknown-version or non-matching receipt means the ordinary path. A receipt authorises
 restoring B only; it never deletes anything that is not in B.
 
 Writers serialize on one `flock`ed lock file per topic next to the stack
