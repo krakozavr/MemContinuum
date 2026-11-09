@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import traceback
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -2665,7 +2666,9 @@ class TestUndoReceipts(BindCase):
         real = memidx._fsync_dir
 
         def fail_in_receipts(path):
-            if Path(path) == self.rec_dir():
+            # only the receipt write's own fsync (the directory initialisation has its own test)
+            if Path(path) == self.rec_dir() and any(
+                    f.name == "_atomic_write_bytes" for f in traceback.extract_stack()):
                 raise OSError(5, "Input/output error")
             return real(path)
 
@@ -2981,6 +2984,35 @@ class TestUndoReceipts(BindCase):
         self.assertEqual(rc, 0, err)
         self.assertNotIn("undo:", out)
         self.assertIn("remove", topic.read_text())
+
+    def test_a_retry_after_a_failed_directory_initialisation_fsyncs_the_whole_chain(self):
+        # gate round 2 (Sol 2): directories left by the failed attempt are not skipped
+        before = self.head_state(refs=())
+        real = memidx._fsync_dir
+        state = {"failed": False}
+
+        def fail_first(path):
+            if not state["failed"]:
+                state["failed"] = True
+                raise OSError(5, "Input/output error")
+            return real(path)
+
+        with mock.patch.object(memidx, "_fsync_dir", side_effect=fail_first):
+            rc, out, err = self.bind()
+        self.assertEqual(rc, 1, (out, err))
+        self.assertEqual((self.raw(), self.receipts()), (before, []))
+        self.assertTrue(self.rec_dir().is_dir())  # the failed attempt left the directories behind
+        seen = []
+
+        def record(path):
+            seen.append(Path(path).resolve())
+            return real(path)
+
+        with mock.patch.object(memidx, "_fsync_dir", side_effect=record):
+            self.assertEqual(self.bind()[0], 0)
+        d = self.rec_dir().resolve()
+        for link in (d, d.parent, d.parent.parent):
+            self.assertIn(link, seen)
 
     def test_a_linked_worktree_keeps_its_own_receipts(self):
         self.head_state(refs=())

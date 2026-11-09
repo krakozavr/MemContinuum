@@ -12732,18 +12732,14 @@ def _fsync_dir(path: Path) -> None:
 
 
 def _makedirs_durable(path: Path) -> None:
-    """`os.makedirs(path, exist_ok=True)`, then fsync every directory it created
-    and the existing directory that now holds the topmost of them, so the new
-    links survive power loss. Raises OSError."""
-    created, probe = [], Path(path)
-    while not probe.exists():
-        created.append(probe)
-        probe = probe.parent
+    """`os.makedirs(path, exist_ok=True)`, then fsync the whole known chain on
+    EVERY successful call -- `path`, its parent and its parent's parent, each
+    entry the next one down hangs from -- not only the directories this call
+    created: a directory left behind by a failed or concurrent attempt has not
+    necessarily been made durable. Raises OSError."""
     os.makedirs(path, exist_ok=True)
-    for made in reversed(created):
-        _fsync_dir(made)
-    if created:
-        _fsync_dir(created[-1].parent)
+    for link in (Path(path), Path(path).parent, Path(path).parent.parent):
+        _fsync_dir(link)
 
 
 def _atomic_write_bytes(path: Path, data: bytes, exclusive: bool = False, *,
