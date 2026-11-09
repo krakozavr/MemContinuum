@@ -272,6 +272,121 @@ class TestUnmappedGitIgnored(unittest.TestCase):
         self.assertEqual(out["ignored"], [])
         self.assertEqual(out["by_path"].get(store_file) != "ignored", True)
 
+    def _slow_git(self, seconds, log=None):
+        """A `git` on PATH that sleeps in check-ignore only (and logs each
+        such call), delegating everything else to the real git."""
+        import shutil
+        stub_dir = self.base / "slow-bin"
+        stub_dir.mkdir(exist_ok=True)
+        stub = stub_dir / "git"
+        stub.write_text(
+            "#!/bin/sh\n"
+            'case " $* " in *" check-ignore "*)\n'
+            + (f'  echo "$*" >> "{log}"\n' if log else "")
+            + f"  sleep {seconds};;\nesac\n"
+            f'exec "{shutil.which("git")}" "$@"\n'
+        )
+        stub.chmod(0o755)
+        return mock.patch.dict(os.environ, {"PATH": f"{stub_dir}{os.pathsep}{os.environ['PATH']}"})
+
+    def test_a_slow_git_fails_open_within_the_ignore_check_budget(self):
+        import time
+        code = self._code_root()
+        with self._slow_git(3), mock.patch.dict(os.environ, {"MEMCONTINUUM_IGNORE_CHECK_BUDGET": "0.2"}):
+            t0 = time.monotonic()
+            out, paths = self._run(code, ["scratch/a.py", "src/nothing.py"])
+            took = time.monotonic() - t0
+        self.assertLess(took, 2.5, took)
+        self.assertEqual(out["ignored"], [])
+        self.assertEqual(out["by_path"], {paths[0]: "unmapped", paths[1]: "unmapped"})
+        self.assertEqual(out["ignore_check"], "timeout")
+
+    def test_the_first_root_eating_the_budget_skips_the_second(self):
+        log = self.base / "check-ignore-calls.log"
+        first, second = self._code_root("code1"), self._code_root("code2")
+        import contextlib
+        import io
+        import json
+        paths = [str(first / "scratch" / "a.py"), str(second / "scratch" / "a.py")]
+        argv = ["unmapped", *paths, "--root", str(self.store), "--project", "zp", "--db", str(self.db),
+                "--code-root", str(first), "--code-root", str(second), "--json"]
+        buf = io.StringIO()
+        with self._slow_git(3, log), mock.patch.dict(os.environ, {"MEMCONTINUUM_IGNORE_CHECK_BUDGET": "0.2"}):
+            with contextlib.redirect_stdout(buf):
+                memidx.main(argv)
+        out = json.loads(buf.getvalue())
+        self.assertEqual(out["by_path"], {paths[0]: "unmapped", paths[1]: "unmapped"})
+        self.assertEqual(len(log.read_text().splitlines()), 1)
+        self.assertEqual(out["ignore_check"], "timeout")
+
+    def test_a_root_left_when_the_deadline_is_spent_is_skipped(self):
+        from types import SimpleNamespace
+        a, b = self._code_root("ra"), self._code_root("rb")
+        ticks = iter([0.0, 0.4, 5.0])  # deadline set, first root has time, second has none
+        fake = SimpleNamespace(monotonic=lambda: next(ticks))
+        with mock.patch.object(memidx, "time", fake), \
+                mock.patch.dict(os.environ, {"MEMCONTINUUM_IGNORE_CHECK_BUDGET": "1"}):
+            out, status = memidx._unmapped_git_ignored(
+                [("A", a, "scratch/a.py"), ("B", b, "scratch/a.py")])
+        self.assertEqual((out, status), ({"A"}, "skipped"))
+
+    def test_a_clean_run_reports_complete(self):
+        code = self._code_root()
+        out, _ = self._run(code, ["scratch/a.py"])
+        self.assertEqual(out["ignore_check"], "complete")
+
+    def test_the_budget_is_explicit_else_a_quarter_of_the_hook_budget_else_one_second(self):
+        keys = ("MEMCONTINUUM_IGNORE_CHECK_BUDGET", "MC_WATCHDOG_EFFECTIVE_BUDGET")
+        base = {k: v for k, v in os.environ.items() if k not in keys}
+        for env, want in (({}, 1.0),
+                          ({"MC_WATCHDOG_EFFECTIVE_BUDGET": "4.0"}, 1.0),
+                          ({"MC_WATCHDOG_EFFECTIVE_BUDGET": "1.5"}, 0.375),
+                          ({"MC_WATCHDOG_EFFECTIVE_BUDGET": "1.5", "MEMCONTINUUM_IGNORE_CHECK_BUDGET": "0.2"}, 0.2),
+                          ({"MEMCONTINUUM_IGNORE_CHECK_BUDGET": "junk"}, 1.0)):
+            with mock.patch.dict(os.environ, {**base, **env}, clear=True):
+                self.assertEqual(memidx._ignore_check_budget(), want, env)
+
+    def _nested(self, store_rel):
+        """A code root that is a git repo ignoring `memory/`, holding the store."""
+        from tests.test_write_hooks import build_store_root, reindex
+        code = self.base / "repo"
+        code.mkdir()
+        (code / ".gitignore").write_text("memory/\nscratch/\nnotes-*.md\n")
+        store = code / store_rel if store_rel else code
+        build_store_root(store)
+        db = self.base / "nested.sqlite"
+        reindex(store, db, project="zp")
+        self.git_init(code)
+        return code, store, db
+
+    def _run_nested(self, code, store, db, paths):
+        import contextlib
+        import io
+        import json
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            memidx.main(["unmapped", *paths, "--root", str(store), "--project", "zp", "--db", str(db),
+                         "--code-root", str(code), "--json"])
+        return json.loads(buf.getvalue())
+
+    def test_a_store_nested_in_a_code_root_is_never_ignore_checked(self):
+        code, store, db = self._nested("memory")
+        (code / "scratch").mkdir()
+        inside = str(store / "topics" / "testing" / "mapped-topic.md")
+        extra = str(store / "notes-not-a-topic.md")
+        scratch = str(code / "scratch" / "a.py")
+        out = self._run_nested(code, store, db, [inside, extra, scratch])
+        self.assertNotEqual(out["by_path"][extra], "ignored")
+        self.assertNotEqual(out["by_path"][inside], "ignored")
+        self.assertEqual(out["by_path"][scratch], "ignored")
+
+    def test_a_store_that_is_the_code_root_is_never_ignore_checked(self):
+        code, store, db = self._nested("")
+        (code / "memory").mkdir(exist_ok=True)
+        extra = str(store / "notes-not-a-topic.md")
+        out = self._run_nested(code, store, db, [extra])
+        self.assertEqual(out["by_path"][extra], "unmapped")
+
 
 class TestUnmappedZeroPaths(unittest.TestCase):
     """`unmapped` with no PATH still runs the index-state check and the stale

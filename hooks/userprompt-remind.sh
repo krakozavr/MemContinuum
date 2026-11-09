@@ -351,6 +351,12 @@ print(json.dumps(state))
         pq_mark_delivered
     fi
     [ -n "$DECIDE_TMP" ] && rm -f "$DECIDE_TMP" 2>/dev/null
+    # A git-ignore pass that timed out or was skipped failed open (TOP-0137
+    # L29): the line says so; a clean pass adds nothing.
+    case "${UC_IGNORE_CHECK:-complete}" in
+        ""|complete) ;;
+        *) extra="${extra:+$extra }ignore_check=$UC_IGNORE_CHECK" ;;
+    esac
     if [ -n "$extra" ]; then
         mc_log "userprompt outcome=$outcome $extra session=${SESSION_ID:-} $(mc_elapsed_field)"
     else
@@ -898,6 +904,7 @@ for p in d.get("code_paths", []):
     UC_RAW=""
     UC_TMP=""
     UC_HEALED="false"
+    UC_IGNORE_CHECK=""
     COVERAGE_STATUS=""
     # One engine call: with the paths new since the last prompt, or with none
     # at all -- it is made whenever the cache is consulted, because the call is also the index-state
@@ -918,21 +925,24 @@ for p in d.get("code_paths", []):
         UC_RAW=""
         COVERAGE_STATUS=""
         UC_HEALED="false"
+        UC_IGNORE_CHECK=""
         # F1 (ruling 68): `unmapped` exits 1 (not just 0) on a coverage_status
         # still worth reading -- uninitialized/upgrade-required/index-error
         # all print a real JSON body with an empty unmapped list. Accept RC 0
         # or 1.
         if { [ $RC -eq 0 ] || [ $RC -eq 1 ]; } && [ -n "$RAW" ]; then
             UC_RAW="$RAW"
-            { IFS= read -r COVERAGE_STATUS; IFS= read -r UC_HEALED; } < <(printf '%s' "$RAW" | env PYTHONPATH= "$MC_PY" -c '
+            { IFS= read -r COVERAGE_STATUS; IFS= read -r UC_HEALED; IFS= read -r UC_IGNORE_CHECK; } < <(printf '%s' "$RAW" | env PYTHONPATH= "$MC_PY" -c '
 import json, sys
 try:
     d = json.load(sys.stdin) or {}
     print(d.get("coverage_status", "unknown"))
     print("true" if d.get("healed") is True else "false")
+    print(d.get("ignore_check", "complete"))
 except Exception:
     print("unknown")
     print("false")
+    print("complete")
 ' 2>/dev/null)
         fi
     }
@@ -1067,9 +1077,14 @@ if called:
         verdicts[p] = st
         displays[p] = queues[st].pop(0)
         stamps[p] = started
+    # A pass that failed open (timeout/skipped) classified some ignored paths
+    # as unmapped: those verdicts must not be cached.
     new_cache = {"store_head": sha, "verdicts": {p: verdicts[p] for p in code_paths},
                  "displays": {p: displays[p] for p in code_paths},
                  "classified_at": {p: stamps[p] for p in code_paths}} if sha else None
+    if raw.get("ignore_check", "complete") != "complete":
+        new_cache = None
+        drop_cache()
 elif not verdicts:
     print("{}")
     raise SystemExit(0)

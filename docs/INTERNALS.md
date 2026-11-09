@@ -4206,11 +4206,21 @@ down:
   `mapped_concept_only`, `unmapped` or `ignored` without walking the code tree.
   `ignored` is a path that would otherwise be `unmapped`, lies under a code
   root and is ignored by that root's git (one `git check-ignore -z --stdin` per
-  root, root-relative paths, bounded by the git timeout used for the code walk): it leaves the
+  root, root-relative paths): it leaves the
   `unmapped` list and count, is listed under `ignored` in the JSON (and printed
   as `ignored: N`) and is `"ignored"` in `by_path`. A tracked file that matches an
-  ignore pattern is still `unmapped`, store-root paths are never checked, and any git
-  failure (missing, not a work tree, timeout) leaves the path `unmapped`.
+  ignore pattern is still `unmapped`. Store paths are excluded by canonical
+  prefix, wherever the store lives: a path equal to the store root or under it
+  is never checked, even when the store sits inside a code root. Any git failure
+  (missing, not a work tree, timeout) leaves the path `unmapped`. The whole pass
+  shares one deadline, `MEMCONTINUUM_IGNORE_CHECK_BUDGET` seconds (default: a
+  quarter of the hook's effective watchdog budget, which the launcher exports
+  as `MC_WATCHDOG_EFFECTIVE_BUDGET`; 1 s outside a hook); each root's git call
+  gets what is left of it (never more than the git timeout used for the code
+  walk) and roots left when it is spent are skipped. The JSON field
+  `ignore_check` says how the pass ended: `"complete"`, `"timeout"` or
+  `"skipped"`; the prompt hook adds `ignore_check=` to its outcome line only
+  when it is not `complete`, and does not cache the verdicts of such a call.
   `coverage_status` mirrors the decision index's states, collapsed for a
   *negative* claim's purposes: `"ok"` (state was `current`, queried normally —
   the only state that actually populates `unmapped`), `"uninitialized"`

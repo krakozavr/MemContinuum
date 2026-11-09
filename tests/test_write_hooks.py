@@ -4307,6 +4307,38 @@ class TestUserPromptRemind(HookTestBase):
         self.assertNotIn("scratch/x.py", third.stdout)
         self.assertEqual(self.load_state(session_id)["unmapped_cache"]["verdicts"][str(scratch)], "ignored")
 
+    def test_a_slow_git_ignore_check_fails_open_before_the_watchdog(self):
+        """Gate round 1 R1-1: a git that outlives the ignore-check budget (a
+        quarter of the hook's effective budget) must not carry the hook into
+        the watchdog kill: the paths stay unmapped, the line says so, and no
+        verdict is cached."""
+        import shutil
+        stub_dir = Path(self.td) / "slow-git-bin"
+        stub_dir.mkdir()
+        stub = stub_dir / "git"
+        stub.write_text(
+            "#!/bin/sh\n"
+            'case " $* " in *" check-ignore "*) sleep 6;; esac\n'
+            f'exec "{shutil.which("git")}" "$@"\n'
+        )
+        stub.chmod(0o755)
+        _write(self.code_root / ".gitignore", "scratch/\n")
+        _write(self.code_root / "scratch" / "x.py", "# scratch\n")
+        session_id = "s-userprompt-slow-git"
+        self.seed_ledger(session_id, [
+            (str(self.code_root / "scratch" / "x.py"), "code"),
+            (str(self.code_root / "src" / "unmapped.py"), "code"),
+        ])
+        env = self.base_env(MC_WATCHDOG_BUDGET="1.5", PATH=f"{stub_dir}{os.pathsep}{os.environ['PATH']}")
+        t0 = time.monotonic()
+        proc = self._prompt(session_id, env)
+        self.assertLess(time.monotonic() - t0, 5.0)
+        log = (self.home / "hook.log").read_text()
+        self.assertNotIn("watchdog-killed", log)
+        self.assertRegex(log, r"userprompt outcome=\S+ .*ignore_check=timeout ")
+        self.assertIn("2 edited file(s) with no decision topic: scratch/x.py, src/unmapped.py;", proc.stdout)
+        self.assertNotIn("unmapped_cache", self.load_state(session_id))
+
     def test_a_non_ok_answer_drops_the_cache(self):
         spy = Path(self.td) / "unmapped-calls.log"
         env = self._spy_env(spy)
