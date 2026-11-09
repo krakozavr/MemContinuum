@@ -56,7 +56,7 @@
           "params": {}
         }
       ],
-      "coverage_limit": "Shell only: finds a function named join_semi anywhere in the scan roots and a function whose normalised body equals the owner's (comments, indentation and `local` names ignored). A join written inline in a loop, or under another name with a different shape, is not recognised.",
+      "coverage_limit": "Shell only: finds a function named join_semi anywhere in the scan roots and a function whose normalised body equals the owner's (comments, indentation and `local` names ignored). A join written inline in a loop is not recognised; a copy whose normalised body differs by one token (a literal, an added statement, reordered locals) escapes; a rewrite under another name needs a human.",
       "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
       "test": "tests.test_reuse_inventory.TestProductionTree"
     },
@@ -102,7 +102,7 @@
           "params": {}
         }
       ],
-      "coverage_limit": "Finds the sentence fragments only as string literals inside executable code (Python units and extracted python payloads); the same words built from pieces, held in a shell variable, or inside a double-quoted -c payload are not seen.",
+      "coverage_limit": "Finds the sentence fragments as text of executable code: Python units, extracted python payloads and shell text outside comments and heredoc bodies (a fragment in a double-quoted -c payload or in a shell variable is still shell text and is seen). Not seen: the same words built from pieces, a reworded sentence, and a fragment inside a non-Python heredoc body (that body is dropped from the shell text and not parsed). The two hook payloads must execute coverage_fact (delegation counts only an executed call (a comment, a `type` probe or a bare import is a mention and does not count)). The exact_copy guard misses a copy whose normalised body differs by one token (a literal, an added statement, reordered locals) escapes; a rewrite under another name needs a human.",
       "variants": [],
       "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
       "test": "tests.test_reuse_inventory.TestProductionTree"
@@ -143,7 +143,7 @@
           "params": {}
         }
       ],
-      "coverage_limit": "Same as the fact builder: string literals in executable Python only.",
+      "coverage_limit": "Finds the sentence fragments as text of executable code: Python units, extracted python payloads and shell text outside comments and heredoc bodies (a fragment in a double-quoted -c payload or in a shell variable is still shell text and is seen). Not seen: the same words built from pieces, a reworded sentence, and a fragment inside a non-Python heredoc body (that body is dropped from the shell text and not parsed). The two hook payloads must execute coverage_question (delegation counts only an executed call (a comment, a `type` probe or a bare import is a mention and does not count)). The exact_copy guard misses a copy whose normalised body differs by one token (a literal, an added statement, reordered locals) escapes; a rewrite under another name needs a human.",
       "variants": [],
       "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
       "test": "tests.test_reuse_inventory.TestProductionTree"
@@ -182,7 +182,7 @@
           }
         }
       ],
-      "coverage_limit": "Finds a literal set, tuple or list of strings equal to the owner's anywhere in the scanned Python (including extracted payloads). A vocabulary built programmatically, or a different subset, is not recognised. The hold-eligibility set is exempted by name; if it is ever made to coincide on purpose it stays a separate role.",
+      "coverage_limit": "Finds a literal set, tuple or list of strings equal to the owner's anywhere in the scanned Python (including extracted payloads). A vocabulary built programmatically, or a different subset, is not recognised. The hold-eligibility set is exempted by name; if it is ever made to coincide on purpose it stays a separate role. Promotion must reference the constant by value inside promotable_link; a mention in a comment does not count.",
       "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
       "test": "tests.test_reuse_inventory.TestProductionTree"
     },
@@ -246,7 +246,7 @@
           }
         }
       ],
-      "coverage_limit": "Recognises the name, a renamed copy with the same normalised body, and the named freeze consumers reaching it. A structural rewrite of span extraction under another name, or a consumer not listed here, is not recognised.",
+      "coverage_limit": "Recognises the name, a renamed copy with the same normalised body, and the named freeze consumers calling it (delegation counts only an executed call (a comment, a `type` probe or a bare import is a mention and does not count)). Not recognised: a copy whose normalised body differs by one token (a literal, an added statement, reordered locals) escapes; a rewrite under another name needs a human; a consumer not listed here.",
       "variants": [],
       "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
       "test": "tests.test_reuse_inventory.TestProductionTree"
@@ -284,7 +284,7 @@
           }
         }
       ],
-      "coverage_limit": "Name pattern, renamed exact copy, and the anchor-freeze consumer reaching it. A differently shaped identity function under another name is not recognised.",
+      "coverage_limit": "Name pattern, renamed exact copy, and the anchor-freeze consumer calling it (delegation counts only an executed call (a comment, a `type` probe or a bare import is a mention and does not count)). Not recognised: a copy whose normalised body differs by one token (a literal, an added statement, reordered locals) escapes; a rewrite under another name needs a human.",
       "variants": [],
       "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
       "test": "tests.test_reuse_inventory.TestProductionTree"
@@ -330,12 +330,14 @@
             "forbid": [
               "EPOCHREALTIME",
               "date\\s+\\+%s%3N",
-              "Time::HiRes"
+              "\\(\\([^\\n]*date\\s+\\+%s|date\\s+\\+%s[^\\n]*\\*\\s*1000|date\\s+\\+%s\\)?000\\b",
+              "Time::HiRes",
+              "time\\.time\\(\\)\\s*\\*\\s*1000|\\btime_ns\\("
             ]
           }
         }
       ],
-      "coverage_limit": "Shell clocks only: the perl Time::HiRes invocation must stay in the owner, and the three elapsed-timing hooks must call it without a clock of their own. Clocks in other languages are outside this contract.",
+      "coverage_limit": "Shell clocks only. The perl Time::HiRes invocation must stay in the owner, and the three elapsed-timing hooks must execute mc_now_ms (delegation counts only an executed call (a comment, a `type` probe or a bare import is a mention and does not count)) and build no millisecond clock of their own: EPOCHREALTIME, `date +%s%3N`, `date +%s` in arithmetic or scaled to milliseconds (inside $(( )), times 1000, or with 000 appended), Time::HiRes, `time.time() * 1000` and `time_ns(`. A plain whole-second `date +%s` or `time.time()` read is NOT forbidden -- the hooks use them for watchdog and timestamp purposes that are not millisecond elapsed timing -- so another clock expression (for example $SECONDS, or a whole-second read scaled in a way the patterns do not list) is not seen. Clocks in other hooks or in other languages are outside this contract.",
       "variants": [],
       "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
       "test": "tests.test_reuse_inventory.TestProductionTree"
@@ -371,12 +373,14 @@
             ],
             "forbid": [
               "PYTHONPATH=\\s*\"\\$(?:PY|py)\"\\s+\"\\$(?:MEMLINT|memlint)\"",
-              "\\$\\{?(?:MEMLINT|memlint)\\}?\"?\\s+--"
+              "\\$\\{?(?:MEMLINT|memlint)\\}?\"?\\s+--",
+              "(?m)(?:^|[;&|(`!]|\\bthen\\b|\\bdo\\b|\\belse\\b)[ \\t]*(?:env[ \\t]+(?:\\w+=\\S*[ \\t]+)*)?(?:\"?\\$\\{?\\w*PY\\w*\\}?\"?|python[\\w.]*)[ \\t]+\"?\\$\\{?(?:MEMLINT|memlint)\\}?\"?",
+              "(?:\"?\\$\\{?\\w*PY\\w*\\}?\"?|python[\\w.]*)[ \\t]+(?:-\\w+[ \\t]+)*\"?[^\\s\"]*memlint\\.py"
             ]
           }
         }
       ],
-      "coverage_limit": "Checks that the two commit hooks call the owner and do not invoke memlint with the lint shape directly. A third hook that runs the lint another way is only caught by the name pattern.",
+      "coverage_limit": "The two commit hooks must execute mc_store_lint_schema (delegation counts only an executed call (a comment, a `type` probe or a bare import is a mention and does not count)), so an inlined lint call that keeps the probe is caught. Forbidden direct shapes: `PYTHONPATH= \"$PY\" \"$MEMLINT\"`, `$MEMLINT --...`, the interpreter followed by \"$MEMLINT\" or \"$memlint\" at command position (with or without PYTHONPATH=), and the interpreter followed by a `memlint.py` path literal. A third hook that runs the lint another way is only caught by the name pattern; a lint reached through an alias variable or eval is not seen.",
       "variants": [],
       "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
       "test": "tests.test_reuse_inventory.TestProductionTree"
@@ -421,12 +425,14 @@
             ],
             "forbid": [
               "PYTHONPATH=\\s*\"\\$(?:PY|py)\"\\s+\"\\$(?:MEMLINT|memlint)\"",
-              "\\$\\{?(?:MEMLINT|memlint)\\}?\"?\\s+--"
+              "\\$\\{?(?:MEMLINT|memlint)\\}?\"?\\s+--",
+              "(?m)(?:^|[;&|(`!]|\\bthen\\b|\\bdo\\b|\\belse\\b)[ \\t]*(?:env[ \\t]+(?:\\w+=\\S*[ \\t]+)*)?(?:\"?\\$\\{?\\w*PY\\w*\\}?\"?|python[\\w.]*)[ \\t]+\"?\\$\\{?(?:MEMLINT|memlint)\\}?\"?",
+              "(?:\"?\\$\\{?\\w*PY\\w*\\}?\"?|python[\\w.]*)[ \\t]+(?:-\\w+[ \\t]+)*\"?[^\\s\"]*memlint\\.py"
             ]
           }
         }
       ],
-      "coverage_limit": "Only the hook-side invocation of the append-only lint is owned; --against-ref in memlint's argument handling, adapters and documentation is legitimate and is not scanned (hooks/ shell only).",
+      "coverage_limit": "Only the hook-side invocation of the append-only lint is owned; --against-ref in memlint's argument handling, adapters and documentation is legitimate and is not scanned (hooks/ shell only). The two commit hooks must execute mc_store_lint_append_only (delegation counts only an executed call (a comment, a `type` probe or a bare import is a mention and does not count)). Forbidden direct shapes: `PYTHONPATH= \"$PY\" \"$MEMLINT\"`, `$MEMLINT --...`, the interpreter followed by \"$MEMLINT\" or \"$memlint\" at command position (with or without PYTHONPATH=), and the interpreter followed by a `memlint.py` path literal. An option assembled dynamically, or an implementation in an extension-less hook, is not seen.",
       "variants": [],
       "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
       "test": "tests.test_reuse_inventory.TestProductionTree"
@@ -498,7 +504,7 @@
           }
         }
       ],
-      "coverage_limit": "Recognises the name, a renamed exact copy, the adapters delegating, and memlint reaching the parser through them. Unrelated YAML loading elsewhere is deliberately not prohibited.",
+      "coverage_limit": "Recognises the name, a copy with the same normalised body, the adapters calling the core and memlint calling the parser through them (delegation counts only an executed call (a comment, a `type` probe or a bare import is a mention and does not count)). Not recognised: a copy whose normalised body differs by one token (a literal, an added statement, reordered locals) escapes; a rewrite under another name needs a human. Unrelated YAML loading elsewhere is deliberately not prohibited.",
       "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
       "test": "tests.test_reuse_inventory.TestProductionTree"
     },

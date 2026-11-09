@@ -266,6 +266,36 @@ class TestGuardsRejectSecondImplementation(unittest.TestCase):
         f = only(ft.findings(), "shell-millisecond-clock", "delegation")
         self.assertTrue(any("bypassing" in x for x in f), ft.findings())
 
+    def test_memlint_invoked_without_pythonpath_from_a_commit_hook_fails_both_lint_rows(self):
+        for line in ('"$PY" "$MEMLINT" "$MEMCONTINUUM_ROOT"', 'python3 "$SCRIPT_DIR/../memlint.py" "$MEMCONTINUUM_ROOT"',
+                     'out="$(env X=1 "$PY" "$memlint" --against-ref HEAD "$ROOT")"'):
+            ft = FixtureTree(self)
+            ft.append("hooks/pre-commit-append-only.sh", "\n" + line + "\n")
+            found = ft.findings()
+            for rid in ("store-lint-schema", "store-lint-append-only"):
+                d = only(found, rid, "delegation")
+                self.assertTrue(any("bypassing the owner" in x for x in d), (line, rid, found))
+
+    def test_passing_memlint_to_the_owner_is_not_an_invocation(self):
+        ft = FixtureTree(self)
+        ft.append("hooks/post-commit-reindex.sh",
+                  '\nmc_store_lint_schema "$PY" "$memlint" "$ROOT"\nMEMLINT="$SCRIPT_DIR/../memlint.py"\n')
+        self.assertEqual(ft.findings(), [])
+
+    def test_elapsed_timing_hooks_cannot_grow_a_millisecond_clock_of_their_own(self):
+        for line in ('t0=$(( $(date +%s) * 1000 ))', 't0="$(date +%s)000"', 'ms=$(date +%s%3N)',
+                     't0=$(python3 -c "import time; print(time.time_ns())")',
+                     't0=$(python3 -c "import time; print(int(time.time() * 1000))")'):
+            ft = FixtureTree(self)
+            ft.append("hooks/newfile-nudge.sh", "\n" + line + "\n")
+            f = only(ft.findings(), "shell-millisecond-clock", "delegation")
+            self.assertTrue(any("bypassing" in x for x in f), (line, ft.findings()))
+
+    def test_a_whole_second_date_read_in_an_elapsed_timing_hook_is_not_forbidden(self):
+        ft = FixtureTree(self)
+        ft.append("hooks/newfile-nudge.sh", '\nSTAMP="$(date +%s 2>/dev/null || echo 0)"\n')
+        self.assertEqual(ft.findings(), [])
+
     def test_second_perl_clock_fails_token_owner(self):
         ft = FixtureTree(self)
         ft.write("hooks/clock2.sh",
@@ -471,6 +501,23 @@ class TestPositiveControls(unittest.TestCase):
         self.assertEqual(hv["policy"], "allowed_variants")
         self.assertIn("memidx.py#HOLD_ELIGIBLE_AUTHORITIES", {v["symbol"] for v in rows["filing-typed-authorities"]["variants"]})
         self.assertEqual(mc_reuse.check_inventory(TOOLS_DIR), [])
+
+    def test_row_texts_state_the_one_token_miss_and_not_the_retired_claims(self):
+        inv = mc_reuse.load_inventory(TOOLS_DIR / mc_reuse.INVENTORY_RELPATH)
+        for r in inv["rows"]:
+            text = r["coverage_limit"]
+            if any(g["method"] == "exact_copy" for g in r["guards"]):
+                self.assertIn("differs by one token", text, r["id"])
+                self.assertIn("another name needs a human", text, r["id"])
+            self.assertNotIn("structural rewrite", text, r["id"])
+            self.assertNotIn("inside a double-quoted -c payload are not seen", text, r["id"])
+        rows = {r["id"]: r for r in inv["rows"]}
+        for rid in ("coverage-fact-sentence", "coverage-question-sentence"):
+            self.assertIn("non-Python heredoc", rows[rid]["coverage_limit"])
+            self.assertIn("double-quoted -c payload", rows[rid]["coverage_limit"])
+            self.assertIn("is seen", rows[rid]["coverage_limit"])
+        self.assertIn("inlined lint call that keeps the probe is caught", rows["store-lint-schema"]["coverage_limit"])
+        self.assertIn("whole-second", rows["shell-millisecond-clock"]["coverage_limit"])
 
     def test_the_three_chunker_backend_families_stay_green_with_their_members_listed(self):
         inv = mc_reuse.load_inventory(TOOLS_DIR / mc_reuse.INVENTORY_RELPATH)
