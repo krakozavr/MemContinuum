@@ -771,8 +771,14 @@ print(json.dumps(state))
             finish "compact-no-state" "standing=$STANDING_LOG_TOKEN"
         fi
 
-        OUTPUT_JSON="$(MEMCONTINUUM_ROOT="${MEMCONTINUUM_ROOT:-}" env PYTHONPATH= "$MC_PY" -c '
+        OUTPUT_JSON="$(MEMCONTINUUM_ROOT="${MEMCONTINUUM_ROOT:-}" MC_NUDGE_DIR="$SCRIPT_DIR" env PYTHONPATH= "$MC_PY" -c '
 import json, os, sys
+
+# The coverage sentence lives in hooks/mc_nudge.py (shared with the prompt
+# hook); no .pyc is written next to the hook scripts.
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.environ["MC_NUDGE_DIR"])
+from mc_nudge import coverage_fact, coverage_question
 
 try:
     with open(sys.argv[1]) as f:
@@ -792,43 +798,12 @@ code_changed = pending.get("code_head_changed")
 store_changed = pending.get("store_head_changed")
 
 
-def yn(v):
-    if v is None:
-        return "unknown"
-    return "yes" if v else "no"
-
-
-if coverage_status != "ok":
-    fact_line = (
-        "Coverage signal — decision-topic coverage unknown "
-        f"(store index {coverage_status}); code HEAD changed: {yn(code_changed)}; "
-        f"store HEAD changed: {yn(store_changed)}"
-    )
-    has_evidence = bool(code_changed) or bool(store_changed)
-else:
-    n = len(unmapped)
-    shown = unmapped[:8]
-    extra = n - len(shown)
-    paths_line = ", ".join(shown) if shown else "(none)"
-    if extra > 0:
-        paths_line += f", +{extra}"
-    fact_line = (
-        f"Coverage signal — {n} edited file(s) with no decision topic: {paths_line}; "
-        f"code HEAD changed: {yn(code_changed)}; store HEAD changed: {yn(store_changed)}"
-    )
-    has_evidence = (n > 0) or bool(code_changed) or bool(store_changed)
+fact_line, has_evidence = coverage_fact(unmapped, coverage_status, code_changed, store_changed)
 
 if not has_evidence:
     sys.exit(3)
 
-store_root = os.environ.get("MEMCONTINUUM_ROOT") or "<store root not configured>"
-question = (
-    "Any ruling, incident, or rejected alternative from this session that "
-    "the MemContinuum store should hold? Store: " + store_root + " — a ruling "
-    "is a new link in topics/<area>/<topic>.md, an incident is a file in "
-    "incidents/ (see docs/SCHEMA.md); NOT Claude Code auto-memory. If none, "
-    "say so once."
-)
+question = coverage_question(os.environ.get("MEMCONTINUUM_ROOT") or "<store root not configured>")
 ctx = fact_line + "\n\n" + question
 print(json.dumps({
     "hookSpecificOutput": {

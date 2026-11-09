@@ -45,7 +45,7 @@ wired one level up, into `~/.claude/settings.json`, by `memcontinuum-setup.sh`.
 |---|---|---|
 | `pre-edit-chain.sh` | `PreToolUse` (Edit/Write, filtered to the repository each `--code-root` sits in, or to the root itself outside git) | `for-path` lookup on the file being edited; injects matching chains as `additionalContext`. On a genuine miss, runs the search fallback (see below) on the path's own words |
 | `newfile-nudge.sh` | `PreToolUse` (Write only, filtered to `--code-root`) | fires only when the write target does not exist yet and its extension is wired for this project; injects one reminder to search the code index first, plus the search fallback (see below) appended to that same reminder. Separately (newlang-nudge): when the extension is one the engine supports but this project never wired, injects a structured, numbered decision point (wire it / decline it permanently via `--never-ext` / not now) naming the language -- deduped once per language per session. The log-only DETECTION outcome (`outcome=language-available-not-wired`) still fires on every occurrence regardless of `--code-root`, unchanged and pre-existing; the VISIBLE decision point is gated on the SAME `--code-root` containment as the wired-file reminder |
-| `ledger-post-edit.sh` | `PostToolUse` (every tool; no settings-level matcher) | a bash-only prefilter exits before the watchdog for read-only built-ins (`Read`, `Grep`, ...); `Edit`/`Write`/`MultiEdit`/`NotebookEdit` ledger the tool's own file path (`source: tool`); `Bash` and any tool this hook has no dedicated branch for fall through to a shell-diff (`git status`) tree comparison against a per-root baseline (`source: shell-diff`); an unrecognized or missing `tool_name` additionally logs `outcome=unsupported-mutation-surface` |
+| `ledger-post-edit.sh` | `PostToolUse` (every tool; no settings-level matcher) | a bash-only prefilter exits before the watchdog for read-only built-ins (`Read`, `Grep`, ...) and for harness-side tools that take no file to write (`SubagentHandback`, `SendMessage`, `Monitor`, `TaskStop`, `TaskOutput`, `ListAgents`, `SendFeedback`, `ReadNotifications`, `ScheduleWakeup`, `ReportFindings`); every `mcp__*` tool and any unlisted name falls through; `Edit`/`Write`/`MultiEdit`/`NotebookEdit` ledger the tool's own file path (`source: tool`); `Bash` and any tool this hook has no dedicated branch for fall through to a shell-diff (`git status`) tree comparison against a per-root baseline (`source: shell-diff`); an unrecognized or missing `tool_name` additionally logs `outcome=unsupported-mutation-surface` |
 | `precompact-persist.sh` | `PreCompact` | persists session state before context is compacted away |
 | `sessionstart-remind.sh` | `SessionStart` | on `startup`/`resume`/`clear`, initializes session state (captures the code/store roots' git HEAD, prunes state older than 24h; `clear` resets the session's counters and pending nudges but carries the edit ledger over, `resume` keeps everything), then attempts the standing-decisions digest (see [standing decisions](#standing-decisions)); on `source: compact`, injects what `precompact-persist.sh` left pending, with the digest appended after it |
 | `userprompt-remind.sh` | `UserPromptSubmit` | never reads the diff; never reads the prompt text UNLESS the opted-in prompt-query channel is ON for this project (see "Prompt-derived queries" below), in which case it may derive search terms from the prompt, in process, and discard it; fires the coverage, commit, look-back, or prompt-query nudge |
@@ -191,7 +191,7 @@ q=<+-joined tokens> fb_ms=<N>`) and `search-fallback-empty`
 `reason=bad-json` / `reason=lib-missing` — `hooks/mc-fallback-lib.sh`
 itself failed to source, plus `fb_ms=<N>` whenever the search subprocess
 actually ran). `fb_ms` is millisecond-resolution wall time of the search
-subprocess call only (`date +%s%3N`, a python `time.time()` fallback where
+subprocess call only (`date +%s%3N`, a perl `Time::HiRes` call, then a python `time.time()` fallback, where
 `%3N` isn't supported) — the same field name on both hooks, present only
 when the subprocess ran, so `no-query`/`store-root` never contribute a
 sample. The query is `+`-joined, not quoted-with-spaces: `memidx.py
@@ -614,9 +614,10 @@ reason: it is not a second prompt, and counting it as one used to inflate a
 handful of real turns into double their number.
 
 `ledger-post-edit.sh` itself has two further exceptions to "exactly one
-`outcome=` line". A read-only built-in (`Read`, `Grep`, ...) is caught by the
-prefilter before the watchdog and writes nothing at all — no line, no
-process spawned. The shell-diff branch (`Bash`, or any tool with no
+`outcome=` line". A read-only built-in (`Read`, `Grep`, ...) or a harness-side tool
+(`SubagentHandback`, `SendMessage`, `Monitor`, ...) is caught by the
+prefilter before the watchdog and writes nothing at all — no line, and no
+Python, watchdog or Git process (the hook has run only `dirname` and `cat`). The shell-diff branch (`Bash`, or any tool with no
 dedicated branch) can write several lines in one run: one
 `outcome=appended kind=<code|store> source=shell-diff` per path the tree
 diff found changed, always followed by exactly one summary line,
@@ -1699,7 +1700,10 @@ the paths edited since the previous one. Whenever the prompt hook consults the c
 paths or with none (the block is entered for a coverage candidate or a moved code HEAD; a prompt outside both reads no cache and makes no call), because that call is also the index-state check and the stale self-heal; cached
 verdicts are reused only while the store HEAD is unchanged, the store worktree is clean (a bind being filed
 is uncommitted by construction), the call did not heal the index (`healed` in its JSON), and the path was not
-edited again since its verdict (the ledger `seen_at` and `classified_at` are both fractional epoch seconds; a fractional `seen_at` makes a path new when `seen_at > classified_at`; only a whole-second `seen_at` (rows from older hook versions, or an integral `time.time()`) uses `seen_at >= floor(classified_at)`, which costs at most one extra classification and never a miss). Anything else reclassifies
+edited again since its verdict (the ledger `seen_at` and `classified_at` are both fractional epoch seconds; a fractional `seen_at` makes a path new when `seen_at > classified_at`; only a whole-second `seen_at` (rows from older hook versions, or an integral `time.time()`) uses `seen_at >= floor(classified_at)`, which costs at most one extra classification and never a miss). `ignored` is cached exactly like `unmapped`. An edit to an
+ignore rule (a `.gitignore`, or a path ending `.git/info/exclude`) seen in the ledger after the oldest cached verdict
+drops the whole cache before the call, so every path is classified again; any other change of an
+ignore rule (made outside the session's ledger) can leave a verdict stale until the file is edited again or the store changes. Anything else reclassifies
 every path and rebuilds the cache. A directory listing is only a fast path for names it contains; a name it
 does not contain is checked with `lstat`, because a Unicode-normalising or case-insensitive mount can
 resolve a spelling the listing does not show.
@@ -4199,7 +4203,24 @@ down:
   has vanished counts as `removed`. Text mode adds `check: N record(s)
   quarantined` and one `! <path>: <field>: <message>` line per entry.
 - **`unmapped PATH...`** — classifies each path as `mapped_topic`,
-  `mapped_concept_only`, or `unmapped` without walking the code tree.
+  `mapped_concept_only`, `unmapped` or `ignored` without walking the code tree.
+  `ignored` is a path that would otherwise be `unmapped`, lies under a code
+  root and is ignored by that root's git (one `git --no-optional-locks check-ignore -z --stdin` per
+  root, root-relative paths): it leaves the
+  `unmapped` list and count, is listed under `ignored` in the JSON (and printed
+  as `ignored: N`) and is `"ignored"` in `by_path`. A tracked file that matches an
+  ignore pattern is still `unmapped`. Store paths are excluded by canonical
+  prefix, wherever the store lives: a path equal to the store root or under it
+  is never checked, even when the store sits inside a code root. Any git failure
+  (missing, not a work tree, timeout) leaves the path `unmapped`. The whole pass
+  shares one deadline, `MEMCONTINUUM_IGNORE_CHECK_BUDGET` seconds (default: a
+  quarter of the hook's effective watchdog budget, which the launcher exports
+  as `MC_WATCHDOG_EFFECTIVE_BUDGET`; 1 s outside a hook); each root's git call
+  gets what is left of it (never more than the git timeout used for the code
+  walk) and roots left when it is spent are skipped. The JSON field
+  `ignore_check` says how the pass ended: `"complete"`, `"timeout"` or
+  `"skipped"`; the prompt hook adds `ignore_check=` to its outcome line only
+  when it is not `complete`, and does not cache the verdicts of such a call.
   `coverage_status` mirrors the decision index's states, collapsed for a
   *negative* claim's purposes: `"ok"` (state was `current`, queried normally —
   the only state that actually populates `unmapped`), `"uninitialized"`

@@ -423,6 +423,17 @@ class HookTestBase(unittest.TestCase):
         env.update(overrides)
         return env
 
+    def assert_hook_logged_under_one_second(self, wall):
+        """TOP-0137 L29: the hook measures itself (`elapsed=` on its hook.log
+        lines, started at script start), which is what a latency bound is
+        about; the test's own wall clock only guards against a hang, since a
+        loaded runner adds process-scheduling time that is not the hook's."""
+        self.assertLess(wall, 5.0, f"hook hung: {wall:.3f}s")
+        text = (self.home / "hook.log").read_text()
+        fields = [float(v) for v in re.findall(r"\belapsed=(\d+(?:\.\d+)?)s", text)]
+        self.assertTrue(fields, "no elapsed= field in hook.log:\n" + text)
+        self.assertLess(max(fields), 1.0, text)
+
     def poisoned_base_env(self, **overrides):
         # Build on the already-correctly-scoped base_env rather than a
         # second, fresh `clean_env()` snapshot -- that fresh snapshot's
@@ -603,6 +614,9 @@ class TestLedgerPostEdit(HookTestBase):
         (fake / "date").write_text(
             '#!/usr/bin/env bash\ncase "$*" in *%3N*) echo 3N;; *) exec /bin/date "$@";; esac\n')
         (fake / "date").chmod(0o755)
+        # No perl either: the last rung (whole seconds) is under test.
+        (fake / "perl").write_text("#!/bin/sh\nexit 127\n")
+        (fake / "perl").chmod(0o755)
         # mc_elapsed_field resolves `python3` from PATH (mc_now_ms "" 1), not
         # from MC_PY: the spy is installed under every interpreter name first
         # on PATH (gate round 2 R2-3).
@@ -620,6 +634,37 @@ class TestLedgerPostEdit(HookTestBase):
             env=self.base_env(PATH=str(fake) + os.pathsep + os.environ["PATH"]),
         )
         self.assertRegex(proc.stdout, r"^elapsed=\d+\.0s mode=python$", proc.stdout + proc.stderr)
+        self.assertFalse(spy.exists(), "python was spawned for a log field")
+
+    def test_elapsed_field_keeps_milliseconds_across_a_second_boundary_without_date_percent_n(self):
+        """Gate round 1 R1-3: bash 3.2 (no EPOCHREALTIME) with a BSD `date`
+        (no %N) must still time a 20 ms hook that spans a second boundary as
+        0.0s, not 1.0s -- the perl rung supplies milliseconds, no python is
+        spawned. The clock is pinned: a stub perl answers 100.990 s then
+        101.010 s after the probe, and the start is pinned the same way."""
+        spy = Path(self.td) / "python-spawned"
+        fake = Path(self.td) / "fakebin-perl"
+        fake.mkdir()
+        (fake / "date").write_text(
+            '#!/usr/bin/env bash\ncase "$*" in *%3N*) echo 3N;; *) exec /bin/date "$@";; esac\n')
+        (fake / "date").chmod(0o755)
+        counter = Path(self.td) / "perl-calls"
+        (fake / "perl").write_text(
+            "#!/bin/sh\n"
+            f'echo x >> "{counter}"; n=$(wc -l < "{counter}" | tr -d " ")\n'
+            'if [ "$n" = 1 ]; then echo 1700000000990; else echo 1700000001010; fi\n')
+        (fake / "perl").chmod(0o755)
+        for name in ("python3", "python"):
+            (fake / name).write_text('#!/bin/sh\ntouch "' + str(spy) + '"\n')
+            (fake / name).chmod(0o755)
+        script = ('unset EPOCHREALTIME; source "$1"; unset EPOCHREALTIME; MC_QUERY_MS_MODE=""; '
+                  'MC_T0_US=1700000000990000; mc_elapsed_field; printf " mode=%s" "$MC_QUERY_MS_MODE"')
+        proc = subprocess.run(
+            [MC_BASH, "-c", script, "_", str(HOOKS_DIR / "memlib.sh")],
+            capture_output=True, text=True, timeout=10,
+            env=self.base_env(PATH=str(fake) + os.pathsep + os.environ["PATH"]),
+        )
+        self.assertEqual(proc.stdout, "elapsed=0.0s mode=perl", proc.stdout + proc.stderr)
         self.assertFalse(spy.exists(), "python was spawned for a log field")
 
     def _future_start_us(self, seconds=5):
@@ -873,7 +918,7 @@ class TestLedgerPostEdit(HookTestBase):
         payload = self.post_tool_use_payload(session_id, fpath)
         proc, elapsed = run_script(LEDGER_HOOK, payload, self.poisoned_base_env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertLess(elapsed, 1.0)
+        self.assert_hook_logged_under_one_second(elapsed)
         state = self.load_state(session_id)
         self.assertIn(fpath, [e["path"] for e in state.get("ledger", [])])
 
@@ -1708,10 +1753,14 @@ class TestMutationSurface(HookTestBase):
         payload = self.read_only_payload(
             session_id, "Read", file_path=str(self.code_root / "src" / "mapped.py")
         )
-        proc, elapsed = run_script(LEDGER_HOOK, payload, self.base_env())
+        # The fast path is "no python launched" (a stub python records every
+        # launch); the wall clock only guards against a hang.
+        marker, env = self._spawn_probe_env()
+        proc, elapsed = run_script(LEDGER_HOOK, payload, env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout, "")
-        self.assertLess(elapsed, 0.05, elapsed)
+        self.assertFalse(marker.exists(), "python was spawned on the read-only fast path")
+        self.assertLess(elapsed, 5.0, f"hook hung: {elapsed:.3f}s")
         log_path = self.home / "hook.log"
         self.assertFalse(
             log_path.exists() and log_path.read_text().strip(),
@@ -1721,12 +1770,58 @@ class TestMutationSurface(HookTestBase):
     def test_grep_tool_also_exits_fast_with_no_log_line(self):
         session_id = "s-mutation-grep"
         payload = self.read_only_payload(session_id, "Grep")
-        proc, elapsed = run_script(LEDGER_HOOK, payload, self.base_env())
+        # The fast path is "no python launched" (a stub python records every
+        # launch); the wall clock only guards against a hang.
+        marker, env = self._spawn_probe_env()
+        proc, elapsed = run_script(LEDGER_HOOK, payload, env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout, "")
-        self.assertLess(elapsed, 0.05, elapsed)
+        self.assertFalse(marker.exists(), "python was spawned on the read-only fast path")
+        self.assertLess(elapsed, 5.0, f"hook hung: {elapsed:.3f}s")
         log_path = self.home / "hook.log"
         self.assertFalse(log_path.exists() and log_path.read_text().strip())
+
+    HARNESS_SIDE_TOOLS = (
+        "SubagentHandback", "SendMessage", "Monitor", "TaskStop", "TaskOutput",
+        "ListAgents", "SendFeedback", "ReadNotifications", "ScheduleWakeup",
+        "ReportFindings",
+    )
+
+    def _spawn_probe_env(self):
+        """base_env with MEMCONTINUUM_PYTHON swapped for a stub that records
+        every launch, so a test can prove that no python was spawned."""
+        marker = Path(self.td) / "python-spawned"
+        stub = Path(self.td) / "stub-python.sh"
+        stub.write_text('#!/bin/sh\necho "$0 $*" >> "%s"\nexit 0\n' % marker)
+        stub.chmod(0o755)
+        return marker, self.base_env(MEMCONTINUUM_PYTHON=str(stub))
+
+    def test_harness_side_tools_exit_before_any_python_with_no_log_line(self):
+        marker, env = self._spawn_probe_env()
+        for tool in self.HARNESS_SIDE_TOOLS:
+            with self.subTest(tool=tool):
+                proc, _ = run_script(
+                    LEDGER_HOOK, self.unknown_tool_payload("s-harness-" + tool, tool), env
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout, "")
+                self.assertFalse(marker.exists(), f"{tool} spawned python")
+                log_path = self.home / "hook.log"
+                self.assertFalse(
+                    log_path.exists() and log_path.read_text().strip(),
+                    f"{tool} must leave hook.log untouched",
+                )
+                self.assertFalse(self.state_file("s-harness-" + tool).exists())
+
+    def test_mcp_and_unknown_tools_still_fall_through_the_prefilter(self):
+        # R6: an unknown tool stays observable; the stub python is launched.
+        marker, env = self._spawn_probe_env()
+        for tool in ("mcp__claude_ai_Claude_Docs__update", "SomeFutureTool"):
+            marker.unlink(missing_ok=True)
+            with self.subTest(tool=tool):
+                proc, _ = run_script(LEDGER_HOOK, self.unknown_tool_payload("s-fall-" + tool, tool), env)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertTrue(marker.exists(), f"{tool} did not reach python")
 
     # -- 4: NotebookEdit ledgered via notebook_path when file_path is absent -
 
@@ -2995,7 +3090,14 @@ class TestSessionStartRemind(HookTestBase):
             self.poisoned_base_env(),
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertLess(elapsed, 1.0)
+        # TOP-0137 L29: this hook logs no elapsed= field, so the property is
+        # asserted directly: the poisoned yaml was never imported and the
+        # hook completed with its own logged outcome. Hang guard only.
+        self.assertLess(elapsed, 5.0, f"hook hung: {elapsed:.3f}s")
+        self.assertNotIn("poisoned PYTHONPATH not cleared", proc.stderr)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertNotIn("poisoned PYTHONPATH not cleared", log_text)
+        self.assertIn("sessionstart outcome=", log_text)
 
     def test_fail_open_when_watchdog_lib_missing(self):
         """R1 regression, round 4 gate: see TestLedgerPostEdit's twin."""
@@ -3788,7 +3890,10 @@ class TestSessionStartCompactLookback(HookTestBase):
             self.poisoned_base_env(),
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertLess(elapsed, 1.0)
+        # TOP-0137 L29: no elapsed= field on this hook; the fire pinned below
+        # proves the poisoned yaml was not imported. Hang guard only.
+        self.assertLess(elapsed, 5.0, f"hook hung: {elapsed:.3f}s")
+        self.assertNotIn("poisoned PYTHONPATH not cleared", proc.stderr)
         # dual-gate finding 6: pin an actual fire under poison, not just
         # "didn't crash" (also true, vacuously, on a hook without the
         # look-back twin at all).
@@ -4190,6 +4295,91 @@ class TestUserPromptRemind(HookTestBase):
         self._prompt(session_id, env)
         calls = self._unmapped_calls(spy)
         self.assertEqual(self._call_paths(calls[1]), [unmapped], calls)
+
+    def test_the_coverage_line_leaves_out_a_gitignored_path_in_list_and_count(self):
+        _write(self.code_root / ".gitignore", "scratch/\n")
+        _write(self.code_root / "scratch" / "x.py", "# scratch\n")
+        session_id = "s-userprompt-gitignored"
+        ignored = str(self.code_root / "scratch" / "x.py")
+        unmapped = str(self.code_root / "src" / "unmapped.py")
+        self.seed_ledger(session_id, [(ignored, "code"), (unmapped, "code")])
+        proc = self._prompt(session_id, self.base_env())
+        self.assertIn("1 edited file(s) with no decision topic: src/unmapped.py;", proc.stdout)
+        self.assertNotIn("scratch", proc.stdout)
+        cache = self.load_state(session_id)["unmapped_cache"]
+        self.assertEqual(cache["verdicts"][ignored], "ignored")
+        self.assertEqual(cache["verdicts"][unmapped], "unmapped")
+
+    def test_only_ignored_paths_count_zero_in_the_coverage_line(self):
+        _write(self.code_root / ".gitignore", "scratch/\n")
+        _write(self.code_root / "scratch" / "x.py", "# scratch\n")
+        session_id = "s-userprompt-gitignored-only"
+        self.seed_ledger(session_id, [(str(self.code_root / "scratch" / "x.py"), "code")])
+        proc = self._prompt(session_id, self.base_env())
+        self.assertIn("0 edited file(s) with no decision topic: (none);", proc.stdout)
+        self.assertNotIn("scratch", proc.stdout)
+
+    def test_an_ignore_rule_edit_drops_the_verdict_cache(self):
+        spy = Path(self.td) / "unmapped-calls.log"
+        env = self._spy_env(spy)
+        session_id = "s-userprompt-gitignore-edit"
+        scratch = self.code_root / "scratch" / "x.py"
+        _write(scratch, "# scratch\n")
+        unmapped = self.code_root / "src" / "unmapped.py"
+        self._edit_through_ledger_hook(session_id, str(scratch))
+        self._edit_through_ledger_hook(session_id, str(unmapped))
+        first = self._prompt(session_id, env)
+        self.assertIn("2 edited file(s) with no decision topic: scratch/x.py, src/unmapped.py;", first.stdout)
+        # An ordinary edit reclassifies that path alone ...
+        self._edit_through_ledger_hook(session_id, str(unmapped))
+        self.patch_state(session_id, last_injected_pairs=[])
+        self._prompt(session_id, env)
+        calls = self._unmapped_calls(spy)
+        self.assertEqual(self._call_paths(calls[1]), [str(unmapped)], calls)
+        # ... a .gitignore edit drops the cache and reclassifies everything.
+        _write(self.code_root / ".gitignore", "scratch/\n")
+        self._edit_through_ledger_hook(session_id, str(self.code_root / ".gitignore"))
+        self.patch_state(session_id, last_injected_pairs=[])
+        third = self._prompt(session_id, env)
+        calls = self._unmapped_calls(spy)
+        self.assertEqual(
+            sorted(self._call_paths(calls[2])),
+            sorted([str(scratch), str(unmapped), str(self.code_root / ".gitignore")]), calls,
+        )
+        self.assertNotIn("scratch/x.py", third.stdout)
+        self.assertEqual(self.load_state(session_id)["unmapped_cache"]["verdicts"][str(scratch)], "ignored")
+
+    def test_a_slow_git_ignore_check_fails_open_before_the_watchdog(self):
+        """Gate round 1 R1-1: a git that outlives the ignore-check budget (a
+        quarter of the hook's effective budget) must not carry the hook into
+        the watchdog kill: the paths stay unmapped, the line says so, and no
+        verdict is cached."""
+        import shutil
+        stub_dir = Path(self.td) / "slow-git-bin"
+        stub_dir.mkdir()
+        stub = stub_dir / "git"
+        stub.write_text(
+            "#!/bin/sh\n"
+            'case " $* " in *" check-ignore "*) sleep 6;; esac\n'
+            f'exec "{shutil.which("git")}" "$@"\n'
+        )
+        stub.chmod(0o755)
+        _write(self.code_root / ".gitignore", "scratch/\n")
+        _write(self.code_root / "scratch" / "x.py", "# scratch\n")
+        session_id = "s-userprompt-slow-git"
+        self.seed_ledger(session_id, [
+            (str(self.code_root / "scratch" / "x.py"), "code"),
+            (str(self.code_root / "src" / "unmapped.py"), "code"),
+        ])
+        env = self.base_env(MC_WATCHDOG_BUDGET="1.5", PATH=f"{stub_dir}{os.pathsep}{os.environ['PATH']}")
+        t0 = time.monotonic()
+        proc = self._prompt(session_id, env)
+        self.assertLess(time.monotonic() - t0, 5.0)
+        log = (self.home / "hook.log").read_text()
+        self.assertNotIn("watchdog-killed", log)
+        self.assertRegex(log, r"userprompt outcome=\S+ .*ignore_check=timeout ")
+        self.assertIn("2 edited file(s) with no decision topic: scratch/x.py, src/unmapped.py;", proc.stdout)
+        self.assertNotIn("unmapped_cache", self.load_state(session_id))
 
     def test_a_non_ok_answer_drops_the_cache(self):
         spy = Path(self.td) / "unmapped-calls.log"
@@ -5125,7 +5315,7 @@ class TestUserPromptRemind(HookTestBase):
             USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.poisoned_base_env()
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertLess(elapsed, 1.0, f"userprompt hook took {elapsed:.3f}s with a 20-path ledger")
+        self.assert_hook_logged_under_one_second(elapsed)
 
     def test_fail_open_when_watchdog_lib_missing(self):
         """R1 regression, round 4 gate: see TestLedgerPostEdit's twin."""
@@ -5489,7 +5679,7 @@ class TestUserPromptLookback(HookTestBase):
             USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.poisoned_base_env()
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertLess(elapsed, 1.0)
+        self.assert_hook_logged_under_one_second(elapsed)
         self.assertIn("Look-back signal", proc.stdout)
 
     def test_log_line_format(self):
@@ -6223,7 +6413,7 @@ Body prose about widget regression throttling handling in detail.
         proc, elapsed = run_script(USERPROMPT_HOOK, payload, self.pq_env(), timeout=10.0)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("Nearest recorded decision", proc.stdout)
-        self.assertLess(elapsed, 1.0, f"userprompt hook (prompt-query ON, hit) took {elapsed:.3f}s")
+        self.assert_hook_logged_under_one_second(elapsed)
 
     # -- fix round 1 (Grok) --------------------------------------------------
 
@@ -9396,7 +9586,8 @@ class TestMacOSPortMechanics(unittest.TestCase):
         the `signal.signal(...)`/`atexit.register(_kill_group)` lines
         back out of mc-watchdog.sh (equivalent to the launcher blob every
         hook used to carry before this dedup) leaves the heartbeat child
-        running well past the 1s bound this test asserts, because nothing
+        running well past the bound this test asserts (a 3 s hang guard;
+        the property is that the child dies), because nothing
         catches the SIGTERM in time to kill its process group before the
         default handler just terminates the launcher outright."""
         launcher_py = subprocess.run(
@@ -9437,14 +9628,18 @@ class TestMacOSPortMechanics(unittest.TestCase):
 
             os.kill(launcher_proc.pid, signal.SIGTERM)
             start = time.monotonic()
-            while child_alive() and time.monotonic() - start < 1.0:
+            while child_alive() and time.monotonic() - start < 3.0:
                 time.sleep(0.02)
             died_after = time.monotonic() - start
             self.assertFalse(
                 child_alive(),
                 f"inner process group outlived the launcher's SIGTERM by >{died_after:.3f}s",
             )
-            self.assertLess(died_after, 1.0, f"took {died_after:.3f}s -- expected ~0.5s")
+            # TOP-0137 L29: a wide guard (the group is killed at once; the 1 s
+            # bound measured the runner, not the launcher). A signal kill logs
+            # no watchdog-killed line -- only a budget expiry does, and that
+            # line's budget= field is pinned by the budget-expiry tests.
+            self.assertLess(died_after, 3.0, f"took {died_after:.3f}s -- expected ~0.5s")
         finally:
             try:
                 os.killpg(launcher_proc.pid, signal.SIGKILL)
