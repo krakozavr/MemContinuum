@@ -865,6 +865,20 @@ class TestNonScalarTypeUnderAgainstRef(GuardCase):
         self.assertRefused(ttext(["src/a.py"]).replace('"fourth"', '"fourth, edited"', 1),
                            "link field changed after being recorded")
 
+    # round 2 bypass: the REF's links chain was read from the repaired parse, so on an incident the
+    # ruling edit rode in with the metadata repair.
+    def _incident_with_links(self, meta=True, text="first"):
+        return self._incident(meta=meta, extra="links:\n" + link_yaml("L1", text=text))
+
+    def test_repairing_the_metadata_of_an_incident_with_links_alone_is_clean(self):
+        self.store(self._incident_with_links())
+        self.assertClean(self._incident_with_links(meta=False))
+
+    def test_repair_plus_rewriting_a_recorded_ruling_on_an_incident_is_refused(self):
+        self.store(self._incident_with_links())
+        self.assertRefused(self._incident_with_links(meta=False, text="first, edited"),
+                           "link field changed after being recorded")
+
     def test_repair_plus_dropping_an_anchor_row_on_a_topic_is_refused(self):
         refs = ("src/foo.py",)
         old = binding_topic([good_row()], code_refs=refs).replace("tags: []\n", "tags: []\nmetadata:\n  type: [x]\n", 1)
