@@ -12928,6 +12928,8 @@ class _Receipt:
         self.command, self.ref, self.mark = data["command"], data["ref"], data["mark"]
         self.before = base64.b64decode(data["before"], validate=True)
         self.after = base64.b64decode(data["after"], validate=True)
+        # decoded once, at admission: a receipt whose images are not UTF-8 is not a receipt
+        self.before_text, self.after_text = self.before.decode("utf-8"), self.after.decode("utf-8")
         self.written_at = data["written_at"]
 
     def row(self) -> str:
@@ -12937,33 +12939,40 @@ class _Receipt:
         return f"{self.command} of {self.ref} (no mark row)"
 
 
-def _valid_state(state, kinds: tuple) -> bool:
-    """A recorded probe result: one of the explicit states, with its fields."""
+def _valid_state(state, kinds: tuple, staged: bool = False) -> bool:
+    """A recorded probe result: one of the explicit states, with exactly its
+    fields (an index entry also carries its integer stage)."""
     if not isinstance(state, dict) or state.get("kind") not in kinds:
         return False
     if state["kind"] != "entry":
         return set(state) == {"kind"}
-    fields = {"kind", "mode", "oid"} | ({"stage"} if "stage" in state else set())
-    return (set(state) == fields and isinstance(state["mode"], str) and isinstance(state["oid"], str)
-            and isinstance(state.get("stage", 0), int) and not isinstance(state.get("stage", 0), bool))
+    stage = state.get("stage")
+    return (set(state) == {"kind", "mode", "oid"} | ({"stage"} if staged else set())
+            and isinstance(state["mode"], str) and isinstance(state["oid"], str)
+            and (not staged or (isinstance(stage, int) and not isinstance(stage, bool))))
 
 
-def _parse_receipt(path: Path, seq: int) -> "_Receipt | None":
+def _parse_receipt(path: Path, seq: int, store: str, topic_id: str) -> "_Receipt | None":
+    """Admit a receipt only when the WHOLE record is valid: this version, every
+    field present with its type, both probe states well formed, a known command,
+    both images base64 of UTF-8, and `store`/`topic_id` equal to the scope's. Any
+    other file authorises nothing (the caller prunes it under the lock)."""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        str_keys = ("topic_id", "topic_path", "command", "ref", "before", "after", "written_at")
+        str_keys = ("store", "topic_id", "topic_path", "command", "ref", "before", "after", "written_at")
+        mark = data.get("mark") if isinstance(data, dict) else None
         if (not isinstance(data, dict) or data.get("v") != RECEIPT_VERSION
                 or any(not isinstance(data.get(k), str) for k in str_keys)
-                or data["command"] not in _UNDO_OF
+                or data["store"] != store or data["topic_id"] != topic_id
+                or data["command"] not in _UNDO_OF or not data["topic_path"]
                 or not _valid_state(data.get("committed"), ("entry", "absent", "unborn"))
-                or not _valid_state(data.get("staged"), ("entry", "absent"))
-                or not (data.get("mark") is None or (
-                    isinstance(data["mark"], dict)
-                    and all(isinstance(data["mark"].get(k), str) for k in ("ref", "action", "recorded_at"))))):
+                or not _valid_state(data.get("staged"), ("entry", "absent"), staged=True)
+                or not (mark is None or (isinstance(mark, dict)
+                                         and all(isinstance(mark.get(k), str) for k in ("ref", "action", "recorded_at"))))):
             return None
         return _Receipt(path, seq, data)
-    except (OSError, ValueError, KeyError, UnicodeDecodeError):
-        return None
+    except (OSError, ValueError, KeyError):
+        return None  # includes bad JSON, bad base64 and UnicodeDecodeError
 
 
 class _UndoScope:
@@ -13021,7 +13030,7 @@ class _UndoScope:
             self.max_seq = max(self.max_seq, int(digits))
             if int(digits) in self._dropped:
                 continue
-            parsed = _parse_receipt(self.rec_dir / name, int(digits))
+            parsed = _parse_receipt(self.rec_dir / name, int(digits), str(self.store), self.topic_id)
             if parsed is None:
                 self.invalid.append(self.rec_dir / name)
             else:
@@ -13254,8 +13263,7 @@ def _restore_receipt(scope: "_UndoScope", path: Path, root: Path, current: bytes
     `scope.locked()` with the bytes `undo_plan` decided on. The committed and
     staged entries and the topic bytes are read once more immediately before
     the replacement: the lock does not serialize external git commands."""
-    sys.stdout.write(_unified_diff(current.decode("utf-8"), receipt.before.decode("utf-8"),
-                                   _edit_label(path, root)))
+    sys.stdout.write(_unified_diff(current.decode("utf-8"), receipt.before_text, _edit_label(path, root)))
     if dry_run:
         print("dry-run: nothing written")
         return

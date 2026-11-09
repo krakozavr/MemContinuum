@@ -2632,6 +2632,53 @@ class TestUndoReceipts(BindCase):
         self.assertNotEqual(self.raw(), before)
         self.assertGuardsClean()
 
+    def forge(self, **changes):
+        """Rewrite the only receipt on disk with `changes` (a value of None deletes the key)."""
+        (name,) = self.receipts()
+        file = self.rec_dir() / name
+        data = json.loads(file.read_text())
+        for key, value in changes.items():
+            if value is None:
+                data.pop(key, None)
+            else:
+                data[key] = value
+        file.write_text(json.dumps(data))
+        return file
+
+    def test_a_receipt_that_is_not_wholly_valid_is_dropped_and_authorises_nothing(self):
+        # gate round 1 (Sol 2): foreign topic id, foreign store, missing fields, invalid UTF-8
+        import base64
+        bad = {
+            "foreign topic id": {"topic_id": "TOP-2"},
+            "foreign store": {"store": "/somewhere/else"},
+            "missing store": {"store": None},
+            "missing mark key type": {"mark": {"ref": 1}},
+            "invalid utf-8 before": {"before": base64.b64encode(b"\xff\xfe").decode()},
+            "invalid utf-8 after": {"after": base64.b64encode(b"\xc3\x28").decode()},
+            "unknown command": {"command": "rebind"},
+            "committed state without its oid": {"committed": {"kind": "entry", "mode": "100644"}},
+            "stage on the committed state": {"committed": {"kind": "absent", "stage": 0}},
+            "staged entry without a stage": {"staged": {"kind": "entry", "mode": "100644", "oid": "ab"}},
+            "version one": {"v": 1},
+        }
+        for name, changes in bad.items():
+            with self.subTest(name):
+                self.head_state(refs=())
+                self.assertEqual(self.bind()[0], 0)
+                after = self.raw()
+                forged = self.forge(**changes)
+                rc, out, err = self.unbind()
+                self.assertEqual(rc, 0, err)
+                self.assertNotIn("undo:", out)
+                self.assertNotIn("Traceback", err)
+                self.assertNotEqual(self.raw(), after)
+                # the forged file was dropped; the only receipt left is the ordinary unbind's own
+                self.assertEqual(json.loads(forged.read_text())["command"], "unbind")
+                self.assertEqual(len(self.receipts()), 1)
+                commit_all(self.store)
+                for leftover in self.rec_dir().glob("*.json"):
+                    leftover.unlink()
+
     def test_receipts_are_outside_the_store_tree_and_the_working_tree_stays_clean(self):
         self.head_state(refs=())
         self.assertEqual(self.bind()[0], 0)

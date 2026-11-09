@@ -3753,8 +3753,11 @@ A, or a changed staged entry is refused with the pending row named and the ways 
 or commit first); nothing is written. Every probe returns an explicit state or
 "unavailable" (a timeout, a missing git, any failure that is not a verified absence); an
 unavailable probe, at decision time or when the receipt is recorded, refuses without
-dropping or writing anything. A missing, malformed, unknown-version or non-matching
-receipt means the ordinary path. A receipt authorises restoring B only; it never deletes
+dropping or writing anything. A receipt is admitted only when the whole record is valid
+(the current version, every field present with its type, well-formed probe states, a known
+command, both images base64 of UTF-8, and `store` and `topic_id` equal to the scope's); any
+other file is dropped under the lock and authorises nothing, so a missing, malformed,
+unknown-version or foreign receipt means the ordinary path. A receipt authorises restoring B only; it never deletes
 anything that is not in B.
 
 Writers serialize on one `flock`ed lock file per topic next to the stack
