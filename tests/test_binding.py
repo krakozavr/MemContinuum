@@ -551,6 +551,18 @@ class TestBind(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         self.assertIn("src/alias/", memidx.parse_record_text(self.topic(), "x").frontmatter["code_refs"])
 
+    def test_prefix_whose_symlink_chain_leaves_the_code_root_and_returns_is_accepted(self):
+        """Containment is decided on the RESOLVED directory (intended rule, gate round 2 note)."""
+        self.put_topic(topic_text())
+        outside = Path(self.td) / "outside-back"
+        outside.mkdir()
+        (self.code / "src" / "real").mkdir()
+        os.symlink(self.code / "src" / "real", outside / "back-in")
+        os.symlink(outside, self.code / "src" / "leak")
+        rc, out, err = self.bind("src/leak/back-in/")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("src/leak/back-in/", memidx.parse_record_text(self.topic(), "x").frontmatter["code_refs"])
+
     def test_directory_without_slash_is_rc_2(self):
         self.put_topic(topic_text())
         rc, out, err = self.bind("src")
