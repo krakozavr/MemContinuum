@@ -53,8 +53,8 @@ INVENTORY_RELPATH = "docs/REUSE-INVENTORY.json"
 
 _INTERP = r"(?:python[\w.]*|\$\{?\w*PY\w*\}?)"
 _HEREDOC_RE = re.compile(r"(?<!<)<<(?!<)(-?)\s*(['\"]?)([A-Za-z_]\w*)\2")
-_PY_HEREDOC_LINE_RE = re.compile(r"(?i)" + _INTERP + r"\"?\s+-(?:\s|<)")
-_PY_INLINE_RE = re.compile(r"(?i)" + _INTERP + r"\"?\s+(?:-\w+\s+)*-c\s+'")
+_PY_HEREDOC_LINE_RE = re.compile(r"(?i)\"?" + _INTERP + r"\"?\s+-(?:\s|<)")
+_PY_INLINE_RE = re.compile(r"(?i)\"?" + _INTERP + r"\"?\s+(?:-\w+\s+)*-c\s+'")
 _SH_DECL_RE = re.compile(
     r"^(?P<indent>[ \t]*)(?:function[ \t]+(?P<fname>[A-Za-z_]\w*)[ \t]*(?:\([ \t]*\))?"
     r"|(?P<name>[A-Za-z_]\w*)[ \t]*\([ \t]*\))[ \t]*(?P<rest>.*)$")
@@ -509,6 +509,21 @@ def _strip_shell_comment(line: str) -> str:
     return line
 
 
+def _sh_interpreter_starts(cmds) -> list:
+    """The offsets of the word that names the program of each parsed command:
+    its first word, or the one after `env` and its `VAR=value` arguments."""
+    out = []
+    for cmd in cmds:
+        k = 0
+        if cmd.words and cmd.words[0].text == "env":
+            k = 1
+            while k < len(cmd.words) and _SH_ASSIGN_RE.match(cmd.words[k].raw):
+                k += 1
+        if k < len(cmd.words):
+            out.append(cmd.words[k].start)
+    return out
+
+
 def _mask_shell(text: str):
     """`(masked_lines, payloads, problems)`: the file's lines with heredoc bodies
     and python `-c '...'` payload bodies blanked (line numbers preserved), the
@@ -531,8 +546,16 @@ def _mask_shell(text: str):
         if not code.strip():
             i += 1
             continue
+        # an interpreter is recognised as a command word only (after assignments, exec, env): a quoted
+        # `python3 -c '...'` argument or a quoted `<<` is text
+        cmds, hd_offsets = _sh_parse(code)
+        starts = _sh_interpreter_starts(cmds)
         # single-quoted `<interp> -c '...'` payload
-        m = _PY_INLINE_RE.search(code)
+        m = None
+        for st in starts:
+            m = _PY_INLINE_RE.match(code, st)
+            if m:
+                break
         if m:
             start = offsets[i] + m.end()
             buf = []
@@ -559,7 +582,7 @@ def _mask_shell(text: str):
                 i = end_line + 1
                 continue
         # heredocs
-        hds = list(_HEREDOC_RE.finditer(code))
+        hds = [hm for hm in _HEREDOC_RE.finditer(code) if hm.start() in hd_offsets]
         if hds:
             j = i + 1
             resume = j
@@ -581,7 +604,7 @@ def _mask_shell(text: str):
                 if dash:
                     body_lines = [bl.lstrip("\t") for bl in body_lines]   # `<<-` strips leading tabs
                 body = "\n".join(body_lines)
-                if _PY_HEREDOC_LINE_RE.search(code[:hm.start()]) and hm is hds[0]:
+                if hm is hds[0] and any(_PY_HEREDOC_LINE_RE.match(code, st, hm.start()) for st in starts):
                     payloads.append((start_body + 1, body))
                 for k in range(start_body, j + 1):
                     keep[k] = False

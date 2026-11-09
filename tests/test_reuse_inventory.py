@@ -951,6 +951,20 @@ class TestScanner(unittest.TestCase):
         self.assertEqual(len(s.problems), 1)
         self.assertIn("h.sh:1:", s.problems[0])
 
+    def test_quoted_heredoc_opener_and_quoted_interpreter_text_are_not_scan_problems(self):
+        s = self.scan({"q.sh": '#!/usr/bin/env bash\necho "<<EOF"\necho "python3 -c \'not python !\'"\n'
+                               'echo \'$PY - <<EOT\'\n'})
+        self.assertEqual(s.problems, [])
+        self.assertEqual([d for d in s.defs if d.embedded], [])
+
+    def test_interpreter_invocations_count_after_assignments_exec_and_env_only(self):
+        for line in ("X=1 python3 -c 'def one():\n    pass'", "exec python3 -c 'def one():\n    pass'",
+                     "env X=1 python3 -c 'def one():\n    pass'", 'out=$("$PY" -c \'def one():\n    pass\')'):
+            s = self.scan({"i.sh": "#!/usr/bin/env bash\n" + line + "\n"})
+            self.assertEqual([d.name for d in s.defs if d.embedded], ["one"], line)
+        s = self.scan({"i.sh": "#!/usr/bin/env bash\nxargs python3 -c 'def one():\n    pass'\n"})
+        self.assertEqual([d for d in s.defs if d.embedded], [])
+
     def test_shell_text_drops_comments_and_heredoc_bodies(self):
         s = self.scan({"a.sh": '''\
             f() {
