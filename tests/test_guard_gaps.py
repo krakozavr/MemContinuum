@@ -3141,6 +3141,10 @@ class TestUndoReceipts(BindCase):
         self.assertEqual(errors, [], errors)
         rc, out = run_memlint(["--against-ref", "HEAD", str(wt)])
         self.assertEqual(rc, 0, out)
+        git(["add", "-A"], wt)
+        rc, out = run_memlint(["--against-ref", "HEAD", "--staged", str(wt)])
+        self.assertEqual(rc, 0, out)
+        git(["reset", "-q"], wt)
 
 
 class TestRemoveCodeRefEditor(unittest.TestCase):
