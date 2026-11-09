@@ -30,7 +30,8 @@ memlint checks both ways. Name the decision in commit messages too (`TOP-xxxx Ln
 A brief for a reviewer or a dispatched agent opens with the decision records, not a
 summary of them: paste the output of `memidx.py context-pack --project {{PROJECT}} <files the brief touches>`
 (engine README, "context pack") at its top; the closing `pack sha256` line names what
-the reader saw.
+the reader saw. When the code repository carries docs/C7-INVENTORY.json, add `--code-root <repo>`:
+the pack then lists the inventory rows for the files it touches, and the agent reuses the named owner.
 
 A brief for a dispatched agent says "find the existing implementation and name it
 (code-search first)"; a gate prompt asks "did this duplicate anything?"; both

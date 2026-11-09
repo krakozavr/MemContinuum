@@ -59,14 +59,23 @@ class TestRoutingRuleTemplate(unittest.TestCase):
         # Cap moved 36 -> 40: TOP-0137 L29 adds the "a decision must still be
         # true tomorrow" paragraph (session state is not a ruling) as its own
         # block after the store-section bullets.
+        # Cap moved 40 -> 41: TOP-0137 L35 adds one sentence to the context-pack
+        # paragraph (the pack lists the repository's reuse-inventory rows for the
+        # files the brief touches) -- a net +1-line addition inside that paragraph.
         text = TEMPLATE.read_text()
         lines = text.splitlines()
-        self.assertLessEqual(len(lines), 40, f"template is {len(lines)} lines, want <= 40")
+        self.assertLessEqual(len(lines), 41, f"template is {len(lines)} lines, want <= 41")
 
     def test_names_the_still_true_tomorrow_rule(self):
         text = TEMPLATE.read_text()
         self.assertIn("A decision must still be true tomorrow.", text)
         self.assertIn("session state, not a ruling", text)
+
+    def test_names_the_reuse_inventory_sentence(self):
+        text = TEMPLATE.read_text()
+        self.assertIn("docs/C7-INVENTORY.json", text)
+        self.assertIn("--code-root <repo>", text)
+        self.assertIn("reuses the named owner", text)
 
     def test_names_the_c3_rule(self):
         text = TEMPLATE.read_text()
