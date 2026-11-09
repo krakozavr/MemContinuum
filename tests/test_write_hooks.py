@@ -1753,10 +1753,14 @@ class TestMutationSurface(HookTestBase):
         payload = self.read_only_payload(
             session_id, "Read", file_path=str(self.code_root / "src" / "mapped.py")
         )
-        proc, elapsed = run_script(LEDGER_HOOK, payload, self.base_env())
+        # The fast path is "no python launched" (a stub python records every
+        # launch); the wall clock only guards against a hang.
+        marker, env = self._spawn_probe_env()
+        proc, elapsed = run_script(LEDGER_HOOK, payload, env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout, "")
-        self.assertLess(elapsed, 0.05, elapsed)
+        self.assertFalse(marker.exists(), "python was spawned on the read-only fast path")
+        self.assertLess(elapsed, 5.0, f"hook hung: {elapsed:.3f}s")
         log_path = self.home / "hook.log"
         self.assertFalse(
             log_path.exists() and log_path.read_text().strip(),
@@ -1766,10 +1770,14 @@ class TestMutationSurface(HookTestBase):
     def test_grep_tool_also_exits_fast_with_no_log_line(self):
         session_id = "s-mutation-grep"
         payload = self.read_only_payload(session_id, "Grep")
-        proc, elapsed = run_script(LEDGER_HOOK, payload, self.base_env())
+        # The fast path is "no python launched" (a stub python records every
+        # launch); the wall clock only guards against a hang.
+        marker, env = self._spawn_probe_env()
+        proc, elapsed = run_script(LEDGER_HOOK, payload, env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout, "")
-        self.assertLess(elapsed, 0.05, elapsed)
+        self.assertFalse(marker.exists(), "python was spawned on the read-only fast path")
+        self.assertLess(elapsed, 5.0, f"hook hung: {elapsed:.3f}s")
         log_path = self.home / "hook.log"
         self.assertFalse(log_path.exists() and log_path.read_text().strip())
 
