@@ -323,7 +323,13 @@ def _records_fresh_vector_counts(conn: "sqlite3.Connection", project: str) -> tu
 # same migration probe forces one full content pass on any generation-5-
 # or-older db, exactly as generation 3/4/5's own bumps did for their own
 # new columns.
-CURRENT_INDEX_GENERATION = 6
+# Bumped to 7 (TOP-0137 L29, gate round 1 R1-3): `type` and `metadata.type` must be a
+# string, so a canonical record that carries a list, mapping, number, bool, date or set
+# there is now quarantined. An unchanged-sha row skips the parser, so a row an older index
+# stored for such a record (type "['topic', 'weird']", "42", ...) would survive every
+# ordinary reindex until the file changed. The migration probe forces one full content
+# pass on any generation-6-or-older db, which re-parses every record and quarantines it.
+CURRENT_INDEX_GENERATION = 7
 
 # MAJOR fix-round item c (TOP-0133 L1): `search --hydrate`'s per-hit byte
 # cap, read once at import time from MEMCONTINUUM_FALLBACK_MAX_BYTES (the
@@ -395,7 +401,9 @@ class ParseResult:
 def record_is_quarantined(result: "ParseResult") -> bool:
     """The reindex quarantine predicate: a parsed record the index skips (no row, no type, no
     for-path or digest membership) because it is canonical-looking yet unusable. `cmd_reindex`
-    and memlint's type freeze both ask this one question."""
+    and memlint's type freeze both ask this one question. (memlint's REF side hands it a
+    `parse_record_text(..., as_delivered=True)` result, so the question is asked with the
+    rules in force when the REF was delivered.)"""
     return not result.valid
 
 
@@ -405,7 +413,8 @@ def is_canonical_frontmatter(fm: dict) -> bool:
         return True
     if isinstance(fm.get("links"), list):
         return True
-    if fm.get("type") in CANONICAL_TYPES:
+    rtype = fm.get("type")
+    if isinstance(rtype, str) and rtype in CANONICAL_TYPES:
         return True
     return False
 
@@ -494,6 +503,12 @@ def _shape_ok_mapping(val) -> bool:
     return not val or isinstance(val, dict)
 
 
+# The two type-shape diagnostics validate_record_shape adds (TOP-0137 L29). memlint's type
+# freeze recognises them by value to classify a REF record as the OLD index delivered it.
+TYPE_SHAPE_DIAGNOSTIC = ("type", "type must be a scalar string")
+METADATA_TYPE_SHAPE_DIAGNOSTIC = ("metadata", "metadata.type must be a scalar string")
+
+
 def validate_record_shape(fm: dict) -> list:
     """Design R2 rule 5: every rule is "this type, OR absent/null/empty".
     Runs on frontmatter that already parsed as a YAML mapping (never on
@@ -511,6 +526,18 @@ def validate_record_shape(fm: dict) -> list:
 
     if not _shape_ok_mapping(fm.get("metadata")):
         diagnostics.append(("metadata", "metadata must be a mapping"))
+
+    # TOP-0137 L29: `type` (and `metadata.type`) names ONE record type, a string. A list
+    # or mapping used to reindex as its repr (`"['topic', 'weird']"`) and lint clean; an
+    # int, bool, date or set stringified into an index type the same way (gate round 1,
+    # R1-5). Absent or null stays legal (the directory decides). Now it is a shape error,
+    # so lint and the index agree (a canonical record is quarantined, a note drops the
+    # field with a warning).
+    if fm.get("type") is not None and not isinstance(fm.get("type"), str):
+        diagnostics.append(TYPE_SHAPE_DIAGNOSTIC)
+    meta = fm.get("metadata")
+    if isinstance(meta, dict) and meta.get("type") is not None and not isinstance(meta.get("type"), str):
+        diagnostics.append(METADATA_TYPE_SHAPE_DIAGNOSTIC)
 
     for key in ("anchors", "standing_marks", "ref_marks"):
         rows = fm.get(key)
@@ -588,7 +615,7 @@ def parse_record(path: Path) -> ParseResult:
     return parse_record_text(text, path)
 
 
-def parse_record_text(text: str, path) -> ParseResult:
+def parse_record_text(text: str, path, *, as_delivered: bool = False) -> ParseResult:
     """Text-based twin of `parse_record` -- everything past the file read
     itself. `path` is used only for string labeling in the diagnostics and
     warnings below (every use is an f-string), never opened, stat'd, or
@@ -596,7 +623,14 @@ def parse_record_text(text: str, path) -> ParseResult:
     Path (memlint `--against-ref` handing this a git-blob's content under a
     store-relative label, e.g. "topics/foo.md (at HEAD)") may pass any
     object with a useful `__str__`. Behavior is otherwise identical to the
-    tail of the old single `parse_record` function this was split from."""
+    tail of the old single `parse_record` function this was split from.
+
+    `as_delivered` (TOP-0137 L29, gate round 2 R2-1/R2-2): parse a memlint `--against-ref` REF
+    blob with the rules in force BEFORE the string-type rule (generation 6). The two type-shape
+    diagnostics are not raised, so a record rejected only by them is valid, and a NOTE's
+    malformed `type` / `metadata.type` is neither warned about nor dropped: `infer_type` then
+    sees the frontmatter the old index saw (`type: 42` -> `"42"`, a list -> its repr). Every
+    other rule is unchanged. The one parse behind every REF-side read of the guard."""
     if not text.startswith("---"):
         return ParseResult({}, text, [], valid=True, fallback=False)
     lines = text.splitlines(keepends=True)
@@ -681,6 +715,8 @@ def parse_record_text(text: str, path) -> ParseResult:
         return ParseResult(fm, body, diagnostics, valid=not canonical, fallback=True)
 
     diagnostics = validate_record_shape(fm)
+    if as_delivered:
+        diagnostics = [d for d in diagnostics if d not in (TYPE_SHAPE_DIAGNOSTIC, METADATA_TYPE_SHAPE_DIAGNOSTIC)]
     canonical = is_canonical_frontmatter(fm)
     if not canonical and diagnostics:
         diagnostics = _drop_note_shape_violations(path, fm, diagnostics)
@@ -720,6 +756,13 @@ def _drop_note_shape_violations(path: Path, fm: dict, diagnostics: list) -> list
     note."""
     kept: list = []
     for field, message in diagnostics:
+        if (field, message) == METADATA_TYPE_SHAPE_DIAGNOSTIC and isinstance(fm.get("metadata"), dict):
+            # Grok round 1: drop only the offending key; sibling `metadata` keys stay.
+            del fm["metadata"]["type"]
+            new_message = "metadata.type: not a scalar string; ignored"
+            print(f"memidx: WARNING: {path}: {new_message}", file=sys.stderr)
+            kept.append((field, new_message))
+            continue
         if "." in field or "[" in field or field not in fm:
             kept.append((field, message))
             continue
@@ -4329,6 +4372,38 @@ def code_ref_matches_exact(file_path: str, code_ref: str) -> bool:
     if not code_ref_is_anchorable(code_ref):
         return False
     return code_ref_split(code_ref)[0] == str(file_path).rstrip("/")
+
+
+def unanchored_ref_problem(code_ref: str, code_roots: list) -> str | None:
+    """Why a code_refs entry that `code_ref_is_anchorable` rejects cannot be
+    bound without an anchor, else None (TOP-0137 L29). A prefix must end with
+    `/` and name an existing directory under a code root; a glob must carry
+    one of `*?[` (the rule `code_ref_matches` applies: segment containment for
+    a directory, fnmatch for a pattern). Neither takes a `#symbol` fragment:
+    there is no byte span to name. Both are repository-relative, as the matcher
+    reads them: an absolute path or any `..` segment is refused, and a prefix's
+    resolved directory (symlinks resolved on both sides) must be a code root or
+    lie under one (gate round 1 R1-4: `Path(root) / "/tmp/"` discards the root)."""
+    ref = str(code_ref)
+    if not code_ref_is_named(ref):
+        return f"{ref!r} names no path"
+    raw_path, sep, _frag = ref.partition("#")
+    if sep:
+        return f"{ref!r}: a prefix or glob takes no #symbol fragment"
+    if raw_path.startswith("/") or os.path.isabs(raw_path) or ".." in raw_path.split("/"):
+        return (f"{ref!r} must be relative to a code root: no leading '/' and no '..' segment")
+    if any(ch in raw_path for ch in _CODE_REF_GLOB_CHARS):
+        return None
+    if not raw_path.endswith("/"):
+        return f"{ref!r} is not a prefix (a prefix ends with '/') or a glob"
+    for r in code_roots:
+        real_root = os.path.realpath(str(r))
+        real_dir = os.path.realpath(os.path.join(real_root, raw_path.rstrip("/")))
+        # a directory that resolves outside the root (a symlink out) counts as not existing under it
+        if os.path.isdir(real_dir) and (
+                real_dir == real_root or real_dir.startswith(real_root.rstrip(os.sep) + os.sep)):
+            return None
+    return f"prefix {ref!r} names no existing directory under the code root(s)"
 
 
 def _mapping_rows(fm: dict, key: str) -> list:
@@ -12302,7 +12377,7 @@ def capture_anchor_row(ref: str, link_id: str, code_roots: list, captured: str) 
     ref_path, frag = code_ref_split(ref)
     for root in code_roots:
         if (Path(root) / ref_path).is_dir():
-            return None, (2, f"not anchorable: {ref!r} names a directory")
+            return None, (2, f"not anchorable: {ref!r} names a directory (a prefix is written with a trailing slash)")
     root, abs_path = _anchor_code_ref_file(ref_path, code_roots)
     if abs_path is None:
         return None, (1, f"file not found under the code root(s): {ref_path}")
@@ -12719,10 +12794,10 @@ def apply_topic_edit(path: Path, old_text: str, new_text: str, dry_run: bool, st
     _atomic_write_bytes(path, new_text.encode("utf-8"))
 
 
-def parse_record_raw(text: str, path):
+def parse_record_raw(text: str, path, *, as_delivered: bool = False):
     """`parse_record_text` over text that may carry CRLF endings (the
     byte-preserving writers keep them; the parser reads LF)."""
-    return parse_record_text(text.replace("\r\n", "\n"), path)
+    return parse_record_text(text.replace("\r\n", "\n"), path, as_delivered=as_delivered)
 
 
 def edit_roundtrip_problem(new_text: str, path, check) -> str | None:
@@ -12759,17 +12834,22 @@ def audit_row_problem(fm: dict, key: str, ident_of, fields, row: dict, old_rows:
 
 
 def bound_edit_problem(new_text: str, path, ref: str, link_id: str, expect_refs: list,
-                       mark_row: dict | None = None, old_marks: list | None = None) -> str | None:
+                       mark_row: dict | None = None, old_marks: list | None = None,
+                       anchored: bool = True) -> str | None:
     """`edit_roundtrip_problem` for `bind`: the `code_refs` must be exactly
     `expect_refs` (so the inserted ref parses back to the string that was
     bound), the anchor row for `(ref, link_id)` must be exactly one (a restore adds
     none) and carry that same ref, and a `mark_row` (the
-    `ref_marks:` row of an inserted ref) must round-trip."""
+    `ref_marks:` row of an inserted ref) must round-trip. `anchored=False` (a
+    prefix or glob) inverts the anchor rule: no anchor row may name `ref`."""
     def check(fm: dict) -> str | None:
         if list(fm.get("code_refs") or []) != list(expect_refs):
             return f"the edit would not round-trip the reference {ref!r} as a string"
         rows = [r for r in anchor_rows(fm) if anchor_row_key(r) == (ref, link_id)]
-        if len(rows) != 1 or any(r.get("ref") != ref for r in rows):
+        if not anchored:
+            if any(r.get("ref") == ref for r in anchor_rows(fm)):
+                return f"the edit would anchor the prefix or glob {ref!r}"
+        elif len(rows) != 1 or any(r.get("ref") != ref for r in rows):
             return f"the edit would not round-trip the anchor row for {ref!r}"
         if mark_row is not None:
             return audit_row_problem(fm, "ref_marks", ref_mark_ident, REF_MARK_FIELDS,
@@ -12868,13 +12948,23 @@ def cmd_bind(args) -> int:
     ref: the one chunk's inclusive line span). A ref that was unbound but whose
     anchor for the current link still exists is RESTORED: the reference and its
     row come back, no new anchor is captured (one baseline per (ref, link); a new
-    baseline is a new link). rc 2: not anchorable (prefix/glob/dir); rc 1: topic
-    or file missing, symbol ambiguous, other failure."""
+    baseline is a new link). A prefix (`src/core/`, an existing directory under
+    a code root) or a glob (`src/app/*.py`) is bound WITHOUT an anchor -- it has
+    no byte span: the entry and its `ref_marks:` `add` row go in, no anchor row
+    is written (TOP-0137 L29; `unanchored_ref_problem` is the check, the
+    matching rule stays `code_ref_matches`). rc 2: a directory named without its
+    trailing slash; rc 1: topic or file missing, a prefix naming no directory
+    or whose resolved directory leaves the code roots (symlinks included), an absolute or
+    `..` prefix/glob, symbol ambiguous, other failure."""
     root = Path(args.root).resolve()
     ref = args.ref
-    if not code_ref_is_anchorable(ref):
-        print(f"bind: not anchorable: {ref!r} is a prefix or glob", file=sys.stderr)
-        return 2
+    code_roots = _code_roots_arg(args.code_root) or [Path.cwd().resolve()]
+    anchored = code_ref_is_anchorable(ref)
+    if not anchored:
+        problem = unanchored_ref_problem(ref, code_roots)
+        if problem:
+            print(f"bind: {problem}; nothing written", file=sys.stderr)
+            return 1
     problem = _audit_text_problem(args)
     if problem:
         print(f"bind: {problem}", file=sys.stderr)
@@ -12894,20 +12984,25 @@ def cmd_bind(args) -> int:
     key = (ref, link_id)
     refs_now = [r for r in fm.get("code_refs") or []]
     in_refs = ref in [str(r) for r in refs_now]
-    has_anchor = any(anchor_row_key(r) == key for r in anchor_rows(fm))
+    has_anchor = anchored and any(anchor_row_key(r) == key for r in anchor_rows(fm))
+    if in_refs and not anchored:
+        print(f"bind: {ref} is already bound to {args.topic} (a prefix or glob carries no anchor); "
+              "nothing written")
+        return 0
     if has_anchor and in_refs:
         print(f"bind: {args.topic} already has an anchor for ({ref}, {link_id}); "
               "one baseline per key -- a new baseline is a new link")
         return 0
-    code_roots = _code_roots_arg(args.code_root) or [Path.cwd().resolve()]
     row = None
-    if not has_anchor:
+    if anchored and not has_anchor:
         row, failure = capture_anchor_row(ref, link_id, code_roots, args.captured)
         if row is None:
             rc, message = failure
             print(f"bind: {message}", file=sys.stderr)
             return rc
     mark = None
+    restored = (not anchored) and any(
+        str(m.get("ref")) == ref for m in ref_mark_rows(fm))
     if not in_refs:
         try:
             authority, source = mark_authority(
@@ -12916,7 +13011,7 @@ def cmd_bind(args) -> int:
             print(f"bind: {exc.message}; nothing written", file=sys.stderr)
             return 1
         mark = new_audit_row("ref", ref, "add", authority, source,
-                             args.why or ("restored by memidx bind" if has_anchor else "bound by memidx bind"),
+                             args.why or ("restored by memidx bind" if has_anchor or restored else "bound by memidx bind"),
                              args.recorded_by)
     try:
         new_text = old_text
@@ -12928,11 +13023,14 @@ def cmd_bind(args) -> int:
         print(f"bind: {exc}", file=sys.stderr)
         return 1
     expect = refs_now if in_refs else refs_now + [ref]
-    problem = bound_edit_problem(new_text, path, ref, link_id, expect, mark, ref_mark_rows(fm))
+    problem = bound_edit_problem(new_text, path, ref, link_id, expect, mark, ref_mark_rows(fm),
+                                 anchored=anchored)
     if problem:
         print(f"bind: {problem}; nothing written", file=sys.stderr)
         return 1
     apply_topic_edit(path, old_text, new_text, args.dry_run, root)
+    if not anchored and not args.dry_run:
+        print(f"bind: {ref} is bound without an anchor (a prefix or glob has no byte span)")
     return 0
 
 
@@ -13295,6 +13393,35 @@ class FilingRefusal(Exception):
         self.on_disk = on_disk
         self.remedy = remedy
         self.path_on_disk = path_on_disk
+
+
+def path_exists_refusal(path: Path, rel: str) -> FilingRefusal:
+    """The `path-exists` refusal of `record` (TOP-0137 L29), written once for
+    both sites that raise it. When the file already there parses as a record
+    with an id, the message names that topic and the command that adds to it,
+    so the agent has somewhere to go; when it does not parse, the old text
+    stays, with the reservation remedy for a zero-byte file."""
+    try:
+        parsed = parse_record(Path(path))
+        rid, title = parsed.frontmatter.get("id"), parsed.frontmatter.get("title")
+        known = parsed.valid and isinstance(rid, str) and bool(rid.strip())
+    except Exception:
+        known = False
+    if known:
+        return FilingRefusal(
+            "path-exists",
+            f'{rel} already exists ({rid} "{title}"); add to it with: '
+            f"memidx.py append {rid} --ruling ...")
+    try:
+        empty = Path(path).stat().st_size == 0
+    except OSError:
+        empty = False
+    if empty:
+        return FilingRefusal(
+            "path-exists",
+            f"{rel} already exists (a zero-byte reservation left by an interrupted record); "
+            f"remove it with: rm {shlex.quote(str(path))}")
+    return FilingRefusal("path-exists", f"{rel} already exists (not a parseable record)")
 
 
 def _bare_or_quoted(value, pattern=_BARE_NAME_RE) -> str:
@@ -13929,7 +14056,7 @@ def _finish_write(command: str, args, ctx: dict, root: Path, path: Path, rel: st
                 path.parent.mkdir(parents=True, exist_ok=True)
                 _atomic_write_bytes(path, new_text.encode("utf-8"), exclusive=True)
             except FileExistsError:
-                raise FilingRefusal("path-exists", f"{rel} already exists")
+                raise path_exists_refusal(path, rel)
             except ReservationLeftError as exc:
                 raise FilingRefusal("io-error", f"cannot write {rel}: {exc}", on_disk="rejected",
                                     remedy=f"remove it with: rm {shlex.quote(exc.reserved_path)}",
@@ -14197,7 +14324,7 @@ def _record_impl(args, ctx: dict) -> int:
         raise FilingRefusal("outside-store", f"{path.relative_to(root)} would be created at {real_parent}, "
                             f"outside the store {root} (a symlinked topics/ or area?)")
     if path.exists():
-        raise FilingRefusal("path-exists", f"{path.relative_to(root)} already exists")
+        raise path_exists_refusal(path, str(path.relative_to(root)))
     ctx["topic"] = topic_id
     ruling = _filing_ruling(args, ctx, code_roots, strict=False)
     link = _build_link(args, "L1", ruling, args.rationale)
@@ -14230,6 +14357,21 @@ def _record_impl(args, ctx: dict) -> int:
     return rc
 
 
+PROMOTABLE_STATUSES = ("active", "provisional")
+
+
+def promotable_link(authority, status) -> bool:
+    """SCHEMA section 5 step 1, the one place the rule is written (TOP-0137
+    L29): the owner may ratify an `agent-inference`, `reviewer-finding` or
+    `code-derived` link that still stands (`active` or `provisional`); those are
+    exactly the typed non-owner tiers the filing commands write
+    (`FILING_TYPED_AUTHORITIES`, one vocabulary). An owner
+    tier is already a ruling and a terminal status (`superseded`,
+    `historical`, `declined`) is history; a link already carrying
+    `promoted_by` is refused by the caller before this is asked."""
+    return authority in FILING_TYPED_AUTHORITIES and status in PROMOTABLE_STATUSES
+
+
 def _promote_impl(args, ctx: dict) -> int:
     root = Path(args.root).resolve()
     _filing_validate_args(args, "promote")
@@ -14243,11 +14385,13 @@ def _promote_impl(args, ctx: dict) -> int:
     old_ruling = old.get("ruling") or {}
     if old.get("promoted_by"):
         raise FilingRefusal("already-promoted", f"{args.link} already carries promoted_by {old['promoted_by']}")
-    if old_ruling.get("authority") != "agent-inference" or old.get("status") != "provisional":
+    if not promotable_link(old_ruling.get("authority"), old.get("status")):
         raise FilingRefusal(
             "not-promotable",
             f"{args.link} is {old.get('status')!r}/{old_ruling.get('authority')!r}; "
-            "SCHEMA section 5 promotes an agent-inference / provisional link")
+            "SCHEMA section 5 promotes an agent-inference link (active or provisional) or a "
+            "reviewer-finding / code-derived link (either status); an owner tier or a "
+            "superseded/historical/declined link cannot be promoted")
     if args.yes_message and args.shown_text is None:
         args.shown_text = str(old_ruling.get("text") or "")
     args.ruling = None
@@ -14867,7 +15011,7 @@ def main(argv=None) -> int:
     )
     add_common_args(p_bind, need_root=True)
     p_bind.add_argument("topic", metavar="TOP-xxxx")
-    p_bind.add_argument("ref", metavar="REF", help="a file path or path#symbol (no prefix/glob)")
+    p_bind.add_argument("ref", metavar="REF", help="a file path or path#symbol (anchored), or a prefix (src/dir/) or glob (src/*.py), bound without an anchor")
     p_bind.add_argument("--code-root", dest="code_root", action="append", default=None)
     p_bind.add_argument("--captured", choices=("ruling", "bind"), default="bind")
     add_mark_args(p_bind, why_required=False)

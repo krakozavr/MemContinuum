@@ -11,6 +11,10 @@ later cleanup pass:
 - Incidents — a file in incidents/.
 - Rejected alternatives, "not now" rulings.
 
+A decision must still be true tomorrow. A take approval, a progress note, today's
+status or a step completed is session state, not a ruling; it goes to auto-memory
+or nowhere.
+
 Claude Code auto-memory (~/.claude/projects/…/memory/):
 - Session state, open questions not yet ruled.
 - Machine facts and recovery recipes.

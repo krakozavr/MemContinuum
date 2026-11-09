@@ -4141,6 +4141,18 @@ class TestMalformedRecordQuarantine(unittest.TestCase):
                 "id: TOP-9105\ntype: topic\nlinks:\n  - not-a-mapping\n  - 42\n",
                 "links[0]",
             ),
+            ("type_list", "id: TOP-9106\ntype: [topic, weird]\n", "type"),
+            ("type_mapping", "id: TOP-9107\ntype: {a: b}\n", "type"),
+            ("metadata_type_list", "id: TOP-9108\ntype: topic\nmetadata:\n  type: [x]\n", "metadata"),
+            # gate round 1 R1-5: the rule is "a string"
+            ("type_int", "id: TOP-9110\ntype: 42\n", "type"),
+            ("type_bool", "id: TOP-9111\ntype: true\n", "type"),
+            ("type_date", "id: TOP-9112\ntype: 2026-01-01\n", "type"),
+            ("type_set", "id: TOP-9113\ntype: !!set {topic: null}\n", "type"),
+            ("metadata_type_int", "id: TOP-9114\ntype: topic\nmetadata:\n  type: 42\n", "metadata"),
+            ("metadata_type_bool", "id: TOP-9115\ntype: topic\nmetadata:\n  type: true\n", "metadata"),
+            ("metadata_type_date", "id: TOP-9116\ntype: topic\nmetadata:\n  type: 2026-01-01\n", "metadata"),
+            ("metadata_type_set", "id: TOP-9117\ntype: topic\nmetadata:\n  type: !!set {x: null}\n", "metadata"),
         ]
         for name, fm_body, expected_field in cases:
             with self.subTest(case=name):
@@ -4158,6 +4170,54 @@ class TestMalformedRecordQuarantine(unittest.TestCase):
                     diagnostics = json.loads(rows[0]["diagnostics"])
                     fields = [d[0] for d in diagnostics]
                     self.assertIn(expected_field, fields, diagnostics)
+
+    def test_scalar_type_is_indexed_unchanged(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            _write_record(root / "topics" / "ok.md", "---\nid: TOP-9109\ntype: topic\ntitle: Ok\n---\nBody.\n")
+            db = Path(td) / "idx.sqlite"
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(reindex(root, db, no_embed=True), 0)
+            conn = sqlite3.connect(str(db))
+            try:
+                self.assertEqual(conn.execute("SELECT type FROM records WHERE id='TOP-9109'").fetchall(),
+                                 [("topic",)])
+            finally:
+                conn.close()
+            self.assertEqual(self._index_errors_rows(db), [])
+
+    def test_an_existing_index_row_with_a_list_type_is_removed_by_the_next_reindex(self):
+        """Gate round 1 R1-3: an unchanged-sha row skips the parser, so the generation bump is
+        what makes an index built under the old (permissive) rule drop the row."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            _write_record(root / "topics" / "listy.md",
+                          "---\nid: TOP-9120\ntype: [topic, weird]\ntitle: Listy\n---\nBody.\n")
+            db = Path(td) / "idx.sqlite"
+            # build the index with the OLD rule: no type-shape diagnostics, then stamp generation 6
+            with mock.patch.object(memidx, "validate_record_shape", lambda fm: []):
+                with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(reindex(root, db, no_embed=True), 0)
+            conn = sqlite3.connect(str(db))
+            try:
+                self.assertEqual(conn.execute("SELECT type FROM records WHERE id='TOP-9120'").fetchall(),
+                                 [("['topic', 'weird']",)])
+                conn.execute("INSERT OR REPLACE INTO db_meta (key, value) VALUES ('index_generation', '6')")
+                conn.commit()
+            finally:
+                conn.close()
+            out = io.StringIO()
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(out):
+                self.assertEqual(reindex(root, db, no_embed=True), 0)
+            self.assertNotIn("1 unchanged", out.getvalue())
+            conn = sqlite3.connect(str(db))
+            try:
+                self.assertEqual(conn.execute("SELECT id FROM records WHERE id='TOP-9120'").fetchall(), [])
+            finally:
+                conn.close()
+            rows = self._index_errors_rows(db)
+            self.assertEqual(len(rows), 1, rows)
+            self.assertIn("type", [d[0] for d in json.loads(rows[0]["diagnostics"])])
 
     # -- scenario 3: a link with no `link:` id -- must quarantine, not IntegrityError
 
@@ -6413,7 +6473,7 @@ class TestStandingReadOnlyAndGenerationGuard(unittest.TestCase):
                 "cmd_standing must never write to a generation-5 index -- read-only, always",
             )
 
-    def test_generation_7_future_index_is_refused_by_name(self):
+    def test_a_future_generation_index_is_refused_by_name(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "root"
             _write_record(root / "topics" / "t.md", _standing_topic("TOP-9710", "L1", ["L1"]))
@@ -6422,7 +6482,7 @@ class TestStandingReadOnlyAndGenerationGuard(unittest.TestCase):
                 reindex(root, db, no_embed=True)
             conn = sqlite3.connect(str(db))
             conn.execute(
-                "INSERT OR REPLACE INTO db_meta (key, value) VALUES ('index_generation', '7')"
+                "INSERT OR REPLACE INTO db_meta (key, value) VALUES ('index_generation', '8')"
             )
             conn.commit(); conn.close()
             sha_before = hashlib.sha256(db.read_bytes()).hexdigest()
@@ -6446,7 +6506,7 @@ class TestStandingReadOnlyAndGenerationGuard(unittest.TestCase):
                 reindex(root, db, no_embed=True)
             conn = sqlite3.connect(str(db))
             conn.execute(
-                "INSERT OR REPLACE INTO db_meta (key, value) VALUES ('index_generation', '7')"
+                "INSERT OR REPLACE INTO db_meta (key, value) VALUES ('index_generation', '8')"
             )
             conn.commit(); conn.close()
             self.assertEqual(
@@ -6477,7 +6537,7 @@ class TestReindexRefusesAGenerationAheadIndex(unittest.TestCase):
 
             conn = sqlite3.connect(str(db))
             conn.execute(
-                "INSERT OR REPLACE INTO db_meta (key, value) VALUES ('index_generation', '7')"
+                "INSERT OR REPLACE INTO db_meta (key, value) VALUES ('index_generation', '8')"
             )
             conn.execute("ALTER TABLE records ADD COLUMN future_only TEXT")
             conn.execute("UPDATE records SET future_only='KEEP' WHERE type='topic'")
@@ -6505,7 +6565,7 @@ class TestReindexRefusesAGenerationAheadIndex(unittest.TestCase):
                 "SELECT future_only FROM records WHERE type='topic'"
             ).fetchone()[0]
             conn.close()
-            self.assertEqual(gen, "7", "generation must stay exactly as it was, never downgraded")
+            self.assertEqual(gen, "8", "generation must stay exactly as it was, never downgraded")
             self.assertEqual(future_only, "KEEP", "a column only the newer generation populates must survive")
 
 

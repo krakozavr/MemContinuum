@@ -450,6 +450,66 @@ class TestPromote(FilingCase):
         self.assertIn("already carries promoted_by", err)
         self.assertEqual(sha(self.prov), before)
 
+    def test_an_active_inference_promotes_and_lints_clean(self):
+        self.prov.write_text(PROVISIONAL_TOPIC.replace("status: provisional", "status: active")
+                             .replace("links:\n", "current: L1\nlinks:\n", 1))
+        self.commit("active inference")
+        self.head0 = self.head()
+        self.write_transcript()
+        rc, out, err = self.run_cmd("promote", "TOP-9101", "L1", "--session", SID, "--yes-message", YES_UUID)
+        self.assertEqual(rc, 0, err)
+        links = self.parsed_links(self.prov.read_text())
+        self.assertEqual((links[0]["link"], links[0]["ruling"]["authority"]), ("L2", "owner-ratified"))
+        old = [l for l in links if l["link"] == "L1"][0]
+        self.assertEqual((old["promoted_by"], old["status"]), ("L2", "active"))
+        rc, text = run_memlint(["--against-ref", "HEAD", str(self.store)])
+        self.assertEqual(rc, 0, text)
+
+    def test_a_provisional_inference_still_promotes(self):
+        self.write_transcript()
+        rc, out, err = self.run_cmd("promote", "TOP-9101", "L1", "--session", SID, "--yes-message", YES_UUID)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(run_memlint(["--against-ref", "HEAD", str(self.store)])[0], 0)
+
+    def test_a_reviewer_finding_or_derivation_promotes(self):
+        for authority in ("reviewer-finding", "code-derived"):
+            for status in ("provisional", "active"):
+                with self.subTest(authority=authority, status=status):
+                    text = PROVISIONAL_TOPIC.replace("authority: agent-inference\n      source: s",
+                                                     f"authority: {authority}\n      source: s")
+                    if status == "active":
+                        text = text.replace("status: provisional", "status: active").replace(
+                            "links:\n", "current: L1\nlinks:\n", 1)
+                    self.prov.write_text(text)
+                    self.commit(f"{authority} {status}")
+                    self.head0 = self.head()
+                    self.write_transcript()
+                    rc, out, err = self.run_cmd("promote", "TOP-9101", "L1", "--session", SID,
+                                                "--yes-message", YES_UUID)
+                    self.assertEqual(rc, 0, err)
+
+    def test_superseded_owner_tier_and_already_promoted_links_are_refused(self):
+        self.write_transcript()
+        superseded = PROVISIONAL_TOPIC.replace("status: provisional", "status: superseded\n    superseded_by: L2")
+        owner = PROVISIONAL_TOPIC.replace("authority: agent-inference\n      source: s",
+                                          "authority: owner-verbatim\n      source: s")
+        promoted = PROVISIONAL_TOPIC.replace("    kind: adopted\n", "    kind: adopted\n    promoted_by: L2\n")
+        historical = PROVISIONAL_TOPIC.replace("status: provisional", "status: historical")
+        declined = PROVISIONAL_TOPIC.replace("status: provisional", "status: declined")
+        for name, text, needle in (("superseded", superseded, "cannot be promoted"),
+                                   ("historical", historical, "cannot be promoted"),
+                                   ("declined", declined, "cannot be promoted"),
+                                   ("owner-verbatim", owner, "cannot be promoted"),
+                                   ("promoted", promoted, "already carries promoted_by")):
+            with self.subTest(case=name):
+                self.prov.write_text(text)
+                before = sha(self.prov)
+                rc, _o, err = self.run_cmd("promote", "TOP-9101", "L1", "--session", SID,
+                                           "--yes-message", YES_UUID)
+                self.assertEqual(rc, 1, err)
+                self.assertIn(needle, err)
+                self.assertEqual(sha(self.prov), before)
+
     def test_promote_verbatim_uses_the_quote(self):
         self.write_transcript()
         rc, _o, err = self.run_cmd("promote", "TOP-9101", "L1", "--session", SID, "--owner-message", OWNER_UUID,
@@ -503,6 +563,30 @@ class TestRecord(FilingCase):
         self.assertEqual(rc, 1)
         self.assertIn("already carried", err)
         self.assertEqual(sha(self.store / "topics" / "memory" / "plain-title.md"), before)
+
+    def test_path_exists_names_the_topic_and_the_append_command(self):
+        rc, _o, err = self.run_cmd("record", "--title", "Plain title", "--area", "memory", "--ruling", "r")
+        self.assertEqual(rc, 0, err)
+        fm = memidx.parse_record(self.store / "topics" / "memory" / "plain-title.md").frontmatter
+        rc, _o, err = self.run_cmd("record", "--title", "Plain title", "--area", "memory", "--ruling", "r")
+        self.assertEqual(rc, 1)
+        self.assertIn(f'topics/memory/plain-title.md already exists ({fm["id"]} "Plain title"); '
+                      f"add to it with: memidx.py append {fm['id']} --ruling ...", err)
+
+    def test_path_exists_on_an_unparseable_file_keeps_the_plain_text(self):
+        target = self.store / "topics" / "memory" / "plain-title.md"
+        for content, needle, absent in ((b"", "zero-byte reservation", "memidx.py append"),
+                                        (b"---\nid: [oops\ntype: topic\n---\n", "not a parseable record",
+                                         "memidx.py append")):
+            with self.subTest(content=content):
+                target.write_bytes(content)
+                rc, _o, err = self.run_cmd("record", "--title", "Plain title", "--area", "memory", "--ruling", "r")
+                self.assertEqual(rc, 1)
+                self.assertIn("already exists", err)
+                self.assertIn(needle, err)
+                self.assertNotIn(absent, err)
+                if not content:
+                    self.assertIn("rm ", err)
 
     def test_provisional_record_has_no_current(self):
         rc, _o, err = self.run_cmd("record", "--title", "Tentative idea", "--area", "memory", "--ruling", "r",

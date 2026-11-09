@@ -754,9 +754,9 @@ class TestTypeFrozen(GuardCase):
         seen = []
         real = memlint._parse_git_blob
 
-        def spy(blob, label):
+        def spy(blob, label, **kw):
             seen.append(label)
-            return real(blob, label)
+            return real(blob, label, **kw)
 
         with mock.patch.object(memlint, "_parse_git_blob", spy):
             memlint.check_append_only(self.root, "HEAD", False)
@@ -767,6 +767,170 @@ class TestTypeFrozen(GuardCase):
         self.assertEqual(len(ref_side), 1, seen)
         self.assertEqual(len([l for l in new_side if isinstance(l, str)]), 1, seen)
         self.assertLessEqual(len(new_side), 2, seen)  # + the pre-existing rejections scan (a Path label)
+
+
+class TestNonScalarTypeUnderAgainstRef(GuardCase):
+    """TOP-0137 L29 (gate round 1, R1-1): a list `type` is a shape error; the append-only
+    guard must judge it (added, repaired, deleted) and never raise on the unhashable value."""
+
+    LIST_TYPE = "type: [topic, weird]\n"
+
+    def _listy(self, **kw):
+        return ttext([], **kw).replace("type: topic\n", self.LIST_TYPE, 1)
+
+    def test_added_record_with_a_list_type_is_a_shape_error_not_a_traceback(self):
+        root = self.store(ttext([]))
+        (root / "topics" / "new.md").write_text(self._listy(tid="TOP-9102"))
+        git(["add", "-A"], root)
+        rc, out = run_memlint(["--against-ref", "HEAD", "--staged", str(root)])
+        self.assertNotIn("Traceback", out)
+        self.assertNotIn("unhashable", out)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("type must be a scalar string", out)
+
+    def test_repairing_a_list_type_to_a_scalar_enters_delivery_and_is_clean(self):
+        self.store(self._listy())
+        self.assertClean(ttext([]))
+
+    def test_staged_bad_types_beside_a_ruling_edit_exit_1_and_report_the_edit(self):
+        """Grok round 1: the crash used to hide the summary, so the pre-commit hook read the
+        run as an engine failure and let the commit through."""
+        root = self.store(ttext([]))
+        for name, bad in (("list.md", "type: [topic, weird]\n"), ("map.md", "type: {a: b}\n")):
+            (root / "topics" / name).write_text(
+                ttext([], tid="TOP-9105" if name == "list.md" else "TOP-9106").replace("type: topic\n", bad, 1))
+        foo = root / "topics" / "foo.md"
+        foo.write_text(foo.read_text().replace('"fourth"', '"fourth, edited"', 1))
+        git(["add", "-A"], root)
+        (root / "topics" / "list.md").unlink()
+        (root / "topics" / "map.md").unlink()
+        rc, out = run_memlint(["--against-ref", "HEAD", "--staged", str(root)])
+        self.assertEqual(rc, 1, out)
+        self.assertNotIn("unexpected failure", out)
+        self.assertIn("type must be a scalar string (added file)", out)
+        self.assertRegex(out, r"changed=[1-9]")
+
+    # R1-2: a REF valid under the OLD rules (type: topic, an ignored non-string metadata.type) was
+    # delivered as `topic`; the string rule now quarantines it, which must not release its freeze.
+    @staticmethod
+    def _bad_metadata(text):
+        return text.replace("tags: []\n", "tags: []\nmetadata:\n  type: [x]\n", 1)
+
+    def test_a_ref_quarantined_only_by_the_new_metadata_type_rule_keeps_its_type_frozen(self):
+        ref = self._bad_metadata(ttext([]))
+        res = memidx.parse_record_text(ref, "x")
+        self.assertTrue(memidx.record_is_quarantined(res), res)
+        self.store(ref)
+        self.assertRefused(ttext([]).replace("type: topic\n", "type: incident\n", 1),
+                           "type changed 'topic' -> 'incident'")
+
+    def test_repairing_that_metadata_alone_is_clean(self):
+        self.store(self._bad_metadata(ttext([])))
+        self.assertClean(ttext([]))
+
+    # R2-1 / R2-2: the REF side is read ONCE, as the index delivered it (parse_record_text
+    # `as_delivered`), for every check the guard makes -- a repair never releases history.
+    @staticmethod
+    def _incident(refs=("src/a.py",), meta=True, extra="", typ="type: incident\n"):
+        body = "code_refs:\n" + "".join(f"  - \"{r}\"\n" for r in refs) if refs else "code_refs: []\n"
+        return ("---\n" + typ + "id: INC-9150\ntitle: Odd\n" + body
+                + ("metadata:\n  type: [x]\n" if meta else "") + extra + "---\n\nBody.\n")
+
+    def test_a_ref_incident_with_bad_metadata_type_is_valid_as_delivered(self):
+        res = memidx.parse_record_text(self._incident(), "x", as_delivered=True)
+        self.assertTrue(res.valid, res)
+        self.assertEqual(res.frontmatter["metadata"], {"type": ["x"]})
+        self.assertFalse(memidx.parse_record_text(self._incident(), "x").valid)
+
+    def test_repairing_the_metadata_alone_on_an_incident_is_clean(self):
+        self.store(self._incident())
+        self.assertClean(self._incident(meta=False))
+
+    def test_repair_plus_dropping_a_reference_without_a_row_on_an_incident_is_refused(self):
+        self.store(self._incident())
+        self.assertRefused(self._incident(refs=(), meta=False),
+                           "code_refs changed for src/a.py (remove) with no matching ref_marks row")
+        self.assertClean(self._incident(refs=(), meta=False, extra="ref_marks:\n" + rmark("src/a.py", "remove")))
+
+    def test_repairing_the_metadata_of_a_topic_alone_is_clean(self):
+        self.store(self._bad_metadata(ttext(["src/a.py"])))
+        self.assertClean(ttext(["src/a.py"]))
+
+    def test_repair_plus_dropping_a_reference_without_a_row_on_a_topic_is_refused(self):
+        self.store(self._bad_metadata(ttext(["src/a.py"])))
+        self.assertRefused(ttext([]), "code_refs changed for src/a.py (remove) with no matching ref_marks row")
+
+    def test_repair_plus_rewriting_a_recorded_ruling_on_a_topic_is_refused(self):
+        self.store(self._bad_metadata(ttext(["src/a.py"])))
+        self.assertRefused(ttext(["src/a.py"]).replace('"fourth"', '"fourth, edited"', 1),
+                           "link field changed after being recorded")
+
+    # round 2 bypass: the REF's links chain was read from the repaired parse, so on an incident the
+    # ruling edit rode in with the metadata repair.
+    def _incident_with_links(self, meta=True, text="first"):
+        return self._incident(meta=meta, extra="links:\n" + link_yaml("L1", text=text))
+
+    def test_repairing_the_metadata_of_an_incident_with_links_alone_is_clean(self):
+        self.store(self._incident_with_links())
+        self.assertClean(self._incident_with_links(meta=False))
+
+    def test_repair_plus_rewriting_a_recorded_ruling_on_an_incident_is_refused(self):
+        self.store(self._incident_with_links())
+        self.assertRefused(self._incident_with_links(meta=False, text="first, edited"),
+                           "link field changed after being recorded")
+
+    def test_repair_plus_dropping_an_anchor_row_on_a_topic_is_refused(self):
+        refs = ("src/foo.py",)
+        old = binding_topic([good_row()], code_refs=refs).replace("tags: []\n", "tags: []\nmetadata:\n  type: [x]\n", 1)
+        self.assertTrue(memidx.parse_record_text(old, "x", as_delivered=True).valid)
+        self.store(old)
+        self.assertClean(binding_topic([good_row()], code_refs=refs))
+        rc, out = self.guard(binding_topic(None, code_refs=refs))
+        self.assertEqual(rc, 1, out)
+
+    def test_a_list_type_at_ref_repaired_to_topic_with_no_other_change_is_clean(self):
+        # the one carve-out: a truthy non-string `type` delivered a repr string nobody can keep
+        self.store(self._listy())
+        self.assertClean(ttext([]))
+
+    # R2-2: a NOTE's malformed type is dropped for CURRENT indexing only; at REF the old index
+    # delivered `str(type)`, a non-canonical string, so nothing is frozen.
+    def _note42(self):
+        return "---\ntype: 42\ntitle: A note\n---\n\nBody.\n"
+
+    def test_a_note_with_an_int_type_at_ref_froze_nothing_so_it_may_become_a_memo_or_be_deleted(self):
+        root = self.store(self._note42())
+        self.assertClean("---\ntype: memo\ntitle: A note\n---\n\nBody.\n")
+        (root / "topics" / "foo.md").unlink()
+        rc, out = run_memlint(["--against-ref", "HEAD", str(root)])
+        self.assertEqual(rc, 0, out)
+
+    def test_a_note_with_an_int_type_is_still_indexed_without_it_and_warned_about_now(self):
+        res = memidx.parse_record_text(self._note42(), "topics/x.md")
+        self.assertNotIn("type", res.frontmatter)
+        self.assertIn(memidx.TYPE_SHAPE_DIAGNOSTIC[0], [d[0] for d in res.diagnostics])
+        self.assertEqual(memidx.parse_record_text(self._note42(), "x", as_delivered=True).frontmatter["type"], 42)
+
+    def test_a_list_type_at_ref_is_quarantined_at_ref_so_its_repair_may_declare_any_type(self):
+        self.store(self._listy())
+        self.assertClean(ttext([]).replace("type: topic\n", "type: incident\n", 1))
+
+    def test_deleting_a_non_topic_record_that_carried_a_list_type_delivered_nothing_and_is_clean(self):
+        # an incident-like record (INC- id, no links): quarantined at REF, deletable like any non-topic
+        text = "---\nid: INC-9103\ntype: [incident, weird]\ntitle: Odd\n---\n\nBody.\n"
+        root = self.store(text)
+        (root / "topics" / "foo.md").unlink()
+        rc, out = run_memlint(["--against-ref", "HEAD", str(root)])
+        self.assertNotIn("Traceback", out)
+        self.assertEqual(rc, 0, out)
+
+    def test_deleting_a_topic_like_record_with_a_list_type_is_refused_by_the_topic_rule_without_a_traceback(self):
+        root = self.store(self._listy())
+        (root / "topics" / "foo.md").unlink()
+        rc, out = run_memlint(["--against-ref", "HEAD", str(root)])
+        self.assertNotIn("Traceback", out)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("file deleted or renamed", out)
 
 
 # ---------------------------------------------------------------------------
@@ -1908,8 +2072,17 @@ class TestUnbind(BindCase):
         self.assertEqual([(r["ref"], r["action"]) for r in memidx.ref_mark_rows(self.fm())],
                          [("src/*.py", "remove"), ("src/lib/", "remove")])
         self.assertGuardsClean()
-        rc, _o, err = self.bind("src/lib/")
-        self.assertEqual(rc, 2, err)  # bind still refuses a prefix
+        # gate round 1 R1-6: commit the removal first. An unbind and a bind of the same entry with no
+        # commit between them leave a `remove` and an `add` row for a membership that did not change
+        # against HEAD, which the guard refuses as orphan rows.
+        commit_all(self.store)
+        rc, out, err = self.bind("src/*.py")  # a glob is bound again, without an anchor (TOP-0137 L29)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("bound without an anchor", out)
+        self.assertFalse(self.fm().get("anchors"))
+        self.assertEqual([(r["ref"], r["action"]) for r in memidx.ref_mark_rows(self.fm())][0],
+                         ("src/*.py", "add"))
+        self.assertGuardsClean()
 
     def test_a_ref_that_is_not_bound_is_a_noop(self):
         self.put(binding_topic())
