@@ -2948,7 +2948,7 @@ class TestUndoReceipts(BindCase):
         self.assertEqual(memidx._work_tree_state(plain), "no")  # git itself answers 128
         for name, result, expect in (
                 ("false", (0, "false\n"), "no"),
-                ("exit 128", (128, ""), "no"),
+                ("exit 128 where a .git entry exists", (128, ""), None),
                 ("exit 1", (1, ""), None),
                 ("empty output", (0, ""), None),
                 ("garbage", (0, "maybe\n"), None),
@@ -2959,6 +2959,51 @@ class TestUndoReceipts(BindCase):
         with self._patch_run(probe, FileNotFoundError(2, "git")):
             self.assertEqual(memidx._work_tree_state(plain), "no")  # git missing, no .git entry
             self.assertIsNone(memidx._work_tree_state(self.store))  # git missing where a .git entry exists
+
+    def test_exit_128_is_a_non_repository_only_with_no_git_entry_above(self):
+        probe = "--is-inside-work-tree"
+        plain = self.tmp / "plain-128"
+        plain.mkdir()
+        with self._patch_run(probe, (128, "")):
+            self.assertEqual(memidx._work_tree_state(plain), "no")  # nothing above: a real non-repository
+            self.assertIsNone(memidx._work_tree_state(self.store))  # a .git at the store
+            nested = self.store / "nested-128"
+            nested.mkdir()
+            self.assertIsNone(memidx._work_tree_state(nested))  # a .git above the store
+
+    def test_a_dangling_git_symlink_is_an_entry(self):
+        probe = "--is-inside-work-tree"
+        outer = self.tmp / "dangling"
+        (outer / "store").mkdir(parents=True)
+        os.symlink(str(outer / "nowhere"), str(outer / ".git"))
+        self.assertFalse((outer / ".git").exists())  # dangling: exists() follows it, lstat does not
+        with self._patch_run(probe, FileNotFoundError(2, "git")):
+            self.assertIsNone(memidx._work_tree_state(outer / "store"))
+        with self._patch_run(probe, (128, "")):
+            self.assertIsNone(memidx._work_tree_state(outer / "store"))
+
+    def test_an_uninspectable_git_entry_is_unavailable(self):
+        probe = "--is-inside-work-tree"
+        plain = self.tmp / "plain-uninspectable"
+        plain.mkdir()
+        with self._patch_run(probe, FileNotFoundError(2, "git")), \
+                mock.patch.object(Path, "lstat", side_effect=PermissionError(13, "denied")):
+            self.assertIsNone(memidx._work_tree_state(plain))
+
+    def test_a_nested_store_with_git_missing_is_unavailable(self):
+        nested = self.store / "nested-missing-git"
+        nested.mkdir()
+        with self._patch_run("--is-inside-work-tree", FileNotFoundError(2, "git")):
+            self.assertIsNone(memidx._work_tree_state(nested))
+
+    def test_a_real_git_fatal_in_a_repository_refuses_the_bind(self):
+        before = self.head_state(refs=())
+        with mock.patch.dict(os.environ, {"GIT_CONFIG_COUNT": "invalid"}):
+            self.assertIsNone(memidx._work_tree_state(self.store, memidx._git_env()))
+            rc, out, err = self.bind()
+        self.assertEqual(rc, 1, (out, err))
+        self.assertIn("git state unavailable for topics/foo.md (work-tree detection); nothing written", err)
+        self.assertEqual((self.raw(), self.receipts()), (before, []))
 
     def test_an_unanswered_work_tree_probe_refuses_and_writes_nothing(self):
         before = self.head_state(refs=())

@@ -3768,10 +3768,10 @@ with the receipts beneath it that it contains, so the stack holds uncommitted wo
 A, or a changed staged entry is refused with the pending row named and the ways out
 (`git restore --source=HEAD --worktree -- <topic>`, `git restore --staged -- <topic>`,
 or commit first); nothing is written. Whether the store is in a git work tree has three answers
-(`_work_tree_state`): git prints `true` -> receipts apply; git prints `false` (a bare repository), exits
-128 (not a repository), or is not installed where no `.git` entry exists at or above the store -> a verified
-non-work-tree, no receipts, the ordinary path; any other outcome (a timeout, an unexpected exit, empty
-output) and a failed lookup of the receipts directory inside a work tree refuse the command and write
+(`_work_tree_state`): git prints `true` -> receipts apply; git prints `false` (a bare repository), or exits
+128 or is not installed where no `.git` entry exists at or above the store (inspected with `lstat`, so a
+dangling `.git` symlink counts) -> a verified non-work-tree, no receipts, the ordinary path; any other outcome (a timeout, an unexpected exit, empty
+output; exit 128 or a missing git where a `.git` entry exists, or one that cannot be inspected) and a failed lookup of the receipts directory inside a work tree refuse the command and write
 nothing, so a slow git can never turn a bind into a receipt-less one. Every probe returns an explicit state or
 "unavailable" (a timeout, a missing git, any failure that is not a verified absence); an
 unavailable probe, at decision time or when the receipt is recorded, refuses without

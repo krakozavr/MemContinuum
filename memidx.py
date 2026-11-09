@@ -14590,26 +14590,45 @@ def _filing_ruling(args, ctx: dict, code_roots: list, strict: bool) -> dict:
             "source": args.source or ""}
 
 
+def _git_entry_above(root: Path) -> bool | None:
+    """Is there a `.git` entry (file, directory or symlink, a dangling one
+    included) at the resolved `root` or any parent? Entries are inspected with
+    `lstat`, never followed. None when an entry cannot be inspected."""
+    here = Path(os.path.realpath(root))
+    for d in (here, *here.parents):
+        try:
+            (d / ".git").lstat()
+            return True
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError:
+            return None
+    return False
+
+
 def _work_tree_state(root: Path, env: dict | None = None) -> str | None:
     """Three results for "is `root` inside a git work tree": "yes" (git exits 0
     and prints `true`), "no" (verified: git exits 0 and prints `false` -- a bare
-    repository -- or exits 128, not a repository, or git is not installed and no
-    `.git` entry exists at or above `root`) or None -- unavailable (a timeout,
-    any other exit, empty output, git missing where a `.git` entry exists). `env`
-    replaces the ambient environment (the undo receipts pass `_git_env()`)."""
+    repository -- or git cannot run or exits 128 and no `.git` entry exists at or
+    above `root`, so it is a plain directory) or None -- unavailable (a timeout,
+    any other exit, empty output, or git missing / failing with 128 where a `.git`
+    entry exists, a dangling symlink included: a repository git refused to open
+    is not a non-repository). `env` replaces the ambient environment (the undo
+    receipts pass `_git_env()`)."""
     try:
         done = subprocess.run(["git", "-C", str(root), "rev-parse", "--is-inside-work-tree"],
                               capture_output=True, text=True, timeout=30, env=env)
     except FileNotFoundError:
-        here = Path(os.path.realpath(root))
-        has_git = any((d / ".git").exists() for d in (here, *here.parents))
-        return None if has_git else "no"
+        entry = _git_entry_above(root)
+        return None if entry is not False else "no"
     except (OSError, subprocess.SubprocessError):
         return None
     answer = done.stdout.strip()
     if done.returncode == 0 and answer in ("true", "false"):
         return "yes" if answer == "true" else "no"
-    return "no" if done.returncode == 128 else None
+    if done.returncode == 128:
+        return "no" if _git_entry_above(root) is False else None
+    return None
 
 
 def _inside_git_work_tree(root: Path, env: dict | None = None) -> bool:
