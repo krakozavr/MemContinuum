@@ -196,12 +196,37 @@ class TestGuardsRejectSecondImplementation(unittest.TestCase):
                  '#!/usr/bin/env bash\n"$PY" - <<EOF\ndef _anchor_ident(row):\n    return None\nEOF\n')
         self.assertEqual(len(only(ft.findings(), "anchor-identity", "name_owner")), 1)
 
-    def test_unparseable_embedded_payload_holding_the_token_is_reported(self):
+    def test_unparseable_recognised_payload_is_a_scan_problem_naming_the_line(self):
         ft = FixtureTree(self)
         ft.write("hooks/odd-hook.sh",
-                 '#!/usr/bin/env bash\n"$MC_PY" - <<\'PYEOF\'\nthis is ( not python Coverage signal\nPYEOF\n')
-        f = only(ft.findings(), "coverage-fact-sentence", "token_owner")
-        self.assertTrue(any("not parseable" in x for x in f), f)
+                 '#!/usr/bin/env bash\necho start\n"$MC_PY" - <<\'PYEOF\'\nthis is ( not python\nPYEOF\n')
+        found = ft.findings()
+        f = [x for x in found if x.startswith("scan: hooks/odd-hook.sh:4:")]
+        self.assertEqual(len(f), 1, found)
+        self.assertIn("embedded python payload is not parseable", f[0])
+
+    def test_unparseable_recognised_dash_c_payload_is_a_scan_problem(self):
+        ft = FixtureTree(self)
+        ft.write("hooks/odd-hook.sh", "#!/usr/bin/env bash\n\"$MC_PY\" -c 'def (:'\n")
+        f = [x for x in ft.findings() if x.startswith("scan: hooks/odd-hook.sh:2:")]
+        self.assertEqual(len(f), 1, ft.findings())
+
+    def test_tab_indented_dash_heredoc_payload_defining_a_guarded_symbol_fails(self):
+        ft = FixtureTree(self)
+        ft.write("scripts/odd.sh",
+                 '#!/usr/bin/env bash\n"$PY" - <<-\'EOF\'\n\tdef _anchor_ident(row):\n\t    return None\n\tEOF\n')
+        found = ft.findings()
+        self.assertEqual(len(only(found, "anchor-identity", "name_owner")), 1, found)
+        self.assertEqual([x for x in found if x.startswith("scan:")], [])
+
+    def test_unterminated_heredoc_is_reported_with_the_line_of_its_opener(self):
+        ft = FixtureTree(self)
+        ft.write("hooks/odd-hook.sh",
+                 '#!/usr/bin/env bash\necho a\ncat <<\'NEVER\'\ndata\nmore data\n')
+        found = ft.findings()
+        f = [x for x in found if x.startswith("scan: hooks/odd-hook.sh:3:")]
+        self.assertEqual(len(f), 1, found)
+        self.assertIn("unterminated heredoc", f[0])
 
     def test_direct_lint_call_bypassing_the_delegation_fails(self):
         ft = FixtureTree(self)
@@ -697,7 +722,17 @@ class TestScanner(unittest.TestCase):
             '''})
         emb = sorted(d.name for d in s.defs if d.embedded)
         self.assertEqual(emb, ["from_dash_c", "from_heredoc"])
-        self.assertEqual(s.unparsed, [])
+        self.assertEqual(s.problems, [])
+
+    def test_dash_heredoc_strips_leading_tabs_from_the_payload(self):
+        s = self.scan({"h.sh": '#!/usr/bin/env bash\n"$MC_PY" - <<-\'EOF\'\n\tdef tabbed():\n\t    pass\n\tEOF\n'})
+        self.assertEqual([d.name for d in s.defs if d.embedded], ["tabbed"])
+        self.assertEqual(s.problems, [])
+
+    def test_unterminated_heredoc_does_not_stop_later_payloads_from_being_scanned(self):
+        s = self.scan({"h.sh": "cat <<'NEVER'\ndata\n"})
+        self.assertEqual(len(s.problems), 1)
+        self.assertIn("h.sh:1:", s.problems[0])
 
     def test_shell_text_drops_comments_and_heredoc_bodies(self):
         s = self.scan({"a.sh": '''\

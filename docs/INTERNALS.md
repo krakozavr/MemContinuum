@@ -4059,11 +4059,17 @@ line at the declaration's indentation (or on the declaration line); `name() (` a
 other forms are reported, never guessed at. Comments (whole-line and trailing,
 quote-aware) and heredoc bodies are dropped. Python inside shell is scanned as
 Python: a heredoc fed to an interpreter (`python - <<'EOF'`, `"$MC_PY" - <<'EOF'`)
-and a single-quoted `<interpreter> -c '...'` payload. Not scanned: double-quoted
+and a single-quoted `<interpreter> -c '...'` payload. A `<<-` heredoc has its leading tabs
+removed from every payload line, as Bash does. Not scanned: double-quoted
 `-c "..."` payloads, Python held in a shell variable, extension-less scripts. A
 registered symbol the scanner cannot read fails with a diagnostic naming the
-supported forms; an embedded payload that does not parse and holds a guarded token
-is reported rather than skipped.
+supported forms; a recognised Python payload that does not parse, and a heredoc
+that is never closed, are scan problems reported with the file and the line of the
+payload or opener (a finding), never skipped. "Bounded" names the syntax the scanner
+covers, not its resources: files are read whole, the scan is linear in file size
+except that the closing-brace search of each unclosed shell declaration reads to the
+end of the file (quadratic only for a file with very many unclosed declarations),
+and there is no size cap.
 
 **The methods** (only these exist):
 

@@ -269,8 +269,7 @@ class Scan:
     defs: list = field(default_factory=list)
     units: list = field(default_factory=list)
     trees: list = field(default_factory=list)       # (path, lineno_offset, ast.Module, embedded)
-    problems: list = field(default_factory=list)    # unsupported / unparseable production syntax
-    unparsed: list = field(default_factory=list)    # (path, lineno, text) embedded payloads that did not parse
+    problems: list = field(default_factory=list)    # unsupported / unparseable / unterminated production syntax
     files: dict = field(default_factory=dict)       # relpath -> "py" | "sh"
     seconds: float = 0.0
     fingerprints: dict = field(default_factory=dict)   # id(Definition) -> normalised body
@@ -383,7 +382,8 @@ def _scan_python(scan, rel, text, line_offset, embedded, prefix):
         tree = ast.parse(text)
     except (SyntaxError, ValueError) as exc:
         if embedded:
-            scan.unparsed.append((rel, line_offset + 1, text))
+            scan.problems.append(f"{rel}:{line_offset + 1}: embedded python payload is not parseable ({exc}); "
+                                 "the inventory cannot scan it, so no guard sees what it defines")
         else:
             scan.problems.append(f"{rel}: not parseable as Python ({exc}); the inventory cannot scan it")
         return
@@ -476,13 +476,15 @@ def _strip_shell_comment(line: str) -> str:
 
 
 def _mask_shell(text: str):
-    """`(masked_lines, payloads)`: the file's lines with heredoc bodies and
-    python `-c '...'` payload bodies blanked (line numbers preserved), and the
-    extracted python payloads as `(first_line_number, source)`."""
+    """`(masked_lines, payloads, problems)`: the file's lines with heredoc bodies
+    and python `-c '...'` payload bodies blanked (line numbers preserved), the
+    extracted python payloads as `(first_line_number, source)`, and the
+    `(line_number, message)` problems found (an unterminated heredoc)."""
     lines = text.split("\n")
     n = len(lines)
     keep = [True] * n
     payloads = []
+    problems = []
     i = 0
     offsets = []
     pos = 0
@@ -526,6 +528,7 @@ def _mask_shell(text: str):
         hds = list(_HEREDOC_RE.finditer(code))
         if hds:
             j = i + 1
+            resume = j
             for hm in hds:
                 dash, tag = hm.group(1), hm.group(3)
                 start_body = j
@@ -535,22 +538,32 @@ def _mask_shell(text: str):
                         break
                     j += 1
                 if j >= n:
+                    problems.append((i + 1, f"unterminated heredoc: `<<{dash}{tag}` opened here is never closed "
+                                            f"by a line holding `{tag}`; the scanner cannot tell code from data "
+                                            "after it"))
+                    j = resume      # resume after the last closed heredoc: nothing more is blanked
                     break
-                body = "\n".join(lines[start_body:j])
+                body_lines = lines[start_body:j]
+                if dash:
+                    body_lines = [bl.lstrip("\t") for bl in body_lines]   # `<<-` strips leading tabs
+                body = "\n".join(body_lines)
                 if _PY_HEREDOC_LINE_RE.search(code[:hm.start()]) and hm is hds[0]:
                     payloads.append((start_body + 1, body))
                 for k in range(start_body, j + 1):
                     keep[k] = False
                 j += 1
+                resume = j
             i = max(j, i + 1)
             continue
         i += 1
     masked = [(_strip_shell_comment(lines[k]) if keep[k] else "") for k in range(n)]
-    return masked, payloads
+    return masked, payloads, problems
 
 
 def _scan_shell(scan, rel, text):
-    masked, payloads = _mask_shell(text)
+    masked, payloads, mask_problems = _mask_shell(text)
+    for lineno, msg in mask_problems:
+        scan.problems.append(f"{rel}:{lineno}: {msg}")
     n = len(masked)
     funcs = []   # (start, end, name, rest)
     for i in range(n):
@@ -1015,10 +1028,6 @@ def _guard_token_owner(scan, row, owner, params):
         if u is not owner_unit:
             out.append(f"another owner of the construct {pat.pattern!r}: {u.qual} at {u.path}:{u.lineno} "
                        f"(the owner is {_def_ref(owner)})")
-    for path, lineno, text in scan.unparsed:
-        if pat.search(text) and (not paths or any(path.startswith(p) for p in paths)):
-            out.append(f"an embedded python payload at {path}:{lineno} contains {pat.pattern!r} but is not "
-                       "parseable; the scanner cannot tell whether it is a second owner")
     return out
 
 
