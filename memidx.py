@@ -12721,11 +12721,39 @@ class ReservationLeftError(OSError):
         self.reserved_path = reserved_path
 
 
-def _atomic_write_bytes(path: Path, data: bytes, exclusive: bool = False) -> None:
+def _fsync_dir(path: Path) -> None:
+    """fsync the directory `path` (so a rename or a new entry in it survives
+    power loss). Raises OSError."""
+    dir_fd = os.open(str(path), os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _makedirs_durable(path: Path) -> None:
+    """`os.makedirs(path, exist_ok=True)`, then fsync every directory it created
+    and the existing directory that now holds the topmost of them, so the new
+    links survive power loss. Raises OSError."""
+    created, probe = [], Path(path)
+    while not probe.exists():
+        created.append(probe)
+        probe = probe.parent
+    os.makedirs(path, exist_ok=True)
+    for made in reversed(created):
+        _fsync_dir(made)
+    if created:
+        _fsync_dir(created[-1].parent)
+
+
+def _atomic_write_bytes(path: Path, data: bytes, exclusive: bool = False, *,
+                        strict_dir_fsync: bool = False) -> None:
     """Write `data` to `path` so a crash or I/O error never leaves a short file:
     a temp file in the SAME directory, flushed and fsynced, then `os.replace`d
     onto the target, then the parent directory fsynced so the rename survives
-    power loss (a failure of that last step is ignored). `exclusive` (a new
+    power loss (a failure of that last step is ignored unless `strict_dir_fsync`,
+    which raises it: the undo receipts and the restore of an earlier image need
+    the rename to be durable). `exclusive` (a new
     file): the target is first created with O_CREAT|O_EXCL as the reservation --
     FileExistsError when it is taken, which never unlinks the winner -- and
     removed again if anything after it fails. For an existing file the original
@@ -12778,13 +12806,10 @@ def _atomic_write_bytes(path: Path, data: bytes, exclusive: bool = False) -> Non
                                    f"cleanup failed: {unlink_exc})") from exc
         raise
     try:
-        dir_fd = os.open(str(path.parent), os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
+        _fsync_dir(path.parent)
     except OSError:
-        pass
+        if strict_dir_fsync:
+            raise
 
 
 # ---------------------------------------------------------------------------
@@ -13078,8 +13103,13 @@ class _UndoScope:
             finally:
                 self._held = False
             return
-        os.makedirs(self.rec_dir, exist_ok=True)
-        fd = os.open(str(self.rec_dir / (self.key + ".lock")), os.O_CREAT | os.O_RDWR, 0o666)
+        lock_path = self.rec_dir / (self.key + ".lock")
+        try:
+            _makedirs_durable(self.rec_dir)
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o666)
+        except OSError as exc:
+            raise TopicEditRefused(f"cannot take the topic's receipt lock at {lock_path} ({exc}); "
+                                   "nothing written") from exc
         try:
             deadline = time.monotonic() + _LOCK_WAIT_SECONDS
             while True:
@@ -13099,15 +13129,15 @@ class _UndoScope:
         finally:
             os.close(fd)
 
-    def record(self, command: str, ref: str, mark: dict | None, before: bytes, after: bytes) -> bool:
+    def record(self, command: str, ref: str, mark: dict | None, before: bytes, after: bytes) -> None:
         """Write one durable receipt (fsynced file, fsynced directory) on top
         of the stack, with the topic's committed and staged entries as they are
         now; call it under `locked()`, BEFORE the topic write. Raises
         `TopicEditRefused` when a git probe is unavailable or the topic is
-        unmerged. False when the receipt could not be written (the edit then
-        goes ahead without an undo)."""
+        unmerged or the receipt cannot be made durable: a git-backed store never
+        edits without its receipt."""
         if not self.enabled:
-            return False
+            return
         committed, staged = self.baseline()
         problem = _unavailable_problem(self.rel, ("HEAD or its tree", committed), ("index", staged))
         if problem:
@@ -13127,14 +13157,13 @@ class _UndoScope:
             "mark": ({k: mark[k] for k in ("ref", "action", "recorded_at")} if mark else None),
             "written_at": datetime.now().astimezone().isoformat(timespec="seconds"),  # not _now(): a receipt must not consume a test clock
         }
+        target = self.rec_dir / f"{self.key}.{seq:08d}.json"
         try:
-            _atomic_write_bytes(self.rec_dir / f"{self.key}.{seq:08d}.json",
-                                json.dumps(data, sort_keys=True).encode("utf-8"))
+            _atomic_write_bytes(target, json.dumps(data, sort_keys=True).encode("utf-8"),
+                                strict_dir_fsync=True)
         except OSError as exc:
-            print(f"warning: no undo receipt written ({exc}); the edit goes ahead without one",
-                  file=sys.stderr)
-            return False
-        return True
+            raise TopicEditRefused(f"the undo receipt could not be written durably at {target} ({exc}); "
+                                   "nothing written") from exc
 
 
 def undo_plan(scope: "_UndoScope", current: bytes, command: str | None, ref: str | None) -> tuple:
@@ -13273,7 +13302,11 @@ def _restore_receipt(scope: "_UndoScope", path: Path, root: Path, current: bytes
             or staged != receipt.staged or Path(path).read_bytes() != current):
         raise TopicEditRefused("the undo receipt no longer applies (the topic or its committed or staged "
                                f"entry changed while this command ran); nothing written")
-    _atomic_write_bytes(path, receipt.before)
+    try:
+        _atomic_write_bytes(path, receipt.before, strict_dir_fsync=True)
+    except OSError as exc:
+        raise TopicEditRefused(f"the earlier bytes of {scope.rel} could not be restored durably ({exc}); "
+                               "check the file with `git diff` -- the receipt is kept") from exc
     scope.drop(receipt)
 
 

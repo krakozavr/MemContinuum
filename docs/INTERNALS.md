@@ -3731,8 +3731,12 @@ store root, the topic path and id, the topic's committed entry at HEAD (an
 `entry` with mode and blob id, `absent`, or `unborn` for a branch with no commit), the staged index
 entry (`git ls-files -s`: mode, blob id and stage, or `absent`), the exact bytes before (B) and after
 (A) as base64, the command, the reference and the identity of the mark row produced
-(ref, action, `recorded_at`; none when the command wrote no row). The file is fsynced
-(`_atomic_write_bytes`) before the topic is written. `--dry-run` writes none.
+(ref, action, `recorded_at`; none when the command wrote no row). The file and its
+directory are fsynced (`_atomic_write_bytes` with `strict_dir_fsync`, and the receipts
+directory's new ancestors once) before the topic is written. In a git-backed store a
+receipt that cannot be made durable, or a lock that cannot be taken (a read-only `.git`),
+refuses the command and writes nothing, naming the receipt path and the error. `--dry-run`
+writes none.
 
 `undo_plan` decides, before any anchor capture or mark generation: the latest receipt
 is the opposite command on the same reference AND the topic path is the recorded one AND

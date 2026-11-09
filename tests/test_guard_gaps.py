@@ -2456,10 +2456,10 @@ class TestUndoReceipts(BindCase):
         before = self.head_state(refs=())
         real = memidx._atomic_write_bytes
 
-        def crash_on_topic(path, data, exclusive=False):
+        def crash_on_topic(path, data, exclusive=False, **kw):
             if Path(path).name == "foo.md":
                 raise OSError("simulated crash after the receipt")
-            return real(path, data, exclusive)
+            return real(path, data, exclusive, **kw)
 
         with mock.patch.object(memidx, "_atomic_write_bytes", side_effect=crash_on_topic):
             with self.assertRaises(OSError):
@@ -2550,6 +2550,76 @@ class TestUndoReceipts(BindCase):
         with scope.locked():
             scope.prune_invalid()
         self.assertFalse(junk.exists())
+
+    def test_a_receipt_that_cannot_be_written_durably_refuses_the_edit(self):
+        # gate round 1 (Sol 4, Grok 3): no receipt, no edit -- never warn-and-proceed
+        before = self.head_state(refs=())
+        real = memidx._atomic_write_bytes
+
+        def deny_receipts(path, data, *a, **kw):
+            if Path(path).suffix == ".json":
+                raise PermissionError(13, "Permission denied")
+            return real(path, data, *a, **kw)
+
+        with mock.patch.object(memidx, "_atomic_write_bytes", side_effect=deny_receipts):
+            rc, out, err = self.bind()
+        self.assertEqual(rc, 1, (out, err))
+        self.assertIn("the undo receipt could not be written durably at", err)
+        self.assertIn(".json", err)
+        self.assertIn("Permission denied", err)
+        self.assertIn("nothing written", err)
+        self.assertEqual((self.raw(), self.receipts()), (before, []))
+        # a second edit on top of an existing receipt refuses the same way and keeps the first receipt
+        self.assertEqual(self.bind()[0], 0)
+        after = self.raw()
+        with mock.patch.object(memidx, "_atomic_write_bytes", side_effect=deny_receipts):
+            rc, out, err = self.bind("src/other.py")
+        self.assertEqual(rc, 1, (out, err))
+        self.assertEqual((self.raw(), len(self.receipts())), (after, 1))
+
+    def test_a_failing_directory_fsync_refuses_the_edit(self):
+        before = self.head_state(refs=())
+        self.assertEqual(self.bind("src/other.py")[0], 0)  # the receipts directory exists now
+        mid = self.raw()
+        real = memidx._fsync_dir
+
+        def fail_in_receipts(path):
+            if Path(path) == self.rec_dir():
+                raise OSError(5, "Input/output error")
+            return real(path)
+
+        with mock.patch.object(memidx, "_fsync_dir", side_effect=fail_in_receipts):
+            rc, out, err = self.bind("src/foo.py")
+        self.assertEqual(rc, 1, (out, err))
+        self.assertIn("could not be written durably", err)
+        self.assertIn("Input/output error", err)
+        self.assertEqual(self.raw(), mid)
+        self.assertNotEqual(mid, before)
+
+    def test_a_read_only_receipts_directory_refuses_with_the_message(self):
+        before = self.head_state(refs=())
+        self.assertEqual(self.bind("src/other.py")[0], 0)
+        mid = self.raw()
+        d = self.rec_dir()
+        scope = memidx._UndoScope(self.store, self.path, "TOP-1")
+        d.chmod(0o500)
+        try:
+            rc, out, err = self.bind("src/foo.py")  # the lock file exists; the receipt cannot be created
+            self.assertEqual(rc, 1, (out, err))
+            self.assertIn("the undo receipt could not be written durably at", err)
+            self.assertEqual(self.raw(), mid)
+        finally:
+            d.chmod(0o700)
+        (d / (scope.key + ".lock")).unlink()
+        d.chmod(0o500)
+        try:
+            rc, out, err = self.bind("src/foo.py")  # not even the lock file can be created
+            self.assertEqual(rc, 1, (out, err))
+            self.assertIn("cannot take the topic's receipt lock at", err)
+            self.assertNotIn("Traceback", err)
+            self.assertEqual(self.raw(), mid)
+        finally:
+            d.chmod(0o700)
 
     def test_a_held_lock_refuses_without_writing(self):
         before = self.head_state(refs=())
