@@ -129,6 +129,9 @@ def _slow_root_factor():
 
 
 budget *= _slow_root_factor()
+# The guarded child sees the budget it really has (after the slow-root
+# factor): memidx.py sizes the git-ignore pass of `unmapped` from it.
+os.environ["MC_WATCHDOG_EFFECTIVE_BUDGET"] = repr(budget)
 
 proc = None
 # Finding 6 (LOW, startup signal race): a SIGTERM/SIGINT can land while

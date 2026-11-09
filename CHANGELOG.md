@@ -17,6 +17,21 @@ state and stay out of the store; repos pick it up at their next update.
 
     Technical: `bind` of a non-anchorable ref calls `unanchored_ref_problem` (trailing-slash prefix naming an existing directory under a code root, or a glob character; no `#symbol`), inserts the entry and its `ref_marks` `add` row, writes no anchor row (`bound_edit_problem(anchored=False)` requires none) and exits 0; a directory without its slash still exits 2; `promotable_link` allows authority `agent-inference`/`reviewer-finding`/`code-derived` with status `active`/`provisional`; `path_exists_refusal` serves both `path-exists` sites; `validate_record_shape` reports a `type` or `metadata.type` that is present and not a `str` (absent and null stay legal) (a canonical record is quarantined, a note drops the field with a warning) and `is_canonical_frontmatter` no longer hashes a list `type`; the index generation moved from 6 to 7 so the next reindex re-parses every record once (an unchanged file skips the parser, so a row stored under the old permissive type rule would otherwise survive); `templates/memcontinuum-rules.md` changed, so rendered rules files read `rules-stale` until `memcontinuum-update.sh --apply`.
 
+### Files git ignores no longer count as uncovered
+
+The coverage reminder used to list scratch files, build output and anything else the project's `.gitignore`
+excludes as "edited files with no decision topic", and counted them. Now a file the code repository's git
+ignores is left out of both the list and the count. A file that is tracked is still reported even when it
+matches an ignore pattern, and when git cannot answer (not a repository, not installed, too slow) the file is
+reported as before. Editing a `.gitignore` is noticed when the edit passes through the session's edit ledger and the next prompt reaches the coverage check: the session's remembered verdicts
+are dropped and every file is checked again. Cost: one extra git call per code root when files are first
+classified, about 0.4 s for 400 files on a Windows-mounted drive, nothing for files already classified. The
+coverage sentence is now built in one place for the prompt and session-start hooks, and the edit ledger no
+longer starts a Python, watchdog or Git process for tools that cannot write files (`SubagentHandback`, `SendMessage`, `Monitor` and
+similar).
+
+    Technical: `memidx.py unmapped` gains the verdict `ignored` (JSON list `ignored`, `by_path` value, text line `ignored: N`) from one `git --no-optional-locks -C <root> check-ignore -z --stdin` per code root (plain, not `--no-index`; failure or exit other than 0 or 1 ignores nothing; one shared deadline `MEMCONTINUUM_IGNORE_CHECK_BUDGET`, default a quarter of the hook's effective watchdog budget, exported by the launcher as `MC_WATCHDOG_EFFECTIVE_BUDGET`; JSON `ignore_check`: `complete`, `timeout` or `skipped`; store paths excluded by canonical prefix); `userprompt-remind.sh` caches `ignored` like `unmapped` and drops `unmapped_cache` when the ledger holds a `.gitignore` or `.git/info/exclude` edit newer than the oldest cached verdict; `hooks/mc_nudge.py` (`coverage_fact`, `coverage_question`, stdlib only) replaces the two inline copies in `userprompt-remind.sh` and `sessionstart-remind.sh`; the `ledger-post-edit.sh` prefilter adds ten harness-side tool names and keeps `mcp__*` and unknown names on the shell-diff fall-through; the tests' one-second bounds on hook latency now assert the hook's own `elapsed=` (or the property they stood for) with a 5 s hang guard.
+
 ### Hooks stop timing out on a Windows-mounted code root
 
 On WSL, a project whose code lives under `/mnt/` (a Windows drive) saw its prompt, edit-ledger and

@@ -167,15 +167,20 @@ case "$MC_PREFIX" in
         ;;
 esac
 
-# Design R6: the read-only built-ins never mutate anything, so a ledger
+# Design R6: the read-only built-ins never mutate anything, and neither do
+# the harness-side tools (agent messaging, monitors, task control, wake-ups,
+# feedback and findings reporters: none takes a file to write), so a ledger
 # row (or even a shell-diff pass) for one of them is pure waste -- exit 0
 # silently, no python spawned, no watchdog, no hook.log line at all (the
 # absence of a line here is itself the fast path; nothing here would be
-# worth logging on top of it).
+# worth logging on top of it). Every mcp__* tool and any name not listed
+# falls through: an unknown tool stays observable, never silenced (R6).
 case "$MC_TOOL_NAME" in
     Read|Grep|Glob|LS|NotebookRead|WebFetch|WebSearch|TodoWrite|TodoRead|\
 Task|Agent|Skill|ToolSearch|AskUserQuestion|BashOutput|KillShell|\
-EnterPlanMode|ExitPlanMode|ListMcpResourcesTool|ReadMcpResourceTool)
+EnterPlanMode|ExitPlanMode|ListMcpResourcesTool|ReadMcpResourceTool|\
+SubagentHandback|SendMessage|Monitor|TaskStop|TaskOutput|ListAgents|\
+SendFeedback|ReadNotifications|ScheduleWakeup|ReportFindings)
         exit 0
         ;;
 esac

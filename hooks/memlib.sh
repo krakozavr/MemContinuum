@@ -136,7 +136,7 @@ MC_DB_PATH="$MEMCONTINUUM_HOME/$MC_PROJECT.sqlite"
 
 # The ONE "now" helper is mc_now_ms (hooks/mc-query-lib.sh, pure and
 # side-effect-free like mc-path-lib.sh): bash >= 5 reads $EPOCHREALTIME with
-# no fork, older bash probes `date +%s%3N` once and falls back to python.
+# no fork, older bash probes `date +%s%3N` once, then perl Time::HiRes, then python.
 # shellcheck source=mc-query-lib.sh
 . "$MC_LIB_DIR/mc-query-lib.sh"
 
