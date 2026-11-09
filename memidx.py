@@ -408,13 +408,15 @@ def record_is_quarantined(result: "ParseResult", *, as_delivered_before_type_rul
     with an ignored, non-string `metadata.type`, was valid and was delivered as `topic`; the new
     rule quarantines it, which must not release its type freeze. So a result whose ONLY
     diagnostics are the two type-shape ones and whose own `type` is a string (or absent/null: the
-    directory decides) counts as delivered. A non-string `type` itself is not forgiven: the old
-    index delivered its repr, a string no store holds (six-store scan), so it stays quarantined."""
+    directory decides) counts as delivered. A FALSY non-string `type` (`false`, `0`, `[]`, `{}`) is
+    the same: `infer_type` skipped it and the old index delivered the directory default. A truthy
+    non-string `type` is not forgiven: the old index delivered its repr, a string no store holds
+    (five-store scan), so it stays quarantined."""
     if result.valid:
         return False
     if (as_delivered_before_type_rule and result.diagnostics
             and all(d in (TYPE_SHAPE_DIAGNOSTIC, METADATA_TYPE_SHAPE_DIAGNOSTIC) for d in result.diagnostics)
-            and (result.frontmatter.get("type") is None or isinstance(result.frontmatter.get("type"), str))):
+            and (not result.frontmatter.get("type") or isinstance(result.frontmatter.get("type"), str))):
         return False
     return True
 

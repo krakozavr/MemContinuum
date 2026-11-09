@@ -6473,7 +6473,7 @@ class TestStandingReadOnlyAndGenerationGuard(unittest.TestCase):
                 "cmd_standing must never write to a generation-5 index -- read-only, always",
             )
 
-    def test_generation_7_future_index_is_refused_by_name(self):
+    def test_a_future_generation_index_is_refused_by_name(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "root"
             _write_record(root / "topics" / "t.md", _standing_topic("TOP-9710", "L1", ["L1"]))
@@ -6482,7 +6482,7 @@ class TestStandingReadOnlyAndGenerationGuard(unittest.TestCase):
                 reindex(root, db, no_embed=True)
             conn = sqlite3.connect(str(db))
             conn.execute(
-                "INSERT OR REPLACE INTO db_meta (key, value) VALUES ('index_generation', '7')"
+                "INSERT OR REPLACE INTO db_meta (key, value) VALUES ('index_generation', '8')"
             )
             conn.commit(); conn.close()
             sha_before = hashlib.sha256(db.read_bytes()).hexdigest()
@@ -6506,7 +6506,7 @@ class TestStandingReadOnlyAndGenerationGuard(unittest.TestCase):
                 reindex(root, db, no_embed=True)
             conn = sqlite3.connect(str(db))
             conn.execute(
-                "INSERT OR REPLACE INTO db_meta (key, value) VALUES ('index_generation', '7')"
+                "INSERT OR REPLACE INTO db_meta (key, value) VALUES ('index_generation', '8')"
             )
             conn.commit(); conn.close()
             self.assertEqual(
@@ -6537,7 +6537,7 @@ class TestReindexRefusesAGenerationAheadIndex(unittest.TestCase):
 
             conn = sqlite3.connect(str(db))
             conn.execute(
-                "INSERT OR REPLACE INTO db_meta (key, value) VALUES ('index_generation', '7')"
+                "INSERT OR REPLACE INTO db_meta (key, value) VALUES ('index_generation', '8')"
             )
             conn.execute("ALTER TABLE records ADD COLUMN future_only TEXT")
             conn.execute("UPDATE records SET future_only='KEEP' WHERE type='topic'")
@@ -6565,7 +6565,7 @@ class TestReindexRefusesAGenerationAheadIndex(unittest.TestCase):
                 "SELECT future_only FROM records WHERE type='topic'"
             ).fetchone()[0]
             conn.close()
-            self.assertEqual(gen, "7", "generation must stay exactly as it was, never downgraded")
+            self.assertEqual(gen, "8", "generation must stay exactly as it was, never downgraded")
             self.assertEqual(future_only, "KEEP", "a column only the newer generation populates must survive")
 
 
