@@ -3721,6 +3721,39 @@ anchor notes from the current `code_refs` only. `bind`, `unbind` and
 `mark-standing` share `new_audit_row`, `mark_authority` and `audit_row_problem`
 (the round-trip proof).
 
+**Undo receipts (`bind` / `unbind`).** Taking back an uncommitted `bind` or
+`unbind` is exact, not inferred: no HEAD-blob reading, no row-span discovery, no
+anchor-ownership logic. Before it writes, each command records a receipt
+(`_UndoScope.record`) under `git rev-parse --git-path memcontinuum/receipts`
+(per worktree, outside the store tree, so never tracked): one JSON file per receipt,
+`<topic id>-<store hash>.<seq>.json`, a per-topic stack ordered by `seq`. It holds the
+store root, the topic path and id, HEAD (or `unborn`), the staged index entry
+(`git ls-files -s`, mode and blob sha, or absent), the exact bytes before (B) and after
+(A) as base64, the command, the reference and the identity of the mark row produced
+(ref, action, `recorded_at`; none when the command wrote no row). The file is fsynced
+(`_atomic_write_bytes`) before the topic is written. `--dry-run` writes none.
+
+`undo_plan` decides, before any anchor capture or mark generation: the latest receipt
+is the opposite command on the same reference AND the topic path is the recorded one AND
+the topic bytes equal A AND `git rev-parse HEAD` equals the receipt's AND the staged entry
+equals the receipt's -> `apply_topic_edit(undo=...)` restores B through the same atomic
+writer, drops the receipt and prints `undo: restored <topic> to its state before the
+uncommitted <command> of <ref>`. A receipt whose HEAD moved is committed history: it is
+dropped (with a note when it was the one the command would have undone) and the ordinary
+write follows. A receipt whose topic still equals B was written before a crash: dropped. A
+moved topic, a topic that differs from A, or a changed staged entry is refused with the
+pending row named and the ways out (`git restore --source=HEAD --worktree -- <topic>`,
+`git restore --staged -- <topic>`, or commit first); nothing is written. A missing,
+malformed, legacy or non-matching receipt means the ordinary path. A receipt authorises
+restoring B only; it never deletes anything that is not in B.
+
+Writers serialize on one `flock`ed lock file per topic next to the stack
+(`_UndoScope.locked`); `apply_topic_edit(scope=...)` re-reads the topic under the lock and
+refuses (`TopicChangedError`, nothing written) unless it still equals the image the command
+read. `mark-standing` calls `apply_topic_edit` without a scope and is unchanged. A store
+outside git has no receipts. `undo-binding TOP-xxxx [--list]` shows the stack (newest
+first, nothing changed) or runs the same `undo_plan` / restore for the latest receipt.
+
 **Derived authority for rows.** `mark-standing` has no `--authority`: it takes
 `--session` and `--yes-message UUID`, or `--owner-message UUID --quote TEXT`,
 through `derive_mark_tier`, an adapter over `derive_owner_tier` (which reads a
@@ -4077,7 +4110,12 @@ down:
   [--recorded-by NAME] [--dry-run]`** — delete the `code_refs` item REF
   (verbatim, a prefix or glob included) and prepend its `remove` row; a REF that
   is not bound prints a message and exits 0 with nothing written. See "Reference
-  marks, `unbind` and the restore".
+  marks, `unbind` and the restore". Right after an uncommitted `bind` of the same REF
+  it restores the exact earlier bytes instead (see "Undo receipts"); `bind` does the
+  same after an uncommitted `unbind`.
+- **`undo-binding TOP-xxxx --root STORE [--list] [--dry-run]`** — list the topic's
+  undo receipts (`--list`) or undo the latest one under the conditions `bind` and
+  `unbind` apply automatically; rc 1 when none applies. See "Undo receipts".
 - **`mark-standing TOP-xxxx Ln (--add | --remove) --session ID (--yes-message UUID
   | --owner-message UUID --quote TEXT) --why TEXT --root STORE [--source NOTE]
   [--code-root DIR] [--recorded-by NAME] [--dry-run]`** — the one writer

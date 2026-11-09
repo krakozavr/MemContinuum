@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Taking back a bind or unbind is exact
+
+Typed the wrong reference, or bound and then changed your mind before committing? Running the opposite
+command (`unbind` after `bind`, `bind` after `unbind`) on the same reference now puts the topic file back
+exactly as it was before the first command, every byte, anchors and pending edits included, and says so.
+If the file, the commit or the staged copy has changed since, it refuses without writing and names the
+way out (commit first, or `git restore`); once the first command is committed it is history and the
+opposite command is an ordinary new edit, as before. `memidx.py undo-binding TOP-xxxx [--list]` lists the
+pending undo records or undoes the latest one.
+
+    Technical: `bind` and `unbind` write a receipt (topic bytes before and after, HEAD, staged entry, command, reference, mark identity) to `git rev-parse --git-path memcontinuum/receipts` before the topic write, per-topic stack and `flock`; the opposite command restores the before-bytes only while the topic equals the after-bytes, HEAD and the staged entry are unchanged and the topic has not moved; `--dry-run` writes none; a stale, crashed or malformed receipt is dropped or ignored and never deletes anything; the commit guard and `memlint.py` are unchanged.
+
 ### Commit guard refuses on a crash; honest latency bars
 
 Three small corrections. The store's commit guard used to let a commit through when the check itself

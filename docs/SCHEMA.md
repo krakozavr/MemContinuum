@@ -169,6 +169,12 @@ history, and a later `add` row re-arms the requirement); a `link` not in
 `(ref, link)`; `span: symbol` without `chunker_version`; a row without `captured_at`
 (`ref`, `link`, `captured` and `captured_at` together identify a row, so all four are required).
 
+**Undo receipts are not store content.** `bind` and `unbind` keep a worktree-local receipt (the topic's
+exact bytes before and after the command) under `git rev-parse --git-path memcontinuum/receipts`, outside
+the store tree, so the opposite command can take back an uncommitted edit byte for byte. A receipt is
+never read by `memlint.py`, never committed and never part of a record; the rows and anchors a topic
+carries are the same with or without one.
+
 **Anchor rows are append-only**, like links: under `--against-ref`, a row present at `REF`
 (identified by `ref`, `link`, `captured`, `captured_at`) must survive with the same fields and the
 same raw bytes; new rows are free. A recorded row whose identity cannot be built is an error, not
