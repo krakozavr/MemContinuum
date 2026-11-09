@@ -13317,6 +13317,8 @@ def _undo_front(scope: "_UndoScope", cmd: str, args, root: Path, path: Path,
     bytes (pruning stale receipts), and when it says undo, restore B and drop the
     receipt. The exit code when an undo ran or was refused, else None (the
     ordinary path)."""
+    if _outside_store_refusal(root, args.topic, path):
+        return None  # the verified parse that follows refuses it with its own message
     try:
         with scope.locked():
             current = Path(path).read_bytes()
@@ -13520,14 +13522,14 @@ def cmd_bind(args) -> int:
     if path is None:
         print(f"bind: no topic {args.topic!r} under {args.root}/topics", file=sys.stderr)
         return 1
-    old_text, fm, reason = _verified_topic_record(root, args.topic, path)
-    if reason:
-        print(f"bind: {reason[1]}; nothing written", file=sys.stderr)
-        return 1
     scope = _UndoScope(root, path, args.topic, dry=args.dry_run)
     undone = _undo_front(scope, "bind", args, root, path, "bind", ref)
     if undone is not None:
         return undone
+    old_text, fm, reason = _verified_topic_record(root, args.topic, path)
+    if reason:
+        print(f"bind: {reason[1]}; nothing written", file=sys.stderr)
+        return 1
     link_id = _topic_current_link(fm)
     if link_id is None:
         print(f"bind: {args.topic} has no active link to anchor", file=sys.stderr)
@@ -13610,14 +13612,14 @@ def cmd_unbind(args) -> int:
     if path is None:
         print(f"unbind: no topic {args.topic!r} under {args.root}/topics", file=sys.stderr)
         return 1
-    old_text, fm, reason = _verified_topic_record(root, args.topic, path)
-    if reason:
-        print(f"unbind: {reason[1]}; nothing written", file=sys.stderr)
-        return 1
     scope = _UndoScope(root, path, args.topic, dry=args.dry_run)
     undone = _undo_front(scope, "unbind", args, root, path, "unbind", ref)
     if undone is not None:
         return undone
+    old_text, fm, reason = _verified_topic_record(root, args.topic, path)
+    if reason:
+        print(f"unbind: {reason[1]}; nothing written", file=sys.stderr)
+        return 1
     refs_now = [r for r in fm.get("code_refs") or []]
     if ref not in [str(r) for r in refs_now]:
         print(f"unbind: {ref!r} is not in {args.topic}'s code_refs; nothing written")
@@ -13671,9 +13673,9 @@ def cmd_undo_binding(args) -> int:
     if path is None:
         print(f"undo-binding: no topic {args.topic!r} under {args.root}/topics", file=sys.stderr)
         return 1
-    old_text, _fm, reason = _verified_topic_record(root, args.topic, path)
-    if reason:
-        print(f"undo-binding: {reason[1]}; nothing written", file=sys.stderr)
+    outside = _outside_store_refusal(root, args.topic, path)
+    if outside:
+        print(f"undo-binding: {outside[1]}; nothing written", file=sys.stderr)
         return 1
     scope = _UndoScope(root, path, args.topic, dry=args.dry_run or args.list)
     if args.list:
@@ -14741,6 +14743,18 @@ def _code_roots_for_filing(args) -> list:
     return _code_roots_arg(args.code_root)
 
 
+def _outside_store_refusal(root: Path, topic_id: str, path: Path) -> tuple | None:
+    """`(token, message)` when `path` does not resolve inside the resolved store
+    `root` (separator-bounded), else None -- the containment half of
+    `_verified_topic_record`, asked on its own before a receipt is consulted."""
+    real_root = os.path.realpath(root)
+    real_path = os.path.realpath(path)
+    if real_path.startswith(real_root.rstrip(os.sep) + os.sep):
+        return None
+    return ("outside-store", f"{topic_id} is claimed by {path}, which resolves to {real_path}, "
+            f"outside the store {root} (a symlinked topics/ or inbox/?)")
+
+
 def _verified_topic_record(root: Path, topic_id: str, path: Path) -> tuple:
     """The ONE write-target check for `append`/`promote` (`_load_topic`), `bind`
     and `mark-standing` (TOP-0137 L23, gate round 6 R6-1/R6-4): `path` must
@@ -14749,11 +14763,9 @@ def _verified_topic_record(root: Path, topic_id: str, path: Path) -> tuple:
     parsed `id` equal to `topic_id`. Returns `(text, frontmatter, None)` or
     `(None, None, (token, message))` -- the refusal token and a one-line
     message; the caller refuses before any write."""
-    real_root = os.path.realpath(root)
-    real_path = os.path.realpath(path)
-    if not real_path.startswith(real_root.rstrip(os.sep) + os.sep):
-        return None, None, ("outside-store", f"{topic_id} is claimed by {path}, which resolves to {real_path}, "
-                            f"outside the store {root} (a symlinked topics/ or inbox/?)")
+    outside = _outside_store_refusal(root, topic_id, path)
+    if outside:
+        return None, None, outside
     try:
         text = read_record_bytes_strict(path)
     except UnicodeDecodeError as exc:

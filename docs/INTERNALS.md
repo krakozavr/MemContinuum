@@ -3738,7 +3738,8 @@ receipt that cannot be made durable, or a lock that cannot be taken (a read-only
 refuses the command and writes nothing, naming the receipt path and the error. `--dry-run`
 writes none.
 
-`undo_plan` decides, before any anchor capture or mark generation: the latest receipt
+`undo_plan` runs on the topic's raw bytes, before the topic has to parse (a damaged file still gets the
+refusal that names the pending row and the way out) and before any anchor capture or mark generation. It decides: the latest receipt
 is the opposite command on the same reference AND the topic path is the recorded one AND
 the topic bytes equal A AND the topic's committed entry at HEAD equals the recorded one
 (a verified unborn branch counts as absent, so an unrelated first commit changes nothing)

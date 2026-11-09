@@ -2309,6 +2309,27 @@ class TestUndoReceipts(BindCase):
         self.assertEqual(self.raw(), changed)
         self.assertNotEqual(changed, before)
 
+    def test_a_damaged_topic_between_bind_and_unbind_still_gets_the_recovery_message(self):
+        # gate round 1 (Sol 5): the refusal needs no YAML, so the parse error must not hide it
+        self.head_state(refs=())
+        self.assertEqual(self.bind()[0], 0)
+        damaged = self.text().replace("code_refs:", "code_refs: [unclosed", 1).encode()
+        self.assertNotEqual(damaged, self.raw())
+        self.path.write_bytes(damaged)
+        for argv in (["unbind", "TOP-1", "src/foo.py"], ["bind", "TOP-1", "src/foo.py", "--code-root", str(self.code)],
+                     ["undo-binding", "TOP-1"]):
+            with self.subTest(argv[0]):
+                rc, out, err = run_memidx(argv + ["--root", str(self.store)])
+                self.assertEqual(rc, 1, (out, err))
+                if argv[0] == "bind":  # not the opposite command: the ordinary path, which needs a parse
+                    self.assertIn("does not parse cleanly", err)
+                    continue
+                self.assertIn("the topic changed after the uncommitted bind of src/foo.py", err)
+                self.assertIn("git restore --source=HEAD --worktree -- topics/foo.md", err)
+                self.assertIn("add row for src/foo.py", err)
+                self.assertEqual(self.raw(), damaged)
+        self.assertEqual(len(self.receipts()), 1)
+
     def test_a_commit_between_drops_the_receipt_and_the_ordinary_unbind_proceeds(self):
         self.head_state(refs=())
         self.assertEqual(self.bind()[0], 0)
