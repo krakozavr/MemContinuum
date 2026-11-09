@@ -4186,6 +4186,39 @@ class TestMalformedRecordQuarantine(unittest.TestCase):
                 conn.close()
             self.assertEqual(self._index_errors_rows(db), [])
 
+    def test_an_existing_index_row_with_a_list_type_is_removed_by_the_next_reindex(self):
+        """Gate round 1 R1-3: an unchanged-sha row skips the parser, so the generation bump is
+        what makes an index built under the old (permissive) rule drop the row."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            _write_record(root / "topics" / "listy.md",
+                          "---\nid: TOP-9120\ntype: [topic, weird]\ntitle: Listy\n---\nBody.\n")
+            db = Path(td) / "idx.sqlite"
+            # build the index with the OLD rule: no type-shape diagnostics, then stamp generation 6
+            with mock.patch.object(memidx, "validate_record_shape", lambda fm: []):
+                with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(reindex(root, db, no_embed=True), 0)
+            conn = sqlite3.connect(str(db))
+            try:
+                self.assertEqual(conn.execute("SELECT type FROM records WHERE id='TOP-9120'").fetchall(),
+                                 [("['topic', 'weird']",)])
+                conn.execute("INSERT OR REPLACE INTO db_meta (key, value) VALUES ('index_generation', '6')")
+                conn.commit()
+            finally:
+                conn.close()
+            out = io.StringIO()
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(out):
+                self.assertEqual(reindex(root, db, no_embed=True), 0)
+            self.assertNotIn("1 unchanged", out.getvalue())
+            conn = sqlite3.connect(str(db))
+            try:
+                self.assertEqual(conn.execute("SELECT id FROM records WHERE id='TOP-9120'").fetchall(), [])
+            finally:
+                conn.close()
+            rows = self._index_errors_rows(db)
+            self.assertEqual(len(rows), 1, rows)
+            self.assertIn("type", [d[0] for d in json.loads(rows[0]["diagnostics"])])
+
     # -- scenario 3: a link with no `link:` id -- must quarantine, not IntegrityError
 
     def test_link_with_no_id_is_quarantined_not_integrity_error(self):

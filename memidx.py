@@ -323,7 +323,13 @@ def _records_fresh_vector_counts(conn: "sqlite3.Connection", project: str) -> tu
 # same migration probe forces one full content pass on any generation-5-
 # or-older db, exactly as generation 3/4/5's own bumps did for their own
 # new columns.
-CURRENT_INDEX_GENERATION = 6
+# Bumped to 7 (TOP-0137 L29, gate round 1 R1-3): `type` and `metadata.type` must be a
+# string, so a canonical record that carries a list, mapping, number, bool, date or set
+# there is now quarantined. An unchanged-sha row skips the parser, so a row an older index
+# stored for such a record (type "['topic', 'weird']", "42", ...) would survive every
+# ordinary reindex until the file changed. The migration probe forces one full content
+# pass on any generation-6-or-older db, which re-parses every record and quarantines it.
+CURRENT_INDEX_GENERATION = 7
 
 # MAJOR fix-round item c (TOP-0133 L1): `search --hydrate`'s per-hit byte
 # cap, read once at import time from MEMCONTINUUM_FALLBACK_MAX_BYTES (the
