@@ -4053,7 +4053,8 @@ one method); tests, fixtures, benchmark corpora, documentation,
 the store, caches and vendored code are outside the scan.
 
 **The scan.** Python definitions (functions, methods, nested functions, module
-constants) are read with `ast`. Shell functions are read by a bounded scanner: the
+constants, found under any compound statement: if, for, while, with, try, match and
+their async variants) are read with `ast`. Shell functions are read by a bounded scanner: the
 forms `name() {` and `function name {`, a body ending at the first `}` on its own
 line at the declaration's indentation (or on the declaration line); `name() (` and
 other forms are reported, never guessed at. Comments (whole-line and trailing,

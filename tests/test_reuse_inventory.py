@@ -164,6 +164,21 @@ class TestGuardsRejectSecondImplementation(unittest.TestCase):
         ft.write("newmod.py", "def parse_record_text(text, path):\n    return None\n")
         self.assertEqual(len(only(ft.findings(), "record-text-parser", "name_owner")), 1)
 
+    def test_same_name_def_inside_match_and_async_with_in_a_new_file_fails(self):
+        ft = FixtureTree(self)
+        ft.write("newmod.py",
+                 "async def run(mode, cm):\n"
+                 "    match mode:\n"
+                 "        case 1:\n"
+                 "            def parse_record_text(text, path):\n"
+                 "                return None\n"
+                 "    async with cm:\n"
+                 "        def _anchor_ident(row):\n"
+                 "            return None\n")
+        found = ft.findings()
+        self.assertEqual(len(only(found, "record-text-parser", "name_owner")), 1, found)
+        self.assertEqual(len(only(found, "anchor-identity", "name_owner")), 1, found)
+
     def test_new_production_file_with_a_coverage_sentence_fails_token_owner(self):
         ft = FixtureTree(self)
         ft.write("hooks/extra_nudge.py",
@@ -715,6 +730,56 @@ class TestScanner(unittest.TestCase):
             '''})
         quals = sorted(d.qual for d in s.defs)
         self.assertEqual(quals, ["C.m", "C.m.inner", "X", "Y", "cond"])
+
+    def test_python_definitions_are_found_under_every_statement_container(self):
+        s = self.scan({"a.py": '''\
+            import sys
+            class C:
+                if sys.argv:
+                    def in_class_if(self):
+                        pass
+            match sys.argv:
+                case [x]:
+                    def in_match():
+                        pass
+            async def run(cm, items):
+                async with cm:
+                    def in_async_with():
+                        pass
+                async for i in items:
+                    def in_async_for():
+                        pass
+            with open("f") as fh:
+                def in_with():
+                    pass
+            for i in range(2):
+                def in_for():
+                    pass
+            while False:
+                def in_while():
+                    pass
+            try:
+                def in_try():
+                    pass
+            except OSError:
+                def in_except():
+                    pass
+            else:
+                def in_else():
+                    pass
+            finally:
+                def in_finally():
+                    pass
+            '''})
+        quals = sorted(d.qual for d in s.defs)
+        self.assertEqual(quals, sorted([
+            "C.in_class_if", "in_match", "run", "run.in_async_with", "run.in_async_for", "in_with", "in_for",
+            "in_while", "in_try", "in_except", "in_else", "in_finally"]))
+
+    @unittest.skipUnless(hasattr(__import__("ast"), "TryStar"), "except* needs Python 3.11")
+    def test_python_definitions_are_found_under_try_star(self):
+        s = self.scan({"a.py": "try:\n    pass\nexcept* OSError:\n    def in_star():\n        pass\n"})
+        self.assertEqual([d.qual for d in s.defs], ["in_star"])
 
     def test_embedded_payload_forms(self):
         s = self.scan({"h.sh": '''\

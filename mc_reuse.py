@@ -381,6 +381,18 @@ def _calls_and_loads(node):
     return frozenset(calls), frozenset(loads)
 
 
+def _nested_stmts(st):
+    """The statements directly inside a compound statement, whatever its kind:
+    its own statement children plus the bodies of except handlers and match cases."""
+    out = []
+    for ch in ast.iter_child_nodes(st):
+        if isinstance(ch, ast.stmt):
+            out.append(ch)
+        elif isinstance(ch, (ast.ExceptHandler, ast.match_case)):
+            out.extend(ch.body)
+    return out
+
+
 def _scan_python(scan, rel, text, line_offset, embedded, prefix):
     """Definitions and units of one Python source (a file or an embedded payload)."""
     try:
@@ -403,26 +415,25 @@ def _scan_python(scan, rel, text, line_offset, embedded, prefix):
             end_lineno=getattr(node, "end_lineno", getattr(node, "lineno", 0)) + line_offset,
             embedded=embedded, node=node))
 
-    def visit(stmts, stack, top):
+    def visit(stmts, stack):
         for st in stmts:
             if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 add_def(st, stack)
-                visit(st.body, stack + [st.name], False)
+                visit(st.body, stack + [st.name])
             elif isinstance(st, ast.ClassDef):
-                visit(st.body, stack + [st.name], False)
+                visit(st.body, stack + [st.name])
             elif isinstance(st, ast.Assign) and not stack:
                 for t in st.targets:
                     if isinstance(t, ast.Name):
                         add_def(st, stack, "const", t.id)
             elif isinstance(st, ast.AnnAssign) and not stack and isinstance(st.target, ast.Name) and st.value is not None:
                 add_def(st, stack, "const", st.target.id)
-            elif isinstance(st, (ast.If, ast.Try, ast.For, ast.While, ast.With)):
-                for fld in ("body", "orelse", "finalbody"):
-                    visit(getattr(st, fld, []) or [], stack, top)
-                for h in getattr(st, "handlers", []) or []:
-                    visit(h.body, stack, top)
+            else:
+                # every other statement (if/for/while/with/async variants/try/try-star/match ...):
+                # descend into whatever statements it holds, keeping the class scope
+                visit(_nested_stmts(st), stack)
 
-    visit(tree.body, [], True)
+    visit(tree.body, [])
 
     residual = []
 
