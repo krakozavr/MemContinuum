@@ -426,6 +426,15 @@ class TestDelegationNeedsAnExecutableCall(unittest.TestCase):
         self.assertEqual(len(f), 1, f)
         self.assertIn("no executable reference", f[0])
 
+    def test_an_attribute_store_is_not_a_reference_to_a_constant_owner(self):
+        files = {"a.py": "K = ('x', 'y')\n",
+                 "s.py": "import a\n\nclass O:\n    pass\n\ndef set_it(obj):\n    obj.K = 1\n    obj.K += 1\n    del obj.K\n",
+                 "l.py": "import a\n\ndef get_it(obj):\n    return obj.K\n"}
+        f = self.check(files, _deleg_row(["s.py"], owner="a.py#K"))
+        self.assertEqual(len(f), 1, f)
+        self.assertIn("no executable reference", f[0])
+        self.assertEqual(self.check(files, _deleg_row(["l.py"], owner="a.py#K")), [])
+
     def test_shell_calls_through_a_pipe_a_substitution_and_an_assignment_are_clean(self):
         owner = "a.sh#mc_job"
         base = {"a.sh": "mc_job() {\n    echo hi\n}\n"}
@@ -536,6 +545,19 @@ class TestPositiveControls(unittest.TestCase):
         # a string that is not a docstring still counts
         ft.write("nested_doc.py", 'def outer(x):\n    def inner(y):\n        return "Coverage signal"\n    return inner\n')
         self.assertEqual(len(only(ft.findings(), "coverage-fact-sentence", "token_owner")), 1, ft.findings())
+
+    def test_a_bare_string_after_a_definition_is_code_not_a_docstring(self):
+        ft = FixtureTree(self)
+        ft.write("tail_string.py", 'def f():\n    pass\n\n"Coverage signal is explained here"\n')
+        self.assertEqual(len(only(ft.findings(), "coverage-fact-sentence", "token_owner")), 1, ft.findings())
+        # the genuine module docstring, and a class docstring, are still prose
+        ft.write("tail_string.py", '"""Coverage signal is explained here."""\n\ndef f():\n    pass\n\n'
+                                   'class C:\n    """Coverage signal again."""\n\n    x = 1\n')
+        self.assertEqual(ft.findings(), [])
+        s = mc_reuse.scan_tree(ft.root, ["."], ["tests"])
+        unit = next(u for u in s.units if u.path == "tail_string.py" and u.qual == "<module>")
+        self.assertNotIn("Coverage", unit.text)
+        self.assertIn("x = 1", unit.text)
 
     def test_against_ref_outside_hooks_is_legitimate(self):
         ft = FixtureTree(self)

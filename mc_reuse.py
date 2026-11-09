@@ -362,15 +362,22 @@ def scan_tree(root, scan_roots, exclusions) -> Scan:
 
 # -- python ------------------------------------------------------------------
 
-def _strip_docstring(node):
+def _is_docstring(st) -> bool:
+    return isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant) and isinstance(st.value.value, str)
+
+
+def _strip_docstring(node, root=True):
     """`node` with the docstring of EVERY module, class and function inside it
-    removed (nested ones too): prose is not executable text for a guard."""
+    removed (nested ones too): prose is not executable text for a guard. With
+    `root=False` the node's own leading string is kept (a synthetic module of
+    leftover statements has no docstring: its first string is code)."""
     for n in ast.walk(node):
         if not isinstance(n, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
+        if n is node and not root:
+            continue
         body = n.body
-        if (body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
-                and isinstance(body[0].value.value, str)):
+        if body and _is_docstring(body[0]):
             n.body = body[1:] or [ast.Pass()]
     return node
 
@@ -397,7 +404,7 @@ def _calls_and_loads(node):
                 calls.add(f.attr)
         elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
             loads.add(n.id)
-        elif isinstance(n, ast.Attribute):
+        elif isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Load):
             loads.add(n.attr)
     return frozenset(calls), frozenset(loads)
 
@@ -464,19 +471,21 @@ def _scan_python(scan, rel, text, line_offset, embedded, prefix):
             path=rel, qual=prefix + qual, lang="py", lineno=node.lineno + line_offset,
             end_lineno=node.end_lineno + line_offset, text=_unit_text(node), calls=calls, loads=loads))
 
-    for st in tree.body:
+    for pos, st in enumerate(tree.body):
+        if pos == 0 and _is_docstring(st):
+            continue                # the module's own docstring; a later bare string is code and stays
         if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
             unit_for(st, st.name)
         elif isinstance(st, ast.ClassDef):
-            for sub in st.body:
+            for sub_pos, sub in enumerate(st.body):
                 if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     unit_for(sub, f"{st.name}.{sub.name}")
-                else:
+                elif not (sub_pos == 0 and _is_docstring(sub)):
                     residual.append(sub)
         else:
             residual.append(st)
     if residual:
-        mod = _strip_docstring(ast.Module(body=copy.deepcopy(residual), type_ignores=[]))
+        mod = _strip_docstring(ast.Module(body=copy.deepcopy(residual), type_ignores=[]), root=False)
         try:
             rtext = ast.unparse(mod)
         except Exception:
