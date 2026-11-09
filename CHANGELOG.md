@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Files git ignores no longer count as uncovered
+
+The coverage reminder used to list scratch files, build output and anything else the project's `.gitignore`
+excludes as "edited files with no decision topic", and counted them. Now a file the code repository's git
+ignores is left out of both the list and the count. A file that is tracked is still reported even when it
+matches an ignore pattern, and when git cannot answer (not a repository, not installed, too slow) the file is
+reported as before. Editing a `.gitignore` is noticed at the next prompt: the session's remembered verdicts
+are dropped and every file is checked again. Cost: one extra git call per code root when files are first
+classified, about 0.4 s for 400 files on a Windows-mounted drive, nothing for files already classified. The
+coverage sentence is now built in one place for the prompt and session-start hooks, and the edit ledger no
+longer starts a process for tools that cannot write files (`SubagentHandback`, `SendMessage`, `Monitor` and
+similar).
+
+    Technical: `memidx.py unmapped` gains the verdict `ignored` (JSON list `ignored`, `by_path` value, text line `ignored: N`) from one `git --no-optional-locks -C <root> check-ignore -z --stdin` per code root (plain, not `--no-index`; failure or exit other than 0 or 1 ignores nothing; timeout `_git_ls_timeout()`); `userprompt-remind.sh` caches `ignored` like `unmapped` and drops `unmapped_cache` when the ledger holds a `.gitignore` or `.git/info/exclude` edit newer than the oldest cached verdict; `hooks/mc_nudge.py` (`coverage_fact`, `coverage_question`, stdlib only) replaces the two inline copies in `userprompt-remind.sh` and `sessionstart-remind.sh`; the `ledger-post-edit.sh` prefilter adds ten harness-side tool names and keeps `mcp__*` and unknown names on the shell-diff fall-through; the tests' one-second bounds on hook latency now assert the hook's own `elapsed=` (or the property they stood for) with a 5 s hang guard.
+
 ### Hooks stop timing out on a Windows-mounted code root
 
 On WSL, a project whose code lives under `/mnt/` (a Windows drive) saw its prompt, edit-ledger and

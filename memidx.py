@@ -6335,8 +6335,8 @@ def _unmapped_resolved(raw_path: str, resolver: "_UnmappedResolver | None") -> P
 
 def _unmapped_classify_path(
     raw_path: str, code_roots: list[Path], resolver: "_UnmappedResolver | None" = None,
-) -> tuple[list[str], str]:
-    """`(candidates, display)` for one PATH argument, from ONE resolution of
+) -> tuple[list[str], str, Path | None]:
+    """`(candidates, display, root)` for one PATH argument, from ONE resolution of
     the raw path (a missing file pays its final-component lstat once, not
     once per consumer; gate round 2 R2-4).
 
@@ -6350,10 +6350,12 @@ def _unmapped_classify_path(
     conventionally repo-relative).
     display: the path string reported back -- relative to the LONGEST
     matching root when resolvable, else the path exactly as given.
+    root: that longest matching root (None when the path is under none).
     `resolver` (one per call) makes the resolution cost per directory
     instead of per path."""
     candidates = [raw_path]
     display = raw_path
+    root = None
     if code_roots:
         try:
             p = Path(raw_path)
@@ -6363,11 +6365,12 @@ def _unmapped_classify_path(
                 if best is not None:
                     rel = str(resolved.relative_to(best))
                     display = rel
+                    root = best
                     if rel not in candidates:
                         candidates.append(rel)
         except (OSError, ValueError):
             pass
-    return candidates, display
+    return candidates, display, root
 
 
 def _unmapped_path_candidates(
@@ -6424,6 +6427,34 @@ def _unmapped_display_path(
     return _unmapped_classify_path(raw_path, code_roots, resolver)[1]
 
 
+def _unmapped_git_ignored(items: "list[tuple[str, Path, str]]") -> set[str]:
+    """The raw paths git ignores. `items` is `(raw_path, code_root, root_relative)`
+    for every path classified unmapped under a code root; ONE
+    `git check-ignore -z --stdin` per root (TOP-0137 L29). Plain check-ignore,
+    never --no-index: a TRACKED file that matches an ignore pattern is not
+    ignored for git and stays unmapped. Any failure (git missing, not a work
+    tree, timeout, exit other than 0/1) ignores nothing for that root: the
+    old behaviour, never a crash."""
+    by_root: dict[Path, list[tuple[str, str]]] = {}
+    for raw, root, rel in items:
+        by_root.setdefault(root, []).append((raw, rel))
+    out: set[str] = set()
+    for root, rows in by_root.items():
+        try:
+            res = subprocess.run(
+                ["git", "--no-optional-locks", "-C", str(root), "check-ignore", "-z", "--stdin"],
+                input=b"".join(os.fsencode(rel) + b"\0" for _, rel in rows),
+                capture_output=True, timeout=_git_ls_timeout(),
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if res.returncode != 0:
+            continue
+        hit = {os.fsdecode(b) for b in res.stdout.split(b"\0") if b}
+        out.update(raw for raw, rel in rows if rel in hit)
+    return out
+
+
 def cmd_unmapped(args) -> int:
     """`memidx.py unmapped PATH... --root R [--code-root CR ...] [--json]`
 
@@ -6467,6 +6498,7 @@ def cmd_unmapped(args) -> int:
     mapped_topic: list[str] = []
     mapped_concept_only: list[str] = []
     unmapped: list[str] = []
+    ignored: list[str] = []
     by_path: dict[str, str] = {}
     degraded: dict | None = None
     healed = False
@@ -6546,8 +6578,11 @@ def cmd_unmapped(args) -> int:
                     # entirely rather than trying to reconstruct a safe
                     # (root, relative_path) pair from a lossy string.
                     resolver = _UnmappedResolver(list(args.paths))
+                    # (raw_path, display, root) of the unmapped
+                    # paths under a code root, for the git-ignore pass below.
+                    unmapped_rows: list[tuple[str, str, Path | None]] = []
                     for raw_path in args.paths:
-                        candidates, display = _unmapped_classify_path(raw_path, code_roots, resolver)
+                        candidates, display, path_root = _unmapped_classify_path(raw_path, code_roots, resolver)
                         topic_hit = _unmapped_ref_hit(
                             topic_matches_for_path, conn, args.project, candidates,
                         )
@@ -6563,11 +6598,24 @@ def cmd_unmapped(args) -> int:
                             mapped_concept_only.append(display)
                             by_path[raw_path] = "mapped_concept_only"
                         elif coverage_status == "ok":
+                            unmapped_rows.append((raw_path, display, path_root))
+                    # TOP-0137 L29: a path the code root's git ignores is
+                    # `ignored`, not a coverage gap (the filter lives here,
+                    # never in the ledger). Store-root paths are never
+                    # checked; they are not under a code root.
+                    git_ignored = _unmapped_git_ignored(
+                        [(r, root_, d) for r, d, root_ in unmapped_rows if root_ is not None]
+                    )
+                    for raw_path, display, _root in unmapped_rows:
+                        if raw_path in git_ignored:
+                            ignored.append(display)
+                            by_path[raw_path] = "ignored"
+                        else:
                             unmapped.append(display)
                             by_path[raw_path] = "unmapped"
     except sqlite3.OperationalError:
         coverage_status = "index-error"
-        mapped_topic, mapped_concept_only, unmapped, by_path = [], [], [], {}
+        mapped_topic, mapped_concept_only, unmapped, ignored, by_path = [], [], [], [], {}
     except Exception as exc:
         # Design R7 (audit MC-P2-03, TOP-0123 L7): this is the ONE branch
         # that used to conflate a genuine operational failure with an
@@ -6581,7 +6629,7 @@ def cmd_unmapped(args) -> int:
         if DEBUG:
             raise
         coverage_status = "unknown"
-        mapped_topic, mapped_concept_only, unmapped, by_path = [], [], [], {}
+        mapped_topic, mapped_concept_only, unmapped, ignored, by_path = [], [], [], [], {}
         degraded = _degraded("internal-error", exc)
         print(
             f"unmapped: degraded reason=internal-error type={degraded['exception_type']}: "
@@ -6600,6 +6648,8 @@ def cmd_unmapped(args) -> int:
         "mapped_topic": mapped_topic,
         "mapped_concept_only": mapped_concept_only,
         "unmapped": unmapped,
+        # Unmapped paths the code root's git ignores (TOP-0137 L29): not a gap.
+        "ignored": ignored,
         "coverage_status": coverage_status,
         # Design R5 (audit MC-P1-05, TOP-0123 L5): an echo of every
         # resolved --code-root this call used.
@@ -6633,6 +6683,7 @@ def cmd_unmapped(args) -> int:
             ("mapped_topic", mapped_topic),
             ("mapped_concept_only", mapped_concept_only),
             ("unmapped", unmapped),
+            ("ignored", ignored),
         ):
             print(f"{label}: {len(paths)}")
             for p in paths:

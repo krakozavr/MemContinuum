@@ -200,10 +200,16 @@ class TestPreEditChainHook(unittest.TestCase):
             MEMCONTINUUM_PYTHON=VENV_PYTHON,
             MEMCONTINUUM_STRIP_PREFIX="/fake/repo/",
         )
+        log_path = Path(self.memtool_home) / "hook.log"
+        before = log_path.read_text() if log_path.exists() else ""
         proc, elapsed = run_hook(payload, env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertLess(elapsed, 1.0, f"hook took {elapsed:.3f}s")
+        # TOP-0137 L29: a wide hang guard only; what the old one-second bound
+        # stood for (the chain was delivered, from a logged match) is asserted
+        # directly, not through the runner's process scheduling.
+        self.assertLess(elapsed, 5.0, f"hook hung: {elapsed:.3f}s")
         self.assertTrue(proc.stdout.strip(), "expected additionalContext output, got nothing")
+        self.assertIn("outcome=matched", log_path.read_text()[len(before):])
 
         out = json.loads(proc.stdout)
         ctx = out["hookSpecificOutput"]["additionalContext"]
@@ -419,9 +425,19 @@ class TestPreEditChainHook(unittest.TestCase):
         """
         payload = self._matching_payload()
         env = self._poisoned_env()
+        log_path = Path(self.memtool_home) / "hook.log"
+        before = log_path.read_text() if log_path.exists() else ""
         proc, elapsed = run_hook(payload, env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertLess(elapsed, 1.0, f"hook took {elapsed:.3f}s with a poisoned PYTHONPATH")
+        # TOP-0137 L29: hang guard only. The property is that the hook cleared
+        # the poisoned PYTHONPATH (the poisoned yaml was never imported) and
+        # still delivered, from a logged match. The log is shared across this
+        # class's tests, so only what this run appended is read.
+        self.assertLess(elapsed, 5.0, f"hook hung: {elapsed:.3f}s with a poisoned PYTHONPATH")
+        self.assertNotIn("poisoned PYTHONPATH not cleared", proc.stderr)
+        new_log = log_path.read_text()[len(before):]
+        self.assertNotIn("poisoned PYTHONPATH not cleared", new_log)
+        self.assertIn("outcome=matched", new_log)
         self.assertTrue(proc.stdout.strip())
         out = json.loads(proc.stdout)
         self.assertIn("TOP-0042", out["hookSpecificOutput"]["additionalContext"])

@@ -817,6 +817,7 @@ if [ "${CANDIDATE:-0}" = "1" ] || [ -n "$MOVED_ROOTS" ]; then
     CODE_PATHS=()
     NEW_PATHS=()
     UC_REUSE=0
+    UC_RULES=0
     UC_STARTED=""
     # The store worktree must be CLEAN for a cached verdict to be reused: an
     # uncommitted bind or a new topics/*.md is the usual filing state, and
@@ -833,10 +834,11 @@ if [ "${CANDIDATE:-0}" = "1" ] || [ -n "$MOVED_ROOTS" ]; then
             P:*) CODE_PATHS+=("${p#P:}") ;;
             N:*) NEW_PATHS+=("${p#N:}") ;;
             R:*) UC_REUSE="${p#R:}" ;;
+            D:*) UC_RULES="${p#D:}" ;;
             T:*) UC_STARTED="${p#T:}" ;;
         esac
     done < <(env PYTHONPATH= "$MC_PY" -c '
-import json, sys, time
+import json, os, sys, time
 with open(sys.argv[1]) as f:
     d = json.load(f)
 # The session keeps the verdicts of the previous prompts (unmapped_cache).
@@ -862,14 +864,30 @@ if sha and not dirty and isinstance(cache, dict) and cache.get("store_head") == 
 seen = d.get("seen_at") if isinstance(d.get("seen_at"), dict) else {}
 def num(v):
     return v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+def is_newer(sv, cv):
+    # A fractional seen_at (current ledger) compares strictly; a whole-second
+    # one (an older hook version, stored as 1731.0 or 1731) keeps >= floor.
+    return sv >= int(cv) if sv == int(sv) else sv > cv
+# An ignore-rule edit (.gitignore, .git/info/exclude) since a path was
+# classified can flip its `ignored` verdict: the whole cache is dropped
+# (D:1) and every path is classified again (TOP-0137 L29).
+rules = False
+if reuse:
+    oldest = min((num(v) for v in stamps.values()), default=0)
+    rules = any(
+        (os.path.basename(q) == ".gitignore" or q.endswith(".git/info/exclude"))
+        and is_newer(num(sv_), oldest)
+        for q, sv_ in seen.items()
+    )
+if rules:
+    verdicts, stamps, reuse = {}, {}, False
 print("R:" + ("1" if reuse else "0"))
+print("D:" + ("1" if rules else "0"))
 print("T:" + repr(time.time()))
 for p in d.get("code_paths", []):
     print("P:" + p)
     sv, cv = num(seen.get(p)), num(stamps.get(p))
-    # A fractional seen_at (current ledger) compares strictly; a whole-second
-    # one (an older hook version, stored as 1731.0 or 1731) keeps >= floor.
-    newer = sv >= int(cv) if sv == int(sv) else sv > cv
+    newer = is_newer(sv, cv)
     if p not in verdicts or newer:
         print("N:" + p)
 ' "$DECIDE_TMP" "$CUR_STORE_SHA" "$STORE_DIRTY" 2>>"$MC_LOG")
@@ -932,7 +950,7 @@ print(json.dumps(state))
         # the file): the first call is the one that can heal the index, and a
         # kill anywhere between it and the write-back must leave NO cache for a
         # later prompt to reuse. It is republished after a good classification.
-        if [ "$UC_REUSE" = "1" ]; then _uc_drop_cache; fi
+        if [ "$UC_REUSE" = "1" ] || [ "$UC_RULES" = "1" ]; then _uc_drop_cache; fi
         if [ "${#NEW_PATHS[@]}" -gt 0 ]; then _uc_call "${NEW_PATHS[@]}"; else _uc_call; fi
         # The call healed a stale index: the verdicts reused from earlier
         # prompts were made against the index as it was BEFORE the rebuild
@@ -1036,7 +1054,7 @@ if called:
         drop_cache()
         raise SystemExit(0)
     fresh = [p for p in code_paths if p not in verdicts]
-    queues = {k: list(raw.get(k) or []) for k in ("mapped_topic", "mapped_concept_only", "unmapped")}
+    queues = {k: list(raw.get(k) or []) for k in ("mapped_topic", "mapped_concept_only", "unmapped", "ignored")}
     by = raw.get("by_path") if isinstance(raw.get("by_path"), dict) else {}
     for p in fresh:
         st = by.get(p)
@@ -1057,7 +1075,7 @@ elif not verdicts:
     raise SystemExit(0)
 out = dict(raw) if raw else {}
 out["coverage_status"] = "ok"
-for k in ("mapped_topic", "mapped_concept_only", "unmapped"):
+for k in ("mapped_topic", "mapped_concept_only", "unmapped", "ignored"):
     out[k] = [displays[p] for p in code_paths if verdicts.get(p) == k]
 out["by_path"] = {p: verdicts[p] for p in code_paths if p in verdicts}
 print(json.dumps(out))
@@ -1295,9 +1313,15 @@ $NUDGE_FACT"
 
     OUTPUT_JSON="$(UNMAPPED_JSON="$UNMAPPED_JSON" CODE_CHANGED="$CODE_CHANGED" STORE_CHANGED="$STORE_CHANGED" \
         MEMCONTINUUM_ROOT="${MEMCONTINUUM_ROOT:-}" MC_NUDGE_FACT_TEXT="$NUDGE_FACT_TEXT" \
-        MC_CANDIDATE="${CANDIDATE:-0}" MC_PQ_TEXT="$PQ_TEXT" \
+        MC_CANDIDATE="${CANDIDATE:-0}" MC_PQ_TEXT="$PQ_TEXT" MC_NUDGE_DIR="$SCRIPT_DIR" \
         env PYTHONPATH= "$MC_PY" -c '
-import json, os
+import json, os, sys
+
+# The coverage sentence lives in hooks/mc_nudge.py (shared with the session-start
+# hook); no .pyc is written next to the hook scripts.
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.environ["MC_NUDGE_DIR"])
+from mc_nudge import coverage_fact, coverage_question
 
 try:
     unmapped_out = json.loads(os.environ.get("UNMAPPED_JSON") or "{}")
@@ -1322,10 +1346,6 @@ pq_text = os.environ.get("MC_PQ_TEXT") or ""
 nudge_lines = [l for l in (os.environ.get("MC_NUDGE_FACT_TEXT") or "").splitlines() if l]
 
 
-def yn(v):
-    return "yes" if v else "no"
-
-
 # Codex 9 (fix wave 1 G4): this block now also runs on a turn that is NOT
 # a coverage candidate, when a root moved (MOVED_ROOTS, checked by the
 # bash `if` above this whole python invocation is nested in). On such a
@@ -1347,37 +1367,12 @@ if not is_candidate:
     }))
     raise SystemExit(0)
 
-if coverage_status != "ok":
-    fact_line = (
-        "Coverage signal — decision-topic coverage unknown "
-        f"(store index {coverage_status}); code HEAD changed: {yn(code_changed)}; "
-        f"store HEAD changed: {yn(store_changed)}"
-    )
-    has_evidence = code_changed or store_changed
-else:
-    n = len(unmapped)
-    shown = unmapped[:8]
-    extra = n - len(shown)
-    paths_line = ", ".join(shown) if shown else "(none)"
-    if extra > 0:
-        paths_line += f", +{extra}"
-    fact_line = (
-        f"Coverage signal — {n} edited file(s) with no decision topic: {paths_line}; "
-        f"code HEAD changed: {yn(code_changed)}; store HEAD changed: {yn(store_changed)}"
-    )
-    has_evidence = (n > 0) or code_changed or store_changed
+fact_line, has_evidence = coverage_fact(unmapped, coverage_status, code_changed, store_changed)
 
 if not has_evidence and not nudge_lines:
     raise SystemExit(3)
 
-store_root = os.environ.get("MEMCONTINUUM_ROOT") or "<store root not configured>"
-question = (
-    "Any ruling, incident, or rejected alternative from this session that "
-    "the MemContinuum store should hold? Store: " + store_root + " — a ruling "
-    "is a new link in topics/<area>/<topic>.md, an incident is a file in "
-    "incidents/ (see docs/SCHEMA.md); NOT Claude Code auto-memory. If none, "
-    "say so once."
-)
+question = coverage_question(os.environ.get("MEMCONTINUUM_ROOT") or "<store root not configured>")
 ctx = fact_line
 for _nl in nudge_lines:
     ctx += "\n" + _nl

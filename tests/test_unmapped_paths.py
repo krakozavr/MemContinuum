@@ -170,6 +170,109 @@ class TestUnmappedResolver(unittest.TestCase):
         self.assertEqual([c for c in calls if c == missing], [missing], calls)
 
 
+class TestUnmappedGitIgnored(unittest.TestCase):
+    """TOP-0137 L29: a path the code root's git ignores is `ignored`, not a
+    coverage gap -- the filter lives in `unmapped`, never in the ledger."""
+
+    def setUp(self):
+        from tests.test_write_hooks import build_store_root, git_init, reindex
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name).resolve()
+        self.store, self.db = self.base / "store", self.base / "zp.sqlite"
+        build_store_root(self.store)
+        reindex(self.store, self.db, project="zp")
+        self.git_init = git_init
+
+    def _code_root(self, name="code", git=True):
+        code = self.base / name
+        (code / "scratch").mkdir(parents=True)
+        (code / "src").mkdir()
+        (code / ".gitignore").write_text("scratch/\n")
+        (code / "scratch" / "a.py").write_text("x")
+        (code / "src" / "nothing.py").write_text("x")
+        if git:
+            self.git_init(code)
+        return code
+
+    def _run(self, code, rel_paths, json_out=True, extra_paths=()):
+        import contextlib
+        import io
+        import json
+        paths = [str(code / r) for r in rel_paths] + list(extra_paths)
+        argv = ["unmapped", *paths, "--root", str(self.store), "--project", "zp",
+                "--db", str(self.db), "--code-root", str(code)]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            memidx.main(argv + (["--json"] if json_out else []))
+        return buf.getvalue() if not json_out else json.loads(buf.getvalue()), paths
+
+    def test_a_gitignored_path_is_ignored_not_unmapped(self):
+        code = self._code_root()
+        out, paths = self._run(code, ["scratch/a.py", "src/nothing.py", "scratch/never-written.py"])
+        self.assertEqual(out["ignored"], ["scratch/a.py", "scratch/never-written.py"])
+        self.assertEqual(out["unmapped"], ["src/nothing.py"])
+        self.assertEqual(out["by_path"], {paths[0]: "ignored", paths[1]: "unmapped", paths[2]: "ignored"})
+        text, _ = self._run(code, ["scratch/a.py", "src/nothing.py"], json_out=False)
+        self.assertIn("unmapped: 1\n  src/nothing.py\n", text)
+        self.assertIn("ignored: 1\n  scratch/a.py\n", text)
+
+    def test_the_same_path_in_a_non_git_root_is_unmapped(self):
+        code = self._code_root(git=False)
+        out, _ = self._run(code, ["scratch/a.py"])
+        self.assertEqual((out["ignored"], out["unmapped"]), ([], ["scratch/a.py"]))
+
+    def test_one_git_call_per_root(self):
+        code = self._code_root()
+        real_run = memidx.subprocess.run
+        calls = []
+
+        def spy(cmd, *a, **k):
+            if "check-ignore" in cmd:
+                calls.append(cmd)
+            return real_run(cmd, *a, **k)
+
+        with mock.patch.object(memidx.subprocess, "run", spy):
+            self._run(code, ["scratch/a.py", "src/nothing.py", "scratch/b.py"])
+        self.assertEqual(len(calls), 1, calls)
+        self.assertIn("--no-optional-locks", calls[0])
+        self.assertNotIn("--no-index", calls[0])
+
+    def test_a_failing_git_leaves_the_old_verdict(self):
+        code = self._code_root()
+        stub_dir = self.base / "stub-bin"
+        stub_dir.mkdir()
+        stub = stub_dir / "git"
+        stub.write_text("#!/bin/sh\nexit 3\n")
+        stub.chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": f"{stub_dir}{os.pathsep}{os.environ['PATH']}"}):
+            out, _ = self._run(code, ["scratch/a.py"])
+        self.assertEqual((out["ignored"], out["unmapped"]), ([], ["scratch/a.py"]))
+
+    def test_a_missing_git_leaves_the_old_verdict(self):
+        code = self._code_root()
+        with mock.patch.object(memidx.subprocess, "run", side_effect=FileNotFoundError("git")):
+            out, _ = self._run(code, ["scratch/a.py"])
+        self.assertEqual((out["ignored"], out["unmapped"]), ([], ["scratch/a.py"]))
+
+    def test_a_tracked_file_matching_an_ignore_pattern_stays_unmapped(self):
+        import subprocess
+        code = self._code_root()
+        subprocess.run(["git", "add", "-f", "scratch/a.py"], cwd=code, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "track"], cwd=code, check=True)
+        out, _ = self._run(code, ["scratch/a.py", "scratch/b.py"])
+        self.assertEqual(out["unmapped"], ["scratch/a.py"])
+        self.assertEqual(out["ignored"], ["scratch/b.py"])
+
+    def test_a_store_path_is_never_checked(self):
+        code = self._code_root()
+        (self.store / ".gitignore").write_text("topics/\n")
+        store_file = str(self.store / "topics" / "testing" / "mapped-topic.md")
+        out, _ = self._run(code, [], extra_paths=[store_file])
+        self.assertEqual(out["ignored"], [])
+        self.assertEqual(out["by_path"].get(store_file) != "ignored", True)
+
+
 class TestUnmappedZeroPaths(unittest.TestCase):
     """`unmapped` with no PATH still runs the index-state check and the stale
     self-heal, and reports whether the heal ran (`healed`)."""
