@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Taking back a bind or unbind is exact
+
+Typed the wrong reference, or bound and then changed your mind before committing? Running the opposite
+command (`unbind` after `bind`, `bind` after `unbind`) on the same reference now puts the topic file back
+exactly as it was before the first command, every byte, anchors and pending edits included, and says so.
+If the file or the staged copy has changed since, or the topic's committed text changed without the
+first command in it, it refuses without writing and names the way out (commit first, or `git restore`) -- unless the tree is clean and the earlier bytes are still in a commit, in which case the receipt is dropped and the command continues as an ordinary edit; every other changed commit refuses and names `--discard`;
+once the first command is committed it is history and the opposite command is an ordinary new edit, as
+before. Committing some other file in between changes nothing. `memidx.py undo-binding TOP-xxxx [--list]` lists the
+pending undo records or undoes the latest one, and `--discard` drops the latest one without touching the topic when a refusal names it as the way out.
+
+    Technical: `bind` and `unbind` write a receipt (topic bytes before and after, the topic's committed and staged entries, command, reference, mark identity) to `git rev-parse --git-path memcontinuum/receipts` before the topic write, per-topic stack and `flock`; the opposite command restores the before-bytes only while the topic equals the after-bytes, its committed entry at HEAD and its staged entry are the recorded ones and the topic has not moved (a blob equal to the after-bytes at HEAD means committed history; a git probe that fails, including the work-tree check, refuses; `undo-binding --discard` drops the latest receipt and writes nothing); a receipt that cannot be written durably (file and directory fsynced), or a lock that cannot be taken, refuses the command and writes nothing; `--dry-run` writes none; a stale, crashed or malformed receipt is dropped or ignored and never deletes anything; the commit guard and `memlint.py` are unchanged.
+
 ### Commit guard refuses on a crash; honest latency bars
 
 Three small corrections. The store's commit guard used to let a commit through when the check itself

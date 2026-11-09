@@ -3713,13 +3713,98 @@ unbound, because the write deletes one item and the round-trip check, which
 requires every equal entry gone, then refuses it: fail-closed; likewise a multi-line quoted reference is not
 unbindable, because the editor compares one physical line, so rewrite it on one line first)
 and prepends a `remove` row; it allows a prefix or
-glob and never touches an anchor. Plain lint lets an anchor's ref be absent from
+glob and an ordinary unbind never touches an anchor (the exact undo of an uncommitted
+`bind`, below, restores the earlier bytes and so removes an anchor that `bind` had
+introduced). Plain lint lets an anchor's ref be absent from
 `code_refs` only when the NEWEST `ref_marks` row for it is a `remove`
 (`ref_latest_action`: rows are append-only, so "ever removed" would excuse a ref
 that went missing again after a re-bind). That exemption lifts only the membership requirement: the prefix/glob prohibition (`_ANCHOR_PREFIX_GLOB_MESSAGE`) is checked first for every anchor row, unbound or not, and `--against-ref` runs the COMPLETE `_anchor_errors` set (prefix/glob, membership, link, algo, digest, span, captured, worktree, `chunker_version`, `captured_at`) on every anchor row whose identity is new since `REF` (`_anchor_freeze_errors` passes the REF identities as `skip_idents`, so old rows stay freeze-only and the duplicate-key check is not reported twice) and on every row of an added topic, so removing `src/` cannot be paired with a fabricated prefix anchor row and a new row cannot carry an invalid digest. `for-path` needed no change: it builds
 anchor notes from the current `code_refs` only. `bind`, `unbind` and
 `mark-standing` share `new_audit_row`, `mark_authority` and `audit_row_problem`
 (the round-trip proof).
+
+**Undo receipts (`bind` / `unbind`).** Taking back an uncommitted `bind` or
+`unbind` is exact, not inferred: no HEAD-blob reading, no row-span discovery, no
+anchor-ownership logic. Before it writes, each command records a receipt
+(`_UndoScope.record`) under `git rev-parse --git-path memcontinuum/receipts`
+(per worktree, outside the store tree, so never tracked): one JSON file per receipt,
+`<topic id>-<store hash>.<seq>.json`, a per-topic stack ordered by `seq`. It holds the
+store root, the topic path and id, the topic's committed entry at HEAD (an
+`entry` with mode and blob id, `absent`, or `unborn` for a branch with no commit), the staged index
+entry (`git ls-files -s`: mode, blob id and stage, or `absent`), the exact bytes before (B) and after
+(A) as base64, the command, the reference and the identity of the mark row produced
+(ref, action, `recorded_at`; none when the command wrote no row). The file and its
+directory are fsynced (`_atomic_write_bytes` with `strict_dir_fsync`) before the topic is written; every
+successful initialisation of the receipts directory fsyncs the whole known chain (the directory, its
+`memcontinuum` parent and that parent's parent in the git administration area), including directories a
+failed or concurrent attempt left behind, so a retry never skips an ancestor's durability. In a git-backed store a
+receipt that cannot be made durable, or a lock that cannot be taken (a read-only `.git`),
+refuses the command and writes nothing, naming the receipt path and the error. `--dry-run`
+writes none.
+
+`undo_plan` runs on the topic's raw bytes, before the topic has to parse (a damaged file still gets the
+refusal that names the pending row and the way out) and before any anchor capture or mark generation. It decides: the latest receipt
+is the opposite command on the same reference AND the topic path is the recorded one AND
+the topic bytes equal A AND the topic's committed entry at HEAD equals the recorded one
+(a verified unborn branch counts as absent, so an unrelated first commit changes nothing)
+AND the staged entry equals the recorded one -> the restore step (`_restore_receipt`) re-reads the committed and
+staged entries and the topic, writes B back through the atomic writer with the file and its directory fsynced,
+then drops the receipt and prints `undo: restored <topic> to
+its state before the uncommitted <command> of <ref>`. HEAD moving alone decides nothing;
+the receipt looks only at the topic. When the topic's blob at HEAD is the git blob id of A
+(`git hash-object --stdin --no-filters`, nothing stored) the action is committed
+history: the receipt is dropped with a note and the ordinary write follows. When the
+committed entry changed but is not A (an earlier edit was committed without the
+binding) the command refuses and names the pending row. That refusal keeps the receipt: a clean
+worktree is not committed history, because the receipt may be the only copy of B. Its message names
+`undo-binding TOP-xxxx --discard`, which drops the latest receipt and writes nothing. The one automatic
+drop on a clean tree needs the topic's bytes and its stage-zero index entry to equal HEAD's entry (compared
+by raw blob identity) AND the before-image's raw blob identity to equal the receipt's recorded committed
+baseline, so B is still in a commit; a before-image that was never committed (an unstaged edit on top of the
+baseline) stays in the receipt. A receipt whose topic still
+equals B was written before a crash: dropped. A latest receipt that is not the one the
+command would undo, but whose A is committed history, is dropped without a note together
+with the receipts beneath it that it contains, so the stack holds uncommitted work only. A moved topic, a topic that differs from
+A, or a changed staged entry is refused with the pending row named and the ways out
+(`git restore --source=HEAD --worktree -- <topic>`, `git restore --staged -- <topic>`,
+or commit first); nothing is written. Whether the store is in a git work tree has three answers
+(`_work_tree_state`): git prints `true` -> receipts apply; git prints `false` (a bare repository), or exits
+128 or is not installed where no `.git` entry exists at or above the store (inspected with `lstat`, so a
+dangling `.git` symlink counts) -> a verified non-work-tree, no receipts, the ordinary path; any other outcome (a timeout, an unexpected exit, empty
+output; exit 128 or a missing git where a `.git` entry exists, or one that cannot be inspected) and a failed lookup of the receipts directory inside a work tree refuse the command and write
+nothing, so a slow git can never turn a bind into a receipt-less one. Every probe returns an explicit state or
+"unavailable" (a timeout, a missing git, any failure that is not a verified absence); an
+unavailable probe, at decision time or when the receipt is recorded, refuses without
+dropping or writing anything. A receipt is admitted only when the whole record is valid
+(the current version, every field present with its type, well-formed probe states, a known
+command, both images base64 of UTF-8, and `store` and `topic_id` equal to the scope's); any
+other file is dropped under the lock and authorises nothing, so a missing, malformed,
+unknown-version or foreign receipt means the ordinary path. A receipt authorises restoring B only; it never deletes
+anything that is not in B.
+
+Writers serialize on one `flock`ed lock file per topic next to the stack
+(`_UndoScope.locked`), and the stack changes only inside it: pruning a stale or malformed
+receipt, the undo decision, recording and dropping. An undo is one critical section (re-read
+the topic, `undo_plan` on those bytes, restore B, drop the receipt); an ordinary edit takes
+the lock to plan and prune, releases it to capture the anchor and generate the mark, then
+takes it again, re-reads the topic and refuses (`TopicEditRefused`, nothing written) unless
+it still equals both the image the command read and the image the undo decision was made on (a
+command that completed between the plan and the parse would make the verdict stale), records the
+receipt and replaces the topic. The
+committed and staged entries and the topic bytes are read once more immediately before an
+undo replaces the file, because the lock does not serialize external git commands. `mark-standing` calls `apply_topic_edit` without a scope and is unchanged. A store
+outside a git work tree (a plain directory, a bare repository) has no receipts, and the receipts' git
+calls ignore the ambient `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE` and `GIT_COMMON_DIR`
+(they report the exit code, which `_git_call_budgeted` folds into None; that is why it is not used). `undo-binding TOP-xxxx [--list]` shows the stack (newest
+first, nothing changed) or runs the same `undo_plan` / restore for the latest receipt; `--discard`
+drops the latest receipt under the lock and writes nothing (rc 1 on an empty stack; `--dry-run` prints
+what it would drop).
+
+The committed-history test compares the blob at HEAD with the RAW identity of A, never a filtered one. In a
+repository where a clean or eol filter applies to the topic path, the committed blob is not the raw
+after-image, so a committed `bind` refuses under the committed-baseline rule with `--discard` as the way
+out. This is deliberate: a clean filter is arbitrary code and can fold B and A into one blob, and
+recognising that blob as A could expire a receipt that is still pending.
 
 **Derived authority for rows.** `mark-standing` has no `--authority`: it takes
 `--session` and `--yes-message UUID`, or `--owner-message UUID --quote TEXT`,
@@ -4077,7 +4162,12 @@ down:
   [--recorded-by NAME] [--dry-run]`** — delete the `code_refs` item REF
   (verbatim, a prefix or glob included) and prepend its `remove` row; a REF that
   is not bound prints a message and exits 0 with nothing written. See "Reference
-  marks, `unbind` and the restore".
+  marks, `unbind` and the restore". Right after an uncommitted `bind` of the same REF
+  it restores the exact earlier bytes instead (see "Undo receipts"); `bind` does the
+  same after an uncommitted `unbind`.
+- **`undo-binding TOP-xxxx --root STORE [--list | --discard] [--dry-run]`** — list the topic's
+  undo receipts (`--list`), undo the latest one under the conditions `bind` and
+  `unbind` apply automatically, or drop it without writing (`--discard`); rc 1 when none applies. See "Undo receipts".
 - **`mark-standing TOP-xxxx Ln (--add | --remove) --session ID (--yes-message UUID
   | --owner-message UUID --quote TEXT) --why TEXT --root STORE [--source NOTE]
   [--code-root DIR] [--recorded-by NAME] [--dry-run]`** — the one writer
