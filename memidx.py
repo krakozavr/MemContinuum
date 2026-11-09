@@ -6480,7 +6480,9 @@ def cmd_unmapped(args) -> int:
     Self-healing is now gated on state == "stale" (a same-generation
     on-disk drift decision_index_state already computed above -- no
     second walk): one `reindex --no-embed` pass, then re-check for drift
-    the same way as before F1. `unmapped` is always [] whenever
+    the same way as before F1. A would-be unmapped path under a code root that
+    the root's git ignores is reported as `ignored` instead (TOP-0137 L29,
+    `_unmapped_git_ignored`). `unmapped` is always [] whenever
     coverage_status != "ok" (a positive match found on a not-fully-current
     index is still real evidence; the *absence* of a match is what an
     unknown-freshness index must never be allowed to assert -- docs/
