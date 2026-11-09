@@ -121,8 +121,9 @@ optional derivation flags of `mark-standing` (without them, or when a derivation
 as history — and may unbind a prefix or a glob. `bind` of a reference whose anchor for the current
 link already exists (an unbound one) **restores** it: the reference and an `add` row come back, no
 second anchor is written (one baseline per `(ref, link)`; a new baseline is a new link).
-`bind` also accepts a prefix (`src/core/`, an existing directory) or a glob (`src/app/*.py`): it
-adds the entry and its `add` row exactly as for a file and writes no anchor row (there is no byte
+`bind` also accepts a prefix (`src/core/`, an existing directory) or a glob (`src/app/*.py`); either is
+relative to a code root (an absolute path or any `..` segment is refused), and a prefix must resolve,
+through symlinks, to a directory inside a code root. It adds the entry and its `add` row exactly as for a file and writes no anchor row (there is no byte
 span to hash), so a prefix or glob is bound and unbound with the same two commands.
 
 Under `--against-ref` the membership change must be paired with rows exactly as `standing:` is (g2

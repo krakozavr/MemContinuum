@@ -3672,7 +3672,10 @@ no byte span, so `bind` adds it to `code_refs` with its `add` row and writes NO
 anchor row (`unanchored_ref_problem` is the check; `bound_edit_problem(...,
 anchored=False)` requires that no anchor row names the ref; the matching rule stays
 `code_ref_matches`) and says so in one line; an unbound prefix or glob is restored
-the same way. A prefix naming no directory, or a `#symbol` on a prefix or glob, is
+the same way. A prefix or glob is relative to a code root: an absolute path or
+any `..` segment is refused, and a prefix's directory, with symlinks resolved on both
+sides, must be a code root or lie under one (`unanchored_ref_problem`). A prefix naming no directory,
+one that resolves outside the roots, or a `#symbol` on a prefix or glob, is
 refused with rc 1, and a directory written without its trailing slash exits 2
 ("not anchorable"); a `path#symbol` with two or more
 matching chunks writes nothing and says "symbol ambiguous"; with zero matches

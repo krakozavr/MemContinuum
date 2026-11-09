@@ -530,6 +530,27 @@ class TestBind(unittest.TestCase):
         self.assertIn("directory", err)
         self.assertEqual(self.topic(), before)
 
+    def test_prefix_must_stay_under_a_code_root(self):
+        """Gate round 1 R1-4: absolute, `..` and symlink-out prefixes are refused; a symlink
+        that stays inside is accepted."""
+        self.put_topic(topic_text())
+        before = self.topic()
+        outside = Path(self.td) / "outside-dir"
+        (outside / "deep").mkdir(parents=True)
+        os.symlink(outside, self.code / "src" / "leak")
+        (self.code / "src" / "real").mkdir()
+        os.symlink(self.code / "src" / "real", self.code / "src" / "alias")
+        for ref in ("/tmp/", f"{outside}/", "../", "src/../../x/", "../*.py", "/etc/*", "src/leak/", "src/leak/deep/"):
+            with self.subTest(ref=ref):
+                rc, out, err = self.bind(ref)
+                self.assertEqual(rc, 1, (out, err))
+                self.assertEqual(self.topic(), before)
+        self.assertIn("relative to a code root", self.bind("/tmp/")[2])
+        self.assertIn("resolves outside", self.bind("src/leak/")[2])
+        rc, out, err = self.bind("src/alias/")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("src/alias/", memidx.parse_record_text(self.topic(), "x").frontmatter["code_refs"])
+
     def test_directory_without_slash_is_rc_2(self):
         self.put_topic(topic_text())
         rc, out, err = self.bind("src")

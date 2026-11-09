@@ -4376,20 +4376,34 @@ def unanchored_ref_problem(code_ref: str, code_roots: list) -> str | None:
     `/` and name an existing directory under a code root; a glob must carry
     one of `*?[` (the rule `code_ref_matches` applies: segment containment for
     a directory, fnmatch for a pattern). Neither takes a `#symbol` fragment:
-    there is no byte span to name."""
+    there is no byte span to name. Both are repository-relative, as the matcher
+    reads them: an absolute path or any `..` segment is refused, and a prefix's
+    resolved directory (symlinks resolved on both sides) must be a code root or
+    lie under one (gate round 1 R1-4: `Path(root) / "/tmp/"` discards the root)."""
     ref = str(code_ref)
     if not code_ref_is_named(ref):
         return f"{ref!r} names no path"
     raw_path, sep, _frag = ref.partition("#")
     if sep:
         return f"{ref!r}: a prefix or glob takes no #symbol fragment"
+    if raw_path.startswith("/") or os.path.isabs(raw_path) or ".." in raw_path.split("/"):
+        return (f"{ref!r} must be relative to a code root: no leading '/' and no '..' segment")
     if any(ch in raw_path for ch in _CODE_REF_GLOB_CHARS):
         return None
     if not raw_path.endswith("/"):
         return f"{ref!r} is not a prefix (a prefix ends with '/') or a glob"
-    if not any((Path(r) / raw_path.rstrip("/")).is_dir() for r in code_roots):
-        return f"prefix {ref!r} names no existing directory under the code root(s)"
-    return None
+    found_dir = False
+    for r in code_roots:
+        real_root = os.path.realpath(str(r))
+        real_dir = os.path.realpath(os.path.join(real_root, raw_path.rstrip("/")))
+        if not os.path.isdir(real_dir):
+            continue
+        found_dir = True
+        if real_dir == real_root or real_dir.startswith(real_root.rstrip(os.sep) + os.sep):
+            return None
+    if found_dir:
+        return f"prefix {ref!r} resolves outside the code root(s) (a symlink leaves the root)"
+    return f"prefix {ref!r} names no existing directory under the code root(s)"
 
 
 def _mapping_rows(fm: dict, key: str) -> list:
@@ -12842,8 +12856,9 @@ def cmd_bind(args) -> int:
     no byte span: the entry and its `ref_marks:` `add` row go in, no anchor row
     is written (TOP-0137 L29; `unanchored_ref_problem` is the check, the
     matching rule stays `code_ref_matches`). rc 2: a directory named without its
-    trailing slash; rc 1: topic or file missing, a prefix naming no directory,
-    symbol ambiguous, other failure."""
+    trailing slash; rc 1: topic or file missing, a prefix naming no directory
+    or resolving outside the code roots (symlinks included), an absolute or
+    `..` prefix/glob, symbol ambiguous, other failure."""
     root = Path(args.root).resolve()
     ref = args.ref
     code_roots = _code_roots_arg(args.code_root) or [Path.cwd().resolve()]
