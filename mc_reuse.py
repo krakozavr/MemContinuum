@@ -1275,17 +1275,29 @@ def select_rows(inv: dict, files) -> list:
     return out
 
 
-def load_for_code_root(code_root) -> dict | None:
-    """The inventory a code repository carries, or None (absent or unusable;
-    a pack never fails over it)."""
+def _one_line_reason(errors, limit=300) -> str:
+    """The first few problems on one line (a pack line must stay one line)."""
+    shown = [" ".join(str(e).split()) for e in errors[:3]]
+    text = "; ".join(shown) + (f" (and {len(errors) - 3} more)" if len(errors) > 3 else "")
+    return text if len(text) <= limit else text[:limit - 3].rstrip() + "..."
+
+
+def load_for_code_root(code_root):
+    """`(inventory, reason)` for a code repository. `(None, None)`: it carries
+    no inventory (absent is silent). `(None, reason)`: the file is present but
+    unusable (unreadable, bad JSON, schema errors) -- the caller says so and
+    carries on; a pack never fails over it."""
     p = Path(code_root) / INVENTORY_RELPATH
-    if not p.is_file():
-        return None
+    if not (p.exists() or p.is_symlink()):
+        return None, None
     try:
         inv = load_inventory(p)
-    except InventoryError:
-        return None
-    return None if validate_schema(inv) else inv
+    except InventoryError as exc:
+        return None, _one_line_reason(exc.errors)
+    errs = validate_schema(inv)
+    if errs:
+        return None, _one_line_reason(errs)
+    return inv, None
 
 
 def main(argv=None) -> int:

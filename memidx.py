@@ -7265,18 +7265,22 @@ CONTEXT_PACK_INVENTORY_HEADER = (
 )
 
 
-def pack_inventory_rows(code_roots, files: list) -> list:
-    """The reuse-inventory rows (mc_reuse.py, docs/REUSE-INVENTORY.json) that
-    match `files`, from the code repositories the pack was given with
-    --code-root -- selected per repository, never from another project's
-    inventory. A root without an inventory, or with an unusable one,
-    contributes nothing (a pack never fails over it). Inventory order, each
-    row once."""
+def pack_inventory_rows(code_roots, files: list):
+    """`(rows, errors)`: the reuse-inventory rows (mc_reuse.py,
+    docs/REUSE-INVENTORY.json) that match `files`, from the code repositories
+    the pack was given with --code-root -- selected per repository, never from
+    another project's inventory -- and `[(inventory_path, reason)]` for every
+    repository whose inventory is present but unusable. A root without an
+    inventory contributes nothing and says nothing; an unusable one never fails
+    the pack, it is reported (a line in the pack, `inventory_error` in the
+    envelope). Inventory order, each row once."""
     if not files or not code_roots:
-        return []
-    out, seen = [], set()
+        return [], []
+    out, errors, seen = [], [], set()
     for root in code_roots:
-        inv = mc_reuse.load_for_code_root(root)
+        inv, reason = mc_reuse.load_for_code_root(root)
+        if reason is not None:
+            errors.append((str(Path(root) / mc_reuse.INVENTORY_RELPATH), reason))
         if inv is None:
             continue
         for row in mc_reuse.select_rows(inv, files):
@@ -7284,13 +7288,14 @@ def pack_inventory_rows(code_roots, files: list) -> list:
             if key not in seen:
                 seen.add(key)
                 out.append(row)
-    return out
+    return out, errors
 
 
 def build_context_pack(conn, project: str, files: list, topic_ids: list, query: str | None,
                        store: str, state: str, max_bytes: int,
                        anchor_roots: list | None = None, code_db=None,
-                       inventory_rows: list | None = None) -> dict:
+                       inventory_rows: list | None = None,
+                       inventory_errors: list | None = None) -> dict:
     """Assemble the pack (see cmd_context_pack). Returns the JSON envelope
     minus the hash fields -- {text, topics, omitted, standing_omitted} -- or
     {"error": msg} when even the fixed part exceeds `max_bytes`. Pure over
@@ -7342,11 +7347,12 @@ def build_context_pack(conn, project: str, files: list, topic_ids: list, query: 
         meta += "]"
         c["variants"] = [[meta] + v for v in _pack_topic_variants(conn, c["row"])]
 
-    def render(sel: list, inv_shown: list = (), inv_omitted: list = ()) -> str:
+    def render(sel: list, inv_shown: list = (), inv_omitted: list = (), inv_notes: list = ()) -> str:
         """`sel`: [(candidate, lines)] in rank order; every other candidate
         is named in the omission line. `inv_shown` / `inv_omitted`: the
         reuse-inventory rows printed after the decision records, and the ids
-        of those left out by the size cap."""
+        of those left out by the size cap. `inv_notes`: one line per
+        repository whose inventory is present but unusable."""
         shown = {id(c) for c, _ in sel}
         out = [CONTEXT_PACK_HEADER.format(store=store).rstrip("\n"), f"Index state: {state}", "", digest]
         if files:
@@ -7375,6 +7381,8 @@ def build_context_pack(conn, project: str, files: list, topic_ids: list, query: 
         omitted = [c["id"] for c in ranked if id(c) not in shown]
         if omitted:
             out += ["", f"[{len(omitted)} topic(s) omitted by the size cap: {', '.join(omitted)}]"]
+        if inv_notes:
+            out += [""] + list(inv_notes)
         if inv_shown or inv_omitted:
             if inv_shown:
                 out += ["", CONTEXT_PACK_INVENTORY_HEADER.rstrip("\n")]
@@ -7402,6 +7410,13 @@ def build_context_pack(conn, project: str, files: list, topic_ids: list, query: 
     if anchor_roots:
         sel = _pack_add_anchor_lines(conn, project, sel, render, size, max_bytes, anchor_roots, code_db)
     inv_shown, inv_omitted_ids, text = [], [], None
+    inv_notes: list = []
+    if inventory_errors:
+        # An unusable inventory is said, not hidden: one line per repository, ahead of the
+        # rows, inside the cap and the hash. If even that does not fit, the envelope still has it.
+        cand_notes = [f"Repository inventory at {p} is unusable: {r}" for p, r in inventory_errors]
+        if size(render(sel, (), (), cand_notes)) <= max_bytes:
+            inv_notes = cand_notes
     if inventory_rows:
         # Decision records first, then anchors; the inventory takes what is left:
         # the longest prefix of whole rows (inventory order) that fits together with
@@ -7410,17 +7425,17 @@ def build_context_pack(conn, project: str, files: list, topic_ids: list, query: 
         ids_all = [r["id"] for r in inventory_rows]
         k = 0
         for n in range(1, len(inventory_rows) + 1):
-            if size(render(sel, inventory_rows[:n], ids_all[n:])) > max_bytes:
+            if size(render(sel, inventory_rows[:n], ids_all[n:], inv_notes)) > max_bytes:
                 break
             k = n
         inv_omitted_ids = ids_all[k:]
-        if size(render(sel, inventory_rows[:k], inv_omitted_ids)) <= max_bytes:
+        if size(render(sel, inventory_rows[:k], inv_omitted_ids, inv_notes)) <= max_bytes:
             inv_shown = inventory_rows[:k]
-            text = render(sel, inv_shown, inv_omitted_ids)
+            text = render(sel, inv_shown, inv_omitted_ids, inv_notes)
         else:
             inv_omitted_ids = list(ids_all)
     if text is None:
-        text = render(sel)
+        text = render(sel, (), (), inv_notes)
     topics = [{"id": tid, "via": list(v)} for tid, v in standing_via.items()]
     by_id = {t["id"]: t for t in topics}
     for c, _ls in sel:
@@ -7436,6 +7451,8 @@ def build_context_pack(conn, project: str, files: list, topic_ids: list, query: 
     if inventory_rows:
         built["inventory"] = [r["id"] for r in inv_shown]
         built["inventory_omitted"] = inv_omitted_ids
+    if inventory_errors:
+        built["inventory_error"] = [{"path": p, "reason": r} for p, r in inventory_errors]
     return built
 
 
@@ -7536,11 +7553,12 @@ def cmd_context_pack(args) -> int:
         return _decision_reply("context-pack", args, "missing")
     files = list(dict.fromkeys(getattr(args, "files", None) or []))
     code_roots = _code_roots_arg(getattr(args, "code_root", None))
+    inventory_rows, inventory_errors = pack_inventory_rows(code_roots, files)
     try:
         built = build_context_pack(
             conn, args.project, files, list(getattr(args, "topic", None) or []),
             getattr(args, "query", None), store, state, max_bytes,
-            inventory_rows=pack_inventory_rows(code_roots, files),
+            inventory_rows=inventory_rows, inventory_errors=inventory_errors,
             anchor_roots=code_roots,
             code_db=resolve_code_db_path(argparse.Namespace(
                 db=getattr(args, "code_db", None), project=args.project)),
@@ -7561,6 +7579,8 @@ def cmd_context_pack(args) -> int:
         if "inventory" in built:
             envelope["inventory"] = built["inventory"]
             envelope["inventory_omitted"] = built["inventory_omitted"]
+        if "inventory_error" in built:
+            envelope["inventory_error"] = built["inventory_error"]
         print(json.dumps(envelope, indent=2))
     else:
         print(built["text"] + line)

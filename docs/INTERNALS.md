@@ -4097,8 +4097,14 @@ records, under "Implementation policy (repository inventory)", inside the byte c
 and the hash. Decision records and anchor lines take their space first; the rows
 that follow are whole rows from the head of the inventory, the rest named in an
 omission line (always in the JSON envelope as `inventory` / `inventory_omitted`).
-The inventory is read only from the code root given, never from another project;
-a missing or unusable inventory contributes nothing.
+The inventory is read only from the code root given, never from another project.
+A code root without `docs/REUSE-INVENTORY.json` contributes nothing and says
+nothing (no key in the envelope). A file that is present but unusable (unreadable,
+not JSON, schema errors) never fails the pack either, but it is not silent: the
+pack carries one line per such repository, `Repository inventory at <path> is
+unusable: <reason>`, after the decision records and ahead of any rows, inside the
+byte cap and the hash (a cap too tight for the line drops it from the text), and the
+JSON envelope always carries `inventory_error`, a list of `{path, reason}`.
 
 **Finding new jobs** is not a test. Which second implementations exist that no
 row lists yet is a measurement a person judges; a confirmed job joins the

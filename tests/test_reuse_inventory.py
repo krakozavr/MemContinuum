@@ -582,6 +582,23 @@ class TestSchema(unittest.TestCase):
         with self.assertRaises(mc_reuse.InventoryError):
             mc_reuse.load_inventory(d / "y.json")
 
+    def test_load_for_code_root_tells_absent_from_present_but_unusable(self):
+        root = _mini(self, {"a.py": "def f():\n    pass\n"})
+        self.assertEqual(mc_reuse.load_for_code_root(root), (None, None))
+        (root / "docs").mkdir()
+        (root / "docs" / "REUSE-INVENTORY.json").write_text("{nope", encoding="utf-8")
+        inv, reason = mc_reuse.load_for_code_root(root)
+        self.assertIsNone(inv)
+        self.assertIn("not valid JSON", reason)
+        self.assertNotIn("\n", reason)
+        (root / "docs" / "REUSE-INVENTORY.json").write_text(json.dumps(_inv(_row(policy="whatever"))), encoding="utf-8")
+        inv, reason = mc_reuse.load_for_code_root(root)
+        self.assertIsNone(inv)
+        self.assertIn("policy must be one of", reason)
+        (root / "docs" / "REUSE-INVENTORY.json").write_text(json.dumps(_inv(_row())), encoding="utf-8")
+        inv, reason = mc_reuse.load_for_code_root(root)
+        self.assertEqual((inv["rows"][0]["id"], reason), ("r1", None))
+
     def test_missing_symbol_is_reported_with_the_path(self):
         root = _mini(self, {"a.py": "def g():\n    pass\n"})
         found = mc_reuse.check_inventory(root, _inv(_row()))

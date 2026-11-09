@@ -523,14 +523,61 @@ class TestContextPackInventory(PackCase):
         self.assertNotIn("Implementation policy", j["text"])
         self.assertEqual(self.pack("src/zzz.py", "--code-root", str(repo)).count("Implementation policy"), 0)
 
-    def test_an_unusable_inventory_is_ignored_not_fatal(self):
+    def unusable_repo(self, content):
         repo = self.td / "code"
-        (repo / "docs").mkdir(parents=True)
-        (repo / "docs" / "REUSE-INVENTORY.json").write_text("{not json", encoding="utf-8")
+        (repo / "docs").mkdir(parents=True, exist_ok=True)
+        (repo / "docs" / "REUSE-INVENTORY.json").write_text(content, encoding="utf-8")
+        return repo
+
+    def test_an_unusable_inventory_is_reported_not_fatal(self):
+        repo = self.unusable_repo("{not json")
         base = self.plain("src/a.py")
         j = self.pack_json("src/a.py", "--code-root", str(repo))
-        self.assertEqual(j["text"].replace(str(repo), ""), base["text"].replace(str(self.bare), ""))
+        path = str(repo.resolve() / "docs" / "REUSE-INVENTORY.json")
+        line = [ln for ln in j["text"].split("\n") if ln.startswith("Repository inventory at ")]
+        self.assertEqual(len(line), 1, j["text"])
+        self.assertTrue(line[0].startswith(f"Repository inventory at {path} is unusable: "), line[0])
+        self.assertIn("not valid JSON", line[0])
+        # the rest of the pack is the pack of a repository with no inventory
+        rest = j["text"].replace("\n\n" + line[0], "", 1)
+        self.assertEqual(rest.replace(str(repo.resolve()), ""), base["text"].replace(str(self.bare.resolve()), ""))
+        self.assertEqual(j["inventory_error"], [{"path": path, "reason": line[0].split(" is unusable: ", 1)[1]}])
         self.assertNotIn("inventory", j)
+        self.assertNotIn("inventory_omitted", j)
+        self.assertEqual(j["sha256"], memidx.pack_hash_line(j["text"])[0])      # the line is inside the hash
+
+    def test_a_schema_error_in_the_inventory_is_reported_with_its_reason(self):
+        repo = self.unusable_repo(json.dumps({"schema_version": 7, "scan_roots": ["."], "exclusions": [], "rows": []}))
+        j = self.pack_json("src/a.py", "--code-root", str(repo))
+        self.assertEqual(len(j["inventory_error"]), 1)
+        self.assertIn("schema_version must be 1", j["inventory_error"][0]["reason"])
+        self.assertIn("is unusable: ", j["text"])
+
+    def test_an_unusable_inventory_line_is_dropped_by_a_tight_cap_but_stays_in_the_envelope(self):
+        repo = self.unusable_repo("{not json")
+        plain = self.plain("src/a.py")
+        j = self.pack_json("src/a.py", "--code-root", str(repo), "--max-bytes", str(plain["bytes"]))
+        self.assertLessEqual(j["bytes"], plain["bytes"])
+        self.assertNotIn("Repository inventory at", j["text"])
+        self.assertEqual(len(j["inventory_error"]), 1)
+
+    def test_no_inventory_or_files_stays_silent_and_keyless(self):
+        j = self.plain("src/a.py")
+        self.assertNotIn("inventory_error", j)
+        self.assertNotIn("Repository inventory at", j["text"])
+        repo = self.unusable_repo("{not json")
+        self.assertNotIn("inventory_error", self.pack_json("--topic", "TOP-9501", "--code-root", str(repo)))
+
+    def test_an_unusable_inventory_beside_a_usable_one_keeps_the_rows(self):
+        good = self.code_repo([inventory_row("row-a", "src/a.py")])
+        bad = self.td / "bad"
+        (bad / "docs").mkdir(parents=True)
+        (bad / "docs" / "REUSE-INVENTORY.json").write_text("[]", encoding="utf-8")
+        j = self.pack_json("src/a.py", "--code-root", str(good), "--code-root", str(bad))
+        self.assertEqual(j["inventory"], ["row-a"])
+        self.assertEqual(len(j["inventory_error"]), 1)
+        self.assertIn("[row-a] job of row-a", j["text"])
+        self.assertLess(j["text"].index("Repository inventory at"), j["text"].index("Implementation policy"))
 
     def test_cap_keeps_whole_rows_and_names_the_omitted_ids_inside_the_pack(self):
         pad = " word" * 120
