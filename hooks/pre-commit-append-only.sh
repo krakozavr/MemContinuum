@@ -77,6 +77,10 @@
 # check run in CI, not this hook alone.
 
 set -u
+# TOP-0137 L32: the override is read from the launching environment HERE, before
+# any `source` (the watchdog library sources config.sh, whose assignments must
+# not be able to enable it); the decision below uses only this private copy.
+MC_PC_OVERRIDE_IN="${MC_STORE_LINT_ALLOW_ENGINE_FAILURE:-}"
 export PYTHONPATH=
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
@@ -190,8 +194,9 @@ esac
 # while the hook keeps working, followed by a second line, previously
 # disagreed with what actually happened.
 
-# The verdict parsing (marker trust: `changed=` must be present, else an
-# engine failure that fails OPEN) lives in hooks/mc-store-lint.sh.
+# The verdict parsing (marker trust: `changed=` must be present, else the run
+# is classified as an engine failure, which refuses the commit below) lives in
+# hooks/mc-store-lint.sh.
 mc_store_lint_append_only "$PY" "$MEMLINT" "$MEMCONTINUUM_ROOT" HEAD
 case "$MC_LINT_APPEND" in
     ok)
@@ -213,7 +218,7 @@ esac
 # HEAD, no python, cwd not the store, no lint lib, root unset) were already
 # skipped above and stay fail-open. An operator who must commit anyway sets
 # MC_STORE_LINT_ALLOW_ENGINE_FAILURE=1 for that one commit.
-if [ "${MC_STORE_LINT_ALLOW_ENGINE_FAILURE:-}" = "1" ]; then
+if [ "$MC_PC_OVERRIDE_IN" = "1" ]; then
     log_line "skipped=engine-failure override=1 rc=$MC_LINT_APPEND_RC $SCHEMA_NOTE project=$PROJECT"
     exit 0
 fi

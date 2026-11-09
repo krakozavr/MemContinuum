@@ -4033,11 +4033,13 @@ class TestPreCommitAppendOnlyHook(unittest.TestCase):
         self.assertIn("project=crash-proj", log_text)
         self.assertNotIn("schema-rc=1", log_text)
 
-    def _run_with_stub_that_exits_2(self, extra_env=None):
+    def _run_with_stub_that_exits_2(self, extra_env=None, config_sh=None):
         tmp = tempfile.mkdtemp(prefix="memcontinuum-precommit-rc2-")
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         home = Path(tmp) / "home"
         home.mkdir()
+        if config_sh is not None:
+            (home / "config.sh").write_text(config_sh)
         store = _init_topic_store(Path(tmp) / "store")
         text = _prepend_new_link((store / "topics" / "foo.md").read_text())
         (store / "topics" / "foo.md").write_text(text)
@@ -4075,6 +4077,24 @@ class TestPreCommitAppendOnlyHook(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("skipped=engine-failure override=1", log_text)
         self.assertNotIn("refused", log_text)
+
+    def test_the_override_set_only_in_config_sh_does_not_let_a_crash_through(self):
+        """TOP-0137 L32 (gate round 1): the override comes from the launching
+        environment only; an assignment in the sourced config.sh (exported or
+        not) is not an operator's decision for this commit."""
+        for line in ("MC_STORE_LINT_ALLOW_ENGINE_FAILURE=1\n",
+                     "export MC_STORE_LINT_ALLOW_ENGINE_FAILURE=1\n"):
+            with self.subTest(config=line):
+                proc, log_text = self._run_with_stub_that_exits_2(config_sh=line)
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertIn("rc=2 engine-failure refused", log_text)
+                self.assertNotIn("override=1", log_text)
+
+    def test_the_override_in_the_environment_wins_over_a_config_sh_without_it(self):
+        proc, log_text = self._run_with_stub_that_exits_2(
+            {"MC_STORE_LINT_ALLOW_ENGINE_FAILURE": "1"}, config_sh="# nothing\n")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("override=1", log_text)
 
     def test_real_commit_refused_on_engine_crash_then_allowed_with_override(self):
         tmp = tempfile.mkdtemp(prefix="memcontinuum-precommit-rc2-real-")
