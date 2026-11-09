@@ -376,6 +376,46 @@ class TestMemlintRule(DeclinedCase):
         self.assertEqual(rc, 1, text)
         self.assertIn("fresh.md:L1: re-adopts a rejected option recorded at TOP-9205 L1 without reverses", text)
 
+    # R3-1: the rejection-holding topic is unmodified at HEAD and its only fault under the new rule is a
+    # non-string type; it was delivered valid, so its rejections still count for the cross-topic scan.
+    def _break_type_at_head(self, how):
+        path = self.topic_path("two-rejections")
+        text = path.read_text()
+        if how == "metadata":
+            self.assertIn("tags: []\n", text)
+            text = text.replace("tags: []\n", "tags: []\nmetadata:\n  type: [x]\n", 1)
+        else:
+            self.assertIn("type: topic\n", text)
+            text = text.replace("type: topic\n", "type: [topic, weird]\n", 1)
+        path.write_text(text)
+        self.commit("non-string type delivered")
+        self.head0 = self.head()
+
+    def _fresh_readoption(self, args):
+        from tests.test_filing import git
+        (self.store / "topics" / "memory" / "fresh.md").write_text(render_topic(
+            "TOP-9300", "Fresh topic", [L(1, "active", "adopted", "never retry")], "L1"))
+        git(["add", "-A"], self.store)
+        rc, text = run_memlint(["--against-ref", "HEAD"] + args + [str(self.store)])
+        self.assertEqual(rc, 1, text)
+        self.assertIn("fresh.md:L1: re-adopts a rejected option recorded at TOP-9205 L1 without reverses", text)
+
+    def test_readoption_seen_when_the_rejection_topic_has_a_list_metadata_type_at_head(self):
+        self._break_type_at_head("metadata")
+        self._fresh_readoption([])
+
+    def test_readoption_seen_when_the_rejection_topic_has_a_list_metadata_type_at_head_staged(self):
+        self._break_type_at_head("metadata")
+        self._fresh_readoption(["--staged"])
+
+    def test_readoption_seen_when_the_rejection_topic_has_a_list_type_at_head(self):
+        self._break_type_at_head("type")
+        self._fresh_readoption([])
+
+    def test_readoption_seen_when_the_rejection_topic_has_a_list_type_at_head_staged(self):
+        self._break_type_at_head("type")
+        self._fresh_readoption(["--staged"])
+
     def test_brand_new_topic_with_a_different_sentence_is_clean(self):
         (self.store / "topics" / "memory" / "fresh.md").write_text(render_topic(
             "TOP-9300", "Fresh topic", [L(1, "active", "adopted", "retry politely")], "L1"))

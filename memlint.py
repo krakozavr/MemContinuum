@@ -1179,15 +1179,16 @@ def _store_rejections(root: Path, staged: tuple | None = None) -> list:
     """`(topic_id, row)` for every parseable topic of the store. One reader
     for both sources, `_parse_git_blob` (CRLF-tolerant, the filing flow's
     parse): the working tree by default, or -- `staged=(toplevel, root_prefix)`
-    -- the INDEX (the pre-commit hook's contract), never the working tree. A
+    -- the INDEX (the pre-commit hook's contract), never the working tree. Read AS DELIVERED
+    (the REF/HEAD side: a non-string `type` is not a fault here). A
     file that does not parse contributes nothing."""
     out: list = []
     if staged is not None:
         for rel, blob in _staged_md_blobs(*staged):
-            out.extend(_rejections_of_parsed(_parse_git_blob(blob, rel), Path(rel).stem))
+            out.extend(_rejections_of_parsed(_parse_git_blob(blob, rel, as_delivered=True), Path(rel).stem))
         return out
     for f in sorted(walk_markdown(root)):
-        out.extend(_rejections_of_parsed(_parse_git_blob(_read_worktree(f), f), f.stem))
+        out.extend(_rejections_of_parsed(_parse_git_blob(_read_worktree(f), f, as_delivered=True), f.stem))
     return out
 
 
