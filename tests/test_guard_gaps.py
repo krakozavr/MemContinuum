@@ -769,6 +769,47 @@ class TestTypeFrozen(GuardCase):
         self.assertLessEqual(len(new_side), 2, seen)  # + the pre-existing rejections scan (a Path label)
 
 
+class TestNonScalarTypeUnderAgainstRef(GuardCase):
+    """TOP-0137 L29 (gate round 1, R1-1): a list `type` is a shape error; the append-only
+    guard must judge it (added, repaired, deleted) and never raise on the unhashable value."""
+
+    LIST_TYPE = "type: [topic, weird]\n"
+
+    def _listy(self, **kw):
+        return ttext([], **kw).replace("type: topic\n", self.LIST_TYPE, 1)
+
+    def test_added_record_with_a_list_type_is_a_shape_error_not_a_traceback(self):
+        root = self.store(ttext([]))
+        (root / "topics" / "new.md").write_text(self._listy(tid="TOP-9102"))
+        git(["add", "-A"], root)
+        rc, out = run_memlint(["--against-ref", "HEAD", "--staged", str(root)])
+        self.assertNotIn("Traceback", out)
+        self.assertNotIn("unhashable", out)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("type must be a scalar string", out)
+
+    def test_repairing_a_list_type_to_a_scalar_enters_delivery_and_is_clean(self):
+        self.store(self._listy())
+        self.assertClean(ttext([]))
+
+    def test_deleting_a_non_topic_record_that_carried_a_list_type_delivered_nothing_and_is_clean(self):
+        # an incident-like record (INC- id, no links): quarantined at REF, deletable like any non-topic
+        text = "---\nid: INC-9103\ntype: [incident, weird]\ntitle: Odd\n---\n\nBody.\n"
+        root = self.store(text)
+        (root / "topics" / "foo.md").unlink()
+        rc, out = run_memlint(["--against-ref", "HEAD", str(root)])
+        self.assertNotIn("Traceback", out)
+        self.assertEqual(rc, 0, out)
+
+    def test_deleting_a_topic_like_record_with_a_list_type_is_refused_by_the_topic_rule_without_a_traceback(self):
+        root = self.store(self._listy())
+        (root / "topics" / "foo.md").unlink()
+        rc, out = run_memlint(["--against-ref", "HEAD", str(root)])
+        self.assertNotIn("Traceback", out)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("file deleted or renamed", out)
+
+
 # ---------------------------------------------------------------------------
 # gate round 11 R11-2: rows new since REF meet the complete anchor validator
 # ---------------------------------------------------------------------------

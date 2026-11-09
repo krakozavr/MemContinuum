@@ -2464,7 +2464,9 @@ def _record_kind(fm: dict) -> str | None:
     a non-mapping document, an unreadable file) -- there is no real kind
     to report there, only "canonical but a total blank"."""
     t = fm.get("type")
-    if t in CANONICAL_TYPES:
+    # TOP-0137 L29 (gate round 1, R1-1): a list or mapping `type` is unhashable, and is
+    # now a shape error that routes through here -- only a string can be a kind.
+    if isinstance(t, str) and t in CANONICAL_TYPES:
         return t
     rid = fm.get("id")
     if isinstance(rid, str):
