@@ -169,7 +169,7 @@ fi
 # follow on their own: those scripts shell out through "$BASH", the path of
 # the interpreter already running them, rather than a bare `bash` off PATH
 # that would hop back to the system's bash 5 halfway through.
-BASH32_SUITES="tests.test_hooks tests.test_write_hooks tests.test_update tests.test_setup tests.test_repo_init tests.test_routing_rule_template"
+BASH32_SUITES="tests.test_hooks tests.test_write_hooks tests.test_update tests.test_setup tests.test_repo_init tests.test_routing_rule_template tests.test_list_lib"
 
 cd "$REPO_ROOT"
 MC_BASH="$BASH32_BIN" PYTHONPATH= "$MEMCONTINUUM_PYTHON" -m unittest $BASH32_SUITES

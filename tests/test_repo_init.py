@@ -170,6 +170,8 @@ def copy_engine(dst):
     # checkout without it exits "incomplete checkout" before doing anything.
     shutil.copy(TOOLS_DIR / "scripts" / "mc-registry-lib.sh", dst / "scripts" / "mc-registry-lib.sh")
     shutil.copy(TOOLS_DIR / "scripts" / "memcontinuum-decide.sh", dst / "scripts" / "memcontinuum-decide.sh")
+    # memcontinuum-decide.sh sources this sibling for its list join.
+    shutil.copy(TOOLS_DIR / "scripts" / "mc-list-lib.sh", dst / "scripts" / "mc-list-lib.sh")
     # TOP-0133 L2: memidx.py now imports mc_text.py at module load (the
     # shared content-term vocabulary, split out so hooks/memlib.sh's
     # prompt-query term derivation can import it without pulling in this

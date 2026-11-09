@@ -129,7 +129,7 @@ def copy_engine_for_machine_layer(dst):
     dst.mkdir(parents=True, exist_ok=True)
     (dst / "scripts").mkdir(exist_ok=True)
     for name in ("repo-init.sh", "mc_settings_merge.py", "mc-registry-lib.sh",
-                 "memcontinuum-decide.sh", "memcontinuum-update.sh"):
+                 "mc-list-lib.sh", "memcontinuum-decide.sh", "memcontinuum-update.sh"):
         shutil.copy(TOOLS_DIR / "scripts" / name, dst / "scripts" / name)
     for name in ("repo-init.sh", "memcontinuum-decide.sh", "memcontinuum-update.sh"):
         (dst / "scripts" / name).chmod(0o755)

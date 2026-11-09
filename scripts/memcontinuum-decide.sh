@@ -76,6 +76,8 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 # shellcheck source=./mc-registry-lib.sh
 . "$SCRIPT_DIR/mc-registry-lib.sh" || { echo "missing $SCRIPT_DIR/mc-registry-lib.sh -- incomplete checkout" >&2; exit 1; }
+# shellcheck source=./mc-list-lib.sh
+. "$SCRIPT_DIR/mc-list-lib.sh" || { echo "missing $SCRIPT_DIR/mc-list-lib.sh -- incomplete checkout" >&2; exit 1; }
 
 mc_resolve_home
 DECISIONS="$MEMCONTINUUM_HOME/decisions.tsv"
@@ -114,17 +116,16 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# join_semi ARR... -- prints array elements joined by ';', "" for a
-# zero-element array, each element percent-encoded for the note column
-# (mc_note_encode, scripts/mc-registry-lib.sh). Bash-3.2-safe (no
-# `${arr[*]/%/;}` tricks, no external tr/paste dependency): plain iteration.
-join_semi() {
-    local out="" first=1 a
+# encode_join_semi ARR... -- prints the elements, each percent-encoded for the
+# note column (mc_note_encode, scripts/mc-registry-lib.sh), joined by ';' with
+# mc_join_semi (scripts/mc-list-lib.sh, the one raw join). Encoding happens
+# here, once per element; the join never encodes.
+encode_join_semi() {
+    local enc=() a
     for a in "$@"; do
-        a="$(mc_note_encode "$a")"
-        if [ "$first" -eq 1 ]; then out="$a"; first=0; else out="$out;$a"; fi
+        enc+=("$(mc_note_encode "$a")")
     done
-    printf '%s' "$out"
+    mc_join_semi "${enc[@]:+${enc[@]}}"
 }
 
 # check_storable LABEL VALUE -- refuses the three characters the note column
@@ -261,10 +262,10 @@ if [ -n "$STORE" ] || [ -n "$PROJECT" ]; then
     NOTE="store=$(mc_note_encode "$STORE") project=$(mc_note_encode "$PROJECT")"
 fi
 if [ "${#CLAUDE_DIRS[@]}" -gt 0 ]; then
-    NOTE="$NOTE claude-dirs=$(join_semi "${CLAUDE_DIRS[@]}")"
+    NOTE="$NOTE claude-dirs=$(encode_join_semi "${CLAUDE_DIRS[@]}")"
 fi
 if [ "${#CODE_ROOTS[@]}" -gt 0 ]; then
-    NOTE="$NOTE code-roots=$(join_semi "${CODE_ROOTS[@]}")"
+    NOTE="$NOTE code-roots=$(encode_join_semi "${CODE_ROOTS[@]}")"
 fi
 if [ -n "$LANGS" ]; then
     NOTE="$NOTE langs=$(mc_note_encode "$(printf '%s' "$LANGS" | tr ',' ';')")"

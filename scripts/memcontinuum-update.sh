@@ -351,6 +351,8 @@ MC_BASH_BIN="${BASH:-bash}"
 
 # shellcheck source=./mc-registry-lib.sh
 . "$SCRIPT_DIR/mc-registry-lib.sh" || { echo "missing $SCRIPT_DIR/mc-registry-lib.sh -- incomplete checkout" >&2; exit 1; }
+# shellcheck source=./mc-list-lib.sh
+. "$SCRIPT_DIR/mc-list-lib.sh" || { echo "missing $SCRIPT_DIR/mc-list-lib.sh -- incomplete checkout" >&2; exit 1; }
 
 usage() {
     sed -n '2,/^# --MC-USAGE-END--$/p' "$0" | grep -v '^# --MC-USAGE-END--$' | sed 's/^# \{0,1\}//'
@@ -1042,7 +1044,7 @@ if isinstance(parsed, list):
         done < <(mc_wired_commands_for_project "$project" \
                      "$claude_dir/settings.local.json" "$claude_dir/settings.json")
     fi
-    MC_RECOVERED_CODE_ROOTS="$(join_semi "${roots[@]:-}")"
+    MC_RECOVERED_CODE_ROOTS="$(mc_join_semi "${roots[@]:-}")"
     MC_RECOVERED_LANG_GLOBS="$lang_glob_str"
     MC_RECOVERED_NEVER_GLOBS="$never_glob_str"
 
@@ -1153,19 +1155,6 @@ PYEOF
         MC_RECOVERED_NEVER="$(IFS=,; printf '%s' "${nevers[*]:-}")"
     fi
     return 0
-}
-
-# join_semi ARR... -- shared join, same as memcontinuum-decide.sh's own
-# (kept in each file rather than promoted to mc-registry-lib.sh: neither the
-# detector nor state.sh needs it, and mc-registry-lib.sh is sourced by the
-# detector on every session start in every repo on the machine -- no
-# unrelated function belongs there).
-join_semi() {
-    local out="" first=1 a
-    for a in "$@"; do
-        if [ "$first" -eq 1 ]; then out="$a"; first=0; else out="$out;$a"; fi
-    done
-    printf '%s' "$out"
 }
 
 # mc_physical now lives in scripts/mc-registry-lib.sh (symlink-review round
@@ -2333,7 +2322,7 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
             for cr in "${OVERRIDE_CODE_ROOTS[@]}"; do
                 OVERRIDE_CODE_ROOTS_PHYSICAL+=("$(mc_physical "$cr")")
             done
-            CODE_ROOTS_SEMI="$(join_semi "${OVERRIDE_CODE_ROOTS_PHYSICAL[@]}")"
+            CODE_ROOTS_SEMI="$(mc_join_semi "${OVERRIDE_CODE_ROOTS_PHYSICAL[@]}")"
             DISAGREE_CODE_ROOTS=0
         fi
         if [ -n "$LANGS_FLAG" ]; then
