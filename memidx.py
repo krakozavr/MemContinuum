@@ -13262,7 +13262,10 @@ def cmd_bind(args) -> int:
     matching rule stays `code_ref_matches`). rc 2: a directory named without its
     trailing slash; rc 1: topic or file missing, a prefix naming no directory
     or whose resolved directory leaves the code roots (symlinks included), an absolute or
-    `..` prefix/glob, symbol ambiguous, other failure."""
+    `..` prefix/glob, symbol ambiguous, other failure. Right after an uncommitted
+    `unbind` of the same REF it instead restores the exact earlier bytes from the
+    undo receipt (`undo_plan`), or refuses when the topic, HEAD or the staged entry
+    changed since."""
     root = Path(args.root).resolve()
     ref = args.ref
     code_roots = _code_roots_arg(args.code_root) or [Path.cwd().resolve()]
@@ -13357,7 +13360,9 @@ def cmd_unbind(args) -> int:
     `ref_marks:` `remove` row, as line edits; no anchor is touched (the frozen
     capture stays as history; `bind` restores the reference). A prefix or glob
     reference may be unbound. rc 1: refused (unknown topic, a non-empty flow
-    list, the edit would not round-trip); rc 0 with a note when REF is not bound."""
+    list, the edit would not round-trip); rc 0 with a note when REF is not bound.
+    Right after an uncommitted `bind` of the same REF it instead restores the exact
+    earlier bytes from the undo receipt (`undo_plan`)."""
     root = Path(args.root).resolve()
     ref = args.ref
     problem = _audit_text_problem(args)
