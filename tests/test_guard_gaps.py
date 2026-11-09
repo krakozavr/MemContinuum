@@ -2597,16 +2597,34 @@ class TestUndoReceipts(BindCase):
 
         done = {}
         env = dict(os.environ, PYTHONPATH="", MEMCONTINUUM_TRANSCRIPTS_DIR=str(self.tmp / "tr"))
+        marker = self.tmp / "child-blocked-on-the-lock"
+        # the child reports, by a marker file, that its lock attempt found the lock HELD (flock raised
+        # BlockingIOError): a fixed sleep cannot tell "waiting for the lock" from "still importing"
+        child = (
+            "import sys, fcntl, pathlib\n"
+            f"sys.path.insert(0, {str(TOOLS_DIR)!r})\n"
+            "import memidx\n"
+            "real = fcntl.flock\n"
+            "def flock(fd, op):\n"
+            "    try:\n"
+            "        return real(fd, op)\n"
+            "    except BlockingIOError:\n"
+            f"        pathlib.Path({str(marker)!r}).write_text('blocked')\n"
+            "        raise\n"
+            "fcntl.flock = flock\n"
+            f"sys.exit(memidx.main(['unbind', 'TOP-1', 'src/other.py', '--root', {str(self.store)!r}]))\n"
+        )
         with mock.patch.object(memidx, "_atomic_write_bytes", side_effect=pause_on_topic):
             first = threading.Thread(target=lambda: done.update(bind=self.bind()))
             first.start()
             try:
                 self.assertTrue(paused.wait(20))
-                other = subprocess.Popen(
-                    [sys.executable, str(TOOLS_DIR / "memidx.py"), "unbind", "TOP-1", "src/other.py",
-                     "--root", str(self.store)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    text=True, env=env)
-                time.sleep(0.6)
+                other = subprocess.Popen([sys.executable, "-c", child], stdout=subprocess.PIPE,
+                                         stderr=subprocess.PIPE, text=True, env=env)
+                deadline = time.monotonic() + 30
+                while not marker.exists() and other.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertTrue(marker.exists(), "the second command must reach the lock and find it held")
                 self.assertIsNone(other.poll(), "the second command must wait for the lock")
                 self.assertEqual(len(self.receipts()), 1)
             finally:
