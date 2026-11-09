@@ -66,17 +66,21 @@
 #     a path rather than crashing; full Unicode-aware tokenization is out
 #     of scope for this feature (see docs/INTERNALS.md's own note).
 #
-# mc_now_ms -- millisecond-epoch timestamp, bash-3.2-safe (no
-# $EPOCHREALTIME, added in bash 5.0; used directly when present). `date +%s%3N` (GNU coreutils) prints
-# 3 zero-padded fractional digits; BSD/macOS `date` has no `%N` at all and
-# prints the literal characters `3N` back -- probed ONCE per process via
-# MC_QUERY_MS_MODE (empty until the first call) rather than re-probing on
-# every timing call a hook makes. The probe result is a plain digit
-# string check (`case ... in *[!0-9]*)`), not a hardcoded GNU-vs-BSD
-# uname branch, so it also degrades correctly on any OTHER date build
-# with partial/no %N support. Falls back to a python one-liner
-# (time.time()) when `date` itself can't do it -- always available here
-# (every caller already requires python for the search subprocess itself).
+# mc_now_ms -- millisecond-epoch timestamp, bash-3.2-safe. The ladder below
+# is the one mc_now_ms implements; the first rung that works wins:
+#   1. $EPOCHREALTIME when present (bash >= 5; no fork at all).
+#   2. GNU `date +%s%3N`, probed ONCE per process into MC_QUERY_MS_MODE by
+#      checking that `date +%3N` prints exactly three digits (BSD/macOS date
+#      prints the literal `3N` and fails the probe).
+#   3. `perl -MTime::HiRes` (ships with macOS), probed once into the same
+#      variable and started only where neither rung 1 nor 2 works, e.g.
+#      macOS bash 3.2 with BSD date. A whole-second clock would log a 20 ms
+#      hook that spans a second boundary as elapsed=1.0s.
+#   4. A python one-liner (time.time()) only when the caller did not pass the
+#      no-python flag (second argument 1). Otherwise whole seconds from
+#      `date +%s`, times 1000.
+# The elapsed-time field callers (hooks/memlib.sh) pass the no-python flag,
+# so that path never starts python.
 
 # MC_QUERY_GENERIC_STEMS -- exact list per TOP-0133 L1's own spec: words that
 # describe "this is code" rather than naming a project-specific concept.

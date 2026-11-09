@@ -9586,7 +9586,8 @@ class TestMacOSPortMechanics(unittest.TestCase):
         the `signal.signal(...)`/`atexit.register(_kill_group)` lines
         back out of mc-watchdog.sh (equivalent to the launcher blob every
         hook used to carry before this dedup) leaves the heartbeat child
-        running well past the 1s bound this test asserts, because nothing
+        running well past the bound this test asserts (a 3 s hang guard;
+        the property is that the child dies), because nothing
         catches the SIGTERM in time to kill its process group before the
         default handler just terminates the launcher outright."""
         launcher_py = subprocess.run(
