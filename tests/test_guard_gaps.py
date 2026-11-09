@@ -2237,7 +2237,7 @@ class TestUndoReceipts(BindCase):
                 commit_all(self.store)
                 before = self.raw()
                 self.assertEqual(self.bind()[0], 0)
-                self.assertUndone(self.unbind(), before, clean=False)
+                self.assertUndone(self.unbind(), before)
                 self.assertEqual(self.receipts(), [])
 
     def test_a_renamed_topic_is_refused_not_treated_as_new(self):
@@ -2269,6 +2269,45 @@ class TestUndoReceipts(BindCase):
         self.assertEqual([r["ref"] for r in memidx.anchor_rows(self.fm())], ["src/other.py"])
         self.assertUndone(self.unbind("src/other.py"), before)
         self.assertEqual(self.receipts(), [])
+
+    L2_LINK = (
+        "  - link: L2\n    date: '2024-02-01'\n    status: active\n    kind: adopted\n"
+        "    ruling:\n      text: \"second ruling\"\n      authority: agent-inference\n")
+
+    def two_link_topic(self, rows=None):
+        """HEAD: links L1/L2, current L2, a committed `remove` for src/foo.py, no anchors."""
+        text = binding_topic(rows, code_refs=("src/other.py",), extra_links=self.L2_LINK,
+                             marks_text=ref_mark_text("src/foo.py", "remove"))
+        return text.replace("current: L1\n", "current: L2\n", 1)
+
+    def test_a_pending_anchor_for_the_same_key_that_bind_restores_is_in_b(self):
+        # hygiene-3 round 1: B already holds a valid uncommitted anchor for the key bind restores
+        self.put(self.two_link_topic())
+        self.path.write_text(self.two_link_topic([good_row(link="L2")]))
+        before = self.raw()
+        self.assertEqual(self.bind()[0], 0)
+        self.assertEqual([a["link"] for a in memidx.anchor_rows(self.fm())], ["L2"])  # restored, none added
+        self.assertUndone(self.unbind(), before)
+        self.assertEqual([a["link"] for a in memidx.anchor_rows(self.fm())], ["L2"])
+
+    def test_an_unrelated_pending_anchor_for_the_same_reference_at_another_link_survives(self):
+        # hygiene-3 round 2: the pending L1 anchor is in B; bind captures the L2 one; undo keeps L1
+        self.put(self.two_link_topic())
+        self.path.write_text(self.two_link_topic([good_row(link="L1")]))
+        before = self.raw()
+        self.assertEqual(self.bind()[0], 0)
+        self.assertEqual(sorted(a["link"] for a in memidx.anchor_rows(self.fm())), ["L1", "L2"])
+        self.assertUndone(self.unbind(), before)
+        self.assertEqual([a["link"] for a in memidx.anchor_rows(self.fm())], ["L1"])
+
+    def test_a_multi_line_quoted_value_containing_a_hash_is_in_b(self):
+        # hygiene-3 round 2: the quoted reference spans two physical lines and carries `# drafts`
+        self.put(binding_topic(code_refs=('"docs/*\n    # drafts"', "src/other.py")))
+        self.assertEqual(self.fm()["code_refs"], ["docs/* # drafts", "src/other.py"])
+        before = self.raw()
+        self.assertEqual(self.bind()[0], 0)
+        self.assertUndone(self.unbind(), before)
+        self.assertEqual(self.fm()["code_refs"], ["docs/* # drafts", "src/other.py"])
 
     def test_a_committed_anchor_with_an_edited_field_survives(self):
         self.bound_head()
@@ -2490,6 +2529,7 @@ class TestUndoReceipts(BindCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("undo: restored TOP-1", done.stdout)
         self.assertEqual(self.raw(), before)
+        self.assertGuardsClean()
 
     def test_a_receipt_whose_topic_write_never_happened_is_dropped(self):
         before = self.head_state(refs=())
@@ -2699,6 +2739,7 @@ class TestUndoReceipts(BindCase):
         self.assertEqual(rc, 1)
         self.assertIn("no undo receipt applies", err)
         self.assertEqual(self.bind("src/other.py")[0], 0)
+        bound_other = self.raw()
         self.assertEqual(self.bind("src/foo.py")[0], 0)
         rc, out, err = run_memidx(["undo-binding", "TOP-1", "--list", "--root", str(self.store)])
         self.assertEqual(rc, 0, err)
@@ -2708,25 +2749,26 @@ class TestUndoReceipts(BindCase):
         self.assertIn("baseline=entry ", lines[0])
         self.assertTrue(lines[1].startswith("#1 bind src/other.py"), lines)
         self.assertEqual(len(self.receipts()), 2)  # --list changes nothing
-        for _ in range(2):
+        for expected in (bound_other, before):  # after EVERY restoration, not only the last
             rc, out, err = run_memidx(["undo-binding", "TOP-1", "--root", str(self.store)])
             self.assertEqual(rc, 0, err)
             self.assertIn("undo: restored TOP-1", out)
-        self.assertEqual(self.raw(), before)
+            self.assertEqual(self.raw(), expected)
         self.assertEqual(self.receipts(), [])
         self.assertGuardsClean()
 
     def test_a_different_reference_or_the_same_direction_is_the_ordinary_path(self):
         before = self.head_state(refs=("src/other.py",))
         self.assertEqual(self.bind("src/foo.py")[0], 0)
+        bound_foo = self.raw()
         rc, out, err = self.unbind("src/other.py")  # latest receipt is another ref: ordinary
         self.assertEqual(rc, 0, err)
         self.assertNotIn("undo:", out)
         self.assertEqual(len(self.receipts()), 2)
-        # reverse order through the explicit command
-        for _ in range(2):
+        # reverse order through the explicit command, B after EVERY restoration
+        for expected in (bound_foo, before):
             self.assertEqual(run_memidx(["undo-binding", "TOP-1", "--root", str(self.store)])[0], 0)
-        self.assertEqual(self.raw(), before)
+            self.assertEqual(self.raw(), expected)
 
     def test_a_malformed_or_legacy_receipt_authorises_nothing(self):
         before = self.bound_head()
@@ -2852,6 +2894,10 @@ class TestUndoReceipts(BindCase):
         self.assertEqual(rc, 0, err)
         self.assertIn("undo: restored TOP-1", out)
         self.assertEqual((wt / "topics" / "foo.md").read_bytes(), before)
+        errors, _ = memlint.lint_root(wt)
+        self.assertEqual(errors, [], errors)
+        rc, out = run_memlint(["--against-ref", "HEAD", str(wt)])
+        self.assertEqual(rc, 0, out)
 
 
 class TestRemoveCodeRefEditor(unittest.TestCase):
