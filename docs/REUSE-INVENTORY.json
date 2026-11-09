@@ -329,7 +329,7 @@
             ],
             "forbid": [
               "EPOCHREALTIME",
-              "date\\s+\\+%s%3N",
+              {"command": "^date(?: \\S+)* \\+%s%3N"},
               "\\(\\([^\\n]*date\\s+\\+%s|date\\s+\\+%s[^\\n]*\\*\\s*1000|date\\s+\\+%s\\)?000\\b",
               "Time::HiRes",
               "time\\.time\\(\\)\\s*\\*\\s*1000|\\btime_ns\\("
@@ -372,10 +372,8 @@
               "mc_store_lint_schema"
             ],
             "forbid": [
-              "PYTHONPATH=\\s*\"\\$(?:PY|py)\"\\s+\"\\$(?:MEMLINT|memlint)\"",
-              "\\$\\{?(?:MEMLINT|memlint)\\}?\"?\\s+--",
-              "(?m)(?:^|[;&|(`!]|\\bthen\\b|\\bdo\\b|\\belse\\b)[ \\t]*(?:env[ \\t]+(?:\\w+=\\S*[ \\t]+)*)?(?:\"?\\$\\{?\\w*PY\\w*\\}?\"?|python[\\w.]*)[ \\t]+\"?\\$\\{?(?:MEMLINT|memlint)\\}?\"?",
-              "(?:\"?\\$\\{?\\w*PY\\w*\\}?\"?|python[\\w.]*)[ \\t]+(?:-\\w+[ \\t]+)*\"?[^\\s\"]*memlint\\.py"
+              {"command": "^(?:env (?:\\S+=\\S* )*)?(?:(?:\\S*/)?python[\\w.]*|\\$\\{?\\w*PY\\w*\\}?) (?:-\\S+ )*(?:\\$\\{?(?:MEMLINT|memlint)\\}?|[^\\s=]*memlint\\.py)(?: |$)"},
+              {"command": "^(?:env (?:\\S+=\\S* )*)?(?:\\$\\{?(?:MEMLINT|memlint)\\}?|[^\\s=]*memlint\\.py)(?: |$)"}
             ]
           }
         }
@@ -424,10 +422,8 @@
               "mc_store_lint_append_only"
             ],
             "forbid": [
-              "PYTHONPATH=\\s*\"\\$(?:PY|py)\"\\s+\"\\$(?:MEMLINT|memlint)\"",
-              "\\$\\{?(?:MEMLINT|memlint)\\}?\"?\\s+--",
-              "(?m)(?:^|[;&|(`!]|\\bthen\\b|\\bdo\\b|\\belse\\b)[ \\t]*(?:env[ \\t]+(?:\\w+=\\S*[ \\t]+)*)?(?:\"?\\$\\{?\\w*PY\\w*\\}?\"?|python[\\w.]*)[ \\t]+\"?\\$\\{?(?:MEMLINT|memlint)\\}?\"?",
-              "(?:\"?\\$\\{?\\w*PY\\w*\\}?\"?|python[\\w.]*)[ \\t]+(?:-\\w+[ \\t]+)*\"?[^\\s\"]*memlint\\.py"
+              {"command": "^(?:env (?:\\S+=\\S* )*)?(?:(?:\\S*/)?python[\\w.]*|\\$\\{?\\w*PY\\w*\\}?) (?:-\\S+ )*(?:\\$\\{?(?:MEMLINT|memlint)\\}?|[^\\s=]*memlint\\.py)(?: |$)"},
+              {"command": "^(?:env (?:\\S+=\\S* )*)?(?:\\$\\{?(?:MEMLINT|memlint)\\}?|[^\\s=]*memlint\\.py)(?: |$)"}
             ]
           }
         }

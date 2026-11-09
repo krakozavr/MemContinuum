@@ -276,6 +276,34 @@ class TestGuardsRejectSecondImplementation(unittest.TestCase):
                 d = only(found, rid, "delegation")
                 self.assertTrue(any("bypassing the owner" in x for x in d), (line, rid, found))
 
+    def test_direct_lint_forms_the_round_2_gate_found_fail_both_lint_rows(self):
+        # each of these ran the lint inside a commit hook and left the complete check clean
+        for line in ('"$memlint" "$MEMCONTINUUM_ROOT"',
+                     '"$SCRIPT_DIR/../memlint.py" "$MEMCONTINUUM_ROOT"',
+                     'X=1 "$PY" "$memlint" "$MEMCONTINUUM_ROOT"',
+                     'PYTHONPATH= python3 "$memlint" "$MEMCONTINUUM_ROOT"',
+                     '"${MEMLINT}" --against-ref HEAD "$ROOT"',
+                     'out=$("$MC_PY" -u "$MEMLINT" "$ROOT")'):
+            ft = FixtureTree(self)
+            ft.append("hooks/post-commit-reindex.sh", "\n" + line + "\n")
+            found = ft.findings()
+            for rid in ("store-lint-schema", "store-lint-append-only"):
+                d = only(found, rid, "delegation")
+                self.assertTrue(any("bypassing the owner" in x for x in d), (line, rid, found))
+
+    def test_text_that_merely_mentions_the_lint_is_not_a_direct_call(self):
+        for line in ("echo 'python3 memlint.py'", 'echo "$PY" "$MEMLINT" "$ROOT"', 'ls "$SCRIPT_DIR/../memlint.py"',
+                     'MEMLINT="$SCRIPT_DIR/../memlint.py"', 'mc_store_lint_schema "$PY" "$MEMLINT" "$ROOT"',
+                     'mc_store_lint_append_only "$PY" "$memlint" "$ROOT" HEAD'):
+            ft = FixtureTree(self)
+            ft.append("hooks/post-commit-reindex.sh", "\n" + line + "\n")
+            self.assertEqual(ft.findings(), [], line)
+
+    def test_a_millisecond_date_named_only_as_text_is_not_a_clock(self):
+        ft = FixtureTree(self)
+        ft.append("hooks/newfile-nudge.sh", "\necho 'date +%s%3N'\n")
+        self.assertEqual(ft.findings(), [])
+
     def test_passing_memlint_to_the_owner_is_not_an_invocation(self):
         ft = FixtureTree(self)
         ft.append("hooks/post-commit-reindex.sh",
@@ -605,6 +633,16 @@ def _inv(*rows, **over):
 class TestSchema(unittest.TestCase):
     def errors(self, inv):
         return mc_reuse.validate_schema(inv)
+
+    def test_forbid_entries_are_a_bare_string_or_one_scoped_pattern(self):
+        def forbid(*entries):
+            return _inv(_row(guards=[{"method": "delegation", "params": {"consumers": ["c.sh"], "forbid": list(entries)}}]))
+        self.assertEqual(self.errors(forbid("x", {"text": "y"}, {"command": "^z"})), [])
+        for bad in ({"shell": "x"}, {"text": "x", "command": "y"}, {"command": 7}, 7, {}):
+            errs = self.errors(forbid(bad))
+            self.assertTrue(any("forbid entry" in e for e in errs), (bad, errs))
+        errs = self.errors(forbid({"command": "("}))
+        self.assertTrue(any("not a valid regular expression" in e for e in errs), errs)
 
     def test_a_valid_minimal_inventory_has_no_errors(self):
         self.assertEqual(self.errors(_inv(_row())), [])

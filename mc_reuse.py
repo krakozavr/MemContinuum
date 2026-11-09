@@ -187,6 +187,20 @@ def _validate_row(label, row) -> list:
     return errs
 
 
+def _forbid_entry(f):
+    """`(scope, regex)` of one `forbid` entry, or None if it is malformed. A bare
+    string, or `{"text": R}`, is searched in the unit's executable text; a
+    `{"command": R}` is matched, from its first word, against each parsed shell
+    simple command (see _sh_command_strings)."""
+    if isinstance(f, str):
+        return "text", f
+    if isinstance(f, dict) and len(f) == 1:
+        (scope, rx), = f.items()
+        if scope in ("text", "command") and isinstance(rx, str):
+            return scope, rx
+    return None
+
+
 def _validate_guard_params(label, method, params) -> list:
     errs = []
     allowed = {
@@ -218,12 +232,17 @@ def _validate_guard_params(label, method, params) -> list:
         if not _is_str_list(params.get("consumers")) or not params.get("consumers"):
             errs.append(f"{label}: needs a non-empty consumers list")
         if "forbid" in params:
-            if not _is_str_list(params["forbid"]):
+            if not isinstance(params["forbid"], list):
                 errs.append(f"{label}: forbid must be a list of regular expressions")
             else:
                 for f in params["forbid"]:
+                    entry = _forbid_entry(f)
+                    if entry is None:
+                        errs.append(f"{label}: forbid entry {f!r} must be a regular expression string or "
+                                    "{\"text\": REGEX} or {\"command\": REGEX}")
+                        continue
                     try:
-                        re.compile(f)
+                        re.compile(entry[1])
                     except re.error:
                         errs.append(f"{label}: forbid entry {f!r} is not a valid regular expression")
     return errs
@@ -262,6 +281,7 @@ class Unit:
     text: str
     calls: frozenset    # names EXECUTED here: python Call targets, shell command words
     loads: frozenset    # python value references (Name loads, attributes); shell: = calls
+    commands: tuple = ()    # shell: each simple command rendered as its words (see _sh_command_strings)
 
 
 @dataclass
@@ -638,12 +658,12 @@ def _scan_shell(scan, rel, text):
         body = "\n".join(masked[s:e + 1])
         cw = frozenset(_sh_command_words(body))
         scan.units.append(Unit(path=rel, qual=name, lang="sh", lineno=s + 1, end_lineno=e + 1,
-                               text=body, calls=cw, loads=cw))
+                               text=body, calls=cw, loads=cw, commands=_sh_command_strings(body)))
         covered.update(range(s, e + 1))
     res = "\n".join(masked[k] for k in range(n) if k not in covered)
     cw = frozenset(_sh_command_words(res))
     scan.units.append(Unit(path=rel, qual="<script>", lang="sh", lineno=1, end_lineno=n, text=res,
-                           calls=cw, loads=cw))
+                           calls=cw, loads=cw, commands=_sh_command_strings(res)))
     for first_line, src in payloads:
         _scan_python(scan, rel, src, first_line - 1, True, f"<embedded L{first_line}>.")
 
@@ -953,6 +973,23 @@ def _sh_parse(text: str):
     return tuple(cmds), tuple(heredocs)
 
 
+def _sh_command_strings(text: str) -> tuple:
+    """Every simple command of `text` (see _sh_parse) rendered as its words joined
+    by single spaces, quotes and redirections removed, a `$( )` body rendered as
+    its own command. Leading `VAR=value` assignments are REMOVED from the
+    rendering, and a second rendering that keeps them is added when there were
+    any, so a pattern may name `PYTHONPATH=` deliberately."""
+    out = []
+    for cmd in _sh_parse(text)[0]:
+        if not cmd.words:
+            continue
+        line = " ".join(w.text for w in cmd.words)
+        out.append(line)
+        if cmd.assigns:
+            out.append(" ".join(cmd.assigns + (line,)))
+    return tuple(out)
+
+
 def _sh_command_words(text: str) -> set:
     """The identifiers that appear in COMMAND position of `text` (shell with
     comments and heredoc bodies already removed): the first word of a simple
@@ -1201,7 +1238,7 @@ def _guard_delegation(scan, row, owner, params):
     import, a string) does not count. A constant owner is reached by a value
     reference (a Name load) instead."""
     refs = set(params.get("refs") or [owner.name])
-    forbid = [re.compile(f) for f in params.get("forbid", [])]
+    forbid = [(scope, re.compile(rx)) for scope, rx in map(_forbid_entry, params.get("forbid", []))]
     by_value = owner.kind == "const"
     out = []
     declared = {owner.name} | set(params.get("aliases", []))
@@ -1240,11 +1277,15 @@ def _guard_delegation(scan, row, owner, params):
                        f"(no executable {how} of {', '.join(sorted(refs))}; a mention, a `type` probe or an "
                        "import is not a call)")
         for u in units:
-            for f in forbid:
-                m = f.search(u.text)
-                if m:
+            for scope, f in forbid:
+                if scope == "text":
+                    hit = f.search(u.text) is not None
+                else:
+                    hit = any(f.match(c) for c in u.commands)
+                if hit:
                     out.append(f"consumer {cons} reaches the job directly, bypassing the owner "
-                               f"{_def_ref(owner)}: {f.pattern!r} found in {u.qual} at {u.path}:{u.lineno}")
+                               f"{_def_ref(owner)}: {scope} pattern {f.pattern!r} found in {u.qual} at "
+                               f"{u.path}:{u.lineno}")
     return out
 
 
