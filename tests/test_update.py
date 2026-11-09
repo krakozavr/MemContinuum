@@ -1211,18 +1211,24 @@ class TestBackupColumn(UpdateTestBase):
                        check=True, capture_output=True, env=clean_env(self.home))
 
     def test_a_store_commit_never_touches_the_parent_home(self):
-        """Regression (TOP-0137 L38): point the PARENT process's HOME at a
-        throwaway dir; a commit in the hooked store must leave it without a
-        .memcontinuum/ (the hook ran in the sandboxed HOME instead)."""
+        """Regression (TOP-0137 L38): point the PARENT process's HOME and
+        MEMCONTINUUM_HOME at a throwaway dir, pinning both hook resolution arms;
+        a commit in the hooked store must leave it without a .memcontinuum/ and
+        the sandboxed hook must still have logged."""
         real_home = tempfile.mkdtemp(prefix="memcontinuum-update-test-realhome-")
         self.addCleanup(shutil.rmtree, real_home, ignore_errors=True)
-        old = os.environ.get("HOME")
-        os.environ["HOME"] = real_home
-        self.addCleanup(lambda: os.environ.__setitem__("HOME", old)
-                        if old is not None else os.environ.pop("HOME", None))
+        parent_mc = str(Path(real_home) / ".memcontinuum")
+        for key, value in (("HOME", real_home), ("MEMCONTINUUM_HOME", parent_mc)):
+            old = os.environ.get(key)
+            os.environ[key] = value
+            self.addCleanup(lambda k=key, o=old: os.environ.__setitem__(k, o)
+                            if o is not None else os.environ.pop(k, None))
         self._commit_in_store("sentinel")
         self.assertFalse(Path(real_home, ".memcontinuum").exists(),
                          os.listdir(real_home))
+        hook_log = Path(self.home) / ".memcontinuum" / "hook.log"
+        self.assertTrue(hook_log.exists(), "the sandboxed hook wrote no hook.log")
+        self.assertIn("post-commit-reindex", hook_log.read_text())
 
     def _write_config(self, backup_dir, keep=None):
         cfg = Path(self.home, ".memcontinuum", "config.sh")
