@@ -309,13 +309,19 @@ whatever else sits in the working tree) and, unlike every other hook here,
 BLOCKS the commit (exit 1) when that check finds an append-only violation —
 the errors on stderr, one `hook.log` line
 (`pre-commit-append-only: rc=1 changed=<n> project=…`). A clean check exits 0
-with `rc=0 changed=<n> project=…`; an unborn HEAD, a missing python,
-memlint itself failing to produce a recognizable result, or (fix wave 1 G1)
-the hook's own cwd not matching `MEMCONTINUUM_ROOT` (`skipped=not-the-store`
+with `rc=0 changed=<n> project=…`. An unborn HEAD, a missing python, a
+missing lint library, an unset store root, or the hook's own cwd not
+matching `MEMCONTINUUM_ROOT` (`skipped=not-the-store`
 — a wrapper invoked from another repository, e.g. through a mistakenly
 shared `core.hooksPath`, must never judge that repository's commit) all
-exit 0 with `skipped=<reason> project=…` instead — fail-open for
-infrastructure, fail-closed only for a genuine history edit. See docs/INTERNALS.md's memlint
+exit 0 with `skipped=<reason> project=…` — the guard could not run, so it
+fails open. But when the append-only check ran and crashed (exit 2, or
+any exit with no `changed=` summary), the commit is REFUSED: the engine's
+output is printed, one line names `MC_STORE_LINT_ALLOW_ENGINE_FAILURE=1 git
+commit …` as the operator's override (read from the launching environment
+only), and the log line reads `rc=<n> engine-failure refused` (with the
+override: `skipped=engine-failure override=1`). A crash inside the guard
+must not let a history edit through. See docs/INTERNALS.md's memlint
 section (`--against-ref`) for the full rule table, and its "Fail-open is the
 contract" and "The watchdog" sections for why this one hook blocks and why it
 carries no timeout guard. `git commit --no-verify` bypasses this hook
