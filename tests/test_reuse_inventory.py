@@ -358,6 +358,18 @@ class TestDelegationNeedsAnExecutableCall(unittest.TestCase):
         self.assertEqual(len(f), 1, ft.findings())
         self.assertIn("post-commit-reindex.sh", f[0])
 
+    def test_post_commit_with_a_redirect_operand_named_like_the_owner_and_an_assigned_lint_call_fails(self):
+        # the round-2 gate's escape, verbatim: `> mc_store_lint_schema` is a redirection target, not a call, and the
+        # assignment prefix hid the inline lint call from the old forbid
+        ft = FixtureTree(self)
+        ft.replace("hooks/post-commit-reindex.sh",
+                   '    mc_store_lint_schema "$PY" "$memlint" "$MEMCONTINUUM_ROOT"\n',
+                   '    > mc_store_lint_schema\n    X=1 "$PY" "$memlint" "$MEMCONTINUUM_ROOT"\n')
+        f = [x for x in only(ft.findings(), "store-lint-schema", "delegation")
+             if "does not reach the job through the owner" in x]
+        self.assertEqual(len(f), 1, ft.findings())
+        self.assertIn("post-commit-reindex.sh", f[0])
+
     def test_python_consumer_that_imports_but_never_calls_fails(self):
         f = self.check({"a.py": "def f(x):\n    return x\n",
                         "c.py": "from a import f\n\ndef parse(text):\n    return text.split()\n"},
@@ -400,6 +412,15 @@ class TestDelegationNeedsAnExecutableCall(unittest.TestCase):
             "brace": "{ mc_job; }\n",
             "time": "time mc_job\n",
             "inline-subst": 'echo "got $(mc_job)"\n',
+            "double-quoted": '"mc_job" a\n',
+            "single-quoted-word": "'mc_job' a\n",
+            "eval-plain": "eval mc_job\n",
+            "eval-double-quoted": 'eval "mc_job"\n',
+            "eval-single-quoted": "eval 'mc_job'\n",
+            "redirect-before-the-command": ">out mc_job\n",
+            "redirect-fd-before-the-command": "2>&1 mc_job\n",
+            "case-body": 'case $x in\n    a)\n        mc_job\n        ;;\nesac\n',
+            "nested-case-body": 'case $x in a) case $y in b) mc_job;; esac;; esac\n',
         }
         for name, body in shapes.items():
             files = dict(base, **{"c.sh": "#!/usr/bin/env bash\n" + body})
@@ -419,6 +440,22 @@ class TestDelegationNeedsAnExecutableCall(unittest.TestCase):
             "single-quoted": "echo 'run mc_job | mc_job'\n",
             "argument": "echo mc_job\n",
             "declaration": "mc_job() {\n    echo mine\n}\n",
+            "redirect-operand": "> mc_job\n",
+            "redirect-operand-append": "echo x >> mc_job\n",
+            "redirect-operand-both": "echo x &> mc_job\n",
+            "redirect-operand-input": "cat < mc_job\n",
+            "case-pattern": 'case $x in\n    mc_job)\n        echo hi\n        ;;\nesac\n',
+            "case-pattern-alternation": 'case $x in (a|mc_job) echo hi;; esac\n',
+            "arithmetic-command": "((mc_job))\n",
+            "array-literal": "arr=(mc_job)\n",
+            "array-append": "arr+=(mc_job other)\n",
+            "local-array": "f() {\n    local arr=(mc_job)\n}\n",
+            "longer-word-quoted-suffix": 'mc_job"other"\n',
+            "longer-word-variable-suffix": "mc_job$x\n",
+            "longer-word-path": "mc_job/x\n",
+            "eval-complex-word": 'eval "mc_job x"\n',
+            "launcher": "xargs mc_job\n",
+            "command-p": "command -p mc_job\n",
         }
         for name, body in shapes.items():
             files = dict(base, **{"c.sh": "#!/usr/bin/env bash\n" + body})

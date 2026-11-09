@@ -34,6 +34,7 @@ from __future__ import annotations
 import ast
 import copy
 import fnmatch
+import functools
 import json
 import os
 import re
@@ -648,8 +649,308 @@ def _scan_shell(scan, rel, text):
 
 
 _SH_KEEP_CMD = frozenset({"if", "then", "elif", "else", "while", "until", "do", "time", "exec", "command",
-                          "builtin", "!"})
+                          "builtin", "eval", "!"})
 _SH_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_SH_ASSIGN_RE = re.compile(r"[A-Za-z_]\w*(?:\[[^\]]*\])?\+?=")
+_SH_REDIR_RE = re.compile(r"(?:\d+|\{\w+\})?(?:<<<|<<-?|>>|>\||>&|<&|<>|&>>|&>|>|<)")
+
+
+@dataclass(frozen=True)
+class _ShWord:
+    start: int      # offset of the word in the parsed text
+    raw: str        # the source text of the word
+    text: str       # the word with quotes and escapes removed (a substitution renders as `$(...)`)
+
+    @property
+    def ident(self) -> str:
+        """The identifier this word spells -- bare (`mc_job`) or as one quoted
+        piece (`"mc_job"`, `'mc_job'`) -- else ''. `mc_job"x"`, `mc_job$x`,
+        `mc_job/x` are longer words, not the identifier."""
+        r = self.raw
+        if _SH_IDENT_RE.fullmatch(r):
+            return r
+        if len(r) > 2 and r[0] in "'\"" and r[-1] == r[0] and _SH_IDENT_RE.fullmatch(r[1:-1]):
+            return r[1:-1]
+        return ""
+
+    @property
+    def bare(self) -> bool:
+        return _SH_IDENT_RE.fullmatch(self.raw) is not None or self.raw in ("{", "}", "!")
+
+
+@dataclass(frozen=True)
+class _ShCmd:
+    """One simple command: its words after any `VAR=value` prefixes (and
+    `if`/`then`/`exec`... keywords), and the assignments before them."""
+    words: tuple
+    assigns: tuple
+
+
+@functools.lru_cache(maxsize=64)
+def _sh_parse(text: str):
+    """`(commands, heredoc_offsets)` of `text` (shell with comments and heredoc
+    bodies already removed): every simple command -- including the ones inside
+    `$( )`, backticks, `<( )` and `( )` -- and the offsets of `<<` / `<<-`
+    operators that sit outside quotes. A bounded tokenizer, not a Bash parser:
+    words, quotes, `$(( ))`/`(( ))` blobs, redirections (an operator consumes
+    its operand word), `case` patterns and `name() {` declarations are told
+    apart from commands; `eval`, `exec`, `time`, `!` and the like keep command
+    position, `command -v/-V/-p` do not."""
+    n = len(text)
+    cmds = []
+    heredocs = []
+
+    def skip_group(i):      # text[i] == "(": the index after its matching ")"
+        depth = 0
+        while i < n:
+            c = text[i]
+            if c == "\\":
+                i += 2
+                continue
+            if c in "'\"":
+                j = text.find(c, i + 1)
+                i = n if j < 0 else j + 1
+                continue
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    return i + 1
+            i += 1
+        return n
+
+    def skip_brace(i):      # text[i] == "{": the index after its matching "}"
+        depth = 0
+        while i < n:
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    return i + 1
+            i += 1
+        return n
+
+    def read_dq(i, buf):    # i is just after an opening double quote
+        while i < n:
+            c = text[i]
+            if c == "\\":
+                if i + 1 < n and text[i + 1] in '$`"\\':
+                    buf.append(text[i + 1])
+                elif i + 1 < n and text[i + 1] != "\n":
+                    buf.append("\\")
+                    i -= 1
+                i += 2
+                continue
+            if c == '"':
+                return i + 1
+            if text.startswith("$((", i):
+                j = skip_group(i + 1)
+                buf.append(text[i:j])
+                i = j
+            elif text.startswith("$(", i):
+                buf.append("$(...)")
+                i = parse_seq(i + 2, ")")
+            elif c == "`":
+                buf.append("`...`")
+                i = parse_seq(i + 1, "`")
+            elif text.startswith("${", i):
+                j = skip_brace(i + 1)
+                buf.append(text[i:j])
+                i = j
+            else:
+                buf.append(c)
+                i += 1
+        return n
+
+    def read_word(i):
+        start = i
+        buf = []
+        while i < n:
+            c = text[i]
+            if c == "\\":
+                if i + 1 < n and text[i + 1] != "\n":
+                    buf.append(text[i + 1])
+                i += 2
+            elif c == "'":
+                j = text.find("'", i + 1)
+                buf.append(text[i + 1:] if j < 0 else text[i + 1:j])
+                i = n if j < 0 else j + 1
+            elif c == '"':
+                i = read_dq(i + 1, buf)
+            elif c == "$" and text.startswith("$'", i):
+                j = i + 2
+                while j < n and text[j] != "'":
+                    j += 2 if text[j] == "\\" else 1
+                buf.append(text[i + 2:j])
+                i = j + 1
+            elif c == "$" and text.startswith("$((", i):
+                j = skip_group(i + 1)
+                buf.append(text[i:j])
+                i = j
+            elif c == "$" and text.startswith("$(", i):
+                buf.append("$(...)")
+                i = parse_seq(i + 2, ")")
+            elif c == "$" and text.startswith("${", i):
+                j = skip_brace(i + 1)
+                buf.append(text[i:j])
+                i = j
+            elif c == "`":
+                buf.append("`...`")
+                i = parse_seq(i + 1, "`")
+            elif c in "<>" and text.startswith("(", i + 1):
+                buf.append(c + "(...)")
+                i = parse_seq(i + 2, ")")
+            elif c == "(" and re.fullmatch(r"[A-Za-z_]\w*\+?=", text[start:i]):
+                j = skip_group(i)           # an array literal: nothing in it is a command word
+                buf.append(text[i:j])
+                i = j
+            elif c in " \t\n;&|()<>":
+                break
+            else:
+                buf.append(c)
+                i += 1
+        return _ShWord(start, text[start:i], "".join(buf)), i
+
+    def parse_seq(i, closer):
+        at_cmd = True           # the next word starts a simple command
+        swallow = False         # the rest of this simple command is not a command (after `command -v`, `((..))`)
+        redir = False           # the next word is a redirection operand
+        after_command = False   # the previous word was a bare `command`
+        skip_name = False       # the previous word was `function`
+        cases = []              # open `case`s: 'hdr' (before `in`), 'pat' (patterns), 'body' (commands)
+        words = []
+        assigns = []
+
+        def end_cmd():
+            nonlocal words, assigns, swallow, redir, after_command
+            if words:
+                cmds.append(_ShCmd(tuple(words), tuple(assigns)))
+            words, assigns = [], []
+            swallow = redir = after_command = False
+
+        while i < n:
+            c = text[i]
+            if c in " \t":
+                i += 1
+                continue
+            if c == "\\" and text.startswith("\\\n", i):
+                i += 2
+                continue
+            if c == closer and not (closer == ")" and cases and cases[-1] == "pat"):
+                end_cmd()
+                return i + 1
+            if c == ")":
+                if cases and cases[-1] == "pat":
+                    cases[-1] = "body"
+                    end_cmd()
+                    at_cmd = True
+                i += 1
+                continue
+            if c in "<>&0123456789{" and not (c in "<>" and text.startswith("(", i + 1)):
+                m = _SH_REDIR_RE.match(text, i)
+                if m:
+                    if m.group(0).endswith("<<") or m.group(0).endswith("<<-"):
+                        heredocs.append(text.index("<<", i))
+                    redir = True
+                    i = m.end()
+                    continue
+            if c in "\n;&|":
+                if c == ";" and cases and cases[-1] == "body" and text.startswith((";;", ";&"), i):
+                    cases[-1] = "pat"
+                    end_cmd()
+                    at_cmd = False
+                    i += 3 if text.startswith(";;&", i) else 2
+                    continue
+                end_cmd()
+                if not (cases and cases[-1] == "pat"):
+                    at_cmd = True
+                skip_name = False
+                i += 1
+                continue
+            if c == "(":
+                if cases and cases[-1] == "pat":
+                    i += 1
+                    continue
+                if at_cmd and text.startswith("((", i):
+                    i = skip_group(i)       # an arithmetic command: nothing in it is a command word
+                    swallow, at_cmd = True, False
+                    continue
+                k = i + 1
+                while k < n and text[k] in " \t":
+                    k += 1
+                if k < n and text[k] == ")":    # `()` of a declaration spelled `function f ()`
+                    i = k + 1
+                    at_cmd = True
+                    continue
+                end_cmd()
+                i = parse_seq(i + 1, ")")
+                swallow, at_cmd = True, False
+                continue
+            w, i = read_word(i)
+            if redir:
+                redir = False
+                continue
+            state = cases[-1] if cases else ""
+            if state == "hdr":
+                if w.raw == "in":
+                    cases[-1] = "pat"
+                continue
+            if state == "pat":
+                if w.raw == "esac":
+                    cases.pop()
+                    swallow, at_cmd = True, False
+                continue
+            if swallow:
+                continue
+            if skip_name:
+                skip_name = False
+                at_cmd = True
+                continue
+            if after_command:
+                after_command = False
+                if re.match(r"-[vVp]", w.raw):
+                    swallow = True
+                    continue
+            if at_cmd:
+                if _SH_ASSIGN_RE.match(w.raw):
+                    assigns.append(w.text)
+                    continue
+                if w.bare:
+                    r = w.raw
+                    if r in _SH_KEEP_CMD or r == "{":
+                        after_command = r == "command"
+                        continue
+                    if r == "case":
+                        cases.append("hdr")
+                        at_cmd = False
+                        continue
+                    if r == "esac" and cases:
+                        cases.pop()
+                        swallow, at_cmd = True, False
+                        continue
+                    if r == "function":
+                        skip_name = True
+                        continue
+                    if r == "}":
+                        swallow, at_cmd = True, False
+                        continue
+                    k = i
+                    while k < n and text[k] in " \t":
+                        k += 1
+                    if text.startswith("(", k) and text[k + 1:].lstrip(" \t").startswith(")"):
+                        i = text.index(")", k) + 1      # `name()`: a declaration, not a call
+                        continue
+                words.append(w)
+                at_cmd = False
+            else:
+                words.append(w)
+        end_cmd()
+        return n
+
+    parse_seq(0, "")
+    return tuple(cmds), tuple(heredocs)
 
 
 def _sh_command_words(text: str) -> set:
@@ -657,166 +958,16 @@ def _sh_command_words(text: str) -> set:
     comments and heredoc bodies already removed): the first word of a simple
     command after optional `VAR=value` assignments, and after `$(`, a backtick,
     `|`, `&&`, `||`, `;`, `&`, a newline, `!`, `{`, `(`, and the keywords
-    if/then/elif/else/while/until/do/time/exec/command/builtin. Words inside
-    single quotes, arguments (of `type`, `declare -f`, `command -v`, `hash`,
-    `unset`, ...) and the name in a `name() {` / `function name {` declaration
-    are not command words. A bounded tokenizer, not a Bash parser."""
-    words = set()
-    n = len(text)
-    i = 0
-    expect = True          # the next word starts a simple command
-    dq = False             # inside double quotes
-    cur_assign = False     # the word being read is a `VAR=value` assignment (expect survives it)
-    skip_name = False      # the previous word was `function`: the next word is a name
-    stack = []             # one entry per open `$(`, `(` or backtick: (kind, saved_dq, saved_expect)
-    boundary = True
-    while i < n:
-        c = text[i]
-        if c == "\\":
-            i += 2
-            continue
-        if dq:
-            if c == '"':
-                dq = False
-            elif text.startswith("$((", i):
-                j = text.find("))", i + 3)
-                i = n if j < 0 else j + 2
-                continue
-            elif text.startswith("$(", i):
-                stack.append(("p", dq, expect if cur_assign else False))
-                dq, expect, cur_assign, boundary = False, True, False, True
-                i += 2
-                continue
-            elif c == "`":
-                if stack and stack[-1][0] == "b":
-                    _, dq, expect = stack.pop()
-                else:
-                    stack.append(("b", dq, expect if cur_assign else False))
-                    dq, expect, cur_assign, boundary = False, True, False, True
-            i += 1
-            continue
-        if c == "'":
-            j = text.find("'", i + 1)
-            i = n if j < 0 else j + 1
-            if not cur_assign:
-                expect = False
-            boundary = False
-            continue
-        if c == '"':
-            dq = True
-            if not cur_assign:
-                expect = False
-            boundary = False
-            i += 1
-            continue
-        if text.startswith("${", i):
-            depth, j = 0, i + 1
-            while j < n:
-                if text[j] == "{":
-                    depth += 1
-                elif text[j] == "}":
-                    depth -= 1
-                    if depth == 0:
-                        break
-                j += 1
-            i = j + 1
-            if not cur_assign:
-                expect = False
-            boundary = False
-            continue
-        if text.startswith("$((", i):
-            j = text.find("))", i + 3)
-            i = n if j < 0 else j + 2
-            boundary = False
-            continue
-        if text.startswith("$(", i):
-            stack.append(("p", dq, expect if cur_assign else False))
-            expect, cur_assign, boundary = True, False, True
-            i += 2
-            continue
-        if c == "`":
-            if stack and stack[-1][0] == "b":
-                _, dq, expect = stack.pop()
-                boundary = False
-            else:
-                stack.append(("b", dq, expect if cur_assign else False))
-                expect, cur_assign, boundary = True, False, True
-            i += 1
-            continue
-        if c == "(":
-            stack.append(("s", dq, False))
-            expect, cur_assign, boundary = True, False, True
-            i += 1
-            continue
-        if c == ")":
-            if stack:
-                _, dq, expect = stack.pop()
-            else:
-                expect = True      # a case pattern's `)`
-            cur_assign = False
-            boundary = True
-            i += 1
-            continue
-        if c == "\n" or c in ";&|":
-            expect, cur_assign, boundary, skip_name = True, False, True, False
-            i += 1
-            continue
-        if c in " \t":
-            cur_assign = False
-            boundary = True
-            i += 1
-            continue
-        if c in "<>":
-            boundary = True
-            i += 1
-            continue
-        if boundary and c in "{}" and (i + 1 >= n or text[i + 1] in " \t\n;"):
-            expect = c == "{"
-            i += 1
-            continue
-        if boundary and (c == "!" and (i + 1 >= n or text[i + 1] in " \t")):
-            i += 1
-            continue
-        m = _SH_IDENT_RE.match(text, i) if boundary else None
-        if m and expect:
-            word, j = m.group(0), m.end()
-            if j < n and text[j] == "=" and not text.startswith("==", j):
-                cur_assign = True
-                boundary = False
-                i = j + 1
-                continue
-            if j < n and text[j] not in " \t\n;&|()<>`'\"":
-                expect, boundary = False, False     # part of a longer word (a path, a flag)
-                i = j
-                continue
-            k = j
-            while k < n and text[k] in " \t":
-                k += 1
-            decl = text.startswith("(", k) and text[k + 1:].lstrip(" \t").startswith(")")
-            if skip_name:
-                skip_name = False
-                expect = False
-            elif decl:
-                expect = False
-            elif word == "function":
-                skip_name = True
-                expect = False
-            elif word in _SH_KEEP_CMD:
-                if word == "command":
-                    nxt = text[k:k + 3]
-                    if re.match(r"-[vVp]", nxt):
-                        expect = False
-            else:
-                words.add(word)
-                expect = False
-            boundary = False
-            i = j
-            continue
-        if boundary and expect and c not in "\t ":
-            expect = False if c != "!" else expect
-        boundary = False
-        i += 1
-    return words
+    if/then/elif/else/while/until/do/time/exec/command/builtin/eval. The word
+    must be exactly the identifier, bare or as one quoted piece (`"mc_job"`).
+    Not command words: arguments (of `type`, `declare -f`, `command -v`,
+    `hash`, `unset`, ...), the operand of a redirection, a `case` pattern, the
+    contents of `(( ))` and of an array literal, a longer word (`mc_job"x"`,
+    `mc_job/x`), single-quoted text and the name in a `name() {` /
+    `function name {` declaration. Launchers (`xargs`, `find -exec`, `sudo`,
+    `env`, `timeout`, `coproc`, `command -p`), a function passed by name and a
+    `$( )` nested inside `$(( ))` are not seen."""
+    return {cmd.words[0].ident for cmd in _sh_parse(text)[0] if cmd.words and cmd.words[0].ident}
 
 
 
