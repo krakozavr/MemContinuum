@@ -3090,6 +3090,21 @@ class TestUndoReceipts(BindCase):
                          ("src/foo.py", "remove"))
         self.assertEqual(len(self.receipts()), 1)
 
+    def test_a_failed_hash_in_the_clean_tree_check_refuses_as_unavailable(self):
+        before, after, other = self._unrelated_commit_over_a_bind(committed_b=True)
+        real = memidx._blob_oid
+        # only the worktree bytes fail to hash; the earlier undo_plan hash (A) passes
+
+        def flaky(store, data):
+            return None if data == other else real(store, data)
+
+        with mock.patch.object(memidx, "_blob_oid", side_effect=flaky):
+            rc, out, err = self.unbind()
+        self.assertEqual(rc, 1, (out, err))
+        self.assertIn("git state unavailable for topics/foo.md (hash-object); nothing written", err)
+        self.assertNotIn("--discard", err)
+        self.assertEqual((self.raw(), len(self.receipts())), (other, 1))
+
     def test_a_clean_tree_drops_a_receipt_whose_before_image_is_still_in_a_commit(self):
         before, after, other = self._unrelated_commit_over_a_bind(committed_b=True)
         rc, out, err = self.unbind()

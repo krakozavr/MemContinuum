@@ -13193,13 +13193,14 @@ class _UndoScope:
 
 
 def _clean_and_before_committed(scope: "_UndoScope", receipt: "_Receipt", current: bytes,
-                                committed: dict, staged: dict) -> bool:
+                                committed: dict, staged: dict) -> bool | None:
     """True when a receipt whose committed baseline has moved on may be dropped
     without a loss: the topic's bytes and its stage-zero index entry both equal
     HEAD's entry (compared by raw blob identity), AND the receipt's before-image
     is the very blob its recorded baseline holds, so that image is still in a
     commit. A before-image that was never committed (an unstaged edit on top of
-    the baseline) stays in the receipt."""
+    the baseline) stays in the receipt. None when a hash probe is unavailable
+    (the caller refuses as unavailable)."""
     base = receipt.committed
     if (committed.get("kind") != "entry" or committed["mode"] not in _FILE_MODES
             or base.get("kind") != "entry"):
@@ -13207,8 +13208,10 @@ def _clean_and_before_committed(scope: "_UndoScope", receipt: "_Receipt", curren
     if (staged.get("kind") != "entry" or staged.get("stage") != 0
             or (staged["mode"], staged["oid"]) != (committed["mode"], committed["oid"])):
         return False
-    return (_blob_oid(scope.store, current) == committed["oid"]
-            and _blob_oid(scope.store, receipt.before) == base["oid"])
+    now, earlier = _blob_oid(scope.store, current), _blob_oid(scope.store, receipt.before)
+    if now is None or earlier is None:
+        return None
+    return now == committed["oid"] and earlier == base["oid"]
 
 
 def undo_plan(scope: "_UndoScope", current: bytes, command: str | None, ref: str | None) -> tuple:
@@ -13279,7 +13282,10 @@ def undo_plan(scope: "_UndoScope", current: bytes, command: str | None, ref: str
         if not matches:
             return "none", None, None, notes
         if _norm_committed(committed) != _norm_committed(top.committed):
-            if _clean_and_before_committed(scope, top, current, committed, staged):
+            clean = _clean_and_before_committed(scope, top, current, committed, staged)
+            if clean is None:
+                return "refuse", top, _unavailable_problem(topic, ("hash-object", None)), notes
+            if clean:
                 scope.drop(top)  # the tree is clean and B is still in a commit: nothing is lost
                 return "none", None, None, notes
             return "refuse", top, (
