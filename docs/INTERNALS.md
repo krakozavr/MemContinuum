@@ -3758,9 +3758,14 @@ receipt means the ordinary path. A receipt authorises restoring B only; it never
 anything that is not in B.
 
 Writers serialize on one `flock`ed lock file per topic next to the stack
-(`_UndoScope.locked`); `apply_topic_edit(scope=...)` re-reads the topic under the lock and
-refuses (`TopicEditRefused`, nothing written) unless it still equals the image the command
-read. `mark-standing` calls `apply_topic_edit` without a scope and is unchanged. A store
+(`_UndoScope.locked`), and the stack changes only inside it: pruning a stale or malformed
+receipt, the undo decision, recording and dropping. An undo is one critical section (re-read
+the topic, `undo_plan` on those bytes, restore B, drop the receipt); an ordinary edit takes
+the lock to plan and prune, releases it to capture the anchor and generate the mark, then
+takes it again, re-reads the topic and refuses (`TopicEditRefused`, nothing written) unless
+it still equals the image the command read, records the receipt and replaces the topic. The
+committed and staged entries and the topic bytes are read once more immediately before an
+undo replaces the file, because the lock does not serialize external git commands. `mark-standing` calls `apply_topic_edit` without a scope and is unchanged. A store
 outside git has no receipts. `undo-binding TOP-xxxx [--list]` shows the stack (newest
 first, nothing changed) or runs the same `undo_plan` / restore for the latest receipt.
 

@@ -12976,6 +12976,9 @@ class _UndoScope:
         self.topic_id = topic_id
         self.dry = dry
         self._dropped: set = set()  # receipts dropped by this command (also under dry-run)
+        self._held = False  # True inside `locked()`: the only place the stack may change
+        self.invalid: list = []  # unreadable receipt files seen by the last `stack()` scan
+        self.max_seq = 0  # the highest sequence number on disk at the last scan, valid or not
         try:
             self.rel = Path(os.path.realpath(topic_path)).relative_to(self.store).as_posix()
         except ValueError:
@@ -12997,8 +13000,10 @@ class _UndoScope:
         return _committed_state(self.store, self.rel), _staged_state(self.store, self.rel)
 
     def stack(self) -> list:
-        """The valid receipts, oldest first; a malformed or legacy file
-        authorises nothing and is removed."""
+        """The valid receipts, oldest first. A malformed or legacy file
+        authorises nothing; it is only noted in `self.invalid` -- the scan never
+        changes the directory, `prune_invalid` does that under the lock."""
+        self.invalid, self.max_seq = [], 0
         if not self.enabled:
             return []
         found = []
@@ -13013,16 +13018,22 @@ class _UndoScope:
             digits = name[len(prefix):-len(".json")]
             if not digits.isdigit():
                 continue
+            self.max_seq = max(self.max_seq, int(digits))
             if int(digits) in self._dropped:
                 continue
             parsed = _parse_receipt(self.rec_dir / name, int(digits))
             if parsed is None:
-                self._unlink(self.rec_dir / name)
+                self.invalid.append(self.rec_dir / name)
             else:
                 found.append(parsed)
         return sorted(found, key=lambda r: r.seq)
 
+    def _require_lock(self) -> None:
+        if not self._held:
+            raise RuntimeError("the receipt stack is changed only under the topic lock")
+
     def _unlink(self, path: Path) -> None:
+        self._require_lock()
         if self.dry:
             return
         try:
@@ -13030,17 +13041,33 @@ class _UndoScope:
         except OSError:
             pass
 
+    def prune_invalid(self) -> None:
+        """Remove the files the last `stack()` scan found unreadable (under the lock)."""
+        for path in self.invalid:
+            self._unlink(path)
+        self.invalid = []
+
     def drop(self, receipt: "_Receipt") -> None:
+        """Remove one receipt (under the lock)."""
+        self._require_lock()
         self._dropped.add(receipt.seq)
         self._unlink(receipt.path)
 
     @contextlib.contextmanager
     def locked(self):
         """The per-topic lock file next to the stack (`flock`, the code base's
-        lock pattern, waited for up to `_LOCK_WAIT_SECONDS`). A no-op without
-        receipts: the caller's re-read still happens."""
-        if not self.enabled:
-            yield
+        lock pattern, waited for up to `_LOCK_WAIT_SECONDS`). Every read-decide-
+        write on the stack -- pruning, the undo decision, recording, dropping --
+        happens inside it, and the caller re-reads the topic inside it. A no-op
+        without receipts (and under `--dry-run`, which changes nothing)."""
+        if self._held:
+            raise RuntimeError("the topic lock is not re-entrant")
+        if not self.enabled or self.dry:
+            self._held = True
+            try:
+                yield
+            finally:
+                self._held = False
             return
         os.makedirs(self.rec_dir, exist_ok=True)
         fd = os.open(str(self.rec_dir / (self.key + ".lock")), os.O_CREAT | os.O_RDWR, 0o666)
@@ -13054,9 +13081,11 @@ class _UndoScope:
                     if time.monotonic() >= deadline:
                         raise TopicEditRefused("another memidx command holds the topic's receipt lock; nothing written")
                     time.sleep(0.05)
+            self._held = True
             try:
                 yield
             finally:
+                self._held = False
                 fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
@@ -13077,8 +13106,9 @@ class _UndoScope:
         if staged.get("stage", 0) != 0:
             raise TopicEditRefused(f"{self.rel} is unmerged in the index (stage {staged['stage']}); "
                                    "nothing written -- resolve the conflict first")
-        stack = self.stack()
-        seq = (stack[-1].seq + 1) if stack else 1
+        self._require_lock()
+        self.stack()
+        seq = self.max_seq + 1
         data = {
             "v": RECEIPT_VERSION, "store": str(self.store), "topic_id": self.topic_id,
             "topic_path": self.rel, "committed": committed, "staged": staged,
@@ -13115,6 +13145,8 @@ def undo_plan(scope: "_UndoScope", current: bytes, command: str | None, ref: str
     notes: list = []
     if not scope.enabled:
         return "none", None, None, notes
+    scope.stack()
+    scope.prune_invalid()
     while True:
         stack = scope.stack()
         if not stack:
@@ -13181,25 +13213,26 @@ def undo_plan(scope: "_UndoScope", current: bytes, command: str | None, ref: str
     return "undo", top, None, notes
 
 
+def _edit_label(path: Path, store_root: Path) -> str:
+    try:
+        return str(path.relative_to(store_root))
+    except ValueError:
+        return str(path)
+
+
 def apply_topic_edit(path: Path, old_text: str, new_text: str, dry_run: bool, store_root: Path,
                      *, scope: "_UndoScope | None" = None, command: str | None = None,
-                     ref: str | None = None, mark: dict | None = None,
-                     undo: "_Receipt | None" = None) -> None:
+                     ref: str | None = None, mark: dict | None = None) -> None:
     """Print the exact diff; write it unless `dry_run` (atomically, see
     `_atomic_write_bytes`; `bind`, `unbind` and `mark-standing` share this
     write). Never commits.
 
     With `scope` (`bind`/`unbind`): the write is serialized by the topic's
     receipt lock and the file is re-read under it -- anything but `old_text`
-    raises `TopicEditRefused` and nothing is written. A fresh edit records its
-    receipt (`command`, `ref`, `mark`) durably first; with `undo` the write
-    restores that receipt's B, once the committed and staged entries are
-    checked again, and the receipt is dropped afterwards."""
-    try:
-        label = str(path.relative_to(store_root))
-    except ValueError:
-        label = str(path)
-    sys.stdout.write(_unified_diff(old_text, new_text, label))
+    raises `TopicEditRefused` and nothing is written. The edit records its
+    receipt (`command`, `ref`, `mark`) durably first, inside the same critical
+    section as the replacement."""
+    sys.stdout.write(_unified_diff(old_text, new_text, _edit_label(path, store_root)))
     if dry_run:
         print("dry-run: nothing written")
         return
@@ -13211,36 +13244,50 @@ def apply_topic_edit(path: Path, old_text: str, new_text: str, dry_run: bool, st
     with scope.locked():
         if Path(path).read_bytes() != old_bytes:
             raise TopicEditRefused("the topic changed while this command ran; nothing written")
-        if undo is not None:
-            committed, staged = scope.baseline()
-            if (not undo.path.exists()
-                    or _unavailable_problem(scope.rel, ("HEAD or its tree", committed), ("index", staged))
-                    or _norm_committed(committed) != _norm_committed(undo.committed)
-                    or staged != undo.staged):
-                raise TopicEditRefused("the undo receipt no longer applies (the committed or staged entry of "
-                                       f"{scope.rel} changed while this command ran); nothing written")
-            _atomic_write_bytes(path, new_bytes)
-            scope.drop(undo)
-        else:
-            scope.record(command, ref, mark, old_bytes, new_bytes)
-            _atomic_write_bytes(path, new_bytes)
+        scope.record(command, ref, mark, old_bytes, new_bytes)
+        _atomic_write_bytes(path, new_bytes)
 
 
-def _try_undo(scope: "_UndoScope", cmd: str, args, root: Path, path: Path, old_text: str,
-              command: str | None, ref: str | None) -> int | None:
-    """The shared front of `bind`, `unbind` and `undo-binding`: the exit code
-    when an undo ran or was refused, else None (the ordinary path)."""
-    kind, receipt, message, notes = undo_plan(scope, old_text.encode("utf-8"), command, ref)
-    for note in notes:
-        print(f"{cmd}: {note}")
-    if kind == "none":
-        return None
-    if kind == "refuse":
-        print(f"{cmd}: {message}", file=sys.stderr)
-        return 1
+def _restore_receipt(scope: "_UndoScope", path: Path, root: Path, current: bytes, receipt: "_Receipt",
+                     dry_run: bool) -> None:
+    """Put `receipt.before` back and drop the receipt; call it inside
+    `scope.locked()` with the bytes `undo_plan` decided on. The committed and
+    staged entries and the topic bytes are read once more immediately before
+    the replacement: the lock does not serialize external git commands."""
+    sys.stdout.write(_unified_diff(current.decode("utf-8"), receipt.before.decode("utf-8"),
+                                   _edit_label(path, root)))
+    if dry_run:
+        print("dry-run: nothing written")
+        return
+    committed, staged = scope.baseline()
+    if (_unavailable_problem(scope.rel, ("HEAD or its tree", committed), ("index", staged))
+            or _norm_committed(committed) != _norm_committed(receipt.committed)
+            or staged != receipt.staged or Path(path).read_bytes() != current):
+        raise TopicEditRefused("the undo receipt no longer applies (the topic or its committed or staged "
+                               f"entry changed while this command ran); nothing written")
+    _atomic_write_bytes(path, receipt.before)
+    scope.drop(receipt)
+
+
+def _undo_front(scope: "_UndoScope", cmd: str, args, root: Path, path: Path,
+                command: str | None, ref: str | None) -> int | None:
+    """The shared front of `bind`, `unbind` and `undo-binding`: ONE critical
+    section under the topic lock -- re-read the topic, run `undo_plan` on those
+    bytes (pruning stale receipts), and when it says undo, restore B and drop the
+    receipt. The exit code when an undo ran or was refused, else None (the
+    ordinary path)."""
     try:
-        apply_topic_edit(path, old_text, receipt.before.decode("utf-8"), args.dry_run, root,
-                         scope=scope, undo=receipt)
+        with scope.locked():
+            current = Path(path).read_bytes()
+            kind, receipt, message, notes = undo_plan(scope, current, command, ref)
+            for note in notes:
+                print(f"{cmd}: {note}")
+            if kind == "none":
+                return None
+            if kind == "refuse":
+                print(f"{cmd}: {message}", file=sys.stderr)
+                return 1
+            _restore_receipt(scope, path, root, current, receipt, args.dry_run)
     except TopicEditRefused as exc:
         print(f"{cmd}: {exc}", file=sys.stderr)
         return 1
@@ -13437,7 +13484,7 @@ def cmd_bind(args) -> int:
         print(f"bind: {reason[1]}; nothing written", file=sys.stderr)
         return 1
     scope = _UndoScope(root, path, args.topic, dry=args.dry_run)
-    undone = _try_undo(scope, "bind", args, root, path, old_text, "bind", ref)
+    undone = _undo_front(scope, "bind", args, root, path, "bind", ref)
     if undone is not None:
         return undone
     link_id = _topic_current_link(fm)
@@ -13527,7 +13574,7 @@ def cmd_unbind(args) -> int:
         print(f"unbind: {reason[1]}; nothing written", file=sys.stderr)
         return 1
     scope = _UndoScope(root, path, args.topic, dry=args.dry_run)
-    undone = _try_undo(scope, "unbind", args, root, path, old_text, "unbind", ref)
+    undone = _undo_front(scope, "unbind", args, root, path, "unbind", ref)
     if undone is not None:
         return undone
     refs_now = [r for r in fm.get("code_refs") or []]
@@ -13596,7 +13643,7 @@ def cmd_undo_binding(args) -> int:
             base = r.committed["kind"] + (f" {r.committed['oid'][:7]}" if r.committed["kind"] == "entry" else "")
             print(f"#{r.seq} {r.command} {r.ref}  baseline={base}  {r.written_at}  {r.row()}")
         return 0
-    undone = _try_undo(scope, "undo-binding", args, root, path, old_text, None, None)
+    undone = _undo_front(scope, "undo-binding", args, root, path, None, None)
     if undone is None:
         print(f"undo-binding: no undo receipt applies to {args.topic}; nothing written", file=sys.stderr)
         return 1

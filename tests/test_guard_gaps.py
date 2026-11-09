@@ -9,6 +9,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -2497,6 +2499,57 @@ class TestUndoReceipts(BindCase):
         self.assertEqual(self.fm()["code_refs"], ["src/other.py"])
         # the winner's receipt is intact and undoes exactly the winner
         self.assertUndone(self.unbind("src/other.py"), before)
+
+    def test_a_concurrent_command_cannot_prune_an_in_flight_receipt(self):
+        # gate round 1 (Sol 1, Grok 2): a second process between the receipt and the topic write must
+        # wait for the lock, not delete the receipt as a crashed write
+        before = self.head_state(refs=())
+        real = memidx._atomic_write_bytes
+        paused, release = threading.Event(), threading.Event()
+
+        def pause_on_topic(path, data, *a, **kw):
+            if Path(path).name == "foo.md":
+                paused.set()
+                release.wait(20)
+            return real(path, data, *a, **kw)
+
+        done = {}
+        env = dict(os.environ, PYTHONPATH="", MEMCONTINUUM_TRANSCRIPTS_DIR=str(self.tmp / "tr"))
+        with mock.patch.object(memidx, "_atomic_write_bytes", side_effect=pause_on_topic):
+            first = threading.Thread(target=lambda: done.update(bind=self.bind()))
+            first.start()
+            try:
+                self.assertTrue(paused.wait(20))
+                other = subprocess.Popen(
+                    [sys.executable, str(TOOLS_DIR / "memidx.py"), "unbind", "TOP-1", "src/other.py",
+                     "--root", str(self.store)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, env=env)
+                time.sleep(0.6)
+                self.assertIsNone(other.poll(), "the second command must wait for the lock")
+                self.assertEqual(len(self.receipts()), 1)
+            finally:
+                release.set()
+                first.join(30)
+            _out, err = other.communicate(timeout=30)
+        self.assertEqual(done["bind"][0], 0, done["bind"])
+        self.assertEqual(other.returncode, 0, err)
+        self.assertEqual(len(self.receipts()), 1)
+        self.assertUndone(self.unbind(), before)
+
+    def test_the_stack_changes_only_under_the_lock(self):
+        self.head_state(refs=())
+        scope = memidx._UndoScope(self.store, self.path, "TOP-1")
+        d = self.rec_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        junk = d / f"{scope.key}.00000007.json"
+        junk.write_text("{not json")
+        self.assertEqual(scope.stack(), [])
+        self.assertTrue(junk.exists())  # reading never prunes
+        with self.assertRaises(RuntimeError):
+            scope.prune_invalid()
+        with scope.locked():
+            scope.prune_invalid()
+        self.assertFalse(junk.exists())
 
     def test_a_held_lock_refuses_without_writing(self):
         before = self.head_state(refs=())
