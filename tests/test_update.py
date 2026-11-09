@@ -4647,6 +4647,37 @@ class TestHelp(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
 
+class TestMemidxNeedsItsSiblingModules(unittest.TestCase):
+    """memidx.py imports mc_text.py and mc_reuse.py at module load; a copy
+    that lacks either exits non-zero with ONE message naming both."""
+
+    MESSAGE = "memidx.py needs mc_text.py and mc_reuse.py beside it -- incomplete checkout"
+
+    def run_copy(self, omit):
+        d = Path(tmpdir(self, "memidx-sibling-"))
+        for name in ("memidx.py", "mc_text.py", "mc_reuse.py", "memlint.py"):
+            if name != omit:
+                shutil.copy(TOOLS_DIR / name, d / name)
+        shutil.copytree(TOOLS_DIR / "chunkers", d / "chunkers", ignore=shutil.ignore_patterns("__pycache__"))
+        return subprocess.run([sys.executable, str(d / "memidx.py"), "--help"], capture_output=True, text=True,
+                              cwd=str(d), env={**os.environ, "PYTHONPATH": ""})
+
+    def test_a_copy_without_mc_reuse_exits_with_the_incomplete_checkout_message(self):
+        r = self.run_copy("mc_reuse.py")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn(self.MESSAGE, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_a_copy_without_mc_text_exits_with_the_same_message(self):
+        r = self.run_copy("mc_text.py")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn(self.MESSAGE, r.stderr)
+
+    def test_a_complete_copy_runs(self):
+        r = self.run_copy(None)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
 

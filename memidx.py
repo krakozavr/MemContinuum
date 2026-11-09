@@ -3463,8 +3463,16 @@ FTS_STEP_ASIDE_COVERAGE = 0.25
 # ~9,000-line module from a hook one-liner. Re-exported here, not copied --
 # `memidx._content_terms is mc_text._content_terms` (see tests/test_bench.py)
 # -- every existing caller in this file keeps working unchanged.
-from mc_text import _STOPWORDS, _CONTENT_TOKEN_RE, _content_terms  # noqa: E402
-import mc_reuse  # noqa: E402  (the reuse inventory: context-pack lists its rows)
+# mc_text.py and mc_reuse.py (the reuse inventory: context-pack lists its rows) sit beside
+# this file; a copy of it without them dies here with ONE message naming both, the same
+# wording family as scripts/mc-list-lib.sh's sourcing error, not a bare ModuleNotFoundError.
+try:
+    from mc_text import _STOPWORDS, _CONTENT_TOKEN_RE, _content_terms  # noqa: E402
+    import mc_reuse  # noqa: E402
+except ModuleNotFoundError as _sibling_exc:
+    if _sibling_exc.name not in ("mc_text", "mc_reuse"):
+        raise
+    sys.exit("memidx.py needs mc_text.py and mc_reuse.py beside it -- incomplete checkout")
 
 
 def _fts_top_hit_coverage(conn, project: str, query: str, top_fts_path: str) -> float | None:
