@@ -616,8 +616,8 @@ handful of real turns into double their number.
 `ledger-post-edit.sh` itself has two further exceptions to "exactly one
 `outcome=` line". A read-only built-in (`Read`, `Grep`, ...) or a harness-side tool
 (`SubagentHandback`, `SendMessage`, `Monitor`, ...) is caught by the
-prefilter before the watchdog and writes nothing at all — no line, no
-process spawned. The shell-diff branch (`Bash`, or any tool with no
+prefilter before the watchdog and writes nothing at all — no line, and no
+Python, watchdog or Git process (the hook has run only `dirname` and `cat`). The shell-diff branch (`Bash`, or any tool with no
 dedicated branch) can write several lines in one run: one
 `outcome=appended kind=<code|store> source=shell-diff` per path the tree
 diff found changed, always followed by exactly one summary line,
