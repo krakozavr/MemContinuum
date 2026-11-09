@@ -3054,6 +3054,27 @@ class TestUndoReceipts(BindCase):
         self.assertEqual(rc, 0, err)
         self.assertEqual((self.raw(), len(self.receipts())), (mid, 1))
 
+    def test_a_filter_on_the_topic_path_makes_a_committed_bind_refuse_with_the_way_out(self):
+        # gate round 2 (Sol Q2): the committed blob is the filtered content, never the raw after-image
+        before = self.head_state(refs=())
+        (self.store / ".gitattributes").write_text("topics/*.md filter=pad\n")
+        git(["config", "filter.pad.clean", "sed -e 's/$/ /'"], self.store)
+        git(["config", "filter.pad.smudge", "cat"], self.store)
+        self.assertEqual(self.bind()[0], 0)
+        after = self.raw()
+        git(["add", "topics/foo.md"], self.store)
+        git(["commit", "-q", "-m", "bind, filtered"], self.store)
+        self.assertNotEqual(git(["rev-parse", "HEAD:topics/foo.md"], self.store).stdout.strip(),
+                            memidx._blob_oid(self.store, after))
+        rc, out, err = self.unbind()
+        self.assertEqual(rc, 1, (out, err))
+        self.assertIn("does not contain it", err)
+        self.assertNotIn("committed history", out)
+        self.assertIn("undo-binding TOP-1 --discard", err)
+        self.assertEqual((self.raw(), len(self.receipts())), (after, 1))
+        self.assertEqual(run_memidx(["undo-binding", "TOP-1", "--discard", "--root", str(self.store)])[0], 0)
+        self.assertEqual(self.receipts(), [])
+
     def test_a_retry_after_a_failed_directory_initialisation_fsyncs_the_whole_chain(self):
         # gate round 2 (Sol 2): directories left by the failed attempt are not skipped
         before = self.head_state(refs=())
