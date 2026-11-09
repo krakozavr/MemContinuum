@@ -4090,6 +4090,19 @@ class TestPreCommitAppendOnlyHook(unittest.TestCase):
                 self.assertIn("rc=2 engine-failure refused", log_text)
                 self.assertNotIn("override=1", log_text)
 
+    def test_config_sh_cannot_set_or_clear_the_captured_override(self):
+        """TOP-0137 L32 (gate round 2): the captured copy is readonly, so a
+        sourced config.sh assigning it neither enables a bypass nor clears an
+        operator's real override."""
+        proc, log_text = self._run_with_stub_that_exits_2(config_sh="MC_PC_OVERRIDE_IN=1\n")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("rc=2 engine-failure refused", log_text)
+        self.assertNotIn("override=1", log_text)
+        proc, log_text = self._run_with_stub_that_exits_2(
+            {"MC_STORE_LINT_ALLOW_ENGINE_FAILURE": "1"}, config_sh="MC_PC_OVERRIDE_IN=\n")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("skipped=engine-failure override=1", log_text)
+
     def test_the_override_in_the_environment_wins_over_a_config_sh_without_it(self):
         proc, log_text = self._run_with_stub_that_exits_2(
             {"MC_STORE_LINT_ALLOW_ENGINE_FAILURE": "1"}, config_sh="# nothing\n")

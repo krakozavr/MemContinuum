@@ -81,6 +81,7 @@ set -u
 # any `source` (the watchdog library sources config.sh, whose assignments must
 # not be able to enable it); the decision below uses only this private copy.
 MC_PC_OVERRIDE_IN="${MC_STORE_LINT_ALLOW_ENGINE_FAILURE:-}"
+readonly MC_PC_OVERRIDE_IN
 export PYTHONPATH=
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
