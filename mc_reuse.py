@@ -47,6 +47,7 @@ METHODS = ("name_owner", "exact_copy", "token_owner", "delegation", "vocab_owner
 ROW_FIELDS = ("id", "job", "policy", "implementation", "contract", "why_single", "related_paths",
               "variants", "guards", "coverage_limit", "evidence", "test")
 TOP_FIELDS = ("schema_version", "scan_roots", "exclusions", "rows")
+OPTIONAL_TOP_FIELDS = ("tests_dir",)    # null: this inventory has no tests directory to resolve test ids in
 INVENTORY_RELPATH = "docs/REUSE-INVENTORY.json"
 
 _INTERP = r"(?:python[\w.]*|\$\{?\w*PY\w*\}?)"
@@ -94,8 +95,11 @@ def validate_schema(inv: dict) -> list:
         if k not in inv:
             errs.append(f"inventory: missing top-level field {k!r}")
     for k in inv:
-        if k not in TOP_FIELDS:
+        if k not in TOP_FIELDS and k not in OPTIONAL_TOP_FIELDS:
             errs.append(f"inventory: unknown top-level field {k!r}")
+    if "tests_dir" in inv and inv["tests_dir"] is not None:
+        errs.append("inventory: tests_dir, when present, must be null (the inventory declares it has no tests "
+                    "directory); omit it to have every row's test id resolved under tests/")
     if inv.get("schema_version") != SCHEMA_VERSION:
         errs.append(f"inventory: schema_version must be {SCHEMA_VERSION}, got {inv.get('schema_version')!r}")
     if not _is_str_list(inv.get("scan_roots")) or not inv.get("scan_roots"):
@@ -188,7 +192,7 @@ def _validate_guard_params(label, method, params) -> list:
         "name_owner": {"pattern", "allow"},
         "exact_copy": set(),
         "token_owner": {"pattern", "paths"},
-        "delegation": {"consumers", "refs", "forbid"},
+        "delegation": {"consumers", "refs", "forbid", "aliases"},
         "vocab_owner": set(),
     }[method]
     for k in params:
@@ -202,7 +206,7 @@ def _validate_guard_params(label, method, params) -> list:
                 errs.append(f"{label}: pattern is not a valid regular expression")
     if method == "token_owner" and "pattern" not in params:
         errs.append(f"{label}: needs a pattern")
-    for k in ("allow", "paths", "refs"):
+    for k in ("allow", "paths", "refs", "aliases"):
         if k in params and not _is_str_list(params[k]):
             errs.append(f"{label}: {k} must be a list of strings")
     if "allow" in params and _is_str_list(params["allow"]):
@@ -923,8 +927,17 @@ def _def_ref(d: Definition) -> str:
 
 def _guard_name_owner(scan, row, owner, params):
     pat = re.compile(params.get("pattern") or ("^" + re.escape(owner.name) + "$"))
-    exempt = _variant_syms(row) | set(params.get("allow", []))
     out = []
+    if not pat.search(owner.name):
+        # a pattern that does not match its own owner protects nothing
+        out.append(f"the name pattern {pat.pattern!r} does not match the owner's name {owner.name!r} "
+                   f"({_def_ref(owner)}); it would guard nothing")
+    allow = list(params.get("allow", []))
+    for a in allow:
+        _, aerr = resolve_symbol(scan, a)
+        if aerr:
+            out.append(f"allow entry {aerr}")
+    exempt = _variant_syms(row) | set(allow)
     for d in scan.defs:
         if d is owner or not pat.search(d.name):
             continue
@@ -1018,6 +1031,16 @@ def _guard_delegation(scan, row, owner, params):
     forbid = [re.compile(f) for f in params.get("forbid", [])]
     by_value = owner.kind == "const"
     out = []
+    declared = {owner.name} | set(params.get("aliases", []))
+    variant_names = {_split_ref(v)[1].split(".")[-1] for v in _variant_syms(row)}
+    for al in params.get("aliases", []):
+        if al not in variant_names:
+            out.append(f"alias {al!r} is not the name of one of the row's variants "
+                       f"({', '.join(sorted(variant_names)) or 'none'}); an alias is an adapter the row declares")
+    for r in sorted(refs - declared):
+        out.append(f"ref {r!r} is neither the owner's name {owner.name!r} nor a declared alias "
+                   f"(aliases: {', '.join(sorted(params.get('aliases', []))) or 'none'}); the check would "
+                   "accept an unrelated call")
     for cons in params["consumers"]:
         path, sym = _split_ref(cons)
         if path not in scan.files:
@@ -1113,8 +1136,8 @@ _GUARDS = {
 def _resolve_test_id(root: Path, test: str):
     """Error text when the guard test identifier does not resolve, else None."""
     parts = test.split(".")
-    if len(parts) < 3 or parts[0] != "tests":
-        return f"test {test!r} must be tests.<module>.<Class>[.<method>]"
+    if len(parts) < 3 or len(parts) > 4 or parts[0] != "tests":
+        return f"test {test!r} must be tests.<module>.<Class>[.<method>] (nothing after the method)"
     f = root / "tests" / f"{parts[1]}.py"
     if not f.is_file():
         return f"test {test!r}: {f.relative_to(root)} does not exist"
@@ -1148,7 +1171,11 @@ def check_inventory(root, inv: dict | None = None, scan: Scan | None = None, che
     if not scan.defs:
         findings.append("scan: the scan roots matched no definitions (empty scan); check scan_roots and exclusions")
     if check_tests is None:
-        check_tests = (root / "tests").is_dir()
+        check_tests = inv.get("tests_dir", "tests") is not None
+    if check_tests and not (root / "tests").is_dir():
+        findings.append("tests directory missing: the rows' test ids cannot be resolved (set `tests_dir: null` "
+                        "in the inventory to say it has none)")
+        check_tests = False
     for row in inv["rows"]:
         rid = row["id"]
         owner, err = resolve_symbol(scan, row["implementation"])

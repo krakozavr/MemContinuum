@@ -4046,7 +4046,10 @@ deliberate multiplicity: members listed in `variants`, no guard) or `known_debt`
 (a temporary row: every current implementation in `variants`, the intended
 resolution in `why_single`, never guarded and always rendered as "KNOWN DEBT, not
 guarded"). The top level carries `schema_version`, `scan_roots` and
-`exclusions` once, not per row; tests, fixtures, benchmark corpora, documentation,
+`exclusions` once, not per row, and may carry `tests_dir: null` to say the
+inventory has no tests directory (otherwise a root without `tests/` fails with
+"tests directory missing" and every `test` id must resolve to a class and at most
+one method); tests, fixtures, benchmark corpora, documentation,
 the store, caches and vendored code are outside the scan.
 
 **The scan.** Python definitions (functions, methods, nested functions, module
@@ -4066,10 +4069,10 @@ is reported rather than skipped.
 
 | method | rejects | misses |
 |---|---|---|
-| `name_owner` | another definition (function or constant, any language in scope, embedded payloads included) whose simple name matches the owner's name pattern (default: the owner's exact name) | a copy under another name |
+| `name_owner` | another definition (function or constant, any language in scope, embedded payloads included) whose simple name matches the owner's name pattern (default: the owner's exact name). The pattern must match the owner's own name and every `allow` entry must resolve, or the row fails | a copy under another name |
 | `exact_copy` | a function whose normalised body equals the owner's: its own name, docstring, locations and consistently renamed local bindings are ignored; literals, attributes, operators, decorators and external dependencies are kept. Shell: comments, indentation, spacing and `local` names are normalised | a structural rewrite; tiny helpers can collide, so enable it per row after checking |
 | `token_owner` | a second unit (an outermost function, a method, or a file's residual code) whose executable text contains the owner's construct; owners are counted, not occurrences, and a stale pattern (the owner no longer holds it) fails too. `paths` narrows the units considered | the construct built from pieces; text in comments or docstrings is deliberately not matched |
-| `delegation` | a named consumer that does not reference the owner (`refs`), or that contains a `forbid` pattern (a direct call that bypasses it) | consumers that are not named |
+| `delegation` | a named consumer that does not EXECUTE the owner, or that contains a `forbid` pattern (a direct call that bypasses it). Executed means a shell command word (the first word of a simple command, after assignments, `$( )`, backticks, pipes, `&&`, `||`, `;`, `!`, `if`/`then`/`do` and the like) or a Python call (`f(...)`, `x.f(...)`); a comment, a `type` probe, a bare import or a quoted string is a mention and does not count. A constant owner is reached by a value reference instead. `refs` must be the owner's name or an `aliases` entry, and an alias must be the name of one of the row's variants | consumers that are not named; a call to the owner placed beside an inline copy of the job (a `forbid` pattern is what catches that) |
 | `vocab_owner` | a literal set, tuple or list of strings equal to the owner's vocabulary anywhere else (variants are exempt by name) | a vocabulary built in code, or a different subset |
 
 **Adding a row.** Find the existing implementation first and name it (code-search),

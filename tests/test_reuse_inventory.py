@@ -459,7 +459,8 @@ def _row(**over):
 
 
 def _inv(*rows, **over):
-    inv = {"schema_version": 1, "scan_roots": ["."], "exclusions": ["tests"], "rows": list(rows)}
+    inv = {"schema_version": 1, "scan_roots": ["."], "exclusions": ["tests"], "tests_dir": None,
+           "rows": list(rows)}
     inv.update(over)
     return inv
 
@@ -548,15 +549,90 @@ class TestSchema(unittest.TestCase):
     def test_unresolvable_test_identifier_is_reported(self):
         root = _mini(self, {"a.py": "def f():\n    pass\n", "tests/test_x.py": "class TestA:\n    def test_one(self):\n        pass\n"})
         ok = _row(test="tests.test_x.TestA.test_one")
-        self.assertEqual(mc_reuse.check_inventory(root, _inv(ok)), [])
-        for bad in ("tests.test_x.Nope", "tests.test_missing.TestA", "tests.test_x.TestA.nope", "test_x"):
-            found = mc_reuse.check_inventory(root, _inv(_row(test=bad)))
+        inv = _inv(ok)
+        del inv["tests_dir"]
+        self.assertEqual(mc_reuse.check_inventory(root, inv), [])
+        for bad in ("tests.test_x.Nope", "tests.test_missing.TestA", "tests.test_x.TestA.nope", "test_x",
+                    "tests.test_x.TestA.test_one.not_a_test"):
+            inv = _inv(_row(test=bad))
+            del inv["tests_dir"]
+            found = mc_reuse.check_inventory(root, inv)
             self.assertTrue(any("test " in f for f in found), (bad, found))
 
     def test_unknown_related_path_is_reported(self):
         root = _mini(self, {"a.py": "def f():\n    pass\n"})
         found = mc_reuse.check_inventory(root, _inv(_row(related_paths=["nowhere/*.py"])))
         self.assertTrue(any("matches nothing" in f for f in found), found)
+
+
+class TestValidationHoles(unittest.TestCase):
+    """A row that guards nothing, or names something that does not resolve, is an error."""
+
+    def check(self, files, row, **over):
+        root = _mini(self, files)
+        return mc_reuse.check_inventory(root, _inv(row, **over), check_tests=False)
+
+    def test_name_pattern_that_does_not_match_its_owner_fails_with_both_names(self):
+        row = _row(guards=[{"method": "name_owner", "params": {"pattern": "^symbol_that_does_not_exist$"}}])
+        f = self.check({"a.py": "def f():\n    pass\n"}, row)
+        self.assertEqual(len(f), 1, f)
+        self.assertIn("'^symbol_that_does_not_exist$'", f[0])
+        self.assertIn("'f'", f[0])
+        self.assertIn("does not match the owner's name", f[0])
+
+    def test_matching_name_pattern_and_default_pattern_are_fine(self):
+        for params in ({"pattern": "^_?f$"}, {}):
+            row = _row(guards=[{"method": "name_owner", "params": params}])
+            self.assertEqual(self.check({"a.py": "def f():\n    pass\n"}, row), [], params)
+
+    def test_unresolved_allow_entry_is_an_error_not_a_silent_no_op(self):
+        row = _row(guards=[{"method": "name_owner", "params": {"allow": ["missing.py#missing"]}}])
+        f = self.check({"a.py": "def f():\n    pass\n"}, row)
+        self.assertEqual(len(f), 1, f)
+        self.assertIn("allow entry", f[0])
+        self.assertIn("missing.py#missing", f[0])
+        good = _row(guards=[{"method": "name_owner", "params": {"pattern": "^[fg]$", "allow": ["a.py#g"]}}])
+        self.assertEqual(self.check({"a.py": "def f():\n    pass\n\ndef g():\n    pass\n"}, good), [])
+
+    def test_delegation_ref_must_be_the_owner_or_a_declared_alias(self):
+        files = {"a.py": "def f(x):\n    return x\n", "c.py": "def g(t):\n    return t.read_text()\n"}
+        row = _deleg_row(["c.py"], refs=["read_text"])
+        f = self.check(files, row)
+        self.assertTrue(any("ref 'read_text' is neither the owner's name 'f' nor a declared alias" in x
+                            for x in f), f)
+
+    def test_delegation_alias_must_be_a_variant_of_the_row(self):
+        files = {"a.py": "def f(x):\n    return x\n", "c.py": "def g(t):\n    return t.read_text()\n"}
+        f = self.check(files, _deleg_row(["c.py"], refs=["read_text"], aliases=["read_text"]))
+        self.assertTrue(any("alias 'read_text' is not the name of one of the row's variants" in x for x in f), f)
+
+    def test_declared_alias_is_accepted(self):
+        files = {"a.py": "def f(x):\n    return x\n\ndef f_wrap(x):\n    return f(x)\n",
+                 "c.py": "from a import f_wrap\n\ndef g(t):\n    return f_wrap(t)\n"}
+        row = _deleg_row(["c.py"], refs=["f", "f_wrap"], aliases=["f_wrap"])
+        row["variants"] = [{"symbol": "a.py#f_wrap", "contract": "c", "reason": "adapter"}]
+        self.assertEqual(self.check(files, row), [])
+
+    def test_test_id_with_trailing_components_is_rejected(self):
+        root = _mini(self, {"a.py": "def f():\n    pass\n",
+                            "tests/test_x.py": "class TestA:\n    def test_one(self):\n        pass\n"})
+        inv = _inv(_row(test="tests.test_x.TestA.test_one.not_a_test"))
+        del inv["tests_dir"]
+        f = mc_reuse.check_inventory(root, inv)
+        self.assertTrue(any("nothing after the method" in x for x in f), f)
+
+    def test_missing_tests_directory_fails_unless_the_inventory_says_it_has_none(self):
+        root = _mini(self, {"a.py": "def f():\n    pass\n"})
+        inv = _inv(_row())
+        del inv["tests_dir"]
+        f = mc_reuse.check_inventory(root, inv)
+        self.assertTrue(any("tests directory missing" in x for x in f), f)
+        self.assertEqual(mc_reuse.check_inventory(root, _inv(_row())), [])            # tests_dir: null
+        self.assertEqual(mc_reuse.check_inventory(root, inv, check_tests=False), [])  # explicit per-call flag
+
+    def test_tests_dir_other_than_null_is_a_schema_error(self):
+        errs = mc_reuse.validate_schema(_inv(_row(), tests_dir="tests"))
+        self.assertTrue(any("tests_dir" in e for e in errs), errs)
 
 
 class TestScanner(unittest.TestCase):

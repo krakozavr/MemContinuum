@@ -490,6 +490,10 @@
             ],
             "forbid": [
               "yaml\\.(?:safe_)?load"
+            ],
+            "aliases": [
+              "parse_record_raw",
+              "parse_record"
             ]
           }
         }
