@@ -53,7 +53,6 @@ OPTIONAL_TOP_FIELDS = ("tests_dir",)    # null: this inventory has no tests dire
 INVENTORY_RELPATH = "docs/REUSE-INVENTORY.json"
 
 _INTERP = r"(?:python[\w.]*|\$\{?\w*PY\w*\}?)"
-_PY_HEREDOC_LINE_RE = re.compile(r"(?i)\"?" + _INTERP + r"\"?\s+-(?:\s|<)")
 _PY_INLINE_RE = re.compile(r"(?i)\"?" + _INTERP + r"\"?\s+(?:-\w+\s+)*-c\s+'")
 _SH_DECL_RE = re.compile(
     r"^(?P<indent>[ \t]*)(?:function[ \t]+(?P<fname>[A-Za-z_]\w*)[ \t]*(?:\([ \t]*\))?"
@@ -498,52 +497,29 @@ def _scan_python(scan, rel, text, line_offset, embedded, prefix):
 
 # -- shell -------------------------------------------------------------------
 
-def _strip_shell_comment(line: str) -> str:
-    """`line` without a trailing `#` comment (quote-aware, backslash-aware)."""
-    sq = dq = False
-    i = 0
-    n = len(line)
-    while i < n:
-        c = line[i]
-        if c == "\\" and not sq:
-            i += 2
-            continue
-        if c == "'" and not dq:
-            sq = not sq
-        elif c == '"' and not sq:
-            dq = not dq
-        elif c == "#" and not sq and not dq and (i == 0 or line[i - 1] in " \t;&|(){}"):
-            return line[:i].rstrip()
-        i += 1
-    return line
-
-
-def _sh_interpreter_starts(cmds) -> list:
-    """The offsets of the word that names the program of each parsed command:
-    its first word, or the one after `env` and its `VAR=value` arguments."""
-    out = []
-    for cmd in cmds:
-        k = 0
-        if cmd.words and cmd.words[0].text == "env":
-            k = 1
-            while k < len(cmd.words) and _SH_ASSIGN_RE.match(cmd.words[k].raw):
-                k += 1
-        if k < len(cmd.words):
-            out.append(cmd.words[k].start)
-    return out
+def _sh_interpreter(cmd):
+    """The index in `cmd.words` of the word that names the program of a parsed
+    command -- its first word, or the one after `env` and its `VAR=value`
+    arguments -- or None."""
+    k = 0
+    if cmd.words and cmd.words[0].text == "env":
+        k = 1
+        while k < len(cmd.words) and _SH_ASSIGN_RE.match(cmd.words[k].raw):
+            k += 1
+    return k if k < len(cmd.words) else None
 
 
 def _mask_shell(text: str):
-    """`(masked_lines, payloads, problems)`: the file's lines with heredoc bodies
-    and python `-c '...'` payload bodies blanked (line numbers preserved), the
-    extracted python payloads as `(first_line_number, source)`, and the
-    `(line_number, message)` problems found (an unterminated heredoc). The whole
-    text is parsed once (`_sh_parse` with bodies=True), so a quote opened on one
-    line is still open on the next and a `<<` or an interpreter name inside it
-    is text."""
+    """`(masked_lines, payloads, problems)`: the file's lines with comments,
+    heredoc bodies and python `-c '...'` payload bodies blanked (line numbers
+    preserved), the extracted python payloads as `(first_line_number, source)`,
+    and the `(line_number, message)` problems found (an unterminated heredoc).
+    The whole text is parsed once (`_sh_parse` with bodies=True) and every span
+    masked here -- comment, heredoc body, payload -- is a span that parse
+    reports, so a quote opened on one line is still open on the next, and a
+    `#`, a `<<` or an interpreter name inside it is text."""
     lines = text.split("\n")
     n = len(lines)
-    keep = [True] * n
     payloads = []
     problems = []
     offsets = []
@@ -555,71 +531,65 @@ def _mask_shell(text: str):
     def line_of(off):
         return bisect.bisect_right(offsets, off) - 1
 
-    cmds, heredocs = _sh_parse(text, True)
-    # an interpreter is recognised as a command word only (after assignments, exec, env): a quoted
-    # `python3 -c '...'` argument or a quoted `<<` is text
-    starts = _sh_interpreter_starts(cmds)
-    by_line = {}
-    for st in starts:
-        by_line.setdefault(line_of(st), []).append(st)
+    cmds, heredocs, comments = _sh_parse(text, True)
+    edits = []      # (start, end, replacement): spans of `text` to rewrite; a replacement keeps the newlines
+    for s0, e0 in comments:                 # a comment goes, with the blanks before it
+        while s0 > 0 and text[s0 - 1] in " \t":
+            s0 -= 1
+        edits.append((s0, e0, ""))
     # heredocs: blank body and terminator; a python heredoc body is a payload
-    seen_lines = set()
+    seen_cmds = set()
     for rec in heredocs:
-        li = line_of(rec.op)
-        first = li not in seen_lines
-        seen_lines.add(li)
+        first = rec.cmd is None or id(rec.cmd) not in seen_cmds
+        if rec.cmd is not None:
+            seen_cmds.add(id(rec.cmd))
         if rec.closed is False:
+            li = line_of(rec.op)
             problems.append((li + 1, f"unterminated heredoc: `<<{'-' if rec.dash else ''}{rec.tag}` opened here is "
                                      f"never closed by a line holding `{rec.tag}`; the scanner cannot tell code "
                                      "from data after it"))
         if not rec.closed:
             continue
         sb, tl = line_of(rec.body), line_of(rec.term)
-        if first and any(_PY_HEREDOC_LINE_RE.match(text, st, rec.op) for st in by_line.get(li, ()) if st < rec.op):
+        if first and rec.cmd is not None and _is_python_stdin(rec.cmd):
             body_lines = lines[sb:tl]
             if rec.dash:
                 body_lines = [bl.lstrip("\t") for bl in body_lines]   # `<<-` strips leading tabs
             payloads.append((sb + 1, "\n".join(body_lines)))
-        for k in range(sb, tl + 1):
-            keep[k] = False
-    # single-quoted `<interp> -c '...'` payload
-    i = 0
-    while i < n:
-        raw = lines[i]
-        line_end = offsets[i] + len(raw)
-        m = None
-        for st in by_line.get(i, ()):
-            m = _PY_INLINE_RE.match(text, st, line_end)
-            if m:
-                break
-        if m:
-            buf = []
-            p = m.end()
-            ok = False
-            while True:
-                q = text.find("'", p)
-                if q < 0:
-                    break
-                if text.startswith("'\\''", q):
-                    buf.append(text[p:q] + "'")
-                    p = q + 4
-                    continue
-                buf.append(text[p:q])
-                ok = True
-                break
-            if ok:
-                end_line = text.count("\n", 0, q)
-                payloads.append((i + 1, "".join(buf)))
-                for j in range(i + 1, end_line + 1):
-                    keep[j] = False
-                # the opening line keeps only the shell text before the payload
-                lines[i] = raw[:m.end() - offsets[i]] + "'"
-                i = end_line + 1
-                continue
-        i += 1
+        edits.append((offsets[sb], offsets[tl] + len(lines[tl]), "\n" * (tl - sb)))
+    # single-quoted `<interp> -c '...'` payload: the one word the parse reads after `-c`, on the interpreter's line
+    word_at = {w.start: w for cmd in cmds for w in cmd.words}
+    for cmd in cmds:
+        k = _sh_interpreter(cmd)
+        if k is None:
+            continue
+        st = cmd.words[k].start
+        li = line_of(st)
+        m = _PY_INLINE_RE.match(text, st, offsets[li] + len(lines[li]))
+        w = word_at.get(m.end() - 1) if m else None
+        if w is None or not w.plain_sq or w.end - w.start < 2 or text[w.end - 1] != "'":
+            continue
+        payloads.append((li + 1, w.text))
+        edits.append((w.start + 1, w.end - 1, "\n" * text.count("\n", w.start, w.end)))
     payloads.sort(key=lambda pl: pl[0])
-    masked = [(_strip_shell_comment(lines[k]) if keep[k] else "") for k in range(n)]
-    return masked, payloads, problems
+    out = []
+    p = 0
+    for s0, e0, repl in sorted(edits):
+        if s0 < p:
+            continue                        # inside a span already rewritten
+        out.append(text[p:s0])
+        out.append(repl)
+        p = e0
+    out.append(text[p:])
+    return "".join(out).split("\n"), payloads, problems
+
+
+def _is_python_stdin(cmd) -> bool:
+    """Is `cmd` a python interpreter reading its program from standard input
+    (`python3 -`, `"$MC_PY" -`, after `env` and assignments)? Its heredoc body is then python."""
+    k = _sh_interpreter(cmd)
+    return (k is not None and k + 1 < len(cmd.words) and cmd.words[k + 1].raw == "-"
+            and re.fullmatch(r'(?i)"?' + _INTERP + '"?', cmd.words[k].raw) is not None)
 
 
 def _scan_shell(scan, rel, text):
@@ -748,6 +718,7 @@ class _ShHeredoc:
     term: int = -1
     end: int = -1
     closed: object = None
+    cmd: object = None  # the simple command this operator belongs to (None: a bare redirection)
 
 
 @functools.lru_cache(maxsize=64)
@@ -768,6 +739,7 @@ def _sh_parse(text: str, bodies: bool = False):
     heredocs = []
     closers = []        # the closer of each open parse_seq: a backtick ends a word inside a backtick substitution
     pending = []        # heredocs whose body starts at the next newline (bodies=True)
+    comments = []       # (start, end) of each `#` comment outside quotes (bodies=True)
     cont = []           # offsets of the backslash-newlines the reader dropped outside single quotes, in order
 
     def joined(a, b):   # text[a:b] without those continuations: the word as bash joins it
@@ -986,11 +958,16 @@ def _sh_parse(text: str, bodies: bool = False):
         cases = []              # open `case`s: 'hdr' (before `in`), 'pat' (patterns), 'body' (commands)
         words = []
         assigns = []
+        own_heredocs = []       # the `<<` operators seen in the simple command being read
 
         def end_cmd():
             nonlocal words, assigns, swallow, redir, after_command
             if words:
-                cmds.append(_ShCmd(tuple(words), tuple(assigns)))
+                cmd = _ShCmd(tuple(words), tuple(assigns))
+                cmds.append(cmd)
+                for rec in own_heredocs:
+                    rec.cmd = cmd
+            own_heredocs.clear()
             words, assigns = [], []
             swallow = redir = after_command = False
 
@@ -1004,7 +981,9 @@ def _sh_parse(text: str, bodies: bool = False):
                 continue
             if c == "#" and bodies:
                 j = text.find("\n", i)
-                i = n if j < 0 else j
+                j = n if j < 0 else j
+                comments.append((i, j))
+                i = j
                 continue
             if c == closer and not (closer == ")" and cases and cases[-1] == "pat"):
                 end_cmd()
@@ -1022,6 +1001,7 @@ def _sh_parse(text: str, bodies: bool = False):
                     if re.fullmatch(r"(?:\d+|\{\w+\})?<<-?", m.group(0)):       # not the here-string `<<<`
                         hd_wait = _ShHeredoc(text.index("<<", i), m.group(0).endswith("-"))
                         heredocs.append(hd_wait)
+                        own_heredocs.append(hd_wait)
                     redir = True
                     i = m.end()
                     continue
@@ -1140,7 +1120,7 @@ def _sh_parse(text: str, bodies: bool = False):
     parse_seq(0, "")
     if pending:
         pending[0].closed = False       # an opener on the last line: there is no body to find
-    return tuple(cmds), tuple(heredocs)
+    return tuple(cmds), tuple(heredocs), tuple(comments)
 
 
 def _sh_command_strings(text: str) -> tuple:

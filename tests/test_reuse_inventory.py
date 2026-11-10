@@ -469,6 +469,19 @@ class TestDelegationNeedsAnExecutableCall(unittest.TestCase):
         self.assertEqual(words('[[ "\\"]]" ]]; mc_job\n'), {"mc_job"})
         self.assertEqual(words('((x="a\\"))"));  mc_job\n'), {"mc_job"})
 
+    def test_quote_state_decides_whether_a_hash_line_is_a_comment_in_the_complete_check(self):
+        call = '    mc_store_lint_schema "$PY" "$memlint" "$MEMCONTINUUM_ROOT"\n'
+        for repl, clean in (('    echo "\n# "\n    echo "\n    mc_store_lint_schema\n# "\n', False),
+                            ('    echo "\n# "\n    mc_store_lint_schema "$PY" "$memlint" "$MEMCONTINUUM_ROOT"\n', True)):
+            ft = FixtureTree(self)
+            ft.replace("hooks/post-commit-reindex.sh", call, repl)
+            found = ft.findings()
+            if clean:
+                self.assertEqual(found, [], found)
+            else:
+                self.assertEqual(len(found), 1, found)
+                self.assertIn("store-lint-schema: delegation:", found[0])
+
     def test_a_lint_call_that_ends_in_a_closing_backtick_is_a_direct_call(self):
         for line in ('out=`"$PY" "$memlint"`', '`python3 "$memlint"`', '`"$memlint"`', 'out=`"$PY" "$memlint" "$ROOT"`'):
             ft = FixtureTree(self)
@@ -599,6 +612,12 @@ class TestDelegationNeedsAnExecutableCall(unittest.TestCase):
         f = only(ft.findings(), "store-lint-schema", "delegation")
         self.assertEqual(len(f), 1, ft.findings())
         self.assertIn("pre-commit-append-only.sh", f[0])
+
+
+def masked_words(src):
+    """(command words, scan problems) of shell text after the scanner masked it, as a unit would see it."""
+    masked, _payloads, problems = mc_reuse._mask_shell(src)
+    return mc_reuse._sh_command_words("\n".join(masked)), problems
 
 
 class TestPositiveControls(unittest.TestCase):
@@ -1078,10 +1097,21 @@ class TestScanner(unittest.TestCase):
         self.assertEqual(emb, ["from_dash_c", "from_heredoc"])
         self.assertEqual(s.problems, [])
 
+    def test_comment_spans_come_from_the_parse_with_the_whole_units_quote_state(self):
+        # Sol: both `# "` lines are inside the strings opened by `echo "`; bash runs two echos only
+        sol = 'echo "\n# "\necho "\nmc_job\n# "\n'
+        self.assertEqual(masked_words(sol), ({"echo"}, []))
+        self.assertEqual(masked_words(sol)[0], mc_reuse._sh_command_words(sol))
+        # Grok: the second `"` closes the string, so mc_job is a command and no comment starts at it
+        self.assertEqual(masked_words('echo "\n# "\nmc_job\n'), ({"echo", "mc_job"}, []))
+        # a real comment is masked; a `#` inside a word is not a comment
+        masked, _p, _q = mc_reuse._mask_shell("echo a # mc_job\n# mc_job\necho a#b mc_job   # tail\n${#x}\n")
+        self.assertEqual(masked, ["echo a", "", "echo a#b mc_job", "${#x}", ""])
+        self.assertEqual(masked_words("echo a#b\n# mc_job\nmc_job # c\n"), ({"echo", "mc_job"}, []))
+        # the parse is the one place that decides: no second comment stripper remains
+        self.assertFalse(hasattr(mc_reuse, "_strip_shell_comment"))
+
     def test_a_heredoc_terminator_is_compared_exactly(self):
-        def masked_words(src):
-            masked, _payloads, problems = mc_reuse._mask_shell(src)
-            return mc_reuse._sh_command_words("\n".join(masked)), problems
         # trailing blanks keep the body going; the data after them is not code
         for term in ("EOF ", "EOF\t", " EOF", "EOF\r"):
             words, problems = masked_words("cat <<EOF\n" + term + "\nmc_job\nEOF\n")
