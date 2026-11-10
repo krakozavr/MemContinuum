@@ -504,6 +504,16 @@ class TestDelegationNeedsAnExecutableCall(unittest.TestCase):
             ft.append("hooks/post-commit-reindex.sh", "\n" + prefix + 'python3 "$memlint"\n')
             self.assertEqual(ft.findings(), [], prefix)
 
+    def test_a_heredoc_inside_a_skipped_group_keeps_its_body_out_of_the_group(self):
+        def words(src):
+            return mc_reuse._sh_command_words("\n".join(mc_reuse._mask_shell(src)[0]))
+        src = "foo=(\n$(cat <<EOF\n)\nEOF\n)\nmc_job\n)\n"
+        self.assertNotIn("mc_job", words(src))
+        self.assertEqual(words("foo=(\n$(cat <<EOF\n)\nEOF\n)\n); mc_job\n"), {"mc_job"})
+        # a shift in an arithmetic group is not a heredoc
+        self.assertEqual(words("((x = 1 << 2)); mc_job\n"), {"mc_job"})
+        self.assertEqual(words("foo=($((1 << 2)) y)\nmc_job\n"), {"mc_job"})
+
     def test_a_lint_call_that_ends_in_a_closing_backtick_is_a_direct_call(self):
         for line in ('out=`"$PY" "$memlint"`', '`python3 "$memlint"`', '`"$memlint"`', 'out=`"$PY" "$memlint" "$ROOT"`'):
             ft = FixtureTree(self)

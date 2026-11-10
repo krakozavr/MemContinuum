@@ -679,6 +679,7 @@ _SH_KEEP_CMD = frozenset({"if", "then", "elif", "else", "while", "until", "do", 
 _SH_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _SH_ASSIGN_RE = re.compile(r"[A-Za-z_]\w*(?:\[[^\]]*\])?\+?=")
 _SH_WORD_BREAK = " \t\n;&|()<>"     # the one set that ends a word and, so, decides that a `#` starts a comment
+_SH_HEREDOC_OP_RE = re.compile(r"<<(-?)[ \t]*")
 _SH_REDIR_RE = re.compile(r"(?:\d+|\{\w+\})?(?:<<<|<<-?|>>|>\||>&|<&|<>|&>>|&>|>|<)")
 
 
@@ -809,12 +810,31 @@ def _sh_parse(text: str, bodies: bool = False):
             return i
         return take_comment(i)
 
+    def skip_heredoc_op(i):     # text[i:] is a `<<` / `<<-` inside a skipped group: the index after its delimiter word;
+        m = _SH_HEREDOC_OP_RE.match(text, i)    # the heredoc is recorded and its body consumed at the next newline
+        mark = (len(cmds), len(heredocs), len(comments))
+        w, j = read_word(m.end())
+        del cmds[mark[0]:], heredocs[mark[1]:], comments[mark[2]:]
+        rec = _ShHeredoc(i, bool(m.group(1)), w.text)
+        heredocs.append(rec)
+        if w.text:
+            pending.append(rec)
+        return j
+
     def skip_group(i):      # text[i] == "(": the index after its matching ")"
         depth = 0
+        shifts = text.startswith("((", i)       # an arithmetic group: `<<` there is a shift, not a heredoc
         while i < n:
             c = text[i]
             if c == "\\":
                 i += 2
+                continue
+            if c == "\n" and pending:
+                i = take_bodies(i + 1)
+                continue
+            if (bodies and c == "<" and not shifts and text.startswith("<<", i) and not text.startswith("<<<", i)
+                    and not text.startswith("(", _SH_HEREDOC_OP_RE.match(text, i).end())):
+                i = skip_heredoc_op(i)
                 continue
             if at_quote(i):
                 i = skip_quote(i)
