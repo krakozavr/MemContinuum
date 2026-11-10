@@ -1160,6 +1160,19 @@ class TestScanner(unittest.TestCase):
         self.assertEqual(len(s.problems), 1)
         self.assertIn("p.sh:4:", s.problems[0])
 
+    def test_a_python_heredoc_split_over_physical_lines_is_extracted_as_python(self):
+        # the interpreter word and the `<<` sit on different lines of ONE simple command (round-4 gate, Sol 6)
+        for head in ('"$MC_PY" \\\n  - <<\'EOF\'', 'env PYTHONPATH= "$MC_PY" \\\n  - <<\'EOF\'',
+                     'python3 \\\n- <<EOF', '"$MC_PY" - \\\n  <<\'EOF\''):
+            s = self.scan({"h.sh": "#!/usr/bin/env bash\n" + head + "\ndef hidden():\n    pass\nEOF\n"})
+            self.assertEqual([d.name for d in s.defs if d.embedded], ["hidden"], head)
+            self.assertEqual(s.problems, [], head)
+        # a non-python command, or python reading its program from somewhere else, stays data
+        for head in ("cat \\\n  <<'EOF'", "python3 \\\n  script.py <<'EOF'"):
+            s = self.scan({"h.sh": "#!/usr/bin/env bash\n" + head + "\ndef hidden():\n    pass\nEOF\n"})
+            self.assertEqual([d.name for d in s.defs if d.embedded], [], head)
+            self.assertEqual(s.problems, [], head)
+
     def test_a_heredoc_opener_on_a_continuation_line_still_masks_its_body(self):
         masked, payloads, problems = mc_reuse._mask_shell("cat \\\n  <<'EOT'\nnot code ( \" '\nEOT\necho after\n")
         self.assertEqual(masked, ["cat \\", "  <<'EOT'", "", "", "echo after", ""])
