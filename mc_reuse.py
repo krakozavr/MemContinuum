@@ -790,7 +790,7 @@ def _sh_parse(text: str, bodies: bool = False):
                 e = text.find("\n", j)
                 e = n if e < 0 else e
                 line = text[j:e]
-                if (line.lstrip("\t") if rec.dash else line).rstrip() == rec.tag:
+                if (line.lstrip("\t") if rec.dash else line) == rec.tag:     # exact: a trailing blank does not close it
                     rec.term, rec.end, rec.closed = j, min(e + 1, n), True
                     i = rec.end
                     break

@@ -1078,6 +1078,22 @@ class TestScanner(unittest.TestCase):
         self.assertEqual(emb, ["from_dash_c", "from_heredoc"])
         self.assertEqual(s.problems, [])
 
+    def test_a_heredoc_terminator_is_compared_exactly(self):
+        def masked_words(src):
+            masked, _payloads, problems = mc_reuse._mask_shell(src)
+            return mc_reuse._sh_command_words("\n".join(masked)), problems
+        # trailing blanks keep the body going; the data after them is not code
+        for term in ("EOF ", "EOF\t", " EOF", "EOF\r"):
+            words, problems = masked_words("cat <<EOF\n" + term + "\nmc_job\nEOF\n")
+            self.assertEqual((words, problems), ({"cat"}, []), repr(term))
+        # a tab-indented terminator closes `<<-` only; the exact name closes either
+        self.assertEqual(masked_words("cat <<-EOF\n\tbody\n\t\tEOF\nmc_job\n"), ({"cat", "mc_job"}, []))
+        self.assertEqual(len(masked_words("cat <<EOF\n\tEOF\nmc_job\n")[1]), 1)    # never closed: reported
+        # quoted terminators compare on the unquoted name
+        for opener in ("<<'EOF'", '<<"EOF"', "<<\\EOF", "<<-'EOF'"):
+            words, problems = masked_words("cat " + opener + "\nEOF \nmc_job\nEOF\nmc_after\n")
+            self.assertEqual((words, problems), ({"cat", "mc_after"}, []), opener)
+
     def test_dash_heredoc_strips_leading_tabs_from_the_payload(self):
         s = self.scan({"h.sh": '#!/usr/bin/env bash\n"$MC_PY" - <<-\'EOF\'\n\tdef tabbed():\n\t    pass\n\tEOF\n'})
         self.assertEqual([d.name for d in s.defs if d.embedded], ["tabbed"])
