@@ -653,6 +653,14 @@ class TestPositiveControls(unittest.TestCase):
             for miss in ("`xargs`", "`find -exec`", "`sudo`", "`env`", "`timeout`", "`coproc`", "`command -p`",
                          "passed to another by name", "nested inside `$((...))`", "one quoted word"):
                 self.assertIn(miss, rows[rid]["coverage_limit"], (rid, miss))
+        for rid in ("store-lint-schema", "store-lint-append-only", "shell-millisecond-clock"):
+            self.assertIn("a command word continued over a backslash-newline is seen", rows[rid]["coverage_limit"], rid)
+            self.assertIn("a `for ((...))` header, an extglob group or any parenthesis that is not a subshell is "
+                          "skipped whole and NOT seen", rows[rid]["coverage_limit"], rid)
+            self.assertIn("`[[ ]]`", rows[rid]["coverage_limit"], rid)
+        internals = (TOOLS_DIR / "docs" / "INTERNALS.md").read_text(encoding="utf-8")
+        self.assertIn("so a call written inside them is NOT seen", internals)
+        self.assertIn("A word continued over a backslash-newline", internals)
         self.assertIn("inlined lint call that keeps the probe is caught", rows["store-lint-schema"]["coverage_limit"])
         self.assertIn("whole-second", rows["shell-millisecond-clock"]["coverage_limit"])
 
