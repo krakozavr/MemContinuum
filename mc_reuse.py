@@ -889,11 +889,8 @@ def _sh_parse(text: str, bodies: bool = False):
     def at_quote(i):        # a quoted piece starts at text[i]: '...', "..." or $'...'
         return text[i] in "'\"" or text.startswith("$'", i)
 
-    def skip_quote(i):      # the index after the quoted piece at text[i], read by the word reader; a skipped
-        m = mark()          # region's commands, heredocs, comments and declarations are not recorded
-        j = read_quoted(i, [])
-        rollback(m)
-        return j
+    def skip_quote(i):      # the index after the quoted piece at text[i], read by the word reader; the piece's own
+        return read_quoted(i, [])   # text is dropped, a substitution inside a double-quoted piece is recorded (it runs)
 
     def take_comment(i):    # text[i] == "#" starts a comment: record it, the index of its end of line
         j = text.find("\n", i)
@@ -926,15 +923,18 @@ def _sh_parse(text: str, bodies: bool = False):
         return _ShWord(w.start, w.raw, "", j), j
 
     def skip_region(i, closer, arith):
-        """The one step that walks a region nothing in is recorded as a command: the index after its `closer`
-        (`)`, `}`, a backtick, or `]]` as a token). i is just after the opener (just after the `[[` word for `]]`).
+        """The one step that walks a region whose own words are not commands (an array literal, `${ }`, `[[ ]]`,
+        an arithmetic or a skipped `( )` group): the index after its `closer` (`)`, `}` or `]]` as a token). The
+        region's words are not recorded, but a command substitution in it (`$( )`, a backtick, `<( )`/`>( )`,
+        also inside a double-quoted piece) runs in bash, so it is parsed by `parse_seq` and everything it records
+        is kept. i is just after the opener (just after the `[[` word for `]]`).
         `arith`: an arithmetic group, where `<<` is a shift. A backslash-newline is a join, so the character
         before it still decides whether a `#` starts a word; quotes are read by the word reader; a `#` that
         starts a word is a comment (not inside `${ }`); a heredoc operator in a command region (`)` or a
-        backtick, never arithmetic) has its body consumed at the next newline; `((`, `$(`, `${`, a backtick, `[[`
-        and `{` (inside `${ }`) open a nested region walked by this same step."""
+        backtick, never arithmetic) has its body consumed at the next newline; `((`, `${`, `[[` and `{`
+        (inside `${ }`) open a nested region walked by this same step."""
         prev = {")": "(", "}": "{"}.get(closer, " ")     # the character before i that is not a join
-        command = closer in (")", "`")
+        command = closer == ")"
         while i < n:
             c = text[i]
             if c == "\\":
@@ -954,11 +954,7 @@ def _sh_parse(text: str, bodies: bool = False):
                 continue
             word_start = prev in _SH_WORD_BREAK
             if c == "#" and closer != "}" and word_start:
-                if closer == "`":
-                    problems.append((i, "a `#` comment inside a backtick substitution: bash ends the substitution "
-                                        "at the next backtick before it reads the comment, which the scanner "
-                                        "cannot reproduce"))
-                elif bodies:
+                if bodies:
                     i = take_comment(i)
                     continue
             elif (command and not arith and word_start and c == "c" and _SH_CASE_RE.match(text, i)):
@@ -973,6 +969,14 @@ def _sh_parse(text: str, bodies: bool = False):
             if c == closer[0] and (closer != "]]" or (
                     word_start and text.startswith("]]", i) and (i + 2 >= n or text[i + 2] in _SH_WORD_BREAK))):
                 return i + len(closer)
+            if c == "$" and text.startswith("$(", i) and not text.startswith("$((", i):
+                i = parse_seq(i + 2, ")")       # a command substitution runs: parsed and recorded
+                prev = ")"
+                continue
+            if c in "<>" and not arith and text.startswith("(", i + 1):
+                i = parse_seq(i + 2, ")")       # a process substitution runs too
+                prev = ")"
+                continue
             if c == "(" and (closer != "}" or text[i - 1] == "$"):
                 i = skip_region(i + 1, ")", text.startswith("((", i) or (arith and text[i - 1] != "$"))
                 prev = ")"
@@ -986,7 +990,7 @@ def _sh_parse(text: str, bodies: bool = False):
                 prev = "}"
                 continue
             if c == "`":
-                i = skip_region(i + 1, "`", False)
+                i = parse_seq(i + 1, "`")
                 prev = "`"
                 continue
             if (command and not arith and word_start and text.startswith("[[", i)

@@ -509,7 +509,7 @@ class TestDelegationNeedsAnExecutableCall(unittest.TestCase):
             return mc_reuse._sh_command_words("\n".join(mc_reuse._mask_shell(src)[0]))
         src = "foo=(\n$(cat <<EOF\n)\nEOF\n)\nmc_job\n)\n"
         self.assertNotIn("mc_job", words(src))
-        self.assertEqual(words("foo=(\n$(cat <<EOF\n)\nEOF\n)\n); mc_job\n"), {"mc_job"})
+        self.assertEqual(words("foo=(\n$(cat <<EOF\n)\nEOF\n)\n); mc_job\n"), {"cat", "mc_job"})   # cat runs
         # a shift in an arithmetic group is not a heredoc
         self.assertEqual(words("((x = 1 << 2)); mc_job\n"), {"mc_job"})
         self.assertEqual(words("foo=($((1 << 2)) y)\nmc_job\n"), {"mc_job"})
@@ -589,10 +589,29 @@ class TestDelegationNeedsAnExecutableCall(unittest.TestCase):
             "redirect-fd-before-the-command": "2>&1 mc_job\n",
             "case-body": 'case $x in\n    a)\n        mc_job\n        ;;\nesac\n',
             "nested-case-body": 'case $x in a) case $y in b) mc_job;; esac;; esac\n',
+            # bash RUNS a substitution wherever it stands; each of these was run through bash with a flag file
+            "double-bracket-substitution": "[[ $(mc_job) == x ]]\n",
+            "array-substitution": "arr=($(mc_job))\n",
+            "array-quoted-substitution": 'arr=("$(mc_job)")\n',
+            "array-backtick": "arr=(`mc_job`)\n",
+            "array-process-substitution": "arr=(<(mc_job))\n",
+            "parameter-default-substitution": ": ${v:-$(mc_job)}\n",
+            "double-bracket-quoted-substitution": '[[ "$(mc_job)" == x ]]\n',
+            "arithmetic-substitution": "(( x = $(mc_job) ))\n",
+            "arithmetic-expansion-substitution": "echo $(( $(mc_job) + 1 ))\n",
         }
         for name, body in shapes.items():
             files = dict(base, **{"c.sh": "#!/usr/bin/env bash\n" + body})
             self.assertEqual(self.check(files, _deleg_row(["c.sh"], owner=owner)), [], name)
+
+    def test_a_substitution_in_an_array_literal_does_not_evade_the_command_forbid(self):
+        for line in ('arr=($(python3 "$memlint"))', 'arr=("$(python3 "$memlint")")'):
+            ft = FixtureTree(self)
+            ft.append("hooks/pre-commit-append-only.sh", "\n" + line + "\n")
+            found = ft.findings()
+            for rid in ("store-lint-schema", "store-lint-append-only"):
+                d = only(found, rid, "delegation")
+                self.assertTrue(any("bypassing the owner" in x for x in d), (line, rid, found))
 
     def test_shell_mentions_are_not_calls(self):
         owner = "a.sh#mc_job"
@@ -622,7 +641,6 @@ class TestDelegationNeedsAnExecutableCall(unittest.TestCase):
             "for-arithmetic-header-empty-init": "for ((;mc_job<0;)); do :; done\n",
             "for-variable-named-like-the-owner": "for mc_job in a b; do echo x; done\n",
             "double-bracket-group": "[[ (mc_job) ]]\n",
-            "double-bracket-substitution": "[[ $(mc_job) == x ]]\n",
             "for-arithmetic-header": "for ((mc_job;0;0)); do :; done\n",
             "case-extglob-then-word": "case x in @(a)mc_job) :;; esac\n",
             "single-bracket-group": "[ (mc_job) ]\n",
@@ -766,17 +784,20 @@ class TestPositiveControls(unittest.TestCase):
             self.assertIn("is seen", rows[rid]["coverage_limit"])
         for rid in ("store-lint-schema", "store-lint-append-only", "shell-millisecond-clock"):
             for miss in ("`xargs`", "`find -exec`", "`sudo`", "`env`", "`timeout`", "`coproc`", "`command -p`",
-                         "passed to another by name", "nested inside `$((...))`", "one quoted word"):
+                         "passed to another by name", "one quoted word"):
                 self.assertIn(miss, rows[rid]["coverage_limit"], (rid, miss))
         for rid in ("store-lint-schema", "store-lint-append-only", "shell-millisecond-clock"):
             self.assertIn("a command word continued over a backslash-newline is seen", rows[rid]["coverage_limit"], rid)
             self.assertIn("a `for ((...))` header, an extglob group, an array literal or any `(` that does not "
-                          "start a command is skipped whole and NOT seen", rows[rid]["coverage_limit"], rid)
+                          "start a command is NOT seen, but a `$( )`, backtick or `<( )` substitution inside them "
+                          "runs and is read as commands", rows[rid]["coverage_limit"], rid)
+            self.assertNotIn("inside a skipped region is not seen", rows[rid]["coverage_limit"], rid)
             self.assertIn("`[[ ]]`", rows[rid]["coverage_limit"], rid)
         for rid in ("store-lint-schema", "store-lint-append-only"):
             self.assertIn("the forbid sees it; the reach check does not", rows[rid]["coverage_limit"], rid)
         internals = (TOOLS_DIR / "docs" / "INTERNALS.md").read_text(encoding="utf-8")
-        self.assertIn("so a call written inside them is NOT seen", internals)
+        self.assertIn("so a call word written directly inside them is NOT seen", internals)
+        self.assertIn("a `$( )`, backtick or `<( )` substitution inside them or inside a double-quoted piece of them runs", internals)
         self.assertIn("A word continued over a backslash-newline", internals)
         self.assertIn("single- or double-quoted piece", internals)
         self.assertNotIn("single-quoted text or a longer word", internals)
@@ -1341,8 +1362,8 @@ class ShellScanRootsTest(unittest.TestCase):
     def test_a_heredoc_inside_a_parameter_expansion_keeps_its_body_out_of_the_expansion(self):
         # bash: `}` and mc_job are heredoc data; nothing runs but echo and cat
         src = "echo ${var:-$(cat <<EOF\n}\nmc_job\nEOF\n)}\nmc_after\n"
-        self.assertEqual(masked_words(src), ({"echo", "mc_after"}, []))
-        self.assertEqual(mc_reuse._sh_command_words(src), {"echo", "mc_after"})
+        self.assertEqual(masked_words(src), ({"echo", "cat", "mc_after"}, []))
+        self.assertEqual(mc_reuse._cmd_words(mc_reuse._sh_parse(src, True)[0]), {"echo", "cat", "mc_after"})
         found = self.swap_call("    echo ${var:-$(cat <<EOF\n}\n    mc_store_lint_schema\nEOF\n)}\n")
         self.assertEqual(len(found), 1, found)
         self.assertIn("store-lint-schema: delegation:", found[0])
@@ -1373,9 +1394,7 @@ class ShellWalkerMatrixTest(unittest.TestCase):
     walks, columns the lexical features; each cell is one bash text whose `mc_live` / `mc_dead` / `mc_after`
     calls were run through bash 5.2 with a flag file to learn which ones execute. A cell is `handled` (the
     command words the parse records equal the ones bash executed, and the scan reports no problem), `refused`
-    (the scan reports a problem and the check fails), `miss` (a `$( )` inside a region the parse skips whole:
-    bash runs it, the parse records nothing from it -- the disclosed fail-closed miss; the test pins what is
-    recorded) or `n/a` (the combination is not bash, with the reason)."""
+    (the scan reports a problem and the check fails), or `n/a` (the combination is not bash, with the reason)."""
 
     ROWS = ['top', 'cmdsub', 'backtick', 'procsub', 'subshell', 'brace', 'func', 'casebody', 'dqsub', 'array', 'arith', 'param', 'dbracket', 'dq', 'case-pattern', 'heredoc-quoted', 'heredoc-unquoted']
     COLS = ['single-quote', 'double-quote', 'ansi-c-quote', 'comment', 'hash-in-word', 'heredoc-op', 'heredoc-closer', 'continuation', 'nested-arith-shift', 'cmd-subst', 'decl-line', 'heredoc-delim-subst', 'case-clause']
@@ -1507,7 +1526,7 @@ class ShellWalkerMatrixTest(unittest.TestCase):
         ('array', 'heredoc-closer', 'handled', 'x=(\n$(cat <<E\n)\nE\n)\ny\n)\nmc_after\n', 'after', 'after'),
         ('array', 'continuation', 'handled', 'x=( a\\\n# mc_dead\nb )\nmc_after\n', 'after', 'after'),
         ('array', 'nested-arith-shift', 'handled', 'x=($((1 << 2)) y)\nmc_after\n', 'after', 'after'),
-        ('array', 'cmd-subst', 'miss', 'x=($(mc_live) y)\nmc_after\n', 'after live', 'after'),
+        ('array', 'cmd-subst', 'handled', 'x=($(mc_live) y)\nmc_after\n', 'after live', 'after live'),
         ('array', 'decl-line', 'handled', "x=(\n'\nmc_fn() {\nmc_dead\n}\n'\n)\nmc_after\n", 'after', 'after'),
         ('array', 'heredoc-delim-subst', 'n/a', 'a redirection is a syntax error inside an array literal'),
         ('array', 'case-clause', 'refused', 'x=( case in )\nmc_after\n', 'after', 'after'),
@@ -1533,10 +1552,10 @@ class ShellWalkerMatrixTest(unittest.TestCase):
         ('param', 'heredoc-closer', 'handled', ': ${v:-$(cat <<E\n}\nmc_dead\nE\n)}\nmc_after\n', 'after', 'after'),
         ('param', 'continuation', 'handled', ': ${v:-a\\\nb}\nmc_after\n', 'after', 'after'),
         ('param', 'nested-arith-shift', 'handled', ': ${v:-$((1 << 2))}\nmc_after\n', 'after', 'after'),
-        ('param', 'cmd-subst', 'miss', ': ${v:-$(mc_live)}\nmc_after\n', 'after live', 'after'),
-        ('param', 'decl-line', 'miss', ': ${v:-$(\nmc_fn() {\n mc_live\n}\nmc_fn\n)}\nmc_after\n', 'after live', 'after'),
+        ('param', 'cmd-subst', 'handled', ': ${v:-$(mc_live)}\nmc_after\n', 'after live', 'after live'),
+        ('param', 'decl-line', 'handled', ': ${v:-$(\nmc_fn() {\n mc_live\n}\nmc_fn\n)}\nmc_after\n', 'after live', 'after live'),
         ('param', 'heredoc-delim-subst', 'refused', ': ${v:-$(cat <<"$(mc_dead)"\n}\n$(mc_dead)\n)}\nmc_after\n', 'after', ''),
-        ('param', 'case-clause', 'refused', ': ${v:-$(case x in x) mc_live;; esac)}\nmc_after\n', 'after live', 'after'),
+        ('param', 'case-clause', 'handled', ': ${v:-$(case x in x) mc_live;; esac)}\nmc_after\n', 'after live', 'after live'),
         ('dbracket', 'single-quote', 'handled', "[[ x == 'mc_dead ]]' ]]\nmc_after\n", 'after', 'after'),
         ('dbracket', 'double-quote', 'handled', '[[ x == "mc_dead ]]" ]]\nmc_after\n', 'after', 'after'),
         ('dbracket', 'ansi-c-quote', 'handled', "[[ x == $'mc_dead ]]' ]]\nmc_after\n", 'after', 'after'),
@@ -1546,10 +1565,10 @@ class ShellWalkerMatrixTest(unittest.TestCase):
         ('dbracket', 'heredoc-closer', 'handled', '[[ $(cat <<E\n]]\nE\n) ]]\nmc_after\n', 'after', 'after'),
         ('dbracket', 'continuation', 'handled', '[[ x\\\n# ]]\nmc_live\n]]\n', 'live', 'live'),
         ('dbracket', 'nested-arith-shift', 'handled', '[[ $((1 << 2)) == 4 ]]\nmc_after\n', 'after', 'after'),
-        ('dbracket', 'cmd-subst', 'miss', "[[ $(mc_live) == '' ]]\nmc_after\n", 'after live', 'after'),
-        ('dbracket', 'decl-line', 'miss', "[[ $(\nmc_fn() {\n mc_live\n}\nmc_fn\n) == '' ]]\nmc_after\n", 'after live', 'after'),
+        ('dbracket', 'cmd-subst', 'handled', "[[ $(mc_live) == '' ]]\nmc_after\n", 'after live', 'after live'),
+        ('dbracket', 'decl-line', 'handled', "[[ $(\nmc_fn() {\n mc_live\n}\nmc_fn\n) == '' ]]\nmc_after\n", 'after live', 'after live'),
         ('dbracket', 'heredoc-delim-subst', 'refused', '[[ $(cat <<"$(mc_dead)"\n]]\n$(mc_dead)\n) ]]\nmc_after\n', 'after', ''),
-        ('dbracket', 'case-clause', 'refused', '[[ $(case x in x) echo y;; esac) == y ]]\nmc_after\n', 'after', 'after'),
+        ('dbracket', 'case-clause', 'handled', '[[ $(case x in x) echo y;; esac) == y ]]\nmc_after\n', 'after', 'after'),
         ('dq', 'single-quote', 'handled', 'x="a \'mc_dead\' b"\nmc_after\n', 'after', 'after'),
         ('dq', 'double-quote', 'handled', 'x="a \\"mc_dead\\" b"\nmc_after\n', 'after', 'after'),
         ('dq', 'ansi-c-quote', 'handled', 'x="a $\'mc_dead\' b"\nmc_after\n', 'after', 'after'),
@@ -1634,13 +1653,9 @@ class ShellWalkerMatrixTest(unittest.TestCase):
                     self.assertEqual(names(parser), names(bash))
                 elif status == "refused":
                     self.assertNotEqual(problems, [])
-                elif status == "miss":
-                    self.assertEqual(problems, [])
-                    self.assertEqual(words, names(parser))
-                    self.assertLess(names(parser), names(bash))
                 else:
                     self.fail(status)
-        self.assertEqual(counts, {"handled": 188, "refused": 16, "n/a": 12, "miss": 5})
+        self.assertEqual(counts, {"handled": 195, "refused": 14, "n/a": 12})
 
 
 class TestRender(unittest.TestCase):
