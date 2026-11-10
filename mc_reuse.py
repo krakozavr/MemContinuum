@@ -706,15 +706,17 @@ _SH_REDIR_RE = re.compile(r"(?:\d+|\{\w+\})?(?:<<<|<<-?|>>|>\||>&|<&|<>|&>>|&>|>
 @dataclass(frozen=True)
 class _ShWord:
     start: int      # offset of the word in the parsed text
-    raw: str        # the source text of the word
+    raw: str        # the source text of the word, a backslash-newline outside single quotes removed (as bash does)
     text: str       # the word with quotes and escapes removed (a substitution renders as `$(...)`)
+    end: int = 0    # offset just after the word in the parsed text
+    plain_sq: bool = False      # the word is single-quoted pieces and `\'` only (a literal payload)
 
     @property
     def ident(self) -> str:
         """The identifier this word spells -- bare (`mc_job`) or as one quoted
         piece (`"mc_job"`, `'mc_job'`) -- else ''. `mc_job"x"`, `mc_job$x`,
         `mc_job/x` are longer words, not the identifier."""
-        r = self.raw.replace("\\\n", "")     # a backslash-newline joins the word (`mc_job\<nl>`), as in bash
+        r = self.raw
         if _SH_IDENT_RE.fullmatch(r):
             return r
         if len(r) > 2 and r[0] in "'\"" and r[-1] == r[0] and _SH_IDENT_RE.fullmatch(r[1:-1]):
@@ -766,6 +768,18 @@ def _sh_parse(text: str, bodies: bool = False):
     heredocs = []
     closers = []        # the closer of each open parse_seq: a backtick ends a word inside a backtick substitution
     pending = []        # heredocs whose body starts at the next newline (bodies=True)
+    cont = []           # offsets of the backslash-newlines the reader dropped outside single quotes, in order
+
+    def joined(a, b):   # text[a:b] without those continuations: the word as bash joins it
+        lo, hi = bisect.bisect_left(cont, a), bisect.bisect_left(cont, b)
+        if lo == hi:
+            return text[a:b]
+        out, p = [], a
+        for q in cont[lo:hi]:
+            out.append(text[p:q])
+            p = q + 2
+        out.append(text[p:b])
+        return "".join(out)
 
     def take_bodies(i):     # i is just after a newline: consume the bodies of the pending heredocs
         while pending:
@@ -855,6 +869,8 @@ def _sh_parse(text: str, bodies: bool = False):
                 elif i + 1 < n and text[i + 1] != "\n":
                     buf.append("\\")
                     i -= 1
+                elif i + 1 < n:
+                    cont.append(i)      # backslash-newline inside double quotes is dropped
                 i += 2
                 continue
             if c == '"':
@@ -881,53 +897,66 @@ def _sh_parse(text: str, bodies: bool = False):
     def read_word(i):
         start = i
         buf = []
+        plain = True
         while i < n:
             c = text[i]
             if c == "\\":
                 if i + 1 < n and text[i + 1] != "\n":
                     buf.append(text[i + 1])
+                    plain = plain and text[i + 1] == "'"
+                elif i + 1 < n:
+                    cont.append(i)      # backslash-newline outside single quotes is dropped
                 i += 2
             elif c == "'":
                 j = text.find("'", i + 1)
                 buf.append(text[i + 1:] if j < 0 else text[i + 1:j])
                 i = n if j < 0 else j + 1
             elif c == '"':
+                plain = False
                 i = read_dq(i + 1, buf)
             elif c == "$" and text.startswith("$'", i):
+                plain = False
                 j = i + 2
                 while j < n and text[j] != "'":
                     j += 2 if text[j] == "\\" else 1
                 buf.append(text[i + 2:j])
                 i = j + 1
             elif c == "$" and text.startswith("$((", i):
+                plain = False
                 j = skip_group(i + 1)
                 buf.append(text[i:j])
                 i = j
             elif c == "$" and text.startswith("$(", i):
+                plain = False
                 buf.append("$(...)")
                 i = parse_seq(i + 2, ")")
             elif c == "$" and text.startswith("${", i):
+                plain = False
                 j = skip_brace(i + 1)
                 buf.append(text[i:j])
                 i = j
             elif c == "`" and i > start and closers[-1] == "`":
                 break           # the closing backtick of the substitution this word is in
             elif c == "`":
+                plain = False
                 buf.append("`...`")
                 i = parse_seq(i + 1, "`")
             elif c in "<>" and text.startswith("(", i + 1):
+                plain = False
                 buf.append(c + "(...)")
                 i = parse_seq(i + 2, ")")
             elif c == "(" and re.fullmatch(r"[A-Za-z_]\w*(?:\[[^\]]*\])?\+?=", text[start:i]):
+                plain = False
                 j = skip_group(i)           # an array literal: nothing in it is a command word
                 buf.append(text[i:j])
                 i = j
             elif c in " \t\n;&|()<>":
                 break
             else:
+                plain = False
                 buf.append(c)
                 i += 1
-        return _ShWord(start, text[start:i], "".join(buf)), i
+        return _ShWord(start, joined(start, i), "".join(buf), i, plain), i
 
     def parse_seq(i, closer):
         closers.append(closer)
