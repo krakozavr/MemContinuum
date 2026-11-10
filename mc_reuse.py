@@ -32,6 +32,7 @@ The shell scanner is a documented, bounded scanner, not a Bash parser:
 from __future__ import annotations
 
 import ast
+import bisect
 import copy
 import fnmatch
 import functools
@@ -52,7 +53,6 @@ OPTIONAL_TOP_FIELDS = ("tests_dir",)    # null: this inventory has no tests dire
 INVENTORY_RELPATH = "docs/REUSE-INVENTORY.json"
 
 _INTERP = r"(?:python[\w.]*|\$\{?\w*PY\w*\}?)"
-_HEREDOC_RE = re.compile(r"(?<!<)<<(?!<)(-?)\s*(['\"]?)([A-Za-z_]\w*)\2")
 _PY_HEREDOC_LINE_RE = re.compile(r"(?i)\"?" + _INTERP + r"\"?\s+-(?:\s|<)")
 _PY_INLINE_RE = re.compile(r"(?i)\"?" + _INTERP + r"\"?\s+(?:-\w+\s+)*-c\s+'")
 _SH_DECL_RE = re.compile(
@@ -537,38 +537,64 @@ def _mask_shell(text: str):
     """`(masked_lines, payloads, problems)`: the file's lines with heredoc bodies
     and python `-c '...'` payload bodies blanked (line numbers preserved), the
     extracted python payloads as `(first_line_number, source)`, and the
-    `(line_number, message)` problems found (an unterminated heredoc)."""
+    `(line_number, message)` problems found (an unterminated heredoc). The whole
+    text is parsed once (`_sh_parse` with bodies=True), so a quote opened on one
+    line is still open on the next and a `<<` or an interpreter name inside it
+    is text."""
     lines = text.split("\n")
     n = len(lines)
     keep = [True] * n
     payloads = []
     problems = []
-    i = 0
     offsets = []
     pos = 0
     for ln in lines:
         offsets.append(pos)
         pos += len(ln) + 1
+
+    def line_of(off):
+        return bisect.bisect_right(offsets, off) - 1
+
+    cmds, heredocs = _sh_parse(text, True)
+    # an interpreter is recognised as a command word only (after assignments, exec, env): a quoted
+    # `python3 -c '...'` argument or a quoted `<<` is text
+    starts = _sh_interpreter_starts(cmds)
+    by_line = {}
+    for st in starts:
+        by_line.setdefault(line_of(st), []).append(st)
+    # heredocs: blank body and terminator; a python heredoc body is a payload
+    seen_lines = set()
+    for rec in heredocs:
+        li = line_of(rec.op)
+        first = li not in seen_lines
+        seen_lines.add(li)
+        if rec.closed is False:
+            problems.append((li + 1, f"unterminated heredoc: `<<{'-' if rec.dash else ''}{rec.tag}` opened here is "
+                                     f"never closed by a line holding `{rec.tag}`; the scanner cannot tell code "
+                                     "from data after it"))
+        if not rec.closed:
+            continue
+        sb, tl = line_of(rec.body), line_of(rec.term)
+        if first and any(_PY_HEREDOC_LINE_RE.match(text, st, rec.op) for st in by_line.get(li, ()) if st < rec.op):
+            body_lines = lines[sb:tl]
+            if rec.dash:
+                body_lines = [bl.lstrip("\t") for bl in body_lines]   # `<<-` strips leading tabs
+            payloads.append((sb + 1, "\n".join(body_lines)))
+        for k in range(sb, tl + 1):
+            keep[k] = False
+    # single-quoted `<interp> -c '...'` payload
+    i = 0
     while i < n:
         raw = lines[i]
-        code = _strip_shell_comment(raw)
-        if not code.strip():
-            i += 1
-            continue
-        # an interpreter is recognised as a command word only (after assignments, exec, env): a quoted
-        # `python3 -c '...'` argument or a quoted `<<` is text
-        cmds, hd_offsets = _sh_parse(code)
-        starts = _sh_interpreter_starts(cmds)
-        # single-quoted `<interp> -c '...'` payload
+        line_end = offsets[i] + len(raw)
         m = None
-        for st in starts:
-            m = _PY_INLINE_RE.match(code, st)
+        for st in by_line.get(i, ()):
+            m = _PY_INLINE_RE.match(text, st, line_end)
             if m:
                 break
         if m:
-            start = offsets[i] + m.end()
             buf = []
-            p = start
+            p = m.end()
             ok = False
             while True:
                 q = text.find("'", p)
@@ -587,41 +613,11 @@ def _mask_shell(text: str):
                 for j in range(i + 1, end_line + 1):
                     keep[j] = False
                 # the opening line keeps only the shell text before the payload
-                lines[i] = raw[:m.end()] + "'"
+                lines[i] = raw[:m.end() - offsets[i]] + "'"
                 i = end_line + 1
                 continue
-        # heredocs
-        hds = [hm for hm in _HEREDOC_RE.finditer(code) if hm.start() in hd_offsets]
-        if hds:
-            j = i + 1
-            resume = j
-            for hm in hds:
-                dash, tag = hm.group(1), hm.group(3)
-                start_body = j
-                while j < n:
-                    cand = lines[j].lstrip("\t") if dash else lines[j]
-                    if cand.rstrip() == tag:
-                        break
-                    j += 1
-                if j >= n:
-                    problems.append((i + 1, f"unterminated heredoc: `<<{dash}{tag}` opened here is never closed "
-                                            f"by a line holding `{tag}`; the scanner cannot tell code from data "
-                                            "after it"))
-                    j = resume      # resume after the last closed heredoc: nothing more is blanked
-                    break
-                body_lines = lines[start_body:j]
-                if dash:
-                    body_lines = [bl.lstrip("\t") for bl in body_lines]   # `<<-` strips leading tabs
-                body = "\n".join(body_lines)
-                if hm is hds[0] and any(_PY_HEREDOC_LINE_RE.match(code, st, hm.start()) for st in starts):
-                    payloads.append((start_body + 1, body))
-                for k in range(start_body, j + 1):
-                    keep[k] = False
-                j += 1
-                resume = j
-            i = max(j, i + 1)
-            continue
         i += 1
+    payloads.sort(key=lambda pl: pl[0])
     masked = [(_strip_shell_comment(lines[k]) if keep[k] else "") for k in range(n)]
     return masked, payloads, problems
 
@@ -738,12 +734,28 @@ class _ShCmd:
     assigns: tuple
 
 
+@dataclass
+class _ShHeredoc:
+    """A `<<` / `<<-` operator outside quotes. With `bodies=True` parsing it also
+    says where the body lies: `closed` is True (body = text[body:term], the
+    terminator line text[term:end]), False (never closed) or None (not examined)."""
+    op: int             # offset of the `<<`
+    dash: bool
+    tag: str = ""
+    body: int = -1
+    term: int = -1
+    end: int = -1
+    closed: object = None
+
+
 @functools.lru_cache(maxsize=64)
-def _sh_parse(text: str):
-    """`(commands, heredoc_offsets)` of `text` (shell with comments and heredoc
-    bodies already removed): every simple command -- including the ones inside
-    `$( )`, backticks, `<( )` and `( )` -- and the offsets of `<<` / `<<-`
-    operators that sit outside quotes. A bounded tokenizer, not a Bash parser:
+def _sh_parse(text: str, bodies: bool = False):
+    """`(commands, heredocs)` of `text`: every simple command -- including the
+    ones inside `$( )`, backticks, `<( )` and `( )` -- and every `<<` / `<<-`
+    operator that sits outside quotes (`_ShHeredoc`). `bodies=False` is for text
+    whose comments and heredoc bodies are already removed; `bodies=True` is for
+    raw source: comments are skipped and, at the newline after the operator, the
+    heredoc body is consumed up to its terminator line. A bounded tokenizer, not a Bash parser:
     words, quotes, `$(( ))`/`(( ))` blobs, redirections (an operator consumes
     its operand word), `case` patterns and `name() {` declarations are told
     apart from commands; `[[ ]]`, `for ((...))` headers, extglob groups in case
@@ -752,6 +764,27 @@ def _sh_parse(text: str):
     n = len(text)
     cmds = []
     heredocs = []
+    pending = []        # heredocs whose body starts at the next newline (bodies=True)
+
+    def take_bodies(i):     # i is just after a newline: consume the bodies of the pending heredocs
+        while pending:
+            rec = pending.pop(0)
+            rec.body = i
+            j = i
+            while j < n:
+                e = text.find("\n", j)
+                e = n if e < 0 else e
+                line = text[j:e]
+                if (line.lstrip("\t") if rec.dash else line).rstrip() == rec.tag:
+                    rec.term, rec.end, rec.closed = j, min(e + 1, n), True
+                    i = rec.end
+                    break
+                j = e + 1
+            else:
+                rec.closed = False
+                del pending[:]      # the scanner cannot tell code from data after an unterminated body
+                break
+        return i
 
     def skip_group(i):      # text[i] == "(": the index after its matching ")"
         depth = 0
@@ -899,6 +932,7 @@ def _sh_parse(text: str):
         redir = False           # the next word is a redirection operand
         after_command = False   # the previous word was a bare `command`
         skip_name = False       # the previous word was `function`
+        hd_wait = None          # the `<<` whose delimiter word comes next
         cases = []              # open `case`s: 'hdr' (before `in`), 'pat' (patterns), 'body' (commands)
         words = []
         assigns = []
@@ -918,6 +952,10 @@ def _sh_parse(text: str):
             if c == "\\" and text.startswith("\\\n", i):
                 i += 2
                 continue
+            if c == "#" and bodies:
+                j = text.find("\n", i)
+                i = n if j < 0 else j
+                continue
             if c == closer and not (closer == ")" and cases and cases[-1] == "pat"):
                 end_cmd()
                 return i + 1
@@ -931,8 +969,9 @@ def _sh_parse(text: str):
             if c in "<>&0123456789{" and not (c in "<>" and text.startswith("(", i + 1)):
                 m = _SH_REDIR_RE.match(text, i)
                 if m:
-                    if m.group(0).endswith("<<") or m.group(0).endswith("<<-"):
-                        heredocs.append(text.index("<<", i))
+                    if re.fullmatch(r"(?:\d+|\{\w+\})?<<-?", m.group(0)):       # not the here-string `<<<`
+                        hd_wait = _ShHeredoc(text.index("<<", i), m.group(0).endswith("-"))
+                        heredocs.append(hd_wait)
                     redir = True
                     i = m.end()
                     continue
@@ -948,6 +987,8 @@ def _sh_parse(text: str):
                     at_cmd = True
                 skip_name = False
                 i += 1
+                if c == "\n" and pending:
+                    i = take_bodies(i)
                 continue
             if c == "(":
                 if cases and cases[-1] == "pat":
@@ -978,6 +1019,11 @@ def _sh_parse(text: str):
             w, i = read_word(i)
             if redir:
                 redir = False
+                if hd_wait is not None:
+                    hd_wait.tag = w.text
+                    if bodies and w.text:
+                        pending.append(hd_wait)
+                    hd_wait = None
                 continue
             state = cases[-1] if cases else ""
             if state == "hdr":
@@ -1042,6 +1088,8 @@ def _sh_parse(text: str):
         return n
 
     parse_seq(0, "")
+    if pending:
+        pending[0].closed = False       # an opener on the last line: there is no body to find
     return tuple(cmds), tuple(heredocs)
 
 

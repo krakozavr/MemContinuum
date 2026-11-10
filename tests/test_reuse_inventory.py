@@ -1027,6 +1027,30 @@ class TestScanner(unittest.TestCase):
         self.assertEqual(s.problems, [])
         self.assertEqual([d for d in s.defs if d.embedded], [])
 
+    def test_multi_line_quoted_text_holding_an_opener_or_an_interpreter_is_not_a_scan_problem(self):
+        # the round-3 gate's two controls: a quote opened on one line is still open on the next
+        for body in ('echo "\n<<EOF\n"\n', 'echo "\npython3 -c \'not python !\'\n"\n',
+                     "echo '\n$PY - <<EOT\n'\n"):
+            s = self.scan({"q.sh": "#!/usr/bin/env bash\n" + body})
+            self.assertEqual(s.problems, [], body)
+            self.assertEqual([d for d in s.defs if d.embedded], [], body)
+        ft = FixtureTree(self)
+        ft.append("hooks/post-commit-reindex.sh", '\necho "\n<<EOF\n"\necho "\npython3 -c \'not python !\'\n"\n')
+        self.assertEqual(ft.findings(), [])
+
+    def test_real_problems_after_a_multi_line_string_keep_their_line_numbers(self):
+        s = self.scan({"h.sh": '#!/usr/bin/env bash\necho "a\nb"\ncat <<\'NEVER\'\ndata\n'})
+        self.assertEqual(len(s.problems), 1)
+        self.assertIn("h.sh:4:", s.problems[0])
+        s = self.scan({"p.sh": "#!/usr/bin/env bash\necho \"a\nb\"\npython3 -c 'def (:'\n"})
+        self.assertEqual(len(s.problems), 1)
+        self.assertIn("p.sh:4:", s.problems[0])
+
+    def test_a_heredoc_opener_on_a_continuation_line_still_masks_its_body(self):
+        masked, payloads, problems = mc_reuse._mask_shell("cat \\\n  <<'EOT'\nnot code ( \" '\nEOT\necho after\n")
+        self.assertEqual(masked, ["cat \\", "  <<'EOT'", "", "", "echo after", ""])
+        self.assertEqual((payloads, problems), ([], []))
+
     def test_interpreter_invocations_count_after_assignments_exec_and_env_only(self):
         for line in ("X=1 python3 -c 'def one():\n    pass'", "exec python3 -c 'def one():\n    pass'",
                      "env X=1 python3 -c 'def one():\n    pass'", 'out=$("$PY" -c \'def one():\n    pass\')'):
