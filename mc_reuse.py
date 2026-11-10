@@ -678,6 +678,7 @@ _SH_KEEP_CMD = frozenset({"if", "then", "elif", "else", "while", "until", "do", 
                           "builtin", "eval", "!"})
 _SH_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _SH_ASSIGN_RE = re.compile(r"[A-Za-z_]\w*(?:\[[^\]]*\])?\+?=")
+_SH_WORD_BREAK = " \t\n;&|()<>"     # the one set that ends a word and, so, decides that a `#` starts a comment
 _SH_REDIR_RE = re.compile(r"(?:\d+|\{\w+\})?(?:<<<|<<-?|>>|>\||>&|<&|<>|&>>|&>|>|<)")
 
 
@@ -804,7 +805,7 @@ def _sh_parse(text: str, bodies: bool = False):
         return j
 
     def skip_comment(i):    # inside a skipped region: a `#` that starts a word is a comment; else i itself
-        if not bodies or (i and text[i - 1] not in " \t\n(;&|"):
+        if not bodies or (i and text[i - 1] not in _SH_WORD_BREAK):
             return i
         return take_comment(i)
 
@@ -869,8 +870,8 @@ def _sh_parse(text: str, bodies: bool = False):
                 depth += 1
             elif c == ")":
                 depth = max(0, depth - 1)
-            elif (c == "]" and depth == 0 and text.startswith("]]", i) and text[i - 1] in " \t\n;&|()<>"
-                  and (i + 2 >= n or text[i + 2] in " \t\n;&|()<>")):
+            elif (c == "]" and depth == 0 and text.startswith("]]", i) and text[i - 1] in _SH_WORD_BREAK
+                  and (i + 2 >= n or text[i + 2] in _SH_WORD_BREAK)):
                 return i + 2        # `]]` is a token: it is set off by whitespace or a metacharacter on both sides
             i += 1
         return n
@@ -967,7 +968,7 @@ def _sh_parse(text: str, bodies: bool = False):
                 j = skip_group(i)           # an array literal: nothing in it is a command word
                 buf.append(text[i:j])
                 i = j
-            elif c in " \t\n;&|()<>":
+            elif c in _SH_WORD_BREAK:
                 break
             else:
                 plain = False

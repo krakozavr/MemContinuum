@@ -482,6 +482,28 @@ class TestDelegationNeedsAnExecutableCall(unittest.TestCase):
                 self.assertEqual(len(found), 1, found)
                 self.assertIn("store-lint-schema: delegation:", found[0])
 
+    def test_one_word_boundary_set_decides_a_comment_inside_and_outside_skipped_regions(self):
+        def words(src):     # the command words of the masked text: the comments the parse reports are gone
+            return mc_reuse._sh_command_words("\n".join(mc_reuse._mask_shell(src)[0]))
+        for src in ("[[ (x)# ]]; mc_job\n", "((x)#); mc_job\n", "[[ x <# ]]; mc_job\n", "[[ x ># ]]; mc_job\n",
+                    "[[ (x) # ]]; mc_job\n", "arr=(foo#bar mc_job)\n"):
+            self.assertNotIn("mc_job", words(src), src)
+        self.assertEqual(words("[[ a#b ]]; mc_job\n"), {"mc_job"})      # `a#b` stays a word
+        self.assertEqual(words("[[ x ]]; mc_job # tail\n"), {"mc_job"})
+        # the complete check: the commented text reaches nothing and fires no `command` forbid
+        call = '    mc_store_lint_schema "$PY" "$memlint" "$MEMCONTINUUM_ROOT"\n'
+        # the comment eats the closer of its own region, so the next line closes it (an open one swallows the file)
+        for prefix, closer in (("[[ (x)# ]]; ", "]]"), ("((x)#); ", ")")):
+            ft = FixtureTree(self)
+            ft.replace("hooks/post-commit-reindex.sh", call, "    " + prefix + call.strip() + "\n    " + closer + "\n")
+            found = ft.findings()
+            self.assertEqual(len(found), 1, (prefix, found))
+            self.assertIn("store-lint-schema: delegation:", found[0])
+            self.assertIn("does not reach the job through the owner", found[0])
+            ft = FixtureTree(self)
+            ft.append("hooks/post-commit-reindex.sh", "\n" + prefix + 'python3 "$memlint"\n')
+            self.assertEqual(ft.findings(), [], prefix)
+
     def test_a_lint_call_that_ends_in_a_closing_backtick_is_a_direct_call(self):
         for line in ('out=`"$PY" "$memlint"`', '`python3 "$memlint"`', '`"$memlint"`', 'out=`"$PY" "$memlint" "$ROOT"`'):
             ft = FixtureTree(self)
