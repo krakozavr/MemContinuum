@@ -4054,35 +4054,60 @@ the store, caches and vendored code are outside the scan.
 
 **The scan.** Python definitions (functions, methods, nested functions, module
 constants, found under any compound statement: if, for, while, with, try, match and
-their async variants) are read with `ast`. Shell functions are read by a bounded scanner: the
-forms `name() {` and `function name {`, a body ending at the first `}` on its own
-line at the declaration's indentation (or on the declaration line); `name() (` and
-other forms are reported, never guessed at. One parse of the whole file (`_sh_parse`)
-is the only code that decides where a quote, a comment, a heredoc body, a continuation
-or a skipped group begins and ends; command words, rendered commands, interpreter
-starts, the comment and heredoc masking and the identifier compare all read it. A
-backslash-newline is dropped only outside single quotes. Comments (the `#` that
-starts a word outside quotes, whole-line or trailing; a `#` line inside a multi-line
-quoted string is text, and so a `# Heading` line in such a string is shell text that
-`token_owner` sees; one word-boundary set, the one that ends a word, decides it, so
-`)#`, `<#` and `>#` start a comment inside a skipped region exactly as outside one,
-and `a#b` stays a word) and heredoc bodies are dropped; a terminator line must equal
-the delimiter exactly (trailing blanks do not close the body). Python inside shell is
+their async variants) are read with `ast`. Shell functions are read from the one parse of the file (`_sh_parse`), not from
+lines: the forms `name() {`, `function name {` and `function name () {` at command
+position (the parse descends into `$( )` and backticks, so a real definition there
+counts), with the brace on the declaration's line or a later one, and a body ending
+at the `}` the parse pairs with that `{` (on its own line or after a `;`). A
+declaration-looking line inside a quoted string or an array literal is text, never a
+definition and never a function unit; a unit's calls and commands are the commands
+the parse recorded inside its extent. `name() (`, `name() command` and a function
+whose `}` the parse cannot find are reported, never guessed at. The same parse is
+the only code that decides where a quote, a comment, a heredoc body, a continuation,
+a skipped region or a function body begins and ends; command words, rendered
+commands, interpreter starts, the comment and heredoc masking and the identifier
+compare all read it. Every skipped region (a parenthesis group, `${...}`, `[[ ]]`,
+backticks) is walked by one shared step that reads quotes, comments, heredoc
+operators and bodies, continuations and nested arithmetic the same way whichever
+region it is in. A backslash-newline is dropped only outside single quotes (it joins
+the word, so a `#` after it is not a comment unless the joined text starts a word).
+Comments (the `#` that starts a word outside quotes, whole-line or trailing; a `#`
+line inside a multi-line quoted string is text, and so a `# Heading` line in such a
+string is shell text that `token_owner` sees; one word-boundary set, the one that
+ends a word, decides it, so `)#`, `<#` and `>#` start a comment inside a skipped
+region exactly as outside one, and `a#b` stays a word) and heredoc bodies are
+dropped; a terminator line must equal the delimiter exactly (trailing blanks do not
+close the body), and an unquoted heredoc joins a backslash-newline before the test,
+as Bash does. The `$( )` and backticks in an unquoted heredoc body run, so the
+commands in them are read. A heredoc opened inside a skipped region (not an
+arithmetic one, where `<<` is a shift, also inside a `$( )` in a `${...}`) has its
+body consumed at the next newline. Python inside shell is
 scanned as Python: a heredoc fed to an interpreter (`python - <<'EOF'`,
 `"$MC_PY" - <<'EOF'`; the interpreter word, a following `-` and the `<<` may sit on
 different physical lines of one command, for example joined by a backslash-newline)
 and a single-quoted `<interpreter> -c '...'` payload that starts on the interpreter's
-line (shell text after its closing quote is kept). A heredoc opened inside a skipped group (not an arithmetic one, where `<<` is a shift) has its body consumed at the next newline, and a `name() {` line inside a multi-line quoted string is text, not a definition. A `<<-` heredoc has its leading tabs
-removed from every payload line, as Bash does. Not scanned: double-quoted
-`-c "..."` payloads, Python held in a shell variable, extension-less scripts. A
+line (shell text after its closing quote is kept). A `<<-` heredoc has its leading
+tabs removed from every payload line, as Bash does. Not scanned: double-quoted
+`-c "..."` payloads, Python held in a shell variable, extension-less scripts.
+**Refused, not guessed:** a shape whose extent the scanner cannot decide exactly is a
+scan problem that fails the check (a finding naming the file and line), never a
+silent skip: a heredoc delimiter that holds a substitution or a `$'..'` / `$".."`
+quote (Bash quote-removes the delimiter and runs nothing in it; a plain, `'..'`,
+`".."` or `\`-quoted word is read exactly, and the rest of the file is then treated
+as data), a heredoc never closed, a `case` inside a skipped group, a `#` comment
+inside a backtick substitution, a command substitution in an unquoted heredoc body
+that runs past the terminator, and the unsupported function forms above. A
 registered symbol the scanner cannot read fails with a diagnostic naming the
-supported forms; a recognised Python payload that does not parse, and a heredoc
-that is never closed, are scan problems reported with the file and the line of the
-payload or opener (a finding), never skipped. "Bounded" names the syntax the scanner
-covers, not its resources: files are read whole, the scan is linear in file size
-except that the closing-brace search of each unclosed shell declaration reads to the
-end of the file (quadratic only for a file with very many unclosed declarations),
-and there is no size cap.
+supported forms; a recognised Python payload that does not parse is a scan problem
+reported with the file and the line of the payload (a finding), never skipped. The
+walker-by-feature table in `tests/test_reuse_inventory.py` (`ShellWalkerMatrixTest`)
+lists every context and feature as handled, refused or not applicable; the one kind of
+cell that is none of these is a `$( )` or backtick inside an array literal, a
+`${...}`, a `[[ ]]` or an arithmetic group: Bash runs it, the scanner records no
+command from it (a miss that is fail-closed for a call to the owner and fail-open for
+a `command` forbid, and stays disclosed). "Bounded" names the syntax the scanner
+covers, not its resources: files are read whole, the scan is linear in file size, and
+there is no size cap.
 
 **The methods** (only these exist):
 
