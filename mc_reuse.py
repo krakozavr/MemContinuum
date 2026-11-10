@@ -746,7 +746,8 @@ def _sh_parse(text: str):
     operators that sit outside quotes. A bounded tokenizer, not a Bash parser:
     words, quotes, `$(( ))`/`(( ))` blobs, redirections (an operator consumes
     its operand word), `case` patterns and `name() {` declarations are told
-    apart from commands; `eval`, `exec`, `time`, `!` and the like keep command
+    apart from commands; `[[ ]]`, `for ((...))` headers, extglob groups in case
+    patterns and any `(` that does not start a command are skipped whole; `eval`, `exec`, `time`, `!` and the like keep command
     position, `command -v/-V/-p` do not."""
     n = len(text)
     cmds = []
@@ -781,6 +782,33 @@ def _sh_parse(text: str):
                 depth -= 1
                 if depth == 0:
                     return i + 1
+            i += 1
+        return n
+
+    def skip_dbracket(i):   # i is just after a `[[` word: the index after its closing `]]`
+        depth = 0
+        while i < n:
+            c = text[i]
+            if c == "\\":
+                i += 2
+                continue
+            if c == "'":
+                j = text.find("'", i + 1)
+                i = n if j < 0 else j + 1
+                continue
+            if c == '"':
+                i += 1
+                while i < n and text[i] != '"':
+                    i += 2 if text[i] == "\\" else 1
+                i += 1
+                continue
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth = max(0, depth - 1)
+            elif (c == "]" and depth == 0 and text.startswith("]]", i) and text[i - 1] in " \t\n"
+                  and (i + 2 >= n or text[i + 2] in " \t\n;&|)")):
+                return i + 2
             i += 1
         return n
 
@@ -923,7 +951,9 @@ def _sh_parse(text: str):
                 continue
             if c == "(":
                 if cases and cases[-1] == "pat":
-                    i += 1
+                    # an extglob group (`@(`, `?(`, `*(`, `+(`, `!(`) is part of the pattern: its `)` does not end
+                    # the clause; a bare `(` is the optional opener of the pattern list
+                    i = skip_group(i) if i and text[i - 1] in "@?*+!" else i + 1
                     continue
                 if at_cmd and text.startswith("((", i):
                     i = skip_group(i)       # an arithmetic command: nothing in it is a command word
@@ -935,6 +965,11 @@ def _sh_parse(text: str):
                 if k < n and text[k] == ")":    # `()` of a declaration spelled `function f ()`
                     i = k + 1
                     at_cmd = True
+                    continue
+                if not at_cmd:
+                    # a `(` that does not open a command (`for ((init; cond; step))`, a stray group after
+                    # words): nothing in it is a command word
+                    i = skip_group(i)
                     continue
                 end_cmd()
                 i = parse_seq(i + 1, ")")
@@ -968,6 +1003,11 @@ def _sh_parse(text: str):
             if at_cmd:
                 if _SH_ASSIGN_RE.match(w.raw):
                     assigns.append(w.text)
+                    continue
+                if w.raw == "[[":
+                    # a conditional expression: its words and parentheses are not commands
+                    i = skip_dbracket(i)
+                    swallow, at_cmd = True, False
                     continue
                 if w.bare:
                     r = w.raw
@@ -1031,7 +1071,8 @@ def _sh_command_words(text: str) -> set:
     must be exactly the identifier, bare or as one quoted piece (`"mc_job"`).
     Not command words: arguments (of `type`, `declare -f`, `command -v`,
     `hash`, `unset`, ...), the operand of a redirection, a `case` pattern, the
-    contents of `(( ))` and of an array literal, a longer word (`mc_job"x"`,
+    contents of `(( ))`, `[[ ]]`, a `for ((...))` header, an extglob group and of an
+    array literal, a call inside any of those (not seen), a longer word (`mc_job"x"`,
     `mc_job/x`), single-quoted text and the name in a `name() {` /
     `function name {` declaration. Launchers (`xargs`, `find -exec`, `sudo`,
     `env`, `timeout`, `coproc`, `command -p`), a function passed by name and a

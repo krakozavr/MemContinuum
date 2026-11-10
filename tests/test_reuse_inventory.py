@@ -435,6 +435,37 @@ class TestDelegationNeedsAnExecutableCall(unittest.TestCase):
         self.assertIn("no executable reference", f[0])
         self.assertEqual(self.check(files, _deleg_row(["l.py"], owner="a.py#K")), [])
 
+    def test_post_commit_whose_owner_call_became_a_non_command_parenthesis_fails_with_only_that_finding(self):
+        # the round-3 gate's escapes: each leaves a mention of the owner where its call was, and none runs it
+        for repl in ("[[ (mc_store_lint_schema) ]]",
+                     "for ((mc_store_lint_schema;0;0)); do :; done",
+                     "case x in @(a)mc_store_lint_schema) :;; esac"):
+            ft = FixtureTree(self)
+            ft.replace("hooks/post-commit-reindex.sh",
+                       '    mc_store_lint_schema "$PY" "$memlint" "$MEMCONTINUUM_ROOT"\n', "    " + repl + "\n")
+            found = ft.findings()
+            self.assertEqual(len(found), 1, (repl, found))
+            self.assertIn("store-lint-schema: delegation:", found[0])
+            self.assertIn("does not reach the job through the owner", found[0])
+            self.assertIn("post-commit-reindex.sh", found[0])
+
+    def test_a_string_inside_a_conditional_is_not_a_direct_lint_call(self):
+        ft = FixtureTree(self)
+        ft.append("hooks/post-commit-reindex.sh", '\n[[ ("python3 memlint.py") ]]\n')
+        self.assertEqual(ft.findings(), [])
+
+    def test_calls_inside_a_conditional_branch_and_a_subshell_still_count(self):
+        owner = "a.sh#mc_job"
+        base = {"a.sh": "mc_job() {\n    echo hi\n}\n"}
+        for name, body in {"if-double-bracket": 'if [[ -n "$x" ]]; then mc_job; fi\n',
+                           "subshell": "( mc_job )\n",
+                           "after-conditional": "[[ -n $x ]] && mc_job\n",
+                           "char-class-in-conditional": "[[ a == [[:alpha:]] ]] && mc_job\n",
+                           "for-body": "for ((i=0;i<3;i++)); do mc_job; done\n",
+                           "case-after-extglob": "case x in @(a|b(c))) mc_job;; esac\n"}.items():
+            files = dict(base, **{"c.sh": "#!/usr/bin/env bash\n" + body})
+            self.assertEqual(self.check(files, _deleg_row(["c.sh"], owner=owner)), [], name)
+
     def test_shell_calls_through_a_pipe_a_substitution_and_an_assignment_are_clean(self):
         owner = "a.sh#mc_job"
         base = {"a.sh": "mc_job() {\n    echo hi\n}\n"}
@@ -484,6 +515,11 @@ class TestDelegationNeedsAnExecutableCall(unittest.TestCase):
             "case-pattern": 'case $x in\n    mc_job)\n        echo hi\n        ;;\nesac\n',
             "case-pattern-alternation": 'case $x in (a|mc_job) echo hi;; esac\n',
             "arithmetic-command": "((mc_job))\n",
+            "double-bracket-group": "[[ (mc_job) ]]\n",
+            "double-bracket-substitution": "[[ $(mc_job) == x ]]\n",
+            "for-arithmetic-header": "for ((mc_job;0;0)); do :; done\n",
+            "case-extglob-then-word": "case x in @(a)mc_job) :;; esac\n",
+            "single-bracket-group": "[ (mc_job) ]\n",
             "array-literal": "arr=(mc_job)\n",
             "array-append": "arr+=(mc_job other)\n",
             "local-array": "f() {\n    local arr=(mc_job)\n}\n",
