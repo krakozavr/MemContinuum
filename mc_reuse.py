@@ -714,7 +714,7 @@ class _ShWord:
         """The identifier this word spells -- bare (`mc_job`) or as one quoted
         piece (`"mc_job"`, `'mc_job'`) -- else ''. `mc_job"x"`, `mc_job$x`,
         `mc_job/x` are longer words, not the identifier."""
-        r = self.raw
+        r = self.raw.replace("\\\n", "")     # a backslash-newline joins the word (`mc_job\<nl>`), as in bash
         if _SH_IDENT_RE.fullmatch(r):
             return r
         if len(r) > 2 and r[0] in "'\"" and r[-1] == r[0] and _SH_IDENT_RE.fullmatch(r[1:-1]):
