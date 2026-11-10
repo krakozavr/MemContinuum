@@ -449,6 +449,15 @@ class TestDelegationNeedsAnExecutableCall(unittest.TestCase):
             self.assertIn("does not reach the job through the owner", found[0])
             self.assertIn("post-commit-reindex.sh", found[0])
 
+    def test_a_lint_call_that_ends_in_a_closing_backtick_is_a_direct_call(self):
+        for line in ('out=`"$PY" "$memlint"`', '`python3 "$memlint"`', '`"$memlint"`', 'out=`"$PY" "$memlint" "$ROOT"`'):
+            ft = FixtureTree(self)
+            ft.append("hooks/post-commit-reindex.sh", "\n" + line + "\n")
+            found = ft.findings()
+            for rid in ("store-lint-schema", "store-lint-append-only"):
+                d = only(found, rid, "delegation")
+                self.assertTrue(any("bypassing the owner" in x for x in d), (line, rid, found))
+
     def test_a_string_inside_a_conditional_is_not_a_direct_lint_call(self):
         ft = FixtureTree(self)
         ft.append("hooks/post-commit-reindex.sh", '\n[[ ("python3 memlint.py") ]]\n')
@@ -482,6 +491,9 @@ class TestDelegationNeedsAnExecutableCall(unittest.TestCase):
             "inline-subst": 'echo "got $(mc_job)"\n',
             "double-quoted": '"mc_job" a\n',
             "single-quoted-word": "'mc_job' a\n",
+            "backtick-bare": "`mc_job`\n",
+            "backtick-assigned": "out=`mc_job`\n",
+            "for-body-after-arithmetic-header": "for ((i=0; i<3; i++)); do mc_job; done\n",
             "continued-command-word": "mc_job\\\n  arg\n",
             "continued-command-word-quoted": '"mc_job"\\\n  arg\n',
             "eval-plain": "eval mc_job\n",
@@ -517,6 +529,12 @@ class TestDelegationNeedsAnExecutableCall(unittest.TestCase):
             "case-pattern": 'case $x in\n    mc_job)\n        echo hi\n        ;;\nesac\n',
             "case-pattern-alternation": 'case $x in (a|mc_job) echo hi;; esac\n',
             "arithmetic-command": "((mc_job))\n",
+            "subscript-array-literal": "a[0]=(mc_job)\n",
+            "subscript-array-append": "arr[i]+=(mc_job other)\n",
+            "local-subscript-array": "f() {\n    local a[0]=(mc_job)\n}\n",
+            "for-arithmetic-header-with-redirection-shape": "for ((i=0; mc_job<0; i++)); do :; done\n",
+            "for-arithmetic-header-empty-init": "for ((;mc_job<0;)); do :; done\n",
+            "for-variable-named-like-the-owner": "for mc_job in a b; do echo x; done\n",
             "double-bracket-group": "[[ (mc_job) ]]\n",
             "double-bracket-substitution": "[[ $(mc_job) == x ]]\n",
             "for-arithmetic-header": "for ((mc_job;0;0)); do :; done\n",
@@ -658,9 +676,13 @@ class TestPositiveControls(unittest.TestCase):
             self.assertIn("a `for ((...))` header, an extglob group or any parenthesis that is not a subshell is "
                           "skipped whole and NOT seen", rows[rid]["coverage_limit"], rid)
             self.assertIn("`[[ ]]`", rows[rid]["coverage_limit"], rid)
+        for rid in ("store-lint-schema", "store-lint-append-only"):
+            self.assertIn("the forbid sees it; the reach check does not", rows[rid]["coverage_limit"], rid)
         internals = (TOOLS_DIR / "docs" / "INTERNALS.md").read_text(encoding="utf-8")
         self.assertIn("so a call written inside them is NOT seen", internals)
         self.assertIn("A word continued over a backslash-newline", internals)
+        self.assertIn("single- or double-quoted piece", internals)
+        self.assertNotIn("single-quoted text or a longer word", internals)
         self.assertIn("inlined lint call that keeps the probe is caught", rows["store-lint-schema"]["coverage_limit"])
         self.assertIn("whole-second", rows["shell-millisecond-clock"]["coverage_limit"])
 

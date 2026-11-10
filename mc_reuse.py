@@ -764,6 +764,7 @@ def _sh_parse(text: str, bodies: bool = False):
     n = len(text)
     cmds = []
     heredocs = []
+    closers = []        # the closer of each open parse_seq: a backtick ends a word inside a backtick substitution
     pending = []        # heredocs whose body starts at the next newline (bodies=True)
 
     def take_bodies(i):     # i is just after a newline: consume the bodies of the pending heredocs
@@ -909,13 +910,15 @@ def _sh_parse(text: str, bodies: bool = False):
                 j = skip_brace(i + 1)
                 buf.append(text[i:j])
                 i = j
+            elif c == "`" and i > start and closers[-1] == "`":
+                break           # the closing backtick of the substitution this word is in
             elif c == "`":
                 buf.append("`...`")
                 i = parse_seq(i + 1, "`")
             elif c in "<>" and text.startswith("(", i + 1):
                 buf.append(c + "(...)")
                 i = parse_seq(i + 2, ")")
-            elif c == "(" and re.fullmatch(r"[A-Za-z_]\w*\+?=", text[start:i]):
+            elif c == "(" and re.fullmatch(r"[A-Za-z_]\w*(?:\[[^\]]*\])?\+?=", text[start:i]):
                 j = skip_group(i)           # an array literal: nothing in it is a command word
                 buf.append(text[i:j])
                 i = j
@@ -927,6 +930,13 @@ def _sh_parse(text: str, bodies: bool = False):
         return _ShWord(start, text[start:i], "".join(buf)), i
 
     def parse_seq(i, closer):
+        closers.append(closer)
+        try:
+            return parse_seq_body(i, closer)
+        finally:
+            closers.pop()
+
+    def parse_seq_body(i, closer):
         at_cmd = True           # the next word starts a simple command
         swallow = False         # the rest of this simple command is not a command (after `command -v`, `((..))`)
         redir = False           # the next word is a redirection operand
@@ -1117,11 +1127,12 @@ def _sh_command_words(text: str) -> set:
     `|`, `&&`, `||`, `;`, `&`, a newline, `!`, `{`, `(`, and the keywords
     if/then/elif/else/while/until/do/time/exec/command/builtin/eval. The word
     must be exactly the identifier, bare or as one quoted piece (`"mc_job"`).
+    A word that is exactly the identifier in single or double quotes counts.
     Not command words: arguments (of `type`, `declare -f`, `command -v`,
     `hash`, `unset`, ...), the operand of a redirection, a `case` pattern, the
     contents of `(( ))`, `[[ ]]`, a `for ((...))` header, an extglob group and of an
     array literal, a call inside any of those (not seen), a longer word (`mc_job"x"`,
-    `mc_job/x`), single-quoted text and the name in a `name() {` /
+    `mc_job/x`), quoted text that is not the whole word and the name in a `name() {` /
     `function name {` declaration. Launchers (`xargs`, `find -exec`, `sudo`,
     `env`, `timeout`, `coproc`, `command -p`), a function passed by name and a
     `$( )` nested inside `$(( ))` are not seen."""
@@ -1356,7 +1367,7 @@ def _guard_token_owner(scan, row, owner, params):
 def _guard_delegation(scan, row, owner, params):
     """Every named consumer must EXECUTE the owner: a shell command word, a
     Python call (`f(...)` or `x.f(...)`). A mention (a `type` probe, a bare
-    import, a string) does not count. A constant owner is reached by a value
+    import, a string, quoted text that is not a whole command word) does not count. A constant owner is reached by a value
     reference (a Name load) instead."""
     refs = set(params.get("refs") or [owner.name])
     forbid = [(scope, re.compile(rx)) for scope, rx in map(_forbid_entry, params.get("forbid", []))]
