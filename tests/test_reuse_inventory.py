@@ -458,6 +458,14 @@ class TestDelegationNeedsAnExecutableCall(unittest.TestCase):
                 d = only(found, rid, "delegation")
                 self.assertTrue(any("bypassing the owner" in x for x in d), (line, rid, found))
 
+    def test_a_continued_assignment_prefix_makes_an_array_literal_that_renders_no_command(self):
+        for src in ("foo=\\\n(command python3 memlint.py)\n", "foo+=\\\n(command python3 memlint.py)\n",
+                    "a[0]=\\\n(command python3 memlint.py)\n"):
+            self.assertEqual(mc_reuse._sh_command_words(src), set(), src)
+            self.assertEqual(mc_reuse._sh_command_strings(src), (), src)
+        # a real newline ends the assignment, so the parentheses are a subshell that bash runs
+        self.assertEqual(mc_reuse._sh_command_words("foo=\n(mc_job)\n"), {"mc_job"})
+
     def test_a_string_inside_a_conditional_is_not_a_direct_lint_call(self):
         ft = FixtureTree(self)
         ft.append("hooks/post-commit-reindex.sh", '\n[[ ("python3 memlint.py") ]]\n')
@@ -496,6 +504,7 @@ class TestDelegationNeedsAnExecutableCall(unittest.TestCase):
             "for-body-after-arithmetic-header": "for ((i=0; i<3; i++)); do mc_job; done\n",
             "continued-command-word": "mc_job\\\n  arg\n",
             "continued-command-word-quoted": '"mc_job"\\\n  arg\n',
+            "assignment-then-a-real-newline-then-a-subshell": "foo=\n(mc_job)\n",
             "continuation-inside-a-double-quoted-name": '"mc_\\\njob" arg\n',
             "eval-plain": "eval mc_job\n",
             "eval-double-quoted": 'eval "mc_job"\n',
@@ -542,6 +551,9 @@ class TestDelegationNeedsAnExecutableCall(unittest.TestCase):
             "case-extglob-then-word": "case x in @(a)mc_job) :;; esac\n",
             "single-bracket-group": "[ (mc_job) ]\n",
             "array-literal": "arr=(mc_job)\n",
+            "continued-assignment-array-literal": "foo=\\\n(mc_job)\n",
+            "continued-append-array-literal": "foo+=\\\n(mc_job)\n",
+            "continued-subscript-array-literal": "a[0]=\\\n(mc_job)\n",
             "array-append": "arr+=(mc_job other)\n",
             "local-array": "f() {\n    local arr=(mc_job)\n}\n",
             "longer-word-quoted-suffix": 'mc_job"other"\n',

@@ -945,7 +945,7 @@ def _sh_parse(text: str, bodies: bool = False):
                 plain = False
                 buf.append(c + "(...)")
                 i = parse_seq(i + 2, ")")
-            elif c == "(" and re.fullmatch(r"[A-Za-z_]\w*(?:\[[^\]]*\])?\+?=", text[start:i]):
+            elif c == "(" and re.fullmatch(r"[A-Za-z_]\w*(?:\[[^\]]*\])?\+?=", joined(start, i)):
                 plain = False
                 j = skip_group(i)           # an array literal: nothing in it is a command word
                 buf.append(text[i:j])
