@@ -21,13 +21,21 @@ The shell scanner is a documented, bounded scanner, not a Bash parser:
     line or the next); the body ends at the first line that is exactly `}` at
     the declaration's indentation, or on the declaration line itself for a
     one-liner. `name() (` and other forms are reported, never guessed at.
-  * comments: whole-line `#` comments and quote-aware trailing comments are
-    dropped from every text the guards read.
-  * heredoc bodies are dropped from the shell text. A heredoc fed to a python
-    interpreter (`python - <<'EOF'`, `"$MC_PY" - <<'EOF'`) and a single-quoted
-    `<interpreter> -c '...'` payload are extracted and scanned as Python.
-    A double-quoted `-c "..."` payload and Python held in a shell variable are
-    NOT scanned.
+  * one lexical authority: `_sh_parse` is the only code that decides where a
+    quote, a comment, a heredoc body, a continuation or a skipped group begins
+    and ends; command words, command rendering, interpreter starts, the
+    heredoc and comment masking and the identifier compare all read that parse.
+    A backslash-newline is dropped only outside single quotes, by the reader.
+  * comments: the `#` comments that parse reports (a `#` that starts a word
+    outside quotes, whole-line or trailing) are dropped from every text the
+    guards read; a `#` line inside a multi-line quoted string is text.
+  * heredoc bodies are dropped from the shell text; a terminator line must
+    equal the delimiter exactly (leading tabs are stripped for `<<-` only). A
+    heredoc fed to a python interpreter (`python - <<'EOF'`, `"$MC_PY" - <<'EOF'`,
+    the interpreter and the `<<` possibly on different physical lines of one
+    command) and a single-quoted `<interpreter> -c '...'` payload are
+    extracted and scanned as Python. A double-quoted `-c "..."` payload and
+    Python held in a shell variable are NOT scanned.
 """
 from __future__ import annotations
 
@@ -723,16 +731,21 @@ class _ShHeredoc:
 
 @functools.lru_cache(maxsize=64)
 def _sh_parse(text: str, bodies: bool = False):
-    """`(commands, heredocs)` of `text`: every simple command -- including the
-    ones inside `$( )`, backticks, `<( )` and `( )` -- and every `<<` / `<<-`
-    operator that sits outside quotes (`_ShHeredoc`). `bodies=False` is for text
-    whose comments and heredoc bodies are already removed; `bodies=True` is for
-    raw source: comments are skipped and, at the newline after the operator, the
-    heredoc body is consumed up to its terminator line. A bounded tokenizer, not a Bash parser:
+    """`(commands, heredocs, comments)` of `text`: every simple command --
+    including the ones inside `$( )`, backticks, `<( )` and `( )` -- every
+    `<<` / `<<-` operator that sits outside quotes (`_ShHeredoc`, with the
+    command it belongs to) and, with `bodies=True`, the `(start, end)` span of
+    every comment. `bodies=False` is for text whose comments and heredoc bodies
+    are already removed; `bodies=True` is for raw source: comments are skipped
+    and recorded and, at the newline after the operator, the heredoc body is
+    consumed up to its terminator line (compared exactly). This is the one place that
+    decides where a quote, a comment, a heredoc body, a continuation or a skipped
+    group begins and ends; a skipped region is walked with the same quote and
+    escape reader as a word. A bounded tokenizer, not a Bash parser:
     words, quotes, `$(( ))`/`(( ))` blobs, redirections (an operator consumes
     its operand word), `case` patterns and `name() {` declarations are told
     apart from commands; `[[ ]]`, `for ((...))` headers, extglob groups in case
-    patterns and any `(` that does not start a command are skipped whole; `eval`, `exec`, `time`, `!` and the like keep command
+    patterns, array literals and any `(` that does not start a command are skipped whole; `eval`, `exec`, `time`, `!` and the like keep command
     position, `command -v/-V/-p` do not."""
     n = len(text)
     cmds = []
@@ -1151,7 +1164,8 @@ def _sh_command_words(text: str) -> set:
     Not command words: arguments (of `type`, `declare -f`, `command -v`,
     `hash`, `unset`, ...), the operand of a redirection, a `case` pattern, the
     contents of `(( ))`, `[[ ]]`, a `for ((...))` header, an extglob group and of an
-    array literal, a call inside any of those (not seen), a longer word (`mc_job"x"`,
+    array literal (also one whose `name=` is continued over a backslash-newline), a call
+    inside any of those (not seen), a longer word (`mc_job"x"`,
     `mc_job/x`), quoted text that is not the whole word and the name in a `name() {` /
     `function name {` declaration. Launchers (`xargs`, `find -exec`, `sudo`,
     `env`, `timeout`, `coproc`, `command -p`), a function passed by name and a
@@ -1387,8 +1401,9 @@ def _guard_token_owner(scan, row, owner, params):
 def _guard_delegation(scan, row, owner, params):
     """Every named consumer must EXECUTE the owner: a shell command word, a
     Python call (`f(...)` or `x.f(...)`). A mention (a `type` probe, a bare
-    import, a string, quoted text that is not a whole command word) does not count. A constant owner is reached by a value
-    reference (a Name load) instead."""
+    import, quoted text that is not the whole command word -- `"mc_job x"`,
+    `mc_job"x"`) does not count; a word that is exactly the name in quotes does.
+    A constant owner is reached by a value reference (a Name load) instead."""
     refs = set(params.get("refs") or [owner.name])
     forbid = [(scope, re.compile(rx)) for scope, rx in map(_forbid_entry, params.get("forbid", []))]
     by_value = owner.kind == "const"
