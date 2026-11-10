@@ -451,6 +451,15 @@ class TestDelegationNeedsAnExecutableCall(unittest.TestCase):
             self.assertIn("does not reach the job through the owner", found[0])
             self.assertIn("post-commit-reindex.sh", found[0])
 
+    def test_a_conditional_closer_is_a_token_set_off_by_metacharacters(self):
+        words = mc_reuse._sh_command_words
+        for src in ("[[ x ]]>/dev/null; mc_job\n", "[[ -n x ]]</dev/null; mc_job\n", "[[ ( -n x )]]; mc_job\n",
+                    '[[ "$x" == "]]" ]]; mc_job\n', "[[ x ]];mc_job\n", "[[ x ]]&&mc_job\n", "[[ ( x ) ]]|mc_job\n"):
+            self.assertEqual(words(src), {"mc_job"}, src)
+        # a `]]` glued to a word is not the closer
+        self.assertEqual(words("[[ a == b]] ]] ; mc_job\n"), {"mc_job"})
+        self.assertEqual(words("[[ a == b]]; mc_job ]]; echo\n"), {"echo"})
+
     def test_skipped_regions_read_quotes_and_escapes_as_ordinary_words_do(self):
         words = mc_reuse._sh_command_words
         self.assertNotIn("mc_job", words('for ((i="\\"))";x=";mc_job;";0)); do :; done\n'))

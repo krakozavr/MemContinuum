@@ -863,9 +863,9 @@ def _sh_parse(text: str, bodies: bool = False):
                 depth += 1
             elif c == ")":
                 depth = max(0, depth - 1)
-            elif (c == "]" and depth == 0 and text.startswith("]]", i) and text[i - 1] in " \t\n"
-                  and (i + 2 >= n or text[i + 2] in " \t\n;&|)")):
-                return i + 2
+            elif (c == "]" and depth == 0 and text.startswith("]]", i) and text[i - 1] in " \t\n;&|()<>"
+                  and (i + 2 >= n or text[i + 2] in " \t\n;&|()<>")):
+                return i + 2        # `]]` is a token: it is set off by whitespace or a metacharacter on both sides
             i += 1
         return n
 
