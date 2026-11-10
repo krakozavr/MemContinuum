@@ -539,7 +539,7 @@ def _mask_shell(text: str):
     def line_of(off):
         return bisect.bisect_right(offsets, off) - 1
 
-    cmds, heredocs, comments = _sh_parse(text, True)
+    cmds, heredocs, comments, _quotes = _sh_parse(text, True)
     edits = []      # (start, end, replacement): spans of `text` to rewrite; a replacement keeps the newlines
     for s0, e0 in comments:                 # a comment goes, with the blanks before it
         while s0 > 0 and text[s0 - 1] in " \t":
@@ -606,6 +606,10 @@ def _scan_shell(scan, rel, text):
         scan.problems.append(f"{rel}:{lineno}: {msg}")
     n = len(masked)
     funcs = []   # (start, end, name, rest)
+    line_start = [0]
+    for ln in text.split("\n"):
+        line_start.append(line_start[-1] + len(ln) + 1)
+    quotes = _sh_parse(text, True)[3]       # the multi-line quoted pieces of the one parse
     for i in range(n):
         line = masked[i]
         if not line.strip():
@@ -613,6 +617,9 @@ def _scan_shell(scan, rel, text):
         m = _SH_DECL_RE.match(line)
         if not m:
             continue
+        at = line_start[i] + len(m.group("indent"))
+        if any(qs < at < qe for qs, qe in quotes):
+            continue                        # a `name() {` line inside a multi-line quoted string is text, not a definition
         name = m.group("fname") or m.group("name")
         rest = m.group("rest").strip()
         indent = m.group("indent")
@@ -755,6 +762,7 @@ def _sh_parse(text: str, bodies: bool = False):
     closers = []        # the closer of each open parse_seq: a backtick ends a word inside a backtick substitution
     pending = []        # heredocs whose body starts at the next newline (bodies=True)
     comments = []       # (start, end) of each `#` comment outside quotes (bodies=True)
+    quotes = []         # (start, end) of each quoted piece that spans a newline (bodies=True or not)
     cont = []           # offsets of the backslash-newlines the reader dropped outside single quotes, in order
 
     def joined(a, b):   # text[a:b] without those continuations: the word as bash joins it
@@ -792,9 +800,9 @@ def _sh_parse(text: str, bodies: bool = False):
         return text[i] in "'\"" or text.startswith("$'", i)
 
     def skip_quote(i):      # the index after the quoted piece at text[i], read by the word reader; a skipped
-        mark = (len(cmds), len(heredocs), len(comments))    # region's commands, heredocs and comments are not recorded
-        j = read_quoted(i, [])
-        del cmds[mark[0]:], heredocs[mark[1]:], comments[mark[2]:]
+        mark = (len(cmds), len(heredocs), len(comments), len(quotes))   # region's commands, heredocs, comments
+        j = read_quoted(i, [])                                          # and quotes are not recorded
+        del cmds[mark[0]:], heredocs[mark[1]:], comments[mark[2]:], quotes[mark[3]:]
         kept = {id(h) for h in heredocs}
         pending[:] = [r for r in pending if id(r) in kept]
         return j
@@ -812,9 +820,9 @@ def _sh_parse(text: str, bodies: bool = False):
 
     def skip_heredoc_op(i):     # text[i:] is a `<<` / `<<-` inside a skipped group: the index after its delimiter word;
         m = _SH_HEREDOC_OP_RE.match(text, i)    # the heredoc is recorded and its body consumed at the next newline
-        mark = (len(cmds), len(heredocs), len(comments))
+        mark = (len(cmds), len(heredocs), len(comments), len(quotes))
         w, j = read_word(m.end())
-        del cmds[mark[0]:], heredocs[mark[1]:], comments[mark[2]:]
+        del cmds[mark[0]:], heredocs[mark[1]:], comments[mark[2]:], quotes[mark[3]:]
         rec = _ShHeredoc(i, bool(m.group(1)), w.text)
         heredocs.append(rec)
         if w.text:
@@ -931,6 +939,12 @@ def _sh_parse(text: str, bodies: bool = False):
         return n
 
     def read_quoted(i, buf):    # the quoted piece at text[i] ('...', "..." or $'...'): its text into buf, the index after it
+        j = read_quoted_piece(i, buf)
+        if "\n" in text[i:j]:
+            quotes.append((i, j))
+        return j
+
+    def read_quoted_piece(i, buf):
         if text[i] == "'":
             j = text.find("'", i + 1)
             buf.append(text[i + 1:] if j < 0 else text[i + 1:j])
@@ -1172,7 +1186,7 @@ def _sh_parse(text: str, bodies: bool = False):
     parse_seq(0, "")
     if pending:
         pending[0].closed = False       # an opener on the last line: there is no body to find
-    return tuple(cmds), tuple(heredocs), tuple(comments)
+    return tuple(cmds), tuple(heredocs), tuple(comments), tuple(quotes)
 
 
 def _sh_command_strings(text: str) -> tuple:

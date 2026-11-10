@@ -514,6 +514,17 @@ class TestDelegationNeedsAnExecutableCall(unittest.TestCase):
         self.assertEqual(words("((x = 1 << 2)); mc_job\n"), {"mc_job"})
         self.assertEqual(words("foo=($((1 << 2)) y)\nmc_job\n"), {"mc_job"})
 
+    def test_a_declaration_line_inside_a_multi_line_string_is_not_a_definition(self):
+        ft = FixtureTree(self)
+        ft.append("hooks/mc-path-lib.sh", 'echo "\nmc_join_semi() {\necho copied\n}\n"\n')
+        self.assertEqual(only(ft.findings(), "join-semicolon-list", "name_owner"), [])
+        ft = FixtureTree(self)
+        ft.append("hooks/mc-path-lib.sh", 'echo "\nmc_join_semi() {\necho copied\n}\n"\n'
+                  'mc_join_semi() {\n    echo real\n}\n')
+        f = only(ft.findings(), "join-semicolon-list", "name_owner")
+        self.assertEqual(len(f), 1, ft.findings())
+        self.assertIn("mc-path-lib.sh", f[0])
+
     def test_a_lint_call_that_ends_in_a_closing_backtick_is_a_direct_call(self):
         for line in ('out=`"$PY" "$memlint"`', '`python3 "$memlint"`', '`"$memlint"`', 'out=`"$PY" "$memlint" "$ROOT"`'):
             ft = FixtureTree(self)
