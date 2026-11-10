@@ -727,8 +727,8 @@ class TestPositiveControls(unittest.TestCase):
                 self.assertIn(miss, rows[rid]["coverage_limit"], (rid, miss))
         for rid in ("store-lint-schema", "store-lint-append-only", "shell-millisecond-clock"):
             self.assertIn("a command word continued over a backslash-newline is seen", rows[rid]["coverage_limit"], rid)
-            self.assertIn("a `for ((...))` header, an extglob group or any parenthesis that is not a subshell is "
-                          "skipped whole and NOT seen", rows[rid]["coverage_limit"], rid)
+            self.assertIn("a `for ((...))` header, an extglob group, an array literal or any `(` that does not "
+                          "start a command is skipped whole and NOT seen", rows[rid]["coverage_limit"], rid)
             self.assertIn("`[[ ]]`", rows[rid]["coverage_limit"], rid)
         for rid in ("store-lint-schema", "store-lint-append-only"):
             self.assertIn("the forbid sees it; the reach check does not", rows[rid]["coverage_limit"], rid)
@@ -1108,6 +1108,9 @@ class TestScanner(unittest.TestCase):
         masked, _p, _q = mc_reuse._mask_shell("echo a # mc_job\n# mc_job\necho a#b mc_job   # tail\n${#x}\n")
         self.assertEqual(masked, ["echo a", "", "echo a#b mc_job", "${#x}", ""])
         self.assertEqual(masked_words("echo a#b\n# mc_job\nmc_job # c\n"), ({"echo", "mc_job"}, []))
+        # a comment inside an array literal or a conditional is a comment there too: its quote does not open a string
+        self.assertEqual(masked_words("arr=(\n a  # don't\n b\n)\nmc_job # it's\n[[ x == y # no ) '\n ]]\nmc_two\n"),
+                         ({"mc_job", "mc_two"}, []))
         # the parse is the one place that decides: no second comment stripper remains
         self.assertFalse(hasattr(mc_reuse, "_strip_shell_comment"))
 

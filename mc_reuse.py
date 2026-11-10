@@ -790,12 +790,23 @@ def _sh_parse(text: str, bodies: bool = False):
         return text[i] in "'\"" or text.startswith("$'", i)
 
     def skip_quote(i):      # the index after the quoted piece at text[i], read by the word reader; a skipped
-        mark = (len(cmds), len(heredocs))       # region's commands and heredocs are not recorded
+        mark = (len(cmds), len(heredocs), len(comments))    # region's commands, heredocs and comments are not recorded
         j = read_quoted(i, [])
-        del cmds[mark[0]:], heredocs[mark[1]:]
+        del cmds[mark[0]:], heredocs[mark[1]:], comments[mark[2]:]
         kept = {id(h) for h in heredocs}
         pending[:] = [r for r in pending if id(r) in kept]
         return j
+
+    def take_comment(i):    # text[i] == "#" starts a comment: record it, the index of its end of line
+        j = text.find("\n", i)
+        j = n if j < 0 else j
+        comments.append((i, j))
+        return j
+
+    def skip_comment(i):    # inside a skipped region: a `#` that starts a word is a comment; else i itself
+        if not bodies or (i and text[i - 1] not in " \t\n(;&|"):
+            return i
+        return take_comment(i)
 
     def skip_group(i):      # text[i] == "(": the index after its matching ")"
         depth = 0
@@ -807,6 +818,11 @@ def _sh_parse(text: str, bodies: bool = False):
             if at_quote(i):
                 i = skip_quote(i)
                 continue
+            if c == "#":
+                j = skip_comment(i)
+                if j != i:
+                    i = j
+                    continue
             if c == "(":
                 depth += 1
             elif c == ")":
@@ -844,6 +860,11 @@ def _sh_parse(text: str, bodies: bool = False):
             if at_quote(i):
                 i = skip_quote(i)
                 continue
+            if c == "#":
+                j = skip_comment(i)
+                if j != i:
+                    i = j
+                    continue
             if c == "(":
                 depth += 1
             elif c == ")":
@@ -993,10 +1014,7 @@ def _sh_parse(text: str, bodies: bool = False):
                 i += 2
                 continue
             if c == "#" and bodies:
-                j = text.find("\n", i)
-                j = n if j < 0 else j
-                comments.append((i, j))
-                i = j
+                i = take_comment(i)
                 continue
             if c == closer and not (closer == ")" and cases and cases[-1] == "pat"):
                 end_cmd()
