@@ -801,6 +801,17 @@ def _sh_parse(text: str, bodies: bool = False):
                 break
         return i
 
+    def at_quote(i):        # a quoted piece starts at text[i]: '...', "..." or $'...'
+        return text[i] in "'\"" or text.startswith("$'", i)
+
+    def skip_quote(i):      # the index after the quoted piece at text[i], read by the word reader; a skipped
+        mark = (len(cmds), len(heredocs))       # region's commands and heredocs are not recorded
+        j = read_quoted(i, [])
+        del cmds[mark[0]:], heredocs[mark[1]:]
+        kept = {id(h) for h in heredocs}
+        pending[:] = [r for r in pending if id(r) in kept]
+        return j
+
     def skip_group(i):      # text[i] == "(": the index after its matching ")"
         depth = 0
         while i < n:
@@ -808,9 +819,8 @@ def _sh_parse(text: str, bodies: bool = False):
             if c == "\\":
                 i += 2
                 continue
-            if c in "'\"":
-                j = text.find(c, i + 1)
-                i = n if j < 0 else j + 1
+            if at_quote(i):
+                i = skip_quote(i)
                 continue
             if c == "(":
                 depth += 1
@@ -824,6 +834,12 @@ def _sh_parse(text: str, bodies: bool = False):
     def skip_brace(i):      # text[i] == "{": the index after its matching "}"
         depth = 0
         while i < n:
+            if text[i] == "\\":
+                i += 2
+                continue
+            if at_quote(i):
+                i = skip_quote(i)
+                continue
             if text[i] == "{":
                 depth += 1
             elif text[i] == "}":
@@ -840,15 +856,8 @@ def _sh_parse(text: str, bodies: bool = False):
             if c == "\\":
                 i += 2
                 continue
-            if c == "'":
-                j = text.find("'", i + 1)
-                i = n if j < 0 else j + 1
-                continue
-            if c == '"':
-                i += 1
-                while i < n and text[i] != '"':
-                    i += 2 if text[i] == "\\" else 1
-                i += 1
+            if at_quote(i):
+                i = skip_quote(i)
                 continue
             if c == "(":
                 depth += 1
@@ -894,6 +903,19 @@ def _sh_parse(text: str, bodies: bool = False):
                 i += 1
         return n
 
+    def read_quoted(i, buf):    # the quoted piece at text[i] ('...', "..." or $'...'): its text into buf, the index after it
+        if text[i] == "'":
+            j = text.find("'", i + 1)
+            buf.append(text[i + 1:] if j < 0 else text[i + 1:j])
+            return n if j < 0 else j + 1
+        if text[i] == '"':
+            return read_dq(i + 1, buf)
+        j = i + 2
+        while j < n and text[j] != "'":
+            j += 2 if text[j] == "\\" else 1
+        buf.append(text[i + 2:j])
+        return j + 1
+
     def read_word(i):
         start = i
         buf = []
@@ -907,20 +929,9 @@ def _sh_parse(text: str, bodies: bool = False):
                 elif i + 1 < n:
                     cont.append(i)      # backslash-newline outside single quotes is dropped
                 i += 2
-            elif c == "'":
-                j = text.find("'", i + 1)
-                buf.append(text[i + 1:] if j < 0 else text[i + 1:j])
-                i = n if j < 0 else j + 1
-            elif c == '"':
-                plain = False
-                i = read_dq(i + 1, buf)
-            elif c == "$" and text.startswith("$'", i):
-                plain = False
-                j = i + 2
-                while j < n and text[j] != "'":
-                    j += 2 if text[j] == "\\" else 1
-                buf.append(text[i + 2:j])
-                i = j + 1
+            elif at_quote(i):
+                plain = plain and c == "'"
+                i = read_quoted(i, buf)
             elif c == "$" and text.startswith("$((", i):
                 plain = False
                 j = skip_group(i + 1)

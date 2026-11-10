@@ -439,7 +439,9 @@ class TestDelegationNeedsAnExecutableCall(unittest.TestCase):
         # the round-3 gate's escapes: each leaves a mention of the owner where its call was, and none runs it
         for repl in ("[[ (mc_store_lint_schema) ]]",
                      "for ((mc_store_lint_schema;0;0)); do :; done",
-                     "case x in @(a)mc_store_lint_schema) :;; esac"):
+                     "case x in @(a)mc_store_lint_schema) :;; esac",
+                     # an escaped double quote does not end the header's string early (round-4 gate)
+                     'for ((i="\\"))";x=";mc_store_lint_schema;";0)); do :; done'):
             ft = FixtureTree(self)
             ft.replace("hooks/post-commit-reindex.sh",
                        '    mc_store_lint_schema "$PY" "$memlint" "$MEMCONTINUUM_ROOT"\n', "    " + repl + "\n")
@@ -448,6 +450,15 @@ class TestDelegationNeedsAnExecutableCall(unittest.TestCase):
             self.assertIn("store-lint-schema: delegation:", found[0])
             self.assertIn("does not reach the job through the owner", found[0])
             self.assertIn("post-commit-reindex.sh", found[0])
+
+    def test_skipped_regions_read_quotes_and_escapes_as_ordinary_words_do(self):
+        words = mc_reuse._sh_command_words
+        self.assertNotIn("mc_job", words('for ((i="\\"))";x=";mc_job;";0)); do :; done\n'))
+        self.assertEqual(words('arr=("\\")" mc_job)\n'), set())
+        self.assertEqual(words('a=(x $\'\\\')\' y); mc_job\n'), {"mc_job"})
+        self.assertEqual(words('x=${a:-"}"}; mc_job\n'), {"mc_job"})
+        self.assertEqual(words('[[ "\\"]]" ]]; mc_job\n'), {"mc_job"})
+        self.assertEqual(words('((x="a\\"))"));  mc_job\n'), {"mc_job"})
 
     def test_a_lint_call_that_ends_in_a_closing_backtick_is_a_direct_call(self):
         for line in ('out=`"$PY" "$memlint"`', '`python3 "$memlint"`', '`"$memlint"`', 'out=`"$PY" "$memlint" "$ROOT"`'):
