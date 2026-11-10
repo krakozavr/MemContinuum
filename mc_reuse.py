@@ -17,15 +17,22 @@ human-judged process; this module only keeps confirmed jobs from regressing.
 
 The shell scanner is a documented, bounded scanner, not a Bash parser:
 
-  * function declarations: `name() {` and `function name {` (brace on the same
-    line or the next); the body ends at the first line that is exactly `}` at
-    the declaration's indentation, or on the declaration line itself for a
-    one-liner. `name() (` and other forms are reported, never guessed at.
+  * function declarations come from the one parse (`_sh_parse`), at command
+    position (it descends into `$( )` and backticks): `name() {`, `function name {`
+    and `function name () {`, the brace on the same line or a later one; the body
+    ends at the `}` the parse pairs with the `{`, so a declaration-looking line in a
+    quote or an array literal is text and a real one inside a command substitution
+    is a definition. `name() (` and other forms are reported, never guessed at.
   * one lexical authority: `_sh_parse` is the only code that decides where a
-    quote, a comment, a heredoc body, a continuation or a skipped group begins
-    and ends; command words, command rendering, interpreter starts, the
-    heredoc and comment masking and the identifier compare all read that parse.
-    A backslash-newline is dropped only outside single quotes, by the reader.
+    quote, a comment, a heredoc body, a continuation, a skipped group or a function
+    body begins and ends; command words, command rendering, interpreter starts, the
+    heredoc and comment masking, the declarations and the identifier compare all
+    read that parse. Every skipped region (parenthesis group, `${ }`, `[[ ]]`,
+    backticks) is walked by its one `skip_region` step. A backslash-newline is
+    dropped only outside single quotes, by the reader.
+  * a boundary the parse cannot decide exactly is a scan problem, not a skip: a
+    heredoc delimiter that is not a plain or simply quoted word, a `case` inside a
+    skipped group, a `#` comment inside backticks, a function with no closing `}`.
   * comments: the `#` comments that parse reports (a `#` that starts a word
     outside quotes, whole-line or trailing) are dropped from every text the
     guards read; a `#` line inside a multi-line quoted string is text.
@@ -62,9 +69,6 @@ INVENTORY_RELPATH = "docs/REUSE-INVENTORY.json"
 
 _INTERP = r"(?:python[\w.]*|\$\{?\w*PY\w*\}?)"
 _PY_INLINE_RE = re.compile(r"(?i)\"?" + _INTERP + r"\"?\s+(?:-\w+\s+)*-c\s+'")
-_SH_DECL_RE = re.compile(
-    r"^(?P<indent>[ \t]*)(?:function[ \t]+(?P<fname>[A-Za-z_]\w*)[ \t]*(?:\([ \t]*\))?"
-    r"|(?P<name>[A-Za-z_]\w*)[ \t]*\([ \t]*\))[ \t]*(?P<rest>.*)$")
 
 
 class InventoryError(Exception):
@@ -517,29 +521,56 @@ def _sh_interpreter(cmd):
     return k if k < len(cmd.words) else None
 
 
-def _mask_shell(text: str):
-    """`(masked_lines, payloads, problems)`: the file's lines with comments,
-    heredoc bodies and python `-c '...'` payload bodies blanked (line numbers
-    preserved), the extracted python payloads as `(first_line_number, source)`,
-    and the `(line_number, message)` problems found (an unterminated heredoc).
-    The whole text is parsed once (`_sh_parse` with bodies=True) and every span
-    masked here -- comment, heredoc body, payload -- is a span that parse
-    reports, so a quote opened on one line is still open on the next, and a
-    `#`, a `<<` or an interpreter name inside it is text."""
+def _text_lines(text: str):
+    """`(lines, offsets)` of `text`: its lines, and the offset where each begins."""
     lines = text.split("\n")
-    n = len(lines)
-    payloads = []
-    problems = []
     offsets = []
     pos = 0
     for ln in lines:
         offsets.append(pos)
         pos += len(ln) + 1
+    return lines, offsets
+
+
+def _inline_py_words(text, cmds, lines, offsets):
+    """`[(word, line_index)]`: the single-quoted `<interpreter> -c '...'` payload word of each interpreter
+    command in `cmds`, when it starts on the interpreter's line -- the one word the parse reads after `-c`."""
+    word_at = {w.start: w for cmd in cmds for w in cmd.words}
+    out = []
+    for cmd in cmds:
+        k = _sh_interpreter(cmd)
+        if k is None:
+            continue
+        st = cmd.words[k].start
+        li = bisect.bisect_right(offsets, st) - 1
+        m = _PY_INLINE_RE.match(text, st, offsets[li] + len(lines[li]))
+        w = word_at.get(m.end() - 1) if m else None
+        if w is None or not w.plain_sq or w.end - w.start < 2 or text[w.end - 1] != "'":
+            continue
+        out.append((w, li))
+    return out
+
+
+def _mask_shell(text: str):
+    """`(masked_lines, payloads, problems)`: the file's lines with comments,
+    heredoc bodies and python `-c '...'` payload bodies blanked (line numbers
+    preserved), the extracted python payloads as `(first_line_number, source)`,
+    and the `(line_number, message)` problems found (an unterminated heredoc and
+    every boundary the parse reports it cannot decide: see `_sh_parse`).
+    The whole text is parsed once (`_sh_parse` with bodies=True) and every span
+    masked here -- comment, heredoc body, payload -- is a span that parse
+    reports, so a quote opened on one line is still open on the next, and a
+    `#`, a `<<` or an interpreter name inside it is text."""
+    lines, offsets = _text_lines(text)
+    payloads = []
+    problems = []
 
     def line_of(off):
         return bisect.bisect_right(offsets, off) - 1
 
-    cmds, heredocs, comments, _quotes = _sh_parse(text, True)
+    cmds, heredocs, comments, _decls, parse_problems = _sh_parse(text, True)
+    for off, msg in parse_problems:
+        problems.append((line_of(off) + 1, msg))
     edits = []      # (start, end, replacement): spans of `text` to rewrite; a replacement keeps the newlines
     for s0, e0 in comments:                 # a comment goes, with the blanks before it
         while s0 > 0 and text[s0 - 1] in " \t":
@@ -566,20 +597,11 @@ def _mask_shell(text: str):
             payloads.append((sb + 1, "\n".join(body_lines)))
         edits.append((offsets[sb], offsets[tl] + len(lines[tl]), "\n" * (tl - sb)))
     # single-quoted `<interp> -c '...'` payload: the one word the parse reads after `-c`, on the interpreter's line
-    word_at = {w.start: w for cmd in cmds for w in cmd.words}
-    for cmd in cmds:
-        k = _sh_interpreter(cmd)
-        if k is None:
-            continue
-        st = cmd.words[k].start
-        li = line_of(st)
-        m = _PY_INLINE_RE.match(text, st, offsets[li] + len(lines[li]))
-        w = word_at.get(m.end() - 1) if m else None
-        if w is None or not w.plain_sq or w.end - w.start < 2 or text[w.end - 1] != "'":
-            continue
+    for w, li in _inline_py_words(text, cmds, lines, offsets):
         payloads.append((li + 1, w.text))
         edits.append((w.start + 1, w.end - 1, "\n" * text.count("\n", w.start, w.end)))
     payloads.sort(key=lambda pl: pl[0])
+    problems.sort()
     out = []
     p = 0
     for s0, e0, repl in sorted(edits):
@@ -600,83 +622,82 @@ def _is_python_stdin(cmd) -> bool:
             and re.fullmatch(r'(?i)"?' + _INTERP + '"?', cmd.words[k].raw) is not None)
 
 
+def _decl_body(masked, lines, offsets, d, ln, end):
+    """The body lines of declaration `d` (starting on line `ln`, closed on line `end`) as the guards normalise
+    them: the masked text after the `{` on the declaration line, the masked lines between, and the masked text
+    before the closing `}` on its line."""
+    def col_of(off):
+        li = bisect.bisect_right(offsets, off) - 1
+        return li, off - offsets[li]
+
+    bl, bcol = col_of(d.open)
+    el, ecol = col_of(d.end - 1)
+    m = masked[bl]
+    inner = m[bcol + 1:] if m[:bcol + 1] == lines[bl][:bcol + 1] else m[m.find("{") + 1:]
+    if end == ln == bl:         # a one-liner: between the braces
+        cm = masked[end]
+        inner = cm[bcol + 1:ecol] if cm[:ecol] == lines[end][:ecol] else inner.rsplit("}", 1)[0]
+        return [inner.strip()]
+    body = [inner.strip()] if bl == ln and inner.strip() else []
+    body += masked[ln + 1:end]
+    cm = masked[end]
+    tail = cm[:ecol] if cm[:ecol] == lines[end][:ecol] else cm.rsplit("}", 1)[0]
+    if tail.strip():
+        body.append(tail)
+    return body
+
+
 def _scan_shell(scan, rel, text):
     masked, payloads, mask_problems = _mask_shell(text)
     for lineno, msg in mask_problems:
         scan.problems.append(f"{rel}:{lineno}: {msg}")
+    lines, offsets = _text_lines(text)
+    cmds, _heredocs, _comments, decls, _problems = _sh_parse(text, True)
     n = len(masked)
-    funcs = []   # (start, end, name, rest)
-    line_start = [0]
-    for ln in text.split("\n"):
-        line_start.append(line_start[-1] + len(ln) + 1)
-    quotes = _sh_parse(text, True)[3]       # the multi-line quoted pieces of the one parse
-    for i in range(n):
-        line = masked[i]
-        if not line.strip():
+
+    def line_of(off):
+        return bisect.bisect_right(offsets, off) - 1
+
+    spans = []      # (start offset, end offset, first line, last line, name) of each declaration the parse closed
+    for d in sorted(decls, key=lambda d: d.start):
+        ln = line_of(d.start)
+        problem = d.problem or ("" if d.end >= 0 else f"shell function `{d.name}` has no closing `}}`: the "
+                                                      "scanner cannot bound its body")
+        if problem:
+            scan.problems.append(f"{rel}:{ln + 1}: {problem}")
             continue
-        m = _SH_DECL_RE.match(line)
-        if not m:
-            continue
-        at = line_start[i] + len(m.group("indent"))
-        if any(qs < at < qe for qs, qe in quotes):
-            continue                        # a `name() {` line inside a multi-line quoted string is text, not a definition
-        name = m.group("fname") or m.group("name")
-        rest = m.group("rest").strip()
-        indent = m.group("indent")
-        if rest.startswith("("):
-            scan.problems.append(f"{rel}:{i + 1}: unsupported shell function form `{name}() (`: the scanner "
-                                 "reads `name() {` and `function name {` only")
-            continue
-        has_open = rest.startswith("{")
-        if not has_open and not rest:
-            # brace on a following line?
-            k = i + 1
-            while k < n and not masked[k].strip():
-                k += 1
-            if k < n and masked[k].strip() == "{":
-                has_open = True
-                rest = ""
-        if not has_open:
-            # `name() command` (no brace) or a command that merely looks like a declaration
-            if rest:
-                scan.problems.append(f"{rel}:{i + 1}: unsupported shell function form `{name}() {rest[:30]}`: "
-                                     "the scanner reads `name() {` and `function name {` only")
-            continue
-        after = rest[1:].strip() if rest.startswith("{") else ""
-        if after.endswith("}") and rest.startswith("{") and after.count("}") >= 1 and ";" in after + ";":
-            end = i
-            body = [after[:-1].strip()]
-        else:
-            end = None
-            for j in range(i + 1, n):
-                if masked[j].rstrip() == indent + "}":
-                    end = j
-                    break
-            if end is None:
-                scan.problems.append(f"{rel}:{i + 1}: shell function `{name}` has no closing `}}` at its own "
-                                     "indentation; the scanner cannot bound its body")
-                continue
-            body = ([after] if after else []) + masked[i + 1:end]
-        funcs.append((i, end, name))
-        scan.defs.append(Definition(path=rel, name=name, qual=name, lang="sh", kind="func",
-                                    lineno=i + 1, end_lineno=end + 1, body=body))
-    # units: outermost functions + residual
+        end = line_of(d.end - 1)
+        spans.append((d.start, d.end, ln, end, d.name))
+        scan.defs.append(Definition(path=rel, name=d.name, qual=d.name, lang="sh", kind="func",
+                                    lineno=ln + 1, end_lineno=end + 1,
+                                    body=_decl_body(masked, lines, offsets, d, ln, end)))
+    # units: outermost functions + residual; a unit's commands are the ones the parse recorded inside its extent
     outer = []
-    for (s, e, name) in sorted(funcs):
-        if outer and s <= outer[-1][1]:
+    for sp in spans:
+        if outer and sp[0] < outer[-1][1]:
             continue
-        outer.append((s, e, name))
+        outer.append(sp)
+    blank = {w.start: "\n" * text.count("\n", w.start, w.end) for w, _li in _inline_py_words(text, cmds, lines, offsets)}
+    starts = [sp[0] for sp in outer]
+    inside = [[] for _ in outer]
+    rest = []
+    for cmd in cmds:
+        if not cmd.words:
+            continue
+        pos = cmd.words[0].start
+        k = bisect.bisect_right(starts, pos) - 1
+        (inside[k] if k >= 0 and pos < outer[k][1] else rest).append(cmd)
     covered = set()
-    for s, e, name in outer:
-        body = "\n".join(masked[s:e + 1])
-        cw = frozenset(_sh_command_words(body))
-        scan.units.append(Unit(path=rel, qual=name, lang="sh", lineno=s + 1, end_lineno=e + 1,
-                               text=body, calls=cw, loads=cw, commands=_sh_command_strings(body)))
-        covered.update(range(s, e + 1))
-    res = "\n".join(masked[k] for k in range(n) if k not in covered)
-    cw = frozenset(_sh_command_words(res))
-    scan.units.append(Unit(path=rel, qual="<script>", lang="sh", lineno=1, end_lineno=n, text=res,
-                           calls=cw, loads=cw, commands=_sh_command_strings(res)))
+    for (s0, e0, ln, end, name), own in zip(outer, inside):
+        cw = frozenset(_cmd_words(own))
+        scan.units.append(Unit(path=rel, qual=name, lang="sh", lineno=ln + 1, end_lineno=end + 1,
+                               text="\n".join(masked[ln:end + 1]), calls=cw, loads=cw,
+                               commands=_cmd_strings(own, blank)))
+        covered.update(range(ln, end + 1))
+    cw = frozenset(_cmd_words(rest))
+    scan.units.append(Unit(path=rel, qual="<script>", lang="sh", lineno=1, end_lineno=n,
+                           text="\n".join(masked[k] for k in range(n) if k not in covered),
+                           calls=cw, loads=cw, commands=_cmd_strings(rest, blank)))
     for first_line, src in payloads:
         _scan_python(scan, rel, src, first_line - 1, True, f"<embedded L{first_line}>.")
 
@@ -736,34 +757,63 @@ class _ShHeredoc:
     end: int = -1
     closed: object = None
     cmd: object = None  # the simple command this operator belongs to (None: a bare redirection)
+    quoted: bool = False    # the delimiter word held a quote or a backslash: the body is literal text, not expanded
+
+
+@dataclass
+class _ShDecl:
+    """A function declaration the parse met at command position (`name() {`, `function name {`,
+    `function name () {`), wherever it sits -- also inside `$( )` and backticks. `end` is the offset just
+    after the `}` that closes its body (-1: none found); `problem` is non-empty for a form the scanner
+    does not read."""
+    name: str
+    start: int          # offset of the `function` keyword, or of the name in `name()`
+    open: int = -1      # offset of the `{`
+    end: int = -1
+    problem: str = ""
+
+
+_SH_CASE_RE = re.compile(r"case(?=[ \t\n])")
+_SH_DECL_MSG = ("unsupported shell function form `{name}() {rest}`: the scanner reads `name() {{` and "
+                "`function name {{` only")
 
 
 @functools.lru_cache(maxsize=64)
 def _sh_parse(text: str, bodies: bool = False):
-    """`(commands, heredocs, comments)` of `text`: every simple command --
-    including the ones inside `$( )`, backticks, `<( )` and `( )` -- every
-    `<<` / `<<-` operator that sits outside quotes (`_ShHeredoc`, with the
-    command it belongs to) and, with `bodies=True`, the `(start, end)` span of
-    every comment. `bodies=False` is for text whose comments and heredoc bodies
-    are already removed; `bodies=True` is for raw source: comments are skipped
-    and recorded and, at the newline after the operator, the heredoc body is
-    consumed up to its terminator line (compared exactly). This is the one place that
-    decides where a quote, a comment, a heredoc body, a continuation or a skipped
-    group begins and ends; a skipped region is walked with the same quote and
-    escape reader as a word. A bounded tokenizer, not a Bash parser:
-    words, quotes, `$(( ))`/`(( ))` blobs, redirections (an operator consumes
-    its operand word), `case` patterns and `name() {` declarations are told
-    apart from commands; `[[ ]]`, `for ((...))` headers, extglob groups in case
-    patterns, array literals and any `(` that does not start a command are skipped whole; `eval`, `exec`, `time`, `!` and the like keep command
-    position, `command -v/-V/-p` do not."""
+    """`(commands, heredocs, comments, decls, problems)` of `text`: every simple
+    command -- including the ones inside `$( )`, backticks, `<( )`, `( )` and the
+    body of an unquoted heredoc -- every `<<` / `<<-` operator that sits outside
+    quotes (`_ShHeredoc`, with the command it belongs to), with `bodies=True` the
+    `(start, end)` span of every comment, every function declaration met at
+    command position (`_ShDecl`: name, start, the `{` and the offset after the
+    `}` that closes it, nested ones included, none from inside a quote or a
+    skipped region) and the `(offset, message)` boundaries the parse cannot
+    decide exactly (a heredoc delimiter that is not a literal word, a `#`
+    inside a backtick substitution, a `case` inside a skipped group): the caller reports each as a scan problem.
+    `bodies=False` is for text whose comments and heredoc bodies are already
+    removed; `bodies=True` is for raw source: comments are skipped and recorded
+    and, at the newline after the operator, the heredoc body is consumed up to
+    its terminator line (compared exactly). This is the one place that decides
+    where a quote, a comment, a heredoc body, a continuation, a skipped group
+    or a function body begins and ends; every skipped region (parenthesis
+    group, `${ }`, `[[ ]]`, backticks) is walked by the one `skip_region` step
+    with the same quote and escape reader as a word. A bounded tokenizer, not a
+    Bash parser: words, quotes, `$(( ))`/`(( ))` blobs, redirections (an
+    operator consumes its operand word), `case` patterns and `name() {`
+    declarations are told apart from commands; `[[ ]]`, `for ((...))` headers,
+    extglob groups in case patterns, array literals and any `(` that does not
+    start a command are skipped whole; `eval`, `exec`, `time`, `!` and the like
+    keep command position, `command -v/-V/-p` do not."""
     n = len(text)
     cmds = []
     heredocs = []
+    decls = []
+    problems = []       # (offset, message); never rolled back: an undecidable boundary stays reported
     closers = []        # the closer of each open parse_seq: a backtick ends a word inside a backtick substitution
     pending = []        # heredocs whose body starts at the next newline (bodies=True)
     comments = []       # (start, end) of each `#` comment outside quotes (bodies=True)
-    quotes = []         # (start, end) of each quoted piece that spans a newline (bodies=True or not)
     cont = []           # offsets of the backslash-newlines the reader dropped outside single quotes, in order
+    subs = [0]          # substitutions and locale quotes the reader met: a heredoc delimiter may hold none
 
     def joined(a, b):   # text[a:b] without those continuations: the word as bash joins it
         lo, hi = bisect.bisect_left(cont, a), bisect.bisect_left(cont, b)
@@ -776,35 +826,73 @@ def _sh_parse(text: str, bodies: bool = False):
         out.append(text[p:b])
         return "".join(out)
 
+    def mark():
+        return (len(cmds), len(heredocs), len(comments), len(decls))
+
+    def rollback(m):    # what a skipped or refused region read is not recorded
+        del cmds[m[0]:], heredocs[m[1]:], comments[m[2]:], decls[m[3]:]
+        kept = {id(h) for h in heredocs}
+        pending[:] = [r for r in pending if id(r) in kept]
+
     def take_bodies(i):     # i is just after a newline: consume the bodies of the pending heredocs
+        scans = []
         while pending:
             rec = pending.pop(0)
             rec.body = i
+            if rec.tag is None:     # a refused delimiter: where the body ends is unknown, so the rest is data
+                i = n
+                del pending[:]
+                break
             j = i
             while j < n:
                 e = text.find("\n", j)
                 e = n if e < 0 else e
+                while not rec.quoted and e < n and (len(text[j:e]) - len(text[j:e].rstrip("\\"))) % 2:
+                    e = text.find("\n", e + 1)     # an unquoted body joins a backslash-newline before the terminator test
+                    e = n if e < 0 else e
                 line = text[j:e]
                 if (line.lstrip("\t") if rec.dash else line) == rec.tag:     # exact: a trailing blank does not close it
                     rec.term, rec.end, rec.closed = j, min(e + 1, n), True
                     i = rec.end
+                    if not rec.quoted:
+                        scans.append((rec.body, rec.term))
                     break
                 j = e + 1
             else:
                 rec.closed = False
                 del pending[:]      # the scanner cannot tell code from data after an unterminated body
                 break
+        for a, b in scans:      # an unquoted body is expanded: its substitutions run (after all bodies are placed)
+            scan_body(a, b)
         return i
+
+    def scan_body(a, b):    # the substitutions of the unquoted heredoc body text[a:b]; quotes there are literal
+        j = a
+        while j < b:
+            c = text[j]
+            if c == "\\":
+                j += 2
+            elif text.startswith("$((", j):
+                j = skip_group(j + 1)
+            elif text.startswith("$(", j):
+                j = parse_seq(j + 2, ")")
+            elif text.startswith("${", j):
+                j = skip_region(j + 2, "}", False)
+            elif c == "`":
+                j = parse_seq(j + 1, "`")
+            else:
+                j += 1
+        if j > b:
+            problems.append((a, "a command substitution in an unquoted heredoc body runs past the terminator "
+                                "line; the scanner cannot tell code from data there"))
 
     def at_quote(i):        # a quoted piece starts at text[i]: '...', "..." or $'...'
         return text[i] in "'\"" or text.startswith("$'", i)
 
     def skip_quote(i):      # the index after the quoted piece at text[i], read by the word reader; a skipped
-        mark = (len(cmds), len(heredocs), len(comments), len(quotes))   # region's commands, heredocs, comments
-        j = read_quoted(i, [])                                          # and quotes are not recorded
-        del cmds[mark[0]:], heredocs[mark[1]:], comments[mark[2]:], quotes[mark[3]:]
-        kept = {id(h) for h in heredocs}
-        pending[:] = [r for r in pending if id(r) in kept]
+        m = mark()          # region's commands, heredocs, comments and declarations are not recorded
+        j = read_quoted(i, [])
+        rollback(m)
         return j
 
     def take_comment(i):    # text[i] == "#" starts a comment: record it, the index of its end of line
@@ -813,96 +901,105 @@ def _sh_parse(text: str, bodies: bool = False):
         comments.append((i, j))
         return j
 
-    def skip_comment(i):    # inside a skipped region: a `#` that starts a word is a comment; else i itself
-        if not bodies or (i and text[i - 1] not in _SH_WORD_BREAK):
-            return i
-        return take_comment(i)
-
     def skip_heredoc_op(i):     # text[i:] is a `<<` / `<<-` inside a skipped group: the index after its delimiter word;
         m = _SH_HEREDOC_OP_RE.match(text, i)    # the heredoc is recorded and its body consumed at the next newline
-        mark = (len(cmds), len(heredocs), len(comments), len(quotes))
-        w, j = read_word(m.end())
-        del cmds[mark[0]:], heredocs[mark[1]:], comments[mark[2]:], quotes[mark[3]:]
-        rec = _ShHeredoc(i, bool(m.group(1)), w.text)
+        w, j = read_delim(m.end())
+        rec = _ShHeredoc(i, bool(m.group(1)), w.text, quoted=w.raw != w.text)
         heredocs.append(rec)
         if w.text:
             pending.append(rec)
         return j
 
-    def skip_group(i):      # text[i] == "(": the index after its matching ")"
-        depth = 0
-        shifts = text.startswith("((", i)       # an arithmetic group: `<<` there is a shift, not a heredoc
+    def read_delim(i):      # the heredoc delimiter word at text[i]: bash removes its quotes and runs nothing in it
+        m, before = mark(), subs[0]
+        w, j = read_word(i)
+        if subs[0] == before:
+            return w, j
+        rollback(m)         # a substitution or locale/ANSI-C quote there is not modelled: refused, records no command
+        if bodies:
+            refused = _ShHeredoc(w.start, False, None)      # its body would start at the next newline and has no known end
+            heredocs.append(refused)
+            pending.append(refused)
+        problems.append((w.start, f"unsupported heredoc delimiter `{w.raw[:30]}`: bash removes quotes from the "
+                                  "delimiter and never runs a substitution in it; the scanner reads a plain or "
+                                  "simply quoted word only"))
+        return _ShWord(w.start, w.raw, "", j), j
+
+    def skip_region(i, closer, arith):
+        """The one step that walks a region nothing in is recorded as a command: the index after its `closer`
+        (`)`, `}`, a backtick, or `]]` as a token). i is just after the opener (just after the `[[` word for `]]`).
+        `arith`: an arithmetic group, where `<<` is a shift. A backslash-newline is a join, so the character
+        before it still decides whether a `#` starts a word; quotes are read by the word reader; a `#` that
+        starts a word is a comment (not inside `${ }`); a heredoc operator in a command region (`)` or a
+        backtick, never arithmetic) has its body consumed at the next newline; `((`, `$(`, `${`, a backtick, `[[`
+        and `{` (inside `${ }`) open a nested region walked by this same step."""
+        prev = {")": "(", "}": "{"}.get(closer, " ")     # the character before i that is not a join
+        command = closer in (")", "`")
         while i < n:
             c = text[i]
             if c == "\\":
+                if not text.startswith("\n", i + 1):
+                    prev = "x"
                 i += 2
                 continue
-            if c == "\n" and pending:
-                i = take_bodies(i + 1)
+            if c == "\n":
+                i += 1
+                if pending:
+                    i = take_bodies(i)
+                prev = "\n"
                 continue
-            if (bodies and c == "<" and not shifts and text.startswith("<<", i) and not text.startswith("<<<", i)
+            if at_quote(i):
+                i = skip_quote(i)
+                prev = "'"
+                continue
+            word_start = prev in _SH_WORD_BREAK
+            if c == "#" and closer != "}" and word_start:
+                if closer == "`":
+                    problems.append((i, "a `#` comment inside a backtick substitution: bash ends the substitution "
+                                        "at the next backtick before it reads the comment, which the scanner "
+                                        "cannot reproduce"))
+                elif bodies:
+                    i = take_comment(i)
+                    continue
+            elif (command and not arith and word_start and c == "c" and _SH_CASE_RE.match(text, i)):
+                problems.append((i, "a `case` inside a skipped group: its pattern `)` cannot be told from the "
+                                    "group's closer"))
+            elif (bodies and c == "<" and command and not arith and text.startswith("<<", i)
+                    and not text.startswith("<<<", i)
                     and not text.startswith("(", _SH_HEREDOC_OP_RE.match(text, i).end())):
                 i = skip_heredoc_op(i)
+                prev = " "
                 continue
-            if at_quote(i):
-                i = skip_quote(i)
+            if c == closer[0] and (closer != "]]" or (
+                    word_start and text.startswith("]]", i) and (i + 2 >= n or text[i + 2] in _SH_WORD_BREAK))):
+                return i + len(closer)
+            if c == "(" and (closer != "}" or text[i - 1] == "$"):
+                i = skip_region(i + 1, ")", text.startswith("((", i) or (arith and text[i - 1] != "$"))
+                prev = ")"
                 continue
-            if c == "#":
-                j = skip_comment(i)
-                if j != i:
-                    i = j
-                    continue
-            if c == "(":
-                depth += 1
-            elif c == ")":
-                depth -= 1
-                if depth == 0:
-                    return i + 1
+            if c == "$" and text.startswith("${", i):
+                i = skip_region(i + 2, "}", False)
+                prev = "}"
+                continue
+            if c == "{" and closer == "}":
+                i = skip_region(i + 1, "}", False)
+                prev = "}"
+                continue
+            if c == "`":
+                i = skip_region(i + 1, "`", False)
+                prev = "`"
+                continue
+            if (command and not arith and word_start and text.startswith("[[", i)
+                    and text[i + 2:i + 3] in (" ", "\t", "\n")):
+                i = skip_region(i + 2, "]]", False)
+                prev = "]"
+                continue
+            prev = c
             i += 1
         return n
 
-    def skip_brace(i):      # text[i] == "{": the index after its matching "}"
-        depth = 0
-        while i < n:
-            if text[i] == "\\":
-                i += 2
-                continue
-            if at_quote(i):
-                i = skip_quote(i)
-                continue
-            if text[i] == "{":
-                depth += 1
-            elif text[i] == "}":
-                depth -= 1
-                if depth == 0:
-                    return i + 1
-            i += 1
-        return n
-
-    def skip_dbracket(i):   # i is just after a `[[` word: the index after its closing `]]`
-        depth = 0
-        while i < n:
-            c = text[i]
-            if c == "\\":
-                i += 2
-                continue
-            if at_quote(i):
-                i = skip_quote(i)
-                continue
-            if c == "#":
-                j = skip_comment(i)
-                if j != i:
-                    i = j
-                    continue
-            if c == "(":
-                depth += 1
-            elif c == ")":
-                depth = max(0, depth - 1)
-            elif (c == "]" and depth == 0 and text.startswith("]]", i) and text[i - 1] in _SH_WORD_BREAK
-                  and (i + 2 >= n or text[i + 2] in _SH_WORD_BREAK)):
-                return i + 2        # `]]` is a token: it is set off by whitespace or a metacharacter on both sides
-            i += 1
-        return n
+    def skip_group(i):      # text[i] == "(": the index after its matching ")"
+        return skip_region(i + 1, ")", text.startswith("((", i))
 
     def read_dq(i, buf):    # i is just after an opening double quote
         while i < n:
@@ -920,17 +1017,21 @@ def _sh_parse(text: str, bodies: bool = False):
             if c == '"':
                 return i + 1
             if text.startswith("$((", i):
+                subs[0] += 1
                 j = skip_group(i + 1)
                 buf.append(text[i:j])
                 i = j
             elif text.startswith("$(", i):
+                subs[0] += 1
                 buf.append("$(...)")
                 i = parse_seq(i + 2, ")")
             elif c == "`":
+                subs[0] += 1
                 buf.append("`...`")
                 i = parse_seq(i + 1, "`")
             elif text.startswith("${", i):
-                j = skip_brace(i + 1)
+                subs[0] += 1
+                j = skip_region(i + 2, "}", False)
                 buf.append(text[i:j])
                 i = j
             else:
@@ -939,12 +1040,6 @@ def _sh_parse(text: str, bodies: bool = False):
         return n
 
     def read_quoted(i, buf):    # the quoted piece at text[i] ('...', "..." or $'...'): its text into buf, the index after it
-        j = read_quoted_piece(i, buf)
-        if "\n" in text[i:j]:
-            quotes.append((i, j))
-        return j
-
-    def read_quoted_piece(i, buf):
         if text[i] == "'":
             j = text.find("'", i + 1)
             buf.append(text[i + 1:] if j < 0 else text[i + 1:j])
@@ -963,6 +1058,8 @@ def _sh_parse(text: str, bodies: bool = False):
         plain = True
         while i < n:
             c = text[i]
+            if c == "$" and text.startswith('$"', i):
+                subs[0] += 1        # a locale-quoted word: the reader takes the `$` as text (a disclosed miss)
             if c == "\\":
                 if i + 1 < n and text[i + 1] != "\n":
                     buf.append(text[i + 1])
@@ -972,29 +1069,36 @@ def _sh_parse(text: str, bodies: bool = False):
                 i += 2
             elif at_quote(i):
                 plain = plain and c == "'"
+                if c == "$":
+                    subs[0] += 1        # an ANSI-C quote
                 i = read_quoted(i, buf)
             elif c == "$" and text.startswith("$((", i):
                 plain = False
+                subs[0] += 1
                 j = skip_group(i + 1)
                 buf.append(text[i:j])
                 i = j
             elif c == "$" and text.startswith("$(", i):
                 plain = False
+                subs[0] += 1
                 buf.append("$(...)")
                 i = parse_seq(i + 2, ")")
             elif c == "$" and text.startswith("${", i):
                 plain = False
-                j = skip_brace(i + 1)
+                subs[0] += 1
+                j = skip_region(i + 2, "}", False)
                 buf.append(text[i:j])
                 i = j
             elif c == "`" and i > start and closers[-1] == "`":
                 break           # the closing backtick of the substitution this word is in
             elif c == "`":
                 plain = False
+                subs[0] += 1
                 buf.append("`...`")
                 i = parse_seq(i + 1, "`")
             elif c in "<>" and text.startswith("(", i + 1):
                 plain = False
+                subs[0] += 1
                 buf.append(c + "(...)")
                 i = parse_seq(i + 2, ")")
             elif c == "(" and re.fullmatch(r"[A-Za-z_]\w*(?:\[[^\]]*\])?\+?=", joined(start, i)):
@@ -1023,7 +1127,10 @@ def _sh_parse(text: str, bodies: bool = False):
         redir = False           # the next word is a redirection operand
         after_command = False   # the previous word was a bare `command`
         skip_name = False       # the previous word was `function`
+        fn_start = 0            # where that `function` keyword stood
         hd_wait = None          # the `<<` whose delimiter word comes next
+        pend_decl = None        # the declaration whose body `{` must come next
+        braces = []             # the open `{` groups of this sequence: the _ShDecl a function body opened, else None
         cases = []              # open `case`s: 'hdr' (before `in`), 'pat' (patterns), 'body' (commands)
         words = []
         assigns = []
@@ -1040,6 +1147,19 @@ def _sh_parse(text: str, bodies: bool = False):
             words, assigns = [], []
             swallow = redir = after_command = False
 
+        def bad_decl(rest):     # the declaration waiting for its `{` is a form the scanner does not read
+            nonlocal pend_decl
+            d, pend_decl = pend_decl, None
+            d.problem = _SH_DECL_MSG.format(name=d.name, rest=rest[:30])
+
+        def finish():
+            end_cmd()
+            if pend_decl is not None:
+                bad_decl("")
+            for d in braces:
+                if d is not None:
+                    d.problem = "shell function `" + d.name + "` has no closing `}`: the scanner cannot bound its body"
+
         while i < n:
             c = text[i]
             if c in " \t":
@@ -1049,10 +1169,14 @@ def _sh_parse(text: str, bodies: bool = False):
                 i += 2
                 continue
             if c == "#" and bodies:
+                if closer == "`":
+                    problems.append((i, "a `#` comment inside a backtick substitution: bash ends the substitution "
+                                        "at the next backtick before it reads the comment, which the scanner "
+                                        "cannot reproduce"))
                 i = take_comment(i)
                 continue
             if c == closer and not (closer == ")" and cases and cases[-1] == "pat"):
-                end_cmd()
+                finish()
                 return i + 1
             if c == ")":
                 if cases and cases[-1] == "pat":
@@ -1078,6 +1202,8 @@ def _sh_parse(text: str, bodies: bool = False):
                     at_cmd = False
                     i += 3 if text.startswith(";;&", i) else 2
                     continue
+                if pend_decl is not None and c != "\n":
+                    bad_decl(c)
                 end_cmd()
                 if not (cases and cases[-1] == "pat"):
                     at_cmd = True
@@ -1092,16 +1218,18 @@ def _sh_parse(text: str, bodies: bool = False):
                     # the clause; a bare `(` is the optional opener of the pattern list
                     i = skip_group(i) if i and text[i - 1] in "@?*+!" else i + 1
                     continue
-                if at_cmd and text.startswith("((", i):
-                    i = skip_group(i)       # an arithmetic command: nothing in it is a command word
-                    swallow, at_cmd = True, False
-                    continue
                 k = i + 1
                 while k < n and text[k] in " \t":
                     k += 1
                 if k < n and text[k] == ")":    # `()` of a declaration spelled `function f ()`
                     i = k + 1
                     at_cmd = True
+                    continue
+                if pend_decl is not None:
+                    bad_decl("(")
+                if at_cmd and text.startswith("((", i):
+                    i = skip_group(i)       # an arithmetic command: nothing in it is a command word
+                    swallow, at_cmd = True, False
                     continue
                 if not at_cmd:
                     # a `(` that does not open a command (`for ((init; cond; step))`, a stray group after
@@ -1112,15 +1240,27 @@ def _sh_parse(text: str, bodies: bool = False):
                 i = parse_seq(i + 1, ")")
                 swallow, at_cmd = True, False
                 continue
-            w, i = read_word(i)
+            if redir and hd_wait is not None:
+                w, i = read_delim(i)
+            else:
+                w, i = read_word(i)
             if redir:
                 redir = False
                 if hd_wait is not None:
                     hd_wait.tag = w.text
+                    hd_wait.quoted = w.raw != w.text
                     if bodies and w.text:
                         pending.append(hd_wait)
                     hd_wait = None
                 continue
+            if pend_decl is not None:
+                if w.raw == "{":
+                    pend_decl.open = w.start
+                    braces.append(pend_decl)
+                    pend_decl = None
+                    at_cmd = True
+                    continue
+                bad_decl(w.text)
             state = cases[-1] if cases else ""
             if state == "hdr":
                 if w.raw == "in":
@@ -1136,6 +1276,8 @@ def _sh_parse(text: str, bodies: bool = False):
             if skip_name:
                 skip_name = False
                 at_cmd = True
+                pend_decl = _ShDecl(w.text, fn_start)
+                decls.append(pend_decl)
                 continue
             if after_command:
                 after_command = False
@@ -1148,13 +1290,15 @@ def _sh_parse(text: str, bodies: bool = False):
                     continue
                 if w.raw == "[[":
                     # a conditional expression: its words and parentheses are not commands
-                    i = skip_dbracket(i)
+                    i = skip_region(i, "]]", False)
                     swallow, at_cmd = True, False
                     continue
                 if w.bare:
                     r = w.raw
                     if r in _SH_KEEP_CMD or r == "{":
                         after_command = r == "command"
+                        if r == "{":
+                            braces.append(None)
                         continue
                     if r == "case":
                         cases.append("hdr")
@@ -1166,27 +1310,54 @@ def _sh_parse(text: str, bodies: bool = False):
                         continue
                     if r == "function":
                         skip_name = True
+                        fn_start = w.start
                         continue
                     if r == "}":
+                        if braces:
+                            d = braces.pop()
+                            if d is not None:
+                                d.end = w.end
                         swallow, at_cmd = True, False
                         continue
                     k = i
                     while k < n and text[k] in " \t":
                         k += 1
                     if text.startswith("(", k) and text[k + 1:].lstrip(" \t").startswith(")"):
-                        i = text.index(")", k) + 1      # `name()`: a declaration, not a call
+                        pend_decl = _ShDecl(r, w.start)     # `name()`: a declaration, not a call
+                        decls.append(pend_decl)
+                        i = text.index(")", k) + 1
                         continue
                 words.append(w)
                 at_cmd = False
             else:
                 words.append(w)
-        end_cmd()
+        finish()
         return n
 
     parse_seq(0, "")
     if pending:
         pending[0].closed = False       # an opener on the last line: there is no body to find
-    return tuple(cmds), tuple(heredocs), tuple(comments), tuple(quotes)
+    return (tuple(cmds), tuple(heredocs), tuple(comments), tuple(decls),
+            tuple(sorted(set(problems))))
+
+
+def _cmd_strings(cmds, blank=None) -> tuple:
+    """The `_sh_command_strings` rendering of parsed commands; a word whose start is a key of `blank` (a python
+    `-c '...'` payload) renders as that value, the payload's newlines, as the masked text had it."""
+    blank = blank or {}
+    out = []
+    for cmd in cmds:
+        if not cmd.words:
+            continue
+        line = " ".join(blank.get(w.start, w.text) for w in cmd.words)
+        out.append(line)
+        if cmd.assigns:
+            out.append(" ".join(cmd.assigns + (line,)))
+    return tuple(out)
+
+
+def _cmd_words(cmds) -> set:
+    return {cmd.words[0].ident for cmd in cmds if cmd.words and cmd.words[0].ident}
 
 
 def _sh_command_strings(text: str) -> tuple:
@@ -1195,15 +1366,7 @@ def _sh_command_strings(text: str) -> tuple:
     its own command. Leading `VAR=value` assignments are REMOVED from the
     rendering, and a second rendering that keeps them is added when there were
     any, so a pattern may name `PYTHONPATH=` deliberately."""
-    out = []
-    for cmd in _sh_parse(text)[0]:
-        if not cmd.words:
-            continue
-        line = " ".join(w.text for w in cmd.words)
-        out.append(line)
-        if cmd.assigns:
-            out.append(" ".join(cmd.assigns + (line,)))
-    return tuple(out)
+    return _cmd_strings(_sh_parse(text)[0])
 
 
 def _sh_command_words(text: str) -> set:
@@ -1223,7 +1386,7 @@ def _sh_command_words(text: str) -> set:
     `function name {` declaration. Launchers (`xargs`, `find -exec`, `sudo`,
     `env`, `timeout`, `coproc`, `command -p`), a function passed by name and a
     `$( )` nested inside `$(( ))` are not seen."""
-    return {cmd.words[0].ident for cmd in _sh_parse(text)[0] if cmd.words and cmd.words[0].ident}
+    return _cmd_words(_sh_parse(text)[0])
 
 
 

@@ -1268,6 +1268,381 @@ class TestScanner(unittest.TestCase):
             self.assertNotEqual(mc_reuse.py_fingerprint(a), mc_reuse.py_fingerprint(other))
 
 
+class ShellScanRootsTest(unittest.TestCase):
+    """Round 6 (TOP-0137 L42): declarations come from the one parse, every skipped region is walked by one
+    step, and a boundary the parser cannot decide is a scan problem. Each shape below was run through bash 5.2
+    with a flag file first; the comments say what bash does."""
+
+    CALL = '    mc_store_lint_schema "$PY" "$memlint" "$MEMCONTINUUM_ROOT"\n'
+    HOOK = "hooks/post-commit-reindex.sh"
+
+    def swap_call(self, repl):
+        ft = FixtureTree(self)
+        ft.replace(self.HOOK, self.CALL, repl)
+        return ft.findings()
+
+    def test_a_heredoc_delimiter_is_never_a_substitution(self):
+        # bash: `cat <<"$(mc_job)"` prints the lines up to a line `$(mc_job)` and never runs mc_job
+        src = 'cat <<"$(mc_job)"\n$(...)\n$(mc_job)\n'
+        masked, _payloads, problems = mc_reuse._mask_shell(src)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("unsupported heredoc delimiter", problems[0][1])
+        self.assertEqual(mc_reuse._cmd_words(mc_reuse._sh_parse(src, True)[0]), {"cat"})
+        for quoted in ("$(mc_job)", "`mc_job`", "${mc_job}", "$((1))"):
+            self.assertEqual(len(mc_reuse._mask_shell('cat <<"' + quoted + '"\nx\n' + quoted + '\n')[2]), 1, quoted)
+        # the literal delimiters bash reduces by quote removal are exact and refuse nothing
+        for opener, term in (("<<EOF", "EOF"), ("<<'EOF'", "EOF"), ('<<"EOF"', "EOF"), ("<<\\EOF", "EOF"),
+                             ("<<'END TAG'", "END TAG"), ('<<"E\\$F"', "E$F"), ("<<$x", "$x"), ("<<E\\\nF", "EF")):
+            words, problems = masked_words("cat " + opener + "\nmc_job\n" + term + "\nmc_after\n")
+            self.assertEqual((words, problems), ({"cat", "mc_after"}, []), opener)
+        # bash runs `$'EOF'` and `$"EOF"` as the word EOF, which the reader does not model: refused
+        for opener in ("<<$'EOF'", '<<$"EOF"'):
+            self.assertEqual(len(masked_words("cat " + opener + "\nmc_job\nEOF\nmc_after\n")[1]), 1, opener)
+
+    def test_a_heredoc_delimiter_substitution_fails_the_complete_check(self):
+        found = self.swap_call('    cat <<"$(mc_store_lint_schema)"\n$(...)\n$(mc_store_lint_schema)\n')
+        self.assertNotEqual(found, [])
+        self.assertTrue(any("unsupported heredoc delimiter" in f for f in found), found)
+        ft = FixtureTree(self)
+        ft.append(self.HOOK, '\ncat <<"$(python3 memlint.py)"\n$(...)\n$(python3 memlint.py)\n')
+        found = ft.findings()
+        self.assertTrue(any("unsupported heredoc delimiter" in f for f in found), found)
+        self.assertFalse(any("bypassing the owner" in f for f in found), found)
+
+    def test_a_definition_inside_a_command_substitution_in_a_string_is_a_definition(self):
+        # bash defines and runs mc_join_semi here: x=copied
+        body = 'x="$(\nmc_join_semi() {\n    printf \'%s\' copied\n}\nmc_join_semi\n)"\n'
+        ft = FixtureTree(self)
+        ft.append("hooks/mc-path-lib.sh", "\n" + body)
+        f = only(ft.findings(), "join-semicolon-list", "name_owner")
+        self.assertEqual(len(f), 1, ft.findings())
+        self.assertIn("mc-path-lib.sh", f[0])
+        # the same with a backtick substitution, and the same function as a plain string stays text
+        ft = FixtureTree(self)
+        ft.append("hooks/mc-path-lib.sh", "\n" + body.replace('$(', '`').replace(')"', '`"'))
+        self.assertEqual(len(only(ft.findings(), "join-semicolon-list", "name_owner")), 1, ft.findings())
+
+    def test_a_declaration_looking_array_string_is_neither_a_definition_nor_a_unit(self):
+        # bash: the array holds one string; nothing runs
+        arr = "arr=('\npretend() {\nmc_store_lint_schema\n}\n')\n"
+        ft = FixtureTree(self)
+        ft.replace(self.HOOK, self.CALL, "    :\n")
+        ft.append(self.HOOK, "\n" + arr)
+        scan = mc_reuse.scan_tree(ft.root, ["."], ["tests"])
+        self.assertFalse([d for d in scan.defs if d.name == "pretend"])
+        self.assertFalse([u for u in scan.units if u.qual == "pretend"])
+        f = ft.findings()
+        self.assertTrue(any("store-lint-schema: delegation:" in x and "does not reach the job" in x for x in f), f)
+        ft = FixtureTree(self)
+        ft.append("hooks/mc-path-lib.sh", "\narr=('\nmc_join_semi() {\n    echo copied\n}\n')\n")
+        self.assertEqual(only(ft.findings(), "join-semicolon-list", "name_owner"), [])
+        self.assertEqual(ft.findings(), [])
+
+    def test_a_heredoc_inside_a_parameter_expansion_keeps_its_body_out_of_the_expansion(self):
+        # bash: `}` and mc_job are heredoc data; nothing runs but echo and cat
+        src = "echo ${var:-$(cat <<EOF\n}\nmc_job\nEOF\n)}\nmc_after\n"
+        self.assertEqual(masked_words(src), ({"echo", "mc_after"}, []))
+        self.assertEqual(mc_reuse._sh_command_words(src), {"echo", "mc_after"})
+        found = self.swap_call("    echo ${var:-$(cat <<EOF\n}\n    mc_store_lint_schema\nEOF\n)}\n")
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("store-lint-schema: delegation:", found[0])
+        self.assertIn("does not reach the job through the owner", found[0])
+        ft = FixtureTree(self)
+        ft.append(self.HOOK, '\necho ${var:-$(cat <<EOF\n}\npython3 "$memlint"\nEOF\n)}\n')
+        self.assertEqual(ft.findings(), [])
+
+    def test_a_shift_in_a_nested_arithmetic_group_inside_an_array_is_a_shift(self):
+        # bash: the array is assigned, then mc_job runs
+        src = "foo=($((1 << 2)) y)\nmc_job\n"
+        self.assertEqual(masked_words(src), ({"mc_job"}, []))
+        self.assertEqual(mc_reuse._sh_command_words(src), {"mc_job"})
+        ft = FixtureTree(self)
+        ft.append("hooks/mc-path-lib.sh", "\n" + src)
+        self.assertEqual(ft.findings(), [])
+
+    def test_a_continuation_before_a_hash_in_a_conditional_joins_the_word(self):
+        # bash runs mc_job (then fails on the extra `]]`): `x\<newline>#` is the word `x#`, not a comment
+        src = "[[ x\\\n# ]]\nmc_job\n]]\n"
+        self.assertEqual(masked_words(src), ({"mc_job"}, []))
+        found = self.swap_call("    [[ x\\\n# ]]\n" + self.CALL + "    ]]\n")
+        self.assertEqual(only(found, "store-lint-schema", "delegation"), [], found)
+
+
+class ShellWalkerMatrixTest(unittest.TestCase):
+    """The walker-by-feature matrix of the shell scan (TOP-0137 L42). Rows are the lexical contexts the parse
+    walks, columns the lexical features; each cell is one bash text whose `mc_live` / `mc_dead` / `mc_after`
+    calls were run through bash 5.2 with a flag file to learn which ones execute. A cell is `handled` (the
+    command words the parse records equal the ones bash executed, and the scan reports no problem), `refused`
+    (the scan reports a problem and the check fails), `miss` (a `$( )` inside a region the parse skips whole:
+    bash runs it, the parse records nothing from it -- the disclosed fail-closed miss; the test pins what is
+    recorded) or `n/a` (the combination is not bash, with the reason)."""
+
+    ROWS = ['top', 'cmdsub', 'backtick', 'procsub', 'subshell', 'brace', 'func', 'casebody', 'dqsub', 'array', 'arith', 'param', 'dbracket', 'dq', 'case-pattern', 'heredoc-quoted', 'heredoc-unquoted']
+    COLS = ['single-quote', 'double-quote', 'ansi-c-quote', 'comment', 'hash-in-word', 'heredoc-op', 'heredoc-closer', 'continuation', 'nested-arith-shift', 'cmd-subst', 'decl-line', 'heredoc-delim-subst', 'case-clause']
+    MARKERS = ("live", "dead", "after")
+    CELLS = [
+        ('top', 'single-quote', 'handled', 'echo \'mc_dead ) } ]] "\' ; mc_live\nmc_after\n', 'after live', 'after live'),
+        ('top', 'double-quote', 'handled', 'echo "mc_dead ) } ]] \'" ; mc_live\nmc_after\n', 'after live', 'after live'),
+        ('top', 'ansi-c-quote', 'handled', "echo $'mc_dead \\') }' ; mc_live\nmc_after\n", 'after live', 'after live'),
+        ('top', 'comment', 'handled', '# mc_dead ) } ]] `\nmc_live\nmc_after\n', 'after live', 'after live'),
+        ('top', 'hash-in-word', 'handled', 'echo a#b ; mc_live\nmc_after\n', 'after live', 'after live'),
+        ('top', 'heredoc-op', 'handled', 'cat <<E >/dev/null\nmc_dead\nE\nmc_live\nmc_after\n', 'after live', 'after live'),
+        ('top', 'heredoc-closer', 'handled', "cat <<'E' >/dev/null\nmc_dead ) } ]] ` ;;\nE\nmc_live\nmc_after\n", 'after live', 'after live'),
+        ('top', 'continuation', 'handled', 'echo x\\\n# mc_dead\nmc_live\nmc_after\n', 'after live', 'after live'),
+        ('top', 'nested-arith-shift', 'handled', 'echo $((1 << 2)) ; mc_live\nmc_after\n', 'after live', 'after live'),
+        ('top', 'cmd-subst', 'handled', 'echo $(mc_live)\nmc_after\n', 'after live', 'after live'),
+        ('top', 'decl-line', 'handled', 'mc_fn() {\n  mc_live\n}\nmc_fn\nmc_after\n', 'after live', 'after live'),
+        ('top', 'heredoc-delim-subst', 'refused', 'cat <<"$(mc_dead)" >/dev/null\nx\n$(mc_dead)\nmc_live\nmc_after\n', 'after live', ''),
+        ('top', 'case-clause', 'handled', 'case x in x) mc_live ;; esac\nmc_after\n', 'after live', 'after live'),
+        ('cmdsub', 'single-quote', 'handled', 'x=$(\necho \'mc_dead ) } ]] "\' ; mc_live\n)\nmc_after\n', 'after live', 'after live'),
+        ('cmdsub', 'double-quote', 'handled', 'x=$(\necho "mc_dead ) } ]] \'" ; mc_live\n)\nmc_after\n', 'after live', 'after live'),
+        ('cmdsub', 'ansi-c-quote', 'handled', "x=$(\necho $'mc_dead \\') }' ; mc_live\n)\nmc_after\n", 'after live', 'after live'),
+        ('cmdsub', 'comment', 'handled', 'x=$(\n# mc_dead ) } ]] `\nmc_live\n)\nmc_after\n', 'after live', 'after live'),
+        ('cmdsub', 'hash-in-word', 'handled', 'x=$(\necho a#b ; mc_live\n)\nmc_after\n', 'after live', 'after live'),
+        ('cmdsub', 'heredoc-op', 'handled', 'x=$(\ncat <<E >/dev/null\nmc_dead\nE\nmc_live\n)\nmc_after\n', 'after live', 'after live'),
+        ('cmdsub', 'heredoc-closer', 'handled', "x=$(\ncat <<'E' >/dev/null\nmc_dead ) } ]] ` ;;\nE\nmc_live\n)\nmc_after\n", 'after live', 'after live'),
+        ('cmdsub', 'continuation', 'handled', 'x=$(\necho x\\\n# mc_dead\nmc_live\n)\nmc_after\n', 'after live', 'after live'),
+        ('cmdsub', 'nested-arith-shift', 'handled', 'x=$(\necho $((1 << 2)) ; mc_live\n)\nmc_after\n', 'after live', 'after live'),
+        ('cmdsub', 'cmd-subst', 'handled', 'x=$(\necho $(mc_live)\n)\nmc_after\n', 'after live', 'after live'),
+        ('cmdsub', 'decl-line', 'handled', 'x=$(\nmc_fn() {\n  mc_live\n}\nmc_fn\n)\nmc_after\n', 'after live', 'after live'),
+        ('cmdsub', 'heredoc-delim-subst', 'refused', 'x=$(\ncat <<"$(mc_dead)" >/dev/null\nx\n$(mc_dead)\nmc_live\n)\nmc_after\n', 'after live', ''),
+        ('cmdsub', 'case-clause', 'handled', 'x=$(\ncase x in x) mc_live ;; esac\n)\nmc_after\n', 'after live', 'after live'),
+        ('backtick', 'single-quote', 'handled', 'x=`\necho \'mc_dead ) } ]] "\' ; mc_live\n`\nmc_after\n', 'after live', 'after live'),
+        ('backtick', 'double-quote', 'handled', 'x=`\necho "mc_dead ) } ]] \'" ; mc_live\n`\nmc_after\n', 'after live', 'after live'),
+        ('backtick', 'ansi-c-quote', 'handled', "x=`\necho $'mc_dead \\') }' ; mc_live\n`\nmc_after\n", 'after live', 'after live'),
+        ('backtick', 'comment', 'refused', 'x=`\n# mc_dead ) } ]]\nmc_live\n`\nmc_after\n', 'after live', 'after live'),
+        ('backtick', 'hash-in-word', 'handled', 'x=`\necho a#b ; mc_live\n`\nmc_after\n', 'after live', 'after live'),
+        ('backtick', 'heredoc-op', 'handled', 'x=`\ncat <<E >/dev/null\nmc_dead\nE\nmc_live\n`\nmc_after\n', 'after live', 'after live'),
+        ('backtick', 'heredoc-closer', 'handled', "x=`\ncat <<'E' >/dev/null\nmc_dead ) } ]] ;;\nE\nmc_live\n`\nmc_after\n", 'after live', 'after live'),
+        ('backtick', 'continuation', 'handled', 'x=`\necho x\\\n# mc_dead\nmc_live\n`\nmc_after\n', 'after live', 'after live'),
+        ('backtick', 'nested-arith-shift', 'handled', 'x=`\necho $((1 << 2)) ; mc_live\n`\nmc_after\n', 'after live', 'after live'),
+        ('backtick', 'cmd-subst', 'handled', 'x=`\necho $(mc_live)\n`\nmc_after\n', 'after live', 'after live'),
+        ('backtick', 'decl-line', 'handled', 'x=`\nmc_fn() {\n  mc_live\n}\nmc_fn\n`\nmc_after\n', 'after live', 'after live'),
+        ('backtick', 'heredoc-delim-subst', 'refused', 'x=`\ncat <<"$(mc_dead)" >/dev/null\nx\n$(mc_dead)\nmc_live\n`\nmc_after\n', 'after live', ''),
+        ('backtick', 'case-clause', 'handled', 'x=`\ncase x in x) mc_live ;; esac\n`\nmc_after\n', 'after live', 'after live'),
+        ('procsub', 'single-quote', 'handled', 'cat <(\necho \'mc_dead ) } ]] "\' ; mc_live\n) >/dev/null\nmc_after\n', 'after live', 'after live'),
+        ('procsub', 'double-quote', 'handled', 'cat <(\necho "mc_dead ) } ]] \'" ; mc_live\n) >/dev/null\nmc_after\n', 'after live', 'after live'),
+        ('procsub', 'ansi-c-quote', 'handled', "cat <(\necho $'mc_dead \\') }' ; mc_live\n) >/dev/null\nmc_after\n", 'after live', 'after live'),
+        ('procsub', 'comment', 'handled', 'cat <(\n# mc_dead ) } ]] `\nmc_live\n) >/dev/null\nmc_after\n', 'after live', 'after live'),
+        ('procsub', 'hash-in-word', 'handled', 'cat <(\necho a#b ; mc_live\n) >/dev/null\nmc_after\n', 'after live', 'after live'),
+        ('procsub', 'heredoc-op', 'handled', 'cat <(\ncat <<E >/dev/null\nmc_dead\nE\nmc_live\n) >/dev/null\nmc_after\n', 'after live', 'after live'),
+        ('procsub', 'heredoc-closer', 'handled', "cat <(\ncat <<'E' >/dev/null\nmc_dead ) } ]] ` ;;\nE\nmc_live\n) >/dev/null\nmc_after\n", 'after live', 'after live'),
+        ('procsub', 'continuation', 'handled', 'cat <(\necho x\\\n# mc_dead\nmc_live\n) >/dev/null\nmc_after\n', 'after live', 'after live'),
+        ('procsub', 'nested-arith-shift', 'handled', 'cat <(\necho $((1 << 2)) ; mc_live\n) >/dev/null\nmc_after\n', 'after live', 'after live'),
+        ('procsub', 'cmd-subst', 'handled', 'cat <(\necho $(mc_live)\n) >/dev/null\nmc_after\n', 'after live', 'after live'),
+        ('procsub', 'decl-line', 'handled', 'cat <(\nmc_fn() {\n  mc_live\n}\nmc_fn\n) >/dev/null\nmc_after\n', 'after live', 'after live'),
+        ('procsub', 'heredoc-delim-subst', 'refused', 'cat <(\ncat <<"$(mc_dead)" >/dev/null\nx\n$(mc_dead)\nmc_live\n) >/dev/null\nmc_after\n', 'after live', ''),
+        ('procsub', 'case-clause', 'handled', 'cat <(\ncase x in x) mc_live ;; esac\n) >/dev/null\nmc_after\n', 'after live', 'after live'),
+        ('subshell', 'single-quote', 'handled', '(\necho \'mc_dead ) } ]] "\' ; mc_live\n)\nmc_after\n', 'after live', 'after live'),
+        ('subshell', 'double-quote', 'handled', '(\necho "mc_dead ) } ]] \'" ; mc_live\n)\nmc_after\n', 'after live', 'after live'),
+        ('subshell', 'ansi-c-quote', 'handled', "(\necho $'mc_dead \\') }' ; mc_live\n)\nmc_after\n", 'after live', 'after live'),
+        ('subshell', 'comment', 'handled', '(\n# mc_dead ) } ]] `\nmc_live\n)\nmc_after\n', 'after live', 'after live'),
+        ('subshell', 'hash-in-word', 'handled', '(\necho a#b ; mc_live\n)\nmc_after\n', 'after live', 'after live'),
+        ('subshell', 'heredoc-op', 'handled', '(\ncat <<E >/dev/null\nmc_dead\nE\nmc_live\n)\nmc_after\n', 'after live', 'after live'),
+        ('subshell', 'heredoc-closer', 'handled', "(\ncat <<'E' >/dev/null\nmc_dead ) } ]] ` ;;\nE\nmc_live\n)\nmc_after\n", 'after live', 'after live'),
+        ('subshell', 'continuation', 'handled', '(\necho x\\\n# mc_dead\nmc_live\n)\nmc_after\n', 'after live', 'after live'),
+        ('subshell', 'nested-arith-shift', 'handled', '(\necho $((1 << 2)) ; mc_live\n)\nmc_after\n', 'after live', 'after live'),
+        ('subshell', 'cmd-subst', 'handled', '(\necho $(mc_live)\n)\nmc_after\n', 'after live', 'after live'),
+        ('subshell', 'decl-line', 'handled', '(\nmc_fn() {\n  mc_live\n}\nmc_fn\n)\nmc_after\n', 'after live', 'after live'),
+        ('subshell', 'heredoc-delim-subst', 'refused', '(\ncat <<"$(mc_dead)" >/dev/null\nx\n$(mc_dead)\nmc_live\n)\nmc_after\n', 'after live', ''),
+        ('subshell', 'case-clause', 'handled', '(\ncase x in x) mc_live ;; esac\n)\nmc_after\n', 'after live', 'after live'),
+        ('brace', 'single-quote', 'handled', '{\necho \'mc_dead ) } ]] "\' ; mc_live\n}\nmc_after\n', 'after live', 'after live'),
+        ('brace', 'double-quote', 'handled', '{\necho "mc_dead ) } ]] \'" ; mc_live\n}\nmc_after\n', 'after live', 'after live'),
+        ('brace', 'ansi-c-quote', 'handled', "{\necho $'mc_dead \\') }' ; mc_live\n}\nmc_after\n", 'after live', 'after live'),
+        ('brace', 'comment', 'handled', '{\n# mc_dead ) } ]] `\nmc_live\n}\nmc_after\n', 'after live', 'after live'),
+        ('brace', 'hash-in-word', 'handled', '{\necho a#b ; mc_live\n}\nmc_after\n', 'after live', 'after live'),
+        ('brace', 'heredoc-op', 'handled', '{\ncat <<E >/dev/null\nmc_dead\nE\nmc_live\n}\nmc_after\n', 'after live', 'after live'),
+        ('brace', 'heredoc-closer', 'handled', "{\ncat <<'E' >/dev/null\nmc_dead ) } ]] ` ;;\nE\nmc_live\n}\nmc_after\n", 'after live', 'after live'),
+        ('brace', 'continuation', 'handled', '{\necho x\\\n# mc_dead\nmc_live\n}\nmc_after\n', 'after live', 'after live'),
+        ('brace', 'nested-arith-shift', 'handled', '{\necho $((1 << 2)) ; mc_live\n}\nmc_after\n', 'after live', 'after live'),
+        ('brace', 'cmd-subst', 'handled', '{\necho $(mc_live)\n}\nmc_after\n', 'after live', 'after live'),
+        ('brace', 'decl-line', 'handled', '{\nmc_fn() {\n  mc_live\n}\nmc_fn\n}\nmc_after\n', 'after live', 'after live'),
+        ('brace', 'heredoc-delim-subst', 'refused', '{\ncat <<"$(mc_dead)" >/dev/null\nx\n$(mc_dead)\nmc_live\n}\nmc_after\n', 'after live', ''),
+        ('brace', 'case-clause', 'handled', '{\ncase x in x) mc_live ;; esac\n}\nmc_after\n', 'after live', 'after live'),
+        ('func', 'single-quote', 'handled', 'f() {\necho \'mc_dead ) } ]] "\' ; mc_live\n}\nf\nmc_after\n', 'after live', 'after live'),
+        ('func', 'double-quote', 'handled', 'f() {\necho "mc_dead ) } ]] \'" ; mc_live\n}\nf\nmc_after\n', 'after live', 'after live'),
+        ('func', 'ansi-c-quote', 'handled', "f() {\necho $'mc_dead \\') }' ; mc_live\n}\nf\nmc_after\n", 'after live', 'after live'),
+        ('func', 'comment', 'handled', 'f() {\n# mc_dead ) } ]] `\nmc_live\n}\nf\nmc_after\n', 'after live', 'after live'),
+        ('func', 'hash-in-word', 'handled', 'f() {\necho a#b ; mc_live\n}\nf\nmc_after\n', 'after live', 'after live'),
+        ('func', 'heredoc-op', 'handled', 'f() {\ncat <<E >/dev/null\nmc_dead\nE\nmc_live\n}\nf\nmc_after\n', 'after live', 'after live'),
+        ('func', 'heredoc-closer', 'handled', "f() {\ncat <<'E' >/dev/null\nmc_dead ) } ]] ` ;;\nE\nmc_live\n}\nf\nmc_after\n", 'after live', 'after live'),
+        ('func', 'continuation', 'handled', 'f() {\necho x\\\n# mc_dead\nmc_live\n}\nf\nmc_after\n', 'after live', 'after live'),
+        ('func', 'nested-arith-shift', 'handled', 'f() {\necho $((1 << 2)) ; mc_live\n}\nf\nmc_after\n', 'after live', 'after live'),
+        ('func', 'cmd-subst', 'handled', 'f() {\necho $(mc_live)\n}\nf\nmc_after\n', 'after live', 'after live'),
+        ('func', 'decl-line', 'handled', 'f() {\nmc_fn() {\n  mc_live\n}\nmc_fn\n}\nf\nmc_after\n', 'after live', 'after live'),
+        ('func', 'heredoc-delim-subst', 'refused', 'f() {\ncat <<"$(mc_dead)" >/dev/null\nx\n$(mc_dead)\nmc_live\n}\nf\nmc_after\n', 'after live', ''),
+        ('func', 'case-clause', 'handled', 'f() {\ncase x in x) mc_live ;; esac\n}\nf\nmc_after\n', 'after live', 'after live'),
+        ('casebody', 'single-quote', 'handled', 'case x in\n  x)\necho \'mc_dead ) } ]] "\' ; mc_live\n  ;;\nesac\nmc_after\n', 'after live', 'after live'),
+        ('casebody', 'double-quote', 'handled', 'case x in\n  x)\necho "mc_dead ) } ]] \'" ; mc_live\n  ;;\nesac\nmc_after\n', 'after live', 'after live'),
+        ('casebody', 'ansi-c-quote', 'handled', "case x in\n  x)\necho $'mc_dead \\') }' ; mc_live\n  ;;\nesac\nmc_after\n", 'after live', 'after live'),
+        ('casebody', 'comment', 'handled', 'case x in\n  x)\n# mc_dead ) } ]] `\nmc_live\n  ;;\nesac\nmc_after\n', 'after live', 'after live'),
+        ('casebody', 'hash-in-word', 'handled', 'case x in\n  x)\necho a#b ; mc_live\n  ;;\nesac\nmc_after\n', 'after live', 'after live'),
+        ('casebody', 'heredoc-op', 'handled', 'case x in\n  x)\ncat <<E >/dev/null\nmc_dead\nE\nmc_live\n  ;;\nesac\nmc_after\n', 'after live', 'after live'),
+        ('casebody', 'heredoc-closer', 'handled', "case x in\n  x)\ncat <<'E' >/dev/null\nmc_dead ) } ]] ` ;;\nE\nmc_live\n  ;;\nesac\nmc_after\n", 'after live', 'after live'),
+        ('casebody', 'continuation', 'handled', 'case x in\n  x)\necho x\\\n# mc_dead\nmc_live\n  ;;\nesac\nmc_after\n', 'after live', 'after live'),
+        ('casebody', 'nested-arith-shift', 'handled', 'case x in\n  x)\necho $((1 << 2)) ; mc_live\n  ;;\nesac\nmc_after\n', 'after live', 'after live'),
+        ('casebody', 'cmd-subst', 'handled', 'case x in\n  x)\necho $(mc_live)\n  ;;\nesac\nmc_after\n', 'after live', 'after live'),
+        ('casebody', 'decl-line', 'handled', 'case x in\n  x)\nmc_fn() {\n  mc_live\n}\nmc_fn\n  ;;\nesac\nmc_after\n', 'after live', 'after live'),
+        ('casebody', 'heredoc-delim-subst', 'refused', 'case x in\n  x)\ncat <<"$(mc_dead)" >/dev/null\nx\n$(mc_dead)\nmc_live\n  ;;\nesac\nmc_after\n', 'after live', ''),
+        ('casebody', 'case-clause', 'handled', 'case x in\n  x)\ncase x in x) mc_live ;; esac\n  ;;\nesac\nmc_after\n', 'after live', 'after live'),
+        ('dqsub', 'single-quote', 'handled', 'x="$(\necho \'mc_dead ) } ]] "\' ; mc_live\n)"\nmc_after\n', 'after live', 'after live'),
+        ('dqsub', 'double-quote', 'handled', 'x="$(\necho "mc_dead ) } ]] \'" ; mc_live\n)"\nmc_after\n', 'after live', 'after live'),
+        ('dqsub', 'ansi-c-quote', 'handled', 'x="$(\necho $\'mc_dead \\\') }\' ; mc_live\n)"\nmc_after\n', 'after live', 'after live'),
+        ('dqsub', 'comment', 'handled', 'x="$(\n# mc_dead ) } ]] `\nmc_live\n)"\nmc_after\n', 'after live', 'after live'),
+        ('dqsub', 'hash-in-word', 'handled', 'x="$(\necho a#b ; mc_live\n)"\nmc_after\n', 'after live', 'after live'),
+        ('dqsub', 'heredoc-op', 'handled', 'x="$(\ncat <<E >/dev/null\nmc_dead\nE\nmc_live\n)"\nmc_after\n', 'after live', 'after live'),
+        ('dqsub', 'heredoc-closer', 'handled', 'x="$(\ncat <<\'E\' >/dev/null\nmc_dead ) } ]] ` ;;\nE\nmc_live\n)"\nmc_after\n', 'after live', 'after live'),
+        ('dqsub', 'continuation', 'handled', 'x="$(\necho x\\\n# mc_dead\nmc_live\n)"\nmc_after\n', 'after live', 'after live'),
+        ('dqsub', 'nested-arith-shift', 'handled', 'x="$(\necho $((1 << 2)) ; mc_live\n)"\nmc_after\n', 'after live', 'after live'),
+        ('dqsub', 'cmd-subst', 'handled', 'x="$(\necho $(mc_live)\n)"\nmc_after\n', 'after live', 'after live'),
+        ('dqsub', 'decl-line', 'handled', 'x="$(\nmc_fn() {\n  mc_live\n}\nmc_fn\n)"\nmc_after\n', 'after live', 'after live'),
+        ('dqsub', 'heredoc-delim-subst', 'refused', 'x="$(\ncat <<"$(mc_dead)" >/dev/null\nx\n$(mc_dead)\nmc_live\n)"\nmc_after\n', 'after live', ''),
+        ('dqsub', 'case-clause', 'handled', 'x="$(\ncase x in x) mc_live ;; esac\n)"\nmc_after\n', 'after live', 'after live'),
+        ('array', 'single-quote', 'handled', "x=( 'mc_dead ) ' mc_dead2 )\nmc_after\n", 'after', 'after'),
+        ('array', 'double-quote', 'handled', 'x=( "mc_dead ) " y )\nmc_after\n', 'after', 'after'),
+        ('array', 'ansi-c-quote', 'handled', "x=( $'mc_dead \\') ' y )\nmc_after\n", 'after', 'after'),
+        ('array', 'comment', 'handled', 'x=(\n a  # mc_dead )\n b\n)\nmc_after\n', 'after', 'after'),
+        ('array', 'hash-in-word', 'handled', 'x=( a#b mc_dead )\nmc_after\n', 'after', 'after'),
+        ('array', 'heredoc-op', 'n/a', 'a redirection is a syntax error inside an array literal'),
+        ('array', 'heredoc-closer', 'handled', 'x=(\n$(cat <<E\n)\nE\n)\ny\n)\nmc_after\n', 'after', 'after'),
+        ('array', 'continuation', 'handled', 'x=( a\\\n# mc_dead\nb )\nmc_after\n', 'after', 'after'),
+        ('array', 'nested-arith-shift', 'handled', 'x=($((1 << 2)) y)\nmc_after\n', 'after', 'after'),
+        ('array', 'cmd-subst', 'miss', 'x=($(mc_live) y)\nmc_after\n', 'after live', 'after'),
+        ('array', 'decl-line', 'handled', "x=(\n'\nmc_fn() {\nmc_dead\n}\n'\n)\nmc_after\n", 'after', 'after'),
+        ('array', 'heredoc-delim-subst', 'n/a', 'a redirection is a syntax error inside an array literal'),
+        ('array', 'case-clause', 'refused', 'x=( case in )\nmc_after\n', 'after', 'after'),
+        ('arith', 'single-quote', 'n/a', 'a quote is not an arithmetic token (syntax error)'),
+        ('arith', 'double-quote', 'handled', ': $(( 1 + 2 )) "mc_dead)"\nmc_after\n', 'after', 'after'),
+        ('arith', 'ansi-c-quote', 'n/a', 'a quote is not an arithmetic token (syntax error)'),
+        ('arith', 'comment', 'handled', '(( 1 + 2 # ) mc_dead\n))\nmc_after\n', 'after', 'after'),
+        ('arith', 'hash-in-word', 'handled', ': $(( 16#ff + 1 ))\nmc_after\n', 'after', 'after'),
+        ('arith', 'heredoc-op', 'handled', '(( 1 << 2 ))\nmc_after\n', 'after', 'after'),
+        ('arith', 'heredoc-closer', 'n/a', 'no heredoc can open inside arithmetic: `<<` is a shift'),
+        ('arith', 'continuation', 'handled', '(( 1 +\\\n2 ))\nmc_after\n', 'after', 'after'),
+        ('arith', 'nested-arith-shift', 'handled', '(( (1 << 2) + $((1 << 3)) ))\nmc_after\n', 'after', 'after'),
+        ('arith', 'cmd-subst', 'handled', ': $(( $(echo 1) + 2 ))\nmc_after\n', 'after', 'after'),
+        ('arith', 'decl-line', 'n/a', 'a declaration is not an arithmetic token'),
+        ('arith', 'heredoc-delim-subst', 'n/a', 'no heredoc can open inside arithmetic: `<<` is a shift'),
+        ('arith', 'case-clause', 'n/a', 'a case clause is not an arithmetic token'),
+        ('param', 'single-quote', 'handled', ": ${v:-'}'}\nmc_after\n", 'after', 'after'),
+        ('param', 'double-quote', 'handled', ': ${v:-"}"}\nmc_after\n', 'after', 'after'),
+        ('param', 'ansi-c-quote', 'handled', ": ${v:-$'}'}\nmc_after\n", 'after', 'after'),
+        ('param', 'comment', 'n/a', '`#` never starts a comment inside a parameter expansion (the hash-in-word cell covers `${#v}`)'),
+        ('param', 'hash-in-word', 'handled', 'v=abc; : ${v#a} ${#v}\nmc_after\n', 'after', 'after'),
+        ('param', 'heredoc-op', 'handled', ': ${v:-$(cat <<E\n}\nmc_dead\nE\n)}\nmc_after\n', 'after', 'after'),
+        ('param', 'heredoc-closer', 'handled', ': ${v:-$(cat <<E\n}\nmc_dead\nE\n)}\nmc_after\n', 'after', 'after'),
+        ('param', 'continuation', 'handled', ': ${v:-a\\\nb}\nmc_after\n', 'after', 'after'),
+        ('param', 'nested-arith-shift', 'handled', ': ${v:-$((1 << 2))}\nmc_after\n', 'after', 'after'),
+        ('param', 'cmd-subst', 'miss', ': ${v:-$(mc_live)}\nmc_after\n', 'after live', 'after'),
+        ('param', 'decl-line', 'miss', ': ${v:-$(\nmc_fn() {\n mc_live\n}\nmc_fn\n)}\nmc_after\n', 'after live', 'after'),
+        ('param', 'heredoc-delim-subst', 'refused', ': ${v:-$(cat <<"$(mc_dead)"\n}\n$(mc_dead)\n)}\nmc_after\n', 'after', ''),
+        ('param', 'case-clause', 'refused', ': ${v:-$(case x in x) mc_live;; esac)}\nmc_after\n', 'after live', 'after'),
+        ('dbracket', 'single-quote', 'handled', "[[ x == 'mc_dead ]]' ]]\nmc_after\n", 'after', 'after'),
+        ('dbracket', 'double-quote', 'handled', '[[ x == "mc_dead ]]" ]]\nmc_after\n', 'after', 'after'),
+        ('dbracket', 'ansi-c-quote', 'handled', "[[ x == $'mc_dead ]]' ]]\nmc_after\n", 'after', 'after'),
+        ('dbracket', 'comment', 'handled', '[[ x == x # mc_dead ]]\n]]\nmc_after\n', 'after', 'after'),
+        ('dbracket', 'hash-in-word', 'handled', '[[ a#b == a#b ]]\nmc_after\n', 'after', 'after'),
+        ('dbracket', 'heredoc-op', 'handled', '[[ x < y ]]\nmc_after\n', 'after', 'after'),
+        ('dbracket', 'heredoc-closer', 'handled', '[[ $(cat <<E\n]]\nE\n) ]]\nmc_after\n', 'after', 'after'),
+        ('dbracket', 'continuation', 'handled', '[[ x\\\n# ]]\nmc_live\n]]\n', 'live', 'live'),
+        ('dbracket', 'nested-arith-shift', 'handled', '[[ $((1 << 2)) == 4 ]]\nmc_after\n', 'after', 'after'),
+        ('dbracket', 'cmd-subst', 'miss', "[[ $(mc_live) == '' ]]\nmc_after\n", 'after live', 'after'),
+        ('dbracket', 'decl-line', 'miss', "[[ $(\nmc_fn() {\n mc_live\n}\nmc_fn\n) == '' ]]\nmc_after\n", 'after live', 'after'),
+        ('dbracket', 'heredoc-delim-subst', 'refused', '[[ $(cat <<"$(mc_dead)"\n]]\n$(mc_dead)\n) ]]\nmc_after\n', 'after', ''),
+        ('dbracket', 'case-clause', 'refused', '[[ $(case x in x) echo y;; esac) == y ]]\nmc_after\n', 'after', 'after'),
+        ('dq', 'single-quote', 'handled', 'x="a \'mc_dead\' b"\nmc_after\n', 'after', 'after'),
+        ('dq', 'double-quote', 'handled', 'x="a \\"mc_dead\\" b"\nmc_after\n', 'after', 'after'),
+        ('dq', 'ansi-c-quote', 'handled', 'x="a $\'mc_dead\' b"\nmc_after\n', 'after', 'after'),
+        ('dq', 'comment', 'handled', 'x="a\n# mc_dead\nb"\nmc_after\n', 'after', 'after'),
+        ('dq', 'hash-in-word', 'handled', 'x="a#b # mc_dead"\nmc_after\n', 'after', 'after'),
+        ('dq', 'heredoc-op', 'handled', 'x="cat <<E\nmc_dead\nE"\nmc_after\n', 'after', 'after'),
+        ('dq', 'heredoc-closer', 'handled', 'x="mc_dead ) } ]] \\` \\""\nmc_after\n', 'after', 'after'),
+        ('dq', 'continuation', 'handled', 'x="a\\\nb mc_dead"\nmc_after\n', 'after', 'after'),
+        ('dq', 'nested-arith-shift', 'handled', 'x="$((1 << 2))"\nmc_after\n', 'after', 'after'),
+        ('dq', 'cmd-subst', 'handled', 'x="$(mc_live)"\nmc_after\n', 'after live', 'after live'),
+        ('dq', 'decl-line', 'handled', 'x="\nmc_fn() {\nmc_dead\n}\n"\nmc_after\n', 'after', 'after'),
+        ('dq', 'heredoc-delim-subst', 'n/a', 'inside a string the text is data; `<<` is not an operator (the heredoc-op cell covers it)'),
+        ('dq', 'case-clause', 'handled', 'x="case x in x) mc_dead"\nmc_after\n', 'after', 'after'),
+        ('case-pattern', 'single-quote', 'handled', "case 'a)' in 'a)') mc_live ;; esac\nmc_after\n", 'after live', 'after live'),
+        ('case-pattern', 'double-quote', 'handled', 'case "a)" in "a)") mc_live ;; esac\nmc_after\n', 'after live', 'after live'),
+        ('case-pattern', 'ansi-c-quote', 'handled', "case $'a)' in $'a)') mc_live ;; esac\nmc_after\n", 'after live', 'after live'),
+        ('case-pattern', 'comment', 'handled', 'case x in\n  # mc_dead )\n  x) mc_live ;;\nesac\nmc_after\n', 'after live', 'after live'),
+        ('case-pattern', 'hash-in-word', 'handled', 'case a#b in a#b) mc_live ;; esac\nmc_after\n', 'after live', 'after live'),
+        ('case-pattern', 'heredoc-op', 'n/a', 'a pattern has no command position, so no heredoc opens there'),
+        ('case-pattern', 'heredoc-closer', 'handled', 'case x in x)\n cat <<E >/dev/null\nmc_dead ;; esac\nE\n ;;\nesac\nmc_after\n', 'after', 'after'),
+        ('case-pattern', 'continuation', 'handled', 'case x in x\\\n) mc_live ;; esac\nmc_after\n', 'after live', 'after live'),
+        ('case-pattern', 'nested-arith-shift', 'handled', 'case $((1 << 2)) in 4) mc_live ;; esac\nmc_after\n', 'after live', 'after live'),
+        ('case-pattern', 'cmd-subst', 'handled', 'case $(echo x) in x) mc_live ;; esac\nmc_after\n', 'after live', 'after live'),
+        ('case-pattern', 'decl-line', 'handled', 'case x in x) mc_fn() { mc_live; } ; mc_fn ;; esac\nmc_after\n', 'after live', 'after live'),
+        ('case-pattern', 'heredoc-delim-subst', 'n/a', 'a pattern has no command position, so no heredoc opens there'),
+        ('case-pattern', 'case-clause', 'handled', 'case x in x) case y in y) mc_live;; esac;; esac\nmc_after\n', 'after live', 'after live'),
+        ('heredoc-quoted', 'single-quote', 'handled', "cat <<'E' >/dev/null\n'mc_dead\nE\nmc_after\n", 'after', 'after'),
+        ('heredoc-quoted', 'double-quote', 'handled', 'cat <<\'E\' >/dev/null\n"mc_dead\nE\nmc_after\n', 'after', 'after'),
+        ('heredoc-quoted', 'ansi-c-quote', 'handled', "cat <<'E' >/dev/null\n$'mc_dead\nE\nmc_after\n", 'after', 'after'),
+        ('heredoc-quoted', 'comment', 'handled', "cat <<'E' >/dev/null\n# mc_dead\nE\nmc_after\n", 'after', 'after'),
+        ('heredoc-quoted', 'hash-in-word', 'handled', "cat <<'E' >/dev/null\na#b mc_dead\nE\nmc_after\n", 'after', 'after'),
+        ('heredoc-quoted', 'heredoc-op', 'handled', "cat <<'E' >/dev/null\ncat <<F\nmc_dead\nE\nF\nmc_after\n", 'after', 'after'),
+        ('heredoc-quoted', 'heredoc-closer', 'handled', "cat <<'E' >/dev/null\nmc_dead ) } ]] ` EOF\nE\nmc_after\n", 'after', 'after'),
+        ('heredoc-quoted', 'continuation', 'handled', "cat <<'E' >/dev/null\nmc_dead \\\nE\nmc_after\n", 'after', 'after'),
+        ('heredoc-quoted', 'nested-arith-shift', 'handled', "cat <<'E' >/dev/null\n$((1 << 2)) mc_dead\nE\nmc_after\n", 'after', 'after'),
+        ('heredoc-quoted', 'cmd-subst', 'handled', "cat <<'E' >/dev/null\n$(mc_dead) `mc_dead`\nE\nmc_after\n", 'after', 'after'),
+        ('heredoc-quoted', 'decl-line', 'handled', "cat <<'E' >/dev/null\nmc_fn() {\nmc_dead\n}\nE\nmc_after\n", 'after', 'after'),
+        ('heredoc-quoted', 'heredoc-delim-subst', 'handled', 'cat <<\'E\' >/dev/null\ncat <<"$(mc_dead)"\nE\nmc_after\n', 'after', 'after'),
+        ('heredoc-quoted', 'case-clause', 'handled', "cat <<'E' >/dev/null\ncase x in x) mc_dead;; esac\nE\nmc_after\n", 'after', 'after'),
+        ('heredoc-unquoted', 'single-quote', 'handled', "cat <<E >/dev/null\n'mc_dead\nE\nmc_after\n", 'after', 'after'),
+        ('heredoc-unquoted', 'double-quote', 'handled', 'cat <<E >/dev/null\n"mc_dead\nE\nmc_after\n', 'after', 'after'),
+        ('heredoc-unquoted', 'ansi-c-quote', 'handled', "cat <<E >/dev/null\n$'mc_dead\nE\nmc_after\n", 'after', 'after'),
+        ('heredoc-unquoted', 'comment', 'handled', 'cat <<E >/dev/null\n# mc_dead\nE\nmc_after\n', 'after', 'after'),
+        ('heredoc-unquoted', 'hash-in-word', 'handled', 'cat <<E >/dev/null\na#b mc_dead\nE\nmc_after\n', 'after', 'after'),
+        ('heredoc-unquoted', 'heredoc-op', 'handled', 'cat <<E >/dev/null\ncat <<F\nmc_dead\nE\nF\nmc_after\n', 'after', 'after'),
+        ('heredoc-unquoted', 'heredoc-closer', 'handled', 'cat <<E >/dev/null\nmc_dead ) } ]] EOF\nE\nmc_after\n', 'after', 'after'),
+        ('heredoc-unquoted', 'continuation', 'refused', 'cat <<E >/dev/null\nmc_dead \\\nE\nmc_after\n', '', 'after dead'),
+        ('heredoc-unquoted', 'nested-arith-shift', 'handled', 'cat <<E >/dev/null\n$((1 << 2)) mc_dead\nE\nmc_after\n', 'after', 'after'),
+        ('heredoc-unquoted', 'cmd-subst', 'handled', 'cat <<E >/dev/null\n$(mc_live) `mc_live`\nE\nmc_after\n', 'after live', 'after live'),
+        ('heredoc-unquoted', 'decl-line', 'handled', 'cat <<E >/dev/null\nmc_fn() {\nmc_dead\n}\nE\nmc_after\n', 'after', 'after'),
+        ('heredoc-unquoted', 'heredoc-delim-subst', 'handled', 'cat <<E >/dev/null\ncat <<"$(mc_live)"\nE\nmc_after\n', 'after live', 'after live'),
+        ('heredoc-unquoted', 'case-clause', 'handled', 'cat <<E >/dev/null\ncase x in x) mc_dead;; esac\nE\nmc_after\n', 'after', 'after'),
+    ]
+
+    @classmethod
+    def seen(cls, text):
+        cmds, _h, _c, decls, _p = mc_reuse._sh_parse(text, True)
+        words = mc_reuse._cmd_words(cmds)
+        problems = [msg for _l, msg in mc_reuse._mask_shell(text)[2]] + [d.problem for d in decls if d.problem]
+        return {"mc_" + k for k in cls.MARKERS} & words, problems
+
+    def test_every_context_and_feature_has_exactly_one_cell(self):
+        pairs = [(c[0], c[1]) for c in self.CELLS]
+        self.assertEqual(len(pairs), len(set(pairs)))
+        self.assertEqual(set(pairs), {(r, f) for r in self.ROWS for f in self.COLS})
+
+    def test_cells(self):
+        counts = {}
+        for cell in self.CELLS:
+            row, col, status = cell[:3]
+            counts[status] = counts.get(status, 0) + 1
+            if status == "n/a":
+                self.assertTrue(cell[3], (row, col))
+                continue
+            text, bash, parser = cell[3], cell[4], cell[5]
+            with self.subTest(row=row, col=col, status=status):
+                words, problems = self.seen(text)
+                names = lambda spec: {"mc_" + k for k in spec.split()}   # noqa: E731
+                if status == "handled":
+                    self.assertEqual(problems, [])
+                    self.assertEqual(words, names(bash))
+                    self.assertEqual(names(parser), names(bash))
+                elif status == "refused":
+                    self.assertNotEqual(problems, [])
+                elif status == "miss":
+                    self.assertEqual(problems, [])
+                    self.assertEqual(words, names(parser))
+                    self.assertLess(names(parser), names(bash))
+                else:
+                    self.fail(status)
+        self.assertEqual(counts, {"handled": 188, "refused": 16, "n/a": 12, "miss": 5})
+
+
 class TestRender(unittest.TestCase):
     def inv(self):
         return mc_reuse.load_inventory(TOOLS_DIR / mc_reuse.INVENTORY_RELPATH)
