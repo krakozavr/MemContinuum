@@ -29,10 +29,13 @@ TMP_ROOT="${TMPDIR:-/tmp}"
 ME="$(id -un)"
 WORK="$(mktemp -d "${TMP_ROOT%/}/mc-leakcheck.XXXXXX")" || exit 70
 
-# find exits non-zero when it meets entries of other users it may not read, so
-# its status is not trusted; a snapshot is good when its file was written and
-# the sort that follows succeeded.
+# find exits non-zero when it meets entries of other users it may not read (or
+# a file vanishing mid-scan), so its status is deliberately ignored. That makes
+# an unscannable root look like an empty one, so the root itself is checked
+# first: it must be a readable, searchable directory. Beyond that, a snapshot
+# is good when its file was written and the sort that follows succeeded.
 snapshot() {
+    [ -d "$TMP_ROOT" ] && [ -r "$TMP_ROOT" ] && [ -x "$TMP_ROOT" ] || return 1
     find "$TMP_ROOT" -maxdepth 1 -mindepth 1 -user "$ME" \
         \( -name 'memcontinuum-*' -o -name 'tmp*' \) -print 2>/dev/null | LC_ALL=C sort >"$1"
     [ "$?" -eq 0 ] && [ -f "$1" ]
@@ -52,7 +55,12 @@ if ! snapshot "$WORK/after"; then
     snapshot_failed
 fi
 if LC_ALL=C comm -13 "$WORK/before" "$WORK/after" >"$WORK/new"; then
-    NEW="$(cat "$WORK/new")"
+    if ! NEW="$(cat "$WORK/new")"; then
+        if [ "$RC" -ne 0 ]; then rm -rf "$WORK"; exit "$RC"; fi
+        echo "check_no_temp_leak: could not read the new-entries list" >&2
+        rm -rf "$WORK"
+        exit 70
+    fi
 else
     if [ "$RC" -ne 0 ]; then rm -rf "$WORK"; exit "$RC"; fi
     echo "check_no_temp_leak: could not compare the temp snapshots" >&2

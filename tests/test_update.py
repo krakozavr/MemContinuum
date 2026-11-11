@@ -4696,7 +4696,7 @@ class TestMemidxNeedsItsSiblingModules(unittest.TestCase):
     MESSAGE = "memidx.py needs mc_text.py and mc_reuse.py beside it -- incomplete checkout"
 
     def run_copy(self, omit):
-        d = Path(tmpdir(self, "memidx-sibling-"))
+        d = Path(tmpdir(self, "memcontinuum-memidx-sibling-"))
         for name in ("memidx.py", "mc_text.py", "mc_reuse.py", "memlint.py"):
             if name != omit:
                 shutil.copy(TOOLS_DIR / name, d / name)
