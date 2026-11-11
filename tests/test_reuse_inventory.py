@@ -795,6 +795,15 @@ class TestPositiveControls(unittest.TestCase):
             self.assertIn("`[[ ]]`", rows[rid]["coverage_limit"], rid)
         for rid in ("store-lint-schema", "store-lint-append-only"):
             self.assertIn("the forbid sees it; the reach check does not", rows[rid]["coverage_limit"], rid)
+        shell_rows = {"join-semicolon-list", "coverage-fact-sentence", "coverage-question-sentence",
+                      "shell-millisecond-clock", "store-lint-schema", "store-lint-append-only"}
+        bar = ("The shell scan reads ordinary shell as this repository writes it; unusual spellings listed in "
+               "the engineering notes can hide a call, a definition or a direct command.")
+        for r in inv["rows"]:
+            if r["id"] in shell_rows:
+                self.assertEqual(r["coverage_limit"].count(bar), 1, r["id"])
+            else:
+                self.assertNotIn("ordinary shell", r["coverage_limit"], r["id"])
         internals = (TOOLS_DIR / "docs" / "INTERNALS.md").read_text(encoding="utf-8")
         self.assertIn("so a call word written directly inside them is NOT seen", internals)
         self.assertIn("a `$( )`, backtick or `<( )` substitution inside them or inside a double-quoted piece of them runs", internals)
@@ -1656,6 +1665,94 @@ class ShellWalkerMatrixTest(unittest.TestCase):
                 else:
                     self.fail(status)
         self.assertEqual(counts, {"handled": 195, "refused": 14, "n/a": 12})
+
+
+class KnownShellMisreads(unittest.TestCase):
+    """The shell shapes the scan misreads, as the engineering notes list them ("Known shapes the scan
+    misreads"). Each test pins what the scan does TODAY, so a later change is noticed. Every input was run
+    through bash 5.2 with a flag file first; the comments say what bash does."""
+
+    CALL = '    mc_store_lint_schema "$PY" "$memlint" "$MEMCONTINUUM_ROOT"\n'
+    HOOK = "hooks/post-commit-reindex.sh"
+    BYPASS = "bypassing the owner"
+
+    def swap_call(self, repl):
+        ft = FixtureTree(self)
+        ft.replace(self.HOOK, self.CALL, repl)
+        return ft.findings()
+
+    def append_hook(self, text, rel=None):
+        ft = FixtureTree(self)
+        ft.append(rel or self.HOOK, text)
+        return ft.findings()
+
+    def assert_silent_bypass(self, text):
+        # the same direct lint call written plainly is found; written in the misread shape it is not
+        plain = self.append_hook('\npython3 "$memlint"\n')
+        self.assertTrue(any(self.BYPASS in f for f in plain), plain)
+        self.assertEqual(self.append_hook(text), [])
+
+    def test_an_empty_heredoc_delimiter_counts_a_call_bash_never_runs(self):
+        # known misread, disclosed in the engineering notes; if this test fails the scan got better --
+        # update the notes and flip the assertion.
+        # bash: `cat <<''` ends at the first empty line, so the owner call before it is body text.
+        self.assertEqual(self.swap_call("    cat <<'' >/dev/null\nmc_store_lint_schema\n\n"), [])
+        # the control: with no call at all the consumer is reported
+        self.assertNotEqual(self.swap_call("    :\n"), [])
+
+    def test_an_escaped_backtick_nested_in_a_backtick_in_an_array_hides_a_command(self):
+        # known misread, disclosed in the engineering notes; if this test fails the scan got better --
+        # update the notes and flip the assertion.
+        # bash runs python3 here
+        self.assert_silent_bypass('\narr=(`echo \\`python3 "$memlint"\\``)\n')
+
+    def test_a_dollar_split_from_its_paren_by_a_continuation_in_a_heredoc_body_hides_a_command(self):
+        # known misread, disclosed in the engineering notes; if this test fails the scan got better --
+        # update the notes and flip the assertion.
+        # bash: in an unquoted heredoc body `$\<newline>(` is `$(`, and python3 runs
+        self.assert_silent_bypass('\ncat <<E >/dev/null\n$\\\n(python3 "$memlint")\nE\n')
+
+    def test_a_substitution_in_single_quotes_in_a_parameter_default_in_a_heredoc_body_hides_a_command(self):
+        # known misread, disclosed in the engineering notes; if this test fails the scan got better --
+        # update the notes and flip the assertion.
+        # bash: inside an unquoted heredoc body the single quotes are literal, so the substitution runs
+        self.assert_silent_bypass("\ncat <<E >/dev/null\n${v:-'$(python3 \"$memlint\")'}\nE\n")
+
+    def test_a_parameter_default_that_opens_a_brace_swallows_the_lines_after_it(self):
+        # known misread, disclosed in the engineering notes; if this test fails the scan got better --
+        # update the notes and flip the assertion.
+        # bash ends the expansion at the first `}`; the scan opens a nested region and swallows what follows
+        for opener in (': "${v:-{ }"', ": ${v:-{ }"):
+            self.assert_silent_bypass("\n" + opener + '\npython3 "$memlint"\n')
+        # a definition after it is unseen by name_owner too (bash defines and runs it)
+        found = self.append_hook('\n: "${v:-{ }"\nmc_join_semi() { printf copied; }\n', "hooks/mc-path-lib.sh")
+        self.assertEqual(found, [])
+        plain = self.append_hook("\nmc_join_semi() { printf copied; }\n", "hooks/mc-path-lib.sh")
+        self.assertTrue(only(plain, "join-semicolon-list", "name_owner"), plain)
+
+    def test_a_substitution_in_single_quotes_in_a_double_quoted_default_is_not_counted(self):
+        # known misread, disclosed in the engineering notes; if this test fails the scan got better --
+        # update the notes and flip the assertion.
+        # bash: inside the double quotes of `"${v:-'...'}"` the single quotes are literal and the
+        # substitution runs; the scan reads it as quoted text, so the real call is not counted
+        found = self.swap_call("    x=\"${v:-'$(mc_store_lint_schema)'}\"\n")
+        self.assertTrue(only(found, "store-lint-schema", "delegation"), found)
+
+    def test_a_substitution_spanning_a_pending_heredoc_line_is_not_counted(self):
+        # known misread, disclosed in the engineering notes; if this test fails the scan got better --
+        # update the notes and flip the assertion.
+        # bash runs mc_job inside the substitution that spans the line holding `<<E`
+        src = 'cat <<E "$(echo x\nmc_job\n)" >/dev/null\ndata\nE\nmc_after\n'
+        words = mc_reuse._cmd_words(mc_reuse._sh_parse(src, True)[0])
+        self.assertIn("mc_after", words)
+        self.assertNotIn("mc_job", words)
+
+    def test_a_heredoc_terminator_split_by_a_continuation_is_not_counted(self):
+        # known misread, disclosed in the engineering notes; if this test fails the scan got better --
+        # update the notes and flip the assertion.
+        # bash: in an unquoted heredoc `E\<newline>OF` is the terminator EOF, so the call after it runs
+        found = self.swap_call("    cat <<EOF >/dev/null\nE\\\nOF\n    mc_store_lint_schema\nEOF\n")
+        self.assertTrue(only(found, "store-lint-schema", "delegation"), found)
 
 
 class TestRender(unittest.TestCase):
