@@ -4034,6 +4034,14 @@ can reject recognisable second implementations; it cannot recognise every
 rewritten implementation of the same job.** Each row therefore says what its own
 checks miss.
 
+**The bar for the shell scan.** The shell scan is a bounded reader built for shell as
+this repository's hooks and scripts write it. It is a check against an accidental
+second implementation, not a security boundary: a deliberately unusual spelling can
+hide a call, a definition or a direct command from it, exactly as a rename hides a
+copy. The shapes known to be misread are listed below ("Known shapes the scan
+misreads"); a shape found in a real hook that the scan misreads is treated as a
+defect and fixed.
+
 **A row** is one contract a caller should reuse (a constant can own one). Fields:
 `id` (stable), `job`, `policy`, `implementation` (`path#qualified_symbol`),
 `contract`, `why_single` (what would drift if callers did it again),
@@ -4089,9 +4097,11 @@ and a single-quoted `<interpreter> -c '...'` payload that starts on the interpre
 line (shell text after its closing quote is kept). A `<<-` heredoc has its leading
 tabs removed from every payload line, as Bash does. Not scanned: double-quoted
 `-c "..."` payloads, Python held in a shell variable, extension-less scripts.
-**Refused, not guessed:** a shape whose extent the scanner cannot decide exactly is a
-scan problem that fails the check (a finding naming the file and line), never a
-silent skip: a heredoc delimiter that holds a substitution or a `$'..'` / `$".."`
+**Refused, not guessed:** these shapes, whose extent the scanner knows it cannot decide
+exactly, are a scan problem that fails the check (a finding naming the file and
+line), never a silent skip (the list is not a promise that no other undecidable
+shape exists; the shapes under "Known shapes the scan misreads" are decided
+wrongly without any scan problem): a heredoc delimiter that holds a substitution or a `$'..'` / `$".."`
 quote (Bash quote-removes the delimiter and runs nothing in it; a plain, `'..'`,
 `".."` or `\`-quoted word is read exactly, and the rest of the file is then treated
 as data), a heredoc never closed, a `case` inside a skipped group, a `#` comment
@@ -4106,9 +4116,45 @@ substitution (`$( )`, backticks, `<( )`) is read wherever Bash runs it: in an ar
 literal, a `${...}`, a `[[ ]]`, an arithmetic group, a skipped parenthesis group and a
 double-quoted piece of any of these; only the region's own words are not commands, and
 single quotes, `$'..'`, a quoted-delimiter heredoc body and a comment hold nothing that
-runs. "Bounded" names the syntax the scanner
+runs. This holds for the spellings the tree uses; the next list names the exceptions.
+"Bounded" names the syntax the scanner
 covers, not its resources: files are read whole, the scan is linear in file size, and
 there is no size cap.
+
+**Known shapes the scan misreads.** Each was run through Bash 5.2 and is pinned by a
+test (`KnownShellMisreads`) so that a change is noticed. None is written anywhere in
+the tree today. The first five err toward silence: Bash runs a command or defines a
+function that the scan does not see, or the scan counts a call Bash never runs. The
+last three err toward a false finding.
+
+- An empty heredoc delimiter (`cat <<''`): Bash ends the body at the first empty
+  line; the scan reads a different extent, so an owner call written inside the body
+  is counted although Bash never runs it (a call counted that bash never runs).
+- An escaped backtick substitution nested in a backtick substitution inside an array
+  literal (``arr=(`echo \`python3 "$memlint"\``)``): Bash runs `python3`; the scan
+  does not see it (a command bash runs that the scan does not see).
+- A command substitution in an unquoted heredoc body with a backslash-newline between
+  `$` and `(` (`$\` newline `(python3 "$memlint")`): Bash joins the lines and runs
+  it; the scan does not see it (a command bash runs that the scan does not see).
+- A command substitution inside single quotes inside a parameter expansion inside an
+  unquoted heredoc body (`${v:-'$(python3 "$memlint")'}`): the quotes are literal
+  there, so Bash runs it; the scan does not see it (a command bash runs that the
+  scan does not see).
+- A parameter-expansion default that opens a brace (`: ${v:-{ }`): Bash ends the
+  expansion at the first `}`; the scan opens a nested region and swallows the lines
+  that follow, so a command or a function definition after it is not seen (a command
+  or definition bash runs that the scan does not see).
+- A command substitution inside single quotes inside `"${v:-'...'}"`
+  (`x="${v:-'$(mc_job)'}"`): Bash runs `mc_job`; the scan reads it as quoted text, so
+  a real call is not counted and the consumer is reported as missing it (a real
+  call not counted).
+- A `$( )` that spans a line holding a pending heredoc operator
+  (`cat <<E "$(echo x` newline `mc_job` newline `)"`): Bash runs `mc_job`; the scan
+  does not count it (a real call not counted).
+- A heredoc terminator split by a continuation (`E\` newline `OF` closing `<<EOF`):
+  an unquoted heredoc joins the lines in Bash, so the body ends there and the next
+  line runs; the scan keeps reading the body and does not count that line (a real
+  call not counted).
 
 **The methods** (only these exist):
 
