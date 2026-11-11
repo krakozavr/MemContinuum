@@ -59,19 +59,35 @@ class TestRoutingRuleTemplate(unittest.TestCase):
         # Cap moved 36 -> 40: TOP-0137 L29 adds the "a decision must still be
         # true tomorrow" paragraph (session state is not a ruling) as its own
         # block after the store-section bullets.
+        # Cap moved 40 -> 41: TOP-0137 L35 adds one sentence to the context-pack
+        # paragraph (the pack lists the repository's reuse-inventory rows for the
+        # files the brief touches) -- a net +1-line addition inside that paragraph.
+        # Cap moved 41 -> 42: TOP-0137 L35 round 1 extends the gate sentence of the
+        # "find the existing implementation" paragraph with the inventory questions
+        # (which jobs were touched, what was reused, what the guard misses) -- a net
+        # +1-line addition inside that paragraph.
         text = TEMPLATE.read_text()
         lines = text.splitlines()
-        self.assertLessEqual(len(lines), 40, f"template is {len(lines)} lines, want <= 40")
+        self.assertLessEqual(len(lines), 42, f"template is {len(lines)} lines, want <= 42")
 
     def test_names_the_still_true_tomorrow_rule(self):
         text = TEMPLATE.read_text()
         self.assertIn("A decision must still be true tomorrow.", text)
         self.assertIn("session state, not a ruling", text)
 
+    def test_names_the_reuse_inventory_sentence(self):
+        text = TEMPLATE.read_text()
+        self.assertIn("docs/REUSE-INVENTORY.json", text)
+        self.assertIn("--code-root <repo>", text)
+        self.assertIn("reuses the named owner", text)
+
     def test_names_the_c3_rule(self):
         text = TEMPLATE.read_text()
         self.assertIn("find the existing implementation and name it", text)
         self.assertIn("did this duplicate anything?", text)
+        flat = " ".join(text.split())
+        self.assertIn('and, when the repository carries an inventory, "which inventory jobs were touched, '
+                      'what existing implementation was reused, what does the guard miss?"', flat)
 
     def test_names_the_record_shapes_and_auto_memory_distinction(self):
         text = TEMPLATE.read_text()

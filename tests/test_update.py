@@ -129,7 +129,7 @@ def copy_engine_for_machine_layer(dst):
     dst.mkdir(parents=True, exist_ok=True)
     (dst / "scripts").mkdir(exist_ok=True)
     for name in ("repo-init.sh", "mc_settings_merge.py", "mc-registry-lib.sh",
-                 "memcontinuum-decide.sh", "memcontinuum-update.sh"):
+                 "mc-list-lib.sh", "memcontinuum-decide.sh", "memcontinuum-update.sh"):
         shutil.copy(TOOLS_DIR / "scripts" / name, dst / "scripts" / name)
     for name in ("repo-init.sh", "memcontinuum-decide.sh", "memcontinuum-update.sh"):
         (dst / "scripts" / name).chmod(0o755)
@@ -137,7 +137,7 @@ def copy_engine_for_machine_layer(dst):
     (dst / "memcontinuum-setup.sh").chmod(0o755)
     # TOP-0133 L2: memidx.py imports mc_text.py at module load -- same
     # reasoning as test_repo_init.py's own copy_engine.
-    for name in ("memidx.py", "mc_text.py", "memlint.py", "requirements.txt", "requirements.lock"):
+    for name in ("memidx.py", "mc_text.py", "mc_reuse.py", "memlint.py", "requirements.txt", "requirements.lock"):
         shutil.copy(TOOLS_DIR / name, dst / name)
     for name in ("hooks", "templates", "skills"):
         shutil.copytree(TOOLS_DIR / name, dst / name)
@@ -4645,6 +4645,37 @@ class TestHelp(unittest.TestCase):
     def test_bash_n(self):
         proc = subprocess.run([MC_BASH, "-n", str(UPDATE_SH)], capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
+
+
+class TestMemidxNeedsItsSiblingModules(unittest.TestCase):
+    """memidx.py imports mc_text.py and mc_reuse.py at module load; a copy
+    that lacks either exits non-zero with ONE message naming both."""
+
+    MESSAGE = "memidx.py needs mc_text.py and mc_reuse.py beside it -- incomplete checkout"
+
+    def run_copy(self, omit):
+        d = Path(tmpdir(self, "memidx-sibling-"))
+        for name in ("memidx.py", "mc_text.py", "mc_reuse.py", "memlint.py"):
+            if name != omit:
+                shutil.copy(TOOLS_DIR / name, d / name)
+        shutil.copytree(TOOLS_DIR / "chunkers", d / "chunkers", ignore=shutil.ignore_patterns("__pycache__"))
+        return subprocess.run([sys.executable, str(d / "memidx.py"), "--help"], capture_output=True, text=True,
+                              cwd=str(d), env={**os.environ, "PYTHONPATH": ""})
+
+    def test_a_copy_without_mc_reuse_exits_with_the_incomplete_checkout_message(self):
+        r = self.run_copy("mc_reuse.py")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn(self.MESSAGE, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_a_copy_without_mc_text_exits_with_the_same_message(self):
+        r = self.run_copy("mc_text.py")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn(self.MESSAGE, r.stderr)
+
+    def test_a_complete_copy_runs(self):
+        r = self.run_copy(None)
+        self.assertEqual(r.returncode, 0, r.stderr)
 
 
 if __name__ == "__main__":

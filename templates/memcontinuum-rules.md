@@ -30,11 +30,13 @@ memlint checks both ways. Name the decision in commit messages too (`TOP-xxxx Ln
 A brief for a reviewer or a dispatched agent opens with the decision records, not a
 summary of them: paste the output of `memidx.py context-pack --project {{PROJECT}} <files the brief touches>`
 (engine README, "context pack") at its top; the closing `pack sha256` line names what
-the reader saw.
+the reader saw. When the code repository carries docs/REUSE-INVENTORY.json, add `--code-root <repo>`:
+the pack then lists the inventory rows for the files it touches, and the agent reuses the named owner.
 
 A brief for a dispatched agent says "find the existing implementation and name it
-(code-search first)"; a gate prompt asks "did this duplicate anything?"; both
-answers go in the gate record.
+(code-search first)"; a gate prompt asks "did this duplicate anything?" and, when the
+repository carries an inventory, "which inventory jobs were touched, what existing
+implementation was reused, what does the guard miss?"; the answers go in the gate record.
 
 A coverage or look-back nudge is an ACTION ITEM, not a notice: answer it with
 records or an explicit "none".

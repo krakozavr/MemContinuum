@@ -1,0 +1,663 @@
+{
+  "schema_version": 1,
+  "scan_roots": [
+    "."
+  ],
+  "exclusions": [
+    "tests",
+    "fixtures",
+    "bench",
+    "docs",
+    "memory",
+    "skills",
+    "templates",
+    ".git",
+    ".github",
+    ".worktrees",
+    ".superpowers",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "node_modules",
+    "vendor",
+    "build",
+    "dist",
+    "site-packages"
+  ],
+  "rows": [
+    {
+      "id": "join-semicolon-list",
+      "job": "Join list elements with semicolons for a registry note column.",
+      "policy": "singleton",
+      "implementation": "scripts/mc-list-lib.sh#mc_join_semi",
+      "contract": "mc_join_semi ELEMENT... prints the arguments joined by ';' with no trailing separator, nothing for zero arguments; elements are joined raw (empty elements, spaces and a literal percent sign are kept; no printf format injection). It never encodes.",
+      "why_single": "Two scripts used to carry their own copy; the updater joined raw values and the decision writer encoded each element first. A third copy would drift in what it encodes or how it treats empty elements.",
+      "related_paths": [
+        "scripts/mc-list-lib.sh",
+        "scripts/memcontinuum-update.sh",
+        "scripts/memcontinuum-decide.sh"
+      ],
+      "variants": [
+        {
+          "symbol": "scripts/memcontinuum-decide.sh#encode_join_semi",
+          "contract": "Percent-encodes each element with mc_note_encode, then joins through mc_join_semi.",
+          "reason": "A wrapper, not a second join: encoding happens exactly once, in the decision writer, before the shared join."
+        }
+      ],
+      "guards": [
+        {
+          "method": "name_owner",
+          "params": {
+            "pattern": "^(mc_)?join_semi$"
+          }
+        },
+        {
+          "method": "exact_copy",
+          "params": {}
+        }
+      ],
+      "coverage_limit": "Shell only: finds a function named join_semi anywhere in the scan roots and a function whose normalised body equals the owner's (comments, indentation and `local` names ignored). A join written inline in a loop is not recognised; a copy whose normalised body differs by one token (a literal, an added statement, reordered locals) escapes; a rewrite under another name needs a human. The shell scan reads ordinary shell as this repository writes it; unusual spellings listed in the engineering notes can hide a call, a definition or a direct command.",
+      "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
+      "test": "tests.test_reuse_inventory.TestProductionTree"
+    },
+    {
+      "id": "coverage-fact-sentence",
+      "job": "Build the coverage fact line and the has-evidence flag shown by the session-start and prompt nudges.",
+      "policy": "singleton",
+      "implementation": "hooks/mc_nudge.py#coverage_fact",
+      "contract": "coverage_fact(unmapped, coverage_status, code_changed, store_changed) returns (fact_line, has_evidence); unmapped already excludes git-ignored paths.",
+      "why_single": "Both hook payloads print this sentence; two builders would let the wording and the evidence rule diverge between the two nudges.",
+      "related_paths": [
+        "hooks/mc_nudge.py",
+        "hooks/userprompt-remind.sh",
+        "hooks/sessionstart-remind.sh"
+      ],
+      "guards": [
+        {
+          "method": "token_owner",
+          "params": {
+            "pattern": "Coverage signal"
+          }
+        },
+        {
+          "method": "token_owner",
+          "params": {
+            "pattern": "edited file\\(s\\) with no decision topic"
+          }
+        },
+        {
+          "method": "delegation",
+          "params": {
+            "consumers": [
+              "hooks/userprompt-remind.sh",
+              "hooks/sessionstart-remind.sh"
+            ],
+            "refs": [
+              "coverage_fact"
+            ]
+          }
+        },
+        {
+          "method": "exact_copy",
+          "params": {}
+        }
+      ],
+      "coverage_limit": "Finds the sentence fragments as text of executable code: Python units, extracted python payloads and shell text outside comments and heredoc bodies (a fragment in a double-quoted -c payload or in a shell variable is still shell text and is seen). Not seen: the same words built from pieces, a reworded sentence, and a fragment inside a non-Python heredoc body (that body is dropped from the shell text and not parsed). The two hook payloads must execute coverage_fact (delegation counts only an executed call (a comment, a `type` probe or a bare import is a mention and does not count)). Not recognised: a copy whose normalised body differs by one token (a literal, an added statement, reordered locals, a renamed local that shares its name with a nested function's variable) escapes; a rewrite under another name needs a human. The shell scan reads ordinary shell as this repository writes it; unusual spellings listed in the engineering notes can hide a call, a definition or a direct command.",
+      "variants": [],
+      "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
+      "test": "tests.test_reuse_inventory.TestProductionTree"
+    },
+    {
+      "id": "coverage-question-sentence",
+      "job": "Build the coverage question that follows the fact line.",
+      "policy": "singleton",
+      "implementation": "hooks/mc_nudge.py#coverage_question",
+      "contract": "coverage_question(store_root) returns the question text naming the store and the record shapes.",
+      "why_single": "A separate contract from the fact builder; both hook payloads must ask the same question.",
+      "related_paths": [
+        "hooks/mc_nudge.py",
+        "hooks/userprompt-remind.sh",
+        "hooks/sessionstart-remind.sh"
+      ],
+      "guards": [
+        {
+          "method": "token_owner",
+          "params": {
+            "pattern": "rejected alternative from this session"
+          }
+        },
+        {
+          "method": "delegation",
+          "params": {
+            "consumers": [
+              "hooks/userprompt-remind.sh",
+              "hooks/sessionstart-remind.sh"
+            ],
+            "refs": [
+              "coverage_question"
+            ]
+          }
+        },
+        {
+          "method": "exact_copy",
+          "params": {}
+        }
+      ],
+      "coverage_limit": "Finds the sentence fragments as text of executable code: Python units, extracted python payloads and shell text outside comments and heredoc bodies (a fragment in a double-quoted -c payload or in a shell variable is still shell text and is seen). Not seen: the same words built from pieces, a reworded sentence, and a fragment inside a non-Python heredoc body (that body is dropped from the shell text and not parsed). The two hook payloads must execute coverage_question (delegation counts only an executed call (a comment, a `type` probe or a bare import is a mention and does not count)). Not recognised: a copy whose normalised body differs by one token (a literal, an added statement, reordered locals, a renamed local that shares its name with a nested function's variable) escapes; a rewrite under another name needs a human. The shell scan reads ordinary shell as this repository writes it; unusual spellings listed in the engineering notes can hide a call, a definition or a direct command.",
+      "variants": [],
+      "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
+      "test": "tests.test_reuse_inventory.TestProductionTree"
+    },
+    {
+      "id": "filing-typed-authorities",
+      "job": "Name the typed non-owner authorities the filing commands write and promotion may ratify.",
+      "policy": "singleton",
+      "implementation": "memidx.py#FILING_TYPED_AUTHORITIES",
+      "contract": "A tuple of the three typed non-owner authority labels (agent-inference, reviewer-finding, code-derived). promotable_link reads it.",
+      "why_single": "Filing and promotion must agree on which labels are filable and ratifiable; a second literal list would let one grow without the other.",
+      "related_paths": [
+        "memidx.py"
+      ],
+      "variants": [
+        {
+          "symbol": "memidx.py#HOLD_ELIGIBLE_AUTHORITIES",
+          "contract": "Authorities a constraint-style hold may carry when it has validated evidence.",
+          "reason": "A different role that happens to hold the same three members today; enforcement policy is not derived from filing permissions or the reverse."
+        }
+      ],
+      "guards": [
+        {
+          "method": "vocab_owner",
+          "params": {}
+        },
+        {
+          "method": "delegation",
+          "params": {
+            "consumers": [
+              "memidx.py#promotable_link"
+            ],
+            "refs": [
+              "FILING_TYPED_AUTHORITIES"
+            ]
+          }
+        }
+      ],
+      "coverage_limit": "Finds a literal set, tuple or list of strings equal to the owner's anywhere in the scanned Python (including extracted payloads). A vocabulary built programmatically, or a different subset, is not recognised. The hold-eligibility set is exempted by name; if it is ever made to coincide on purpose it stays a separate role. Promotion must reference the constant by value inside promotable_link; a mention in a comment does not count.",
+      "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
+      "test": "tests.test_reuse_inventory.TestProductionTree"
+    },
+    {
+      "id": "hold-eligible-authorities",
+      "job": "Name the authorities a hold may carry (a deliberate variant of the filing vocabulary).",
+      "policy": "allowed_variants",
+      "implementation": "memidx.py#HOLD_ELIGIBLE_AUTHORITIES",
+      "contract": "A set of the authority labels eligible for an evidence-backed hold; invariant_enforcement_class and memlint's tiering read it.",
+      "why_single": "Not applicable: this row records a deliberate second vocabulary, not a singleton.",
+      "related_paths": [
+        "memidx.py",
+        "memlint.py"
+      ],
+      "variants": [
+        {
+          "symbol": "memidx.py#FILING_TYPED_AUTHORITIES",
+          "contract": "The typed authorities the filing commands write and promotion ratifies.",
+          "reason": "Same members today, different role. Enforcement and filing change for different reasons; do not derive one from the other merely because the members coincide."
+        }
+      ],
+      "coverage_limit": "No guard: the pair is a recorded exception to the filing-vocabulary row, which exempts it by name.",
+      "test": "tests.test_reuse_inventory.TestPositiveControls",
+      "guards": [],
+      "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)"
+    },
+    {
+      "id": "link-raw-spans",
+      "job": "Extract the byte-preserving raw span of each frontmatter mapping row (links, anchors, marks).",
+      "policy": "singleton",
+      "implementation": "memlint.py#_link_raw_spans",
+      "contract": "_link_raw_spans(text, parsed_rows, key, ident) maps a row identity to the exact raw text of its list item, positionally, or None when the structure is inconclusive.",
+      "why_single": "The append-only freeze depends on one walker whose limits are documented; a second span extractor would disagree on edge cases and either hide or invent a rewrite.",
+      "related_paths": [
+        "memlint.py",
+        "memidx.py"
+      ],
+      "guards": [
+        {
+          "method": "name_owner",
+          "params": {
+            "pattern": "^_?link_raw_spans$"
+          }
+        },
+        {
+          "method": "exact_copy",
+          "params": {}
+        },
+        {
+          "method": "delegation",
+          "params": {
+            "consumers": [
+              "memlint.py#_anchor_freeze_errors",
+              "memlint.py#_standing_marks_freeze_errors",
+              "memlint.py#check_append_only",
+              "memidx.py#insert_promoted_by"
+            ],
+            "refs": [
+              "_link_raw_spans"
+            ]
+          }
+        }
+      ],
+      "coverage_limit": "Recognises the name, a renamed copy with the same normalised body, and the named freeze consumers calling it (delegation counts only an executed call (a comment, a `type` probe or a bare import is a mention and does not count)). Not recognised: a copy whose normalised body differs by one token (a literal, an added statement, reordered locals, a renamed local that shares its name with a nested function's variable) escapes; a rewrite under another name needs a human; a consumer not listed here.",
+      "variants": [],
+      "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
+      "test": "tests.test_reuse_inventory.TestProductionTree"
+    },
+    {
+      "id": "anchor-identity",
+      "job": "Identify an anchor row for the append-only freeze.",
+      "policy": "singleton",
+      "implementation": "memlint.py#_anchor_ident",
+      "contract": "_anchor_ident(row) returns the four-field identity (ref, link, captured, captured_at) joined by NUL, or None when a part is missing or not a scalar.",
+      "why_single": "The freeze decides whether a recorded anchor changed by this identity; its four-field shape differs from the two-field baseline key and must not be restated.",
+      "related_paths": [
+        "memlint.py"
+      ],
+      "guards": [
+        {
+          "method": "name_owner",
+          "params": {
+            "pattern": "^_?anchor_ident$"
+          }
+        },
+        {
+          "method": "exact_copy",
+          "params": {}
+        },
+        {
+          "method": "delegation",
+          "params": {
+            "consumers": [
+              "memlint.py#_anchor_freeze_errors"
+            ],
+            "refs": [
+              "_anchor_ident"
+            ]
+          }
+        }
+      ],
+      "coverage_limit": "Name pattern, renamed exact copy, and the anchor-freeze consumer calling it (delegation counts only an executed call (a comment, a `type` probe or a bare import is a mention and does not count)). Not recognised: a copy whose normalised body differs by one token (a literal, an added statement, reordered locals, a renamed local that shares its name with a nested function's variable) escapes; a rewrite under another name needs a human.",
+      "variants": [],
+      "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
+      "test": "tests.test_reuse_inventory.TestProductionTree"
+    },
+    {
+      "id": "shell-millisecond-clock",
+      "job": "Read a portable millisecond clock from shell hooks.",
+      "policy": "singleton",
+      "implementation": "hooks/mc-query-lib.sh#mc_now_ms",
+      "contract": "mc_now_ms [PY [NOPY]] sets and prints MC_NOW_MS using the ladder EPOCHREALTIME, date +%3N, perl Time::HiRes, python (unless NOPY), whole seconds.",
+      "why_single": "The ladder encodes macOS and bash 3.2 behaviour learned the hard way; a second clock in a hook would skip a rung and log wrong elapsed times.",
+      "related_paths": [
+        "hooks/mc-query-lib.sh",
+        "hooks/pre-edit-chain.sh",
+        "hooks/newfile-nudge.sh",
+        "hooks/userprompt-remind.sh",
+        "hooks/memlib.sh"
+      ],
+      "guards": [
+        {
+          "method": "name_owner",
+          "params": {
+            "pattern": "^(mc_)?now_ms$"
+          }
+        },
+        {
+          "method": "token_owner",
+          "params": {
+            "pattern": "perl\\s+-MTime::HiRes"
+          }
+        },
+        {
+          "method": "delegation",
+          "params": {
+            "consumers": [
+              "hooks/pre-edit-chain.sh",
+              "hooks/newfile-nudge.sh",
+              "hooks/userprompt-remind.sh"
+            ],
+            "refs": [
+              "mc_now_ms"
+            ],
+            "forbid": [
+              "EPOCHREALTIME",
+              {"command": "^date(?: \\S+)* \\+%s%3N"},
+              "\\(\\([^\\n]*date\\s+\\+%s|date\\s+\\+%s[^\\n]*\\*\\s*1000|date\\s+\\+%s\\)?000\\b",
+              "Time::HiRes",
+              "time\\.time\\(\\)\\s*\\*\\s*1000|\\btime_ns\\("
+            ]
+          }
+        }
+      ],
+      "coverage_limit": "Shell clocks only. The perl Time::HiRes invocation must stay in the owner, and the three elapsed-timing hooks must execute mc_now_ms (delegation counts only an executed call: a command word, bare or as one quoted word, also directly after `eval`; a comment, a `type` probe, a redirection target, a `case` pattern or an argument is a mention and does not count; a command word continued over a backslash-newline is seen; a call word written inside `[[ ]]`, a `for ((...))` header, an extglob group, an array literal or any `(` that does not start a command is NOT seen, but a `$( )`, backtick or `<( )` substitution inside them runs and is read as commands) and build no millisecond clock of their own: EPOCHREALTIME, `date +%s%3N`, `date +%s` in arithmetic or scaled to milliseconds (inside $(( )), times 1000, or with 000 appended), Time::HiRes, `time.time() * 1000` and `time_ns(`. `date +%s%3N` is matched as a parsed command; the other patterns are matched as text, so a string that merely spells one of them is also reported. A plain whole-second `date +%s` or `time.time()` read is NOT forbidden -- the hooks use them for watchdog and timestamp purposes that are not millisecond elapsed timing -- so another clock expression (for example $SECONDS, or a whole-second read scaled in a way the patterns do not list) is not seen. A shape whose extent the scanner cannot decide (a heredoc delimiter that is not a plain or simply quoted word, a `case` inside a skipped group, a `#` comment inside backticks, a function with no closing `}`) is a scan problem that fails the check, never a skip. Not seen: a launcher in front of the call (`xargs`, `find -exec`, `sudo`, `env`, `timeout`, `coproc`, `command -p`), a function passed to another by name. Clocks in other hooks or in other languages are outside this contract. The shell scan reads ordinary shell as this repository writes it; unusual spellings listed in the engineering notes can hide a call, a definition or a direct command.",
+      "variants": [],
+      "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
+      "test": "tests.test_reuse_inventory.TestProductionTree"
+    },
+    {
+      "id": "store-lint-schema",
+      "job": "Run the plain schema lint of the store and classify its process result.",
+      "policy": "singleton",
+      "implementation": "hooks/mc-store-lint.sh#mc_store_lint_schema",
+      "contract": "mc_store_lint_schema PY MEMLINT ROOT sets MC_LINT_SCHEMA (ok | fail | engine-failure), the output and the summary flag; a bare rc=1 without memlint's own summary is an engine failure, never a finding.",
+      "why_single": "The pre-commit and post-commit hooks must judge a record by exactly the same rules; the invocation and verdict parsing live in one place.",
+      "related_paths": [
+        "hooks/mc-store-lint.sh",
+        "hooks/pre-commit-append-only.sh",
+        "hooks/post-commit-reindex.sh"
+      ],
+      "guards": [
+        {
+          "method": "name_owner",
+          "params": {
+            "pattern": "^(mc_)?store_lint_schema$"
+          }
+        },
+        {
+          "method": "delegation",
+          "params": {
+            "consumers": [
+              "hooks/pre-commit-append-only.sh",
+              "hooks/post-commit-reindex.sh"
+            ],
+            "refs": [
+              "mc_store_lint_schema"
+            ],
+            "forbid": [
+              {"command": "^(?:env (?:\\S+=\\S* )*)?(?:(?:\\S*/)?python[\\w.]*|\\$\\{?\\w*PY\\w*\\}?) (?:-\\S+ )*(?:\\$\\{?(?:MEMLINT|memlint)\\}?|[^\\s=]*memlint\\.py)(?: |$)"},
+              {"command": "^(?:env (?:\\S+=\\S* )*)?(?:\\$\\{?(?:MEMLINT|memlint)\\}?|[^\\s=]*memlint\\.py)(?: |$)"}
+            ]
+          }
+        }
+      ],
+      "coverage_limit": "The two commit hooks must execute mc_store_lint_schema (delegation counts only an executed call: a command word, bare or as one quoted word (`mc_store_lint_schema`, `\"mc_store_lint_schema\"`), also directly after `eval`; a comment, a `type` probe, a redirection target, a `case` pattern, an argument or a bare import is a mention and does not count; a command word continued over a backslash-newline is seen; a call word written inside `[[ ]]`, a `for ((...))` header, an extglob group, an array literal or any `(` that does not start a command is NOT seen, but a `$( )`, backtick or `<( )` substitution inside them runs and is read as commands), so an inlined lint call that keeps the probe is caught. Forbidden direct shapes, matched against each parsed command with its `VAR=value` prefixes ignored: an interpreter (`python3`, `\"$PY\"`, `$MC_PY`) followed by `$MEMLINT`, `$memlint` or a `memlint.py` path, and the lint executed directly (`$memlint ROOT`, `.../memlint.py ROOT`, `$MEMLINT --...`), also behind an `env` prefix (the forbid sees it; the reach check does not, so `env mc_store_lint_...` is not seen as a call). Text that only mentions the lint (an `echo`, the owner's own arguments) is not a direct call. A third hook that runs the lint another way is only caught by the name pattern. A shape whose extent the scanner cannot decide (a heredoc delimiter that is not a plain or simply quoted word, a `case` inside a skipped group, a `#` comment inside backticks, a function with no closing `}`) is a scan problem that fails the check, never a skip. Not seen: a launcher in front of the call (`xargs`, `find -exec`, `sudo`, `env`, `timeout`, `coproc`, `command -p`), a function passed to another by name, and an `eval` of anything but one plain word. A lint reached through an alias variable is not seen either. The shell scan reads ordinary shell as this repository writes it; unusual spellings listed in the engineering notes can hide a call, a definition or a direct command.",
+      "variants": [],
+      "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
+      "test": "tests.test_reuse_inventory.TestProductionTree"
+    },
+    {
+      "id": "store-lint-append-only",
+      "job": "Run the append-only lint of the index against a ref and classify its result.",
+      "policy": "singleton",
+      "implementation": "hooks/mc-store-lint.sh#mc_store_lint_append_only",
+      "contract": "mc_store_lint_append_only PY MEMLINT ROOT REF sets MC_LINT_APPEND (ok | fail | engine-failure), the output, rc, the changed= and notes= counts; the rc is trusted only together with the changed= marker.",
+      "why_single": "Pre-commit (REF = HEAD) and post-commit (REF = HEAD~1) must share the verdict parsing, or --no-verify bypasses would be judged by different rules.",
+      "related_paths": [
+        "hooks/mc-store-lint.sh",
+        "hooks/pre-commit-append-only.sh",
+        "hooks/post-commit-reindex.sh"
+      ],
+      "guards": [
+        {
+          "method": "name_owner",
+          "params": {
+            "pattern": "^(mc_)?store_lint_append_only$"
+          }
+        },
+        {
+          "method": "token_owner",
+          "params": {
+            "pattern": "--against-ref",
+            "paths": [
+              "hooks"
+            ]
+          }
+        },
+        {
+          "method": "delegation",
+          "params": {
+            "consumers": [
+              "hooks/pre-commit-append-only.sh",
+              "hooks/post-commit-reindex.sh"
+            ],
+            "refs": [
+              "mc_store_lint_append_only"
+            ],
+            "forbid": [
+              {"command": "^(?:env (?:\\S+=\\S* )*)?(?:(?:\\S*/)?python[\\w.]*|\\$\\{?\\w*PY\\w*\\}?) (?:-\\S+ )*(?:\\$\\{?(?:MEMLINT|memlint)\\}?|[^\\s=]*memlint\\.py)(?: |$)"},
+              {"command": "^(?:env (?:\\S+=\\S* )*)?(?:\\$\\{?(?:MEMLINT|memlint)\\}?|[^\\s=]*memlint\\.py)(?: |$)"}
+            ]
+          }
+        }
+      ],
+      "coverage_limit": "Only the hook-side invocation of the append-only lint is owned; --against-ref in memlint's argument handling, adapters and documentation is legitimate and is not scanned (hooks/ shell only). The two commit hooks must execute mc_store_lint_append_only (delegation counts only an executed call: a command word, bare or as one quoted word (`mc_store_lint_append_only`, `\"mc_store_lint_append_only\"`), also directly after `eval`; a comment, a `type` probe, a redirection target, a `case` pattern, an argument or a bare import is a mention and does not count; a command word continued over a backslash-newline is seen; a call word written inside `[[ ]]`, a `for ((...))` header, an extglob group, an array literal or any `(` that does not start a command is NOT seen, but a `$( )`, backtick or `<( )` substitution inside them runs and is read as commands). Forbidden direct shapes, matched against each parsed command with its `VAR=value` prefixes ignored: an interpreter (`python3`, `\"$PY\"`, `$MC_PY`) followed by `$MEMLINT`, `$memlint` or a `memlint.py` path, and the lint executed directly (`$memlint ROOT`, `.../memlint.py ROOT`, `$MEMLINT --...`), also behind an `env` prefix (the forbid sees it; the reach check does not, so `env mc_store_lint_...` is not seen as a call). Text that only mentions the lint (an `echo`, the owner's own arguments) is not a direct call. An option assembled dynamically, or an implementation in an extension-less hook, is not seen. A shape whose extent the scanner cannot decide (a heredoc delimiter that is not a plain or simply quoted word, a `case` inside a skipped group, a `#` comment inside backticks, a function with no closing `}`) is a scan problem that fails the check, never a skip. Not seen: a launcher in front of the call (`xargs`, `find -exec`, `sudo`, `env`, `timeout`, `coproc`, `command -p`), a function passed to another by name, and an `eval` of anything but one plain word. The shell scan reads ordinary shell as this repository writes it; unusual spellings listed in the engineering notes can hide a call, a definition or a direct command.",
+      "variants": [],
+      "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
+      "test": "tests.test_reuse_inventory.TestProductionTree"
+    },
+    {
+      "id": "record-text-parser",
+      "job": "Parse record text (frontmatter and body) with the shared diagnostics.",
+      "policy": "singleton",
+      "implementation": "memidx.py#parse_record_text",
+      "contract": "parse_record_text(text, path, as_delivered=False) returns a ParseResult with the frontmatter, the diagnostics and the lenient-fallback recovery.",
+      "why_single": "Every consumer must see the same validity verdict and diagnostics; a second parser would accept or reject different records.",
+      "related_paths": [
+        "memidx.py",
+        "memlint.py"
+      ],
+      "variants": [
+        {
+          "symbol": "memidx.py#parse_record",
+          "contract": "Reads the file, then delegates.",
+          "reason": "File-reading adapter."
+        },
+        {
+          "symbol": "memidx.py#parse_record_raw",
+          "contract": "Normalises CRLF endings, then delegates.",
+          "reason": "Text adapter."
+        }
+      ],
+      "guards": [
+        {
+          "method": "name_owner",
+          "params": {
+            "pattern": "^_?parse_record_text$"
+          }
+        },
+        {
+          "method": "exact_copy",
+          "params": {}
+        },
+        {
+          "method": "delegation",
+          "params": {
+            "consumers": [
+              "memidx.py#parse_record",
+              "memidx.py#parse_record_raw"
+            ],
+            "refs": [
+              "parse_record_text"
+            ]
+          }
+        },
+        {
+          "method": "delegation",
+          "params": {
+            "consumers": [
+              "memlint.py"
+            ],
+            "refs": [
+              "parse_record_text",
+              "parse_record_raw",
+              "parse_record"
+            ],
+            "forbid": [
+              "yaml\\.(?:safe_)?load"
+            ],
+            "aliases": [
+              "parse_record_raw",
+              "parse_record"
+            ]
+          }
+        }
+      ],
+      "coverage_limit": "Recognises the name, a copy with the same normalised body, the adapters calling the core and memlint calling the parser through them (delegation counts only an executed call (a comment, a `type` probe or a bare import is a mention and does not count)). Not recognised: a copy whose normalised body differs by one token (a literal, an added statement, reordered locals, a renamed local that shares its name with a nested function's variable) escapes; a rewrite under another name needs a human. Unrelated YAML loading elsewhere is deliberately not prohibited.",
+      "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
+      "test": "tests.test_reuse_inventory.TestProductionTree"
+    },
+    {
+      "id": "parser-adapters",
+      "job": "Adapters that feed the record-text parser (a recorded deliberate variant).",
+      "policy": "allowed_variants",
+      "implementation": "memidx.py#parse_record_text",
+      "contract": "parse_record reads a file; parse_record_raw normalises CRLF; both delegate to parse_record_text.",
+      "why_single": "Not applicable: adapters, not additional parser cores.",
+      "related_paths": [
+        "memidx.py"
+      ],
+      "variants": [
+        {
+          "symbol": "memidx.py#parse_record",
+          "contract": "File-reading wrapper.",
+          "reason": "Reads the path, then calls the parser core."
+        },
+        {
+          "symbol": "memidx.py#parse_record_raw",
+          "contract": "CRLF-normalising wrapper.",
+          "reason": "Normalises line endings, then calls the parser core."
+        }
+      ],
+      "coverage_limit": "No guard: the singleton row for the parser core exempts and checks them.",
+      "test": "tests.test_reuse_inventory.TestPositiveControls",
+      "guards": [],
+      "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)"
+    },
+    {
+      "id": "chunker-declared-symbols",
+      "job": "Declare a file's symbol vocabulary per language backend.",
+      "policy": "allowed_variants",
+      "implementation": "chunkers/__init__.py#get_chunker",
+      "contract": "Each backend implements declared_symbols(text) returning (symbol, qualified_name) pairs for its own grammar.",
+      "why_single": "Not applicable: the registry contract is implemented once per source grammar, deliberately.",
+      "related_paths": [
+        "chunkers/__init__.py",
+        "chunkers/swift.py",
+        "chunkers/python_ast.py",
+        "chunkers/treesitter.py"
+      ],
+      "variants": [
+        {
+          "symbol": "chunkers/swift.py#declared_symbols",
+          "contract": "Swift declaration vocabulary.",
+          "reason": "Different source grammar."
+        },
+        {
+          "symbol": "chunkers/python_ast.py#declared_symbols",
+          "contract": "Python vocabulary from the stdlib ast.",
+          "reason": "Different source grammar."
+        },
+        {
+          "symbol": "chunkers/treesitter.py#TreeSitterChunker.declared_symbols",
+          "contract": "Vocabulary for every tree-sitter language.",
+          "reason": "Query-driven, shared by the community grammars."
+        }
+      ],
+      "coverage_limit": "No guard: the backend families are recorded exceptions. This does not exempt unrelated code anywhere under chunkers/.",
+      "test": "tests.test_reuse_inventory.TestPositiveControls",
+      "guards": [],
+      "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)"
+    },
+    {
+      "id": "chunker-chunk-file",
+      "job": "Chunk a file into callable chunks per language backend.",
+      "policy": "allowed_variants",
+      "implementation": "chunkers/__init__.py#get_chunker",
+      "contract": "Each backend implements chunk_file(text, rel_path) returning a ChunkResult.",
+      "why_single": "Not applicable: backend-specific parsing is deliberate.",
+      "related_paths": [
+        "chunkers/__init__.py",
+        "chunkers/swift.py",
+        "chunkers/python_ast.py",
+        "chunkers/treesitter.py"
+      ],
+      "variants": [
+        {
+          "symbol": "chunkers/swift.py#chunk_file",
+          "contract": "Hand-written Swift lexer chunking.",
+          "reason": "Swift has no pinned grammar wheel."
+        },
+        {
+          "symbol": "chunkers/python_ast.py#chunk_file",
+          "contract": "Stdlib ast chunking.",
+          "reason": "Python chunking needs no grammar wheel."
+        },
+        {
+          "symbol": "chunkers/treesitter.py#TreeSitterChunker.chunk_file",
+          "contract": "Query-driven chunking over pinned grammar wheels.",
+          "reason": "One backend for all other languages."
+        }
+      ],
+      "coverage_limit": "No guard: the backend families are recorded exceptions.",
+      "test": "tests.test_reuse_inventory.TestPositiveControls",
+      "guards": [],
+      "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)"
+    },
+    {
+      "id": "chunker-doc-extraction",
+      "job": "Extract a chunk's leading documentation per language backend.",
+      "policy": "allowed_variants",
+      "implementation": "chunkers/__init__.py#get_chunker",
+      "contract": "Each backend finds the documentation attached to a declaration in its own syntax.",
+      "why_single": "Not applicable: documentation syntax and extraction behaviour differ per language.",
+      "related_paths": [
+        "chunkers/__init__.py",
+        "chunkers/swift.py",
+        "chunkers/python_ast.py",
+        "chunkers/treesitter.py"
+      ],
+      "variants": [
+        {
+          "symbol": "chunkers/swift.py#_doc_comment_before",
+          "contract": "Swift /// and /** */ comments before a declaration.",
+          "reason": "Language syntax."
+        },
+        {
+          "symbol": "chunkers/python_ast.py#_doc_first_line",
+          "contract": "First line of a Python docstring.",
+          "reason": "Language syntax."
+        },
+        {
+          "symbol": "chunkers/treesitter.py#_doc_for",
+          "contract": "Doc comments chosen by the language row's node types.",
+          "reason": "Table-driven per language."
+        }
+      ],
+      "coverage_limit": "No guard: the backend families are recorded exceptions.",
+      "test": "tests.test_reuse_inventory.TestPositiveControls",
+      "guards": [],
+      "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)"
+    },
+    {
+      "id": "link-classification",
+      "job": "Classify a decision link as a constraint, a hold or context (two deliberate contracts).",
+      "policy": "allowed_variants",
+      "implementation": "memidx.py#invariant_enforcement_class",
+      "contract": "Drift classifies an invariant-bearing SQLite row.",
+      "why_single": "Not applicable: two distinct contracts share authority vocabulary and must stay distinct.",
+      "related_paths": [
+        "memidx.py",
+        "memlint.py"
+      ],
+      "variants": [
+        {
+          "symbol": "memlint.py#_link_tier",
+          "contract": "Marker verification classifies a raw YAML link and requires an invariant specifically for an agent-inference hold.",
+          "reason": "Two distinct contracts share authority vocabulary: drift classifies an invariant-bearing SQLite row; marker verification classifies a raw YAML link and requires an invariant specifically for an agent-inference hold. Preserve that difference; reuse the authority sets and evidence validator."
+        }
+      ],
+      "coverage_limit": "No guard: do not force one classifier through the other merely to reduce the definition count.",
+      "test": "tests.test_reuse_inventory.TestPositiveControls",
+      "guards": [],
+      "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)"
+    }
+  ]
+}

@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+### A list of the jobs the code does once, and a check that keeps it so
+
+The engine now carries `docs/REUSE-INVENTORY.json`: the jobs it implements in exactly one place (the semicolon
+list join, the two coverage sentences, the filing authorities, the byte-span walker, the millisecond clock,
+the two commit-time lint runs, the record parser), the owner of each, and what a second copy would look
+like. A test (`tests/test_reuse_inventory.py`) fails when a recognisable second implementation appears: the
+same name, a renamed copy of the same body, a second owner of a guarded construct (including inside the
+Python the hooks embed), or a caller that goes around the owner. Deliberate variants (the three chunker
+backends, the two link classifiers, the parser adapters) are recorded with their reason instead of
+guarded. The list is honest about its limits: each row says what its checks cannot see, and a rewrite
+under another name still needs a human. `context-pack FILE... --code-root DIR` now also prints the rows for
+the files a brief touches, after the decision records, so a dispatched agent is told to reuse the owner;
+an inventory file that is present but unusable is named in the pack instead of being skipped silently.
+To make the join checkable, the two scripts that each carried their own copy of it now share one in
+`scripts/mc-list-lib.sh`; behaviour is unchanged.
+
+    Technical: `mc_reuse.py` (stdlib only; `python3 mc_reuse.py` checks a checkout) loads and validates the inventory, scans Python with `ast` and shell with a bounded scanner for ordinary shell (`name() {` and `function name {`; heredoc and single-quoted `-c` payloads fed to an interpreter are scanned as Python) and runs the five guard methods `name_owner`, `exact_copy`, `token_owner`, `delegation`, `vocab_owner`; a `known_debt` row is rendered as such and never as guarded; the full scan of the tree takes under a second; the shell scan does not see every spelling of a call, and its known misreads are listed in the engineering notes. `context-pack` reads the inventory of each `--code-root` only, adds `inventory` / `inventory_omitted` to the JSON envelope when rows matched and `inventory_error` when the file is present but unusable, keeps decision records and anchor lines ahead of the rows under `--max-bytes` and names rows the cap left out; the routing rule template gains one sentence. `mc_join_semi` (raw join) replaces both `join_semi` copies; the decision writer percent-encodes each element once, then joins. The engine-copy fixtures list `mc-list-lib.sh` and `mc_reuse.py`.
+
 ### Taking back a bind or unbind is exact
 
 Typed the wrong reference, or bound and then changed your mind before committing? Running the opposite

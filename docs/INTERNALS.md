@@ -4022,6 +4022,181 @@ only a fixed notice that no decision records were supplied, plus its hash
 line, so a blind review is recorded as such and carries nothing
 memory-shaped.
 
+## The reuse inventory
+
+`docs/REUSE-INVENTORY.json` lists the jobs this engine implements once, the owner of
+each, and the deterministic checks that reject a recognisable second
+implementation. `mc_reuse.py` (stdlib only, no production module imported) loads
+it, scans the production tree and runs the checks; `tests/test_reuse_inventory.py`
+runs it on every test run, and `memidx.py context-pack ... --code-root DIR`
+prints the rows that match a brief's files. The limit is stated up front: **a test
+can reject recognisable second implementations; it cannot recognise every
+rewritten implementation of the same job.** Each row therefore says what its own
+checks miss.
+
+**The bar for the shell scan.** The shell scan is a bounded reader built for shell as
+this repository's hooks and scripts write it. It is a check against an accidental
+second implementation, not a security boundary: a deliberately unusual spelling can
+hide a call, a definition or a direct command from it, exactly as a rename hides a
+copy. The shapes known to be misread are listed below ("Known shapes the scan
+misreads"); a shape found in a real hook that the scan misreads is treated as a
+defect and fixed.
+
+**A row** is one contract a caller should reuse (a constant can own one). Fields:
+`id` (stable), `job`, `policy`, `implementation` (`path#qualified_symbol`),
+`contract`, `why_single` (what would drift if callers did it again),
+`related_paths` (consumers and relevant patterns, used to pick rows for a brief),
+`variants` (`symbol`, `contract`, `reason`), `guards` (`method` and `params`),
+`coverage_limit`, `evidence` (a plain title or rationale, never a record id), and
+`test` (`tests.<module>.<Class>[.<method>]`, resolved by the checker). `policy` is
+`singleton` (must name at least one guard), `allowed_variants` (a recorded
+deliberate multiplicity: members listed in `variants`, no guard) or `known_debt`
+(a temporary row: every current implementation in `variants`, the intended
+resolution in `why_single`, never guarded and always rendered as "KNOWN DEBT, not
+guarded"). The top level carries `schema_version`, `scan_roots` and
+`exclusions` once, not per row, and may carry `tests_dir: null` to say the
+inventory has no tests directory (otherwise a root without `tests/` fails with
+"tests directory missing" and every `test` id must resolve to a class and at most
+one method); tests, fixtures, benchmark corpora, documentation,
+the store, caches and vendored code are outside the scan.
+
+**The scan.** Python definitions (functions, methods, nested functions, module
+constants, found under any compound statement: if, for, while, with, try, match and
+their async variants) are read with `ast`. Shell functions are read from the one parse of the file (`_sh_parse`), not from
+lines: the forms `name() {`, `function name {` and `function name () {` at command
+position (the parse descends into `$( )` and backticks, so a real definition there
+counts), with the brace on the declaration's line or a later one, and a body ending
+at the `}` the parse pairs with that `{` (on its own line or after a `;`). A
+declaration-looking line inside a quoted string or an array literal is text, never a
+definition and never a function unit; a unit's calls and commands are the commands
+the parse recorded inside its extent. `name() (`, `name() command` and a function
+whose `}` the parse cannot find are reported, never guessed at. The same parse is
+the only code that decides where a quote, a comment, a heredoc body, a continuation,
+a skipped region or a function body begins and ends; command words, rendered
+commands, interpreter starts, the comment and heredoc masking and the identifier
+compare all read it. Every skipped region (a parenthesis group, `${...}`, `[[ ]]`,
+backticks) is walked by one shared step that reads quotes, comments, heredoc
+operators and bodies, continuations and nested arithmetic the same way whichever
+region it is in. A backslash-newline is dropped only outside single quotes (it joins
+the word, so a `#` after it is not a comment unless the joined text starts a word).
+Comments (the `#` that starts a word outside quotes, whole-line or trailing; a `#`
+line inside a multi-line quoted string is text, and so a `# Heading` line in such a
+string is shell text that `token_owner` sees; one word-boundary set, the one that
+ends a word, decides it, so `)#`, `<#` and `>#` start a comment inside a skipped
+region exactly as outside one, and `a#b` stays a word) and heredoc bodies are
+dropped; a terminator line must equal the delimiter exactly (trailing blanks do not
+close the body), and an unquoted heredoc joins a backslash-newline before the test,
+as Bash does. The `$( )` and backticks in an unquoted heredoc body run, so the
+commands in them are read. A heredoc opened inside a skipped region (not an
+arithmetic one, where `<<` is a shift, also inside a `$( )` in a `${...}`) has its
+body consumed at the next newline. Python inside shell is
+scanned as Python: a heredoc fed to an interpreter (`python - <<'EOF'`,
+`"$MC_PY" - <<'EOF'`; the interpreter word, a following `-` and the `<<` may sit on
+different physical lines of one command, for example joined by a backslash-newline)
+and a single-quoted `<interpreter> -c '...'` payload that starts on the interpreter's
+line (shell text after its closing quote is kept). A `<<-` heredoc has its leading
+tabs removed from every payload line, as Bash does. Not scanned: double-quoted
+`-c "..."` payloads, Python held in a shell variable, extension-less scripts.
+**Refused, not guessed:** these shapes, whose extent the scanner knows it cannot decide
+exactly, are a scan problem that fails the check (a finding naming the file and
+line), never a silent skip (the list is not a promise that no other undecidable
+shape exists; the shapes under "Known shapes the scan misreads" are decided
+wrongly without any scan problem): a heredoc delimiter that holds a substitution or a `$'..'` / `$".."`
+quote (Bash quote-removes the delimiter and runs nothing in it; a plain, `'..'`,
+`".."` or `\`-quoted word is read exactly, and the rest of the file is then treated
+as data), a heredoc never closed, a `case` inside a skipped group, a `#` comment
+inside a backtick substitution, a command substitution in an unquoted heredoc body
+that runs past the terminator, and the unsupported function forms above. A
+registered symbol the scanner cannot read fails with a diagnostic naming the
+supported forms; a recognised Python payload that does not parse is a scan problem
+reported with the file and the line of the payload (a finding), never skipped. The
+walker-by-feature table in `tests/test_reuse_inventory.py` (`ShellWalkerMatrixTest`)
+lists every context and feature as handled, refused or not applicable. A command
+substitution (`$( )`, backticks, `<( )`) is read wherever Bash runs it: in an array
+literal, a `${...}`, a `[[ ]]`, an arithmetic group, a skipped parenthesis group and a
+double-quoted piece of any of these; only the region's own words are not commands, and
+single quotes, `$'..'`, a quoted-delimiter heredoc body and a comment hold nothing that
+runs. This holds for the spellings the tree uses; the next list names the exceptions.
+"Bounded" names the syntax the scanner
+covers, not its resources: files are read whole, the scan is linear in file size, and
+there is no size cap.
+
+**Known shapes the scan misreads.** Each was run through Bash 5.2 and is pinned by a
+test (`KnownShellMisreads`) so that a change is noticed. None is written anywhere in
+the tree today. The first five err toward silence: Bash runs a command or defines a
+function that the scan does not see, or the scan counts a call Bash never runs. The
+last three err toward a false finding.
+
+- An empty heredoc delimiter (`cat <<''`): Bash ends the body at the first empty
+  line; the scan reads a different extent, so an owner call written inside the body
+  is counted although Bash never runs it (a call counted that bash never runs).
+- An escaped backtick substitution nested in a backtick substitution inside an array
+  literal (``arr=(`echo \`python3 "$memlint"\``)``): Bash runs `python3`; the scan
+  does not see it (a command bash runs that the scan does not see).
+- A command substitution in an unquoted heredoc body with a backslash-newline between
+  `$` and `(` (`$\` newline `(python3 "$memlint")`): Bash joins the lines and runs
+  it; the scan does not see it (a command bash runs that the scan does not see).
+- A command substitution inside single quotes inside a parameter expansion inside an
+  unquoted heredoc body (`${v:-'$(python3 "$memlint")'}`): the quotes are literal
+  there, so Bash runs it; the scan does not see it (a command bash runs that the
+  scan does not see).
+- A parameter-expansion default that opens a brace (`: ${v:-{ }`): Bash ends the
+  expansion at the first `}`; the scan opens a nested region and swallows the lines
+  that follow, so a command or a function definition after it is not seen (a command
+  or definition bash runs that the scan does not see).
+- A command substitution inside single quotes inside `"${v:-'...'}"`
+  (`x="${v:-'$(mc_job)'}"`): Bash runs `mc_job`; the scan reads it as quoted text, so
+  a real call is not counted and the consumer is reported as missing it (a real
+  call not counted).
+- A `$( )` that spans a line holding a pending heredoc operator
+  (`cat <<E "$(echo x` newline `mc_job` newline `)"`): Bash runs `mc_job`; the scan
+  does not count it (a real call not counted).
+- A heredoc terminator split by a continuation (`E\` newline `OF` closing `<<EOF`):
+  an unquoted heredoc joins the lines in Bash, so the body ends there and the next
+  line runs; the scan keeps reading the body and does not count that line (a real
+  call not counted).
+
+**The methods** (only these exist):
+
+| method | rejects | misses |
+|---|---|---|
+| `name_owner` | another definition (function or constant, any language in scope, embedded payloads included) whose simple name matches the owner's name pattern (default: the owner's exact name). The pattern must match the owner's own name and every `allow` entry must resolve, or the row fails | a copy under another name |
+| `exact_copy` | a function whose normalised body equals the owner's: its own name, docstrings (nested ones too), locations and consistently renamed local bindings are ignored; literals, attributes, operators, decorators and external dependencies are kept. Shell: comments, indentation, spacing and `local` names are normalised | a copy whose normalised body differs by one token (a literal, an added statement, reordered locals, a renamed local that shares its name with a nested function's variable) escapes; a rewrite under another name needs a human; tiny helpers can collide, so enable it per row after checking |
+| `token_owner` | a second unit (an outermost function, a method, or a file's residual code) whose executable text contains the owner's construct; owners are counted, not occurrences, and a stale pattern (the owner no longer holds it) fails too. `paths` narrows the units considered | the construct built from pieces; text in comments or in docstrings (of modules, classes and functions at any depth, which are removed before matching) is deliberately not matched |
+| `delegation` | a named consumer that does not EXECUTE the owner, or that contains a `forbid` pattern (a direct call that bypasses it). Executed means a shell command word (the first word of a simple command, after assignments, `$( )`, backticks, pipes, `&&`, `||`, `;`, `!`, `if`/`then`/`do`, `exec` and `eval`; it must be exactly the identifier, bare or as one single- or double-quoted piece such as `"name"` or `'name'`) or a Python call (`f(...)`, `x.f(...)`); a comment, a `type` probe, a bare import, a redirection target, a `case` pattern, an argument, quoted text that is not the whole word or a longer word (`name"x"`, `name/x`) is a mention and does not count. A word continued over a backslash-newline (`name\<newline>arg`, `"na\<newline>me"`) is the identifier and counts; inside single quotes the backslash-newline is part of the text and the word is not. The parser skips `[[ ... ]]`, an arithmetic `(( ))` command or `for ((...))` header, an extglob group in a case pattern, an array literal (also `name=\<newline>(...)`) and any `(` that does not start a command, whole, reading quotes and escapes inside them as it does in a word, so a call word written directly inside them is NOT seen (their own words are not matched by a `command` forbid); a `$( )`, backtick or `<( )` substitution inside them or inside a double-quoted piece of them runs in Bash and is read as a command sequence (commands, declarations, heredocs, comments recorded, and counted or forbidden like any other). A `forbid` entry is a bare string or `{"text": REGEX}` (searched in the unit's executable text) or `{"command": REGEX}` (matched from the first word of each parsed shell command, words joined by single spaces, quotes and redirections removed, and the same command again with its `VAR=value` prefixes kept; anchor it with `^`). A constant owner is reached by a value reference (an attribute load counts, a store does not) instead. `refs` must be the owner's name or an `aliases` entry, and an alias must be the name of one of the row's variants | consumers that are not named; a call to the owner placed beside an inline copy of the job (a `forbid` pattern is what catches that); a launcher in front of a shell call (`xargs`, `find -exec`, `sudo`, `env`, `timeout`, `coproc`, `command -p`), a function passed to another by name, an `eval` of anything but one plain word, and the spellings the bounded tokenizer does not join (`\name`, `$'name'`, `"na""me"`, `$"name"` (a locale-quoted word), `time -p name`, `exec -a x name`; all of these miss in the fail-closed direction) |
+| `vocab_owner` | a literal set, tuple or list of strings equal to the owner's vocabulary anywhere else (variants are exempt by name) | a vocabulary built in code, or a different subset |
+
+**Adding a row.** Find the existing implementation first and name it (code-search),
+write the row in the same change that adds or moves the owner, give every guard the
+narrowest pattern that identifies the job, and state in `coverage_limit` what the
+guards cannot see. A deliberate second implementation is a `variants` entry (and, if
+it is a separate pairing worth recording, an `allowed_variants` row), not a loosened
+pattern. Moving an owner, weakening a guard or adding an exception belongs in the
+same reviewed change; the checker names the affected row. `python3 mc_reuse.py`
+runs the whole check from the checkout root and prints the scan time.
+
+**Context pack.** With `--code-root DIR` and files, the rows whose owner file,
+variant file or `related_paths` match a file are rendered after the decision
+records, under "Implementation policy (repository inventory)", inside the byte cap
+and the hash. Decision records and anchor lines take their space first; the rows
+that follow are whole rows from the head of the inventory, the rest named in an
+omission line (always in the JSON envelope as `inventory` / `inventory_omitted`).
+The inventory is read only from the code root given, never from another project.
+A code root without `docs/REUSE-INVENTORY.json` contributes nothing and says
+nothing (no key in the envelope). A file that is present but unusable (unreadable,
+not JSON, schema errors) never fails the pack either, but it is not silent: the
+pack carries one line per such repository, `Repository inventory at <path> is
+unusable: <reason>`, after the decision records and ahead of any rows, inside the
+byte cap and the hash (a cap too tight for the line drops it from the text), and the
+JSON envelope always carries `inventory_error`, a list of `{path, reason}`.
+
+**Finding new jobs** is not a test. Which second implementations exist that no
+row lists yet is a measurement a person judges; a confirmed job joins the
+inventory together with its consolidation and a guard that discriminates it. The
+discovery protocol -- how duplicates are FOUND, as opposed to how the known ones are
+guarded here -- is a maintainer measurement that lives outside the checker and is
+recorded in the project's design notes, not in this repository.
+
 ## Filing
 
 `record`, `append` and `promote` are three entry points to one writer.
