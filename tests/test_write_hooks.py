@@ -12335,5 +12335,40 @@ class TestNudgeNamesItsProject(HookTestBase):
                 self.assertEqual(outs, [""] * 5, label)
 
 
+    def test_a_quoted_value_followed_by_more_characters_is_not_its_prefix(self):
+        """Hook project BA; the nearest folder is wired to B and also carries
+        MEMCONTINUUM_PROJECT='B'A (the shell assigns BA): ownership is unknown, BA speaks."""
+        hook_project, other = "BA", "B"
+        cwd = self.nested()
+        self._wire_raw(self.nest / "inner", [
+            f"MEMCONTINUUM_PROJECT={other} bash /engine/hooks/userprompt-remind.sh",
+            "MEMCONTINUUM_PROJECT='B'A bash /engine/hooks/userprompt-remind.sh",
+        ], "settings.local.json")
+        sid = "s-c3-ba"
+        self.start_nearest(other, sid, cwd)
+        outs = self.five_prompts(sid, cwd, project=hook_project)
+        self.assertNotEqual(outs[-1].strip(), "", "the hook stayed quiet")
+        self.assertIn(lookback_question(self.store_root, hook_project), self.ctx_of(outs[-1]))
+        self.assertEqual(self.foreign_lines("userprompt"), [])
+
+    def test_the_nested_candidate_check_writes_no_bytecode_into_the_engine(self):
+        """The foreign-cwd python start imports hooks/mc_nudge.py and
+        scripts/mc_settings_merge.py: on a pristine engine copy it must leave no __pycache__."""
+        engine = Path(self.td) / "engine"
+        for sub in ("hooks", "scripts"):
+            shutil.copytree(TOOLS_DIR / sub, engine / sub, ignore=shutil.ignore_patterns("__pycache__"))
+        env = self.env_for(self.project)
+        env.pop("PYTHONDONTWRITEBYTECODE", None)
+        cwd = self.nested()
+        sid = "s-c5-pyc"
+        self.start_session(self.project, sid, cwd)
+        proc, _ = run_script(
+            engine / "hooks" / "userprompt-remind.sh", self.payload("prompt", sid, cwd), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.foreign_lines("userprompt")), 1)  # the foreign check really ran
+        self.assertEqual(sorted(str(p) for p in engine.rglob("__pycache__")), [])
+        self.assertEqual(sorted(str(p) for p in engine.rglob("*.pyc")), [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -297,6 +297,8 @@ _mc_foreign_verify() {
         MC_FC_CAND="$MC_FC_CAND_NAME" MC_FC_BASENAMES="$MC_HOOK_BASENAMES" MC_FC_SID="$sid" \
         MC_FC_STATE="$(mc_state_file_for "$MC_FC_CAND_NAME" "$sid")" "$MC_PY" -c '
 import os, sys
+# no .pyc is written next to the engine files (the write surface above)
+sys.dont_write_bytecode = True
 sys.path.insert(0, os.environ["MC_NUDGE_DIR"])
 import mc_nudge
 e = os.environ

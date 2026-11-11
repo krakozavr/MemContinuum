@@ -74,8 +74,13 @@ import sys
 # The env-assignment position every reader of a wired command keys on: the
 # start of the command, or whitespace before it (MEMCONTINUUM_PROJECT=<p>).
 _ASSIGN_PREFIX = r"(?:^|\s)MEMCONTINUUM_PROJECT="
-_PROJECT_NAME_RE = re.compile(r"[A-Za-z0-9._-]+\Z")
-_ASSIGNMENT_RE = re.compile(_ASSIGN_PREFIX + r"(?:'([^']*)'|\"([^\"]*)\"|(\S*))")
+# One strict assignment: the value is a plain project name (bare, single- or
+# double-quoted) and the next character is whitespace or the end of the
+# command, so the shell and this reader agree on the value ('B'A is BA to the
+# shell, never B).
+_ASSIGNMENT_RE = re.compile(
+    _ASSIGN_PREFIX + r"(?:'([A-Za-z0-9._-]+)'|\"([A-Za-z0-9._-]+)\"|([A-Za-z0-9._-]+))(?=\s|\Z)"
+)
 
 
 class MergeRefused(Exception):
@@ -182,10 +187,7 @@ def wired_projects(paths, basenames):
             values = [a or b or c for a, b, c in _ASSIGNMENT_RE.findall(cmd)]
             if not values or cmd.count("MEMCONTINUUM_PROJECT=") != len(values):
                 raise ValueError(f"{path}: a wired command names no single parseable project")
-            for value in values:
-                if not _PROJECT_NAME_RE.match(value):
-                    raise ValueError(f"{path}: not a project name: {value!r}")
-                projects.add(value)
+            projects.update(values)
     return projects
 
 
