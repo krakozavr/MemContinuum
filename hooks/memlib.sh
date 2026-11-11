@@ -220,14 +220,100 @@ mc_cwd_token() {
 # The settings readers are scripts/mc-registry-lib.sh's (mc_first_wired_command,
 # mc_wired_command_for_project, mc_command_env_value), sourced lazily from the
 # engine-relative path hooks/memcontinuum-detect.sh also uses.
+#
+# The walk (who is nearest) is paid once per session and payload cwd: its RESULT
+# is cached in a sidecar beside this project's per-session state file,
+# "<state file>.fcwd" (mc_state_file_for), one line "<raw payload cwd><TAB><nearest
+# foreign project | !none>" -- "!none" stands for "not foreign" AND for
+# "unknown" alike (neither is distinguished by any caller). A hit needs the
+# cached cwd string to equal the payload cwd string exactly and is read with
+# shell builtins only; anything else (missing, empty, unreadable, malformed
+# file, another cwd) is a miss and re-walks; a failed cache write is ignored.
+# The cache is session-scoped on purpose: a project wired into a folder
+# mid-session is picked up by the NEXT session. Only the walk is cached: whether
+# the nearest project's session-start initialised the session (MC_FOREIGN_PRESENT)
+# is re-read on every call, because it can become true later in the session when
+# the other project's hook runs second. mc_prune_old_state removes stale sidecars.
 mc_foreign_cwd_nearest() {
-    local dir="${1:-}" sid="${2:-}" nearest="" wired_dir="" f first_cmd rest
+    local dir="${1:-}" sid="${2:-}" cf="" line="" ccwd="" cres="" f
     MC_FOREIGN_NEAREST=""
     MC_FOREIGN_PRESENT=0
     case "$dir" in
         /*) ;;
         *) return 1 ;;
     esac
+    if [ -n "$sid" ] && [ -n "${MC_PROJECT:-}" ]; then
+        cf="$(mc_state_file_for "$MC_PROJECT" "$sid").fcwd"
+        # no stat first (a stat is a round trip on a Windows mount): a missing,
+        # unreadable or directory path just leaves $line empty
+        {
+            { IFS= read -r line || :; } < "$cf"
+        } 2>/dev/null
+        if [ -n "$line" ]; then
+            case "$line" in
+                *$'\t'*)
+                    ccwd="${line%%$'\t'*}"
+                    cres="${line#*$'\t'}"
+                    if [ "$ccwd" = "$dir" ]; then
+                        case "$cres" in
+                            "!none") return 1 ;;
+                            ""|*[!A-Za-z0-9._-]*) ;;
+                            *)
+                                MC_FOREIGN_NEAREST="$cres"
+                                _mc_foreign_present "$cres" "$sid"
+                                return 0
+                                ;;
+                        esac
+                    fi
+                    ;;
+            esac
+        fi
+    fi
+    if _mc_foreign_walk "$dir"; then
+        _mc_foreign_present "$MC_FOREIGN_NEAREST" "$sid"
+        cres="$MC_FOREIGN_NEAREST"
+        f=0
+    else
+        cres="!none"
+        f=1
+    fi
+    if [ -n "$cf" ] && [ -d "${cf%/*}" ]; then
+        case "$dir" in
+            *$'\t'*|*$'\n'*) ;;
+            *)
+                # atomic: temp beside the target (same directory), removed on any failure
+                { printf '%s\t%s\n' "$dir" "$cres" > "$cf.tmp.$$" && mv -f "$cf.tmp.$$" "$cf"; } 2>/dev/null \
+                    || rm -f "$cf.tmp.$$" 2>/dev/null
+                ;;
+        esac
+    fi
+    return $f
+}
+
+# _mc_foreign_present NEAREST SID -- sets MC_FOREIGN_PRESENT=1 when NEAREST's
+# own session-start positively initialised SID (state keys only session-start
+# writes: start_store_sha and created_at), else 0. Never cached.
+_mc_foreign_present() {
+    local nearest="$1" sid="$2" f
+    MC_FOREIGN_PRESENT=0
+    case "$nearest" in
+        */*|.|..) ;;
+        *)
+            f="$(mc_state_file_for "$nearest" "$sid")"
+            if [ -n "$sid" ] && [ -f "$f" ] && grep -q '"start_store_sha"' "$f" 2>/dev/null \
+                && grep -q '"created_at"' "$f" 2>/dev/null; then
+                MC_FOREIGN_PRESENT=1
+            fi
+            ;;
+    esac
+}
+
+# _mc_foreign_walk ABSOLUTE_CWD -- the uncached walk (see mc_foreign_cwd_nearest):
+# returns 0 with MC_FOREIGN_NEAREST set when the nearest wired directory is
+# foreign, else 1 with it empty.
+_mc_foreign_walk() {
+    local dir="$1" nearest="" wired_dir="" f first_cmd rest
+    MC_FOREIGN_NEAREST=""
     dir="$(cd "$dir" 2>/dev/null && pwd -P)"
     [ -n "$dir" ] || return 1
     if ! command -v mc_first_wired_command >/dev/null 2>&1; then
@@ -263,16 +349,6 @@ mc_foreign_cwd_nearest() {
         return 1
     fi
     MC_FOREIGN_NEAREST="$nearest"
-    case "$nearest" in
-        */*|.|..) ;;
-        *)
-            f="$(mc_state_file_for "$nearest" "$sid")"
-            if [ -n "$sid" ] && [ -f "$f" ] && grep -q '"start_store_sha"' "$f" 2>/dev/null \
-                && grep -q '"created_at"' "$f" 2>/dev/null; then
-                MC_FOREIGN_PRESENT=1
-            fi
-            ;;
-    esac
     return 0
 }
 
@@ -957,7 +1033,7 @@ $py_transform
 }
 
 # mc_prune_old_state PROJECT MINUTES -- deletes *.json state files older than
-# MINUTES under $MEMCONTINUUM_HOME/sessions/PROJECT (mtime-based; a state
+# MINUTES (and their .fcwd walk-result sidecars) under $MEMCONTINUUM_HOME/sessions/PROJECT (mtime-based; a state
 # file's mtime is its last write, i.e. its last activity). Never touches any
 # other project's directory, and never touches MEMCONTINUUM_ROOT/CODE_ROOT.
 mc_prune_old_state() {
@@ -966,7 +1042,9 @@ mc_prune_old_state() {
     local dir
     dir="$(mc_state_dir_for "$project")"
     [ -d "$dir" ] || return 0
-    find "$dir" -maxdepth 1 -type f -name '*.json' -mmin "+$minutes" -exec rm -f {} + 2>/dev/null || true
+    # the walk-result sidecars (<id>.json.fcwd, and a stray <id>.json.fcwd.tmp.<pid>)
+    # go with the state files
+    find "$dir" -maxdepth 1 -type f \( -name '*.json' -o -name '*.json.fcwd' -o -name '*.json.fcwd.tmp.*' \) -mmin "+$minutes" -exec rm -f {} + 2>/dev/null || true
 }
 
 # mc_path_under_root now lives in mc-path-lib.sh (sourced near the top of

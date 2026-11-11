@@ -12016,6 +12016,147 @@ class TestNudgeNamesItsProject(HookTestBase):
             if "mc-" in line:
                 self.assertTrue(line.startswith(tmp + "/mc-"), line)
 
+    # ---- the folder walk is paid once per session and cwd ----------------------
+
+    def fcwd_file(self, session_id, project=None):
+        return self.home / "sessions" / (project or self.project) / f"{session_id}.json.fcwd"
+
+    def start_session(self, project, session_id, cwd):
+        """Real session-start (startup) plus the seeded thin ledger a prompt needs."""
+        env = self.env_for(project)
+        proc, _ = run_script(SESSIONSTART_HOOK, self.payload("start", session_id, cwd, source="startup"), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with self.as_project(project):
+            self.seed_ledger(session_id, [])
+            self.patch_state(session_id, project=project)
+
+    def prompt_once(self, project, session_id, cwd):
+        proc, _ = run_script(USERPROMPT_HOOK, self.payload("prompt", session_id, cwd), self.env_for(project))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout
+
+    def test_second_prompt_in_the_session_uses_the_cached_walk(self):
+        cwd = self.nested()
+        sid = "s-fc-hit"
+        self.start_session(self.project, sid, cwd)
+        self.prompt_once(self.project, sid, cwd)
+        self.assertEqual(self.fcwd_file(sid).read_text(), f"{cwd}\t{self.OTHER}\n")
+        first = self.foreign_lines("userprompt")
+        self.assertEqual(len(first), 1)
+        # the settings the walk read are gone: only the cache can still name the project
+        for settings in (self.nest / "inner" / ".claude").iterdir():
+            settings.unlink()
+        self.prompt_once(self.project, sid, cwd)
+        lines = self.foreign_lines("userprompt")
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(lines[0], lines[1])
+        # a session-start of the same session also answers from the cache
+        run_script(SESSIONSTART_HOOK, self.payload("start", sid, cwd, source="compact"), self.env_for(self.project))
+        self.assertEqual(len(self.foreign_lines("sessionstart")), 2)
+
+    def test_not_foreign_is_cached_and_a_late_wiring_waits_for_the_next_session(self):
+        self.wire(self.nest, self.project)
+        cwd = self.nest / "sub"
+        cwd.mkdir()
+        sid = "s-fc-none"
+        self.start_session(self.project, sid, str(cwd))
+        self.prompt_once(self.project, sid, str(cwd))
+        self.assertEqual(self.fcwd_file(sid).read_text(), f"{cwd}\t!none\n")
+        self.wire(cwd, self.OTHER)  # wired after the walk
+        self.prompt_once(self.project, sid, str(cwd))
+        self.assertEqual(self.foreign_lines(), [])
+        self.start_session(self.project, "s-fc-none-next", str(cwd))
+        self.prompt_once(self.project, "s-fc-none-next", str(cwd))
+        self.assertEqual(len(self.foreign_lines("userprompt")), 1)
+
+    def test_a_changed_cwd_walks_again(self):
+        cwd = self.nested()
+        sid = "s-fc-cwd"
+        self.start_session(self.project, sid, cwd)
+        self.prompt_once(self.project, sid, cwd)
+        self.assertEqual(len(self.foreign_lines("userprompt")), 1)
+        elsewhere = self.nest / "elsewhere"
+        elsewhere.mkdir()
+        self.prompt_once(self.project, sid, str(elsewhere))
+        self.assertEqual(len(self.foreign_lines("userprompt")), 1)
+        self.assertEqual(self.fcwd_file(sid).read_text(), f"{elsewhere}\t!none\n")
+        self.prompt_once(self.project, sid, cwd)
+        self.assertEqual(len(self.foreign_lines("userprompt")), 2)
+        self.assertEqual(self.fcwd_file(sid).read_text(), f"{cwd}\t{self.OTHER}\n")
+
+    def test_a_corrupt_cache_file_is_a_miss(self):
+        cwd = self.nested()
+        garbage = ["", "\n", "no tab here\n", f"{cwd}\t\n", f"{cwd}\tbad/name\n", f"{cwd}\tbad name\n",
+                   "\t\t\t\n", "\x00\x01\xff\n", f"/other\t{self.OTHER}\n", f"{cwd}"]
+        for n, content in enumerate(garbage):
+            sid = f"s-fc-bad{n}"
+            self.start_session(self.project, sid, cwd)
+            self.fcwd_file(sid).write_text(content)
+            self.prompt_once(self.project, sid, cwd)
+            self.assertEqual(len(self.foreign_lines("userprompt")), n + 1, repr(content))
+            self.assertEqual(self.fcwd_file(sid).read_text(), f"{cwd}\t{self.OTHER}\n", repr(content))
+        if os.geteuid() != 0:
+            sid = "s-fc-unreadable"
+            self.start_session(self.project, sid, cwd)
+            self.fcwd_file(sid).write_text("x")
+            self.fcwd_file(sid).chmod(0)
+            self.addCleanup(self.fcwd_file(sid).chmod, 0o644)
+            out = self.prompt_once(self.project, sid, cwd)
+            self.assertEqual(len(self.foreign_lines("userprompt")), len(garbage) + 1)
+            self.assertEqual(out, "")
+        # a directory where the cache file belongs is a miss too, and the write failure is ignored
+        sid = "s-fc-dir"
+        self.start_session(self.project, sid, cwd)
+        self.fcwd_file(sid).unlink(missing_ok=True)
+        self.fcwd_file(sid).mkdir()
+        self.prompt_once(self.project, sid, cwd)
+        self.assertEqual(len(self.foreign_lines("userprompt")), len(garbage) + (2 if os.geteuid() != 0 else 1))
+
+    def test_quiet_turns_on_later_though_the_walk_is_cached(self):
+        cwd = self.nested()
+        sid = "s-fc-late"
+        self.start_session(self.project, sid, cwd)
+        out = self.prompt_once(self.project, sid, cwd)
+        self.assertEqual(len(self.foreign_lines("userprompt")), 1)
+        self.assertIn("outcome=foreign-cwd ", self.foreign_lines("userprompt")[0])
+        self.start_nearest(self.OTHER, sid, cwd)  # the other project's session-start runs second
+        for settings in (self.nest / "inner" / ".claude").iterdir():
+            settings.unlink()  # so only the cached walk can still say who is nearest
+        out = self.prompt_once(self.project, sid, cwd)
+        self.assertEqual(out, "")
+        lines = self.foreign_lines("userprompt")
+        self.assertEqual(len(lines), 2)
+        self.assertIn("outcome=foreign-cwd-quiet", lines[1])
+        self.assertIn(f"nearest={self.OTHER}", lines[1])
+
+    def test_the_cache_file_is_beside_the_state_file_and_never_in_the_temp_dir(self):
+        cwd = self.nested()
+        env = self.env_for(self.project)
+        tmp = env["TMPDIR"]
+        before = sorted(os.listdir(tmp))
+        sid = "s-fc-tmp"
+        self.start_session(self.project, sid, cwd)
+        for _ in range(3):
+            self.prompt_once(self.project, sid, cwd)
+        self.assertEqual(sorted(os.listdir(tmp)), before)
+        self.assertEqual(self.fcwd_file(sid).parent, self.state_file(sid).parent)
+        self.assertEqual(sorted(n for n in os.listdir(self.state_file(sid).parent) if ".tmp." in n), [])
+
+    def test_session_start_prunes_stale_cache_files_with_their_state(self):
+        stale = self.fcwd_file("s-fc-stale")
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stray = stale.parent / "s-fc-stale.json.fcwd.tmp.123"
+        fresh = self.fcwd_file("s-fc-fresh")
+        for f in (stale, stray, fresh):
+            f.write_text("x\ty\n")
+        old = time.time() - (25 * 3600)
+        for f in (stale, stray):
+            os.utime(f, (old, old))
+        self.start_session(self.project, "s-fc-prune", str(self.nest))
+        self.assertFalse(stale.exists())
+        self.assertFalse(stray.exists())
+        self.assertTrue(fresh.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -488,7 +488,17 @@ worked in is recognisable from the text. When the session folder (the payload's
 and session-start hooks add one supplemental line,
 `outcome=foreign-cwd nearest=<project>` (the check is `mc_foreign_cwd_nearest`
 in `hooks/memlib.sh`, built on the settings readers in
-`scripts/mc-registry-lib.sh`). When, in addition, that nearest project's own
+`scripts/mc-registry-lib.sh`). The folder walk is paid once per session and
+payload `cwd`: its result (the nearest foreign project, or `!none` for "not foreign"
+and "unknown" alike) is kept in a sidecar beside the project's per-session state
+file, `<state file>.fcwd`, one line holding the raw `cwd`, a tab and the result, and
+read back with shell builtins only; a different `cwd` string, or a missing, empty,
+unreadable or malformed file, is a miss and walks again. Because the verdict is kept
+for the session, a project wired into a folder mid-session is noticed by the next
+session, not this one. `mc_prune_old_state` removes stale sidecars with their state
+files. Only the walk is kept: whether the nearest project's session-start has
+initialised the session is read afresh each time, since it can become true later in
+the session. When, in addition, that nearest project's own
 session-start hook has positively initialised this session id (its per-session
 state carries the keys only session-start writes, `start_store_sha` and
 `created_at`; a state file made by the ledger hook does not), the hook withholds

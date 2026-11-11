@@ -14,7 +14,7 @@ project's own session-start hook has run for the same session, withholds the wri
 (`outcome=foreign-cwd-quiet`); ownership that cannot be decided is never treated as foreign. The prompt hook's three scratch files are created under the temp directory with an explicit
 template and removed by its single exit trap.
 
-    Technical: `coverage_question(store_root, project)`; the look-back sentence in both hooks gains the same words; `mc_foreign_cwd_nearest` in `hooks/memlib.sh` walks up from the payload `cwd` with `mc_first_wired_command` / `mc_wired_command_for_project` / `mc_command_env_value` sourced from `scripts/mc-registry-lib.sh`; fail-open and log-only.
+    Technical: `coverage_question(store_root, project)`; the look-back sentence in both hooks gains the same words; `mc_foreign_cwd_nearest` in `hooks/memlib.sh` walks up from the payload `cwd` with `mc_first_wired_command` / `mc_wired_command_for_project` / `mc_command_env_value` sourced from `scripts/mc-registry-lib.sh`; fail-open and log-only. The folder walk is paid once per session and payload `cwd`: its result is kept in `<session state file>.fcwd` (one line, the raw `cwd`, a tab, the nearest foreign project or `!none`) and read back with shell builtins; "not foreign" and "unknown" are kept too, so a project wired mid-session is picked up by the next session; whether the nearest project's session-start has run is still read on every call; `mc_prune_old_state` removes stale `.fcwd` files with their state files. `lookback_question(store_root, project)` in `hooks/mc_nudge.py` is now the one owner of the look-back sentence (guarded by the reuse inventory row `lookback-question-sentence`).
 
 ### A list of the jobs the code does once, and a check that keeps it so
 
