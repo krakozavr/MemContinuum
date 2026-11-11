@@ -29,16 +29,22 @@ TMP_ROOT="${TMPDIR:-/tmp}"
 ME="$(id -un)"
 WORK="$(mktemp -d "${TMP_ROOT%/}/mc-leakcheck.XXXXXX")" || exit 70
 
-# find exits non-zero when it meets entries of other users it may not read (or
-# a file vanishing mid-scan), so its status is deliberately ignored. That makes
-# an unscannable root look like an empty one, so the root itself is checked
-# first: it must be a readable, searchable directory. Beyond that, a snapshot
-# is good when its file was written and the sort that follows succeeded.
+# find's exit status is checked: at -maxdepth 1 it only stats the entries of the
+# root (it does not descend), so entries of other users do not make it fail. The
+# one benign failure is an entry another process removes between find's
+# directory read and its stat; one retry absorbs that race, and a second failure
+# is a failed snapshot. The root itself is checked first: it must be a readable,
+# searchable directory. The raw list is sorted into the snapshot file, and the
+# sort's status is checked too.
 snapshot() {
     [ -d "$TMP_ROOT" ] && [ -r "$TMP_ROOT" ] && [ -x "$TMP_ROOT" ] || return 1
-    find "$TMP_ROOT" -maxdepth 1 -mindepth 1 -user "$ME" \
-        \( -name 'memcontinuum-*' -o -name 'tmp*' \) -print 2>/dev/null | LC_ALL=C sort >"$1"
-    [ "$?" -eq 0 ] && [ -f "$1" ]
+    if ! find "$TMP_ROOT" -maxdepth 1 -mindepth 1 -user "$ME" \
+        \( -name 'memcontinuum-*' -o -name 'tmp*' \) -print >"$1.raw" 2>/dev/null; then
+        find "$TMP_ROOT" -maxdepth 1 -mindepth 1 -user "$ME" \
+            \( -name 'memcontinuum-*' -o -name 'tmp*' \) -print >"$1.raw" 2>/dev/null || return 1
+    fi
+    LC_ALL=C sort "$1.raw" >"$1" || return 1
+    [ -f "$1" ]
 }
 
 snapshot_failed() {
