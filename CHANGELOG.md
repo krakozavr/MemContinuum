@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### A write-side question names the project it asks about
+
+The "should the store hold anything?" texts (the coverage and look-back questions, at session start after a
+compaction and on prompts) now say which project they speak for: "the MemContinuum store of project P should
+hold? This asks about P work only. Store: …". Where two wired projects are nested and the harness runs both
+sets of hooks for a session in the inner folder, the outer project's question is now recognisable as not the
+one being worked on. The prompt and session-start hooks also log one `outcome=foreign-cwd nearest=<project>`
+line when the session folder sits inside a nearer directory wired to a different project, and, when that
+project's own session-start hook has run for the same session, withholds the write-side question altogether
+(`outcome=foreign-cwd-quiet`); ownership that cannot be decided is never treated as foreign. The prompt hook's three scratch files are created under the temp directory with an explicit
+template and removed by its single exit trap.
+
+    Technical: `coverage_question(store_root, project)`; the look-back sentence in both hooks gains the same words; `mc_foreign_cwd_nearest` in `hooks/memlib.sh` walks up from the payload `cwd` with `mc_first_wired_command` / `mc_wired_command_for_project` / `mc_command_env_value` sourced from `scripts/mc-registry-lib.sh`; fail-open and log-only.
+
 ### A list of the jobs the code does once, and a check that keeps it so
 
 The engine now carries `docs/REUSE-INVENTORY.json`: the jobs it implements in exactly one place (the semicolon

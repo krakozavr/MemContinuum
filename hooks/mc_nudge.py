@@ -36,10 +36,11 @@ def coverage_fact(unmapped, coverage_status, code_changed, store_changed):
     return fact_line, (n > 0) or bool(code_changed) or bool(store_changed)
 
 
-def coverage_question(store_root):
+def coverage_question(store_root, project):
     return (
         "Any ruling, incident, or rejected alternative from this session that "
-        "the MemContinuum store should hold? Store: " + store_root + " — a ruling "
+        "the MemContinuum store of project " + project + " should hold? This "
+        "asks about " + project + " work only. Store: " + store_root + " — a ruling "
         "is a new link in topics/<area>/<topic>.md, an incident is a file in "
         "incidents/ (see docs/SCHEMA.md); NOT Claude Code auto-memory. If none, "
         "say so once."

@@ -200,6 +200,13 @@ fi
 source "${MC_MEMLIB_PATH:-$SCRIPT_DIR/memlib.sh}"
 
 DECIDE_TMP=""
+UC_TMP=""
+NUDGE_TMP=""
+PQ_STARTED_MARKER=""
+# ONE EXIT trap for every temp file and the prompt-query started marker (a
+# second `trap ... EXIT` would replace it). Covers a crash or a set -u abort;
+# a watchdog SIGKILL still bypasses it.
+trap 'rm -f "${DECIDE_TMP:-}" "${UC_TMP:-}" "${NUDGE_TMP:-}" 2>/dev/null; [ -n "${PQ_STARTED_MARKER:-}" ] && rm -f "$PQ_STARTED_MARKER" 2>/dev/null; true' EXIT
 DELIVERY_CLOSE_DONE=""
 # TOP-0133 L2: PQ_TEXT holds the rendered guess (label + chain text) once
 # the prompt-query channel finds a hit further down this script -- empty
@@ -400,7 +407,7 @@ PAYLOAD="$(cat)"
 # every project that never opts in). mc_extract_fields (hooks/memlib.sh)
 # is the ONLY place the raw prompt text is ever read; PROMPT_TERMS is the
 # one derived, terms-only value this script itself ever sees.
-MC_EXTRACT_FIELD_LIST="session_id agent_id agent_type _prompt_hash _top_keys_csv"
+MC_EXTRACT_FIELD_LIST="session_id agent_id agent_type _prompt_hash _top_keys_csv cwd"
 [ "$PQ_ON" = "1" ] && MC_EXTRACT_FIELD_LIST="$MC_EXTRACT_FIELD_LIST _prompt_terms"
 eval "$(mc_extract_fields "$PAYLOAD" $MC_EXTRACT_FIELD_LIST)" 2>/dev/null
 unset PAYLOAD
@@ -443,7 +450,23 @@ if [ -n "${AGENT_ID:-}" ] || [ -n "${AGENT_TYPE:-}" ]; then
     finish "agent-source"
 fi
 
-DECIDE_TMP="$(mktemp 2>/dev/null)" || finish "mktemp-failed"
+# A session working inside a nearer directory wired to a DIFFERENT project
+# gets one log line saying so (observation only: the hook carries on exactly
+# as before; see mc_foreign_cwd_nearest in memlib.sh).
+# When that nearest project's own session-start hook has positively initialised
+# THIS session, the write-side question is withheld as well (FOREIGN_QUIET):
+# the right project is present and speaks for itself.
+FOREIGN_QUIET=""
+if mc_foreign_cwd_nearest "${CWD:-}" "${SESSION_ID:-}"; then
+    if [ "$MC_FOREIGN_PRESENT" = "1" ]; then
+        FOREIGN_QUIET=1
+        mc_log "userprompt outcome=foreign-cwd-quiet nearest=$MC_FOREIGN_NEAREST session=${SESSION_ID:-}"
+    else
+        mc_log "userprompt outcome=foreign-cwd nearest=$MC_FOREIGN_NEAREST session=${SESSION_ID:-}"
+    fi
+fi
+
+DECIDE_TMP="$(mktemp "${TMPDIR:-/tmp}/mc-decide.XXXXXX" 2>/dev/null)" || finish "mktemp-failed"
 
 export MC_DECIDE_OUT="$DECIDE_TMP"
 export MC_NOW="$(date +%s 2>/dev/null || echo 0)"
@@ -716,7 +739,6 @@ if [ "$PQ_ON" = "1" ]; then
             # kill handler checks for it), so a watchdog kill mid-search
             # on this channel is visible the same way theirs already is.
             PQ_STARTED_MARKER="$MEMCONTINUUM_HOME/.fb-started.$$"
-            trap '[ -n "${PQ_STARTED_MARKER:-}" ] && rm -f "$PQ_STARTED_MARKER" 2>/dev/null' EXIT
             : >"$PQ_STARTED_MARKER" 2>/dev/null || true
             PQ_MS_T0="$(mc_now_ms "$MC_PY")"
             # Search subprocess stderr -> /dev/null, never hook.log (same
@@ -1007,7 +1029,7 @@ print(d.get("reason_code", "") if isinstance(d, dict) else "")
     # other-HEAD or dirty-store cache, a healed index and a re-edited path
     # already made their paths new above (UC_REUSE, NEW_PATHS).
     if [ "${#CODE_PATHS[@]}" -gt 0 ] && [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
-        UC_TMP="$(mktemp 2>/dev/null)" || UC_TMP=""
+        UC_TMP="$(mktemp "${TMPDIR:-/tmp}/mc-uc.XXXXXX" 2>/dev/null)" || UC_TMP=""
         if [ -n "$UC_TMP" ]; then
             UC_NEW_TEXT=""
             if [ "${#NEW_PATHS[@]}" -gt 0 ]; then UC_NEW_TEXT="$(printf '%s\n' "${NEW_PATHS[@]}")"; fi
@@ -1139,7 +1161,7 @@ print(json.dumps(state))
         if [ "${#CODE_PATHS[@]}" -gt 0 ]; then
             CODE_PATHS_TEXT="$(printf '%s\n' "${CODE_PATHS[@]}")"
         fi
-        NUDGE_TMP="$(mktemp 2>/dev/null)"
+        NUDGE_TMP="$(mktemp "${TMPDIR:-/tmp}/mc-nudge.XXXXXX" 2>/dev/null)"
         if [ -n "$NUDGE_TMP" ]; then
             export MC_CODE_HEADS="$CODE_HEADS"
             export MC_CODE_ROOTS_TEXT="$CODE_ROOTS_TEXT"
@@ -1327,8 +1349,8 @@ $NUDGE_FACT"
     fi
 
     OUTPUT_JSON="$(UNMAPPED_JSON="$UNMAPPED_JSON" CODE_CHANGED="$CODE_CHANGED" STORE_CHANGED="$STORE_CHANGED" \
-        MEMCONTINUUM_ROOT="${MEMCONTINUUM_ROOT:-}" MC_NUDGE_FACT_TEXT="$NUDGE_FACT_TEXT" \
-        MC_CANDIDATE="${CANDIDATE:-0}" MC_PQ_TEXT="$PQ_TEXT" MC_NUDGE_DIR="$SCRIPT_DIR" \
+        MEMCONTINUUM_ROOT="${MEMCONTINUUM_ROOT:-}" MC_PROJECT_NAME="$MC_PROJECT" MC_NUDGE_FACT_TEXT="$NUDGE_FACT_TEXT" \
+        MC_CANDIDATE="${CANDIDATE:-0}" MC_QUIET="$FOREIGN_QUIET" MC_PQ_TEXT="$PQ_TEXT" MC_NUDGE_DIR="$SCRIPT_DIR" \
         env PYTHONPATH= "$MC_PY" -c '
 import json, os, sys
 
@@ -1349,7 +1371,10 @@ unmapped = unmapped_out.get("unmapped") or []
 coverage_status = unmapped_out.get("coverage_status", "unknown")
 code_changed = os.environ.get("CODE_CHANGED") == "true"
 store_changed = os.environ.get("STORE_CHANGED") == "true"
-is_candidate = os.environ.get("MC_CANDIDATE") == "1"
+# A withheld write-side question (foreign project, the right one present)
+# takes the nudge-only shape: no coverage fact, no question, no coverage
+# bookkeeping; the commit nudge lines and the search guess still go out.
+is_candidate = os.environ.get("MC_CANDIDATE") == "1" and os.environ.get("MC_QUIET") != "1"
 # TOP-0133 L2: the prompt-query channel own already-rendered guess (label
 # + chain text), or "" on a turn it found nothing/never ran. Merged, never
 # re-derived, into whichever branch below actually emits something --
@@ -1387,7 +1412,7 @@ fact_line, has_evidence = coverage_fact(unmapped, coverage_status, code_changed,
 if not has_evidence and not nudge_lines:
     raise SystemExit(3)
 
-question = coverage_question(os.environ.get("MEMCONTINUUM_ROOT") or "<store root not configured>")
+question = coverage_question(os.environ.get("MEMCONTINUUM_ROOT") or "<store root not configured>", os.environ.get("MC_PROJECT_NAME") or "default")
 ctx = fact_line
 for _nl in nudge_lines:
     ctx += "\n" + _nl
@@ -1418,7 +1443,7 @@ print(json.dumps({
         # one printf.
         [ -n "$PQ_TEXT" ] && PQ_EMITTED=1
 
-        if [ "${CANDIDATE:-0}" = "1" ]; then
+        if [ "${CANDIDATE:-0}" = "1" ] && [ -z "$FOREIGN_QUIET" ]; then
             # Phase 3 (locked): commit the injection bookkeeping now that we
             # know it actually happened. last_inject_ts mirrors
             # last_inject_time (the look-back's shared "since last inject of
@@ -1489,6 +1514,11 @@ fi
 if [ "${LB_ELIGIBLE:-0}" != "1" ]; then
     finish "no-evidence"
 fi
+# The look-back is a write-side question too: withheld, its clocks untouched
+# (nothing was shown, so nothing counts as shown).
+if [ -n "$FOREIGN_QUIET" ]; then
+    finish "no-evidence" "withheld=foreign-cwd"
+fi
 
 # search-fallback look-back mention (TOP-0133 L1): reads STATE, never
 # hook.log, and never re-searches. hook.log's own pre-edit-chain.sh
@@ -1542,7 +1572,7 @@ for h in fallbacks[-8:]:
 sys.stdout.write("\n".join(lines))
 ' "$STATE_FILE" 2>>"$MC_LOG")"
 
-LB_OUTPUT_JSON="$(SINCE_TURN="${SINCE_TURN:-0}" MEMCONTINUUM_ROOT="${MEMCONTINUUM_ROOT:-}" HOOK_FB_LOOKBACK="$FB_LOOKBACK_LINES" \
+LB_OUTPUT_JSON="$(SINCE_TURN="${SINCE_TURN:-0}" MEMCONTINUUM_ROOT="${MEMCONTINUUM_ROOT:-}" MC_PROJECT_NAME="$MC_PROJECT" HOOK_FB_LOOKBACK="$FB_LOOKBACK_LINES" \
     MC_PQ_TEXT="$PQ_TEXT" \
     env PYTHONPATH= "$MC_PY" -c '
 import json, os
@@ -1550,6 +1580,7 @@ import json, os
 since = os.environ.get("SINCE_TURN", "0")
 Q = chr(39)
 store_root = os.environ.get("MEMCONTINUUM_ROOT") or "<store root not configured>"
+project = os.environ.get("MC_PROJECT_NAME") or "default"
 fact = f"Look-back signal — {since} user turns with no edited-file evidence."
 fb_lines = [l for l in os.environ.get("HOOK_FB_LOOKBACK", "").split(chr(10)) if l]
 # TOP-0133 L2: same already-rendered guess as the coverage/nudge envelope
@@ -1558,7 +1589,8 @@ pq_text = os.environ.get("MC_PQ_TEXT") or ""
 question = (
     "Did the conversation since then establish any ruling, incident, "
     "rejected alternative, priority, wording choice, money decision, or "
-    f"{Q}not now{Q} that the MemContinuum store should hold? Store: "
+    f"{Q}not now{Q} that the MemContinuum store of project {project} should hold? "
+    f"This asks about {project} work only. Store: "
     + store_root + " — a ruling is a new link in topics/<area>/<topic>.md, "
     "an incident is a file in incidents/ (see docs/SCHEMA.md); NOT Claude "
     "Code auto-memory. If none, say so once."

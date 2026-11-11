@@ -479,7 +479,30 @@ refuses `.` and `..` as `--project`. `--apply` never creates a bundle.
 **Logging, per hook.** The eight project-level hooks each write exactly one
 `outcome=` line per run to `$MEMCONTINUUM_HOME/hook.log`.
 Diagnostic lines may precede it (`pre-edit-chain.sh` logs a missing-python note
-before its own `outcome=`). A watchdog kill is included in "every run": the
+before its own `outcome=`).
+**Nested wired projects.** Every write-side question names the project it asks
+about ("the MemContinuum store of project P should hold? This asks about P work
+only. Store: …"), so a question from a different project than the one being
+worked in is recognisable from the text. When the session folder (the payload's
+`cwd`) sits inside a nearer directory wired to a different project, the prompt
+and session-start hooks add one supplemental line,
+`outcome=foreign-cwd nearest=<project>` (the check is `mc_foreign_cwd_nearest`
+in `hooks/memlib.sh`, built on the settings readers in
+`scripts/mc-registry-lib.sh`). When, in addition, that nearest project's own
+session-start hook has positively initialised this session id (its per-session
+state carries the keys only session-start writes, `start_store_sha` and
+`created_at`; a state file made by the ledger hook does not), the hook withholds
+its write-side question (the coverage and look-back text, on a prompt and on a
+compaction restart) and logs `outcome=foreign-cwd-quiet nearest=<project>`
+instead; the turn then ends as a turn without evidence (`withheld=foreign-cwd`),
+no inject clock or look-back count is stamped (nothing was shown), pending
+evidence is consumed as for any compaction without evidence, and the commit
+nudge, the search guess and the standing digest are unchanged. Ownership that
+cannot be decided is never treated as foreign: `cwd` missing, relative or not a
+directory, an unreadable settings file, a settings line that is not a
+pretty-printed single hook command or names more than one or no plain project,
+the two settings files of the nearest directory naming different projects, the
+hook's own project also wired there, or no wired directory at all. A watchdog kill is included in "every run": the
 guarded hook cannot write its own outcome line then — it may be mid-call, or may
 never have reached that code — so `mc-watchdog.sh` writes
 `outcome=watchdog-killed hook=<name>` itself before exiting. The three hooks
