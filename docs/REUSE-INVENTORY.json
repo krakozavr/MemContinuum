@@ -56,7 +56,7 @@
           "params": {}
         }
       ],
-      "coverage_limit": "Shell only: finds a function named join_semi anywhere in the scan roots and a function whose normalised body equals the owner's (comments, indentation and `local` names ignored). A join written inline in a loop is not recognised; a copy whose normalised body differs by one token (a literal, an added statement, reordered locals) escapes; a rewrite under another name needs a human. The shell scan reads ordinary shell as this repository writes it; unusual spellings listed in the engineering notes can hide a call, a definition or a direct command.",
+      "coverage_limit": "Shell only: finds a function named join_semi anywhere in the scan roots and a function whose normalised body equals the owner's (comments, indentation and `local` names ignored). A join written inline in a loop is not recognised; a copy whose normalised body differs by one token (a literal, an added statement, reordered locals, a renamed parameter of a nested function or lambda) escapes; a rewrite under another name needs a human. The shell scan reads ordinary shell as this repository writes it; unusual spellings listed in the engineering notes can hide a call, a definition or a direct command.",
       "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
       "test": "tests.test_reuse_inventory.TestProductionTree"
     },
@@ -102,7 +102,7 @@
           "params": {}
         }
       ],
-      "coverage_limit": "Finds the sentence fragments as text of executable code: Python units, extracted python payloads and shell text outside comments and heredoc bodies (a fragment in a double-quoted -c payload or in a shell variable is still shell text and is seen). Not seen: the same words built from pieces, a reworded sentence, and a fragment inside a non-Python heredoc body (that body is dropped from the shell text and not parsed). The two hook payloads must execute coverage_fact (delegation counts only an executed call (a comment, a `type` probe or a bare import is a mention and does not count)). Not recognised: a copy whose normalised body differs by one token (a literal, an added statement, reordered locals) escapes; a rewrite under another name needs a human. The shell scan reads ordinary shell as this repository writes it; unusual spellings listed in the engineering notes can hide a call, a definition or a direct command.",
+      "coverage_limit": "Finds the sentence fragments as text of executable code: Python units, extracted python payloads and shell text outside comments and heredoc bodies (a fragment in a double-quoted -c payload or in a shell variable is still shell text and is seen). Not seen: the same words built from pieces, a reworded sentence, and a fragment inside a non-Python heredoc body (that body is dropped from the shell text and not parsed). The two hook payloads must execute coverage_fact (delegation counts only an executed call (a comment, a `type` probe or a bare import is a mention and does not count)). Not recognised: a copy whose normalised body differs by one token (a literal, an added statement, reordered locals, a renamed parameter of a nested function or lambda) escapes; a rewrite under another name needs a human. The shell scan reads ordinary shell as this repository writes it; unusual spellings listed in the engineering notes can hide a call, a definition or a direct command.",
       "variants": [],
       "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
       "test": "tests.test_reuse_inventory.TestProductionTree"
@@ -143,7 +143,7 @@
           "params": {}
         }
       ],
-      "coverage_limit": "Finds the sentence fragments as text of executable code: Python units, extracted python payloads and shell text outside comments and heredoc bodies (a fragment in a double-quoted -c payload or in a shell variable is still shell text and is seen). Not seen: the same words built from pieces, a reworded sentence, and a fragment inside a non-Python heredoc body (that body is dropped from the shell text and not parsed). The two hook payloads must execute coverage_question (delegation counts only an executed call (a comment, a `type` probe or a bare import is a mention and does not count)). Not recognised: a copy whose normalised body differs by one token (a literal, an added statement, reordered locals) escapes; a rewrite under another name needs a human. The shell scan reads ordinary shell as this repository writes it; unusual spellings listed in the engineering notes can hide a call, a definition or a direct command.",
+      "coverage_limit": "Finds the sentence fragments as text of executable code: Python units, extracted python payloads and shell text outside comments and heredoc bodies (a fragment in a double-quoted -c payload or in a shell variable is still shell text and is seen). Not seen: the same words built from pieces, a reworded sentence, and a fragment inside a non-Python heredoc body (that body is dropped from the shell text and not parsed). The two hook payloads must execute coverage_question (delegation counts only an executed call (a comment, a `type` probe or a bare import is a mention and does not count)). Not recognised: a copy whose normalised body differs by one token (a literal, an added statement, reordered locals, a renamed parameter of a nested function or lambda) escapes; a rewrite under another name needs a human. The shell scan reads ordinary shell as this repository writes it; unusual spellings listed in the engineering notes can hide a call, a definition or a direct command.",
       "variants": [],
       "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
       "test": "tests.test_reuse_inventory.TestProductionTree"
@@ -246,7 +246,7 @@
           }
         }
       ],
-      "coverage_limit": "Recognises the name, a renamed copy with the same normalised body, and the named freeze consumers calling it (delegation counts only an executed call (a comment, a `type` probe or a bare import is a mention and does not count)). Not recognised: a copy whose normalised body differs by one token (a literal, an added statement, reordered locals) escapes; a rewrite under another name needs a human; a consumer not listed here.",
+      "coverage_limit": "Recognises the name, a renamed copy with the same normalised body, and the named freeze consumers calling it (delegation counts only an executed call (a comment, a `type` probe or a bare import is a mention and does not count)). Not recognised: a copy whose normalised body differs by one token (a literal, an added statement, reordered locals, a renamed parameter of a nested function or lambda) escapes; a rewrite under another name needs a human; a consumer not listed here.",
       "variants": [],
       "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
       "test": "tests.test_reuse_inventory.TestProductionTree"
@@ -284,7 +284,7 @@
           }
         }
       ],
-      "coverage_limit": "Name pattern, renamed exact copy, and the anchor-freeze consumer calling it (delegation counts only an executed call (a comment, a `type` probe or a bare import is a mention and does not count)). Not recognised: a copy whose normalised body differs by one token (a literal, an added statement, reordered locals) escapes; a rewrite under another name needs a human.",
+      "coverage_limit": "Name pattern, renamed exact copy, and the anchor-freeze consumer calling it (delegation counts only an executed call (a comment, a `type` probe or a bare import is a mention and does not count)). Not recognised: a copy whose normalised body differs by one token (a literal, an added statement, reordered locals, a renamed parameter of a nested function or lambda) escapes; a rewrite under another name needs a human.",
       "variants": [],
       "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
       "test": "tests.test_reuse_inventory.TestProductionTree"
@@ -500,7 +500,7 @@
           }
         }
       ],
-      "coverage_limit": "Recognises the name, a copy with the same normalised body, the adapters calling the core and memlint calling the parser through them (delegation counts only an executed call (a comment, a `type` probe or a bare import is a mention and does not count)). Not recognised: a copy whose normalised body differs by one token (a literal, an added statement, reordered locals) escapes; a rewrite under another name needs a human. Unrelated YAML loading elsewhere is deliberately not prohibited.",
+      "coverage_limit": "Recognises the name, a copy with the same normalised body, the adapters calling the core and memlint calling the parser through them (delegation counts only an executed call (a comment, a `type` probe or a bare import is a mention and does not count)). Not recognised: a copy whose normalised body differs by one token (a literal, an added statement, reordered locals, a renamed parameter of a nested function or lambda) escapes; a rewrite under another name needs a human. Unrelated YAML loading elsewhere is deliberately not prohibited.",
       "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
       "test": "tests.test_reuse_inventory.TestProductionTree"
     },

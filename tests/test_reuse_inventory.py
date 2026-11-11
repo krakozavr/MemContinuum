@@ -812,7 +812,7 @@ class TestPositiveControls(unittest.TestCase):
             self.assertNotIn("inside a double-quoted -c payload are not seen", text, r["id"])
         rows = {r["id"]: r for r in inv["rows"]}
         sentence = (r"(?:Not recognised: |is not recognised; )a copy whose normalised body differs by one token "
-                    r"\(a literal, an added statement, reordered locals\) escapes; a rewrite under another name "
+                    r"\(a literal, an added statement, reordered locals, a renamed parameter of a nested function or lambda\) escapes; a rewrite under another name "
                     r"needs a human")
         for r in inv["rows"]:
             if any(g["method"] == "exact_copy" for g in r["guards"]):
@@ -1365,8 +1365,9 @@ class TestScanner(unittest.TestCase):
                 return n
             """)
         self.assertEqual(base, outer_only)
-        self.assertEqual(base, nested_only)
-        self.assertEqual(base, both)
+        # nested parameter names are interface; a copy that renames one is not recognised
+        self.assertNotEqual(base, nested_only)
+        self.assertNotEqual(base, both)
         # a closure reading the OUTER variable is a different function from one reading its own parameter
         closure = fp("""
             def f(rows):
@@ -1443,7 +1444,7 @@ class TestScanner(unittest.TestCase):
         ext_b = fp("def f(a):\n    return helper_two(a)\n")
         self.assertNotEqual(ext_a, ext_b)
 
-    def test_py_fingerprint_keeps_class_attributes_and_keyword_bound_parameters(self):
+    def test_py_fingerprint_keeps_class_attributes_and_nested_parameters(self):
         import ast
 
         def fp(src):
@@ -1517,10 +1518,39 @@ class TestScanner(unittest.TestCase):
                 return h(a=1, b=2)
             """)
         self.assertNotEqual(k1, k2)
-        # ... while a parameter no caller names by keyword is still renamed
+        # ... and so does a parameter no call names by keyword: the name is interface whatever route supplies it
+        # (nested parameter names are interface; a copy that renames one is not recognised)
         p1 = fp("def f():\n    def h(a, b):\n        return a - b\n    return h(1, 2)\n")
         p2 = fp("def f():\n    def h(x, y):\n        return x - y\n    return h(1, 2)\n")
-        self.assertEqual(p1, p2)
+        self.assertNotEqual(p1, p2)
+        # Sol's round-10 pair: the names reach the nested function through a **dict
+        s1 = fp("""
+            def f(value):
+                def subtract(value, other):
+                    return value - other
+                kwargs = {"value": 1, "other": 2}
+                return value + subtract(**kwargs)
+            """)
+        s2 = fp("""
+            def g(value):
+                def subtract(other, value):
+                    return other - value
+                kwargs = {"value": 1, "other": 2}
+                return value + subtract(**kwargs)
+            """)
+        self.assertNotEqual(s1, s2)
+        # every parameter kind of a nested function and of a lambda keeps its name
+        for a, b in (("def h(a, /, b): return a - b", "def h(b, /, a): return b - a"),
+                     ("def h(*, a, b): return a - b", "def h(*, b, a): return b - a"),
+                     ("def h(*a, **b): return a, b", "def h(*b, **a): return b, a"),
+                     ("h = lambda a, b: a - b", "h = lambda b, a: b - a"),
+                     ("h = lambda *a, **b: (a, b)", "h = lambda *b, **a: (b, a)")):
+            self.assertNotEqual(fp("def f():\n    %s\n    return h\n" % a),
+                                fp("def f():\n    %s\n    return h\n" % b), a)
+        # the ROOT function's own parameters are still renamed, as are non-parameter locals of a nested function
+        self.assertEqual(fp("def f(a, b):\n    return a - b\n"), fp("def f(x, y):\n    return x - y\n"))
+        self.assertEqual(fp("def f():\n    def h(p):\n        t = p + 1\n        return t\n    return h\n"),
+                         fp("def f():\n    def h(p):\n        u = p + 1\n        return u\n    return h\n"))
 
     def test_py_fingerprint_renames_locals_but_keeps_literals_and_globals(self):
         import ast

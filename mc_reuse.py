@@ -1451,8 +1451,10 @@ class _Renamer(ast.NodeTransformer):
     order). A name resolves to the nearest enclosing scope that binds it (class
     scopes are invisible to the scopes nested in them); otherwise it is external
     and kept as written. `global` names, imports, external names, names bound
-    in a class body (attributes) and the parameters of a nested function that a
-    call passes by keyword stay as written."""
+    in a class body (attributes) and every parameter of a nested function or
+    lambda (its interface: a caller can supply the name by keyword, `**dict`,
+    functools.partial or a callback registered elsewhere) stay as written. The
+    root function's own parameters are renamed."""
 
     def __init__(self, root):
         self.root = root
@@ -1461,10 +1463,6 @@ class _Renamer(ast.NodeTransformer):
         self.scopes = {}
         self.walrus = {}
         self.slots = {}
-        # Keyword names at any call site: a nested function's parameter named
-        # here may be bound by a caller as written, so it keeps its name.
-        self.kwnames = {k.arg for n in ast.walk(root) if isinstance(n, ast.Call)
-                        for k in n.keywords if k.arg}
 
     # -- name resolution -------------------------------------------------
     def _decl(self, name, scope=None):
@@ -1509,9 +1507,11 @@ class _Renamer(ast.NodeTransformer):
         for a in args.posonlyargs + args.args + args.kwonlyargs + [args.vararg, args.kwarg]:
             if a is not None:
                 a.annotation = None
-                if nested and a.arg in self.kwnames and self.binding:
-                    self.cur.kept.add(a.arg)
-                a.arg = self._decl(a.arg)
+                if nested:
+                    if self.binding:
+                        self.cur.kept.add(a.arg)
+                else:
+                    a.arg = self._decl(a.arg)
 
     def _outer_defaults(self, args):
         args.defaults = [self.visit(d) for d in args.defaults]
