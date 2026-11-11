@@ -488,20 +488,33 @@ worked in is recognisable from the text. When the session folder (the payload's
 and session-start hooks add one supplemental line,
 `outcome=foreign-cwd nearest=<project>` (the check is `mc_foreign_cwd_nearest`
 in `hooks/memlib.sh`, built on the settings readers in
-`scripts/mc-registry-lib.sh`). The folder walk is paid once per session and
-payload `cwd`: its result (the nearest foreign project, or `!none` for "not foreign"
-and "unknown" alike) is kept in a sidecar beside the project's per-session state
-file, `<state file>.fcwd`, one line holding the raw `cwd`, a tab and the result, and
-read back with shell builtins only; a different `cwd` string, or a missing, empty,
-unreadable or malformed file, is a miss and walks again. Because the verdict is kept
-for the session, a project wired into a folder mid-session is noticed by the next
-session, not this one. `mc_prune_old_state` removes stale sidecars with their state
-files. Only the walk is kept: whether the nearest project's session-start has
-initialised the session is read afresh each time, since it can become true later in
-the session. When, in addition, that nearest project's own
+`scripts/mc-registry-lib.sh`). "Foreign" is established strictly. A cheap shell
+walk from the physical `cwd` finds the nearest directory with a wired settings file
+and only names a candidate; the candidate becomes foreign after one python start
+(`foreign_verdict` in `hooks/mc_nudge.py`, about 17 ms, paid only in the nested
+case) reads the whole of both `.claude/settings.json` and `settings.local.json` of
+that directory through `wired_projects` in `scripts/mc_settings_merge.py`: every
+present file must parse, and every `MEMCONTINUUM_PROJECT=` assignment of every
+wired command (anywhere in the command, bare or quoted) must name exactly one
+project, the candidate, different from the hook's own. Anything else is unknown.
+Only "not foreign / unknown" is cached, never "foreign": the sidecar beside the
+project's per-session state file, `<state file>.fcwd`, holds one line, the raw
+`cwd`, a tab and `!none`, written when the walk found no candidate and read back with
+shell builtins only. A cached `!none` can only make a hook speak, never go quiet; a
+line with a project name or anything else, a different `cwd` string, or a missing,
+empty, unreadable or malformed file is a miss, is not rewritten, and a candidate
+re-establishes everything on every call (so a retargeted symlink, a vanished folder
+or edited settings can never keep a hook quiet). A project wired into a folder
+mid-session is noticed by the next session when the walk found nothing.
+`mc_prune_old_state` removes stale sidecars with their state files. Whether the
+nearest project's session-start has initialised the session is read afresh each time,
+since it can become true later in the session. When, in addition, that nearest project's own
 session-start hook has positively initialised this session id (its per-session
-state carries the keys only session-start writes, `start_store_sha` and
-`created_at`; a state file made by the ledger hook does not), the hook withholds
+state is a JSON object with the top-level keys only session-start writes, a
+non-empty `start_store_sha` and a numeric `created_at`, and a `session_id`, when
+recorded, equal to this one; a state file made by the ledger hook, truncated JSON,
+keys nested elsewhere or another session's state do not count: `session_initialised`
+in `hooks/mc_nudge.py`), the hook withholds
 its write-side question (the coverage and look-back text, on a prompt and on a
 compaction restart) and logs `outcome=foreign-cwd-quiet nearest=<project>`
 instead; the turn then ends as a turn without evidence (`withheld=foreign-cwd`),

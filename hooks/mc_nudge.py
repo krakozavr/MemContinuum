@@ -1,9 +1,14 @@
-"""The coverage sentence, built in one place (TOP-0137 L29).
+"""The coverage sentence, built in one place (TOP-0137 L29), and the strict
+foreign-project check (foreign_verdict) of the nested-projects detector.
 
 Imported by the inline python of hooks/userprompt-remind.sh and
 hooks/sessionstart-remind.sh. Stdlib only and no memidx import: the prompt hook
 is the hot path and `import memidx` costs ~100-170 ms there.
 """
+import json
+import math
+import os
+import sys
 
 
 def yn(v):
@@ -58,3 +63,51 @@ def lookback_question(store_root, project):
         "an incident is a file in incidents/ (see docs/SCHEMA.md); NOT Claude "
         "Code auto-memory. If none, say so once."
     )
+
+
+def session_initialised(state_path, session_id):
+    """True only when the state file at STATE_PATH is what a session-start hook
+    writes for SESSION_ID (hooks/sessionstart-remind.sh): a JSON object with a
+    top-level non-empty `start_store_sha` string and a top-level numeric
+    `created_at`, and, when it records a `session_id`, that id equals SESSION_ID.
+    A file the ledger hook made, truncated JSON, the keys nested elsewhere or
+    another session's state are all False."""
+    try:
+        with open(state_path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(state, dict) or not session_id:
+        return False
+    sha = state.get("start_store_sha")
+    created = state.get("created_at")
+    if not isinstance(sha, str) or not sha:
+        return False
+    if isinstance(created, bool) or not isinstance(created, (int, float)) or not math.isfinite(created) or created <= 0:
+        return False
+    if "session_id" in state and state["session_id"] != session_id:
+        return False
+    return True
+
+
+def foreign_verdict(wired_dir, own_project, candidate, basenames, state_path, session_id):
+    """`foreign-present`, `foreign-absent` or `unknown` for the nearest wired
+    directory WIRED_DIR found by the shell walk (hooks/memlib.sh,
+    mc_foreign_cwd_nearest). Foreign only when both settings files of that
+    directory parse and name exactly ONE project, it is CANDIDATE (the shell's
+    reading, whose state file STATE_PATH is) and it is not OWN_PROJECT; the
+    first word then says whether that project's session-start initialised
+    SESSION_ID. Anything else is `unknown`."""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
+    try:
+        from mc_settings_merge import wired_projects
+        projects = wired_projects(
+            [os.path.join(wired_dir, ".claude", "settings.local.json"),
+             os.path.join(wired_dir, ".claude", "settings.json")],
+            basenames.split(),
+        )
+    except (ImportError, ValueError, OSError):
+        return "unknown"
+    if projects != {candidate} or candidate == own_project:
+        return "unknown"
+    return "foreign-present" if session_initialised(state_path, session_id) else "foreign-absent"

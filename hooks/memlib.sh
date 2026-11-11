@@ -200,42 +200,49 @@ mc_cwd_token() {
 # mc_foreign_cwd_nearest CWD SESSION_ID -- detector for a hook that runs for a
 # session whose folder sits inside a NEARER directory wired to a DIFFERENT
 # project (nested wired projects: the harness can load an ancestor's hooks for
-# a session working in a descendant). Resolves CWD physically, walks up to the
-# filesystem root and stops at the FIRST directory whose
-# .claude/settings.local.json or .claude/settings.json carries a
-# MemContinuum-wired hook command (an unwired .claude is skipped).
-# Returns 0 and sets MC_FOREIGN_NEAREST to that directory's project when it
-# differs from $MC_PROJECT and $MC_PROJECT is not also wired in that same
-# directory (both settings files checked); MC_FOREIGN_PRESENT is then 1 when
-# the nearest project's own session-start hook positively initialised
-# SESSION_ID (its per-session state carries the keys only session-start
-# writes: start_store_sha and created_at -- a state file the ledger hook
-# created lacks them), else 0. Returns 1 (both empty) in every other case;
-# UNKNOWN is never foreign: CWD empty/relative/not a directory, an unreadable
-# settings file, the library missing, no wired directory, a wired line with
-# more than one hook command or more than one project assignment or an empty
-# project (a minified file, a double-quoted assignment), or the two settings
-# files of the nearest directory naming different projects. Never reads the
-# hook's own $PWD. Observation only: callers decide what to do with the answer.
-# The settings readers are scripts/mc-registry-lib.sh's (mc_first_wired_command,
-# mc_wired_command_for_project, mc_command_env_value), sourced lazily from the
-# engine-relative path hooks/memcontinuum-detect.sh also uses.
+# a session working in a descendant). Returns 0 and sets MC_FOREIGN_NEAREST to
+# that directory's project when it is FOREIGN, else 1 with both variables empty.
+# MC_FOREIGN_PRESENT is 1 when, in addition, the nearest project's own
+# session-start hook positively initialised SESSION_ID, else 0.
 #
-# The walk (who is nearest) is paid once per session and payload cwd: its RESULT
-# is cached in a sidecar beside this project's per-session state file,
-# "<state file>.fcwd" (mc_state_file_for), one line "<raw payload cwd><TAB><nearest
-# foreign project | !none>" -- "!none" stands for "not foreign" AND for
-# "unknown" alike (neither is distinguished by any caller). A hit needs the
-# cached cwd string to equal the payload cwd string exactly and is read with
-# shell builtins only; anything else (missing, empty, unreadable, malformed
-# file, another cwd) is a miss and re-walks; a failed cache write is ignored.
-# The cache is session-scoped on purpose: a project wired into a folder
-# mid-session is picked up by the NEXT session. Only the walk is cached: whether
-# the nearest project's session-start initialised the session (MC_FOREIGN_PRESENT)
-# is re-read on every call, because it can become true later in the session when
-# the other project's hook runs second. mc_prune_old_state removes stale sidecars.
+# Two facts decide, and a hook goes quiet only on both, so each is strict:
+#  * FOREIGN: a cheap shell walk resolves CWD physically and walks up to the
+#    first directory whose .claude/settings.local.json or .claude/settings.json
+#    carries a MemContinuum-wired hook command (an unwired .claude is skipped);
+#    that walk only yields a CANDIDATE. The candidate becomes foreign after
+#    mc_nudge.py's foreign_verdict (one python start, paid only when the walk
+#    found a candidate) reads the WHOLE of both settings files of that directory:
+#    every present file must parse as JSON, and every MEMCONTINUUM_PROJECT=
+#    assignment of every wired command (scripts/mc_settings_merge.py,
+#    wired_projects) must name exactly ONE project, equal to the candidate and
+#    different from this hook's own.
+#  * PRESENT: that project's per-session state file (mc_state_file_for) is a JSON
+#    object carrying what its session-start writes (mc_nudge.py,
+#    session_initialised), for this session id. Read on every call, never cached.
+# UNKNOWN is never foreign: CWD empty/relative/not a directory, an unreadable or
+# unparseable settings file, the library or python missing, no wired directory,
+# a wired line with more than one hook command or project assignment or an empty
+# project (a minified file, a double-quoted assignment), two or more projects
+# across the two files, or this hook's own project among them. Never reads the
+# hook's own $PWD. Observation only: callers decide what to do with the answer.
+# The pre-filter's readers are scripts/mc-registry-lib.sh's (mc_first_wired_command,
+# mc_command_env_value), sourced lazily from the engine-relative path
+# hooks/memcontinuum-detect.sh also uses.
+#
+# Only "not foreign / unknown" is cached, never "foreign": the sidecar
+# "<state file>.fcwd" (mc_state_file_for) holds one line
+# "<raw payload cwd><TAB>!none" written when the walk found no candidate, and is
+# read with shell builtins only. A cached "!none" can only make a hook SPEAK,
+# never go quiet; it is trusted only when its cwd string equals the payload cwd
+# string exactly. A line carrying anything else (a project name, garbage, another
+# cwd, an unreadable file) is a miss and is not rewritten as foreign: a candidate
+# re-establishes everything (walk + settings + state) on every invocation, so a
+# retargeted symlink, a vanished folder or a rewritten settings file can never
+# keep a hook quiet. A failed cache write is ignored. The cache is
+# session-scoped on purpose: a project wired into a folder mid-session is
+# picked up by the NEXT session. mc_prune_old_state removes stale sidecars.
 mc_foreign_cwd_nearest() {
-    local dir="${1:-}" sid="${2:-}" cf="" line="" ccwd="" cres="" f
+    local dir="${1:-}" sid="${2:-}" cf="" line="" ccwd="" cres=""
     MC_FOREIGN_NEAREST=""
     MC_FOREIGN_PRESENT=0
     case "$dir" in
@@ -249,106 +256,91 @@ mc_foreign_cwd_nearest() {
         {
             { IFS= read -r line || :; } < "$cf"
         } 2>/dev/null
-        if [ -n "$line" ]; then
-            case "$line" in
-                *$'\t'*)
-                    ccwd="${line%%$'\t'*}"
-                    cres="${line#*$'\t'}"
-                    if [ "$ccwd" = "$dir" ]; then
-                        case "$cres" in
-                            "!none") return 1 ;;
-                            ""|*[!A-Za-z0-9._-]*) ;;
-                            *)
-                                MC_FOREIGN_NEAREST="$cres"
-                                _mc_foreign_present "$cres" "$sid"
-                                return 0
-                                ;;
-                        esac
-                    fi
-                    ;;
-            esac
-        fi
+        case "$line" in
+            *$'\t'*)
+                ccwd="${line%%$'\t'*}"
+                cres="${line#*$'\t'}"
+                if [ "$ccwd" = "$dir" ] && [ "$cres" = "!none" ]; then
+                    return 1
+                fi
+                ;;
+        esac
     fi
     if _mc_foreign_walk "$dir"; then
-        _mc_foreign_present "$MC_FOREIGN_NEAREST" "$sid"
-        cres="$MC_FOREIGN_NEAREST"
-        f=0
-    else
-        cres="!none"
-        f=1
+        _mc_foreign_verify "$sid"
+        return $?
     fi
     if [ -n "$cf" ] && [ -d "${cf%/*}" ]; then
         case "$dir" in
             *$'\t'*|*$'\n'*) ;;
             *)
                 # atomic: temp beside the target (same directory), removed on any failure
-                { printf '%s\t%s\n' "$dir" "$cres" > "$cf.tmp.$$" && mv -f "$cf.tmp.$$" "$cf"; } 2>/dev/null \
+                { printf '%s\t!none\n' "$dir" > "$cf.tmp.$$" && mv -f "$cf.tmp.$$" "$cf"; } 2>/dev/null \
                     || rm -f "$cf.tmp.$$" 2>/dev/null
                 ;;
         esac
     fi
-    return $f
+    return 1
 }
 
-# _mc_foreign_present NEAREST SID -- sets MC_FOREIGN_PRESENT=1 when NEAREST's
-# own session-start positively initialised SID (state keys only session-start
-# writes: start_store_sha and created_at), else 0. Never cached.
-_mc_foreign_present() {
-    local nearest="$1" sid="$2" f
-    MC_FOREIGN_PRESENT=0
-    case "$nearest" in
-        */*|.|..) ;;
-        *)
-            f="$(mc_state_file_for "$nearest" "$sid")"
-            if [ -n "$sid" ] && [ -f "$f" ] && grep -q '"start_store_sha"' "$f" 2>/dev/null \
-                && grep -q '"created_at"' "$f" 2>/dev/null; then
-                MC_FOREIGN_PRESENT=1
-            fi
-            ;;
-    esac
-}
-
-# _mc_foreign_walk ABSOLUTE_CWD -- the uncached walk (see mc_foreign_cwd_nearest):
-# returns 0 with MC_FOREIGN_NEAREST set when the nearest wired directory is
-# foreign, else 1 with it empty.
-_mc_foreign_walk() {
-    local dir="$1" nearest="" wired_dir="" f first_cmd rest
+# _mc_foreign_verify SID -- the strict check of the candidate _mc_foreign_walk
+# left in MC_FC_CAND_DIR / MC_FC_CAND_NAME (see mc_foreign_cwd_nearest): one
+# python start. Returns 0 with MC_FOREIGN_NEAREST and MC_FOREIGN_PRESENT set when
+# the candidate is strictly foreign, else 1 with both cleared (unknown). Never
+# cached.
+_mc_foreign_verify() {
+    local sid="$1" verdict=""
     MC_FOREIGN_NEAREST=""
+    MC_FOREIGN_PRESENT=0
+    [ -n "$sid" ] && [ -x "$MC_PY" ] || return 1
+    verdict="$(env PYTHONPATH= MC_NUDGE_DIR="$MC_LIB_DIR" MC_FC_DIR="$MC_FC_CAND_DIR" MC_FC_OWN="$MC_PROJECT" \
+        MC_FC_CAND="$MC_FC_CAND_NAME" MC_FC_BASENAMES="$MC_HOOK_BASENAMES" MC_FC_SID="$sid" \
+        MC_FC_STATE="$(mc_state_file_for "$MC_FC_CAND_NAME" "$sid")" "$MC_PY" -c '
+import os, sys
+sys.path.insert(0, os.environ["MC_NUDGE_DIR"])
+import mc_nudge
+e = os.environ
+print(mc_nudge.foreign_verdict(e["MC_FC_DIR"], e["MC_FC_OWN"], e["MC_FC_CAND"],
+                               e["MC_FC_BASENAMES"], e["MC_FC_STATE"], e["MC_FC_SID"]))
+' 2>/dev/null)" || return 1
+    case "$verdict" in
+        foreign-present) MC_FOREIGN_PRESENT=1 ;;
+        foreign-absent) ;;
+        *) return 1 ;;
+    esac
+    MC_FOREIGN_NEAREST="$MC_FC_CAND_NAME"
+    return 0
+}
+
+# _mc_foreign_walk ABSOLUTE_CWD -- the cheap, uncached pre-filter (see
+# mc_foreign_cwd_nearest): returns 0 with MC_FC_CAND_DIR (the nearest wired
+# directory) and MC_FC_CAND_NAME (the project its first wired command names, a
+# CANDIDATE only) set when that name differs from this hook's own project, else 1.
+_mc_foreign_walk() {
+    local dir="$1"
+    MC_FC_CAND_DIR=""
+    MC_FC_CAND_NAME=""
     dir="$(cd "$dir" 2>/dev/null && pwd -P)"
     [ -n "$dir" ] || return 1
     if ! command -v mc_first_wired_command >/dev/null 2>&1; then
         . "$MC_LIB_DIR/../scripts/mc-registry-lib.sh" 2>/dev/null || return 1
     fi
+    local f
     while :; do
         if [ -f "$dir/.claude/settings.local.json" ] || [ -f "$dir/.claude/settings.json" ]; then
             for f in "$dir/.claude/settings.local.json" "$dir/.claude/settings.json"; do
                 if [ -f "$f" ] && [ ! -r "$f" ]; then return 1; fi
             done
             if mc_first_wired_command "$dir/.claude/settings.local.json" "$dir/.claude/settings.json"; then
-                wired_dir="${dir%/}"
+                MC_FC_CAND_DIR="${dir%/}"
                 break
             fi
         fi
         [ -z "$dir" ] && return 1
         dir="${dir%/*}"
     done
-    first_cmd="$MC_WIRED_COMMAND"
-    nearest="$(_mc_unambiguous_project "$first_cmd")" || return 1
-    # the other settings file of that directory must not name a different owner
-    if [ "$MC_WIRED_SETTINGS_FILE" = "$wired_dir/.claude/settings.local.json" ]; then
-        f="$wired_dir/.claude/settings.json"
-    else
-        f="$wired_dir/.claude/settings.local.json"
-    fi
-    if mc_first_wired_command "$f"; then
-        rest="$(_mc_unambiguous_project "$MC_WIRED_COMMAND")" || return 1
-        [ "$rest" = "$nearest" ] || return 1
-    fi
-    [ "$nearest" = "$MC_PROJECT" ] && return 1
-    if mc_wired_command_for_project "$MC_PROJECT" "$wired_dir/.claude/settings.local.json" "$wired_dir/.claude/settings.json"; then
-        return 1
-    fi
-    MC_FOREIGN_NEAREST="$nearest"
+    MC_FC_CAND_NAME="$(_mc_unambiguous_project "$MC_WIRED_COMMAND")" || return 1
+    [ "$MC_FC_CAND_NAME" = "$MC_PROJECT" ] && return 1
     return 0
 }
 

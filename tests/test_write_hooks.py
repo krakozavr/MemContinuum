@@ -12035,17 +12035,14 @@ class TestNudgeNamesItsProject(HookTestBase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         return proc.stdout
 
-    def test_second_prompt_in_the_session_uses_the_cached_walk(self):
+    def test_a_foreign_result_is_never_cached_so_deleted_settings_are_unknown(self):
         cwd = self.nested()
         sid = "s-fc-hit"
         self.start_session(self.project, sid, cwd)
         self.prompt_once(self.project, sid, cwd)
-        self.assertEqual(self.fcwd_file(sid).read_text(), f"{cwd}\t{self.OTHER}\n")
-        first = self.foreign_lines("userprompt")
-        self.assertEqual(len(first), 1)
-        # the settings the walk read are gone: only the cache can still name the project
-        for settings in (self.nest / "inner" / ".claude").iterdir():
-            settings.unlink()
+        # a foreign result leaves no sidecar: every invocation re-establishes it
+        self.assertFalse(self.fcwd_file(sid).exists())
+        self.assertEqual(len(self.foreign_lines("userprompt")), 1)
         self.prompt_once(self.project, sid, cwd)
         lines = self.foreign_lines("userprompt")
         self.assertEqual(len(lines), 2)
@@ -12053,9 +12050,13 @@ class TestNudgeNamesItsProject(HookTestBase):
         expected = (f"userprompt outcome=foreign-cwd nearest={self.OTHER} "
                     f"session={sid} project={self.project}")
         self.assertEqual([l.split(" ", 1)[1] for l in lines], [expected, expected])
-        # a session-start of the same session also answers from the cache
+        # the settings the walk read are gone: ownership is unknown, no line, the hook speaks
+        for settings in (self.nest / "inner" / ".claude").iterdir():
+            settings.unlink()
+        self.prompt_once(self.project, sid, cwd)
+        self.assertEqual(len(self.foreign_lines("userprompt")), 2)
         run_script(SESSIONSTART_HOOK, self.payload("start", sid, cwd, source="compact"), self.env_for(self.project))
-        self.assertEqual(len(self.foreign_lines("sessionstart")), 2)
+        self.assertEqual(len(self.foreign_lines("sessionstart")), 1)  # only the startup one
 
     def test_not_foreign_is_cached_and_a_late_wiring_waits_for_the_next_session(self):
         self.wire(self.nest, self.project)
@@ -12085,7 +12086,8 @@ class TestNudgeNamesItsProject(HookTestBase):
         self.assertEqual(self.fcwd_file(sid).read_text(), f"{elsewhere}\t!none\n")
         self.prompt_once(self.project, sid, cwd)
         self.assertEqual(len(self.foreign_lines("userprompt")), 2)
-        self.assertEqual(self.fcwd_file(sid).read_text(), f"{cwd}\t{self.OTHER}\n")
+        # a foreign result is never written: the sidecar still holds the other cwd's "!none"
+        self.assertEqual(self.fcwd_file(sid).read_text(), f"{elsewhere}\t!none\n")
 
     def test_a_corrupt_cache_file_is_a_miss(self):
         cwd = self.nested()
@@ -12097,7 +12099,8 @@ class TestNudgeNamesItsProject(HookTestBase):
             self.fcwd_file(sid).write_text(content)
             self.prompt_once(self.project, sid, cwd)
             self.assertEqual(len(self.foreign_lines("userprompt")), n + 1, repr(content))
-            self.assertEqual(self.fcwd_file(sid).read_text(), f"{cwd}\t{self.OTHER}\n", repr(content))
+            # a miss is not rewritten as a foreign result
+            self.assertEqual(self.fcwd_file(sid).read_text(), content, repr(content))
         if os.geteuid() != 0:
             sid = "s-fc-unreadable"
             self.start_session(self.project, sid, cwd)
@@ -12115,7 +12118,7 @@ class TestNudgeNamesItsProject(HookTestBase):
         self.prompt_once(self.project, sid, cwd)
         self.assertEqual(len(self.foreign_lines("userprompt")), len(garbage) + (2 if os.geteuid() != 0 else 1))
 
-    def test_quiet_turns_on_later_though_the_walk_is_cached(self):
+    def test_quiet_turns_on_later_when_the_nearest_project_starts_second(self):
         cwd = self.nested()
         sid = "s-fc-late"
         self.start_session(self.project, sid, cwd)
@@ -12123,14 +12126,17 @@ class TestNudgeNamesItsProject(HookTestBase):
         self.assertEqual(len(self.foreign_lines("userprompt")), 1)
         self.assertIn("outcome=foreign-cwd ", self.foreign_lines("userprompt")[0])
         self.start_nearest(self.OTHER, sid, cwd)  # the other project's session-start runs second
-        for settings in (self.nest / "inner" / ".claude").iterdir():
-            settings.unlink()  # so only the cached walk can still say who is nearest
         out = self.prompt_once(self.project, sid, cwd)
         self.assertEqual(out, "")
         lines = self.foreign_lines("userprompt")
         self.assertEqual(len(lines), 2)
         self.assertIn("outcome=foreign-cwd-quiet", lines[1])
         self.assertIn(f"nearest={self.OTHER}", lines[1])
+        # the quiet answer is re-established every time: with the settings gone it is unknown
+        for settings in (self.nest / "inner" / ".claude").iterdir():
+            settings.unlink()
+        self.prompt_once(self.project, sid, cwd)
+        self.assertEqual(len(self.foreign_lines("userprompt")), 2)
 
     def test_the_cache_file_is_beside_the_state_file_and_never_in_the_temp_dir(self):
         cwd = self.nested()
@@ -12159,6 +12165,174 @@ class TestNudgeNamesItsProject(HookTestBase):
         self.assertFalse(stale.exists())
         self.assertFalse(stray.exists())
         self.assertTrue(fresh.exists())
+
+
+    # ---- round 1 of the gate: "foreign" and "present" are strict, "foreign" is never cached --
+
+    def five_prompts(self, sid, cwd, project=None):
+        """Real session-start plus five prompts; returns the five stdouts (the fifth is the first look-back)."""
+        project = project or self.project
+        self.start_session(project, sid, cwd)
+        return [self.prompt_once(project, sid, cwd) for _ in range(5)]
+
+    def assertSpoke(self, out):
+        self.assertNotEqual(out.strip(), "", "the hook stayed quiet")
+        self.assertIn(lookback_question(self.store_root), self.ctx_of(out))
+
+    def userprompt_kinds(self):
+        """Per userprompt foreign line: 'quiet' or 'speak' (the line carrying outcome=foreign-cwd)."""
+        return ["quiet" if "outcome=foreign-cwd-quiet" in l else "speak" for l in self.foreign_lines("userprompt")]
+
+    def test_f1a_cwd_symlink_retargeted_into_the_hooks_own_project_speaks(self):
+        cwd = self.nested()
+        sid = "s-f1a"
+        self.start_nearest(self.OTHER, sid, cwd)
+        own = self.nest / "own"
+        own.mkdir()
+        link = Path(self.td) / "link-f1a"
+        link.symlink_to(cwd)
+        self.start_session(self.project, sid, str(link))
+        for _ in range(4):
+            self.assertEqual(self.prompt_once(self.project, sid, str(link)), "")
+        self.assertEqual(self.userprompt_kinds(), ["quiet"] * 4)
+        link.unlink()
+        link.symlink_to(own)
+        self.assertSpoke(self.prompt_once(self.project, sid, str(link)))
+        self.assertEqual(self.userprompt_kinds(), ["quiet"] * 4)
+
+    def test_f1b_cwd_directory_removed_after_a_quiet_prompt_speaks(self):
+        cwd = self.nested()
+        sid = "s-f1b"
+        self.start_nearest(self.OTHER, sid, cwd)
+        self.start_session(self.project, sid, cwd)
+        for _ in range(4):
+            self.assertEqual(self.prompt_once(self.project, sid, cwd), "")
+        shutil.rmtree(cwd)
+        self.assertSpoke(self.prompt_once(self.project, sid, cwd))
+        self.assertEqual(self.userprompt_kinds(), ["quiet"] * 4)
+
+    def test_f1c_a_hand_written_cache_naming_a_project_is_not_trusted(self):
+        # (1) the folder is the hook's own, the cache claims it is B's and B ran: still speaks
+        self.wire(self.nest, self.project)
+        own = self.nest / "own"
+        own.mkdir()
+        inner = self.nest / "inner"
+        self.wire(inner, self.OTHER)
+        sid = "s-f1c-b"
+        self.start_nearest(self.OTHER, sid, str(own))
+        self.start_session(self.project, sid, str(own))
+        self.fcwd_file(sid).write_text(f"{own}\t{self.OTHER}\n")
+        for _ in range(4):
+            self.prompt_once(self.project, sid, str(own))
+            self.fcwd_file(sid).write_text(f"{own}\t{self.OTHER}\n")
+        self.assertSpoke(self.prompt_once(self.project, sid, str(own)))
+        self.assertEqual(self.foreign_lines("userprompt"), [])
+        # (2) the folder is B's, the cache names the hook's own project: the decision is the fresh one
+        cwd = str(inner / "sub")
+        (inner / "sub").mkdir()
+        sid = "s-f1c-a"
+        self.start_session(self.project, sid, cwd)
+        for _ in range(4):
+            self.fcwd_file(sid).write_text(f"{cwd}\t{self.project}\n")
+            self.prompt_once(self.project, sid, cwd)
+        self.fcwd_file(sid).write_text(f"{cwd}\t{self.project}\n")
+        self.assertSpoke(self.prompt_once(self.project, sid, cwd))
+        lines = self.foreign_lines("userprompt")
+        self.assertEqual(len(lines), 5)
+        for line in lines:
+            self.assertIn(f"outcome=foreign-cwd nearest={self.OTHER} ", line)
+
+    def _present_case(self, label, state_text):
+        cwd = self.nested()
+        sid = f"s-f2-{label}"
+        state = self.nearest_state(self.OTHER, sid)
+        state.parent.mkdir(parents=True, exist_ok=True)
+        state.write_text(state_text(sid) if callable(state_text) else state_text)
+        outs = self.five_prompts(sid, cwd)
+        self.assertSpoke(outs[-1])
+        lines = self.foreign_lines("userprompt")
+        self.assertEqual(len(lines), 5, label)
+        for line in lines:
+            self.assertIn("outcome=foreign-cwd ", line)
+            self.assertIn(f"nearest={self.OTHER}", line)
+
+    def test_f2a_null_fields_nested_in_another_object_are_not_presence(self):
+        self._present_case("nested", '{"metadata":{"start_store_sha":null,"created_at":null}}')
+
+    def test_f2b_truncated_state_naming_both_keys_is_not_presence(self):
+        self._present_case("trunc", '{"start_store_sha": "abc123", "created_at": 1.5, "ledg')
+
+    def test_f2c_state_recording_another_session_is_not_presence(self):
+        self._present_case("othersid", json.dumps(
+            {"session_id": "some-other-session", "start_store_sha": "abc123", "created_at": 1.5}))
+
+    def test_f2_a_well_formed_initialised_state_is_presence(self):
+        cwd = self.nested()
+        sid = "s-f2-ok"
+        state = self.nearest_state(self.OTHER, sid)
+        state.parent.mkdir(parents=True, exist_ok=True)
+        state.write_text(json.dumps({"session_id": sid, "start_store_sha": "abc123", "created_at": 1.5}))
+        outs = self.five_prompts(sid, cwd)
+        self.assertEqual(outs, [""] * 5)
+        self.assertEqual(self.userprompt_kinds(), ["quiet"] * 5)
+
+    def _unknown_case(self, label, setup):
+        """B initialised for the session; `setup(inner)` rewrites B's folder; the hook must speak, no foreign line."""
+        cwd = self.nested()
+        sid = f"s-f3-{label}"
+        self.start_nearest(self.OTHER, sid, cwd)
+        setup(self.nest / "inner")
+        outs = self.five_prompts(sid, cwd)
+        self.assertSpoke(outs[-1])
+        self.assertEqual(self.foreign_lines("userprompt"), [], label)
+
+    def _append(self, inner, text, name="settings.local.json"):
+        p = inner / ".claude" / name
+        p.write_text(p.read_text() + text)
+
+    def test_f3a_garbage_appended_to_pretty_printed_settings_is_unknown(self):
+        self._unknown_case("broken", lambda inner: self._append(inner, "\nBROKEN\n"))
+
+    def test_f3b_two_projects_on_separate_lines_of_one_file_is_unknown(self):
+        self._unknown_case("twolines", lambda inner: self.wire(inner, self.OTHER, "third"))
+
+    def test_f3b_two_projects_one_in_each_file_is_unknown(self):
+        self._unknown_case("twofiles", lambda inner: self.wire(inner, "third", name="settings.json"))
+
+    def _wire_raw(self, directory, commands, name):
+        Path(directory, ".claude").mkdir(parents=True, exist_ok=True)
+        entries = [{"hooks": [{"type": "command", "command": c}]} for c in commands]
+        Path(directory, ".claude", name).write_text(json.dumps({"hooks": {"UserPromptSubmit": entries}}, indent=2))
+
+    def test_f3c_own_project_assignment_at_the_start_of_the_command_is_present_same_file(self):
+        def setup(inner):
+            self._wire_raw(inner, [
+                f"MEMCONTINUUM_PROJECT={self.OTHER} bash /engine/hooks/userprompt-remind.sh",
+                f"MEMCONTINUUM_PROJECT={self.project} bash /engine/hooks/userprompt-remind.sh",
+            ], "settings.local.json")
+        self._unknown_case("ownstart-same", setup)
+
+    def test_f3c_own_project_assignment_at_the_start_of_the_command_is_present_other_file(self):
+        def setup(inner):
+            self._wire_raw(inner, [f"MEMCONTINUUM_PROJECT={self.OTHER} bash /engine/hooks/userprompt-remind.sh"],
+                           "settings.local.json")
+            self._wire_raw(inner, [f"MEMCONTINUUM_PROJECT={self.project} bash /engine/hooks/userprompt-remind.sh"],
+                           "settings.json")
+        self._unknown_case("ownstart-other", setup)
+
+    def test_strict_check_reads_assignments_wherever_they_sit(self):
+        """A single owner with the assignment after `env `, or with a quoted value, is still ONE owner."""
+        cwd = self.nested()
+        for label, cmd in (
+            ("env-prefix", "env MEMCONTINUUM_PROJECT=%s bash /engine/hooks/userprompt-remind.sh"),
+            ("single-quoted", "MEMCONTINUUM_PROJECT='%s' bash /engine/hooks/userprompt-remind.sh"),
+        ):
+            with self.subTest(case=label):
+                self._wire_raw(self.nest / "inner", [cmd % self.OTHER], "settings.local.json")
+                sid = f"s-wherever-{label}"
+                self.start_nearest(self.OTHER, sid, cwd)
+                outs = self.five_prompts(sid, cwd)
+                self.assertEqual(outs, [""] * 5, label)
 
 
 if __name__ == "__main__":
