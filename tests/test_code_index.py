@@ -49,6 +49,11 @@ import chunkers  # noqa: E402
 import chunkers.treesitter  # noqa: E402,F401
 import memidx  # noqa: E402
 import memlint  # noqa: E402
+from tests.test_update import isolate_memcontinuum_home, tmpdir  # noqa: E402 -- the shared temp-dir helpers
+
+
+def setUpModule():
+    isolate_memcontinuum_home()  # code-search appends a hook.log line wherever --db points
 
 FIXTURES = TOOLS_DIR / "fixtures" / "code"
 PY_FIXTURES = TOOLS_DIR / "tests" / "fixtures" / "python_corpus"
@@ -2835,11 +2840,8 @@ class TestIsolationFromMarkdownIndex(unittest.TestCase):
             shutil.copy(FIXTURES / "NestedTypes.swift", root / "NestedTypes.swift")
 
             args = ns(code_root=str(root), project="isoproj", no_embed=True, full=False, lang="swift")
-            os.environ["MEMCONTINUUM_HOME"] = str(home)
-            try:
+            with mock.patch.dict(os.environ, {"MEMCONTINUUM_HOME": str(home)}):
                 rc = memidx.cmd_code_reindex(args)
-            finally:
-                del os.environ["MEMCONTINUUM_HOME"]
             self.assertEqual(rc, 0)
 
             self.assertTrue((home / "isoproj-code.sqlite").exists())
@@ -2848,12 +2850,9 @@ class TestIsolationFromMarkdownIndex(unittest.TestCase):
     def test_code_db_path_differs_from_markdown_db_path(self):
         code_args = ns(project="samename", db=None)
         md_args = ns(project="samename", db=None)
-        os.environ["MEMCONTINUUM_HOME"] = "/tmp/does-not-need-to-exist-for-this-check"
-        try:
+        with mock.patch.dict(os.environ, {"MEMCONTINUUM_HOME": "/tmp/does-not-need-to-exist-for-this-check"}):
             code_path = memidx.resolve_code_db_path(code_args)
             md_path = memidx.resolve_db_path(md_args)
-        finally:
-            del os.environ["MEMCONTINUUM_HOME"]
         self.assertNotEqual(code_path, md_path)
 
 
@@ -3100,6 +3099,7 @@ class TestConceptAttachment(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             home = Path(td) / "home"
             home.mkdir()
+            prior_home = os.environ.get("MEMCONTINUUM_HOME")
             os.environ["MEMCONTINUUM_HOME"] = str(home)
             try:
                 _build_decision_db_with_concepts(td, [{
@@ -3125,7 +3125,10 @@ class TestConceptAttachment(unittest.TestCase):
                 results = _json.loads(buf.getvalue())["results"]
                 self.assertTrue(any(r.get("concept_id") == "CON-ATTACH" for r in results), results)
             finally:
-                del os.environ["MEMCONTINUUM_HOME"]
+                if prior_home is None:
+                    os.environ.pop("MEMCONTINUUM_HOME", None)
+                else:
+                    os.environ["MEMCONTINUUM_HOME"] = prior_home
 
     def test_explicit_code_db_still_attaches_concepts_from_decision_db_and_stays_clean(self):
         """Finding 3: `code-search --db <codedb>` used to run the markdown
@@ -3137,6 +3140,7 @@ class TestConceptAttachment(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             home = Path(td) / "home"
             home.mkdir()
+            prior_home = os.environ.get("MEMCONTINUUM_HOME")
             os.environ["MEMCONTINUUM_HOME"] = str(home)
             try:
                 _build_decision_db_with_concepts(td, [{
@@ -3184,7 +3188,10 @@ class TestConceptAttachment(unittest.TestCase):
                     f"code db must never carry markdown tables: {tables & markdown_only_tables}",
                 )
             finally:
-                del os.environ["MEMCONTINUUM_HOME"]
+                if prior_home is None:
+                    os.environ.pop("MEMCONTINUUM_HOME", None)
+                else:
+                    os.environ["MEMCONTINUUM_HOME"] = prior_home
 
     def test_two_concepts_on_one_file_different_symbols_each_get_their_own_chunk(self):
         """Finding 4: concept_id attachment must prefer a symbol-level
@@ -3194,6 +3201,7 @@ class TestConceptAttachment(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             home = Path(td) / "home"
             home.mkdir()
+            prior_home = os.environ.get("MEMCONTINUUM_HOME")
             os.environ["MEMCONTINUUM_HOME"] = str(home)
             try:
                 _build_decision_db_with_concepts(td, [
@@ -3227,7 +3235,10 @@ class TestConceptAttachment(unittest.TestCase):
                 self.assertEqual(ext_hit["qualified_name"], "Outer.extFunc")
                 self.assertEqual(ext_hit.get("concept_id"), "CON-EXT", ext_hit)
             finally:
-                del os.environ["MEMCONTINUUM_HOME"]
+                if prior_home is None:
+                    os.environ.pop("MEMCONTINUUM_HOME", None)
+                else:
+                    os.environ["MEMCONTINUUM_HOME"] = prior_home
 
 
 class TestConceptAttachIsRootChecked(unittest.TestCase):
@@ -3745,7 +3756,7 @@ class TestLoadProbeSet(unittest.TestCase):
     would never execute in CI at all (reviewer finding 6, 2026-08-31)."""
 
     def write(self, body):
-        d = tempfile.mkdtemp()
+        d = tmpdir(self, "memcontinuum-probeset-")
         f = Path(d) / "probes.tsv"
         f.write_text(body, encoding="utf-8")
         return f
@@ -3768,7 +3779,7 @@ class TestLoadProbeSet(unittest.TestCase):
         self.assertIsNone(load_probe_set(Path("/nonexistent/probes.tsv")))
 
     def test_non_utf8_file_is_none_not_an_error(self):
-        d = tempfile.mkdtemp()
+        d = tmpdir(self, "memcontinuum-probeset-")
         f = Path(d) / "probes.tsv"
         f.write_bytes(b"#corpus: /tmp\n\xff\xfe binary\n")
         self.assertIsNone(load_probe_set(f))

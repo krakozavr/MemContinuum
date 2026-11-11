@@ -31,7 +31,7 @@ from mc_settings_merge import (  # noqa: E402
 
 class MergeCase(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="mc-settings-merge-test-")
+        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-settings-merge-test-")
         self.path = str(Path(self.tmp) / "settings.local.json")
 
     def tearDown(self):

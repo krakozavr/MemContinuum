@@ -28,6 +28,8 @@ from pathlib import Path
 TOOLS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(TOOLS_DIR))
 
+from tests.test_update import confine_tmp  # noqa: E402 -- the one temp-dir confinement helper
+
 import memidx  # noqa: E402
 import memlint  # noqa: E402
 
@@ -376,6 +378,7 @@ class TestRunnerInterface(unittest.TestCase):
             env = dict(os.environ)
             env["PYTHONPATH"] = ""
             env.update(env_python)
+            confine_tmp(self, env)  # the runner caches its index under the temp dir
             proc = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=60)
             self.assertEqual(proc.returncode, 0, proc.stderr)
             lines = [ln for ln in proc.stdout.splitlines()]
@@ -388,6 +391,7 @@ class TestRunnerInterface(unittest.TestCase):
         env = dict(os.environ)
         env["PYTHONPATH"] = ""
         env["MEMCONTINUUM_PYTHON"] = VENV_PYTHON
+        confine_tmp(self, env)  # the runner caches its index under the temp dir
         argv = [sys.executable, str(RUNNERS_DIR / "memcontinuum.py"), "--corpus", str(CORPUS),
                 "--kind", "path", "--query", "src/storage/dedup/store.py", "--limit", "10"]
         proc = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=60)
@@ -413,6 +417,7 @@ class TestRunnerInterface(unittest.TestCase):
             env = dict(os.environ)
             env["PYTHONPATH"] = ""
             env["MEMCONTINUUM_PYTHON"] = VENV_PYTHON
+            confine_tmp(self, env)
             proc = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=60)
             self.assertNotEqual(proc.returncode, 0)
 

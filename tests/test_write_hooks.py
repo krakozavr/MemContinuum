@@ -37,6 +37,7 @@ TOOLS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(TOOLS_DIR))
 
 import chunkers  # noqa: E402
+from tests.test_update import confine_tmp, tmpdir  # noqa: E402 -- the one temp-dir confinement helper
 import memidx  # noqa: E402
 
 # This machine's venv python is never hardcoded in tracked test code -- set
@@ -420,8 +421,35 @@ class HookTestBase(unittest.TestCase):
             MEMCONTINUUM_CODE_ROOT=str(self.code_root),
             MEMCONTINUUM_PYTHON=VENV_PYTHON,
         )
+        # A hook the watchdog kills mid-run leaves its `mktemp` file behind;
+        # the file lands in a directory this test removes (the hook is not
+        # changed).
+        confine_tmp(self, env)
+        env["PATH"] = self.mktemp_shim_dir() + os.pathsep + env.get("PATH", "")
         env.update(overrides)
         return env
+
+    def mktemp_shim_dir(self):
+        """A directory holding a `mktemp` that honours TMPDIR when called with
+        no arguments. Apple's bare `mktemp` uses the Darwin per-user temp
+        directory BEFORE looking at TMPDIR, so confine_tmp alone would not
+        catch a killed hook's `DECIDE_TMP="$(mktemp)"` file on macOS. With
+        arguments the shim runs the real mktemp unchanged; on Linux the
+        result is the same file the bare call would have made. One per test."""
+        cached = getattr(self, "_mktemp_shim_dir", None)
+        if cached is None:
+            cached = tmpdir(self, "memcontinuum-mktemp-shim-")
+            shim = Path(cached) / "mktemp"
+            shim.write_text(
+                "#!/bin/sh\n"
+                'if [ "$#" -eq 0 ]; then\n'
+                f'    exec "{shutil.which("mktemp")}" "${{TMPDIR:-/tmp}}/tmp.XXXXXX"\n'
+                "fi\n"
+                f'exec "{shutil.which("mktemp")}" "$@"\n'
+            )
+            shim.chmod(0o755)
+            self._mktemp_shim_dir = cached
+        return cached
 
     def assert_hook_logged_within_budget(self, wall, env=None, budget=None):
         """TOP-0137 L32: the product guarantee is that a hook finishes inside
@@ -1399,7 +1427,7 @@ class TestLedgerPostEditWorktreeGap(HookTestBase):
         for base in (tempfile.gettempdir(), "/dev/shm", "/var/tmp", str(Path.home())):
             if not os.path.isdir(base) or not os.access(base, os.W_OK) or not clean(base):
                 continue
-            root = Path(tempfile.mkdtemp(prefix="mc-no-git-", dir=base))
+            root = Path(tempfile.mkdtemp(prefix="memcontinuum-no-git-", dir=base))
             self.addCleanup(shutil.rmtree, str(root), True)
             if clean(root):
                 return root

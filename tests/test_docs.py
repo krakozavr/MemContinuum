@@ -28,6 +28,7 @@ sys.path.insert(0, str(TOOLS_DIR))
 
 import chunkers  # noqa: E402
 import memidx  # noqa: E402
+from tests.test_update import tmpdir  # noqa: E402 -- the one cleaned-up temp-dir helper
 
 README = TOOLS_DIR / "README.md"
 INTERNALS = TOOLS_DIR / "docs" / "INTERNALS.md"
@@ -456,7 +457,7 @@ class TestHelpTextsAgreeWithTheParsers(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-helpflags-test-")
+        self.tmp = tmpdir(self, "memcontinuum-helpflags-test-")
         self.env = dict(os.environ)
         self.env["PYTHONPATH"] = ""
         self.env["HOME"] = self.tmp

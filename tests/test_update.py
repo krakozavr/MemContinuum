@@ -109,6 +109,48 @@ def tmpdir(test, prefix):
     return path
 
 
+def isolate_memcontinuum_home(prefix="memcontinuum-modhome-"):
+    """Call from a module's setUpModule: points MEMCONTINUUM_HOME at a
+    directory that is removed when the module's last test has run, restoring
+    the variable's previous value. Code under test that appends a hook.log
+    line (memidx `code-search` does, whatever --db says) would otherwise write
+    into the developer's real ~/.memcontinuum. A test that sets its own
+    MEMCONTINUUM_HOME still overrides this one for its own duration."""
+    path = os.path.realpath(tempfile.mkdtemp(prefix=prefix))
+    previous = os.environ.get("MEMCONTINUUM_HOME")
+
+    def restore():
+        if previous is None:
+            os.environ.pop("MEMCONTINUUM_HOME", None)
+        else:
+            os.environ["MEMCONTINUUM_HOME"] = previous
+        shutil.rmtree(path, ignore_errors=True)
+
+    os.environ["MEMCONTINUUM_HOME"] = path
+    unittest.addModuleCleanup(restore)
+    return path
+
+
+# fastembed resolves its model cache to <system temp>/fastembed_cache when
+# FASTEMBED_CACHE_PATH is unset. confine_tmp() below moves a subprocess's
+# TMPDIR, so the cache location is pinned to where it was BEFORE the move;
+# otherwise every confined subprocess that embeds would download the model
+# into its own throwaway directory.
+_FASTEMBED_CACHE = os.environ.get("FASTEMBED_CACHE_PATH") or os.path.join(
+    tempfile.gettempdir(), "fastembed_cache")
+
+
+def confine_tmp(test, env, prefix="memcontinuum-confined-tmp-"):
+    """Point a subprocess env's TMPDIR at a directory removed when `test`
+    ends, so what a hook or script leaves in its temp dir (a killed hook's
+    `mktemp` file, a library's per-process log) is removed with the test
+    instead of accumulating in the developer's real temp directory. Mutates
+    and returns `env`. The scripts themselves are not changed."""
+    env["TMPDIR"] = tmpdir(test, prefix)
+    env.setdefault("FASTEMBED_CACHE_PATH", _FASTEMBED_CACHE)
+    return env
+
+
 def copy_engine_for_machine_layer(dst):
     """Copies the whole engine (mirrors test_repo_init.py's own copy_engine,
     plus memcontinuum-setup.sh, scripts/memcontinuum-update.sh, and
@@ -4654,7 +4696,7 @@ class TestMemidxNeedsItsSiblingModules(unittest.TestCase):
     MESSAGE = "memidx.py needs mc_text.py and mc_reuse.py beside it -- incomplete checkout"
 
     def run_copy(self, omit):
-        d = Path(tmpdir(self, "memidx-sibling-"))
+        d = Path(tmpdir(self, "memcontinuum-memidx-sibling-"))
         for name in ("memidx.py", "mc_text.py", "mc_reuse.py", "memlint.py"):
             if name != omit:
                 shutil.copy(TOOLS_DIR / name, d / name)

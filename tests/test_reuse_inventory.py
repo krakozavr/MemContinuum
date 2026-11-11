@@ -32,12 +32,15 @@ class FixtureTree:
     @classmethod
     def base(cls):
         if cls._base is None:
-            cls._base = Path(tempfile.mkdtemp(prefix="reuse-base-"))
+            cls._base = Path(tempfile.mkdtemp(prefix="memcontinuum-reuse-base-"))
+            # One shared copy for the whole module: removed when the module's
+            # last test has run (it was never removed before).
+            unittest.addModuleCleanup(shutil.rmtree, cls._base, True)
             shutil.copytree(TOOLS_DIR, cls._base / "t", ignore=_COPY_IGNORE)
         return cls._base / "t"
 
     def __init__(self, test):
-        self.root = Path(tempfile.mkdtemp(prefix="reuse-fixture-")) / "t"
+        self.root = Path(tempfile.mkdtemp(prefix="memcontinuum-reuse-fixture-")) / "t"
         test.addCleanup(shutil.rmtree, self.root.parent, True)
         shutil.copytree(self.base(), self.root)
 
@@ -883,7 +886,7 @@ class TestPositiveControls(unittest.TestCase):
 
 
 def _mini(test, files, inv_mutator=None):
-    root = Path(tempfile.mkdtemp(prefix="reuse-mini-"))
+    root = Path(tempfile.mkdtemp(prefix="memcontinuum-reuse-mini-"))
     test.addCleanup(shutil.rmtree, root, True)
     for rel, text in files.items():
         p = root / rel
