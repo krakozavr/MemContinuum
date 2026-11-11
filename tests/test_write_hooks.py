@@ -12049,7 +12049,10 @@ class TestNudgeNamesItsProject(HookTestBase):
         self.prompt_once(self.project, sid, cwd)
         lines = self.foreign_lines("userprompt")
         self.assertEqual(len(lines), 2)
-        self.assertEqual(lines[0], lines[1])
+        # the lines differ only in their leading wall-clock timestamp
+        expected = (f"userprompt outcome=foreign-cwd nearest={self.OTHER} "
+                    f"session={sid} project={self.project}")
+        self.assertEqual([l.split(" ", 1)[1] for l in lines], [expected, expected])
         # a session-start of the same session also answers from the cache
         run_script(SESSIONSTART_HOOK, self.payload("start", sid, cwd, source="compact"), self.env_for(self.project))
         self.assertEqual(len(self.foreign_lines("sessionstart")), 2)
