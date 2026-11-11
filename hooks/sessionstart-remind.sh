@@ -843,8 +843,14 @@ print(json.dumps({
         LB_TURN=""
         if [ $RC -ne 0 ]; then
             LB_META_TMP="$(mktemp 2>/dev/null)"
-            LB_JSON="$(MEMCONTINUUM_ROOT="${MEMCONTINUUM_ROOT:-}" MC_PROJECT_NAME="$MC_PROJECT" env PYTHONPATH= "$MC_PY" -c '
+            LB_JSON="$(MEMCONTINUUM_ROOT="${MEMCONTINUUM_ROOT:-}" MC_PROJECT_NAME="$MC_PROJECT" MC_NUDGE_DIR="$SCRIPT_DIR" env PYTHONPATH= "$MC_PY" -c '
 import json, os, sys
+
+# The look-back sentence lives in hooks/mc_nudge.py (shared with the prompt
+# hook); no .pyc is written next to the hook scripts.
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.environ["MC_NUDGE_DIR"])
+from mc_nudge import lookback_question
 
 try:
     with open(sys.argv[1]) as f:
@@ -864,22 +870,13 @@ since = turn - last_growth_turn
 if since < 3:
     sys.exit(3)
 
-Q = chr(39)
 store_root = os.environ.get("MEMCONTINUUM_ROOT") or "<store root not configured>"
 project = os.environ.get("MC_PROJECT_NAME") or "default"
 fact = (
     f"Look-back signal — {since} user turns with no edited-file evidence; "
     "context was just compacted."
 )
-question = (
-    "Did the conversation since then establish any ruling, incident, "
-    "rejected alternative, priority, wording choice, money decision, or "
-    f"{Q}not now{Q} that the MemContinuum store of project {project} should hold? "
-    f"This asks about {project} work only. Store: "
-    + store_root + " — a ruling is a new link in topics/<area>/<topic>.md, "
-    "an incident is a file in incidents/ (see docs/SCHEMA.md); NOT Claude "
-    "Code auto-memory. If none, say so once."
-)
+question = lookback_question(store_root, project)
 ctx = fact + "\n\n" + question
 print(json.dumps({
     "hookSpecificOutput": {

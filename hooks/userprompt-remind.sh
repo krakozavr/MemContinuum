@@ -1573,12 +1573,17 @@ sys.stdout.write("\n".join(lines))
 ' "$STATE_FILE" 2>>"$MC_LOG")"
 
 LB_OUTPUT_JSON="$(SINCE_TURN="${SINCE_TURN:-0}" MEMCONTINUUM_ROOT="${MEMCONTINUUM_ROOT:-}" MC_PROJECT_NAME="$MC_PROJECT" HOOK_FB_LOOKBACK="$FB_LOOKBACK_LINES" \
-    MC_PQ_TEXT="$PQ_TEXT" \
+    MC_PQ_TEXT="$PQ_TEXT" MC_NUDGE_DIR="$SCRIPT_DIR" \
     env PYTHONPATH= "$MC_PY" -c '
-import json, os
+import json, os, sys
+
+# The look-back sentence lives in hooks/mc_nudge.py (shared with the session-start
+# hook); no .pyc is written next to the hook scripts.
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.environ["MC_NUDGE_DIR"])
+from mc_nudge import lookback_question
 
 since = os.environ.get("SINCE_TURN", "0")
-Q = chr(39)
 store_root = os.environ.get("MEMCONTINUUM_ROOT") or "<store root not configured>"
 project = os.environ.get("MC_PROJECT_NAME") or "default"
 fact = f"Look-back signal — {since} user turns with no edited-file evidence."
@@ -1586,15 +1591,7 @@ fb_lines = [l for l in os.environ.get("HOOK_FB_LOOKBACK", "").split(chr(10)) if 
 # TOP-0133 L2: same already-rendered guess as the coverage/nudge envelope
 # above, merged in the same order (existing block first, then the guess).
 pq_text = os.environ.get("MC_PQ_TEXT") or ""
-question = (
-    "Did the conversation since then establish any ruling, incident, "
-    "rejected alternative, priority, wording choice, money decision, or "
-    f"{Q}not now{Q} that the MemContinuum store of project {project} should hold? "
-    f"This asks about {project} work only. Store: "
-    + store_root + " — a ruling is a new link in topics/<area>/<topic>.md, "
-    "an incident is a file in incidents/ (see docs/SCHEMA.md); NOT Claude "
-    "Code auto-memory. If none, say so once."
-)
+question = lookback_question(store_root, project)
 ctx = fact
 for fb in fb_lines:
     ctx += "\n" + fb

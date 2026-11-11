@@ -45,3 +45,16 @@ def coverage_question(store_root, project):
         "incidents/ (see docs/SCHEMA.md); NOT Claude Code auto-memory. If none, "
         "say so once."
     )
+
+
+def lookback_question(store_root, project):
+    q = chr(39)
+    return (
+        "Did the conversation since then establish any ruling, incident, "
+        "rejected alternative, priority, wording choice, money decision, or "
+        + q + "not now" + q + " that the MemContinuum store of project " + project
+        + " should hold? This asks about " + project + " work only. Store: "
+        + store_root + " — a ruling is a new link in topics/<area>/<topic>.md, "
+        "an incident is a file in incidents/ (see docs/SCHEMA.md); NOT Claude "
+        "Code auto-memory. If none, say so once."
+    )
