@@ -144,6 +144,46 @@ class TestGuardsRejectSecondImplementation(unittest.TestCase):
         self.assertEqual(len(f), 1, found)
         self.assertIn("ident_of_anchor", f[0])
 
+    def _scoped_copy_of_link_raw_spans(self, rename_outer_line):
+        """Source of a copy of memlint._link_raw_spans named `copied_spans`; with `rename_outer_line` every NAME
+        token `line` outside the nested `_is_comment_only` becomes `outer_line` (that function's own parameter
+        `line` is left alone). String literals and comments are untouched."""
+        import ast
+        import io
+        import tokenize
+        src = (TOOLS_DIR / "memlint.py").read_text(encoding="utf-8")
+        fn = next(n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef) and n.name == "_link_raw_spans")
+        nested = next(n for n in ast.walk(fn) if isinstance(n, ast.FunctionDef) and n.name == "_is_comment_only")
+        lines = src.splitlines(keepends=True)
+        text = "".join(lines[fn.lineno - 1:fn.end_lineno])
+        base = fn.lineno
+        edits = []
+        for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+            row, col = tok.start
+            at = base + row - 1
+            if tok.type == tokenize.NAME and tok.string == "_link_raw_spans" and at == fn.lineno:
+                edits.append((row, col, len(tok.string), "copied_spans"))
+            elif (rename_outer_line and tok.type == tokenize.NAME and tok.string == "line"
+                    and not nested.lineno <= at <= nested.end_lineno):
+                edits.append((row, col, 4, "outer_line"))
+        out = text.splitlines(keepends=True)
+        for row, col, n, new in sorted(edits, reverse=True):
+            out[row - 1] = out[row - 1][:col] + new + out[row - 1][col + n:]
+        return "\n\n" + "".join(out)
+
+    def test_copy_with_only_the_outer_variable_renamed_fails_exact_copy(self):
+        ft = FixtureTree(self)
+        ft.append("memlint.py", self._scoped_copy_of_link_raw_spans(rename_outer_line=True))
+        f = only(ft.findings(), "link-raw-spans", "exact_copy")
+        self.assertEqual(len(f), 1, ft.findings())
+        self.assertIn("copied_spans", f[0])
+
+    def test_copy_with_only_the_function_renamed_still_fails_exact_copy(self):
+        ft = FixtureTree(self)
+        ft.append("memlint.py", self._scoped_copy_of_link_raw_spans(rename_outer_line=False))
+        f = only(ft.findings(), "link-raw-spans", "exact_copy")
+        self.assertEqual(len(f), 1, ft.findings())
+
     def test_python_exact_copy_keeps_literals_so_a_different_function_is_not_flagged(self):
         ft = FixtureTree(self)
         ft.append("memlint.py",
@@ -1281,6 +1321,127 @@ class TestScanner(unittest.TestCase):
         s = self.scan({"a.py": "def (:\n", "b.py": "def ok():\n    pass\n"})
         self.assertEqual(len(s.problems), 1)
         self.assertIn("a.py", s.problems[0])
+
+    def test_py_fingerprint_resolves_names_lexically_per_scope(self):
+        import ast
+
+        def fp(src):
+            return mc_reuse.py_fingerprint(ast.parse(textwrap.dedent(src)).body[0])
+
+        base = fp("""
+            def f(rows):
+                line = 0
+                def inner(line):
+                    return line + 1
+                for row in rows:
+                    line = inner(line)
+                return line
+            """)
+        outer_only = fp("""
+            def g(rows):
+                n = 0
+                def inner(line):
+                    return line + 1
+                for row in rows:
+                    n = inner(n)
+                return n
+            """)
+        nested_only = fp("""
+            def g(rows):
+                line = 0
+                def inner(value):
+                    return value + 1
+                for row in rows:
+                    line = inner(line)
+                return line
+            """)
+        both = fp("""
+            def g(items):
+                n = 0
+                def helper(value):
+                    return value + 1
+                for it in items:
+                    n = helper(n)
+                return n
+            """)
+        self.assertEqual(base, outer_only)
+        self.assertEqual(base, nested_only)
+        self.assertEqual(base, both)
+        # a closure reading the OUTER variable is a different function from one reading its own parameter
+        closure = fp("""
+            def f(rows):
+                line = 0
+                def inner():
+                    return line + 1
+                for row in rows:
+                    line = inner()
+                return line
+            """)
+        param = fp("""
+            def f(rows):
+                line = 0
+                def inner(line):
+                    return line + 1
+                for row in rows:
+                    line = inner(line)
+                return line
+            """)
+        self.assertNotEqual(closure, param)
+        # nonlocal binds to the enclosing function's variable, whatever it is called
+        nl_a = fp("""
+            def f():
+                count = 0
+                def bump():
+                    nonlocal count
+                    count += 1
+                bump()
+                return count
+            """)
+        nl_b = fp("""
+            def f():
+                total = 0
+                def step():
+                    nonlocal total
+                    total += 1
+                step()
+                return total
+            """)
+        nl_not = fp("""
+            def f():
+                total = 0
+                def step():
+                    total = 0
+                    total += 1
+                step()
+                return total
+            """)
+        self.assertEqual(nl_a, nl_b)
+        self.assertNotEqual(nl_a, nl_not)
+        # a comprehension variable shadows an outer local; renaming either alone changes nothing
+        comp = fp("""
+            def f(xs):
+                x = 1
+                ys = [x for x in xs]
+                return x, ys
+            """)
+        comp_renamed = fp("""
+            def f(xs):
+                keep = 1
+                ys = [item for item in xs]
+                return keep, ys
+            """)
+        comp_unshadowed = fp("""
+            def f(xs):
+                x = 1
+                ys = [x for y in xs]
+                return x, ys
+            """)
+        self.assertEqual(comp, comp_renamed)
+        self.assertNotEqual(comp, comp_unshadowed)
+        # an external (global / builtin) name is kept as written
+        ext_a = fp("def f(a):\n    return helper_one(a)\n")
+        ext_b = fp("def f(a):\n    return helper_two(a)\n")
+        self.assertNotEqual(ext_a, ext_b)
 
     def test_py_fingerprint_renames_locals_but_keeps_literals_and_globals(self):
         import ast

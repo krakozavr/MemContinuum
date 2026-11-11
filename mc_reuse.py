@@ -1384,12 +1384,14 @@ def _sh_command_words(text: str) -> set:
     Not command words: arguments (of `type`, `declare -f`, `command -v`,
     `hash`, `unset`, ...), the operand of a redirection, a `case` pattern, the
     contents of `(( ))`, `[[ ]]`, a `for ((...))` header, an extglob group and of an
-    array literal (also one whose `name=` is continued over a backslash-newline), a call
-    inside any of those (not seen), a longer word (`mc_job"x"`,
+    array literal (also one whose `name=` is continued over a backslash-newline): the
+    regions' own words are not commands, but a command substitution inside them runs in
+    Bash and is read, so a call in a `$( )`, backtick or `<( )` inside any of them IS seen;
+    a longer word (`mc_job"x"`,
     `mc_job/x`), quoted text that is not the whole word and the name in a `name() {` /
     `function name {` declaration. Launchers (`xargs`, `find -exec`, `sudo`,
-    `env`, `timeout`, `coproc`, `command -p`), a function passed by name and a
-    `$( )` nested inside `$(( ))` are not seen."""
+    `env`, `timeout`, `coproc`, `command -p`) and a function passed by name are
+    not seen."""
     return _cmd_words(_sh_parse(text)[0])
 
 
@@ -1428,69 +1430,210 @@ def resolve_symbol(scan: Scan, ref: str):
 # Fingerprints (exact_copy)
 # ---------------------------------------------------------------------------
 
+class _PyScope:
+    """One lexical scope of the function being fingerprinted: the names it
+    binds, the names it imports (kept as written), and its `global` /
+    `nonlocal` declarations."""
+
+    def __init__(self, kind, parent):
+        self.kind = kind  # "module" | "function" | "class" | "comp"
+        self.parent = parent
+        self.bound = set()
+        self.kept = set()
+        self.globals = set()
+        self.nonlocals = set()
+
+
 class _Renamer(ast.NodeTransformer):
-    def __init__(self, local_names):
-        self.locals = local_names
-        self.map = {}
+    """Scope-aware local renaming. Run twice over the same tree: first with
+    `binding=True` (collect every scope's bindings), then with it False (rewrite
+    each name to a placeholder unique per (scope, binding), in first-appearance
+    order). A name resolves to the nearest enclosing scope that binds it (class
+    scopes are invisible to the scopes nested in them); otherwise it is external
+    and kept as written. `global` names, imports and external names stay as
+    written."""
 
-    def _name(self, ident):
-        if ident not in self.locals:
-            return ident
-        if ident not in self.map:
-            self.map[ident] = f"v{len(self.map)}"
-        return self.map[ident]
+    def __init__(self, root):
+        self.root = root
+        self.binding = True
+        self.cur = _PyScope("module", None)
+        self.scopes = {}
+        self.walrus = {}
+        self.slots = {}
 
-    def visit_Name(self, node):
-        node.id = self._name(node.id)
+    # -- name resolution -------------------------------------------------
+    def _decl(self, name, scope=None):
+        if self.binding:
+            (scope or self.cur).bound.add(name)
+            return name
+        return self._ref(name, scope)
+
+    def _ref(self, name, start=None):
+        if self.binding:
+            return name
+        first = start or self.cur
+        s = first
+        while s is not None:
+            if name in s.globals:
+                return name
+            if name in s.nonlocals:
+                pass
+            elif (s is first or s.kind != "class") and (name in s.bound or name in s.kept):
+                if name in s.kept:
+                    return name
+                return self.slots.setdefault((id(s), name), f"v{len(self.slots)}")
+            s = s.parent
+        return name
+
+    def _scope(self, node, kind):
+        if self.binding:
+            self.scopes[id(node)] = _PyScope(kind, self.cur)
+        return self.scopes[id(node)]
+
+    def _within(self, scope, work):
+        outer, self.cur = self.cur, scope
+        try:
+            return work()
+        finally:
+            self.cur = outer
+
+    def _args(self, args):
+        for a in args.posonlyargs + args.args + args.kwonlyargs + [args.vararg, args.kwarg]:
+            if a is not None:
+                a.annotation = None
+                a.arg = self._decl(a.arg)
+
+    def _outer_defaults(self, args):
+        args.defaults = [self.visit(d) for d in args.defaults]
+        args.kw_defaults = [self.visit(d) if d is not None else None for d in args.kw_defaults]
+
+    # -- scope-opening nodes ----------------------------------------------
+    def visit_FunctionDef(self, node):
+        if node is not self.root:
+            node.name = self._decl(node.name)
+        node.returns = None
+        node.decorator_list = [self.visit(d) for d in node.decorator_list]
+        self._outer_defaults(node.args)
+
+        def inside():
+            self._args(node.args)
+            node.body = [self.visit(s) for s in node.body]
+
+        self._within(self._scope(node, "function"), inside)
         return node
 
-    def visit_arg(self, node):
-        node.arg = self._name(node.arg)
-        node.annotation = None
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_Lambda(self, node):
+        self._outer_defaults(node.args)
+
+        def inside():
+            self._args(node.args)
+            node.body = self.visit(node.body)
+
+        self._within(self._scope(node, "function"), inside)
+        return node
+
+    def visit_ClassDef(self, node):
+        node.name = self._decl(node.name)
+        node.decorator_list = [self.visit(d) for d in node.decorator_list]
+        node.bases = [self.visit(b) for b in node.bases]
+        node.keywords = [self.visit(k) for k in node.keywords]
+        self._within(self._scope(node, "class"),
+                     lambda: setattr(node, "body", [self.visit(s) for s in node.body]))
+        return node
+
+    def _comp(self, node):
+        gens = node.generators
+        gens[0].iter = self.visit(gens[0].iter)
+
+        def inside():
+            for i, g in enumerate(gens):
+                g.target = self.visit(g.target)
+                if i:
+                    g.iter = self.visit(g.iter)
+                g.ifs = [self.visit(c) for c in g.ifs]
+            if isinstance(node, ast.DictComp):
+                node.key = self.visit(node.key)
+                node.value = self.visit(node.value)
+            else:
+                node.elt = self.visit(node.elt)
+
+        self._within(self._scope(node, "comp"), inside)
+        return node
+
+    visit_ListComp = visit_SetComp = visit_DictComp = visit_GeneratorExp = _comp
+
+    # -- binders and references ---------------------------------------------
+    def visit_Name(self, node):
+        if isinstance(node.ctx, (ast.Store, ast.Del)):
+            node.id = self._decl(node.id, self.walrus.get(id(node)))
+        else:
+            node.id = self._ref(node.id)
+        return node
+
+    def visit_NamedExpr(self, node):
+        scope = self.cur
+        while scope.kind == "comp":
+            scope = scope.parent
+        self.walrus[id(node.target)] = scope
+        node.value = self.visit(node.value)
+        node.target = self.visit(node.target)
         return node
 
     def visit_ExceptHandler(self, node):
         if node.name:
-            node.name = self._name(node.name)
+            node.name = self._decl(node.name)
         return self.generic_visit(node)
 
-    def visit_FunctionDef(self, node):
-        node.name = self._name(node.name)
-        node.returns = None
+    def visit_Import(self, node):
+        if self.binding:
+            for a in node.names:
+                if a.name != "*":
+                    self.cur.kept.add((a.asname or a.name).split(".")[0])
+        return node
+
+    visit_ImportFrom = visit_Import
+
+    def visit_Global(self, node):
+        if self.binding:
+            self.cur.globals.update(node.names)
+        return node
+
+    def visit_Nonlocal(self, node):
+        if self.binding:
+            self.cur.nonlocals.update(node.names)
+        else:
+            node.names = [self._ref(n) for n in node.names]
+        return node
+
+    def visit_MatchAs(self, node):
+        if node.name:
+            node.name = self._decl(node.name)
         return self.generic_visit(node)
 
-    visit_AsyncFunctionDef = visit_FunctionDef
+    visit_MatchStar = visit_MatchAs
 
-    def visit_AnnAssign(self, node):
+    def visit_MatchMapping(self, node):
+        if node.rest:
+            node.rest = self._decl(node.rest)
         return self.generic_visit(node)
 
 
 def py_fingerprint(fn) -> str:
-    """Normalised body of a function: its own name, docstring, locations,
-    annotations and consistently renamed local bindings are ignored; literals,
-    attributes, operators, decorators, imports and global names are kept."""
+    """Normalised body of a function: its own name, docstrings (at every
+    depth), locations, annotations and lexically scoped, consistently renamed
+    local bindings are ignored; literals, attributes, operators, decorators,
+    imports and names that no enclosing function binds are kept. A name is
+    renamed per scope: the same identifier bound in an outer and in a nested
+    scope is two bindings."""
     node = _strip_docstring(copy.deepcopy(fn))
-    locals_ = set()
-    declared_global = set()
-    imported = set()
-    for n in ast.walk(node):
-        if isinstance(n, ast.arg):
-            locals_.add(n.arg)
-        elif isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
-            locals_.add(n.id)
-        elif isinstance(n, ast.ExceptHandler) and n.name:
-            locals_.add(n.name)
-        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n is not node:
-            locals_.add(n.name)
-        elif isinstance(n, (ast.Global, ast.Nonlocal)):
-            declared_global.update(n.names)
-        elif isinstance(n, (ast.Import, ast.ImportFrom)):
-            for a in n.names:
-                imported.add((a.asname or a.name).split(".")[0])
-    locals_ -= declared_global | imported
     node.name = "_"
-    renamed = _Renamer(locals_).visit(node)
-    return ast.dump(renamed, annotate_fields=True, include_attributes=False)
+    renamer = _Renamer(node)
+    renamer.visit(node)
+    renamer.binding = False
+    renamer.visit(node)
+    return ast.dump(node, annotate_fields=True, include_attributes=False)
 
 
 def sh_fingerprint(d: Definition) -> str:
