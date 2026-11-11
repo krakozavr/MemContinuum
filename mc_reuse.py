@@ -1430,220 +1430,69 @@ def resolve_symbol(scan: Scan, ref: str):
 # Fingerprints (exact_copy)
 # ---------------------------------------------------------------------------
 
-class _PyScope:
-    """One lexical scope of the function being fingerprinted: the names it
-    binds, the names it imports (kept as written), and its `global` /
-    `nonlocal` declarations."""
-
-    def __init__(self, kind, parent):
-        self.kind = kind  # "module" | "function" | "class" | "comp"
-        self.parent = parent
-        self.bound = set()
-        self.kept = set()
-        self.globals = set()
-        self.nonlocals = set()
-
-
 class _Renamer(ast.NodeTransformer):
-    """Scope-aware local renaming. Run twice over the same tree: first with
-    `binding=True` (collect every scope's bindings), then with it False (rewrite
-    each name to a placeholder unique per (scope, binding), in first-appearance
-    order). A name resolves to the nearest enclosing scope that binds it (class
-    scopes are invisible to the scopes nested in them); otherwise it is external
-    and kept as written. `global` names, imports, external names, names bound
-    in a class body (attributes) and every parameter of a nested function or
-    lambda (its interface: a caller can supply the name by keyword, `**dict`,
-    functools.partial or a callback registered elsewhere) stay as written. The
-    root function's own parameters are renamed."""
+    def __init__(self, local_names):
+        self.locals = local_names
+        self.map = {}
 
-    def __init__(self, root):
-        self.root = root
-        self.binding = True
-        self.cur = _PyScope("module", None)
-        self.scopes = {}
-        self.walrus = {}
-        self.slots = {}
+    def _name(self, ident):
+        if ident not in self.locals:
+            return ident
+        if ident not in self.map:
+            self.map[ident] = f"v{len(self.map)}"
+        return self.map[ident]
 
-    # -- name resolution -------------------------------------------------
-    def _decl(self, name, scope=None):
-        scope = scope or self.cur
-        if self.binding:
-            # A name bound in a class body is an attribute, read from outside as
-            # `Result.value`; attribute names are kept as written, so it is too.
-            (scope.kept if scope.kind == "class" else scope.bound).add(name)
-            return name
-        return self._ref(name, scope)
-
-    def _ref(self, name, start=None):
-        if self.binding:
-            return name
-        first = start or self.cur
-        s = first
-        while s is not None:
-            if name in s.globals:
-                return name
-            if name in s.nonlocals:
-                pass
-            elif (s is first or s.kind != "class") and (name in s.bound or name in s.kept):
-                if name in s.kept:
-                    return name
-                return self.slots.setdefault((id(s), name), f"v{len(self.slots)}")
-            s = s.parent
-        return name
-
-    def _scope(self, node, kind):
-        if self.binding:
-            self.scopes[id(node)] = _PyScope(kind, self.cur)
-        return self.scopes[id(node)]
-
-    def _within(self, scope, work):
-        outer, self.cur = self.cur, scope
-        try:
-            return work()
-        finally:
-            self.cur = outer
-
-    def _args(self, args, nested):
-        for a in args.posonlyargs + args.args + args.kwonlyargs + [args.vararg, args.kwarg]:
-            if a is not None:
-                a.annotation = None
-                if nested:
-                    if self.binding:
-                        self.cur.kept.add(a.arg)
-                else:
-                    a.arg = self._decl(a.arg)
-
-    def _outer_defaults(self, args):
-        args.defaults = [self.visit(d) for d in args.defaults]
-        args.kw_defaults = [self.visit(d) if d is not None else None for d in args.kw_defaults]
-
-    # -- scope-opening nodes ----------------------------------------------
-    def visit_FunctionDef(self, node):
-        if node is not self.root:
-            node.name = self._decl(node.name)
-        node.returns = None
-        node.decorator_list = [self.visit(d) for d in node.decorator_list]
-        self._outer_defaults(node.args)
-
-        def inside():
-            self._args(node.args, node is not self.root)
-            node.body = [self.visit(s) for s in node.body]
-
-        self._within(self._scope(node, "function"), inside)
-        return node
-
-    visit_AsyncFunctionDef = visit_FunctionDef
-
-    def visit_Lambda(self, node):
-        self._outer_defaults(node.args)
-
-        def inside():
-            self._args(node.args, True)
-            node.body = self.visit(node.body)
-
-        self._within(self._scope(node, "function"), inside)
-        return node
-
-    def visit_ClassDef(self, node):
-        node.name = self._decl(node.name)
-        node.decorator_list = [self.visit(d) for d in node.decorator_list]
-        node.bases = [self.visit(b) for b in node.bases]
-        node.keywords = [self.visit(k) for k in node.keywords]
-        self._within(self._scope(node, "class"),
-                     lambda: setattr(node, "body", [self.visit(s) for s in node.body]))
-        return node
-
-    def _comp(self, node):
-        gens = node.generators
-        gens[0].iter = self.visit(gens[0].iter)
-
-        def inside():
-            for i, g in enumerate(gens):
-                g.target = self.visit(g.target)
-                if i:
-                    g.iter = self.visit(g.iter)
-                g.ifs = [self.visit(c) for c in g.ifs]
-            if isinstance(node, ast.DictComp):
-                node.key = self.visit(node.key)
-                node.value = self.visit(node.value)
-            else:
-                node.elt = self.visit(node.elt)
-
-        self._within(self._scope(node, "comp"), inside)
-        return node
-
-    visit_ListComp = visit_SetComp = visit_DictComp = visit_GeneratorExp = _comp
-
-    # -- binders and references ---------------------------------------------
     def visit_Name(self, node):
-        if isinstance(node.ctx, (ast.Store, ast.Del)):
-            node.id = self._decl(node.id, self.walrus.get(id(node)))
-        else:
-            node.id = self._ref(node.id)
+        node.id = self._name(node.id)
         return node
 
-    def visit_NamedExpr(self, node):
-        scope = self.cur
-        while scope.kind == "comp":
-            scope = scope.parent
-        self.walrus[id(node.target)] = scope
-        node.value = self.visit(node.value)
-        node.target = self.visit(node.target)
+    def visit_arg(self, node):
+        node.arg = self._name(node.arg)
+        node.annotation = None
         return node
 
     def visit_ExceptHandler(self, node):
         if node.name:
-            node.name = self._decl(node.name)
+            node.name = self._name(node.name)
         return self.generic_visit(node)
 
-    def visit_Import(self, node):
-        if self.binding:
-            for a in node.names:
-                if a.name != "*":
-                    self.cur.kept.add((a.asname or a.name).split(".")[0])
-        return node
-
-    visit_ImportFrom = visit_Import
-
-    def visit_Global(self, node):
-        if self.binding:
-            self.cur.globals.update(node.names)
-        return node
-
-    def visit_Nonlocal(self, node):
-        if self.binding:
-            self.cur.nonlocals.update(node.names)
-        else:
-            node.names = [self._ref(n) for n in node.names]
-        return node
-
-    def visit_MatchAs(self, node):
-        if node.name:
-            node.name = self._decl(node.name)
+    def visit_FunctionDef(self, node):
+        node.name = self._name(node.name)
+        node.returns = None
         return self.generic_visit(node)
 
-    visit_MatchStar = visit_MatchAs
+    visit_AsyncFunctionDef = visit_FunctionDef
 
-    def visit_MatchMapping(self, node):
-        if node.rest:
-            node.rest = self._decl(node.rest)
+    def visit_AnnAssign(self, node):
         return self.generic_visit(node)
 
 
 def py_fingerprint(fn) -> str:
-    """Normalised body of a function: its own name, docstrings (at every
-    depth), locations, annotations and lexically scoped, consistently renamed
-    local bindings are ignored; literals, attributes, operators, decorators,
-    imports and names that no enclosing function binds are kept. A name is
-    renamed per scope: the same identifier bound in an outer and in a nested
-    scope is two bindings."""
+    """Normalised body of a function: its own name, docstring, locations,
+    annotations and consistently renamed local bindings are ignored; literals,
+    attributes, operators, decorators, imports and global names are kept."""
     node = _strip_docstring(copy.deepcopy(fn))
+    locals_ = set()
+    declared_global = set()
+    imported = set()
+    for n in ast.walk(node):
+        if isinstance(n, ast.arg):
+            locals_.add(n.arg)
+        elif isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
+            locals_.add(n.id)
+        elif isinstance(n, ast.ExceptHandler) and n.name:
+            locals_.add(n.name)
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n is not node:
+            locals_.add(n.name)
+        elif isinstance(n, (ast.Global, ast.Nonlocal)):
+            declared_global.update(n.names)
+        elif isinstance(n, (ast.Import, ast.ImportFrom)):
+            for a in n.names:
+                imported.add((a.asname or a.name).split(".")[0])
+    locals_ -= declared_global | imported
     node.name = "_"
-    renamer = _Renamer(node)
-    renamer.visit(node)
-    renamer.binding = False
-    renamer.visit(node)
-    return ast.dump(node, annotate_fields=True, include_attributes=False)
+    renamed = _Renamer(locals_).visit(node)
+    return ast.dump(renamed, annotate_fields=True, include_attributes=False)
 
 
 def sh_fingerprint(d: Definition) -> str:
