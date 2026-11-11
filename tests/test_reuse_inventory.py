@@ -1443,6 +1443,85 @@ class TestScanner(unittest.TestCase):
         ext_b = fp("def f(a):\n    return helper_two(a)\n")
         self.assertNotEqual(ext_a, ext_b)
 
+    def test_py_fingerprint_keeps_class_attributes_and_keyword_bound_parameters(self):
+        import ast
+
+        def fp(src):
+            return mc_reuse.py_fingerprint(ast.parse(textwrap.dedent(src)).body[0])
+
+        # class-body names are attributes (`Result.value`): swapped attributes differ
+        f = fp("""
+            def f(value):
+                class Result:
+                    value = 1
+                    other = 2
+                return Result.value
+            """)
+        g = fp("""
+            def g(value):
+                class Result:
+                    other = 1
+                    value = 2
+                return Result.value
+            """)
+        self.assertNotEqual(f, g)
+        # a consistently renamed method-local variable is still the same class
+        m1 = fp("""
+            def f(x):
+                class C:
+                    def m(self, v):
+                        total = v + 1
+                        return total
+                return C
+            """)
+        m2 = fp("""
+            def f(x):
+                class C:
+                    def m(self, v):
+                        acc = v + 1
+                        return acc
+                return C
+            """)
+        self.assertEqual(m1, m2)
+        # a function containing a class, with the function-local variable renamed
+        c1 = fp("""
+            def f(rows):
+                n = len(rows)
+                class C:
+                    size = 3
+                return C, n
+            """)
+        c2 = fp("""
+            def g(items):
+                count = len(items)
+                class C:
+                    size = 3
+                return C, count
+            """)
+        self.assertEqual(c1, c2)
+        # the nested class's own NAME is a local of the function: renamed consistently
+        n1 = fp("def f():\n    class A:\n        pass\n    return A\n")
+        n2 = fp("def f():\n    class B:\n        pass\n    return B\n")
+        self.assertEqual(n1, n2)
+        # a nested function called by keyword keeps the parameter names the caller passes
+        k1 = fp("""
+            def f():
+                def h(a, b):
+                    return a - b
+                return h(a=1, b=2)
+            """)
+        k2 = fp("""
+            def f():
+                def h(b, a):
+                    return a - b
+                return h(a=1, b=2)
+            """)
+        self.assertNotEqual(k1, k2)
+        # ... while a parameter no caller names by keyword is still renamed
+        p1 = fp("def f():\n    def h(a, b):\n        return a - b\n    return h(1, 2)\n")
+        p2 = fp("def f():\n    def h(x, y):\n        return x - y\n    return h(1, 2)\n")
+        self.assertEqual(p1, p2)
+
     def test_py_fingerprint_renames_locals_but_keeps_literals_and_globals(self):
         import ast
         a = ast.parse("def f(x, y=1):\n    '''d'''\n    t = x + y\n    return len(t)\n").body[0]

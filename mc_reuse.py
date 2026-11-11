@@ -1450,8 +1450,9 @@ class _Renamer(ast.NodeTransformer):
     each name to a placeholder unique per (scope, binding), in first-appearance
     order). A name resolves to the nearest enclosing scope that binds it (class
     scopes are invisible to the scopes nested in them); otherwise it is external
-    and kept as written. `global` names, imports and external names stay as
-    written."""
+    and kept as written. `global` names, imports, external names, names bound
+    in a class body (attributes) and the parameters of a nested function that a
+    call passes by keyword stay as written."""
 
     def __init__(self, root):
         self.root = root
@@ -1460,11 +1461,18 @@ class _Renamer(ast.NodeTransformer):
         self.scopes = {}
         self.walrus = {}
         self.slots = {}
+        # Keyword names at any call site: a nested function's parameter named
+        # here may be bound by a caller as written, so it keeps its name.
+        self.kwnames = {k.arg for n in ast.walk(root) if isinstance(n, ast.Call)
+                        for k in n.keywords if k.arg}
 
     # -- name resolution -------------------------------------------------
     def _decl(self, name, scope=None):
+        scope = scope or self.cur
         if self.binding:
-            (scope or self.cur).bound.add(name)
+            # A name bound in a class body is an attribute, read from outside as
+            # `Result.value`; attribute names are kept as written, so it is too.
+            (scope.kept if scope.kind == "class" else scope.bound).add(name)
             return name
         return self._ref(name, scope)
 
@@ -1497,10 +1505,12 @@ class _Renamer(ast.NodeTransformer):
         finally:
             self.cur = outer
 
-    def _args(self, args):
+    def _args(self, args, nested):
         for a in args.posonlyargs + args.args + args.kwonlyargs + [args.vararg, args.kwarg]:
             if a is not None:
                 a.annotation = None
+                if nested and a.arg in self.kwnames and self.binding:
+                    self.cur.kept.add(a.arg)
                 a.arg = self._decl(a.arg)
 
     def _outer_defaults(self, args):
@@ -1516,7 +1526,7 @@ class _Renamer(ast.NodeTransformer):
         self._outer_defaults(node.args)
 
         def inside():
-            self._args(node.args)
+            self._args(node.args, node is not self.root)
             node.body = [self.visit(s) for s in node.body]
 
         self._within(self._scope(node, "function"), inside)
@@ -1528,7 +1538,7 @@ class _Renamer(ast.NodeTransformer):
         self._outer_defaults(node.args)
 
         def inside():
-            self._args(node.args)
+            self._args(node.args, True)
             node.body = self.visit(node.body)
 
         self._within(self._scope(node, "function"), inside)
