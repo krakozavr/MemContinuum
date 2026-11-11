@@ -67,7 +67,7 @@ jobs:
         # a hardcoded path here would diverge from whatever
         # actions/setup-python put on PATH and break that gate silently).
         run: |
-          MEMCONTINUUM_PYTHON="$(command -v python)" PYTHONPATH= python -m unittest discover -s tests
+          MEMCONTINUUM_PYTHON="$(command -v python)" PYTHONPATH= bash tests/check_no_temp_leak.sh python -m unittest discover -s tests
 
   bash32:
     runs-on: ubuntu-latest
@@ -106,7 +106,7 @@ jobs:
         # a clean-cache build on this same ubuntu toolchain shape before
         # this workflow was committed, so it is NOT marked continue-on-error.
         run: |
-          MEMCONTINUUM_PYTHON="$(command -v python)" bash tests/run_bash32.sh
+          MEMCONTINUUM_PYTHON="$(command -v python)" bash tests/check_no_temp_leak.sh bash tests/run_bash32.sh
 
   macos:
     # A real macOS runner, not a Bash-3.2-on-Ubuntu simulation: it exercises
@@ -146,9 +146,9 @@ jobs:
         run: PYTHONPATH= python -c "import memidx; memidx.load_embedding_model()"
       - name: Run unittest suite
         run: |
-          MEMCONTINUUM_PYTHON="$(command -v python)" PYTHONPATH= python -m unittest discover -s tests
+          MEMCONTINUUM_PYTHON="$(command -v python)" PYTHONPATH= bash tests/check_no_temp_leak.sh python -m unittest discover -s tests
       - name: Run bash 3.2 verification harness
         # Real macOS /bin/bash is 3.2.57 already -- MC_BASH32 points
         # run_bash32.sh at it directly instead of building one from source.
         run: |
-          MEMCONTINUUM_PYTHON="$(command -v python)" MC_BASH32=/bin/bash bash tests/run_bash32.sh
+          MEMCONTINUUM_PYTHON="$(command -v python)" MC_BASH32=/bin/bash bash tests/check_no_temp_leak.sh bash tests/run_bash32.sh

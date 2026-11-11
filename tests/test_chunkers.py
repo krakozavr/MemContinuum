@@ -26,6 +26,11 @@ if str(TESTS_DIR) not in sys.path:
 from test_code_index import FIXTURES, code_reindex, ns  # noqa: E402 -- reuse the Swift fixture
 # corpus and code-reindex helper test_code_index.py already builds, rather than duplicating
 # the corpus text here.
+from tests.test_update import isolate_memcontinuum_home  # noqa: E402 -- TOOLS_DIR is on sys.path via test_code_index
+
+
+def setUpModule():
+    isolate_memcontinuum_home()  # code-search appends a hook.log line wherever --db points
 
 GOLDEN_PATH = TESTS_DIR / "goldens" / "swift_chunks_kind_v2.json"
 PRE_EXTRACTION_GOLDEN_PATH = TESTS_DIR / "goldens" / "swift_chunks_pre_extraction.json"

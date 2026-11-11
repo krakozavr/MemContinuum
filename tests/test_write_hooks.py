@@ -37,6 +37,7 @@ TOOLS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(TOOLS_DIR))
 
 import chunkers  # noqa: E402
+from tests.test_update import confine_tmp  # noqa: E402 -- the one temp-dir confinement helper
 import memidx  # noqa: E402
 
 # This machine's venv python is never hardcoded in tracked test code -- set
@@ -420,6 +421,10 @@ class HookTestBase(unittest.TestCase):
             MEMCONTINUUM_CODE_ROOT=str(self.code_root),
             MEMCONTINUUM_PYTHON=VENV_PYTHON,
         )
+        # A hook the watchdog kills mid-run leaves its `mktemp` file behind;
+        # the file lands in a directory this test removes (the hook is not
+        # changed).
+        confine_tmp(self, env)
         env.update(overrides)
         return env
 

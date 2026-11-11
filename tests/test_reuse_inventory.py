@@ -33,6 +33,9 @@ class FixtureTree:
     def base(cls):
         if cls._base is None:
             cls._base = Path(tempfile.mkdtemp(prefix="reuse-base-"))
+            # One shared copy for the whole module: removed when the module's
+            # last test has run (it was never removed before).
+            unittest.addModuleCleanup(shutil.rmtree, cls._base, True)
             shutil.copytree(TOOLS_DIR, cls._base / "t", ignore=_COPY_IGNORE)
         return cls._base / "t"
 

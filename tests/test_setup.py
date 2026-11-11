@@ -16,12 +16,16 @@ import os
 import pty
 import shutil
 import subprocess
-import tempfile
+import sys
 import termios
 import unittest
 from pathlib import Path
 
 TOOLS_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(TOOLS_DIR))
+
+from tests.test_update import tmpdir  # noqa: E402 -- the one cleaned-up temp-dir helper
+
 SETUP_SH = TOOLS_DIR / "memcontinuum-setup.sh"
 DETECT_SH = TOOLS_DIR / "hooks" / "memcontinuum-detect.sh"
 STATE_SH = TOOLS_DIR / "scripts" / "memcontinuum-state.sh"
@@ -109,7 +113,7 @@ def git_repo(path):
 
 class BootstrapCase(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-setup-test-")
+        self.tmp = tmpdir(self, "memcontinuum-setup-test-")
         self.home = str(Path(self.tmp) / "home")
         self.mc_home = str(Path(self.home) / ".memcontinuum")
         self.claude = str(Path(self.home) / ".claude")
