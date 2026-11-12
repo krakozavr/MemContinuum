@@ -3027,7 +3027,8 @@ class TestSessionStartRemind(HookTestBase):
         self.assertIn("store HEAD changed: no", ctx)
         self.assertIn(
             "Any ruling, incident, or rejected alternative from this session that "
-            "the MemContinuum store should hold? Store: " + str(self.store_root) + " — "
+            "the MemContinuum store of project hooktest should hold? This asks about "
+            "hooktest work only. Store: " + str(self.store_root) + " — "
             "a ruling is a new link in topics/<area>/<topic>.md, an incident is a "
             "file in incidents/ (see docs/SCHEMA.md); NOT Claude Code auto-memory. "
             "If none, say so once.",
@@ -3840,7 +3841,8 @@ class TestSessionStartCompactLookback(HookTestBase):
         self.assertIn(
             "Did the conversation since then establish any ruling, incident, "
             "rejected alternative, priority, wording choice, money decision, or "
-            "'not now' that the MemContinuum store should hold? Store: "
+            "'not now' that the MemContinuum store of project hooktest should hold? "
+            "This asks about hooktest work only. Store: "
             + str(self.store_root) + " — a ruling is a new link in "
             "topics/<area>/<topic>.md, an incident is a file in incidents/ "
             "(see docs/SCHEMA.md); NOT Claude Code auto-memory. If none, say so once.",
@@ -5222,7 +5224,8 @@ class TestUserPromptRemind(HookTestBase):
         self.assertIn("src/unmapped.py", ctx)
         self.assertIn(
             "Any ruling, incident, or rejected alternative from this session that "
-            "the MemContinuum store should hold? Store: " + str(self.store_root) + " — "
+            "the MemContinuum store of project hooktest should hold? This asks about "
+            "hooktest work only. Store: " + str(self.store_root) + " — "
             "a ruling is a new link in topics/<area>/<topic>.md, an incident is a "
             "file in incidents/ (see docs/SCHEMA.md); NOT Claude Code auto-memory. "
             "If none, say so once.",
@@ -5373,11 +5376,12 @@ class TestUserPromptRemind(HookTestBase):
 #     (docs/DESIGN.md 2026-08-30)
 # ---------------------------------------------------------------------------
 
-def lookback_question(store_root):
+def lookback_question(store_root, project="hooktest"):
     return (
         "Did the conversation since then establish any ruling, incident, "
         "rejected alternative, priority, wording choice, money decision, or "
-        "'not now' that the MemContinuum store should hold? Store: "
+        "'not now' that the MemContinuum store of project " + project + " should hold? "
+        "This asks about " + project + " work only. Store: "
         + str(store_root) + " — a ruling is a new link in "
         "topics/<area>/<topic>.md, an incident is a file in incidents/ "
         "(see docs/SCHEMA.md); NOT Claude Code auto-memory. If none, say so once."
@@ -11482,6 +11486,888 @@ class TestCwdTokenEncodersAgree(unittest.TestCase):
     def test_a_control_character_is_encoded_not_dropped(self):
         self.assertEqual(self._bash("/a\x01b\nc"), "cwd=/a%01b%0Ac")
         self.assertEqual(memidx._log_path_token("/a\x01b\nc"), "/a%01b%0Ac")
+
+
+class TestNudgeNamesItsProject(HookTestBase):
+    """A write-side nudge names the project it speaks for, and a prompt or
+    session-start hook running with the session folder inside a nearer
+    directory wired to a DIFFERENT project logs one `foreign-cwd` line (and
+    changes nothing else)."""
+
+    OTHER = "otherproj"
+
+    def setUp(self):
+        super().setUp()
+        self.nest = Path(os.path.realpath(self.td)) / "nest"
+        self.nest.mkdir()
+
+    def wire(self, directory, *projects, name="settings.local.json"):
+        """Write <directory>/.claude/<name> carrying one rendered-looking hook
+        command per project (the shape the readers recognise)."""
+        directory = Path(directory)
+        (directory / ".claude").mkdir(parents=True, exist_ok=True)
+        entries = []
+        for project in projects:
+            cmd = (
+                f"MEMCONTINUUM_ROOT=/x/{project}-store MEMCONTINUUM_PROJECT={project} "
+                f"bash /engine/hooks/userprompt-remind.sh"
+            )
+            entries.append({"hooks": [{"type": "command", "command": cmd}]})
+        (directory / ".claude" / name).write_text(
+            json.dumps({"hooks": {"UserPromptSubmit": entries}}, indent=2)
+        )
+
+    def unwired_claude(self, directory, content="{}"):
+        Path(directory, ".claude").mkdir(parents=True, exist_ok=True)
+        Path(directory, ".claude", "settings.json").write_text(content)
+
+    def env_for(self, project):
+        return self.base_env(MEMCONTINUUM_PROJECT=project)
+
+    @contextlib.contextmanager
+    def as_project(self, project):
+        """seed_ledger/patch_state address the state file by self.project."""
+        saved, self.project = self.project, project
+        try:
+            yield
+        finally:
+            self.project = saved
+
+    def payload(self, kind, session_id, cwd="<omit>", **extra):
+        d = {"session_id": session_id}
+        if kind == "prompt":
+            d.update(hook_event_name="UserPromptSubmit", prompt="this text must never be read by the hook")
+        else:
+            d.update(hook_event_name="SessionStart", source=extra.pop("source", "compact"))
+        if cwd != "<omit>":
+            d["cwd"] = cwd
+        d.update(extra)
+        return json.dumps(d)
+
+    def log_lines(self, needle):
+        path = self.home / "hook.log"
+        if not path.exists():
+            return []
+        return [l for l in path.read_text().splitlines() if needle in l]
+
+    def foreign_lines(self, hook=None):
+        lines = self.log_lines("outcome=foreign-cwd")
+        if hook:
+            lines = [l for l in lines if f" {hook} outcome=" in l]
+        return lines
+
+    def prompt_lookback(self, project, session_id, cwd):
+        """Real prompt hook, five thin turns; returns (turn-5 stdout, outputs).
+        The fifth turn is the first look-back."""
+        env = self.env_for(project)
+        run_script(SESSIONSTART_HOOK, self.payload("start", session_id, cwd, source="startup"), env)
+        with self.as_project(project):
+            self.seed_ledger(session_id, [])
+            self.patch_state(session_id, project=project)
+        outs = []
+        for _ in range(5):
+            proc, _ = run_script(USERPROMPT_HOOK, self.payload("prompt", session_id, cwd), env)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            outs.append(proc.stdout)
+        return outs[-1], outs
+
+    def compact_lookback(self, project, session_id, cwd):
+        env = self.env_for(project)
+        with self.as_project(project):
+            self.seed_ledger(session_id, [])
+            self.patch_state(session_id, project=project, pending={
+                "unmapped": [], "coverage_status": "ok", "code_head_changed": False,
+                "store_head_changed": False, "computed_at": time.time(),
+                "user_turn_count": 5, "last_growth_turn": 2,
+            })
+        proc, _ = run_script(SESSIONSTART_HOOK, self.payload("start", session_id, cwd), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout
+
+    def ctx_of(self, stdout):
+        return json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
+
+    def nested(self):
+        """outer dir wired to hooktest, inner dir wired to OTHER; returns the
+        session folder inside the inner one."""
+        self.wire(self.nest, self.project)
+        inner = self.nest / "inner"
+        self.wire(inner, self.OTHER)
+        cwd = inner / "sub"
+        cwd.mkdir(parents=True)
+        return str(cwd)
+
+    # ---- Part 1: the text names its project ---------------------------------
+
+    def test_coverage_text_names_project(self):
+        out = self.ctx_of(self.compact_coverage(self.project, "s-cov-name", str(self.code_root)))
+        self.assertIn(
+            f"the MemContinuum store of project {self.project} should hold? "
+            f"This asks about {self.project} work only. Store: {self.store_root}",
+            out,
+        )
+
+    def compact_coverage(self, project, session_id, cwd):
+        env = self.env_for(project)
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+        self.patch_state(session_id, project=project, pending={
+            "unmapped": ["src/unmapped.py"], "mapped_topic_count": 0,
+            "mapped_concept_only_count": 0, "coverage_status": "ok",
+            "code_head_changed": True, "store_head_changed": False,
+            "computed_at": time.time(),
+        })
+        proc, _ = run_script(SESSIONSTART_HOOK, self.payload("start", session_id, cwd), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout
+
+    # ---- Part 2 / test 1: nested different-project wiring --------------------
+
+    def test_nested_outer_project_prompt_and_compact(self):
+        cwd = self.nested()
+        last, outs = self.prompt_lookback(self.project, "s-nest-a-prompt", cwd)
+        ctx = self.ctx_of(last)
+        self.assertIn(lookback_question(self.store_root), ctx)
+        self.assertIn(f"This asks about {self.project} work only.", ctx)
+        self.assertEqual(len(self.foreign_lines("userprompt")), 5)  # one per invocation
+        for line in self.foreign_lines("userprompt"):
+            self.assertIn(f"nearest={self.OTHER}", line)
+            self.assertIn("session=s-nest-a-prompt", line)
+            self.assertIn(f"project={self.project}", line)
+        # the session-start line of the same session (startup source) is one too
+        self.assertEqual(len(self.foreign_lines("sessionstart")), 1)
+
+        out = self.ctx_of(self.compact_lookback(self.project, "s-nest-a-compact", cwd))
+        self.assertIn(lookback_question(self.store_root), out)
+        self.assertEqual(len(self.foreign_lines("sessionstart")), 2)
+        self.assertIn("source=compact", self.foreign_lines("sessionstart")[-1])
+        self.assertIn(f"nearest={self.OTHER}", self.foreign_lines("sessionstart")[-1])
+
+    def test_nested_inner_project_names_itself_and_logs_nothing(self):
+        cwd = self.nested()
+        last, _ = self.prompt_lookback(self.OTHER, "s-nest-b-prompt", cwd)
+        ctx = self.ctx_of(last)
+        self.assertIn(lookback_question(self.store_root, self.OTHER), ctx)
+        self.assertIn(f"This asks about {self.OTHER} work only.", ctx)
+        out = self.ctx_of(self.compact_lookback(self.OTHER, "s-nest-b-compact", cwd))
+        self.assertIn(lookback_question(self.store_root, self.OTHER), out)
+        self.assertEqual(self.foreign_lines(), [])
+
+    # ---- test 2: ordinary cases ---------------------------------------------
+
+    def test_own_wired_dir_logs_nothing(self):
+        self.wire(self.nest, self.project)
+        cwd = self.nest / "a" / "b"
+        cwd.mkdir(parents=True)
+        self.prompt_lookback(self.project, "s-own-prompt", str(cwd))
+        self.compact_lookback(self.project, "s-own-compact", str(cwd))
+        self.assertEqual(self.foreign_lines(), [])
+
+    def test_same_project_wired_at_two_directories_logs_nothing(self):
+        self.wire(self.nest, self.project)
+        self.wire(self.nest / "inner", self.project, name="settings.json")
+        cwd = self.nest / "inner" / "sub"
+        cwd.mkdir(parents=True)
+        self.prompt_lookback(self.project, "s-two-prompt", str(cwd))
+        self.compact_lookback(self.project, "s-two-compact", str(cwd))
+        self.assertEqual(self.foreign_lines(), [])
+
+    def test_own_project_also_wired_in_the_nearest_directory_logs_nothing(self):
+        inner = self.nest / "inner"
+        self.wire(inner, self.OTHER, self.project)
+        (inner / "sub").mkdir()
+        self.compact_lookback(self.project, "s-both-compact", str(inner / "sub"))
+        self.assertEqual(self.foreign_lines(), [])
+
+    # ---- test 3: fail open ----------------------------------------------------
+
+    def _baseline(self):
+        self.wire(self.nest, self.project)
+        own = self.nest / "own"
+        own.mkdir()
+        last, _ = self.prompt_lookback(self.project, "s-base-prompt", str(own))
+        self.assertEqual(self.foreign_lines(), [])
+        return last
+
+    def test_fail_open_cwd_shapes_leave_output_unchanged_and_no_line(self):
+        # a different project wired nearer than the hook's own would log if the
+        # cwd were usable; none of these shapes is.
+        cwd_inner = self.nested()
+        baseline = self._baseline()
+        for label, cwd in (
+            ("missing", "<omit>"),
+            ("empty", ""),
+            ("nonexistent", str(self.nest / "inner" / "no-such-dir")),
+            ("relative", "inner/sub"),
+        ):
+            with self.subTest(cwd=label):
+                last, _ = self.prompt_lookback(self.project, f"s-fo-{label}", cwd)
+                self.assertEqual(last, baseline)
+                self.assertEqual(self.foreign_lines(), [])
+                out = self.compact_lookback(self.project, f"s-fo-c-{label}", cwd)
+                self.assertIn(lookback_question(self.store_root), self.ctx_of(out))
+                self.assertEqual(self.foreign_lines(), [])
+        self.assertTrue(os.path.isdir(cwd_inner))
+
+    def test_the_hook_own_pwd_is_never_substituted(self):
+        self.nested()
+        env = self.env_for(self.project)
+        inner_sub = self.nest / "inner" / "sub"
+        proc, _ = run_script(
+            SESSIONSTART_HOOK, self.payload("start", "s-pwd", "<omit>", source="startup"), env, cwd=inner_sub
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.foreign_lines(), [])
+
+    def test_unwired_claude_directory_is_skipped_and_the_walk_continues(self):
+        self.wire(self.nest, self.project)
+        mid = self.nest / "mid"
+        self.unwired_claude(mid)
+        cwd = mid / "sub"
+        cwd.mkdir()
+        self.compact_lookback(self.project, "s-unwired-own", str(cwd))
+        self.assertEqual(self.foreign_lines(), [])
+        # the same shape, wired one level up to another project: found and logged
+        other = Path(self.td) / "nest2"
+        self.wire(other, self.OTHER)
+        self.unwired_claude(other / "mid")
+        (other / "mid" / "sub").mkdir()
+        self.compact_lookback(self.project, "s-unwired-foreign", str(other / "mid" / "sub"))
+        lines = self.foreign_lines("sessionstart")
+        self.assertEqual(len(lines), 1)
+        self.assertIn(f"nearest={self.OTHER}", lines[0])
+
+    def test_unreadable_settings_file_fails_open(self):
+        if os.geteuid() == 0:
+            self.skipTest("root reads every file")
+        self.wire(self.nest, self.project)
+        inner = self.nest / "inner"
+        self.wire(inner, self.OTHER)
+        (inner / "sub").mkdir()
+        settings = inner / ".claude" / "settings.local.json"
+        settings.chmod(0)
+        self.addCleanup(settings.chmod, 0o644)
+        out = self.compact_lookback(self.project, "s-unreadable", str(inner / "sub"))
+        self.assertIn(lookback_question(self.store_root), self.ctx_of(out))
+        self.assertEqual(self.foreign_lines(), [])
+
+    def test_subagent_prompt_stays_silent_and_unlogged(self):
+        cwd = self.nested()
+        env = self.env_for(self.project)
+        run_script(SESSIONSTART_HOOK, self.payload("start", "s-sub", cwd, source="startup"), env)
+        before = len(self.foreign_lines("userprompt"))
+        proc, _ = run_script(
+            USERPROMPT_HOOK,
+            self.payload("prompt", "s-sub", cwd, agent_id="a1", agent_type="Explore"),
+            env,
+        )
+        self.assertEqual(proc.stdout.strip(), "")
+        self.assertEqual(len(self.foreign_lines("userprompt")), before)
+
+    # ---- test 4: spaces and ! in the path --------------------------------------
+
+    def test_path_with_spaces_and_bang(self):
+        root = Path(self.td) / "!_WORK_! x" / "MMD y"
+        self.wire(root, self.project)
+        inner = root / "!_Videos z"
+        self.wire(inner, self.OTHER)
+        cwd = inner / "Videos" / "Install ation"
+        cwd.mkdir(parents=True)
+        out = self.compact_lookback(self.project, "s-bang", str(cwd))
+        self.assertIn(lookback_question(self.store_root), self.ctx_of(out))
+        lines = self.foreign_lines("sessionstart")
+        self.assertEqual(len(lines), 1)
+        self.assertIn(f"nearest={self.OTHER}", lines[0])
+        self.assertIn("!_Videos%20z", lines[0])
+
+    # ---- Part 3: the write-side question is withheld, only when both facts hold --
+
+    def start_nearest(self, project, session_id, cwd):
+        """The nearest project's own session-start ran for this session id."""
+        proc, _ = run_script(
+            SESSIONSTART_HOOK, self.payload("start", session_id, cwd, source="startup"),
+            self.env_for(project),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(self.nearest_state(project, session_id).exists())
+
+    def nearest_state(self, project, session_id):
+        return self.home / "sessions" / project / f"{session_id}.json"
+
+    def read_state(self, session_id):
+        return json.loads(self.state_file(session_id).read_text())
+
+    CLOCKS = ("last_inject_turn", "last_inject_time", "last_inject_ts", "lookback_count",
+              "last_injected_pairs", "delivery_open")
+
+    def test_quiet_when_nearest_session_start_ran_prompt(self):
+        cwd = self.nested()
+        self.start_nearest(self.OTHER, "s-quiet", cwd)
+        last, outs = self.prompt_lookback(self.project, "s-quiet", cwd)
+        self.assertEqual(outs, [""] * 5)
+        quiet = self.foreign_lines("userprompt")
+        self.assertEqual(len(quiet), 5)
+        for line in quiet:
+            self.assertIn("outcome=foreign-cwd-quiet", line)
+            self.assertIn(f"nearest={self.OTHER}", line)
+        self.assertEqual([l for l in self.log_lines("outcome=foreign-cwd ") if " userprompt " in l], [])
+        quiet_state = self.read_state("s-quiet")
+        self.assertEqual(quiet_state["user_turn_count"], 5)  # turns still counted
+        self.assertEqual(quiet_state["lookback_count"], 0)
+        self.assertEqual(quiet_state["last_inject_turn"], -999)  # no clock claims a delivery
+        self.assertFalse(any("injected" in l for l in self.log_lines("userprompt outcome=")))
+        # control: same session shape with the nearest project NOT initialised
+        last2, _ = self.prompt_lookback(self.project, "s-noisy", cwd)
+        control_state = self.read_state("s-noisy")
+        self.assertIn(lookback_question(self.store_root), self.ctx_of(last2))
+        self.assertEqual(control_state["lookback_count"], 1)
+        for key in set(quiet_state) - set(self.CLOCKS) - {"session_id", "created_at", "start_store_sha",
+                                                       "start_code_sha", "start_code_shas", "last_seen_heads",
+                                                       "last_growth_ts", "payload_keys_logged"}:
+            self.assertEqual(quiet_state[key], control_state.get(key), key)
+
+    def test_quiet_when_nearest_session_start_ran_compact_coverage_and_lookback(self):
+        cwd = self.nested()
+        self.start_nearest(self.OTHER, "s-quiet-c", cwd)
+        out = self.compact_coverage(self.project, "s-quiet-c", cwd)
+        self.assertEqual(out.strip(), "")
+        self.start_nearest(self.OTHER, "s-quiet-l", cwd)
+        out = self.compact_lookback(self.project, "s-quiet-l", cwd)
+        self.assertEqual(out.strip(), "")
+        lines = self.foreign_lines("sessionstart")
+        self.assertEqual(len(lines), 2)
+        for line in lines:
+            self.assertIn("outcome=foreign-cwd-quiet", line)
+        for sid in ("s-quiet-c", "s-quiet-l"):
+            st = self.read_state(sid)
+            self.assertEqual(st["pending"], {})  # consumed as for any no-evidence compact
+            self.assertEqual(st["last_inject_turn"], -999)
+            self.assertEqual(st.get("lookback_count", 0), 0)
+        self.assertTrue(any("compact-no-evidence" in l and "withheld=foreign-cwd" in l
+                            for l in self.log_lines("sessionstart outcome=")))
+
+    def test_ledger_made_state_is_not_evidence_of_presence(self):
+        cwd = self.nested()
+        other_state = self.nearest_state(self.OTHER, "s-ledger-only")
+        other_state.parent.mkdir(parents=True, exist_ok=True)
+        other_state.write_text(json.dumps({"session_id": "s-ledger-only", "ledger": [],
+                                           "user_turn_count": 0, "lookback_count": 0}))
+        out = self.compact_lookback(self.project, "s-ledger-only", cwd)
+        self.assertIn(lookback_question(self.store_root), self.ctx_of(out))
+        lines = self.foreign_lines("sessionstart")
+        self.assertEqual(len(lines), 1)
+        self.assertIn("outcome=foreign-cwd ", lines[0])
+
+    def test_nearest_projects_own_hooks_are_never_quiet(self):
+        cwd = self.nested()
+        self.start_nearest(self.OTHER, "s-own-b", cwd)
+        last, outs = self.prompt_lookback(self.OTHER, "s-own-b", cwd)
+        self.assertIn(lookback_question(self.store_root, self.OTHER), self.ctx_of(last))
+        self.assertEqual(self.foreign_lines(), [])
+
+    def test_unknown_ownership_is_never_foreign_or_quiet(self):
+        def hook(project, extra=""):
+            return (f"MEMCONTINUUM_ROOT=/x/{project}-store MEMCONTINUUM_PROJECT={project}{extra} "
+                    f"bash /engine/hooks/userprompt-remind.sh")
+
+        def cmdline(c):
+            return '{"type": "command", "command": %s}' % json.dumps(c)
+
+        cases = {
+            "two-commands-one-line": "{\"hooks\": {\"A\": [%s, %s]}}" % (
+                cmdline(hook(self.OTHER)), cmdline(hook("third"))),
+            "double-quoted-assignment": json.dumps({"hooks": {"A": [{"hooks": [{"type": "command",
+                "command": 'MEMCONTINUUM_PROJECT="%s" bash /engine/hooks/userprompt-remind.sh' % self.OTHER}]}]}}, indent=2),
+            "two-assignments-in-one-command": json.dumps({"hooks": {"A": [{"hooks": [{"type": "command",
+                "command": hook(self.OTHER) + " MEMCONTINUUM_PROJECT=third"}]}]}}, indent=2),
+            "malformed": '{"hooks": [ "command": %s' % json.dumps(hook(self.OTHER)).replace("}", ""),
+        }
+        for label, text in cases.items():
+            with self.subTest(case=label):
+                root = Path(self.td) / f"unk-{label}"
+                (root / ".claude").mkdir(parents=True)
+                (root / ".claude" / "settings.local.json").write_text(text)
+                (root / "sub").mkdir()
+                sid = f"s-unk-{label}"
+                self.start_nearest(self.OTHER, sid, str(root / "sub"))
+                out = self.compact_lookback(self.project, sid, str(root / "sub"))
+                self.assertIn(lookback_question(self.store_root), self.ctx_of(out))
+        self.assertEqual([l for l in self.foreign_lines() if f"project={self.project}" in l], [])
+
+    def test_two_settings_files_naming_different_owners_is_unknown(self):
+        root = Path(self.td) / "unk-two-files"
+        self.wire(root, self.OTHER)
+        self.wire(root, "third", name="settings.json")
+        (root / "sub").mkdir()
+        self.start_nearest(self.OTHER, "s-two-owners", str(root / "sub"))
+        out = self.compact_lookback(self.project, "s-two-owners", str(root / "sub"))
+        self.assertIn(lookback_question(self.store_root), self.ctx_of(out))
+        self.assertEqual(self.foreign_lines(), [])
+
+    def test_co_located_projects_are_never_quiet_even_when_the_other_ran(self):
+        inner = self.nest / "inner"
+        self.wire(inner, self.OTHER, self.project)
+        (inner / "sub").mkdir()
+        self.start_nearest(self.OTHER, "s-coloc", str(inner / "sub"))
+        out = self.compact_lookback(self.project, "s-coloc", str(inner / "sub"))
+        self.assertIn(lookback_question(self.store_root), self.ctx_of(out))
+        self.assertEqual(self.foreign_lines(), [])
+
+    def test_cwd_is_resolved_physically(self):
+        cwd = self.nested()
+        link = Path(self.td) / "link-to-sub"
+        link.symlink_to(cwd)
+        self.start_nearest(self.OTHER, "s-sym", cwd)
+        out = self.compact_lookback(self.project, "s-sym", str(link))
+        self.assertEqual(out.strip(), "")
+        self.assertIn("foreign-cwd-quiet", self.foreign_lines("sessionstart")[0])
+
+    # ---- test 5: temp hygiene --------------------------------------------------
+
+    def test_one_unconditional_exit_trap_precedes_every_temp_file(self):
+        text = USERPROMPT_HOOK.read_text().splitlines()
+        code = [(i, l) for i, l in enumerate(text) if not l.lstrip().startswith("#")]
+        traps = [i for i, l in code if re.match(r"\s*trap\b.*\bEXIT\b", l)]
+        allocs = [i for i, l in code if "mktemp" in l]
+        self.assertEqual(len(traps), 1, traps)
+        self.assertTrue(allocs and all(traps[0] < a for a in allocs), (traps, allocs))
+        trap_line = text[traps[0]]
+        for var in ("DECIDE_TMP", "UC_TMP", "NUDGE_TMP", "PQ_STARTED_MARKER"):
+            self.assertIn(var, trap_line)
+
+    def test_a_signalled_hook_removes_its_decision_file(self):
+        """Injected failure right after the first allocation, prompt-derived
+        query channel off and on: a `date` shim signals the hook's process
+        group the moment the decision file exists; the exit trap removes it."""
+        if sys.platform != "linux":
+            self.skipTest("uses /proc-free ps but kills a process group; Linux only")
+        for pq in ("0", "1"):
+            with self.subTest(prompt_query=pq):
+                env = self.env_for(self.project)
+                env["MEMCONTINUUM_PROMPT_QUERY"] = pq
+                tmp = env["TMPDIR"]
+                fired = Path(self.td) / f"shim-fired-{pq}"
+                shim_dir = tmpdir(self, "memcontinuum-date-shim-")
+                shim = Path(shim_dir) / "date"
+                shim.write_text(
+                    "#!/bin/sh\n"
+                    f'if [ "$1" = "+%s" ] && ls "{tmp}"/mc-decide.* >/dev/null 2>&1 '
+                    f'&& [ ! -e "{fired}" ] '
+                    f'&& [ "$(ps -o pgid= -p $$ | tr -d " ")" != "{os.getpgrp()}" ]; then\n'
+                    f'    : >"{fired}"\n'
+                    '    kill -s TERM -- "-$(ps -o pgid= -p $$ | tr -d " ")"\n'
+                    "    sleep 1\n"
+                    "fi\n"
+                    f'exec "{shutil.which("date")}" "$@"\n'
+                )
+                shim.chmod(0o755)
+                env["PATH"] = shim_dir + os.pathsep + env["PATH"]
+                sid = f"s-term-{pq}"
+                run_script(SESSIONSTART_HOOK, self.payload("start", sid, str(self.code_root), source="startup"), env)
+                self.seed_ledger(sid, [])
+                run_script(
+                    USERPROMPT_HOOK,
+                    self.payload("prompt", sid, str(self.code_root),
+                                 prompt="rename the widget factory module before release"),
+                    env,
+                )
+                self.assertTrue(fired.exists(), "the injected failure never fired")
+                self.assertEqual(
+                    sorted(n for n in os.listdir(tmp) if n.startswith(("mc-decide.", "mc-uc.", "mc-nudge."))), [])
+
+    def test_prompt_hook_leaves_no_temp_file_and_uses_explicit_templates(self):
+        env = self.env_for(self.project)
+        tmp = env["TMPDIR"]
+        calls = Path(self.td) / "mktemp-calls"
+        shim_dir = tmpdir(self, "memcontinuum-mktemp-log-")
+        real = shutil.which("mktemp")
+        shim = Path(shim_dir) / "mktemp"
+        shim.write_text(
+            "#!/bin/sh\n"
+            f'printf \'%s\\n\' "$*" >>"{calls}"\n'
+            f'exec "{real}" "$@"\n'
+        )
+        shim.chmod(0o755)
+        env["PATH"] = shim_dir + os.pathsep + env["PATH"]
+
+        def leftovers():
+            return sorted(
+                n for n in os.listdir(tmp)
+                if n.startswith(("mc-decide.", "mc-uc.", "mc-nudge."))
+            )
+
+        sid = "s-temp"
+        run_script(SESSIONSTART_HOOK, self.payload("start", sid, str(self.code_root), source="startup"), env)
+        self.seed_ledger(sid, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+        for turn in range(1, 8):  # silent turns, a coverage turn, look-back turns
+            proc, _ = run_script(USERPROMPT_HOOK, self.payload("prompt", sid, str(self.code_root)), env)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(leftovers(), [], f"turn {turn}")
+        # early exits after the temp file exists: a subagent turn exits before it,
+        # a duplicate-delivery turn after it
+        run_script(
+            USERPROMPT_HOOK,
+            self.payload("prompt", sid, str(self.code_root), agent_id="a1", agent_type="Explore"),
+            env,
+        )
+        self.assertEqual(leftovers(), [])
+        recorded = calls.read_text().splitlines()
+        self.assertTrue(any(l == f"{tmp}/mc-decide.XXXXXX" for l in recorded), recorded)
+        for line in recorded:
+            if "mc-" in line:
+                self.assertTrue(line.startswith(tmp + "/mc-"), line)
+
+    # ---- the folder walk is paid once per session and cwd ----------------------
+
+    def fcwd_file(self, session_id, project=None):
+        return self.home / "sessions" / (project or self.project) / f"{session_id}.json.fcwd"
+
+    def start_session(self, project, session_id, cwd):
+        """Real session-start (startup) plus the seeded thin ledger a prompt needs."""
+        env = self.env_for(project)
+        proc, _ = run_script(SESSIONSTART_HOOK, self.payload("start", session_id, cwd, source="startup"), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with self.as_project(project):
+            self.seed_ledger(session_id, [])
+            self.patch_state(session_id, project=project)
+
+    def prompt_once(self, project, session_id, cwd):
+        proc, _ = run_script(USERPROMPT_HOOK, self.payload("prompt", session_id, cwd), self.env_for(project))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout
+
+    def test_a_foreign_result_is_never_cached_so_deleted_settings_are_unknown(self):
+        cwd = self.nested()
+        sid = "s-fc-hit"
+        self.start_session(self.project, sid, cwd)
+        self.prompt_once(self.project, sid, cwd)
+        # a foreign result leaves no sidecar: every invocation re-establishes it
+        self.assertFalse(self.fcwd_file(sid).exists())
+        self.assertEqual(len(self.foreign_lines("userprompt")), 1)
+        self.prompt_once(self.project, sid, cwd)
+        lines = self.foreign_lines("userprompt")
+        self.assertEqual(len(lines), 2)
+        # the lines differ only in their leading wall-clock timestamp
+        expected = (f"userprompt outcome=foreign-cwd nearest={self.OTHER} "
+                    f"session={sid} project={self.project}")
+        self.assertEqual([l.split(" ", 1)[1] for l in lines], [expected, expected])
+        # the settings the walk read are gone: ownership is unknown, no line, the hook speaks
+        for settings in (self.nest / "inner" / ".claude").iterdir():
+            settings.unlink()
+        self.prompt_once(self.project, sid, cwd)
+        self.assertEqual(len(self.foreign_lines("userprompt")), 2)
+        run_script(SESSIONSTART_HOOK, self.payload("start", sid, cwd, source="compact"), self.env_for(self.project))
+        self.assertEqual(len(self.foreign_lines("sessionstart")), 1)  # only the startup one
+
+    def test_not_foreign_is_cached_and_a_late_wiring_waits_for_the_next_session(self):
+        self.wire(self.nest, self.project)
+        cwd = self.nest / "sub"
+        cwd.mkdir()
+        sid = "s-fc-none"
+        self.start_session(self.project, sid, str(cwd))
+        self.prompt_once(self.project, sid, str(cwd))
+        self.assertEqual(self.fcwd_file(sid).read_text(), f"{cwd}\t!none\n")
+        self.wire(cwd, self.OTHER)  # wired after the walk
+        self.prompt_once(self.project, sid, str(cwd))
+        self.assertEqual(self.foreign_lines(), [])
+        self.start_session(self.project, "s-fc-none-next", str(cwd))
+        self.prompt_once(self.project, "s-fc-none-next", str(cwd))
+        self.assertEqual(len(self.foreign_lines("userprompt")), 1)
+
+    def test_a_changed_cwd_walks_again(self):
+        cwd = self.nested()
+        sid = "s-fc-cwd"
+        self.start_session(self.project, sid, cwd)
+        self.prompt_once(self.project, sid, cwd)
+        self.assertEqual(len(self.foreign_lines("userprompt")), 1)
+        elsewhere = self.nest / "elsewhere"
+        elsewhere.mkdir()
+        self.prompt_once(self.project, sid, str(elsewhere))
+        self.assertEqual(len(self.foreign_lines("userprompt")), 1)
+        self.assertEqual(self.fcwd_file(sid).read_text(), f"{elsewhere}\t!none\n")
+        self.prompt_once(self.project, sid, cwd)
+        self.assertEqual(len(self.foreign_lines("userprompt")), 2)
+        # a foreign result is never written: the sidecar still holds the other cwd's "!none"
+        self.assertEqual(self.fcwd_file(sid).read_text(), f"{elsewhere}\t!none\n")
+
+    def test_a_corrupt_cache_file_is_a_miss(self):
+        cwd = self.nested()
+        garbage = ["", "\n", "no tab here\n", f"{cwd}\t\n", f"{cwd}\tbad/name\n", f"{cwd}\tbad name\n",
+                   "\t\t\t\n", "\x00\x01\xff\n", f"/other\t{self.OTHER}\n", f"{cwd}"]
+        for n, content in enumerate(garbage):
+            sid = f"s-fc-bad{n}"
+            self.start_session(self.project, sid, cwd)
+            self.fcwd_file(sid).write_text(content)
+            self.prompt_once(self.project, sid, cwd)
+            self.assertEqual(len(self.foreign_lines("userprompt")), n + 1, repr(content))
+            # a miss is not rewritten as a foreign result
+            self.assertEqual(self.fcwd_file(sid).read_text(), content, repr(content))
+        if os.geteuid() != 0:
+            sid = "s-fc-unreadable"
+            self.start_session(self.project, sid, cwd)
+            self.fcwd_file(sid).write_text("x")
+            self.fcwd_file(sid).chmod(0)
+            self.addCleanup(self.fcwd_file(sid).chmod, 0o644)
+            out = self.prompt_once(self.project, sid, cwd)
+            self.assertEqual(len(self.foreign_lines("userprompt")), len(garbage) + 1)
+            self.assertEqual(out, "")
+        # a directory where the cache file belongs is a miss too, and the write failure is ignored
+        sid = "s-fc-dir"
+        self.start_session(self.project, sid, cwd)
+        self.fcwd_file(sid).unlink(missing_ok=True)
+        self.fcwd_file(sid).mkdir()
+        self.prompt_once(self.project, sid, cwd)
+        self.assertEqual(len(self.foreign_lines("userprompt")), len(garbage) + (2 if os.geteuid() != 0 else 1))
+
+    def test_quiet_turns_on_later_when_the_nearest_project_starts_second(self):
+        cwd = self.nested()
+        sid = "s-fc-late"
+        self.start_session(self.project, sid, cwd)
+        out = self.prompt_once(self.project, sid, cwd)
+        self.assertEqual(len(self.foreign_lines("userprompt")), 1)
+        self.assertIn("outcome=foreign-cwd ", self.foreign_lines("userprompt")[0])
+        self.start_nearest(self.OTHER, sid, cwd)  # the other project's session-start runs second
+        out = self.prompt_once(self.project, sid, cwd)
+        self.assertEqual(out, "")
+        lines = self.foreign_lines("userprompt")
+        self.assertEqual(len(lines), 2)
+        self.assertIn("outcome=foreign-cwd-quiet", lines[1])
+        self.assertIn(f"nearest={self.OTHER}", lines[1])
+        # the quiet answer is re-established every time: with the settings gone it is unknown
+        for settings in (self.nest / "inner" / ".claude").iterdir():
+            settings.unlink()
+        self.prompt_once(self.project, sid, cwd)
+        self.assertEqual(len(self.foreign_lines("userprompt")), 2)
+
+    def test_the_cache_file_is_beside_the_state_file_and_never_in_the_temp_dir(self):
+        cwd = self.nested()
+        env = self.env_for(self.project)
+        tmp = env["TMPDIR"]
+        before = sorted(os.listdir(tmp))
+        sid = "s-fc-tmp"
+        self.start_session(self.project, sid, cwd)
+        for _ in range(3):
+            self.prompt_once(self.project, sid, cwd)
+        self.assertEqual(sorted(os.listdir(tmp)), before)
+        self.assertEqual(self.fcwd_file(sid).parent, self.state_file(sid).parent)
+        self.assertEqual(sorted(n for n in os.listdir(self.state_file(sid).parent) if ".tmp." in n), [])
+
+    def test_session_start_prunes_stale_cache_files_with_their_state(self):
+        stale = self.fcwd_file("s-fc-stale")
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stray = stale.parent / "s-fc-stale.json.fcwd.tmp.123"
+        fresh = self.fcwd_file("s-fc-fresh")
+        for f in (stale, stray, fresh):
+            f.write_text("x\ty\n")
+        old = time.time() - (25 * 3600)
+        for f in (stale, stray):
+            os.utime(f, (old, old))
+        self.start_session(self.project, "s-fc-prune", str(self.nest))
+        self.assertFalse(stale.exists())
+        self.assertFalse(stray.exists())
+        self.assertTrue(fresh.exists())
+
+
+    # ---- round 1 of the gate: "foreign" and "present" are strict, "foreign" is never cached --
+
+    def five_prompts(self, sid, cwd, project=None):
+        """Real session-start plus five prompts; returns the five stdouts (the fifth is the first look-back)."""
+        project = project or self.project
+        self.start_session(project, sid, cwd)
+        return [self.prompt_once(project, sid, cwd) for _ in range(5)]
+
+    def assertSpoke(self, out):
+        self.assertNotEqual(out.strip(), "", "the hook stayed quiet")
+        self.assertIn(lookback_question(self.store_root), self.ctx_of(out))
+
+    def userprompt_kinds(self):
+        """Per userprompt foreign line: 'quiet' or 'speak' (the line carrying outcome=foreign-cwd)."""
+        return ["quiet" if "outcome=foreign-cwd-quiet" in l else "speak" for l in self.foreign_lines("userprompt")]
+
+    def test_f1a_cwd_symlink_retargeted_into_the_hooks_own_project_speaks(self):
+        cwd = self.nested()
+        sid = "s-f1a"
+        self.start_nearest(self.OTHER, sid, cwd)
+        own = self.nest / "own"
+        own.mkdir()
+        link = Path(self.td) / "link-f1a"
+        link.symlink_to(cwd)
+        self.start_session(self.project, sid, str(link))
+        for _ in range(4):
+            self.assertEqual(self.prompt_once(self.project, sid, str(link)), "")
+        self.assertEqual(self.userprompt_kinds(), ["quiet"] * 4)
+        link.unlink()
+        link.symlink_to(own)
+        self.assertSpoke(self.prompt_once(self.project, sid, str(link)))
+        self.assertEqual(self.userprompt_kinds(), ["quiet"] * 4)
+
+    def test_f1b_cwd_directory_removed_after_a_quiet_prompt_speaks(self):
+        cwd = self.nested()
+        sid = "s-f1b"
+        self.start_nearest(self.OTHER, sid, cwd)
+        self.start_session(self.project, sid, cwd)
+        for _ in range(4):
+            self.assertEqual(self.prompt_once(self.project, sid, cwd), "")
+        shutil.rmtree(cwd)
+        self.assertSpoke(self.prompt_once(self.project, sid, cwd))
+        self.assertEqual(self.userprompt_kinds(), ["quiet"] * 4)
+
+    def test_f1c_a_hand_written_cache_naming_a_project_is_not_trusted(self):
+        # (1) the folder is the hook's own, the cache claims it is B's and B ran: still speaks
+        self.wire(self.nest, self.project)
+        own = self.nest / "own"
+        own.mkdir()
+        inner = self.nest / "inner"
+        self.wire(inner, self.OTHER)
+        sid = "s-f1c-b"
+        self.start_nearest(self.OTHER, sid, str(own))
+        self.start_session(self.project, sid, str(own))
+        self.fcwd_file(sid).write_text(f"{own}\t{self.OTHER}\n")
+        for _ in range(4):
+            self.prompt_once(self.project, sid, str(own))
+            self.fcwd_file(sid).write_text(f"{own}\t{self.OTHER}\n")
+        self.assertSpoke(self.prompt_once(self.project, sid, str(own)))
+        self.assertEqual(self.foreign_lines("userprompt"), [])
+        # (2) the folder is B's, the cache names the hook's own project: the decision is the fresh one
+        cwd = str(inner / "sub")
+        (inner / "sub").mkdir()
+        sid = "s-f1c-a"
+        self.start_session(self.project, sid, cwd)
+        for _ in range(4):
+            self.fcwd_file(sid).write_text(f"{cwd}\t{self.project}\n")
+            self.prompt_once(self.project, sid, cwd)
+        self.fcwd_file(sid).write_text(f"{cwd}\t{self.project}\n")
+        self.assertSpoke(self.prompt_once(self.project, sid, cwd))
+        lines = self.foreign_lines("userprompt")
+        self.assertEqual(len(lines), 5)
+        for line in lines:
+            self.assertIn(f"outcome=foreign-cwd nearest={self.OTHER} ", line)
+
+    def _present_case(self, label, state_text):
+        cwd = self.nested()
+        sid = f"s-f2-{label}"
+        state = self.nearest_state(self.OTHER, sid)
+        state.parent.mkdir(parents=True, exist_ok=True)
+        state.write_text(state_text(sid) if callable(state_text) else state_text)
+        outs = self.five_prompts(sid, cwd)
+        self.assertSpoke(outs[-1])
+        lines = self.foreign_lines("userprompt")
+        self.assertEqual(len(lines), 5, label)
+        for line in lines:
+            self.assertIn("outcome=foreign-cwd ", line)
+            self.assertIn(f"nearest={self.OTHER}", line)
+
+    def test_f2a_null_fields_nested_in_another_object_are_not_presence(self):
+        self._present_case("nested", '{"metadata":{"start_store_sha":null,"created_at":null}}')
+
+    def test_f2b_truncated_state_naming_both_keys_is_not_presence(self):
+        self._present_case("trunc", '{"start_store_sha": "abc123", "created_at": 1.5, "ledg')
+
+    def test_f2c_state_recording_another_session_is_not_presence(self):
+        self._present_case("othersid", json.dumps(
+            {"session_id": "some-other-session", "start_store_sha": "abc123", "created_at": 1.5}))
+
+    def test_f2_a_well_formed_initialised_state_is_presence(self):
+        cwd = self.nested()
+        sid = "s-f2-ok"
+        state = self.nearest_state(self.OTHER, sid)
+        state.parent.mkdir(parents=True, exist_ok=True)
+        state.write_text(json.dumps({"session_id": sid, "start_store_sha": "abc123", "created_at": 1.5}))
+        outs = self.five_prompts(sid, cwd)
+        self.assertEqual(outs, [""] * 5)
+        self.assertEqual(self.userprompt_kinds(), ["quiet"] * 5)
+
+    def _unknown_case(self, label, setup):
+        """B initialised for the session; `setup(inner)` rewrites B's folder; the hook must speak, no foreign line."""
+        cwd = self.nested()
+        sid = f"s-f3-{label}"
+        self.start_nearest(self.OTHER, sid, cwd)
+        setup(self.nest / "inner")
+        outs = self.five_prompts(sid, cwd)
+        self.assertSpoke(outs[-1])
+        self.assertEqual(self.foreign_lines("userprompt"), [], label)
+
+    def _append(self, inner, text, name="settings.local.json"):
+        p = inner / ".claude" / name
+        p.write_text(p.read_text() + text)
+
+    def test_f3a_garbage_appended_to_pretty_printed_settings_is_unknown(self):
+        self._unknown_case("broken", lambda inner: self._append(inner, "\nBROKEN\n"))
+
+    def test_f3b_two_projects_on_separate_lines_of_one_file_is_unknown(self):
+        self._unknown_case("twolines", lambda inner: self.wire(inner, self.OTHER, "third"))
+
+    def test_f3b_two_projects_one_in_each_file_is_unknown(self):
+        self._unknown_case("twofiles", lambda inner: self.wire(inner, "third", name="settings.json"))
+
+    def _wire_raw(self, directory, commands, name):
+        Path(directory, ".claude").mkdir(parents=True, exist_ok=True)
+        entries = [{"hooks": [{"type": "command", "command": c}]} for c in commands]
+        Path(directory, ".claude", name).write_text(json.dumps({"hooks": {"UserPromptSubmit": entries}}, indent=2))
+
+    def test_f3c_own_project_assignment_at_the_start_of_the_command_is_present_same_file(self):
+        def setup(inner):
+            self._wire_raw(inner, [
+                f"MEMCONTINUUM_PROJECT={self.OTHER} bash /engine/hooks/userprompt-remind.sh",
+                f"MEMCONTINUUM_PROJECT={self.project} bash /engine/hooks/userprompt-remind.sh",
+            ], "settings.local.json")
+        self._unknown_case("ownstart-same", setup)
+
+    def test_f3c_own_project_assignment_at_the_start_of_the_command_is_present_other_file(self):
+        def setup(inner):
+            self._wire_raw(inner, [f"MEMCONTINUUM_PROJECT={self.OTHER} bash /engine/hooks/userprompt-remind.sh"],
+                           "settings.local.json")
+            self._wire_raw(inner, [f"MEMCONTINUUM_PROJECT={self.project} bash /engine/hooks/userprompt-remind.sh"],
+                           "settings.json")
+        self._unknown_case("ownstart-other", setup)
+
+    def test_strict_check_reads_assignments_wherever_they_sit(self):
+        """A single owner with the assignment after `env `, or with a quoted value, is still ONE owner."""
+        cwd = self.nested()
+        for label, cmd in (
+            ("env-prefix", "env MEMCONTINUUM_PROJECT=%s bash /engine/hooks/userprompt-remind.sh"),
+            ("single-quoted", "MEMCONTINUUM_PROJECT='%s' bash /engine/hooks/userprompt-remind.sh"),
+        ):
+            with self.subTest(case=label):
+                self._wire_raw(self.nest / "inner", [cmd % self.OTHER], "settings.local.json")
+                sid = f"s-wherever-{label}"
+                self.start_nearest(self.OTHER, sid, cwd)
+                outs = self.five_prompts(sid, cwd)
+                self.assertEqual(outs, [""] * 5, label)
+
+
+    def test_a_quoted_value_followed_by_more_characters_is_not_its_prefix(self):
+        """Hook project BA; the nearest folder is wired to B and also carries
+        MEMCONTINUUM_PROJECT='B'A (the shell assigns BA): ownership is unknown, BA speaks."""
+        hook_project, other = "BA", "B"
+        cwd = self.nested()
+        self._wire_raw(self.nest / "inner", [
+            f"MEMCONTINUUM_PROJECT={other} bash /engine/hooks/userprompt-remind.sh",
+            "MEMCONTINUUM_PROJECT='B'A bash /engine/hooks/userprompt-remind.sh",
+        ], "settings.local.json")
+        sid = "s-c3-ba"
+        self.start_nearest(other, sid, cwd)
+        outs = self.five_prompts(sid, cwd, project=hook_project)
+        self.assertNotEqual(outs[-1].strip(), "", "the hook stayed quiet")
+        self.assertIn(lookback_question(self.store_root, hook_project), self.ctx_of(outs[-1]))
+        self.assertEqual(self.foreign_lines("userprompt"), [])
+
+    def test_the_nested_candidate_check_writes_no_bytecode_into_the_engine(self):
+        """The foreign-cwd python start imports hooks/mc_nudge.py and
+        scripts/mc_settings_merge.py: on a pristine engine copy it must leave no __pycache__."""
+        engine = Path(self.td) / "engine"
+        for sub in ("hooks", "scripts"):
+            shutil.copytree(TOOLS_DIR / sub, engine / sub, ignore=shutil.ignore_patterns("__pycache__"))
+        env = self.env_for(self.project)
+        env.pop("PYTHONDONTWRITEBYTECODE", None)
+        cwd = self.nested()
+        sid = "s-c5-pyc"
+        self.start_session(self.project, sid, cwd)
+        proc, _ = run_script(
+            engine / "hooks" / "userprompt-remind.sh", self.payload("prompt", sid, cwd), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self.foreign_lines("userprompt")), 1)  # the foreign check really ran
+        self.assertEqual(sorted(str(p) for p in engine.rglob("__pycache__")), [])
+        self.assertEqual(sorted(str(p) for p in engine.rglob("*.pyc")), [])
 
 
 if __name__ == "__main__":

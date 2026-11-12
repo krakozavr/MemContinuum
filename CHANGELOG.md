@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### A write-side question names the project it asks about
+
+The "should the store hold anything?" texts (the coverage and look-back questions, at session start after a
+compaction and on prompts) now say which project they speak for: "the MemContinuum store of project P should
+hold? This asks about P work only. Store: …". Where two wired projects are nested and the harness runs both
+sets of hooks for a session in the inner folder, the outer project's question is now recognisable as not the
+one being worked on. The prompt and session-start hooks also log one `outcome=foreign-cwd nearest=<project>`
+line when the session folder sits inside a nearer directory wired to a different project, and, when that
+project's own session-start hook has run for the same session, withholds the write-side question altogether
+(`outcome=foreign-cwd-quiet`); ownership that cannot be decided is never treated as foreign. The prompt hook's three scratch files are created under the temp directory with an explicit
+template and removed by its single exit trap.
+
+    Technical: `coverage_question(store_root, project)`; the look-back sentence in both hooks gains the same words; `mc_foreign_cwd_nearest` in `hooks/memlib.sh` walks up from the payload `cwd` with `mc_first_wired_command` / `mc_command_env_value` sourced from `scripts/mc-registry-lib.sh`; fail-open and log-only. The foreign check is strict: the shell walk only names a candidate, and one python start (`foreign_verdict` in `hooks/mc_nudge.py`, ~17 ms, nested case only) reads both settings files whole through `wired_projects` in `scripts/mc_settings_merge.py` (every file must parse, every `MEMCONTINUUM_PROJECT=` assignment must name exactly the one candidate, different from the hook's own) and checks the nearest project's state with `session_initialised` (a JSON object, top-level non-empty `start_store_sha`, numeric `created_at`, matching `session_id`). Only "not foreign / unknown" is cached, in `<session state file>.fcwd` (the raw `cwd`, a tab, `!none`), and a cached `!none` can only make a hook speak; "foreign" is re-established on every call. `mc_prune_old_state` removes stale `.fcwd` files with their state files. `lookback_question(store_root, project)` in `hooks/mc_nudge.py` is now the one owner of the look-back sentence (guarded by the reuse inventory row `lookback-question-sentence`).
+
 ### A list of the jobs the code does once, and a check that keeps it so
 
 The engine now carries `docs/REUSE-INVENTORY.json`: the jobs it implements in exactly one place (the semicolon

@@ -83,7 +83,7 @@ class TestProductionTree(unittest.TestCase):
         inv = mc_reuse.load_inventory(TOOLS_DIR / mc_reuse.INVENTORY_RELPATH)
         ids = {r["id"] for r in inv["rows"]}
         for want in ("join-semicolon-list", "coverage-fact-sentence", "coverage-question-sentence",
-                     "filing-typed-authorities", "link-raw-spans", "anchor-identity", "shell-millisecond-clock",
+                     "lookback-question-sentence", "filing-typed-authorities", "link-raw-spans", "anchor-identity", "shell-millisecond-clock",
                      "store-lint-schema", "store-lint-append-only", "record-text-parser",
                      "hold-eligible-authorities", "link-classification", "parser-adapters",
                      "chunker-declared-symbols", "chunker-chunk-file", "chunker-doc-extraction"):
@@ -242,6 +242,14 @@ class TestGuardsRejectSecondImplementation(unittest.TestCase):
         f = only(ft.findings(), "coverage-question-sentence", "token_owner")
         self.assertEqual(len(f), 1, ft.findings())
         self.assertIn("another-hook.sh", f[0])
+
+    def test_a_second_copy_of_the_lookback_question_fails_token_owner(self):
+        ft = FixtureTree(self)
+        ft.write("hooks/extra_nudge.py",
+                 'def ask(p):\n    return "rejected alternative, priority, wording choice, money decision"\n')
+        f = only(ft.findings(), "lookback-question-sentence", "token_owner")
+        self.assertEqual(len(f), 1, ft.findings())
+        self.assertIn("extra_nudge.py", f[0])
 
     def test_embedded_python_dash_c_payload_second_owner_fails(self):
         ft = FixtureTree(self)
@@ -829,7 +837,7 @@ class TestPositiveControls(unittest.TestCase):
                 self.assertEqual("nested function's variable" in r["coverage_limit"],
                                  r["id"] != "join-semicolon-list", r["id"])
                 self.assertNotIn("guard misses a copy", r["coverage_limit"], r["id"])
-        for rid in ("coverage-fact-sentence", "coverage-question-sentence"):
+        for rid in ("coverage-fact-sentence", "coverage-question-sentence", "lookback-question-sentence"):
             self.assertIn("non-Python heredoc", rows[rid]["coverage_limit"])
             self.assertIn("double-quoted -c payload", rows[rid]["coverage_limit"])
             self.assertIn("is seen", rows[rid]["coverage_limit"])
@@ -847,6 +855,7 @@ class TestPositiveControls(unittest.TestCase):
         for rid in ("store-lint-schema", "store-lint-append-only"):
             self.assertIn("the forbid sees it; the reach check does not", rows[rid]["coverage_limit"], rid)
         shell_rows = {"join-semicolon-list", "coverage-fact-sentence", "coverage-question-sentence",
+                      "lookback-question-sentence",
                       "shell-millisecond-clock", "store-lint-schema", "store-lint-append-only"}
         bar = ("The shell scan reads ordinary shell as this repository writes it; unusual spellings listed in "
                "the engineering notes can hide a call, a definition or a direct command.")

@@ -149,6 +149,47 @@
       "test": "tests.test_reuse_inventory.TestProductionTree"
     },
     {
+      "id": "lookback-question-sentence",
+      "job": "Build the look-back question asked after a stretch of turns with no edited-file evidence.",
+      "policy": "singleton",
+      "implementation": "hooks/mc_nudge.py#lookback_question",
+      "contract": "lookback_question(store_root, project) returns the look-back question text naming the project, the store and the record shapes.",
+      "why_single": "A separate contract from the coverage question; both hook payloads must ask the same question.",
+      "related_paths": [
+        "hooks/mc_nudge.py",
+        "hooks/userprompt-remind.sh",
+        "hooks/sessionstart-remind.sh"
+      ],
+      "guards": [
+        {
+          "method": "token_owner",
+          "params": {
+            "pattern": "rejected alternative, priority, wording choice"
+          }
+        },
+        {
+          "method": "delegation",
+          "params": {
+            "consumers": [
+              "hooks/userprompt-remind.sh",
+              "hooks/sessionstart-remind.sh"
+            ],
+            "refs": [
+              "lookback_question"
+            ]
+          }
+        },
+        {
+          "method": "exact_copy",
+          "params": {}
+        }
+      ],
+      "coverage_limit": "Finds the sentence fragments as text of executable code: Python units, extracted python payloads and shell text outside comments and heredoc bodies (a fragment in a double-quoted -c payload or in a shell variable is still shell text and is seen). Not seen: the same words built from pieces, a reworded sentence, and a fragment inside a non-Python heredoc body (that body is dropped from the shell text and not parsed). The two hook payloads must execute lookback_question (delegation counts only an executed call (a comment, a `type` probe or a bare import is a mention and does not count)). Not recognised: a copy whose normalised body differs by one token (a literal, an added statement, reordered locals, a renamed local that shares its name with a nested function's variable) escapes; a rewrite under another name needs a human. The shell scan reads ordinary shell as this repository writes it; unusual spellings listed in the engineering notes can hide a call, a definition or a direct command.",
+      "variants": [],
+      "evidence": "The reuse inventory design: a versioned inventory with deterministic guards for recognised second implementations (owner-ratified roadmap item; this row is a design recommendation from the external design consult, not an owner ruling on this job)",
+      "test": "tests.test_reuse_inventory.TestProductionTree"
+    },
+    {
       "id": "filing-typed-authorities",
       "job": "Name the typed non-owner authorities the filing commands write and promotion may ratify.",
       "policy": "singleton",

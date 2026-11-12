@@ -26,6 +26,7 @@ from mc_settings_merge import (  # noqa: E402
     basenames_identity,
     merge_settings,
     needle_identity,
+    wired_projects,
 )
 
 
@@ -235,6 +236,32 @@ class TestBasenamesIdentityProjectScoping(unittest.TestCase):
             "a markerless legacy entry must be swept even when a path argument "
             "contains the marker text at a non-assignment position",
         )
+
+
+class TestWiredProjectsReaderIsStrict(unittest.TestCase):
+    """A wired command names a project only when the shell would assign exactly
+    that value; anything else is UNKNOWN (ValueError), never a truncated name."""
+
+    def read(self, command):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "settings.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command", "command": command}]}]}}, f)
+            return wired_projects([path], ["userprompt-remind.sh"])
+
+    def test_plain_shapes_name_the_project(self):
+        for value in ("B", "'B'", '"B"', "b.c_d-1"):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    self.read(f"X=1 MEMCONTINUUM_PROJECT={value} bash /e/userprompt-remind.sh"),
+                    {value.strip("'\"")})
+        self.assertEqual(self.read("bash /e/userprompt-remind.sh MEMCONTINUUM_PROJECT=B"), {"B"})
+
+    def test_a_value_with_anything_after_it_is_unknown(self):
+        for value in ("'B'A", '"B"A', "B'A'", "B\\ A", "B$X", "'B'\"A\"", "", "''", "B;", "B\\"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    self.read(f"MEMCONTINUUM_PROJECT={value} bash /e/userprompt-remind.sh")
 
 
 class TestNeedleIdentity(unittest.TestCase):

@@ -71,6 +71,18 @@ import shutil
 import sys
 
 
+# The env-assignment position every reader of a wired command keys on: the
+# start of the command, or whitespace before it (MEMCONTINUUM_PROJECT=<p>).
+_ASSIGN_PREFIX = r"(?:^|\s)MEMCONTINUUM_PROJECT="
+# One strict assignment: the value is a plain project name (bare, single- or
+# double-quoted) and the next character is whitespace or the end of the
+# command, so the shell and this reader agree on the value ('B'A is BA to the
+# shell, never B).
+_ASSIGNMENT_RE = re.compile(
+    _ASSIGN_PREFIX + r"(?:'([A-Za-z0-9._-]+)'|\"([A-Za-z0-9._-]+)\"|([A-Za-z0-9._-]+))(?=\s|\Z)"
+)
+
+
 class MergeRefused(Exception):
     """The existing settings file is malformed in a way that must not be
     silently overwritten. str(e) is the REFUSED message, ready to print."""
@@ -100,12 +112,12 @@ def basenames_identity(basenames, project=None):
     the refreshed groups are appended.
     """
 
-    any_marker_re = re.compile(r"(?:^|\s)MEMCONTINUUM_PROJECT=")
+    any_marker_re = re.compile(_ASSIGN_PREFIX)
     project_re = None
     if project is not None:
         esc = re.escape(project)
         project_re = re.compile(
-            r"(?:^|\s)MEMCONTINUUM_PROJECT=(?:'" + esc + r"'|" + esc + r")(?=\s|$)"
+            _ASSIGN_PREFIX + r"(?:'" + esc + r"'|" + esc + r")(?=\s|$)"
         )
 
     def is_ours(cmd):
@@ -118,6 +130,65 @@ def basenames_identity(basenames, project=None):
         return project_re.search(cmd) is not None
 
     return is_ours
+
+
+def settings_hook_commands(path):
+    """Every hook `command` string of the settings file PATH, in file order.
+    Raises ValueError when the file cannot be read, is not a JSON object, or
+    its `hooks` tree is not the event -> [group] -> hooks -> [entry] shape
+    (a reader that must name ONE owner cannot trust a file it cannot parse)."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.loads(f.read())
+    except (OSError, ValueError) as e:
+        raise ValueError(f"{path}: {e}")
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: not a JSON object")
+    hooks = data.get("hooks")
+    if hooks is None:
+        return []
+    if not isinstance(hooks, dict):
+        raise ValueError(f"{path}: hooks is not an object")
+    commands = []
+    for groups in hooks.values():
+        if not isinstance(groups, list):
+            raise ValueError(f"{path}: an event is not a list")
+        for group in groups:
+            if not isinstance(group, dict):
+                raise ValueError(f"{path}: a hook group is not an object")
+            items = group.get("hooks")
+            if items is None:
+                continue
+            if not isinstance(items, list):
+                raise ValueError(f"{path}: group hooks is not a list")
+            for item in items:
+                if isinstance(item, dict) and "command" in item:
+                    if not isinstance(item["command"], str):
+                        raise ValueError(f"{path}: a command is not a string")
+                    commands.append(item["command"])
+    return commands
+
+
+def wired_projects(paths, basenames):
+    """The set of projects named by the MemContinuum-wired hook commands (a
+    command containing one of BASENAMES) of every PRESENT settings file in
+    PATHS. Every MEMCONTINUUM_PROJECT= assignment of a command counts, wherever
+    it sits and bare, single- or double-quoted. Raises ValueError (the answer
+    is UNKNOWN) when a present file does not parse, or a wired command carries
+    no assignment, an assignment that does not read as a plain project name,
+    or a MEMCONTINUUM_PROJECT= text that is not an assignment position."""
+    projects = set()
+    for path in paths:
+        if not os.path.isfile(path):
+            continue
+        for cmd in settings_hook_commands(path):
+            if not any(name in cmd for name in basenames):
+                continue
+            values = [a or b or c for a, b, c in _ASSIGNMENT_RE.findall(cmd)]
+            if not values or cmd.count("MEMCONTINUUM_PROJECT=") != len(values):
+                raise ValueError(f"{path}: a wired command names no single parseable project")
+            projects.update(values)
+    return projects
 
 
 def needle_identity(needle):

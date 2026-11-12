@@ -197,6 +197,181 @@ mc_cwd_token() {
     printf 'cwd=%s' "${out:--}"
 }
 
+# mc_foreign_cwd_nearest CWD SESSION_ID -- detector for a hook that runs for a
+# session whose folder sits inside a NEARER directory wired to a DIFFERENT
+# project (nested wired projects: the harness can load an ancestor's hooks for
+# a session working in a descendant). Returns 0 and sets MC_FOREIGN_NEAREST to
+# that directory's project when it is FOREIGN, else 1 with both variables empty.
+# MC_FOREIGN_PRESENT is 1 when, in addition, the nearest project's own
+# session-start hook positively initialised SESSION_ID, else 0.
+#
+# Two facts decide, and a hook goes quiet only on both, so each is strict:
+#  * FOREIGN: a cheap shell walk resolves CWD physically and walks up to the
+#    first directory whose .claude/settings.local.json or .claude/settings.json
+#    carries a MemContinuum-wired hook command (an unwired .claude is skipped);
+#    that walk only yields a CANDIDATE. The candidate becomes foreign after
+#    mc_nudge.py's foreign_verdict (one python start, paid only when the walk
+#    found a candidate) reads the WHOLE of both settings files of that directory:
+#    every present file must parse as JSON, and every MEMCONTINUUM_PROJECT=
+#    assignment of every wired command (scripts/mc_settings_merge.py,
+#    wired_projects) must name exactly ONE project, equal to the candidate and
+#    different from this hook's own.
+#  * PRESENT: that project's per-session state file (mc_state_file_for) is a JSON
+#    object carrying what its session-start writes (mc_nudge.py,
+#    session_initialised), for this session id. Read on every call, never cached.
+# UNKNOWN is never foreign: CWD empty/relative/not a directory, an unreadable or
+# unparseable settings file, the library or python missing, no wired directory,
+# a wired line with more than one hook command or project assignment or an empty
+# project (a minified file, a double-quoted assignment), two or more projects
+# across the two files, or this hook's own project among them. Never reads the
+# hook's own $PWD. Observation only: callers decide what to do with the answer.
+# The pre-filter's readers are scripts/mc-registry-lib.sh's (mc_first_wired_command,
+# mc_command_env_value), sourced lazily from the engine-relative path
+# hooks/memcontinuum-detect.sh also uses.
+#
+# Only "not foreign / unknown" is cached, never "foreign": the sidecar
+# "<state file>.fcwd" (mc_state_file_for) holds one line
+# "<raw payload cwd><TAB>!none" written when the walk found no candidate, and is
+# read with shell builtins only. A cached "!none" can only make a hook SPEAK,
+# never go quiet; it is trusted only when its cwd string equals the payload cwd
+# string exactly. A line carrying anything else (a project name, garbage, another
+# cwd, an unreadable file) is a miss and is not rewritten as foreign: a candidate
+# re-establishes everything (walk + settings + state) on every invocation, so a
+# retargeted symlink, a vanished folder or a rewritten settings file can never
+# keep a hook quiet. A failed cache write is ignored. The cache is
+# session-scoped on purpose: a project wired into a folder mid-session is
+# picked up by the NEXT session. mc_prune_old_state removes stale sidecars.
+mc_foreign_cwd_nearest() {
+    local dir="${1:-}" sid="${2:-}" cf="" line="" ccwd="" cres=""
+    MC_FOREIGN_NEAREST=""
+    MC_FOREIGN_PRESENT=0
+    case "$dir" in
+        /*) ;;
+        *) return 1 ;;
+    esac
+    if [ -n "$sid" ] && [ -n "${MC_PROJECT:-}" ]; then
+        cf="$(mc_state_file_for "$MC_PROJECT" "$sid").fcwd"
+        # no stat first (a stat is a round trip on a Windows mount): a missing,
+        # unreadable or directory path just leaves $line empty
+        {
+            { IFS= read -r line || :; } < "$cf"
+        } 2>/dev/null
+        case "$line" in
+            *$'\t'*)
+                ccwd="${line%%$'\t'*}"
+                cres="${line#*$'\t'}"
+                if [ "$ccwd" = "$dir" ] && [ "$cres" = "!none" ]; then
+                    return 1
+                fi
+                ;;
+        esac
+    fi
+    if _mc_foreign_walk "$dir"; then
+        _mc_foreign_verify "$sid"
+        return $?
+    fi
+    if [ -n "$cf" ] && [ -d "${cf%/*}" ]; then
+        case "$dir" in
+            *$'\t'*|*$'\n'*) ;;
+            *)
+                # atomic: temp beside the target (same directory), removed on any failure
+                { printf '%s\t!none\n' "$dir" > "$cf.tmp.$$" && mv -f "$cf.tmp.$$" "$cf"; } 2>/dev/null \
+                    || rm -f "$cf.tmp.$$" 2>/dev/null
+                ;;
+        esac
+    fi
+    return 1
+}
+
+# _mc_foreign_verify SID -- the strict check of the candidate _mc_foreign_walk
+# left in MC_FC_CAND_DIR / MC_FC_CAND_NAME (see mc_foreign_cwd_nearest): one
+# python start. Returns 0 with MC_FOREIGN_NEAREST and MC_FOREIGN_PRESENT set when
+# the candidate is strictly foreign, else 1 with both cleared (unknown). Never
+# cached.
+_mc_foreign_verify() {
+    local sid="$1" verdict=""
+    MC_FOREIGN_NEAREST=""
+    MC_FOREIGN_PRESENT=0
+    [ -n "$sid" ] && [ -x "$MC_PY" ] || return 1
+    verdict="$(env PYTHONPATH= MC_NUDGE_DIR="$MC_LIB_DIR" MC_FC_DIR="$MC_FC_CAND_DIR" MC_FC_OWN="$MC_PROJECT" \
+        MC_FC_CAND="$MC_FC_CAND_NAME" MC_FC_BASENAMES="$MC_HOOK_BASENAMES" MC_FC_SID="$sid" \
+        MC_FC_STATE="$(mc_state_file_for "$MC_FC_CAND_NAME" "$sid")" "$MC_PY" -c '
+import os, sys
+# no .pyc is written next to the engine files (the write surface above)
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.environ["MC_NUDGE_DIR"])
+import mc_nudge
+e = os.environ
+print(mc_nudge.foreign_verdict(e["MC_FC_DIR"], e["MC_FC_OWN"], e["MC_FC_CAND"],
+                               e["MC_FC_BASENAMES"], e["MC_FC_STATE"], e["MC_FC_SID"]))
+' 2>/dev/null)" || return 1
+    case "$verdict" in
+        foreign-present) MC_FOREIGN_PRESENT=1 ;;
+        foreign-absent) ;;
+        *) return 1 ;;
+    esac
+    MC_FOREIGN_NEAREST="$MC_FC_CAND_NAME"
+    return 0
+}
+
+# _mc_foreign_walk ABSOLUTE_CWD -- the cheap, uncached pre-filter (see
+# mc_foreign_cwd_nearest): returns 0 with MC_FC_CAND_DIR (the nearest wired
+# directory) and MC_FC_CAND_NAME (the project its first wired command names, a
+# CANDIDATE only) set when that name differs from this hook's own project, else 1.
+_mc_foreign_walk() {
+    local dir="$1"
+    MC_FC_CAND_DIR=""
+    MC_FC_CAND_NAME=""
+    dir="$(cd "$dir" 2>/dev/null && pwd -P)"
+    [ -n "$dir" ] || return 1
+    if ! command -v mc_first_wired_command >/dev/null 2>&1; then
+        . "$MC_LIB_DIR/../scripts/mc-registry-lib.sh" 2>/dev/null || return 1
+    fi
+    local f
+    while :; do
+        if [ -f "$dir/.claude/settings.local.json" ] || [ -f "$dir/.claude/settings.json" ]; then
+            for f in "$dir/.claude/settings.local.json" "$dir/.claude/settings.json"; do
+                if [ -f "$f" ] && [ ! -r "$f" ]; then return 1; fi
+            done
+            if mc_first_wired_command "$dir/.claude/settings.local.json" "$dir/.claude/settings.json"; then
+                MC_FC_CAND_DIR="${dir%/}"
+                break
+            fi
+        fi
+        [ -z "$dir" ] && return 1
+        dir="${dir%/*}"
+    done
+    MC_FC_CAND_NAME="$(_mc_unambiguous_project "$MC_WIRED_COMMAND")" || return 1
+    [ "$MC_FC_CAND_NAME" = "$MC_PROJECT" ] && return 1
+    return 0
+}
+
+# _mc_unambiguous_project WIRED_COMMAND_LINE -- prints the one project a
+# settings line names, or fails when the line cannot be trusted to name exactly
+# one (more than one hook command or project assignment on the line, or no
+# parseable project).
+_mc_unambiguous_project() {
+    local line="$1" rest
+    # a pretty-printed settings file keeps each hook on its own line that
+    # STARTS with the "command" key; any other shape (a minified or
+    # hand-joined file) cannot be attributed to one owner
+    case "$line" in
+        "\"command\""*|[[:space:]]*"\"command\""*) ;;
+        *) return 1 ;;
+    esac
+    case "${line%%\"command\"*}" in *[!\ \	]*) return 1 ;; esac
+    rest="${line#*\"command\"}"
+    case "$rest" in *'"command"'*) return 1 ;; esac
+    rest="${line#*MEMCONTINUUM_PROJECT=}"
+    [ "$rest" != "$line" ] || return 1
+    case "$rest" in *MEMCONTINUUM_PROJECT=*) return 1 ;; esac
+    mc_command_env_value "$line" MEMCONTINUUM_PROJECT
+    case "$MC_ENV_VALUE" in
+        ""|*[!A-Za-z0-9._-]*) return 1 ;;
+    esac
+    printf '%s' "$MC_ENV_VALUE"
+}
+
 # mc_rotate_orphans_oldest_first -- lists every hook.log.rotating.* file
 # next to $MC_LOG, oldest mtime first. Portable across GNU and BSD/macOS
 # without arrays or a GNU-only/BSD-only reversal tool: `ls -t` sorts
@@ -852,7 +1027,7 @@ $py_transform
 }
 
 # mc_prune_old_state PROJECT MINUTES -- deletes *.json state files older than
-# MINUTES under $MEMCONTINUUM_HOME/sessions/PROJECT (mtime-based; a state
+# MINUTES (and their .fcwd walk-result sidecars) under $MEMCONTINUUM_HOME/sessions/PROJECT (mtime-based; a state
 # file's mtime is its last write, i.e. its last activity). Never touches any
 # other project's directory, and never touches MEMCONTINUUM_ROOT/CODE_ROOT.
 mc_prune_old_state() {
@@ -861,7 +1036,9 @@ mc_prune_old_state() {
     local dir
     dir="$(mc_state_dir_for "$project")"
     [ -d "$dir" ] || return 0
-    find "$dir" -maxdepth 1 -type f -name '*.json' -mmin "+$minutes" -exec rm -f {} + 2>/dev/null || true
+    # the walk-result sidecars (<id>.json.fcwd, and a stray <id>.json.fcwd.tmp.<pid>)
+    # go with the state files
+    find "$dir" -maxdepth 1 -type f \( -name '*.json' -o -name '*.json.fcwd' -o -name '*.json.fcwd.tmp.*' \) -mmin "+$minutes" -exec rm -f {} + 2>/dev/null || true
 }
 
 # mc_path_under_root now lives in mc-path-lib.sh (sourced near the top of

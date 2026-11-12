@@ -162,6 +162,22 @@ eval "$(mc_extract_fields "$PAYLOAD" session_id source cwd)" 2>/dev/null
 
 STATE_FILE="$(mc_state_file_for "$MC_PROJECT" "$SESSION_ID")"
 
+# A session working inside a nearer directory wired to a DIFFERENT project
+# gets one log line saying so (observation only: the hook carries on exactly
+# as before; see mc_foreign_cwd_nearest in memlib.sh).
+# When that nearest project's own session-start hook has positively initialised
+# THIS session, the compaction-restart write-side question is withheld as well
+# (FOREIGN_QUIET): the right project is present and speaks for itself.
+FOREIGN_QUIET=""
+if mc_foreign_cwd_nearest "${CWD:-}" "${SESSION_ID:-}"; then
+    if [ "$MC_FOREIGN_PRESENT" = "1" ]; then
+        FOREIGN_QUIET=1
+        mc_log "sessionstart outcome=foreign-cwd-quiet nearest=$MC_FOREIGN_NEAREST session=${SESSION_ID:-} source=${SOURCE:-} $(mc_cwd_token "${CWD:-}")"
+    else
+        mc_log "sessionstart outcome=foreign-cwd nearest=$MC_FOREIGN_NEAREST session=${SESSION_ID:-} source=${SOURCE:-} $(mc_cwd_token "${CWD:-}")"
+    fi
+fi
+
 # mc_compute_standing -- TOP-0132 L1/L2. Runs `memidx.py standing --json`
 # EXACTLY ONCE (never touches session state itself; callers below decide
 # dedupe/persistence) and sets these globals:
@@ -771,7 +787,7 @@ print(json.dumps(state))
             finish "compact-no-state" "standing=$STANDING_LOG_TOKEN"
         fi
 
-        OUTPUT_JSON="$(MEMCONTINUUM_ROOT="${MEMCONTINUUM_ROOT:-}" MC_NUDGE_DIR="$SCRIPT_DIR" env PYTHONPATH= "$MC_PY" -c '
+        OUTPUT_JSON="$(MEMCONTINUUM_ROOT="${MEMCONTINUUM_ROOT:-}" MC_PROJECT_NAME="$MC_PROJECT" MC_NUDGE_DIR="$SCRIPT_DIR" env PYTHONPATH= "$MC_PY" -c '
 import json, os, sys
 
 # The coverage sentence lives in hooks/mc_nudge.py (shared with the prompt
@@ -803,7 +819,7 @@ fact_line, has_evidence = coverage_fact(unmapped, coverage_status, code_changed,
 if not has_evidence:
     sys.exit(3)
 
-question = coverage_question(os.environ.get("MEMCONTINUUM_ROOT") or "<store root not configured>")
+question = coverage_question(os.environ.get("MEMCONTINUUM_ROOT") or "<store root not configured>", os.environ.get("MC_PROJECT_NAME") or "default")
 ctx = fact_line + "\n\n" + question
 print(json.dumps({
     "hookSpecificOutput": {
@@ -813,6 +829,10 @@ print(json.dumps({
 }))
 ' "$STATE_FILE" 2>>"$MC_LOG")"
         RC=$?
+        # Withheld write-side question (foreign project, the right one
+        # present): behave as a compact with no coverage evidence. Pending is
+        # consumed exactly as in that case; no inject clock is stamped.
+        if [ -n "$FOREIGN_QUIET" ]; then OUTPUT_JSON=""; RC=3; fi
 
         # Look-back compact twin: only evaluated (and only reads pending,
         # never mutates it) when coverage found no evidence above. Coverage
@@ -823,8 +843,14 @@ print(json.dumps({
         LB_TURN=""
         if [ $RC -ne 0 ]; then
             LB_META_TMP="$(mktemp 2>/dev/null)"
-            LB_JSON="$(MEMCONTINUUM_ROOT="${MEMCONTINUUM_ROOT:-}" env PYTHONPATH= "$MC_PY" -c '
+            LB_JSON="$(MEMCONTINUUM_ROOT="${MEMCONTINUUM_ROOT:-}" MC_PROJECT_NAME="$MC_PROJECT" MC_NUDGE_DIR="$SCRIPT_DIR" env PYTHONPATH= "$MC_PY" -c '
 import json, os, sys
+
+# The look-back sentence lives in hooks/mc_nudge.py (shared with the prompt
+# hook); no .pyc is written next to the hook scripts.
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.environ["MC_NUDGE_DIR"])
+from mc_nudge import lookback_question
 
 try:
     with open(sys.argv[1]) as f:
@@ -844,20 +870,13 @@ since = turn - last_growth_turn
 if since < 3:
     sys.exit(3)
 
-Q = chr(39)
 store_root = os.environ.get("MEMCONTINUUM_ROOT") or "<store root not configured>"
+project = os.environ.get("MC_PROJECT_NAME") or "default"
 fact = (
     f"Look-back signal — {since} user turns with no edited-file evidence; "
     "context was just compacted."
 )
-question = (
-    "Did the conversation since then establish any ruling, incident, "
-    "rejected alternative, priority, wording choice, money decision, or "
-    f"{Q}not now{Q} that the MemContinuum store should hold? Store: "
-    + store_root + " — a ruling is a new link in topics/<area>/<topic>.md, "
-    "an incident is a file in incidents/ (see docs/SCHEMA.md); NOT Claude "
-    "Code auto-memory. If none, say so once."
-)
+question = lookback_question(store_root, project)
 ctx = fact + "\n\n" + question
 print(json.dumps({
     "hookSpecificOutput": {
@@ -868,6 +887,7 @@ print(json.dumps({
 print(f"{turn} {since}", file=sys.stderr)
 ' "$STATE_FILE" 2>"${LB_META_TMP:-/dev/null}")"
             LB_RC=$?
+            if [ -n "$FOREIGN_QUIET" ]; then LB_JSON=""; LB_RC=3; fi
             if [ -n "${LB_META_TMP:-}" ] && [ -s "$LB_META_TMP" ]; then
                 read -r LB_TURN LB_SINCE < "$LB_META_TMP" 2>/dev/null
             fi
@@ -969,7 +989,7 @@ print(kind or "none", file=sys.stderr)
         case "$MERGE_KIND" in
             coverage) finish "compact-injected" "standing=$STANDING_LOG_TOKEN" ;;
             lookback) finish "compact-lookback" "turn=$LB_TURN since=$LB_SINCE count=${LB_COUNT:-0} standing=$STANDING_LOG_TOKEN" ;;
-            *) finish "compact-no-evidence" "standing=$STANDING_LOG_TOKEN" ;;
+            *) finish "compact-no-evidence" "standing=$STANDING_LOG_TOKEN${FOREIGN_QUIET:+ withheld=foreign-cwd}" ;;
         esac
         ;;
 
