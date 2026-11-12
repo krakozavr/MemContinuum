@@ -42,15 +42,28 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import secrets
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from probe_fixture import (  # noqa: E402
+    BaseFixture,
+    claude_argv,
+    hook_command,
+    make_dirs,
+    new_nonce,
+    nonce_in_project_tree,
+    parse_transcript,
+    run_claude,
+    session_env,
+    write_settings,
+)
+from probe_fixture import default_claude_binary as _default_claude_binary  # noqa: E402,F401 -- re-exported for the sibling probes' older import
 
 ENGINE_ROOT = Path(__file__).resolve().parent.parent
 HOOKS_DIR = ENGINE_ROOT / "hooks"
@@ -63,7 +76,7 @@ GOVERNED_RELPATH = "src/governed.py"
 def generate_nonce() -> str:
     """Per-run unguessable token -- a separate, patchable seam, never an
     inline call, so a test can substitute a known value."""
-    return f"MC-NONCE-{secrets.token_hex(16)}"
+    return new_nonce("MC-NONCE-", 16)
 
 
 def runtime_topic(nonce: str) -> str:
@@ -123,18 +136,12 @@ decision, or topic files outside the ordinary edit workflow described here.
 # --------------------------------------------------------------------------
 
 
-class Fixture:
+class Fixture(BaseFixture):
     def __init__(self, root: Path, nonce: str):
-        self.root = root
-        self.nonce = nonce
-        self.home = root / "home"
-        self.claude_config = root / "claude-config"
-        self.tmp = root / "tmp"
+        super().__init__(root, nonce)
         self.mc_home = root / "memcontinuum-home"
         self.store = root / "store"
-        self.project = root / "project"
         self.governed = self.project / GOVERNED_RELPATH
-        self.settings = self.project / ".claude" / "settings.json"
         self.db = self.mc_home / f"{PROJECT_NAME}.sqlite"
 
 
@@ -152,7 +159,7 @@ def build_fixture(root: Path, python: Path, nonce: str | None = None) -> Fixture
     never "stale" or "missing"."""
     nonce = nonce or generate_nonce()
     fixture = Fixture(root, nonce)
-    for path in (
+    make_dirs(
         fixture.home,
         fixture.claude_config,
         fixture.tmp,
@@ -160,8 +167,7 @@ def build_fixture(root: Path, python: Path, nonce: str | None = None) -> Fixture
         fixture.store / "topics",
         fixture.project / "src",
         fixture.project / ".claude",
-    ):
-        path.mkdir(parents=True, exist_ok=True)
+    )
 
     (fixture.governed).write_text("value = 'old'\n", encoding="utf-8")
     (fixture.store / "topics" / "runtime.md").write_text(
@@ -174,13 +180,16 @@ def build_fixture(root: Path, python: Path, nonce: str | None = None) -> Fixture
     def esc(s: str) -> str:
         return shlex.quote(s)
 
-    command = (
-        f"MEMCONTINUUM_ROOT={esc(str(fixture.store))} "
-        f"MEMCONTINUUM_PROJECT={esc(PROJECT_NAME)} "
-        f"MEMCONTINUUM_STRIP_PREFIX={esc(strip_prefix)} "
-        f"MEMCONTINUUM_PYTHON={esc(str(python))} "
-        f"MEMCONTINUUM_HOME={esc(str(fixture.mc_home))} "
-        f"bash {esc(str(HOOKS_DIR / 'pre-edit-chain.sh'))}"
+    command = hook_command(
+        {
+            "MEMCONTINUUM_ROOT": str(fixture.store),
+            "MEMCONTINUUM_PROJECT": PROJECT_NAME,
+            "MEMCONTINUUM_STRIP_PREFIX": strip_prefix,
+            "MEMCONTINUUM_PYTHON": str(python),
+            "MEMCONTINUUM_HOME": str(fixture.mc_home),
+        },
+        "bash",
+        str(HOOKS_DIR / "pre-edit-chain.sh"),
     )
     settings = {
         "hooks": {
@@ -205,7 +214,7 @@ def build_fixture(root: Path, python: Path, nonce: str | None = None) -> Fixture
             ]
         }
     }
-    fixture.settings.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+    write_settings(fixture.settings, settings)
 
     reindex = subprocess.run(
         [
@@ -277,14 +286,7 @@ def contamination_check(fixture: Fixture) -> dict[str, Any]:
     """The essential property this whole probe depends on: the nonce must
     be findable ONLY in the store's ruling text -- never in the prompt,
     never in any file under the code root the model is allowed to read."""
-    hits_in_project = []
-    for path in fixture.project.rglob("*"):
-        if path.is_file():
-            try:
-                if fixture.nonce in path.read_text(encoding="utf-8", errors="ignore"):
-                    hits_in_project.append(str(path))
-            except OSError:
-                continue
+    hits_in_project = nonce_in_project_tree(fixture.project, fixture.nonce)
     return {
         "nonce_in_prompt": fixture.nonce in PROMPT,
         "nonce_in_project_tree": hits_in_project,
@@ -298,67 +300,19 @@ def contamination_check(fixture: Fixture) -> dict[str, Any]:
 
 
 def build_claude_argv(claude_binary: Path, model: str, effort: str, max_budget_usd: float) -> list[str]:
-    return [
-        str(claude_binary),
-        "-p",
-        PROMPT,
-        "--output-format",
-        "stream-json",
-        "--include-hook-events",
-        "--verbose",
-        "--strict-mcp-config",
-        "--setting-sources",
-        "project",
-        "--tools",
-        "Read,Edit,Write",
-        "--permission-mode",
-        "acceptEdits",
-        "--model",
-        model,
-        "--effort",
-        effort,
-        "--max-budget-usd",
-        str(max_budget_usd),
-    ]
+    return claude_argv(claude_binary, PROMPT, "Read,Edit,Write", model, effort, max_budget_usd)
 
 
 def run_session(fixture: Fixture, claude_binary: Path, model: str, effort: str, max_budget_usd: float, timeout: int) -> subprocess.CompletedProcess:
-    env = {
-        "HOME": str(fixture.home),
-        "CLAUDE_CONFIG_DIR": str(fixture.claude_config),
-        "TMPDIR": str(fixture.tmp),
-        "MEMCONTINUUM_HOME": str(fixture.mc_home),
-        "PATH": os.environ.get("PATH", ""),
-        "ANTHROPIC_API_KEY": os.environ.get("ANTHROPIC_API_KEY", ""),
-    }
+    env = session_env(fixture, {"MEMCONTINUUM_HOME": str(fixture.mc_home)})
     argv = build_claude_argv(claude_binary, model, effort, max_budget_usd)
-    return subprocess.run(
-        argv,
-        cwd=str(fixture.project),
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
+    return run_claude(argv, fixture, env, timeout)
 
 
 # --------------------------------------------------------------------------
 # Ordering analysis -- pure function over a parsed transcript, no live
 # session needed. This is the reusable, unit-testable core.
 # --------------------------------------------------------------------------
-
-
-def parse_transcript(stdout: str) -> list[dict[str, Any]]:
-    events = []
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            events.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return events
 
 
 def analyze_nonce_ordering(events: list[dict[str, Any]], nonce: str) -> dict[str, Any]:
@@ -457,18 +411,6 @@ def analyze_nonce_ordering(events: list[dict[str, Any]], nonce: str) -> dict[str
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
-
-
-def _default_claude_binary() -> Path:
-    which = shutil.which("claude")
-    if which:
-        resolved = Path(which)
-        try:
-            resolved = resolved.resolve()
-        except OSError:
-            pass
-        return resolved
-    raise RuntimeError("no `claude` binary found on PATH; pass --claude-binary")
 
 
 def main(argv: list[str] | None = None) -> int:
