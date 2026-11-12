@@ -41,7 +41,8 @@ import time
 
 def _read_counter(path: str) -> int:
     try:
-        return int(open(path, encoding="utf-8").read().strip() or "0")
+        with open(path, encoding="utf-8") as fh:
+            return int(fh.read().strip() or "0")
     except (OSError, ValueError):
         return 0
 
@@ -85,9 +86,11 @@ def _block(nonce: str, filler_bytes: int) -> str:
     return "\n".join(lines)
 
 
-def dispatch_main(scenario: str, payload: dict, nonce: str, log_path: str, counter_path: str) -> int:
+def dispatch_main(scenario: str, payload: dict, nonce: str, log_path: str, counter_path: str,
+                  sleep=time.sleep, monotonic=time.monotonic) -> int:
+    """`sleep` and `monotonic` are injectable so the unit tests need no real time."""
     t0 = time.time()
-    m0 = time.monotonic()
+    m0 = monotonic()
     event = payload.get("hook_event_name") or ""
     tool_name = payload.get("tool_name")
     tool_input = payload.get("tool_input") or {}
@@ -103,7 +106,7 @@ def dispatch_main(scenario: str, payload: dict, nonce: str, log_path: str, count
     is_dispatch = event == "PreToolUse" and tool_name in dispatch_tools
     if is_dispatch:
         if sleep_s:
-            time.sleep(sleep_s)
+            sleep(sleep_s)
         block = _block(nonce, filler)
         original = tool_input.get(field, "")
         out = {"hookEventName": "PreToolUse", "permissionDecision": "allow"}
@@ -135,7 +138,7 @@ def dispatch_main(scenario: str, payload: dict, nonce: str, log_path: str, count
                     {
                         "ts": t0,
                         "ts_end": time.time(),
-                        "elapsed_s": time.monotonic() - m0,
+                        "elapsed_s": monotonic() - m0,
                         "call_n": call_n,
                         "scenario": scenario,
                         "event": event,

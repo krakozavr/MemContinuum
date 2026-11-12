@@ -302,6 +302,13 @@ def analyze(fixture: Fixture, events: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def claude_version(fixture: Fixture, claude_binary: Path) -> str:
+    """`claude --version` inside the same isolation as the session (fixture HOME/config/TMPDIR, project cwd)."""
+    done = subprocess.run([str(claude_binary), "--version"], cwd=str(fixture.project), env=session_env(fixture),
+                          capture_output=True, text=True)
+    return done.stdout.strip()
+
+
 def run_one(scenario: str, python: Path, claude_binary: Path, model: str, effort: str, max_budget_usd: float,
             timeout: int, out_dir: Path | None, knobs: dict[str, str], extra: list[str] | None = None, background: bool = False, hook_timeout: int = 30, pre_matcher: str = ".*") -> dict[str, Any]:
     root = Path(tempfile.mkdtemp(prefix=f"mc-disp-{scenario.lower()}-"))
@@ -312,7 +319,7 @@ def run_one(scenario: str, python: Path, claude_binary: Path, model: str, effort
         if not report["contamination_check"]["clean"]:
             report["status"] = "contaminated"
             return report
-        report["claude_version"] = subprocess.run([str(claude_binary), "--version"], capture_output=True, text=True).stdout.strip()
+        report["claude_version"] = claude_version(fixture, claude_binary)
         completed, wall = run_session(fixture, claude_binary, model, effort, max_budget_usd, timeout, extra, background)
         report.update(session_returncode=completed.returncode, session_stderr_tail=completed.stderr[-1500:], wall_s=round(wall, 2))
         events = parse_transcript(completed.stdout)

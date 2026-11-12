@@ -148,7 +148,8 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     out = []
-    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+    # strict UTF-8 on purpose: a corrupted evidence log must raise, not shrink
+    for line in path.read_text(encoding="utf-8").splitlines():
         try:
             out.append(json.loads(line))
         except json.JSONDecodeError:

@@ -7,11 +7,14 @@ and the analysis helpers run over hand-written events.
 from __future__ import annotations
 
 import json
+import contextlib
+import io
 import os
 import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 TOOLS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(TOOLS_DIR))
@@ -23,6 +26,7 @@ import dispatch_probe as dp  # noqa: E402
 import pretooluse_ordering_probe as op  # noqa: E402
 import pretooluse_rewrite_deny_probe as rp  # noqa: E402
 import probe_fixture as pf  # noqa: E402
+import pretooluse_probe_hook as hook  # noqa: E402
 
 HOOK = TOOLS_DIR / "bench" / "pretooluse_probe_hook.py"
 NONCE = "MC-DISP-unittest"
@@ -114,9 +118,31 @@ class TestDispatchScenarios(HookCase):
         out, _ = self.run_hook("X1", self.pre(tool="Task", tool_input={"task": "x"}), PROBE_PROMPT_FIELD="task")
         self.assertTrue(out["updatedInput"]["task"].startswith("x"))
 
-    def test_sleep_knob_delays_the_dispatch_answer(self):
-        _, log = self.run_hook("X1", self.pre(), PROBE_SLEEP="0.3")
-        self.assertGreaterEqual(log[0]["elapsed_s"], 0.3)
+    def _in_process(self, **env):
+        root = Path(tmpdir(self, "mc-dispatch-probe-test-"))
+        (root / "counter.txt").write_text("0", encoding="utf-8")
+        return root, env
+
+    def test_sleep_knob_is_slept_and_elapsed_is_the_monotonic_difference(self):
+        root, env = self._in_process(PROBE_SLEEP="0.3")
+        slept = []
+        ticks = iter([100.0, 102.5])
+        with mock.patch.dict(os.environ, env), contextlib.redirect_stdout(io.StringIO()):
+            hook.dispatch_main("X1", self.pre(), NONCE, str(root / "log.jsonl"), str(root / "counter.txt"),
+                               sleep=slept.append, monotonic=lambda: next(ticks))
+        self.assertEqual(slept, [0.3])
+        row = json.loads((root / "log.jsonl").read_text(encoding="utf-8"))
+        self.assertEqual(row["elapsed_s"], 2.5)
+
+    def test_no_sleep_knob_means_no_sleep_and_non_dispatch_never_sleeps(self):
+        root, env = self._in_process(PROBE_SLEEP="0")
+        slept = []
+        with mock.patch.dict(os.environ, env), contextlib.redirect_stdout(io.StringIO()):
+            hook.dispatch_main("X1", self.pre(), NONCE, str(root / "log.jsonl"), str(root / "counter.txt"), sleep=slept.append)
+        with mock.patch.dict(os.environ, {"PROBE_SLEEP": "9"}), contextlib.redirect_stdout(io.StringIO()):
+            hook.dispatch_main("X1", self.pre(tool="Write", tool_input={}), NONCE, str(root / "log.jsonl"),
+                               str(root / "counter.txt"), sleep=slept.append)
+        self.assertEqual(slept, [])
 
 
 class TestProbePlumbing(unittest.TestCase):
@@ -230,13 +256,42 @@ class TestSharedProbeFixture(unittest.TestCase):
     def test_timeout_is_a_synthetic_result_only_when_asked(self):
         root = Path(tmpdir(self, "mc-dispatch-probe-test-"))
         fixture = pf.BaseFixture(root, "n")
-        make = lambda **k: pf.run_claude(["sleep", "5"], fixture, {"PATH": os.environ.get("PATH", "")}, 1, **k)  # noqa: E731
-        root.joinpath("project").mkdir()
-        with self.assertRaises(subprocess.TimeoutExpired):
-            make()
-        done = make(catch_timeout=True)
-        self.assertEqual((done.returncode, done.stderr), (-1, "TIMEOUT after 1s"))
-        self.assertTrue(make(catch_timeout=True, timeout_detail=True).stderr.startswith("TIMEOUT after 1s: "))
+        argv = ["claude", "-p", "x"]
+        expired = subprocess.TimeoutExpired(argv, 7, output=b"partial\xff")
+        make = lambda **k: pf.run_claude(argv, fixture, {"PATH": ""}, 7, **k)  # noqa: E731
+        with mock.patch.object(subprocess, "run", side_effect=expired) as run:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                make()
+            done = make(catch_timeout=True)
+            self.assertEqual((done.returncode, done.stdout, done.stderr), (-1, "partial", "TIMEOUT after 7s"))
+            detailed = make(catch_timeout=True, timeout_detail=True)
+            self.assertEqual(detailed.stderr, f"TIMEOUT after 7s: {expired}")
+            self.assertEqual(run.call_args.kwargs["timeout"], 7)
+
+    def test_shared_jsonl_reader_is_strict_and_the_older_probe_inherits_it(self):
+        root = Path(tmpdir(self, "mc-dispatch-probe-test-"))
+        fixture = rp.build_fixture(root, Path(sys.executable), "D4", "MC-RWDN-unittest")
+        fixture.hook_log.write_bytes(b'{"a": 1}\n{"b": "\xff"}\n')
+        with self.assertRaises(UnicodeDecodeError):
+            pf.read_jsonl(fixture.hook_log)
+        with self.assertRaises(UnicodeDecodeError):
+            rp.read_hook_log(fixture)
+        fixture.hook_log.write_text('{"a": 1}\nnot json\n', encoding="utf-8")
+        self.assertEqual(pf.read_jsonl(fixture.hook_log), [{"a": 1}])
+
+    def test_version_lookup_runs_inside_the_fixture_isolation(self):
+        root = Path(tmpdir(self, "mc-dispatch-probe-test-"))
+        fixture = dp.build_fixture(root, Path(sys.executable), "X1", {}, nonce=NONCE)
+        done = subprocess.CompletedProcess([], 0, "2.1.270 (Claude Code)\n", "")
+        with mock.patch.object(subprocess, "run", return_value=done) as run:
+            self.assertEqual(dp.claude_version(fixture, Path("/c/claude")), "2.1.270 (Claude Code)")
+        argv = run.call_args.args[0]
+        self.assertEqual(argv, ["/c/claude", "--version"])
+        env = run.call_args.kwargs["env"]
+        self.assertEqual(env, pf.session_env(fixture))
+        for key in ("HOME", "CLAUDE_CONFIG_DIR", "TMPDIR"):
+            self.assertTrue(env[key].startswith(str(root)), key)
+        self.assertEqual(run.call_args.kwargs["cwd"], str(fixture.project))
 
 
 if __name__ == "__main__":
