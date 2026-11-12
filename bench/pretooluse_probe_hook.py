@@ -51,6 +51,105 @@ def _write_counter(path: str, value: int) -> None:
         fh.write(str(value))
 
 
+# --------------------------------------------------------------------------
+# Dispatch scenarios (X*): used only by bench/dispatch_probe.py. Unlike the
+# R*/D* scenarios these run for EVERY hook event the settings wire (PreToolUse
+# on every tool, PostToolUse, SubagentStart, SubagentStop) and log the WHOLE
+# payload, so the log shows which event fired, for which tool, and which
+# agent-identifying fields the payload carries. Behaviour is selected by
+# PROBE_SCENARIO plus optional PROBE_* knobs (all read here, none by the model):
+#   PROBE_PROMPT_FIELD   name of the dispatch tool's prompt field (default prompt)
+#   PROBE_DISPATCH_TOOLS comma list of tool names that count as dispatch
+#                        (default Agent,Task)
+#   PROBE_APPEND_BYTES   filler size inserted between the START and END lines
+#   PROBE_SLEEP          seconds to sleep before answering a dispatch call
+#   PROBE_SUBAGENT_CTX   1 = SubagentStart hook returns additionalContext
+# Scenarios: X0 log-only passthrough; X1 append, full object; X2 append,
+# partial object (prompt only); X3 invalid payload (PROBE_INVALID =
+# wrongtype|missing|extra); X4 additionalContext only; X5 additionalContext
+# plus append; X6 SubagentStart context only (no PreToolUse change).
+# --------------------------------------------------------------------------
+
+
+def _block(nonce: str, filler_bytes: int) -> str:
+    """Marked block. Lines starting MCPROBE-LINE are what the subagent is
+    told (in the ORIGINAL prompt) to copy to a file; START/END nonces bracket
+    the filler so truncation of a large block is visible."""
+    lines = ["", "", "[MC-DELIVERY-BLOCK]", f"MCPROBE-LINE START {nonce}-S"]
+    filler = "FILLER the quick brown fox jumps over the lazy dog 0123456789"
+    total = 0
+    while total < filler_bytes:
+        lines.append(filler)
+        total += len(filler) + 1
+    lines += [f"MCPROBE-LINE END {nonce}-E", "[/MC-DELIVERY-BLOCK]"]
+    return "\n".join(lines)
+
+
+def dispatch_main(scenario: str, payload: dict, nonce: str, log_path: str, counter_path: str) -> int:
+    t0 = time.time()
+    event = payload.get("hook_event_name") or ""
+    tool_name = payload.get("tool_name")
+    tool_input = payload.get("tool_input") or {}
+    field = os.environ.get("PROBE_PROMPT_FIELD", "prompt")
+    dispatch_tools = os.environ.get("PROBE_DISPATCH_TOOLS", "Agent,Task").split(",")
+    filler = int(os.environ.get("PROBE_APPEND_BYTES", "0") or 0)
+    sleep_s = float(os.environ.get("PROBE_SLEEP", "0") or 0)
+    call_n = _read_counter(counter_path) + 1
+    _write_counter(counter_path, call_n)
+
+    out: dict | None = None
+    note = ""
+    is_dispatch = event == "PreToolUse" and tool_name in dispatch_tools
+    if is_dispatch:
+        if sleep_s:
+            time.sleep(sleep_s)
+        block = _block(nonce, filler)
+        original = tool_input.get(field, "")
+        out = {"hookEventName": "PreToolUse", "permissionDecision": "allow"}
+        if scenario in ("X1", "X5"):
+            out["updatedInput"] = {**tool_input, field: original + block}
+        elif scenario == "X2":
+            out["updatedInput"] = {field: original + block}
+        elif scenario == "X3":
+            kind = os.environ.get("PROBE_INVALID", "wrongtype")
+            if kind == "wrongtype":
+                out["updatedInput"] = {**tool_input, field: 12345}
+            elif kind == "missing":
+                out["updatedInput"] = {k: v for k, v in tool_input.items() if k != field}
+            elif kind == "extra":
+                out["updatedInput"] = {**tool_input, field: original + block, "mc_unknown_field": "x"}
+            else:
+                note = f"unknown PROBE_INVALID={kind}"
+        if scenario in ("X4", "X5"):
+            out["additionalContext"] = f"MCPROBE-LINE ctx {nonce}-C"
+        if scenario == "X0" or scenario == "X6":
+            out = None
+    elif event == "SubagentStart" and (scenario == "X6" or os.environ.get("PROBE_SUBAGENT_CTX") == "1"):
+        out = {"hookEventName": "SubagentStart", "additionalContext": f"MCPROBE-LINE subagentstart {nonce}-A"}
+
+    if log_path:
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(
+                    {
+                        "ts": t0,
+                        "ts_end": time.time(),
+                        "call_n": call_n,
+                        "scenario": scenario,
+                        "event": event,
+                        "tool_name": tool_name,
+                        "payload": payload,
+                        "decision_returned": out,
+                        "note": note,
+                    }
+                )
+                + "\n"
+            )
+    if out is not None:
+        print(json.dumps({"hookSpecificOutput": out}))
+    return 0
+
+
 def main() -> int:
     raw_stdin = sys.stdin.read()
     try:
@@ -70,6 +169,9 @@ def main() -> int:
 
     tool_name = payload.get("tool_name")
     tool_input = payload.get("tool_input") or {}
+
+    if scenario.startswith("X"):
+        return dispatch_main(scenario, payload, nonce, log_path, counter_path)
 
     call_n = _read_counter(counter_path) + 1
     _write_counter(counter_path, call_n)
