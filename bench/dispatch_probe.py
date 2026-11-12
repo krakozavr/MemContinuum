@@ -3,12 +3,12 @@
 subagent receives?  Measured on a real, non-interactive Claude Code session
 (TOP-0144 L1, "delivery at the prompt boundary": step 1 is this probe).
 
-Reuses, by import, the machinery of bench/pretooluse_ordering_probe.py
-(`parse_transcript`, `_default_claude_binary`) and the scenario-driven stand-in
-hook bench/pretooluse_probe_hook.py (its X* scenarios); the fixture shape
-(disposable HOME / CLAUDE_CONFIG_DIR / TMPDIR, project-scoped settings, a
-per-run nonce that lives only in a file outside the project tree and is never
-in the prompt) follows bench/pretooluse_rewrite_deny_probe.py.
+Reuses, by import, the disposable-session machinery shared with the two
+PreToolUse probes (bench/probe_fixture.py: disposable HOME / CLAUDE_CONFIG_DIR /
+TMPDIR, project-scoped settings, a per-run nonce that lives only in a file
+outside the project tree and is never in the prompt, the `claude -p` argv, the
+launch, transcript parsing) and the scenario-driven stand-in hook
+bench/pretooluse_probe_hook.py (its X* scenarios).
 
 Three independent evidence sources per run, never a model's self-report alone:
   1. transcript event order (stream-json + hook events),
@@ -28,8 +28,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import secrets
-import shlex
 import shutil
 import subprocess
 import sys
@@ -45,7 +43,20 @@ ENGINE_ROOT = BENCH_DIR.parent
 PROBE_HOOK = BENCH_DIR / "pretooluse_probe_hook.py"
 
 sys.path.insert(0, str(BENCH_DIR))
-from pretooluse_ordering_probe import _default_claude_binary, parse_transcript  # noqa: E402
+from probe_fixture import (  # noqa: E402
+    ProbeHookFixture,
+    claude_argv,
+    hook_command,
+    make_dirs,
+    new_nonce,
+    nonce_in_project_tree,
+    parse_transcript,
+    read_jsonl,
+    run_claude,
+    session_env,
+    write_settings,
+)
+from probe_fixture import default_claude_binary as _default_claude_binary  # noqa: E402
 
 SCENARIOS = ("X0", "X1", "X2", "X3", "X4", "X5", "X6")
 MARKER = "MCPROBE-LINE"
@@ -82,22 +93,12 @@ Do not search for hook or settings files.
 
 
 def generate_nonce() -> str:
-    return f"MC-DISP-{secrets.token_hex(12)}"
+    return new_nonce("MC-DISP-", 12)
 
 
-class Fixture:
+class Fixture(ProbeHookFixture):
     def __init__(self, root: Path, scenario: str, nonce: str):
-        self.root = root
-        self.scenario = scenario
-        self.nonce = nonce
-        self.home = root / "home"
-        self.claude_config = root / "claude-config"
-        self.tmp = root / "tmp"
-        self.project = root / "project"
-        self.settings = self.project / ".claude" / "settings.json"
-        self.hook_log = root / "hook-calls.jsonl"
-        self.hook_counter = root / "hook-counter.txt"
-        self.nonce_file = root / "nonce.txt"
+        super().__init__(root, scenario, nonce)
         self.received = self.project / RECEIVED_RELPATH
         self.orch = self.project / ORCH_RELPATH
 
@@ -123,8 +124,7 @@ def build_hook_command(fixture: Fixture, python: Path, knobs: dict[str, str]) ->
         "PROBE_COUNTER": str(fixture.hook_counter),
         **knobs,
     }
-    prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
-    return f"{prefix} {shlex.quote(str(python))} {shlex.quote(str(PROBE_HOOK))}"
+    return hook_command(env, str(python), str(PROBE_HOOK))
 
 
 def build_settings(command: str, timeout: int, pre_matcher: str = ".*") -> dict[str, Any]:
@@ -146,69 +146,33 @@ def build_settings(command: str, timeout: int, pre_matcher: str = ".*") -> dict[
 def build_fixture(root: Path, python: Path, scenario: str, knobs: dict[str, str], nonce: str | None = None, hook_timeout: int = 30, pre_matcher: str = ".*") -> Fixture:
     nonce = nonce or generate_nonce()
     fixture = Fixture(root, scenario, nonce)
-    for path in (fixture.home, fixture.claude_config, fixture.tmp, fixture.project / "out", fixture.project / ".claude"):
-        path.mkdir(parents=True, exist_ok=True)
-    fixture.hook_counter.write_text("0", encoding="utf-8")
-    fixture.nonce_file.write_text(nonce, encoding="utf-8")  # outside project/, never in the prompt
-    fixture.settings.write_text(
-        json.dumps(build_settings(build_hook_command(fixture, python, knobs), hook_timeout, pre_matcher), indent=2) + "\n",
-        encoding="utf-8",
-    )
+    make_dirs(fixture.home, fixture.claude_config, fixture.tmp, fixture.project / "out", fixture.project / ".claude")
+    fixture.seed_hook_state()  # nonce file outside project/, never in the prompt
+    write_settings(fixture.settings, build_settings(build_hook_command(fixture, python, knobs), hook_timeout, pre_matcher))
     return fixture
 
 
 def contamination_check(fixture: Fixture) -> dict[str, Any]:
-    hits = []
-    for path in fixture.project.rglob("*"):
-        if path.is_file() and fixture.nonce in path.read_text(encoding="utf-8", errors="ignore"):
-            hits.append(str(path))
+    hits = nonce_in_project_tree(fixture.project, fixture.nonce)
     prompts = orchestrator_prompt()
     return {"nonce_in_prompt": fixture.nonce in prompts, "nonce_in_project_tree": hits,
             "clean": not hits and fixture.nonce not in prompts}
 
 
 def build_claude_argv(claude_binary: Path, model: str, effort: str, max_budget_usd: float, extra: list[str] | None = None, background: bool = False) -> list[str]:
-    return [
-        str(claude_binary), "-p", orchestrator_prompt(background),
-        "--output-format", "stream-json", "--include-hook-events", "--verbose",
-        "--strict-mcp-config", "--setting-sources", "project",
-        "--tools", "Agent,Read,Write,Bash",
-        "--allowedTools", "Bash(echo *)",
-        "--permission-mode", "acceptEdits",
-        "--model", model, "--effort", effort,
-        "--max-budget-usd", str(max_budget_usd),
-        *(extra or []),
-    ]
+    return claude_argv(claude_binary, orchestrator_prompt(background), "Agent,Read,Write,Bash", model, effort, max_budget_usd,
+                       allowed_tools="Bash(echo *)", extra=extra)
 
 
 def run_session(fixture: Fixture, claude_binary: Path, model: str, effort: str, max_budget_usd: float, timeout: int, extra: list[str] | None = None, background: bool = False) -> tuple[subprocess.CompletedProcess, float]:
-    env = {
-        "HOME": str(fixture.home), "CLAUDE_CONFIG_DIR": str(fixture.claude_config), "TMPDIR": str(fixture.tmp),
-        "PATH": os.environ.get("PATH", ""), "ANTHROPIC_API_KEY": os.environ.get("ANTHROPIC_API_KEY", ""),
-    }
+    env = session_env(fixture)
     argv = build_claude_argv(claude_binary, model, effort, max_budget_usd, extra, background)
     t0 = time.time()
-    try:
-        done = subprocess.run(argv, cwd=str(fixture.project), env=env, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
-    except subprocess.TimeoutExpired as exc:
-        out = exc.stdout.decode("utf-8", "ignore") if isinstance(exc.stdout, (bytes, bytearray)) else (exc.stdout or "")
-        done = subprocess.CompletedProcess(argv, returncode=-1, stdout=out, stderr=f"TIMEOUT after {timeout}s")
+    done = run_claude(argv, fixture, env, timeout, catch_timeout=True, stdin_devnull=True)
     return done, time.time() - t0
 
 
 # ---- analysis: pure functions over the transcript, hook log and disk -------
-
-
-def read_jsonl(path: Path) -> list[dict[str, Any]]:
-    if not path.exists():
-        return []
-    out = []
-    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
-        try:
-            out.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return out
 
 
 def dispatch_tool_uses(events: list[dict[str, Any]]) -> list[dict[str, Any]]:

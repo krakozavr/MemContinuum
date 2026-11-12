@@ -12,9 +12,8 @@ not from documentation:
      carry the denial's content, and does an always-denying hook hang the
      session?
 
-Companion to bench/pretooluse_ordering_probe.py, whose fixture machinery
-this module reuses directly (imported, not copied): `parse_transcript` and
-`_default_claude_binary`. Unlike that probe, the hook under test here is
+Companion to bench/pretooluse_ordering_probe.py; the disposable-session
+machinery both share (and dispatch_probe.py) lives in bench/probe_fixture.py. Unlike that probe, the hook under test here is
 NOT the engine's real hooks/pre-edit-chain.sh -- these two questions are
 about the generic Claude Code hook contract, not about MemContinuum's own
 hook, so a small scenario-driven stand-in
@@ -91,13 +90,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import secrets
-import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 from typing import Any
 
@@ -108,10 +104,20 @@ ENGINE_ROOT = BENCH_DIR.parent
 PROBE_HOOK = BENCH_DIR / "pretooluse_probe_hook.py"
 
 sys.path.insert(0, str(BENCH_DIR))
-from pretooluse_ordering_probe import (  # noqa: E402
-    _default_claude_binary,
+from probe_fixture import (  # noqa: E402
+    ProbeHookFixture,
+    claude_argv,
+    hook_command,
+    make_dirs,
+    new_nonce,
+    nonce_in_project_tree,
     parse_transcript,
+    read_jsonl,
+    run_claude,
+    session_env,
+    write_settings,
 )
+from probe_fixture import default_claude_binary as _default_claude_binary  # noqa: E402
 
 SCENARIOS = ("R1", "R2", "R3", "R4", "D1", "D1B", "D2", "D3", "D3L", "D4", "D5", "D5B")
 
@@ -221,24 +227,14 @@ decision, or topic files outside the ordinary edit workflow described here.
 
 
 def generate_nonce() -> str:
-    return f"MC-RWDN-{secrets.token_hex(16)}"
+    return new_nonce("MC-RWDN-", 16)
 
 
-class Fixture:
+class Fixture(ProbeHookFixture):
     def __init__(self, root: Path, scenario: str, nonce: str):
-        self.root = root
-        self.scenario = scenario
-        self.nonce = nonce
-        self.home = root / "home"
-        self.claude_config = root / "claude-config"
-        self.tmp = root / "tmp"
-        self.project = root / "project"
+        super().__init__(root, scenario, nonce)
         self.target = self.project / TARGET_RELPATH
         self.redirect = self.project / REDIRECT_RELPATH
-        self.settings = self.project / ".claude" / "settings.json"
-        self.hook_log = root / "hook-calls.jsonl"
-        self.hook_counter = root / "hook-counter.txt"
-        self.nonce_file = root / "nonce.txt"  # sibling of project/, never under it
 
 
 def build_fixture(root: Path, python: Path, scenario: str, nonce: str | None = None) -> Fixture:
@@ -250,8 +246,7 @@ def build_fixture(root: Path, python: Path, scenario: str, nonce: str | None = N
     memidx reindex -- the probe hook never touches the engine."""
     nonce = nonce or generate_nonce()
     fixture = Fixture(root, scenario, nonce)
-    for path in (fixture.home, fixture.claude_config, fixture.tmp, fixture.project / "src", fixture.project / ".claude"):
-        path.mkdir(parents=True, exist_ok=True)
+    make_dirs(fixture.home, fixture.claude_config, fixture.tmp, fixture.project / "src", fixture.project / ".claude")
 
     # D3/D4 plant an extra, real sibling file the denial's reason text
     # cites and the model can Read to check -- see D3_SIBLING_* /
@@ -267,23 +262,22 @@ def build_fixture(root: Path, python: Path, scenario: str, nonce: str | None = N
     elif scenario == "D5B":
         (fixture.project / D4_SIBLING_RELPATH).write_text(D5B_SIBLING_CONTENT, encoding="utf-8")
     fixture.redirect.write_text(ORIGINAL_CONTENT, encoding="utf-8")
-    fixture.hook_counter.write_text("0", encoding="utf-8")
-    # The nonce VALUE lives only here -- outside project/, so it can never
+    # The nonce VALUE (and the hook counter) are seeded here -- outside project/, so it can never
     # be the thing contamination_check finds under the project tree even
     # though the model's Read tool can see .claude/settings.json (which
     # only ever carries this file's PATH, never the nonce value itself).
-    fixture.nonce_file.write_text(nonce, encoding="utf-8")
+    fixture.seed_hook_state()
 
-    def esc(s: str) -> str:
-        return shlex.quote(s)
-
-    command = (
-        f"PROBE_SCENARIO={esc(scenario)} "
-        f"PROBE_NONCE_FILE={esc(str(fixture.nonce_file))} "
-        f"PROBE_LOG={esc(str(fixture.hook_log))} "
-        f"PROBE_COUNTER={esc(str(fixture.hook_counter))} "
-        f"PROBE_REDIRECT={esc(str(fixture.redirect))} "
-        f"{esc(str(python))} {esc(str(PROBE_HOOK))}"
+    command = hook_command(
+        {
+            "PROBE_SCENARIO": scenario,
+            "PROBE_NONCE_FILE": str(fixture.nonce_file),
+            "PROBE_LOG": str(fixture.hook_log),
+            "PROBE_COUNTER": str(fixture.hook_counter),
+            "PROBE_REDIRECT": str(fixture.redirect),
+        },
+        str(python),
+        str(PROBE_HOOK),
     )
     settings = {
         "hooks": {
@@ -297,7 +291,7 @@ def build_fixture(root: Path, python: Path, scenario: str, nonce: str | None = N
             ]
         }
     }
-    fixture.settings.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+    write_settings(fixture.settings, settings)
     return fixture
 
 
@@ -349,14 +343,7 @@ def preflight_hook(fixture: Fixture, python: Path) -> dict[str, Any]:
 
 
 def contamination_check(fixture: Fixture) -> dict[str, Any]:
-    hits = []
-    for path in fixture.project.rglob("*"):
-        if path.is_file():
-            try:
-                if fixture.nonce in path.read_text(encoding="utf-8", errors="ignore"):
-                    hits.append(str(path))
-            except OSError:
-                continue
+    hits = nonce_in_project_tree(fixture.project, fixture.nonce)
     prompt_used = LATITUDE_PROMPT if fixture.scenario == "D4" else PROMPT
     return {
         "nonce_in_prompt": fixture.nonce in prompt_used,
@@ -373,58 +360,15 @@ def build_claude_argv(claude_binary: Path, model: str, effort: str, max_budget_u
     else:
         prompt_template = PROMPT
     prompt = prompt_template.format(target=TARGET_RELPATH)
-    return [
-        str(claude_binary),
-        "-p",
-        prompt,
-        "--output-format",
-        "stream-json",
-        "--include-hook-events",
-        "--verbose",
-        "--strict-mcp-config",
-        "--setting-sources",
-        "project",
-        "--tools",
-        "Read,Edit,Write",
-        "--permission-mode",
-        "acceptEdits",
-        "--model",
-        model,
-        "--effort",
-        effort,
-        "--max-budget-usd",
-        str(max_budget_usd),
-    ]
+    return claude_argv(claude_binary, prompt, "Read,Edit,Write", model, effort, max_budget_usd)
 
 
 def run_session(fixture: Fixture, claude_binary: Path, model: str, effort: str, max_budget_usd: float, timeout: int, persistent: bool = False) -> subprocess.CompletedProcess:
-    env = {
-        "HOME": str(fixture.home),
-        "CLAUDE_CONFIG_DIR": str(fixture.claude_config),
-        "TMPDIR": str(fixture.tmp),
-        "PATH": os.environ.get("PATH", ""),
-        "ANTHROPIC_API_KEY": os.environ.get("ANTHROPIC_API_KEY", ""),
-    }
+    env = session_env(fixture)
     argv = build_claude_argv(claude_binary, model, effort, max_budget_usd, fixture.scenario, persistent)
-    try:
-        return subprocess.run(
-            argv,
-            cwd=str(fixture.project),
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired as exc:
-        # Surface a timeout as a synthetic CompletedProcess rather than
-        # letting the exception propagate -- a hang IS a measurement for
-        # D2, not a harness failure.
-        return subprocess.CompletedProcess(
-            argv,
-            returncode=-1,
-            stdout=(exc.stdout or b"").decode("utf-8", "ignore") if isinstance(exc.stdout, (bytes, bytearray)) else (exc.stdout or ""),
-            stderr=f"TIMEOUT after {timeout}s: {exc}",
-        )
+    # A timeout is a synthetic CompletedProcess, not an exception -- a hang IS a
+    # measurement for D2, not a harness failure.
+    return run_claude(argv, fixture, env, timeout, catch_timeout=True, timeout_detail=True)
 
 
 # --------------------------------------------------------------------------
@@ -435,18 +379,7 @@ def run_session(fixture: Fixture, claude_binary: Path, model: str, effort: str, 
 
 
 def read_hook_log(fixture: Fixture) -> list[dict[str, Any]]:
-    if not fixture.hook_log.exists():
-        return []
-    out = []
-    for line in fixture.hook_log.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            out.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return out
+    return read_jsonl(fixture.hook_log)
 
 
 def extract_tool_flow(events: list[dict[str, Any]]) -> list[dict[str, Any]]:

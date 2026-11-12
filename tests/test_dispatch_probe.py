@@ -20,6 +20,9 @@ sys.path.insert(0, str(TOOLS_DIR / "bench"))
 from tests.test_update import tmpdir  # noqa: E402 -- the one cleaned-up temp-dir helper
 
 import dispatch_probe as dp  # noqa: E402
+import pretooluse_ordering_probe as op  # noqa: E402
+import pretooluse_rewrite_deny_probe as rp  # noqa: E402
+import probe_fixture as pf  # noqa: E402
 
 HOOK = TOOLS_DIR / "bench" / "pretooluse_probe_hook.py"
 NONCE = "MC-DISP-unittest"
@@ -158,6 +161,82 @@ class TestProbePlumbing(unittest.TestCase):
                                      "payload": {"agent_id": "a1", "agent_type": "general-purpose", "session_id": "s"}}])
         self.assertEqual(rows[0]["agent_fields"]["agent_id"], "a1")
         self.assertEqual(rows[0]["elapsed_s"], 0.5)
+
+
+class TestSharedProbeFixture(unittest.TestCase):
+    """bench/probe_fixture.py is the one owner of the disposable-session
+    machinery; one old-probe scenario and one dispatch scenario go through it."""
+
+    def _captured_session(self, run, fixture):
+        seen = {}
+        real = subprocess.run
+
+        def fake(argv, **kw):
+            seen.update(argv=argv, **kw)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        subprocess.run = fake
+        try:
+            run(fixture)
+        finally:
+            subprocess.run = real
+        return seen
+
+    def test_old_probe_scenario_d4_env_settings_and_argv(self):
+        root = Path(tmpdir(self, "mc-dispatch-probe-test-"))
+        fixture = rp.build_fixture(root, Path(sys.executable), "D4", "MC-RWDN-unittest")
+        hook = json.loads(fixture.settings.read_text(encoding="utf-8"))["hooks"]["PreToolUse"]
+        self.assertEqual(hook[0]["matcher"], "Edit|Write")
+        self.assertEqual(hook[0]["hooks"][0]["timeout"], 10)
+        command = hook[0]["hooks"][0]["command"]
+        self.assertTrue(command.startswith("PROBE_SCENARIO=D4 PROBE_NONCE_FILE="))
+        self.assertIn(f"PROBE_REDIRECT={fixture.redirect}", command)
+        self.assertNotIn("MC-RWDN-unittest", command)
+        self.assertEqual(fixture.nonce_file.read_text(encoding="utf-8"), "MC-RWDN-unittest")
+        self.assertEqual(fixture.hook_counter.read_text(encoding="utf-8"), "0")
+        self.assertTrue(rp.contamination_check(fixture)["clean"])
+        seen = self._captured_session(lambda f: rp.run_session(f, Path("/c/claude"), "m", "low", 0.5, 5), fixture)
+        self.assertEqual(
+            seen["env"],
+            {"HOME": str(fixture.home), "CLAUDE_CONFIG_DIR": str(fixture.claude_config), "TMPDIR": str(fixture.tmp),
+             "PATH": os.environ.get("PATH", ""), "ANTHROPIC_API_KEY": os.environ.get("ANTHROPIC_API_KEY", "")},
+        )
+        self.assertEqual(seen["cwd"], str(fixture.project))
+        self.assertEqual(seen["argv"][seen["argv"].index("--tools") + 1], "Read,Edit,Write")
+        self.assertNotIn("--allowedTools", seen["argv"])
+
+    def test_old_probe_ordering_session_env_adds_memcontinuum_home(self):
+        root = Path(tmpdir(self, "mc-dispatch-probe-test-"))
+        fixture = op.Fixture(root, "MC-NONCE-unittest")
+        seen = self._captured_session(lambda f: op.run_session(f, Path("/c/claude"), "m", "low", 1.0, 5), fixture)
+        self.assertEqual(seen["env"]["MEMCONTINUUM_HOME"], str(fixture.mc_home))
+        self.assertEqual(set(seen["env"]), {"HOME", "CLAUDE_CONFIG_DIR", "TMPDIR", "MEMCONTINUUM_HOME", "PATH", "ANTHROPIC_API_KEY"})
+        self.assertEqual(seen["argv"], pf.claude_argv(Path("/c/claude"), op.PROMPT, "Read,Edit,Write", "m", "low", 1.0))
+
+    def test_dispatch_scenario_env_settings_and_argv(self):
+        root = Path(tmpdir(self, "mc-dispatch-probe-test-"))
+        fixture = dp.build_fixture(root, Path(sys.executable), "X1", {"PROBE_SLEEP": "1"}, nonce=NONCE, pre_matcher="Agent")
+        settings = json.loads(fixture.settings.read_text(encoding="utf-8"))["hooks"]
+        self.assertEqual(settings["PreToolUse"][0]["matcher"], "Agent")
+        self.assertEqual(settings["PostToolUse"][0]["matcher"], ".*")
+        seen = self._captured_session(lambda f: dp.run_session(f, Path("/c/claude"), "m", "low", 1.0, 5, ["--x"], True), fixture)
+        self.assertEqual(set(seen["env"]), {"HOME", "CLAUDE_CONFIG_DIR", "TMPDIR", "PATH", "ANTHROPIC_API_KEY"})
+        self.assertEqual(seen["stdin"], subprocess.DEVNULL)
+        argv = seen["argv"]
+        self.assertEqual(argv[argv.index("--tools") + 1], "Agent,Read,Write,Bash")
+        self.assertEqual(argv[argv.index("--allowedTools") + 1], "Bash(echo *)")
+        self.assertEqual(argv[-1], "--x")
+
+    def test_timeout_is_a_synthetic_result_only_when_asked(self):
+        root = Path(tmpdir(self, "mc-dispatch-probe-test-"))
+        fixture = pf.BaseFixture(root, "n")
+        make = lambda **k: pf.run_claude(["sleep", "5"], fixture, {"PATH": os.environ.get("PATH", "")}, 1, **k)  # noqa: E731
+        root.joinpath("project").mkdir()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            make()
+        done = make(catch_timeout=True)
+        self.assertEqual((done.returncode, done.stderr), (-1, "TIMEOUT after 1s"))
+        self.assertTrue(make(catch_timeout=True, timeout_detail=True).stderr.startswith("TIMEOUT after 1s: "))
 
 
 if __name__ == "__main__":
