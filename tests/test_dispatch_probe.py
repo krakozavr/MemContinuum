@@ -116,7 +116,7 @@ class TestDispatchScenarios(HookCase):
 
     def test_sleep_knob_delays_the_dispatch_answer(self):
         _, log = self.run_hook("X1", self.pre(), PROBE_SLEEP="0.3")
-        self.assertGreaterEqual(log[0]["ts_end"] - log[0]["ts"], 0.3)
+        self.assertGreaterEqual(log[0]["elapsed_s"], 0.3)
 
 
 class TestProbePlumbing(unittest.TestCase):

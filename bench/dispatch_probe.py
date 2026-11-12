@@ -167,9 +167,9 @@ def build_claude_argv(claude_binary: Path, model: str, effort: str, max_budget_u
 def run_session(fixture: Fixture, claude_binary: Path, model: str, effort: str, max_budget_usd: float, timeout: int, extra: list[str] | None = None, background: bool = False) -> tuple[subprocess.CompletedProcess, float]:
     env = session_env(fixture)
     argv = build_claude_argv(claude_binary, model, effort, max_budget_usd, extra, background)
-    t0 = time.time()
+    t0 = time.monotonic()
     done = run_claude(argv, fixture, env, timeout, catch_timeout=True, stdin_devnull=True)
-    return done, time.time() - t0
+    return done, time.monotonic() - t0
 
 
 # ---- analysis: pure functions over the transcript, hook log and disk -------
@@ -241,7 +241,7 @@ def hook_log_summary(log: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "n": rec.get("call_n"), "event": rec.get("event"), "tool": rec.get("tool_name"),
             "payload_keys": sorted(payload.keys()),
             "agent_fields": {k: payload[k] for k in payload if "agent" in k.lower() or k in ("transcript_path", "session_id")},
-            "elapsed_s": round((rec.get("ts_end") or 0) - (rec.get("ts") or 0), 3),
+            "elapsed_s": round(rec["elapsed_s"] if rec.get("elapsed_s") is not None else (rec.get("ts_end") or 0) - (rec.get("ts") or 0), 3),
             "returned": rec.get("decision_returned"),
         })
     return rows

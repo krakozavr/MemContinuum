@@ -87,6 +87,7 @@ def _block(nonce: str, filler_bytes: int) -> str:
 
 def dispatch_main(scenario: str, payload: dict, nonce: str, log_path: str, counter_path: str) -> int:
     t0 = time.time()
+    m0 = time.monotonic()
     event = payload.get("hook_event_name") or ""
     tool_name = payload.get("tool_name")
     tool_input = payload.get("tool_input") or {}
@@ -134,6 +135,7 @@ def dispatch_main(scenario: str, payload: dict, nonce: str, log_path: str, count
                     {
                         "ts": t0,
                         "ts_end": time.time(),
+                        "elapsed_s": time.monotonic() - m0,
                         "call_n": call_n,
                         "scenario": scenario,
                         "event": event,
